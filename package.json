@@ -1,0 +1,46 @@
+{
+	"name": "@harperfast/replace-me",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"license": "Apache-2.0",
+	"homepage": "https://harpersystems.dev/",
+	"bugs": {
+		"url": "https://github.com/harperdb/replace-me/issues",
+		"email": "opensource@harperdb.io"
+	},
+	"author": {
+		"name": "HarperDB, Inc.",
+		"email": "opensource@harperdb.io",
+		"url": "https://harpersystems.dev/"
+	},
+	"contributors": [],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/harperdb/replace-me.git"
+	},
+	"scripts": {
+		"lint": "eslint .",
+		"format:check": "prettier --check .",
+		"format:write": "prettier --write ."
+	},
+	"devDependencies": {
+		"@harperdb/code-guidelines": "^0.0.5",
+		"eslint": "^9.35.0",
+		"prettier": "^3.6.2"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"devEngines": {
+		"runtime": {
+			"name": "node",
+			"version": ">=20",
+			"onFail": "error"
+		},
+		"packageManager": {
+			"name": "npm",
+			"onFail": "error"
+		}
+	}
+}
