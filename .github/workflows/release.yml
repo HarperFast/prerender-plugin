@@ -1,0 +1,42 @@
+name: Release tarballs
+
+# When a GitHub Release is published, build and attach the package tarballs
+# (@harperfast/prerender and @harperfast/prerender-browser) as release assets.
+# Consumers reference these tarball URLs because the packages live in monorepo
+# subdirectories that npm can't install from a plain git URL.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  tarballs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Install dev deps (TypeScript for the browser build). Skip lifecycle scripts
+      # so Puppeteer doesn't download a Chrome binary we don't need just to pack.
+      - run: npm ci --ignore-scripts
+
+      # The plugin is plain JS (no build); the render library is TypeScript.
+      - run: npm run build --workspace @harperfast/prerender-browser
+
+      - name: Pack packages
+        run: >-
+          npm pack
+          --workspace @harperfast/prerender
+          --workspace @harperfast/prerender-browser
+          --pack-destination ./artifacts
+
+      - name: Attach tarballs to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" ./artifacts/*.tgz --clobber --repo "${{ github.repository }}"
