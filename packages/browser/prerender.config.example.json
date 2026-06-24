@@ -1,0 +1,27 @@
+{
+	"$comment": "Example rendering config. Pass this file's path (or an inline object) as the `config` option to startWorker(). Every field is optional and deep-merged over the built-in defaults — include only what you want to change.",
+	"devices": {
+		"desktop": { "viewport": { "width": 1920, "height": 5000 } },
+		"mobile": { "viewport": { "width": 390, "height": 844 } },
+		"tablet": { "viewport": { "width": 768, "height": 1024 } }
+	},
+	"defaultDevice": "desktop",
+	"block": {
+		"resourceTypes": ["image", "media", "font"],
+		"urlPatterns": ["googletagmanager.com", "google-analytics.com", "doubleclick.net"]
+	},
+	"navigation": {
+		"waitUntil": "networkidle2",
+		"renderBudgetMs": 20000,
+		"networkIdleMs": 500,
+		"networkIdleTimeoutMs": 2000
+	},
+	"scroll": { "enabled": true, "stepMs": 200 },
+	"postProcess": {
+		"stripScripts": true,
+		"inlineEmptyStyleSheets": true,
+		"removeSelectors": ["link[rel=import]", "link[as=script]", "script#__NEXT_DATA__"]
+	},
+	"injectWebComponentsPolyfill": false,
+	"extraHeaders": {}
+}

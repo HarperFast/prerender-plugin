@@ -1,12 +1,15 @@
 {
-	"name": "@harperfast/replace-me",
-	"version": "0.0.1",
+	"name": "@harperfast/prerender-monorepo",
+	"version": "0.1.0",
 	"private": true,
 	"type": "module",
 	"license": "Apache-2.0",
+	"workspaces": [
+		"packages/*"
+	],
 	"homepage": "https://harpersystems.dev/",
 	"bugs": {
-		"url": "https://github.com/harperdb/replace-me/issues",
+		"url": "https://github.com/harperdb/prerender/issues",
 		"email": "opensource@harperdb.io"
 	},
 	"author": {
@@ -17,12 +20,13 @@
 	"contributors": [],
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/harperdb/replace-me.git"
+		"url": "https://github.com/harperdb/prerender.git"
 	},
 	"scripts": {
 		"lint": "eslint .",
 		"format:check": "prettier --check .",
-		"format:write": "prettier --write ."
+		"format:write": "prettier --write .",
+		"build": "npm run build --workspaces --if-present"
 	},
 	"devDependencies": {
 		"@harperdb/code-guidelines": "^0.0.5",

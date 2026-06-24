@@ -1,0 +1,76 @@
+# Prerender plugin schema.
+#
+# Tables are grouped into databases by write-transaction coupling. Harper serializes
+# writes per database and commits each database independently, so the hot,
+# high-frequency queue table is isolated in its own database; tables that don't need
+# cross-table atomic writes live apart to maximize write concurrency.
+#
+#   render_schedule  RenderSchedule                  — the hot render queue (isolated)
+#   render_service   RenderTarget, QueueStatus       — target registry + queue status
+#   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
+#   sitemaps         Sitemap, SitemapRefresh         — sitemap data
+#   signals          NonIndexable                    — indexability signals
+#   coordination     SharedBuffer                    — node-local SAB, never replicated
+
+type SitemapEntry {
+	loc: String
+	lastmod: String
+	changefreq: String
+	priority: Float
+}
+
+type Sitemap @table(database: "sitemaps") {
+	url: String @primaryKey
+	isIndex: Boolean
+	entryCount: Int
+	entries: [SitemapEntry]
+	lastRefreshed: Date
+}
+
+type SitemapRefresh @table(database: "sitemaps") {
+	id: Any @primaryKey
+	lastRefreshed: Date
+}
+
+type RenderTarget @table(database: "render_service") @export {
+	cacheKey: String @primaryKey
+	url: String
+	deviceType: String
+	region: String
+	sitemapUrl: String @indexed
+	schedulerNode: String
+	renderInterval: Long
+}
+
+type RenderSchedule @table(database: "render_schedule") @export {
+	cacheKey: String @primaryKey
+	nextRenderTime: Long @indexed
+	# Denormalized from RenderTarget.sitemapUrl so `claim` doesn't need a per-job
+	# cross-database read just to flag sitemap-sourced jobs. Refreshed on every
+	# reschedule (job result), so it self-corrects when a URL leaves its sitemap.
+	fromSitemap: Boolean
+}
+
+type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
+	hostname: String @primaryKey
+	# Queue status (empty, queued, or paused)
+	status: String
+	updatedTime: Date @updatedTime
+}
+
+type NonIndexable @table(database: "signals", expiration: 604800) @export {
+	url: String @primaryKey
+}
+
+type PrerenderedPage @table(database: "page_cache") @export {
+	cacheKey: String @primaryKey
+	statusCode: Int!
+	headers: String
+	content: Blob
+	lastCached: Date
+	expiresAt: Date
+}
+
+type SharedBuffer @table(database: "coordination", replicate: false) {
+	key: Any @primaryKey
+}

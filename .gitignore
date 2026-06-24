@@ -1,6 +1,10 @@
 # OS Files
 .DS_Store
 
+# Local agent config + packed tarballs
+.claude/
+*.tgz
+
 # IDE Files
 .vscode/
 .idea/

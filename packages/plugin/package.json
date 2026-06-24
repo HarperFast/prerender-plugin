@@ -1,0 +1,39 @@
+{
+	"name": "@harperfast/prerender",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Configurable Harper plugin for prerendering pages for bots and crawlers",
+	"license": "Apache-2.0",
+	"main": "extension.js",
+	"homepage": "https://harpersystems.dev/",
+	"bugs": {
+		"url": "https://github.com/harperdb/prerender/issues",
+		"email": "opensource@harperdb.io"
+	},
+	"author": {
+		"name": "HarperDB, Inc.",
+		"email": "opensource@harperdb.io",
+		"url": "https://harpersystems.dev/"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/harperdb/prerender.git",
+		"directory": "packages/plugin"
+	},
+	"scripts": {
+		"test": "node --test"
+	},
+	"dependencies": {
+		"fast-xml-parser": "^5.0.9",
+		"undici": "^7.18.2"
+	},
+	"peerDependencies": {
+		"harper": ">=5.0.15"
+	},
+	"devDependencies": {
+		"harper": "^5.0.21"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}

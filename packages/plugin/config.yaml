@@ -1,0 +1,20 @@
+# Harper component configuration for the prerender plugin.
+#
+# This file declares what the plugin provides to a host Harper application:
+#   - graphqlSchema: the tables (fixed database names — see schema.graphql).
+#   - jsResource:    the custom resources (render queue, targets, sitemap, ...).
+#   - pluginModule:  extension.js — reads per-deployment options via scope.options.
+#
+# Per-deployment options (domains, security token, device types, render times,
+# etc.) are supplied by the HOST app under this plugin's key in its own
+# config.yaml. See README.md for the full option reference.
+
+rest: true
+
+graphqlSchema:
+  files: 'src/schemas/schema.graphql'
+
+jsResource:
+  files: 'src/index.js'
+
+pluginModule: 'extension.js'

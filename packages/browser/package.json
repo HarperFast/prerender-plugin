@@ -1,0 +1,62 @@
+{
+	"name": "@harperfast/prerender-browser",
+	"version": "1.2.13",
+	"type": "module",
+	"description": "Headless-browser render library for Harper Prerender: claims render jobs from the @harperfast/prerender queue, renders pages in headless Chrome (Puppeteer), and posts the HTML back. Embedded by a render service and configured entirely via startWorker() options.",
+	"keywords": [
+		"prerender",
+		"prerendering",
+		"ssr",
+		"seo",
+		"puppeteer",
+		"headless-chrome",
+		"crawler",
+		"bot",
+		"harper",
+		"harperdb"
+	],
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"license": "Apache-2.0",
+	"homepage": "https://harpersystems.dev/",
+	"bugs": {
+		"url": "https://github.com/harperdb/prerender/issues",
+		"email": "opensource@harperdb.io"
+	},
+	"author": {
+		"name": "HarperDB, Inc.",
+		"email": "opensource@harperdb.io",
+		"url": "https://harpersystems.dev/"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/harperdb/prerender.git",
+		"directory": "packages/browser"
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "rm -rf dist && tsc",
+		"test": "npm run build && node --test",
+		"prepublishOnly": "npm run build"
+	},
+	"dependencies": {
+		"mqtt": "^5.10.4",
+		"pino": "^9.9.0",
+		"puppeteer": "^24.7.2",
+		"undici": "^7.15.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"typescript": "^5.8.2"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}
