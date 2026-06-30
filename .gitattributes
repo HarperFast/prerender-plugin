@@ -1,0 +1,4 @@
+# Always diff source as text, even if a stray byte (e.g. a NUL) would trip
+# git's binary auto-detection, so reviews stay readable.
+*.js text diff
+*.ts text diff
