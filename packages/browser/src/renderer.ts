@@ -196,7 +196,13 @@ const renderer: Renderer = async (page, job) => {
 			// Count light + open-shadow elements: widgets like the reviews list render into
 			// shadow DOM, which wouldn't change a light-DOM-only count, so the wait would
 			// settle before they appear.
-			const count = await page.evaluate(countDomElements).catch(() => baseline);
+			let count: number;
+			try {
+				count = await page.evaluate(countDomElements);
+			} catch {
+				// Page closed / crashed / navigated — stop polling instead of spinning to the deadline.
+				return;
+			}
 			// Reset the timer only when the count drifts past the baseline by more than the
 			// tolerance; small ± churn around a plateau is treated as stable.
 			if (baseline < 0 || Math.abs(count - baseline) > domStableTolerance) {
@@ -218,9 +224,15 @@ const renderer: Renderer = async (page, job) => {
 		let last = -1;
 		let stablePasses = 0;
 		while (Date.now() < deadline && stablePasses < requiredStablePasses) {
-			await page.evaluate(scrollPass, config.scroll.stepMs).catch(noop);
-			await networkIdle();
-			const count = await page.evaluate(countDomElements).catch(() => last);
+			let count: number;
+			try {
+				await page.evaluate(scrollPass, config.scroll.stepMs);
+				await networkIdle();
+				count = await page.evaluate(countDomElements);
+			} catch {
+				// Page closed / crashed during a pass — stop instead of looping to the deadline.
+				return;
+			}
 			if (last >= 0 && Math.abs(count - last) <= config.navigation.domStableTolerance) stablePasses++;
 			else stablePasses = 0;
 			last = count;
@@ -308,13 +320,18 @@ async function scrollPass(stepMs: number) {
 }
 
 // Count elements across the light DOM and all open shadow roots (widgets like the
-// reviews list render into shadow DOM, invisible to a light-DOM-only count).
+// reviews list render into shadow DOM, invisible to a light-DOM-only count). Walks the
+// tree via firstChild/nextSibling rather than querySelectorAll('*') so it allocates no
+// NodeLists — this runs on every poll/pass over element-heavy pages.
 function countDomElements() {
 	let n = 0;
-	const walk = (root: Document | ShadowRoot) => {
-		const els = root.querySelectorAll('*');
-		n += els.length;
-		for (const el of els) if (el.shadowRoot) walk(el.shadowRoot);
+	const walk = (node: Node) => {
+		if (node.nodeType === 1) {
+			n++;
+			const shadow = (node as Element).shadowRoot;
+			if (shadow) walk(shadow);
+		}
+		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
 	};
 	walk(document);
 	return n;
@@ -426,13 +443,29 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 						/* cross-origin stylesheet — cssRules not readable */
 					}
 				}
+				// Resolve <slot>s: replace each with its projected (assigned) light-DOM nodes,
+				// or its fallback content if nothing is assigned. This must happen before we
+				// clear the host's light children, otherwise slotted content would be lost and
+				// components using slot projection would render with the wrong structure.
+				for (const slot of sr.querySelectorAll('slot')) {
+					const assigned = slot.assignedNodes();
+					const replacement = document.createDocumentFragment();
+					if (assigned.length > 0) {
+						for (const node of assigned) replacement.appendChild(node);
+					} else {
+						while (slot.firstChild) replacement.appendChild(slot.firstChild);
+					}
+					slot.replaceWith(replacement);
+				}
+				// Clear the host's remaining (unassigned, therefore unrendered) light children,
+				// then move the resolved shadow tree into the host as direct children — so
+				// `:host > x` / descendant relationships survive (a wrapper would break `>`).
+				while (host.firstChild) host.removeChild(host.firstChild);
 				if (css) {
 					const style = document.createElement('style');
 					style.textContent = css;
 					host.appendChild(style);
 				}
-				// Move the shadow's nodes into the host's light DOM as direct children, so
-				// `:host > x` / descendant relationships survive (a wrapper would break `>`).
 				while (sr.firstChild) host.appendChild(sr.firstChild);
 			} catch {
 				/* closed shadow root or serialization error — skip */
@@ -449,7 +482,12 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 			const first = (value || '').trim().split(',')[0];
 			return first ? first.trim().split(/\s+/)[0] : '';
 		};
-		const isRealUrl = (u: string) => /^https?:\/\//.test(u) || u.startsWith('//') || u.startsWith('/');
+		// Any non-empty value that isn't a data:/javascript: URI or a bare hash — so relative
+		// paths (`images/p.jpg`, `../logo.png`) resolve too, not just absolute/slash URLs.
+		const isRealUrl = (u: string) => {
+			const t = (u || '').trim();
+			return t !== '' && !t.startsWith('data:') && !t.startsWith('javascript:') && !t.startsWith('#');
+		};
 		for (const img of document.querySelectorAll('img')) {
 			const src = img.getAttribute('src') || '';
 			const needsSrc = !src || src.startsWith('data:') || /loader|placeholder|spacer|blank|1x1|transparent/i.test(src);
