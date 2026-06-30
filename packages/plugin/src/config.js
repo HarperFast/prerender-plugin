@@ -291,7 +291,11 @@ const warnOnRiskyConfig = () => {
 		log.warn?.('[prerender] domains allowlist is empty — all hosts will be treated as indexable');
 	}
 	if (config.staging.ip) {
-		if (isIP(config.staging.ip)) {
+		// Mirror stagingTargetIp's gate (ip AND header AND valid ip) so the warning never
+		// claims the feature is on when it is actually disabled.
+		if (!config.staging.header) {
+			log.warn?.('[prerender] staging.ip is set but staging.header is empty — staging passthrough is disabled');
+		} else if (isIP(config.staging.ip)) {
 			log.warn?.(
 				`[prerender] staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved)`
 			);

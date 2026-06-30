@@ -43,6 +43,11 @@ test('stagingTargetIp ignores an invalid configured ip (feature disabled)', () =
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
+test('stagingTargetIp is disabled when the toggle header name is configured empty', () => {
+	applyOptions({ staging: { ip: '23.50.51.27', header: '' } });
+	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
+});
+
 test('stagingTargetIp supports an IPv6 staging address', () => {
 	applyOptions({ staging: { ip: '2606:2800:220:1:248:1893:25c8:1946' } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '2606:2800:220:1:248:1893:25c8:1946');
