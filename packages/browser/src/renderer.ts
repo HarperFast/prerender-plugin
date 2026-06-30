@@ -5,6 +5,10 @@ import type { PostProcessConfig } from './config.js';
 
 const noop = () => {};
 
+// 1×1 transparent GIF used to satisfy blocked image requests (see block.stubImages).
+const STUB_IMAGE = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+const STUB_IMAGE_RESPONSE = { status: 200, contentType: 'image/gif', body: STUB_IMAGE };
+
 // Forces the Web Components polyfills so shadow DOM / custom-element CSS is
 // serialized into the prerendered HTML. Injected before document load when
 // `injectWebComponentsPolyfill` is enabled.
@@ -91,8 +95,17 @@ const renderer: Renderer = async (page, job) => {
 				req.continue({ headers }).catch(noop);
 				return;
 			}
-			if (blockedResourceTypes.has(req.resourceType()) || isBlockedUrl(req.url())) {
+			if (isBlockedUrl(req.url())) {
 				req.abort().catch(noop);
+				return;
+			}
+			if (blockedResourceTypes.has(req.resourceType())) {
+				// Stub blocked images (vs abort) so lazy-loaders keep their real src URLs.
+				if (config.block.stubImages && req.resourceType() === 'image') {
+					req.respond(STUB_IMAGE_RESPONSE).catch(noop);
+				} else {
+					req.abort().catch(noop);
+				}
 				return;
 			}
 
@@ -167,15 +180,79 @@ const renderer: Renderer = async (page, job) => {
 			})
 			.catch(noop);
 
-	if (config.scroll.enabled) {
-		// Scroll to the bottom to trigger lazy-loaded content, then back to the top
-		// (e.g. so a scroll-aware navbar renders in its default state).
-		await page.evaluate(scrollToBottom, config.scroll.stepMs);
-		await networkIdle();
-		await page.evaluate(() => window.scrollTo(0, 0));
-	}
+	// Wait until the DOM's element count stops changing for `domStableMs`, capped by
+	// `domStableTimeoutMs` and the remaining render budget. Catches late content
+	// (e.g. a reviews widget injected after a network lull) that network-idle misses.
+	// Element count (not HTML length) is the signal so perpetual cosmetic churn —
+	// rotating carousels, animation classes, countdown text — doesn't reset the timer;
+	// it still jumps when a widget injects real DOM.
+	const domStable = async () => {
+		const { domStableMs, domStableTimeoutMs, domStablePollMs, domStableTolerance } = config.navigation;
+		if (domStableMs <= 0) return;
+		const deadline = Date.now() + Math.min(remainingTimer.remaining, domStableTimeoutMs);
+		let baseline = -1;
+		let stableSince = Date.now();
+		while (Date.now() < deadline) {
+			// Count light + open-shadow elements: widgets like the reviews list render into
+			// shadow DOM, which wouldn't change a light-DOM-only count, so the wait would
+			// settle before they appear.
+			let count: number;
+			try {
+				count = await page.evaluate(countDomElements);
+			} catch {
+				// Page closed / crashed / navigated — stop polling instead of spinning to the deadline.
+				return;
+			}
+			// Reset the timer only when the count drifts past the baseline by more than the
+			// tolerance; small ± churn around a plateau is treated as stable.
+			if (baseline < 0 || Math.abs(count - baseline) > domStableTolerance) {
+				baseline = count;
+				stableSince = Date.now();
+			} else if (Date.now() - stableSince >= domStableMs) {
+				return;
+			}
+			await new Promise((resolve) => setTimeout(resolve, domStablePollMs));
+		}
+	};
 
-	await networkIdle();
+	// Loop scroll-passes (network-idle between each) until the DOM element count holds
+	// steady across passes — keeps IntersectionObserver-lazy widgets in view long enough
+	// to fully load (reviews, UGC carousels, vote controls) before the snapshot.
+	const scrollSettle = async () => {
+		const deadline = Date.now() + Math.min(remainingTimer.remaining, config.navigation.domStableTimeoutMs);
+		const requiredStablePasses = Math.max(1, config.scroll.settleStablePasses);
+		let last = -1;
+		let stablePasses = 0;
+		while (Date.now() < deadline && stablePasses < requiredStablePasses) {
+			let count: number;
+			try {
+				await page.evaluate(scrollPass, config.scroll.stepMs);
+				await networkIdle();
+				count = await page.evaluate(countDomElements);
+			} catch {
+				// Page closed / crashed during a pass — stop instead of looping to the deadline.
+				return;
+			}
+			if (last >= 0 && Math.abs(count - last) <= config.navigation.domStableTolerance) stablePasses++;
+			else stablePasses = 0;
+			last = count;
+		}
+		await page.evaluate(() => window.scrollTo(0, 0)).catch(noop);
+	};
+
+	if (config.scroll.enabled && config.scroll.settleUntilStable) {
+		await scrollSettle();
+	} else {
+		if (config.scroll.enabled) {
+			// Scroll to the bottom to trigger lazy-loaded content, then back to the top
+			// (e.g. so a scroll-aware navbar renders in its default state).
+			await page.evaluate(scrollToBottom, config.scroll.stepMs);
+			await networkIdle();
+			await page.evaluate(() => window.scrollTo(0, 0));
+		}
+		await networkIdle();
+		await domStable();
+	}
 
 	if (finalRes) {
 		job.httpResponse = job.httpResponse || {
@@ -195,7 +272,7 @@ const renderer: Renderer = async (page, job) => {
 			job.isIndexable = await page.evaluate(isIndexableFromContent, pageUrl);
 
 			if (job.isIndexable || job.isFromSitemap) {
-				const content = await page.evaluate(postProcess, config.postProcess);
+				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
 				return content;
 			}
 		} else {
@@ -223,6 +300,41 @@ async function scrollToBottom(stepMs: number) {
 			}
 		}, stepMs);
 	});
+}
+
+// One absolute-position scroll pass from top to bottom in half-viewport steps. Used by
+// the settle loop so each lazy section is held in the viewport long enough to trigger.
+async function scrollPass(stepMs: number) {
+	await new Promise<void>((resolve) => {
+		let y = 0;
+		const step = Math.max(1, Math.round(window.innerHeight * 0.5));
+		const timer = setInterval(() => {
+			window.scrollTo(0, y);
+			y += step;
+			if (y >= document.body.scrollHeight) {
+				clearInterval(timer);
+				resolve();
+			}
+		}, stepMs);
+	});
+}
+
+// Count elements across the light DOM and all open shadow roots (widgets like the
+// reviews list render into shadow DOM, invisible to a light-DOM-only count). Walks the
+// tree via firstChild/nextSibling rather than querySelectorAll('*') so it allocates no
+// NodeLists — this runs on every poll/pass over element-heavy pages.
+function countDomElements() {
+	let n = 0;
+	const walk = (node: Node) => {
+		if (node.nodeType === 1) {
+			n++;
+			const shadow = (node as Element).shadowRoot;
+			if (shadow) walk(shadow);
+		}
+		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
+	};
+	walk(document);
+	return n;
 }
 
 function isIndexableFromContent(pageUrl: string) {
@@ -261,7 +373,153 @@ function isIndexableFromContent(pageUrl: string) {
 	return isIndexable;
 }
 
-function postProcess(opts: PostProcessConfig) {
+function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = []) {
+	if (opts.flattenShadowDom) {
+		// Inline open shadow roots into their host's light DOM so outerHTML/XMLSerializer
+		// include them (content rendered in shadow DOM — e.g. a reviews widget Googlebot
+		// sees after rendering — is otherwise lost). Collect deepest-last, then process
+		// deepest-first so nested shadow content is inlined before its ancestor.
+		const hosts: Element[] = [];
+		const walk = (root: Document | ShadowRoot) => {
+			for (const el of root.querySelectorAll('*')) {
+				if (el.shadowRoot) {
+					hosts.push(el);
+					walk(el.shadowRoot);
+				}
+			}
+		};
+		walk(document);
+
+		// Rewrite a shadow selector so it (a) still applies once flattened and (b) stays
+		// SCOPED to its host. `:host`/`:host(x)` re-target the (now light-DOM) host via a
+		// unique attribute we stamp on it; every other selector is prefixed with the host
+		// selector so it only matches inside the flattened subtree — otherwise unscoped
+		// shadow rules (e.g. a bare `button {…}`) would leak out and restyle the whole page.
+		const rewriteSelector = (selectorText: string, hostSel: string): string =>
+			selectorText
+				.split(',')
+				.map((s) => {
+					s = s.trim();
+					if (s.includes(':host')) {
+						return s.replace(/:host\(([^)]*)\)/g, (_m, inner) => hostSel + inner.trim()).replace(/:host/g, hostSel);
+					}
+					return `${hostSel} ${s}`;
+				})
+				.join(', ');
+
+		// Serialize CSSOM rules to text (innerHTML omits insertRule()/adoptedStyleSheets
+		// rules), rewriting :host and recursing into @media/@supports groups.
+		const serializeRules = (rules: CSSRuleList, hostSel: string): string => {
+			let css = '';
+			for (const rule of rules) {
+				const styleRule = rule as CSSStyleRule;
+				const groupRule = rule as CSSGroupingRule;
+				if (styleRule.selectorText !== undefined && styleRule.style) {
+					css += `${rewriteSelector(styleRule.selectorText, hostSel)}{${styleRule.style.cssText}}\n`;
+				} else if (groupRule.cssRules) {
+					const prelude = rule.cssText.slice(0, rule.cssText.indexOf('{'));
+					css += `${prelude}{\n${serializeRules(groupRule.cssRules, hostSel)}}\n`;
+				} else {
+					css += rule.cssText + '\n'; // @keyframes, @font-face, …
+				}
+			}
+			return css;
+		};
+
+		let hostSeq = 0;
+		for (const host of hosts.reverse()) {
+			try {
+				const sr = host.shadowRoot as ShadowRoot;
+				const hostId = `s${hostSeq++}`;
+				host.setAttribute('data-shadow-host', hostId);
+				const hostSel = `[data-shadow-host="${hostId}"]`;
+
+				let css = '';
+				const sheets = [...sr.styleSheets, ...((sr.adoptedStyleSheets as CSSStyleSheet[]) ?? [])];
+				for (const sheet of sheets) {
+					try {
+						css += serializeRules(sheet.cssRules, hostSel);
+					} catch {
+						/* cross-origin stylesheet — cssRules not readable */
+					}
+				}
+				// Resolve <slot>s: replace each with its projected (assigned) light-DOM nodes,
+				// or its fallback content if nothing is assigned. This must happen before we
+				// clear the host's light children, otherwise slotted content would be lost and
+				// components using slot projection would render with the wrong structure.
+				for (const slot of sr.querySelectorAll('slot')) {
+					const assigned = slot.assignedNodes();
+					const replacement = document.createDocumentFragment();
+					if (assigned.length > 0) {
+						for (const node of assigned) replacement.appendChild(node);
+					} else {
+						while (slot.firstChild) replacement.appendChild(slot.firstChild);
+					}
+					slot.replaceWith(replacement);
+				}
+				// Clear the host's remaining (unassigned, therefore unrendered) light children,
+				// then move the resolved shadow tree into the host as direct children — so
+				// `:host > x` / descendant relationships survive (a wrapper would break `>`).
+				while (host.firstChild) host.removeChild(host.firstChild);
+				if (css) {
+					const style = document.createElement('style');
+					style.textContent = css;
+					host.appendChild(style);
+				}
+				while (sr.firstChild) host.appendChild(sr.firstChild);
+			} catch {
+				/* closed shadow root or serialization error — skip */
+			}
+		}
+	}
+
+	if (opts.resolveLazyImages) {
+		// Copy the real URL from a lazy attribute into `src` for images that never got a
+		// real `src` (off-screen carousel/grid slides). Without this they ship with an empty
+		// or placeholder `src` and never load when the page is served.
+		const lazyAttrs = ['data-lazy', 'data-src', 'data-original', 'data-image-src', 'data-img-src'];
+		const firstUrl = (value: string): string => {
+			const first = (value || '').trim().split(',')[0];
+			return first ? first.trim().split(/\s+/)[0] : '';
+		};
+		// Any non-empty value that isn't a data:/javascript: URI or a bare hash — so relative
+		// paths (`images/p.jpg`, `../logo.png`) resolve too, not just absolute/slash URLs.
+		const isRealUrl = (u: string) => {
+			const t = (u || '').trim();
+			return t !== '' && !t.startsWith('data:') && !t.startsWith('javascript:') && !t.startsWith('#');
+		};
+		for (const img of document.querySelectorAll('img')) {
+			const src = img.getAttribute('src') || '';
+			const needsSrc = !src || src.startsWith('data:') || /loader|placeholder|spacer|blank|1x1|transparent/i.test(src);
+			if (!needsSrc) continue;
+			let real = '';
+			for (const attr of lazyAttrs) {
+				const v = img.getAttribute(attr) || '';
+				if (isRealUrl(v)) {
+					real = v;
+					break;
+				}
+			}
+			if (!real) real = firstUrl(img.getAttribute('srcset') || img.getAttribute('data-srcset') || '');
+			if (real && isRealUrl(real)) img.setAttribute('src', real);
+		}
+	}
+
+	if (opts.stripBlockedResources && blockedUrlPatterns.length > 0) {
+		// Remove resource elements pointing at blocked hosts (ad/analytics/RUM pixels,
+		// frames, scripts) so the served HTML doesn't fire them on load. Runs after the
+		// shadow flatten so pixels that came from shadow content are caught too.
+		document.querySelectorAll('img, iframe, script, source, embed, object, link, video, audio').forEach((el) => {
+			const url =
+				el.getAttribute('src') ||
+				el.getAttribute('href') ||
+				el.getAttribute('srcset') ||
+				el.getAttribute('data-src') ||
+				'';
+			if (url && blockedUrlPatterns.some((pattern) => url.includes(pattern))) el.remove();
+		});
+	}
+
 	if (opts.inlineEmptyStyleSheets) {
 		// Inline any style sheets that are empty (assumed to be dynamically injected CSSOM)
 		for (const styleSheet of document.styleSheets) {
