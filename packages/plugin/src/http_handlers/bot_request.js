@@ -148,6 +148,9 @@ function deliverResource(resource, request) {
 		if (resource.lastCached) {
 			headers.set('x-harper-cache-timestamp', new Date(resource.lastCached).toISOString());
 		}
+		if (resource.viaStaging) {
+			headers.set('x-harper-origin', 'staging');
+		}
 	}
 
 	// handle 304
