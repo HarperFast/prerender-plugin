@@ -63,6 +63,11 @@ rest: true # required for the @export-ed table REST endpoints
     key: x-harper-prerender-debug
     value: 'true'
 
+  staging: # origin staging passthrough (see "Staging passthrough" below)
+    ip: '' # staging edge IP; empty = disabled. When set, a cache-MISS fetch that carries
+    #        the `header` request header connects here instead of the public origin.
+    header: x-harper-staging # request header whose presence toggles staging passthrough
+
   page:
     ttl: 86400000 # 24h — default cached-page TTL
     minTtl: 21600000 # 6h  — floor for sitemap-derived TTLs
@@ -133,6 +138,24 @@ How bot requests reach the plugin is configurable via `ingress.mode`:
   Example: `GET /mobile/catalog/x.jsp?CN=...&utm=...` with `X-Forwarded-Host: www.example.com`
   → device `mobile`, target `https://www.example.com/catalog/x.jsp?CN=...` (a catalog route
   keeping only `CN`).
+
+### Staging passthrough
+
+To verify an origin against a staging edge (e.g. the Akamai staging network) _through_ the
+plugin, set `staging.ip` to the staging edge IP. Then any **cache-miss** bot request that carries
+the `staging.header` request header (`x-harper-staging` by default) has its origin fetch connected
+to that IP instead of the public origin. Only the TCP address is pinned — the `Host` header and TLS
+SNI stay the real origin host — so the staging edge serves the right property and presents a valid
+certificate (the server-side equivalent of a `host-resolver-rules` / `/etc/hosts` override).
+
+- **Cache hits are unaffected.** The header is not part of the cache key, so a cached page is always
+  returned as-is; only the live origin fetch on a miss is redirected.
+- **The header is a toggle, not a target.** The connect address is always the configured
+  `staging.ip`, never a value from the request — so a request can't repoint the fetch at an
+  arbitrary host. Leave `staging.ip` empty (the default) to disable the feature entirely; production
+  is unaffected unless a staging IP is explicitly configured.
+- With the `debugHeader` also present, a staging-served response is tagged with the
+  `x-harper-origin: staging` response header so you can confirm it.
 
 ### Database topology
 

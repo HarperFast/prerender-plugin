@@ -11,6 +11,8 @@
  * time, so overrides applied during `handleApplication` take effect.
  */
 
+import { isIP } from 'node:net';
+
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
@@ -98,6 +100,22 @@ const defaultConfig = () => ({
 	debugHeader: {
 		key: 'x-harper-prerender-debug',
 		value: 'true',
+	},
+
+	// Staging passthrough — for verifying an origin against a staging edge (e.g. the
+	// Akamai staging network). When `ip` is set, a cache-MISS origin fetch that carries
+	// the `header` request header is connected to `ip` instead of the public origin. The
+	// Host header and TLS SNI stay the real origin host (only the TCP address is pinned),
+	// so the staging edge serves the right property and presents a valid certificate.
+	//
+	// The header is only a toggle: the connect address is always the configured `ip`, never
+	// a value from the request, so a request can't repoint the fetch at an arbitrary host.
+	// The cache key does not include the header, so cache HITS always return the normal
+	// cached page regardless of it. Empty `ip` disables the feature — production is
+	// unaffected unless a staging IP is explicitly configured.
+	staging: {
+		ip: '',
+		header: 'x-harper-staging',
 	},
 
 	page: {
@@ -271,6 +289,17 @@ const warnOnRiskyConfig = () => {
 	}
 	if (config.domains.length === 0) {
 		log.warn?.('[prerender] domains allowlist is empty — all hosts will be treated as indexable');
+	}
+	if (config.staging.ip) {
+		if (isIP(config.staging.ip)) {
+			log.warn?.(
+				`[prerender] staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved)`
+			);
+		} else {
+			log.warn?.(
+				`[prerender] staging.ip "${config.staging.ip}" is not a valid IP address — staging passthrough is disabled`
+			);
+		}
 	}
 };
 

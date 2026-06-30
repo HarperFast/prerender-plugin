@@ -1,8 +1,46 @@
 import { Readable } from 'node:stream';
+import { isIP } from 'node:net';
 import { Agent } from 'undici';
 import { config } from '../config.js';
 
 const agent = new Agent({});
+
+/**
+ * The staging IP to connect to for this origin fetch, or undefined for a normal fetch.
+ * Staging passthrough is active only when a staging `ip` is configured (and valid) AND
+ * the request carries the configured toggle header. The address is always the configured
+ * `config.staging.ip` — never a value from the request — so a request can only switch the
+ * fetch to the one pre-approved IP, not repoint it at an arbitrary host.
+ */
+export const stagingTargetIp = (headers) => {
+	const { ip, header } = config.staging;
+	if (!ip || !header || !isIP(ip)) return undefined;
+	return headers?.get(header) ? ip : undefined;
+};
+
+// Dispatchers that pin DNS resolution to a fixed IP (staging passthrough), one per IP.
+// Only the connect address is overridden — the origin (so Host header + TLS SNI + cert
+// validation) stays the real origin host, the server-side equivalent of Chrome's
+// --host-resolver-rules=MAP host ip. In practice there is at most one entry (the single
+// configured staging IP); the map just keeps it stable across requests and across a
+// config reload that changes the IP.
+const pinnedDispatchers = new Map();
+const dispatcherFor = (ip) => {
+	if (!ip) return agent;
+	let dispatcher = pinnedDispatchers.get(ip);
+	if (!dispatcher) {
+		const family = isIP(ip);
+		dispatcher = new Agent({
+			connect: {
+				// Node's lookup callback has two shapes depending on the `all` option.
+				lookup: (_hostname, options, callback) =>
+					options?.all ? callback(null, [{ address: ip, family }]) : callback(null, ip, family),
+			},
+		});
+		pinnedDispatchers.set(ip, dispatcher);
+	}
+	return dispatcher;
+};
 
 const hopByHopHeaders = [
 	'connection',
@@ -59,7 +97,12 @@ export const fetchOriginResource = async (request) => {
 
 	const urlObj = url instanceof URL ? url : new URL(url);
 
-	const response = await agent.request({
+	// Cache misses (and non-GET passthroughs) may be routed to a staging edge when the
+	// request opts in via the staging header; the origin/Host stays the real host so only
+	// the connect address differs.
+	const stagingIp = stagingTargetIp(request.headers);
+
+	const response = await dispatcherFor(stagingIp).request({
 		origin: urlObj.origin,
 		path: urlObj.pathname + urlObj.search,
 		method,
@@ -79,5 +122,6 @@ export const fetchOriginResource = async (request) => {
 		statusCode: response.statusCode,
 		headers: response.headers,
 		content: Readable.toWeb(response.body),
+		viaStaging: Boolean(stagingIp),
 	};
 };
