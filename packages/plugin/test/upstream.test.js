@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
-import { resolveUpstreamHeaders, stagingTargetIp } from '../src/util/upstream.js';
+import { resolveUpstreamHeaders, sanitizeOriginResponseHeaders, stagingTargetIp } from '../src/util/upstream.js';
 
 // Minimal stand-in for the request headers object (only `.get` is used here).
 const headersWith = (present) => ({ get: (name) => (present.includes(name) ? '1' : null) });
@@ -97,6 +97,58 @@ test('resolveUpstreamHeaders matches ignoredHeaders case-insensitively', () => {
 	applyOptions({ ignoredHeaders: ['X-Internal'] });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret' }, 'desktop');
 	assert.equal(upstream['x-internal'], undefined);
+});
+
+test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
+	const clean = sanitizeOriginResponseHeaders({
+		'content-type': 'text/html; charset=utf-8',
+		'content-encoding': 'gzip',
+		'content-length': '1234',
+		'cache-control': 'max-age=60',
+		'etag': '"abc"',
+		'last-modified': 'Wed, 02 Jul 2026 00:00:00 GMT',
+		'vary': 'Accept-Encoding',
+		'x-robots-tag': 'noindex',
+	});
+	assert.equal(clean['content-type'], 'text/html; charset=utf-8');
+	assert.equal(clean['content-encoding'], 'gzip');
+	assert.equal(clean['content-length'], '1234');
+	assert.equal(clean['cache-control'], 'max-age=60');
+	assert.equal(clean['etag'], '"abc"');
+	assert.equal(clean['vary'], 'Accept-Encoding');
+	assert.equal(clean['x-robots-tag'], 'noindex');
+});
+
+test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {
+	const clean = sanitizeOriginResponseHeaders({
+		'content-type': 'text/html',
+		'akamai-grn': '0.1234abcd',
+		'x-akamai-staging': 'ESSL',
+		'x-akamai-transformed': '9 0 0',
+		'x-cache': 'TCP_MISS from a1-2-3-4',
+		'x-cache-key': '/L/1/2/3/foo',
+		'x-check-cacheable': 'NO',
+		'via': '1.1 akamai.net',
+		'server-timing': 'cdn-cache; desc=MISS',
+		'set-cookie': 'sid=abc; Path=/',
+		'connection': 'keep-alive',
+		// empty duplicated custom origin headers seen in the wild — must not be forwarded
+		'x-origin-cc': '',
+		'x-origin-ttl': '',
+	});
+	assert.deepEqual(Object.keys(clean), ['content-type']);
+});
+
+test('sanitizeOriginResponseHeaders returns {} for null/undefined input', () => {
+	assert.deepEqual(sanitizeOriginResponseHeaders(null), {});
+	assert.deepEqual(sanitizeOriginResponseHeaders(undefined), {});
+});
+
+test('sanitizeOriginResponseHeaders matches allowlist case-insensitively (normalizes key)', () => {
+	const clean = sanitizeOriginResponseHeaders({ 'Content-Type': 'text/html', 'X-Akamai-Staging': 'ESSL' });
+	assert.equal(clean['content-type'], 'text/html');
+	assert.equal(clean['x-akamai-staging'], undefined);
+	assert.equal(clean['X-Akamai-Staging'], undefined);
 });
 
 test('resolveUpstreamHeaders drops a spoofed token/debug header even when configured mixed-case', () => {

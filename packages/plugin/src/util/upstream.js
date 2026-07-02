@@ -83,11 +83,57 @@ const ignoredDownstreamRequestHeaders = () => {
 	return ignoredHeadersCache;
 };
 
+// Origin responses are relayed to the edge on a cache miss. The origin sits behind a CDN
+// (Akamai), so its response carries the CDN's own control headers (akamai-grn, x-akamai-*,
+// x-cache*, via, server-timing, …). When the edge's "Serve Alternate Response" swap re-adds
+// its own copies the response ends up with duplicated CDN headers, and the edge fails the
+// transform (ERR_SWAPFAIL_*|badxform). Relay only this allowlist of genuine origin-response
+// headers so the swapped-in response looks like a clean origin reply; everything else (CDN
+// headers, hop-by-hop headers, set-cookie) is dropped.
+//
+// server-timing is deliberately NOT relayed: the value from the origin is the staging edge's
+// own Akamai timing tokens, and the serving edge adds its own on egress — so dropping the
+// origin's avoids re-doubling it and keeps Akamai-internal tokens off the response.
+//
+// NOTE: unlike the render path (RenderJob.allowedResponseHeaders), which strips the origin
+// encoding and re-encodes stored pages itself, the proxy path relays content-encoding +
+// content-length for the passed-through body. See the accept-encoding note in
+// resolveUpstreamHeaders for why the origin body is fetched gzip (not brotli).
+const FORWARDED_RESPONSE_HEADERS = new Set([
+	'content-type',
+	'content-encoding',
+	'content-length',
+	'cache-control',
+	'expires',
+	'etag',
+	'last-modified',
+	'vary',
+	'x-robots-tag',
+	'retry-after',
+]);
+
+export const sanitizeOriginResponseHeaders = (headers) => {
+	const clean = {};
+	if (!headers) return clean;
+	// HTTP header names are case-insensitive; match the allowlist on a lowercased key
+	// (undici lowercases already, but a future caller may not).
+	for (const [key, value] of Object.entries(headers)) {
+		if (value === undefined) continue;
+		const name = key.toLowerCase();
+		if (FORWARDED_RESPONSE_HEADERS.has(name)) clean[name] = value;
+	}
+	return clean;
+};
+
 export const resolveUpstreamHeaders = (downstream, deviceType) => {
 	const upstream = {
 		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
 		[config.securityToken.header]: config.securityToken.value,
-		'accept-encoding': 'br, gzip',
+		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
+		// to the Akamai edge for its "Serve Alternate Response" swap, and Akamai cannot apply
+		// its outgoing transform to a brotli-encoded alternate response (ERR_SWAPFAIL_*|badxform).
+		// gzip is transform-safe; the edge re-compresses (to br) for the real client on egress.
+		'accept-encoding': 'gzip',
 	};
 
 	if (downstream) {
@@ -120,17 +166,12 @@ export const fetchOriginResource = async (request) => {
 		body,
 	});
 
-	for (const key of hopByHopHeaders) {
-		delete response.headers[key];
-	}
-	delete response.headers['set-cookie'];
-
 	return {
 		miss: true,
 		url: urlObj.href,
 		deviceType,
 		statusCode: response.statusCode,
-		headers: response.headers,
+		headers: sanitizeOriginResponseHeaders(response.headers),
 		content: Readable.toWeb(response.body),
 		viaStaging: Boolean(stagingIp),
 	};
