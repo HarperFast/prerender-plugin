@@ -60,9 +60,10 @@ const BASE_IGNORED_HEADERS = [...hopByHopHeaders, 'host', 'user-agent', 'accept-
 // The full ignore set also includes the configurable security-token and debug
 // header names (so a client can't spoof them) plus any operator-configured
 // `ignoredHeaders`. Header names are matched case-insensitively — downstream
-// keys and the base set are lowercase, so configured names are lowered here.
-// Memoize the Set and rebuild only when those inputs change, instead of
-// allocating a Set on every origin fetch.
+// keys and the base set are lowercase, so every configurable name (token, debug,
+// and each ignoredHeaders entry) is lowercased here; otherwise a mixed-case
+// configured name would let a lowercase spoof slip past. Memoize the Set and
+// rebuild only when those inputs change, instead of allocating on every fetch.
 let ignoredHeadersCache = null;
 let ignoredHeadersKey = '';
 const ignoredDownstreamRequestHeaders = () => {
@@ -73,9 +74,9 @@ const ignoredDownstreamRequestHeaders = () => {
 	if (ignoredHeadersCache === null || key !== ignoredHeadersKey) {
 		ignoredHeadersCache = new Set([
 			...BASE_IGNORED_HEADERS,
-			tokenHeader,
-			debugKey,
-			...configured.map((name) => name.toLowerCase()),
+			String(tokenHeader).toLowerCase(),
+			String(debugKey).toLowerCase(),
+			...configured.map((name) => String(name).toLowerCase()),
 		]);
 		ignoredHeadersKey = key;
 	}
