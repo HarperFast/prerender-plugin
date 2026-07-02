@@ -83,18 +83,22 @@ const ignoredDownstreamRequestHeaders = () => {
 	return ignoredHeadersCache;
 };
 
-// Origin responses are relayed to the edge verbatim on a cache miss. The origin sits
-// behind a CDN (Akamai), so its response carries the CDN's own singular control headers
-// (akamai-grn, x-akamai-*, x-cache*, via, …). When the edge's "Serve Alternate Response"
-// swap re-adds its own copies, those singular headers appear twice and the edge fails the
+// Origin responses are relayed to the edge on a cache miss. The origin sits behind a CDN
+// (Akamai), so its response carries the CDN's own control headers (akamai-grn, x-akamai-*,
+// x-cache*, via, server-timing, …). When the edge's "Serve Alternate Response" swap re-adds
+// its own copies the response ends up with duplicated CDN headers, and the edge fails the
 // transform (ERR_SWAPFAIL_*|badxform). Relay only this allowlist of genuine origin-response
-// headers — the same sanitization philosophy the render path already applies to stored
-// pages — so the swapped-in response looks like a clean origin reply. Anything not listed
-// (including hop-by-hop headers and set-cookie) is dropped.
+// headers so the swapped-in response looks like a clean origin reply; everything else (CDN
+// headers, hop-by-hop headers, set-cookie) is dropped.
 //
-// server-timing is intentionally kept: it is a List-type header (RFC 8941), so the inner
-// value and the edge's own value merge into one valid header rather than a malformed
-// duplicate — and it is useful for observability.
+// server-timing is deliberately NOT relayed: the value from the origin is the staging edge's
+// own Akamai timing tokens, and the serving edge adds its own on egress — so dropping the
+// origin's avoids re-doubling it and keeps Akamai-internal tokens off the response.
+//
+// NOTE: unlike the render path (RenderJob.allowedResponseHeaders), which strips the origin
+// encoding and re-encodes stored pages itself, the proxy path relays content-encoding +
+// content-length for the passed-through body. See the accept-encoding note in
+// resolveUpstreamHeaders for why the origin body is fetched gzip (not brotli).
 const FORWARDED_RESPONSE_HEADERS = new Set([
 	'content-type',
 	'content-encoding',
@@ -106,7 +110,6 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
 	'vary',
 	'x-robots-tag',
 	'retry-after',
-	'server-timing',
 ]);
 
 export const sanitizeOriginResponseHeaders = (headers) => {

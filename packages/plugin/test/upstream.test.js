@@ -109,7 +109,6 @@ test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
 		'last-modified': 'Wed, 02 Jul 2026 00:00:00 GMT',
 		'vary': 'Accept-Encoding',
 		'x-robots-tag': 'noindex',
-		'server-timing': 'cdn-cache; desc=MISS',
 	});
 	assert.equal(clean['content-type'], 'text/html; charset=utf-8');
 	assert.equal(clean['content-encoding'], 'gzip');
@@ -118,8 +117,6 @@ test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
 	assert.equal(clean['etag'], '"abc"');
 	assert.equal(clean['vary'], 'Accept-Encoding');
 	assert.equal(clean['x-robots-tag'], 'noindex');
-	// server-timing is a List-type header (mergeable), so it is kept for observability
-	assert.equal(clean['server-timing'], 'cdn-cache; desc=MISS');
 });
 
 test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {
@@ -132,6 +129,7 @@ test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform c
 		'x-cache-key': '/L/1/2/3/foo',
 		'x-check-cacheable': 'NO',
 		'via': '1.1 akamai.net',
+		'server-timing': 'cdn-cache; desc=MISS',
 		'set-cookie': 'sid=abc; Path=/',
 		'connection': 'keep-alive',
 		// empty duplicated custom origin headers seen in the wild — must not be forwarded
