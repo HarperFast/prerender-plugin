@@ -63,6 +63,11 @@ rest: true # required for the @export-ed table REST endpoints
     key: x-harper-prerender-debug
     value: 'true'
 
+  ignoredHeaders: [] # extra request header names not forwarded to the origin, on top of the
+  #                    always-ignored set (hop-by-hop headers plus host, user-agent,
+  #                    accept-encoding, cookie, authorization, and the securityToken/debugHeader
+  #                    names); matched case-insensitively
+
   staging: # origin staging passthrough (see "Staging passthrough" below)
     ip: '' # staging edge IP; empty = disabled. When set, a cache-MISS fetch that carries
     #        the `header` request header connects here instead of the public origin.
