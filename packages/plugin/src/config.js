@@ -102,6 +102,12 @@ const defaultConfig = () => ({
 		value: 'true',
 	},
 
+	// Additional downstream request header names never forwarded to the origin, on
+	// top of the always-ignored set (hop-by-hop headers plus host, user-agent,
+	// accept-encoding, cookie, authorization, and the security-token/debug header
+	// names). Matched case-insensitively.
+	ignoredHeaders: [],
+
 	// Staging passthrough — for verifying an origin against a staging edge (e.g. the
 	// Akamai staging network). When `ip` is set, a cache-MISS origin fetch that carries
 	// the `header` request header is connected to `ip` instead of the public origin. The

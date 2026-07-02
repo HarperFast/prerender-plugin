@@ -58,22 +58,31 @@ const hopByHopHeaders = [
 const BASE_IGNORED_HEADERS = [...hopByHopHeaders, 'host', 'user-agent', 'accept-encoding', 'cookie', 'authorization'];
 
 // The full ignore set also includes the configurable security-token and debug
-// header names (so a client can't spoof them). Memoize it and rebuild only when
-// those names change, instead of allocating a Set on every origin fetch.
+// header names (so a client can't spoof them) plus any operator-configured
+// `ignoredHeaders`. Header names are matched case-insensitively — downstream
+// keys and the base set are lowercase, so configured names are lowered here.
+// Memoize the Set and rebuild only when those inputs change, instead of
+// allocating a Set on every origin fetch.
 let ignoredHeadersCache = null;
 let ignoredHeadersKey = '';
 const ignoredDownstreamRequestHeaders = () => {
 	const tokenHeader = config.securityToken.header;
 	const debugKey = config.debugHeader.key;
-	const key = `${tokenHeader} ${debugKey}`;
+	const configured = config.ignoredHeaders;
+	const key = `${tokenHeader} ${debugKey} ${configured.join(',')}`;
 	if (ignoredHeadersCache === null || key !== ignoredHeadersKey) {
-		ignoredHeadersCache = new Set([...BASE_IGNORED_HEADERS, tokenHeader, debugKey]);
+		ignoredHeadersCache = new Set([
+			...BASE_IGNORED_HEADERS,
+			tokenHeader,
+			debugKey,
+			...configured.map((name) => name.toLowerCase()),
+		]);
 		ignoredHeadersKey = key;
 	}
 	return ignoredHeadersCache;
 };
 
-const resolveUpstreamHeaders = (downstream, deviceType) => {
+export const resolveUpstreamHeaders = (downstream, deviceType) => {
 	const upstream = {
 		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
 		[config.securityToken.header]: config.securityToken.value,
