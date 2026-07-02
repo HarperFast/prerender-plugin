@@ -95,7 +95,7 @@ const ignoredDownstreamRequestHeaders = () => {
 // server-timing is intentionally kept: it is a List-type header (RFC 8941), so the inner
 // value and the edge's own value merge into one valid header rather than a malformed
 // duplicate — and it is useful for observability.
-const FORWARDED_RESPONSE_HEADERS = [
+const FORWARDED_RESPONSE_HEADERS = new Set([
 	'content-type',
 	'content-encoding',
 	'content-length',
@@ -107,13 +107,17 @@ const FORWARDED_RESPONSE_HEADERS = [
 	'x-robots-tag',
 	'retry-after',
 	'server-timing',
-];
+]);
 
 export const sanitizeOriginResponseHeaders = (headers) => {
 	const clean = {};
-	for (const key of FORWARDED_RESPONSE_HEADERS) {
-		const value = headers[key];
-		if (value !== undefined) clean[key] = value;
+	if (!headers) return clean;
+	// HTTP header names are case-insensitive; match the allowlist on a lowercased key
+	// (undici lowercases already, but a future caller may not).
+	for (const [key, value] of Object.entries(headers)) {
+		if (value === undefined) continue;
+		const name = key.toLowerCase();
+		if (FORWARDED_RESPONSE_HEADERS.has(name)) clean[name] = value;
 	}
 	return clean;
 };
@@ -122,7 +126,11 @@ export const resolveUpstreamHeaders = (downstream, deviceType) => {
 	const upstream = {
 		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
 		[config.securityToken.header]: config.securityToken.value,
-		'accept-encoding': 'br, gzip',
+		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
+		// to the Akamai edge for its "Serve Alternate Response" swap, and Akamai cannot apply
+		// its outgoing transform to a brotli-encoded alternate response (ERR_SWAPFAIL_*|badxform).
+		// gzip is transform-safe; the edge re-compresses (to br) for the real client on egress.
+		'accept-encoding': 'gzip',
 	};
 
 	if (downstream) {

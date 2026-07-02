@@ -134,8 +134,23 @@ test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform c
 		'via': '1.1 akamai.net',
 		'set-cookie': 'sid=abc; Path=/',
 		'connection': 'keep-alive',
+		// empty duplicated custom origin headers seen in the wild — must not be forwarded
+		'x-origin-cc': '',
+		'x-origin-ttl': '',
 	});
 	assert.deepEqual(Object.keys(clean), ['content-type']);
+});
+
+test('sanitizeOriginResponseHeaders returns {} for null/undefined input', () => {
+	assert.deepEqual(sanitizeOriginResponseHeaders(null), {});
+	assert.deepEqual(sanitizeOriginResponseHeaders(undefined), {});
+});
+
+test('sanitizeOriginResponseHeaders matches allowlist case-insensitively (normalizes key)', () => {
+	const clean = sanitizeOriginResponseHeaders({ 'Content-Type': 'text/html', 'X-Akamai-Staging': 'ESSL' });
+	assert.equal(clean['content-type'], 'text/html');
+	assert.equal(clean['x-akamai-staging'], undefined);
+	assert.equal(clean['X-Akamai-Staging'], undefined);
 });
 
 test('resolveUpstreamHeaders drops a spoofed token/debug header even when configured mixed-case', () => {
