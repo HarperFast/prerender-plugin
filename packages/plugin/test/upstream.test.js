@@ -60,7 +60,7 @@ test('ignoredHeaders defaults to an empty list', () => {
 
 test('resolveUpstreamHeaders forwards arbitrary downstream headers by default', () => {
 	applyOptions({});
-	const upstream = resolveUpstreamHeaders({ 'x-custom': 'keep', referer: 'https://example.com' }, 'desktop');
+	const upstream = resolveUpstreamHeaders({ 'x-custom': 'keep', 'referer': 'https://example.com' }, 'desktop');
 	assert.equal(upstream['x-custom'], 'keep');
 	assert.equal(upstream['referer'], 'https://example.com');
 });
@@ -69,9 +69,9 @@ test('resolveUpstreamHeaders always drops the base-ignored and security/debug he
 	applyOptions({});
 	const upstream = resolveUpstreamHeaders(
 		{
-			host: 'evil.example',
-			cookie: 'session=abc',
-			authorization: 'Bearer x',
+			'host': 'evil.example',
+			'cookie': 'session=abc',
+			'authorization': 'Bearer x',
 			'x-harper-renderer-bypass': 'spoofed',
 			'x-harper-prerender-debug': 'true',
 		},
@@ -87,10 +87,7 @@ test('resolveUpstreamHeaders always drops the base-ignored and security/debug he
 
 test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
 	applyOptions({ ignoredHeaders: ['x-internal', 'x-trace-id'] });
-	const upstream = resolveUpstreamHeaders(
-		{ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' },
-		'desktop'
-	);
+	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' }, 'desktop');
 	assert.equal(upstream['x-internal'], undefined);
 	assert.equal(upstream['x-trace-id'], undefined);
 	assert.equal(upstream['x-keep'], 'yes');
@@ -100,6 +97,16 @@ test('resolveUpstreamHeaders matches ignoredHeaders case-insensitively', () => {
 	applyOptions({ ignoredHeaders: ['X-Internal'] });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret' }, 'desktop');
 	assert.equal(upstream['x-internal'], undefined);
+});
+
+test('resolveUpstreamHeaders drops a spoofed token/debug header even when configured mixed-case', () => {
+	// Incoming keys are lowercased, so a mixed-case configured name must still match.
+	applyOptions({ securityToken: { header: 'X-Harper-Token', value: 'real' }, debugHeader: { key: 'X-Harper-Debug' } });
+	const upstream = resolveUpstreamHeaders({ 'x-harper-token': 'spoofed', 'x-harper-debug': 'true' }, 'desktop');
+	assert.equal(upstream['x-harper-token'], undefined);
+	assert.equal(upstream['x-harper-debug'], undefined);
+	// the real token is still attached under the configured header name
+	assert.equal(upstream['X-Harper-Token'], 'real');
 });
 
 test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions (memo rebuild)', () => {
