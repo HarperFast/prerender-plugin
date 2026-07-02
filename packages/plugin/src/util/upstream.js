@@ -83,6 +83,41 @@ const ignoredDownstreamRequestHeaders = () => {
 	return ignoredHeadersCache;
 };
 
+// Origin responses are relayed to the edge verbatim on a cache miss. The origin sits
+// behind a CDN (Akamai), so its response carries the CDN's own singular control headers
+// (akamai-grn, x-akamai-*, x-cache*, via, …). When the edge's "Serve Alternate Response"
+// swap re-adds its own copies, those singular headers appear twice and the edge fails the
+// transform (ERR_SWAPFAIL_*|badxform). Relay only this allowlist of genuine origin-response
+// headers — the same sanitization philosophy the render path already applies to stored
+// pages — so the swapped-in response looks like a clean origin reply. Anything not listed
+// (including hop-by-hop headers and set-cookie) is dropped.
+//
+// server-timing is intentionally kept: it is a List-type header (RFC 8941), so the inner
+// value and the edge's own value merge into one valid header rather than a malformed
+// duplicate — and it is useful for observability.
+const FORWARDED_RESPONSE_HEADERS = [
+	'content-type',
+	'content-encoding',
+	'content-length',
+	'cache-control',
+	'expires',
+	'etag',
+	'last-modified',
+	'vary',
+	'x-robots-tag',
+	'retry-after',
+	'server-timing',
+];
+
+export const sanitizeOriginResponseHeaders = (headers) => {
+	const clean = {};
+	for (const key of FORWARDED_RESPONSE_HEADERS) {
+		const value = headers[key];
+		if (value !== undefined) clean[key] = value;
+	}
+	return clean;
+};
+
 export const resolveUpstreamHeaders = (downstream, deviceType) => {
 	const upstream = {
 		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
@@ -120,17 +155,12 @@ export const fetchOriginResource = async (request) => {
 		body,
 	});
 
-	for (const key of hopByHopHeaders) {
-		delete response.headers[key];
-	}
-	delete response.headers['set-cookie'];
-
 	return {
 		miss: true,
 		url: urlObj.href,
 		deviceType,
 		statusCode: response.statusCode,
-		headers: response.headers,
+		headers: sanitizeOriginResponseHeaders(response.headers),
 		content: Readable.toWeb(response.body),
 		viaStaging: Boolean(stagingIp),
 	};
