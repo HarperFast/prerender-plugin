@@ -72,6 +72,19 @@ test('composeHostResolverRulesArg builds the Chrome flag and drops empty entries
 	);
 });
 
+test('composeHostResolverRulesArg rejects values with whitespace or commas (rule injection)', () => {
+	// A comma in a value would inject a second rule (e.g. a wildcard remap of every host).
+	assert.throws(
+		() => composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27,MAP * 1.1.1.1' }),
+		/must not contain whitespace or commas/
+	);
+	assert.throws(
+		() => composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27 1.1.1.1' }),
+		/must not contain whitespace or commas/
+	);
+	assert.throws(() => composeHostResolverRulesArg({ 'bad host': '1.2.3.4' }), /must not contain whitespace or commas/);
+});
+
 test('hostResolverRules appends --host-resolver-rules onto the default chrome args', () => {
 	applySettings({ harper: HARPER, hostResolverRules: { 'www.kohls.com': '23.50.51.27' } });
 	assert.deepEqual(settings.hostResolverRules, { 'www.kohls.com': '23.50.51.27' });

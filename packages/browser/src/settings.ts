@@ -114,11 +114,26 @@ const DEFAULT_CHROME_ARGS = [
  * Compose Chrome's `--host-resolver-rules` flag from a hostname → IP map, or return
  * null when there are no (valid) rules. Entries with an empty host or IP are dropped.
  * Multiple rules are comma-joined, e.g. `--host-resolver-rules=MAP a 1.1.1.1,MAP b 2.2.2.2`.
+ *
+ * Values are trimmed and must not contain whitespace or commas — those are the flag's
+ * own separators, so a stray one would silently corrupt the grammar (e.g. an IP of
+ * `1.1.1.1,MAP * 2.2.2.2` injects a second wildcard rule remapping every host). A bad
+ * entry throws at resolve time (startup) rather than mis-pointing renders. Legitimate
+ * values — wildcards (`*.example.com`), `host:port`, IPv6 literals — contain neither.
  */
 export const composeHostResolverRulesArg = (rules?: Record<string, string>): string | null => {
-	const maps = Object.entries(rules ?? {})
-		.filter(([host, ip]) => host?.trim() && ip?.trim())
-		.map(([host, ip]) => `MAP ${host.trim()} ${ip.trim()}`);
+	const maps: string[] = [];
+	for (const [rawHost, rawIp] of Object.entries(rules ?? {})) {
+		const host = rawHost.trim();
+		const ip = (rawIp ?? '').trim();
+		if (!host || !ip) continue; // unset entry — skip
+		if (/[\s,]/.test(host) || /[\s,]/.test(ip)) {
+			throw new Error(
+				`hostResolverRules: entry "${host}" → "${ip}" is invalid — host and IP must not contain whitespace or commas`
+			);
+		}
+		maps.push(`MAP ${host} ${ip}`);
+	}
 	return maps.length ? `--host-resolver-rules=${maps.join(',')}` : null;
 };
 
