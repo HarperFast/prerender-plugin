@@ -53,7 +53,12 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 			limit: number
 		): Promise<{ jobs: RenderJob[]; outcome: ClaimOutcome; retryAfterMs?: number }> => {
 			try {
-				const res = await request(`http://${host}:${settings.queuePort}`, {
+				// The queue API port is TLS in every real deployment; only a local dev Harper
+				// is plaintext. Speaking http:// to the TLS port gets the connection closed with
+				// no response (undici "other side closed"), so default to https and use http only
+				// for a localhost origin — mirrors the plugin's callbackOrigin scheme choice.
+				const scheme = host === 'localhost' || host === '127.0.0.1' ? 'http' : 'https';
+				const res = await request(`${scheme}://${host}:${settings.queuePort}`, {
 					method: 'POST',
 					path: '/render_queue/claim',
 					body: JSON.stringify({ limit }),

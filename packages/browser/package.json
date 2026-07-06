@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/prerender-browser",
-	"version": "1.5.0",
+	"version": "1.5.1",
 	"type": "module",
 	"description": "Headless-browser render library for Harper Prerender: claims render jobs from the @harperfast/prerender queue, renders pages in headless Chrome (Puppeteer), and posts the HTML back. Embedded by a render service and configured entirely via startWorker() options.",
 	"keywords": [
