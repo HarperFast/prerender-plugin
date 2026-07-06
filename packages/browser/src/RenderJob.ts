@@ -1,7 +1,25 @@
+import { setTimeout as sleep } from 'timers/promises';
 import { request } from './external/http.js';
 import logger from './util/Logger.js';
 import { settings } from './settings.js';
 import { encode } from './util/encoder.js';
+import { getHostHealth, parseRetryAfter } from './HostHealth.js';
+
+// Result-POST failures worth retrying: transient overload/gateway errors. Anything else
+// (e.g. a 4xx) is a bug, not a blip — logged and dropped (the lease expires → re-render).
+const RESULT_RETRIABLE_STATUS = new Set([429, 502, 503, 504]);
+
+// Cap on the sleep BETWEEN result-POST attempts. This is deliberately small and independent
+// of the (up-to-30s) circuit backoff: `render()` awaits `sendResult()` inside a CONCURRENCY
+// slot, so a long sleep pins a slot. The host-level backoff (honoring Retry-After) is applied
+// to the shared circuit via recordUnavailable; this only spaces out THIS render's few retries.
+const RESULT_MAX_SLEEP_MS = 5000;
+
+/** Backoff (ms) between result-POST attempts: exponential + equal jitter, capped small. */
+const resultBackoffMs = (attempt: number): number => {
+	const exp = Math.min(RESULT_MAX_SLEEP_MS, settings.backoff.minMs * 2 ** (attempt - 1));
+	return Math.round(exp / 2 + Math.random() * (exp / 2));
+};
 
 export type JobConfig = {
 	id: string;
@@ -110,55 +128,86 @@ export default class RenderJob {
 	}
 
 	async sendResult() {
+		const health = getHostHealth();
+		let host = '';
 		try {
-			const metadata = {
-				id: this.id,
-				url: this.url,
-				statusCode: this.httpResponse?.statusCode,
-				headers: {} as Record<string, string>,
-				renderTime: undefined as number | undefined,
-				redirectedTo: this.redirectedTo,
-				isIndexable: this.isIndexable,
-			};
+			host = new URL(this.callbackOrigin).hostname;
+		} catch {
+			// Malformed callbackOrigin — can't track host health, but still attempt the POST.
+		}
 
-			if (this.httpResponse) {
-				Object.entries(this.httpResponse.headers).forEach(([key, val]) => {
-					metadata.headers[key] = val;
-				});
-			}
-			if (this.latestAttempt?.renderEndTime) {
-				metadata.renderTime = this.latestAttempt.renderEndTime - this.latestAttempt.renderStartTime;
-			}
-
-			let contentBuffer: Buffer | null = null;
-
-			if (this.content) {
-				metadata.headers['content-encoding'] = settings.contentEncoding;
-				const compressed = await encode(this.content, settings.contentEncoding);
-				contentBuffer = compressed;
-			}
-
-			const metadataBuffer = Buffer.from(JSON.stringify(metadata), 'utf-8');
-
-			const res = await request(this.callbackOrigin, {
-				method: 'POST',
-				path: '/render_queue/job_result',
-				body: contentBuffer
-					? Buffer.concat([metadataBuffer, contentBuffer], metadataBuffer.byteLength + contentBuffer.byteLength)
-					: metadataBuffer,
-				headers: {
-					'x-metadata-size': metadataBuffer.byteLength.toString(),
-					'content-type': 'application/octet-stream',
-				},
+		// Build the payload (incl. the expensive gzip) ONCE; retries re-send the same bytes.
+		const metadata = {
+			id: this.id,
+			url: this.url,
+			statusCode: this.httpResponse?.statusCode,
+			headers: {} as Record<string, string>,
+			renderTime: undefined as number | undefined,
+			redirectedTo: this.redirectedTo,
+			isIndexable: this.isIndexable,
+		};
+		if (this.httpResponse) {
+			Object.entries(this.httpResponse.headers).forEach(([key, val]) => {
+				metadata.headers[key] = val;
 			});
+		}
+		if (this.latestAttempt?.renderEndTime) {
+			metadata.renderTime = this.latestAttempt.renderEndTime - this.latestAttempt.renderStartTime;
+		}
 
-			if (res.statusCode !== 204) {
-				throw new Error(`Failed to send job result: ${res.statusCode} ${await res.body.text()}`);
-			} else {
-				await res.body.bytes();
+		let contentBuffer: Buffer | null = null;
+		if (this.content) {
+			metadata.headers['content-encoding'] = settings.contentEncoding;
+			contentBuffer = await encode(this.content, settings.contentEncoding);
+		}
+		const metadataBuffer = Buffer.from(JSON.stringify(metadata), 'utf-8');
+		const body = contentBuffer
+			? Buffer.concat([metadataBuffer, contentBuffer], metadataBuffer.byteLength + contentBuffer.byteLength)
+			: metadataBuffer;
+
+		// Retry transient failures (503/overload/network) so an expensive render isn't thrown
+		// away on a blip — bounded by the retry cap AND the job's lease (`expiresAt`), after
+		// which Harper may have re-leased it, so posting is pointless.
+		const maxAttempts = Math.max(1, settings.backoff.resultRetries + 1);
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				const res = await request(this.callbackOrigin, {
+					method: 'POST',
+					path: '/render_queue/job_result',
+					body,
+					headers: {
+						'x-metadata-size': metadataBuffer.byteLength.toString(),
+						'content-type': 'application/octet-stream',
+					},
+				});
+
+				if (res.statusCode === 204) {
+					await res.body.bytes();
+					if (host) health.recordSuccess(host);
+					return;
+				}
+
+				const text = await res.body.text().catch(() => '');
+				if (RESULT_RETRIABLE_STATUS.has(res.statusCode)) {
+					const retryAfterMs = parseRetryAfter(res.headers['retry-after'] as string | string[] | undefined);
+					if (host) health.recordUnavailable(host, retryAfterMs);
+					if (attempt < maxAttempts && Date.now() < this.expiresAt) {
+						await sleep(resultBackoffMs(attempt));
+						continue;
+					}
+				}
+				logger.error({ id: this.id, statusCode: res.statusCode, body: text, attempt }, 'failed to send job result');
+				return;
+			} catch (e) {
+				// Network error — host unreachable.
+				if (host) health.recordUnavailable(host);
+				if (attempt < maxAttempts && Date.now() < this.expiresAt) {
+					await sleep(resultBackoffMs(attempt));
+					continue;
+				}
+				logger.error({ id: this.id, err: e, attempt }, 'failed to send job result');
+				return;
 			}
-		} catch (e) {
-			logger.error(e);
 		}
 	}
 }
