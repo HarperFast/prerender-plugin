@@ -190,6 +190,12 @@ export default class RenderWorker {
 		if (this.browser) {
 			this.browser.close().catch(noop);
 		}
+		// A browser mid-launch isn't in `this.browser` yet; close it once it resolves so a
+		// destroy() during launch (shutdown drain deadline, or an uncaught exception) doesn't
+		// orphan the Chrome process.
+		if (this.browserPromise) {
+			this.browserPromise.then((b) => b.close().catch(noop)).catch(noop);
+		}
 		this.retiredBrowsers.forEach((browser) => {
 			browser.close().catch(noop);
 		});

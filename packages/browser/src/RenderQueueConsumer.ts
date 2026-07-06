@@ -27,55 +27,58 @@ interface ProducerState {
 export async function* RenderQueueConsumer(signal?: AbortSignal) {
 	const mqttClient = await connectMqtt();
 
-	const producerStates = new Map<string, ProducerState>();
+	// try wraps ALL setup after connectMqtt (message handler, subscribe, loop) so a failure
+	// during setup — e.g. subscribeAsync throwing — still closes the MQTT client in `finally`
+	// instead of leaking the connection.
+	try {
+		const producerStates = new Map<string, ProducerState>();
 
-	mqttClient.on('message', (_topic, payload) => {
-		const queueState = JSON.parse(payload.toString());
-		producerStates.set(queueState.hostname, queueState);
-	});
-
-	await mqttClient.subscribeAsync(Topic.queueState, { qos: 1, rh: 0 });
-
-	const pickAvailableQueueHost: () => string | null = () => {
-		const eligibleHosts: string[] = [];
-
-		producerStates.forEach((producer) => {
-			if (producer.status === ProducerStatus.queued) {
-				eligibleHosts.push(producer.hostname);
-			}
+		mqttClient.on('message', (_topic, payload) => {
+			const queueState = JSON.parse(payload.toString());
+			producerStates.set(queueState.hostname, queueState);
 		});
 
-		if (eligibleHosts.length === 0) return null;
+		await mqttClient.subscribeAsync(Topic.queueState, { qos: 1, rh: 0 });
 
-		return eligibleHosts[Math.floor(Math.random() * eligibleHosts.length)];
-	};
+		const pickAvailableQueueHost: () => string | null = () => {
+			const eligibleHosts: string[] = [];
 
-	const claimJobs = async (host: string, limit: number): Promise<RenderJob[]> => {
-		try {
-			const res = await request(`http://${host}:${settings.queuePort}`, {
-				method: 'POST',
-				path: '/render_queue/claim',
-				body: JSON.stringify({
-					limit,
-				}),
-				headers: {
-					'content-type': 'application/json',
-				},
+			producerStates.forEach((producer) => {
+				if (producer.status === ProducerStatus.queued) {
+					eligibleHosts.push(producer.hostname);
+				}
 			});
-			if (res.statusCode === 200) {
-				const jobs: any = await res.body.json();
-				return jobs.map((job: any) => new RenderJob(job));
-			} else {
-				logger.error(res.body.json());
+
+			if (eligibleHosts.length === 0) return null;
+
+			return eligibleHosts[Math.floor(Math.random() * eligibleHosts.length)];
+		};
+
+		const claimJobs = async (host: string, limit: number): Promise<RenderJob[]> => {
+			try {
+				const res = await request(`http://${host}:${settings.queuePort}`, {
+					method: 'POST',
+					path: '/render_queue/claim',
+					body: JSON.stringify({
+						limit,
+					}),
+					headers: {
+						'content-type': 'application/json',
+					},
+				});
+				if (res.statusCode === 200) {
+					const jobs: any = await res.body.json();
+					return jobs.map((job: any) => new RenderJob(job));
+				} else {
+					logger.error(res.body.json());
+					return [];
+				}
+			} catch (e) {
+				logger.error(e);
 				return [];
 			}
-		} catch (e) {
-			logger.error(e);
-			return [];
-		}
-	};
+		};
 
-	try {
 		while (!signal?.aborted) {
 			const host = pickAvailableQueueHost();
 
