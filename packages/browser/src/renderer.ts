@@ -2,6 +2,7 @@ import { Renderer } from './Worker.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
+import { normalizeUrlForCompare, canonicalAllowsIndex } from './util/url.js';
 
 const noop = () => {};
 
@@ -33,12 +34,6 @@ class RemainingTimer {
 		return Math.max(1, this.maxBudget - elapsed);
 	}
 }
-
-const normalizeUrlForCompare = (url: string | URL): string => {
-	const parsed = new URL(url);
-	parsed.searchParams.sort();
-	return decodeURI(parsed.href);
-};
 
 const renderer: Renderer = async (page, job) => {
 	const { url, deviceType } = job;
@@ -269,7 +264,8 @@ const renderer: Renderer = async (page, job) => {
 		}
 
 		if (statusCode === 200) {
-			job.isIndexable = await page.evaluate(isIndexableFromContent, pageUrl);
+			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
+			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, pageUrl);
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
@@ -337,40 +333,24 @@ function countDomElements() {
 	return n;
 }
 
-function isIndexableFromContent(pageUrl: string) {
-	const normalizeUrl = (url: string) => {
-		try {
-			const parsed = new URL(url);
-			parsed.hash = '';
-			let href = parsed.href;
-			href = href.endsWith('/') ? href.substring(0, href.length - 1) : href;
-			return decodeURI(href);
-		} catch {
-			return url;
-		}
-	};
-	let isIndexable = true;
+// Read indexability signals from the rendered DOM. DOM extraction only — the URL comparison
+// lives in Node (util/url.ts) so it is unit-tested and can't drift from the redirect
+// normalizer. (That drift is exactly what marked self-canonical pages non-indexable: the
+// canonical's literal `:` never matched the request's `%3A`.)
+function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
+	let canonicalHref: string | null = null;
+	let noindex = false;
 
 	document.querySelectorAll('link[rel="canonical"], meta[name="robots"], meta[name="googlebot"]').forEach((el) => {
-		if (isIndexable === false) return;
-		const tagName = el.tagName.toLowerCase();
-
-		if (tagName === 'link') {
-			const href = el.getAttribute('href');
-			if (href && href !== pageUrl) {
-				const canonicalUrl = normalizeUrl(href);
-				const currentUrl = normalizeUrl(pageUrl);
-
-				if (canonicalUrl !== currentUrl) {
-					isIndexable = false;
-				}
-			}
-		} else if (tagName === 'meta') {
-			if (el.getAttribute('content')?.includes('noindex')) isIndexable = false;
+		if (el.tagName.toLowerCase() === 'link') {
+			// First canonical wins (multiple canonicals is invalid HTML anyway).
+			if (canonicalHref === null) canonicalHref = el.getAttribute('href');
+		} else if (el.getAttribute('content')?.includes('noindex')) {
+			noindex = true;
 		}
 	});
 
-	return isIndexable;
+	return { canonicalHref, noindex };
 }
 
 function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = []) {
