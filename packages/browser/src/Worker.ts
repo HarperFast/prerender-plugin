@@ -55,6 +55,12 @@ export default class RenderWorker {
 
 	lastRenderStartTime = Date.now();
 
+	// Set on graceful shutdown: stops the consumer loop and blocks new renders while
+	// in-flight ones drain.
+	private shuttingDown = false;
+
+	private consumerAbort = new AbortController();
+
 	constructor(config: RenderWorkerConfig) {
 		this.browserLaunchOptions = config.browserLaunchOptions;
 		this.CONCURRENCY = config.maxConcurrency ?? 5;
@@ -83,7 +89,8 @@ export default class RenderWorker {
 	}
 
 	async run() {
-		for await (const job of RenderQueueConsumer()) {
+		for await (const job of RenderQueueConsumer(this.consumerAbort.signal)) {
+			if (this.shuttingDown) break;
 			const ts = Date.now();
 			// Do not run expired jobs to prevent double rendering
 			if (job.expiresAt - ts < 30 * 1000) {
@@ -104,7 +111,10 @@ export default class RenderWorker {
 			}
 			this.lastRenderStartTime = Date.now();
 			const p = this.render(job)
-				.catch(logger.error)
+				// NB: pino logger methods rely on `this`; passing `logger.error` bare makes it throw
+				// (`Cannot read properties of undefined (reading Symbol(pino.msgPrefix))`) when a render
+				// rejects, turning a logged failure into an unhandledRejection that kills the worker.
+				.catch((err) => logger.error({ err }, 'failed to render job'))
 				.finally(() => {
 					this.inflight.delete(p);
 				});
@@ -146,7 +156,31 @@ export default class RenderWorker {
 		});
 	}
 
+	/**
+	 * Graceful shutdown: stop claiming new jobs, let in-flight renders finish (so their
+	 * results are posted back instead of silently dropped and re-queued), then tear down.
+	 * Bounded by `deadlineMs` so a stuck render can't outlast the supervisor's SIGKILL grace.
+	 */
+	async shutdown(deadlineMs = 12000) {
+		if (this.shuttingDown) return;
+		this.shuttingDown = true;
+		logger.info({ inflight: this.inflight.size }, 'worker shutting down — draining in-flight renders');
+		this.consumerAbort.abort();
+
+		// NB: `setTimeout` here is the promise-based timers/promises import (see top of file).
+		// Use an AbortController to cancel the deadline timer once the drain wins, and swallow
+		// the resulting abort rejection.
+		const ac = new AbortController();
+		const deadline = setTimeout(deadlineMs, undefined, { signal: ac.signal }).catch(() => {});
+		await Promise.race([Promise.allSettled([...this.inflight]), deadline]);
+		ac.abort();
+
+		this.destroy();
+		logger.info('worker shutdown complete');
+	}
+
 	destroy() {
+		clearInterval(this.logStatsInterval);
 		if (this.browserCleanupInterval !== null) {
 			clearInterval(this.browserCleanupInterval);
 			this.browserCleanupInterval = null;

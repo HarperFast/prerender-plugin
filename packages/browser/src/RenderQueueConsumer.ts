@@ -24,7 +24,7 @@ interface ProducerState {
 	lastUpdated: Date;
 }
 
-export async function* RenderQueueConsumer() {
+export async function* RenderQueueConsumer(signal?: AbortSignal) {
 	const mqttClient = await connectMqtt();
 
 	const producerStates = new Map<string, ProducerState>();
@@ -75,18 +75,28 @@ export async function* RenderQueueConsumer() {
 		}
 	};
 
-	while (true) {
-		const host = pickAvailableQueueHost();
+	try {
+		while (!signal?.aborted) {
+			const host = pickAvailableQueueHost();
 
-		if (!host) {
-			await sleep(Math.random() * SLEEP_DELAY);
-			continue;
+			if (!host) {
+				try {
+					// Abortable so a graceful shutdown doesn't wait out the (up to 60s) idle poll.
+					await sleep(Math.random() * SLEEP_DELAY, undefined, { signal });
+				} catch {
+					break; // aborted during the idle sleep
+				}
+				continue;
+			}
+
+			const jobs = await claimJobs(host, settings.jobClaimLimit);
+
+			for (const job of jobs) {
+				if (signal?.aborted) return;
+				yield job;
+			}
 		}
-
-		const jobs = await claimJobs(host, settings.jobClaimLimit);
-
-		for (const job of jobs) {
-			yield job;
-		}
+	} finally {
+		await mqttClient.endAsync().catch(() => {});
 	}
 }

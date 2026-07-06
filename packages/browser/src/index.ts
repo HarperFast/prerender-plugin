@@ -47,10 +47,6 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 	applySettings(browserOptions);
 	const renderer = customRenderer ?? defaultRenderer;
 
-	if (installSignalHandlers !== false) {
-		new ErrorHandler();
-	}
-
 	logger.info({
 		event: 'prerender-browser-config',
 		customRenderer: Boolean(customRenderer),
@@ -77,6 +73,12 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 		},
 		renderer,
 	});
+
+	// Install signal handlers AFTER the worker exists so SIGTERM/SIGINT can drain it
+	// (stop claiming, finish in-flight renders) instead of dropping in-flight work.
+	if (installSignalHandlers !== false) {
+		new ErrorHandler({ onTerminate: () => worker.shutdown() });
+	}
 
 	worker.run();
 	return worker;
