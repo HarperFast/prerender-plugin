@@ -72,9 +72,11 @@ export default class RenderWorker {
 		}, 10000);
 		this.browserCleanupInterval.unref();
 
-		process.on('uncaughtException', (err) => {
+		process.on('uncaughtException', async (err) => {
 			logger.error({ err }, 'uncaught exception');
-			this.destroy();
+			// Await so browsers are actually closed before the event loop dies (otherwise Chrome
+			// is orphaned). ManagedBrowser.close() has its own SIGKILL fallback if it hangs.
+			await this.destroy().catch(() => {});
 			process.exit(1);
 		});
 
@@ -175,26 +177,37 @@ export default class RenderWorker {
 		await Promise.race([Promise.allSettled([...this.inflight]), deadline]);
 		ac.abort();
 
-		this.destroy();
+		await this.destroy();
 		logger.info('worker shutdown complete');
 	}
 
-	destroy() {
+	// Async so callers can AWAIT it before process.exit() — otherwise the event loop dies before
+	// the browser .close() promises run and Chrome is orphaned (the whole point of closing here).
+	async destroy() {
 		clearInterval(this.logStatsInterval);
 		if (this.browserCleanupInterval !== null) {
 			clearInterval(this.browserCleanupInterval);
 			this.browserCleanupInterval = null;
 		}
 
-		// close all browsers
+		const closing: Promise<void>[] = [];
 		if (this.browser) {
-			this.browser.close().catch(noop);
+			closing.push(this.browser.close().catch(noop));
+		}
+		// A browser mid-launch isn't in `this.browser` yet; close it once it resolves so a
+		// destroy() during launch (shutdown drain deadline, or an uncaught exception) doesn't
+		// orphan the Chrome process.
+		if (this.browserPromise) {
+			closing.push(this.browserPromise.then((b) => b.close().catch(noop)).catch(noop));
 		}
 		this.retiredBrowsers.forEach((browser) => {
-			browser.close().catch(noop);
+			closing.push(browser.close().catch(noop));
 		});
+
 		this.browser = null;
 		this.retiredBrowsers.clear();
+
+		await Promise.all(closing);
 	}
 
 	closeRetiredBrowsers() {

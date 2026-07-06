@@ -53,20 +53,29 @@ export class ErrorHandler {
 	}
 
 	private async handleTermination(signal: string) {
-		if (this.terminating) return; // ignore a second SIGTERM/SIGINT while already draining
+		if (this.terminating) {
+			// A second signal (e.g. an impatient Ctrl+C) forces an immediate, unclean exit
+			// instead of waiting out the drain.
+			logger.warn({ signal }, 'Second termination signal — forcing exit');
+			process.exit(1);
+		}
 		this.terminating = true;
 		logger.info({ signal }, 'Termination signal received');
 
-		// Hard backstop: if the drain hangs, still exit before the supervisor SIGKILLs us.
-		const backstop = setTimeout(() => process.exit(0), this.shutdownDeadlineMs);
+		// Hard backstop: if the drain hangs, exit before the supervisor SIGKILLs us — with a
+		// NON-zero code so the orchestrator sees an unclean/timed-out shutdown, not a clean one.
+		const backstop = setTimeout(() => process.exit(1), this.shutdownDeadlineMs);
 		backstop.unref();
+		let exitCode = 0;
 		try {
 			await this.onTerminate?.();
 		} catch (err) {
+			// The drain failed/was incomplete — signal an unclean shutdown to the orchestrator.
 			logger.error({ err }, 'error during graceful shutdown');
+			exitCode = 1;
 		}
 		clearTimeout(backstop);
-		process.exit(0);
+		process.exit(exitCode);
 	}
 
 	private gracefulShutdown(exitCode: number) {
