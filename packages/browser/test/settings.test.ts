@@ -22,7 +22,22 @@ test('applies defaults and derives jobClaimLimit from concurrency', () => {
 	assert.equal(settings.bypass.header, 'x-harper-renderer-bypass');
 	assert.equal(settings.contentEncoding, 'gzip');
 	assert.equal(settings.resourceCache.enabled, true);
+	assert.deepEqual(settings.backoff, {
+		idleMs: 15000,
+		minMs: 1000,
+		maxMs: 30000,
+		pausedMs: 30000,
+		maxIdleMs: 60000,
+		resultRetries: 3,
+	});
 	assert.deepEqual(settings.config, defaultConfig());
+});
+
+test('backoff options override defaults (partial merge)', () => {
+	applySettings({ harper: HARPER, backoff: { idleMs: 5000, resultRetries: 1 } });
+	assert.equal(settings.backoff.idleMs, 5000);
+	assert.equal(settings.backoff.resultRetries, 1);
+	assert.equal(settings.backoff.maxMs, 30000); // untouched default preserved
 });
 
 test('options override defaults', () => {

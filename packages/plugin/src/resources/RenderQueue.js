@@ -151,27 +151,33 @@ export class RenderQueue extends Resource {
 		}
 
 		const currentMinute = currentMinuteMs();
-		const it = RenderSchedule.search(
-			{
-				conditions: [
-					{
+		// Fully drain the search (read) transaction into memory BEFORE issuing any
+		// RenderSchedule.put leases. Interleaving the puts inside the `for await` keeps the
+		// read cursor's transaction open across the writes, which pins the log and blocks
+		// reclamation; reading first releases it promptly (same pattern as refreshQueueStatus).
+		const schedules = await Array.fromAsync(
+			RenderSchedule.search(
+				{
+					conditions: [
+						{
+							attribute: 'nextRenderTime',
+							comparator: 'less_than_equal',
+							value: currentMinute,
+						},
+					],
+					sort: {
 						attribute: 'nextRenderTime',
-						comparator: 'less_than_equal',
-						value: currentMinute,
 					},
-				],
-				sort: {
-					attribute: 'nextRenderTime',
+					limit,
 				},
-				limit,
-			},
-			{ replicateFrom: false }
+				{ replicateFrom: false }
+			)
 		);
 
 		const jobs = [];
 		const promises = [];
 
-		for await (const schedule of it) {
+		for (const schedule of schedules) {
 			const { url, deviceType } = CacheKey.parse(schedule.cacheKey);
 
 			const expiresAt = currentMinuteMs(Date.now() + config.queue.jobLeaseTime);

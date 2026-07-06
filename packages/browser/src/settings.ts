@@ -51,6 +51,27 @@ export type BrowserOptions = {
 	incognitoPages?: boolean;
 	/** Encoding used when posting rendered HTML back (default 'gzip'). */
 	contentEncoding?: string;
+	/**
+	 * Per-host claim/result backoff + circuit-breaker tuning. When a Harper host has
+	 * no work (empty claim) the consumer waits `idleMs` before re-polling it; when it
+	 * returns 503/429/502/504 or is unreachable, the host is circuit-broken with an
+	 * exponential, jittered backoff between `minMs` and `maxMs`. A `Retry-After` header
+	 * is honored when present (capped). All values are milliseconds except `resultRetries`.
+	 */
+	backoff?: {
+		/** Delay before re-polling a host that reported empty/no work (default 15000). */
+		idleMs?: number;
+		/** Base circuit backoff on the first 503/unreachable (default 1000). */
+		minMs?: number;
+		/** Circuit backoff cap (default 30000). */
+		maxMs?: number;
+		/** Re-poll delay when a host reports `paused` (default 30000). */
+		pausedMs?: number;
+		/** Cap on the idle sleep between poll re-evaluations (default 60000). */
+		maxIdleMs?: number;
+		/** Max `job_result` POST retries on 503/5xx/network before dropping (default 3). */
+		resultRetries?: number;
+	};
 	/** Chrome launch flags (default: a hardened headless set). */
 	chromeArgs?: string[];
 	/**
@@ -66,6 +87,15 @@ export type BrowserOptions = {
 	browserLaunchOptions?: LaunchOptions;
 	/** On-disk shared sub-resource (script/stylesheet) cache. */
 	resourceCache?: ResourceCacheOptions;
+};
+
+export type ResolvedBackoff = {
+	idleMs: number;
+	minMs: number;
+	maxMs: number;
+	pausedMs: number;
+	maxIdleMs: number;
+	resultRetries: number;
 };
 
 export type ResolvedResourceCache = {
@@ -92,6 +122,7 @@ export type Settings = {
 	hostResolverRules: Record<string, string>;
 	browserLaunchOptions?: LaunchOptions;
 	resourceCache: ResolvedResourceCache;
+	backoff: ResolvedBackoff;
 };
 
 const DEFAULT_CHROME_ARGS = [
@@ -161,6 +192,14 @@ const defaults = (): Settings => ({
 		maxTtlMs: 30 * 24 * 60 * 60 * 1000,
 		allowPrivateResponses: true,
 	},
+	backoff: {
+		idleMs: 15000,
+		minMs: 1000,
+		maxMs: 30000,
+		pausedMs: 30000,
+		maxIdleMs: 60000,
+		resultRetries: 3,
+	},
 });
 
 // The live settings (stable reference; mutated in place by applySettings so existing
@@ -208,6 +247,14 @@ export const applySettings = (options: BrowserOptions): Settings => {
 		maxTotalBytes: options.resourceCache?.maxTotalBytes ?? fresh.resourceCache.maxTotalBytes,
 		maxTtlMs: options.resourceCache?.maxTtlMs ?? fresh.resourceCache.maxTtlMs,
 		allowPrivateResponses: options.resourceCache?.allowPrivate ?? fresh.resourceCache.allowPrivateResponses,
+	};
+	fresh.backoff = {
+		idleMs: options.backoff?.idleMs ?? fresh.backoff.idleMs,
+		minMs: options.backoff?.minMs ?? fresh.backoff.minMs,
+		maxMs: options.backoff?.maxMs ?? fresh.backoff.maxMs,
+		pausedMs: options.backoff?.pausedMs ?? fresh.backoff.pausedMs,
+		maxIdleMs: options.backoff?.maxIdleMs ?? fresh.backoff.maxIdleMs,
+		resultRetries: options.backoff?.resultRetries ?? fresh.backoff.resultRetries,
 	};
 
 	Object.assign(settings, fresh);

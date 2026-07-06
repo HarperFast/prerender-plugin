@@ -1,44 +1,46 @@
-import { setTimeout as sleep } from 'timers/promises';
 import RenderJob from './RenderJob.js';
 import logger from './util/Logger.js';
 import { request } from './external/http.js';
 import { connectMqtt } from './external/mqtt.js';
 import { settings } from './settings.js';
-
-const SLEEP_DELAY = 60 * 1000;
+import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 
 export const Topic = {
 	// Matches the plugin's QueueStatus export name (@export(name: "queue_status")).
 	queueState: 'queue_status/#',
 } as const;
 
-enum ProducerStatus {
-	queued = 'queued',
-	empty = 'empty',
-	paused = 'paused',
-}
+// Claim responses that mean "host overloaded/unavailable" (vs. a real bug) — these
+// circuit-break the host with escalating backoff instead of tight-looping.
+const UNAVAILABLE_STATUS = new Set([429, 502, 503, 504]);
 
-interface ProducerState {
-	hostname: string;
-	status: ProducerStatus;
-	lastUpdated: Date;
-}
+type ClaimOutcome = 'jobs' | 'empty' | 'unavailable' | 'error';
+
+/** Coerce a producer `updatedTime` (number epoch-ms or ISO string) to ms, or undefined. */
+const toEpochMs = (value: unknown): number | undefined => {
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (typeof value === 'string') {
+		const t = Date.parse(value);
+		if (!Number.isNaN(t)) return t;
+	}
+	return undefined;
+};
 
 export async function* RenderQueueConsumer(signal?: AbortSignal) {
 	const mqttClient = await connectMqtt();
+	const health = getHostHealth();
 
 	// try wraps ALL setup after connectMqtt (message handler, subscribe, loop) so a failure
 	// during setup — e.g. subscribeAsync throwing — still closes the MQTT client in `finally`
 	// instead of leaking the connection.
 	try {
-		const producerStates = new Map<string, ProducerState>();
-
 		mqttClient.on('message', (_topic, payload) => {
-			// This runs async in the event loop, so a JSON.parse throw would bypass the
+			// Runs async in the event loop, so a JSON.parse throw would bypass the
 			// surrounding try/finally and crash the worker — guard it.
 			try {
 				const queueState = JSON.parse(payload.toString());
-				producerStates.set(queueState.hostname, queueState);
+				if (!queueState?.hostname) return;
+				health.applyMqttStatus(queueState.hostname, queueState.status, toEpochMs(queueState.updatedTime));
 			} catch (err) {
 				logger.error({ err }, 'failed to parse queue_status message');
 			}
@@ -46,62 +48,64 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 
 		await mqttClient.subscribeAsync(Topic.queueState, { qos: 1, rh: 0 });
 
-		const pickAvailableQueueHost: () => string | null = () => {
-			const eligibleHosts: string[] = [];
-
-			producerStates.forEach((producer) => {
-				if (producer.status === ProducerStatus.queued) {
-					eligibleHosts.push(producer.hostname);
-				}
-			});
-
-			if (eligibleHosts.length === 0) return null;
-
-			return eligibleHosts[Math.floor(Math.random() * eligibleHosts.length)];
-		};
-
-		const claimJobs = async (host: string, limit: number): Promise<RenderJob[]> => {
+		const claimJobs = async (
+			host: string,
+			limit: number
+		): Promise<{ jobs: RenderJob[]; outcome: ClaimOutcome; retryAfterMs?: number }> => {
 			try {
 				const res = await request(`http://${host}:${settings.queuePort}`, {
 					method: 'POST',
 					path: '/render_queue/claim',
-					body: JSON.stringify({
-						limit,
-					}),
-					headers: {
-						'content-type': 'application/json',
-					},
+					body: JSON.stringify({ limit }),
+					headers: { 'content-type': 'application/json' },
 				});
 				if (res.statusCode === 200) {
 					const jobs: any = await res.body.json();
-					return jobs.map((job: any) => new RenderJob(job));
-				} else {
-					// res.body.json() is a Promise (and can reject on a non-JSON error body) — await
-					// text() so we log the actual response, not a pending Promise / unhandled rejection.
-					const body = await res.body.text().catch(() => '');
-					logger.error({ statusCode: res.statusCode, body }, 'failed to claim jobs');
-					return [];
+					const renderJobs = jobs.map((job: any) => new RenderJob(job));
+					return { jobs: renderJobs, outcome: renderJobs.length ? 'jobs' : 'empty' };
 				}
+				// res.body.json() is a Promise (and can reject on a non-JSON error body) — await
+				// text() so we log the actual response, not a pending Promise / unhandled rejection.
+				const body = await res.body.text().catch(() => '');
+				if (UNAVAILABLE_STATUS.has(res.statusCode)) {
+					const retryAfterMs = parseRetryAfter(res.headers['retry-after'] as string | string[] | undefined);
+					logger.warn({ host, statusCode: res.statusCode, retryAfterMs }, 'queue host unavailable — backing off');
+					return { jobs: [], outcome: 'unavailable', retryAfterMs };
+				}
+				logger.error({ host, statusCode: res.statusCode, body }, 'failed to claim jobs');
+				return { jobs: [], outcome: 'error' };
 			} catch (e) {
-				logger.error(e);
-				return [];
+				// Network error / host unreachable — treat as unavailable and circuit-break.
+				logger.warn({ host, err: e }, 'queue host unreachable — backing off');
+				return { jobs: [], outcome: 'unavailable' };
 			}
 		};
 
 		while (!signal?.aborted) {
-			const host = pickAvailableQueueHost();
+			const host = health.pickEligible();
 
 			if (!host) {
-				try {
-					// Abortable so a graceful shutdown doesn't wait out the (up to 60s) idle poll.
-					await sleep(Math.random() * SLEEP_DELAY, undefined, { signal });
-				} catch {
-					break; // aborted during the idle sleep
-				}
+				// Abortable, and woken early when a host becomes eligible (a `queued` status
+				// arrives), so a freshly-enqueued job is picked up without waiting out the timer.
+				await health.wait(health.nextWakeDelay(), signal);
 				continue;
 			}
 
-			const jobs = await claimJobs(host, settings.jobClaimLimit);
+			const { jobs, outcome, retryAfterMs } = await claimJobs(host, settings.jobClaimLimit);
+			switch (outcome) {
+				case 'jobs':
+					health.recordJobs(host);
+					break;
+				case 'empty':
+					health.recordEmpty(host);
+					break;
+				case 'unavailable':
+					health.recordUnavailable(host, retryAfterMs);
+					break;
+				case 'error':
+					health.recordError(host);
+					break;
+			}
 
 			for (const job of jobs) {
 				if (signal?.aborted) return;
