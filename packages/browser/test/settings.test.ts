@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applySettings, settings } from '../dist/settings.js';
+import { applySettings, composeHostResolverRulesArg, settings } from '../dist/settings.js';
 import { defaultConfig } from '../dist/config.js';
 
 const HARPER = { mqttOrigin: 'mqtt://localhost:1883', user: 'u', pass: 'p', workerId: 'w1' };
@@ -56,4 +56,40 @@ test('config option accepts a deep-partial object merged over defaults', () => {
 test('bypass token defaults to empty when omitted', () => {
 	applySettings({ harper: HARPER });
 	assert.equal(settings.bypass.token, '');
+});
+
+test('composeHostResolverRulesArg builds the Chrome flag and drops empty entries', () => {
+	assert.equal(composeHostResolverRulesArg(undefined), null);
+	assert.equal(composeHostResolverRulesArg({}), null);
+	assert.equal(composeHostResolverRulesArg({ '': '1.2.3.4', 'www.kohls.com': '' }), null);
+	assert.equal(
+		composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27' }),
+		'--host-resolver-rules=MAP www.kohls.com 23.50.51.27'
+	);
+	assert.equal(
+		composeHostResolverRulesArg({ 'www.kohls.com': ' 23.50.51.27 ', 'api.kohls.com': '1.2.3.4' }),
+		'--host-resolver-rules=MAP www.kohls.com 23.50.51.27,MAP api.kohls.com 1.2.3.4'
+	);
+});
+
+test('hostResolverRules appends --host-resolver-rules onto the default chrome args', () => {
+	applySettings({ harper: HARPER, hostResolverRules: { 'www.kohls.com': '23.50.51.27' } });
+	assert.deepEqual(settings.hostResolverRules, { 'www.kohls.com': '23.50.51.27' });
+	assert.ok(settings.chromeArgs.includes('--no-sandbox')); // hardened defaults preserved
+	assert.equal(settings.chromeArgs.at(-1), '--host-resolver-rules=MAP www.kohls.com 23.50.51.27');
+});
+
+test('hostResolverRules appends onto custom chromeArgs without dropping them', () => {
+	applySettings({
+		harper: HARPER,
+		chromeArgs: ['--foo'],
+		hostResolverRules: { 'www.kohls.com': '23.50.51.27' },
+	});
+	assert.deepEqual(settings.chromeArgs, ['--foo', '--host-resolver-rules=MAP www.kohls.com 23.50.51.27']);
+});
+
+test('no host-resolver flag is added when hostResolverRules is omitted', () => {
+	applySettings({ harper: HARPER });
+	assert.deepEqual(settings.hostResolverRules, {});
+	assert.ok(!settings.chromeArgs.some((a: string) => a.startsWith('--host-resolver-rules')));
 });

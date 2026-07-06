@@ -53,6 +53,15 @@ export type BrowserOptions = {
 	contentEncoding?: string;
 	/** Chrome launch flags (default: a hardened headless set). */
 	chromeArgs?: string[];
+	/**
+	 * Per-browser DNS overrides: a map of hostname → IP that composes Chrome's
+	 * `--host-resolver-rules` flag (`MAP <host> <ip>`), appended to `chromeArgs`. Chrome
+	 * connects to the given IP but keeps the original Host header and TLS SNI, so the
+	 * certificate still validates — the mechanism for pointing renders at an Akamai
+	 * staging edge (or any alternate origin) without touching `/etc/hosts`. Ignored when
+	 * `browserLaunchOptions` is supplied (that fully owns the launch args). Default none.
+	 */
+	hostResolverRules?: Record<string, string>;
 	/** Full Puppeteer launch options — overrides the default built from `chromeArgs`. */
 	browserLaunchOptions?: LaunchOptions;
 	/** On-disk shared sub-resource (script/stylesheet) cache. */
@@ -80,6 +89,7 @@ export type Settings = {
 	incognitoPages: boolean;
 	contentEncoding: string;
 	chromeArgs: string[];
+	hostResolverRules: Record<string, string>;
 	browserLaunchOptions?: LaunchOptions;
 	resourceCache: ResolvedResourceCache;
 };
@@ -100,6 +110,18 @@ const DEFAULT_CHROME_ARGS = [
 	'--js-flags=--max-old-space-size=768',
 ];
 
+/**
+ * Compose Chrome's `--host-resolver-rules` flag from a hostname → IP map, or return
+ * null when there are no (valid) rules. Entries with an empty host or IP are dropped.
+ * Multiple rules are comma-joined, e.g. `--host-resolver-rules=MAP a 1.1.1.1,MAP b 2.2.2.2`.
+ */
+export const composeHostResolverRulesArg = (rules?: Record<string, string>): string | null => {
+	const maps = Object.entries(rules ?? {})
+		.filter(([host, ip]) => host?.trim() && ip?.trim())
+		.map(([host, ip]) => `MAP ${host.trim()} ${ip.trim()}`);
+	return maps.length ? `--host-resolver-rules=${maps.join(',')}` : null;
+};
+
 const defaultConcurrency = () => Math.max(1, Math.floor((cpus().length - 3) / 2));
 
 const defaults = (): Settings => ({
@@ -114,6 +136,7 @@ const defaults = (): Settings => ({
 	incognitoPages: true,
 	contentEncoding: 'gzip',
 	chromeArgs: DEFAULT_CHROME_ARGS,
+	hostResolverRules: {},
 	browserLaunchOptions: undefined,
 	resourceCache: {
 		enabled: true,
@@ -156,7 +179,12 @@ export const applySettings = (options: BrowserOptions): Settings => {
 	fresh.browserExpirationThreshold = options.browserExpirationThreshold ?? fresh.browserExpirationThreshold;
 	fresh.incognitoPages = options.incognitoPages ?? fresh.incognitoPages;
 	fresh.contentEncoding = options.contentEncoding ?? fresh.contentEncoding;
-	fresh.chromeArgs = options.chromeArgs ?? fresh.chromeArgs;
+	// Append the composed --host-resolver-rules flag onto the base args (custom or default)
+	// so a host→IP override doesn't require re-declaring the hardened default flag set.
+	fresh.hostResolverRules = { ...(options.hostResolverRules ?? {}) };
+	const baseChromeArgs = options.chromeArgs ?? DEFAULT_CHROME_ARGS;
+	const hostResolverArg = composeHostResolverRulesArg(fresh.hostResolverRules);
+	fresh.chromeArgs = hostResolverArg ? [...baseChromeArgs, hostResolverArg] : [...baseChromeArgs];
 	fresh.browserLaunchOptions = options.browserLaunchOptions;
 	fresh.resourceCache = {
 		enabled: options.resourceCache?.enabled ?? fresh.resourceCache.enabled,
