@@ -195,6 +195,12 @@ export default class RenderJob {
 						await sleep(resultBackoffMs(attempt));
 						continue;
 					}
+				} else if (host) {
+					// Non-retriable (4xx bug, auth failure, wrong endpoint) — usually persistent and
+					// host-wide. Feed the shared circuit (same as the claim path's non-2xx handling)
+					// so the consumer stops claiming work it can't deliver to this host, instead of
+					// rendering more results that will only be dropped.
+					health.recordError(host);
 				}
 				logger.error({ id: this.id, statusCode: res.statusCode, body: text, attempt }, 'failed to send job result');
 				return;
