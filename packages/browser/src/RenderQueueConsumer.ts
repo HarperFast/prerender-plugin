@@ -34,8 +34,14 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 		const producerStates = new Map<string, ProducerState>();
 
 		mqttClient.on('message', (_topic, payload) => {
-			const queueState = JSON.parse(payload.toString());
-			producerStates.set(queueState.hostname, queueState);
+			// This runs async in the event loop, so a JSON.parse throw would bypass the
+			// surrounding try/finally and crash the worker — guard it.
+			try {
+				const queueState = JSON.parse(payload.toString());
+				producerStates.set(queueState.hostname, queueState);
+			} catch (err) {
+				logger.error({ err }, 'failed to parse queue_status message');
+			}
 		});
 
 		await mqttClient.subscribeAsync(Topic.queueState, { qos: 1, rh: 0 });
@@ -70,7 +76,10 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 					const jobs: any = await res.body.json();
 					return jobs.map((job: any) => new RenderJob(job));
 				} else {
-					logger.error(res.body.json());
+					// res.body.json() is a Promise (and can reject on a non-JSON error body) — await
+					// text() so we log the actual response, not a pending Promise / unhandled rejection.
+					const body = await res.body.text().catch(() => '');
+					logger.error({ statusCode: res.statusCode, body }, 'failed to claim jobs');
 					return [];
 				}
 			} catch (e) {

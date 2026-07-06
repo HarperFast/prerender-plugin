@@ -66,13 +66,16 @@ export class ErrorHandler {
 		// NON-zero code so the orchestrator sees an unclean/timed-out shutdown, not a clean one.
 		const backstop = setTimeout(() => process.exit(1), this.shutdownDeadlineMs);
 		backstop.unref();
+		let exitCode = 0;
 		try {
 			await this.onTerminate?.();
 		} catch (err) {
+			// The drain failed/was incomplete — signal an unclean shutdown to the orchestrator.
 			logger.error({ err }, 'error during graceful shutdown');
+			exitCode = 1;
 		}
 		clearTimeout(backstop);
-		process.exit(0);
+		process.exit(exitCode);
 	}
 
 	private gracefulShutdown(exitCode: number) {
