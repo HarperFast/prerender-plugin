@@ -232,7 +232,23 @@ const renderer: Renderer = async (page, job) => {
 			else stablePasses = 0;
 			last = count;
 		}
+		await scrollToTop();
+	};
+
+	// Return to the top and let scroll-reactive UI settle before we serialize. Sticky/
+	// compact headers hide the main header on scroll-down and re-reveal it only at the top
+	// via a throttled scroll handler that fires a tick *after* scrollTo(0, 0); serializing
+	// immediately captures the header mid-hide (a blank band). Flush a couple of animation
+	// frames (scroll listeners commonly run on rAF), then hold for topSettleMs to cover
+	// throttled/debounced handlers.
+	const scrollToTop = async () => {
 		await page.evaluate(() => window.scrollTo(0, 0)).catch(noop);
+		if (config.scroll.topSettleMs > 0) {
+			await page
+				.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+				.catch(noop);
+			await new Promise((resolve) => setTimeout(resolve, config.scroll.topSettleMs));
+		}
 	};
 
 	if (config.scroll.enabled && config.scroll.settleUntilStable) {
@@ -243,7 +259,7 @@ const renderer: Renderer = async (page, job) => {
 			// (e.g. so a scroll-aware navbar renders in its default state).
 			await page.evaluate(scrollToBottom, config.scroll.stepMs);
 			await networkIdle();
-			await page.evaluate(() => window.scrollTo(0, 0));
+			await scrollToTop();
 		}
 		await networkIdle();
 		await domStable();

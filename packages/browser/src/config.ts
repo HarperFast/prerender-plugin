@@ -96,6 +96,15 @@ export type ScrollConfig = {
 	 * `navigation.domStableTolerance` controls how much late churn is ignored. Default 2.
 	 */
 	settleStablePasses: number;
+	/**
+	 * After scrolling back to the top (end of the scroll/settle phase), wait this many ms
+	 * before serializing so scroll-reactive UI returns to its top state. Sticky/compact
+	 * headers commonly hide the main header on scroll-down and re-reveal it only at the
+	 * top via a throttled scroll handler that runs a tick *after* `scrollTo(0, 0)` — with
+	 * no wait, the snapshot captures the header mid-hide (a blank band). `0` disables the
+	 * wait. Default 300.
+	 */
+	topSettleMs: number;
 };
 
 export type PostProcessConfig = {
@@ -166,7 +175,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStablePollMs: 250,
 		domStableTolerance: 8,
 	},
-	scroll: { enabled: true, stepMs: 200, settleUntilStable: false, settleStablePasses: 2 },
+	scroll: { enabled: true, stepMs: 200, settleUntilStable: false, settleStablePasses: 2, topSettleMs: 300 },
 	postProcess: {
 		stripScripts: true,
 		inlineEmptyStyleSheets: true,

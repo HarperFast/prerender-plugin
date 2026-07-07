@@ -91,7 +91,7 @@ include what you change:
 		"networkIdleMs": 300,
 		"networkIdleTimeoutMs": 1000,
 	},
-	"scroll": { "enabled": true, "stepMs": 200 }, // scroll to bottom to trigger lazy content
+	"scroll": { "enabled": true, "stepMs": 200, "topSettleMs": 300 }, // scroll to bottom for lazy content; topSettleMs lets scroll-reactive headers re-reveal at the top before serializing
 	"postProcess": {
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,

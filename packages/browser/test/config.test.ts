@@ -22,6 +22,7 @@ test('defaults reproduce the original hardcoded behavior', () => {
 	assert.deepEqual(config.block.urlPatterns, []);
 	assert.equal(config.navigation.waitUntil, 'domcontentloaded');
 	assert.equal(config.scroll.enabled, true);
+	assert.equal(config.scroll.topSettleMs, 300);
 	assert.equal(config.postProcess.stripScripts, true);
 	assert.equal(config.injectWebComponentsPolyfill, true);
 });
