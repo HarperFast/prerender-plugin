@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { currentMinuteMs, getNextRenderTime } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
-import { cacheKeyUrl } from '../util/url.js';
+import { cacheKeyUrl, normalizeUrl } from '../util/url.js';
 import { RenderTarget } from './RenderTarget.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
@@ -75,11 +75,12 @@ export class RenderQueue extends Resource {
 
 			const { deviceType } = CacheKey.parse(result.id);
 
-			// Normalize the redirect target the same way serving does, so the rendered content
-			// is stored under the key a bot request for that URL will look up (the renderer's
-			// redirectedTo is decodeURI'd and skips the query allowlist — normalizeUrl re-encodes
-			// and re-applies the policy for a consistent key).
-			cacheKey = CacheKey.toCacheKey({ deviceType, url: cacheKeyUrl(result.redirectedTo) });
+			// Normalize the redirect target the same way serving does, so the rendered content is
+			// stored under the key a bot request for that URL will look up. redirectedTo is the
+			// renderer's decodeURI'd form; normalizeUrl re-sorts and standardizes the encoding
+			// (['*'] keeps all params — the matched route, hence its allowlist, isn't known here),
+			// then cacheKeyUrl applies the shared cache-key encoding.
+			cacheKey = CacheKey.toCacheKey({ deviceType, url: cacheKeyUrl(normalizeUrl(result.redirectedTo, false, ['*'])) });
 		}
 
 		try {

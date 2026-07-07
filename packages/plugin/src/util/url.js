@@ -47,6 +47,7 @@ export const normalizeUrl = (url, returnObject = false, queryParams = config.url
  */
 const DECODE = { '%3a': ':', '%2c': ',', '%40': '@' };
 export const cacheKeyUrl = (url) => {
-	const href = typeof url === 'string' ? url : (url?.href ?? String(url));
+	if (!url) return '';
+	const href = typeof url === 'string' ? url : (url.href ?? String(url));
 	return href.replace(/%(?:3a|2c|40)/gi, (m) => DECODE[m.toLowerCase()]);
 };
