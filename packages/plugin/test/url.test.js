@@ -67,6 +67,12 @@ test('cacheKeyUrl accepts a URL object and never throws', () => {
 	assert.doesNotThrow(() => cacheKeyUrl('::::not a url'));
 });
 
+test('cacheKeyUrl returns "" for falsy input (no "null"/"undefined" key)', () => {
+	assert.equal(cacheKeyUrl(null), '');
+	assert.equal(cacheKeyUrl(undefined), '');
+	assert.equal(cacheKeyUrl(''), '');
+});
+
 // The encoded/decoded COLLAPSE comes from normalizeUrl (sort re-encodes to %3A) then
 // cacheKeyUrl (decode) — the pipeline the serving + scheduling paths use.
 test('normalizeUrl -> cacheKeyUrl collapses encoded and decoded to one key', () => {
