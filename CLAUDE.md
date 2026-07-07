@@ -23,7 +23,7 @@ plain git URL — hence the tarball).
 
 ```bash
 npm run build --workspace @harperfast/prerender-browser   # tsc
-cd packages/browser && node --test                        # 42 tests; run from the package dir
+cd packages/browser && node --test                        # run tests from the package dir
 npm run lint && npm run format:check                      # root, all workspaces
 ```
 
@@ -64,4 +64,5 @@ plugin tarball to that release, and vice-versa.
   consumer mislabels as an unreachable host and circuit-breaks. Build queue URLs as
   `localhost`/`127.0.0.1` → `http`, else `https` — see the claim path in
   [`RenderQueueConsumer.ts`](packages/browser/src/RenderQueueConsumer.ts) and `callbackOrigin` in
-  [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js).
+  [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js) (which currently checks only
+  `localhost`, not `127.0.0.1`).
