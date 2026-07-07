@@ -53,3 +53,13 @@ test('normalizeCanonicalUrl is idempotent', () => {
 test('normalizeUrlForCompare (redirect detection) is param-order-insensitive', () => {
 	assert.equal(normalizeUrlForCompare('https://x.com/p?b=2&a=1'), normalizeUrlForCompare('https://x.com/p?a=1&b=2'));
 });
+
+// A malformed %-sequence must not throw URIError out of these normalizers — they run on
+// every render job, and an uncaught throw would fail the job permanently.
+test('malformed percent-encoding falls back to raw instead of throwing', () => {
+	for (const bad of ['https://x.com/%E0%A0/a', 'https://x.com/p?x=%E0%A0']) {
+		assert.doesNotThrow(() => normalizeUrlForCompare(bad));
+		assert.doesNotThrow(() => normalizeCanonicalUrl(bad));
+	}
+	assert.doesNotThrow(() => canonicalAllowsIndex('https://x.com/a', 'https://x.com/%E0%A0/a'));
+});

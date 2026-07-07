@@ -345,7 +345,8 @@ function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean
 		if (el.tagName.toLowerCase() === 'link') {
 			// First canonical wins (multiple canonicals is invalid HTML anyway).
 			if (canonicalHref === null) canonicalHref = el.getAttribute('href');
-		} else if (el.getAttribute('content')?.includes('noindex')) {
+		} else if (el.getAttribute('content')?.toLowerCase().includes('noindex')) {
+			// robots directives are case-insensitive per spec (NOINDEX / NoIndex).
 			noindex = true;
 		}
 	});
