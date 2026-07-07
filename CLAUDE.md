@@ -71,8 +71,8 @@ plugin tarball to that release, and vice-versa.
 <!-- SHARED:system-overview — keep in sync across prerender-plugin, kohls-pr, render-service -->
 ## System overview (all three repos)
 
-Freshly-spun-up agents: the three repos are coupled through release tarballs. Know the whole picture
-before touching versions.
+Freshly-spun-up agents: these three repos are coupled through release tarballs — know the whole
+picture before touching versions. (Your repo-specific section is at the top of this file.)
 
 ```
 Akamai ──bot/crawler traffic──▶  kohls-pr  (Harper component + @harperfast/prerender plugin)
@@ -83,23 +83,25 @@ Akamai ──bot/crawler traffic──▶  kohls-pr  (Harper component + @harper
                                     └──────────── posts rendered HTML back to the component ─────────▶
 ```
 
-| Repo | Role | Branch model | Dep on this monorepo |
+| Repo | Role | Branch model | Dep on the monorepo |
 | --- | --- | --- | --- |
-| **prerender-plugin** | source monorepo (this) | PRs → `main` | — |
+| **prerender-plugin** | source monorepo (two packages) | PRs → `main` | — |
 | **kohls-pr** | Harper component, serves bot traffic behind Akamai | PRs → `main` | `@harperfast/prerender` tarball (`prerender-v*`) |
 | **render-service** | headless-browser render fleet, one branch per customer (`kohls`, `stbhb`, `mcy`…) | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`) |
 
 A downstream repo cannot bump until the upstream tarball asset already exists at its release URL —
-**cut the release here first, then bump the consumer.**
+**cut the prerender-plugin release first, then bump the consumer.**
 
 <!-- SHARED:concurrency — keep in sync across all three repos -->
 ## Concurrent work (multiple agents/people)
 
 - **One git worktree per agent/task — never two agents in one clone.** A clone shares its working
   tree, checked-out branch, and `node_modules`; two agents in it corrupt each other's state.
-  `git worktree add /private/tmp/<repo>/<task> -b <fix-or-feat>/<task> origin/<base>` — put
-  worktrees under `/private/tmp/`, remove with `git worktree remove`.
-- **Keep `main` / customer branches clean.** No uncommitted work on a shared branch; branch first.
+  `git worktree add /tmp/<repo>/<task> -b <fix-or-feat>/<task> origin/<base>` — put worktrees under
+  `/tmp/` (cross-platform), remove with `git worktree remove`. There's a helper for this across all
+  three repos: `~/.claude/scripts/prerender-worktree.sh new <repo> <task>`.
+- **Keep base branches clean** (`main`, or the customer branch for render-service). No uncommitted
+  work on a shared branch; branch first.
 - **Sequence the release trains** and **reserve the next version number** in the issue/PR before you
   start, so two people don't both claim `v1.6.1` / `prerender-v0.3.5`.
 - **Isolate shared runtime/test state:** distinct `WORKER_ID`, cache dirs, MQTT origins per run;
@@ -111,13 +113,16 @@ A downstream repo cannot bump until the upstream tarball asset already exists at
 
 PRs here are reviewed by **other agents and humans** who leave comments. "PR opened" ≠ "done".
 
-- **Never auto-merge. A human performs every merge, approve, and deploy.** Agents drive a PR to a
-  reviewable state; that's the finish line.
+- **A human merges by default.** Agents open/update PRs and drive them to a reviewable state;
+  merging, approving, and deploying are human actions. **Exception:** if the user explicitly
+  authorizes the agent to merge, you may — once all review threads are addressed and CI is green.
 - **Before considering a PR finished, read and address *every* open review thread from *any*
-  reviewer** — not just findings handed to you. Inline and PR-level comments both count:
+  reviewer** — not just findings handed to you. PR-level (conversation) and inline (diff) comments
+  live in different places, so check both:
   ```sh
-  gh pr view <PR#> --comments
-  gh api repos/HarperFast/<repo>/pulls/<PR#>/comments --jq '.[] | {path, line, user: .user.login, body}'
+  gh pr view <PR#> --comments                                    # PR-level conversation comments
+  gh api repos/HarperFast/<repo>/pulls/<PR#>/comments \          # inline (diff) review comments
+    --jq '.[] | {path, line, user: .user.login, body}'
   ```
 - For each comment: **fix it and push to the same branch**, or **reply explaining the dismissal**.
   Don't silently ignore feedback. After pushing fixes, leave a short summary comment so reviewers can
