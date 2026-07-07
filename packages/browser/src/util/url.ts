@@ -11,10 +11,21 @@
  * Normalize a URL for redirect detection (page.url() vs the requested job URL): sort the
  * query so param order is insignificant, and decode non-reserved percent-escapes.
  */
+/** decodeURI that never throws: a malformed %-sequence (e.g. `%E0%A0`, `%9`) falls back to
+ *  the raw string, so a bad URL degrades to a byte comparison instead of throwing URIError
+ *  out of a normalizer that runs on every render job. */
+const safeDecodeURI = (s: string): string => {
+	try {
+		return decodeURI(s);
+	} catch {
+		return s;
+	}
+};
+
 export const normalizeUrlForCompare = (url: string | URL): string => {
 	const parsed = new URL(url);
 	parsed.searchParams.sort();
-	return decodeURI(parsed.href);
+	return safeDecodeURI(parsed.href);
 };
 
 /**
@@ -33,7 +44,7 @@ export const normalizeCanonicalUrl = (url: string | URL): string => {
 	if (parsed.pathname !== '/' && parsed.pathname.endsWith('/')) {
 		parsed.pathname = parsed.pathname.slice(0, -1);
 	}
-	return decodeURI(parsed.href);
+	return safeDecodeURI(parsed.href);
 };
 
 /**
