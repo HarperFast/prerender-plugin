@@ -3,7 +3,7 @@ import { Readable } from 'node:stream';
 import { CacheKey } from '../util/cacheKey.js';
 import { getBotName } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
-import { normalizeUrl } from '../util/url.js';
+import { normalizeUrl, cacheKeyUrl } from '../util/url.js';
 import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
@@ -53,7 +53,7 @@ export async function handleBotRequest(request) {
 				body: request._nodeRequest,
 			});
 		} else {
-			const cacheKey = CacheKey.toCacheKey({ url: url.href, deviceType });
+			const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(url), deviceType });
 
 			const page = await PrerenderedPage.get(cacheKey);
 
@@ -77,11 +77,14 @@ export async function handleBotRequest(request) {
 async function handlePageScheduling(resource) {
 	try {
 		if (isPrerenderCandidate(resource)) {
-			const existingNonIndexable = await databases.signals.NonIndexable.get({ id: resource.url, select: 'url' });
+			const existingNonIndexable = await databases.signals.NonIndexable.get({
+				id: cacheKeyUrl(resource.url),
+				select: 'url',
+			});
 
 			if (!existingNonIndexable) {
 				for (const deviceType of config.deviceTypes.default) {
-					const cacheKey = CacheKey.toCacheKey({ url: resource.url, deviceType });
+					const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(resource.url), deviceType });
 					const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
 					if (!existingTarget) {
 						await RenderTarget.put(cacheKey, {
