@@ -37,7 +37,8 @@ the bump commit. e.g. `fix(browser): claim over https (queue port is TLS); v1.5.
 1. Branch off `main` (**never commit directly to `main`**).
 2. Bump the version: `npm version <ver> --workspace <pkg> --no-git-tag-version` (updates the
    package's `package.json` + the root lockfile; does **not** create a git tag).
-3. Commit, `git push -u origin <branch>`, `gh pr create --base main`, then `gh pr merge --merge`.
+3. Commit, `git push -u origin <branch>`, `gh pr create --base main`. **Do not merge** — see
+   "PRs & review" below. A human merges after review.
 
 ## Releasing (this is what produces the tarball consumers install)
 
@@ -66,3 +67,58 @@ plugin tarball to that release, and vice-versa.
   [`RenderQueueConsumer.ts`](packages/browser/src/RenderQueueConsumer.ts) and `callbackOrigin` in
   [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js) (which currently checks only
   `localhost`, not `127.0.0.1`).
+
+<!-- SHARED:system-overview — keep in sync across prerender-plugin, kohls-pr, render-service -->
+## System overview (all three repos)
+
+Freshly-spun-up agents: the three repos are coupled through release tarballs. Know the whole picture
+before touching versions.
+
+```
+Akamai ──bot/crawler traffic──▶  kohls-pr  (Harper component + @harperfast/prerender plugin)
+                                    │  enqueues render jobs, serves cached HTML
+                                    ▼
+                        render-service@<customer>  (fleet of @harperfast/prerender-browser workers)
+                                    │  headless Chrome renders the page
+                                    └──────────── posts rendered HTML back to the component ─────────▶
+```
+
+| Repo | Role | Branch model | Dep on this monorepo |
+| --- | --- | --- | --- |
+| **prerender-plugin** | source monorepo (this) | PRs → `main` | — |
+| **kohls-pr** | Harper component, serves bot traffic behind Akamai | PRs → `main` | `@harperfast/prerender` tarball (`prerender-v*`) |
+| **render-service** | headless-browser render fleet, one branch per customer (`kohls`, `stbhb`, `mcy`…) | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`) |
+
+A downstream repo cannot bump until the upstream tarball asset already exists at its release URL —
+**cut the release here first, then bump the consumer.**
+
+<!-- SHARED:concurrency — keep in sync across all three repos -->
+## Concurrent work (multiple agents/people)
+
+- **One git worktree per agent/task — never two agents in one clone.** A clone shares its working
+  tree, checked-out branch, and `node_modules`; two agents in it corrupt each other's state.
+  `git worktree add /private/tmp/<repo>/<task> -b <fix-or-feat>/<task> origin/<base>` — put
+  worktrees under `/private/tmp/`, remove with `git worktree remove`.
+- **Keep `main` / customer branches clean.** No uncommitted work on a shared branch; branch first.
+- **Sequence the release trains** and **reserve the next version number** in the issue/PR before you
+  start, so two people don't both claim `v1.6.1` / `prerender-v0.3.5`.
+- **Isolate shared runtime/test state:** distinct `WORKER_ID`, cache dirs, MQTT origins per run;
+  don't share the Akamai staging pipeline across simultaneous sessions (its cache is keyed by URL
+  only and cross-contaminates; toggling staging↔prod requires wiping the resource cache).
+
+<!-- SHARED:pr-review — keep in sync across all three repos -->
+## PRs & review (multi-agent)
+
+PRs here are reviewed by **other agents and humans** who leave comments. "PR opened" ≠ "done".
+
+- **Never auto-merge. A human performs every merge, approve, and deploy.** Agents drive a PR to a
+  reviewable state; that's the finish line.
+- **Before considering a PR finished, read and address *every* open review thread from *any*
+  reviewer** — not just findings handed to you. Inline and PR-level comments both count:
+  ```sh
+  gh pr view <PR#> --comments
+  gh api repos/HarperFast/<repo>/pulls/<PR#>/comments --jq '.[] | {path, line, user: .user.login, body}'
+  ```
+- For each comment: **fix it and push to the same branch**, or **reply explaining the dismissal**.
+  Don't silently ignore feedback. After pushing fixes, leave a short summary comment so reviewers can
+  re-check; don't resolve others' threads on their behalf.
