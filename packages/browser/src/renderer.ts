@@ -238,15 +238,14 @@ const renderer: Renderer = async (page, job) => {
 	// Return to the top and let scroll-reactive UI settle before we serialize. Sticky/
 	// compact headers hide the main header on scroll-down and re-reveal it only at the top
 	// via a throttled scroll handler that fires a tick *after* scrollTo(0, 0); serializing
-	// immediately captures the header mid-hide (a blank band). Flush a couple of animation
-	// frames (scroll listeners commonly run on rAF), then hold for topSettleMs to cover
-	// throttled/debounced handlers.
+	// immediately captures the header mid-hide (a blank band). Hold for topSettleMs so that
+	// handler runs first. The wait is a Node-side timer (not an in-page requestAnimationFrame
+	// flush) on purpose: rAF can be paused indefinitely in a backgrounded headless tab, which
+	// would hang the render — and since we serialize the DOM (not a paint), only the handler's
+	// class flip needs to land, which the wall-clock wait covers regardless of how it's scheduled.
 	const scrollToTop = async () => {
 		await page.evaluate(() => window.scrollTo(0, 0)).catch(noop);
 		if (config.scroll.topSettleMs > 0) {
-			await page
-				.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-				.catch(noop);
 			await new Promise((resolve) => setTimeout(resolve, config.scroll.topSettleMs));
 		}
 	};
