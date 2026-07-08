@@ -122,6 +122,7 @@ export class RenderQueue extends Resource {
 					content: createBlob(result.content),
 					headers: JSON.stringify(result.headers),
 					expiresAt: nextRenderTime,
+					isIndexable: typeof result.isIndexable === 'boolean' ? result.isIndexable : null,
 				});
 			}
 

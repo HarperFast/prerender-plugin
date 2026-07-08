@@ -124,22 +124,32 @@ const defaultConfig = () => ({
 		header: 'x-harper-staging',
 	},
 
-	// On-demand render ("render now"). When enabled, a GET bot request carrying the
-	// configured `header` bypasses BOTH the cache and the origin proxy, forces an
-	// immediate one-off render, and long-polls for the fresh result before responding.
-	// This is expensive and cache/origin-bypassing, so it is opt-in and should be gated
-	// by a shared secret `token` (the header VALUE must equal it). An empty token leaves
-	// the feature unauthenticated (any client sending the header can force renders — a
-	// DoS vector), which is warned about at config-apply time. `valueEnv` sources the
-	// token from an environment variable so the secret stays out of config.yaml.
+	// On-demand render control. When enabled, an authorized GET bot request gets two
+	// orthogonal levers (both ignored for unauthorized requests, so real crawler traffic
+	// is unaffected):
+	//   1. Cache freshness — a request `Cache-Control: no-cache`/`no-store` SKIPS the
+	//      served cache (forces a miss).
+	//   2. Miss behavior — the `missHeader` value picks what to do on a miss/skip:
+	//      'prerender' (force an immediate one-off render and long-poll for the fresh
+	//      result) or 'origin' (proxy the origin, same as a normal miss). Absent →
+	//      `defaultMissMode`.
+	// So `defaultMissMode: prerender` + no Cache-Control = "serve cache, else render now"
+	// (warm-on-demand); adding `Cache-Control: no-cache` = "always render fresh now".
+	//
+	// Authorization is gated by `header` presence; when a `token` is set the header VALUE
+	// must equal it. An empty token leaves it unauthenticated (any client sending the
+	// header can force renders — a DoS vector), which is warned about at config-apply
+	// time. `valueEnv` sources the token from an environment variable.
 	renderNow: {
 		enabled: false,
-		header: 'x-harper-render-now',
+		header: 'x-harper-render-now', // authorizes the on-demand levers
 		token: '',
 		valueEnv: '',
+		missHeader: 'x-harper-render-miss', // value: 'prerender' | 'origin'
+		defaultMissMode: 'prerender', // miss behavior when missHeader is absent
 		timeoutMs: 30 * SECOND, // give up waiting for the fresh render after this long
 		pollIntervalMs: 250, // how often to re-check the cache for the fresh render
-		// What to serve when the render doesn't land before `timeoutMs`:
+		// What to serve when a prerender doesn't land before `timeoutMs`:
 		//   'origin' — proxy the origin (same as a normal cache miss)
 		//   'stale'  — serve the existing cached page if any, else fall back to origin
 		//   'error'  — respond 504
