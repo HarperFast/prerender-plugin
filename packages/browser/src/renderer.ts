@@ -237,7 +237,7 @@ const renderer: Renderer = async (page, job) => {
 		while (Date.now() < deadline && stablePasses < requiredStablePasses) {
 			let count: number;
 			try {
-				await page.evaluate(scrollPass, config.scroll.stepMs);
+				await page.evaluate(scrollPass, config.scroll.stepMs, config.scroll.stepFraction);
 				await networkIdle();
 				count = await page.evaluate(countDomElements);
 			} catch {
@@ -332,12 +332,16 @@ async function scrollToBottom(stepMs: number) {
 	});
 }
 
-// One absolute-position scroll pass from top to bottom in half-viewport steps. Used by
-// the settle loop so each lazy section is held in the viewport long enough to trigger.
-async function scrollPass(stepMs: number) {
+// One absolute-position scroll pass from top to bottom in `stepFraction`-of-viewport steps.
+// Used by the settle loop so each lazy section is held in the viewport long enough to trigger.
+async function scrollPass(stepMs: number, stepFraction: number) {
 	await new Promise<void>((resolve) => {
 		let y = 0;
-		const step = Math.max(1, Math.round(window.innerHeight * 0.5));
+		// Guard the in-page math: a non-positive/NaN/pathologically-small fraction would floor to
+		// a 1px step (an extremely slow pass), so fall back to the half-viewport default. Values
+		// this small are already rejected by config validate(); this is in-page defense-in-depth.
+		const frac = stepFraction >= 0.01 ? stepFraction : 0.5;
+		const step = Math.max(1, Math.round(window.innerHeight * frac));
 		const timer = setInterval(() => {
 			window.scrollTo(0, y);
 			y += step;

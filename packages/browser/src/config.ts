@@ -82,6 +82,14 @@ export type ScrollConfig = {
 	/** Delay between scroll steps (ms). */
 	stepMs: number;
 	/**
+	 * Scroll increment per step in the settle loop (`settleUntilStable`), as a fraction of the
+	 * viewport height. Larger = fewer steps per pass = faster + less layout/paint CPU, but skips
+	 * more per hop, so a lazy widget with a tight `rootMargin` could be scrolled past before its
+	 * IntersectionObserver fires. `0.5` (half-viewport) is the safe default; `1.0` (full viewport)
+	 * roughly halves pass time. Values ≤ 0 fall back to 0.5. Default 0.5.
+	 */
+	stepFraction: number;
+	/**
 	 * Loop full scroll-passes (with a network-idle wait between each) until the DOM's
 	 * element count holds steady across passes, instead of a single scroll-to-bottom.
 	 * A single fast scroll triggers IntersectionObserver-lazy widgets but snapshots
@@ -175,7 +183,14 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStablePollMs: 250,
 		domStableTolerance: 8,
 	},
-	scroll: { enabled: true, stepMs: 200, settleUntilStable: false, settleStablePasses: 2, topSettleMs: 300 },
+	scroll: {
+		enabled: true,
+		stepMs: 200,
+		stepFraction: 0.5,
+		settleUntilStable: false,
+		settleStablePasses: 2,
+		topSettleMs: 300,
+	},
 	postProcess: {
 		stripScripts: true,
 		inlineEmptyStyleSheets: true,
@@ -237,6 +252,12 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 		if (typeof config.navigation[field] !== 'number' || config.navigation[field] < 0) {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
 		}
+	}
+	// Scroll step is a positive fraction of the viewport; reject non-numbers / non-positive
+	// (config is API- and JSON-supplied). scrollPass additionally floors pathologically small
+	// positive values in-page.
+	if (typeof config.scroll.stepFraction !== 'number' || config.scroll.stepFraction <= 0) {
+		throw new Error('prerender config: scroll.stepFraction must be a positive number');
 	}
 	return config;
 };
