@@ -115,10 +115,11 @@ export class RenderQueue extends Resource {
 			// Schedule the next render relative to when THIS one completed (now), not a
 			// fixed wall-clock time — so renders stay spread across the interval instead of
 			// realigning into a daily herd, and the cadence self-paces to fleet throughput.
-			// The per-target renderInterval drives the recurring cadence; the default only
-			// backs the cached-page expiry for an untracked one-off (no reschedule below).
+			// The per-target renderInterval drives the recurring cadence; fall back to the
+			// default when a target exists without a valid interval (a bare number check also
+			// rejects NaN from an arbitrary API PUT).
 			const interval =
-				typeof renderInterval === 'number' && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
+				Number.isFinite(renderInterval) && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
 			// The cached page expires when the next render is due; the swrTtl window then keeps
 			// it served while the re-render lands, so render latency up to swrTtl never causes
 			// a cache miss.
@@ -136,11 +137,14 @@ export class RenderQueue extends Resource {
 				});
 			}
 
-			if (typeof renderInterval === 'number' && renderInterval > 0) {
-				// Refresh fromSitemap from the live target so it self-corrects if the URL
-				// has since left its sitemap.
+			if (renderTarget) {
+				// A target owns this schedule → recurring. Reschedule relative to completion
+				// using the resolved interval (so a target lacking an explicit renderInterval
+				// falls back to the default instead of getting stuck re-claiming every lease
+				// period). Refresh fromSitemap from the live target so it self-corrects if the
+				// URL has since left its sitemap.
 				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
-			} else if (!renderTarget) {
+			} else {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
 				// row. Nothing sets a recurring cadence, so drop the schedule instead of
 				// leaving it to be re-claimed when the lease expires.

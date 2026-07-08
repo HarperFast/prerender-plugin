@@ -54,6 +54,11 @@ export const getNextTimeOfDay = (timeStr, timezone) => {
  * relative to render completion (see RenderQueue.processJobResult), so this initial
  * spread is preserved cycle over cycle rather than realigning to a fixed instant.
  */
-export const getInitialRenderTime = (key, interval) => currentMinuteMs(Date.now() + (fnv1a32(key) % interval));
+export const getInitialRenderTime = (key, interval) => {
+	// Guard against a zero/negative/NaN interval (which would make the modulo NaN and
+	// schedule an invalid time) so the helper is safe to call with unvalidated inputs.
+	const safeInterval = Number.isFinite(interval) && interval > 0 ? interval : config.render.defaultInterval;
+	return currentMinuteMs(Date.now() + (fnv1a32(key) % safeInterval));
+};
 
 export const getNextSitemapRefreshTime = () => getNextTimeOfDay(config.sitemap.refreshTime, config.sitemap.timezone);
