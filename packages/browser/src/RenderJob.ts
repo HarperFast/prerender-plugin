@@ -127,7 +127,8 @@ export default class RenderJob {
 		return this.latestAttempt?.error || null;
 	}
 
-	async sendResult() {
+	/** Returns true if the result was delivered (204), false if it was dropped after retries. */
+	async sendResult(): Promise<boolean> {
 		const health = getHostHealth();
 		let host = '';
 		try {
@@ -184,7 +185,7 @@ export default class RenderJob {
 				if (res.statusCode === 204) {
 					await res.body.bytes();
 					if (host) health.recordSuccess(host);
-					return;
+					return true;
 				}
 
 				const text = await res.body.text().catch(() => '');
@@ -203,7 +204,7 @@ export default class RenderJob {
 					health.recordError(host);
 				}
 				logger.error({ id: this.id, statusCode: res.statusCode, body: text, attempt }, 'failed to send job result');
-				return;
+				return false;
 			} catch (e) {
 				// Network error — host unreachable.
 				if (host) health.recordUnavailable(host);
@@ -212,8 +213,10 @@ export default class RenderJob {
 					continue;
 				}
 				logger.error({ id: this.id, err: e, attempt }, 'failed to send job result');
-				return;
+				return false;
 			}
 		}
+		// Exhausted retries without a definitive response (e.g. lease expired mid-backoff).
+		return false;
 	}
 }

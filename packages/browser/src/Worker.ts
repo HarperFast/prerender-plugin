@@ -6,6 +6,7 @@ import { RenderQueueConsumer } from './RenderQueueConsumer.js';
 import { setTimeout } from 'timers/promises';
 import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
+import { settings } from './settings.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -55,6 +56,30 @@ export default class RenderWorker {
 
 	lastRenderStartTime = Date.now();
 
+	// Per-interval counters, snapshotted-and-reset by logStats() so each log line is a delta
+	// (what this worker did since the last line), not a monotonic total. `renderTimes` is bounded
+	// by throughput over one interval and cleared each tick.
+	private stats = RenderWorker.freshStats();
+
+	private statsSince = Date.now();
+
+	private static freshStats() {
+		return {
+			completed: 0,
+			succeeded: 0,
+			emptyContent: 0,
+			failures: { timeout: 0, protocol: 0, tooManyRedirects: 0, getPageFailed: 0, other: 0 },
+			expiredSkipped: 0,
+			concurrencyBlocked: 0,
+			rpsDelayed: 0,
+			resultPostFailures: 0,
+			fromSitemap: 0,
+			browserLaunches: 0,
+			browserRetirements: 0,
+			renderTimes: [] as number[],
+		};
+	}
+
 	// Set on graceful shutdown: stops the consumer loop and blocks new renders while
 	// in-flight ones drain.
 	private shuttingDown = false;
@@ -82,7 +107,7 @@ export default class RenderWorker {
 
 		this.logStatsInterval = setInterval(() => {
 			this.logStats();
-		}, 45000);
+		}, 60000);
 
 		if (config.rps) {
 			this.rps = config.rps;
@@ -96,22 +121,26 @@ export default class RenderWorker {
 			const ts = Date.now();
 			// Do not run expired jobs to prevent double rendering
 			if (job.expiresAt - ts < 30 * 1000) {
+				this.stats.expiredSkipped++;
 				console.log(`Skipping expired job ${job.id}`);
 				continue;
 			}
 
 			// wait for slot to open up
 			if (this.inflight.size >= this.CONCURRENCY) {
+				this.stats.concurrencyBlocked++;
 				await Promise.race(this.inflight);
 			}
 
 			// wait if need to delay
 			const elapsed = ts - (this.lastRenderStartTime || Date.now());
 			if (elapsed < this.jobStartDelay) {
+				this.stats.rpsDelayed++;
 				const delay = this.jobStartDelay - elapsed;
 				await setTimeout(delay);
 			}
 			this.lastRenderStartTime = Date.now();
+			if (job.isFromSitemap) this.stats.fromSitemap++;
 			const p = this.render(job)
 				// NB: pino logger methods rely on `this`; passing `logger.error` bare makes it throw
 				// (`Cannot read properties of undefined (reading Symbol(pino.msgPrefix))`) when a render
@@ -144,16 +173,62 @@ export default class RenderWorker {
 				})()
 			: null;
 
+		// Snapshot-and-reset: everything below is a delta over the elapsed window, so a log line
+		// answers "what did this worker do since the last line" rather than "lifetime totals".
+		const s = this.stats;
+		this.stats = RenderWorker.freshStats();
+		const now = Date.now();
+		const elapsedSec = Math.max(0.001, (now - this.statsSince) / 1000);
+		this.statsSince = now;
+
+		const times = s.renderTimes.sort((a, b) => a - b);
+		const n = times.length;
+		const pct = (p: number) => (n ? times[Math.min(n - 1, Math.floor(p * n))] : 0);
+		const mean = n ? Math.round(times.reduce((a, b) => a + b, 0) / n) : 0;
+		const failuresTotal =
+			s.failures.timeout +
+			s.failures.protocol +
+			s.failures.tooManyRedirects +
+			s.failures.getPageFailed +
+			s.failures.other;
+
+		const mem = process.memoryUsage();
+
 		logger.info({
-			retiredBrowsers: this.retiredBrowsers.size,
-			currentBrowser: this.browser
-				? {
-						totalOpenedPages: this.browser.totalOpenedPages,
-						activePages: this.browser.activePages,
-						freeSlots: this.browser.freeSlots,
-						jobRefs: this.browser.jobRefs,
-					}
-				: null,
+			workerId: settings.harper.workerId || undefined,
+			windowSec: Number(elapsedSec.toFixed(1)),
+			throughput: {
+				completed: s.completed,
+				perSec: Number((s.completed / elapsedSec).toFixed(2)),
+				succeeded: s.succeeded,
+				emptyContent: s.emptyContent,
+				fromSitemap: s.fromSitemap,
+				failures: failuresTotal,
+				failuresByType: s.failures,
+				resultPostFailures: s.resultPostFailures,
+			},
+			renderMs: n ? { mean, p50: pct(0.5), p95: pct(0.95), max: times[n - 1] } : null,
+			saturation: {
+				inflight: this.inflight.size,
+				concurrency: this.CONCURRENCY,
+				concurrencyBlocked: s.concurrencyBlocked,
+				rpsDelayed: s.rpsDelayed,
+				expiredSkipped: s.expiredSkipped,
+			},
+			browsers: {
+				current: this.browser
+					? {
+							totalOpenedPages: this.browser.totalOpenedPages,
+							activePages: this.browser.activePages,
+							freeSlots: this.browser.freeSlots,
+							jobRefs: this.browser.jobRefs,
+						}
+					: null,
+				retired: this.retiredBrowsers.size,
+				launches: s.browserLaunches,
+				retirements: s.browserRetirements,
+			},
+			rssMb: Math.round(mem.rss / 1024 / 1024),
 			resourceCache: cacheStats,
 		});
 	}
@@ -225,6 +300,7 @@ export default class RenderWorker {
 			return;
 		}
 		this.retiredBrowsers.add(browser);
+		this.stats.browserRetirements++;
 		this.browser = null;
 	}
 
@@ -243,6 +319,7 @@ export default class RenderWorker {
 			page = await browser.getPage();
 		} catch (e) {
 			this.retireBrowser(browser);
+			this.stats.failures.getPageFailed++;
 			logger.error({ err: e }, 'failed to get page');
 			error = e as Error;
 		}
@@ -251,10 +328,17 @@ export default class RenderWorker {
 			try {
 				content = await this.renderFn(page, job);
 			} catch (e) {
-				if (e instanceof TimeoutError || e instanceof ProtocolError) {
+				if (e instanceof TimeoutError) {
 					this.retireBrowser(browser);
+					this.stats.failures.timeout++;
+				} else if (e instanceof ProtocolError) {
+					this.retireBrowser(browser);
+					this.stats.failures.protocol++;
 				} else if (e instanceof Error && e.message.startsWith('net::ERR_TOO_MANY_REDIRECTS')) {
 					job.isIndexable = false;
+					this.stats.failures.tooManyRedirects++;
+				} else {
+					this.stats.failures.other++;
 				}
 				logger.error({ url: job.url, err: e }, 'failed to render page');
 				error = e as Error;
@@ -264,13 +348,21 @@ export default class RenderWorker {
 		job.attemptEnded(error, content);
 		browser.jobRefs--;
 
-		const promises = [job.sendResult()];
-
-		if (page) {
-			promises.push(browser.closePage(page));
+		// Per-interval outcome + latency accounting (drained by logStats).
+		this.stats.completed++;
+		const attempt = job.latestAttempt;
+		if (attempt?.renderEndTime) {
+			this.stats.renderTimes.push(attempt.renderEndTime - attempt.renderStartTime);
+		}
+		if (!error) {
+			this.stats.succeeded++;
+			if (!content) this.stats.emptyContent++;
 		}
 
-		await Promise.all(promises);
+		const sendPromise = job.sendResult();
+		const closePromise = page ? browser.closePage(page) : Promise.resolve();
+		const [posted] = await Promise.all([sendPromise, closePromise]);
+		if (!posted) this.stats.resultPostFailures++;
 	}
 
 	async getBrowser(): Promise<ManagedBrowser> {
@@ -284,6 +376,7 @@ export default class RenderWorker {
 				puppeteerLaunchOptions: this.browserLaunchOptions,
 			}).finally(() => (this.browserPromise = null));
 			this.browser = await this.browserPromise;
+			this.stats.browserLaunches++;
 			logger.info({ event: 'launched browser', retired: this.retiredBrowsers.size });
 		}
 
