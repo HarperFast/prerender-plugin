@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
-import { resolveUpstreamHeaders, sanitizeOriginResponseHeaders, stagingTargetIp } from '../src/util/upstream.js';
+import {
+	configuredStagingIp,
+	resolveUpstreamHeaders,
+	sanitizeOriginResponseHeaders,
+	stagingTargetIp,
+} from '../src/util/upstream.js';
 
 // Minimal stand-in for the request headers object (only `.get` is used here).
 const headersWith = (present) => ({ get: (name) => (present.includes(name) ? '1' : null) });
@@ -51,6 +56,22 @@ test('stagingTargetIp is disabled when the toggle header name is configured empt
 test('stagingTargetIp supports an IPv6 staging address', () => {
 	applyOptions({ staging: { ip: '2606:2800:220:1:248:1893:25c8:1946' } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '2606:2800:220:1:248:1893:25c8:1946');
+});
+
+test('configuredStagingIp returns the configured ip regardless of any request header', () => {
+	applyOptions({ staging: { ip: '23.50.51.27' } });
+	// No header argument at all — the sitemap refresh opts in out-of-band, not via a header.
+	assert.equal(configuredStagingIp(), '23.50.51.27');
+});
+
+test('configuredStagingIp is undefined when no staging ip is configured', () => {
+	applyOptions({});
+	assert.equal(configuredStagingIp(), undefined);
+});
+
+test('configuredStagingIp ignores an invalid configured ip', () => {
+	applyOptions({ staging: { ip: 'not-an-ip' } });
+	assert.equal(configuredStagingIp(), undefined);
 });
 
 test('ignoredHeaders defaults to an empty list', () => {

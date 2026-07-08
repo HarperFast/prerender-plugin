@@ -119,6 +119,11 @@ const defaultConfig = () => ({
 	// The cache key does not include the header, so cache HITS always return the normal
 	// cached page regardless of it. Empty `ip` disables the feature — production is
 	// unaffected unless a staging IP is explicitly configured.
+	//
+	// The sitemap refresh reuses this `ip` too (opt-in via `staging: true` in the refresh
+	// POST body, since it has no incoming request header to toggle on): the security token
+	// often only authenticates against the staging edge, so a direct prod sitemap fetch is
+	// bounced with a 403.
 	staging: {
 		ip: '',
 		header: 'x-harper-staging',

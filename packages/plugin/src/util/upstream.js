@@ -18,6 +18,16 @@ export const stagingTargetIp = (headers) => {
 	return headers?.get(header) ? ip : undefined;
 };
 
+/**
+ * The configured staging IP if it is set and valid, else undefined — regardless of any
+ * request header. For callers that opt into staging out-of-band rather than via a per-request
+ * toggle header (e.g. the sitemap refresh, which has no incoming request to carry a header).
+ */
+export const configuredStagingIp = () => {
+	const { ip } = config.staging;
+	return ip && isIP(ip) ? ip : undefined;
+};
+
 // Dispatchers that pin DNS resolution to a fixed IP (staging passthrough), one per IP.
 // Only the connect address is overridden — the origin (so Host header + TLS SNI + cert
 // validation) stays the real origin host, the server-side equivalent of Chrome's
@@ -25,7 +35,7 @@ export const stagingTargetIp = (headers) => {
 // configured staging IP); the map just keeps it stable across requests and across a
 // config reload that changes the IP.
 const pinnedDispatchers = new Map();
-const dispatcherFor = (ip) => {
+export const dispatcherFor = (ip) => {
 	if (!ip) return agent;
 	let dispatcher = pinnedDispatchers.get(ip);
 	if (!dispatcher) {

@@ -1,13 +1,17 @@
-import { XMLParser } from 'fast-xml-parser';
 import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
+import { parseSitemap } from '../util/sitemap.js';
+import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
-	static async refresh(rootSitemapUrl, { revalidate = false, deviceTypes = config.deviceTypes.default } = {}) {
+	static async refresh(
+		rootSitemapUrl,
+		{ revalidate = false, deviceTypes = config.deviceTypes.default, staging = false } = {}
+	) {
 		let created = 0;
 		let updated = 0;
 		let skipped = 0;
@@ -29,7 +33,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 
 				logger.info(`Processing sitemap`, sitemapUrl);
 
-				const latestSitemap = await fetchLatestSitemap(sitemapUrl);
+				const latestSitemap = await fetchLatestSitemap(sitemapUrl, { staging });
 
 				if (latestSitemap.isIndex === true) {
 					for (const { loc } of latestSitemap.entries) {
@@ -201,33 +205,54 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 	return Math.max(ttl, minTtl);
 }
 
-async function fetchLatestSitemap(url) {
+async function fetchLatestSitemap(url, { staging = false } = {}) {
+	// The security token typically only authenticates against the staging edge, so a direct
+	// prod fetch gets bounced (Akamai 403 "Access Denied"). When the caller opts into staging,
+	// pin the TCP connection to the configured staging IP (Host/SNI stay the real origin, same
+	// as the origin-fetch path in upstream.js) so the token is honored.
+	const stagingIp = staging ? configuredStagingIp() : undefined;
+	const via = stagingIp ? ` (via staging ${stagingIp})` : '';
+
 	const res = await fetch(url, {
 		method: 'GET',
 		redirect: 'follow',
 		headers: { 'User-Agent': 'harper-bot/1.0', [config.securityToken.header]: config.securityToken.value },
+		dispatcher: dispatcherFor(stagingIp),
 	});
 	const xml = await res.text();
 
-	const parser = new XMLParser({
-		isArray: (tagName) => ['sitemap', 'url'].some((value) => value === tagName),
-	});
-
-	const data = parser.parse(xml);
-
-	const parsed = { url, lastRefreshed: new Date(), entries: [], entryCount: 0 };
-
-	if (Array.isArray(data?.urlset?.url)) {
-		parsed.isIndex = false;
-		parsed.entries = data.urlset.url;
-	} else if (Array.isArray(data?.sitemapindex?.sitemap)) {
-		parsed.isIndex = true;
-		parsed.entries = data.sitemapindex.sitemap;
+	// A blocked/errored fetch returns an HTML error page with a 4xx/5xx status. Guard the
+	// status AND the parsed shape so it fails loudly instead of being silently treated as an
+	// empty sitemap (which used to return a misleading `created: 0` success).
+	if (!res.ok) {
+		throw new Error(`Sitemap fetch failed for ${url}${via}: ${res.status} ${res.statusText} — ${snippet(xml)}`);
 	}
 
-	parsed.entryCount = parsed.entries.length;
+	let parsed;
+	try {
+		parsed = parseSitemap(xml);
+	} catch (e) {
+		const contentType = res.headers.get('content-type') ?? 'unknown';
+		throw new Error(
+			`Sitemap fetch for ${url}${via} returned a non-sitemap response (status ${res.status}, content-type ${contentType}): ${e.message} — ${snippet(xml)}`
+		);
+	}
 
-	return parsed;
+	return {
+		url,
+		lastRefreshed: new Date(),
+		isIndex: parsed.isIndex,
+		entries: parsed.entries,
+		entryCount: parsed.entries.length,
+	};
+}
+
+// A short, single-line excerpt of a response body for error messages.
+function snippet(body, max = 200) {
+	const text = String(body ?? '')
+		.replace(/\s+/g, ' ')
+		.trim();
+	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 let sitemapSchedulerStarted = false;
