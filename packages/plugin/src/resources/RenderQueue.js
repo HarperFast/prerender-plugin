@@ -119,15 +119,10 @@ export class RenderQueue extends Resource {
 			// backs the cached-page expiry for an untracked one-off (no reschedule below).
 			const interval =
 				typeof renderInterval === 'number' && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
-			const now = currentMinuteMs();
-			const expiresAt = now + interval;
-
-			// Re-render AHEAD of expiry so the fresh page replaces the old one before it goes
-			// stale. The lead is the fleet-latency margin that keeps a slow render from turning
-			// into a cache miss; clamped to half the interval so short-interval targets still
-			// make forward progress.
-			const lead = Math.min(config.render.refreshLeadTime, Math.floor(interval / 2));
-			const nextRenderTime = expiresAt - lead;
+			// The cached page expires when the next render is due; the swrTtl window then keeps
+			// it served while the re-render lands, so render latency up to swrTtl never causes
+			// a cache miss.
+			const nextRenderTime = currentMinuteMs() + interval;
 
 			if (result.content) {
 				result.headers['x-harper-rendered'] = '1';
@@ -136,7 +131,7 @@ export class RenderQueue extends Resource {
 					lastCached: Date.now(),
 					content: createBlob(result.content),
 					headers: JSON.stringify(result.headers),
-					expiresAt,
+					expiresAt: nextRenderTime,
 					isIndexable: typeof result.isIndexable === 'boolean' ? result.isIndexable : null,
 				});
 			}
@@ -183,6 +178,11 @@ export class RenderQueue extends Resource {
 		if (QueueState.status === 'paused') {
 			return [];
 		}
+
+		// Bound the batch server-side so no consumer can over-claim: a large grant means a
+		// large lease-write burst held under this mutex (long lock hold) and lets one worker
+		// hoard a burst other renderers should share.
+		limit = Math.min(Math.max(1, limit | 0), config.queue.maxClaimLimit);
 
 		const currentMinute = currentMinuteMs();
 		// Fully drain the search (read) transaction into memory BEFORE issuing any

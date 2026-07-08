@@ -80,7 +80,6 @@ rest: true # required for the @export-ed table REST endpoints
 
   render:
     defaultInterval: 86400000 # 24h — how often a target is re-rendered (relative to completion)
-    refreshLeadTime: 3600000 # 1h  — re-render this long before a page expires (refresh-ahead)
 
   sitemap:
     refreshTime: '12:00' # local time-of-day for the daily sitemap refresh

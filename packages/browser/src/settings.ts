@@ -229,7 +229,10 @@ export const applySettings = (options: BrowserOptions): Settings => {
 	fresh.config = typeof options.config === 'string' ? loadConfig(options.config) : mergeConfig(options.config ?? {});
 	fresh.concurrency = options.concurrency ?? fresh.concurrency;
 	fresh.rps = options.rps ?? fresh.rps;
-	fresh.jobClaimLimit = options.jobClaimLimit ?? fresh.concurrency * 2;
+	// Claim at most what this worker can actually render at once. Over-claiming (the old
+	// concurrency*2) made one worker grab jobs it couldn't start and hold them leased-idle,
+	// starving other renderers of a burst and doubling the per-claim lease-write transaction.
+	fresh.jobClaimLimit = options.jobClaimLimit ?? fresh.concurrency;
 	fresh.browserExpirationThreshold = options.browserExpirationThreshold ?? fresh.browserExpirationThreshold;
 	fresh.incognitoPages = options.incognitoPages ?? fresh.incognitoPages;
 	fresh.contentEncoding = options.contentEncoding ?? fresh.contentEncoding;
