@@ -1,5 +1,6 @@
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
 import { Readable } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
 import { getBotName } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
@@ -8,8 +9,10 @@ import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
 import { RenderTarget } from '../resources/RenderTarget.js';
+import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
+import { isRenderNowAuthorized, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
 
 export async function handleBotRequest(request) {
@@ -41,6 +44,7 @@ export async function handleBotRequest(request) {
 		}
 
 		let resource;
+		let renderNowStatus;
 
 		if (request.method !== 'GET' && request.method !== 'HEAD') {
 			logger.warn(`Unexpected Request ${request.method} ${url}`);
@@ -55,16 +59,20 @@ export async function handleBotRequest(request) {
 		} else {
 			const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(url), deviceType });
 
-			const page = await PrerenderedPage.get(cacheKey);
-
-			if (page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now()) {
-				resource = page;
+			if (request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url)) {
+				({ resource, renderNowStatus } = await renderNow({ url, deviceType, cacheKey, request }));
 			} else {
-				resource = await fetchOriginResource({ url, deviceType, headers: request.headers });
+				const page = await PrerenderedPage.get(cacheKey);
+
+				if (page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now()) {
+					resource = page;
+				} else {
+					resource = await fetchOriginResource({ url, deviceType, headers: request.headers });
+				}
 			}
 		}
 
-		return deliverResource(resource, request);
+		return deliverResource(resource, request, renderNowStatus);
 	} catch (e) {
 		logger.error(e);
 		return {
@@ -72,6 +80,64 @@ export async function handleBotRequest(request) {
 			status: 500,
 		};
 	}
+}
+
+// A URL is excluded from prerendering when its string form contains any configured
+// exclude pattern. Accepts a URL object or a string.
+function isExcludedUrl(url) {
+	const urlString = String(url);
+	return config.excludePathPatterns.some((pattern) => urlString.includes(pattern));
+}
+
+// On-demand render: force an immediate one-off render and wait for the fresh result,
+// bypassing both the cache and the origin proxy. Returns { resource, renderNowStatus }
+// where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
+async function renderNow({ url, deviceType, cacheKey, request }) {
+	const since = Date.now();
+	const { RenderSchedule } = databases.render_schedule;
+
+	// Force an immediately-claimable, one-off schedule. No RenderTarget is created, so
+	// processJobResult won't reschedule it — and drops the schedule row once the result
+	// lands — keeping this a single render rather than a recurring target.
+	await RenderSchedule.put(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
+
+	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
+	// so a paused queue stays paused (the render then simply times out to the fallback).
+	await QueueState.reportStatus('queued');
+
+	const page = await pollForFreshRender({
+		get: (key) => PrerenderedPage.get(key),
+		cacheKey,
+		since,
+		timeoutMs: config.renderNow.timeoutMs,
+		pollIntervalMs: config.renderNow.pollIntervalMs,
+		sleep,
+	});
+
+	if (page) {
+		return { resource: page, renderNowStatus: 'hit' };
+	}
+
+	// The render didn't land before the timeout — fall back per config.
+	const { fallback } = config.renderNow;
+
+	if (fallback === 'error') {
+		return {
+			resource: { miss: true, statusCode: 504, url: String(url), deviceType, headers: {}, content: null },
+			renderNowStatus: 'timeout',
+		};
+	}
+
+	if (fallback === 'stale') {
+		const stale = await PrerenderedPage.get(cacheKey);
+		if (stale) return { resource: stale, renderNowStatus: 'timeout' };
+	}
+
+	// 'origin' (default), or 'stale' with no cached page to serve.
+	return {
+		resource: await fetchOriginResource({ url, deviceType, headers: request.headers }),
+		renderNowStatus: 'timeout',
+	};
 }
 
 async function handlePageScheduling(resource) {
@@ -102,7 +168,7 @@ async function handlePageScheduling(resource) {
 
 const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
 
-function deliverResource(resource, request) {
+function deliverResource(resource, request, renderNowStatus) {
 	let status = resource.statusCode;
 	let headers = new Headers();
 	let body = request.method === 'HEAD' ? undefined : resource.content;
@@ -122,7 +188,7 @@ function deliverResource(resource, request) {
 			wasCacheMiss = true;
 		}
 
-		const excluded = config.excludePathPatterns.some((pattern) => resource.url.includes(pattern));
+		const excluded = isExcludedUrl(resource.url);
 		if (status === 200 && !excluded) {
 			setImmediate(handlePageScheduling, resource);
 		}
@@ -196,6 +262,13 @@ function deliverResource(resource, request) {
 			headers = headers304;
 			body = undefined;
 		}
+	}
+
+	// Always surface the on-demand render outcome so the caller knows whether it got a
+	// fresh render ('hit') or the fallback ('timeout'). Set after 304 handling so it
+	// survives the header reset on a conditional response.
+	if (renderNowStatus) {
+		headers.set('x-harper-render-now', renderNowStatus);
 	}
 
 	if (body) {

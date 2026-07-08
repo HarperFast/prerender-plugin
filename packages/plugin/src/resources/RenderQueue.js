@@ -129,6 +129,11 @@ export class RenderQueue extends Resource {
 				// Refresh fromSitemap from the live target so it self-corrects if the URL
 				// has since left its sitemap.
 				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+			} else if (!renderTarget) {
+				// No target owns this schedule: it's a one-off (render-now) or an orphaned
+				// row. Nothing sets a recurring cadence, so drop the schedule instead of
+				// leaving it to be re-claimed when the lease expires.
+				await RenderSchedule.delete(cacheKey);
 			}
 		} else if (result.isIndexable === false) {
 			logger.warn(`Skipped prerendered url: ${cacheKey}`);
