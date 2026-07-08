@@ -153,6 +153,13 @@ export class RenderQueue extends Resource {
 			}
 		} else {
 			logger.warn(`Unknown prerender error for ${cacheKey}`);
+			// A target-backed job is left to retry after its lease expires. But a one-off
+			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
+			// and re-render the failed job indefinitely — drop it instead.
+			const renderTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
+			if (!renderTarget) {
+				await RenderSchedule.delete(cacheKey);
+			}
 		}
 	}
 

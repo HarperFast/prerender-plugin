@@ -12,7 +12,7 @@ import { RenderTarget } from '../resources/RenderTarget.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
-import { isRenderNowAuthorized, pollForFreshRender } from '../util/renderNow.js';
+import { isRenderNowAuthorized, isRenderInFlight, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
 
 export async function handleBotRequest(request) {
@@ -94,16 +94,23 @@ function isExcludedUrl(url) {
 // where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
 async function renderNow({ url, deviceType, cacheKey, request }) {
 	const since = Date.now();
+	const now = currentMinuteMs();
 	const { RenderSchedule } = databases.render_schedule;
 
-	// Force an immediately-claimable, one-off schedule. No RenderTarget is created, so
-	// processJobResult won't reschedule it — and drops the schedule row once the result
-	// lands — keeping this a single render rather than a recurring target.
-	await RenderSchedule.put(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
+	// Piggyback on a render that is already in flight rather than forcing a duplicate
+	// concurrent render (see isRenderInFlight — a DoS guard against render-now spam).
+	const existing = await RenderSchedule.get(cacheKey);
 
-	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
-	// so a paused queue stays paused (the render then simply times out to the fallback).
-	await QueueState.reportStatus('queued');
+	if (!isRenderInFlight(existing, now, config.queue.jobLeaseTime)) {
+		// Force an immediately-claimable schedule. When no RenderTarget owns this key it's a
+		// one-off — processJobResult won't reschedule it and drops the row once the result
+		// lands. Preserve an existing target's `fromSitemap` flag so we don't clobber it.
+		await RenderSchedule.put(cacheKey, { nextRenderTime: now, fromSitemap: existing?.fromSitemap ?? false });
+
+		// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
+		// so a paused queue stays paused (the render then simply times out to the fallback).
+		await QueueState.reportStatus('queued');
+	}
 
 	const page = await pollForFreshRender({
 		get: (key) => PrerenderedPage.get(key),

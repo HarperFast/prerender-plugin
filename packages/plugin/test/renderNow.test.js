@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
-import { isRenderNowAuthorized, pollForFreshRender } from '../src/util/renderNow.js';
+import { isRenderNowAuthorized, isRenderInFlight, pollForFreshRender } from '../src/util/renderNow.js';
 
 // Minimal stand-in for request headers (only `.get` is used). `values` maps
 // header name -> value; a missing name returns null (Harper/Headers semantics).
@@ -55,6 +55,34 @@ test('renderNow.token is sourced from valueEnv when set', () => {
 	assert.equal(config.renderNow.token, 'from-env');
 	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'from-env' })), true);
 	delete process.env.RENDER_NOW_TOKEN_TEST;
+});
+
+test('isRenderInFlight: no existing schedule is not in flight (safe to enqueue)', () => {
+	const lease = 10 * 60 * 1000;
+	assert.equal(isRenderInFlight(null, 1_000_000, lease), false);
+	assert.equal(isRenderInFlight(undefined, 1_000_000, lease), false);
+});
+
+test('isRenderInFlight: a due/past schedule is not in flight (claimable, re-enqueue)', () => {
+	const now = 1_000_000;
+	const lease = 10 * 60 * 1000;
+	assert.equal(isRenderInFlight({ nextRenderTime: now }, now, lease), false);
+	assert.equal(isRenderInFlight({ nextRenderTime: now - 1 }, now, lease), false);
+});
+
+test('isRenderInFlight: a lease-window schedule IS in flight (piggyback, no duplicate render)', () => {
+	const now = 1_000_000;
+	const lease = 10 * 60 * 1000;
+	assert.equal(isRenderInFlight({ nextRenderTime: now + 1 }, now, lease), true);
+	assert.equal(isRenderInFlight({ nextRenderTime: now + lease }, now, lease), true);
+});
+
+test('isRenderInFlight: a far-future scheduled target is NOT in flight (bump to now)', () => {
+	const now = 1_000_000;
+	const lease = 10 * 60 * 1000;
+	// e.g. a target scheduled for tonight — render-now should still force it now.
+	assert.equal(isRenderInFlight({ nextRenderTime: now + lease + 1 }, now, lease), false);
+	assert.equal(isRenderInFlight({ nextRenderTime: now + 24 * 60 * 60 * 1000 }, now, lease), false);
 });
 
 test('pollForFreshRender returns a page rendered at/after `since`', async () => {
