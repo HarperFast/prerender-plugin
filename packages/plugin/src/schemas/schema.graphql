@@ -32,10 +32,13 @@ type SitemapRefresh @table(database: "sitemaps") {
 	lastRefreshed: Date
 }
 
+# One row per URL. Rendering is per-device, so RenderSchedule and PrerenderedPage
+# stay keyed by the full `url|deviceType` cacheKey; this registry collapses those
+# variations into a single row whose `deviceTypes` array drives the per-device
+# schedule/page fan-out in RenderTarget.put/delete/revalidate.
 type RenderTarget @table(database: "render_service") @export {
-	cacheKey: String @primaryKey
-	url: String
-	deviceType: String
+	url: String @primaryKey
+	deviceTypes: [String]
 	region: String
 	sitemapUrl: String @indexed
 	schedulerNode: String

@@ -70,7 +70,7 @@ export class RenderQueue extends Resource {
 		if (result.redirectedTo) {
 			if (result.redirectedTo !== result.url) {
 				logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-				await RenderTarget.delete(result.id);
+				await RenderTarget.delete(CacheKey.extractUrl(result.id));
 			}
 
 			const { deviceType } = CacheKey.parse(result.id);
@@ -109,7 +109,10 @@ export class RenderQueue extends Resource {
 		}
 
 		if (result.isIndexable === true || hasContent) {
-			const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
+			const renderTarget = await RenderTarget.get({
+				id: CacheKey.extractUrl(cacheKey),
+				select: ['renderInterval', 'sitemapUrl'],
+			});
 			const renderInterval = renderTarget?.renderInterval;
 
 			const nextRenderTime = getNextRenderTime();
@@ -138,7 +141,7 @@ export class RenderQueue extends Resource {
 			}
 		} else if (result.isIndexable === false) {
 			logger.warn(`Skipped prerendered url: ${cacheKey}`);
-			await RenderTarget.delete(cacheKey);
+			await RenderTarget.delete(CacheKey.extractUrl(cacheKey));
 
 			try {
 				const nonIndexableUrl = CacheKey.extractUrl(cacheKey);
@@ -157,7 +160,7 @@ export class RenderQueue extends Resource {
 			// A target-backed job is left to retry after its lease expires. But a one-off
 			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
 			// and re-render the failed job indefinitely — drop it instead.
-			const renderTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
+			const renderTarget = await RenderTarget.get({ id: CacheKey.extractUrl(cacheKey), select: 'url' });
 			if (!renderTarget) {
 				await RenderSchedule.delete(cacheKey);
 			}

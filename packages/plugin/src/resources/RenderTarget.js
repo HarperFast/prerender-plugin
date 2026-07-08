@@ -9,43 +9,72 @@ const {
 	page_cache: { PrerenderedPage },
 } = databases;
 
+// RenderTarget is keyed by URL (one row per URL) while RenderSchedule and
+// PrerenderedPage stay keyed by the full `url|deviceType` cacheKey (rendered HTML
+// and render cadence are per-device). Every lifecycle method below therefore fans
+// out over the target's `deviceTypes` to maintain the N schedule/page rows a single
+// target owns.
 export class RenderTarget extends databases.render_service.RenderTarget {
 	async put(data, target) {
-		const cacheKey = this.getId();
+		const url = this.getId();
 
 		let nextRenderTime = data.nextRenderTime;
 		delete data.nextRenderTime;
 
+		// `put` replaces a target's device set wholesale; callers pass the full set they
+		// want tracked (sitemap refresh / auto-discovery both use the configured default).
+		const deviceTypes =
+			Array.isArray(data.deviceTypes) && data.deviceTypes.length ? data.deviceTypes : config.deviceTypes.default;
+		data.deviceTypes = deviceTypes;
+
 		if (!data.schedulerNode) {
-			data.schedulerNode = getResidencyByUrl(CacheKey.extractUrl(cacheKey));
+			data.schedulerNode = getResidencyByUrl(url);
 		}
 
-		// Write the target first, then the schedule. RenderTarget and RenderSchedule
-		// now live in separate databases (the schedule is isolated as the hot queue),
-		// so these are two independent commits rather than one atomic write. Ordering
+		// Write the target first, then the schedules. RenderTarget and RenderSchedule
+		// live in separate databases (the schedule is isolated as the hot queue), so
+		// these are independent commits rather than one atomic write. Ordering
 		// target-first keeps the invariant "a schedule always references an existing
 		// target" (which `claim` relies on); the reverse gap — a target with no
 		// schedule — is benign and self-heals on the next sitemap refresh / revalidate.
-		const result = await super.put({ ...CacheKey.parse(cacheKey), ...data }, target);
+		const result = await super.put({ url, ...data }, target);
 
-		await RenderSchedule.put(cacheKey, {
-			nextRenderTime: typeof nextRenderTime === 'number' ? nextRenderTime : getNextRenderTime(),
-			fromSitemap: !!data.sitemapUrl,
-		});
+		const scheduleTime = typeof nextRenderTime === 'number' ? nextRenderTime : getNextRenderTime();
+		const fromSitemap = !!data.sitemapUrl;
+
+		await Promise.all(
+			deviceTypes.map((deviceType) =>
+				RenderSchedule.put(CacheKey.toCacheKey({ url, deviceType }), {
+					nextRenderTime: scheduleTime,
+					fromSitemap,
+				})
+			)
+		);
 
 		return result;
 	}
 
 	async delete() {
-		const cacheKey = this.getId();
+		const url = this.getId();
 
-		await Promise.all([RenderSchedule.delete(cacheKey), PrerenderedPage.delete(cacheKey)]);
+		// Drop every per-device schedule and cached page this URL owns. Read the row's
+		// own device set so we clean up exactly what was written (falling back to the
+		// configured default if the row is missing/partial).
+		const existing = await RenderTarget.get({ id: url, select: ['deviceTypes'] });
+		const deviceTypes = existing?.deviceTypes?.length ? existing.deviceTypes : config.deviceTypes.default;
+
+		await Promise.all(
+			deviceTypes.flatMap((deviceType) => {
+				const cacheKey = CacheKey.toCacheKey({ url, deviceType });
+				return [RenderSchedule.delete(cacheKey), PrerenderedPage.delete(cacheKey)];
+			})
+		);
 
 		return super.delete(...arguments);
 	}
 
-	static async getRenderInterval(cacheKey) {
-		const renderInterval = await RenderTarget.get({ id: cacheKey, select: 'renderInterval' });
+	static async getRenderInterval(url) {
+		const renderInterval = await RenderTarget.get({ id: url, select: 'renderInterval' });
 		return renderInterval ?? config.render.defaultInterval;
 	}
 
@@ -64,19 +93,24 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 		let count = 0;
 
 		for await (const target of this.search(requestTarget)) {
-			count++;
-			const existingPage = await PrerenderedPage.get({ id: target.cacheKey, select: ['cacheKey', 'expiresAt'] });
+			const deviceTypes = target.deviceTypes?.length ? target.deviceTypes : config.deviceTypes.default;
 
-			if (existingPage) {
-				batch.push(PrerenderedPage.patch(target.cacheKey, { expiresAt: Date.now() }));
-			}
+			for (const deviceType of deviceTypes) {
+				count++;
+				const cacheKey = CacheKey.toCacheKey({ url: target.url, deviceType });
+				const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
 
-			batch.push(RenderSchedule.put(target.cacheKey, { nextRenderTime }));
+				if (existingPage) {
+					batch.push(PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() }));
+				}
 
-			if (batch.length >= 100) {
-				await Promise.all(batch);
-				batch = [];
-				await setImmediate();
+				batch.push(RenderSchedule.put(cacheKey, { nextRenderTime }));
+
+				if (batch.length >= 100) {
+					await Promise.all(batch);
+					batch = [];
+					await setImmediate();
+				}
 			}
 		}
 

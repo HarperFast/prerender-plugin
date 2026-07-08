@@ -1,7 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
-import { CacheKey } from '../util/cacheKey.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 
 class Sitemap extends databases.sitemaps.Sitemap {
@@ -42,12 +41,11 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					const incomingEntryMap = new Map(latestSitemap.entries.map((entry) => [entry.loc, entry]));
 
 					for await (const target of RenderTarget.search({
-						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
+						select: ['url', 'renderInterval', 'sitemapUrl'],
 						conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 					})) {
-						const parsed = CacheKey.parse(target.cacheKey);
-						if (!incomingEntryMap.has(parsed.url)) {
-							lastPromise = RenderTarget.patch(target.cacheKey, {
+						if (!incomingEntryMap.has(target.url)) {
+							lastPromise = RenderTarget.patch(target.url, {
 								sitemapUrl: null,
 							});
 							inflightCount++;
@@ -68,49 +66,47 @@ class Sitemap extends databases.sitemaps.Sitemap {
 							defaultTtl: config.page.ttl,
 						});
 
-						for (const deviceType of deviceTypes) {
-							let updateTarget = false;
-							let revalidateNow = revalidate;
+						let updateTarget = false;
+						let revalidateNow = revalidate;
 
-							const cacheKey = CacheKey.toCacheKey({ url, deviceType });
+						if (revalidateNow) {
+							updateTarget = true;
+							created++;
+						} else {
+							// Only `sitemapUrl` is needed here; avoid materializing the full
+							// record for every entry in this bulk loop.
+							const existingTarget = await RenderTarget.get({ id: url, select: 'sitemapUrl' });
 
-							if (revalidateNow) {
-								updateTarget = true;
-								created++;
-							} else {
-								// Only `sitemapUrl` is needed here; avoid materializing the full
-								// record for every entry × deviceType in this bulk loop.
-								const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'sitemapUrl' });
-
-								if (existingTarget) {
-									updateTarget = existingTarget.sitemapUrl !== sitemapUrl;
-									if (updateTarget) {
-										updated++;
-									}
-								} else {
-									created++;
-									updateTarget = true;
-									revalidateNow = true;
+							if (existingTarget) {
+								updateTarget = existingTarget.sitemapUrl !== sitemapUrl;
+								if (updateTarget) {
+									updated++;
 								}
-							}
-
-							if (updateTarget) {
-								lastPromise = RenderTarget.put(cacheKey, {
-									renderInterval,
-									sitemapUrl,
-									nextRenderTime: revalidateNow ? currentMinuteMs() : undefined,
-								});
-								inflightCount++;
 							} else {
-								skipped++;
+								created++;
+								updateTarget = true;
+								revalidateNow = true;
 							}
+						}
 
-							if (inflightCount >= 50) {
-								await lastPromise;
-								inflightCount = 0;
-							} else if (inflightCount % 20 === 0) {
-								await new Promise(setImmediate);
-							}
+						if (updateTarget) {
+							// One target per URL; put fans out the per-device schedules for `deviceTypes`.
+							lastPromise = RenderTarget.put(url, {
+								deviceTypes,
+								renderInterval,
+								sitemapUrl,
+								nextRenderTime: revalidateNow ? currentMinuteMs() : undefined,
+							});
+							inflightCount++;
+						} else {
+							skipped++;
+						}
+
+						if (inflightCount >= 50) {
+							await lastPromise;
+							inflightCount = 0;
+						} else if (inflightCount % 20 === 0) {
+							await new Promise(setImmediate);
 						}
 					}
 
@@ -153,10 +149,10 @@ class Sitemap extends databases.sitemaps.Sitemap {
 	async delete() {
 		const url = this.getId();
 
-		const it = RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: url }], select: 'cacheKey' });
+		const it = RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: url }], select: 'url' });
 		let promise;
-		for await (const cacheKey of it) {
-			promise = RenderTarget.delete(cacheKey);
+		for await (const targetUrl of it) {
+			promise = RenderTarget.delete(targetUrl);
 			await new Promise(setImmediate);
 		}
 

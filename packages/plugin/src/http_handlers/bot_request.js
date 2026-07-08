@@ -172,15 +172,15 @@ async function handlePageScheduling(resource) {
 			});
 
 			if (!existingNonIndexable) {
-				for (const deviceType of config.deviceTypes.default) {
-					const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(resource.url), deviceType });
-					const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
-					if (!existingTarget) {
-						await RenderTarget.put(cacheKey, {
-							renderInterval: config.render.defaultInterval,
-							nextRenderTime: currentMinuteMs(),
-						});
-					}
+				const url = cacheKeyUrl(resource.url);
+				const existingTarget = await RenderTarget.get({ id: url, select: 'url' });
+				if (!existingTarget) {
+					// One target per URL; put fans out schedules for the default device set.
+					await RenderTarget.put(url, {
+						deviceTypes: config.deviceTypes.default,
+						renderInterval: config.render.defaultInterval,
+						nextRenderTime: currentMinuteMs(),
+					});
 				}
 			}
 		}
