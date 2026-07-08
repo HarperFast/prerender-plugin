@@ -34,7 +34,7 @@ export const wantsCacheSkip = (headers) => {
 	const directives = cacheControl
 		.toLowerCase()
 		.split(',')
-		.map((directive) => directive.trim().split('=')[0]);
+		.map((directive) => directive.split('=')[0].trim());
 	return directives.includes('no-cache') || directives.includes('no-store');
 };
 
@@ -47,7 +47,7 @@ export const resolveMissMode = (headers) => {
 	const { missHeader, defaultMissMode } = config.renderNow;
 	const value = missHeader ? headers.get(missHeader) : null;
 	if (!value) return defaultMissMode;
-	const normalized = value.toLowerCase();
+	const normalized = value.trim().toLowerCase();
 	if (normalized === 'origin') return 'origin';
 	if (normalized === 'prerender') return 'prerender';
 	return defaultMissMode;

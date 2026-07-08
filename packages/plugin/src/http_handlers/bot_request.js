@@ -194,7 +194,8 @@ const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-mod
 // Compact one-line description of a matched forwarded-mode route for the
 // x-harper-route debug header.
 function formatRoute(route) {
-	return `${route.match} ${route.path} [${route.queryParams.join(', ')}]`;
+	const params = Array.isArray(route.queryParams) ? route.queryParams.join(', ') : '';
+	return `${route.match ?? ''} ${route.path ?? ''} [${params}]`;
 }
 
 function deliverResource(resource, request, info = {}) {

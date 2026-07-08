@@ -63,6 +63,8 @@ test('wantsCacheSkip is true for no-cache / no-store, false otherwise', () => {
 	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'no-cache, no-store' })), true);
 	// case-insensitive and tolerant of surrounding directives
 	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'public, No-Cache, max-age=0' })), true);
+	// robust to spaces around '=' in a (malformed) directive
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'no-cache = foo' })), true);
 	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'max-age=0' })), false);
 	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'public, max-age=60' })), false);
 	assert.equal(wantsCacheSkip(headersWith({})), false);
@@ -73,6 +75,8 @@ test('resolveMissMode reads the configured missHeader and falls back to the defa
 	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'prerender' })), 'prerender');
 	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'origin' })), 'origin');
 	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'ORIGIN' })), 'origin');
+	// robust to surrounding whitespace
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': '  origin  ' })), 'origin');
 	// absent / empty / unrecognized -> default
 	assert.equal(resolveMissMode(headersWith({})), 'prerender');
 	assert.equal(resolveMissMode(headersWith({ 'x-miss': '' })), 'prerender');
