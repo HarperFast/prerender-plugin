@@ -8,10 +8,7 @@ import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
-	static async refresh(
-		rootSitemapUrl,
-		{ revalidate = false, deviceTypes = config.deviceTypes.default, staging = false } = {}
-	) {
+	static async refresh(rootSitemapUrl, { revalidate = false, deviceTypes = config.deviceTypes.default } = {}) {
 		let created = 0;
 		let updated = 0;
 		let skipped = 0;
@@ -33,7 +30,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 
 				logger.info(`Processing sitemap`, sitemapUrl);
 
-				const latestSitemap = await fetchLatestSitemap(sitemapUrl, { staging });
+				const latestSitemap = await fetchLatestSitemap(sitemapUrl);
 
 				if (latestSitemap.isIndex === true) {
 					for (const { loc } of latestSitemap.entries) {
@@ -205,18 +202,19 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 	return Math.max(ttl, minTtl);
 }
 
-async function fetchLatestSitemap(url, { staging = false } = {}) {
-	// The security token typically only authenticates against the staging edge, so a direct
-	// prod fetch gets bounced (Akamai 403 "Access Denied"). When the caller opts into staging,
-	// pin the TCP connection to the configured staging IP (Host/SNI stay the real origin, same
-	// as the origin-fetch path in upstream.js) so the token is honored.
-	const stagingIp = staging ? configuredStagingIp() : undefined;
+async function fetchLatestSitemap(url) {
+	// Route every Harper→origin sitemap fetch through the same edge as the render/origin-fetch
+	// path: whenever a staging IP is configured, pin the TCP connection to it (Host/SNI stay the
+	// real origin, exactly like upstream.js). The security token typically only authenticates
+	// against the staging edge, so a direct prod fetch is bounced with a 403 "Access Denied".
+	// Empty staging.ip → normal direct fetch (production, once the token is valid at the origin).
+	const stagingIp = configuredStagingIp();
 	const via = stagingIp ? ` (via staging ${stagingIp})` : '';
 
 	const res = await fetch(url, {
 		method: 'GET',
 		redirect: 'follow',
-		headers: { 'User-Agent': 'harper-bot/1.0', [config.securityToken.header]: config.securityToken.value },
+		headers: { 'User-Agent': config.sitemapUserAgent, [config.securityToken.header]: config.securityToken.value },
 		dispatcher: dispatcherFor(stagingIp),
 	});
 	const xml = await res.text();
