@@ -31,6 +31,20 @@ test('applyOptions rejects type-mismatched values and keeps defaults', () => {
 	assert.equal(config.page.ttl, 24 * 60 * 60 * 1000);
 });
 
+test('sitemapUserAgent defaults to the Harper sitemap crawler UA and is overridable', () => {
+	applyOptions({});
+	assert.equal(config.sitemapUserAgent, 'HarperSitemapCrawler/1.0');
+	applyOptions({ sitemapUserAgent: 'AcmeBot/2.0' });
+	assert.equal(config.sitemapUserAgent, 'AcmeBot/2.0');
+});
+
+test('proxy device UAs carry the HarperProxy product token', () => {
+	applyOptions({});
+	for (const ua of Object.values(config.userAgents)) {
+		assert.match(ua, /HarperProxy\/1\.0$/);
+	}
+});
+
 test('applyOptions exposes analytics + url defaults', () => {
 	applyOptions({});
 	assert.equal(config.analytics.enabled, true);

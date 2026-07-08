@@ -1,8 +1,9 @@
-import { XMLParser } from 'fast-xml-parser';
 import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
+import { parseSitemap } from '../util/sitemap.js';
+import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
@@ -202,32 +203,56 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 }
 
 async function fetchLatestSitemap(url) {
+	// Route every Harper→origin sitemap fetch through the same edge as the render/origin-fetch
+	// path: whenever a staging IP is configured, pin the TCP connection to it (Host/SNI stay the
+	// real origin, exactly like upstream.js). The security token typically only authenticates
+	// against the staging edge, so a direct prod fetch is bounced with a 403 "Access Denied".
+	// Empty staging.ip → normal direct fetch (production, once the token is valid at the origin).
+	const stagingIp = configuredStagingIp();
+	const via = stagingIp ? ` (via staging ${stagingIp})` : '';
+
 	const res = await fetch(url, {
 		method: 'GET',
 		redirect: 'follow',
-		headers: { 'User-Agent': 'harper-bot/1.0', [config.securityToken.header]: config.securityToken.value },
+		headers: { 'User-Agent': config.sitemapUserAgent, [config.securityToken.header]: config.securityToken.value },
+		dispatcher: dispatcherFor(stagingIp),
 	});
 	const xml = await res.text();
 
-	const parser = new XMLParser({
-		isArray: (tagName) => ['sitemap', 'url'].some((value) => value === tagName),
-	});
-
-	const data = parser.parse(xml);
-
-	const parsed = { url, lastRefreshed: new Date(), entries: [], entryCount: 0 };
-
-	if (Array.isArray(data?.urlset?.url)) {
-		parsed.isIndex = false;
-		parsed.entries = data.urlset.url;
-	} else if (Array.isArray(data?.sitemapindex?.sitemap)) {
-		parsed.isIndex = true;
-		parsed.entries = data.sitemapindex.sitemap;
+	// A blocked/errored fetch returns an HTML error page with a 4xx/5xx status. Guard the
+	// status AND the parsed shape so it fails loudly instead of being silently treated as an
+	// empty sitemap (which used to return a misleading `created: 0` success).
+	if (!res.ok) {
+		throw new Error(`Sitemap fetch failed for ${url}${via}: ${res.status} ${res.statusText} — ${snippet(xml)}`);
 	}
 
-	parsed.entryCount = parsed.entries.length;
+	let parsed;
+	try {
+		parsed = parseSitemap(xml);
+	} catch (e) {
+		const contentType = res.headers.get('content-type') ?? 'unknown';
+		throw new Error(
+			`Sitemap fetch for ${url}${via} returned a non-sitemap response (status ${res.status}, content-type ${contentType}): ${e.message} — ${snippet(xml)}`
+		);
+	}
 
-	return parsed;
+	return {
+		url,
+		lastRefreshed: new Date(),
+		isIndex: parsed.isIndex,
+		entries: parsed.entries,
+		entryCount: parsed.entries.length,
+	};
+}
+
+// A short, single-line excerpt of a response body for error messages. Slice before the
+// whitespace-collapse so a large body (a full sitemap can be >1 MB) doesn't run the regex
+// over the whole string.
+function snippet(body, max = 200) {
+	const raw = String(body ?? '');
+	const truncated = raw.length > max * 2 ? raw.slice(0, max * 2) : raw;
+	const text = truncated.replace(/\s+/g, ' ').trim();
+	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 let sitemapSchedulerStarted = false;

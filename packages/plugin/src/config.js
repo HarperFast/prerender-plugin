@@ -119,6 +119,11 @@ const defaultConfig = () => ({
 	// The cache key does not include the header, so cache HITS always return the normal
 	// cached page regardless of it. Empty `ip` disables the feature — production is
 	// unaffected unless a staging IP is explicitly configured.
+	//
+	// The sitemap refresh reuses this `ip` too, but unconditionally (no toggle header — it has
+	// no incoming request): whenever `ip` is set, every sitemap fetch is pinned to it, so all
+	// Harper→origin traffic hits the same edge. The security token often only authenticates
+	// against the staging edge, so a direct prod sitemap fetch is bounced with a 403.
 	staging: {
 		ip: '',
 		header: 'x-harper-staging',
@@ -189,15 +194,24 @@ const defaultConfig = () => ({
 		maxClaimLimit: 25,
 	},
 
-	// Per-device-type User-Agent strings sent to the origin.
+	// Per-device-type User-Agent strings sent to the origin on the proxy (cache-miss
+	// passthrough) fetch. Each carries a `HarperProxy/1.0` product token so Harper's
+	// proxy traffic is identifiable in origin/CDN logs while still presenting a real,
+	// device-appropriate browser UA (the origin serves device-specific HTML off it).
 	userAgents: {
 		mobile:
-			'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 HarperPrerender/1.0',
+			'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 HarperProxy/1.0',
 		tablet:
-			'Mozilla/5.0 (Linux; Android 7.0; Pixel C Build/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/52.0.2743.98 Safari/537.36 HarperPrerender/1.0',
+			'Mozilla/5.0 (Linux; Android 7.0; Pixel C Build/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/52.0.2743.98 Safari/537.36 HarperProxy/1.0',
 		desktop:
-			'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/W.X.Y.Z Safari/537.36 HarperPrerender/1.0',
+			'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/W.X.Y.Z Safari/537.36 HarperProxy/1.0',
 	},
+
+	// User-Agent for Harper's sitemap crawler fetch (Sitemap.refresh). Unlike the proxy
+	// fetch above, a sitemap fetch isn't a device render, so it sends a single self-identifying
+	// UA rather than a spoofed browser one — makes Harper's sitemap traffic obvious in
+	// origin/CDN logs and separable from the proxy traffic.
+	sitemapUserAgent: 'HarperSitemapCrawler/1.0',
 
 	// Pages whose normalized URL contains any of these substrings are never
 	// auto-scheduled for rendering.
