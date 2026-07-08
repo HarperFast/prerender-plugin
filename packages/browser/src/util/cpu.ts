@@ -77,9 +77,16 @@ function readLimitCores(): number {
 }
 
 /**
- * Cumulative CPU ticks (utime+stime) of `rootPid` and all its descendants, or null if the root
- * isn't readable. Scans `/proc` once to build the parent→child map — Chrome renderers are
- * children (or grandchildren via a zygote) of the launched browser process.
+ * Cumulative CPU ticks of `rootPid` and all its descendants, or null if the root isn't
+ * readable. Scans `/proc` once to build the parent→child map — Chrome renderers are children
+ * (or grandchildren via a zygote) of the launched browser process.
+ *
+ * Each node contributes utime+stime AND cutime+cstime (the CPU of its reaped, exited children).
+ * Chrome cycles renderer/utility processes constantly; counting only live processes would drop
+ * an exited renderer's ticks out of the tree total, underreporting usage and producing negative
+ * deltas across a window. A parent accumulates a child's full lifetime CPU into cutime/cstime
+ * when it reaps the child, so including them keeps the tree total monotonic. No double count:
+ * cutime/cstime cover only exited children, while live children are summed as their own nodes.
  */
 function readProcTreeTicks(rootPid: number): number | null {
 	let entries: string[];
@@ -111,8 +118,12 @@ function readProcTreeTicks(rootPid: number): number | null {
 		const ppid = Number(rest[1]);
 		const utime = Number(rest[11]);
 		const stime = Number(rest[12]);
+		// cutime/cstime: CPU of this process's reaped (exited) children — preserves the ticks of
+		// Chrome renderers that came and went between samples.
+		const cutime = Number(rest[13]);
+		const cstime = Number(rest[14]);
 		if (!Number.isFinite(utime) || !Number.isFinite(stime)) continue;
-		ticksOf.set(pid, utime + stime);
+		ticksOf.set(pid, utime + stime + (Number.isFinite(cutime) ? cutime : 0) + (Number.isFinite(cstime) ? cstime : 0));
 		if (Number.isFinite(ppid)) {
 			const siblings = childrenOf.get(ppid);
 			if (siblings) siblings.push(pid);
@@ -197,14 +208,19 @@ export class CpuSampler {
 
 		// Browser delta is only meaningful when the PID is unchanged across the window; a
 		// relaunch (browser retirement) resets the tree, so that window is reported as null
-		// rather than a bogus negative — the next full window is accurate.
-		const browserCores =
+		// rather than a bogus negative — the next full window is accurate. cutime/cstime keep the
+		// tree total monotonic for a stable PID, but a still-unreaped exiting renderer can briefly
+		// shrink it, so a negative delta is also reported as null rather than a nonsensical value.
+		let browserCores: number | null = null;
+		if (
 			cur.browserPid !== undefined &&
 			cur.browserPid === prev.browserPid &&
 			cur.browserTicks !== null &&
 			prev.browserTicks !== null
-				? round2((cur.browserTicks - prev.browserTicks) / USER_HZ / windowSec)
-				: null;
+		) {
+			const deltaTicks = cur.browserTicks - prev.browserTicks;
+			if (deltaTicks >= 0) browserCores = round2(deltaTicks / USER_HZ / windowSec);
+		}
 
 		const usedCores =
 			cur.cgroupUsec !== null && prev.cgroupUsec !== null
