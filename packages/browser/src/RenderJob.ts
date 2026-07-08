@@ -33,11 +33,29 @@ export type JobConfig = {
 	isFromSitemap: boolean;
 };
 
+/**
+ * Per-phase wall-clock split of a single render, in ms, populated by the renderer. Lets the
+ * per-window stats attribute the render time to network-wait vs Chrome-CPU work:
+ *  - `navTtfb`: navigation start → main-document response headers received — origin/edge
+ *    response time (the signal for a slow pinned upstream IP).
+ *  - `navTotal`: full `page.goto` (TTFB + waiting for the `waitUntil` lifecycle event).
+ *  - `settle`: the post-navigation scroll / network-idle / DOM-stable settling loop (mixed
+ *    network-idle waits + in-page `evaluate` passes).
+ *  - `postProcess`: the final in-page serialize/flatten `evaluate` (Chrome CPU).
+ */
+export type RenderTimings = {
+	navTtfb?: number;
+	navTotal?: number;
+	settle?: number;
+	postProcess?: number;
+};
+
 type RenderAttempt = {
 	renderStartTime: number;
 	renderEndTime?: number;
 	error?: Error;
 	content?: string;
+	timings?: RenderTimings;
 };
 
 type OriginHttpResponse = {

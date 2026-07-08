@@ -7,6 +7,7 @@ import { setTimeout } from 'timers/promises';
 import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
 import { settings } from './settings.js';
+import { CpuSampler } from './util/cpu.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -50,6 +51,10 @@ export default class RenderWorker {
 
 	logStatsInterval: NodeJS.Timeout;
 
+	// Per-worker CPU sampler (this Node process + its own Chrome tree, plus container-wide
+	// context). Reads the live browser PID each sample since it changes on browser retirement.
+	private cpuSampler = new CpuSampler(() => this.browser?.pid);
+
 	rps = 10;
 
 	inflight: Set<Promise<void>> = new Set();
@@ -77,6 +82,12 @@ export default class RenderWorker {
 			browserLaunches: 0,
 			browserRetirements: 0,
 			renderTimes: [] as number[],
+			// Per-phase wall-clock samples (ms), drained into percentiles by logStats. Attribute
+			// the render time to network-wait (navTtfb/navTotal) vs in-browser work (settle/postProcess).
+			navTtfb: [] as number[],
+			navTotal: [] as number[],
+			settle: [] as number[],
+			postProcess: [] as number[],
 		};
 	}
 
@@ -181,10 +192,33 @@ export default class RenderWorker {
 		const elapsedSec = Math.max(0.001, (now - this.statsSince) / 1000);
 		this.statsSince = now;
 
-		const times = s.renderTimes.sort((a, b) => a - b);
-		const n = times.length;
-		const pct = (p: number) => (n ? times[Math.round(p * (n - 1))] : 0);
-		const mean = n ? Math.round(times.reduce((a, b) => a + b, 0) / n) : 0;
+		// mean/p50/p95/max for a sample set, or null when empty (same percentile index the
+		// render-time summary has always used: round(p·(n-1)) into the sorted array).
+		const summarize = (samples: number[]) => {
+			const n = samples.length;
+			if (!n) return null;
+			const sorted = [...samples].sort((a, b) => a - b);
+			const q = (p: number) => sorted[Math.round(p * (n - 1))];
+			return {
+				mean: Math.round(sorted.reduce((a, b) => a + b, 0) / n),
+				p50: q(0.5),
+				p95: q(0.95),
+				max: sorted[n - 1],
+			};
+		};
+
+		// Average concurrent renders over the window (Little's law: L = Σ latency / window). Used
+		// with this worker's CPU to derive cores-per-render for concurrency tuning.
+		const renderMsSum = s.renderTimes.reduce((a, b) => a + b, 0);
+		const avgConcurrent = Number((renderMsSum / (elapsedSec * 1000)).toFixed(2));
+
+		const cpu = this.cpuSampler.next();
+		// What one in-flight render actually costs in CPU, so a better CONCURRENCY can be picked:
+		// coresPerRender ≈ this worker's cores ÷ its concurrent renders; at container scale the
+		// CPU-bound concurrency is limitCores ÷ coresPerRender. Null until both are measurable.
+		const coresPerRender =
+			cpu.workerCores !== null && avgConcurrent > 0 ? Number((cpu.workerCores / avgConcurrent).toFixed(3)) : null;
+
 		const failuresTotal =
 			s.failures.timeout +
 			s.failures.protocol +
@@ -207,7 +241,26 @@ export default class RenderWorker {
 				failuresByType: s.failures,
 				resultPostFailures: s.resultPostFailures,
 			},
-			renderMs: n ? { mean, p50: pct(0.5), p95: pct(0.95), max: times[n - 1] } : null,
+			renderMs: summarize(s.renderTimes),
+			// Where the render time went: navTtfb/navTotal are origin/edge response time (network),
+			// settle/postProcess are in-browser work (CPU). Isolates a slow upstream from render cost.
+			phaseMs: {
+				navTtfb: summarize(s.navTtfb),
+				navTotal: summarize(s.navTotal),
+				settle: summarize(s.settle),
+				postProcess: summarize(s.postProcess),
+			},
+			// `worker`: THIS worker's own cores (Node + its Chrome tree). `container`: the whole
+			// pod from the cgroup — identical across all workers in the container, NOT this worker's
+			// share. coresPerRender + container.utilization drive CONCURRENCY tuning.
+			cpu: {
+				workerCores: cpu.workerCores,
+				nodeCores: cpu.nodeCores,
+				browserCores: cpu.browserCores,
+				avgConcurrent,
+				coresPerRender,
+				container: cpu.container,
+			},
 			saturation: {
 				inflight: this.inflight.size,
 				concurrency: this.CONCURRENCY,
@@ -353,6 +406,13 @@ export default class RenderWorker {
 		const attempt = job.latestAttempt;
 		if (attempt?.renderEndTime) {
 			this.stats.renderTimes.push(attempt.renderEndTime - attempt.renderStartTime);
+		}
+		const t = attempt?.timings;
+		if (t) {
+			if (t.navTtfb !== undefined) this.stats.navTtfb.push(t.navTtfb);
+			if (t.navTotal !== undefined) this.stats.navTotal.push(t.navTotal);
+			if (t.settle !== undefined) this.stats.settle.push(t.settle);
+			if (t.postProcess !== undefined) this.stats.postProcess.push(t.postProcess);
 		}
 		if (!error) {
 			this.stats.succeeded++;

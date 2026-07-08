@@ -1,4 +1,5 @@
 import { Renderer } from './Worker.js';
+import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
@@ -43,6 +44,13 @@ const renderer: Renderer = async (page, job) => {
 	const cache = getResourceCache();
 
 	const navigationUrl = new URL(url);
+
+	// Per-phase timing split, surfaced to the worker's per-window stats through the render
+	// attempt. Mutated in place below; the attempt holds the same object reference, so partial
+	// timings survive an early return (non-200 / redirect / non-indexable).
+	const timings: RenderTimings = {};
+	if (job.latestAttempt) job.latestAttempt.timings = timings;
+	let navStart = 0;
 
 	const blockedResourceTypes = new Set(config.block.resourceTypes);
 	const blockedUrlPatterns = config.block.urlPatterns;
@@ -123,6 +131,10 @@ const renderer: Renderer = async (page, job) => {
 		.on('response', (res) => {
 			const req = res.request();
 			if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+				// Time-to-first-byte for the main document: navigation start → response headers.
+				// This is the origin/edge response time — the signal that isolates a slow upstream
+				// (e.g. a saturated pinned staging IP) from in-browser render cost.
+				if (navStart && timings.navTtfb === undefined) timings.navTtfb = Date.now() - navStart;
 				const status = res.status();
 				const headers = res.headers();
 				if (status >= 400) {
@@ -161,11 +173,15 @@ const renderer: Renderer = async (page, job) => {
 
 	const remainingTimer = new RemainingTimer(job.renderBudget || config.navigation.renderBudgetMs);
 
+	navStart = Date.now();
 	const finalRes = await page.goto(navigationUrl.href, {
 		waitUntil: config.navigation.waitUntil,
 		timeout: remainingTimer.remaining,
 		signal: ac.signal,
 	});
+	timings.navTotal = Date.now() - navStart;
+
+	const settleStart = Date.now();
 
 	const networkIdle = () =>
 		page
@@ -263,6 +279,7 @@ const renderer: Renderer = async (page, job) => {
 		await networkIdle();
 		await domStable();
 	}
+	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {
 		job.httpResponse = job.httpResponse || {
@@ -283,7 +300,9 @@ const renderer: Renderer = async (page, job) => {
 			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, pageUrl);
 
 			if (job.isIndexable || job.isFromSitemap) {
+				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
+				timings.postProcess = Date.now() - ppStart;
 				return content;
 			}
 		} else {
