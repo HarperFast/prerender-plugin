@@ -22,6 +22,38 @@ export const isRenderNowAuthorized = (headers) => {
 };
 
 /**
+ * Whether a request opts out of the served cache via a standard Cache-Control
+ * directive (`no-cache` or `no-store`). Only honored for authorized on-demand
+ * requests (the caller gates on `isRenderNowAuthorized` first), so it never lets
+ * anonymous traffic bypass the cache. `no-cache`/`no-store` are matched as whole
+ * directive tokens (a `max-age=...` param is ignored).
+ */
+export const wantsCacheSkip = (headers) => {
+	const cacheControl = headers.get('cache-control');
+	if (!cacheControl) return false;
+	const directives = cacheControl
+		.toLowerCase()
+		.split(',')
+		.map((directive) => directive.trim().split('=')[0]);
+	return directives.includes('no-cache') || directives.includes('no-store');
+};
+
+/**
+ * Resolve the cache-miss behavior for an authorized on-demand request from the
+ * configured `missHeader`: 'origin' (proxy the origin) or 'prerender' (render now
+ * and wait). An absent/empty/unrecognized value falls back to `defaultMissMode`.
+ */
+export const resolveMissMode = (headers) => {
+	const { missHeader, defaultMissMode } = config.renderNow;
+	const value = missHeader ? headers.get(missHeader) : null;
+	if (!value) return defaultMissMode;
+	const normalized = value.toLowerCase();
+	if (normalized === 'origin') return 'origin';
+	if (normalized === 'prerender') return 'prerender';
+	return defaultMissMode;
+};
+
+/**
  * Poll `get(cacheKey)` until it returns a page rendered at/after `since` (epoch
  * ms), or `timeoutMs` elapses. Returns the fresh page, or null on timeout.
  *

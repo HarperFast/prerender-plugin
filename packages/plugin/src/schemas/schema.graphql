@@ -69,6 +69,9 @@ type PrerenderedPage @table(database: "page_cache") @export {
 	content: Blob
 	lastCached: Date
 	expiresAt: Date
+	# Indexability verdict from the render, stored so the serving path can surface it
+	# as a debug response header (x-harper-indexable). Optional — older rows lack it.
+	isIndexable: Boolean
 }
 
 type SharedBuffer @table(database: "coordination", replicate: false) {

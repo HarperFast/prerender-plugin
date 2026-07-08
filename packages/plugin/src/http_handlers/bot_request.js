@@ -12,7 +12,7 @@ import { RenderTarget } from '../resources/RenderTarget.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
-import { isRenderNowAuthorized, pollForFreshRender } from '../util/renderNow.js';
+import { isRenderNowAuthorized, wantsCacheSkip, resolveMissMode, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
 
 export async function handleBotRequest(request) {
@@ -44,7 +44,9 @@ export async function handleBotRequest(request) {
 		}
 
 		let resource;
-		let renderNowStatus;
+		// Debug/observability info surfaced as x-harper-* response headers (only when the
+		// debug header is present). `route` is the matched forwarded-mode route, if any.
+		const info = { route: request._prerenderTarget?.route };
 
 		if (request.method !== 'GET' && request.method !== 'HEAD') {
 			logger.warn(`Unexpected Request ${request.method} ${url}`);
@@ -56,23 +58,42 @@ export async function handleBotRequest(request) {
 				headers: request.headers,
 				body: request._nodeRequest,
 			});
+			info.source = 'origin';
 		} else {
 			const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(url), deviceType });
+			info.cacheKey = cacheKey;
+			info.url = url.href;
 
-			if (request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url)) {
-				({ resource, renderNowStatus } = await renderNow({ url, deviceType, cacheKey, request }));
+			// On-demand levers apply only to an authorized GET for a non-excluded URL.
+			const authorized = request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url);
+			const skipCache = authorized && wantsCacheSkip(request.headers);
+			const missMode = authorized ? resolveMissMode(request.headers) : 'origin';
+
+			const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
+			const fresh = page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now();
+
+			if (fresh) {
+				resource = page;
+				info.cacheStatus = 'hit';
+				info.source = 'cache';
 			} else {
-				const page = await PrerenderedPage.get(cacheKey);
+				info.cacheStatus = skipCache ? 'skip' : page ? 'stale' : 'miss';
 
-				if (page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now()) {
-					resource = page;
+				if (missMode === 'prerender') {
+					const rendered = await renderNow({ url, deviceType, cacheKey, request });
+					resource = rendered.resource;
+					info.renderNowStatus = rendered.renderNowStatus;
+					// 'hit' served the fresh render; on timeout we served the fallback (a
+					// cached page when miss=false, else the origin proxy / 504).
+					info.source = rendered.renderNowStatus === 'hit' ? 'rendered' : resource.miss ? 'origin' : 'cache';
 				} else {
 					resource = await fetchOriginResource({ url, deviceType, headers: request.headers });
+					info.source = 'origin';
 				}
 			}
 		}
 
-		return deliverResource(resource, request, renderNowStatus);
+		return deliverResource(resource, request, info);
 	} catch (e) {
 		logger.error(e);
 		return {
@@ -170,7 +191,13 @@ async function handlePageScheduling(resource) {
 
 const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
 
-function deliverResource(resource, request, renderNowStatus) {
+// Compact one-line description of a matched forwarded-mode route for the
+// x-harper-route debug header.
+function formatRoute(route) {
+	return `${route.match} ${route.path} [${route.queryParams.join(', ')}]`;
+}
+
+function deliverResource(resource, request, info = {}) {
 	let status = resource.statusCode;
 	let headers = new Headers();
 	let body = request.method === 'HEAD' ? undefined : resource.content;
@@ -222,6 +249,24 @@ function deliverResource(resource, request, renderNowStatus) {
 		if (resource.viaStaging) {
 			headers.set('x-harper-origin', 'staging');
 		}
+		if (info.cacheStatus) {
+			headers.set('x-harper-cache', info.cacheStatus);
+		}
+		if (info.source) {
+			headers.set('x-harper-source', info.source);
+		}
+		if (info.cacheKey) {
+			headers.set('x-harper-cache-key', info.cacheKey);
+		}
+		if (info.url) {
+			headers.set('x-harper-url', info.url);
+		}
+		if (info.route) {
+			headers.set('x-harper-route', formatRoute(info.route));
+		}
+		if (resource.isIndexable === true || resource.isIndexable === false) {
+			headers.set('x-harper-indexable', String(resource.isIndexable));
+		}
 	}
 
 	// handle 304
@@ -269,8 +314,8 @@ function deliverResource(resource, request, renderNowStatus) {
 	// Always surface the on-demand render outcome so the caller knows whether it got a
 	// fresh render ('hit') or the fallback ('timeout'). Set after 304 handling so it
 	// survives the header reset on a conditional response.
-	if (renderNowStatus) {
-		headers.set('x-harper-render-now', renderNowStatus);
+	if (info.renderNowStatus) {
+		headers.set('x-harper-render-now', info.renderNowStatus);
 	}
 
 	if (body) {

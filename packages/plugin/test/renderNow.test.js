@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
-import { isRenderNowAuthorized, pollForFreshRender } from '../src/util/renderNow.js';
+import { isRenderNowAuthorized, wantsCacheSkip, resolveMissMode, pollForFreshRender } from '../src/util/renderNow.js';
 
 // Minimal stand-in for request headers (only `.get` is used). `values` maps
 // header name -> value; a missing name returns null (Harper/Headers semantics).
@@ -55,6 +55,34 @@ test('renderNow.token is sourced from valueEnv when set', () => {
 	assert.equal(config.renderNow.token, 'from-env');
 	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'from-env' })), true);
 	delete process.env.RENDER_NOW_TOKEN_TEST;
+});
+
+test('wantsCacheSkip is true for no-cache / no-store, false otherwise', () => {
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'no-cache' })), true);
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'no-store' })), true);
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'no-cache, no-store' })), true);
+	// case-insensitive and tolerant of surrounding directives
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'public, No-Cache, max-age=0' })), true);
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'max-age=0' })), false);
+	assert.equal(wantsCacheSkip(headersWith({ 'cache-control': 'public, max-age=60' })), false);
+	assert.equal(wantsCacheSkip(headersWith({})), false);
+});
+
+test('resolveMissMode reads the configured missHeader and falls back to the default', () => {
+	applyOptions({ renderNow: { enabled: true, missHeader: 'x-miss', defaultMissMode: 'prerender' } });
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'prerender' })), 'prerender');
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'origin' })), 'origin');
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'ORIGIN' })), 'origin');
+	// absent / empty / unrecognized -> default
+	assert.equal(resolveMissMode(headersWith({})), 'prerender');
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': '' })), 'prerender');
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'bogus' })), 'prerender');
+});
+
+test('resolveMissMode honors a configured default of origin', () => {
+	applyOptions({ renderNow: { enabled: true, missHeader: 'x-miss', defaultMissMode: 'origin' } });
+	assert.equal(resolveMissMode(headersWith({})), 'origin');
+	assert.equal(resolveMissMode(headersWith({ 'x-miss': 'prerender' })), 'prerender');
 });
 
 test('pollForFreshRender returns a page rendered at/after `since`', async () => {
