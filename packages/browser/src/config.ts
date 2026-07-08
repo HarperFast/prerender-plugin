@@ -253,6 +253,12 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
 		}
 	}
+	// Scroll step is a positive fraction of the viewport; reject non-numbers / non-positive
+	// (config is API- and JSON-supplied). scrollPass additionally floors pathologically small
+	// positive values in-page.
+	if (typeof config.scroll.stepFraction !== 'number' || config.scroll.stepFraction <= 0) {
+		throw new Error('prerender config: scroll.stepFraction must be a positive number');
+	}
 	return config;
 };
 

@@ -337,9 +337,10 @@ async function scrollToBottom(stepMs: number) {
 async function scrollPass(stepMs: number, stepFraction: number) {
 	await new Promise<void>((resolve) => {
 		let y = 0;
-		// Guard the in-page math: a non-positive/NaN fraction would floor to a 1px step (a
-		// pathologically slow pass), so fall back to the half-viewport default.
-		const frac = stepFraction > 0 ? stepFraction : 0.5;
+		// Guard the in-page math: a non-positive/NaN/pathologically-small fraction would floor to
+		// a 1px step (an extremely slow pass), so fall back to the half-viewport default. Values
+		// this small are already rejected by config validate(); this is in-page defense-in-depth.
+		const frac = stepFraction >= 0.01 ? stepFraction : 0.5;
 		const step = Math.max(1, Math.round(window.innerHeight * frac));
 		const timer = setInterval(() => {
 			window.scrollTo(0, y);
