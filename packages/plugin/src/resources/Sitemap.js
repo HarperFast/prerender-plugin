@@ -245,11 +245,13 @@ async function fetchLatestSitemap(url) {
 	};
 }
 
-// A short, single-line excerpt of a response body for error messages.
+// A short, single-line excerpt of a response body for error messages. Slice before the
+// whitespace-collapse so a large body (a full sitemap can be >1 MB) doesn't run the regex
+// over the whole string.
 function snippet(body, max = 200) {
-	const text = String(body ?? '')
-		.replace(/\s+/g, ' ')
-		.trim();
+	const raw = String(body ?? '');
+	const truncated = raw.length > max * 2 ? raw.slice(0, max * 2) : raw;
+	const text = truncated.replace(/\s+/g, ' ').trim();
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 

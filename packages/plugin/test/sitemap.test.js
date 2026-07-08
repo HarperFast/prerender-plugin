@@ -53,5 +53,10 @@ test('throws on an HTML error/challenge page (the Akamai 403 case)', () => {
 });
 
 test('throws on an empty document', () => {
-	assert.throws(() => parseSitemap(''), /got an empty document/);
+	assert.throws(() => parseSitemap(''), /got a non-XML or empty document/);
+});
+
+test('throws on a plain-text (non-XML) response — e.g. a bare "Access Denied"', () => {
+	// fast-xml-parser parses plain text to {}, so this must NOT crash on `'urlset' in data`.
+	assert.throws(() => parseSitemap('Access Denied'), /got a non-XML or empty document/);
 });

@@ -15,20 +15,24 @@ const parser = new XMLParser({
  *
  * A valid but empty `<urlset/>` / `<sitemapindex/>` parses to `entries: []` WITHOUT throwing:
  * fast-xml-parser renders an empty element as `''`, so presence is checked with `in`, not
- * truthiness (`data.urlset` is falsy for an empty sitemap).
+ * truthiness (`data.urlset` is falsy for an empty sitemap). The `typeof data === 'object'`
+ * guard keeps `in` off a non-object result — fast-xml-parser v5 always returns an object
+ * (plain text parses to `{}`), but this stays safe if that ever changes.
  */
 export function parseSitemap(xml) {
 	const data = parser.parse(xml);
 
-	if (data && 'urlset' in data) {
-		return { isIndex: false, entries: Array.isArray(data.urlset?.url) ? data.urlset.url : [] };
-	}
-	if (data && 'sitemapindex' in data) {
-		return { isIndex: true, entries: Array.isArray(data.sitemapindex?.sitemap) ? data.sitemapindex.sitemap : [] };
+	if (data && typeof data === 'object') {
+		if ('urlset' in data) {
+			return { isIndex: false, entries: Array.isArray(data.urlset?.url) ? data.urlset.url : [] };
+		}
+		if ('sitemapindex' in data) {
+			return { isIndex: true, entries: Array.isArray(data.sitemapindex?.sitemap) ? data.sitemapindex.sitemap : [] };
+		}
 	}
 
-	const rootTags = Object.keys(data ?? {}).filter((key) => key !== '?xml');
+	const rootTags = data && typeof data === 'object' ? Object.keys(data).filter((key) => key !== '?xml') : [];
 	throw new Error(
-		`expected a <urlset> or <sitemapindex> root, got ${rootTags.length ? `<${rootTags.join('>, <')}>` : 'an empty document'}`
+		`expected a <urlset> or <sitemapindex> root, got ${rootTags.length ? `<${rootTags.join('>, <')}>` : 'a non-XML or empty document'}`
 	);
 }
