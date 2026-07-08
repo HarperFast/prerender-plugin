@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { currentMinuteMs, getNextTimeOfDay, getNextRenderTime, MINUTE } from '../src/util/time.js';
+import { currentMinuteMs, getNextTimeOfDay, getInitialRenderTime, MINUTE } from '../src/util/time.js';
 
 beforeEach(() => applyOptions({}));
 
@@ -24,14 +24,22 @@ test('getNextTimeOfDay tolerates a missing minute component', () => {
 	assert.ok(next > Date.now());
 });
 
-test('getNextRenderTime reflects configured render time/timezone', () => {
-	applyOptions({ render: { time: '03:30', timezone: 'UTC' } });
-	const next = getNextRenderTime();
-	const asUtc = new Date(next);
-	// minute-aligned and in the future
-	assert.equal(next % MINUTE, 0);
-	assert.ok(next > Date.now());
-	// the UTC time-of-day should be 03:30
-	assert.equal(asUtc.getUTCHours(), 3);
-	assert.equal(asUtc.getUTCMinutes(), 30);
+test('getInitialRenderTime is minute-aligned within [now, now+interval)', () => {
+	const interval = 24 * 60 * MINUTE; // a day
+	const base = currentMinuteMs();
+	const t = getInitialRenderTime('https://x.test/a|desktop', interval);
+	assert.equal(t % MINUTE, 0);
+	assert.ok(t >= base, 'not scheduled before now');
+	assert.ok(t < base + interval + MINUTE, 'within the render interval');
+});
+
+test('getInitialRenderTime is stable per key and spreads across keys', () => {
+	const interval = 24 * 60 * MINUTE;
+	const a = getInitialRenderTime('key-a', interval);
+	// Same key resolves to the same minute (deterministic offset; allow a 1-minute
+	// window in case the wall clock ticks over a minute between the two calls).
+	assert.ok(Math.abs(getInitialRenderTime('key-a', interval) - a) <= MINUTE, 'stable for a given key');
+	// Distinct keys spread across the interval rather than collapsing to one time.
+	const values = new Set(Array.from({ length: 100 }, (_, i) => getInitialRenderTime(`key-${i}`, interval)));
+	assert.ok(values.size > 1, 'distinct keys spread across times');
 });

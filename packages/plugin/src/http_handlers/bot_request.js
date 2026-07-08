@@ -176,9 +176,10 @@ async function handlePageScheduling(resource) {
 					const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(resource.url), deviceType });
 					const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
 					if (!existingTarget) {
+						// No explicit time → RenderTarget.put jitters the first render across the
+						// interval, so a crawl that discovers many URLs at once doesn't stampede.
 						await RenderTarget.put(cacheKey, {
 							renderInterval: config.render.defaultInterval,
-							nextRenderTime: currentMinuteMs(),
 						});
 					}
 				}

@@ -1,12 +1,4 @@
-// FNV-1a 32-bit (fast, deterministic)
-function fnv1a32(str) {
-	let h = 0x811c9dc5;
-	for (let i = 0; i < str.length; i++) {
-		h ^= str.charCodeAt(i);
-		h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
-	}
-	return h >>> 0;
-}
+import { fnv1a32 } from './hash.js';
 
 export const nodes = [server.hostname, ...(server.nodes?.map(({ name }) => name) ?? [])].sort();
 

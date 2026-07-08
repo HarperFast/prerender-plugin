@@ -70,11 +70,10 @@ class Sitemap extends databases.sitemaps.Sitemap {
 
 						for (const deviceType of deviceTypes) {
 							let updateTarget = false;
-							let revalidateNow = revalidate;
 
 							const cacheKey = CacheKey.toCacheKey({ url, deviceType });
 
-							if (revalidateNow) {
+							if (revalidate) {
 								updateTarget = true;
 								created++;
 							} else {
@@ -90,15 +89,17 @@ class Sitemap extends databases.sitemaps.Sitemap {
 								} else {
 									created++;
 									updateTarget = true;
-									revalidateNow = true;
 								}
 							}
 
 							if (updateTarget) {
+								// Explicit revalidate renders now; a newly-discovered target omits the
+								// time so RenderTarget.put jitters its first render across the interval,
+								// keeping bulk sitemap population from stampeding the queue.
 								lastPromise = RenderTarget.put(cacheKey, {
 									renderInterval,
 									sitemapUrl,
-									nextRenderTime: revalidateNow ? currentMinuteMs() : undefined,
+									nextRenderTime: revalidate ? currentMinuteMs() : undefined,
 								});
 								inflightCount++;
 							} else {

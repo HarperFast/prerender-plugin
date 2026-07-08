@@ -1,6 +1,6 @@
 import { getMutex } from '../util/coordination.js';
 import { config } from '../config.js';
-import { currentMinuteMs, getNextRenderTime } from '../util/time.js';
+import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { cacheKeyUrl, normalizeUrl } from '../util/url.js';
@@ -112,7 +112,22 @@ export class RenderQueue extends Resource {
 			const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
 			const renderInterval = renderTarget?.renderInterval;
 
-			const nextRenderTime = getNextRenderTime();
+			// Schedule the next render relative to when THIS one completed (now), not a
+			// fixed wall-clock time — so renders stay spread across the interval instead of
+			// realigning into a daily herd, and the cadence self-paces to fleet throughput.
+			// The per-target renderInterval drives the recurring cadence; the default only
+			// backs the cached-page expiry for an untracked one-off (no reschedule below).
+			const interval =
+				typeof renderInterval === 'number' && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
+			const now = currentMinuteMs();
+			const expiresAt = now + interval;
+
+			// Re-render AHEAD of expiry so the fresh page replaces the old one before it goes
+			// stale. The lead is the fleet-latency margin that keeps a slow render from turning
+			// into a cache miss; clamped to half the interval so short-interval targets still
+			// make forward progress.
+			const lead = Math.min(config.render.refreshLeadTime, Math.floor(interval / 2));
+			const nextRenderTime = expiresAt - lead;
 
 			if (result.content) {
 				result.headers['x-harper-rendered'] = '1';
@@ -121,7 +136,7 @@ export class RenderQueue extends Resource {
 					lastCached: Date.now(),
 					content: createBlob(result.content),
 					headers: JSON.stringify(result.headers),
-					expiresAt: nextRenderTime,
+					expiresAt,
 					isIndexable: typeof result.isIndexable === 'boolean' ? result.isIndexable : null,
 				});
 			}

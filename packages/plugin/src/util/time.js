@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { fnv1a32 } from './hash.js';
 
 export const SECOND = 1000;
 export const MINUTE = 60 * SECOND;
@@ -44,6 +45,15 @@ export const getNextTimeOfDay = (timeStr, timezone) => {
 	return currentMinuteMs(tzNow.getTime() + targetOffset);
 };
 
-export const getNextRenderTime = () => getNextTimeOfDay(config.render.time, config.render.timezone);
+/**
+ * Deterministic first-render time: `now` plus a per-key offset in `[0, interval)`,
+ * floored to the minute. Spreads the initial render of freshly-scheduled targets
+ * across the render interval instead of firing them all at once (the thundering
+ * herd on bulk sitemap population / crawl spikes). The offset is keyed off the
+ * cacheKey so it's stable and reproducible. Recurring re-renders are scheduled
+ * relative to render completion (see RenderQueue.processJobResult), so this initial
+ * spread is preserved cycle over cycle rather than realigning to a fixed instant.
+ */
+export const getInitialRenderTime = (key, interval) => currentMinuteMs(Date.now() + (fnv1a32(key) % interval));
 
 export const getNextSitemapRefreshTime = () => getNextTimeOfDay(config.sitemap.refreshTime, config.sitemap.timezone);
