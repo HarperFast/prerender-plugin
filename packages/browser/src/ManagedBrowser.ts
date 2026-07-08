@@ -55,6 +55,16 @@ export default class ManagedBrowser {
 		return this.maxActivePages - this.activePages;
 	}
 
+	/**
+	 * PID of the launched Chrome process, or undefined if it never started / already exited.
+	 * The renderer processes Chrome spawns are descendants of this PID, so it's the root for
+	 * per-worker CPU accounting (the cgroup only sees the whole container, which holds every
+	 * worker's browser).
+	 */
+	get pid(): number | undefined {
+		return this.browser.process()?.pid;
+	}
+
 	async getPage() {
 		this.activePages++;
 		this.totalOpenedPages++;
