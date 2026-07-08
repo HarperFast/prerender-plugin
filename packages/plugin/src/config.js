@@ -163,9 +163,11 @@ const defaultConfig = () => ({
 	},
 
 	render: {
-		defaultInterval: DAY, // how often a target is re-rendered
-		time: '07:00', // local time-of-day for the daily render run
-		timezone: 'America/New_York',
+		// How often a target is re-rendered. Cadence is relative to each render's
+		// completion (not a fixed time-of-day), and a target's first render is jittered
+		// across this interval — so the fleet renders as a smooth stream rather than a
+		// daily herd. Sitemap-derived targets override this per-URL from `changefreq`.
+		defaultInterval: DAY,
 	},
 
 	sitemap: {
@@ -180,6 +182,11 @@ const defaultConfig = () => ({
 	queue: {
 		jobLeaseTime: 10 * MINUTE, // how long a claimed job is leased before re-claim
 		statusSyncInterval: MINUTE, // how often queue status is recomputed/broadcast
+		// Hard ceiling on jobs granted per claim, regardless of what a consumer asks for.
+		// Each claimed job costs a lease write held under the claim mutex, so this bounds
+		// the per-claim transaction (keeps one greedy/misconfigured worker from grabbing a
+		// huge batch — long lock hold + starving other renderers of the burst).
+		maxClaimLimit: 25,
 	},
 
 	// Per-device-type User-Agent strings sent to the origin.

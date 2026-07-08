@@ -1,6 +1,6 @@
 import { getMutex } from '../util/coordination.js';
 import { config } from '../config.js';
-import { currentMinuteMs, getNextRenderTime } from '../util/time.js';
+import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { cacheKeyUrl, normalizeUrl } from '../util/url.js';
@@ -112,7 +112,18 @@ export class RenderQueue extends Resource {
 			const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
 			const renderInterval = renderTarget?.renderInterval;
 
-			const nextRenderTime = getNextRenderTime();
+			// Schedule the next render relative to when THIS one completed (now), not a
+			// fixed wall-clock time — so renders stay spread across the interval instead of
+			// realigning into a daily herd, and the cadence self-paces to fleet throughput.
+			// The per-target renderInterval drives the recurring cadence; fall back to the
+			// default when a target exists without a valid interval (a bare number check also
+			// rejects NaN from an arbitrary API PUT).
+			const interval =
+				Number.isFinite(renderInterval) && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
+			// The cached page expires when the next render is due; the swrTtl window then keeps
+			// it served while the re-render lands, so render latency up to swrTtl never causes
+			// a cache miss.
+			const nextRenderTime = currentMinuteMs() + interval;
 
 			if (result.content) {
 				result.headers['x-harper-rendered'] = '1';
@@ -126,11 +137,14 @@ export class RenderQueue extends Resource {
 				});
 			}
 
-			if (typeof renderInterval === 'number' && renderInterval > 0) {
-				// Refresh fromSitemap from the live target so it self-corrects if the URL
-				// has since left its sitemap.
+			if (renderTarget) {
+				// A target owns this schedule → recurring. Reschedule relative to completion
+				// using the resolved interval (so a target lacking an explicit renderInterval
+				// falls back to the default instead of getting stuck re-claiming every lease
+				// period). Refresh fromSitemap from the live target so it self-corrects if the
+				// URL has since left its sitemap.
 				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
-			} else if (!renderTarget) {
+			} else {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
 				// row. Nothing sets a recurring cadence, so drop the schedule instead of
 				// leaving it to be re-claimed when the lease expires.
@@ -168,6 +182,11 @@ export class RenderQueue extends Resource {
 		if (QueueState.status === 'paused') {
 			return [];
 		}
+
+		// Bound the batch server-side so no consumer can over-claim: a large grant means a
+		// large lease-write burst held under this mutex (long lock hold) and lets one worker
+		// hoard a burst other renderers should share.
+		limit = Math.min(Math.max(1, limit | 0), config.queue.maxClaimLimit);
 
 		const currentMinute = currentMinuteMs();
 		// Fully drain the search (read) transaction into memory BEFORE issuing any

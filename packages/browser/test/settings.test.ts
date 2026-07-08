@@ -17,7 +17,7 @@ test('applies defaults and derives jobClaimLimit from concurrency', () => {
 	applySettings({ harper: HARPER, concurrency: 4 });
 	assert.equal(settings.harper.workerId, 'w1');
 	assert.equal(settings.concurrency, 4);
-	assert.equal(settings.jobClaimLimit, 8); // concurrency * 2
+	assert.equal(settings.jobClaimLimit, 4); // defaults to concurrency
 	assert.equal(settings.queuePort, 9926);
 	assert.equal(settings.bypass.header, 'x-harper-renderer-bypass');
 	assert.equal(settings.contentEncoding, 'gzip');

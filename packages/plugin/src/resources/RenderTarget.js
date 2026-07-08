@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { getResidencyByUrl } from '../util/residency.js';
-import { currentMinuteMs, getNextRenderTime } from '../util/time.js';
+import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { setImmediate } from 'node:timers/promises';
 
 const {
@@ -28,8 +28,20 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 		// schedule — is benign and self-heals on the next sitemap refresh / revalidate.
 		const result = await super.put({ ...CacheKey.parse(cacheKey), ...data }, target);
 
+		// Absent a valid explicit time, jitter the first render across the interval (keyed
+		// off the cacheKey) so bulk-created targets don't all come due at once. RenderTarget
+		// is API-exposed, so validate the numbers (reject negatives / NaN / non-numbers)
+		// rather than trust the payload.
+		const interval =
+			Number.isFinite(data.renderInterval) && data.renderInterval > 0
+				? data.renderInterval
+				: config.render.defaultInterval;
+
 		await RenderSchedule.put(cacheKey, {
-			nextRenderTime: typeof nextRenderTime === 'number' ? nextRenderTime : getNextRenderTime(),
+			nextRenderTime:
+				Number.isFinite(nextRenderTime) && nextRenderTime > 0
+					? nextRenderTime
+					: getInitialRenderTime(cacheKey, interval),
 			fromSitemap: !!data.sitemapUrl,
 		});
 
