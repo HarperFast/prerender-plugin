@@ -23,6 +23,7 @@ test('defaults reproduce the original hardcoded behavior', () => {
 	assert.equal(config.navigation.waitUntil, 'domcontentloaded');
 	assert.equal(config.scroll.enabled, true);
 	assert.equal(config.scroll.topSettleMs, 300);
+	assert.equal(config.scroll.stepFraction, 0.5);
 	assert.equal(config.postProcess.stripScripts, true);
 	assert.equal(config.injectWebComponentsPolyfill, true);
 });
@@ -45,6 +46,9 @@ test('deep-merges a file over defaults, preserving untouched nested fields', () 
 	assert.equal(config.injectWebComponentsPolyfill, false);
 	// untouched sibling in the same nested object keeps its default
 	assert.equal(config.navigation.renderBudgetMs, 20000);
+	// scroll deep-merge: overridden stepFraction wins, sibling stepMs keeps its default
+	assert.equal(loadConfig(writeConfig({ scroll: { stepFraction: 1 } })).scroll.stepFraction, 1);
+	assert.equal(loadConfig(writeConfig({ scroll: { stepFraction: 1 } })).scroll.stepMs, defaultConfig().scroll.stepMs);
 	// arrays replace wholesale
 	assert.deepEqual(config.block.urlPatterns, ['google-analytics.com']);
 	assert.deepEqual(config.block.resourceTypes, ['image', 'media', 'font']);
