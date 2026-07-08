@@ -183,7 +183,7 @@ export default class RenderWorker {
 
 		const times = s.renderTimes.sort((a, b) => a - b);
 		const n = times.length;
-		const pct = (p: number) => (n ? times[Math.min(n - 1, Math.floor(p * n))] : 0);
+		const pct = (p: number) => (n ? times[Math.round(p * (n - 1))] : 0);
 		const mean = n ? Math.round(times.reduce((a, b) => a + b, 0) / n) : 0;
 		const failuresTotal =
 			s.failures.timeout +
@@ -359,7 +359,13 @@ export default class RenderWorker {
 			if (!content) this.stats.emptyContent++;
 		}
 
-		const sendPromise = job.sendResult();
+		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure
+		// (e.g. encode() throwing before the retry loop). Catch it so it's counted as a post
+		// failure rather than rejecting the whole render() through run()'s generic catch.
+		const sendPromise = job.sendResult().catch((err) => {
+			logger.error({ id: job.id, err }, 'failed to send job result');
+			return false;
+		});
 		const closePromise = page ? browser.closePage(page) : Promise.resolve();
 		const [posted] = await Promise.all([sendPromise, closePromise]);
 		if (!posted) this.stats.resultPostFailures++;
