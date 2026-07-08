@@ -124,6 +124,28 @@ const defaultConfig = () => ({
 		header: 'x-harper-staging',
 	},
 
+	// On-demand render ("render now"). When enabled, a GET bot request carrying the
+	// configured `header` bypasses BOTH the cache and the origin proxy, forces an
+	// immediate one-off render, and long-polls for the fresh result before responding.
+	// This is expensive and cache/origin-bypassing, so it is opt-in and should be gated
+	// by a shared secret `token` (the header VALUE must equal it). An empty token leaves
+	// the feature unauthenticated (any client sending the header can force renders — a
+	// DoS vector), which is warned about at config-apply time. `valueEnv` sources the
+	// token from an environment variable so the secret stays out of config.yaml.
+	renderNow: {
+		enabled: false,
+		header: 'x-harper-render-now',
+		token: '',
+		valueEnv: '',
+		timeoutMs: 30 * SECOND, // give up waiting for the fresh render after this long
+		pollIntervalMs: 250, // how often to re-check the cache for the fresh render
+		// What to serve when the render doesn't land before `timeoutMs`:
+		//   'origin' — proxy the origin (same as a normal cache miss)
+		//   'stale'  — serve the existing cached page if any, else fall back to origin
+		//   'error'  — respond 504
+		fallback: 'origin',
+	},
+
 	page: {
 		ttl: DAY, // default cached-page TTL
 		minTtl: 6 * HOUR, // floor for sitemap-derived TTLs
@@ -286,6 +308,10 @@ const resolveSecretsFromEnv = () => {
 	if (valueEnv && process.env[valueEnv]) {
 		config.securityToken.value = process.env[valueEnv];
 	}
+	const renderNowEnv = config.renderNow.valueEnv;
+	if (renderNowEnv && process.env[renderNowEnv]) {
+		config.renderNow.token = process.env[renderNowEnv];
+	}
 };
 
 const warnOnRiskyConfig = () => {
@@ -308,6 +334,15 @@ const warnOnRiskyConfig = () => {
 		} else {
 			log.warn?.(
 				`[prerender] staging.ip "${config.staging.ip}" is not a valid IP address — staging passthrough is disabled`
+			);
+		}
+	}
+	if (config.renderNow.enabled) {
+		if (!config.renderNow.header) {
+			log.warn?.('[prerender] renderNow.enabled but renderNow.header is empty — on-demand render is disabled');
+		} else if (!config.renderNow.token) {
+			log.warn?.(
+				`[prerender] renderNow ENABLED WITHOUT A TOKEN — any client sending "${config.renderNow.header}" can force cache/origin-bypassing renders (DoS risk); set renderNow.token or renderNow.valueEnv`
 			);
 		}
 	}

@@ -129,6 +129,11 @@ export class RenderQueue extends Resource {
 				// Refresh fromSitemap from the live target so it self-corrects if the URL
 				// has since left its sitemap.
 				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+			} else if (!renderTarget) {
+				// No target owns this schedule: it's a one-off (render-now) or an orphaned
+				// row. Nothing sets a recurring cadence, so drop the schedule instead of
+				// leaving it to be re-claimed when the lease expires.
+				await RenderSchedule.delete(cacheKey);
 			}
 		} else if (result.isIndexable === false) {
 			logger.warn(`Skipped prerendered url: ${cacheKey}`);
@@ -148,6 +153,13 @@ export class RenderQueue extends Resource {
 			}
 		} else {
 			logger.warn(`Unknown prerender error for ${cacheKey}`);
+			// A target-backed job is left to retry after its lease expires. But a one-off
+			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
+			// and re-render the failed job indefinitely — drop it instead.
+			const renderTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
+			if (!renderTarget) {
+				await RenderSchedule.delete(cacheKey);
+			}
 		}
 	}
 
