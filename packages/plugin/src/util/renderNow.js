@@ -22,21 +22,6 @@ export const isRenderNowAuthorized = (headers) => {
 };
 
 /**
- * Whether the schedule row for a render-now key means a render is already in flight.
- *
- * A claimed job's schedule carries a lease-expiry `nextRenderTime` in
- * (now, now + leaseTime]. A render-now request for such a key should piggyback on
- * the running render (its fresh `lastCached` will resolve the poll) rather than
- * overwrite the lease — overwriting makes the leased job immediately re-claimable
- * and spawns a duplicate concurrent render, so spamming render-now for one URL
- * could launch many parallel Chrome renders (DoS). A far-future scheduled target
- * (nextRenderTime beyond the lease window) is NOT in flight and is still bumped to
- * now so render-now actually renders it.
- */
-export const isRenderInFlight = (existing, now, leaseTime) =>
-	!!existing && existing.nextRenderTime > now && existing.nextRenderTime <= now + leaseTime;
-
-/**
  * Poll `get(cacheKey)` until it returns a page rendered at/after `since` (epoch
  * ms), or `timeoutMs` elapses. Returns the fresh page, or null on timeout.
  *
