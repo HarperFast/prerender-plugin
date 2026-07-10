@@ -78,9 +78,16 @@ const firstHeaderValue = (raw) => (raw ? raw.split(',')[0].trim() : '');
 
 /**
  * Resolve a forwarded request into its prerender target. Returns
- * `{ url: URL, deviceType, route }` when the request is a prerender request, or
- * `null` when its (device-stripped) path matches no route, or when a matched route
- * has an unusable forwarded host. Never throws.
+ * `{ url: URL, deviceType, route }` when the request is a prerender request (`route`
+ * is `null` when no configured route matched — see below), or `null` when the request
+ * should be skipped: it carries no device-type prefix (path mode), it matches no route
+ * in header mode, or a matched route has an unusable forwarded host. Never throws.
+ *
+ * A device-prefixed path-mode request that matches no route is still a prerender
+ * request (the CDN only prefixes bot traffic) — it resolves with `route: null`,
+ * `noCache: true`, and all query params preserved, so the handler serves a cache hit
+ * if one exists but otherwise just proxies to origin without caching. A warning is
+ * logged so the missing route can be configured.
  */
 export const resolveForwardedRequest = (request) => {
 	const target = request.url;
@@ -90,15 +97,32 @@ export const resolveForwardedRequest = (request) => {
 
 	let deviceType;
 	let path;
+	let fromPath = false;
 	if (config.ingress.deviceTypeSource === 'path') {
 		({ deviceType, path } = extractDeviceFromPath(rawPath));
+		// No device prefix => upstream didn't tag this as bot/prerender traffic. Skip it.
+		if (deviceType === null) return null;
+		fromPath = true;
 	} else {
 		deviceType = sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader));
 		path = rawPath;
 	}
 
 	const route = matchRoute(path);
-	if (!route) return null;
+	if (!route) {
+		// In path mode the device prefix already identifies this as bot/prerender
+		// traffic the CDN forwarded, so don't block a valid bot request just because
+		// the CDN forwarded a path outside the configured routes. We don't recognize
+		// the route, so we don't cache it: it resolves with `noCache` (see below) and
+		// keeps all query params. Log it so the missing route can be configured.
+		// In header mode the route match is the only bot discriminator (no device
+		// prefix to distinguish prerender traffic from the plugin's own API endpoints),
+		// so a non-match there must still fall through.
+		if (!fromPath) return null;
+		getLogger().warn?.(
+			`[prerender] forwarded request to ${path} matched no configured route; proxying uncached (all query params preserved)`
+		);
+	}
 
 	const host = firstHeaderValue(request.headers.get(config.ingress.forwardedHostHeader));
 	if (!host || !HOST_PATTERN.test(host)) {
@@ -112,8 +136,11 @@ export const resolveForwardedRequest = (request) => {
 		firstHeaderValue(request.headers.get(config.ingress.forwardedProtoHeader)) || config.ingress.defaultProtocol;
 
 	try {
-		const url = normalizeUrl(`${proto}://${host}${path}${search}`, true, route.queryParams);
-		return { url, deviceType, route };
+		// A matched route applies its query allowlist; an unmatched path (path mode)
+		// keeps every query param ('*') and is flagged noCache so the handler proxies
+		// it without populating the cache for a route we don't recognize.
+		const url = normalizeUrl(`${proto}://${host}${path}${search}`, true, route ? route.queryParams : ['*']);
+		return { url, deviceType, route, noCache: !route };
 	} catch (e) {
 		getLogger().warn?.(`[prerender] could not reconstruct forwarded URL for ${path}: ${e.message}`);
 		return null;

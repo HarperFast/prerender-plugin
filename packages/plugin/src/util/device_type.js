@@ -16,13 +16,15 @@ export const sanitizeDeviceType = (deviceType) => {
 /**
  * Forwarded path-based device detection. When the first path segment is a
  * supported device type it is consumed: returns that device type and the path
- * with the segment removed. Otherwise the device couldn't be determined (the
- * upstream proxy omits the segment), so it falls back to the first supported type
- * and returns the path unchanged.
+ * with the segment removed. Otherwise the request carries no device prefix — the
+ * upstream proxy only prefixes bot/prerender traffic — so it isn't a prerender
+ * request: returns `{ deviceType: null, path }` with the path unchanged, and the
+ * caller skips it.
  *
- *   '/mobile/product/prd-1'  -> { deviceType: 'mobile',  path: '/product/prd-1' }
- *   '/catalog/x'             -> { deviceType: 'desktop', path: '/catalog/x' }
- *   '/'                      -> { deviceType: 'desktop', path: '/' }
+ *   '/mobile/product/prd-1'  -> { deviceType: 'mobile', path: '/product/prd-1' }
+ *   '/tablet'                -> { deviceType: 'tablet', path: '/' }
+ *   '/catalog/x'             -> { deviceType: null,     path: '/catalog/x' }
+ *   '/'                      -> { deviceType: null,     path: '/' }
  */
 export const extractDeviceFromPath = (pathname) => {
 	const supported = config.deviceTypes.supported;
@@ -33,5 +35,5 @@ export const extractDeviceFromPath = (pathname) => {
 		return { deviceType: firstSegment, path: slashIndex === -1 ? '/' : pathname.slice(slashIndex) };
 	}
 
-	return { deviceType: supported[0], path: pathname };
+	return { deviceType: null, path: pathname };
 };

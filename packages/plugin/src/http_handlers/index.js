@@ -5,10 +5,11 @@ import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
 // Read configuration lazily so host overrides (and live reload) apply.
 //
 // In 'prefix' mode a bot request is any path under botPathPrefix. In 'forwarded'
-// mode it is any request whose device-stripped path matches a configured route;
-// the resolved target is stashed on the request so handleBotRequest doesn't repeat
-// the work. Non-matching requests fall through to Harper's REST routing (which
-// serves the plugin's own resource endpoints).
+// mode resolveForwardedRequest decides: a device-prefixed request (path mode) is bot
+// traffic even if it matches no configured route, whereas an unprefixed request — or a
+// header-mode request that matches no route — falls through to Harper's REST routing
+// (which serves the plugin's own resource endpoints). The resolved target is stashed
+// on the request so handleBotRequest doesn't repeat the work.
 const isBotRequest = (request) => {
 	if (isForwardedMode()) {
 		const target = resolveForwardedRequest(request);
