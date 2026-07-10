@@ -76,8 +76,37 @@ test('honors x-forwarded-proto and falls back to the default protocol', () => {
 	assert.equal(resolveForwardedRequest(defaultReq).url.protocol, 'https:');
 });
 
-test('returns null for paths that match no route', () => {
+test('returns null (skips) a path-mode request with no device prefix', () => {
+	// upstream only prefixes bot/prerender traffic; an unprefixed path is a non-bot request
 	const req = mockRequest('/render_queue', { 'x-forwarded-host': 'www.kohls.com' });
+	assert.equal(resolveForwardedRequest(req), null);
+});
+
+test('path-mode request with a device prefix but no matching route resolves as noCache, keeping all query params', () => {
+	// the device prefix identifies it as CDN-forwarded bot traffic; a route the CDN
+	// forwarded but we haven't configured must not be dropped, only logged — and it is
+	// flagged noCache with every query param preserved so the handler just proxies it
+	const req = mockRequest('/mobile/help/contact-us?ref=nav&utm=x', { 'x-forwarded-host': 'www.kohls.com' });
+	const res = resolveForwardedRequest(req);
+	assert.notEqual(res, null);
+	assert.equal(res.deviceType, 'mobile');
+	assert.equal(res.route, null);
+	assert.equal(res.noCache, true);
+	assert.equal(res.url.pathname, '/help/contact-us');
+	assert.equal(res.url.searchParams.get('ref'), 'nav');
+	assert.equal(res.url.searchParams.get('utm'), 'x');
+});
+
+test('a matched route resolves with noCache false', () => {
+	const req = mockRequest('/mobile/product/prd-1107/lee.jsp', { 'x-forwarded-host': 'www.kohls.com' });
+	assert.equal(resolveForwardedRequest(req).noCache, false);
+});
+
+test('header-mode request with no matching route falls through (returns null)', () => {
+	// no device prefix to distinguish bot traffic from the plugin's own API endpoints,
+	// so route match remains the gate in header mode
+	applyOptions({ ingress: { mode: 'forwarded', deviceTypeSource: 'header', routes: ROUTES } });
+	const req = mockRequest('/render_queue', { 'x-forwarded-host': 'www.kohls.com', 'x-device-type': 'tablet' });
 	assert.equal(resolveForwardedRequest(req), null);
 });
 

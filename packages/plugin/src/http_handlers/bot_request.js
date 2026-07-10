@@ -1,5 +1,3 @@
-import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
-import { Readable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
 import { getBotName } from '../util/userAgent.js';
@@ -14,84 +12,30 @@ import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { isRenderNowAuthorized, wantsCacheSkip, resolveMissMode, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
+import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
 	request.handlerPath = 'p';
 
 	try {
-		let url;
-		let deviceType;
-
-		if (isForwardedMode()) {
-			// isBotRequest already resolved + stashed the target; the fallback resolve
-			// guards against direct calls. A null here means a matched route with an
-			// unusable forwarded host.
-			const target = request._prerenderTarget ?? resolveForwardedRequest(request);
-			if (!target) {
-				return { headers: {}, status: 400 };
-			}
-			url = target.url;
-			deviceType = target.deviceType;
-		} else {
-			url = normalizeUrl(request.url.slice(config.botPathPrefix.length), true);
-			deviceType = sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader));
+		const target = resolveBotTarget(request);
+		if (!target) {
+			return { headers: {}, status: 400 };
 		}
+		const { url, deviceType, noCache, route } = target;
 
 		request.botName = getBotName(request.headers);
-
 		if (config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched)) {
 			server.recordAnalytics(true, 'bot_request', url.hostname, request.botName, deviceType);
 		}
 
-		let resource;
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
-		// debug header is present). `route` is the matched forwarded-mode route, if any.
-		const info = { route: request._prerenderTarget?.route };
+		// debug header is present). `route` is the matched forwarded-mode route, if any;
+		// `noCache` marks an unrecognized forwarded path we proxy but never cache.
+		const info = { route, noCache };
 
-		if (request.method !== 'GET' && request.method !== 'HEAD') {
-			logger.warn(`Unexpected Request ${request.method} ${url}`);
-
-			resource = await fetchOriginResource({
-				url,
-				deviceType,
-				method: request.method,
-				headers: request.headers,
-				body: request._nodeRequest,
-			});
-			info.source = 'origin';
-		} else {
-			const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(url), deviceType });
-			info.cacheKey = cacheKey;
-			info.url = url.href;
-
-			// On-demand levers apply only to an authorized GET for a non-excluded URL.
-			const authorized = request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url);
-			const skipCache = authorized && wantsCacheSkip(request.headers);
-			const missMode = authorized ? resolveMissMode(request.headers) : 'origin';
-
-			const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
-			const fresh = page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now();
-
-			if (fresh) {
-				resource = page;
-				info.cacheStatus = 'hit';
-				info.source = 'cache';
-			} else {
-				info.cacheStatus = skipCache ? 'skip' : page ? 'stale' : 'miss';
-
-				if (missMode === 'prerender') {
-					const rendered = await renderNow({ url, deviceType, cacheKey, request });
-					resource = rendered.resource;
-					info.renderNowStatus = rendered.renderNowStatus;
-					// 'hit' served the fresh render; on timeout we served the fallback (a
-					// cached page when miss=false, else the origin proxy / 504).
-					info.source = rendered.renderNowStatus === 'hit' ? 'rendered' : resource.miss ? 'origin' : 'cache';
-				} else {
-					resource = await fetchOriginResource({ url, deviceType, headers: request.headers });
-					info.source = 'origin';
-				}
-			}
-		}
+		const resource = await resolveResource({ request, url, deviceType, info });
+		maybeSchedule(resource, noCache);
 
 		return deliverResource(resource, request, info);
 	} catch (e) {
@@ -103,11 +47,99 @@ export async function handleBotRequest(request) {
 	}
 }
 
+// Resolve the request into { url, deviceType, noCache, route }, dispatching on ingress
+// mode. In 'forwarded' mode isBotRequest already resolved + stashed the target; the
+// fallback resolve guards against direct calls. Returns null when a forwarded request
+// can't be resolved (a matched route with an unusable forwarded host) => the caller 400s.
+function resolveBotTarget(request) {
+	if (isForwardedMode()) {
+		const target = request._prerenderTarget ?? resolveForwardedRequest(request);
+		if (!target) return null;
+		return { url: target.url, deviceType: target.deviceType, noCache: !!target.noCache, route: target.route };
+	}
+
+	return {
+		url: normalizeUrl(request.url.slice(config.botPathPrefix.length), true),
+		deviceType: sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader)),
+		noCache: false,
+		route: undefined,
+	};
+}
+
+// Resolve the resource to serve: an origin proxy for non-GET/HEAD, else a fresh cache hit,
+// an on-demand render, or an origin proxy per the miss mode. Populates the debug `info`
+// (cacheKey/url/cacheStatus/source/renderNowStatus) as a side effect.
+async function resolveResource({ request, url, deviceType, info }) {
+	if (request.method !== 'GET' && request.method !== 'HEAD') {
+		logger.warn(`Unexpected Request ${request.method} ${url}`);
+		info.source = 'origin';
+		return fetchOriginResource({
+			url,
+			deviceType,
+			method: request.method,
+			headers: request.headers,
+			body: request._nodeRequest,
+		});
+	}
+
+	// `url.href` re-serializes on each access; read it once and reuse for the cache key
+	// and the debug info.
+	const href = url.href;
+	const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(href), deviceType });
+	info.cacheKey = cacheKey;
+	info.url = href;
+
+	// On-demand levers apply only to an authorized GET for a non-excluded URL.
+	const authorized = request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url);
+	const skipCache = authorized && wantsCacheSkip(request.headers);
+	// Unrecognized paths are never rendered/cached, so a miss always just proxies.
+	const missMode = authorized && !info.noCache ? resolveMissMode(request.headers) : 'origin';
+
+	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
+	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
+	// number, or serialized string all compare correctly — cf. the Number() coercion in
+	// util/renderNow.js. A bad/missing value yields NaN => not fresh.
+	const expiresAtMs = page && page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
+	const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
+
+	if (fresh) {
+		info.cacheStatus = 'hit';
+		info.source = 'cache';
+		return page;
+	}
+
+	info.cacheStatus = skipCache ? 'skip' : page ? 'stale' : 'miss';
+
+	if (missMode === 'prerender') {
+		const rendered = await renderNow({ url, deviceType, cacheKey, request });
+		info.renderNowStatus = rendered.renderNowStatus;
+		// 'hit' served the fresh render; on timeout we served the fallback (a cached page
+		// when miss=false, else the origin proxy / 504).
+		info.source = rendered.renderNowStatus === 'hit' ? 'rendered' : rendered.resource.miss ? 'origin' : 'cache';
+		return rendered.resource;
+	}
+
+	info.source = 'origin';
+	return fetchOriginResource({ url, deviceType, headers: request.headers });
+}
+
+// Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
+// didn't already have cached). Skipped for excluded URLs and for unrecognized forwarded
+// paths (noCache), which we proxy but never populate into the cache.
+function maybeSchedule(resource, noCache) {
+	if (resource.miss && resource.statusCode === 200 && !noCache && !isExcludedUrl(resource.url)) {
+		setImmediate(handlePageScheduling, resource);
+	}
+}
+
 // A URL is excluded from prerendering when its string form contains any configured
-// exclude pattern. Accepts a URL object or a string.
+// exclude pattern. Accepts a URL object or a string. Skips the string coercion entirely
+// when no patterns are configured (the common case).
 function isExcludedUrl(url) {
+	const patterns = config.excludePathPatterns;
+	if (patterns.length === 0) return false;
 	const urlString = String(url);
-	return config.excludePathPatterns.some((pattern) => urlString.includes(pattern));
+	return patterns.some((pattern) => urlString.includes(pattern));
 }
 
 // On-demand render: force an immediate one-off render and wait for the fresh result,
@@ -188,160 +220,4 @@ async function handlePageScheduling(resource) {
 	} catch (e) {
 		logger.error(e);
 	}
-}
-
-const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
-
-// Compact one-line description of a matched forwarded-mode route for the
-// x-harper-route debug header.
-function formatRoute(route) {
-	const params = Array.isArray(route.queryParams) ? route.queryParams.join(', ') : '';
-	return `${route.match ?? ''} ${route.path ?? ''} [${params}]`;
-}
-
-function deliverResource(resource, request, info = {}) {
-	let status = resource.statusCode;
-	let headers = new Headers();
-	let body = request.method === 'HEAD' ? undefined : resource.content;
-	let wasCacheMiss;
-
-	if (!resource.miss) {
-		wasCacheMiss = false;
-		if (body instanceof Blob) {
-			body.on('error', (e) => {
-				logger.error('blob delivery error', e);
-				PrerenderedPage.delete(resource.cacheKey);
-			});
-			body = body.stream();
-		}
-	} else {
-		if (status === 200 || status === 304) {
-			wasCacheMiss = true;
-		}
-
-		const excluded = isExcludedUrl(resource.url);
-		if (status === 200 && !excluded) {
-			setImmediate(handlePageScheduling, resource);
-		}
-	}
-
-	const upstreamHeaders = typeof resource.headers === 'string' ? JSON.parse(resource.headers) : resource.headers;
-
-	for (const [key, value] of Object.entries(upstreamHeaders)) {
-		try {
-			if (key !== 'link') {
-				headers.append(key, value);
-			}
-		} catch (e) {
-			logger.error(e);
-		}
-	}
-
-	// set age header
-	if (status === 200 && resource.lastCached) {
-		const ageSec = Math.max(0, Math.floor((Date.now() - resource.lastCached.valueOf()) / 1000));
-		headers.set('age', String(ageSec));
-	}
-
-	if (request.headers.get(config.debugHeader.key)) {
-		headers.set('x-harper-device-type', resource.deviceType || CacheKey.parse(resource.cacheKey).deviceType);
-		if (resource.lastCached) {
-			headers.set('x-harper-cache-timestamp', new Date(resource.lastCached).toISOString());
-		}
-		if (resource.viaStaging) {
-			headers.set('x-harper-origin', 'staging');
-		}
-		if (info.cacheStatus) {
-			headers.set('x-harper-cache', info.cacheStatus);
-		}
-		if (info.source) {
-			headers.set('x-harper-source', info.source);
-		}
-		if (info.cacheKey) {
-			headers.set('x-harper-cache-key', info.cacheKey);
-		}
-		if (info.url) {
-			headers.set('x-harper-url', info.url);
-		}
-		if (info.route) {
-			headers.set('x-harper-route', formatRoute(info.route));
-		}
-		if (resource.isIndexable === true || resource.isIndexable === false) {
-			headers.set('x-harper-indexable', String(resource.isIndexable));
-		}
-	}
-
-	// handle 304
-	if (status === 200) {
-		let return304 = false;
-
-		// handle etag
-		{
-			const etag = request.headers.get('if-none-match');
-			if (etag && etag === headers.get('etag')) {
-				return304 = true;
-			}
-		}
-
-		// handle last-modified
-		{
-			const ifModifiedSince = request.headers.get('if-modified-since');
-			const lastModified = headers.get('last-modified');
-			if (ifModifiedSince && lastModified) {
-				const ifModifiedSinceTime = new Date(ifModifiedSince).getTime();
-				const lastModifiedTime = new Date(lastModified).getTime();
-				if (!isNaN(ifModifiedSinceTime) && !isNaN(lastModifiedTime)) {
-					if (lastModifiedTime <= ifModifiedSinceTime) {
-						return304 = true;
-					}
-				}
-			}
-		}
-
-		if (return304) {
-			// return 304 with only allowed headers
-			const headers304 = new Headers();
-			for (const headerName of allowed304Headers) {
-				const headerValue = headers.get(headerName);
-				if (headerValue !== null) {
-					headers304.set(headerName, headerValue);
-				}
-			}
-			status = 304;
-			headers = headers304;
-			body = undefined;
-		}
-	}
-
-	// Always surface the on-demand render outcome so the caller knows whether it got a
-	// fresh render ('hit') or the fallback ('timeout'). Set after 304 handling so it
-	// survives the header reset on a conditional response.
-	if (info.renderNowStatus) {
-		headers.set('x-harper-render-now', info.renderNowStatus);
-	}
-
-	if (body) {
-		const contentEncoding = headers.get('content-encoding') || null;
-
-		const bestEncoding = getBestEncoding(getAcceptedEncodings(request.headers.get('accept-encoding')), contentEncoding);
-
-		if (bestEncoding !== contentEncoding) {
-			if (bestEncoding) {
-				headers.set('content-encoding', bestEncoding);
-			} else {
-				headers.delete('content-encoding');
-			}
-
-			body = reencode(Readable.fromWeb(body), contentEncoding, bestEncoding, false);
-
-			headers.delete('content-length');
-		}
-	}
-
-	return {
-		headers,
-		status,
-		body,
-		wasCacheMiss,
-	};
 }

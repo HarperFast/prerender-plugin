@@ -31,7 +31,7 @@ test('extractDeviceFromPath maps a device-only path to the homepage', () => {
 	assert.deepEqual(extractDeviceFromPath('/tablet'), { deviceType: 'tablet', path: '/' });
 });
 
-test('extractDeviceFromPath falls back to the default device when no segment is present', () => {
-	assert.deepEqual(extractDeviceFromPath('/catalog/x.jsp'), { deviceType: 'desktop', path: '/catalog/x.jsp' });
-	assert.deepEqual(extractDeviceFromPath('/'), { deviceType: 'desktop', path: '/' });
+test('extractDeviceFromPath returns a null device (path unchanged) when no device prefix is present', () => {
+	assert.deepEqual(extractDeviceFromPath('/catalog/x.jsp'), { deviceType: null, path: '/catalog/x.jsp' });
+	assert.deepEqual(extractDeviceFromPath('/'), { deviceType: null, path: '/' });
 });
