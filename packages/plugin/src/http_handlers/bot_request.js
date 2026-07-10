@@ -96,7 +96,11 @@ async function resolveResource({ request, url, deviceType, info }) {
 	const missMode = authorized && !info.noCache ? resolveMissMode(request.headers) : 'origin';
 
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
-	const fresh = page && page.expiresAt && page.expiresAt.valueOf() + config.page.swrTtl > Date.now();
+	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
+	// number, or serialized string all compare correctly — cf. the Number() coercion in
+	// util/renderNow.js. A bad/missing value yields NaN => not fresh.
+	const expiresAtMs = page && page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
+	const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
 
 	if (fresh) {
 		info.cacheStatus = 'hit';

@@ -54,6 +54,40 @@ test('applyConditional downgrades when if-modified-since is at/after last-modifi
 	assert.equal(applyConditional(200, headers, req, 'B').status, 304);
 });
 
+test('applyConditional matches weak etags, comma-lists, and the * wildcard (RFC 7232)', () => {
+	// weak validator: W/"v1" request tag matches a strong "v1" response etag
+	const weak = applyConditional(200, new Headers({ etag: '"v1"' }), mockRequest({ 'if-none-match': 'W/"v1"' }), 'B');
+	assert.equal(weak.status, 304);
+
+	// comma-separated list containing the etag
+	const list = applyConditional(
+		200,
+		new Headers({ etag: '"v2"' }),
+		mockRequest({ 'if-none-match': '"v1", "v2"' }),
+		'B'
+	);
+	assert.equal(list.status, 304);
+
+	// wildcard matches any existing representation
+	const star = applyConditional(200, new Headers({ etag: '"v9"' }), mockRequest({ 'if-none-match': '*' }), 'B');
+	assert.equal(star.status, 304);
+});
+
+test('applyConditional ignores if-modified-since when if-none-match is present but unmatched (RFC 7232)', () => {
+	const headers = new Headers({
+		'etag': '"v1"',
+		'last-modified': new Date('2026-01-01T00:00:00Z').toUTCString(),
+	});
+	// if-none-match does not match => must NOT fall through to the (matching) if-modified-since
+	const req = mockRequest({
+		'if-none-match': '"other"',
+		'if-modified-since': new Date('2026-01-02T00:00:00Z').toUTCString(),
+	});
+	const res = applyConditional(200, headers, req, 'B');
+	assert.equal(res.status, 200);
+	assert.equal(res.body, 'B');
+});
+
 test('applyConditional passes through on no match or a non-200 status', () => {
 	const noMatch = applyConditional(200, new Headers({ etag: '"v1"' }), mockRequest({ 'if-none-match': '"v2"' }), 'B');
 	assert.equal(noMatch.status, 200);

@@ -50,8 +50,13 @@ export function buildResponseHeaders(resource) {
 	}
 
 	if (resource.statusCode === 200 && resource.lastCached) {
-		const ageSec = Math.max(0, Math.floor((Date.now() - resource.lastCached.valueOf()) / 1000));
-		headers.set('age', String(ageSec));
+		// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad
+		// value yields no age header rather than "NaN".
+		const lastCachedMs = new Date(resource.lastCached).getTime();
+		if (!isNaN(lastCachedMs)) {
+			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
+			headers.set('age', String(ageSec));
+		}
 	}
 
 	return headers;
@@ -64,7 +69,11 @@ export function buildResponseHeaders(resource) {
 export function applyDebugHeaders(headers, request, resource, info) {
 	headers.set('x-harper-device-type', resource.deviceType || CacheKey.parse(resource.cacheKey).deviceType);
 	if (resource.lastCached) {
-		headers.set('x-harper-cache-timestamp', new Date(resource.lastCached).toISOString());
+		// Guard toISOString against an invalid date, which would otherwise throw.
+		const date = new Date(resource.lastCached);
+		if (!isNaN(date.getTime())) {
+			headers.set('x-harper-cache-timestamp', date.toISOString());
+		}
 	}
 	if (resource.viaStaging) {
 		headers.set('x-harper-origin', 'staging');
@@ -89,35 +98,20 @@ export function applyDebugHeaders(headers, request, resource, info) {
 	}
 }
 
-/**
- * Apply conditional-request handling to a 200: if the request's `if-none-match` /
- * `if-modified-since` matches, downgrade to a 304 carrying only `allowed304Headers` and no
- * body. Non-200 responses pass through untouched. Returns `{ status, headers, body }`.
- */
-export function applyConditional(status, headers, request, body) {
-	if (status !== 200) return { status, headers, body };
+// Strip a weak-validator prefix so `W/"x"` and `"x"` compare equal (RFC 7232 §2.3.2 —
+// weak comparison is what a conditional GET/HEAD needs).
+const normalizeEtag = (tag) => tag.trim().replace(/^W\//i, '');
 
-	let return304 = false;
+// Does the `If-None-Match` header (a `*`, or a comma-separated tag list) match `etag`?
+const ifNoneMatchMatches = (ifNoneMatch, etag) => {
+	if (ifNoneMatch === '*') return true;
+	if (!etag) return false;
+	const target = normalizeEtag(etag);
+	return ifNoneMatch.split(',').some((tag) => normalizeEtag(tag) === target);
+};
 
-	const etag = request.headers.get('if-none-match');
-	if (etag && etag === headers.get('etag')) {
-		return304 = true;
-	}
-
-	if (!return304) {
-		const ifModifiedSince = request.headers.get('if-modified-since');
-		const lastModified = headers.get('last-modified');
-		if (ifModifiedSince && lastModified) {
-			const ifModifiedSinceTime = new Date(ifModifiedSince).getTime();
-			const lastModifiedTime = new Date(lastModified).getTime();
-			if (!isNaN(ifModifiedSinceTime) && !isNaN(lastModifiedTime) && lastModifiedTime <= ifModifiedSinceTime) {
-				return304 = true;
-			}
-		}
-	}
-
-	if (!return304) return { status, headers, body };
-
+// Build the 304 response: only the headers allowed on a Not-Modified reply, no body.
+const downgradeTo304 = (headers) => {
 	const headers304 = new Headers();
 	for (const headerName of allowed304Headers) {
 		const headerValue = headers.get(headerName);
@@ -126,6 +120,35 @@ export function applyConditional(status, headers, request, body) {
 		}
 	}
 	return { status: 304, headers: headers304, body: undefined };
+};
+
+/**
+ * Apply conditional-request handling to a 200: if the request's validators match,
+ * downgrade to a 304 carrying only `allowed304Headers` and no body. Non-200 responses pass
+ * through untouched. Returns `{ status, headers, body }`.
+ *
+ * Follows RFC 7232: `If-None-Match` (weak comparison, comma lists, `*`) takes precedence
+ * and, when present, `If-Modified-Since` is ignored entirely.
+ */
+export function applyConditional(status, headers, request, body) {
+	if (status !== 200) return { status, headers, body };
+
+	const ifNoneMatch = request.headers.get('if-none-match');
+	if (ifNoneMatch) {
+		return ifNoneMatchMatches(ifNoneMatch, headers.get('etag')) ? downgradeTo304(headers) : { status, headers, body };
+	}
+
+	const ifModifiedSince = request.headers.get('if-modified-since');
+	const lastModified = headers.get('last-modified');
+	if (ifModifiedSince && lastModified) {
+		const ifModifiedSinceTime = new Date(ifModifiedSince).getTime();
+		const lastModifiedTime = new Date(lastModified).getTime();
+		if (!isNaN(ifModifiedSinceTime) && !isNaN(lastModifiedTime) && lastModifiedTime <= ifModifiedSinceTime) {
+			return downgradeTo304(headers);
+		}
+	}
+
+	return { status, headers, body };
 }
 
 /**
@@ -159,12 +182,16 @@ export function deliverResource(resource, request, info = {}) {
 	let body = request.method === 'HEAD' ? undefined : resource.content;
 	const wasCacheMiss = computeWasCacheMiss(resource);
 
-	// A cached (non-miss) Blob body streams; a delivery error evicts the entry.
+	// A cached (non-miss) Blob body streams; a delivery error evicts the entry. Harper's
+	// cached-content Blob is EventEmitter-like (.on); guard in case a standard web Blob
+	// (which has .stream() but no .on) ever flows through.
 	if (!resource.miss && body instanceof Blob) {
-		body.on('error', (e) => {
-			getLogger().error('blob delivery error', e);
-			PrerenderedPage.delete(resource.cacheKey);
-		});
+		if (typeof body.on === 'function') {
+			body.on('error', (e) => {
+				getLogger().error('blob delivery error', e);
+				PrerenderedPage.delete(resource.cacheKey);
+			});
+		}
 		body = body.stream();
 	}
 
