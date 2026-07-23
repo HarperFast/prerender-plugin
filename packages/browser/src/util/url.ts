@@ -22,6 +22,56 @@ const safeDecodeURI = (s: string): string => {
 	}
 };
 
+/**
+ * Canonical URL-half of a cache key. This MUST stay byte-for-byte identical to the plugin's
+ * `canonicalizeUrl` (packages/plugin/src/util/url.js) — the two are pinned by the shared test
+ * vector at repo root (`test-vectors/canonicalize-url.json`), asserted by both packages' test
+ * suites, so the copies cannot drift. The browser uses it ONLY to detect a genuine redirect
+ * (does the final page URL canonicalize to a different key than the job URL?); it forms no
+ * cache key itself and posts the RAW page URL back for the plugin to canonicalize with the
+ * route allowlist. See that file for the full rule list.
+ *
+ * `queryParams` defaults to `['*']` (keep all) — the browser has no route config, and for
+ * redirect detection keeping every param is the conservative choice; the plugin re-keys with
+ * the real per-route allowlist.
+ */
+const FIXED_DECODE: Record<string, string> = { '%3a': ':', '%2c': ',', '%40': '@' };
+
+export const canonicalizeUrl = (url: string | URL, queryParams: string[] = ['*']): string => {
+	const parsed = url instanceof URL ? new URL(url.href) : new URL(url);
+	parsed.hash = '';
+
+	const rawQuery = parsed.search.startsWith('?') ? parsed.search.slice(1) : parsed.search;
+	let query = '';
+	if (rawQuery) {
+		const keepAll = queryParams.includes('*');
+		const keep = keepAll ? null : new Set(queryParams);
+		const segments = rawQuery.split('&').filter((seg) => {
+			if (seg === '') return false;
+			if (keepAll) return true;
+			const rawKey = seg.split('=')[0];
+			let key: string;
+			try {
+				key = decodeURIComponent(rawKey);
+			} catch {
+				key = rawKey;
+			}
+			return keep!.has(key);
+		});
+		segments.sort();
+		if (segments.length) query = `?${segments.join('&')}`;
+	}
+
+	const path =
+		parsed.pathname !== '/' && parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
+
+	let half = `${parsed.protocol}//${parsed.host}${path}${query}`;
+	half = half.replace(/%(?:3a|2c|40)/gi, (m) => FIXED_DECODE[m.toLowerCase()]);
+	half = half.replace(/%[0-9a-f]{2}/gi, (m) => m.toUpperCase());
+	half = half.replace(/\|/g, '%7C');
+	return half;
+};
+
 export const normalizeUrlForCompare = (url: string | URL): string => {
 	const parsed = new URL(url);
 	parsed.searchParams.sort();
