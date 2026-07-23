@@ -1,6 +1,8 @@
 import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
+import { canonicalizeUrl } from '../util/url.js';
+import { queryAllowlistFor } from '../util/ingress.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
@@ -40,7 +42,12 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					let inflightCount = 0;
 					let lastPromise = null;
 
-					const incomingEntryMap = new Map(latestSitemap.entries.map((entry) => [entry.loc, entry]));
+					// Key by the canonical URL-half (the same transform the bot-read path uses),
+					// so both the prune diff below (against existing targets' parsed keys) and the
+					// render-target keys built later match the key a bot request will look up.
+					const incomingEntryMap = new Map(
+						latestSitemap.entries.map((entry) => [canonicalizeUrl(entry.loc, queryAllowlistFor(entry.loc)), entry])
+					);
 
 					for await (const target of RenderTarget.search({
 						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
@@ -63,7 +70,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 						}
 					}
 
-					for (const { loc: url, changefreq } of incomingEntryMap.values()) {
+					for (const [cacheUrl, { changefreq }] of incomingEntryMap) {
 						const renderInterval = getTtlFromChangeFreq(changefreq, {
 							minTtl: config.page.minTtl,
 							defaultTtl: config.page.ttl,
@@ -72,7 +79,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 						for (const deviceType of deviceTypes) {
 							let updateTarget = false;
 
-							const cacheKey = CacheKey.toCacheKey({ url, deviceType });
+							const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
 
 							if (revalidate) {
 								updateTarget = true;

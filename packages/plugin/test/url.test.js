@@ -1,84 +1,78 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { applyOptions } from '../src/config.js';
-import { normalizeUrl, cacheKeyUrl } from '../src/util/url.js';
+import { canonicalizeUrl } from '../src/util/url.js';
 
 beforeEach(() => applyOptions({}));
 
-test('default policy keeps only the page param and drops the hash', () => {
-	assert.equal(normalizeUrl('https://x.com/a?foo=1&page=2&bar=3#frag'), 'https://x.com/a?page=2');
+// The single shared vector, asserted by BOTH the plugin (this file) and the browser suite,
+// so the two canonicalizeUrl copies cannot drift.
+const VECTORS = JSON.parse(readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url)));
+
+test('canonicalizeUrl matches every shared cache-key vector', () => {
+	for (const { url, allowlist, expected } of VECTORS) {
+		assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
+	}
 });
 
-test('drops all query params when none are allowlisted', () => {
-	applyOptions({ url: { queryParams: [] } });
-	assert.equal(normalizeUrl('https://x.com/a?foo=1&page=2'), 'https://x.com/a');
+test('default allowlist keeps only the page param and drops the hash', () => {
+	// default queryParams is ['page']
+	assert.equal(canonicalizeUrl('https://x.com/a?foo=1&page=2&bar=3#frag'), 'https://x.com/a?page=2');
 });
 
-test('keeps all query params (sorted) with the "*" sentinel', () => {
-	applyOptions({ url: { queryParams: ['*'] } });
-	assert.equal(normalizeUrl('https://x.com/a?foo=1&bar=2'), 'https://x.com/a?bar=2&foo=1');
+test('drops all query params with an empty allowlist', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?foo=1&page=2', []), 'https://x.com/a');
+});
+
+test('keeps all params (sorted) with the "*" sentinel', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?foo=1&bar=2', ['*']), 'https://x.com/a?bar=2&foo=1');
 });
 
 test('honors a custom allowlist and sorts survivors', () => {
-	applyOptions({ url: { queryParams: ['ref', 'page'] } });
-	assert.equal(normalizeUrl('https://x.com/a?utm=x&page=2&ref=abc'), 'https://x.com/a?page=2&ref=abc');
-});
-
-test('returnObject yields a URL instance', () => {
-	const u = normalizeUrl('https://x.com/a?page=2', true);
-	assert.ok(u instanceof URL);
-	assert.equal(u.href, 'https://x.com/a?page=2');
-});
-
-test('an explicit allowlist overrides the global policy', () => {
-	applyOptions({ url: { queryParams: ['page'] } });
-	// global keeps `page`; the explicit allowlist keeps only `CN`
-	assert.equal(normalizeUrl('https://x.com/a?page=2&CN=foo&utm=z', false, ['CN']), 'https://x.com/a?CN=foo');
-});
-
-test('an explicit empty allowlist drops all params regardless of global policy', () => {
-	applyOptions({ url: { queryParams: ['*'] } });
-	assert.equal(normalizeUrl('https://x.com/a?page=2&CN=foo', false, []), 'https://x.com/a');
-});
-
-// cacheKeyUrl presents the cache-key form of an ALREADY-NORMALIZED url: it decodes `:` so
-// keys read like the canonical form (`?CN=Gender:Mens`). Pure transform — it must NOT
-// re-normalize or drop params (serving already applied the route/global allowlist).
-test('cacheKeyUrl decodes ":" and preserves the (already-normalized) query verbatim', () => {
 	assert.equal(
-		cacheKeyUrl('https://www.kohls.com/catalog/mens-clothing.jsp?CN=Gender%3AMens+Department%3AClothing'),
-		'https://www.kohls.com/catalog/mens-clothing.jsp?CN=Gender:Mens+Department:Clothing'
+		canonicalizeUrl('https://x.com/a?utm=x&page=2&ref=abc', ['ref', 'page']),
+		'https://x.com/a?page=2&ref=abc'
 	);
 });
 
-test('cacheKeyUrl does not drop params (no allowlist re-applied)', () => {
-	// even a param the global allowlist would drop is preserved — the caller already normalized
-	assert.equal(cacheKeyUrl('https://x.com/a?CN=x%3Ay&foo=1'), 'https://x.com/a?CN=x:y&foo=1');
+// The crux: '+' (facet separator) and '%20' (space) are NOT collapsed — the bug that made
+// sitemap-seeded multi-word-facet catalog pages a permanent cache miss.
+test('preserves + and %20 distinctly (no URLSearchParams form-decode)', () => {
+	assert.equal(
+		canonicalizeUrl('https://x.com/a?f=Two%20Words+Kind:Sample', ['f']),
+		'https://x.com/a?f=Two%20Words+Kind:Sample'
+	);
 });
 
-test('cacheKeyUrl decodes safe query sub-delimiters (: , @) but leaves separators encoded', () => {
-	assert.equal(cacheKeyUrl('https://x.com/a?CN=A%3AB%2CC%40D'), 'https://x.com/a?CN=A:B,C@D');
-	// %26 (&), %3D (=), %3B (;) stay encoded — decoding them could shift how the URL parses.
-	assert.equal(cacheKeyUrl('https://x.com/a?q=a%26b%3Dc%3Bd'), 'https://x.com/a?q=a%26b%3Dc%3Bd');
+test('collapses encoded and decoded data sub-delimiters to one key (:/%3A, ,/%2C, @/%40)', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['*']), canonicalizeUrl('https://x.com/a?f=A:B', ['*']));
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC%40D', ['f']), 'https://x.com/a?f=A:B,C@D');
 });
 
-test('cacheKeyUrl accepts a URL object and never throws', () => {
-	assert.equal(cacheKeyUrl(new URL('https://x.com/a?CN=x%3Ay')), 'https://x.com/a?CN=x:y');
-	assert.doesNotThrow(() => cacheKeyUrl('::::not a url'));
+test('leaves structural separators (& = ;) encoded so the URL cannot reparse', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?q=a%26b%3Dc%3Bd', ['q']), 'https://x.com/a?q=a%26b%3Dc%3Bd');
 });
 
-test('cacheKeyUrl returns "" for falsy input (no "null"/"undefined" key)', () => {
-	assert.equal(cacheKeyUrl(null), '');
-	assert.equal(cacheKeyUrl(undefined), '');
-	assert.equal(cacheKeyUrl(''), '');
+test('encodes a literal | in the url-half so it cannot collide with the cache-key delimiter', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a|b/c', ['*']), 'https://x.com/a%7Cb/c');
+	// literal and pre-encoded pipe collapse to the same form
+	assert.equal(canonicalizeUrl('https://x.com/a|b/c', ['*']), canonicalizeUrl('https://x.com/a%7Cb/c', ['*']));
 });
 
-// The encoded/decoded COLLAPSE comes from normalizeUrl (sort re-encodes to %3A) then
-// cacheKeyUrl (decode) — the pipeline the serving + scheduling paths use.
-test('normalizeUrl -> cacheKeyUrl collapses encoded and decoded to one key', () => {
-	applyOptions({ url: { queryParams: ['*'] } });
-	const enc = cacheKeyUrl(normalizeUrl('https://x.com/a?CN=Gender%3AMens'));
-	const dec = cacheKeyUrl(normalizeUrl('https://x.com/a?CN=Gender:Mens'));
-	assert.equal(enc, dec);
-	assert.equal(enc, 'https://x.com/a?CN=Gender:Mens');
+test('drops a trailing slash on a non-root path but keeps root "/"', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a/', ['*']), 'https://x.com/a');
+	assert.equal(canonicalizeUrl('https://x.com/', ['*']), 'https://x.com/');
+});
+
+test('the returned half round-trips through new URL() unchanged (safe to build a fetch URL from)', () => {
+	for (const { url, allowlist } of VECTORS) {
+		const half = canonicalizeUrl(url, allowlist);
+		assert.equal(new URL(half).href, half, `round-trip: ${half}`);
+	}
+});
+
+test('accepts a URL object and an explicit allowlist overrides the global policy', () => {
+	applyOptions({ url: { queryParams: ['page'] } });
+	assert.equal(canonicalizeUrl(new URL('https://x.com/a?page=2&f=foo&utm=z'), ['f']), 'https://x.com/a?f=foo');
 });

@@ -1,0 +1,82 @@
+[
+	{
+		"url": "https://example.com/c/multi-word-facet-page?filter=Group:1%20to%202+Kind:Sample+Type:Two%20Words+Cat:Items",
+		"allowlist": ["filter"],
+		"expected": "https://example.com/c/multi-word-facet-page?filter=Group:1%20to%202+Kind:Sample+Type:Two%20Words+Cat:Items"
+	},
+	{
+		"url": "https://example.com/c/multi-word-facet-page?filter=Group%3A1%20to%202+Kind%3ASample+Type%3ATwo%20Words+Cat%3AItems",
+		"allowlist": ["filter"],
+		"expected": "https://example.com/c/multi-word-facet-page?filter=Group:1%20to%202+Kind:Sample+Type:Two%20Words+Cat:Items"
+	},
+	{
+		"url": "https://example.com/c/page?filter=Two%20Words&clk=abc",
+		"allowlist": ["filter"],
+		"expected": "https://example.com/c/page?filter=Two%20Words"
+	},
+	{
+		"url": "https://example.com/c/page?clk=abc&filter=Two%20Words",
+		"allowlist": ["filter"],
+		"expected": "https://example.com/c/page?filter=Two%20Words"
+	},
+	{
+		"url": "https://example.com/?utm=x",
+		"allowlist": [],
+		"expected": "https://example.com/"
+	},
+	{
+		"url": "https://example.com/p/item-123/detail?color=red",
+		"allowlist": [],
+		"expected": "https://example.com/p/item-123/detail"
+	},
+	{
+		"url": "https://example.com/a|b/foo?x=1",
+		"allowlist": ["*"],
+		"expected": "https://example.com/a%7Cb/foo?x=1"
+	},
+	{
+		"url": "https://example.com/a%7Cb/foo?x=1",
+		"allowlist": ["*"],
+		"expected": "https://example.com/a%7Cb/foo?x=1"
+	},
+	{
+		"url": "https://example.com/c/",
+		"allowlist": ["*"],
+		"expected": "https://example.com/c"
+	},
+	{
+		"url": "https://example.com/c",
+		"allowlist": ["*"],
+		"expected": "https://example.com/c"
+	},
+	{
+		"url": "https://example.com/x#frag",
+		"allowlist": ["*"],
+		"expected": "https://example.com/x"
+	},
+	{
+		"url": "https://example.com/a?f=A%3AB%2CC%40D",
+		"allowlist": ["f"],
+		"expected": "https://example.com/a?f=A:B,C@D"
+	},
+	{
+		"url": "https://example.com/a?q=a%26b%3Dc%3Bd",
+		"allowlist": ["q"],
+		"expected": "https://example.com/a?q=a%26b%3Dc%3Bd"
+	},
+	{
+		"url": "https://example.com/a?a=2&a=1&b=3",
+		"allowlist": ["*"],
+		"expected": "https://example.com/a?a=1&a=2&b=3"
+	},
+	{
+		"url": "https://example.com/a?flag&page=2",
+		"allowlist": ["*"],
+		"expected": "https://example.com/a?flag&page=2"
+	},
+	{
+		"url": "https://example.com/a?z=1&m=2&a=3",
+		"allowlist": ["*"],
+		"expected": "https://example.com/a?a=3&m=2&z=1"
+	}
+]
