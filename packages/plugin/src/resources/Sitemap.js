@@ -44,10 +44,17 @@ class Sitemap extends databases.sitemaps.Sitemap {
 
 					// Key by the canonical URL-half (the same transform the bot-read path uses),
 					// so both the prune diff below (against existing targets' parsed keys) and the
-					// render-target keys built later match the key a bot request will look up.
-					const incomingEntryMap = new Map(
-						latestSitemap.entries.map((entry) => [canonicalizeUrl(entry.loc, queryAllowlistFor(entry.loc)), entry])
-					);
+					// render-target keys built later match the key a bot request will look up. Skip
+					// a malformed <loc> (canonicalizeUrl throws on an unparseable URL) so one bad
+					// entry doesn't abort the whole refresh.
+					const incomingEntryMap = new Map();
+					for (const entry of latestSitemap.entries) {
+						try {
+							incomingEntryMap.set(canonicalizeUrl(entry.loc, queryAllowlistFor(entry.loc)), entry);
+						} catch (e) {
+							logger.warn(`Skipping invalid sitemap entry ${entry.loc}: ${e.message}`);
+						}
+					}
 
 					for await (const target of RenderTarget.search({
 						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
