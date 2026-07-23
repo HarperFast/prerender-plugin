@@ -3,7 +3,7 @@ import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
-import { normalizeUrlForCompare, canonicalAllowsIndex } from './util/url.js';
+import { canonicalizeUrl, canonicalAllowsIndex } from './util/url.js';
 
 const noop = () => {};
 
@@ -288,16 +288,17 @@ const renderer: Renderer = async (page, job) => {
 		};
 		const statusCode = job.httpResponse.statusCode;
 
-		const pageUrl = normalizeUrlForCompare(page.url());
-		const jobUrl = normalizeUrlForCompare(job.url);
-
-		if (pageUrl !== jobUrl) {
-			job.redirectedTo = pageUrl;
+		// Redirect detection uses the SHARED canonical form (matches the plugin), so encoding,
+		// param order, hash, and trailing-slash differences never trip a false redirect. Post
+		// back the RAW final URL — the plugin canonicalizes it with the real route allowlist.
+		const rawPageUrl = page.url();
+		if (canonicalizeUrl(rawPageUrl) !== canonicalizeUrl(job.url)) {
+			job.redirectedTo = rawPageUrl;
 		}
 
 		if (statusCode === 200) {
 			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
-			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, pageUrl);
+			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, rawPageUrl);
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const ppStart = Date.now();

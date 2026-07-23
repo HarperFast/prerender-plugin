@@ -3,7 +3,8 @@ import { config } from '../config.js';
 import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
-import { cacheKeyUrl, normalizeUrl } from '../util/url.js';
+import { canonicalizeUrl } from '../util/url.js';
+import { queryAllowlistFor } from '../util/ingress.js';
 import { RenderTarget } from './RenderTarget.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
@@ -68,19 +69,25 @@ export class RenderQueue extends Resource {
 		const url = result.redirectedTo || result.url;
 
 		if (result.redirectedTo) {
-			if (result.redirectedTo !== result.url) {
-				logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-				await RenderTarget.delete(result.id);
-			}
-
 			const { deviceType } = CacheKey.parse(result.id);
 
-			// Normalize the redirect target the same way serving does, so the rendered content is
-			// stored under the key a bot request for that URL will look up. redirectedTo is the
-			// renderer's decodeURI'd form; normalizeUrl re-sorts and standardizes the encoding
-			// (['*'] keeps all params — the matched route, hence its allowlist, isn't known here),
-			// then cacheKeyUrl applies the shared cache-key encoding.
-			cacheKey = CacheKey.toCacheKey({ deviceType, url: cacheKeyUrl(normalizeUrl(result.redirectedTo, false, ['*'])) });
+			// The browser posts the RAW final page URL as `redirectedTo`. Canonicalize it the
+			// same way serving does — with the allowlist a bot READ of that target would use
+			// (route-aware) — so the rendered content is stored under the key that read computes.
+			const redirectKey = CacheKey.toCacheKey({
+				deviceType,
+				url: canonicalizeUrl(result.redirectedTo, queryAllowlistFor(result.redirectedTo)),
+			});
+
+			// Only treat it as a redirect when the final URL canonicalizes to a DIFFERENT key.
+			// A target whose page URL collapses back to the same key (trailing slash, param
+			// reorder, encoding) is not a redirect — keep it under result.id and, crucially,
+			// do NOT delete its RenderTarget (which would drop it from the recurring rotation).
+			if (redirectKey !== result.id) {
+				logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
+				await RenderTarget.delete(result.id);
+				cacheKey = redirectKey;
+			}
 		}
 
 		try {

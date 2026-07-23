@@ -2,7 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
 import { getBotName } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
-import { normalizeUrl, cacheKeyUrl } from '../util/url.js';
+import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
@@ -22,7 +22,7 @@ export async function handleBotRequest(request) {
 		if (!target) {
 			return { headers: {}, status: 400 };
 		}
-		const { url, deviceType, noCache, route } = target;
+		const { url, cacheUrl, deviceType, noCache, route } = target;
 
 		request.botName = getBotName(request.headers);
 		if (config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched)) {
@@ -34,7 +34,7 @@ export async function handleBotRequest(request) {
 		// `noCache` marks an unrecognized forwarded path we proxy but never cache.
 		const info = { route, noCache };
 
-		const resource = await resolveResource({ request, url, deviceType, info });
+		const resource = await resolveResource({ request, url, cacheUrl, deviceType, info });
 		maybeSchedule(resource, noCache);
 
 		return deliverResource(resource, request, info);
@@ -55,11 +55,20 @@ function resolveBotTarget(request) {
 	if (isForwardedMode()) {
 		const target = request._prerenderTarget ?? resolveForwardedRequest(request);
 		if (!target) return null;
-		return { url: target.url, deviceType: target.deviceType, noCache: !!target.noCache, route: target.route };
+		return {
+			url: target.url,
+			cacheUrl: target.cacheUrl,
+			deviceType: target.deviceType,
+			noCache: !!target.noCache,
+			route: target.route,
+		};
 	}
 
+	// Native/prefix mode: the request path (minus the bot prefix) IS the absolute target URL.
+	const cacheUrl = canonicalizeUrl(request.url.slice(config.botPathPrefix.length), config.url.queryParams);
 	return {
-		url: normalizeUrl(request.url.slice(config.botPathPrefix.length), true),
+		url: new URL(cacheUrl),
+		cacheUrl,
 		deviceType: sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader)),
 		noCache: false,
 		route: undefined,
@@ -69,7 +78,7 @@ function resolveBotTarget(request) {
 // Resolve the resource to serve: an origin proxy for non-GET/HEAD, else a fresh cache hit,
 // an on-demand render, or an origin proxy per the miss mode. Populates the debug `info`
 // (cacheKey/url/cacheStatus/source/renderNowStatus) as a side effect.
-async function resolveResource({ request, url, deviceType, info }) {
+async function resolveResource({ request, url, cacheUrl, deviceType, info }) {
 	if (request.method !== 'GET' && request.method !== 'HEAD') {
 		logger.warn(`Unexpected Request ${request.method} ${url}`);
 		info.source = 'origin';
@@ -82,12 +91,11 @@ async function resolveResource({ request, url, deviceType, info }) {
 		});
 	}
 
-	// `url.href` re-serializes on each access; read it once and reuse for the cache key
-	// and the debug info.
-	const href = url.href;
-	const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(href), deviceType });
+	// `cacheUrl` is the canonical URL-half (already computed at ingress); it IS the cache-key
+	// url component, so no re-normalization here.
+	const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
 	info.cacheKey = cacheKey;
-	info.url = href;
+	info.url = cacheUrl;
 
 	// On-demand levers apply only to an authorized GET for a non-excluded URL.
 	const authorized = request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url);
@@ -198,14 +206,18 @@ async function renderNow({ url, deviceType, cacheKey, request }) {
 async function handlePageScheduling(resource) {
 	try {
 		if (isPrerenderCandidate(resource)) {
+			// resource.url is the origin-fetch URL built from the canonical half, so it is
+			// already route-filtered; canonicalize idempotently ('*' keeps it as-is) so this
+			// url-half equals CacheKey.extractUrl of the render key (and the NonIndexable id).
+			const canonicalUrl = canonicalizeUrl(resource.url, ['*']);
 			const existingNonIndexable = await databases.signals.NonIndexable.get({
-				id: cacheKeyUrl(resource.url),
+				id: canonicalUrl,
 				select: 'url',
 			});
 
 			if (!existingNonIndexable) {
 				for (const deviceType of config.deviceTypes.default) {
-					const cacheKey = CacheKey.toCacheKey({ url: cacheKeyUrl(resource.url), deviceType });
+					const cacheKey = CacheKey.toCacheKey({ url: canonicalUrl, deviceType });
 					const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
 					if (!existingTarget) {
 						// No explicit time → RenderTarget.put jitters the first render across the

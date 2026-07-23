@@ -16,7 +16,7 @@
 
 import { config, getLogger } from '../config.js';
 import { extractDeviceFromPath, sanitizeDeviceType } from './device_type.js';
-import { normalizeUrl } from './url.js';
+import { canonicalizeUrl } from './url.js';
 
 const VALID_MATCH = new Set(['exact', 'prefix']);
 
@@ -139,10 +139,38 @@ export const resolveForwardedRequest = (request) => {
 		// A matched route applies its query allowlist; an unmatched path (path mode)
 		// keeps every query param ('*') and is flagged noCache so the handler proxies
 		// it without populating the cache for a route we don't recognize.
-		const url = normalizeUrl(`${proto}://${host}${path}${search}`, true, route ? route.queryParams : ['*']);
-		return { url, deviceType, route, noCache: !route };
+		// `cacheUrl` is the canonical URL-half of the cache key; the URL object (for the
+		// origin fetch / analytics) is built from it, so both share one encoding and the
+		// proxy fetches the same bytes the key represents.
+		const cacheUrl = canonicalizeUrl(`${proto}://${host}${path}${search}`, route ? route.queryParams : ['*']);
+		return { url: new URL(cacheUrl), cacheUrl, deviceType, route, noCache: !route };
 	} catch (e) {
 		getLogger().warn?.(`[prerender] could not reconstruct forwarded URL for ${path}: ${e.message}`);
 		return null;
 	}
+};
+
+/**
+ * The query-param allowlist to canonicalize a URL with, matching what a bot READ of that URL
+ * would use — so the sitemap-write, discovery, and redirect-rekey keys equal the read key.
+ * Forwarded mode resolves the per-route allowlist by matching the URL's path; an unmatched
+ * path keeps all params ('*'), exactly like `resolveForwardedRequest`. Native (prefix) mode
+ * uses the global `config.url.queryParams`.
+ *
+ * CONTRACT: `rawUrl` is a DEVICE-FREE public URL — a sitemap `<loc>` or the browser's final
+ * `page.url()`, both of which never carry the CDN's device path-prefix. `matchRoute` matches
+ * the same device-stripped path the read path feeds it (ingress resolves the device prefix
+ * off separately). Do NOT strip a device prefix here: these URLs have none, and doing so
+ * would wrongly consume a real first path segment that happens to equal a device-type name.
+ */
+export const queryAllowlistFor = (rawUrl) => {
+	if (!isForwardedMode()) return config.url.queryParams;
+	let pathname;
+	try {
+		pathname = new URL(rawUrl).pathname;
+	} catch {
+		return ['*'];
+	}
+	const route = matchRoute(pathname);
+	return route ? route.queryParams : ['*'];
 };
