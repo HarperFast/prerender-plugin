@@ -266,6 +266,7 @@ export class RenderQueue extends Resource {
 }
 
 let queueStatusSyncStarted = false;
+let queueStatusSyncInterval = null;
 
 /**
  * Start the periodic queue-status refresh on worker 0. Called from
@@ -291,5 +292,20 @@ export function startQueueStatusSync() {
 
 	refresh();
 
-	setInterval(refresh, config.queue.statusSyncInterval).unref?.();
+	queueStatusSyncInterval = setInterval(refresh, config.queue.statusSyncInterval);
+	queueStatusSyncInterval.unref?.();
+}
+
+/**
+ * Stop the periodic queue-status refresh. Called from the plugin's close hook so a
+ * status-sync tick can't run during shutdown — in particular so it can't flip the
+ * status back off `paused` after the close hook pauses the queue. Idempotent and a
+ * no-op on any worker that never started the sync (only worker 0 runs it).
+ */
+export function stopQueueStatusSync() {
+	if (queueStatusSyncInterval !== null) {
+		clearInterval(queueStatusSyncInterval);
+		queueStatusSyncInterval = null;
+	}
+	queueStatusSyncStarted = false;
 }

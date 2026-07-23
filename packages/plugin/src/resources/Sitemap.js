@@ -8,7 +8,7 @@ import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
-	static async refresh(rootSitemapUrl, { revalidate = false, deviceTypes = config.deviceTypes.default } = {}) {
+	static async refresh(rootSitemapUrl, { revalidate = false, deviceTypes = config.deviceTypes.default, signal } = {}) {
 		let created = 0;
 		let updated = 0;
 		let skipped = 0;
@@ -18,10 +18,17 @@ class Sitemap extends databases.sitemaps.Sitemap {
 
 		const queue = [rootSitemapUrl];
 
+		// `signal` lets the caller abort a long refresh (thousands of RenderTarget writes) at the
+		// next yield point — used by the plugin's close hook so shutdown isn't blocked waiting on a
+		// full crawl and the read cursor is released promptly. Returns the partial counts so far.
 		while (queue.length) {
+			if (signal?.aborted) break;
+
 			let qLen = queue.length;
 
 			while (qLen--) {
+				if (signal?.aborted) break;
+
 				const sitemapUrl = queue.shift();
 
 				if (visited.has(sitemapUrl)) continue;
@@ -46,6 +53,8 @@ class Sitemap extends databases.sitemaps.Sitemap {
 						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
 						conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 					})) {
+						if (signal?.aborted) break;
+
 						const parsed = CacheKey.parse(target.cacheKey);
 						if (!incomingEntryMap.has(parsed.url)) {
 							lastPromise = RenderTarget.patch(target.cacheKey, {
@@ -64,6 +73,8 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					}
 
 					for (const { loc: url, changefreq } of incomingEntryMap.values()) {
+						if (signal?.aborted) break;
+
 						const renderInterval = getTtlFromChangeFreq(changefreq, {
 							minTtl: config.page.minTtl,
 							defaultTtl: config.page.ttl,
@@ -256,6 +267,8 @@ function snippet(body, max = 200) {
 }
 
 let sitemapSchedulerStarted = false;
+let sitemapRefreshTimeout = null;
+let sitemapRefreshAbort = null;
 
 /**
  * Start the daily sitemap refresh, pinned to the configured node + worker. Called
@@ -268,6 +281,8 @@ export function startSitemapRefreshScheduler() {
 	if (config.sitemap.node !== server.hostname || config.sitemap.workerIndex !== server.workerIndex) return;
 
 	sitemapSchedulerStarted = true;
+	sitemapRefreshAbort = new AbortController();
+	const { signal } = sitemapRefreshAbort;
 
 	let isRefreshing = false;
 
@@ -281,27 +296,48 @@ export function startSitemapRefreshScheduler() {
 			const urls = await Array.fromAsync(Sitemap.search({ select: 'url' }));
 
 			for (const url of urls) {
+				if (signal.aborted) break;
 				try {
-					await Sitemap.refresh(url);
+					await Sitemap.refresh(url, { signal });
 				} catch (e) {
 					logger.error(e);
 				}
 			}
 
-			await databases.sitemaps.SitemapRefresh.put('all', { lastRefreshed: Date.now() });
+			// Only record a completed refresh if the whole pass finished — an aborted (shutdown)
+			// pass is partial and must not move the "last refreshed" watermark forward.
+			if (!signal.aborted) {
+				await databases.sitemaps.SitemapRefresh.put('all', { lastRefreshed: Date.now() });
+			}
 		} catch (e) {
 			logger.error(e);
 		}
 
 		isRefreshing = false;
 
-		scheduleNextRefresh();
+		// Don't re-arm the timer once shutdown has aborted the scheduler.
+		if (!signal.aborted) scheduleNextRefresh();
 	};
 
 	const scheduleNextRefresh = () => {
 		const nextSitemapRefreshTime = getNextSitemapRefreshTime();
-		setTimeout(refreshAllSitemaps, nextSitemapRefreshTime - Date.now()).unref?.();
+		sitemapRefreshTimeout = setTimeout(refreshAllSitemaps, nextSitemapRefreshTime - Date.now());
+		sitemapRefreshTimeout.unref?.();
 	};
 
 	scheduleNextRefresh();
+}
+
+/**
+ * Stop the sitemap refresh scheduler and signal any in-flight refresh to abort at its next
+ * yield point. Called from the plugin's close hook. Idempotent and a no-op on any worker/node
+ * that never started the scheduler (only the pinned one runs it).
+ */
+export function stopSitemapRefreshScheduler() {
+	if (sitemapRefreshTimeout !== null) {
+		clearTimeout(sitemapRefreshTimeout);
+		sitemapRefreshTimeout = null;
+	}
+	sitemapRefreshAbort?.abort();
+	sitemapSchedulerStarted = false;
 }
