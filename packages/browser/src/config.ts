@@ -149,6 +149,43 @@ export type PostProcessConfig = {
 	resolveLazyImages: boolean;
 };
 
+/**
+ * A declarative "wait for content" rule applied after the scroll/settle phase and before the
+ * snapshot. It scrolls a selector into view (to trip an IntersectionObserver-lazy widget) and then
+ * waits until a content selector reaches a minimum match count. This is the reusable seam for
+ * content that a fast scroll-settle passes over before it finishes loading — e.g. a reviews widget
+ * that lazy-loads only once its container enters the viewport and sits below the fold on a short
+ * (mobile) viewport. Because it lives in the config, the SAME rule is honored identically by the
+ * on-demand harness (`renderOnce`) and the production fleet (it travels the per-site config the
+ * consumer already feeds `startWorker`). Best-effort: a rule that never satisfies just times out.
+ */
+export type WaitForRule = {
+	/** CSS selector to scroll into view. Required; caller-supplied at runtime — there is no default. */
+	selector: string;
+	/** Scroll `selector` into view before waiting (default true; set false to only wait). */
+	scrollIntoView?: boolean;
+	/** Selector whose match count must reach `minCount`. Defaults to `selector`. */
+	waitForSelector?: string;
+	/** Minimum matches of `waitForSelector` required to proceed (default 1). */
+	minCount?: number;
+	/** Require the match count to hold steady this long (ms) before proceeding (optional). */
+	stableMs?: number;
+	/** Max time to wait for this rule (ms). Default: the remaining render budget. */
+	timeoutMs?: number;
+	/**
+	 * Only apply this rule for these device types (matched against the job's `deviceType`, i.e. the
+	 * keys of `devices`). Omit → all devices. Scope a rule to the device(s) that actually need it
+	 * (e.g. `['mobile', 'tablet']`, since a tall desktop viewport already has the content in view).
+	 */
+	devices?: string[];
+	/**
+	 * Only apply this rule when the render URL's PATH matches this JavaScript regular expression
+	 * (e.g. `'^/product/'` for PDPs). Omit → all paths. Scope a rule to the routes that have the
+	 * widget so it never polls to the timeout on pages that don't (a page-type latency guard).
+	 */
+	pathPattern?: string;
+};
+
 export type PrerenderConfig = {
 	/** Device profiles keyed by the job's `deviceType`; unknown types fall back to `defaultDevice`. */
 	devices: Record<string, DeviceProfile>;
@@ -157,6 +194,12 @@ export type PrerenderConfig = {
 	navigation: NavigationConfig;
 	scroll: ScrollConfig;
 	postProcess: PostProcessConfig;
+	/**
+	 * Optional declarative "wait for content" rules applied after scroll/settle and before the
+	 * snapshot (see {@link WaitForRule}). Absent by default → a complete no-op, so existing
+	 * deployments render byte-identically; present → both `renderOnce` and the fleet honor it.
+	 */
+	waitFor?: WaitForRule[];
 	/** Inject Web Components (ShadyDOM/ShadyCSS) polyfill-forcing flags before load. */
 	injectWebComponentsPolyfill: boolean;
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
@@ -258,6 +301,48 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	// positive values in-page.
 	if (typeof config.scroll.stepFraction !== 'number' || config.scroll.stepFraction <= 0) {
 		throw new Error('prerender config: scroll.stepFraction must be a positive number');
+	}
+	// waitFor is optional; when present every rule needs a non-empty selector and non-negative
+	// numeric fields (it is API-/JSON-supplied, so validate before it reaches the in-page waits).
+	if (config.waitFor !== undefined) {
+		if (!Array.isArray(config.waitFor)) {
+			throw new Error('prerender config: waitFor must be an array of rules');
+		}
+		config.waitFor.forEach((rule, i) => {
+			if (!rule || typeof rule.selector !== 'string' || rule.selector.trim() === '') {
+				throw new Error(`prerender config: waitFor[${i}].selector must be a non-empty string`);
+			}
+			if (
+				rule.waitForSelector !== undefined &&
+				(typeof rule.waitForSelector !== 'string' || rule.waitForSelector.trim() === '')
+			) {
+				throw new Error(`prerender config: waitFor[${i}].waitForSelector must be a non-empty string`);
+			}
+			for (const field of ['minCount', 'stableMs', 'timeoutMs'] as const) {
+				const v = rule[field];
+				if (v !== undefined && (typeof v !== 'number' || v < 0)) {
+					throw new Error(`prerender config: waitFor[${i}].${field} must be a non-negative number`);
+				}
+			}
+			if (
+				rule.devices !== undefined &&
+				(!Array.isArray(rule.devices) || rule.devices.some((d) => typeof d !== 'string' || d.trim() === ''))
+			) {
+				throw new Error(`prerender config: waitFor[${i}].devices must be an array of non-empty device names`);
+			}
+			if (rule.pathPattern !== undefined) {
+				if (typeof rule.pathPattern !== 'string' || rule.pathPattern.trim() === '') {
+					throw new Error(`prerender config: waitFor[${i}].pathPattern must be a non-empty string`);
+				}
+				try {
+					new RegExp(rule.pathPattern);
+				} catch (err) {
+					throw new Error(
+						`prerender config: waitFor[${i}].pathPattern is not a valid regex: ${(err as Error).message}`
+					);
+				}
+			}
+		});
 	}
 	return config;
 };

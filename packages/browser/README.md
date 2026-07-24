@@ -27,7 +27,7 @@ await startWorker({
 	harper: { mqttOrigin: 'mqtt://harper:1883', user: 'HDB_ADMIN', pass: '…', workerId: 'renderer-1' },
 
 	// shared secret the origin fetches carry — must match the plugin's securityToken
-	bypass: { header: 'x-harper-pr-token', token: process.env.RENDERER_BYPASS_TOKEN },
+	bypass: { header: 'x-harper-renderer-bypass', token: process.env.RENDERER_BYPASS_TOKEN },
 
 	// rendering config — a deep-partial object merged over the defaults (or a path to a JSON file)
 	config: {
@@ -92,6 +92,20 @@ include what you change:
 		"networkIdleTimeoutMs": 1000,
 	},
 	"scroll": { "enabled": true, "stepMs": 200, "topSettleMs": 300 }, // scroll to bottom for lazy content; topSettleMs lets scroll-reactive headers re-reveal at the top before serializing
+	// optional: AFTER the normal scroll-settle (which still runs and triggers all other lazy content),
+	// scroll a selector into view and wait for lazy content (e.g. reviews below the fold on a short
+	// viewport) before the snapshot. Absent → no-op. Scope each rule with `devices`/`pathPattern` so it
+	// only runs where the widget is — otherwise it polls to `timeoutMs` on pages/devices that lack it.
+	"waitFor": [
+		{
+			"selector": "#reviews",
+			"waitForSelector": ".review",
+			"minCount": 1,
+			"timeoutMs": 15000,
+			"devices": ["mobile", "tablet"], // desktop's tall viewport already has it in view
+			"pathPattern": "^/product/", // only product pages have this widget
+		},
+	],
 	"postProcess": {
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
@@ -111,11 +125,52 @@ A renderer receives the Puppeteer `page` and the `RenderJob` and returns the ser
 `undefined`). **Wrapping `defaultRenderer`** keeps all the `config` behavior and lets you add steps
 around it (auth cookies, app-ready waits, widget removal); returning your own HTML bypasses it.
 
+## On-demand rendering & analysis (`renderOnce`)
+
+`renderOnce()` runs the **same production render path** as a worker for a single URL fed directly —
+off the queue, no MQTT, no result POST — and returns the HTML, per-phase timings, and outcome
+signals. It's the harness for testing config changes and analyzing a page's prerenderability.
+
+```ts
+import { renderOnce, renderMatrix, selectorCountProbe, htmlContainsProbe } from '@harperfast/prerender-browser';
+
+const r = await renderOnce({
+	url: 'https://example.com/product/123',
+	device: 'mobile', // a key in config.devices; default config.defaultDevice
+	config: {
+		/* same shape as startWorker's config */
+	},
+	bypass: { header: 'x-harper-renderer-bypass', token: process.env.TOKEN },
+	probes: {
+		// each runs against the live, settled page before teardown
+		reviews: selectorCountProbe(['.review']),
+		text: htmlContainsProbe(['Verified Buyer']),
+	},
+	screenshot: true,
+});
+console.log(r.outcome, r.statusCode, r.timings, r.probes);
+// also: r.html, r.htmlBytes, r.isIndexable, r.redirectedTo, r.viewport, r.screenshot …
+```
+
+- **No Harper connection required** — an off-queue render never reads `settings.harper`, so `harper` is optional.
+- **Fidelity** — the render is the unmodified `defaultRenderer` over the real settings/config/interception
+  path; pass your deployed `renderer`/`config` for an exact reproduction. The resource cache defaults **off**.
+- **`probes`** — the flexible analysis surface: each is `(ctx) => result` run against the live post-render
+  page; results are keyed into `result.probes`. Two neutral factories ship — `selectorCountProbe` (live DOM,
+  walks open shadow roots) and `htmlContainsProbe` (serialized-HTML substrings); pairing them separates
+  "never loaded" from "lost in serialization". `keepOpen: true` returns the still-open `page`/`browser`
+  (+ idempotent `close()`) for interactive/CDP probing.
+- **`renderMatrix(url, devices, options)`** renders one URL across devices in a single browser — the
+  desktop-vs-mobile comparison substrate.
+
+`renderOnce`/`renderMatrix` mutate the process-global settings; run them one at a time (single-flight).
+
 ## Exports
 
 `startWorker`, `defaultRenderer`, `RenderWorker`, `settings`, `loadConfig` / `mergeConfig` /
-`defaultConfig`, and the `BrowserOptions`, `Renderer`, `RenderJob`, `PrerenderConfig` (and related)
-types.
+`defaultConfig`, `renderOnce` / `renderMatrix` / `selectorCountProbe` / `htmlContainsProbe`, and the
+`BrowserOptions`, `Renderer`, `RenderJob`, `PrerenderConfig`, `WaitForRule`, `RenderOnceOptions`,
+`RenderResult`, `Probe` (and related) types.
 
 ## License
 
