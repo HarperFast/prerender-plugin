@@ -266,6 +266,63 @@ const renderer: Renderer = async (page, job) => {
 		}
 	};
 
+	// Declarative "wait for content" step (config.waitFor). For each rule: optionally scroll the
+	// selector into view (to trip an IntersectionObserver-lazy widget the fast scroll-settle passed
+	// over before it loaded), then poll — across the light DOM and open shadow roots — until the
+	// content selector reaches minCount (optionally held stable for stableMs) or the rule's timeout
+	// / the remaining render budget elapses. Best-effort: a rule that never satisfies just times
+	// out (same discipline as the renderer's other waits), so it can never fail a render. Reached
+	// identically by renderOnce and the fleet because both run this renderer over the same config.
+	const applyWaitFor = async () => {
+		// The URL path, used for per-rule pathPattern scoping (falls back to '' if job.url is odd).
+		let path = '';
+		try {
+			path = new URL(url).pathname;
+		} catch {
+			/* leave '' */
+		}
+		for (const rule of config.waitFor ?? []) {
+			// Per-rule scoping: skip rules that don't target this device or path, so a rule never
+			// polls to its timeout on renders it isn't meant for (e.g. a PDP-reviews rule on a
+			// category page, or on desktop where the content is already in view). Validated at config
+			// load, so a bad pathPattern regex can't reach here.
+			if (rule.devices && !rule.devices.includes(deviceType)) continue;
+			if (rule.pathPattern && !new RegExp(rule.pathPattern).test(path)) continue;
+
+			const contentSelector = rule.waitForSelector ?? rule.selector;
+			const minCount = Math.max(1, rule.minCount ?? 1);
+			const doScroll = rule.scrollIntoView !== false;
+			const stableMs = Math.max(0, rule.stableMs ?? 0);
+			const deadline = Date.now() + Math.min(remainingTimer.remaining, rule.timeoutMs ?? remainingTimer.remaining);
+			let satisfiedSince = 0;
+			let hasScrolled = false;
+			while (Date.now() < deadline) {
+				// Scroll the anchor into view ONCE (enough to trip its IntersectionObserver); the widget
+				// then loads into the DOM and is counted regardless of scroll position. Avoids per-tick
+				// layout thrash and fighting the page's own scroll handling. Keeps retrying until the
+				// anchor is actually found (it may itself be injected late).
+				if (doScroll && !hasScrolled) {
+					const scrolled = await page.evaluate(scrollSelectorIntoView, rule.selector).catch(() => false);
+					if (scrolled) hasScrolled = true;
+				}
+				let count: number;
+				try {
+					count = await page.evaluate(countMatchingElements, contentSelector);
+				} catch {
+					return; // page closed / navigated — stop instead of looping to the deadline.
+				}
+				if (count >= minCount) {
+					if (stableMs === 0) break;
+					if (satisfiedSince === 0) satisfiedSince = Date.now();
+					else if (Date.now() - satisfiedSince >= stableMs) break;
+				} else {
+					satisfiedSince = 0;
+				}
+				await new Promise((resolve) => setTimeout(resolve, config.navigation.domStablePollMs));
+			}
+		}
+	};
+
 	if (config.scroll.enabled && config.scroll.settleUntilStable) {
 		await scrollSettle();
 	} else {
@@ -278,6 +335,15 @@ const renderer: Renderer = async (page, job) => {
 		}
 		await networkIdle();
 		await domStable();
+	}
+
+	// Content-readiness waits run AFTER the scroll/settle phase (so lazy widgets have been scrolled
+	// through) and BEFORE the snapshot; scroll back to the top afterward so scroll-reactive UI
+	// (sticky headers) re-lands. No-op unless config.waitFor is set. Its dwell is attributed to
+	// `settle` on purpose — it reads as part of the settle budget.
+	if (config.waitFor?.length) {
+		await applyWaitFor();
+		await scrollToTop();
 	}
 	timings.settle = Date.now() - settleStart;
 
@@ -369,6 +435,57 @@ function countDomElements() {
 		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
 	};
 	walk(document);
+	return n;
+}
+
+// Scroll the first element matching `selector` — searched across the light DOM and all open shadow
+// roots — into the center of the viewport, to trip an IntersectionObserver-lazy widget. Returns
+// whether an element was found and scrolled (so the caller can scroll once, then stop). Runs in-page
+// (passed to page.evaluate), so it is fully self-contained.
+function scrollSelectorIntoView(selector: string): boolean {
+	const find = (root: Document | ShadowRoot): Element | null => {
+		const direct = root.querySelector(selector);
+		if (direct) return direct;
+		for (const el of root.querySelectorAll('*')) {
+			const sr = (el as Element).shadowRoot;
+			if (sr) {
+				const nested = find(sr);
+				if (nested) return nested;
+			}
+		}
+		return null;
+	};
+	const el = find(document);
+	if (!el) return false;
+	el.scrollIntoView({ block: 'center' });
+	return true;
+}
+
+// Count elements matching `selector` across the light DOM and all open shadow roots (widgets like
+// the reviews list render into shadow DOM, invisible to a light-DOM-only querySelectorAll). Runs
+// in-page; self-contained.
+// Allocation-free (matches the countDomElements walk): a manual firstChild/nextSibling traversal
+// testing each element with `matches(selector)` and recursing into open shadow roots, rather than
+// querySelectorAll('*') per root (which allocates a NodeList of every element on every poll tick).
+function countMatchingElements(selector: string): number {
+	let n = 0;
+	const walk = (node: Node) => {
+		if (node.nodeType === 1) {
+			const el = node as Element;
+			if (el.matches(selector)) n++;
+			const sr = el.shadowRoot;
+			if (sr) walk(sr);
+		}
+		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
+	};
+	// A malformed/empty selector makes matches() throw a SyntaxError; return 0 so a bad rule just
+	// times out best-effort instead of throwing out of the wait loop and abandoning the remaining
+	// rules. (A closed/navigated page rejects at page.evaluate — still handled upstream.)
+	try {
+		walk(document);
+	} catch {
+		return 0;
+	}
 	return n;
 }
 

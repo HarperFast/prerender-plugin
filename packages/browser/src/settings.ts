@@ -206,21 +206,44 @@ const defaults = (): Settings => ({
 // `import { settings }` references keep seeing the resolved values).
 export const settings: Settings = defaults();
 
+/** Options accepted by `resolveSettings` — `BrowserOptions` with an optional/partial harper block,
+ *  so an off-queue one-shot render (`renderOnce`) can resolve config/bypass without a connection. */
+export type ResolvableOptions = Omit<BrowserOptions, 'harper'> & { harper?: Partial<BrowserOptions['harper']> };
+
+export type ResolveOptions = {
+	/**
+	 * Require a complete Harper connection block (default true). `startWorker` needs one to claim
+	 * jobs and POST results; a single off-queue render (`renderOnce`) never touches MQTT/the queue —
+	 * the render path reads only settings.config/bypass/cache — so it resolves with `false`.
+	 */
+	requireHarper?: boolean;
+};
+
 /**
- * Resolve `options` over the defaults into the live `settings` and return it. Throws
- * if a required Harper connection field is missing. Safe to call once at startup.
+ * Resolve `options` over the defaults into the live `settings` and return it. With
+ * `requireHarper` (the default), throws if a Harper connection field is missing. `applySettings`
+ * below is the public, always-require wrapper used by `startWorker`; `renderOnce` calls this
+ * directly with `{ requireHarper: false }`.
  */
-export const applySettings = (options: BrowserOptions): Settings => {
+export const resolveSettings = (
+	options: ResolvableOptions,
+	{ requireHarper = true }: ResolveOptions = {}
+): Settings => {
 	if (!options || typeof options !== 'object') {
 		throw new Error('startWorker: an options object is required');
 	}
 	const harper = options.harper;
-	for (const field of ['mqttOrigin', 'user', 'pass', 'workerId'] as const) {
-		if (!harper?.[field]) throw new Error(`startWorker: harper.${field} is required`);
+	if (requireHarper) {
+		for (const field of ['mqttOrigin', 'user', 'pass', 'workerId'] as const) {
+			if (!harper?.[field]) throw new Error(`startWorker: harper.${field} is required`);
+		}
 	}
 
 	const fresh = defaults();
-	fresh.harper = { ...harper };
+	// Merge over the empty-string defaults so a partial/absent harper block leaves the missing
+	// fields '' (never undefined) — any future settings.harper read then fails loudly instead of
+	// silently pointing somewhere unexpected.
+	fresh.harper = { ...fresh.harper, ...(harper ?? {}) };
 	fresh.queuePort = options.queuePort ?? fresh.queuePort;
 	fresh.bypass = {
 		header: options.bypass?.header ?? fresh.bypass.header,
@@ -263,3 +286,23 @@ export const applySettings = (options: BrowserOptions): Settings => {
 	Object.assign(settings, fresh);
 	return settings;
 };
+
+/**
+ * Public settings resolver — same behavior as before: resolve `options` over the defaults and
+ * throw if the Harper connection block is incomplete. Used by `startWorker`.
+ */
+export const applySettings = (options: BrowserOptions): Settings => resolveSettings(options, { requireHarper: true });
+
+/**
+ * The Puppeteer launch options a render worker uses by default — shared by `startWorker` and
+ * `renderOnce` so the two can't drift on Chrome flags/timeouts. `args` reads the resolved
+ * `settings.chromeArgs` (incl. any composed `--host-resolver-rules`), so call this AFTER
+ * `applySettings`/`resolveSettings`.
+ */
+export const defaultLaunchOptions = (): LaunchOptions => ({
+	timeout: 20000,
+	protocolTimeout: 50000,
+	headless: 'shell',
+	ignoreDefaultArgs: ['--disable-dev-shm-usage'],
+	args: settings.chromeArgs,
+});

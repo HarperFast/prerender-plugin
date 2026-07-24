@@ -20,7 +20,7 @@
 import RenderWorker, { Renderer } from './Worker.js';
 import defaultRenderer from './renderer.js';
 import logger from './util/Logger.js';
-import { applySettings, settings } from './settings.js';
+import { applySettings, settings, defaultLaunchOptions } from './settings.js';
 import type { BrowserOptions } from './settings.js';
 import { initResourceCache } from './ResourceCache.js';
 import { ErrorHandler } from './errorHandler.js';
@@ -64,13 +64,7 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 		maxConcurrency: settings.concurrency,
 		browserExpirationThreshold: settings.browserExpirationThreshold,
 		rps: settings.rps,
-		browserLaunchOptions: settings.browserLaunchOptions ?? {
-			timeout: 20000,
-			protocolTimeout: 50000,
-			headless: 'shell',
-			ignoreDefaultArgs: ['--disable-dev-shm-usage'],
-			args: settings.chromeArgs,
-		},
+		browserLaunchOptions: settings.browserLaunchOptions ?? defaultLaunchOptions(),
 		renderer,
 	});
 
@@ -90,7 +84,12 @@ export { default as RenderJob } from './RenderJob.js';
 export { settings } from './settings.js';
 export { defaultConfig, loadConfig, mergeConfig } from './config.js';
 
+// On-demand render + analysis harness (the off-queue counterpart to startWorker). resolveSettings
+// and defaultLaunchOptions stay internal — the public surface is renderOnce/renderMatrix + probes.
+export { renderOnce, renderMatrix, selectorCountProbe, htmlContainsProbe } from './renderOnce.js';
+
 export type { Renderer } from './Worker.js';
+export type { RenderOnceOptions, RenderResult, RenderOutcome, Probe, ProbeContext } from './renderOnce.js';
 export type { JobConfig } from './RenderJob.js';
 export type { BrowserOptions, ResourceCacheOptions, Settings } from './settings.js';
 export type {
@@ -102,4 +101,5 @@ export type {
 	NavigationConfig,
 	ScrollConfig,
 	PostProcessConfig,
+	WaitForRule,
 } from './config.js';

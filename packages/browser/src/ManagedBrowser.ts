@@ -104,9 +104,13 @@ export default class ManagedBrowser {
 			logger.error({ err }, 'failed to close browser');
 		}
 
-		setTimeout(() => {
+		const fallback = setTimeout(() => {
 			this.kill().catch((err) => logger.error({ err }, 'failed to kill process'));
 		}, 5000);
+		// Don't let this fallback timer hold the event loop open on its own — a finished one-shot
+		// (renderOnce) process should exit promptly. In the long-lived worker the loop stays alive
+		// via other refs, so kill() still fires there.
+		fallback.unref();
 	}
 
 	async kill() {
@@ -119,6 +123,8 @@ export default class ManagedBrowser {
 		const timeout = setTimeout(() => {
 			process?.kill('SIGKILL');
 		}, 5000);
+		// Same rationale as close(): don't independently keep a finished one-shot process alive.
+		timeout.unref();
 
 		try {
 			await this.browser.close();

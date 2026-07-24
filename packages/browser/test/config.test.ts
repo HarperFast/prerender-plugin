@@ -81,6 +81,49 @@ test('validation: defaultDevice must exist in devices', () => {
 	assert.throws(() => loadConfig(file), /defaultDevice "phone" is not present/);
 });
 
+test('waitFor: valid rules pass; arrays replace wholesale; absent stays undefined', () => {
+	assert.equal(mergeConfig().waitFor, undefined);
+	const cfg = mergeConfig({ waitFor: [{ selector: '#reviews', waitForSelector: '.review', minCount: 2 }] });
+	assert.deepEqual(cfg.waitFor, [{ selector: '#reviews', waitForSelector: '.review', minCount: 2 }]);
+});
+
+test('waitFor: validation rejects an empty selector / waitForSelector / negative numbers', () => {
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '' }] }),
+		/waitFor\[0\]\.selector must be a non-empty string/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', waitForSelector: '   ' }] }),
+		/waitFor\[0\]\.waitForSelector must be a non-empty string/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', minCount: -1 }] }),
+		/waitFor\[0\]\.minCount must be a non-negative number/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: { selector: '#r' } as unknown as [] }),
+		/waitFor must be an array of rules/
+	);
+});
+
+test('waitFor: validation of devices / pathPattern scoping', () => {
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', devices: 'mobile' as unknown as string[] }] }),
+		/waitFor\[0\]\.devices must be an array/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', devices: [''] }] }),
+		/waitFor\[0\]\.devices must be an array/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', pathPattern: '[' }] }),
+		/waitFor\[0\]\.pathPattern is not a valid regex/
+	);
+	assert.doesNotThrow(() =>
+		mergeConfig({ waitFor: [{ selector: '#r', devices: ['mobile'], pathPattern: '^/product/' }] })
+	);
+});
+
 test('validation: a device must have a numeric viewport', () => {
 	const file = writeConfig({ devices: { desktop: { viewport: { width: 'wide' } } } });
 	assert.throws(() => loadConfig(file), /requires a viewport with numeric width and height/);
