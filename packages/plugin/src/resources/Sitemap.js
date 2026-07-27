@@ -4,7 +4,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { queryAllowlistFor } from '../util/ingress.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
-import { parseSitemap } from '../util/sitemap.js';
+import { parseSitemap, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 
 class Sitemap extends databases.sitemaps.Sitemap {
@@ -94,10 +94,19 @@ class Sitemap extends databases.sitemaps.Sitemap {
 							} else {
 								// Only `sitemapUrl` is needed here; avoid materializing the full
 								// record for every entry × deviceType in this bulk loop.
-								const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'sitemapUrl' });
+								//
+								// MUST be an array select. A string select projects to the bare VALUE,
+								// not a record, so `existingTarget.sitemapUrl` read `undefined` off a
+								// string and `updateTarget` was therefore always true: every known
+								// target was re-put on every refresh, and since `RenderTarget.put`
+								// recomputes `getInitialRenderTime` (now + jitter), each refresh pushed
+								// the next render FORWARD. Any target whose interval exceeds the refresh
+								// period — changefreq weekly, monthly, yearly — was reset before it ever
+								// came due and so never re-rendered at all.
+								const existingTarget = await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] });
 
 								if (existingTarget) {
-									updateTarget = existingTarget.sitemapUrl !== sitemapUrl;
+									updateTarget = sitemapTargetNeedsUpdate(existingTarget, sitemapUrl);
 									if (updateTarget) {
 										updated++;
 									}

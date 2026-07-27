@@ -48,3 +48,30 @@ test('values are rendered via textContent, never innerHTML', () => {
 	assert.equal(script.includes('outerHTML'), false);
 	assert.equal(script.includes('insertAdjacentHTML'), false);
 });
+
+test('the client calls only routes the server dispatches', () => {
+	// The route names are the contract between this page and PrerenderAdmin's switch. A typo
+	// here fails only in a browser, so pin the set: every path the client posts to must be one
+	// the resource handles.
+	const served = [
+		'session',
+		'login',
+		'logout',
+		'overview',
+		'config',
+		'explain',
+		'schedule',
+		'queue',
+		'revalidate',
+		'reconcile',
+	];
+	const posted = [...inlineScript().matchAll(/\b(?:post|api)\(\s*'([a-z_]+)'/g)].map((match) => match[1]);
+
+	assert.ok(posted.length > 0, 'expected the page to call at least one route');
+	for (const route of posted) {
+		assert.ok(served.includes(route), `client calls unknown route "${route}"`);
+	}
+	// The two actions added for schedule repair must actually be wired up.
+	assert.ok(posted.includes('revalidate'), 'the explainer must offer a single-key revalidate');
+	assert.ok(posted.includes('reconcile'), 'the overview must offer the repair sweep');
+});

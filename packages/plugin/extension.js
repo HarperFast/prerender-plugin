@@ -10,6 +10,7 @@
 import { applyOptions } from './src/config.js';
 import { startQueueStatusSync } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
+import { startScheduleReconciler } from './src/util/reconcile.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -27,8 +28,10 @@ export async function handleApplication(scope) {
 		}
 	});
 
-	// Start background work now that config is applied. Both are idempotent and
-	// self-gate by worker/node.
+	// Start background work now that config is applied. All are idempotent and
+	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
+	// every node repairs the schedule rows it owns (see util/reconcile.js).
 	startQueueStatusSync();
 	startSitemapRefreshScheduler();
+	startScheduleReconciler();
 }

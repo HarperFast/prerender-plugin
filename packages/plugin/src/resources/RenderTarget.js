@@ -24,8 +24,14 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 		// now live in separate databases (the schedule is isolated as the hot queue),
 		// so these are two independent commits rather than one atomic write. Ordering
 		// target-first keeps the invariant "a schedule always references an existing
-		// target" (which `claim` relies on); the reverse gap — a target with no
-		// schedule — is benign and self-heals on the next sitemap refresh / revalidate.
+		// target" (which `claim` relies on).
+		//
+		// The reverse gap — a target with no schedule — is NOT self-healing, despite what
+		// this comment used to claim. For a URL in a sitemap the next refresh re-puts it,
+		// but a traffic-discovered URL is never revisited: `handlePageScheduling` is gated
+		// on the target not existing, and `processJobResult` only reschedules after a
+		// render that can no longer be claimed. Such a URL goes dark permanently and
+		// silently. `util/reconcile.js` is what actually repairs it.
 		const result = await super.put({ ...CacheKey.parse(cacheKey), ...data }, target);
 
 		// Absent a valid explicit time, jitter the first render across the interval (keyed

@@ -82,6 +82,13 @@ rest: true # required for the @export-ed table REST endpoints
 
   render:
     defaultInterval: 86400000 # 24h — how often a target is re-rendered (relative to completion)
+    reconcile: # repairs targets whose schedule row went missing (see "Schedule repair")
+      enabled: true
+      interval: 21600000 # 6h — how often each node sweeps its own slice of the keyspace
+      startDelay: 300000 # 5m — grace after boot before the first sweep
+      startJitter: 300000 # 5m — per-node spread, so a rolling restart doesn't sync the sweeps
+      batchSize: 500 # targets per page (bounds how long each read transaction stays open)
+      maxRestores: 5000 # ceiling on rows RESTORED per sweep; a truncated sweep logs that it was
 
   sitemap:
     refreshTime: '12:00' # local time-of-day for the daily sitemap refresh
@@ -226,17 +233,19 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                    | Purpose                                         | Gate         |
-| -------------------------------- | ----------------------------------------------- | ------------ |
-| `GET /prerender_admin`           | the UI page (contains no data)                  | public       |
-| `GET /prerender_admin/session`   | who am I                                        | public       |
-| `POST /prerender_admin/login`    | `{ username, password }`                        | public       |
-| `POST /prerender_admin/logout`   | end the session                                 | session      |
-| `GET /prerender_admin/overview`  | nodes, counts, backlog shape                    | `super_user` |
-| `GET /prerender_admin/config`    | effective config + warnings                     | `super_user` |
-| `POST /prerender_admin/explain`  | `{ url, deviceType }` → cache-key trace         | `super_user` |
-| `POST /prerender_admin/schedule` | `{ cacheKey }` → this node's local schedule row | `super_user` |
-| `POST /prerender_admin/queue`    | `{ scope, paused }` → pause control             | `super_user` |
+| Method & path                      | Purpose                                         | Gate         |
+| ---------------------------------- | ----------------------------------------------- | ------------ |
+| `GET /prerender_admin`             | the UI page (contains no data)                  | public       |
+| `GET /prerender_admin/session`     | who am I                                        | public       |
+| `POST /prerender_admin/login`      | `{ username, password }`                        | public       |
+| `POST /prerender_admin/logout`     | end the session                                 | session      |
+| `GET /prerender_admin/overview`    | nodes, counts, backlog shape                    | `super_user` |
+| `GET /prerender_admin/config`      | effective config + warnings                     | `super_user` |
+| `POST /prerender_admin/explain`    | `{ url, deviceType }` → cache-key trace         | `super_user` |
+| `POST /prerender_admin/schedule`   | `{ cacheKey }` → this node's local schedule row | `super_user` |
+| `POST /prerender_admin/queue`      | `{ scope, paused }` → pause control             | `super_user` |
+| `POST /prerender_admin/revalidate` | `{ url, deviceType }` → make one key due now    | `super_user` |
+| `POST /prerender_admin/reconcile`  | start a schedule-repair sweep on this node      | `super_user` |
 
 ### What it shows
 
@@ -255,6 +264,46 @@ this plugin's resources all set `loadAsInstance = false`.
   whether they are set, alongside the risky-config warnings that previously existed only as
   startup log lines (empty security token, staging passthrough enabled, `renderNow` without a
   token).
+
+The explainer also offers **Render this URL now**, which makes that one key due immediately.
+It writes a single `RenderSchedule` row on purpose: the collection-level
+`RenderTarget.revalidate` takes a search target, and aimed at the whole registry it queues
+every target at once — at a million targets that is a self-inflicted render herd.
+
+### Schedule repair: the half-written target
+
+A `RenderTarget` and its `RenderSchedule` row live in **separate databases**, so creating a
+target is two independent commits — and the schedule half is residency-routed to whichever node
+owns the URL. If that second write is lost (a crash between them, or a routed write to a node
+whose replication link is unhealthy), or if cluster membership changes and moves a key's owner,
+the target survives with no schedule row.
+
+Nothing then renders that URL, and **nothing re-creates the row**:
+
+- the bot-traffic path (`handlePageScheduling`) is gated on the target _not_ existing, so it
+  skips the URL from then on;
+- the sitemap refresh only visits URLs present in a sitemap, so a traffic-discovered URL — a
+  site's home page being the obvious one — is never revisited;
+- `processJobResult` reschedules, but only after a render, which needs a claim, which needs the
+  very row that is missing.
+
+The state is therefore terminal _and_ silent: the cached page expires, every later bot request
+falls through to the origin, and there is no error and no metric to notice it by. The only
+symptom is a page whose `lastCached` keeps receding.
+
+`render.reconcile` is the repair. Each node walks the target registry in primary-key pages and,
+**for the keys it owns**, checks node-locally whether the schedule row exists and restores it if
+not. Owner-scoped is a safety requirement, not an optimization: a point read of a
+residency-pinned row this node does not own takes Harper's untimed replication fetch, so a
+single such read could hang the sweep forever. Every node sweeping its own slice covers the
+whole keyspace with no coordination and no cross-node reads.
+
+Restores use the **jittered** initial render time rather than "now" — a sweep can repair a great
+many rows at once, and queueing them all immediately would trade a silent outage for a render
+herd. `maxRestores` caps writes per sweep and a truncated sweep says so in the log, so a short
+count is never mistaken for "all clear".
+
+The Overview panel shows the last sweep's result on that node and can start one on demand.
 
 ### Residency: why the schedule row is fetched from another node
 

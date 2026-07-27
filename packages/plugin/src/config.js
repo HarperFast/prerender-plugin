@@ -196,6 +196,24 @@ const defaultConfig = () => ({
 		// across this interval — so the fleet renders as a smooth stream rather than a
 		// daily herd. Sitemap-derived targets override this per-URL from `changefreq`.
 		defaultInterval: DAY,
+
+		// Periodic repair of targets whose RenderSchedule row is missing. A target and its
+		// schedule are two commits in two databases (the schedule routed to the node owning
+		// the URL), so the pair can end up half-written — and for a URL that is not in a
+		// sitemap, NOTHING otherwise re-creates the schedule: the URL stops rendering
+		// silently and permanently. See util/reconcile.js. Runs on worker 0 of every node,
+		// each covering only the keys it owns.
+		reconcile: {
+			enabled: true,
+			interval: 6 * HOUR, // how often each node sweeps its own slice of the keyspace
+			startDelay: 5 * MINUTE, // grace after boot before the first sweep
+			startJitter: 5 * MINUTE, // per-node spread, so a rolling restart doesn't sync the sweeps
+			batchSize: 500, // targets per page; bounds how long each read transaction stays open
+			// Ceiling on rows RESTORED per sweep (not rows examined). A membership change can
+			// strand a large slice of the keyspace at once, and rewriting millions of rows in
+			// a single pass would be its own outage. A truncated sweep says so in the log.
+			maxRestores: 5000,
+		},
 	},
 
 	sitemap: {
