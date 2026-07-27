@@ -1,5 +1,8 @@
-import { test, beforeEach, afterEach } from 'node:test';
+import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+// Safe to import statically: the module reads the `databases` global inside the function
+// body, at call time, so each test can install its own fake before calling.
+import { getDesiredPause } from '../src/util/queueControl.js';
 
 /**
  * Regression tests for the READ side of pause-intent resolution.
@@ -33,13 +36,6 @@ const makeFakeDatabases = (rows) => ({
 			},
 		},
 	},
-});
-
-let getDesiredPause;
-
-beforeEach(async () => {
-	// Imported after the global exists, since the module reaches for `databases` at call time.
-	({ getDesiredPause } = await import('../src/util/queueControl.js'));
 });
 
 afterEach(() => {
