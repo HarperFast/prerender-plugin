@@ -24,6 +24,7 @@ import { applySettings, settings, defaultLaunchOptions } from './settings.js';
 import type { BrowserOptions } from './settings.js';
 import { initResourceCache } from './ResourceCache.js';
 import { ErrorHandler } from './errorHandler.js';
+import type { MetricsRecorder } from './metrics.js';
 
 export type StartWorkerOptions = BrowserOptions & {
 	/** Renderer to use instead of the built-in default. */
@@ -54,8 +55,23 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 			...settings,
 			harper: { ...settings.harper, pass: settings.harper.pass ? 'REDACTED' : '' },
 			bypass: { ...settings.bypass, token: settings.bypass.token ? 'REDACTED' : '' },
+			// headers may carry an auth token for the collector — never log their values.
+			metrics: { ...settings.metrics, headers: Object.keys(settings.metrics.headers) },
 		},
 	});
+
+	// Optional OTLP metrics: construct only when enabled AND an endpoint is set — that dynamic
+	// import is the only thing that loads the OpenTelemetry SDK, so a disabled worker pays nothing.
+	// A metrics-init failure must never stop the worker from rendering.
+	let metrics: MetricsRecorder | undefined;
+	if (settings.metrics.enabled && settings.metrics.otlpEndpoint) {
+		try {
+			const { createMetrics } = await import('./metrics.js');
+			metrics = await createMetrics(settings.metrics, { workerId: settings.harper.workerId });
+		} catch (err) {
+			logger.error({ err }, 'failed to start metrics export — continuing without metrics');
+		}
+	}
 
 	// Block job intake until the cache has scanned disk and built its in-memory index.
 	await initResourceCache(settings.resourceCache);
@@ -66,6 +82,7 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 		rps: settings.rps,
 		browserLaunchOptions: settings.browserLaunchOptions ?? defaultLaunchOptions(),
 		renderer,
+		metrics,
 	});
 
 	// Install signal handlers AFTER the worker exists so SIGTERM/SIGINT can drain it

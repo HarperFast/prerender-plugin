@@ -8,6 +8,7 @@ import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
 import { settings } from './settings.js';
 import { CpuSampler } from './util/cpu.js';
+import type { MetricsRecorder } from './metrics.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -29,6 +30,12 @@ type RenderWorkerConfig = {
 	rps?: number;
 
 	browserLaunchOptions?: LaunchOptions;
+
+	/**
+	 * Optional metrics recorder. When present, each stats window is folded into it (see
+	 * `logStats`) and it is flushed on shutdown. Absent unless the embedder enabled OTLP metrics.
+	 */
+	metrics?: MetricsRecorder;
 };
 
 export default class RenderWorker {
@@ -56,6 +63,9 @@ export default class RenderWorker {
 	private cpuSampler = new CpuSampler(() => this.browser?.pid);
 
 	rps = 10;
+
+	// Optional OTLP metrics recorder; null unless the embedder enabled metrics.
+	private metrics: MetricsRecorder | null = null;
 
 	inflight: Set<Promise<void>> = new Set();
 
@@ -102,6 +112,7 @@ export default class RenderWorker {
 		this.CONCURRENCY = config.maxConcurrency ?? 5;
 		this.BROWSER_MAX_TOTAL_PAGES = config.browserExpirationThreshold ?? 5000;
 		this.renderFn = config.renderer;
+		this.metrics = config.metrics ?? null;
 
 		this.browserCleanupInterval = setInterval(() => {
 			this.closeRetiredBrowsers();
@@ -284,6 +295,40 @@ export default class RenderWorker {
 			rssMb: Math.round(mem.rss / 1024 / 1024),
 			resourceCache: cacheStats,
 		});
+
+		// Fold the same window into OTLP metrics (no-op unless the embedder enabled them). `s`
+		// still holds the raw per-render sample arrays, so histograms get true observations —
+		// not the already-summarized percentiles above.
+		this.metrics?.record(
+			{
+				completed: s.completed,
+				succeeded: s.succeeded,
+				emptyContent: s.emptyContent,
+				fromSitemap: s.fromSitemap,
+				failures: s.failures,
+				expiredSkipped: s.expiredSkipped,
+				concurrencyBlocked: s.concurrencyBlocked,
+				rpsDelayed: s.rpsDelayed,
+				resultPostFailures: s.resultPostFailures,
+				browserLaunches: s.browserLaunches,
+				browserRetirements: s.browserRetirements,
+				renderTimes: s.renderTimes,
+				navTtfb: s.navTtfb,
+				navTotal: s.navTotal,
+				settle: s.settle,
+				postProcess: s.postProcess,
+			},
+			{
+				inflight: this.inflight.size,
+				concurrency: this.CONCURRENCY,
+				retiredBrowsers: this.retiredBrowsers.size,
+				rssBytes: mem.rss,
+				workerCores: cpu.workerCores,
+				nodeCores: cpu.nodeCores,
+				browserCores: cpu.browserCores,
+				cacheHitRate: cacheStats ? cacheStats.hitRate : null,
+			}
+		);
 	}
 
 	/**
@@ -319,6 +364,18 @@ export default class RenderWorker {
 		}
 
 		const closing: Promise<void>[] = [];
+		// Flush buffered metrics before the loop dies (shutdown() is internally guarded — never
+		// throws). Cap the wait so a down collector's flush retries can't delay container exit; a
+		// dropped final window is an acceptable trade at shutdown. AbortController cancels the cap
+		// timer once the flush wins so it doesn't linger on the event loop (mirrors the drain above).
+		if (this.metrics) {
+			const metrics = this.metrics;
+			this.metrics = null;
+			const ac = new AbortController();
+			const flush = metrics.shutdown().finally(() => ac.abort());
+			const cap = setTimeout(2000, undefined, { signal: ac.signal }).catch(() => {});
+			closing.push(Promise.race([flush, cap]));
+		}
 		if (this.browser) {
 			closing.push(this.browser.close().catch(noop));
 		}
