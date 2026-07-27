@@ -93,7 +93,11 @@ export class RenderQueue extends Resource {
 		// deleted earlier in this request is still visible to a read here, so re-reading it
 		// resolves a resume straight back to "paused" and returns the opposite of what
 		// actually happened. The other scope is read normally — this write didn't touch it.
-		const local = await syncQueueState(true, { scope: target, paused });
+		// `intent.paused`, not the raw argument: setDesiredPause normalizes (an absent `paused`
+		// is written as `false`), so threading the raw value could resolve "no opinion" while
+		// the row on disk says `false`. Using what was actually written keeps the resolved
+		// state and the persisted state identical by construction.
+		const local = await syncQueueState(true, { scope: target, paused: intent.paused });
 		return { ...intent, node: server.hostname, local };
 	});
 

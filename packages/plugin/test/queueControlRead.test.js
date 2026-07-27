@@ -159,3 +159,57 @@ test('pending for an unrelated scope does not shadow either read', async () => {
 		source: 'cluster',
 	});
 });
+
+/**
+ * `setDesiredPause` normalization. `setPause` threads `intent.paused` (what was written)
+ * rather than its raw argument into the pending substitution, so these pin the property
+ * that makes that safe: the returned `paused` is always a boolean or null, never undefined.
+ */
+
+test('setDesiredPause normalizes a missing paused to false, and reports what it wrote', async () => {
+	const writes = [];
+	globalThis.databases = {
+		render_service: {
+			QueueControl: {
+				put: (scope, record) => {
+					writes.push({ scope, ...record });
+					return Promise.resolve();
+				},
+				delete: (scope) => {
+					writes.push({ scope, deleted: true });
+					return Promise.resolve();
+				},
+			},
+		},
+	};
+	const { setDesiredPause } = await import('../src/util/queueControl.js');
+
+	// An absent `paused` is written as false — so the value threaded into `pending` must be
+	// that same normalized false, not undefined (which would resolve as "no opinion" and
+	// contradict the row just written).
+	const intent = await setDesiredPause('node-a', undefined, 'tester');
+	assert.equal(intent.paused, false);
+	assert.equal(writes[0].paused, false);
+
+	// null deletes and reports null (inherit), which IS "no opinion" — correctly so.
+	const cleared = await setDesiredPause('node-a', null, 'tester');
+	assert.equal(cleared.paused, null);
+	assert.equal(cleared.inherited, true);
+	assert.equal(writes[1].deleted, true);
+});
+
+test('a normalized false is an explicit override, distinct from "no opinion"', async () => {
+	globalThis.databases = makeFakeDatabases({ all: { scope: 'all', paused: true } });
+
+	// paused:false must win over a cluster pause...
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-a', paused: false }), {
+		paused: false,
+		source: 'node',
+	});
+	// ...whereas undefined would silently fall through to it. This is exactly the confusion
+	// threading `intent.paused` avoids.
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-a', paused: undefined }), {
+		paused: true,
+		source: 'cluster',
+	});
+});
