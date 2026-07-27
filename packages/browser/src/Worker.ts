@@ -363,11 +363,23 @@ export default class RenderWorker {
 			this.browserCleanupInterval = null;
 		}
 
+		// Emit one final stats window before tearing down. The interval timer is now cleared, so the
+		// up-to-one-window of counts/timings accumulated since the last tick would otherwise be lost
+		// from both the log line and (more importantly) the metrics flush below — logStats() folds it
+		// into the recorder via record(), while this.metrics is still set. Guarded so a failure here
+		// (e.g. mid-uncaughtException) can't block the browser cleanup that follows.
+		try {
+			this.logStats();
+		} catch (err) {
+			logger.warn({ err }, 'failed to log final stats during destroy');
+		}
+
 		const closing: Promise<void>[] = [];
-		// Flush buffered metrics before the loop dies (shutdown() is internally guarded — never
-		// throws). Cap the wait so a down collector's flush retries can't delay container exit; a
-		// dropped final window is an acceptable trade at shutdown. AbortController cancels the cap
-		// timer once the flush wins so it doesn't linger on the event loop (mirrors the drain above).
+		// Flush the buffered metrics (incl. the final window just recorded above) before the loop
+		// dies (shutdown() is internally guarded — never throws). Cap the wait so a down collector's
+		// flush retries can't delay container exit — losing that last export to a dead collector is an
+		// acceptable trade. AbortController cancels the cap timer once the flush wins so it doesn't
+		// linger on the event loop (mirrors the drain above).
 		if (this.metrics) {
 			const metrics = this.metrics;
 			this.metrics = null;
