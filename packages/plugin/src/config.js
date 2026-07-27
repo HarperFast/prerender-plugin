@@ -208,10 +208,10 @@ const defaultConfig = () => ({
 			interval: 6 * HOUR, // how often each node sweeps its own slice of the keyspace
 			startDelay: 5 * MINUTE, // grace after boot before the first sweep
 			startJitter: 5 * MINUTE, // per-node spread, so a rolling restart doesn't sync the sweeps
-			batchSize: 500, // targets per page; bounds how long each read transaction stays open
-			// Ceiling on rows RESTORED per sweep (not rows examined). A membership change can
-			// strand a large slice of the keyspace at once, and rewriting millions of rows in
-			// a single pass would be its own outage. A truncated sweep says so in the log.
+			// Ceiling on rows RESTORED per sweep. The scan always runs to completion, so a
+			// truncated sweep still reports the true size of the gap — the cap bounds only how
+			// much is repaired at once, since a membership change can strand a large slice of the
+			// keyspace and rewriting millions of rows in one pass would be its own outage.
 			maxRestores: 5000,
 		},
 	},

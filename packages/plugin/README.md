@@ -87,8 +87,9 @@ rest: true # required for the @export-ed table REST endpoints
       interval: 21600000 # 6h — how often each node sweeps its own slice of the keyspace
       startDelay: 300000 # 5m — grace after boot before the first sweep
       startJitter: 300000 # 5m — per-node spread, so a rolling restart doesn't sync the sweeps
-      batchSize: 500 # targets per page (bounds how long each read transaction stays open)
-      maxRestores: 5000 # ceiling on rows RESTORED per sweep; a truncated sweep logs that it was
+      maxRestores:
+        5000 # ceiling on rows RESTORED per sweep; the scan always completes, so a
+        # truncated sweep still reports the full size of the gap
 
   sitemap:
     refreshTime: '12:00' # local time-of-day for the daily sitemap refresh
@@ -291,9 +292,16 @@ The state is therefore terminal _and_ silent: the cached page expires, every lat
 falls through to the origin, and there is no error and no metric to notice it by. The only
 symptom is a page whose `lastCached` keeps receding.
 
-`render.reconcile` is the repair. Each node walks the target registry in primary-key pages and,
-**for the keys it owns**, checks node-locally whether the schedule row exists and restores it if
-not. Owner-scoped is a safety requirement, not an optimization: a point read of a
+`render.reconcile` is the repair. Each node makes **one pass** over the target registry and, **for
+the keys it owns**, checks node-locally whether the schedule row exists, collecting the gaps and
+restoring them once the scan has finished.
+
+The pass is deliberately cursor-free, so nothing depends on the order rows arrive in. Paging by
+primary key and resuming from the last key seen would make correctness rest on the storage engine
+returning rows in key order — and if that ever stopped holding, the cursor would skip rows
+silently, which is the worst failure mode available to a repair tool. Restoring only after the
+scan closes also makes the transaction rule structural rather than a convention: no write is ever
+issued while the scan's cursor is open. Owner-scoped is a safety requirement, not an optimization: a point read of a
 residency-pinned row this node does not own takes Harper's untimed replication fetch, so a
 single such read could hang the sweep forever. Every node sweeping its own slice covers the
 whole keyspace with no coordination and no cross-node reads.

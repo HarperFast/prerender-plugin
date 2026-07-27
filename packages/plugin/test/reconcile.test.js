@@ -36,41 +36,43 @@ afterEach(() => {
  * A fake registry. `owners` maps a cacheKey to its owning node so a test can place rows on
  * either side of the residency boundary; `schedules` is the set of keys that HAVE a row.
  */
-const harness = ({ targets, owners = {}, schedules = [], hostname = 'node-a', batchSize = 2, maxRestores = 100 }) => {
+const harness = ({ targets, owners = {}, schedules = [], hostname = 'node-a', maxRestores = 100 }) => {
 	const scheduleSet = new Set(schedules);
 	const puts = [];
 	const scheduleReads = [];
-	let openCursor = false;
-	const writesWhileCursorOpen = [];
+	let scanOpen = false;
+	const writesWhileScanOpen = [];
 
-	const searchTargets = async ({ cursor, limit }) => {
-		openCursor = true;
-		const ordered = [...targets].sort((a, b) => (a.cacheKey < b.cacheKey ? -1 : 1));
-		const page = ordered.filter((t) => cursor === null || t.cacheKey > cursor).slice(0, limit);
-		// A drained batch: the cursor is closed before the caller does any writing.
-		openCursor = false;
-		return page;
-	};
+	// A live async iterator, like the real `search`. `scanOpen` tracks whether its cursor is
+	// still being consumed, so a write issued mid-scan is caught rather than merely discouraged.
+	const streamTargets = () =>
+		(async function* () {
+			scanOpen = true;
+			try {
+				for (const target of targets) yield target;
+			} finally {
+				scanOpen = false;
+			}
+		})();
 
 	return {
 		puts,
 		scheduleReads,
-		writesWhileCursorOpen,
+		writesWhileScanOpen,
 		run: (overrides = {}) =>
 			reconcile.reconcileSchedules({
-				searchTargets,
+				streamTargets,
 				getSchedule: async (cacheKey) => {
 					scheduleReads.push(cacheKey);
 					return scheduleSet.has(cacheKey) ? { cacheKey } : null;
 				},
 				putSchedule: async (cacheKey, row) => {
-					if (openCursor) writesWhileCursorOpen.push(cacheKey);
+					if (scanOpen) writesWhileScanOpen.push(cacheKey);
 					puts.push({ cacheKey, ...row });
 					scheduleSet.add(cacheKey);
 				},
 				ownerOf: (url) => owners[url] ?? 'node-a',
 				hostname,
-				batchSize,
 				maxRestores,
 				...overrides,
 			}),
@@ -204,7 +206,7 @@ test('the walk pages through every target rather than stopping at the first batc
 		cacheKey: `https://x/${i}|desktop`,
 		renderInterval: 60000,
 	}));
-	const h = harness({ targets, batchSize: 2 });
+	const h = harness({ targets });
 
 	const stats = await h.run();
 
@@ -212,33 +214,37 @@ test('the walk pages through every target rather than stopping at the first batc
 	assert.equal(stats.restored, 7);
 });
 
-test('no write is issued while a search cursor is still open', async () => {
-	// Interleaving writes into an open search holds its read transaction across them and pins
-	// the log against reclamation — the same reason `claim` drains before leasing.
+test('no write is issued while the scan is still open', async () => {
+	// Structural, not incidental: every restore happens in a second phase after the scan has
+	// finished. Interleaving them would hold the read transaction across the writes and pin the
+	// log against reclamation — the same reason `claim` drains before leasing.
 	const targets = Array.from({ length: 5 }, (_, i) => ({
 		cacheKey: `https://x/${i}|desktop`,
 		renderInterval: 60000,
 	}));
-	const h = harness({ targets, batchSize: 2 });
+	const h = harness({ targets });
 
 	await h.run();
 
-	assert.deepEqual(h.writesWhileCursorOpen, []);
+	assert.deepEqual(h.writesWhileScanOpen, []);
 });
 
-test('the restore cap stops the sweep and reports truncation', async () => {
+test('the restore cap bounds writes but still measures the whole gap', async () => {
 	const targets = Array.from({ length: 10 }, (_, i) => ({
 		cacheKey: `https://x/${i}|desktop`,
 		renderInterval: 60000,
 	}));
-	const h = harness({ targets, batchSize: 3, maxRestores: 4 });
+	const h = harness({ targets, maxRestores: 4 });
 
 	const stats = await h.run();
 
 	assert.equal(stats.restored, 4);
-	assert.equal(stats.truncated, true);
-	// Truncation must be visible: a short count that reads as "all clear" is the failure mode.
 	assert.equal(h.puts.length, 4);
+	// The scan still runs to completion, so the true size of the gap is reported even though
+	// only part of it was repaired. A short count that reads as "all clear" is the failure mode.
+	assert.equal(stats.examined, 10);
+	assert.equal(stats.missing, 10);
+	assert.equal(stats.truncated, true);
 });
 
 test('a clean sweep reports truncated:false', async () => {
@@ -254,61 +260,45 @@ test('a clean sweep reports truncated:false', async () => {
 	assert.equal(stats.owned, 1);
 });
 
-test('an empty registry terminates instead of looping', async () => {
+test('an empty registry is a clean no-op', async () => {
 	const h = harness({ targets: [] });
 
 	const stats = await h.run();
 
-	assert.deepEqual(
-		{ examined: stats.examined, restored: stats.restored, lastKey: stats.lastKey },
-		{ examined: 0, restored: 0, lastKey: null }
-	);
+	assert.deepEqual(stats, { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false });
 });
 
-test('the cursor advances past skipped rows so a capped run makes progress', async () => {
-	// If the cursor only advanced on restored rows, a sweep whose first page is entirely
-	// owned elsewhere would re-read that same page forever.
-	const pages = [];
-	const h = harness({
-		targets: [
-			{ cacheKey: 'https://x/a|desktop' },
-			{ cacheKey: 'https://x/b|desktop' },
-			{ cacheKey: 'https://x/c|desktop' },
-		],
-		owners: { 'https://x/a': 'node-b', 'https://x/b': 'node-b' },
-		batchSize: 2,
-	});
+test('the result does not depend on the order rows arrive in', async () => {
+	// The point of the cursor-free design. A paged cursor resuming from the last key seen would
+	// silently skip rows if the storage engine ever stopped returning them in key order; this
+	// asserts the sweep is indifferent to order instead of relying on that guarantee.
+	const targets = [
+		{ cacheKey: 'https://x/c|desktop', renderInterval: 60000 },
+		{ cacheKey: 'https://x/a|desktop', renderInterval: 60000 },
+		{ cacheKey: 'https://x/b|desktop', renderInterval: 60000 },
+	];
 
-	await h.run({
-		searchTargets: async ({ cursor, limit }) => {
-			pages.push(cursor);
-			const ordered = [
-				{ cacheKey: 'https://x/a|desktop' },
-				{ cacheKey: 'https://x/b|desktop' },
-				{ cacheKey: 'https://x/c|desktop' },
-			];
-			return ordered.filter((t) => cursor === null || t.cacheKey > cursor).slice(0, limit);
-		},
-	});
+	const shuffled = await harness({ targets }).run();
+	const sorted = await harness({ targets: [...targets].sort((a, b) => (a.cacheKey < b.cacheKey ? -1 : 1)) }).run();
 
-	assert.deepEqual(pages, [null, 'https://x/b|desktop']);
+	assert.deepEqual(shuffled, sorted);
+	assert.equal(shuffled.restored, 3);
 });
 
 /**
- * The LIVE query shape, exercised through `reconcileScheduleGaps` rather than the injected
- * `searchTargets` fake above.
+ * The LIVE query, exercised through `reconcileScheduleGaps` rather than the injected
+ * `streamTargets` fake above.
  *
  * v0.10.0 shipped broken because every test stubbed this layer out: the traversal logic was
- * right and the query was rejected by Harper on the very first page, so the sweep restored
- * nothing and reported an error. Asserting the shape is the cheapest way to hold the contract
- * without a live database.
+ * right and the query was rejected by Harper on its very first page, so the sweep restored
+ * nothing and reported an error. Asserting the query shape is the cheapest way to hold that
+ * contract without a live database.
  */
-test('the live query carries a primary-key condition on every page, including the first', async () => {
+test('the live query asks for no sort — Harper rejects sorting by the primary key', async () => {
 	const searches = [];
 	const rows = [
 		{ cacheKey: 'https://x/a|desktop', renderInterval: 60000, sitemapUrl: null },
 		{ cacheKey: 'https://x/b|desktop', renderInterval: 60000, sitemapUrl: null },
-		{ cacheKey: 'https://x/c|desktop', renderInterval: 60000, sitemapUrl: null },
 	];
 
 	globalThis.databases = {
@@ -316,11 +306,8 @@ test('the live query carries a primary-key condition on every page, including th
 			RenderTarget: {
 				search(target) {
 					searches.push(target);
-					const cursor = target.conditions?.[0]?.value;
-					const after = typeof cursor === 'string' ? rows.filter((r) => r.cacheKey > cursor) : rows;
-					const page = after.slice(0, target.limit);
 					return (async function* () {
-						yield* page;
+						yield* rows;
 					})();
 				},
 			},
@@ -330,23 +317,21 @@ test('the live query carries a primary-key condition on every page, including th
 		},
 	};
 
-	const stats = await reconcile.reconcileScheduleGaps({ batchSize: 2, maxRestores: 10 });
+	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
 
-	assert.equal(stats.examined, 3);
-	assert.ok(searches.length >= 2, 'expected the walk to page');
+	assert.equal(stats.examined, 2);
+	assert.equal(stats.restored, 2);
 
-	for (const search of searches) {
-		// Harper rejects a `sort` on the primary key (not flagged `indexed`) when no condition
-		// accompanies it, and injects its own condition only AFTER that check — so the first page
-		// must carry one explicitly rather than relying on the injection.
-		assert.ok(Array.isArray(search.conditions) && search.conditions.length > 0, 'search must carry conditions');
-		assert.equal(search.conditions[0].attribute, 'cacheKey');
-		assert.equal(search.conditions[0].comparator, 'greater_than');
-		// Sort-aligned (same attribute), so the walk follows the index instead of post-sorting.
-		assert.equal(search.sort.attribute, search.conditions[0].attribute);
-	}
+	// Exactly one scan: no paging, so no cursor and no resumption.
+	assert.equal(searches.length, 1);
+	const [search] = searches;
 
-	// First page uses Harper's own scan sentinel; later pages resume from the last key seen.
-	assert.equal(searches[0].conditions[0].value, true);
-	assert.equal(typeof searches[1].conditions[0].value, 'string');
+	// `sort` on the primary key is rejected outright ("cacheKey is not indexed and not combined
+	// with any other conditions") because it is not flagged `indexed` in attribute metadata.
+	assert.equal(search.sort, undefined, 'must not ask Harper to sort by the primary key');
+	// And no conditions: with none, Harper injects its own full-scan condition, which is what
+	// this wants. Supplying a range condition is only needed to resume a cursor — there is none.
+	assert.equal(search.conditions, undefined, 'an unconstrained scan needs no conditions');
+	assert.equal(search.limit, undefined, 'a streamed scan needs no limit');
+	assert.deepEqual(search.select, ['cacheKey', 'renderInterval', 'sitemapUrl']);
 });
