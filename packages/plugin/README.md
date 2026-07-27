@@ -10,6 +10,8 @@ crawlers. It provides:
   back to.
 - Sitemap ingestion (`Sitemap`) that discovers URLs and schedules them for rendering.
 - A prerendered-page cache (`PrerenderedPage`) and indexability signals (`NonIndexable`).
+- A management API + UI at `/prerender_admin` (see [Management UI](#management-ui-prerender_admin)),
+  authenticated with Harper users and restricted to `super_user`.
 
 Everything that used to be hardcoded — domains, security token, device types, render/refresh
 schedules, user-agent strings, TTLs — is supplied per deployment through the host application's
@@ -91,6 +93,10 @@ rest: true # required for the @export-ed table REST endpoints
     jobLeaseTime: 600000 # 10m — how long a claimed job is leased
     statusSyncInterval: 60000 # 1m  — how often queue status is recomputed/broadcast
 
+  management: # the admin API + UI at /prerender_admin
+    enabled: true # false makes every management route 404
+    scanCap: 20000 # ceiling on rows an overview scan walks (see "Management UI")
+
   userAgents: # per-device User-Agent strings sent to the origin
     desktop: 'Mozilla/5.0 ... HarperPrerender/1.0'
     mobile: 'Mozilla/5.0 ... HarperPrerender/1.0'
@@ -166,14 +172,14 @@ Database/table names are fixed. Tables are split across databases by write-trans
 Harper serializes writes per database and commits each database independently, so the hot, high-write
 queue table is isolated and bursty/heavy writes don't serialize against it:
 
-| Database          | Tables                        | Notes                                          |
-| ----------------- | ----------------------------- | ---------------------------------------------- |
-| `render_schedule` | `RenderSchedule`              | the hot render queue — isolated                |
-| `render_service`  | `RenderTarget`, `QueueStatus` | render-target registry + per-host queue status |
-| `page_cache`      | `PrerenderedPage`             | rendered-HTML cache (heavy blob writes)        |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`   | sitemap data + refresh marker                  |
-| `signals`         | `NonIndexable`                | indexability signals                           |
-| `coordination`    | `SharedBuffer`                | node-local cross-worker SAB (never replicated) |
+| Database          | Tables                                        | Notes                                            |
+| ----------------- | --------------------------------------------- | ------------------------------------------------ |
+| `render_schedule` | `RenderSchedule`                              | the hot render queue — isolated                  |
+| `render_service`  | `RenderTarget`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status |
+| `page_cache`      | `PrerenderedPage`                             | rendered-HTML cache (heavy blob writes)          |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`                   | sitemap data + refresh marker                    |
+| `signals`         | `NonIndexable`                                | indexability signals                             |
+| `coordination`    | `SharedBuffer`                                | node-local cross-worker SAB (never replicated)   |
 
 Because `RenderTarget` and `RenderSchedule` now live in separate databases, a target and its schedule
 are written as two independent commits (target first). The brief window where a target exists without a
@@ -186,14 +192,98 @@ See [`src/schemas/schema.graphql`](src/schemas/schema.graphql).
 | Method & path                                | Purpose                                                             |
 | -------------------------------------------- | ------------------------------------------------------------------- |
 | `GET /p/<absolute-url>`                      | Serve prerendered/cached HTML for a bot (cache hit or origin fetch) |
-| `POST /render_queue/pause`                   | Pause the queue                                                     |
-| `POST /render_queue/resume`                  | Resume the queue                                                    |
+| `POST /render_queue/pause`                   | Pause **this node's** queue                                         |
+| `POST /render_queue/resume`                  | Clear this node's pause override                                    |
 | `POST /render_queue/claim`                   | Claim due render jobs (`{ "limit": N }`)                            |
 | `POST /render_queue/job_result`              | Submit a render result (binary; `x-metadata-size` header)           |
 | `GET/PUT/DELETE /RenderTarget/...`           | Manage render targets                                               |
 | `POST /RenderTarget` `{action:"revalidate"}` | Force re-render of matching targets                                 |
 | `GET/POST/DELETE /sitemaps/<url>`            | Ingest / list / remove sitemaps                                     |
-| `GET /queue_status`                          | Read per-host queue status                                          |
+| `GET /queue_status`                          | Read per-node queue status (**observed**)                           |
+| `GET /queue_control`                         | Read the desired pause state (**intent**)                           |
+| `GET /prerender_admin`                       | Management UI + API — see below                                     |
+
+## Management UI (`/prerender_admin`)
+
+A single self-contained page (no build step, no external requests) plus the JSON API behind
+it. Open `https://<host>:<port>/prerender_admin` and sign in with a Harper username and
+password.
+
+**Authentication is Harper's own.** `POST /prerender_admin/login` calls Harper's
+`context.login()`, which authenticates against Harper users and sets the `hdb-session`
+cookie; every data and action route then requires `role.permission.super_user`. There is no
+separate password to configure. Two consequences worth knowing:
+
+- The instance needs `authentication.enableSessions: true` (Harper's default). The UI says so
+  explicitly if sessions are off rather than failing obscurely.
+- With `authentication.authorizeLocal: true` (also the default) requests from `127.0.0.1` are
+  auto-authorized as super-user — so on a local instance the UI opens without a login. Set it
+  to `false` if that matters to you.
+
+The super-user check is written out on every route rather than relying on Harper's
+`allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
+this plugin's resources all set `loadAsInstance = false`.
+
+| Method & path                   | Purpose                                 | Gate         |
+| ------------------------------- | --------------------------------------- | ------------ |
+| `GET /prerender_admin`          | the UI page (contains no data)          | public       |
+| `GET /prerender_admin/session`  | who am I                                | public       |
+| `POST /prerender_admin/login`   | `{ username, password }`                | public       |
+| `POST /prerender_admin/logout`  | end the session                         | session      |
+| `GET /prerender_admin/overview` | nodes, counts, backlog shape            | `super_user` |
+| `GET /prerender_admin/config`   | effective config + warnings             | `super_user` |
+| `POST /prerender_admin/explain` | `{ url, deviceType }` → cache-key trace | `super_user` |
+| `POST /prerender_admin/queue`   | `{ scope, paused }` → pause control     | `super_user` |
+
+### What it shows
+
+- **Overview** — per-node queue status with staleness, table counts, the due-now backlog, and
+  a next-24h histogram of `nextRenderTime`. That histogram is the quickest way to tell a
+  healthy jittered spread from a render herd: a flat distribution means the initial-render
+  jitter is working, a single tall bar means everything comes due at once.
+- **URL explainer** — paste a URL and see the ingress route that matched, the query allowlist
+  it selected, the canonical URL, the resulting cache key, and the live
+  `RenderTarget`/`RenderSchedule`/`PrerenderedPage`/`NonIndexable` rows under it. It also
+  reports the key the URL would get under the global `url.queryParams`, and flags a
+  difference — that divergence is the usual fingerprint of a permanent cache miss caused by a
+  missing or misordered route. It surfaces a `NonIndexable` suppression too, which otherwise
+  removes a URL from rotation silently.
+- **Config** — the effective merge of defaults and host overrides, with secrets shown only as
+  whether they are set, alongside the risky-config warnings that previously existed only as
+  startup log lines (empty security token, staging passthrough enabled, `renderNow` without a
+  token).
+
+### Counting is capped, on purpose
+
+Table totals come from Harper's `getRecordCount()`, which is time-bounded and switches to
+sampling on a large table — it is reported with its `estimatedRange` rather than as an exact
+figure. The backlog/histogram scan walks at most `management.scanCap` rows (default 20 000)
+and marks the result `truncated` when it hits that ceiling. At 1M+ targets an exact range
+count is not a page-load query, so the UI labels an estimate as an estimate instead of
+presenting a short count as the total.
+
+### Queue control: intent vs. observed
+
+`claim` reads a **node-local**, non-replicated flag (a `SharedBuffer` SAB), which is why
+pausing used to mean calling `POST /render_queue/pause` on every node in turn. The
+`QueueControl` table now holds the _desired_ state and **is** replicated:
+
+| Scope        | Meaning                                                 |
+| ------------ | ------------------------------------------------------- |
+| `all`        | cluster-wide default                                    |
+| `<hostname>` | per-node override — wins over `all`, in both directions |
+
+`paused: true` pauses, `paused: false` explicitly keeps a node running _through_ a
+cluster-wide pause, and deleting a node's row (`paused: null`) returns it to inheriting `all`.
+Each node resolves the intent on its own `queue.statusSyncInterval` tick, so **a change
+reaches a remote node within one interval (default 1m), not instantly** — the UI states this.
+`QueueStatus` remains what each node last _observed_; the UI shows both, and marks a node
+stale when it stops reporting.
+
+`POST /render_queue/pause` stays deliberately node-scoped: that endpoint sets
+`loadAsInstance = false` and therefore enforces no authentication of its own, so it must not
+be able to stop the whole fleet. Cluster-scoped control is only reachable through the
+super-user-gated admin route.
 
 ## How it fits together
 

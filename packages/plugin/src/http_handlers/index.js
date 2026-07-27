@@ -10,7 +10,20 @@ import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
 // header-mode request that matches no route — falls through to Harper's REST routing
 // (which serves the plugin's own resource endpoints). The resolved target is stashed
 // on the request so handleBotRequest doesn't repeat the work.
+// The management UI's REST mount. Bot routing must never swallow it: in forwarded mode a
+// device-prefixed path is treated as bot traffic even when it matches no route, and a broad
+// `prefix` route (e.g. '/') matches everything — either would shadow the admin endpoint and
+// leave it unreachable in exactly the deployments where it is most needed.
+const ADMIN_PATH = '/prerender_admin';
+
+const isAdminRequest = (request) => {
+	const path = request.url.split('?')[0];
+	return path === ADMIN_PATH || path.startsWith(`${ADMIN_PATH}/`);
+};
+
 const isBotRequest = (request) => {
+	if (isAdminRequest(request)) return false;
+
 	if (isForwardedMode()) {
 		const target = resolveForwardedRequest(request);
 		if (!target) return false;

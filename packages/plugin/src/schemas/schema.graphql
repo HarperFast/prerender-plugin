@@ -6,7 +6,8 @@
 # cross-table atomic writes live apart to maximize write concurrency.
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
-#   render_service   RenderTarget, QueueStatus       — target registry + queue status
+#   render_service   RenderTarget, QueueStatus,      — target registry + queue status
+#                    QueueControl                     + desired (replicated) pause intent
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
 #   signals          NonIndexable                    — indexability signals
@@ -56,6 +57,23 @@ type QueueStatus @table(database: "render_service") @sealed @export(name: "queue
 	# Queue status (empty, queued, or paused)
 	status: String
 	updatedTime: Date @updatedTime
+}
+
+# Desired pause state — the *intent*, as opposed to QueueStatus's *observed* status.
+#
+# QueueStatus can't carry this: each node rewrites its own row every status sync, so an
+# intent written there by another node would be clobbered. This table is replicated
+# (the default), so a write on any node reaches every node, and each node's periodic
+# refreshQueueStatus resolves it onto its local (non-replicated) queue-state flag.
+#
+#   scope 'all'      — cluster-wide default
+#   scope <hostname> — per-node override; `paused: false` explicitly runs a node even
+#                      while 'all' is paused. Delete the row to inherit 'all' again.
+type QueueControl @table(database: "render_service") @sealed @export(name: "queue_control") {
+	scope: String @primaryKey
+	paused: Boolean
+	updatedTime: Date @updatedTime
+	updatedBy: String
 }
 
 type NonIndexable @table(database: "signals", expiration: 604800) @export {
