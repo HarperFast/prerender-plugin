@@ -30,6 +30,12 @@ import { nodes } from './residency.js';
 // custom CA, no disabled verification). Only a localhost origin speaks plain http.
 const isLocalHost = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 
+// An IPv6 literal must be bracketed before a port can be appended, or the result isn't a
+// parseable URL (`https://::1:9926`). Worth handling rather than assuming DNS names: this
+// module's own `isLocalHost` already contemplates `::1`, so the unbracketed form was reachable
+// by the code as written.
+const formatHost = (hostname) => (hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname);
+
 /**
  * Base origin for a peer node. Mirrors the `callbackOrigin` logic in RenderQueue: prefer the
  * secure port, fall back to the plain port for a localhost origin.
@@ -38,15 +44,20 @@ export const peerOrigin = (hostname) => {
 	const httpConfig = server.config?.http ?? {};
 	const secure = !isLocalHost(hostname);
 	const port = secure ? httpConfig.securePort || httpConfig.port : httpConfig.port || httpConfig.securePort;
-	return `${secure ? 'https' : 'http'}://${hostname}:${port}`;
+	return `${secure ? 'https' : 'http'}://${formatHost(hostname)}:${port}`;
 };
 
 /**
  * Is `hostname` a node this cluster knows about? Guards the fetch destination: the owner comes
  * from our own residency function, but validating it against the node list keeps a bug or a
  * config change from turning this into an arbitrary-host request.
+ *
+ * Compared case-insensitively, since hostnames are: a casing difference between Harper's
+ * configured node name and the resolved one would otherwise fail a legitimate peer. This does
+ * not weaken the guard — membership in the known set is still required.
  */
-export const isKnownNode = (hostname) => typeof hostname === 'string' && nodes.includes(hostname);
+export const isKnownNode = (hostname) =>
+	typeof hostname === 'string' && nodes.some((node) => node.toLowerCase() === hostname.toLowerCase());
 
 /**
  * The subset of the caller's headers to forward. Only credentials, nothing else — the peer
@@ -100,7 +111,15 @@ export const fetchScheduleFromPeer = async ({ hostname, cacheKey, headers }) => 
 		return { ok: true, row: body?.renderSchedule ?? null };
 	} catch (e) {
 		// AbortError included — a peer that doesn't answer costs one field, not the request.
-		return { ok: false, reason: e.name === 'AbortError' ? 'peer timed out' : `peer fetch failed: ${e.message}` };
+		//
+		// Properties are read with `?.` rather than gated on `instanceof Error`: anything can be
+		// thrown, and `null`/`undefined` would make a direct property access throw. `instanceof`
+		// would be the wrong guard here — an abort rejects with a DOMException, whose prototype
+		// chain differs across runtimes, so testing for Error risks misreporting a timeout as a
+		// generic failure. Reading the name directly classifies it correctly either way.
+		const name = e?.name;
+		const message = e?.message ?? String(e);
+		return { ok: false, reason: name === 'AbortError' ? 'peer timed out' : `peer fetch failed: ${message}` };
 	} finally {
 		clearTimeout(timer);
 	}

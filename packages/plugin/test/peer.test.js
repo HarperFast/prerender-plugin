@@ -85,3 +85,69 @@ test('no forwardable credentials short-circuits instead of calling the peer unau
 	assert.equal(result.ok, false);
 	assert.match(result.reason, /no forwardable credentials/);
 });
+
+/**
+ * Robustness cases raised in review on PR #36.
+ */
+
+test('an IPv6 peer literal is bracketed so the URL parses', () => {
+	// Unbracketed, `https://2001:db8::1:9926` is not a parseable URL and fetch would reject.
+	assert.equal(peer.peerOrigin('2001:db8::1'), 'https://[2001:db8::1]:9926');
+	// Already-bracketed input is left alone rather than double-wrapped.
+	assert.equal(peer.peerOrigin('[2001:db8::1]'), 'https://[2001:db8::1]:9926');
+	// And the loopback literal this module already special-cases stays valid.
+	assert.equal(peer.peerOrigin('::1'), 'http://[::1]:9925');
+	// Every form must survive URL parsing.
+	for (const host of ['2001:db8::1', '[2001:db8::1]', '::1', 'node-b.example.com']) {
+		assert.doesNotThrow(() => new URL(peer.peerOrigin(host)), `unparseable origin for ${host}`);
+	}
+});
+
+test('known-node matching is case-insensitive, as hostnames are', () => {
+	assert.equal(peer.isKnownNode('NODE-A.example.com'), true);
+	assert.equal(peer.isKnownNode('node-a.EXAMPLE.COM'), true);
+	// ...but membership in the known set is still required.
+	assert.equal(peer.isKnownNode('node-a.example.com.evil.test'), false);
+});
+
+test('a non-Error rejection is reported, not re-thrown', async () => {
+	const realFetch = globalThis.fetch;
+	try {
+		// Anything can be thrown; `null` in particular would make a direct `.name` access throw
+		// and turn a degraded field into a 500.
+		for (const thrown of [null, undefined, 'a string', 42]) {
+			globalThis.fetch = () => Promise.reject(thrown);
+			const result = await peer.fetchScheduleFromPeer({
+				hostname: 'node-a.example.com',
+				cacheKey: 'https://x/|desktop',
+				headers: new Headers({ authorization: 'Basic abc' }),
+			});
+			assert.equal(result.ok, false);
+			assert.match(result.reason, /peer fetch failed/);
+		}
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
+
+test('an aborted fetch is classified as a timeout, not a generic failure', async () => {
+	const realFetch = globalThis.fetch;
+	try {
+		// A DOMException-shaped abort: the distinction matters because "peer timed out" tells the
+		// operator something different from "peer fetch failed".
+		globalThis.fetch = () => {
+			const error = new Error('This operation was aborted');
+			error.name = 'AbortError';
+			return Promise.reject(error);
+		};
+		const result = await peer.fetchScheduleFromPeer({
+			hostname: 'node-a.example.com',
+			cacheKey: 'https://x/|desktop',
+			headers: new Headers({ authorization: 'Basic abc' }),
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.reason, 'peer timed out');
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
