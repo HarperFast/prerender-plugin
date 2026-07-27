@@ -594,13 +594,24 @@ const PAGE = `<title>Prerender Admin</title>
 			]));
 		}
 		if (data.residency && !data.residency.scheduleReadIsAuthoritative) {
-			notes.push(el('div', { cls: 'note info' }, [
-				'RenderSchedule rows are pinned to the node owning the URL, and this node (' +
-				data.residency.queriedNode + ') is not the owner — ' + data.residency.scheduleOwnedBy +
-				' is. The schedule row below is read locally, so an absent one means "not scheduled ' +
-				'on this node", not "not scheduled". Ask ' + data.residency.scheduleOwnedBy +
-				' for the authoritative answer.'
-			]));
+			if (data.residency.scheduleAuthoritative) {
+				// The owner answered — say so, since the row came from a different node than the
+				// rest of the response.
+				notes.push(el('div', { cls: 'note ok' }, [
+					'The schedule row is owned by ' + data.residency.scheduleOwnedBy +
+					' and was fetched from it, so it is authoritative. Everything else was read on ' +
+					data.residency.queriedNode + '.'
+				]));
+			} else {
+				notes.push(el('div', { cls: 'note' }, [
+					'RenderSchedule rows are pinned to the node owning the URL, and this node (' +
+					data.residency.queriedNode + ') is not the owner — ' + data.residency.scheduleOwnedBy +
+					' is. Could not reach the owner' +
+					(data.residency.peerError ? ' (' + data.residency.peerError + ')' : '') +
+					', so the row below is this node’s local copy: an absent one means "not scheduled ' +
+					'on this node", not "not scheduled".'
+				]));
+			}
 		}
 
 		var page = data.rows.prerenderedPage;
@@ -662,7 +673,7 @@ const PAGE = `<title>Prerender Admin</title>
 				schedule ? kv([
 					['Next render', (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs)],
 					['From sitemap', String(!!schedule.fromSitemap)]
-				]) : emptyState(data, 'renderSchedule', data.residency && !data.residency.scheduleReadIsAuthoritative
+				]) : emptyState(data, 'renderSchedule', data.residency && !data.residency.scheduleAuthoritative
 					? 'No schedule row on this node — inconclusive, since ' + data.residency.scheduleOwnedBy + ' owns it.'
 					: 'Not scheduled — nothing will render this URL.'),
 

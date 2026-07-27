@@ -169,6 +169,14 @@ const defaultConfig = () => ({
 	// written out rather than inherited.
 	management: {
 		enabled: true,
+		// The URL explainer reads node-locally (a cross-node point read on the residency-pinned
+		// schedule table awaits Harper's replication `getRecord`, which has no timeout). When the
+		// row is owned by another node, ask that node over HTTPS instead — a bounded request,
+		// forwarding only the caller's own credentials, which the peer re-authorizes. Set false
+		// to keep every read strictly node-local and accept an inconclusive schedule row.
+		proxyToOwner: true,
+		peerTimeoutMs: 2500,
+
 		// Ceiling on rows touched by an overview scan (due-count, next-24h histogram).
 		// Counting is a capped index walk — at 1M+ targets an uncapped count is not a
 		// page-load query — so results past this are reported as truncated rather than

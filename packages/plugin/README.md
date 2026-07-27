@@ -96,6 +96,8 @@ rest: true # required for the @export-ed table REST endpoints
   management: # the admin API + UI at /prerender_admin
     enabled: true # false makes every management route 404
     scanCap: 20000 # ceiling on rows an overview scan walks (see "Management UI")
+    proxyToOwner: true # ask the owning node for a residency-pinned schedule row (see below)
+    peerTimeoutMs: 2500 # deadline on that peer call
 
   userAgents: # per-device User-Agent strings sent to the origin
     desktop: 'Mozilla/5.0 ... HarperPrerender/1.0'
@@ -224,16 +226,17 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                   | Purpose                                 | Gate         |
-| ------------------------------- | --------------------------------------- | ------------ |
-| `GET /prerender_admin`          | the UI page (contains no data)          | public       |
-| `GET /prerender_admin/session`  | who am I                                | public       |
-| `POST /prerender_admin/login`   | `{ username, password }`                | public       |
-| `POST /prerender_admin/logout`  | end the session                         | session      |
-| `GET /prerender_admin/overview` | nodes, counts, backlog shape            | `super_user` |
-| `GET /prerender_admin/config`   | effective config + warnings             | `super_user` |
-| `POST /prerender_admin/explain` | `{ url, deviceType }` → cache-key trace | `super_user` |
-| `POST /prerender_admin/queue`   | `{ scope, paused }` → pause control     | `super_user` |
+| Method & path                    | Purpose                                         | Gate         |
+| -------------------------------- | ----------------------------------------------- | ------------ |
+| `GET /prerender_admin`           | the UI page (contains no data)                  | public       |
+| `GET /prerender_admin/session`   | who am I                                        | public       |
+| `POST /prerender_admin/login`    | `{ username, password }`                        | public       |
+| `POST /prerender_admin/logout`   | end the session                                 | session      |
+| `GET /prerender_admin/overview`  | nodes, counts, backlog shape                    | `super_user` |
+| `GET /prerender_admin/config`    | effective config + warnings                     | `super_user` |
+| `POST /prerender_admin/explain`  | `{ url, deviceType }` → cache-key trace         | `super_user` |
+| `POST /prerender_admin/schedule` | `{ cacheKey }` → this node's local schedule row | `super_user` |
+| `POST /prerender_admin/queue`    | `{ scope, paused }` → pause control             | `super_user` |
 
 ### What it shows
 
@@ -252,6 +255,37 @@ this plugin's resources all set `loadAsInstance = false`.
   whether they are set, alongside the risky-config warnings that previously existed only as
   startup log lines (empty security token, staging passthrough enabled, `renderNow` without a
   token).
+
+### Residency: why the schedule row is fetched from another node
+
+`RenderSchedule` is residency-pinned (`setResidencyById`), so each row lives on the node that
+owns its URL. **A point `get` for a row owned by another node takes Harper's cross-node
+`sourceLoad` path, which awaits a replication `getRecord` with no timeout — an unanswered peer
+hangs the request indefinitely.** Every schedule read in this plugin therefore passes
+`{ replicateFrom: false }` and stays node-local (`claim`, `refreshQueueStatus`, and the admin
+overview scan always did; the explainer's point read was fixed in v0.8.3).
+
+Node-local reads alone would make the explainer useless for most URLs, though: rendezvous
+hashing spreads ownership evenly, so on an N-node cluster **(N−1)/N of URLs are owned
+elsewhere** — about 75% on a 4-node cluster. So when this node isn't the owner and has no local
+row, the explainer asks the owner over HTTPS via `POST /prerender_admin/schedule` — a bounded
+request, in place of an unbounded one.
+
+- The destination is always a hostname from the cluster's own node list, never a value derived
+  from the request.
+- Only the caller's `authorization` / `cookie` headers are forwarded, and the peer re-runs its
+  own `super_user` check — the proxy grants no authority the caller didn't have. (Both work
+  cluster-wide: Harper users are replicated, and the session cookie is issued for the shared
+  parent domain per `authentication.cookie.domains`.)
+- Bounded by `management.peerTimeoutMs`; a slow peer costs that one field, not the page.
+- `/prerender_admin/schedule` is a leaf — it never proxies onward, so no residency
+  disagreement between nodes can cause a request loop.
+
+The response reports `residency.scheduleOwnedBy`, `scheduleSource`, and
+`scheduleAuthoritative`. Only when `scheduleAuthoritative` is false does an absent row mean
+"not scheduled **on this node**" rather than "not scheduled" — and the UI says so, including
+why the owner couldn't be reached. Set `proxyToOwner: false` to keep all reads strictly
+node-local and accept the inconclusive answer.
 
 ### Counting is capped, on purpose
 
