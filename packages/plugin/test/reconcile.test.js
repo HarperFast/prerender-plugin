@@ -29,6 +29,7 @@ beforeEach(async () => {
 afterEach(() => {
 	delete globalThis.server;
 	delete globalThis.logger;
+	delete globalThis.databases;
 });
 
 /**
@@ -291,4 +292,61 @@ test('the cursor advances past skipped rows so a capped run makes progress', asy
 	});
 
 	assert.deepEqual(pages, [null, 'https://x/b|desktop']);
+});
+
+/**
+ * The LIVE query shape, exercised through `reconcileScheduleGaps` rather than the injected
+ * `searchTargets` fake above.
+ *
+ * v0.10.0 shipped broken because every test stubbed this layer out: the traversal logic was
+ * right and the query was rejected by Harper on the very first page, so the sweep restored
+ * nothing and reported an error. Asserting the shape is the cheapest way to hold the contract
+ * without a live database.
+ */
+test('the live query carries a primary-key condition on every page, including the first', async () => {
+	const searches = [];
+	const rows = [
+		{ cacheKey: 'https://x/a|desktop', renderInterval: 60000, sitemapUrl: null },
+		{ cacheKey: 'https://x/b|desktop', renderInterval: 60000, sitemapUrl: null },
+		{ cacheKey: 'https://x/c|desktop', renderInterval: 60000, sitemapUrl: null },
+	];
+
+	globalThis.databases = {
+		render_service: {
+			RenderTarget: {
+				search(target) {
+					searches.push(target);
+					const cursor = target.conditions?.[0]?.value;
+					const after = typeof cursor === 'string' ? rows.filter((r) => r.cacheKey > cursor) : rows;
+					const page = after.slice(0, target.limit);
+					return (async function* () {
+						yield* page;
+					})();
+				},
+			},
+		},
+		render_schedule: {
+			RenderSchedule: { get: async () => null, put: async () => {} },
+		},
+	};
+
+	const stats = await reconcile.reconcileScheduleGaps({ batchSize: 2, maxRestores: 10 });
+
+	assert.equal(stats.examined, 3);
+	assert.ok(searches.length >= 2, 'expected the walk to page');
+
+	for (const search of searches) {
+		// Harper rejects a `sort` on the primary key (not flagged `indexed`) when no condition
+		// accompanies it, and injects its own condition only AFTER that check — so the first page
+		// must carry one explicitly rather than relying on the injection.
+		assert.ok(Array.isArray(search.conditions) && search.conditions.length > 0, 'search must carry conditions');
+		assert.equal(search.conditions[0].attribute, 'cacheKey');
+		assert.equal(search.conditions[0].comparator, 'greater_than');
+		// Sort-aligned (same attribute), so the walk follows the index instead of post-sorting.
+		assert.equal(search.sort.attribute, search.conditions[0].attribute);
+	}
+
+	// First page uses Harper's own scan sentinel; later pages resume from the last key seen.
+	assert.equal(searches[0].conditions[0].value, true);
+	assert.equal(typeof searches[1].conditions[0].value, 'string');
 });

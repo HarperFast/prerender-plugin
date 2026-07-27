@@ -129,13 +129,22 @@ export const reconcileScheduleGaps = async ({
 		searchTargets: ({ cursor, limit }) =>
 			Array.fromAsync(
 				RenderTarget.search({
-					// Paging by primary key is an ordinary index walk: Harper injects this exact
-					// condition shape (`greater_than` on the primary key) for any unconstrained
-					// scan, so a cursor is just that scan resumed. The first page passes no
-					// condition and lets Harper inject it.
-					...(cursor === null
-						? {}
-						: { conditions: [{ attribute: 'cacheKey', comparator: 'greater_than', value: cursor }] }),
+					// EVERY page must carry this condition, including the first.
+					//
+					// The primary key is not flagged `indexed` in Harper's attribute metadata, and a
+					// `sort` on a non-indexed attribute with ZERO conditions is rejected outright:
+					// "cacheKey is not indexed and not combined with any other conditions"
+					// (`Table.js`, the sort-alignment branch). Harper does inject exactly this
+					// condition for an unconstrained scan — but it does so AFTER that check, so
+					// letting it inject the first page threw before the scan ever started.
+					//
+					// Passing it also makes it the sort-ALIGNED condition, so the walk follows the
+					// primary index in order rather than buffering a page for a post-sort.
+					//
+					// `true` is the first-page sentinel because that is precisely what Harper's own
+					// full-scan injection uses (`comparator: 'greater_than', value: true`): in the
+					// key encoding booleans sort ahead of strings, so it precedes every cacheKey.
+					conditions: [{ attribute: 'cacheKey', comparator: 'greater_than', value: cursor ?? true }],
 					sort: { attribute: 'cacheKey' },
 					select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
 					limit,
