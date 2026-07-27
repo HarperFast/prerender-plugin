@@ -121,3 +121,24 @@ test('no host-resolver flag is added when hostResolverRules is omitted', () => {
 	assert.deepEqual(settings.hostResolverRules, {});
 	assert.ok(!settings.chromeArgs.some((a: string) => a.startsWith('--host-resolver-rules')));
 });
+
+test('metrics defaults to disabled with a 60s export interval', () => {
+	applySettings({ harper: HARPER });
+	assert.deepEqual(settings.metrics, {
+		enabled: false,
+		otlpEndpoint: '',
+		exportIntervalMs: 60000,
+		headers: {},
+	});
+});
+
+test('metrics options override defaults (partial merge)', () => {
+	applySettings({
+		harper: HARPER,
+		metrics: { enabled: true, otlpEndpoint: 'http://alloy.monitoring:4318/v1/metrics' },
+	});
+	assert.equal(settings.metrics.enabled, true);
+	assert.equal(settings.metrics.otlpEndpoint, 'http://alloy.monitoring:4318/v1/metrics');
+	assert.equal(settings.metrics.exportIntervalMs, 60000); // untouched default preserved
+	assert.deepEqual(settings.metrics.headers, {});
+});

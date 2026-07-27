@@ -87,6 +87,24 @@ export type BrowserOptions = {
 	browserLaunchOptions?: LaunchOptions;
 	/** On-disk shared sub-resource (script/stylesheet) cache. */
 	resourceCache?: ResourceCacheOptions;
+	/**
+	 * Opt-in OpenTelemetry metrics export over OTLP/HTTP. Disabled unless `enabled` is true
+	 * AND `otlpEndpoint` is set — when off, no OpenTelemetry code is loaded (it is imported
+	 * lazily) and there is zero runtime overhead. Export is periodic and fire-and-forget: a
+	 * slow or unreachable collector can never block, delay, or fail a render. See `src/metrics`.
+	 */
+	metrics?: MetricsOptions;
+};
+
+export type MetricsOptions = {
+	/** Turn metrics export on. Still a no-op unless `otlpEndpoint` is also set. Default false. */
+	enabled?: boolean;
+	/** OTLP/HTTP metrics endpoint, e.g. `http://alloy.monitoring:4318/v1/metrics`. */
+	otlpEndpoint?: string;
+	/** Export/collect interval in ms — defaults to 60000 to match the stats-log window. */
+	exportIntervalMs?: number;
+	/** Extra headers on the OTLP POST (e.g. auth), if the collector needs them. */
+	headers?: Record<string, string>;
 };
 
 export type ResolvedBackoff = {
@@ -123,6 +141,14 @@ export type Settings = {
 	browserLaunchOptions?: LaunchOptions;
 	resourceCache: ResolvedResourceCache;
 	backoff: ResolvedBackoff;
+	metrics: ResolvedMetrics;
+};
+
+export type ResolvedMetrics = {
+	enabled: boolean;
+	otlpEndpoint: string;
+	exportIntervalMs: number;
+	headers: Record<string, string>;
 };
 
 const DEFAULT_CHROME_ARGS = [
@@ -199,6 +225,12 @@ const defaults = (): Settings => ({
 		pausedMs: 30000,
 		maxIdleMs: 60000,
 		resultRetries: 3,
+	},
+	metrics: {
+		enabled: false,
+		otlpEndpoint: '',
+		exportIntervalMs: 60000,
+		headers: {},
 	},
 });
 
@@ -281,6 +313,12 @@ export const resolveSettings = (
 		pausedMs: options.backoff?.pausedMs ?? fresh.backoff.pausedMs,
 		maxIdleMs: options.backoff?.maxIdleMs ?? fresh.backoff.maxIdleMs,
 		resultRetries: options.backoff?.resultRetries ?? fresh.backoff.resultRetries,
+	};
+	fresh.metrics = {
+		enabled: options.metrics?.enabled ?? fresh.metrics.enabled,
+		otlpEndpoint: options.metrics?.otlpEndpoint ?? fresh.metrics.otlpEndpoint,
+		exportIntervalMs: options.metrics?.exportIntervalMs ?? fresh.metrics.exportIntervalMs,
+		headers: options.metrics?.headers ?? fresh.metrics.headers,
 	};
 
 	Object.assign(settings, fresh);

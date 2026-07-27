@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/prerender-browser",
-	"version": "1.12.0",
+	"version": "1.13.0",
 	"type": "module",
 	"description": "Headless-browser render library for Harper Prerender: claims render jobs from the @harperfast/prerender queue, renders pages in headless Chrome (Puppeteer), and posts the HTML back. Embedded by a render service and configured entirely via startWorker() options.",
 	"keywords": [
@@ -44,6 +44,10 @@
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
+		"@opentelemetry/api": "^1.9.1",
+		"@opentelemetry/exporter-metrics-otlp-proto": "^0.221.0",
+		"@opentelemetry/resources": "^2.10.0",
+		"@opentelemetry/sdk-metrics": "^2.10.0",
 		"mqtt": "^5.10.4",
 		"pino": "^9.9.0",
 		"puppeteer": "^24.7.2",
