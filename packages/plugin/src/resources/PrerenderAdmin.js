@@ -497,6 +497,11 @@ export class PrerenderAdmin extends Resource {
 				nonIndexable: suppressed ? { url: suppressed.url ?? explanation.resolved.canonicalUrl } : null,
 			},
 			verdict: {
+				// Every field here is derived from rows that may have failed to read, so it is
+				// only trustworthy when `reliable` is true. A timed-out read yields a null row,
+				// which would otherwise be indistinguishable from a genuinely absent one and turn
+				// a degraded response into a confident false negative.
+				reliable: timedOutReads.length === 0,
 				// What a bot request for this URL would get right now.
 				wouldServe: fresh ? 'cache' : 'origin-or-render',
 				// Only meaningful when the schedule read was authoritative — see `residency`.
