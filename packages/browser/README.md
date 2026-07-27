@@ -165,12 +165,60 @@ console.log(r.outcome, r.statusCode, r.timings, r.probes);
 
 `renderOnce`/`renderMatrix` mutate the process-global settings; run them one at a time (single-flight).
 
+## Prerenderability audit (`renderAudit`)
+
+`renderAudit()` is the analysis counterpart to `renderOnce`. For one `(url, device)` cell it renders the
+page in **three states** and reports the **two diffs** that expose what a bot actually receives:
+
+- **State A — full render (ground truth):** the deployed config with an exhaustive scroll/settle + a
+  hydration sweep, so every lazy/below-the-fold module loads. This is "everything the page can show".
+- **State B — served snapshot:** the deployed config as-is → the exact bytes the cache serves to bots.
+- **State C — re-hydrated snapshot:** B's bytes reloaded at the real URL (nav-intercepted), so you see
+  what those served bytes _display_ when a browser loads them.
+
+```ts
+import { renderAudit, renderHtmlReport } from '@harperfast/prerender-browser';
+
+const cell = await renderAudit({
+	url: 'https://example.com/product/123',
+	device: 'mobile',
+	base: {
+		/* your DEPLOYED config — state B renders with exactly this */
+	},
+	bypass: { header: 'x-harper-renderer-bypass', token: process.env.TOKEN },
+	hostResolverRules: { 'example.com': '203.0.113.10' }, // reach a staging edge IP in this env
+	buckets: { reviews: '[class*=review-]' }, // page-type element counts, shadow-aware
+	pageType: 'pdp',
+	pathPattern: '^/product/',
+});
+
+console.log(cell.diff1.missing); // SEO content in the full render but absent from the served bytes
+console.log(cell.diff2.findings); // served-fidelity defects: hidden / frozen / occluded / broken-img
+console.log(cell.suggestedConfig); // a minimal, scoped config patch that would close the gaps
+
+const html = renderHtmlReport([cell], { title: 'Prerender audit' }); // self-contained HTML report
+```
+
+- **Diff 1 — SEO completeness (A − B):** content present in every full render but missing from every
+  served snapshot. Guarded against cry-wolf (digit/counter churn, phrase re-chunking, an unstable ground
+  truth) so a finding means a real gap, not render noise.
+- **Diff 2 — served fidelity (B − C):** ways the served bytes fail to _display_ — present-but-hidden text,
+  a frozen/empty placeholder, a full-viewport overlay occluding content, or a broken/unresolved `<img>`.
+- **`suggestedConfig`** — the two diffs rolled into one minimal `PrerenderConfig` patch (a scoped
+  `waitFor` rule, `postProcess.removeSelectors`, `resolveLazyImages`, …) you can deep-merge and re-audit.
+- **Customer-agnostic** — every site specific (selectors, hosts, tokens, page types) is an argument; the
+  package bakes in no hostnames or IPs. `renderAudit` renders sequentially (single-flight, like `renderOnce`).
+- **`runSelfCheck()` / `runSelfCheckResults()`** — the tool's own correctness suite (the pure diff
+  classifier on synthetic fingerprints + the fidelity detectors against self-contained golden fixtures).
+
 ## Exports
 
 `startWorker`, `defaultRenderer`, `RenderWorker`, `settings`, `loadConfig` / `mergeConfig` /
-`defaultConfig`, `renderOnce` / `renderMatrix` / `selectorCountProbe` / `htmlContainsProbe`, and the
+`defaultConfig`, `renderOnce` / `renderMatrix` / `selectorCountProbe` / `htmlContainsProbe`,
+`renderAudit` / `renderHtmlReport` / `runSelfCheck` / `runSelfCheckResults`, and the
 `BrowserOptions`, `Renderer`, `RenderJob`, `PrerenderConfig`, `WaitForRule`, `RenderOnceOptions`,
-`RenderResult`, `Probe` (and related) types.
+`RenderResult`, `Probe`, `RenderAuditOptions`, `AuditResult`, `Finding`, `Diff1`, `Diff2`,
+`Fingerprint`, `SuggestedConfig` (and related) types.
 
 ## License
 

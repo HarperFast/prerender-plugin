@@ -88,8 +88,36 @@ export { defaultConfig, loadConfig, mergeConfig } from './config.js';
 // and defaultLaunchOptions stay internal — the public surface is renderOnce/renderMatrix + probes.
 export { renderOnce, renderMatrix, selectorCountProbe, htmlContainsProbe } from './renderOnce.js';
 
+// Prerenderability audit — the analysis counterpart to renderOnce: it renders one (url, device) cell in
+// three states (full render / served bytes / served-bytes-rehydrated) and reports the two content diffs
+// that expose what bots miss. renderAudit is the primitive; renderHtmlReport builds a self-contained HTML
+// report from the cells; runSelfCheck is the tool's own correctness suite.
+export { renderAudit } from './audit/renderAudit.js';
+export { renderHtmlReport } from './audit/report.js';
+export { runSelfCheck, runSelfCheckResults } from './audit/selfCheck.js';
+
 export type { Renderer } from './Worker.js';
 export type { RenderOnceOptions, RenderResult, RenderOutcome, Probe, ProbeContext } from './renderOnce.js';
+export type { RenderAuditOptions } from './audit/renderAudit.js';
+export type { SelfCheckResult } from './audit/selfCheck.js';
+export type {
+	AuditResult,
+	AuditOutcome,
+	Finding,
+	FixType,
+	Frequency,
+	Fingerprint,
+	FingerprintMeta,
+	LinkKey,
+	ImageKey,
+	JsonLdEntry,
+	Diff1,
+	Diff2,
+	BucketDrop,
+	NoiseInfo,
+	SelfJaccard,
+	SuggestedConfig,
+} from './audit/util.js';
 export type { JobConfig } from './RenderJob.js';
 export type { BrowserOptions, ResourceCacheOptions, Settings } from './settings.js';
 export type {
