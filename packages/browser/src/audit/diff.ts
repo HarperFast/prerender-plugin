@@ -153,18 +153,27 @@ export function diffContent(aFps: Fingerprint[], bFps: Fingerprint[], N: number)
 					'low'
 				)
 			);
-		} else if (
-			fb === N &&
-			fa === 0 &&
-			!aDigitSet.has(digitCollapse(line)) &&
-			!(tokenize(line).length && tokenize(line).every((t) => aTokenSet.has(t)))
-		) {
+		} else if (fb === N && fa === 0 && !aDigitSet.has(digitCollapse(line))) {
 			// In every snapshot but never in a real render — frozen/stale prerender-only content. Guarded
 			// symmetrically to MISSING: skip count-churn twins ("130 Reviews" vs live "132") and lines
 			// whose tokens all appear in A (same content, re-chunked) → those are NOISE, not stale. (review M2)
-			stale.push(
-				mkFinding('stale', line, fa, N, 'In every served snapshot but no full render (stale / prerender-only)', 'high')
-			);
+			// tokenize(line) once (was computed twice in the guard); a line whose tokens all appear in A is NOISE.
+			const toks = tokenize(line);
+			if (!(toks.length && toks.every((t) => aTokenSet.has(t)))) {
+				stale.push(
+					mkFinding(
+						'stale',
+						line,
+						fa,
+						N,
+						'In every served snapshot but no full render (stale / prerender-only)',
+						'high'
+					)
+				);
+			} else {
+				noiseCount++;
+				noiseSamples.push(line);
+			}
 		} else {
 			// NOISE (spec §2.2 "else"): gated-out (freqA<⌈2N/3⌉), digit-churn, variable, or
 			// stable-shared content. Non-actionable → aggregate count + samples only.
@@ -204,7 +213,7 @@ export function diffContent(aFps: Fingerprint[], bFps: Fingerprint[], N: number)
 	const jsonldMissing: string[] = [];
 	for (const [t, ca] of aTypes) {
 		// present in EVERY A sample AND no B sample
-		if (aFps.length > 0 && ca === aFps.length && !((bTypes.get(t) as number) > 0)) jsonldMissing.push(t);
+		if (aFps.length > 0 && ca === aFps.length && !bTypes.has(t)) jsonldMissing.push(t);
 	}
 	jsonldMissing.sort();
 

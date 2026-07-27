@@ -258,7 +258,10 @@ function countDomElements(): number {
 }
 
 // Resolve when webfonts are ready; returns a serializable boolean so page.evaluate can await it.
+// Bounded IN-PAGE (not only by sweep's Node-side race): a stalled webfont subresource keeps
+// document.fonts.ready pending forever, and an abandoned page.evaluate leaves that promise pending on
+// the CDP session — so cap the wait here too, freeing the connection immediately. (review H3)
 function fontsReady(): boolean | Promise<boolean> {
 	if (!document.fonts) return true;
-	return document.fonts.ready.then(() => true);
+	return Promise.race([document.fonts.ready, new Promise((resolve) => setTimeout(resolve, 1500))]).then(() => true);
 }

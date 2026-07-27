@@ -8,7 +8,7 @@
 // returns a 0/1 exit code (the shape a CLI `--self-check` flag consumes).
 
 import puppeteer from 'puppeteer';
-import type { Browser } from 'puppeteer';
+import type { Browser, Page } from 'puppeteer';
 import { auditServed } from './detectors.js';
 import { diffContent } from './diff.js';
 import type { Fingerprint, Finding } from './util.js';
@@ -149,10 +149,13 @@ export async function runSelfCheckResults(): Promise<SelfCheckResult[]> {
 				await page.close().catch(() => {});
 			}
 		}
-		// C-determinism: the same fixture audited twice yields the same finding set.
-		const p1 = await browser.newPage();
-		const p2 = await browser.newPage();
+		// C-determinism: the same fixture audited twice yields the same finding set. Declare the pages
+		// outside the try and create them inside, so a throw from the second newPage() can't leak the first.
+		let p1: Page | undefined;
+		let p2: Page | undefined;
 		try {
+			p1 = await browser.newPage();
+			p2 = await browser.newPage();
 			await p1.setContent(FIXTURES.overlay.html, { waitUntil: 'load' });
 			await p2.setContent(FIXTURES.overlay.html, { waitUntil: 'load' });
 			const a = (await auditServed(p1, {})).findings.map((f) => f.symptom + '|' + f.selectorPath).sort();
@@ -163,8 +166,8 @@ export async function runSelfCheckResults(): Promise<SelfCheckResult[]> {
 				`${a.length} vs ${b.length}`
 			);
 		} finally {
-			await p1.close().catch(() => {});
-			await p2.close().catch(() => {});
+			if (p1) await p1.close().catch(() => {});
+			if (p2) await p2.close().catch(() => {});
 		}
 	} finally {
 		await browser.close().catch(() => {});

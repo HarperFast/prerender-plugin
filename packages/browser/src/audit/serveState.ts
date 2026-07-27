@@ -34,53 +34,58 @@ export async function loadServed(
 	}: { url: string; html: string; bypass?: { header: string; token: string }; blockUrlPatterns?: string[] }
 ): Promise<{ page: Page; failed: Map<string, string> }> {
 	const page = await browser.newPage();
-	const failed = new Map<string, string>(); // url -> errorText, for graceful image degradation
+	try {
+		const failed = new Map<string, string>(); // url -> errorText, for graceful image degradation
 
-	await page.setRequestInterception(true);
+		await page.setRequestInterception(true);
 
-	page.on('request', (req: HTTPRequest) => {
-		// Clone headers so we can augment without mutating puppeteer's internal object.
-		const h = { ...req.headers() };
-		if (bypass && bypass.token) h[bypass.header] = bypass.token; // staging asset subrequests need the token
+		page.on('request', (req: HTTPRequest) => {
+			// Clone headers so we can augment without mutating puppeteer's internal object.
+			const h = { ...req.headers() };
+			if (bypass && bypass.token) h[bypass.header] = bypass.token; // staging asset subrequests need the token
 
-		// Interception can race (disabled mid-flight, request already handled) — each of respond/
-		// abort/continue can throw SYNCHRONOUSLY ("Request is already handled!") or reject. Wrap the
-		// whole handler in try/catch AND .catch the returned promise so one bad request never throws
-		// out of the event listener.
-		try {
-			// The main-frame navigation to the real URL: answer with B's bytes.
-			if (req.isNavigationRequest() && req.frame() === page.mainFrame() && req.url() === url) {
-				return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: html }).catch(noop);
-			}
-			// Mirror B's URL-pattern blocking (trackers/etc.) so C loads the same asset set B did.
-			if (blockUrlPatterns.some((p) => req.url().includes(p))) {
-				return req.abort().catch(noop);
-			}
-			return req.continue({ headers: h }).catch(noop);
-		} catch {
-			// Already-handled / interception-disabled race: best-effort continue, then give up.
+			// Interception can race (disabled mid-flight, request already handled) — each of respond/
+			// abort/continue can throw SYNCHRONOUSLY ("Request is already handled!") or reject. Wrap the
+			// whole handler in try/catch AND .catch the returned promise so one bad request never throws
+			// out of the event listener.
 			try {
-				return req.continue().catch(noop);
+				// The main-frame navigation to the real URL: answer with B's bytes.
+				if (req.isNavigationRequest() && req.frame() === page.mainFrame() && req.url() === url) {
+					return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: html }).catch(noop);
+				}
+				// Mirror B's URL-pattern blocking (trackers/etc.) so C loads the same asset set B did.
+				if (blockUrlPatterns.some((p) => req.url().includes(p))) {
+					return req.abort().catch(noop);
+				}
+				return req.continue({ headers: h }).catch(noop);
 			} catch {
-				return undefined;
+				// Already-handled / interception-disabled race: best-effort continue, then give up.
+				try {
+					return req.continue().catch(noop);
+				} catch {
+					return undefined;
+				}
 			}
-		}
-	});
+		});
 
-	// Record sub-resource failures (bad token, unroutable CDN, 4xx/5xx) for the image-canary tiers.
-	page.on('requestfailed', (r: HTTPRequest) =>
-		failed.set(r.url(), (r.failure() && (r.failure() as { errorText: string }).errorText) || 'failed')
-	);
-	page.on('response', (r: HTTPResponse) => {
-		if (r.status() >= 400) failed.set(r.url(), 'HTTP ' + r.status());
-	});
+		// Record sub-resource failures (bad token, unroutable CDN, 4xx/5xx) for the image-canary tiers.
+		page.on('requestfailed', (r: HTTPRequest) => failed.set(r.url(), r.failure()?.errorText || 'failed'));
+		page.on('response', (r: HTTPResponse) => {
+			if (r.status() >= 400) failed.set(r.url(), 'HTTP ' + r.status());
+		});
 
-	// Bounded navigation + settle: goto ≤20s, network-idle ≤5s, then a fixed 1.5s dwell so CSS
-	// transitions/fades finish before detectors hit-test the page. Every wait is `.catch(noop)`'d —
-	// a timeout here is not fatal; C construction is deterministic given B (scripts stripped).
-	await page.goto(url, { waitUntil: 'load', timeout: 20000 }).catch(noop);
-	await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(noop);
-	await sleep(1500);
+		// Bounded navigation + settle: goto ≤20s, network-idle ≤5s, then a fixed 1.5s dwell so CSS
+		// transitions/fades finish before detectors hit-test the page. Every wait is `.catch(noop)`'d —
+		// a timeout here is not fatal; C construction is deterministic given B (scripts stripped).
+		await page.goto(url, { waitUntil: 'load', timeout: 20000 }).catch(noop);
+		await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(noop);
+		await sleep(1500);
 
-	return { page, failed };
+		return { page, failed };
+	} catch (err) {
+		// Setup (setRequestInterception) can reject after newPage — close the page so a throw here does
+		// not orphan it (the caller never received a reference to close it; it just `continue`s the loop).
+		await page.close().catch(noop);
+		throw err;
+	}
 }
