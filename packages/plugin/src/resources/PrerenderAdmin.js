@@ -19,7 +19,14 @@
  *   GET  /prerender_admin/overview  nodes, counts, backlog shape    super_user
  *   GET  /prerender_admin/config    effective config + warnings     super_user
  *   POST /prerender_admin/explain   { url, deviceType }             super_user
+ *   POST /prerender_admin/schedule  { cacheKey } -> local row       super_user
  *   POST /prerender_admin/queue     { scope, paused }               super_user
+ *
+ * `schedule` exists for cross-node explains: RenderSchedule rows are residency-pinned, and a
+ * point read for a row owned by another node would take Harper's replication fetch, which has
+ * no timeout. So `explain` reads locally and, when it isn't the owner, asks the owner through
+ * this route instead — a bounded HTTPS call forwarding only the caller's own credentials. The
+ * route is a leaf: it never proxies onward, so no residency disagreement can cause a loop.
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -28,6 +35,7 @@ import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
+import { fetchScheduleFromPeer } from '../util/peer.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { HOUR } from '../util/time.js';
@@ -303,12 +311,54 @@ export class PrerenderAdmin extends Resource {
 
 		switch (route) {
 			case 'explain':
-				return PrerenderAdmin.explain(data);
+				return PrerenderAdmin.explain(data, context);
+			case 'schedule':
+				return PrerenderAdmin.scheduleRow(data);
 			case 'queue':
 				return PrerenderAdmin.setQueuePause(data, context);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
+	}
+
+	/**
+	 * This node's local RenderSchedule row for a cache key. Exists so a peer running `explain`
+	 * can get an authoritative answer for a row it doesn't own.
+	 *
+	 * Deliberately a LEAF: it reads node-locally and never proxies onward, so no residency
+	 * disagreement between nodes can produce a request loop. It is the same super-user-gated
+	 * surface as everything else — the caller's credentials are re-authenticated here, so
+	 * proxying grants no authority the original caller lacked.
+	 */
+	static async scheduleRow(data) {
+		const cacheKey = data?.cacheKey;
+		if (typeof cacheKey !== 'string' || !cacheKey) {
+			return json({ error: 'cacheKey is required' }, 400);
+		}
+
+		const timedOutReads = [];
+		const row = await readWithTimeout('renderSchedule', timedOutReads, () =>
+			RenderSchedule.get(
+				{ id: cacheKey, select: ['cacheKey', 'nextRenderTime', 'fromSitemap'] },
+				{ replicateFrom: false }
+			)
+		);
+
+		if (timedOutReads.length) return json({ error: 'local schedule read timed out' }, 504);
+
+		const now = Date.now();
+		return json({
+			node: server.hostname,
+			renderSchedule: row
+				? {
+						...row,
+						nextRenderTime: Number(row.nextRenderTime),
+						dueInMs: Number(row.nextRenderTime) - now,
+						overdue: Number(row.nextRenderTime) <= now,
+					}
+				: null,
+			checkedAt: now,
+		});
 	}
 
 	static async login(context, data) {
@@ -399,7 +449,7 @@ export class PrerenderAdmin extends Resource {
 		};
 	}
 
-	static async explain(data) {
+	static async explain(data, context) {
 		const rawUrl = data?.url;
 		if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
 			return json({ error: 'url is required' }, 400);
@@ -467,16 +517,42 @@ export class PrerenderAdmin extends Resource {
 		// bot would actually get.
 		const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > now;
 
+		// The local schedule read was node-local. If another node owns this row, ask it — a
+		// bounded HTTPS call we control, rather than the unbounded replication fetch a plain
+		// cross-node `get` would have done. Only attempted when the local read didn't already
+		// find the row (a row present locally is authoritative regardless of residency).
+		let scheduleRow = schedule;
+		let scheduleSource = scheduleReadIsAuthoritative ? 'local (owner)' : 'local (not owner)';
+		let peerError = null;
+
+		if (!scheduleReadIsAuthoritative && !schedule && config.management.proxyToOwner) {
+			const peer = await fetchScheduleFromPeer({
+				hostname: scheduleOwnedBy,
+				cacheKey,
+				headers: context?.headers,
+			});
+			if (peer.ok) {
+				scheduleRow = peer.row;
+				scheduleSource = `owner ${scheduleOwnedBy}`;
+			} else {
+				peerError = peer.reason;
+			}
+		}
+
+		// True when the row shown is the owner's answer — either we ARE the owner, or the owner
+		// told us. Drives the UI's "inconclusive" wording.
+		const scheduleAuthoritative = scheduleReadIsAuthoritative || scheduleSource.startsWith('owner ');
+
 		return json({
 			...explanation,
 			rows: {
 				renderTarget: target ?? null,
-				renderSchedule: schedule
+				renderSchedule: scheduleRow
 					? {
-							...schedule,
-							nextRenderTime: Number(schedule.nextRenderTime),
-							dueInMs: Number(schedule.nextRenderTime) - now,
-							overdue: Number(schedule.nextRenderTime) <= now,
+							...scheduleRow,
+							nextRenderTime: Number(scheduleRow.nextRenderTime),
+							dueInMs: Number(scheduleRow.nextRenderTime) - now,
+							overdue: Number(scheduleRow.nextRenderTime) <= now,
 						}
 					: null,
 				prerenderedPage: page
@@ -497,10 +573,15 @@ export class PrerenderAdmin extends Resource {
 				nonIndexable: suppressed ? { url: suppressed.url ?? explanation.resolved.canonicalUrl } : null,
 			},
 			verdict: {
+				// Every field here is derived from rows that may have failed to read, so it is
+				// only trustworthy when `reliable` is true. A timed-out read yields a null row,
+				// which would otherwise be indistinguishable from a genuinely absent one and turn
+				// a degraded response into a confident false negative.
+				reliable: timedOutReads.length === 0,
 				// What a bot request for this URL would get right now.
 				wouldServe: fresh ? 'cache' : 'origin-or-render',
-				// Only meaningful when the schedule read was authoritative — see `residency`.
-				scheduled: !!schedule,
+				// Only meaningful when `residency.scheduleAuthoritative` is true.
+				scheduled: !!scheduleRow,
 				recurring: !!target,
 				// A NonIndexable row blocks re-discovery for the table's expiration window, so
 				// a URL can be absent from rotation with no target and no obvious reason why.
@@ -508,12 +589,18 @@ export class PrerenderAdmin extends Resource {
 			},
 			residency: {
 				queriedNode: server.hostname,
-				// RenderSchedule rows are pinned to the node that owns the URL, and this endpoint
-				// reads node-locally to avoid a cross-node fetch. On any other node the row is
-				// expected to be absent, so `scheduled: false` there means "not scheduled HERE",
-				// not "not scheduled".
+				// RenderSchedule rows are pinned to the node that owns the URL. This node reads
+				// locally (a cross-node point read would await Harper's untimed replication
+				// fetch), then asks the owner directly over HTTPS when it isn't the owner.
 				scheduleOwnedBy,
+				// Was the LOCAL read the owner's own copy?
 				scheduleReadIsAuthoritative,
+				// Is the row actually shown authoritative — local-as-owner, or fetched from the
+				// owner? Only when this is false does "not scheduled" mean "not scheduled here".
+				scheduleAuthoritative,
+				scheduleSource,
+				// Why the owner could not be consulted, when it couldn't.
+				peerError,
 			},
 			degraded: timedOutReads.length ? { timedOutReads } : null,
 			checkedAt: now,

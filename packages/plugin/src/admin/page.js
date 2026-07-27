@@ -531,6 +531,21 @@ const PAGE = `<title>Prerender Admin</title>
 		return el('div', null, panels);
 	}
 
+	// Did this row's read time out? A row that could not be read is UNKNOWN, and must never be
+	// rendered with the same wording as a row that was read and found absent — that turns a
+	// degraded response into a confident false negative ("not scheduled", "no cached page"),
+	// which is exactly the wrong thing to hand someone debugging a missing page.
+	function timedOut(data, name) {
+		return !!(data.degraded && data.degraded.timedOutReads.indexOf(name) !== -1);
+	}
+
+	function emptyState(data, name, absentText) {
+		return el('p', {
+			cls: 'muted',
+			text: timedOut(data, name) ? 'Read timed out — status unknown, not necessarily absent.' : absentText
+		});
+	}
+
 	function renderExplainResult(data) {
 		var notes = [];
 
@@ -579,13 +594,24 @@ const PAGE = `<title>Prerender Admin</title>
 			]));
 		}
 		if (data.residency && !data.residency.scheduleReadIsAuthoritative) {
-			notes.push(el('div', { cls: 'note info' }, [
-				'RenderSchedule rows are pinned to the node owning the URL, and this node (' +
-				data.residency.queriedNode + ') is not the owner — ' + data.residency.scheduleOwnedBy +
-				' is. The schedule row below is read locally, so an absent one means "not scheduled ' +
-				'on this node", not "not scheduled". Ask ' + data.residency.scheduleOwnedBy +
-				' for the authoritative answer.'
-			]));
+			if (data.residency.scheduleAuthoritative) {
+				// The owner answered — say so, since the row came from a different node than the
+				// rest of the response.
+				notes.push(el('div', { cls: 'note ok' }, [
+					'The schedule row is owned by ' + data.residency.scheduleOwnedBy +
+					' and was fetched from it, so it is authoritative. Everything else was read on ' +
+					data.residency.queriedNode + '.'
+				]));
+			} else {
+				notes.push(el('div', { cls: 'note' }, [
+					'RenderSchedule rows are pinned to the node owning the URL, and this node (' +
+					data.residency.queriedNode + ') is not the owner — ' + data.residency.scheduleOwnedBy +
+					' is. Could not reach the owner' +
+					(data.residency.peerError ? ' (' + data.residency.peerError + ')' : '') +
+					', so the row below is this node’s local copy: an absent one means "not scheduled ' +
+					'on this node", not "not scheduled".'
+				]));
+			}
 		}
 
 		var page = data.rows.prerenderedPage;
@@ -614,15 +640,21 @@ const PAGE = `<title>Prerender Admin</title>
 			el('div', { cls: 'panel' }, [
 				el('h2', { text: 'What a bot would get now' }),
 				el('div', { cls: 'toolbar' }, [
-					page && page.fresh
-						? el('span', { cls: 'badge ok', text: 'cache hit' })
-						: el('span', { cls: 'badge warn', text: page ? 'stale — origin or render' : 'miss — origin or render' }),
+					// A timed-out read must never render as a confident verdict: an unread page row
+					// is "unknown", not "miss".
+					timedOut(data, 'prerenderedPage')
+						? el('span', { cls: 'badge mute', text: 'unknown — cache read timed out' })
+						: page && page.fresh
+							? el('span', { cls: 'badge ok', text: 'cache hit' })
+							: el('span', { cls: 'badge warn', text: page ? 'stale — origin or render' : 'miss — origin or render' }),
 					page && page.inStaleWhileRevalidate
 						? el('span', { cls: 'badge mute', text: 'serving stale-while-revalidate' })
 						: null,
-					data.verdict.recurring
-						? el('span', { cls: 'badge ok', text: 'recurring target' })
-						: el('span', { cls: 'badge warn', text: 'no render target' })
+					timedOut(data, 'renderTarget')
+						? el('span', { cls: 'badge mute', text: 'unknown — target read timed out' })
+						: data.verdict.recurring
+							? el('span', { cls: 'badge ok', text: 'recurring target' })
+							: el('span', { cls: 'badge warn', text: 'no render target' })
 				])
 			]),
 
@@ -635,22 +667,22 @@ const PAGE = `<title>Prerender Admin</title>
 					['Expires', page.expiresAt ? ago(page.expiresAt) : '—'],
 					['Fresh', boolBadge(!page.fresh, 'no', 'yes')],
 					['Indexable', page.isIndexable === null ? 'unknown' : String(page.isIndexable)]
-				]) : el('p', { cls: 'muted', text: 'No cached page under this key.' }),
+				]) : emptyState(data, 'prerenderedPage', 'No cached page under this key.'),
 
 				el('h3', { cls: 'muted', text: 'RenderSchedule' }),
 				schedule ? kv([
 					['Next render', (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs)],
 					['From sitemap', String(!!schedule.fromSitemap)]
-				]) : el('p', { cls: 'muted', text: data.residency && !data.residency.scheduleReadIsAuthoritative
+				]) : emptyState(data, 'renderSchedule', data.residency && !data.residency.scheduleAuthoritative
 					? 'No schedule row on this node — inconclusive, since ' + data.residency.scheduleOwnedBy + ' owns it.'
-					: 'Not scheduled — nothing will render this URL.' }),
+					: 'Not scheduled — nothing will render this URL.'),
 
 				el('h3', { cls: 'muted', text: 'RenderTarget' }),
 				target ? kv([
 					['Sitemap', target.sitemapUrl || '—'],
 					['Scheduler node', target.schedulerNode || '—'],
 					['Render interval', target.renderInterval ? duration(Number(target.renderInterval)) : 'default']
-				]) : el('p', { cls: 'muted', text: 'No target — not in the recurring rotation.' })
+				]) : emptyState(data, 'renderTarget', 'No target — not in the recurring rotation.')
 			])
 		];
 
