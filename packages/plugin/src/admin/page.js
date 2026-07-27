@@ -572,6 +572,21 @@ const PAGE = `<title>Prerender Admin</title>
 				data.resolved.deviceType + '".'
 			]));
 		}
+		if (data.degraded) {
+			notes.push(el('div', { cls: 'note bad' }, [
+				'These reads timed out and are shown as empty: ' + data.degraded.timedOutReads.join(', ') +
+				'. Treat those rows as unknown, not absent.'
+			]));
+		}
+		if (data.residency && !data.residency.scheduleReadIsAuthoritative) {
+			notes.push(el('div', { cls: 'note info' }, [
+				'RenderSchedule rows are pinned to the node owning the URL, and this node (' +
+				data.residency.queriedNode + ') is not the owner — ' + data.residency.scheduleOwnedBy +
+				' is. The schedule row below is read locally, so an absent one means "not scheduled ' +
+				'on this node", not "not scheduled". Ask ' + data.residency.scheduleOwnedBy +
+				' for the authoritative answer.'
+			]));
+		}
 
 		var page = data.rows.prerenderedPage;
 		var schedule = data.rows.renderSchedule;
@@ -626,7 +641,9 @@ const PAGE = `<title>Prerender Admin</title>
 				schedule ? kv([
 					['Next render', (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs)],
 					['From sitemap', String(!!schedule.fromSitemap)]
-				]) : el('p', { cls: 'muted', text: 'Not scheduled — nothing will render this URL.' }),
+				]) : el('p', { cls: 'muted', text: data.residency && !data.residency.scheduleReadIsAuthoritative
+					? 'No schedule row on this node — inconclusive, since ' + data.residency.scheduleOwnedBy + ' owns it.'
+					: 'Not scheduled — nothing will render this URL.' }),
 
 				el('h3', { cls: 'muted', text: 'RenderTarget' }),
 				target ? kv([
