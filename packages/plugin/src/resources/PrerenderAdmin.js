@@ -21,6 +21,8 @@
  *   POST /prerender_admin/explain   { url, deviceType }             super_user
  *   POST /prerender_admin/schedule  { cacheKey } -> local row       super_user
  *   POST /prerender_admin/queue     { scope, paused }               super_user
+ *   POST /prerender_admin/revalidate { url, deviceType }            super_user
+ *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *
  * `schedule` exists for cross-node explains: RenderSchedule rows are residency-pinned, and a
  * point read for a row owned by another node would take Harper's replication fetch, which has
@@ -36,9 +38,10 @@ import { explainCacheKey } from '../util/explain.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
+import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
-import { HOUR } from '../util/time.js';
+import { currentMinuteMs, HOUR } from '../util/time.js';
 import { renderAdminPage } from '../admin/page.js';
 
 const {
@@ -316,9 +319,103 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.scheduleRow(data);
 			case 'queue':
 				return PrerenderAdmin.setQueuePause(data, context);
+			case 'revalidate':
+				return PrerenderAdmin.revalidateUrl(data);
+			case 'reconcile':
+				return PrerenderAdmin.reconcile();
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
+	}
+
+	/**
+	 * Make ONE url due for render now.
+	 *
+	 * Deliberately not `RenderTarget.revalidate`, which takes a search target: pointed at the
+	 * whole collection that revalidates the entire registry, and at 1M+ targets an accidental
+	 * full revalidate is a self-inflicted render herd. This writes exactly one schedule row.
+	 *
+	 * Requires an existing RenderTarget. A schedule row without one is a one-off that
+	 * `processJobResult` drops after a single render — that is the render-now feature, not
+	 * this, and quietly creating one here would look like it joined the rotation when it
+	 * hadn't.
+	 */
+	static async revalidateUrl(data) {
+		let explanation;
+		try {
+			explanation = explainCacheKey(String(data?.url ?? '').trim(), data?.deviceType);
+		} catch (e) {
+			return json({ error: `Not a valid absolute URL: ${e?.message ?? String(e)}` }, 400);
+		}
+
+		const { cacheKey, canonicalUrl } = explanation.resolved;
+
+		const timedOutReads = [];
+		const target = await readWithTimeout('renderTarget', timedOutReads, () =>
+			RenderTarget.get({ id: cacheKey, select: ['cacheKey', 'sitemapUrl'] })
+		);
+		if (timedOutReads.length) return json({ error: 'target read timed out' }, 504);
+
+		if (!target) {
+			return json(
+				{
+					error:
+						'No RenderTarget for this key, so there is no recurring rotation to rejoin. A schedule row on its own would render once and be dropped.',
+					cacheKey,
+				},
+				409
+			);
+		}
+
+		const nextRenderTime = currentMinuteMs();
+		// The write is residency-routed, so this reaches the owning node from any node.
+		await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!target.sitemapUrl });
+
+		// `claim` reads a node-local flag, so waking consumers only helps on the node that owns
+		// the row — anywhere else the owner picks it up on its own status-sync tick instead.
+		const owner = getResidencyByUrl(canonicalUrl);
+		if (owner === server.hostname) await QueueState.reportStatus('queued');
+
+		return json({
+			cacheKey,
+			canonicalUrl,
+			nextRenderTime,
+			scheduleOwnedBy: owner,
+			wokeLocalConsumers: owner === server.hostname,
+			node: server.hostname,
+		});
+	}
+
+	/**
+	 * Start a schedule-repair sweep on THIS node.
+	 *
+	 * Detached on purpose: the sweep walks the whole target registry, which at scale takes far
+	 * longer than a request should stay open. The previous run's summary comes back with the
+	 * acknowledgement, so the UI can show what the last pass actually did.
+	 *
+	 * Node-scoped, because a node can only authoritatively check the keys it owns — see
+	 * util/reconcile.js. Every node runs the periodic sweep for its own slice.
+	 */
+	static reconcile() {
+		const lastRun = getLastReconcile();
+		const payload = {
+			node: server.hostname,
+			ownerScopeNote: 'Repairs only the keys this node owns; every node sweeps its own slice.',
+			lastRun,
+		};
+
+		// Checked up front so a double-click reports honestly rather than implying a second
+		// pass began. `runReconcileOnce` holds the authoritative guard either way, so the
+		// microtask-wide race between these two only affects the wording, never the work.
+		if (isReconcileRunning()) {
+			return json({ ...payload, started: false, alreadyRunning: true });
+		}
+
+		// Detached: the sweep outlives this request, so a rejection has to be handled here or
+		// it surfaces as an unhandled rejection.
+		runReconcileOnce().catch((e) => logger.error(e));
+
+		return json({ ...payload, started: true, alreadyRunning: false });
 	}
 
 	/**
@@ -446,6 +543,14 @@ export class PrerenderAdmin extends Resource {
 				jobLeaseTime: config.queue.jobLeaseTime,
 				defaultRenderInterval: config.render.defaultInterval,
 			},
+			// This node's last schedule-repair sweep. Node-scoped like the sweep itself: it
+			// covers only the keys this node owns.
+			reconcile: {
+				enabled: config.render.reconcile.enabled,
+				interval: config.render.reconcile.interval,
+				running: isReconcileRunning(),
+				lastRun: getLastReconcile(),
+			},
 		};
 	}
 
@@ -459,7 +564,7 @@ export class PrerenderAdmin extends Resource {
 		try {
 			explanation = explainCacheKey(rawUrl.trim(), data?.deviceType);
 		} catch (e) {
-			return json({ error: `Not a valid absolute URL: ${e.message}` }, 400);
+			return json({ error: `Not a valid absolute URL: ${e?.message ?? String(e)}` }, 400);
 		}
 
 		const { cacheKey, canonicalUrl } = explanation.resolved;

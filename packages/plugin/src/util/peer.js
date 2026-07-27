@@ -7,8 +7,8 @@
  * therefore passes `replicateFrom: false` and stays node-local.
  *
  * That keeps the explainer responsive but leaves it unable to answer authoritatively: with
- * rendezvous hashing over N nodes, (N-1)/N of all URLs are owned elsewhere (~75% on the
- * 4-node kohls cluster), so "the row lives on another node" would be the usual answer. This
+ * rendezvous hashing over N nodes, (N-1)/N of all URLs are owned elsewhere (~75% on a
+ * four-node cluster), so "the row lives on another node" would be the usual answer. This
  * module closes that gap by asking the owner over plain HTTPS instead — a bounded request we
  * control, rather than an unbounded one we don't.
  *

@@ -76,44 +76,44 @@ test('bypass token defaults to empty when omitted', () => {
 test('composeHostResolverRulesArg builds the Chrome flag and drops empty entries', () => {
 	assert.equal(composeHostResolverRulesArg(undefined), null);
 	assert.equal(composeHostResolverRulesArg({}), null);
-	assert.equal(composeHostResolverRulesArg({ '': '1.2.3.4', 'www.kohls.com': '' }), null);
+	assert.equal(composeHostResolverRulesArg({ '': '1.2.3.4', 'www.example.com': '' }), null);
 	assert.equal(
-		composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27' }),
-		'--host-resolver-rules=MAP www.kohls.com 23.50.51.27'
+		composeHostResolverRulesArg({ 'www.example.com': '192.0.2.27' }),
+		'--host-resolver-rules=MAP www.example.com 192.0.2.27'
 	);
 	assert.equal(
-		composeHostResolverRulesArg({ 'www.kohls.com': ' 23.50.51.27 ', 'api.kohls.com': '1.2.3.4' }),
-		'--host-resolver-rules=MAP www.kohls.com 23.50.51.27,MAP api.kohls.com 1.2.3.4'
+		composeHostResolverRulesArg({ 'www.example.com': ' 192.0.2.27 ', 'api.example.com': '1.2.3.4' }),
+		'--host-resolver-rules=MAP www.example.com 192.0.2.27,MAP api.example.com 1.2.3.4'
 	);
 });
 
 test('composeHostResolverRulesArg rejects values with whitespace or commas (rule injection)', () => {
 	// A comma in a value would inject a second rule (e.g. a wildcard remap of every host).
 	assert.throws(
-		() => composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27,MAP * 1.1.1.1' }),
+		() => composeHostResolverRulesArg({ 'www.example.com': '192.0.2.27,MAP * 1.1.1.1' }),
 		/must not contain whitespace or commas/
 	);
 	assert.throws(
-		() => composeHostResolverRulesArg({ 'www.kohls.com': '23.50.51.27 1.1.1.1' }),
+		() => composeHostResolverRulesArg({ 'www.example.com': '192.0.2.27 1.1.1.1' }),
 		/must not contain whitespace or commas/
 	);
 	assert.throws(() => composeHostResolverRulesArg({ 'bad host': '1.2.3.4' }), /must not contain whitespace or commas/);
 });
 
 test('hostResolverRules appends --host-resolver-rules onto the default chrome args', () => {
-	applySettings({ harper: HARPER, hostResolverRules: { 'www.kohls.com': '23.50.51.27' } });
-	assert.deepEqual(settings.hostResolverRules, { 'www.kohls.com': '23.50.51.27' });
+	applySettings({ harper: HARPER, hostResolverRules: { 'www.example.com': '192.0.2.27' } });
+	assert.deepEqual(settings.hostResolverRules, { 'www.example.com': '192.0.2.27' });
 	assert.ok(settings.chromeArgs.includes('--no-sandbox')); // hardened defaults preserved
-	assert.equal(settings.chromeArgs.at(-1), '--host-resolver-rules=MAP www.kohls.com 23.50.51.27');
+	assert.equal(settings.chromeArgs.at(-1), '--host-resolver-rules=MAP www.example.com 192.0.2.27');
 });
 
 test('hostResolverRules appends onto custom chromeArgs without dropping them', () => {
 	applySettings({
 		harper: HARPER,
 		chromeArgs: ['--foo'],
-		hostResolverRules: { 'www.kohls.com': '23.50.51.27' },
+		hostResolverRules: { 'www.example.com': '192.0.2.27' },
 	});
-	assert.deepEqual(settings.chromeArgs, ['--foo', '--host-resolver-rules=MAP www.kohls.com 23.50.51.27']);
+	assert.deepEqual(settings.chromeArgs, ['--foo', '--host-resolver-rules=MAP www.example.com 192.0.2.27']);
 });
 
 test('no host-resolver flag is added when hostResolverRules is omitted', () => {

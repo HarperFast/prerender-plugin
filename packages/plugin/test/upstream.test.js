@@ -18,8 +18,8 @@ test('staging defaults are off (empty ip) with a default toggle header', () => {
 });
 
 test('applyOptions accepts staging overrides', () => {
-	applyOptions({ staging: { ip: '23.50.51.27', header: 'x-acme-staging' } });
-	assert.equal(config.staging.ip, '23.50.51.27');
+	applyOptions({ staging: { ip: '192.0.2.27', header: 'x-acme-staging' } });
+	assert.equal(config.staging.ip, '192.0.2.27');
 	assert.equal(config.staging.header, 'x-acme-staging');
 	// untouched sibling keeps its default when only ip is overridden
 	applyOptions({ staging: { ip: '1.2.3.4' } });
@@ -32,14 +32,14 @@ test('stagingTargetIp is undefined when no staging ip is configured', () => {
 });
 
 test('stagingTargetIp returns the configured ip only when the toggle header is present', () => {
-	applyOptions({ staging: { ip: '23.50.51.27' } });
-	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '23.50.51.27');
+	applyOptions({ staging: { ip: '192.0.2.27' } });
+	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '192.0.2.27');
 	assert.equal(stagingTargetIp(headersWith([])), undefined);
 });
 
 test('stagingTargetIp honors a custom toggle header name', () => {
-	applyOptions({ staging: { ip: '23.50.51.27', header: 'x-acme-staging' } });
-	assert.equal(stagingTargetIp(headersWith(['x-acme-staging'])), '23.50.51.27');
+	applyOptions({ staging: { ip: '192.0.2.27', header: 'x-acme-staging' } });
+	assert.equal(stagingTargetIp(headersWith(['x-acme-staging'])), '192.0.2.27');
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
@@ -49,7 +49,7 @@ test('stagingTargetIp ignores an invalid configured ip (feature disabled)', () =
 });
 
 test('stagingTargetIp is disabled when the toggle header name is configured empty', () => {
-	applyOptions({ staging: { ip: '23.50.51.27', header: '' } });
+	applyOptions({ staging: { ip: '192.0.2.27', header: '' } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
@@ -59,9 +59,9 @@ test('stagingTargetIp supports an IPv6 staging address', () => {
 });
 
 test('configuredStagingIp returns the configured ip regardless of any request header', () => {
-	applyOptions({ staging: { ip: '23.50.51.27' } });
+	applyOptions({ staging: { ip: '192.0.2.27' } });
 	// No header argument at all — the sitemap refresh opts in out-of-band, not via a header.
-	assert.equal(configuredStagingIp(), '23.50.51.27');
+	assert.equal(configuredStagingIp(), '192.0.2.27');
 });
 
 test('configuredStagingIp is undefined when no staging ip is configured', () => {

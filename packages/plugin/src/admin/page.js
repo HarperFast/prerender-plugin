@@ -321,8 +321,84 @@ const PAGE = `<title>Prerender Admin</title>
 			state.error ? el('div', { cls: 'note bad', text: state.error }) : null,
 			renderCounts(data),
 			renderQueueControl(data),
+			renderScheduleRepair(data),
 			renderHistogram(data)
 		]);
+	}
+
+	// A target whose RenderSchedule row is missing renders nothing, forever, with no error to
+	// notice it by — so the repair sweep's last result belongs on the dashboard whether or not
+	// anyone thinks to run it.
+	function renderScheduleRepair(data) {
+		var info = data.reconcile || {};
+		var last = info.lastRun;
+
+		var button = el('button', {
+			text: info.running ? 'Sweep running…' : 'Run repair sweep',
+			disabled: state.busy || info.running ? 'disabled' : null,
+			onclick: function () {
+				state.busy = true;
+				state.error = null;
+				render();
+				post('reconcile', {}).then(function (res) {
+					state.busy = false;
+					if (!res.ok) {
+						state.error = (res.body && res.body.error) || 'Failed to start the repair sweep';
+						render();
+						return;
+					}
+					// Reload rather than render the acknowledgement: the sweep is detached, so the
+					// refreshed overview (running / lastRun) is the honest view of it.
+					load();
+				});
+			}
+		});
+
+		var children = [
+			el('h2', { text: 'Schedule repair' }),
+			el('div', { cls: 'toolbar' }, [
+				info.enabled
+					? el('span', { cls: 'badge ok', text: 'every ' + duration(info.interval) })
+					: el('span', { cls: 'badge bad', text: 'disabled' }),
+				info.running ? el('span', { cls: 'badge warn', text: 'running now' }) : null,
+				el('span', { cls: 'spacer' }),
+				button
+			])
+		];
+
+		if (!info.enabled) {
+			children.push(el('div', { cls: 'note bad' }, [
+				'render.reconcile.enabled is false. Nothing will repair a target whose schedule row goes ' +
+				'missing, and such a URL stops rendering permanently and silently.'
+			]));
+		}
+
+		if (last && last.error) {
+			children.push(el('div', { cls: 'note bad', text: 'Last sweep failed: ' + last.error }));
+		} else if (last) {
+			children.push(kv([
+				['Last sweep', ago(last.finishedAt)],
+				['Targets examined', num(last.examined)],
+				['Owned by this node', num(last.owned)],
+				['Schedule rows restored', last.restored
+					? el('span', { cls: 'badge warn', text: num(last.restored) })
+					: el('span', { cls: 'badge ok', text: '0' })],
+				last.truncated
+					? ['Truncated', el('span', { cls: 'badge bad', text: 'hit the restore cap — more may remain' })]
+					: null
+			]));
+		} else {
+			children.push(el('p', { cls: 'muted', text:
+				'No sweep has run on this node yet since it started.' }));
+		}
+
+		children.push(el('p', { cls: 'muted', text:
+			'A target and its schedule are two writes in two databases, and the schedule is routed to the ' +
+			'node owning the URL — so the pair can end up half-written. This sweep repairs only the keys ' +
+			'THIS node owns (a node can only read its own residency-pinned rows without a cross-node ' +
+			'fetch); every node sweeps its own slice.' }));
+
+		return el('div', { cls: 'panel' }, children);
 	}
 
 	function renderCounts(data) {
@@ -546,6 +622,77 @@ const PAGE = `<title>Prerender Admin</title>
 		});
 	}
 
+	// Make this one key due now. Scoped to a single row on purpose: the collection-level
+	// revalidate takes a search target, and pointed at the whole registry it would queue every
+	// target at once.
+	function renderRevalidate(data, target, schedule) {
+		var key = data.resolved.cacheKey;
+		var result = state.revalidate && state.revalidate.cacheKey === key ? state.revalidate : null;
+
+		var button = el('button', {
+			cls: 'primary',
+			text: 'Render this URL now',
+			// A key with no target has no rotation to rejoin; the server rejects it, but there is
+			// no reason to offer the click. An unread (timed-out) target is still offered — the
+			// server is the authority, and refusing on an unknown would be its own false negative.
+			disabled: !target && !timedOut(data, 'renderTarget') ? 'disabled' : null
+		});
+
+		button.addEventListener('click', function () {
+			button.disabled = true;
+			post('revalidate', {
+				url: data.input.url,
+				deviceType: data.input.deviceType || undefined
+			}).then(function (res) {
+				button.disabled = false;
+				state.revalidate = {
+					cacheKey: key,
+					ok: res.ok,
+					body: res.body,
+					error: res.ok ? null : (res.body && res.body.error) || 'Could not mark this URL for render'
+				};
+				render();
+			});
+		});
+
+		var children = [
+			el('div', { cls: 'toolbar' }, [
+				button,
+				el('span', { cls: 'muted', text: !target && !timedOut(data, 'renderTarget')
+					? 'No target under this key, so there is no recurring rotation to rejoin.'
+					: 'Sets this one key due immediately. Never touches any other row.' })
+			])
+		];
+
+		if (result && result.ok) {
+			children.push(el('div', { cls: 'note ok' }, [
+				result.body.wokeLocalConsumers
+					? 'Marked due now. This node owns the row and its consumers were woken, so the render should start shortly.'
+					: 'Marked due now. ' + result.body.scheduleOwnedBy + ' owns this row and will claim it on its next ' +
+						'status sync — the write is residency-routed, so it landed on that node.'
+			]));
+		} else if (result) {
+			children.push(el('div', { cls: 'note bad', text: result.error }));
+		} else if (
+			!schedule && target && !timedOut(data, 'renderSchedule') &&
+			data.residency && data.residency.scheduleAuthoritative
+		) {
+			// The state this button exists for: a target with no schedule renders nothing, and
+			// nothing else in the system will restore the row for a URL outside every sitemap.
+			//
+			// Gated on an AUTHORITATIVE read. If the owner could not be reached, an absent row
+			// means "not here", and asserting the diagnosis off that would be the same false
+			// negative the wording elsewhere is careful to avoid.
+			children.push(el('div', { cls: 'note' }, [
+				'This key has a target but no schedule row, so nothing will render it. If the URL is not in ' +
+				'a sitemap, no other code path re-creates that row — use the button above, or let this ' +
+				'node’s periodic repair sweep pick it up.'
+			]));
+		}
+
+		return children;
+	}
+
 	function renderExplainResult(data) {
 		var notes = [];
 
@@ -683,7 +830,7 @@ const PAGE = `<title>Prerender Admin</title>
 					['Scheduler node', target.schedulerNode || '—'],
 					['Render interval', target.renderInterval ? duration(Number(target.renderInterval)) : 'default']
 				]) : emptyState(data, 'renderTarget', 'No target — not in the recurring rotation.')
-			])
+			].concat(renderRevalidate(data, target, schedule)))
 		];
 
 		return el('div', null, sections);

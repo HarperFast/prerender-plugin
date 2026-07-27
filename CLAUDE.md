@@ -68,14 +68,20 @@ plugin tarball to that release, and vice-versa.
   [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js) (which currently checks only
   `localhost`, not `127.0.0.1`).
 
-<!-- SHARED:system-overview — keep in sync across prerender-plugin, kohls-pr, render-service -->
+<!-- SHARED:system-overview — keep in sync across prerender-plugin, <customer>-pr, render-service -->
 ## System overview (all three repos)
 
 Freshly-spun-up agents: these three repos are coupled through release tarballs — know the whole
 picture before touching versions. (Your repo-specific section is at the top of this file.)
 
+> **This repo is PUBLIC.** The consumer repos are internal, so their copies of this shared block
+> name the customer directly; this copy deliberately does not. When syncing the block, keep the
+> placeholders here — do not "restore" the concrete names. Same rule applies to everything else in
+> `packages/`: no customer names, real hostnames, or real IPs in source, comments, or test
+> fixtures. Use `example.com` and the RFC 5737 ranges (`192.0.2.0/24`, `198.51.100.0/24`).
+
 ```
-Akamai ──bot/crawler traffic──▶  kohls-pr  (Harper component + @harperfast/prerender plugin)
+CDN ──bot/crawler traffic──▶  <customer>-pr  (Harper component + @harperfast/prerender plugin)
                                     │  enqueues render jobs, serves cached HTML
                                     ▼
                         render-service@<customer>  (fleet of @harperfast/prerender-browser workers)
@@ -86,8 +92,8 @@ Akamai ──bot/crawler traffic──▶  kohls-pr  (Harper component + @harper
 | Repo | Role | Branch model | Dep on the monorepo |
 | --- | --- | --- | --- |
 | **prerender-plugin** | source monorepo (two packages) | PRs → `main` | — |
-| **kohls-pr** | Harper component, serves bot traffic behind Akamai | PRs → `main` | `@harperfast/prerender` tarball (`prerender-v*`) |
-| **render-service** | headless-browser render fleet, one branch per customer (`kohls`, `stbhb`, `mcy`…) | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`) |
+| **`<customer>-pr`** | Harper component, serves bot traffic behind the CDN | PRs → `main` | `@harperfast/prerender` tarball (`prerender-v*`) |
+| **render-service** | headless-browser render fleet, one branch per customer | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`) |
 
 A downstream repo cannot bump until the upstream tarball asset already exists at its release URL —
 **cut the prerender-plugin release first, then bump the consumer.**

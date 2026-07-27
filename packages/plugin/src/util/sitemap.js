@@ -36,3 +36,19 @@ export function parseSitemap(xml) {
 		`expected a <urlset> or <sitemapindex> root, got ${rootTags.length ? `<${rootTags.join('>, <')}>` : 'a non-XML or empty document'}`
 	);
 }
+
+/**
+ * Does an already-known target need re-putting for `sitemapUrl`?
+ *
+ * `existingTarget` must be the RECORD an array select returns. Handed the bare scalar that a
+ * STRING select returns, `.sitemapUrl` is `undefined` and this is unconditionally true — which
+ * is precisely what went wrong: every known target was re-put on every refresh, and because
+ * `RenderTarget.put` recomputes `getInitialRenderTime` (now + jitter), each refresh pushed the
+ * next render FORWARD. Any target whose interval exceeded the refresh period (changefreq
+ * weekly, monthly, yearly) was pushed back before it ever came due, and so never re-rendered.
+ *
+ * Lives here rather than in `resources/Sitemap.js` so it stays unit-testable: that module
+ * subclasses `databases.sitemaps.Sitemap` at import time and cannot be loaded without a live
+ * Harper.
+ */
+export const sitemapTargetNeedsUpdate = (existingTarget, sitemapUrl) => existingTarget?.sitemapUrl !== sitemapUrl;
