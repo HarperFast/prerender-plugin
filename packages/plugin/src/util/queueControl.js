@@ -44,7 +44,7 @@ export const resolveDesiredPause = (nodeControl, clusterControl) => {
  * Read both intent records for `hostname` and resolve them. Kept separate from the pure
  * resolver above so the precedence rules stay unit-testable outside Harper.
  */
-export const getDesiredPause = async (hostname) => {
+export const getDesiredPause = async (hostname, pending = null) => {
 	const { QueueControl } = databases.render_service;
 
 	// `select` MUST be an array here. A string `select` projects to the bare scalar rather
@@ -53,9 +53,17 @@ export const getDesiredPause = async (hostname) => {
 	// `.paused` off a boolean gets undefined, silently treats it as "no opinion", and every
 	// pause resolves to "not paused". That failure is invisible: the row is written and shows
 	// up in the UI, but no node ever acts on it.
+	//
+	// `pending` substitutes a scope's value instead of reading it, for the caller that has
+	// just written that scope in this same request. A row deleted earlier in the request is
+	// still visible to this read (the read does not observe the delete), so re-reading it
+	// resolves a resume back to "paused" and reports the opposite of what happened. Trusting
+	// the value just written removes the dependency on write visibility entirely.
+	const pendingFor = (scope) => (pending && pending.scope === scope ? { paused: pending.paused } : undefined);
+
 	const [nodeControl, clusterControl] = await Promise.all([
-		QueueControl.get({ id: hostname, select: ['paused'] }),
-		QueueControl.get({ id: CLUSTER_SCOPE, select: ['paused'] }),
+		pendingFor(hostname) ?? QueueControl.get({ id: hostname, select: ['paused'] }),
+		pendingFor(CLUSTER_SCOPE) ?? QueueControl.get({ id: CLUSTER_SCOPE, select: ['paused'] }),
 	]);
 
 	return resolveDesiredPause(nodeControl, clusterControl);

@@ -95,3 +95,67 @@ test('the read projects to a RECORD, not a bare scalar', async () => {
 		assert.ok(Array.isArray(select), `select must be an array, got ${typeof select} (${select})`);
 	}
 });
+
+/**
+ * The `pending` substitution. `setPause` writes an intent and then immediately re-resolves
+ * it in the same request — but a row deleted earlier in that request is still visible to
+ * the read, so re-reading it resolves a resume back to "paused" and the API reports the
+ * opposite of what happened. The fakes below return deliberately STALE rows to prove the
+ * resolution trusts the just-written value instead of the table.
+ */
+
+test('pending resume wins over a stale row that still reads as paused', async () => {
+	// The delete already happened; the read just cannot see it yet.
+	globalThis.databases = makeFakeDatabases({ 'node-a': { scope: 'node-a', paused: true } });
+
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-a', paused: null }), {
+		paused: false,
+		source: 'default',
+	});
+});
+
+test('pending resume on a node still inherits a cluster pause', async () => {
+	globalThis.databases = makeFakeDatabases({
+		'all': { scope: 'all', paused: true },
+		'node-a': { scope: 'node-a', paused: false },
+	});
+
+	// Clearing the node override must fall back to the cluster row, not to "running".
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-a', paused: null }), {
+		paused: true,
+		source: 'cluster',
+	});
+});
+
+test('pending pause wins over a stale row that has not appeared yet', async () => {
+	globalThis.databases = makeFakeDatabases({});
+
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-a', paused: true }), {
+		paused: true,
+		source: 'node',
+	});
+});
+
+test('a pending cluster write leaves the node override authoritative', async () => {
+	globalThis.databases = makeFakeDatabases({ 'node-a': { scope: 'node-a', paused: false } });
+
+	// Cluster-wide pause requested, but this node is explicitly pinned to keep running.
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'all', paused: true }), {
+		paused: false,
+		source: 'node',
+	});
+	// A node with no override does take the pending cluster pause.
+	assert.deepEqual(await getDesiredPause('node-b', { scope: 'all', paused: true }), {
+		paused: true,
+		source: 'cluster',
+	});
+});
+
+test('pending for an unrelated scope does not shadow either read', async () => {
+	globalThis.databases = makeFakeDatabases({ all: { scope: 'all', paused: true } });
+
+	assert.deepEqual(await getDesiredPause('node-a', { scope: 'node-z', paused: false }), {
+		paused: true,
+		source: 'cluster',
+	});
+});
