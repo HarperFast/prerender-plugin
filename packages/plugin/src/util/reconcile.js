@@ -96,9 +96,10 @@ export const reconcileSchedules = async ({
 				// `RenderTarget.put` would have written, so a repaired target rejoins the
 				// rotation exactly where it belonged.
 				//
-				// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright,
-				// so coerce before handing it over — `getInitialRenderTime` falls back to the
-				// default interval for anything non-finite.
+				// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright, so
+				// coerce before handing it over. No range check is needed here: the callee guards
+				// `Number.isFinite(interval) && interval > 0`, so a NON-POSITIVE value falls back
+				// to the default too — `Number(null)` is 0, which that guard rejects.
 				nextRenderTime: getInitialRenderTime(cacheKey, Number(target.renderInterval)),
 				fromSitemap: !!target.sitemapUrl,
 			});
@@ -194,7 +195,9 @@ export const runReconcileOnce = async (options) => {
 
 		return lastRun;
 	} catch (e) {
-		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e.message };
+		// `e?.message ?? String(e)` rather than `e.message`: anything can be thrown, and a
+		// null/undefined/string throw would turn the failure record itself into a TypeError.
+		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
 		throw e;
 	} finally {
 		running = false;

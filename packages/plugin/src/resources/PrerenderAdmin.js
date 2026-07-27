@@ -345,7 +345,7 @@ export class PrerenderAdmin extends Resource {
 		try {
 			explanation = explainCacheKey(String(data?.url ?? '').trim(), data?.deviceType);
 		} catch (e) {
-			return json({ error: `Not a valid absolute URL: ${e.message}` }, 400);
+			return json({ error: `Not a valid absolute URL: ${e?.message ?? String(e)}` }, 400);
 		}
 
 		const { cacheKey, canonicalUrl } = explanation.resolved;
@@ -564,7 +564,7 @@ export class PrerenderAdmin extends Resource {
 		try {
 			explanation = explainCacheKey(rawUrl.trim(), data?.deviceType);
 		} catch (e) {
-			return json({ error: `Not a valid absolute URL: ${e.message}` }, 400);
+			return json({ error: `Not a valid absolute URL: ${e?.message ?? String(e)}` }, 400);
 		}
 
 		const { cacheKey, canonicalUrl } = explanation.resolved;
