@@ -94,9 +94,13 @@ export class RenderQueue extends Resource {
 	// Node-scoped pause: this node stops claiming until resumed. Resume CLEARS the node's
 	// override (rather than writing `paused: false`) so it restores the inherited state
 	// instead of silently punching a hole in a deliberate cluster-wide pause.
-	static pause = ({ updatedBy } = {}) => this.setPause({ scope: server.hostname, paused: true, updatedBy });
+	//
+	// Named explicitly rather than via `this` so the binding survives being destructured or
+	// passed as a callback (`const { pause } = RenderQueue`), and so a subclass can't
+	// accidentally redirect it.
+	static pause = ({ updatedBy } = {}) => RenderQueue.setPause({ scope: server.hostname, paused: true, updatedBy });
 
-	static resume = ({ updatedBy } = {}) => this.setPause({ scope: server.hostname, paused: null, updatedBy });
+	static resume = ({ updatedBy } = {}) => RenderQueue.setPause({ scope: server.hostname, paused: null, updatedBy });
 
 	static decodeJobResult(buffer, metadataSize) {
 		const metadataBuffer = buffer.subarray(0, metadataSize);
