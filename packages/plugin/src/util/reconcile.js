@@ -36,111 +36,106 @@ import { fnv1a32 } from './hash.js';
 import { getResidencyByUrl } from './residency.js';
 import { getInitialRenderTime } from './time.js';
 
+// Rows scanned between event-loop yields, so a sweep over a large registry stays background
+// work rather than monopolizing the thread.
+const YIELD_EVERY = 200;
+
 /**
- * Walk targets in primary-key order and restore any missing schedule row for the keys this
- * node owns. All I/O is injected so the traversal, the ownership filter and the caps are
- * testable without a live database.
+ * ONE pass over the targets: find the keys this node owns whose schedule row is missing, then
+ * restore them after the scan has finished. All I/O is injected, so the traversal, the
+ * ownership filter and the cap are testable without a live database.
  *
- * `searchTargets({ cursor, limit })` must return an ARRAY (a drained batch), not a live
- * iterator: writes must never be issued while a search cursor is still open, since that keeps
- * the read transaction open across them and pins the log against reclamation (the same
- * reason `claim` drains before leasing). Paging by primary key is what keeps each read
- * transaction short — a single walk across a million targets would sit open long enough for
- * Harper to complain about it and commit it out from under us.
+ * Deliberately CURSOR-FREE, and therefore indifferent to the order rows arrive in. An earlier
+ * version paged by primary key and resumed from the last key seen, which quietly made
+ * correctness depend on the storage engine returning rows in key order: if that ever stopped
+ * holding, the cursor would skip rows silently — the worst possible failure mode for a repair
+ * tool, in the one place nobody would look. A single pass needs no such guarantee.
+ *
+ * The two phases also make the transaction rule structural rather than a convention to
+ * remember: no write is issued while the scan's cursor is open, because every write happens
+ * after it closes. (Interleaving them would hold the read transaction across the writes and
+ * pin the log against reclamation — the same reason `claim` drains before leasing.)
+ *
+ * The cap bounds WRITES, not scanning: the scan always runs to completion, so `missing` is the
+ * true size of the gap even when only `maxRestores` of it was repaired this pass. That also
+ * means the loop never breaks early, so the iterator is always fully consumed and its read
+ * transaction always released.
  */
 export const reconcileSchedules = async ({
-	searchTargets,
+	streamTargets,
 	getSchedule,
 	putSchedule,
 	ownerOf,
 	hostname,
-	batchSize,
 	maxRestores,
-	onBatch = () => {},
+	onYield = () => {},
 } = {}) => {
-	const stats = { examined: 0, owned: 0, restored: 0, truncated: false, lastKey: null };
-	let cursor = null;
+	const stats = { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false };
+	const toRestore = [];
 
-	for (;;) {
-		const batch = await searchTargets({ cursor, limit: batchSize });
-		if (!batch.length) break;
+	// Phase 1 — read only.
+	for await (const target of streamTargets()) {
+		stats.examined++;
+		if (stats.examined % YIELD_EVERY === 0) await onYield();
 
-		for (const target of batch) {
-			const cacheKey = target.cacheKey;
-			// Advance the cursor for every row, including ones we skip, so a capped or
-			// interrupted run always makes forward progress instead of re-reading its prefix.
-			cursor = cacheKey;
-			stats.examined++;
-			stats.lastKey = cacheKey;
+		const cacheKey = target.cacheKey;
 
-			// Residency is keyed off the URL-half exactly as RenderSchedule's own
-			// `setResidencyById` computes it, so this agrees with where the row actually lives.
-			if (ownerOf(CacheKey.extractUrl(cacheKey)) !== hostname) continue;
-			stats.owned++;
+		// Residency is keyed off the URL-half exactly as RenderSchedule's own
+		// `setResidencyById` computes it, so this agrees with where the row actually lives.
+		if (ownerOf(CacheKey.extractUrl(cacheKey)) !== hostname) continue;
+		stats.owned++;
 
-			if (await getSchedule(cacheKey)) continue;
+		if (await getSchedule(cacheKey)) continue;
+		stats.missing++;
 
-			// A cap on WRITES, not on rows examined: the pathological case is a membership
-			// change stranding a large slice of the keyspace at once, and restoring millions of
-			// rows in a single pass would be its own outage. Report the truncation so a short
-			// count is never mistaken for "all clear".
-			if (stats.restored >= maxRestores) {
-				stats.truncated = true;
-				return stats;
-			}
-
-			await putSchedule(cacheKey, {
-				// The jittered initial time, NOT "now": a repair pass can restore a great many
-				// rows at once, and scheduling them all immediately would replace a silent
-				// outage with a render herd. This is the same value the original
-				// `RenderTarget.put` would have written, so a repaired target rejoins the
-				// rotation exactly where it belonged.
-				//
-				// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright, so
-				// coerce before handing it over. No range check is needed here: the callee guards
-				// `Number.isFinite(interval) && interval > 0`, so a NON-POSITIVE value falls back
-				// to the default too — `Number(null)` is 0, which that guard rejects.
-				nextRenderTime: getInitialRenderTime(cacheKey, Number(target.renderInterval)),
-				fromSitemap: !!target.sitemapUrl,
-			});
-			stats.restored++;
-		}
-
-		await onBatch(stats);
-
-		// A short page means the index walk is done.
-		if (batch.length < batchSize) break;
+		// Past the cap we keep counting but stop collecting, so the gap is measured in full
+		// while the repair stays bounded. A membership change can strand a large slice of the
+		// keyspace at once, and rewriting millions of rows in one pass would be its own outage.
+		if (toRestore.length < maxRestores) toRestore.push(target);
 	}
+
+	// Phase 2 — writes, with the scan's cursor now closed.
+	for (const target of toRestore) {
+		await putSchedule(target.cacheKey, {
+			// The jittered initial time, NOT "now": a repair pass can restore a great many rows at
+			// once, and scheduling them all immediately would replace a silent outage with a
+			// render herd. This is the same value the original `RenderTarget.put` would have
+			// written, so a repaired target rejoins the rotation exactly where it belonged.
+			//
+			// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright, so
+			// coerce before handing it over. No range check is needed here: the callee guards
+			// `Number.isFinite(interval) && interval > 0`, so a NON-POSITIVE value falls back to
+			// the default too — `Number(null)` is 0, which that guard rejects.
+			nextRenderTime: getInitialRenderTime(target.cacheKey, Number(target.renderInterval)),
+			fromSitemap: !!target.sitemapUrl,
+		});
+		stats.restored++;
+	}
+
+	stats.truncated = stats.missing > stats.restored;
 
 	return stats;
 };
 
 /** `reconcileSchedules` bound to the live tables. */
-export const reconcileScheduleGaps = async ({
-	batchSize = config.render.reconcile.batchSize,
-	maxRestores = config.render.reconcile.maxRestores,
-} = {}) => {
+export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconcile.maxRestores } = {}) => {
 	const {
 		render_service: { RenderTarget },
 		render_schedule: { RenderSchedule },
 	} = databases;
 
 	return reconcileSchedules({
-		searchTargets: ({ cursor, limit }) =>
-			Array.fromAsync(
-				RenderTarget.search({
-					// Paging by primary key is an ordinary index walk: Harper injects this exact
-					// condition shape (`greater_than` on the primary key) for any unconstrained
-					// scan, so a cursor is just that scan resumed. The first page passes no
-					// condition and lets Harper inject it.
-					...(cursor === null
-						? {}
-						: { conditions: [{ attribute: 'cacheKey', comparator: 'greater_than', value: cursor }] }),
-					sort: { attribute: 'cacheKey' },
-					select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
-					limit,
-				})
-			),
+		// One unconstrained scan, streamed. No conditions, no `sort`, no `limit`:
+		//   - no `sort`, because asking Harper to sort by the primary key is what broke v0.10.0
+		//     (the primary key is not flagged `indexed`, so a sort on it is rejected unless a
+		//     condition accompanies it — and Harper injects its own scan condition only AFTER
+		//     that check, so the first page threw before scanning anything);
+		//   - no conditions, because with none Harper injects that full-scan condition itself,
+		//     which is exactly what this wants;
+		//   - no `limit`, because the caller streams and never resumes, so it needs no paging.
+		//
+		// Nothing here depends on the order rows arrive in — see `reconcileSchedules`.
+		streamTargets: () => RenderTarget.search({ select: ['cacheKey', 'renderInterval', 'sitemapUrl'] }),
 		// Node-local by construction — see the module comment. Existence is all that matters.
 		getSchedule: (cacheKey) => RenderSchedule.get({ id: cacheKey, select: ['cacheKey'] }, { replicateFrom: false }),
 		// Writes route by residency, so this reaches the owning node even though the read above
@@ -148,10 +143,8 @@ export const reconcileScheduleGaps = async ({
 		putSchedule: (cacheKey, row) => RenderSchedule.put(cacheKey, row),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
-		batchSize,
 		maxRestores,
-		// Yield between pages so a sweep over a large registry stays background work.
-		onBatch: () => setImmediate(),
+		onYield: () => setImmediate(),
 	});
 };
 
@@ -182,9 +175,9 @@ export const runReconcileOnce = async (options) => {
 		// warning rather than an info line. A clean pass says so quietly.
 		if (stats.restored || stats.truncated) {
 			logger.warn(
-				`[prerender] schedule reconcile: restored ${stats.restored} missing schedule row(s) across ${stats.owned} owned target(s) (${stats.examined} examined)` +
+				`[prerender] schedule reconcile: restored ${stats.restored} of ${stats.missing} missing schedule row(s) across ${stats.owned} owned target(s) (${stats.examined} examined)` +
 					(stats.truncated
-						? ` — stopped at the ${config.render.reconcile.maxRestores}-restore cap, more may remain`
+						? ` — ${stats.missing - stats.restored} left for the next sweep by the ${config.render.reconcile.maxRestores}-restore cap`
 						: '')
 			);
 		} else {
