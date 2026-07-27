@@ -25,8 +25,8 @@ const mutex = getMutex('render_queue');
  * this on its own status-sync interval, so a replicated intent write converges everywhere
  * within one `queue.statusSyncInterval`.
  */
-async function syncQueueState(force = false) {
-	const desired = await getDesiredPause(server.hostname);
+async function syncQueueState(force = false, pending = null) {
+	const desired = await getDesiredPause(server.hostname, pending);
 
 	if (desired.paused) {
 		await QueueState.reportStatus('paused');
@@ -84,10 +84,20 @@ export class RenderQueue extends Resource {
 	 * 'all' again). Remote nodes pick the change up on their next status sync.
 	 */
 	static setPause = mutex.withLock(async ({ scope, paused, updatedBy } = {}) => {
-		const intent = await setDesiredPause(scope ?? server.hostname, paused, updatedBy);
+		const target = scope ?? server.hostname;
+		const intent = await setDesiredPause(target, paused, updatedBy);
 		// Re-resolve rather than assuming the write applies here: a cluster-wide pause does
 		// not pause a node carrying an explicit `paused: false` override, and vice versa.
-		const local = await syncQueueState(true);
+		//
+		// The just-written scope is passed as `pending` instead of being re-read: a row
+		// deleted earlier in this request is still visible to a read here, so re-reading it
+		// resolves a resume straight back to "paused" and returns the opposite of what
+		// actually happened. The other scope is read normally — this write didn't touch it.
+		// `intent.paused`, not the raw argument: setDesiredPause normalizes (an absent `paused`
+		// is written as `false`), so threading the raw value could resolve "no opinion" while
+		// the row on disk says `false`. Using what was actually written keeps the resolved
+		// state and the persisted state identical by construction.
+		const local = await syncQueueState(true, { scope: target, paused: intent.paused });
 		return { ...intent, node: server.hostname, local };
 	});
 

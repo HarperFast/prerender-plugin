@@ -208,7 +208,9 @@ async function buildNodeList(now) {
 				: null,
 		// Scopes a control write is allowed to name, so a typo can't create a row that
 		// silently never applies to anything.
-		knownScopes: [CLUSTER_SCOPE, ...new Set([...statuses.map((r) => r.hostname), ...controlByScope.keys()])].filter(
+		// CLUSTER_SCOPE goes INSIDE the Set: a cluster control row also appears in
+		// controlByScope, so prepending it outside listed "all" twice.
+		knownScopes: [...new Set([CLUSTER_SCOPE, ...statuses.map((r) => r.hostname), ...controlByScope.keys()])].filter(
 			Boolean
 		),
 	};
