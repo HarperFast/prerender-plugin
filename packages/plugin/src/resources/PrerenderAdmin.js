@@ -27,6 +27,7 @@ import { config, collectConfigWarnings } from '../config.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
+import { getResidencyByUrl } from '../util/residency.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { HOUR } from '../util/time.js';
@@ -50,6 +51,35 @@ const nodeStaleAfter = () => config.queue.statusSyncInterval * 2;
 const FAILED_LOGIN_DELAY_MS = 300;
 
 const HISTOGRAM_HOURS = 24;
+
+// Ceiling on any single row read behind the URL explainer. A status view must never hang on
+// a slow or unreachable peer; a missing field with `degraded` set is a far better answer than
+// a request that never returns.
+const READ_TIMEOUT_MS = 3000;
+
+/**
+ * Run a read with a deadline. On timeout the field comes back null and `label` is recorded in
+ * `timedOut`, so the response can say which parts are unreliable rather than silently
+ * presenting an absent row as a confirmed absence.
+ */
+async function readWithTimeout(label, timedOut, read) {
+	let timer;
+	try {
+		return await Promise.race([
+			read(),
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`${label} read timed out`)), READ_TIMEOUT_MS);
+				timer.unref?.();
+			}),
+		]);
+	} catch (e) {
+		logger.warn?.(`[prerender] admin explain: ${label} read failed or timed out: ${e.message}`);
+		timedOut.push(label);
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 const noStore = (extra = {}) => ({ 'cache-control': 'no-store', ...extra });
 
@@ -382,25 +412,53 @@ export class PrerenderAdmin extends Resource {
 			return json({ error: `Not a valid absolute URL: ${e.message}` }, 400);
 		}
 
-		const { cacheKey } = explanation.resolved;
+		const { cacheKey, canonicalUrl } = explanation.resolved;
+
+		// RenderSchedule is residency-pinned (`setResidencyById`), so a plain `get` for a row
+		// owned by another node performs a REMOTE fetch (`sourceLoad`) — see Harper's
+		// `Table.ts` loadLocalRecord, gated on `context.replicateFrom !== false`. With
+		// rendezvous hashing across N nodes, roughly (N-1)/N of all URLs are owned elsewhere,
+		// so on a real cluster that made this endpoint hang for almost every URL. Every other
+		// RenderSchedule read in this plugin already passes `replicateFrom: false` for the same
+		// reason; this one did not.
+		//
+		// Reading node-locally means the row may simply be absent here rather than missing, so
+		// the response reports which node owns it and whether this read was authoritative —
+		// otherwise "not scheduled" would be indistinguishable from "not scheduled HERE".
+		const scheduleOwnedBy = getResidencyByUrl(canonicalUrl);
+		const scheduleReadIsAuthoritative = scheduleOwnedBy === server.hostname;
+
+		// Nothing in a status view justifies hanging the request. Any read that stalls is
+		// reported as degraded instead, so a slow or unreachable peer costs a field rather than
+		// the whole page.
+		const timedOutReads = [];
 
 		// Read every row that decides this URL's fate. The page body is deliberately NOT
 		// selected — this is a status view, and a cached page can be megabytes.
 		const [target, schedule, page, suppressed] = await Promise.all([
-			RenderTarget.get({
-				id: cacheKey,
-				select: ['cacheKey', 'url', 'deviceType', 'sitemapUrl', 'schedulerNode', 'renderInterval'],
-			}),
-			RenderSchedule.get({ id: cacheKey, select: ['cacheKey', 'nextRenderTime', 'fromSitemap'] }),
-			PrerenderedPage.get({
-				id: cacheKey,
-				select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
-			}),
+			readWithTimeout('renderTarget', timedOutReads, () =>
+				RenderTarget.get({
+					id: cacheKey,
+					select: ['cacheKey', 'url', 'deviceType', 'sitemapUrl', 'schedulerNode', 'renderInterval'],
+				})
+			),
+			readWithTimeout('renderSchedule', timedOutReads, () =>
+				RenderSchedule.get(
+					{ id: cacheKey, select: ['cacheKey', 'nextRenderTime', 'fromSitemap'] },
+					{ replicateFrom: false }
+				)
+			),
+			readWithTimeout('prerenderedPage', timedOutReads, () =>
+				PrerenderedPage.get({
+					id: cacheKey,
+					select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
+				})
+			),
 			// Array select, like the three above: a string select would return the bare url
 			// string instead of a record. Only existence matters here, so a scalar would still
 			// have worked — but keeping the projection uniform avoids the next reader assuming
 			// a record and reaching for `.url` on a string.
-			NonIndexable.get({ id: explanation.resolved.canonicalUrl, select: ['url'] }),
+			readWithTimeout('nonIndexable', timedOutReads, () => NonIndexable.get({ id: canonicalUrl, select: ['url'] })),
 		]);
 
 		const now = Date.now();
@@ -441,12 +499,23 @@ export class PrerenderAdmin extends Resource {
 			verdict: {
 				// What a bot request for this URL would get right now.
 				wouldServe: fresh ? 'cache' : 'origin-or-render',
+				// Only meaningful when the schedule read was authoritative — see `residency`.
 				scheduled: !!schedule,
 				recurring: !!target,
 				// A NonIndexable row blocks re-discovery for the table's expiration window, so
 				// a URL can be absent from rotation with no target and no obvious reason why.
 				suppressedByNonIndexable: !!suppressed,
 			},
+			residency: {
+				queriedNode: server.hostname,
+				// RenderSchedule rows are pinned to the node that owns the URL, and this endpoint
+				// reads node-locally to avoid a cross-node fetch. On any other node the row is
+				// expected to be absent, so `scheduled: false` there means "not scheduled HERE",
+				// not "not scheduled".
+				scheduleOwnedBy,
+				scheduleReadIsAuthoritative,
+			},
+			degraded: timedOutReads.length ? { timedOutReads } : null,
 			checkedAt: now,
 		});
 	}
