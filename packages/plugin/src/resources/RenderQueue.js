@@ -6,6 +6,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { queryAllowlistFor } from '../util/ingress.js';
 import { RenderTarget } from './RenderTarget.js';
+import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
 const port = protocol === 'https' ? server.config.http.securePort || server.config.http.port : server.config.http.port;
@@ -14,32 +15,60 @@ const { RenderSchedule } = databases.render_schedule;
 
 const mutex = getMutex('render_queue');
 
+/**
+ * Resolve this node's desired pause intent from the replicated `QueueControl` table and
+ * store it into the node-local queue flag; when not paused, recompute empty/queued from
+ * the backlog as before. Caller must hold `mutex`.
+ *
+ * This is what makes pause/resume work cluster-wide: `claim` reads a non-replicated,
+ * node-local flag, so a remote node can't be addressed directly — but every node runs
+ * this on its own status-sync interval, so a replicated intent write converges everywhere
+ * within one `queue.statusSyncInterval`.
+ */
+async function syncQueueState(force = false) {
+	const desired = await getDesiredPause(server.hostname);
+
+	if (desired.paused) {
+		await QueueState.reportStatus('paused');
+		return { status: 'paused', ...desired };
+	}
+
+	// The intent says "run". If the local flag still holds `paused`, the report must be
+	// forced: reportStatus's non-forced path is a compareExchange between empty<->queued,
+	// which by design cannot move a flag currently holding `paused`.
+	const liftingPause = QueueState.status === 'paused';
+
+	const now = currentMinuteMs();
+
+	const [existingId] = await Array.fromAsync(
+		RenderSchedule.search(
+			{
+				conditions: [
+					{
+						attribute: 'nextRenderTime',
+						comparator: 'less_than_equal',
+						value: now,
+					},
+				],
+				select: 'cacheKey',
+				limit: 1,
+			},
+			{ replicateFrom: false }
+		)
+	);
+
+	const status = existingId ? 'queued' : 'empty';
+	await QueueState.reportStatus(status, force || liftingPause);
+	return { status, ...desired };
+}
+
 export class RenderQueue extends Resource {
 	static loadAsInstance = false;
 
 	static refreshQueueStatus = async (force = false) => {
 		await mutex.lock();
 		try {
-			const now = currentMinuteMs();
-
-			const [existingId] = await Array.fromAsync(
-				RenderSchedule.search(
-					{
-						conditions: [
-							{
-								attribute: 'nextRenderTime',
-								comparator: 'less_than_equal',
-								value: now,
-							},
-						],
-						select: 'cacheKey',
-						limit: 1,
-					},
-					{ replicateFrom: false }
-				)
-			);
-
-			await QueueState.reportStatus(existingId ? 'queued' : 'empty', force);
+			return await syncQueueState(force);
 		} catch (e) {
 			logger.error(e);
 		} finally {
@@ -47,9 +76,31 @@ export class RenderQueue extends Resource {
 		}
 	};
 
-	static pause = mutex.withLock(() => QueueState.reportStatus('paused'));
+	/**
+	 * Record a pause intent and immediately re-resolve it for this node.
+	 *
+	 * `scope` is a hostname (per-node override) or 'all' (cluster-wide default); `paused`
+	 * is true, false (explicitly run), or null (delete the row — for a node scope, inherit
+	 * 'all' again). Remote nodes pick the change up on their next status sync.
+	 */
+	static setPause = mutex.withLock(async ({ scope, paused, updatedBy } = {}) => {
+		const intent = await setDesiredPause(scope ?? server.hostname, paused, updatedBy);
+		// Re-resolve rather than assuming the write applies here: a cluster-wide pause does
+		// not pause a node carrying an explicit `paused: false` override, and vice versa.
+		const local = await syncQueueState(true);
+		return { ...intent, node: server.hostname, local };
+	});
 
-	static resume = () => this.refreshQueueStatus(true);
+	// Node-scoped pause: this node stops claiming until resumed. Resume CLEARS the node's
+	// override (rather than writing `paused: false`) so it restores the inherited state
+	// instead of silently punching a hole in a deliberate cluster-wide pause.
+	//
+	// Named explicitly rather than via `this` so the binding survives being destructured or
+	// passed as a callback (`const { pause } = RenderQueue`), and so a subclass can't
+	// accidentally redirect it.
+	static pause = ({ updatedBy } = {}) => RenderQueue.setPause({ scope: server.hostname, paused: true, updatedBy });
+
+	static resume = ({ updatedBy } = {}) => RenderQueue.setPause({ scope: server.hostname, paused: null, updatedBy });
 
 	static decodeJobResult(buffer, metadataSize) {
 		const metadataBuffer = buffer.subarray(0, metadataSize);
@@ -258,10 +309,14 @@ export class RenderQueue extends Resource {
 	async post(target, data) {
 		const ctx = this.getContext();
 		switch (target.id) {
+			// Deliberately node-scoped: this resource sets `loadAsInstance = false`, which
+			// skips Harper's allow* permission checks (see Resource.ts), so it must not be
+			// able to pause the whole cluster. Cluster-scoped control lives on the
+			// super-user-gated admin resource.
 			case 'pause':
-				return RenderQueue.pause();
+				return RenderQueue.pause({ updatedBy: ctx?.user?.username ?? 'render_queue-api' });
 			case 'resume':
-				return RenderQueue.resume();
+				return RenderQueue.resume({ updatedBy: ctx?.user?.username ?? 'render_queue-api' });
 			case 'claim':
 				return RenderQueue.claim(data, ctx);
 			case 'job_result':

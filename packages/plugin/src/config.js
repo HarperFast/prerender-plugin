@@ -161,6 +161,21 @@ const defaultConfig = () => ({
 		fallback: 'origin',
 	},
 
+	// Management API + UI, served at the fixed path `/prerender_admin` (resource endpoint
+	// names are fixed, like the database/table names). Gated on Harper's own
+	// authentication: every endpoint except the login/session/page routes requires a
+	// `super_user`, checked explicitly in the resource — this plugin's resources set
+	// `loadAsInstance = false`, which skips Harper's implicit allow* checks, so the gate is
+	// written out rather than inherited.
+	management: {
+		enabled: true,
+		// Ceiling on rows touched by an overview scan (due-count, next-24h histogram).
+		// Counting is a capped index walk — at 1M+ targets an uncapped count is not a
+		// page-load query — so results past this are reported as truncated rather than
+		// silently undercounted.
+		scanCap: 20000,
+	},
+
 	page: {
 		ttl: DAY, // default cached-page TTL
 		minTtl: 6 * HOUR, // floor for sitemap-derived TTLs
@@ -345,37 +360,65 @@ const resolveSecretsFromEnv = () => {
 	}
 };
 
-const warnOnRiskyConfig = () => {
-	const log = getLogger();
+/**
+ * Collect the risky-configuration findings for the live config as structured data, so the
+ * same list can be logged at config-apply time AND surfaced by the management API (these
+ * used to exist only as log lines, where nobody sees them until something is already
+ * wrong). `severity` is 'warn' for a misconfiguration and 'info' for a
+ * dangerous-but-deliberate mode that is worth showing prominently.
+ */
+export const collectConfigWarnings = () => {
+	const findings = [];
+	const add = (severity, key, message) => findings.push({ severity, key, message });
+
 	if (!config.securityToken.value) {
-		log.warn?.('[prerender] securityToken.value is empty — the origin cannot authenticate prerender requests');
+		add(
+			'warn',
+			'securityToken.value',
+			'securityToken.value is empty — the origin cannot authenticate prerender requests'
+		);
 	}
 	if (config.domains.length === 0) {
-		log.warn?.('[prerender] domains allowlist is empty — all hosts will be treated as indexable');
+		add('warn', 'domains', 'domains allowlist is empty — all hosts will be treated as indexable');
 	}
 	if (config.staging.ip) {
-		// Mirror stagingTargetIp's gate (ip AND header AND valid ip) so the warning never
+		// Mirror stagingTargetIp's gate (ip AND header AND valid ip) so the finding never
 		// claims the feature is on when it is actually disabled.
 		if (!config.staging.header) {
-			log.warn?.('[prerender] staging.ip is set but staging.header is empty — staging passthrough is disabled');
+			add('warn', 'staging.header', 'staging.ip is set but staging.header is empty — staging passthrough is disabled');
 		} else if (isIP(config.staging.ip)) {
-			log.warn?.(
-				`[prerender] staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved)`
+			add(
+				'info',
+				'staging.ip',
+				`staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved). Toggling this on/off contaminates the URL-keyed page cache; wipe it when switching.`
 			);
 		} else {
-			log.warn?.(
-				`[prerender] staging.ip "${config.staging.ip}" is not a valid IP address — staging passthrough is disabled`
+			add(
+				'warn',
+				'staging.ip',
+				`staging.ip "${config.staging.ip}" is not a valid IP address — staging passthrough is disabled`
 			);
 		}
 	}
 	if (config.renderNow.enabled) {
 		if (!config.renderNow.header) {
-			log.warn?.('[prerender] renderNow.enabled but renderNow.header is empty — on-demand render is disabled');
+			add('warn', 'renderNow.header', 'renderNow.enabled but renderNow.header is empty — on-demand render is disabled');
 		} else if (!config.renderNow.token) {
-			log.warn?.(
-				`[prerender] renderNow ENABLED WITHOUT A TOKEN — any client sending "${config.renderNow.header}" can force cache/origin-bypassing renders (DoS risk); set renderNow.token or renderNow.valueEnv`
+			add(
+				'warn',
+				'renderNow.token',
+				`renderNow ENABLED WITHOUT A TOKEN — any client sending "${config.renderNow.header}" can force cache/origin-bypassing renders (DoS risk); set renderNow.token or renderNow.valueEnv`
 			);
 		}
+	}
+
+	return findings;
+};
+
+const warnOnRiskyConfig = () => {
+	const log = getLogger();
+	for (const { message } of collectConfigWarnings()) {
+		log.warn?.(`[prerender] ${message}`);
 	}
 };
 
