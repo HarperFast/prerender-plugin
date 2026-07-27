@@ -394,7 +394,11 @@ export class PrerenderAdmin extends Resource {
 				id: cacheKey,
 				select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
 			}),
-			NonIndexable.get({ id: explanation.resolved.canonicalUrl, select: 'url' }),
+			// Array select, like the three above: a string select would return the bare url
+			// string instead of a record. Only existence matters here, so a scalar would still
+			// have worked — but keeping the projection uniform avoids the next reader assuming
+			// a record and reaching for `.url` on a string.
+			NonIndexable.get({ id: explanation.resolved.canonicalUrl, select: ['url'] }),
 		]);
 
 		const now = Date.now();

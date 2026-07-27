@@ -47,9 +47,15 @@ export const resolveDesiredPause = (nodeControl, clusterControl) => {
 export const getDesiredPause = async (hostname) => {
 	const { QueueControl } = databases.render_service;
 
+	// `select` MUST be an array here. A string `select` projects to the bare scalar rather
+	// than a record (cf. `RenderTarget.getRenderInterval`, which relies on exactly that), so
+	// `select: 'paused'` returns the boolean itself — and `resolveDesiredPause` reading
+	// `.paused` off a boolean gets undefined, silently treats it as "no opinion", and every
+	// pause resolves to "not paused". That failure is invisible: the row is written and shows
+	// up in the UI, but no node ever acts on it.
 	const [nodeControl, clusterControl] = await Promise.all([
-		QueueControl.get({ id: hostname, select: 'paused' }),
-		QueueControl.get({ id: CLUSTER_SCOPE, select: 'paused' }),
+		QueueControl.get({ id: hostname, select: ['paused'] }),
+		QueueControl.get({ id: CLUSTER_SCOPE, select: ['paused'] }),
 	]);
 
 	return resolveDesiredPause(nodeControl, clusterControl);
