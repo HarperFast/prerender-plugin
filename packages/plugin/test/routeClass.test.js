@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
 import {
 	classifyPath,
+	classifyUrl,
 	matchRoute,
 	prerenderRouteCount,
 	queryAllowlistFor,
@@ -166,4 +167,27 @@ test('tolerates junk in excludePathPatterns without breaking route matching', ()
 test('tolerates a non-array routes value', () => {
 	forwarded({ ingress: { routes: 'not-an-array' } });
 	assert.equal(classifyPath('/anything').routeClass, UNCLASSIFIED);
+});
+
+test('classifyUrl classifies a whole URL the same way classifyPath does its path', () => {
+	forwarded({ excludePathPatterns: ['/search/'] });
+	for (const path of ['/', '/catalog/girls.jsp', '/help/contact-us', '/catalog/search/x']) {
+		const byUrl = classifyUrl(`https://www.example.com${path}?a=1`);
+		const byPath = classifyPath(path);
+		assert.equal(byUrl.routeClass, byPath.routeClass, `class disagreement for ${path}`);
+		assert.deepEqual(byUrl.queryParams, byPath.queryParams, `allowlist disagreement for ${path}`);
+	}
+});
+
+test('classifyUrl reports an unparseable URL as unclassified, keeping all params', () => {
+	forwarded();
+	const result = classifyUrl('not-a-url');
+	assert.equal(result.routeClass, UNCLASSIFIED);
+	assert.deepEqual(result.queryParams, ['*']);
+	assert.equal(result.entry, null);
+});
+
+test('classifyUrl on an unparseable URL still yields the global allowlist in prefix mode', () => {
+	applyOptions({});
+	assert.deepEqual(classifyUrl('not-a-url').queryParams, config.url.queryParams);
 });

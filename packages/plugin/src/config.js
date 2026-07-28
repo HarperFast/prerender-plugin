@@ -251,6 +251,13 @@ const defaultConfig = () => ({
 	sitemap: {
 		refreshTime: '12:00', // local time-of-day for the daily sitemap refresh
 		timezone: 'America/New_York',
+		// A sitemap lists every indexable URL on the site, which is routinely a superset of the
+		// paths the CDN forwards here — so entries that are not a prerender route are counted and
+		// dropped rather than scheduled. Past this share of one sitemap, that is reported as an
+		// ERROR instead of an info line: filtering most of a sitemap is far more likely to mean
+		// `ingress.routes` is incomplete than that the sitemap is wrong, and a silent filter looks
+		// exactly like a healthy refresh.
+		filteredWarnPercent: 50,
 		// Pin the periodic sitemap refresh to one node + worker. Empty `node`
 		// disables the scheduled refresh entirely (manual refresh still works).
 		node: '',
