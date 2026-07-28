@@ -1,7 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
-import { isRenderNowAuthorized, wantsCacheSkip, resolveMissMode, pollForFreshRender } from '../src/util/renderNow.js';
+import {
+	isRenderNowAuthorized,
+	wantsCacheSkip,
+	resolveMissMode,
+	pollForFreshRender,
+	resolveServingPolicy,
+} from '../src/util/renderNow.js';
+import { PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../src/util/routeClass.js';
 
 // Minimal stand-in for request headers (only `.get` is used). `values` maps
 // header name -> value; a missing name returns null (Harper/Headers semantics).
@@ -156,4 +163,45 @@ test('pollForFreshRender returns null on timeout when the page is missing', asyn
 		now,
 	});
 	assert.equal(page, null);
+});
+
+// --- resolveServingPolicy: how the route class interacts with the on-demand levers ---
+
+const authorizedOnDemand = () =>
+	applyOptions({ renderNow: { enabled: true, token: 'secret', defaultMissMode: 'prerender' } });
+
+test('resolveServingPolicy: a prerender path gets both on-demand levers', () => {
+	authorizedOnDemand();
+	const policy = resolveServingPolicy(
+		PRERENDER,
+		'GET',
+		headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' })
+	);
+	assert.deepEqual(policy, { skipCache: true, missMode: 'prerender' });
+});
+
+test('resolveServingPolicy: a non-prerender path never skips the cache or forces a render', () => {
+	// The cache is still READ for these classes — that happens in the handler, and skipCache
+	// false is what keeps it happening. What a non-prerender path cannot do is bypass the cache
+	// or force a render for a URL that would never be stored.
+	authorizedOnDemand();
+	const headers = headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' });
+	for (const routeClass of [PASSTHROUGH, UNCLASSIFIED]) {
+		assert.deepEqual(resolveServingPolicy(routeClass, 'GET', headers), { skipCache: false, missMode: 'origin' });
+	}
+});
+
+test('resolveServingPolicy: the levers need an authorized GET', () => {
+	authorizedOnDemand();
+	const headers = headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' });
+	assert.deepEqual(resolveServingPolicy(PRERENDER, 'HEAD', headers), { skipCache: false, missMode: 'origin' });
+
+	const unauthorized = headersWith({ 'x-harper-render-now': 'wrong', 'cache-control': 'no-cache' });
+	assert.deepEqual(resolveServingPolicy(PRERENDER, 'GET', unauthorized), { skipCache: false, missMode: 'origin' });
+});
+
+test('resolveServingPolicy: an authorized GET without Cache-Control still warms on demand', () => {
+	authorizedOnDemand();
+	const policy = resolveServingPolicy(PRERENDER, 'GET', headersWith({ 'x-harper-render-now': 'secret' }));
+	assert.deepEqual(policy, { skipCache: false, missMode: 'prerender' });
 });

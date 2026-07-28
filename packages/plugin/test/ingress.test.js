@@ -1,12 +1,16 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { isForwardedMode, matchRoute, resolveForwardedRequest } from '../src/util/ingress.js';
+import { resolveForwardedRequest } from '../src/util/ingress.js';
+import { isForwardedMode, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../src/util/routeClass.js';
 
+// Route matching and classification are covered in routeClass.test.js; this file covers
+// turning a forwarded request into a target.
 const ROUTES = [
 	{ match: 'exact', path: '/', queryParams: [] },
 	{ match: 'prefix', path: '/catalog/', queryParams: ['CN'] },
 	{ match: 'prefix', path: '/product/prd-', queryParams: [] },
+	{ match: 'prefix', path: '/orders/', mode: 'passthrough' },
 ];
 
 // Minimal stand-in for a Harper request: a case-insensitive `headers.get` and a
@@ -25,35 +29,13 @@ test('isForwardedMode reflects the configured mode', () => {
 	assert.equal(isForwardedMode(), false);
 });
 
-test('matchRoute honors exact vs prefix and first-match order', () => {
-	assert.equal(matchRoute('/').path, '/');
-	assert.equal(matchRoute('/catalog/girls.jsp').path, '/catalog/');
-	assert.equal(matchRoute('/product/prd-1/x').path, '/product/prd-');
-	assert.equal(matchRoute('/product/other'), null); // prd- prefix required
-	assert.equal(matchRoute('/render_queue'), null); // plugin API endpoints fall through
-});
-
-test('compiles away malformed routes', () => {
-	applyOptions({
-		ingress: {
-			mode: 'forwarded',
-			routes: [
-				{ match: 'prefix', path: '/ok/', queryParams: [] },
-				{ match: 'nope', path: '/bad/' }, // invalid match
-				{ match: 'exact', path: 'no-slash' }, // path must start with /
-			],
-		},
-	});
-	assert.equal(matchRoute('/ok/x').path, '/ok/');
-	assert.equal(matchRoute('no-slash'), null);
-});
-
 test('reconstructs the absolute URL and reads the device from the path', () => {
 	const req = mockRequest('/mobile/product/prd-1107/lee.jsp', { 'x-forwarded-host': 'www.example.com' });
 	const res = resolveForwardedRequest(req);
 	assert.equal(res.deviceType, 'mobile');
 	assert.equal(res.url.href, 'https://www.example.com/product/prd-1107/lee.jsp');
 	assert.equal(res.route.path, '/product/prd-');
+	assert.equal(res.routeClass, PRERENDER);
 });
 
 test('applies the per-route query allowlist (catalog keeps only CN)', () => {
@@ -82,32 +64,43 @@ test('returns null (skips) a path-mode request with no device prefix', () => {
 	assert.equal(resolveForwardedRequest(req), null);
 });
 
-test('path-mode request with a device prefix but no matching route resolves as noCache, keeping all query params', () => {
-	// the device prefix identifies it as CDN-forwarded bot traffic; a route the CDN
-	// forwarded but we haven't configured must not be dropped, only logged — and it is
-	// flagged noCache with every query param preserved so the handler just proxies it
+test('a device-prefixed path matching no route is unclassified, and keeps all query params', () => {
+	// the device prefix identifies it as CDN-forwarded bot traffic; a path the CDN forwarded
+	// but we haven't declared must not be dropped, only counted — and every query param is
+	// preserved so the handler proxies exactly what the visitor asked for
 	const req = mockRequest('/mobile/help/contact-us?ref=nav&utm=x', { 'x-forwarded-host': 'www.example.com' });
 	const res = resolveForwardedRequest(req);
 	assert.notEqual(res, null);
 	assert.equal(res.deviceType, 'mobile');
 	assert.equal(res.route, null);
-	assert.equal(res.noCache, true);
+	assert.equal(res.routeClass, UNCLASSIFIED);
 	assert.equal(res.url.pathname, '/help/contact-us');
 	assert.equal(res.url.searchParams.get('ref'), 'nav');
 	assert.equal(res.url.searchParams.get('utm'), 'x');
 });
 
-test('a matched route resolves with noCache false', () => {
-	const req = mockRequest('/mobile/product/prd-1107/lee.jsp', { 'x-forwarded-host': 'www.example.com' });
-	assert.equal(resolveForwardedRequest(req).noCache, false);
+test('a passthrough route resolves for proxying, keeping all query params', () => {
+	const req = mockRequest('/desktop/orders/history?id=123&page=4', { 'x-forwarded-host': 'www.example.com' });
+	const res = resolveForwardedRequest(req);
+	assert.equal(res.routeClass, PASSTHROUGH);
+	assert.equal(res.route.path, '/orders/');
+	// Nothing is stripped: a passthrough request reaches the origin as the visitor sent it.
+	assert.equal(res.url.searchParams.get('id'), '123');
+	assert.equal(res.url.searchParams.get('page'), '4');
 });
 
-test('header-mode request with no matching route falls through (returns null)', () => {
-	// no device prefix to distinguish bot traffic from the plugin's own API endpoints,
-	// so route match remains the gate in header mode
+test('header-mode: an unclassified path falls through, but a passthrough route proxies', () => {
+	// No device prefix to distinguish bot traffic from the plugin's own API endpoints, so an
+	// unclassified path must fall through to them — which makes a passthrough route the only
+	// way to proxy a non-prerendered path in this mode.
 	applyOptions({ ingress: { mode: 'forwarded', deviceTypeSource: 'header', routes: ROUTES } });
-	const req = mockRequest('/render_queue', { 'x-forwarded-host': 'www.example.com', 'x-device-type': 'tablet' });
-	assert.equal(resolveForwardedRequest(req), null);
+	const headers = { 'x-forwarded-host': 'www.example.com', 'x-device-type': 'tablet' };
+
+	assert.equal(resolveForwardedRequest(mockRequest('/render_queue', headers)), null);
+
+	const proxied = resolveForwardedRequest(mockRequest('/orders/history', headers));
+	assert.equal(proxied.routeClass, PASSTHROUGH);
+	assert.equal(proxied.deviceType, 'tablet');
 });
 
 test('returns null when the forwarded host is missing or unsafe', () => {

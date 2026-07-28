@@ -106,7 +106,8 @@ test('applyDebugHeaders emits x-harper-* from the resource and info', () => {
 		source: 'origin',
 		cacheKey: 'https://x/|mobile',
 		url: 'https://x/',
-		route: { match: 'prefix', path: '/catalog/', queryParams: ['CN'] },
+		routeClass: 'prerender',
+		route: { match: 'prefix', path: '/catalog/', mode: 'prerender', queryParams: ['CN'], source: 'ingress.routes' },
 	};
 	applyDebugHeaders(headers, mockRequest(), resource, info);
 	assert.equal(headers.get('x-harper-device-type'), 'mobile');
@@ -114,8 +115,17 @@ test('applyDebugHeaders emits x-harper-* from the resource and info', () => {
 	assert.equal(headers.get('x-harper-source'), 'origin');
 	assert.equal(headers.get('x-harper-cache-key'), 'https://x/|mobile');
 	assert.equal(headers.get('x-harper-url'), 'https://x/');
-	assert.equal(headers.get('x-harper-route'), 'prefix /catalog/ [CN]');
+	assert.equal(headers.get('x-harper-route-class'), 'prerender');
+	assert.equal(headers.get('x-harper-route'), 'prefix /catalog/ [CN] prerender (ingress.routes)');
 	assert.equal(headers.get('x-harper-indexable'), 'true');
+});
+
+test('applyDebugHeaders emits the route class even with no matched route', () => {
+	// The unclassified case is exactly the one worth seeing in a response header.
+	const headers = new Headers();
+	applyDebugHeaders(headers, mockRequest(), { cacheKey: 'https://x/|mobile' }, { routeClass: 'unclassified' });
+	assert.equal(headers.get('x-harper-route-class'), 'unclassified');
+	assert.equal(headers.get('x-harper-route'), null);
 });
 
 test('applyDebugHeaders falls back to the cache-key device type', () => {

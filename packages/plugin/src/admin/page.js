@@ -704,10 +704,11 @@ const PAGE = `<title>Prerender Admin</title>
 				'permanent cache miss — check that the route is present and ordered correctly.'
 			]));
 		}
-		if (data.ingress.matchedRoute === false) {
+		if (data.ingress.routeClass === 'unclassified') {
 			notes.push(el('div', { cls: 'note' }, [
-				'No ingress route matched this path, so all query params are kept and the page is proxied ' +
-				'but never cached. Add a route for it if it should be prerendered.'
+				'No route matched this path, so all query params are kept and the page is proxied but never ' +
+				'cached. Either add a prerender route for it, declare it as a passthrough route if it is ' +
+				'deliberately not prerendered, or stop the CDN forwarding it here.'
 			]));
 		}
 		if (data.verdict.suppressedByNonIndexable) {
@@ -717,10 +718,12 @@ const PAGE = `<title>Prerender Admin</title>
 				'page is silently out of SEO rotation.'
 			]));
 		}
-		if (data.eligibility.excluded) {
+		if (data.ingress.routeClass === 'passthrough') {
 			notes.push(el('div', { cls: 'note' }, [
-				'Matches excludePathPatterns (' + data.eligibility.excludedBy.join(', ') +
-				') — proxied, never scheduled for rendering.'
+				data.eligibility.excludedByPattern
+					? 'Matches excludePathPatterns (' + data.eligibility.excludedByPattern +
+						') — proxied live, never scheduled for rendering.'
+					: 'Declared as a passthrough route — proxied live and deliberately never prerendered.'
 			]));
 		}
 		if (!data.eligibility.domainAllowed) {
@@ -774,12 +777,19 @@ const PAGE = `<title>Prerender Admin</title>
 					['Canonical URL', el('code', { text: data.resolved.canonicalUrl })],
 					['Device type', data.resolved.deviceType],
 					['Ingress mode', data.ingress.mode],
+					['Route class', el('span', null, [
+						el('code', { text: data.ingress.routeClass }),
+						el('span', { cls: 'muted', text: data.eligibility.prerendered ? '  cached + scheduled' : '  proxied live, never cached' })
+					])],
 					['Query allowlist', el('span', null, [
 						el('code', { text: '[' + data.allowlist.used.join(', ') + ']' }),
 						el('span', { cls: 'muted', text: '  ' + data.allowlist.source })
 					])],
 					data.ingress.route
-						? ['Matched route', el('code', { text: data.ingress.route.match + ' ' + data.ingress.route.path })]
+						? ['Matched route', el('span', null, [
+							el('code', { text: data.ingress.route.match + ' ' + data.ingress.route.path }),
+							el('span', { cls: 'muted', text: '  ' + data.ingress.route.source })
+						])]
 						: null
 				])
 			])),

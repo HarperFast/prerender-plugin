@@ -27,8 +27,10 @@ test('forwarded mode resolves the allowlist from the matched route', () => {
 
 	const out = explainCacheKey('https://www.example.com/catalog/girls.jsp?CN=a&utm=x&page=2', 'desktop');
 
-	assert.equal(out.ingress.matchedRoute, true);
+	assert.equal(out.ingress.routeClass, 'prerender');
+	assert.equal(out.eligibility.prerendered, true);
 	assert.equal(out.ingress.route.path, '/catalog/');
+	assert.equal(out.ingress.route.source, 'ingress.routes');
 	assert.deepEqual(out.allowlist.used, ['CN']);
 	assert.equal(out.resolved.canonicalUrl, 'https://www.example.com/catalog/girls.jsp?CN=a');
 	// The global allowlist keeps `page` instead of `CN`, so the keys diverge — this flag is
@@ -42,7 +44,9 @@ test('an unmatched forwarded path keeps every param and says so', () => {
 
 	const out = explainCacheKey('https://www.example.com/nope?b=2&a=1');
 
-	assert.equal(out.ingress.matchedRoute, false);
+	assert.equal(out.ingress.routeClass, 'unclassified');
+	assert.equal(out.eligibility.prerendered, false);
+	assert.equal(out.ingress.route, null);
 	assert.deepEqual(out.allowlist.used, ['*']);
 	// '*' keeps params but still sorts them, so the key stays stable.
 	assert.equal(out.resolved.canonicalUrl, 'https://www.example.com/nope?a=1&b=2');
@@ -63,14 +67,34 @@ test('a case-only device difference is normalization, not a fallback', () => {
 test('exclude patterns and the domain allowlist are reported', () => {
 	applyOptions({ domains: ['www.example.com'], excludePathPatterns: ['/search/'] });
 
+	// An excluded path now reports as passthrough, and names the config key it came from —
+	// `excludePathPatterns`, not a route someone wrote — since that is what to go and change.
 	const excluded = explainCacheKey('https://www.example.com/search/q?x=1');
-	assert.equal(excluded.eligibility.excluded, true);
-	assert.deepEqual(excluded.eligibility.excludedBy, ['/search/']);
+	assert.equal(excluded.ingress.routeClass, 'passthrough');
+	assert.equal(excluded.eligibility.prerendered, false);
+	assert.equal(excluded.eligibility.excludedByPattern, '/search/');
 	assert.equal(excluded.eligibility.domainAllowed, true);
 
 	const offHost = explainCacheKey('https://other.example.org/a');
 	assert.equal(offHost.eligibility.domainAllowed, false);
-	assert.equal(offHost.eligibility.excluded, false);
+	assert.equal(offHost.eligibility.excludedByPattern, null);
+	// Prefix mode: anything not excluded is prerenderable.
+	assert.equal(offHost.ingress.routeClass, 'prerender');
+});
+
+test('a passthrough route is reported as deliberate, with no exclude pattern to blame', () => {
+	applyOptions({
+		ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/orders/', mode: 'passthrough' }] },
+		excludePathPatterns: [],
+	});
+
+	const out = explainCacheKey('https://www.example.com/orders/history?id=1');
+	assert.equal(out.ingress.routeClass, 'passthrough');
+	assert.equal(out.ingress.route.source, 'ingress.routes');
+	assert.equal(out.eligibility.excludedByPattern, null);
+	assert.equal(out.eligibility.prerendered, false);
+	// No allowlist on a passthrough route, so the proxied URL keeps the query intact.
+	assert.deepEqual(out.allowlist.used, ['*']);
 });
 
 test('an empty domains allowlist allows every host', () => {

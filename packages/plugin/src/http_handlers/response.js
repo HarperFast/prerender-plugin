@@ -24,11 +24,12 @@ const computeWasCacheMiss = (resource) => {
 	return resource.statusCode === 200 || resource.statusCode === 304 ? true : undefined;
 };
 
-// Compact one-line description of a matched forwarded-mode route for the x-harper-route
-// debug header.
+// Compact one-line description of the matched route for the x-harper-route debug header.
+// `source` is included so a folded excludePathPatterns entry is distinguishable from a
+// hand-written passthrough route — they behave the same but live in different config keys.
 function formatRoute(route) {
 	const params = Array.isArray(route.queryParams) ? route.queryParams.join(', ') : '';
-	return `${route.match ?? ''} ${route.path ?? ''} [${params}]`;
+	return `${route.match ?? ''} ${route.path ?? ''} [${params}] ${route.mode ?? ''} (${route.source ?? ''})`;
 }
 
 /**
@@ -89,6 +90,11 @@ export function applyDebugHeaders(headers, request, resource, info) {
 	}
 	if (info.url) {
 		headers.set('x-harper-url', info.url);
+	}
+	// The class is the answer to "why wasn't this served from cache" — emitted even with no
+	// matched route, which is exactly the unclassified case worth seeing.
+	if (info.routeClass) {
+		headers.set('x-harper-route-class', info.routeClass);
 	}
 	if (info.route) {
 		headers.set('x-harper-route', formatRoute(info.route));

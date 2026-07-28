@@ -1,4 +1,30 @@
 import { config } from '../config.js';
+import { PRERENDER } from './routeClass.js';
+
+/**
+ * The serving policy for one request: `{ skipCache, missMode }`.
+ *
+ * Composed here rather than inline in the handler because the interaction of route class,
+ * method and the two on-demand levers is the part that is easy to get subtly wrong, and this
+ * way it is a pure function of (class, method, headers, config) that can be tested directly.
+ *
+ * `skipCache` NEVER means "don't read the cache because of the class". A non-prerender path is
+ * still served from cache when a fresh entry exists — it just never populates one (the
+ * handler's `maybeSchedule` is what enforces that). Cutting the read would take a URL that is
+ * cached today and drop it to the origin the moment its route stopped being declared: a silent
+ * loss of prerendered output rather than a graceful one.
+ *
+ * What the class DOES decide is the on-demand levers, which only make sense for a URL we would
+ * actually store: a non-prerender class can neither skip the cache nor force a render, so its
+ * miss always proxies.
+ */
+export const resolveServingPolicy = (routeClass, method, headers) => {
+	const authorized = routeClass === PRERENDER && method === 'GET' && isRenderNowAuthorized(headers);
+	return {
+		skipCache: authorized && wantsCacheSkip(headers),
+		missMode: authorized ? resolveMissMode(headers) : 'origin',
+	};
+};
 
 /**
  * Whether a request is an authorized on-demand render ("render now") request.

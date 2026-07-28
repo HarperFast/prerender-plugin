@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { queryAllowlistFor } from '../util/ingress.js';
+import { queryAllowlistFor } from '../util/routeClass.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';

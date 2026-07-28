@@ -5,12 +5,13 @@ import { isPrerenderCandidate } from '../util/indexSignals.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
-import { isForwardedMode, resolveForwardedRequest } from '../util/ingress.js';
+import { resolveForwardedRequest } from '../util/ingress.js';
+import { classifyPath, isForwardedMode, PRERENDER } from '../util/routeClass.js';
 import { RenderTarget } from '../resources/RenderTarget.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
-import { isRenderNowAuthorized, wantsCacheSkip, resolveMissMode, pollForFreshRender } from '../util/renderNow.js';
+import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
 import { deliverResource } from './response.js';
 
@@ -22,7 +23,7 @@ export async function handleBotRequest(request) {
 		if (!target) {
 			return { headers: {}, status: 400 };
 		}
-		const { url, cacheUrl, deviceType, noCache, route } = target;
+		const { url, cacheUrl, deviceType, routeClass, route } = target;
 
 		request.botName = getBotName(request.headers);
 		if (config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched)) {
@@ -30,12 +31,12 @@ export async function handleBotRequest(request) {
 		}
 
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
-		// debug header is present). `route` is the matched forwarded-mode route, if any;
-		// `noCache` marks an unrecognized forwarded path we proxy but never cache.
-		const info = { route, noCache };
+		// debug header is present). `route` is the matched route entry, if any; `routeClass`
+		// decides whether this request is cached and scheduled at all.
+		const info = { route, routeClass };
 
-		const resource = await resolveResource({ request, url, cacheUrl, deviceType, info });
-		maybeSchedule(resource, noCache);
+		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
+		maybeSchedule(resource, routeClass);
 
 		return deliverResource(resource, request, info);
 	} catch (e) {
@@ -47,10 +48,10 @@ export async function handleBotRequest(request) {
 	}
 }
 
-// Resolve the request into { url, deviceType, noCache, route }, dispatching on ingress
-// mode. In 'forwarded' mode isBotRequest already resolved + stashed the target; the
+// Resolve the request into { url, cacheUrl, deviceType, routeClass, route }, dispatching on
+// ingress mode. In 'forwarded' mode isBotRequest already resolved + stashed the target; the
 // fallback resolve guards against direct calls. Returns null when a forwarded request
-// can't be resolved (a matched route with an unusable forwarded host) => the caller 400s.
+// can't be resolved (e.g. an unusable forwarded host) => the caller 400s.
 function resolveBotTarget(request) {
 	if (isForwardedMode()) {
 		const target = request._prerenderTarget ?? resolveForwardedRequest(request);
@@ -59,26 +60,30 @@ function resolveBotTarget(request) {
 			url: target.url,
 			cacheUrl: target.cacheUrl,
 			deviceType: target.deviceType,
-			noCache: !!target.noCache,
+			routeClass: target.routeClass,
 			route: target.route,
 		};
 	}
 
 	// Native/prefix mode: the request path (minus the bot prefix) IS the absolute target URL.
+	// Classification still applies — it is what carries the folded excludePathPatterns into
+	// this mode — but the allowlist stays the global `url.queryParams`, so the key is
+	// unchanged. canonicalizeUrl has already proved the URL parses by the time we classify.
 	const cacheUrl = canonicalizeUrl(request.url.slice(config.botPathPrefix.length), config.url.queryParams);
+	const { routeClass, entry } = classifyPath(URL.parse(cacheUrl)?.pathname ?? '/');
 	return {
 		url: new URL(cacheUrl),
 		cacheUrl,
 		deviceType: sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader)),
-		noCache: false,
-		route: undefined,
+		routeClass,
+		route: entry,
 	};
 }
 
 // Resolve the resource to serve: an origin proxy for non-GET/HEAD, else a fresh cache hit,
 // an on-demand render, or an origin proxy per the miss mode. Populates the debug `info`
 // (cacheKey/url/cacheStatus/source/renderNowStatus) as a side effect.
-async function resolveResource({ request, url, cacheUrl, deviceType, info }) {
+async function resolveResource({ request, url, cacheUrl, deviceType, routeClass, info }) {
 	if (request.method !== 'GET' && request.method !== 'HEAD') {
 		logger.warn(`Unexpected Request ${request.method} ${url}`);
 		info.source = 'origin';
@@ -92,16 +97,16 @@ async function resolveResource({ request, url, cacheUrl, deviceType, info }) {
 	}
 
 	// `cacheUrl` is the canonical URL-half (already computed at ingress); it IS the cache-key
-	// url component, so no re-normalization here.
+	// url component, so no re-normalization here. Recorded even for a class we never cache,
+	// because "what key WOULD this be" is the first thing to check when a URL unexpectedly
+	// isn't being served from cache.
 	const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
 	info.cacheKey = cacheKey;
 	info.url = cacheUrl;
 
-	// On-demand levers apply only to an authorized GET for a non-excluded URL.
-	const authorized = request.method === 'GET' && isRenderNowAuthorized(request.headers) && !isExcludedUrl(url);
-	const skipCache = authorized && wantsCacheSkip(request.headers);
-	// Unrecognized paths are never rendered/cached, so a miss always just proxies.
-	const missMode = authorized && !info.noCache ? resolveMissMode(request.headers) : 'origin';
+	// Note a non-prerender class still SERVES from cache here — it only never populates one
+	// (`maybeSchedule` below). See resolveServingPolicy for why that matters.
+	const { skipCache, missMode } = resolveServingPolicy(routeClass, request.method, request.headers);
 
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
 	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
@@ -132,22 +137,13 @@ async function resolveResource({ request, url, cacheUrl, deviceType, info }) {
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
-// didn't already have cached). Skipped for excluded URLs and for unrecognized forwarded
-// paths (noCache), which we proxy but never populate into the cache.
-function maybeSchedule(resource, noCache) {
-	if (resource.miss && resource.statusCode === 200 && !noCache && !isExcludedUrl(resource.url)) {
+// didn't already have cached). Only a `prerender` path is ever scheduled — which now also
+// covers what `excludePathPatterns` used to gate separately, since those patterns compile
+// into passthrough routes (see util/routeClass.js).
+function maybeSchedule(resource, routeClass) {
+	if (routeClass === PRERENDER && resource.miss && resource.statusCode === 200) {
 		setImmediate(handlePageScheduling, resource);
 	}
-}
-
-// A URL is excluded from prerendering when its string form contains any configured
-// exclude pattern. Accepts a URL object or a string. Skips the string coercion entirely
-// when no patterns are configured (the common case).
-function isExcludedUrl(url) {
-	const patterns = config.excludePathPatterns;
-	if (patterns.length === 0) return false;
-	const urlString = String(url);
-	return patterns.some((pattern) => urlString.includes(pattern));
 }
 
 // On-demand render: force an immediate one-off render and wait for the fresh result,
