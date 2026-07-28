@@ -111,7 +111,7 @@ A downstream repo cannot bump until the upstream tarball asset already exists at
 - **Sequence the release trains** and **reserve the next version number** in the issue/PR before you
   start, so two people don't both claim `v1.6.1` / `prerender-v0.3.5`.
 - **Isolate shared runtime/test state:** distinct `WORKER_ID`, cache dirs, MQTT origins per run;
-  don't share the Akamai staging pipeline across simultaneous sessions (its cache is keyed by URL
+  don't share the CDN staging pipeline across simultaneous sessions (its cache is keyed by URL
   only and cross-contaminates; toggling staging↔prod requires wiping the resource cache).
 
 <!-- SHARED:pr-review — keep in sync across all three repos -->
@@ -121,7 +121,12 @@ PRs here are reviewed by **other agents and humans** who leave comments. "PR ope
 
 - **A human merges by default.** Agents open/update PRs and drive them to a reviewable state;
   merging, approving, and deploying are human actions. **Exception:** if the user explicitly
-  authorizes the agent to merge, you may — once all review threads are addressed and CI is green.
+  authorizes the agent to merge, you may do so — once all review threads are addressed and CI is
+  green.
+- **Cutting a release is NOT a human-only action, and is not the same as deploying.** Once a
+  version-bump PR is merged, the agent itself cuts the GitHub Release — that is what produces the
+  tarball consumers install — and then confirms the asset landed on the release tag. Rolling that
+  tarball out to a running fleet stays a human action.
 - **Before considering a PR finished, read and address *every* open review thread from *any*
   reviewer** — not just findings handed to you. PR-level (conversation) and inline (diff) comments
   live in different places, so check both:
