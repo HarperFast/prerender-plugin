@@ -100,6 +100,7 @@ rest: true # required for the @export-ed table REST endpoints
   sitemap:
     refreshTime: '12:00' # local time-of-day for the daily sitemap refresh
     timezone: America/New_York
+    filteredWarnPercent: 50 # filtered share of one sitemap that is reported as an ERROR
     node: '' # pin the scheduled refresh to this node ('' disables it)
     workerIndex: 0 # ...and this worker
 
@@ -204,6 +205,37 @@ Unclassified and passthrough traffic is counted per first path segment and flush
 forwarding `/blog/*`"); passthrough is the coverage backlog ("we proxy this much bot traffic live,
 on purpose"). The tally is in-process, so **every worker** flushes its own line — each carries
 `node=` and `worker=`, and a reader sums across them.
+
+### Sitemaps are filtered to prerender routes
+
+A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely
+a superset of the paths the CDN forwards here. Entries that are not a `prerender` route are counted
+and **not scheduled** — creating a target for one would render and store a page no read ever looks
+up, which is render load and cache growth for no served output.
+
+`Sitemap.refresh` reports what it dropped:
+
+```json
+{
+	"created": 1200,
+	"updated": 0,
+	"skipped": 40,
+	"removed": [],
+	"filtered": { "passthrough": 3, "unclassified": 812 },
+	"deferred": 0
+}
+```
+
+A large `filtered` share is far more likely to mean `ingress.routes` is incomplete than that the
+sitemap is wrong, so past `sitemap.filteredWarnPercent` (default 50%) it is logged as an **error**
+rather than an info line — a silent filter otherwise looks exactly like a healthy refresh while
+removing most of the render coverage.
+
+`deferred` counts existing targets whose URL no longer classifies as `prerender`. Those are
+deliberately left untouched: the refresh **unlinks** a target that genuinely left the sitemap
+(`sitemapUrl: null`) but must not do that to a filtered URL, because unlinking leaves the
+`RenderSchedule` row intact — the target would keep rendering forever with nothing tracking it.
+Retiring them needs guardrails that belong to the schedule-repair sweep, not to an ingest pass.
 
 A forwarded-mode config that compiles to **zero** prerender routes is reported as a warning
 (`/prerender_admin` surfaces it): nothing is prerendered in that state, and it is what a single

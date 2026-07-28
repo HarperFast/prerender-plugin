@@ -1,11 +1,39 @@
 import { config } from '../config.js';
 import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
-import { canonicalizeUrl } from '../util/url.js';
-import { queryAllowlistFor } from '../util/routeClass.js';
+import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
-import { parseSitemap, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
+import { parseSitemap, partitionSitemapEntries, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
+
+// Rows scanned between event-loop yields while walking the existing targets for a sitemap, so a
+// pass over a large registry stays background work. Matches util/reconcile.js's YIELD_EVERY.
+const SCAN_YIELD_EVERY = 200;
+
+/**
+ * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
+ * means `ingress.routes` is incomplete rather than that the sitemap is wrong — a silent filter
+ * would look identical to a healthy refresh while quietly removing most of the render coverage,
+ * so past the configured share this is an error, not an info line.
+ */
+function reportFiltered(sitemapUrl, filtered, totalEntries) {
+	const total = filtered[PASSTHROUGH] + filtered[UNCLASSIFIED];
+	if (total === 0) return;
+
+	const percent = totalEntries > 0 ? Math.round((total / totalEntries) * 100) : 0;
+	const summary =
+		`${sitemapUrl}: ${total}/${totalEntries} entries (${percent}%) are not prerender routes and were ` +
+		`not scheduled — passthrough ${filtered[PASSTHROUGH]}, unclassified ${filtered[UNCLASSIFIED]}`;
+
+	if (percent >= config.sitemap.filteredWarnPercent) {
+		logger.error(
+			`[prerender] ${summary}. That is most of the sitemap: check ingress.routes for missing or ` +
+				`mis-ordered routes before assuming the sitemap is at fault.`
+		);
+	} else {
+		logger.info(`[prerender] ${summary}`);
+	}
+}
 
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
@@ -14,6 +42,10 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		let created = 0;
 		let updated = 0;
 		let skipped = 0;
+		// Entries dropped because they are not a prerender path, and existing targets for such
+		// URLs that this pass deliberately left in place for the reconcile sweep to retire.
+		const filteredTotals = { [PASSTHROUGH]: 0, [UNCLASSIFIED]: 0 };
+		let deferred = 0;
 		const removed = [];
 
 		const visited = new Set();
@@ -42,38 +74,71 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					let inflightCount = 0;
 					let lastPromise = null;
 
-					// Key by the canonical URL-half (the same transform the bot-read path uses),
-					// so both the prune diff below (against existing targets' parsed keys) and the
-					// render-target keys built later match the key a bot request will look up. Skip
-					// a malformed <loc> (canonicalizeUrl throws on an unparseable URL) so one bad
-					// entry doesn't abort the whole refresh.
-					const incomingEntryMap = new Map();
-					for (const entry of latestSitemap.entries) {
-						try {
-							incomingEntryMap.set(canonicalizeUrl(entry.loc, queryAllowlistFor(entry.loc)), entry);
-						} catch (e) {
-							logger.warn(`Skipping invalid sitemap entry ${entry.loc}: ${e.message}`);
-						}
-					}
+					// Keep only the URLs this deployment actually prerenders, keyed by the canonical
+					// URL-half the bot read uses — so the prune diff below and the target keys built
+					// later both match what a request will look up. Everything else is counted and
+					// dropped rather than turned into a target that renders into a key no read
+					// computes. See util/sitemap.js.
+					const { incoming: incomingEntryMap, filtered, invalid } = partitionSitemapEntries(latestSitemap.entries);
 
+					for (const { loc, message } of invalid) {
+						logger.warn(`Skipping invalid sitemap entry ${loc}: ${message}`);
+					}
+					reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
+					filteredTotals[PASSTHROUGH] += filtered[PASSTHROUGH];
+					filteredTotals[UNCLASSIFIED] += filtered[UNCLASSIFIED];
+
+					// Yield on rows SCANNED, not on writes issued. The write-driven yields below only
+					// fire on the rows this pass actually unlinks, and for a healthy sitemap that is
+					// almost none of them — so the loop can walk a very large registry reaching
+					// nothing but `continue`. `await` on the cursor drains microtasks but does not let
+					// timers or I/O callbacks run, so that walk starves the event loop. Same count-based
+					// convention (and constant) as the RenderTarget scan in util/reconcile.js.
+					//
+					// This got sharper with the filter: each non-matching row now costs a URL parse and
+					// a route-list walk (`classifyUrl`) where it used to cost almost nothing.
+					let scanned = 0;
 					for await (const target of RenderTarget.search({
 						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
 						conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 					})) {
-						const parsed = CacheKey.parse(target.cacheKey);
-						if (!incomingEntryMap.has(parsed.url)) {
-							lastPromise = RenderTarget.patch(target.cacheKey, {
-								sitemapUrl: null,
-							});
-							inflightCount++;
-							removed.push(target);
+						if (++scanned % SCAN_YIELD_EVERY === 0) await new Promise(setImmediate);
 
-							if (inflightCount >= 50) {
-								await lastPromise;
-								inflightCount = 0;
-							} else if (inflightCount % 20 === 0) {
-								await new Promise(setImmediate);
-							}
+						const parsed = CacheKey.parse(target.cacheKey);
+						if (incomingEntryMap.has(parsed.url)) continue;
+
+						// Absent from the incoming map now means one of two very different things, and
+						// conflating them is what would turn every filtered URL into an orphan:
+						//   - it left the sitemap        -> unlink it, as before
+						//   - it was FILTERED just above -> leave it alone
+						// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the
+						// RenderSchedule row intact: the target keeps rendering on its interval with
+						// nothing tracking it and no sitemap to bring it back. Fine for a URL that
+						// genuinely left the sitemap (that is the pre-existing discovery-target shape),
+						// but applied to a filtered URL it would silently convert this pass's entire
+						// filtered set into permanently-rendering, unattributable targets — the exact
+						// load this change exists to remove.
+						//
+						// Retiring them is deliberately NOT done here. Deleting targets needs the
+						// guardrails the reconcile sweep will carry (refuse when no prerender routes
+						// compile, a ceiling on how much one pass may retire), not an ingest pass that
+						// would act on whatever the route list happened to say this morning.
+						if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
+							deferred++;
+							continue;
+						}
+
+						lastPromise = RenderTarget.patch(target.cacheKey, {
+							sitemapUrl: null,
+						});
+						inflightCount++;
+						removed.push(target);
+
+						if (inflightCount >= 50) {
+							await lastPromise;
+							inflightCount = 0;
+						} else if (inflightCount % 20 === 0) {
+							await new Promise(setImmediate);
 						}
 					}
 
@@ -149,7 +214,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			}
 		}
 
-		return { created, updated, skipped, removed };
+		return { created, updated, skipped, removed, filtered: filteredTotals, deferred };
 	}
 
 	async post(options = {}) {

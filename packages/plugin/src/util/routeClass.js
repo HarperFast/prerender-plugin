@@ -200,8 +200,8 @@ export const classifyPath = (path) => {
 };
 
 /**
- * The query-param allowlist to canonicalize a URL with, matching what a bot READ of that URL
- * would use — so the sitemap-write, discovery, and redirect-re-key keys equal the read key.
+ * `classifyPath` for a whole URL — the form every non-request caller has. Returns the same
+ * `{ routeClass, queryParams, entry }`.
  *
  * CONTRACT: `rawUrl` is a DEVICE-FREE public URL — a sitemap `<loc>` or the browser's final
  * `page.url()`, both of which never carry the CDN's device path-prefix. Classification matches
@@ -209,10 +209,26 @@ export const classifyPath = (path) => {
  * separately). Do NOT strip a device prefix here: these URLs have none, and doing so would
  * wrongly consume a real first path segment that happens to equal a device-type name.
  */
-export const queryAllowlistFor = (rawUrl) => {
-	if (!isForwardedMode()) return config.url.queryParams;
+export const classifyUrl = (rawUrl) => {
 	const pathname = URL.parse(rawUrl)?.pathname;
-	// An unparseable URL can't be classified; keep every param, as an unmatched path does.
-	if (pathname === undefined) return KEEP_ALL;
-	return classifyPath(pathname).queryParams;
+	if (pathname === undefined) {
+		// Unparseable, so unclassifiable. Keep every param exactly as an unmatched path does —
+		// any caller that goes on to build a key from this URL fails on the URL itself first.
+		return {
+			routeClass: UNCLASSIFIED,
+			queryParams: isForwardedMode() ? KEEP_ALL : config.url.queryParams,
+			entry: null,
+		};
+	}
+	return classifyPath(pathname);
 };
+
+/**
+ * The query-param allowlist to canonicalize a URL with, matching what a bot READ of that URL
+ * would use — so the sitemap-write, discovery, and redirect-re-key keys equal the read key.
+ *
+ * A thin projection of `classifyUrl` so the allowlist and the class can never be derived from
+ * two different parses of the same URL. Callers that need both (sitemap ingest) should call
+ * `classifyUrl` once instead of this plus a separate classification.
+ */
+export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
