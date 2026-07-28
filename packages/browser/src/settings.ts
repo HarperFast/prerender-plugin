@@ -78,7 +78,7 @@ export type BrowserOptions = {
 	 * Per-browser DNS overrides: a map of hostname → IP that composes Chrome's
 	 * `--host-resolver-rules` flag (`MAP <host> <ip>`), appended to `chromeArgs`. Chrome
 	 * connects to the given IP but keeps the original Host header and TLS SNI, so the
-	 * certificate still validates — the mechanism for pointing renders at an Akamai
+	 * certificate still validates — the mechanism for pointing renders at a CDN
 	 * staging edge (or any alternate origin) without touching `/etc/hosts`. Ignored when
 	 * `browserLaunchOptions` is supplied (that fully owns the launch args). Default none.
 	 */

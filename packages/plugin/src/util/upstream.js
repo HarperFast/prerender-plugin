@@ -93,17 +93,16 @@ const ignoredDownstreamRequestHeaders = () => {
 	return ignoredHeadersCache;
 };
 
-// Origin responses are relayed to the edge on a cache miss. The origin sits behind a CDN
-// (Akamai), so its response carries the CDN's own control headers (akamai-grn, x-akamai-*,
-// x-cache*, via, server-timing, …). When the edge's "Serve Alternate Response" swap re-adds
-// its own copies the response ends up with duplicated CDN headers, and the edge fails the
-// transform (ERR_SWAPFAIL_*|badxform). Relay only this allowlist of genuine origin-response
-// headers so the swapped-in response looks like a clean origin reply; everything else (CDN
-// headers, hop-by-hop headers, set-cookie) is dropped.
+// Origin responses are relayed to the edge on a cache miss. The origin sits behind a CDN, so
+// its response carries the CDN's own control headers (request-id/trace headers, x-cache*, via,
+// server-timing, …). When the edge's alternate-response swap re-adds its own copies the response
+// ends up with duplicated CDN headers, and the edge fails the transform. Relay only this
+// allowlist of genuine origin-response headers so the swapped-in response looks like a clean
+// origin reply; everything else (CDN headers, hop-by-hop headers, set-cookie) is dropped.
 //
 // server-timing is deliberately NOT relayed: the value from the origin is the staging edge's
-// own Akamai timing tokens, and the serving edge adds its own on egress — so dropping the
-// origin's avoids re-doubling it and keeps Akamai-internal tokens off the response.
+// own timing tokens, and the serving edge adds its own on egress — so dropping the origin's
+// avoids re-doubling it and keeps CDN-internal tokens off the response.
 //
 // NOTE: unlike the render path (RenderJob.allowedResponseHeaders), which strips the origin
 // encoding and re-encodes stored pages itself, the proxy path relays content-encoding +
@@ -140,9 +139,9 @@ export const resolveUpstreamHeaders = (downstream, deviceType) => {
 		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
 		[config.securityToken.header]: config.securityToken.value,
 		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
-		// to the Akamai edge for its "Serve Alternate Response" swap, and Akamai cannot apply
-		// its outgoing transform to a brotli-encoded alternate response (ERR_SWAPFAIL_*|badxform).
-		// gzip is transform-safe; the edge re-compresses (to br) for the real client on egress.
+		// to the CDN edge for its alternate-response swap, and the edge cannot apply its outgoing
+		// transform to a brotli-encoded alternate response. gzip is transform-safe; the edge
+		// re-compresses (to br) for the real client on egress.
 		'accept-encoding': 'gzip',
 	};
 

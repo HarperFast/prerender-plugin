@@ -143,13 +143,13 @@ test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
 test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {
 	const clean = sanitizeOriginResponseHeaders({
 		'content-type': 'text/html',
-		'akamai-grn': '0.1234abcd',
-		'x-akamai-staging': 'ESSL',
-		'x-akamai-transformed': '9 0 0',
+		'x-cdn-request-id': '0.1234abcd',
+		'x-cdn-staging': 'ESSL',
+		'x-cdn-transformed': '9 0 0',
 		'x-cache': 'TCP_MISS from a1-2-3-4',
 		'x-cache-key': '/L/1/2/3/foo',
 		'x-check-cacheable': 'NO',
-		'via': '1.1 akamai.net',
+		'via': '1.1 cdn.example.net',
 		'server-timing': 'cdn-cache; desc=MISS',
 		'set-cookie': 'sid=abc; Path=/',
 		'connection': 'keep-alive',
@@ -166,10 +166,10 @@ test('sanitizeOriginResponseHeaders returns {} for null/undefined input', () => 
 });
 
 test('sanitizeOriginResponseHeaders matches allowlist case-insensitively (normalizes key)', () => {
-	const clean = sanitizeOriginResponseHeaders({ 'Content-Type': 'text/html', 'X-Akamai-Staging': 'ESSL' });
+	const clean = sanitizeOriginResponseHeaders({ 'Content-Type': 'text/html', 'X-Cdn-Staging': 'ESSL' });
 	assert.equal(clean['content-type'], 'text/html');
-	assert.equal(clean['x-akamai-staging'], undefined);
-	assert.equal(clean['X-Akamai-Staging'], undefined);
+	assert.equal(clean['x-cdn-staging'], undefined);
+	assert.equal(clean['X-Cdn-Staging'], undefined);
 });
 
 test('resolveUpstreamHeaders drops a spoofed token/debug header even when configured mixed-case', () => {
