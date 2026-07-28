@@ -5,6 +5,7 @@ import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/route
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
+import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 
 /**
@@ -192,7 +193,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 							if (inflight.length >= config.scan.batchSize) {
 								await Promise.all(inflight);
 								inflight = [];
-								await new Promise(setImmediate);
+								await setImmediate();
 							}
 						}
 					}

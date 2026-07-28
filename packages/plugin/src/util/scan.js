@@ -29,6 +29,7 @@
  * database.
  */
 
+import { setImmediate } from 'node:timers/promises';
 import { config } from '../config.js';
 
 /**
@@ -36,7 +37,8 @@ import { config } from '../config.js';
  *
  * `pick` returns the value to collect, or `undefined`/`null` to skip the row. It MUST NOT write:
  * that is the whole point (see the module comment). It may be async — the sitemap prune needs a
- * classification per row — and rows are counted whether or not they are collected.
+ * classification per row — and it is called for EVERY scanned row, so it may safely keep its own
+ * counters; only retention is capped.
  *
  * Yields to the event loop every `yieldEvery` rows SCANNED, not every row collected. A walk that
  * collects almost nothing (the healthy case) would otherwise never yield, and `await` on a cursor
@@ -51,7 +53,7 @@ export const collectFromScan = async ({
 	pick,
 	cap = config.scan.collectCap,
 	yieldEvery = config.scan.yieldEvery,
-	onYield = () => new Promise(setImmediate),
+	onYield = () => setImmediate(),
 } = {}) => {
 	const items = [];
 	let examined = 0;
@@ -60,11 +62,16 @@ export const collectFromScan = async ({
 		examined++;
 		if (examined % yieldEvery === 0) await onYield();
 
-		// Past the cap we keep scanning but stop collecting, so the count stays honest.
-		if (items.length >= cap) continue;
-
+		// `pick` runs for EVERY row, including past the cap. Only the retention is capped.
+		//
+		// An earlier version skipped `pick` once the cap was reached, to save its work. That
+		// quietly broke any caller whose `pick` also counts something — the sitemap prune tallies
+		// the targets it is deliberately leaving for the retirement sweep — because the tally
+		// silently stopped at the cap while still being reported as a total. Under-reporting how
+		// much work was left undone is the one thing these walks must never do, so the cap now
+		// bounds memory alone, exactly as this module claims.
 		const picked = await pick(row);
-		if (picked !== undefined && picked !== null) items.push(picked);
+		if (picked !== undefined && picked !== null && items.length < cap) items.push(picked);
 	}
 
 	return { items, examined, truncated: items.length >= cap };
@@ -85,7 +92,7 @@ export const applyInBatches = async ({
 	items,
 	apply,
 	batchSize = config.scan.batchSize,
-	onYield = () => new Promise(setImmediate),
+	onYield = () => setImmediate(),
 } = {}) => {
 	let applied = 0;
 

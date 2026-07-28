@@ -46,6 +46,27 @@ test('the cap bounds memory but NOT scanning, so the count stays honest', async 
 	assert.equal(truncated, true);
 });
 
+test('pick runs for every scanned row, so a side-effecting counter stays accurate past the cap', async () => {
+	// The sitemap prune counts the targets it deliberately leaves for the retirement sweep from
+	// inside `pick`. An earlier version skipped `pick` past the cap, which silently stopped that
+	// tally while still reporting it as a total — under-reporting undone work is the one thing
+	// these walks must never do.
+	let picked = 0;
+	const { items, examined, truncated } = await collectFromScan({
+		scan: streamOf(rows(30)),
+		pick: (row) => {
+			picked++;
+			return row.cacheKey;
+		},
+		cap: 5,
+		onYield: () => Promise.resolve(),
+	});
+	assert.equal(picked, 30, 'pick was skipped past the cap');
+	assert.equal(items.length, 5);
+	assert.equal(examined, 30);
+	assert.equal(truncated, true);
+});
+
 test('yields on rows SCANNED, not on rows collected', async () => {
 	// A walk that collects almost nothing (the healthy case) must still yield, or it starves the
 	// event loop: `await` on a cursor drains microtasks without letting timers or I/O run.
