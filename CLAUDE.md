@@ -120,11 +120,13 @@ A downstream repo cannot bump until the upstream tarball asset already exists at
 PRs here are reviewed by **other agents and humans** who leave comments. "PR opened" ≠ "done".
 
 - **A human merges by default.** Agents open/update PRs and drive them to a reviewable state;
-  merging and approving are human actions. **Exception:** if the user explicitly
-  authorizes the agent to merge, you may — once all review threads are addressed and CI is green.
-- **Cutting a release is NOT a human-only action.** Once a version-bump PR is merged, the agent
-  cuts the GitHub Release itself — that is what produces the tarball consumers install — and then
-  confirms the asset landed on the release tag.
+  merging, approving, and deploying are human actions. **Exception:** if the user explicitly
+  authorizes the agent to merge, you may do so — once all review threads are addressed and CI is
+  green.
+- **Cutting a release is NOT a human-only action, and is not the same as deploying.** Once a
+  version-bump PR is merged, the agent itself cuts the GitHub Release — that is what produces the
+  tarball consumers install — and then confirms the asset landed on the release tag. Rolling that
+  tarball out to a running fleet stays a human action.
 - **Before considering a PR finished, read and address *every* open review thread from *any*
   reviewer** — not just findings handed to you. PR-level (conversation) and inline (diff) comments
   live in different places, so check both:
