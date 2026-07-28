@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
-import { setImmediate } from 'node:timers/promises';
+import { applyInBatches, collectFromScan } from '../util/scan.js';
 
 const {
 	render_schedule: { RenderSchedule },
@@ -76,30 +76,44 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 		}
 	}
 
+	/**
+	 * Bring every matching target due now.
+	 *
+	 * Two-phase on purpose: the old version issued its writes from inside the open search cursor,
+	 * so on a large match set the long-transaction monitor could fire while writes were pending
+	 * and ABORT the transaction (HTTP 422) with part of the batch already applied. Collecting the
+	 * keys first and writing after the cursor closes means no write is ever pending while the
+	 * cursor is open — see util/scan.js.
+	 */
 	static async revalidate(requestTarget) {
 		const nextRenderTime = currentMinuteMs();
-		let batch = [];
-		let count = 0;
 
-		for await (const target of this.search(requestTarget)) {
-			count++;
-			const existingPage = await PrerenderedPage.get({ id: target.cacheKey, select: ['cacheKey', 'expiresAt'] });
+		// Phase 1 — read only. Just the keys; the page lookup moves to phase 2 so this walk stays
+		// as short as possible.
+		const {
+			items: cacheKeys,
+			examined,
+			truncated,
+		} = await collectFromScan({
+			scan: () => this.search(requestTarget),
+			pick: (target) => target.cacheKey,
+		});
 
-			if (existingPage) {
-				batch.push(PrerenderedPage.patch(target.cacheKey, { expiresAt: Date.now() }));
-			}
+		// Phase 2 — writes, cursor now closed. Each batch is awaited before the next starts, so
+		// pending writes never span a monitor tick.
+		await applyInBatches({
+			items: cacheKeys,
+			apply: async (cacheKey) => {
+				const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+				if (existingPage) {
+					await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
+				}
+				await RenderSchedule.put(cacheKey, { nextRenderTime });
+			},
+		});
 
-			batch.push(RenderSchedule.put(target.cacheKey, { nextRenderTime }));
-
-			if (batch.length >= 100) {
-				await Promise.all(batch);
-				batch = [];
-				await setImmediate();
-			}
-		}
-
-		await Promise.all(batch);
-
-		return { revalidating: count };
+		// `examined` is the true match count even when the collection was capped; `truncated` says
+		// the caller is looking at a partial pass rather than silently under-reporting it.
+		return { revalidating: cacheKeys.length, examined, truncated };
 	}
 }
