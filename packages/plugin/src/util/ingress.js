@@ -1,93 +1,48 @@
 /**
  * Forwarded (reverse-proxy / CDN) ingress for the bot request handler.
  *
- * In `forwarded` mode an upstream proxy (e.g. Akamai) routes a restricted set of
+ * In `forwarded` mode an upstream proxy (a reverse proxy or CDN) routes a restricted set of
  * paths to the plugin. Unlike the native `prefix` mode — where the request path
  * IS the absolute target URL — a forwarded request carries:
  *   - the device type as the first path segment (e.g. `/mobile/product/prd-1`),
  *   - the original public host/scheme in forwarded headers, and
  *   - a relative origin path.
  *
- * This module reconstructs the absolute target URL, resolves the device type, and
- * matches the request against the configured `routes` (which also decide whether a
- * request is a prerender request at all, and which query params survive into the
- * cache key / origin fetch).
+ * This module reconstructs the absolute target URL and resolves the device type. What to DO
+ * with the resulting path — prerender it, proxy it quietly, or proxy it and report it — is
+ * decided by util/routeClass.js, which owns that judgement for every ingress mode.
  */
 
 import { config, getLogger } from '../config.js';
 import { extractDeviceFromPath, sanitizeDeviceType } from './device_type.js';
 import { canonicalizeUrl } from './url.js';
-
-const VALID_MATCH = new Set(['exact', 'prefix']);
+import { classifyPath, PRERENDER, UNCLASSIFIED } from './routeClass.js';
+import { recordUnroutedPath } from './unrouted.js';
 
 // A bare hostname with optional port. Guards against host-header injection (path,
 // userinfo, scheme) being smuggled in via the forwarded-host header, which would
 // otherwise repoint the origin fetch at an attacker-chosen host.
 const HOST_PATTERN = /^[a-z0-9.-]+(:\d+)?$/i;
 
-export const isForwardedMode = () => config.ingress.mode === 'forwarded';
-
-// Compile + memoize the route list. applyOptions swaps in a fresh routes array on
-// every change, so an identity check is enough to detect a registry change.
-let compiledRoutes = null;
-let compiledFrom;
-
-const compileRoutes = (routes) => {
-	if (!Array.isArray(routes)) return [];
-
-	const valid = routes
-		.filter(
-			(route) => route && VALID_MATCH.has(route.match) && typeof route.path === 'string' && route.path.startsWith('/')
-		)
-		.map((route) => ({
-			match: route.match,
-			path: route.path,
-			queryParams: Array.isArray(route.queryParams) ? route.queryParams.slice() : [],
-		}));
-
-	if (valid.length !== routes.length) {
-		getLogger().warn?.(`[prerender] Ignoring ${routes.length - valid.length} invalid ingress route(s)`);
-	}
-
-	return valid;
-};
-
-const getRoutes = () => {
-	if (config.ingress.routes !== compiledFrom) {
-		compiledRoutes = compileRoutes(config.ingress.routes);
-		compiledFrom = config.ingress.routes;
-	}
-	return compiledRoutes;
-};
-
-/**
- * Match a device-stripped path against the configured routes. First match wins, so
- * routes should be ordered most-specific first. Returns the matched route (with its
- * query allowlist) or null.
- */
-export const matchRoute = (path) => {
-	for (const route of getRoutes()) {
-		if (route.match === 'exact' ? path === route.path : path.startsWith(route.path)) {
-			return route;
-		}
-	}
-	return null;
-};
-
 const firstHeaderValue = (raw) => (raw ? raw.split(',')[0].trim() : '');
 
 /**
- * Resolve a forwarded request into its prerender target. Returns
- * `{ url: URL, deviceType, route }` when the request is a prerender request (`route`
- * is `null` when no configured route matched — see below), or `null` when the request
- * should be skipped: it carries no device-type prefix (path mode), it matches no route
- * in header mode, or a matched route has an unusable forwarded host. Never throws.
+ * Resolve a forwarded request into its prerender target:
+ * `{ url: URL, cacheUrl, deviceType, route, routeClass }`, or `null` when the request should
+ * be skipped entirely. Never throws.
  *
- * A device-prefixed path-mode request that matches no route is still a prerender
- * request (the CDN only prefixes bot traffic) — it resolves with `route: null`,
- * `noCache: true`, and all query params preserved, so the handler serves a cache hit
- * if one exists but otherwise just proxies to origin without caching. A warning is
- * logged so the missing route can be configured.
+ * `routeClass` is the single source of truth for how the handler treats this request — there
+ * is deliberately no separate `noCache` flag that could fall out of step with it. Only
+ * `prerender` is cached and scheduled. `route` is the matched compiled entry, or null.
+ *
+ * Skipped (`null`) means: no device-type prefix in path mode, an unusable forwarded host, or
+ * an unclassified path in HEADER mode. That last case is a mode asymmetry worth stating. In
+ * path mode the device prefix already proves the CDN tagged this as bot traffic, so an
+ * unclassified path is still a real bot request and gets proxied. In header mode a route
+ * match is the only bot discriminator, so an unclassified path is indistinguishable from a
+ * request to the plugin's own REST endpoints (`/render_queue`, `/queue_status`) and must fall
+ * through to them — which makes a `passthrough` route the only way to proxy a non-prerendered
+ * path in header mode.
  */
 export const resolveForwardedRequest = (request) => {
 	const target = request.url;
@@ -108,21 +63,10 @@ export const resolveForwardedRequest = (request) => {
 		path = rawPath;
 	}
 
-	const route = matchRoute(path);
-	if (!route) {
-		// In path mode the device prefix already identifies this as bot/prerender
-		// traffic the CDN forwarded, so don't block a valid bot request just because
-		// the CDN forwarded a path outside the configured routes. We don't recognize
-		// the route, so we don't cache it: it resolves with `noCache` (see below) and
-		// keeps all query params. Log it so the missing route can be configured.
-		// In header mode the route match is the only bot discriminator (no device
-		// prefix to distinguish prerender traffic from the plugin's own API endpoints),
-		// so a non-match there must still fall through.
-		if (!fromPath) return null;
-		getLogger().warn?.(
-			`[prerender] forwarded request to ${path} matched no configured route; proxying uncached (all query params preserved)`
-		);
-	}
+	const { routeClass, queryParams, entry } = classifyPath(path);
+
+	// See the header-mode asymmetry above.
+	if (routeClass === UNCLASSIFIED && !fromPath) return null;
 
 	const host = firstHeaderValue(request.headers.get(config.ingress.forwardedHostHeader));
 	if (!host || !HOST_PATTERN.test(host)) {
@@ -136,41 +80,22 @@ export const resolveForwardedRequest = (request) => {
 		firstHeaderValue(request.headers.get(config.ingress.forwardedProtoHeader)) || config.ingress.defaultProtocol;
 
 	try {
-		// A matched route applies its query allowlist; an unmatched path (path mode)
-		// keeps every query param ('*') and is flagged noCache so the handler proxies
-		// it without populating the cache for a route we don't recognize.
-		// `cacheUrl` is the canonical URL-half of the cache key; the URL object (for the
-		// origin fetch / analytics) is built from it, so both share one encoding and the
-		// proxy fetches the same bytes the key represents.
-		const cacheUrl = canonicalizeUrl(`${proto}://${host}${path}${search}`, route ? route.queryParams : ['*']);
-		return { url: new URL(cacheUrl), cacheUrl, deviceType, route, noCache: !route };
+		// `cacheUrl` is the canonical URL-half of the cache key; the URL object (for the origin
+		// fetch / analytics) is built from it, so both share one encoding and the proxy fetches
+		// the same bytes the key represents. For every non-prerender class the allowlist is
+		// `['*']`, so a proxied request reaches the origin with the query the visitor sent.
+		const cacheUrl = canonicalizeUrl(`${proto}://${host}${path}${search}`, queryParams);
+
+		// Counted only once we know we are actually serving it — a request rejected for a bad
+		// forwarded host above is not a routing gap. Aggregated rather than logged per request;
+		// see util/unrouted.js for why.
+		if (routeClass !== PRERENDER) recordUnroutedPath(routeClass, path, 'cdn');
+
+		return { url: new URL(cacheUrl), cacheUrl, deviceType, route: entry, routeClass };
 	} catch (e) {
-		getLogger().warn?.(`[prerender] could not reconstruct forwarded URL for ${path}: ${e.message}`);
+		// `e?.message ?? String(e)` rather than `e.message`: anything can be thrown, and a
+		// non-Error rejection must not turn a skipped request into a TypeError in the logger.
+		getLogger().warn?.(`[prerender] could not reconstruct forwarded URL for ${path}: ${e?.message ?? String(e)}`);
 		return null;
 	}
-};
-
-/**
- * The query-param allowlist to canonicalize a URL with, matching what a bot READ of that URL
- * would use — so the sitemap-write, discovery, and redirect-rekey keys equal the read key.
- * Forwarded mode resolves the per-route allowlist by matching the URL's path; an unmatched
- * path keeps all params ('*'), exactly like `resolveForwardedRequest`. Native (prefix) mode
- * uses the global `config.url.queryParams`.
- *
- * CONTRACT: `rawUrl` is a DEVICE-FREE public URL — a sitemap `<loc>` or the browser's final
- * `page.url()`, both of which never carry the CDN's device path-prefix. `matchRoute` matches
- * the same device-stripped path the read path feeds it (ingress resolves the device prefix
- * off separately). Do NOT strip a device prefix here: these URLs have none, and doing so
- * would wrongly consume a real first path segment that happens to equal a device-type name.
- */
-export const queryAllowlistFor = (rawUrl) => {
-	if (!isForwardedMode()) return config.url.queryParams;
-	let pathname;
-	try {
-		pathname = new URL(rawUrl).pathname;
-	} catch {
-		return ['*'];
-	}
-	const route = matchRoute(pathname);
-	return route ? route.queryParams : ['*'];
 };

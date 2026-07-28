@@ -12,6 +12,12 @@
  */
 
 import { isIP } from 'node:net';
+// Cyclic by design, and safe: routeClass.js imports `config`/`getLogger` from here, and this
+// module calls back into it only from inside `collectConfigWarnings` — never at module
+// evaluation time. The count has to come from the compiler rather than from raw config,
+// because the finding's whole job is to catch entries the compiler REJECTED (a typo'd
+// `match`), which the raw array still contains.
+import { prerenderRouteCount } from './util/routeClass.js';
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -37,7 +43,7 @@ const defaultConfig = () => ({
 	// Request-ingestion model.
 	//   'prefix'    — native model: bot requests arrive at `${botPathPrefix}<absolute-url>`
 	//                 and the device type comes from a header (`deviceTypeHeader`).
-	//   'forwarded' — reverse-proxy / CDN model (e.g. Akamai): the proxy routes a
+	//   'forwarded' — reverse-proxy / CDN model: the proxy routes a
 	//                 restricted set of paths to the plugin. The device type is the
 	//                 first path segment, the target URL is reconstructed from the
 	//                 forwarded host/proto headers, and `routes` both identifies which
@@ -53,12 +59,38 @@ const defaultConfig = () => ({
 		forwardedHostHeader: 'x-forwarded-host',
 		forwardedProtoHeader: 'x-forwarded-proto',
 		defaultProtocol: 'https',
-		// Ordered route list (forwarded mode). Each entry is
-		// { match: 'exact' | 'prefix', path: string, queryParams: string[] }. A request
-		// is a prerender request only if its device-stripped path matches a route; the
-		// matched route's `queryParams` is the cache-key / origin-fetch query allowlist
-		// (same semantics as `url.queryParams`: ['*'] keeps all, [] drops all).
+		// Ordered route list. Each entry is
+		//   { match: 'exact' | 'prefix' | 'contains', path: string,
+		//     mode?: 'prerender' | 'passthrough', queryParams?: string[] }
+		//
+		// FIRST MATCH WINS, so order most-specific first. That ordering is what lets a
+		// passthrough carve-out sit inside a prerendered prefix (`/products/clearance/`
+		// above `/products/`) without a second list and a precedence rule.
+		//
+		// `mode` (default 'prerender') decides the class — see util/routeClass.js:
+		//   prerender   — cache it, schedule it, serve it from cache. `queryParams` is its
+		//                 cache-key / origin-fetch query allowlist (same semantics as
+		//                 `url.queryParams`: ['*'] keeps all, [] drops all).
+		//   passthrough — proxy it live, never cache or schedule it, and don't report it.
+		//                 A declaration that the CDN forwards this path and we have chosen
+		//                 not to prerender it. `queryParams` is REJECTED here: with no cache
+		//                 there is no key for it to shape, so it could only strip params off
+		//                 the proxied origin fetch and hand the visitor the wrong page.
+		//
+		// A path matching NOTHING is 'unclassified': still proxied (never blocked), never
+		// cached, and counted for reporting so the gap can be fixed at the CDN or here.
 		routes: [],
+
+		// Periodic aggregated report of paths served without prerendering, bucketed by first
+		// path segment. Replaces a per-request warning that was unusable at crawler volume.
+		// Runs on EVERY worker (the counters are in-process), so each line carries node +
+		// worker and a reader sums across them. See util/unrouted.js.
+		report: {
+			enabled: true,
+			interval: 5 * MINUTE, // how often each worker flushes its tally
+			maxBuckets: 200, // distinct buckets tracked per class before overflow counting
+			topN: 20, // buckets listed per log line, highest count first
+		},
 	},
 
 	deviceTypes: {
@@ -109,7 +141,7 @@ const defaultConfig = () => ({
 	ignoredHeaders: [],
 
 	// Staging passthrough — for verifying an origin against a staging edge (e.g. the
-	// Akamai staging network). When `ip` is set, a cache-MISS origin fetch that carries
+	// CDN's staging network). When `ip` is set, a cache-MISS origin fetch that carries
 	// the `header` request header is connected to `ip` instead of the public origin. The
 	// Host header and TLS SNI stay the real origin host (only the TCP address is pinned),
 	// so the staging edge serves the right property and presents a valid certificate.
@@ -254,8 +286,15 @@ const defaultConfig = () => ({
 	// origin/CDN logs and separable from the proxy traffic.
 	sitemapUserAgent: 'HarperSitemapCrawler/1.0',
 
-	// Pages whose normalized URL contains any of these substrings are never
-	// auto-scheduled for rendering.
+	// Paths never auto-scheduled for rendering. Compiled into `ingress.routes` as
+	// `{ match: 'contains', mode: 'passthrough' }` entries, PREPENDED so an exclude still
+	// beats any prerender route it overlaps — which is the precedence these had when they
+	// were a separate, later gate. Folding them in means one classifier decides every path
+	// in both ingress modes, instead of two mechanisms that could disagree.
+	//
+	// NOTE: these are now matched against the PATH only. They used to be matched against the
+	// whole URL string, so a pattern aimed at a query param no longer matches (and is warned
+	// about at config-apply time). Prefer declaring a `contains`/`passthrough` route directly.
 	excludePathPatterns: ['/search/'],
 
 	// Bot-request analytics. `bots` is the registry used both to label requests and
@@ -406,6 +445,19 @@ export const collectConfigWarnings = () => {
 	}
 	if (config.domains.length === 0) {
 		add('warn', 'domains', 'domains allowlist is empty — all hosts will be treated as indexable');
+	}
+	if (config.ingress.mode === 'forwarded' && prerenderRouteCount() === 0) {
+		// Nothing is prerendered in this state: every forwarded request classifies as
+		// unclassified and is proxied straight through. Silent before — the plugin looked
+		// healthy while serving zero cached pages. It is also the state a single typo in
+		// `routes` produces, since invalid entries are dropped individually, which is why the
+		// retirement sweep refuses to run when this finding is present.
+		add(
+			'warn',
+			'ingress.routes',
+			'forwarded mode with NO valid prerender routes — every request will be proxied uncached; ' +
+				'check ingress.routes for entries dropped as invalid'
+		);
 	}
 	if (config.staging.ip) {
 		// Mirror stagingTargetIp's gate (ip AND header AND valid ip) so the finding never

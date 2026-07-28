@@ -19,11 +19,16 @@
 import { config } from '../config.js';
 import { CacheKey } from './cacheKey.js';
 import { canonicalizeUrl } from './url.js';
-import { isForwardedMode, matchRoute } from './ingress.js';
+import { classifyPath, isForwardedMode, PRERENDER } from './routeClass.js';
 import { sanitizeDeviceType } from './device_type.js';
 
+// `source` is included deliberately: an entry folded in from `excludePathPatterns` looks
+// identical to a hand-written passthrough route otherwise, and "which config key produced
+// this" is the difference between two very different fixes.
 const summarizeRoute = (route) =>
-	route ? { match: route.match, path: route.path, queryParams: route.queryParams } : null;
+	route
+		? { match: route.match, path: route.path, mode: route.mode, queryParams: route.queryParams, source: route.source }
+		: null;
 
 /**
  * Explain how `rawUrl` + `requestedDeviceType` map to a cache key.
@@ -36,15 +41,15 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 
 	const deviceType = sanitizeDeviceType(requestedDeviceType);
 	const forwarded = isForwardedMode();
-	const route = forwarded ? matchRoute(url.pathname) : null;
 
-	// Mirror queryAllowlistFor's resolution, but keep the reason visible.
-	const allowlist = forwarded ? (route ? route.queryParams : ['*']) : config.url.queryParams;
-	const allowlistSource = forwarded
-		? route
+	// The same classifier the read path uses, so this can never explain a key the serving path
+	// wouldn't actually compute.
+	const { routeClass, queryParams: allowlist, entry: route } = classifyPath(url.pathname);
+	const allowlistSource = !forwarded
+		? 'url.queryParams'
+		: routeClass === PRERENDER
 			? 'ingress.routes[matched].queryParams'
-			: 'unmatched route — all params kept'
-		: 'url.queryParams';
+			: `${routeClass} — all params kept`;
 
 	const canonicalUrl = canonicalizeUrl(rawUrl, allowlist);
 	const cacheKey = CacheKey.toCacheKey({ url: canonicalUrl, deviceType });
@@ -55,7 +60,6 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 	const globalCanonicalUrl = canonicalizeUrl(rawUrl, config.url.queryParams);
 	const globalCacheKey = CacheKey.toCacheKey({ url: globalCanonicalUrl, deviceType });
 
-	const excludedBy = config.excludePathPatterns.filter((pattern) => rawUrl.includes(pattern));
 	// Empty allowlist = allow all hosts (same rule as processJobResult).
 	const domainAllowed = config.domains.length === 0 || config.domains.includes(url.hostname);
 
@@ -75,8 +79,10 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 		ingress: {
 			mode: config.ingress.mode,
 			deviceTypeSource: config.ingress.deviceTypeSource,
+			// The headline answer to "will this URL be prerendered". Sole home for the class —
+			// `eligibility.prerendered` below is the derived boolean, not a second copy of it.
+			routeClass,
 			route: summarizeRoute(route),
-			matchedRoute: forwarded ? !!route : null,
 		},
 		allowlist: { used: allowlist, source: allowlistSource },
 		underGlobalAllowlist: {
@@ -86,9 +92,12 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 			differs: globalCacheKey !== cacheKey,
 		},
 		eligibility: {
-			// A URL matching an exclude pattern is proxied but never scheduled for rendering.
-			excluded: excludedBy.length > 0,
-			excludedBy,
+			// Only a `prerender` path is cached and scheduled; the other two classes are proxied
+			// live and never enter the cache.
+			prerendered: routeClass === PRERENDER,
+			// Set when the classification came from a folded `excludePathPatterns` entry rather
+			// than a route the operator wrote — a different config key to go and change.
+			excludedByPattern: route && route.source === 'excludePathPatterns' ? route.path : null,
 			// A host outside the allowlist is rendered but force-marked non-indexable.
 			domainAllowed,
 			domains: config.domains,

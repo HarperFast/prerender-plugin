@@ -4,7 +4,8 @@ import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { queryAllowlistFor } from '../util/ingress.js';
+import { classifyPath, queryAllowlistFor, PRERENDER } from '../util/routeClass.js';
+import { recordUnroutedPath } from '../util/unrouted.js';
 import { RenderTarget } from './RenderTarget.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 
@@ -128,6 +129,9 @@ export class RenderQueue extends Resource {
 
 		let cacheKey = result.id;
 		const url = result.redirectedTo || result.url;
+		// Set when the render landed somewhere we don't serve from cache: reschedule as normal
+		// but store nothing, since the content belongs to a different URL than the key.
+		let discardContent = false;
 
 		if (result.redirectedTo) {
 			const { deviceType } = CacheKey.parse(result.id);
@@ -145,9 +149,27 @@ export class RenderQueue extends Resource {
 			// reorder, encoding) is not a redirect — keep it under result.id and, crucially,
 			// do NOT delete its RenderTarget (which would drop it from the recurring rotation).
 			if (redirectKey !== result.id) {
-				logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-				await RenderTarget.delete(result.id);
-				cacheKey = redirectKey;
+				const redirectPath = URL.parse(result.redirectedTo)?.pathname;
+				const landedOn = redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass;
+
+				if (landedOn === PRERENDER) {
+					logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
+					await RenderTarget.delete(result.id);
+					cacheKey = redirectKey;
+				} else {
+					// The redirect target is a class we never serve from cache, so re-keying onto it
+					// would file the render where no read will ever look — and deleting this target
+					// would silently end the URL's rendering for good (see util/reconcile.js on how
+					// undiagnosable that state is). The route list may simply be incomplete, so
+					// report it and leave the target alone rather than destroy it on that evidence.
+					// The render is wasted each interval until the redirect or the routes are fixed.
+					logger.warn(
+						`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which is ${landedOn} — ` +
+							`discarding the render and keeping the target (no key to store it under)`
+					);
+					recordUnroutedPath(landedOn, redirectPath, 'redirect');
+					discardContent = true;
+				}
 			}
 		}
 
@@ -193,7 +215,7 @@ export class RenderQueue extends Resource {
 			// a cache miss.
 			const nextRenderTime = currentMinuteMs() + interval;
 
-			if (result.content) {
+			if (result.content && !discardContent) {
 				result.headers['x-harper-rendered'] = '1';
 				await databases.page_cache.PrerenderedPage.put(cacheKey, {
 					statusCode: result.statusCode,

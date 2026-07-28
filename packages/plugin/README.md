@@ -43,7 +43,13 @@ rest: true # required for the @export-ed table REST endpoints
     forwardedHostHeader: x-forwarded-host # forwarded mode: original public host
     forwardedProtoHeader: x-forwarded-proto
     defaultProtocol: https
-    routes: [] # forwarded mode: [{ match: exact|prefix, path, queryParams: [...] }]
+    # ordered, first match wins — see "Route classes"
+    routes: [] # [{ match: exact|prefix|contains, path, mode: prerender|passthrough, queryParams: [...] }]
+    report: # periodic tally of paths served without prerendering
+      enabled: true
+      interval: 300000 # ms between flushes, per worker
+      maxBuckets: 200 # distinct path buckets per class before overflow counting
+      topN: 20 # buckets listed per log line
 
   deviceTypes:
     supported: [desktop, mobile, tablet]
@@ -112,7 +118,8 @@ rest: true # required for the @export-ed table REST endpoints
     mobile: 'Mozilla/5.0 ... HarperPrerender/1.0'
     tablet: 'Mozilla/5.0 ... HarperPrerender/1.0'
 
-  excludePathPatterns: ['/search/'] # URLs containing these are never auto-scheduled
+  # compiled into ingress.routes as prepended passthrough entries; matched against the PATH
+  excludePathPatterns: ['/search/'] # paths containing these are never auto-scheduled
 
   analytics:
     enabled: true # record bot_request analytics at all
@@ -135,18 +142,13 @@ How bot requests reach the plugin is configurable via `ingress.mode`:
   target URL (`GET /p/https://example.com/page`). The device type comes from the
   `deviceTypeHeader` (`x-device-type`).
 
-- **`forwarded`** — for sitting behind a reverse proxy / CDN (e.g. Akamai) that routes a
+- **`forwarded`** — for sitting behind a reverse proxy / CDN that routes a
   restricted set of paths to the plugin. Here the incoming request carries a **relative**
   path, the original public host in a forwarded header, and (optionally) the device type as
   the **first path segment**:
-  - `ingress.routes` is an ordered list of `{ match, path, queryParams }`. `match` is
-    `exact` or `prefix`. A request is a prerender request only if its device-stripped path
-    matches a route — so the plugin's own resource endpoints (`/render_queue`,
-    `/queue_status`, …) fall through to REST **as long as no route matches them**. `prefix` is
-    a raw string prefix, so keep routes specific (e.g. `/catalog/`, not `/c`) — an overly broad
-    prefix like `/` would shadow those resource endpoints. The matched route's `queryParams` is
-    the cache-key / origin-fetch query allowlist (same semantics as `url.queryParams`), so
-    different routes can keep different params.
+  - `ingress.routes` is the ordered route list — see **Route classes** below. `prefix` is a raw
+    string prefix, so keep routes specific (e.g. `/products/`, not `/pr`) — an overly broad prefix
+    like `/` would shadow the plugin's own resource endpoints (`/render_queue`, `/queue_status`, …).
   - With `deviceTypeSource: path`, a leading `desktop`/`mobile`/`tablet` segment is consumed
     as the device type and stripped before the URL is rebuilt; if absent, the first supported
     device type is used and the path is left unchanged.
@@ -158,9 +160,58 @@ How bot requests reach the plugin is configurable via `ingress.mode`:
   → device `mobile`, target `https://www.example.com/catalog/x.jsp?CN=...` (a catalog route
   keeping only `CN`).
 
+### Route classes
+
+Every path resolves to exactly one class (`util/routeClass.js`). **No class blocks a request** —
+the difference is what gets cached and what gets reported:
+
+| class          | cached? | scheduled? | reported? | when                                                 |
+| -------------- | ------- | ---------- | --------- | ---------------------------------------------------- |
+| `prerender`    | yes     | yes        | no        | matched a route with `mode: prerender` (the default) |
+| `passthrough`  | no      | no         | no        | matched a route with `mode: passthrough`             |
+| `unclassified` | no      | no         | **yes**   | matched nothing                                      |
+
+```yaml
+ingress:
+  routes:
+    - { match: prefix, path: '/products/clearance/', mode: passthrough } # carve-out, ordered first
+    - { match: prefix, path: '/products/', queryParams: ['category'] } # mode defaults to prerender
+    - { match: exact, path: '/', queryParams: [] }
+```
+
+**First match wins**, so order most-specific first. That ordering is what lets a passthrough
+carve-out sit inside a prerendered prefix without a second list and a precedence rule.
+
+`passthrough` is a declaration that the CDN forwards a path and you have deliberately chosen not
+to prerender it. It differs from `unclassified` in two ways: it is not reported (no alarm), and in
+`deviceTypeSource: header` mode it is the **only** way to proxy a non-prerendered path at all —
+there, an unclassified path has to fall through to the plugin's own REST endpoints, because a
+route match is the only thing distinguishing bot traffic from an API call.
+
+`queryParams` is **rejected on a passthrough route**. The allowlist produces the canonical URL
+that serves as both the cache key _and_ the URL fetched from the origin. On a prerender route that
+coupling is required — the fetch must retrieve exactly what the key represents. A passthrough route
+has no cache and so no key, leaving an allowlist nothing to do but silently strip params from the
+proxied request and hand the visitor the wrong page.
+
+`excludePathPatterns` compiles into this list as `{ match: contains, mode: passthrough }` entries,
+**prepended** so an exclude still beats any prerender route it overlaps. Note that these are now
+matched against the **path** only (they used to match the whole URL string); a pattern aimed at a
+query param is warned about at config-apply time.
+
+Unclassified and passthrough traffic is counted per first path segment and flushed to the log every
+`ingress.report.interval`, one line per class. Unclassified is the CDN-config report ("the CDN is
+forwarding `/blog/*`"); passthrough is the coverage backlog ("we proxy this much bot traffic live,
+on purpose"). The tally is in-process, so **every worker** flushes its own line — each carries
+`node=` and `worker=`, and a reader sums across them.
+
+A forwarded-mode config that compiles to **zero** prerender routes is reported as a warning
+(`/prerender_admin` surfaces it): nothing is prerendered in that state, and it is what a single
+typo produces, since invalid entries are dropped one at a time.
+
 ### Staging passthrough
 
-To verify an origin against a staging edge (e.g. the Akamai staging network) _through_ the
+To verify an origin against a staging edge (e.g. a CDN's staging network) _through_ the
 plugin, set `staging.ip` to the staging edge IP. Then any **cache-miss** bot request that carries
 the `staging.header` request header (`x-harper-staging` by default) has its origin fetch connected
 to that IP instead of the public origin. Only the TCP address is pinned — the `Host` header and TLS

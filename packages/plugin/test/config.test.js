@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { config, applyOptions } from '../src/config.js';
+import { config, applyOptions, collectConfigWarnings } from '../src/config.js';
+
+const findingKeys = () => collectConfigWarnings().map((finding) => finding.key);
 
 test('applyOptions overrides scalars and replaces arrays', () => {
 	applyOptions({ botPathPrefix: '/bot/', domains: ['a.com', 'b.com'] });
@@ -94,6 +96,39 @@ test('applyOptions accepts forwarded ingress overrides and replaces routes whole
 	// untouched nested keys keep defaults
 	assert.equal(config.ingress.forwardedHostHeader, 'x-forwarded-host');
 	assert.deepEqual(config.ingress.routes, [{ match: 'prefix', path: '/catalog/', queryParams: ['CN'] }]);
+});
+
+test('applyOptions exposes the unrouted-path report defaults', () => {
+	applyOptions({});
+	assert.equal(config.ingress.report.enabled, true);
+	assert.equal(config.ingress.report.maxBuckets, 200);
+	applyOptions({ ingress: { report: { maxBuckets: 5 } } });
+	assert.equal(config.ingress.report.maxBuckets, 5);
+	assert.equal(config.ingress.report.enabled, true); // untouched nested keys keep defaults
+});
+
+test('forwarded mode with no valid prerender route is reported as a finding', () => {
+	// Nothing is prerendered in this state and nothing used to say so. It is also what a single
+	// typo produces, since invalid entries are dropped one by one.
+	applyOptions({ ingress: { mode: 'forwarded', routes: [{ match: 'typo', path: '/catalog/' }] } });
+	assert.ok(findingKeys().includes('ingress.routes'));
+
+	applyOptions({ ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/catalog/', queryParams: [] }] } });
+	assert.equal(findingKeys().includes('ingress.routes'), false);
+});
+
+test('a passthrough-only route list still counts as having no prerender routes', () => {
+	applyOptions({
+		ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/orders/', mode: 'passthrough' }] },
+	});
+	assert.ok(findingKeys().includes('ingress.routes'));
+});
+
+test('prefix mode is not held to the prerender-route requirement', () => {
+	// There is no route list to gate ingress in prefix mode — every request to botPathPrefix is
+	// a prerender request by construction.
+	applyOptions({});
+	assert.equal(findingKeys().includes('ingress.routes'), false);
 });
 
 test('applyOptions sources the security token from valueEnv (overriding the literal)', () => {
