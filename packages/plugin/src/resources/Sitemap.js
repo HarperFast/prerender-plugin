@@ -6,6 +6,10 @@ import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 
+// Rows scanned between event-loop yields while walking the existing targets for a sitemap, so a
+// pass over a large registry stays background work. Matches util/reconcile.js's YIELD_EVERY.
+const SCAN_YIELD_EVERY = 200;
+
 /**
  * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
  * means `ingress.routes` is incomplete rather than that the sitemap is wrong — a silent filter
@@ -84,10 +88,22 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					filteredTotals[PASSTHROUGH] += filtered[PASSTHROUGH];
 					filteredTotals[UNCLASSIFIED] += filtered[UNCLASSIFIED];
 
+					// Yield on rows SCANNED, not on writes issued. The write-driven yields below only
+					// fire on the rows this pass actually unlinks, and for a healthy sitemap that is
+					// almost none of them — so the loop can walk a very large registry reaching
+					// nothing but `continue`. `await` on the cursor drains microtasks but does not let
+					// timers or I/O callbacks run, so that walk starves the event loop. Same count-based
+					// convention (and constant) as the RenderTarget scan in util/reconcile.js.
+					//
+					// This got sharper with the filter: each non-matching row now costs a URL parse and
+					// a route-list walk (`classifyUrl`) where it used to cost almost nothing.
+					let scanned = 0;
 					for await (const target of RenderTarget.search({
 						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
 						conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 					})) {
+						if (++scanned % SCAN_YIELD_EVERY === 0) await new Promise(setImmediate);
+
 						const parsed = CacheKey.parse(target.cacheKey);
 						if (incomingEntryMap.has(parsed.url)) continue;
 
