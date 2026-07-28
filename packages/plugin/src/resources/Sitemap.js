@@ -5,10 +5,7 @@ import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/route
 import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
-
-// Rows scanned between event-loop yields while walking the existing targets for a sitemap, so a
-// pass over a large registry stays background work. Matches util/reconcile.js's YIELD_EVERY.
-const SCAN_YIELD_EVERY = 200;
+import { applyInBatches, collectFromScan } from '../util/scan.js';
 
 /**
  * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
@@ -71,8 +68,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 						queue.push(loc);
 					}
 				} else if (latestSitemap.entries?.length) {
-					let inflightCount = 0;
-					let lastPromise = null;
+					let inflight = [];
 
 					// Keep only the URLs this deployment actually prerenders, keyed by the canonical
 					// URL-half the bot read uses — so the prune diff below and the target keys built
@@ -88,59 +84,50 @@ class Sitemap extends databases.sitemaps.Sitemap {
 					filteredTotals[PASSTHROUGH] += filtered[PASSTHROUGH];
 					filteredTotals[UNCLASSIFIED] += filtered[UNCLASSIFIED];
 
-					// Yield on rows SCANNED, not on writes issued. The write-driven yields below only
-					// fire on the rows this pass actually unlinks, and for a healthy sitemap that is
-					// almost none of them — so the loop can walk a very large registry reaching
-					// nothing but `continue`. `await` on the cursor drains microtasks but does not let
-					// timers or I/O callbacks run, so that walk starves the event loop. Same count-based
-					// convention (and constant) as the RenderTarget scan in util/reconcile.js.
+					// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
+					// `RenderTarget.patch` from inside the open search cursor. Harper's long-transaction
+					// monitor aborts (422, poisoned) any transaction that has writes pending when it fires,
+					// so on a large sitemap the refresh could die partway through with some targets already
+					// unlinked. Collect while reading, write once the cursor is closed — see util/scan.js.
 					//
-					// This got sharper with the filter: each non-matching row now costs a URL parse and
-					// a route-list walk (`classifyUrl`) where it used to cost almost nothing.
-					let scanned = 0;
-					for await (const target of RenderTarget.search({
-						select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
-						conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
-					})) {
-						if (++scanned % SCAN_YIELD_EVERY === 0) await new Promise(setImmediate);
+					// The collect step is also where the filtered-vs-departed distinction is made. Absent
+					// from the incoming map means one of two very different things, and conflating them is
+					// what would turn every filtered URL into an orphan:
+					//   - it left the sitemap        -> unlink it, as before
+					//   - it was FILTERED just above -> leave it alone
+					// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the
+					// RenderSchedule row intact: the target keeps rendering on its interval with nothing
+					// tracking it and no sitemap to bring it back. Fine for a URL that genuinely left the
+					// sitemap (that is the pre-existing discovery-target shape), but applied to a filtered
+					// URL it would silently convert this pass's entire filtered set into
+					// permanently-rendering, unattributable targets — the exact load the filter removes.
+					//
+					// Retiring them is deliberately NOT done here. Deleting targets needs the guardrails the
+					// reconcile sweep will carry (refuse when no prerender routes compile, a ceiling on how
+					// much one pass may retire), not an ingest pass that would act on whatever the route
+					// list happened to say this morning.
+					const { items: departed } = await collectFromScan({
+						scan: () =>
+							RenderTarget.search({
+								select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
+								conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
+							}),
+						pick: (target) => {
+							const parsed = CacheKey.parse(target.cacheKey);
+							if (incomingEntryMap.has(parsed.url)) return null;
+							if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
+								deferred++;
+								return null;
+							}
+							return target;
+						},
+					});
 
-						const parsed = CacheKey.parse(target.cacheKey);
-						if (incomingEntryMap.has(parsed.url)) continue;
-
-						// Absent from the incoming map now means one of two very different things, and
-						// conflating them is what would turn every filtered URL into an orphan:
-						//   - it left the sitemap        -> unlink it, as before
-						//   - it was FILTERED just above -> leave it alone
-						// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the
-						// RenderSchedule row intact: the target keeps rendering on its interval with
-						// nothing tracking it and no sitemap to bring it back. Fine for a URL that
-						// genuinely left the sitemap (that is the pre-existing discovery-target shape),
-						// but applied to a filtered URL it would silently convert this pass's entire
-						// filtered set into permanently-rendering, unattributable targets — the exact
-						// load this change exists to remove.
-						//
-						// Retiring them is deliberately NOT done here. Deleting targets needs the
-						// guardrails the reconcile sweep will carry (refuse when no prerender routes
-						// compile, a ceiling on how much one pass may retire), not an ingest pass that
-						// would act on whatever the route list happened to say this morning.
-						if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
-							deferred++;
-							continue;
-						}
-
-						lastPromise = RenderTarget.patch(target.cacheKey, {
-							sitemapUrl: null,
-						});
-						inflightCount++;
-						removed.push(target);
-
-						if (inflightCount >= 50) {
-							await lastPromise;
-							inflightCount = 0;
-						} else if (inflightCount % 20 === 0) {
-							await new Promise(setImmediate);
-						}
-					}
+					await applyInBatches({
+						items: departed,
+						apply: (target) => RenderTarget.patch(target.cacheKey, { sitemapUrl: null }),
+					});
+					removed.push(...departed);
 
 					for (const [cacheUrl, { changefreq }] of incomingEntryMap) {
 						const renderInterval = getTtlFromChangeFreq(changefreq, {
@@ -185,28 +172,34 @@ class Sitemap extends databases.sitemaps.Sitemap {
 								// Explicit revalidate renders now; a newly-discovered target omits the
 								// time so RenderTarget.put jitters its first render across the interval,
 								// keeping bulk sitemap population from stampeding the queue.
-								lastPromise = RenderTarget.put(cacheKey, {
-									renderInterval,
-									sitemapUrl,
-									nextRenderTime: revalidate ? currentMinuteMs() : undefined,
-								});
-								inflightCount++;
+								inflight.push(
+									RenderTarget.put(cacheKey, {
+										renderInterval,
+										sitemapUrl,
+										nextRenderTime: revalidate ? currentMinuteMs() : undefined,
+									})
+								);
 							} else {
 								skipped++;
 							}
 
-							if (inflightCount >= 50) {
-								await lastPromise;
-								inflightCount = 0;
-							} else if (inflightCount % 20 === 0) {
+							// Drain the WHOLE batch, not just the most recent promise. This used to await
+							// `lastPromise` alone, which left up to 49 writes still in flight — and Harper's
+							// long-transaction monitor aborts (422, poisoned) any transaction that has writes
+							// pending when it fires, so a slow batch could kill the refresh partway through.
+							// Awaiting every promise in the batch is what makes "no pending writes across a
+							// monitor tick" actually true. See util/scan.js.
+							if (inflight.length >= config.scan.batchSize) {
+								await Promise.all(inflight);
+								inflight = [];
 								await new Promise(setImmediate);
 							}
 						}
 					}
 
-					if (inflightCount > 0) {
-						await lastPromise;
-						inflightCount = 0;
+					if (inflight.length > 0) {
+						await Promise.all(inflight);
+						inflight = [];
 					}
 				}
 
@@ -240,17 +233,20 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		return results;
 	}
 
+	/**
+	 * Two-phase for the same reason as RenderTarget.revalidate: deleting from inside the open
+	 * search cursor leaves writes pending while the cursor is open, which the long-transaction
+	 * monitor aborts (422) partway through on a large sitemap. See util/scan.js.
+	 */
 	async delete() {
 		const url = this.getId();
 
-		const it = RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: url }], select: 'cacheKey' });
-		let promise;
-		for await (const cacheKey of it) {
-			promise = RenderTarget.delete(cacheKey);
-			await new Promise(setImmediate);
-		}
+		const { items: cacheKeys } = await collectFromScan({
+			scan: () => RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: url }], select: 'cacheKey' }),
+			pick: (cacheKey) => cacheKey,
+		});
 
-		await promise;
+		await applyInBatches({ items: cacheKeys, apply: (cacheKey) => RenderTarget.delete(cacheKey) });
 
 		return super.delete(...arguments);
 	}

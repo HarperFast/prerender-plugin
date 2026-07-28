@@ -248,6 +248,17 @@ const defaultConfig = () => ({
 		},
 	},
 
+	// Bounded registry walks. Harper ends a transaction that stays open too long: with writes
+	// pending it is ABORTED and poisoned (422 "split long-running work into smaller
+	// transactions"), and read-only it is committed and its clock reset. So every walk over a
+	// large table collects while reading and writes only after the cursor closes, in drained
+	// batches. See util/scan.js.
+	scan: {
+		collectCap: 100000, // max rows buffered from one scan; the scan still completes and reports the true count
+		batchSize: 100, // writes issued (and fully awaited) per batch once the cursor is closed
+		yieldEvery: 200, // rows scanned between event-loop yields — matches util/reconcile.js
+	},
+
 	sitemap: {
 		refreshTime: '12:00', // local time-of-day for the daily sitemap refresh
 		timezone: 'America/New_York',
