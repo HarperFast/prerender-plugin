@@ -411,6 +411,25 @@ const mergeInto = (target, source, path = 'prerender') => {
 };
 
 /**
+ * Reject overrides that pass `mergeInto`'s type check but cannot be honored at all, restoring
+ * the default. This is distinct from `collectConfigWarnings`, which reports settings that are
+ * merely risky — these are values that would silently corrupt behavior, so they are dropped.
+ *
+ * `cacheKey.delimiter` is structural: an empty string is a string, so the type check accepts
+ * it, but then `toCacheKey` concatenates the attributes with no separator (making the keys of
+ * two URLs where one is a prefix of the other collide) and `parse` splits on `''`, i.e. into
+ * individual CHARACTERS — a cache key parses to `{ url: 'h', deviceType: 't' }`. It would also
+ * collapse the whole render schedule onto a single minute, since `indexOf('')` is 0 and every
+ * jitter seed becomes the empty string. Nothing downstream can work, so the default wins.
+ */
+const rejectUnusableOverrides = (fresh) => {
+	if (fresh.cacheKey.delimiter === '') {
+		getLogger().warn?.('[prerender] Ignoring prerender.cacheKey.delimiter: must not be empty — keeping the default');
+		fresh.cacheKey.delimiter = defaultConfig().cacheKey.delimiter;
+	}
+};
+
+/**
  * Apply host-provided options onto the live `config`, with validation. Safe to
  * call repeatedly (e.g. on every options `change`). Resets to defaults first so
  * removed keys revert.
@@ -418,6 +437,7 @@ const mergeInto = (target, source, path = 'prerender') => {
 export const applyOptions = (options) => {
 	const fresh = defaultConfig();
 	if (isPlainObject(options)) mergeInto(fresh, options);
+	rejectUnusableOverrides(fresh);
 
 	// Replace the contents of the live object in place to preserve the reference.
 	for (const key of Object.keys(config)) delete config[key];
