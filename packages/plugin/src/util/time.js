@@ -46,19 +46,43 @@ export const getNextTimeOfDay = (timeStr, timezone) => {
 };
 
 /**
- * Deterministic first-render time: `now` plus a per-key offset in `[0, interval)`,
+ * The jitter offset is seeded off the URL half of a cache key, NOT the whole key, so every
+ * device-type variant of one URL lands on the SAME minute. Seeded off the full key, `desktop`
+ * and `mobile` hash to unrelated offsets and drift up to a whole interval apart, which means
+ * the two copies of a page can differ in age by up to 24h — a content change shows on one
+ * device and not the other, and every render pays a cold origin/CDN fetch. Aligned, the pair
+ * sorts adjacently in `RenderQueue.claim`'s nextRenderTime order and is rendered back-to-back
+ * by one worker off a warm origin. Residency already groups them this way (`schedulerNode`
+ * comes from the URL alone), so the seed now agrees with the routing.
+ *
+ * Alignment persists cycle over cycle because `processJobResult` reschedules from
+ * `currentMinuteMs() + interval` — both variants completing within the same minute get an
+ * identical next time, so the pair stays locked instead of drifting.
+ */
+const jitterSeed = (key) => {
+	const str = String(key ?? '');
+	const at = str.indexOf(config.cacheKey.delimiter);
+	// No delimiter → not a cache key. Seed off the whole string rather than the empty prefix
+	// `CacheKey.extractUrl` would return, which would collapse every such key onto a single
+	// minute — precisely the herd this jitter exists to prevent.
+	return at === -1 ? str : str.slice(0, at);
+};
+
+/**
+ * Deterministic first-render time: `now` plus a per-URL offset in `[0, interval)`,
  * floored to the minute. Spreads the initial render of freshly-scheduled targets
  * across the render interval instead of firing them all at once (the thundering
- * herd on bulk sitemap population / crawl spikes). The offset is keyed off the
- * cacheKey so it's stable and reproducible. Recurring re-renders are scheduled
- * relative to render completion (see RenderQueue.processJobResult), so this initial
- * spread is preserved cycle over cycle rather than realigning to a fixed instant.
+ * herd on bulk sitemap population / crawl spikes). The offset is keyed off the URL
+ * half of the cacheKey (see `jitterSeed`) so it's stable, reproducible, and shared
+ * by a URL's device variants. Recurring re-renders are scheduled relative to render
+ * completion (see RenderQueue.processJobResult), so this initial spread is preserved
+ * cycle over cycle rather than realigning to a fixed instant.
  */
 export const getInitialRenderTime = (key, interval) => {
 	// Guard against a zero/negative/NaN interval (which would make the modulo NaN and
 	// schedule an invalid time) so the helper is safe to call with unvalidated inputs.
 	const safeInterval = Number.isFinite(interval) && interval > 0 ? interval : config.render.defaultInterval;
-	return currentMinuteMs(Date.now() + (fnv1a32(key) % safeInterval));
+	return currentMinuteMs(Date.now() + (fnv1a32(jitterSeed(key)) % safeInterval));
 };
 
 export const getNextSitemapRefreshTime = () => getNextTimeOfDay(config.sitemap.refreshTime, config.sitemap.timezone);
