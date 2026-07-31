@@ -20,10 +20,15 @@
 import RenderWorker, { Renderer } from './Worker.js';
 import defaultRenderer from './renderer.js';
 import logger from './util/Logger.js';
-import { applySettings, settings, defaultLaunchOptions } from './settings.js';
+import { applySettings, settings, workerLaunchOptions } from './settings.js';
 import type { BrowserOptions } from './settings.js';
 import { initResourceCache } from './ResourceCache.js';
 import { ErrorHandler } from './errorHandler.js';
+
+// How long in-flight renders get to finish after a termination signal before they're abandoned.
+// Must stay comfortably under the supervisor's termination grace period (Kubernetes' default is
+// 30s) so the drain + browser close complete before SIGKILL.
+const SHUTDOWN_DRAIN_MS = 12000;
 
 export type StartWorkerOptions = BrowserOptions & {
 	/** Renderer to use instead of the built-in default. */
@@ -60,18 +65,27 @@ export async function startWorker(options: StartWorkerOptions): Promise<RenderWo
 	// Block job intake until the cache has scanned disk and built its in-memory index.
 	await initResourceCache(settings.resourceCache);
 
+	// Who owns SIGTERM/SIGINT also decides how Chrome is torn down — see workerLaunchOptions.
+	const ownsSignals = installSignalHandlers !== false;
 	const worker = new RenderWorker({
 		maxConcurrency: settings.concurrency,
 		browserExpirationThreshold: settings.browserExpirationThreshold,
 		rps: settings.rps,
-		browserLaunchOptions: settings.browserLaunchOptions ?? defaultLaunchOptions(),
+		browserLaunchOptions: workerLaunchOptions(ownsSignals),
 		renderer,
 	});
 
 	// Install signal handlers AFTER the worker exists so SIGTERM/SIGINT can drain it
 	// (stop claiming, finish in-flight renders) instead of dropping in-flight work.
-	if (installSignalHandlers !== false) {
-		new ErrorHandler({ onTerminate: () => worker.shutdown() });
+	if (ownsSignals) {
+		new ErrorHandler({
+			// The forced-exit backstop must land strictly AFTER the drain deadline: with both at
+			// the same value it can fire in the same tick the drain gives up, cutting off the
+			// graceful browser close that follows it.
+			shutdownDeadlineMs: SHUTDOWN_DRAIN_MS + 3000,
+			onTerminate: () => worker.shutdown(SHUTDOWN_DRAIN_MS),
+			onForceExit: () => worker.killBrowsersSync(),
+		});
 	}
 
 	worker.run();

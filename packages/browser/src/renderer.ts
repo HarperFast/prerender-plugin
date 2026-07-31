@@ -4,6 +4,7 @@ import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalAllowsIndex } from './util/url.js';
+import { markRenderPhase } from './util/renderPhase.js';
 
 const noop = () => {};
 
@@ -174,11 +175,23 @@ const renderer: Renderer = async (page, job) => {
 	const remainingTimer = new RemainingTimer(job.renderBudget || config.navigation.renderBudgetMs);
 
 	navStart = Date.now();
-	const finalRes = await page.goto(navigationUrl.href, {
-		waitUntil: config.navigation.waitUntil,
-		timeout: remainingTimer.remaining,
-		signal: ac.signal,
-	});
+	// Navigation gets the smaller of its own sub-cap and what's left of the render budget, so a
+	// stalled origin fails fast instead of consuming the whole budget (see navigationTimeoutMs).
+	const navigationTimeout = config.navigation.navigationTimeoutMs
+		? Math.min(remainingTimer.remaining, config.navigation.navigationTimeoutMs)
+		: remainingTimer.remaining;
+	let finalRes;
+	try {
+		finalRes = await page.goto(navigationUrl.href, {
+			waitUntil: config.navigation.waitUntil,
+			timeout: navigationTimeout,
+			signal: ac.signal,
+		});
+	} catch (e) {
+		// Tag the phase so the worker separates "never reached waitUntil" from a settle-phase
+		// timeout — same TimeoutError, different cause.
+		throw markRenderPhase(e, 'navigation');
+	}
 	timings.navTotal = Date.now() - navStart;
 
 	const settleStart = Date.now();

@@ -80,7 +80,15 @@ export default class ManagedBrowser {
 					try {
 						await context.close();
 					} catch (err: any) {
-						logger.error({ err }, 'Failed to close context.');
+						// A context dies with its browser, so a disconnected browser here means the
+						// context is already gone — expected during teardown (the page 'close' event
+						// that got us here IS the browser closing). Only a live-browser failure is a
+						// real leak worth an error.
+						if (this.browser.connected) {
+							logger.error({ err }, 'Failed to close context.');
+						} else {
+							logger.debug({ err }, 'context already gone with its browser');
+						}
 					}
 				}
 				this.activePages--;
@@ -111,6 +119,19 @@ export default class ManagedBrowser {
 		// (renderOnce) process should exit promptly. In the long-lived worker the loop stays alive
 		// via other refs, so kill() still fires there.
 		fallback.unref();
+	}
+
+	/**
+	 * SIGKILL Chrome without awaiting anything, for use immediately before `process.exit()`
+	 * (see RenderWorker.killBrowsersSync). `close()`/`kill()` are the graceful paths; this one
+	 * only guarantees the process isn't left behind.
+	 */
+	killSync() {
+		try {
+			this.browser.process()?.kill('SIGKILL');
+		} catch {
+			// Already exited, or we can't signal it — nothing left to do on the way out.
+		}
 	}
 
 	async kill() {

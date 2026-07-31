@@ -306,3 +306,21 @@ export const defaultLaunchOptions = (): LaunchOptions => ({
 	ignoreDefaultArgs: ['--disable-dev-shm-usage'],
 	args: settings.chromeArgs,
 });
+
+/**
+ * Launch options for the long-lived worker's browser: the consumer's options (or the defaults)
+ * plus, when the worker owns process signals, puppeteer's own signal handlers turned OFF.
+ *
+ * Those handlers close Chrome the moment SIGTERM/SIGHUP lands — and `process.exit(130)` on
+ * SIGINT — which races the worker's graceful drain: in-flight renders die mid-evaluate
+ * ("Attempted to use detached Frame" / "Target closed"), their results are lost, and the
+ * page-close handlers then fail to dispose their browser contexts. The worker closes the browser
+ * itself (`destroy()`, with a SIGKILL fallback, plus `killBrowsersSync()` on forced exits), so
+ * disabling them orphans nothing. They're applied LAST so a consumer-supplied `handleSIGTERM`
+ * can't silently reinstate the race; when the embedding app owns signals we don't touch them,
+ * since there puppeteer's handlers may be the only teardown.
+ */
+export const workerLaunchOptions = (ownsSignals: boolean): LaunchOptions => ({
+	...(settings.browserLaunchOptions ?? defaultLaunchOptions()),
+	...(ownsSignals ? { handleSIGTERM: false, handleSIGINT: false, handleSIGHUP: false } : {}),
+});

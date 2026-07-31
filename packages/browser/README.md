@@ -51,23 +51,23 @@ cache, and starts the worker loop; it resolves once the cache index is built. It
 
 Only `harper` is required; everything else has a default.
 
-| Option                       | Default                                           | Purpose                                                           |
-| ---------------------------- | ------------------------------------------------- | ----------------------------------------------------------------- |
-| `harper`                     | _(required)_                                      | `{ mqttOrigin, user, pass, workerId }` — connection + identity    |
-| `queuePort`                  | `9926`                                            | Port of the plugin's render-queue HTTP API                        |
-| `bypass`                     | `{ header: x-harper-renderer-bypass, token: '' }` | Shared origin-bypass header/token (match the plugin)              |
-| `config`                     | built-in defaults                                 | Rendering config (deep-partial object _or_ JSON file path)        |
-| `concurrency`                | ~half the CPUs                                    | Max concurrent page renders                                       |
-| `rps`                        | `8`                                               | Max render starts per second                                      |
-| `jobClaimLimit`              | `concurrency * 2`                                 | Jobs claimed per batch                                            |
-| `browserExpirationThreshold` | `200`                                             | Pages a browser renders before being retired                      |
-| `incognitoPages`             | `true`                                            | Render each page in a fresh incognito context                     |
-| `contentEncoding`            | `gzip`                                            | Encoding used when posting rendered HTML back                     |
-| `chromeArgs`                 | hardened headless set                             | Chrome launch flags                                               |
-| `browserLaunchOptions`       | built from `chromeArgs`                           | Full Puppeteer launch options (overrides `chromeArgs`)            |
-| `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)        |
-| `renderer`                   | the default renderer                              | Custom renderer (see below)                                       |
-| `installSignalHandlers`      | `true`                                            | Install uncaught/SIGTERM handlers; set `false` to own the process |
+| Option                       | Default                                           | Purpose                                                                                     |
+| ---------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `harper`                     | _(required)_                                      | `{ mqttOrigin, user, pass, workerId }` — connection + identity                              |
+| `queuePort`                  | `9926`                                            | Port of the plugin's render-queue HTTP API                                                  |
+| `bypass`                     | `{ header: x-harper-renderer-bypass, token: '' }` | Shared origin-bypass header/token (match the plugin)                                        |
+| `config`                     | built-in defaults                                 | Rendering config (deep-partial object _or_ JSON file path)                                  |
+| `concurrency`                | ~half the CPUs                                    | Max concurrent page renders                                                                 |
+| `rps`                        | `8`                                               | Max render starts per second                                                                |
+| `jobClaimLimit`              | `concurrency * 2`                                 | Jobs claimed per batch                                                                      |
+| `browserExpirationThreshold` | `200`                                             | Pages a browser renders before being retired                                                |
+| `incognitoPages`             | `true`                                            | Render each page in a fresh incognito context                                               |
+| `contentEncoding`            | `gzip`                                            | Encoding used when posting rendered HTML back                                               |
+| `chromeArgs`                 | hardened headless set                             | Chrome launch flags                                                                         |
+| `browserLaunchOptions`       | built from `chromeArgs`                           | Full Puppeteer launch options (overrides `chromeArgs`)                                      |
+| `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)                                  |
+| `renderer`                   | the default renderer                              | Custom renderer (see below)                                                                 |
+| `installSignalHandlers`      | `true`                                            | Own SIGTERM/SIGINT (drain in-flight renders, then close Chrome); `false` to own the process |
 
 ## Rendering config
 
@@ -88,6 +88,10 @@ include what you change:
 	"navigation": {
 		"waitUntil": "domcontentloaded", // 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'
 		"renderBudgetMs": 20000,
+		// Cap on the initial navigation alone. 0 (default) lets it use the whole renderBudgetMs, so a
+		// page that stalls before `waitUntil` holds a concurrency slot for the full budget and leaves
+		// nothing for settle. Set it to fail a stalled navigation fast (counted as failures.navTimeout).
+		"navigationTimeoutMs": 0,
 		"networkIdleMs": 300,
 		"networkIdleTimeoutMs": 1000,
 	},
