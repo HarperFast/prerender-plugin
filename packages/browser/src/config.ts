@@ -51,6 +51,18 @@ export type NavigationConfig = {
 	waitUntil: PuppeteerLifeCycleEvent | PuppeteerLifeCycleEvent[];
 	/** Default per-render time budget (ms) used when a job doesn't specify one. */
 	renderBudgetMs: number;
+	/**
+	 * Cap (ms) on the initial navigation alone — the wait for `waitUntil`. Without it the
+	 * `goto` timeout is the *whole* remaining render budget, so a page that stalls before
+	 * `waitUntil` burns a concurrency slot for the full budget and, when it does eventually
+	 * load, leaves nothing for the settle phase (the waits below all clamp to what's left).
+	 * A sub-budget fails a stalled navigation fast, frees the slot, and separates the two
+	 * causes in the worker's stats (`failures.navTimeout` vs `failures.timeout`).
+	 *
+	 * `0` disables the cap (navigation may use the entire budget) — the default, preserving
+	 * prior behavior. Values above the remaining budget have no effect; the smaller wins.
+	 */
+	navigationTimeoutMs: number;
 	/** Idle window for the post-navigation/scroll network-idle waits (ms). */
 	networkIdleMs: number;
 	/** Max time to wait for network idle (ms). */
@@ -219,6 +231,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 	navigation: {
 		waitUntil: 'domcontentloaded',
 		renderBudgetMs: 20000,
+		navigationTimeoutMs: 0,
 		networkIdleMs: 300,
 		networkIdleTimeoutMs: 1000,
 		domStableMs: 0,
@@ -289,9 +302,9 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 			throw new Error(`prerender config: navigation.${field} must be a positive number`);
 		}
 	}
-	// domStableMs may be 0 (disabled) and domStableTolerance 0 (exact match), so these
-	// only have to be non-negative numbers.
-	for (const field of ['domStableMs', 'domStableTolerance'] as const) {
+	// domStableMs may be 0 (disabled), domStableTolerance 0 (exact match), and
+	// navigationTimeoutMs 0 (no navigation sub-cap), so these only have to be non-negative.
+	for (const field of ['domStableMs', 'domStableTolerance', 'navigationTimeoutMs'] as const) {
 		if (typeof config.navigation[field] !== 'number' || config.navigation[field] < 0) {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
 		}

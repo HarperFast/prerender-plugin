@@ -11,11 +11,39 @@ type ManagedBrowserConfig = ManagedBrowserOptions & {
 	puppeteerLaunchOptions?: LaunchOptions;
 };
 
+/**
+ * All of these mean the browser context is ALREADY gone (its browser is closing, its target died,
+ * or the connection is down) — so a failed dispose leaked nothing and isn't worth an error. The
+ * case that IS worth one: a live browser refusing to dispose a context that still exists, since
+ * that context then survives until the browser exits.
+ */
+export const contextAlreadyGone = (err: unknown): boolean => {
+	const message = err instanceof Error ? err.message : String(err);
+	return (
+		message.includes('Failed to find context') ||
+		message.includes('Target closed') ||
+		message.includes('Session closed') ||
+		message.includes('Connection closed')
+	);
+};
+
 export default class ManagedBrowser {
 	maxActivePages: number;
 
 	browser: Browser;
 
+	/**
+	 * Set once teardown starts (close/kill), so page-close handlers can tell "the browser is going
+	 * away under me" from a genuine failure. Also stops a caller from re-entering close() while the
+	 * first one is still in flight.
+	 */
+	closing = false;
+
+	/**
+	 * Renders currently using this browser — incremented when a job starts on it and decremented
+	 * only once that job's page is closed and its result posted, so `jobRefs === 0` really means
+	 * "nothing is touching this browser" (what the retirement cleanup keys on).
+	 */
 	jobRefs: number = 0;
 
 	activePages: number = 0;
@@ -80,7 +108,15 @@ export default class ManagedBrowser {
 					try {
 						await context.close();
 					} catch (err: any) {
-						logger.error({ err }, 'Failed to close context.');
+						// A context dies with its browser, so teardown makes this expected: the page
+						// 'close' event that got us here can BE the browser closing (worker shutdown, or
+						// a retired browser being reaped). Only a live browser failing to dispose a
+						// context that still exists is a real leak.
+						if (this.closing || !this.browser.connected || contextAlreadyGone(err)) {
+							logger.debug({ err }, 'browser context already gone at page close');
+						} else {
+							logger.error({ err }, 'Failed to close context.');
+						}
 					}
 				}
 				this.activePages--;
@@ -98,6 +134,7 @@ export default class ManagedBrowser {
 	}
 
 	async close() {
+		this.closing = true;
 		try {
 			await this.browser.close();
 		} catch (err) {
@@ -113,7 +150,22 @@ export default class ManagedBrowser {
 		fallback.unref();
 	}
 
+	/**
+	 * SIGKILL Chrome without awaiting anything, for use immediately before `process.exit()`
+	 * (see RenderWorker.killBrowsersSync). `close()`/`kill()` are the graceful paths; this one
+	 * only guarantees the process isn't left behind.
+	 */
+	killSync() {
+		this.closing = true;
+		try {
+			this.browser.process()?.kill('SIGKILL');
+		} catch {
+			// Already exited, or we can't signal it — nothing left to do on the way out.
+		}
+	}
+
 	async kill() {
+		this.closing = true;
 		const process = this.browser.process();
 
 		if (!process) {

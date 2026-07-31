@@ -21,6 +21,8 @@ test('defaults reproduce the original hardcoded behavior', () => {
 	assert.deepEqual(config.block.resourceTypes, ['image', 'media', 'font']);
 	assert.deepEqual(config.block.urlPatterns, []);
 	assert.equal(config.navigation.waitUntil, 'domcontentloaded');
+	// no navigation sub-cap by default: goto may use the whole render budget
+	assert.equal(config.navigation.navigationTimeoutMs, 0);
 	assert.equal(config.scroll.enabled, true);
 	assert.equal(config.scroll.topSettleMs, 300);
 	assert.equal(config.scroll.stepFraction, 0.5);
@@ -58,6 +60,17 @@ test('deep-merges a file over defaults, preserving untouched nested fields', () 
 	assert.throws(
 		() => mergeConfig({ scroll: { stepFraction: 'half' as unknown as number } }),
 		/scroll\.stepFraction must be a positive number/
+	);
+	// navigation.navigationTimeoutMs may be 0 (no sub-cap) but not negative / non-numeric
+	assert.equal(mergeConfig({ navigation: { navigationTimeoutMs: 0 } }).navigation.navigationTimeoutMs, 0);
+	assert.equal(mergeConfig({ navigation: { navigationTimeoutMs: 8000 } }).navigation.navigationTimeoutMs, 8000);
+	assert.throws(
+		() => mergeConfig({ navigation: { navigationTimeoutMs: -1 } }),
+		/navigation\.navigationTimeoutMs must be a non-negative number/
+	);
+	assert.throws(
+		() => mergeConfig({ navigation: { navigationTimeoutMs: '8s' as unknown as number } }),
+		/navigation\.navigationTimeoutMs must be a non-negative number/
 	);
 	// arrays replace wholesale
 	assert.deepEqual(config.block.urlPatterns, ['google-analytics.com']);

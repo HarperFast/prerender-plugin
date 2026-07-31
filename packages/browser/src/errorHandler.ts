@@ -5,17 +5,36 @@ export type ErrorHandlerOptions = {
 	onTerminate?: () => Promise<void> | void;
 	/** Hard cap on the graceful drain before forcing exit(0). Default 12s. */
 	shutdownDeadlineMs?: number;
+	/**
+	 * Synchronous last-resort cleanup run immediately before a forced `process.exit()` — a
+	 * second termination signal, or the drain blowing through `shutdownDeadlineMs`. Neither
+	 * path can await `onTerminate`, so this is where anything that would otherwise be orphaned
+	 * (the Chrome processes) gets killed. Must not be async: nothing after it is awaited.
+	 */
+	onForceExit?: () => void;
 };
 
 export class ErrorHandler {
 	private onTerminate?: () => Promise<void> | void;
+	private onForceExit?: () => void;
 	private shutdownDeadlineMs: number;
 	private terminating = false;
 
 	constructor(options: ErrorHandlerOptions = {}) {
 		this.onTerminate = options.onTerminate;
+		this.onForceExit = options.onForceExit;
 		this.shutdownDeadlineMs = options.shutdownDeadlineMs ?? 12000;
 		this.setupGlobalHandlers();
+	}
+
+	/** Run the sync last-resort cleanup; never let it prevent the exit it precedes. */
+	private forceExit(code: number): never {
+		try {
+			this.onForceExit?.();
+		} catch (err) {
+			logger.error({ err }, 'error during forced-exit cleanup');
+		}
+		process.exit(code);
 	}
 
 	private setupGlobalHandlers() {
@@ -57,14 +76,14 @@ export class ErrorHandler {
 			// A second signal (e.g. an impatient Ctrl+C) forces an immediate, unclean exit
 			// instead of waiting out the drain.
 			logger.warn({ signal }, 'Second termination signal — forcing exit');
-			process.exit(1);
+			this.forceExit(1);
 		}
 		this.terminating = true;
 		logger.info({ signal }, 'Termination signal received');
 
 		// Hard backstop: if the drain hangs, exit before the supervisor SIGKILLs us — with a
 		// NON-zero code so the orchestrator sees an unclean/timed-out shutdown, not a clean one.
-		const backstop = setTimeout(() => process.exit(1), this.shutdownDeadlineMs);
+		const backstop = setTimeout(() => this.forceExit(1), this.shutdownDeadlineMs);
 		backstop.unref();
 		let exitCode = 0;
 		try {

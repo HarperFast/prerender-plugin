@@ -8,8 +8,13 @@ import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
 import { settings } from './settings.js';
 import { CpuSampler } from './util/cpu.js';
+import { renderPhaseOf } from './util/renderPhase.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
+
+// How long a retired browser may sit un-reaped before it's closed regardless of its ref counts.
+// Comfortably longer than a render + its result POST, so it only ever fires on stuck bookkeeping.
+const RETIRED_BROWSER_MAX_MS = 120000;
 
 type RenderWorkerConfig = {
 	/**
@@ -43,7 +48,8 @@ export default class RenderWorker {
 
 	browserPromise: Promise<ManagedBrowser> | null = null;
 
-	retiredBrowsers: Set<ManagedBrowser> = new Set();
+	/** Retired browsers awaiting reaping, each mapped to when it was retired (see closeRetiredBrowsers). */
+	retiredBrowsers: Map<ManagedBrowser, number> = new Map();
 
 	browserLaunchOptions?: LaunchOptions;
 
@@ -73,7 +79,20 @@ export default class RenderWorker {
 			completed: 0,
 			succeeded: 0,
 			emptyContent: 0,
-			failures: { timeout: 0, protocol: 0, tooManyRedirects: 0, getPageFailed: 0, other: 0 },
+			failures: {
+				timeout: 0,
+				// Navigation never reached `waitUntil` (slow origin / starved renderer) — distinct
+				// from `timeout`, which is a settle-phase or protocol-level timeout.
+				navTimeout: 0,
+				protocol: 0,
+				tooManyRedirects: 0,
+				getPageFailed: 0,
+				// Renders killed by our own teardown (drain deadline / browser gone during
+				// shutdown). Not a render regression — kept out of the other buckets so a
+				// rollout doesn't read as a failure spike.
+				shutdownAborted: 0,
+				other: 0,
+			},
 			expiredSkipped: 0,
 			concurrencyBlocked: 0,
 			rpsDelayed: 0,
@@ -302,11 +321,34 @@ export default class RenderWorker {
 		// the resulting abort rejection.
 		const ac = new AbortController();
 		const deadline = setTimeout(deadlineMs, undefined, { signal: ac.signal }).catch(() => {});
-		await Promise.race([Promise.allSettled([...this.inflight]), deadline]);
+		const DRAINED = Symbol('drained');
+		const outcome = await Promise.race([Promise.allSettled([...this.inflight]).then(() => DRAINED), deadline]);
 		ac.abort();
 
+		// Whether in-flight renders finished (their results are posted) or were abandoned to the
+		// deadline (re-rendered later by whoever re-claims the jobs) — the difference matters when
+		// reading a rollout's logs, so say which happened.
+		const drained = outcome === DRAINED;
+		if (!drained) {
+			logger.warn({ deadlineMs, inflight: this.inflight.size }, 'shutdown drain deadline expired — abandoning renders');
+		}
+
 		await this.destroy();
-		logger.info('worker shutdown complete');
+		logger.info({ drained }, 'worker shutdown complete');
+	}
+
+	/**
+	 * Best-effort SYNCHRONOUS teardown of every Chrome process, for the forced-exit paths where
+	 * there's no time to await `destroy()` (a second termination signal, or the shutdown deadline
+	 * backstop). Puppeteer's own signal handlers are disabled when we own the drain, so without
+	 * this a forced exit would orphan Chrome. A browser still mid-launch has no PID yet and can't
+	 * be reached from here — the same gap those forced paths already accept.
+	 */
+	killBrowsersSync() {
+		const browsers = [...this.retiredBrowsers.keys(), ...(this.browser ? [this.browser] : [])];
+		for (const browser of browsers) {
+			browser.killSync();
+		}
 	}
 
 	// Async so callers can AWAIT it before process.exit() — otherwise the event loop dies before
@@ -328,9 +370,9 @@ export default class RenderWorker {
 		if (this.browserPromise) {
 			closing.push(this.browserPromise.then((b) => b.close().catch(noop)).catch(noop));
 		}
-		this.retiredBrowsers.forEach((browser) => {
+		for (const browser of this.retiredBrowsers.keys()) {
 			closing.push(browser.close().catch(noop));
-		});
+		}
 
 		this.browser = null;
 		this.retiredBrowsers.clear();
@@ -338,13 +380,32 @@ export default class RenderWorker {
 		await Promise.all(closing);
 	}
 
+	/**
+	 * Reap retired browsers once they're genuinely idle — BOTH counters at zero. Either-or (the
+	 * previous condition) closed a browser out from under open pages: a render drops its job ref
+	 * before its result POST completes, so `jobRefs === 0` while pages are still open is normal,
+	 * and closing there killed those pages mid-flight — which surfaced as "Failed to close
+	 * context" from their close handlers.
+	 *
+	 * The backstop is a deadline, not a looser condition: if a counter is somehow stuck (a page
+	 * whose 'close' never fires), force the close after RETIRED_BROWSER_MAX_MS rather than leak a
+	 * Chrome process forever — and say so, because a stuck counter is a bug worth seeing.
+	 */
 	closeRetiredBrowsers() {
-		for (const browser of this.retiredBrowsers) {
-			if (browser.activePages === 0 || browser.jobRefs === 0) {
-				browser.close().then(() => {
-					this.retiredBrowsers.delete(browser);
-				});
+		for (const [browser, retiredAt] of this.retiredBrowsers) {
+			if (browser.closing) continue; // already being reaped by an earlier tick
+			const idle = browser.activePages === 0 && browser.jobRefs === 0;
+			const expired = Date.now() - retiredAt >= RETIRED_BROWSER_MAX_MS;
+			if (!idle && !expired) continue;
+			if (!idle) {
+				logger.warn(
+					{ activePages: browser.activePages, jobRefs: browser.jobRefs, retiredMs: Date.now() - retiredAt },
+					'retired browser never went idle — closing anyway'
+				);
 			}
+			browser.close().then(() => {
+				this.retiredBrowsers.delete(browser);
+			});
 		}
 	}
 
@@ -352,7 +413,7 @@ export default class RenderWorker {
 		if (this.retiredBrowsers.has(browser)) {
 			return;
 		}
-		this.retiredBrowsers.add(browser);
+		this.retiredBrowsers.set(browser, Date.now());
 		this.stats.browserRetirements++;
 		this.browser = null;
 	}
@@ -381,9 +442,20 @@ export default class RenderWorker {
 			try {
 				content = await this.renderFn(page, job);
 			} catch (e) {
-				if (e instanceof TimeoutError) {
+				if (this.shuttingDown) {
+					// We tore the browser down under this render (drain deadline, or a browser that
+					// went away mid-drain): "detached Frame" / "Target closed" / a failed context
+					// dispose. Our own doing, so it's a warning, not a render failure — and no point
+					// retiring a browser that's already being closed.
+					this.stats.failures.shutdownAborted++;
+					logger.warn({ url: job.url, phase: renderPhaseOf(e), err: e }, 'render aborted by worker shutdown');
+				} else if (e instanceof TimeoutError) {
 					this.retireBrowser(browser);
-					this.stats.failures.timeout++;
+					if (renderPhaseOf(e) === 'navigation') {
+						this.stats.failures.navTimeout++;
+					} else {
+						this.stats.failures.timeout++;
+					}
 				} else if (e instanceof ProtocolError) {
 					this.retireBrowser(browser);
 					this.stats.failures.protocol++;
@@ -393,13 +465,14 @@ export default class RenderWorker {
 				} else {
 					this.stats.failures.other++;
 				}
-				logger.error({ url: job.url, err: e }, 'failed to render page');
+				if (!this.shuttingDown) {
+					logger.error({ url: job.url, phase: renderPhaseOf(e), err: e }, 'failed to render page');
+				}
 				error = e as Error;
 			}
 		}
 
 		job.attemptEnded(error, content);
-		browser.jobRefs--;
 
 		// Per-interval outcome + latency accounting (drained by logStats).
 		this.stats.completed++;
@@ -427,8 +500,15 @@ export default class RenderWorker {
 			return false;
 		});
 		const closePromise = page ? browser.closePage(page) : Promise.resolve();
-		const [posted] = await Promise.all([sendPromise, closePromise]);
-		if (!posted) this.stats.resultPostFailures++;
+		try {
+			const [posted] = await Promise.all([sendPromise, closePromise]);
+			if (!posted) this.stats.resultPostFailures++;
+		} finally {
+			// Released only now — not when the render finished. A retired browser is reaped once its
+			// refs hit zero, so dropping the ref before the page is closed let the reaper close the
+			// browser under an open page.
+			browser.jobRefs--;
+		}
 	}
 
 	async getBrowser(): Promise<ManagedBrowser> {
