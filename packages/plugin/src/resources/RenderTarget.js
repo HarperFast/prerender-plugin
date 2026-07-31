@@ -34,10 +34,11 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 		// silently. `util/reconcile.js` is what actually repairs it.
 		const result = await super.put({ ...CacheKey.parse(cacheKey), ...data }, target);
 
-		// Absent a valid explicit time, jitter the first render across the interval (keyed
-		// off the cacheKey) so bulk-created targets don't all come due at once. RenderTarget
-		// is API-exposed, so validate the numbers (reject negatives / NaN / non-numbers)
-		// rather than trust the payload.
+		// Absent a valid explicit time, jitter the first render across the interval (keyed off
+		// the URL half of the cacheKey, so a URL's device variants share one slot) so
+		// bulk-created targets don't all come due at once. RenderTarget is API-exposed, so
+		// validate the numbers (reject negatives / NaN / non-numbers) rather than trust the
+		// payload.
 		const interval =
 			Number.isFinite(data.renderInterval) && data.renderInterval > 0
 				? data.renderInterval

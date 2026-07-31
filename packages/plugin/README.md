@@ -83,7 +83,11 @@ rest: true # required for the @export-ed table REST endpoints
 
   page:
     ttl: 86400000 # 24h — default cached-page TTL
-    minTtl: 21600000 # 6h  — floor for sitemap-derived TTLs
+    minTtl: 21600000 # 6h  — floor for sitemap-derived TTLs. Also floors the RENDER INTERVAL a
+    #                        sitemap's `changefreq` produces, and therefore the width of the
+    #                        initial-render jitter: `changefreq: hourly` becomes a 6h cadence
+    #                        spread over 6h, i.e. 4x the sustained render load of `daily`.
+    #                        Raise this to slow a fleet down; it trades page freshness for load.
     swrTtl: 10800000 # 3h  — stale-while-revalidate window
 
   render:
@@ -241,6 +245,33 @@ A forwarded-mode config that compiles to **zero** prerender routes is reported a
 (`/prerender_admin` surfaces it): nothing is prerendered in that state, and it is what a single
 typo produces, since invalid entries are dropped one at a time.
 
+### How bulk sitemap population is staggered
+
+Populating a large sitemap must not queue every URL at once. A new target's first render is
+therefore `now + (hash(url) % renderInterval)`, floored to the minute — a uniform spread over the
+interval, so the fleet sees a flat stream rather than a herd. Because `processJobResult`
+reschedules from **render completion** (`currentMinuteMs() + interval`) rather than a fixed
+time-of-day, that spread is preserved cycle over cycle and self-paces to fleet throughput.
+
+Three properties are worth knowing before a bulk upload:
+
+- **The stagger window is the target's own `renderInterval`, not a fixed 24h.** For a sitemap
+  target that comes from `changefreq`, floored at `page.minTtl` — so `always`/`hourly` spread over
+  `minTtl` (6h by default) and re-render that often, i.e. 4× the sustained load of `daily`. A
+  sitemap's `changefreq` is the single biggest determinant of steady-state render load, and it
+  comes from the sitemap XML, not from this config. Check it before uploading.
+- **A URL's device variants share one slot.** The offset is seeded off the URL half of the cache
+  key, so `…|desktop` and `…|mobile` come due together, sort adjacently in claim order, and get
+  rendered back-to-back by one worker off a warm origin. It also keeps the cached copies of one
+  page the same age — seeded off the full key they drifted up to a whole interval apart, so a
+  content change could appear on one device and not the other for hours.
+- **`revalidate: true` bypasses the stagger entirely**, setting every entry due in the same
+  minute. That is its purpose (forcing a backfill), but it is not how to warm a large sitemap for
+  the first time — omit it and let the jitter place the URLs.
+
+There is no separate "warm-up" pacing knob, and none is needed: the initial spread is exactly the
+steady-state cadence, so a fleet that can sustain the ongoing load can absorb the warm.
+
 ### Staging passthrough
 
 To verify an origin against a staging edge (e.g. a CDN's staging network) _through_ the
@@ -336,7 +367,11 @@ this plugin's resources all set `loadAsInstance = false`.
 - **Overview** — per-node queue status with staleness, table counts, the due-now backlog, and
   a next-24h histogram of `nextRenderTime`. That histogram is the quickest way to tell a
   healthy jittered spread from a render herd: a flat distribution means the initial-render
-  jitter is working, a single tall bar means everything comes due at once.
+  jitter is working, a single tall bar means everything comes due at once. Note the histogram
+  is capped at `management.scanCap` rows and reports `truncated` — at a large registry read the
+  shape, not the counts. The due-now backlog is the capacity signal: jitter flattens the
+  arrival curve but cannot lower it, so a backlog that climbs and never returns to zero means
+  sustained demand (`Σ targets ÷ renderInterval`) exceeds fleet throughput.
 - **URL explainer** — paste a URL and see the ingress route that matched, the query allowlist
   it selected, the canonical URL, the resulting cache key, and the live
   `RenderTarget`/`RenderSchedule`/`PrerenderedPage`/`NonIndexable` rows under it. It also

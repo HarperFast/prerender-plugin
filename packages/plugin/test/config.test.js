@@ -145,3 +145,19 @@ test('applyOptions keeps the literal token when valueEnv is unset or missing', (
 	applyOptions({ securityToken: { value: 'literal', valueEnv: '__MISSING_ENV__' } });
 	assert.equal(config.securityToken.value, 'literal');
 });
+
+/*
+ * An empty cacheKey.delimiter passes mergeInto's typeof check (it IS a string) but cannot be
+ * honored: `toCacheKey` would concatenate with no separator, `parse` would split on '' into
+ * individual characters, and every jitter seed would become '' — collapsing the whole render
+ * schedule onto one minute. It is rejected outright rather than merely warned about.
+ */
+test('applyOptions rejects an empty cacheKey.delimiter and keeps the default', () => {
+	applyOptions({ cacheKey: { delimiter: '' } });
+	assert.equal(config.cacheKey.delimiter, '|');
+});
+
+test('applyOptions still honors a non-empty cacheKey.delimiter override', () => {
+	applyOptions({ cacheKey: { delimiter: '::' } });
+	assert.equal(config.cacheKey.delimiter, '::');
+});

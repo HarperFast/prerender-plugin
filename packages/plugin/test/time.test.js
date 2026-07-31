@@ -43,3 +43,43 @@ test('getInitialRenderTime is stable per key and spreads across keys', () => {
 	const values = new Set(Array.from({ length: 100 }, (_, i) => getInitialRenderTime(`key-${i}`, interval)));
 	assert.ok(values.size > 1, 'distinct keys spread across times');
 });
+
+/*
+ * The jitter is seeded off the URL half of the cache key, so a URL's device variants come due
+ * together: the pair sorts adjacently in claim order and renders back-to-back off a warm
+ * origin, and the two cached copies of a page never differ in age by up to a whole interval.
+ * Seeded off the full cacheKey (as it was), `|desktop` and `|mobile` hashed to unrelated
+ * offsets.
+ */
+test('getInitialRenderTime aligns a URL device variants on one slot', () => {
+	const interval = 24 * 60 * MINUTE;
+	const url = 'https://x.test/catalog/shoes';
+	const desktop = getInitialRenderTime(`${url}|desktop`, interval);
+	const mobile = getInitialRenderTime(`${url}|mobile`, interval);
+	const tablet = getInitialRenderTime(`${url}|tablet`, interval);
+
+	// Allow a 1-minute window: the calls can straddle a wall-clock minute boundary.
+	assert.ok(Math.abs(desktop - mobile) <= MINUTE, 'desktop and mobile share a slot');
+	assert.ok(Math.abs(desktop - tablet) <= MINUTE, 'desktop and tablet share a slot');
+});
+
+test('getInitialRenderTime still spreads distinct URLs that share a device type', () => {
+	const interval = 24 * 60 * MINUTE;
+	const values = new Set(
+		Array.from({ length: 200 }, (_, i) => getInitialRenderTime(`https://x.test/p/prd-${i}|desktop`, interval))
+	);
+	// Aligning device variants must not collapse the URL spread. 200 URLs over 1440 minute
+	// buckets: a handful of hash collisions is expected, a near-total collapse is the bug.
+	assert.ok(values.size > 100, `distinct URLs stay spread (got ${values.size} slots)`);
+});
+
+/*
+ * A key with no delimiter is not a cache key. It must fall back to hashing the whole string:
+ * `CacheKey.extractUrl` returns '' for such a key, and seeding off that would put EVERY
+ * delimiter-less key on the same minute — the exact herd this jitter prevents.
+ */
+test('getInitialRenderTime does not collapse keys that lack the delimiter', () => {
+	const interval = 24 * 60 * MINUTE;
+	const values = new Set(Array.from({ length: 100 }, (_, i) => getInitialRenderTime(`no-delimiter-${i}`, interval)));
+	assert.ok(values.size > 50, `delimiter-less keys stay spread (got ${values.size} slots)`);
+});
