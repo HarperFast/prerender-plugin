@@ -12,6 +12,10 @@ import { renderPhaseOf } from './util/renderPhase.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
+// How long a retired browser may sit un-reaped before it's closed regardless of its ref counts.
+// Comfortably longer than a render + its result POST, so it only ever fires on stuck bookkeeping.
+const RETIRED_BROWSER_MAX_MS = 120000;
+
 type RenderWorkerConfig = {
 	/**
 	 * The max number of concurrent page renders
@@ -44,7 +48,8 @@ export default class RenderWorker {
 
 	browserPromise: Promise<ManagedBrowser> | null = null;
 
-	retiredBrowsers: Set<ManagedBrowser> = new Set();
+	/** Retired browsers awaiting reaping, each mapped to when it was retired (see closeRetiredBrowsers). */
+	retiredBrowsers: Map<ManagedBrowser, number> = new Map();
 
 	browserLaunchOptions?: LaunchOptions;
 
@@ -340,7 +345,7 @@ export default class RenderWorker {
 	 * be reached from here — the same gap those forced paths already accept.
 	 */
 	killBrowsersSync() {
-		const browsers = [...this.retiredBrowsers, ...(this.browser ? [this.browser] : [])];
+		const browsers = [...this.retiredBrowsers.keys(), ...(this.browser ? [this.browser] : [])];
 		for (const browser of browsers) {
 			browser.killSync();
 		}
@@ -365,9 +370,9 @@ export default class RenderWorker {
 		if (this.browserPromise) {
 			closing.push(this.browserPromise.then((b) => b.close().catch(noop)).catch(noop));
 		}
-		this.retiredBrowsers.forEach((browser) => {
+		for (const browser of this.retiredBrowsers.keys()) {
 			closing.push(browser.close().catch(noop));
-		});
+		}
 
 		this.browser = null;
 		this.retiredBrowsers.clear();
@@ -375,13 +380,32 @@ export default class RenderWorker {
 		await Promise.all(closing);
 	}
 
+	/**
+	 * Reap retired browsers once they're genuinely idle — BOTH counters at zero. Either-or (the
+	 * previous condition) closed a browser out from under open pages: a render drops its job ref
+	 * before its result POST completes, so `jobRefs === 0` while pages are still open is normal,
+	 * and closing there killed those pages mid-flight — which surfaced as "Failed to close
+	 * context" from their close handlers.
+	 *
+	 * The backstop is a deadline, not a looser condition: if a counter is somehow stuck (a page
+	 * whose 'close' never fires), force the close after RETIRED_BROWSER_MAX_MS rather than leak a
+	 * Chrome process forever — and say so, because a stuck counter is a bug worth seeing.
+	 */
 	closeRetiredBrowsers() {
-		for (const browser of this.retiredBrowsers) {
-			if (browser.activePages === 0 || browser.jobRefs === 0) {
-				browser.close().then(() => {
-					this.retiredBrowsers.delete(browser);
-				});
+		for (const [browser, retiredAt] of this.retiredBrowsers) {
+			if (browser.closing) continue; // already being reaped by an earlier tick
+			const idle = browser.activePages === 0 && browser.jobRefs === 0;
+			const expired = Date.now() - retiredAt >= RETIRED_BROWSER_MAX_MS;
+			if (!idle && !expired) continue;
+			if (!idle) {
+				logger.warn(
+					{ activePages: browser.activePages, jobRefs: browser.jobRefs, retiredMs: Date.now() - retiredAt },
+					'retired browser never went idle — closing anyway'
+				);
 			}
+			browser.close().then(() => {
+				this.retiredBrowsers.delete(browser);
+			});
 		}
 	}
 
@@ -389,7 +413,7 @@ export default class RenderWorker {
 		if (this.retiredBrowsers.has(browser)) {
 			return;
 		}
-		this.retiredBrowsers.add(browser);
+		this.retiredBrowsers.set(browser, Date.now());
 		this.stats.browserRetirements++;
 		this.browser = null;
 	}
@@ -449,7 +473,6 @@ export default class RenderWorker {
 		}
 
 		job.attemptEnded(error, content);
-		browser.jobRefs--;
 
 		// Per-interval outcome + latency accounting (drained by logStats).
 		this.stats.completed++;
@@ -477,8 +500,15 @@ export default class RenderWorker {
 			return false;
 		});
 		const closePromise = page ? browser.closePage(page) : Promise.resolve();
-		const [posted] = await Promise.all([sendPromise, closePromise]);
-		if (!posted) this.stats.resultPostFailures++;
+		try {
+			const [posted] = await Promise.all([sendPromise, closePromise]);
+			if (!posted) this.stats.resultPostFailures++;
+		} finally {
+			// Released only now — not when the render finished. A retired browser is reaped once its
+			// refs hit zero, so dropping the ref before the page is closed let the reaper close the
+			// browser under an open page.
+			browser.jobRefs--;
+		}
 	}
 
 	async getBrowser(): Promise<ManagedBrowser> {
