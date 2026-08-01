@@ -50,6 +50,43 @@ test('REATTACH is distinct from CREATE so attribution changes never reset the re
 	assert.notEqual(actionForExisting(moved, SITEMAP), TargetAction.CREATE);
 });
 
+// --- first writer wins: a URL listed by two sitemaps in the same walk ---
+
+test('a target claimed by an EARLIER sitemap in this walk is left alone', () => {
+	// The ping-pong this prevents: A claims it, B takes it, next walk A takes it back, forever.
+	const visited = new Set(['https://x/index.xml', 'https://x/sm-a.xml']);
+	const existing = project({ sitemapUrl: 'https://x/sm-a.xml' }, ['sitemapUrl']);
+	assert.equal(actionForExisting(existing, 'https://x/sm-b.xml', visited), TargetAction.DUPLICATE);
+});
+
+test('a target owned by a sitemap NOT in this walk is still re-attached', () => {
+	// It genuinely moved — e.g. shuffled across a paginated product sitemap boundary.
+	const visited = new Set(['https://x/index.xml', 'https://x/sm-b.xml']);
+	const existing = project({ sitemapUrl: 'https://x/old.xml' }, ['sitemapUrl']);
+	assert.equal(actionForExisting(existing, 'https://x/sm-b.xml', visited), TargetAction.REATTACH);
+});
+
+test('an unlinked target (sitemapUrl null) is re-attached, never treated as a duplicate', () => {
+	// `claimedThisWalk.has(null)` must not be reachable — null is "owned by nobody".
+	const visited = new Set(['https://x/sm-a.xml']);
+	const existing = project({ sitemapUrl: null }, ['sitemapUrl']);
+	assert.equal(actionForExisting(existing, 'https://x/sm-b.xml', visited), TargetAction.REATTACH);
+});
+
+test('ownership converges: the second walk produces no writes at all', () => {
+	// Walk 1: A creates it. Walk 2: A skips via knownKeys, B sees A in visited -> DUPLICATE.
+	// Neither walk writes, so `updated` returns to zero and becomes a usable change signal.
+	const visited = new Set(['https://x/sm-a.xml', 'https://x/sm-b.xml']);
+	const ownedByA = project({ sitemapUrl: 'https://x/sm-a.xml' }, ['sitemapUrl']);
+	assert.equal(actionForExisting(ownedByA, 'https://x/sm-a.xml', visited), TargetAction.SKIP);
+	assert.equal(actionForExisting(ownedByA, 'https://x/sm-b.xml', visited), TargetAction.DUPLICATE);
+});
+
+test('omitting claimedThisWalk keeps the old re-attach behaviour', () => {
+	const existing = project({ sitemapUrl: 'https://x/sm-a.xml' }, ['sitemapUrl']);
+	assert.equal(actionForExisting(existing, 'https://x/sm-b.xml'), TargetAction.REATTACH);
+});
+
 test('a STRING select still reads as changed — the bug this guards', () => {
 	// Documents why the call site must pass an array. A string select returns the bare value, so
 	// `.sitemapUrl` is undefined and every known target looks re-attachable. The blast radius is
@@ -82,6 +119,12 @@ test('revalidate never skips — it must re-put every target with an immediate r
 });
 
 // --- createRefreshRun: the tally, and the things the old result shape lost ---
+
+test('duplicates are counted so an otherwise invisible overlap is reported', () => {
+	const run = createRefreshRun();
+	run.count('duplicates', 95);
+	assert.equal(run.snapshot().duplicates, 95);
+});
 
 test('counts accumulate and filtered totals merge per class', () => {
 	const run = createRefreshRun();
