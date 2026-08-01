@@ -1,9 +1,11 @@
 import { config } from '../config.js';
-import { RenderTarget } from './RenderTarget.js';
+import { describeError } from '../util/errors.js';
+import { RenderTarget, getScheduleWriteTimeouts } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
-import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
-import { parseSitemap, partitionSitemapEntries, sitemapTargetNeedsUpdate } from '../util/sitemap.js';
+import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
+import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
+import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
@@ -36,224 +38,569 @@ function reportFiltered(sitemapUrl, filtered, totalEntries) {
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
-	static async refresh(rootSitemapUrl, { revalidate = false, deviceTypes = config.deviceTypes.default } = {}) {
-		let created = 0;
-		let updated = 0;
-		let skipped = 0;
-		// Entries dropped because they are not a prerender path, and existing targets for such
-		// URLs that this pass deliberately left in place for the reconcile sweep to retire.
-		const filteredTotals = { [PASSTHROUGH]: 0, [UNCLASSIFIED]: 0 };
-		let deferred = 0;
-		const removed = [];
+	/**
+	 * Walk a sitemap (or sitemap index) and reconcile it into RenderTargets.
+	 *
+	 * `onProgress` is invoked after every document with the run's current snapshot, so a caller
+	 * running this in the background can persist where it got to. It is awaited but never
+	 * allowed to fail the walk.
+	 */
+	static async refresh(
+		rootSitemapUrl,
+		{ revalidate = false, deviceTypes = config.deviceTypes.default, onProgress } = {}
+	) {
+		const run = createRefreshRun({
+			removedSampleCap: config.sitemap.removedSampleCap,
+			failedCap: config.sitemap.failedCap,
+		});
+		// Routed-write timeouts are counted node-wide (see RenderTarget), so the walk reports the
+		// delta across its own run. Concurrent traffic can contribute, which is fine for what the
+		// number is for: any non-zero value means schedule writes are being lost right now.
+		const timeoutsAtStart = getScheduleWriteTimeouts();
 
 		const visited = new Set();
-
-		const queue = [rootSitemapUrl];
+		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
+		run.count('sitemapsDiscovered');
 
 		while (queue.length) {
-			let qLen = queue.length;
+			const { url: sitemapUrl, parentUrl } = queue.shift();
 
-			while (qLen--) {
-				const sitemapUrl = queue.shift();
+			if (visited.has(sitemapUrl)) continue;
+			visited.add(sitemapUrl);
 
-				if (visited.has(sitemapUrl)) continue;
-
-				visited.add(sitemapUrl);
-
-				logger.info(`Processing sitemap`, sitemapUrl);
-
-				const latestSitemap = await fetchLatestSitemap(sitemapUrl);
-
-				if (latestSitemap.isIndex === true) {
-					for (const { loc } of latestSitemap.entries) {
-						queue.push(loc);
-					}
-				} else if (latestSitemap.entries?.length) {
-					let inflight = [];
-
-					// Keep only the URLs this deployment actually prerenders, keyed by the canonical
-					// URL-half the bot read uses — so the prune diff below and the target keys built
-					// later both match what a request will look up. Everything else is counted and
-					// dropped rather than turned into a target that renders into a key no read
-					// computes. See util/sitemap.js.
-					const { incoming: incomingEntryMap, filtered, invalid } = partitionSitemapEntries(latestSitemap.entries);
-
-					for (const { loc, message } of invalid) {
-						logger.warn(`Skipping invalid sitemap entry ${loc}: ${message}`);
-					}
-					reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
-					filteredTotals[PASSTHROUGH] += filtered[PASSTHROUGH];
-					filteredTotals[UNCLASSIFIED] += filtered[UNCLASSIFIED];
-
-					// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
-					// `RenderTarget.patch` from inside the open search cursor. Harper's long-transaction
-					// monitor aborts (422, poisoned) any transaction that has writes pending when it fires,
-					// so on a large sitemap the refresh could die partway through with some targets already
-					// unlinked. Collect while reading, write once the cursor is closed — see util/scan.js.
-					//
-					// The collect step is also where the filtered-vs-departed distinction is made. Absent
-					// from the incoming map means one of two very different things, and conflating them is
-					// what would turn every filtered URL into an orphan:
-					//   - it left the sitemap        -> unlink it, as before
-					//   - it was FILTERED just above -> leave it alone
-					// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the
-					// RenderSchedule row intact: the target keeps rendering on its interval with nothing
-					// tracking it and no sitemap to bring it back. Fine for a URL that genuinely left the
-					// sitemap (that is the pre-existing discovery-target shape), but applied to a filtered
-					// URL it would silently convert this pass's entire filtered set into
-					// permanently-rendering, unattributable targets — the exact load the filter removes.
-					//
-					// Retiring them is deliberately NOT done here. Deleting targets needs the guardrails the
-					// reconcile sweep will carry (refuse when no prerender routes compile, a ceiling on how
-					// much one pass may retire), not an ingest pass that would act on whatever the route
-					// list happened to say this morning.
-					const { items: departed } = await collectFromScan({
-						scan: () =>
-							RenderTarget.search({
-								select: ['cacheKey', 'renderInterval', 'sitemapUrl'],
-								conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
-							}),
-						pick: (target) => {
-							const parsed = CacheKey.parse(target.cacheKey);
-							if (incomingEntryMap.has(parsed.url)) return null;
-							if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
-								deferred++;
-								return null;
-							}
-							return target;
-						},
-					});
-
-					await applyInBatches({
-						items: departed,
-						apply: (target) => RenderTarget.patch(target.cacheKey, { sitemapUrl: null }),
-					});
-					removed.push(...departed);
-
-					for (const [cacheUrl, { changefreq }] of incomingEntryMap) {
-						const renderInterval = getTtlFromChangeFreq(changefreq, {
-							minTtl: config.page.minTtl,
-							defaultTtl: config.page.ttl,
-						});
-
-						for (const deviceType of deviceTypes) {
-							let updateTarget = false;
-
-							const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
-
-							if (revalidate) {
-								updateTarget = true;
-								created++;
-							} else {
-								// Only `sitemapUrl` is needed here; avoid materializing the full
-								// record for every entry × deviceType in this bulk loop.
-								//
-								// MUST be an array select. A string select projects to the bare VALUE,
-								// not a record, so `existingTarget.sitemapUrl` read `undefined` off a
-								// string and `updateTarget` was therefore always true: every known
-								// target was re-put on every refresh, and since `RenderTarget.put`
-								// recomputes `getInitialRenderTime` (now + jitter), each refresh pushed
-								// the next render FORWARD. Any target whose interval exceeds the refresh
-								// period — changefreq weekly, monthly, yearly — was reset before it ever
-								// came due and so never re-rendered at all.
-								const existingTarget = await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] });
-
-								if (existingTarget) {
-									updateTarget = sitemapTargetNeedsUpdate(existingTarget, sitemapUrl);
-									if (updateTarget) {
-										updated++;
-									}
-								} else {
-									created++;
-									updateTarget = true;
-								}
-							}
-
-							if (updateTarget) {
-								// Explicit revalidate renders now; a newly-discovered target omits the
-								// time so RenderTarget.put jitters its first render across the interval,
-								// keeping bulk sitemap population from stampeding the queue.
-								inflight.push(
-									RenderTarget.put(cacheKey, {
-										renderInterval,
-										sitemapUrl,
-										nextRenderTime: revalidate ? currentMinuteMs() : undefined,
-									})
-								);
-							} else {
-								skipped++;
-							}
-
-							// Drain the WHOLE batch, not just the most recent promise. This used to await
-							// `lastPromise` alone, which left up to 49 writes still in flight — and Harper's
-							// long-transaction monitor aborts (422, poisoned) any transaction that has writes
-							// pending when it fires, so a slow batch could kill the refresh partway through.
-							// Awaiting every promise in the batch is what makes "no pending writes across a
-							// monitor tick" actually true. See util/scan.js.
-							if (inflight.length >= config.scan.batchSize) {
-								await Promise.all(inflight);
-								inflight = [];
-								await setImmediate();
-							}
-						}
-					}
-
-					if (inflight.length > 0) {
-						await Promise.all(inflight);
-						inflight = [];
-					}
+			try {
+				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run });
+				for (const child of children) {
+					queue.push({ url: child, parentUrl: sitemapUrl });
+					run.count('sitemapsDiscovered');
 				}
+			} catch (e) {
+				// A failing ROOT means the operator's own action was invalid (a bad URL, a 403 from
+				// the edge, an HTML error page where XML was expected) and nothing was accomplished,
+				// so it propagates — the same "fail loudly rather than report created: 0" property
+				// `fetchLatestSitemap` was written for.
+				//
+				// A failing CHILD is one branch of a fan-out that is routinely tens of documents
+				// wide. Aborting the whole walk over one of them used to throw away every remaining
+				// child, which at index scale means abandoning hundreds of thousands of URLs because
+				// a single sitemap 503'd. Record it and keep going; `failed` reports it.
+				if (sitemapUrl === rootSitemapUrl) throw e;
 
-				await Sitemap.put(sitemapUrl, latestSitemap);
+				logger.error(`[prerender] Sitemap ${sitemapUrl} failed and was skipped: ${describeError(e)}`);
+				run.addFailure(sitemapUrl, e);
+			}
+
+			// Counts attempts, failures included: this is what a caller watches against
+			// `sitemapsDiscovered` to see progress, and a walk with a failed child must still be
+			// able to reach its total rather than appearing to stall forever.
+			run.count('sitemapsProcessed');
+
+			try {
+				await onProgress?.(snapshotWithTimeouts(run, timeoutsAtStart));
+			} catch (e) {
+				logger.warn(`[prerender] Sitemap progress callback failed: ${describeError(e)}`);
 			}
 		}
 
-		return { created, updated, skipped, removed, filtered: filteredTotals, deferred };
+		return snapshotWithTimeouts(run, timeoutsAtStart);
 	}
 
+	/**
+	 * Refresh one sitemap (by id) or every stored sitemap (no id).
+	 *
+	 * Background by default — see `config.sitemap.background`. A sitemap index is not an
+	 * HTTP-request-sized unit of work: a real one fans out to tens of children and over a million
+	 * target writes, so holding the request open guarantees the client or an intermediary times
+	 * out with no result, no error, and no way to tell what was written. Answering immediately
+	 * with a handle, and persisting progress to `SitemapRefresh`, makes the walk observable
+	 * instead.
+	 */
 	async post(options = {}) {
+		const { background = config.sitemap.background, ...refreshOptions } = options;
 		const urls = [];
 		const paramUrl = this.getId();
 
 		if (paramUrl) {
 			urls.push(paramUrl);
 		} else {
-			for await (const url of Sitemap.search({ select: 'url' })) {
-				urls.push(url);
+			// Roots only — an index reaches its own children, so walking the children as top-level
+			// rows too would process every one of them twice. See `rootSitemapUrls`.
+			urls.push(...(await rootSitemapUrls()));
+		}
+
+		if (!background) {
+			const results = [];
+			for (const url of urls) {
+				logger.info(`Scheduling refresh for sitemap`, url);
+				results.push(await runTrackedRefresh(url, refreshOptions));
 			}
+			return results;
 		}
 
-		const results = [];
+		// One sitemap: claim synchronously so the caller is told immediately when a run is already
+		// in flight, rather than silently starting a second walk over the same targets.
+		if (urls.length === 1) {
+			const [url] = urls;
+			const claim = await claimRefreshRun(url);
+			if (!claim.ok) {
+				return {
+					background: true,
+					sitemaps: [{ url, started: false, reason: claim.reason, progress: progressPath(url) }],
+				};
+			}
 
-		for (const url of urls) {
-			logger.info(`Scheduling refresh for sitemap`, url);
-			const result = await Sitemap.refresh(url, options);
-			results.push(result);
+			logger.info(`Starting background refresh for sitemap`, url);
+			// Deliberately not awaited: the walk outlives this request. Failures are logged and
+			// recorded on the progress row by `runTrackedRefresh`; the catch here only keeps the
+			// rejection from surfacing as an unhandled one.
+			void runTrackedRefresh(url, refreshOptions).catch(() => {});
+			return { background: true, sitemaps: [{ url, started: true, progress: progressPath(url) }] };
 		}
 
-		return results;
+		// Refresh-all: ONE background job that walks them in sequence. Starting every stored
+		// sitemap at once would put N concurrent walks on a single worker, each holding its own
+		// entry map and issuing its own write batches — strictly worse than the sequential
+		// behaviour this replaces. Claims are taken just-in-time inside the loop so a queued
+		// sitemap is not judged against a claim made an hour earlier.
+		void (async () => {
+			for (const url of urls) {
+				const claim = await claimRefreshRun(url);
+				if (!claim.ok) {
+					logger.info(`[prerender] Skipping sitemap ${url}: ${claim.reason}`);
+					continue;
+				}
+				await runTrackedRefresh(url, refreshOptions).catch(() => {});
+			}
+		})();
+
+		return {
+			background: true,
+			sitemaps: urls.map((url) => ({ url, started: true, progress: progressPath(url) })),
+		};
 	}
 
 	/**
-	 * Two-phase for the same reason as RenderTarget.revalidate: deleting from inside the open
-	 * search cursor leaves writes pending while the cursor is open, which the long-transaction
-	 * monitor aborts (422) partway through on a large sitemap. See util/scan.js.
+	 * Remove a sitemap, its descendants, and every RenderTarget attributed to any of them.
+	 *
+	 * Deleting an INDEX has to reach its children or it accomplishes almost nothing: targets are
+	 * attributed to the child sitemap that listed them, never to the index, so an index delete on
+	 * its own removes ZERO targets. It just drops the index row and strands every child row plus
+	 * all their targets, which keep rendering forever with nothing left to attribute or retire
+	 * them. `parentUrl` is what makes the descendants findable.
+	 *
+	 * Target removal is two-phase per sitemap — see `deleteTargetsFor`.
 	 */
 	async delete() {
 		const url = this.getId();
 
-		const { items: cacheKeys } = await collectFromScan({
-			scan: () => RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: url }], select: 'cacheKey' }),
-			pick: (cacheKey) => cacheKey,
-		});
+		// Re-entrancy: an ancestor's cascade has already removed this sitemap's targets and is
+		// only calling back through here to drop the row. Also what makes a cyclic index
+		// (A lists B, B lists A) terminate.
+		if (cascading.has(url)) return super.delete(...arguments);
 
-		await applyInBatches({ items: cacheKeys, apply: (cacheKey) => RenderTarget.delete(cacheKey) });
+		const descendants = await sitemapDescendants(url);
+
+		for (const sitemapUrl of [url, ...descendants]) {
+			await deleteTargetsFor(sitemapUrl);
+		}
+
+		for (const child of descendants) cascading.add(child);
+		try {
+			await applyInBatches({ items: descendants, apply: (child) => Sitemap.delete(child) });
+		} finally {
+			for (const child of descendants) cascading.delete(child);
+		}
 
 		return super.delete(...arguments);
 	}
 }
 
 export const sitemaps = Sitemap;
+
+/** The run's tally plus the node-wide routed-write timeouts observed since it started. */
+function snapshotWithTimeouts(run, timeoutsAtStart) {
+	return { ...run.snapshot(), scheduleWriteTimeouts: getScheduleWriteTimeouts() - timeoutsAtStart };
+}
+
+/** Where a caller polls for a walk's progress. */
+const progressPath = (rootUrl) => `/sitemap_refresh/${encodeURIComponent(rootUrl)}`;
+
+/** Sitemap rows currently being removed as part of an ancestor's cascade. See `delete`. */
+const cascading = new Set();
+
+/** Every sitemap reachable from `url` via `parentUrl`, breadth-first and cycle-safe. */
+async function sitemapDescendants(url) {
+	const found = [];
+	const seen = new Set([url]);
+	const queue = [url];
+
+	while (queue.length) {
+		const parent = queue.shift();
+		for await (const row of Sitemap.search({
+			select: ['url'],
+			conditions: [{ attribute: 'parentUrl', value: parent }],
+		})) {
+			if (seen.has(row.url)) continue;
+			seen.add(row.url);
+			found.push(row.url);
+			queue.push(row.url);
+		}
+	}
+
+	return found;
+}
+
+/** Remove every RenderTarget attributed to one sitemap, two-phase and bounded. */
+async function deleteTargetsFor(sitemapUrl) {
+	// Two-phase for the same reason as everywhere else: deleting from inside the open search
+	// cursor leaves writes pending while it is open, which the long-transaction monitor aborts
+	// (422) partway through on a large sitemap. See util/scan.js.
+	const {
+		items: cacheKeys,
+		examined,
+		truncated,
+	} = await collectFromScan({
+		scan: () =>
+			RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }], select: 'cacheKey' }),
+		pick: (cacheKey) => cacheKey,
+	});
+
+	await applyInBatches({ items: cacheKeys, apply: (cacheKey) => RenderTarget.delete(cacheKey) });
+
+	// `collectFromScan` reports this precisely so a caller cannot act on a partial set while
+	// believing it was complete, and it used to be discarded here. A sitemap with more targets
+	// than `scan.collectCap` loses only the first capful; the row goes away regardless, so the
+	// remainder would be left rendering forever with nothing attributing them. Say so loudly —
+	// re-running the delete is what clears the rest.
+	if (truncated) {
+		logger.error(
+			`[prerender] Deleting sitemap ${sitemapUrl} removed ${cacheKeys.length} of ${examined} targets ` +
+				`(scan.collectCap=${config.scan.collectCap}). Re-run the delete to remove the rest.`
+		);
+	}
+}
+
+/**
+ * Milliseconds since a `Date`-typed column. See `epochMsOf` for the shapes one can arrive in.
+ *
+ * An unparseable or absent timestamp reports `Infinity`, which makes `claimRefreshRun` treat the
+ * run as dead and take it over. That direction is deliberate: failing the other way would let one
+ * unreadable timestamp block every future refresh of that root permanently, which is the terminal
+ * state `staleRunMs` exists to prevent. Taking over merely risks a duplicate walk, and the walk is
+ * idempotent.
+ */
+function ageOf(value) {
+	const ms = epochMsOf(value);
+	return Number.isFinite(ms) ? Date.now() - ms : Infinity;
+}
+
+/**
+ * Refuse to start a second walk over a root that is already being walked.
+ *
+ * Advisory, not a lock: this is a node-local read of a replicated table (so no residency
+ * routing and no unbounded cross-node fetch), and two requests arriving simultaneously can both
+ * see "not running". That is acceptable — the walk is idempotent, and the guard exists to stop
+ * the common case of an operator re-POSTing a slow index, not to serialize a race.
+ *
+ * A run whose progress row has gone stale is treated as dead and taken over. Without that, a
+ * worker restart mid-walk would leave a `running` row that blocks every later refresh of that
+ * root forever.
+ */
+async function claimRefreshRun(rootUrl) {
+	let existing;
+	try {
+		existing = await databases.sitemaps.SitemapRefresh.get({ id: rootUrl, select: ['state', 'updatedAt', 'node'] });
+	} catch (e) {
+		// A progress row we cannot read must not block the actual work.
+		logger.warn(`[prerender] Could not read refresh progress for ${rootUrl}: ${describeError(e)}`);
+		return { ok: true };
+	}
+
+	if (existing?.state !== 'running') return { ok: true };
+
+	const age = ageOf(existing.updatedAt);
+	if (age < config.sitemap.staleRunMs) {
+		return {
+			ok: false,
+			reason: `a refresh on ${existing.node ?? 'another node'} is already running (last progress ${Math.round(age / 1000)}s ago)`,
+		};
+	}
+
+	logger.warn(
+		`[prerender] Taking over the sitemap refresh for ${rootUrl}: the run on ${existing.node ?? 'another node'} ` +
+			`has not reported progress in ${Math.round(age / 1000)}s (sitemap.staleRunMs=${config.sitemap.staleRunMs}).`
+	);
+	return { ok: true };
+}
+
+/** The snapshot fields that are persisted as progress. */
+const progressFields = (snapshot) => ({
+	sitemapsProcessed: snapshot.sitemapsProcessed,
+	sitemapsDiscovered: snapshot.sitemapsDiscovered,
+	created: snapshot.created,
+	updated: snapshot.updated,
+	skipped: snapshot.skipped,
+	deferred: snapshot.deferred,
+	removed: snapshot.removed,
+	scheduleWriteTimeouts: snapshot.scheduleWriteTimeouts,
+	failed: snapshot.failed,
+});
+
+/**
+ * Run one refresh and record its progress and outcome on the `SitemapRefresh` row for that root.
+ *
+ * Rethrows so a blocking caller still sees the failure; the background call sites swallow it
+ * because the row already carries it.
+ */
+async function runTrackedRefresh(rootUrl, options) {
+	const startedAt = new Date();
+
+	// `put` replaces the record, so every write restates the identity fields. A progress write
+	// that fails must never take the walk down with it — it is telemetry, not the work.
+	const writeProgress = (fields) =>
+		databases.sitemaps.SitemapRefresh.put(rootUrl, {
+			node: server.hostname,
+			startedAt,
+			updatedAt: new Date(),
+			...fields,
+		}).catch((e) => logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${describeError(e)}`));
+
+	await writeProgress({ state: 'running' });
+
+	try {
+		const result = await Sitemap.refresh(rootUrl, {
+			...options,
+			onProgress: (snapshot) => writeProgress({ state: 'running', ...progressFields(snapshot) }),
+		});
+
+		await writeProgress({
+			state: 'completed',
+			finishedAt: new Date(),
+			lastRefreshed: new Date(),
+			...progressFields(result),
+		});
+
+		logger.info(
+			`[prerender] Sitemap refresh for ${rootUrl} finished: ${result.sitemapsProcessed} sitemaps, ` +
+				`${result.created} created, ${result.updated} re-attributed, ${result.skipped} unchanged, ` +
+				`${result.removed} unlinked, ${result.failed.length} failed`
+		);
+
+		return result;
+	} catch (e) {
+		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${describeError(e)}`);
+		await writeProgress({ state: 'failed', finishedAt: new Date(), error: describeError(e) });
+		throw e;
+	}
+}
+
+/**
+ * Fetch and process ONE sitemap document. Returns the child sitemap URLs to walk (empty for a
+ * `<urlset>`).
+ *
+ * The stored row is written last, so a document that throws partway leaves the previous row —
+ * and its `lastRefreshed` — untouched rather than recording a refresh that did not happen.
+ */
+async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run }) {
+	logger.info(`Processing sitemap`, sitemapUrl);
+
+	const latestSitemap = await fetchLatestSitemap(sitemapUrl);
+	const row = { ...latestSitemap, parentUrl };
+
+	if (latestSitemap.isIndex === true) {
+		await Sitemap.put(sitemapUrl, row);
+		return latestSitemap.entries.map(({ loc }) => loc).filter(Boolean);
+	}
+
+	if (latestSitemap.entries?.length) {
+		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run });
+	}
+
+	await Sitemap.put(sitemapUrl, row);
+	return [];
+}
+
+/**
+ * The sitemaps a "refresh everything" pass should start from: those no index claims as a child.
+ *
+ * Rows written before `parentUrl` existed have none, so they read as roots and are walked
+ * directly on the first pass after upgrading — which is also the pass that stamps them, so the
+ * duplication corrects itself. Filtering in JS rather than querying for a null attribute keeps
+ * this independent of Harper's null-comparison semantics, and the row count here is the number
+ * of sitemap documents, not of URLs.
+ */
+async function rootSitemapUrls() {
+	const roots = [];
+	for await (const row of Sitemap.search({ select: ['url', 'parentUrl'] })) {
+		if (!row.parentUrl) roots.push(row.url);
+	}
+	return roots;
+}
+
+/** Diff one `<urlset>` against the targets currently attributed to it, and apply the result. */
+async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run }) {
+	// Keep only the URLs this deployment actually prerenders, keyed by the canonical URL-half the
+	// bot read uses — so the prune diff below and the target keys built later both match what a
+	// request will look up. Everything else is counted and dropped rather than turned into a
+	// target that renders into a key no read computes. See util/sitemap.js.
+	const { incoming: incomingEntryMap, filtered, invalid } = partitionSitemapEntries(latestSitemap.entries);
+
+	for (const { loc, message } of invalid) {
+		logger.warn(`Skipping invalid sitemap entry ${loc}: ${message}`);
+	}
+	reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
+	run.addFiltered(filtered);
+
+	// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
+	// `RenderTarget.patch` from inside the open search cursor. Harper's long-transaction monitor
+	// aborts (422, poisoned) any transaction that has writes pending when it fires, so on a large
+	// sitemap the refresh could die partway through with some targets already unlinked. Collect
+	// while reading, write once the cursor is closed — see util/scan.js.
+	//
+	// The collect step is also where the filtered-vs-departed distinction is made. Absent from the
+	// incoming map means one of two very different things, and conflating them is what would turn
+	// every filtered URL into an orphan:
+	//   - it left the sitemap        -> unlink it, as before
+	//   - it was FILTERED just above -> leave it alone
+	// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the RenderSchedule
+	// row intact: the target keeps rendering on its interval with nothing tracking it and no
+	// sitemap to bring it back. Fine for a URL that genuinely left the sitemap (that is the
+	// pre-existing discovery-target shape), but applied to a filtered URL it would silently
+	// convert this pass's entire filtered set into permanently-rendering, unattributable
+	// targets — the exact load the filter removes.
+	//
+	// Retiring them is deliberately NOT done here. Deleting targets needs the guardrails the
+	// reconcile sweep will carry (refuse when no prerender routes compile, a ceiling on how much
+	// one pass may retire), not an ingest pass that would act on whatever the route list happened
+	// to say this morning.
+	//
+	// The same pass builds `knownKeys`: every target this scan returns is BOTH present and (by the
+	// scan's own condition) already attributed to this sitemap, which is exactly what the entry
+	// loop below would otherwise spend a point read per entry × device discovering. It is a cache,
+	// not an authority — a miss falls through to the read — so capping it costs latency, never
+	// correctness.
+	const knownKeys = new Set();
+	const {
+		items: departed,
+		examined,
+		truncated,
+	} = await collectFromScan({
+		scan: () =>
+			RenderTarget.search({
+				// Array select, NOT a string one: a string select projects to the bare VALUE
+				// rather than a record, which is the trap that once made every target look
+				// un-attributed. Only the key is needed — nothing here reads the other columns.
+				select: ['cacheKey'],
+				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
+			}),
+		pick: (target) => {
+			const parsed = CacheKey.parse(target.cacheKey);
+			if (incomingEntryMap.has(parsed.url)) {
+				if (knownKeys.size < config.scan.collectCap) knownKeys.add(target.cacheKey);
+				return null;
+			}
+			if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
+				run.count('deferred');
+				return null;
+			}
+			return target;
+		},
+	});
+
+	// `collectFromScan` computes this precisely so a caller cannot act on a partial set while
+	// reporting success, and it used to be discarded here. A truncated prune means some departed
+	// targets kept their attribution and will be unlinked on a later pass.
+	if (truncated) {
+		logger.error(
+			`[prerender] ${sitemapUrl}: prune collected ${departed.length} of ${examined} scanned targets ` +
+				`(scan.collectCap=${config.scan.collectCap}). Only the collected ones were unlinked this pass.`
+		);
+		run.addTruncatedScan(sitemapUrl, examined, departed.length);
+	}
+
+	await applyInBatches({
+		items: departed,
+		apply: (target) => RenderTarget.patch(target.cacheKey, { sitemapUrl: null }),
+	});
+	run.addRemoved(departed);
+
+	let inflight = [];
+	let considered = 0;
+
+	for (const [cacheUrl, { changefreq }] of incomingEntryMap) {
+		const renderInterval = getTtlFromChangeFreq(changefreq, {
+			minTtl: config.page.minTtl,
+			defaultTtl: config.page.ttl,
+		});
+
+		for (const deviceType of deviceTypes) {
+			// Yield on rows CONSIDERED, not on writes issued. The skip path below is entirely
+			// synchronous now that `knownKeys` answers it without a point read, so the healthy
+			// steady state — where almost everything is already correct — would otherwise run
+			// 100,000 iterations for a single product sitemap without ever reaching the batch
+			// drain, monopolizing the thread. The previous code was accidentally safe here only
+			// because it awaited a database read every iteration. Same reasoning, and the same
+			// counter, as `collectFromScan`.
+			if (++considered % config.scan.yieldEvery === 0) await setImmediate();
+
+			const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
+
+			let action;
+			if (revalidate) {
+				action = TargetAction.RENDER;
+			} else if (canSkipLookup({ revalidate, knownKeys, cacheKey })) {
+				action = TargetAction.SKIP;
+			} else {
+				// Only reached for a key the prune scan did not return: genuinely new, moved here
+				// from another sitemap, or missed because `knownKeys` was capped. Only `sitemapUrl`
+				// is needed, so don't materialize the whole record in a bulk loop.
+				action = actionForExisting(await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] }), sitemapUrl);
+			}
+
+			switch (action) {
+				case TargetAction.SKIP:
+					run.count('skipped');
+					continue;
+
+				case TargetAction.REATTACH:
+					// Attribution changed, the page did not. `patch` leaves the RenderSchedule row
+					// alone; `put` would recompute `getInitialRenderTime` and shove the next render
+					// forward by a fresh jitter every pass. See util/sitemapRun.js.
+					run.count('updated');
+					inflight.push(RenderTarget.patch(cacheKey, { sitemapUrl, renderInterval }));
+					break;
+
+				case TargetAction.CREATE:
+					// No explicit time, so RenderTarget.put jitters the first render across the
+					// interval — bulk sitemap population must not stampede the queue.
+					run.count('created');
+					inflight.push(RenderTarget.put(cacheKey, { renderInterval, sitemapUrl }));
+					break;
+
+				case TargetAction.RENDER:
+					run.count('created');
+					inflight.push(RenderTarget.put(cacheKey, { renderInterval, sitemapUrl, nextRenderTime: currentMinuteMs() }));
+					break;
+			}
+
+			// Drain the WHOLE batch, not just the most recent promise. This used to await
+			// `lastPromise` alone, which left the rest of the batch still in flight — and Harper's
+			// long-transaction monitor aborts (422, poisoned) any transaction that has writes
+			// pending when it fires, so a slow batch could kill the refresh partway through.
+			// Awaiting every promise in the batch is what makes "no pending writes across a monitor
+			// tick" actually true. See util/scan.js.
+			if (inflight.length >= config.scan.batchSize) {
+				await Promise.all(inflight);
+				inflight = [];
+				await setImmediate();
+			}
+		}
+	}
+
+	if (inflight.length > 0) {
+		await Promise.all(inflight);
+	}
+}
 
 function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 	changefreq = changefreq?.toLowerCase();
@@ -363,14 +710,16 @@ export function startSitemapRefreshScheduler() {
 		try {
 			logger.info('Starting sitemap refresh');
 
-			const urls = await Array.fromAsync(Sitemap.search({ select: 'url' }));
-
-			for (const url of urls) {
-				try {
-					await Sitemap.refresh(url);
-				} catch (e) {
-					logger.error(e);
+			// Roots only, and sequential: an index walks its own children, so including them here
+			// too doubled every fetch, point read and write in the daily pass.
+			for (const url of await rootSitemapUrls()) {
+				const claim = await claimRefreshRun(url);
+				if (!claim.ok) {
+					logger.info(`[prerender] Skipping scheduled refresh of ${url}: ${claim.reason}`);
+					continue;
 				}
+				// Already logged and recorded on the progress row; one bad root must not stop the rest.
+				await runTrackedRefresh(url).catch(() => {});
 			}
 
 			await databases.sitemaps.SitemapRefresh.put('all', { lastRefreshed: Date.now() });
