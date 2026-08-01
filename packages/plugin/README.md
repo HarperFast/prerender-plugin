@@ -228,6 +228,7 @@ up, which is render load and cache growth for no served output.
 	"created": 1200,
 	"updated": 0,
 	"skipped": 40,
+	"duplicates": 0,
 	"removed": 0,
 	"removedSample": [],
 	"filtered": { "passthrough": 3, "unclassified": 812 },
@@ -290,6 +291,16 @@ Four properties matter at index scale:
   row, children included, so a "refresh everything" pass used to walk each child **twice** — once
   by descending the index, then again as a top-level row. `parentUrl` records who listed whom.
   Rows written before this field existed read as roots and are re-stamped on the first pass.
+- **A URL listed by two sitemaps is owned by the first one that claims it.** Overlapping children
+  are normal — a catalog spanning facets will list the same page under several — and previously
+  each walk handed the URL back and forth between them. Nothing converged: `updated` never reached
+  zero (so it was useless as a "did anything change" signal), the stored `renderInterval`
+  oscillated between whatever the two declared, and which sitemap owned the URL — and therefore
+  what a `DELETE` would take with it — depended on index ordering. A walk now leaves a target
+  alone when it is already owned by a sitemap that same walk has visited, and reports the count as
+  `duplicates`. A sitemap that _failed_ this walk still counts as an owner: a bad fetch is not a
+  reason to reassign its URLs.
+
 - **Re-attributing a URL no longer resets its render clock.** A URL listed in two sitemaps, or moved
   between fixed-size paginated product sitemaps, changes `sitemapUrl` without changing the page.
   That now `patch`es attribution instead of re-`put`ting the target, because a `put` recomputes

@@ -15,13 +15,15 @@ import { describeError } from './errors.js';
  *   CREATE   — no target yet. `put`, which also creates the jittered schedule row.
  *   REATTACH — the target exists but is attributed to a different sitemap. Update attribution
  *              only; do NOT touch the schedule (see `actionForExisting`).
- *   SKIP     — already correct. No write.
- *   RENDER   — explicit revalidate: `put` with an immediate render time.
+ *   SKIP      — already correct. No write.
+ *   DUPLICATE — listed by more than one sitemap in this walk; an earlier one owns it. No write.
+ *   RENDER    — explicit revalidate: `put` with an immediate render time.
  */
 export const TargetAction = {
 	CREATE: 'create',
 	REATTACH: 'reattach',
 	SKIP: 'skip',
+	DUPLICATE: 'duplicate',
 	RENDER: 'render',
 };
 
@@ -45,20 +47,35 @@ export const canSkipLookup = ({ revalidate, knownKeys, cacheKey }) => !revalidat
  * REATTACH is deliberately NOT a `put`. `RenderTarget.put` recomputes `getInitialRenderTime`
  * whenever no explicit `nextRenderTime` is supplied, so re-putting a target merely to correct
  * its attribution pushes its next render forward by a fresh jitter. That is the same mechanism
- * that made weekly/monthly targets never render at all (see `sitemapTargetNeedsUpdate`), and
- * it fires routinely: a URL listed in two sitemaps flip-flops between them on every pass, and
- * fixed-size paginated product sitemaps shuffle URLs across child boundaries whenever the
- * catalog changes. Patching attribution leaves the schedule — and therefore the render
- * cadence — exactly where it was.
+ * that made weekly/monthly targets never render at all, and fixed-size paginated product
+ * sitemaps shuffle URLs across child boundaries whenever the catalog changes. Patching
+ * attribution leaves the schedule — and therefore the render cadence — exactly where it was.
  *
  * The tradeoff: `put` would incidentally recreate a missing schedule row, and `patch` will not.
  * That repair was never systematic here anyway (a correctly-attributed target is skipped
  * outright, so it was only ever reached for re-attached URLs) and it is `util/reconcile.js`
  * that actually owns the schedule-gap sweep.
+ *
+ * FIRST WRITER WINS within a walk. `claimedThisWalk` is the set of sitemaps this walk has
+ * already visited; a target attributed to one of them was legitimately claimed by an earlier
+ * child, so this one leaves it alone (DUPLICATE) instead of patching it away.
+ *
+ * Without that, a URL listed in two children of the same index — 95 of them in one real
+ * 800k-URL corpus, and unavoidable whenever a catalog spans overlapping facets — ping-pongs
+ * forever: A claims it, B takes it, next walk A takes it back, and so on. Nothing converges,
+ * `updated` never reaches zero so it stops being a usable "did anything change" signal, the
+ * stored `renderInterval` oscillates between whatever the two children declare, and which
+ * sitemap owns the URL depends on index ordering. It also decides what a `DELETE` takes with
+ * it, since targets are removed by attribution.
+ *
+ * A sitemap that FAILED this walk is still in `claimedThisWalk`, which is deliberate: a child
+ * having a bad fetch is not a reason to reassign the URLs it owns.
  */
-export const actionForExisting = (existingTarget, sitemapUrl) => {
+export const actionForExisting = (existingTarget, sitemapUrl, claimedThisWalk) => {
 	if (!existingTarget) return TargetAction.CREATE;
-	return existingTarget.sitemapUrl === sitemapUrl ? TargetAction.SKIP : TargetAction.REATTACH;
+	if (existingTarget.sitemapUrl === sitemapUrl) return TargetAction.SKIP;
+	if (existingTarget.sitemapUrl && claimedThisWalk?.has(existingTarget.sitemapUrl)) return TargetAction.DUPLICATE;
+	return TargetAction.REATTACH;
 };
 
 /**
@@ -79,6 +96,10 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 		created: 0,
 		updated: 0,
 		skipped: 0,
+		// Entries left alone because an earlier sitemap in the same walk already owns them.
+		// Steady and non-zero simply means the sitemaps overlap; it is not an error, but it is
+		// worth seeing, because nothing else in the system would ever mention it.
+		duplicates: 0,
 		deferred: 0,
 		removed: 0,
 		sitemapsProcessed: 0,

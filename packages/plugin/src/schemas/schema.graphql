@@ -65,6 +65,8 @@ type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh"
 	created: Int
 	updated: Int
 	skipped: Int
+	# Entries an earlier sitemap in the same walk already owned (overlapping sitemaps).
+	duplicates: Int
 	deferred: Int
 	removed: Int
 	# Children that threw. The walk continues past them rather than aborting.

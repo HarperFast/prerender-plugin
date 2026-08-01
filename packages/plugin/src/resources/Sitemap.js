@@ -64,7 +64,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			visited.add(sitemapUrl);
 
 			try {
-				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run });
+				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run, visited });
 				for (const child of children) {
 					queue.push({ url: child, parentUrl: sitemapUrl });
 					run.count('sitemapsDiscovered');
@@ -330,6 +330,7 @@ const progressFields = (snapshot) => ({
 	created: snapshot.created,
 	updated: snapshot.updated,
 	skipped: snapshot.skipped,
+	duplicates: snapshot.duplicates,
 	deferred: snapshot.deferred,
 	removed: snapshot.removed,
 	failed: snapshot.failed,
@@ -390,7 +391,7 @@ async function runTrackedRefresh(rootUrl, options) {
  * The stored row is written last, so a document that throws partway leaves the previous row —
  * and its `lastRefreshed` — untouched rather than recording a refresh that did not happen.
  */
-async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run }) {
+async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run, visited }) {
 	logger.info(`Processing sitemap`, sitemapUrl);
 
 	const latestSitemap = await fetchLatestSitemap(sitemapUrl);
@@ -402,7 +403,7 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceType
 	}
 
 	if (latestSitemap.entries?.length) {
-		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run });
+		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run, visited });
 	}
 
 	await Sitemap.put(sitemapUrl, row);
@@ -427,7 +428,7 @@ async function rootSitemapUrls() {
 }
 
 /** Diff one `<urlset>` against the targets currently attributed to it, and apply the result. */
-async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run }) {
+async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run, visited }) {
 	// Keep only the URLs this deployment actually prerenders, keyed by the canonical URL-half the
 	// bot read uses — so the prune diff below and the target keys built later both match what a
 	// request will look up. Everything else is counted and dropped rather than turned into a
@@ -543,12 +544,22 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				// Only reached for a key the prune scan did not return: genuinely new, moved here
 				// from another sitemap, or missed because `knownKeys` was capped. Only `sitemapUrl`
 				// is needed, so don't materialize the whole record in a bulk loop.
-				action = actionForExisting(await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] }), sitemapUrl);
+				action = actionForExisting(
+					await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] }),
+					sitemapUrl,
+					visited
+				);
 			}
 
 			switch (action) {
 				case TargetAction.SKIP:
 					run.count('skipped');
+					continue;
+
+				case TargetAction.DUPLICATE:
+					// Listed by an earlier sitemap in this same walk, which already owns it. Leaving
+					// it alone is what makes attribution converge instead of ping-ponging.
+					run.count('duplicates');
 					continue;
 
 				case TargetAction.REATTACH:
