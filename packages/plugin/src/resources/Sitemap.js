@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { RenderTarget, getScheduleWriteTimeouts } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
-import { currentMinuteMs, getNextSitemapRefreshTime } from '../util/time.js';
+import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
@@ -85,7 +85,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 				// a single sitemap 503'd. Record it and keep going; `failed` reports it.
 				if (sitemapUrl === rootSitemapUrl) throw e;
 
-				logger.error(`[prerender] Sitemap ${sitemapUrl} failed and was skipped: ${e?.message ?? e}`);
+				logger.error(`[prerender] Sitemap ${sitemapUrl} failed and was skipped: ${e?.message ?? String(e)}`);
 				run.addFailure(sitemapUrl, e);
 			}
 
@@ -97,7 +97,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			try {
 				await onProgress?.(snapshotWithTimeouts(run, timeoutsAtStart));
 			} catch (e) {
-				logger.warn(`[prerender] Sitemap progress callback failed: ${e?.message ?? e}`);
+				logger.warn(`[prerender] Sitemap progress callback failed: ${e?.message ?? String(e)}`);
 			}
 		}
 
@@ -279,9 +279,17 @@ async function deleteTargetsFor(sitemapUrl) {
 	}
 }
 
-/** Milliseconds since a `Date`-typed column, tolerating a raw epoch number or a string. */
+/**
+ * Milliseconds since a `Date`-typed column. See `epochMsOf` for the shapes one can arrive in.
+ *
+ * An unparseable or absent timestamp reports `Infinity`, which makes `claimRefreshRun` treat the
+ * run as dead and take it over. That direction is deliberate: failing the other way would let one
+ * unreadable timestamp block every future refresh of that root permanently, which is the terminal
+ * state `staleRunMs` exists to prevent. Taking over merely risks a duplicate walk, and the walk is
+ * idempotent.
+ */
 function ageOf(value) {
-	const ms = value instanceof Date ? value.getTime() : Number(value);
+	const ms = epochMsOf(value);
 	return Number.isFinite(ms) ? Date.now() - ms : Infinity;
 }
 
@@ -303,7 +311,7 @@ async function claimRefreshRun(rootUrl) {
 		existing = await databases.sitemaps.SitemapRefresh.get({ id: rootUrl, select: ['state', 'updatedAt', 'node'] });
 	} catch (e) {
 		// A progress row we cannot read must not block the actual work.
-		logger.warn(`[prerender] Could not read refresh progress for ${rootUrl}: ${e?.message ?? e}`);
+		logger.warn(`[prerender] Could not read refresh progress for ${rootUrl}: ${e?.message ?? String(e)}`);
 		return { ok: true };
 	}
 
@@ -354,7 +362,9 @@ async function runTrackedRefresh(rootUrl, options) {
 			startedAt,
 			updatedAt: new Date(),
 			...fields,
-		}).catch((e) => logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${e?.message ?? e}`));
+		}).catch((e) =>
+			logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${e?.message ?? String(e)}`)
+		);
 
 	await writeProgress({ state: 'running' });
 
@@ -379,7 +389,7 @@ async function runTrackedRefresh(rootUrl, options) {
 
 		return result;
 	} catch (e) {
-		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${e?.message ?? e}`);
+		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${e?.message ?? String(e)}`);
 		await writeProgress({ state: 'failed', finishedAt: new Date(), error: e?.message ?? String(e) });
 		throw e;
 	}
@@ -516,6 +526,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	run.addRemoved(departed);
 
 	let inflight = [];
+	let considered = 0;
 
 	for (const [cacheUrl, { changefreq }] of incomingEntryMap) {
 		const renderInterval = getTtlFromChangeFreq(changefreq, {
@@ -524,6 +535,15 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 		});
 
 		for (const deviceType of deviceTypes) {
+			// Yield on rows CONSIDERED, not on writes issued. The skip path below is entirely
+			// synchronous now that `knownKeys` answers it without a point read, so the healthy
+			// steady state — where almost everything is already correct — would otherwise run
+			// 100,000 iterations for a single product sitemap without ever reaching the batch
+			// drain, monopolizing the thread. The previous code was accidentally safe here only
+			// because it awaited a database read every iteration. Same reasoning, and the same
+			// counter, as `collectFromScan`.
+			if (++considered % config.scan.yieldEvery === 0) await setImmediate();
+
 			const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
 
 			let action;

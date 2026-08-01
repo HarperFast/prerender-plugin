@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { currentMinuteMs, getNextTimeOfDay, getInitialRenderTime, MINUTE } from '../src/util/time.js';
+import { currentMinuteMs, epochMsOf, getNextTimeOfDay, getInitialRenderTime, MINUTE } from '../src/util/time.js';
 
 beforeEach(() => applyOptions({}));
 
@@ -82,4 +82,30 @@ test('getInitialRenderTime does not collapse keys that lack the delimiter', () =
 	const interval = 24 * 60 * MINUTE;
 	const values = new Set(Array.from({ length: 100 }, (_, i) => getInitialRenderTime(`no-delimiter-${i}`, interval)));
 	assert.ok(values.size > 50, `delimiter-less keys stay spread (got ${values.size} slots)`);
+});
+
+// --- epochMsOf: a Harper Date column does not arrive in one predictable shape ---
+
+test('epochMsOf accepts a Date, an epoch number, and an ISO string alike', () => {
+	const ms = Date.UTC(2026, 7, 1, 12, 0, 0);
+	assert.equal(epochMsOf(new Date(ms)), ms);
+	assert.equal(epochMsOf(ms), ms);
+	assert.equal(epochMsOf(new Date(ms).toISOString()), ms);
+});
+
+test('epochMsOf returns NaN for an absent column rather than the epoch', () => {
+	// `new Date(null).getTime()` is 0, not NaN. Without the guard a missing timestamp reads as
+	// 1970 — infinitely old — which is the opposite of "absent" for any staleness comparison.
+	for (const absent of [null, undefined, '']) {
+		assert.ok(Number.isNaN(epochMsOf(absent)), `${JSON.stringify(absent)} must be NaN`);
+	}
+});
+
+test('epochMsOf returns NaN for an unparseable value', () => {
+	assert.ok(Number.isNaN(epochMsOf('not a date')));
+	assert.ok(Number.isNaN(epochMsOf({})));
+});
+
+test('epochMsOf keeps epoch 0 distinguishable from absent', () => {
+	assert.equal(epochMsOf(0), 0);
 });

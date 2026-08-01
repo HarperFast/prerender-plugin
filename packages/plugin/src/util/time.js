@@ -8,6 +8,21 @@ export const DAY = 24 * HOUR;
 
 export const currentMinuteMs = (ts = Date.now()) => Math.floor(ts / MINUTE) * MINUTE;
 
+/**
+ * Epoch milliseconds from a Harper `Date` column, or `NaN` when there isn't one.
+ *
+ * A Date column does not arrive in one predictable shape: it can be a `Date`, an epoch number,
+ * or an ISO string depending on how the row was written and whether it crossed a serialization
+ * boundary. `Number(value)` handles only the second and yields `NaN` for an ISO string, while
+ * `new Date(value)` handles all three.
+ *
+ * The empty check is not decoration: `new Date(null).getTime()` is 0, not `NaN`, so a missing
+ * column would otherwise read as 1970 — an infinitely old timestamp — rather than as absent.
+ * Callers comparing an age against a staleness threshold get the opposite answer from the one
+ * they want.
+ */
+export const epochMsOf = (value) => (value || value === 0 ? new Date(value).getTime() : Number.NaN);
+
 export const hrToMs = (numHours) => Math.floor(numHours * HOUR);
 
 const parseTimeOfDay = (timeStr) => {
