@@ -107,6 +107,10 @@ rest: true # required for the @export-ed table REST endpoints
     filteredWarnPercent: 50 # filtered share of one sitemap that is reported as an ERROR
     node: '' # pin the scheduled refresh to this node ('' disables it)
     workerIndex: 0 # ...and this worker
+    background: true # POST returns a handle immediately; the walk runs in the background
+    staleRunMs: 600000 # 10m — un-updated progress after which a run is treated as dead
+    removedSampleCap: 20 # sample size of unlinked keys in the result (the COUNT is exact)
+    failedCap: 100 # per-child failures retained in the result (the overflow is counted)
 
   queue:
     jobLeaseTime: 600000 # 10m — how long a claimed job is leased
@@ -224,11 +228,21 @@ up, which is render load and cache growth for no served output.
 	"created": 1200,
 	"updated": 0,
 	"skipped": 40,
-	"removed": [],
+	"removed": 0,
+	"removedSample": [],
 	"filtered": { "passthrough": 3, "unclassified": 812 },
-	"deferred": 0
+	"deferred": 0,
+	"sitemapsProcessed": 31,
+	"sitemapsDiscovered": 31,
+	"failed": [],
+	"failedOverflow": 0,
+	"truncatedScans": [],
+	"scheduleWriteTimeouts": 0
 }
 ```
+
+`removed` is a count with a capped `removedSample`, not the full record list it used to be — one
+walk over a large index can unlink more rows than belong in an HTTP response.
 
 A large `filtered` share is far more likely to mean `ingress.routes` is incomplete than that the
 sitemap is wrong, so past `sitemap.filteredWarnPercent` (default 50%) it is logged as an **error**
@@ -244,6 +258,50 @@ Retiring them needs guardrails that belong to the schedule-repair sweep, not to 
 A forwarded-mode config that compiles to **zero** prerender routes is reported as a warning
 (`/prerender_admin` surfaces it): nothing is prerendered in that state, and it is what a single
 typo produces, since invalid entries are dropped one at a time.
+
+### A sitemap index is not an HTTP-request-sized unit of work
+
+A real index fans out to tens of children and over a million target writes. `POST /sitemaps/<url>`
+therefore answers immediately with a handle and walks in the background:
+
+```json
+{
+	"background": true,
+	"sitemaps": [
+		{ "url": "https://www.example.com/sitemap.xml", "started": true, "progress": "/sitemap_refresh/https%3A%2F%2F…" }
+	]
+}
+```
+
+Poll `GET /sitemap_refresh/<root-url>` for `state` (`running` / `completed` / `failed`),
+`sitemapsProcessed` of `sitemapsDiscovered`, the running counts, and `updatedAt` — which is bumped
+after every child, so a stalled walk is distinguishable from a slow one. `POST` with
+`{"background": false}` blocks instead, which is what a small sitemap or a test wants.
+
+Four properties matter at index scale:
+
+- **One bad child no longer loses the rest.** A child that 503s, returns an HTML error page, or
+  fails to parse is recorded in `failed[]` and the walk continues. Only a failing **root**
+  propagates, because that means the request itself was invalid and nothing was accomplished.
+- **A second refresh of the same root is refused** while one is running, so re-POSTing a slow index
+  does not start a competing walk. A run whose progress goes stale past `sitemap.staleRunMs` is
+  treated as dead and taken over — otherwise a worker restart mid-walk would block that root
+  forever. The guard is advisory, not a lock; the walk is idempotent.
+- **Refresh-all visits roots only.** Every document reached during a walk gets its own `Sitemap`
+  row, children included, so a "refresh everything" pass used to walk each child **twice** — once
+  by descending the index, then again as a top-level row. `parentUrl` records who listed whom.
+  Rows written before this field existed read as roots and are re-stamped on the first pass.
+- **Re-attributing a URL no longer resets its render clock.** A URL listed in two sitemaps, or moved
+  between fixed-size paginated product sitemaps, changes `sitemapUrl` without changing the page.
+  That now `patch`es attribution instead of re-`put`ting the target, because a `put` recomputes
+  `getInitialRenderTime` and pushes the next render forward by a fresh jitter on every pass.
+
+`scheduleWriteTimeouts` counts residency-routed `RenderSchedule` writes that hit
+`render.scheduleWriteTimeoutMs`. Harper forwards a write for a key this node does not own to the
+owning node with **no deadline of its own**, so an unreachable owner used to hang the walk
+permanently — no error, no partial result, and `.catch()` cannot help because a hang never rejects.
+The deadline turns that into a schedule gap, which is exactly what the reconcile sweep repairs. Any
+non-zero value means schedule writes are being lost right now: check replication health.
 
 ### How bulk sitemap population is staggered
 
@@ -301,7 +359,7 @@ queue table is isolated and bursty/heavy writes don't serialize against it:
 | `render_schedule` | `RenderSchedule`                              | the hot render queue — isolated                  |
 | `render_service`  | `RenderTarget`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status |
 | `page_cache`      | `PrerenderedPage`                             | rendered-HTML cache (heavy blob writes)          |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`                   | sitemap data + refresh marker                    |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`                   | sitemap data + per-root refresh progress         |
 | `signals`         | `NonIndexable`                                | indexability signals                             |
 | `coordination`    | `SharedBuffer`                                | node-local cross-worker SAB (never replicated)   |
 
@@ -323,6 +381,7 @@ See [`src/schemas/schema.graphql`](src/schemas/schema.graphql).
 | `GET/PUT/DELETE /RenderTarget/...`           | Manage render targets                                               |
 | `POST /RenderTarget` `{action:"revalidate"}` | Force re-render of matching targets                                 |
 | `GET/POST/DELETE /sitemaps/<url>`            | Ingest / list / remove sitemaps                                     |
+| `GET /sitemap_refresh/<root-url>`            | Progress + outcome of a background sitemap walk                     |
 | `GET /queue_status`                          | Read per-node queue status (**observed**)                           |
 | `GET /queue_control`                         | Read the desired pause state (**intent**)                           |
 | `GET /prerender_admin`                       | Management UI + API — see below                                     |

@@ -26,11 +26,54 @@ type Sitemap @table(database: "sitemaps") {
 	entryCount: Int
 	entries: [SitemapEntry]
 	lastRefreshed: Date
+	# The index that listed this sitemap, or null for one added directly.
+	#
+	# Every document reached during a walk gets its own row, children included, so without this
+	# a "refresh everything" pass walked each child TWICE: once by descending the index, then
+	# again as a top-level row in its own right. At index scale that is double the fetches,
+	# double the point reads and double the writes, every single pass. Refresh-all now visits
+	# roots only and lets the index reach its own children.
+	parentUrl: String @indexed
 }
 
-type SitemapRefresh @table(database: "sitemaps") {
+type SitemapFailure {
+	url: String
+	error: String
+}
+
+# Progress and outcome for one sitemap walk.
+#
+# Two kinds of row share this table:
+#   'all'        — written by the daily scheduler when a full pass finishes (`lastRefreshed`).
+#   <root url>   — one per root sitemap, rewritten as that walk progresses.
+#
+# The per-root rows exist because a real sitemap index is not an HTTP-request-sized unit of
+# work: the walk runs in the background and this row is the only way to see where it got to,
+# whether any child failed, and whether it is still alive (`updatedAt`).
+type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh") {
 	id: Any @primaryKey
 	lastRefreshed: Date
+	# running | completed | failed
+	state: String
+	node: String
+	startedAt: Date
+	# Bumped after every child sitemap, so a stalled walk is distinguishable from a slow one.
+	updatedAt: Date
+	finishedAt: Date
+	sitemapsProcessed: Int
+	sitemapsDiscovered: Int
+	created: Int
+	updated: Int
+	skipped: Int
+	deferred: Int
+	removed: Int
+	# Routed RenderSchedule writes that hit their deadline; each is a schedule gap for the
+	# reconcile sweep to repair, so a non-zero count means the cluster is degraded.
+	scheduleWriteTimeouts: Int
+	# Children that threw. The walk continues past them rather than aborting.
+	failed: [SitemapFailure]
+	# Set only when the walk itself aborted (the root sitemap could not be fetched or parsed).
+	error: String
 }
 
 type RenderTarget @table(database: "render_service") @export {

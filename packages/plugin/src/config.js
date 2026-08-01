@@ -246,6 +246,18 @@ const defaultConfig = () => ({
 			// keyspace and rewriting millions of rows in one pass would be its own outage.
 			maxRestores: 5000,
 		},
+
+		// Deadline on the residency-routed `RenderSchedule` write that every `RenderTarget.put`
+		// performs. Harper forwards a write for a key this node does not own to the owning node,
+		// and that forward has no timeout of its own: when the owner is unreachable the promise
+		// never settles, so the caller hangs forever rather than failing. A bulk sitemap walk
+		// (millions of routed writes, drained in batches) and `RenderQueue.claim` (which awaits
+		// its lease writes while holding the queue mutex) both stop dead, silently.
+		//
+		// Timing out degrades that to a target with no schedule row, which is exactly what the
+		// reconcile sweep above repairs. Set to 0 to disable the deadline and restore the
+		// unbounded wait. See util/timeout.js.
+		scheduleWriteTimeoutMs: 15 * 1000,
 	},
 
 	// Bounded registry walks. Harper ends a transaction that stays open too long: with writes
@@ -273,6 +285,29 @@ const defaultConfig = () => ({
 		// disables the scheduled refresh entirely (manual refresh still works).
 		node: '',
 		workerIndex: 0,
+
+		// Run `POST /Sitemap/<url>` as a background walk and answer immediately with a handle,
+		// instead of holding the request open for the whole traversal. A sitemap index is not an
+		// HTTP-request-sized unit of work — a real one fans out to tens of children and over a
+		// million target writes, so the client (or any proxy between it and Harper) times out
+		// long before the walk finishes, leaving the operator with no result, no error, and no
+		// way to tell whether anything was written. Progress is persisted to `SitemapRefresh`
+		// under the root URL; `GET /SitemapRefresh/<root-url>` reports it.
+		//
+		// `POST ... {"background": false}` restores the blocking behaviour for a small sitemap
+		// or a test.
+		background: true,
+
+		// How long a progress row may go un-updated before a new refresh treats the run that
+		// wrote it as dead and starts over. Guards against a worker restart mid-walk leaving a
+		// `running` row that blocks every later refresh of that root.
+		staleRunMs: 10 * MINUTE,
+
+		// Bounds on the arrays a refresh result carries back. The result used to accumulate a
+		// full record for every unlinked target across every child, which is unbounded in both
+		// memory and response size; counts are always exact, only the samples are capped.
+		removedSampleCap: 20,
+		failedCap: 100,
 	},
 
 	queue: {

@@ -3,11 +3,51 @@ import { CacheKey } from '../util/cacheKey.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
+import { isTimeoutError, withTimeout } from '../util/timeout.js';
 
 const {
 	render_schedule: { RenderSchedule },
 	page_cache: { PrerenderedPage },
 } = databases;
+
+// Monotonic count of residency-routed RenderSchedule writes that hit their deadline. Each one
+// is a target left without a schedule row — a URL that has silently stopped rendering until
+// the reconcile sweep restores it — so a rising count means the cluster is degraded, not that
+// a single request was slow. Exposed for the management API and for the sitemap walk, which
+// reports the delta across its run.
+let scheduleWriteTimeouts = 0;
+export const getScheduleWriteTimeouts = () => scheduleWriteTimeouts;
+
+/**
+ * Await a residency-routed schedule write, but not forever.
+ *
+ * `RenderSchedule` is pinned by `setResidencyById`, so this write is forwarded to whichever
+ * node owns the URL, and Harper's forward has no deadline. An unreachable owner therefore
+ * hangs the caller permanently instead of failing it: the bot path stalls a request, the
+ * sitemap walk stops mid-batch with no error, and `claim` wedges the queue mutex it is holding.
+ *
+ * A timeout here is genuinely recoverable — a target with no schedule row is precisely the gap
+ * `util/reconcile.js` sweeps for — so this logs, counts, and returns rather than rejecting. The
+ * target write has already committed and callers must not be told it failed. See
+ * util/timeout.js for why the underlying write may still land afterwards.
+ */
+const putScheduleBounded = async (cacheKey, row) => {
+	try {
+		await withTimeout(
+			RenderSchedule.put(cacheKey, row),
+			config.render.scheduleWriteTimeoutMs,
+			`RenderSchedule.put(${cacheKey})`
+		);
+	} catch (e) {
+		if (!isTimeoutError(e)) throw e;
+		scheduleWriteTimeouts++;
+		logger.warn(
+			`[prerender] Routed RenderSchedule write for ${cacheKey} (owner ${getResidencyByUrl(CacheKey.extractUrl(cacheKey))}) ` +
+				`timed out after ${config.render.scheduleWriteTimeoutMs}ms. The target has no schedule row and will not ` +
+				`render until the reconcile sweep restores it — check replication health to that node.`
+		);
+	}
+};
 
 export class RenderTarget extends databases.render_service.RenderTarget {
 	async put(data, target) {
@@ -44,7 +84,7 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 				? data.renderInterval
 				: config.render.defaultInterval;
 
-		await RenderSchedule.put(cacheKey, {
+		await putScheduleBounded(cacheKey, {
 			nextRenderTime:
 				Number.isFinite(nextRenderTime) && nextRenderTime > 0
 					? nextRenderTime
@@ -58,7 +98,27 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 	async delete() {
 		const cacheKey = this.getId();
 
-		await Promise.all([RenderSchedule.delete(cacheKey), PrerenderedPage.delete(cacheKey)]);
+		// The schedule delete is residency-routed and carries the same unbounded-hang risk as the
+		// put above — and this one runs inside `applyInBatches` loops (a sitemap teardown deletes
+		// every target it owns), where a single unreachable owner would stall the entire sweep.
+		//
+		// Unlike the put, a lost delete does NOT self-correct and is NOT rethrown-as-recoverable:
+		// `claim` builds jobs from the schedule row alone and never checks that the target still
+		// exists, and `getRenderInterval` falls back to the default interval when it doesn't — so
+		// an orphaned schedule row is claimed and re-rendered forever, for a URL nothing serves.
+		// That is strictly worse than a visible failure, and deletes are operator-initiated and
+		// idempotent, so the timeout propagates and the caller retries.
+		await Promise.all([
+			withTimeout(
+				RenderSchedule.delete(cacheKey),
+				config.render.scheduleWriteTimeoutMs,
+				`RenderSchedule.delete(${cacheKey})`
+			).catch((e) => {
+				if (isTimeoutError(e)) scheduleWriteTimeouts++;
+				throw e;
+			}),
+			PrerenderedPage.delete(cacheKey),
+		]);
 
 		return super.delete(...arguments);
 	}
