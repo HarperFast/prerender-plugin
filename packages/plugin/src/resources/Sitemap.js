@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { describeError } from '../util/errors.js';
 import { RenderTarget, getScheduleWriteTimeouts } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
@@ -85,7 +86,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 				// a single sitemap 503'd. Record it and keep going; `failed` reports it.
 				if (sitemapUrl === rootSitemapUrl) throw e;
 
-				logger.error(`[prerender] Sitemap ${sitemapUrl} failed and was skipped: ${e?.message ?? String(e)}`);
+				logger.error(`[prerender] Sitemap ${sitemapUrl} failed and was skipped: ${describeError(e)}`);
 				run.addFailure(sitemapUrl, e);
 			}
 
@@ -97,7 +98,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			try {
 				await onProgress?.(snapshotWithTimeouts(run, timeoutsAtStart));
 			} catch (e) {
-				logger.warn(`[prerender] Sitemap progress callback failed: ${e?.message ?? String(e)}`);
+				logger.warn(`[prerender] Sitemap progress callback failed: ${describeError(e)}`);
 			}
 		}
 
@@ -311,7 +312,7 @@ async function claimRefreshRun(rootUrl) {
 		existing = await databases.sitemaps.SitemapRefresh.get({ id: rootUrl, select: ['state', 'updatedAt', 'node'] });
 	} catch (e) {
 		// A progress row we cannot read must not block the actual work.
-		logger.warn(`[prerender] Could not read refresh progress for ${rootUrl}: ${e?.message ?? String(e)}`);
+		logger.warn(`[prerender] Could not read refresh progress for ${rootUrl}: ${describeError(e)}`);
 		return { ok: true };
 	}
 
@@ -362,9 +363,7 @@ async function runTrackedRefresh(rootUrl, options) {
 			startedAt,
 			updatedAt: new Date(),
 			...fields,
-		}).catch((e) =>
-			logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${e?.message ?? String(e)}`)
-		);
+		}).catch((e) => logger.warn(`[prerender] Could not record refresh progress for ${rootUrl}: ${describeError(e)}`));
 
 	await writeProgress({ state: 'running' });
 
@@ -389,8 +388,8 @@ async function runTrackedRefresh(rootUrl, options) {
 
 		return result;
 	} catch (e) {
-		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${e?.message ?? String(e)}`);
-		await writeProgress({ state: 'failed', finishedAt: new Date(), error: e?.message ?? String(e) });
+		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${describeError(e)}`);
+		await writeProgress({ state: 'failed', finishedAt: new Date(), error: describeError(e) });
 		throw e;
 	}
 }

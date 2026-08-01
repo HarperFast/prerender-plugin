@@ -7,6 +7,7 @@
  */
 
 import { PASSTHROUGH, UNCLASSIFIED } from './routeClass.js';
+import { describeError } from './errors.js';
 
 /**
  * What to do with one incoming sitemap entry × device.
@@ -110,7 +111,7 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 
 		/** A child sitemap threw. The walk continues; the failure is reported, not swallowed. */
 		addFailure(url, error) {
-			if (failed.length < failedCap) failed.push({ url, error: error?.message ?? String(error) });
+			if (failed.length < failedCap) failed.push({ url, error: describeError(error) });
 			else failedOverflow++;
 		},
 
