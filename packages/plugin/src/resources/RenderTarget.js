@@ -3,51 +3,32 @@ import { CacheKey } from '../util/cacheKey.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
-import { isTimeoutError, withTimeout } from '../util/timeout.js';
 
 const {
 	render_schedule: { RenderSchedule },
 	page_cache: { PrerenderedPage },
 } = databases;
 
-// Monotonic count of residency-routed RenderSchedule writes that hit their deadline. Each one
-// is a target left without a schedule row — a URL that has silently stopped rendering until
-// the reconcile sweep restores it — so a rising count means the cluster is degraded, not that
-// a single request was slow. Exposed for the management API and for the sitemap walk, which
-// reports the delta across its run.
-let scheduleWriteTimeouts = 0;
-export const getScheduleWriteTimeouts = () => scheduleWriteTimeouts;
-
 /**
- * Await a residency-routed schedule write, but not forever.
+ * WRITES TO A RESIDENCY-PINNED KEY DO NOT BLOCK ON THE OWNING NODE. Reads do. The asymmetry is
+ * not obvious and v0.15.0 got it wrong, so it is written down here.
  *
- * `RenderSchedule` is pinned by `setResidencyById`, so this write is forwarded to whichever
- * node owns the URL, and Harper's forward has no deadline. An unreachable owner therefore
- * hangs the caller permanently instead of failing it: the bot path stalls a request, the
- * sitemap walk stops mid-batch with no error, and `claim` wedges the queue mutex it is holding.
+ * `RenderSchedule` is pinned with `setResidencyById`, so most of its keys belong to some other
+ * node. It is tempting to assume — as v0.15.0 did — that writing one forwards to the owner and
+ * therefore inherits the same unbounded wait that a cross-node READ does, and to wrap it in a
+ * deadline. It does not, and the deadline was removed.
  *
- * A timeout here is genuinely recoverable — a target with no schedule row is precisely the gap
- * `util/reconcile.js` sweeps for — so this logs, counts, and returns rather than rejecting. The
- * target write has already committed and callers must not be told it failed. See
- * util/timeout.js for why the underlying write may still land afterwards.
+ * What Harper actually does (`resources/Table.ts`, the residency block in the store path): it
+ * computes the residency list, sees this node is not in it, sets `omitLocalRecord`, drops the
+ * local record entirely for a `getResidencyById` table, commits the local transaction, and lets
+ * the replication layer ship it. There is no forward, no acknowledgement, and nothing to wait
+ * for. Measured against a live Harper with residency pinned to a node that does not exist:
+ * 500 writes in 10.7ms, mean 0.021ms, max 0.63ms — i.e. an unreachable owner costs nothing.
+ *
+ * The read side is the genuinely dangerous one, and `util/reconcile.js` explains it: an unowned
+ * point read takes Harper's replication fetch, which has no timeout. That is why reads pass
+ * `replicateFrom: false` and writes need no such guard.
  */
-const putScheduleBounded = async (cacheKey, row) => {
-	try {
-		await withTimeout(
-			RenderSchedule.put(cacheKey, row),
-			config.render.scheduleWriteTimeoutMs,
-			`RenderSchedule.put(${cacheKey})`
-		);
-	} catch (e) {
-		if (!isTimeoutError(e)) throw e;
-		scheduleWriteTimeouts++;
-		logger.warn(
-			`[prerender] Routed RenderSchedule write for ${cacheKey} (owner ${getResidencyByUrl(CacheKey.extractUrl(cacheKey))}) ` +
-				`timed out after ${config.render.scheduleWriteTimeoutMs}ms. The target has no schedule row and will not ` +
-				`render until the reconcile sweep restores it — check replication health to that node.`
-		);
-	}
-};
 
 export class RenderTarget extends databases.render_service.RenderTarget {
 	async put(data, target) {
@@ -84,7 +65,7 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 				? data.renderInterval
 				: config.render.defaultInterval;
 
-		await putScheduleBounded(cacheKey, {
+		await RenderSchedule.put(cacheKey, {
 			nextRenderTime:
 				Number.isFinite(nextRenderTime) && nextRenderTime > 0
 					? nextRenderTime
@@ -98,27 +79,14 @@ export class RenderTarget extends databases.render_service.RenderTarget {
 	async delete() {
 		const cacheKey = this.getId();
 
-		// The schedule delete is residency-routed and carries the same unbounded-hang risk as the
-		// put above — and this one runs inside `applyInBatches` loops (a sitemap teardown deletes
-		// every target it owns), where a single unreachable owner would stall the entire sweep.
-		//
-		// Unlike the put, a lost delete does NOT self-correct and is NOT rethrown-as-recoverable:
-		// `claim` builds jobs from the schedule row alone and never checks that the target still
-		// exists, and `getRenderInterval` falls back to the default interval when it doesn't — so
-		// an orphaned schedule row is claimed and re-rendered forever, for a URL nothing serves.
-		// That is strictly worse than a visible failure, and deletes are operator-initiated and
-		// idempotent, so the timeout propagates and the caller retries.
-		await Promise.all([
-			withTimeout(
-				RenderSchedule.delete(cacheKey),
-				config.render.scheduleWriteTimeoutMs,
-				`RenderSchedule.delete(${cacheKey})`
-			).catch((e) => {
-				if (isTimeoutError(e)) scheduleWriteTimeouts++;
-				throw e;
-			}),
-			PrerenderedPage.delete(cacheKey),
-		]);
+		// Both deletes are unguarded for the reason in the module comment: the schedule delete is
+		// residency-routed but does not wait on the owner. A rejection still propagates, which
+		// matters here — `claim` builds jobs from the schedule row alone and never checks that the
+		// target still exists, and `getRenderInterval` falls back to the default interval when it
+		// doesn't, so an orphaned schedule row would be claimed and re-rendered forever for a URL
+		// nothing serves. Deletes are operator-initiated and idempotent; a visible failure the
+		// caller can retry is the right outcome.
+		await Promise.all([RenderSchedule.delete(cacheKey), PrerenderedPage.delete(cacheKey)]);
 
 		return super.delete(...arguments);
 	}

@@ -67,9 +67,6 @@ type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh"
 	skipped: Int
 	deferred: Int
 	removed: Int
-	# Routed RenderSchedule writes that hit their deadline; each is a schedule gap for the
-	# reconcile sweep to repair, so a non-zero count means the cluster is degraded.
-	scheduleWriteTimeouts: Int
 	# Children that threw. The walk continues past them rather than aborting.
 	failed: [SitemapFailure]
 	# Set only when the walk itself aborted (the root sitemap could not be fetched or parsed).

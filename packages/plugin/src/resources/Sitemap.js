@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { describeError } from '../util/errors.js';
-import { RenderTarget, getScheduleWriteTimeouts } from './RenderTarget.js';
+import { RenderTarget } from './RenderTarget.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
 import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
@@ -53,11 +53,6 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			removedSampleCap: config.sitemap.removedSampleCap,
 			failedCap: config.sitemap.failedCap,
 		});
-		// Routed-write timeouts are counted node-wide (see RenderTarget), so the walk reports the
-		// delta across its own run. Concurrent traffic can contribute, which is fine for what the
-		// number is for: any non-zero value means schedule writes are being lost right now.
-		const timeoutsAtStart = getScheduleWriteTimeouts();
-
 		const visited = new Set();
 		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
 		run.count('sitemapsDiscovered');
@@ -96,13 +91,13 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			run.count('sitemapsProcessed');
 
 			try {
-				await onProgress?.(snapshotWithTimeouts(run, timeoutsAtStart));
+				await onProgress?.(run.snapshot());
 			} catch (e) {
 				logger.warn(`[prerender] Sitemap progress callback failed: ${describeError(e)}`);
 			}
 		}
 
-		return snapshotWithTimeouts(run, timeoutsAtStart);
+		return run.snapshot();
 	}
 
 	/**
@@ -216,11 +211,6 @@ class Sitemap extends databases.sitemaps.Sitemap {
 }
 
 export const sitemaps = Sitemap;
-
-/** The run's tally plus the node-wide routed-write timeouts observed since it started. */
-function snapshotWithTimeouts(run, timeoutsAtStart) {
-	return { ...run.snapshot(), scheduleWriteTimeouts: getScheduleWriteTimeouts() - timeoutsAtStart };
-}
 
 /** Where a caller polls for a walk's progress. */
 const progressPath = (rootUrl) => `/sitemap_refresh/${encodeURIComponent(rootUrl)}`;
@@ -342,7 +332,6 @@ const progressFields = (snapshot) => ({
 	skipped: snapshot.skipped,
 	deferred: snapshot.deferred,
 	removed: snapshot.removed,
-	scheduleWriteTimeouts: snapshot.scheduleWriteTimeouts,
 	failed: snapshot.failed,
 });
 

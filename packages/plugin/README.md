@@ -236,8 +236,7 @@ up, which is render load and cache growth for no served output.
 	"sitemapsDiscovered": 31,
 	"failed": [],
 	"failedOverflow": 0,
-	"truncatedScans": [],
-	"scheduleWriteTimeouts": 0
+	"truncatedScans": []
 }
 ```
 
@@ -296,12 +295,23 @@ Four properties matter at index scale:
   That now `patch`es attribution instead of re-`put`ting the target, because a `put` recomputes
   `getInitialRenderTime` and pushes the next render forward by a fresh jitter on every pass.
 
-`scheduleWriteTimeouts` counts residency-routed `RenderSchedule` writes that hit
-`render.scheduleWriteTimeoutMs`. Harper forwards a write for a key this node does not own to the
-owning node with **no deadline of its own**, so an unreachable owner used to hang the walk
-permanently — no error, no partial result, and `.catch()` cannot help because a hang never rejects.
-The deadline turns that into a schedule gap, which is exactly what the reconcile sweep repairs. Any
-non-zero value means schedule writes are being lost right now: check replication health.
+### Residency: reads block on the owner, writes do not
+
+`RenderSchedule` is pinned with `setResidencyById`, so on a multi-node cluster most of its keys
+belong to some other node. The two directions behave very differently, and the asymmetry is easy to
+get backwards — v0.15.0 did, and shipped a deadline around a write that never needed one.
+
+A **read** of a key this node does not own takes Harper's replication fetch, which has **no
+timeout**: it can hang the caller indefinitely. Every such read in this plugin therefore passes
+`replicateFrom: false` and accepts a node-local answer, and `util/reconcile.js` is built entirely
+around that constraint — each node repairs only the keys it owns, because only there is its local
+read authoritative.
+
+A **write** does not forward at all. Harper computes the residency list, sees this node is not in
+it, omits the local record, commits, and lets replication ship it asynchronously — there is no
+acknowledgement to wait for. Measured against a live instance with residency pinned to a node that
+does not exist: 500 writes in 10.7ms (mean 0.021ms). An unreachable owner costs the writer nothing,
+so no deadline is needed and none is applied.
 
 ### How bulk sitemap population is staggered
 

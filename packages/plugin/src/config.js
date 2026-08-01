@@ -246,18 +246,6 @@ const defaultConfig = () => ({
 			// keyspace and rewriting millions of rows in one pass would be its own outage.
 			maxRestores: 5000,
 		},
-
-		// Deadline on the residency-routed `RenderSchedule` write that every `RenderTarget.put`
-		// performs. Harper forwards a write for a key this node does not own to the owning node,
-		// and that forward has no timeout of its own: when the owner is unreachable the promise
-		// never settles, so the caller hangs forever rather than failing. A bulk sitemap walk
-		// (millions of routed writes, drained in batches) and `RenderQueue.claim` (which awaits
-		// its lease writes while holding the queue mutex) both stop dead, silently.
-		//
-		// Timing out degrades that to a target with no schedule row, which is exactly what the
-		// reconcile sweep above repairs. Set to 0 to disable the deadline and restore the
-		// unbounded wait. See util/timeout.js.
-		scheduleWriteTimeoutMs: 15 * 1000,
 	},
 
 	// Bounded registry walks. Harper ends a transaction that stays open too long: with writes

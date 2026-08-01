@@ -68,6 +68,17 @@ plugin tarball to that release, and vice-versa.
   [`RenderQueue.js`](packages/plugin/src/resources/RenderQueue.js) (which currently checks only
   `localhost`, not `127.0.0.1`).
 
+- **Residency: an unowned READ blocks, an unowned WRITE does not.** `RenderSchedule` is pinned with
+  `setResidencyById`, so on a 4-node cluster ~75% of its keys belong to another node. A point read of
+  a key this node does not own takes Harper's replication fetch, which has **no timeout** and can
+  hang the caller forever — hence `replicateFrom: false` on every such read, and hence
+  [`util/reconcile.js`](packages/plugin/src/util/reconcile.js) being per-node and owner-scoped. A
+  **write** is not symmetric and does not forward: Harper computes the residency list, sees this
+  node is absent, omits the local record, commits, and replicates asynchronously
+  (`resources/Table.ts`, the residency block in the store path). Measured with residency pinned to a
+  nonexistent node, 500 writes took 10.7ms — mean 0.021ms. v0.15.0 assumed the symmetry and wrapped
+  these writes in a deadline that could never fire; v0.16.0 removed it. Don't add it back.
+
 <!-- SHARED:system-overview — keep in sync across prerender-plugin, <customer>-pr, render-service -->
 ## System overview (all three repos)
 
