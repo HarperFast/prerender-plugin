@@ -5,12 +5,13 @@ import assert from 'node:assert/strict';
  * The one-shot legacy-registry migration (pre-v0.19 per-device RenderTarget rows → url-keyed
  * Target rows).
  *
- * The property that matters most is what it does NOT touch: RenderSchedule and
- * PrerenderedPage rows survive byte-for-byte, because losing them means re-rendering the
- * entire cache — the exact thing the migration exists to prevent. The rest: absent-only
- * writes (crashed/concurrent runs converge), the legacy rows are consumed so the run is
- * naturally one-shot, and the cluster queue is paused around the rebuild — unless an
- * operator had already paused it, in which case their intent survives.
+ * The property that matters most is what it does NOT touch: RenderSchedule,
+ * PrerenderedPage, AND the legacy rows themselves all survive byte-for-byte — the first two
+ * because losing them means re-rendering the entire cache, the last because it keeps
+ * rollback to pre-v0.19 clean. The rest: keyset pagination that never holds a cursor across
+ * writes, absent-only writes (crashed/repeated runs converge), and the cluster queue paused
+ * around the rebuild — unless an operator had already paused it, in which case their intent
+ * survives.
  */
 
 const key = (url, device) => `${url}|${device}`;
