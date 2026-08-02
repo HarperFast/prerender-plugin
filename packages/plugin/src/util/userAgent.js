@@ -105,7 +105,7 @@ const GENERIC_TOKENS = new Set([
 // Cheap containment probe: only run the strip pass when the UA can actually contain a
 // URL or email address. Most UAs — browser-shaped and many bots — skip the replace (and
 // its string allocation) entirely.
-const HAS_LINKISH = /:\/\/|@|www\./;
+const HAS_LINKISH = /:\/\/|@|www\./i;
 // URLs and email addresses (contact info in UA comments) must not contribute tokens —
 // e.g. `+http://www.google.com/bot.html` would otherwise derive "bot.html". One combined
 // pass instead of one replace per shape.
@@ -118,7 +118,7 @@ const KEYWORD_TOKEN = /(?<![A-Za-z0-9._-])[A-Za-z][A-Za-z0-9._-]*?(?:bot|crawler
 // A plausible product name: starts with a letter, modest length, benign charset.
 const NAME_SHAPE = /^[A-Za-z][A-Za-z0-9 ._-]{1,39}$/;
 const TRAILING_VERSION = /\s+v?\d[\d.~_]*$/;
-const BARE_KEYWORD = /^(?:bot|robot|robots|crawler|spider|slurp)$/i;
+const BARE_KEYWORD = /^(?:bots?|robots?|crawlers?|spiders?|slurp)$/i;
 
 /**
  * Reduce a raw candidate ("MJ12bot/v1.4.8", "MSIE 10.0", "Screaming Frog SEO Spider") to a
@@ -131,7 +131,9 @@ function cleanCandidate(raw) {
 	let name = (slash === -1 ? raw : raw.slice(0, slash)).trim();
 	name = name.replace(TRAILING_VERSION, '');
 	if (!NAME_SHAPE.test(name)) return null;
-	const words = name.toLowerCase().split(' ');
+	// /\s+/ so consecutive spaces can't mint empty words — an empty word is not in
+	// GENERIC_TOKENS, so it would defeat the all-generic rejection below.
+	const words = name.toLowerCase().split(/\s+/);
 	if (words.length > 4) return null;
 	if (words.every((w) => GENERIC_TOKENS.has(w))) return null;
 	if (words.length === 1 && BARE_KEYWORD.test(name)) return null;
