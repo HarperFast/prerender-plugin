@@ -79,6 +79,10 @@ export default class RenderWorker {
 			completed: 0,
 			succeeded: 0,
 			emptyContent: 0,
+			// Renders that ended as a redirect (bailed after navigation, or landed elsewhere by a
+			// client-side redirect). Split out of emptyContent so a site restructure's 301 wave
+			// doesn't read as a content regression.
+			redirected: 0,
 			failures: {
 				timeout: 0,
 				// Navigation never reached `waitUntil` (slow origin / starved renderer) — distinct
@@ -260,6 +264,7 @@ export default class RenderWorker {
 				perSec: Number((s.completed / elapsedSec).toFixed(2)),
 				succeeded: s.succeeded,
 				emptyContent: s.emptyContent,
+				redirected: s.redirected,
 				// Non-zero means pages are being cached with content missing even though every
 				// render "succeeded" — treat it like a failure count, not a curiosity.
 				rendersDegraded: s.rendersDegraded,
@@ -470,6 +475,7 @@ export default class RenderWorker {
 					this.stats.failures.protocol++;
 				} else if (e instanceof Error && e.message.startsWith('net::ERR_TOO_MANY_REDIRECTS')) {
 					job.isIndexable = false;
+					job.reason = 'redirect-loop';
 					this.stats.failures.tooManyRedirects++;
 				} else {
 					this.stats.failures.other++;
@@ -502,7 +508,10 @@ export default class RenderWorker {
 		}
 		if (!error) {
 			this.stats.succeeded++;
-			if (!content) this.stats.emptyContent++;
+			if (!content) {
+				if (job.redirectedTo) this.stats.redirected++;
+				else this.stats.emptyContent++;
+			}
 		}
 
 		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure

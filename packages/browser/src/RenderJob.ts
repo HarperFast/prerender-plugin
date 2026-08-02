@@ -4,6 +4,7 @@ import logger from './util/Logger.js';
 import { settings } from './settings.js';
 import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
+import { renderPhaseOf } from './util/renderPhase.js';
 
 // Result-POST failures worth retrying: transient overload/gateway errors. Anything else
 // (e.g. a 4xx) is a bug, not a blip — logged and dropped (the lease expires → re-render).
@@ -95,6 +96,15 @@ export default class RenderJob {
 	isIndexable: boolean | undefined;
 	redirectedTo: string | undefined;
 	isFromSitemap: boolean;
+	/**
+	 * Why this render produced no cacheable content — one slug across every no-content class,
+	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
+	 * 'canonical-mismatch' (page canonicalizes elsewhere), 'http-error' (non-200 document),
+	 * 'redirect-loop', 'redirect' (bailed at navigation), or 'error' (renderer threw — details
+	 * ride in the posted `error`). Unset when content was produced; sendResult derives the
+	 * redirect/error fallbacks so callers only set the values they alone can know.
+	 */
+	reason: string | undefined;
 
 	_httpResponse: OriginHttpResponse | null = null;
 
@@ -165,6 +175,7 @@ export default class RenderJob {
 		}
 
 		// Build the payload (incl. the expensive gzip) ONCE; retries re-send the same bytes.
+		const attemptError = this.error;
 		const metadata = {
 			id: this.id,
 			url: this.url,
@@ -173,6 +184,18 @@ export default class RenderJob {
 			renderTime: undefined as number | undefined,
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
+			// One slug for WHY there is no content (see the field doc). The redirect/error
+			// fallbacks are derived here so every no-content result carries a reason without
+			// each producer having to remember to set one.
+			reason: this.content
+				? undefined
+				: (this.reason ?? (attemptError ? 'error' : this.redirectedTo ? 'redirect' : undefined)),
+			// The failed attempt's detail — without it the plugin can only log "unknown
+			// prerender error". `phase` separates a navigation that never completed (slow
+			// origin) from a failure in the settle/serialize work.
+			error: attemptError
+				? { name: attemptError.name, message: attemptError.message, phase: renderPhaseOf(attemptError) }
+				: undefined,
 		};
 		if (this.httpResponse) {
 			Object.entries(this.httpResponse.headers).forEach(([key, val]) => {
