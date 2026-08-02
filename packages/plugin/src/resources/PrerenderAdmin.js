@@ -1001,9 +1001,8 @@ export class PrerenderAdmin extends Resource {
 		const now = Date.now();
 		const pageRows = rows.slice(0, limit).map((row) => {
 			const expiresAtMs = row.expiresAt ? new Date(row.expiresAt).getTime() : NaN;
-			// The URL-half of the key has no scheme; queue URLs are always https except
-			// localhost (see the claim path), and so are page URLs in practice — good enough
-			// for the console's "explain this" handoff, which re-resolves it anyway.
+			// The URL-half of a cache key is `canonicalizeUrl` output, which is a full URL
+			// (scheme included; see util/url.js — `new URL(half).href === half` by contract).
 			const urlHalf = CacheKey.extractUrl(row.cacheKey);
 			const { deviceType } = CacheKey.parse(row.cacheKey);
 			return {
@@ -1014,7 +1013,7 @@ export class PrerenderAdmin extends Resource {
 				isIndexable: row.isIndexable ?? null,
 				// Same freshness rule the serving path applies.
 				fresh: !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > now,
-				url: urlHalf ? `https://${urlHalf}` : null,
+				url: urlHalf || null,
 				deviceType: deviceType ?? null,
 			};
 		});
