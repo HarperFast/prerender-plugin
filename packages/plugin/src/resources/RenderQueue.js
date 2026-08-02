@@ -16,6 +16,12 @@ const { RenderSchedule } = databases.render_schedule;
 
 const mutex = getMutex('render_queue');
 
+// The statuses a browser (≥ v1.16.0) posts when it ends a render at navigation because the URL
+// HTTP-redirected to a different document. An explicit set, not a 3xx range: 304 is not a
+// redirect, and an unrecognized 3xx from some middlebox shouldn't route into scheduling
+// decisions it was never designed for.
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
  * Resolve this node's desired pause intent from the replicated `QueueControl` table and
  * store it into the node-local queue flag; when not paused, recompute empty/queued from
@@ -152,6 +158,17 @@ export class RenderQueue extends Resource {
 				const redirectPath = URL.parse(result.redirectedTo)?.pathname;
 				const landedOn = redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass;
 
+				// A 3xx status means the browser (≥ v1.16.0) ended the render at navigation: the URL
+				// HTTP-redirected to a different document, and content rendered under this job's
+				// context (device profile, waitFor path scoping) could only be stored under a key it
+				// wasn't rendered for. There is nothing to store — only scheduling to decide.
+				if (REDIRECT_STATUSES.has(result.statusCode)) {
+					await this.processRedirectResult(result, { redirectKey, landedOn, redirectPath });
+					return;
+				}
+
+				// Rendered-through redirect: a client-side redirect (no HTTP status to reason
+				// about) or a pre-1.16 browser. Keep the long-standing refile semantics.
 				if (landedOn === PRERENDER) {
 					logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
 					await RenderTarget.delete(result.id);
@@ -241,7 +258,10 @@ export class RenderQueue extends Resource {
 				await RenderSchedule.delete(cacheKey);
 			}
 		} else if (result.isIndexable === false) {
-			logger.warn(`Skipped prerendered url: ${cacheKey}`);
+			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
+			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
+			// render is broken", which read identically without it.
+			logger.warn(`Skipped prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
 			await RenderTarget.delete(cacheKey);
 
 			try {
@@ -257,7 +277,14 @@ export class RenderQueue extends Resource {
 				/* best-effort signal write */
 			}
 		} else {
-			logger.warn(`Unknown prerender error for ${cacheKey}`);
+			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
+			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
+			// means the document never arrived (slow/refusing origin) — a different problem from
+			// a render that failed mid-settle.
+			const detail = result.error
+				? ` — ${result.error.name}${result.error.phase ? ` [${result.error.phase}]` : ''}: ${result.error.message}`
+				: '';
+			logger.warn(`Prerender failed for ${cacheKey} (${result.reason || 'no reason reported'})${detail}`);
 			// A target-backed job is left to retry after its lease expires. But a one-off
 			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
 			// and re-render the failed job indefinitely — drop it instead.
@@ -266,6 +293,101 @@ export class RenderQueue extends Resource {
 				await RenderSchedule.delete(cacheKey);
 			}
 		}
+	}
+
+	/**
+	 * A render the browser ended at navigation because the URL HTTP-redirected to a different
+	 * document (`result.statusCode` is the FIRST hop's 3xx — the origin's statement about the
+	 * job URL itself). There is no content; the outcome is what happens to the source target,
+	 * and whether the destination becomes a target of its own so it gets rendered under its own
+	 * job context instead of being cached from a render that ran as another URL.
+	 */
+	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath }) {
+		if (typeof result.renderTime === 'number') {
+			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
+		}
+
+		if (landedOn !== PRERENDER) {
+			// The destination is a class we never serve from cache — adopting it would file
+			// renders where no read looks, and deleting the source would end its rendering for
+			// good on evidence as weak as an incomplete route list. Keep the source and retry at
+			// its normal cadence; the retry now costs a navigation, not a full settle.
+			logger.warn(
+				`Prerendered url ${result.id} redirected (${result.statusCode}) to ${result.redirectedTo}, which is ` +
+					`${landedOn} — keeping the target (no key to schedule the destination under)`
+			);
+			recordUnroutedPath(landedOn, redirectPath, 'redirect');
+			await this.rescheduleRedirectSource(result.id);
+			return;
+		}
+
+		if (result.statusCode !== 301 && result.statusCode !== 308) {
+			// Temporary redirect: failover, geo bounce, outage page. The source is expected to
+			// come back — keep its target AND its cached page, and look again next interval.
+			logger.warn(
+				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
+					`keeping the target and retrying at its normal cadence`
+			);
+			await this.rescheduleRedirectSource(result.id);
+			return;
+		}
+
+		// Permanent move onto a route we serve: retire the source — RenderTarget.delete drops its
+		// target, schedule, and cached page — and adopt the destination in its place. A mutual
+		// 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each hop is a
+		// navigation-only render surfaced by this warn, so a broken site costs noise, not settles.
+		logger.warn(
+			`Prerendered url ${result.id} permanently redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
+				`retiring the target in favor of ${redirectKey}`
+		);
+		const source = await RenderTarget.get({ id: result.id, select: ['renderInterval'] });
+		await RenderTarget.delete(result.id);
+
+		const existingTarget = await RenderTarget.get({ id: redirectKey, select: 'cacheKey' });
+		if (existingTarget) return; // already in the rotation under its own cadence
+
+		// Same gate the bot-traffic discovery applies: a host outside the allowlist can never be
+		// marked indexable, and a URL already proven non-indexable shouldn't be resurrected by a
+		// redirect pointing at it.
+		const destinationUrl = CacheKey.extractUrl(redirectKey);
+		const domain = URL.parse(destinationUrl)?.hostname;
+		if (config.domains.length && !config.domains.includes(domain)) return;
+		const existingNonIndexable = await databases.signals.NonIndexable.get({
+			id: destinationUrl,
+			select: 'url',
+		});
+		if (existingNonIndexable) return;
+
+		// Due now, not jittered: adoptions arrive one per source render, already spread by the
+		// sources' own schedule jitter, and the source's cached page was just deleted — the
+		// sooner the destination renders, the shorter the window a bot gets neither page.
+		const target = { nextRenderTime: currentMinuteMs() };
+		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
+			target.renderInterval = source.renderInterval;
+		}
+		await RenderTarget.put(redirectKey, target);
+	}
+
+	/**
+	 * Keep a redirecting source in its rotation. Mirrors the post-render scheduling in
+	 * processJobResult: a target-backed key comes due one interval from completion (so cadence
+	 * self-paces instead of realigning into a herd); a targetless key (render-now one-off,
+	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
+	 */
+	static async rescheduleRedirectSource(cacheKey) {
+		const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
+		if (!renderTarget) {
+			await RenderSchedule.delete(cacheKey);
+			return;
+		}
+		const interval =
+			Number.isFinite(renderTarget.renderInterval) && renderTarget.renderInterval > 0
+				? renderTarget.renderInterval
+				: config.render.defaultInterval;
+		await RenderSchedule.put(cacheKey, {
+			nextRenderTime: currentMinuteMs() + interval,
+			fromSitemap: !!renderTarget.sitemapUrl,
+		});
 	}
 
 	static claim = mutex.withLock(async ({ limit = 20 } = {}) => {
