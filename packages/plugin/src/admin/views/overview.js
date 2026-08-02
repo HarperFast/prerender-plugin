@@ -1,11 +1,12 @@
 /**
  * Overview: scale, the upcoming-render shape, node status, and the schedule-repair result.
  *
- * NOTHING ON THIS VIEW WALKS AN INDEX ON LOAD. The counts are table metadata (`getRecordCount`)
- * and the backlog/histogram comes from a snapshot computed on a background cadence — `claim`
- * does a sorted range read on `RenderSchedule.nextRenderTime` from every worker every few
- * seconds and every completed render writes back to it, so a panel that swept that index on
- * every page load would compete directly with rendering. Recomputing is an explicit click.
+ * NOTHING ON THIS VIEW SCANS OR COUNTS ON LOAD. The table counts AND the backlog/histogram
+ * come from a snapshot computed on a background cadence — `claim` does a sorted range read on
+ * `RenderSchedule.nextRenderTime` from every worker every few seconds and every completed
+ * render writes back to it, and even a time-bounded `getRecordCount` is scanning work a
+ * dashboard refresh has no business doing on a worker that serves bot traffic. Loading this
+ * view costs two node-sized table walks and one point read; recomputing is an explicit click.
  */
 
 import { ago, card, chart, duration, el, ICONS, kv, link, muted, num, pill, spacer, stat, unwired } from '../ui.js';
@@ -37,23 +38,28 @@ export function render(ctx) {
 	];
 }
 
+// Counts (like the histogram) come from the background snapshot, not from a per-load count:
+// a dashboard refresh costs point reads only. Null until the first snapshot has run.
 function counts(ctx, data) {
+	const tables = data.counts;
+	const asOf = data.countsAsOf ? `as of ${ago(data.countsAsOf)}` : 'no snapshot yet';
 	const value = (count) => (count ? num(count.recordCount) : '—');
-	const sub = (count) => (count?.estimatedRange ? `estimate ±${num(count.estimatedRange)}` : (count?.error ?? 'exact'));
+	const sub = (count) =>
+		count?.estimatedRange ? `estimate ±${num(count.estimatedRange)} · ${asOf}` : (count?.error ?? asOf);
 
 	const backlog = data.backlog.lastRun;
 
 	return el('div', { cls: 'stat-grid' }, [
-		stat('Render targets', value(data.counts.targets), sub(data.counts.targets)),
-		stat('Cached pages', value(data.counts.pages), sub(data.counts.pages)),
+		stat('Render targets', value(tables?.targets), sub(tables?.targets)),
+		stat('Cached pages', value(tables?.pages), sub(tables?.pages)),
 		stat(
 			'Due now',
 			backlog && !backlog.error ? num(backlog.overdue) + (backlog.truncated ? '+' : '') : '—',
 			backlog?.error ? 'last snapshot failed' : backlog ? `snapshot ${ago(backlog.finishedAt)}` : 'no snapshot yet',
 			{ warn: !!backlog && !backlog.error && backlog.overdue > 0 }
 		),
-		stat('Sitemaps', value(data.counts.sitemaps), [link('view sitemaps →', () => ctx.go('sitemaps'))]),
-		stat('Non-indexable', value(data.counts.nonIndexable), 'suppressed URLs'),
+		stat('Sitemaps', value(tables?.sitemaps), [link('view sitemaps →', () => ctx.go('sitemaps'))]),
+		stat('Non-indexable', value(tables?.nonIndexable), 'suppressed URLs'),
 	]);
 }
 

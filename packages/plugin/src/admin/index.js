@@ -89,6 +89,7 @@ export const adminAssetIds = () => [...ASSETS.keys()];
 /**
  * The console shell. Static: its asset URLs are relative, so it needs no base-path
  * substitution — the resource 308s the slashless root to `prerender_admin/` and everything
- * resolves from there, deployment prefix included.
+ * resolves from there, deployment prefix included. Read once and memoized like the assets.
  */
-export const renderAdminPage = () => read('page.html').toString('utf8');
+let page;
+export const renderAdminPage = () => (page ??= read('page.html').toString('utf8'));

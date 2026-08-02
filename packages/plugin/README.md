@@ -581,7 +581,7 @@ The response reports `residency.scheduleOwnedBy`, `scheduleSource`, and
 why the owner couldn't be reached. Set `proxyToOwner: false` to keep all reads strictly
 node-local and accept the inconclusive answer.
 
-### Counting is capped, on purpose
+### Counting is capped — and never happens on page load
 
 Table totals come from Harper's `getRecordCount()`, which is time-bounded and switches to
 sampling on a large table — it is reported with its `estimatedRange` rather than as an exact
@@ -589,6 +589,14 @@ figure. The backlog/histogram scan walks at most `management.scanCap` rows (defa
 and marks the result `truncated` when it hits that ceiling. At 1M+ targets an exact range
 count is not a page-load query, so the UI labels an estimate as an estimate instead of
 presenting a short count as the total.
+
+Both live in the background snapshot: a dashboard load is two walks of node-sized tables plus
+one node-local point read, regardless of deployment size. The console never polls — data
+refreshes on explicit clicks only — and the three routes that do bounded real work per click
+(sitemap detail, page-cache browse, page-content) yield to the event loop between batches,
+hold no read snapshot open (`snapshot: false`), and are capped at 2 concurrent per worker
+(further requests get `429`): this UI shares its workers with bot traffic, and refusing an
+operator beats delaying a crawler.
 
 ### Queue control: intent vs. observed
 

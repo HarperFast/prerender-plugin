@@ -1,14 +1,16 @@
 /**
- * The overdue-backlog count and next-24h render histogram, computed on a background cadence
- * instead of on page load.
+ * The dashboard's periodic snapshot: overdue-backlog count, next-24h render histogram, and the
+ * table counts — everything the overview needs that is not a point read, computed on a
+ * background cadence instead of on page load.
  *
- * WHY NOT ON PAGE LOAD. The scan is a sorted, capped range read over
+ * WHY NOT ON PAGE LOAD. The histogram scan is a sorted, capped range read over
  * `RenderSchedule.nextRenderTime` — the same index `claim` walks from every worker every few
- * seconds, and the one every completed render writes back to. Running it whenever someone
- * looks at the dashboard puts an operator's browser refresh in direct competition with
- * rendering; during a real incident it was deliberately refused for exactly that reason. So
- * the overview serves the LAST snapshot with its timestamp, a timer on worker 0 recomputes it
- * on a slow cadence, and recomputing right now is an explicit admin action.
+ * seconds, and the one every completed render writes back to. The table counts
+ * (`getRecordCount`) are time-bounded, but four of them is still up to ~2s of scanning per
+ * refresh on 1M-row tables. This plugin shares its workers with bot traffic; a dashboard
+ * refresh must never put either kind of work in front of a bot request, so the overview serves
+ * the LAST snapshot with its timestamp, a timer on worker 0 recomputes it on a slow cadence,
+ * and recomputing right now is an explicit admin action.
  *
  * WHY THE RESULT LIVES IN THE `coordination` DATABASE, NOT MODULE STATE. The timer runs on
  * worker 0, but overview requests are served by every worker — module state would leave the
@@ -21,9 +23,14 @@
  * redundant capped scan; a crashed worker can never wedge the snapshot forever.
  */
 
+import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config } from '../config.js';
 import { fnv1a32 } from './hash.js';
 import { HOUR, MINUTE } from './time.js';
+
+// Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
+// worker that also serves bot traffic must never monopolize the loop between rows.
+const YIELD_EVERY = 200;
 
 export const HISTOGRAM_HOURS = 24;
 
@@ -51,18 +58,6 @@ export async function scanUpcoming(now, cap) {
 	const { RenderSchedule } = databases.render_schedule;
 	const horizon = now + HISTOGRAM_HOURS * HOUR;
 
-	const rows = await Array.fromAsync(
-		RenderSchedule.search(
-			{
-				conditions: [{ attribute: 'nextRenderTime', comparator: 'less_than_equal', value: horizon }],
-				sort: { attribute: 'nextRenderTime' },
-				select: ['nextRenderTime'],
-				limit: cap,
-			},
-			{ replicateFrom: false }
-		)
-	);
-
 	const buckets = Array.from({ length: HISTOGRAM_HOURS }, (_, hour) => ({
 		hour,
 		startMs: now + hour * HOUR,
@@ -70,8 +65,25 @@ export async function scanUpcoming(now, cap) {
 	}));
 
 	let overdue = 0;
+	let scanned = 0;
 
-	for (const row of rows) {
+	// Streamed and bucketed incrementally — never buffered (`cap` rows of nothing but a
+	// timestamp is still cap rows of garbage), yielding between batches so the loop stays
+	// available to bot requests, and `snapshot: false` so a slow pass cannot pin a read
+	// snapshot against the hottest table in the system.
+	for await (const row of RenderSchedule.search(
+		{
+			conditions: [{ attribute: 'nextRenderTime', comparator: 'less_than_equal', value: horizon }],
+			sort: { attribute: 'nextRenderTime' },
+			select: ['nextRenderTime'],
+			limit: cap,
+			snapshot: false,
+		},
+		{ replicateFrom: false }
+	)) {
+		scanned++;
+		if (scanned % YIELD_EVERY === 0) await yieldNow();
+
 		const at = Number(row.nextRenderTime);
 		if (!Number.isFinite(at)) continue;
 		if (at <= now) {
@@ -85,11 +97,27 @@ export async function scanUpcoming(now, cap) {
 	return {
 		overdue,
 		buckets,
-		scanned: rows.length,
+		scanned,
 		cap,
-		truncated: rows.length >= cap,
+		truncated: scanned >= cap,
 		horizonMs: horizon,
 	};
+}
+
+/**
+ * `getRecordCount` for one table: time-bounded and yielding inside Harper, and it reports
+ * `estimatedRange` when the number is an estimate. Surfaced as-is — an estimate labelled as
+ * one beats an exact number nobody can afford to compute. A failure costs the field, never
+ * the snapshot.
+ */
+async function countTable(table) {
+	try {
+		const { recordCount, estimatedRange } = await table.getRecordCount();
+		return { recordCount, estimatedRange: estimatedRange ?? null };
+	} catch (e) {
+		logger.error(e);
+		return { recordCount: null, error: 'unavailable' };
+	}
 }
 
 const readRow = async () => {
@@ -128,7 +156,25 @@ export const runBacklogSnapshotOnce = async () => {
 	let lastRun;
 	try {
 		const stats = await scanUpcoming(startedAt, Math.max(1, config.management.scanCap | 0));
-		lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+
+		// The table counts ride in the same snapshot for the same reason as the histogram:
+		// getRecordCount is bounded (and yields internally), but it is still scanning work, and
+		// dashboard page load must cost point reads only. SEQUENTIAL on purpose — this runs
+		// beside bot traffic, and there is nothing to win by stacking four scans at once.
+		const {
+			render_service: { RenderTarget },
+			page_cache: { PrerenderedPage },
+			sitemaps: { Sitemap },
+			signals: { NonIndexable },
+		} = databases;
+		const counts = {
+			targets: await countTable(RenderTarget),
+			pages: await countTable(PrerenderedPage),
+			sitemaps: await countTable(Sitemap),
+			nonIndexable: await countTable(NonIndexable),
+		};
+
+		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 	} catch (e) {
 		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
 	}

@@ -53,7 +53,7 @@
  * route is a leaf: it never proxies onward, so no residency disagreement can cause a loop.
  */
 
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promises';
 import { config, collectConfigWarnings } from '../config.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
@@ -166,6 +166,34 @@ const routeOf = (target) => {
 	return id === null || id === undefined ? '' : String(id);
 };
 
+/**
+ * One-slot per-worker cache of the last sitemap row read for the detail view.
+ *
+ * The `entries` array lives inside the sitemap row, so paging through a large sitemap
+ * re-reads and re-deserializes the whole thing — potentially tens of thousands of entries —
+ * on every "next page" click. One slot keyed by (url, lastRefreshed) turns a browse across N
+ * pages into one row read; a refresh bumps `lastRefreshed`, which invalidates it naturally.
+ * Deliberately a single slot, not an LRU: the browsing pattern is one sitemap at a time, and
+ * a bounded wrong-guess costs exactly one extra read.
+ */
+let sitemapRowCache = null;
+
+async function readSitemapRow(url) {
+	// A cheap point read of the metadata decides cache validity without touching `entries`.
+	const head = await Sitemap.get({ id: url, select: ['url', 'lastRefreshed'] });
+	if (!head) {
+		sitemapRowCache = null;
+		return null;
+	}
+	const stamp = head.lastRefreshed ? new Date(head.lastRefreshed).getTime() : 0;
+	if (sitemapRowCache && sitemapRowCache.url === url && sitemapRowCache.stamp === stamp) {
+		return sitemapRowCache.row;
+	}
+	const row = await Sitemap.get(url);
+	if (row) sitemapRowCache = { url, stamp, row };
+	return row;
+}
+
 const isSuperUser = (user) => !!user?.role?.permission?.super_user;
 
 const usernameOf = (user) => user?.username ?? user?.getId?.() ?? null;
@@ -180,16 +208,33 @@ const denyUnlessSuperUser = (user) => {
 	return null;
 };
 
-// getRecordCount is time-bounded and falls back to sampling on a large table, so it
-// reports `estimatedRange` when the number is an estimate. Surfaced as-is: an estimate
-// labelled as one beats an exact number nobody can afford to compute.
-async function countTable(table) {
+// Rows walked between event-loop yields in the capped scans below, matching
+// util/reconcile.js: an admin scan on a worker that also serves bot traffic must never
+// monopolize the loop between rows.
+const YIELD_EVERY = 200;
+
+/**
+ * Per-worker ceiling on CONCURRENT expensive console reads (sitemap detail, page-cache
+ * browse, page-content). Each is individually bounded, but they share the event loop with
+ * bot traffic, and nothing else stops several operators (or one impatient one, or a script
+ * with credentials) from stacking them. Beyond the cap the route answers 429 immediately —
+ * on a high-traffic server, refusing an operator beats delaying a crawler.
+ */
+const MAX_CONCURRENT_HEAVY = 2;
+let heavyInFlight = 0;
+
+async function withHeavySlot(fn) {
+	if (heavyInFlight >= MAX_CONCURRENT_HEAVY) {
+		return json(
+			{ error: `Too many console queries in flight on this worker (max ${MAX_CONCURRENT_HEAVY}) — retry shortly` },
+			429
+		);
+	}
+	heavyInFlight++;
 	try {
-		const { recordCount, estimatedRange } = await table.getRecordCount();
-		return { recordCount, estimatedRange: estimatedRange ?? null };
-	} catch (e) {
-		logger.error(e);
-		return { recordCount: null, error: 'unavailable' };
+		return await fn();
+	} finally {
+		heavyInFlight--;
 	}
 }
 
@@ -533,14 +578,17 @@ export class PrerenderAdmin extends Resource {
 	static async overview() {
 		const now = Date.now();
 
-		const [{ nodes, cluster, knownScopes }, backlogState, targets, pages, sitemaps, nonIndexable] = await Promise.all([
+		// Deliberately NOTHING here scans or counts: two walks of node-sized tables
+		// (QueueStatus/QueueControl, one row per node) and one node-local point read. The
+		// histogram AND the table counts come from the background snapshot — this endpoint is
+		// hit on every dashboard view and after every action, on workers shared with bot
+		// traffic, so its cost has to stay flat no matter how large the deployment is.
+		const [{ nodes, cluster, knownScopes }, backlogState] = await Promise.all([
 			buildNodeList(now),
 			getBacklogSnapshotState(),
-			countTable(RenderTarget),
-			countTable(PrerenderedPage),
-			countTable(Sitemap),
-			countTable(NonIndexable),
 		]);
+
+		const lastRun = backlogState.lastRun;
 
 		return {
 			generatedAt: now,
@@ -551,7 +599,9 @@ export class PrerenderAdmin extends Resource {
 			localQueueStatus: QueueState.status,
 			control: { cluster, knownScopes },
 			nodes,
-			counts: { targets, pages, sitemaps, nonIndexable },
+			// From the snapshot, so they age with it. Null until the first pass has run.
+			counts: lastRun?.counts ?? null,
+			countsAsOf: lastRun?.counts ? (lastRun.finishedAt ?? null) : null,
 			// The overdue count and next-24h histogram, from the cached snapshot — NOT computed
 			// here. The scan walks the index `claim` reads from, so it runs on a background
 			// cadence (util/backlogSnapshot.js) and POST /backlog recomputes it on demand. The
@@ -560,7 +610,7 @@ export class PrerenderAdmin extends Resource {
 				enabled: config.management.backlogSnapshotInterval > 0,
 				interval: config.management.backlogSnapshotInterval,
 				running: backlogState.running,
-				lastRun: backlogState.lastRun,
+				lastRun,
 			},
 			intervals: {
 				statusSyncInterval: config.queue.statusSyncInterval,
@@ -830,7 +880,11 @@ export class PrerenderAdmin extends Resource {
 	 *     explainer is the tool for one URL's schedule, with the peer fetch and the wording
 	 *     that distinguishes "absent" from "absent here".
 	 */
-	static async sitemapDetail(data) {
+	static sitemapDetail(data) {
+		return withHeavySlot(() => PrerenderAdmin.sitemapDetailInner(data));
+	}
+
+	static async sitemapDetailInner(data) {
 		const url = data?.url;
 		if (typeof url !== 'string' || !url) return json({ error: 'url is required' }, 400);
 
@@ -839,7 +893,7 @@ export class PrerenderAdmin extends Resource {
 		const offset = Math.max(0, data?.offset | 0);
 
 		const timedOutReads = [];
-		const sitemap = await readWithTimeout('sitemap', timedOutReads, () => Sitemap.get(url));
+		const sitemap = await readWithTimeout('sitemap', timedOutReads, () => readSitemapRow(url));
 		if (timedOutReads.length) return json({ error: 'sitemap read timed out' }, 504);
 		if (!sitemap) return json({ error: `No sitemap stored under ${url}` }, 404);
 
@@ -881,13 +935,17 @@ export class PrerenderAdmin extends Resource {
 		const timedOut = [];
 		const counted = await readWithTimeout('targetCount', timedOut, async () => {
 			let count = 0;
+			// Yields between batches (shared worker) and holds no read snapshot open for the
+			// walk's duration.
 			// eslint-disable-next-line no-unused-vars
 			for await (const row of RenderTarget.search({
 				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 				select: ['cacheKey'],
 				limit: cap,
+				snapshot: false,
 			})) {
 				count++;
+				if (count % YIELD_EVERY === 0) await yieldNow();
 			}
 			return count;
 		});
@@ -969,7 +1027,11 @@ export class PrerenderAdmin extends Resource {
 	 * would be unindexed table filters, and the client filters the fetched page instead,
 	 * labelled as exactly that. `content` is never selected.
 	 */
-	static async listPages(target) {
+	static listPages(target) {
+		return withHeavySlot(() => PrerenderAdmin.listPagesInner(target));
+	}
+
+	static async listPagesInner(target) {
 		const prefix = String(target?.get?.('prefix') ?? '').trim();
 		const cursor = String(target?.get?.('cursor') ?? '');
 		const pageSize = Math.max(1, config.management.pageSize | 0);
@@ -997,7 +1059,10 @@ export class PrerenderAdmin extends Resource {
 		);
 		if (timedOut.length) return json({ error: 'page-cache read timed out' }, 504);
 
-		const total = await countTable(PrerenderedPage);
+		// The table total comes from the background snapshot, aged like the overview's counts —
+		// a browse click must not trigger a count scan.
+		const { lastRun } = await getBacklogSnapshotState();
+		const total = lastRun?.counts?.pages ?? null;
 		const now = Date.now();
 		const pageRows = rows.slice(0, limit).map((row) => {
 			const expiresAtMs = row.expiresAt ? new Date(row.expiresAt).getTime() : NaN;
@@ -1036,7 +1101,11 @@ export class PrerenderAdmin extends Resource {
 	 * operator's super-user session. The stored body may carry a content-encoding from the
 	 * render; it is decoded here so the response is the bytes a person can actually read.
 	 */
-	static async pageContent(target) {
+	static pageContent(target) {
+		return withHeavySlot(() => PrerenderAdmin.pageContentInner(target));
+	}
+
+	static async pageContentInner(target) {
 		const cacheKey = String(target?.get?.('cacheKey') ?? '');
 		if (!cacheKey) return json({ error: 'cacheKey is required' }, 400);
 
