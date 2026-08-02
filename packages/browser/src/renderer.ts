@@ -60,9 +60,16 @@ const renderer: Renderer = async (page, job) => {
 
 	// The bypass token goes to the navigation's OWN origin and nowhere else, so it can never be
 	// handed to a third-party host the page happens to pull from.
+	//
+	// Resolved against `navigationUrl` so a relative reference is judged the way the browser would
+	// judge it. Puppeteer always hands us absolute URLs, so today this only matters if a caller or
+	// refactor ever passes a bare path — it resolves to the navigation origin instead of throwing.
+	// The base cannot widen what counts as same-origin: a protocol-relative (`//other.example`) or
+	// absolute foreign URL still resolves to its own origin and gets no token, and opaque schemes
+	// (`about:`, `data:`) resolve to a null origin, which never matches.
 	const isSameOrigin = (requestUrl: string) => {
 		try {
-			return new URL(requestUrl).origin === navigationUrl.origin;
+			return new URL(requestUrl, navigationUrl).origin === navigationUrl.origin;
 		} catch {
 			return false;
 		}
