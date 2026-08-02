@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="robots" content="noindex, nofollow" />
+		<title>Prerender Console</title>
+		<!--
+			Asset URLs are RELATIVE, which is what makes a deployment base-URL prefix work with a
+			static shell: the server 308s /prerender_admin to /prerender_admin/, and everything
+			below resolves against that. Staleness is handled by ETag revalidation (no-cache on
+			the code assets), so no version query is needed.
+		-->
+		<link rel="stylesheet" href="app.css" />
+	</head>
+	<body>
+		<div id="app"></div>
+		<script type="module" src="app.js"></script>
+		<noscript>The prerender console needs JavaScript. Nothing on this page is loaded from a third party.</noscript>
+	</body>
+</html>

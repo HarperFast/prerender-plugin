@@ -107,6 +107,29 @@ export const drainUnroutedReport = () => {
 	return report;
 };
 
+/**
+ * Read the current tally WITHOUT clearing it, for the management API. Draining belongs to the
+ * periodic log flush alone — an admin page reading through `drainUnroutedReport` would steal
+ * the counts from the next log line and make the report under-count for everyone else.
+ *
+ * Same shape as the drained report. Remember the scope: these counters are per-worker and
+ * reset on every flush interval, so this is "what this worker has seen since its last flush",
+ * not a node-wide or cluster-wide total — the caller labels it as such.
+ */
+export const peekUnroutedReport = () => {
+	const report = { overflowed };
+
+	for (const [routeClass, forClass] of buckets) {
+		const rows = new Array(forClass.size);
+		let index = 0;
+		for (const [bucket, stats] of forClass) rows[index++] = { bucket, ...stats };
+		rows.sort((a, b) => b.count - a.count);
+		report[routeClass] = rows;
+	}
+
+	return report;
+};
+
 const formatRow = ({ bucket, count, samplePath }) => `${bucket} ×${count} (e.g. ${samplePath})`;
 
 /** Flush the tally to the log as at most one line per class. Silent when nothing was seen. */

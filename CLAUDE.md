@@ -7,14 +7,14 @@ plain git URL — hence the tarball).
 
 ## Packages
 
-| Path | Package | Release tag | Build |
-|---|---|---|---|
-| `packages/browser` | `@harperfast/prerender-browser` | `vX.Y.Z` | TypeScript → `tsc` |
-| `packages/plugin`  | `@harperfast/prerender` | `prerender-vX.Y.Z` | plain JS, no build |
+| Path               | Package                         | Release tag        | Build              |
+| ------------------ | ------------------------------- | ------------------ | ------------------ |
+| `packages/browser` | `@harperfast/prerender-browser` | `vX.Y.Z`           | TypeScript → `tsc` |
+| `packages/plugin`  | `@harperfast/prerender`         | `prerender-vX.Y.Z` | plain JS, no build |
 
 `packages/browser` is the headless-Chrome render library that **render-service** embeds and drives
 (claims jobs from the queue, renders, posts HTML back). `packages/plugin` is the Harper component
-(REST resources + schema) that runs *inside* Harper and serves the render queue.
+(REST resources + schema) that runs _inside_ Harper and serves the render queue.
 
 - **`dist/` is gitignored — never commit build output.** CI builds it at release time.
 - Node 24 in use (`engines: >=20`; the `.ts` tests need ≥ 22 for type-stripping).
@@ -49,7 +49,7 @@ packages, and uploads the `.tgz` assets to that release tag.
 1. Merge the version-bump PR to `main`.
 2. `gh release create vX.Y.Z --target main --title "vX.Y.Z — @harperfast/prerender-browser" --notes "…"`
    (plugin releases use the tag `prerender-vX.Y.Z`).
-3. Wait for the *Release tarballs* run, then confirm the asset:
+3. Wait for the _Release tarballs_ run, then confirm the asset:
    `gh release view vX.Y.Z --json assets --jq '.assets[].name'`
 4. Consumers reference
    `https://github.com/HarperFast/prerender-plugin/releases/download/vX.Y.Z/harperfast-prerender-browser-X.Y.Z.tgz`.
@@ -93,6 +93,7 @@ plugin tarball to that release, and vice-versa.
   hydration); byte size and status code will both look fine.
 
 <!-- SHARED:system-overview — keep in sync across prerender-plugin, <customer>-pr, render-service -->
+
 ## System overview (all three repos)
 
 Freshly-spun-up agents: these three repos are coupled through release tarballs — know the whole
@@ -113,16 +114,17 @@ CDN ──bot/crawler traffic──▶  <customer>-pr  (Harper component + @harp
                                     └──────────── posts rendered HTML back to the component ─────────▶
 ```
 
-| Repo | Role | Branch model | Dep on the monorepo |
-| --- | --- | --- | --- |
-| **prerender-plugin** | source monorepo (two packages) | PRs → `main` | — |
-| **`<customer>-pr`** | Harper component, serves bot traffic behind the CDN | PRs → `main` | `@harperfast/prerender` tarball (`prerender-v*`) |
-| **render-service** | headless-browser render fleet, one branch per customer | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`) |
+| Repo                 | Role                                                   | Branch model                                                                           | Dep on the monorepo                              |
+| -------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| **prerender-plugin** | source monorepo (two packages)                         | PRs → `main`                                                                           | —                                                |
+| **`<customer>-pr`**  | Harper component, serves bot traffic behind the CDN    | PRs → `main`                                                                           | `@harperfast/prerender` tarball (`prerender-v*`) |
+| **render-service**   | headless-browser render fleet, one branch per customer | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`)   |
 
 A downstream repo cannot bump until the upstream tarball asset already exists at its release URL —
 **cut the prerender-plugin release first, then bump the consumer.**
 
 <!-- SHARED:concurrency — keep in sync across all three repos -->
+
 ## Concurrent work (multiple agents/people)
 
 - **One git worktree per agent/task — never two agents in one clone.** A clone shares its working
@@ -139,6 +141,7 @@ A downstream repo cannot bump until the upstream tarball asset already exists at
   only and cross-contaminates; toggling staging↔prod requires wiping the resource cache).
 
 <!-- SHARED:pr-review — keep in sync across all three repos -->
+
 ## PRs & review (multi-agent)
 
 PRs here are reviewed by **other agents and humans** who leave comments. "PR opened" ≠ "done".
@@ -151,7 +154,7 @@ PRs here are reviewed by **other agents and humans** who leave comments. "PR ope
   version-bump PR is merged, the agent itself cuts the GitHub Release — that is what produces the
   tarball consumers install — and then confirms the asset landed on the release tag. Rolling that
   tarball out to a running fleet stays a human action.
-- **Before considering a PR finished, read and address *every* open review thread from *any*
+- **Before considering a PR finished, read and address _every_ open review thread from _any_
   reviewer** — not just findings handed to you. PR-level (conversation) and inline (diff) comments
   live in different places, so check both:
   ```sh

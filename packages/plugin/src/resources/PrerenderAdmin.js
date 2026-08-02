@@ -11,18 +11,40 @@
  * `loadAsInstance !== false` (see `resources/Resource.ts`). Inheriting the default gate
  * here would look secure and enforce nothing.
  *
- * Routes (all responses are `no-store`):
- *   GET  /prerender_admin           the UI page                     public (contains no data)
- *   GET  /prerender_admin/session   who am I                        public
- *   POST /prerender_admin/login     { username, password }          public
- *   POST /prerender_admin/logout    end the session                 session required
- *   GET  /prerender_admin/overview  nodes, counts, backlog shape    super_user
- *   GET  /prerender_admin/config    effective config + warnings     super_user
- *   POST /prerender_admin/explain   { url, deviceType }             super_user
- *   POST /prerender_admin/schedule  { cacheKey } -> local row       super_user
- *   POST /prerender_admin/queue     { scope, paused }               super_user
+ * Routes (data responses are `no-store`; static assets carry cache headers of their own):
+ *   GET  /prerender_admin/           the UI shell                   public (contains no data)
+ *   GET  /prerender_admin            308 → ./prerender_admin/       public
+ *   GET  /prerender_admin/<asset>    app.css/app.js/views/fonts     public (contain no data)
+ *   GET  /prerender_admin/session    who am I                       public
+ *   POST /prerender_admin/login      { username, password }         public
+ *   POST /prerender_admin/logout     end the session                session required
+ *   GET  /prerender_admin/overview   nodes, counts, backlog shape   super_user
+ *   GET  /prerender_admin/config     effective config + warnings    super_user
+ *   GET  /prerender_admin/sitemaps   root sitemaps + refresh state  super_user
+ *   GET  /prerender_admin/pages      ?prefix&cursor&limit           super_user
+ *   GET  /prerender_admin/page-content ?cacheKey (text/plain)       super_user
+ *   GET  /prerender_admin/unrouted   this worker's unrouted tally   super_user
+ *   POST /prerender_admin/explain    { url, deviceType }            super_user
+ *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
+ *   POST /prerender_admin/queue      { scope, paused }              super_user
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
+ *   POST /prerender_admin/backlog    recompute the backlog snapshot super_user
+ *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
+ *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
+ *
+ * QUERY-COST RULES for every route here (this console shares the server with bot traffic):
+ *   - Nothing walks `RenderSchedule.nextRenderTime` on page load — `claim` reads that index
+ *     from every worker every few seconds. The backlog histogram is a cached snapshot
+ *     (util/backlogSnapshot.js); recomputing it is an explicit POST.
+ *   - `PrerenderedPage.content` is never selected in a list; a row can be megabytes. The one
+ *     route that returns it (`page-content`) streams a single row as text/plain.
+ *   - `Sitemap.entries` is never selected in a list query; one row can hold tens of
+ *     thousands of entries. The detail route reads ONE row and slices server-side.
+ *   - Reads that can cross nodes pass `replicateFrom: false` and go through readWithTimeout,
+ *     reporting `degraded`/null instead of hanging (an unowned point read on a
+ *     residency-pinned table takes Harper's replication fetch, which has no timeout).
+ *   - Capped scans report scanned/cap/truncated; a short count is never presented as a total.
  *
  * `schedule` exists for cross-node explains: RenderSchedule rows are residency-pinned, and a
  * point read for a row owned by another node would take Harper's replication fetch, which has
@@ -31,24 +53,29 @@
  * route is a leaf: it never proxies onward, so no residency disagreement can cause a loop.
  */
 
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promises';
 import { config, collectConfigWarnings } from '../config.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
+import { CacheKey } from '../util/cacheKey.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
+import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
+import { peekUnroutedReport } from '../util/unrouted.js';
+import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
-import { currentMinuteMs, HOUR } from '../util/time.js';
-import { renderAdminPage } from '../admin/page.js';
+import { startSitemapRefreshInBackground } from './Sitemap.js';
+import { currentMinuteMs } from '../util/time.js';
+import { getAdminAsset, renderAdminPage } from '../admin/index.js';
 
 const {
 	render_schedule: { RenderSchedule },
 	render_service: { RenderTarget, QueueStatus, QueueControl },
 	page_cache: { PrerenderedPage },
-	sitemaps: { Sitemap },
+	sitemaps: { Sitemap, SitemapRefresh },
 	signals: { NonIndexable },
 } = databases;
 
@@ -60,8 +87,6 @@ const nodeStaleAfter = () => config.queue.statusSyncInterval * 2;
 // state here) — just enough to make a serial password walk unproductive. Harper's own
 // auth audit log is the actual detection surface.
 const FAILED_LOGIN_DELAY_MS = 300;
-
-const HISTOGRAM_HOURS = 24;
 
 // Ceiling on any single row read behind the URL explainer. A status view must never hang on
 // a slow or unreachable peer; a missing field with `degraded` set is a far better answer than
@@ -107,12 +132,31 @@ const html = (body) =>
 			'content-type': 'text/html; charset=utf-8',
 			'x-content-type-options': 'nosniff',
 			'referrer-policy': 'no-referrer',
-			// The page is fully self-contained: inline style/script, same-origin fetches, no
-			// external loads of any kind. Nothing here needs to reach the network.
+			// The console is fully self-contained: its stylesheet, scripts and fonts are served
+			// from this same resource, and everything else is same-origin fetch. No inline
+			// script or style anywhere, so no 'unsafe-inline'.
 			'content-security-policy':
-				"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+				"default-src 'none'; style-src 'self'; script-src 'self'; font-src 'self'; connect-src 'self'; img-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
 		}),
 	});
+
+/**
+ * One static asset. Public like the shell itself — these files ship in the package and carry
+ * no data. Code assets are `no-cache` (always revalidated, answered 304 via ETag), fonts are
+ * immutable (their bytes are pinned to their filename; a changed font gets a new name).
+ */
+const assetResponse = (asset, requestHeaders) => {
+	const headers = {
+		'content-type': asset.contentType,
+		'etag': asset.etag,
+		'cache-control': asset.immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+		'x-content-type-options': 'nosniff',
+	};
+	if (requestHeaders?.get?.('if-none-match') === asset.etag) {
+		return new Response(null, { status: 304, headers });
+	}
+	return new Response(asset.body, { status: 200, headers });
+};
 
 // Harper's RequestTarget leaves `id` undefined for `/prerender_admin` but sets it to `null`
 // for `/prerender_admin/` (a trailing slash marks a collection). Both mean "the root", so
@@ -121,6 +165,34 @@ const routeOf = (target) => {
 	const id = target?.id;
 	return id === null || id === undefined ? '' : String(id);
 };
+
+/**
+ * One-slot per-worker cache of the last sitemap row read for the detail view.
+ *
+ * The `entries` array lives inside the sitemap row, so paging through a large sitemap
+ * re-reads and re-deserializes the whole thing — potentially tens of thousands of entries —
+ * on every "next page" click. One slot keyed by (url, lastRefreshed) turns a browse across N
+ * pages into one row read; a refresh bumps `lastRefreshed`, which invalidates it naturally.
+ * Deliberately a single slot, not an LRU: the browsing pattern is one sitemap at a time, and
+ * a bounded wrong-guess costs exactly one extra read.
+ */
+let sitemapRowCache = null;
+
+async function readSitemapRow(url) {
+	// A cheap point read of the metadata decides cache validity without touching `entries`.
+	const head = await Sitemap.get({ id: url, select: ['url', 'lastRefreshed'] });
+	if (!head) {
+		sitemapRowCache = null;
+		return null;
+	}
+	const stamp = head.lastRefreshed ? new Date(head.lastRefreshed).getTime() : 0;
+	if (sitemapRowCache && sitemapRowCache.url === url && sitemapRowCache.stamp === stamp) {
+		return sitemapRowCache.row;
+	}
+	const row = await Sitemap.get(url);
+	if (row) sitemapRowCache = { url, stamp, row };
+	return row;
+}
 
 const isSuperUser = (user) => !!user?.role?.permission?.super_user;
 
@@ -136,72 +208,33 @@ const denyUnlessSuperUser = (user) => {
 	return null;
 };
 
+// Rows walked between event-loop yields in the capped scans below, matching
+// util/reconcile.js: an admin scan on a worker that also serves bot traffic must never
+// monopolize the loop between rows.
+const YIELD_EVERY = 200;
+
 /**
- * One capped, index-ordered walk of `RenderSchedule` over everything due within the next
- * `HISTOGRAM_HOURS`, bucketed by hour (plus an `overdue` bucket for anything already due).
- *
- * A single ascending scan gives both the backlog count and the upcoming shape. Because it
- * is ascending, a backlog larger than the cap consumes the whole budget and the histogram
- * comes back empty — which is the correct signal, not a defect: when you are that far
- * behind, the next-24h distribution is not the problem.
- *
- * Counting is capped because there is no cheap exact count for a range in the underlying
- * store; `truncated` says so explicitly rather than presenting a short count as the total.
+ * Per-worker ceiling on CONCURRENT expensive console reads (sitemap detail, page-cache
+ * browse, page-content). Each is individually bounded, but they share the event loop with
+ * bot traffic, and nothing else stops several operators (or one impatient one, or a script
+ * with credentials) from stacking them. Beyond the cap the route answers 429 immediately —
+ * on a high-traffic server, refusing an operator beats delaying a crawler.
  */
-async function scanUpcoming(now, cap) {
-	const horizon = now + HISTOGRAM_HOURS * HOUR;
+const MAX_CONCURRENT_HEAVY = 2;
+let heavyInFlight = 0;
 
-	const rows = await Array.fromAsync(
-		RenderSchedule.search(
-			{
-				conditions: [{ attribute: 'nextRenderTime', comparator: 'less_than_equal', value: horizon }],
-				sort: { attribute: 'nextRenderTime' },
-				select: ['nextRenderTime'],
-				limit: cap,
-			},
-			{ replicateFrom: false }
-		)
-	);
-
-	const buckets = Array.from({ length: HISTOGRAM_HOURS }, (_, hour) => ({
-		hour,
-		startMs: now + hour * HOUR,
-		count: 0,
-	}));
-
-	let overdue = 0;
-
-	for (const row of rows) {
-		const at = Number(row.nextRenderTime);
-		if (!Number.isFinite(at)) continue;
-		if (at <= now) {
-			overdue++;
-			continue;
-		}
-		const hour = Math.floor((at - now) / HOUR);
-		if (hour >= 0 && hour < HISTOGRAM_HOURS) buckets[hour].count++;
+async function withHeavySlot(fn) {
+	if (heavyInFlight >= MAX_CONCURRENT_HEAVY) {
+		return json(
+			{ error: `Too many console queries in flight on this worker (max ${MAX_CONCURRENT_HEAVY}) — retry shortly` },
+			429
+		);
 	}
-
-	return {
-		overdue,
-		buckets,
-		scanned: rows.length,
-		cap,
-		truncated: rows.length >= cap,
-		horizonMs: horizon,
-	};
-}
-
-// getRecordCount is time-bounded and falls back to sampling on a large table, so it
-// reports `estimatedRange` when the number is an estimate. Surfaced as-is: an estimate
-// labelled as one beats an exact number nobody can afford to compute.
-async function countTable(table) {
+	heavyInFlight++;
 	try {
-		const { recordCount, estimatedRange } = await table.getRecordCount();
-		return { recordCount, estimatedRange: estimatedRange ?? null };
-	} catch (e) {
-		logger.error(e);
-		return { recordCount: null, error: 'unavailable' };
+		return await fn();
+	} finally {
+		heavyInFlight--;
 	}
 }
 
@@ -267,9 +300,24 @@ export class PrerenderAdmin extends Resource {
 		const context = this.getContext();
 		const user = context?.user;
 
-		// The page itself carries no data — it renders a login form and fetches everything
-		// through the gated routes below.
-		if (route === '') return html(renderAdminPage());
+		if (route === '') {
+			// The shell's asset URLs are relative, so it must be served under the trailing-slash
+			// URL. `isCollection` is how RequestTarget distinguishes `/prerender_admin/` from
+			// `/prerender_admin`; the Location is relative (resolved by the browser against the
+			// request URL), so a deployment base-URL prefix is preserved without knowing it here.
+			if (!target?.isCollection) {
+				return new Response(null, { status: 308, headers: noStore({ location: 'prerender_admin/' }) });
+			}
+			// The page itself carries no data — it renders a login form and fetches everything
+			// through the gated routes below.
+			return html(renderAdminPage());
+		}
+
+		// Static assets, public like the shell: they ship in the package and carry no data.
+		// getAdminAsset resolves ONLY allowlisted ids — the id arrives percent-decoded, so a
+		// traversal attempt is just an unknown id and falls through to the 404 below.
+		const asset = getAdminAsset(route);
+		if (asset) return assetResponse(asset, context?.headers);
 
 		if (route === 'session') {
 			return json({
@@ -293,6 +341,23 @@ export class PrerenderAdmin extends Resource {
 					warnings: collectConfigWarnings(),
 					node: server.hostname,
 					workerIndex: server.workerIndex,
+				});
+			case 'sitemaps':
+				return json(await PrerenderAdmin.sitemapList());
+			case 'pages':
+				return PrerenderAdmin.listPages(target);
+			case 'page-content':
+				return PrerenderAdmin.pageContent(target);
+			case 'unrouted':
+				// A non-destructive peek: draining here would steal the tally from the periodic
+				// log flush. Counters are per-worker in-process state, so the response names
+				// which worker's slice this is.
+				return json({
+					node: server.hostname,
+					workerIndex: server.workerIndex,
+					perWorker: true,
+					interval: config.ingress.report.interval,
+					report: peekUnroutedReport(),
 				});
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
@@ -323,6 +388,12 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.revalidateUrl(data);
 			case 'reconcile':
 				return PrerenderAdmin.reconcile();
+			case 'backlog':
+				return PrerenderAdmin.backlog();
+			case 'sitemap':
+				return PrerenderAdmin.sitemapDetail(data);
+			case 'sitemap-refresh':
+				return PrerenderAdmin.sitemapRefresh(data);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -506,16 +577,18 @@ export class PrerenderAdmin extends Resource {
 
 	static async overview() {
 		const now = Date.now();
-		const cap = Math.max(1, config.management.scanCap | 0);
 
-		const [{ nodes, cluster, knownScopes }, upcoming, targets, pages, sitemaps, nonIndexable] = await Promise.all([
+		// Deliberately NOTHING here scans or counts: two walks of node-sized tables
+		// (QueueStatus/QueueControl, one row per node) and one node-local point read. The
+		// histogram AND the table counts come from the background snapshot — this endpoint is
+		// hit on every dashboard view and after every action, on workers shared with bot
+		// traffic, so its cost has to stay flat no matter how large the deployment is.
+		const [{ nodes, cluster, knownScopes }, backlogState] = await Promise.all([
 			buildNodeList(now),
-			scanUpcoming(now, cap),
-			countTable(RenderTarget),
-			countTable(PrerenderedPage),
-			countTable(Sitemap),
-			countTable(NonIndexable),
+			getBacklogSnapshotState(),
 		]);
+
+		const lastRun = backlogState.lastRun;
 
 		return {
 			generatedAt: now,
@@ -526,17 +599,18 @@ export class PrerenderAdmin extends Resource {
 			localQueueStatus: QueueState.status,
 			control: { cluster, knownScopes },
 			nodes,
-			counts: { targets, pages, sitemaps, nonIndexable },
+			// From the snapshot, so they age with it. Null until the first pass has run.
+			counts: lastRun?.counts ?? null,
+			countsAsOf: lastRun?.counts ? (lastRun.finishedAt ?? null) : null,
+			// The overdue count and next-24h histogram, from the cached snapshot — NOT computed
+			// here. The scan walks the index `claim` reads from, so it runs on a background
+			// cadence (util/backlogSnapshot.js) and POST /backlog recomputes it on demand. The
+			// snapshot row lives in the node-local coordination database, so any worker sees it.
 			backlog: {
-				overdue: upcoming.overdue,
-				truncated: upcoming.truncated,
-				cap: upcoming.cap,
-				scanned: upcoming.scanned,
-			},
-			histogram: {
-				buckets: upcoming.buckets,
-				horizonMs: upcoming.horizonMs,
-				truncated: upcoming.truncated,
+				enabled: config.management.backlogSnapshotInterval > 0,
+				interval: config.management.backlogSnapshotInterval,
+				running: backlogState.running,
+				lastRun,
 			},
 			intervals: {
 				statusSyncInterval: config.queue.statusSyncInterval,
@@ -745,6 +819,322 @@ export class PrerenderAdmin extends Resource {
 			...result,
 			// A remote node applies this on its next status sync, not instantly.
 			appliesRemotelyWithinMs: config.queue.statusSyncInterval,
+		});
+	}
+
+	/**
+	 * Recompute the backlog snapshot NOW. Same shape as `reconcile`: the scan is detached (it
+	 * can take a while against a large backlog and nothing is gained holding the request open),
+	 * and a scan already in flight reports itself rather than implying a second one started.
+	 */
+	static async backlog() {
+		const { running, lastRun } = await getBacklogSnapshotState();
+		const payload = { node: server.hostname, lastRun };
+
+		if (running) return json({ ...payload, started: false, alreadyRunning: true });
+
+		runBacklogSnapshotOnce().catch((e) => logger.error(e));
+		return json({ ...payload, started: true, alreadyRunning: false });
+	}
+
+	/**
+	 * Root sitemaps with their refresh state. `entries` is deliberately never selected — one
+	 * row can hold tens of thousands of them; the counts are what the list needs. Children are
+	 * omitted for the same reason `rootSitemapUrls` walks roots only: an index reaches its own
+	 * children, and the per-root SitemapRefresh row already aggregates the walk.
+	 */
+	static async sitemapList() {
+		const roots = [];
+		for await (const row of Sitemap.search({ select: ['url', 'parentUrl', 'entryCount', 'lastRefreshed'] })) {
+			if (!row.parentUrl) roots.push(row);
+		}
+		roots.sort((a, b) => String(a.url).localeCompare(String(b.url)));
+
+		// The whole SitemapRefresh table is one row per root plus the 'all' marker — small by
+		// construction.
+		const refreshRows = await Array.fromAsync(SitemapRefresh.search({}));
+		const refreshById = new Map(refreshRows.map((row) => [row.id, row]));
+
+		return {
+			node: server.hostname,
+			sitemaps: roots.map((row) => ({
+				url: row.url,
+				entryCount: row.entryCount ?? null,
+				lastRefreshed: row.lastRefreshed ?? null,
+				refresh: refreshById.get(row.url) ?? null,
+			})),
+			lastFullPass: refreshById.get('all')?.lastRefreshed ?? null,
+		};
+	}
+
+	/**
+	 * One sitemap's detail: its refresh row, a capped count of the targets attributed to it,
+	 * and ONE page of entries with per-entry state.
+	 *
+	 * Costs, deliberately bounded to an explicit click:
+	 *   - one point read of the sitemap row (`entries` included — that is where they live);
+	 *   - a capped walk of the `sitemapUrl` index (select of the key only) for the target count;
+	 *   - ≤ pageSize point reads each on RenderTarget / PrerenderedPage / NonIndexable for the
+	 *     page of entries shown. RenderSchedule is deliberately NOT read per entry: it is
+	 *     residency-pinned, so most rows are unreadable without a cross-node fetch — the
+	 *     explainer is the tool for one URL's schedule, with the peer fetch and the wording
+	 *     that distinguishes "absent" from "absent here".
+	 */
+	static sitemapDetail(data) {
+		return withHeavySlot(() => this.sitemapDetailInner(data));
+	}
+
+	static async sitemapDetailInner(data) {
+		const url = data?.url;
+		if (typeof url !== 'string' || !url) return json({ error: 'url is required' }, 400);
+
+		const pageSize = Math.max(1, config.management.pageSize | 0);
+		const limit = Math.min(Math.max(1, data?.limit | 0 || pageSize), pageSize);
+		const offset = Math.max(0, data?.offset | 0);
+
+		const timedOutReads = [];
+		const sitemap = await readWithTimeout('sitemap', timedOutReads, () => readSitemapRow(url));
+		if (timedOutReads.length) return json({ error: 'sitemap read timed out' }, 504);
+		if (!sitemap) return json({ error: `No sitemap stored under ${url}` }, 404);
+
+		const refresh = await readWithTimeout('sitemapRefresh', timedOutReads, () => SitemapRefresh.get(url));
+
+		const allEntries = Array.isArray(sitemap.entries) ? sitemap.entries : [];
+		const pageOfEntries = allEntries.slice(offset, offset + limit);
+
+		const [targetCount, entries] = await Promise.all([
+			this.countTargetsFor(url),
+			Promise.all(pageOfEntries.map((entry) => this.entryState(entry))),
+		]);
+
+		return json({
+			node: server.hostname,
+			sitemap: {
+				url: sitemap.url,
+				isIndex: !!sitemap.isIndex,
+				entryCount: sitemap.entryCount ?? allEntries.length,
+				lastRefreshed: sitemap.lastRefreshed ?? null,
+				parentUrl: sitemap.parentUrl ?? null,
+			},
+			refresh: refresh ?? null,
+			targetCount,
+			entries,
+			offset,
+			limit,
+			degraded: timedOutReads.length ? { timedOutReads } : null,
+		});
+	}
+
+	/**
+	 * Capped count of RenderTargets attributed to one sitemap — an indexed equality walk
+	 * selecting only the key, counted without buffering. Null when it timed out (unknown, not
+	 * zero).
+	 */
+	static async countTargetsFor(sitemapUrl) {
+		const cap = Math.max(1, config.management.scanCap | 0);
+		const timedOut = [];
+		const counted = await readWithTimeout('targetCount', timedOut, async () => {
+			let count = 0;
+			// Yields between batches (shared worker) and holds no read snapshot open for the
+			// walk's duration.
+			// eslint-disable-next-line no-unused-vars
+			for await (const row of RenderTarget.search({
+				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
+				select: ['cacheKey'],
+				limit: cap,
+				snapshot: false,
+			})) {
+				count++;
+				if (count % YIELD_EVERY === 0) await yieldNow();
+			}
+			return count;
+		});
+		if (counted === null) return null;
+		return { count: counted, cap, truncated: counted >= cap };
+	}
+
+	/**
+	 * The console-facing state of one sitemap entry, from bounded point reads.
+	 *
+	 * A `filtered` entry needs NO reads: the same classifier the serving path uses says the
+	 * path is not a prerender route, so nothing about it is stored anywhere. A read that times
+	 * out yields `state: null` — unknown, which the UI must render as such rather than as
+	 * "not cached".
+	 */
+	static async entryState(entry) {
+		const loc = entry?.loc;
+		const base = {
+			loc: loc ?? null,
+			changefreq: entry?.changefreq ?? null,
+			priority: entry?.priority ?? null,
+		};
+
+		let explanation;
+		try {
+			explanation = explainCacheKey(String(loc));
+		} catch {
+			return { ...base, state: 'invalid', stateDetail: 'not an absolute URL' };
+		}
+
+		if (!explanation.eligibility.prerendered) {
+			return { ...base, state: 'filtered', stateDetail: `${explanation.ingress.routeClass} route` };
+		}
+
+		const { cacheKey, canonicalUrl } = explanation.resolved;
+		const timedOut = [];
+
+		const [target, page, suppressed] = await Promise.all([
+			readWithTimeout('renderTarget', timedOut, () => RenderTarget.get({ id: cacheKey, select: ['cacheKey'] })),
+			readWithTimeout('prerenderedPage', timedOut, () =>
+				PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] })
+			),
+			readWithTimeout('nonIndexable', timedOut, () => NonIndexable.get({ id: canonicalUrl, select: ['url'] })),
+		]);
+
+		if (timedOut.length) return { ...base, cacheKey, state: null };
+
+		if (suppressed) return { ...base, cacheKey, state: 'non-indexable' };
+
+		if (page) {
+			const expiresAtMs = page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
+			const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
+			return { ...base, cacheKey, state: fresh ? 'cached' : 'stale' };
+		}
+
+		return target
+			? { ...base, cacheKey, state: 'scheduled', stateDetail: 'target, not yet cached' }
+			: { ...base, cacheKey, state: 'no target' };
+	}
+
+	/**
+	 * Kick off a background sitemap refresh — one root when `url` is given, else every root.
+	 * Same claim/skip semantics as POSTing the sitemaps resource itself; this exists so the
+	 * console talks only to this one gated surface.
+	 */
+	static async sitemapRefresh(data) {
+		const url = data?.url;
+		if (url !== undefined && (typeof url !== 'string' || !url)) {
+			return json({ error: 'url must be a sitemap URL, or omitted to refresh every root' }, 400);
+		}
+		return json(await startSitemapRefreshInBackground(url));
+	}
+
+	/**
+	 * A page of `PrerenderedPage` rows by cache-key prefix, cursor-paged.
+	 *
+	 * This is a primary-key RANGE — the only cheap shape this table offers (its only index is
+	 * the key). No freshness/status/indexable conditions exist server-side, on purpose: they
+	 * would be unindexed table filters, and the client filters the fetched page instead,
+	 * labelled as exactly that. `content` is never selected.
+	 */
+	static listPages(target) {
+		return withHeavySlot(() => this.listPagesInner(target));
+	}
+
+	static async listPagesInner(target) {
+		const prefix = String(target?.get?.('prefix') ?? '').trim();
+		const cursor = String(target?.get?.('cursor') ?? '');
+		const pageSize = Math.max(1, config.management.pageSize | 0);
+		const limit = Math.min(Math.max(1, Number(target?.get?.('limit')) || pageSize), pageSize);
+
+		// `￿` sorts after every code unit that can appear in a key, so [prefix, prefix+
+		// '￿') is the prefix range. The cursor (last key of the previous page) narrows the
+		// lower bound; `greater_than` both excludes it and gives the no-prefix case a full-table
+		// ascending walk bounded by `limit`.
+		const conditions = [{ attribute: 'cacheKey', comparator: 'greater_than', value: cursor || prefix || '' }];
+		if (prefix) {
+			conditions.push({ attribute: 'cacheKey', comparator: 'less_than', value: `${prefix}￿` });
+		}
+
+		const timedOut = [];
+		const rows = await readWithTimeout('pages', timedOut, () =>
+			Array.fromAsync(
+				PrerenderedPage.search({
+					conditions,
+					sort: { attribute: 'cacheKey' },
+					select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
+					limit: limit + 1, // one extra row = "there is a next page", never shown
+				})
+			)
+		);
+		if (timedOut.length) return json({ error: 'page-cache read timed out' }, 504);
+
+		// The table total comes from the background snapshot, aged like the overview's counts —
+		// a browse click must not trigger a count scan.
+		const { lastRun } = await getBacklogSnapshotState();
+		const total = lastRun?.counts?.pages ?? null;
+		const now = Date.now();
+		const pageRows = rows.slice(0, limit).map((row) => {
+			const expiresAtMs = row.expiresAt ? new Date(row.expiresAt).getTime() : NaN;
+			// The URL-half of a cache key is `canonicalizeUrl` output, which is a full URL
+			// (scheme included; see util/url.js — `new URL(half).href === half` by contract).
+			const urlHalf = CacheKey.extractUrl(row.cacheKey);
+			const { deviceType } = CacheKey.parse(row.cacheKey);
+			return {
+				cacheKey: row.cacheKey,
+				statusCode: row.statusCode,
+				lastCached: row.lastCached ? new Date(row.lastCached).getTime() : null,
+				expiresAt: Number.isFinite(expiresAtMs) ? expiresAtMs : null,
+				isIndexable: row.isIndexable ?? null,
+				// Same freshness rule the serving path applies.
+				fresh: !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > now,
+				url: urlHalf || null,
+				deviceType: deviceType ?? null,
+			};
+		});
+
+		return json({
+			node: server.hostname,
+			prefix,
+			pages: pageRows,
+			truncated: rows.length > limit,
+			nextCursor: rows.length > limit ? pageRows[pageRows.length - 1].cacheKey : null,
+			total,
+		});
+	}
+
+	/**
+	 * Stream ONE stored page's HTML.
+	 *
+	 * Served as text/plain with nosniff, NEVER text/html: the stored markup is origin-
+	 * influenced content, and serving it as HTML from this origin would execute it against the
+	 * operator's super-user session. The stored body may carry a content-encoding from the
+	 * render; it is decoded here so the response is the bytes a person can actually read.
+	 */
+	static pageContent(target) {
+		return withHeavySlot(() => this.pageContentInner(target));
+	}
+
+	static async pageContentInner(target) {
+		const cacheKey = String(target?.get?.('cacheKey') ?? '');
+		if (!cacheKey) return json({ error: 'cacheKey is required' }, 400);
+
+		const timedOut = [];
+		const page = await readWithTimeout('pageContent', timedOut, () =>
+			PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'content', 'headers'] })
+		);
+		if (timedOut.length) return json({ error: 'page read timed out' }, 504);
+		if (!page?.content) return json({ error: `No cached page under this key`, cacheKey }, 404);
+
+		let body;
+		try {
+			// Buffer the one row rather than plumbing a stream: cached pages are sub-few-MB by
+			// construction, this is an explicit per-row click, and decoding needs the bytes anyway.
+			body = Buffer.from(await page.content.arrayBuffer());
+			const storedHeaders = page.headers ? JSON.parse(page.headers) : {};
+			const encoding = storedHeaders['content-encoding'];
+			if (encoding) body = decode(body, encoding);
+		} catch (e) {
+			return json({ error: `Could not read the stored content: ${e?.message ?? String(e)}` }, 500);
+		}
+
+		return new Response(body, {
+			status: 200,
+			headers: noStore({
+				'content-type': 'text/plain; charset=utf-8',
+				'x-content-type-options': 'nosniff',
+				'content-disposition': 'inline',
+			}),
 		});
 	}
 }
