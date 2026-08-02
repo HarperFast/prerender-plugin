@@ -69,15 +69,15 @@ export async function scanUpcoming(now, cap) {
 
 	// Streamed and bucketed incrementally — never buffered (`cap` rows of nothing but a
 	// timestamp is still cap rows of garbage), yielding between batches so the loop stays
-	// available to bot requests, and `snapshot: false` so a slow pass cannot pin a read
-	// snapshot against the hottest table in the system.
+	// available to bot requests. The walk is `cap`-bounded, which is what actually bounds how
+	// long its read snapshot lives — a `snapshot: false` query option is NOT consumed by
+	// Harper's search path (it exists only on internal store-level getRange calls).
 	for await (const row of RenderSchedule.search(
 		{
 			conditions: [{ attribute: 'nextRenderTime', comparator: 'less_than_equal', value: horizon }],
 			sort: { attribute: 'nextRenderTime' },
 			select: ['nextRenderTime'],
 			limit: cap,
-			snapshot: false,
 		},
 		{ replicateFrom: false }
 	)) {
@@ -132,7 +132,6 @@ async function countSuppressed(Target) {
 			conditions: [{ attribute: 'state', value: 'suppressed' }],
 			select: ['url'],
 			limit: cap,
-			snapshot: false,
 		})) {
 			void row;
 			count++;

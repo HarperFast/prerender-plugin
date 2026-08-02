@@ -63,7 +63,7 @@ import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
-import { getLastMigration, runTargetMigration } from '../util/migrateTargets.js';
+import { getMigrationStatus, runTargetMigration } from '../util/migrateTargets.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { decode } from '../util/contentEncoding.js';
@@ -390,7 +390,7 @@ export class PrerenderAdmin extends Resource {
 			case 'reconcile':
 				return PrerenderAdmin.reconcile();
 			case 'migrate-targets':
-				return PrerenderAdmin.migrateTargets();
+				return PrerenderAdmin.migrateTargets(data);
 			case 'backlog':
 				return PrerenderAdmin.backlog();
 			case 'sitemap':
@@ -471,17 +471,33 @@ export class PrerenderAdmin extends Resource {
 	 * util/reconcile.js. Every node runs the periodic sweep for its own slice.
 	 */
 	/**
-	 * Run the one-shot legacy-registry migration on THIS node (see util/migrateTargets.js for
-	 * the deploy sequence). Synchronous on purpose: the operator triggers it exactly once
-	 * during the v0.19 rollout and wants the stats in the response; the sweep is sized for a
-	 * staging registry, and a re-trigger of a completed run answers `skipped` immediately.
+	 * Start (or poll) the one-shot legacy-registry migration on THIS node — see
+	 * util/migrateTargets.js for the deploy sequence. Detached like `reconcile`: the sweep
+	 * walks ~1.6M legacy rows, far past any HTTP timeout, so the first POST starts it and
+	 * returns; re-POSTing reports live progress and, once finished, the run summary. A POST
+	 * after a completed run only REPORTS — re-running the (idempotent, but multi-minute)
+	 * sweep requires an explicit `{"restart": true}`, so polling can never accidentally
+	 * start a fresh one.
 	 */
-	static async migrateTargets() {
-		try {
-			return json(await runTargetMigration());
-		} catch (e) {
-			return json({ error: e?.message ?? String(e), lastRun: getLastMigration() }, 500);
+	static migrateTargets(data) {
+		const status = getMigrationStatus();
+		if (status.running) {
+			return json({ ...status, started: false, alreadyRunning: true });
 		}
+		if (status.lastRun && data?.restart !== true) {
+			return json({
+				...status,
+				started: false,
+				alreadyRunning: false,
+				note: 'already ran on this node — POST {"restart": true} to run it again',
+			});
+		}
+
+		// Detached: the sweep outlives this request, so a rejection has to be handled here or
+		// it surfaces as an unhandled rejection. The failure lands in lastRun for the next poll.
+		runTargetMigration().catch((e) => logger.error(e, '[prerender] target migration failed'));
+
+		return json({ ...status, started: true, alreadyRunning: false });
 	}
 
 	static reconcile() {
@@ -968,14 +984,14 @@ export class PrerenderAdmin extends Resource {
 		const timedOut = [];
 		const counted = await readWithTimeout('targetCount', timedOut, async () => {
 			let count = 0;
-			// Yields between batches (shared worker) and holds no read snapshot open for the
-			// walk's duration.
+			// Yields between batches (shared worker); the `cap` bound is what limits how long
+			// the walk's read snapshot lives (a `snapshot` query option is not consumed by
+			// Harper's search path).
 			// eslint-disable-next-line no-unused-vars
 			for await (const row of Target.search({
 				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 				select: ['url'],
 				limit: cap,
-				snapshot: false,
 			})) {
 				count++;
 				if (count % YIELD_EVERY === 0) await yieldNow();
