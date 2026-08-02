@@ -54,6 +54,7 @@ import { setImmediate } from 'node:timers/promises';
 import { CacheKey } from './cacheKey.js';
 import { getResidencyByUrl } from './residency.js';
 import { CLUSTER_SCOPE } from './queueControl.js';
+import { getSab } from './coordination.js';
 import { RenderQueue } from '../resources/RenderQueue.js';
 
 // Rows scanned between event-loop yields, same courtesy as the reconcile sweep.
@@ -129,32 +130,77 @@ export const migrateLegacyTargets = async ({
 	return stats;
 };
 
-let running = false;
-let lastRun = null;
-// Mutated in place by the sweep, so the admin action can report live progress.
-const progress = { legacyRows: 0, created: 0, existing: 0 };
+/**
+ * CROSS-WORKER node state. Module state is per-worker, and a Harper node runs many workers:
+ * a poll POST that lands on a worker that never ran the sweep would see "not running, never
+ * ran" and start ANOTHER sweep — observed live during the v0.19.1 prod migration (each poll
+ * spawned a redundant sweep on a fresh worker; absent-only writes kept it safe, but each one
+ * re-walked 1.6M rows). The guard therefore lives in the node-shared coordination buffer,
+ * where a single Atomics.compareExchange decides who runs, no matter which worker the
+ * request lands on.
+ *
+ * Layout (Int32Array): [0] running (0/1) · [1] legacyRows · [2] created · [3] existing ·
+ * [4] outcome (0 never ran, 1 completed ok, 2 failed, 3 skipped-empty). Note this is a plain
+ * ArrayBuffer (no Atomics.wait), which load/store/compareExchange are fine with.
+ */
+const STATE_RUNNING = 0;
+const STATE_LEGACY_ROWS = 1;
+const STATE_CREATED = 2;
+const STATE_EXISTING = 3;
+const STATE_OUTCOME = 4;
+const OUTCOME_LABEL = { 0: null, 1: 'completed', 2: 'failed', 3: 'skipped-empty-legacy' };
 
-/** Live status for the admin action: whether a sweep is running, how far it is, and the
- *  last completed run's summary. */
-export const getMigrationStatus = () => ({ running, progress: { ...progress }, lastRun });
+const state = new Int32Array(await getSab('target_migration', 8 * Int32Array.BYTES_PER_ELEMENT));
+
+// Worker-local detail for the worker that actually ran the sweep (timing, error message).
+// The SAB carries everything cross-worker status needs; this enriches the response when the
+// poll happens to land on the runner.
+let lastRun = null;
+
+/** Live status for the admin action, valid from ANY worker: whether a sweep is running on
+ *  this node, how far it is, and how the last run ended. */
+export const getMigrationStatus = () => ({
+	running: Atomics.load(state, STATE_RUNNING) === 1,
+	progress: {
+		legacyRows: Atomics.load(state, STATE_LEGACY_ROWS),
+		created: Atomics.load(state, STATE_CREATED),
+		existing: Atomics.load(state, STATE_EXISTING),
+	},
+	lastOutcome: OUTCOME_LABEL[Atomics.load(state, STATE_OUTCOME)],
+	// Present only when this worker ran the sweep; other workers report the SAB fields alone.
+	lastRun,
+});
+
+const publishProgress = (progress) => {
+	Atomics.store(state, STATE_LEGACY_ROWS, progress.legacyRows);
+	Atomics.store(state, STATE_CREATED, progress.created);
+	Atomics.store(state, STATE_EXISTING, progress.existing);
+};
 
 /**
- * Run the sweep against the live tables, wrapped in the cluster pause. Guarded against
- * overlap on this node; the operator triggers it on ONE node, so there is exactly one
- * writer — the absent-only semantics are a safety net, not the mechanism.
+ * Run the sweep against the live tables, wrapped in the cluster pause. The Atomics CAS is
+ * the node-wide overlap guard (any worker, any request); the operator triggers it on ONE
+ * node, so there is exactly one writer cluster-wide — the absent-only semantics are a safety
+ * net, not the mechanism.
  */
 export const runTargetMigration = async () => {
-	if (running) return { skipped: true, reason: 'a migration is already running on this node', ...getMigrationStatus() };
-	running = true;
+	if (Atomics.compareExchange(state, STATE_RUNNING, 0, 1) !== 0) {
+		return { skipped: true, reason: 'a migration is already running on this node', ...getMigrationStatus() };
+	}
 	const startedAt = Date.now();
+	const progress = { legacyRows: 0, created: 0, existing: 0 };
+	publishProgress(progress);
 
 	try {
-		const outcome = await runTargetMigrationInner();
+		const outcome = await runTargetMigrationInner(progress);
+		publishProgress(progress); // final counters — the last onYield can be up to 199 rows stale
+		Atomics.store(state, STATE_OUTCOME, outcome.skipped ? 3 : 1);
 		lastRun = { ...outcome, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 		return lastRun;
 	} catch (e) {
+		Atomics.store(state, STATE_OUTCOME, 2);
 		lastRun = {
-			...getMigrationStatus().progress,
+			...progress,
 			node: server.hostname,
 			startedAt,
 			finishedAt: Date.now(),
@@ -162,11 +208,11 @@ export const runTargetMigration = async () => {
 		};
 		throw e;
 	} finally {
-		running = false;
+		Atomics.store(state, STATE_RUNNING, 0);
 	}
 };
 
-const runTargetMigrationInner = async () => {
+const runTargetMigrationInner = async (progress) => {
 	const {
 		render_service: { Target: TargetTable, RenderTarget: LegacyTable, QueueControl },
 	} = databases;
@@ -206,7 +252,12 @@ const runTargetMigrationInner = async () => {
 			// The RAW table class ON PURPOSE: resources/Target.js `put` fans out fresh jittered
 			// schedule rows, and preserving the existing schedules untouched is the entire point.
 			putTarget: (url, row) => TargetTable.put(url, row),
-			onYield: () => setImmediate(),
+			// Publish the counters to the node-shared buffer at every yield point, so a status
+			// poll landing on ANY worker sees live progress.
+			onYield: () => {
+				publishProgress(progress);
+				return setImmediate();
+			},
 			stats: progress,
 		});
 

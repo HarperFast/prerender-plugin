@@ -474,27 +474,34 @@ export class PrerenderAdmin extends Resource {
 	 * Start (or poll) the one-shot legacy-registry migration on THIS node — see
 	 * util/migrateTargets.js for the deploy sequence. Detached like `reconcile`: the sweep
 	 * walks ~1.6M legacy rows, far past any HTTP timeout, so the first POST starts it and
-	 * returns; re-POSTing reports live progress and, once finished, the run summary. A POST
-	 * after a completed run only REPORTS — re-running the (idempotent, but multi-minute)
-	 * sweep requires an explicit `{"restart": true}`, so polling can never accidentally
-	 * start a fresh one.
+	 * returns; re-POSTing reports live progress and, once finished, the outcome. A POST after
+	 * a completed (or failed, or skipped) run only REPORTS — re-running the (idempotent, but
+	 * multi-minute) sweep requires an explicit `{"restart": true}`.
+	 *
+	 * Every decision here reads NODE-shared state, not module state: requests land on
+	 * arbitrary workers, and per-worker state made each poll on a fresh worker look like
+	 * "never ran" — which started a redundant full sweep per poll. The start itself is also
+	 * not decided here: runTargetMigration's Atomics CAS is the single authority, so two
+	 * concurrent first-POSTs on different workers still yield exactly one sweep (the loser
+	 * reports `skipped`).
 	 */
 	static migrateTargets(data) {
 		const status = getMigrationStatus();
 		if (status.running) {
 			return json({ ...status, started: false, alreadyRunning: true });
 		}
-		if (status.lastRun && data?.restart !== true) {
+		if (status.lastOutcome && data?.restart !== true) {
 			return json({
 				...status,
 				started: false,
 				alreadyRunning: false,
-				note: 'already ran on this node — POST {"restart": true} to run it again',
+				note: `last run on this node: ${status.lastOutcome} — POST {"restart": true} to run it again`,
 			});
 		}
 
 		// Detached: the sweep outlives this request, so a rejection has to be handled here or
-		// it surfaces as an unhandled rejection. The failure lands in lastRun for the next poll.
+		// it surfaces as an unhandled rejection. The failure lands in the shared outcome flag
+		// (and this worker's lastRun detail) for the next poll.
 		runTargetMigration().catch((e) => logger.error(e, '[prerender] target migration failed'));
 
 		return json({ ...status, started: true, alreadyRunning: false });

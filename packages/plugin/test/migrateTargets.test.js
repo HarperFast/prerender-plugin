@@ -194,8 +194,26 @@ test('the run summary and live progress are exposed for the admin poll', async (
 	assert.equal(run.node, 'test-node');
 	const status = migrate.getMigrationStatus();
 	assert.equal(status.running, false);
+	assert.equal(status.lastOutcome, 'completed', 'the outcome flag is the cross-worker completion signal');
 	assert.deepEqual(status.lastRun, run);
 	assert.equal(status.progress.legacyRows, run.legacyRows, 'progress counters reflect the completed sweep');
+});
+
+test('concurrent triggers yield exactly ONE sweep — the CAS guard, not module state', async () => {
+	// The v0.19.1 prod migration proved why: requests land on arbitrary workers, per-worker
+	// state let every poll start a redundant sweep, and Harper's write-conflict detection
+	// then killed the racing losers ("After 40 retries, unable to commit"). The Atomics CAS
+	// on the node-shared buffer makes the second trigger a no-op instead of a coin-flip.
+	seedLegacy(A);
+	const [first, second] = await Promise.all([migrate.runTargetMigration(), migrate.runTargetMigration()]);
+
+	const outcomes = [first, second];
+	const ran = outcomes.filter((o) => !o.skipped);
+	const refused = outcomes.filter((o) => o.skipped);
+	assert.equal(ran.length, 1, 'exactly one sweep runs');
+	assert.equal(refused.length, 1);
+	assert.match(refused[0].reason, /already running/);
+	assert.equal(stores.target.size, 1, 'the registry is written once');
 });
 
 test('pauses the cluster for the rebuild and resumes after', async () => {
