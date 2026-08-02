@@ -79,6 +79,19 @@ plugin tarball to that release, and vice-versa.
   nonexistent node, 500 writes took 10.7ms — mean 0.021ms. v0.15.0 assumed the symmetry and wrapped
   these writes in a deadline that could never fire; v0.16.0 removed it. Don't add it back.
 
+- **The origin-bypass token goes on EVERY same-origin request, not just the navigation.** A CDN
+  bot-mitigation rule keyed on that token answers the tokened document with a normal `200` and
+  `403`s every un-tokened asset behind it. The page then loads with no scripts and no stylesheet,
+  and the snapshot is raw pre-hydration SSR markup — while the render reports `200`, non-empty,
+  indexable, zero failures. Nothing upstream notices; the cache just quietly fills with pages
+  missing everything the client renders. Measured from inside a render pod, same host, seconds
+  apart: a hashed JS chunk and the layout CSS each returned `403` un-tokened and `200` tokened.
+  Before v1.15.0 the renderer tokened only the navigation request and every deployed page was
+  cached un-hydrated. Scope it to the navigation **origin** — never send the token to a
+  third-party host the page pulls from. To tell an un-hydrated snapshot from a healthy one, look
+  for the framework's own hydration marker (Astro removes `ssr` from `<astro-island>` on
+  hydration); byte size and status code will both look fine.
+
 <!-- SHARED:system-overview — keep in sync across prerender-plugin, <customer>-pr, render-service -->
 ## System overview (all three repos)
 

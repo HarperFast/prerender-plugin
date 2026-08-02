@@ -56,6 +56,15 @@ type RenderAttempt = {
 	error?: Error;
 	content?: string;
 	timings?: RenderTimings;
+	/**
+	 * Same-origin subresources (scripts, stylesheets, XHR) the origin answered 4xx/5xx while the
+	 * document itself succeeded. Non-zero means the page rendered against a crippled asset set —
+	 * typically an edge policy the navigation slipped past — and the snapshot is missing whatever
+	 * those assets would have produced. The render still "succeeds", so this is the only signal.
+	 * Our own aborts (`block.resourceTypes` / `block.urlPatterns`) never appear here: an aborted
+	 * request produces no response.
+	 */
+	subresourceErrors?: number;
 };
 
 type OriginHttpResponse = {
