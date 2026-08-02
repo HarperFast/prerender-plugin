@@ -216,9 +216,15 @@ export default class RenderJob {
 				: (this.reason ?? (attemptError ? 'error' : this.redirectedTo ? 'redirect' : undefined)),
 			// The failed attempt's detail — without it the plugin can only log "unknown
 			// prerender error". `phase` separates a navigation that never completed (slow
-			// origin) from a failure in the settle/serialize work.
+			// origin) from a failure in the settle/serialize work. Anything can be thrown, so
+			// don't trust the Error shape: a string/object throw must not serialize as
+			// "undefined: undefined".
 			error: attemptError
-				? { name: attemptError.name, message: attemptError.message, phase: renderPhaseOf(attemptError) }
+				? {
+						name: attemptError?.name ?? 'Error',
+						message: attemptError?.message ?? String(attemptError),
+						phase: renderPhaseOf(attemptError),
+					}
 				: undefined,
 		};
 		if (this.httpResponse) {
