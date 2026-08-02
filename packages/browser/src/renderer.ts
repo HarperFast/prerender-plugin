@@ -58,6 +58,16 @@ const renderer: Renderer = async (page, job) => {
 	const isBlockedUrl = (requestUrl: string) =>
 		blockedUrlPatterns.length > 0 && blockedUrlPatterns.some((pattern) => requestUrl.includes(pattern));
 
+	// The bypass token goes to the navigation's OWN origin and nowhere else, so it can never be
+	// handed to a third-party host the page happens to pull from.
+	const isSameOrigin = (requestUrl: string) => {
+		try {
+			return new URL(requestUrl).origin === navigationUrl.origin;
+		} catch {
+			return false;
+		}
+	};
+
 	const profile = config.devices[deviceType] ?? config.devices[config.defaultDevice];
 
 	const setupPromises: Promise<unknown>[] = [page.setRequestInterception(true), page.setViewport(profile.viewport)];
@@ -127,6 +137,20 @@ const renderer: Renderer = async (page, job) => {
 					return;
 				}
 			}
+			// Same-origin SUBRESOURCES need the bypass token as much as the document does. An edge
+			// bot-mitigation rule keyed on the token answers the tokened navigation with a normal
+			// 200 but 403s every un-tokened asset behind it — so the page loads with no scripts and
+			// no stylesheet, and the snapshot is raw un-hydrated SSR markup. That render looks
+			// perfectly healthy from the outside (200, non-empty, indexable), which is exactly why
+			// it went unnoticed: the only visible symptom is client-rendered content silently
+			// missing from the cache. Measured against a live edge: `_astro/*.js` and the layout
+			// CSS return 403 un-tokened and 200 tokened, from the same host, seconds apart.
+			if (settings.bypass.token && isSameOrigin(req.url())) {
+				req.continue({ headers: { ...req.headers(), [settings.bypass.header]: settings.bypass.token } }).catch(
+					noop,
+				);
+				return;
+			}
 			req.continue().catch(noop); // For all other requests, continue without modification
 		})
 		.on('response', (res) => {
@@ -147,6 +171,14 @@ const renderer: Renderer = async (page, job) => {
 					aborted = true;
 				}
 				return;
+			}
+
+			// A same-origin asset the origin refused while the document succeeded. Recorded on the
+			// attempt (mutated in place, like `timings`, so it survives an early return) and
+			// aggregated by the worker — a render whose scripts all 403 otherwise reports as a
+			// clean success.
+			if (res.status() >= 400 && isSameOrigin(res.url()) && job.latestAttempt) {
+				job.latestAttempt.subresourceErrors = (job.latestAttempt.subresourceErrors ?? 0) + 1;
 			}
 
 			if (!cache || !cache.isCacheableRequest(req)) return;

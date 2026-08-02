@@ -100,6 +100,11 @@ export default class RenderWorker {
 			fromSitemap: 0,
 			browserLaunches: 0,
 			browserRetirements: 0,
+			// Renders that succeeded but loaded against a crippled asset set — see
+			// RenderAttempt.subresourceErrors. `rendersDegraded` is the render count (how much of the
+			// cache is affected); `subresourceErrors` is the total refused assets (how badly).
+			rendersDegraded: 0,
+			subresourceErrors: 0,
 			renderTimes: [] as number[],
 			// Per-phase wall-clock samples (ms), drained into percentiles by logStats. Attribute
 			// the render time to network-wait (navTtfb/navTotal) vs in-browser work (settle/postProcess).
@@ -255,6 +260,10 @@ export default class RenderWorker {
 				perSec: Number((s.completed / elapsedSec).toFixed(2)),
 				succeeded: s.succeeded,
 				emptyContent: s.emptyContent,
+				// Non-zero means pages are being cached with content missing even though every
+				// render "succeeded" — treat it like a failure count, not a curiosity.
+				rendersDegraded: s.rendersDegraded,
+				subresourceErrors: s.subresourceErrors,
 				fromSitemap: s.fromSitemap,
 				failures: failuresTotal,
 				failuresByType: s.failures,
@@ -479,6 +488,10 @@ export default class RenderWorker {
 		const attempt = job.latestAttempt;
 		if (attempt?.renderEndTime) {
 			this.stats.renderTimes.push(attempt.renderEndTime - attempt.renderStartTime);
+		}
+		if (attempt?.subresourceErrors) {
+			this.stats.rendersDegraded++;
+			this.stats.subresourceErrors += attempt.subresourceErrors;
 		}
 		const t = attempt?.timings;
 		if (t) {
