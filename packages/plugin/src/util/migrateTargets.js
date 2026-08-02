@@ -158,8 +158,14 @@ const runTargetMigrationInner = async () => {
 	try {
 		const stats = await migrateLegacyTargets({
 			// Unconstrained streamed scan — same query rules as the reconcile sweep (no sort on
-			// the primary key, no conditions, no limit).
-			streamLegacy: () => LegacyTable.search({ select: ['cacheKey', 'url', 'sitemapUrl', 'renderInterval'] }),
+			// the primary key, no conditions, no limit). `snapshot: false` because this single
+			// pass interleaves ~800k Target writes with the walk: holding one read snapshot
+			// across minutes of same-database writes pins the log against reclamation (the
+			// two-phase rule everywhere else in this codebase). A snapshot-free walk is EXACT
+			// here because nothing mutates the legacy table anymore — the migration is additive
+			// and the legacy rows are only ever dropped by a later release's drop_table.
+			streamLegacy: () =>
+				LegacyTable.search({ select: ['cacheKey', 'url', 'sitemapUrl', 'renderInterval'], snapshot: false }),
 			getTarget: (url) => TargetTable.get({ id: url, select: ['url'] }),
 			// The RAW table class ON PURPOSE: resources/Target.js `put` fans out fresh jittered
 			// schedule rows, and preserving the existing schedules untouched is the entire point.
