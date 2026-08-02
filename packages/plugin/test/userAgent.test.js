@@ -40,6 +40,11 @@ test('honors a configured bot registry (and recompiles on change)', () => {
 
 test('identifies expanded-registry crawlers under their display names', () => {
 	const cases = [
+		['GoogleOther-Image/1.0', 'GoogleOther-Image'],
+		[
+			'Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Safari/537.36',
+			'Storebot-Google',
+		],
 		['Mozilla/5.0 (compatible; SeznamBot/4.0; +http://napoveda.seznam.cz/seznambot-intro/)', 'SeznamBot'],
 		['Mozilla/5.0 (compatible; Yeti/1.1; +https://naver.me/spd)', 'Naver Yeti'],
 		[

@@ -375,19 +375,26 @@ const defaultConfig = () => ({
 		recordUnmatched: true, // record requests whose UA yielded no name at all (as 'other')
 		deriveUnknownBots: true, // label unregistered crawlers with the name their UA declares
 		bots: [
+			// Entries must match the HTTP *request* User-Agent, not a robots.txt token.
+			// Some crawler names exist only in robots.txt and never appear in a request UA
+			// (Googlebot-News, Google-Extended, Applebot-Extended…) — an entry for one of
+			// those never matches anything and just misleads readers of this list.
+			//
 			// Search engines
 			{ name: 'Googlebot-Image', match: 'googlebot-image' },
-			{ name: 'Googlebot-News', match: 'googlebot-news' },
 			{ name: 'Googlebot-Video', match: 'googlebot-video' },
-			{ name: 'Googlebot-Smartphone', match: 'googlebot-smartphone' },
 			{ name: 'Google InspectionTool', match: 'google-inspectiontool' },
+			// the -Image/-Video variants need their own entries: the matcher requires a
+			// boundary after the match, so bare `googleother` can't cross the hyphen
+			{ name: 'GoogleOther-Image', match: 'googleother-image' },
+			{ name: 'GoogleOther-Video', match: 'googleother-video' },
 			{ name: 'GoogleOther', match: 'googleother' },
+			{ name: 'Storebot-Google', match: 'storebot-google' },
 			{ name: 'AdsBot-Google', match: 'adsbot-google' },
 			{ name: 'Googlebot', match: 'googlebot' },
 			{ name: 'Bingbot', match: 'bingbot' },
 			{ name: 'DuckDuckBot', match: 'duckduckbot-https' },
 			{ name: 'DuckDuckBot', match: 'duckduckbot' },
-			{ name: 'Applebot-Extended', match: 'applebot-extended' },
 			{ name: 'Applebot', match: 'applebot' },
 			{ name: 'YandexBot', match: 'yandexbot' },
 			{ name: 'Baidu Spider', match: 'baiduspider' },
@@ -402,9 +409,8 @@ const defaultConfig = () => ({
 			{ name: 'ClaudeBot', match: 'claudebot' },
 			{ name: 'Claude-User', match: 'claude-user' },
 			{ name: 'Claude-SearchBot', match: 'claude-searchbot' },
-			{ name: 'Claude-Web', match: 'claude-web' },
-			{ name: 'Anthropic-AI', match: 'anthropic-ai' },
 			{ name: 'PerplexityBot', match: 'perplexitybot' },
+			{ name: 'Google-CloudVertexBot', match: 'google-cloudvertexbot' },
 			{ name: 'Perplexity-User', match: 'perplexity-user' },
 			{ name: 'CCBot', match: 'ccbot' },
 			{ name: 'Bytespider', match: 'bytespider' },
