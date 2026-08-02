@@ -12,6 +12,7 @@ import { startQueueStatusSync } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
+import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -35,6 +36,9 @@ export async function handleApplication(scope) {
 	startQueueStatusSync();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();
+	// Keeps the console's backlog histogram off the page-load path: the scan walks the same
+	// nextRenderTime index `claim` reads from, so it recomputes on this slow cadence instead.
+	startBacklogSnapshotter();
 	// Unlike the three above, this one runs on EVERY worker: its counters are in-process, so
 	// each worker has to flush its own tally (see util/unrouted.js).
 	startUnroutedReporter();

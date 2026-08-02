@@ -121,6 +121,8 @@ rest: true # required for the @export-ed table REST endpoints
     scanCap: 20000 # ceiling on rows an overview scan walks (see "Management UI")
     proxyToOwner: true # ask the owning node for a residency-pinned schedule row (see below)
     peerTimeoutMs: 2500 # deadline on that peer call
+    backlogSnapshotInterval: 900000 # 15m — backlog/histogram recompute cadence; 0 = manual only
+    pageSize: 50 # rows per page in the console's sitemap-entry and page-cache tables
 
   userAgents: # per-device User-Agent strings sent to the origin
     desktop: 'Mozilla/5.0 ... HarperPrerender/1.0'
@@ -428,19 +430,37 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                      | Purpose                                         | Gate         |
-| ---------------------------------- | ----------------------------------------------- | ------------ |
-| `GET /prerender_admin`             | the UI page (contains no data)                  | public       |
-| `GET /prerender_admin/session`     | who am I                                        | public       |
-| `POST /prerender_admin/login`      | `{ username, password }`                        | public       |
-| `POST /prerender_admin/logout`     | end the session                                 | session      |
-| `GET /prerender_admin/overview`    | nodes, counts, backlog shape                    | `super_user` |
-| `GET /prerender_admin/config`      | effective config + warnings                     | `super_user` |
-| `POST /prerender_admin/explain`    | `{ url, deviceType }` → cache-key trace         | `super_user` |
-| `POST /prerender_admin/schedule`   | `{ cacheKey }` → this node's local schedule row | `super_user` |
-| `POST /prerender_admin/queue`      | `{ scope, paused }` → pause control             | `super_user` |
-| `POST /prerender_admin/revalidate` | `{ url, deviceType }` → make one key due now    | `super_user` |
-| `POST /prerender_admin/reconcile`  | start a schedule-repair sweep on this node      | `super_user` |
+| Method & path                           | Purpose                                          | Gate         |
+| --------------------------------------- | ------------------------------------------------ | ------------ |
+| `GET /prerender_admin/`                 | the console shell (contains no data)             | public       |
+| `GET /prerender_admin`                  | `308` → `prerender_admin/` (relative asset URLs) | public       |
+| `GET /prerender_admin/<asset>`          | `app.css`, `app.js`, `views/*.js`, `fonts/*`     | public       |
+| `GET /prerender_admin/session`          | who am I                                         | public       |
+| `POST /prerender_admin/login`           | `{ username, password }`                         | public       |
+| `POST /prerender_admin/logout`          | end the session                                  | session      |
+| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                  | `super_user` |
+| `GET /prerender_admin/config`           | effective config + warnings                      | `super_user` |
+| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`)  | `super_user` |
+| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
+| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
+| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
+| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
+| `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row  | `super_user` |
+| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control              | `super_user` |
+| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now     | `super_user` |
+| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node       | `super_user` |
+| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now     | `super_user` |
+| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
+| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots    | `super_user` |
+
+The console is fully self-contained: its stylesheet, scripts and fonts are served from the
+same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
+`src/admin/fonts/`), the CSP is `default-src 'none'` with `'self'` allowances and **no**
+`unsafe-inline`, and nothing on the page loads from a third party. Static assets are public
+like the shell — they ship in the package and carry no data; every data route re-checks
+`super_user`. `page-content` is served as `text/plain` with `nosniff`, never `text/html`:
+stored markup is origin-influenced content, and serving it as HTML from this origin would
+execute it against the operator's super-user session.
 
 ### What it shows
 
@@ -452,6 +472,25 @@ this plugin's resources all set `loadAsInstance = false`.
   shape, not the counts. The due-now backlog is the capacity signal: jitter flattens the
   arrival curve but cannot lower it, so a backlog that climbs and never returns to zero means
   sustained demand (`Σ targets ÷ renderInterval`) exceeds fleet throughput.
+
+  The backlog/histogram is a **cached snapshot**, not a page-load query: the scan walks the
+  same `nextRenderTime` index every render worker's `claim` reads, so it recomputes on
+  `management.backlogSnapshotInterval` (worker 0 of each node, result in the node-local
+  coordination database) and the page shows it with its age. _Recompute_ triggers a one-off
+  pass; a dashboard refresh never touches the index.
+
+- **Sitemaps** — the root list with per-root refresh state (running / failed, with the child
+  failures), a capped count of targets attributed to the selected sitemap, and a paged entry
+  table with per-entry state (`cached` / `stale` / `scheduled` / `filtered` /
+  `non-indexable`). A `filtered` verdict costs no reads — it comes from the same route
+  classifier the serving path uses. Alongside it, the unrouted-path tally: bot traffic served
+  without prerendering, bucketed by first path segment, labelled with the worker whose slice
+  it is.
+- **Page cache** — browse `PrerenderedPage` by cache-key prefix (a primary-key range; the
+  table's only index) with cursor paging. Freshness/indexable dropdowns filter the fetched
+  page only and say so — those fields have no index, and the console never pretends
+  otherwise. _view HTML_ streams the stored bytes as `text/plain`; _explain_ hands the row to
+  the URL explainer.
 - **URL explainer** — paste a URL and see the ingress route that matched, the query allowlist
   it selected, the canonical URL, the resulting cache key, and the live
   `RenderTarget`/`RenderSchedule`/`PrerenderedPage`/`NonIndexable` rows under it. It also

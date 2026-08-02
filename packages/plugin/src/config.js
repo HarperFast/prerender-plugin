@@ -214,6 +214,16 @@ const defaultConfig = () => ({
 		// page-load query — so results past this are reported as truncated rather than
 		// silently undercounted.
 		scanCap: 20000,
+
+		// How often the backlog/histogram snapshot recomputes (worker 0 of each node). The
+		// scan walks the same nextRenderTime index `claim` reads from every worker every few
+		// seconds, so it runs on this cadence — never on dashboard page load. 0 disables the
+		// timer; the console's Recompute button still triggers a one-off pass.
+		backlogSnapshotInterval: 15 * MINUTE,
+
+		// Rows per page for the console's sitemap-entry and page-cache tables. Also bounds
+		// the per-entry state lookups a sitemap detail performs (point reads, one per row).
+		pageSize: 50,
 	},
 
 	page: {

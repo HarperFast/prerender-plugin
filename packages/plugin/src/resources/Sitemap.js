@@ -112,66 +112,19 @@ class Sitemap extends databases.sitemaps.Sitemap {
 	 */
 	async post(options = {}) {
 		const { background = config.sitemap.background, ...refreshOptions } = options;
-		const urls = [];
 		const paramUrl = this.getId();
 
-		if (paramUrl) {
-			urls.push(paramUrl);
-		} else {
-			// Roots only — an index reaches its own children, so walking the children as top-level
-			// rows too would process every one of them twice. See `rootSitemapUrls`.
-			urls.push(...(await rootSitemapUrls()));
+		if (background) {
+			return startSitemapRefreshInBackground(paramUrl || undefined, refreshOptions);
 		}
 
-		if (!background) {
-			const results = [];
-			for (const url of urls) {
-				logger.info(`Scheduling refresh for sitemap`, url);
-				results.push(await runTrackedRefresh(url, refreshOptions));
-			}
-			return results;
+		const urls = paramUrl ? [paramUrl] : await rootSitemapUrls();
+		const results = [];
+		for (const url of urls) {
+			logger.info(`Scheduling refresh for sitemap`, url);
+			results.push(await runTrackedRefresh(url, refreshOptions));
 		}
-
-		// One sitemap: claim synchronously so the caller is told immediately when a run is already
-		// in flight, rather than silently starting a second walk over the same targets.
-		if (urls.length === 1) {
-			const [url] = urls;
-			const claim = await claimRefreshRun(url);
-			if (!claim.ok) {
-				return {
-					background: true,
-					sitemaps: [{ url, started: false, reason: claim.reason, progress: progressPath(url) }],
-				};
-			}
-
-			logger.info(`Starting background refresh for sitemap`, url);
-			// Deliberately not awaited: the walk outlives this request. Failures are logged and
-			// recorded on the progress row by `runTrackedRefresh`; the catch here only keeps the
-			// rejection from surfacing as an unhandled one.
-			void runTrackedRefresh(url, refreshOptions).catch(() => {});
-			return { background: true, sitemaps: [{ url, started: true, progress: progressPath(url) }] };
-		}
-
-		// Refresh-all: ONE background job that walks them in sequence. Starting every stored
-		// sitemap at once would put N concurrent walks on a single worker, each holding its own
-		// entry map and issuing its own write batches — strictly worse than the sequential
-		// behaviour this replaces. Claims are taken just-in-time inside the loop so a queued
-		// sitemap is not judged against a claim made an hour earlier.
-		void (async () => {
-			for (const url of urls) {
-				const claim = await claimRefreshRun(url);
-				if (!claim.ok) {
-					logger.info(`[prerender] Skipping sitemap ${url}: ${claim.reason}`);
-					continue;
-				}
-				await runTrackedRefresh(url, refreshOptions).catch(() => {});
-			}
-		})();
-
-		return {
-			background: true,
-			sitemaps: urls.map((url) => ({ url, started: true, progress: progressPath(url) })),
-		};
+		return results;
 	}
 
 	/**
@@ -211,6 +164,59 @@ class Sitemap extends databases.sitemaps.Sitemap {
 }
 
 export const sitemaps = Sitemap;
+
+/**
+ * Kick off a background refresh of one root sitemap (`url` given) or every root (omitted).
+ * Extracted from `post` so the management console can start a walk through its own gated
+ * surface without duplicating the claim/skip semantics.
+ *
+ * One sitemap: the claim is taken synchronously, so the caller is told immediately when a run
+ * is already in flight rather than silently starting a second walk over the same targets.
+ *
+ * Refresh-all: ONE background job that walks the roots in sequence. Starting every stored
+ * sitemap at once would put N concurrent walks on a single worker, each holding its own entry
+ * map and issuing its own write batches — strictly worse than sequential. Claims are taken
+ * just-in-time inside the loop so a queued sitemap is not judged against a claim made an hour
+ * earlier. Roots only — an index reaches its own children, so walking children as top-level
+ * jobs too would process every one of them twice (see `rootSitemapUrls`).
+ */
+export async function startSitemapRefreshInBackground(url, refreshOptions = {}) {
+	const urls = url ? [url] : await rootSitemapUrls();
+
+	if (urls.length === 1) {
+		const [only] = urls;
+		const claim = await claimRefreshRun(only);
+		if (!claim.ok) {
+			return {
+				background: true,
+				sitemaps: [{ url: only, started: false, reason: claim.reason, progress: progressPath(only) }],
+			};
+		}
+
+		logger.info(`Starting background refresh for sitemap`, only);
+		// Deliberately not awaited: the walk outlives this request. Failures are logged and
+		// recorded on the progress row by `runTrackedRefresh`; the catch here only keeps the
+		// rejection from surfacing as an unhandled one.
+		void runTrackedRefresh(only, refreshOptions).catch(() => {});
+		return { background: true, sitemaps: [{ url: only, started: true, progress: progressPath(only) }] };
+	}
+
+	void (async () => {
+		for (const root of urls) {
+			const claim = await claimRefreshRun(root);
+			if (!claim.ok) {
+				logger.info(`[prerender] Skipping sitemap ${root}: ${claim.reason}`);
+				continue;
+			}
+			await runTrackedRefresh(root, refreshOptions).catch(() => {});
+		}
+	})();
+
+	return {
+		background: true,
+		sitemaps: urls.map((root) => ({ url: root, started: true, progress: progressPath(root) })),
+	};
+}
 
 /** Where a caller polls for a walk's progress. */
 const progressPath = (rootUrl) => `/sitemap_refresh/${encodeURIComponent(rootUrl)}`;
