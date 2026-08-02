@@ -121,14 +121,13 @@ const seedLegacy = (url, { devices = ['desktop', 'mobile'], sitemapUrl = null, r
 	}
 };
 
-test('rebuilds one Target row per URL and consumes the legacy rows', async () => {
+test('rebuilds one Target row per URL and leaves the legacy rows in place (rollback insurance)', async () => {
 	seedLegacy(A, { sitemapUrl: 'https://site.example.com/sitemap.xml', renderInterval: 1234567 });
 	seedLegacy(B);
 
 	const stats = await migrate.runTargetMigration();
 
 	assert.equal(stats.legacyRows, 4);
-	assert.equal(stats.urls, 2);
 	assert.equal(stats.created, 2);
 
 	const a = stores.target.get(A);
@@ -137,7 +136,8 @@ test('rebuilds one Target row per URL and consumes the legacy rows', async () =>
 	assert.equal(a.schedulerNode, 'test-node');
 	assert.notEqual(a.state, 'suppressed');
 
-	assert.equal(stores.legacy.size, 0, 'legacy rows must be consumed so the next boot no-ops');
+	assert.equal(stats.existing, 2, 'each URL sibling device row is covered by the first row seen');
+	assert.equal(stores.legacy.size, 4, 'legacy rows must SURVIVE — pre-v0.19 code still finds its registry on rollback');
 });
 
 test('NEVER touches schedules or cached pages — the whole point is zero re-renders', async () => {
@@ -157,17 +157,17 @@ test('absent-only: an existing Target row (parallel node, live traffic) is never
 
 	const stats = await migrate.runTargetMigration();
 
-	assert.equal(stats.existing, 1);
+	assert.equal(stats.existing, 2, 'both device rows skip over the existing target');
 	assert.equal(stats.created, 0);
 	assert.deepEqual(stores.target.get(A), { url: A, renderInterval: 999, state: 'suppressed', strikes: 3 });
 });
 
-test('a re-trigger after completion is a no-op (legacy rows were consumed)', async () => {
+test('a re-trigger after completion creates nothing (absent-only over surviving legacy rows)', async () => {
 	seedLegacy(A);
 	await migrate.runTargetMigration();
 	const again = await migrate.runTargetMigration();
-	assert.equal(again.skipped, true);
-	assert.match(again.reason, /empty/);
+	assert.equal(again.created, 0);
+	assert.equal(again.existing, again.legacyRows, 'every legacy row is already covered');
 });
 
 test('an empty legacy table (fresh deployment) skips without pausing anything', async () => {
@@ -176,12 +176,15 @@ test('an empty legacy table (fresh deployment) skips without pausing anything', 
 	assert.equal(stores.queueControl.size, 0, 'no pause intent should ever have been written');
 });
 
-test('the run summary is kept for the admin action', async () => {
+test('the run summary and live progress are exposed for the admin poll', async () => {
 	seedLegacy(A);
 	const run = await migrate.runTargetMigration();
 	assert.equal(run.error, null);
 	assert.equal(run.node, 'test-node');
-	assert.deepEqual(migrate.getLastMigration(), run);
+	const status = migrate.getMigrationStatus();
+	assert.equal(status.running, false);
+	assert.deepEqual(status.lastRun, run);
+	assert.equal(status.progress.legacyRows, run.legacyRows, 'progress counters reflect the completed sweep');
 });
 
 test('pauses the cluster for the rebuild and resumes after', async () => {
@@ -228,13 +231,16 @@ test('half-pairs and BigInt intervals migrate cleanly', async () => {
 
 	const stats = await migrate.runTargetMigration();
 
-	assert.equal(stats.urls, 1);
+	assert.equal(stats.created, 1);
 	const target = stores.target.get(A);
 	assert.ok(target);
 	assert.equal(target.renderInterval, 3600000, 'BigInt Long coerced to a number');
 });
 
-test('device rows that disagree resolve deterministically (first non-empty wins)', async () => {
+test('device rows that disagree resolve to the FIRST row seen; attribution self-heals via sitemap reattach', async () => {
+	// Streaming per-row (no in-memory grouping at 1.6M rows), so the first device row wins.
+	// A first row missing sitemapUrl creates the target unattributed — the next sitemap
+	// refresh REATTACHes it (patch sitemapUrl + renderInterval), so drift heals in a pass.
 	stores.legacy.set(key(A, 'desktop'), { cacheKey: key(A, 'desktop'), url: A, sitemapUrl: null, renderInterval: null });
 	stores.legacy.set(key(A, 'mobile'), {
 		cacheKey: key(A, 'mobile'),
@@ -246,6 +252,6 @@ test('device rows that disagree resolve deterministically (first non-empty wins)
 	await migrate.runTargetMigration();
 
 	const target = stores.target.get(A);
-	assert.equal(target.sitemapUrl, 'https://site.example.com/sitemap.xml', 'null does not shadow a real value');
-	assert.equal(target.renderInterval, 60000);
+	assert.ok(target, 'the URL is targeted either way');
+	assert.equal(target.sitemapUrl, null, 'first row seen wins — reattach owns the correction');
 });

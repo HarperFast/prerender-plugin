@@ -75,10 +75,11 @@ type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh"
 }
 
 # LEGACY — the pre-v0.19 per-device registry (one row per url|deviceType). Kept declared
-# (unexported) so the one-shot startup migration can read it: it rebuilds the url-keyed
-# Target rows from these and then deletes them, leaving the existing RenderSchedule rows —
-# and their accumulated jitter — untouched. Remove this type (and drop_table the files)
-# once every environment has booted v0.19 at least once. See util/migrateTargets.js.
+# (unexported) so the operator-triggered migration can read it: it rebuilds the url-keyed
+# Target rows from these, leaving BOTH the legacy rows (rollback insurance — pre-v0.19 code
+# still finds its registry) and the existing RenderSchedule rows untouched. Remove this type
+# and drop_table the files in a follow-up release once v0.19 is verified in every
+# environment. See util/migrateTargets.js.
 type RenderTarget @table(database: "render_service") {
 	cacheKey: String @primaryKey
 	url: String
