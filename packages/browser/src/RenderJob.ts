@@ -73,6 +73,20 @@ type OriginHttpResponse = {
 	headers: Record<string, string>;
 };
 
+/**
+ * What happened to a render, as the ONE decision field the plugin keys result handling on:
+ *  - 'rendered'       — content was produced. A rendered-through client-side redirect is still
+ *                       a rendered page (the plugin refiles it under the landed key).
+ *  - 'redirected'     — the render ended WITHOUT content because navigation landed on a
+ *                       different document (HTTP bail, or a client-side move to a page that
+ *                       produced nothing).
+ *  - 'non-indexable'  — the page itself said not to (see `reason`).
+ *  - 'error'          — nothing usable and nothing deliberate about it (see `error`).
+ * `isIndexable` still rides along, but as a PROPERTY of a rendered page (it is stored on the
+ * cache row) — not the signal decisions are inferred from.
+ */
+export type JobOutcome = 'rendered' | 'redirected' | 'non-indexable' | 'error';
+
 const allowedResponseHeaders = [
 	'etag', // helps 304 Not Modified
 	'last-modified', // helps 304 Not Modified
@@ -160,6 +174,15 @@ export default class RenderJob {
 		return this.latestAttempt?.content || null;
 	}
 
+	/** See {@link JobOutcome}. Content wins; then a landed-elsewhere navigation; then the
+	 *  page's own indexability verdict; anything else is an error by definition. */
+	get outcome(): JobOutcome {
+		if (this.content) return 'rendered';
+		if (this.redirectedTo) return 'redirected';
+		if (this.isIndexable === false) return 'non-indexable';
+		return 'error';
+	}
+
 	get error(): Error | null {
 		return this.latestAttempt?.error || null;
 	}
@@ -184,6 +207,7 @@ export default class RenderJob {
 			renderTime: undefined as number | undefined,
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
+			outcome: this.outcome,
 			// One slug for WHY there is no content (see the field doc). The redirect/error
 			// fallbacks are derived here so every no-content result carries a reason without
 			// each producer having to remember to set one.
