@@ -33,6 +33,10 @@ export async function handleApplication(scope) {
 	// Start background work now that config is applied. All are idempotent and
 	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
 	// every node repairs the schedule rows it owns (see util/reconcile.js).
+	//
+	// The legacy-registry migration is NOT here: it is operator-triggered on one node
+	// (POST /prerender_admin/migrate-targets) so there is exactly one writer — see
+	// util/migrateTargets.js for the deploy sequence.
 	startQueueStatusSync();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();

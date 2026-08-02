@@ -29,6 +29,7 @@
  *   POST /prerender_admin/queue      { scope, paused }              super_user
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
+ *   POST /prerender_admin/migrate-targets  one-shot v0.19 registry migration  super_user
  *   POST /prerender_admin/backlog    recompute the backlog snapshot super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
@@ -62,6 +63,7 @@ import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
+import { getLastMigration, runTargetMigration } from '../util/migrateTargets.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { decode } from '../util/contentEncoding.js';
@@ -73,10 +75,9 @@ import { getAdminAsset, renderAdminPage } from '../admin/index.js';
 
 const {
 	render_schedule: { RenderSchedule },
-	render_service: { RenderTarget, QueueStatus, QueueControl },
+	render_service: { Target, QueueStatus, QueueControl },
 	page_cache: { PrerenderedPage },
 	sitemaps: { Sitemap, SitemapRefresh },
-	signals: { NonIndexable },
 } = databases;
 
 // How long after a node's last status report we call its row stale. Two sync intervals,
@@ -388,6 +389,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.revalidateUrl(data);
 			case 'reconcile':
 				return PrerenderAdmin.reconcile();
+			case 'migrate-targets':
+				return PrerenderAdmin.migrateTargets();
 			case 'backlog':
 				return PrerenderAdmin.backlog();
 			case 'sitemap':
@@ -400,13 +403,13 @@ export class PrerenderAdmin extends Resource {
 	}
 
 	/**
-	 * Make ONE url due for render now.
+	 * Make ONE url due for render now (one device — this writes exactly one schedule row).
 	 *
-	 * Deliberately not `RenderTarget.revalidate`, which takes a search target: pointed at the
+	 * Deliberately not `Target.revalidate`, which takes a search target: pointed at the
 	 * whole collection that revalidates the entire registry, and at 1M+ targets an accidental
-	 * full revalidate is a self-inflicted render herd. This writes exactly one schedule row.
+	 * full revalidate is a self-inflicted render herd.
 	 *
-	 * Requires an existing RenderTarget. A schedule row without one is a one-off that
+	 * Requires an existing Target. A schedule row without one is a one-off that
 	 * `processJobResult` drops after a single render — that is the render-now feature, not
 	 * this, and quietly creating one here would look like it joined the rotation when it
 	 * hadn't.
@@ -423,7 +426,7 @@ export class PrerenderAdmin extends Resource {
 
 		const timedOutReads = [];
 		const target = await readWithTimeout('renderTarget', timedOutReads, () =>
-			RenderTarget.get({ id: cacheKey, select: ['cacheKey', 'sitemapUrl'] })
+			Target.get({ id: canonicalUrl, select: ['url', 'sitemapUrl'] })
 		);
 		if (timedOutReads.length) return json({ error: 'target read timed out' }, 504);
 
@@ -431,7 +434,7 @@ export class PrerenderAdmin extends Resource {
 			return json(
 				{
 					error:
-						'No RenderTarget for this key, so there is no recurring rotation to rejoin. A schedule row on its own would render once and be dropped.',
+						'No Target for this URL, so there is no recurring rotation to rejoin. A schedule row on its own would render once and be dropped.',
 					cacheKey,
 				},
 				409
@@ -467,6 +470,20 @@ export class PrerenderAdmin extends Resource {
 	 * Node-scoped, because a node can only authoritatively check the keys it owns — see
 	 * util/reconcile.js. Every node runs the periodic sweep for its own slice.
 	 */
+	/**
+	 * Run the one-shot legacy-registry migration on THIS node (see util/migrateTargets.js for
+	 * the deploy sequence). Synchronous on purpose: the operator triggers it exactly once
+	 * during the v0.19 rollout and wants the stats in the response; the sweep is sized for a
+	 * staging registry, and a re-trigger of a completed run answers `skipped` immediately.
+	 */
+	static async migrateTargets() {
+		try {
+			return json(await runTargetMigration());
+		} catch (e) {
+			return json({ error: e?.message ?? String(e), lastRun: getLastMigration() }, 500);
+		}
+	}
+
 	static reconcile() {
 		const lastRun = getLastReconcile();
 		const payload = {
@@ -663,12 +680,23 @@ export class PrerenderAdmin extends Resource {
 		const timedOutReads = [];
 
 		// Read every row that decides this URL's fate. The page body is deliberately NOT
-		// selected — this is a status view, and a cached page can be megabytes.
-		const [target, schedule, page, suppressed] = await Promise.all([
+		// selected — this is a status view, and a cached page can be megabytes. The target row
+		// is keyed by URL and carries the suppression verdict, so one read answers both "is it
+		// in rotation" and "did a render suppress it".
+		const [target, schedule, page] = await Promise.all([
 			readWithTimeout('renderTarget', timedOutReads, () =>
-				RenderTarget.get({
-					id: cacheKey,
-					select: ['cacheKey', 'url', 'deviceType', 'sitemapUrl', 'schedulerNode', 'renderInterval'],
+				Target.get({
+					id: canonicalUrl,
+					select: [
+						'url',
+						'sitemapUrl',
+						'schedulerNode',
+						'renderInterval',
+						'state',
+						'suppressedReason',
+						'suppressedAt',
+						'strikes',
+					],
 				})
 			),
 			readWithTimeout('renderSchedule', timedOutReads, () =>
@@ -683,12 +711,9 @@ export class PrerenderAdmin extends Resource {
 					select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
 				})
 			),
-			// Array select, like the three above: a string select would return the bare url
-			// string instead of a record. Only existence matters here, so a scalar would still
-			// have worked — but keeping the projection uniform avoids the next reader assuming
-			// a record and reaching for `.url` on a string.
-			readWithTimeout('nonIndexable', timedOutReads, () => NonIndexable.get({ id: canonicalUrl, select: ['url'] })),
 		]);
+
+		const suppressed = target?.state === 'suppressed';
 
 		const now = Date.now();
 		const expiresAtMs = page?.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
@@ -749,7 +774,15 @@ export class PrerenderAdmin extends Resource {
 							swrTtl: config.page.swrTtl,
 						}
 					: null,
-				nonIndexable: suppressed ? { url: suppressed.url ?? explanation.resolved.canonicalUrl } : null,
+				suppression: suppressed
+					? {
+							reason: target.suppressedReason ?? null,
+							suppressedAt: target.suppressedAt ? new Date(target.suppressedAt).getTime() : null,
+							strikes: target.strikes ?? null,
+							maxStrikes: config.render.suppression.maxStrikes,
+							recheckInterval: config.render.suppression.recheckInterval,
+						}
+					: null,
 			},
 			verdict: {
 				// Every field here is derived from rows that may have failed to read, so it is
@@ -761,10 +794,10 @@ export class PrerenderAdmin extends Resource {
 				wouldServe: fresh ? 'cache' : 'origin-or-render',
 				// Only meaningful when `residency.scheduleAuthoritative` is true.
 				scheduled: !!scheduleRow,
-				recurring: !!target,
-				// A NonIndexable row blocks re-discovery for the table's expiration window, so
-				// a URL can be absent from rotation with no target and no obvious reason why.
-				suppressedByNonIndexable: !!suppressed,
+				recurring: !!target && !suppressed,
+				// A suppressed target blocks re-discovery and re-checks itself on its own
+				// schedule; the row above says why and since when.
+				suppressed,
 			},
 			residency: {
 				queriedNode: server.hostname,
@@ -874,7 +907,7 @@ export class PrerenderAdmin extends Resource {
 	 * Costs, deliberately bounded to an explicit click:
 	 *   - one point read of the sitemap row (`entries` included — that is where they live);
 	 *   - a capped walk of the `sitemapUrl` index (select of the key only) for the target count;
-	 *   - ≤ pageSize point reads each on RenderTarget / PrerenderedPage / NonIndexable for the
+	 *   - ≤ pageSize point reads each on Target / PrerenderedPage for the
 	 *     page of entries shown. RenderSchedule is deliberately NOT read per entry: it is
 	 *     residency-pinned, so most rows are unreadable without a cross-node fetch — the
 	 *     explainer is the tool for one URL's schedule, with the peer fetch and the wording
@@ -926,7 +959,7 @@ export class PrerenderAdmin extends Resource {
 	}
 
 	/**
-	 * Capped count of RenderTargets attributed to one sitemap — an indexed equality walk
+	 * Capped count of Targets attributed to one sitemap — an indexed equality walk
 	 * selecting only the key, counted without buffering. Null when it timed out (unknown, not
 	 * zero).
 	 */
@@ -938,9 +971,9 @@ export class PrerenderAdmin extends Resource {
 			// Yields between batches (shared worker) and holds no read snapshot open for the
 			// walk's duration.
 			// eslint-disable-next-line no-unused-vars
-			for await (const row of RenderTarget.search({
+			for await (const row of Target.search({
 				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
-				select: ['cacheKey'],
+				select: ['url'],
 				limit: cap,
 				snapshot: false,
 			})) {
@@ -983,17 +1016,16 @@ export class PrerenderAdmin extends Resource {
 		const { cacheKey, canonicalUrl } = explanation.resolved;
 		const timedOut = [];
 
-		const [target, page, suppressed] = await Promise.all([
-			readWithTimeout('renderTarget', timedOut, () => RenderTarget.get({ id: cacheKey, select: ['cacheKey'] })),
+		const [target, page] = await Promise.all([
+			readWithTimeout('renderTarget', timedOut, () => Target.get({ id: canonicalUrl, select: ['url', 'state'] })),
 			readWithTimeout('prerenderedPage', timedOut, () =>
 				PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] })
 			),
-			readWithTimeout('nonIndexable', timedOut, () => NonIndexable.get({ id: canonicalUrl, select: ['url'] })),
 		]);
 
 		if (timedOut.length) return { ...base, cacheKey, state: null };
 
-		if (suppressed) return { ...base, cacheKey, state: 'non-indexable' };
+		if (target?.state === 'suppressed') return { ...base, cacheKey, state: 'non-indexable' };
 
 		if (page) {
 			const expiresAtMs = page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;

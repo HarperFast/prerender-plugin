@@ -1,7 +1,6 @@
 import { config } from '../config.js';
 import { describeError } from '../util/errors.js';
-import { RenderTarget } from './RenderTarget.js';
-import { CacheKey } from '../util/cacheKey.js';
+import { Target } from './Target.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
 import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
@@ -39,16 +38,13 @@ class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
 	/**
-	 * Walk a sitemap (or sitemap index) and reconcile it into RenderTargets.
+	 * Walk a sitemap (or sitemap index) and reconcile it into Targets (one per URL).
 	 *
 	 * `onProgress` is invoked after every document with the run's current snapshot, so a caller
 	 * running this in the background can persist where it got to. It is awaited but never
 	 * allowed to fail the walk.
 	 */
-	static async refresh(
-		rootSitemapUrl,
-		{ revalidate = false, deviceTypes = config.deviceTypes.default, onProgress } = {}
-	) {
+	static async refresh(rootSitemapUrl, { revalidate = false, onProgress } = {}) {
 		const run = createRefreshRun({
 			removedSampleCap: config.sitemap.removedSampleCap,
 			failedCap: config.sitemap.failedCap,
@@ -64,7 +60,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			visited.add(sitemapUrl);
 
 			try {
-				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run, visited });
+				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited });
 				for (const child of children) {
 					queue.push({ url: child, parentUrl: sitemapUrl });
 					run.count('sitemapsDiscovered');
@@ -128,7 +124,7 @@ class Sitemap extends databases.sitemaps.Sitemap {
 	}
 
 	/**
-	 * Remove a sitemap, its descendants, and every RenderTarget attributed to any of them.
+	 * Remove a sitemap, its descendants, and every Target attributed to any of them.
 	 *
 	 * Deleting an INDEX has to reach its children or it accomplishes almost nothing: targets are
 	 * attributed to the child sitemap that listed them, never to the index, so an index delete on
@@ -246,22 +242,21 @@ async function sitemapDescendants(url) {
 	return found;
 }
 
-/** Remove every RenderTarget attributed to one sitemap, two-phase and bounded. */
+/** Remove every Target attributed to one sitemap, two-phase and bounded. */
 async function deleteTargetsFor(sitemapUrl) {
 	// Two-phase for the same reason as everywhere else: deleting from inside the open search
 	// cursor leaves writes pending while it is open, which the long-transaction monitor aborts
 	// (422) partway through on a large sitemap. See util/scan.js.
 	const {
-		items: cacheKeys,
+		items: urls,
 		examined,
 		truncated,
 	} = await collectFromScan({
-		scan: () =>
-			RenderTarget.search({ conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }], select: 'cacheKey' }),
-		pick: (cacheKey) => cacheKey,
+		scan: () => Target.search({ conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }], select: 'url' }),
+		pick: (url) => url,
 	});
 
-	await applyInBatches({ items: cacheKeys, apply: (cacheKey) => RenderTarget.delete(cacheKey) });
+	await applyInBatches({ items: urls, apply: (url) => Target.delete(url) });
 
 	// `collectFromScan` reports this precisely so a caller cannot act on a partial set while
 	// believing it was complete, and it used to be discarded here. A sitemap with more targets
@@ -270,7 +265,7 @@ async function deleteTargetsFor(sitemapUrl) {
 	// re-running the delete is what clears the rest.
 	if (truncated) {
 		logger.error(
-			`[prerender] Deleting sitemap ${sitemapUrl} removed ${cacheKeys.length} of ${examined} targets ` +
+			`[prerender] Deleting sitemap ${sitemapUrl} removed ${urls.length} of ${examined} targets ` +
 				`(scan.collectCap=${config.scan.collectCap}). Re-run the delete to remove the rest.`
 		);
 	}
@@ -397,7 +392,7 @@ async function runTrackedRefresh(rootUrl, options) {
  * The stored row is written last, so a document that throws partway leaves the previous row —
  * and its `lastRefreshed` — untouched rather than recording a refresh that did not happen.
  */
-async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceTypes, run, visited }) {
+async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited }) {
 	logger.info(`Processing sitemap`, sitemapUrl);
 
 	const latestSitemap = await fetchLatestSitemap(sitemapUrl);
@@ -409,7 +404,7 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, deviceType
 	}
 
 	if (latestSitemap.entries?.length) {
-		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run, visited });
+		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited });
 	}
 
 	await Sitemap.put(sitemapUrl, row);
@@ -434,7 +429,7 @@ async function rootSitemapUrls() {
 }
 
 /** Diff one `<urlset>` against the targets currently attributed to it, and apply the result. */
-async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, deviceTypes, run, visited }) {
+async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited }) {
 	// Keep only the URLs this deployment actually prerenders, keyed by the canonical URL-half the
 	// bot read uses — so the prune diff below and the target keys built later both match what a
 	// request will look up. Everything else is counted and dropped rather than turned into a
@@ -448,7 +443,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	run.addFiltered(filtered);
 
 	// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
-	// `RenderTarget.patch` from inside the open search cursor. Harper's long-transaction monitor
+	// `Target.patch` from inside the open search cursor. Harper's long-transaction monitor
 	// aborts (422, poisoned) any transaction that has writes pending when it fires, so on a large
 	// sitemap the refresh could die partway through with some targets already unlinked. Collect
 	// while reading, write once the cursor is closed — see util/scan.js.
@@ -482,20 +477,19 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 		truncated,
 	} = await collectFromScan({
 		scan: () =>
-			RenderTarget.search({
+			Target.search({
 				// Array select, NOT a string one: a string select projects to the bare VALUE
 				// rather than a record, which is the trap that once made every target look
 				// un-attributed. Only the key is needed — nothing here reads the other columns.
-				select: ['cacheKey'],
+				select: ['url'],
 				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
 			}),
 		pick: (target) => {
-			const parsed = CacheKey.parse(target.cacheKey);
-			if (incomingEntryMap.has(parsed.url)) {
-				if (knownKeys.size < config.scan.collectCap) knownKeys.add(target.cacheKey);
+			if (incomingEntryMap.has(target.url)) {
+				if (knownKeys.size < config.scan.collectCap) knownKeys.add(target.url);
 				return null;
 			}
-			if (classifyUrl(parsed.url).routeClass !== PRERENDER) {
+			if (classifyUrl(target.url).routeClass !== PRERENDER) {
 				run.count('deferred');
 				return null;
 			}
@@ -516,7 +510,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 
 	await applyInBatches({
 		items: departed,
-		apply: (target) => RenderTarget.patch(target.cacheKey, { sitemapUrl: null }),
+		apply: (target) => Target.patch(target.url, { sitemapUrl: null }),
 	});
 	run.addRemoved(departed);
 
@@ -529,77 +523,69 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 			defaultTtl: config.page.ttl,
 		});
 
-		for (const deviceType of deviceTypes) {
-			// Yield on rows CONSIDERED, not on writes issued. The skip path below is entirely
-			// synchronous now that `knownKeys` answers it without a point read, so the healthy
-			// steady state — where almost everything is already correct — would otherwise run
-			// 100,000 iterations for a single product sitemap without ever reaching the batch
-			// drain, monopolizing the thread. The previous code was accidentally safe here only
-			// because it awaited a database read every iteration. Same reasoning, and the same
-			// counter, as `collectFromScan`.
-			if (++considered % config.scan.yieldEvery === 0) await setImmediate();
+		// Yield on rows CONSIDERED, not on writes issued. The skip path below is entirely
+		// synchronous now that `knownKeys` answers it without a point read, so the healthy
+		// steady state — where almost everything is already correct — would otherwise run
+		// 100,000 iterations for a single product sitemap without ever reaching the batch
+		// drain, monopolizing the thread. The previous code was accidentally safe here only
+		// because it awaited a database read every iteration. Same reasoning, and the same
+		// counter, as `collectFromScan`.
+		if (++considered % config.scan.yieldEvery === 0) await setImmediate();
 
-			const cacheKey = CacheKey.toCacheKey({ url: cacheUrl, deviceType });
+		let action;
+		if (revalidate) {
+			action = TargetAction.RENDER;
+		} else if (canSkipLookup({ revalidate, knownKeys, key: cacheUrl })) {
+			action = TargetAction.SKIP;
+		} else {
+			// Only reached for a URL the prune scan did not return: genuinely new, moved here
+			// from another sitemap, or missed because `knownKeys` was capped. Only `sitemapUrl`
+			// is needed, so don't materialize the whole record in a bulk loop.
+			action = actionForExisting(await Target.get({ id: cacheUrl, select: ['sitemapUrl'] }), sitemapUrl, visited);
+		}
 
-			let action;
-			if (revalidate) {
-				action = TargetAction.RENDER;
-			} else if (canSkipLookup({ revalidate, knownKeys, cacheKey })) {
-				action = TargetAction.SKIP;
-			} else {
-				// Only reached for a key the prune scan did not return: genuinely new, moved here
-				// from another sitemap, or missed because `knownKeys` was capped. Only `sitemapUrl`
-				// is needed, so don't materialize the whole record in a bulk loop.
-				action = actionForExisting(
-					await RenderTarget.get({ id: cacheKey, select: ['sitemapUrl'] }),
-					sitemapUrl,
-					visited
-				);
-			}
+		switch (action) {
+			case TargetAction.SKIP:
+				run.count('skipped');
+				continue;
 
-			switch (action) {
-				case TargetAction.SKIP:
-					run.count('skipped');
-					continue;
+			case TargetAction.DUPLICATE:
+				// Listed by an earlier sitemap in this same walk, which already owns it. Leaving
+				// it alone is what makes attribution converge instead of ping-ponging.
+				run.count('duplicates');
+				continue;
 
-				case TargetAction.DUPLICATE:
-					// Listed by an earlier sitemap in this same walk, which already owns it. Leaving
-					// it alone is what makes attribution converge instead of ping-ponging.
-					run.count('duplicates');
-					continue;
+			case TargetAction.REATTACH:
+				// Attribution changed, the page did not. `patch` leaves the RenderSchedule rows
+				// alone; `put` would recompute `getInitialRenderTime` and shove the next render
+				// forward by a fresh jitter every pass. See util/sitemapRun.js.
+				run.count('updated');
+				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval }));
+				break;
 
-				case TargetAction.REATTACH:
-					// Attribution changed, the page did not. `patch` leaves the RenderSchedule row
-					// alone; `put` would recompute `getInitialRenderTime` and shove the next render
-					// forward by a fresh jitter every pass. See util/sitemapRun.js.
-					run.count('updated');
-					inflight.push(RenderTarget.patch(cacheKey, { sitemapUrl, renderInterval }));
-					break;
+			case TargetAction.CREATE:
+				// No explicit time, so Target.put jitters the first render across the
+				// interval — bulk sitemap population must not stampede the queue.
+				run.count('created');
+				inflight.push(Target.put(cacheUrl, { renderInterval, sitemapUrl }));
+				break;
 
-				case TargetAction.CREATE:
-					// No explicit time, so RenderTarget.put jitters the first render across the
-					// interval — bulk sitemap population must not stampede the queue.
-					run.count('created');
-					inflight.push(RenderTarget.put(cacheKey, { renderInterval, sitemapUrl }));
-					break;
+			case TargetAction.RENDER:
+				run.count('created');
+				inflight.push(Target.put(cacheUrl, { renderInterval, sitemapUrl, nextRenderTime: currentMinuteMs() }));
+				break;
+		}
 
-				case TargetAction.RENDER:
-					run.count('created');
-					inflight.push(RenderTarget.put(cacheKey, { renderInterval, sitemapUrl, nextRenderTime: currentMinuteMs() }));
-					break;
-			}
-
-			// Drain the WHOLE batch, not just the most recent promise. This used to await
-			// `lastPromise` alone, which left the rest of the batch still in flight — and Harper's
-			// long-transaction monitor aborts (422, poisoned) any transaction that has writes
-			// pending when it fires, so a slow batch could kill the refresh partway through.
-			// Awaiting every promise in the batch is what makes "no pending writes across a monitor
-			// tick" actually true. See util/scan.js.
-			if (inflight.length >= config.scan.batchSize) {
-				await Promise.all(inflight);
-				inflight = [];
-				await setImmediate();
-			}
+		// Drain the WHOLE batch, not just the most recent promise. This used to await
+		// `lastPromise` alone, which left the rest of the batch still in flight — and Harper's
+		// long-transaction monitor aborts (422, poisoned) any transaction that has writes
+		// pending when it fires, so a slow batch could kill the refresh partway through.
+		// Awaiting every promise in the batch is what makes "no pending writes across a monitor
+		// tick" actually true. See util/scan.js.
+		if (inflight.length >= config.scan.batchSize) {
+			await Promise.all(inflight);
+			inflight = [];
+			await setImmediate();
 		}
 	}
 

@@ -1,11 +1,12 @@
 /**
- * Repair for targets whose `RenderSchedule` row has gone missing.
+ * Repair for targets whose `RenderSchedule` rows have gone missing.
  *
- * `RenderTarget` and `RenderSchedule` live in separate databases, so creating a target is
- * two independent commits — and the schedule half is residency-routed to whichever node owns
- * the URL. If that second write is lost (a crash between them, or a routed write to a node
- * whose replication link is unhealthy), or if cluster membership changes and moves a key's
- * owner, the target survives with no schedule row.
+ * `Target` and `RenderSchedule` live in separate databases, so creating a target is a target
+ * commit plus one schedule commit PER DEVICE — and the schedule half is residency-routed to
+ * whichever node owns the URL. If a schedule write is lost (a crash between them, or a routed
+ * write to a node whose replication link is unhealthy), or if cluster membership changes and
+ * moves a key's owner, the target survives with a missing schedule row for one or more of its
+ * devices.
  *
  * Nothing then repairs it, and nothing renders that URL again:
  *
@@ -67,46 +68,50 @@ export const reconcileSchedules = async ({
 	putSchedule,
 	ownerOf,
 	hostname,
+	deviceTypes,
 	maxRestores,
 	onYield = () => {},
 } = {}) => {
 	const stats = { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false };
 	const toRestore = [];
 
-	// Phase 1 — read only.
+	// Phase 1 — read only. One target row implies one schedule row PER configured device, and
+	// each is checked independently — a URL can be half-scheduled (desktop present, mobile
+	// missing) and that partial gap is just as silent as a full one.
 	for await (const target of streamTargets()) {
 		stats.examined++;
 		if (stats.examined % YIELD_EVERY === 0) await onYield();
 
-		const cacheKey = target.cacheKey;
-
-		// Residency is keyed off the URL-half exactly as RenderSchedule's own
-		// `setResidencyById` computes it, so this agrees with where the row actually lives.
-		if (ownerOf(CacheKey.extractUrl(cacheKey)) !== hostname) continue;
+		// Residency is keyed off the URL exactly as RenderSchedule's own `setResidencyById`
+		// computes it, so this agrees with where the rows actually live.
+		if (ownerOf(target.url) !== hostname) continue;
 		stats.owned++;
 
-		if (await getSchedule(cacheKey)) continue;
-		stats.missing++;
+		for (const deviceType of deviceTypes) {
+			const cacheKey = CacheKey.toCacheKey({ url: target.url, deviceType });
+			if (await getSchedule(cacheKey)) continue;
+			stats.missing++;
 
-		// Past the cap we keep counting but stop collecting, so the gap is measured in full
-		// while the repair stays bounded. A membership change can strand a large slice of the
-		// keyspace at once, and rewriting millions of rows in one pass would be its own outage.
-		if (toRestore.length < maxRestores) toRestore.push(target);
+			// Past the cap we keep counting but stop collecting, so the gap is measured in full
+			// while the repair stays bounded. A membership change can strand a large slice of the
+			// keyspace at once, and rewriting millions of rows in one pass would be its own outage.
+			if (toRestore.length < maxRestores) toRestore.push({ cacheKey, target });
+		}
 	}
 
 	// Phase 2 — writes, with the scan's cursor now closed.
-	for (const target of toRestore) {
-		await putSchedule(target.cacheKey, {
+	for (const { cacheKey, target } of toRestore) {
+		await putSchedule(cacheKey, {
 			// The jittered initial time, NOT "now": a repair pass can restore a great many rows at
 			// once, and scheduling them all immediately would replace a silent outage with a
-			// render herd. This is the same value the original `RenderTarget.put` would have
-			// written, so a repaired target rejoins the rotation exactly where it belonged.
+			// render herd. This is the same value the original `Target.put` would have written,
+			// so a repaired target rejoins the rotation exactly where it belonged.
 			//
 			// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright, so
 			// coerce before handing it over. No range check is needed here: the callee guards
 			// `Number.isFinite(interval) && interval > 0`, so a NON-POSITIVE value falls back to
 			// the default too — `Number(null)` is 0, which that guard rejects.
-			nextRenderTime: getInitialRenderTime(target.cacheKey, Number(target.renderInterval)),
+			nextRenderTime: getInitialRenderTime(cacheKey, Number(target.renderInterval)),
 			fromSitemap: !!target.sitemapUrl,
 		});
 		stats.restored++;
@@ -120,7 +125,7 @@ export const reconcileSchedules = async ({
 /** `reconcileSchedules` bound to the live tables. */
 export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconcile.maxRestores } = {}) => {
 	const {
-		render_service: { RenderTarget },
+		render_service: { Target },
 		render_schedule: { RenderSchedule },
 	} = databases;
 
@@ -135,7 +140,7 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		//   - no `limit`, because the caller streams and never resumes, so it needs no paging.
 		//
 		// Nothing here depends on the order rows arrive in — see `reconcileSchedules`.
-		streamTargets: () => RenderTarget.search({ select: ['cacheKey', 'renderInterval', 'sitemapUrl'] }),
+		streamTargets: () => Target.search({ select: ['url', 'renderInterval', 'sitemapUrl'] }),
 		// Node-local by construction — see the module comment. Existence is all that matters.
 		getSchedule: (cacheKey) => RenderSchedule.get({ id: cacheKey, select: ['cacheKey'] }, { replicateFrom: false }),
 		// Writes route by residency, so this reaches the owning node even though the read above
@@ -143,6 +148,9 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		putSchedule: (cacheKey, row) => RenderSchedule.put(cacheKey, row),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
+		// Config at sweep time, matching Target.put's fan-out — so a device added to config
+		// gets its missing schedule rows created for every existing target by this sweep.
+		deviceTypes: config.deviceTypes.default,
 		maxRestores,
 		onYield: () => setImmediate(),
 	});

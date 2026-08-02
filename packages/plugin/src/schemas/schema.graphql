@@ -6,11 +6,10 @@
 # cross-table atomic writes live apart to maximize write concurrency.
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
-#   render_service   RenderTarget, QueueStatus,      — target registry + queue status
-#                    QueueControl                     + desired (replicated) pause intent
+#   render_service   Target, QueueStatus,            — URL registry (incl. indexability
+#                    QueueControl                      verdicts) + queue status + pause intent
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
-#   signals          NonIndexable                    — indexability signals
 #   coordination     SharedBuffer                    — node-local SAB, never replicated
 
 type SitemapEntry {
@@ -75,7 +74,12 @@ type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh"
 	error: String
 }
 
-type RenderTarget @table(database: "render_service") @export {
+# LEGACY — the pre-v0.19 per-device registry (one row per url|deviceType). Kept declared
+# (unexported) so the one-shot startup migration can read it: it rebuilds the url-keyed
+# Target rows from these and then deletes them, leaving the existing RenderSchedule rows —
+# and their accumulated jitter — untouched. Remove this type (and drop_table the files)
+# once every environment has booted v0.19 at least once. See util/migrateTargets.js.
+type RenderTarget @table(database: "render_service") {
 	cacheKey: String @primaryKey
 	url: String
 	deviceType: String
@@ -83,6 +87,31 @@ type RenderTarget @table(database: "render_service") @export {
 	sitemapUrl: String @indexed
 	schedulerNode: String
 	renderInterval: Long
+}
+
+# The registry of URLs in the render rotation — ONE row per URL. Device variants are not
+# stored: the set of devices a URL renders for is `config.deviceTypes.default` at write time,
+# and `Target.put` fans out one RenderSchedule row per device (RenderSchedule and
+# PrerenderedPage stay cacheKey-keyed — the queue and the content are genuinely per-device;
+# only the registry is per-URL).
+#
+# `state: suppressed` is the render-verdict memory that used to live in the NonIndexable
+# table: a render proved the page non-indexable, so discovery must not keep re-creating the
+# target. A suppressed target keeps its schedule at `render.suppression.recheckInterval` —
+# the schedule IS the TTL — so the verdict re-proves (or heals) itself on cadence, and
+# `strikes` consecutive non-indexable verdicts delete the row outright.
+type Target @table(database: "render_service") @export {
+	url: String @primaryKey
+	sitemapUrl: String @indexed
+	schedulerNode: String
+	renderInterval: Long
+	# 'suppressed', or absent/null for a target in normal rotation.
+	state: String @indexed
+	# Why the last verdict suppressed it: noindex | canonical-mismatch | redirect-loop | ...
+	suppressedReason: String
+	suppressedAt: Date
+	# Consecutive non-indexable verdicts; render.suppression.maxStrikes deletes the target.
+	strikes: Int
 }
 
 type RenderSchedule @table(database: "render_schedule") @export {
@@ -116,10 +145,6 @@ type QueueControl @table(database: "render_service") @sealed @export(name: "queu
 	paused: Boolean
 	updatedTime: Date @updatedTime
 	updatedBy: String
-}
-
-type NonIndexable @table(database: "signals", expiration: 604800) @export {
-	url: String @primaryKey
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {

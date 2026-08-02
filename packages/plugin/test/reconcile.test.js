@@ -4,15 +4,16 @@ import assert from 'node:assert/strict';
 /**
  * The schedule-gap repair sweep.
  *
- * The bug it exists for: `RenderTarget` and `RenderSchedule` are separate databases, so a
- * target is created in two commits and the pair can be left half-written. For a URL that is
- * not in a sitemap, NOTHING re-creates the schedule — the bot-traffic path is gated on the
- * target not existing, and `processJobResult` needs a claim that can never happen. The URL
- * goes dark permanently and silently.
+ * The bug it exists for: `Target` and `RenderSchedule` are separate databases, so a target is
+ * one commit plus one schedule commit PER DEVICE, and the set can be left half-written. For a
+ * URL that is not in a sitemap, NOTHING re-creates a missing schedule — the bot-traffic path
+ * is gated on the target not existing, and `processJobResult` needs a claim that can never
+ * happen. The URL (or one device of it) goes dark permanently and silently.
  *
  * The properties pinned here are the ones that make the sweep safe to run against a live
  * multi-node cluster with a million targets: it only ever asks about keys it OWNS (a
  * cross-node read of a residency-pinned row takes Harper's untimed replication fetch), it
+ * checks every configured device independently (a half-scheduled URL is just as silent), it
  * pages so no read transaction stays open across writes, it restores with the JITTERED time
  * rather than "now", and its write cap reports truncation instead of quietly covering less
  * than it claims.
@@ -33,10 +34,17 @@ afterEach(() => {
 });
 
 /**
- * A fake registry. `owners` maps a cacheKey to its owning node so a test can place rows on
- * either side of the residency boundary; `schedules` is the set of keys that HAVE a row.
+ * A fake registry. `owners` maps a URL to its owning node so a test can place rows on either
+ * side of the residency boundary; `schedules` is the set of cacheKeys that HAVE a row.
  */
-const harness = ({ targets, owners = {}, schedules = [], hostname = 'node-a', maxRestores = 100 }) => {
+const harness = ({
+	targets,
+	owners = {},
+	schedules = [],
+	hostname = 'node-a',
+	deviceTypes = ['desktop'],
+	maxRestores = 100,
+}) => {
 	const scheduleSet = new Set(schedules);
 	const puts = [];
 	const scheduleReads = [];
@@ -73,6 +81,7 @@ const harness = ({ targets, owners = {}, schedules = [], hostname = 'node-a', ma
 				},
 				ownerOf: (url) => owners[url] ?? 'node-a',
 				hostname,
+				deviceTypes,
 				maxRestores,
 				...overrides,
 			}),
@@ -81,7 +90,7 @@ const harness = ({ targets, owners = {}, schedules = [], hostname = 'node-a', ma
 
 test('a target missing its schedule row gets one restored', async () => {
 	const h = harness({
-		targets: [{ cacheKey: 'https://x/a|desktop', renderInterval: 60000, sitemapUrl: null }],
+		targets: [{ url: 'https://x/a', renderInterval: 60000, sitemapUrl: null }],
 	});
 
 	const stats = await h.run();
@@ -93,7 +102,7 @@ test('a target missing its schedule row gets one restored', async () => {
 
 test('a target that already has a schedule row is left alone', async () => {
 	const h = harness({
-		targets: [{ cacheKey: 'https://x/a|desktop', renderInterval: 60000 }],
+		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
 		schedules: ['https://x/a|desktop'],
 	});
 
@@ -103,14 +112,34 @@ test('a target that already has a schedule row is left alone', async () => {
 	assert.equal(h.puts.length, 0);
 });
 
+test('every configured device is checked, and only the missing one is restored', async () => {
+	// One URL row implies one schedule row PER device. A half-scheduled URL — desktop present,
+	// mobile missing — is exactly as silent as a fully missing one and must be repaired
+	// without disturbing the sibling that is fine.
+	const h = harness({
+		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
+		deviceTypes: ['desktop', 'mobile'],
+		schedules: ['https://x/a|desktop'],
+	});
+
+	const stats = await h.run();
+
+	assert.deepEqual(h.scheduleReads.sort(), ['https://x/a|desktop', 'https://x/a|mobile']);
+	assert.equal(stats.missing, 1);
+	assert.deepEqual(
+		h.puts.map((p) => p.cacheKey),
+		['https://x/a|mobile']
+	);
+});
+
 test('keys owned by another node are never even asked about', async () => {
 	// This is the safety property, not an optimization: a point read for a residency-pinned row
 	// this node does not own takes Harper's replication fetch, which has no timeout — one such
 	// read would hang the whole sweep.
 	const h = harness({
 		targets: [
-			{ cacheKey: 'https://x/mine|desktop', renderInterval: 60000 },
-			{ cacheKey: 'https://x/theirs|desktop', renderInterval: 60000 },
+			{ url: 'https://x/mine', renderInterval: 60000 },
+			{ url: 'https://x/theirs', renderInterval: 60000 },
 		],
 		owners: { 'https://x/mine': 'node-a', 'https://x/theirs': 'node-b' },
 	});
@@ -126,16 +155,13 @@ test('keys owned by another node are never even asked about', async () => {
 	);
 });
 
-test('residency is computed from the URL half, exactly as RenderSchedule pins it', async () => {
-	// RenderSchedule.setResidencyById hashes CacheKey.extractUrl(cacheKey), so the same URL on
-	// two device types lands on the SAME node. Hashing the whole key would split the pair and
-	// make the sweep skip rows it actually owns.
+test('residency is asked once per URL, and both device rows live with that owner', async () => {
+	// RenderSchedule.setResidencyById hashes the URL half of the cacheKey, so the same URL on
+	// two device types lands on the SAME node — one ownership answer covers the whole fan-out.
 	const seen = [];
 	const h = harness({
-		targets: [
-			{ cacheKey: 'https://x/a|desktop', renderInterval: 60000 },
-			{ cacheKey: 'https://x/a|mobile', renderInterval: 60000 },
-		],
+		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
+		deviceTypes: ['desktop', 'mobile'],
 	});
 
 	await h.run({
@@ -145,7 +171,8 @@ test('residency is computed from the URL half, exactly as RenderSchedule pins it
 		},
 	});
 
-	assert.deepEqual(seen, ['https://x/a', 'https://x/a']);
+	assert.deepEqual(seen, ['https://x/a']);
+	assert.deepEqual(h.scheduleReads.sort(), ['https://x/a|desktop', 'https://x/a|mobile']);
 });
 
 test('restores at the jittered initial time, not now', async () => {
@@ -155,9 +182,9 @@ test('restores at the jittered initial time, not now', async () => {
 	const before = Date.now();
 	const h = harness({
 		targets: [
-			{ cacheKey: 'https://x/a|desktop', renderInterval: interval },
-			{ cacheKey: 'https://x/b|desktop', renderInterval: interval },
-			{ cacheKey: 'https://x/c|desktop', renderInterval: interval },
+			{ url: 'https://x/a', renderInterval: interval },
+			{ url: 'https://x/b', renderInterval: interval },
+			{ url: 'https://x/c', renderInterval: interval },
 		],
 	});
 
@@ -176,7 +203,7 @@ test('a BigInt renderInterval still produces a usable time', async () => {
 	// `renderInterval` is a `Long`, which can arrive as BigInt — and `Number.isFinite(1n)` is
 	// false, so an uncoerced value would silently fall through to the default interval.
 	const h = harness({
-		targets: [{ cacheKey: 'https://x/a|desktop', renderInterval: 3600000n }],
+		targets: [{ url: 'https://x/a', renderInterval: 3600000n }],
 	});
 
 	await h.run();
@@ -190,8 +217,8 @@ test('fromSitemap is carried over from the target', async () => {
 	// `false` would mislabel every repaired sitemap job.
 	const h = harness({
 		targets: [
-			{ cacheKey: 'https://x/a|desktop', sitemapUrl: 'https://x/sitemap.xml' },
-			{ cacheKey: 'https://x/b|desktop', sitemapUrl: null },
+			{ url: 'https://x/a', sitemapUrl: 'https://x/sitemap.xml' },
+			{ url: 'https://x/b', sitemapUrl: null },
 		],
 	});
 
@@ -203,7 +230,7 @@ test('fromSitemap is carried over from the target', async () => {
 
 test('the walk pages through every target rather than stopping at the first batch', async () => {
 	const targets = Array.from({ length: 7 }, (_, i) => ({
-		cacheKey: `https://x/${i}|desktop`,
+		url: `https://x/${i}`,
 		renderInterval: 60000,
 	}));
 	const h = harness({ targets });
@@ -219,7 +246,7 @@ test('no write is issued while the scan is still open', async () => {
 	// finished. Interleaving them would hold the read transaction across the writes and pin the
 	// log against reclamation — the same reason `claim` drains before leasing.
 	const targets = Array.from({ length: 5 }, (_, i) => ({
-		cacheKey: `https://x/${i}|desktop`,
+		url: `https://x/${i}`,
 		renderInterval: 60000,
 	}));
 	const h = harness({ targets });
@@ -231,7 +258,7 @@ test('no write is issued while the scan is still open', async () => {
 
 test('the restore cap bounds writes but still measures the whole gap', async () => {
 	const targets = Array.from({ length: 10 }, (_, i) => ({
-		cacheKey: `https://x/${i}|desktop`,
+		url: `https://x/${i}`,
 		renderInterval: 60000,
 	}));
 	const h = harness({ targets, maxRestores: 4 });
@@ -249,7 +276,7 @@ test('the restore cap bounds writes but still measures the whole gap', async () 
 
 test('a clean sweep reports truncated:false', async () => {
 	const h = harness({
-		targets: [{ cacheKey: 'https://x/a|desktop', renderInterval: 60000 }],
+		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
 		schedules: ['https://x/a|desktop'],
 	});
 
@@ -273,13 +300,13 @@ test('the result does not depend on the order rows arrive in', async () => {
 	// silently skip rows if the storage engine ever stopped returning them in key order; this
 	// asserts the sweep is indifferent to order instead of relying on that guarantee.
 	const targets = [
-		{ cacheKey: 'https://x/c|desktop', renderInterval: 60000 },
-		{ cacheKey: 'https://x/a|desktop', renderInterval: 60000 },
-		{ cacheKey: 'https://x/b|desktop', renderInterval: 60000 },
+		{ url: 'https://x/c', renderInterval: 60000 },
+		{ url: 'https://x/a', renderInterval: 60000 },
+		{ url: 'https://x/b', renderInterval: 60000 },
 	];
 
 	const shuffled = await harness({ targets }).run();
-	const sorted = await harness({ targets: [...targets].sort((a, b) => (a.cacheKey < b.cacheKey ? -1 : 1)) }).run();
+	const sorted = await harness({ targets: [...targets].sort((a, b) => (a.url < b.url ? -1 : 1)) }).run();
 
 	assert.deepEqual(shuffled, sorted);
 	assert.equal(shuffled.restored, 3);
@@ -297,13 +324,13 @@ test('the result does not depend on the order rows arrive in', async () => {
 test('the live query asks for no sort — Harper rejects sorting by the primary key', async () => {
 	const searches = [];
 	const rows = [
-		{ cacheKey: 'https://x/a|desktop', renderInterval: 60000, sitemapUrl: null },
-		{ cacheKey: 'https://x/b|desktop', renderInterval: 60000, sitemapUrl: null },
+		{ url: 'https://x/a', renderInterval: 60000, sitemapUrl: null },
+		{ url: 'https://x/b', renderInterval: 60000, sitemapUrl: null },
 	];
 
 	globalThis.databases = {
 		render_service: {
-			RenderTarget: {
+			Target: {
 				search(target) {
 					searches.push(target);
 					return (async function* () {
@@ -320,18 +347,19 @@ test('the live query asks for no sort — Harper rejects sorting by the primary 
 	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
 
 	assert.equal(stats.examined, 2);
-	assert.equal(stats.restored, 2);
+	// config.deviceTypes.default is ['desktop', 'mobile'], so two URLs fan out to four rows.
+	assert.equal(stats.restored, 4);
 
 	// Exactly one scan: no paging, so no cursor and no resumption.
 	assert.equal(searches.length, 1);
 	const [search] = searches;
 
-	// `sort` on the primary key is rejected outright ("cacheKey is not indexed and not combined
+	// `sort` on the primary key is rejected outright ("url is not indexed and not combined
 	// with any other conditions") because it is not flagged `indexed` in attribute metadata.
 	assert.equal(search.sort, undefined, 'must not ask Harper to sort by the primary key');
 	// And no conditions: with none, Harper injects its own full-scan condition, which is what
 	// this wants. Supplying a range condition is only needed to resume a cursor — there is none.
 	assert.equal(search.conditions, undefined, 'an unconstrained scan needs no conditions');
 	assert.equal(search.limit, undefined, 'a streamed scan needs no limit');
-	assert.deepEqual(search.select, ['cacheKey', 'renderInterval', 'sitemapUrl']);
+	assert.deepEqual(search.select, ['url', 'renderInterval', 'sitemapUrl']);
 });

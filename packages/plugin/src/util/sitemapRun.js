@@ -34,17 +34,17 @@ export const TargetAction = {
  * `sitemapUrl` equals the sitemap being processed. A key it returned is, by construction,
  * both present and correctly attributed — the exact condition `SKIP` needs — so re-asking the
  * database is a wasted round trip. At 1.6M targets that redundant read WAS the bulk of the
- * refresh: one sequential `RenderTarget.get` per entry × device, every pass, forever.
+ * refresh: one sequential `Target.get` per entry × device, every pass, forever.
  *
  * `knownKeys` is a fast path, never an authority: a miss falls through to the point read, so a
  * set that was capped or is otherwise incomplete costs latency and never correctness.
  */
-export const canSkipLookup = ({ revalidate, knownKeys, cacheKey }) => !revalidate && !!knownKeys?.has(cacheKey);
+export const canSkipLookup = ({ revalidate, knownKeys, key }) => !revalidate && !!knownKeys?.has(key);
 
 /**
  * Decide from the point-read result.
  *
- * REATTACH is deliberately NOT a `put`. `RenderTarget.put` recomputes `getInitialRenderTime`
+ * REATTACH is deliberately NOT a `put`. `Target.put` recomputes `getInitialRenderTime`
  * whenever no explicit `nextRenderTime` is supplied, so re-putting a target merely to correct
  * its attribution pushes its next render forward by a fresh jitter. That is the same mechanism
  * that made weekly/monthly targets never render at all, and fixed-size paginated product
@@ -121,12 +121,12 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 			filtered[UNCLASSIFIED] += counts[UNCLASSIFIED];
 		},
 
-		/** Record unlinked targets: the full count always, a bounded sample of the keys. */
+		/** Record unlinked targets: the full count always, a bounded sample of the URLs. */
 		addRemoved(targets) {
 			totals.removed += targets.length;
 			for (const target of targets) {
 				if (removedSample.length >= removedSampleCap) break;
-				removedSample.push(target.cacheKey);
+				removedSample.push(target.url);
 			}
 		},
 

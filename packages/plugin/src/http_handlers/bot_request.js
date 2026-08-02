@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { resolveForwardedRequest } from '../util/ingress.js';
 import { classifyPath, isForwardedMode, PRERENDER } from '../util/routeClass.js';
-import { RenderTarget } from '../resources/RenderTarget.js';
+import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
@@ -153,7 +153,7 @@ async function renderNow({ url, deviceType, cacheKey, request }) {
 	const since = Date.now();
 	const { RenderSchedule } = databases.render_schedule;
 
-	// Force an immediately-claimable, one-off schedule. No RenderTarget is created, so
+	// Force an immediately-claimable, one-off schedule. No Target is created, so
 	// processJobResult won't reschedule it — and drops the schedule row once the result
 	// lands — keeping this a single render rather than a recurring target. Concurrent
 	// render-now requests for the same URL collapse onto this one row; the feature is
@@ -204,25 +204,20 @@ async function handlePageScheduling(resource) {
 		if (isPrerenderCandidate(resource)) {
 			// resource.url is the origin-fetch URL built from the canonical half, so it is
 			// already route-filtered; canonicalize idempotently ('*' keeps it as-is) so this
-			// url-half equals CacheKey.extractUrl of the render key (and the NonIndexable id).
+			// url-half equals the Target primary key.
 			const canonicalUrl = canonicalizeUrl(resource.url, ['*']);
-			const existingNonIndexable = await databases.signals.NonIndexable.get({
-				id: canonicalUrl,
-				select: 'url',
-			});
 
-			if (!existingNonIndexable) {
-				for (const deviceType of config.deviceTypes.default) {
-					const cacheKey = CacheKey.toCacheKey({ url: canonicalUrl, deviceType });
-					const existingTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
-					if (!existingTarget) {
-						// No explicit time → RenderTarget.put jitters the first render across the
-						// interval, so a crawl that discovers many URLs at once doesn't stampede.
-						await RenderTarget.put(cacheKey, {
-							renderInterval: config.render.defaultInterval,
-						});
-					}
-				}
+			// One row answers both questions the old shape needed two tables for: an ACTIVE
+			// target is already in rotation, and a SUPPRESSED one is a render verdict saying
+			// "stop re-creating me" (it re-checks itself on its own schedule). Only a URL with
+			// no row at all is genuinely new.
+			const existingTarget = await Target.get({ id: canonicalUrl, select: 'url' });
+			if (!existingTarget) {
+				// No explicit time → Target.put jitters the first render across the interval,
+				// so a crawl that discovers many URLs at once doesn't stampede.
+				await Target.put(canonicalUrl, {
+					renderInterval: config.render.defaultInterval,
+				});
 			}
 		}
 	} catch (e) {

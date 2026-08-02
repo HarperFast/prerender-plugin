@@ -100,12 +100,12 @@ test('a STRING select still reads as changed — the bug this guards', () => {
 
 test('a key the prune scan returned skips the point read', () => {
 	const knownKeys = new Set(['https://x/a|desktop']);
-	assert.equal(canSkipLookup({ revalidate: false, knownKeys, cacheKey: 'https://x/a|desktop' }), true);
+	assert.equal(canSkipLookup({ revalidate: false, knownKeys, key: 'https://x/a|desktop' }), true);
 });
 
 test('a key the scan did not return still gets looked up', () => {
 	const knownKeys = new Set(['https://x/a|desktop']);
-	assert.equal(canSkipLookup({ revalidate: false, knownKeys, cacheKey: 'https://x/b|desktop' }), false);
+	assert.equal(canSkipLookup({ revalidate: false, knownKeys, key: 'https://x/b|desktop' }), false);
 });
 
 test('the fast path is a cache, not an authority: an absent or capped set just costs a read', () => {
@@ -115,7 +115,7 @@ test('the fast path is a cache, not an authority: an absent or capped set just c
 
 test('revalidate never skips — it must re-put every target with an immediate render time', () => {
 	const knownKeys = new Set(['k']);
-	assert.equal(canSkipLookup({ revalidate: true, knownKeys, cacheKey: 'k' }), false);
+	assert.equal(canSkipLookup({ revalidate: true, knownKeys, key: 'k' }), false);
 });
 
 // --- createRefreshRun: the tally, and the things the old result shape lost ---
@@ -145,7 +145,7 @@ test('removed is an exact count with a BOUNDED sample, not every record', () => 
 	// The old result pushed a full target record for every unlinked target from every child into
 	// one array and returned it in the HTTP body — unbounded in both memory and response size.
 	const run = createRefreshRun({ removedSampleCap: 3 });
-	run.addRemoved(Array.from({ length: 500 }, (_, i) => ({ cacheKey: `k${i}` })));
+	run.addRemoved(Array.from({ length: 500 }, (_, i) => ({ url: `k${i}` })));
 
 	const snapshot = run.snapshot();
 	assert.equal(snapshot.removed, 500, 'the count stays exact');
@@ -155,8 +155,8 @@ test('removed is an exact count with a BOUNDED sample, not every record', () => 
 
 test('removed accumulates across children', () => {
 	const run = createRefreshRun({ removedSampleCap: 2 });
-	run.addRemoved([{ cacheKey: 'a' }, { cacheKey: 'b' }]);
-	run.addRemoved([{ cacheKey: 'c' }]);
+	run.addRemoved([{ url: 'a' }, { url: 'b' }]);
+	run.addRemoved([{ url: 'c' }]);
 
 	const snapshot = run.snapshot();
 	assert.equal(snapshot.removed, 3);

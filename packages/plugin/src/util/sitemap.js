@@ -43,7 +43,7 @@ export function parseSitemap(xml) {
  * Split a sitemap's `<url>` entries into the ones worth prerendering and the ones that aren't.
  *
  * A sitemap is written for search engines, not for us: it lists every indexable URL on the site,
- * which is routinely a superset of the paths the CDN forwards here. Creating a RenderTarget for
+ * which is routinely a superset of the paths the CDN forwards here. Creating a Target for
  * a URL outside the prerender routes renders and stores a page that no read will ever look up —
  * pure render load and cache growth for no served output. At 1M+ URLs that is the difference
  * between the fleet working on pages bots actually receive and working on nothing.
