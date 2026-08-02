@@ -162,17 +162,26 @@ test('absent-only: an existing Target row (parallel node, live traffic) is never
 	assert.deepEqual(stores.target.get(A), { url: A, renderInterval: 999, state: 'suppressed', strikes: 3 });
 });
 
-test('a second run is a no-op', async () => {
+test('a re-trigger after completion is a no-op (legacy rows were consumed)', async () => {
 	seedLegacy(A);
 	await migrate.runTargetMigration();
 	const again = await migrate.runTargetMigration();
-	assert.deepEqual(again, { skipped: true });
+	assert.equal(again.skipped, true);
+	assert.match(again.reason, /empty/);
 });
 
 test('an empty legacy table (fresh deployment) skips without pausing anything', async () => {
 	const result = await migrate.runTargetMigration();
-	assert.deepEqual(result, { skipped: true });
+	assert.equal(result.skipped, true);
 	assert.equal(stores.queueControl.size, 0, 'no pause intent should ever have been written');
+});
+
+test('the run summary is kept for the admin action', async () => {
+	seedLegacy(A);
+	const run = await migrate.runTargetMigration();
+	assert.equal(run.error, null);
+	assert.equal(run.node, 'test-node');
+	assert.deepEqual(migrate.getLastMigration(), run);
 });
 
 test('pauses the cluster for the rebuild and resumes after', async () => {

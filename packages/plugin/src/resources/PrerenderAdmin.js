@@ -29,6 +29,7 @@
  *   POST /prerender_admin/queue      { scope, paused }              super_user
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
+ *   POST /prerender_admin/migrate-targets  one-shot v0.19 registry migration  super_user
  *   POST /prerender_admin/backlog    recompute the backlog snapshot super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
@@ -62,6 +63,7 @@ import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
+import { getLastMigration, runTargetMigration } from '../util/migrateTargets.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { decode } from '../util/contentEncoding.js';
@@ -387,6 +389,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.revalidateUrl(data);
 			case 'reconcile':
 				return PrerenderAdmin.reconcile();
+			case 'migrate-targets':
+				return PrerenderAdmin.migrateTargets();
 			case 'backlog':
 				return PrerenderAdmin.backlog();
 			case 'sitemap':
@@ -466,6 +470,20 @@ export class PrerenderAdmin extends Resource {
 	 * Node-scoped, because a node can only authoritatively check the keys it owns — see
 	 * util/reconcile.js. Every node runs the periodic sweep for its own slice.
 	 */
+	/**
+	 * Run the one-shot legacy-registry migration on THIS node (see util/migrateTargets.js for
+	 * the deploy sequence). Synchronous on purpose: the operator triggers it exactly once
+	 * during the v0.19 rollout and wants the stats in the response; the sweep is sized for a
+	 * staging registry, and a re-trigger of a completed run answers `skipped` immediately.
+	 */
+	static async migrateTargets() {
+		try {
+			return json(await runTargetMigration());
+		} catch (e) {
+			return json({ error: e?.message ?? String(e), lastRun: getLastMigration() }, 500);
+		}
+	}
+
 	static reconcile() {
 		const lastRun = getLastReconcile();
 		const payload = {

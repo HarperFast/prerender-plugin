@@ -13,14 +13,20 @@
  * whose fan-out would rewrite every schedule row with a fresh jitter and shove the whole
  * rotation's cadence around.
  *
- * Sequence (worker 0 of every node; every step idempotent, so concurrent nodes are benign):
+ * MANUALLY TRIGGERED — `POST /prerender_admin/migrate-targets` on ONE node (super_user), so
+ * there is exactly one writer and no duplicated creates/deletes across nodes. The recommended
+ * deploy is: operator pauses the cluster queue (`scope: 'all'`) → roll the nodes → trigger
+ * this once → verify → resume. Every step is still idempotent (absent-only writes, idempotent
+ * deletes), so a crashed or accidentally repeated run converges instead of corrupting.
+ *
+ * Sequence:
  *   1. Skip unless the legacy table has rows (self-limiting: step 4 empties it).
- *   2. PAUSE the cluster queue (unless an operator already paused it) so in-flight results
- *      can't hit the targetless-schedule drain path mid-rebuild. A result that slipped in
- *      from a pre-pause claim costs at most a schedule gap, which util/reconcile.js repairs.
+ *   2. PAUSE the cluster queue if the operator hasn't already — their intent outranks ours
+ *      and is never resumed on their behalf. The pause keeps in-flight results from hitting
+ *      the targetless-schedule drain path mid-rebuild; anything that slips in from a
+ *      pre-pause claim costs at most a schedule gap, which util/reconcile.js repairs.
  *   3. Group legacy rows by URL and write each Target row that does not already exist.
- *      Half-migrated crashes just resume: absent-only writes make re-runs free.
- *   4. Delete the legacy rows, so the next boot is a no-op and the next release can drop
+ *   4. Delete the legacy rows, so a re-trigger is a no-op and the next release can drop
  *      the type from the schema entirely.
  *   5. Resume the queue (only if step 2 was ours to pause).
  *
@@ -104,15 +110,40 @@ export const migrateLegacyTargets = async ({
 	return stats;
 };
 
-/** The sweep bound to the live tables, wrapped in the cluster pause. */
+let running = false;
+let lastRun = null;
+
+/** Summary of the most recent migration run on this node, for the admin action. */
+export const getLastMigration = () => lastRun;
+
+/** The sweep bound to the live tables, wrapped in the cluster pause. Guarded against
+ *  overlap on this node; the operator triggers it on ONE node, so there is exactly one
+ *  writer — the absent-only semantics below are a safety net, not the mechanism. */
 export const runTargetMigration = async () => {
+	if (running) return { skipped: true, reason: 'a migration is already running on this node', lastRun };
+	running = true;
+	const startedAt = Date.now();
+
+	try {
+		const outcome = await runTargetMigrationInner();
+		lastRun = { ...outcome, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+		return lastRun;
+	} catch (e) {
+		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		throw e;
+	} finally {
+		running = false;
+	}
+};
+
+const runTargetMigrationInner = async () => {
 	const {
 		render_service: { Target: TargetTable, RenderTarget: LegacyTable, QueueControl },
 	} = databases;
 
 	// Anything at all in the legacy table means a pre-v0.19 deployment's registry is waiting.
 	const [firstLegacy] = await Array.fromAsync(LegacyTable.search({ select: ['cacheKey'], limit: 1 }));
-	if (!firstLegacy) return { skipped: true };
+	if (!firstLegacy) return { skipped: true, reason: 'legacy table is empty — nothing to migrate' };
 
 	// Pause the WHOLE cluster's claiming while the registry is rebuilt — a replicated intent
 	// every node resolves within one statusSyncInterval. Left alone if an operator already
@@ -151,17 +182,3 @@ export const runTargetMigration = async () => {
 		}
 	}
 };
-
-let migrationStarted = false;
-
-/**
- * Run the migration in the background on worker 0. Called from handleApplication after
- * config is applied. Idempotent per worker; every node runs it (absent-only writes make the
- * overlap benign), so a node that was down during the fleet's first v0.19 boot still
- * migrates whatever its peers hadn't when it comes back.
- */
-export function startTargetMigration() {
-	if (server.workerIndex !== 0 || migrationStarted) return;
-	migrationStarted = true;
-	runTargetMigration().catch((e) => logger.error(e, '[prerender] target migration failed'));
-}
