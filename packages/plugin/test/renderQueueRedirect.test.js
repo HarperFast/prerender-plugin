@@ -241,6 +241,74 @@ test('301 to a host outside the domain allowlist is not adopted', async () => {
 	assert.equal(stores.renderTarget.has(key(foreign)), false, 'a foreign host can never be marked indexable');
 });
 
+// ---- outcome-shaped results (browser ≥ 1.16 posts `outcome`; the tests above omit it and
+// ---- exercise the legacyOutcome fallback for the deployed fleet) ----
+
+test('outcome=rendered stores the page and reschedules', async () => {
+	seedSource({ renderInterval: 60_000 });
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>fresh</html>'
+	);
+
+	const page = stores.prerenderedPage.get(key(A));
+	assert.ok(page, 'content must be stored');
+	assert.equal(page.isIndexable, true);
+	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'rescheduled one interval out');
+});
+
+test('outcome=rendered with a landed URL that keys elsewhere keeps the refile semantics', async () => {
+	seedSource();
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, redirectedTo: B, headers: {} },
+		'<html>landed</html>'
+	);
+
+	assert.equal(stores.renderTarget.has(key(A)), false, 'source target retired by the refile');
+	assert.ok(stores.prerenderedPage.get(key(B)), 'content filed under the landed key');
+});
+
+test('outcome=redirected onto a non-indexable landing retires the source and marks the destination', async () => {
+	seedSource();
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 200, // client-side redirect: no HTTP hop status
+		outcome: 'redirected',
+		redirectedTo: B,
+		isIndexable: false,
+		reason: 'noindex',
+	});
+
+	assert.equal(stores.renderTarget.has(key(A)), false, 'the source leads to a dead page — retire it');
+	assert.equal(stores.renderTarget.has(key(B)), false, 'a non-indexable destination is never adopted');
+	assert.ok(stores.nonIndexable.has(B), 'the destination indexability verdict is recorded');
+});
+
+test('outcome=redirected without permanence (client-side, 200) keeps the source', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'redirected', redirectedTo: B });
+
+	assert.ok(stores.renderTarget.has(key(A)), 'no proof of permanence — the source stays');
+	assert.ok(stores.renderSchedule.has(key(A)), 'and stays scheduled');
+	assert.equal(stores.renderTarget.has(key(B)), false);
+});
+
+test('outcome=error leaves a target-backed job for the lease to retry', async () => {
+	seedSource();
+	const scheduleBefore = stores.renderSchedule.get(key(A));
+	await postResult({
+		id: key(A),
+		url: A,
+		outcome: 'error',
+		reason: 'error',
+		error: { name: 'ProtocolError', message: 'Target closed' },
+	});
+
+	assert.ok(stores.renderTarget.has(key(A)), 'an error must never retire the target');
+	assert.equal(stores.renderSchedule.get(key(A)), scheduleBefore, 'schedule untouched — the lease drives the retry');
+});
+
 test('non-indexable results log the reason; failed results log the posted error', async () => {
 	seedSource();
 	await postResult({ id: key(A), url: A, statusCode: 200, isIndexable: false, reason: 'noindex' });

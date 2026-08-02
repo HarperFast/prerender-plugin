@@ -16,11 +16,18 @@ const { RenderSchedule } = databases.render_schedule;
 
 const mutex = getMutex('render_queue');
 
-// The statuses a browser (≥ v1.16.0) posts when it ends a render at navigation because the URL
-// HTTP-redirected to a different document. An explicit set, not a 3xx range: 304 is not a
-// redirect, and an unrecognized 3xx from some middlebox shouldn't route into scheduling
-// decisions it was never designed for.
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Browsers ≥ v1.16.0 post `outcome` — the single field result handling keys on: 'rendered'
+// (content present; a rendered-through client-side redirect is still a rendered page),
+// 'redirected' (ended at navigation, no content), 'non-indexable' (the page said don't), or
+// 'error'. Older browsers don't post it; infer it from the legacy signals with the same
+// precedence the old condition chain applied, so a mixed fleet lands in the branches it
+// always did.
+const legacyOutcome = (result) => {
+	if ((result.statusCode === 200 && result.content) || result.isIndexable === true) return 'rendered';
+	if (result.redirectedTo) return 'redirected';
+	if (result.isIndexable === false) return 'non-indexable';
+	return 'error';
+};
 
 /**
  * Resolve this node's desired pause intent from the replicated `QueueControl` table and
@@ -139,6 +146,20 @@ export class RenderQueue extends Resource {
 		// but store nothing, since the content belongs to a different URL than the key.
 		let discardContent = false;
 
+		// The domain allowlist runs BEFORE the outcome is resolved so a legacy result for a
+		// foreign host still infers 'non-indexable' the way the old chain coerced it.
+		try {
+			const domain = URL.parse(url)?.hostname;
+			// Empty allowlist = allow all hosts.
+			if (config.domains.length && !config.domains.includes(domain)) {
+				result.isIndexable = false;
+			}
+		} catch (e) {
+			logger.error(e, result.id);
+		}
+
+		const outcome = result.outcome ?? legacyOutcome(result);
+
 		if (result.redirectedTo) {
 			const { deviceType } = CacheKey.parse(result.id);
 
@@ -158,46 +179,40 @@ export class RenderQueue extends Resource {
 				const redirectPath = URL.parse(result.redirectedTo)?.pathname;
 				const landedOn = redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass;
 
-				// A 3xx status means the browser (≥ v1.16.0) ended the render at navigation: the URL
-				// HTTP-redirected to a different document, and content rendered under this job's
-				// context (device profile, waitFor path scoping) could only be stored under a key it
-				// wasn't rendered for. There is nothing to store — only scheduling to decide.
-				if (REDIRECT_STATUSES.has(result.statusCode)) {
+				// 'redirected' = the render ended without content: the browser (≥ v1.16.0) bailed
+				// at navigation on an HTTP redirect (statusCode = the first hop's 3xx), or a
+				// rendered-through client-side redirect landed on a page that produced nothing.
+				// Content rendered under this job's context (device profile, waitFor path scoping)
+				// could only be stored under a key it wasn't rendered for, so there is nothing to
+				// store — only scheduling to decide.
+				if (outcome === 'redirected') {
 					await this.processRedirectResult(result, { redirectKey, landedOn, redirectPath });
 					return;
 				}
 
-				// Rendered-through redirect: a client-side redirect (no HTTP status to reason
-				// about) or a pre-1.16 browser. Keep the long-standing refile semantics.
-				if (landedOn === PRERENDER) {
-					logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-					await RenderTarget.delete(result.id);
-					cacheKey = redirectKey;
-				} else {
-					// The redirect target is a class we never serve from cache, so re-keying onto it
-					// would file the render where no read will ever look — and deleting this target
-					// would silently end the URL's rendering for good (see util/reconcile.js on how
-					// undiagnosable that state is). The route list may simply be incomplete, so
-					// report it and leave the target alone rather than destroy it on that evidence.
-					// The render is wasted each interval until the redirect or the routes are fixed.
-					logger.warn(
-						`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which is ${landedOn} — ` +
-							`discarding the render and keeping the target (no key to store it under)`
-					);
-					recordUnroutedPath(landedOn, redirectPath, 'redirect');
-					discardContent = true;
+				// A rendered result whose landed URL keys elsewhere (client-side redirect that
+				// produced a real page): keep the long-standing refile semantics.
+				if (outcome === 'rendered') {
+					if (landedOn === PRERENDER) {
+						logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
+						await RenderTarget.delete(result.id);
+						cacheKey = redirectKey;
+					} else {
+						// The redirect target is a class we never serve from cache, so re-keying onto it
+						// would file the render where no read will ever look — and deleting this target
+						// would silently end the URL's rendering for good (see util/reconcile.js on how
+						// undiagnosable that state is). The route list may simply be incomplete, so
+						// report it and leave the target alone rather than destroy it on that evidence.
+						// The render is wasted each interval until the redirect or the routes are fixed.
+						logger.warn(
+							`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which is ${landedOn} — ` +
+								`discarding the render and keeping the target (no key to store it under)`
+						);
+						recordUnroutedPath(landedOn, redirectPath, 'redirect');
+						discardContent = true;
+					}
 				}
 			}
-		}
-
-		try {
-			const domain = URL.parse(url)?.hostname;
-			// Empty allowlist = allow all hosts.
-			if (config.domains.length && !config.domains.includes(domain)) {
-				result.isIndexable = false;
-			}
-		} catch (e) {
-			logger.error(e, result.id);
 		}
 
 		const hasContent = result.statusCode === 200 && result.content;
@@ -215,7 +230,7 @@ export class RenderQueue extends Resource {
 			);
 		}
 
-		if (result.isIndexable === true || hasContent) {
+		if (outcome === 'rendered') {
 			const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
 			const renderInterval = renderTarget?.renderInterval;
 
@@ -257,25 +272,13 @@ export class RenderQueue extends Resource {
 				// leaving it to be re-claimed when the lease expires.
 				await RenderSchedule.delete(cacheKey);
 			}
-		} else if (result.isIndexable === false) {
+		} else if (outcome === 'non-indexable') {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
 			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
 			// render is broken", which read identically without it.
 			logger.warn(`Skipped prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
 			await RenderTarget.delete(cacheKey);
-
-			try {
-				const nonIndexableUrl = CacheKey.extractUrl(cacheKey);
-				const existingNonIndexable = await databases.signals.NonIndexable.get({
-					id: nonIndexableUrl,
-					select: 'url',
-				});
-				if (!existingNonIndexable) {
-					await databases.signals.NonIndexable.put(nonIndexableUrl, { url: nonIndexableUrl });
-				}
-			} catch {
-				/* best-effort signal write */
-			}
+			await this.markNonIndexable(CacheKey.extractUrl(cacheKey));
 		} else {
 			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
 			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
@@ -296,11 +299,13 @@ export class RenderQueue extends Resource {
 	}
 
 	/**
-	 * A render the browser ended at navigation because the URL HTTP-redirected to a different
-	 * document (`result.statusCode` is the FIRST hop's 3xx — the origin's statement about the
-	 * job URL itself). There is no content; the outcome is what happens to the source target,
-	 * and whether the destination becomes a target of its own so it gets rendered under its own
-	 * job context instead of being cached from a render that ran as another URL.
+	 * A render that ended as a redirect with no content. Usually the browser bailed at
+	 * navigation on an HTTP redirect (`result.statusCode` is the FIRST hop's 3xx — the origin's
+	 * statement about the job URL itself); a client-side redirect that rendered through to a
+	 * page that produced nothing lands here too (statusCode 200, permanence unknowable). What's
+	 * decided is what happens to the source target, and whether the destination becomes a
+	 * target of its own so it gets rendered under its own job context instead of being cached
+	 * from a render that ran as another URL.
 	 */
 	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath }) {
 		if (typeof result.renderTime === 'number') {
@@ -321,9 +326,24 @@ export class RenderQueue extends Resource {
 			return;
 		}
 
+		if (result.isIndexable === false) {
+			// The landed document was actually loaded and inspected (a rendered-through
+			// client-side redirect) and it is non-indexable: the source now leads to a page we
+			// would never cache. Retire the source and remember the destination is dead, so
+			// neither keeps rendering.
+			logger.warn(
+				`Prerendered url ${result.id} redirected to non-indexable ${result.redirectedTo}` +
+					`${result.reason ? ` (${result.reason})` : ''} — retiring the target`
+			);
+			await RenderTarget.delete(result.id);
+			await this.markNonIndexable(CacheKey.extractUrl(redirectKey));
+			return;
+		}
+
 		if (result.statusCode !== 301 && result.statusCode !== 308) {
-			// Temporary redirect: failover, geo bounce, outage page. The source is expected to
-			// come back — keep its target AND its cached page, and look again next interval.
+			// No proof of permanence (302/303/307 — failover, geo bounce, outage page — or a
+			// client-side redirect's 200). The source is expected to come back — keep its target
+			// AND its cached page, and look again next interval.
 			logger.warn(
 				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
@@ -366,6 +386,19 @@ export class RenderQueue extends Resource {
 			target.renderInterval = source.renderInterval;
 		}
 		await RenderTarget.put(redirectKey, target);
+	}
+
+	/** Record the indexability verdict for a URL (idempotent, best-effort — a failed signal
+	 *  write must never fail the job result that carried it). */
+	static async markNonIndexable(url) {
+		try {
+			const existing = await databases.signals.NonIndexable.get({ id: url, select: 'url' });
+			if (!existing) {
+				await databases.signals.NonIndexable.put(url, { url });
+			}
+		} catch {
+			/* best-effort signal write */
+		}
 	}
 
 	/**
