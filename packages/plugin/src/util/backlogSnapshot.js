@@ -124,7 +124,7 @@ const readRow = async () => {
 	try {
 		return (await table().get(ROW_KEY)) ?? null;
 	} catch (e) {
-		logger.warn?.(`[prerender] could not read the backlog snapshot row: ${e?.message ?? e}`);
+		logger.warn?.(`[prerender] could not read the backlog snapshot row: ${e?.message ?? String(e)}`);
 		return null;
 	}
 };

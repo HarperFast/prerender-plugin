@@ -256,7 +256,7 @@ async function load() {
 	} catch (e) {
 		// A view's own fetch layer never throws (see api.js), so this is a bug in the view, not a
 		// transport failure. Surface it rather than leaving the console stuck on "Loading…".
-		state.error = `Failed to load ${state.view}: ${e?.message ?? e}`;
+		state.error = `Failed to load ${state.view}: ${e?.message ?? String(e)}`;
 	}
 
 	state.busy = false;

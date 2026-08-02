@@ -881,7 +881,7 @@ export class PrerenderAdmin extends Resource {
 	 *     that distinguishes "absent" from "absent here".
 	 */
 	static sitemapDetail(data) {
-		return withHeavySlot(() => PrerenderAdmin.sitemapDetailInner(data));
+		return withHeavySlot(() => this.sitemapDetailInner(data));
 	}
 
 	static async sitemapDetailInner(data) {
@@ -903,8 +903,8 @@ export class PrerenderAdmin extends Resource {
 		const pageOfEntries = allEntries.slice(offset, offset + limit);
 
 		const [targetCount, entries] = await Promise.all([
-			PrerenderAdmin.countTargetsFor(url),
-			Promise.all(pageOfEntries.map((entry) => PrerenderAdmin.entryState(entry))),
+			this.countTargetsFor(url),
+			Promise.all(pageOfEntries.map((entry) => this.entryState(entry))),
 		]);
 
 		return json({
@@ -1028,7 +1028,7 @@ export class PrerenderAdmin extends Resource {
 	 * labelled as exactly that. `content` is never selected.
 	 */
 	static listPages(target) {
-		return withHeavySlot(() => PrerenderAdmin.listPagesInner(target));
+		return withHeavySlot(() => this.listPagesInner(target));
 	}
 
 	static async listPagesInner(target) {
@@ -1102,7 +1102,7 @@ export class PrerenderAdmin extends Resource {
 	 * render; it is decoded here so the response is the bytes a person can actually read.
 	 */
 	static pageContent(target) {
-		return withHeavySlot(() => PrerenderAdmin.pageContentInner(target));
+		return withHeavySlot(() => this.pageContentInner(target));
 	}
 
 	static async pageContentInner(target) {

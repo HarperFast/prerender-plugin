@@ -30,7 +30,7 @@ async function request(path, options) {
 	try {
 		res = await fetch(`${BASE}/${path}`, options);
 	} catch (e) {
-		return { ok: false, status: 0, body: { error: `Request failed: ${e?.message ?? e}` } };
+		return { ok: false, status: 0, body: { error: `Request failed: ${e?.message ?? String(e)}` } };
 	}
 	let body = {};
 	try {
