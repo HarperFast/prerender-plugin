@@ -63,9 +63,19 @@ const makeResourceBase = (rows) =>
 			const resource = new this(id);
 			return resource.delete();
 		}
+		// Models the two query shapes the migration issues: the bare limit-1 existence probe,
+		// and keyset pages (`cacheKey greater_than <afterKey|true>` + limit) returned in
+		// primary-key order, like the real store's range scan.
 		static async *search(query = {}) {
+			const keyset = query.conditions?.find((c) => c.attribute === 'cacheKey' && c.comparator === 'greater_than');
+			let entries = [...rows.values()];
+			if (keyset) {
+				entries = entries
+					.filter((row) => keyset.value === true || row.cacheKey > keyset.value)
+					.sort((a, b) => (a.cacheKey < b.cacheKey ? -1 : 1));
+			}
 			let yielded = 0;
-			for (const row of rows.values()) {
+			for (const row of entries) {
 				if (query.limit !== undefined && yielded >= query.limit) return;
 				yielded++;
 				yield { ...row };
@@ -235,6 +245,31 @@ test('half-pairs and BigInt intervals migrate cleanly', async () => {
 	const target = stores.target.get(A);
 	assert.ok(target);
 	assert.equal(target.renderInterval, 3600000, 'BigInt Long coerced to a number');
+});
+
+test('keyset pagination visits every row exactly once across page boundaries', async () => {
+	// Force many pages with pageSize 1: the sweep must advance strictly by last-seen key,
+	// terminate, and neither skip nor double-create.
+	for (let i = 0; i < 7; i++) {
+		seedLegacy(`https://site.example.com/product/p${i}`, { devices: ['desktop'] });
+	}
+	const stats = { legacyRows: 0, created: 0, existing: 0 };
+	const sorted = () => [...stores.legacy.values()].sort((a, b) => (a.cacheKey < b.cacheKey ? -1 : 1));
+
+	await migrate.migrateLegacyTargets({
+		pageLegacy: async (afterKey, limit) =>
+			sorted()
+				.filter((row) => afterKey === undefined || row.cacheKey > afterKey)
+				.slice(0, limit),
+		getTarget: async (url) => stores.target.get(url) ?? null,
+		putTarget: async (url, row) => stores.target.set(url, row),
+		stats,
+		pageSize: 1,
+	});
+
+	assert.equal(stats.legacyRows, 7);
+	assert.equal(stats.created, 7);
+	assert.equal(stores.target.size, 7);
 });
 
 test('device rows that disagree resolve to the FIRST row seen; attribution self-heals via sitemap reattach', async () => {

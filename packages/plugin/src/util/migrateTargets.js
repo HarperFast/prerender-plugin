@@ -16,11 +16,18 @@
  * SIZED FOR THE REAL REGISTRY (~1.6M legacy rows), which forces three properties:
  *   - DETACHED: the sweep takes minutes, far past any HTTP timeout, so the admin action
  *     starts it and returns; progress and the final summary are polled from the same action
- *     (the reconcile pattern).
- *   - STREAMING: one pass, one row at a time, no in-memory grouping. The first device row
- *     seen for a URL creates the Target (absent-only); the sibling row skips. A first row
- *     missing `sitemapUrl`/`renderInterval` creates the target unattributed — the next
- *     sitemap refresh REATTACHes it (patch), so per-device drift self-heals within a pass.
+ *     (the reconcile pattern). Re-running after completion requires an explicit
+ *     `{"restart": true}`, so a poll can never accidentally start a fresh sweep.
+ *   - PAGED, not held open: keyset pagination on the primary key (`cacheKey greater_than
+ *     <last seen>`, bounded pages), each page's cursor fully drained BEFORE its writes —
+ *     the same no-write-under-an-open-cursor rule as util/scan.js, without collecting 1.6M
+ *     rows in memory. (`snapshot: false` is NOT the answer: Harper's search path does not
+ *     consume it — the option only exists on internal store-level getRange calls.) Keyset
+ *     order is the primary store's native range order, and the walk is exact because the
+ *     legacy table is immutable throughout; a re-seen row is absorbed by absent-only.
+ *     The first device row seen for a URL creates the Target; the sibling row skips. A
+ *     first row missing `sitemapUrl`/`renderInterval` creates the target unattributed —
+ *     the next sitemap refresh REATTACHes it (patch), so per-device drift self-heals.
  *   - PURE-ADDITIVE: legacy rows are NOT deleted, so rolling back to pre-v0.19 still finds
  *     its registry intact — the clean-rollback window stays open until the follow-up
  *     release drops the legacy table (`drop_table` reclaims the files; the new code never
@@ -56,43 +63,67 @@ const YIELD_EVERY = 200;
 // quiet enough not to flood the log.
 const PROGRESS_EVERY = 100_000;
 
+// Keyset page size: bounds both the memory held (one page of skinny rows) and how long any
+// single read cursor stays open.
+const PAGE_SIZE = 5000;
+
 /**
  * The pure sweep, all I/O injected (same testing discipline as reconcileSchedules).
- * Single streamed pass; `stats` is mutated in place so a caller can expose it as live
- * progress while the sweep runs.
+ * `pageLegacy(afterKey, limit)` returns the next page of legacy rows in primary-key order
+ * (afterKey === undefined asks for the first page); each page is fully materialized before
+ * its writes, so no read cursor is ever open across a write. `stats` is mutated in place so
+ * a caller can expose it as live progress while the sweep runs.
  */
-export const migrateLegacyTargets = async ({ streamLegacy, getTarget, putTarget, onYield = () => {}, stats }) => {
+export const migrateLegacyTargets = async ({
+	pageLegacy,
+	getTarget,
+	putTarget,
+	onYield = () => {},
+	stats,
+	pageSize = PAGE_SIZE,
+}) => {
 	stats.legacyRows = 0;
 	stats.created = 0;
 	stats.existing = 0;
 
-	for await (const row of streamLegacy()) {
-		stats.legacyRows++;
-		if (stats.legacyRows % YIELD_EVERY === 0) await onYield();
-		if (stats.legacyRows % PROGRESS_EVERY === 0) {
-			logger.warn(
-				`[prerender] target migration: ${stats.legacyRows} legacy rows scanned, ${stats.created} targets created`
-			);
+	let afterKey;
+	for (;;) {
+		// Phase 1 (per page) — read only, cursor drained by materializing the page.
+		const page = await pageLegacy(afterKey, pageSize);
+		if (page.length === 0) break;
+
+		// Phase 2 (per page) — writes, with no cursor open.
+		for (const row of page) {
+			stats.legacyRows++;
+			if (stats.legacyRows % YIELD_EVERY === 0) await onYield();
+			if (stats.legacyRows % PROGRESS_EVERY === 0) {
+				logger.warn(
+					`[prerender] target migration: ${stats.legacyRows} legacy rows scanned, ${stats.created} targets created`
+				);
+			}
+
+			const url = row.url ?? CacheKey.extractUrl(row.cacheKey);
+
+			// Absent-only: the sibling device row of an already-created URL, a row from a prior
+			// (crashed/repeated) run, and a row re-seen across a page boundary all land here and
+			// skip.
+			if (await getTarget(url)) {
+				stats.existing++;
+				continue;
+			}
+
+			// Long can arrive as BigInt (Number.isFinite rejects it) — coerce before the check.
+			const interval = Number(row.renderInterval);
+			await putTarget(url, {
+				url,
+				sitemapUrl: row.sitemapUrl ?? null,
+				renderInterval: Number.isFinite(interval) && interval > 0 ? interval : null,
+				schedulerNode: getResidencyByUrl(url),
+			});
+			stats.created++;
 		}
 
-		const url = row.url ?? CacheKey.extractUrl(row.cacheKey);
-
-		// Absent-only: the sibling device row of an already-created URL, a row from a prior
-		// (crashed/repeated) run, and a row racing live traffic all land here and skip.
-		if (await getTarget(url)) {
-			stats.existing++;
-			continue;
-		}
-
-		// Long can arrive as BigInt (Number.isFinite rejects it) — coerce before the check.
-		const interval = Number(row.renderInterval);
-		await putTarget(url, {
-			url,
-			sitemapUrl: row.sitemapUrl ?? null,
-			renderInterval: Number.isFinite(interval) && interval > 0 ? interval : null,
-			schedulerNode: getResidencyByUrl(url),
-		});
-		stats.created++;
+		afterKey = page[page.length - 1].cacheKey;
 	}
 
 	return stats;
@@ -157,15 +188,20 @@ const runTargetMigrationInner = async () => {
 
 	try {
 		const stats = await migrateLegacyTargets({
-			// Unconstrained streamed scan — same query rules as the reconcile sweep (no sort on
-			// the primary key, no conditions, no limit). `snapshot: false` because this single
-			// pass interleaves ~800k Target writes with the walk: holding one read snapshot
-			// across minutes of same-database writes pins the log against reclamation (the
-			// two-phase rule everywhere else in this codebase). A snapshot-free walk is EXACT
-			// here because nothing mutates the legacy table anymore — the migration is additive
-			// and the legacy rows are only ever dropped by a later release's drop_table.
-			streamLegacy: () =>
-				LegacyTable.search({ select: ['cacheKey', 'url', 'sitemapUrl', 'renderInterval'], snapshot: false }),
+			// Keyset pagination on the primary key. No `sort` (rejected on an unindexed PK —
+			// the v0.10.0 trap); the ordering comes from the primary store's native range scan.
+			// `value: true` is Harper's own start-of-range form (what it injects for a full
+			// scan); subsequent pages continue strictly after the last key seen. Each page is
+			// drained via Array.fromAsync BEFORE its writes, so no read cursor is ever open
+			// across a write and no snapshot outlives one page.
+			pageLegacy: (afterKey, limit) =>
+				Array.fromAsync(
+					LegacyTable.search({
+						conditions: [{ attribute: 'cacheKey', comparator: 'greater_than', value: afterKey ?? true }],
+						select: ['cacheKey', 'url', 'sitemapUrl', 'renderInterval'],
+						limit,
+					})
+				),
 			getTarget: (url) => TargetTable.get({ id: url, select: ['url'] }),
 			// The RAW table class ON PURPOSE: resources/Target.js `put` fans out fresh jittered
 			// schedule rows, and preserving the existing schedules untouched is the entire point.
