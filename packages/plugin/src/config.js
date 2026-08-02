@@ -359,30 +359,78 @@ const defaultConfig = () => ({
 	// about at config-apply time). Prefer declaring a `contains`/`passthrough` route directly.
 	excludePathPatterns: ['/search/'],
 
-	// Bot-request analytics. `bots` is the registry used both to label requests and
-	// to choose which crawlers are tracked by name — remove an entry to stop tracking
-	// that bot (its requests then bucket as 'other'). Each entry is { name, match },
-	// where `match` is a case-insensitive substring of the User-Agent; longer matches
-	// win over shorter ones (e.g. `googlebot-image` before `googlebot`).
+	// Bot-request analytics. `bots` is the registry that gives crawlers a stable display
+	// name — remove an entry to stop tracking that bot under it. Each entry is
+	// { name, match }, where `match` is a case-insensitive substring of the User-Agent;
+	// longer matches win over shorter ones (e.g. `googlebot-image` before `googlebot`).
+	//
+	// A UA the registry misses is not necessarily 'other': with `deriveUnknownBots` on,
+	// a self-identifying crawler UA is labeled with the name it declares (see
+	// util/userAgent.js), so a crawler the CDN starts forwarding before it's registered
+	// still shows up in analytics under a usable name — promote recurring derived names
+	// into the registry to pin their display name. Only a UA that doesn't self-identify
+	// at all becomes 'other', and `recordUnmatched` governs whether those are recorded.
 	analytics: {
 		enabled: true, // record bot_request analytics at all
-		recordUnmatched: true, // record requests whose UA matched no configured bot (as 'other')
+		recordUnmatched: true, // record requests whose UA yielded no name at all (as 'other')
+		deriveUnknownBots: true, // label unregistered crawlers with the name their UA declares
 		bots: [
+			// Entries must match the HTTP *request* User-Agent, not a robots.txt token.
+			// Some crawler names exist only in robots.txt and never appear in a request UA
+			// (Googlebot-News, Google-Extended, Applebot-Extended…) — an entry for one of
+			// those never matches anything and just misleads readers of this list.
+			//
+			// Search engines
 			{ name: 'Googlebot-Image', match: 'googlebot-image' },
-			{ name: 'Googlebot-News', match: 'googlebot-news' },
 			{ name: 'Googlebot-Video', match: 'googlebot-video' },
-			{ name: 'Googlebot-Smartphone', match: 'googlebot-smartphone' },
 			{ name: 'Google InspectionTool', match: 'google-inspectiontool' },
+			// the -Image/-Video variants need their own entries: the matcher requires a
+			// boundary after the match, so bare `googleother` can't cross the hyphen
+			{ name: 'GoogleOther-Image', match: 'googleother-image' },
+			{ name: 'GoogleOther-Video', match: 'googleother-video' },
 			{ name: 'GoogleOther', match: 'googleother' },
+			{ name: 'Storebot-Google', match: 'storebot-google' },
 			{ name: 'AdsBot-Google', match: 'adsbot-google' },
 			{ name: 'Googlebot', match: 'googlebot' },
 			{ name: 'Bingbot', match: 'bingbot' },
-			{ name: 'GPTBot', match: 'gptbot' },
-			{ name: 'AhrefsBot', match: 'ahrefsbot' },
-			{ name: 'SemrushBot', match: 'semrushbot' },
+			{ name: 'DuckDuckBot', match: 'duckduckbot-https' },
+			{ name: 'DuckDuckBot', match: 'duckduckbot' },
 			{ name: 'Applebot', match: 'applebot' },
 			{ name: 'YandexBot', match: 'yandexbot' },
 			{ name: 'Baidu Spider', match: 'baiduspider' },
+			{ name: 'SeznamBot', match: 'seznambot' },
+			{ name: 'Naver Yeti', match: 'yeti' },
+			{ name: 'Sogou Spider', match: 'sogou' },
+			{ name: 'PetalBot', match: 'petalbot' },
+			// AI crawlers & assistants
+			{ name: 'GPTBot', match: 'gptbot' },
+			{ name: 'OAI-SearchBot', match: 'oai-searchbot' },
+			{ name: 'ChatGPT-User', match: 'chatgpt-user' },
+			{ name: 'ClaudeBot', match: 'claudebot' },
+			{ name: 'Claude-User', match: 'claude-user' },
+			{ name: 'Claude-SearchBot', match: 'claude-searchbot' },
+			{ name: 'PerplexityBot', match: 'perplexitybot' },
+			{ name: 'Google-CloudVertexBot', match: 'google-cloudvertexbot' },
+			{ name: 'Perplexity-User', match: 'perplexity-user' },
+			{ name: 'CCBot', match: 'ccbot' },
+			{ name: 'Bytespider', match: 'bytespider' },
+			{ name: 'Meta-ExternalAgent', match: 'meta-externalagent' },
+			{ name: 'Meta-ExternalFetcher', match: 'meta-externalfetcher' },
+			{ name: 'FacebookBot', match: 'facebookbot' },
+			{ name: 'Amazonbot', match: 'amazonbot' },
+			{ name: 'DuckAssistBot', match: 'duckassistbot' },
+			{ name: 'MistralAI-User', match: 'mistralai-user' },
+			// SEO / site-audit tools
+			{ name: 'AhrefsBot', match: 'ahrefsbot' },
+			{ name: 'SemrushBot', match: 'semrushbot' },
+			{ name: 'MJ12bot', match: 'mj12bot' },
+			{ name: 'Rogerbot', match: 'rogerbot' },
+			{ name: 'DotBot', match: 'dotbot' },
+			{ name: 'Screaming Frog', match: 'screaming frog seo spider' },
+			{ name: 'Botify', match: 'botify' },
+			{ name: 'Deepcrawl', match: 'deepcrawl' },
+			{ name: 'OnCrawl', match: 'oncrawl' },
+			{ name: 'Sitebulb', match: 'sitebulb' },
 		],
 	},
 });

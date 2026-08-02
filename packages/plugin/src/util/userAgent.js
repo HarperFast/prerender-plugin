@@ -77,6 +77,104 @@ export function getBotName(headers) {
 		if (m) name = byMatch.get(m[1].toLowerCase()) ?? 'other';
 	}
 
+	// Registry miss: a well-behaved crawler still self-identifies, so label it with the
+	// name its UA declares rather than collapsing to 'other'. The registry always wins
+	// (stable display names); derivation only fills the gap until an entry is promoted.
+	if (name === 'other' && config.analytics.deriveUnknownBots) {
+		name = deriveBotName(ua) ?? 'other';
+	}
+
 	cache.set(ua, name);
 	return name;
+}
+
+// Tokens that name a browser, engine, or platform — never a crawler identity. Anything
+// reducing to only these is a browser-shaped UA, not a self-identification.
+const GENERIC_TOKENS = new Set([
+	...['mozilla', 'applewebkit', 'webkit', 'khtml', 'gecko', 'presto', 'like', 'compatible', 'version'],
+	...['chrome', 'chromium', 'crios', 'headlesschrome', 'safari', 'firefox', 'fxios', 'opera', 'opr'],
+	...['edg', 'edge', 'edga', 'edgios', 'msie', 'trident', 'samsungbrowser', 'ucbrowser'],
+	...['windows', 'win64', 'wow64', 'x11', 'linux', 'ubuntu', 'android', 'iphone', 'ipad', 'ipod'],
+	...['macintosh', 'mac', 'os', 'x', 'nt', 'cpu', 'u', 'wv', 'mobile', 'tablet', 'arm64', 'x86_64', 'intel'],
+]);
+
+// All patterns precompiled at module scope — deriveBotName runs on the bot serving path
+// (once per distinct UA; the LRU absorbs repeats) and must not compile or allocate more
+// than it has to.
+//
+// Cheap containment probe: only run the strip pass when the UA can actually contain a
+// URL or email address. Most UAs — browser-shaped and many bots — skip the replace (and
+// its string allocation) entirely.
+const HAS_LINKISH = /:\/\/|@|www\./i;
+// URLs and email addresses (contact info in UA comments) must not contribute tokens —
+// e.g. `+http://www.google.com/bot.html` would otherwise derive "bot.html". One combined
+// pass instead of one replace per shape.
+const URL_OR_EMAIL = /\+?(?:https?:\/\/|www\.)\S+|\S+@\S+/gi;
+const COMPAT_SLOT = /\bcompatible;\s*([^;()]+)/i;
+const LEADING_HEAD = /^([A-Za-z][A-Za-z0-9 ._-]{0,49}?)\s*\//;
+// A whole token (boundary enforced by the lookbehind) containing a crawler keyword.
+// Sticky-global: reset lastIndex before every scan.
+const KEYWORD_TOKEN = /(?<![A-Za-z0-9._-])[A-Za-z][A-Za-z0-9._-]*?(?:bot|crawler|spider|slurp)[A-Za-z0-9._-]*/gi;
+// A plausible product name: starts with a letter, modest length, benign charset.
+const NAME_SHAPE = /^[A-Za-z][A-Za-z0-9 ._-]{1,39}$/;
+const TRAILING_VERSION = /\s+v?\d[\d.~_]*$/;
+const BARE_KEYWORD = /^(?:bots?|robots?|crawlers?|spiders?|slurp)$/i;
+
+/**
+ * Reduce a raw candidate ("MJ12bot/v1.4.8", "MSIE 10.0", "Screaming Frog SEO Spider") to a
+ * clean bot name, or null if it doesn't look like one. Strips a version suffix, then
+ * rejects anything shaped wrong, too wordy, purely generic, or a bare keyword ("bot")
+ * that would aggregate unrelated crawlers under one meaningless label.
+ */
+function cleanCandidate(raw) {
+	const slash = raw.indexOf('/');
+	let name = (slash === -1 ? raw : raw.slice(0, slash)).trim();
+	name = name.replace(TRAILING_VERSION, '');
+	if (!NAME_SHAPE.test(name)) return null;
+	// /\s+/ so consecutive spaces can't mint empty words — an empty word is not in
+	// GENERIC_TOKENS, so it would defeat the all-generic rejection below.
+	const words = name.toLowerCase().split(/\s+/);
+	if (words.length > 4) return null;
+	if (words.every((w) => GENERIC_TOKENS.has(w))) return null;
+	if (words.length === 1 && BARE_KEYWORD.test(name)) return null;
+	return name;
+}
+
+/**
+ * Derive a bot name from a self-identifying User-Agent the registry doesn't know.
+ * Assumes cooperative crawlers (upstream bot management filters hostile traffic), so this
+ * optimizes for coverage of the shapes well-behaved bots actually use, in order of how
+ * reliable each shape is:
+ *
+ *   1. the `compatible; Name/1.0` slot — the conventional self-identification spot
+ *   2. a leading product token — `CCBot/2.0 (…)`, incl. multiword heads like
+ *      `Screaming Frog SEO Spider/21.4` (browser UAs lead with Mozilla/Opera, which
+ *      cleanCandidate rejects as generic)
+ *   3. any token containing a crawler keyword — catches names buried in an otherwise
+ *      browser-shaped UA, e.g. `… Safari/605.1.15 (Applebot/0.1; +…)`
+ *
+ * Returns null when nothing self-identifies (the caller then falls back to 'other').
+ */
+export function deriveBotName(ua) {
+	const cleaned = HAS_LINKISH.test(ua) ? ua.replace(URL_OR_EMAIL, ' ') : ua;
+
+	const slot = COMPAT_SLOT.exec(cleaned);
+	if (slot) {
+		const name = cleanCandidate(slot[1]);
+		if (name) return name;
+	}
+
+	const head = LEADING_HEAD.exec(cleaned);
+	if (head) {
+		const name = cleanCandidate(head[1]);
+		if (name) return name;
+	}
+
+	KEYWORD_TOKEN.lastIndex = 0;
+	for (let m; (m = KEYWORD_TOKEN.exec(cleaned)); ) {
+		const name = cleanCandidate(m[0]);
+		if (name) return name;
+	}
+
+	return null;
 }
