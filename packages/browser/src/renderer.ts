@@ -231,6 +231,40 @@ const renderer: Renderer = async (page, job) => {
 	}
 	timings.navTotal = Date.now() - navStart;
 
+	// A navigation that HTTP-redirected to a different document is not worth settling. The plugin
+	// never serves this render from the job's own key: it either discards the content (destination
+	// on a route we don't serve) or refiles it under the destination's key — content produced under
+	// the WRONG job context (waitFor rules are scoped by the job URL's path, so the destination
+	// page type's rules never ran). Post the redirect back now and let the plugin schedule the
+	// destination as a first-class target; the settle phase dominates a render's CPU, so this
+	// frees the slot almost entirely.
+	//
+	// Two deliberate scope limits:
+	//  - HTTP redirects only (`redirectChain()` non-empty). A client-side redirect has no redirect
+	//    status to report; it falls through, renders, and is caught by the post-render check below,
+	//    exactly as before.
+	//  - Origin/path changes only (query compared with an empty allowlist, i.e. ignored). The
+	//    plugin re-keys the destination with its per-route query allowlist, so a query-only change
+	//    can collapse back to the SAME cache key — bailing on that would throw away a render the
+	//    plugin would have stored. Render through and let its allowlist decide.
+	if (finalRes) {
+		const redirectChain = finalRes.request().redirectChain();
+		const landedUrl = page.url();
+		if (redirectChain.length > 0 && canonicalizeUrl(landedUrl, []) !== canonicalizeUrl(url, [])) {
+			job.redirectedTo = landedUrl;
+			// The FIRST hop's status is the origin's statement about the job URL itself — the
+			// permanence signal (301/308 moved for good, else temporary) the plugin keys the
+			// keep-vs-replace decision on. A missing hop response falls back to 302: temporary is
+			// the conservative reading (the plugin keeps the target and retries next interval).
+			const firstHop = redirectChain[0].response();
+			job.httpResponse = {
+				statusCode: firstHop?.status() ?? 302,
+				headers: firstHop?.headers() ?? {},
+			};
+			return;
+		}
+	}
+
 	const settleStart = Date.now();
 
 	const networkIdle = () =>
@@ -407,6 +441,8 @@ const renderer: Renderer = async (page, job) => {
 		// Redirect detection uses the SHARED canonical form (matches the plugin), so encoding,
 		// param order, hash, and trailing-slash differences never trip a false redirect. Post
 		// back the RAW final URL — the plugin canonicalizes it with the real route allowlist.
+		// HTTP redirects to a different origin/path bailed right after navigation (above); what
+		// reaches this check is client-side redirects and query-only changes, rendered through.
 		const rawPageUrl = page.url();
 		if (canonicalizeUrl(rawPageUrl) !== canonicalizeUrl(job.url)) {
 			job.redirectedTo = rawPageUrl;
@@ -415,6 +451,7 @@ const renderer: Renderer = async (page, job) => {
 		if (statusCode === 200) {
 			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
 			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, rawPageUrl);
+			if (!job.isIndexable) job.reason = noindex ? 'noindex' : 'canonical-mismatch';
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const ppStart = Date.now();
@@ -424,6 +461,7 @@ const renderer: Renderer = async (page, job) => {
 			}
 		} else {
 			job.isIndexable = false;
+			job.reason = 'http-error';
 		}
 	}
 };

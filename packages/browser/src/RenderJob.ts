@@ -4,6 +4,7 @@ import logger from './util/Logger.js';
 import { settings } from './settings.js';
 import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
+import { renderPhaseOf } from './util/renderPhase.js';
 
 // Result-POST failures worth retrying: transient overload/gateway errors. Anything else
 // (e.g. a 4xx) is a bug, not a blip — logged and dropped (the lease expires → re-render).
@@ -72,6 +73,20 @@ type OriginHttpResponse = {
 	headers: Record<string, string>;
 };
 
+/**
+ * What happened to a render, as the ONE decision field the plugin keys result handling on:
+ *  - 'rendered'       — content was produced. A rendered-through client-side redirect is still
+ *                       a rendered page (the plugin refiles it under the landed key).
+ *  - 'redirected'     — the render ended WITHOUT content because navigation landed on a
+ *                       different document (HTTP bail, or a client-side move to a page that
+ *                       produced nothing).
+ *  - 'non-indexable'  — the page itself said not to (see `reason`).
+ *  - 'error'          — nothing usable and nothing deliberate about it (see `error`).
+ * `isIndexable` still rides along, but as a PROPERTY of a rendered page (it is stored on the
+ * cache row) — not the signal decisions are inferred from.
+ */
+export type JobOutcome = 'rendered' | 'redirected' | 'non-indexable' | 'error';
+
 const allowedResponseHeaders = [
 	'etag', // helps 304 Not Modified
 	'last-modified', // helps 304 Not Modified
@@ -95,6 +110,15 @@ export default class RenderJob {
 	isIndexable: boolean | undefined;
 	redirectedTo: string | undefined;
 	isFromSitemap: boolean;
+	/**
+	 * Why this render produced no cacheable content — one slug across every no-content class,
+	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
+	 * 'canonical-mismatch' (page canonicalizes elsewhere), 'http-error' (non-200 document),
+	 * 'redirect-loop', 'redirect' (bailed at navigation), or 'error' (renderer threw — details
+	 * ride in the posted `error`). Unset when content was produced; sendResult derives the
+	 * redirect/error fallbacks so callers only set the values they alone can know.
+	 */
+	reason: string | undefined;
 
 	_httpResponse: OriginHttpResponse | null = null;
 
@@ -150,6 +174,15 @@ export default class RenderJob {
 		return this.latestAttempt?.content || null;
 	}
 
+	/** See {@link JobOutcome}. Content wins; then a landed-elsewhere navigation; then the
+	 *  page's own indexability verdict; anything else is an error by definition. */
+	get outcome(): JobOutcome {
+		if (this.content) return 'rendered';
+		if (this.redirectedTo) return 'redirected';
+		if (this.isIndexable === false) return 'non-indexable';
+		return 'error';
+	}
+
 	get error(): Error | null {
 		return this.latestAttempt?.error || null;
 	}
@@ -165,6 +198,7 @@ export default class RenderJob {
 		}
 
 		// Build the payload (incl. the expensive gzip) ONCE; retries re-send the same bytes.
+		const attemptError = this.error;
 		const metadata = {
 			id: this.id,
 			url: this.url,
@@ -173,6 +207,25 @@ export default class RenderJob {
 			renderTime: undefined as number | undefined,
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
+			outcome: this.outcome,
+			// One slug for WHY there is no content (see the field doc). The redirect/error
+			// fallbacks are derived here so every no-content result carries a reason without
+			// each producer having to remember to set one.
+			reason: this.content
+				? undefined
+				: (this.reason ?? (attemptError ? 'error' : this.redirectedTo ? 'redirect' : undefined)),
+			// The failed attempt's detail — without it the plugin can only log "unknown
+			// prerender error". `phase` separates a navigation that never completed (slow
+			// origin) from a failure in the settle/serialize work. Anything can be thrown, so
+			// don't trust the Error shape: a string/object throw must not serialize as
+			// "undefined: undefined".
+			error: attemptError
+				? {
+						name: attemptError?.name ?? 'Error',
+						message: attemptError?.message ?? String(attemptError),
+						phase: renderPhaseOf(attemptError),
+					}
+				: undefined,
 		};
 		if (this.httpResponse) {
 			Object.entries(this.httpResponse.headers).forEach(([key, val]) => {

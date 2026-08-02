@@ -95,6 +95,8 @@ export interface RenderResult {
 	outcome: RenderOutcome;
 	statusCode: number | undefined;
 	isIndexable: boolean | undefined;
+	/** Why no cacheable content: 'noindex' | 'canonical-mismatch' | 'http-error' | 'redirect-loop' | 'redirect' | 'error'. */
+	reason: string | undefined;
 	/** Normalized redirect target (job.redirectedTo), if the final URL canonically differs. */
 	redirectedTo: string | undefined;
 	/** Raw page.url() at snapshot time (complements the normalized redirectedTo). */
@@ -224,7 +226,10 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 			const err = e as Error;
 			// Mirror Worker.render: a redirect loop is a non-indexable signal, not just a generic
 			// error — so the harness reports the same isIndexable a worker would post.
-			if (err.message?.startsWith('net::ERR_TOO_MANY_REDIRECTS')) job.isIndexable = false;
+			if (err.message?.startsWith('net::ERR_TOO_MANY_REDIRECTS')) {
+				job.isIndexable = false;
+				job.reason = 'redirect-loop';
+			}
 			error = { name: err.name, message: err.message };
 		}
 		job.attemptEnded(error ? new Error(error.message) : undefined, html);
@@ -270,6 +275,7 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 			outcome: deriveOutcome(job, html, error),
 			statusCode: job.httpResponse?.statusCode,
 			isIndexable: job.isIndexable,
+			reason: job.reason ?? (error ? 'error' : !html && job.redirectedTo ? 'redirect' : undefined),
 			redirectedTo: job.redirectedTo,
 			finalUrl,
 			responseHeaders: job.httpResponse?.headers,
