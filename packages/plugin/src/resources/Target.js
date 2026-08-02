@@ -155,10 +155,12 @@ export class Target extends TargetTable {
 		});
 
 		const recheckAt = currentMinuteMs() + config.render.suppression.recheckInterval;
-		for (const cacheKey of cacheKeysOf(url)) {
-			await RenderSchedule.put(cacheKey, { nextRenderTime: recheckAt, fromSitemap: !!existing?.sitemapUrl });
-			await PrerenderedPage.delete(cacheKey);
-		}
+		await Promise.all(
+			cacheKeysOf(url).flatMap((cacheKey) => [
+				RenderSchedule.put(cacheKey, { nextRenderTime: recheckAt, fromSitemap: !!existing?.sitemapUrl }),
+				PrerenderedPage.delete(cacheKey),
+			])
+		);
 		return { deleted: false, strikes };
 	}
 
@@ -194,18 +196,20 @@ export class Target extends TargetTable {
 		});
 
 		// Phase 2 — writes, cursor now closed. Each batch is awaited before the next starts,
-		// so pending writes never span a monitor tick.
+		// so pending writes never span a monitor tick; within one URL the device variants are
+		// independent rows, so they proceed in parallel.
 		await applyInBatches({
 			items: urls,
-			apply: async (url) => {
-				for (const cacheKey of cacheKeysOf(url)) {
-					const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
-					if (existingPage) {
-						await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
-					}
-					await RenderSchedule.put(cacheKey, { nextRenderTime });
-				}
-			},
+			apply: (url) =>
+				Promise.all(
+					cacheKeysOf(url).map(async (cacheKey) => {
+						const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+						if (existingPage) {
+							await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
+						}
+						await RenderSchedule.put(cacheKey, { nextRenderTime });
+					})
+				),
 		});
 
 		// `examined` is the true match count even when the collection was capped; `truncated`
