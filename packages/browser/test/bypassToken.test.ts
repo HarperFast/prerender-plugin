@@ -55,7 +55,7 @@ before(async () => {
 		if (path === '/style.css') {
 			res.setHeader('content-type', 'text/css');
 			res.end('body{color:#111}');
-		 	return;
+			return;
 		}
 		res.setHeader('content-type', 'text/html; charset=utf-8');
 		res.end(`<!doctype html><html><head><title>bypass</title>

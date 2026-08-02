@@ -146,9 +146,7 @@ const renderer: Renderer = async (page, job) => {
 			// missing from the cache. Measured against a live edge: `_astro/*.js` and the layout
 			// CSS return 403 un-tokened and 200 tokened, from the same host, seconds apart.
 			if (settings.bypass.token && isSameOrigin(req.url())) {
-				req.continue({ headers: { ...req.headers(), [settings.bypass.header]: settings.bypass.token } }).catch(
-					noop,
-				);
+				req.continue({ headers: { ...req.headers(), [settings.bypass.header]: settings.bypass.token } }).catch(noop);
 				return;
 			}
 			req.continue().catch(noop); // For all other requests, continue without modification
