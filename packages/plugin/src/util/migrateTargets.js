@@ -1,6 +1,6 @@
 /**
- * One-shot startup migration: rebuild the url-keyed `Target` registry from the legacy
- * per-device `RenderTarget` table (pre-v0.19, one row per url|deviceType).
+ * One-shot migration: rebuild the url-keyed `Target` registry from the legacy per-device
+ * `RenderTarget` table (pre-v0.19, one row per url|deviceType).
  *
  * WHAT IT MUST NOT DO is re-render anything. The RenderSchedule and PrerenderedPage tables
  * did not change shape — every existing schedule row (with its accumulated jitter and
@@ -84,9 +84,9 @@ export const migrateLegacyTargets = async ({
 	}
 	stats.urls = byUrl.size;
 
-	// Phase 2 — absent-only Target writes, cursor closed. Absent-only is what makes crashed or
-	// concurrent runs (every node's worker 0 runs this) converge instead of clobbering: a row
-	// written by a parallel run — or by live traffic while we ran — always wins.
+	// Phase 2 — absent-only Target writes, cursor closed. Absent-only is what makes a crashed
+	// or accidentally repeated run converge instead of clobbering: a row written by an earlier
+	// attempt — or by live traffic while we ran — always wins.
 	let considered = 0;
 	for (const [url, agg] of byUrl) {
 		if (++considered % YIELD_EVERY === 0) await onYield();
@@ -103,7 +103,7 @@ export const migrateLegacyTargets = async ({
 		stats.created++;
 	}
 
-	// Phase 3 — consume the legacy rows, so the next boot skips at step 1 and the next
+	// Phase 3 — consume the legacy rows, so a re-trigger skips at step 1 and the next
 	// release can drop the table.
 	await deleteLegacy(legacyKeys);
 
