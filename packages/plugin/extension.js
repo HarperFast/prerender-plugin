@@ -13,6 +13,7 @@ import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
 import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
+import { startTargetMigration } from './src/util/migrateTargets.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -33,6 +34,11 @@ export async function handleApplication(scope) {
 	// Start background work now that config is applied. All are idempotent and
 	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
 	// every node repairs the schedule rows it owns (see util/reconcile.js).
+	//
+	// The migration goes FIRST: it pauses the queue while the url-keyed Target registry is
+	// rebuilt from the legacy per-device rows, so nothing renders against a half-rebuilt
+	// registry. One-shot — it consumes the legacy rows and no-ops forever after.
+	startTargetMigration();
 	startQueueStatusSync();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();
