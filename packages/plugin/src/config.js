@@ -239,6 +239,17 @@ const defaultConfig = () => ({
 		// daily herd. Sitemap-derived targets override this per-URL from `changefreq`.
 		defaultInterval: DAY,
 
+		// What happens when a render proves a URL non-indexable (noindex, canonical
+		// mismatch, redirect loop). The target is not deleted — it is marked
+		// `state: suppressed` and rescheduled at `recheckInterval`, so the verdict
+		// re-proves (or heals) itself on cadence, and discovery stops re-creating it.
+		// `maxStrikes` consecutive non-indexable verdicts delete the target outright;
+		// crawler re-discovery restarts the cycle at bounded cost.
+		suppression: {
+			recheckInterval: 7 * DAY,
+			maxStrikes: 4,
+		},
+
 		// Periodic repair of targets whose RenderSchedule row is missing. A target and its
 		// schedule are two commits in two databases (the schedule routed to the node owning
 		// the URL), so the pair can end up half-written — and for a URL that is not in a

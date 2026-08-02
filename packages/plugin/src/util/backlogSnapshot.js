@@ -120,6 +120,31 @@ async function countTable(table) {
 	}
 }
 
+/**
+ * Capped count of suppressed targets (`state` is indexed, so this is an equality walk, not a
+ * table scan). Reported with the cap so a truncated count reads as "≥ cap", never as exact.
+ */
+async function countSuppressed(Target) {
+	const cap = Math.max(1, config.management.scanCap | 0);
+	try {
+		let count = 0;
+		for await (const row of Target.search({
+			conditions: [{ attribute: 'state', value: 'suppressed' }],
+			select: ['url'],
+			limit: cap,
+			snapshot: false,
+		})) {
+			void row;
+			count++;
+			if (count % 200 === 0) await yieldNow();
+		}
+		return { recordCount: count, truncated: count >= cap };
+	} catch (e) {
+		logger.error(e);
+		return { recordCount: null, error: 'unavailable' };
+	}
+}
+
 const readRow = async () => {
 	try {
 		return (await table().get(ROW_KEY)) ?? null;
@@ -162,16 +187,18 @@ export const runBacklogSnapshotOnce = async () => {
 		// dashboard page load must cost point reads only. SEQUENTIAL on purpose — this runs
 		// beside bot traffic, and there is nothing to win by stacking four scans at once.
 		const {
-			render_service: { RenderTarget },
+			render_service: { Target },
 			page_cache: { PrerenderedPage },
 			sitemaps: { Sitemap },
-			signals: { NonIndexable },
 		} = databases;
 		const counts = {
-			targets: await countTable(RenderTarget),
+			targets: await countTable(Target),
 			pages: await countTable(PrerenderedPage),
 			sitemaps: await countTable(Sitemap),
-			nonIndexable: await countTable(NonIndexable),
+			// Suppressed targets replaced the NonIndexable table: an indexed-equality walk,
+			// capped like every other management scan, so a runaway suppression count can't
+			// turn the snapshot into a full table scan.
+			suppressed: await countSuppressed(Target),
 		};
 
 		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };

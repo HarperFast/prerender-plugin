@@ -74,6 +74,16 @@ const timedOut = (data, name) => !!data.degraded?.timedOutReads?.includes(name);
 const emptyState = (data, name, absentText) =>
 	muted(timedOut(data, name) ? 'Read timed out — status unknown, not necessarily absent.' : absentText);
 
+/** One line for the target card: why, how many strikes, and since when. */
+const suppressionSummary = (s) =>
+	[
+		s.reason ?? 'non-indexable',
+		Number.isFinite(s.strikes) ? `${s.strikes}/${s.maxStrikes} strikes` : null,
+		s.suppressedAt ? ago(s.suppressedAt) : null,
+	]
+		.filter(Boolean)
+		.join(' · ');
+
 function explanation(ctx, data) {
 	const page = data.rows.prerenderedPage;
 	const schedule = data.rows.renderSchedule;
@@ -140,7 +150,7 @@ function explanation(ctx, data) {
 								: 'Not scheduled — nothing will render this URL.'
 						),
 
-				el('h3', { cls: 'subhead', text: 'RenderTarget' }),
+				el('h3', { cls: 'subhead', text: 'Target' }),
 				target
 					? kv([
 							[
@@ -151,6 +161,8 @@ function explanation(ctx, data) {
 							],
 							['Scheduler node', mono(target.schedulerNode ?? '—')],
 							['Render interval', target.renderInterval ? duration(Number(target.renderInterval)) : 'default'],
+							['State', target.state === 'suppressed' ? pill('suppressed', 'warn') : pill('active', 'ok')],
+							data.rows.suppression && ['Suppressed', suppressionSummary(data.rows.suppression)],
 						])
 					: emptyState(data, 'renderTarget', 'No target — not in the recurring rotation.'),
 
@@ -204,11 +216,14 @@ function notes(data) {
 				'deliberately not prerendered, or stop the CDN forwarding it here.',
 		]);
 	}
-	if (data.verdict.suppressedByNonIndexable) {
+	if (data.verdict.suppressed) {
+		const s = data.rows.suppression;
 		note('bad', [
-			'A NonIndexable row suppresses this URL: a render judged it non-indexable, which deleted its ' +
-				'render target and blocks re-discovery until the row expires. If that verdict was wrong, ' +
-				'this page is silently out of SEO rotation.',
+			`This target is suppressed: a render judged it non-indexable` +
+				(s?.reason ? ` (${s.reason})` : '') +
+				(s?.strikes ? `, ${s.strikes}/${s.maxStrikes} strikes` : '') +
+				'. It blocks re-discovery and re-checks itself on its own schedule — the next render lifts ' +
+				'the suppression if the page is indexable again, or deletes the target at the strike limit.',
 		]);
 	}
 	if (data.ingress.routeClass === 'passthrough') {

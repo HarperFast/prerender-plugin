@@ -2,26 +2,27 @@ import { test, before, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 /**
- * processJobResult's handling of a content-less redirect result — the shape a browser
- * (≥ v1.16.0) posts when it ends a render at navigation because the URL HTTP-redirected to a
- * different document (statusCode = the FIRST hop's 3xx, no content).
+ * processJobResult over the url-keyed Target registry.
  *
  * The properties pinned here:
- *   - 301/308 onto a served route RETIRES the source (target, schedule, cached page) and
- *     ADOPTS the destination as a first-class target — due now, inheriting the source's
- *     cadence — so it renders under its own job context instead of being cached from a
- *     render that ran as another URL.
- *   - adoption never clobbers an existing destination target, never resurrects a URL in
- *     NonIndexable, and respects the domain allowlist.
- *   - 302/303/307 KEEPS the source (and its cached page) and just reschedules it: failover
- *     and geo bounces are expected to heal.
- *   - a redirect onto a route class we don't serve keeps the source too — deleting it on
- *     evidence as weak as an incomplete route list would end its rendering silently.
+ *   - Targets are ONE row per URL; put/delete/suppress fan out over the configured devices'
+ *     RenderSchedule and PrerenderedPage rows.
+ *   - A non-indexable verdict SUPPRESSES the target (state + strikes + recheck schedule,
+ *     cached pages dropped) instead of deleting it — and `maxStrikes` consecutive verdicts
+ *     delete it outright. A later indexable render lifts the suppression.
+ *   - 301/308 onto a served route retires the source URL (row, schedules, pages) and adopts
+ *     the destination as a first-class target — due now, inheriting the source's cadence —
+ *     never clobbering an existing (or suppressed) destination, and respecting the domain
+ *     allowlist.
+ *   - 302/303/307 (or a client-side redirect's 200) keeps the source and its cached pages.
+ *   - a redirect onto a route class we don't serve keeps the source.
  *   - a targetless source (render-now one-off) has its schedule dropped, not retried forever.
  */
 
-const DEVICE = 'desktop';
-const key = (url) => `${url}|${DEVICE}`;
+const DESKTOP = 'desktop';
+const key = (url, device = DESKTOP) => `${url}|${device}`;
+// config.deviceTypes.default — what Target fan-out uses.
+const DEVICES = ['desktop', 'mobile'];
 
 const A = 'https://site.example.com/product/old';
 const B = 'https://site.example.com/product/new';
@@ -29,19 +30,19 @@ const B = 'https://site.example.com/product/new';
 // One Map per table for the whole run (the module under test captures the table objects at
 // import), cleared between tests.
 const stores = {
-	renderTarget: new Map(),
+	target: new Map(),
 	renderSchedule: new Map(),
 	prerenderedPage: new Map(),
-	nonIndexable: new Map(),
 };
 
 let warns = [];
 let analytics = [];
 
 // Minimal stand-in for a Harper table/resource: static get/put/delete dispatch through an
-// instance (so RenderTarget's put/delete overrides apply, exactly like Harper's Resource),
-// and get() honors Harper's select semantics — a STRING select returns the bare scalar, an
-// array select builds a record. Both shapes are load-bearing in the code under test.
+// instance (so Target's put/delete overrides apply, exactly like Harper's Resource), put
+// REPLACES the row (that is what makes Target.put a reactivation — omitted suppression
+// fields clear), patch merges, and get() honors Harper's select semantics — a STRING select
+// returns the bare scalar, an array select builds a record. All are load-bearing.
 const makeResourceBase = (rows) =>
 	class FakeResource {
 		constructor(id) {
@@ -51,7 +52,7 @@ const makeResourceBase = (rows) =>
 			return this.__id;
 		}
 		async put(data) {
-			rows.set(this.__id, { ...(rows.get(this.__id) ?? {}), ...data });
+			rows.set(this.__id, { ...data });
 		}
 		async delete() {
 			return rows.delete(this.__id);
@@ -72,6 +73,9 @@ const makeResourceBase = (rows) =>
 		static async put(id, data) {
 			const resource = new this(id);
 			return resource.put({ ...data });
+		}
+		static async patch(id, data) {
+			rows.set(id, { ...(rows.get(id) ?? {}), ...data });
 		}
 		static async delete(id) {
 			const resource = new this(id);
@@ -109,12 +113,11 @@ before(async () => {
 			},
 		},
 		render_service: {
-			RenderTarget: makeResourceBase(stores.renderTarget),
+			Target: makeResourceBase(stores.target),
 			QueueControl: makeResourceBase(new Map()),
 		},
 		render_schedule: { RenderSchedule: makeResourceBase(stores.renderSchedule) },
 		page_cache: { PrerenderedPage: makeResourceBase(stores.prerenderedPage) },
-		signals: { NonIndexable: makeResourceBase(stores.nonIndexable) },
 	};
 
 	({ config } = await import('../src/config.js'));
@@ -141,27 +144,36 @@ const postResult = async (metadata, content) => {
 	await RenderQueue.processJobResult(body, ctx);
 };
 
-const seedSource = ({ renderInterval = 3_600_000 } = {}) => {
-	stores.renderTarget.set(key(A), { cacheKey: key(A), url: A, deviceType: DEVICE, renderInterval });
-	stores.renderSchedule.set(key(A), { nextRenderTime: 1, fromSitemap: false });
-	stores.prerenderedPage.set(key(A), { statusCode: 200, content: 'old html' });
+const seedSource = ({ url = A, renderInterval = 3_600_000, state } = {}) => {
+	stores.target.set(url, { url, renderInterval, ...(state ? { state } : {}) });
+	for (const device of DEVICES) {
+		stores.renderSchedule.set(key(url, device), { nextRenderTime: 1, fromSitemap: false });
+		stores.prerenderedPage.set(key(url, device), { statusCode: 200, content: 'old html' });
+	}
 };
 
-test('301 onto a served route retires the source and adopts the destination', async () => {
+// ---- redirects ----
+
+test('301 onto a served route retires the source URL — all devices — and adopts the destination', async () => {
 	seedSource({ renderInterval: 1234567 });
-	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: B, renderTime: 42 });
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: B, renderTime: 42 });
 
-	assert.equal(stores.renderTarget.has(key(A)), false, 'source target must be retired');
-	assert.equal(stores.renderSchedule.has(key(A)), false, 'source schedule must be dropped');
-	assert.equal(stores.prerenderedPage.has(key(A)), false, 'source cached page must be dropped');
+	assert.equal(stores.target.has(A), false, 'source target must be retired');
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule must be dropped`);
+		assert.equal(stores.prerenderedPage.has(key(A, device)), false, `${device} cached page must be dropped`);
+	}
 
-	const adopted = stores.renderTarget.get(key(B));
+	const adopted = stores.target.get(B);
 	assert.ok(adopted, 'destination must become a target of its own');
 	assert.equal(adopted.renderInterval, 1234567, 'cadence is inherited — the page moved, its schedule did not');
+	assert.notEqual(adopted.state, 'suppressed');
 
-	const schedule = stores.renderSchedule.get(key(B));
-	assert.ok(schedule, 'destination must be scheduled');
-	assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source page is gone, fill the gap fast');
+	for (const device of DEVICES) {
+		const schedule = stores.renderSchedule.get(key(B, device));
+		assert.ok(schedule, `destination must be scheduled for ${device}`);
+		assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
+	}
 
 	assert.equal(analytics.length, 1, 'redirect results still record render_time analytics');
 	assert.equal(analytics[0][3], 'redirect');
@@ -169,13 +181,13 @@ test('301 onto a served route retires the source and adopts the destination', as
 
 test('301 onto an already-targeted destination adopts nothing and leaves its schedule alone', async () => {
 	seedSource();
-	stores.renderTarget.set(key(B), { cacheKey: key(B), renderInterval: 999 });
+	stores.target.set(B, { url: B, renderInterval: 999 });
 	stores.renderSchedule.set(key(B), { nextRenderTime: 8_888_888_888_888 });
 
-	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: B });
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: B });
 
-	assert.equal(stores.renderTarget.has(key(A)), false, 'source is still retired');
-	assert.equal(stores.renderTarget.get(key(B)).renderInterval, 999, 'existing destination target untouched');
+	assert.equal(stores.target.has(A), false, 'source is still retired');
+	assert.equal(stores.target.get(B).renderInterval, 999, 'existing destination target untouched');
 	assert.equal(
 		stores.renderSchedule.get(key(B)).nextRenderTime,
 		8_888_888_888_888,
@@ -183,14 +195,25 @@ test('301 onto an already-targeted destination adopts nothing and leaves its sch
 	);
 });
 
-test('temporary redirect (302) keeps the source — target, cached page — and retries next interval', async () => {
+test('301 onto a SUPPRESSED destination does not resurrect it', async () => {
+	seedSource();
+	stores.target.set(B, { url: B, state: 'suppressed', suppressedReason: 'noindex', strikes: 2 });
+
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: B });
+
+	assert.equal(stores.target.has(A), false, 'the source still retires — the move is real');
+	assert.equal(stores.target.get(B).state, 'suppressed', 'a render verdict outranks a redirect pointing at it');
+	assert.equal(stores.target.get(B).strikes, 2, 'the verdict record is untouched');
+});
+
+test('temporary redirect (302) keeps the source — target, cached pages — and retries next interval', async () => {
 	seedSource({ renderInterval: 60_000 });
 	const before = Date.now();
-	await postResult({ id: key(A), url: A, statusCode: 302, redirectedTo: B });
+	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
 
-	assert.ok(stores.renderTarget.has(key(A)), 'a failover bounce must not retire the target');
+	assert.ok(stores.target.has(A), 'a failover bounce must not retire the target');
 	assert.ok(stores.prerenderedPage.has(key(A)), 'the cached page keeps serving while the redirect heals');
-	assert.equal(stores.renderTarget.has(key(B)), false, 'a temporary destination is not adopted');
+	assert.equal(stores.target.has(B), false, 'a temporary destination is not adopted');
 
 	const schedule = stores.renderSchedule.get(key(A));
 	// nextRenderTime is minute-floored "now" + interval.
@@ -203,7 +226,7 @@ test('temporary redirect (302) keeps the source — target, cached page — and 
 
 test('a targetless source (render-now one-off) has its schedule dropped instead of retrying forever', async () => {
 	stores.renderSchedule.set(key(A), { nextRenderTime: 1 });
-	await postResult({ id: key(A), url: A, statusCode: 302, redirectedTo: B });
+	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
 	assert.equal(stores.renderSchedule.has(key(A)), false);
 });
 
@@ -213,21 +236,11 @@ test('redirect onto an unrouted path keeps the source and adopts nothing', async
 	seedSource();
 	const off = 'https://site.example.com/checkout/thanks';
 
-	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: off });
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: off });
 
-	assert.ok(stores.renderTarget.has(key(A)), 'incomplete route list must not end this URL for good');
+	assert.ok(stores.target.has(A), 'incomplete route list must not end this URL for good');
 	assert.ok(stores.renderSchedule.has(key(A)), 'source stays in rotation');
-	assert.equal(stores.renderTarget.has(key(off)), false);
-});
-
-test('301 does not resurrect a destination already proven non-indexable', async () => {
-	seedSource();
-	stores.nonIndexable.set(B, { url: B });
-
-	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: B });
-
-	assert.equal(stores.renderTarget.has(key(A)), false, 'the source still retires — the move is real');
-	assert.equal(stores.renderTarget.has(key(B)), false, 'NonIndexable wins over adoption');
+	assert.equal(stores.target.has(off), false);
 });
 
 test('301 to a host outside the domain allowlist is not adopted', async () => {
@@ -235,14 +248,41 @@ test('301 to a host outside the domain allowlist is not adopted', async () => {
 	seedSource();
 	const foreign = 'https://other.example.net/product/new';
 
-	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: foreign });
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: foreign });
 
-	assert.equal(stores.renderTarget.has(key(A)), false);
-	assert.equal(stores.renderTarget.has(key(foreign)), false, 'a foreign host can never be marked indexable');
+	assert.equal(stores.target.has(A), false);
+	assert.equal(stores.target.has(foreign), false, 'a foreign host can never be marked indexable');
 });
 
-// ---- outcome-shaped results (browser ≥ 1.16 posts `outcome`; the tests above omit it and
-// ---- exercise the legacyOutcome fallback for the deployed fleet) ----
+test('outcome=redirected onto a non-indexable landing retires the source and suppresses the destination', async () => {
+	seedSource();
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 200, // client-side redirect: no HTTP hop status
+		outcome: 'redirected',
+		redirectedTo: B,
+		isIndexable: false,
+		reason: 'noindex',
+	});
+
+	assert.equal(stores.target.has(A), false, 'the source leads to a dead page — retire it');
+	const destination = stores.target.get(B);
+	assert.equal(destination?.state, 'suppressed', 'the destination verdict is recorded as a suppressed target');
+	assert.equal(destination?.suppressedReason, 'noindex');
+	assert.equal(destination?.strikes, 1);
+});
+
+test('outcome=redirected without permanence (client-side, 200) keeps the source', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'redirected', redirectedTo: B });
+
+	assert.ok(stores.target.has(A), 'no proof of permanence — the source stays');
+	assert.ok(stores.renderSchedule.has(key(A)), 'and stays scheduled');
+	assert.equal(stores.target.has(B), false);
+});
+
+// ---- rendered ----
 
 test('outcome=rendered stores the page and reschedules', async () => {
 	seedSource({ renderInterval: 60_000 });
@@ -264,35 +304,100 @@ test('outcome=rendered with a landed URL that keys elsewhere keeps the refile se
 		'<html>landed</html>'
 	);
 
-	assert.equal(stores.renderTarget.has(key(A)), false, 'source target retired by the refile');
+	assert.equal(stores.target.has(A), false, 'source target retired by the refile');
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule retired with it`);
+	}
 	assert.ok(stores.prerenderedPage.get(key(B)), 'content filed under the landed key');
 });
 
-test('outcome=redirected onto a non-indexable landing retires the source and marks the destination', async () => {
-	seedSource();
+// ---- suppression lifecycle ----
+
+test('a non-indexable verdict suppresses the target: state, strikes, recheck schedule, pages dropped', async () => {
+	seedSource({ renderInterval: 60_000 });
+	const before = Date.now();
 	await postResult({
 		id: key(A),
 		url: A,
-		statusCode: 200, // client-side redirect: no HTTP hop status
-		outcome: 'redirected',
-		redirectedTo: B,
+		statusCode: 200,
+		outcome: 'non-indexable',
 		isIndexable: false,
 		reason: 'noindex',
 	});
 
-	assert.equal(stores.renderTarget.has(key(A)), false, 'the source leads to a dead page — retire it');
-	assert.equal(stores.renderTarget.has(key(B)), false, 'a non-indexable destination is never adopted');
-	assert.ok(stores.nonIndexable.has(B), 'the destination indexability verdict is recorded');
+	const target = stores.target.get(A);
+	assert.ok(target, 'the target must NOT be deleted — suppression replaces deletion');
+	assert.equal(target.state, 'suppressed');
+	assert.equal(target.suppressedReason, 'noindex');
+	assert.equal(target.strikes, 1);
+	assert.equal(target.renderInterval, 60_000, 'the cadence survives for when it heals');
+
+	for (const device of DEVICES) {
+		assert.equal(stores.prerenderedPage.has(key(A, device)), false, `${device} cached page must be dropped`);
+		const schedule = stores.renderSchedule.get(key(A, device));
+		assert.ok(
+			schedule.nextRenderTime >= before + config.render.suppression.recheckInterval - 60_000,
+			`${device} rescheduled at the recheck interval, not the render interval`
+		);
+	}
+	assert.ok(
+		warns.some((w) => w.includes('Suppressing') && w.includes('(noindex)')),
+		`expected a suppression warn naming the reason, got: ${warns.join(' | ')}`
+	);
 });
 
-test('outcome=redirected without permanence (client-side, 200) keeps the source', async () => {
+test('maxStrikes consecutive non-indexable verdicts delete the target outright', async () => {
 	seedSource();
-	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'redirected', redirectedTo: B });
+	for (let i = 0; i < config.render.suppression.maxStrikes; i++) {
+		await postResult({
+			id: key(A),
+			url: A,
+			statusCode: 200,
+			outcome: 'non-indexable',
+			isIndexable: false,
+			reason: 'noindex',
+		});
+	}
 
-	assert.ok(stores.renderTarget.has(key(A)), 'no proof of permanence — the source stays');
-	assert.ok(stores.renderSchedule.has(key(A)), 'and stays scheduled');
-	assert.equal(stores.renderTarget.has(key(B)), false);
+	assert.equal(stores.target.has(A), false, 'strike limit reached — the target is gone');
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, 'and its schedules with it');
+	}
 });
+
+test('an indexable render lifts a suppression', async () => {
+	seedSource({ state: 'suppressed' });
+	stores.target.get(A).suppressedReason = 'noindex';
+	stores.target.get(A).strikes = 2;
+
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>healed</html>'
+	);
+
+	const target = stores.target.get(A);
+	assert.equal(target.state, null, 'back in normal rotation');
+	assert.equal(target.strikes, 0, 'the strike count resets — a heal is a heal');
+	assert.ok(stores.prerenderedPage.get(key(A)), 'the healed content is cached');
+});
+
+test('a verdict for a URL nothing targeted creates the suppression row (render-now, redirect landings)', async () => {
+	stores.renderSchedule.set(key(A), { nextRenderTime: 1 });
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 200,
+		outcome: 'non-indexable',
+		isIndexable: false,
+		reason: 'canonical-mismatch',
+	});
+
+	const target = stores.target.get(A);
+	assert.equal(target?.state, 'suppressed', 'the verdict must outlive the one-off render');
+	assert.equal(target?.suppressedReason, 'canonical-mismatch');
+});
+
+// ---- errors ----
 
 test('outcome=error leaves a target-backed job for the lease to retry', async () => {
 	seedSource();
@@ -305,29 +410,27 @@ test('outcome=error leaves a target-backed job for the lease to retry', async ()
 		error: { name: 'ProtocolError', message: 'Target closed' },
 	});
 
-	assert.ok(stores.renderTarget.has(key(A)), 'an error must never retire the target');
+	assert.ok(stores.target.has(A), 'an error must never retire the target');
 	assert.equal(stores.renderSchedule.get(key(A)), scheduleBefore, 'schedule untouched — the lease drives the retry');
-});
-
-test('non-indexable results log the reason; failed results log the posted error', async () => {
-	seedSource();
-	await postResult({ id: key(A), url: A, statusCode: 200, isIndexable: false, reason: 'noindex' });
 	assert.ok(
-		warns.some((w) => w.includes(key(A)) && w.includes('(noindex)')),
-		`expected a skip warn naming the reason, got: ${warns.join(' | ')}`
-	);
-
-	warns = [];
-	seedSource();
-	await postResult({
-		id: key(A),
-		url: A,
-		reason: 'error',
-		error: { name: 'TimeoutError', message: 'Navigation timeout of 30000 ms exceeded', phase: 'navigation' },
-	});
-	assert.ok(
-		warns.some((w) => w.includes('TimeoutError') && w.includes('[navigation]')),
+		warns.some((w) => w.includes('ProtocolError')),
 		`expected the posted error in the failure warn, got: ${warns.join(' | ')}`
 	);
-	assert.ok(stores.renderSchedule.has(key(A)), 'a target-backed failure is left for the lease to retry');
+});
+
+// ---- legacy results (no outcome posted — pre-1.16 browsers, inferred by legacyOutcome) ----
+
+test('a legacy 301 result (no outcome field) still lands in the redirect branch', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 301, redirectedTo: B });
+
+	assert.equal(stores.target.has(A), false);
+	assert.ok(stores.target.get(B), 'destination adopted from the inferred outcome');
+});
+
+test('a legacy non-indexable result (no outcome field) still suppresses', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 200, isIndexable: false, reason: 'noindex' });
+
+	assert.equal(stores.target.get(A)?.state, 'suppressed');
 });

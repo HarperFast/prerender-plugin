@@ -257,7 +257,7 @@ function statsRow(detail) {
 		},
 		[
 			statCell('Entries', num(entryCount), meter(1)),
-			// targetCount is a capped count of RenderTarget rows whose sitemapUrl matches (an
+			// targetCount is a capped count of Target rows whose sitemapUrl matches (an
 			// indexed equality). Null when the count timed out — shown as unknown, not zero.
 			statCell(
 				'Targets',

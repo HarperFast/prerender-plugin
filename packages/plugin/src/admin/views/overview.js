@@ -59,7 +59,13 @@ function counts(ctx, data) {
 			{ warn: !!backlog && !backlog.error && backlog.overdue > 0 }
 		),
 		stat('Sitemaps', value(tables?.sitemaps), [link('view sitemaps →', () => ctx.go('sitemaps'))]),
-		stat('Non-indexable', value(tables?.nonIndexable), 'suppressed URLs'),
+		stat(
+			'Suppressed',
+			tables?.suppressed && !tables.suppressed.error
+				? num(tables.suppressed.recordCount) + (tables.suppressed.truncated ? '+' : '')
+				: '—',
+			'non-indexable verdicts'
+		),
 	]);
 }
 

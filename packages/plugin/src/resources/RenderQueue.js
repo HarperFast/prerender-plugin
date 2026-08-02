@@ -6,7 +6,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { classifyPath, queryAllowlistFor, PRERENDER } from '../util/routeClass.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
-import { RenderTarget } from './RenderTarget.js';
+import { Target } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
@@ -146,6 +146,11 @@ export class RenderQueue extends Resource {
 		// but store nothing, since the content belongs to a different URL than the key.
 		let discardContent = false;
 
+		// The browser's OWN verdict about the landed document, captured before the domain
+		// coercion below — "the page said noindex" and "the host is outside our allowlist"
+		// must not be conflated: only the former means the destination was inspected.
+		const inspectedNonIndexable = result.isIndexable === false;
+
 		// The domain allowlist runs BEFORE the outcome is resolved so a legacy result for a
 		// foreign host still infers 'non-indexable' the way the old chain coerced it.
 		try {
@@ -174,7 +179,7 @@ export class RenderQueue extends Resource {
 			// Only treat it as a redirect when the final URL canonicalizes to a DIFFERENT key.
 			// A target whose page URL collapses back to the same key (trailing slash, param
 			// reorder, encoding) is not a redirect — keep it under result.id and, crucially,
-			// do NOT delete its RenderTarget (which would drop it from the recurring rotation).
+			// do NOT delete its Target (which would drop it from the recurring rotation).
 			if (redirectKey !== result.id) {
 				const redirectPath = URL.parse(result.redirectedTo)?.pathname;
 				const landedOn = redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass;
@@ -186,7 +191,7 @@ export class RenderQueue extends Resource {
 				// could only be stored under a key it wasn't rendered for, so there is nothing to
 				// store — only scheduling to decide.
 				if (outcome === 'redirected') {
-					await this.processRedirectResult(result, { redirectKey, landedOn, redirectPath });
+					await this.processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable });
 					return;
 				}
 
@@ -194,8 +199,10 @@ export class RenderQueue extends Resource {
 				// produced a real page): keep the long-standing refile semantics.
 				if (outcome === 'rendered') {
 					if (landedOn === PRERENDER) {
+						// Retiring by URL takes the device siblings too — a page does not redirect
+						// for one device and serve for another.
 						logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-						await RenderTarget.delete(result.id);
+						await Target.delete(CacheKey.extractUrl(result.id));
 						cacheKey = redirectKey;
 					} else {
 						// The redirect target is a class we never serve from cache, so re-keying onto it
@@ -231,7 +238,8 @@ export class RenderQueue extends Resource {
 		}
 
 		if (outcome === 'rendered') {
-			const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
+			const url = CacheKey.extractUrl(cacheKey);
+			const renderTarget = await Target.get({ id: url, select: ['renderInterval', 'sitemapUrl', 'state'] });
 			const renderInterval = renderTarget?.renderInterval;
 
 			// Schedule the next render relative to when THIS one completed (now), not a
@@ -266,6 +274,13 @@ export class RenderQueue extends Resource {
 				// period). Refresh fromSitemap from the live target so it self-corrects if the
 				// URL has since left its sitemap.
 				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+
+				// A suppressed URL that rendered indexable again has healed — put it back in
+				// normal rotation, so the recheck cadence stops and discovery may see it again.
+				if (renderTarget.state === 'suppressed' && result.isIndexable === true) {
+					logger.warn(`Prerendered url ${url} is indexable again — lifting its suppression`);
+					await Target.reactivate(url);
+				}
 			} else {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
 				// row. Nothing sets a recurring cadence, so drop the schedule instead of
@@ -275,10 +290,10 @@ export class RenderQueue extends Resource {
 		} else if (outcome === 'non-indexable') {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
 			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
-			// render is broken", which read identically without it.
-			logger.warn(`Skipped prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
-			await RenderTarget.delete(cacheKey);
-			await this.markNonIndexable(CacheKey.extractUrl(cacheKey));
+			// render is broken", which read identically without it. The verdict SUPPRESSES the
+			// target (state + recheck schedule) rather than deleting it — see Target.suppress.
+			logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
+			await Target.suppress(CacheKey.extractUrl(cacheKey), { reason: result.reason });
 		} else {
 			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
 			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
@@ -291,7 +306,7 @@ export class RenderQueue extends Resource {
 			// A target-backed job is left to retry after its lease expires. But a one-off
 			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
 			// and re-render the failed job indefinitely — drop it instead.
-			const renderTarget = await RenderTarget.get({ id: cacheKey, select: 'cacheKey' });
+			const renderTarget = await Target.get({ id: CacheKey.extractUrl(cacheKey), select: 'url' });
 			if (!renderTarget) {
 				await RenderSchedule.delete(cacheKey);
 			}
@@ -307,7 +322,7 @@ export class RenderQueue extends Resource {
 	 * target of its own so it gets rendered under its own job context instead of being cached
 	 * from a render that ran as another URL.
 	 */
-	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath }) {
+	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable }) {
 		if (typeof result.renderTime === 'number') {
 			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
 		}
@@ -326,17 +341,23 @@ export class RenderQueue extends Resource {
 			return;
 		}
 
-		if (result.isIndexable === false) {
+		if (inspectedNonIndexable) {
 			// The landed document was actually loaded and inspected (a rendered-through
 			// client-side redirect) and it is non-indexable: the source now leads to a page we
-			// would never cache. Retire the source and remember the destination is dead, so
-			// neither keeps rendering.
+			// would never cache. Retire the source and suppress the destination, so neither
+			// keeps rendering at full cadence. (This keys on the browser's posted verdict, not
+			// the domain-coerced one — a foreign host was never inspected, and a suppressed
+			// foreign row would be registry noise nothing ever reads.)
 			logger.warn(
 				`Prerendered url ${result.id} redirected to non-indexable ${result.redirectedTo}` +
 					`${result.reason ? ` (${result.reason})` : ''} — retiring the target`
 			);
-			await RenderTarget.delete(result.id);
-			await this.markNonIndexable(CacheKey.extractUrl(redirectKey));
+			await Target.delete(CacheKey.extractUrl(result.id));
+			const destinationUrl = CacheKey.extractUrl(redirectKey);
+			const domain = URL.parse(destinationUrl)?.hostname;
+			if (!config.domains.length || config.domains.includes(domain)) {
+				await Target.suppress(destinationUrl, { reason: result.reason });
+			}
 			return;
 		}
 
@@ -352,31 +373,30 @@ export class RenderQueue extends Resource {
 			return;
 		}
 
-		// Permanent move onto a route we serve: retire the source — RenderTarget.delete drops its
-		// target, schedule, and cached page — and adopt the destination in its place. A mutual
-		// 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each hop is a
-		// navigation-only render surfaced by this warn, so a broken site costs noise, not settles.
+		// Permanent move onto a route we serve: retire the source — Target.delete drops the URL's
+		// row and every device's schedule and cached page — and adopt the destination in its
+		// place. A mutual 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each
+		// hop is a navigation-only render surfaced by this warn, so a broken site costs noise,
+		// not settles.
 		logger.warn(
 			`Prerendered url ${result.id} permanently redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 				`retiring the target in favor of ${redirectKey}`
 		);
-		const source = await RenderTarget.get({ id: result.id, select: ['renderInterval'] });
-		await RenderTarget.delete(result.id);
+		const sourceUrl = CacheKey.extractUrl(result.id);
+		const source = await Target.get({ id: sourceUrl, select: ['renderInterval'] });
+		await Target.delete(sourceUrl);
 
-		const existingTarget = await RenderTarget.get({ id: redirectKey, select: 'cacheKey' });
-		if (existingTarget) return; // already in the rotation under its own cadence
-
-		// Same gate the bot-traffic discovery applies: a host outside the allowlist can never be
-		// marked indexable, and a URL already proven non-indexable shouldn't be resurrected by a
-		// redirect pointing at it.
+		// An existing destination row — active OR suppressed — wins: active means it's already
+		// in rotation under its own cadence; suppressed means a render already proved it
+		// non-indexable, and a redirect pointing at it is no reason to resurrect it.
 		const destinationUrl = CacheKey.extractUrl(redirectKey);
+		const existingTarget = await Target.get({ id: destinationUrl, select: 'url' });
+		if (existingTarget) return;
+
+		// Same gate the bot-traffic discovery applies: a host outside the allowlist can never
+		// be marked indexable.
 		const domain = URL.parse(destinationUrl)?.hostname;
 		if (config.domains.length && !config.domains.includes(domain)) return;
-		const existingNonIndexable = await databases.signals.NonIndexable.get({
-			id: destinationUrl,
-			select: 'url',
-		});
-		if (existingNonIndexable) return;
 
 		// Due now, not jittered: adoptions arrive one per source render, already spread by the
 		// sources' own schedule jitter, and the source's cached page was just deleted — the
@@ -385,20 +405,7 @@ export class RenderQueue extends Resource {
 		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
 			target.renderInterval = source.renderInterval;
 		}
-		await RenderTarget.put(redirectKey, target);
-	}
-
-	/** Record the indexability verdict for a URL (idempotent, best-effort — a failed signal
-	 *  write must never fail the job result that carried it). */
-	static async markNonIndexable(url) {
-		try {
-			const existing = await databases.signals.NonIndexable.get({ id: url, select: 'url' });
-			if (!existing) {
-				await databases.signals.NonIndexable.put(url, { url });
-			}
-		} catch {
-			/* best-effort signal write */
-		}
+		await Target.put(destinationUrl, target);
 	}
 
 	/**
@@ -408,7 +415,10 @@ export class RenderQueue extends Resource {
 	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
 	 */
 	static async rescheduleRedirectSource(cacheKey) {
-		const renderTarget = await RenderTarget.get({ id: cacheKey, select: ['renderInterval', 'sitemapUrl'] });
+		const renderTarget = await Target.get({
+			id: CacheKey.extractUrl(cacheKey),
+			select: ['renderInterval', 'sitemapUrl'],
+		});
 		if (!renderTarget) {
 			await RenderSchedule.delete(cacheKey);
 			return;
@@ -466,7 +476,7 @@ export class RenderQueue extends Resource {
 			const expiresAt = currentMinuteMs(Date.now() + config.queue.jobLeaseTime);
 
 			// `fromSitemap` is denormalized onto the schedule, so the job can be built
-			// synchronously with no per-job RenderTarget read. Preserve it on the lease
+			// synchronously with no per-job Target read. Preserve it on the lease
 			// write (put replaces the record).
 			promises.push(
 				Promise.resolve(
