@@ -365,3 +365,14 @@ test('a client-side redirect landing on a 404 page retires the source and seeds 
 	assert.equal(stores.target.has(A), false, 'source retired — it leads to a page that is gone');
 	assert.equal(stores.target.get(B)?.suppressedReason, 'http-gone', 'destination suppressed under the gone class');
 });
+
+test('a BigInt strikes value (Harper numeric surfacing) still counts toward the slow lane', async () => {
+	const fast = config.render.failureRetry.fastRetries;
+	seedSource({ renderInterval: 3_600_000 });
+	stores.target.get(A).strikes = BigInt(fast); // Number.isFinite(BigInt) is false — must coerce first
+
+	await postResult(nonIndexable(503));
+
+	assert.equal(stores.target.get(A).strikes, fast + 1, 'BigInt count read correctly, not reset to 1');
+	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'transitioned to the slow lane');
+});

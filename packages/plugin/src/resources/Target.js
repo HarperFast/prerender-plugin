@@ -16,6 +16,17 @@ const {
 const TargetTable = databases.render_service.Target;
 
 /**
+ * A target's stored strike count, read defensively: coerce BEFORE the finite check, because
+ * Harper numeric columns can surface as BigInt (which `Number.isFinite` rejects outright —
+ * the same trap `resolveRenderInterval` guards for renderInterval), and `Number(null)` is 0,
+ * so an absent count correctly reads as zero rather than NaN.
+ */
+export const countedStrikes = (value) => {
+	const count = Number(value);
+	return Number.isFinite(count) && count > 0 ? count : 0;
+};
+
+/**
  * The URL registry — ONE row per URL (see schema.graphql). Device variants are not stored:
  * the devices a URL renders for are `config.deviceTypes.default` at write time, and `put`
  * fans out one RenderSchedule row per device. RenderSchedule and PrerenderedPage stay
@@ -146,7 +157,7 @@ export class Target extends TargetTable {
 			id: url,
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode'],
 		});
-		const strikes = (Number.isFinite(existing?.strikes) ? Number(existing.strikes) : 0) + 1;
+		const strikes = countedStrikes(existing?.strikes) + 1;
 
 		const maxStrikes = knobs.maxStrikes;
 		if (existing && Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {

@@ -6,7 +6,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
-import { Target } from './Target.js';
+import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
@@ -486,7 +486,7 @@ export class RenderQueue extends Resource {
 			await RenderSchedule.delete(cacheKey);
 			return;
 		}
-		const strikes = (Number.isFinite(renderTarget.strikes) ? Number(renderTarget.strikes) : 0) + 1;
+		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		const maxStrikes = config.render.redirects.maxStrikes;
 		if (Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
 			logger.warn(
@@ -526,7 +526,7 @@ export class RenderQueue extends Resource {
 			await RenderSchedule.delete(cacheKey);
 			return;
 		}
-		const strikes = (Number.isFinite(renderTarget.strikes) ? Number(renderTarget.strikes) : 0) + 1;
+		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		await Target.patch(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
