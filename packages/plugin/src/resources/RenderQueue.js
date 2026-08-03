@@ -4,7 +4,7 @@ import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { classifyPath, queryAllowlistFor, PRERENDER } from '../util/routeClass.js';
+import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { Target } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
@@ -245,11 +245,12 @@ export class RenderQueue extends Resource {
 			// Schedule the next render relative to when THIS one completed (now), not a
 			// fixed wall-clock time — so renders stay spread across the interval instead of
 			// realigning into a daily herd, and the cadence self-paces to fleet throughput.
-			// The per-target renderInterval drives the recurring cadence; fall back to the
-			// default when a target exists without a valid interval (a bare number check also
-			// rejects NaN from an arbitrary API PUT).
-			const interval =
-				Number.isFinite(renderInterval) && renderInterval > 0 ? renderInterval : config.render.defaultInterval;
+			// Cadence precedence: matched route's renderInterval, else the target's stored
+			// interval (sitemap changefreq / explicit API write; invalid values — including
+			// NaN from an arbitrary API PUT — are rejected), else the default. Resolved here
+			// on every cycle, so a route-cadence config change applies on each URL's next
+			// render without touching stored rows.
+			const interval = resolveRenderInterval(url, renderInterval);
 			// The cached page expires when the next render is due; the swrTtl window then keeps
 			// it served while the re-render lands, so render latency up to swrTtl never causes
 			// a cache miss.
@@ -415,18 +416,17 @@ export class RenderQueue extends Resource {
 	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
 	 */
 	static async rescheduleRedirectSource(cacheKey) {
+		const sourceUrl = CacheKey.extractUrl(cacheKey);
 		const renderTarget = await Target.get({
-			id: CacheKey.extractUrl(cacheKey),
+			id: sourceUrl,
 			select: ['renderInterval', 'sitemapUrl'],
 		});
 		if (!renderTarget) {
 			await RenderSchedule.delete(cacheKey);
 			return;
 		}
-		const interval =
-			Number.isFinite(renderTarget.renderInterval) && renderTarget.renderInterval > 0
-				? renderTarget.renderInterval
-				: config.render.defaultInterval;
+		// Same cadence resolution as the post-render path above (route > stored > default).
+		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		await RenderSchedule.put(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,

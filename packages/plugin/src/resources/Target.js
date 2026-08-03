@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { CacheKey } from '../util/cacheKey.js';
+import { resolveRenderInterval } from '../util/routeClass.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
@@ -47,8 +48,6 @@ const deviceTypes = () => config.deviceTypes.default;
 /** Every cacheKey a URL's row implies (one per configured device). */
 export const cacheKeysOf = (url) => deviceTypes().map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
 
-const validInterval = (value) => (Number.isFinite(value) && value > 0 ? value : config.render.defaultInterval);
-
 export class Target extends TargetTable {
 	async put(data, target) {
 		const url = this.getId();
@@ -74,9 +73,11 @@ export class Target extends TargetTable {
 
 		// Absent a valid explicit time, jitter the first render across the interval — keyed
 		// off the URL, so bulk-created targets don't all come due at once and a URL's device
-		// variants share one slot. Target is API-exposed, so validate the numbers (reject
-		// negatives / NaN / non-numbers) rather than trust the payload.
-		const interval = validInterval(data.renderInterval);
+		// variants share one slot. The jitter window is the same cadence the reschedule loop
+		// will resolve (route > stored > default), so the initial spread matches the recurring
+		// one. Target is API-exposed and resolveRenderInterval validates the stored number
+		// (rejects negatives / NaN / non-numbers) rather than trusting the payload.
+		const interval = resolveRenderInterval(url, data.renderInterval);
 		const fromSitemap = !!data.sitemapUrl;
 		for (const cacheKey of cacheKeysOf(url)) {
 			await RenderSchedule.put(cacheKey, {

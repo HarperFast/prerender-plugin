@@ -77,7 +77,28 @@ const compileEntry = (raw, source, warn) => {
 		queryParams = Array.isArray(raw.queryParams) ? raw.queryParams.slice() : [];
 	}
 
-	return { match: raw.match, path: raw.path, mode, queryParams, source };
+	// Optional per-route render cadence (ms). A bad value drops the FIELD, never the route —
+	// rejecting the whole entry over a cadence typo would silently change how the path is
+	// SERVED (prerender → unclassified), a far worse failure than falling back to the
+	// default interval.
+	let renderInterval = null;
+	if (raw.renderInterval !== undefined) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring renderInterval on passthrough route "${raw.match} ${raw.path}" — a passthrough route is ` +
+					`never scheduled, so it has no render cadence`
+			);
+		} else if (Number.isFinite(raw.renderInterval) && raw.renderInterval > 0) {
+			renderInterval = raw.renderInterval;
+		} else {
+			warn(
+				`ignoring renderInterval on route "${raw.match} ${raw.path}" — expected a positive number of ` +
+					`milliseconds, got ${JSON.stringify(raw.renderInterval)}`
+			);
+		}
+	}
+
+	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, source };
 };
 
 /**
@@ -232,3 +253,26 @@ export const classifyUrl = (rawUrl) => {
  * `classifyUrl` once instead of this plus a separate classification.
  */
 export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
+
+/**
+ * The render cadence for a URL: the matched route's `renderInterval` when it sets one, else
+ * the target's stored interval (sitemap `<changefreq>` or an explicit API write), else
+ * `render.defaultInterval`.
+ *
+ * ROUTE BEATS STORED, deliberately. The stored interval is data written at creation time;
+ * if it won, changing a route's cadence would apply only to targets discovered AFTER the
+ * config change — every existing row would keep its stamped value forever, and making config
+ * apply would mean sweeping the whole registry. Route-first makes a cadence change take
+ * effect on each URL's next render cycle with no data migration. The expressiveness lost is
+ * none: a per-URL exception to a route's cadence is an `exact` route above it (first match
+ * wins), and a route that should defer to sitemap `<changefreq>` simply doesn't set
+ * `renderInterval`.
+ *
+ * Same contract as `classifyUrl`: `url` is a device-free public URL (the Target primary key
+ * / the url-half of a cacheKey).
+ */
+export const resolveRenderInterval = (url, storedInterval) => {
+	const { entry } = classifyUrl(url);
+	if (entry && entry.renderInterval !== null && entry.renderInterval !== undefined) return entry.renderInterval;
+	return Number.isFinite(storedInterval) && storedInterval > 0 ? storedInterval : config.render.defaultInterval;
+};

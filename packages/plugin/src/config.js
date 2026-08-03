@@ -61,11 +61,27 @@ const defaultConfig = () => ({
 		defaultProtocol: 'https',
 		// Ordered route list. Each entry is
 		//   { match: 'exact' | 'prefix' | 'contains', path: string,
-		//     mode?: 'prerender' | 'passthrough', queryParams?: string[] }
+		//     mode?: 'prerender' | 'passthrough', queryParams?: string[],
+		//     renderInterval?: number }
 		//
 		// FIRST MATCH WINS, so order most-specific first. That ordering is what lets a
 		// passthrough carve-out sit inside a prerendered prefix (`/products/clearance/`
 		// above `/products/`) without a second list and a precedence rule.
+		//
+		// `renderInterval` (ms, prerender routes only) sets the render cadence for every URL
+		// the route matches. Precedence: route > the target's stored interval (sitemap
+		// `<changefreq>` or an explicit API write) > `render.defaultInterval` — resolved at
+		// schedule time on every cycle, so changing it here takes effect on each URL's next
+		// render with no data migration (see resolveRenderInterval in util/routeClass.js).
+		// A per-URL exception is an `exact` route ordered above its class (e.g. the homepage
+		// `exact /` at 2h above a 6h section prefix); a route that should defer to sitemap
+		// changefreq simply doesn't set one.
+		//
+		// OPERATIONAL NOTE: if the CDN edge-caches a route's responses with a fixed TTL from
+		// its own property settings (not from our response headers), that TTL and the route's
+		// renderInterval must be kept aligned BY HAND — rendering much faster than the edge
+		// TTL burns renders the edge never serves, and much slower means the edge re-fetches
+		// stale content. Neither side can see the other drift.
 		//
 		// `mode` (default 'prerender') decides the class — see util/routeClass.js:
 		//   prerender   — cache it, schedule it, serve it from cache. `queryParams` is its
@@ -233,10 +249,12 @@ const defaultConfig = () => ({
 	},
 
 	render: {
-		// How often a target is re-rendered. Cadence is relative to each render's
-		// completion (not a fixed time-of-day), and a target's first render is jittered
-		// across this interval — so the fleet renders as a smooth stream rather than a
-		// daily herd. Sitemap-derived targets override this per-URL from `changefreq`.
+		// How often a target is re-rendered when nothing more specific applies. Cadence is
+		// relative to each render's completion (not a fixed time-of-day), and a target's
+		// first render is jittered across its interval — so the fleet renders as a smooth
+		// stream rather than a daily herd. Full precedence, resolved at schedule time:
+		// matched route `renderInterval` (ingress.routes) > the target's stored interval
+		// (sitemap `changefreq` / explicit API write) > this default.
 		defaultInterval: DAY,
 
 		// What happens when a render proves a URL non-indexable (noindex, canonical

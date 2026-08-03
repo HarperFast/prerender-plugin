@@ -7,6 +7,7 @@ import {
 	matchRoute,
 	prerenderRouteCount,
 	queryAllowlistFor,
+	resolveRenderInterval,
 	PASSTHROUGH,
 	PRERENDER,
 	UNCLASSIFIED,
@@ -190,4 +191,74 @@ test('classifyUrl reports an unparseable URL as unclassified, keeping all params
 test('classifyUrl on an unparseable URL still yields the global allowlist in prefix mode', () => {
 	applyOptions({});
 	assert.deepEqual(classifyUrl('not-a-url').queryParams, config.url.queryParams);
+});
+
+// ---- per-route renderInterval ----
+
+const HOUR_MS = 3_600_000;
+
+test('route renderInterval: valid values kept, invalid values drop the FIELD but never the route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'exact', path: '/', renderInterval: 2 * HOUR_MS },
+				{ match: 'prefix', path: '/catalog/', renderInterval: -5 }, // invalid → field dropped
+				{ match: 'prefix', path: '/product/prd-', renderInterval: 'daily' }, // invalid → field dropped
+			],
+		},
+	});
+	assert.equal(matchRoute('/').renderInterval, 2 * HOUR_MS);
+	// The route still classifies (a cadence typo must not unroute a served path)…
+	assert.equal(classifyPath('/catalog/girls.jsp').routeClass, PRERENDER);
+	assert.equal(classifyPath('/product/prd-1').routeClass, PRERENDER);
+	// …it just carries no cadence.
+	assert.equal(matchRoute('/catalog/girls.jsp').renderInterval, null);
+	assert.equal(matchRoute('/product/prd-1').renderInterval, null);
+});
+
+test('route renderInterval is rejected on a passthrough route (never scheduled)', () => {
+	forwarded({
+		ingress: { routes: [{ match: 'prefix', path: '/help/', mode: 'passthrough', renderInterval: HOUR_MS }] },
+	});
+	const entry = matchRoute('/help/contact-us');
+	assert.equal(entry.mode, PASSTHROUGH);
+	assert.equal(entry.renderInterval, null);
+});
+
+test('resolveRenderInterval precedence: route > stored > default', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'exact', path: '/', renderInterval: 2 * HOUR_MS },
+				{ match: 'prefix', path: '/catalog/' }, // no cadence → defers to stored
+			],
+		},
+	});
+	const base = 'https://www.example.com';
+
+	// Route cadence beats a stored interval — this is what makes config changes retroactive.
+	assert.equal(resolveRenderInterval(`${base}/`, 24 * HOUR_MS), 2 * HOUR_MS);
+	// A route without a cadence defers to the stored (sitemap changefreq / API) value…
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, 6 * HOUR_MS), 6 * HOUR_MS);
+	// …and to the default when nothing is stored or the stored value is unusable.
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, null), config.render.defaultInterval);
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, NaN), config.render.defaultInterval);
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, -1), config.render.defaultInterval);
+	// An unmatched path behaves as before: stored else default.
+	assert.equal(resolveRenderInterval(`${base}/unrouted`, 5 * HOUR_MS), 5 * HOUR_MS);
+	assert.equal(resolveRenderInterval(`${base}/unrouted`, 0), config.render.defaultInterval);
+});
+
+test('a per-URL cadence exception is an exact route above its class prefix', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'exact', path: '/catalog/hot-deals.jsp', renderInterval: HOUR_MS },
+				{ match: 'prefix', path: '/catalog/', renderInterval: 6 * HOUR_MS },
+			],
+		},
+	});
+	const base = 'https://www.example.com';
+	assert.equal(resolveRenderInterval(`${base}/catalog/hot-deals.jsp`, null), HOUR_MS);
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, null), 6 * HOUR_MS);
 });

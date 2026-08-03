@@ -215,9 +215,11 @@ async function handlePageScheduling(resource) {
 			if (!existingTarget) {
 				// No explicit time → Target.put jitters the first render across the interval,
 				// so a crawl that discovers many URLs at once doesn't stampede.
-				await Target.put(canonicalUrl, {
-					renderInterval: config.render.defaultInterval,
-				});
+				// Deliberately NO renderInterval: cadence is resolved at schedule time
+				// (route > stored > default — see resolveRenderInterval). Stamping the
+				// default here would freeze creation-time config into the row, which is
+				// exactly what made interval config changes non-retroactive.
+				await Target.put(canonicalUrl, {});
 			}
 		}
 	} catch (e) {
