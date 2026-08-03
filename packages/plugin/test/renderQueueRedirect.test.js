@@ -472,3 +472,60 @@ test('a legacy non-indexable result (no outcome field) still suppresses', async 
 
 	assert.equal(stores.target.get(A)?.state, 'suppressed');
 });
+
+// ---- redirect strikes (a source that keeps redirecting is retired) ----
+
+test('a temp redirect strikes the source but keeps it (and its cached page) below maxStrikes', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
+
+	const target = stores.target.get(A);
+	assert.ok(target, 'source survives a first temp redirect');
+	assert.equal(target.strikes, 1, 'but the strike is recorded');
+	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'cached page keeps serving');
+	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'retry scheduled at cadence');
+});
+
+test('maxStrikes consecutive temp redirects retire the source outright', async () => {
+	const max = config.render.redirects.maxStrikes;
+	seedSource();
+	stores.target.get(A).strikes = max - 1;
+
+	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
+
+	assert.equal(stores.target.has(A), false, 'source retired — the temporary status was a lie');
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule dropped`);
+		assert.equal(
+			stores.prerenderedPage.has(key(A, device)),
+			false,
+			`${device} page dropped (origin serves the redirect)`
+		);
+	}
+	assert.equal(stores.target.has(B), false, 'no adoption from a temp redirect');
+});
+
+test('a redirect onto an unserved route class strikes the source too', async () => {
+	config.ingress.mode = 'forwarded'; // only forwarded mode classifies unmatched paths as unserved
+	config.ingress.routes = [{ match: 'prefix', path: '/product/', mode: 'prerender' }];
+	const C = 'https://site.example.com/checkout/cart';
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: C });
+
+	const target = stores.target.get(A);
+	assert.ok(target, 'source kept — route list may just be incomplete');
+	assert.equal(target.strikes, 1, 'but the strike is recorded');
+});
+
+test('a successful render clears redirect strikes — only CONSECUTIVE redirects retire', async () => {
+	seedSource();
+	stores.target.get(A).strikes = 2;
+
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {}, renderTime: 10 },
+		'<html>fresh</html>'
+	);
+
+	assert.equal(stores.target.get(A).strikes, 0, 'strikes reset on success');
+	assert.notEqual(stores.target.get(A).state, 'suppressed');
+});

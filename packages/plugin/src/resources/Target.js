@@ -124,21 +124,34 @@ export class Target extends TargetTable {
 	 * cadence — the schedule IS the TTL. `maxStrikes` consecutive verdicts delete the target
 	 * outright; crawler re-discovery restarts the cycle at bounded cost.
 	 *
+	 * `statusCode` (when the verdict came from an HTTP error page) picks the knob set:
+	 * 404/410 use `render.suppression.gone` — fewer, further-apart rechecks, because "gone"
+	 * is the origin's most permanent verdict — and are stored as `http-gone` so the registry
+	 * distinguishes "page vanished" from "page errored". Callers must NOT route 401/403 here
+	 * (see RenderQueue.processJobResult); auth-shaped errors are a renderer/origin problem,
+	 * not a page verdict.
+	 *
 	 * Creates the row when absent (a render-now one-off or a redirect destination can be
 	 * proven non-indexable before anything targeted it). Deletes the cached pages either
 	 * way — stale content of a page that said "don't index me" must not keep serving.
 	 */
-	static async suppress(url, { reason } = {}) {
+	static async suppress(url, { reason, statusCode } = {}) {
+		// Only an http-error verdict classifies by status: a noindex/canonical verdict came
+		// from a document that rendered, so its status is not the statement being made.
+		const gone = reason === 'http-error' && (statusCode === 404 || statusCode === 410);
+		const knobs = gone ? config.render.suppression.gone : config.render.suppression;
+		const storedReason = gone ? 'http-gone' : (reason ?? null);
+
 		const existing = await Target.get({
 			id: url,
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode'],
 		});
 		const strikes = (Number.isFinite(existing?.strikes) ? Number(existing.strikes) : 0) + 1;
 
-		const maxStrikes = config.render.suppression.maxStrikes;
+		const maxStrikes = knobs.maxStrikes;
 		if (existing && Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
 			logger.warn(
-				`Prerender target ${url} non-indexable ${strikes} consecutive times (${reason ?? 'no reason'}) — deleting it`
+				`Prerender target ${url} non-indexable ${strikes} consecutive times (${storedReason ?? 'no reason'}) — deleting it`
 			);
 			await Target.delete(url); // drops schedules + pages too
 			return { deleted: true, strikes };
@@ -150,12 +163,12 @@ export class Target extends TargetTable {
 			schedulerNode: existing?.schedulerNode ?? getResidencyByUrl(url),
 			renderInterval: existing?.renderInterval ?? null,
 			state: 'suppressed',
-			suppressedReason: reason ?? null,
+			suppressedReason: storedReason,
 			suppressedAt: Date.now(),
 			strikes,
 		});
 
-		const recheckAt = currentMinuteMs() + config.render.suppression.recheckInterval;
+		const recheckAt = currentMinuteMs() + knobs.recheckInterval;
 		await Promise.all(
 			cacheKeysOf(url).flatMap((cacheKey) => [
 				RenderSchedule.put(cacheKey, { nextRenderTime: recheckAt, fromSitemap: !!existing?.sitemapUrl }),

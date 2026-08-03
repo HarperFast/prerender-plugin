@@ -239,7 +239,10 @@ export class RenderQueue extends Resource {
 
 		if (outcome === 'rendered') {
 			const url = CacheKey.extractUrl(cacheKey);
-			const renderTarget = await Target.get({ id: url, select: ['renderInterval', 'sitemapUrl', 'state'] });
+			const renderTarget = await Target.get({
+				id: url,
+				select: ['renderInterval', 'sitemapUrl', 'state', 'strikes'],
+			});
 			const renderInterval = renderTarget?.renderInterval;
 
 			// Schedule the next render relative to when THIS one completed (now), not a
@@ -281,6 +284,12 @@ export class RenderQueue extends Resource {
 				if (renderTarget.state === 'suppressed' && result.isIndexable === true) {
 					logger.warn(`Prerendered url ${url} is indexable again — lifting its suppression`);
 					await Target.reactivate(url);
+				} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
+					// Strikes are CONSECUTIVE failures by definition: a successful render resets the
+					// count, so redirect blips months apart never accumulate toward retirement.
+					// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
+					// extra write.
+					await Target.patch(url, { strikes: 0 });
 				}
 			} else {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
@@ -292,9 +301,37 @@ export class RenderQueue extends Resource {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
 			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
 			// render is broken", which read identically without it. The verdict SUPPRESSES the
-			// target (state + recheck schedule) rather than deleting it — see Target.suppress.
-			logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
-			await Target.suppress(CacheKey.extractUrl(cacheKey), { reason: result.reason });
+			// target (state + recheck schedule) rather than deleting it — see Target.suppress,
+			// which also grades http-error verdicts by status (404/410 recheck less, die sooner).
+			//
+			// EXCEPT 401/403: an auth-shaped error is almost never a statement about the page —
+			// it's a broken renderer credential, an origin bot-mitigation rule change, or an
+			// origin auth outage. Striking on it would suppress (and after maxStrikes DELETE)
+			// swathes of healthy targets exactly when such a failure hits everything at once.
+			// Keep the target, keep its cached page, reschedule at normal cadence, log loudly.
+			if (result.statusCode === 401 || result.statusCode === 403) {
+				logger.error(
+					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
+						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
+				);
+				await this.rescheduleAtTargetCadence(cacheKey);
+			} else if (result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500) {
+				// Transient-shaped: the origin failed to serve the page, it didn't disavow it.
+				// Suppressing would delete the last good cached page and count a strike toward
+				// deletion over what may be one bad minute at the origin — keep both, retry at
+				// the target's normal cadence, and let a persistent failure surface as noise
+				// here rather than as silently vanished targets.
+				logger.warn(
+					`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page, retrying at normal cadence`
+				);
+				await this.rescheduleAtTargetCadence(cacheKey);
+			} else {
+				logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
+				await Target.suppress(CacheKey.extractUrl(cacheKey), {
+					reason: result.reason,
+					statusCode: result.statusCode,
+				});
+			}
 		} else {
 			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
 			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
@@ -328,17 +365,38 @@ export class RenderQueue extends Resource {
 			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
 		}
 
+		// Same status rules as processJobResult, applied BEFORE anything retires or strikes
+		// the source. Only a rendered-through client-side redirect can carry these statuses
+		// (a bail-at-nav result posts the first hop's 3xx), so `statusCode` here is the LANDED
+		// document's: an auth-shaped or transient-shaped landing is a credential/origin
+		// problem, not a verdict on either URL. Without this, a page whose client-side
+		// redirect lands on a 401/403 would delete its source target on the FIRST such result
+		// (via the inspectedNonIndexable branch below) — the exact mass-deletion the
+		// processJobResult guard exists to prevent.
+		const authShaped = result.statusCode === 401 || result.statusCode === 403;
+		const transientShaped = result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500;
+		if (authShaped || transientShaped) {
+			logger[authShaped ? 'error' : 'warn'](
+				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
+					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target and retrying at its normal cadence`
+			);
+			await this.rescheduleAtTargetCadence(result.id);
+			return;
+		}
+
 		if (landedOn !== PRERENDER) {
 			// The destination is a class we never serve from cache — adopting it would file
-			// renders where no read looks, and deleting the source would end its rendering for
-			// good on evidence as weak as an incomplete route list. Keep the source and retry at
-			// its normal cadence; the retry now costs a navigation, not a full settle.
+			// renders where no read looks, and deleting the source on ONE such result would end
+			// its rendering on evidence as weak as an incomplete route list. Keep the source and
+			// retry at its normal cadence (the retry costs a navigation, not a full settle) —
+			// but count the strike: a source that answers this way every interval is de facto
+			// permanently redirected, and recordRedirectStrike retires it after maxStrikes.
 			logger.warn(
 				`Prerendered url ${result.id} redirected (${result.statusCode}) to ${result.redirectedTo}, which is ` +
 					`${landedOn} — keeping the target (no key to schedule the destination under)`
 			);
 			recordUnroutedPath(landedOn, redirectPath, 'redirect');
-			await this.rescheduleRedirectSource(result.id);
+			await this.recordRedirectStrike(result.id, `to unserved ${landedOn} destination`);
 			return;
 		}
 
@@ -356,8 +414,10 @@ export class RenderQueue extends Resource {
 			await Target.delete(CacheKey.extractUrl(result.id));
 			const destinationUrl = CacheKey.extractUrl(redirectKey);
 			const domain = URL.parse(destinationUrl)?.hostname;
+			// Auth-shaped and transient statuses never reach here (guarded above), so this
+			// suppression is a genuine content/gone verdict about the destination.
 			if (!config.domains.length || config.domains.includes(domain)) {
-				await Target.suppress(destinationUrl, { reason: result.reason });
+				await Target.suppress(destinationUrl, { reason: result.reason, statusCode: result.statusCode });
 			}
 			return;
 		}
@@ -365,12 +425,15 @@ export class RenderQueue extends Resource {
 		if (result.statusCode !== 301 && result.statusCode !== 308) {
 			// No proof of permanence (302/303/307 — failover, geo bounce, outage page — or a
 			// client-side redirect's 200). The source is expected to come back — keep its target
-			// AND its cached page, and look again next interval.
+			// AND its cached page, and look again next interval. But a source that answers with
+			// a temp redirect EVERY interval is a permanent redirect wearing a temporary status:
+			// each result costs a strike and recordRedirectStrike retires the source after
+			// maxStrikes rather than paying a navigation every interval forever.
 			logger.warn(
 				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
 			);
-			await this.rescheduleRedirectSource(result.id);
+			await this.recordRedirectStrike(result.id, `temporary ${result.statusCode} to ${result.redirectedTo}`);
 			return;
 		}
 
@@ -410,17 +473,53 @@ export class RenderQueue extends Resource {
 	}
 
 	/**
+	 * A redirect result that keeps its source in rotation still costs a strike: one temp
+	 * redirect is failover noise, but `render.redirects.maxStrikes` consecutive ones mean the
+	 * "temporary" status is a lie (or the route list will never serve the destination) and the
+	 * source is retired outright. Retiring is safe, not destructive — bot traffic for the URL
+	 * proxies to the origin, which serves its own redirect, and on-demand discovery re-creates
+	 * whatever the origin actually serves. The strike counter is the target's one shared
+	 * `strikes` field (suppression uses it too); any successful render clears it.
+	 */
+	static async recordRedirectStrike(cacheKey, why) {
+		const sourceUrl = CacheKey.extractUrl(cacheKey);
+		// One read serves both the strike decision and the reschedule below.
+		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		if (!renderTarget) {
+			await RenderSchedule.delete(cacheKey);
+			return;
+		}
+		const strikes = (Number.isFinite(renderTarget.strikes) ? Number(renderTarget.strikes) : 0) + 1;
+		const maxStrikes = config.render.redirects.maxStrikes;
+		if (Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
+			logger.warn(
+				`Prerendered url ${sourceUrl} kept redirecting ${strikes} consecutive times (${why}) — retiring it; ` +
+					`bots get the origin's own redirect and discovery re-creates what it actually serves`
+			);
+			await Target.delete(sourceUrl); // drops schedules + pages too
+			return;
+		}
+		await Target.patch(sourceUrl, { strikes });
+		await this.rescheduleAtTargetCadence(cacheKey, renderTarget);
+	}
+
+	/**
 	 * Keep a redirecting source in its rotation. Mirrors the post-render scheduling in
 	 * processJobResult: a target-backed key comes due one interval from completion (so cadence
 	 * self-paces instead of realigning into a herd); a targetless key (render-now one-off,
 	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
+	 *
+	 * `preloaded` (a row already read with at least renderInterval + sitemapUrl, e.g. by
+	 * recordRedirectStrike) skips the point read.
 	 */
-	static async rescheduleRedirectSource(cacheKey) {
+	static async rescheduleAtTargetCadence(cacheKey, preloaded) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
-		const renderTarget = await Target.get({
-			id: sourceUrl,
-			select: ['renderInterval', 'sitemapUrl'],
-		});
+		const renderTarget =
+			preloaded ??
+			(await Target.get({
+				id: sourceUrl,
+				select: ['renderInterval', 'sitemapUrl'],
+			}));
 		if (!renderTarget) {
 			await RenderSchedule.delete(cacheKey);
 			return;

@@ -258,13 +258,40 @@ const defaultConfig = () => ({
 		defaultInterval: DAY,
 
 		// What happens when a render proves a URL non-indexable (noindex, canonical
-		// mismatch, redirect loop). The target is not deleted — it is marked
-		// `state: suppressed` and rescheduled at `recheckInterval`, so the verdict
+		// mismatch, redirect loop, HTTP error page). The target is not deleted — it is
+		// marked `state: suppressed` and rescheduled at `recheckInterval`, so the verdict
 		// re-proves (or heals) itself on cadence, and discovery stops re-creating it.
 		// `maxStrikes` consecutive non-indexable verdicts delete the target outright;
 		// crawler re-discovery restarts the cycle at bounded cost.
+		//
+		// Verdicts are not all equally permanent, so the knobs split by HTTP status:
+		//   - 404/410 (`gone`): the origin's strongest statement that the page no longer
+		//     exists. Rechecking it on the default cadence is almost pure waste, so it gets
+		//     fewer, further-apart rechecks before deletion.
+		//   - 401/403 never suppress at all (see RenderQueue): an auth-shaped error is far
+		//     more likely a broken renderer credential or an origin rule change than a page
+		//     verdict, and striking on it would mass-delete healthy targets during an outage.
+		//   - 408/429/5xx never suppress either (see RenderQueue): the origin failed to serve
+		//     the page, it didn't disavow it — the target and its cached page both survive and
+		//     the render just retries at its normal cadence.
 		suppression: {
 			recheckInterval: 7 * DAY,
+			maxStrikes: 4,
+			gone: {
+				recheckInterval: 14 * DAY,
+				maxStrikes: 2,
+			},
+		},
+
+		// A redirect that proves nothing permanent (302/303/307, a client-side redirect's
+		// 200, or any redirect onto a route class we don't serve) keeps the source target on
+		// the theory the page is coming back. A source that answers that way EVERY interval
+		// is de facto permanent, so each such result counts a strike (the same shared
+		// counter suppression uses; any successful render clears it) and `maxStrikes`
+		// consecutive ones retire the source outright. Retiring is safe, not destructive:
+		// bot traffic for the URL is proxied to the origin — which serves the redirect
+		// itself — and on-demand discovery re-creates whatever the origin actually serves.
+		redirects: {
 			maxStrikes: 4,
 		},
 
