@@ -82,7 +82,9 @@ const compileEntry = (raw, source, warn) => {
 	// SERVED (prerender → unclassified), a far worse failure than falling back to the
 	// default interval.
 	let renderInterval = null;
-	if (raw.renderInterval !== undefined) {
+	// `null` is treated as "not set", not as a bad value — it's the conventional way to
+	// explicitly clear a setting, so it shouldn't warn.
+	if (raw.renderInterval !== undefined && raw.renderInterval !== null) {
 		if (mode === PASSTHROUGH) {
 			warn(
 				`ignoring renderInterval on passthrough route "${raw.match} ${raw.path}" — a passthrough route is ` +
@@ -91,9 +93,11 @@ const compileEntry = (raw, source, warn) => {
 		} else if (Number.isFinite(raw.renderInterval) && raw.renderInterval > 0) {
 			renderInterval = raw.renderInterval;
 		} else {
+			// String(), not JSON.stringify(): the latter THROWS on a BigInt, and a warning
+			// path must never be able to crash config compilation.
 			warn(
 				`ignoring renderInterval on route "${raw.match} ${raw.path}" — expected a positive number of ` +
-					`milliseconds, got ${JSON.stringify(raw.renderInterval)}`
+					`milliseconds, got ${String(raw.renderInterval)}`
 			);
 		}
 	}
@@ -274,5 +278,10 @@ export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
 export const resolveRenderInterval = (url, storedInterval) => {
 	const { entry } = classifyUrl(url);
 	if (entry && entry.renderInterval !== null && entry.renderInterval !== undefined) return entry.renderInterval;
-	return Number.isFinite(storedInterval) && storedInterval > 0 ? storedInterval : config.render.defaultInterval;
+	// Coerce before the finite check: `Long` columns can surface the stored interval as a
+	// BigInt, which `Number.isFinite` rejects outright — without this, every such target
+	// would silently fall back to the default cadence. `Number(null)` is 0 and
+	// `Number(undefined)` is NaN, so absent values still fall through to the default.
+	const stored = Number(storedInterval);
+	return Number.isFinite(stored) && stored > 0 ? stored : config.render.defaultInterval;
 };

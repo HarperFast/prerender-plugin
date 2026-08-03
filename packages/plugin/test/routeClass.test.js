@@ -247,6 +247,14 @@ test('resolveRenderInterval precedence: route > stored > default', () => {
 	// An unmatched path behaves as before: stored else default.
 	assert.equal(resolveRenderInterval(`${base}/unrouted`, 5 * HOUR_MS), 5 * HOUR_MS);
 	assert.equal(resolveRenderInterval(`${base}/unrouted`, 0), config.render.defaultInterval);
+	// A `Long` column can surface the stored interval as BigInt — it must still count.
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, BigInt(6 * HOUR_MS)), 6 * HOUR_MS);
+});
+
+test('renderInterval: null on a route entry means "not set" — no warning, defers to stored', () => {
+	forwarded({ ingress: { routes: [{ match: 'prefix', path: '/catalog/', renderInterval: null }] } });
+	assert.equal(matchRoute('/catalog/girls.jsp').renderInterval, null);
+	assert.equal(resolveRenderInterval('https://www.example.com/catalog/girls.jsp', HOUR_MS), HOUR_MS);
 });
 
 test('a per-URL cadence exception is an exact route above its class prefix', () => {
