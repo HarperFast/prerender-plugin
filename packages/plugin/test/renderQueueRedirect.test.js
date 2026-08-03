@@ -297,6 +297,44 @@ test('outcome=rendered stores the page and reschedules', async () => {
 	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'rescheduled one interval out');
 });
 
+// ---- route-typed render cadence ----
+
+const HOUR_MS = 3_600_000;
+
+test('outcome=rendered reschedules at the matched route renderInterval, beating the stored one', async () => {
+	config.ingress.routes = [{ match: 'prefix', path: '/product/', renderInterval: 6 * HOUR_MS }];
+	seedSource({ renderInterval: 24 * HOUR_MS });
+	const before = Date.now();
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>fresh</html>'
+	);
+
+	const schedule = stores.renderSchedule.get(key(A));
+	// ≈ now + 6h (minute-floored), NOT now + the stored 24h — route cadence is retroactive.
+	assert.ok(schedule.nextRenderTime >= before + 6 * HOUR_MS - 60_000, 'due no earlier than ~6h out');
+	assert.ok(schedule.nextRenderTime < before + 7 * HOUR_MS, 'stored 24h interval must not win');
+	assert.equal(
+		stores.prerenderedPage.get(key(A)).expiresAt,
+		schedule.nextRenderTime,
+		'page expiry stays coupled to the next render'
+	);
+});
+
+test('outcome=rendered keeps the stored interval when the matched route sets no cadence', async () => {
+	config.ingress.routes = [{ match: 'prefix', path: '/product/' }];
+	seedSource({ renderInterval: 2 * HOUR_MS });
+	const before = Date.now();
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>fresh</html>'
+	);
+
+	const schedule = stores.renderSchedule.get(key(A));
+	assert.ok(schedule.nextRenderTime >= before + 2 * HOUR_MS - 60_000, 'stored cadence still drives');
+	assert.ok(schedule.nextRenderTime < before + 3 * HOUR_MS, 'default must not win over a valid stored interval');
+});
+
 test('outcome=rendered with a landed URL that keys elsewhere keeps the refile semantics', async () => {
 	seedSource();
 	await postResult(

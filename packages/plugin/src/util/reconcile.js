@@ -36,6 +36,7 @@ import { CacheKey } from './cacheKey.js';
 import { fnv1a32 } from './hash.js';
 import { getResidencyByUrl } from './residency.js';
 import { getInitialRenderTime } from './time.js';
+import { resolveRenderInterval } from './routeClass.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread.
@@ -107,11 +108,11 @@ export const reconcileSchedules = async ({
 			// render herd. This is the same value the original `Target.put` would have written,
 			// so a repaired target rejoins the rotation exactly where it belonged.
 			//
-			// `Long` columns can arrive as BigInt, which `Number.isFinite` rejects outright, so
-			// coerce before handing it over. No range check is needed here: the callee guards
-			// `Number.isFinite(interval) && interval > 0`, so a NON-POSITIVE value falls back to
-			// the default too — `Number(null)` is 0, which that guard rejects.
-			nextRenderTime: getInitialRenderTime(cacheKey, Number(target.renderInterval)),
+			// Cadence resolved the same way Target.put would (route > stored > default), so a
+			// repaired row rejoins the rotation exactly where a fresh one would land. The
+			// resolver owns the numeric guards — BigInt from a `Long` column is coerced,
+			// null/NaN/non-positive fall back to the default.
+			nextRenderTime: getInitialRenderTime(cacheKey, resolveRenderInterval(target.url, target.renderInterval)),
 			fromSitemap: !!target.sitemapUrl,
 		});
 		stats.restored++;
