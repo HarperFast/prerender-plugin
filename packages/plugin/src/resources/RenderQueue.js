@@ -511,9 +511,11 @@ export class RenderQueue extends Resource {
 	 *
 	 *   SLOW — after `fastRetries` consecutive failures this is not a blip: drop to the
 	 *   target's normal cadence so a persistently failing page can't hot-loop renders all
-	 *   day, and push the kept page's `expiresAt` out to that retry so bots keep getting the
-	 *   last good render instead of falling through to a failing origin (a cadence-sized
-	 *   wait is far beyond swrTtl).
+	 *   day. The kept page's expiry is deliberately NOT extended: `swrTtl` is the product
+	 *   bound on how stale we serve as if fresh, and past it bots fall through to the
+	 *   origin — whose answer (a live page for auth-shaped failures, an honest 5xx for
+	 *   transient ones) is the truth. Serving arbitrarily old snapshots while users get
+	 *   errors would break bot/user parity.
 	 *
 	 * Strikes are the target's one shared counter (suppression and redirect strikes use it
 	 * too); any successful render clears it. A targetless key (render-now one-off) has its
@@ -536,16 +538,8 @@ export class RenderQueue extends Resource {
 
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const nextRenderTime = currentMinuteMs() + interval;
-		logger.warn(`Retrying ${cacheKey} at its normal cadence (failure strike ${strikes}) — extending the cached page`);
+		logger.warn(`Retrying ${cacheKey} at its normal cadence (failure strike ${strikes})`);
 		await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
-		// Guarded by a point read: patch on a missing row would materialize a content-less
-		// page record that the serving path could then try to serve. ARRAY select on purpose —
-		// it builds a record (truthy for any existing row); a string select returns the bare
-		// scalar, which is exactly the projection trap that has bitten twice before.
-		const page = await databases.page_cache.PrerenderedPage.get({ id: cacheKey, select: ['cacheKey'] });
-		if (page) {
-			await databases.page_cache.PrerenderedPage.patch(cacheKey, { expiresAt: nextRenderTime });
-		}
 	}
 
 	/**

@@ -258,10 +258,11 @@ for (const statusCode of [408, 429, 500, 503]) {
 	});
 }
 
-test('past fastRetries, a failure drops to the target cadence and extends the cached page', async () => {
+test('past fastRetries, a failure drops to the target cadence — page kept but its expiry untouched', async () => {
 	const fast = config.render.failureRetry.fastRetries;
 	seedSource({ renderInterval: 3_600_000 });
 	stores.target.get(A).strikes = fast; // this failure is strike fast+1 — first slow-lane one
+	stores.prerenderedPage.get(key(A)).expiresAt = 777; // sentinel: must not be rewritten
 
 	await postResult(nonIndexable(503));
 
@@ -275,19 +276,11 @@ test('past fastRetries, a failure drops to the target cadence and extends the ca
 
 	const page = stores.prerenderedPage.get(key(A));
 	assert.equal(page.content, 'old html', 'page survives');
-	assert.equal(page.expiresAt, schedule.nextRenderTime, 'expiresAt extended to the retry, so bots never fall through');
-});
-
-test('the slow lane does not materialize a page row where none exists', async () => {
-	const fast = config.render.failureRetry.fastRetries;
-	seedSource();
-	stores.target.get(A).strikes = fast;
-	stores.prerenderedPage.delete(key(A)); // desktop page missing (mobile still cached)
-
-	await postResult(nonIndexable(500));
-
-	assert.equal(stores.prerenderedPage.has(key(A)), false, 'no content-less page record created');
-	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'still rescheduled at cadence');
+	assert.equal(
+		page.expiresAt,
+		777,
+		'expiry deliberately NOT extended — swrTtl bounds staleness; past it, origin is the truth'
+	);
 });
 
 // ---- content verdicts stay on the default knobs ----

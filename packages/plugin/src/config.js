@@ -288,11 +288,13 @@ const defaultConfig = () => ({
 		// job's claim lease in place, so the retry comes on lease expiry
 		// (`queue.jobLeaseTime`, minutes) — an origin blip recovers fast, and the cached
 		// page's stale-while-revalidate window covers bots throughout. From the next strike
-		// on, the retry drops to the target's normal cadence — a persistently failing page
-		// must not hot-loop 100+ renders a day — and the kept page's `expiresAt` is pushed
-		// out to that retry, so bots keep getting the last good render instead of falling
-		// through to a failing origin. Strikes are the target's one shared counter; any
-		// successful render clears it.
+		// on, the retry drops to the target's normal cadence: a persistently failing page
+		// must not hot-loop 100+ renders a day. Past `page.swrTtl` the kept page stops
+		// serving and bots fall through to the origin on purpose — its answer (a live page
+		// for auth-shaped failures, an honest 5xx for transient ones) is the truth, and
+		// serving arbitrarily old snapshots while users get errors would break bot/user
+		// parity. Strikes are the target's one shared counter; any successful render
+		// clears it.
 		failureRetry: {
 			fastRetries: 2,
 		},
