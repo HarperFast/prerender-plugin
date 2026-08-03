@@ -285,7 +285,7 @@ test('a noindex verdict that happens to carry a 404 status is still classified g
 
 // ---- redirect destination ----
 
-test('a redirect landing on a 403 page does not seed a suppressed destination row', async () => {
+test('a client-side redirect landing on a 403 page keeps the source and seeds nothing', async () => {
 	seedSource();
 	await postResult({
 		id: key(A),
@@ -296,6 +296,42 @@ test('a redirect landing on a 403 page does not seed a suppressed destination ro
 		isIndexable: false,
 	});
 
-	assert.equal(stores.target.has(A), false, 'inspected non-indexable destination still retires the source');
+	const source = stores.target.get(A);
+	assert.ok(source, 'auth-shaped landing must NOT retire the source — a credential outage would mass-delete');
+	assert.notEqual(source.state, 'suppressed');
+	assert.ok(!source.strikes, 'no strike either');
+	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 	assert.equal(stores.target.has(B), false, 'auth-shaped destination must not become a suppressed row');
+});
+
+test('a client-side redirect landing on a 503 page keeps the source and seeds nothing', async () => {
+	seedSource();
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 503,
+		outcome: 'redirected',
+		redirectedTo: B,
+		isIndexable: false,
+	});
+
+	assert.ok(stores.target.get(A), 'transient landing must not retire the source');
+	assert.equal(stores.target.has(B), false, 'transient destination must not become a suppressed row');
+});
+
+test('a client-side redirect landing on a 404 page retires the source and seeds an http-gone destination', async () => {
+	// The genuine-verdict path the guard must NOT swallow: gone destinations still classify.
+	seedSource();
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 404,
+		outcome: 'redirected',
+		redirectedTo: B,
+		isIndexable: false,
+		reason: 'http-error',
+	});
+
+	assert.equal(stores.target.has(A), false, 'source retired — it leads to a page that is gone');
+	assert.equal(stores.target.get(B)?.suppressedReason, 'http-gone', 'destination suppressed under the gone class');
 });

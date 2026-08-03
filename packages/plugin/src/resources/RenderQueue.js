@@ -365,6 +365,25 @@ export class RenderQueue extends Resource {
 			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
 		}
 
+		// Same status rules as processJobResult, applied BEFORE anything retires or strikes
+		// the source. Only a rendered-through client-side redirect can carry these statuses
+		// (a bail-at-nav result posts the first hop's 3xx), so `statusCode` here is the LANDED
+		// document's: an auth-shaped or transient-shaped landing is a credential/origin
+		// problem, not a verdict on either URL. Without this, a page whose client-side
+		// redirect lands on a 401/403 would delete its source target on the FIRST such result
+		// (via the inspectedNonIndexable branch below) — the exact mass-deletion the
+		// processJobResult guard exists to prevent.
+		const authShaped = result.statusCode === 401 || result.statusCode === 403;
+		const transientShaped = result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500;
+		if (authShaped || transientShaped) {
+			logger[authShaped ? 'error' : 'warn'](
+				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
+					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target and retrying at its normal cadence`
+			);
+			await this.rescheduleAtTargetCadence(result.id);
+			return;
+		}
+
 		if (landedOn !== PRERENDER) {
 			// The destination is a class we never serve from cache — adopting it would file
 			// renders where no read looks, and deleting the source on ONE such result would end
@@ -395,10 +414,9 @@ export class RenderQueue extends Resource {
 			await Target.delete(CacheKey.extractUrl(result.id));
 			const destinationUrl = CacheKey.extractUrl(redirectKey);
 			const domain = URL.parse(destinationUrl)?.hostname;
-			// Same 401/403 rule as processJobResult: an auth-shaped destination is a
-			// credential/access problem, not a verdict on the page — don't seed a suppressed row.
-			const authShaped = result.statusCode === 401 || result.statusCode === 403;
-			if (!authShaped && (!config.domains.length || config.domains.includes(domain))) {
+			// Auth-shaped and transient statuses never reach here (guarded above), so this
+			// suppression is a genuine content/gone verdict about the destination.
+			if (!config.domains.length || config.domains.includes(domain)) {
 				await Target.suppress(destinationUrl, { reason: result.reason, statusCode: result.statusCode });
 			}
 			return;
@@ -465,7 +483,8 @@ export class RenderQueue extends Resource {
 	 */
 	static async recordRedirectStrike(cacheKey, why) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
-		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes'] });
+		// One read serves both the strike decision and the reschedule below.
+		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
 		if (!renderTarget) {
 			await RenderSchedule.delete(cacheKey);
 			return;
@@ -481,7 +500,7 @@ export class RenderQueue extends Resource {
 			return;
 		}
 		await Target.patch(sourceUrl, { strikes });
-		await this.rescheduleAtTargetCadence(cacheKey);
+		await this.rescheduleAtTargetCadence(cacheKey, renderTarget);
 	}
 
 	/**
@@ -489,13 +508,18 @@ export class RenderQueue extends Resource {
 	 * processJobResult: a target-backed key comes due one interval from completion (so cadence
 	 * self-paces instead of realigning into a herd); a targetless key (render-now one-off,
 	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
+	 *
+	 * `preloaded` (a row already read with at least renderInterval + sitemapUrl, e.g. by
+	 * recordRedirectStrike) skips the point read.
 	 */
-	static async rescheduleAtTargetCadence(cacheKey) {
+	static async rescheduleAtTargetCadence(cacheKey, preloaded) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
-		const renderTarget = await Target.get({
-			id: sourceUrl,
-			select: ['renderInterval', 'sitemapUrl'],
-		});
+		const renderTarget =
+			preloaded ??
+			(await Target.get({
+				id: sourceUrl,
+				select: ['renderInterval', 'sitemapUrl'],
+			}));
 		if (!renderTarget) {
 			await RenderSchedule.delete(cacheKey);
 			return;
