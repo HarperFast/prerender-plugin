@@ -239,7 +239,10 @@ export class RenderQueue extends Resource {
 
 		if (outcome === 'rendered') {
 			const url = CacheKey.extractUrl(cacheKey);
-			const renderTarget = await Target.get({ id: url, select: ['renderInterval', 'sitemapUrl', 'state'] });
+			const renderTarget = await Target.get({
+				id: url,
+				select: ['renderInterval', 'sitemapUrl', 'state', 'strikes'],
+			});
 			const renderInterval = renderTarget?.renderInterval;
 
 			// Schedule the next render relative to when THIS one completed (now), not a
@@ -281,6 +284,12 @@ export class RenderQueue extends Resource {
 				if (renderTarget.state === 'suppressed' && result.isIndexable === true) {
 					logger.warn(`Prerendered url ${url} is indexable again — lifting its suppression`);
 					await Target.reactivate(url);
+				} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
+					// Strikes are CONSECUTIVE failures by definition: a successful render resets the
+					// count, so redirect blips months apart never accumulate toward retirement.
+					// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
+					// extra write.
+					await Target.patch(url, { strikes: 0 });
 				}
 			} else {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
@@ -358,15 +367,17 @@ export class RenderQueue extends Resource {
 
 		if (landedOn !== PRERENDER) {
 			// The destination is a class we never serve from cache — adopting it would file
-			// renders where no read looks, and deleting the source would end its rendering for
-			// good on evidence as weak as an incomplete route list. Keep the source and retry at
-			// its normal cadence; the retry now costs a navigation, not a full settle.
+			// renders where no read looks, and deleting the source on ONE such result would end
+			// its rendering on evidence as weak as an incomplete route list. Keep the source and
+			// retry at its normal cadence (the retry costs a navigation, not a full settle) —
+			// but count the strike: a source that answers this way every interval is de facto
+			// permanently redirected, and recordRedirectStrike retires it after maxStrikes.
 			logger.warn(
 				`Prerendered url ${result.id} redirected (${result.statusCode}) to ${result.redirectedTo}, which is ` +
 					`${landedOn} — keeping the target (no key to schedule the destination under)`
 			);
 			recordUnroutedPath(landedOn, redirectPath, 'redirect');
-			await this.rescheduleAtTargetCadence(result.id);
+			await this.recordRedirectStrike(result.id, `to unserved ${landedOn} destination`);
 			return;
 		}
 
@@ -396,12 +407,15 @@ export class RenderQueue extends Resource {
 		if (result.statusCode !== 301 && result.statusCode !== 308) {
 			// No proof of permanence (302/303/307 — failover, geo bounce, outage page — or a
 			// client-side redirect's 200). The source is expected to come back — keep its target
-			// AND its cached page, and look again next interval.
+			// AND its cached page, and look again next interval. But a source that answers with
+			// a temp redirect EVERY interval is a permanent redirect wearing a temporary status:
+			// each result costs a strike and recordRedirectStrike retires the source after
+			// maxStrikes rather than paying a navigation every interval forever.
 			logger.warn(
 				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
 			);
-			await this.rescheduleAtTargetCadence(result.id);
+			await this.recordRedirectStrike(result.id, `temporary ${result.statusCode} to ${result.redirectedTo}`);
 			return;
 		}
 
@@ -438,6 +452,36 @@ export class RenderQueue extends Resource {
 			target.renderInterval = source.renderInterval;
 		}
 		await Target.put(destinationUrl, target);
+	}
+
+	/**
+	 * A redirect result that keeps its source in rotation still costs a strike: one temp
+	 * redirect is failover noise, but `render.redirects.maxStrikes` consecutive ones mean the
+	 * "temporary" status is a lie (or the route list will never serve the destination) and the
+	 * source is retired outright. Retiring is safe, not destructive — bot traffic for the URL
+	 * proxies to the origin, which serves its own redirect, and on-demand discovery re-creates
+	 * whatever the origin actually serves. The strike counter is the target's one shared
+	 * `strikes` field (suppression uses it too); any successful render clears it.
+	 */
+	static async recordRedirectStrike(cacheKey, why) {
+		const sourceUrl = CacheKey.extractUrl(cacheKey);
+		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes'] });
+		if (!renderTarget) {
+			await RenderSchedule.delete(cacheKey);
+			return;
+		}
+		const strikes = (Number.isFinite(renderTarget.strikes) ? Number(renderTarget.strikes) : 0) + 1;
+		const maxStrikes = config.render.redirects.maxStrikes;
+		if (Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
+			logger.warn(
+				`Prerendered url ${sourceUrl} kept redirecting ${strikes} consecutive times (${why}) — retiring it; ` +
+					`bots get the origin's own redirect and discovery re-creates what it actually serves`
+			);
+			await Target.delete(sourceUrl); // drops schedules + pages too
+			return;
+		}
+		await Target.patch(sourceUrl, { strikes });
+		await this.rescheduleAtTargetCadence(cacheKey);
 	}
 
 	/**

@@ -283,6 +283,18 @@ const defaultConfig = () => ({
 			},
 		},
 
+		// A redirect that proves nothing permanent (302/303/307, a client-side redirect's
+		// 200, or any redirect onto a route class we don't serve) keeps the source target on
+		// the theory the page is coming back. A source that answers that way EVERY interval
+		// is de facto permanent, so each such result counts a strike (the same shared
+		// counter suppression uses; any successful render clears it) and `maxStrikes`
+		// consecutive ones retire the source outright. Retiring is safe, not destructive:
+		// bot traffic for the URL is proxied to the origin — which serves the redirect
+		// itself — and on-demand discovery re-creates whatever the origin actually serves.
+		redirects: {
+			maxStrikes: 4,
+		},
+
 		// Periodic repair of targets whose RenderSchedule row is missing. A target and its
 		// schedule are two commits in two databases (the schedule routed to the node owning
 		// the URL), so the pair can end up half-written — and for a URL that is not in a
