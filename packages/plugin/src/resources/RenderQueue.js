@@ -292,9 +292,37 @@ export class RenderQueue extends Resource {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
 			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
 			// render is broken", which read identically without it. The verdict SUPPRESSES the
-			// target (state + recheck schedule) rather than deleting it — see Target.suppress.
-			logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
-			await Target.suppress(CacheKey.extractUrl(cacheKey), { reason: result.reason });
+			// target (state + recheck schedule) rather than deleting it — see Target.suppress,
+			// which also grades http-error verdicts by status (404/410 recheck less, die sooner).
+			//
+			// EXCEPT 401/403: an auth-shaped error is almost never a statement about the page —
+			// it's a broken renderer credential, an origin bot-mitigation rule change, or an
+			// origin auth outage. Striking on it would suppress (and after maxStrikes DELETE)
+			// swathes of healthy targets exactly when such a failure hits everything at once.
+			// Keep the target, keep its cached page, reschedule at normal cadence, log loudly.
+			if (result.statusCode === 401 || result.statusCode === 403) {
+				logger.error(
+					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
+						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
+				);
+				await this.rescheduleAtTargetCadence(cacheKey);
+			} else if (result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500) {
+				// Transient-shaped: the origin failed to serve the page, it didn't disavow it.
+				// Suppressing would delete the last good cached page and count a strike toward
+				// deletion over what may be one bad minute at the origin — keep both, retry at
+				// the target's normal cadence, and let a persistent failure surface as noise
+				// here rather than as silently vanished targets.
+				logger.warn(
+					`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page, retrying at normal cadence`
+				);
+				await this.rescheduleAtTargetCadence(cacheKey);
+			} else {
+				logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
+				await Target.suppress(CacheKey.extractUrl(cacheKey), {
+					reason: result.reason,
+					statusCode: result.statusCode,
+				});
+			}
 		} else {
 			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
 			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
@@ -338,7 +366,7 @@ export class RenderQueue extends Resource {
 					`${landedOn} — keeping the target (no key to schedule the destination under)`
 			);
 			recordUnroutedPath(landedOn, redirectPath, 'redirect');
-			await this.rescheduleRedirectSource(result.id);
+			await this.rescheduleAtTargetCadence(result.id);
 			return;
 		}
 
@@ -356,8 +384,11 @@ export class RenderQueue extends Resource {
 			await Target.delete(CacheKey.extractUrl(result.id));
 			const destinationUrl = CacheKey.extractUrl(redirectKey);
 			const domain = URL.parse(destinationUrl)?.hostname;
-			if (!config.domains.length || config.domains.includes(domain)) {
-				await Target.suppress(destinationUrl, { reason: result.reason });
+			// Same 401/403 rule as processJobResult: an auth-shaped destination is a
+			// credential/access problem, not a verdict on the page — don't seed a suppressed row.
+			const authShaped = result.statusCode === 401 || result.statusCode === 403;
+			if (!authShaped && (!config.domains.length || config.domains.includes(domain))) {
+				await Target.suppress(destinationUrl, { reason: result.reason, statusCode: result.statusCode });
 			}
 			return;
 		}
@@ -370,7 +401,7 @@ export class RenderQueue extends Resource {
 				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
 			);
-			await this.rescheduleRedirectSource(result.id);
+			await this.rescheduleAtTargetCadence(result.id);
 			return;
 		}
 
@@ -415,7 +446,7 @@ export class RenderQueue extends Resource {
 	 * self-paces instead of realigning into a herd); a targetless key (render-now one-off,
 	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
 	 */
-	static async rescheduleRedirectSource(cacheKey) {
+	static async rescheduleAtTargetCadence(cacheKey) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
 		const renderTarget = await Target.get({
 			id: sourceUrl,
