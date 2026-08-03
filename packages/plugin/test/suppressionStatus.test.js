@@ -207,20 +207,19 @@ test('a 404 verdict does NOT delete at gone.maxStrikes when the strikes came und
 
 // ---- auth-shaped (401/403) ----
 
-test('403 keeps the target, keeps the cached pages, reschedules at normal cadence', async () => {
+test('403 keeps the target and cached pages; first failure retries on the claim lease', async () => {
 	seedSource({ renderInterval: 3_600_000 });
 	await postResult(nonIndexable(403));
 
 	const target = stores.target.get(A);
 	assert.ok(target, 'target must survive an auth-shaped result');
 	assert.notEqual(target.state, 'suppressed');
-	assert.ok(!target.strikes, 'no strike for an auth-shaped result');
+	assert.equal(target.strikes, 1, 'the failure is counted');
 
-	const schedule = stores.renderSchedule.get(key(A));
-	assert.ok(schedule.nextRenderTime > Date.now(), 'rescheduled in the future');
-	assert.ok(
-		schedule.nextRenderTime < Date.now() + 2 * 3_600_000,
-		'rescheduled at the target cadence, not a suppression recheck'
+	assert.equal(
+		stores.renderSchedule.get(key(A)).nextRenderTime,
+		1,
+		'schedule untouched — the claim lease drives the fast retry'
 	);
 	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 	assert.ok(
@@ -245,20 +244,44 @@ test('403 on a targetless one-off drops the schedule instead of retrying forever
 // ---- transient (408/429/5xx) ----
 
 for (const statusCode of [408, 429, 500, 503]) {
-	test(`${statusCode} keeps the target and cached pages and retries at normal cadence`, async () => {
+	test(`${statusCode} keeps the target and cached pages; first failure retries on the claim lease`, async () => {
 		seedSource();
 		await postResult(nonIndexable(statusCode));
 
 		const target = stores.target.get(A);
 		assert.ok(target, 'target must survive a transient failure');
 		assert.notEqual(target.state, 'suppressed');
-		assert.ok(!target.strikes, 'no strike for a transient failure');
+		assert.equal(target.strikes, 1, 'the failure is counted');
 		assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 
-		const schedule = stores.renderSchedule.get(key(A));
-		assert.ok(schedule.nextRenderTime > Date.now(), 'rescheduled in the future');
+		assert.equal(stores.renderSchedule.get(key(A)).nextRenderTime, 1, 'schedule untouched — lease-driven retry');
 	});
 }
+
+test('past fastRetries, a failure drops to the target cadence — page kept but its expiry untouched', async () => {
+	const fast = config.render.failureRetry.fastRetries;
+	seedSource({ renderInterval: 3_600_000 });
+	stores.target.get(A).strikes = fast; // this failure is strike fast+1 — first slow-lane one
+	stores.prerenderedPage.get(key(A)).expiresAt = 777; // sentinel: must not be rewritten
+
+	await postResult(nonIndexable(503));
+
+	const target = stores.target.get(A);
+	assert.equal(target.strikes, fast + 1);
+	assert.notEqual(target.state, 'suppressed');
+
+	const schedule = stores.renderSchedule.get(key(A));
+	assert.ok(schedule.nextRenderTime > Date.now(), 'slow lane: rescheduled at the target cadence');
+	assert.ok(schedule.nextRenderTime < Date.now() + 2 * 3_600_000, 'cadence, not a suppression recheck');
+
+	const page = stores.prerenderedPage.get(key(A));
+	assert.equal(page.content, 'old html', 'page survives');
+	assert.equal(
+		page.expiresAt,
+		777,
+		'expiry deliberately NOT extended — swrTtl bounds staleness; past it, origin is the truth'
+	);
+});
 
 // ---- content verdicts stay on the default knobs ----
 
@@ -299,7 +322,7 @@ test('a client-side redirect landing on a 403 page keeps the source and seeds no
 	const source = stores.target.get(A);
 	assert.ok(source, 'auth-shaped landing must NOT retire the source — a credential outage would mass-delete');
 	assert.notEqual(source.state, 'suppressed');
-	assert.ok(!source.strikes, 'no strike either');
+	assert.equal(source.strikes, 1, 'the failure is counted toward the retry lanes');
 	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 	assert.equal(stores.target.has(B), false, 'auth-shaped destination must not become a suppressed row');
 });
@@ -334,4 +357,15 @@ test('a client-side redirect landing on a 404 page retires the source and seeds 
 
 	assert.equal(stores.target.has(A), false, 'source retired — it leads to a page that is gone');
 	assert.equal(stores.target.get(B)?.suppressedReason, 'http-gone', 'destination suppressed under the gone class');
+});
+
+test('a BigInt strikes value (Harper numeric surfacing) still counts toward the slow lane', async () => {
+	const fast = config.render.failureRetry.fastRetries;
+	seedSource({ renderInterval: 3_600_000 });
+	stores.target.get(A).strikes = BigInt(fast); // Number.isFinite(BigInt) is false — must coerce first
+
+	await postResult(nonIndexable(503));
+
+	assert.equal(stores.target.get(A).strikes, fast + 1, 'BigInt count read correctly, not reset to 1');
+	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'transitioned to the slow lane');
 });

@@ -273,7 +273,7 @@ const defaultConfig = () => ({
 		//     verdict, and striking on it would mass-delete healthy targets during an outage.
 		//   - 408/429/5xx never suppress either (see RenderQueue): the origin failed to serve
 		//     the page, it didn't disavow it — the target and its cached page both survive and
-		//     the render just retries at its normal cadence.
+		//     the render retries under `failureRetry` below.
 		suppression: {
 			recheckInterval: 7 * DAY,
 			maxStrikes: 4,
@@ -281,6 +281,22 @@ const defaultConfig = () => ({
 				recheckInterval: 14 * DAY,
 				maxStrikes: 2,
 			},
+		},
+
+		// Retry shape for the HTTP failures that never suppress (401/403 auth-shaped,
+		// 408/429/5xx transient). The first `fastRetries` consecutive failures leave the
+		// job's claim lease in place, so the retry comes on lease expiry
+		// (`queue.jobLeaseTime`, minutes) — an origin blip recovers fast, and the cached
+		// page's stale-while-revalidate window covers bots throughout. From the next strike
+		// on, the retry drops to the target's normal cadence: a persistently failing page
+		// must not hot-loop 100+ renders a day. Past `page.swrTtl` the kept page stops
+		// serving and bots fall through to the origin on purpose — its answer (a live page
+		// for auth-shaped failures, an honest 5xx for transient ones) is the truth, and
+		// serving arbitrarily old snapshots while users get errors would break bot/user
+		// parity. Strikes are the target's one shared counter; any successful render
+		// clears it.
+		failureRetry: {
+			fastRetries: 2,
 		},
 
 		// A redirect that proves nothing permanent (302/303/307, a client-side redirect's

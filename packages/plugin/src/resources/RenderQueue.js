@@ -6,7 +6,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
-import { Target } from './Target.js';
+import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
@@ -306,25 +306,22 @@ export class RenderQueue extends Resource {
 			//
 			// EXCEPT 401/403: an auth-shaped error is almost never a statement about the page —
 			// it's a broken renderer credential, an origin bot-mitigation rule change, or an
-			// origin auth outage. Striking on it would suppress (and after maxStrikes DELETE)
-			// swathes of healthy targets exactly when such a failure hits everything at once.
-			// Keep the target, keep its cached page, reschedule at normal cadence, log loudly.
+			// origin auth outage. Striking toward deletion would suppress (and after maxStrikes
+			// DELETE) swathes of healthy targets exactly when such a failure hits everything at
+			// once. Keep the target, keep its cached page, retry via retryAfterFailure.
 			if (result.statusCode === 401 || result.statusCode === 403) {
 				logger.error(
 					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
 						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
 				);
-				await this.rescheduleAtTargetCadence(cacheKey);
+				await this.retryAfterFailure(cacheKey);
 			} else if (result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500) {
 				// Transient-shaped: the origin failed to serve the page, it didn't disavow it.
-				// Suppressing would delete the last good cached page and count a strike toward
-				// deletion over what may be one bad minute at the origin — keep both, retry at
-				// the target's normal cadence, and let a persistent failure surface as noise
-				// here rather than as silently vanished targets.
-				logger.warn(
-					`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page, retrying at normal cadence`
-				);
-				await this.rescheduleAtTargetCadence(cacheKey);
+				// Suppressing would delete the last good cached page and park the URL for the
+				// recheck interval over what may be one bad minute at the origin — keep both
+				// and retry via retryAfterFailure (fast first, then the target's cadence).
+				logger.warn(`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page`);
+				await this.retryAfterFailure(cacheKey);
 			} else {
 				logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
 				await Target.suppress(CacheKey.extractUrl(cacheKey), {
@@ -378,9 +375,9 @@ export class RenderQueue extends Resource {
 		if (authShaped || transientShaped) {
 			logger[authShaped ? 'error' : 'warn'](
 				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
-					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target and retrying at its normal cadence`
+					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target`
 			);
-			await this.rescheduleAtTargetCadence(result.id);
+			await this.retryAfterFailure(result.id);
 			return;
 		}
 
@@ -489,7 +486,7 @@ export class RenderQueue extends Resource {
 			await RenderSchedule.delete(cacheKey);
 			return;
 		}
-		const strikes = (Number.isFinite(renderTarget.strikes) ? Number(renderTarget.strikes) : 0) + 1;
+		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		const maxStrikes = config.render.redirects.maxStrikes;
 		if (Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
 			logger.warn(
@@ -501,6 +498,48 @@ export class RenderQueue extends Resource {
 		}
 		await Target.patch(sourceUrl, { strikes });
 		await this.rescheduleAtTargetCadence(cacheKey, renderTarget);
+	}
+
+	/**
+	 * Retry shape for auth-shaped (401/403) and transient (408/429/5xx) failures — the ones
+	 * that never suppress. Two lanes, split by the target's strike count
+	 * (`render.failureRetry.fastRetries`):
+	 *
+	 *   FAST — the schedule is left holding its claim lease, so the retry comes on lease
+	 *   expiry (`queue.jobLeaseTime`, minutes). An origin blip recovers fast, and the cached
+	 *   page's swrTtl window keeps serving bots across a lease-sized wait.
+	 *
+	 *   SLOW — after `fastRetries` consecutive failures this is not a blip: drop to the
+	 *   target's normal cadence so a persistently failing page can't hot-loop renders all
+	 *   day. The kept page's expiry is deliberately NOT extended: `swrTtl` is the product
+	 *   bound on how stale we serve as if fresh, and past it bots fall through to the
+	 *   origin — whose answer (a live page for auth-shaped failures, an honest 5xx for
+	 *   transient ones) is the truth. Serving arbitrarily old snapshots while users get
+	 *   errors would break bot/user parity.
+	 *
+	 * Strikes are the target's one shared counter (suppression and redirect strikes use it
+	 * too); any successful render clears it. A targetless key (render-now one-off) has its
+	 * schedule dropped, as everywhere else.
+	 */
+	static async retryAfterFailure(cacheKey) {
+		const sourceUrl = CacheKey.extractUrl(cacheKey);
+		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		if (!renderTarget) {
+			await RenderSchedule.delete(cacheKey);
+			return;
+		}
+		const strikes = countedStrikes(renderTarget.strikes) + 1;
+		await Target.patch(sourceUrl, { strikes });
+
+		if (strikes <= config.render.failureRetry.fastRetries) {
+			logger.warn(`Retrying ${cacheKey} on its claim lease (failure strike ${strikes})`);
+			return; // schedule untouched — the lease written at claim drives the retry
+		}
+
+		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
+		const nextRenderTime = currentMinuteMs() + interval;
+		logger.warn(`Retrying ${cacheKey} at its normal cadence (failure strike ${strikes})`);
+		await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
 	}
 
 	/**
