@@ -5,6 +5,7 @@ import {
 	configuredStagingIp,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
+	sitemapStagingIp,
 	stagingTargetIp,
 } from '../src/util/upstream.js';
 
@@ -72,6 +73,24 @@ test('configuredStagingIp is undefined when no staging ip is configured', () => 
 test('configuredStagingIp ignores an invalid configured ip', () => {
 	applyOptions({ staging: { ip: 'not-an-ip' } });
 	assert.equal(configuredStagingIp(), undefined);
+});
+
+test('sitemapStagingIp follows staging.ip by default', () => {
+	applyOptions({ staging: { ip: '192.0.2.27' } });
+	assert.equal(config.sitemap.useStagingIp, true);
+	assert.equal(sitemapStagingIp(), '192.0.2.27');
+});
+
+test('sitemapStagingIp is undefined when sitemap.useStagingIp is off (direct prod fetch)', () => {
+	applyOptions({ staging: { ip: '192.0.2.27' }, sitemap: { useStagingIp: false } });
+	// The render/proxy path still pins to staging; only the sitemap fetch goes direct.
+	assert.equal(configuredStagingIp(), '192.0.2.27');
+	assert.equal(sitemapStagingIp(), undefined);
+});
+
+test('sitemapStagingIp is undefined when no staging ip is configured, regardless of the flag', () => {
+	applyOptions({ sitemap: { useStagingIp: true } });
+	assert.equal(sitemapStagingIp(), undefined);
 });
 
 test('ignoredHeaders defaults to an empty list', () => {

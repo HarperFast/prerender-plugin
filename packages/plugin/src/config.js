@@ -168,10 +168,9 @@ const defaultConfig = () => ({
 	// cached page regardless of it. Empty `ip` disables the feature — production is
 	// unaffected unless a staging IP is explicitly configured.
 	//
-	// The sitemap refresh reuses this `ip` too, but unconditionally (no toggle header — it has
-	// no incoming request): whenever `ip` is set, every sitemap fetch is pinned to it, so all
-	// Harper→origin traffic hits the same edge. The security token often only authenticates
-	// against the staging edge, so a direct prod sitemap fetch is bounced with a 403.
+	// The sitemap refresh reuses this `ip` too, gated by `sitemap.useStagingIp` instead of the
+	// toggle header (it has no incoming request to carry one): when that flag is on and `ip` is
+	// set, every sitemap fetch is pinned to it, so all Harper→origin traffic hits the same edge.
 	staging: {
 		ip: '',
 		header: 'x-harper-staging',
@@ -355,6 +354,14 @@ const defaultConfig = () => ({
 		// disables the scheduled refresh entirely (manual refresh still works).
 		node: '',
 		workerIndex: 0,
+
+		// Whether sitemap fetches follow `staging.ip` when it is set. The sitemap fetch has no
+		// incoming request to carry the staging toggle header, so this flag is its equivalent.
+		// On (the default), sitemap XML is fetched via the staging edge like every other
+		// Harper→origin fetch. Off, sitemap fetches go direct to the production origin — the
+		// security token still rides along, so the edge's bot-mitigation bypass must accept it
+		// on the production property, not just staging, or every fetch 403s.
+		useStagingIp: true,
 
 		// Run `POST /Sitemap/<url>` as a background walk and answer immediately with a handle,
 		// instead of holding the request open for the whole traversal. A sitemap index is not an
@@ -659,7 +666,7 @@ export const collectConfigWarnings = () => {
 			add(
 				'info',
 				'staging.ip',
-				`staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved). Toggling this on/off contaminates the URL-keyed page cache; wipe it when switching.`
+				`staging passthrough ENABLED — cache-miss requests carrying "${config.staging.header}" are proxied to ${config.staging.ip} (Host/SNI preserved); sitemap fetches go ${config.sitemap.useStagingIp ? `to ${config.staging.ip} too (sitemap.useStagingIp)` : 'direct to the production origin (sitemap.useStagingIp: false)'}. Toggling this on/off contaminates the URL-keyed page cache; wipe it when switching.`
 			);
 		} else {
 			add(

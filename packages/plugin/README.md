@@ -107,6 +107,7 @@ rest: true # required for the @export-ed table REST endpoints
     filteredWarnPercent: 50 # filtered share of one sitemap that is reported as an ERROR
     node: '' # pin the scheduled refresh to this node ('' disables it)
     workerIndex: 0 # ...and this worker
+    useStagingIp: true # sitemap fetches follow staging.ip when set; false = direct to prod
     background: true # POST returns a handle immediately; the walk runs in the background
     staleRunMs: 600000 # 10m — un-updated progress after which a run is treated as dead
     removedSampleCap: 20 # sample size of unlinked keys in the result (the COUNT is exact)
@@ -370,6 +371,11 @@ certificate (the server-side equivalent of a `host-resolver-rules` / `/etc/hosts
   is unaffected unless a staging IP is explicitly configured.
 - With the `debugHeader` also present, a staging-served response is tagged with the
   `x-harper-origin: staging` response header so you can confirm it.
+- **Sitemap fetches follow `staging.ip` by default.** They have no incoming request to carry the
+  toggle header, so `sitemap.useStagingIp` is their equivalent: `true` (the default) pins every
+  sitemap fetch to the staging edge; `false` sends them direct to the production origin. The
+  security token is sent either way, so a direct fetch requires the token to be accepted on the
+  production property — otherwise every sitemap fetch is bounced with a 403.
 
 ### Database topology
 

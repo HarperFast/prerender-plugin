@@ -28,6 +28,15 @@ export const configuredStagingIp = () => {
 	return ip && isIP(ip) ? ip : undefined;
 };
 
+/**
+ * The staging IP a sitemap fetch should connect to, or undefined for a direct production
+ * fetch. The sitemap refresh has no incoming request to carry the staging toggle header, so
+ * `sitemap.useStagingIp` is its equivalent: on, sitemap fetches follow `staging.ip` like
+ * every other Harper→origin fetch; off, they go direct to the production origin (the
+ * security token is sent either way).
+ */
+export const sitemapStagingIp = () => (config.sitemap.useStagingIp ? configuredStagingIp() : undefined);
+
 // Dispatchers that pin DNS resolution to a fixed IP (staging passthrough), one per IP.
 // Only the connect address is overridden — the origin (so Host header + TLS SNI + cert
 // validation) stays the real origin host, the server-side equivalent of Chrome's

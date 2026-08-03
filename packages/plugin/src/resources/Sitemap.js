@@ -5,7 +5,7 @@ import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/route
 import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
-import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
+import { dispatcherFor, sitemapStagingIp } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 
@@ -627,12 +627,12 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 }
 
 async function fetchLatestSitemap(url) {
-	// Route every Harper→origin sitemap fetch through the same edge as the render/origin-fetch
-	// path: whenever a staging IP is configured, pin the TCP connection to it (Host/SNI stay the
-	// real origin, exactly like upstream.js). The security token typically only authenticates
-	// against the staging edge, so a direct prod fetch is bounced with a 403 "Access Denied".
-	// Empty staging.ip → normal direct fetch (production, once the token is valid at the origin).
-	const stagingIp = configuredStagingIp();
+	// Pin the TCP connection to the staging edge when `sitemap.useStagingIp` + `staging.ip`
+	// say so (Host/SNI stay the real origin, exactly like upstream.js). The flag exists because
+	// the right edge differs per deployment: a token that only authenticates against the
+	// staging edge needs the pin, while a token accepted on the production property can fetch
+	// the real sitemap direct — `useStagingIp: false`. Either way the token is sent.
+	const stagingIp = sitemapStagingIp();
 	const via = stagingIp ? ` (via staging ${stagingIp})` : '';
 
 	const res = await fetch(url, {
