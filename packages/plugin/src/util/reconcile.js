@@ -31,7 +31,7 @@
  */
 
 import { setImmediate } from 'node:timers/promises';
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { CacheKey } from './cacheKey.js';
 import { fnv1a32 } from './hash.js';
 import { getResidencyByUrl } from './residency.js';
@@ -207,31 +207,69 @@ export const runReconcileOnce = async (options) => {
 };
 
 let reconcilerStarted = false;
+let reconcilerDelayTimer = null;
+let reconcilerIntervalTimer = null;
+let reconcilerArmed = null; // the interval the timers were armed for, or null when disabled
 
-/**
- * Start the periodic sweep on worker 0 of EVERY node — unlike the sitemap refresh, this is
- * not pinned to one node, because each node can only authoritatively check the keys it owns.
- * Called from handleApplication after config is applied. Idempotent.
- */
-export function startScheduleReconciler() {
-	if (server.workerIndex !== 0 || reconcilerStarted) return;
-	if (!config.render.reconcile.enabled) return;
+const clearReconcilerTimers = () => {
+	if (reconcilerDelayTimer) clearTimeout(reconcilerDelayTimer);
+	if (reconcilerIntervalTimer) clearInterval(reconcilerIntervalTimer);
+	reconcilerDelayTimer = reconcilerIntervalTimer = null;
+};
 
-	reconcilerStarted = true;
+// (Re)arm the sweep timers to match config: `render.reconcile.enabled`/`interval` are
+// live. `startDelay`/`startJitter` stay restart-scoped — they only shape the first arming.
+const syncReconcilerTimers = () => {
+	const desired = config.render.reconcile.enabled ? config.render.reconcile.interval : null;
+	if (desired === reconcilerArmed) return;
+
+	const wasEnabled = reconcilerArmed !== null;
+	clearReconcilerTimers();
+	reconcilerArmed = desired;
+	if (desired === null) return;
 
 	const run = () => {
 		runReconcileOnce().catch(logger.error);
 	};
 
-	// Stagger the first pass per node. Every node runs this sweep, and a rolling restart is
-	// exactly when they would otherwise all start walking the registry at the same moment.
+	if (wasEnabled) {
+		// Cadence change while running: swap the interval; the next sweep comes on the new
+		// cadence rather than immediately.
+		reconcilerIntervalTimer = setInterval(run, desired);
+		reconcilerIntervalTimer.unref?.();
+		return;
+	}
+
+	// (Re)enabling arms boot-shaped: delay + per-node stagger. Every node runs this sweep,
+	// and a config change (like a rolling restart) reaches them all at the same moment —
+	// exactly when they would otherwise all start walking the registry at once.
 	// Floor the modulus at 1 so `startJitter: 0` means "no stagger" rather than `% 0` → NaN,
 	// which would hand setTimeout a NaN delay and fire everywhere at once — the very thing the
 	// stagger exists to prevent.
 	const stagger = fnv1a32(server.hostname) % Math.max(1, config.render.reconcile.startJitter | 0);
 
-	setTimeout(() => {
+	reconcilerDelayTimer = setTimeout(() => {
 		run();
-		setInterval(run, config.render.reconcile.interval).unref?.();
-	}, config.render.reconcile.startDelay + stagger).unref?.();
+		reconcilerIntervalTimer = setInterval(run, reconcilerArmed);
+		reconcilerIntervalTimer.unref?.();
+	}, config.render.reconcile.startDelay + stagger);
+	reconcilerDelayTimer.unref?.();
+};
+
+// Introspection for tests and the management API: what the timers are currently armed
+// with (`armedInterval: null` = disabled).
+export const reconcilerTimerState = () => ({ started: reconcilerStarted, armedInterval: reconcilerArmed });
+
+/**
+ * Start the periodic sweep on worker 0 of EVERY node — unlike the sitemap refresh, this is
+ * not pinned to one node, because each node can only authoritatively check the keys it owns.
+ * Called from handleApplication after config is applied. Idempotent. The timers follow
+ * config changes (enable/disable, interval) without a restart.
+ */
+export function startScheduleReconciler() {
+	if (server.workerIndex !== 0 || reconcilerStarted) return;
+	reconcilerStarted = true;
+
+	syncReconcilerTimers();
+	onConfigApplied(syncReconcilerTimers);
 }

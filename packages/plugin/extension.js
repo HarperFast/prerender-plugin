@@ -19,9 +19,11 @@ export async function handleApplication(scope) {
 
 	applyOptions(scope.options.getAll());
 
-	// Live reload: re-apply whenever the host config changes. (Database names are
-	// fixed and structural changes like render-scheduler pinning take effect on
-	// restart.)
+	// Live reload: re-apply whenever the host config changes. The background schedulers
+	// below subscribe to applyOptions (onConfigApplied) and re-arm themselves, so their
+	// gates and intervals — including the sitemap-refresh pinning — follow config without
+	// a restart. The few boot-only options (schema scope 'restart') are diffed on
+	// re-apply and reported via pendingRestartChanges instead of taking effect silently.
 	scope.options.on('change', () => {
 		try {
 			applyOptions(scope.options.getAll());

@@ -21,7 +21,7 @@
  * Rows replicate (table default), so any single node can answer for the cluster.
  */
 
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { getMutex } from './coordination.js';
 import { createSketch, addToSketch, mergeSketch, estimateSketch } from './hll.js';
 
@@ -64,11 +64,35 @@ export function recordCrawl(botName, url) {
 	dirty.add(botName);
 
 	// Lazily started so only threads that actually serve bot traffic run a timer.
-	if (!flushTimer) {
-		flushTimer = setInterval(() => flushSketches().catch((e) => logger.error(e)), config.crawlStats.flushInterval);
-		flushTimer.unref?.();
-	}
+	if (!flushTimer) armFlushTimer();
 }
+
+let armedFlushInterval = null;
+
+const armFlushTimer = () => {
+	armedFlushInterval = config.crawlStats.flushInterval;
+	flushTimer = setInterval(() => flushSketches().catch((e) => logger.error(e)), armedFlushInterval);
+	flushTimer.unref?.();
+};
+
+// Keep the lazy flush timer following config, like the other background timers
+// (`crawlStats.flushInterval`/`enabled` are live). A thread that never armed the timer
+// needs nothing here — the next recordCrawl reads current config when it arms.
+onConfigApplied(() => {
+	if (!flushTimer) return;
+	if (!config.crawlStats.enabled) {
+		clearInterval(flushTimer);
+		flushTimer = null;
+		armedFlushInterval = null;
+		// Persist what was already observed instead of holding it hostage until re-enable.
+		flushSketches().catch((e) => logger.error(e));
+		return;
+	}
+	if (config.crawlStats.flushInterval !== armedFlushInterval) {
+		clearInterval(flushTimer);
+		armFlushTimer();
+	}
+});
 
 // Close out the old day and start the new one. The old sketches are captured and persisted
 // off the hot path via setImmediate; the maps are swapped synchronously so no observation

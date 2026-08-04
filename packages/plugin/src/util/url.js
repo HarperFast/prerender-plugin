@@ -32,7 +32,7 @@ import { config } from '../config.js';
  *
  * `queryParams` is the allowlist of params to keep: `['*']` keeps all, `[]` drops all,
  * `['CN']` keeps only `CN`. Callers pass the per-route allowlist (forwarded mode) or the
- * global `config.url.queryParams` (native/prefix mode); see `queryAllowlistFor` in ingress.
+ * global `config.cacheKey.queryParams` (native/prefix mode); see `queryAllowlistFor` in ingress.
  *
  * `new URL(canonicalizeUrl(x)).href === canonicalizeUrl(x)` for every input, so callers may
  * build the origin-fetch / navigation URL object straight from the returned half without a
@@ -40,7 +40,7 @@ import { config } from '../config.js';
  */
 const FIXED_DECODE = { '%3a': ':', '%2c': ',', '%40': '@' };
 
-export const canonicalizeUrl = (url, queryParams = config.url.queryParams) => {
+export const canonicalizeUrl = (url, queryParams = config.cacheKey.queryParams) => {
 	const parsed = url instanceof URL ? new URL(url.href) : new URL(url);
 	parsed.hash = '';
 

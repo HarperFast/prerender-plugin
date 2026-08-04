@@ -1,0 +1,760 @@
+/**
+ * The configuration schema: the single source of truth for every option the plugin
+ * understands. Each option declares its default, a description, and how a change takes
+ * effect — everything `config.js` (defaults, merge validation, redaction, restart
+ * warnings) and the management API (a machine-readable schema for the admin UI) derive
+ * from.
+ *
+ * Field reference for `option(default, description, extra)`:
+ *   scope     'live' (default) — a change via the host's options `change` event takes
+ *             effect without a restart (per request, per timer tick, or on the next
+ *             scheduled cycle). 'restart' — the value is consumed once at worker boot;
+ *             a live change is reported as pending-restart and otherwise ignored.
+ *             Groups may set a scope their children inherit.
+ *   secret    true — the value is redacted to a presence marker wherever config is
+ *             read back (management API, logs).
+ *   enum      Allowed values; anything else is rejected at apply time (default kept).
+ *   unit      Display/documentation hint ('ms', 'percent'). No behavioral effect.
+ *   min/max   Numeric bounds enforced at apply time (violation keeps the default).
+ *   nonEmpty  true — an empty string/array is rejected at apply time (default kept).
+ *             Reserved for values where empty is catastrophic rather than unwise.
+ *   itemType  Display hint for array options ('string' | 'object').
+ *   movedFrom Dotted path this option (or group) lived at before the v0.25.0
+ *             reorganization. The old path still applies with a deprecation warning.
+ *
+ * Descriptions are user-facing documentation: they are served by the management API and
+ * will back the admin UI's config editor. Write them for an operator, not a code reader.
+ */
+
+const SECOND = 1000;
+const MINUTE = 60 * SECOND;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+
+const OPTION = Symbol('option');
+const GROUP = Symbol('group');
+
+const option = (defaultValue, description, extra = {}) => ({
+	[OPTION]: true,
+	default: defaultValue,
+	description,
+	...extra,
+});
+
+const group = (description, children, extra = {}) => ({
+	[GROUP]: true,
+	description,
+	children,
+	...extra,
+});
+
+export const isOption = (node) => !!node?.[OPTION];
+export const isGroup = (node) => !!node?.[GROUP];
+
+// Database/table names are fixed (defined statically in src/schemas/schema.graphql).
+// Tables are split across databases by write-transaction coupling so the hot queue
+// (render_schedule) is isolated from target, page-cache, and sitemap writes.
+export const configSchema = group('Prerender plugin configuration.', {
+	domains: option(
+		[],
+		'Allowlist of hostnames considered indexable. Pages on other hosts are rendered but ' +
+			'never marked indexable/cached. Empty = allow all.',
+		{ itemType: 'string' }
+	),
+
+	ingress: group(
+		'Request-ingestion model: how incoming bot requests are recognized, which paths are ' +
+			'prerendered, and how the target URL and device type are derived.\n\n' +
+			"mode 'prefix' — native model: bot requests arrive at `${botPathPrefix}<absolute-url>` " +
+			'and the device type comes from a header (`deviceTypeHeader`).\n' +
+			"mode 'forwarded' — reverse-proxy / CDN model: the proxy routes a restricted set of " +
+			'paths to the plugin. The device type is the first path segment, the target URL is ' +
+			'reconstructed from the forwarded host/proto headers, and `routes` both identifies ' +
+			"which requests are prerender requests and sets each route's query-param allowlist.",
+		{
+			mode: option('prefix', "Request-ingestion model: 'prefix' (native) or 'forwarded' (reverse-proxy / CDN).", {
+				enum: ['prefix', 'forwarded'],
+			}),
+			botPathPrefix: option(
+				'/p/',
+				'Requests whose path starts with this prefix are treated as bot prerender requests ' +
+					'(e.g. `/p/<absolute-url>`). Prefix mode only.',
+				{ movedFrom: 'botPathPrefix', nonEmpty: true }
+			),
+			deviceTypeSource: option(
+				'header',
+				"Where the device type comes from in forwarded mode: 'path' (first path segment, " +
+					"consumed when it is a supported device type) or 'header'.",
+				{ enum: ['path', 'header'] }
+			),
+			deviceTypeHeader: option('x-device-type', 'Request header carrying the device type.'),
+			forwardedHostHeader: option('x-forwarded-host', 'Header carrying the original public host (forwarded mode).'),
+			forwardedProtoHeader: option('x-forwarded-proto', 'Header carrying the original public scheme (forwarded mode).'),
+			defaultProtocol: option('https', 'Scheme assumed when the forwarded-proto header is absent.', {
+				enum: ['https', 'http'],
+			}),
+			routes: option(
+				[],
+				'Ordered route list (forwarded mode). Each entry is ' +
+					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
+					'queryParams?: string[], renderInterval?: number }.\n\n' +
+					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
+					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
+					'without a second list and a precedence rule.\n\n' +
+					"`mode` (default 'prerender') decides the class:\n" +
+					'  prerender — cache it, schedule it, serve it from cache. `queryParams` is its cache-key / ' +
+					"origin-fetch query allowlist (same semantics as `cacheKey.queryParams`: ['*'] keeps all, " +
+					'[] drops all).\n' +
+					'  passthrough — proxy it live, never cache or schedule it, and don’t report it. A declaration ' +
+					'that the CDN forwards this path and we have chosen not to prerender it. `queryParams` is ' +
+					'REJECTED here: with no cache there is no key for it to shape, so it could only strip params ' +
+					'off the proxied origin fetch and hand the visitor the wrong page.\n\n' +
+					"A path matching NOTHING is 'unclassified': still proxied (never blocked), never cached, and " +
+					'counted for reporting so the gap can be fixed at the CDN or here.\n\n' +
+					'`renderInterval` (ms, prerender routes only) sets the render cadence for every URL the route ' +
+					"matches. Precedence: route > the target's stored interval (sitemap `<changefreq>` or an " +
+					'explicit API write) > `render.defaultInterval` — resolved at schedule time on every cycle, so ' +
+					"changing it here takes effect on each URL's next render with no data migration. A per-URL " +
+					'exception is an `exact` route ordered above its class (e.g. the homepage `exact /` at 2h above ' +
+					'a 6h section prefix); a route that should defer to sitemap changefreq simply doesn’t set one.\n\n' +
+					"OPERATIONAL NOTE: if the CDN edge-caches a route's responses with a fixed TTL from its own " +
+					"property settings (not from our response headers), that TTL and the route's renderInterval " +
+					'must be kept aligned BY HAND — rendering much faster than the edge TTL burns renders the edge ' +
+					'never serves, and much slower means the edge re-fetches stale content. Neither side can see ' +
+					'the other drift.',
+				{ itemType: 'object' }
+			),
+			excludePathPatterns: option(
+				['/search/'],
+				'Paths never auto-scheduled for rendering. Compiled into `routes` as ' +
+					"{ match: 'contains', mode: 'passthrough' } entries, PREPENDED so an exclude still beats any " +
+					'prerender route it overlaps. Matched against the PATH only (never the query string). ' +
+					'Prefer declaring a `contains`/`passthrough` route directly.',
+				{ movedFrom: 'excludePathPatterns', itemType: 'string' }
+			),
+			report: group(
+				'Periodic aggregated report of paths served without prerendering, bucketed by first path ' +
+					'segment. Replaces a per-request warning that was unusable at crawler volume. Runs on EVERY ' +
+					'worker (the counters are in-process), so each line carries node + worker and a reader sums ' +
+					'across them.',
+				{
+					enabled: option(true, 'Emit the periodic unrouted-path report.'),
+					interval: option(5 * MINUTE, 'How often each worker flushes its tally.', { unit: 'ms', min: SECOND }),
+					maxBuckets: option(200, 'Distinct buckets tracked per class before overflow counting.', { min: 1 }),
+					topN: option(20, 'Buckets listed per log line, highest count first.', { min: 1 }),
+				}
+			),
+		}
+	),
+
+	deviceTypes: group('Device variants the service renders and serves.', {
+		supported: option(
+			['desktop', 'mobile', 'tablet'],
+			'Device types the service understands; unrecognized values fall back to the first entry.',
+			{ itemType: 'string', nonEmpty: true }
+		),
+		default: option(['desktop', 'mobile'], 'Device types scheduled for rendering when a page is auto-discovered.', {
+			itemType: 'string',
+		}),
+	}),
+
+	cacheKey: group(
+		'How a request URL becomes a cache identity. Changing any of these reshapes every key: ' +
+			'existing cached pages and schedules are orphaned (not migrated), so treat a live change ' +
+			'as a full cache rebuild.',
+		{
+			delimiter: option('|', 'Separator joining the key attributes.', { nonEmpty: true }),
+			attributes: option(['url', 'deviceType'], 'Attributes joined (in order) to form the key.', {
+				itemType: 'string',
+				nonEmpty: true,
+			}),
+			queryParams: option(
+				['page'],
+				'URL normalization used to build the cache key: an allowlist of query parameters to retain ' +
+					'(others are dropped; the remaining ones are sorted for a stable key).\n' +
+					"  ['page'] — keep only `?page=` (default)\n" +
+					"  ['*'] — keep all query params\n" +
+					'  [] — drop all query params\n' +
+					'In forwarded mode a matched route’s own `queryParams` takes precedence.',
+				{ movedFrom: 'url.queryParams', itemType: 'string' }
+			),
+		}
+	),
+
+	origin: group('How Harper fetches from the origin: identification, staging routing, and header hygiene.', {
+		securityToken: group(
+			'Shared secret sent to the origin so it can distinguish the prerender service (and bypass ' +
+				'bot mitigation). Set the value per deployment — preferably via `valueEnv` so the secret ' +
+				'stays out of config.yaml.',
+			{
+				header: option('x-harper-renderer-bypass', 'Header name carrying the token.'),
+				value: option('', 'The token itself. Prefer `valueEnv`.', { secret: true }),
+				valueEnv: option(
+					'',
+					'If set, the token is sourced from this environment variable at config-apply time and takes ' +
+						'precedence over `value` (keeps the secret out of config.yaml). The environment itself is ' +
+						'loaded once at boot (loadEnv), so changing the variable’s VALUE still needs a restart; ' +
+						'changing which variable is read does not.'
+				),
+			},
+			{ movedFrom: 'securityToken' }
+		),
+		staging: group(
+			'Staging passthrough — for verifying an origin against a staging edge (e.g. the CDN’s staging ' +
+				'network). When `ip` is set, a cache-MISS origin fetch that carries the `header` request header ' +
+				'is connected to `ip` instead of the public origin. The Host header and TLS SNI stay the real ' +
+				'origin host (only the TCP address is pinned), so the staging edge serves the right property and ' +
+				'presents a valid certificate.\n\n' +
+				'The header is only a toggle: the connect address is always the configured `ip`, never a value ' +
+				'from the request, so a request can’t repoint the fetch at an arbitrary host. The cache key does ' +
+				'not include the header, so cache HITS always return the normal cached page regardless of it. ' +
+				'Empty `ip` disables the feature — production is unaffected unless a staging IP is explicitly ' +
+				'configured.\n\n' +
+				'The sitemap refresh reuses this `ip` too, but unconditionally (no toggle header — it has no ' +
+				'incoming request): whenever `ip` is set, every sitemap fetch is pinned to it, so all ' +
+				'Harper→origin traffic hits the same edge. The security token often only authenticates against ' +
+				'the staging edge, so a direct prod sitemap fetch is bounced with a 403.\n\n' +
+				'Toggling staging↔prod contaminates the URL-keyed page cache; wipe it when switching.',
+			{
+				ip: option('', 'Staging edge IP. Empty disables staging passthrough entirely.'),
+				header: option('x-harper-staging', 'Request header that toggles the staging connect on a miss fetch.'),
+			},
+			{ movedFrom: 'staging' }
+		),
+		userAgents: group(
+			'Per-device-type User-Agent strings sent to the origin on the proxy (cache-miss passthrough) ' +
+				'fetch. Each carries a `HarperProxy/1.0` product token so Harper’s proxy traffic is identifiable ' +
+				'in origin/CDN logs while still presenting a real, device-appropriate browser UA (the origin ' +
+				'serves device-specific HTML off it).',
+			{
+				mobile: option(
+					'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 HarperProxy/1.0',
+					'UA for mobile proxy fetches.'
+				),
+				tablet: option(
+					'Mozilla/5.0 (Linux; Android 7.0; Pixel C Build/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/52.0.2743.98 Safari/537.36 HarperProxy/1.0',
+					'UA for tablet proxy fetches.'
+				),
+				desktop: option(
+					'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/W.X.Y.Z Safari/537.36 HarperProxy/1.0',
+					'UA for desktop proxy fetches.'
+				),
+			},
+			{ movedFrom: 'userAgents' }
+		),
+		ignoredHeaders: option(
+			[],
+			'Additional downstream request header names never forwarded to the origin, on top of the ' +
+				'always-ignored set (hop-by-hop headers plus host, user-agent, accept-encoding, cookie, ' +
+				'authorization, and the security-token/debug header names). Matched case-insensitively.',
+			{ movedFrom: 'ignoredHeaders', itemType: 'string' }
+		),
+	}),
+
+	debugHeader: group('Debug response headers, emitted when the request carries this header (any value).', {
+		key: option('x-harper-prerender-debug', 'Request header name that turns on debug response headers.'),
+	}),
+
+	renderNow: group(
+		'On-demand render control. When enabled, an authorized GET bot request gets two orthogonal ' +
+			'levers (both ignored for unauthorized requests, so real crawler traffic is unaffected):\n' +
+			'  1. Cache freshness — a request `Cache-Control: no-cache`/`no-store` SKIPS the served cache ' +
+			'(forces a miss).\n' +
+			'  2. Miss behavior — the `missHeader` value picks what to do on a miss/skip: ‘prerender’ ' +
+			'(force an immediate one-off render and long-poll for the fresh result) or ‘origin’ (proxy ' +
+			'the origin, same as a normal miss). Absent → `defaultMissMode`.\n' +
+			'So `defaultMissMode: prerender` + no Cache-Control = "serve cache, else render now" ' +
+			'(warm-on-demand); adding `Cache-Control: no-cache` = "always render fresh now".',
+		{
+			enabled: option(false, 'Enable the on-demand render levers.'),
+			header: option(
+				'x-harper-render-now',
+				'Request header that authorizes the on-demand levers. Authorization is gated on its presence; ' +
+					'when a `token` is set the header VALUE must equal it.'
+			),
+			token: option(
+				'',
+				'Expected value of `header`. An empty token leaves the feature unauthenticated (any client ' +
+					'sending the header can force renders — a DoS vector), which is warned about at config-apply ' +
+					'time.',
+				{ secret: true }
+			),
+			valueEnv: option(
+				'',
+				'If set, the token is sourced from this environment variable at config-apply time and takes ' +
+					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.'
+			),
+			missHeader: option('x-harper-render-miss', "Request header picking miss behavior: 'prerender' | 'origin'."),
+			defaultMissMode: option('prerender', 'Miss behavior when `missHeader` is absent.', {
+				enum: ['prerender', 'origin'],
+			}),
+			timeoutMs: option(30 * SECOND, 'Give up waiting for the fresh render after this long.', {
+				unit: 'ms',
+				min: 1,
+			}),
+			pollIntervalMs: option(250, 'How often to re-check the cache for the fresh render.', {
+				unit: 'ms',
+				min: 10,
+			}),
+			fallback: option(
+				'origin',
+				'What to serve when a prerender doesn’t land before `timeoutMs`:\n' +
+					"  'origin' — proxy the origin (same as a normal cache miss)\n" +
+					"  'stale' — serve the existing cached page if any, else fall back to origin\n" +
+					"  'error' — respond 504",
+				{ enum: ['origin', 'stale', 'error'] }
+			),
+		}
+	),
+
+	management: group(
+		'Management API + UI, served at the fixed path `/prerender_admin` (resource endpoint names are ' +
+			'fixed, like the database/table names). Gated on Harper’s own authentication: every endpoint ' +
+			'except the login/session/page routes requires a `super_user`.',
+		{
+			enabled: option(true, 'Serve the management API and console.'),
+			proxyToOwner: option(
+				true,
+				'The URL explainer reads node-locally (a cross-node point read on the residency-pinned ' +
+					'schedule table awaits Harper’s replication fetch, which has no timeout). When the row is ' +
+					'owned by another node, ask that node over HTTPS instead — a bounded request, forwarding only ' +
+					'the caller’s own credentials, which the peer re-authorizes. Set false to keep every read ' +
+					'strictly node-local and accept an inconclusive schedule row.'
+			),
+			peerTimeoutMs: option(2500, 'Timeout for the peer-node explainer request.', { unit: 'ms', min: 1 }),
+			scanCap: option(
+				20000,
+				'Ceiling on rows touched by an overview scan (due-count, next-24h histogram). Counting is a ' +
+					'capped index walk — at 1M+ targets an uncapped count is not a page-load query — so results ' +
+					'past this are reported as truncated rather than silently undercounted.',
+				{ min: 1 }
+			),
+			backlogSnapshotInterval: option(
+				15 * MINUTE,
+				'How often the backlog/histogram snapshot recomputes (worker 0 of each node). The scan walks ' +
+					'the same nextRenderTime index `claim` reads from every worker every few seconds, so it runs ' +
+					'on this cadence — never on dashboard page load. 0 disables the timer; the console’s ' +
+					'Recompute button still triggers a one-off pass.',
+				{ unit: 'ms', min: 0 }
+			),
+			pageSize: option(
+				50,
+				'Rows per page for the console’s sitemap-entry and page-cache tables. Also bounds the ' +
+					'per-entry state lookups a sitemap detail performs (point reads, one per row).',
+				{ min: 1 }
+			),
+		}
+	),
+
+	page: group('Cached-page lifetimes.', {
+		ttl: option(DAY, 'Default cached-page TTL.', { unit: 'ms', min: 1 }),
+		minTtl: option(6 * HOUR, 'Floor for sitemap-derived TTLs.', { unit: 'ms', min: 1 }),
+		swrTtl: option(3 * HOUR, 'Stale-while-revalidate window.', { unit: 'ms', min: 0 }),
+	}),
+
+	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
+		defaultInterval: option(
+			DAY,
+			'How often a target is re-rendered when nothing more specific applies. Cadence is relative to ' +
+				'each render’s completion (not a fixed time-of-day), and a target’s first render is jittered ' +
+				'across its interval — so the fleet renders as a smooth stream rather than a daily herd. Full ' +
+				'precedence, resolved at schedule time: matched route `renderInterval` (ingress.routes) > the ' +
+				'target’s stored interval (sitemap `changefreq` / explicit API write) > this default.',
+			{ unit: 'ms', min: 1 }
+		),
+		suppression: group(
+			'What happens when a render proves a URL non-indexable (noindex, canonical mismatch, redirect ' +
+				'loop, HTTP error page). The target is not deleted — it is marked `state: suppressed` and ' +
+				'rescheduled at `recheckInterval`, so the verdict re-proves (or heals) itself on cadence, and ' +
+				'discovery stops re-creating it. `maxStrikes` consecutive non-indexable verdicts delete the ' +
+				'target outright; crawler re-discovery restarts the cycle at bounded cost.\n\n' +
+				'Verdicts are not all equally permanent, so the knobs split by HTTP status:\n' +
+				'  - 404/410 (`gone`): the origin’s strongest statement that the page no longer exists. ' +
+				'Rechecking it on the default cadence is almost pure waste, so it gets fewer, further-apart ' +
+				'rechecks before deletion.\n' +
+				'  - 401/403 never suppress at all: an auth-shaped error is far more likely a broken renderer ' +
+				'credential or an origin rule change than a page verdict, and striking on it would mass-delete ' +
+				'healthy targets during an outage.\n' +
+				'  - 408/429/5xx never suppress either: the origin failed to serve the page, it didn’t disavow ' +
+				'it — the target and its cached page both survive and the render retries under `failureRetry`.',
+			{
+				recheckInterval: option(7 * DAY, 'Re-render cadence for a suppressed target.', { unit: 'ms', min: 1 }),
+				maxStrikes: option(4, 'Consecutive non-indexable verdicts before the target is deleted.', { min: 1 }),
+				gone: group('Tighter knobs for 404/410 verdicts.', {
+					recheckInterval: option(14 * DAY, 'Re-render cadence for a gone (404/410) target.', {
+						unit: 'ms',
+						min: 1,
+					}),
+					maxStrikes: option(2, 'Consecutive gone verdicts before the target is deleted.', { min: 1 }),
+				}),
+			}
+		),
+		failureRetry: group(
+			'Retry shape for the HTTP failures that never suppress (401/403 auth-shaped, 408/429/5xx ' +
+				'transient). The first `fastRetries` consecutive failures leave the job’s claim lease in place, ' +
+				'so the retry comes on lease expiry (`queue.jobLeaseTime`) — an origin blip recovers fast, and ' +
+				'the cached page’s stale-while-revalidate window covers bots throughout. From the next strike ' +
+				'on, the retry drops to the target’s normal cadence: a persistently failing page must not ' +
+				'hot-loop 100+ renders a day. Past `page.swrTtl` the kept page stops serving and bots fall ' +
+				'through to the origin on purpose — its answer (a live page for auth-shaped failures, an honest ' +
+				'5xx for transient ones) is the truth, and serving arbitrarily old snapshots while users get ' +
+				'errors would break bot/user parity. Strikes are the target’s one shared counter; any ' +
+				'successful render clears it.',
+			{
+				fastRetries: option(2, 'Consecutive failures retried on lease expiry before dropping to cadence.', {
+					min: 0,
+				}),
+			}
+		),
+		redirects: group(
+			'A redirect that proves nothing permanent (302/303/307, a client-side redirect’s 200, or any ' +
+				'redirect onto a route class we don’t serve) keeps the source target on the theory the page is ' +
+				'coming back. A source that answers that way EVERY interval is de facto permanent, so each such ' +
+				'result counts a strike (the same shared counter suppression uses; any successful render clears ' +
+				'it) and `maxStrikes` consecutive ones retire the source outright. Retiring is safe, not ' +
+				'destructive: bot traffic for the URL is proxied to the origin — which serves the redirect ' +
+				'itself — and on-demand discovery re-creates whatever the origin actually serves.',
+			{
+				maxStrikes: option(4, 'Consecutive impermanent-redirect results before the source is retired.', {
+					min: 1,
+				}),
+			}
+		),
+		reconcile: group(
+			'Periodic repair of targets whose RenderSchedule row is missing. A target and its schedule are ' +
+				'two commits in two databases (the schedule routed to the node owning the URL), so the pair can ' +
+				'end up half-written — and for a URL that is not in a sitemap, NOTHING otherwise re-creates the ' +
+				'schedule: the URL stops rendering silently and permanently. Runs on worker 0 of every node, ' +
+				'each covering only the keys it owns.',
+			{
+				enabled: option(true, 'Run the periodic schedule-repair sweep.'),
+				interval: option(6 * HOUR, 'How often each node sweeps its own slice of the keyspace.', {
+					unit: 'ms',
+					min: SECOND,
+				}),
+				startDelay: option(5 * MINUTE, 'Grace after boot before the first sweep.', {
+					unit: 'ms',
+					min: 0,
+					scope: 'restart',
+				}),
+				startJitter: option(
+					5 * MINUTE,
+					'Per-node spread on the first sweep, so a rolling restart doesn’t sync the sweeps.',
+					{ unit: 'ms', min: 0, scope: 'restart' }
+				),
+				maxRestores: option(
+					5000,
+					'Ceiling on rows RESTORED per sweep. The scan always runs to completion, so a truncated sweep ' +
+						'still reports the true size of the gap — the cap bounds only how much is repaired at once, ' +
+						'since a membership change can strand a large slice of the keyspace and rewriting millions of ' +
+						'rows in one pass would be its own outage.',
+					{ min: 1 }
+				),
+			}
+		),
+	}),
+
+	scan: group(
+		'Bounded registry walks. Harper ends a transaction that stays open too long: with writes pending ' +
+			'it is ABORTED and poisoned (422 "split long-running work into smaller transactions"), and ' +
+			'read-only it is committed and its clock reset. So every walk over a large table collects while ' +
+			'reading and writes only after the cursor closes, in drained batches.',
+		{
+			collectCap: option(
+				100000,
+				'Max rows buffered from one scan; the scan still completes and reports the true count.',
+				{ min: 1 }
+			),
+			batchSize: option(100, 'Writes issued (and fully awaited) per batch once the cursor is closed.', {
+				min: 1,
+			}),
+			yieldEvery: option(200, 'Rows scanned between event-loop yields.', { min: 1 }),
+		}
+	),
+
+	sitemap: group('Sitemap ingestion: the daily refresh, filtering, and crawler identity.', {
+		refreshTime: option('12:00', 'Local time-of-day ("HH:MM") for the daily sitemap refresh.'),
+		timezone: option('America/New_York', 'IANA timezone `refreshTime` is interpreted in.'),
+		filteredWarnPercent: option(
+			50,
+			'A sitemap lists every indexable URL on the site, which is routinely a superset of the paths ' +
+				'the CDN forwards here — so entries that are not a prerender route are counted and dropped ' +
+				'rather than scheduled. Past this share of one sitemap, that is reported as an ERROR instead of ' +
+				'an info line: filtering most of a sitemap is far more likely to mean `ingress.routes` is ' +
+				'incomplete than that the sitemap is wrong, and a silent filter looks exactly like a healthy ' +
+				'refresh.',
+			{ unit: 'percent', min: 0, max: 100 }
+		),
+		node: option(
+			'',
+			'Pin the periodic sitemap refresh to this node (hostname). Empty disables the scheduled ' +
+				'refresh entirely (manual refresh still works).'
+		),
+		workerIndex: option(0, 'Worker index (on `node`) that runs the scheduled refresh.', { min: 0 }),
+		background: option(
+			true,
+			'Run `POST /Sitemap/<url>` as a background walk and answer immediately with a handle, instead ' +
+				'of holding the request open for the whole traversal. A sitemap index is not an ' +
+				'HTTP-request-sized unit of work — a real one fans out to tens of children and over a million ' +
+				'target writes, so the client (or any proxy between it and Harper) times out long before the ' +
+				'walk finishes, leaving the operator with no result, no error, and no way to tell whether ' +
+				'anything was written. Progress is persisted to `SitemapRefresh` under the root URL; ' +
+				'`GET /SitemapRefresh/<root-url>` reports it. `POST ... {"background": false}` restores the ' +
+				'blocking behaviour for a small sitemap or a test.'
+		),
+		staleRunMs: option(
+			10 * MINUTE,
+			'How long a progress row may go un-updated before a new refresh treats the run that wrote it ' +
+				'as dead and starts over. Guards against a worker restart mid-walk leaving a `running` row that ' +
+				'blocks every later refresh of that root.',
+			{ unit: 'ms', min: 1 }
+		),
+		removedSampleCap: option(
+			20,
+			'Max unlinked-target samples carried back in a refresh result (counts stay exact; only the ' +
+				'samples are capped).',
+			{ min: 0 }
+		),
+		failedCap: option(100, 'Max failed-entry samples carried back in a refresh result.', { min: 0 }),
+		userAgent: option(
+			'HarperSitemapCrawler/1.0',
+			'User-Agent for Harper’s sitemap crawler fetch. Unlike the proxy fetch UAs, a sitemap fetch ' +
+				'isn’t a device render, so it sends a single self-identifying UA rather than a spoofed browser ' +
+				'one — makes Harper’s sitemap traffic obvious in origin/CDN logs and separable from the proxy ' +
+				'traffic.',
+			{ movedFrom: 'sitemapUserAgent' }
+		),
+	}),
+
+	queue: group('Render-queue mechanics between the plugin and the render fleet.', {
+		jobLeaseTime: option(10 * MINUTE, 'How long a claimed job is leased before re-claim.', {
+			unit: 'ms',
+			min: SECOND,
+		}),
+		statusSyncInterval: option(MINUTE, 'How often queue status is recomputed/broadcast.', {
+			unit: 'ms',
+			min: SECOND,
+		}),
+		maxClaimLimit: option(
+			25,
+			'Hard ceiling on jobs granted per claim, regardless of what a consumer asks for. Each claimed ' +
+				'job costs a lease write held under the claim mutex, so this bounds the per-claim transaction ' +
+				'(keeps one greedy/misconfigured worker from grabbing a huge batch — long lock hold + starving ' +
+				'other renderers of the burst).',
+			{ min: 1 }
+		),
+	}),
+
+	analytics: group(
+		'Bot-request analytics. `bots` is the registry that gives crawlers a stable display name — ' +
+			'remove an entry to stop tracking that bot under it. A UA the registry misses is not necessarily ' +
+			"'other': with `deriveUnknownBots` on, a self-identifying crawler UA is labeled with the name it " +
+			'declares, so a crawler the CDN starts forwarding before it’s registered still shows up in ' +
+			'analytics under a usable name — promote recurring derived names into the registry to pin their ' +
+			'display name. Only a UA that doesn’t self-identify at all becomes ‘other’, and ' +
+			'`recordUnmatched` governs whether those are recorded.',
+		{
+			enabled: option(true, 'Record bot_request analytics at all.'),
+			recordUnmatched: option(true, "Record requests whose UA yielded no name at all (as 'other')."),
+			deriveUnknownBots: option(true, 'Label unregistered crawlers with the name their UA declares.'),
+			bots: option(
+				[
+					// Entries must match the HTTP *request* User-Agent, not a robots.txt token.
+					// Some crawler names exist only in robots.txt and never appear in a request UA
+					// (Googlebot-News, Google-Extended, Applebot-Extended…) — an entry for one of
+					// those never matches anything and just misleads readers of this list.
+					//
+					// Search engines
+					{ name: 'Googlebot-Image', match: 'googlebot-image' },
+					{ name: 'Googlebot-Video', match: 'googlebot-video' },
+					{ name: 'Google InspectionTool', match: 'google-inspectiontool' },
+					// the -Image/-Video variants need their own entries: the matcher requires a
+					// boundary after the match, so bare `googleother` can't cross the hyphen
+					{ name: 'GoogleOther-Image', match: 'googleother-image' },
+					{ name: 'GoogleOther-Video', match: 'googleother-video' },
+					{ name: 'GoogleOther', match: 'googleother' },
+					{ name: 'Storebot-Google', match: 'storebot-google' },
+					{ name: 'AdsBot-Google', match: 'adsbot-google' },
+					{ name: 'Googlebot', match: 'googlebot' },
+					{ name: 'Bingbot', match: 'bingbot' },
+					{ name: 'DuckDuckBot', match: 'duckduckbot-https' },
+					{ name: 'DuckDuckBot', match: 'duckduckbot' },
+					{ name: 'Applebot', match: 'applebot' },
+					{ name: 'YandexBot', match: 'yandexbot' },
+					{ name: 'Baidu Spider', match: 'baiduspider' },
+					{ name: 'SeznamBot', match: 'seznambot' },
+					{ name: 'Naver Yeti', match: 'yeti' },
+					{ name: 'Sogou Spider', match: 'sogou' },
+					{ name: 'PetalBot', match: 'petalbot' },
+					// AI crawlers & assistants
+					{ name: 'GPTBot', match: 'gptbot' },
+					{ name: 'OAI-SearchBot', match: 'oai-searchbot' },
+					{ name: 'ChatGPT-User', match: 'chatgpt-user' },
+					{ name: 'ClaudeBot', match: 'claudebot' },
+					{ name: 'Claude-User', match: 'claude-user' },
+					{ name: 'Claude-SearchBot', match: 'claude-searchbot' },
+					{ name: 'PerplexityBot', match: 'perplexitybot' },
+					{ name: 'Google-CloudVertexBot', match: 'google-cloudvertexbot' },
+					{ name: 'Perplexity-User', match: 'perplexity-user' },
+					{ name: 'CCBot', match: 'ccbot' },
+					{ name: 'Bytespider', match: 'bytespider' },
+					{ name: 'Meta-ExternalAgent', match: 'meta-externalagent' },
+					{ name: 'Meta-ExternalFetcher', match: 'meta-externalfetcher' },
+					{ name: 'FacebookBot', match: 'facebookbot' },
+					{ name: 'Amazonbot', match: 'amazonbot' },
+					{ name: 'DuckAssistBot', match: 'duckassistbot' },
+					{ name: 'MistralAI-User', match: 'mistralai-user' },
+					// SEO / site-audit tools
+					{ name: 'AhrefsBot', match: 'ahrefsbot' },
+					{ name: 'SemrushBot', match: 'semrushbot' },
+					{ name: 'MJ12bot', match: 'mj12bot' },
+					{ name: 'Rogerbot', match: 'rogerbot' },
+					{ name: 'DotBot', match: 'dotbot' },
+					{ name: 'Screaming Frog', match: 'screaming frog seo spider' },
+					{ name: 'Botify', match: 'botify' },
+					{ name: 'Deepcrawl', match: 'deepcrawl' },
+					{ name: 'OnCrawl', match: 'oncrawl' },
+					{ name: 'Sitebulb', match: 'sitebulb' },
+				],
+				'Crawler registry: { name, match } entries, where `match` is a case-insensitive substring of ' +
+					'the User-Agent; longer matches win over shorter ones (e.g. `googlebot-image` before ' +
+					'`googlebot`).',
+				{ itemType: 'object' }
+			),
+		}
+	),
+
+	crawlStats: group(
+		'Crawl breadth: distinct URLs crawled per bot per UTC day, via per-thread HyperLogLog ' +
+			'sketches flushed to crawl_stats.CrawlSketch. Read merged through ' +
+			'GET /prerender_admin/crawl-breadth. Recording is additionally gated by the analytics ' +
+			'gate (no bot name → nothing to attribute a sketch to).',
+		{
+			enabled: option(true, 'Record crawl-breadth sketches at all.'),
+			flushInterval: option(
+				5 * MINUTE,
+				'Per-thread sketch persistence cadence — the maximum sketch data lost on a crash.',
+				{ unit: 'ms', min: SECOND }
+			),
+			retentionDays: option(90, 'Sketch rows older than this are swept at day rollover.', { min: 1 }),
+			maxBotsPerThread: option(
+				64,
+				'Sketches are 16 KB each; this caps a UA-derivation flood from minting unbounded per-thread ' +
+					"sketches. Overflow bots share one '~overflow' bucket for the day.",
+				{ min: 1 }
+			),
+		}
+	),
+});
+
+const clone = (value) => {
+	if (Array.isArray(value)) return value.map(clone);
+	if (value && typeof value === 'object') {
+		const out = {};
+		for (const [key, inner] of Object.entries(value)) out[key] = clone(inner);
+		return out;
+	}
+	return value;
+};
+
+/** Fresh defaults derived from the schema (deep-cloned, safe to mutate). */
+export const defaultConfig = () => {
+	const build = (node) => {
+		if (isOption(node)) return clone(node.default);
+		const out = {};
+		for (const [key, child] of Object.entries(node.children)) out[key] = build(child);
+		return out;
+	};
+	return build(configSchema);
+};
+
+/**
+ * Walk every option in the schema, calling `visit(path, node, inheritedScope)` with the
+ * dotted path (no `prerender.` prefix) and the option's effective scope.
+ */
+const walkOptions = (visit) => {
+	const walk = (node, path, inheritedScope) => {
+		const scope = node.scope ?? inheritedScope;
+		if (isOption(node)) return visit(path, node, scope);
+		for (const [key, child] of Object.entries(node.children)) {
+			walk(child, path ? `${path}.${key}` : key, scope);
+		}
+	};
+	walk(configSchema, '', 'live');
+};
+
+/** Dotted paths of secret options (drives redaction). */
+export const secretPaths = () => {
+	const paths = [];
+	walkOptions((path, node) => {
+		if (node.secret) paths.push(path);
+	});
+	return paths;
+};
+
+/** Dotted paths of restart-scoped options (drives pending-restart detection). */
+export const restartPaths = () => {
+	const paths = [];
+	walkOptions((path, node, scope) => {
+		if (scope === 'restart') paths.push(path);
+	});
+	return paths;
+};
+
+/**
+ * Map of legacy dotted path -> current dotted path, from `movedFrom` markers (a marker
+ * on a group covers its whole subtree).
+ */
+export const aliasPaths = () => {
+	const aliases = {};
+	const walk = (node, path) => {
+		if (node.movedFrom) aliases[node.movedFrom] = path;
+		if (isGroup(node)) {
+			for (const [key, child] of Object.entries(node.children)) walk(child, path ? `${path}.${key}` : key);
+		}
+	};
+	walk(configSchema, '');
+	return aliases;
+};
+
+const typeOf = (defaultValue) => (Array.isArray(defaultValue) ? 'array' : typeof defaultValue);
+
+/**
+ * JSON-serializable schema description for the management API / admin UI. Groups become
+ * { kind: 'group', description, scope?, children }; options become
+ * { kind: 'option', type, description, scope, default, ...validation/display hints }.
+ * Secret defaults are all empty strings, so defaults are safe to serve as-is.
+ */
+export const describeConfigSchema = () => {
+	const describe = (node, inheritedScope) => {
+		const scope = node.scope ?? inheritedScope;
+		if (isOption(node)) {
+			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
+			out.default = clone(node.default);
+			for (const key of ['enum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
+				if (node[key] !== undefined) out[key] = node[key];
+			}
+			return out;
+		}
+		const children = {};
+		for (const [key, child] of Object.entries(node.children)) children[key] = describe(child, scope);
+		const out = { kind: 'group', description: node.description, children };
+		if (node.scope) out.scope = node.scope;
+		if (node.movedFrom) out.movedFrom = node.movedFrom;
+		return out;
+	};
+	return describe(configSchema, 'live');
+};
+
+/** Look up the schema node (option or group) at a dotted path, or undefined. */
+export const schemaNodeAt = (path) => {
+	let node = configSchema;
+	for (const segment of path.split('.')) {
+		if (!isGroup(node)) return undefined;
+		node = node.children[segment];
+		if (!node) return undefined;
+	}
+	return node;
+};
+
+export { SECOND, MINUTE, HOUR, DAY };

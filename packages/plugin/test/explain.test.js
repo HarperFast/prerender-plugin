@@ -65,7 +65,7 @@ test('a case-only device difference is normalization, not a fallback', () => {
 });
 
 test('exclude patterns and the domain allowlist are reported', () => {
-	applyOptions({ domains: ['www.example.com'], excludePathPatterns: ['/search/'] });
+	applyOptions({ domains: ['www.example.com'], ingress: { excludePathPatterns: ['/search/'] } });
 
 	// An excluded path now reports as passthrough, and names the config key it came from —
 	// `excludePathPatterns`, not a route someone wrote — since that is what to go and change.

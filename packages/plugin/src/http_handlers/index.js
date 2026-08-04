@@ -31,7 +31,7 @@ const isBotRequest = (request) => {
 		request._prerenderTarget = target;
 		return true;
 	}
-	return request.url.startsWith(config.botPathPrefix);
+	return request.url.startsWith(config.ingress.botPathPrefix);
 };
 
 server.http((request, nextHandler) => {

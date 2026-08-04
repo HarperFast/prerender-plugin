@@ -71,8 +71,8 @@ const ROUTES = [
 	{ match: 'prefix', path: '/orders/', mode: 'passthrough' },
 ];
 
-const forwarded = (extra = {}) =>
-	applyOptions({ ingress: { mode: 'forwarded', routes: ROUTES }, excludePathPatterns: [], ...extra });
+const forwarded = ({ excludePathPatterns = [] } = {}) =>
+	applyOptions({ ingress: { mode: 'forwarded', routes: ROUTES, excludePathPatterns } });
 
 const locs = (...urls) => urls.map((loc) => ({ loc }));
 
@@ -126,7 +126,7 @@ test('carries the entry through so changefreq still drives renderInterval', () =
 
 test('prefix mode keeps everything except a folded exclude', () => {
 	// No route list gates ingress in prefix mode, so a sitemap is not filtered down to routes.
-	applyOptions({ excludePathPatterns: ['/search/'] });
+	applyOptions({ ingress: { excludePathPatterns: ['/search/'] } });
 	const { incoming, filtered } = partitionSitemapEntries(
 		locs('https://www.example.com/anything', 'https://www.example.com/search/q')
 	);

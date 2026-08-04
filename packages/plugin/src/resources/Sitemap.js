@@ -1,4 +1,4 @@
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
@@ -638,7 +638,10 @@ async function fetchLatestSitemap(url) {
 	const res = await fetch(url, {
 		method: 'GET',
 		redirect: 'follow',
-		headers: { 'User-Agent': config.sitemapUserAgent, [config.securityToken.header]: config.securityToken.value },
+		headers: {
+			'User-Agent': config.sitemap.userAgent,
+			[config.origin.securityToken.header]: config.origin.securityToken.value,
+		},
 		dispatcher: dispatcherFor(stagingIp),
 	});
 	const xml = await res.text();
@@ -680,17 +683,27 @@ function snippet(body, max = 200) {
 }
 
 let sitemapSchedulerStarted = false;
+let sitemapPendingTimer = null;
+let sitemapArmedKey = null; // `${refreshTime}|${timezone}` while scheduled, null while not
+
+// This node+worker runs the scheduled refresh only while it is the pinned one. Live:
+// re-pinning via config (node, workerIndex) starts/stops the scheduler without a restart.
+const isPinnedHere = () =>
+	!!config.sitemap.node && config.sitemap.node === server.hostname && config.sitemap.workerIndex === server.workerIndex;
+
+// Introspection for tests and the management API: what the pending refresh is armed with
+// (`armedKey: null` = not scheduled on this worker).
+export const sitemapSchedulerState = () => ({ started: sitemapSchedulerStarted, armedKey: sitemapArmedKey });
 
 /**
- * Start the daily sitemap refresh, pinned to the configured node + worker. Called
- * from handleApplication after config is applied. No-op when `sitemap.node` is
- * empty or this node/worker is not the pinned one. Idempotent.
+ * Start the daily sitemap refresh, pinned to the configured node + worker. Called from
+ * handleApplication after config is applied. Every worker subscribes; only the pinned
+ * one holds a timer. `sitemap.node`/`workerIndex`/`refreshTime`/`timezone` are all live:
+ * changing any of them re-schedules (or stops) the pending refresh on the next
+ * config apply. Idempotent.
  */
 export function startSitemapRefreshScheduler() {
 	if (sitemapSchedulerStarted) return;
-	if (!config.sitemap.node) return;
-	if (config.sitemap.node !== server.hostname || config.sitemap.workerIndex !== server.workerIndex) return;
-
 	sitemapSchedulerStarted = true;
 
 	let isRefreshing = false;
@@ -721,13 +734,27 @@ export function startSitemapRefreshScheduler() {
 
 		isRefreshing = false;
 
+		// Re-checks the pin: if it moved while this run was in flight, no new timer is armed here.
 		scheduleNextRefresh();
 	};
 
 	const scheduleNextRefresh = () => {
-		const nextSitemapRefreshTime = getNextSitemapRefreshTime();
-		setTimeout(refreshAllSitemaps, nextSitemapRefreshTime - Date.now()).unref?.();
+		if (sitemapPendingTimer) clearTimeout(sitemapPendingTimer);
+		sitemapPendingTimer = null;
+		sitemapArmedKey = null;
+		if (!isPinnedHere()) return;
+
+		sitemapArmedKey = `${config.sitemap.refreshTime}|${config.sitemap.timezone}`;
+		sitemapPendingTimer = setTimeout(refreshAllSitemaps, getNextSitemapRefreshTime() - Date.now());
+		sitemapPendingTimer.unref?.();
+	};
+
+	const sync = () => {
+		const desiredKey = isPinnedHere() ? `${config.sitemap.refreshTime}|${config.sitemap.timezone}` : null;
+		if (desiredKey === sitemapArmedKey) return;
+		scheduleNextRefresh();
 	};
 
 	scheduleNextRefresh();
+	onConfigApplied(sync);
 }
