@@ -133,7 +133,9 @@ rest: true # required for the @export-ed table REST endpoints
   excludePathPatterns: ['/search/'] # paths containing these are never auto-scheduled
 
   analytics:
-    enabled: true # record bot_request analytics at all
+    enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
+    # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate), and
+    # page_age (ms since the served page rendered — freshness at serve, cache hits only)
     recordUnmatched: true # also record UAs that matched no configured bot (as 'other')
     bots: # registry: which crawlers are tracked by name. { name, match } — match is a
       - { name: Googlebot, match: googlebot } # case-insensitive UA substring; longer matches win.
