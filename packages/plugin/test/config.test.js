@@ -232,6 +232,18 @@ test('numeric bounds are enforced', () => {
 	assert.equal(config.queue.maxClaimLimit, 25);
 });
 
+test('empty strings are rejected for nonEmpty header names and refresh time/zone', () => {
+	applyOptions({
+		origin: { securityToken: { header: '' } },
+		debugHeader: { key: '' },
+		sitemap: { refreshTime: '', timezone: '' },
+	});
+	assert.equal(config.origin.securityToken.header, 'x-harper-renderer-bypass');
+	assert.equal(config.debugHeader.key, 'x-harper-prerender-debug');
+	assert.equal(config.sitemap.refreshTime, '12:00');
+	assert.equal(config.sitemap.timezone, 'America/New_York');
+});
+
 test('an empty deviceTypes.supported is rejected (the fallback device is its first entry)', () => {
 	applyOptions({ deviceTypes: { supported: [] } });
 	assert.deepEqual(config.deviceTypes.supported, ['desktop', 'mobile', 'tablet']);

@@ -187,7 +187,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'bot mitigation). Set the value per deployment — preferably via `valueEnv` so the secret ' +
 				'stays out of config.yaml.',
 			{
-				header: option('x-harper-renderer-bypass', 'Header name carrying the token.'),
+				header: option('x-harper-renderer-bypass', 'Header name carrying the token.', { nonEmpty: true }),
 				value: option('', 'The token itself. Prefer `valueEnv`.', { secret: true }),
 				valueEnv: option(
 					'',
@@ -252,7 +252,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 	}),
 
 	debugHeader: group('Debug response headers, emitted when the request carries this header (any value).', {
-		key: option('x-harper-prerender-debug', 'Request header name that turns on debug response headers.'),
+		key: option('x-harper-prerender-debug', 'Request header name that turns on debug response headers.', {
+			nonEmpty: true,
+		}),
 	}),
 
 	renderNow: group(
@@ -473,8 +475,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 	),
 
 	sitemap: group('Sitemap ingestion: the daily refresh, filtering, and crawler identity.', {
-		refreshTime: option('12:00', 'Local time-of-day ("HH:MM") for the daily sitemap refresh.'),
-		timezone: option('America/New_York', 'IANA timezone `refreshTime` is interpreted in.'),
+		refreshTime: option('12:00', 'Local time-of-day ("HH:MM") for the daily sitemap refresh.', { nonEmpty: true }),
+		timezone: option('America/New_York', 'IANA timezone `refreshTime` is interpreted in.', { nonEmpty: true }),
 		filteredWarnPercent: option(
 			50,
 			'A sitemap lists every indexable URL on the site, which is routinely a superset of the paths ' +

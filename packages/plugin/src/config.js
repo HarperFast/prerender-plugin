@@ -200,7 +200,13 @@ const enforceSchemaConstraints = (fresh) => {
 			reject(path, node, `must be one of ${node.enum.map((v) => `'${v}'`).join(' | ')}`);
 			return;
 		}
-		if (node.nonEmpty && (value === '' || (Array.isArray(value) && value.length === 0))) {
+		// null/undefined can't actually reach here through applyOptions (mergeInto skips
+		// null/undefined overrides, and every schema path exists in the defaults), but the
+		// validator shouldn't depend on the merge layer's behavior to be safe.
+		if (
+			node.nonEmpty &&
+			(value === null || value === undefined || value === '' || (Array.isArray(value) && value.length === 0))
+		) {
 			reject(path, node, 'must not be empty');
 			return;
 		}
