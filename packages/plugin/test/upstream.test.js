@@ -204,14 +204,21 @@ test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions
 // kMaxHeadersSize symbol, so the tests survive an undici refactor and actually prove the thing
 // that broke in production: a large-but-legitimate origin response head must not kill the request.
 
-// Serve a response whose head sums to roughly `bytes` across many headers — the shape a real
-// origin produces (a Set-Cookie pile-up plus CSP/Link-preload), since the cap is cumulative
-// over the whole head, not per header.
+// Serve a response whose head sums to `bytes` across many headers — the shape a real origin
+// produces (a Set-Cookie pile-up plus CSP/Link-preload), since the cap is cumulative over the
+// whole head, not per header.
+//
+// undici counts header NAME and VALUE bytes (Parser.onHeaderField / onHeaderValue each call
+// trackHeader with their own buffer length) and not the `: ` / CRLF delimiters, so budgeting
+// `name.length + value.length` per header is exactly what the cap sees.
+const HEADER_BYTES = 1024;
 const serverWithHeadBytes = async (bytes) => {
 	const server = http.createServer((_req, res) => {
 		const headers = {};
-		const per = 1024;
-		for (let i = 0; i < Math.ceil(bytes / per); i++) headers[`x-pad-${i}`] = 'a'.repeat(per - 12);
+		for (let i = 0; i < Math.ceil(bytes / HEADER_BYTES); i++) {
+			const name = `x-pad-${i}`;
+			headers[name] = 'a'.repeat(HEADER_BYTES - name.length);
+		}
 		res.writeHead(200, headers);
 		res.end('ok');
 	});
@@ -284,6 +291,30 @@ test('maxResponseHeaderBytes is declared restart-scoped', () => {
 	// Guards the scope declaration itself: dropping it would make the option look live while the
 	// running dispatcher quietly kept the old cap.
 	assert.ok(restartPaths().includes('origin.maxResponseHeaderBytes'));
+});
+
+test('a dispatcher built after a live cap edit still uses the captured cap', async () => {
+	// origin.staging.ip IS live-scoped, so enabling staging mints a pinned dispatcher long after
+	// boot. If that construction re-read config it would pick up a cap edited in the meantime
+	// while the unpinned singleton kept the boot value — two dispatchers disagreeing, and a
+	// pending-restart notice that was only half true. The cap is captured once instead.
+	// A fresh module instance so the pinned entry is genuinely built here rather than reused from
+	// an earlier test, and so the capture starts unset.
+	applyOptions({});
+	const fresh = await import('../src/util/upstream.js?fresh=capture-once');
+	fresh.dispatcherFor(undefined); // force the capture at the default
+
+	applyOptions({ origin: { maxResponseHeaderBytes: 16 * 1024, staging: { ip: '127.0.0.1' } } });
+	const pinnedAfterEdit = fresh.dispatcherFor('127.0.0.1');
+
+	// Built after the edit, but still honors the captured 64 KiB — a 32 KiB head must pass. Were
+	// it reading config at construction it would have taken the 16 KiB cap and overflowed.
+	await withServer(32 * 1024, async (origin) => {
+		const res = await pinnedAfterEdit.request({ origin, path: '/', method: 'GET' });
+		assert.equal(res.statusCode, 200);
+		await res.body.text();
+	});
+	applyOptions({});
 });
 
 test('the staging-pinned dispatcher carries the cap too', async () => {

@@ -33,7 +33,15 @@ export const configuredStagingIp = () => {
 // single page (a Set-Cookie pile-up plus CSP/Link-preload is enough), and undici answers by
 // DESTROYING THE SOCKET with UND_ERR_HEADERS_OVERFLOW. The crawler then gets a 500 for a page
 // browsers and the CDN load fine, deterministically, because it is a property of that response.
-const agentOptions = () => ({ maxHeaderSize: config.origin.maxResponseHeaderBytes });
+// Captured on first use and reused by every dispatcher built afterwards, so restart scope holds
+// for all of them. Re-reading config per construction would not: `origin.staging.ip` is
+// live-scoped, so a pinned dispatcher can be built long after boot, and it would then pick up a
+// cap edited in the meantime while the unpinned singleton kept the boot value — two dispatchers
+// disagreeing, and a pending-restart notice that was only half true.
+let capturedMaxHeaderSize;
+const agentOptions = () => ({
+	maxHeaderSize: (capturedMaxHeaderSize ??= config.origin.maxResponseHeaderBytes),
+});
 
 // The unpinned dispatcher carries every cache-miss and passthrough fetch, so it stays a plain
 // lazily-built singleton: one `??=` test on the hot path, no key to build and no Map to probe.
