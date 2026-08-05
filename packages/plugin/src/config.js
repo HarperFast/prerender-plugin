@@ -370,8 +370,8 @@ export const collectConfigWarnings = () => {
 				'warn',
 				'renderNow.token',
 				valueEnv
-					? `renderNow.enabled but renderNow.valueEnv ("${valueEnv}") is not set in the environment and no renderNow.token is configured — the on-demand levers stay INERT (they fail closed rather than authorizing anyone)`
-					: 'renderNow.enabled but no renderNow.token is configured — the on-demand levers stay INERT (they fail closed rather than authorizing anyone); set renderNow.token or renderNow.valueEnv'
+					? `renderNow.enabled is true but renderNow.valueEnv ("${valueEnv}") is not set in the environment and no renderNow.token is configured — renderNow is DISABLED (the levers fail closed rather than authorizing anyone)`
+					: 'renderNow.enabled is true but no renderNow.token is configured — renderNow is DISABLED (the levers fail closed rather than authorizing anyone); set renderNow.token or renderNow.valueEnv'
 			);
 		}
 	}

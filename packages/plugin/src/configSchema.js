@@ -303,7 +303,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			token: option(
 				'',
 				'Expected value of `header`. **Required** — there is no unauthenticated mode: an empty token ' +
-					'makes the feature inert (the levers stay off even when `enabled` is true) rather than ' +
+					'leaves renderNow DISABLED (the levers stay off even when `enabled` is true) rather than ' +
 					'authorizing anyone who sends the header, and is reported at config-apply time.\n\n' +
 					'This fails CLOSED deliberately. The levers let a caller bypass the served cache and force ' +
 					'a synchronous render that occupies the request for up to `timeoutMs`, so on a path that ' +
