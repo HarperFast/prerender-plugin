@@ -57,6 +57,21 @@ export function buildResponseHeaders(resource) {
 		if (!isNaN(lastCachedMs)) {
 			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
 			headers.set('age', String(ageSec));
+
+			// Conditional-request validator for a cached page. The stored representation
+			// changes only when a render replaces it, so lastCached IS its version.
+			//
+			// Deliberately NO `last-modified`: an ETag is an opaque version token with no date
+			// semantics, so it buys 304s without publishing a freshness date that would flap on
+			// every re-render even when the content is byte-identical. Weak is the honest
+			// strength — the same page is served gzip or identity depending on negotiation, and
+			// weak comparison is what RFC 7232 conditional GET/HEAD uses regardless.
+			//
+			// Never clobber an upstream validator: if the origin/render supplied its own, that
+			// one describes the content more precisely than our render timestamp does.
+			if (!headers.has('etag')) {
+				headers.set('etag', `W/"${lastCachedMs.toString(36)}"`);
+			}
 		}
 	}
 
@@ -161,6 +176,9 @@ export function applyConditional(status, headers, request, body) {
  * Re-encode the body to the client's best accepted encoding when it differs from what the
  * upstream sent. Mutates `content-encoding`/`content-length` on `headers` and returns the
  * (possibly re-encoded) body.
+ *
+ * Called for bodiless responses too — a HEAD must report the encoding a GET would have
+ * returned, so the header half runs even when there is nothing to transcode.
  */
 export function negotiateEncoding(body, headers, request) {
 	const contentEncoding = headers.get('content-encoding') || null;
@@ -174,6 +192,10 @@ export function negotiateEncoding(body, headers, request) {
 		headers.delete('content-encoding');
 	}
 	headers.delete('content-length');
+
+	// No bytes to transcode (HEAD). The headers above have already been corrected, which is
+	// the whole point of running this for a bodiless response.
+	if (!body) return body;
 
 	return reencode(Readable.fromWeb(body), contentEncoding, bestEncoding, false);
 }
@@ -216,7 +238,14 @@ export function deliverResource(resource, request, info = {}) {
 		headers.set('x-harper-render-now', info.renderNowStatus);
 	}
 
-	if (body) {
+	// Negotiate whenever the resource HAS a representation — including a HEAD, whose headers
+	// must describe what a GET would have returned even though no bytes follow (RFC 9110
+	// §9.3.2). Gated on `resource.content` rather than `body` precisely because a HEAD nulls
+	// the body above: gating on `body` left HEAD advertising the stored `content-encoding:
+	// gzip` while the GET re-encoded to identity. A 304 carries no representation, and neither
+	// does the render-now 504 fallback (content: null) — both keep their headers untouched, or
+	// we would invent a content-encoding for a body that does not exist.
+	if (status !== 304 && resource.content) {
 		body = negotiateEncoding(body, headers, request);
 	}
 

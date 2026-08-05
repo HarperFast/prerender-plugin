@@ -1,5 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import zlib from 'node:zlib';
 import { applyOptions } from '../src/config.js';
 
 // response.js transitively imports PrerenderedPage, which extends a Harper `databases`
@@ -175,4 +176,120 @@ test('deliverResource gates debug headers on the debug request header, and repor
 
 	const debug = deliverResource(resource, mockRequest({ 'x-harper-prerender-debug': 'true' }), { source: 'origin' });
 	assert.equal(debug.headers.get('x-harper-source'), 'origin');
+});
+
+// --- HEAD (RFC 9110 §9.3.2): no body, but headers identical to the GET's ---
+
+const headRequest = (headers = {}) => ({ ...mockRequest(headers), method: 'HEAD' });
+
+// A gzip payload so the GET half of the comparison can actually decode rather than
+// erroring asynchronously on a stream that only claims to be gzip.
+const gzipStream = () => {
+	const gzipped = zlib.gzipSync(Buffer.from('<html>hydrated</html>'));
+	return new ReadableStream({
+		start(c) {
+			c.enqueue(new Uint8Array(gzipped));
+			c.close();
+		},
+	});
+};
+
+const gzipResource = () => ({
+	statusCode: 200,
+	miss: true,
+	headers: { 'content-type': 'text/html', 'content-encoding': 'gzip' },
+	content: gzipStream(),
+	url: 'https://x/',
+	deviceType: 'desktop',
+	cacheKey: 'https://x/|desktop',
+});
+
+test('deliverResource: a HEAD reports the encoding a GET would have returned, not the stored one', () => {
+	// The live prod regression: HEAD kept the stored `content-encoding: gzip` while the GET
+	// re-encoded to identity, so HEAD described a representation the GET never delivered.
+	const get = deliverResource(gzipResource(), mockRequest(), {});
+	const head = deliverResource(gzipResource(), headRequest(), {});
+
+	assert.equal(head.body, undefined, 'HEAD must carry no body');
+	assert.notEqual(get.body, undefined, 'GET still carries a body');
+
+	// The whole point: identical encoding metadata for identical requests.
+	assert.equal(get.headers.has('content-encoding'), false);
+	assert.equal(head.headers.has('content-encoding'), false);
+	assert.equal(head.headers.get('content-type'), get.headers.get('content-type'));
+});
+
+test('deliverResource: a HEAD that accepts the stored encoding keeps it', () => {
+	const head = deliverResource(gzipResource(), headRequest({ 'accept-encoding': 'gzip' }), {});
+	assert.equal(head.headers.get('content-encoding'), 'gzip');
+	assert.equal(head.body, undefined);
+});
+
+test('deliverResource: a 304 never gains a content-encoding', () => {
+	// Negotiation must not run on a response with no representation — otherwise a client
+	// advertising gzip would get `content-encoding: gzip` on a bodiless 304.
+	const lastCached = new Date('2026-08-01T00:00:00Z');
+	const etag = `W/"${lastCached.getTime().toString(36)}"`;
+	const resource = { ...gzipResource(), lastCached };
+
+	const res = deliverResource(resource, mockRequest({ 'if-none-match': etag, 'accept-encoding': 'gzip' }), {});
+	assert.equal(res.status, 304);
+	assert.equal(res.body, undefined);
+	assert.equal(res.headers.has('content-encoding'), false);
+});
+
+test('deliverResource: a bodiless fallback (content: null) keeps its headers untouched', () => {
+	// The render-now timeout 504 has no representation at all.
+	const resource = {
+		miss: true,
+		statusCode: 504,
+		url: 'https://x/',
+		deviceType: 'desktop',
+		headers: {},
+		content: null,
+	};
+	const res = deliverResource(resource, mockRequest({ 'accept-encoding': 'gzip' }), {});
+	assert.equal(res.status, 504);
+	assert.equal(res.headers.has('content-encoding'), false);
+});
+
+// --- Conditional-request validator synthesized from lastCached ---
+
+test('buildResponseHeaders synthesizes a weak etag from lastCached, and no last-modified', () => {
+	const lastCached = new Date('2026-08-01T00:00:00Z');
+	const headers = buildResponseHeaders({ statusCode: 200, headers: { 'content-type': 'text/html' }, lastCached });
+
+	assert.equal(headers.get('etag'), `W/"${lastCached.getTime().toString(36)}"`);
+	// Deliberately absent: a date-semantic validator would flap on every re-render even when
+	// the content is byte-identical.
+	assert.equal(headers.has('last-modified'), false);
+});
+
+test('buildResponseHeaders never clobbers an upstream etag', () => {
+	const headers = buildResponseHeaders({
+		statusCode: 200,
+		headers: { etag: '"from-origin"' },
+		lastCached: new Date('2026-08-01T00:00:00Z'),
+	});
+	assert.equal(headers.get('etag'), '"from-origin"');
+});
+
+test('buildResponseHeaders omits the etag when there is no usable lastCached', () => {
+	assert.equal(buildResponseHeaders({ statusCode: 200, headers: {} }).has('etag'), false);
+	assert.equal(buildResponseHeaders({ statusCode: 200, headers: {}, lastCached: 'nonsense' }).has('etag'), false);
+	// Not a cached 200 => no validator to offer.
+	assert.equal(buildResponseHeaders({ statusCode: 404, headers: {}, lastCached: new Date() }).has('etag'), false);
+});
+
+test('the synthesized etag round-trips to a 304 for both GET and HEAD', () => {
+	const lastCached = new Date('2026-08-01T00:00:00Z');
+	const etag = buildResponseHeaders({ statusCode: 200, headers: {}, lastCached }).get('etag');
+	const resource = { ...gzipResource(), lastCached };
+
+	for (const request of [mockRequest({ 'if-none-match': etag }), headRequest({ 'if-none-match': etag })]) {
+		const res = deliverResource({ ...resource, content: gzipStream() }, request, {});
+		assert.equal(res.status, 304);
+		assert.equal(res.body, undefined);
+		assert.equal(res.headers.get('etag'), etag);
+	}
 });
