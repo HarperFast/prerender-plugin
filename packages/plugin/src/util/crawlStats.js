@@ -110,9 +110,14 @@ async function persist(forDay, forSketches, bots) {
 		if (!mine) continue;
 		// Read-merge-write of this node's row, serialized against the other workers by the
 		// cross-worker mutex. The row is this node's own (node is in the key), so the read
-		// is local — no cross-node fetch to time out on.
+		// is local — no cross-node fetch to time out on. Explicit lock/finally rather than
+		// `withLock` because this is a one-shot section — the repo's withLock idiom wraps a
+		// REUSABLE function (see RenderQueue.claim), and an inline `withLock(fn)()` reads
+		// like an accidental double call.
 		const id = `${forDay}|${bot}|${server.hostname}`;
-		await getMutex(`crawlSketch/${bot}`).withLock(async () => {
+		const mutex = getMutex(`crawlSketch/${bot}`);
+		await mutex.lock();
+		try {
 			const existing = await CrawlSketch.get(id);
 			// Merge into a copy: merging the row INTO the thread sketch would fold other
 			// workers' registers into thread-local state, and a later failed write would
@@ -129,7 +134,9 @@ async function persist(forDay, forSketches, bots) {
 				estimate: estimateSketch(merged),
 				updatedAt: Date.now(),
 			});
-		})();
+		} finally {
+			mutex.unlock();
+		}
 	}
 }
 
@@ -150,23 +157,28 @@ async function sweepExpired() {
 }
 
 /**
- * Merge raw sketch rows into per-day breadth estimates — the pure half of the admin
- * crawl-breadth route, split out so it's testable without the resource plumbing.
- * Returns [{ day, total, bots: [{ bot, distinctUrls, shards }] }] sorted by day desc,
- * where `total` is the distinct-URL count of the UNION across bots (not a sum).
+ * Streaming accumulator for the admin crawl-breadth route: fold one raw sketch row into
+ * `byDay` (a Map of day -> Map of bot -> { registers, shards }). Split this way so the
+ * route can `for await` a search cursor row by row — merging each 16 KB row into the
+ * accumulator and releasing it — instead of buffering the whole result set; the resident
+ * set is one sketch per (day, bot), not one per row.
  */
-export function computeBreadth(rows) {
-	const byDay = new Map();
-	for (const row of rows) {
-		if (!row?.registers || !row.bot) continue;
-		let bots = byDay.get(row.day);
-		if (!bots) byDay.set(row.day, (bots = new Map()));
-		let entry = bots.get(row.bot);
-		if (!entry) bots.set(row.bot, (entry = { registers: createSketch(), shards: 0 }));
-		mergeSketch(entry.registers, row.registers);
-		entry.shards++;
-	}
+export function mergeBreadthRow(byDay, row) {
+	if (!row?.registers || !row.bot) return;
+	let bots = byDay.get(row.day);
+	if (!bots) byDay.set(row.day, (bots = new Map()));
+	let entry = bots.get(row.bot);
+	if (!entry) bots.set(row.bot, (entry = { registers: createSketch(), shards: 0 }));
+	mergeSketch(entry.registers, row.registers);
+	entry.shards++;
+}
 
+/**
+ * Turn the accumulator into per-day breadth estimates:
+ * [{ day, total, bots: [{ bot, distinctUrls, shards }] }] sorted by day desc, where
+ * `total` is the distinct-URL count of the UNION across bots (not a sum).
+ */
+export function finalizeBreadth(byDay) {
 	return [...byDay]
 		.sort(([a], [b]) => (a < b ? 1 : -1))
 		.map(([forDay, bots]) => {
@@ -179,6 +191,13 @@ export function computeBreadth(rows) {
 				.sort((a, b) => b.distinctUrls - a.distinctUrls);
 			return { day: forDay, total: estimateSketch(union), bots: perBot };
 		});
+}
+
+/** Convenience over the two halves above, for in-memory row sets (and tests). */
+export function computeBreadth(rows) {
+	const byDay = new Map();
+	for (const row of rows) mergeBreadthRow(byDay, row);
+	return finalizeBreadth(byDay);
 }
 
 /** Test hook: reset module state between tests. */

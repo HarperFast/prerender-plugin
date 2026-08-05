@@ -65,7 +65,7 @@ import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
-import { computeBreadth } from '../util/crawlStats.js';
+import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
@@ -1058,22 +1058,35 @@ export class PrerenderAdmin extends Resource {
 		const days = Math.min(Math.max(1, Number(target?.get?.('days')) || 7), 31);
 		const since = new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 		const cap = 4096;
-		const rows = await Array.fromAsync(
-			databases.crawl_stats.CrawlSketch.search({
-				conditions: [{ attribute: 'day', comparator: 'greater_than_equal', value: since }],
-				select: ['day', 'bot', 'registers'],
-				limit: cap + 1, // one extra row = "truncated", never merged
-			})
-		);
-		const truncated = rows.length > cap;
-		if (truncated) rows.length = cap;
+		const results = databases.crawl_stats.CrawlSketch.search({
+			conditions: [{ attribute: 'day', comparator: 'greater_than_equal', value: since }],
+			select: ['day', 'bot', 'registers'],
+			limit: cap + 1, // one extra row = "truncated", never merged
+		});
+
+		// Stream the cursor instead of buffering it: each 16 KB row merges into the
+		// accumulator and is released, so the resident set is one sketch per (day, bot) —
+		// not up to cap × 16 KB of raw rows. Yield the event loop periodically; this worker
+		// also serves bot traffic.
+		const byDay = new Map();
+		let shardsMerged = 0;
+		let truncated = false;
+		for await (const row of results) {
+			if (shardsMerged === cap) {
+				truncated = true;
+				break;
+			}
+			mergeBreadthRow(byDay, row);
+			if (++shardsMerged % 200 === 0) await yieldNow();
+		}
+
 		return json({
 			node: server.hostname,
 			days,
 			since,
-			shardsMerged: rows.length,
+			shardsMerged,
 			truncated,
-			breadth: computeBreadth(rows),
+			breadth: finalizeBreadth(byDay),
 		});
 	}
 
