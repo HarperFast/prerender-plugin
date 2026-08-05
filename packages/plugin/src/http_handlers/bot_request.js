@@ -68,11 +68,13 @@ export async function handleBotRequest(request) {
 // Exported for tests: the dimension ORDER is the contract dashboards key on.
 export function recordServeOutcome(resource, request, info, deviceType) {
 	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
-	if (info.source === 'cache') {
-		// lastCached is a schema Date — coerce robustly like expiresAt above (Date, number, or
-		// serialized string all compare correctly). A missing/bad value yields NaN, and a
+	if (info.source === 'cache' && resource.lastCached) {
+		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
+		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
+		// would record age ≈ Date.now() and poison the metric. Past the guard, a Date, number,
+		// or serialized string all compare correctly; a malformed value yields NaN, and a
 		// negative age (cross-node clock skew on a page another node just wrote) would poison
-		// the mean; both fail the >= 0 check and record nothing.
+		// the mean — both fail the >= 0 check and record nothing.
 		const age = Date.now() - new Date(resource.lastCached).getTime();
 		if (age >= 0) {
 			server.recordAnalytics(age, 'page_age', request.botName, deviceType);

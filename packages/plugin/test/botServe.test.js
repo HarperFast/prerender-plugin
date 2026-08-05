@@ -78,9 +78,12 @@ test('page_age is skipped for a non-cache source, even with lastCached present',
 	assert.equal(analytics[0][1], 'bot_serve');
 });
 
-test('page_age is skipped when lastCached is missing or in the future', () => {
+test('page_age is skipped when lastCached is missing, null, or in the future', () => {
 	recordServeOutcome({}, request, { source: 'cache', cacheStatus: 'hit' }, 'desktop');
+	// null is the trap case: new Date(null) is epoch 0, not NaN — unguarded, this would
+	// record age ≈ Date.now() instead of nothing.
+	recordServeOutcome({ lastCached: null }, request, { source: 'cache', cacheStatus: 'hit' }, 'desktop');
 	recordServeOutcome({ lastCached: Date.now() + 60_000 }, request, { source: 'cache', cacheStatus: 'hit' }, 'desktop');
-	assert.equal(analytics.length, 2);
+	assert.equal(analytics.length, 3);
 	assert.ok(analytics.every(([, metric]) => metric === 'bot_serve'));
 });
