@@ -71,16 +71,18 @@ function counts(ctx, data) {
 
 /**
  * Bot traffic is the one number that says whether any of this is working, and it is the panel
- * this console most obviously wants. The serving path already records a `bot_request` metric,
- * but without a cache-status label there is no way to split hit from stale from miss — which is
- * the entire point of the chart. Left declared and empty until that is decided.
+ * this console most obviously wants. The serving path now records everything it needs — the
+ * `bot_serve` metric (source / cacheStatus / botName, see http_handlers/bot_request.js) splits
+ * hit from stale from miss with the crawler breakdown, and `page_age` carries freshness. Left
+ * declared and empty until the remaining decision is made: reading node-local hdb_analytics
+ * vs aggregating across the cluster.
  */
 const traffic = () =>
 	card('Bot traffic served, last 24h', {
 		body: [
 			unwired(
 				'Requests served to bots, split by cache hit / stale / miss, with the crawler breakdown.',
-				'a cache-status label on the bot_request analytics metric, and a decision on reading node-local hdb_analytics vs aggregating across the cluster'
+				'a decision on reading node-local hdb_analytics vs aggregating across the cluster (the bot_serve and page_age metrics are recorded as of v0.26.0)'
 			),
 		],
 	});

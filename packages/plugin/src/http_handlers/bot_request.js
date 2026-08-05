@@ -26,7 +26,8 @@ export async function handleBotRequest(request) {
 		const { url, cacheUrl, deviceType, routeClass, route } = target;
 
 		request.botName = getBotName(request.headers);
-		if (config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched)) {
+		const recordBots = config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched);
+		if (recordBots) {
 			server.recordAnalytics(true, 'bot_request', url.hostname, request.botName, deviceType);
 		}
 
@@ -37,6 +38,9 @@ export async function handleBotRequest(request) {
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		maybeSchedule(resource, routeClass);
+		if (recordBots) {
+			recordServeOutcome(resource, request, info, deviceType);
+		}
 
 		return deliverResource(resource, request, info);
 	} catch (e) {
@@ -45,6 +49,36 @@ export async function handleBotRequest(request) {
 			headers: {},
 			status: 500,
 		};
+	}
+}
+
+// Serve-outcome analytics, recorded once the request has resolved to a resource. `bot_request`
+// (above, at ingress) is raw bot volume; this is what actually answered the request — the
+// rollout success metrics:
+//
+//   origin offload   = bot_serve where source !== 'origin' (requests the origin never saw)
+//   cache hit rate   = bot_serve by cacheStatus (hit / stale / miss / skip / bypass)
+//   freshness        = page_age, ms since the served page rendered (cache-served only, so a
+//                      render-now response doesn't drag the distribution toward zero)
+//
+// Cost: one in-memory counter bump per request plus one numeric sample on a cache hit
+// (recordAnalytics buffers in a Map and flushes on Harper's analytics timer) — no storage
+// touch, no await, nothing added to response latency.
+//
+// Exported for tests: the dimension ORDER is the contract dashboards key on.
+export function recordServeOutcome(resource, request, info, deviceType) {
+	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
+	if (info.source === 'cache' && resource.lastCached) {
+		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
+		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
+		// would record age ≈ Date.now() and poison the metric. Past the guard, a Date, number,
+		// or serialized string all compare correctly; a malformed value yields NaN, and a
+		// negative age (cross-node clock skew on a page another node just wrote) would poison
+		// the mean — both fail the >= 0 check and record nothing.
+		const age = Date.now() - new Date(resource.lastCached).getTime();
+		if (age >= 0) {
+			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
+		}
 	}
 }
 
@@ -86,6 +120,7 @@ function resolveBotTarget(request) {
 async function resolveResource({ request, url, cacheUrl, deviceType, routeClass, info }) {
 	if (request.method !== 'GET' && request.method !== 'HEAD') {
 		logger.warn(`Unexpected Request ${request.method} ${url}`);
+		info.cacheStatus = 'bypass';
 		info.source = 'origin';
 		return fetchOriginResource({
 			url,
