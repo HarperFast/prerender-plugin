@@ -28,7 +28,7 @@
  * worker, and a reader sums across them.
  */
 
-import { config, getLogger } from '../config.js';
+import { config, getLogger, onConfigApplied } from '../config.js';
 import { PASSTHROUGH, UNCLASSIFIED } from './routeClass.js';
 
 // class -> bucket -> { count, firstMs, lastMs, samplePath }
@@ -163,20 +163,46 @@ export const logUnroutedReport = () => {
 };
 
 let reporterStarted = false;
+let reporterTimer = null;
+let reporterArmed = null; // the interval the timer was armed with, or null when disabled
+
+const flushSafely = () => {
+	try {
+		logUnroutedReport();
+	} catch (e) {
+		getLogger().error?.(e);
+	}
+};
+
+// (Re)arm the flush timer to match config: `ingress.report.enabled`/`interval` are live.
+// Counters keep accumulating while disabled (bounded by maxBuckets), so re-enabling
+// flushes what built up on the next tick.
+const syncReporterTimer = () => {
+	const desired = config.ingress.report.enabled ? config.ingress.report.interval : null;
+	if (desired === reporterArmed) return;
+
+	if (reporterTimer) clearInterval(reporterTimer);
+	reporterTimer = null;
+	reporterArmed = desired;
+	if (desired === null) return;
+
+	reporterTimer = setInterval(flushSafely, desired);
+	reporterTimer.unref?.();
+};
+
+// Introspection for tests and the management API: what the timer is currently armed with
+// (`armedInterval: null` = disabled).
+export const unroutedReporterState = () => ({ started: reporterStarted, armedInterval: reporterArmed });
 
 /**
  * Start the periodic flush on EVERY worker of every node — see the per-worker note above.
- * Idempotent, and unref'd so it never holds the process open.
+ * Idempotent, and unref'd so it never holds the process open. The timer follows config
+ * changes (enable/disable, interval) without a restart.
  */
 export const startUnroutedReporter = () => {
-	if (reporterStarted || !config.ingress.report.enabled) return;
+	if (reporterStarted) return;
 	reporterStarted = true;
 
-	setInterval(() => {
-		try {
-			logUnroutedReport();
-		} catch (e) {
-			getLogger().error?.(e);
-		}
-	}, config.ingress.report.interval).unref();
+	syncReporterTimer();
+	onConfigApplied(syncReporterTimer);
 };

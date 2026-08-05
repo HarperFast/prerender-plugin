@@ -159,10 +159,10 @@ let compiledFromRoutes;
 let compiledFromExcludes;
 
 const getRoutes = () => {
-	if (config.ingress.routes !== compiledFromRoutes || config.excludePathPatterns !== compiledFromExcludes) {
-		compiled = compileRoutes(config.ingress.routes, config.excludePathPatterns);
+	if (config.ingress.routes !== compiledFromRoutes || config.ingress.excludePathPatterns !== compiledFromExcludes) {
+		compiled = compileRoutes(config.ingress.routes, config.ingress.excludePathPatterns);
 		compiledFromRoutes = config.ingress.routes;
-		compiledFromExcludes = config.excludePathPatterns;
+		compiledFromExcludes = config.ingress.excludePathPatterns;
 	}
 	return compiled;
 };
@@ -214,7 +214,7 @@ export const classifyPath = (path) => {
 	if (!isForwardedMode()) {
 		return {
 			routeClass: entry && entry.mode === PASSTHROUGH ? PASSTHROUGH : PRERENDER,
-			queryParams: config.url.queryParams,
+			queryParams: config.cacheKey.queryParams,
 			entry: entry ?? null,
 		};
 	}
@@ -241,7 +241,7 @@ export const classifyUrl = (rawUrl) => {
 		// any caller that goes on to build a key from this URL fails on the URL itself first.
 		return {
 			routeClass: UNCLASSIFIED,
-			queryParams: isForwardedMode() ? KEEP_ALL : config.url.queryParams,
+			queryParams: isForwardedMode() ? KEEP_ALL : config.cacheKey.queryParams,
 			entry: null,
 		};
 	}

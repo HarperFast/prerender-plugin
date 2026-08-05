@@ -24,7 +24,7 @@
  */
 
 import { setImmediate as yieldNow } from 'node:timers/promises';
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
 import { HOUR, MINUTE } from './time.js';
 
@@ -210,30 +210,67 @@ export const runBacklogSnapshotOnce = async () => {
 };
 
 let snapshotterStarted = false;
+let snapshotterDelayTimer = null;
+let snapshotterIntervalTimer = null;
+let snapshotterArmed = null; // the interval the timers were armed for, or null when disabled
 
-/**
- * Start the periodic snapshot on worker 0 of every node. Idempotent; called from
- * handleApplication after config is applied. `backlogSnapshotInterval: 0` disables the timer
- * and leaves the panel manual-only (the console's Recompute button still works).
- */
-export function startBacklogSnapshotter() {
-	if (server.workerIndex !== 0 || snapshotterStarted) return;
-	if (!config.management.enabled || !config.management.backlogSnapshotInterval) return;
+const clearSnapshotterTimers = () => {
+	if (snapshotterDelayTimer) clearTimeout(snapshotterDelayTimer);
+	if (snapshotterIntervalTimer) clearInterval(snapshotterIntervalTimer);
+	snapshotterDelayTimer = snapshotterIntervalTimer = null;
+};
 
-	snapshotterStarted = true;
+// (Re)arm the snapshot timers to match config: `management.enabled` and
+// `management.backlogSnapshotInterval` are live. `backlogSnapshotInterval: 0` disables the
+// timer and leaves the panel manual-only (the console's Recompute button still works).
+const syncSnapshotterTimers = () => {
+	const wanted = config.management.enabled && config.management.backlogSnapshotInterval;
+	const desired = wanted ? config.management.backlogSnapshotInterval : null;
+	if (desired === snapshotterArmed) return;
+
+	const wasEnabled = snapshotterArmed !== null;
+	clearSnapshotterTimers();
+	snapshotterArmed = desired;
+	if (desired === null) return;
 
 	const run = () => {
 		runBacklogSnapshotOnce().catch((e) => logger.error(e));
 	};
 
-	// Stagger per node for the same reason the reconciler does: every node scans its own slice,
-	// and a rolling restart would otherwise sync them all onto the shared render index at the
-	// same moment. Seeded differently than the reconciler so the two sweeps don't coincide.
-	const interval = config.management.backlogSnapshotInterval;
-	const stagger = fnv1a32(`backlog:${server.hostname}`) % Math.max(1, Math.min(interval, 5 * MINUTE));
+	if (wasEnabled) {
+		// Cadence change while running: swap the interval, no immediate recompute.
+		snapshotterIntervalTimer = setInterval(run, desired);
+		snapshotterIntervalTimer.unref?.();
+		return;
+	}
 
-	setTimeout(() => {
+	// Stagger per node for the same reason the reconciler does: every node scans its own slice,
+	// and a rolling restart (or a config change, which reaches every node at once) would
+	// otherwise sync them all onto the shared render index at the same moment. Seeded
+	// differently than the reconciler so the two sweeps don't coincide.
+	const stagger = fnv1a32(`backlog:${server.hostname}`) % Math.max(1, Math.min(desired, 5 * MINUTE));
+
+	snapshotterDelayTimer = setTimeout(() => {
 		run();
-		setInterval(run, interval).unref?.();
-	}, stagger).unref?.();
+		snapshotterIntervalTimer = setInterval(run, snapshotterArmed);
+		snapshotterIntervalTimer.unref?.();
+	}, stagger);
+	snapshotterDelayTimer.unref?.();
+};
+
+// Introspection for tests and the management API: what the timers are currently armed
+// with (`armedInterval: null` = disabled).
+export const snapshotterTimerState = () => ({ started: snapshotterStarted, armedInterval: snapshotterArmed });
+
+/**
+ * Start the periodic snapshot on worker 0 of every node. Idempotent; called from
+ * handleApplication after config is applied. The timers follow config changes
+ * (enable/disable, interval) without a restart.
+ */
+export function startBacklogSnapshotter() {
+	if (server.workerIndex !== 0 || snapshotterStarted) return;
+	snapshotterStarted = true;
+
+	syncSnapshotterTimers();
+	onConfigApplied(syncSnapshotterTimers);
 }

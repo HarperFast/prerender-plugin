@@ -55,7 +55,8 @@
  */
 
 import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promises';
-import { config, collectConfigWarnings } from '../config.js';
+import { config, collectConfigWarnings, pendingRestartChanges } from '../config.js';
+import { describeConfigSchema } from '../configSchema.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
@@ -337,9 +338,15 @@ export class PrerenderAdmin extends Resource {
 			case 'overview':
 				return json(await PrerenderAdmin.overview());
 			case 'config':
+				// `schema` is the full option catalog (descriptions, types, defaults, live-vs-restart
+				// scope, validation hints) — the contract a config editor renders from.
+				// `pendingRestart` lists restart-scoped options changed since boot: the new value is
+				// in `config` but the running behavior still reflects the boot value.
 				return json({
 					config: redactConfig(config),
+					schema: describeConfigSchema(),
 					warnings: collectConfigWarnings(),
+					pendingRestart: pendingRestartChanges(),
 					node: server.hostname,
 					workerIndex: server.workerIndex,
 				});

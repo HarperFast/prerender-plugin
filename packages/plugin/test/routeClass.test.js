@@ -21,8 +21,13 @@ const ROUTES = [
 
 const forwarded = (overrides = {}) =>
 	applyOptions({
-		ingress: { mode: 'forwarded', deviceTypeSource: 'path', routes: ROUTES, ...overrides.ingress },
-		excludePathPatterns: overrides.excludePathPatterns ?? [],
+		ingress: {
+			mode: 'forwarded',
+			deviceTypeSource: 'path',
+			routes: ROUTES,
+			excludePathPatterns: overrides.excludePathPatterns ?? [],
+			...overrides.ingress,
+		},
 	});
 
 beforeEach(() => forwarded());
@@ -108,17 +113,17 @@ test('recompiles when excludePathPatterns changes without ingress.routes changin
 });
 
 test('prefix mode: everything is prerender except a folded exclude, and the allowlist is global', () => {
-	applyOptions({ excludePathPatterns: ['/search/'] });
+	applyOptions({ ingress: { excludePathPatterns: ['/search/'] } });
 	assert.equal(config.ingress.mode, 'prefix');
 
 	const normal = classifyPath('/anything/at/all');
 	assert.equal(normal.routeClass, PRERENDER);
-	assert.deepEqual(normal.queryParams, config.url.queryParams);
+	assert.deepEqual(normal.queryParams, config.cacheKey.queryParams);
 
 	const excluded = classifyPath('/search/q');
 	assert.equal(excluded.routeClass, PASSTHROUGH);
 	// Prefix mode has one global allowlist; the class decides scheduling, not the key.
-	assert.deepEqual(excluded.queryParams, config.url.queryParams);
+	assert.deepEqual(excluded.queryParams, config.cacheKey.queryParams);
 });
 
 test('queryAllowlistFor agrees with classifyPath for the same path', () => {
@@ -141,7 +146,7 @@ test('queryAllowlistFor keeps all params for an unparseable URL', () => {
 
 test('queryAllowlistFor returns the global allowlist in prefix mode', () => {
 	applyOptions({});
-	assert.deepEqual(queryAllowlistFor('https://www.example.com/catalog/x'), config.url.queryParams);
+	assert.deepEqual(queryAllowlistFor('https://www.example.com/catalog/x'), config.cacheKey.queryParams);
 });
 
 test('prerenderRouteCount ignores passthrough entries', () => {
@@ -190,7 +195,7 @@ test('classifyUrl reports an unparseable URL as unclassified, keeping all params
 
 test('classifyUrl on an unparseable URL still yields the global allowlist in prefix mode', () => {
 	applyOptions({});
-	assert.deepEqual(classifyUrl('not-a-url').queryParams, config.url.queryParams);
+	assert.deepEqual(classifyUrl('not-a-url').queryParams, config.cacheKey.queryParams);
 });
 
 // ---- per-route renderInterval ----

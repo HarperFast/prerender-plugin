@@ -73,6 +73,6 @@ test('the returned half round-trips through new URL() unchanged (safe to build a
 });
 
 test('accepts a URL object and an explicit allowlist overrides the global policy', () => {
-	applyOptions({ url: { queryParams: ['page'] } });
+	applyOptions({ cacheKey: { queryParams: ['page'] } });
 	assert.equal(canonicalizeUrl(new URL('https://x.com/a?page=2&f=foo&utm=z'), ['f']), 'https://x.com/a?f=foo');
 });

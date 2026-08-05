@@ -7,8 +7,10 @@
  * marker: an operator needs to know whether a secret is set, never what it is.
  */
 
-// Dotted paths whose values are secrets.
-const SECRET_PATHS = ['securityToken.value', 'renderNow.token'];
+import { secretPaths } from '../configSchema.js';
+
+// Dotted paths whose values are secrets — the schema's `secret: true` options.
+const SECRET_PATHS = secretPaths();
 
 // A secret is reported only as whether it is set, and how long it is — enough to spot a
 // truncated/whitespace-mangled value without disclosing it.

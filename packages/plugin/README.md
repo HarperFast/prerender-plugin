@@ -33,11 +33,11 @@ rest: true # required for the @export-ed table REST endpoints
   files: '/'
 
   # --- options (all optional; defaults shown) ---
-  botPathPrefix: /p/ # requests under this prefix are treated as bot requests
   domains: [] # indexable-host allowlist; empty = allow all hosts
 
   ingress: # how incoming bot requests are parsed (see "Ingress modes" below)
     mode: prefix # 'prefix' (native /p/<absolute-url>) or 'forwarded' (reverse proxy/CDN)
+    botPathPrefix: /p/ # prefix mode: requests under this prefix are treated as bot requests
     deviceTypeSource: header # 'header' (deviceTypeHeader) or 'path' (first path segment)
     deviceTypeHeader: x-device-type
     forwardedHostHeader: x-forwarded-host # forwarded mode: original public host
@@ -45,6 +45,8 @@ rest: true # required for the @export-ed table REST endpoints
     defaultProtocol: https
     # ordered, first match wins — see "Route classes"
     routes: [] # [{ match: exact|prefix|contains, path, mode: prerender|passthrough, queryParams: [...] }]
+    # compiled into `routes` as prepended passthrough entries; matched against the PATH
+    excludePathPatterns: ['/search/'] # paths containing these are never auto-scheduled
     report: # periodic tally of paths served without prerendering
       enabled: true
       interval: 300000 # ms between flushes, per worker
@@ -55,31 +57,31 @@ rest: true # required for the @export-ed table REST endpoints
     supported: [desktop, mobile, tablet]
     default: [desktop, mobile] # device types scheduled for auto-discovered pages
 
-  cacheKey:
+  cacheKey: # how a URL becomes a cache identity — changing these orphans every cached page
     delimiter: '|'
     attributes: [url, deviceType]
-
-  url:
     queryParams: [page] # query params kept in the cache key; ['*'] = keep all, [] = drop all
 
-  securityToken: # shared secret sent to the origin; must match the render client
-    header: x-harper-renderer-bypass
-    value: '' # SET THIS per deployment (or use valueEnv to keep it out of config.yaml)
-    valueEnv: '' # if set, the token is read from this env var and overrides `value`
+  origin: # how Harper fetches from the origin
+    securityToken: # shared secret sent to the origin; must match the render client
+      header: x-harper-renderer-bypass
+      value: '' # SET THIS per deployment (or use valueEnv to keep it out of config.yaml)
+      valueEnv: '' # if set, the token is read from this env var and overrides `value`
+    staging: # origin staging passthrough (see "Staging passthrough" below)
+      ip: '' # staging edge IP; empty = disabled. When set, a cache-MISS fetch that carries
+      #        the `header` request header connects here instead of the public origin.
+      header: x-harper-staging # request header whose presence toggles staging passthrough
+    userAgents: # per-device User-Agent strings sent to the origin on the miss-proxy fetch
+      desktop: 'Mozilla/5.0 ... HarperProxy/1.0'
+      mobile: 'Mozilla/5.0 ... HarperProxy/1.0'
+      tablet: 'Mozilla/5.0 ... HarperProxy/1.0'
+    ignoredHeaders: [] # extra request header names not forwarded to the origin, on top of the
+    #                    always-ignored set (hop-by-hop headers plus host, user-agent,
+    #                    accept-encoding, cookie, authorization, and the securityToken/debugHeader
+    #                    names); matched case-insensitively
 
-  debugHeader: # when this request header is present, debug response headers are added
+  debugHeader: # when this request header is present (any value), debug response headers are added
     key: x-harper-prerender-debug
-    value: 'true'
-
-  ignoredHeaders: [] # extra request header names not forwarded to the origin, on top of the
-  #                    always-ignored set (hop-by-hop headers plus host, user-agent,
-  #                    accept-encoding, cookie, authorization, and the securityToken/debugHeader
-  #                    names); matched case-insensitively
-
-  staging: # origin staging passthrough (see "Staging passthrough" below)
-    ip: '' # staging edge IP; empty = disabled. When set, a cache-MISS fetch that carries
-    #        the `header` request header connects here instead of the public origin.
-    header: x-harper-staging # request header whose presence toggles staging passthrough
 
   page:
     ttl: 86400000 # 24h — default cached-page TTL
@@ -111,6 +113,7 @@ rest: true # required for the @export-ed table REST endpoints
     staleRunMs: 600000 # 10m — un-updated progress after which a run is treated as dead
     removedSampleCap: 20 # sample size of unlinked keys in the result (the COUNT is exact)
     failedCap: 100 # per-child failures retained in the result (the overflow is counted)
+    userAgent: HarperSitemapCrawler/1.0 # self-identifying UA for the sitemap crawler fetch
 
   queue:
     jobLeaseTime: 600000 # 10m — how long a claimed job is leased
@@ -123,14 +126,6 @@ rest: true # required for the @export-ed table REST endpoints
     peerTimeoutMs: 2500 # deadline on that peer call
     backlogSnapshotInterval: 900000 # 15m — backlog/histogram recompute cadence; 0 = manual only
     pageSize: 50 # rows per page in the console's sitemap-entry and page-cache tables
-
-  userAgents: # per-device User-Agent strings sent to the origin
-    desktop: 'Mozilla/5.0 ... HarperPrerender/1.0'
-    mobile: 'Mozilla/5.0 ... HarperPrerender/1.0'
-    tablet: 'Mozilla/5.0 ... HarperPrerender/1.0'
-
-  # compiled into ingress.routes as prepended passthrough entries; matched against the PATH
-  excludePathPatterns: ['/search/'] # paths containing these are never auto-scheduled
 
   analytics:
     enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
@@ -147,17 +142,30 @@ rest: true # required for the @export-ed table REST endpoints
       - { name: Googlebot, match: googlebot } # case-insensitive UA substring; longer matches win.
       - { name: Bingbot, match: bingbot } # Remove an entry to stop tracking that bot.
       - { name: GPTBot, match: gptbot }
-      # ... (see config.js for the full default list)
+      # ... (see configSchema.js for the full default list)
 ```
 
-Most options are **live-reloaded** when you edit `config.yaml` — no restart needed.
+Every option is declared in [`src/configSchema.js`](src/configSchema.js) — the single source
+of truth for defaults, descriptions, validation (enums, numeric bounds, non-empty), and
+whether a change applies live. Almost every option is **live-reloaded** when you edit
+`config.yaml` — including the background schedulers (sitemap refresh pinning, schedule
+repair, queue status sync), which re-arm themselves on a config change. The only
+restart-scoped options are the boot-stagger knobs (`render.reconcile.startDelay`/`startJitter`);
+changing one live logs a warning and is listed under `pendingRestart` on
+`GET /prerender_admin/config`, which also serves the machine-readable schema
+(`schema`) alongside the redacted effective config.
+
+Options that moved in v0.25.0 (`botPathPrefix`, `excludePathPatterns` → `ingress.*`;
+`securityToken`, `staging`, `userAgents`, `ignoredHeaders` → `origin.*`;
+`url.queryParams` → `cacheKey.queryParams`; `sitemapUserAgent` → `sitemap.userAgent`)
+still apply from their old paths, with a deprecation warning at startup.
 
 ### Ingress modes
 
 How bot requests reach the plugin is configurable via `ingress.mode`:
 
 - **`prefix`** (default) — the native model. A request is a bot request when its path
-  starts with `botPathPrefix` (`/p/`), and the remainder of the path **is** the absolute
+  starts with `ingress.botPathPrefix` (`/p/`), and the remainder of the path **is** the absolute
   target URL (`GET /p/https://example.com/page`). The device type comes from the
   `deviceTypeHeader` (`x-device-type`).
 
@@ -364,8 +372,8 @@ steady-state cadence, so a fleet that can sustain the ongoing load can absorb th
 ### Staging passthrough
 
 To verify an origin against a staging edge (e.g. a CDN's staging network) _through_ the
-plugin, set `staging.ip` to the staging edge IP. Then any **cache-miss** bot request that carries
-the `staging.header` request header (`x-harper-staging` by default) has its origin fetch connected
+plugin, set `origin.staging.ip` to the staging edge IP. Then any **cache-miss** bot request that carries
+the `origin.staging.header` request header (`x-harper-staging` by default) has its origin fetch connected
 to that IP instead of the public origin. Only the TCP address is pinned — the `Host` header and TLS
 SNI stay the real origin host — so the staging edge serves the right property and presents a valid
 certificate (the server-side equivalent of a `host-resolver-rules` / `/etc/hosts` override).
@@ -373,8 +381,8 @@ certificate (the server-side equivalent of a `host-resolver-rules` / `/etc/hosts
 - **Cache hits are unaffected.** The header is not part of the cache key, so a cached page is always
   returned as-is; only the live origin fetch on a miss is redirected.
 - **The header is a toggle, not a target.** The connect address is always the configured
-  `staging.ip`, never a value from the request — so a request can't repoint the fetch at an
-  arbitrary host. Leave `staging.ip` empty (the default) to disable the feature entirely; production
+  `origin.staging.ip`, never a value from the request — so a request can't repoint the fetch at an
+  arbitrary host. Leave `origin.staging.ip` empty (the default) to disable the feature entirely; production
   is unaffected unless a staging IP is explicitly configured.
 - With the `debugHeader` also present, a staging-served response is tagged with the
   `x-harper-origin: staging` response header so you can confirm it.
@@ -502,7 +510,7 @@ execute it against the operator's super-user session.
 - **URL explainer** — paste a URL and see the ingress route that matched, the query allowlist
   it selected, the canonical URL, the resulting cache key, and the live
   `RenderTarget`/`RenderSchedule`/`PrerenderedPage`/`NonIndexable` rows under it. It also
-  reports the key the URL would get under the global `url.queryParams`, and flags a
+  reports the key the URL would get under the global `cacheKey.queryParams`, and flags a
   difference — that divergence is the usual fingerprint of a permanent cache miss caused by a
   missing or misordered route. It surfaces a `NonIndexable` suppression too, which otherwise
   removes a URL from rotation silently.
@@ -640,7 +648,7 @@ render client ──claim──▶ render_queue ──jobs──▶ [headless re
 ```
 
 The render service is a separate process; see [`@harperfast/prerender-browser`](../browser). Its
-`RENDERER_BYPASS_*` settings must match this plugin's `securityToken`.
+`RENDERER_BYPASS_*` settings must match this plugin's `origin.securityToken`.
 
 ## Development
 

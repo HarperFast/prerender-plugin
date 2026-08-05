@@ -13,17 +13,17 @@ const headersWith = (present) => ({ get: (name) => (present.includes(name) ? '1'
 
 test('staging defaults are off (empty ip) with a default toggle header', () => {
 	applyOptions({});
-	assert.equal(config.staging.ip, '');
-	assert.equal(config.staging.header, 'x-harper-staging');
+	assert.equal(config.origin.staging.ip, '');
+	assert.equal(config.origin.staging.header, 'x-harper-staging');
 });
 
 test('applyOptions accepts staging overrides', () => {
-	applyOptions({ staging: { ip: '192.0.2.27', header: 'x-acme-staging' } });
-	assert.equal(config.staging.ip, '192.0.2.27');
-	assert.equal(config.staging.header, 'x-acme-staging');
+	applyOptions({ origin: { staging: { ip: '192.0.2.27', header: 'x-acme-staging' } } });
+	assert.equal(config.origin.staging.ip, '192.0.2.27');
+	assert.equal(config.origin.staging.header, 'x-acme-staging');
 	// untouched sibling keeps its default when only ip is overridden
-	applyOptions({ staging: { ip: '1.2.3.4' } });
-	assert.equal(config.staging.header, 'x-harper-staging');
+	applyOptions({ origin: { staging: { ip: '1.2.3.4' } } });
+	assert.equal(config.origin.staging.header, 'x-harper-staging');
 });
 
 test('stagingTargetIp is undefined when no staging ip is configured', () => {
@@ -32,34 +32,34 @@ test('stagingTargetIp is undefined when no staging ip is configured', () => {
 });
 
 test('stagingTargetIp returns the configured ip only when the toggle header is present', () => {
-	applyOptions({ staging: { ip: '192.0.2.27' } });
+	applyOptions({ origin: { staging: { ip: '192.0.2.27' } } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '192.0.2.27');
 	assert.equal(stagingTargetIp(headersWith([])), undefined);
 });
 
 test('stagingTargetIp honors a custom toggle header name', () => {
-	applyOptions({ staging: { ip: '192.0.2.27', header: 'x-acme-staging' } });
+	applyOptions({ origin: { staging: { ip: '192.0.2.27', header: 'x-acme-staging' } } });
 	assert.equal(stagingTargetIp(headersWith(['x-acme-staging'])), '192.0.2.27');
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
 test('stagingTargetIp ignores an invalid configured ip (feature disabled)', () => {
-	applyOptions({ staging: { ip: 'not-an-ip' } });
+	applyOptions({ origin: { staging: { ip: 'not-an-ip' } } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
 test('stagingTargetIp is disabled when the toggle header name is configured empty', () => {
-	applyOptions({ staging: { ip: '192.0.2.27', header: '' } });
+	applyOptions({ origin: { staging: { ip: '192.0.2.27', header: '' } } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), undefined);
 });
 
 test('stagingTargetIp supports an IPv6 staging address', () => {
-	applyOptions({ staging: { ip: '2606:2800:220:1:248:1893:25c8:1946' } });
+	applyOptions({ origin: { staging: { ip: '2606:2800:220:1:248:1893:25c8:1946' } } });
 	assert.equal(stagingTargetIp(headersWith(['x-harper-staging'])), '2606:2800:220:1:248:1893:25c8:1946');
 });
 
 test('configuredStagingIp returns the configured ip regardless of any request header', () => {
-	applyOptions({ staging: { ip: '192.0.2.27' } });
+	applyOptions({ origin: { staging: { ip: '192.0.2.27' } } });
 	// No header argument at all — the sitemap refresh opts in out-of-band, not via a header.
 	assert.equal(configuredStagingIp(), '192.0.2.27');
 });
@@ -70,13 +70,13 @@ test('configuredStagingIp is undefined when no staging ip is configured', () => 
 });
 
 test('configuredStagingIp ignores an invalid configured ip', () => {
-	applyOptions({ staging: { ip: 'not-an-ip' } });
+	applyOptions({ origin: { staging: { ip: 'not-an-ip' } } });
 	assert.equal(configuredStagingIp(), undefined);
 });
 
 test('ignoredHeaders defaults to an empty list', () => {
 	applyOptions({});
-	assert.deepEqual(config.ignoredHeaders, []);
+	assert.deepEqual(config.origin.ignoredHeaders, []);
 });
 
 test('resolveUpstreamHeaders forwards arbitrary downstream headers by default', () => {
@@ -102,12 +102,12 @@ test('resolveUpstreamHeaders always drops the base-ignored and security/debug he
 	assert.equal(upstream['cookie'], undefined);
 	assert.equal(upstream['authorization'], undefined);
 	// the security token is set from config, never from the (spoofable) downstream value
-	assert.equal(upstream['x-harper-renderer-bypass'], config.securityToken.value);
+	assert.equal(upstream['x-harper-renderer-bypass'], config.origin.securityToken.value);
 	assert.equal(upstream['x-harper-prerender-debug'], undefined);
 });
 
 test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
-	applyOptions({ ignoredHeaders: ['x-internal', 'x-trace-id'] });
+	applyOptions({ origin: { ignoredHeaders: ['x-internal', 'x-trace-id'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' }, 'desktop');
 	assert.equal(upstream['x-internal'], undefined);
 	assert.equal(upstream['x-trace-id'], undefined);
@@ -115,7 +115,7 @@ test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
 });
 
 test('resolveUpstreamHeaders matches ignoredHeaders case-insensitively', () => {
-	applyOptions({ ignoredHeaders: ['X-Internal'] });
+	applyOptions({ origin: { ignoredHeaders: ['X-Internal'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret' }, 'desktop');
 	assert.equal(upstream['x-internal'], undefined);
 });
@@ -174,7 +174,10 @@ test('sanitizeOriginResponseHeaders matches allowlist case-insensitively (normal
 
 test('resolveUpstreamHeaders drops a spoofed token/debug header even when configured mixed-case', () => {
 	// Incoming keys are lowercased, so a mixed-case configured name must still match.
-	applyOptions({ securityToken: { header: 'X-Harper-Token', value: 'real' }, debugHeader: { key: 'X-Harper-Debug' } });
+	applyOptions({
+		origin: { securityToken: { header: 'X-Harper-Token', value: 'real' } },
+		debugHeader: { key: 'X-Harper-Debug' },
+	});
 	const upstream = resolveUpstreamHeaders({ 'x-harper-token': 'spoofed', 'x-harper-debug': 'true' }, 'desktop');
 	assert.equal(upstream['x-harper-token'], undefined);
 	assert.equal(upstream['x-harper-debug'], undefined);
@@ -183,9 +186,9 @@ test('resolveUpstreamHeaders drops a spoofed token/debug header even when config
 });
 
 test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions (memo rebuild)', () => {
-	applyOptions({ ignoredHeaders: ['x-first'] });
+	applyOptions({ origin: { ignoredHeaders: ['x-first'] } });
 	assert.equal(resolveUpstreamHeaders({ 'x-first': 'a', 'x-second': 'b' }, 'desktop')['x-first'], undefined);
-	applyOptions({ ignoredHeaders: ['x-second'] });
+	applyOptions({ origin: { ignoredHeaders: ['x-second'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-first': 'a', 'x-second': 'b' }, 'desktop');
 	// x-first is no longer ignored, x-second now is
 	assert.equal(upstream['x-first'], 'a');

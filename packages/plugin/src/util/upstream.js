@@ -9,11 +9,11 @@ const agent = new Agent({});
  * The staging IP to connect to for this origin fetch, or undefined for a normal fetch.
  * Staging passthrough is active only when a staging `ip` is configured (and valid) AND
  * the request carries the configured toggle header. The address is always the configured
- * `config.staging.ip` — never a value from the request — so a request can only switch the
+ * `config.origin.staging.ip` — never a value from the request — so a request can only switch the
  * fetch to the one pre-approved IP, not repoint it at an arbitrary host.
  */
 export const stagingTargetIp = (headers) => {
-	const { ip, header } = config.staging;
+	const { ip, header } = config.origin.staging;
 	if (!ip || !header || !isIP(ip)) return undefined;
 	return headers?.get(header) ? ip : undefined;
 };
@@ -24,7 +24,7 @@ export const stagingTargetIp = (headers) => {
  * toggle header (e.g. the sitemap refresh, which has no incoming request to carry a header).
  */
 export const configuredStagingIp = () => {
-	const { ip } = config.staging;
+	const { ip } = config.origin.staging;
 	return ip && isIP(ip) ? ip : undefined;
 };
 
@@ -77,9 +77,9 @@ const BASE_IGNORED_HEADERS = [...hopByHopHeaders, 'host', 'user-agent', 'accept-
 let ignoredHeadersCache = null;
 let ignoredHeadersKey = '';
 const ignoredDownstreamRequestHeaders = () => {
-	const tokenHeader = config.securityToken.header;
+	const tokenHeader = config.origin.securityToken.header;
 	const debugKey = config.debugHeader.key;
-	const configured = config.ignoredHeaders;
+	const configured = config.origin.ignoredHeaders;
 	const key = `${tokenHeader} ${debugKey} ${configured.join(',')}`;
 	if (ignoredHeadersCache === null || key !== ignoredHeadersKey) {
 		ignoredHeadersCache = new Set([
@@ -136,8 +136,8 @@ export const sanitizeOriginResponseHeaders = (headers) => {
 
 export const resolveUpstreamHeaders = (downstream, deviceType) => {
 	const upstream = {
-		'user-agent': config.userAgents[deviceType] ?? config.userAgents.desktop,
-		[config.securityToken.header]: config.securityToken.value,
+		'user-agent': config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop,
+		[config.origin.securityToken.header]: config.origin.securityToken.value,
 		// Request gzip (not brotli) from the origin. On a cache miss this response is relayed
 		// to the CDN edge for its alternate-response swap, and the edge cannot apply its outgoing
 		// transform to a brotli-encoded alternate response. gzip is transform-safe; the edge

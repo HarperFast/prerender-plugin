@@ -107,7 +107,7 @@ function resolveBotTarget(request) {
 	// Classification still applies — it is what carries the folded excludePathPatterns into
 	// this mode — but the allowlist stays the global `url.queryParams`, so the key is
 	// unchanged. canonicalizeUrl has already proved the URL parses by the time we classify.
-	const cacheUrl = canonicalizeUrl(request.url.slice(config.botPathPrefix.length), config.url.queryParams);
+	const cacheUrl = canonicalizeUrl(request.url.slice(config.ingress.botPathPrefix.length), config.cacheKey.queryParams);
 	const { routeClass, entry } = classifyPath(URL.parse(cacheUrl)?.pathname ?? '/');
 	return {
 		url: new URL(cacheUrl),

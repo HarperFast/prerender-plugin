@@ -57,7 +57,7 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 	// The same URL keyed under the global allowlist. In prefix mode this is by definition
 	// the same thing; in forwarded mode a difference means the route allowlist is what
 	// decides this URL's identity — the thing to check first when a URL never hits cache.
-	const globalCanonicalUrl = canonicalizeUrl(rawUrl, config.url.queryParams);
+	const globalCanonicalUrl = canonicalizeUrl(rawUrl, config.cacheKey.queryParams);
 	const globalCacheKey = CacheKey.toCacheKey({ url: globalCanonicalUrl, deviceType });
 
 	// Empty allowlist = allow all hosts (same rule as processJobResult).
@@ -86,7 +86,7 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 		},
 		allowlist: { used: allowlist, source: allowlistSource },
 		underGlobalAllowlist: {
-			allowlist: config.url.queryParams,
+			allowlist: config.cacheKey.queryParams,
 			canonicalUrl: globalCanonicalUrl,
 			cacheKey: globalCacheKey,
 			differs: globalCacheKey !== cacheKey,

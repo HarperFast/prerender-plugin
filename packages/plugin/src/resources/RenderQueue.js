@@ -1,5 +1,5 @@
 import { getMutex } from '../util/coordination.js';
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
@@ -667,7 +667,7 @@ let queueStatusSyncStarted = false;
 /**
  * Start the periodic queue-status refresh on worker 0. Called from
  * handleApplication after config is applied (so the interval reflects overrides).
- * Idempotent.
+ * Idempotent. The interval follows `queue.statusSyncInterval` changes without a restart.
  */
 export function startQueueStatusSync() {
 	if (server.workerIndex !== 0 || queueStatusSyncStarted) return;
@@ -688,5 +688,15 @@ export function startQueueStatusSync() {
 
 	refresh();
 
-	setInterval(refresh, config.queue.statusSyncInterval).unref?.();
+	let armedInterval = config.queue.statusSyncInterval;
+	let timer = setInterval(refresh, armedInterval);
+	timer.unref?.();
+
+	onConfigApplied(() => {
+		if (config.queue.statusSyncInterval === armedInterval) return;
+		clearInterval(timer);
+		armedInterval = config.queue.statusSyncInterval;
+		timer = setInterval(refresh, armedInterval);
+		timer.unref?.();
+	});
 }
