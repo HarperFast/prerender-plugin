@@ -136,6 +136,12 @@ rest: true # required for the @export-ed table REST endpoints
     enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
     # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate), and
     # page_age (ms since the served page rendered — freshness at serve, cache hits only)
+
+  crawlStats: # crawl breadth: distinct URLs crawled per bot per UTC day (HyperLogLog, ~0.8% error)
+    enabled: true # also gated by analytics.enabled above; read via GET /prerender_admin/crawl-breadth?days=7
+    flushInterval: 300000 # ms between sketch persists (max observation loss if a worker dies)
+    retentionDays: 90 # sketch rows older than this are swept at day rollover
+    maxBotsPerThread: 64 # cap on per-thread sketches; overflow bots share one '~overflow' bucket
     recordUnmatched: true # also record UAs that matched no configured bot (as 'other')
     bots: # registry: which crawlers are tracked by name. { name, match } — match is a
       - { name: Googlebot, match: googlebot } # case-insensitive UA substring; longer matches win.
