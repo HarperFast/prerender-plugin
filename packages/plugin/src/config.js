@@ -362,10 +362,16 @@ export const collectConfigWarnings = () => {
 		if (!config.renderNow.header) {
 			add('warn', 'renderNow.header', 'renderNow.enabled but renderNow.header is empty — on-demand render is disabled');
 		} else if (!config.renderNow.token) {
+			// Inert, not open: isRenderNowAuthorized fails closed without a token. Still worth
+			// reporting, because the operator asked for a feature that is not actually on — and
+			// naming the unresolved variable is the difference between a five-second fix and a hunt.
+			const { valueEnv } = config.renderNow;
 			add(
 				'warn',
 				'renderNow.token',
-				`renderNow ENABLED WITHOUT A TOKEN — any client sending "${config.renderNow.header}" can force cache/origin-bypassing renders (DoS risk); set renderNow.token or renderNow.valueEnv`
+				valueEnv
+					? `renderNow.enabled is true but renderNow.valueEnv ("${valueEnv}") is not set in the environment and no renderNow.token is configured — renderNow is DISABLED (the levers fail closed rather than authorizing anyone)`
+					: 'renderNow.enabled is true but no renderNow.token is configured — renderNow is DISABLED (the levers fail closed rather than authorizing anyone); set renderNow.token or renderNow.valueEnv'
 			);
 		}
 	}

@@ -141,6 +141,34 @@ test('prefix mode is not held to the prerender-route requirement', () => {
 	assert.equal(findingKeys().includes('ingress.routes'), false);
 });
 
+test('renderNow enabled without a token reports the feature as disabled', () => {
+	// The warning is the operator's only signal that a feature they switched on is not actually
+	// running, so it has to mirror the runtime gate: say DISABLED, not "DoS risk". The old wording
+	// would send someone hunting an exposure that no longer exists, and anything that reads as
+	// "enabled" would hide the fact that nothing is on.
+	applyOptions({ renderNow: { enabled: true } });
+	const finding = collectConfigWarnings().find((f) => f.key === 'renderNow.token');
+	assert.ok(finding, 'expected a renderNow.token finding');
+	assert.match(finding.message, /DISABLED/);
+	assert.match(finding.message, /fail closed/);
+});
+
+test('an unresolved renderNow valueEnv is named in the warning', () => {
+	// Naming the variable is the difference between a five-second fix and a hunt: config.js only
+	// assigns from the environment when the variable is set, so a typo silently leaves token empty.
+	delete process.env.__TEST_RENDER_NOW_ABSENT;
+	applyOptions({ renderNow: { enabled: true, valueEnv: '__TEST_RENDER_NOW_ABSENT' } });
+	const finding = collectConfigWarnings().find((f) => f.key === 'renderNow.token');
+	assert.ok(finding, 'expected a renderNow.token finding');
+	assert.match(finding.message, /__TEST_RENDER_NOW_ABSENT/);
+	assert.match(finding.message, /DISABLED/);
+});
+
+test('renderNow with a token reports nothing', () => {
+	applyOptions({ renderNow: { enabled: true, token: 'a-real-secret' } });
+	assert.equal(findingKeys().includes('renderNow.token'), false);
+});
+
 test('applyOptions sources the security token from valueEnv (overriding the literal)', () => {
 	process.env.__TEST_PR_TOKEN = 'env-secret';
 	try {
