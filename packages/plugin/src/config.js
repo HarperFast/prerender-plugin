@@ -494,6 +494,19 @@ const defaultConfig = () => ({
 			{ name: 'Sitebulb', match: 'sitebulb' },
 		],
 	},
+
+	// Crawl breadth: distinct URLs crawled per bot per UTC day, via per-thread HyperLogLog
+	// sketches flushed to crawl_stats.CrawlSketch (util/crawlStats.js). Read merged through
+	// GET /prerender_admin/crawl-breadth. Recording is additionally gated by the analytics
+	// gate above (no bot name → nothing to attribute a sketch to).
+	crawlStats: {
+		enabled: true,
+		flushInterval: 5 * MINUTE, // per-thread sketch persistence cadence (max data loss on a crash)
+		retentionDays: 90, // sketch rows older than this are swept at day rollover
+		// Sketches are 16 KB each; this caps a UA-derivation flood from minting unbounded
+		// per-thread sketches. Overflow bots share one '~overflow' bucket for the day.
+		maxBotsPerThread: 64,
+	},
 });
 
 // The live config object. Mutated in place by applyOptions so existing imports

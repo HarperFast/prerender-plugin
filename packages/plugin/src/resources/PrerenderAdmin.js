@@ -24,6 +24,7 @@
  *   GET  /prerender_admin/pages      ?prefix&cursor&limit           super_user
  *   GET  /prerender_admin/page-content ?cacheKey (text/plain)       super_user
  *   GET  /prerender_admin/unrouted   this worker's unrouted tally   super_user
+ *   GET  /prerender_admin/crawl-breadth ?days (default 7, max 31)   super_user
  *   POST /prerender_admin/explain    { url, deviceType }            super_user
  *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
  *   POST /prerender_admin/queue      { scope, paused }              super_user
@@ -64,6 +65,7 @@ import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
+import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
@@ -358,6 +360,8 @@ export class PrerenderAdmin extends Resource {
 					interval: config.ingress.report.interval,
 					report: peekUnroutedReport(),
 				});
+			case 'crawl-breadth':
+				return PrerenderAdmin.crawlBreadth(target);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -1041,6 +1045,51 @@ export class PrerenderAdmin extends Resource {
 	 * would be unindexed table filters, and the client filters the fetched page instead,
 	 * labelled as exactly that. `content` is never selected.
 	 */
+	// Crawl breadth: distinct URLs crawled per bot per UTC day, from the merged CrawlSketch
+	// node rows (util/crawlStats.js). Query cost: one day-indexed range read of
+	// days × bots-with-traffic × nodes 16 KB rows (a week on a 4-node cluster is a few
+	// hundred rows), capped below and reported truncated rather than presented as complete.
+	// Never touches the render queue or the page cache.
+	static crawlBreadth(target) {
+		return withHeavySlot(() => this.crawlBreadthInner(target));
+	}
+
+	static async crawlBreadthInner(target) {
+		const days = Math.min(Math.max(1, Number(target?.get?.('days')) || 7), 31);
+		const since = new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+		const cap = 4096;
+		const results = databases.crawl_stats.CrawlSketch.search({
+			conditions: [{ attribute: 'day', comparator: 'greater_than_equal', value: since }],
+			select: ['day', 'bot', 'registers'],
+			limit: cap + 1, // one extra row = "truncated", never merged
+		});
+
+		// Stream the cursor instead of buffering it: each 16 KB row merges into the
+		// accumulator and is released, so the resident set is one sketch per (day, bot) —
+		// not up to cap × 16 KB of raw rows. Yield the event loop periodically; this worker
+		// also serves bot traffic.
+		const byDay = new Map();
+		let shardsMerged = 0;
+		let truncated = false;
+		for await (const row of results) {
+			if (shardsMerged === cap) {
+				truncated = true;
+				break;
+			}
+			mergeBreadthRow(byDay, row);
+			if (++shardsMerged % 200 === 0) await yieldNow();
+		}
+
+		return json({
+			node: server.hostname,
+			days,
+			since,
+			shardsMerged,
+			truncated,
+			breadth: finalizeBreadth(byDay),
+		});
+	}
+
 	static listPages(target) {
 		return withHeavySlot(() => this.listPagesInner(target));
 	}

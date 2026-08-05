@@ -147,3 +147,23 @@ type PrerenderedPage @table(database: "page_cache") @export {
 type SharedBuffer @table(database: "coordination", replicate: false) {
 	key: Any @primaryKey
 }
+
+# One HyperLogLog register array per (UTC day, bot, node) — this node's shard of that day's
+# global distinct-URL sketch for that crawler (util/crawlStats.js). Workers merge their
+# thread sketches into the node row under the cross-worker mutex; readers merge a day's
+# node rows by element-wise max, which reassembles the exact union. Rows replicate
+# (default) so any one node can answer for the cluster. Deliberately NOT @export: the raw
+# 16 KB shards are only useful merged — reads go through GET /prerender_admin/crawl-breadth,
+# behind that resource's super-user gate. Own database: writes are low-frequency and share
+# no transaction with any other table.
+type CrawlSketch @table(database: "crawl_stats") {
+	id: String @primaryKey # `${day}|${bot}|${node}`
+	day: String @indexed
+	bot: String
+	node: String
+	registers: Bytes
+	# This NODE's own estimate, stored for eyeballing a raw row. Never sum these —
+	# distinct counts don't add; merge the node rows and estimate the union.
+	estimate: Float
+	updatedAt: Date
+}

@@ -13,6 +13,7 @@ import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { currentMinuteMs } from '../util/time.js';
+import { recordCrawl } from '../util/crawlStats.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -29,6 +30,9 @@ export async function handleBotRequest(request) {
 		const recordBots = config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched);
 		if (recordBots) {
 			server.recordAnalytics(true, 'bot_request', url.hostname, request.botName, deviceType);
+			// Crawl breadth (distinct URLs per bot per day): one hash + one byte max into a
+			// per-thread HLL sketch — see util/crawlStats.js for the cost/loss model.
+			recordCrawl(request.botName, cacheUrl);
 		}
 
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
