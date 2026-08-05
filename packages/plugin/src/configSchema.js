@@ -289,17 +289,27 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'So `defaultMissMode: prerender` + no Cache-Control = "serve cache, else render now" ' +
 			'(warm-on-demand); adding `Cache-Control: no-cache` = "always render fresh now".',
 		{
-			enabled: option(false, 'Enable the on-demand render levers.'),
+			enabled: option(
+				false,
+				'Enable the on-demand render levers. Enabling is necessary but not sufficient — a non-empty ' +
+					'`token` (or a `valueEnv` that resolves to one) is also required, so this cannot open the ' +
+					'levers on its own.'
+			),
 			header: option(
 				'x-harper-render-now',
-				'Request header that authorizes the on-demand levers. Authorization is gated on its presence; ' +
-					'when a `token` is set the header VALUE must equal it.'
+				'Request header that authorizes the on-demand levers. The header VALUE must equal the ' +
+					'configured `token`; presence alone never authorizes.'
 			),
 			token: option(
 				'',
-				'Expected value of `header`. An empty token leaves the feature unauthenticated (any client ' +
-					'sending the header can force renders — a DoS vector), which is warned about at config-apply ' +
-					'time.',
+				'Expected value of `header`. **Required** — there is no unauthenticated mode: an empty token ' +
+					'makes the feature inert (the levers stay off even when `enabled` is true) rather than ' +
+					'authorizing anyone who sends the header, and is reported at config-apply time.\n\n' +
+					'This fails CLOSED deliberately. The levers let a caller bypass the served cache and force ' +
+					'a synchronous render that occupies the request for up to `timeoutMs`, so on a path that ' +
+					'takes public crawler traffic an absent or unresolved token must not degrade to "authorize ' +
+					'everyone". Prefer `valueEnv` so the secret stays out of config.yaml, and never commit a ' +
+					'guessable placeholder — a value like "true" is not meaningfully better than none.',
 				{ secret: true }
 			),
 			valueEnv: option(

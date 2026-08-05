@@ -38,11 +38,38 @@ test('isRenderNowAuthorized requires the header value to match the token', () =>
 	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'wrong' })), false);
 });
 
-test('isRenderNowAuthorized authorizes on presence when no token is configured', () => {
+test('isRenderNowAuthorized fails CLOSED when no token is configured', () => {
+	// Previously presence alone authorized here, which made an absent token an open door on a
+	// path that takes public crawler traffic: any caller could skip the cache and force a
+	// synchronous render occupying the request for up to timeoutMs. Enabling is now necessary
+	// but not sufficient — without a token the levers are inert.
 	applyOptions({ renderNow: { enabled: true } });
-	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'anything' })), true);
-	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': '' })), true);
+	assert.equal(config.renderNow.token, '');
+	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'anything' })), false);
+	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': '' })), false);
 	assert.equal(isRenderNowAuthorized(headersWith({})), false);
+});
+
+test('an unresolved valueEnv leaves the levers inert, not open', () => {
+	// The misconfiguration this exists for: config.js only assigns from the environment when the
+	// variable is actually set, so a typo in the variable name leaves token at its empty default.
+	// Under the old permissive reading that typo silently became an open door.
+	delete process.env.RENDER_NOW_TOKEN_ABSENT;
+	applyOptions({ renderNow: { enabled: true, valueEnv: 'RENDER_NOW_TOKEN_ABSENT' } });
+	assert.equal(config.renderNow.token, '');
+	assert.equal(isRenderNowAuthorized(headersWith({ 'x-harper-render-now': 'anything' })), false);
+});
+
+test('resolveServingPolicy grants no levers when the token is missing', () => {
+	// The end-to-end consequence: a miss must proxy the origin as normal rather than forcing a
+	// render, and Cache-Control must not be honored as a cache skip.
+	applyOptions({ renderNow: { enabled: true, defaultMissMode: 'prerender' } });
+	const policy = resolveServingPolicy(
+		PRERENDER,
+		'GET',
+		headersWith({ 'x-harper-render-now': 'anything', 'cache-control': 'no-cache' })
+	);
+	assert.deepEqual(policy, { skipCache: false, missMode: 'origin' });
 });
 
 test('isRenderNowAuthorized honors a custom header name', () => {

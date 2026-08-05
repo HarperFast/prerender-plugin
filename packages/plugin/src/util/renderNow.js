@@ -29,10 +29,16 @@ export const resolveServingPolicy = (routeClass, method, headers) => {
 /**
  * Whether a request is an authorized on-demand render ("render now") request.
  *
- * The feature must be enabled and a header name configured; the request must
- * carry that header. When a `token` is configured the header value must equal it
- * (the shared secret gate). When no token is configured, mere presence of the
- * header authorizes — the feature is then unauthenticated (see config warning).
+ * Requires the feature enabled, a header name configured, AND a non-empty token;
+ * the request must carry that header with a value equal to the token.
+ *
+ * This fails CLOSED on a missing token rather than treating "no token" as
+ * "authorize anyone". The levers bypass the served cache and can occupy a request
+ * for up to `timeoutMs` forcing a synchronous render, so on a path that takes
+ * public crawler traffic the unauthenticated reading is a DoS lever, not a
+ * convenience. It is also the state a misconfiguration lands in: `valueEnv`
+ * pointing at an unset variable leaves `token` at its empty default, so the
+ * permissive reading would turn a typo in a variable name into an open door.
  *
  * `headers` is anything with a `.get(name)` accessor (Harper request headers or a
  * `Headers` instance). An unauthorized-but-present header returns false so the
@@ -41,10 +47,10 @@ export const resolveServingPolicy = (routeClass, method, headers) => {
  */
 export const isRenderNowAuthorized = (headers) => {
 	const { enabled, header, token } = config.renderNow;
-	if (!enabled || !header) return false;
+	if (!enabled || !header || !token) return false;
 	const value = headers.get(header);
 	if (value === null || value === undefined) return false;
-	return token ? value === token : true;
+	return value === token;
 };
 
 /**
