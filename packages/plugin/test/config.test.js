@@ -203,7 +203,11 @@ test('defaultConfig returns fresh deep copies (no shared references)', () => {
 
 test('secret and restart paths are what the schema declares', () => {
 	assert.deepEqual(secretPaths().sort(), ['origin.securityToken.value', 'renderNow.token']);
-	assert.deepEqual(restartPaths().sort(), ['render.reconcile.startDelay', 'render.reconcile.startJitter']);
+	assert.deepEqual(restartPaths().sort(), [
+		'origin.maxResponseHeaderBytes',
+		'render.reconcile.startDelay',
+		'render.reconcile.startJitter',
+	]);
 });
 
 test('describeConfigSchema is JSON-serializable and carries the editor contract', () => {

@@ -3,8 +3,6 @@ import { isIP } from 'node:net';
 import { Agent } from 'undici';
 import { config } from '../config.js';
 
-const agent = new Agent({});
-
 /**
  * The staging IP to connect to for this origin fetch, or undefined for a normal fetch.
  * Staging passthrough is active only when a staging `ip` is configured (and valid) AND
@@ -28,19 +26,42 @@ export const configuredStagingIp = () => {
 	return ip && isIP(ip) ? ip : undefined;
 };
 
-// Dispatchers that pin DNS resolution to a fixed IP (staging passthrough), one per IP.
-// Only the connect address is overridden — the origin (so Host header + TLS SNI + cert
-// validation) stays the real origin host, the server-side equivalent of Chrome's
-// --host-resolver-rules=MAP host ip. In practice there is at most one entry (the single
-// configured staging IP); the map just keeps it stable across requests and across a
-// config reload that changes the IP.
+// `maxHeaderSize` is fixed at Agent construction — undici exposes no way to change it on a live
+// Agent — so `origin.maxResponseHeaderBytes` is restart-scoped: config.js reports a live change
+// as pending-restart and the running dispatchers keep the value they were built with. Without it
+// undici falls back to Node's http.maxHeaderSize (16 KiB), which a real origin can exceed on a
+// single page (a Set-Cookie pile-up plus CSP/Link-preload is enough), and undici answers by
+// DESTROYING THE SOCKET with UND_ERR_HEADERS_OVERFLOW. The crawler then gets a 500 for a page
+// browsers and the CDN load fine, deterministically, because it is a property of that response.
+// Captured on first use and reused by every dispatcher built afterwards, so restart scope holds
+// for all of them. Re-reading config per construction would not: `origin.staging.ip` is
+// live-scoped, so a pinned dispatcher can be built long after boot, and it would then pick up a
+// cap edited in the meantime while the unpinned singleton kept the boot value — two dispatchers
+// disagreeing, and a pending-restart notice that was only half true.
+let capturedMaxHeaderSize;
+const agentOptions = () => ({
+	maxHeaderSize: (capturedMaxHeaderSize ??= config.origin.maxResponseHeaderBytes),
+});
+
+// The unpinned dispatcher carries every cache-miss and passthrough fetch, so it stays a plain
+// lazily-built singleton: one `??=` test on the hot path, no key to build and no Map to probe.
+// It cannot be built at import time because the cap is not known until the component applies
+// its options; by the first origin fetch it always is.
+let agent;
+
+// Dispatchers that pin DNS resolution to a fixed IP (staging passthrough), one per IP. Only the
+// connect address is overridden — the origin (so Host header + TLS SNI + cert validation) stays
+// the real origin host, the server-side equivalent of Chrome's --host-resolver-rules=MAP host ip.
+// In practice there is at most one entry (the single configured staging IP); the map just keeps
+// it stable across requests and across a config reload that changes the IP.
 const pinnedDispatchers = new Map();
 export const dispatcherFor = (ip) => {
-	if (!ip) return agent;
+	if (!ip) return (agent ??= new Agent(agentOptions()));
 	let dispatcher = pinnedDispatchers.get(ip);
 	if (!dispatcher) {
 		const family = isIP(ip);
 		dispatcher = new Agent({
+			...agentOptions(),
 			connect: {
 				// Node's lookup callback has two shapes depending on the `all` option.
 				lookup: (_hostname, options, callback) =>
