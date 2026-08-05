@@ -222,7 +222,12 @@ const serverWithHeadBytes = async (bytes) => {
 		res.writeHead(200, headers);
 		res.end('ok');
 	});
-	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	// Reject on a listen error rather than leaving the await to hang forever (EADDRINUSE, or a
+	// sandbox that forbids binding) — a hung test is far harder to diagnose than a failed one.
+	await new Promise((resolve, reject) => {
+		server.once('error', reject);
+		server.listen(0, '127.0.0.1', resolve);
+	});
 	return { server, origin: `http://127.0.0.1:${server.address().port}` };
 };
 
@@ -231,7 +236,8 @@ const withServer = async (bytes, fn) => {
 	try {
 		return await fn(origin);
 	} finally {
-		server.close();
+		// close() is async; awaiting it keeps a lingering handle from leaking into the next test.
+		await new Promise((resolve) => server.close(resolve));
 	}
 };
 
@@ -332,10 +338,19 @@ test('the staging-pinned dispatcher carries the cap too', async () => {
 	});
 });
 
-test('a cap below Node’s own default is rejected back to the default', () => {
+test('a cap outside the schema bounds is rejected back to the default', () => {
 	// enforceSchemaConstraints warns and restores the default rather than throwing, so a typo
-	// here degrades to the safe 64 KiB instead of silently reintroducing the 16 KiB failure.
+	// degrades to the safe 64 KiB instead of silently reintroducing the 16 KiB failure...
 	applyOptions({ origin: { maxResponseHeaderBytes: 1024 } });
 	assert.equal(config.origin.maxResponseHeaderBytes, 64 * 1024);
+
+	// ...and the ceiling catches the opposite typo — a stray factor of a thousand — before it
+	// becomes an out-of-memory risk multiplied across concurrent connections.
+	applyOptions({ origin: { maxResponseHeaderBytes: 64 * 1024 * 1024 } });
+	assert.equal(config.origin.maxResponseHeaderBytes, 64 * 1024);
+
+	// The bounds themselves are inclusive and must stay usable.
+	applyOptions({ origin: { maxResponseHeaderBytes: 1024 * 1024 } });
+	assert.equal(config.origin.maxResponseHeaderBytes, 1024 * 1024);
 	applyOptions({});
 });

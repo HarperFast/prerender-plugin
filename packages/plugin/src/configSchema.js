@@ -262,11 +262,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'origin’s response rather than a transient. Hence a default well above Node’s, matching what ' +
 				'a CDN in front of the same origin already tolerates.\n\n' +
 				'Raising it raises the worst-case memory held per connection while a response head is ' +
-				'parsed, which is why it is bounded rather than unlimited.\n\n' +
+				'parsed, which is why it is bounded at both ends. The 1 MiB ceiling is far above any ' +
+				'legitimate response head — it exists to catch a typo (a stray factor of a thousand) ' +
+				'before it becomes an out-of-memory risk multiplied across concurrent connections.\n\n' +
 				'Restart-scoped: undici fixes `maxHeaderSize` when the dispatcher is constructed and offers ' +
 				'no way to change it afterwards, so a live edit is reported as pending-restart and the ' +
 				'running dispatchers keep the value they were built with.',
-			{ unit: 'bytes', min: 16 * 1024, scope: 'restart' }
+			{ unit: 'bytes', min: 16 * 1024, max: 1024 * 1024, scope: 'restart' }
 		),
 	}),
 
