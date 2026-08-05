@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { applyOptions, config } from '../src/config.js';
+import { restartPaths } from '../src/configSchema.js';
 import {
 	configuredStagingIp,
+	dispatcherFor,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
 	stagingTargetIp,
@@ -193,4 +196,115 @@ test('resolveUpstreamHeaders picks up ignoredHeaders changes across applyOptions
 	// x-first is no longer ignored, x-second now is
 	assert.equal(upstream['x-first'], 'a');
 	assert.equal(upstream['x-second'], undefined);
+});
+
+// --- origin response-header cap -------------------------------------------------------------
+//
+// Asserted behaviorally against a real server rather than by reading undici's internal
+// kMaxHeadersSize symbol, so the tests survive an undici refactor and actually prove the thing
+// that broke in production: a large-but-legitimate origin response head must not kill the request.
+
+// Serve a response whose head sums to roughly `bytes` across many headers — the shape a real
+// origin produces (a Set-Cookie pile-up plus CSP/Link-preload), since the cap is cumulative
+// over the whole head, not per header.
+const serverWithHeadBytes = async (bytes) => {
+	const server = http.createServer((_req, res) => {
+		const headers = {};
+		const per = 1024;
+		for (let i = 0; i < Math.ceil(bytes / per); i++) headers[`x-pad-${i}`] = 'a'.repeat(per - 12);
+		res.writeHead(200, headers);
+		res.end('ok');
+	});
+	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	return { server, origin: `http://127.0.0.1:${server.address().port}` };
+};
+
+const withServer = async (bytes, fn) => {
+	const { server, origin } = await serverWithHeadBytes(bytes);
+	try {
+		return await fn(origin);
+	} finally {
+		server.close();
+	}
+};
+
+test('a 32 KiB origin response head succeeds under the default cap', async () => {
+	applyOptions({});
+	assert.equal(config.origin.maxResponseHeaderBytes, 64 * 1024);
+	// The whole point: the default must clear Node's http.maxHeaderSize, which is what undici
+	// falls back to and what produced UND_ERR_HEADERS_OVERFLOW -> 500 for the crawler.
+	assert.ok(config.origin.maxResponseHeaderBytes > http.maxHeaderSize);
+
+	await withServer(32 * 1024, async (origin) => {
+		const res = await dispatcherFor(undefined).request({ origin, path: '/', method: 'GET' });
+		assert.equal(res.statusCode, 200);
+		await res.body.text();
+	});
+});
+
+test('the cap is genuinely enforced (a head above it still overflows)', async () => {
+	// Proves the option is wired to undici rather than merely stored. A fresh module instance is
+	// needed because the unpinned dispatcher is built once per process — which is the restart
+	// scope, asserted below. The query string gives a distinct module URL; config.js resolves to
+	// the same URL either way, so the singleton config this sets is what the fresh module reads.
+	applyOptions({ origin: { maxResponseHeaderBytes: 16 * 1024 } });
+	const fresh = await import('../src/util/upstream.js?fresh=low-cap');
+	try {
+		await withServer(32 * 1024, async (origin) => {
+			await assert.rejects(
+				() => fresh.dispatcherFor(undefined).request({ origin, path: '/', method: 'GET' }),
+				(err) => err.code === 'UND_ERR_HEADERS_OVERFLOW'
+			);
+		});
+	} finally {
+		applyOptions({});
+	}
+});
+
+test('the unpinned dispatcher is built once and ignores a live cap change', async () => {
+	// Both halves of restart scope: the hot path must not rebuild per request (efficiency), and a
+	// live edit must not silently take effect (correctness — config.js reports pending-restart).
+	applyOptions({});
+	const first = dispatcherFor(undefined);
+	assert.equal(dispatcherFor(undefined), first);
+
+	applyOptions({ origin: { maxResponseHeaderBytes: 128 * 1024 } });
+	assert.equal(dispatcherFor(undefined), first, 'a live cap change must not swap the dispatcher');
+
+	// ...and it still honors the cap it was constructed with, not the newly configured one.
+	await withServer(32 * 1024, async (origin) => {
+		const res = await first.request({ origin, path: '/', method: 'GET' });
+		assert.equal(res.statusCode, 200);
+		await res.body.text();
+	});
+	applyOptions({});
+});
+
+test('maxResponseHeaderBytes is declared restart-scoped', () => {
+	// Guards the scope declaration itself: dropping it would make the option look live while the
+	// running dispatcher quietly kept the old cap.
+	assert.ok(restartPaths().includes('origin.maxResponseHeaderBytes'));
+});
+
+test('the staging-pinned dispatcher carries the cap too', async () => {
+	// Constructed on its own branch, so it is the easy one to miss — and a staging deploy that
+	// 500s on every large-header page would look like a staging-edge fault, not a config gap.
+	applyOptions({});
+	const pinned = dispatcherFor('127.0.0.1');
+	assert.notEqual(pinned, dispatcherFor(undefined));
+
+	await withServer(32 * 1024, async (origin) => {
+		// The pin rewrites DNS to 127.0.0.1; the port still comes from the origin URL.
+		const res = await pinned.request({ origin, path: '/', method: 'GET' });
+		assert.equal(res.statusCode, 200);
+		await res.body.text();
+	});
+});
+
+test('a cap below Node’s own default is rejected back to the default', () => {
+	// enforceSchemaConstraints warns and restores the default rather than throwing, so a typo
+	// here degrades to the safe 64 KiB instead of silently reintroducing the 16 KiB failure.
+	applyOptions({ origin: { maxResponseHeaderBytes: 1024 } });
+	assert.equal(config.origin.maxResponseHeaderBytes, 64 * 1024);
+	applyOptions({});
 });

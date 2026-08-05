@@ -249,6 +249,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'authorization, and the security-token/debug header names). Matched case-insensitively.',
 			{ movedFrom: 'ignoredHeaders', itemType: 'string' }
 		),
+		maxResponseHeaderBytes: option(
+			64 * 1024,
+			'Largest response head Harper will accept from the origin, summed across every header name ' +
+				'and value in the response (not per header).\n\n' +
+				'Undici defaults this to Node’s `http.maxHeaderSize` (16 KiB), which is a header-flood ' +
+				'mitigation for servers accepting untrusted requests — too strict for a reverse proxy reading ' +
+				'its own origin. A real origin can exceed 16 KiB on a single page (several Set-Cookie plus ' +
+				'CSP, Link rel=preload, NEL, Report-To), and undici responds by destroying the connection ' +
+				'with UND_ERR_HEADERS_OVERFLOW, so the crawler gets a 500 for a page browsers and the CDN ' +
+				'load normally. It fails deterministically for those URLs, since it is a property of the ' +
+				'origin’s response rather than a transient. Hence a default well above Node’s, matching what ' +
+				'a CDN in front of the same origin already tolerates.\n\n' +
+				'Raising it raises the worst-case memory held per connection while a response head is ' +
+				'parsed, which is why it is bounded rather than unlimited.\n\n' +
+				'Restart-scoped: undici fixes `maxHeaderSize` when the dispatcher is constructed and offers ' +
+				'no way to change it afterwards, so a live edit is reported as pending-restart and the ' +
+				'running dispatchers keep the value they were built with.',
+			{ unit: 'bytes', min: 16 * 1024, scope: 'restart' }
+		),
 	}),
 
 	debugHeader: group('Debug response headers, emitted when the request carries this header (any value).', {
