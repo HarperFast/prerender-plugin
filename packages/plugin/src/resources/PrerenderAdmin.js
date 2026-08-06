@@ -60,6 +60,7 @@ import { describeConfigSchema } from '../configSchema.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
+import { cacheServeStatus } from '../util/pageFreshness.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -710,9 +711,9 @@ export class PrerenderAdmin extends Resource {
 
 		const now = Date.now();
 		const expiresAtMs = page?.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-		// Same freshness rule the serving path applies, so this cannot disagree with what a
-		// bot would actually get.
-		const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > now;
+		// THE freshness rule the serving path applies (same function, not a copy), so this
+		// cannot disagree with what a bot would actually get.
+		const fresh = cacheServeStatus(expiresAtMs, config.page.swrTtl, now) !== null;
 
 		// The local schedule read was node-local. If another node owns this row, ask it — a
 		// bounded HTTPS call we control, rather than the unbounded replication fetch a plain
@@ -1022,7 +1023,7 @@ export class PrerenderAdmin extends Resource {
 
 		if (page) {
 			const expiresAtMs = page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-			const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
+			const fresh = cacheServeStatus(expiresAtMs, config.page.swrTtl, Date.now()) !== null;
 			return { ...base, cacheKey, state: fresh ? 'cached' : 'stale' };
 		}
 
@@ -1146,8 +1147,8 @@ export class PrerenderAdmin extends Resource {
 				lastCached: row.lastCached ? new Date(row.lastCached).getTime() : null,
 				expiresAt: Number.isFinite(expiresAtMs) ? expiresAtMs : null,
 				isIndexable: row.isIndexable ?? null,
-				// Same freshness rule the serving path applies.
-				fresh: !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > now,
+				// THE freshness rule the serving path applies (same function, not a copy).
+				fresh: cacheServeStatus(expiresAtMs, config.page.swrTtl, now) !== null,
 				url: urlHalf || null,
 				deviceType: deviceType ?? null,
 			};

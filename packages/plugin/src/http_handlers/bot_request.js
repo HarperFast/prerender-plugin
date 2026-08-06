@@ -12,6 +12,7 @@ import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
+import { cacheServeStatus } from '../util/pageFreshness.js';
 import { currentMinuteMs } from '../util/time.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { deliverResource } from './response.js';
@@ -104,21 +105,6 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
 		}
 	}
-}
-
-// Can this cached page be served, and under which status? 'hit' = within the page's own
-// renderInterval (expiresAt is still ahead); 'swr' = past expiresAt but inside the
-// stale-while-revalidate window (the re-render is late or still in flight); null = not
-// servable from cache (stale/miss — fall through to the miss mode). The serve is identical
-// either way; the split exists because folding both into 'hit' made the headline hit rate
-// unreadable as a freshness signal: at one measured point 71.9% "hit" quietly included ~13%
-// of the corpus being served past expiry. A NaN expiresAtMs fails both comparisons => null.
-//
-// Exported for tests: this boundary (and NaN handling) is the whole hit/swr contract.
-export function cacheServeStatus(expiresAtMs, swrTtl, now) {
-	if (expiresAtMs > now) return 'hit';
-	if (expiresAtMs + swrTtl > now) return 'swr';
-	return null;
 }
 
 // Resolve the request into { url, cacheUrl, deviceType, routeClass, route }, dispatching on

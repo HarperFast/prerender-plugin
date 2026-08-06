@@ -48,7 +48,8 @@ before(async () => {
 		render_schedule: { RenderSchedule: class {} },
 		page_cache: { PrerenderedPage: class {} },
 	};
-	({ recordServeOutcome, cacheServeStatus } = await import('../src/http_handlers/bot_request.js'));
+	({ recordServeOutcome } = await import('../src/http_handlers/bot_request.js'));
+	({ cacheServeStatus } = await import('../src/util/pageFreshness.js'));
 });
 
 beforeEach(() => {
