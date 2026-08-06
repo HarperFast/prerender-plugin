@@ -129,8 +129,13 @@ rest: true # required for the @export-ed table REST endpoints
 
   analytics:
     enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
-    # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate), and
-    # page_age (ms since the served page rendered — freshness at serve, cache hits only)
+    # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate),
+    # page_age (ms since the served page rendered — freshness at serve, cache-served only),
+    # route_serve (outcome by route/cache-status/device — per-route delivery, for tuning each
+    # route's renderInterval), and route_page_age (served age by route/cache-status/device).
+    # cache-status distinguishes 'hit' (within the page's renderInterval) from 'swr' (served
+    # from the stale-while-revalidate window because the re-render is late/in flight) — both
+    # are cache serves; 'hit' alone is the "is the TTL being met" signal.
 
   crawlStats: # crawl breadth: distinct URLs crawled per bot per UTC day (HyperLogLog, ~0.8% error)
     enabled: true # also gated by analytics.enabled above; read via GET /prerender_admin/crawl-breadth?days=7

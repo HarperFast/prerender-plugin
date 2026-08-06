@@ -12,6 +12,7 @@ import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
+import { cacheServeStatus } from '../util/pageFreshness.js';
 import { currentMinuteMs } from '../util/time.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { deliverResource } from './response.js';
@@ -61,17 +62,36 @@ export async function handleBotRequest(request) {
 // rollout success metrics:
 //
 //   origin offload   = bot_serve where source !== 'origin' (requests the origin never saw)
-//   cache hit rate   = bot_serve by cacheStatus (hit / stale / miss / skip / bypass)
+//   cache hit rate   = bot_serve by cacheStatus (hit / swr / stale / miss / skip / bypass).
+//                      'hit' is within the page's renderInterval; 'swr' is served from the
+//                      stale-while-revalidate window. Cache-served = hit + swr; treat hit
+//                      alone as the freshness signal ("is the configured TTL being met").
 //   freshness        = page_age, ms since the served page rendered (cache-served only, so a
 //                      render-now response doesn't drag the distribution toward zero)
 //
-// Cost: one in-memory counter bump per request plus one numeric sample on a cache hit
+// Per-route variants of the same two signals, for tuning each route's renderInterval up or
+// down independently (recordAnalytics has exactly three dimension slots — path/method/type —
+// and bot_serve's are all taken, hence separate metrics rather than a fourth dimension):
+//
+//   route_serve      = (route, cacheStatus, deviceType) counter. swr/stale share per route
+//                      says whether that route's cadence is being DELIVERED; miss share says
+//                      whether its corpus is even covered.
+//   route_page_age   = (route, cacheStatus, deviceType), ms since render, cache-served only.
+//                      Served age per route against that route's own renderInterval is the
+//                      "should this TTL move" number.
+//
+// The route label is the matched route's path ('/', '/catalog/', '/product/prd-' — tiny,
+// stable cardinality), else the route class for passthrough, else 'unrouted'.
+//
+// Cost: two counter bumps per request plus two numeric samples on a cache hit
 // (recordAnalytics buffers in a Map and flushes on Harper's analytics timer) — no storage
 // touch, no await, nothing added to response latency.
 //
 // Exported for tests: the dimension ORDER is the contract dashboards key on.
 export function recordServeOutcome(resource, request, info, deviceType) {
+	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
 	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
+	server.recordAnalytics(true, 'route_serve', route, info.cacheStatus, deviceType);
 	if (info.source === 'cache' && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
@@ -82,6 +102,7 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 		const age = Date.now() - new Date(resource.lastCached).getTime();
 		if (age >= 0) {
 			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
+			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
 		}
 	}
 }
@@ -150,12 +171,12 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
 	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
 	// number, or serialized string all compare correctly — cf. the Number() coercion in
-	// util/renderNow.js. A bad/missing value yields NaN => not fresh.
+	// util/renderNow.js. A bad/missing value yields NaN => not servable from cache.
 	const expiresAtMs = page && page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-	const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
+	const serveStatus = cacheServeStatus(expiresAtMs, config.page.swrTtl, Date.now());
 
-	if (fresh) {
-		info.cacheStatus = 'hit';
+	if (serveStatus) {
+		info.cacheStatus = serveStatus;
 		info.source = 'cache';
 		return page;
 	}
