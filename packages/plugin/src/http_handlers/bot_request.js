@@ -61,17 +61,36 @@ export async function handleBotRequest(request) {
 // rollout success metrics:
 //
 //   origin offload   = bot_serve where source !== 'origin' (requests the origin never saw)
-//   cache hit rate   = bot_serve by cacheStatus (hit / stale / miss / skip / bypass)
+//   cache hit rate   = bot_serve by cacheStatus (hit / swr / stale / miss / skip / bypass).
+//                      'hit' is within the page's renderInterval; 'swr' is served from the
+//                      stale-while-revalidate window. Cache-served = hit + swr; treat hit
+//                      alone as the freshness signal ("is the configured TTL being met").
 //   freshness        = page_age, ms since the served page rendered (cache-served only, so a
 //                      render-now response doesn't drag the distribution toward zero)
 //
-// Cost: one in-memory counter bump per request plus one numeric sample on a cache hit
+// Per-route variants of the same two signals, for tuning each route's renderInterval up or
+// down independently (recordAnalytics has exactly three dimension slots — path/method/type —
+// and bot_serve's are all taken, hence separate metrics rather than a fourth dimension):
+//
+//   route_serve      = (route, cacheStatus, deviceType) counter. swr/stale share per route
+//                      says whether that route's cadence is being DELIVERED; miss share says
+//                      whether its corpus is even covered.
+//   route_page_age   = (route, cacheStatus, deviceType), ms since render, cache-served only.
+//                      Served age per route against that route's own renderInterval is the
+//                      "should this TTL move" number.
+//
+// The route label is the matched route's path ('/', '/catalog/', '/product/prd-' — tiny,
+// stable cardinality), else the route class for passthrough, else 'unrouted'.
+//
+// Cost: two counter bumps per request plus two numeric samples on a cache hit
 // (recordAnalytics buffers in a Map and flushes on Harper's analytics timer) — no storage
 // touch, no await, nothing added to response latency.
 //
 // Exported for tests: the dimension ORDER is the contract dashboards key on.
 export function recordServeOutcome(resource, request, info, deviceType) {
+	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
 	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
+	server.recordAnalytics(true, 'route_serve', route, info.cacheStatus, deviceType);
 	if (info.source === 'cache' && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
@@ -82,8 +101,24 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 		const age = Date.now() - new Date(resource.lastCached).getTime();
 		if (age >= 0) {
 			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
+			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
 		}
 	}
+}
+
+// Can this cached page be served, and under which status? 'hit' = within the page's own
+// renderInterval (expiresAt is still ahead); 'swr' = past expiresAt but inside the
+// stale-while-revalidate window (the re-render is late or still in flight); null = not
+// servable from cache (stale/miss — fall through to the miss mode). The serve is identical
+// either way; the split exists because folding both into 'hit' made the headline hit rate
+// unreadable as a freshness signal: at one measured point 71.9% "hit" quietly included ~13%
+// of the corpus being served past expiry. A NaN expiresAtMs fails both comparisons => null.
+//
+// Exported for tests: this boundary (and NaN handling) is the whole hit/swr contract.
+export function cacheServeStatus(expiresAtMs, swrTtl, now) {
+	if (expiresAtMs > now) return 'hit';
+	if (expiresAtMs + swrTtl > now) return 'swr';
+	return null;
 }
 
 // Resolve the request into { url, cacheUrl, deviceType, routeClass, route }, dispatching on
@@ -150,12 +185,12 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
 	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
 	// number, or serialized string all compare correctly — cf. the Number() coercion in
-	// util/renderNow.js. A bad/missing value yields NaN => not fresh.
+	// util/renderNow.js. A bad/missing value yields NaN => not servable from cache.
 	const expiresAtMs = page && page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-	const fresh = !isNaN(expiresAtMs) && expiresAtMs + config.page.swrTtl > Date.now();
+	const serveStatus = cacheServeStatus(expiresAtMs, config.page.swrTtl, Date.now());
 
-	if (fresh) {
-		info.cacheStatus = 'hit';
+	if (serveStatus) {
+		info.cacheStatus = serveStatus;
 		info.source = 'cache';
 		return page;
 	}
