@@ -117,7 +117,13 @@ export async function renderAudit(o: RenderAuditOptions): Promise<AuditResult> {
 	const fullConfig = buildFullConfig(base);
 	const blockUrlPatterns = (base && base.block && base.block.urlPatterns) || [];
 	const resolvedHosts = Object.keys(hostResolverRules || {});
-	const common = { device, bypass, hostResolverRules };
+	// `pageType` reaches the RENDER, not just the report grouping. It was a label only, which was
+	// harmless while nothing in a render consulted it — but a `waitFor` rule scoped with
+	// `pageTypes` would then be skipped on every audit render, so state B would settle differently
+	// from the fleet it is supposed to reproduce and the audit would report content as missing that
+	// production actually captures. Empty string (the default) is passed as undefined so an
+	// unlabelled audit is "no page type", not a type named ''.
+	const common = { device, bypass, hostResolverRules, pageType: pageType || undefined };
 
 	// State A probe: hydrate, then extract BOTH modes from the live post-render page:
 	//  • structural → the Diff-1 fingerprint (bots parse the DOM; visibility is irrelevant to "is the

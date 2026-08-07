@@ -54,6 +54,13 @@ export interface RenderOnceOptions extends Omit<BrowserOptions, 'harper'> {
 	url: string;
 	/** Device profile key (into config.devices). Default: config.defaultDevice. */
 	device?: string;
+	/**
+	 * Page type (template) name to render as, e.g. `'pdp'` — what the plugin would send on a real
+	 * queue job for this URL. Required to reproduce a `waitFor` rule scoped with `pageTypes`:
+	 * without it the job carries no template and every such rule is skipped, so the harness would
+	 * silently render a page the fleet settles differently.
+	 */
+	pageType?: string;
 	/** Extra per-navigation request headers (merged onto the request like a job's headers). */
 	headers?: Record<string, string>;
 	acceptLanguage?: string;
@@ -140,6 +147,7 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 	const {
 		url,
 		device,
+		pageType,
 		headers,
 		acceptLanguage,
 		renderBudgetMs,
@@ -199,6 +207,7 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 		renderBudget: renderBudgetMs,
 		callbackOrigin: 'http://localhost', // unused: no sendResult
 		isFromSitemap: captureNonIndexable ?? true, // serialize even non-indexable pages so HTML is inspectable
+		pageType,
 		headers,
 	});
 

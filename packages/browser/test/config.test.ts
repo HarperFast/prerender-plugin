@@ -137,6 +137,26 @@ test('waitFor: validation of devices / pathPattern scoping', () => {
 	);
 });
 
+test('waitFor: validation of pageTypes scoping', () => {
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', pageTypes: 'pdp' as unknown as string[] }] }),
+		/waitFor\[0\]\.pageTypes must be an array/
+	);
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#r', pageTypes: ['pdp', ''] }] }),
+		/waitFor\[0\]\.pageTypes must be an array/
+	);
+	// One template reached by several URL shapes is several names here, not a regex alternation
+	// that has to be kept in step with the plugin's route list by hand.
+	assert.doesNotThrow(() =>
+		mergeConfig({ waitFor: [{ selector: '#r', devices: ['mobile'], pageTypes: ['pdp', 'category'] }] })
+	);
+	// pageTypes and pathPattern coexist — the migration path is rule-by-rule, not a flag day.
+	assert.doesNotThrow(() =>
+		mergeConfig({ waitFor: [{ selector: '#r', pageTypes: ['pdp'], pathPattern: '^/product/' }] })
+	);
+});
+
 test('validation: a device must have a numeric viewport', () => {
 	const file = writeConfig({ devices: { desktop: { viewport: { width: 'wide' } } } });
 	assert.throws(() => loadConfig(file), /requires a viewport with numeric width and height/);

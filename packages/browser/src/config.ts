@@ -194,8 +194,30 @@ export type WaitForRule = {
 	 * Only apply this rule when the render URL's PATH matches this JavaScript regular expression
 	 * (e.g. `'^/product/'` for PDPs). Omit → all paths. Scope a rule to the routes that have the
 	 * widget so it never polls to the timeout on pages that don't (a page-type latency guard).
+	 *
+	 * Prefer {@link WaitForRule.pageTypes} where the plugin declares page types: this pattern is a
+	 * SECOND description of a routing fact the plugin's route list already owns, and the two drift
+	 * silently — a route added there keeps rendering without the rule, and nothing reports it.
 	 */
 	pathPattern?: string;
+	/**
+	 * Only apply this rule when the job's declared page type is one of these names (e.g.
+	 * `['pdp']`). Omit → all page types.
+	 *
+	 * The template name comes from the plugin's own route list (`ingress.routes[].pageType`), so
+	 * this expresses "the pages that have this widget" in the same vocabulary that decides what
+	 * gets rendered at all — one list to keep correct instead of two. It also covers what a path
+	 * regex cannot say cheaply: one template reached by several unrelated URL shapes is one name
+	 * here, rather than an alternation that has to be kept in step by hand.
+	 *
+	 * A job carrying NO page type (a plugin older than prerender-v0.34.0, or a route that names
+	 * no template) does not match any `pageTypes` rule. That is the safe direction: the rule is
+	 * skipped, which costs the content it would have waited for, rather than applied blindly,
+	 * which costs a poll to the timeout on every page that lacks the widget.
+	 *
+	 * Combines with the other scopes by AND — a rule with `devices` and `pageTypes` needs both.
+	 */
+	pageTypes?: string[];
 };
 
 export type PrerenderConfig = {
@@ -342,6 +364,12 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 				(!Array.isArray(rule.devices) || rule.devices.some((d) => typeof d !== 'string' || d.trim() === ''))
 			) {
 				throw new Error(`prerender config: waitFor[${i}].devices must be an array of non-empty device names`);
+			}
+			if (
+				rule.pageTypes !== undefined &&
+				(!Array.isArray(rule.pageTypes) || rule.pageTypes.some((t) => typeof t !== 'string' || t.trim() === ''))
+			) {
+				throw new Error(`prerender config: waitFor[${i}].pageTypes must be an array of non-empty type names`);
 			}
 			if (rule.pathPattern !== undefined) {
 				if (typeof rule.pathPattern !== 'string' || rule.pathPattern.trim() === '') {

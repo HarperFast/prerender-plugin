@@ -85,7 +85,7 @@ function bucketNameOf(
 	return '';
 }
 
-/** Build one waitFor rule from a lazy-widget finding, scoped to the given devices/pathPattern.
+/** Build one waitFor rule from a lazy-widget finding, scoped to the given devices/page type.
  *  Mapping (e.g. `{selector:'#reviews', waitForSelector:'[class*=review-]'}`):
  *    selector        = the specific element/container to scroll into view (finding.selectorPath),
  *    waitForSelector = the lazy-content class to count (the bucket selector), emitted only when it is
@@ -94,7 +94,7 @@ function bucketNameOf(
  *  human-fillable rather than silently broken. */
 function deriveWaitForRule(
 	finding: Finding,
-	{ devices, pathPattern }: { devices: string[]; pathPattern?: string }
+	{ devices, pageType, pathPattern }: { devices: string[]; pageType?: string; pathPattern?: string }
 ): WaitForRule {
 	const content = bucketSelectorOf(finding); // lazy content class → waitForSelector
 	const anchor = trimStr(finding && finding.selectorPath); // specific element/container → selector
@@ -108,8 +108,15 @@ function deriveWaitForRule(
 	rule.minCount = 1;
 	rule.timeoutMs = 15000;
 	if (devices.length) rule.devices = devices; // omit → all devices (config default); avoids [undefined]
+	// Scope so the rule never adds latency where the widget doesn't exist. Prefer the page-type
+	// NAME when the audit was given one: it is the plugin's own vocabulary, so the emitted patch
+	// stays correct as routes are added to that template — a suggested `pathPattern` is a second
+	// copy of the route list that starts drifting the moment one is. Fall back to the pattern when
+	// the audit was run without a type.
+	const pt = trimStr(pageType);
 	const pp = trimStr(pathPattern);
-	if (pp) rule.pathPattern = pp; // scope to the page type's routes so it never adds latency elsewhere
+	if (pt) rule.pageTypes = [pt];
+	else if (pp) rule.pathPattern = pp;
 	return rule;
 }
 
@@ -119,8 +126,8 @@ function deriveWaitForRule(
  * @param {{missing?:object[], flakyB?:object[], stale?:object[], bucketDrops?:object[]}} diff1
  * @param {{findings?:object[]}} diff2
  * @param {object} [options]
- * @param {string} [options.pageType]        page-type label (context for the viewport note)
- * @param {string} [options.pathPattern]     regex source scoping waitFor rules to this page type's routes
+ * @param {string} [options.pageType]        page-type name — scopes emitted waitFor rules, and context for the viewport note
+ * @param {string} [options.pathPattern]     regex fallback for scoping waitFor rules when no pageType is given
  * @param {string} [options.device]          the device this cell audited (default waitFor scope)
  * @param {string[]} [options.missingDevices] devices that actually lack the content → waitFor scope
  * @returns {object} minimal patch: some subset of { postProcess:{removeSelectors?,resolveLazyImages?},
@@ -170,7 +177,7 @@ export function suggestFixes(
 	const seenRuleKeys = new Set<string>(); // dedupe rules that collapse to the same (selector, waitForSelector)
 	let hasTodoRule = false;
 	for (const f of lazyCandidates) {
-		const rule = deriveWaitForRule(f, { devices, pathPattern });
+		const rule = deriveWaitForRule(f, { devices, pageType, pathPattern });
 		const key = rule.selector + '\n' + (rule.waitForSelector || '');
 		if (seenRuleKeys.has(key)) continue;
 		seenRuleKeys.add(key);

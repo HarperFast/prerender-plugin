@@ -32,6 +32,16 @@ export type JobConfig = {
 	renderBudget?: number;
 	callbackOrigin: string;
 	isFromSitemap: boolean;
+	/**
+	 * The template this URL belongs to — the plugin's declared `pageType` for the route that
+	 * matched (`home`, `category`, `pdp`), or absent when the route names none.
+	 *
+	 * Lets render rules be scoped by template name instead of by a `pathPattern` regex that
+	 * restates URL shapes the plugin's route list already owns. Absent on jobs from a plugin
+	 * older than prerender-v0.34.0, so anything reading it must treat absence as "unknown
+	 * template" and fall back rather than skip.
+	 */
+	pageType?: string | null;
 };
 
 /**
@@ -110,6 +120,8 @@ export default class RenderJob {
 	isIndexable: boolean | undefined;
 	redirectedTo: string | undefined;
 	isFromSitemap: boolean;
+	/** Declared template name for this URL, or null/undefined when the plugin sent none. */
+	pageType: string | null | undefined;
 	/**
 	 * Why this render produced no cacheable content — one slug across every no-content class,
 	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
@@ -136,6 +148,7 @@ export default class RenderJob {
 		this.renderBudget = config.renderBudget;
 		this.callbackOrigin = config.callbackOrigin;
 		this.isFromSitemap = config.isFromSitemap;
+		this.pageType = config.pageType;
 	}
 
 	sanitizeHeaders(headers: Record<string, string>) {

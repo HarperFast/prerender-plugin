@@ -366,11 +366,16 @@ const renderer: Renderer = async (page, job) => {
 			/* leave '' */
 		}
 		for (const rule of config.waitFor ?? []) {
-			// Per-rule scoping: skip rules that don't target this device or path, so a rule never
-			// polls to its timeout on renders it isn't meant for (e.g. a PDP-reviews rule on a
-			// category page, or on desktop where the content is already in view). Validated at config
-			// load, so a bad pathPattern regex can't reach here.
+			// Per-rule scoping: skip rules that don't target this device, page type, or path, so a
+			// rule never polls to its timeout on renders it isn't meant for (e.g. a PDP-reviews rule
+			// on a category page, or on desktop where the content is already in view). Scopes AND
+			// together. Validated at config load, so a bad pathPattern regex can't reach here.
 			if (rule.devices && !rule.devices.includes(deviceType)) continue;
+			// A job with no declared page type never matches a pageTypes rule — the plugin may
+			// predate the field, or the route may name no template. Skipping costs the content this
+			// rule would have waited for; applying it blindly would cost a poll to the timeout on
+			// every page that lacks the widget, which is the failure this scoping exists to prevent.
+			if (rule.pageTypes && !(job.pageType && rule.pageTypes.includes(job.pageType))) continue;
 			if (rule.pathPattern && !new RegExp(rule.pathPattern).test(path)) continue;
 
 			const contentSelector = rule.waitForSelector ?? rule.selector;

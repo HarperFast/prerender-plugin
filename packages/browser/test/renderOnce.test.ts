@@ -178,6 +178,44 @@ test('waitFor path scoping: a rule only runs when the URL path matches pathPatte
 	assert.equal(await count('^/'), 5, 'rule runs when path matches');
 });
 
+test('waitFor page-type scoping: a rule only runs for its listed page types', async () => {
+	// The point of scoping by NAME rather than by a path regex: the template comes from the
+	// plugin's route list, so this rule says "the pages that have this widget" in the same
+	// vocabulary that decided the page would be rendered at all.
+	const rule = (pageTypes: string[]) => ({
+		selector: '#reviews',
+		waitForSelector: '.rev-item',
+		minCount: 1,
+		timeoutMs: 3000,
+		pageTypes,
+	});
+	const count = async (pageTypes: string[], pageType?: string) => {
+		const r = await renderOnce({
+			url: base,
+			device: 'mobile',
+			pageType,
+			config: { ...NO_SCROLL, waitFor: [rule(pageTypes)] },
+			probes: { rev: selectorCountProbe(['.rev-item']) },
+		});
+		return (r.probes.rev as Record<string, number>)['.rev-item'];
+	};
+	assert.equal(await count(['pdp'], 'pdp'), 5, 'rule runs for its page type');
+	assert.equal(await count(['pdp'], 'category'), 0, 'rule is skipped for another page type');
+	// One template, several names — the multi-URL-shape case a regex would need an alternation for.
+	assert.equal(await count(['pdp', 'category'], 'category'), 5, 'matches any listed type');
+	// A job with no declared type never matches: a plugin older than prerender-v0.34.0, or a route
+	// naming no template. Skipping costs this rule's content; applying it blindly would cost a poll
+	// to the timeout on every page lacking the widget, which is what the scoping exists to prevent.
+	assert.equal(await count(['pdp'], undefined), 0, 'a job with no page type matches no pageTypes rule');
+});
+
+test('the job carries the page type through to the renderer', async () => {
+	const r = await renderOnce({ url: base, device: 'desktop', pageType: 'pdp', config: NO_SCROLL });
+	assert.equal(r.job.pageType, 'pdp');
+	const untyped = await renderOnce({ url: base, device: 'desktop', config: NO_SCROLL });
+	assert.equal(untyped.job.pageType, undefined);
+});
+
 test('captureNonIndexable returns HTML for a noindex page (and marks it non-indexable)', async () => {
 	const r = await renderOnce({ url: `${base}/noindex`, device: 'desktop', config: NO_SCROLL });
 	assert.equal(r.isIndexable, false);

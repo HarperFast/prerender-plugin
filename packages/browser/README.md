@@ -98,7 +98,7 @@ include what you change:
 	"scroll": { "enabled": true, "stepMs": 200, "topSettleMs": 300 }, // scroll to bottom for lazy content; topSettleMs lets scroll-reactive headers re-reveal at the top before serializing
 	// optional: AFTER the normal scroll-settle (which still runs and triggers all other lazy content),
 	// scroll a selector into view and wait for lazy content (e.g. reviews below the fold on a short
-	// viewport) before the snapshot. Absent → no-op. Scope each rule with `devices`/`pathPattern` so it
+	// viewport) before the snapshot. Absent → no-op. Scope each rule with `devices`/`pageTypes` so it
 	// only runs where the widget is — otherwise it polls to `timeoutMs` on pages/devices that lack it.
 	"waitFor": [
 		{
@@ -107,7 +107,7 @@ include what you change:
 			"minCount": 1,
 			"timeoutMs": 15000,
 			"devices": ["mobile", "tablet"], // desktop's tall viewport already has it in view
-			"pathPattern": "^/product/", // only product pages have this widget
+			"pageTypes": ["pdp"], // only product pages have this widget
 		},
 	],
 	"postProcess": {
@@ -122,6 +122,34 @@ include what you change:
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### Scoping a `waitFor` rule: `pageTypes` vs `pathPattern`
+
+An unscoped rule polls to its `timeoutMs` on every page and device that lacks the widget, so every
+rule should say where it applies. There are two ways, and they AND together with `devices`:
+
+| scope         | matches when                                | use when                                   |
+| ------------- | ------------------------------------------- | ------------------------------------------ |
+| `pageTypes`   | the job's declared page type is in the list | the plugin declares page types (preferred) |
+| `pathPattern` | the URL path matches this regex             | no page types declared, or a one-off URL   |
+
+**Prefer `pageTypes`.** The name comes from the plugin's own route list
+(`ingress.routes[].pageType`), so the rule is expressed in the same vocabulary that decides what
+gets rendered at all — one list to keep correct instead of two. A `pathPattern` is a second
+description of a routing fact the plugin already owns, and the two drift silently: add a route to
+that template on the plugin side and it renders without the rule, with nothing reporting it. Page
+types also express cheaply what a regex needs an alternation for — one template reached by several
+unrelated URL shapes is one name.
+
+A job carrying **no** page type never matches a `pageTypes` rule. That happens with a plugin older
+than `prerender-v0.34.0`, or a route that names no template. Skipping is the safe direction: it
+costs the content this one rule would have waited for, rather than reinstating the poll-to-timeout
+on every page that lacks the widget. `pathPattern` still works and is not deprecated — migrate rule
+by rule.
+
+`renderOnce`/`renderMatrix` take a `pageType` option, and `renderAudit`'s existing `pageType`
+now reaches the render as well as the report. Without it, a `pageTypes`-scoped rule is skipped and
+the harness renders a page the fleet settles differently.
 
 ## Custom renderer
 
@@ -192,8 +220,7 @@ const cell = await renderAudit({
 	bypass: { header: 'x-harper-renderer-bypass', token: process.env.TOKEN },
 	hostResolverRules: { 'example.com': '203.0.113.10' }, // reach a staging edge IP in this env
 	buckets: { reviews: '[class*=review-]' }, // page-type element counts, shadow-aware
-	pageType: 'pdp',
-	pathPattern: '^/product/',
+	pageType: 'pdp', // groups the report AND scopes the render + any suggested waitFor rule
 });
 
 console.log(cell.diff1.missing); // SEO content in the full render but absent from the served bytes
