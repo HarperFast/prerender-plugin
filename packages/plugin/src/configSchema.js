@@ -62,6 +62,30 @@ export const configSchema = group('Prerender plugin configuration.', {
 		{ itemType: 'string' }
 	),
 
+	pageTypes: option(
+		[],
+		'Named page types (templates) — the site’s own vocabulary for the kinds of page it serves: ' +
+			'`home`, `category`, `pdp`. Each entry is { name: string, renderInterval?: number }.\n\n' +
+			'A page type is the unit that per-template settings and per-template METRICS hang off. ' +
+			'`ingress.routes` entries point at one with `pageType: <name>`, and SEVERAL routes may share ' +
+			'the same name — which is the point: a site whose category pages are reachable by two ' +
+			'different URL shapes gets ONE set of numbers for “category” instead of two unrelated rows ' +
+			'that a reader has to know to add together.\n\n' +
+			'Declaring a type here is optional. It is only required to (a) set a value once for several ' +
+			'routes, or (b) give the type a name in metrics; a route may name a type that is not declared ' +
+			'and it still labels metrics correctly — an undeclared name is not an error, just a type with ' +
+			'no settings of its own.\n\n' +
+			'`renderInterval` (ms) is the render cadence for every URL of this type. Full precedence, ' +
+			'resolved at schedule time on each cycle: route `renderInterval` > this > the target’s stored ' +
+			'interval (sitemap `changefreq` / explicit API write) > `render.defaultInterval`. The route ' +
+			'level still wins so a single URL (an `exact` route) can carve itself out of its type’s ' +
+			'cadence without inventing a one-member type.\n\n' +
+			'Names travel: the matched type is sent to the renderer on each queue job, so browser-side ' +
+			'render rules can be scoped by template name instead of re-describing the same URL shapes as ' +
+			'regular expressions in a second repository.',
+		{ itemType: 'object' }
+	),
+
 	ingress: group(
 		'Request-ingestion model: how incoming bot requests are recognized, which paths are ' +
 			'prerendered, and how the target URL and device type are derived.\n\n' +
@@ -97,7 +121,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				[],
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
-					'queryParams?: string[], renderInterval?: number }.\n\n' +
+					'queryParams?: string[], pageType?: string, renderInterval?: number }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -111,12 +135,17 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'off the proxied origin fetch and hand the visitor the wrong page.\n\n' +
 					"A path matching NOTHING is 'unclassified': still proxied (never blocked), never cached, and " +
 					'counted for reporting so the gap can be fixed at the CDN or here.\n\n' +
+					'`pageType` (prerender routes only) names the template this route serves — see the top-level ' +
+					'`pageTypes`. It is what per-template settings and metrics key on, and SEVERAL routes may ' +
+					'carry the same name so that one template reachable by two URL shapes reports as one thing. ' +
+					'Omitted, the route reports under its own `path`, which is the pre-`pageTypes` behavior.\n\n' +
 					'`renderInterval` (ms, prerender routes only) sets the render cadence for every URL the route ' +
-					"matches. Precedence: route > the target's stored interval (sitemap `<changefreq>` or an " +
-					'explicit API write) > `render.defaultInterval` — resolved at schedule time on every cycle, so ' +
-					"changing it here takes effect on each URL's next render with no data migration. A per-URL " +
-					'exception is an `exact` route ordered above its class (e.g. the homepage `exact /` at 2h above ' +
-					'a 6h section prefix); a route that should defer to sitemap changefreq simply doesn’t set one.\n\n' +
+					"matches. Precedence: route > the route's `pageType` > the target's stored interval (sitemap " +
+					'`<changefreq>` or an explicit API write) > `render.defaultInterval` — resolved at schedule time ' +
+					"on every cycle, so changing it here takes effect on each URL's next render with no data " +
+					'migration. Prefer setting a cadence on the `pageType` when several routes share it; keep it ' +
+					'here for a per-URL exception (e.g. the homepage `exact /` at 2h above a 6h section prefix). A ' +
+					'route that should defer to sitemap changefreq simply doesn’t set one.\n\n' +
 					"OPERATIONAL NOTE: if the CDN edge-caches a route's responses with a fixed TTL from its own " +
 					"property settings (not from our response headers), that TTL and the route's renderInterval " +
 					'must be kept aligned BY HAND — rendering much faster than the edge TTL burns renders the edge ' +
@@ -391,8 +420,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'How often a target is re-rendered when nothing more specific applies. Cadence is relative to ' +
 				'each render’s completion (not a fixed time-of-day), and a target’s first render is jittered ' +
 				'across its interval — so the fleet renders as a smooth stream rather than a daily herd. Full ' +
-				'precedence, resolved at schedule time: matched route `renderInterval` (ingress.routes) > the ' +
-				'target’s stored interval (sitemap `changefreq` / explicit API write) > this default.',
+				'precedence, resolved at schedule time: matched route `renderInterval` (ingress.routes) > that ' +
+				'route’s `pageType` `renderInterval` (top-level `pageTypes`) > the target’s stored interval ' +
+				'(sitemap `changefreq` / explicit API write) > this default.',
 			{ unit: 'ms', min: 1 }
 		),
 		suppression: group(

@@ -25,7 +25,7 @@ export async function handleBotRequest(request) {
 		if (!target) {
 			return { headers: {}, status: 400 };
 		}
-		const { url, cacheUrl, deviceType, routeClass, route } = target;
+		const { url, cacheUrl, deviceType, routeClass, pageType, pageTypeLabel, route } = target;
 
 		request.botName = getBotName(request.headers);
 		const recordBots = config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched);
@@ -38,8 +38,11 @@ export async function handleBotRequest(request) {
 
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
-		// decides whether this request is cached and scheduled at all.
-		const info = { route, routeClass };
+		// decides whether this request is cached and scheduled at all. `pageType` is the declared
+		// template name or null; `pageTypeLabel` is the always-present metrics label for it. Both
+		// come from the one classification the ingress already did, so the debug headers and the
+		// serve metrics can never disagree about which template answered a request.
+		const info = { route, routeClass, pageType, pageTypeLabel };
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		maybeSchedule(resource, routeClass);
@@ -69,19 +72,24 @@ export async function handleBotRequest(request) {
 //   freshness        = page_age, ms since the served page rendered (cache-served only, so a
 //                      render-now response doesn't drag the distribution toward zero)
 //
-// Per-route variants of the same two signals, for tuning each route's renderInterval up or
-// down independently (recordAnalytics has exactly three dimension slots — path/method/type —
+// Per-PAGE-TYPE variants of the same two signals, for tuning each template's renderInterval up
+// or down independently (recordAnalytics has exactly three dimension slots — path/method/type —
 // and bot_serve's are all taken, hence separate metrics rather than a fourth dimension):
 //
-//   route_serve      = (route, cacheStatus, deviceType) counter. swr/stale share per route
-//                      says whether that route's cadence is being DELIVERED; miss share says
-//                      whether its corpus is even covered.
-//   route_page_age   = (route, cacheStatus, deviceType), ms since render, cache-served only.
-//                      Served age per route against that route's own renderInterval is the
-//                      "should this TTL move" number.
+//   pagetype_serve   = (pageType, cacheStatus, deviceType) counter. swr/stale share per
+//                      template says whether that template's cadence is being DELIVERED; miss
+//                      share says whether its corpus is even covered.
+//   pagetype_age     = (pageType, cacheStatus, deviceType), ms since render, cache-served only.
+//                      Served age per template against that template's own renderInterval is
+//                      the "should this TTL move" number.
 //
-// The route label is the matched route's path ('/', '/catalog/', '/product/prd-' — tiny,
-// stable cardinality), else the route class for passthrough, else 'unrouted'.
+// These replace v0.33.0's `route_serve` / `route_page_age`, which labelled by the matched
+// route's PATH. That split one template across every URL shape that reaches it — a site with
+// two category routes got two unrelated rows that only a reader holding the route list could
+// add back together — and it is the same label the render-side cost metric needs, so the two
+// halves of "is this template worth what it costs" could not be joined. `pageTypeLabel` still
+// falls back to the route path when no type is declared, so an un-migrated deployment emits the
+// same label values under the new metric names.
 //
 // Cost: two counter bumps per request plus two numeric samples on a cache hit
 // (recordAnalytics buffers in a Map and flushes on Harper's analytics timer) — no storage
@@ -89,9 +97,9 @@ export async function handleBotRequest(request) {
 //
 // Exported for tests: the dimension ORDER is the contract dashboards key on.
 export function recordServeOutcome(resource, request, info, deviceType) {
-	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
+	const pageType = info.pageTypeLabel;
 	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
-	server.recordAnalytics(true, 'route_serve', route, info.cacheStatus, deviceType);
+	server.recordAnalytics(true, 'pagetype_serve', pageType, info.cacheStatus, deviceType);
 	if (info.source === 'cache' && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
@@ -102,7 +110,7 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 		const age = Date.now() - new Date(resource.lastCached).getTime();
 		if (age >= 0) {
 			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
-			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
+			server.recordAnalytics(age, 'pagetype_age', pageType, info.cacheStatus, deviceType);
 		}
 	}
 }
@@ -120,6 +128,8 @@ function resolveBotTarget(request) {
 			cacheUrl: target.cacheUrl,
 			deviceType: target.deviceType,
 			routeClass: target.routeClass,
+			pageType: target.pageType,
+			pageTypeLabel: target.pageTypeLabel,
 			route: target.route,
 		};
 	}
@@ -129,12 +139,14 @@ function resolveBotTarget(request) {
 	// this mode — but the allowlist stays the global `url.queryParams`, so the key is
 	// unchanged. canonicalizeUrl has already proved the URL parses by the time we classify.
 	const cacheUrl = canonicalizeUrl(request.url.slice(config.ingress.botPathPrefix.length), config.cacheKey.queryParams);
-	const { routeClass, entry } = classifyPath(URL.parse(cacheUrl)?.pathname ?? '/');
+	const { routeClass, pageType, pageTypeLabel, entry } = classifyPath(URL.parse(cacheUrl)?.pathname ?? '/');
 	return {
 		url: new URL(cacheUrl),
 		cacheUrl,
 		deviceType: sanitizeDeviceType(request.headers.get(config.ingress.deviceTypeHeader)),
 		routeClass,
+		pageType,
+		pageTypeLabel,
 		route: entry,
 	};
 }

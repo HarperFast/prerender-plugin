@@ -19,7 +19,7 @@
 import { config } from '../config.js';
 import { CacheKey } from './cacheKey.js';
 import { canonicalizeUrl } from './url.js';
-import { classifyPath, isForwardedMode, PRERENDER } from './routeClass.js';
+import { classifyPath, isForwardedMode, pageTypeSettings, PRERENDER } from './routeClass.js';
 import { sanitizeDeviceType } from './device_type.js';
 
 // `source` is included deliberately: an entry folded in from `excludePathPatterns` looks
@@ -27,7 +27,15 @@ import { sanitizeDeviceType } from './device_type.js';
 // this" is the difference between two very different fixes.
 const summarizeRoute = (route) =>
 	route
-		? { match: route.match, path: route.path, mode: route.mode, queryParams: route.queryParams, source: route.source }
+		? {
+				match: route.match,
+				path: route.path,
+				mode: route.mode,
+				queryParams: route.queryParams,
+				pageType: route.pageType,
+				renderInterval: route.renderInterval,
+				source: route.source,
+			}
 		: null;
 
 /**
@@ -44,7 +52,8 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 
 	// The same classifier the read path uses, so this can never explain a key the serving path
 	// wouldn't actually compute.
-	const { routeClass, queryParams: allowlist, entry: route } = classifyPath(url.pathname);
+	const { routeClass, pageType, pageTypeLabel, queryParams: allowlist, entry: route } = classifyPath(url.pathname);
+	const typeSettings = pageTypeSettings(pageType);
 	const allowlistSource = !forwarded
 		? 'url.queryParams'
 		: routeClass === PRERENDER
@@ -83,6 +92,36 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 			// `eligibility.prerendered` below is the derived boolean, not a second copy of it.
 			routeClass,
 			route: summarizeRoute(route),
+		},
+		// Which template this URL belongs to, and the cadence that follows from it. Answers the
+		// two questions the route block alone can't: what will this URL be REPORTED as, and why
+		// is it re-rendering at the rate it is.
+		pageType: {
+			// The declared name (null when the route names none) versus the label metrics
+			// actually carry — which falls back to the route path, then the class. Showing both
+			// is the point: a `null` name beside a `/catalog/` label is precisely the state where
+			// two routes are reporting separately and an operator meant them to be one template.
+			name: pageType,
+			metricLabel: pageTypeLabel,
+			declared: typeSettings !== null,
+			// Cadence precedence, resolved as far as config can see it. The target's STORED
+			// interval (sitemap changefreq / an API write) sits between `pageType` and `default`
+			// and is per-URL data, so it isn't knowable here — hence `effective` is the
+			// config-derived answer and is marked as assuming no stored value.
+			cadence: (() => {
+				const fromRoute = route?.renderInterval ?? null;
+				const fromType = typeSettings?.renderInterval ?? null;
+				const configured = fromRoute ?? fromType;
+				return {
+					route: fromRoute,
+					pageType: fromType,
+					default: config.render.defaultInterval,
+					effective: configured ?? config.render.defaultInterval,
+					// Nothing in config pins this URL's cadence, so a stored interval on the target
+					// would win over the default shown above.
+					effectiveAssumesNoStoredInterval: configured === null,
+				};
+			})(),
 		},
 		allowlist: { used: allowlist, source: allowlistSource },
 		underGlobalAllowlist: {

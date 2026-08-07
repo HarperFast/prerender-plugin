@@ -1,5 +1,6 @@
 /**
- * Route classification — the single answer to "do we prerender this path?"
+ * Route classification — the single answer to "do we prerender this path?" and "what KIND of
+ * page is this?"
  *
  * Every path the plugin sees resolves to exactly one of three classes:
  *
@@ -30,6 +31,22 @@
  * allowlist could still do there is silently strip params from the proxied request and hand
  * the visitor the wrong page — with no cached entry and no `x-harper-cache-key` to explain
  * it. So an allowlist on a passthrough entry is rejected at compile time, not honored.
+ *
+ * PAGE TYPES (templates) are the SECOND thing a path resolves to, and the reason they live here
+ * rather than beside the metrics that consume them: a page type is a property of the ROUTE, and
+ * the route match is already computed on every request. A type is a name — `home`, `category`,
+ * `pdp` — that several routes may share, which is the whole point. A site whose category pages
+ * are reachable by two URL shapes has ONE category template and wants one set of numbers for
+ * it; labelling metrics by the matched route's PATH (what this module used to expose) split that
+ * template into two unrelated rows only a reader who knew the route list could add back
+ * together. Types also give per-template settings a single home, so two routes sharing a
+ * template cannot drift apart on cadence, and they travel to the renderer on the queue job so
+ * browser-side rules can be scoped by template name instead of by a second, independently
+ * maintained set of URL patterns in another repository.
+ *
+ * The type is deliberately NOT derived from the path (first segment, a regex, a heuristic).
+ * Those all re-encode routing knowledge the route list already holds, and they drift from it
+ * silently. Declaring `pageType` on the route keeps one list authoritative.
  */
 
 import { config, getLogger } from '../config.js';
@@ -102,7 +119,66 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
-	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, source };
+	// Optional template name. Like renderInterval, a bad value drops the FIELD, never the route:
+	// losing a name costs a metrics label, while dropping the entry would change how the path is
+	// SERVED. An unknown name is NOT rejected — `pageTypes` only has to declare a type that
+	// carries settings, so requiring a declaration here would make naming a type for metrics
+	// alone impossible.
+	let pageType = null;
+	if (raw.pageType !== undefined && raw.pageType !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring pageType on passthrough route "${raw.match} ${raw.path}" — a passthrough route is never ` +
+					`rendered or cached, so it has no template to configure or report on`
+			);
+		} else if (typeof raw.pageType === 'string' && raw.pageType !== '') {
+			pageType = raw.pageType;
+		} else {
+			warn(
+				`ignoring pageType on route "${raw.match} ${raw.path}" — expected a non-empty string, got ` +
+					`${String(raw.pageType)}`
+			);
+		}
+	}
+
+	return { match: raw.match, path: raw.path, mode, queryParams, pageType, renderInterval, source };
+};
+
+/**
+ * Compile the top-level `pageTypes` list into a name → settings map.
+ *
+ * Last declaration of a duplicated name wins, and says so. Silently keeping the first would
+ * leave an operator staring at a cadence that plainly does not match the config they are
+ * reading.
+ */
+const compilePageTypes = (pageTypes) => {
+	const log = getLogger();
+	const byName = new Map();
+
+	for (const raw of Array.isArray(pageTypes) ? pageTypes : []) {
+		if (!raw || typeof raw.name !== 'string' || raw.name === '') continue;
+
+		let renderInterval = null;
+		if (raw.renderInterval !== undefined && raw.renderInterval !== null) {
+			if (Number.isFinite(raw.renderInterval) && raw.renderInterval > 0) {
+				renderInterval = raw.renderInterval;
+			} else {
+				// String(), never JSON.stringify() — the latter throws on a BigInt, and config
+				// compilation must not be crashable from a warning path.
+				log.warn?.(
+					`[prerender] ignoring renderInterval on pageType "${raw.name}" — expected a positive number of ` +
+						`milliseconds, got ${String(raw.renderInterval)}`
+				);
+			}
+		}
+
+		if (byName.has(raw.name)) {
+			log.warn?.(`[prerender] pageType "${raw.name}" is declared more than once — using the last declaration`);
+		}
+		byName.set(raw.name, { name: raw.name, renderInterval });
+	}
+
+	return byName;
 };
 
 /**
@@ -167,6 +243,32 @@ const getRoutes = () => {
 	return compiled;
 };
 
+// Same compile-and-memoize treatment for the page-type table, tracked independently: a
+// `pageTypes` edit must not force the route list to recompile, and vice versa.
+let compiledTypes = null;
+let compiledFromPageTypes;
+
+const getPageTypes = () => {
+	if (config.pageTypes !== compiledFromPageTypes) {
+		compiledTypes = compilePageTypes(config.pageTypes);
+		compiledFromPageTypes = config.pageTypes;
+	}
+	return compiledTypes;
+};
+
+/** Declared settings for a page-type name, or null when the name carries none. */
+export const pageTypeSettings = (name) => (name ? (getPageTypes().get(name) ?? null) : null);
+
+/** Every declared page-type name, for config reporting and the admin UI. */
+export const declaredPageTypes = () => [...getPageTypes().keys()];
+
+/** Every page-type name actually referenced by a compiled route. */
+export const routePageTypes = () => {
+	const names = new Set();
+	for (const entry of getRoutes()) if (entry.pageType) names.add(entry.pageType);
+	return names;
+};
+
 /**
  * First matching compiled entry for `path`, or null. First match wins, so entries should be
  * ordered most-specific first — which is what lets a passthrough carve-out sit inside a
@@ -193,11 +295,48 @@ export const prerenderRouteCount = () => {
 };
 
 /**
- * Classify a device-stripped path into `{ routeClass, queryParams, entry }`.
+ * Build the classification result every `classify*` returns, including the metrics label.
+ *
+ * The label is computed HERE rather than offered as a `pageTypeLabel(x)` helper callers apply
+ * themselves. Every caller that labels a metric already holds a classification, and a helper
+ * would have to agree with each of them about what its argument is called — the read path calls
+ * the matched route `route`, this module calls it `entry` — which is exactly the kind of drift
+ * this module exists to prevent. It is a `??` chain over values already in hand: no allocation,
+ * nothing worth making lazy.
+ *
+ * WHY THE FALLBACK CHAIN (name → route path → class). Every request must produce a label or the
+ * metric develops holes that read as traffic disappearing. Falling back to the route path
+ * (rather than one 'other' bucket) means a deployment that declares no `pageTypes` emits exactly
+ * the label values it emitted before types existed — so adoption is incremental, one route at a
+ * time, instead of a flag day that resets every dashboard.
+ *
+ * CARDINALITY is bounded by construction and must stay that way: every arm resolves to a
+ * configured name, a configured path, or one of three class constants. Nothing here may ever
+ * derive a label from the REQUEST (its path, query, or headers) — an unbounded metrics label is
+ * how a monitoring backend gets taken down by a crawler walking a faceted URL space.
+ */
+const classification = (routeClass, pageType, queryParams, entry) => ({
+	routeClass,
+	pageType,
+	pageTypeLabel: pageType ?? entry?.path ?? routeClass,
+	queryParams,
+	entry,
+});
+
+/**
+ * Classify a device-stripped path into
+ * `{ routeClass, pageType, pageTypeLabel, queryParams, entry }`.
  *
  * `queryParams` is the allowlist to canonicalize this path's URL with; `entry` is the
  * matched compiled route (null when nothing matched) and carries `source`, so a caller can
  * report WHERE a classification came from.
+ *
+ * `pageType` is the declared template name, or null — never a fallback — while `pageTypeLabel`
+ * is always a string. The two are separate on purpose. A caller labelling a metric needs a
+ * value for every request, so it takes the label. A caller telling the renderer which template
+ * it is about to render (the queue job) must send the real name or nothing: were it to send the
+ * label's fallback, a browser-side rule scoped to a template would fire on a route that was
+ * never declared to be one.
  *
  * The field is `routeClass`, not `class`: `class` is a reserved word, so a caller could not
  * destructure it without renaming at every call site.
@@ -212,16 +351,16 @@ export const classifyPath = (path) => {
 	const entry = matchRoute(path);
 
 	if (!isForwardedMode()) {
-		return {
-			routeClass: entry && entry.mode === PASSTHROUGH ? PASSTHROUGH : PRERENDER,
-			queryParams: config.cacheKey.queryParams,
-			entry: entry ?? null,
-		};
+		const routeClass = entry && entry.mode === PASSTHROUGH ? PASSTHROUGH : PRERENDER;
+		// Prefix mode reaches here with `entry` set only for a folded exclude (always
+		// passthrough), so a named type can only ever come from a real prerender route.
+		const pageType = routeClass === PRERENDER ? (entry?.pageType ?? null) : null;
+		return classification(routeClass, pageType, config.cacheKey.queryParams, entry ?? null);
 	}
 
-	if (!entry) return { routeClass: UNCLASSIFIED, queryParams: KEEP_ALL, entry: null };
-	if (entry.mode === PASSTHROUGH) return { routeClass: PASSTHROUGH, queryParams: KEEP_ALL, entry };
-	return { routeClass: PRERENDER, queryParams: entry.queryParams, entry };
+	if (!entry) return classification(UNCLASSIFIED, null, KEEP_ALL, null);
+	if (entry.mode === PASSTHROUGH) return classification(PASSTHROUGH, null, KEEP_ALL, entry);
+	return classification(PRERENDER, entry.pageType, entry.queryParams, entry);
 };
 
 /**
@@ -239,11 +378,7 @@ export const classifyUrl = (rawUrl) => {
 	if (pathname === undefined) {
 		// Unparseable, so unclassifiable. Keep every param exactly as an unmatched path does —
 		// any caller that goes on to build a key from this URL fails on the URL itself first.
-		return {
-			routeClass: UNCLASSIFIED,
-			queryParams: isForwardedMode() ? KEEP_ALL : config.cacheKey.queryParams,
-			entry: null,
-		};
+		return classification(UNCLASSIFIED, null, isForwardedMode() ? KEEP_ALL : config.cacheKey.queryParams, null);
 	}
 	return classifyPath(pathname);
 };
@@ -260,8 +395,13 @@ export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
 
 /**
  * The render cadence for a URL: the matched route's `renderInterval` when it sets one, else
- * the target's stored interval (sitemap `<changefreq>` or an explicit API write), else
- * `render.defaultInterval`.
+ * that route's `pageType` cadence, else the target's stored interval (sitemap `<changefreq>` or
+ * an explicit API write), else `render.defaultInterval`.
+ *
+ * ROUTE BEATS ITS PAGE TYPE so a single URL can carve itself out of its template's cadence
+ * (an `exact` route above the template's prefix) without inventing a one-member type. The
+ * template level is where a cadence shared by several routes belongs — set on each route
+ * instead, the two copies drift and only the first-matching one is ever observed.
  *
  * ROUTE BEATS STORED, deliberately. The stored interval is data written at creation time;
  * if it won, changing a route's cadence would apply only to targets discovered AFTER the
@@ -276,8 +416,10 @@ export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
  * / the url-half of a cacheKey).
  */
 export const resolveRenderInterval = (url, storedInterval) => {
-	const { entry } = classifyUrl(url);
+	const { pageType, entry } = classifyUrl(url);
 	if (entry && entry.renderInterval !== null && entry.renderInterval !== undefined) return entry.renderInterval;
+	const typeInterval = pageTypeSettings(pageType)?.renderInterval;
+	if (typeInterval !== null && typeInterval !== undefined) return typeInterval;
 	// Coerce before the finite check: `Long` columns can surface the stored interval as a
 	// BigInt, which `Number.isFinite` rejects outright — without this, every such target
 	// would silently fall back to the default cadence. `Number(null)` is 0 and

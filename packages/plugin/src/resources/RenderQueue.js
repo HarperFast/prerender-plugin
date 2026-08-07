@@ -4,7 +4,7 @@ import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
+import { classifyPath, classifyUrl, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
@@ -225,6 +225,14 @@ export class RenderQueue extends Resource {
 		const hasContent = result.statusCode === 200 && result.content;
 
 		if (typeof result.renderTime === 'number') {
+			// The third dimension was unused until page types existed, and filling it with the
+			// template is what makes render COST attributable. Render time is the fleet's
+			// capacity input — demand is the sum over templates of (corpus / interval) — but
+			// until now it was recorded as one undifferentiated distribution, so "product pages
+			// are expensive to settle" was a thing you could believe and not a thing you could
+			// show. Sharing the label with `pagetype_serve`/`pagetype_age` is the point: cost
+			// per template and delivered freshness per template finally join on one key, which
+			// is the whole argument for moving a template's interval.
 			server.recordAnalytics(
 				result.renderTime,
 				'render_time',
@@ -233,7 +241,11 @@ export class RenderQueue extends Resource {
 					? result.isIndexable || hasContent
 						? 'candidate'
 						: 'non-candidate'
-					: 'unknown'
+					: 'unknown',
+				// `result.id`, NOT `cacheKey`: the latter may already have been re-pointed at a
+				// redirect destination above, which would bill this render to the template it
+				// landed on instead of the one that was scheduled and actually paid for.
+				classifyUrl(CacheKey.extractUrl(result.id)).pageTypeLabel
 			);
 		}
 
@@ -359,7 +371,17 @@ export class RenderQueue extends Resource {
 	 */
 	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable }) {
 		if (typeof result.renderTime === 'number') {
-			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
+			// Same template attribution as the main path: a render that ended in a redirect still
+			// consumed a slot, and the template that keeps paying for redirects is the one worth
+			// finding. Billed to the SOURCE (`result.id`) — the job that was scheduled — not to
+			// wherever it landed.
+			server.recordAnalytics(
+				result.renderTime,
+				'render_time',
+				result.statusCode,
+				'redirect',
+				classifyUrl(CacheKey.extractUrl(result.id)).pageTypeLabel
+			);
 		}
 
 		// Same status rules as processJobResult, applied BEFORE anything retires or strikes
@@ -629,6 +651,13 @@ export class RenderQueue extends Resource {
 				expiresAt,
 				callbackOrigin: `${protocol}://${server.hostname}:${port}`,
 				isFromSitemap: !!schedule.fromSitemap,
+				// The template name (or null), so browser-side render rules can be scoped by
+				// template instead of re-describing the same URL shapes as regular expressions in
+				// the render fleet's own config — two pattern lists for one routing fact, in two
+				// repositories, with nothing keeping them in step. Sent as the DECLARED name only:
+				// the metrics label's route-path fallback would make a rule scoped to a template
+				// fire on routes never declared to be one. Older browsers ignore the field.
+				pageType: classifyUrl(url).pageType,
 			});
 		}
 

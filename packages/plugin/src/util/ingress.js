@@ -28,12 +28,14 @@ const firstHeaderValue = (raw) => (raw ? raw.split(',')[0].trim() : '');
 
 /**
  * Resolve a forwarded request into its prerender target:
- * `{ url: URL, cacheUrl, deviceType, route, routeClass }`, or `null` when the request should
- * be skipped entirely. Never throws.
+ * `{ url: URL, cacheUrl, deviceType, route, routeClass, pageType, pageTypeLabel }`, or `null`
+ * when the request should be skipped entirely. Never throws.
  *
  * `routeClass` is the single source of truth for how the handler treats this request — there
  * is deliberately no separate `noCache` flag that could fall out of step with it. Only
  * `prerender` is cached and scheduled. `route` is the matched compiled entry, or null.
+ * `pageType`/`pageTypeLabel` are that route's template name and its metrics label; both are
+ * carried from the single `classifyPath` call below so nothing downstream re-derives them.
  *
  * Skipped (`null`) means: no device-type prefix in path mode, an unusable forwarded host, or
  * an unclassified path in HEADER mode. That last case is a mode asymmetry worth stating. In
@@ -63,7 +65,7 @@ export const resolveForwardedRequest = (request) => {
 		path = rawPath;
 	}
 
-	const { routeClass, queryParams, entry } = classifyPath(path);
+	const { routeClass, pageType, pageTypeLabel, queryParams, entry } = classifyPath(path);
 
 	// See the header-mode asymmetry above.
 	if (routeClass === UNCLASSIFIED && !fromPath) return null;
@@ -91,7 +93,7 @@ export const resolveForwardedRequest = (request) => {
 		// see util/unrouted.js for why.
 		if (routeClass !== PRERENDER) recordUnroutedPath(routeClass, path, 'cdn');
 
-		return { url: new URL(cacheUrl), cacheUrl, deviceType, route: entry, routeClass };
+		return { url: new URL(cacheUrl), cacheUrl, deviceType, route: entry, routeClass, pageType, pageTypeLabel };
 	} catch (e) {
 		// `e?.message ?? String(e)` rather than `e.message`: anything can be thrown, and a
 		// non-Error rejection must not turn a skipped request into a TypeError in the logger.

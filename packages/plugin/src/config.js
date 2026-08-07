@@ -35,7 +35,7 @@ import {
 // evaluation time. The count has to come from the compiler rather than from raw config,
 // because the finding's whole job is to catch entries the compiler REJECTED (a typo'd
 // `match`), which the raw array still contains.
-import { prerenderRouteCount } from './util/routeClass.js';
+import { declaredPageTypes, prerenderRouteCount, routePageTypes } from './util/routeClass.js';
 
 // Returns the Harper logger when running inside Harper, otherwise the console.
 // Unit tests run outside Harper where `logger` is undefined.
@@ -332,6 +332,19 @@ export const collectConfigWarnings = () => {
 			'ingress.routes',
 			'forwarded mode with NO valid prerender routes — every request will be proxied uncached; ' +
 				'check ingress.routes for entries dropped as invalid'
+		);
+	}
+	// A `pageTypes` entry nothing points at is almost always a typo on one side of the join, and
+	// its symptom is silence: the type's settings simply never apply and its name never appears
+	// in metrics, which reads exactly like "this template gets no traffic". Info, not warn — the
+	// same list is legitimately shared across deployments whose route sets differ.
+	const unusedPageTypes = declaredPageTypes().filter((name) => !routePageTypes().has(name));
+	if (unusedPageTypes.length > 0) {
+		add(
+			'info',
+			'pageTypes',
+			`pageTypes declared but not referenced by any route: ${unusedPageTypes.join(', ')} — their settings ` +
+				'will never apply; check for a spelling mismatch with ingress.routes[].pageType'
 		);
 	}
 	const { staging } = config.origin;

@@ -7,6 +7,9 @@ import {
 	matchRoute,
 	prerenderRouteCount,
 	queryAllowlistFor,
+	pageTypeSettings,
+	declaredPageTypes,
+	routePageTypes,
 	resolveRenderInterval,
 	PASSTHROUGH,
 	PRERENDER,
@@ -274,4 +277,190 @@ test('a per-URL cadence exception is an exact route above its class prefix', () 
 	const base = 'https://www.example.com';
 	assert.equal(resolveRenderInterval(`${base}/catalog/hot-deals.jsp`, null), HOUR_MS);
 	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, null), 6 * HOUR_MS);
+});
+
+/* ── Page types (templates) ─────────────────────────────────────────────────────────────── */
+
+// The shape this whole feature exists for: one template reached by two different URL shapes.
+const withPageTypes = (pageTypes, routes) => applyOptions({ pageTypes, ingress: { mode: 'forwarded', routes } });
+
+const KOHLS_SHAPED = [
+	{ match: 'exact', path: '/', pageType: 'home' },
+	{ match: 'prefix', path: '/catalog/', pageType: 'category' },
+	{ match: 'contains', path: '/category/', pageType: 'category' },
+	{ match: 'prefix', path: '/product/prd-', pageType: 'pdp' },
+];
+
+test('several routes share one page type, and the metrics label collapses onto it', () => {
+	withPageTypes([], KOHLS_SHAPED);
+	// Two distinct route patterns, one label — without this the two category shapes would report
+	// as '/catalog/' and '/category/' and no consumer could tell they were the same template.
+	assert.equal(classifyPath('/catalog/girls.jsp').pageTypeLabel, 'category');
+	assert.equal(classifyPath('/shop/category/boys').pageTypeLabel, 'category');
+	assert.equal(classifyPath('/').pageTypeLabel, 'home');
+	assert.equal(classifyPath('/product/prd-1').pageTypeLabel, 'pdp');
+});
+
+test('pageType is the DECLARED name only; pageTypeLabel carries the fallback', () => {
+	withPageTypes([], [{ match: 'prefix', path: '/catalog/' }]);
+	const c = classifyPath('/catalog/girls.jsp');
+	// Null name, path label. The queue job sends `pageType`, so an undeclared route must not
+	// make a browser-side rule scoped to a template fire on it.
+	assert.equal(c.pageType, null);
+	assert.equal(c.pageTypeLabel, '/catalog/');
+});
+
+test('label falls back name -> route path -> route class', () => {
+	withPageTypes(
+		[],
+		[
+			{ match: 'prefix', path: '/named/', pageType: 'pdp' },
+			{ match: 'prefix', path: '/bare/' },
+		]
+	);
+	assert.equal(classifyPath('/named/x').pageTypeLabel, 'pdp');
+	assert.equal(classifyPath('/bare/x').pageTypeLabel, '/bare/');
+	// Nothing matched at all — the class is the label, and it is always a string.
+	assert.equal(classifyPath('/nothing').pageTypeLabel, UNCLASSIFIED);
+});
+
+test('a deployment declaring no page types emits exactly its pre-pageTypes labels', () => {
+	// The adoption guarantee: turning the feature on changes no label until a route names a type.
+	forwarded();
+	assert.equal(classifyPath('/catalog/girls.jsp').pageTypeLabel, '/catalog/');
+	assert.equal(classifyPath('/').pageTypeLabel, '/');
+	assert.equal(classifyPath('/nothing').pageTypeLabel, UNCLASSIFIED);
+});
+
+test('pageType is rejected on a passthrough route (never rendered or cached)', () => {
+	withPageTypes([], [{ match: 'prefix', path: '/search/', mode: PASSTHROUGH, pageType: 'search' }]);
+	const entry = matchRoute('/search/x');
+	assert.equal(entry.mode, PASSTHROUGH);
+	assert.equal(entry.pageType, null);
+	assert.equal(classifyPath('/search/x').pageType, null);
+	// It still labels by its PATH, exactly as it did before page types existed — knowing which
+	// declared passthrough is absorbing traffic is worth more than one merged 'passthrough' row.
+	// Only a path matching NOTHING falls all the way through to the class.
+	assert.equal(classifyPath('/search/x').pageTypeLabel, '/search/');
+	assert.equal(classifyPath('/nothing').pageTypeLabel, UNCLASSIFIED);
+});
+
+test('a malformed pageType drops the FIELD, never the route', () => {
+	// Losing a name costs a label; dropping the entry would change how the path is SERVED.
+	withPageTypes(
+		[],
+		[
+			{ match: 'prefix', path: '/a/', pageType: '' },
+			{ match: 'prefix', path: '/b/', pageType: 42 },
+			{ match: 'prefix', path: '/c/', pageType: 'ok' },
+		]
+	);
+	assert.equal(prerenderRouteCount(), 3);
+	assert.equal(matchRoute('/a/x').pageType, null);
+	assert.equal(matchRoute('/b/x').pageType, null);
+	assert.equal(matchRoute('/c/x').pageType, 'ok');
+});
+
+test('a route may name a page type that is not declared — metrics only, no settings', () => {
+	// Declaring a type is only needed to give it SETTINGS; requiring it would make naming a
+	// template purely for reporting impossible.
+	withPageTypes([], [{ match: 'prefix', path: '/product/', pageType: 'pdp' }]);
+	assert.equal(classifyPath('/product/x').pageType, 'pdp');
+	assert.equal(pageTypeSettings('pdp'), null);
+	assert.equal(resolveRenderInterval('https://www.example.com/product/x', null), config.render.defaultInterval);
+});
+
+test('resolveRenderInterval precedence: route > pageType > stored > default', () => {
+	withPageTypes(
+		[
+			{ name: 'category', renderInterval: 12 * HOUR_MS },
+			{ name: 'pdp', renderInterval: 48 * HOUR_MS },
+		],
+		[
+			// An exact route carves one URL out of its template's cadence.
+			{ match: 'exact', path: '/catalog/hot-deals.jsp', pageType: 'category', renderInterval: HOUR_MS },
+			{ match: 'prefix', path: '/catalog/', pageType: 'category' },
+			{ match: 'contains', path: '/category/', pageType: 'category' },
+			{ match: 'prefix', path: '/product/prd-', pageType: 'pdp' },
+			{ match: 'prefix', path: '/misc/' }, // no type, no cadence
+		]
+	);
+	const base = 'https://www.example.com';
+
+	// Route beats its page type.
+	assert.equal(resolveRenderInterval(`${base}/catalog/hot-deals.jsp`, 5 * HOUR_MS), HOUR_MS);
+	// Page type beats the stored interval, on BOTH routes that share the type — the drift this
+	// replaces: the same cadence copied onto two routes, where only the first match is observed.
+	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, 5 * HOUR_MS), 12 * HOUR_MS);
+	assert.equal(resolveRenderInterval(`${base}/shop/category/boys`, 5 * HOUR_MS), 12 * HOUR_MS);
+	assert.equal(resolveRenderInterval(`${base}/product/prd-1`, 5 * HOUR_MS), 48 * HOUR_MS);
+	// A route with no type still falls through to stored, then default.
+	assert.equal(resolveRenderInterval(`${base}/misc/x`, 5 * HOUR_MS), 5 * HOUR_MS);
+	assert.equal(resolveRenderInterval(`${base}/misc/x`, null), config.render.defaultInterval);
+});
+
+test('a declared page type with no renderInterval defers to stored, then default', () => {
+	withPageTypes([{ name: 'pdp' }], [{ match: 'prefix', path: '/product/', pageType: 'pdp' }]);
+	const url = 'https://www.example.com/product/x';
+	assert.equal(pageTypeSettings('pdp').renderInterval, null);
+	assert.equal(resolveRenderInterval(url, 6 * HOUR_MS), 6 * HOUR_MS);
+	assert.equal(resolveRenderInterval(url, null), config.render.defaultInterval);
+});
+
+test('an invalid pageType renderInterval drops the FIELD, keeping the type usable', () => {
+	withPageTypes([{ name: 'pdp', renderInterval: -5 }], [{ match: 'prefix', path: '/product/', pageType: 'pdp' }]);
+	assert.equal(pageTypeSettings('pdp').renderInterval, null);
+	assert.equal(classifyPath('/product/x').pageTypeLabel, 'pdp'); // still labels
+	assert.equal(resolveRenderInterval('https://www.example.com/product/x', null), config.render.defaultInterval);
+});
+
+test('a duplicated page-type name resolves to the last declaration', () => {
+	withPageTypes(
+		[
+			{ name: 'pdp', renderInterval: 12 * HOUR_MS },
+			{ name: 'pdp', renderInterval: 48 * HOUR_MS },
+		],
+		[{ match: 'prefix', path: '/product/', pageType: 'pdp' }]
+	);
+	assert.equal(resolveRenderInterval('https://www.example.com/product/x', null), 48 * HOUR_MS);
+});
+
+test('declaredPageTypes and routePageTypes expose both sides of the join', () => {
+	// What the "declared but unreferenced" config finding is computed from.
+	withPageTypes(
+		[{ name: 'category' }, { name: 'orphan' }],
+		[
+			{ match: 'prefix', path: '/catalog/', pageType: 'category' },
+			{ match: 'prefix', path: '/x/', pageType: 'ghost' },
+		]
+	);
+	assert.deepEqual(declaredPageTypes(), ['category', 'orphan']);
+	assert.deepEqual([...routePageTypes()].sort(), ['category', 'ghost']);
+});
+
+test('tolerates a non-array pageTypes value and junk entries', () => {
+	withPageTypes([null, {}, { name: '' }, { name: 'ok' }], [{ match: 'prefix', path: '/a/', pageType: 'ok' }]);
+	assert.deepEqual(declaredPageTypes(), ['ok']);
+	assert.equal(classifyPath('/a/x').pageTypeLabel, 'ok');
+});
+
+test('prefix (native) mode still resolves page types from routes', () => {
+	// Prefix mode has no route list gating ingress, but a route that names a template must still
+	// label and configure it — otherwise the feature would silently be forwarded-mode-only.
+	applyOptions({
+		pageTypes: [{ name: 'pdp', renderInterval: 48 * HOUR_MS }],
+		ingress: { mode: 'prefix', routes: [{ match: 'prefix', path: '/product/', pageType: 'pdp' }] },
+	});
+	assert.equal(classifyPath('/product/x').pageType, 'pdp');
+	assert.equal(classifyPath('/product/x').pageTypeLabel, 'pdp');
+	assert.equal(resolveRenderInterval('https://www.example.com/product/x', null), 48 * HOUR_MS);
+	// A folded exclude is passthrough and carries no template.
+	assert.equal(classifyPath('/other').pageType, null);
+});
+
+test('classifyUrl on an unparseable URL yields a label rather than undefined', () => {
+	// Every request must produce a label or the metric develops holes that read as lost traffic.
+	withPageTypes([], KOHLS_SHAPED);
+	assert.equal(classifyUrl('not a url').pageTypeLabel, UNCLASSIFIED);
+	assert.equal(classifyUrl('not a url').pageType, null);
 });

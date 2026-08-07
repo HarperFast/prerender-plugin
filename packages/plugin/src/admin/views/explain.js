@@ -119,6 +119,34 @@ function explanation(ctx, data) {
 							muted(`  ${data.ingress.route.source}`),
 						]),
 					],
+					data.eligibility.prerendered && [
+						'Page type',
+						el('span', null, [
+							el('code', { text: data.pageType.metricLabel }),
+							muted(
+								data.pageType.name === null
+									? '  no pageType on this route — reported under its path'
+									: data.pageType.declared
+										? '  declared in pageTypes'
+										: '  named but not declared — metrics only, no settings'
+							),
+						]),
+					],
+					data.eligibility.prerendered && [
+						'Render cadence',
+						el('span', null, [
+							el('code', { text: duration(data.pageType.cadence.effective) }),
+							muted(
+								`  ${
+									data.pageType.cadence.route !== null
+										? 'from the matched route'
+										: data.pageType.cadence.pageType !== null
+											? `from pageType ${data.pageType.name}`
+											: 'render.defaultInterval'
+								}${data.pageType.cadence.effectiveAssumesNoStoredInterval ? ', unless this target stores its own' : ''}`
+							),
+						]),
+					],
 				]),
 				verdictPills(data, page),
 			],

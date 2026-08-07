@@ -35,6 +35,9 @@ rest: true # required for the @export-ed table REST endpoints
   # --- options (all optional; defaults shown) ---
   domains: [] # indexable-host allowlist; empty = allow all hosts
 
+  # named templates; routes point at one with `pageType` — see "Page types (templates)"
+  pageTypes: [] # [{ name, renderInterval }] — several routes may share one name
+
   ingress: # how incoming bot requests are parsed (see "Ingress modes" below)
     mode: prefix # 'prefix' (native /p/<absolute-url>) or 'forwarded' (reverse proxy/CDN)
     botPathPrefix: /p/ # prefix mode: requests under this prefix are treated as bot requests
@@ -44,7 +47,8 @@ rest: true # required for the @export-ed table REST endpoints
     forwardedProtoHeader: x-forwarded-proto
     defaultProtocol: https
     # ordered, first match wins — see "Route classes"
-    routes: [] # [{ match: exact|prefix|contains, path, mode: prerender|passthrough, queryParams: [...] }]
+    routes: [] # [{ match: exact|prefix|contains, path, mode: prerender|passthrough,
+    #                queryParams: [...], pageType, renderInterval }]
     # compiled into `routes` as prepended passthrough entries; matched against the PATH
     excludePathPatterns: ['/search/'] # paths containing these are never auto-scheduled
     report: # periodic tally of paths served without prerendering
@@ -131,11 +135,13 @@ rest: true # required for the @export-ed table REST endpoints
     enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
     # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate),
     # page_age (ms since the served page rendered — freshness at serve, cache-served only),
-    # route_serve (outcome by route/cache-status/device — per-route delivery, for tuning each
-    # route's renderInterval), and route_page_age (served age by route/cache-status/device).
+    # pagetype_serve (outcome by page-type/cache-status/device — per-template delivery, for
+    # tuning each template's renderInterval), and pagetype_age (served age by the same three).
     # cache-status distinguishes 'hit' (within the page's renderInterval) from 'swr' (served
     # from the stale-while-revalidate window because the re-render is late/in flight) — both
     # are cache serves; 'hit' alone is the "is the TTL being met" signal.
+    # render_time carries the page type as its third dimension, so render COST and delivered
+    # freshness join on one key — see "Page types (templates)".
 
   crawlStats: # crawl breadth: distinct URLs crawled per bot per UTC day (HyperLogLog, ~0.8% error)
     enabled: true # also gated by analytics.enabled above; read via GET /prerender_admin/crawl-breadth?days=7
@@ -236,6 +242,72 @@ Unclassified and passthrough traffic is counted per first path segment and flush
 forwarding `/blog/*`"); passthrough is the coverage backlog ("we proxy this much bot traffic live,
 on purpose"). The tally is in-process, so **every worker** flushes its own line — each carries
 `node=` and `worker=`, and a reader sums across them.
+
+### Page types (templates)
+
+A route says _whether_ a path is prerendered. A **page type** says _what kind of page it is_ —
+the site's own vocabulary for its templates: `home`, `category`, `pdp`. It is the unit that
+per-template settings and per-template metrics hang off.
+
+```yaml
+pageTypes:
+  - { name: home, renderInterval: 7200000 } # 2h
+  - { name: category, renderInterval: 43200000 } # 12h
+  - { name: pdp, renderInterval: 172800000 } # 48h
+
+ingress:
+  routes:
+    - { match: exact, path: '/', pageType: home }
+    - { match: prefix, path: '/catalog/', pageType: category }
+    - { match: contains, path: '/category/', pageType: category } # same template, second URL shape
+    - { match: prefix, path: '/product/prd-', pageType: pdp }
+```
+
+**Several routes may share one name, and that is the point.** A template reachable by two URL
+shapes is one template. Before page types, metrics were labelled with the matched route's _path_,
+so those two category routes produced two unrelated series that only a reader holding the route
+list could add back together — and a cadence set on both could silently drift, with only the
+first-matching copy ever taking effect.
+
+Declaring a type is **optional**. A route may name a type that appears in no `pageTypes` entry;
+it still labels metrics correctly. Declaring it is only needed to give the type settings, or to
+share one setting across the routes that carry it. A type declared but referenced by no route is
+reported as an `info` config finding — that state is almost always a spelling mismatch, and its
+symptom otherwise is silence.
+
+**Cadence precedence** (resolved at schedule time, every cycle — no data migration):
+
+```
+route renderInterval  >  pageType renderInterval  >  target's stored interval  >  render.defaultInterval
+```
+
+The route level still wins so a single URL can carve itself out of its template's cadence (an
+`exact` route ordered above the template's prefix) without inventing a one-member type.
+
+**What the name is used for:**
+
+| consumer                          | uses                                                                   |
+| --------------------------------- | ---------------------------------------------------------------------- |
+| `pagetype_serve` / `pagetype_age` | delivery + freshness per template — the "should this TTL move" numbers |
+| `render_time`                     | render **cost** per template — the fleet capacity input                |
+| `resolveRenderInterval`           | one cadence for every route sharing the template                       |
+| the queue job (`pageType`)        | lets browser-side render rules scope by template name                  |
+| `/prerender_admin` explain        | the template, whether it is declared, and the cadence that follows     |
+
+The job payload carries the **declared name only**, never the metrics fallback — a browser-side
+rule scoped to a template must not fire on a route that was never declared to be one. That field
+is what lets the render fleet stop re-describing the same URL shapes as regular expressions in its
+own config: two pattern lists for one routing fact, in two repositories, with nothing keeping them
+in step.
+
+**Adoption is incremental.** With no `pageType` on any route, the label falls back to the route's
+path and then to the route class — exactly the values emitted before page types existed. Name one
+route at a time; nothing resets.
+
+Metrics labels are bounded by construction: every label resolves to a configured name, a
+configured path, or one of three class constants. Nothing derives a label from the request itself
+— an unbounded label is how a monitoring backend gets taken down by a crawler walking a faceted
+URL space.
 
 ### Sitemaps are filtered to prerender routes
 
