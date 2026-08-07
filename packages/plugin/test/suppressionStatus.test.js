@@ -73,12 +73,31 @@ const makeResourceBase = (rows) =>
 			const resource = new this(id);
 			return resource.delete();
 		}
-		static async search() {
-			return [];
+		/**
+		 * Enough of Harper's search to drive a real claim pass: the one-sided
+		 * `nextRenderTime >= value` condition, the sort on the same attribute, and the limit. The
+		 * primary key is injected into each projected row, which is what the real table does for a
+		 * `select` naming it.
+		 */
+		static async *search(query = {}) {
+			const [condition] = query.conditions ?? [];
+			const floor = condition ? Number(condition.value) : Number.NEGATIVE_INFINITY;
+			const matching = [...rows.entries()]
+				.map(([cacheKey, row]) => ({ cacheKey, ...row }))
+				.filter((row) => Number(row.nextRenderTime) >= floor)
+				.sort((a, b) => Number(a.nextRenderTime) - Number(b.nextRenderTime))
+				.slice(0, query.limit ?? Infinity);
+			for (const row of matching) yield row;
 		}
 	};
 
-let RenderQueue, config;
+let RenderQueue, config, funnel;
+
+// The named cross-worker shared buffers. KEYED, not "return whatever was passed": QueueState and
+// the render-lease table both acquire from this store under different names, and an unkeyed fake
+// hands every acquisition its own freshly zeroed buffer — so a lease taken by `claim` would be
+// invisible to `processJobResult` and every lease assertion below would pass for the wrong reason.
+const sabs = new Map();
 
 before(async () => {
 	globalThis.Resource = class {};
@@ -98,7 +117,10 @@ before(async () => {
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
-					getUserSharedBuffer: (_key, buf) => buf,
+					getUserSharedBuffer: (key, buf) => {
+						if (!sabs.has(key)) sabs.set(key, buf);
+						return sabs.get(key);
+					},
 					tryLock: () => true,
 					unlock() {},
 				},
@@ -107,6 +129,8 @@ before(async () => {
 		render_service: {
 			Target: makeResourceBase(stores.target),
 			QueueControl: makeResourceBase(new Map()),
+			// `claim` reports empty/queued, and reporting writes this row.
+			QueueStatus: makeResourceBase(new Map()),
 		},
 		render_schedule: { RenderSchedule: makeResourceBase(stores.renderSchedule) },
 		page_cache: { PrerenderedPage: makeResourceBase(stores.prerenderedPage) },
@@ -114,13 +138,28 @@ before(async () => {
 
 	({ config } = await import('../src/config.js'));
 	({ RenderQueue } = await import('../src/resources/RenderQueue.js'));
+	funnel = await import('../src/util/renderSchedule.js');
 });
 
 beforeEach(() => {
 	for (const rows of Object.values(stores)) rows.clear();
 	warns = [];
 	errors = [];
+	// The shared buffer OUTLIVES the store clears above, so without this the leases and the claim
+	// floor leak from one test into the next.
+	funnel.resetRenderQueueState();
 });
+
+/** Claim jobs the way the render fleet would, so the lease is recorded exactly as production does. */
+const claim = (limit = 10) => RenderQueue.claim({ limit });
+
+/**
+ * `seedSource` writes STRAIGHT into the fake table, bypassing the funnel, so a seeded row never
+ * lowers the claim floor. That is fine only because `beforeEach` resets the floor to 0 ("seek the
+ * absolute minimum") — a test that seeds after a floor has been established must seed through the
+ * funnel or reset first.
+ */
+const leased = (cacheKey) => !!funnel.leaseInfo(cacheKey);
 
 const postResult = async (metadata, content) => {
 	const meta = Buffer.from(JSON.stringify(metadata), 'utf8');
@@ -209,6 +248,12 @@ test('a 404 verdict does NOT delete at gone.maxStrikes when the strikes came und
 
 test('403 keeps the target and cached pages; first failure retries on the claim lease', async () => {
 	seedSource({ renderInterval: 3_600_000 });
+	const claimed = await claim();
+	assert.ok(
+		claimed.some((job) => job.id === key(A)),
+		'precondition: the job is claimed, so a lease exists to be held'
+	);
+
 	await postResult(nonIndexable(403));
 
 	const target = stores.target.get(A);
@@ -221,6 +266,13 @@ test('403 keeps the target and cached pages; first failure retries on the claim 
 		1,
 		'schedule untouched — the claim lease drives the fast retry'
 	);
+	// AND THE LEASE IS HELD. This is the load-bearing half: "schedule untouched" alone was the whole
+	// mechanism when the lease lived IN nextRenderTime, and it stays true even if the lease is
+	// released — at which point the row, still carrying its original overdue due time, is instantly
+	// re-claimable and the fleet hot-loops the failing page.
+	assert.equal(leased(key(A)), true, 'the fast lane must KEEP the lease');
+	assert.deepEqual(await claim(), [], 'so an immediate second claim grants nothing');
+
 	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 	assert.ok(
 		errors.some((e) => e.includes('403')),
@@ -236,9 +288,19 @@ test('401 behaves like 403', async () => {
 });
 
 test('403 on a targetless one-off drops the schedule instead of retrying forever', async () => {
-	stores.renderSchedule.set(key(A), { nextRenderTime: 1 });
+	stores.renderSchedule.set(key(A), { nextRenderTime: 1, fromSitemap: false });
+	await claim();
+	assert.equal(leased(key(A)), true, 'precondition: the one-off was claimed under a lease');
+
 	await postResult(nonIndexable(403));
+
 	assert.equal(stores.renderSchedule.has(key(A)), false);
+	// `deleteSchedule` itself never releases a lease (that invariant is pinned directly in
+	// test/renderQueueFloor.test.js). What releases it here is the single release point at the end of
+	// processJobResult, on the 'dropped' lane — safe, because the row it referred to no longer exists,
+	// and it frees the slot immediately rather than pinning the claim floor for a whole lease.
+	assert.equal(leased(key(A)), false, 'the dropped lane releases, since there is no row left to pace');
+	assert.deepEqual(await claim(), [], 'and nothing is left to claim');
 });
 
 // ---- transient (408/429/5xx) ----
@@ -246,6 +308,7 @@ test('403 on a targetless one-off drops the schedule instead of retrying forever
 for (const statusCode of [408, 429, 500, 503]) {
 	test(`${statusCode} keeps the target and cached pages; first failure retries on the claim lease`, async () => {
 		seedSource();
+		await claim();
 		await postResult(nonIndexable(statusCode));
 
 		const target = stores.target.get(A);
@@ -255,6 +318,36 @@ for (const statusCode of [408, 429, 500, 503]) {
 		assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'last good page keeps serving');
 
 		assert.equal(stores.renderSchedule.get(key(A)).nextRenderTime, 1, 'schedule untouched — lease-driven retry');
+		assert.equal(leased(key(A)), true, 'and the lease is HELD, which is what paces the retry');
+		assert.deepEqual(await claim(), [], 'no immediate re-claim');
+	});
+
+	test(`${statusCode} retries exactly once, on lease expiry — not as fast as the fleet can claim`, async () => {
+		seedSource();
+		await claim();
+		await postResult(nonIndexable(statusCode));
+
+		// The whole lease window: still nothing.
+		for (let elapsed = 0; elapsed < config.queue.jobLeaseTime; elapsed += config.queue.jobLeaseTime / 4) {
+			assert.deepEqual(await claim(), [], 'the failing page must not be re-rendered inside the lease');
+		}
+
+		// Past expiry: granted, and exactly once. `+ 2s` rather than `+ 1ms` because expiries are
+		// stored in whole seconds and ROUNDED UP — deliberately, so second granularity can only ever
+		// make a lease longer than jobLeaseTime, never shorter.
+		const originalNow = Date.now;
+		try {
+			Date.now = () => originalNow() + config.queue.jobLeaseTime + 2_000;
+			const afterExpiry = await claim();
+			assert.equal(
+				afterExpiry.filter((job) => job.id === key(A)).length,
+				1,
+				'the retry arrives on lease expiry, exactly once'
+			);
+			assert.deepEqual(await claim(), [], 'and the fresh lease immediately covers it again');
+		} finally {
+			Date.now = originalNow;
+		}
 	});
 }
 
@@ -263,6 +356,7 @@ test('past fastRetries, a failure drops to the target cadence — page kept but 
 	seedSource({ renderInterval: 3_600_000 });
 	stores.target.get(A).strikes = fast; // this failure is strike fast+1 — first slow-lane one
 	stores.prerenderedPage.get(key(A)).expiresAt = 777; // sentinel: must not be rewritten
+	await claim();
 
 	await postResult(nonIndexable(503));
 
@@ -273,6 +367,11 @@ test('past fastRetries, a failure drops to the target cadence — page kept but 
 	const schedule = stores.renderSchedule.get(key(A));
 	assert.ok(schedule.nextRenderTime > Date.now(), 'slow lane: rescheduled at the target cadence');
 	assert.ok(schedule.nextRenderTime < Date.now() + 2 * 3_600_000, 'cadence, not a suppression recheck');
+
+	// The slow lane RELEASES the lease. Holding it would pin the claim floor for a full jobLeaseTime
+	// for a row that is now hours in the future — a latency cost for nothing.
+	assert.equal(leased(key(A)), false, 'the slow lane releases the lease');
+	assert.deepEqual(await claim(), [], 'and the immediate re-claim is refused BY THE DUE TIME, not by a lease');
 
 	const page = stores.prerenderedPage.get(key(A));
 	assert.equal(page.content, 'old html', 'page survives');
