@@ -14,6 +14,7 @@ import {
 	deleteSchedule,
 	deriveQueueStatus,
 	maybeResetFloor,
+	reconcileLeaseGauge,
 	releaseLease,
 	resetFloorNow,
 	writeSchedule,
@@ -28,6 +29,13 @@ const port = protocol === 'https' ? server.config.http.securePort || server.conf
 // end that URL's rendering. `test/queueFunnel.test.js` enforces that mechanically.
 
 const mutex = getMutex('render_queue');
+
+// Rate limit for the wedged-row warning below. Per worker, which is the cheap and correct-enough
+// direction: the pin AGE it gates on is node-wide (it lives in the shared header), so every worker
+// agrees about when to start warning, and the worst case is one message per worker per window rather
+// than one per node. Sharing a timestamp across workers would mean another header word and a CAS to
+// suppress log lines.
+let lastFloorPinWarnAt = 0;
 
 // Browsers ≥ v1.16.0 post `outcome` — the single field result handling keys on: 'rendered'
 // (content present; a rendered-through client-side redirect is still a rendered page),
@@ -77,6 +85,14 @@ async function syncQueueState(force = false, pending = null) {
 	// recovery for a due time written below the floor by the operations API or the exported REST
 	// surface — nothing in-process can observe those writes.
 	maybeResetFloor(Date.now());
+
+	// And the lease-gauge walk rides here for the same reason, on the same cadence. It is NOT
+	// bookkeeping: the gauge only ever drifts UP (a lease that expires without a result has nobody to
+	// decrement it) and it SIZES the claim scan, so unreconciled it climbs until every claim pass
+	// drains the full `queue.claimScanCap` — measured at 820 against 20 truly in flight after ~80
+	// minutes, and minutes rather than hours during a broad origin outage. One walk fixes the number
+	// for every worker, because the buffer is shared.
+	reconcileLeaseGauge();
 
 	const status = deriveQueueStatus(Date.now());
 	await QueueState.reportStatus(status, force || liftingPause);
@@ -766,6 +782,38 @@ export class RenderQueue extends Resource {
 					`the scan window — raise queue.claimScanCap, or look at ${pass.floorHeldBy ?? 'the oldest due row'}, ` +
 					`which is holding the claim floor at minute ${pass.floorTo}.`
 			);
+		}
+
+		// A SEPARATE CHECK, deliberately not chained onto the branches above. The wedged row this names
+		// is one due row that never reschedules on an otherwise HEALTHY node: every pass still reaches a
+		// not-yet-due row, so `scanTruncated` is false and `leaseRefused` is false, and the branch above
+		// stays silent for as long as the node runs. That was the whole failure — the single scenario the
+		// `floorHeldBy` report was added for was the one scenario that could never print it, while the
+		// scan quietly degraded past the cost the floor was introduced to remove.
+		//
+		// The threshold is what the retry design itself can explain and no more: the fast-retry lane
+		// holds its lease, and therefore the floor, for `fastRetries` full leases before the slow lane
+		// writes the row forward, so one further lease beyond that is not a lane — it is a row whose
+		// result never comes. Rate-limited to one line per window per worker, so a genuinely stuck row
+		// says so about twice before `queue.claimFloor.unpinAfter` pushes it forward on its own.
+		// Gated on the floor being ON: with it off the scan seeks from the absolute index minimum anyway,
+		// so a row that never moves costs nothing extra and there is nothing to warn about.
+		if (config.queue.claimFloor.enabled) {
+			const explainable = config.queue.jobLeaseTime * (Math.max(0, config.render.failureRetry.fastRetries | 0) + 1);
+			if (pass.floorPinnedForMs > explainable && Date.now() - lastFloorPinWarnAt >= explainable) {
+				lastFloorPinWarnAt = Date.now();
+				const unpin = config.queue.claimFloor.unpinAfter;
+				logger.warn(
+					`[prerender] ${pass.floorHeldBy} has held the claim floor at minute ${pass.floorTo} for ` +
+						`${Math.round(pass.floorPinnedForMs / 60_000)} minute(s) — longer than the retry lanes can account ` +
+						`for (${Math.round(explainable / 60_000)} min), so its render is failing in a way that posts no ` +
+						`result and reschedules nothing. Everything due behind it is waiting and the nextRenderTime index ` +
+						`is degrading above it. ` +
+						(unpin > 0
+							? `It will be pushed forward automatically after ${Math.round(unpin / 60_000)} min.`
+							: `queue.claimFloor.unpinAfter is 0, so this will NOT resolve on its own — repair or delete the URL.`)
+				);
+			}
 		}
 
 		if (notOwnedHere) {

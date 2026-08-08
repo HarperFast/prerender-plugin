@@ -43,10 +43,12 @@ const harness = ({ slots = SLOTS, now = 1_700_000_000_000 } = {}) => {
 // ---- layout ----
 
 test('the buffer layout is header + fixed-size slots', () => {
-	assert.equal(LEASE_HEADER_BYTES, 16);
+	// 7 header words: floor, occupancy, sawDue, earliestNotYetDue, and the three that track WHICH key
+	// the floor is pinned at and since when (`notePinnedBy`).
+	assert.equal(LEASE_HEADER_BYTES, 28);
 	assert.equal(LEASE_SLOT_BYTES, 16);
-	assert.equal(leaseBufferBytes(4096), 16 + 16 * 4096);
-	assert.equal(leaseBufferBytes(4096), 65_552, 'the documented 64KB sizing');
+	assert.equal(leaseBufferBytes(4096), 28 + 16 * 4096);
+	assert.equal(leaseBufferBytes(4096), 65_564, 'the documented 64KB sizing');
 });
 
 // ---- the all-zero buffer ----
@@ -319,6 +321,68 @@ test('the occupancy gauge is only ever HIGH — a late release of an expired lea
 
 	assert.equal(table.occupancy(), holding.length, 'releasing an already-expired lease decrements nothing');
 	assert.equal(table.scanLive().count, holding.length, 'and the walk agrees — the two never disagree');
+});
+
+test('releasing an EXPIRED lease never pushes its expiry back into the future', () => {
+	// `release` shortens a lease to a commit-visibility grace, and "shorten" must mean shorten. For an
+	// already-expired lease the grace (now + 5s) is LATER than the stored expiry, so writing it would
+	// resurrect a dead slot for five seconds and make the key unclaimable again.
+	//
+	// This is also the half of the recycled-slot hazard that IS reachable from a single thread. The
+	// other half is not: `release` reads the expiry BEFORE it re-validates ownership and CASes against
+	// exactly that value, so a slot recycled between the two is caught either by the ownership check or
+	// by the failed CAS — but reaching that interleaving needs the recycling `grant` to run between two
+	// adjacent instructions of this function, which no sequential test can arrange. That ordering is
+	// argued from `grant`'s publish order (payload before `hashLo`) in the module comment, and it is
+	// deliberately NOT pinned by a test here rather than pinned by one that would pass either way.
+	const now = 1_700_000_000_000;
+	const { table, clock } = harness({ slots: 8, now });
+	const key = 'https://www.example.com/expired|desktop';
+
+	table.grant(key, { dueMinute: 500, leaseExpiryMs: now + MINUTE });
+	clock.now = now + 5 * MINUTE; // long expired
+	assert.equal(table.isLeased(key), false);
+
+	assert.equal(table.release(key), true, 'the release is still accepted — it is the one result for it');
+	assert.equal(table.isLeased(key), false, 'and the key stays claimable, rather than being re-blocked');
+});
+
+// ---- the pin tracker ----
+
+test('notePinnedBy measures a pin in TIME, resets on a new holder, and clears on none', () => {
+	// Deliberately AT `LEASE_EPOCH_SEC`, where the stored second is 0. `H_PIN_LO` is what says whether
+	// anything is pinned; a version that read a `sinceSec` of 0 as "unset" re-stamped the pin on every
+	// pass inside that second and it could never age.
+	const now = 1_700_000_000_000;
+	const { table, clock } = harness({ now });
+
+	assert.equal(table.notePinnedBy('a|desktop'), 0, 'the pass that first observes a pin reports no age');
+	assert.equal(table.notePinnedBy('a|desktop'), 0, 'a SECOND pass in the same second is still 0 — not a count');
+
+	clock.now = now + 90_000;
+	assert.equal(table.notePinnedBy('a|desktop'), 90_000);
+	assert.equal(table.readPinAgeMs(), 90_000, 'and it can be read without recording anything');
+
+	// A different row takes over: it starts its own clock rather than inheriting this age. Without
+	// that, unpinning one row would immediately qualify the next and the escape hatch becomes a sweep.
+	assert.equal(table.notePinnedBy('b|desktop'), 0);
+	clock.now = now + 120_000;
+	assert.equal(table.notePinnedBy('b|desktop'), 30_000);
+
+	assert.equal(table.notePinnedBy(null), 0, 'nothing due ⇒ no pin');
+	assert.equal(table.readPinAgeMs(), 0);
+	// And the cleared pin does not resurrect the old holder's age when it comes back.
+	assert.equal(table.notePinnedBy('b|desktop'), 0);
+});
+
+test('a backwards clock step reads as a fresh pin, not as an age that can never cross a threshold', () => {
+	const now = 1_700_000_000_000;
+	const { table, clock } = harness({ now });
+
+	table.notePinnedBy('a|desktop');
+	clock.now = now - 10 * MINUTE;
+	assert.equal(table.notePinnedBy('a|desktop'), 0, 'clamped at 0 rather than negative');
+	assert.equal(table.readPinAgeMs(), 0);
 });
 
 // ---- the claim floor ----

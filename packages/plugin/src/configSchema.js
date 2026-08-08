@@ -679,6 +679,31 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'that state is.',
 					{ unit: 'ms', min: 0 }
 				),
+				unpinAfter: option(
+					HOUR,
+					'How long one row may hold the floor before the claim path writes it forward by ' +
+						'render.defaultInterval itself, so the queue can advance past it.\n\n' +
+						'This is the bound on the cost described above. The floor cannot pass the oldest DUE row, and ' +
+						'only that row’s own result moves it — but the highest-volume failure path (a renderer crash, ' +
+						'navigation timeout or settle failure on a URL that still has a target) deliberately holds its ' +
+						'lease and writes NO row, so it never moves. One such URL would pin the floor forever while ' +
+						'dead index entries pile up above it at the full render rate: measured ~43ms per claim after a ' +
+						'day, which is worse than the 6.25ms unfloored scan the floor exists to replace.\n\n' +
+						'It is self-limiting and does not need a rate limit: it fires on the row HOLDING the floor, and ' +
+						'unpinning one promotes the next, which must then hold for a full interval of its own. So the ' +
+						'ceiling is one write per interval per node — 24 a day at the default — even during an outage ' +
+						'in which every render fails. It is a fix for index degradation, not a way to keep throughput ' +
+						'up.\n\n' +
+						'No strike is counted and no retry semantics change: `strikes` is the target’s one shared ' +
+						'counter that suppression and redirect verdicts DELETE targets on, so routing the failure path ' +
+						'through it would walk the corpus toward deletion during a broad origin outage. The pushed URL ' +
+						'is named in a warning, and a warning also fires earlier, once the pin outlives what ' +
+						'render.failureRetry can account for.\n\n' +
+						'Set it above `render.failureRetry.fastRetries × queue.jobLeaseTime` (the pin that lane holds ' +
+						'legitimately) or healthy retries get pushed out. `0` disables the push entirely and restores ' +
+						'the unbounded pin — the queue then waits on that row until it is repaired or deleted by hand.',
+					{ unit: 'ms', min: 0 }
+				),
 			}
 		),
 		maxLeases: option(

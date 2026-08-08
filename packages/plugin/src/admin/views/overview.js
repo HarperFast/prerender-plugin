@@ -107,11 +107,16 @@ function counts(ctx, data) {
 			floor.enabled === false ? 'disabled' : Number.isFinite(floor.lagMs) ? duration(floor.lagMs) : '—',
 			floor.enabled === false
 				? 'queue.claimFloor.enabled is false'
-				: // NAME THE ROW. A lag figure alone sends an operator hunting; the floor sits at the due
-					// minute of one row, and only a claim pass can say which — so this is what this worker's
-					// last pass saw, and nothing else in the system records it.
+				: // NAME THE ROW, AND SAY HOW LONG IT HAS HELD. A lag figure alone sends an operator
+					// hunting; the floor sits at the due minute of one row, and only a claim pass can say
+					// which — so the key is what this worker's last pass saw. The duration beside it is
+					// NODE-WIDE (it lives in the shared buffer), and it is the number that separates a
+					// render legitimately in flight from one that never posts a result: past
+					// queue.claimFloor.unpinAfter the claim pass writes that row forward itself.
 					floor.floorHeldBy
-					? `held by ${shortUrl(floor.floorHeldBy)} · this worker’s last claim`
+					? `held by ${shortUrl(floor.floorHeldBy)}${
+							floor.floorPinnedForMs > 0 ? ` for ${duration(floor.floorPinnedForMs)}` : ''
+						} · this worker’s last claim`
 					: 'how far back the claim scan starts · live',
 			// The floor cannot advance past the oldest DUE ROW, and only that row's own result moves
 			// it — a lease expiring does not — so a lag well past one lease means a render is holding

@@ -90,17 +90,27 @@
  * The bounded cases: any result that reschedules (success, the slow retry lane, a redirect verdict,
  * a suppression recheck) moves its row, and the fast-retry lane holds its lease for at most
  * `render.failureRetry.fastRetries × queue.jobLeaseTime` before the slow lane writes the row forward.
- * The UNBOUNDED case is a row whose result never reschedules it: the generic-failure branch in
- * `resources/RenderQueue.js` (target exists → hold the lease, no schedule write, no strike) is
- * exactly that shape, and it is where every renderer crash, navigation timeout and settle failure
- * lands. One permanently failing URL in an 803k corpus therefore holds the floor at its own minute
- * indefinitely, and dead index entries then accumulate above that point at the full render rate —
- * the same degradation this design exists to remove (~43 ms/pass after a day at 200 renders/min).
- * It is detectable and it is NAMED: the pass reports `floorHeldBy`, `claim` logs it, and the console
- * shows it beside the floor lag. Routing that branch through `retryAfterFailure`'s strike-counted
- * lanes would make the pin genuinely bounded, and is deliberately not in this release: those strikes
- * are the SHARED target counter that suppression and redirect verdicts retire targets on, so feeding
- * a broad origin outage into it risks mass deletion.
+ * The case that bounds NOTHING BY ITSELF is a row whose result never reschedules it: the
+ * generic-failure branch in `resources/RenderQueue.js` (target exists → hold the lease, no schedule
+ * write, no strike) is exactly that shape, and it is where every renderer crash, navigation timeout
+ * and settle failure lands. One permanently failing URL in an 803k corpus would hold the floor at its
+ * own minute forever, and dead index entries would then accumulate above that point at the full render
+ * rate — the same degradation this design exists to remove (~43 ms/pass after a day at 200
+ * renders/min), only worse than the 6.25 ms it replaces.
+ *
+ * So the pin is bounded HERE instead, by `maybeUnpinFloor`: a row that has held the floor for longer
+ * than `queue.claimFloor.unpinAfter` is written forward one render interval by the claim path itself,
+ * and named in a warning. That is deliberately a much smaller change than routing the branch through
+ * `retryAfterFailure`'s lanes, and the reason is `strikes` — the SHARED target counter that suppression
+ * and redirect verdicts delete targets on. Feeding the highest-volume failure path into it means a
+ * broad origin outage walks the corpus toward deletion, which is the mass deletion the 401/403 guard
+ * exists to prevent. The escape hatch touches `strikes` nowhere and changes no retry semantics: it
+ * moves ONE row so the index can breathe, at a ceiling of one write per `unpinAfter` per node, because
+ * unpinning one row promotes the next which must then hold for a full interval of its own.
+ *
+ * The pin is also NAMED throughout while it lasts: the pass reports `floorHeldBy` and
+ * `floorPinnedForMs`, `claim` warns once the pin outlives what the retry lanes can explain, and the
+ * console shows both beside the floor lag.
  *
  * `jobLeaseTime` is a LATENCY knob either way, not just a retry knob: during a broad origin 5xx event
  * or a bot-mitigation rule change EVERY job takes the fast-retry lane, which holds its lease on
@@ -316,6 +326,10 @@ export const runClaimPass = async ({
 	// holds the floor at its own minute indefinitely and the only evidence is this. Reported so the
 	// warning and the console can say WHICH URL, instead of "something is wedged".
 	let floorHeldBy = null;
+	// ...and the row itself, because the unpin escape hatch has to REWRITE it, and `put` replaces the
+	// record — so it needs the `fromSitemap` flag this pass already projected. Re-reading the row to
+	// recover a flag that was in hand is how `Target.revalidate` silently cleared it for a year.
+	let floorHeldByRow = null;
 	let lastGrantedMinute = null;
 	let earliestNotYetDueMinute = 0;
 	let leaseRefused = false;
@@ -346,6 +360,7 @@ export const runClaimPass = async ({
 		if (firstDueMinute === null) {
 			firstDueMinute = dueMinute;
 			floorHeldBy = row.cacheKey;
+			floorHeldByRow = { cacheKey: row.cacheKey, dueMinute, fromSitemap: !!row.fromSitemap };
 		}
 
 		if (leases.isLeased(row.cacheKey)) {
@@ -385,6 +400,12 @@ export const runClaimPass = async ({
 
 	leases.recordPassOutcome({ sawDue, earliestNotYetDueMinute });
 
+	// How long the SAME row has been holding the floor, node-wide. Recorded here rather than derived
+	// by a caller because this is the only place that knows which row the floor rule actually picked,
+	// and it is what both the wedged-row warning and the unpin escape hatch key off. `null` clears it,
+	// so a pass that finds nothing due does not leave a stale pin ageing forever.
+	const floorPinnedForMs = leases.notePinnedBy(floorHeldBy);
+
 	return {
 		jobs,
 		sawDue,
@@ -395,6 +416,8 @@ export const runClaimPass = async ({
 		floorFrom,
 		floorTo,
 		floorHeldBy,
+		floorHeldByRow,
+		floorPinnedForMs,
 		floorAdvanced,
 		scanned: rows.length,
 		scanLimit,
@@ -421,6 +444,69 @@ export const runClaimPass = async ({
  */
 let lastFloorHeldBy = null;
 let lastFloorHeldByAt = 0;
+
+/**
+ * THE UNPIN ESCAPE HATCH. Write the row that has held the claim floor for longer than
+ * `queue.claimFloor.unpinAfter` forward by one `render.defaultInterval`, so the floor can finally
+ * advance past it. Returns what it did, or `null`.
+ *
+ * WHY THIS EXISTS. The floor cannot advance past the oldest DUE ROW, and the only thing that moves a
+ * row is its own result — a lease expiring does not, because claiming writes nothing. The
+ * generic-failure branch in `resources/RenderQueue.js` (target exists → hold the lease, write no row,
+ * no strike) is therefore genuinely unbounded: every renderer crash, navigation timeout and settle
+ * failure lands there, and one such URL in an 803k corpus pins the floor at its own minute forever
+ * while dead index entries pile up above it at the full render rate — measured at ~43 ms/pass after a
+ * day, i.e. WORSE than the 6.25 ms unfloored scan this whole design replaces. The periodic reset
+ * cannot help: that row IS the oldest due row, so re-deriving from the absolute minimum lands on the
+ * same value.
+ *
+ * WHY IT DOES NOT GO THROUGH `retryAfterFailure`, WHICH IS THE OBVIOUS FIX. Those lanes are counted
+ * by `strikes`, and `strikes` is the target's ONE SHARED counter that `Target.suppress` and the
+ * redirect verdicts delete targets on at `maxStrikes`. Feeding the highest-volume failure path into it
+ * means a broad origin outage — where every job fails at once — walks the whole corpus toward
+ * deletion, which is the exact mass-deletion the 401/403 guard exists to prevent. So this touches
+ * `strikes` nowhere, changes no retry semantics, and does one thing only: moves ONE row so the index
+ * can breathe.
+ *
+ * IT IS SELF-RATE-LIMITING, which is why it needs no throttle of its own. It fires on the floor
+ * HOLDER, and only after that holder has held for `unpinAfter`; unpinning row A promotes row B, which
+ * must then hold for another full `unpinAfter` before it qualifies. So the ceiling is one write per
+ * `unpinAfter` per node — 24/day at the default — even during a sustained outage in which every single
+ * job takes the unbounded branch. It is a fix for index degradation, not a throughput rescue.
+ *
+ * The write goes through `writeSchedule`, so `fromSitemap` is preserved from the row the pass already
+ * projected (`put` REPLACES the record) and the floor lowering rides along — a CAS-min against a
+ * future minute, so it changes nothing. A failure here is logged and swallowed: the claim must not 500
+ * because a repair could not be written, and the next pass simply tries again.
+ */
+const maybeUnpinFloor = async (pass) => {
+	const unpinAfter = config.queue.claimFloor.unpinAfter;
+	if (!(unpinAfter > 0)) return null;
+	if (!config.queue.claimFloor.enabled) return null;
+	if (!pass.floorHeldByRow || !(pass.floorPinnedForMs >= unpinAfter)) return null;
+
+	const { cacheKey, fromSitemap } = pass.floorHeldByRow;
+	const nextRenderTime = Date.now() + config.render.defaultInterval;
+	try {
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+	} catch (e) {
+		logger.error(e, `[prerender] could not unpin the claim floor from ${cacheKey}`);
+		return null;
+	}
+
+	// Clear the pin so the promoted row starts its own clock from this pass rather than inheriting
+	// this one's age — without it the next pass would qualify immediately and unpin a healthy row.
+	leaseTable().notePinnedBy(null);
+
+	logger.warn(
+		`[prerender] ${cacheKey} held the claim queue's floor for ${Math.round(pass.floorPinnedForMs / 60_000)} minute(s) ` +
+			`without ever being rescheduled — rendering it is failing in a way that posts no result (crash, navigation ` +
+			`timeout or settle failure), so it has been pushed to ${new Date(nextRenderTime).toISOString()} to let the ` +
+			`queue advance. Nothing behind it was rendering while it was pinned. Investigate this URL: the push repeats ` +
+			`every render interval until it renders or is deleted, and no strike was counted against it.`
+	);
+	return { cacheKey, pinnedForMs: pass.floorPinnedForMs, nextRenderTime };
+};
 
 /** `runClaimPass` bound to the live table and config. Called by `RenderQueue.claim`. */
 export const claimSchedules = async ({ grantLimit } = {}) => {
@@ -468,7 +554,11 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 	lastFloorHeldBy = pass.floorHeldBy;
 	lastFloorHeldByAt = Date.now();
 
-	return pass;
+	// AFTER the pass, never inside it: `runClaimPass` takes all its I/O as arguments precisely so the
+	// floor algebra has no database in it, and a write issued mid-pass would also be a write with the
+	// scan cursor still open (see the drain note above).
+	const floorUnpinned = await maybeUnpinFloor(pass);
+	return floorUnpinned ? { ...pass, floorUnpinned } : pass;
 };
 
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
@@ -516,6 +606,29 @@ export const maybeResetFloor = (nowMs = Date.now()) => {
 	return true;
 };
 
+/**
+ * Walk the lease slots and reconcile the occupancy gauge to what is actually live. Called from
+ * `syncQueueState` beside `maybeResetFloor` — same worker, same claim mutex, once per
+ * `queue.statusSyncInterval`.
+ *
+ * NOT COSMETIC, AND NOT OPTIONAL. The gauge has no other way back down. `grant`/`release` are exact
+ * about every lease that ends in a RESULT, but a lease that merely EXPIRES leaves its +1 behind
+ * forever: the grant counted it, and the late release (or the release that never comes) sees a dead
+ * slot and correctly declines to decrement. Every expiry leaks one.
+ *
+ * And the gauge is not just a display: it SIZES the claim pass's read, `grantLimit + occupancy +
+ * grantLimit`, capped at `queue.claimScanCap`. Measured against the real pass, the drift reached 820
+ * against 20 genuinely in flight by pass 40 (~80 minutes), crossed a 1,000-row cap around pass 49 and
+ * stayed there — after which every claim drains the full cap of projected rows, under the claim mutex,
+ * on a worker that also serves bot traffic. That is the exact regression the floor exists to remove,
+ * reached by drift instead of by index decay. Under a broad origin outage, where every lease expires
+ * unreleased, it saturates in minutes. It also feeds `inFlightLeases()` into the persisted backlog
+ * snapshot, and makes the lease-refused warning report "8000 of 4096 slots occupied".
+ *
+ * The buffer is shared, so ONE walk on ONE worker fixes the number every worker reads.
+ */
+export const reconcileLeaseGauge = () => leaseTable().scanLive();
+
 /** The operator escape hatch: reset now instead of waiting out the interval. */
 export const resetFloorNow = () => {
 	const previousFloorMinute = leaseTable().rawFloorMinute();
@@ -543,6 +656,12 @@ export const floorState = (nowMs = Date.now()) => {
 		// place it is recorded. This worker's last claim pass; see `lastFloorHeldBy`.
 		floorHeldBy: lastFloorHeldBy,
 		floorHeldByAt: lastFloorHeldByAt || null,
+		// HOW LONG that pin has lasted, and unlike the key beside it this one is NODE-WIDE: it comes
+		// from the shared header, so it is the whole node's answer even on a worker that has never
+		// claimed. Compare it against `queue.claimFloor.unpinAfter` — past that, the pass pushes the row
+		// forward itself rather than leaving the queue wedged behind it.
+		floorPinnedForMs: leaseTable().readPinAgeMs(),
+		unpinAfter: config.queue.claimFloor.unpinAfter,
 	};
 };
 

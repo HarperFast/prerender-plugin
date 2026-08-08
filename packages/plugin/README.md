@@ -124,6 +124,7 @@ rest: true # required for the @export-ed table REST endpoints
       enabled: true # false = seek the absolute index minimum, as before v0.35.0
       guard: 300000 # 5m — the floor is always held at least this far behind now
       resetInterval: 300000 # 5m — how often the floor is reset and re-derived from the index
+      unpinAfter: 3600000 # 1h — a row holding the floor this long is written forward (0 = never)
 
   management: # the admin API + UI at /prerender_admin
     enabled: true # false makes every management route 404
@@ -463,12 +464,25 @@ The floor advances to **the first due row a pass observed**, which is the same t
   periodic floor reset cannot recover it either: that row _is_ the oldest due row the reset would
   re-derive from. The generic-failure path (renderer crash, navigation timeout, settle failure on a
   URL that still has a target) has exactly this shape — it holds the lease and writes no row — so one
-  permanently failing URL pins the floor indefinitely and dead index entries accumulate above it at
-  the full render rate. That is why the floor lag names the row: repair or delete that URL (deleting
-  is safe — bots proxy to the origin and discovery re-creates whatever it serves). Making the pin
-  bounded means routing that path through the strike-counted retry lanes, which is deliberately not
-  in this release: those strikes are the shared target counter that suppression and redirect
-  verdicts retire targets on.
+  permanently failing URL would pin the floor indefinitely while dead index entries accumulate above
+  it at the full render rate (~43 ms/pass after a day, i.e. worse than the unfloored scan the floor
+  replaces).
+
+  So `queue.claimFloor.unpinAfter` bounds it: a row that has held the floor for longer than that is
+  written forward one `render.defaultInterval` by the claim path itself, and named in a warning. A
+  warning also fires earlier, as soon as the pin outlives what `render.failureRetry` can account for
+  (`fastRetries × jobLeaseTime`) — that one is the signal to act on, because the automatic push
+  unblocks the _queue_ without fixing the _URL_. Repair or delete it (deleting is safe — bots proxy
+  to the origin and discovery re-creates whatever it serves), and watch **Claim floor lag** on the
+  overview, which names the row and shows how long it has held on.
+
+  The push is self-limiting at one write per interval per node, because unpinning one row promotes
+  the next, which must then hold for a full interval of its own. It counts **no strike** and changes
+  no retry semantics, deliberately: `strikes` is the target's one shared counter that suppression and
+  redirect verdicts _delete_ targets on, so routing the highest-volume failure path through it would
+  walk the corpus toward deletion during a broad origin outage. Set `unpinAfter: 0` to restore the
+  unbounded pin.
+
 - **A due time written below the floor is never claimed again.** Every schedule write inside the
   plugin goes through one funnel ([`src/util/renderSchedule.js`](src/util/renderSchedule.js)) that
   lowers the floor with the write, and the floor is held `queue.claimFloor.guard` behind the current

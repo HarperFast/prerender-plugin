@@ -191,6 +191,37 @@ test('a forced refresh writes the QueueStatus row', async () => {
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
 
+// ---- the lease-gauge walk rides on the status sync ----
+
+test('the status refresh reconciles the lease gauge, which otherwise climbs without bound', async () => {
+	// The gauge only comes DOWN on a release that matches a live lease. A lease that simply EXPIRES has
+	// nobody to decrement it — the grant counted +1, and a late release (or the release that never
+	// arrives) sees a dead slot and correctly declines — so every expiry leaks one, permanently.
+	//
+	// That is not cosmetic, because the gauge SIZES the claim scan (`grantLimit + occupancy +
+	// grantLimit`, capped at queue.claimScanCap). Measured on the real pass it reached 820 against 20
+	// genuinely in flight after ~80 minutes and crossed a 1,000-row cap by pass 49, after which every
+	// claim drains the full cap of projected rows under the claim mutex, on the worker that also serves
+	// bot traffic. Nothing else in the system walks the slots on a timer, so if this refresh stops doing
+	// it the drift is unbounded again.
+	const leases = funnel.leaseTable();
+	const now = Date.now();
+
+	// The broad-outage shape: leases granted and left to expire, over and over, with no result ever
+	// posted for any of them.
+	for (let round = 0; round < 5; round++) {
+		for (let i = 0; i < 20; i++) {
+			leases.grant(`k${i}|desktop`, { dueMinute: minuteOf(now) - 10, leaseExpiryMs: now - MINUTE });
+		}
+	}
+	assert.equal(leases.occupancy(), 100, 'the gauge has drifted to 100 with nothing whatsoever live');
+
+	await RenderQueue.refreshQueueStatus();
+
+	assert.equal(leases.occupancy(), 0, 'the refresh walked the slots and reconciled it to the truth');
+	assert.equal(searchCalls, 0, 'and did it without touching the queue index — the walk is pure Atomics');
+});
+
 // ---- the floor reset rides on the status sync ----
 
 test('the status refresh resets the claim floor at most once per resetInterval', async () => {

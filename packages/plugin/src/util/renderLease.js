@@ -88,12 +88,19 @@ import { lease64 } from './hash.js';
  */
 export const LEASE_EPOCH_SEC = 1_700_000_000;
 
-// Header: [floorMinute, occupancy, lastPassSawDue, earliestNotYetDueMinute]
+// Header: [floorMinute, occupancy, lastPassSawDue, earliestNotYetDueMinute, pinLo, pinHi, pinSinceSec]
 const H_FLOOR = 0;
 const H_OCCUPANCY = 1;
 const H_SAW_DUE = 2;
 const H_EARLIEST_NOT_DUE = 3;
-const HEADER_INT32 = 4;
+// Which key the claim floor is pinned at, and since when — see `notePinnedBy`. In the SHARED header
+// rather than in module state because a claim pass runs on whichever worker the consumer's poll
+// landed on, so a per-worker counter would be divided by the worker count and never reach a
+// threshold.
+const H_PIN_LO = 4;
+const H_PIN_HI = 5;
+const H_PIN_SINCE = 6;
+const HEADER_INT32 = 7;
 
 // Slot: [hashLo, hashHi, expiresSec, dueMinute]
 const S_LO = 0;
@@ -135,7 +142,7 @@ const MAX_PROBE = 8;
 export const LEASE_HEADER_BYTES = HEADER_INT32 * 4;
 export const LEASE_SLOT_BYTES = SLOT_INT32 * 4;
 
-/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 65,552 B. */
+/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 65,564 B. */
 export const leaseBufferBytes = (slots) => LEASE_HEADER_BYTES + LEASE_SLOT_BYTES * Math.max(0, slots | 0);
 
 /** Slots that actually fit in a buffer of this size — the authority when a size assert fails. */
@@ -290,7 +297,23 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		const { found } = locate(lo, hi, nowSec);
 		if (found === -1) return false;
 		const at = base(found);
-		if (Atomics.load(i32, at + S_HI) !== hi) return false;
+
+		// READ THE EXPIRY BEFORE RE-VALIDATING OWNERSHIP, and CAS against exactly this value below.
+		// The order is the whole protection, and having it the other way round was a live bug: it read
+		// the expiry AFTER the ownership check, so a slot recycled in between handed this function the
+		// RECYCLER'S FRESH EXPIRY, which is far in the future — `graceSec < expiresSec` was therefore
+		// true and the CAS truncated somebody else's brand-new lease to a five-second grace. That key
+		// was then re-granted seconds later while its first render was still running: a duplicate
+		// render, and on a failing key a duplicate strike toward `maxStrikes` (the result path does not
+		// share the claim mutex, so release-vs-grant is genuinely concurrent).
+		//
+		// Reading it first is sufficient because `grant` publishes a recycled slot's payload (`hashHi`,
+		// `expiresSec`, `dueMinute`) BEFORE it claims `hashLo`. A recycle that began before this read is
+		// caught by the ownership re-check; one that landed after it necessarily stored a different
+		// expiry, so the CAS fails and nothing is written. And with THIS key's own expiry in hand the
+		// guard below also declines, correctly, to "shorten" an already-expired lease into the future.
+		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
+		if (Atomics.load(i32, at + S_LO) !== lo || Atomics.load(i32, at + S_HI) !== hi) return false;
 
 		// ONE release per lease, claimed with a CAS on the due-minute word. Two results for one key is
 		// a documented case (the restart duplicate-render burst), and without this claim the second
@@ -301,26 +324,37 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		if (Atomics.compareExchange(i32, at + S_DUE, dueMinute, DUE_RELEASED) !== dueMinute) return false;
 
 		// Shorten to the grace, never lengthen (a lease that already expired stays expired), and only
-		// if the expiry is still the one that was read — a `grant` that recycled this slot must not
-		// have its fresh lease cut short.
-		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
+		// if the expiry is still the one read above.
 		const graceSec = toExpiresSec(now() + RELEASE_GRACE_MS);
 		if (graceSec < expiresSec) Atomics.compareExchange(i32, at + S_EXPIRES, expiresSec, graceSec);
 		if (wasCounted) Atomics.sub(i32, H_OCCUPANCY, 1);
 		return true;
 	};
 
-	// Best-effort and reconciled by `scanLive`, but ONLY EVER HIGH: `grant`/`release` are exact about
-	// `isCounted`, so the sole drift is a lease that expired without a result, which reads as one
-	// extra in-flight job until the next full walk. High is the safe direction — it widens the claim
-	// pass's scan window; low silently stops it granting.
+	// Best-effort, and drifts ONLY EVER HIGH — but it drifts WITHOUT BOUND until something walks the
+	// slots, so `scanLive` is a periodic obligation and not merely a console read. `grant`/`release`
+	// are exact about every lease that ends in a RESULT; a lease that simply EXPIRES has nobody to
+	// decrement it, because the grant counted +1 and a late release (or no release at all) sees a dead
+	// slot and correctly declines. Every expiry therefore leaks one, permanently.
+	//
+	// High is the SAFER direction, not a harmless one: it widens the claim pass's scan window (low
+	// silently stops the pass granting), and the window is capped at `queue.claimScanCap` — so
+	// unchecked drift ends with every pass draining the full cap of projected rows under the claim
+	// mutex, on a worker that also serves bot traffic. Measured against the real pass: 820 against 20
+	// genuinely in flight by pass 40, crossing a 1,000-row cap around pass 49 and staying there. Under
+	// a broad origin outage, where every job's lease expires unreleased, it saturates in minutes.
+	// `reconcileLeaseGauge` in util/renderSchedule.js is what keeps that from happening.
 	const occupancy = () => Math.max(0, Atomics.load(i32, H_OCCUPANCY));
 
 	/**
 	 * Full slot walk: in-flight count, oldest expiry, and the due minute that oldest lease is holding
-	 * the floor at. O(slots) — for the admin console only, never the claim path. Reconciles the
-	 * best-effort occupancy gauge on the way past, so a lease that expired rather than being released
-	 * (or a stomped CAS) self-corrects instead of inflating the gauge forever.
+	 * the floor at. Reconciles the best-effort occupancy gauge on the way past, so a lease that expired
+	 * rather than being released (or a stomped CAS) stops inflating the gauge forever.
+	 *
+	 * O(slots) of plain Atomics loads, and NOT an admin-console luxury: the gauge has no other way back
+	 * down (see `occupancy`), so this must run on a timer as well as on a console read. It does — from
+	 * `syncQueueState` via `reconcileLeaseGauge`, on worker 0, under the claim mutex, once per
+	 * `queue.statusSyncInterval`. Never call it from inside the claim pass's row loop.
 	 *
 	 * It counts EXACTLY what `grant`/`release` maintain — `isCounted`, i.e. live and not released.
 	 * Storing anything else here is what made the gauge driftable in both directions: a walk that
@@ -450,6 +484,58 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		earliestNotYetDueMinute: Atomics.load(i32, H_EARLIEST_NOT_DUE),
 	});
 
+	/**
+	 * Note which key the claim floor is pinned at and return how long THIS pin has lasted, in ms.
+	 * `0` both when there is no pin and on the pass that first observes one — a duration, not a count,
+	 * so "no pin yet" and "just started" are the same answer and neither can trip a threshold.
+	 *
+	 * WHY IT IS MEASURED IN TIME AND NOT IN PASSES. A count of passes is not a duration: the render
+	 * fleet polls on its own cadence, so fifty passes is a few seconds behind a nine-pod fleet and
+	 * over an hour behind one idle consumer — while what makes a pin pathological is only ever how
+	 * long it lasts. (And it lives in the SHARED header, not in module state, because a claim pass runs
+	 * on whichever worker the consumer's poll landed on: a per-worker counter would be divided by the
+	 * worker count and never reach a threshold at all.)
+	 *
+	 * Stored as seconds against `LEASE_EPOCH_SEC`, the same idiom as a lease expiry, because a raw ms
+	 * timestamp does not fit an Int32.
+	 *
+	 * `H_PIN_LO` ALONE ANSWERS "is anything pinned", and the stored second is never a sentinel for
+	 * anything. `lease64` never returns a `lo` of 0, so 0 there is an unambiguous "no pin", exactly as
+	 * it is in a slot — whereas treating a `sinceSec` of 0 as "unset" collided with the real second 0
+	 * (`LEASE_EPOCH_SEC` itself), and a pin first observed inside that one-second window then re-stamped
+	 * itself on every pass and could never age past 0. Narrow, but it is the class of bug the epoch
+	 * offset exists to avoid, and `H_PIN_LO` already carries the information.
+	 *
+	 * PUBLISH ORDER, mirroring `grant`: the second and the high word first, `H_PIN_LO` last. A reader
+	 * that sees a matching `lo` has therefore already seen the timestamp that belongs with it, instead
+	 * of pairing a new holder with the previous holder's start time and reporting a huge age.
+	 */
+	const notePinnedBy = (cacheKey) => {
+		if (!cacheKey) {
+			Atomics.store(i32, H_PIN_LO, 0);
+			Atomics.store(i32, H_PIN_HI, 0);
+			Atomics.store(i32, H_PIN_SINCE, 0);
+			return 0;
+		}
+		const { lo, hi } = lease64(cacheKey);
+		const nowSec = nowSecond();
+		if (Atomics.load(i32, H_PIN_LO) !== lo || Atomics.load(i32, H_PIN_HI) !== hi) {
+			Atomics.store(i32, H_PIN_SINCE, nowSec);
+			Atomics.store(i32, H_PIN_HI, hi);
+			Atomics.store(i32, H_PIN_LO, lo);
+			return 0;
+		}
+		// Clamped at 0 so a backwards clock step reads as a fresh pin rather than as a negative age
+		// that could never cross a threshold again.
+		return Math.max(0, (nowSec - Atomics.load(i32, H_PIN_SINCE)) * 1000);
+	};
+
+	/** How long the current pin has lasted, without recording anything. Observability. */
+	const readPinAgeMs = () => {
+		if (Atomics.load(i32, H_PIN_LO) === 0) return 0;
+		return Math.max(0, (nowSecond() - Atomics.load(i32, H_PIN_SINCE)) * 1000);
+	};
+
 	/** Zero everything. Tests only — see `resetRenderQueueState` in util/renderSchedule.js. */
 	const resetAll = () => i32.fill(0);
 
@@ -468,6 +554,8 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		resetFloor,
 		recordPassOutcome,
 		readPassOutcome,
+		notePinnedBy,
+		readPinAgeMs,
 		resetAll,
 	};
 };

@@ -552,7 +552,11 @@ test('the scan window sizes itself off the LIVE lease count, not off a gauge dra
 	}
 
 	h.clock.now = T0 + 2 * MINUTE; // half the leases have expired with no result
-	h.leases.scanLive(); // a console read reconciles the gauge to the live set
+	// The reconciling walk — a console read, or the periodic one `syncQueueState` runs. THE OTHER
+	// DIRECTION of this drift is pinned in test/queueStatusDerived.test.js: without that periodic walk
+	// the gauge climbs without bound, because an expired lease has nobody to decrement it. This test is
+	// the floor of the range and that one is the ceiling; neither is meaningful without the other.
+	h.leases.scanLive();
 	for (const key of expired) h.leases.release(key); // ...and then the late results arrive
 
 	const result = await h.pass({ grantLimit: 20 });
