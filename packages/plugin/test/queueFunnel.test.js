@@ -81,6 +81,29 @@ test('every RenderSchedule.get passes { replicateFrom: false }', () => {
 	assert.ok(checked > 0, 'the regex matched nothing — it has drifted from the source and is asserting nothing');
 });
 
+test('no schedule write hardcodes fromSitemap: false — put REPLACES the record', () => {
+	// The funnel makes `fromSitemap` REQUIRED, which caught the writes that omitted it. It cannot
+	// catch the next mistake, which has now happened twice: satisfying the argument with a literal
+	// `false`. `put` replaces the record, so that CLEARS the flag for a sitemap-listed URL; `claim`
+	// then hands the renderer `isFromSitemap: false`, and the renderer skips serializing a
+	// non-indexable sitemap-listed page — so one on-demand render quietly stops that page being
+	// cached at all, with no error anywhere. Every writer must derive it from the live target
+	// (`!!target.sitemapUrl`) or from the row it is rewriting.
+	//
+	// A genuinely targetless one-off (the render-now shape) reads `!!undefined` off an absent target,
+	// which is `false` without a literal — so this rule costs that case nothing.
+	const literal = /fromSitemap:\s*false/;
+
+	for (const [path, source] of sources) {
+		assert.equal(
+			literal.test(source),
+			false,
+			`${path} passes a literal fromSitemap: false to a schedule write. Derive it from the target ` +
+				`(!!target.sitemapUrl) — a hardcoded false silently un-flags a sitemap-listed URL.`
+		);
+	}
+});
+
 test('the funnel owns the claim floor: nothing else touches the lease table’s floor primitives', () => {
 	// `advanceFloor`/`resetFloor`/`lowerFloorTo` are the correctness surface. A caller outside the
 	// funnel could advance the floor past a row it never observed, which is exactly the 14%-stranding

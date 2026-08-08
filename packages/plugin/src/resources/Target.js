@@ -225,6 +225,33 @@ export class Target extends TargetTable {
 	 * is ever pending while the cursor is open — see util/scan.js.
 	 */
 	static async revalidate(requestTarget) {
+		// THE PROJECTION IS NOT THE CALLER'S TO CHOOSE — the last hole in a bug this call site has
+		// already been fixed for once, and it is present in the single-id form too, since both forms
+		// pass the request's query straight to `search`.
+		//
+		// Phase 1 reads exactly two fields off every scanned row: `url`, which is the key phase 2
+		// writes, and `sitemapUrl`, which is the flag it must re-supply because `put` REPLACES the
+		// record. `requestTarget` is a REST query, so `?select(url)` on the action request is enough to
+		// take `sitemapUrl` away — and an ABSENT `sitemapUrl` is indistinguishable from a null one:
+		// every revalidated key would quietly report `isFromSitemap: false` to the renderer, which then
+		// skips serializing a non-indexable sitemap-listed page, i.e. exactly the silent
+		// stop-caching-these-pages bug the explicit `fromSitemap` argument was introduced to end.
+		// Dropping `url` fails in the opposite direction and is just as quiet: `pick` skips every row
+		// and the sweep reports success having written nothing.
+		//
+		// Neither is worth trusting a query string over, and rebuilding the query here is not an
+		// option — spreading a request target into a fresh object is how the single-id form silently
+		// becomes a whole-registry sweep. So an unusable projection is refused BY NAME.
+		const { select } = requestTarget ?? {};
+		const projects = (name) => (Array.isArray(select) ? select.includes(name) : select === name);
+		if (select !== undefined && select !== null && !(projects('url') && projects('sitemapUrl'))) {
+			throw new Error(
+				`revalidate cannot run against a projection that omits url or sitemapUrl (select: ${JSON.stringify(select)}). ` +
+					`An absent sitemapUrl reads as false and put replaces the schedule record, so every revalidated key ` +
+					`would tell the renderer it is not sitemap-listed. Reissue the request without a select.`
+			);
+		}
+
 		// Phase 1 — read only. Just the keys; the page lookup moves to phase 2 so this walk
 		// stays as short as possible. `sitemapUrl` rides along because phase 2 needs it and a
 		// second point read per URL would double the cost of the whole sweep — see below for what

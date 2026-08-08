@@ -14,6 +14,7 @@ import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
 import { resolveInvalidation } from '../util/invalidation.js';
+import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { currentMinuteMs } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
@@ -45,6 +46,16 @@ export async function handleBotRequest(request) {
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		maybeSchedule(resource, routeClass);
+		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
+		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
+		// only when the page would otherwise have been served). Detached inside, like maybeSchedule —
+		// and gated on the same `routeClass`, since a passthrough route still serves from cache.
+		maybeAccelerateHeal({
+			url: cacheUrl,
+			cacheKey: info.cacheKey,
+			invalidatedBy: info.invalidatedBy,
+			routeClass,
+		});
 		if (recordBots) {
 			recordServeOutcome(resource, request, info, deviceType);
 		}
@@ -227,6 +238,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	if (effectiveMissMode === 'prerender') {
 		const rendered = await renderNow({
 			url,
+			cacheUrl,
 			deviceType,
 			cacheKey,
 			request,
@@ -256,8 +268,19 @@ function maybeSchedule(resource, routeClass) {
 // On-demand render: force an immediate one-off render and wait for the fresh result,
 // bypassing both the cache and the origin proxy. Returns { resource, renderNowStatus }
 // where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
-async function renderNow({ url, deviceType, cacheKey, request, routeScope }) {
+async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeScope }) {
 	const since = Date.now();
+
+	// `fromSitemap` COMES FROM THE TARGET, and this fixes a pre-existing bug: `put` REPLACES the
+	// record, so the hardcoded `false` this call used to pass silently cleared the flag on any
+	// sitemap-sourced URL somebody rendered on demand. `claim` then reported `isFromSitemap: false`
+	// to the renderer, which skips serializing a non-indexable page unless it is sitemap-listed — so
+	// one authenticated render-now could quietly stop that page being cached at all, and the next
+	// scheduled render would re-file the same `false` from a schedule row nobody suspected.
+	// The target is the field's source of truth (`RenderQueue` re-derives it from there on every
+	// reschedule for exactly that reason). NO target is the legitimate render-now one-off shape, where
+	// `false` is the true answer.
+	const renderTarget = await Target.get({ id: cacheUrl, select: ['sitemapUrl'] });
 
 	// Force an immediately-claimable, one-off schedule. No Target is created, so
 	// processJobResult won't reschedule it — and drops the schedule row once the result
@@ -269,7 +292,7 @@ async function renderNow({ url, deviceType, cacheKey, request, routeScope }) {
 	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
 	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
 	// keeps the row above the owner's floor and therefore claimable.
-	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
+	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: !!renderTarget?.sitemapUrl });
 
 	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
 	// so a paused queue stays paused (the render then simply times out to the fallback).

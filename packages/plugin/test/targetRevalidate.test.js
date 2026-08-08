@@ -58,8 +58,21 @@ const makeResourceBase = (rows) =>
 		static async delete(id) {
 			return new this(id).delete();
 		}
-		static async *search() {
-			for (const row of [...rows.values()]) yield { ...row };
+		/**
+		 * HONOURS `select`, which is the whole point of the projection test below. A fake that yields
+		 * whole rows regardless makes `sitemapUrl` present no matter what the caller asked for, so the
+		 * guard's premise — that the request's projection decides what phase 2 can see — is never
+		 * exercised and the assertion passes for a reason unrelated to what it claims.
+		 */
+		static async *search(query = {}) {
+			const { select } = query;
+			const project = (row) =>
+				typeof select === 'string'
+					? { [select]: row[select] }
+					: Array.isArray(select)
+						? Object.fromEntries(select.map((name) => [name, row[name]]))
+						: { ...row };
+			for (const row of [...rows.values()]) yield project(row);
 		}
 	};
 
@@ -134,6 +147,52 @@ test('every URL is filed at the minute IT was written, not at the minute the swe
 				'a URL’s device variants still share one minute'
 			);
 		}
+	}
+});
+
+test('the sitemap flag survives the sweep — put REPLACES the schedule record', async () => {
+	const listed = 'https://www.example.com/listed';
+	const unlisted = 'https://www.example.com/unlisted';
+	stores.target.set(listed, { url: listed, sitemapUrl: 'https://www.example.com/sitemap.xml' });
+	stores.target.set(unlisted, { url: unlisted, sitemapUrl: null });
+
+	await Target.revalidate({});
+
+	for (const device of DEVICES) {
+		assert.equal(
+			stores.renderSchedule.get(`${listed}|${device}`).fromSitemap,
+			true,
+			'a cleared flag makes claim report isFromSitemap:false, and the renderer then skips serializing a ' +
+				'non-indexable sitemap-listed page — i.e. a revalidate quietly stops those pages being cached'
+		);
+		assert.equal(stores.renderSchedule.get(`${unlisted}|${device}`).fromSitemap, false);
+	}
+});
+
+test('a caller projection that cannot support the sweep is refused by name, not silently trusted', async () => {
+	const url = 'https://www.example.com/listed';
+	stores.target.set(url, { url, sitemapUrl: 'https://www.example.com/sitemap.xml' });
+
+	// `?select(url)` on the action request. An ABSENT sitemapUrl is indistinguishable from a null one,
+	// so trusting the projection re-opens the clobber above on every matched key; dropping `url`
+	// instead makes the sweep skip every row and report success. Both are silent.
+	for (const select of [['url'], ['sitemapUrl'], 'url', ['strikes', 'state']]) {
+		await assert.rejects(
+			() => Target.revalidate({ select }),
+			/omits url or sitemapUrl/,
+			`select ${JSON.stringify(select)}`
+		);
+	}
+	assert.equal(stores.renderSchedule.size, 0, 'and it refuses before writing anything');
+
+	// The full projection runs, and — because the fake `search` above honours `select` — this also
+	// asserts the thing the guard exists for: the two fields it insists on are the two phase 2 needs,
+	// so the flag survives a projected sweep. Under a fake that ignored `select` the row carried
+	// `sitemapUrl` whatever the caller asked for, and this assertion proved nothing about projections.
+	await Target.revalidate({ select: ['url', 'sitemapUrl'] });
+	assert.equal(stores.renderSchedule.size, DEVICES.length);
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.get(`${url}|${device}`).fromSitemap, true, 'from the projected row');
 	}
 });
 
