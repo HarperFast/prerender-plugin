@@ -632,7 +632,7 @@ export class RenderQueue extends Resource {
 	 * too); any successful render clears it. A targetless key (render-now one-off) has its
 	 * schedule dropped, as everywhere else.
 	 *
-	 * WHAT CHANGED IN v0.35.0, AND WHY IT HAD TO. The fast lane used to work purely by omission:
+	 * WHAT CHANGED IN v0.34.0, AND WHY IT HAD TO. The fast lane used to work purely by omission:
 	 * `claim` wrote `now + jobLeaseTime` into `nextRenderTime`, so "leave the schedule untouched"
 	 * meant "the row is due again at lease expiry". With the lease moved out of the row (see
 	 * util/renderLease.js), "untouched" means the row still carries its ORIGINAL overdue due time

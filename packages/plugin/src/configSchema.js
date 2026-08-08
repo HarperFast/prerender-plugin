@@ -366,7 +366,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			backlogSnapshotInterval: option(
 				15 * MINUTE,
-				'How often the backlog/histogram snapshot recomputes (worker 0 of each node). Since v0.35.0 ' +
+				'How often the backlog/histogram snapshot recomputes (worker 0 of each node). Since v0.34.0 ' +
 					'this is the ONLY scan that still seeks the absolute minimum of the nextRenderTime index — ' +
 					'`claim` starts from queue.claimFloor instead — and it is kept that way deliberately, because ' +
 					'it is therefore the only reader that can see a row filed BELOW the floor and report it. It ' +
@@ -649,7 +649,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				enabled: option(
 					true,
 					'Kill switch. `false` forces the floor to 0, so the scan seeks from the absolute index ' +
-						'minimum exactly as it did before v0.35.0 — and changes nothing else (leases still live in ' +
+						'minimum exactly as it did before v0.34.0 — and changes nothing else (leases still live in ' +
 						'the shared buffer either way). It exists, and is live-reloadable, because a floor that is ' +
 						'wrong strands rows SILENTLY: such a URL stops rendering and reports nothing.'
 				),

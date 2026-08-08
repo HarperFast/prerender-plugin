@@ -121,7 +121,7 @@ rest: true # required for the @export-ed table REST endpoints
     maxLeases: 4096 # lease slots in the node-local shared buffer (restart-scoped)
     claimScanCap: 1000 # ceiling on schedule rows read per claim pass
     claimFloor: # the lower bound the claim scan seeks from (see "The claim floor")
-      enabled: true # false = seek the absolute index minimum, as before v0.35.0
+      enabled: true # false = seek the absolute index minimum, as before v0.34.0
       guard: 300000 # 5m — the floor is always held at least this far behind now
       resetInterval: 300000 # 5m — how often the floor is reset and re-derived from the index
       unpinAfter: 3600000 # 1h — a row holding the floor this long is written forward (0 = never)
@@ -432,7 +432,7 @@ of the cache key, plus the claim floor as a single integer. A lease costs zero d
 row is, and it was never moved — so a job whose lease vanished is simply granted again. The visible
 cost is a duplicate-render burst for whatever was in flight (~500 per node at 12k renders/hour), and
 both results are accepted, with the later `PrerenderedPage.put` winning. The floor zeroing on restart
-is a _feature_: `0` means "seek the absolute index minimum", i.e. exactly the pre-v0.35.0 behaviour,
+is a _feature_: `0` means "seek the absolute index minimum", i.e. exactly the pre-v0.34.0 behaviour,
 so a restart cannot help but re-derive the truth from the index. Persisting the floor would make a
 bad value durable, which is why it is deliberately not persisted.
 
@@ -592,7 +592,7 @@ execute it against the operator's super-user session.
   worker serving the page — the claim pass is the only thing that sees it). A **Below claim floor** alarm means rows have been
   filed where no claim will look — see "The claim floor".
 
-  The backlog/histogram is a **cached snapshot**, not a page-load query. Since v0.35.0 it is also
+  The backlog/histogram is a **cached snapshot**, not a page-load query. Since v0.34.0 it is also
   the only scan left that seeks the absolute minimum of the `nextRenderTime` index, kept that way
   deliberately: that makes it the only detector of a below-floor row. It recomputes on
   `management.backlogSnapshotInterval` (worker 0 of each node, result in the node-local

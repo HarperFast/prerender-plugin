@@ -800,7 +800,7 @@ test('floorEnabled:false forces a floor of 0 and changes nothing else', async ()
 
 	const result = await h.pass({ floorEnabled: false });
 
-	assert.equal(result.floorFrom, 0, 'the scan seeks the absolute minimum, exactly as before v0.35.0');
+	assert.equal(result.floorFrom, 0, 'the scan seeks the absolute minimum, exactly as before v0.34.0');
 	assert.equal(h.searches.at(-1).query.conditions[0].value, 0);
 	assert.equal(h.leases.rawFloorMinute(), 0, 'and the stored floor is cleared, so re-enabling starts clean');
 	assert.equal(result.jobs.length, 1);

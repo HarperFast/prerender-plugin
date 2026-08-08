@@ -11,7 +11,7 @@
  * the LAST snapshot with its timestamp, a timer on worker 0 recomputes it on a slow cadence,
  * and recomputing right now is an explicit admin action.
  *
- * SINCE v0.35.0 THIS IS THE ONLY SCAN THAT STILL SEEKS THE ABSOLUTE MINIMUM of that index —
+ * SINCE v0.34.0 THIS IS THE ONLY SCAN THAT STILL SEEKS THE ABSOLUTE MINIMUM of that index —
  * `claim` starts from the claim floor instead (`util/renderSchedule.js`) — and it is kept that
  * way DELIBERATELY. It is therefore the only reader in the system that can see a row filed BELOW
  * the floor, which is a row nothing will ever claim: the same terminal, silent state
@@ -21,7 +21,7 @@
  *
  * `overdue` ALSO CHANGED MEANING. A leased job's row keeps its past due time until its result
  * lands, so `overdue` now includes every in-flight render and acquires a permanent floor equal to
- * the in-flight count. It is no longer comparable with numbers recorded before v0.35.0, and
+ * the in-flight count. It is no longer comparable with numbers recorded before v0.34.0, and
  * "backlog returns to zero" is no longer the capacity test — "backlog returns to the in-flight
  * count" is. The snapshot reports `inFlight` beside it so the console can show both rather than
  * subtract a live gauge from a 15-minute-old scan and present the difference as one figure.

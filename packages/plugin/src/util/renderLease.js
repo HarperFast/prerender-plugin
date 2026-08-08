@@ -65,7 +65,7 @@
  *
  * The floor, by contrast, is NOT persisted for a reason that is easy to get backwards:
  * restart-zeroing is the single accidental self-heal that every stranding bug in this design
- * depends on. `floor = 0` means "seek from the absolute minimum", i.e. exactly the pre-v0.35.0
+ * depends on. `floor = 0` means "seek from the absolute minimum", i.e. exactly the pre-v0.34.0
  * behaviour — so a restart cannot help but re-derive the truth from the index. Persisting the
  * floor would make a backwards clock step, or any bug that advanced it too far, DURABLE. The
  * price of not persisting it is one degraded 6.25 ms seek per worker generation. Pay it.
@@ -388,7 +388,7 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 
 	/**
 	 * The floor to seek from, in minutes since the epoch. `0` means "no floor" — seek the
-	 * absolute index minimum, exactly as before v0.35.0.
+	 * absolute index minimum, exactly as before v0.34.0.
 	 *
 	 * THE GUARD CLAMP IS APPLIED ON EVERY READ, and it is what makes the whole design safe
 	 * without cross-node coordination. `RenderSchedule` is residency-pinned, so ~75% of "render
