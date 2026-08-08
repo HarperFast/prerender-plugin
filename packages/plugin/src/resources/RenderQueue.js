@@ -178,6 +178,22 @@ export class RenderQueue extends Resource {
 					holdLease = true;
 				},
 			});
+		} catch (e) {
+			// A THROW MUST HOLD THE LEASE. `holdLease` is only set by branches that ran to
+			// completion, so without this a throw would release it — and a throw is precisely the
+			// case where nothing moved the row forward. Worse, the throw propagates out of the
+			// request handler, so Harper ABORTS the ambient transaction and rolls back whatever this
+			// result did commit (the `PrerenderedPage.put` included). The row keeps its original
+			// overdue due time and the floor is at or below its minute by construction, so a freed
+			// lease means the next pass re-grants it seconds later: an unpaced re-render loop against
+			// whatever is throwing, at claim frequency rather than once per lease.
+			//
+			// Reachable, not theoretical: `result.headers[...] = '1'` on a post with no headers
+			// object, a `PrerenderedPage.put`/`createBlob` failure, a `Target.get`/`Target.patch`
+			// rejection. Holding the lease paces the retry at `queue.jobLeaseTime`, exactly like the
+			// fast-retry lanes below, and the 500 is what says the result was not processed.
+			holdLease = true;
+			throw e;
 		} finally {
 			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`.
 			if (!holdLease && claimKey) releaseLease(claimKey);
@@ -733,16 +749,22 @@ export class RenderQueue extends Resource {
 			});
 		}
 
-		if (pass.leaseTableFull) {
+		if (pass.leaseRefused) {
+			// Deliberately not "all N slots are in use": a grant is also refused when the key's
+			// 8-slot probe window is full (occupancy can be a fraction of maxLeases) or when its
+			// publish CAS lost a race. Report the occupancy and let it say which.
 			logger.warn(
-				`[prerender] claim could not record a lease: all ${config.queue.maxLeases} lease slots are in use ` +
-					`(occupancy ${pass.occupancy}). Granted ${jobs.length} of ${limit}. Raise queue.maxLeases (restart-scoped).`
+				`[prerender] claim could not record a lease for a due row: ${pass.occupancy} of ` +
+					`${config.queue.maxLeases} slots occupied. Granted ${jobs.length} of ${limit}. If the occupancy is ` +
+					`near the table size, raise queue.maxLeases (restart-scoped); if it is nowhere near it, the key's ` +
+					`probe window is full and the next pass will place it elsewhere.`
 			);
 		} else if (pass.scanTruncated && jobs.length < limit) {
 			logger.warn(
 				`[prerender] claim hit its ${pass.scanLimit}-row scan cap with ${pass.occupancy} lease(s) in flight and ` +
-					`granted ${jobs.length} of ${limit}. In-flight work is filling the scan window — raise ` +
-					`queue.claimScanCap, or look for wedged renders holding the claim floor.`
+					`granted ${jobs.length} of ${limit}, without reaching a not-yet-due row. In-flight work is filling ` +
+					`the scan window — raise queue.claimScanCap, or look at ${pass.floorHeldBy ?? 'the oldest due row'}, ` +
+					`which is holding the claim floor at minute ${pass.floorTo}.`
 			);
 		}
 

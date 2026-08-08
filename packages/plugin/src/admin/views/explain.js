@@ -149,7 +149,15 @@ function explanation(ctx, data) {
 							[
 								'Next render',
 								schedule.leased
-									? `claimed, lease expires ${ago(schedule.leaseExpiresAt)} (was due ${duration(schedule.dueInMs)} ago)`
+									? // SIGNED. `duration()` takes an absolute value, so a hard-coded " ago" printed
+										// "was due 9h ago" for a row due in nine hours — which a leased row genuinely
+										// can be, since the slow retry lane and a redirect reschedule move the row
+										// while the lease is still held.
+										`claimed, lease expires ${ago(schedule.leaseExpiresAt)} (${
+											schedule.overdue
+												? `was due ${duration(schedule.dueInMs)} ago`
+												: `due in ${duration(schedule.dueInMs)}`
+										})`
 									: (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs),
 							],
 							['From sitemap', boolText(schedule.fromSitemap)],

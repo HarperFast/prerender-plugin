@@ -123,7 +123,7 @@ beforeEach(() => {
 });
 
 test('refreshQueueStatus resolves with a status even though RenderSchedule.search throws', async () => {
-	funnel.leaseTable.recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
 
 	const result = await RenderQueue.refreshQueueStatus();
 
@@ -133,16 +133,16 @@ test('refreshQueueStatus resolves with a status even though RenderSchedule.searc
 });
 
 test('the derivation is tri-state: due rows seen ⇒ queued, none ⇒ empty', async () => {
-	funnel.leaseTable.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
 	assert.equal((await RenderQueue.refreshQueueStatus()).status, 'empty');
 
-	funnel.leaseTable.recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
 	assert.equal((await RenderQueue.refreshQueueStatus()).status, 'queued');
 	assert.equal(searchCalls, 0);
 });
 
 test('a not-yet-due row whose minute has arrived flips the derivation to queued', () => {
-	funnel.leaseTable.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: minuteOf(T0 + 5 * MINUTE) });
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: minuteOf(T0 + 5 * MINUTE) });
 	assert.equal(funnel.deriveQueueStatus(T0), 'empty');
 	assert.equal(funnel.deriveQueueStatus(T0 + 5 * MINUTE), 'queued');
 	assert.equal(searchCalls, 0);
@@ -178,7 +178,7 @@ test('LIFTING a pause is force-written — a compareExchange cannot move a flag 
 	assert.equal(QueueState.status, 'paused');
 
 	controls.delete('all');
-	funnel.leaseTable.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
 	const result = await RenderQueue.refreshQueueStatus();
 
 	assert.equal(result.status, 'empty');
@@ -186,7 +186,7 @@ test('LIFTING a pause is force-written — a compareExchange cannot move a flag 
 });
 
 test('a forced refresh writes the QueueStatus row', async () => {
-	funnel.leaseTable.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
 	await RenderQueue.refreshQueueStatus(true);
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
@@ -202,12 +202,12 @@ test('the status refresh resets the claim floor at most once per resetInterval',
 		// First refresh: the reset fires (this is what recovers a due time written below the floor by
 		// the operations API, which no plugin code can observe).
 		await RenderQueue.refreshQueueStatus();
-		funnel.leaseTable.advanceFloor(0, minuteOf(T0));
+		funnel.leaseTable().advanceFloor(0, minuteOf(T0));
 		assert.equal(funnel.maybeResetFloor(Date.now() + MINUTE), false, 'not again inside the interval');
-		assert.equal(funnel.leaseTable.rawFloorMinute(), minuteOf(T0), 'so the floor survives');
+		assert.equal(funnel.leaseTable().rawFloorMinute(), minuteOf(T0), 'so the floor survives');
 
 		assert.equal(funnel.maybeResetFloor(Date.now() + 6 * MINUTE), true);
-		assert.equal(funnel.leaseTable.rawFloorMinute(), 0, 'and the next pass re-derives it from the index');
+		assert.equal(funnel.leaseTable().rawFloorMinute(), 0, 'and the next pass re-derives it from the index');
 	} finally {
 		config.queue.claimFloor.resetInterval = original;
 	}
@@ -215,12 +215,12 @@ test('the status refresh resets the claim floor at most once per resetInterval',
 
 test('resetting the claim floor by hand reports what it changed', async () => {
 	funnel.resetRenderQueueState();
-	funnel.leaseTable.advanceFloor(0, minuteOf(T0));
+	funnel.leaseTable().advanceFloor(0, minuteOf(T0));
 
 	const result = await RenderQueue.resetClaimFloor();
 
 	assert.equal(result.previousFloorMinute, minuteOf(T0));
 	assert.equal(result.floorMinute, 0);
 	assert.equal(result.node, 'node-a');
-	assert.equal(funnel.leaseTable.rawFloorMinute(), 0);
+	assert.equal(funnel.leaseTable().rawFloorMinute(), 0);
 });

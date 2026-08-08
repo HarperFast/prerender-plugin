@@ -80,14 +80,33 @@
  *
  * ── THE ACCEPTED COST, STATED PLAINLY ───────────────────────────────────────────────────────
  *
- * The floor advances only as fast as the OLDEST IN-FLIGHT job completes. One wedged job pins it
- * for a full `queue.jobLeaseTime`, and everything behind it waits — `jobLeaseTime` is now a
- * LATENCY knob, not just a retry knob. Worse and more likely: during a broad origin 5xx event or
- * a bot-mitigation rule change, EVERY job takes the fast-retry lane, which holds its lease on
- * purpose, so no lease is released at all for that window and the floor cannot move — the 14×
- * win degrades back toward today's cost exactly when the node is busiest. This is accepted, it
- * is documented in `queue.jobLeaseTime`'s description, and it is why the scan limit accommodates
- * the in-flight pile instead of trusting `limit: 20`.
+ * The floor advances only as fast as the OLDEST DUE ROW leaves the due window, and the only thing
+ * that moves a row is its own result. So the pin lasts until that row is written forward or deleted —
+ * NOT "for one lease", which is the easy thing to assume and is wrong. A lease expiring changes
+ * nothing here: `claim` writes nothing to the table, so the row is still due at the same minute and
+ * the next pass derives the same floor from it. The periodic reset cannot recover it either — the row
+ * IS the oldest due row, so re-deriving from the absolute minimum lands on the same value.
+ *
+ * The bounded cases: any result that reschedules (success, the slow retry lane, a redirect verdict,
+ * a suppression recheck) moves its row, and the fast-retry lane holds its lease for at most
+ * `render.failureRetry.fastRetries × queue.jobLeaseTime` before the slow lane writes the row forward.
+ * The UNBOUNDED case is a row whose result never reschedules it: the generic-failure branch in
+ * `resources/RenderQueue.js` (target exists → hold the lease, no schedule write, no strike) is
+ * exactly that shape, and it is where every renderer crash, navigation timeout and settle failure
+ * lands. One permanently failing URL in an 803k corpus therefore holds the floor at its own minute
+ * indefinitely, and dead index entries then accumulate above that point at the full render rate —
+ * the same degradation this design exists to remove (~43 ms/pass after a day at 200 renders/min).
+ * It is detectable and it is NAMED: the pass reports `floorHeldBy`, `claim` logs it, and the console
+ * shows it beside the floor lag. Routing that branch through `retryAfterFailure`'s strike-counted
+ * lanes would make the pin genuinely bounded, and is deliberately not in this release: those strikes
+ * are the SHARED target counter that suppression and redirect verdicts retire targets on, so feeding
+ * a broad origin outage into it risks mass deletion.
+ *
+ * `jobLeaseTime` is a LATENCY knob either way, not just a retry knob: during a broad origin 5xx event
+ * or a bot-mitigation rule change EVERY job takes the fast-retry lane, which holds its lease on
+ * purpose, so no lease is released at all for that window — the 14× win degrades back toward today's
+ * cost exactly when the node is busiest. That is why the scan limit accommodates the in-flight pile
+ * instead of trusting `limit: 20`.
  *
  * Downstream, a pinned floor shifts served-page age right for EVERY page type at once (a rising
  * stale-while-revalidate share and a right-shifted per-page-type age with no config change).
@@ -103,33 +122,52 @@ import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from 
 /**
  * The live lease table + claim floor, over one named buffer shared by every worker on this node.
  *
- * Acquired at MODULE SCOPE, mirroring `QueueState.js`: the size of a named `getUserSharedBuffer` is
- * fixed by the FIRST allocation in the process, so a later worker asking for a different size gets
- * a view of the first size. That is precisely why `queue.maxLeases` is restart-scoped, and why a
- * mismatch is logged loudly and then honoured — indexing past a short buffer would be silent
- * memory corruption, whereas deriving the slot count from the buffer we actually got is merely a
- * smaller table.
+ * ALLOCATED ON FIRST USE, NEVER AT MODULE SCOPE. `queue.maxLeases` sizes the buffer, and module
+ * scope is too early to read it: `extension.js` imports this module chain (RenderQueue → Target →
+ * Sitemap → …) BEFORE it calls `applyOptions(scope.options.getAll())`, which is the rule stated at
+ * the top of `src/config.js` — read `config.*` lazily, at request/timer time. Sized at module scope
+ * it read the DEFAULT, so an operator who set `queue.maxLeases: 16384` still got 4,096 slots after a
+ * restart, and the size assert below could not fire either, because both sides of its comparison
+ * came from that same stale number. First use is a claim or a lease operation, always after options
+ * are applied.
+ *
+ * The buffer is STILL sized once per process — the size of a named `getUserSharedBuffer` is fixed by
+ * the first allocation, so a later worker asking for a different size gets a view of the first size.
+ * That is why `queue.maxLeases` stays restart-scoped, and why a mismatch is logged loudly and then
+ * honoured: indexing past a short buffer would be silent memory corruption, whereas deriving the slot
+ * count from the buffer we actually got is merely a smaller table.
  *
  * It lives HERE rather than in `renderLease.js` so that module stays free of Harper globals and its
  * tests can run against a plain ArrayBuffer.
  */
-const wantedSlots = Math.max(1, config.queue.maxLeases | 0);
-const leaseSab = await getSab(LEASE_SAB_KEY, leaseBufferBytes(wantedSlots));
+let liveLeaseTable = null;
 
-if (leaseSab.byteLength !== leaseBufferBytes(wantedSlots)) {
-	logger.error(
-		`[prerender] render-lease buffer is ${leaseSab.byteLength} bytes but queue.maxLeases=${wantedSlots} wants ` +
-			`${leaseBufferBytes(wantedSlots)}. The named shared buffer was sized by an earlier worker generation — ` +
-			`this node runs with ${leaseSlotsIn(leaseSab.byteLength)} lease slots until it restarts. ` +
-			`queue.maxLeases is restart-scoped for exactly this reason.`
-	);
-}
+export const leaseTable = () => {
+	if (liveLeaseTable) return liveLeaseTable;
 
-// `now` is passed as a wrapper rather than as the bare `Date.now` reference so the clock stays
-// LATE-BOUND: `createLeaseTable`'s default would capture the function object at this line, and a
-// test that swaps `Date.now` to walk past a lease expiry would then move the queue's clock but not
-// the lease table's — the two would silently disagree.
-export const leaseTable = createLeaseTable({ buffer: leaseSab, slots: wantedSlots, now: () => Date.now() });
+	const wantedSlots = Math.max(1, config.queue.maxLeases | 0);
+	// `getSab` is synchronous — `getUserSharedBuffer` hands back the buffer itself, not a promise —
+	// which is what lets this be a plain accessor. An async one would have to be awaited from
+	// `isLeased`, from the release path and from the console's O(1) reads, and the `await` it used to
+	// carry at module scope was awaiting a non-promise.
+	const buffer = getSab(LEASE_SAB_KEY, leaseBufferBytes(wantedSlots));
+
+	if (buffer.byteLength !== leaseBufferBytes(wantedSlots)) {
+		logger.error(
+			`[prerender] render-lease buffer is ${buffer.byteLength} bytes but queue.maxLeases=${wantedSlots} wants ` +
+				`${leaseBufferBytes(wantedSlots)}. The named shared buffer was sized by an earlier worker generation — ` +
+				`this node runs with ${leaseSlotsIn(buffer.byteLength)} lease slots until it restarts. ` +
+				`queue.maxLeases is restart-scoped for exactly this reason.`
+		);
+	}
+
+	// `now` is passed as a wrapper rather than as the bare `Date.now` reference so the clock stays
+	// LATE-BOUND: `createLeaseTable`'s default would capture the function object at this line, and a
+	// test that swaps `Date.now` to walk past a lease expiry would then move the queue's clock but not
+	// the lease table's — the two would silently disagree.
+	liveLeaseTable = createLeaseTable({ buffer, slots: wantedSlots, now: () => Date.now() });
+	return liveLeaseTable;
+};
 
 // Resolved per call rather than destructured at module load, matching `util/reconcile.js` and
 // `util/backlogSnapshot.js`. This module is imported by almost everything (Target → Sitemap →
@@ -159,7 +197,7 @@ const lowerFloorFor = (nextRenderTime) => {
 		logger.warn(`[prerender] schedule write with a non-numeric nextRenderTime (${nextRenderTime}) — floor not lowered`);
 		return;
 	}
-	leaseTable.lowerFloorTo(minuteOf(at));
+	leaseTable().lowerFloorTo(minuteOf(at));
 };
 
 /**
@@ -171,10 +209,15 @@ const lowerFloorFor = (nextRenderTime) => {
  * serializing a non-indexable sitemap-listed page. A required argument is how that stops being
  * possible.
  *
- * ORDER: row first, floor second. The row must be visible to a scan before the floor invites a
- * scan to look for it; the reverse order has a window where the floor says "there is work at
- * minute M" and minute M is empty. (It also makes a torn lease-slot read harmless: a slot can
- * only be recycled after the row beneath it was moved or deleted.)
+ * ORDER: row first, floor second — but be honest about what that does and does not buy. It does NOT
+ * guarantee the row is visible before the floor invites a scan to look for it: `put` with no explicit
+ * context joins the ambient transaction, which commits after the calling handler settles, so the row
+ * becomes visible AFTER this function returns either way. What actually covers the hazard is the
+ * GUARD BAND — the floor is clamped `queue.claimFloor.guard` behind the current minute on every read,
+ * and every caller here writes the current minute or later, so the row is above the floor by
+ * construction and stays claimable however late it lands. A floor lowered for a row not yet visible
+ * costs at most one pass that finds nothing at that minute. The order stays this way because it is
+ * the free direction, not because it is the invariant.
  *
  * NOT wrapped in a deadline, ever. See the module comment in `resources/Target.js`: a write to a
  * residency-pinned key this node does not own does NOT block on the owner (measured: 500 writes
@@ -268,9 +311,14 @@ export const runClaimPass = async ({
 	const jobs = [];
 	let sawDue = false;
 	let firstDueMinute = null;
+	// The key of that first due row. The floor rule is defined by which ROW the pass saw first, and
+	// nothing else in the system can name it: `claim` writes nothing, so a row that never completes
+	// holds the floor at its own minute indefinitely and the only evidence is this. Reported so the
+	// warning and the console can say WHICH URL, instead of "something is wedged".
+	let floorHeldBy = null;
 	let lastGrantedMinute = null;
 	let earliestNotYetDueMinute = 0;
-	let leaseTableFull = false;
+	let leaseRefused = false;
 	let skippedLeased = 0;
 	let nonFinite = 0;
 
@@ -295,7 +343,10 @@ export const runClaimPass = async ({
 		sawDue = true;
 		const dueMinute = minuteOf(at);
 		// Recorded for the FIRST due row regardless of what happens to it — that is the floor rule.
-		if (firstDueMinute === null) firstDueMinute = dueMinute;
+		if (firstDueMinute === null) {
+			firstDueMinute = dueMinute;
+			floorHeldBy = row.cacheKey;
+		}
 
 		if (leases.isLeased(row.cacheKey)) {
 			skippedLeased++;
@@ -307,7 +358,11 @@ export const runClaimPass = async ({
 		if (!leases.grant(row.cacheKey, { dueMinute, leaseExpiryMs: expiresAtMs })) {
 			// No slot, no job. A granted-but-unrecorded job is a double render AND an untracked
 			// hold on the floor; refusing to hand it out is the only safe answer.
-			leaseTableFull = true;
+			//
+			// "Refused", not "table full": `grant` also returns false when its publish CAS lost a race
+			// for the slot, and reporting that as "every lease slot is in use" sends the operator to
+			// raise `queue.maxLeases` over a full probe window (8 slots) or a lost CAS.
+			leaseRefused = true;
 			break;
 		}
 		lastGrantedMinute = dueMinute;
@@ -339,18 +394,37 @@ export const runClaimPass = async ({
 		earliestNotYetDueMinute,
 		floorFrom,
 		floorTo,
+		floorHeldBy,
 		floorAdvanced,
 		scanned: rows.length,
 		scanLimit,
-		scanTruncated: rows.length >= scanLimit,
-		leaseTableFull,
+		// BOTH HALVES. A full window on its own says nothing: the query is deliberately ONE-SIDED, so
+		// on any real corpus every row above the floor matches and the window fills on a perfectly
+		// healthy, caught-up node — `rows.length >= scanLimit` alone is true essentially always, and
+		// the warning it drove fired when the node was IDLE and went quiet when it was busy. The window
+		// is only genuinely truncated if the drain never reached a not-yet-due row; reaching one proves
+		// there was nothing more to grant beyond it.
+		scanTruncated: rows.length >= scanLimit && earliestNotYetDueMinute === 0,
+		leaseRefused,
 		occupancy: leases.occupancy(),
 	};
 };
 
+/**
+ * The cacheKey of the row the claim floor is being held at, as observed by the last claim pass ON
+ * THIS WORKER, with when that pass ran.
+ *
+ * Per worker, deliberately, and labelled as such wherever it is shown: the pass result is not shared
+ * across workers (only the buffer is), so a worker that has not claimed recently reports `null`
+ * rather than somebody else's answer. `null` also legitimately means "the last pass saw no due row",
+ * i.e. nothing is holding the floor.
+ */
+let lastFloorHeldBy = null;
+let lastFloorHeldByAt = 0;
+
 /** `runClaimPass` bound to the live table and config. Called by `RenderQueue.claim`. */
-export const claimSchedules = ({ grantLimit } = {}) =>
-	runClaimPass({
+export const claimSchedules = async ({ grantLimit } = {}) => {
+	const pass = await runClaimPass({
 		searchSchedules: ({ floorMinute, limit }) =>
 			scheduleTable().search(
 				{
@@ -361,11 +435,16 @@ export const claimSchedules = ({ grantLimit } = {}) =>
 					// index-ordered walk of `nextRenderTime` is unverified — on 1.6M rows a wrong
 					// answer there is a full table scan plus a sort on the claim path.
 					//
-					// One-sided, not a range. A two-sided range on this SECONDARY index measures fine
-					// (0.74 ms), but the one-sided form is what was measured at 0.43 ms, and the
-					// `<= now` half is free in application code. (On a PRIMARY key a two-sided range
-					// collapses to a filtered intersection — 289–1490 ms — which is why the shape of
-					// this query is worth a comment at all.)
+					// ONE-SIDED, AND A TWO-SIDED RANGE IS NOT A SAFE ALTERNATIVE HERE. Adding the
+					// `<= now` half measures fine (0.74 ms) only while the window can FILL the limit.
+					// Measured on 400k rows when it cannot — which is the normal steady state, "nothing
+					// is due" — it costs 1,128–2,977 ms: only the FIRST condition becomes the index
+					// range and the second is applied as a post-filter, so the cost is O(rows above the
+					// lower bound) rather than O(window), and the limit can never short-circuit it.
+					// That is a ~480× regression on the claim path, in the state the queue spends most
+					// of its time in. The `<= now` half stays in application code, where it is free.
+					// (On a PRIMARY key a two-sided range collapses to a filtered intersection —
+					// 289–1490 ms — which is why the shape of this query is worth a comment at all.)
 					conditions: [{ attribute: 'nextRenderTime', comparator: 'greater_than_equal', value: floorMinute * MINUTE }],
 					sort: { attribute: 'nextRenderTime' },
 					// ARRAY select. A string `select` returns the bare scalar rather than a record —
@@ -375,7 +454,7 @@ export const claimSchedules = ({ grantLimit } = {}) =>
 				},
 				{ replicateFrom: false }
 			),
-		leases: leaseTable,
+		leases: leaseTable(),
 		nowMs: Date.now(),
 		grantLimit,
 		guardMinutes: guardMinutes(),
@@ -384,11 +463,19 @@ export const claimSchedules = ({ grantLimit } = {}) =>
 		floorEnabled: config.queue.claimFloor.enabled,
 	});
 
+	// Whatever this pass saw, including `null` for "nothing is due": a stale key here would name an
+	// innocent URL as the thing pinning the queue.
+	lastFloorHeldBy = pass.floorHeldBy;
+	lastFloorHeldByAt = Date.now();
+
+	return pass;
+};
+
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
 
-export const releaseLease = (cacheKey) => leaseTable.release(cacheKey);
+export const releaseLease = (cacheKey) => leaseTable().release(cacheKey);
 
-export const leaseInfo = (cacheKey) => leaseTable.leaseOf(cacheKey);
+export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
 
 // ---- status derivation (zero DB ops) --------------------------------------------------------
 
@@ -403,7 +490,7 @@ export const leaseInfo = (cacheKey) => leaseTable.leaseOf(cacheKey);
  * interval while a large backlog is entirely in flight.
  */
 export const deriveQueueStatus = (nowMs = Date.now()) => {
-	const { sawDue, earliestNotYetDueMinute } = leaseTable.readPassOutcome();
+	const { sawDue, earliestNotYetDueMinute } = leaseTable().readPassOutcome();
 	// A row that was in the future when the last pass saw it, and whose minute has since arrived,
 	// makes the queue non-empty without anything having to scan for it.
 	if (earliestNotYetDueMinute && earliestNotYetDueMinute <= minuteOf(nowMs)) return 'queued';
@@ -425,14 +512,14 @@ export const maybeResetFloor = (nowMs = Date.now()) => {
 	if (!(interval > 0)) return false;
 	if (lastFloorReset && nowMs - lastFloorReset < interval) return false;
 	lastFloorReset = nowMs;
-	leaseTable.resetFloor();
+	leaseTable().resetFloor();
 	return true;
 };
 
 /** The operator escape hatch: reset now instead of waiting out the interval. */
 export const resetFloorNow = () => {
-	const previousFloorMinute = leaseTable.rawFloorMinute();
-	leaseTable.resetFloor();
+	const previousFloorMinute = leaseTable().rawFloorMinute();
+	leaseTable().resetFloor();
 	lastFloorReset = Date.now();
 	return { previousFloorMinute, floorMinute: 0, lastResetAt: lastFloorReset };
 };
@@ -440,18 +527,22 @@ export const resetFloorNow = () => {
 /** Everything the console needs about the floor and the lease table. All O(1) except `oldestLease`. */
 export const floorState = (nowMs = Date.now()) => {
 	const guard = guardMinutes();
-	const live = leaseTable.scanLive();
+	const live = leaseTable().scanLive();
 	return {
 		enabled: config.queue.claimFloor.enabled,
-		floorMinute: config.queue.claimFloor.enabled ? leaseTable.readFloorMinute(minuteOf(nowMs), guard) : 0,
-		rawFloorMinute: leaseTable.rawFloorMinute(),
+		floorMinute: config.queue.claimFloor.enabled ? leaseTable().readFloorMinute(minuteOf(nowMs), guard) : 0,
+		rawFloorMinute: leaseTable().rawFloorMinute(),
 		guardMinutes: guard,
 		resetInterval: config.queue.claimFloor.resetInterval,
 		lastResetAt: lastFloorReset || null,
 		occupancy: live.count,
 		oldestLeaseExpiresAt: live.oldestExpiresAtMs,
 		oldestLeaseDueMinute: live.oldestDueMinute,
-		maxLeases: leaseTable.slots,
+		maxLeases: leaseTable().slots,
+		// WHICH ROW IS HOLDING THE FLOOR — the one thing a floor lag does not tell you, and the only
+		// place it is recorded. This worker's last claim pass; see `lastFloorHeldBy`.
+		floorHeldBy: lastFloorHeldBy,
+		floorHeldByAt: lastFloorHeldByAt || null,
 	};
 };
 
@@ -460,12 +551,14 @@ export const floorState = (nowMs = Date.now()) => {
  * the backlog snapshot compare a row against. `null` when there is no floor.
  */
 export const currentFloorMs = (nowMs = Date.now()) => {
-	const floorMinute = config.queue.claimFloor.enabled ? leaseTable.readFloorMinute(minuteOf(nowMs), guardMinutes()) : 0;
+	const floorMinute = config.queue.claimFloor.enabled
+		? leaseTable().readFloorMinute(minuteOf(nowMs), guardMinutes())
+		: 0;
 	return floorMinute > 0 ? floorMinute * MINUTE : null;
 };
 
 /** In-flight lease count, for the backlog snapshot and the console. O(1). */
-export const inFlightLeases = () => leaseTable.occupancy();
+export const inFlightLeases = () => leaseTable().occupancy();
 
 /**
  * Zero the whole shared buffer. TESTS ONLY (precedent: `resetCrawlStats`). The buffer outlives
@@ -473,6 +566,6 @@ export const inFlightLeases = () => leaseTable.occupancy();
  * between tests in one file and the second test in a file mysteriously claims nothing.
  */
 export const resetRenderQueueState = () => {
-	leaseTable.resetAll();
+	leaseTable().resetAll();
 	lastFloorReset = 0;
 };

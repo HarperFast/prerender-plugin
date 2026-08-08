@@ -24,6 +24,7 @@ import {
 	LEASE_EPOCH_SEC,
 	LEASE_HEADER_BYTES,
 	LEASE_SLOT_BYTES,
+	RELEASE_GRACE_MS,
 	createLeaseTable,
 	leaseBufferBytes,
 } from '../src/util/renderLease.js';
@@ -125,16 +126,50 @@ test('expiries relative to LEASE_EPOCH_SEC survive past 2038 (they are not raw I
 	assert.ok(LEASE_EPOCH_SEC > 0);
 });
 
-test('release is idempotent, keyed on the hash pair, and frees the slot', () => {
+test('release gives the lease up at once but keeps the key unclaimable for the commit grace', () => {
+	// THE COMMIT-VISIBILITY GRACE. The result path releases from a `finally` inside the request
+	// handler, while the reschedule it just issued commits with the AMBIENT transaction — after the
+	// handler settles. Freeing the key on the spot leaves a window in which committed state still
+	// shows the row overdue and unleased, and a `claim` on another worker (which does not share the
+	// result path's mutex) grants it a second time: a duplicate render on every result, and a second
+	// strike toward maxStrikes on a failing key.
 	const now = 1_700_000_000_000;
-	const { table } = harness({ now });
+	const { table, clock } = harness({ now });
 
-	table.grant('a|desktop', { dueMinute: 1, leaseExpiryMs: now + MINUTE });
+	table.grant('a|desktop', { dueMinute: 1, leaseExpiryMs: now + 10 * MINUTE });
 	assert.equal(table.release('a|desktop'), true);
-	assert.equal(table.isLeased('a|desktop'), false);
+
+	// Given up immediately for everything that means "is this being rendered": the gauge and leaseOf.
 	assert.equal(table.occupancy(), 0);
-	assert.equal(table.release('a|desktop'), false, 'releasing twice is a no-op, not a corruption');
+	assert.equal(table.leaseOf('a|desktop'), null, 'not in flight any more');
+	// But NOT claimable, which is the whole point — and never for longer than the original lease.
+	assert.equal(table.isLeased('a|desktop'), true, 'still unclaimable while the transaction commits');
+	assert.ok(RELEASE_GRACE_MS < 10 * MINUTE);
+
+	assert.equal(table.release('a|desktop'), false, 'releasing twice is a no-op, not a second decrement');
+	assert.equal(table.occupancy(), 0, 'and specifically not a gauge that goes negative');
 	assert.equal(table.release('never-granted|desktop'), false);
+
+	clock.now = now + RELEASE_GRACE_MS + 1_000;
+	assert.equal(table.isLeased('a|desktop'), false, 'and the grace expires — the slot is reusable');
+	assert.equal(table.grant('a|desktop', { dueMinute: 2, leaseExpiryMs: clock.now + MINUTE }), true);
+	assert.equal(table.occupancy(), 1, 'a re-grant counts once');
+});
+
+test('a release cannot cut short a lease another key has since taken over the slot', () => {
+	// The old publish order CAS'd hashLo to 0 and only THEN zeroed the expiry, so a grant landing in
+	// between had its brand-new lease silently zeroed. Release writes no hashLo at all now.
+	const now = 1_700_000_000_000;
+	const { table, clock } = harness({ slots: 1, now });
+
+	table.grant('first|desktop', { dueMinute: 1, leaseExpiryMs: now + MINUTE });
+	clock.now = now + 2 * MINUTE; // first|desktop's lease expired unreleased
+	assert.equal(table.grant('second|desktop', { dueMinute: 2, leaseExpiryMs: clock.now + 10 * MINUTE }), true);
+
+	// The first key's result finally arrives, for a slot that now belongs to somebody else.
+	assert.equal(table.release('first|desktop'), false, 'the hash pair no longer matches — nothing to release');
+	assert.equal(table.isLeased('second|desktop'), true, 'and the live lease is intact');
+	assert.deepEqual(table.leaseOf('second|desktop'), { leaseExpiresAtMs: clock.now + 10 * MINUTE, dueMinute: 2 });
 });
 
 test('re-granting the same key reuses its slot instead of consuming a second one', () => {
@@ -161,7 +196,10 @@ test('two instances over the SAME buffer see each other’s leases', () => {
 	workerB.lowerFloorTo(0);
 	assert.equal(workerA.rawFloorMinute(), 0);
 	assert.equal(workerB.release('shared|desktop'), true);
-	assert.equal(workerA.isLeased('shared|desktop'), false);
+	// Giving the lease up on one worker is visible on every worker — as "not in flight" immediately,
+	// and as "claimable" once the commit grace has passed (which is what `isLeased` answers).
+	assert.equal(workerA.leaseOf('shared|desktop'), null);
+	assert.equal(workerA.occupancy(), 0);
 });
 
 // ---- capacity ----
@@ -243,6 +281,44 @@ test('scanLive reports the oldest live lease and reconciles the occupancy gauge'
 	assert.equal(table.occupancy(), 2, 'the gauge is best-effort and still says 2');
 	assert.equal(table.scanLive().count, 1);
 	assert.equal(table.occupancy(), 1, 'and the walk reconciled it');
+});
+
+test('the occupancy gauge is only ever HIGH — a late release of an expired lease cannot pull it below the live count', () => {
+	// THE DIRECTION MATTERS ENORMOUSLY. `occupancy()` sizes the claim pass's read past the in-flight
+	// pile (grantLimit + occupancy + grantLimit), so a gauge reading high costs a slightly wider scan
+	// while a gauge reading LOW makes a pass with more live leases than 2 × grantLimit grant NOTHING
+	// while a backlog exists — silently, and for as long as the drift lasts.
+	//
+	// The interleaving that used to do it: `grant` counted only never-used slots, `release`
+	// decremented unconditionally, and `scanLive` stored the live count. So every lease that expired
+	// without a result and was released LATE (the result arrives after the lease ran out — routine)
+	// left an unmatched −1 behind the reconciliation. Measured with 150 grants and 100 expired: the
+	// gauge read 0 with 50 leases genuinely in flight.
+	const now = 1_700_000_000_000;
+	const { table, clock } = harness({ slots: 512, now });
+
+	const expiring = [];
+	const holding = [];
+	for (let i = 0; i < 150; i++) {
+		const key = `https://www.example.com/p${i}|desktop`;
+		const keeps = i % 3 === 0;
+		if (!table.grant(key, { dueMinute: 100 + i, leaseExpiryMs: now + (keeps ? 10 : 1) * MINUTE })) continue;
+		(keeps ? holding : expiring).push(key);
+	}
+	assert.ok(holding.length > 40 && expiring.length > 80, 'precondition: a real pile in both states');
+	assert.equal(table.occupancy(), holding.length + expiring.length);
+
+	// Two minutes on: the short leases have expired with no result posted, and a console read (the
+	// admin overview, an explain, a peer schedule request) reconciles the gauge down to the live set.
+	clock.now = now + 2 * MINUTE;
+	assert.equal(table.scanLive().count, holding.length);
+	assert.equal(table.occupancy(), holding.length);
+
+	// NOW the late results arrive for every expired lease.
+	for (const key of expiring) table.release(key);
+
+	assert.equal(table.occupancy(), holding.length, 'releasing an already-expired lease decrements nothing');
+	assert.equal(table.scanLive().count, holding.length, 'and the walk agrees — the two never disagree');
 });
 
 // ---- the claim floor ----
@@ -351,6 +427,28 @@ test('a funnel lowering marks the earliest-due hint so status can flip with no s
 	table.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
 	table.lowerFloorTo(0);
 	assert.equal(table.readPassOutcome().earliestNotYetDueMinute, 1);
+});
+
+test('a pass STORES its own horizon — a LATER one replaces an earlier mark, so the status cannot latch', () => {
+	// The pass drained every row from the floor up to the first future one, so it is authoritative
+	// about the whole window: a horizon that has moved later means the row that used to name it has
+	// rendered. Under the CAS-min this replaced, that later horizon was discarded — so once the
+	// recorded minute arrived, `deriveQueueStatus` answered `queued` for the life of the buffer while
+	// `claim` answered `empty`, the node rewrote the replicated QueueStatus row about twice a minute,
+	// and no consumer in the fleet ever reached its idle interval.
+	const { table } = harness();
+	const M = 28_000_000;
+
+	table.recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: M + 1 });
+	assert.equal(table.readPassOutcome().earliestNotYetDueMinute, M + 1);
+
+	// That row rendered and is now a day out; the next pass sees nothing due and a much later horizon.
+	table.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: M + 1440 });
+	assert.deepEqual(table.readPassOutcome(), { sawDue: false, earliestNotYetDueMinute: M + 1440 });
+
+	// And a pass that reached no future row at all clears the mark, as it always did.
+	table.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	assert.equal(table.readPassOutcome().earliestNotYetDueMinute, 0);
 });
 
 test('a size mismatch derives the slot count from the buffer instead of indexing past it', () => {

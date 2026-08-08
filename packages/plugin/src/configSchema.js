@@ -590,10 +590,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'never moved, so a lost lease simply means the job is granted again (which does mean a restart ' +
 				'produces a short duplicate-render burst for whatever was in flight).\n\n' +
 				'THIS IS A LATENCY KNOB, NOT ONLY A RETRY KNOB. The claim scan starts from a floor that cannot ' +
-				'advance past the oldest in-flight lease (see queue.claimFloor), so one wedged job holds the ' +
-				'floor for a full lease and everything behind it waits that long. `render.failureRetry` ' +
-				'multiplies it: the fast-retry lane deliberately holds its lease, so `fastRetries: 2` can pin ' +
-				'the floor for 2 leases, and during a broad origin 5xx event every job takes that lane at once.\n\n' +
+				'advance past the oldest DUE ROW (see queue.claimFloor), and everything behind that row waits. ' +
+				'`render.failureRetry` multiplies this lease: the fast-retry lane deliberately holds it, so ' +
+				'`fastRetries: 2` pins the floor for 2 leases before the slow lane writes the row forward, and ' +
+				'during a broad origin 5xx event every job takes that lane at once.\n\n' +
+				'A LEASE EXPIRING DOES NOT LIFT THE PIN, so “one wedged render costs one lease” is not true. ' +
+				'Claiming writes nothing to the schedule row, so a render that never posts a result leaves the ' +
+				'row due at the same minute and every later pass derives the same floor from it — indefinitely. ' +
+				'The periodic reset cannot recover it either, because that row is the oldest due row it would ' +
+				'then re-derive from. Only writing the row forward or deleting it lifts the pin, and the ' +
+				'generic-failure path (a renderer crash, navigation timeout or settle failure on a URL that ' +
+				'still has a target) holds the lease and writes no row. Watch “Claim floor lag” on the overview ' +
+				'— it names the row holding the floor — and repair or delete that URL.\n\n' +
 				'The minimum is two minutes because the render fleet DISCARDS any granted job with under 30 ' +
 				'seconds of lease left. Below roughly 90s the fleet skips 100% of granted jobs and the queue ' +
 				'live-locks: claims keep succeeding, nothing ever renders, and the plugin sees only healthy ' +
@@ -630,8 +638,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'degraded from 0.36ms to 6.25ms over 40,000 reschedules — linear, position-dependent (churn away ' +
 				'from the seek point was free), and it did not recover after the churn stopped. With the floor, ' +
 				'the identical 20 keys come back in 0.43ms.\n\n' +
-				'WHAT IT COSTS: the floor cannot advance past the oldest in-flight lease, so one wedged render ' +
-				'holds it for a full queue.jobLeaseTime and everything behind it waits. A due time written BELOW ' +
+				'WHAT IT COSTS: the floor cannot advance past the oldest DUE ROW, and only that row’s own result ' +
+				'moves it — a lease expiring does not, because claiming writes nothing to the row. So a render ' +
+				'that never posts a result pins the floor at its minute until the row is written forward or ' +
+				'deleted (see queue.jobLeaseTime), and everything behind it waits. A due time written BELOW ' +
 				'the floor would never be read again, which is why every schedule write inside the plugin goes ' +
 				'through one funnel that lowers the floor with the write, why the floor is held a guard band ' +
 				'behind the current minute, and why it is periodically reset.',
@@ -682,7 +692,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'jobs than asked, with a warning naming the occupancy.\n\n' +
 				'Restart-scoped: the buffer is sized once by the first allocation in the process, so a live ' +
 				'change would give workers within one generation differently-sized views of the same named ' +
-				'buffer.',
+				'buffer. It is read at FIRST USE (the first claim or lease operation) rather than at module ' +
+				'load, which is what makes a restart actually honour it: read at load it preceded the host’s ' +
+				'options being applied, so this option had no effect at all and the size mismatch it warns ' +
+				'about could not be detected.',
 			{ min: 1, scope: 'restart' }
 		),
 		claimScanCap: option(

@@ -49,6 +49,20 @@
  * lane across restarts, which is worse, and re-adding an `@updatedTime` column to detect
  * "recently claimed" would re-add the very write this change removes.
  *
+ * RELEASING A LEASE SHORTENS IT TO A GRACE; IT NEVER FREES THE SLOT ON THE SPOT. The result path
+ * releases from a `finally` inside the request handler, and the reschedule it just issued is a
+ * `Table.put` with no explicit context — i.e. it joined the AMBIENT transaction, which commits after
+ * the handler's promise settles. So at the moment the lease is given up, committed state still shows
+ * the row at its original overdue due time, at the head of the floored scan, and `claim` (which does
+ * not share the result path's mutex) can grant it a second time. The window is one commit, on every
+ * single result — the design accepts duplicate grants at worker-generation frequency, not at render
+ * frequency, and the duplicate costs a wasted render plus, on a failing key, a second strike toward
+ * `maxStrikes`. So `release` sets the expiry to `now + RELEASE_GRACE_MS` instead: the key stays
+ * unclaimable for a few seconds while the transaction becomes visible, and the slot is then reused
+ * exactly like any expired one. It costs nothing — the floor derivation never reads a slot (see
+ * util/renderSchedule.js), and by then the row is forward-dated, so a lingering slot pins nothing.
+ * Committing the transaction early instead is NOT an option: the request wrapper commits again.
+ *
  * The floor, by contrast, is NOT persisted for a reason that is easy to get backwards:
  * restart-zeroing is the single accidental self-heal that every stranding bug in this design
  * depends on. `floor = 0` means "seek from the absolute minimum", i.e. exactly the pre-v0.35.0
@@ -87,6 +101,27 @@ const S_HI = 1;
 const S_EXPIRES = 2;
 const S_DUE = 3;
 const SLOT_INT32 = 4;
+
+/**
+ * `dueMinute` of a slot whose lease has been RELEASED and is only sitting out its
+ * commit-visibility grace (see the module comment). A real due minute is minutes-since-the-epoch,
+ * so it can never be negative — this is a marker, not a value in the same space.
+ *
+ * It is what separates the two questions a slot answers. "Is this key claimable?" is `isLeased`,
+ * which is about the EXPIRY alone and stays true through the grace: that is the whole point.
+ * "Is this key being rendered right now?" is `leaseOf` and the occupancy gauge, and the answer for
+ * a released lease is no. Conflating them would either re-open the duplicate-grant window or make
+ * the console report every just-finished render as in flight.
+ */
+const DUE_RELEASED = -1;
+
+/**
+ * How long a released lease keeps its key unclaimable, covering the visibility gap between the
+ * result path releasing and its transaction committing. Whole seconds (expiries are stored in
+ * seconds, rounded up), and short next to the two-minute `queue.jobLeaseTime` minimum. Not a config
+ * option: it is a property of Harper's commit timing, not of a deployment.
+ */
+export const RELEASE_GRACE_MS = 5_000;
 
 /**
  * Probe length for the open-addressed table. Bounded rather than "probe until an empty slot"
@@ -157,6 +192,23 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		return { found, free };
 	};
 
+	/**
+	 * A slot the OCCUPANCY GAUGE counts: a live lease that has not been released. The gauge exists to
+	 * size the claim pass's read past the in-flight pile, so this predicate is the one thing `grant`,
+	 * `release` and `scanLive` must all agree on — they used to disagree, and the gauge could read 0
+	 * with leases genuinely in flight (`grant` incremented only when it took a never-used slot, while
+	 * `release` decremented unconditionally, so every lease that EXPIRED and was released late left an
+	 * unmatched −1 behind `scanLive`'s reconciliation). `occupancy()` reading low is not cosmetic: it
+	 * collapses the claim scan window to `2 × grantLimit`, and a pass with more live leases than that
+	 * grants NOTHING while a backlog exists.
+	 */
+	const isCounted = (at, nowSec) =>
+		Atomics.load(i32, at + S_LO) !== 0 &&
+		isLive(Atomics.load(i32, at + S_EXPIRES), nowSec) &&
+		Atomics.load(i32, at + S_DUE) !== DUE_RELEASED;
+
+	/** "Is this key claimable?" — the expiry alone, so a released lease still blocks through its
+	 *  grace. See DUE_RELEASED for why this is deliberately not the same question as `leaseOf`. */
 	const isLeased = (cacheKey) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
@@ -165,15 +217,19 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		return isLive(Atomics.load(i32, base(found) + S_EXPIRES), nowSec);
 	};
 
+	/** "Is this key being rendered right now, and since when?" — observability, so a lease sitting
+	 *  out its release grace reads as no lease at all. */
 	const leaseOf = (cacheKey) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
 		const { found } = locate(lo, hi, nowSec);
 		if (found === -1) return null;
 		const at = base(found);
-		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
-		if (!isLive(expiresSec, nowSec)) return null;
-		return { leaseExpiresAtMs: fromExpiresSec(expiresSec), dueMinute: Atomics.load(i32, at + S_DUE) };
+		if (!isCounted(at, nowSec)) return null;
+		return {
+			leaseExpiresAtMs: fromExpiresSec(Atomics.load(i32, at + S_EXPIRES)),
+			dueMinute: Atomics.load(i32, at + S_DUE),
+		};
 	};
 
 	/**
@@ -199,40 +255,77 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 
 		const at = base(slot);
 		const observedLo = Atomics.load(i32, at + S_LO);
+		// Read BEFORE the payload stores below overwrite it. The only way this slot is already
+		// counted is that it holds a live, unreleased lease for THIS key (`free` never selects a live
+		// slot), i.e. a renewal — which must not count twice. Every other case (empty, expired, or
+		// released and inside its grace) is a new live lease and a genuine +1.
+		const renewingCounted = isCounted(at, nowSec);
 		Atomics.store(i32, at + S_HI, hi);
 		Atomics.store(i32, at + S_EXPIRES, toExpiresSec(leaseExpiryMs));
-		Atomics.store(i32, at + S_DUE, dueMinute | 0);
+		// Clamped at 0 so a caller's junk value can never land on the DUE_RELEASED marker.
+		Atomics.store(i32, at + S_DUE, Math.max(0, dueMinute | 0));
 		if (Atomics.compareExchange(i32, at + S_LO, observedLo, lo) !== observedLo) return false;
-		if (observedLo === 0) Atomics.add(i32, H_OCCUPANCY, 1);
+		if (!renewingCounted) Atomics.add(i32, H_OCCUPANCY, 1);
 		return true;
 	};
 
 	/**
-	 * Release the lease for `cacheKey`. Idempotent; false when this key does not hold one.
+	 * Give up the lease for `cacheKey`: the key stops counting as in flight immediately and becomes
+	 * claimable again once its `RELEASE_GRACE_MS` grace has passed. Idempotent; false when this key
+	 * holds no lease to give up.
 	 *
-	 * Keyed on the hash pair, never on a slot index remembered from earlier: the slot a key
-	 * hashed to can have been recycled by another key in between, and clearing it by index would
-	 * silently free somebody else's lease.
+	 * The slot is deliberately NOT published free — see the module comment on the commit-visibility
+	 * grace. That also removes the old publish-order hazard here: this used to CAS `hashLo` to 0 and
+	 * only THEN zero the expiry, so a `grant` that took the slot in between had its brand-new lease
+	 * silently zeroed. Nothing in this function writes `hashLo` any more, and the one payload word it
+	 * does write is CAS'd against the value it read.
+	 *
+	 * Keyed on the hash pair, never on a slot index remembered from earlier: the slot a key hashed to
+	 * can have been recycled by another key in between, and clearing it by index would silently free
+	 * somebody else's lease.
 	 */
 	const release = (cacheKey) => {
 		const { lo, hi } = lease64(cacheKey);
-		const { found } = locate(lo, hi, nowSecond());
+		const nowSec = nowSecond();
+		const { found } = locate(lo, hi, nowSec);
 		if (found === -1) return false;
 		const at = base(found);
 		if (Atomics.load(i32, at + S_HI) !== hi) return false;
-		if (Atomics.compareExchange(i32, at + S_LO, lo, 0) !== lo) return false;
-		Atomics.store(i32, at + S_EXPIRES, 0);
-		Atomics.sub(i32, H_OCCUPANCY, 1);
+
+		// ONE release per lease, claimed with a CAS on the due-minute word. Two results for one key is
+		// a documented case (the restart duplicate-render burst), and without this claim the second
+		// would decrement the occupancy gauge for a grant that was only ever counted once.
+		const dueMinute = Atomics.load(i32, at + S_DUE);
+		if (dueMinute === DUE_RELEASED) return false;
+		const wasCounted = isCounted(at, nowSec);
+		if (Atomics.compareExchange(i32, at + S_DUE, dueMinute, DUE_RELEASED) !== dueMinute) return false;
+
+		// Shorten to the grace, never lengthen (a lease that already expired stays expired), and only
+		// if the expiry is still the one that was read — a `grant` that recycled this slot must not
+		// have its fresh lease cut short.
+		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
+		const graceSec = toExpiresSec(now() + RELEASE_GRACE_MS);
+		if (graceSec < expiresSec) Atomics.compareExchange(i32, at + S_EXPIRES, expiresSec, graceSec);
+		if (wasCounted) Atomics.sub(i32, H_OCCUPANCY, 1);
 		return true;
 	};
 
+	// Best-effort and reconciled by `scanLive`, but ONLY EVER HIGH: `grant`/`release` are exact about
+	// `isCounted`, so the sole drift is a lease that expired without a result, which reads as one
+	// extra in-flight job until the next full walk. High is the safe direction — it widens the claim
+	// pass's scan window; low silently stops it granting.
 	const occupancy = () => Math.max(0, Atomics.load(i32, H_OCCUPANCY));
 
 	/**
-	 * Full slot walk: live count, oldest expiry, and the due minute that oldest lease is holding
+	 * Full slot walk: in-flight count, oldest expiry, and the due minute that oldest lease is holding
 	 * the floor at. O(slots) — for the admin console only, never the claim path. Reconciles the
-	 * best-effort occupancy gauge on the way past, so a lost increment/decrement (a stomped CAS,
-	 * a lease that expired rather than being released) self-corrects.
+	 * best-effort occupancy gauge on the way past, so a lease that expired rather than being released
+	 * (or a stomped CAS) self-corrects instead of inflating the gauge forever.
+	 *
+	 * It counts EXACTLY what `grant`/`release` maintain — `isCounted`, i.e. live and not released.
+	 * Storing anything else here is what made the gauge driftable in both directions: a walk that
+	 * counted a different population left the next `release` decrementing something this store had
+	 * already taken out.
 	 */
 	const scanLive = () => {
 		const nowSec = nowSecond();
@@ -241,9 +334,8 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 		let oldestDueMinute = null;
 		for (let slot = 0; slot < slotCount; slot++) {
 			const at = base(slot);
-			if (Atomics.load(i32, at + S_LO) === 0) continue;
+			if (!isCounted(at, nowSec)) continue;
 			const expiresSec = Atomics.load(i32, at + S_EXPIRES);
-			if (!isLive(expiresSec, nowSec)) continue;
 			count++;
 			if (oldestExpiresSec === null || expiresSec < oldestExpiresSec) {
 				oldestExpiresSec = expiresSec;
@@ -330,24 +422,27 @@ export const createLeaseTable = ({ buffer, slots = leaseSlotsIn(buffer.byteLengt
 
 	const resetFloor = () => Atomics.store(i32, H_FLOOR, 0);
 
+	/**
+	 * Record what one claim pass saw: whether anything was due, and the minute of the earliest
+	 * NOT-YET-DUE row it reached (0 = it reached none).
+	 *
+	 * A STORE, NOT A CAS-MIN, and that is the fix for a latch. The pass drained every row from the
+	 * floor up to the first future one, so it is authoritative about the whole window — including the
+	 * case that matters, a horizon that has moved LATER because the row that used to name it has since
+	 * rendered. Under a CAS-min that later horizon was discarded, so once a recorded minute arrived
+	 * `deriveQueueStatus` answered `queued` for the life of the buffer while `claim` kept answering
+	 * `empty`: the node flapped, rewrote the replicated `QueueStatus` row about twice a minute, and no
+	 * consumer in the fleet ever reached its idle interval.
+	 *
+	 * The CAS-min stays where it belongs, in `lowerFloorTo`: a funnel write is authoritative about its
+	 * OWN row and nothing else, so it may only pull the mark earlier. The price of the store is that a
+	 * funnel write racing the exact end of a pass can lose its mark — one `statusSyncInterval` of
+	 * reporting `empty`, and every such writer also calls `QueueState.reportStatus('queued')` itself.
+	 * The FLOOR half of that write, which is the correctness half, is a CAS-min and cannot be lost.
+	 */
 	const recordPassOutcome = ({ sawDue, earliestNotYetDueMinute } = {}) => {
 		Atomics.store(i32, H_SAW_DUE, sawDue ? 1 : 0);
-		const mark = Math.max(0, earliestNotYetDueMinute | 0);
-		if (mark === 0) {
-			Atomics.store(i32, H_EARLIEST_NOT_DUE, 0);
-			return;
-		}
-		// CAS-min, not a store: a funnel write during this pass may have marked something
-		// earlier, and that mark is the only reason the next status recompute knows there is work.
-		// (A write racing the exact end of a pass can still lose its mark; it costs one
-		// `statusSyncInterval` of reporting `empty`, and every such writer also calls
-		// `QueueState.reportStatus('queued')` itself. The FLOOR half of a funnel write — the
-		// correctness half — cannot be lost, because it is a CAS-min too.)
-		for (;;) {
-			const current = Atomics.load(i32, H_EARLIEST_NOT_DUE);
-			if (current !== 0 && current <= mark) break;
-			if (Atomics.compareExchange(i32, H_EARLIEST_NOT_DUE, current, mark) === current) break;
-		}
+		Atomics.store(i32, H_EARLIEST_NOT_DUE, Math.max(0, earliestNotYetDueMinute | 0));
 	};
 
 	const readPassOutcome = () => ({

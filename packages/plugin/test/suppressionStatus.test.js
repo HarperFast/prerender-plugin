@@ -371,7 +371,10 @@ test('past fastRetries, a failure drops to the target cadence — page kept but 
 	// The slow lane RELEASES the lease. Holding it would pin the claim floor for a full jobLeaseTime
 	// for a row that is now hours in the future — a latency cost for nothing.
 	assert.equal(leased(key(A)), false, 'the slow lane releases the lease');
-	assert.deepEqual(await claim(), [], 'and the immediate re-claim is refused BY THE DUE TIME, not by a lease');
+	// Refused by the DUE TIME — the row is hours out. (A released lease also keeps its key
+	// unclaimable for its commit-visibility grace, which is why this cannot be asserted the other way
+	// round; the due time is the thing that holds past the grace.)
+	assert.deepEqual(await claim(), [], 'and the immediate re-claim is refused by the due time, not by a lease');
 
 	const page = stores.prerenderedPage.get(key(A));
 	assert.equal(page.content, 'old html', 'page survives');
@@ -467,4 +470,35 @@ test('a BigInt strikes value (Harper numeric surfacing) still counts toward the 
 
 	assert.equal(stores.target.get(A).strikes, fast + 1, 'BigInt count read correctly, not reset to 1');
 	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'transitioned to the slow lane');
+});
+
+// ---- a THROW out of result handling ----
+
+test('a throw while handling a result HOLDS the lease — it must not become a re-render loop', async () => {
+	// `holdLease` is only set by branches that ran to completion, so a throw used to release. That is
+	// the worst case to release on: the throw propagates out of the request handler, Harper ABORTS the
+	// ambient transaction, and everything this result had written — the cached page included — is
+	// rolled back. The row keeps its original overdue due time, and the claim floor is at or below its
+	// minute by construction, so a freed lease means the next pass re-grants it seconds later: an
+	// UNPACED re-render loop against whatever is throwing, at claim frequency rather than once per
+	// lease.
+	//
+	// The throw here is a real one, not an injected stub: a rendered result with content but no
+	// `headers` object, which the store path stamps `x-harper-rendered` onto.
+	seedSource();
+	const claimed = await claim();
+	assert.ok(
+		claimed.some((job) => job.id === key(A)),
+		'precondition: claimed, so there is a lease to hold'
+	);
+
+	await assert.rejects(
+		() => postResult({ id: key(A), url: A, statusCode: 200, outcome: 'rendered' }, 'fresh html'),
+		/x-harper-rendered/,
+		'the failure must surface (a 500), not be swallowed'
+	);
+
+	assert.equal(leased(key(A)), true, 'the lease is HELD, so the retry is paced by queue.jobLeaseTime');
+	assert.deepEqual(await claim(), [], 'and an immediate re-claim grants nothing');
+	assert.equal(stores.renderSchedule.get(key(A)).nextRenderTime, 1, 'the row was never moved — nothing else paces it');
 });

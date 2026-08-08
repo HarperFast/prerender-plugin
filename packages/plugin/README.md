@@ -451,12 +451,24 @@ stopped). With the floor the same 20 keys come back in 0.43 ms.
 The floor advances to **the first due row a pass observed**, which is the same thing as
 `min(last granted, oldest in-flight lease)`. So:
 
-- **`queue.jobLeaseTime` is now a latency knob.** The floor cannot advance past the oldest in-flight
-  lease, so one wedged render holds it for a full lease and everything behind it waits. The
-  fast-retry lane (`render.failureRetry.fastRetries`) deliberately holds its lease, which multiplies
-  that — and during a broad origin 5xx event _every_ job takes that lane, so no lease is released at
-  all for the duration and the claim scan degrades back toward its old cost. Watch **Claim floor
-  lag** on the overview.
+- **`queue.jobLeaseTime` is now a latency knob.** The floor cannot advance past the oldest _due row_,
+  so everything behind that row waits for it. The fast-retry lane
+  (`render.failureRetry.fastRetries`) deliberately holds its lease, which multiplies that — and
+  during a broad origin 5xx event _every_ job takes that lane, so no lease is released at all for the
+  duration and the claim scan degrades back toward its old cost. Watch **Claim floor lag** on the
+  overview; it names the row holding the floor.
+- **A lease expiring does _not_ lift the pin.** Claiming writes nothing to the schedule row, so a
+  render that never posts a result leaves the row due at the same minute, and every later pass
+  derives the same floor from it — until something writes that row forward or deletes it. The
+  periodic floor reset cannot recover it either: that row _is_ the oldest due row the reset would
+  re-derive from. The generic-failure path (renderer crash, navigation timeout, settle failure on a
+  URL that still has a target) has exactly this shape — it holds the lease and writes no row — so one
+  permanently failing URL pins the floor indefinitely and dead index entries accumulate above it at
+  the full render rate. That is why the floor lag names the row: repair or delete that URL (deleting
+  is safe — bots proxy to the origin and discovery re-creates whatever it serves). Making the pin
+  bounded means routing that path through the strike-counted retry lanes, which is deliberately not
+  in this release: those strikes are the shared target counter that suppression and redirect
+  verdicts retire targets on.
 - **A due time written below the floor is never claimed again.** Every schedule write inside the
   plugin goes through one funnel ([`src/util/renderSchedule.js`](src/util/renderSchedule.js)) that
   lowers the floor with the write, and the floor is held `queue.claimFloor.guard` behind the current
@@ -561,8 +573,9 @@ execute it against the operator's super-user session.
   reason.
 
   **Claim floor lag** and **In flight** are live O(1) reads of the node-local shared buffer, and
-  are labelled as such. A lag well past one `queue.jobLeaseTime` means a wedged render is pinning
-  the floor and everything behind it is waiting. A **Below claim floor** alarm means rows have been
+  are labelled as such. A lag well past one `queue.jobLeaseTime` means a render is pinning the floor
+  and everything behind it is waiting; the lag's subtitle names the row (as last observed by the
+  worker serving the page — the claim pass is the only thing that sees it). A **Below claim floor** alarm means rows have been
   filed where no claim will look — see "The claim floor".
 
   The backlog/histogram is a **cached snapshot**, not a page-load query. Since v0.35.0 it is also

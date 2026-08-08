@@ -334,11 +334,11 @@ test('every write shape lowers the floor only when it should', async () => {
 
 	for (const [what, nextRenderTime, shouldLower] of cases) {
 		funnel.resetRenderQueueState();
-		assert.equal(funnel.leaseTable.advanceFloor(0, nowMinute), true, 'precondition: establish a floor');
+		assert.equal(funnel.leaseTable().advanceFloor(0, nowMinute), true, 'precondition: establish a floor');
 
 		await funnel.writeSchedule('k|desktop', { nextRenderTime, fromSitemap: false });
 
-		const raw = funnel.leaseTable.rawFloorMinute();
+		const raw = funnel.leaseTable().rawFloorMinute();
 		if (shouldLower) {
 			assert.ok(raw <= minuteOf(nextRenderTime), `${what} must lower the floor to cover its own row (got ${raw})`);
 		} else {
@@ -350,7 +350,7 @@ test('every write shape lowers the floor only when it should', async () => {
 test('writeSchedules lowers ONCE, with the batch minimum', async () => {
 	funnel.resetRenderQueueState();
 	const nowMinute = minuteOf(T0);
-	funnel.leaseTable.advanceFloor(0, nowMinute);
+	funnel.leaseTable().advanceFloor(0, nowMinute);
 
 	await funnel.writeSchedules([
 		{ cacheKey: 'a|desktop', nextRenderTime: T0 + 90 * MINUTE, fromSitemap: false },
@@ -358,7 +358,7 @@ test('writeSchedules lowers ONCE, with the batch minimum', async () => {
 		{ cacheKey: 'c|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false },
 	]);
 
-	assert.equal(funnel.leaseTable.rawFloorMinute(), minuteOf(T0 - 3 * MINUTE), 'the batch minimum, not the last row');
+	assert.equal(funnel.leaseTable().rawFloorMinute(), minuteOf(T0 - 3 * MINUTE), 'the batch minimum, not the last row');
 });
 
 test('a write BELOW the floor is claimable on the very next pass', async () => {
@@ -448,18 +448,126 @@ test('an in-flight pile larger than the scan cap grants zero but reports QUEUED,
 	assert.equal(result.jobs.length, 0, 'the cap is consumed by leased rows');
 	assert.equal(result.scanTruncated, true);
 	assert.equal(result.sawDue, true, 'and the pass KNOWS there is work');
-	funnel.leaseTable.recordPassOutcome({ sawDue: result.sawDue, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: result.sawDue, earliestNotYetDueMinute: 0 });
 	assert.equal(funnel.deriveQueueStatus(T0), 'queued');
+});
+
+test('a FULL scan window that reached a not-yet-due row is NOT truncated — the healthy node must not warn', async () => {
+	// The query is deliberately ONE-SIDED, so on any real corpus every row above the floor matches and
+	// the window fills on a perfectly caught-up node: `rows.length >= scanLimit` alone was true
+	// essentially always, and the warning it drove ("look for wedged renders holding the claim floor")
+	// fired once per claim per worker on an IDLE node and went quiet exactly when the node was busy.
+	// Reaching a not-yet-due row PROVES there was nothing more to grant beyond the window.
+	const h = harness({
+		rows: [
+			row('due|desktop', T0 - MINUTE),
+			row('soon0|desktop', T0 + MINUTE),
+			row('soon1|desktop', T0 + 2 * MINUTE),
+			row('soon2|desktop', T0 + 3 * MINUTE),
+			row('soon3|desktop', T0 + 4 * MINUTE),
+		],
+	});
+
+	const result = await h.pass({ grantLimit: 1, scanCap: 2 });
+
+	assert.equal(result.scanned, result.scanLimit, 'the window is full');
+	assert.equal(result.earliestNotYetDueMinute, minuteOf(T0 + MINUTE), 'and a not-yet-due row was reached');
+	assert.equal(result.scanTruncated, false, 'so nothing was cut off');
+
+	// The genuinely truncated case: the whole window is due work and the drain never got past it.
+	const busy = harness({ rows: Array.from({ length: 10 }, (_, i) => row(`k${i}|desktop`, T0 - (10 - i) * MINUTE)) });
+	const truncated = await busy.pass({ grantLimit: 1, scanCap: 3 });
+	assert.equal(truncated.earliestNotYetDueMinute, 0);
+	assert.equal(truncated.scanTruncated, true);
+});
+
+// ---- naming the row that holds the floor ----
+
+test('the pass NAMES the row holding the floor, and the funnel remembers it for the console', async () => {
+	// `claim` writes nothing to the table, so a row whose result never arrives keeps its due minute and
+	// every later pass derives the same floor from it — not for one lease, but until something moves or
+	// deletes that row. The floor reset cannot recover it either: that row IS the oldest due row it
+	// would re-derive from. So the key has to be reportable, or an operator has a lag figure and no way
+	// to find the URL behind it.
+	const h = harness({
+		rows: [row('wedged|desktop', T0 - 30 * MINUTE), row('healthy|desktop', T0 - MINUTE)],
+	});
+	h.leases.grant('wedged|desktop', { dueMinute: minuteOf(T0 - 30 * MINUTE), leaseExpiryMs: T0 + 5 * MINUTE });
+
+	const result = await h.pass({ grantLimit: 5 });
+
+	assert.equal(result.floorHeldBy, 'wedged|desktop', 'the FIRST due row observed, leased or not');
+	assert.equal(result.floorTo, minuteOf(T0 - 30 * MINUTE), 'which is exactly the minute the floor sits at');
+	assert.equal(result.skippedLeased, 1);
+
+	// An empty pass names nobody rather than leaving a stale key implicating an innocent URL.
+	const idle = harness({ rows: [] });
+	assert.equal((await idle.pass()).floorHeldBy, null);
+});
+
+// ---- the commit-visibility grace ----
+
+test('a released key is NOT re-granted while its reschedule is still uncommitted', async () => {
+	// The result path releases from a `finally` inside the request handler; the reschedule it just
+	// issued commits with the AMBIENT transaction, i.e. after the handler settles. So for one commit's
+	// worth of time the committed row is still overdue and unleased, and a claim pass — on another
+	// worker, not sharing the result path's mutex — would grant it a second time. On every result.
+	// A duplicate render is wasted work; on a failing key it is also a second strike toward maxStrikes.
+	const h = harness({ rows: [row('a|desktop', T0 - MINUTE)] });
+
+	const first = await h.pass({ grantLimit: 5 });
+	assert.equal(first.jobs.length, 1);
+
+	// The result lands and releases the lease. The row is deliberately left as the fake table had it —
+	// this IS the pre-commit state.
+	h.leases.release('a|desktop');
+
+	const second = await h.pass({ grantLimit: 5 });
+	assert.equal(second.jobs.length, 0, 'no duplicate grant inside the grace');
+	assert.equal(second.skippedLeased, 1);
+	assert.equal(second.floorTo, minuteOf(T0 - MINUTE), 'and the row still holds the floor, which costs nothing');
+
+	// Once the grace is out, an uncommitted-forever row (a rolled-back transaction) is claimable again.
+	h.clock.now += lease.RELEASE_GRACE_MS + 1_000;
+	const third = await h.pass({ grantLimit: 5 });
+	assert.deepEqual(
+		third.jobs.map((job) => job.cacheKey),
+		['a|desktop']
+	);
+});
+
+test('the scan window sizes itself off the LIVE lease count, not off a gauge drained by late releases', async () => {
+	// `scanLimit` is grantLimit + occupancy + grantLimit: it exists so the pass can read PAST the
+	// in-flight pile, which keeps its overdue index position now. A gauge that reads low collapses the
+	// window to 2 × grantLimit and the pass grants nothing while a backlog exists — so what the gauge
+	// must never do is drop below the live count when results arrive after their leases expired.
+	const h = harness({ rows: [], slots: 256 });
+	const live = [];
+	const expired = [];
+	for (let i = 0; i < 60; i++) {
+		const key = `k${i}|desktop`;
+		const keeps = i % 2 === 0;
+		h.leases.grant(key, { dueMinute: minuteOf(T0) - 10, leaseExpiryMs: T0 + (keeps ? 10 * MINUTE : MINUTE) });
+		(keeps ? live : expired).push(key);
+	}
+
+	h.clock.now = T0 + 2 * MINUTE; // half the leases have expired with no result
+	h.leases.scanLive(); // a console read reconciles the gauge to the live set
+	for (const key of expired) h.leases.release(key); // ...and then the late results arrive
+
+	const result = await h.pass({ grantLimit: 20 });
+	assert.equal(result.occupancy, live.length, 'the gauge still knows about every live lease');
+	assert.equal(result.scanLimit, 20 + live.length + 20, 'so the window still reads past the pile');
 });
 
 // ---- the tri-state status ----
 
 test('derived status: granted > 0 → queued, granted 0 with due rows → queued, no due rows → empty', async () => {
 	funnel.resetRenderQueueState();
-	funnel.leaseTable.recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
 	assert.equal(funnel.deriveQueueStatus(T0), 'queued');
 
-	funnel.leaseTable.recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
 	assert.equal(funnel.deriveQueueStatus(T0), 'empty');
 });
 
@@ -471,12 +579,51 @@ test('a row that was in the future flips the status to queued with ZERO searches
 	assert.equal(result.sawDue, false);
 	assert.equal(result.earliestNotYetDueMinute, minuteOf(T0 + 5 * MINUTE));
 
-	funnel.leaseTable.recordPassOutcome(result);
+	funnel.leaseTable().recordPassOutcome(result);
 	assert.equal(funnel.deriveQueueStatus(T0), 'empty');
 
 	const searchesBefore = h.searches.length;
 	assert.equal(funnel.deriveQueueStatus(T0 + 5 * MINUTE), 'queued', 'the minute arrived');
 	assert.equal(h.searches.length, searchesBefore, 'and nothing was scanned to find that out');
+});
+
+test('...and once that row has rendered, the status goes back to EMPTY — the mark does not latch queued', async () => {
+	// The full flap, driven through two real passes. The earliest-due mark used to be CAS-MIN'd, so a
+	// later horizon was discarded and the mark stayed at a minute that had already arrived: this node
+	// answered `queued` forever from `deriveQueueStatus` (the status sync, twice a minute, rewriting
+	// the replicated QueueStatus row) while `claim` kept answering `empty` from the same pass — and no
+	// consumer in the fleet reached its idle interval again until a restart.
+	// A second row further out matters: it means every pass reaches SOME not-yet-due row, so the mark is
+	// never cleared by the `earliestNotYetDueMinute === 0` case and the only thing that can move it
+	// later is the pass being authoritative.
+	const h = harness({ rows: [row('soon|desktop', T0 + 5 * MINUTE), row('later|desktop', T0 + 1000 * MINUTE)] });
+
+	funnel.leaseTable().recordPassOutcome(await h.pass());
+	assert.equal(funnel.deriveQueueStatus(T0 + 5 * MINUTE), 'queued', 'precondition: the minute arrives');
+
+	// It comes due, is granted, renders, and is rescheduled a day out.
+	h.clock.now = T0 + 5 * MINUTE;
+	const claimed = await h.pass();
+	assert.deepEqual(
+		claimed.jobs.map((job) => job.cacheKey),
+		['soon|desktop']
+	);
+	funnel.leaseTable().recordPassOutcome(claimed);
+	h.table.set('soon|desktop', row('soon|desktop', h.clock.now + 24 * 60 * MINUTE));
+	h.leases.release('soon|desktop');
+
+	// The next pass sees nothing due and a horizon a day out — LATER than the mark on record.
+	h.clock.now += MINUTE;
+	const idle = await h.pass();
+	assert.equal(idle.sawDue, false);
+	funnel.leaseTable().recordPassOutcome(idle);
+
+	assert.equal(funnel.deriveQueueStatus(h.clock.now), 'empty', 'the queue really is empty, and says so');
+	assert.equal(
+		funnel.leaseTable().readPassOutcome().earliestNotYetDueMinute,
+		idle.earliestNotYetDueMinute,
+		'the mark is the LATEST pass’s own horizon, a day out — not the earliest ever recorded'
+	);
 });
 
 // ---- the drain discipline ----
@@ -633,12 +780,12 @@ test('deleteSchedule lowers nothing and releases nothing', async () => {
 	// the funnel primitive.)
 	funnel.resetRenderQueueState();
 	const nowMinute = minuteOf(T0);
-	funnel.leaseTable.advanceFloor(0, nowMinute);
-	funnel.leaseTable.grant('gone|desktop', { dueMinute: 1, leaseExpiryMs: Date.now() + 10 * MINUTE });
+	funnel.leaseTable().advanceFloor(0, nowMinute);
+	funnel.leaseTable().grant('gone|desktop', { dueMinute: 1, leaseExpiryMs: Date.now() + 10 * MINUTE });
 
 	await funnel.deleteSchedule('gone|desktop');
 
-	assert.equal(funnel.leaseTable.rawFloorMinute(), nowMinute, 'a vanished row strands nothing — no lowering');
+	assert.equal(funnel.leaseTable().rawFloorMinute(), nowMinute, 'a vanished row strands nothing — no lowering');
 	assert.ok(funnel.leaseInfo('gone|desktop'), 'and the lease is untouched');
 });
 
@@ -661,4 +808,29 @@ test('maybeResetFloor honours its interval and is a no-op at 0', () => {
 	} finally {
 		config.queue.claimFloor.resetInterval = original;
 	}
+});
+
+// ---- what the console reads ----
+
+// LAST IN THE FILE: it installs its own RenderSchedule over the global one, like the write-budget
+// test above, and does not put it back.
+test('claimSchedules records the floor-holding key where floorState (and so the console) reads it', async () => {
+	funnel.resetRenderQueueState();
+	const at = Date.now() - 5 * MINUTE;
+	globalThis.databases.render_schedule.RenderSchedule = {
+		put: async () => {},
+		delete: async () => {},
+		search: async function* ({ limit }) {
+			for (const cacheKey of ['wedged|desktop', 'next|desktop'].slice(0, limit)) {
+				yield { cacheKey, nextRenderTime: at, fromSitemap: false };
+			}
+		},
+	};
+
+	const pass = await funnel.claimSchedules({ grantLimit: 1 });
+	assert.equal(pass.floorHeldBy, 'wedged|desktop');
+
+	const state = funnel.floorState(Date.now());
+	assert.equal(state.floorHeldBy, 'wedged|desktop', 'the overview payload can name the row pinning the queue');
+	assert.ok(state.floorHeldByAt > 0, 'with the pass it came from timestamped, since it is per worker');
 });

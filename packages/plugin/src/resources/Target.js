@@ -225,8 +225,6 @@ export class Target extends TargetTable {
 	 * is ever pending while the cursor is open — see util/scan.js.
 	 */
 	static async revalidate(requestTarget) {
-		const nextRenderTime = currentMinuteMs();
-
 		// Phase 1 — read only. Just the keys; the page lookup moves to phase 2 so this walk
 		// stays as short as possible. `sitemapUrl` rides along because phase 2 needs it and a
 		// second point read per URL would double the cost of the whole sweep — see below for what
@@ -237,7 +235,12 @@ export class Target extends TargetTable {
 			truncated,
 		} = await collectFromScan({
 			scan: () => this.search(requestTarget),
-			pick: (target) => ({ url: target.url, sitemapUrl: target.sitemapUrl ?? null }),
+			// A row with no `url` is SKIPPED, which needs saying because `pick` returning an object
+			// made it stop being automatic: `collectFromScan` skips on `undefined`/`null`, and
+			// `{ url: undefined }` is neither. Such a row would reach phase 2 and build cache keys
+			// for the string "undefined" — schedule rows and a floor lowering for a URL that does
+			// not exist.
+			pick: (target) => (target.url ? { url: target.url, sitemapUrl: target.sitemapUrl ?? null } : undefined),
 		});
 
 		// Phase 2 — writes, cursor now closed. Each batch is awaited before the next starts,
@@ -246,6 +249,15 @@ export class Target extends TargetTable {
 		await applyInBatches({
 			items: urls,
 			apply: async ({ url, sitemapUrl }) => {
+				// THE CURRENT MINUTE, PER URL — never captured once for the whole sweep. Phase 2 writes
+				// up to `scan.collectCap` × devices rows with a `PrerenderedPage.get` per key, which at
+				// scale takes tens of minutes. Rows are residency-routed, so ~75% land on nodes whose
+				// claim floor this process cannot lower and which hold it at
+				// `nowMinute − queue.claimFloor.guard`: every row filed with a minute more than the guard
+				// band old lands BELOW the owner's floor and is never claimed again — silently, from a
+				// fully funnel-routed in-plugin write, and permanently where `resetInterval: 0`.
+				// `Sitemap.js` already computes it per entry for the same reason.
+				const nextRenderTime = currentMinuteMs();
 				await Promise.all(
 					cacheKeysOf(url).map(async (cacheKey) => {
 						const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });

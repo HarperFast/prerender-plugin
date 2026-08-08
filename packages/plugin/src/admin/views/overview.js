@@ -15,7 +15,23 @@
  * clocks would look authoritative and mean nothing.
  */
 
-import { ago, card, chart, duration, el, ICONS, kv, link, muted, num, pill, spacer, stat, unwired } from '../ui.js';
+import {
+	ago,
+	card,
+	chart,
+	duration,
+	el,
+	ICONS,
+	kv,
+	link,
+	muted,
+	num,
+	pill,
+	shortUrl,
+	spacer,
+	stat,
+	unwired,
+} from '../ui.js';
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
@@ -59,7 +75,13 @@ function counts(ctx, data) {
 	// in-flight render and its healthy floor is the in-flight count, not zero. The two are shown
 	// SIDE BY SIDE and never subtracted: `overdue` is a scan that may be minutes old, `inFlight` is
 	// a gauge read at request time.
-	const inFlight = Number.isFinite(backlog?.inFlight) ? backlog.inFlight : (floor.occupancy ?? null);
+	//
+	// THE LIVE GAUGE FIRST, because the tile says "live". `claimFloor.occupancy` is an atomic load
+	// taken while this payload was built; `backlog.inFlight` is the same gauge as of whenever the
+	// snapshot last ran, which can be fifteen minutes ago — it was being preferred, so a tile
+	// labelled live was showing a snapshot number. It stays as the fallback, and says so.
+	const inFlightLive = Number.isFinite(floor.occupancy);
+	const inFlight = inFlightLive ? floor.occupancy : Number.isFinite(backlog?.inFlight) ? backlog.inFlight : null;
 	const dueBeyondInFlight = backlog && !backlog.error && Number.isFinite(inFlight) && backlog.overdue - inFlight > 0;
 
 	return el('div', { cls: 'stat-grid' }, [
@@ -75,13 +97,25 @@ function counts(ctx, data) {
 					: 'no snapshot yet',
 			{ warn: dueBeyondInFlight }
 		),
-		stat('In flight', Number.isFinite(inFlight) ? num(inFlight) : '—', 'leased to a renderer · live'),
+		stat(
+			'In flight',
+			Number.isFinite(inFlight) ? num(inFlight) : '—',
+			inFlightLive ? 'leased to a renderer · live' : `leased to a renderer · snapshot ${ago(backlog?.finishedAt)}`
+		),
 		stat(
 			'Claim floor lag',
 			floor.enabled === false ? 'disabled' : Number.isFinite(floor.lagMs) ? duration(floor.lagMs) : '—',
-			floor.enabled === false ? 'queue.claimFloor.enabled is false' : 'how far back the claim scan starts · live',
-			// The floor cannot advance past the oldest in-flight lease, so a lag well past one lease
-			// means something is wedged and everything behind it is waiting.
+			floor.enabled === false
+				? 'queue.claimFloor.enabled is false'
+				: // NAME THE ROW. A lag figure alone sends an operator hunting; the floor sits at the due
+					// minute of one row, and only a claim pass can say which — so this is what this worker's
+					// last pass saw, and nothing else in the system records it.
+					floor.floorHeldBy
+					? `held by ${shortUrl(floor.floorHeldBy)} · this worker’s last claim`
+					: 'how far back the claim scan starts · live',
+			// The floor cannot advance past the oldest DUE ROW, and only that row's own result moves
+			// it — a lease expiring does not — so a lag well past one lease means a render is holding
+			// it and everything behind it is waiting. The subtitle names the row.
 			{ warn: Number.isFinite(floor.lagMs) && floor.lagMs > 2 * (data.intervals?.jobLeaseTime ?? 0) }
 		),
 		stat('Sitemaps', value(tables?.sitemaps), [link('view sitemaps →', () => ctx.go('sitemaps'))]),
