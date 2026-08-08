@@ -63,7 +63,9 @@ import { describeConfigSchema } from '../configSchema.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
-import { cacheServeStatus } from '../util/pageFreshness.js';
+import { resolveServeStatus } from '../util/pageFreshness.js';
+import { listInvalidations, epochFromActiveSet } from '../util/invalidation.js';
+import { routeScopeForUrl } from '../util/routeClass.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -746,7 +748,7 @@ export class PrerenderAdmin extends Resource {
 		// selected — this is a status view, and a cached page can be megabytes. The target row
 		// is keyed by URL and carries the suppression verdict, so one read answers both "is it
 		// in rotation" and "did a render suppress it".
-		const [target, schedule, page] = await Promise.all([
+		const [target, schedule, page, invalidations] = await Promise.all([
 			readWithTimeout('renderTarget', timedOutReads, () =>
 				Target.get({
 					id: canonicalUrl,
@@ -774,15 +776,31 @@ export class PrerenderAdmin extends Resource {
 					select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
 				})
 			),
+			// The active invalidation set, ONCE per request. Wrapped in readWithTimeout like every
+			// other read here, so a slow one degrades this view instead of hanging it.
+			readWithTimeout('invalidations', timedOutReads, async () => (await listInvalidations()).rows),
 		]);
 
+		const activeInvalidations = invalidations ?? [];
 		const suppressed = target?.state === 'suppressed';
 
 		const now = Date.now();
 		const expiresAtMs = page?.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-		// THE freshness rule the serving path applies (same function, not a copy), so this
-		// cannot disagree with what a bot would actually get.
-		const fresh = cacheServeStatus(expiresAtMs, config.page.swrTtl, now) !== null;
+		const lastCachedMs = page?.lastCached ? new Date(page.lastCached).getTime() : NaN;
+		// THE freshness rule the serving path applies (same function, not a copy), so this cannot
+		// disagree with what a bot would actually get — INCLUDING the invalidation epoch. Reporting
+		// `cached` for a page bots are being sent to the origin for is the specific divergence the
+		// `resolveServeStatus` rename exists to make impossible, and this view is where an operator
+		// looks first when asking why a URL is not being served.
+		const invalidationEpoch = epochFromActiveSet(activeInvalidations, routeScopeForUrl(canonicalUrl));
+		const serve = resolveServeStatus({
+			expiresAtMs,
+			lastCachedMs,
+			swrTtl: config.page.swrTtl,
+			now,
+			epoch: invalidationEpoch,
+		});
+		const fresh = serve.servable;
 
 		// The local schedule read was node-local. If another node owns this row, ask it — a
 		// bounded HTTPS call we control, rather than the unbounded replication fetch a plain
@@ -1012,9 +1030,16 @@ export class PrerenderAdmin extends Resource {
 		const allEntries = Array.isArray(sitemap.entries) ? sitemap.entries : [];
 		const pageOfEntries = allEntries.slice(offset, offset + limit);
 
+		// ONE read for the whole page of entries, derived per row synchronously. A per-row epoch read
+		// would double this view's cost — it is already a fan-out inside a heavy slot — and the path
+		// of least resistance would have been to pass only the cluster epoch and silently miss every
+		// route scope.
+		const activeInvalidations =
+			(await readWithTimeout('invalidations', timedOutReads, () => listInvalidations()))?.rows ?? [];
+
 		const [targetCount, entries] = await Promise.all([
 			this.countTargetsFor(url),
-			Promise.all(pageOfEntries.map((entry) => this.entryState(entry))),
+			Promise.all(pageOfEntries.map((entry) => this.entryState(entry, activeInvalidations))),
 		]);
 
 		return json({
@@ -1071,7 +1096,7 @@ export class PrerenderAdmin extends Resource {
 	 * out yields `state: null` — unknown, which the UI must render as such rather than as
 	 * "not cached".
 	 */
-	static async entryState(entry) {
+	static async entryState(entry, activeInvalidations = []) {
 		const loc = entry?.loc;
 		const base = {
 			loc: loc ?? null,
@@ -1096,7 +1121,7 @@ export class PrerenderAdmin extends Resource {
 		const [target, page] = await Promise.all([
 			readWithTimeout('renderTarget', timedOut, () => Target.get({ id: canonicalUrl, select: ['url', 'state'] })),
 			readWithTimeout('prerenderedPage', timedOut, () =>
-				PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] })
+				PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt', 'lastCached'] })
 			),
 		]);
 
@@ -1106,8 +1131,22 @@ export class PrerenderAdmin extends Resource {
 
 		if (page) {
 			const expiresAtMs = page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-			const fresh = cacheServeStatus(expiresAtMs, config.page.swrTtl, Date.now()) !== null;
-			return { ...base, cacheKey, state: fresh ? 'cached' : 'stale' };
+			const lastCachedMs = page.lastCached ? new Date(page.lastCached).getTime() : NaN;
+			// `lastCached` was added to this select for the epoch comparison. Without it this view
+			// reported `cached` while bots got the origin — and it is fanned across a whole page of
+			// sitemap entries, so it was the widest-reach instance of that divergence.
+			const serve = resolveServeStatus({
+				expiresAtMs,
+				lastCachedMs,
+				swrTtl: config.page.swrTtl,
+				now: Date.now(),
+				epoch: epochFromActiveSet(activeInvalidations, routeScopeForUrl(canonicalUrl)),
+			});
+			return {
+				...base,
+				cacheKey,
+				state: serve.servable ? 'cached' : serve.status === 'invalidated' ? 'invalidated' : 'stale',
+			};
 		}
 
 		return target
@@ -1213,6 +1252,10 @@ export class PrerenderAdmin extends Resource {
 		);
 		if (timedOut.length) return json({ error: 'page-cache read timed out' }, 504);
 
+		// ONE read for the whole page, derived per row synchronously below.
+		const activeInvalidations =
+			(await readWithTimeout('invalidations', timedOut, () => listInvalidations()))?.rows ?? [];
+
 		// The table total comes from the background snapshot, aged like the overview's counts —
 		// a browse click must not trigger a count scan.
 		const { lastRun } = await getBacklogSnapshotState();
@@ -1230,8 +1273,16 @@ export class PrerenderAdmin extends Resource {
 				lastCached: row.lastCached ? new Date(row.lastCached).getTime() : null,
 				expiresAt: Number.isFinite(expiresAtMs) ? expiresAtMs : null,
 				isIndexable: row.isIndexable ?? null,
-				// THE freshness rule the serving path applies (same function, not a copy).
-				fresh: cacheServeStatus(expiresAtMs, config.page.swrTtl, now) !== null,
+				// THE freshness rule the serving path applies (same function, not a copy), epoch
+				// included. Derived synchronously off the one active-set read above — this map is
+				// synchronous by design and a per-row read would make it a fan-out.
+				fresh: resolveServeStatus({
+					expiresAtMs,
+					lastCachedMs: row.lastCached ? new Date(row.lastCached).getTime() : NaN,
+					swrTtl: config.page.swrTtl,
+					now,
+					epoch: epochFromActiveSet(activeInvalidations, routeScopeForUrl(urlHalf)),
+				}).servable,
 				url: urlHalf || null,
 				deviceType: deviceType ?? null,
 			};

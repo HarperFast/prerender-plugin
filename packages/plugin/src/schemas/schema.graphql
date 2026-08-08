@@ -11,6 +11,8 @@
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
 #   coordination     SharedBuffer                    — node-local SAB, never replicated
+#   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
+#                                                      serve path; isolated, see the type)
 
 type SitemapEntry {
 	loc: String
@@ -130,6 +132,57 @@ type QueueControl @table(database: "render_service") @sealed @export(name: "queu
 	paused: Boolean
 	updatedTime: Date @updatedTime
 	updatedBy: String
+}
+
+# Bulk cache invalidation. "Everything of this kind is wrong as of now; stop serving it."
+#
+# ONE ROW PER SCOPE, and replicated (the default): a write on any node reaches all of them, and two
+# operators invalidating different scopes never collide — a single aggregate row would lose one of
+# them to last-write-wins.
+#
+# The mechanism is a COMPARISON, not a rewrite. Nothing in PrerenderedPage or RenderSchedule is
+# touched: the serve path asks "was this page rendered before the epoch?" and demotes it if so.
+# Measured against the alternative of rewriting the corpus (400k rows, one node's slice):
+# 15.7 s and 61.8 MB of audit per node per invalidation, versus 0.18 ms and 102 bytes here —
+# ~606,000x less audit. It also makes undo instant, because `lastCached` was never altered.
+#
+# ITS OWN DATABASE, for two measured reasons. Harper serializes writes per database, and (a) a bulk
+# write to another table in the same database pushed tiny-table read p99 from 0.24 ms to 9.7 ms
+# (max 13.9 ms) — and this table is read ON THE SERVE PATH; (b) `Target.revalidate` and the queue
+# both write `render_service`, so a scope row there would queue behind those commits.
+#
+# DELIBERATELY NOT @export. A REST write verb here takes the whole corpus off the serve path in one
+# request, and a bare PUT cannot enforce any of the validation that makes a scope meaningful — the
+# same reasoning that keeps CrawlSketch unexported. `PrerenderAdmin` is the only authenticated write
+# surface in this plugin, so it is the only door.
+type Invalidation @table(database: "invalidation") @sealed {
+	# 'all' | 'route:<match>:<path>' naming one compiled prerender route (util/routeClass.js
+	# `routeScopeOf`). COMPARED, never parsed — a path may contain a colon. The route list is the
+	# scope axis because it is the only closed, already-compiled partition of the corpus available:
+	# an unvalidatable scope records a row that looks applied and matches nothing, which is the worst
+	# failure this feature has, because the operator's mitigation appears to have worked.
+	scope: String @primaryKey
+
+	# THE EPOCH. A cached page whose `lastCached` is not strictly greater than
+	# (`invalidatedAt` + `invalidation.pad`) is not servable.
+	#
+	# Explicit, and NEVER @updatedTime. @updatedTime re-stamps on every write, so correcting a typo
+	# in `reason` would silently re-invalidate the entire scope. For the same reason there is no
+	# "fall back to updatedTime when this is missing" rule: a hand-written row (the operations-socket
+	# escape hatch) has a re-stamped updatedTime, so the fallback would reintroduce exactly the
+	# hazard this column exists to avoid. A row lacking it does not apply at all, and is reported.
+	invalidatedAt: Date
+
+	# 'hard' only in v1 — stop serving, proxy to the origin until the page re-renders on its normal
+	# cadence. The column exists so that adding a 'grace' mode later is an addition, not a migration.
+	# A present-but-unrecognised value is treated as 'hard' (the safe direction) and reported.
+	mode: String
+
+	# Required by the API, <=200 chars. One sentence of friction against an unexplained red button
+	# at 04:00, and the only record of intent that outlives the incident.
+	reason: String
+	updatedBy: String
+	updatedTime: Date @updatedTime
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {

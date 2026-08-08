@@ -390,6 +390,67 @@ export const configSchema = group('Prerender plugin configuration.', {
 		swrTtl: option(3 * HOUR, 'Stale-while-revalidate window.', { unit: 'ms', min: 0 }),
 	}),
 
+	invalidation: group(
+		'Bulk cache invalidation. An invalidation records ONE ROW naming a scope and an instant; from then ' +
+			'on, any cached page in that scope rendered before that instant stops being served and bots get ' +
+			'the origin instead, until the page re-renders on its normal cadence.\n\n' +
+			'Nothing is rewritten — not the cached pages, not the render schedule — so recording one costs a ' +
+			'single 102-byte write instead of the ~61.8MB of audit per node a corpus rewrite costs, and UNDO ' +
+			'IS INSTANT: delete the row and every page still inside its own expiry/stale-while-revalidate ' +
+			'window serves again on the next request. Pages already past that window cannot come back, ' +
+			'because their own lifetime expired while the invalidation was active; that asymmetry is inherent ' +
+			'to not rewriting anything.\n\n' +
+			'A scope is `all` or one prerender route from ingress.routes, written `route:<match>:<path>`. ' +
+			'There are deliberately no free-text prefix scopes: a prefix cannot be checked against a closed ' +
+			'set, so a typo would record a row that reports as applied and matches nothing — the worst ' +
+			'failure available, because the mitigation appears to have worked. For a narrower blast radius, ' +
+			'declare a narrower route.\n\n' +
+			'TWO THINGS THIS CANNOT DO, both worth knowing before you rely on it. THE CDN EDGE IS NOT ' +
+			'INVALIDATED and keeps its own TTL, and neither is a copy a crawler already holds. And origin ' +
+			'markup carries correct price, availability, canonical, title and meta description, but not ' +
+			'reviews or most images — so an invalidated page serves a thinner document than a rendered one.',
+		{
+			enabled: option(
+				true,
+				'Consult invalidation rows when serving, and allow the API to record them.\n\n' +
+					'FALSE IS A KILL SWITCH, not a feature flag: every active invalidation stops applying at once ' +
+					'and the whole corpus serves pre-invalidation bytes again. It exists because at 3am you want a ' +
+					'way to take a new mechanism out of the serve path — but while any row exists it is reported as ' +
+					'a config warning, a log line and a console banner, because silently serving content somebody ' +
+					'deliberately invalidated is the one outcome this feature must never produce.'
+			),
+			pad: option(
+				2 * MINUTE,
+				'Added to `invalidatedAt` before comparing, so the comparison errs toward invalidating.\n\n' +
+					'It covers two things. Cross-node clock skew: a page’s `lastCached` is stamped by whichever ' +
+					'node rendered it and the epoch by whichever node recorded it. And — the certain one — renders ' +
+					'ALREADY IN FLIGHT: a job claimed a moment before you invalidate fetched pre-change content but ' +
+					'stamps `lastCached` at completion, so with no pad that page outlives the invalidation for a ' +
+					'full render interval. The cost of over-including a page is one extra render of it.',
+				{ unit: 'ms', min: 0 }
+			),
+			lkgMaxAge: option(
+				5 * MINUTE,
+				'How long a worker may reuse its last successful resolution when a read fails.\n\n' +
+					'Past this, resolution fails OPEN — serving from cache as though nothing were invalidated — ' +
+					'rather than trusting a stale answer. Both halves matter: without a bound, one transient read ' +
+					'error after a clear would pin a worker on a deleted epoch for the rest of its life, with the ' +
+					'console showing nothing active and offload quietly sagging. Failing open is the right default ' +
+					'because this table’s normal state is EMPTY, so "unknown" almost certainly means "nothing is ' +
+					'invalidated", and failing closed would turn a cosmetic storage fault into a total offload ' +
+					'outage. Set 0 to fail open on the first read error.',
+				{ unit: 'ms', min: 0 }
+			),
+			maxScopes: option(
+				16,
+				'Ceiling on simultaneously active scopes. Bounds the console walk and the operator surface — NOT ' +
+					'the serve-path read, which is at most two point reads by known key (`all` plus the one route ' +
+					'the request matched) however many rows exist.',
+				{ min: 1 }
+			),
+		}
+	),
+
 	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
 		defaultInterval: option(
 			DAY,

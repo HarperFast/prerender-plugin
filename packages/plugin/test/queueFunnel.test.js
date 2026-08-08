@@ -105,6 +105,12 @@ test('no table in the schema disables audit — the audit store IS the redo log'
 	// 45s wait did not help. Table data runs WAL-off and `replayLogs()` replays from the audit store,
 	// so turning audit off to halve write volume silently trades durability for bytes. Halving the
 	// queue's write COUNT (which is what this release does) is the safe version of that idea.
+	// Matches the DIRECTIVE, not the word. It used to forbid the word `audit` anywhere in the file,
+	// which was a false positive waiting to happen: audit VOLUME is the measured justification for
+	// several design decisions in here (bulk invalidation records a 102-byte row precisely because
+	// rewriting the corpus costs 61.8 MB of it per node), so a table comment has every reason to say
+	// the word. Forbidding the assignment is what this test actually means.
 	const schema = readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
-	assert.equal(/audit/i.test(schema), false, 'schema.graphql must not mention audit');
+	assert.equal(/audit\s*:/i.test(schema), false, 'schema.graphql must not set an `audit:` directive on any table');
+	assert.equal(/@audit/i.test(schema), false, 'nor an @audit annotation');
 });
