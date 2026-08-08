@@ -237,6 +237,36 @@ test('past unpinAfter the row is written forward, preserving fromSitemap and cou
 	assert.ok(warning?.includes(WEDGED), 'the push is reported by name');
 });
 
+test('the push is ONE RENDER INTERVAL as every other writer resolves it — route beats stored beats default', async () => {
+	// Two properties, and the second is the one worth a test. The push must be the row's OWN cadence,
+	// so a 1h page is not parked for a day and a 48h page does not come back due long before its
+	// cadence. And because every other schedule writer files `completionMinute + interval`, the value
+	// filed here is also what any reader inferring "when did this last render" gets back via
+	// `nextRenderTime - interval` — a flat `render.defaultInterval` made this the one writer whose rows
+	// lied to that arithmetic, reading as a completion 24h in the past on this 48h route.
+	const routes = config.ingress.routes;
+	// The seeded target ALSO carries a stored interval of DAY, so this pins the precedence too.
+	config.ingress.routes = [{ match: 'prefix', path: '/wedged', renderInterval: 2 * DAY }];
+	try {
+		seed();
+		await RenderQueue.claim({ limit: 5 });
+
+		nowMs += config.queue.claimFloor.unpinAfter + MINUTE;
+		await RenderQueue.claim({ limit: 5 });
+
+		const filed = Number(schedule.get(WEDGED).nextRenderTime);
+		assert.equal(filed, nowMs + 2 * DAY, 'the route’s cadence, not render.defaultInterval');
+		const { resolveRenderInterval } = await import('../src/util/routeClass.js');
+		assert.equal(
+			filed - resolveRenderInterval('https://www.example.com/wedged', DAY),
+			nowMs,
+			'so a reader inferring "the minute the last render completed" from the row gets NOW, not a fake past'
+		);
+	} finally {
+		config.ingress.routes = routes;
+	}
+});
+
 test('once the row moves, the floor advances past it and the next row starts its own clock', async () => {
 	seed();
 	await RenderQueue.claim({ limit: 5 });

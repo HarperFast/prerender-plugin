@@ -126,6 +126,8 @@
 
 import { config } from '../config.js';
 import { getSab } from './coordination.js';
+import { CacheKey } from './cacheKey.js';
+import { resolveRenderInterval } from './routeClass.js';
 import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 
@@ -450,8 +452,8 @@ let lastFloorHeldByAt = 0;
 
 /**
  * THE UNPIN ESCAPE HATCH. Write the row that has held the claim floor for longer than
- * `queue.claimFloor.unpinAfter` forward by one `render.defaultInterval`, so the floor can finally
- * advance past it. Returns what it did, or `null`.
+ * `queue.claimFloor.unpinAfter` forward by one render interval, so the floor can finally advance
+ * past it. Returns what it did, or `null`.
  *
  * WHY THIS EXISTS. The floor cannot advance past the oldest DUE ROW, and the only thing that moves a
  * row is its own result — a lease expiring does not, because claiming writes nothing. The
@@ -489,7 +491,26 @@ const maybeUnpinFloor = async (pass) => {
 	if (!pass.floorHeldByRow || !(pass.floorPinnedForMs >= unpinAfter)) return null;
 
 	const { cacheKey, fromSitemap } = pass.floorHeldByRow;
-	const nextRenderTime = Date.now() + config.render.defaultInterval;
+	// ONE RENDER INTERVAL, RESOLVED THE WAY EVERY OTHER SCHEDULE WRITER RESOLVES IT — not a flat
+	// `render.defaultInterval`. Two reasons, and the second one is a bug this used to cause:
+	//
+	//   - It is the right distance. A 1h-cadence row pushed a full day is a day of that URL not
+	//     rendering; a 48h-cadence row pushed only 24h comes back due long before its own cadence.
+	//   - `nextRenderTime - interval` IS HOW A COMPLETION IS READ BACK OUT OF A ROW, because every
+	//     other writer files `completionMinute + interval`. A flat `now + defaultInterval` here
+	//     manufactured a completion that never happened — on a 48h route the row read as "rendered 24h
+	//     ago", on a 1h route as "rendered in the future" — so this was the one writer whose rows lied
+	//     to that arithmetic. Nothing on this branch performs it yet, which is exactly why it is worth
+	//     fixing now: the row is the only record, it outlives the pass that wrote it, and a later
+	//     reader has no way to know this particular value was synthetic.
+	//
+	// Route > default here, where `processJobResult` resolves route > the target's stored interval >
+	// default: reading the Target from the funnel would mean a point read on the claim path and an
+	// import cycle (`resources/Target.js` imports this module). The residual, stated because it is
+	// invisible from either site: a target whose STORED interval differs from the default with no route
+	// interval to override it still desynchronises the two by that difference. Cost of that residual is
+	// one extra render per crawl of one URL, rate-limited by the accelerator's own budget.
+	const nextRenderTime = Date.now() + resolveRenderInterval(CacheKey.extractUrl(cacheKey), null);
 	try {
 		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
 	} catch (e) {
