@@ -16,6 +16,7 @@ import { cacheServeStatus } from '../util/pageFreshness.js';
 import { currentMinuteMs } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
+import { recordVisit } from '../util/visitFilter.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -36,6 +37,13 @@ export async function handleBotRequest(request) {
 			// per-thread HLL sketch — see util/crawlStats.js for the cost/loss model.
 			recordCrawl(request.botName, cacheUrl);
 		}
+
+		// Demand signal for the render ladder. Deliberately OUTSIDE the `recordBots` gate: that
+		// gate is about analytics volume, whereas this feeds scheduling — a deployment that turns
+		// analytics down must not silently demote its whole corpus for lack of observed traffic.
+		// Keyed on the device-free URL, since cadence resolves per URL and dropping the device
+		// split halves the distinct count the filter carries. No-op unless render.demand.enabled.
+		recordVisit(cacheUrl);
 
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`

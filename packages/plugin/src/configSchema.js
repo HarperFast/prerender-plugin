@@ -400,6 +400,93 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'target’s stored interval (sitemap `changefreq` / explicit API write) > this default.',
 			{ unit: 'ms', min: 1 }
 		),
+		demand: group(
+			'Demand-driven cadence: move a target UP or DOWN a fixed ladder of render intervals based ' +
+				'on whether bots actually visit it, inside the same total render budget. Hot pages get a ' +
+				'tighter freshness bound; pages nothing crawls get a looser one.\n\n' +
+				'A render interval only bounds staleness for content that drifts with TIME. On this corpus ' +
+				'that is AVAILABILITY (~0.04%/hour, continuous, and directionally in-stock -> out-of-stock, ' +
+				'i.e. the cache claims stock for sold-through items), so each rung is really an ' +
+				'availability-error budget: 6h ~ 0.24%, 12h ~ 0.5%, 24h ~ 1%, 48h ~ 2%. Price does NOT ' +
+				'drift that way — it steps at promotional events, most of the catalog at once — so no ' +
+				'affordable interval bounds it and this does not try.\n\n' +
+				'COST IS NOT SELF-LIMITING. It scales with the fraction of the corpus bots touch, which ' +
+				'grows as search-engine traffic ramps. `maxFastFraction` is the backstop and the level ' +
+				'histogram logged every `statsInterval` is the early warning — watch it before trusting it.',
+			{
+				enabled: option(false, 'Master switch. Off = `resolveRenderInterval` is used unchanged.'),
+				dryRun: option(
+					true,
+					'Compute and LOG every ladder decision but schedule with the unchanged base interval. ' +
+						'A week of this reports the steady-state level distribution — and therefore the render ' +
+						'budget — before you pay for it. Default ON: enabling `enabled` alone changes nothing ' +
+						'until this is turned off.'
+				),
+				ladder: option(
+					[6 * HOUR, 12 * HOUR, 24 * HOUR, 48 * HOUR],
+					'Render intervals a target may occupy, ascending. The route/stored interval is the ' +
+						'CEILING — the ladder reallocates within the cadence the route already grants and never ' +
+						'schedules slower than it. Bottoming out at 6h rather than 1h is deliberate: 1h buys ' +
+						'~0.04% availability error against 6h\u2019s ~0.24% for six times the render cost, and the ' +
+						'fast rungs are where a runaway hot set becomes unaffordable.',
+					{ unit: 'ms' }
+				),
+				promoteWindows: option(
+					2,
+					'How many consecutive windows of the CANDIDATE (faster) interval must each contain a ' +
+						'visit before a target is promoted. 1 promotes on "visited at all this interval", which ' +
+						'settles at rendering twice per visit; 2 asks whether a render at the faster rung would ' +
+						'actually have been seen, and settles near once per visit.',
+					{ min: 1 }
+				),
+				maxFastInterval: option(
+					12 * HOUR,
+					'Rungs strictly below this count as "fast" for `maxFastFraction` and the logged ' + '`fastFraction`.',
+					{ unit: 'ms', min: 1 }
+				),
+				maxFastFraction: option(
+					0.05,
+					'Budget backstop: the share of decisions allowed to land on a fast rung. Exceeding it is ' +
+						'logged as a warning — the hot set has grown past what the ladder was sized for.',
+					{ min: 0, max: 1 }
+				),
+				sliceMs: option(
+					6 * HOUR,
+					'Time resolution of the visit ring. Cannot be coarser than the fastest rung or that rung ' +
+						'can never be evaluated.',
+					{ unit: 'ms', min: 1 }
+				),
+				slices: option(
+					16,
+					'Ring length. Must cover promoteWindows x the slowest rung, so the promotion test for the ' +
+						'top rung can see far enough back.',
+					{ min: 2 }
+				),
+				bitsPerSlice: option(
+					1 << 20,
+					'Bloom filter bits per ring slice (power of two). ~1M bits holds ~100k distinct URLs per ' +
+						'slice at ~1% false positives. False positives promote a page nobody asked for — wasted ' +
+						'renders, never staleness — and there are no false negatives.',
+					{ min: 1024 }
+				),
+				hashes: option(7, 'Bloom hash count (k).', { min: 1, max: 32 }),
+				flushInterval: option(
+					5 * MINUTE,
+					'How often a worker merges its in-memory ring slices into this node\u2019s replicated row.',
+					{ unit: 'ms', min: SECOND }
+				),
+				mergeInterval: option(
+					5 * MINUTE,
+					'How often the read side re-unions every node\u2019s rows. The reschedule path runs ~20x/s ' +
+						'and cannot pay a multi-row read per job result, so it reads a cached union this stale.',
+					{ unit: 'ms', min: SECOND }
+				),
+				statsInterval: option(15 * MINUTE, 'How often the level histogram + promote/demote counters are logged.', {
+					unit: 'ms',
+					min: SECOND,
+				}),
+			}
+		),
 		suppression: group(
 			'What happens when a render proves a URL non-indexable (noindex, canonical mismatch, redirect ' +
 				'loop, HTTP error page). The target is not deleted — it is marked `state: suppressed` and ' +
