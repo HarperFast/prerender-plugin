@@ -9,6 +9,9 @@
  *   - "Not scheduled" is only asserted from an AUTHORITATIVE read. RenderSchedule rows are
  *     residency-pinned; when this node is not the owner and the owner could not be reached, an
  *     absent local row means "not scheduled HERE", and the view says so.
+ *   - The same rule now covers "below the claim floor" and "leased", which are answers about the
+ *     OWNER's node-local shared buffer. The owner computes both and this view consumes them
+ *     verbatim; it never compares a row against the querying node's own floor.
  */
 
 import { ago, boolText, card, duration, el, ICONS, kv, link, mono, muted, pill, spacer, unwired } from '../ui.js';
@@ -139,7 +142,24 @@ function explanation(ctx, data) {
 				el('h3', { cls: 'subhead', text: 'RenderSchedule' }),
 				schedule
 					? kv([
-							['Next render', (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs)],
+							// A LEASED ROW IS NOT A LATE ROW. Since the lease left `nextRenderTime`, a row
+							// keeps its past due time for the whole time it is being rendered, so
+							// `overdue` is true for every in-flight job and "overdue by 9m" alone stops
+							// meaning "the queue is behind on this key". Say which it is.
+							[
+								'Next render',
+								schedule.leased
+									? // SIGNED. `duration()` takes an absolute value, so a hard-coded " ago" printed
+										// "was due 9h ago" for a row due in nine hours — which a leased row genuinely
+										// can be, since the slow retry lane and a redirect reschedule move the row
+										// while the lease is still held.
+										`claimed, lease expires ${ago(schedule.leaseExpiresAt)} (${
+											schedule.overdue
+												? `was due ${duration(schedule.dueInMs)} ago`
+												: `due in ${duration(schedule.dueInMs)}`
+										})`
+									: (schedule.overdue ? 'overdue by ' : 'in ') + duration(schedule.dueInMs),
+							],
 							['From sitemap', boolText(schedule.fromSitemap)],
 						])
 					: emptyState(
@@ -338,6 +358,26 @@ function revalidate(ctx, data, target, schedule) {
 				'This key has a target but no schedule row, so nothing will render it. If the URL is not in ' +
 					'a sitemap, no other code path re-creates that row — use the button above, or let this ' +
 					'node’s periodic repair sweep pick it up.',
+			])
+		);
+	} else if (schedule?.belowClaimFloor && data.residency?.scheduleAuthoritative) {
+		// STRUCTURALLY THE SAME BUG AS THE ONE ABOVE, and it needs its own case because the row
+		// EXISTS: without this the view above says "overdue by 9m" and reads as healthy-but-late,
+		// when in fact no claim will ever look at this key again. The repair sweep cannot see it
+		// either — it tests row existence, and the row is there.
+		//
+		// Gated on an authoritative read for the same reason, and doubly so here: the claim floor is
+		// node-local state about the OWNER's slice of the table, so a non-owner's floor answers a
+		// different question entirely.
+		children.push(
+			el('div', { cls: 'note bad', style: { marginTop: '10px' } }, [
+				`This key is scheduled BELOW ${data.residency.scheduleOwnedBy}’s claim floor, so nothing will ` +
+					'claim it and nothing will report an error. A due time written straight to the table (the ' +
+					'operations API, or a PUT to the exported RenderSchedule endpoint) is the usual cause — no ' +
+					'plugin code runs in those paths, so the floor is not lowered to cover the write. It clears on ' +
+					'the owner’s next floor reset (queue.claimFloor.resetInterval), or immediately with the queue ' +
+					'action reset-claim-floor on that node. The button above also fixes it: it writes through the ' +
+					'schedule funnel, which lowers the floor with the row.',
 			])
 		);
 	}

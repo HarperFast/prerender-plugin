@@ -116,8 +116,15 @@ rest: true # required for the @export-ed table REST endpoints
     userAgent: HarperSitemapCrawler/1.0 # self-identifying UA for the sitemap crawler fetch
 
   queue:
-    jobLeaseTime: 600000 # 10m — how long a claimed job is leased
-    statusSyncInterval: 60000 # 1m  — how often queue status is recomputed/broadcast
+    jobLeaseTime: 600000 # 10m — how long a claimed job is leased (also a LATENCY knob, see below)
+    statusSyncInterval: 60000 # 1m  — pause convergence, status broadcast, claim-floor reset
+    maxLeases: 4096 # lease slots in the node-local shared buffer (restart-scoped)
+    claimScanCap: 1000 # ceiling on schedule rows read per claim pass
+    claimFloor: # the lower bound the claim scan seeks from (see "The claim floor")
+      enabled: true # false = seek the absolute index minimum, as before v0.34.0
+      guard: 300000 # 5m — the floor is always held at least this far behind now
+      resetInterval: 300000 # 5m — how often the floor is reset and re-derived from the index
+      unpinAfter: 3600000 # 1h — a row holding the floor this long is written forward (0 = never)
 
   management: # the admin API + UI at /prerender_admin
     enabled: true # false makes every management route 404
@@ -369,7 +376,9 @@ Three properties are worth knowing before a bulk upload:
   content change could appear on one device and not the other for hours.
 - **`revalidate: true` bypasses the stagger entirely**, setting every entry due in the same
   minute. That is its purpose (forcing a backfill), but it is not how to warm a large sitemap for
-  the first time — omit it and let the jitter place the URLs.
+  the first time — omit it and let the jitter place the URLs. It is safe with respect to the claim
+  floor because it writes through the schedule funnel (which lowers the floor with the rows) and
+  because the guard band keeps the current minute above every node's floor — see "The claim floor".
 
 There is no separate "warm-up" pacing knob, and none is needed: the initial spread is exactly the
 steady-state cadence, so a fleet that can sustain the ongoing load can absorb the warm.
@@ -412,6 +421,81 @@ are written as two independent commits (target first). The brief window where a 
 schedule is benign and self-heals on the next sitemap refresh / `revalidate`.
 
 See [`src/schemas/schema.graphql`](src/schemas/schema.graphql).
+
+#### Where the claim floor and the job leases live
+
+Neither is a table. Both are **node-local shared-buffer state**, in one named cross-worker buffer
+(`coordination.SharedBuffer`, never replicated): a fixed array of lease slots keyed by a 64-bit hash
+of the cache key, plus the claim floor as a single integer. A lease costs zero database operations.
+
+**Losing them on a restart is correct, not a fault.** A lease is not a record of work — the schedule
+row is, and it was never moved — so a job whose lease vanished is simply granted again. The visible
+cost is a duplicate-render burst for whatever was in flight (~500 per node at 12k renders/hour), and
+both results are accepted, with the later `PrerenderedPage.put` winning. The floor zeroing on restart
+is a _feature_: `0` means "seek the absolute index minimum", i.e. exactly the pre-v0.34.0 behaviour,
+so a restart cannot help but re-derive the truth from the index. Persisting the floor would make a
+bad value durable, which is why it is deliberately not persisted.
+
+Consequences worth knowing before you read a dashboard: lease state is **per node**, so only the node
+that owns a URL (residency) can answer "is this key being rendered right now" or "is this row below
+the floor" — the URL explainer asks that node and shows its answer, and never compares a row against
+the querying node's floor. And every one of these numbers is gone after a deploy.
+
+#### The claim floor
+
+`claim` reads `nextRenderTime >= floor` (one condition, sorted, limited) instead of scanning from the
+absolute minimum of that index. It has to: every completed render moves a key off the head of the
+index and leaves a dead entry **at the seek point**, and the scan measurably degraded 0.36 ms →
+6.25 ms over 40,000 reschedules — linearly, and permanently (it did not recover when the churn
+stopped). With the floor the same 20 keys come back in 0.43 ms.
+
+The floor advances to **the first due row a pass observed**, which is the same thing as
+`min(last granted, oldest in-flight lease)`. So:
+
+- **`queue.jobLeaseTime` is now a latency knob.** The floor cannot advance past the oldest _due row_,
+  so everything behind that row waits for it. The fast-retry lane
+  (`render.failureRetry.fastRetries`) deliberately holds its lease, which multiplies that — and
+  during a broad origin 5xx event _every_ job takes that lane, so no lease is released at all for the
+  duration and the claim scan degrades back toward its old cost. Watch **Claim floor lag** on the
+  overview; it names the row holding the floor.
+- **A lease expiring does _not_ lift the pin.** Claiming writes nothing to the schedule row, so a
+  render that never posts a result leaves the row due at the same minute, and every later pass
+  derives the same floor from it — until something writes that row forward or deletes it. The
+  periodic floor reset cannot recover it either: that row _is_ the oldest due row the reset would
+  re-derive from. The generic-failure path (renderer crash, navigation timeout, settle failure on a
+  URL that still has a target) has exactly this shape — it holds the lease and writes no row — so one
+  permanently failing URL would pin the floor indefinitely while dead index entries accumulate above
+  it at the full render rate (~43 ms/pass after a day, i.e. worse than the unfloored scan the floor
+  replaces).
+
+  So `queue.claimFloor.unpinAfter` bounds it: a row that has held the floor for longer than that is
+  written forward one `render.defaultInterval` by the claim path itself, and named in a warning. A
+  warning also fires earlier, as soon as the pin outlives what `render.failureRetry` can account for
+  (`fastRetries × jobLeaseTime`) — that one is the signal to act on, because the automatic push
+  unblocks the _queue_ without fixing the _URL_. Repair or delete it (deleting is safe — bots proxy
+  to the origin and discovery re-creates whatever it serves), and watch **Claim floor lag** on the
+  overview, which names the row and shows how long it has held on.
+
+  The push is self-limiting at one write per interval per node, because unpinning one row promotes
+  the next, which must then hold for a full interval of its own. It counts **no strike** and changes
+  no retry semantics, deliberately: `strikes` is the target's one shared counter that suppression and
+  redirect verdicts _delete_ targets on, so routing the highest-volume failure path through it would
+  walk the corpus toward deletion during a broad origin outage. Set `unpinAfter: 0` to restore the
+  unbounded pin.
+
+- **A due time written below the floor is never claimed again.** Every schedule write inside the
+  plugin goes through one funnel ([`src/util/renderSchedule.js`](src/util/renderSchedule.js)) that
+  lowers the floor with the write, and the floor is held `queue.claimFloor.guard` behind the current
+  minute so a "due now" write from _any_ node lands above it without coordination. What is _not_
+  covered is a write with no plugin code in its path — the Harper operations API, or a `PUT` to the
+  exported `RenderSchedule` endpoint. Those are recovered by the periodic floor reset
+  (`queue.claimFloor.resetInterval`), or immediately by `POST /prerender_admin/queue`
+  `{"action":"reset-claim-floor"}`. The backlog snapshot counts such rows (`belowFloor`) and both the
+  overview and the URL explainer call them out — that is the only automatic evidence you get, because
+  the schedule-repair sweep tests row _existence_ and such a row exists.
+
+Set `queue.claimFloor.enabled: false` to roll the floor back to the old full seek. It changes nothing
+else; leases stay where they are either way.
 
 ## HTTP & resource API
 
@@ -467,7 +551,8 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
 | `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
 | `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row  | `super_user` |
-| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control              | `super_user` |
+| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or          | `super_user` |
+|                                         | `{ action: "reset-claim-floor" }` (this node)    |              |
 | `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now     | `super_user` |
 | `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node       | `super_user` |
 | `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now     | `super_user` |
@@ -485,17 +570,31 @@ execute it against the operator's super-user session.
 
 ### What it shows
 
-- **Overview** — per-node queue status with staleness, table counts, the due-now backlog, and
-  a next-24h histogram of `nextRenderTime`. That histogram is the quickest way to tell a
-  healthy jittered spread from a render herd: a flat distribution means the initial-render
-  jitter is working, a single tall bar means everything comes due at once. Note the histogram
-  is capped at `management.scanCap` rows and reports `truncated` — at a large registry read the
-  shape, not the counts. The due-now backlog is the capacity signal: jitter flattens the
-  arrival curve but cannot lower it, so a backlog that climbs and never returns to zero means
-  sustained demand (`Σ targets ÷ renderInterval`) exceeds fleet throughput.
+- **Overview** — per-node queue status with staleness, table counts, the due-now backlog, the
+  in-flight count, the claim-floor lag, and a next-24h histogram of `nextRenderTime`. That
+  histogram is the quickest way to tell a healthy jittered spread from a render herd: a flat
+  distribution means the initial-render jitter is working, a single tall bar means everything
+  comes due at once. Note the histogram is capped at `management.scanCap` rows and reports
+  `truncated` — at a large registry read the shape, not the counts.
 
-  The backlog/histogram is a **cached snapshot**, not a page-load query: the scan walks the
-  same `nextRenderTime` index every render worker's `claim` reads, so it recomputes on
+  **The due-now backlog is still the capacity signal, but its healthy floor is no longer zero.**
+  A claimed job's schedule row keeps its past due time until its result lands, so "due now"
+  includes every in-flight render. Jitter flattens the arrival curve but cannot lower it, so a
+  backlog that climbs and never returns to _roughly the in-flight count_ means sustained demand
+  (`Σ targets ÷ renderInterval`) exceeds fleet throughput. The two numbers are shown side by side
+  and never subtracted: one is a scan that may be fifteen minutes old, the other a gauge read at
+  request time. Hour 0 of the histogram no longer holds the in-flight population for the same
+  reason.
+
+  **Claim floor lag** and **In flight** are live O(1) reads of the node-local shared buffer, and
+  are labelled as such. A lag well past one `queue.jobLeaseTime` means a render is pinning the floor
+  and everything behind it is waiting; the lag's subtitle names the row (as last observed by the
+  worker serving the page — the claim pass is the only thing that sees it). A **Below claim floor** alarm means rows have been
+  filed where no claim will look — see "The claim floor".
+
+  The backlog/histogram is a **cached snapshot**, not a page-load query. Since v0.34.0 it is also
+  the only scan left that seeks the absolute minimum of the `nextRenderTime` index, kept that way
+  deliberately: that makes it the only detector of a below-floor row. It recomputes on
   `management.backlogSnapshotInterval` (worker 0 of each node, result in the node-local
   coordination database) and the page shows it with its age. _Recompute_ triggers a one-off
   pass; a dashboard refresh never touches the index.
@@ -528,6 +627,13 @@ The explainer also offers **Render this URL now**, which makes that one key due 
 It writes a single `RenderSchedule` row on purpose: the collection-level
 `RenderTarget.revalidate` takes a search target, and aimed at the whole registry it queues
 every target at once — at a million targets that is a self-inflicted render herd.
+
+**This is also the supported way to force one URL to the front of the queue.** Writing
+`nextRenderTime = 1` straight to the table through the operations socket used to work and no longer
+reliably does: no plugin code runs in that path, so nothing lowers the claim floor, and the row can
+land where no claim will look. Such a row is recovered only on the next floor reset
+(`queue.claimFloor.resetInterval`), and until then the URL silently does not render. Use
+`POST /prerender_admin/revalidate` — or the button — which writes through the funnel.
 
 ### Schedule repair: the half-written target
 
@@ -636,6 +742,14 @@ Each node resolves the intent on its own `queue.statusSyncInterval` tick, so **a
 reaches a remote node within one interval (default 1m), not instantly** — the UI states this.
 `QueueStatus` remains what each node last _observed_; the UI shows both, and marks a node
 stale when it stops reporting.
+
+The `empty`/`queued` half of that observed status is **derived, not scanned**. It used to be a
+second head-seeking query against the render index on every tick; it is now computed from the claim
+floor plus the last claim outcome, at zero database cost. It is deliberately tri-state at the
+source: a pass that saw due rows but granted none (because they are all in flight) reports
+`queued`, never `empty` — reporting `empty` there would tell the whole fleet to go idle while a
+large backlog is being rendered. The `statusSyncInterval` convergence promise above is unchanged;
+that interval now also carries the periodic claim-floor reset.
 
 `POST /render_queue/pause` stays deliberately node-scoped: that endpoint sets
 `loadAsInstance = false` and therefore enforces no authentication of its own, so it must not

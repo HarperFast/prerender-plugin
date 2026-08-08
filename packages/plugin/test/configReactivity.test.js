@@ -23,14 +23,31 @@ before(async () => {
 		warn: (msg) => warns.push(String(msg)),
 		error() {},
 	};
-	// Sitemap.js's import graph (Target.js, RenderQueue.js) destructures Harper tables at
-	// module load; these tests never touch the tables, only the schedulers' timer state.
+	// Sitemap.js's import graph (Target.js, and through it the RenderSchedule funnel) destructures
+	// Harper tables at module load; these tests never touch the tables, only the schedulers' timer
+	// state. `coordination.SharedBuffer.primaryStore` is not optional: the funnel pulls in
+	// util/renderLease.js, which acquires its shared buffer at module scope, so without it every
+	// import in this file throws in `before`.
+	const sabs = new Map();
 	globalThis.databases = {
 		render_service: { Target: class {}, QueueControl: class {} },
 		render_schedule: { RenderSchedule: class {} },
 		page_cache: { PrerenderedPage: class {} },
 		sitemaps: { Sitemap: class {}, SitemapRefresh: class {} },
-		coordination: { SharedBuffer: class {} },
+		coordination: {
+			SharedBuffer: class {
+				static primaryStore = {
+					// Keyed — see test/renderLease.test.js on why an unkeyed fake passes for the wrong
+					// reason.
+					getUserSharedBuffer: (key, buffer) => {
+						if (!sabs.has(key)) sabs.set(key, buffer);
+						return sabs.get(key);
+					},
+					tryLock: () => true,
+					unlock() {},
+				};
+			},
+		},
 	};
 
 	({ applyOptions } = await import('../src/config.js'));

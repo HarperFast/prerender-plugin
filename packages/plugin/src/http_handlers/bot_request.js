@@ -14,6 +14,7 @@ import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { cacheServeStatus } from '../util/pageFreshness.js';
 import { currentMinuteMs } from '../util/time.js';
+import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { deliverResource } from './response.js';
 
@@ -211,14 +212,18 @@ function maybeSchedule(resource, routeClass) {
 // where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
 async function renderNow({ url, deviceType, cacheKey, request }) {
 	const since = Date.now();
-	const { RenderSchedule } = databases.render_schedule;
 
 	// Force an immediately-claimable, one-off schedule. No Target is created, so
 	// processJobResult won't reschedule it — and drops the schedule row once the result
 	// lands — keeping this a single render rather than a recurring target. Concurrent
 	// render-now requests for the same URL collapse onto this one row; the feature is
 	// authenticated, so we accept the small window where a spammed key can re-render.
-	await RenderSchedule.put(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
+	//
+	// Through the funnel, because "due at the current minute" is exactly the write a claim floor
+	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
+	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
+	// keeps the row above the owner's floor and therefore claimable.
+	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
 
 	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
 	// so a paused queue stays paused (the render then simply times out to the fallback).

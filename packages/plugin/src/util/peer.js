@@ -108,7 +108,10 @@ export const fetchScheduleFromPeer = async ({ hostname, cacheKey, headers }) => 
 		}
 
 		const body = await response.json();
-		return { ok: true, row: body?.renderSchedule ?? null };
+		// `claimFloor` comes back too, and it is the OWNER's — the only copy that means anything
+		// for this key. The claim floor and the lease table are node-local, so the querying node's
+		// own numbers would be an answer to a different question.
+		return { ok: true, row: body?.renderSchedule ?? null, claimFloor: body?.claimFloor ?? null };
 	} catch (e) {
 		// AbortError included — a peer that doesn't answer costs one field, not the request.
 		//
