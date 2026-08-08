@@ -564,6 +564,38 @@ test('the scan window sizes itself off the LIVE lease count, not off a gauge dra
 	assert.equal(result.scanLimit, 20 + live.length + 20, 'so the window still reads past the pile');
 });
 
+// ---- absent vs. zero due times ----
+
+test('an ABSENT nextRenderTime does not unbound the floor, but a real 0 still does', async () => {
+	// `Number(null)` is 0, `0` is finite, and `lowerFloorTo(0)` means NO FLOOR. So a bare `Number`
+	// coercion in the funnel would let one missing due time put the claim scan back to seeking the
+	// absolute index minimum — the degraded 6.25 ms seek this release exists to remove — silently,
+	// because 0 passes a finite check. The distinction the fix has to preserve is that a REAL 0 is a
+	// documented value here (the `nextRenderTime = 1` priority trick, a junk `PUT`) and must still
+	// unbound it.
+	funnel.resetRenderQueueState();
+	const established = minuteOf(T0);
+	funnel.leaseTable().advanceFloor(0, established);
+	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'precondition: a floor exists');
+
+	await funnel.writeSchedule('a|desktop', { nextRenderTime: null, fromSitemap: false });
+	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'a null due time lowers nothing');
+
+	await funnel.writeSchedule('b|desktop', { nextRenderTime: undefined, fromSitemap: false });
+	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'nor an undefined one');
+
+	// The batch form is the worse case: one null row would win the minimum for the whole fan-out.
+	await funnel.writeSchedules([
+		{ cacheKey: 'c|desktop', nextRenderTime: null, fromSitemap: false },
+		{ cacheKey: 'd|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false },
+	]);
+	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'and one null row cannot unbound a batch');
+
+	// ...while an explicit epoch due time is honoured, because that is a real request.
+	await funnel.writeSchedule('e|desktop', { nextRenderTime: 0, fromSitemap: false });
+	assert.equal(funnel.leaseTable().rawFloorMinute(), 0, 'a due time AT the epoch unbounds the scan on purpose');
+});
+
 // ---- the tri-state status ----
 
 test('derived status: granted > 0 → queued, granted 0 with due rows → queued, no due rows → empty', async () => {

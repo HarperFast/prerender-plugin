@@ -76,7 +76,7 @@ import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { startSitemapRefreshInBackground } from './Sitemap.js';
-import { currentMinuteMs } from '../util/time.js';
+import { currentMinuteMs, numberOf } from '../util/time.js';
 import { getAdminAsset, renderAdminPage } from '../admin/index.js';
 
 const {
@@ -150,21 +150,26 @@ const localClaimFloor = (now) => {
  * claim floor (i.e. filed where no claim will ever look again).
  */
 const describeScheduleRow = (row, now) => {
-	const at = Number(row.nextRenderTime);
+	// `numberOf`, not `Number`: `Number(null)` is 0, so a row with no due time would be shown as due
+	// since 1970 — overdue AND below the claim floor — which is a false accusation against a specific
+	// URL in the one view an operator uses to decide whether to repair or delete it. A row with no due
+	// time reports `null` for every derived field instead of an answer it does not have.
+	const at = numberOf(row.nextRenderTime);
+	const due = Number.isFinite(at);
 	const floor = localClaimFloor(now);
 	const lease = leaseInfo(row.cacheKey);
 	return {
 		...row,
-		nextRenderTime: at,
-		dueInMs: at - now,
+		nextRenderTime: due ? at : null,
+		dueInMs: due ? at - now : null,
 		// True for EVERY in-flight render now, since a leased row keeps its past due time until the
 		// result lands. On its own it no longer means "the queue is behind on this key" — pair it
 		// with `leased` before concluding anything.
-		overdue: at <= now,
+		overdue: due && at <= now,
 		leased: !!lease,
 		leaseExpiresAt: lease?.leaseExpiresAtMs ?? null,
 		// The floor comparator is inclusive, so a row AT the floor is claimable.
-		belowClaimFloor: floor.floorMinute > 0 && Number.isFinite(at) && minuteOf(at) < floor.floorMinute,
+		belowClaimFloor: due && floor.floorMinute > 0 && minuteOf(at) < floor.floorMinute,
 	};
 };
 

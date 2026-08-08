@@ -126,7 +126,7 @@
 
 import { config } from '../config.js';
 import { getSab } from './coordination.js';
-import { MINUTE } from './time.js';
+import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 
 /**
@@ -200,7 +200,11 @@ const guardMinutes = () => Math.max(0, Math.round(config.queue.claimFloor.guard 
  * minute continuously and the whole win would evaporate.
  */
 const lowerFloorFor = (nextRenderTime) => {
-	const at = Number(nextRenderTime);
+	// `numberOf`, not `Number`: `Number(null)` is 0, 0 is finite, and `lowerFloorTo(0)` means NO FLOOR
+	// — so a single missing due time would silently put the scan back to seeking the absolute index
+	// minimum, which is the degraded 6.25 ms seek this whole release exists to remove. A REAL 0 still
+	// unbounds it, on purpose (see `lowerFloorTo`); only absence is the bug.
+	const at = numberOf(nextRenderTime);
 	if (!Number.isFinite(at)) {
 		// Not throwing: the row is already written, and a floor that stays where it is can only
 		// strand THIS key, whereas throwing here would fail a caller that has committed.
@@ -259,7 +263,9 @@ export const writeSchedules = async (rows = []) => {
 			throw new Error(`writeSchedules(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 		}
 		await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
-		const at = Number(nextRenderTime);
+		// Same trap as `lowerFloorFor`, and WORSE here: with a bare `Number` a single null row anywhere
+		// in the batch becomes 0, wins the minimum, and unbounds the floor for the whole fan-out.
+		const at = numberOf(nextRenderTime);
 		if (Number.isFinite(at) && at < lowest) lowest = at;
 	}
 	if (lowest !== Number.POSITIVE_INFINITY) lowerFloorFor(lowest);
@@ -337,13 +343,10 @@ export const runClaimPass = async ({
 	let nonFinite = 0;
 
 	for (const row of rows) {
-		// Coerce BEFORE the finite check: a Harper `Long` column can surface as BigInt, and
-		// `Number.isFinite(BigInt)` is false while `Math.min(bigint, number)` THROWS. A throw here
-		// happens inside the claim mutex, which 500s `claim` — and a consumer that gets a 500
-		// circuit-breaks the node. `Number(null)` is 0, which would read as "due since 1970", so
-		// a null due time has to be skipped rather than coerced.
-		const at =
-			row.nextRenderTime === null || row.nextRenderTime === undefined ? Number.NaN : Number(row.nextRenderTime);
+		// `numberOf` because `Number(null)` is 0, which reads as "due since 1970" and would make an
+		// absent due time the oldest due row in the corpus — pinning the floor at the epoch and naming
+		// the wrong key as the row holding it. A missing due time is skipped and counted, not coerced.
+		const at = numberOf(row.nextRenderTime);
 		if (!Number.isFinite(at)) {
 			nonFinite++;
 			continue;

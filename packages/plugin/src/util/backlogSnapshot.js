@@ -40,7 +40,7 @@
 import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
-import { HOUR, MINUTE } from './time.js';
+import { HOUR, MINUTE, numberOf } from './time.js';
 import { currentFloorMs, inFlightLeases } from './renderSchedule.js';
 
 // Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
@@ -104,7 +104,10 @@ export async function scanUpcoming(now, cap) {
 		scanned++;
 		if (scanned % YIELD_EVERY === 0) await yieldNow();
 
-		const at = Number(row.nextRenderTime);
+		// `numberOf`, not `Number`: `Number(null)` is 0, which is finite and below any floor, so an
+		// absent due time would count as `belowFloor` with an `oldest` of 1970 — a permanent false
+		// alarm on the ONE metric that reports rows filed where no claim will look again.
+		const at = numberOf(row.nextRenderTime);
 		if (!Number.isFinite(at)) continue;
 		// THE ALARM FOR THE NEW FAILURE MODE. A row below the floor is invisible to `claim` and to
 		// the reconcile sweep (which tests existence, and the row exists), so this count is the
