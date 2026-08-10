@@ -325,11 +325,15 @@ export class RenderQueue extends Resource {
 		}
 
 		if (outcome === 'rendered') {
-			// One render_outcome per posted result (the redirect path emits its own inside
+			// One render outcome per posted result (the redirect path emits its own inside
 			// processRedirectResult). `refiled` = the client-side-redirect re-key above moved the
 			// result onto the destination's cache key; `discarded` = it landed on a class we never
-			// serve and the content was dropped.
-			metrics.renderOutcome('rendered', discardContent ? 'discarded' : cacheKey !== result.id ? 'refiled' : 'stored');
+			// serve and the content was dropped; `no-content` = a legacy worker's isIndexable-only
+			// result (legacyOutcome calls it rendered, but there is nothing to store).
+			metrics.renderOutcome(
+				'rendered',
+				discardContent ? 'discarded' : cacheKey !== result.id ? 'refiled' : result.content ? 'stored' : 'no-content'
+			);
 			const url = CacheKey.extractUrl(cacheKey);
 			const renderTarget = await Target.get({
 				id: url,

@@ -244,6 +244,7 @@ export const METRICS = Object.freeze({
 					'stored',
 					'discarded',
 					'refiled',
+					'no-content',
 					'noindex',
 					'canonical-mismatch',
 					'http-error',
@@ -261,7 +262,8 @@ export const METRICS = Object.freeze({
 					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
 					'no isIndexable) | redirect (its own lane, so redirect bails do not read as fast renders). ' +
 					'outcome: per-outcome refinement — rendered: stored / discarded (landed on a class we never ' +
-					'serve) / refiled (client-side redirect onto another prerender key); suppressed: the browser’s ' +
+					'serve) / refiled (client-side redirect onto another prerender key) / no-content (a legacy ' +
+					'worker posted an indexable verdict with nothing to store); suppressed: the browser’s ' +
 					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
 					'transient: the status code; failed: the error phase (navigation = the document never arrived; ' +
 					'unknown = pre-v1.16.0 worker posted no detail); redirect: landed-auth/landed-transient ' +
@@ -293,11 +295,12 @@ export const METRICS = Object.freeze({
 			},
 			method: {
 				name: 'reason',
-				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'render-timeout'],
+				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'render-timeout', 'other'],
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
 					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +
-					'origin was the fallback).',
+					"origin was the fallback). 'other' is the emitter's default for a caller that passed no " +
+					'reason — its presence is a bug in the caller, not a traffic category.',
 			},
 			type: { name: null, description: 'Unused (emitted as null).' },
 		},
@@ -434,7 +437,9 @@ export const METRICS = Object.freeze({
 				name: 'detail',
 				description:
 					"unrouted: the route class ('unclassified' — the CDN forwarded a path nobody declared — or " +
-					"'passthrough' — declared, deliberately not prerendered). serve_error: the kind " +
+					"'passthrough' — declared, deliberately not prerendered), or 'overflow' — requests dropped from " +
+					'the per-bucket breakdown past ingress.report.maxBuckets, counted here so the metric’s volume ' +
+					'is never a lie (their class is unknown by construction). serve_error: the kind ' +
 					"('blob-stream' = a cached page’s stored body errored while streaming out). page_age_negative: " +
 					'the bot name. invalidation_error: the kind — read-error (the row read threw; a live ' +
 					'last-known-good answered, or the request failed OPEN), lkg-expired (it threw and the memory ' +
@@ -447,9 +452,9 @@ export const METRICS = Object.freeze({
 			type: {
 				name: 'context',
 				description:
-					'unrouted: first path segment (`/blog/*`), `/` for root, or the overflow bucket past ' +
-					'ingress.report.maxBuckets. page_age_negative: the device type. invalidation_reenqueue: the ' +
-					'invalidation scope literal that triggered the heal. Other series: null.',
+					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
+					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
+					'that triggered the heal. Other series: null.',
 			},
 		},
 	}),

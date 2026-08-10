@@ -74,6 +74,28 @@ test('counts into an overflow tally past maxBuckets instead of evicting', () => 
 	assert.equal(report[UNCLASSIFIED].find((row) => row.bucket === '/a/*').count, 2);
 });
 
+test('the flush emits the overflow tally so the metric never undercounts silently', () => {
+	const lines = [];
+	const emitted = [];
+	globalThis.server = { hostname: 'node-1', workerIndex: 0, recordAnalytics: (...a) => emitted.push(a) };
+	globalThis.logger = { warn: (message) => lines.push(message), error: () => {} };
+	try {
+		applyOptions({ ingress: { report: { maxBuckets: 1 } } });
+		recordUnroutedPath(UNCLASSIFIED, '/a/x', 'cdn');
+		recordUnroutedPath(UNCLASSIFIED, '/b/x', 'cdn'); // past the cap — breakdown drops it
+		logUnroutedReport();
+		// One bucket row plus the overflow row, whose class is unknown by construction.
+		assert.deepEqual(emitted, [
+			[1, 'prerender_ops', 'unrouted', 'unclassified', '/a/*'],
+			[1, 'prerender_ops', 'unrouted', 'overflow', null],
+		]);
+		assert.ok(lines.some((l) => l.includes('dropped 1 request(s)')));
+	} finally {
+		delete globalThis.server;
+		delete globalThis.logger;
+	}
+});
+
 test('records nothing when reporting is disabled', () => {
 	applyOptions({ ingress: { report: { enabled: false } } });
 	recordUnroutedPath(UNCLASSIFIED, '/help/x', 'cdn');

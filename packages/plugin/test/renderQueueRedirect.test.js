@@ -217,6 +217,18 @@ test('301 onto a served route retires the source URL — all devices — and ado
 	);
 });
 
+test('a rendered verdict with nothing to store is counted as no-content, not stored', async () => {
+	// legacyOutcome calls an isIndexable-only result 'rendered'; the outcome detail must not
+	// claim a page was cached when nothing was.
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true });
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
+	assert.deepEqual(
+		outcomes.map((a) => [a[3], a[4]]),
+		[['rendered', 'no-content']]
+	);
+});
+
 test('301 onto an already-targeted destination adopts nothing and leaves its schedule alone', async () => {
 	seedSource();
 	stores.target.set(B, { url: B, renderInterval: 999 });

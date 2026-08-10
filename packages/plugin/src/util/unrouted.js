@@ -165,6 +165,15 @@ export const logUnroutedReport = () => {
 	}
 
 	if (report.overflowed > 0) {
+		// The dropped-from-the-breakdown requests still COUNT: without this the metric silently
+		// undercounts exactly when the path space explodes — the moment the number matters most.
+		// The class is unknown by construction (overflow is tallied before classification into a
+		// bucket), so it carries its own marker.
+		try {
+			metrics.unrouted(report.overflowed, 'overflow', null);
+		} catch (e) {
+			log.warn?.(`[prerender] unrouted overflow gauge not recorded: ${e?.message ?? String(e)}`);
+		}
 		log.warn?.(
 			`[prerender] unrouted-path report dropped ${report.overflowed} request(s) from the breakdown ` +
 				`(more than ingress.report.maxBuckets=${config.ingress.report.maxBuckets} distinct buckets) [${where}]`
