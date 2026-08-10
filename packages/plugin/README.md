@@ -756,6 +756,64 @@ that interval now also carries the periodic claim-floor reset.
 be able to stop the whole fleet. Cluster-scoped control is only reachable through the
 super-user-gated admin route.
 
+### Bulk cache invalidation
+
+"Everything of this kind is wrong as of now; stop serving it." One row records a **scope** and an
+**instant**; from then on any cached page in that scope rendered before that instant stops being
+served, and bots get the origin until the page re-renders on its normal cadence.
+
+```sh
+# preview — writes nothing, returns exactly the body the real call would
+POST /prerender_admin/invalidate  {"scope":"all","reason":"price flip","dryRun":true}
+POST /prerender_admin/invalidate  {"scope":"route:prefix:/catalog/","reason":"price flip"}
+GET  /prerender_admin/invalidations
+POST /prerender_admin/invalidate  {"scope":"all","mode":null}      # clear
+```
+
+**Nothing is rewritten.** That is the whole design, and it is a measured choice, not an aesthetic
+one. Rewriting the corpus — which `Target.revalidate`'s collection form does — costs **15.7 s and
+61.8 MB of audit per node per invalidation** at 400k rows, and pacing does not reduce it (same
+162 B/write, 8.9× longer, claim's max latency _worse_). Collapsing due times to "now" is worse still:
+the rows land exactly where the claim scan seeks, taking it **0.36 ms → 11.59 ms**. Recording an
+epoch costs **0.18 ms and 102 bytes** — ~606,000× less audit — and it is what makes undo instant.
+
+There is deliberately **no corpus sweep, and never will be**: 1.53M PDP keys against a measured
+fleet ceiling of 71,289 renders/hr is a **21.5 h floor at 100% utilisation**, against the 48 h such a
+page waits anyway, while utilisation is already 98%. Healing is by normal cadence. Set
+`invalidation.reenqueue.enabled: true` to additionally pull forward the pages bots actually crawl
+(off by default — enable it after one rehearsal, not on the deploy that introduces it).
+
+**Scopes are a closed set:** `all`, or one prerender route written `route:<match>:<path>` exactly as
+`ingress.routes` declares it. `GET /prerender_admin/invalidations` lists the valid literals, and an
+unknown scope is a 400. There are no free-text prefix scopes on purpose — a prefix cannot be checked
+against anything, so a typo would record a row that reports as applied and matches nothing, which is
+the worst failure available because the operator's mitigation _appears_ to have worked. For a
+narrower blast radius, declare a narrower route.
+
+Precedence between overlapping scopes is **the latest `invalidatedAt` wins** — not most-specific —
+so a leftover rehearsal row cannot hide a fresh `all`. The write response names every other
+applicable scope so this is visible rather than inferred.
+
+**What it cannot do**, both worth knowing before relying on it:
+
+- **The CDN edge is not invalidated** and keeps its own TTL, and neither is a copy a crawler already
+  holds. A conditional request cannot defeat it, though: on an invalidated verdict the validators are
+  stripped from the origin fetch and the local 304 path is skipped, because otherwise the origin
+  answers `304` to validators this plugin handed out off the pre-invalidation snapshot and the
+  crawler keeps the old bytes while every signal reports success.
+- **Origin markup is thinner than a render.** It carries correct price, availability, canonical,
+  title and meta description — but not reviews or most images.
+
+**Undo is asymmetric, by construction.** Clearing the row restores service on the next request for
+every page still inside its own expiry/SWR window. A page whose window elapsed _while_ the
+invalidation was active cannot come back — its lifetime ended on its own terms and nothing here
+rewrote `lastCached`. So a long-running invalidation cannot be fully undone; the clear response says
+so with the numbers attached.
+
+`invalidation.enabled: false` is a kill switch, and while any row exists it is reported as a log line
+on boot and on every config apply, plus a flag on `GET /invalidations` — silently serving content
+somebody deliberately invalidated is the one outcome this feature must never produce.
+
 ## How it fits together
 
 ```

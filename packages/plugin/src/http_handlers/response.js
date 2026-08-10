@@ -203,11 +203,31 @@ export function deliverResource(resource, request, info = {}) {
 
 	let headers = buildResponseHeaders(resource);
 
+	// A CONDITIONAL REQUEST MUST NOT BE ABLE TO UNDO AN INVALIDATION, and it could, by two
+	// independent routes. The crawler's validators are ones this plugin handed it off the
+	// PRE-INVALIDATION snapshot, and (a) they are forwarded to the origin, whose ETag may be a
+	// publish-date rather than a content hash, so it answers 304; (b) `applyConditional` compares them
+	// against the RESPONSE headers, which on an origin proxy are the origin's, and can produce the 304
+	// locally. Either way `computeWasCacheMiss` reports true, so the request records
+	// `bot_serve(source: 'origin', cacheStatus: 'invalidated')` — every signal says the invalidation
+	// worked while the crawler keeps the pre-change bytes.
+	//
+	// This is NOT the documented "the edge keeps its own TTL" caveat. A TTL expires; a 304 loop does
+	// not. The origin-side half is closed in util/upstream.js (`stripValidators`); this is the local
+	// half. `invalidated` is the only verdict that skips it, so ordinary 304 handling is untouched.
+	const suppressConditional = info.cacheStatus === 'invalidated';
+
+	if (!suppressConditional) {
+		({ status, headers, body } = applyConditional(status, headers, request, body));
+	}
+
+	// AFTER `applyConditional`, not before — the same treatment `x-harper-render-now` already gets
+	// below, and for the same reason. `downgradeTo304` REPLACES the header set, so debug headers
+	// applied earlier were dropped by any 304: "one curl from a render pod is a complete diagnosis"
+	// was false the moment that curl carried a validator, on every path, not just this feature's.
 	if (request.headers.get(config.debugHeader.key)) {
 		applyDebugHeaders(headers, request, resource, info);
 	}
-
-	({ status, headers, body } = applyConditional(status, headers, request, body));
 
 	// Always surface the on-demand render outcome so the caller knows whether it got a
 	// fresh render ('hit') or the fallback ('timeout'). Set after 304 handling so it

@@ -13,6 +13,7 @@ import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
 import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
+import { startInvalidationWatch } from './src/util/invalidation.js';
 
 export async function handleApplication(scope) {
 	await scope.ready;
@@ -44,4 +45,11 @@ export async function handleApplication(scope) {
 	// Unlike the three above, this one runs on EVERY worker: its counters are in-process, so
 	// each worker has to flush its own tally (see util/unrouted.js).
 	startUnroutedReporter();
+	// EVERY worker too, and for two different reasons in one call: it primes this worker's
+	// last-known-good invalidation set (the serve path resolves per request, and the HTTP handler is
+	// installed at module load — before this runs — so the very first cache-servable request would
+	// otherwise be the one uncovered read), and it reports any recorded scope that no longer names a
+	// configured route. That second half must re-run on config changes, because a route RENAMED by a
+	// live edit un-invalidates a corpus somebody deliberately invalidated, with nothing else to notice.
+	startInvalidationWatch();
 }

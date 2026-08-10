@@ -547,8 +547,14 @@ test('maybeAccelerateHeal detaches the attempt and swallows a write failure as a
 			}),
 			true
 		);
-		// Let the setImmediate and the awaits inside it run.
-		await new Promise((resolve) => setTimeout(resolve, 5));
+		// POLL, DO NOT SLEEP. `maybeAccelerateHeal` returns synchronously and does its work in a
+		// detached `setImmediate` whose body then awaits several reads, so a fixed delay is a race
+		// against the machine: a 5ms sleep passed locally and failed in a loaded run. Yielding until
+		// the outcome lands is bounded (it fails if the work genuinely never happens) without being
+		// timing-dependent.
+		for (let i = 0; i < 500 && outcomes().length === 0; i++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
 	} finally {
 		RenderSchedule.put = realPut;
 	}

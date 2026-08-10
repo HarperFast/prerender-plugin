@@ -64,8 +64,19 @@ import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
-import { listInvalidations, epochFromActiveSet } from '../util/invalidation.js';
-import { routeScopeForUrl } from '../util/routeClass.js';
+import {
+	listInvalidations,
+	epochFromActiveSet,
+	isScopeResolvable,
+	checkScopeResolvability,
+	recordInvalidation,
+	clearInvalidation,
+	scopeCoverage,
+	HARD,
+	MAX_REASON_LENGTH,
+	CLUSTER_SCOPE as CLUSTER_INVALIDATION,
+} from '../util/invalidation.js';
+import { routeScopes, routeScopeForUrl } from '../util/routeClass.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -258,6 +269,13 @@ const usernameOf = (user) => user?.username ?? user?.getId?.() ?? null;
 
 // Returns null when authorized, otherwise the response to send. 401 vs 403 is the useful
 // distinction for the UI: 401 means "show the login form", 403 means "signed in, wrong role".
+/**
+ * The scope literals an invalidation may name right now, for a 400 body. Returned rather than
+ * described, because "unknown scope" without the valid set is exactly the message that sends an
+ * operator to guess — and a guessed scope is a row that looks applied and matches nothing.
+ */
+const knownInvalidationScopes = () => [CLUSTER_INVALIDATION, ...routeScopes()];
+
 const denyUnlessSuperUser = (user) => {
 	if (!user) return json({ error: 'Authentication required', authenticated: false }, 401);
 	if (!isSuperUser(user)) {
@@ -406,6 +424,8 @@ export class PrerenderAdmin extends Resource {
 					node: server.hostname,
 					workerIndex: server.workerIndex,
 				});
+			case 'invalidations':
+				return PrerenderAdmin.listInvalidationsRoute();
 			case 'sitemaps':
 				return json(await PrerenderAdmin.sitemapList());
 			case 'pages':
@@ -450,6 +470,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.scheduleRow(data);
 			case 'queue':
 				return PrerenderAdmin.setQueuePause(data, context);
+			case 'invalidate':
+				return PrerenderAdmin.invalidate(data, context);
 			case 'revalidate':
 				return PrerenderAdmin.revalidateUrl(data);
 			case 'reconcile':
@@ -463,6 +485,203 @@ export class PrerenderAdmin extends Resource {
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
+	}
+
+	/**
+	 * Record, preview, or clear a bulk invalidation.
+	 *
+	 *   { scope, reason }                 record
+	 *   { scope, reason, dryRun: true }   preview — writes nothing, returns the same body
+	 *   { scope, mode: null }             clear (delete the row)
+	 *
+	 * HOME IS HERE, not `RenderQueue.post`, and not a bare `@export` on the table. This resource is
+	 * the only one in the plugin that actually authenticates (`loadAsInstance = false` plus the
+	 * hand-written super-user gate above). One request here takes the whole corpus off the serve path;
+	 * an unauthenticated version of that is strictly worse than an unauthenticated fleet pause, which
+	 * `RenderQueue` already keeps node-scoped for the same reason.
+	 *
+	 * THE RESPONSE IS THE PRIMARY CORRECTNESS SURFACE. Everything an operator needs to know that the
+	 * invalidation did what they meant is computed server-side and returned: what the scope covers,
+	 * which other active scopes also apply (so the `max(at)` precedence is visible rather than
+	 * inferred), and the two things the plugin cannot do. `dryRun` returns exactly the same body
+	 * without the write, so "what would this do" and "what did this do" cannot drift apart.
+	 */
+	static async invalidate(data, context) {
+		const rawScope = String(data?.scope ?? '').trim();
+		const clearing = data?.mode === null;
+		const dryRun = data?.dryRun === true;
+
+		if (!rawScope) {
+			return json({ error: 'scope is required', knownScopes: knownInvalidationScopes() }, 400);
+		}
+
+		// A CLOSED SET, checked here. An unvalidatable scope records a row that reports as applied and
+		// matches nothing — the worst failure this feature has, because the operator's mitigation
+		// appears to have worked. 400 with the valid literals beats a green no-op.
+		if (!isScopeResolvable(rawScope)) {
+			return json(
+				{
+					error:
+						`Unknown scope "${rawScope}". A scope is 'all' or one configured prerender route. ` +
+						`For a narrower blast radius, declare a narrower route rather than inventing a scope.`,
+					knownScopes: knownInvalidationScopes(),
+				},
+				400
+			);
+		}
+
+		if (clearing) {
+			const before = (await listInvalidations()).rows.find((row) => row.scope === rawScope) ?? null;
+			if (!before) {
+				return json({ error: `Nothing is invalidated for scope "${rawScope}".`, scope: rawScope }, 404);
+			}
+			// Computed from what we just did, NEVER by re-reading: a row deleted earlier in a request is
+			// still visible to a read in that request (util/queueControl.js:57-63 documents the trap), so
+			// re-reading would make the one operation whose entire value is confirmation report the exact
+			// opposite of what happened.
+			const cleared = await clearInvalidation(rawScope);
+			logger.warn(
+				`[prerender] invalidation CLEARED for scope "${rawScope}" by ${context?.user?.username ?? 'unknown'} ` +
+					`(was invalidated at ${before.invalidatedAt}).`
+			);
+			return json({
+				...cleared,
+				wasInvalidatedAt: before.invalidatedAt ?? null,
+				effect:
+					'Effective on the NEXT request on every node — resolution is per request, so there is nothing to ' +
+					'propagate and nothing to wait for.',
+				warning:
+					'UN-INVALIDATION IS PARTIAL BY CONSTRUCTION. Every page still inside its own expiry/stale-while-' +
+					'revalidate window serves from cache again immediately. Every page whose own window elapsed while ' +
+					'the invalidation was active CANNOT come back — its lifetime expired on its own terms, and nothing ' +
+					'here rewrote lastCached. If the invalidation ran longer than page.ttl + page.swrTtl, clearing it ' +
+					'restores almost nothing and those pages wait for their next render.',
+			});
+		}
+
+		if (data?.mode !== undefined && data?.mode !== null && data.mode !== HARD) {
+			return json({ error: `mode must be "${HARD}" or null (to clear). Got "${data.mode}".`, validModes: [HARD] }, 400);
+		}
+
+		// REJECTED, not ignored. An operator who believes they backdated an invalidation and did not has
+		// a corpus they think is invalidated and isn't.
+		if (data?.invalidatedAt !== undefined) {
+			return json(
+				{
+					error:
+						'invalidatedAt is stamped by the server and cannot be supplied — it is the epoch pages compare against.',
+				},
+				400
+			);
+		}
+
+		const reason = String(data?.reason ?? '').trim();
+		if (!reason) {
+			return json({ error: 'reason is required — it is the only record of intent that outlives the incident.' }, 400);
+		}
+		if (reason.length > MAX_REASON_LENGTH) {
+			return json({ error: `reason must be ${MAX_REASON_LENGTH} characters or fewer (got ${reason.length}).` }, 400);
+		}
+
+		// 409, not a silent write: recording a row the serve path never reads is the definition of
+		// silent, and it is the state a half-finished rollback leaves behind.
+		if (!config.invalidation.enabled) {
+			return json(
+				{
+					error:
+						'invalidation.enabled is false, so a recorded row would never be consulted. Enable it first, or ' +
+						'this would look applied and do nothing.',
+				},
+				409
+			);
+		}
+
+		const active = (await listInvalidations()).rows;
+		const replacing = active.some((row) => row.scope === rawScope);
+		if (!replacing && active.length >= config.invalidation.maxScopes) {
+			return json(
+				{
+					error: `Already at invalidation.maxScopes (${config.invalidation.maxScopes}) active scopes. Clear one first.`,
+					active: active.map((row) => row.scope),
+				},
+				409
+			);
+		}
+
+		const coverage = scopeCoverage(rawScope);
+		// Every OTHER active scope that also applies to this one's pages, so the max(at) precedence is
+		// stated rather than inferred. A leftover rehearsal row that is NEWER than this write is the case
+		// that matters: it wins, and without this the operator would have no way to know.
+		const overlaps = active
+			.filter(
+				(row) => row.scope !== rawScope && (row.scope === CLUSTER_INVALIDATION || rawScope === CLUSTER_INVALIDATION)
+			)
+			.map((row) => ({ scope: row.scope, invalidatedAt: row.invalidatedAt ?? null }));
+
+		const body = {
+			scope: rawScope,
+			mode: HARD,
+			reason,
+			dryRun,
+			coverage,
+			overlaps,
+			precedence:
+				overlaps.length > 0
+					? 'The LATEST invalidatedAt among all applicable scopes wins (max, not most-specific) — a newer ' +
+						'overlapping scope listed above will keep pages unservable even after this one is cleared.'
+					: 'No other active scope applies to these pages.',
+			effect:
+				'Any cached page in this scope rendered before the recorded instant stops being served on the NEXT ' +
+				'request, on every node, and bots get the origin until the page re-renders on its normal cadence. ' +
+				'Nothing is rewritten, so undo is instant for pages still inside their own expiry/SWR window.',
+			limits: [
+				'The CDN edge is NOT invalidated and keeps its own TTL. Neither is a copy a crawler already holds.',
+				'Origin markup carries correct price, availability, canonical, title and meta description — but not ' +
+					'reviews or most images. An invalidated page therefore serves a thinner document than a rendered one.',
+				`Healing is by normal render cadence. invalidation.reenqueue is ${
+					config.invalidation.reenqueue.enabled ? 'ON' : 'OFF'
+				}, so crawled pages ${config.invalidation.reenqueue.enabled ? 'are' : 'are NOT'} pulled forward.`,
+			],
+			padMs: config.invalidation.pad,
+		};
+
+		if (dryRun) return json({ ...body, wrote: false });
+
+		const written = await recordInvalidation({ scope: rawScope, reason, updatedBy: context?.user?.username ?? null });
+		logger.warn(
+			`[prerender] INVALIDATED scope "${rawScope}" at ${written.invalidatedAt} by ` +
+				`${context?.user?.username ?? 'unknown'}: ${reason}`
+		);
+		return json({ ...body, ...written, dryRun: false, wrote: true, replaced: replacing });
+	}
+
+	/** Every active invalidation, plus whether each one still names a configured route. */
+	static async listInvalidationsRoute() {
+		const { rows, truncated } = await listInvalidations();
+		const resolvability = await checkScopeResolvability();
+		return json({
+			node: server.hostname,
+			enabled: config.invalidation.enabled,
+			padMs: config.invalidation.pad,
+			maxScopes: config.invalidation.maxScopes,
+			reenqueueEnabled: config.invalidation.reenqueue.enabled,
+			knownScopes: resolvability.knownScopes,
+			truncated,
+			// The pill in the console derives from RESOLVABILITY, not from row presence: a row whose scope
+			// no longer names a route is worse than no row, because it looks applied.
+			unresolvable: resolvability.unresolvable,
+			killSwitchHidingRows: !config.invalidation.enabled && rows.length > 0,
+			invalidations: rows.map((row) => ({
+				scope: row.scope,
+				invalidatedAt: row.invalidatedAt ?? null,
+				mode: row.mode ?? null,
+				reason: row.reason ?? null,
+				updatedBy: row.updatedBy ?? null,
+				updatedTime: row.updatedTime ?? null,
+				resolvable: !resolvability.unresolvable.includes(row.scope),
+				coverage: scopeCoverage(row.scope),
+			})),
+		});
 	}
 
 	/**

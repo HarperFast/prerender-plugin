@@ -61,7 +61,7 @@
  * resolution is two point reads by known key rather than a walk.
  */
 
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { epochMsOf } from './time.js';
 import { routeScopes, routeForScope } from './routeClass.js';
 
@@ -111,7 +111,11 @@ const readScope = async (scope) => {
 		logger.error(e, `[prerender] invalidation read failed for scope ${scope}`);
 		const remembered = lkg.get(scope);
 		const maxAge = config.invalidation.lkgMaxAge;
-		if (remembered && Date.now() - remembered.at <= maxAge) {
+		// STRICTLY less than, so `lkgMaxAge: 0` means what the option says it means — "fail open on the
+		// first read error". With `<=`, an age of 0 (a read failing in the same millisecond the LKG was
+		// written, which is the common case for two reads in one request) satisfied `0 <= 0` and the LKG
+		// was used anyway, so the documented way to switch this off did not switch it off.
+		if (remembered && Date.now() - remembered.at < maxAge) {
 			countError('read-error');
 			return remembered.invalidatedAtMs;
 		}
@@ -297,6 +301,62 @@ export const checkScopeResolvability = async () => {
 
 /** Is this scope literal one an invalidation may name right now? */
 export const isScopeResolvable = (scope) => scope === CLUSTER_SCOPE || routeScopes().has(scope);
+
+/**
+ * Prime the LKG and watch for scopes that stop resolving. Called once per worker from
+ * `handleApplication`, and re-run on every config apply.
+ *
+ * EVERY WORKER, not worker 0. Both halves are per-worker concerns: the LKG is per-worker process
+ * state, and there is no cross-worker channel for it (deliberately — see the module comment on why
+ * there is no propagation mechanism at all). The resolvability report is a log line, so worker 0
+ * would be enough for it alone; running it everywhere costs one bounded read of a single-digit table
+ * per worker per config change and keeps the two halves in one place.
+ *
+ * RE-RUNNING ON CONFIG APPLY IS THE POINT, and it is the half that cannot be got from config alone.
+ * A route renamed or removed by a live edit silently un-invalidates whatever that scope covered —
+ * the row is still there, still looks applied, and now matches nothing. `collectConfigWarnings()` is
+ * synchronous and a pure function of config, so it cannot read the table to notice; this can.
+ *
+ * Failures are swallowed per call. Priming is an optimisation and the report is diagnostics; a boot
+ * that failed because an empty table could not be read would be a far worse trade than a late warning.
+ */
+let invalidationWatchStarted = false;
+
+export const startInvalidationWatch = () => {
+	if (invalidationWatchStarted) return;
+	invalidationWatchStarted = true;
+
+	const run = () => {
+		primeInvalidationLkg().catch(() => {});
+		checkScopeResolvability().catch(() => {});
+		warnIfKillSwitchHidesRows().catch(() => {});
+	};
+
+	run();
+	onConfigApplied(run);
+};
+
+/**
+ * `invalidation.enabled: false` while rows exist MUST NEVER BE SILENT.
+ *
+ * It is a kill switch, and it exists because at 3am you want a way to take a new mechanism out of the
+ * serve path. But the state it produces — rows recorded, console showing them, and the whole corpus
+ * quietly serving pre-invalidation bytes again — is the single outcome this feature must never
+ * produce without saying so. `collectConfigWarnings()` cannot detect it (it cannot read a table), so
+ * the detection lives here and fires on boot and on every config apply, which is exactly when someone
+ * flips the switch.
+ */
+const warnIfKillSwitchHidesRows = async () => {
+	if (config.invalidation.enabled) return;
+	const { rows } = await listInvalidations();
+	if (!rows.length) return;
+	logger.warn(
+		`[prerender] invalidation.enabled is FALSE while ${rows.length} invalidation row(s) exist ` +
+			`(${rows.map((row) => row.scope).join(', ')}). Those invalidations are NOT being applied: every page ` +
+			`they cover is serving pre-invalidation content again, and the rows will keep looking applied to ` +
+			`anyone reading the table. Either re-enable it or clear the rows.`
+	);
+};
 
 // ---- writes ----------------------------------------------------------------------------------
 

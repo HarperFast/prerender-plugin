@@ -252,7 +252,16 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	}
 
 	info.source = 'origin';
-	return fetchOriginResource({ url, deviceType, headers: request.headers });
+	// `stripValidators` on an invalidated verdict, so the origin cannot answer 304 to the validators
+	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
+	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
+	// invalidation worked. See util/upstream.js.
+	return fetchOriginResource({
+		url,
+		deviceType,
+		headers: request.headers,
+		stripValidators: info.cacheStatus === 'invalidated',
+	});
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
