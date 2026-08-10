@@ -4,13 +4,27 @@
  * background cadence instead of on page load.
  *
  * WHY NOT ON PAGE LOAD. The histogram scan is a sorted, capped range read over
- * `RenderSchedule.nextRenderTime` — the same index `claim` walks from every worker every few
- * seconds, and the one every completed render writes back to. The table counts
- * (`getRecordCount`) are time-bounded, but four of them is still up to ~2s of scanning per
+ * `RenderSchedule.nextRenderTime` — the index every completed render writes back to. The table
+ * counts (`getRecordCount`) are time-bounded, but four of them is still up to ~2s of scanning per
  * refresh on 1M-row tables. This plugin shares its workers with bot traffic; a dashboard
  * refresh must never put either kind of work in front of a bot request, so the overview serves
  * the LAST snapshot with its timestamp, a timer on worker 0 recomputes it on a slow cadence,
  * and recomputing right now is an explicit admin action.
+ *
+ * SINCE v0.34.0 THIS IS THE ONLY SCAN THAT STILL SEEKS THE ABSOLUTE MINIMUM of that index —
+ * `claim` starts from the claim floor instead (`util/renderSchedule.js`) — and it is kept that
+ * way DELIBERATELY. It is therefore the only reader in the system that can see a row filed BELOW
+ * the floor, which is a row nothing will ever claim: the same terminal, silent state
+ * `util/reconcile.js` exists for, reachable now through a due time written by the operations API
+ * or the exported REST surface. Narrowing this query to the floor (a two-sided range would be the
+ * obvious "optimisation") would make that failure mode invisible again. Do not.
+ *
+ * `overdue` ALSO CHANGED MEANING. A leased job's row keeps its past due time until its result
+ * lands, so `overdue` now includes every in-flight render and acquires a permanent floor equal to
+ * the in-flight count. It is no longer comparable with numbers recorded before v0.34.0, and
+ * "backlog returns to zero" is no longer the capacity test — "backlog returns to the in-flight
+ * count" is. The snapshot reports `inFlight` beside it so the console can show both rather than
+ * subtract a live gauge from a 15-minute-old scan and present the difference as one figure.
  *
  * WHY THE RESULT LIVES IN THE `coordination` DATABASE, NOT MODULE STATE. The timer runs on
  * worker 0, but overview requests are served by every worker — module state would leave the
@@ -26,7 +40,8 @@
 import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
-import { HOUR, MINUTE } from './time.js';
+import { HOUR, MINUTE, numberOf } from './time.js';
+import { currentFloorMs, inFlightLeases, floorState } from './renderSchedule.js';
 
 // Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
 // worker that also serves bot traffic must never monopolize the loop between rows.
@@ -66,6 +81,11 @@ export async function scanUpcoming(now, cap) {
 
 	let overdue = 0;
 	let scanned = 0;
+	// The claim floor as `claim` would read it right now, captured ONCE so every row in this pass
+	// is judged against the same value. Null = no floor, in which case nothing can be below it.
+	const floorMs = currentFloorMs(now);
+	let belowFloor = 0;
+	let oldestBelowFloorMs = null;
 
 	// Streamed and bucketed incrementally — never buffered (`cap` rows of nothing but a
 	// timestamp is still cap rows of garbage), yielding between batches so the loop stays
@@ -84,8 +104,19 @@ export async function scanUpcoming(now, cap) {
 		scanned++;
 		if (scanned % YIELD_EVERY === 0) await yieldNow();
 
-		const at = Number(row.nextRenderTime);
+		// `numberOf`, not `Number`: `Number(null)` is 0, which is finite and below any floor, so an
+		// absent due time would count as `belowFloor` with an `oldest` of 1970 — a permanent false
+		// alarm on the ONE metric that reports rows filed where no claim will look again.
+		const at = numberOf(row.nextRenderTime);
 		if (!Number.isFinite(at)) continue;
+		// THE ALARM FOR THE NEW FAILURE MODE. A row below the floor is invisible to `claim` and to
+		// the reconcile sweep (which tests existence, and the row exists), so this count is the
+		// only automatic evidence that it happened. The floor comparator is inclusive, so a row AT
+		// the floor is claimable and must not be counted.
+		if (floorMs !== null && at < floorMs) {
+			belowFloor++;
+			if (oldestBelowFloorMs === null || at < oldestBelowFloorMs) oldestBelowFloorMs = at;
+		}
 		if (at <= now) {
 			overdue++;
 			continue;
@@ -96,6 +127,13 @@ export async function scanUpcoming(now, cap) {
 
 	return {
 		overdue,
+		// The live in-flight lease count, reported beside `overdue` rather than subtracted from it:
+		// one is a scan that may be minutes old and the other is a gauge read right now, and
+		// presenting their difference as a single number would be arithmetic across two clocks.
+		inFlight: inFlightLeases(),
+		belowFloor,
+		oldestBelowFloorMs,
+		floorMs,
 		buckets,
 		scanned,
 		cap,
@@ -201,6 +239,25 @@ export const runBacklogSnapshotOnce = async () => {
 		};
 
 		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+
+		// Alertable gauges off numbers this pass already computed — until here they existed only in
+		// the admin console, so "a row sits below the claim floor" (the silent render gap) and "the
+		// floor has been pinned for hours" were facts nobody could page on. Emitted from the same
+		// one-worker-per-node cadence as the snapshot itself; value metrics, same buffered
+		// recordAnalytics path as page_age. Guarded separately: losing a gauge must never cost the
+		// snapshot.
+		try {
+			const floor = floorState(startedAt);
+			server.recordAnalytics(stats.overdue, 'queue_health', 'overdue', null, null);
+			server.recordAnalytics(stats.inFlight, 'queue_health', 'lease_occupancy', null, null);
+			server.recordAnalytics(stats.belowFloor, 'queue_health', 'below_floor', null, null);
+			if (stats.oldestBelowFloorMs !== null) {
+				server.recordAnalytics(startedAt - stats.oldestBelowFloorMs, 'queue_health', 'below_floor_age_ms', null, null);
+			}
+			server.recordAnalytics(floor.floorPinnedForMs, 'queue_health', 'floor_pin_age_ms', null, null);
+		} catch (e) {
+			logger.warn?.(`[prerender] queue_health gauges not recorded: ${e?.message ?? String(e)}`);
+		}
 	} catch (e) {
 		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
 	}

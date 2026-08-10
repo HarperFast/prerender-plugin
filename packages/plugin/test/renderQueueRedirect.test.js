@@ -81,12 +81,25 @@ const makeResourceBase = (rows) =>
 			const resource = new this(id);
 			return resource.delete();
 		}
-		static async search() {
-			return [];
+		/** Enough of Harper's search for a real claim pass — see the twin in suppressionStatus.test.js. */
+		static async *search(query = {}) {
+			const [condition] = query.conditions ?? [];
+			const floor = condition ? Number(condition.value) : Number.NEGATIVE_INFINITY;
+			const matching = [...rows.entries()]
+				.map(([cacheKey, row]) => ({ cacheKey, ...row }))
+				.filter((row) => Number(row.nextRenderTime) >= floor)
+				.sort((a, b) => Number(a.nextRenderTime) - Number(b.nextRenderTime))
+				.slice(0, query.limit ?? Infinity);
+			for (const row of matching) yield row;
 		}
 	};
 
-let RenderQueue, config;
+let RenderQueue, config, funnel;
+
+// KEYED — QueueState and the render-lease table share this store under different names, and an
+// unkeyed fake gives each acquisition its own zeroed buffer, so no lease assertion would mean
+// anything.
+const sabs = new Map();
 
 before(async () => {
 	globalThis.Resource = class {};
@@ -106,7 +119,10 @@ before(async () => {
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
-					getUserSharedBuffer: (_key, buf) => buf,
+					getUserSharedBuffer: (key, buf) => {
+						if (!sabs.has(key)) sabs.set(key, buf);
+						return sabs.get(key);
+					},
 					tryLock: () => true,
 					unlock() {},
 				},
@@ -115,6 +131,8 @@ before(async () => {
 		render_service: {
 			Target: makeResourceBase(stores.target),
 			QueueControl: makeResourceBase(new Map()),
+			// `claim` reports empty/queued, and reporting writes this row.
+			QueueStatus: makeResourceBase(new Map()),
 		},
 		render_schedule: { RenderSchedule: makeResourceBase(stores.renderSchedule) },
 		page_cache: { PrerenderedPage: makeResourceBase(stores.prerenderedPage) },
@@ -122,13 +140,21 @@ before(async () => {
 
 	({ config } = await import('../src/config.js'));
 	({ RenderQueue } = await import('../src/resources/RenderQueue.js'));
+	funnel = await import('../src/util/renderSchedule.js');
 });
 
 beforeEach(() => {
 	for (const rows of Object.values(stores)) rows.clear();
 	warns = [];
 	analytics = [];
+	// The shared buffer OUTLIVES the store clears above, so the leases and the claim floor would
+	// otherwise leak from one test into the next.
+	funnel.resetRenderQueueState();
 });
+
+/** Claim the way the fleet would, so leases are recorded exactly as production records them. */
+const claim = (limit = 10) => RenderQueue.claim({ limit });
+const leased = (cacheKey) => !!funnel.leaseInfo(cacheKey);
 
 afterEach(() => {
 	config.domains = [];
@@ -225,9 +251,18 @@ test('temporary redirect (302) keeps the source — target, cached pages — and
 });
 
 test('a targetless source (render-now one-off) has its schedule dropped instead of retrying forever', async () => {
-	stores.renderSchedule.set(key(A), { nextRenderTime: 1 });
+	stores.renderSchedule.set(key(A), { nextRenderTime: 1, fromSitemap: false });
+	await claim();
+	assert.equal(leased(key(A)), true, 'precondition: claimed under a lease');
+
 	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
+
 	assert.equal(stores.renderSchedule.has(key(A)), false);
+	// `deleteSchedule` itself releases nothing (pinned in test/renderQueueFloor.test.js); the single
+	// release point at the end of processJobResult frees the slot, which is safe precisely because
+	// the row it paced no longer exists.
+	assert.equal(leased(key(A)), false);
+	assert.deepEqual(await claim(), [], 'and nothing is left to re-claim');
 });
 
 test('redirect onto an unrouted path keeps the source and adopts nothing', async () => {
@@ -438,7 +473,14 @@ test('a verdict for a URL nothing targeted creates the suppression row (render-n
 // ---- errors ----
 
 test('outcome=error leaves a target-backed job for the lease to retry', async () => {
+	// THE SECOND FAST-LANE-BY-OMISSION, and the branch every renderer crash, timeout, ProtocolError
+	// and settle failure lands in — i.e. the highest-volume failure path in production. It writes no
+	// schedule row at all, so its pacing was ENTIRELY the lease sitting in `nextRenderTime`. With the
+	// lease out of the row, "schedule untouched" stays true whether or not the lease is held, and
+	// without the hold the row keeps its overdue due time and the fleet re-renders the failing page as
+	// fast as it can claim it. The lease assertions below are the only thing that catches that.
 	seedSource();
+	await claim();
 	const scheduleBefore = stores.renderSchedule.get(key(A));
 	await postResult({
 		id: key(A),
@@ -450,10 +492,57 @@ test('outcome=error leaves a target-backed job for the lease to retry', async ()
 
 	assert.ok(stores.target.has(A), 'an error must never retire the target');
 	assert.equal(stores.renderSchedule.get(key(A)), scheduleBefore, 'schedule untouched — the lease drives the retry');
+	assert.equal(leased(key(A)), true, 'the lease must be HELD');
+	assert.deepEqual(await claim(), [], 'so there is no immediate re-claim');
+
+	// `+ 2s`: expiries are stored in whole seconds, rounded UP, so a lease is never shorter than
+	// jobLeaseTime.
+	const originalNow = Date.now;
+	try {
+		Date.now = () => originalNow() + config.queue.jobLeaseTime + 2_000;
+		const afterExpiry = await claim();
+		assert.equal(
+			afterExpiry.filter((job) => job.id === key(A)).length,
+			1,
+			'and the retry arrives on lease expiry, exactly once'
+		);
+	} finally {
+		Date.now = originalNow;
+	}
+
 	assert.ok(
 		warns.some((w) => w.includes('ProtocolError')),
 		`expected the posted error in the failure warn, got: ${warns.join(' | ')}`
 	);
+});
+
+test('a rendered client-side redirect releases the lease held under result.id, not the destination key', async () => {
+	// `processJobResult` re-points `cacheKey` at the redirect destination for the refile. Releasing by
+	// that would leak the SOURCE's lease on every such result — and the source row, still carrying its
+	// old due time, would then pin the claim floor for a whole lease, every cycle, forever.
+	seedSource();
+	await claim();
+	assert.equal(leased(key(A)), true);
+
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, redirectedTo: B, headers: {} },
+		'<html>landed</html>'
+	);
+
+	assert.equal(leased(key(A)), false, 'the SOURCE lease — the one that was actually granted — is released');
+	assert.equal(leased(key(B)), false, 'and no lease is invented for the destination');
+});
+
+test('a job_result with an unusable x-metadata-size is a legible 400, not a mystery 500', async () => {
+	// `subarray(0, NaN)` yields an empty buffer and `JSON.parse('')` throws, which surfaced as a bare
+	// 500. Nothing can be recovered — without a decoded id there is not even a lease to release, so
+	// the render's lease simply expires and the job is re-granted.
+	const body = Buffer.from('{"id":"x"}', 'utf8');
+	for (const size of [undefined, 'abc', '0', '99999']) {
+		const ctx = { headers: new Map(size === undefined ? [] : [['x-metadata-size', size]]) };
+		const response = await RenderQueue.processJobResult(body, ctx);
+		assert.equal(response?.status, 400, `x-metadata-size "${size}" must be refused with a 400`);
+	}
 });
 
 // ---- legacy results (no outcome posted — pre-1.16 browsers, inferred by legacyOutcome) ----

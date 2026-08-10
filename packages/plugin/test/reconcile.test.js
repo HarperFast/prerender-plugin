@@ -21,9 +21,29 @@ import assert from 'node:assert/strict';
 
 let reconcile;
 
+/**
+ * The named cross-worker shared buffers, keyed. `reconcile.js` reaches the schedule funnel — the
+ * only module allowed to write RenderSchedule — which acquires the render-lease buffer at MODULE
+ * SCOPE, so this stub has to exist before the import or the whole file fails in `beforeEach`.
+ *
+ * KEYED, not "return whatever was passed": an unkeyed fake hands every acquisition its own freshly
+ * zeroed buffer, so nothing ever sees anything anyone else wrote and the tests pass for the wrong
+ * reason.
+ */
+const sabs = new Map();
+const sharedBufferStub = {
+	getUserSharedBuffer: (key, buffer) => {
+		if (!sabs.has(key)) sabs.set(key, buffer);
+		return sabs.get(key);
+	},
+	tryLock: () => true,
+	unlock() {},
+};
+
 beforeEach(async () => {
 	globalThis.server = { hostname: 'node-a', nodes: [], config: { http: {} } };
 	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.databases = { coordination: { SharedBuffer: { primaryStore: sharedBufferStub } } };
 	reconcile = await import('../src/util/reconcile.js');
 });
 
@@ -339,9 +359,12 @@ test('the live query asks for no sort — Harper rejects sorting by the primary 
 				},
 			},
 		},
+		// `get` and `put` ONLY: the schedule funnel must never reach for `search` on the reconcile
+		// path — that would be a second walk of the hot queue index inside a registry sweep.
 		render_schedule: {
 			RenderSchedule: { get: async () => null, put: async () => {} },
 		},
+		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
 	};
 
 	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });

@@ -37,6 +37,7 @@ import { fnv1a32 } from './hash.js';
 import { getResidencyByUrl } from './residency.js';
 import { getInitialRenderTime } from './time.js';
 import { resolveRenderInterval } from './routeClass.js';
+import { getScheduleRow, writeSchedule } from './renderSchedule.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread.
@@ -112,6 +113,12 @@ export const reconcileSchedules = async ({
 			// repaired row rejoins the rotation exactly where a fresh one would land. The
 			// resolver owns the numeric guards — BigInt from a `Long` column is coerced,
 			// null/NaN/non-positive fall back to the default.
+			//
+			// `getInitialRenderTime` is always >= `currentMinuteMs(now)`, so a repair can at worst
+			// TIE the claim floor — and a tie is claimable only because the floor comparator is
+			// inclusive (`greater_than_equal`). If that comparator were ever made exclusive, every
+			// repaired row would be filed one step behind the floor and this sweep would restore
+			// rows into the very silent gap it exists to close.
 			nextRenderTime: getInitialRenderTime(cacheKey, resolveRenderInterval(target.url, target.renderInterval)),
 			fromSitemap: !!target.sitemapUrl,
 		});
@@ -127,7 +134,6 @@ export const reconcileSchedules = async ({
 export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconcile.maxRestores } = {}) => {
 	const {
 		render_service: { Target },
-		render_schedule: { RenderSchedule },
 	} = databases;
 
 	return reconcileSchedules({
@@ -143,10 +149,18 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		// Nothing here depends on the order rows arrive in — see `reconcileSchedules`.
 		streamTargets: () => Target.search({ select: ['url', 'renderInterval', 'sitemapUrl'] }),
 		// Node-local by construction — see the module comment. Existence is all that matters.
-		getSchedule: (cacheKey) => RenderSchedule.get({ id: cacheKey, select: ['cacheKey'] }, { replicateFrom: false }),
+		// (`getScheduleRow` is what carries the mandatory `replicateFrom: false`.)
+		getSchedule: (cacheKey) => getScheduleRow(cacheKey, ['cacheKey']),
 		// Writes route by residency, so this reaches the owning node even though the read above
-		// deliberately does not.
-		putSchedule: (cacheKey, row) => RenderSchedule.put(cacheKey, row),
+		// deliberately does not — and it goes through the schedule funnel, which lowers the claim
+		// floor with the write. A restored row filed BEHIND the floor would be exactly the silent,
+		// terminal gap this sweep exists to close, so the funnel is not optional here.
+		//
+		// Per row rather than one batched lowering for the whole phase: every restore is a jittered
+		// FUTURE time, so the funnel's CAS-min never actually moves the floor and the per-row cost
+		// is one atomic load. Batching it would mean changing the injected port signature that keeps
+		// the traversal tests running with no Harper globals, for no measurable gain.
+		putSchedule: (cacheKey, row) => writeSchedule(cacheKey, row),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
 		// Config at sweep time, matching Target.put's fan-out — so a device added to config

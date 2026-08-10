@@ -23,6 +23,33 @@ export const currentMinuteMs = (ts = Date.now()) => Math.floor(ts / MINUTE) * MI
  */
 export const epochMsOf = (value) => (value || value === 0 ? new Date(value).getTime() : Number.NaN);
 
+/**
+ * A NUMERIC column as a number, or `NaN` when the column is absent — the guard every reader of
+ * `nextRenderTime` (and of any other numeric column) needs before comparing it to anything.
+ *
+ * IT REJECTS `null`/`undefined` EXPLICITLY, and that is the entire reason it exists: `Number(null)`
+ * is `0`, and `0` is finite, so a bare `Number.isFinite(Number(x))` accepts a MISSING value as the
+ * epoch — the most plausible-looking wrong answer available. On the claim-floor paths that has real
+ * teeth. A null due time reaching `lowerFloorFor` drives the floor to 0, which is "no floor", so the
+ * scan silently goes back to seeking the absolute index minimum — the degraded 6.25 ms seek the floor
+ * exists to remove, with no warning because 0 passed the finite check. In the backlog snapshot the
+ * same null counts the row as below-floor with an oldest of 1970, falsifying the one alarm that
+ * reports that failure mode.
+ *
+ * A REAL `0` IS STILL ACCEPTED, deliberately. A due time at or before the epoch minute is a
+ * legitimate value with a defined meaning here — the documented `nextRenderTime = 1` priority trick,
+ * or a junk `PUT` — and it unbounds the floor ON PURPOSE. Only the ABSENCE of a value is the bug, so
+ * only absence is rejected.
+ *
+ * Distinct from `epochMsOf` above, which is for genuinely `Date`-typed columns and has to round-trip
+ * through `new Date` to accept an ISO string. This one never allocates, because it runs once per
+ * scanned row on the claim path and once per row of a 20,000-row backlog sweep.
+ *
+ * IT IS NOT A BigInt DEFENCE, and should not be described as one. A `Long` in a Harper schema is a
+ * 52-bit integer, so it always arrives as a JS number and `Number.isFinite` on one is safe by itself.
+ */
+export const numberOf = (value) => (value === null || value === undefined ? Number.NaN : Number(value));
+
 export const hrToMs = (numHours) => Math.floor(numHours * HOUR);
 
 const parseTimeOfDay = (timeStr) => {

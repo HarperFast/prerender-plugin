@@ -7,9 +7,31 @@
  * render writes back to it, and even a time-bounded `getRecordCount` is scanning work a
  * dashboard refresh has no business doing on a worker that serves bot traffic. Loading this
  * view costs two node-sized table walks and one point read; recomputing is an explicit click.
+ *
+ * TWO CLOCKS ON ONE SCREEN, and they must stay visibly separate. The snapshot numbers can be
+ * fifteen minutes old; the claim-floor and in-flight numbers are atomic loads read at request
+ * time. Every snapshot-sourced stat carries a "snapshot Nm ago" subtitle and every live one says
+ * "live", and NOTHING here subtracts one from the other — a difference computed across those two
+ * clocks would look authoritative and mean nothing.
  */
 
-import { ago, card, chart, duration, el, ICONS, kv, link, muted, num, pill, spacer, stat, unwired } from '../ui.js';
+import {
+	ago,
+	card,
+	chart,
+	duration,
+	el,
+	ICONS,
+	kv,
+	link,
+	muted,
+	num,
+	pill,
+	shortUrl,
+	spacer,
+	stat,
+	unwired,
+} from '../ui.js';
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
@@ -48,6 +70,19 @@ function counts(ctx, data) {
 		count?.estimatedRange ? `estimate ±${num(count.estimatedRange)} · ${asOf}` : (count?.error ?? asOf);
 
 	const backlog = data.backlog.lastRun;
+	const floor = data.claimFloor ?? {};
+	// A leased row keeps its past due time until the render lands, so "Due now" now includes every
+	// in-flight render and its healthy floor is the in-flight count, not zero. The two are shown
+	// SIDE BY SIDE and never subtracted: `overdue` is a scan that may be minutes old, `inFlight` is
+	// a gauge read at request time.
+	//
+	// THE LIVE GAUGE FIRST, because the tile says "live". `claimFloor.occupancy` is an atomic load
+	// taken while this payload was built; `backlog.inFlight` is the same gauge as of whenever the
+	// snapshot last ran, which can be fifteen minutes ago — it was being preferred, so a tile
+	// labelled live was showing a snapshot number. It stays as the fallback, and says so.
+	const inFlightLive = Number.isFinite(floor.occupancy);
+	const inFlight = inFlightLive ? floor.occupancy : Number.isFinite(backlog?.inFlight) ? backlog.inFlight : null;
+	const dueBeyondInFlight = backlog && !backlog.error && Number.isFinite(inFlight) && backlog.overdue - inFlight > 0;
 
 	return el('div', { cls: 'stat-grid' }, [
 		stat('Render targets', value(tables?.targets), sub(tables?.targets)),
@@ -55,8 +90,38 @@ function counts(ctx, data) {
 		stat(
 			'Due now',
 			backlog && !backlog.error ? num(backlog.overdue) + (backlog.truncated ? '+' : '') : '—',
-			backlog?.error ? 'last snapshot failed' : backlog ? `snapshot ${ago(backlog.finishedAt)}` : 'no snapshot yet',
-			{ warn: !!backlog && !backlog.error && backlog.overdue > 0 }
+			backlog?.error
+				? 'last snapshot failed'
+				: backlog
+					? `includes in-flight · snapshot ${ago(backlog.finishedAt)}`
+					: 'no snapshot yet',
+			{ warn: dueBeyondInFlight }
+		),
+		stat(
+			'In flight',
+			Number.isFinite(inFlight) ? num(inFlight) : '—',
+			inFlightLive ? 'leased to a renderer · live' : `leased to a renderer · snapshot ${ago(backlog?.finishedAt)}`
+		),
+		stat(
+			'Claim floor lag',
+			floor.enabled === false ? 'disabled' : Number.isFinite(floor.lagMs) ? duration(floor.lagMs) : '—',
+			floor.enabled === false
+				? 'queue.claimFloor.enabled is false'
+				: // NAME THE ROW, AND SAY HOW LONG IT HAS HELD. A lag figure alone sends an operator
+					// hunting; the floor sits at the due minute of one row, and only a claim pass can say
+					// which — so the key is what this worker's last pass saw. The duration beside it is
+					// NODE-WIDE (it lives in the shared buffer), and it is the number that separates a
+					// render legitimately in flight from one that never posts a result: past
+					// queue.claimFloor.unpinAfter the claim pass writes that row forward itself.
+					floor.floorHeldBy
+					? `held by ${shortUrl(floor.floorHeldBy)}${
+							floor.floorPinnedForMs > 0 ? ` for ${duration(floor.floorPinnedForMs)}` : ''
+						} · this worker’s last claim`
+					: 'how far back the claim scan starts · live',
+			// The floor cannot advance past the oldest DUE ROW, and only that row's own result moves
+			// it — a lease expiring does not — so a lag well past one lease means a render is holding
+			// it and everything behind it is waiting. The subtitle names the row.
+			{ warn: Number.isFinite(floor.lagMs) && floor.lagMs > 2 * (data.intervals?.jobLeaseTime ?? 0) }
 		),
 		stat('Sitemaps', value(tables?.sitemaps), [link('view sitemaps →', () => ctx.go('sitemaps'))]),
 		stat(
@@ -99,6 +164,24 @@ function upcoming(ctx, data) {
 
 	const body = [];
 
+	// THE ALARM FOR THE FAILURE MODE THE CLAIM FLOOR INTRODUCES. A row whose due time sits below
+	// the floor is never claimed again, and nothing else notices: the reconcile sweep tests row
+	// EXISTENCE and the row exists, the URL simply stops rendering. This snapshot is the only
+	// reader that still scans from the absolute index minimum, which makes it the only detector.
+	if (lastRun?.belowFloor > 0) {
+		body.push(
+			el('div', { cls: 'note bad' }, [
+				`${num(lastRun.belowFloor)} schedule row(s) sit BELOW this node's claim floor` +
+					(lastRun.oldestBelowFloorMs ? ` (oldest was due ${ago(lastRun.oldestBelowFloorMs)})` : '') +
+					'. Nothing will claim those keys, and they report no error. They are recovered when the floor ' +
+					'resets (queue.claimFloor.resetInterval), or immediately with the queue action ' +
+					'reset-claim-floor on this node. A due time written straight to the table — the operations API ' +
+					'or the exported RenderSchedule endpoint — is the usual cause; nothing in the plugin can see ' +
+					'those writes.',
+			])
+		);
+	}
+
 	if (lastRun?.error) {
 		body.push(el('div', { cls: 'note bad', text: `The last snapshot failed: ${lastRun.error}` }));
 	} else if (!lastRun) {
@@ -132,7 +215,9 @@ function upcoming(ctx, data) {
 		body.push(
 			el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
 				'A flat spread means the initial-render jitter is working. A single tall spike is a render ' +
-					'herd — every target in that hour comes due at once.',
+					'herd — every target in that hour comes due at once. Hour 0 no longer holds the jobs ' +
+					'currently being rendered: a leased row keeps its past due time until its result lands, so ' +
+					'in-flight work counts as “due now” above rather than appearing in this histogram.',
 			])
 		);
 	}
@@ -182,6 +267,10 @@ function nodes(ctx, data) {
  * Renders that fail leave a log line and nothing else: `processJobResult` warns and either
  * leaves the job to retry or drops an orphaned schedule row. Nothing persists what failed or
  * why, so there is nothing to list here yet.
+ *
+ * THE LEASE TABLE DOES NOT WIRE THIS PANEL. A lease says a key is currently being rendered, not
+ * that its last render failed, and the whole table evaporates on a worker restart. Filling this
+ * card from it would put a list of in-flight renders under the heading "Failing renders".
  */
 const failures = () =>
 	card('Failing renders', {

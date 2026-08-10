@@ -8,13 +8,34 @@ import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } fro
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
+import { getResidencyByUrl } from '../util/residency.js';
+import {
+	claimSchedules,
+	deleteSchedule,
+	deriveQueueStatus,
+	maybeResetFloor,
+	reconcileLeaseGauge,
+	releaseLease,
+	resetFloorNow,
+	writeSchedule,
+} from '../util/renderSchedule.js';
 
 const protocol = server.hostname === 'localhost' ? 'http' : 'https';
 const port = protocol === 'https' ? server.config.http.securePort || server.config.http.port : server.config.http.port;
 
-const { RenderSchedule } = databases.render_schedule;
+// The `RenderSchedule` table is deliberately NOT destructured here. Every read, write and delete
+// of it goes through `util/renderSchedule.js`, which owns the due-time write and the claim-floor
+// lowering together — a raw write from this file would file a row behind the floor and silently
+// end that URL's rendering. `test/queueFunnel.test.js` enforces that mechanically.
 
 const mutex = getMutex('render_queue');
+
+// Rate limit for the wedged-row warning below. Per worker, which is the cheap and correct-enough
+// direction: the pin AGE it gates on is node-wide (it lives in the shared header), so every worker
+// agrees about when to start warning, and the worst case is one message per worker per window rather
+// than one per node. Sharing a timestamp across workers would mean another header word and a CAS to
+// suppress log lines.
+let lastFloorPinWarnAt = 0;
 
 // Browsers ≥ v1.16.0 post `outcome` — the single field result handling keys on: 'rendered'
 // (content present; a rendered-through client-side redirect is still a rendered page),
@@ -31,13 +52,20 @@ const legacyOutcome = (result) => {
 
 /**
  * Resolve this node's desired pause intent from the replicated `QueueControl` table and
- * store it into the node-local queue flag; when not paused, recompute empty/queued from
- * the backlog as before. Caller must hold `mutex`.
+ * store it into the node-local queue flag; when not paused, derive empty/queued. Caller must
+ * hold `mutex`.
  *
  * This is what makes pause/resume work cluster-wide: `claim` reads a non-replicated,
  * node-local flag, so a remote node can't be addressed directly — but every node runs
  * this on its own status-sync interval, so a replicated intent write converges everywhere
  * within one `queue.statusSyncInterval`.
+ *
+ * THE STATUS RECOMPUTE NO LONGER SCANS. It used to run a second head-seeking query
+ * (`nextRenderTime <= now`, limit 1) against the same index `claim` walks — measured at ~700ms
+ * of synchronous native iteration per minute on an aged node, on worker 0, which also serves bot
+ * traffic. Once a claim floor exists the answer is derivable from it plus the last claim outcome
+ * at zero database cost, so the scan is gone. `test/queueStatusDerived.test.js` pins its absence
+ * by installing a `search` that throws.
  */
 async function syncQueueState(force = false, pending = null) {
 	const desired = await getDesiredPause(server.hostname, pending);
@@ -52,26 +80,21 @@ async function syncQueueState(force = false, pending = null) {
 	// which by design cannot move a flag currently holding `paused`.
 	const liftingPause = QueueState.status === 'paused';
 
-	const now = currentMinuteMs();
+	// The floor reset rides here because this function already holds the claim mutex, which is
+	// exactly the serialization a reset needs against a concurrent `advanceFloor`. It is the only
+	// recovery for a due time written below the floor by the operations API or the exported REST
+	// surface — nothing in-process can observe those writes.
+	maybeResetFloor(Date.now());
 
-	const [existingId] = await Array.fromAsync(
-		RenderSchedule.search(
-			{
-				conditions: [
-					{
-						attribute: 'nextRenderTime',
-						comparator: 'less_than_equal',
-						value: now,
-					},
-				],
-				select: 'cacheKey',
-				limit: 1,
-			},
-			{ replicateFrom: false }
-		)
-	);
+	// And the lease-gauge walk rides here for the same reason, on the same cadence. It is NOT
+	// bookkeeping: the gauge only ever drifts UP (a lease that expires without a result has nobody to
+	// decrement it) and it SIZES the claim scan, so unreconciled it climbs until every claim pass
+	// drains the full `queue.claimScanCap` — measured at 820 against 20 truly in flight after ~80
+	// minutes, and minutes rather than hours during a broad origin outage. One walk fixes the number
+	// for every worker, because the buffer is shared.
+	reconcileLeaseGauge();
 
-	const status = existingId ? 'queued' : 'empty';
+	const status = deriveQueueStatus(Date.now());
 	await QueueState.reportStatus(status, force || liftingPause);
 	return { status, ...desired };
 }
@@ -138,8 +161,62 @@ export class RenderQueue extends Resource {
 	static async processJobResult(data, ctx) {
 		const metadataSize = parseInt(ctx.headers.get('x-metadata-size'));
 
+		// A missing or unparseable header used to make `subarray(0, NaN)` produce an empty buffer
+		// and `JSON.parse('')` throw, which surfaced as a bare 500 with no clue what was wrong.
+		// Nothing can be recovered from such a post — without a decoded `id` there is not even a
+		// lease to release, so the lease just expires and the job is re-granted — so say so
+		// legibly instead of leaving a mystery 500 in the log.
+		if (!Number.isFinite(metadataSize) || metadataSize <= 0 || metadataSize > data.byteLength) {
+			logger.error(
+				`[prerender] job_result rejected: x-metadata-size is ${ctx.headers.get('x-metadata-size')} for a ` +
+					`${data.byteLength}-byte body. The render's lease will expire and the job be re-granted.`
+			);
+			return new Response(
+				JSON.stringify({ error: 'x-metadata-size must be a positive integer no larger than the request body' }),
+				{ status: 400, headers: { 'content-type': 'application/json; charset=utf-8' } }
+			);
+		}
+
 		const result = this.decodeJobResult(data, metadataSize);
 
+		// THE key the lease was granted under, captured before anything can re-point `cacheKey`.
+		// The redirect refile below reassigns `cacheKey` to the destination, and releasing by that
+		// would leak the SOURCE's lease on every rendered client-side redirect — the source row
+		// would then pin the claim floor until the lease expired, every cycle, forever.
+		const claimKey = result.id;
+		// Set true by the branches whose retry pacing IS the lease (see retryAfterFailure): they
+		// must keep it, or the row — which still carries its original overdue due time now that
+		// the lease has left `nextRenderTime` — becomes immediately re-claimable and hot-loops.
+		let holdLease = false;
+		try {
+			return await this.processDecodedJobResult(result, {
+				holdLease: () => {
+					holdLease = true;
+				},
+			});
+		} catch (e) {
+			// A THROW MUST HOLD THE LEASE. `holdLease` is only set by branches that ran to
+			// completion, so without this a throw would release it — and a throw is precisely the
+			// case where nothing moved the row forward. Worse, the throw propagates out of the
+			// request handler, so Harper ABORTS the ambient transaction and rolls back whatever this
+			// result did commit (the `PrerenderedPage.put` included). The row keeps its original
+			// overdue due time and the floor is at or below its minute by construction, so a freed
+			// lease means the next pass re-grants it seconds later: an unpaced re-render loop against
+			// whatever is throwing, at claim frequency rather than once per lease.
+			//
+			// Reachable, not theoretical: `result.headers[...] = '1'` on a post with no headers
+			// object, a `PrerenderedPage.put`/`createBlob` failure, a `Target.get`/`Target.patch`
+			// rejection. Holding the lease paces the retry at `queue.jobLeaseTime`, exactly like the
+			// fast-retry lanes below, and the 500 is what says the result was not processed.
+			holdLease = true;
+			throw e;
+		} finally {
+			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`.
+			if (!holdLease && claimKey) releaseLease(claimKey);
+		}
+	}
+
+	static async processDecodedJobResult(result, { holdLease }) {
 		let cacheKey = result.id;
 		const url = result.redirectedTo || result.url;
 		// Set when the render landed somewhere we don't serve from cache: reschedule as normal
@@ -191,7 +268,15 @@ export class RenderQueue extends Resource {
 				// could only be stored under a key it wasn't rendered for, so there is nothing to
 				// store — only scheduling to decide.
 				if (outcome === 'redirected') {
-					await this.processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable });
+					// The lane comes back up so the fast-retry branch inside it holds its lease just
+					// like the two in this function — one release point, three deciders.
+					const lane = await this.processRedirectResult(result, {
+						redirectKey,
+						landedOn,
+						redirectPath,
+						inspectedNonIndexable,
+					});
+					if (lane === 'fast') holdLease();
 					return;
 				}
 
@@ -277,7 +362,13 @@ export class RenderQueue extends Resource {
 				// falls back to the default instead of getting stuck re-claiming every lease
 				// period). Refresh fromSitemap from the live target so it self-corrects if the
 				// URL has since left its sitemap.
-				await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+				//
+				// This is the highest-volume schedule write in the system, and it writes
+				// `now + interval` — i.e. FORWARD. The funnel's floor lowering is a CAS-min, so this
+				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
+				// lowering on every completed render would rewind the floor to the current minute
+				// continuously and the whole 14× seek win would evaporate.
+				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
 
 				// A suppressed URL that rendered indexable again has healed — put it back in
 				// normal rotation, so the recheck cadence stops and discovery may see it again.
@@ -295,7 +386,12 @@ export class RenderQueue extends Resource {
 				// No target owns this schedule: it's a one-off (render-now) or an orphaned
 				// row. Nothing sets a recurring cadence, so drop the schedule instead of
 				// leaving it to be re-claimed when the lease expires.
-				await RenderSchedule.delete(cacheKey);
+				//
+				// The delete does NOT release the key's lease (see util/renderSchedule.js): the slot
+				// keeps holding the claim floor at this row's old due minute until it expires. That
+				// is the conservative direction — releasing here would let the floor advance past a
+				// row whose result may still be arriving from a duplicate renderer.
+				await deleteSchedule(cacheKey);
 			}
 		} else if (outcome === 'non-indexable') {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
@@ -314,14 +410,14 @@ export class RenderQueue extends Resource {
 					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
 						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
 				);
-				await this.retryAfterFailure(cacheKey);
+				if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
 			} else if (result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500) {
 				// Transient-shaped: the origin failed to serve the page, it didn't disavow it.
 				// Suppressing would delete the last good cached page and park the URL for the
 				// recheck interval over what may be one bad minute at the origin — keep both
 				// and retry via retryAfterFailure (fast first, then the target's cadence).
 				logger.warn(`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page`);
-				await this.retryAfterFailure(cacheKey);
+				if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
 			} else {
 				logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
 				await Target.suppress(CacheKey.extractUrl(cacheKey), {
@@ -343,7 +439,20 @@ export class RenderQueue extends Resource {
 			// and re-render the failed job indefinitely — drop it instead.
 			const renderTarget = await Target.get({ id: CacheKey.extractUrl(cacheKey), select: 'url' });
 			if (!renderTarget) {
-				await RenderSchedule.delete(cacheKey);
+				await deleteSchedule(cacheKey);
+			} else {
+				// THE SECOND FAST-LANE-BY-OMISSION, and the highest-volume failure path in production:
+				// every renderer crash, navigation timeout, ProtocolError and settle failure lands
+				// here. Its pacing has always come entirely from the lease — the branch writes no
+				// schedule row at all — so with the lease out of `nextRenderTime` it must HOLD the
+				// lease, or the row keeps its original overdue due time and the fleet re-renders the
+				// failing page as fast as it can claim it.
+				//
+				// Note what this does and has always done: a permanently-crashing render re-renders
+				// once per `queue.jobLeaseTime`, forever, with no strike and no escalation to the slow
+				// lane. That is unchanged here on purpose — turning it into a strike-counted lane is a
+				// behaviour change that does not belong in the same release as the lease move.
+				holdLease();
 			}
 		}
 	}
@@ -356,6 +465,9 @@ export class RenderQueue extends Resource {
 	 * decided is what happens to the source target, and whether the destination becomes a
 	 * target of its own so it gets rendered under its own job context instead of being cached
 	 * from a render that ran as another URL.
+	 *
+	 * Returns the retry lane when it took one (`'fast'`/`'slow'`/`'dropped'`), so the caller — the
+	 * single lease-release point — knows whether this result's pacing is the lease itself.
 	 */
 	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable }) {
 		if (typeof result.renderTime === 'number') {
@@ -377,8 +489,7 @@ export class RenderQueue extends Resource {
 				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
 					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target`
 			);
-			await this.retryAfterFailure(result.id);
-			return;
+			return await this.retryAfterFailure(result.id);
 		}
 
 		if (landedOn !== PRERENDER) {
@@ -483,7 +594,7 @@ export class RenderQueue extends Resource {
 		// One read serves both the strike decision and the reschedule below.
 		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
 		if (!renderTarget) {
-			await RenderSchedule.delete(cacheKey);
+			await deleteSchedule(cacheKey);
 			return;
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
@@ -505,9 +616,9 @@ export class RenderQueue extends Resource {
 	 * that never suppress. Two lanes, split by the target's strike count
 	 * (`render.failureRetry.fastRetries`):
 	 *
-	 *   FAST — the schedule is left holding its claim lease, so the retry comes on lease
-	 *   expiry (`queue.jobLeaseTime`, minutes). An origin blip recovers fast, and the cached
-	 *   page's swrTtl window keeps serving bots across a lease-sized wait.
+	 *   FAST — the schedule row is left alone AND THE CALLER KEEPS THE CLAIM LEASE, so the retry
+	 *   comes on lease expiry (`queue.jobLeaseTime`, minutes). An origin blip recovers fast, and
+	 *   the cached page's swrTtl window keeps serving bots across a lease-sized wait.
 	 *
 	 *   SLOW — after `fastRetries` consecutive failures this is not a blip: drop to the
 	 *   target's normal cadence so a persistently failing page can't hot-loop renders all
@@ -520,26 +631,48 @@ export class RenderQueue extends Resource {
 	 * Strikes are the target's one shared counter (suppression and redirect strikes use it
 	 * too); any successful render clears it. A targetless key (render-now one-off) has its
 	 * schedule dropped, as everywhere else.
+	 *
+	 * WHAT CHANGED IN v0.34.0, AND WHY IT HAD TO. The fast lane used to work purely by omission:
+	 * `claim` wrote `now + jobLeaseTime` into `nextRenderTime`, so "leave the schedule untouched"
+	 * meant "the row is due again at lease expiry". With the lease moved out of the row (see
+	 * util/renderLease.js), "untouched" means the row still carries its ORIGINAL overdue due time
+	 * and is immediately re-claimable — a paced retry silently becomes a hot loop re-rendering a
+	 * failing page as fast as the fleet can claim it. So the fast lane now returns `'fast'` and
+	 * the caller does NOT release the lease. The timing is deliberately unchanged: the lease
+	 * expires at CLAIM + jobLeaseTime, so a render that fails 30s in retries in
+	 * jobLeaseTime − 30s. The lease is NOT re-armed to `now + jobLeaseTime` on failure — that
+	 * would quietly lengthen a documented wait.
+	 *
+	 * The cost, which belongs in the operator's head: a held lease holds the claim floor, so
+	 * `fastRetries: 2` can pin it for 2 × jobLeaseTime (20 minutes on defaults), and during a
+	 * broad origin 5xx or a bot-mitigation rule change EVERY job takes this lane and no lease is
+	 * released at all for that window.
+	 *
+	 * @returns {Promise<'fast'|'slow'|'dropped'>} which lane was taken. `'fast'` means the caller
+	 *   must keep the lease; the other two mean release it (the row is now in the future or gone,
+	 *   and holding a lease for it would pin the claim floor for a full lease for nothing).
 	 */
 	static async retryAfterFailure(cacheKey) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
 		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
 		if (!renderTarget) {
-			await RenderSchedule.delete(cacheKey);
-			return;
+			await deleteSchedule(cacheKey);
+			return 'dropped';
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		await Target.patch(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
 			logger.warn(`Retrying ${cacheKey} on its claim lease (failure strike ${strikes})`);
-			return; // schedule untouched — the lease written at claim drives the retry
+			// Schedule untouched, lease held by the caller — the lease expiry drives the retry.
+			return 'fast';
 		}
 
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const nextRenderTime = currentMinuteMs() + interval;
 		logger.warn(`Retrying ${cacheKey} at its normal cadence (failure strike ${strikes})`);
-		await RenderSchedule.put(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+		return 'slow';
 	}
 
 	/**
@@ -560,86 +693,156 @@ export class RenderQueue extends Resource {
 				select: ['renderInterval', 'sitemapUrl'],
 			}));
 		if (!renderTarget) {
-			await RenderSchedule.delete(cacheKey);
+			await deleteSchedule(cacheKey);
 			return;
 		}
 		// Same cadence resolution as the post-render path above (route > stored > default).
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
-		await RenderSchedule.put(cacheKey, {
+		await writeSchedule(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
 		});
 	}
 
+	/**
+	 * Grant up to `limit` due jobs.
+	 *
+	 * THE RESPONSE SHAPE IS A CONTRACT: HTTP 200 with a bare JSON array, `[]` when there is
+	 * nothing to grant. The render fleet's consumer treats only 200 as success and immediately
+	 * `.map`s the body — a 204, an object wrapper, or a new status code circuit-breaks a
+	 * perfectly healthy node.
+	 *
+	 * WHAT NO LONGER HAPPENS HERE: the per-job lease write. `claim` used to write
+	 * `nextRenderTime = now + jobLeaseTime` back onto every granted row, which was a second
+	 * write per render landing on the hot head of the very index the scan seeks from. The lease
+	 * now lives in a node-local shared buffer (util/renderLease.js) and recording it is an atomic
+	 * store, so one render costs exactly ONE schedule write — the reschedule when its result
+	 * lands. That halves queue write volume and audit bytes (~87 → ~44 MB/day/node).
+	 *
+	 * `expiresAt` is therefore no longer minute-floored either. The flooring only ever existed
+	 * because the value doubled as a `nextRenderTime`, and it silently cost up to 59,999 ms of
+	 * lease — which matters because the fleet discards any granted job with under 30s of lease
+	 * left (hence `queue.jobLeaseTime`'s two-minute minimum).
+	 */
 	static claim = mutex.withLock(async ({ limit = 20 } = {}) => {
 		if (QueueState.status === 'paused') {
 			return [];
 		}
 
-		// Bound the batch server-side so no consumer can over-claim: a large grant means a
-		// large lease-write burst held under this mutex (long lock hold) and lets one worker
-		// hoard a burst other renderers should share.
+		// Bound the batch server-side so no consumer can over-claim: the whole pass runs under
+		// this mutex, and one worker must not be able to hold it while hoarding a burst other
+		// renderers should share.
 		limit = Math.min(Math.max(1, limit | 0), config.queue.maxClaimLimit);
 
-		const currentMinute = currentMinuteMs();
-		// Fully drain the search (read) transaction into memory BEFORE issuing any
-		// RenderSchedule.put leases. Interleaving the puts inside the `for await` keeps the
-		// read cursor's transaction open across the writes, which pins the log and blocks
-		// reclamation; reading first releases it promptly (same pattern as refreshQueueStatus).
-		const schedules = await Array.fromAsync(
-			RenderSchedule.search(
-				{
-					conditions: [
-						{
-							attribute: 'nextRenderTime',
-							comparator: 'less_than_equal',
-							value: currentMinute,
-						},
-					],
-					sort: {
-						attribute: 'nextRenderTime',
-					},
-					limit,
-				},
-				{ replicateFrom: false }
-			)
-		);
+		// One pass: floored scan, drained before anything is leased, leases granted from memory,
+		// floor advanced to the first due row the pass saw. All of it in util/renderSchedule.js —
+		// this function owns the wire format and the status report, nothing else.
+		const pass = await claimSchedules({ grantLimit: limit });
 
 		const jobs = [];
-		const promises = [];
+		let notOwnedHere = 0;
 
-		for (const schedule of schedules) {
-			const { url, deviceType } = CacheKey.parse(schedule.cacheKey);
+		for (const granted of pass.jobs) {
+			const { url, deviceType } = CacheKey.parse(granted.cacheKey);
 
-			const expiresAt = currentMinuteMs(Date.now() + config.queue.jobLeaseTime);
-
-			// `fromSitemap` is denormalized onto the schedule, so the job can be built
-			// synchronously with no per-job Target read. Preserve it on the lease
-			// write (put replaces the record).
-			promises.push(
-				Promise.resolve(
-					RenderSchedule.put(schedule.cacheKey, { nextRenderTime: expiresAt, fromSitemap: schedule.fromSitemap })
-				).catch(logger.error)
-			);
+			// Detection only, deliberately. `claim`'s lease write used to purge a stale local
+			// record on a node that is no longer the residency owner, as a side effect; that purge
+			// is gone with the write. The corrective write is a new write on the hot claim path with
+			// residency semantics that could not be verified, so Stage 1 ships the count and leaves
+			// the repair to `render.reconcile` (which restores the row on the new owner) until this
+			// number proves it happens.
+			if (getResidencyByUrl(url) !== server.hostname) notOwnedHere++;
 
 			jobs.push({
-				id: schedule.cacheKey,
+				id: granted.cacheKey,
 				url,
 				deviceType,
-				expiresAt,
+				expiresAt: granted.expiresAtMs,
 				callbackOrigin: `${protocol}://${server.hostname}:${port}`,
-				isFromSitemap: !!schedule.fromSitemap,
+				// `fromSitemap` is denormalized onto the schedule row, so the job is built with no
+				// per-job Target read.
+				isFromSitemap: !!granted.fromSitemap,
 			});
 		}
 
-		await Promise.all(promises);
+		if (pass.leaseRefused) {
+			// Deliberately not "all N slots are in use": a grant is also refused when the key's
+			// 8-slot probe window is full (occupancy can be a fraction of maxLeases) or when its
+			// publish CAS lost a race. Report the occupancy and let it say which.
+			logger.warn(
+				`[prerender] claim could not record a lease for a due row: ${pass.occupancy} of ` +
+					`${config.queue.maxLeases} slots occupied. Granted ${jobs.length} of ${limit}. If the occupancy is ` +
+					`near the table size, raise queue.maxLeases (restart-scoped); if it is nowhere near it, the key's ` +
+					`probe window is full and the next pass will place it elsewhere.`
+			);
+		} else if (pass.scanTruncated && jobs.length < limit) {
+			logger.warn(
+				`[prerender] claim hit its ${pass.scanLimit}-row scan cap with ${pass.occupancy} lease(s) in flight and ` +
+					`granted ${jobs.length} of ${limit}, without reaching a not-yet-due row. In-flight work is filling ` +
+					`the scan window — raise queue.claimScanCap, or look at ${pass.floorHeldBy ?? 'the oldest due row'}, ` +
+					`which is holding the claim floor at minute ${pass.floorTo}.`
+			);
+		}
+
+		// A SEPARATE CHECK, deliberately not chained onto the branches above. The wedged row this names
+		// is one due row that never reschedules on an otherwise HEALTHY node: every pass still reaches a
+		// not-yet-due row, so `scanTruncated` is false and `leaseRefused` is false, and the branch above
+		// stays silent for as long as the node runs. That was the whole failure — the single scenario the
+		// `floorHeldBy` report was added for was the one scenario that could never print it, while the
+		// scan quietly degraded past the cost the floor was introduced to remove.
+		//
+		// The threshold is what the retry design itself can explain and no more: the fast-retry lane
+		// holds its lease, and therefore the floor, for `fastRetries` full leases before the slow lane
+		// writes the row forward, so one further lease beyond that is not a lane — it is a row whose
+		// result never comes. Rate-limited to one line per window per worker, so a genuinely stuck row
+		// says so about twice before `queue.claimFloor.unpinAfter` pushes it forward on its own.
+		// Gated on the floor being ON: with it off the scan seeks from the absolute index minimum anyway,
+		// so a row that never moves costs nothing extra and there is nothing to warn about.
+		if (config.queue.claimFloor.enabled) {
+			const explainable = config.queue.jobLeaseTime * (Math.max(0, config.render.failureRetry.fastRetries | 0) + 1);
+			if (pass.floorPinnedForMs > explainable && Date.now() - lastFloorPinWarnAt >= explainable) {
+				lastFloorPinWarnAt = Date.now();
+				const unpin = config.queue.claimFloor.unpinAfter;
+				logger.warn(
+					`[prerender] ${pass.floorHeldBy} has held the claim floor at minute ${pass.floorTo} for ` +
+						`${Math.round(pass.floorPinnedForMs / 60_000)} minute(s) — longer than the retry lanes can account ` +
+						`for (${Math.round(explainable / 60_000)} min), so its render is failing in a way that posts no ` +
+						`result and reschedules nothing. Everything due behind it is waiting and the nextRenderTime index ` +
+						`is degrading above it. ` +
+						(unpin > 0
+							? `It will be pushed forward automatically after ${Math.round(unpin / 60_000)} min.`
+							: `queue.claimFloor.unpinAfter is 0, so this will NOT resolve on its own — repair or delete the URL.`)
+				);
+			}
+		}
+
+		if (notOwnedHere) {
+			logger.warn(
+				`[prerender] claim granted ${notOwnedHere} job(s) for URL(s) this node does not own by residency. ` +
+					`Stale local schedule rows on a former owner are no longer purged at claim time; the schedule ` +
+					`reconcile sweep restores them on the new owner.`
+			);
+		}
 
 		if (jobs.length === 0) {
-			QueueState.reportStatus('empty');
+			// TRI-STATE, and the distinction is not cosmetic. "Saw due rows but granted none" means
+			// a large backlog is entirely in flight (or the scan cap was consumed by it) — reporting
+			// `empty` there tells every consumer in the fleet to back off to its idle interval while
+			// there is work, and nothing corrects it until the next status sync.
+			QueueState.reportStatus(pass.sawDue ? 'queued' : 'empty');
 		}
 
 		return jobs;
 	});
+
+	/**
+	 * Reset the claim floor now instead of waiting out `queue.claimFloor.resetInterval`.
+	 *
+	 * The operator escape hatch for the one write this plugin cannot see: a due time written
+	 * below the floor through the operations API or the exported `RenderSchedule` REST surface.
+	 * Under the claim mutex, so it cannot interleave with a pass's `advanceFloor`.
+	 */
+	static resetClaimFloor = mutex.withLock(async () => ({ ...resetFloorNow(), node: server.hostname }));
 
 	async post(target, data) {
 		const ctx = this.getContext();

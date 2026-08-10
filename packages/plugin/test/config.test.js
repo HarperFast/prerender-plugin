@@ -233,6 +233,9 @@ test('secret and restart paths are what the schema declares', () => {
 	assert.deepEqual(secretPaths().sort(), ['origin.securityToken.value', 'renderNow.token']);
 	assert.deepEqual(restartPaths().sort(), [
 		'origin.maxResponseHeaderBytes',
+		// The render-lease shared buffer is sized by the first allocation in the process, so a live
+		// change would give workers in one generation differently-sized views of the same buffer.
+		'queue.maxLeases',
 		'render.reconcile.startDelay',
 		'render.reconcile.startJitter',
 	]);

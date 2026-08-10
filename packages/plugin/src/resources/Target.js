@@ -4,11 +4,16 @@ import { resolveRenderInterval } from '../util/routeClass.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
+import { deleteSchedule, writeSchedules } from '../util/renderSchedule.js';
 
 const {
-	render_schedule: { RenderSchedule },
 	page_cache: { PrerenderedPage },
 } = databases;
+
+// `RenderSchedule` is deliberately not destructured here: every write goes through
+// `util/renderSchedule.js`, which lowers the claim floor with the write. A raw put from this file
+// would file a row behind the floor and end that URL's rendering silently — see that module's
+// comment, and `test/queueFunnel.test.js`, which fails the build on one.
 
 // The raw table class. Suppression writes go through this on purpose: `Target.put` (the
 // override below) is a REACTIVATION — it clears suppression fields and fans out fresh
@@ -90,15 +95,21 @@ export class Target extends TargetTable {
 		// (rejects negatives / NaN / non-numbers) rather than trusting the payload.
 		const interval = resolveRenderInterval(url, data.renderInterval);
 		const fromSitemap = !!data.sitemapUrl;
-		for (const cacheKey of cacheKeysOf(url)) {
-			await RenderSchedule.put(cacheKey, {
+		// One floor lowering for the whole device fan-out. The explicit `nextRenderTime` branch is
+		// validated no further than `> 0`, and it is the funnel for redirect adoption, sitemap
+		// `revalidate: true`, and any external `PUT /render_targets` — i.e. exactly the "due now"
+		// and "due in the past" writes a claim floor would otherwise strand. That is why it must
+		// not be a bare table put.
+		await writeSchedules(
+			cacheKeysOf(url).map((cacheKey) => ({
+				cacheKey,
 				nextRenderTime:
 					Number.isFinite(nextRenderTime) && nextRenderTime > 0
 						? nextRenderTime
 						: getInitialRenderTime(cacheKey, interval),
 				fromSitemap,
-			});
-		}
+			}))
+		);
 
 		return result;
 	}
@@ -113,7 +124,7 @@ export class Target extends TargetTable {
 		// until its own result drops it. Deletes are idempotent; a visible failure the caller
 		// can retry is the right outcome.
 		await Promise.all(
-			cacheKeysOf(url).flatMap((cacheKey) => [RenderSchedule.delete(cacheKey), PrerenderedPage.delete(cacheKey)])
+			cacheKeysOf(url).flatMap((cacheKey) => [deleteSchedule(cacheKey), PrerenderedPage.delete(cacheKey)])
 		);
 
 		return super.delete(...arguments);
@@ -180,12 +191,19 @@ export class Target extends TargetTable {
 		});
 
 		const recheckAt = currentMinuteMs() + knobs.recheckInterval;
-		await Promise.all(
-			cacheKeysOf(url).flatMap((cacheKey) => [
-				RenderSchedule.put(cacheKey, { nextRenderTime: recheckAt, fromSitemap: !!existing?.sitemapUrl }),
-				PrerenderedPage.delete(cacheKey),
-			])
-		);
+		// Safe by arithmetic (a recheck is always in the future, so it never lowers the claim
+		// floor), routed through the funnel anyway so the first "recheck this immediately" path
+		// anyone adds here inherits the lowering instead of silently stranding the URL.
+		await Promise.all([
+			writeSchedules(
+				cacheKeysOf(url).map((cacheKey) => ({
+					cacheKey,
+					nextRenderTime: recheckAt,
+					fromSitemap: !!existing?.sitemapUrl,
+				}))
+			),
+			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
+		]);
 		return { deleted: false, strikes };
 	}
 
@@ -207,17 +225,22 @@ export class Target extends TargetTable {
 	 * is ever pending while the cursor is open — see util/scan.js.
 	 */
 	static async revalidate(requestTarget) {
-		const nextRenderTime = currentMinuteMs();
-
 		// Phase 1 — read only. Just the keys; the page lookup moves to phase 2 so this walk
-		// stays as short as possible.
+		// stays as short as possible. `sitemapUrl` rides along because phase 2 needs it and a
+		// second point read per URL would double the cost of the whole sweep — see below for what
+		// happens when it is missing.
 		const {
 			items: urls,
 			examined,
 			truncated,
 		} = await collectFromScan({
 			scan: () => this.search(requestTarget),
-			pick: (target) => target.url,
+			// A row with no `url` is SKIPPED, which needs saying because `pick` returning an object
+			// made it stop being automatic: `collectFromScan` skips on `undefined`/`null`, and
+			// `{ url: undefined }` is neither. Such a row would reach phase 2 and build cache keys
+			// for the string "undefined" — schedule rows and a floor lowering for a URL that does
+			// not exist.
+			pick: (target) => (target.url ? { url: target.url, sitemapUrl: target.sitemapUrl ?? null } : undefined),
 		});
 
 		// Phase 2 — writes, cursor now closed. Each batch is awaited before the next starts,
@@ -225,16 +248,38 @@ export class Target extends TargetTable {
 		// independent rows, so they proceed in parallel.
 		await applyInBatches({
 			items: urls,
-			apply: (url) =>
-				Promise.all(
+			apply: async ({ url, sitemapUrl }) => {
+				// THE CURRENT MINUTE, PER URL — never captured once for the whole sweep. Phase 2 writes
+				// up to `scan.collectCap` × devices rows with a `PrerenderedPage.get` per key, which at
+				// scale takes tens of minutes. Rows are residency-routed, so ~75% land on nodes whose
+				// claim floor this process cannot lower and which hold it at
+				// `nowMinute − queue.claimFloor.guard`: every row filed with a minute more than the guard
+				// band old lands BELOW the owner's floor and is never claimed again — silently, from a
+				// fully funnel-routed in-plugin write, and permanently where `resetInterval: 0`.
+				// `Sitemap.js` already computes it per entry for the same reason.
+				const nextRenderTime = currentMinuteMs();
+				await Promise.all(
 					cacheKeysOf(url).map(async (cacheKey) => {
 						const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
 						if (existingPage) {
 							await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
 						}
-						await RenderSchedule.put(cacheKey, { nextRenderTime });
 					})
-				),
+				);
+				// `fromSitemap` is now explicit, which FIXES A PRE-EXISTING BUG: `put` replaces the
+				// record, so this call omitting the field silently cleared it on every revalidated
+				// key. `claim` then reported `isFromSitemap: false`, and the renderer skips serializing
+				// a non-indexable page unless it is sitemap-listed — so a revalidate quietly stopped
+				// those pages being cached at all.
+				//
+				// One lowering per URL rather than one for the whole batch: every row here gets the
+				// same `currentMinuteMs()`, so after the first the CAS-min is a single atomic load
+				// that changes nothing. Hoisting the lowering out of the loop would mean carrying the
+				// batch's rows in memory to no measurable end.
+				await writeSchedules(
+					cacheKeysOf(url).map((cacheKey) => ({ cacheKey, nextRenderTime, fromSitemap: !!sitemapUrl }))
+				);
+			},
 		});
 
 		// `examined` is the true match count even when the collection was capped; `truncated`
