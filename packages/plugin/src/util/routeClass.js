@@ -193,6 +193,79 @@ export const prerenderRouteCount = () => {
 };
 
 /**
+ * ── THE INVALIDATION SCOPE AXIS ──────────────────────────────────────────────────────────────
+ *
+ * A bulk invalidation names a SCOPE, and a scope is either `all` or one compiled prerender route.
+ * The route list is the axis because it is the only closed, validatable, already-compiled partition
+ * of the corpus this plugin has: `classifyPath` already returns the matched `entry`, so the scope a
+ * page belongs to is derivable synchronously, with no extra read, from a linear scan of a
+ * single-digit list.
+ *
+ * WHY A CLOSED SET IS LOAD-BEARING, AND NOT MERELY TIDY. Two reasons, both about silence:
+ *
+ *   1. A scope that matches nothing is the worst failure this feature can have, because the
+ *      operator's mitigation LOOKS applied. A free-text prefix scope cannot be validated, so one
+ *      typo records a row that reports green and demotes not a single page. Against a closed set a
+ *      typo is a 400 with the valid literals in the body.
+ *   2. It is what makes the serve-path read affordable. A request matches exactly ONE route, so
+ *      resolution is `all` plus at most one route key — two point reads by known key, never a walk.
+ *      A prefix axis turns resolution into a scan and forces a refresh timer back into the design.
+ *
+ * `route:<match>:<path>`, and the literal is COMPARED, NEVER PARSED. A path may contain a colon, so
+ * splitting on `:` is wrong for the same reason it is wrong for a page-type name; membership in the
+ * set below answers the only question anyone asks of it. The `match` verb is part of the literal
+ * because `exact /` and `prefix /` are different routes covering wildly different corpora, and a
+ * scope naming only the path could not tell them apart.
+ *
+ * Sub-route granularity costs nothing: an operator who wants a narrower blast radius declares a
+ * narrower route (`exact`, or a deeper `prefix`), which also buys that path its own metrics series
+ * and its own `renderInterval`.
+ */
+export const routeScopeOf = (entry) => `route:${entry.match}:${entry.path}`;
+
+/**
+ * The closed set of route scopes an invalidation may name. Prerender routes only — a passthrough
+ * route is never cached, so there is nothing about it to invalidate, and offering it would imply
+ * otherwise.
+ *
+ * A `Set`, so validation is `.has(scope)`. Rebuilt per call off the memoized compiled list rather
+ * than cached separately: it is a single-digit list, and a second memo keyed on config identity is
+ * exactly the kind of thing that goes stale on a live edit while the first one does not.
+ */
+export const routeScopes = () => {
+	const scopes = new Set();
+	for (const entry of getRoutes()) if (entry.mode === PRERENDER) scopes.add(routeScopeOf(entry));
+	return scopes;
+};
+
+/** The compiled prerender route a scope literal names, or null when nothing matches it. */
+export const routeForScope = (scope) => {
+	for (const entry of getRoutes()) if (entry.mode === PRERENDER && routeScopeOf(entry) === scope) return entry;
+	return null;
+};
+
+/**
+ * The route scope a URL belongs to, or `null` when no prerender route claims it.
+ *
+ * `null` is NOT an error and must not be treated as one. In `prefix` ingress mode with no
+ * `ingress.routes` declared, `classifyPath` returns `PRERENDER` with `entry: null` by construction —
+ * a request arriving at `botPathPrefix` is a prerender request whether or not a route matched. Such a
+ * deployment has an empty `routeScopes()`, so no route scope can be recorded in the first place, and
+ * every page there is covered by `all` alone. That degradation is coherent end to end: the API
+ * refuses a route scope with a 400 listing an empty set, rather than accepting one that silently
+ * matches nothing.
+ */
+export const routeScopeForEntry = (entry) => (entry && entry.mode === PRERENDER ? routeScopeOf(entry) : null);
+
+/**
+ * The route scope a URL belongs to. For callers that do NOT already have a matched entry — the admin
+ * views, deriving a scope per cached row from its cache key. The serve path must use
+ * `routeScopeForEntry(info.route)` instead: it matched the route at ingress, and re-classifying would
+ * be a second linear scan whose answer could differ from the one the metrics label already used.
+ */
+export const routeScopeForUrl = (rawUrl) => routeScopeForEntry(classifyUrl(rawUrl).entry);
+
+/**
  * Classify a device-stripped path into `{ routeClass, queryParams, entry }`.
  *
  * `queryParams` is the allowlist to canonicalize this path's URL with; `entry` is the

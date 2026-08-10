@@ -390,6 +390,125 @@ export const configSchema = group('Prerender plugin configuration.', {
 		swrTtl: option(3 * HOUR, 'Stale-while-revalidate window.', { unit: 'ms', min: 0 }),
 	}),
 
+	invalidation: group(
+		'Bulk cache invalidation. An invalidation records ONE ROW naming a scope and an instant; from then ' +
+			'on, any cached page in that scope rendered before that instant stops being served and bots get ' +
+			'the origin instead, until the page re-renders on its normal cadence.\n\n' +
+			'Nothing is rewritten — not the cached pages, not the render schedule — so recording one costs a ' +
+			'single 102-byte write instead of the ~61.8MB of audit per node a corpus rewrite costs, and UNDO ' +
+			'IS INSTANT: delete the row and every page still inside its own expiry/stale-while-revalidate ' +
+			'window serves again on the next request. Pages already past that window cannot come back, ' +
+			'because their own lifetime expired while the invalidation was active; that asymmetry is inherent ' +
+			'to not rewriting anything.\n\n' +
+			'A scope is `all` or one prerender route from ingress.routes, written `route:<match>:<path>`. ' +
+			'There are deliberately no free-text prefix scopes: a prefix cannot be checked against a closed ' +
+			'set, so a typo would record a row that reports as applied and matches nothing — the worst ' +
+			'failure available, because the mitigation appears to have worked. For a narrower blast radius, ' +
+			'declare a narrower route.\n\n' +
+			'TWO THINGS THIS CANNOT DO, both worth knowing before you rely on it. THE CDN EDGE IS NOT ' +
+			'INVALIDATED and keeps its own TTL, and neither is a copy a crawler already holds. And origin ' +
+			'markup carries correct price, availability, canonical, title and meta description, but not ' +
+			'reviews or most images — so an invalidated page serves a thinner document than a rendered one.',
+		{
+			enabled: option(
+				true,
+				'Consult invalidation rows when serving, and allow the API to record them.\n\n' +
+					'FALSE IS A KILL SWITCH, not a feature flag: every active invalidation stops applying at once ' +
+					'and the whole corpus serves pre-invalidation bytes again. It exists because at 3am you want a ' +
+					'way to take a new mechanism out of the serve path — but while any row exists it is reported as ' +
+					'a config warning, a log line and a console banner, because silently serving content somebody ' +
+					'deliberately invalidated is the one outcome this feature must never produce.'
+			),
+			pad: option(
+				10 * MINUTE,
+				'Added to `invalidatedAt` before comparing, so the comparison errs toward invalidating.\n\n' +
+					'It covers two things. Cross-node clock skew: a page’s `lastCached` is stamped by whichever ' +
+					'node rendered it and the epoch by whichever node recorded it. And — the certain one — renders ' +
+					'ALREADY IN FLIGHT: a job claimed a moment before you invalidate fetched pre-change content but ' +
+					'stamps `lastCached` at completion, so with no pad that page outlives the invalidation for a ' +
+					'full render interval. That window is legitimately as long as `queue.jobLeaseTime` (a job may ' +
+					'post back any time inside its lease, and does under backlog — exactly the state incidents ' +
+					'create), so keep this at or above jobLeaseTime; a smaller value is reported as a config ' +
+					'warning. The cost of over-including a page is one extra render of it.',
+				{ unit: 'ms', min: 0 }
+			),
+			lkgMaxAge: option(
+				5 * MINUTE,
+				'How long a worker may reuse its last successful resolution when a read fails.\n\n' +
+					'Past this, resolution fails OPEN — serving from cache as though nothing were invalidated — ' +
+					'rather than trusting a stale answer. Both halves matter: without a bound, one transient read ' +
+					'error after a clear would pin a worker on a deleted epoch for the rest of its life, with the ' +
+					'console showing nothing active and offload quietly sagging. Failing open is the right default ' +
+					'because this table’s normal state is EMPTY, so "unknown" almost certainly means "nothing is ' +
+					'invalidated", and failing closed would turn a cosmetic storage fault into a total offload ' +
+					'outage. Set 0 to fail open on the first read error.',
+				{ unit: 'ms', min: 0 }
+			),
+			maxScopes: option(
+				16,
+				'Ceiling on simultaneously active scopes. Bounds the console walk and the operator surface — NOT ' +
+					'the serve-path read, which is at most two point reads by known key (`all` plus the one route ' +
+					'the request matched) however many rows exist.',
+				{ min: 1 }
+			),
+			reenqueue: group(
+				'DEMAND-DRIVEN HEAL. When an invalidation is what made a request non-servable, lower that URL’s ' +
+					'due time so the pages bots actually crawl heal first instead of waiting out their cadence in ' +
+					'crawl order. The request itself is the trigger — no timer, no table scan, no cursor — and only ' +
+					'the node that OWNS the key by residency acts, because the claim floor a lowered due time has to ' +
+					'move is a node-local shared buffer that a write from another node cannot reach.\n\n' +
+					'THERE IS DELIBERATELY NO CORPUS-WIDE SWEEP, and there will not be one. At a measured fleet ' +
+					'ceiling of 71,289 renders/hr the 1,530,046-key long-tail corpus floors a full re-render at 21.5h ' +
+					'at 100% utilisation — against the 48h those pages wait anyway, with measured utilisation already ' +
+					'98% and a 3.05h standing backlog — while rewriting the corpus costs ~61.8MB of audit per node ' +
+					'that pacing provably does not reduce (batching kept 162 B/write, took 8.9x longer and made ' +
+					'claim’s max latency WORSE). Cadence-heal plus this accelerator is the whole mechanism.\n\n' +
+					'Scale, so the ceilings below read as the small numbers they are: ~4,000 bot requests/day ' +
+					'cluster-wide against 1.6M cache keys, of which crawlers request about 0.25%.',
+				{
+					enabled: option(
+						false,
+						'Off by default, like `render.reconcile.enabled`: enable it after one rehearsal, not on the ' +
+							'same deploy that introduces it. While off, an invalidation adds NOTHING to the queue — zero ' +
+							'schedule writes, zero audit, zero claim-scan work — and every page heals on its own cadence.'
+					),
+					spreadWindow: option(
+						15 * MINUTE,
+						'Jitter window a lowered due time lands in: `now + hash(url) % spreadWindow`, seeded off the ' +
+							'URL half of the cache key so a page’s device variants land on the SAME minute (see ' +
+							'util/time.js — de-aligned variants show a content change on one device and not the other, ' +
+							'permanently, cycle over cycle).\n\n' +
+							'NEVER "now". Collapsing due times onto one instant piles rows exactly where the claim scan ' +
+							'seeks: measured, that takes the claim scan from 0.36ms to 11.59ms (32x), and the scar clears ' +
+							'only on the next compaction of that store, which needs write pressure.\n\n' +
+							'MUST BE >= `queue.jobLeaseTime`, and a smaller value is reported as a config warning and ' +
+							'then clamped up to it — because a narrow window is a smaller version of the same pile, not ' +
+							'because the two quantities are coupled. `queue.jobLeaseTime` is floored at 2 minutes, which ' +
+							'makes it the smallest spread this system already trusts. (Overwriting a render in flight is a ' +
+							'DIFFERENT hazard and is closed elsewhere, exactly: the accelerator refuses outright when any ' +
+							'device key of the URL holds a live claim lease.)',
+						{ unit: 'ms', min: 0 }
+					),
+					maxPerMinute: option(
+						10,
+						'Per-node ceiling on accelerated REQUESTS per minute, shared across every worker on the node ' +
+							'(one minute-bucketed counter in a shared buffer). One accelerated request writes at most one ' +
+							'schedule row PER DEVICE ROW THE URL HAS — `deviceTypes.default` (two on this deployment), ' +
+							'plus the served device when that one is merely `supported` — so the write ceiling is this ' +
+							'number times those rows.\n\n' +
+							'Sized so its CEILING is defensible, not just its typical. 10/min/node is 14,400 ' +
+							'requests/node/day ≈ 28,800 schedule writes ≈ 2.3MB of audit/node/day, about 7% of measured ' +
+							'spare fleet render capacity (~792,700 renders/day spare against a 1,710,936/day ceiling and ' +
+							'~918,000/day of baseline cadence demand) — against a measured demand of roughly 1,000 ' +
+							'owner-node candidate requests/day CLUSTER-WIDE, i.e. ~14x headroom. Raising it toward 120 ' +
+							'would authorise ~87% of all spare fleet capacity, which is why it is not the default.',
+						{ min: 1 }
+					),
+				}
+			),
+		}
+	),
+
 	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
 		defaultInterval: option(
 			DAY,

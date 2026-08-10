@@ -85,6 +85,29 @@ test('every RenderSchedule.get passes { replicateFrom: false }', () => {
 	assert.ok(checked > 0, 'the regex matched nothing — it has drifted from the source and is asserting nothing');
 });
 
+test('no schedule write hardcodes fromSitemap: false — put REPLACES the record', () => {
+	// The funnel makes `fromSitemap` REQUIRED, which caught the writes that omitted it. It cannot
+	// catch the next mistake, which has now happened twice: satisfying the argument with a literal
+	// `false`. `put` replaces the record, so that CLEARS the flag for a sitemap-listed URL; `claim`
+	// then hands the renderer `isFromSitemap: false`, and the renderer skips serializing a
+	// non-indexable sitemap-listed page — so one on-demand render quietly stops that page being
+	// cached at all, with no error anywhere. Every writer must derive it from the live target
+	// (`!!target.sitemapUrl`) or from the row it is rewriting.
+	//
+	// A genuinely targetless one-off (the render-now shape) reads `!!undefined` off an absent target,
+	// which is `false` without a literal — so this rule costs that case nothing.
+	const literal = /fromSitemap:\s*false/;
+
+	for (const [path, source] of sources) {
+		assert.equal(
+			literal.test(source),
+			false,
+			`${path} passes a literal fromSitemap: false to a schedule write. Derive it from the target ` +
+				`(!!target.sitemapUrl) — a hardcoded false silently un-flags a sitemap-listed URL.`
+		);
+	}
+});
+
 test('the funnel owns the claim floor: nothing else touches the lease table’s floor primitives', () => {
 	// `advanceFloor`/`resetFloor`/`lowerFloorTo` are the correctness surface. A caller outside the
 	// funnel could advance the floor past a row it never observed, which is exactly the 14%-stranding
@@ -109,6 +132,12 @@ test('no table in the schema disables audit — the audit store IS the redo log'
 	// 45s wait did not help. Table data runs WAL-off and `replayLogs()` replays from the audit store,
 	// so turning audit off to halve write volume silently trades durability for bytes. Halving the
 	// queue's write COUNT (which is what this release does) is the safe version of that idea.
+	// Matches the DIRECTIVE, not the word. It used to forbid the word `audit` anywhere in the file,
+	// which was a false positive waiting to happen: audit VOLUME is the measured justification for
+	// several design decisions in here (bulk invalidation records a 102-byte row precisely because
+	// rewriting the corpus costs 61.8 MB of it per node), so a table comment has every reason to say
+	// the word. Forbidding the assignment is what this test actually means.
 	const schema = readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
-	assert.equal(/audit/i.test(schema), false, 'schema.graphql must not mention audit');
+	assert.equal(/audit\s*:/i.test(schema), false, 'schema.graphql must not set an `audit:` directive on any table');
+	assert.equal(/@audit/i.test(schema), false, 'nor an @audit annotation');
 });
