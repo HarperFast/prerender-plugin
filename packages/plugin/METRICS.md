@@ -1,8 +1,10 @@
 # Metrics & observability — `@harperfast/prerender`
 
 Everything this plugin makes observable, in one place: the metrics it emits, the metrics Harper
-emits for its traffic, and the things worth watching that are **not** metrics at all. Written for
-whoever is building the next dashboard or alert.
+emits for its traffic, the API and log surfaces that carry signals no metric has, and what to
+alert on. Written for whoever is building the next dashboard, monitor, or alert — §5 is the
+alerting entry point; §6 lists what is _not_ yet observable so nothing gets built on the
+assumption that it is.
 
 **Source of truth.** The metric names, their dimension slots and their descriptions are declared in
 [`src/metrics.js`](src/metrics.js) and served, live, by
@@ -166,6 +168,26 @@ Grep-able, `[prerender]`-prefixed, and each is the richer record of something th
   `Retrying … (failure strike N)`, `redirected to … which is <class>`. The **only** place a render
   outcome is recorded per URL today (see the gaps below).
 
+And error lines that are the _only_ evidence of their failure mode — each is alert-worthy on any
+sustained rate (see §5):
+
+- **`blob delivery error`** — a cached page whose stored body failed to stream **after the 200 was
+  committed**: the crawler got a truncated response while every metric records a cache hit. The
+  entry self-evicts (the next request heals it), but the serve that triggered it is already wrong,
+  and this line is the only record. Log-only today — see the gaps.
+- **`invalidation read failed for scope …`** — the storage fault behind `invalidation_error`; the
+  metric says how often, the line says which scope and what threw.
+- **`could not accelerate … after an invalidation`** — the demand-driven heal path failing
+  unexpectedly (the metric's `error` outcome, with the exception attached).
+- **`job_result rejected: x-metadata-size …`** — a render worker posting malformed results; the
+  render is lost and re-granted when its lease expires, so a burst means fleet-version skew or a
+  broken worker, not queue trouble.
+- **`render-lease buffer is N bytes but queue.maxLeases=M wants …`** — a `queue.maxLeases` config
+  change reached a running node; the node runs at the OLD size until restarted (the option is
+  restart-scoped for this reason).
+- **`Sitemap <url> failed and was skipped` / `Sitemap refresh for <url> aborted`** — a sitemap walk
+  losing coverage; nothing else reports a failed walk.
+
 ### 4c. Tables you can query directly
 
 Read-only, and mind the caveats: **no `sql` on production**, and a point read of a
@@ -180,9 +202,68 @@ residency-pinned row you don't own can block indefinitely — pass `replicateFro
 | `crawl_stats.CrawlSketch`        | The raw HLL sketches behind crawl-breadth (`day\|bot\|node`).                                                                                                                    |
 | `coordination.SharedBuffer`      | Node-local: the stored backlog snapshot, sitemap-run claims, advisory markers.                                                                                                   |
 
+### 4d. Public REST surfaces (outside `/prerender_admin`)
+
+Same-instance HTTP, documented in the README's endpoint table; these are what an external monitor
+that cannot hold a super-user session can still watch.
+
+| Endpoint                      | Signal                                                                                                                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /queue_status`           | Per-node **observed** queue state (`empty`/`queued`/`paused`) with its `updatedTime` — the staleness of that timestamp is itself a signal (a node not reporting is a node not claiming).          |
+| `GET /queue_control`          | The **desired** pause state (replicated intent). Intent ≠ observed for longer than one `statusSyncInterval` means a node is not converging — that comparison is the pause-machinery health check. |
+| `GET /sitemap_refresh/<root>` | Progress and outcome of a background sitemap walk: which node holds the claim, cursor position, counts so far. The way to tell "slow but moving" from "stalled".                                  |
+| `GET /RenderTarget/<url>`     | One target's stored state (`state`, `strikes`, intervals) — the minimal per-URL probe when the admin API's `explain` isn't available.                                                             |
+
+### 4e. Config warnings are a monitorable surface
+
+`GET /prerender_admin/config` returns `warnings` — the plugin's own findings about risky or
+inert settings (empty security token, empty domains allowlist, rejected route entries, a
+reenqueue window clamped up to the lease time, an invalidation row present while
+`invalidation.enabled` is false…). Each has a `severity` and a stable `key`. **A non-empty
+warnings list after a deploy is the cheapest misconfiguration alert there is** — poll it once per
+config change, not on a cadence.
+
 ---
 
-## 5. Known gaps — worth emitting, not emitted yet
+## 5. Alerting: what to watch
+
+The catalog above is reference; this is the short list. "Sum across nodes" is implied everywhere
+(§1.3). Thresholds are starting points, not doctrine — tune against a week of your own traffic.
+
+**Expect zero — page on any sustained non-zero:**
+
+| Condition                                                     | Meaning                                                                                                                                   |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `below_floor` > 0 across consecutive snapshots | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                            |
+| `invalidation_error` any rate, especially kind `lkg-expired`  | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving. |
+| `page_age_negative` sustained                                 | Cross-node clock skew on the serve path; also quietly undermines `invalidation.pad`'s sizing.                                             |
+| log `blob delivery error`                                     | Truncated 200s recorded as cache hits — invisible to every metric.                                                                        |
+| log `schedule reconcile: restored N` with N > 0               | Terminal schedule gaps existed and were repaired; find what created them.                                                                 |
+| log `Sitemap … failed and was skipped` / `… aborted`          | Lost sitemap coverage.                                                                                                                    |
+
+**Thresholds — warn, then investigate:**
+
+| Condition                                                                           | Meaning                                                                                                         |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `overdue` − `lease_occupancy` growing snapshot-over-snapshot         | The fleet is falling behind demand (remember: `overdue`'s healthy floor IS the in-flight count).                |
+| `queue_health` `floor_pin_age_ms` > ~1 h                                            | One key is holding the claim scan's seek position — the whole node's queue ages behind it.                      |
+| `bot_serve` swr share rising / `route_page_age` p95 > that route's `renderInterval` | The cadence is configured but not delivered — a capacity or scheduling problem, not a config one.               |
+| `bot_serve` miss share rising                                                       | Coverage: new URLs the corpus doesn't have, or the CDN forwarding paths it shouldn't (check `unrouted`).        |
+| `duration` p95 (`path: 'p'`) or `success` ratio degrading                           | The crawler-facing SLO, independent of any plugin-level explanation.                                            |
+| `demand_ladder` `fill` > ~0.5, or `fast_fraction` near `maxFastFraction`            | The visit filter is saturating (false positives promote unvisited pages) / the ladder is at its budget ceiling. |
+| `queue_status` report timestamp stale, or intent ≠ observed > one sync interval     | A node stopped reporting (and likely claiming), or pause propagation is stuck.                                  |
+
+**Absence is a signal — alert when a series stops:**
+
+| Condition                                                 | Meaning                                                                                                                            |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| No `bot_request` rows at all                              | Ingress broken, the CDN stopped forwarding, or `analytics.enabled` was turned off — all three look identical from the dashboard.   |
+| No `queue_health` rows for > 2× `backlogSnapshotInterval` | The snapshotter died or `management.enabled`/the interval was zeroed — the queue is now unmonitored, which is itself the incident. |
+| No `render_time` rows while `overdue` is non-zero         | Workers are not posting results: fleet down, or claim/callback path broken.                                                        |
+
+---
+
+## 6. Known gaps — worth emitting, not emitted yet
 
 Listed with the shape they'd take, so a dashboard doesn't get built on the assumption they exist.
 None of these are decided; all are cheap (a counter bump on a path that already runs).
@@ -207,3 +288,13 @@ None of these are decided; all are cheap (a counter bump on a path that already 
 7. **Hydration health.** A snapshot can be `200`, non-empty and indexable while missing everything
    the client renders. The framework's own hydration marker is the only reliable signal, and nothing
    counts it — the failure mode is silent by construction.
+8. **Serve-path blob failures as a counter.** `blob delivery error` (§4b) is the worst kind of
+   silent: the response was already committed as a 200 cache hit when the body died, so the
+   _metrics say success_. A counter would make truncated serves alertable without log scraping.
+   Shape: `serve_error` counter, `path` = kind (`blob-stream`/…).
+9. **Queue pause as a gauge.** Whether a node's queue is paused (and for how long) lives only in
+   `GET /queue_status` — an alert on "paused > N hours" needs a poller today. One `queue_health`
+   series (`paused`, 0/1) from the snapshot pass would make it a metric like the rest.
+10. **Config warnings as a gauge.** The warnings list (§4e) is pull-only; a `config_warnings` count
+    emitted on config apply would page on a bad deploy instead of waiting for someone to open the
+    console.
