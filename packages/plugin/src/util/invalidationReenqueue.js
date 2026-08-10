@@ -118,6 +118,7 @@ import { getScheduleRow, leaseInfo, writeSchedules } from './renderSchedule.js';
 import { getResidencyByUrl } from './residency.js';
 import { PRERENDER, resolveRenderInterval } from './routeClass.js';
 import { MINUTE, getInitialRenderTime, numberOf } from './time.js';
+import { metrics } from '../metrics.js';
 
 /**
  * Every value the `outcome` dimension can take. Exported so a dashboard or a test can enumerate
@@ -220,7 +221,7 @@ const reserveSlot = () => {
  */
 const spreadWindowMs = () => Math.max(config.invalidation.reenqueue.spreadWindow, config.queue.jobLeaseTime);
 
-const record = (outcome, scope) => server.recordAnalytics(true, 'invalidation_reenqueue', outcome, scope ?? null, null);
+const record = (outcome, scope) => metrics.invalidationReenqueue(outcome, scope);
 
 /**
  * Accelerate one URL, or say exactly why not. Awaited by tests; in production it runs detached

@@ -18,6 +18,7 @@ import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { currentMinuteMs } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
+import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { deliverResource } from './response.js';
 
@@ -34,7 +35,7 @@ export async function handleBotRequest(request) {
 		request.botName = getBotName(request.headers);
 		const recordBots = config.analytics.enabled && (request.botName !== 'other' || config.analytics.recordUnmatched);
 		if (recordBots) {
-			server.recordAnalytics(true, 'bot_request', url.hostname, request.botName, deviceType);
+			metrics.botRequest(url.hostname, request.botName, deviceType);
 			// Crawl breadth (distinct URLs per bot per day): one hash + one byte max into a
 			// per-thread HLL sketch — see util/crawlStats.js for the cost/loss model.
 			recordCrawl(request.botName, cacheUrl);
@@ -84,39 +85,25 @@ export async function handleBotRequest(request) {
 
 // Serve-outcome analytics, recorded once the request has resolved to a resource. `bot_request`
 // (above, at ingress) is raw bot volume; this is what actually answered the request — the
-// rollout success metrics:
+// rollout success metrics. What each one MEANS and what a dashboard does with it lives in the
+// catalog (`src/metrics.js`), which is also what `GET /prerender_admin/metrics` serves; this
+// comment covers only why the emissions are shaped this way HERE.
 //
-//   origin offload   = bot_serve where source !== 'origin' (requests the origin never saw)
-//   cache hit rate   = bot_serve by cacheStatus (hit / swr / stale / miss / skip / bypass).
-//                      'hit' is within the page's renderInterval; 'swr' is served from the
-//                      stale-while-revalidate window. Cache-served = hit + swr; treat hit
-//                      alone as the freshness signal ("is the configured TTL being met").
-//   freshness        = page_age, ms since the served page rendered (cache-served only, so a
-//                      render-now response doesn't drag the distribution toward zero)
+// FOUR METRICS RATHER THAN TWO WITH MORE DIMENSIONS, because recordAnalytics has exactly three
+// dimension slots (path/method/type) and bot_serve's are all taken. The per-route variants carry
+// the route label instead of the bot, which is what makes each route's renderInterval tunable
+// independently. The route label is the matched route's path ('/', '/catalog/', '/product/prd-' —
+// tiny, stable cardinality), else the route class for passthrough, else 'unrouted'.
 //
-// Per-route variants of the same two signals, for tuning each route's renderInterval up or
-// down independently (recordAnalytics has exactly three dimension slots — path/method/type —
-// and bot_serve's are all taken, hence separate metrics rather than a fourth dimension):
+// Cost: two counter bumps per request plus two numeric samples on a cache hit (recordAnalytics
+// buffers in a Map and flushes on Harper's analytics timer) — no storage touch, no await,
+// nothing added to response latency.
 //
-//   route_serve      = (route, cacheStatus, deviceType) counter. swr/stale share per route
-//                      says whether that route's cadence is being DELIVERED; miss share says
-//                      whether its corpus is even covered.
-//   route_page_age   = (route, cacheStatus, deviceType), ms since render, cache-served only.
-//                      Served age per route against that route's own renderInterval is the
-//                      "should this TTL move" number.
-//
-// The route label is the matched route's path ('/', '/catalog/', '/product/prd-' — tiny,
-// stable cardinality), else the route class for passthrough, else 'unrouted'.
-//
-// Cost: two counter bumps per request plus two numeric samples on a cache hit
-// (recordAnalytics buffers in a Map and flushes on Harper's analytics timer) — no storage
-// touch, no await, nothing added to response latency.
-//
-// Exported for tests: the dimension ORDER is the contract dashboards key on.
+// Exported for tests, which assert the emissions this function makes per outcome.
 export function recordServeOutcome(resource, request, info, deviceType) {
 	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
-	server.recordAnalytics(true, 'bot_serve', info.source, info.cacheStatus, request.botName);
-	server.recordAnalytics(true, 'route_serve', route, info.cacheStatus, deviceType);
+	metrics.botServe(info.source, info.cacheStatus, request.botName);
+	metrics.routeServe(route, info.cacheStatus, deviceType);
 	if (info.source === 'cache' && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
@@ -126,8 +113,8 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 		// the mean — both fail the >= 0 check and record nothing.
 		const age = Date.now() - new Date(resource.lastCached).getTime();
 		if (age >= 0) {
-			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
-			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
+			metrics.pageAge(age, request.botName, deviceType);
+			metrics.routePageAge(age, route, info.cacheStatus, deviceType);
 		} else {
 			// COUNT the discards instead of throwing them away. A negative age is a page whose
 			// `lastCached` is in this node's future, i.e. cross-node clock skew — and that is the only
@@ -135,7 +122,7 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 			// cover it and its default is otherwise justified only by the in-flight-render argument,
 			// which is certain but bounds a different quantity. One counter, and the number stops being
 			// silently discarded on every served request.
-			server.recordAnalytics(true, 'page_age_negative', request.botName, deviceType, null);
+			metrics.pageAgeNegative(request.botName, deviceType);
 		}
 	}
 }

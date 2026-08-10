@@ -33,6 +33,8 @@ See each package's README for configuration and usage:
 
 - [Plugin configuration & API](packages/plugin/README.md)
 - [Render service setup](packages/browser/README.md)
+- [Metrics & observability](packages/plugin/METRICS.md) — the metric catalog, and everything else
+  worth watching, for building dashboards and alerts
 
 The plugin's `securityToken` and the client's `RENDERER_BYPASS_*` settings must match for the origin
 to authenticate the renderer.

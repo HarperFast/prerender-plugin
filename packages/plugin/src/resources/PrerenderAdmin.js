@@ -60,6 +60,7 @@
 import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promises';
 import { config, collectConfigWarnings, pendingRestartChanges } from '../config.js';
 import { describeConfigSchema } from '../configSchema.js';
+import { describeMetrics } from '../metrics.js';
 import { redactConfig } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
@@ -445,6 +446,14 @@ export class PrerenderAdmin extends Resource {
 				});
 			case 'crawl-breadth':
 				return PrerenderAdmin.crawlBreadth(target);
+			case 'metrics':
+				// The metric CATALOG, not metric values: names, dimension slots, units, and what each
+				// number is for (`src/metrics.js`). Values come from Harper's own `get_analytics`
+				// operation, per node — see METRICS.md. Served for the same reason `config` serves its
+				// schema: a dashboard (or an agent writing one) should read the contract off the running
+				// version rather than guess which release a doc describes. Static, so it costs nothing
+				// and cannot be a load surface.
+				return json({ metrics: describeMetrics(), node: server.hostname });
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}

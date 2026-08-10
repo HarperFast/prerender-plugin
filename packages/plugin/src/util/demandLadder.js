@@ -40,6 +40,7 @@
 
 import { config, onConfigApplied } from '../config.js';
 import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged, newestFill } from './visitFilter.js';
+import { metrics } from '../metrics.js';
 
 // Normalized rungs, recomputed only when config changes — decideInterval runs on the
 // reschedule path (~20x/s) and must not re-filter/sort per decision. The per-base effective
@@ -233,12 +234,12 @@ export function logDemandStats() {
 	// value metrics on the same buffered path as page_age. Guarded: losing a gauge must never
 	// cost the log line, which is still the richer record (per-level histogram).
 	try {
-		server.recordAnalytics(s.promoted, 'demand_ladder', 'promoted', null, null);
-		server.recordAnalytics(s.demoted, 'demand_ladder', 'demoted', null, null);
-		server.recordAnalytics(s.held, 'demand_ladder', 'held', null, null);
-		server.recordAnalytics(s.skippedCold, 'demand_ladder', 'skipped_cold', null, null);
-		server.recordAnalytics(s.fastFraction, 'demand_ladder', 'fast_fraction', null, null);
-		server.recordAnalytics(fill, 'demand_ladder', 'fill', null, null);
+		metrics.demandLadder(s.promoted, 'promoted');
+		metrics.demandLadder(s.demoted, 'demoted');
+		metrics.demandLadder(s.held, 'held');
+		metrics.demandLadder(s.skippedCold, 'skipped_cold');
+		metrics.demandLadder(s.fastFraction, 'fast_fraction');
+		metrics.demandLadder(fill, 'fill');
 	} catch (e) {
 		logger.warn(`[prerender] demand_ladder gauges not recorded: ${e?.message ?? String(e)}`);
 	}
