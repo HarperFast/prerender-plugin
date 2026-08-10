@@ -182,22 +182,31 @@ test('no module outside src/metrics.js calls server.recordAnalytics directly', a
 
 test('METRICS.md documents exactly the metrics that exist', async () => {
 	// The doc is the human entry point and the catalog is the source of truth; this is what keeps
-	// "added a metric, forgot the doc" from shipping. Names only — the prose is allowed to be
-	// shorter than the catalog's.
+	// "added a metric, forgot the doc" — and its inverse, a doc row for a metric nobody emits —
+	// from shipping.
+	//
+	// CHECKED AGAINST THE TABLE ROWS, not "is the name mentioned somewhere". The metric tables are
+	// the doc's authoritative list, so a row is what "documented" has to mean; a passing mention in
+	// prose is not. Scanning prose instead would also be unable to tell a metric name from the
+	// dozen other snake_case tokens the doc legitimately contains — Harper operation names
+	// (`get_analytics`, `list_metrics`, `describe_table`), dimension VALUES (`below_floor`,
+	// `fast_fraction`, `skipped_cold`), and the deliberately-not-yet-emitted names proposed in the
+	// gaps section (`render_outcome`, `claim_scan`, `origin_fetch`) — each of which a
+	// prose-wide check would flag as an unknown metric.
+	//
+	// The first cell of a metric row is a backticked name and nothing else, which is what the
+	// pattern keys on: the other tables' first cells carry spaces, capitals or dots
+	// (`GET overview`, `render_service.Target`) and so never match.
 	const doc = await readFile(new URL('../METRICS.md', import.meta.url), 'utf8');
-	for (const name of Object.keys(METRICS)) {
-		assert.ok(doc.includes(`\`${name}\``), `METRICS.md does not mention ${name}`);
-	}
-	for (const name of Object.keys(BUILT_IN_METRICS)) {
-		assert.ok(doc.includes(`\`${name}\``), `METRICS.md does not mention the built-in ${name}`);
-	}
-	// And nothing invented: every `metric_name`-shaped token the doc presents as a plugin metric
-	// must exist. Restricted to the snake_case shape the plugin uses, so prose is unaffected.
+	const documented = [...doc.matchAll(/^\|\s*`([a-z0-9_<>-]+)`\s*\|/gm)].map(([, name]) => name);
+
 	const known = new Set([...Object.keys(METRICS), ...Object.keys(BUILT_IN_METRICS)]);
-	for (const [, token] of doc.matchAll(/`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`/g)) {
-		if (token.startsWith('invalidation_') || token.startsWith('route_') || token.startsWith('bot_')) {
-			assert.ok(known.has(token), `METRICS.md references an unknown metric \`${token}\``);
-		}
+	for (const name of documented) {
+		assert.ok(known.has(name), `METRICS.md has a table row for \`${name}\`, which no catalog entry declares`);
+	}
+	// Every direction, and every metric — a typo anywhere in a name fails one side or the other.
+	for (const name of known) {
+		assert.ok(documented.includes(name), `METRICS.md has no table row for \`${name}\``);
 	}
 });
 
