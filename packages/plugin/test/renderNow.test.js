@@ -69,7 +69,7 @@ test('resolveServingPolicy grants no levers when the token is missing', () => {
 		'GET',
 		headersWith({ 'x-harper-render-now': 'anything', 'cache-control': 'no-cache' })
 	);
-	assert.deepEqual(policy, { skipCache: false, missMode: 'origin' });
+	assert.deepEqual(policy, { skipCache: false, missMode: 'origin', missModeExplicit: false });
 });
 
 test('isRenderNowAuthorized honors a custom header name', () => {
@@ -204,7 +204,36 @@ test('resolveServingPolicy: a prerender path gets both on-demand levers', () => 
 		'GET',
 		headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' })
 	);
-	assert.deepEqual(policy, { skipCache: true, missMode: 'prerender' });
+	assert.deepEqual(policy, { skipCache: true, missMode: 'prerender', missModeExplicit: false });
+});
+
+test('missModeExplicit distinguishes an ASKED-FOR prerender from an inherited default', () => {
+	// This is the whole reason the field exists. A bulk invalidation forces `missMode: 'origin'` for
+	// an invalidated-but-still-fresh page, because with `defaultMissMode: 'prerender'` every
+	// authorized request to one would otherwise become an unjittered schedule write plus up to 30s of
+	// polling for a render that has no reason to arrive. But an operator who explicitly asks for
+	// `prerender` is saying "heal this one URL now", which is exactly how a rehearsal is verified — so
+	// that gesture has to survive, and the two cases are indistinguishable from `missMode` alone.
+	applyOptions({ renderNow: { enabled: true, token: 'secret', defaultMissMode: 'prerender', missHeader: 'x-miss' } });
+	const authorized = { 'x-harper-render-now': 'secret' };
+
+	const inherited = resolveServingPolicy(PRERENDER, 'GET', headersWith(authorized));
+	assert.equal(inherited.missMode, 'prerender');
+	assert.equal(inherited.missModeExplicit, false, 'the default is not a gesture');
+
+	const asked = resolveServingPolicy(PRERENDER, 'GET', headersWith({ ...authorized, 'x-miss': 'prerender' }));
+	assert.equal(asked.missModeExplicit, true);
+
+	// An unrecognised value falls back to the default, and falling back is not an explicit choice.
+	const garbage = resolveServingPolicy(PRERENDER, 'GET', headersWith({ ...authorized, 'x-miss': 'sideways' }));
+	assert.equal(garbage.missMode, 'prerender');
+	assert.equal(garbage.missModeExplicit, false);
+
+	// And an UNAUTHORIZED request never gets it, however it asks — crawler volume must never be able
+	// to turn itself into schedule writes.
+	const unauth = resolveServingPolicy(PRERENDER, 'GET', headersWith({ 'x-miss': 'prerender' }));
+	assert.equal(unauth.missModeExplicit, false);
+	assert.equal(unauth.missMode, 'origin');
 });
 
 test('resolveServingPolicy: a non-prerender path never skips the cache or forces a render', () => {
@@ -214,21 +243,33 @@ test('resolveServingPolicy: a non-prerender path never skips the cache or forces
 	authorizedOnDemand();
 	const headers = headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' });
 	for (const routeClass of [PASSTHROUGH, UNCLASSIFIED]) {
-		assert.deepEqual(resolveServingPolicy(routeClass, 'GET', headers), { skipCache: false, missMode: 'origin' });
+		assert.deepEqual(resolveServingPolicy(routeClass, 'GET', headers), {
+			skipCache: false,
+			missMode: 'origin',
+			missModeExplicit: false,
+		});
 	}
 });
 
 test('resolveServingPolicy: the levers need an authorized GET', () => {
 	authorizedOnDemand();
 	const headers = headersWith({ 'x-harper-render-now': 'secret', 'cache-control': 'no-cache' });
-	assert.deepEqual(resolveServingPolicy(PRERENDER, 'HEAD', headers), { skipCache: false, missMode: 'origin' });
+	assert.deepEqual(resolveServingPolicy(PRERENDER, 'HEAD', headers), {
+		skipCache: false,
+		missMode: 'origin',
+		missModeExplicit: false,
+	});
 
 	const unauthorized = headersWith({ 'x-harper-render-now': 'wrong', 'cache-control': 'no-cache' });
-	assert.deepEqual(resolveServingPolicy(PRERENDER, 'GET', unauthorized), { skipCache: false, missMode: 'origin' });
+	assert.deepEqual(resolveServingPolicy(PRERENDER, 'GET', unauthorized), {
+		skipCache: false,
+		missMode: 'origin',
+		missModeExplicit: false,
+	});
 });
 
 test('resolveServingPolicy: an authorized GET without Cache-Control still warms on demand', () => {
 	authorizedOnDemand();
 	const policy = resolveServingPolicy(PRERENDER, 'GET', headersWith({ 'x-harper-render-now': 'secret' }));
-	assert.deepEqual(policy, { skipCache: false, missMode: 'prerender' });
+	assert.deepEqual(policy, { skipCache: false, missMode: 'prerender', missModeExplicit: false });
 });

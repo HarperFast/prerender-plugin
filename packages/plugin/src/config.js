@@ -375,6 +375,49 @@ export const collectConfigWarnings = () => {
 			);
 		}
 	}
+	if (config.invalidation.enabled && config.invalidation.pad < config.queue.jobLeaseTime) {
+		// Cross-option, like spreadWindow below. The pad's config text calls in-flight renders "the
+		// certain one" of the two things it covers — but a job legitimately holds its claim for up to
+		// jobLeaseTime, and a render that posts back later than the pad stamps lastCached after
+		// epoch+pad with PRE-change bytes: the page reads as healed and serves wrong content until its
+		// next cadence render (48h on the long-tail route), with no counter firing because the
+		// comparison sincerely passes. Normal claim-to-post is seconds, so the default usually holds —
+		// this fires so the operator sees the gap during exactly the degraded/backlogged states in
+		// which invalidations get recorded. Cost of matching pad to jobLeaseTime is one extra render
+		// per over-included page.
+		add(
+			'warn',
+			'invalidation.pad',
+			`invalidation.pad (${config.invalidation.pad}ms) is below queue.jobLeaseTime ` +
+				`(${config.queue.jobLeaseTime}ms) — a render claimed just before an invalidation may post back ` +
+				`after the pad, stamping pre-change content as healed for a full render interval. Set pad >= ` +
+				`jobLeaseTime unless post-back latency is known to be seconds.`
+		);
+	}
+	const { reenqueue } = config.invalidation;
+	if (reenqueue.enabled && reenqueue.spreadWindow < config.queue.jobLeaseTime) {
+		// Cross-option, so it cannot live in the schema's per-option constraints — and it is a warning
+		// plus a clamp at use time rather than a rejection, because rejecting back to the default would
+		// silently WIDEN the window an operator deliberately narrowed.
+		//
+		// THE HAZARD IS THE PILE, NOT THE LEASE. A narrow window squeezes every accelerated row on the
+		// node onto a handful of minutes, and rows piled at the minute the claim scan seeks take that
+		// scan from 0.36ms to 11.59ms (32x), clearing only on the store's next compaction. This warning
+		// used to claim instead that a key re-armed sooner than `jobLeaseTime` chases a render that still
+		// holds its lease — which a window WIDTH cannot prevent (the jitter is uniform, so most keys are
+		// re-armed sooner than a lease even at the defaults), and which the accelerator's node-local
+		// `leased` guard already refuses exactly. `jobLeaseTime` remains the clamp only because the
+		// schema floors it at 2 minutes, making it the smallest spread this system already trusts.
+		add(
+			'warn',
+			'invalidation.reenqueue.spreadWindow',
+			`invalidation.reenqueue.spreadWindow (${reenqueue.spreadWindow}ms) is below queue.jobLeaseTime ` +
+				`(${config.queue.jobLeaseTime}ms) — that squeezes every accelerated due time onto a handful of ` +
+				`minutes, and a pile of rows at the minute the claim scan seeks takes that scan from 0.36ms to ` +
+				`11.59ms. The accelerator is using ${config.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
+				`least that to silence this.`
+		);
+	}
 
 	return findings;
 };

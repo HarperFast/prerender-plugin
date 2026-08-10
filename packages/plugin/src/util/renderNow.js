@@ -23,7 +23,27 @@ export const resolveServingPolicy = (routeClass, method, headers) => {
 	return {
 		skipCache: authorized && wantsCacheSkip(headers),
 		missMode: authorized ? resolveMissMode(headers) : 'origin',
+		// Whether `prerender` was ASKED FOR on this request rather than inherited from
+		// `defaultMissMode`. The bulk-invalidation path needs the distinction and must not re-parse
+		// headers to get it: an invalidated-but-still-fresh page is not a miss, so with
+		// `defaultMissMode: 'prerender'` every authorized request to one would otherwise become an
+		// unjittered schedule write plus up to `renderNow.timeoutMs` of polling that cannot succeed.
+		// An explicit `missHeader: prerender` is a deliberate "heal this one URL now" gesture and
+		// still wins; the default is not a gesture at all.
+		missModeExplicit: authorized && isMissModeExplicit(headers),
 	};
+};
+
+/**
+ * Did this request name a miss mode itself? True only for a header value this plugin recognises —
+ * an unrecognised value falls back to `defaultMissMode`, which is not an explicit choice of anything.
+ */
+export const isMissModeExplicit = (headers) => {
+	const { missHeader } = config.renderNow;
+	const value = missHeader ? headers.get(missHeader) : null;
+	if (!value) return false;
+	const normalized = value.trim().toLowerCase();
+	return normalized === 'origin' || normalized === 'prerender';
 };
 
 /**

@@ -6,13 +6,15 @@ import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { resolveForwardedRequest } from '../util/ingress.js';
-import { classifyPath, isForwardedMode, PRERENDER } from '../util/routeClass.js';
+import { classifyPath, isForwardedMode, routeScopeForEntry, PRERENDER } from '../util/routeClass.js';
 import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
-import { cacheServeStatus } from '../util/pageFreshness.js';
+import { resolveServeStatus } from '../util/pageFreshness.js';
+import { resolveInvalidation } from '../util/invalidation.js';
+import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { currentMinuteMs } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
@@ -56,6 +58,16 @@ export async function handleBotRequest(request) {
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		maybeSchedule(resource, routeClass);
+		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
+		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
+		// only when the page would otherwise have been served). Detached inside, like maybeSchedule —
+		// and gated on the same `routeClass`, since a passthrough route still serves from cache.
+		maybeAccelerateHeal({
+			url: cacheUrl,
+			cacheKey: info.cacheKey,
+			invalidatedBy: info.invalidatedBy,
+			routeClass,
+		});
 		if (recordBots) {
 			recordServeOutcome(resource, request, info, deviceType);
 		}
@@ -116,6 +128,14 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 		if (age >= 0) {
 			server.recordAnalytics(age, 'page_age', request.botName, deviceType);
 			server.recordAnalytics(age, 'route_page_age', route, info.cacheStatus, deviceType);
+		} else {
+			// COUNT the discards instead of throwing them away. A negative age is a page whose
+			// `lastCached` is in this node's future, i.e. cross-node clock skew — and that is the only
+			// evidence anywhere of how large the skew actually is. `invalidation.pad` exists partly to
+			// cover it and its default is otherwise justified only by the in-flight-render argument,
+			// which is certain but bounds a different quantity. One counter, and the number stops being
+			// silently discarded on every served request.
+			server.recordAnalytics(true, 'page_age_negative', request.botName, deviceType, null);
 		}
 	}
 }
@@ -179,25 +199,63 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 
 	// Note a non-prerender class still SERVES from cache here — it only never populates one
 	// (`maybeSchedule` below). See resolveServingPolicy for why that matters.
-	const { skipCache, missMode } = resolveServingPolicy(routeClass, request.method, request.headers);
+	const { skipCache, missMode, missModeExplicit } = resolveServingPolicy(routeClass, request.method, request.headers);
 
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
 	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
 	// number, or serialized string all compare correctly — cf. the Number() coercion in
 	// util/renderNow.js. A bad/missing value yields NaN => not servable from cache.
 	const expiresAtMs = page && page.expiresAt ? new Date(page.expiresAt).getTime() : NaN;
-	const serveStatus = cacheServeStatus(expiresAtMs, config.page.swrTtl, Date.now());
+	// Threaded from here rather than re-parsed: `lastCached` was being turned into a number two to
+	// three times per served request across this file and response.js.
+	const lastCachedMs = page && page.lastCached ? new Date(page.lastCached).getTime() : NaN;
+	const now = Date.now();
 
-	if (serveStatus) {
-		info.cacheStatus = serveStatus;
+	// READ THE EPOCH ONLY WHEN THIS REQUEST WOULD OTHERWISE HAVE BEEN A CACHE SERVE. Invalidation has
+	// one mode and can only ever DEMOTE, so gating on "would have served" costs no correctness at all,
+	// while a miss, a cache skip, a non-GET, a page already past its SWR window, and
+	// `invalidation.enabled: false` every one of them pay ZERO added cost. The gate is also what makes
+	// the `invalidated` counter mean "cache serves this invalidation is costing us" rather than an
+	// unbounded tally of every stale key in the scope.
+	// `info.route` is the entry matched at ingress, so this costs no second classification and cannot
+	// disagree with the route label the metrics already used.
+	const epoch =
+		page && expiresAtMs + config.page.swrTtl > now ? await resolveInvalidation(routeScopeForEntry(info.route)) : null;
+
+	const { status, servable, invalidatedBy } = resolveServeStatus({
+		expiresAtMs,
+		lastCachedMs,
+		swrTtl: config.page.swrTtl,
+		now,
+		epoch,
+	});
+	info.invalidatedBy = invalidatedBy;
+
+	if (servable) {
+		info.cacheStatus = status;
 		info.source = 'cache';
 		return page;
 	}
 
-	info.cacheStatus = skipCache ? 'skip' : page ? 'stale' : 'miss';
+	info.cacheStatus = skipCache ? 'skip' : status === 'invalidated' ? 'invalidated' : page ? 'stale' : 'miss';
 
-	if (missMode === 'prerender') {
-		const rendered = await renderNow({ url, deviceType, cacheKey, request });
+	// AN INVALIDATION IS NOT A MISS FOR THE ON-DEMAND LEVERS. Without this, `defaultMissMode:
+	// 'prerender'` turns every authorized request for a still-fresh-but-invalidated page into a
+	// schedule write at `currentMinuteMs()` — unjittered, which is the herd this feature exists to
+	// avoid — plus up to `renderNow.timeoutMs` (30s) of polling for a render that has no reason to
+	// arrive. An EXPLICIT `missHeader: prerender` still wins: that is a deliberate "heal this one URL
+	// now", and it is exactly the gesture an operator uses to verify a rehearsal.
+	const effectiveMissMode = status === 'invalidated' && !missModeExplicit ? 'origin' : missMode;
+
+	if (effectiveMissMode === 'prerender') {
+		const rendered = await renderNow({
+			url,
+			cacheUrl,
+			deviceType,
+			cacheKey,
+			request,
+			routeScope: routeScopeForEntry(info.route),
+		});
 		info.renderNowStatus = rendered.renderNowStatus;
 		// 'hit' served the fresh render; on timeout we served the fallback (a cached page
 		// when miss=false, else the origin proxy / 504).
@@ -206,7 +264,16 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	}
 
 	info.source = 'origin';
-	return fetchOriginResource({ url, deviceType, headers: request.headers });
+	// `stripValidators` on an invalidated verdict, so the origin cannot answer 304 to the validators
+	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
+	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
+	// invalidation worked. See util/upstream.js.
+	return fetchOriginResource({
+		url,
+		deviceType,
+		headers: request.headers,
+		stripValidators: info.cacheStatus === 'invalidated',
+	});
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
@@ -222,8 +289,19 @@ function maybeSchedule(resource, routeClass) {
 // On-demand render: force an immediate one-off render and wait for the fresh result,
 // bypassing both the cache and the origin proxy. Returns { resource, renderNowStatus }
 // where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
-async function renderNow({ url, deviceType, cacheKey, request }) {
+async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeScope }) {
 	const since = Date.now();
+
+	// `fromSitemap` COMES FROM THE TARGET, and this fixes a pre-existing bug: `put` REPLACES the
+	// record, so the hardcoded `false` this call used to pass silently cleared the flag on any
+	// sitemap-sourced URL somebody rendered on demand. `claim` then reported `isFromSitemap: false`
+	// to the renderer, which skips serializing a non-indexable page unless it is sitemap-listed — so
+	// one authenticated render-now could quietly stop that page being cached at all, and the next
+	// scheduled render would re-file the same `false` from a schedule row nobody suspected.
+	// The target is the field's source of truth (`RenderQueue` re-derives it from there on every
+	// reschedule for exactly that reason). NO target is the legitimate render-now one-off shape, where
+	// `false` is the true answer.
+	const renderTarget = await Target.get({ id: cacheUrl, select: ['sitemapUrl'] });
 
 	// Force an immediately-claimable, one-off schedule. No Target is created, so
 	// processJobResult won't reschedule it — and drops the schedule row once the result
@@ -235,7 +313,7 @@ async function renderNow({ url, deviceType, cacheKey, request }) {
 	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
 	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
 	// keeps the row above the owner's floor and therefore claimable.
-	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: false });
+	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: !!renderTarget?.sitemapUrl });
 
 	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
 	// so a paused queue stays paused (the render then simply times out to the fallback).
@@ -266,12 +344,29 @@ async function renderNow({ url, deviceType, cacheKey, request }) {
 
 	if (fallback === 'stale') {
 		const stale = await PrerenderedPage.get(cacheKey);
-		if (stale) return { resource: stale, renderNowStatus: 'timeout' };
+		// `fallback: 'stale'` is opt-in STALENESS — it deliberately serves a page past its window, so
+		// no freshness check belongs here. An invalidation is a different statement: not "this is old"
+		// but "this is WRONG", and serving it would defeat the invalidation on the one path that reads
+		// the cache without ever passing the gate above (it got here with `skipCache` true, so this is
+		// the request's first and only epoch read).
+		if (stale) {
+			const staleLastCachedMs = stale.lastCached ? new Date(stale.lastCached).getTime() : NaN;
+			const epoch = await resolveInvalidation(routeScope);
+			if (!epoch || staleLastCachedMs > epoch.at) return { resource: stale, renderNowStatus: 'timeout' };
+		}
 	}
 
-	// 'origin' (default), or 'stale' with no cached page to serve.
+	// 'origin' (default), or 'stale' with no cached page to serve. If an invalidation is active
+	// for this scope, strip the crawler's conditional validators — the same 304 defeat the direct
+	// origin path in resolveResource closes: the validators came from us, off a snapshot the epoch
+	// may have just invalidated, and an origin whose ETag is publish-date-shaped answers 304,
+	// letting the crawler keep pre-change bytes while the request records renderNowStatus:
+	// 'timeout' and every signal reads as success. Stripping whenever ANY epoch is active for the
+	// scope (rather than re-deriving this page's exact verdict) over-strips at worst — the cost is
+	// a full origin response instead of a 304, only while an invalidation row exists.
+	const activeEpoch = await resolveInvalidation(routeScope);
 	return {
-		resource: await fetchOriginResource({ url, deviceType, headers: request.headers }),
+		resource: await fetchOriginResource({ url, deviceType, headers: request.headers, stripValidators: !!activeEpoch }),
 		renderNowStatus: 'timeout',
 	};
 }

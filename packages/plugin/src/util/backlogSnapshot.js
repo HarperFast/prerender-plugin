@@ -41,7 +41,7 @@ import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
 import { HOUR, MINUTE, numberOf } from './time.js';
-import { currentFloorMs, inFlightLeases } from './renderSchedule.js';
+import { currentFloorMs, inFlightLeases, floorState } from './renderSchedule.js';
 
 // Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
 // worker that also serves bot traffic must never monopolize the loop between rows.
@@ -246,6 +246,25 @@ export const runBacklogSnapshotOnce = async () => {
 				};
 
 		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+
+		// Alertable gauges off numbers this pass already computed — until here they existed only in
+		// the admin console, so "a row sits below the claim floor" (the silent render gap) and "the
+		// floor has been pinned for hours" were facts nobody could page on. Emitted from the same
+		// one-worker-per-node cadence as the snapshot itself; value metrics, same buffered
+		// recordAnalytics path as page_age. Guarded separately: losing a gauge must never cost the
+		// snapshot.
+		try {
+			const floor = floorState(startedAt);
+			server.recordAnalytics(stats.overdue, 'queue_health', 'overdue', null, null);
+			server.recordAnalytics(stats.inFlight, 'queue_health', 'lease_occupancy', null, null);
+			server.recordAnalytics(stats.belowFloor, 'queue_health', 'below_floor', null, null);
+			if (stats.oldestBelowFloorMs !== null) {
+				server.recordAnalytics(startedAt - stats.oldestBelowFloorMs, 'queue_health', 'below_floor_age_ms', null, null);
+			}
+			server.recordAnalytics(floor.floorPinnedForMs, 'queue_health', 'floor_pin_age_ms', null, null);
+		} catch (e) {
+			logger.warn?.(`[prerender] queue_health gauges not recorded: ${e?.message ?? String(e)}`);
+		}
 	} catch (e) {
 		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
 	}

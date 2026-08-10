@@ -155,7 +155,14 @@ export const sanitizeOriginResponseHeaders = (headers) => {
 	return clean;
 };
 
-export const resolveUpstreamHeaders = (downstream, deviceType) => {
+/**
+ * The two request validators. Normally forwarded to the origin on purpose — a crawler's conditional
+ * request is cheap for everyone when the origin can answer 304 — but they must be stripped when an
+ * invalidation is why we are fetching at all. See `stripValidators` below.
+ */
+const VALIDATOR_HEADERS = ['if-none-match', 'if-modified-since'];
+
+export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators = false } = {}) => {
 	const upstream = {
 		'user-agent': config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop,
 		[config.origin.securityToken.header]: config.origin.securityToken.value,
@@ -170,6 +177,17 @@ export const resolveUpstreamHeaders = (downstream, deviceType) => {
 		const ignored = ignoredDownstreamRequestHeaders();
 		Object.keys(downstream).forEach((key) => {
 			if (ignored.has(key)) return;
+			// STRIP THE VALIDATORS WHEN AN INVALIDATION IS WHY WE ARE HERE, so the origin must send a
+			// body. The validators the crawler is holding came from US, off the snapshot that has just
+			// been invalidated — and an origin whose ETag is a publish date rather than a content hash
+			// answers 304 to them. The plugin then relays that 304, `computeWasCacheMiss` reports a miss,
+			// and the request records `cacheStatus: 'invalidated'` while the crawler keeps the exact
+			// bytes the invalidation existed to stop serving. Every signal reads as success.
+			//
+			// Scoped to that one verdict: forwarding a conditional request is otherwise correct and
+			// cheap, and stripping these unconditionally would turn every crawler revalidation into a
+			// full body transfer.
+			if (stripValidators && VALIDATOR_HEADERS.includes(key)) return;
 			upstream[key] = downstream[key];
 		});
 	}
@@ -178,7 +196,7 @@ export const resolveUpstreamHeaders = (downstream, deviceType) => {
 };
 
 export const fetchOriginResource = async (request) => {
-	const { url, deviceType, method = 'GET', body } = request;
+	const { url, deviceType, method = 'GET', body, stripValidators = false } = request;
 	const headers = request.headers.asObject;
 
 	const urlObj = url instanceof URL ? url : new URL(url);
@@ -192,7 +210,7 @@ export const fetchOriginResource = async (request) => {
 		origin: urlObj.origin,
 		path: urlObj.pathname + urlObj.search,
 		method,
-		headers: resolveUpstreamHeaders(headers, deviceType),
+		headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators }),
 		body,
 	});
 
