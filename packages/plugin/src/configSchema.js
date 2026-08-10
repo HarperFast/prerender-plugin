@@ -663,8 +663,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'`fastRetries` consecutive failures DELIBERATELY DO NOT RELEASE the job’s claim lease, so the ' +
 				'retry comes on lease expiry (`queue.jobLeaseTime`) — an origin blip recovers fast, and the ' +
 				'cached page’s stale-while-revalidate window covers bots throughout. From the next strike on, ' +
-				'the retry drops to the target’s normal cadence: a persistently failing page must not hot-loop ' +
-				'100+ renders a day. Past `page.swrTtl` the kept page stops serving and bots fall through to ' +
+				'the retry drops to the target’s normal cadence and then backs off from there ' +
+				'(`backoffFactor`, `maxBackoff`, `nonSitemapPenalty`): a persistently failing page must not ' +
+				'hot-loop 100+ renders a day. Past `page.swrTtl` the kept page stops serving and bots fall through to ' +
 				'the origin on purpose — its answer (a live page for auth-shaped failures, an honest 5xx for ' +
 				'transient ones) is the truth, and serving arbitrarily old snapshots while users get errors ' +
 				'would break bot/user parity. Strikes are the target’s one shared counter; any successful ' +
@@ -683,6 +684,30 @@ export const configSchema = group('Prerender plugin configuration.', {
 					{
 						min: 0,
 					}
+				),
+				backoffFactor: option(
+					2,
+					'Multiplier applied per strike once the fast lane is exhausted. The first escalation waits ' +
+						'exactly one normal interval; each strike after that multiplies by this. 1 disables ' +
+						'backoff and restores the flat pre-0.37.0 cadence.',
+					{ min: 1 }
+				),
+				maxBackoff: option(
+					7 * DAY,
+					'Ceiling on the backed-off wait. Never shortens a retry below the target’s own cadence — a ' +
+						'ceiling under the interval (a 48h page against a 24h ceiling) would otherwise make a ' +
+						'FAILING page come due more often than a healthy one.',
+					{ unit: 'ms', min: 1 }
+				),
+				nonSitemapPenalty: option(
+					4,
+					'Extra wait multiplier for a failing target with no sitemap source, applied from the SECOND ' +
+						'escalation on — every target gets one honest retry at its normal cadence first, so a ' +
+						'single failure never deprioritizes a URL. Sitemap URLs are the corpus we promised to ' +
+						'keep fresh, so they stay on the base curve while discovered URLs back off harder. ' +
+						'Priority is expressed purely as a due time — `claim` orders by nextRenderTime alone — ' +
+						'so this needs no priority field and no second index. 1 treats both alike.',
+					{ min: 1 }
 				),
 			}
 		),
