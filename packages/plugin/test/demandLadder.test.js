@@ -4,8 +4,10 @@ import { applyOptions, config } from '../src/config.js';
 import { defaultConfig } from '../src/configSchema.js';
 import { decideInterval, rungIndexOf, rungs, drainStats, resetDemandStats } from '../src/util/demandLadder.js';
 
-// The module logs through the ambient Harper `logger` global; give the test env one.
+// The module logs through the ambient Harper `logger` global and records gauges through
+// `server`; give the test env both.
 globalThis.logger ??= { info() {}, warn() {}, error() {} };
+globalThis.server ??= { hostname: 'test-node', recordAnalytics() {} };
 
 const H = 60 * 60 * 1000;
 

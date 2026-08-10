@@ -225,6 +225,23 @@ export function logDemandStats() {
 	const s = drainStats();
 	if (!s.total) return;
 	const demand = config.render.demand;
+	const fill = newestFill();
+
+	// The same numbers as METRICS, not just a log line — with the ladder enabled without a
+	// dry-run week, this histogram is the only guardrail, and a guardrail nobody can alert on
+	// is a postmortem exhibit. Counters sum correctly across workers; fastFraction and fill are
+	// value metrics on the same buffered path as page_age. Guarded: losing a gauge must never
+	// cost the log line, which is still the richer record (per-level histogram).
+	try {
+		server.recordAnalytics(s.promoted, 'demand_ladder', 'promoted', null, null);
+		server.recordAnalytics(s.demoted, 'demand_ladder', 'demoted', null, null);
+		server.recordAnalytics(s.held, 'demand_ladder', 'held', null, null);
+		server.recordAnalytics(s.skippedCold, 'demand_ladder', 'skipped_cold', null, null);
+		server.recordAnalytics(s.fastFraction, 'demand_ladder', 'fast_fraction', null, null);
+		server.recordAnalytics(fill, 'demand_ladder', 'fill', null, null);
+	} catch (e) {
+		logger.warn(`[prerender] demand_ladder gauges not recorded: ${e?.message ?? String(e)}`);
+	}
 	const pretty = Object.fromEntries(Object.entries(s.levels).map(([ms, n]) => [`${Math.round(ms / 3600000)}h`, n]));
 	const line = {
 		dryRun: demand.dryRun,
@@ -237,7 +254,7 @@ export function logDemandStats() {
 		// Set-bit fraction of the newest union slot — the sizing early warning. A k-hash probe
 		// false-positives at ~fill^k (k=7: fill 0.5 ≈ 0.8%, fill 0.88 ≈ 40%), and false
 		// positives promote pages nobody visited — watch this before trusting the histogram.
-		fill: Number(newestFill().toFixed(4)),
+		fill: Number(fill.toFixed(4)),
 		levels: pretty,
 	};
 	if (s.fastFraction > demand.maxFastFraction) {
