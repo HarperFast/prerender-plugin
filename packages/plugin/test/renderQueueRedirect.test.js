@@ -36,6 +36,7 @@ const stores = {
 };
 
 let warns = [];
+let infos = [];
 let analytics = [];
 
 // Minimal stand-in for a Harper table/resource: static get/put/delete dispatch through an
@@ -110,7 +111,8 @@ before(async () => {
 		recordAnalytics: (...args) => analytics.push(args),
 	};
 	globalThis.logger = {
-		info() {},
+		debug() {},
+		info: (msg) => infos.push(String(msg)),
 		warn: (msg) => warns.push(String(msg)),
 		error() {},
 	};
@@ -146,6 +148,7 @@ before(async () => {
 beforeEach(() => {
 	for (const rows of Object.values(stores)) rows.clear();
 	warns = [];
+	infos = [];
 	analytics = [];
 	// The shared buffer OUTLIVES the store clears above, so the leases and the claim floor would
 	// otherwise leak from one test into the next.
@@ -201,8 +204,29 @@ test('301 onto a served route retires the source URL — all devices — and ado
 		assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
 	}
 
-	assert.equal(analytics.length, 1, 'redirect results still record render_time analytics');
-	assert.equal(analytics[0][3], 'redirect');
+	// One time_ms sample plus exactly one outcome — the emit-once-per-result contract, both
+	// series of the `render` metric: (value, 'render', series, ...detail slots).
+	const renderTimes = analytics.filter((a) => a[1] === 'render' && a[2] === 'time_ms');
+	assert.equal(renderTimes.length, 1, 'redirect results still record render duration analytics');
+	assert.equal(renderTimes[0][4], 'redirect');
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
+	assert.deepEqual(
+		outcomes.map((a) => [a[3], a[4]]),
+		[['redirect', 'permanent']],
+		'exactly one render outcome per posted result'
+	);
+});
+
+test('a rendered verdict with nothing to store is counted as no-content, not stored', async () => {
+	// legacyOutcome calls an isIndexable-only result 'rendered'; the outcome detail must not
+	// claim a page was cached when nothing was.
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true });
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
+	assert.deepEqual(
+		outcomes.map((a) => [a[3], a[4]]),
+		[['rendered', 'no-content']]
+	);
 });
 
 test('301 onto an already-targeted destination adopts nothing and leaves its schedule alone', async () => {
@@ -413,9 +437,15 @@ test('a non-indexable verdict suppresses the target: state, strikes, recheck sch
 			`${device} rescheduled at the recheck interval, not the render interval`
 		);
 	}
+	// info, not warn, since the log relevel: a suppression is a normal verdict, and the
+	// alertable aggregate is the render_outcome counter (asserted below).
 	assert.ok(
-		warns.some((w) => w.includes('Suppressing') && w.includes('(noindex)')),
-		`expected a suppression warn naming the reason, got: ${warns.join(' | ')}`
+		infos.some((w) => w.includes('Suppressing') && w.includes('(noindex)')),
+		`expected a suppression info line naming the reason, got: ${infos.join(' | ')}`
+	);
+	assert.ok(
+		analytics.some((a) => a[1] === 'render' && a[2] === 'outcome' && a[3] === 'suppressed' && a[4] === 'noindex'),
+		'the suppression is counted with its reason'
 	);
 });
 

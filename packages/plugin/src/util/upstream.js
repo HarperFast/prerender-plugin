@@ -1,4 +1,5 @@
 import { Readable } from 'node:stream';
+import { metrics } from '../metrics.js';
 import { isIP } from 'node:net';
 import { Agent } from 'undici';
 import { config } from '../config.js';
@@ -196,7 +197,7 @@ export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators
 };
 
 export const fetchOriginResource = async (request) => {
-	const { url, deviceType, method = 'GET', body, stripValidators = false } = request;
+	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other' } = request;
 	const headers = request.headers.asObject;
 
 	const urlObj = url instanceof URL ? url : new URL(url);
@@ -206,13 +207,25 @@ export const fetchOriginResource = async (request) => {
 	// the connect address differs.
 	const stagingIp = stagingTargetIp(request.headers);
 
-	const response = await dispatcherFor(stagingIp).request({
-		origin: urlObj.origin,
-		path: urlObj.pathname + urlObj.search,
-		method,
-		headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators }),
-		body,
-	});
+	// origin_fetch times to RESPONSE HEADERS (the body streams to the client afterwards, so
+	// body time is the crawler's, not the origin's) and records the caller's `reason` — why
+	// the cache didn't answer. statusCode 0 = the fetch itself failed before any status
+	// arrived; the throw still propagates to the caller's own error handling.
+	const fetchStarted = performance.now();
+	let response;
+	try {
+		response = await dispatcherFor(stagingIp).request({
+			origin: urlObj.origin,
+			path: urlObj.pathname + urlObj.search,
+			method,
+			headers: resolveUpstreamHeaders(headers, deviceType, { stripValidators }),
+			body,
+		});
+	} catch (e) {
+		metrics.originFetch(performance.now() - fetchStarted, 0, reason);
+		throw e;
+	}
+	metrics.originFetch(performance.now() - fetchStarted, response.statusCode, reason);
 
 	return {
 		miss: true,

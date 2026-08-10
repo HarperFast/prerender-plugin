@@ -33,7 +33,7 @@ before(async () => {
 		config: { http: { port: 9926 } },
 		recordAnalytics: (...args) => analytics.push(args),
 	};
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
 		coordination: {
 			SharedBuffer: {
@@ -136,11 +136,12 @@ test('a lastCached in the FUTURE records page_age_negative instead of silently v
 	// skew actually is — which is half of what invalidation.pad exists to cover. It still must not
 	// enter page_age (it would drag the mean), so it becomes a counter rather than a discard.
 	recordServeOutcome({ lastCached: Date.now() + 60_000 }, request, { source: 'cache', cacheStatus: 'hit' }, 'desktop');
+	// page_age_negative is a prerender_ops series: (true, 'prerender_ops', series, bot, device)
 	assert.deepEqual(
-		analytics.map(([, metric]) => metric),
+		analytics.map(([, metric, seriesOrDim]) => (metric === 'prerender_ops' ? seriesOrDim : metric)),
 		['bot_serve', 'route_serve', 'page_age_negative']
 	);
-	const [value, , bot, device] = analytics[2];
+	const [value, , , bot, device] = analytics[2];
 	assert.equal(value, true, 'a counter, not a duration');
 	assert.equal(bot, 'Googlebot');
 	assert.equal(device, 'desktop');

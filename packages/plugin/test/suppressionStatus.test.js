@@ -108,6 +108,7 @@ before(async () => {
 		recordAnalytics: () => {},
 	};
 	globalThis.logger = {
+		debug() {},
 		info() {},
 		warn: (msg) => warns.push(String(msg)),
 		error: (msg) => errors.push(String(msg)),

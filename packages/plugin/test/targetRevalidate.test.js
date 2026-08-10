@@ -78,7 +78,7 @@ const makeResourceBase = (rows) =>
 
 before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], config: { http: { port: 9926 } } };
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
 		coordination: {
 			SharedBuffer: {

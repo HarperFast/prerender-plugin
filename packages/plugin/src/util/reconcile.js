@@ -30,6 +30,7 @@
  * reads.
  */
 
+import { metrics } from '../metrics.js';
 import { setImmediate } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { CacheKey } from './cacheKey.js';
@@ -193,6 +194,15 @@ export const runReconcileOnce = async (options) => {
 	try {
 		const stats = await reconcileScheduleGaps(options);
 		lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+
+		// The same numbers as METRICS: `restored` > 0 is the alert (URLs were silently
+		// un-renderable until this sweep). Guarded — a gauge must never cost the sweep record.
+		try {
+			metrics.reconcile(stats.restored, 'restored');
+			metrics.reconcile(stats.missing, 'missing');
+		} catch (e) {
+			logger.warn(`[prerender] reconcile gauges not recorded: ${e?.message ?? String(e)}`);
+		}
 
 		// Restoring a row means a URL was silently un-renderable until now, which is worth a
 		// warning rather than an info line. A clean pass says so quietly.

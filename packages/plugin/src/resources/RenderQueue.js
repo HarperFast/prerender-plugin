@@ -289,7 +289,7 @@ export class RenderQueue extends Resource {
 					if (landedOn === PRERENDER) {
 						// Retiring by URL takes the device siblings too — a page does not redirect
 						// for one device and serve for another.
-						logger.warn(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
+						logger.info(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
 						await Target.delete(CacheKey.extractUrl(result.id));
 						cacheKey = redirectKey;
 					} else {
@@ -325,6 +325,15 @@ export class RenderQueue extends Resource {
 		}
 
 		if (outcome === 'rendered') {
+			// One render outcome per posted result (the redirect path emits its own inside
+			// processRedirectResult). `refiled` = the client-side-redirect re-key above moved the
+			// result onto the destination's cache key; `discarded` = it landed on a class we never
+			// serve and the content was dropped; `no-content` = a legacy worker's isIndexable-only
+			// result (legacyOutcome calls it rendered, but there is nothing to store).
+			metrics.renderOutcome(
+				'rendered',
+				discardContent ? 'discarded' : cacheKey !== result.id ? 'refiled' : result.content ? 'stored' : 'no-content'
+			);
 			const url = CacheKey.extractUrl(cacheKey);
 			const renderTarget = await Target.get({
 				id: url,
@@ -389,7 +398,7 @@ export class RenderQueue extends Resource {
 				// A suppressed URL that rendered indexable again has healed — put it back in
 				// normal rotation, so the recheck cadence stops and discovery may see it again.
 				if (renderTarget.state === 'suppressed' && result.isIndexable === true) {
-					logger.warn(`Prerendered url ${url} is indexable again — lifting its suppression`);
+					logger.info(`Prerendered url ${url} is indexable again — lifting its suppression`);
 					await Target.reactivate(url);
 				} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
 					// Strikes are CONSECUTIVE failures by definition: a successful render resets the
@@ -422,6 +431,7 @@ export class RenderQueue extends Resource {
 			// DELETE) swathes of healthy targets exactly when such a failure hits everything at
 			// once. Keep the target, keep its cached page, retry via retryAfterFailure.
 			if (result.statusCode === 401 || result.statusCode === 403) {
+				metrics.renderOutcome('auth-failure', result.statusCode);
 				logger.error(
 					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
 						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
@@ -432,10 +442,17 @@ export class RenderQueue extends Resource {
 				// Suppressing would delete the last good cached page and park the URL for the
 				// recheck interval over what may be one bad minute at the origin — keep both
 				// and retry via retryAfterFailure (fast first, then the target's cadence).
-				logger.warn(`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page`);
+				metrics.renderOutcome('transient', result.statusCode);
+				// info, not warn: by-design tolerance of an origin blip. The aggregate (a transient
+				// BURST is origin trouble) is render_outcome's job, not a per-URL log flood's.
+				logger.info(`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page`);
 				if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
 			} else {
-				logger.warn(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
+				metrics.renderOutcome('suppressed', result.reason ?? 'unspecified');
+				// info, not warn: a suppression is a normal verdict (the page declared itself
+				// non-indexable) and it self-heals on its own recheck cadence. The alertable event is
+				// MASS suppression, which is the render_outcome counter's job.
+				logger.info(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
 				await Target.suppress(CacheKey.extractUrl(cacheKey), {
 					reason: result.reason,
 					statusCode: result.statusCode,
@@ -449,6 +466,7 @@ export class RenderQueue extends Resource {
 			const detail = result.error
 				? ` — ${result.error.name}${result.error.phase ? ` [${result.error.phase}]` : ''}: ${result.error.message}`
 				: '';
+			metrics.renderOutcome('failed', result.error?.phase ?? 'unknown');
 			logger.warn(`Prerender failed for ${cacheKey} (${result.reason || 'no reason reported'})${detail}`);
 			// Same lane as every other non-suppressing failure: fast retries on the held lease,
 			// then escalation to a backed-off due time. This branch used to hold the lease
@@ -496,7 +514,10 @@ export class RenderQueue extends Resource {
 		const authShaped = result.statusCode === 401 || result.statusCode === 403;
 		const transientShaped = result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500;
 		if (authShaped || transientShaped) {
-			logger[authShaped ? 'error' : 'warn'](
+			metrics.renderOutcome('redirect', authShaped ? 'landed-auth' : 'landed-transient');
+			// error for auth (credential/mitigation trouble), info for transient (origin blip) —
+			// same split as processJobResult's non-redirect branches.
+			logger[authShaped ? 'error' : 'info'](
 				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
 					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target`
 			);
@@ -510,6 +531,7 @@ export class RenderQueue extends Resource {
 			// retry at its normal cadence (the retry costs a navigation, not a full settle) —
 			// but count the strike: a source that answers this way every interval is de facto
 			// permanently redirected, and recordRedirectStrike retires it after maxStrikes.
+			metrics.renderOutcome('redirect', 'unrouted-destination');
 			logger.warn(
 				`Prerendered url ${result.id} redirected (${result.statusCode}) to ${result.redirectedTo}, which is ` +
 					`${landedOn} — keeping the target (no key to schedule the destination under)`
@@ -526,7 +548,8 @@ export class RenderQueue extends Resource {
 			// keeps rendering at full cadence. (This keys on the browser's posted verdict, not
 			// the domain-coerced one — a foreign host was never inspected, and a suppressed
 			// foreign row would be registry noise nothing ever reads.)
-			logger.warn(
+			metrics.renderOutcome('redirect', 'non-indexable-destination');
+			logger.info(
 				`Prerendered url ${result.id} redirected to non-indexable ${result.redirectedTo}` +
 					`${result.reason ? ` (${result.reason})` : ''} — retiring the target`
 			);
@@ -548,7 +571,8 @@ export class RenderQueue extends Resource {
 			// a temp redirect EVERY interval is a permanent redirect wearing a temporary status:
 			// each result costs a strike and recordRedirectStrike retires the source after
 			// maxStrikes rather than paying a navigation every interval forever.
-			logger.warn(
+			metrics.renderOutcome('redirect', 'temporary');
+			logger.info(
 				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
 			);
@@ -561,7 +585,8 @@ export class RenderQueue extends Resource {
 		// place. A mutual 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each
 		// hop is a navigation-only render surfaced by this warn, so a broken site costs noise,
 		// not settles.
-		logger.warn(
+		metrics.renderOutcome('redirect', 'permanent');
+		logger.info(
 			`Prerendered url ${result.id} permanently redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
 				`retiring the target in favor of ${redirectKey}`
 		);
@@ -611,7 +636,7 @@ export class RenderQueue extends Resource {
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		const maxStrikes = config.render.redirects.maxStrikes;
 		if (Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
-			logger.warn(
+			logger.info(
 				`Prerendered url ${sourceUrl} kept redirecting ${strikes} consecutive times (${why}) — retiring it; ` +
 					`bots get the origin's own redirect and discovery re-creates what it actually serves`
 			);
@@ -674,7 +699,7 @@ export class RenderQueue extends Resource {
 		await Target.patch(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
-			logger.warn(`Retrying ${cacheKey} on its claim lease (failure strike ${strikes})`);
+			logger.debug(`Retrying ${cacheKey} on its claim lease (failure strike ${strikes})`);
 			// Schedule untouched, lease held by the caller — the lease expiry drives the retry.
 			return 'fast';
 		}
@@ -683,7 +708,7 @@ export class RenderQueue extends Resource {
 		const fromSitemap = !!renderTarget.sitemapUrl;
 		const wait = backoffWait(interval, strikes, fromSitemap);
 		const nextRenderTime = currentMinuteMs() + wait;
-		logger.warn(
+		logger.debug(
 			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
@@ -753,7 +778,15 @@ export class RenderQueue extends Resource {
 		// One pass: floored scan, drained before anything is leased, leases granted from memory,
 		// floor advanced to the first due row the pass saw. All of it in util/renderSchedule.js —
 		// this function owns the wire format and the status report, nothing else.
+		const scanStarted = performance.now();
 		const pass = await claimSchedules({ grantLimit: limit });
+		// The queue's leading indicator: this duration degrades (measured 17x once) when dead index
+		// entries pile at the seek point, before any backlog shows. Two clock reads and one buffered
+		// emit per pass — nothing on the per-row path.
+		metrics.claimScan(
+			performance.now() - scanStarted,
+			pass.scanTruncated ? 'capped' : pass.jobs.length ? 'granted' : 'empty'
+		);
 
 		const jobs = [];
 		let notOwnedHere = 0;

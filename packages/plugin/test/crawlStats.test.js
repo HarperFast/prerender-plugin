@@ -28,7 +28,7 @@ let applyOptions;
 before(async () => {
 	globalThis.Resource = class {};
 	globalThis.server = { hostname: 'node-a', workerIndex: 1 };
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
 		coordination: {
 			SharedBuffer: {

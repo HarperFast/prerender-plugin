@@ -173,6 +173,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 			method: request.method,
 			headers: request.headers,
 			body: request._nodeRequest,
+			reason: 'bypass',
 		});
 	}
 
@@ -260,6 +261,8 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		deviceType,
 		headers: request.headers,
 		stripValidators: info.cacheStatus === 'invalidated',
+		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
+		reason: info.cacheStatus,
 	});
 }
 
@@ -353,7 +356,13 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// a full origin response instead of a 304, only while an invalidation row exists.
 	const activeEpoch = await resolveInvalidation(routeScope);
 	return {
-		resource: await fetchOriginResource({ url, deviceType, headers: request.headers, stripValidators: !!activeEpoch }),
+		resource: await fetchOriginResource({
+			url,
+			deviceType,
+			headers: request.headers,
+			stripValidators: !!activeEpoch,
+			reason: 'render-timeout',
+		}),
 		renderNowStatus: 'timeout',
 	};
 }

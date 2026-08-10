@@ -74,6 +74,28 @@ test('counts into an overflow tally past maxBuckets instead of evicting', () => 
 	assert.equal(report[UNCLASSIFIED].find((row) => row.bucket === '/a/*').count, 2);
 });
 
+test('the flush emits the overflow tally so the metric never undercounts silently', () => {
+	const lines = [];
+	const emitted = [];
+	globalThis.server = { hostname: 'node-1', workerIndex: 0, recordAnalytics: (...a) => emitted.push(a) };
+	globalThis.logger = { warn: (message) => lines.push(message), error: () => {} };
+	try {
+		applyOptions({ ingress: { report: { maxBuckets: 1 } } });
+		recordUnroutedPath(UNCLASSIFIED, '/a/x', 'cdn');
+		recordUnroutedPath(UNCLASSIFIED, '/b/x', 'cdn'); // past the cap — breakdown drops it
+		logUnroutedReport();
+		// One bucket row plus the overflow row, whose class is unknown by construction.
+		assert.deepEqual(emitted, [
+			[1, 'prerender_ops', 'unrouted', 'unclassified', '/a/*'],
+			[1, 'prerender_ops', 'unrouted', 'overflow', null],
+		]);
+		assert.ok(lines.some((l) => l.includes('dropped 1 request(s)')));
+	} finally {
+		delete globalThis.server;
+		delete globalThis.logger;
+	}
+});
+
 test('records nothing when reporting is disabled', () => {
 	applyOptions({ ingress: { report: { enabled: false } } });
 	recordUnroutedPath(UNCLASSIFIED, '/help/x', 'cdn');
@@ -88,7 +110,8 @@ test('draining resets the tally, so each report is a rate for the interval', () 
 
 test('logs one line per class, with node and worker, and stays silent when empty', () => {
 	const lines = [];
-	globalThis.server = { hostname: 'node-1', workerIndex: 3 };
+	const emitted = [];
+	globalThis.server = { hostname: 'node-1', workerIndex: 3, recordAnalytics: (...a) => emitted.push(a) };
 	globalThis.logger = { warn: (message) => lines.push(message), error: () => {} };
 
 	try {
@@ -104,6 +127,13 @@ test('logs one line per class, with node and worker, and stays silent when empty
 		assert.match(lines[0], /node=node-1 worker=3/);
 		assert.match(lines[0], /\/help\/\* ×1 \(e\.g\. \/help\/contact-us\)/);
 		assert.match(lines[1], /passthrough: 1 request\(s\)/);
+
+		// The same flush emits one `unrouted` value per active bucket — (count, class, bucket),
+		// so a reader sums `total` for request volume without the per-worker fan-out.
+		assert.deepEqual(emitted, [
+			[1, 'prerender_ops', 'unrouted', 'unclassified', '/help/*'],
+			[1, 'prerender_ops', 'unrouted', 'passthrough', '/orders/*'],
+		]);
 	} finally {
 		delete globalThis.server;
 		delete globalThis.logger;

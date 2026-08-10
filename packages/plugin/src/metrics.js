@@ -17,32 +17,62 @@
  * The same shape as `configSchema.js`, and for the same reason: a machine-readable contract
  * beats prose that drifts.
  *
- * HOW `recordAnalytics` BEHAVES (harper-pro `core/resources/analytics/write.ts`), because every
- * reading of these numbers depends on it:
+ * WHAT HARPER ANALYTICS ACTUALLY DOES with an emit (harper-pro
+ * `core/resources/analytics/write.ts` + `read.ts` — every cost statement below is read off that
+ * pipeline, not assumed):
  *
- *   - A BOOLEAN value is a counter: `total` counts the `true`s, `count` counts the calls. Every
- *     counter here passes `true`, so `total === count` and either reads as "how many".
- *   - A NUMBER value is a distribution: Harper keeps the samples and reports
- *     `total`/`count`/`mean`/`median`/`p95`/`p99`. Samples land in a `Float32Array`, so a
- *     millisecond age is precise to ~7 significant digits — fine for a duration, not a counter
- *     substitute.
- *   - Calls AGGREGATE per (metric, path, method, type) into a Map and flush on Harper's own
- *     analytics timer (`analytics.aggregatePeriod`). One call is a Map lookup and an add: no
- *     storage touch, no await, nothing added to response latency. That is what makes the
- *     per-request metrics below affordable on the bot read path.
- *   - Aggregation is PER THREAD and PER NODE, and rows are node-local. Every query is a fan-out
- *     and every reading is a SUM across nodes and threads; a per-node number is a quarter of the
- *     cluster's answer on a 4-node cluster. Means/medians must be recombined count-weighted, and
- *     a p95 of p95s is an approximation.
- *   - An unused dimension slot is left as the emit site had it (absent, or an explicit null).
- *     Read every empty slot as "not a dimension of this metric" — never group by it.
+ * THE WRITE PATH, stage by stage:
+ *
+ *   1. `recordAnalytics(value, metric, path, method, type)` appends into a PER-THREAD Map keyed
+ *      by the full combo string `metric-path-method-type`. A boolean (counter) is two integer
+ *      adds; a number (value/distribution) is a `Float32Array` append (~7 significant digits).
+ *      No storage touch, no await — this is what makes per-request emits affordable.
+ *   2. ~1 SECOND later (`analyticsDelay`, armed by the first emit) the thread flushes: each
+ *      value-combo's samples are SORTED and compressed to a ~10-point percentile distribution,
+ *      with an event-loop yield between combos because the sorts are the expensive part. This is
+ *      the real cost a per-request VALUE metric adds to a traffic-serving worker — a counter
+ *      skips it entirely. Value metrics on hot paths must earn the distribution; a counter that
+ *      would do the job should be a counter.
+ *   3. The whole thread report — every combo, one message — lands on the main thread as ONE row
+ *      in `hdb_raw_analytics` (retention: 1 hour). Raw row COUNT is per thread-second and does
+ *      not depend on how many metric NAMES exist; row SIZE is the active combo count.
+ *   4. Every `analytics.aggregatePeriod` (default 60 s) the MAIN thread re-merges raw rows by
+ *      the same combo key — count-weighted means, distribution merges, another sort per
+ *      value-combo — and writes ONE `hdb_analytics` row PER ACTIVE COMBO PER PERIOD. Default
+ *      retention is ONE YEAR (`analytics.aggregateRetentionMs`, Harper ≥ 5.2.0) — far longer
+ *      than anything here gets charted; deployments should set it to ~90 days (see METRICS.md).
+ *      Aggregation happens on the main thread, so combo cardinality is main-thread CPU every
+ *      half-period, for as long as the rows are retained.
+ *
+ *   So the durable write cost of a signal is its ACTIVE COMBO COUNT (rows/period/node + that
+ *   main-thread merge), and the hot-path cost is counter-vs-value. The metric NAME is free on
+ *   the write side: merging or splitting names moves the same combos around.
+ *
+ * THE READ PATH — where names are NOT free:
+ *
+ *   `hdb_analytics` deliberately indexes nothing but its primary key (the writes go through
+ *   `primaryStore.put`, which bypasses `updateIndices` — a `metric` index would stay permanently
+ *   empty). `get_analytics(metric, start_time)` therefore scans the PK time window across ALL
+ *   metrics' rows and filters by name: a dashboard sweeping N names re-reads the same window N
+ *   times, while every combo of ONE name comes back in a single scan. A METRIC NAME IS A SCAN;
+ *   A SERIES IS A ROW.
+ *
+ *   Rows are per node (fan out and SUM; a per-node number is a quarter of a 4-node cluster's
+ *   answer; recombine means count-weighted, treat merged p95s as approximate) and per thread
+ *   before aggregation. An unused dimension slot is absent-or-null — never group by it.
+ *
+ * NAMING RULE that falls out of the two paths: PREFER A SERIES ON AN EXISTING NAME over a new
+ * name for any low-volume signal (`queue_health` and `prerender_ops` are the two umbrellas);
+ * spend a new name only on a metric that needs its own dimension slots and earns its scan
+ * (`bot_serve`, `render_outcome`, `origin_fetch`). Adding a series to a released name is
+ * non-breaking; renaming a released name breaks every consumer.
  *
  * COST DISCIPLINE. Dimension values must have SMALL, BOUNDED cardinality: each distinct
- * combination is a row per node per flush, forever, in `system.hdb_analytics`. Bot names come
- * from the registry, device types are sanitized, route labels are the configured route paths,
- * cache statuses and outcomes are closed sets. A URL, a cache key, or an un-bucketed path must
- * never become a dimension value — see `util/unrouted.js` for what to do instead when the value
- * space is genuinely unbounded.
+ * combination is an `hdb_analytics` row per node per period for a year, plus main-thread merge
+ * work. Bot names come from the registry, device types are sanitized, route labels are the
+ * configured route paths, cache statuses and outcomes are closed sets. A URL, a cache key, or
+ * an un-bucketed path must never become a dimension value — see `util/unrouted.js` for what to
+ * do instead when the value space is genuinely unbounded.
  */
 
 /**
@@ -170,71 +200,144 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
-	page_age_negative: metric('page_age_negative', {
-		kind: 'counter',
-		emittedBy: 'http_handlers/bot_request.js',
-		cadence: 'per cache-served bot request whose page claims to have rendered in this node’s future',
-		summary:
-			'Served pages discarded from page_age because their age computed negative — `lastCached` ahead of ' +
-			'this node’s clock, i.e. cross-node clock skew on a page another node just wrote. The sample is ' +
-			'dropped so it cannot poison the mean, and counted here so the fact is not silently discarded.',
+	render: metric('render', {
+		kind: 'value',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence:
+			'per render result posted back by a browser worker: one `outcome` row always, one `time_ms` sample ' +
+			'when the worker reported a duration',
+		summary: 'The render fleet, in one scan: how long each render took, and what became of it.',
 		usefulFor:
-			'The only evidence anywhere of cluster clock skew on the serve path. Expect zero. Anything sustained ' +
-			'means NTP drift, and it also means invalidation.pad is covering a larger quantity than its default assumes.',
-		gatedBy: 'analytics.enabled',
+			'`time_ms` is fleet capacity (renders/hour/pod = concurrency ÷ time_ms) and what a settle-tuning ' +
+			'change has to move. `outcome` is the render-failure alert — "renders are failing", "the corpus is ' +
+			'being mass-suppressed", and "the renderer credential broke" were log-grep-only before it. One ' +
+			'`outcome` emit per posted result, so outcomes sum to results processed and any share reads as a ' +
+			'fraction of render throughput.',
+		caveats:
+			'auth-failure is special-cased on purpose: 401/403 never suppresses (it is almost never a statement ' +
+			'about the page), so a spike there with a steady `suppressed` is the signature of a broken bypass ' +
+			'token or an origin bot-mitigation change. `redirect` counts every redirect-shaped result; its type ' +
+			'slot says how each was resolved. A source retired after repeated redirects appears as its final ' +
+			'`temporary`/`unrouted-destination` emit — the retirement itself is in the log and the Target table.',
 		dimensions: {
-			path: { name: 'botName', description: 'As bot_request.method.' },
-			method: { name: 'deviceType', values: DEVICE_TYPES, description: 'Sanitized device type.' },
-			type: { name: null, description: 'Unused (emitted as null).' },
+			path: {
+				name: 'series',
+				values: ['time_ms', 'outcome'],
+				description: 'time_ms = duration distribution (ms). outcome = counter of what became of the result.',
+			},
+			method: {
+				name: 'statusCode (time_ms) / outcome (outcome)',
+				description:
+					'time_ms: HTTP status the render observed — a NUMBER at the emit site (for a redirect bail, ' +
+					'the FIRST hop’s 3xx). outcome: rendered | suppressed | auth-failure | transient | failed | ' +
+					'redirect — rendered = usable result, suppressed = genuine non-indexable verdict (target moves ' +
+					'to its recheck cadence), auth-failure = 401/403 kept and retried, transient = 408/429/5xx kept ' +
+					'and retried, failed = the render itself broke, redirect = the page moved or bounced.',
+			},
+			type: {
+				name: 'candidacy (time_ms) / detail (outcome)',
+				values: [
+					'candidate',
+					'non-candidate',
+					'unknown',
+					'redirect',
+					'stored',
+					'discarded',
+					'refiled',
+					'no-content',
+					'noindex',
+					'canonical-mismatch',
+					'http-error',
+					'redirect-loop',
+					'unspecified',
+					'landed-auth',
+					'landed-transient',
+					'unrouted-destination',
+					'non-indexable-destination',
+					'temporary',
+					'permanent',
+					'navigation',
+				],
+				description:
+					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
+					'no isIndexable) | redirect (its own lane, so redirect bails do not read as fast renders). ' +
+					'outcome: per-outcome refinement — rendered: stored / discarded (landed on a class we never ' +
+					'serve) / refiled (client-side redirect onto another prerender key) / no-content (a legacy ' +
+					'worker posted an indexable verdict with nothing to store); suppressed: the browser’s ' +
+					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
+					'transient: the status code; failed: the error phase (navigation = the document never arrived; ' +
+					'unknown = pre-v1.16.0 worker posted no detail); redirect: landed-auth/landed-transient ' +
+					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
+					'it — a render is wasted every interval until fixed), non-indexable-destination (source ' +
+					'retired, destination suppressed), temporary (kept, strike counted), permanent (source retired ' +
+					'in favor of the destination).',
+			},
 		},
 	}),
 
-	render_time: metric('render_time', {
+	origin_fetch: metric('origin_fetch', {
 		kind: 'value',
 		unit: 'ms',
-		emittedBy: 'resources/RenderQueue.js',
-		cadence: 'once per render result posted back by a browser worker (whenever the worker reported a renderTime)',
-		summary: 'How long the render fleet took to produce one result, as measured by the worker.',
+		emittedBy: 'util/upstream.js',
+		cadence: 'once per origin proxy on the bot serve path (time to response headers; the body streams after)',
+		summary: 'What a non-cache serve costs: origin latency and status, by why the origin was consulted.',
 		usefulFor:
-			'Fleet capacity: renders/hour/pod is concurrency ÷ render_time, so this is the input to every sizing ' +
-			'estimate, and its p95 is what a settle-tuning change has to move. Split by status code to keep ' +
-			'error-path renders from flattering the distribution.',
+			'The cost of a miss, which offload alone hides: bot_serve says how often the origin answered, this ' +
+			'says how slowly and with what. A rising `error`/5xx share here is origin trouble bots are feeling ' +
+			'directly; `render-timeout` rows are renderNow falling back, i.e. the fleet not keeping up with ' +
+			'on-demand requests.',
 		dimensions: {
 			path: {
 				name: 'statusCode',
 				description:
-					'HTTP status the render observed — a NUMBER at the emit site, so it arrives as a numeric-looking ' +
-					'label. For a redirect bail this is the FIRST hop’s 3xx.',
+					'HTTP status the origin answered — a NUMBER at the emit site, like render_time. 0 = the fetch ' +
+					'itself failed (connect/TLS/reset) before any status arrived.',
 			},
 			method: {
-				name: 'candidacy',
-				values: ['candidate', 'non-candidate', 'unknown', 'redirect'],
+				name: 'reason',
+				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'render-timeout', 'other'],
 				description:
-					'Whether the result was indexable/storable: `candidate` was cached, `non-candidate` was a ' +
-					'suppression verdict, `unknown` means the worker reported no isIndexable, `redirect` is a ' +
-					'redirect result (its own path, so redirect bails do not read as fast renders).',
+					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
+					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +
+					"origin was the fallback). 'other' is the emitter's default for a caller that passed no " +
+					'reason — its presence is a bug in the caller, not a traffic category.',
 			},
-			type: { name: null, description: 'Unused.' },
+			type: { name: null, description: 'Unused (emitted as null).' },
 		},
 	}),
 
 	queue_health: metric('queue_health', {
 		kind: 'value',
-		emittedBy: 'util/backlogSnapshot.js',
-		cadence: 'once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval)',
-		summary: 'Alertable gauges off the periodic backlog scan: is the queue keeping up, and can it still be claimed.',
+		emittedBy:
+			'util/backlogSnapshot.js (snapshot gauges), resources/RenderQueue.js (claim_scan_ms), util/reconcile.js (reconcile_*)',
+		cadence:
+			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
+			'claim_scan_ms once per claim pass; reconcile_* once per sweep per node',
+		summary: 'Every queue signal under one name: backlog gauges, claim-scan health, schedule-gap repairs.',
 		usefulFor:
-			'The queue’s only alertable surface. Before these existed, "a row sits below the claim floor" and "the ' +
-			'floor has been pinned for hours" — both silent, both terminal for the affected URLs — were visible ' +
-			'only to someone looking at the admin console.',
+			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
+			'module header). Backlog gauges say whether the queue is keeping up; claim_scan_ms is the leading ' +
+			'indicator (the scan degrades — measured 17× once — before any backlog shows); reconcile_restored > 0 ' +
+			'means URLs were silently un-renderable until the sweep repaired them.',
 		caveats:
-			'A GAUGE ON A SLOW CADENCE, not a rate: chart the latest value, never a sum, and remember one row per ' +
-			'node (sum `overdue` across nodes for a cluster backlog; each node scans its own residency slice). ' +
-			'Values come from a capped scan — a backlog past management.scanCap reports the cap, not the truth.',
+			'MIXED CADENCES under one name: the snapshot series are slow gauges (chart the latest value, never a ' +
+			'sum; one row per node — sum `overdue` across nodes), claim_scan_ms is a per-pass duration ' +
+			'distribution, reconcile_* are per-sweep totals. Snapshot values come from a capped scan — a backlog ' +
+			'past management.scanCap reports the cap, not the truth.',
 		dimensions: {
 			path: {
-				name: 'gauge',
-				values: ['overdue', 'lease_occupancy', 'below_floor', 'below_floor_age_ms', 'floor_pin_age_ms'],
+				name: 'series',
+				values: [
+					'overdue',
+					'lease_occupancy',
+					'below_floor',
+					'below_floor_age_ms',
+					'floor_pin_age_ms',
+					'paused',
+					'claim_scan_ms',
+					'reconcile_restored',
+					'reconcile_missing',
+				],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
 					'in-flight count, not zero — not comparable with pre-0.34.0 numbers). ' +
@@ -243,108 +346,116 @@ export const METRICS = Object.freeze({
 					'treat any sustained non-zero as lost renders. ' +
 					'below_floor_age_ms = age of the oldest such row (absent when there are none). ' +
 					'floor_pin_age_ms = how long the claim floor has been stuck at one value; a floor pinned for ' +
-					'hours means one failing key is holding the whole queue’s scan position.',
+					'hours means one failing key is holding the whole queue’s scan position. ' +
+					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
+					'alertable without polling the REST surface. ' +
+					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
+					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
+					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
+					'something is CREATING gaps, and the reconcile log line names the URLs.',
 			},
-			method: { name: null, description: 'Unused (emitted as null).' },
+			method: {
+				name: 'result (claim_scan_ms only)',
+				values: ['granted', 'empty', 'capped'],
+				description:
+					'Only claim_scan_ms uses this slot: granted = jobs handed out, empty = nothing due, capped = the ' +
+					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
+					'window). Every other series emits null here.',
+			},
 			type: { name: null, description: 'Unused (emitted as null).' },
 		},
 	}),
 
-	demand_ladder: metric('demand_ladder', {
+	prerender_ops: metric('prerender_ops', {
 		kind: 'value',
-		emittedBy: 'util/demandLadder.js',
-		cadence: 'once per stats interval per worker that made decisions (render.demand.statsInterval)',
-		summary: 'The demand ladder’s decision histogram, plus the sizing signal for the filter behind it.',
+		emittedBy:
+			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
+			'util/demandLadder.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js',
+		cadence:
+			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
+			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
+			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue)',
+		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
-			'The ladder’s only guardrail: whether "promote the hot pages" is quietly turning into "halve every ' +
-			'interval" and doubling render demand. Recorded during a dry run too, which is the point — the ' +
-			'histogram is how a dry-run week is judged.',
+			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
+			'coverage backlog (read `total`; the log line keeps the sample paths). sitemap_* = corpus churn and ' +
+			'walk health; failed > 0 was log-only before. serve_error = a response that failed AFTER the 200 and ' +
+			'the cache-hit row were committed — truncated bytes reaching a crawler while every serve metric says ' +
+			'success; expect zero. config_warnings = current finding count; alert on change, not level (the ' +
+			'findings are on GET /prerender_admin/config). page_age_negative = served pages discarded from ' +
+			'page_age because their age computed negative (cross-node clock skew — the only evidence of it on ' +
+			'the serve path; it also quietly undermines invalidation.pad’s sizing); expect zero. demand_* = the ' +
+			'demand ladder’s guardrail: whether "promote the hot pages" is quietly becoming "halve every ' +
+			'interval"; recorded during dry runs too — the histogram is how a dry-run week is judged. ' +
+			'invalidation_error = an active invalidation is NOT being enforced on the requests that failed ' +
+			'(the serve path falls back per-worker, so these are invisible in serve metrics); expect zero, ' +
+			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
+			'its outcome — `lowered` is work accepted, everything else is a refusal with its reason; the feature ' +
+			'is off by default, so no rows means disabled.',
 		caveats:
-			'Counters here (promoted/demoted/held/skipped_cold) SUM correctly across workers and nodes; ' +
-			'fast_fraction and fill are per-worker gauges and must be averaged, not summed. The per-level ' +
-			'histogram exists only in the log line — see METRICS.md.',
+			'Value semantics per series: unrouted, sitemap_* and the demand_* decision counters ' +
+			'(promoted/demoted/held/skipped_cold) are per-interval/per-run counts whose `total` is the meaningful ' +
+			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error and ' +
+			'invalidation_reenqueue are counters; config_warnings is a slow gauge (latest value); ' +
+			'demand_fast_fraction and demand_fill are per-worker gauges — average them, never sum ' +
+			'(fill = set-bit fraction of the newest visit-filter slot; a k=7 probe false-positives at ~fill^7, ' +
+			'and false positives promote pages nobody visited — watch it before trusting the histogram). ' +
+			'unrouted’s bucket slot is bounded by ingress.report.maxBuckets per class. The per-level ladder ' +
+			'histogram exists only in the demand-ladder log line.',
 		dimensions: {
 			path: {
 				name: 'series',
-				values: ['promoted', 'demoted', 'held', 'skipped_cold', 'fast_fraction', 'fill'],
-				description:
-					'promoted/demoted/held = decisions that moved a target up a rung, down a rung, or left it. ' +
-					'skipped_cold = decisions declined because the visit filter was not warm yet (expected after a ' +
-					'restart; sustained means it never warms). ' +
-					'fast_fraction = share of decisions landing on a fast rung, against render.demand.maxFastFraction. ' +
-					'fill = set-bit fraction of the newest visit-filter slot: the false-positive early warning, since ' +
-					'a k=7 probe false-positives at ~fill^7 (0.5 ≈ 0.8%, 0.88 ≈ 40%) and false positives promote ' +
-					'pages nobody visited. Watch this before trusting the histogram.',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	invalidation_error: metric('invalidation_error', {
-		kind: 'counter',
-		emittedBy: 'util/invalidation.js',
-		cadence: 'per failed epoch resolution on the serve path',
-		summary: 'The invalidation epoch could not be read or made sense of.',
-		usefulFor:
-			'Whether an active invalidation is actually being enforced. The serve path falls back to a per-worker ' +
-			'last-known-good, so these failures are INVISIBLE in the serve metrics — a page can keep being served ' +
-			'while the epoch that should have demoted it is unreadable. Expect zero; alert on any rate.',
-		dimensions: {
-			path: {
-				name: 'kind',
-				values: ['read-error', 'lkg-expired', 'invalid-row', 'unknown-mode'],
-				description:
-					'read-error = the row read threw; either a live last-known-good answered, or this worker had no ' +
-					'memory of the scope at all and the request failed OPEN (served as if nothing were invalidated). ' +
-					'lkg-expired = it threw and the remembered value is older than invalidation.lkgMaxAge, so a ' +
-					'known-stale memory was discarded and the request failed open — the serious one. ' +
-					'invalid-row = a row exists but its shape is unusable. ' +
-					'unknown-mode = a mode this version does not implement (treated as hard).',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	invalidation_reenqueue: metric('invalidation_reenqueue', {
-		kind: 'counter',
-		emittedBy: 'util/invalidationReenqueue.js',
-		cadence: 'per demand-driven heal attempt (only when an invalidation is what cost a request its cache serve)',
-		summary: 'Outcome of every attempt to pull an invalidated URL’s render forward.',
-		usefulFor:
-			'How fast an invalidation actually heals, and why it is not healing when it is not: `lowered` is work ' +
-			'accepted, everything else is a refusal WITH ITS REASON. `throttled` says the rate limit is the ' +
-			'binding constraint; `unhealable` says those URLs need a human. Off by default — no rows means the ' +
-			'feature is disabled, not that nothing happened.',
-		dimensions: {
-			path: {
-				name: 'outcome',
 				values: [
-					'lowered',
-					'not-owner',
-					'paused',
-					'leased',
-					'no-schedule',
-					'no-target',
-					'unhealable',
-					'not-sooner',
-					'throttled',
-					'error',
+					'unrouted',
+					'sitemap_sitemaps',
+					'sitemap_created',
+					'sitemap_updated',
+					'sitemap_skipped',
+					'sitemap_removed',
+					'sitemap_failed',
+					'serve_error',
+					'config_warnings',
+					'page_age_negative',
+					'demand_promoted',
+					'demand_demoted',
+					'demand_held',
+					'demand_skipped_cold',
+					'demand_fast_fraction',
+					'demand_fill',
+					'invalidation_error',
+					'invalidation_reenqueue',
 				],
 				description:
-					'lowered = the due time was pulled forward (the success case). not-owner/paused/leased = correctly ' +
-					'declined (another node owns the row, the queue is paused, a render is already in flight). ' +
-					'no-schedule/no-target = nothing to accelerate, and no-schedule on a live URL is the terminal ' +
-					'schedule-gap state util/reconcile.js repairs. unhealable = strikes exhausted or already rendered ' +
-					'after the epoch. not-sooner = already due sooner than we would have asked. throttled = this node’s ' +
-					'per-interval budget is spent. error = the write failed.',
+					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
+					'sitemaps processed, targets created / re-attributed / unchanged / unlinked, sitemaps failed ' +
+					'and skipped. serve_error = committed-then-failed deliveries. config_warnings = finding count. ' +
+					'page_age_negative = negative-age samples discarded from page_age. demand_* = ladder decisions ' +
+					'(promoted/demoted/held/skipped_cold) and its two sizing gauges (fast_fraction, fill). ' +
+					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes.',
 			},
 			method: {
-				name: 'scope',
-				description: 'The invalidation scope literal that triggered the heal (cluster scope, or a route path).',
+				name: 'detail',
+				description:
+					"unrouted: the route class ('unclassified' — the CDN forwarded a path nobody declared — or " +
+					"'passthrough' — declared, deliberately not prerendered), or 'overflow' — requests dropped from " +
+					'the per-bucket breakdown past ingress.report.maxBuckets, counted here so the metric’s volume ' +
+					'is never a lie (their class is unknown by construction). serve_error: the kind ' +
+					"('blob-stream' = a cached page’s stored body errored while streaming out). page_age_negative: " +
+					'the bot name. invalidation_error: the kind — read-error (the row read threw; a live ' +
+					'last-known-good answered, or the request failed OPEN), lkg-expired (it threw and the memory ' +
+					'was older than invalidation.lkgMaxAge — the serious one), invalid-row (row exists, shape ' +
+					'unusable), unknown-mode (treated as hard). invalidation_reenqueue: the outcome — lowered ' +
+					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
+					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
+					'not-sooner, throttled, error. Other series: null.',
 			},
-			type: { name: null, description: 'Unused (emitted as null).' },
+			type: {
+				name: 'context',
+				description:
+					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
+					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
+					'that triggered the heal. Other series: null.',
+			},
 		},
 	}),
 });
@@ -476,24 +587,50 @@ export const metrics = Object.freeze({
 	routePageAge: (ageMs, route, cacheStatus, deviceType) =>
 		server.recordAnalytics(ageMs, 'route_page_age', route, cacheStatus, deviceType),
 
-	/** A served page whose age computed negative (clock skew) and was therefore not sampled. */
+	/** A served page whose age computed negative (clock skew), not sampled — a prerender_ops series. */
 	pageAgeNegative: (botName, deviceType) =>
-		server.recordAnalytics(true, 'page_age_negative', botName, deviceType, null),
+		server.recordAnalytics(true, 'prerender_ops', 'page_age_negative', botName, deviceType),
 
-	/** One render's duration, as reported by the browser worker. */
+	/** One render's duration, as reported by the browser worker — the `render` time_ms series. */
 	renderTime: (renderTimeMs, statusCode, candidacy) =>
-		server.recordAnalytics(renderTimeMs, 'render_time', statusCode, candidacy),
+		server.recordAnalytics(renderTimeMs, 'render', 'time_ms', statusCode, candidacy),
+
+	/** What became of one posted render result — exactly one call per result; the `render` outcome series. */
+	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render', 'outcome', outcome, detail ?? null),
+
+	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
+	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
+
+	/** One origin proxy on the serve path: time to response headers, status, and why. */
+	originFetch: (durationMs, statusCode, reason) =>
+		server.recordAnalytics(durationMs, 'origin_fetch', statusCode, reason, null),
+
+	/** A committed response whose body failed on the way out — a prerender_ops series. */
+	serveError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'serve_error', kind, null),
+
+	/** One flush-interval's count for one unrouted bucket (read `total` for the request sum). */
+	unrouted: (count, routeClass, bucket) =>
+		server.recordAnalytics(count, 'prerender_ops', 'unrouted', routeClass, bucket),
+
+	/** One series of a finished sitemap refresh run — prerender_ops `sitemap_<series>`. */
+	sitemapRun: (value, series) => server.recordAnalytics(value, 'prerender_ops', `sitemap_${series}`, null, null),
+
+	/** One series of a finished reconcile sweep — queue_health `reconcile_<series>`. */
+	reconcile: (value, series) => server.recordAnalytics(value, 'queue_health', `reconcile_${series}`, null, null),
+
+	/** The current config-warning count, from the snapshot pass — a prerender_ops series. */
+	configWarnings: (count) => server.recordAnalytics(count, 'prerender_ops', 'config_warnings', null, null),
 
 	/** One queue-health gauge from the periodic backlog snapshot. */
 	queueHealth: (value, gauge) => server.recordAnalytics(value, 'queue_health', gauge, null, null),
 
-	/** One series of the demand ladder's decision histogram. */
-	demandLadder: (value, series) => server.recordAnalytics(value, 'demand_ladder', series, null, null),
+	/** One series of the demand ladder's decision histogram — prerender_ops `demand_<series>`. */
+	demandLadder: (value, series) => server.recordAnalytics(value, 'prerender_ops', `demand_${series}`, null, null),
 
-	/** A failed invalidation-epoch resolution. */
-	invalidationError: (kind) => server.recordAnalytics(true, 'invalidation_error', kind, null, null),
+	/** A failed invalidation-epoch resolution — a prerender_ops series. */
+	invalidationError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'invalidation_error', kind, null),
 
-	/** The outcome of one demand-driven heal attempt. */
+	/** The outcome of one demand-driven heal attempt — a prerender_ops series. */
 	invalidationReenqueue: (outcome, scope) =>
-		server.recordAnalytics(true, 'invalidation_reenqueue', outcome, scope ?? null, null),
+		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 });

@@ -41,7 +41,7 @@ before(async () => {
 	// workerIndex 1: rollover's worker-0 sweep must not fire mid-test; sweepExpired is
 	// exercised directly instead.
 	globalThis.server = { hostname: 'node-a', workerIndex: 1 };
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
 		coordination: {
 			SharedBuffer: {

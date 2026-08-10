@@ -1,4 +1,5 @@
 import { config, onConfigApplied } from '../config.js';
+import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
@@ -377,6 +378,19 @@ async function runTrackedRefresh(rootUrl, options) {
 				`${result.removed} unlinked, ${result.failed.length} failed`
 		);
 
+		// The same numbers as METRICS — corpus churn and walk health, previously log-only.
+		// Guarded: a gauge must never cost the run its completed progress row.
+		try {
+			metrics.sitemapRun(result.sitemapsProcessed, 'sitemaps');
+			metrics.sitemapRun(result.created, 'created');
+			metrics.sitemapRun(result.updated, 'updated');
+			metrics.sitemapRun(result.skipped, 'skipped');
+			metrics.sitemapRun(result.removed, 'removed');
+			metrics.sitemapRun(result.failed.length, 'failed');
+		} catch (e) {
+			logger.warn(`[prerender] sitemap_run gauges not recorded: ${describeError(e)}`);
+		}
+
 		return result;
 	} catch (e) {
 		logger.error(`[prerender] Sitemap refresh for ${rootUrl} aborted: ${describeError(e)}`);
@@ -436,8 +450,11 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	// target that renders into a key no read computes. See util/sitemap.js.
 	const { incoming: incomingEntryMap, filtered, invalid } = partitionSitemapEntries(latestSitemap.entries);
 
+	// debug, not warn: per-entry, and a sitemap with thousands of bad entries would flood the
+	// log. The aggregate summary (reportFiltered) already reports counts and escalates itself
+	// to error when most of the sitemap is affected.
 	for (const { loc, message } of invalid) {
-		logger.warn(`Skipping invalid sitemap entry ${loc}: ${message}`);
+		logger.debug(`Skipping invalid sitemap entry ${loc}: ${message}`);
 	}
 	reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
 	run.addFiltered(filtered);

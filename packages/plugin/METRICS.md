@@ -24,24 +24,54 @@ is emitted. **Adding a metric = a catalog entry + an emitter + a row in the tabl
 ## 1. How to read any of them
 
 Metrics go into Harper's own analytics store (`system.hdb_analytics`) via
-`server.recordAnalytics(value, metric, path, method, type)`. Six facts govern every query:
+`server.recordAnalytics(value, metric, path, method, type)`. What Harper actually does with an
+emit — read off `core/resources/analytics/write.ts`/`read.ts`, not assumed — governs every cost
+decision here:
 
-1. **Three positional dimension slots**, named `path`, `method`, `type` — and their meaning is
-   per-metric. `bot_serve`'s `path` is the serve source; `route_serve`'s `path` is the route. Always
-   check the table below before grouping.
-2. **Counters vs. distributions.** A boolean value is a counter (`total` counts the `true`s,
-   `count` the calls — identical here, since every counter passes `true`). A numeric value is a
-   distribution: `total`, `count`, `mean`, `median`, `p95`, `p99`.
-3. **Per node, per thread.** Rows are node-local and aggregated per worker thread. Every reading is
-   a **sum across nodes**; means and medians must be recombined count-weighted, and a p95 of p95s is
-   an approximation. A single node's number is roughly a quarter of the answer on a 4-node cluster.
-4. **Buffered, then flushed** on Harper's `analytics.aggregatePeriod` timer. Nothing here touches
-   storage on the request path, and nothing is visible instantly.
-5. **An empty dimension slot is not a dimension.** Depending on the emitter it is absent or an
-   explicit `null`; either way, never group by it.
-6. **Cardinality is a permanent cost.** Each distinct `(metric, path, method, type)` is a row per
-   node per flush. Bot names, device types, route labels, statuses and outcomes are closed sets by
-   construction — never put a URL, cache key or raw path into a dimension.
+**The write path:** an emit appends into a per-thread Map keyed by the full
+`(metric, path, method, type)` combo — a boolean (counter) is two integer adds, a number is a
+`Float32Array` sample append; no storage touch, no await. ~1 s later the thread flushes: each
+value-combo's samples are **sorted** into a ~10-point percentile distribution (the expensive
+part — a counter skips it), and the whole thread report lands as **one row in
+`hdb_raw_analytics`** (1 h retention). Every `analytics.aggregatePeriod` (default 60 s) the main
+thread re-merges raw rows by combo and writes **one `hdb_analytics` row per active combo per
+period**. So:
+
+1. **Write cost is combos, not names.** The durable cost of a signal is its active combo count —
+   rows per period per node, plus main-thread merge CPU. Merging or splitting metric _names_
+   moves the same combos around.
+2. **Counters are near-free on hot paths; values pay for their percentiles.** A per-request value
+   metric buys its distribution with a sample buffer and a sort every flush on a traffic-serving
+   worker. If a counter would answer the question, use a counter.
+
+**The read path:** `hdb_analytics` deliberately indexes nothing but its primary key (the flush
+writes bypass index maintenance), so `get_analytics(metric, start_time)` **scans the time window
+across ALL metrics** and filters by name. So:
+
+3. **A metric name is a scan; a series is a row.** A sweep querying N names re-reads the same
+   window N times; every dimension combo of one name comes back in a single scan. This is why
+   the low-volume signals live as series under two umbrella names (`queue_health`,
+   `prerender_ops`) instead of as nine names.
+4. **Three positional dimension slots** (`path`, `method`, `type`), meaning per-metric —
+   `bot_serve`'s `path` is the serve source, `route_serve`'s is the route. Check the table
+   before grouping. An empty slot is absent-or-null; never group by it.
+5. **Per node, per thread.** Rows are node-local: every reading is a **sum across nodes**,
+   recombine means count-weighted, treat merged p95s as approximate.
+6. **Counters vs. distributions.** Boolean → `total` = `count` = how many. Number → `total`,
+   `count`, `mean`, `median`, `p95`, `p99` (from the merged distribution).
+7. **Cardinality is a year-long cost** (fact 1's row count) — bot names, routes, statuses and
+   outcomes are closed sets; never put a URL, cache key or raw path in a dimension.
+
+### Retention — set it, the default is a year
+
+Aggregated rows default to **one year** of retention (`analytics.aggregateRetentionMs`,
+available since Harper 5.2.0; raw rows default to 1 hour via `analytics.rawRetentionMs`, which
+is fine). Nothing in this catalog gets charted past a quarter, and every retained combo-period
+row is storage plus cleanup work forever — **set `analytics.aggregateRetentionMs` to ~90 days**
+(`7776000000`) in the Harper instance config. Windowed queries don't get faster (the PK range
+bounds them either way), but an accidental un-windowed `get_analytics` scans a quarter instead
+of a year, and the table stops growing past what anyone reads. This is instance config on the
+nodes, not plugin config — it rides a Harper config change, not a component deploy.
 
 ### Querying
 
@@ -71,7 +101,7 @@ Two hazards worth knowing before pointing anything at a production cluster:
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Are we taking load off the origin?       | `bot_serve` — share of rows with `path != 'origin'`, over all rows. Denominator sanity-check: `bot_request`.                                                              |
 | Is the cache being hit, and is it fresh? | `bot_serve` grouped by `method`: cache-served is `hit + swr`; `hit` alone is "is the configured TTL being met". Then `page_age` p95 against the route's `renderInterval`. |
-| Is the render queue keeping up?          | `queue_health` (`overdue`, `lease_occupancy`) plus `render_time` p95 — and `below_floor` / `floor_pin_age_ms` for the silent failures.                                    |
+| Is the render queue keeping up?          | `queue_health` (`overdue`, `lease_occupancy`, `claim_scan_ms`) plus `render` `time_ms` p95 — and `below_floor` / `floor_pin_age_ms` for the silent failures.              |
 | Which route should change its cadence?   | `route_serve` (swr/stale share = cadence not delivered, miss share = corpus not covered) and `route_page_age` p95 per route.                                              |
 
 ---
@@ -81,25 +111,23 @@ Two hazards worth knowing before pointing anything at a production cluster:
 One-line summaries; `src/metrics.js` carries the full description of every dimension value and the
 reasoning behind it.
 
-| Metric                   | Kind    | `path`     | `method`    | `type`     | What it's for                                                                               |
-| ------------------------ | ------- | ---------- | ----------- | ---------- | ------------------------------------------------------------------------------------------- |
-| `bot_request`            | counter | host       | botName     | deviceType | Raw crawl volume and mix at ingress. The denominator for every serve-side ratio.            |
-| `bot_serve`              | counter | source     | cacheStatus | botName    | **Origin offload** and **cache hit rate** — the two rollout numbers.                        |
-| `route_serve`            | counter | route      | cacheStatus | deviceType | The same outcome per route: which route's `renderInterval` needs to move.                   |
-| `page_age`               | ms      | botName    | deviceType  | —          | Freshness as delivered: ms since the served snapshot rendered (cache serves only).          |
-| `route_page_age`         | ms      | route      | cacheStatus | deviceType | Served age per route, split by freshness state — the "should this TTL move" number.         |
-| `page_age_negative`      | counter | botName    | deviceType  | —          | Cross-node clock skew on the serve path. Expect zero.                                       |
-| `render_time`            | ms      | statusCode | candidacy   | —          | Fleet capacity (renders/hour = concurrency ÷ render_time) and settle-tuning results.        |
-| `queue_health`           | gauge   | gauge name | —           | —          | `overdue`, `lease_occupancy`, `below_floor`, `below_floor_age_ms`, `floor_pin_age_ms`.      |
-| `demand_ladder`          | gauge   | series     | —           | —          | Ladder decisions (`promoted`/`demoted`/`held`/`skipped_cold`) plus `fast_fraction`, `fill`. |
-| `invalidation_error`     | counter | kind       | —           | —          | An invalidation that cannot be read is being silently not enforced. Expect zero.            |
-| `invalidation_reenqueue` | counter | outcome    | scope       | —          | Whether an invalidation is actually healing, and why not when it isn't.                     |
+| Metric           | Kind    | `path`     | `method`    | `type`     | What it's for                                                                                                                                                                                                                                                                          |
+| ---------------- | ------- | ---------- | ----------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bot_request`    | counter | host       | botName     | deviceType | Raw crawl volume and mix at ingress. The denominator for every serve-side ratio.                                                                                                                                                                                                       |
+| `bot_serve`      | counter | source     | cacheStatus | botName    | **Origin offload** and **cache hit rate** — the two rollout numbers.                                                                                                                                                                                                                   |
+| `route_serve`    | counter | route      | cacheStatus | deviceType | The same outcome per route: which route's `renderInterval` needs to move.                                                                                                                                                                                                              |
+| `page_age`       | ms      | botName    | deviceType  | —          | Freshness as delivered: ms since the served snapshot rendered (cache serves only).                                                                                                                                                                                                     |
+| `route_page_age` | ms      | route      | cacheStatus | deviceType | Served age per route, split by freshness state — the "should this TTL move" number.                                                                                                                                                                                                    |
+| `render`         | value   | series     | per-series  | per-series | The render fleet in one scan: `time_ms` (duration by statusCode × candidacy — renders/hour = concurrency ÷ time_ms) and `outcome` (counter by outcome × detail, exactly one per posted result — the render-failure alert).                                                             |
+| `origin_fetch`   | ms      | statusCode | reason      | —          | Cost of every non-cache serve: origin latency + status, by why the cache didn't answer (miss/stale/skip/invalidated/bypass/render-timeout).                                                                                                                                            |
+| `prerender_ops`  | value   | series     | detail      | context    | Every low-volume ops signal in one scan: `unrouted` (class, bucket), `sitemap_*`, `serve_error`, `config_warnings`, `page_age_negative` (bot, device), `demand_*` (ladder decisions + `fast_fraction`/`fill`), `invalidation_error` (kind), `invalidation_reenqueue` (outcome, scope). |
+| `queue_health`   | value   | series     | result      | —          | Every queue signal in one scan: the snapshot gauges (`overdue`, `lease_occupancy`, `below_floor`, `below_floor_age_ms`, `floor_pin_age_ms`, `paused`), `claim_scan_ms` (per pass, method = granted/empty/capped), `reconcile_restored`/`reconcile_missing` (per sweep).                |
 
 Notes that bite:
 
 - **`bot_request`, `bot_serve`, `route_serve`, `page_age*` are gated** on `analytics.enabled` (and
   `analytics.recordUnmatched` for requests whose UA yields no name). No rows ≠ no traffic.
-- **`queue_health` and `demand_ladder` are gauges on a slow cadence**, one set per node
+- **`queue_health`'s snapshot series and `prerender_ops`' `demand_*` are gauges on a slow cadence**, one set per node
   (`management.backlogSnapshotInterval`, `render.demand.statsInterval`). Chart the latest value;
   never sum a gauge over time. `overdue` sums across nodes, `fast_fraction` and `fill` average.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
@@ -107,8 +135,23 @@ Notes that bite:
   before v0.34.0. The scan is capped by `management.scanCap`: a backlog past the cap reports the cap.
 - **`queue_health` needs `management.snapshotTableCounts` only for the table counts**; the gauges
   themselves survive with it off (that flag exists to dodge a `getRecordCount` stall).
-- **`invalidation_reenqueue` is off by default.** No rows means the feature is disabled.
-- **`render_time`'s `path` is a number** at the emit site, so it arrives as a numeric-looking label.
+- **`invalidation_reenqueue` (a `prerender_ops` series) is off by default.** No rows means the feature is disabled.
+- **`render` `time_ms` carries a numeric statusCode** in its method slot, so it arrives as a
+  numeric-looking label (`origin_fetch`'s path too; its `0` means the fetch itself failed before
+  any status arrived).
+- **`render` `outcome` emits exactly once per posted result**, so its outcomes sum to results
+  processed and any single outcome reads as a share of render throughput.
+- **Renamed in 0.39.0** (this plugin owns its only metric consumers, so the break was taken
+  deliberately): `render_time` → `render`/`time_ms`; `demand_ladder` → `prerender_ops`/`demand_*`;
+  `invalidation_error`, `invalidation_reenqueue`, `page_age_negative` → `prerender_ops` series of
+  the same name. Rows under old names linger until analytics retention expires them — a chart
+  spanning the deploy reads both.
+- **Value semantics vary per series inside the umbrellas** — `prerender_ops`' `unrouted`/`sitemap_*`
+  and `queue_health`'s `reconcile_*` are per-interval/per-run counts whose `total` is the
+  meaningful sum (`count` is flushes/runs); `config_warnings` and the snapshot gauges are
+  latest-value gauges; `claim_scan_ms` and `origin_fetch` are ordinary duration distributions.
+- **`queue_health` mixes cadences on purpose** (slow snapshot gauges beside per-pass
+  `claim_scan_ms`): one name = one `get_analytics` scan for the whole queue panel.
 
 ---
 
@@ -145,7 +188,7 @@ Point reads, safe to poll at dashboard cadence unless noted. See the README's
 | `GET metrics`                     | This catalog, from the running version.                                                                                                                                                                                                                                                                         |
 | `GET unrouted`                    | Paths served without prerendering, bucketed by first path segment: CDN over-forwarding vs. missing routes. **Per-worker in-process counters** — the response says which worker's slice it is, so a cluster view must fan out over nodes _and_ workers.                                                          |
 | `GET crawl-breadth?days=7`        | **Distinct URLs crawled per bot per day** (HyperLogLog). Crawl breadth is not derivable from `bot_request`, which counts requests.                                                                                                                                                                              |
-| `GET invalidations`               | Active invalidation rows with scope, instant and reason. Pair with `invalidation_error`.                                                                                                                                                                                                                        |
+| `GET invalidations`               | Active invalidation rows with scope, instant and reason. Pair with `prerender_ops` series `invalidation_error`.                                                                                                                                                                                                 |
 | `GET sitemaps` / `POST sitemap`   | Per-sitemap URL counts and the last refresh run's outcome.                                                                                                                                                                                                                                                      |
 | `GET pages`, `GET page-content`   | The actual cached snapshot — the only way to check hydration or a stray iframe.                                                                                                                                                                                                                                 |
 | `POST explain`                    | **Per-URL diagnosis**: cache key, route match, freshness verdict, schedule row, residency owner, suppression state. The first call to make about one URL; the metrics can't name a URL by construction.                                                                                                         |
@@ -156,7 +199,7 @@ Point reads, safe to poll at dashboard cadence unless noted. See the README's
 
 Grep-able, `[prerender]`-prefixed, and each is the richer record of something the metrics summarize:
 
-- **`demand ladder {…}`** — the per-rung decision histogram (`levels`), which `demand_ladder` cannot
+- **`demand ladder {…}`** — the per-rung decision histogram (`levels`), which the `demand_*` series cannot
   carry: the metric has one series dimension, the log line has the whole distribution.
 - **`<class>: N request(s) served without prerendering across …`** — the periodic unrouted report
   (`ingress.report.interval`), with the top buckets and a sample path per bucket.
@@ -165,17 +208,20 @@ Grep-able, `[prerender]`-prefixed, and each is the richer record of something th
   reports it.
 - **`Sitemap refresh for <url> finished: …`** — sitemaps processed, targets created/removed, duration.
 - **Render verdicts per URL** — `Suppressing prerendered url …`, `Prerender failed for … (reason)`,
-  `Retrying … (failure strike N)`, `redirected to … which is <class>`. The **only** place a render
-  outcome is recorded per URL today (see the gaps below).
+  `Retrying … (failure strike N)`, `redirected to … which is <class>`. The aggregate is
+  the `render` metric's `outcome` series; these lines carry the URL. Most are `info`/`debug` now (they are normal
+  verdicts — turn the level up when investigating a specific URL); the ones that stay `warn`/`error`
+  are the actionable ones: `Prerender failed`, auth-shaped results, and a redirect landing on a
+  route class the config can't serve.
 
 And error lines that are the _only_ evidence of their failure mode — each is alert-worthy on any
 sustained rate (see §5):
 
 - **`blob delivery error`** — a cached page whose stored body failed to stream **after the 200 was
-  committed**: the crawler got a truncated response while every metric records a cache hit. The
-  entry self-evicts (the next request heals it), but the serve that triggered it is already wrong,
-  and this line is the only record. Log-only today — see the gaps.
-- **`invalidation read failed for scope …`** — the storage fault behind `invalidation_error`; the
+  committed**: the crawler got a truncated response while `bot_serve` records a cache hit. The
+  entry self-evicts (the next request heals it), but the serve that triggered it was already wrong.
+  Counted as `prerender_ops` series `serve_error` (`blob-stream`); the line carries the cache key and the exception.
+- **`invalidation read failed for scope …`** — the storage fault behind the `invalidation_error` series; the
   metric says how often, the line says which scope and what threw.
 - **`could not accelerate … after an invalidation`** — the demand-driven heal path failing
   unexpectedly (the metric's `error` outcome, with the exception attached).
@@ -232,26 +278,32 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 
 **Expect zero — page on any sustained non-zero:**
 
-| Condition                                                     | Meaning                                                                                                                                   |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `queue_health` `below_floor` > 0 across consecutive snapshots | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                            |
-| `invalidation_error` any rate, especially kind `lkg-expired`  | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving. |
-| `page_age_negative` sustained                                 | Cross-node clock skew on the serve path; also quietly undermines `invalidation.pad`'s sizing.                                             |
-| log `blob delivery error`                                     | Truncated 200s recorded as cache hits — invisible to every metric.                                                                        |
-| log `schedule reconcile: restored N` with N > 0               | Terminal schedule gaps existed and were repaired; find what created them.                                                                 |
-| log `Sitemap … failed and was skipped` / `… aborted`          | Lost sitemap coverage.                                                                                                                    |
+| Condition                                                                    | Meaning                                                                                                                                            |
+| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `below_floor` > 0 across consecutive snapshots                | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                                     |
+| `prerender_ops` `invalidation_error` any rate, especially kind `lkg-expired` | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving.          |
+| log `blob delivery error`                                                    | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                 |
+| log `schedule reconcile: restored N` with N > 0                              | Terminal schedule gaps existed and were repaired; find what created them.                                                                          |
+| log `Sitemap … failed and was skipped` / `… aborted`                         | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                              |
+| `render` outcome `auth-failure` any rate                                     | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design. |
+| `prerender_ops` series `serve_error` any rate                                | Truncated 200s reaching crawlers while `bot_serve` records cache hits.                                                                             |
+| `queue_health` series `reconcile_restored` > 0                               | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                        |
 
 **Thresholds — warn, then investigate:**
 
-| Condition                                                                           | Meaning                                                                                                         |
-| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `queue_health` `overdue` − `lease_occupancy` growing snapshot-over-snapshot         | The fleet is falling behind demand (remember: `overdue`'s healthy floor IS the in-flight count).                |
-| `queue_health` `floor_pin_age_ms` > ~1 h                                            | One key is holding the claim scan's seek position — the whole node's queue ages behind it.                      |
-| `bot_serve` swr share rising / `route_page_age` p95 > that route's `renderInterval` | The cadence is configured but not delivered — a capacity or scheduling problem, not a config one.               |
-| `bot_serve` miss share rising                                                       | Coverage: new URLs the corpus doesn't have, or the CDN forwarding paths it shouldn't (check `unrouted`).        |
-| `duration` p95 (`path: 'p'`) or `success` ratio degrading                           | The crawler-facing SLO, independent of any plugin-level explanation.                                            |
-| `demand_ladder` `fill` > ~0.5, or `fast_fraction` near `maxFastFraction`            | The visit filter is saturating (false positives promote unvisited pages) / the ladder is at its budget ceiling. |
-| `queue_status` report timestamp stale, or intent ≠ observed > one sync interval     | A node stopped reporting (and likely claiming), or pause propagation is stuck.                                  |
+| Condition                                                                           | Meaning                                                                                                                                 |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `overdue` − `lease_occupancy` growing snapshot-over-snapshot         | The fleet is falling behind demand (remember: `overdue`'s healthy floor IS the in-flight count).                                        |
+| `queue_health` `floor_pin_age_ms` > ~1 h                                            | One key is holding the claim scan's seek position — the whole node's queue ages behind it.                                              |
+| `bot_serve` swr share rising / `route_page_age` p95 > that route's `renderInterval` | The cadence is configured but not delivered — a capacity or scheduling problem, not a config one.                                       |
+| `bot_serve` miss share rising                                                       | Coverage: new URLs the corpus doesn't have, or the CDN forwarding paths it shouldn't (check `unrouted`).                                |
+| `duration` p95 (`path: 'p'`) or `success` ratio degrading                           | The crawler-facing SLO, independent of any plugin-level explanation.                                                                    |
+| `queue_status` report timestamp stale, or intent ≠ observed > one sync interval     | A node stopped reporting (and likely claiming), or pause propagation is stuck.                                                          |
+| `render` outcome `suppressed` or `failed` share rising                              | Mass suppression (an origin change disavowing pages) or a failing fleet — shares are readable directly because outcomes sum to results. |
+| `queue_health` `claim_scan_ms` p95 trending up                                      | The scan is degrading (dead index entries at the seek point) before any backlog shows. Watch the trend, not the absolute number.        |
+| `origin_fetch` p95 or 5xx/`0` share rising                                          | Origin trouble that bots feel directly on every miss; a rising `render-timeout` share is renderNow falling back.                        |
+| `queue_health` `paused` = 1 beyond the expected window                              | A node's queue is paused longer than whoever paused it intended.                                                                        |
+| `prerender_ops` series `config_warnings` changed after a deploy                     | The deploy introduced a finding; `GET /prerender_admin/config` names it.                                                                |
 
 **Absence is a signal — alert when a series stops:**
 
@@ -259,42 +311,21 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | No `bot_request` rows at all                              | Ingress broken, the CDN stopped forwarding, or `analytics.enabled` was turned off — all three look identical from the dashboard.   |
 | No `queue_health` rows for > 2× `backlogSnapshotInterval` | The snapshotter died or `management.enabled`/the interval was zeroed — the queue is now unmonitored, which is itself the incident. |
-| No `render_time` rows while `overdue` is non-zero         | Workers are not posting results: fleet down, or claim/callback path broken.                                                        |
+| No `render` rows while `overdue` is non-zero              | Workers are not posting results: fleet down, or claim/callback path broken.                                                        |
 
 ---
 
-## 6. Known gaps — worth emitting, not emitted yet
+## 6. Known gaps — worth having, not observable yet
 
-Listed with the shape they'd take, so a dashboard doesn't get built on the assumption they exist.
-None of these are decided; all are cheap (a counter bump on a path that already runs).
+Signals that _should_ exist and don't, listed so nothing gets built on the assumption they exist.
+(Everything cheap enough to be a buffered emit on an existing path has been implemented — these two
+need real lift.)
 
-1. **Render outcomes.** `render_time` records how long a render took, never **what happened to it**.
-   Suppressions, failures, strikes, transient statuses and redirect verdicts exist only as per-URL
-   log lines, so "renders are failing" is not chartable and not alertable. This is the largest gap.
-   Shape: `render_outcome` counter, `path` = outcome (`rendered`/`failed`/`suppressed`/
-   `redirect`/`transient`/`unroutable`), `method` = status code.
-2. **Claim-path health.** The claim scan's duration is the queue's leading indicator — a measured
-   17× degradation from dead index entries at the seek point was invisible to metrics. Shape:
-   `claim_scan` value (ms), `path` = outcome (`claimed`/`empty`/`paused`).
-3. **Origin proxy cost.** Every non-cache serve proxies to the origin, and neither its latency nor
-   its status mix is recorded — so the cost of a miss is invisible while offload looks fine. Shape:
-   `origin_fetch` value (ms), `path` = status code, `method` = reason (`miss`/`bypass`/`renderNow-fallback`).
-4. **Sitemap and reconcile runs as counters** (targets created/removed, rows restored) — today
-   log-only, so neither can be alerted on.
-5. **Unrouted volume as a metric.** The buckets are already bounded and reporting-safe; a counter
-   would remove the per-worker fan-out from the read path.
-6. **Crawl breadth as a daily gauge**, so distinct-URL coverage sits beside request volume instead of
-   needing its own endpoint.
-7. **Hydration health.** A snapshot can be `200`, non-empty and indexable while missing everything
-   the client renders. The framework's own hydration marker is the only reliable signal, and nothing
-   counts it — the failure mode is silent by construction.
-8. **Serve-path blob failures as a counter.** `blob delivery error` (§4b) is the worst kind of
-   silent: the response was already committed as a 200 cache hit when the body died, so the
-   _metrics say success_. A counter would make truncated serves alertable without log scraping.
-   Shape: `serve_error` counter, `path` = kind (`blob-stream`/…).
-9. **Queue pause as a gauge.** Whether a node's queue is paused (and for how long) lives only in
-   `GET /queue_status` — an alert on "paused > N hours" needs a poller today. One `queue_health`
-   series (`paused`, 0/1) from the snapshot pass would make it a metric like the rest.
-10. **Config warnings as a gauge.** The warnings list (§4e) is pull-only; a `config_warnings` count
-    emitted on config apply would page on a bad deploy instead of waiting for someone to open the
-    console.
+1. **Crawl breadth as a daily gauge.** A per-node emit would be misleading — HLL sketches union,
+   they don't sum, so the honest number needs the cluster-wide merge that only the `crawl-breadth`
+   endpoint does today. Emitting it would mean electing one node to read every node's sketch rows
+   on a daily timer. Until then: the endpoint.
+2. **Hydration health.** A snapshot can be `200`, non-empty and indexable while missing everything
+   the client renders. The framework's own hydration marker is the only reliable signal, and
+   detecting it belongs in the render fleet (the browser package), not this plugin — a
+   cross-package change. The failure mode stays silent by construction until then.

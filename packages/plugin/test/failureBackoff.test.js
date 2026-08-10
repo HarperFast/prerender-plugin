@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
 import { backoffWait } from '../src/util/failureBackoff.js';
 
-globalThis.logger ??= { info() {}, warn() {}, error() {} };
+globalThis.logger ??= { debug() {}, info() {}, warn() {}, error() {} };
 
 const H = 60 * 60 * 1000;
 const DAY = 24 * H;
