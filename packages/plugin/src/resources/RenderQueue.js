@@ -6,6 +6,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
+import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
@@ -449,26 +450,21 @@ export class RenderQueue extends Resource {
 				? ` — ${result.error.name}${result.error.phase ? ` [${result.error.phase}]` : ''}: ${result.error.message}`
 				: '';
 			logger.warn(`Prerender failed for ${cacheKey} (${result.reason || 'no reason reported'})${detail}`);
-			// A target-backed job is left to retry after its lease expires. But a one-off
-			// (render-now) / orphaned schedule has no target, so leaving it would re-claim
-			// and re-render the failed job indefinitely — drop it instead.
-			const renderTarget = await Target.get({ id: CacheKey.extractUrl(cacheKey), select: 'url' });
-			if (!renderTarget) {
-				await deleteSchedule(cacheKey);
-			} else {
-				// THE SECOND FAST-LANE-BY-OMISSION, and the highest-volume failure path in production:
-				// every renderer crash, navigation timeout, ProtocolError and settle failure lands
-				// here. Its pacing has always come entirely from the lease — the branch writes no
-				// schedule row at all — so with the lease out of `nextRenderTime` it must HOLD the
-				// lease, or the row keeps its original overdue due time and the fleet re-renders the
-				// failing page as fast as it can claim it.
-				//
-				// Note what this does and has always done: a permanently-crashing render re-renders
-				// once per `queue.jobLeaseTime`, forever, with no strike and no escalation to the slow
-				// lane. That is unchanged here on purpose — turning it into a strike-counted lane is a
-				// behaviour change that does not belong in the same release as the lease move.
-				holdLease();
-			}
+			// Same lane as every other non-suppressing failure: fast retries on the held lease,
+			// then escalation to a backed-off due time. This branch used to hold the lease
+			// unconditionally and forever — no strike, no escalation — so a permanently-crashing
+			// render re-rendered once per `queue.jobLeaseTime` for the life of the target.
+			//
+			// The waste was never the renders (measured: 7 such keys per node, ~42 renders/hr
+			// against a fleet doing 87,660). It was the CLAIM FLOOR: a held lease pins the floor at
+			// its row's due minute, so a handful of permanently-failing rows held the floor 12+
+			// hours in the past indefinitely, and every claim scan seeked from there across dead
+			// index entries. Escalating returns 'slow', which releases the lease and lets the floor
+			// advance — that is the point of this change, not the saved render capacity.
+			//
+			// `retryAfterFailure` does its own target read (and drops a targetless render-now /
+			// orphaned row), so the redundant existence check that used to guard this branch is gone.
+			if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
 		}
 	}
 
@@ -684,9 +680,14 @@ export class RenderQueue extends Resource {
 		}
 
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
-		const nextRenderTime = currentMinuteMs() + interval;
-		logger.warn(`Retrying ${cacheKey} at its normal cadence (failure strike ${strikes})`);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+		const fromSitemap = !!renderTarget.sitemapUrl;
+		const wait = backoffWait(interval, strikes, fromSitemap);
+		const nextRenderTime = currentMinuteMs() + wait;
+		logger.warn(
+			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
+				`${fromSitemap ? '' : ', non-sitemap'})`
+		);
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
 		return 'slow';
 	}
 
