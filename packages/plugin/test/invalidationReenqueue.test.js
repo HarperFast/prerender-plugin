@@ -174,7 +174,8 @@ const seed = (url, { strikes = 0, sitemapUrl = null, lastCompleted = nowMs - 3 *
 const epoch = (at = nowMs - HOUR) => ({ scope: 'all', at });
 
 const outcomes = () =>
-	analytics.filter(([, metric]) => metric === 'invalidation_reenqueue').map(([, , outcome]) => outcome);
+	// invalidation_reenqueue is a prerender_ops series: (true, 'prerender_ops', series, outcome, scope)
+	analytics.filter(([, , series]) => series === 'invalidation_reenqueue').map(([, , , outcome]) => outcome);
 
 test('an owner-node request lowers every device key of the URL to the same jittered minute', async () => {
 	const url = ownedUrl();
@@ -571,10 +572,10 @@ test('every outcome records the scope beside it, so a refusal set is readable pe
 		cacheKey: keysOf(url)[0],
 		invalidatedBy: { scope: 'route:prefix:/product/', at: nowMs - HOUR },
 	});
-	const [record] = analytics.filter(([, metric]) => metric === 'invalidation_reenqueue');
-	assert.deepEqual(record, [true, 'invalidation_reenqueue', 'lowered', 'route:prefix:/product/', null]);
+	const [record] = analytics.filter(([, , series]) => series === 'invalidation_reenqueue');
+	assert.deepEqual(record, [true, 'prerender_ops', 'invalidation_reenqueue', 'lowered', 'route:prefix:/product/']);
 	assert.ok(
-		accelerator.REENQUEUE_OUTCOMES.includes(record[2]),
+		accelerator.REENQUEUE_OUTCOMES.includes(record[3]),
 		'the outcome set is closed and exported — §12.4 coverage is not answerable otherwise'
 	);
 });

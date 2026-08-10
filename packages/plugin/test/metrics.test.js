@@ -94,37 +94,34 @@ test('route_page_age emits the age FIRST, then (route, cacheStatus, deviceType)'
 	});
 });
 
-test('page_age_negative is a counter, not a sample of the negative age', () => {
-	// A negative age must never reach a distribution — that is the whole point of the metric.
+test('page_age_negative is a prerender_ops counter, not a sample of the negative age', () => {
+	// A negative age must never reach a distribution — that is the whole point of the series.
 	const e = emitted(() => metrics.pageAgeNegative('Googlebot', 'mobile'));
-	assert.equal(e.value, true);
-	assert.deepEqual([e.metric, e.path, e.method], ['page_age_negative', 'Googlebot', 'mobile']);
+	assert.deepEqual(e, {
+		value: true,
+		metric: 'prerender_ops',
+		path: 'page_age_negative',
+		method: 'Googlebot',
+		type: 'mobile',
+	});
 });
 
-test('render_time emits the duration FIRST, then (statusCode, candidacy)', () => {
-	const e = emitted(() => metrics.renderTime(9600, 200, 'candidate'));
-	assert.deepEqual(e, { value: 9600, metric: 'render_time', path: 200, method: 'candidate', type: undefined });
+test('render carries both the duration and the outcome, so the render panel reads in ONE scan', () => {
+	const t = emitted(() => metrics.renderTime(9600, 200, 'candidate'));
+	assert.deepEqual(t, { value: 9600, metric: 'render', path: 'time_ms', method: 200, type: 'candidate' });
 });
 
-test('queue_health and demand_ladder put the gauge name in the path slot', () => {
-	// One metric with a series dimension, rather than five metric names — the shape a dashboard
-	// iterates over to draw the queue panel.
+test('queue_health puts the series in the path slot; the ladder is a prerender_ops demand_* series', () => {
 	const q = emitted(() => metrics.queueHealth(42, 'overdue'));
 	assert.deepEqual([q.value, q.metric, q.path], [42, 'queue_health', 'overdue']);
 	const d = emitted(() => metrics.demandLadder(0.03, 'fast_fraction'));
-	assert.deepEqual([d.value, d.metric, d.path], [0.03, 'demand_ladder', 'fast_fraction']);
+	assert.deepEqual([d.value, d.metric, d.path], [0.03, 'prerender_ops', 'demand_fast_fraction']);
 });
 
-test('the declared series of queue_health and demand_ladder are the ones the emitters accept', () => {
-	for (const name of ['queue_health', 'demand_ladder']) {
-		const values = METRICS[name].dimensions.path.values;
-		assert.ok(values?.length, `${name} declares its series`);
-		for (const series of values) {
-			const e = emitted(() =>
-				name === 'queue_health' ? metrics.queueHealth(1, series) : metrics.demandLadder(1, series)
-			);
-			assert.equal(e.path, series);
-		}
+test('every ladder series the emitter can produce is declared on prerender_ops', () => {
+	for (const series of ['promoted', 'demoted', 'held', 'skipped_cold', 'fast_fraction', 'fill']) {
+		const e = emitted(() => metrics.demandLadder(1, series));
+		assert.ok(METRICS.prerender_ops.dimensions.path.values.includes(e.path), `prerender_ops missing ${e.path}`);
 	}
 });
 
@@ -134,38 +131,41 @@ test('invalidation_reenqueue normalizes a missing scope to null rather than drop
 	const e = emitted(() => metrics.invalidationReenqueue('lowered', undefined));
 	assert.deepEqual(e, {
 		value: true,
-		metric: 'invalidation_reenqueue',
-		path: 'lowered',
-		method: null,
+		metric: 'prerender_ops',
+		path: 'invalidation_reenqueue',
+		method: 'lowered',
 		type: null,
 	});
 });
 
-test('invalidation_error emits (kind) only', () => {
+test('invalidation_error is a prerender_ops series keyed by kind', () => {
 	const e = emitted(() => metrics.invalidationError('lkg-expired'));
 	assert.deepEqual(e, {
 		value: true,
-		metric: 'invalidation_error',
-		path: 'lkg-expired',
-		method: null,
+		metric: 'prerender_ops',
+		path: 'invalidation_error',
+		method: 'lkg-expired',
 		type: null,
 	});
 });
 
-test('render_outcome emits (outcome, detail) and normalizes a missing detail to null', () => {
+test('render outcome emits (outcome, detail) into the render name and normalizes a missing detail', () => {
 	const e = emitted(() => metrics.renderOutcome('suppressed', 'noindex'));
-	assert.deepEqual(e, { value: true, metric: 'render_outcome', path: 'suppressed', method: 'noindex', type: null });
+	assert.deepEqual(e, { value: true, metric: 'render', path: 'outcome', method: 'suppressed', type: 'noindex' });
 	const bare = emitted(() => metrics.renderOutcome('rendered', undefined));
-	assert.equal(bare.method, null);
+	assert.equal(bare.type, null);
 });
 
-test('render_outcome documents every outcome and detail the emitters use', () => {
+test('render documents every outcome detail the emitters use', () => {
 	// The emit sites are spread across two RenderQueue methods; this pins the catalog's closed
 	// sets so a new branch cannot invent an undocumented dimension value.
-	const outcomes = METRICS.render_outcome.dimensions.path.values;
-	assert.deepEqual(outcomes, ['rendered', 'suppressed', 'auth-failure', 'transient', 'failed', 'redirect']);
+	const details = METRICS.render.dimensions.type.values;
 	for (const detail of ['stored', 'discarded', 'refiled', 'unspecified', 'landed-auth', 'temporary', 'permanent']) {
-		assert.ok(METRICS.render_outcome.dimensions.method.values.includes(detail), `detail ${detail} undocumented`);
+		assert.ok(details.includes(detail), `detail ${detail} undocumented`);
+	}
+	// And the time_ms candidacy labels ride the same slot.
+	for (const candidacy of ['candidate', 'non-candidate', 'unknown', 'redirect']) {
+		assert.ok(details.includes(candidacy), `candidacy ${candidacy} undocumented`);
 	}
 });
 

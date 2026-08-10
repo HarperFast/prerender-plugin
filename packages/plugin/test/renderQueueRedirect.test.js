@@ -204,15 +204,16 @@ test('301 onto a served route retires the source URL — all devices — and ado
 		assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
 	}
 
-	// One render_time sample plus exactly one render_outcome — the emit-once-per-result contract.
-	const renderTimes = analytics.filter((a) => a[1] === 'render_time');
-	assert.equal(renderTimes.length, 1, 'redirect results still record render_time analytics');
-	assert.equal(renderTimes[0][3], 'redirect');
-	const outcomes = analytics.filter((a) => a[1] === 'render_outcome');
+	// One time_ms sample plus exactly one outcome — the emit-once-per-result contract, both
+	// series of the `render` metric: (value, 'render', series, ...detail slots).
+	const renderTimes = analytics.filter((a) => a[1] === 'render' && a[2] === 'time_ms');
+	assert.equal(renderTimes.length, 1, 'redirect results still record render duration analytics');
+	assert.equal(renderTimes[0][4], 'redirect');
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
 	assert.deepEqual(
-		outcomes.map((a) => [a[2], a[3]]),
+		outcomes.map((a) => [a[3], a[4]]),
 		[['redirect', 'permanent']],
-		'exactly one render_outcome per posted result'
+		'exactly one render outcome per posted result'
 	);
 });
 
@@ -431,7 +432,7 @@ test('a non-indexable verdict suppresses the target: state, strikes, recheck sch
 		`expected a suppression info line naming the reason, got: ${infos.join(' | ')}`
 	);
 	assert.ok(
-		analytics.some((a) => a[1] === 'render_outcome' && a[2] === 'suppressed' && a[3] === 'noindex'),
+		analytics.some((a) => a[1] === 'render' && a[2] === 'outcome' && a[3] === 'suppressed' && a[4] === 'noindex'),
 		'the suppression is counted with its reason'
 	);
 });
