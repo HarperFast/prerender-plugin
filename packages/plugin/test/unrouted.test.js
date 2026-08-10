@@ -109,8 +109,8 @@ test('logs one line per class, with node and worker, and stays silent when empty
 		// The same flush emits one `unrouted` value per active bucket — (count, class, bucket),
 		// so a reader sums `total` for request volume without the per-worker fan-out.
 		assert.deepEqual(emitted, [
-			[1, 'unrouted', 'unclassified', '/help/*', null],
-			[1, 'unrouted', 'passthrough', '/orders/*', null],
+			[1, 'prerender_ops', 'unrouted', 'unclassified', '/help/*'],
+			[1, 'prerender_ops', 'unrouted', 'passthrough', '/orders/*'],
 		]);
 	} finally {
 		delete globalThis.server;

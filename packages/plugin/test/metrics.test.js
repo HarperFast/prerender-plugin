@@ -169,30 +169,64 @@ test('render_outcome documents every outcome and detail the emitters use', () =>
 	}
 });
 
-test('claim_scan and origin_fetch emit the duration FIRST', () => {
+test('claim_scan rides queue_health so the queue reads in ONE get_analytics scan', () => {
+	// A metric name is a window scan on the read side (metric is unindexed in hdb_analytics);
+	// a series is just rows in an existing scan. These pins are the consolidation contract.
 	const c = emitted(() => metrics.claimScan(3.2, 'granted'));
-	assert.deepEqual(c, { value: 3.2, metric: 'claim_scan', path: 'granted', method: null, type: null });
+	assert.deepEqual(c, { value: 3.2, metric: 'queue_health', path: 'claim_scan_ms', method: 'granted', type: null });
+});
+
+test('origin_fetch keeps its own name (it needs both dimension slots) and emits the duration FIRST', () => {
 	const o = emitted(() => metrics.originFetch(120, 200, 'miss'));
 	assert.deepEqual(o, { value: 120, metric: 'origin_fetch', path: 200, method: 'miss', type: null });
 });
 
-test('unrouted emits the interval count as the VALUE so `total` sums to requests', () => {
+test('unrouted is a prerender_ops series carrying (class, bucket), with the count as the VALUE', () => {
 	const e = emitted(() => metrics.unrouted(17, 'unclassified', '/blog/*'));
-	assert.deepEqual(e, { value: 17, metric: 'unrouted', path: 'unclassified', method: '/blog/*', type: null });
+	assert.deepEqual(e, {
+		value: 17,
+		metric: 'prerender_ops',
+		path: 'unrouted',
+		method: 'unclassified',
+		type: '/blog/*',
+	});
 });
 
-test('sitemap_run, reconcile and config_warnings emit their number as the value', () => {
+test('sitemap_run and config_warnings are prerender_ops series; reconcile is a queue_health series', () => {
 	const s = emitted(() => metrics.sitemapRun(42, 'created'));
-	assert.deepEqual([s.value, s.metric, s.path], [42, 'sitemap_run', 'created']);
+	assert.deepEqual([s.value, s.metric, s.path], [42, 'prerender_ops', 'sitemap_created']);
 	const r = emitted(() => metrics.reconcile(3, 'restored'));
-	assert.deepEqual([r.value, r.metric, r.path], [3, 'reconcile', 'restored']);
+	assert.deepEqual([r.value, r.metric, r.path], [3, 'queue_health', 'reconcile_restored']);
 	const c = emitted(() => metrics.configWarnings(2));
-	assert.deepEqual([c.value, c.metric, c.path], [2, 'config_warnings', null]);
+	assert.deepEqual([c.value, c.metric, c.path], [2, 'prerender_ops', 'config_warnings']);
 });
 
-test('serve_error is a counter keyed by kind', () => {
+test('serve_error is a prerender_ops counter keyed by kind', () => {
 	const e = emitted(() => metrics.serveError('blob-stream'));
-	assert.deepEqual(e, { value: true, metric: 'serve_error', path: 'blob-stream', method: null, type: null });
+	assert.deepEqual(e, { value: true, metric: 'prerender_ops', path: 'serve_error', method: 'blob-stream', type: null });
+});
+
+test('every series the consolidated emitters produce is declared in its catalog entry', () => {
+	// The series values are built at the emit site (e.g. `sitemap_${series}`), so this is what
+	// keeps a new call from minting an undocumented series.
+	const qh = METRICS.queue_health.dimensions.path.values;
+	for (const series of ['claim_scan_ms', 'reconcile_restored', 'reconcile_missing']) {
+		assert.ok(qh.includes(series), `queue_health missing ${series}`);
+	}
+	const ops = METRICS.prerender_ops.dimensions.path.values;
+	for (const series of [
+		'unrouted',
+		'serve_error',
+		'config_warnings',
+		'sitemap_sitemaps',
+		'sitemap_created',
+		'sitemap_updated',
+		'sitemap_skipped',
+		'sitemap_removed',
+		'sitemap_failed',
+	]) {
+		assert.ok(ops.includes(series), `prerender_ops missing ${series}`);
+	}
 });
 
 test('every emitter emits a metric the catalog documents, and every catalog entry has an emitter', () => {

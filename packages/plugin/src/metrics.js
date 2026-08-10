@@ -17,32 +17,60 @@
  * The same shape as `configSchema.js`, and for the same reason: a machine-readable contract
  * beats prose that drifts.
  *
- * HOW `recordAnalytics` BEHAVES (harper-pro `core/resources/analytics/write.ts`), because every
- * reading of these numbers depends on it:
+ * WHAT HARPER ANALYTICS ACTUALLY DOES with an emit (harper-pro
+ * `core/resources/analytics/write.ts` + `read.ts` — every cost statement below is read off that
+ * pipeline, not assumed):
  *
- *   - A BOOLEAN value is a counter: `total` counts the `true`s, `count` counts the calls. Every
- *     counter here passes `true`, so `total === count` and either reads as "how many".
- *   - A NUMBER value is a distribution: Harper keeps the samples and reports
- *     `total`/`count`/`mean`/`median`/`p95`/`p99`. Samples land in a `Float32Array`, so a
- *     millisecond age is precise to ~7 significant digits — fine for a duration, not a counter
- *     substitute.
- *   - Calls AGGREGATE per (metric, path, method, type) into a Map and flush on Harper's own
- *     analytics timer (`analytics.aggregatePeriod`). One call is a Map lookup and an add: no
- *     storage touch, no await, nothing added to response latency. That is what makes the
- *     per-request metrics below affordable on the bot read path.
- *   - Aggregation is PER THREAD and PER NODE, and rows are node-local. Every query is a fan-out
- *     and every reading is a SUM across nodes and threads; a per-node number is a quarter of the
- *     cluster's answer on a 4-node cluster. Means/medians must be recombined count-weighted, and
- *     a p95 of p95s is an approximation.
- *   - An unused dimension slot is left as the emit site had it (absent, or an explicit null).
- *     Read every empty slot as "not a dimension of this metric" — never group by it.
+ * THE WRITE PATH, stage by stage:
+ *
+ *   1. `recordAnalytics(value, metric, path, method, type)` appends into a PER-THREAD Map keyed
+ *      by the full combo string `metric-path-method-type`. A boolean (counter) is two integer
+ *      adds; a number (value/distribution) is a `Float32Array` append (~7 significant digits).
+ *      No storage touch, no await — this is what makes per-request emits affordable.
+ *   2. ~1 SECOND later (`analyticsDelay`, armed by the first emit) the thread flushes: each
+ *      value-combo's samples are SORTED and compressed to a ~10-point percentile distribution,
+ *      with an event-loop yield between combos because the sorts are the expensive part. This is
+ *      the real cost a per-request VALUE metric adds to a traffic-serving worker — a counter
+ *      skips it entirely. Value metrics on hot paths must earn the distribution; a counter that
+ *      would do the job should be a counter.
+ *   3. The whole thread report — every combo, one message — lands on the main thread as ONE row
+ *      in `hdb_raw_analytics` (retention: 1 hour). Raw row COUNT is per thread-second and does
+ *      not depend on how many metric NAMES exist; row SIZE is the active combo count.
+ *   4. Every `analytics.aggregatePeriod` (default 60 s) the MAIN thread re-merges raw rows by
+ *      the same combo key — count-weighted means, distribution merges, another sort per
+ *      value-combo — and writes ONE `hdb_analytics` row PER ACTIVE COMBO PER PERIOD (retention:
+ *      one year). Aggregation happens on the main thread, so combo cardinality is main-thread
+ *      CPU every half-period, forever.
+ *
+ *   So the durable write cost of a signal is its ACTIVE COMBO COUNT (rows/period/node + that
+ *   main-thread merge), and the hot-path cost is counter-vs-value. The metric NAME is free on
+ *   the write side: merging or splitting names moves the same combos around.
+ *
+ * THE READ PATH — where names are NOT free:
+ *
+ *   `hdb_analytics` deliberately indexes nothing but its primary key (the writes go through
+ *   `primaryStore.put`, which bypasses `updateIndices` — a `metric` index would stay permanently
+ *   empty). `get_analytics(metric, start_time)` therefore scans the PK time window across ALL
+ *   metrics' rows and filters by name: a dashboard sweeping N names re-reads the same window N
+ *   times, while every combo of ONE name comes back in a single scan. A METRIC NAME IS A SCAN;
+ *   A SERIES IS A ROW.
+ *
+ *   Rows are per node (fan out and SUM; a per-node number is a quarter of a 4-node cluster's
+ *   answer; recombine means count-weighted, treat merged p95s as approximate) and per thread
+ *   before aggregation. An unused dimension slot is absent-or-null — never group by it.
+ *
+ * NAMING RULE that falls out of the two paths: PREFER A SERIES ON AN EXISTING NAME over a new
+ * name for any low-volume signal (`queue_health` and `prerender_ops` are the two umbrellas);
+ * spend a new name only on a metric that needs its own dimension slots and earns its scan
+ * (`bot_serve`, `render_outcome`, `origin_fetch`). Adding a series to a released name is
+ * non-breaking; renaming a released name breaks every consumer.
  *
  * COST DISCIPLINE. Dimension values must have SMALL, BOUNDED cardinality: each distinct
- * combination is a row per node per flush, forever, in `system.hdb_analytics`. Bot names come
- * from the registry, device types are sanitized, route labels are the configured route paths,
- * cache statuses and outcomes are closed sets. A URL, a cache key, or an un-bucketed path must
- * never become a dimension value — see `util/unrouted.js` for what to do instead when the value
- * space is genuinely unbounded.
+ * combination is an `hdb_analytics` row per node per period for a year, plus main-thread merge
+ * work. Bot names come from the registry, device types are sanitized, route labels are the
+ * configured route paths, cache statuses and outcomes are closed sets. A URL, a cache key, or
+ * an un-bucketed path must never become a dimension value — see `util/unrouted.js` for what to
+ * do instead when the value space is genuinely unbounded.
  */
 
 /**
@@ -279,30 +307,6 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
-	claim_scan: metric('claim_scan', {
-		kind: 'value',
-		unit: 'ms',
-		emittedBy: 'resources/RenderQueue.js',
-		cadence: 'once per claim pass (skipped when the queue is paused — no scan runs)',
-		summary: 'Duration of the claim pass: the scan that finds due renders and grants leases.',
-		usefulFor:
-			'The queue’s leading indicator. The claim scan degrades when dead index entries pile up at its seek ' +
-			'point (measured 17× once, invisible to every other metric) — a rising p95 here precedes the backlog ' +
-			'it causes. Watch the trend, not the absolute number.',
-		dimensions: {
-			path: {
-				name: 'result',
-				values: ['granted', 'empty', 'capped'],
-				description:
-					'granted = jobs were handed out. empty = the pass completed and found nothing due. capped = the ' +
-					'scan hit queue.claimScanCap without reaching a not-yet-due row — in-flight work is filling the ' +
-					'scan window (the claim warn line carries the specifics).',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
 	origin_fetch: metric('origin_fetch', {
 		kind: 'value',
 		unit: 'ms',
@@ -333,131 +337,38 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
-	serve_error: metric('serve_error', {
-		kind: 'counter',
-		emittedBy: 'http_handlers/response.js',
-		cadence: 'per serve-path delivery failure',
-		summary: 'A response that failed AFTER being committed — the crawler got truncated bytes recorded as a success.',
-		usefulFor:
-			'The one failure the serve metrics cannot see by construction: the 200 and the cache-hit row are ' +
-			'recorded before the body streams, so when the stored Blob dies mid-stream every signal says success. ' +
-			'Expect zero; any rate is truncated pages reaching crawlers. The entry self-evicts (the next request ' +
-			'heals it), but the serves already made were wrong.',
-		dimensions: {
-			path: {
-				name: 'kind',
-				values: ['blob-stream'],
-				description: 'blob-stream = a cached page’s stored body errored while streaming out.',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	unrouted: metric('unrouted', {
-		kind: 'value',
-		emittedBy: 'util/unrouted.js',
-		cadence: 'per report flush per worker (ingress.report.interval), one emit per active bucket',
-		summary: 'Requests served without prerendering, as summable numbers instead of a log line.',
-		usefulFor:
-			'unclassified volume = the CDN forwarding paths nobody declared (over-forwarding, or a missing ' +
-			'route = lost SEO coverage); passthrough volume = the declared-but-not-prerendered backlog, priced ' +
-			'in live origin proxies. Read `total` (the per-flush counts sum); `count` is just flushes.',
-		caveats:
-			'Bucket cardinality is bounded by ingress.report.maxBuckets per class (default 200, overflow rolls ' +
-			'up); the log line remains the richer record (sample path per bucket).',
-		dimensions: {
-			path: {
-				name: 'routeClass',
-				values: ['unclassified', 'passthrough'],
-				description: 'Which kind of non-prerendered serve this bucket counts.',
-			},
-			method: {
-				name: 'bucket',
-				description: 'First path segment (`/blog/*`), `/` for root, or the overflow bucket past maxBuckets.',
-			},
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	sitemap_run: metric('sitemap_run', {
-		kind: 'value',
-		emittedBy: 'resources/Sitemap.js',
-		cadence: 'once per completed sitemap refresh run (per root sitemap, on the node that ran it)',
-		summary: 'What a sitemap walk did to the corpus: targets created, re-attributed, unlinked, sitemaps failed.',
-		usefulFor:
-			'Corpus churn and walk health as chartable numbers — `failed` > 0 was log-only before. A `created` ' +
-			'spike after a site release is expected; a `removed` spike is worth confirming against the sitemap ' +
-			'diff before the prune retires real pages. Read `total` for sums, `count` for runs.',
-		dimensions: {
-			path: {
-				name: 'series',
-				values: ['sitemaps', 'created', 'updated', 'skipped', 'removed', 'failed'],
-				description:
-					'Per finished run: sitemaps processed, targets created / re-attributed / unchanged / unlinked, ' +
-					'and sitemaps that failed and were skipped (their targets are left untouched).',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	reconcile: metric('reconcile', {
-		kind: 'value',
-		emittedBy: 'util/reconcile.js',
-		cadence: 'once per reconcile sweep per node (render.reconcile.interval, or the admin action)',
-		summary: 'Schedule-gap repairs: targets found with no schedule row, and how many were restored.',
-		usefulFor:
-			'`restored` > 0 means URLs were silently un-renderable until this sweep — the terminal state nothing ' +
-			'else reports. Expect zero; a steady rate means something is CREATING gaps (a replication fault, a ' +
-			'bad delete path) faster than the sweep heals them, and the log line names the URLs.',
-		dimensions: {
-			path: {
-				name: 'series',
-				values: ['restored', 'missing'],
-				description:
-					'missing = gaps found this sweep; restored = gaps repaired (they differ when the per-sweep ' +
-					'restore cap truncates the pass — the remainder waits for the next sweep).',
-			},
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
-	config_warnings: metric('config_warnings', {
-		kind: 'value',
-		emittedBy: 'util/backlogSnapshot.js',
-		cadence: 'once per backlog snapshot per node (worker 0) — the same pass as queue_health',
-		summary: 'How many findings collectConfigWarnings currently reports on this node.',
-		usefulFor:
-			'Pages on a bad deploy instead of waiting for someone to open the console: the warnings list catches ' +
-			'an empty security token, an inert route entry, a clamped window, an invalidation row sitting behind ' +
-			'a disabled kill switch. Expect the value this deployment has accepted (usually 0); alert on change, ' +
-			'not on level. GET /prerender_admin/config carries the actual findings.',
-		dimensions: {
-			path: { name: null, description: 'Unused (emitted as null).' },
-			method: { name: null, description: 'Unused (emitted as null).' },
-			type: { name: null, description: 'Unused (emitted as null).' },
-		},
-	}),
-
 	queue_health: metric('queue_health', {
 		kind: 'value',
-		emittedBy: 'util/backlogSnapshot.js',
-		cadence: 'once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval)',
-		summary: 'Alertable gauges off the periodic backlog scan: is the queue keeping up, and can it still be claimed.',
+		emittedBy:
+			'util/backlogSnapshot.js (snapshot gauges), resources/RenderQueue.js (claim_scan_ms), util/reconcile.js (reconcile_*)',
+		cadence:
+			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
+			'claim_scan_ms once per claim pass; reconcile_* once per sweep per node',
+		summary: 'Every queue signal under one name: backlog gauges, claim-scan health, schedule-gap repairs.',
 		usefulFor:
-			'The queue’s only alertable surface. Before these existed, "a row sits below the claim floor" and "the ' +
-			'floor has been pinned for hours" — both silent, both terminal for the affected URLs — were visible ' +
-			'only to someone looking at the admin console.',
+			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
+			'module header). Backlog gauges say whether the queue is keeping up; claim_scan_ms is the leading ' +
+			'indicator (the scan degrades — measured 17× once — before any backlog shows); reconcile_restored > 0 ' +
+			'means URLs were silently un-renderable until the sweep repaired them.',
 		caveats:
-			'A GAUGE ON A SLOW CADENCE, not a rate: chart the latest value, never a sum, and remember one row per ' +
-			'node (sum `overdue` across nodes for a cluster backlog; each node scans its own residency slice). ' +
-			'Values come from a capped scan — a backlog past management.scanCap reports the cap, not the truth.',
+			'MIXED CADENCES under one name: the snapshot series are slow gauges (chart the latest value, never a ' +
+			'sum; one row per node — sum `overdue` across nodes), claim_scan_ms is a per-pass duration ' +
+			'distribution, reconcile_* are per-sweep totals. Snapshot values come from a capped scan — a backlog ' +
+			'past management.scanCap reports the cap, not the truth.',
 		dimensions: {
 			path: {
-				name: 'gauge',
-				values: ['overdue', 'lease_occupancy', 'below_floor', 'below_floor_age_ms', 'floor_pin_age_ms', 'paused'],
+				name: 'series',
+				values: [
+					'overdue',
+					'lease_occupancy',
+					'below_floor',
+					'below_floor_age_ms',
+					'floor_pin_age_ms',
+					'paused',
+					'claim_scan_ms',
+					'reconcile_restored',
+					'reconcile_missing',
+				],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
 					'in-flight count, not zero — not comparable with pre-0.34.0 numbers). ' +
@@ -468,10 +379,73 @@ export const METRICS = Object.freeze({
 					'floor_pin_age_ms = how long the claim floor has been stuck at one value; a floor pinned for ' +
 					'hours means one failing key is holding the whole queue’s scan position. ' +
 					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
-					'alertable without polling the REST surface.',
+					'alertable without polling the REST surface. ' +
+					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
+					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
+					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
+					'something is CREATING gaps, and the reconcile log line names the URLs.',
 			},
-			method: { name: null, description: 'Unused (emitted as null).' },
+			method: {
+				name: 'result (claim_scan_ms only)',
+				values: ['granted', 'empty', 'capped'],
+				description:
+					'Only claim_scan_ms uses this slot: granted = jobs handed out, empty = nothing due, capped = the ' +
+					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
+					'window). Every other series emits null here.',
+			},
 			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	prerender_ops: metric('prerender_ops', {
+		kind: 'value',
+		emittedBy: 'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js',
+		cadence:
+			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure (serve_error), per snapshot (config_warnings)',
+		summary: 'The low-volume operational signals, under one name so a sweep pays one scan for all of them.',
+		usefulFor:
+			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
+			'coverage backlog (read `total`; the log line keeps the sample paths). sitemap_* = corpus churn and ' +
+			'walk health; failed > 0 was log-only before. serve_error = a response that failed AFTER the 200 and ' +
+			'the cache-hit row were committed — truncated bytes reaching a crawler while every serve metric says ' +
+			'success; expect zero. config_warnings = current finding count; alert on change, not level (the ' +
+			'findings are on GET /prerender_admin/config).',
+		caveats:
+			'Value semantics per series: unrouted and sitemap_* are per-interval/per-run counts whose `total` is ' +
+			'the meaningful sum (`count` is flushes/runs); serve_error is a counter; config_warnings is a slow ' +
+			'gauge (latest value). unrouted’s bucket slot is bounded by ingress.report.maxBuckets per class.',
+		dimensions: {
+			path: {
+				name: 'series',
+				values: [
+					'unrouted',
+					'sitemap_sitemaps',
+					'sitemap_created',
+					'sitemap_updated',
+					'sitemap_skipped',
+					'sitemap_removed',
+					'sitemap_failed',
+					'serve_error',
+					'config_warnings',
+				],
+				description:
+					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
+					'sitemaps processed, targets created / re-attributed / unchanged / unlinked, sitemaps failed ' +
+					'and skipped. serve_error = committed-then-failed deliveries. config_warnings = finding count.',
+			},
+			method: {
+				name: 'detail',
+				description:
+					"unrouted: the route class ('unclassified' — the CDN forwarded a path nobody declared — or " +
+					"'passthrough' — declared, deliberately not prerendered). serve_error: the kind " +
+					"('blob-stream' = a cached page’s stored body errored while streaming out). Other series: null.",
+			},
+			type: {
+				name: 'bucket (unrouted only)',
+				description:
+					'unrouted: first path segment (`/blog/*`), `/` for root, or the overflow bucket past ' +
+					'ingress.report.maxBuckets. Other series: null.',
+			},
 		},
 	}),
 
@@ -712,27 +686,28 @@ export const metrics = Object.freeze({
 	/** What became of one posted render result — exactly one call per result. */
 	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render_outcome', outcome, detail ?? null, null),
 
-	/** One claim pass's duration and how it ended. */
-	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'claim_scan', result, null, null),
+	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
+	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
 
 	/** One origin proxy on the serve path: time to response headers, status, and why. */
 	originFetch: (durationMs, statusCode, reason) =>
 		server.recordAnalytics(durationMs, 'origin_fetch', statusCode, reason, null),
 
-	/** A committed response whose body failed on the way out. */
-	serveError: (kind) => server.recordAnalytics(true, 'serve_error', kind, null, null),
+	/** A committed response whose body failed on the way out — a prerender_ops series. */
+	serveError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'serve_error', kind, null),
 
 	/** One flush-interval's count for one unrouted bucket (read `total` for the request sum). */
-	unrouted: (count, routeClass, bucket) => server.recordAnalytics(count, 'unrouted', routeClass, bucket, null),
+	unrouted: (count, routeClass, bucket) =>
+		server.recordAnalytics(count, 'prerender_ops', 'unrouted', routeClass, bucket),
 
-	/** One series of a finished sitemap refresh run. */
-	sitemapRun: (value, series) => server.recordAnalytics(value, 'sitemap_run', series, null, null),
+	/** One series of a finished sitemap refresh run — prerender_ops `sitemap_<series>`. */
+	sitemapRun: (value, series) => server.recordAnalytics(value, 'prerender_ops', `sitemap_${series}`, null, null),
 
-	/** One series of a finished reconcile sweep. */
-	reconcile: (value, series) => server.recordAnalytics(value, 'reconcile', series, null, null),
+	/** One series of a finished reconcile sweep — queue_health `reconcile_<series>`. */
+	reconcile: (value, series) => server.recordAnalytics(value, 'queue_health', `reconcile_${series}`, null, null),
 
-	/** The current config-warning count, from the snapshot pass. */
-	configWarnings: (count) => server.recordAnalytics(count, 'config_warnings', null, null, null),
+	/** The current config-warning count, from the snapshot pass — a prerender_ops series. */
+	configWarnings: (count) => server.recordAnalytics(count, 'prerender_ops', 'config_warnings', null, null),
 
 	/** One queue-health gauge from the periodic backlog snapshot. */
 	queueHealth: (value, gauge) => server.recordAnalytics(value, 'queue_health', gauge, null, null),

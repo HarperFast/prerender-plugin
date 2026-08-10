@@ -24,24 +24,43 @@ is emitted. **Adding a metric = a catalog entry + an emitter + a row in the tabl
 ## 1. How to read any of them
 
 Metrics go into Harper's own analytics store (`system.hdb_analytics`) via
-`server.recordAnalytics(value, metric, path, method, type)`. Six facts govern every query:
+`server.recordAnalytics(value, metric, path, method, type)`. What Harper actually does with an
+emit — read off `core/resources/analytics/write.ts`/`read.ts`, not assumed — governs every cost
+decision here:
 
-1. **Three positional dimension slots**, named `path`, `method`, `type` — and their meaning is
-   per-metric. `bot_serve`'s `path` is the serve source; `route_serve`'s `path` is the route. Always
-   check the table below before grouping.
-2. **Counters vs. distributions.** A boolean value is a counter (`total` counts the `true`s,
-   `count` the calls — identical here, since every counter passes `true`). A numeric value is a
-   distribution: `total`, `count`, `mean`, `median`, `p95`, `p99`.
-3. **Per node, per thread.** Rows are node-local and aggregated per worker thread. Every reading is
-   a **sum across nodes**; means and medians must be recombined count-weighted, and a p95 of p95s is
-   an approximation. A single node's number is roughly a quarter of the answer on a 4-node cluster.
-4. **Buffered, then flushed** on Harper's `analytics.aggregatePeriod` timer. Nothing here touches
-   storage on the request path, and nothing is visible instantly.
-5. **An empty dimension slot is not a dimension.** Depending on the emitter it is absent or an
-   explicit `null`; either way, never group by it.
-6. **Cardinality is a permanent cost.** Each distinct `(metric, path, method, type)` is a row per
-   node per flush. Bot names, device types, route labels, statuses and outcomes are closed sets by
-   construction — never put a URL, cache key or raw path into a dimension.
+**The write path:** an emit appends into a per-thread Map keyed by the full
+`(metric, path, method, type)` combo — a boolean (counter) is two integer adds, a number is a
+`Float32Array` sample append; no storage touch, no await. ~1 s later the thread flushes: each
+value-combo's samples are **sorted** into a ~10-point percentile distribution (the expensive
+part — a counter skips it), and the whole thread report lands as **one row in
+`hdb_raw_analytics`** (1 h retention). Every `analytics.aggregatePeriod` (default 60 s) the main
+thread re-merges raw rows by combo and writes **one `hdb_analytics` row per active combo per
+period** (1 year retention). So:
+
+1. **Write cost is combos, not names.** The durable cost of a signal is its active combo count —
+   rows per period per node, plus main-thread merge CPU. Merging or splitting metric _names_
+   moves the same combos around.
+2. **Counters are near-free on hot paths; values pay for their percentiles.** A per-request value
+   metric buys its distribution with a sample buffer and a sort every flush on a traffic-serving
+   worker. If a counter would answer the question, use a counter.
+
+**The read path:** `hdb_analytics` deliberately indexes nothing but its primary key (the flush
+writes bypass index maintenance), so `get_analytics(metric, start_time)` **scans the time window
+across ALL metrics** and filters by name. So:
+
+3. **A metric name is a scan; a series is a row.** A sweep querying N names re-reads the same
+   window N times; every dimension combo of one name comes back in a single scan. This is why
+   the low-volume signals live as series under two umbrella names (`queue_health`,
+   `prerender_ops`) instead of as nine names.
+4. **Three positional dimension slots** (`path`, `method`, `type`), meaning per-metric —
+   `bot_serve`'s `path` is the serve source, `route_serve`'s is the route. Check the table
+   before grouping. An empty slot is absent-or-null; never group by it.
+5. **Per node, per thread.** Rows are node-local: every reading is a **sum across nodes**,
+   recombine means count-weighted, treat merged p95s as approximate.
+6. **Counters vs. distributions.** Boolean → `total` = `count` = how many. Number → `total`,
+   `count`, `mean`, `median`, `p95`, `p99` (from the merged distribution).
+7. **Cardinality is a year-long cost** (fact 1's row count) — bot names, routes, statuses and
+   outcomes are closed sets; never put a URL, cache key or raw path in a dimension.
 
 ### Querying
 
@@ -81,27 +100,22 @@ Two hazards worth knowing before pointing anything at a production cluster:
 One-line summaries; `src/metrics.js` carries the full description of every dimension value and the
 reasoning behind it.
 
-| Metric                   | Kind    | `path`     | `method`    | `type`     | What it's for                                                                                                                                             |
-| ------------------------ | ------- | ---------- | ----------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bot_request`            | counter | host       | botName     | deviceType | Raw crawl volume and mix at ingress. The denominator for every serve-side ratio.                                                                          |
-| `bot_serve`              | counter | source     | cacheStatus | botName    | **Origin offload** and **cache hit rate** — the two rollout numbers.                                                                                      |
-| `route_serve`            | counter | route      | cacheStatus | deviceType | The same outcome per route: which route's `renderInterval` needs to move.                                                                                 |
-| `page_age`               | ms      | botName    | deviceType  | —          | Freshness as delivered: ms since the served snapshot rendered (cache serves only).                                                                        |
-| `route_page_age`         | ms      | route      | cacheStatus | deviceType | Served age per route, split by freshness state — the "should this TTL move" number.                                                                       |
-| `page_age_negative`      | counter | botName    | deviceType  | —          | Cross-node clock skew on the serve path. Expect zero.                                                                                                     |
-| `render_time`            | ms      | statusCode | candidacy   | —          | Fleet capacity (renders/hour = concurrency ÷ render_time) and settle-tuning results.                                                                      |
-| `render_outcome`         | counter | outcome    | detail      | —          | What became of each render: stored / suppressed / auth-failure / transient / failed / redirect. Exactly one per posted result — the render-failure alert. |
-| `claim_scan`             | ms      | result     | —           | —          | Claim-pass duration — the queue's leading indicator (degrades before backlog shows). `granted`/`empty`/`capped`.                                          |
-| `origin_fetch`           | ms      | statusCode | reason      | —          | Cost of every non-cache serve: origin latency + status, by why the cache didn't answer (miss/stale/skip/invalidated/bypass/render-timeout).               |
-| `serve_error`            | counter | kind       | —           | —          | A committed response whose body failed on the way out (`blob-stream`): truncated bytes recorded as a success everywhere else. Expect zero.                |
-| `unrouted`               | value   | routeClass | bucket      | —          | Non-prerendered serve volume per path bucket (read `total`). CDN over-forwarding vs. the coverage backlog, without per-worker fan-out.                    |
-| `sitemap_run`            | value   | series     | —           | —          | Per finished walk: sitemaps / created / updated / skipped / removed / failed. Corpus churn and walk health (read `total`).                                |
-| `reconcile`              | value   | series     | —           | —          | Per sweep: `missing` gaps found, `restored` repaired. Expect zero; a steady rate means something is creating gaps.                                        |
-| `config_warnings`        | value   | —          | —           | —          | Current config-warning count, from the snapshot pass. Alert on change, not level; findings are on `GET config`.                                           |
-| `queue_health`           | gauge   | gauge name | —           | —          | `overdue`, `lease_occupancy`, `below_floor`, `below_floor_age_ms`, `floor_pin_age_ms`, `paused` (0/1).                                                    |
-| `demand_ladder`          | gauge   | series     | —           | —          | Ladder decisions (`promoted`/`demoted`/`held`/`skipped_cold`) plus `fast_fraction`, `fill`.                                                               |
-| `invalidation_error`     | counter | kind       | —           | —          | An invalidation that cannot be read is being silently not enforced. Expect zero.                                                                          |
-| `invalidation_reenqueue` | counter | outcome    | scope       | —          | Whether an invalidation is actually healing, and why not when it isn't.                                                                                   |
+| Metric                   | Kind    | `path`     | `method`    | `type`     | What it's for                                                                                                                                                                                                                                                           |
+| ------------------------ | ------- | ---------- | ----------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bot_request`            | counter | host       | botName     | deviceType | Raw crawl volume and mix at ingress. The denominator for every serve-side ratio.                                                                                                                                                                                        |
+| `bot_serve`              | counter | source     | cacheStatus | botName    | **Origin offload** and **cache hit rate** — the two rollout numbers.                                                                                                                                                                                                    |
+| `route_serve`            | counter | route      | cacheStatus | deviceType | The same outcome per route: which route's `renderInterval` needs to move.                                                                                                                                                                                               |
+| `page_age`               | ms      | botName    | deviceType  | —          | Freshness as delivered: ms since the served snapshot rendered (cache serves only).                                                                                                                                                                                      |
+| `route_page_age`         | ms      | route      | cacheStatus | deviceType | Served age per route, split by freshness state — the "should this TTL move" number.                                                                                                                                                                                     |
+| `page_age_negative`      | counter | botName    | deviceType  | —          | Cross-node clock skew on the serve path. Expect zero.                                                                                                                                                                                                                   |
+| `render_time`            | ms      | statusCode | candidacy   | —          | Fleet capacity (renders/hour = concurrency ÷ render_time) and settle-tuning results.                                                                                                                                                                                    |
+| `render_outcome`         | counter | outcome    | detail      | —          | What became of each render: stored / suppressed / auth-failure / transient / failed / redirect. Exactly one per posted result — the render-failure alert.                                                                                                               |
+| `origin_fetch`           | ms      | statusCode | reason      | —          | Cost of every non-cache serve: origin latency + status, by why the cache didn't answer (miss/stale/skip/invalidated/bypass/render-timeout).                                                                                                                             |
+| `prerender_ops`          | value   | series     | detail      | bucket     | The low-volume ops signals in one scan: `unrouted` (class, bucket), `sitemap_*` (per-run churn), `serve_error` (kind), `config_warnings`.                                                                                                                               |
+| `queue_health`           | value   | series     | result      | —          | Every queue signal in one scan: the snapshot gauges (`overdue`, `lease_occupancy`, `below_floor`, `below_floor_age_ms`, `floor_pin_age_ms`, `paused`), `claim_scan_ms` (per pass, method = granted/empty/capped), `reconcile_restored`/`reconcile_missing` (per sweep). |
+| `demand_ladder`          | gauge   | series     | —           | —          | Ladder decisions (`promoted`/`demoted`/`held`/`skipped_cold`) plus `fast_fraction`, `fill`.                                                                                                                                                                             |
+| `invalidation_error`     | counter | kind       | —           | —          | An invalidation that cannot be read is being silently not enforced. Expect zero.                                                                                                                                                                                        |
+| `invalidation_reenqueue` | counter | outcome    | scope       | —          | Whether an invalidation is actually healing, and why not when it isn't.                                                                                                                                                                                                 |
 
 Notes that bite:
 
@@ -120,9 +134,12 @@ Notes that bite:
   (`origin_fetch` too; its `0` means the fetch itself failed before any status arrived).
 - **`render_outcome` emits exactly once per posted result**, so its outcomes sum to results
   processed and any single outcome reads as a share of render throughput.
-- **`unrouted`, `sitemap_run`, `reconcile` and `config_warnings` are numeric values whose `total`
-  is the meaningful sum** (`count` is just flushes/runs) — the same convention as `demand_ladder`'s
-  counters. `claim_scan` and `origin_fetch` are ordinary duration distributions.
+- **Value semantics vary per series inside the umbrellas** — `prerender_ops`' `unrouted`/`sitemap_*`
+  and `queue_health`'s `reconcile_*` are per-interval/per-run counts whose `total` is the
+  meaningful sum (`count` is flushes/runs); `config_warnings` and the snapshot gauges are
+  latest-value gauges; `claim_scan_ms` and `origin_fetch` are ordinary duration distributions.
+- **`queue_health` mixes cadences on purpose** (slow snapshot gauges beside per-pass
+  `claim_scan_ms`): one name = one `get_analytics` scan for the whole queue panel.
 
 ---
 
@@ -191,7 +208,7 @@ sustained rate (see §5):
 - **`blob delivery error`** — a cached page whose stored body failed to stream **after the 200 was
   committed**: the crawler got a truncated response while `bot_serve` records a cache hit. The
   entry self-evicts (the next request heals it), but the serve that triggered it was already wrong.
-  Counted as `serve_error` (`blob-stream`); the line carries the cache key and the exception.
+  Counted as `prerender_ops` series `serve_error` (`blob-stream`); the line carries the cache key and the exception.
 - **`invalidation read failed for scope …`** — the storage fault behind `invalidation_error`; the
   metric says how often, the line says which scope and what threw.
 - **`could not accelerate … after an invalidation`** — the demand-driven heal path failing
@@ -256,10 +273,10 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 | `page_age_negative` sustained                                 | Cross-node clock skew on the serve path; also quietly undermines `invalidation.pad`'s sizing.                                                      |
 | log `blob delivery error`                                     | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                 |
 | log `schedule reconcile: restored N` with N > 0               | Terminal schedule gaps existed and were repaired; find what created them.                                                                          |
-| log `Sitemap … failed and was skipped` / `… aborted`          | Lost sitemap coverage (also `sitemap_run` series `failed`).                                                                                        |
+| log `Sitemap … failed and was skipped` / `… aborted`          | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                              |
 | `render_outcome` outcome `auth-failure` any rate              | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design. |
-| `serve_error` any rate                                        | Truncated 200s reaching crawlers while `bot_serve` records cache hits.                                                                             |
-| `reconcile` series `restored` > 0                             | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                        |
+| `prerender_ops` series `serve_error` any rate                 | Truncated 200s reaching crawlers while `bot_serve` records cache hits.                                                                             |
+| `queue_health` series `reconcile_restored` > 0                | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                        |
 
 **Thresholds — warn, then investigate:**
 
@@ -273,10 +290,10 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 | `demand_ladder` `fill` > ~0.5, or `fast_fraction` near `maxFastFraction`            | The visit filter is saturating (false positives promote unvisited pages) / the ladder is at its budget ceiling.                         |
 | `queue_status` report timestamp stale, or intent ≠ observed > one sync interval     | A node stopped reporting (and likely claiming), or pause propagation is stuck.                                                          |
 | `render_outcome` `suppressed` or `failed` share of results rising                   | Mass suppression (an origin change disavowing pages) or a failing fleet — shares are readable directly because outcomes sum to results. |
-| `claim_scan` p95 trending up                                                        | The scan is degrading (dead index entries at the seek point) before any backlog shows. Watch the trend, not the absolute number.        |
+| `queue_health` `claim_scan_ms` p95 trending up                                      | The scan is degrading (dead index entries at the seek point) before any backlog shows. Watch the trend, not the absolute number.        |
 | `origin_fetch` p95 or 5xx/`0` share rising                                          | Origin trouble that bots feel directly on every miss; a rising `render-timeout` share is renderNow falling back.                        |
 | `queue_health` `paused` = 1 beyond the expected window                              | A node's queue is paused longer than whoever paused it intended.                                                                        |
-| `config_warnings` changed after a deploy                                            | The deploy introduced a finding; `GET /prerender_admin/config` names it.                                                                |
+| `prerender_ops` series `config_warnings` changed after a deploy                     | The deploy introduced a finding; `GET /prerender_admin/config` names it.                                                                |
 
 **Absence is a signal — alert when a series stops:**
 
