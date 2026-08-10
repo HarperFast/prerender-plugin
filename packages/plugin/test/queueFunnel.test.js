@@ -33,7 +33,11 @@ const FUNNEL = 'util/renderSchedule.js';
 const SEARCH_ALLOWED = new Set([FUNNEL, 'util/backlogSnapshot.js']);
 
 test('exactly one file writes RenderSchedule — the funnel', () => {
-	const writer = /RenderSchedule\s*\.\s*(?:put|delete)\s*\(/;
+	// Every write-shaped method a Harper table exposes, not just the two the codebase uses today:
+	// a future `RenderSchedule.patch(key, { nextRenderTime })` is the natural way to "just nudge a
+	// due time", and it would file the row without lowering the claim floor — exactly the silent
+	// gap this scan exists to make unwritable.
+	const writer = /RenderSchedule\s*\.\s*(?:put|delete|patch|update|upsert|create|post|publish)\s*\(/;
 
 	for (const [path, source] of sources) {
 		if (path === FUNNEL) continue;
