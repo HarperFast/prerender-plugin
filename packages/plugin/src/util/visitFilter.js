@@ -8,7 +8,8 @@
  * this exists for. A per-URL write dedupes only within a flush window, so at the ~10M
  * bot-requests/day the search-engine ramp is sized for, writes land at roughly the distinct-
  * URL rate — order 100/s against a REPLICATED table whose patch path has already caused one
- * replication incident. A Bloom ring writes ONE merged row per node per flush (~0.02/s) and
+ * replication incident. A Bloom ring writes one merged-row RMW per WORKER per dirty slot per
+ * flush interval (~a dozen small replicated puts per node per 5 minutes, ~0.05/s/node) and
  * costs constant memory regardless of request volume. The price is that it cannot enumerate
  * its members (see "no enumeration" below) and answers with false positives.
  *
@@ -141,16 +142,25 @@ function rollover(now) {
 	}
 }
 
-/** Delete persisted slices older than the ring. Exported for tests. */
-export async function sweepExpired(cutoffSlot) {
+/**
+ * Delete persisted slices outside the ring: older than the cutoff, and beyond the current
+ * slot. The future side is not paranoia — a `sliceMs` INCREASE renumbers slots DOWNWARD, so
+ * rows written under the old numbering sit above every reachable slot; the age cutoff can
+ * never touch them, and every worker would re-load them into its union forever. Nothing
+ * legitimate is ever filed past the current slot (+1 absorbs boundary skew across nodes).
+ * Exported for tests.
+ */
+export async function sweepExpired(cutoffSlot, nowSlot = slotOf(Date.now())) {
 	const VisitFilter = table();
-	const expired = await VisitFilter.search({
-		conditions: [{ attribute: 'slot', comparator: 'less_than', value: cutoffSlot }],
-		select: ['id'],
-		limit: 1000,
-	});
-	for await (const row of expired) {
-		await VisitFilter.delete(row.id);
+	const gone = [
+		[{ attribute: 'slot', comparator: 'less_than', value: cutoffSlot }],
+		[{ attribute: 'slot', comparator: 'greater_than', value: nowSlot + 1 }],
+	];
+	for (const conditions of gone) {
+		const rows = await VisitFilter.search({ conditions, select: ['id'], limit: 1000 });
+		for await (const row of rows) {
+			await VisitFilter.delete(row.id);
+		}
 	}
 }
 
@@ -160,7 +170,33 @@ const armFlushTimer = () => {
 	flushTimer.unref?.();
 };
 
+// The filter's persisted shape: slot numbering (sliceMs), byte length (bitsPerSlice,
+// normalized), probe count (hashes). Rows written under a different shape are at best
+// unreadable (length mismatch, dropped by the union) and at worst silently wrong (fewer
+// probe bits set than checked), and a sliceMs change renumbers every slot.
+const shapeOf = () => `${sliceMs()}|${bitCount()}|${hashes()}`;
+let armedShape = shapeOf();
+let coldUntilMs = 0;
+
 onConfigApplied(() => {
+	if (shapeOf() !== armedShape) {
+		armedShape = shapeOf();
+		// Drop BOTH sides of the in-memory state: old-shape write slices must not flush under
+		// the new numbering, and the union must not keep answering from old-shape rows. Then
+		// hold the ladder cold until a full slowest-rung window of NEW-shape history exists —
+		// engaging against a near-empty union reads as "nobody visited anything" and demotes
+		// the corpus, the error direction this module must not produce. (Persisted old-shape
+		// rows age out via sweepExpired; a sliceMs increase leaves them at impossible-future
+		// slot numbers, which the sweep also deletes.)
+		slices = new Map();
+		dirty.clear();
+		slot = null;
+		slotEndMs = 0;
+		merged = new Map();
+		mergedAt = 0;
+		const ladder = (config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0);
+		coldUntilMs = Date.now() + (ladder.length ? Math.max(...ladder) : 0);
+	}
 	if (!flushTimer) return;
 	if (!config.render.demand.enabled) {
 		clearInterval(flushTimer);
@@ -256,8 +292,12 @@ export async function refreshMerged(nowMs = Date.now()) {
 	return merged;
 }
 
-/** True once the read-side union is warm enough to answer. */
-export const mergedReady = () => mergedAt > 0;
+/**
+ * True once the read-side union is warm enough to answer. After a shape change this also
+ * holds until a full slowest-rung window of new-shape history exists — the union may be
+ * populated but still blind to everything recorded before the reshape.
+ */
+export const mergedReady = () => mergedAt > 0 && Date.now() >= coldUntilMs;
 
 /**
  * Kick the background refresh without asking a membership question.
@@ -289,9 +329,16 @@ export function visitedWithin(url, windowMs, nowMs = Date.now()) {
 	if (!merged.size) return false;
 	const k = hashes();
 	const newest = slotOf(nowMs);
-	const span = Math.max(1, Math.ceil(windowMs / sliceMs()));
+	// Anchor on the slot containing the window's START, not on a slot count. The newest slot
+	// is PARTIAL: `ceil(windowMs/sliceMs)` slots back from it cover as little as the elapsed
+	// part of the current slot — a probe minutes into a slot at the 6h rung would examine
+	// minutes of its 6h window, and the miss direction is a false NEGATIVE, the one error
+	// this filter must not make (a genuinely visited page reading unvisited gets demoted).
+	// Anchoring instead over-covers by up to one slice — the safe, documented direction.
+	// Clamped to the ring so a window wider than the ring cannot walk absent slots.
+	const oldest = Math.max(slotOf(nowMs - windowMs), newest - sliceCount() + 1);
 	const idx = bitsFor(url, bitCount(), k, scratch);
-	for (let s = newest; s > newest - span; s--) {
+	for (let s = newest; s >= oldest; s--) {
 		const bytes = merged.get(s);
 		if (bytes && bytes.length === bitCount() >>> 3 && hasBits(bytes, idx, k)) return true;
 	}
@@ -316,6 +363,27 @@ export function visitedInEachWindow(url, windowMs, count, nowMs = Date.now()) {
 	return true;
 }
 
+/**
+ * Fill factor (set-bit fraction) of the newest slot in the union — the sizing early warning
+ * surfaced in the demand-ladder histogram log. A k-hash probe false-positives at ~fill^k, and
+ * false positives promote pages nobody visited. Read once per histogram interval, never on
+ * the serve path.
+ */
+export function newestFill() {
+	let newest = -Infinity;
+	for (const s of merged.keys()) if (s > newest) newest = s;
+	const bytes = merged.get(newest);
+	if (!bytes?.length) return 0;
+	let set = 0;
+	for (let i = 0; i < bytes.length; i++) {
+		let b = bytes[i];
+		b = b - ((b >> 1) & 0x55);
+		b = (b & 0x33) + ((b >> 2) & 0x33);
+		set += (b + (b >> 4)) & 0x0f;
+	}
+	return set / (bytes.length * 8);
+}
+
 /** Test seam: drop all in-memory state (both sides). */
 export function resetVisitFilter() {
 	slices = new Map();
@@ -324,6 +392,7 @@ export function resetVisitFilter() {
 	slotEndMs = 0;
 	merged = new Map();
 	mergedAt = 0;
+	coldUntilMs = 0;
 	if (flushTimer) clearInterval(flushTimer);
 	flushTimer = null;
 	armedFlushInterval = null;

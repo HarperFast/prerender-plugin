@@ -419,14 +419,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 					true,
 					'Compute and LOG every ladder decision but schedule with the unchanged base interval. ' +
 						'A week of this reports the steady-state level distribution — and therefore the render ' +
-						'budget — before you pay for it. Default ON: enabling `enabled` alone changes nothing ' +
-						'until this is turned off.'
+						'budget — before you pay for it. Default ON: enabling `enabled` alone changes no ' +
+						'SCHEDULE until this is turned off.\n\n' +
+						'One write does happen in dry-run, deliberately: a rung move persists to ' +
+						'`Target.demandInterval` (only on an actual move, never on hold). That persistence is ' +
+						'what makes the dry-run histogram converge to the steady-state distribution instead ' +
+						'of reporting first-step decisions forever — and it means the measured week is not ' +
+						'free of replicated Target writes (~one per target that moves, per rung walked, plus ' +
+						'boundary pages that flap). Turning the ladder fully off leaves `demandInterval` in ' +
+						'place, ignored; a later re-enable resumes from the stored rung rather than from base.'
 				),
 				ladder: option(
 					[6 * HOUR, 12 * HOUR, 24 * HOUR, 48 * HOUR],
 					'Render intervals a target may occupy, ascending. The route/stored interval is the ' +
 						'CEILING — the ladder reallocates within the cadence the route already grants and never ' +
-						'schedules slower than it. Bottoming out at 6h rather than 1h is deliberate: 1h buys ' +
+						'schedules slower than it. An interval that is not itself a rung participates as its ' +
+						'own top rung: it rests at its granted cadence and may only move through the rungs ' +
+						'FASTER than it — never snapped to a rung in either direction (a 1h route parked at ' +
+						'6h, or a weekly sitemap route pulled to 48h at 3.5x its granted render budget). ' +
+						'Bottoming out at 6h rather than 1h is deliberate: 1h buys ' +
 						'~0.04% availability error against 6h\u2019s ~0.24% for six times the render cost, and the ' +
 						'fast rungs are where a runaway hot set becomes unaffordable.',
 					{ unit: 'ms' }

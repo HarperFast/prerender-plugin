@@ -39,22 +39,55 @@
  */
 
 import { config, onConfigApplied } from '../config.js';
-import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged } from './visitFilter.js';
+import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged, newestFill } from './visitFilter.js';
 
 // Normalized rungs, recomputed only when config changes — decideInterval runs on the
-// reschedule path (~20x/s) and must not re-filter/sort per decision.
+// reschedule path (~20x/s) and must not re-filter/sort per decision. The per-base effective
+// ladders derive from the same config, so they are cleared together.
 let cachedRungs = [];
+const effectiveLadders = new Map();
 const updateRungs = () => {
 	cachedRungs = [...new Set((config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0))].sort(
 		(a, b) => a - b
 	);
+	effectiveLadders.clear();
 };
 updateRungs();
 
 /** Rungs, ascending, normalized and de-duplicated. Config is the source of truth. */
 export const rungs = () => cachedRungs;
 
-/** Index of the rung a target currently sits on; the closest rung when `current` is off-ladder. */
+/**
+ * The ladder a given base interval actually offers: every configured rung STRICTLY faster
+ * than base, with base itself as the top (slowest) rung.
+ *
+ * Base is the resting state, and an off-ladder base is deliberately never snapped to a
+ * configured rung — in either direction. Snapping UP schedules slower than the route granted
+ * (a 1h route parked at the 6h rung, with no traffic input at all); snapping DOWN renders
+ * faster than the route budgeted (a weekly `changefreq` route at 168h pulled to the 48h rung
+ * is a 3.5x render-cost multiplier on that corpus slice — a fleet-capacity event, and one
+ * `maxFastFraction` cannot see, because 48h is not "fast"). Both directions break the two
+ * contracts the config text states: base is the ceiling, and the ladder reallocates within
+ * the budget the route already grants.
+ *
+ * Memoized per base: bases come from routes/changefreq/default — a handful of distinct
+ * values — and this runs per reschedule. Bounded anyway so a caller bug cannot grow it.
+ */
+export const effectiveLadder = (base) => {
+	let list = effectiveLadders.get(base);
+	if (!list) {
+		if (effectiveLadders.size >= 64) effectiveLadders.clear();
+		list = [...cachedRungs.filter((r) => r < base), base];
+		effectiveLadders.set(base, list);
+	}
+	return list;
+};
+
+/**
+ * Index of the rung a target currently sits on; the closest rung when `current` is
+ * off-ladder (a stored rung from an old ladder config — bases never snap, see
+ * `effectiveLadder`).
+ */
 export const rungIndexOf = (current, list = rungs()) => {
 	if (!list.length) return -1;
 	const n = Number(current);
@@ -96,10 +129,20 @@ const bump = (interval) => stats.levels.set(interval, (stats.levels.get(interval
  */
 export function decideInterval(url, base, current, nowMs = Date.now(), probe = visitProbe) {
 	const demand = config.render.demand;
-	const list = rungs();
 
-	if (!demand.enabled || !list.length) return { interval: base, level: base, action: 'off' };
+	if (!demand.enabled || !cachedRungs.length) return { interval: base, level: base, action: 'off' };
 	armDemandStats();
+
+	// The rungs this base can actually occupy: everything faster than it, plus base itself
+	// as the resting state. A single entry means no configured rung is faster than the
+	// granted cadence — nothing to reallocate, so skip the probe (and the cold hold: there
+	// is no move to hold back).
+	const list = effectiveLadder(Number(base));
+	if (list.length === 1) {
+		stats.held++;
+		bump(base);
+		return { interval: base, level: base, action: 'held' };
+	}
 
 	// A cold read-side union would read as "nothing was visited anywhere", which would demote
 	// the entire corpus to the slowest rung on the first pass after a restart. Hold instead.
@@ -112,10 +155,10 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
 		return { interval: base, level: base, action: 'cold' };
 	}
 
-	// `base` is the ceiling: the ladder reallocates within the cadence the route already
-	// grants, it never renders a target SLOWER than its route asked for. Rungs at or above
-	// base are unreachable, so a route set to 6h simply has nowhere to demote to.
-	const ceiling = rungIndexOf(base, list);
+	// `base` is the ceiling — the last entry of its own effective ladder — so rungs at or
+	// above the route's grant are unreachable by construction, and a route set to 6h simply
+	// has nowhere to demote to.
+	const ceiling = list.length - 1;
 	const from = Math.min(rungIndexOf(current ?? base, list), ceiling);
 
 	let to = from;
@@ -191,6 +234,10 @@ export function logDemandStats() {
 		held: s.held,
 		skippedCold: s.skippedCold,
 		fastFraction: Number(s.fastFraction.toFixed(4)),
+		// Set-bit fraction of the newest union slot — the sizing early warning. A k-hash probe
+		// false-positives at ~fill^k (k=7: fill 0.5 ≈ 0.8%, fill 0.88 ≈ 40%), and false
+		// positives promote pages nobody visited — watch this before trusting the histogram.
+		fill: Number(newestFill().toFixed(4)),
 		levels: pretty,
 	};
 	if (s.fastFraction > demand.maxFastFraction) {

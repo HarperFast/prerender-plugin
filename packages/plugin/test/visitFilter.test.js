@@ -16,15 +16,22 @@ import { setImmediate as tick } from 'node:timers/promises';
  *     filter must not have);
  *   - flush UNIONS with the stored row (read-merge-write under the mutex), never
  *     overwrites — that is what makes the node row the union of all workers;
+ *   - visitedWithin anchors on the slot containing the window's START — the newest slot is
+ *     partial, so a slot-counted probe under-covers the window and reads genuinely-visited
+ *     pages as unvisited (the false-negative direction that demotes them);
  *   - visitedInEachWindow demands a hit in EACH consecutive window, not just any;
- *   - sweepExpired deletes rows older than the ring and nothing newer.
+ *   - sweepExpired deletes rows outside the ring on BOTH sides — older than the cutoff, and
+ *     past the current slot (a sliceMs increase renumbers slots downward, stranding
+ *     old-numbering rows above every reachable slot);
+ *   - a sizing (shape) change drops both sides of the in-memory state and holds the ladder
+ *     cold rather than answering from old-shape rows.
  */
 
 const rows = new Map();
 let locks = [];
 
 let recordVisit, flushSlices, refreshMerged, visitedWithin, visitedInEachWindow;
-let sweepExpired, resetVisitFilter, slotOf;
+let sweepExpired, resetVisitFilter, slotOf, mergedReady;
 let applyOptions;
 
 const H = 60 * 60 * 1000;
@@ -60,12 +67,16 @@ before(async () => {
 					rows.delete(id);
 				},
 				// Honors just enough of the search contract for refreshMerged and sweepExpired:
-				// one slot condition, either direction.
+				// one slot condition, any direction.
 				async search({ conditions = [] } = {}) {
 					const out = [];
 					for (const row of rows.values()) {
 						const ok = conditions.every((c) =>
-							c.comparator === 'less_than' ? row.slot < c.value : row.slot >= c.value
+							c.comparator === 'less_than'
+								? row.slot < c.value
+								: c.comparator === 'greater_than'
+									? row.slot > c.value
+									: row.slot >= c.value
 						);
 						if (ok) out.push({ ...row });
 					}
@@ -85,6 +96,7 @@ before(async () => {
 		sweepExpired,
 		resetVisitFilter,
 		slotOf,
+		mergedReady,
 	} = await import('../src/util/visitFilter.js'));
 });
 
@@ -174,12 +186,16 @@ test('visitedInEachWindow requires a hit in EACH consecutive window, not just an
 	assert.equal(visitedInEachWindow(url, H, 3, now), false, 'no hit in the third window back');
 });
 
-test('sweepExpired deletes rows older than the ring and nothing newer', async () => {
+test('sweepExpired deletes rows outside the ring on both sides and nothing inside', async () => {
 	const cur = slotOf(Date.now());
 	const bits = Buffer.alloc(8, 0xff);
 	rows.set(`${cur}|node-a`, { id: `${cur}|node-a`, slot: cur, node: 'node-a', bits });
 	rows.set(`${cur - 20}|node-a`, { id: `${cur - 20}|node-a`, slot: cur - 20, node: 'node-a', bits });
 	rows.set(`${cur - 40}|node-b`, { id: `${cur - 40}|node-b`, slot: cur - 40, node: 'node-b', bits });
+	// Boundary skew is legitimate; an old-numbering orphan (sliceMs was increased) is not —
+	// without the future sweep it can never age out and rides every union refresh forever.
+	rows.set(`${cur + 1}|node-b`, { id: `${cur + 1}|node-b`, slot: cur + 1, node: 'node-b', bits });
+	rows.set(`${cur + 500}|node-a`, { id: `${cur + 500}|node-a`, slot: cur + 500, node: 'node-a', bits });
 
 	await sweepExpired(cur - 16);
 	await tick();
@@ -187,6 +203,45 @@ test('sweepExpired deletes rows older than the ring and nothing newer', async ()
 	assert.equal(rows.has(`${cur}|node-a`), true, 'live slot kept');
 	assert.equal(rows.has(`${cur - 20}|node-a`), false, 'aged-out slot deleted');
 	assert.equal(rows.has(`${cur - 40}|node-b`), false, "other node's aged-out slot deleted too");
+	assert.equal(rows.has(`${cur + 1}|node-b`), true, 'boundary-skew slot kept');
+	assert.equal(rows.has(`${cur + 500}|node-a`), false, 'old-numbering orphan deleted');
+});
+
+test('a visit late in the previous slot is seen by a probe early in the current one', async () => {
+	// The newest slot is PARTIAL. A slot-counted probe (`ceil(window/slice)` slots back)
+	// covers only the elapsed part of the current slot for a one-slice window — a visit 50
+	// minutes ago read as "not visited" when probed 10 minutes into the next slot. That is a
+	// false negative, the one error direction the filter must not have: it demotes a
+	// genuinely-visited page. Anchoring on the slot containing the window's START over-covers
+	// by up to one slice instead (the safe, documented direction).
+	const now = Date.now();
+	const url = 'https://example.com/product/prd-7';
+	recordVisit(url);
+	await flushSlices();
+	// Move the row to the previous slot: the bit pattern is slot-independent.
+	const [id, row] = [...rows.entries()][0];
+	rows.delete(id);
+	const prev = slotOf(now) - 1;
+	rows.set(`${prev}|node-a`, { ...row, id: `${prev}|node-a`, slot: prev });
+
+	await refreshMerged(now);
+	const earlyInSlot = slotOf(now) * H + 10 * 60 * 1000; // 10 minutes into the current slot
+	assert.equal(visitedWithin(url, H, earlyInSlot), true);
+});
+
+test('a sizing change drops both sides of the in-memory state and holds the ladder cold', async () => {
+	const now = Date.now();
+	recordVisit('https://example.com/a');
+	await flushSlices();
+	await refreshMerged(now);
+	assert.equal(mergedReady(), true);
+	assert.equal(visitedWithin('https://example.com/a', H, now), true);
+
+	// Reshape: the slot numbering changes, so every old-shape answer is garbage. The union
+	// must stop answering (cold hold) rather than demote the corpus off near-empty data.
+	setDemand({ sliceMs: 2 * H });
+	assert.equal(mergedReady(), false, 'union no longer claims to be warm');
+	assert.equal(visitedWithin('https://example.com/a', H, now), false, 'old-shape union dropped');
 });
 
 test('a cold union answers false rather than throwing or inventing traffic', () => {

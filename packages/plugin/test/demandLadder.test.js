@@ -105,10 +105,45 @@ test('dry run reports the level it would pick but schedules the base', () => {
 	assert.equal(drainStats().promoted, 1, 'and still counts the decision');
 });
 
-test('an off-ladder stored interval snaps to the nearest rung', () => {
+test('an off-ladder STORED interval snaps to the nearest rung', () => {
+	// This pins `rungIndexOf` for `current` only — a stored rung from an old ladder config.
+	// Bases never snap; they participate as their own top rung (next tests).
 	assert.equal(rungIndexOf(23 * H), 2); // nearest 24h
 	assert.equal(rungIndexOf(0), rungs().length - 1); // invalid -> slowest
 	assert.equal(rungIndexOf(undefined), rungs().length - 1);
+});
+
+test('an off-ladder BASE is never snapped to a rung — it rests at its own cadence', () => {
+	// Below the fastest rung: a 1h route must not be parked at the 6h rung — that schedules
+	// it 6x slower than the route granted, with no traffic input at all.
+	const fast = decideInterval('u', 1 * H, undefined, Date.now(), always);
+	assert.equal(fast.interval, 1 * H);
+	assert.equal(fast.level, 1 * H);
+	assert.equal(fast.action, 'held');
+
+	// Above the slowest rung: an UNVISITED weekly (168h) route must not be pulled to the 48h
+	// rung — a 3.5x render-cost multiplier `maxFastFraction` cannot see, because 48h is not
+	// "fast".
+	const slow = decideInterval('u', 168 * H, undefined, Date.now(), never);
+	assert.equal(slow.level, 168 * H);
+	assert.equal(slow.action, 'held');
+
+	// Between rungs: an 18h route rests at 18h and promotes only through rungs faster than it.
+	assert.equal(decideInterval('u', 18 * H, undefined, Date.now(), never).level, 18 * H);
+	assert.equal(decideInterval('u', 18 * H, 18 * H, Date.now(), always).level, 12 * H);
+});
+
+test('a hot off-ladder base promotes through the faster rungs and walks back to its own grant', () => {
+	let cur = 168 * H;
+	for (const expected of [48 * H, 24 * H, 12 * H, 6 * H]) {
+		cur = decideInterval('u', 168 * H, cur, Date.now(), always).level;
+		assert.equal(cur, expected);
+	}
+	// Gone cold, it demotes back up — topping out at 168h, its own grant, not the 48h rung.
+	for (const expected of [12 * H, 24 * H, 48 * H, 168 * H, 168 * H]) {
+		cur = decideInterval('u', 168 * H, cur, Date.now(), never).level;
+		assert.equal(cur, expected);
+	}
 });
 
 test('fastFraction counts rungs below maxFastInterval', () => {
