@@ -38,9 +38,11 @@
  *      not depend on how many metric NAMES exist; row SIZE is the active combo count.
  *   4. Every `analytics.aggregatePeriod` (default 60 s) the MAIN thread re-merges raw rows by
  *      the same combo key — count-weighted means, distribution merges, another sort per
- *      value-combo — and writes ONE `hdb_analytics` row PER ACTIVE COMBO PER PERIOD (retention:
- *      one year). Aggregation happens on the main thread, so combo cardinality is main-thread
- *      CPU every half-period, forever.
+ *      value-combo — and writes ONE `hdb_analytics` row PER ACTIVE COMBO PER PERIOD. Default
+ *      retention is ONE YEAR (`analytics.aggregateRetentionMs`, Harper ≥ 5.2.0) — far longer
+ *      than anything here gets charted; deployments should set it to ~90 days (see METRICS.md).
+ *      Aggregation happens on the main thread, so combo cardinality is main-thread CPU every
+ *      half-period, for as long as the rows are retained.
  *
  *   So the durable write cost of a signal is its ACTIVE COMBO COUNT (rows/period/node + that
  *   main-thread merge), and the hot-path cost is counter-vs-value. The metric NAME is free on

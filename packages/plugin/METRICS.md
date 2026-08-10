@@ -35,7 +35,7 @@ value-combo's samples are **sorted** into a ~10-point percentile distribution (t
 part — a counter skips it), and the whole thread report lands as **one row in
 `hdb_raw_analytics`** (1 h retention). Every `analytics.aggregatePeriod` (default 60 s) the main
 thread re-merges raw rows by combo and writes **one `hdb_analytics` row per active combo per
-period** (1 year retention). So:
+period**. So:
 
 1. **Write cost is combos, not names.** The durable cost of a signal is its active combo count —
    rows per period per node, plus main-thread merge CPU. Merging or splitting metric _names_
@@ -61,6 +61,17 @@ across ALL metrics** and filters by name. So:
    `count`, `mean`, `median`, `p95`, `p99` (from the merged distribution).
 7. **Cardinality is a year-long cost** (fact 1's row count) — bot names, routes, statuses and
    outcomes are closed sets; never put a URL, cache key or raw path in a dimension.
+
+### Retention — set it, the default is a year
+
+Aggregated rows default to **one year** of retention (`analytics.aggregateRetentionMs`,
+available since Harper 5.2.0; raw rows default to 1 hour via `analytics.rawRetentionMs`, which
+is fine). Nothing in this catalog gets charted past a quarter, and every retained combo-period
+row is storage plus cleanup work forever — **set `analytics.aggregateRetentionMs` to ~90 days**
+(`7776000000`) in the Harper instance config. Windowed queries don't get faster (the PK range
+bounds them either way), but an accidental un-windowed `get_analytics` scans a quarter instead
+of a year, and the table stops growing past what anyone reads. This is instance config on the
+nodes, not plugin config — it rides a Harper config change, not a component deploy.
 
 ### Querying
 
