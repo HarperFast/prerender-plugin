@@ -71,7 +71,7 @@ const makeTable = (rows) =>
 before(async () => {
 	globalThis.Resource = class {};
 	globalThis.server = { hostname: 'node-a', workerIndex: 0, nodes: [], config: { http: { port: 9926 } } };
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.createBlob = (buffer) => buffer;
 	globalThis.databases = {
 		coordination: {

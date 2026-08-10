@@ -152,6 +152,49 @@ test('invalidation_error emits (kind) only', () => {
 	});
 });
 
+test('render_outcome emits (outcome, detail) and normalizes a missing detail to null', () => {
+	const e = emitted(() => metrics.renderOutcome('suppressed', 'noindex'));
+	assert.deepEqual(e, { value: true, metric: 'render_outcome', path: 'suppressed', method: 'noindex', type: null });
+	const bare = emitted(() => metrics.renderOutcome('rendered', undefined));
+	assert.equal(bare.method, null);
+});
+
+test('render_outcome documents every outcome and detail the emitters use', () => {
+	// The emit sites are spread across two RenderQueue methods; this pins the catalog's closed
+	// sets so a new branch cannot invent an undocumented dimension value.
+	const outcomes = METRICS.render_outcome.dimensions.path.values;
+	assert.deepEqual(outcomes, ['rendered', 'suppressed', 'auth-failure', 'transient', 'failed', 'redirect']);
+	for (const detail of ['stored', 'discarded', 'refiled', 'unspecified', 'landed-auth', 'temporary', 'permanent']) {
+		assert.ok(METRICS.render_outcome.dimensions.method.values.includes(detail), `detail ${detail} undocumented`);
+	}
+});
+
+test('claim_scan and origin_fetch emit the duration FIRST', () => {
+	const c = emitted(() => metrics.claimScan(3.2, 'granted'));
+	assert.deepEqual(c, { value: 3.2, metric: 'claim_scan', path: 'granted', method: null, type: null });
+	const o = emitted(() => metrics.originFetch(120, 200, 'miss'));
+	assert.deepEqual(o, { value: 120, metric: 'origin_fetch', path: 200, method: 'miss', type: null });
+});
+
+test('unrouted emits the interval count as the VALUE so `total` sums to requests', () => {
+	const e = emitted(() => metrics.unrouted(17, 'unclassified', '/blog/*'));
+	assert.deepEqual(e, { value: 17, metric: 'unrouted', path: 'unclassified', method: '/blog/*', type: null });
+});
+
+test('sitemap_run, reconcile and config_warnings emit their number as the value', () => {
+	const s = emitted(() => metrics.sitemapRun(42, 'created'));
+	assert.deepEqual([s.value, s.metric, s.path], [42, 'sitemap_run', 'created']);
+	const r = emitted(() => metrics.reconcile(3, 'restored'));
+	assert.deepEqual([r.value, r.metric, r.path], [3, 'reconcile', 'restored']);
+	const c = emitted(() => metrics.configWarnings(2));
+	assert.deepEqual([c.value, c.metric, c.path], [2, 'config_warnings', null]);
+});
+
+test('serve_error is a counter keyed by kind', () => {
+	const e = emitted(() => metrics.serveError('blob-stream'));
+	assert.deepEqual(e, { value: true, metric: 'serve_error', path: 'blob-stream', method: null, type: null });
+});
+
 test('every emitter emits a metric the catalog documents, and every catalog entry has an emitter', () => {
 	const emittedNames = new Set();
 	for (const emit of Object.values(metrics)) {

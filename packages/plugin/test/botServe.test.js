@@ -33,7 +33,7 @@ before(async () => {
 		config: { http: { port: 9926 } },
 		recordAnalytics: (...args) => analytics.push(args),
 	};
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
 		coordination: {
 			SharedBuffer: {

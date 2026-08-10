@@ -42,7 +42,7 @@ const sharedBufferStub = {
 
 beforeEach(async () => {
 	globalThis.server = { hostname: 'node-a', nodes: [], config: { http: {} } };
-	globalThis.logger = { info() {}, warn() {}, error() {} };
+	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = { coordination: { SharedBuffer: { primaryStore: sharedBufferStub } } };
 	reconcile = await import('../src/util/reconcile.js');
 });

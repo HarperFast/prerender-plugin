@@ -147,7 +147,9 @@ export const interpretRow = (scope, row) => {
 	const at = epochMsOf(row.invalidatedAt);
 	if (!Number.isFinite(at)) {
 		countError('invalid-row');
-		logger.warn(
+		// error, not warn: this is somebody's deliberate invalidation being silently inert —
+		// the one outcome this feature must never produce (see the module header).
+		logger.error(
 			`[prerender] invalidation row "${scope}" has no readable invalidatedAt, so it applies to NOTHING. ` +
 				`Write an explicit ISO instant (there is deliberately no updatedTime fallback, because updatedTime ` +
 				`re-stamps on every write and would re-invalidate the corpus whenever the row was edited).`

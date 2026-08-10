@@ -13,6 +13,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { headersToObject } from '../util/headers.js';
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
+import { metrics } from '../metrics.js';
 
 // Headers preserved on a 304 response; everything else is dropped.
 const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
@@ -194,6 +195,9 @@ export function deliverResource(resource, request, info = {}) {
 	if (!resource.miss && body instanceof Blob) {
 		if (typeof body.on === 'function') {
 			body.on('error', (e) => {
+				// The 200 and the bot_serve cache-hit row were committed before the body streamed, so
+				// without this counter a truncated serve is recorded as a SUCCESS everywhere.
+				metrics.serveError('blob-stream');
 				getLogger().error('blob delivery error', e);
 				PrerenderedPage.delete(resource.cacheKey);
 			});

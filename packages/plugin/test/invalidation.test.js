@@ -31,10 +31,16 @@ const rows = new Map();
 let reads = [];
 let failNext = 0;
 let warns = [];
+let errors = [];
 
 before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], recordAnalytics: () => {} };
-	globalThis.logger = { info() {}, warn: (m) => warns.push(String(m)), error: () => {} };
+	globalThis.logger = {
+		debug() {},
+		info() {},
+		warn: (m) => warns.push(String(m)),
+		error: (...a) => errors.push(a.map(String).join(' ')),
+	};
 	globalThis.databases = {
 		invalidation: {
 			Invalidation: {
@@ -72,6 +78,7 @@ beforeEach(() => {
 	rows.clear();
 	reads = [];
 	warns = [];
+	errors = [];
 	failNext = 0;
 	inv.resetInvalidationState();
 	config.invalidation.enabled = true;
@@ -151,8 +158,10 @@ test('a row with no readable invalidatedAt applies to NOTHING, and says so', asy
 	rows.set('all', { scope: 'all', mode: 'hard', reason: 'no epoch', updatedTime: at(9_000_000) });
 
 	assert.equal(await inv.resolveInvalidation(null), null, 'not "invalidated since 1970", and not updatedTime');
+	// error since the log relevel: this is somebody's deliberate invalidation being silently
+	// inert — the one outcome the feature must never produce.
 	assert.ok(
-		warns.some((w) => w.includes('no readable invalidatedAt')),
+		errors.some((w) => w.includes('no readable invalidatedAt')),
 		'and it is reported — a row that applies to nothing must not be silent'
 	);
 });

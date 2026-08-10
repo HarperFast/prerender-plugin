@@ -218,6 +218,229 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
+	render_outcome: metric('render_outcome', {
+		kind: 'counter',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence: 'exactly once per render result posted back by a browser worker',
+		summary: 'What happened to each render: stored, suppressed, failed, retried, or resolved as a redirect.',
+		usefulFor:
+			'The render-failure alert. render_time says how long a render took; this says what became of it — ' +
+			'"renders are failing", "the corpus is being mass-suppressed", and "the renderer credential broke" ' +
+			'were all log-grep-only before this existed. One emit per posted result, so the outcomes sum to ' +
+			'results processed and any share can be read as a fraction of render throughput.',
+		caveats:
+			'auth-failure is special-cased on purpose: 401/403 never suppresses (it is almost never a statement ' +
+			'about the page), so a spike here with a steady `suppressed` is the signature of a broken bypass ' +
+			'token or an origin bot-mitigation change. `redirect` counts every redirect-shaped result; its ' +
+			'detail says how each was resolved. A source retired after repeated redirects appears as its final ' +
+			'`temporary`/`unrouted-destination` emit — the retirement itself is in the log and the Target table.',
+		dimensions: {
+			path: {
+				name: 'outcome',
+				values: ['rendered', 'suppressed', 'auth-failure', 'transient', 'failed', 'redirect'],
+				description:
+					'rendered = a usable result (see detail for where it went). suppressed = a genuine non-indexable ' +
+					'verdict; the target moves to its recheck cadence. auth-failure = 401/403, kept and retried. ' +
+					'transient = 408/429/5xx, kept and retried. failed = the render itself broke (crash, timeout). ' +
+					'redirect = the page moved or bounced; detail says what was decided.',
+			},
+			method: {
+				name: 'detail',
+				values: [
+					'stored',
+					'discarded',
+					'refiled',
+					'noindex',
+					'canonical-mismatch',
+					'http-error',
+					'redirect-loop',
+					'unspecified',
+					'landed-auth',
+					'landed-transient',
+					'unrouted-destination',
+					'non-indexable-destination',
+					'temporary',
+					'permanent',
+					'navigation',
+					'unknown',
+				],
+				description:
+					'Per-outcome refinement. rendered: stored (cached), discarded (landed on a route class we never ' +
+					'serve), refiled (client-side redirect onto another prerender key). suppressed: the browser’s ' +
+					'reason (noindex / canonical-mismatch / http-error / redirect-loop, else unspecified). ' +
+					'auth-failure/transient: the status code. failed: the error phase (navigation = the document ' +
+					'never arrived; unknown = pre-v1.16.0 worker posted no detail). redirect: landed-auth/' +
+					'landed-transient (destination answered 401/403 / 5xx-shaped), unrouted-destination (route list ' +
+					'has no home for it — a render is wasted every interval until fixed), non-indexable-destination ' +
+					'(source retired, destination suppressed), temporary (kept, strike counted), permanent (source ' +
+					'retired in favor of the destination).',
+			},
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	claim_scan: metric('claim_scan', {
+		kind: 'value',
+		unit: 'ms',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence: 'once per claim pass (skipped when the queue is paused — no scan runs)',
+		summary: 'Duration of the claim pass: the scan that finds due renders and grants leases.',
+		usefulFor:
+			'The queue’s leading indicator. The claim scan degrades when dead index entries pile up at its seek ' +
+			'point (measured 17× once, invisible to every other metric) — a rising p95 here precedes the backlog ' +
+			'it causes. Watch the trend, not the absolute number.',
+		dimensions: {
+			path: {
+				name: 'result',
+				values: ['granted', 'empty', 'capped'],
+				description:
+					'granted = jobs were handed out. empty = the pass completed and found nothing due. capped = the ' +
+					'scan hit queue.claimScanCap without reaching a not-yet-due row — in-flight work is filling the ' +
+					'scan window (the claim warn line carries the specifics).',
+			},
+			method: { name: null, description: 'Unused (emitted as null).' },
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	origin_fetch: metric('origin_fetch', {
+		kind: 'value',
+		unit: 'ms',
+		emittedBy: 'util/upstream.js',
+		cadence: 'once per origin proxy on the bot serve path (time to response headers; the body streams after)',
+		summary: 'What a non-cache serve costs: origin latency and status, by why the origin was consulted.',
+		usefulFor:
+			'The cost of a miss, which offload alone hides: bot_serve says how often the origin answered, this ' +
+			'says how slowly and with what. A rising `error`/5xx share here is origin trouble bots are feeling ' +
+			'directly; `render-timeout` rows are renderNow falling back, i.e. the fleet not keeping up with ' +
+			'on-demand requests.',
+		dimensions: {
+			path: {
+				name: 'statusCode',
+				description:
+					'HTTP status the origin answered — a NUMBER at the emit site, like render_time. 0 = the fetch ' +
+					'itself failed (connect/TLS/reset) before any status arrived.',
+			},
+			method: {
+				name: 'reason',
+				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'render-timeout'],
+				description:
+					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
+					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +
+					'origin was the fallback).',
+			},
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	serve_error: metric('serve_error', {
+		kind: 'counter',
+		emittedBy: 'http_handlers/response.js',
+		cadence: 'per serve-path delivery failure',
+		summary: 'A response that failed AFTER being committed — the crawler got truncated bytes recorded as a success.',
+		usefulFor:
+			'The one failure the serve metrics cannot see by construction: the 200 and the cache-hit row are ' +
+			'recorded before the body streams, so when the stored Blob dies mid-stream every signal says success. ' +
+			'Expect zero; any rate is truncated pages reaching crawlers. The entry self-evicts (the next request ' +
+			'heals it), but the serves already made were wrong.',
+		dimensions: {
+			path: {
+				name: 'kind',
+				values: ['blob-stream'],
+				description: 'blob-stream = a cached page’s stored body errored while streaming out.',
+			},
+			method: { name: null, description: 'Unused (emitted as null).' },
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	unrouted: metric('unrouted', {
+		kind: 'value',
+		emittedBy: 'util/unrouted.js',
+		cadence: 'per report flush per worker (ingress.report.interval), one emit per active bucket',
+		summary: 'Requests served without prerendering, as summable numbers instead of a log line.',
+		usefulFor:
+			'unclassified volume = the CDN forwarding paths nobody declared (over-forwarding, or a missing ' +
+			'route = lost SEO coverage); passthrough volume = the declared-but-not-prerendered backlog, priced ' +
+			'in live origin proxies. Read `total` (the per-flush counts sum); `count` is just flushes.',
+		caveats:
+			'Bucket cardinality is bounded by ingress.report.maxBuckets per class (default 200, overflow rolls ' +
+			'up); the log line remains the richer record (sample path per bucket).',
+		dimensions: {
+			path: {
+				name: 'routeClass',
+				values: ['unclassified', 'passthrough'],
+				description: 'Which kind of non-prerendered serve this bucket counts.',
+			},
+			method: {
+				name: 'bucket',
+				description: 'First path segment (`/blog/*`), `/` for root, or the overflow bucket past maxBuckets.',
+			},
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	sitemap_run: metric('sitemap_run', {
+		kind: 'value',
+		emittedBy: 'resources/Sitemap.js',
+		cadence: 'once per completed sitemap refresh run (per root sitemap, on the node that ran it)',
+		summary: 'What a sitemap walk did to the corpus: targets created, re-attributed, unlinked, sitemaps failed.',
+		usefulFor:
+			'Corpus churn and walk health as chartable numbers — `failed` > 0 was log-only before. A `created` ' +
+			'spike after a site release is expected; a `removed` spike is worth confirming against the sitemap ' +
+			'diff before the prune retires real pages. Read `total` for sums, `count` for runs.',
+		dimensions: {
+			path: {
+				name: 'series',
+				values: ['sitemaps', 'created', 'updated', 'skipped', 'removed', 'failed'],
+				description:
+					'Per finished run: sitemaps processed, targets created / re-attributed / unchanged / unlinked, ' +
+					'and sitemaps that failed and were skipped (their targets are left untouched).',
+			},
+			method: { name: null, description: 'Unused (emitted as null).' },
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	reconcile: metric('reconcile', {
+		kind: 'value',
+		emittedBy: 'util/reconcile.js',
+		cadence: 'once per reconcile sweep per node (render.reconcile.interval, or the admin action)',
+		summary: 'Schedule-gap repairs: targets found with no schedule row, and how many were restored.',
+		usefulFor:
+			'`restored` > 0 means URLs were silently un-renderable until this sweep — the terminal state nothing ' +
+			'else reports. Expect zero; a steady rate means something is CREATING gaps (a replication fault, a ' +
+			'bad delete path) faster than the sweep heals them, and the log line names the URLs.',
+		dimensions: {
+			path: {
+				name: 'series',
+				values: ['restored', 'missing'],
+				description:
+					'missing = gaps found this sweep; restored = gaps repaired (they differ when the per-sweep ' +
+					'restore cap truncates the pass — the remainder waits for the next sweep).',
+			},
+			method: { name: null, description: 'Unused (emitted as null).' },
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
+	config_warnings: metric('config_warnings', {
+		kind: 'value',
+		emittedBy: 'util/backlogSnapshot.js',
+		cadence: 'once per backlog snapshot per node (worker 0) — the same pass as queue_health',
+		summary: 'How many findings collectConfigWarnings currently reports on this node.',
+		usefulFor:
+			'Pages on a bad deploy instead of waiting for someone to open the console: the warnings list catches ' +
+			'an empty security token, an inert route entry, a clamped window, an invalidation row sitting behind ' +
+			'a disabled kill switch. Expect the value this deployment has accepted (usually 0); alert on change, ' +
+			'not on level. GET /prerender_admin/config carries the actual findings.',
+		dimensions: {
+			path: { name: null, description: 'Unused (emitted as null).' },
+			method: { name: null, description: 'Unused (emitted as null).' },
+			type: { name: null, description: 'Unused (emitted as null).' },
+		},
+	}),
+
 	queue_health: metric('queue_health', {
 		kind: 'value',
 		emittedBy: 'util/backlogSnapshot.js',
@@ -234,7 +457,7 @@ export const METRICS = Object.freeze({
 		dimensions: {
 			path: {
 				name: 'gauge',
-				values: ['overdue', 'lease_occupancy', 'below_floor', 'below_floor_age_ms', 'floor_pin_age_ms'],
+				values: ['overdue', 'lease_occupancy', 'below_floor', 'below_floor_age_ms', 'floor_pin_age_ms', 'paused'],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
 					'in-flight count, not zero — not comparable with pre-0.34.0 numbers). ' +
@@ -243,7 +466,9 @@ export const METRICS = Object.freeze({
 					'treat any sustained non-zero as lost renders. ' +
 					'below_floor_age_ms = age of the oldest such row (absent when there are none). ' +
 					'floor_pin_age_ms = how long the claim floor has been stuck at one value; a floor pinned for ' +
-					'hours means one failing key is holding the whole queue’s scan position.',
+					'hours means one failing key is holding the whole queue’s scan position. ' +
+					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
+					'alertable without polling the REST surface.',
 			},
 			method: { name: null, description: 'Unused (emitted as null).' },
 			type: { name: null, description: 'Unused (emitted as null).' },
@@ -483,6 +708,31 @@ export const metrics = Object.freeze({
 	/** One render's duration, as reported by the browser worker. */
 	renderTime: (renderTimeMs, statusCode, candidacy) =>
 		server.recordAnalytics(renderTimeMs, 'render_time', statusCode, candidacy),
+
+	/** What became of one posted render result — exactly one call per result. */
+	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render_outcome', outcome, detail ?? null, null),
+
+	/** One claim pass's duration and how it ended. */
+	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'claim_scan', result, null, null),
+
+	/** One origin proxy on the serve path: time to response headers, status, and why. */
+	originFetch: (durationMs, statusCode, reason) =>
+		server.recordAnalytics(durationMs, 'origin_fetch', statusCode, reason, null),
+
+	/** A committed response whose body failed on the way out. */
+	serveError: (kind) => server.recordAnalytics(true, 'serve_error', kind, null, null),
+
+	/** One flush-interval's count for one unrouted bucket (read `total` for the request sum). */
+	unrouted: (count, routeClass, bucket) => server.recordAnalytics(count, 'unrouted', routeClass, bucket, null),
+
+	/** One series of a finished sitemap refresh run. */
+	sitemapRun: (value, series) => server.recordAnalytics(value, 'sitemap_run', series, null, null),
+
+	/** One series of a finished reconcile sweep. */
+	reconcile: (value, series) => server.recordAnalytics(value, 'reconcile', series, null, null),
+
+	/** The current config-warning count, from the snapshot pass. */
+	configWarnings: (count) => server.recordAnalytics(count, 'config_warnings', null, null, null),
 
 	/** One queue-health gauge from the periodic backlog snapshot. */
 	queueHealth: (value, gauge) => server.recordAnalytics(value, 'queue_health', gauge, null, null),

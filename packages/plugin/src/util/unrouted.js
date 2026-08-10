@@ -30,6 +30,7 @@
 
 import { config, getLogger, onConfigApplied } from '../config.js';
 import { PASSTHROUGH, UNCLASSIFIED } from './routeClass.js';
+import { metrics } from '../metrics.js';
 
 // class -> bucket -> { count, firstMs, lastMs, samplePath }
 const buckets = new Map([
@@ -145,6 +146,15 @@ export const logUnroutedReport = () => {
 
 		let total = 0;
 		for (const row of rows) total += row.count;
+
+		// The same numbers as METRICS, at the same flush: one buffered emit per active bucket
+		// (bounded by maxBuckets), value = this interval's count so `total` sums to requests.
+		// Guarded — reporting must never be able to throw out of the flush timer.
+		try {
+			for (const row of rows) metrics.unrouted(row.count, routeClass, row.bucket);
+		} catch (e) {
+			log.warn?.(`[prerender] unrouted gauges not recorded: ${e?.message ?? String(e)}`);
+		}
 		const shown = rows.slice(0, topN).map(formatRow).join(', ');
 		const truncated = rows.length > topN ? `, +${rows.length - topN} more bucket(s)` : '';
 

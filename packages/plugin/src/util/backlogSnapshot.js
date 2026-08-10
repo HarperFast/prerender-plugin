@@ -38,7 +38,7 @@
  */
 
 import { setImmediate as yieldNow } from 'node:timers/promises';
-import { config, onConfigApplied } from '../config.js';
+import { config, collectConfigWarnings, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
 import { HOUR, MINUTE, numberOf } from './time.js';
 import { currentFloorMs, inFlightLeases, floorState } from './renderSchedule.js';
@@ -256,6 +256,13 @@ export const runBacklogSnapshotOnce = async () => {
 		// snapshot.
 		try {
 			const floor = floorState(startedAt);
+			// Dynamic import, not top-level: QueueState's module load touches Harper globals (a
+			// shared status buffer) that plain unit-test imports of this module don't have.
+			const { QueueState } = await import('../resources/QueueState.js');
+			metrics.queueHealth(QueueState.status === 'paused' ? 1 : 0, 'paused');
+			// The warning COUNT rides the same per-node gauge pass; the findings themselves are on
+			// GET /prerender_admin/config. Alert on change, not on level.
+			metrics.configWarnings(collectConfigWarnings().length);
 			metrics.queueHealth(stats.overdue, 'overdue');
 			metrics.queueHealth(stats.inFlight, 'lease_occupancy');
 			metrics.queueHealth(stats.belowFloor, 'below_floor');

@@ -88,7 +88,8 @@ test('draining resets the tally, so each report is a rate for the interval', () 
 
 test('logs one line per class, with node and worker, and stays silent when empty', () => {
 	const lines = [];
-	globalThis.server = { hostname: 'node-1', workerIndex: 3 };
+	const emitted = [];
+	globalThis.server = { hostname: 'node-1', workerIndex: 3, recordAnalytics: (...a) => emitted.push(a) };
 	globalThis.logger = { warn: (message) => lines.push(message), error: () => {} };
 
 	try {
@@ -104,6 +105,13 @@ test('logs one line per class, with node and worker, and stays silent when empty
 		assert.match(lines[0], /node=node-1 worker=3/);
 		assert.match(lines[0], /\/help\/\* ×1 \(e\.g\. \/help\/contact-us\)/);
 		assert.match(lines[1], /passthrough: 1 request\(s\)/);
+
+		// The same flush emits one `unrouted` value per active bucket — (count, class, bucket),
+		// so a reader sums `total` for request volume without the per-worker fan-out.
+		assert.deepEqual(emitted, [
+			[1, 'unrouted', 'unclassified', '/help/*', null],
+			[1, 'unrouted', 'passthrough', '/orders/*', null],
+		]);
 	} finally {
 		delete globalThis.server;
 		delete globalThis.logger;
