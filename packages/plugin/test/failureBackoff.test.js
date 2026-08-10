@@ -78,6 +78,32 @@ test('fastRetries: 0 escalates from the very first strike without a negative exp
 	assert.equal(backoffWait(24 * H, 2, true), 48 * H);
 });
 
+test('a float-valued factor or penalty still yields an integer, minute-aligned wait', () => {
+	// nextRenderTime is `Long @indexed` and the claim floor compares whole minutes (minuteOf), so
+	// a fractional wait must never reach the row. Both options are `min: 1` with no integer bound.
+	setRetry({ backoffFactor: 1.5, nonSitemapPenalty: 2.5 });
+	for (const [strikes, sitemap] of [
+		[4, true],
+		[5, true],
+		[4, false],
+		[6, false],
+	]) {
+		const w = backoffWait(6 * H, strikes, sitemap);
+		assert.equal(Number.isInteger(w), true, `strike ${strikes} produced non-integer ${w}`);
+		assert.equal(w % 60000, 0, `strike ${strikes} produced non-minute-aligned ${w}`);
+	}
+});
+
+test('flooring to a minute never pushes the wait over maxBackoff', () => {
+	// The ceiling only governs where it sits ABOVE the cadence — below it, the cadence floor wins
+	// by design (see the maxBackoff-under-interval test), so use a short interval here.
+	const cap = 100 * 60 * 1000 + 30_000; // deliberately not minute-aligned
+	setRetry({ backoffFactor: 1.7, maxBackoff: cap });
+	const w = backoffWait(10 * 60 * 1000, 9, false);
+	assert.ok(w <= cap, `${w} exceeded the cap ${cap}`);
+	assert.equal(w % 60000, 0);
+});
+
 test('the wait never goes backwards as strikes climb', () => {
 	setRetry();
 	let prev = 0;
