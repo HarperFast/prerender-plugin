@@ -375,6 +375,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'timer; the console’s Recompute button still triggers a one-off pass.',
 				{ unit: 'ms', min: 0 }
 			),
+			snapshotTableCounts: option(
+				true,
+				'Include the four table counts (targets, pages, sitemaps, suppressed) in each backlog ' +
+					'snapshot. The counts go through Harper’s getRecordCount, which on RocksDB tables past ' +
+					'the sampling budget issues ONE synchronous native full-key iteration — measured 2.47s ' +
+					'on a ~2.2M-key table, during which every request routed to that worker waits ' +
+					'(harper-pro#664). False keeps the snapshot itself (the capped backlog/histogram walk and ' +
+					'the queue_health gauges, which never take that walk) while the console shows the counts ' +
+					'as unavailable — the setting for a deployment that disabled the whole snapshot to dodge ' +
+					'#664 and thereby lost its below-floor detector.',
+				{}
+			),
 			pageSize: option(
 				50,
 				'Rows per page for the console’s sitemap-entry and page-cache tables. Also bounds the ' +

@@ -228,15 +228,22 @@ export const runBacklogSnapshotOnce = async () => {
 			page_cache: { PrerenderedPage },
 			sitemaps: { Sitemap },
 		} = databases;
-		const counts = {
-			targets: await countTable(Target),
-			pages: await countTable(PrerenderedPage),
-			sitemaps: await countTable(Sitemap),
-			// Suppressed targets replaced the NonIndexable table: an indexed-equality walk,
-			// capped like every other management scan, so a runaway suppression count can't
-			// turn the snapshot into a full table scan.
-			suppressed: await countSuppressed(Target),
-		};
+		// `snapshotTableCounts: false` is the #664 dodge: getRecordCount's native full-key walk is
+		// the ONLY part of this pass that can stall a traffic-serving worker, so a deployment can
+		// drop the counts while keeping the capped backlog walk and the queue_health gauges. The
+		// shape matches countTable's own failure value, which the console already renders.
+		const skipped = { recordCount: null, error: 'disabled' };
+		const counts = !config.management.snapshotTableCounts
+			? { targets: skipped, pages: skipped, sitemaps: skipped, suppressed: skipped }
+			: {
+					targets: await countTable(Target),
+					pages: await countTable(PrerenderedPage),
+					sitemaps: await countTable(Sitemap),
+					// Suppressed targets replaced the NonIndexable table: an indexed-equality walk,
+					// capped like every other management scan, so a runaway suppression count can't
+					// turn the snapshot into a full table scan.
+					suppressed: await countSuppressed(Target),
+				};
 
 		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 	} catch (e) {
