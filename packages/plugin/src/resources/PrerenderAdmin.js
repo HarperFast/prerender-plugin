@@ -515,21 +515,13 @@ export class PrerenderAdmin extends Resource {
 			return json({ error: 'scope is required', knownScopes: knownInvalidationScopes() }, 400);
 		}
 
-		// A CLOSED SET, checked here. An unvalidatable scope records a row that reports as applied and
-		// matches nothing — the worst failure this feature has, because the operator's mitigation
-		// appears to have worked. 400 with the valid literals beats a green no-op.
-		if (!isScopeResolvable(rawScope)) {
-			return json(
-				{
-					error:
-						`Unknown scope "${rawScope}". A scope is 'all' or one configured prerender route. ` +
-						`For a narrower blast radius, declare a narrower route rather than inventing a scope.`,
-					knownScopes: knownInvalidationScopes(),
-				},
-				400
-			);
-		}
-
+		// Clearing runs BEFORE the closed-set check, deliberately. The row that most needs clearing is
+		// one whose scope has STOPPED resolving — a route renamed or removed by a live config edit, the
+		// exact state checkScopeResolvability warns about on every boot and config apply. Validating
+		// first made that row undeletable through the only authenticated door, so the documented
+		// remediation ("either re-enable it or clear the rows") answered 400. Clearing an unknown scope
+		// is always safe — the 404 below still refuses scopes that were never recorded, and the
+		// closed-set check protects the RECORD path, which stays behind it.
 		if (clearing) {
 			const before = (await listInvalidations()).rows.find((row) => row.scope === rawScope) ?? null;
 			if (!before) {
@@ -548,8 +540,10 @@ export class PrerenderAdmin extends Resource {
 				...cleared,
 				wasInvalidatedAt: before.invalidatedAt ?? null,
 				effect:
-					'Effective on the NEXT request on every node — resolution is per request, so there is nothing to ' +
-					'propagate and nothing to wait for.',
+					'Effective on THIS node on the next request — resolution is per request, so no worker has to be ' +
+					'told. Other nodes serve from their own replica of the invalidation table and pick the clear up ' +
+					'on their next request after the delete replicates (normally sub-second; unbounded if ' +
+					'replication is degraded — verify on a peer before declaring the incident over).',
 				warning:
 					'UN-INVALIDATION IS PARTIAL BY CONSTRUCTION. Every page still inside its own expiry/stale-while-' +
 					'revalidate window serves from cache again immediately. Every page whose own window elapsed while ' +
@@ -557,6 +551,22 @@ export class PrerenderAdmin extends Resource {
 					'here rewrote lastCached. If the invalidation ran longer than page.ttl + page.swrTtl, clearing it ' +
 					'restores almost nothing and those pages wait for their next render.',
 			});
+		}
+
+		// A CLOSED SET, checked here — record path only (clearing, above, is exempt). An unvalidatable
+		// scope records a row that reports as applied and matches nothing — the worst failure this
+		// feature has, because the operator's mitigation appears to have worked. 400 with the valid
+		// literals beats a green no-op.
+		if (!isScopeResolvable(rawScope)) {
+			return json(
+				{
+					error:
+						`Unknown scope "${rawScope}". A scope is 'all' or one configured prerender route. ` +
+						`For a narrower blast radius, declare a narrower route rather than inventing a scope.`,
+					knownScopes: knownInvalidationScopes(),
+				},
+				400
+			);
 		}
 
 		if (data?.mode !== undefined && data?.mode !== null && data.mode !== HARD) {
@@ -632,8 +642,11 @@ export class PrerenderAdmin extends Resource {
 					: 'No other active scope applies to these pages.',
 			effect:
 				'Any cached page in this scope rendered before the recorded instant stops being served on the NEXT ' +
-				'request, on every node, and bots get the origin until the page re-renders on its normal cadence. ' +
-				'Nothing is rewritten, so undo is instant for pages still inside their own expiry/SWR window.',
+				'request on THIS node, and on other nodes on their next request after the row replicates ' +
+				'(normally sub-second — but each node reads its own replica, so degraded replication delays the ' +
+				'other three; verify on a peer when it matters). Bots get the origin until the page re-renders on ' +
+				'its normal cadence. Nothing is rewritten, so undo is instant for pages still inside their own ' +
+				'expiry/SWR window.',
 			limits: [
 				'The CDN edge is NOT invalidated and keeps its own TTL. Neither is a copy a crawler already holds.',
 				'Origin markup carries correct price, availability, canonical, title and meta description — but not ' +

@@ -420,13 +420,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'deliberately invalidated is the one outcome this feature must never produce.'
 			),
 			pad: option(
-				2 * MINUTE,
+				10 * MINUTE,
 				'Added to `invalidatedAt` before comparing, so the comparison errs toward invalidating.\n\n' +
 					'It covers two things. Cross-node clock skew: a page’s `lastCached` is stamped by whichever ' +
 					'node rendered it and the epoch by whichever node recorded it. And — the certain one — renders ' +
 					'ALREADY IN FLIGHT: a job claimed a moment before you invalidate fetched pre-change content but ' +
 					'stamps `lastCached` at completion, so with no pad that page outlives the invalidation for a ' +
-					'full render interval. The cost of over-including a page is one extra render of it.',
+					'full render interval. That window is legitimately as long as `queue.jobLeaseTime` (a job may ' +
+					'post back any time inside its lease, and does under backlog — exactly the state incidents ' +
+					'create), so keep this at or above jobLeaseTime; a smaller value is reported as a config ' +
+					'warning. The cost of over-including a page is one extra render of it.',
 				{ unit: 'ms', min: 0 }
 			),
 			lkgMaxAge: option(

@@ -375,6 +375,25 @@ export const collectConfigWarnings = () => {
 			);
 		}
 	}
+	if (config.invalidation.enabled && config.invalidation.pad < config.queue.jobLeaseTime) {
+		// Cross-option, like spreadWindow below. The pad's config text calls in-flight renders "the
+		// certain one" of the two things it covers — but a job legitimately holds its claim for up to
+		// jobLeaseTime, and a render that posts back later than the pad stamps lastCached after
+		// epoch+pad with PRE-change bytes: the page reads as healed and serves wrong content until its
+		// next cadence render (48h on the long-tail route), with no counter firing because the
+		// comparison sincerely passes. Normal claim-to-post is seconds, so the default usually holds —
+		// this fires so the operator sees the gap during exactly the degraded/backlogged states in
+		// which invalidations get recorded. Cost of matching pad to jobLeaseTime is one extra render
+		// per over-included page.
+		add(
+			'warn',
+			'invalidation.pad',
+			`invalidation.pad (${config.invalidation.pad}ms) is below queue.jobLeaseTime ` +
+				`(${config.queue.jobLeaseTime}ms) — a render claimed just before an invalidation may post back ` +
+				`after the pad, stamping pre-change content as healed for a full render interval. Set pad >= ` +
+				`jobLeaseTime unless post-back latency is known to be seconds.`
+		);
+	}
 	const { reenqueue } = config.invalidation;
 	if (reenqueue.enabled && reenqueue.spreadWindow < config.queue.jobLeaseTime) {
 		// Cross-option, so it cannot live in the schema's per-option constraints — and it is a warning

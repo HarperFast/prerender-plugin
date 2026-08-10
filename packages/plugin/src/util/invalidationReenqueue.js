@@ -230,7 +230,10 @@ const record = (outcome, scope) => server.recordAnalytics(true, 'invalidation_re
  * `resolveServeStatus`'s verdict, so `.at` ALREADY INCLUDES `invalidation.pad`.
  */
 export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
-	const scope = invalidatedBy?.scope ?? null;
+	// No null tolerance here, on purpose: the one production caller (`maybeAccelerateHeal`)
+	// returns before dispatch without a verdict, so a null `invalidatedBy` is a caller bug —
+	// better a loud TypeError on the first property read than a guard that quietly accepts it.
+	const scope = invalidatedBy.scope ?? null;
 	const refuse = (outcome, extra) => {
 		record(outcome, scope);
 		return { outcome, ...extra };

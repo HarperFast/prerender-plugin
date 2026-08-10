@@ -344,9 +344,17 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 		}
 	}
 
-	// 'origin' (default), or 'stale' with no cached page to serve.
+	// 'origin' (default), or 'stale' with no cached page to serve. If an invalidation is active
+	// for this scope, strip the crawler's conditional validators — the same 304 defeat the direct
+	// origin path in resolveResource closes: the validators came from us, off a snapshot the epoch
+	// may have just invalidated, and an origin whose ETag is publish-date-shaped answers 304,
+	// letting the crawler keep pre-change bytes while the request records renderNowStatus:
+	// 'timeout' and every signal reads as success. Stripping whenever ANY epoch is active for the
+	// scope (rather than re-deriving this page's exact verdict) over-strips at worst — the cost is
+	// a full origin response instead of a 304, only while an invalidation row exists.
+	const activeEpoch = await resolveInvalidation(routeScope);
 	return {
-		resource: await fetchOriginResource({ url, deviceType, headers: request.headers }),
+		resource: await fetchOriginResource({ url, deviceType, headers: request.headers, stripValidators: !!activeEpoch }),
 		renderNowStatus: 'timeout',
 	};
 }

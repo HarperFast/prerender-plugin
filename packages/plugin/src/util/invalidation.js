@@ -52,13 +52,22 @@
  * ── HOW THE EPOCH REACHES EVERY WORKER: IT DOES NOT ─────────────────────────────────────────────
  *
  * There is no propagation mechanism, deliberately. Every worker resolves per request, so apply AND
- * undo are both effective on the next request everywhere, and "the epoch never reached worker 5" is
- * not a state this design can be in. A refresh timer was costed and rejected: 8 workers x 4 nodes x
+ * undo are both effective on the next request, and "the epoch never reached worker 5" is not a
+ * state this design can be in. A refresh timer was costed and rejected: 8 workers x 4 nodes x
  * 1/min is 46,080 reads/day against <=5,800 for per-request resolution at this traffic (~7.9x more
  * storage work), while introducing that very failure mode and delaying both apply and undo by an
  * interval. The affordability comes from the gate in `bot_request.js` — the epoch is read only when
  * the request would otherwise have been a cache serve — and from the scope set being closed, so
  * resolution is two point reads by known key rather than a walk.
+ *
+ * WHAT PER-REQUEST RESOLUTION DOES NOT BUY: cross-NODE effectiveness. Each node's serve path reads
+ * its own replica of the invalidation table, so a row recorded on node A reaches node B by Harper
+ * async replication — normally sub-second, but this cluster has seen freshly-written rows silently
+ * fail to replicate for days (the Target replication-gap incident). During such a fault an "all"
+ * invalidation is silently inert on the nodes that never received the row, while the console —
+ * answering from the writing node — shows it active. The operator responses say this; the rehearsal
+ * step that matters is confirming the row is visible on a PEER node, not the one that took the
+ * write.
  */
 
 import { config, onConfigApplied } from '../config.js';
