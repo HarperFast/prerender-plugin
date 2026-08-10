@@ -5,6 +5,7 @@ import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
+import { decideInterval } from '../util/demandLadder.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
@@ -326,7 +327,7 @@ export class RenderQueue extends Resource {
 			const url = CacheKey.extractUrl(cacheKey);
 			const renderTarget = await Target.get({
 				id: url,
-				select: ['renderInterval', 'sitemapUrl', 'state', 'strikes'],
+				select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
 			});
 			const renderInterval = renderTarget?.renderInterval;
 
@@ -338,7 +339,12 @@ export class RenderQueue extends Resource {
 			// NaN from an arbitrary API PUT — are rejected), else the default. Resolved here
 			// on every cycle, so a route-cadence config change applies on each URL's next
 			// render without touching stored rows.
-			const interval = resolveRenderInterval(url, renderInterval);
+			const base = resolveRenderInterval(url, renderInterval);
+			// The demand ladder reallocates cadence WITHIN `base` (which stays the ceiling) by
+			// whether bots actually visit this URL. Off / dry-run / cold filter all return `base`
+			// unchanged, so this is a no-op until deliberately switched on.
+			const demand = decideInterval(url, base, renderTarget?.demandInterval);
+			const interval = demand.interval;
 			// The cached page expires when the next render is due; the swrTtl window then keeps
 			// it served while the re-render lands, so render latency up to swrTtl never causes
 			// a cache miss.
@@ -369,6 +375,15 @@ export class RenderQueue extends Resource {
 				// lowering on every completed render would rewind the floor to the current minute
 				// continuously and the whole 14× seek win would evaporate.
 				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+
+				// Persist the rung ONLY on an actual move. 'held' must not write even when the
+				// stored field is absent — absence already resolves to the base ceiling, so writing
+				// it would be redundant, and on first evaluation it would be a corpus-wide storm of
+				// replicated Target patches (~one per render for a full cycle), in dry-run too.
+				// A converged corpus therefore pays nothing here, on the system's hottest path.
+				if (demand.action === 'promoted' || demand.action === 'demoted') {
+					await Target.patch(url, { demandInterval: demand.level });
+				}
 
 				// A suppressed URL that rendered indexable again has healed — put it back in
 				// normal rotation, so the recheck cadence stops and discovery may see it again.

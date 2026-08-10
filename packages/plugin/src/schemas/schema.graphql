@@ -99,6 +99,10 @@ type Target @table(database: "render_service") @export {
 	suppressedAt: Date
 	# Consecutive non-indexable verdicts; render.suppression.maxStrikes deletes the target.
 	strikes: Int
+	# Current demand-ladder rung (ms), when render.demand is enabled. Absent = the target has
+	# never been evaluated and starts from its route/stored interval. Written ONLY when the rung
+	# actually changes, so a converged corpus pays no write — same discipline as `strikes`.
+	demandInterval: Long
 }
 
 type RenderSchedule @table(database: "render_schedule") @export {
@@ -218,5 +222,22 @@ type CrawlSketch @table(database: "crawl_stats") {
 	# This NODE's own estimate, stored for eyeballing a raw row. Never sum these —
 	# distinct counts don't add; merge the node rows and estimate the union.
 	estimate: Float
+	updatedAt: Date
+}
+
+# One ring slice of the bot-visit Bloom filter, per node (`slot|node`) — see util/visitFilter.js.
+# Same shape and rationale as CrawlSketch above: per-thread observations merge into one row per
+# node, rows replicate so any node can answer, and reads union the node rows for the slots they
+# need. Bloom rather than a per-URL `lastVisitedAt` because at search-engine traffic volumes a
+# per-URL write lands at roughly the distinct-URL rate against a replicated table; this is one
+# merged row per node per flush and constant memory regardless of request volume.
+#
+# Deliberately NOT @export: raw filter bits are meaningless outside a merge, and membership is
+# only ever consumed internally by the demand ladder.
+type VisitFilter @table(database: "crawl_stats") {
+	id: String @primaryKey # `${slot}|${node}`
+	slot: Int @indexed
+	node: String
+	bits: Bytes
 	updatedAt: Date
 }

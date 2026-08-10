@@ -18,6 +18,7 @@ import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { currentMinuteMs } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
+import { recordVisit } from '../util/visitFilter.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -38,6 +39,17 @@ export async function handleBotRequest(request) {
 			// per-thread HLL sketch — see util/crawlStats.js for the cost/loss model.
 			recordCrawl(request.botName, cacheUrl);
 		}
+
+		// Demand signal for the render ladder. Deliberately OUTSIDE the `recordBots` gate: that
+		// gate is about analytics volume, whereas this feeds scheduling — a deployment that turns
+		// analytics down must not silently demote its whole corpus for lack of observed traffic.
+		// Keyed on the device-free URL, since cadence resolves per URL and dropping the device
+		// split halves the distinct count the filter carries. No-op unless render.demand.enabled.
+		// Prerender-class only: those are the only keys the ladder ever probes (proxied and
+		// unclassified paths own no Target), and recording the plentiful junk URLs the CDN
+		// over-forwards would only raise the filter's fill factor — at high fill the
+		// false-positive rate explodes and the ladder degenerates into promoting everything.
+		if (routeClass === PRERENDER) recordVisit(cacheUrl);
 
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
