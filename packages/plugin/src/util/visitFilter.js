@@ -40,6 +40,7 @@
  * over the URL, k byte writes. No allocation, no await, no storage touch.
  */
 
+import { setImmediate } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { getMutex } from './coordination.js';
 import { fnv1a32 } from './hash.js';
@@ -80,7 +81,24 @@ const scratch = new Int32Array(32); // reused index buffer; k is bounded well be
 
 const sliceMs = () => config.render.demand.sliceMs;
 const sliceCount = () => config.render.demand.slices;
-const bitCount = () => config.render.demand.bitsPerSlice;
+// bitsPerSlice, normalized UP to a power of two (memoized on the raw config value — one
+// compare on the hot path). Two things depend on the normalization, not just prefer it:
+//   - byte sizing: a non-multiple-of-8 count would truncate at `>>> 3`, and bits past the
+//     truncated end silently never store (typed arrays ignore OOB writes) yet always read
+//     absent — a false-NEGATIVE source, the one error direction this filter must not have;
+//   - probe spread: `bitsFor` guarantees distinct probes via an odd stride, which is
+//     coprime with a POWER-OF-TWO modulus specifically.
+let bcRaw = 0;
+let bcNorm = 0;
+const bitCount = () => {
+	const raw = config.render.demand.bitsPerSlice;
+	if (raw !== bcRaw) {
+		bcRaw = raw;
+		bcNorm = 1024;
+		while (bcNorm < raw) bcNorm *= 2;
+	}
+	return bcNorm;
+};
 const hashes = () => Math.min(config.render.demand.hashes, scratch.length);
 
 /** Ring slot for a wall-clock time. Monotonic, so slot order is comparable modulo the ring. */
@@ -113,9 +131,27 @@ export function recordVisit(url) {
 function rollover(now) {
 	slot = slotOf(now);
 	slotEndMs = (slot + 1) * sliceMs();
-	// Drop slices that have aged out of the ring; their rows expire server-side via sweep.
+	// Drop in-memory slices that have aged out of the ring; one worker per node also sweeps
+	// their persisted rows (same division of labor as crawlStats' day rollover — the sweep is
+	// setImmediate'd off the hot path and bounded by `limit`).
 	const oldest = slot - sliceCount();
 	for (const s of slices.keys()) if (s <= oldest) slices.delete(s);
+	if (server.workerIndex === 0) {
+		setImmediate().then(() => sweepExpired(oldest).catch((e) => logger.error(e)));
+	}
+}
+
+/** Delete persisted slices older than the ring. Exported for tests. */
+export async function sweepExpired(cutoffSlot) {
+	const VisitFilter = table();
+	const expired = await VisitFilter.search({
+		conditions: [{ attribute: 'slot', comparator: 'less_than', value: cutoffSlot }],
+		select: ['id'],
+		limit: 1000,
+	});
+	for await (const row of expired) {
+		await VisitFilter.delete(row.id);
+	}
 }
 
 const armFlushTimer = () => {
@@ -164,8 +200,8 @@ async function persist(slots) {
 		// Read-merge-write of this node's own row (node is in the key, so the read is local
 		// and cannot take a cross-node fetch), serialized against sibling workers by the
 		// cross-worker mutex. Same discipline as crawlStats.persist.
-		const mutex = getMutex(`visitfilter:${id}`);
-		const release = await mutex.lock();
+		const mutex = getMutex(`visitFilter/${s}`);
+		await mutex.lock();
 		try {
 			const existing = await VisitFilter.get(id);
 			const merged = existing?.bits ? new Uint8Array(existing.bits) : newSlice();
@@ -178,7 +214,7 @@ async function persist(slots) {
 			for (let i = 0; i < merged.length; i++) merged[i] |= mine[i];
 			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
 		} finally {
-			release();
+			mutex.unlock();
 		}
 	}
 }
@@ -199,10 +235,16 @@ export async function refreshMerged(nowMs = Date.now()) {
 	const newest = slotOf(nowMs);
 	const oldest = newest - sliceCount() + 1;
 	const next = new Map();
-	for await (const row of VisitFilter.search({
+	let scanned = 0;
+	const found = await VisitFilter.search({
 		conditions: [{ attribute: 'slot', comparator: 'greater_than_equal', value: oldest }],
 		select: ['slot', 'bits'],
-	})) {
+	});
+	for await (const row of found) {
+		// Bounded at ring-length x nodes rows, so this rarely fires — but it runs on workers
+		// serving traffic, and awaiting a cursor only drains microtasks (repo convention:
+		// yield by rows SCANNED, same as util/scan.js).
+		if (++scanned % config.scan.yieldEvery === 0) await setImmediate();
 		if (!row?.bits) continue;
 		const cur = next.get(row.slot);
 		const bits = new Uint8Array(row.bits);

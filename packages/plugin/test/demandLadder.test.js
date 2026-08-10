@@ -4,6 +4,9 @@ import { applyOptions, config } from '../src/config.js';
 import { defaultConfig } from '../src/configSchema.js';
 import { decideInterval, rungIndexOf, rungs, drainStats, resetDemandStats } from '../src/util/demandLadder.js';
 
+// The module logs through the ambient Harper `logger` global; give the test env one.
+globalThis.logger ??= { info() {}, warn() {}, error() {} };
+
 const H = 60 * 60 * 1000;
 
 /** A probe with an explicit visit history, so the ladder's logic is tested on its own. */

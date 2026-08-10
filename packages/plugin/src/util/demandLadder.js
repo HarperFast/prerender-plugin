@@ -38,12 +38,21 @@
  * steady-state level distribution, and therefore the render budget, BEFORE paying for it.
  */
 
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged } from './visitFilter.js';
 
+// Normalized rungs, recomputed only when config changes — decideInterval runs on the
+// reschedule path (~20x/s) and must not re-filter/sort per decision.
+let cachedRungs = [];
+const updateRungs = () => {
+	cachedRungs = [...new Set((config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0))].sort(
+		(a, b) => a - b
+	);
+};
+updateRungs();
+
 /** Rungs, ascending, normalized and de-duplicated. Config is the source of truth. */
-export const rungs = () =>
-	[...new Set((config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0))].sort((a, b) => a - b);
+export const rungs = () => cachedRungs;
 
 /** Index of the rung a target currently sits on; the closest rung when `current` is off-ladder. */
 export const rungIndexOf = (current, list = rungs()) => {
@@ -192,7 +201,7 @@ export function logDemandStats() {
 			line
 		);
 	} else {
-		logger.notify?.('demand ladder', line) ?? logger.info('demand ladder', line);
+		(logger.notify ?? logger.info).call(logger, `[prerender] demand ladder ${JSON.stringify(line)}`);
 	}
 }
 
@@ -215,3 +224,20 @@ export function stopDemandStats() {
 	statsTimer = null;
 	armedStatsInterval = null;
 }
+
+// Keep the cached rungs and the histogram timer following live config, mirroring the
+// flush-timer handling in crawlStats/visitFilter: disable stops the timer (flushing the
+// counters one last time so a toggle doesn't swallow them), an interval change re-arms.
+onConfigApplied(() => {
+	updateRungs();
+	if (!statsTimer) return;
+	if (!config.render.demand.enabled) {
+		logDemandStats();
+		stopDemandStats();
+		return;
+	}
+	if (config.render.demand.statsInterval !== armedStatsInterval) {
+		stopDemandStats();
+		armDemandStats();
+	}
+});

@@ -376,11 +376,12 @@ export class RenderQueue extends Resource {
 				// continuously and the whole 14× seek win would evaporate.
 				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
 
-				// Persist the rung only when it actually MOVES. A converged target pays no write,
-				// which matters because this is the highest-volume path in the system. Dry-run
-				// records the counterfactual level too, so the histogram reflects where the corpus
-				// would settle without any of it taking effect.
-				if (demand.action !== 'off' && demand.level !== renderTarget.demandInterval) {
+				// Persist the rung ONLY on an actual move. 'held' must not write even when the
+				// stored field is absent — absence already resolves to the base ceiling, so writing
+				// it would be redundant, and on first evaluation it would be a corpus-wide storm of
+				// replicated Target patches (~one per render for a full cycle), in dry-run too.
+				// A converged corpus therefore pays nothing here, on the system's hottest path.
+				if (demand.action === 'promoted' || demand.action === 'demoted') {
 					await Target.patch(url, { demandInterval: demand.level });
 				}
 

@@ -464,9 +464,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				bitsPerSlice: option(
 					1 << 20,
-					'Bloom filter bits per ring slice (power of two). ~1M bits holds ~100k distinct URLs per ' +
-						'slice at ~1% false positives. False positives promote a page nobody asked for — wasted ' +
-						'renders, never staleness — and there are no false negatives.',
+					'Bloom filter bits per ring slice, rounded UP to a power of two at use (byte sizing and ' +
+						'probe spread both require it). ~1M bits holds ~100k distinct URLs per slice at ~1% ' +
+						'false positives. False positives promote a page nobody asked for — wasted renders, ' +
+						'never staleness — and there are no false negatives.',
 					{ min: 1024 }
 				),
 				hashes: option(7, 'Bloom hash count (k).', { min: 1, max: 32 }),
