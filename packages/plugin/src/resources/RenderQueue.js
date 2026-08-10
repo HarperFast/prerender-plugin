@@ -8,6 +8,7 @@ import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } fro
 import { decideInterval } from '../util/demandLadder.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
+import { metrics } from '../metrics.js';
 import { Target, countedStrikes } from './Target.js';
 import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
@@ -312,9 +313,8 @@ export class RenderQueue extends Resource {
 		const hasContent = result.statusCode === 200 && result.content;
 
 		if (typeof result.renderTime === 'number') {
-			server.recordAnalytics(
+			metrics.renderTime(
 				result.renderTime,
-				'render_time',
 				result.statusCode,
 				typeof result.isIndexable === 'boolean'
 					? result.isIndexable || hasContent
@@ -482,7 +482,7 @@ export class RenderQueue extends Resource {
 	 */
 	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable }) {
 		if (typeof result.renderTime === 'number') {
-			server.recordAnalytics(result.renderTime, 'render_time', result.statusCode, 'redirect');
+			metrics.renderTime(result.renderTime, result.statusCode, 'redirect');
 		}
 
 		// Same status rules as processJobResult, applied BEFORE anything retires or strikes

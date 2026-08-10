@@ -135,14 +135,9 @@ rest: true # required for the @export-ed table REST endpoints
     pageSize: 50 # rows per page in the console's sitemap-entry and page-cache tables
 
   analytics:
-    enabled: true # record bot analytics at all: bot_request (ingress volume by host/bot/device),
-    # bot_serve (outcome by source/cache-status/bot — origin offload + cache hit rate),
-    # page_age (ms since the served page rendered — freshness at serve, cache-served only),
-    # route_serve (outcome by route/cache-status/device — per-route delivery, for tuning each
-    # route's renderInterval), and route_page_age (served age by route/cache-status/device).
-    # cache-status distinguishes 'hit' (within the page's renderInterval) from 'swr' (served
-    # from the stale-while-revalidate window because the re-render is late/in flight) — both
-    # are cache serves; 'hit' alone is the "is the TTL being met" signal.
+    enabled: true # record bot analytics at all: bot_request, bot_serve, route_serve, page_age,
+    # route_page_age. What each one means, its dimensions, and what to chart it against are in
+    # METRICS.md (and served live by GET /prerender_admin/metrics).
 
   crawlStats: # crawl breadth: distinct URLs crawled per bot per UTC day (HyperLogLog, ~0.8% error)
     enabled: true # also gated by analytics.enabled above; read via GET /prerender_admin/crawl-breadth?days=7
@@ -513,6 +508,7 @@ else; leases stay where they are either way.
 | `GET /queue_status`                          | Read per-node queue status (**observed**)                           |
 | `GET /queue_control`                         | Read the desired pause state (**intent**)                           |
 | `GET /prerender_admin`                       | Management UI + API — see below                                     |
+| `GET /prerender_admin/metrics`               | The metric catalog — see [METRICS.md](METRICS.md)                   |
 
 ## Management UI (`/prerender_admin`)
 
@@ -549,6 +545,9 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
 | `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
 | `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
+| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                    | `super_user` |
+| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day  | `super_user` |
+| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)              | `super_user` |
 | `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
 | `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row  | `super_user` |
 | `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or          | `super_user` |
@@ -813,6 +812,19 @@ so with the numbers attached.
 `invalidation.enabled: false` is a kill switch, and while any row exists it is reported as a log line
 on boot and on every config apply, plus a flag on `GET /invalidations` — silently serving content
 somebody deliberately invalidated is the one outcome this feature must never produce.
+
+## Metrics & observability
+
+**[METRICS.md](METRICS.md) is the one place to start when building a dashboard or an alert.** It
+covers every metric this plugin emits (names, dimension slots, units, and what each number is
+actually for), the Harper built-ins worth charting beside them, the management-API and log-only
+signals that carry numbers no metric has, and the known gaps.
+
+The machine-readable version of that catalog is [`src/metrics.js`](src/metrics.js), served live by
+`GET /prerender_admin/metrics` — so a dashboard (or an agent writing one) can read the contract off
+the running version instead of guessing which release a doc describes. Every emission goes through
+the emitters in that module, and a test fails if any other module calls `server.recordAnalytics`
+directly.
 
 ## How it fits together
 

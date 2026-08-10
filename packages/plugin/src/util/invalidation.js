@@ -73,6 +73,7 @@
 import { config, onConfigApplied } from '../config.js';
 import { epochMsOf } from './time.js';
 import { routeScopes, routeForScope } from './routeClass.js';
+import { metrics } from '../metrics.js';
 
 /** The scope covering every prerender route. `route:<match>:<path>` covers exactly one. */
 export const CLUSTER_SCOPE = 'all';
@@ -94,11 +95,9 @@ const table = () => databases.invalidation.Invalidation;
  */
 const lkg = new Map();
 
-const countError = (kind) => {
-	// `true` as the value, matching every other counter in this plugin: recordAnalytics buffers in a
-	// Map and flushes on Harper's own timer, so this costs no storage touch and no await.
-	server.recordAnalytics(true, 'invalidation_error', kind, null, null);
-};
+// A counter, so it costs no storage touch and no await: recordAnalytics buffers in a Map and
+// flushes on Harper's own timer. Dimensions and kinds are documented in `src/metrics.js`.
+const countError = (kind) => metrics.invalidationError(kind);
 
 /**
  * One scope's epoch in ms, or `null` when the scope does not apply. `pad` is NOT added here — it is

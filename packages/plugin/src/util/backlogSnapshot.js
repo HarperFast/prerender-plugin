@@ -42,6 +42,7 @@ import { config, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
 import { HOUR, MINUTE, numberOf } from './time.js';
 import { currentFloorMs, inFlightLeases, floorState } from './renderSchedule.js';
+import { metrics } from '../metrics.js';
 
 // Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
 // worker that also serves bot traffic must never monopolize the loop between rows.
@@ -255,13 +256,13 @@ export const runBacklogSnapshotOnce = async () => {
 		// snapshot.
 		try {
 			const floor = floorState(startedAt);
-			server.recordAnalytics(stats.overdue, 'queue_health', 'overdue', null, null);
-			server.recordAnalytics(stats.inFlight, 'queue_health', 'lease_occupancy', null, null);
-			server.recordAnalytics(stats.belowFloor, 'queue_health', 'below_floor', null, null);
+			metrics.queueHealth(stats.overdue, 'overdue');
+			metrics.queueHealth(stats.inFlight, 'lease_occupancy');
+			metrics.queueHealth(stats.belowFloor, 'below_floor');
 			if (stats.oldestBelowFloorMs !== null) {
-				server.recordAnalytics(startedAt - stats.oldestBelowFloorMs, 'queue_health', 'below_floor_age_ms', null, null);
+				metrics.queueHealth(startedAt - stats.oldestBelowFloorMs, 'below_floor_age_ms');
 			}
-			server.recordAnalytics(floor.floorPinnedForMs, 'queue_health', 'floor_pin_age_ms', null, null);
+			metrics.queueHealth(floor.floorPinnedForMs, 'floor_pin_age_ms');
 		} catch (e) {
 			logger.warn?.(`[prerender] queue_health gauges not recorded: ${e?.message ?? String(e)}`);
 		}
