@@ -400,6 +400,24 @@ export const configSchema = group('Prerender plugin configuration.', {
 		ttl: option(DAY, 'Default cached-page TTL.', { unit: 'ms', min: 1 }),
 		minTtl: option(6 * HOUR, 'Floor for sitemap-derived TTLs.', { unit: 'ms', min: 1 }),
 		swrTtl: option(3 * HOUR, 'Stale-while-revalidate window.', { unit: 'ms', min: 0 }),
+		blobReadBudgetMs: option(
+			500,
+			'How long a cache serve may spend reading the stored body before giving up and proxying to ' +
+				'the origin instead.\n\n' +
+				'The body is read to completion before the response commits a status, so that a record whose ' +
+				'blob file is gone becomes an origin serve rather than a truncated 200. Without a budget that ' +
+				'read inherits Harper’s own retry window (`storage_blobReadTimeout`, default 20s): a blob ' +
+				'whose bytes are still arriving — which any base copy produces in quantity — puts the reader ' +
+				'into an incomplete-content retry loop, and the crawler waits it out. Measured on a 4-node ' +
+				'production cluster mid-copy: a cohort of cache hits averaging 13.6s, p95 17.5s, ~13% of hits ' +
+				'on the worst node, while the same node’s median hit was 2.3ms.\n\n' +
+				'A healthy read is nowhere near this: p50 0.75ms and p99 0.94ms for a ~223KB body on cold ' +
+				'NVMe, so 500ms is ~500x the p99 and only a blob that is genuinely stuck can trip it. Keep it ' +
+				'BELOW typical origin latency (~500-600ms here) so falling back is faster than waiting; ' +
+				'raising it past `storage_blobReadTimeout` disables it entirely. 0 disables the budget and ' +
+				'restores the unbounded wait.',
+			{ unit: 'ms', min: 0 }
+		),
 	}),
 
 	invalidation: group(

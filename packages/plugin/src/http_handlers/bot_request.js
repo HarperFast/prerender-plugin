@@ -238,16 +238,29 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 			info.source = 'cache';
 			return page;
 		}
-		// Distinct from 'blob-stream', which is the residual mid-stream failure in response.js.
-		metrics.serveError('blob-unreadable');
-		logger.error(`cached blob unreadable for ${cacheKey}; serving origin instead`, cached.error);
-		info.cacheStatus = 'blob-missing';
+		// GONE and SLOW are separated on purpose: they have different causes and different fixes.
+		// `blob-missing` is a dangling reference (harper#2134) — the bytes are not coming back, and the
+		// page is repaired by its next render. `blob-timeout` is a read still in progress, which in
+		// practice means a base copy is streaming that blob right now (harper-pro#683) — the bytes DO
+		// arrive, just not within a crawler's patience. Folding them together would have hidden the
+		// second behind the first: the timeout cohort only appeared once a copy was running.
+		const timedOut = cached.reason === 'timeout';
+		const status = timedOut ? 'blob-timeout' : 'blob-missing';
+		metrics.serveError(timedOut ? 'blob-timeout' : 'blob-unreadable');
+		if (timedOut) {
+			logger.warn(
+				`cached blob read exceeded ${config.page.blobReadBudgetMs}ms for ${cacheKey}; serving origin instead`
+			);
+		} else {
+			logger.error(`cached blob unreadable for ${cacheKey}; serving origin instead`, cached.error);
+		}
+		info.cacheStatus = status;
 		info.source = 'origin';
 		return fetchOriginResource({
 			url,
 			deviceType,
 			headers: request.headers,
-			reason: 'blob-missing',
+			reason: status,
 		});
 	}
 
@@ -304,14 +317,46 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
  * evicts the page on every node — including peers holding a readable blob — and schedules no
  * repair, leaving the key on origin until its next scheduled render. See response.js.
  */
-export async function materializeCachedBody(page, method) {
+export async function materializeCachedBody(page, method, budgetMs = config.page.blobReadBudgetMs) {
 	if (method === 'HEAD') return { ok: true, body: undefined };
 	const content = page?.content;
 	if (!content || typeof content.bytes !== 'function') return { ok: true, body: content ?? undefined };
+
+	const read = content.bytes();
+	if (!(budgetMs > 0)) {
+		try {
+			return { ok: true, body: await read };
+		} catch (error) {
+			return { ok: false, reason: 'unreadable', error };
+		}
+	}
+
+	// Bound the read. Without this the request inherits Harper's own retry window
+	// (`storage_blobReadTimeout`, 20s): a blob whose bytes are still arriving puts the reader into an
+	// incomplete-content retry loop and the crawler waits it out. Losing the race does NOT cancel the
+	// read — `bytes()` is `readFile`-based and has no cancellation seam — but `readFile` owns and
+	// closes its own descriptor, so the abandoned read finishes or times out on its own and its buffer
+	// is collected. It costs a background read, never a leaked fd.
+	let timer;
+	const expired = Symbol('blob-read-budget');
 	try {
-		return { ok: true, body: await content.bytes() };
+		const result = await Promise.race([
+			read,
+			new Promise((resolve) => {
+				timer = setTimeout(() => resolve(expired), budgetMs);
+			}),
+		]);
+		if (result === expired) return { ok: false, reason: 'timeout' };
+		return { ok: true, body: result };
 	} catch (error) {
-		return { ok: false, error };
+		return { ok: false, reason: 'unreadable', error };
+	} finally {
+		// Always clear it: an uncleared timer holds a handle for the whole budget on every served
+		// request, and at serve volume that is a lot of live timers for no reason.
+		clearTimeout(timer);
+		// The loser of the race is still in flight on the timeout path; swallow its eventual rejection
+		// so an unreadable blob cannot surface as an unhandled rejection after we already answered.
+		read.catch(() => {});
 	}
 }
 

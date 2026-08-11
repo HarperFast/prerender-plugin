@@ -94,6 +94,11 @@ const CACHE_STATUSES = Object.freeze([
 	// two have different fixes — 'miss' means coverage, this means blob integrity (harper#2134).
 	// Should sit at ~0; a rising share is dangling blob references, not a caching problem.
 	'blob-missing',
+	// The body was still being READ when `page.blobReadBudgetMs` ran out, so we served origin rather
+	// than let the crawler wait. Split from 'blob-missing' because the cause and the fix differ: the
+	// bytes are arriving (a base copy is streaming that blob — harper-pro#683), just not in time.
+	// A rising share tracks replication churn, not dangling references.
+	'blob-timeout',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
@@ -300,7 +305,17 @@ export const METRICS = Object.freeze({
 			},
 			method: {
 				name: 'reason',
-				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'blob-missing', 'render-timeout', 'other'],
+				values: [
+					'miss',
+					'stale',
+					'skip',
+					'invalidated',
+					'bypass',
+					'blob-missing',
+					'blob-timeout',
+					'render-timeout',
+					'other',
+				],
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
 					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +
