@@ -2,9 +2,10 @@
  * HTTP-response building for the bot request handler.
  *
  * Turns a resolved `resource` (a cached page or an origin/rendered result) into the
- * `{ headers, status, body, wasCacheMiss }` shape the handler returns. This module is
- * side-effect-free with respect to the cache — scheduling/eviction decisions live in the
- * handler; the only cache touch here is evicting a page whose Blob body fails to stream.
+ * `{ headers, status, body, wasCacheMiss }` shape the handler returns. This module is now
+ * entirely side-effect-free with respect to the cache: scheduling and eviction decisions live
+ * in the handler, and a cache-served body is read to completion BEFORE it gets here, so an
+ * unreadable blob never reaches the point of committing a status.
  */
 
 import { Readable } from 'node:stream';
@@ -12,7 +13,6 @@ import { config, getLogger } from '../config.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { headersToObject } from '../util/headers.js';
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
-import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { metrics } from '../metrics.js';
 
 // Headers preserved on a 304 response; everything else is dropped.
@@ -176,7 +176,25 @@ export function negotiateEncoding(body, headers, request) {
 	}
 	headers.delete('content-length');
 
-	return reencode(Readable.fromWeb(body), contentEncoding, bestEncoding, false);
+	// Normalize the body to a Node stream before re-encoding. Three shapes reach here and each
+	// needs different handling — getting this wrong corrupts the response SILENTLY:
+	//   - web ReadableStream (the origin path, `Readable.toWeb(response.body)`) → convert
+	//   - Node Readable → pass through; `Readable.from([stream])` would emit the stream OBJECT as
+	//     a single chunk. Not currently reachable (upstream.js hands over a web stream), but
+	//     upstream.js holds a Node Readable and only converts it for this call, so anyone dropping
+	//     that round-trip would land here.
+	//   - Buffer (the cache path, materialized before the response commits — see resolveResource)
+	//     → wrap in an array; `Readable.from(buffer)` iterates a Buffer as individual BYTES.
+	// Only reached when the client's accepted encodings exclude what we stored, which for a
+	// gzip-accepting crawler never happens.
+	const source =
+		typeof body?.getReader === 'function'
+			? Readable.fromWeb(body)
+			: body instanceof Readable
+				? body
+				: Readable.from([body]);
+
+	return reencode(source, contentEncoding, bestEncoding, false);
 }
 
 /**
@@ -186,12 +204,22 @@ export function negotiateEncoding(body, headers, request) {
  */
 export function deliverResource(resource, request, info = {}) {
 	let status = resource.statusCode;
-	let body = request.method === 'HEAD' ? undefined : resource.content;
+	// `info.cachedBody` is a cache-served body already read to completion, so an unreadable blob
+	// was turned into an origin serve BEFORE this function committed a status (see
+	// `resolveResource`). The fallback to `resource.content` covers the origin path and the
+	// render-now timeout fallback, which can hand back a cached page nobody materialized.
+	let body = request.method === 'HEAD' ? undefined : (info.cachedBody ?? resource.content);
 	const wasCacheMiss = computeWasCacheMiss(resource);
 
-	// A cached (non-miss) Blob body streams; a delivery error evicts the entry. Harper's
-	// cached-content Blob is EventEmitter-like (.on); guard in case a standard web Blob
-	// (which has .stream() but no .on) ever flows through.
+	// RESIDUAL PATH ONLY: a cached Blob that arrived unmaterialized. It still streams, and a
+	// mid-stream failure is still counted — but the entry is deliberately NOT deleted any more.
+	// `PrerenderedPage` replicates (no `replicate: false`, and all nodes hold full copies), so the
+	// delete evicted the page on EVERY node — including peers whose blob was perfectly readable,
+	// which is the common shape when replication is what dropped the bytes on one node. Nothing
+	// rescheduled a render either (`maybeSchedule` only fires on a miss, and creates a Target at
+	// most), so the key then served origin cluster-wide until its next scheduled render — up to the
+	// route interval, 48h for a PDP. One truncated response is far cheaper than that, and the
+	// scheduled re-render restores the blob regardless.
 	if (!resource.miss && body instanceof Blob) {
 		if (typeof body.on === 'function') {
 			body.on('error', (e) => {
@@ -199,7 +227,6 @@ export function deliverResource(resource, request, info = {}) {
 				// without this counter a truncated serve is recorded as a SUCCESS everywhere.
 				metrics.serveError('blob-stream');
 				getLogger().error('blob delivery error', e);
-				PrerenderedPage.delete(resource.cacheKey);
 			});
 		}
 		body = body.stream();

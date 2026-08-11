@@ -89,6 +89,11 @@ const CACHE_STATUSES = Object.freeze([
 	'miss', // nothing cached under this key
 	'skip', // the cache was deliberately not consulted (renderNow / Cache-Control)
 	'bypass', // not a cacheable request at all (non-GET/HEAD)
+	// A servable record whose blob body could not be read, so we served origin instead. Its own
+	// status rather than folding into 'miss': the key IS cached and correctly scheduled, and the
+	// two have different fixes — 'miss' means coverage, this means blob integrity (harper#2134).
+	// Should sit at ~0; a rising share is dangling blob references, not a caching problem.
+	'blob-missing',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
@@ -295,7 +300,7 @@ export const METRICS = Object.freeze({
 			},
 			method: {
 				name: 'reason',
-				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'render-timeout', 'other'],
+				values: ['miss', 'stale', 'skip', 'invalidated', 'bypass', 'blob-missing', 'render-timeout', 'other'],
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
 					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +

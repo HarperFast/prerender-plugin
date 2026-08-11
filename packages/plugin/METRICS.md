@@ -119,7 +119,7 @@ reasoning behind it.
 | `page_age`       | ms      | botName    | deviceType  | —          | Freshness as delivered: ms since the served snapshot rendered (cache serves only).                                                                                                                                                                                                     |
 | `route_page_age` | ms      | route      | cacheStatus | deviceType | Served age per route, split by freshness state — the "should this TTL move" number.                                                                                                                                                                                                    |
 | `render`         | value   | series     | per-series  | per-series | The render fleet in one scan: `time_ms` (duration by statusCode × candidacy — renders/hour = concurrency ÷ time_ms) and `outcome` (counter by outcome × detail, exactly one per posted result — the render-failure alert).                                                             |
-| `origin_fetch`   | ms      | statusCode | reason      | —          | Cost of every non-cache serve: origin latency + status, by why the cache didn't answer (miss/stale/skip/invalidated/bypass/render-timeout).                                                                                                                                            |
+| `origin_fetch`   | ms      | statusCode | reason      | —          | Cost of every non-cache serve: origin latency + status, by why the cache didn't answer (miss/stale/skip/invalidated/bypass/blob-missing/render-timeout).                                                                                                                               |
 | `prerender_ops`  | value   | series     | detail      | context    | Every low-volume ops signal in one scan: `unrouted` (class, bucket), `sitemap_*`, `serve_error`, `config_warnings`, `page_age_negative` (bot, device), `demand_*` (ladder decisions + `fast_fraction`/`fill`), `invalidation_error` (kind), `invalidation_reenqueue` (outcome, scope). |
 | `queue_health`   | value   | series     | result      | —          | Every queue signal in one scan: the snapshot gauges (`overdue`, `lease_occupancy`, `below_floor`, `below_floor_age_ms`, `floor_pin_age_ms`, `paused`), `claim_scan_ms` (per pass, method = granted/empty/capped), `reconcile_restored`/`reconcile_missing` (per sweep).                |
 
@@ -217,10 +217,20 @@ Grep-able, `[prerender]`-prefixed, and each is the richer record of something th
 And error lines that are the _only_ evidence of their failure mode — each is alert-worthy on any
 sustained rate (see §5):
 
-- **`blob delivery error`** — a cached page whose stored body failed to stream **after the 200 was
-  committed**: the crawler got a truncated response while `bot_serve` records a cache hit. The
-  entry self-evicts (the next request heals it), but the serve that triggered it was already wrong.
-  Counted as `prerender_ops` series `serve_error` (`blob-stream`); the line carries the cache key and the exception.
+- **`cached blob unreadable for … ; serving origin instead`** — a cached record whose blob file is
+  gone (cause: harper#2134, where the invalidate path unlinks blobs live records still reference;
+  replication also lands records whose bytes never arrived). The body is read to completion BEFORE
+  the response commits a status, so this is now an ordinary origin serve rather than a truncated
+  200 — correct bytes to the crawler, and visible: counted as `prerender_ops` series `serve_error`
+  (`blob-unreadable`) **and** as `bot_serve`/`origin_fetch` with cacheStatus/reason
+  `blob-missing`. That last one is the number to trend: it isolates blob integrity from coverage,
+  which a `miss` cannot. The record is deliberately NOT deleted — `PrerenderedPage` replicates, so
+  a delete evicted the page on every node (peers included, whose blob was often readable) and
+  scheduled no repair, leaving the key on origin until its next scheduled render, up to 48h later.
+  The scheduled re-render restores the blob either way.
+- **`blob delivery error`** — the residual mid-stream failure, now reachable only for a cached body
+  that arrived unmaterialized (the render-now timeout fallback). Still counted as `serve_error`
+  (`blob-stream`); a non-zero rate here means a path is bypassing the up-front read.
 - **`invalidation read failed for scope …`** — the storage fault behind the `invalidation_error` series; the
   metric says how often, the line says which scope and what threw.
 - **`could not accelerate … after an invalidation`** — the demand-driven heal path failing
@@ -278,16 +288,17 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 
 **Expect zero — page on any sustained non-zero:**
 
-| Condition                                                                    | Meaning                                                                                                                                            |
-| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `queue_health` `below_floor` > 0 across consecutive snapshots                | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                                     |
-| `prerender_ops` `invalidation_error` any rate, especially kind `lkg-expired` | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving.          |
-| log `blob delivery error`                                                    | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                 |
-| log `schedule reconcile: restored N` with N > 0                              | Terminal schedule gaps existed and were repaired; find what created them.                                                                          |
-| log `Sitemap … failed and was skipped` / `… aborted`                         | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                              |
-| `render` outcome `auth-failure` any rate                                     | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design. |
-| `prerender_ops` series `serve_error` any rate                                | Truncated 200s reaching crawlers while `bot_serve` records cache hits.                                                                             |
-| `queue_health` series `reconcile_restored` > 0                               | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                        |
+| Condition                                                                                           | Meaning                                                                                                                                                                         |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `below_floor` > 0 across consecutive snapshots                                       | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                                                                  |
+| `prerender_ops` `invalidation_error` any rate, especially kind `lkg-expired`                        | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving.                                       |
+| log `blob delivery error`                                                                           | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                                              |
+| log `schedule reconcile: restored N` with N > 0                                                     | Terminal schedule gaps existed and were repaired; find what created them.                                                                                                       |
+| log `Sitemap … failed and was skipped` / `… aborted`                                                | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                                                           |
+| `render` outcome `auth-failure` any rate                                                            | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design.                              |
+| `prerender_ops` series `serve_error` = `blob-unreadable`, or `bot_serve` cacheStatus `blob-missing` | Dangling blob references (harper#2134): cached records whose body is gone. Served correctly from origin, but it is lost offload and a blob-integrity signal, not a caching one. |
+| `prerender_ops` series `serve_error` = `blob-stream` any rate                                       | A truncated 200 DID reach a crawler — a cached body bypassed the up-front read.                                                                                                 |
+| `queue_health` series `reconcile_restored` > 0                                                      | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                                                     |
 
 **Thresholds — warn, then investigate:**
 
