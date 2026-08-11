@@ -176,12 +176,23 @@ export function negotiateEncoding(body, headers, request) {
 	}
 	headers.delete('content-length');
 
-	// `body` is a web ReadableStream on the origin path but a Buffer on the cache path, whose
-	// bytes are materialized before the response commits (see `resolveResource`). Normalize
-	// before re-encoding. `Readable.from(buffer)` would iterate the Buffer as individual BYTES —
-	// wrap it so it yields one chunk. Only reached when the client's accepted encodings exclude
-	// what we stored, which for a gzip-accepting crawler never happens.
-	const source = typeof body?.getReader === 'function' ? Readable.fromWeb(body) : Readable.from([body]);
+	// Normalize the body to a Node stream before re-encoding. Three shapes reach here and each
+	// needs different handling — getting this wrong corrupts the response SILENTLY:
+	//   - web ReadableStream (the origin path, `Readable.toWeb(response.body)`) → convert
+	//   - Node Readable → pass through; `Readable.from([stream])` would emit the stream OBJECT as
+	//     a single chunk. Not currently reachable (upstream.js hands over a web stream), but
+	//     upstream.js holds a Node Readable and only converts it for this call, so anyone dropping
+	//     that round-trip would land here.
+	//   - Buffer (the cache path, materialized before the response commits — see resolveResource)
+	//     → wrap in an array; `Readable.from(buffer)` iterates a Buffer as individual BYTES.
+	// Only reached when the client's accepted encodings exclude what we stored, which for a
+	// gzip-accepting crawler never happens.
+	const source =
+		typeof body?.getReader === 'function'
+			? Readable.fromWeb(body)
+			: body instanceof Readable
+				? body
+				: Readable.from([body]);
 
 	return reencode(source, contentEncoding, bestEncoding, false);
 }

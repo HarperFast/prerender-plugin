@@ -248,6 +248,20 @@ test('deliverResource does NOT delete the record when a residual Blob stream err
 	);
 });
 
+test('negotiateEncoding passes a Node Readable through instead of wrapping the stream object', async () => {
+	// Readable.from([stream]) would emit the STREAM OBJECT as one chunk, silently corrupting the
+	// response. Not reachable from upstream.js today (it hands over a web stream), but it holds a
+	// Node Readable and converts it only for this call.
+	const { Readable } = await import('node:stream');
+	const { gzipSync } = await import('node:zlib');
+	const headers = new Headers({ 'content-encoding': 'gzip' });
+	const req = mockRequest({ 'accept-encoding': 'identity' });
+	const out = negotiateEncoding(Readable.from([gzipSync(Buffer.from('node stream body'))]), headers, req);
+	const chunks = [];
+	for await (const chunk of out) chunks.push(chunk);
+	assert.equal(Buffer.concat(chunks).toString(), 'node stream body');
+});
+
 test('negotiateEncoding decompresses a Buffer body rather than iterating it byte-by-byte', async () => {
 	// The cache path hands in a Buffer. `Readable.from(buffer)` would emit individual byte NUMBERS,
 	// so gunzip would receive garbage; the body must be wrapped as a single chunk. Verified by
