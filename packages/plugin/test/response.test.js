@@ -6,6 +6,10 @@ import { applyOptions } from '../src/config.js';
 // binding that doesn't exist outside the runtime. Stub it, then dynamic-import so the
 // stub is in place before module evaluation.
 globalThis.databases = { page_cache: { PrerenderedPage: class {} } };
+// metrics.serveError() emits through the Harper `server` global; capture instead of stubbing
+// it away, so the tests can assert the failure is COUNTED as well as non-destructive.
+const emitted = [];
+globalThis.server ??= { hostname: 'test-node', recordAnalytics: (...a) => emitted.push(a) };
 const { buildResponseHeaders, applyDebugHeaders, applyConditional, negotiateEncoding, deliverResource } = await import(
 	'../src/http_handlers/response.js'
 );
@@ -175,4 +179,86 @@ test('deliverResource gates debug headers on the debug request header, and repor
 
 	const debug = deliverResource(resource, mockRequest({ 'x-harper-prerender-debug': 'true' }), { source: 'origin' });
 	assert.equal(debug.headers.get('x-harper-source'), 'origin');
+});
+
+// ── cache-served bodies are materialized before the response commits ───────────────────────
+// Regression cover for prerender-plugin#75 / harper#2134: a record whose blob file is gone used
+// to be discovered only mid-stream, after the 200 and the bot_serve hit row were committed, so
+// the crawler got a truncated document under a success status.
+
+test('deliverResource sends info.cachedBody in preference to resource.content', () => {
+	const resource = {
+		statusCode: 200,
+		miss: false,
+		headers: { 'content-type': 'text/html' },
+		content: 'SHOULD-NOT-BE-USED',
+		cacheKey: 'https://x/|desktop',
+	};
+	const out = deliverResource(resource, mockRequest(), { cachedBody: Buffer.from('MATERIALIZED') });
+	assert.equal(out.status, 200);
+	assert.equal(out.body.toString(), 'MATERIALIZED');
+});
+
+test('deliverResource still sends resource.content when no body was materialized', () => {
+	const resource = {
+		statusCode: 200,
+		miss: true,
+		headers: { 'content-type': 'text/html' },
+		content: 'ORIGIN-STREAM',
+		cacheKey: 'https://x/|desktop',
+	};
+	assert.equal(deliverResource(resource, mockRequest(), {}).body, 'ORIGIN-STREAM');
+});
+
+test('deliverResource sends no body for HEAD even when one was materialized', () => {
+	const resource = { statusCode: 200, miss: false, headers: {}, content: 'X', cacheKey: 'https://x/|desktop' };
+	const req = { ...mockRequest(), method: 'HEAD' };
+	assert.equal(deliverResource(resource, req, { cachedBody: Buffer.from('Y') }).body, undefined);
+});
+
+test('deliverResource does NOT delete the record when a residual Blob stream errors', async () => {
+	// The delete replicated, so one node's unreadable blob evicted the page on every node —
+	// including peers holding readable bytes — and scheduled no repair.
+	let deleted = 0;
+	globalThis.databases.page_cache.PrerenderedPage.delete = () => deleted++;
+
+	class FakeBlob extends Blob {
+		on(event, handler) {
+			if (event === 'error') setImmediate(() => handler(new Error('Blob file not found')));
+			return this;
+		}
+		stream() {
+			return new ReadableStream({ start: (c) => c.close() });
+		}
+	}
+	const resource = {
+		statusCode: 200,
+		miss: false,
+		headers: {},
+		content: new FakeBlob(['x']),
+		cacheKey: 'https://x/|desktop',
+	};
+	emitted.length = 0;
+	deliverResource(resource, mockRequest(), {});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(deleted, 0, 'a blob delivery error must not evict the replicated record');
+	assert.ok(
+		emitted.some((a) => a[1] === 'prerender_ops' && a[3] === 'blob-stream'),
+		'the failure must still be counted'
+	);
+});
+
+test('negotiateEncoding decompresses a Buffer body rather than iterating it byte-by-byte', async () => {
+	// The cache path hands in a Buffer. `Readable.from(buffer)` would emit individual byte NUMBERS,
+	// so gunzip would receive garbage; the body must be wrapped as a single chunk. Verified by
+	// round-tripping real gzip bytes through the identity negotiation and reading them back.
+	const { gzipSync } = await import('node:zlib');
+	const headers = new Headers({ 'content-encoding': 'gzip', 'content-length': '99' });
+	const req = mockRequest({ 'accept-encoding': 'identity' });
+	const out = negotiateEncoding(gzipSync(Buffer.from('hello cached page')), headers, req);
+	assert.equal(headers.has('content-length'), false, 'a re-encode invalidates the stored length');
+	assert.equal(headers.has('content-encoding'), false, 'identity means no content-encoding');
+	const chunks = [];
+	for await (const chunk of out) chunks.push(chunk);
+	assert.equal(Buffer.concat(chunks).toString(), 'hello cached page');
 });

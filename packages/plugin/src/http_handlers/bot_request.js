@@ -220,9 +220,35 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	info.invalidatedBy = invalidatedBy;
 
 	if (servable) {
-		info.cacheStatus = status;
-		info.source = 'cache';
-		return page;
+		// READ THE BODY BEFORE COMMITTING TO THE CACHE SERVE. A record whose blob file is gone
+		// (harper#2134: the invalidate path unlinks blobs live records still reference; replication
+		// also lands records whose bytes never arrived) used to be discovered only once the body was
+		// already streaming — after the status, the headers and the `bot_serve` hit row had all been
+		// committed. The crawler got a truncated document under a 200 and every signal said cache
+		// hit. Reading here converts that into an ordinary origin serve: correct bytes, and counted.
+		//
+		// Buffering is affordable BECAUSE OF THE MEASURED SIZE DISTRIBUTION of this corpus: mean
+		// 223 KB, p99 322 KB, hard max 420 KB, no tail; a full cold read is p50 0.75 ms / p99
+		// 0.94 ms, on the libuv threadpool rather than the event loop. If page bodies ever grow
+		// unbounded, revisit — streaming with a first-chunk peek trades this guarantee for memory.
+		const cached = await materializeCachedBody(page, request.method);
+		if (cached.ok) {
+			info.cachedBody = cached.body;
+			info.cacheStatus = status;
+			info.source = 'cache';
+			return page;
+		}
+		// Distinct from 'blob-stream', which is the residual mid-stream failure in response.js.
+		metrics.serveError('blob-unreadable');
+		logger.error(`cached blob unreadable for ${cacheKey}; serving origin instead`, cached.error);
+		info.cacheStatus = 'blob-missing';
+		info.source = 'origin';
+		return fetchOriginResource({
+			url,
+			deviceType,
+			headers: request.headers,
+			reason: 'blob-missing',
+		});
 	}
 
 	info.cacheStatus = skipCache ? 'skip' : status === 'invalidated' ? 'invalidated' : page ? 'stale' : 'miss';
@@ -264,6 +290,29 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
 		reason: info.cacheStatus,
 	});
+}
+
+/**
+ * Read a cached page's body up front so the caller can still choose origin if it is unreadable.
+ *
+ * Returns `{ ok: true, body }` with the bytes in hand — `body` is `undefined` for HEAD, which
+ * sends none, and for a page with no content at all — or `{ ok: false, error }` when the blob
+ * could not be read. A non-Blob body needs no read and cannot fail mid-stream, so it passes
+ * straight through (this is what keeps the unit tests' plain-string fixtures working).
+ *
+ * Deliberately NOT deleting the record on failure: `PrerenderedPage` replicates, so a delete
+ * evicts the page on every node — including peers holding a readable blob — and schedules no
+ * repair, leaving the key on origin until its next scheduled render. See response.js.
+ */
+export async function materializeCachedBody(page, method) {
+	if (method === 'HEAD') return { ok: true, body: undefined };
+	const content = page?.content;
+	if (!content || typeof content.bytes !== 'function') return { ok: true, body: content ?? undefined };
+	try {
+		return { ok: true, body: await content.bytes() };
+	} catch (error) {
+		return { ok: false, error };
+	}
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
