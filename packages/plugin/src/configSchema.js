@@ -415,8 +415,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'NVMe, so 500ms is ~500x the p99 and only a blob that is genuinely stuck can trip it. Keep it ' +
 				'BELOW typical origin latency (~500-600ms here) so falling back is faster than waiting; ' +
 				'raising it past `storage_blobReadTimeout` disables it entirely. 0 disables the budget and ' +
-				'restores the unbounded wait.',
-			{ unit: 'ms', min: 0 }
+				'restores the unbounded wait.\n\n' +
+				'Capped at 2147483647 because `setTimeout` stores its delay as a signed 32-bit int: a larger ' +
+				'value does not mean "effectively never", it makes Node warn and fire the callback after 1ms — ' +
+				'so a fat-fingered budget would time out EVERY cache hit and send all traffic to the origin. ' +
+				'The cap turns that into a rejected value that keeps the default.',
+			{ unit: 'ms', min: 0, max: 2147483647 }
 		),
 	}),
 

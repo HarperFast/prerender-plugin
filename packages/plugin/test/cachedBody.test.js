@@ -157,3 +157,21 @@ test('HEAD skips the read entirely, so the budget can never apply to it', async 
 	assert.equal(res.ok, true);
 	assert.equal(res.body, undefined);
 });
+
+test('a SYNCHRONOUS throw from bytes() is captured, not propagated', async () => {
+	// bytes() is called before the await, so a synchronous throw would escape every catch below it
+	// and reject — turning a recoverable dangling blob into a 500 for a crawler, which is exactly
+	// what the rest of this function exists to prevent.
+	const exploding = {
+		bytes() {
+			throw new TypeError('bad internal state');
+		},
+	};
+	let res;
+	await assert.doesNotReject(async () => {
+		res = await materializeCachedBody({ content: exploding }, 'GET', 500);
+	});
+	assert.equal(res.ok, false);
+	assert.equal(res.reason, 'unreadable');
+	assert.ok(res.error instanceof TypeError);
+});

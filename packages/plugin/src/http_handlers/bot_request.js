@@ -245,7 +245,8 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// arrive, just not within a crawler's patience. Folding them together would have hidden the
 		// second behind the first: the timeout cohort only appeared once a copy was running.
 		const timedOut = cached.reason === 'timeout';
-		const status = timedOut ? 'blob-timeout' : 'blob-missing';
+		// NOT `status` — that name is taken by the freshness verdict from resolveServeStatus above.
+		const failStatus = timedOut ? 'blob-timeout' : 'blob-missing';
 		metrics.serveError(timedOut ? 'blob-timeout' : 'blob-unreadable');
 		if (timedOut) {
 			logger.warn(
@@ -254,13 +255,13 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		} else {
 			logger.error(`cached blob unreadable for ${cacheKey}; serving origin instead`, cached.error);
 		}
-		info.cacheStatus = status;
+		info.cacheStatus = failStatus;
 		info.source = 'origin';
 		return fetchOriginResource({
 			url,
 			deviceType,
 			headers: request.headers,
-			reason: status,
+			reason: failStatus,
 		});
 	}
 
@@ -322,7 +323,16 @@ export async function materializeCachedBody(page, method, budgetMs = config.page
 	const content = page?.content;
 	if (!content || typeof content.bytes !== 'function') return { ok: true, body: content ?? undefined };
 
-	const read = content.bytes();
+	// Start the read inside the guard too: a synchronous throw here (bad internal state, a TypeError)
+	// would otherwise escape every catch below and reject, turning a recoverable dangling blob into a
+	// 500 for a crawler — the exact outcome the rest of this function exists to avoid.
+	let read;
+	try {
+		read = content.bytes();
+	} catch (error) {
+		return { ok: false, reason: 'unreadable', error };
+	}
+
 	if (!(budgetMs > 0)) {
 		try {
 			return { ok: true, body: await read };
