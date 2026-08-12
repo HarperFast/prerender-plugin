@@ -340,6 +340,57 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	peerRescue: group(
+		'Cluster peer rescue for the serve path. A cache serve reads the stored body before committing ' +
+			'a status; when that LOCAL read fails — the blob file is gone (a dangling reference), or the ' +
+			'read outlived `page.blobReadBudgetMs` (a base copy is streaming that blob) — the bytes are ' +
+			'fetched from the URL’s residency owner over the cluster’s own HTTPS instead of proxying the ' +
+			'origin. The owner granted every render claim for its keys, so its blob is a written original, ' +
+			'never a received replica: it is the node most likely to hold complete bytes, a few ' +
+			'milliseconds away, and the rescued response is the real prerendered snapshot rather than raw ' +
+			'un-prerendered origin markup. The origin remains the backstop whenever the rescue misses ' +
+			'(the owner is this node, unreachable, past `timeoutMs`, or its own read fails).\n\n' +
+			'Enabling also serves the endpoint peers call (`GET /prerender_peer/page`), gated on `token`. ' +
+			'Set the SAME token on every node: a node with a different or empty token answers 403/404 and ' +
+			'its peers simply fall back to the origin, so a staggered rollout degrades softly rather than ' +
+			'breaking serves.',
+		{
+			enabled: option(
+				false,
+				'Enable the rescue (and the endpoint that serves peers). Necessary but not sufficient — a ' +
+					'non-empty `token` (or a `valueEnv` that resolves to one) is also required, so this cannot ' +
+					'open an unauthenticated endpoint on its own.'
+			),
+			header: option('x-harper-peer-token', 'Request header carrying the shared token on peer calls.', {
+				nonEmpty: true,
+			}),
+			token: option(
+				'',
+				'The shared cluster secret, identical on every node. **Required** — there is no ' +
+					'unauthenticated mode: an empty token leaves the feature DISABLED (no rescues attempted, the ' +
+					'endpoint answers 404) rather than serving cached pages to anyone who finds the path. ' +
+					'Compared timing-safely. Prefer `valueEnv` so the secret stays out of config.yaml, and never ' +
+					'commit a guessable placeholder.',
+				{ secret: true }
+			),
+			valueEnv: option(
+				'',
+				'If set, the token is sourced from this environment variable at config-apply time and takes ' +
+					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.'
+			),
+			timeoutMs: option(
+				500,
+				'Deadline for the whole peer fetch (connect through body). A healthy rescue is a few ' +
+					'milliseconds of intra-cluster round trip plus the owner’s sub-millisecond blob read, so ' +
+					'this only trips when the owner is down, saturated, or mid-copy itself — at which point the ' +
+					'origin fallback proceeds exactly as it would have without the rescue. Keep it in the same ' +
+					'order as `page.blobReadBudgetMs`: the two are additive on the worst-case path ' +
+					'(budget + rescue timeout + origin).',
+				{ unit: 'ms', min: 1 }
+			),
+		}
+	),
+
 	management: group(
 		'Management API + UI, served at the fixed path `/prerender_admin` (resource endpoint names are ' +
 			'fixed, like the database/table names). Gated on Harper’s own authentication: every endpoint ' +

@@ -229,13 +229,22 @@ sustained rate (see §5):
   scheduled no repair, leaving the key on origin until its next scheduled render, up to 48h later.
   The scheduled re-render restores the blob either way.
 - **`cached blob read exceeded …ms`** — the body was still being READ when `page.blobReadBudgetMs`
-  ran out, so the request went to origin rather than making the crawler wait. Counted as
-  `serve_error` (`blob-timeout`) and as cacheStatus/reason `blob-timeout`. Split from
-  `blob-missing` because the cause differs: the bytes ARE arriving — a base copy is streaming that
-  blob (harper-pro#683) — just not in time. Without the budget these inherit Harper's
-  `storage_blobReadTimeout` (20s): measured mid-copy on production, a cohort of 88 cache hits
-  averaging **13.6s** (p95 17.5s) on one node whose median hit was 2.3ms. A rising share here
-  tracks replication churn; a rising `blob-missing` share tracks dangling references.
+  ran out, so the request stopped waiting rather than making the crawler wait. Counted as
+  `serve_error` (`blob-timeout`); as cacheStatus/reason `blob-timeout` when it then went to
+  origin, or as cacheStatus `peer-rescue` when the residency owner's copy answered instead (see
+  below). Split from `blob-missing` because the cause differs: the bytes ARE arriving — a base
+  copy is streaming that blob (harper-pro#683) — just not in time. Without the budget these
+  inherit Harper's `storage_blobReadTimeout` (20s): measured mid-copy on production, a cohort of
+  88 cache hits averaging **13.6s** (p95 17.5s) on one node whose median hit was 2.3ms. A rising
+  share here tracks replication churn; a rising `blob-missing` share tracks dangling references.
+- **`cached blob … for … ; served the owner's copy (…)`** — the same two local failures, rescued:
+  with `peerRescue` configured, the bytes came from the URL's residency owner over the cluster's
+  own HTTPS (the owner wrote every render for its keys, so its blob is an original, never a
+  received replica). Counted as `bot_serve` source `cache` / cacheStatus `peer-rescue` — still a
+  cache serve for offload, but its own status so the rescue rate is trendable — alongside the
+  same `serve_error`, which counts the LOCAL fault either way. `blob-timeout`/`blob-missing` on
+  `bot_serve`/`origin_fetch` therefore now mean the rescue ALSO missed (owner is this node, owner
+  unreachable, or the owner's own read failed) and the request fell back to origin.
 - **`blob delivery error`** — the residual mid-stream failure, now reachable only for a cached body
   that arrived unmaterialized (the render-now timeout fallback). Still counted as `serve_error`
   (`blob-stream`); a non-zero rate here means a path is bypassing the up-front read.
@@ -296,18 +305,18 @@ The catalog above is reference; this is the short list. "Sum across nodes" is im
 
 **Expect zero — page on any sustained non-zero:**
 
-| Condition                                                                                           | Meaning                                                                                                                                                                                                            |
-| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `queue_health` `below_floor` > 0 across consecutive snapshots                                       | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                                                                                                     |
-| `prerender_ops` `invalidation_error` any rate, especially kind `lkg-expired`                        | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving.                                                                          |
-| log `blob delivery error`                                                                           | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                                                                                 |
-| log `schedule reconcile: restored N` with N > 0                                                     | Terminal schedule gaps existed and were repaired; find what created them.                                                                                                                                          |
-| log `Sitemap … failed and was skipped` / `… aborted`                                                | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                                                                                              |
-| `render` outcome `auth-failure` any rate                                                            | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design.                                                                 |
-| `prerender_ops` series `serve_error` = `blob-timeout`, or `bot_serve` cacheStatus `blob-timeout`    | Cache reads timing out against `page.blobReadBudgetMs` — a base copy is streaming those blobs. Served correctly from origin; the signal is replication churn, and the alternative was a multi-second crawler wait. |
-| `prerender_ops` series `serve_error` = `blob-unreadable`, or `bot_serve` cacheStatus `blob-missing` | Dangling blob references (harper#2134): cached records whose body is gone. Served correctly from origin, but it is lost offload and a blob-integrity signal, not a caching one.                                    |
-| `prerender_ops` series `serve_error` = `blob-stream` any rate                                       | A truncated 200 DID reach a crawler — a cached body bypassed the up-front read.                                                                                                                                    |
-| `queue_health` series `reconcile_restored` > 0                                                      | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                                                                                        |
+| Condition                                                                                           | Meaning                                                                                                                                                                                                                                                                                                         |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queue_health` `below_floor` > 0 across consecutive snapshots                                       | Rows filed where no claim will ever look: **silently lost renders**. The gauge is the only automatic evidence.                                                                                                                                                                                                  |
+| `prerender_ops` `invalidation_error` any rate, especially kind `lkg-expired`                        | An active invalidation is not being enforced on the requests that failed — content someone deliberately invalidated may still be serving.                                                                                                                                                                       |
+| log `blob delivery error`                                                                           | Truncated 200s recorded as cache hits — invisible to every metric.                                                                                                                                                                                                                                              |
+| log `schedule reconcile: restored N` with N > 0                                                     | Terminal schedule gaps existed and were repaired; find what created them.                                                                                                                                                                                                                                       |
+| log `Sitemap … failed and was skipped` / `… aborted`                                                | Lost sitemap coverage (also `prerender_ops` series `sitemap_failed`).                                                                                                                                                                                                                                           |
+| `render` outcome `auth-failure` any rate                                                            | The renderer's origin-bypass credential broke, or an origin bot-mitigation rule changed — hits everything at once, and never suppresses by design.                                                                                                                                                              |
+| `prerender_ops` series `serve_error` = `blob-timeout`, or `bot_serve` cacheStatus `blob-timeout`    | Cache reads timing out against `page.blobReadBudgetMs` — a base copy is streaming those blobs. Served correctly (from the residency owner's copy when `peerRescue` is on — cacheStatus `peer-rescue` — else from origin); the signal is replication churn, and the alternative was a multi-second crawler wait. |
+| `prerender_ops` series `serve_error` = `blob-unreadable`, or `bot_serve` cacheStatus `blob-missing` | Dangling blob references (harper#2134): cached records whose body is gone. Served correctly (owner's copy or origin, as above); with a rescue it isn't even lost offload — but it stays a blob-integrity signal, not a caching one.                                                                             |
+| `prerender_ops` series `serve_error` = `blob-stream` any rate                                       | A truncated 200 DID reach a crawler — a cached body bypassed the up-front read.                                                                                                                                                                                                                                 |
+| `queue_health` series `reconcile_restored` > 0                                                      | URLs were silently un-renderable until the sweep repaired them; find what created the gaps.                                                                                                                                                                                                                     |
 
 **Thresholds — warn, then investigate:**
 

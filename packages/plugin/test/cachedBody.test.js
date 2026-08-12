@@ -19,20 +19,12 @@ import assert from 'node:assert/strict';
 let materializeCachedBody;
 
 before(async () => {
+	// util/cachedBody.js only pulls in config, but keep the bootstrap shape consistent with the
+	// other handler tests so moving code between the handler and the util never breaks it.
 	globalThis.Resource = class {};
 	globalThis.server = { hostname: 'test-node', nodes: [], config: { http: { port: 9926 } }, recordAnalytics() {} };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
-	globalThis.databases = {
-		coordination: {
-			SharedBuffer: {
-				primaryStore: { getUserSharedBuffer: (_key, buf) => buf, tryLock: () => true, unlock() {} },
-			},
-		},
-		render_service: { Target: class {}, QueueControl: class {} },
-		render_schedule: { RenderSchedule: class {} },
-		page_cache: { PrerenderedPage: class {} },
-	};
-	({ materializeCachedBody } = await import('../src/http_handlers/bot_request.js'));
+	({ materializeCachedBody } = await import('../src/util/cachedBody.js'));
 });
 
 // Stand-in for Harper's cached-content Blob: `bytes()` resolves the body or rejects the way a

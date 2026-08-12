@@ -298,6 +298,10 @@ const resolveSecretsFromEnv = () => {
 	if (renderNowEnv && process.env[renderNowEnv]) {
 		config.renderNow.token = process.env[renderNowEnv];
 	}
+	const peerRescueEnv = config.peerRescue.valueEnv;
+	if (peerRescueEnv && process.env[peerRescueEnv]) {
+		config.peerRescue.token = process.env[peerRescueEnv];
+	}
 };
 
 /**
@@ -374,6 +378,18 @@ export const collectConfigWarnings = () => {
 					: 'renderNow.enabled is true but no renderNow.token is configured — renderNow is DISABLED (the levers fail closed rather than authorizing anyone); set renderNow.token or renderNow.valueEnv'
 			);
 		}
+	}
+	if (config.peerRescue.enabled && !config.peerRescue.token) {
+		// Inert, not open: both the rescue client and the endpoint fail closed without a token.
+		// Same shape as the renderNow finding — the operator asked for a feature that is not on.
+		const { valueEnv } = config.peerRescue;
+		add(
+			'warn',
+			'peerRescue.token',
+			valueEnv
+				? `peerRescue.enabled is true but peerRescue.valueEnv ("${valueEnv}") is not set in the environment and no peerRescue.token is configured — peer rescue is DISABLED (it fails closed rather than serving cached pages unauthenticated)`
+				: 'peerRescue.enabled is true but no peerRescue.token is configured — peer rescue is DISABLED (it fails closed rather than serving cached pages unauthenticated); set peerRescue.token or peerRescue.valueEnv'
+		);
 	}
 	if (config.invalidation.enabled && config.invalidation.pad < config.queue.jobLeaseTime) {
 		// Cross-option, like spreadWindow below. The pad's config text calls in-flight renders "the

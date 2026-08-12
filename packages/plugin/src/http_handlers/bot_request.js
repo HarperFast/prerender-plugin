@@ -20,6 +20,8 @@ import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
+import { materializeCachedBody } from '../util/cachedBody.js';
+import { rescueFromOwner } from '../util/peerRescue.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -247,10 +249,46 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		const timedOut = cached.reason === 'timeout';
 		// NOT `status` — that name is taken by the freshness verdict from resolveServeStatus above.
 		const failStatus = timedOut ? 'blob-timeout' : 'blob-missing';
+		// The serve_error counts the LOCAL blob fault and is emitted regardless of how the request is
+		// ultimately answered — it is the blob-health signal, not the serve-outcome one (bot_serve is).
 		metrics.serveError(timedOut ? 'blob-timeout' : 'blob-unreadable');
+
+		// TRY THE RESIDENCY OWNER BEFORE THE ORIGIN. Both failure modes here are receive-side: the
+		// owner granted every render claim for this key (claims are owner-scoped and callbackOrigin
+		// points the result back at the granting node), so its blob is a written ORIGINAL, never a
+		// received replica — the node most likely to hold complete bytes, a few ms away. The rescue
+		// serves the real prerendered snapshot where the origin proxy would serve raw un-prerendered
+		// markup, and an intra-cluster fetch is ~50x cheaper than the origin round trip. Inert unless
+		// `peerRescue` is configured; origin remains the backstop for every miss (owner is this node,
+		// owner unreachable, owner's own read fails).
+		const rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		if (rescue.ok) {
+			const note = timedOut ? `read exceeded ${config.page.blobReadBudgetMs}ms` : 'unreadable';
+			logger.warn(`cached blob ${note} for ${cacheKey}; served the owner's copy (${rescue.owner})`);
+			info.cachedBody = rescue.body;
+			// Its own status rather than the freshness verdict: the rescue rate is the number an
+			// operator trends against replication churn, and it must not inflate 'hit'.
+			info.cacheStatus = 'peer-rescue';
+			info.source = 'cache';
+			// A plain view assembled from the OWNER's metadata, not the local record: the bytes and
+			// their headers (content-encoding above all) must come from the same version, and the owner
+			// writes every render for this key, so its copy is never older than the local one.
+			return {
+				statusCode: rescue.page.statusCode,
+				headers: rescue.page.headers,
+				lastCached: rescue.page.lastCached,
+				expiresAt: rescue.page.expiresAt,
+				isIndexable: rescue.page.isIndexable,
+				cacheKey,
+				deviceType,
+				url: cacheUrl,
+			};
+		}
+
 		if (timedOut) {
 			logger.warn(
-				`cached blob read exceeded ${config.page.blobReadBudgetMs}ms for ${cacheKey}; serving origin instead`
+				`cached blob read exceeded ${config.page.blobReadBudgetMs}ms for ${cacheKey}; serving origin instead` +
+					(rescue.reason === 'disabled' ? '' : ` (peer rescue: ${rescue.reason})`)
 			);
 		} else {
 			logger.error(`cached blob unreadable for ${cacheKey}; serving origin instead`, cached.error);
@@ -304,70 +342,6 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
 		reason: info.cacheStatus,
 	});
-}
-
-/**
- * Read a cached page's body up front so the caller can still choose origin if it is unreadable.
- *
- * Returns `{ ok: true, body }` with the bytes in hand — `body` is `undefined` for HEAD, which
- * sends none, and for a page with no content at all — or `{ ok: false, error }` when the blob
- * could not be read. A non-Blob body needs no read and cannot fail mid-stream, so it passes
- * straight through (this is what keeps the unit tests' plain-string fixtures working).
- *
- * Deliberately NOT deleting the record on failure: `PrerenderedPage` replicates, so a delete
- * evicts the page on every node — including peers holding a readable blob — and schedules no
- * repair, leaving the key on origin until its next scheduled render. See response.js.
- */
-export async function materializeCachedBody(page, method, budgetMs = config.page.blobReadBudgetMs) {
-	if (method === 'HEAD') return { ok: true, body: undefined };
-	const content = page?.content;
-	if (!content || typeof content.bytes !== 'function') return { ok: true, body: content ?? undefined };
-
-	// Start the read inside the guard too: a synchronous throw here (bad internal state, a TypeError)
-	// would otherwise escape every catch below and reject, turning a recoverable dangling blob into a
-	// 500 for a crawler — the exact outcome the rest of this function exists to avoid.
-	let read;
-	try {
-		read = content.bytes();
-	} catch (error) {
-		return { ok: false, reason: 'unreadable', error };
-	}
-
-	if (!(budgetMs > 0)) {
-		try {
-			return { ok: true, body: await read };
-		} catch (error) {
-			return { ok: false, reason: 'unreadable', error };
-		}
-	}
-
-	// Bound the read. Without this the request inherits Harper's own retry window
-	// (`storage_blobReadTimeout`, 20s): a blob whose bytes are still arriving puts the reader into an
-	// incomplete-content retry loop and the crawler waits it out. Losing the race does NOT cancel the
-	// read — `bytes()` is `readFile`-based and has no cancellation seam — but `readFile` owns and
-	// closes its own descriptor, so the abandoned read finishes or times out on its own and its buffer
-	// is collected. It costs a background read, never a leaked fd.
-	let timer;
-	const expired = Symbol('blob-read-budget');
-	try {
-		const result = await Promise.race([
-			read,
-			new Promise((resolve) => {
-				timer = setTimeout(() => resolve(expired), budgetMs);
-			}),
-		]);
-		if (result === expired) return { ok: false, reason: 'timeout' };
-		return { ok: true, body: result };
-	} catch (error) {
-		return { ok: false, reason: 'unreadable', error };
-	} finally {
-		// Always clear it: an uncleared timer holds a handle for the whole budget on every served
-		// request, and at serve volume that is a lot of live timers for no reason.
-		clearTimeout(timer);
-		// The loser of the race is still in flight on the timeout path; swallow its eventual rejection
-		// so an unreadable blob cannot surface as an unhandled rejection after we already answered.
-		read.catch(() => {});
-	}
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller

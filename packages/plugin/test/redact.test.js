@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { redactConfig, SECRET_PATHS } from '../src/util/redact.js';
 
 test('the redaction list is derived from the schema (secret: true options)', () => {
-	assert.deepEqual(SECRET_PATHS.sort(), ['origin.securityToken.value', 'renderNow.token'].sort());
+	assert.deepEqual(SECRET_PATHS.sort(), ['origin.securityToken.value', 'peerRescue.token', 'renderNow.token'].sort());
 });
 
 test('secrets are replaced with a presence marker, not disclosed', () => {

@@ -99,6 +99,13 @@ const CACHE_STATUSES = Object.freeze([
 	// bytes are arriving (a base copy is streaming that blob — harper-pro#683), just not in time.
 	// A rising share tracks replication churn, not dangling references.
 	'blob-timeout',
+	// A local blob failure ANSWERED FROM THE RESIDENCY OWNER'S COPY (peerRescue) — still a cache
+	// serve (source stays 'cache', so offload accounting is right), but its own status rather than
+	// the freshness verdict, because the rescue rate is what an operator trends against replication
+	// churn and it must not inflate 'hit'. The local fault is counted separately by `serve_error`
+	// (blob-timeout / blob-unreadable), which fires whether or not the rescue lands; blob-timeout /
+	// blob-missing here now mean the rescue ALSO missed and the request went to origin.
+	'peer-rescue',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
