@@ -414,6 +414,11 @@ export const METRICS = Object.freeze({
 			'the serve path; it also quietly undermines invalidation.pad’s sizing); expect zero. demand_* = the ' +
 			'demand ladder’s guardrail: whether "promote the hot pages" is quietly becoming "halve every ' +
 			'interval"; recorded during dry runs too — the histogram is how a dry-run week is judged. ' +
+			'demand_fast_fraction is scored over GRADED decisions only (promoted + demoted + held); routes ' +
+			'with no rung faster than their own cadence (demand_single_rung) and cold-filter holds ' +
+			'(demand_skipped_cold) are not ladder outcomes and would otherwise make it a readout of the ' +
+			'route mix. demand_promoted_fast is the movement counter — budget being reallocated onto fast ' +
+			'rungs right now, zero once the distribution settles. ' +
 			'invalidation_error = an active invalidation is NOT being enforced on the requests that failed ' +
 			'(the serve path falls back per-worker, so these are invisible in serve metrics); expect zero, ' +
 			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
@@ -421,7 +426,7 @@ export const METRICS = Object.freeze({
 			'is off by default, so no rows means disabled.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_* and the demand_* decision counters ' +
-			'(promoted/demoted/held/skipped_cold) are per-interval/per-run counts whose `total` is the meaningful ' +
+			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error and ' +
 			'invalidation_reenqueue are counters; config_warnings is a slow gauge (latest value); ' +
 			'demand_fast_fraction and demand_fill are per-worker gauges — average them, never sum ' +
@@ -447,6 +452,8 @@ export const METRICS = Object.freeze({
 					'demand_demoted',
 					'demand_held',
 					'demand_skipped_cold',
+					'demand_single_rung',
+					'demand_promoted_fast',
 					'demand_fast_fraction',
 					'demand_fill',
 					'invalidation_error',
@@ -457,7 +464,9 @@ export const METRICS = Object.freeze({
 					'sitemaps processed, targets created / re-attributed / unchanged / unlinked, sitemaps failed ' +
 					'and skipped. serve_error = committed-then-failed deliveries. config_warnings = finding count. ' +
 					'page_age_negative = negative-age samples discarded from page_age. demand_* = ladder decisions ' +
-					'(promoted/demoted/held/skipped_cold) and its two sizing gauges (fast_fraction, fill). ' +
+					'(promoted/demoted/held are the graded ones and sum to fast_fraction’s denominator; ' +
+					'skipped_cold and single_rung are the two paths where no decision was possible), ' +
+					'promoted_fast = promotions onto a fast rung, plus its two sizing gauges (fast_fraction, fill). ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes.',
 			},
 			method: {
