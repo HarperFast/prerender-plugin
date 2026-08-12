@@ -450,12 +450,16 @@ const renderer: Renderer = async (page, job) => {
 
 		if (statusCode === 200) {
 			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
-			// The canonical is read against the CACHE KEY, so a URL whose canonical is the same
-			// URL re-spelled ('variant') is non-indexable too — it would otherwise hold a second
-			// target rendering forever for bytes the canonical key already has. Its own reason
-			// slug, so a wave of duplicate spellings stays legible next to genuine mismatches.
+			// A canonical naming a DIFFERENT document always disowns the page — invariable, every
+			// site. A canonical naming this very document RE-SPELLED as another cache key
+			// ('variant') is only a duplicate if the site's origin cannot tell the two spellings
+			// apart, which is a property of its query parser, not of the URLs — so that half is
+			// config, defaulting to the historical lenient reading. See config.canonical.strict.
+			// Either way the reason slug is distinct, so duplicate spellings stay legible next to
+			// genuine mismatches.
 			const verdict = canonicalVerdict(canonicalHref, rawPageUrl);
-			job.isIndexable = !noindex && verdict === 'self';
+			const disowned = verdict === 'elsewhere' || (verdict === 'variant' && config.canonical.strict);
+			job.isIndexable = !noindex && !disowned;
 			if (!job.isIndexable) {
 				job.reason = noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
 			}

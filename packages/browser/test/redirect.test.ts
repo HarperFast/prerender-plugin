@@ -179,10 +179,10 @@ test('reason distinguishes noindex from canonical-mismatch', async () => {
 // A canonical that names THIS document under another spelling is still a second cache key, so
 // it is non-indexable — with its own reason, because "you already render this page under a
 // different key" is a different operational story from "this page disowns itself".
-test('a re-spelled self-canonical is non-indexable as canonical-variant', async () => {
+test('a re-spelled self-canonical is non-indexable as canonical-variant — under canonical.strict', async () => {
 	const result = await renderOnce({
 		url: `${base}/canonical-respelled?f=A%20B`,
-		config: { scroll: { enabled: false } },
+		config: { scroll: { enabled: false }, canonical: { strict: true } },
 		resourceCache: { enabled: false },
 		captureNonIndexable: false, // production's gate: a DISCOVERED url, not a sitemap-listed one
 	});
@@ -192,6 +192,39 @@ test('a re-spelled self-canonical is non-indexable as canonical-variant', async 
 	assert.equal(result.reason, 'canonical-variant');
 	assert.equal(result.outcome, 'non-indexable');
 	assert.equal(result.html, undefined);
+});
+
+// Whether two spellings are one resource is a fact about the SITE's query parser, so the default
+// must be the historical reading: the re-spelling keeps its own target and renders. A site only
+// opts in after establishing that its origin form-decodes (one request, see CanonicalConfig).
+test('by default a re-spelled self-canonical is still indexable (no behavior change on upgrade)', async () => {
+	const result = await renderOnce({
+		url: `${base}/canonical-respelled?f=A%20B`,
+		config: { scroll: { enabled: false } },
+		resourceCache: { enabled: false },
+		captureNonIndexable: false,
+	});
+	await result.close();
+
+	assert.equal(result.isIndexable, true);
+	assert.equal(result.reason, undefined);
+	assert.ok(result.html);
+});
+
+// The invariable half is NOT configurable: a canonical naming a different document disowns the
+// page whatever `strict` says.
+test('a canonical pointing elsewhere is non-indexable regardless of canonical.strict', async () => {
+	for (const strict of [false, true]) {
+		const result = await renderOnce({
+			url: `${base}/canonical-elsewhere`,
+			config: { scroll: { enabled: false }, canonical: { strict } },
+			resourceCache: { enabled: false },
+			captureNonIndexable: false,
+		});
+		await result.close();
+		assert.equal(result.isIndexable, false, `strict=${strict}`);
+		assert.equal(result.reason, 'canonical-mismatch', `strict=${strict}`);
+	}
 });
 
 // THE BLAST-RADIUS GUARANTEE, pinned so a refactor cannot quietly remove it. A sitemap-listed
@@ -204,7 +237,8 @@ test('a sitemap-listed url survives any canonical verdict (content wins → rend
 	for (const path of ['/canonical-respelled?f=A%20B', '/canonical-elsewhere']) {
 		const result = await renderOnce({
 			url: `${base}${path}`,
-			config: { scroll: { enabled: false } },
+			// strict on, i.e. the harshest reading available — the guarantee must hold even there.
+			config: { scroll: { enabled: false }, canonical: { strict: true } },
 			resourceCache: { enabled: false },
 			captureNonIndexable: true, // === isFromSitemap in production
 			// The POSTED outcome — what the plugin actually branches on — not renderOnce's own slug.
