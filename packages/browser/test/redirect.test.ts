@@ -78,6 +78,14 @@ before(async () => {
 				return res.end(
 					`<!doctype html><html><head><title>t</title><link rel="canonical" href="/destination"></head><body>x</body></html>`
 				);
+			// Serves one page under any spelling of its query, and canonicalizes to the `+` one —
+			// what a faceted origin does. Requested as `%20`, it is the same document under a
+			// different cache key.
+			case '/canonical-respelled':
+				res.setHeader('content-type', 'text/html');
+				return res.end(
+					`<!doctype html><html><head><title>t</title><link rel="canonical" href="/canonical-respelled?f=A+B"></head><body>x</body></html>`
+				);
 			case '/destination':
 				res.setHeader('content-type', 'text/html');
 				return page('DESTINATION');
@@ -166,4 +174,46 @@ test('reason distinguishes noindex from canonical-mismatch', async () => {
 	await canonical.close();
 	assert.equal(canonical.isIndexable, false);
 	assert.equal(canonical.reason, 'canonical-mismatch');
+});
+
+// A canonical that names THIS document under another spelling is still a second cache key, so
+// it is non-indexable — with its own reason, because "you already render this page under a
+// different key" is a different operational story from "this page disowns itself".
+test('a re-spelled self-canonical is non-indexable as canonical-variant', async () => {
+	const result = await renderOnce({
+		url: `${base}/canonical-respelled?f=A%20B`,
+		config: { scroll: { enabled: false } },
+		resourceCache: { enabled: false },
+		captureNonIndexable: false, // production's gate: a DISCOVERED url, not a sitemap-listed one
+	});
+	await result.close();
+
+	assert.equal(result.isIndexable, false);
+	assert.equal(result.reason, 'canonical-variant');
+	assert.equal(result.outcome, 'non-indexable');
+	assert.equal(result.html, undefined);
+});
+
+// THE BLAST-RADIUS GUARANTEE, pinned so a refactor cannot quietly remove it. A sitemap-listed
+// url serializes even when non-indexable, and content wins in RenderJob.outcome — so the result
+// posts as 'rendered' and the plugin's suppression branch is never reached. Whatever a canonical
+// verdict decides, it can only ever retire urls we DISCOVERED; the corpus the site itself
+// declared is structurally out of reach. An origin whose canonicals are spelled differently from
+// its own sitemap therefore loses nothing but the isIndexable flag on the stored page.
+test('a sitemap-listed url survives any canonical verdict (content wins → rendered)', async () => {
+	for (const path of ['/canonical-respelled?f=A%20B', '/canonical-elsewhere']) {
+		const result = await renderOnce({
+			url: `${base}${path}`,
+			config: { scroll: { enabled: false } },
+			resourceCache: { enabled: false },
+			captureNonIndexable: true, // === isFromSitemap in production
+			// The POSTED outcome — what the plugin actually branches on — not renderOnce's own slug.
+			probes: { posted: ({ job }) => job.outcome },
+		});
+		await result.close();
+
+		assert.equal(result.isIndexable, false, `${path}: the verdict itself is unchanged`);
+		assert.ok(result.html, `${path}: but the page is serialized anyway`);
+		assert.equal(result.probes.posted, 'rendered', `${path}: so content wins and nothing suppresses it`);
+	}
 });

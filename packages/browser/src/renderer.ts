@@ -3,7 +3,7 @@ import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
-import { canonicalizeUrl, canonicalAllowsIndex } from './util/url.js';
+import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 
 const noop = () => {};
@@ -450,8 +450,15 @@ const renderer: Renderer = async (page, job) => {
 
 		if (statusCode === 200) {
 			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
-			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, rawPageUrl);
-			if (!job.isIndexable) job.reason = noindex ? 'noindex' : 'canonical-mismatch';
+			// The canonical is read against the CACHE KEY, so a URL whose canonical is the same
+			// URL re-spelled ('variant') is non-indexable too — it would otherwise hold a second
+			// target rendering forever for bytes the canonical key already has. Its own reason
+			// slug, so a wave of duplicate spellings stays legible next to genuine mismatches.
+			const verdict = canonicalVerdict(canonicalHref, rawPageUrl);
+			job.isIndexable = !noindex && verdict === 'self';
+			if (!job.isIndexable) {
+				job.reason = noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
+			}
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const ppStart = Date.now();
