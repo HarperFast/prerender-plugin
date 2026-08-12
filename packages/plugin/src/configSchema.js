@@ -1154,6 +1154,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 				{ unit: 'ms', min: SECOND }
 			),
 			retentionDays: option(90, 'Sketch rows older than this are swept at day rollover.', { min: 1 }),
+			precision: option(
+				14,
+				'HyperLogLog precision `p`. Sets both the accuracy and the SIZE of every sketch row: the ' +
+					'sketch is 2^p registers of one byte, so p = 14 is 16 KB with a standard error of ' +
+					'~1.04/sqrt(2^p) ≈ 0.8%, p = 12 is 4 KB at ~1.6%, and p = 10 is 1 KB at ~3.3%.\n\n' +
+					'This is the lever for the WRITE side, not just for memory. Rows are replicated and ' +
+					'rewritten on every flush, so halving p halves the transaction-log volume this table ' +
+					'generates — and crawl breadth is a reporting number where a couple of percent of ' +
+					'error is immaterial, which makes a lower p unusually cheap. Weigh it against what the ' +
+					'estimate is used for before moving it.\n\n' +
+					'CHANGING IT RESHAPES EVERY SKETCH. A row written at a different p describes a ' +
+					'different register space and cannot be merged with one written at this p, so ' +
+					'mismatched rows are ignored rather than merged: expect that day to undercount for ' +
+					'the bots involved (and, during a staggered rollout, to ignore shards from nodes ' +
+					'still on the old value) until the next UTC day rollover starts every sketch fresh. ' +
+					'Nothing is corrupted and nothing needs migrating; one day of breadth numbers is ' +
+					'soft. Prefer changing it at a day boundary.',
+				{ min: 8, max: 16 }
+			),
 			maxBotsPerThread: option(
 				64,
 				'Sketches are 16 KB each; this caps a UA-derivation flood from minting unbounded per-thread ' +

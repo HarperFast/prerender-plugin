@@ -20,6 +20,9 @@ import { setImmediate as tick } from 'node:timers/promises';
 
 const rows = new Map();
 let locks = [];
+// The node's shared sketches, keyed as getUserSharedBuffer keys them. Cleared per test so one
+// test's registers can never inflate another's estimate.
+const sabs = new Map();
 
 let recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET;
 let estimateSketch, createSketch, addToSketch;
@@ -33,6 +36,17 @@ before(async () => {
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
+					// Named buffers as getUserSharedBuffer provides them: the FIRST caller for a key
+					// sizes it and every later caller gets that same buffer back. That sharing is what
+					// lets sibling workers accumulate into one sketch and only one of them write it.
+					getUserSharedBuffer(key, initial) {
+						let buf = sabs.get(key);
+						if (!buf) {
+							buf = initial;
+							sabs.set(key, buf);
+						}
+						return buf;
+					},
 					tryLock: (key) => {
 						locks.push(key);
 						return true; // granted synchronously; the callback is never called
@@ -71,6 +85,7 @@ beforeEach(() => {
 	resetCrawlStats();
 	rows.clear();
 	locks = [];
+	sabs.clear();
 	mock.timers.reset();
 });
 
@@ -186,4 +201,69 @@ test('computeBreadth merges shards per bot and reports the cross-bot union', () 
 	assert.equal(breadth[1].bots[0].distinctUrls, 100);
 	// estimateSketch sanity on the exported surface used by the admin route.
 	assert.equal(estimateSketch(createSketch()), 0);
+});
+
+// ── one writer per node (#87) + configurable precision ───────────────────────────────────────
+// The row is 2^precision bytes and replicates, so every worker rewriting it per interval put
+// ~256 KB per bot per interval of replicated transaction log behind one row's worth of state.
+// Workers now merge into a node-shared sketch and one writes. These pin what that must not cost.
+
+test('registers from a worker that did not write are carried by the worker that does', async () => {
+	// A worker that loses the interval's turn: merges into the node-shared sketch, writes nothing.
+	for (let i = 0; i < 500; i++) recordCrawl('Googlebot', `https://site.example.com/p/${i}`);
+	await flushSketches({ write: false });
+	assert.equal(rows.size, 0, 'losing the turn must not write a row');
+
+	// The winner writes one row, which must account for BOTH workers' observations.
+	for (let i = 500; i < 1000; i++) recordCrawl('Googlebot', `https://site.example.com/p/${i}`);
+	await flushSketches({ write: true });
+
+	const row = rows.get(`${today()}|Googlebot|node-a`);
+	assert.ok(row, 'the winner wrote the row');
+	assert.ok(
+		Math.abs(row.estimate - 1000) / 1000 <= 0.03,
+		`estimate ${row.estimate} should reflect all 1000 URLs, not just the 500 the writer saw`
+	);
+});
+
+test('a restart with empty shared sketches cannot erase the registers already in the row', async () => {
+	for (let i = 0; i < 800; i++) recordCrawl('Googlebot', `https://site.example.com/p/${i}`);
+	await flushSketches();
+
+	// Restart: shared buffers and thread state gone, the persisted row is not. The write path
+	// must still read-merge, or the first post-restart flush replaces a full day of registers
+	// with only what this process has seen since boot.
+	sabs.clear();
+	resetCrawlStats();
+
+	recordCrawl('Googlebot', 'https://site.example.com/p/new');
+	await flushSketches();
+
+	const row = rows.get(`${today()}|Googlebot|node-a`);
+	assert.ok(
+		Math.abs(row.estimate - 801) / 801 <= 0.03,
+		`estimate ${row.estimate} should still reflect the pre-restart 800, not just the 1 seen since`
+	);
+});
+
+test('precision sets the row size, and a mismatched stored row is ignored rather than merged', async () => {
+	// p = 10 -> 1 KB rows instead of 16 KB: the write-volume lever.
+	applyOptions({ crawlStats: { precision: 10 } });
+	recordCrawl('Googlebot', 'https://site.example.com/p/1');
+	await flushSketches();
+	const row = rows.get(`${today()}|Googlebot|node-a`);
+	assert.equal(row.registers.length, 1 << 10, 'row is 2^precision bytes');
+
+	// A row left behind at another precision describes a different register space. Merging it
+	// element-wise would be meaningless, so it must be ignored — the new-shape sketch wins and
+	// the day self-heals at rollover.
+	sabs.clear();
+	resetCrawlStats();
+	applyOptions({ crawlStats: { precision: 12 } });
+	recordCrawl('Googlebot', 'https://site.example.com/p/2');
+	await flushSketches();
+
+	const after = rows.get(`${today()}|Googlebot|node-a`);
+	assert.equal(after.registers.length, 1 << 12, 'rewritten at the new precision');
+	assert.ok(after.estimate >= 1, 'still a usable estimate rather than garbage from a bad merge');
 });

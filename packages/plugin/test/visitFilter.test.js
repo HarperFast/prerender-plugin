@@ -29,6 +29,9 @@ import { setImmediate as tick } from 'node:timers/promises';
 
 const rows = new Map();
 let locks = [];
+// The node's shared buffers, keyed as getUserSharedBuffer keys them. Cleared per test so one
+// test's accumulated bits can never answer another's probe.
+const sabs = new Map();
 
 let recordVisit, flushSlices, refreshMerged, visitedWithin, visitedInEachWindow;
 let sweepExpired, resetVisitFilter, slotOf, mergedReady;
@@ -46,6 +49,18 @@ before(async () => {
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
+					// Named buffers, as Harper's getUserSharedBuffer provides them: the FIRST caller
+					// for a key sizes it and every later caller gets that same buffer back. Sharing
+					// is what lets sibling workers accumulate into one slice and only one of them
+					// write it; `sabs` stands in for the cross-thread identity.
+					getUserSharedBuffer(key, initial) {
+						let buf = sabs.get(key);
+						if (!buf) {
+							buf = initial;
+							sabs.set(key, buf);
+						}
+						return buf;
+					},
 					tryLock: (key) => {
 						locks.push(key);
 						return true;
@@ -117,6 +132,7 @@ const setDemand = (overrides = {}) =>
 beforeEach(() => {
 	rows.clear();
 	locks = [];
+	sabs.clear();
 	resetVisitFilter();
 	setDemand();
 });
@@ -246,4 +262,70 @@ test('a sizing change drops both sides of the in-memory state and holds the ladd
 
 test('a cold union answers false rather than throwing or inventing traffic', () => {
 	assert.equal(visitedWithin('https://example.com/x', H, Date.now()), false);
+});
+
+// ── one writer per node (#87) ────────────────────────────────────────────────────────────────
+// The row is bitsPerSlice/8 bytes (128 KB at the default) and it replicates, so every worker
+// rewriting it per interval put ~2 MB per slot per interval into the replicated transaction log
+// for one row's worth of state — measured as 1.2 GB of logs behind 18 MB of live data. Workers
+// now merge into a node-shared buffer and one of them writes. These pin the two properties that
+// makes safe: nothing is lost by NOT writing, and nothing already stored is erased by writing.
+
+test('bits from a worker that did not write are carried by the worker that does', async () => {
+	const now = Date.now();
+
+	// A worker that loses the interval's turn: it merges into the node-shared slice and returns.
+	recordVisit('https://example.com/product/prd-loser');
+	await flushSlices({ write: false });
+	assert.equal(rows.size, 0, 'losing the turn must not write a row');
+
+	// The worker that wins the turn writes ONE row, and it must carry the other worker's bits.
+	recordVisit('https://example.com/product/prd-winner');
+	await flushSlices({ write: true });
+	assert.equal(rows.size, 1, 'one row per node per slot, however many workers contributed');
+
+	await refreshMerged(now);
+	assert.equal(
+		visitedWithin('https://example.com/product/prd-loser', H, now),
+		true,
+		'a visit observed by a non-writing worker must still be visible — dropping it would be a false negative'
+	);
+	assert.equal(visitedWithin('https://example.com/product/prd-winner', H, now), true);
+});
+
+test('a restart with empty shared buffers cannot erase history already in the row', async () => {
+	const now = Date.now();
+	recordVisit('https://example.com/product/prd-before');
+	await flushSlices();
+
+	// Restart: shared buffers and thread state are gone, the persisted row is not. The write
+	// path must still read-merge, or the first post-restart flush overwrites the slot's history
+	// with only what this process has seen since boot.
+	sabs.clear();
+	resetVisitFilter();
+	setDemand();
+
+	recordVisit('https://example.com/product/prd-after');
+	await flushSlices();
+
+	await refreshMerged(now);
+	assert.equal(
+		visitedWithin('https://example.com/product/prd-before', H, now),
+		true,
+		'pre-restart visits must survive the first post-restart write'
+	);
+	assert.equal(visitedWithin('https://example.com/product/prd-after', H, now), true);
+});
+
+test('merging is idempotent: the same slice merged twice is indistinguishable from once', async () => {
+	// OR-merging is what makes the retry path in flushSlices safe to replay after a failed write.
+	const now = Date.now();
+	recordVisit('https://example.com/product/prd-1');
+	await flushSlices({ write: false });
+	await flushSlices({ write: true });
+	await flushSlices({ write: true });
+
+	await refreshMerged(now);
+	assert.equal(visitedWithin('https://example.com/product/prd-1', H, now), true);
+	assert.equal(rows.size, 1);
 });
