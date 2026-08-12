@@ -214,9 +214,14 @@ const claimWriteTurn = () => {
 	// against rows of a different byte length.
 	const turn = new Int32Array(getSab(`visitFilter/turn/${shapeOf()}`, 4));
 	const last = Atomics.load(turn, 0);
-	// `now - last` rather than a bare compare, so a clock step backwards costs at most one
-	// skipped interval instead of wedging the turn forever.
-	if (last !== 0 && now - last < intervalSec) return false;
+	const elapsed = now - last;
+	// Only a turn taken in the PAST, within the interval, blocks this one. A bare
+	// `elapsed < intervalSec` would also match a NEGATIVE elapsed — a clock stepped backwards
+	// (NTP correction, VM migration) leaves `last` in the future, and the turn would then be
+	// wedged shut until the clock caught up, which for a large step means no visit-filter write
+	// for as long as it takes. Requiring `elapsed >= 0` to block makes a backward step reclaim
+	// the turn on the next tick and re-anchor `last` to the corrected clock.
+	if (last !== 0 && elapsed >= 0 && elapsed < intervalSec) return false;
 	return Atomics.compareExchange(turn, 0, last, now) === last;
 };
 
@@ -325,47 +330,43 @@ export async function flushSlices({ write = true } = {}) {
 	dirty.clear();
 
 	if (!write || !pendingWrite.size) return;
-	const slots = [...pendingWrite];
-	pendingWrite.clear();
-	try {
-		await persist(slots);
-	} catch (e) {
-		// Re-mark so the next winning flush retries the WRITE. The bits are already safe in the
-		// shared buffer (this thread's copy is cleared), so the retry re-reads them from there
-		// rather than depending on anything held on this thread.
-		for (const s of slots) pendingWrite.add(s);
-		throw e;
+	// Clear the debt slot by slot AS EACH ONE LANDS, rather than clearing up front and restoring
+	// on failure. A failure part-way through would otherwise re-queue the slots that had already
+	// been written, and each of those is another full-size replicated row — re-spending exactly
+	// what this function exists to save. Whatever remains in the set is precisely what did not
+	// land, and the next winning flush retries only that.
+	for (const s of [...pendingWrite]) {
+		await persist(s);
+		pendingWrite.delete(s);
 	}
 }
 
-async function persist(slots) {
+async function persist(s) {
 	const VisitFilter = table();
 	const node = server.hostname;
-	for (const s of slots) {
-		const bits = new Uint8Array(sharedSlice(s));
-		const id = `${s}|${node}`;
-		// Read-merge-write of this node's own row (node is in the key, so the read is local and
-		// cannot take a cross-node fetch), serialized against sibling workers by the cross-worker
-		// mutex. The read is still required even though the shared buffer holds this process's
-		// full accumulation: after a restart the buffer starts empty while the ROW still holds
-		// everything written before it, and a plain overwrite would drop that history — again a
-		// false negative. Same discipline as crawlStats.persist.
-		const mutex = getMutex(`visitFilter/${s}`);
-		await mutex.lock();
-		try {
-			const existing = await VisitFilter.get(id);
-			const merged = existing?.bits ? new Uint8Array(existing.bits) : newSlice();
-			if (merged.length !== bits.length) {
-				// bitsPerSlice changed under us; the old row is a different shape. Start clean
-				// rather than merging garbage — one slice of undercount, self-heals next slot.
-				await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(bits), updatedAt: Date.now() });
-				continue;
-			}
-			for (let i = 0; i < merged.length; i++) merged[i] |= bits[i];
-			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
-		} finally {
-			mutex.unlock();
+	const bits = new Uint8Array(sharedSlice(s));
+	const id = `${s}|${node}`;
+	// Read-merge-write of this node's own row (node is in the key, so the read is local and
+	// cannot take a cross-node fetch), serialized against sibling workers by the cross-worker
+	// mutex. The read is still required even though the shared buffer holds this process's full
+	// accumulation: after a restart the buffer starts empty while the ROW still holds everything
+	// written before it, and a plain overwrite would drop that history — again a false negative.
+	// Same discipline as crawlStats.persist.
+	const mutex = getMutex(`visitFilter/${s}`);
+	await mutex.lock();
+	try {
+		const existing = await VisitFilter.get(id);
+		const merged = existing?.bits ? new Uint8Array(existing.bits) : newSlice();
+		if (merged.length !== bits.length) {
+			// bitsPerSlice changed under us; the old row is a different shape. Start clean rather
+			// than merging garbage — one slice of undercount, self-heals next slot.
+			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(bits), updatedAt: Date.now() });
+			return;
 		}
+		for (let i = 0; i < merged.length; i++) merged[i] |= bits[i];
+		await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
+	} finally {
+		mutex.unlock();
 	}
 }
 
