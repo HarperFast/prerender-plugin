@@ -264,7 +264,9 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		const rescue = await rescueFromOwner({ cacheKey, cacheUrl });
 		if (rescue.ok) {
 			const note = timedOut ? `read exceeded ${config.page.blobReadBudgetMs}ms` : 'unreadable';
-			logger.warn(`cached blob ${note} for ${cacheKey}; served the owner's copy (${rescue.owner})`);
+			logger.warn(
+				`cached blob ${note} for ${cacheKey}; served the owner's copy (${rescue.owner}, ${Math.round(rescue.ms)}ms)`
+			);
 			info.cachedBody = rescue.body;
 			// Its own status rather than the freshness verdict: the rescue rate is the number an
 			// operator trends against replication churn, and it must not inflate 'hit'.

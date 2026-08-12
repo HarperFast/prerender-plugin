@@ -51,13 +51,25 @@ export const peerTokenMatches = (provided) => {
 	return timingSafeEqual(digest(provided), digest(expected));
 };
 
-// Pooled keep-alive connections to peers (peers are a handful of fixed origins, so the pool is
-// tiny and warm). The cap matters for the failure mode this feature exists in: during a base
-// copy MANY reads trip the budget at once, and without a cap each would open its own socket to
-// the same owner. Excess requests queue on the pool instead — bounded by `timeoutMs` like
-// everything else here. Lazily built: config is not applied at import time.
+// Pooled keep-alive connections to peers (peers are a handful of fixed origins, so the pool
+// stays warm between bursts). Deliberately UNCAPPED (undici's default): v0.41.0 capped this at
+// 4 connections per owner to bound sockets during a copy storm, and production showed that to
+// be exactly backwards — rescue demand arrives in bursts (12-15/min measured mid-copy), the
+// queued requests burned their `timeoutMs` deadline waiting for a pool slot, and the misses
+// surfaced as "peer timed out" origin fallbacks. A rescue that queues is a rescue that fails;
+// an extra socket to our own cluster node is cheap. Concurrency stays bounded in practice by
+// the serve path itself (only blob-failure requests reach here, each bounded by `timeoutMs`).
+// Lazily built: config is not applied at import time.
+//
+// `maxHeaderSize` matches upstream.js rather than undici's 16 KiB default. The rescue response
+// carries the record's stored head serialized inside one `x-prerender-page` header; stored heads
+// are the render path's small allowlist (~300 bytes measured live), so the default would in fact
+// suffice today — but an oversized head here would DESTROY the socket as UND_ERR_HEADERS_OVERFLOW
+// (the exact failure origin.maxResponseHeaderBytes exists for), so bound it by the same config
+// instead of a second, silently different ceiling. Same restart-scoped semantics as upstream.js:
+// the value is fixed at first construction.
 let agent;
-const dispatcher = () => (agent ??= new Agent({ connections: 4 }));
+const dispatcher = () => (agent ??= new Agent({ maxHeaderSize: config.origin.maxResponseHeaderBytes }));
 
 /**
  * Fetch `cacheKey`'s stored page from the residency owner of `cacheUrl`.
@@ -83,6 +95,11 @@ export const rescueFromOwner = async ({ cacheKey, cacheUrl }) => {
 	const timer = setTimeout(() => controller.abort(), config.peerRescue.timeoutMs);
 	timer.unref?.();
 
+	// Timed because nothing else measures the client side of a rescue: the owner's
+	// Server-Timing covers only its handler, and the network hop (cross-region TLS + a
+	// ~200KB body) is most of the cost. The caller logs it, which is what makes a slow
+	// peer visible BEFORE it becomes a "peer timed out" miss.
+	const started = performance.now();
 	try {
 		// undici.request rather than fetch: it sends no implicit accept-encoding, so the stored
 		// bytes cross the wire exactly as written — they must stay paired with the stored
@@ -109,7 +126,7 @@ export const rescueFromOwner = async ({ cacheKey, cacheUrl }) => {
 		}
 
 		const body = Buffer.from(await response.body.arrayBuffer());
-		return { ok: true, owner, page, body };
+		return { ok: true, owner, page, body, ms: performance.now() - started };
 	} catch (e) {
 		// Read with `?.` rather than gated on instanceof — anything can be thrown, and an abort's
 		// prototype chain differs across runtimes (see the same handling in util/peer.js).
