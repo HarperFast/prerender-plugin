@@ -33,6 +33,11 @@
  * "halve every interval". `maxFastFraction` is the backstop, and the level histogram this
  * module logs is the early warning. Never ship this without watching that number.
  *
+ * The backstop only works if it measures the LADDER. It is scored over graded decisions —
+ * the ones where a faster rung existed and the visit filter was warm — never over routes
+ * already granted a cadence at or below the fastest rung, which the ladder was never offered
+ * a choice about. See the stats block below.
+ *
  * DRY RUN. With `dryRun` on (the default), every decision is computed and counted but the
  * returned interval is the unchanged base — so a week of production traffic tells you the
  * steady-state level distribution, and therefore the render budget, BEFORE paying for it.
@@ -112,10 +117,28 @@ export const visitProbe = {
 };
 
 // Per-interval decision counters, drained by `drainStats` into the periodic histogram log.
+//
+// GRADED vs. UNGRADED. Only the decisions the ladder actually got to make — `promoted`,
+// `demoted`, `held` — carry a level, and only they feed the histogram and `fastFraction`.
+// The two early returns below are not ladder outcomes: `singleRung` had no faster rung to
+// move to (the route's own cadence is the whole ladder) and `skippedCold` had no visit data
+// to decide on. Counting them as levels was the defect in #86 — a deployment with a 6h route
+// reported that route's every reschedule as "landed below 12h", so `fastFraction` had a
+// structural floor set by the route mix and `maxFastFraction` warned forever about a hot set
+// that had not moved at all.
 let stats = newStats();
 
 function newStats() {
-	return { promoted: 0, demoted: 0, held: 0, levels: new Map(), skippedCold: 0 };
+	return {
+		promoted: 0,
+		demoted: 0,
+		held: 0,
+		levels: new Map(),
+		skippedCold: 0,
+		singleRung: 0,
+		fast: 0,
+		promotedFast: 0,
+	};
 }
 
 const bump = (interval) => stats.levels.set(interval, (stats.levels.get(interval) ?? 0) + 1);
@@ -127,6 +150,9 @@ const bump = (interval) => stats.levels.set(interval, (stats.levels.get(interval
  * Returns `{ interval, level, action }`. `interval` is what the caller should schedule with —
  * in dry-run that is always `base`, while `level` still reports what the ladder WOULD have
  * chosen, so callers can log the counterfactual without acting on it.
+ *
+ * `action` is one of `off` (ladder disabled), `single-rung` / `cold` (no decision was
+ * possible — see the stats block above), or `promoted` / `demoted` / `held`.
  */
 export function decideInterval(url, base, current, nowMs = Date.now(), probe = visitProbe) {
 	const demand = config.render.demand;
@@ -137,12 +163,12 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
 	// The rungs this base can actually occupy: everything faster than it, plus base itself
 	// as the resting state. A single entry means no configured rung is faster than the
 	// granted cadence — nothing to reallocate, so skip the probe (and the cold hold: there
-	// is no move to hold back).
+	// is no move to hold back). Counted apart from `held`: the ladder did not hold this
+	// target at its rung, it was never offered another one.
 	const list = effectiveLadder(Number(base));
 	if (list.length === 1) {
-		stats.held++;
-		bump(base);
-		return { interval: base, level: base, action: 'held' };
+		stats.singleRung++;
+		return { interval: base, level: base, action: 'single-rung' };
 	}
 
 	// A cold read-side union would read as "nothing was visited anywhere", which would demote
@@ -152,7 +178,6 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
 		// branch skips — without this the union never warms and the ladder never engages.
 		probe.warm(nowMs);
 		stats.skippedCold++;
-		bump(base);
 		return { interval: base, level: base, action: 'cold' };
 	}
 
@@ -180,28 +205,44 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
 
 	const level = list[to];
 	bump(level);
+	// Classified here rather than derived from the histogram at drain time, so a live
+	// `maxFastInterval` change grades each decision against the limit in force when it was
+	// made, and so the fast counters cannot drift from the set of decisions that produced them.
+	if (level < demand.maxFastInterval) {
+		stats.fast++;
+		if (action === 'promoted') stats.promotedFast++;
+	}
 	return { interval: demand.dryRun ? base : level, level, action };
 }
 
 /**
- * Drain and return the interval's decision counters. The level histogram is the number that
- * says whether the split is still affordable — `fastFraction` is the share of decisions
- * landing below `maxFastInterval`, which is what `maxFastFraction` bounds.
+ * Drain and return the interval's decision counters.
+ *
+ * `graded` is the decisions the ladder actually made; `total` adds the two no-decision paths.
+ * `fastFraction` — what `maxFastFraction` bounds — is `fast / graded`: the share of LADDER
+ * decisions that landed below `maxFastInterval`. Deliberately decision-weighted, because
+ * decisions are renders: a target sitting on the 6h rung emits eight times the decisions of
+ * one at 48h, so this reads as the share of the eligible render budget spent on fast rungs,
+ * which is the thing `maxFastFraction` is trying to cap. Weighting by corpus instead would
+ * report a number that no longer tracks cost.
+ *
+ * `promotedFast` is the movement counter beside it: promotions ONTO a fast rung, i.e. budget
+ * the ladder is actively reallocating this interval, zero in a settled steady state.
  */
 export function drainStats() {
 	const out = stats;
 	stats = newStats();
-	const total = [...out.levels.values()].reduce((a, b) => a + b, 0);
-	const fastLimit = config.render.demand.maxFastInterval;
-	let fast = 0;
-	for (const [interval, n] of out.levels) if (interval < fastLimit) fast += n;
+	const graded = out.promoted + out.demoted + out.held;
 	return {
 		promoted: out.promoted,
 		demoted: out.demoted,
 		held: out.held,
 		skippedCold: out.skippedCold,
-		total,
-		fastFraction: total ? fast / total : 0,
+		singleRung: out.singleRung,
+		promotedFast: out.promotedFast,
+		graded,
+		total: graded + out.skippedCold + out.singleRung,
+		fastFraction: graded ? out.fast / graded : 0,
 		levels: Object.fromEntries([...out.levels].sort((a, b) => a[0] - b[0])),
 	};
 }
@@ -238,6 +279,8 @@ export function logDemandStats() {
 		metrics.demandLadder(s.demoted, 'demoted');
 		metrics.demandLadder(s.held, 'held');
 		metrics.demandLadder(s.skippedCold, 'skipped_cold');
+		metrics.demandLadder(s.singleRung, 'single_rung');
+		metrics.demandLadder(s.promotedFast, 'promoted_fast');
 		metrics.demandLadder(s.fastFraction, 'fast_fraction');
 		metrics.demandLadder(fill, 'fill');
 	} catch (e) {
@@ -247,10 +290,15 @@ export function logDemandStats() {
 	const line = {
 		dryRun: demand.dryRun,
 		decisions: s.total,
+		// The denominator of fastFraction: decisions the ladder actually made. The two
+		// counters after it are the rest of `decisions`, and neither is a ladder outcome.
+		graded: s.graded,
 		promoted: s.promoted,
 		demoted: s.demoted,
 		held: s.held,
 		skippedCold: s.skippedCold,
+		singleRung: s.singleRung,
+		promotedFast: s.promotedFast,
 		fastFraction: Number(s.fastFraction.toFixed(4)),
 		// Set-bit fraction of the newest union slot — the sizing early warning. A k-hash probe
 		// false-positives at ~fill^k (k=7: fill 0.5 ≈ 0.8%, fill 0.88 ≈ 40%), and false
@@ -260,7 +308,7 @@ export function logDemandStats() {
 	};
 	if (s.fastFraction > demand.maxFastFraction) {
 		logger.warn(
-			`demand ladder: ${(s.fastFraction * 100).toFixed(1)}% of decisions landed below ` +
+			`demand ladder: ${(s.fastFraction * 100).toFixed(1)}% of ${s.graded} ladder decisions landed below ` +
 				`${Math.round(demand.maxFastInterval / 3600000)}h (limit ${(demand.maxFastFraction * 100).toFixed(1)}%) — ` +
 				`the hot set has outgrown the configured budget`,
 			line

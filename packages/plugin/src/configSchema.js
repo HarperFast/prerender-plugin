@@ -661,8 +661,23 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				maxFastFraction: option(
 					0.05,
-					'Budget backstop: the share of decisions allowed to land on a fast rung. Exceeding it is ' +
-						'logged as a warning — the hot set has grown past what the ladder was sized for.',
+					'Budget backstop: the share of LADDER decisions allowed to land on a fast rung. ' +
+						'Exceeding it is logged as a warning — the hot set has grown past what the ladder was ' +
+						'sized for.\n\n' +
+						'The denominator is the `graded` count in the histogram — promoted + demoted + held — ' +
+						'not every reschedule. Decisions where the ladder had no choice are excluded: a route ' +
+						'whose granted cadence is at or below the fastest rung has a one-entry effective ladder ' +
+						'(`singleRung`), and a cold visit filter holds without deciding (`skippedCold`). ' +
+						'Counting those made the number a readout of the ROUTE MIX — a deployment with any ' +
+						'route below `maxFastInterval` had a structural floor it could never get under, so the ' +
+						'warning fired continuously with zero promotions.\n\n' +
+						'Within the graded set it is decision-weighted, which is what a budget cap wants: ' +
+						'decisions are renders, so a target on the 6h rung contributes 8x one at 48h and the ' +
+						'fraction reads as the share of the eligible render BUDGET spent on fast rungs. At the ' +
+						'0.05 default with the default ladder, that is roughly 0.65% of eligible targets fully ' +
+						'promoted to 6h — near the ~0.5% hot fraction the split was sized for. Beside it, ' +
+						'`promotedFast` counts promotions ONTO a fast rung: the budget being reallocated right ' +
+						'now, and zero once the distribution settles.',
 					{ min: 0, max: 1 }
 				),
 				sliceMs: option(

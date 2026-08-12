@@ -57,7 +57,10 @@ test('a cold filter holds rather than demoting the whole corpus', () => {
 	const r = decideInterval('u', 24 * H, 6 * H, Date.now(), probeOf({ ready: false }));
 	assert.equal(r.action, 'cold');
 	assert.equal(r.interval, 24 * H);
-	assert.equal(drainStats().skippedCold, 1);
+	const s = drainStats();
+	assert.equal(s.skippedCold, 1);
+	assert.equal(s.graded, 0, 'a hold with no visit data is not a ladder decision');
+	assert.deepEqual(s.levels, {}, 'and carries no level');
 });
 
 test('an unvisited target demotes one rung per cycle, stopping at the base ceiling', () => {
@@ -93,10 +96,11 @@ test('promotion uses the CANDIDATE interval, not the current one', () => {
 });
 
 test('the route interval is a ceiling — the ladder never schedules slower than the route', () => {
-	// A route granting 6h has nowhere to demote to, even with zero traffic.
+	// A route granting 6h has nowhere to demote to, even with zero traffic — and nowhere to
+	// promote to either, so this is not a ladder decision at all.
 	const r = decideInterval('u', 6 * H, 6 * H, Date.now(), never);
 	assert.equal(r.level, 6 * H);
-	assert.equal(r.action, 'held');
+	assert.equal(r.action, 'single-rung');
 });
 
 test('dry run reports the level it would pick but schedules the base', () => {
@@ -121,7 +125,7 @@ test('an off-ladder BASE is never snapped to a rung — it rests at its own cade
 	const fast = decideInterval('u', 1 * H, undefined, Date.now(), always);
 	assert.equal(fast.interval, 1 * H);
 	assert.equal(fast.level, 1 * H);
-	assert.equal(fast.action, 'held');
+	assert.equal(fast.action, 'single-rung');
 
 	// Above the slowest rung: an UNVISITED weekly (168h) route must not be pulled to the 48h
 	// rung — a 3.5x render-cost multiplier `maxFastFraction` cannot see, because 48h is not
@@ -153,6 +157,50 @@ test('fastFraction counts rungs below maxFastInterval', () => {
 	decideInterval('b', 48 * H, 48 * H, Date.now(), never); // stays 48h -> not fast
 	const s = drainStats();
 	assert.equal(s.total, 2);
+	assert.equal(s.graded, 2);
+	assert.equal(s.fastFraction, 0.5);
+});
+
+test('fastFraction excludes decisions the ladder never made', () => {
+	// The #86 regression. A route granted a cadence at or below the fastest rung returns before
+	// any ladder logic runs — counting those as "landed below 12h" gave fastFraction a floor set
+	// by the ROUTE MIX, so the guardrail warned continuously with zero promotions.
+	const now = Date.now();
+	for (let i = 0; i < 8; i++) decideInterval(`catalog${i}`, 6 * H, 6 * H, now, always); // 6h route
+	decideInterval('pdp-a', 48 * H, 48 * H, now, never); // graded, rests at 48h
+	decideInterval('pdp-b', 48 * H, 48 * H, now, never);
+
+	const s = drainStats();
+	assert.equal(s.singleRung, 8);
+	assert.equal(s.graded, 2, 'only the two PDP decisions were the ladder’s to make');
+	assert.equal(s.total, 10, 'but every decision is still reported');
+	assert.equal(s.held, 2, 'a single-rung route is not a hold — the ladder held nothing back');
+	assert.equal(s.fastFraction, 0, 'zero promotions must read as zero fast');
+	assert.deepEqual(s.levels, { [48 * H]: 2 }, 'the histogram is the ladder’s own decisions');
+});
+
+test('promotedFast counts promotions ONTO a fast rung, not every promotion', () => {
+	const now = Date.now();
+	decideInterval('a', 48 * H, 48 * H, now, always); // 48h -> 24h, a promotion but not fast
+	decideInterval('b', 48 * H, 24 * H, now, always); // 24h -> 12h, still not fast (12h is the limit)
+	decideInterval('c', 48 * H, 12 * H, now, always); // 12h -> 6h, fast
+
+	const s = drainStats();
+	assert.equal(s.promoted, 3);
+	assert.equal(s.promotedFast, 1);
+	assert.equal(s.fastFraction, 1 / 3);
+});
+
+test('fastFraction grades each decision against the limit in force when it was made', () => {
+	// Classified at decision time, not derived from the histogram at drain — so a live config
+	// change cannot retroactively re-grade decisions taken under the old limit.
+	const now = Date.now();
+	decideInterval('a', 48 * H, 6 * H, now, always); // fast under the 12h limit
+	setDemand({ maxFastInterval: 1 * H }); // now nothing on the default ladder is "fast"
+	decideInterval('b', 48 * H, 6 * H, now, always);
+
+	const s = drainStats();
+	assert.equal(s.graded, 2);
 	assert.equal(s.fastFraction, 0.5);
 });
 

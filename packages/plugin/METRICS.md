@@ -135,6 +135,16 @@ Notes that bite:
   before v0.34.0. The scan is capped by `management.scanCap`: a backlog past the cap reports the cap.
 - **`queue_health` needs `management.snapshotTableCounts` only for the table counts**; the gauges
   themselves survive with it off (that flag exists to dodge a `getRecordCount` stall).
+- **`prerender_ops`' `demand_fast_fraction` is scored over GRADED decisions only** —
+  `demand_promoted + demand_demoted + demand_held`. The other two decision counters are the paths
+  where the ladder had no choice and so are excluded from both halves of the ratio:
+  `demand_single_rung` (the route's own cadence is at or below the fastest rung, so its effective
+  ladder has one entry) and `demand_skipped_cold` (the visit filter was not warm). Including them —
+  the behaviour before v0.43.0 — made the number a readout of the route mix: any route configured
+  below `maxFastInterval` put a floor under it that no amount of correct ladder behaviour could get
+  under, and `maxFastFraction` warned continuously against zero promotions. Numbers spanning that
+  deploy are not comparable. `demand_promoted_fast` is the companion movement counter (promotions
+  onto a fast rung); it settles to zero while `fast_fraction` holds at whatever the ladder bought.
 - **`invalidation_reenqueue` (a `prerender_ops` series) is off by default.** No rows means the feature is disabled.
 - **`render` `time_ms` carries a numeric statusCode** in its method slot, so it arrives as a
   numeric-looking label (`origin_fetch`'s path too; its `0` means the fetch itself failed before
