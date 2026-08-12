@@ -340,6 +340,57 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	peerRescue: group(
+		'Cluster peer rescue for the serve path. A cache serve reads the stored body before committing ' +
+			'a status; when that LOCAL read fails — the blob file is gone (a dangling reference), or the ' +
+			'read outlived `page.blobReadBudgetMs` (a base copy is streaming that blob) — the bytes are ' +
+			'fetched from the URL’s residency owner over the cluster’s own HTTPS instead of proxying the ' +
+			'origin. The owner granted every render claim for its keys, so its blob is a written original, ' +
+			'never a received replica: it is the node most likely to hold complete bytes, a few ' +
+			'milliseconds away, and the rescued response is the real prerendered snapshot rather than raw ' +
+			'un-prerendered origin markup. The origin remains the backstop whenever the rescue misses ' +
+			'(the owner is this node, unreachable, past `timeoutMs`, or its own read fails).\n\n' +
+			'Enabling also serves the endpoint peers call (`GET /prerender_peer/page`), gated on `token`. ' +
+			'Set the SAME token on every node: a node with a different or empty token answers 403/404 and ' +
+			'its peers simply fall back to the origin, so a staggered rollout degrades softly rather than ' +
+			'breaking serves.',
+		{
+			enabled: option(
+				false,
+				'Enable the rescue (and the endpoint that serves peers). Necessary but not sufficient — a ' +
+					'non-empty `token` (or a `valueEnv` that resolves to one) is also required, so this cannot ' +
+					'open an unauthenticated endpoint on its own.'
+			),
+			header: option('x-harper-peer-token', 'Request header carrying the shared token on peer calls.', {
+				nonEmpty: true,
+			}),
+			token: option(
+				'',
+				'The shared cluster secret, identical on every node. **Required** — there is no ' +
+					'unauthenticated mode: an empty token leaves the feature DISABLED (no rescues attempted, the ' +
+					'endpoint answers 404) rather than serving cached pages to anyone who finds the path. ' +
+					'Compared timing-safely. Prefer `valueEnv` so the secret stays out of config.yaml, and never ' +
+					'commit a guessable placeholder.',
+				{ secret: true }
+			),
+			valueEnv: option(
+				'',
+				'If set, the token is sourced from this environment variable at config-apply time and takes ' +
+					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.'
+			),
+			timeoutMs: option(
+				500,
+				'Deadline for the whole peer fetch (connect through body). A healthy rescue is a few ' +
+					'milliseconds of intra-cluster round trip plus the owner’s sub-millisecond blob read, so ' +
+					'this only trips when the owner is down, saturated, or mid-copy itself — at which point the ' +
+					'origin fallback proceeds exactly as it would have without the rescue. Keep it in the same ' +
+					'order as `page.blobReadBudgetMs`: the two are additive on the worst-case path ' +
+					'(budget + rescue timeout + origin).',
+				{ unit: 'ms', min: 1 }
+			),
+		}
+	),
+
 	management: group(
 		'Management API + UI, served at the fixed path `/prerender_admin` (resource endpoint names are ' +
 			'fixed, like the database/table names). Gated on Harper’s own authentication: every endpoint ' +
@@ -400,6 +451,28 @@ export const configSchema = group('Prerender plugin configuration.', {
 		ttl: option(DAY, 'Default cached-page TTL.', { unit: 'ms', min: 1 }),
 		minTtl: option(6 * HOUR, 'Floor for sitemap-derived TTLs.', { unit: 'ms', min: 1 }),
 		swrTtl: option(3 * HOUR, 'Stale-while-revalidate window.', { unit: 'ms', min: 0 }),
+		blobReadBudgetMs: option(
+			500,
+			'How long a cache serve may spend reading the stored body before giving up and proxying to ' +
+				'the origin instead.\n\n' +
+				'The body is read to completion before the response commits a status, so that a record whose ' +
+				'blob file is gone becomes an origin serve rather than a truncated 200. Without a budget that ' +
+				'read inherits Harper’s own retry window (`storage_blobReadTimeout`, default 20s): a blob ' +
+				'whose bytes are still arriving — which any base copy produces in quantity — puts the reader ' +
+				'into an incomplete-content retry loop, and the crawler waits it out. Measured on a 4-node ' +
+				'production cluster mid-copy: a cohort of cache hits averaging 13.6s, p95 17.5s, ~13% of hits ' +
+				'on the worst node, while the same node’s median hit was 2.3ms.\n\n' +
+				'A healthy read is nowhere near this: p50 0.75ms and p99 0.94ms for a ~223KB body on cold ' +
+				'NVMe, so 500ms is ~500x the p99 and only a blob that is genuinely stuck can trip it. Keep it ' +
+				'BELOW typical origin latency (~500-600ms here) so falling back is faster than waiting; ' +
+				'raising it past `storage_blobReadTimeout` disables it entirely. 0 disables the budget and ' +
+				'restores the unbounded wait.\n\n' +
+				'Capped at 2147483647 because `setTimeout` stores its delay as a signed 32-bit int: a larger ' +
+				'value does not mean "effectively never", it makes Node warn and fire the callback after 1ms — ' +
+				'so a fat-fingered budget would time out EVERY cache hit and send all traffic to the origin. ' +
+				'The cap turns that into a rejected value that keeps the default.',
+			{ unit: 'ms', min: 0, max: 2147483647 }
+		),
 	}),
 
 	invalidation: group(

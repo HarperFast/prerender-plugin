@@ -169,6 +169,37 @@ test('renderNow with a token reports nothing', () => {
 	assert.equal(findingKeys().includes('renderNow.token'), false);
 });
 
+test('peerRescue enabled without a token reports the feature as disabled', () => {
+	// Same contract as the renderNow finding: mirror the runtime gate (both the rescue client and
+	// the /prerender_peer/page endpoint fail closed), so the operator learns the feature is OFF
+	// rather than hunting a nonexistent exposure.
+	applyOptions({ peerRescue: { enabled: true } });
+	const finding = collectConfigWarnings().find((f) => f.key === 'peerRescue.token');
+	assert.ok(finding, 'expected a peerRescue.token finding');
+	assert.match(finding.message, /DISABLED/);
+	assert.match(finding.message, /fails closed/);
+});
+
+test('an unresolved peerRescue valueEnv is named in the warning', () => {
+	delete process.env.__TEST_PEER_RESCUE_ABSENT;
+	applyOptions({ peerRescue: { enabled: true, valueEnv: '__TEST_PEER_RESCUE_ABSENT' } });
+	const finding = collectConfigWarnings().find((f) => f.key === 'peerRescue.token');
+	assert.ok(finding, 'expected a peerRescue.token finding');
+	assert.match(finding.message, /__TEST_PEER_RESCUE_ABSENT/);
+	assert.match(finding.message, /DISABLED/);
+});
+
+test('peerRescue with a token reports nothing, and valueEnv overrides the literal', () => {
+	process.env.__TEST_PEER_RESCUE_TOKEN = 'env-cluster-secret';
+	try {
+		applyOptions({ peerRescue: { enabled: true, token: 'literal', valueEnv: '__TEST_PEER_RESCUE_TOKEN' } });
+		assert.equal(findingKeys().includes('peerRescue.token'), false);
+		assert.equal(config.peerRescue.token, 'env-cluster-secret');
+	} finally {
+		delete process.env.__TEST_PEER_RESCUE_TOKEN;
+	}
+});
+
 test('applyOptions sources the security token from valueEnv (overriding the literal)', () => {
 	process.env.__TEST_PR_TOKEN = 'env-secret';
 	try {
@@ -230,7 +261,7 @@ test('defaultConfig returns fresh deep copies (no shared references)', () => {
 });
 
 test('secret and restart paths are what the schema declares', () => {
-	assert.deepEqual(secretPaths().sort(), ['origin.securityToken.value', 'renderNow.token']);
+	assert.deepEqual(secretPaths().sort(), ['origin.securityToken.value', 'peerRescue.token', 'renderNow.token']);
 	assert.deepEqual(restartPaths().sort(), [
 		'origin.maxResponseHeaderBytes',
 		// The render-lease shared buffer is sized by the first allocation in the process, so a live
