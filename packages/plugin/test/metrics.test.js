@@ -114,13 +114,14 @@ test('render carries both the duration and the outcome, so the render panel read
 test('queue_health puts the series in the path slot; the ladder is a prerender_ops demand_* series', () => {
 	const q = emitted(() => metrics.queueHealth(42, 'overdue'));
 	assert.deepEqual([q.value, q.metric, q.path], [42, 'queue_health', 'overdue']);
-	const d = emitted(() => metrics.demandLadder(0.03, 'fast_fraction'));
-	assert.deepEqual([d.value, d.metric, d.path], [0.03, 'prerender_ops', 'demand_fast_fraction']);
+	const d = emitted(() => metrics.demandLadder(0.03, 'fill'));
+	assert.deepEqual([d.value, d.metric, d.path], [0.03, 'prerender_ops', 'demand_fill']);
 });
 
 test('every ladder series the emitter can produce is declared on prerender_ops', () => {
-	for (const series of ['promoted', 'demoted', 'held', 'skipped_cold', 'fast_fraction', 'fill']) {
-		const e = emitted(() => metrics.demandLadder(1, series));
+	const series = ['promoted', 'demoted', 'held', 'skipped_cold', 'single_rung', 'promoted_fast', 'fast', 'graded'];
+	for (const s of [...series, 'fill']) {
+		const e = emitted(() => metrics.demandLadder(1, s));
 		assert.ok(METRICS.prerender_ops.dimensions.path.values.includes(e.path), `prerender_ops missing ${e.path}`);
 	}
 });

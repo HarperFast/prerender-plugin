@@ -677,7 +677,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'0.05 default with the default ladder, that is roughly 0.65% of eligible targets fully ' +
 						'promoted to 6h — near the ~0.5% hot fraction the split was sized for. Beside it, ' +
 						'`promotedFast` counts promotions ONTO a fast rung: the budget being reallocated right ' +
-						'now, and zero once the distribution settles.',
+						'now, and zero once the distribution settles.\n\n' +
+						'ALERT ON THE POOLED RATIO, not on any single emitted number: ' +
+						'`sum(demand_fast) / sum(demand_graded)` across workers and nodes. The counters are ' +
+						'per worker per interval and worker volumes are very unequal (production has had ' +
+						'graded 3 on one worker and 50 on a sibling in the same interval), so averaging ' +
+						'per-worker ratios overstates the result — 1/3 and 1/50 average to 0.175 against a ' +
+						'pooled 0.038. The per-worker `fastFraction` in the log line is a diagnostic for that ' +
+						'worker; its warning is suppressed below `1 / maxFastFraction` graded decisions, where ' +
+						'a single fast decision would exceed the limit on its own and the ratio therefore says ' +
+						'nothing.',
 					{ min: 0, max: 1 }
 				),
 				sliceMs: option(

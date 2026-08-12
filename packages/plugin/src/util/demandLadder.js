@@ -38,6 +38,12 @@
  * already granted a cadence at or below the fastest rung, which the ladder was never offered
  * a choice about. See the stats block below.
  *
+ * And it only works if it is POOLED. Every counter here is per worker per interval, and
+ * worker decision volumes are wildly unequal, so the guardrail ships as the raw `fast` and
+ * `graded` counters and the ratio is taken at query time over their sums. A per-worker ratio
+ * can only be aggregated by averaging ratios, which systematically overstates the number by
+ * weighting the workers with the least evidence the same as the ones with the most.
+ *
  * DRY RUN. With `dryRun` on (the default), every decision is computed and counted but the
  * returned interval is the unchanged base — so a week of production traffic tells you the
  * steady-state level distribution, and therefore the render budget, BEFORE paying for it.
@@ -228,12 +234,17 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
  *
  * `promotedFast` is the movement counter beside it: promotions ONTO a fast rung, i.e. budget
  * the ladder is actively reallocating this interval, zero in a settled steady state.
+ *
+ * `fastFraction` here is THIS WORKER's ratio over THIS interval, which is a diagnostic, not
+ * the guardrail. The guardrail is the pooled ratio, `sum(fast) / sum(graded)` over the raw
+ * counters — see `logDemandStats`.
  */
 export function drainStats() {
 	const out = stats;
 	stats = newStats();
 	const graded = out.promoted + out.demoted + out.held;
 	return {
+		fast: out.fast,
 		promoted: out.promoted,
 		demoted: out.demoted,
 		held: out.held,
@@ -270,10 +281,18 @@ export function logDemandStats() {
 	const fill = newestFill();
 
 	// The same numbers as METRICS, not just a log line — with the ladder enabled without a
-	// dry-run week, this histogram is the only guardrail, and a guardrail nobody can alert on
-	// is a postmortem exhibit. Counters sum correctly across workers; fastFraction and fill are
-	// value metrics on the same buffered path as page_age. Guarded: losing a gauge must never
-	// cost the log line, which is still the richer record (per-level histogram).
+	// dry-run week, this is the only guardrail, and a guardrail nobody can alert on is a
+	// postmortem exhibit. Guarded: losing a metric must never cost the log line, which is
+	// still the richer record (per-level histogram).
+	//
+	// The guardrail ships as its two COUNTERS, `fast` and `graded`, never as a ratio. These
+	// counters are per worker per interval, and workers see wildly unequal decision volumes —
+	// measured in production, one worker's interval had graded 3 while a sibling's had 50. A
+	// ratio emitted per worker can then only be consumed by AVERAGING ratios, and the average
+	// of ratios is not the ratio of sums: 1/3 and 1/50 average to 0.175, while the pooled truth
+	// is 2/53 = 0.038. That is a 4.6x overstatement of budget consumption, biased by exactly
+	// the workers with the least evidence. Summing counters and dividing at query time is
+	// correct across workers AND across nodes, which a gauge can never be.
 	try {
 		metrics.demandLadder(s.promoted, 'promoted');
 		metrics.demandLadder(s.demoted, 'demoted');
@@ -281,10 +300,11 @@ export function logDemandStats() {
 		metrics.demandLadder(s.skippedCold, 'skipped_cold');
 		metrics.demandLadder(s.singleRung, 'single_rung');
 		metrics.demandLadder(s.promotedFast, 'promoted_fast');
-		metrics.demandLadder(s.fastFraction, 'fast_fraction');
+		metrics.demandLadder(s.fast, 'fast');
+		metrics.demandLadder(s.graded, 'graded');
 		metrics.demandLadder(fill, 'fill');
 	} catch (e) {
-		logger.warn(`[prerender] demand_ladder gauges not recorded: ${e?.message ?? String(e)}`);
+		logger.warn(`[prerender] demand_ladder metrics not recorded: ${e?.message ?? String(e)}`);
 	}
 	const pretty = Object.fromEntries(Object.entries(s.levels).map(([ms, n]) => [`${Math.round(ms / 3600000)}h`, n]));
 	const line = {
@@ -299,6 +319,9 @@ export function logDemandStats() {
 		skippedCold: s.skippedCold,
 		singleRung: s.singleRung,
 		promotedFast: s.promotedFast,
+		fast: s.fast,
+		// This WORKER's ratio for this interval. The fleet number is the pooled
+		// sum(demand_fast)/sum(demand_graded) — see the metrics block above.
 		fastFraction: Number(s.fastFraction.toFixed(4)),
 		// Set-bit fraction of the newest union slot — the sizing early warning. A k-hash probe
 		// false-positives at ~fill^k (k=7: fill 0.5 ≈ 0.8%, fill 0.88 ≈ 40%), and false
@@ -306,17 +329,39 @@ export function logDemandStats() {
 		fill: Number(fill.toFixed(4)),
 		levels: pretty,
 	};
-	if (s.fastFraction > demand.maxFastFraction) {
+	if (s.graded >= minResolvableSample() && s.fastFraction > demand.maxFastFraction) {
 		logger.warn(
-			`demand ladder: ${(s.fastFraction * 100).toFixed(1)}% of ${s.graded} ladder decisions landed below ` +
-				`${Math.round(demand.maxFastInterval / 3600000)}h (limit ${(demand.maxFastFraction * 100).toFixed(1)}%) — ` +
-				`the hot set has outgrown the configured budget`,
+			`demand ladder: ${(s.fastFraction * 100).toFixed(1)}% of this worker's ${s.graded} ladder decisions ` +
+				`landed below ${Math.round(demand.maxFastInterval / 3600000)}h ` +
+				`(limit ${(demand.maxFastFraction * 100).toFixed(1)}%) — the hot set may be outgrowing the ` +
+				`configured budget; confirm against pooled demand_fast / demand_graded`,
 			line
 		);
 	} else {
 		(logger.notify ?? logger.info).call(logger, `[prerender] demand ladder ${JSON.stringify(line)}`);
 	}
 }
+
+/**
+ * The smallest `graded` count at which this worker's ratio can say anything about the limit.
+ *
+ * Below `1 / maxFastFraction` decisions, ONE fast decision already exceeds the limit by
+ * itself — the test then reports the arrival of a single promotion, not a budget trend, and
+ * at the 0.05 default that is any interval with fewer than 20 graded decisions. Production
+ * intervals per worker ran as low as 2, so without this floor the warning fires on samples
+ * that cannot carry it (every warning observed in the first hour of v0.43.0 was one of these).
+ *
+ * This is a floor on MEANINGLESSNESS, not a significance test: at exactly 1/maxFastFraction
+ * the warning still trips on two fast decisions, which is noisy but no longer vacuous. The
+ * statistically sound version of this question is the pooled counters, where the denominator
+ * is every worker on every node and the interval count is however long you chart it — which
+ * is why the metric, not this line, is the alert.
+ */
+const minResolvableSample = () => {
+	const limit = config.render.demand.maxFastFraction;
+	// A zero limit means "any fast decision is too many", which one decision does resolve.
+	return limit > 0 ? Math.ceil(1 / limit) : 1;
+};
 
 /** Arm the histogram timer once, on the first thread that decides anything. */
 export function armDemandStats() {

@@ -414,8 +414,10 @@ export const METRICS = Object.freeze({
 			'the serve path; it also quietly undermines invalidation.pad’s sizing); expect zero. demand_* = the ' +
 			'demand ladder’s guardrail: whether "promote the hot pages" is quietly becoming "halve every ' +
 			'interval"; recorded during dry runs too — the histogram is how a dry-run week is judged. ' +
-			'demand_fast_fraction is scored over GRADED decisions only (promoted + demoted + held); routes ' +
-			'with no rung faster than their own cadence (demand_single_rung) and cold-filter holds ' +
+			'The guardrail is the POOLED ratio demand_fast / demand_graded, summed across workers and ' +
+			'nodes and divided at query time — never a per-emitter ratio (see caveats). demand_graded ' +
+			'counts only decisions the ladder actually made (promoted + demoted + held); routes with no ' +
+			'rung faster than their own cadence (demand_single_rung) and cold-filter holds ' +
 			'(demand_skipped_cold) are not ladder outcomes and would otherwise make it a readout of the ' +
 			'route mix. demand_promoted_fast is the movement counter — budget being reallocated onto fast ' +
 			'rungs right now, zero once the distribution settles. ' +
@@ -426,10 +428,10 @@ export const METRICS = Object.freeze({
 			'is off by default, so no rows means disabled.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_* and the demand_* decision counters ' +
-			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast) are per-interval/per-run counts whose `total` is the meaningful ' +
+			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error and ' +
 			'invalidation_reenqueue are counters; config_warnings is a slow gauge (latest value); ' +
-			'demand_fast_fraction and demand_fill are per-worker gauges — average them, never sum ' +
+			'demand_fill is a per-worker gauge — average it, never sum ' +
 			'(fill = set-bit fraction of the newest visit-filter slot; a k=7 probe false-positives at ~fill^7, ' +
 			'and false positives promote pages nobody visited — watch it before trusting the histogram). ' +
 			'unrouted’s bucket slot is bounded by ingress.report.maxBuckets per class. The per-level ladder ' +
@@ -454,7 +456,8 @@ export const METRICS = Object.freeze({
 					'demand_skipped_cold',
 					'demand_single_rung',
 					'demand_promoted_fast',
-					'demand_fast_fraction',
+					'demand_fast',
+					'demand_graded',
 					'demand_fill',
 					'invalidation_error',
 					'invalidation_reenqueue',
@@ -464,9 +467,10 @@ export const METRICS = Object.freeze({
 					'sitemaps processed, targets created / re-attributed / unchanged / unlinked, sitemaps failed ' +
 					'and skipped. serve_error = committed-then-failed deliveries. config_warnings = finding count. ' +
 					'page_age_negative = negative-age samples discarded from page_age. demand_* = ladder decisions ' +
-					'(promoted/demoted/held are the graded ones and sum to fast_fraction’s denominator; ' +
-					'skipped_cold and single_rung are the two paths where no decision was possible), ' +
-					'promoted_fast = promotions onto a fast rung, plus its two sizing gauges (fast_fraction, fill). ' +
+					'(promoted/demoted/held are the graded ones and sum to demand_graded; skipped_cold and ' +
+					'single_rung are the two paths where no decision was possible), fast/graded = the ' +
+					'guardrail ratio\u2019s two halves, promoted_fast = promotions onto a fast rung, plus the ' +
+					'fill sizing gauge. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes.',
 			},
 			method: {
