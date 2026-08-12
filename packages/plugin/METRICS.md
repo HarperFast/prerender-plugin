@@ -129,22 +129,34 @@ Notes that bite:
   `analytics.recordUnmatched` for requests whose UA yields no name). No rows ≠ no traffic.
 - **`queue_health`'s snapshot series and `prerender_ops`' `demand_*` are gauges on a slow cadence**, one set per node
   (`management.backlogSnapshotInterval`, `render.demand.statsInterval`). Chart the latest value;
-  never sum a gauge over time. `overdue` sums across nodes, `fast_fraction` and `fill` average.
+  never sum a gauge over time. `overdue` sums across nodes and `fill` averages. The ladder's
+  decision counters are NOT gauges — they are per-interval counts and must be summed.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. The scan is capped by `management.scanCap`: a backlog past the cap reports the cap.
 - **`queue_health` needs `management.snapshotTableCounts` only for the table counts**; the gauges
   themselves survive with it off (that flag exists to dodge a `getRecordCount` stall).
-- **`prerender_ops`' `demand_fast_fraction` is scored over GRADED decisions only** —
-  `demand_promoted + demand_demoted + demand_held`. The other two decision counters are the paths
-  where the ladder had no choice and so are excluded from both halves of the ratio:
-  `demand_single_rung` (the route's own cadence is at or below the fastest rung, so its effective
-  ladder has one entry) and `demand_skipped_cold` (the visit filter was not warm). Including them —
-  the behaviour before v0.43.0 — made the number a readout of the route mix: any route configured
-  below `maxFastInterval` put a floor under it that no amount of correct ladder behaviour could get
-  under, and `maxFastFraction` warned continuously against zero promotions. Numbers spanning that
-  deploy are not comparable. `demand_promoted_fast` is the companion movement counter (promotions
-  onto a fast rung); it settles to zero while `fast_fraction` holds at whatever the ladder bought.
+- **The demand-ladder guardrail is `sum(demand_fast) / sum(demand_graded)`** — pool the counters
+  across workers and nodes, divide at query time. Do **not** alert on a per-emitter ratio. The
+  counters are per worker per interval and worker volumes are very unequal (production has shown
+  `graded: 3` on one worker against `50` on a sibling in the same interval), so averaging per-worker
+  ratios weights the least-evidenced workers equally with the best: 1/3 and 1/50 average to 0.175
+  against a pooled truth of 2/53 = 0.038, a 4.6x overstatement. `demand_fast_fraction` was such a
+  gauge and **was removed in v0.44.0**; chart the two counters instead.
+- **`demand_graded` counts only decisions the ladder actually made** — `demand_promoted +
+demand_demoted + demand_held`. The other two decision counters are the paths where the ladder had
+  no choice and are excluded from both halves of the ratio: `demand_single_rung` (the route's own
+  cadence is at or below the fastest rung, so its effective ladder has one entry) and
+  `demand_skipped_cold` (the visit filter was not warm). Including them — the behaviour before
+  v0.43.0 — made the number a readout of the route mix: any route configured below
+  `maxFastInterval` put a floor under it that no amount of correct ladder behaviour could get under,
+  and `maxFastFraction` warned continuously against zero promotions. Numbers do not span either
+  deploy. `demand_promoted_fast` is the companion movement counter (promotions onto a fast rung);
+  it settles to zero while the pooled ratio holds at whatever the ladder bought.
+- **The `demand ladder` WARN line is per-worker and deliberately conservative.** It is suppressed
+  below `1 / maxFastFraction` graded decisions (20 at the default), because under that a single fast
+  decision exceeds the limit on its own and the ratio reports an event rather than a trend. It is a
+  heads-up; the pooled counters are the alert.
 - **`invalidation_reenqueue` (a `prerender_ops` series) is off by default.** No rows means the feature is disabled.
 - **`render` `time_ms` carries a numeric statusCode** in its method slot, so it arrives as a
   numeric-looking label (`origin_fetch`'s path too; its `0` means the fetch itself failed before
@@ -156,6 +168,10 @@ Notes that bite:
   `invalidation_error`, `invalidation_reenqueue`, `page_age_negative` → `prerender_ops` series of
   the same name. Rows under old names linger until analytics retention expires them — a chart
   spanning the deploy reads both.
+- **Changed in 0.43.0 / 0.44.0**: 0.43.0 added `demand_single_rung` and `demand_promoted_fast` and
+  narrowed `demand_fast_fraction`'s denominator to graded decisions; 0.44.0 replaced that gauge
+  with the `demand_fast` and `demand_graded` counters. Three releases, three different numbers
+  under the guardrail — do not chart across them; the current one is the pooled ratio.
 - **Value semantics vary per series inside the umbrellas** — `prerender_ops`' `unrouted`/`sitemap_*`
   and `queue_health`'s `reconcile_*` are per-interval/per-run counts whose `total` is the
   meaningful sum (`count` is flushes/runs); `config_warnings` and the snapshot gauges are

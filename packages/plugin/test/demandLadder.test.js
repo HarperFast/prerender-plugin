@@ -2,7 +2,14 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions, config } from '../src/config.js';
 import { defaultConfig } from '../src/configSchema.js';
-import { decideInterval, rungIndexOf, rungs, drainStats, resetDemandStats } from '../src/util/demandLadder.js';
+import {
+	decideInterval,
+	rungIndexOf,
+	rungs,
+	drainStats,
+	resetDemandStats,
+	logDemandStats,
+} from '../src/util/demandLadder.js';
 
 // The module logs through the ambient Harper `logger` global and records gauges through
 // `server`; give the test env both.
@@ -202,6 +209,60 @@ test('fastFraction grades each decision against the limit in force when it was m
 	const s = drainStats();
 	assert.equal(s.graded, 2);
 	assert.equal(s.fastFraction, 0.5);
+});
+
+test('drainStats exposes the raw fast count, so the ratio can be pooled at query time', () => {
+	// The guardrail ships as sum(fast)/sum(graded), never as a per-worker ratio: worker decision
+	// volumes are very unequal, and averaging ratios overweights the workers with least evidence.
+	const now = Date.now();
+	decideInterval('a', 48 * H, 12 * H, now, always); // -> 6h, fast
+	decideInterval('b', 48 * H, 48 * H, now, never); // stays 48h
+	decideInterval('c', 48 * H, 48 * H, now, never);
+	const s = drainStats();
+	assert.equal(s.fast, 1);
+	assert.equal(s.graded, 3);
+	assert.equal(s.fastFraction, 1 / 3, 'the per-worker ratio is still reported as a diagnostic');
+});
+
+test('the warning is suppressed below a resolvable sample, and fires above it', () => {
+	// At maxFastFraction 0.05 the floor is 20 graded decisions: under that, ONE fast decision
+	// exceeds the limit by itself, so the ratio reports an arrival rather than a trend. Every
+	// warning seen in the first hour of v0.43.0 in production was one of these.
+	const now = Date.now();
+	const warns = [];
+	const realWarn = globalThis.logger.warn;
+	globalThis.logger.warn = (msg) => warns.push(msg);
+	try {
+		// 3 graded decisions, one of them fast -> 33%, way over the 5% limit, but meaningless.
+		decideInterval('a', 48 * H, 12 * H, now, always); // -> 6h, fast
+		decideInterval('b', 48 * H, 48 * H, now, never);
+		decideInterval('c', 48 * H, 48 * H, now, never);
+		logDemandStats();
+		assert.equal(warns.length, 0, 'graded 3 is below the floor of 20');
+
+		// 20 graded decisions with two fast -> 10%, over the limit on a sample that can carry it.
+		for (let i = 0; i < 2; i++) decideInterval(`f${i}`, 48 * H, 12 * H, now, always); // -> 6h
+		for (let i = 0; i < 18; i++) decideInterval(`s${i}`, 48 * H, 48 * H, now, never);
+		logDemandStats();
+		assert.equal(warns.length, 1);
+		assert.match(warns[0], /10\.0% of this worker's 20 ladder decisions/);
+	} finally {
+		globalThis.logger.warn = realWarn;
+	}
+});
+
+test('a zero maxFastFraction still warns — one decision resolves "any fast is too many"', () => {
+	setDemand({ maxFastFraction: 0 });
+	const warns = [];
+	const realWarn = globalThis.logger.warn;
+	globalThis.logger.warn = (msg) => warns.push(msg);
+	try {
+		decideInterval('a', 48 * H, 12 * H, Date.now(), always); // -> 6h, fast
+		logDemandStats();
+		assert.equal(warns.length, 1, 'the floor must not become Infinity and silence the limit');
+	} finally {
+		globalThis.logger.warn = realWarn;
+	}
 });
 
 test('ladder config is normalized: unsorted, duplicated and invalid rungs', () => {
