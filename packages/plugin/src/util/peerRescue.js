@@ -60,8 +60,16 @@ export const peerTokenMatches = (provided) => {
 // an extra socket to our own cluster node is cheap. Concurrency stays bounded in practice by
 // the serve path itself (only blob-failure requests reach here, each bounded by `timeoutMs`).
 // Lazily built: config is not applied at import time.
+//
+// `maxHeaderSize` matches upstream.js rather than undici's 16 KiB default. The rescue response
+// carries the record's stored head serialized inside one `x-prerender-page` header; stored heads
+// are the render path's small allowlist (~300 bytes measured live), so the default would in fact
+// suffice today — but an oversized head here would DESTROY the socket as UND_ERR_HEADERS_OVERFLOW
+// (the exact failure origin.maxResponseHeaderBytes exists for), so bound it by the same config
+// instead of a second, silently different ceiling. Same restart-scoped semantics as upstream.js:
+// the value is fixed at first construction.
 let agent;
-const dispatcher = () => (agent ??= new Agent());
+const dispatcher = () => (agent ??= new Agent({ maxHeaderSize: config.origin.maxResponseHeaderBytes }));
 
 /**
  * Fetch `cacheKey`'s stored page from the residency owner of `cacheUrl`.
