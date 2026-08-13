@@ -158,3 +158,55 @@ test('a url that cannot be parsed is never treated as an orphan', async () => {
 	assert.equal(stats.examined, 2);
 	assert.equal(stats.orphaned, 0);
 });
+
+/**
+ * The summary line. Split out from the runner because the branch had a bug that only shows up
+ * in one state: every orphan deferred as in-flight.
+ */
+const statsOf = (over = {}) => ({
+	examined: 10,
+	owned: 5,
+	orphaned: 0,
+	leaseSkipped: 0,
+	deleted: 0,
+	truncated: false,
+	dryRun: false,
+	...over,
+});
+
+test('a pass whose orphans were ALL deferred still reports them', async () => {
+	// truncated is `orphaned - leaseSkipped > deleted`, i.e. `0 > 0` = false here, and deleted is
+	// 0 — so a condition written in terms of the deletion takes the quiet branch and claims there
+	// are no orphans while three exist. That would tell an operator the cleanup is done when
+	// nothing was cleaned.
+	const { level, message } = orphanSweep.summarizeSweep(statsOf({ orphaned: 3, leaseSkipped: 3 }), 5000);
+
+	assert.equal(level, 'warn');
+	assert.match(message, /0 of 3 key-rule orphan\(s\)/);
+	assert.match(message, /3 deferred as in-flight/);
+	assert.doesNotMatch(message, /no key-rule orphans/);
+});
+
+test('a genuinely clean pass stays quiet', async () => {
+	const { level, message } = orphanSweep.summarizeSweep(statsOf(), 5000);
+
+	assert.equal(level, 'info');
+	assert.match(message, /no key-rule orphans among 5 owned target\(s\)/);
+});
+
+test('a truncated pass names the cap so a short count is not read as "all clear"', async () => {
+	const { level, message } = orphanSweep.summarizeSweep(
+		statsOf({ orphaned: 9000, deleted: 5000, truncated: true }),
+		5000
+	);
+
+	assert.equal(level, 'warn');
+	assert.match(message, /5000 of 9000 key-rule orphan\(s\)/);
+	assert.match(message, /5000-delete cap/);
+});
+
+test('a dry run says so in the line, so a census is never read as a deletion', async () => {
+	const { message } = orphanSweep.summarizeSweep(statsOf({ orphaned: 2, deleted: 2, dryRun: true }), 5000);
+
+	assert.match(message, /DRY RUN, nothing deleted/);
+});

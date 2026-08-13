@@ -188,6 +188,41 @@ export const sweepKeyRuleOrphans = async ({
 	});
 };
 
+/**
+ * The one-line summary of a pass, split out so the branch is unit-testable.
+ *
+ * GATED ON `orphaned`, NOT ON `deleted`. A pass that found orphans and deferred every one of
+ * them as in-flight has `deleted === 0` and `truncated === false` (truncation is
+ * `orphaned - leaseSkipped > deleted`, which is `0 > 0` when they are all deferred) — so a
+ * condition written in terms of the deletion would take the quiet branch and report "no
+ * key-rule orphans" while orphans plainly exist. That is the one wrong answer this line must
+ * never give: it says the cleanup is finished when nothing was cleaned.
+ *
+ * `orphaned` is also the condition that cannot drift, because the other two are derived from
+ * it: `deleted <= orphaned` (nothing is collected without counting first), and `truncated` can
+ * only be true when `orphaned` is non-zero.
+ */
+export const summarizeSweep = (stats, maxDeletes) => {
+	if (!stats.orphaned) {
+		return {
+			level: 'info',
+			message: `[prerender] orphan sweep: no key-rule orphans among ${stats.owned} owned target(s) (${stats.examined} examined)`,
+		};
+	}
+
+	// Deleting corpus is never routine, so any pass that found any says so at WARN, with the
+	// numbers an operator would want to reconcile against what they expected the rule change to
+	// re-key.
+	return {
+		level: 'warn',
+		message:
+			`[prerender] orphan sweep${stats.dryRun ? ' (DRY RUN, nothing deleted)' : ''}: ` +
+			`${stats.deleted} of ${stats.orphaned} key-rule orphan(s) across ${stats.owned} owned target(s) ` +
+			`(${stats.examined} examined, ${stats.leaseSkipped} deferred as in-flight)` +
+			(stats.truncated ? ` — the rest left for the next sweep by the ${maxDeletes}-delete cap` : ''),
+	};
+};
+
 let running = false;
 let lastRun = null;
 
@@ -210,20 +245,8 @@ export const runOrphanSweepOnce = async (options) => {
 		const stats = await sweepKeyRuleOrphans(options);
 		lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 
-		// Deleting corpus is never routine, so every pass that removed anything says so at WARN
-		// with the numbers an operator would want to reconcile against their own expectation.
-		if (stats.deleted || stats.truncated) {
-			logger.warn(
-				`[prerender] orphan sweep${stats.dryRun ? ' (DRY RUN, nothing deleted)' : ''}: ` +
-					`${stats.deleted} of ${stats.orphaned} key-rule orphan(s) across ${stats.owned} owned target(s) ` +
-					`(${stats.examined} examined, ${stats.leaseSkipped} deferred as in-flight)` +
-					(stats.truncated ? ` — the rest left for the next sweep by the ${maxDeletesOf(options)}-delete cap` : '')
-			);
-		} else {
-			logger.info(
-				`[prerender] orphan sweep: no key-rule orphans among ${stats.owned} owned target(s) (${stats.examined} examined)`
-			);
-		}
+		const { level, message } = summarizeSweep(stats, maxDeletesOf(options));
+		logger[level](message);
 
 		return lastRun;
 	} catch (e) {
