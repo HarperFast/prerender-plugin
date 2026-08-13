@@ -505,3 +505,45 @@ test('config: identical nodes report no divergence, and warnings are tagged by n
 		['a.example.com:9926', 'b.example.com:9926']
 	);
 });
+
+// ---- orphan sweep: node-scoped like reconcile, but MANUAL, which changes the merge ----
+
+test('mergeOverview sums orphan sweeps and names the nodes nobody has swept', () => {
+	// The shortfall that matters here is the opposite of reconcile's. There is no cadence to be
+	// "disabled" on — the sweep has no timer at all — so the hole is a node that has simply never
+	// been swept. It contributes zero to every total, which is indistinguishable from a node that
+	// came back clean, and unlike a scheduled sweep nothing will ever fill it in on its own.
+	const node = (hostname, lastRun) => ({
+		ok: true,
+		status: 200,
+		origin: `https://${hostname}:9926`,
+		hostname,
+		body: {
+			generatedAt: 1000,
+			nodes: [],
+			counts: {},
+			backlog: {},
+			control: {},
+			orphanSweep: { maxDeletes: 5000, dryRunDefault: true, running: false, lastRun },
+		},
+	});
+
+	const merged = mergeOverview([
+		node('a', { examined: 100, owned: 40, orphaned: 6, deleted: 6, leaseSkipped: 0, dryRun: false, finishedAt: 500 }),
+		node('b', { examined: 200, owned: 60, orphaned: 4, deleted: 0, leaseSkipped: 4, dryRun: true, finishedAt: 900 }),
+		node('c', null),
+	]).body.orphanSweep;
+
+	assert.equal(merged.lastRun.examined, 300);
+	assert.equal(merged.lastRun.owned, 100);
+	assert.equal(merged.lastRun.orphaned, 10);
+	assert.equal(merged.lastRun.deleted, 6);
+	assert.equal(merged.lastRun.leaseSkipped, 4);
+	assert.equal(merged.lastRun.nodes, 2, 'only the nodes that actually swept');
+	assert.equal(merged.lastRun.finishedAt, 500, 'as of the OLDEST sweep, not the newest');
+	// One node really deleted, so the cluster figure is not a dry run — reporting "nothing was
+	// deleted" because the majority were would be exactly backwards on a destructive action.
+	assert.equal(merged.lastRun.dryRun, false);
+	assert.deepEqual(merged.sweptNodes, 2);
+	assert.deepEqual(merged.unsweptNodes, ['c']);
+});

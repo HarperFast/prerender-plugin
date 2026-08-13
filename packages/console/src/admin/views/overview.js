@@ -518,15 +518,30 @@ function orphans(ctx, data) {
 
 	const body = [];
 
+	// A node nobody has swept contributes ZERO to every total below, which is indistinguishable
+	// from a node that came back clean. Under cluster scope that is the shortfall worth naming —
+	// there is no schedule to fall back on, so an unswept node stays unswept until someone acts.
+	if (info.unsweptNodes?.length) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				`Never swept on ${info.unsweptNodes.join(', ')} — those nodes' keys are not represented in the ` +
+					'counts below, so the real orphan count is larger than shown.',
+			])
+		);
+	}
+
 	if (last?.error) {
 		body.push(el('div', { cls: 'note bad', text: `Last sweep failed: ${last.error}` }));
 	} else if (last) {
 		const stranded = (last.orphaned ?? 0) - (last.leaseSkipped ?? 0) - (last.deleted ?? 0);
 		body.push(
 			kv([
-				['Last sweep', `${ago(last.finishedAt)}${last.dryRun ? ' (dry run — nothing deleted)' : ''}`],
+				[
+					last.nodes > 1 ? `Oldest of ${last.nodes} sweeps` : 'Last sweep',
+					`${last.finishedAt ? ago(last.finishedAt) : 'unknown'}${last.dryRun ? ' (dry run — nothing deleted)' : ''}`,
+				],
 				['Targets examined', num(last.examined)],
-				['Owned by this node', num(last.owned)],
+				[last.nodes > 1 ? 'Owned across nodes' : 'Owned by this node', num(last.owned)],
 				['Key-rule orphans found', last.orphaned ? pill(num(last.orphaned), 'warn') : pill('0', 'ok')],
 				['Deleted', last.dryRun ? muted('none — dry run') : num(last.deleted)],
 				// Deferred is not a failure: a key mid-render is skipped and caught next pass.

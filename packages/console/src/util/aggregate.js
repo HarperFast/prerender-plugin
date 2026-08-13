@@ -559,6 +559,37 @@ export function mergeOverview(results) {
 			: null,
 	};
 
+	// ---- orphan sweep: same node scope as reconcile, so the same sum — but MANUAL, which
+	// changes what the merge has to say. There is no cadence to report and no "disabled on"
+	// hole to name; the interesting shortfall is the opposite one, a node nobody has swept.
+	// `sweptNodes` vs the answering node count is what says so, since a node that has never run
+	// it contributes zero to every total here and that is indistinguishable from a clean node.
+	const orphanRuns = bodies.map((r) => ({ hostname: r.hostname, ...(r.b.orphanSweep ?? {}) }));
+	const orphanSweeps = orphanRuns.map((r) => r.lastRun).filter(Boolean);
+	const orphanSweep = {
+		maxDeletes: orphanRuns.find((r) => Number.isFinite(r.maxDeletes))?.maxDeletes ?? null,
+		dryRunDefault: orphanRuns.some((r) => r.dryRunDefault),
+		running: orphanRuns.some((r) => r.running),
+		sweptNodes: orphanSweeps.length,
+		unsweptNodes: orphanRuns.filter((r) => !r.lastRun).map((r) => r.hostname),
+		lastRun: orphanSweeps.length
+			? {
+					examined: sumOf(orphanSweeps, (s) => s.examined),
+					owned: sumOf(orphanSweeps, (s) => s.owned),
+					orphaned: sumOf(orphanSweeps, (s) => s.orphaned),
+					deleted: sumOf(orphanSweeps, (s) => s.deleted),
+					leaseSkipped: sumOf(orphanSweeps, (s) => s.leaseSkipped),
+					truncated: orphanSweeps.some((s) => s.truncated),
+					// A cluster figure counts as a dry run only if EVERY node's was: one node that
+					// actually deleted makes "nothing was deleted" false.
+					dryRun: orphanSweeps.every((s) => s.dryRun),
+					finishedAt: minOf(orphanSweeps, (s) => msOf(s.finishedAt)),
+					error: orphanSweeps.find((s) => s.error)?.error ?? null,
+					nodes: orphanSweeps.length,
+				}
+			: null,
+	};
+
 	const controlRows = bodies.map((r) => r.b.control?.cluster).filter(Boolean);
 	const intervalsJson = bodies.map((r) => JSON.stringify(r.b.intervals ?? null));
 
@@ -590,6 +621,7 @@ export function mergeOverview(results) {
 			intervalsDiverge: new Set(intervalsJson).size > 1,
 			claimFloor,
 			reconcile,
+			orphanSweep,
 			sources: sourcesOf(results, { mode: 'merged' }),
 		},
 	};
