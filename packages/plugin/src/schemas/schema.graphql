@@ -118,11 +118,6 @@ type QueueStatus @table(database: "render_service") @sealed @export(name: "queue
 	hostname: String @primaryKey
 	# Queue status (empty, queued, or paused)
 	status: String
-	# LAST REPORTED, not last changed — the periodic status sync rewrites this row every
-	# `queue.statusSyncInterval` whether or not the status moved (QueueState.reportStatus's
-	# `heartbeat`). That is what makes the row a liveness signal: a node that stops reporting
-	# is the one case the console's staleness check exists to catch, and a change-only write
-	# makes it indistinguishable from a node that has simply been healthy and busy.
 	updatedTime: Date @updatedTime
 }
 

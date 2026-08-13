@@ -109,16 +109,6 @@ const {
 	sitemaps: { Sitemap, SitemapRefresh },
 } = databases;
 
-// How long after a node's last status report we call its row stale. Two sync intervals,
-// so a single missed tick doesn't flap the UI.
-//
-// This depends on the periodic sync REWRITING the row every interval even when nothing
-// changed (QueueState.reportStatus's `heartbeat`). If that ever reverts to writing only on a
-// status change, this check silently inverts: every healthy node goes stale within two
-// intervals and stays there, and the node that actually stopped reporting is the one thing it
-// can no longer distinguish.
-const nodeStaleAfter = () => config.queue.statusSyncInterval * 2;
-
 // Delay applied to a rejected login. Not real rate limiting (there is no cross-worker
 // state here) — just enough to make a serial password walk unproductive. Harper's own
 // auth audit log is the actual detection surface.
@@ -297,14 +287,13 @@ async function withHeavySlot(fn) {
 	}
 }
 
-async function buildNodeList(now) {
+async function buildNodeList() {
 	const [statuses, controls] = await Promise.all([
 		Array.fromAsync(QueueStatus.search({})),
 		Array.fromAsync(QueueControl.search({})),
 	]);
 
 	const controlByScope = new Map(controls.map((row) => [row.scope, row]));
-	const staleAfter = nodeStaleAfter();
 
 	const nodes = statuses.map((row) => {
 		const updatedMs = row.updatedTime ? new Date(row.updatedTime).getTime() : NaN;
@@ -313,10 +302,21 @@ async function buildNodeList(now) {
 		return {
 			hostname: row.hostname,
 			status: row.status ?? null,
-			updatedTime: Number.isFinite(updatedMs) ? updatedMs : null,
-			// A node that has stopped reporting is the interesting case: its `status` is
-			// whatever it last said, which may be nothing like reality.
-			stale: Number.isFinite(updatedMs) ? now - updatedMs > staleAfter : true,
+			// WHEN THE STATUS LAST CHANGED — not when this node last reported.
+			//
+			// The row is written only when the status actually moves (QueueState.reportStatus's
+			// compareExchange), which is deliberate: `reportStatus` is called per bot request and
+			// per claim pass, and the node-local shared buffer exists precisely so those paths do
+			// not each become a replicated write. A steady `queued` node therefore has an old
+			// timestamp and is perfectly healthy.
+			//
+			// SO THERE IS NO `stale` HERE, and adding one would be wrong in both directions: an
+			// age-based rule flags every healthy busy node, and a node that has genuinely died
+			// looks identical to one that has simply not changed state. Liveness is not knowable
+			// from this row at all — the console determines it from whether the node answered its
+			// fan-out, which is a real-time fact, and compares each node's COPY of these rows to
+			// spot a replication gap. See util/aggregate.js.
+			statusChangedTime: Number.isFinite(updatedMs) ? updatedMs : null,
 			isThisNode: row.hostname === server.hostname,
 			override:
 				control && typeof control.paused === 'boolean'
@@ -907,7 +907,7 @@ export class PrerenderAdmin extends Resource {
 		// hit on every dashboard view and after every action, on workers shared with bot
 		// traffic, so its cost has to stay flat no matter how large the deployment is.
 		const [{ nodes, cluster, knownScopes }, backlogState] = await Promise.all([
-			buildNodeList(now),
+			buildNodeList(),
 			getBacklogSnapshotState(),
 		]);
 

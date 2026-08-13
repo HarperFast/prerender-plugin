@@ -349,15 +349,33 @@ function nodes(ctx, data) {
 		el('tr', null, [
 			el('td', { cls: 'mono' }, [node.hostname, node.isThisNode && muted(' (this node)')]),
 			el('td', null, [statusPill(node.status)]),
-			el('td', { cls: 'right' }, [
-				el('span', { cls: node.stale ? 'pill warn' : 'muted', text: ago(node.updatedTime) }),
-			]),
+			// LIVENESS, and it is a live fact: whether this node answered the fan-out that built
+			// this page. Never inferred from the timestamp beside it — see nodeAge.
+			el('td', null, [node.responding === false ? pill('not responding', 'bad') : null]),
+			el('td', { cls: 'right' }, [nodeAge(node)]),
 		])
 	);
+
+	// A row every peer holds an older copy of means replication is not delivering that node's
+	// writes — the one thing this table can see that nothing else can, since it is the only place
+	// four copies of the same replicated row are compared side by side.
+	const diverged = data.nodes.filter((n) => n.behind?.length);
 
 	return card('Nodes', {
 		head: [spacer(), link('open queue →', () => ctx.go('queue'))],
 		body: [
+			diverged.length &&
+				el('div', { cls: 'note bad' }, [
+					'Replication gap: ' +
+						diverged
+							.map(
+								(n) =>
+									`${n.hostname}'s row is ${duration(n.spreadMs)} behind on ${n.behind.map((b) => b.reporter).join(', ')}`
+							)
+							.join('; ') +
+						'. Those nodes are not receiving that node’s writes to render_service — which also carries ' +
+						'Target, so URLs it discovers are not reaching them either.',
+				]),
 			el('div', { cls: 'scroll' }, [
 				el('table', null, [
 					el(
@@ -370,7 +388,14 @@ function nodes(ctx, data) {
 				]),
 			]),
 		],
-		foot: [muted('Per-node throughput, pause intent and claim health are on Queue & nodes.')],
+		foot: [
+			muted(
+				'“Status since” is when that node’s queue status last CHANGED — the row is written only on a ' +
+					'change, so a steady node showing hours is healthy, not stale. Liveness is the column beside ' +
+					'it: whether the node answered this page load. Per-node throughput, pause intent and claim ' +
+					'health are on Queue & nodes.'
+			),
+		],
 	});
 }
 
@@ -590,6 +615,21 @@ function orphans(ctx, data) {
 		body,
 	});
 }
+
+/**
+ * How long a node has HELD its current queue status — never "how long since it reported".
+ *
+ * The QueueStatus row is written only when the status actually moves: `reportStatus` is called
+ * per bot request and per claim pass, and the node-local shared buffer exists so those paths do
+ * not each become a replicated write. So an old timestamp on a busy node means "it has been
+ * queued for three hours", which is health, not silence — and this used to render as an amber
+ * "stale" pill on every node in the cluster, permanently, which made the one node that had
+ * genuinely stopped indistinguishable from the three that were fine.
+ */
+export const nodeAge = (node) =>
+	Number.isFinite(node.statusChangedTime)
+		? muted(`since ${ago(node.statusChangedTime)}`)
+		: muted('status never recorded');
 
 export const statusPill = (status) =>
 	pill(

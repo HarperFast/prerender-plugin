@@ -457,21 +457,70 @@ export function mergeOverview(results) {
 
 	const bodies = usable.map((r) => ({ ...r, b: r.body }));
 
-	// ---- nodes: QueueStatus replicates, so every node sees every node. Merge by hostname and
-	// keep the freshest row for each — a node whose own replication is lagging shouldn't be the
-	// one deciding what a peer's status is.
-	const byHost = new Map();
-	for (const { b } of bodies) {
-		for (const node of b.nodes ?? []) {
-			const existing = byHost.get(node.hostname);
-			const at = msOf(node.updatedTime);
-			if (!existing || !(msOf(existing.updatedTime) >= at)) {
-				// `isThisNode` is meaningless in a cluster view — there is no "this node".
-				byHost.set(node.hostname, { ...node, isThisNode: false });
-			}
+	// ---- nodes: QueueStatus replicates, so every node holds a copy of every node's row. That
+	// makes this the one place a fan-out sees the SAME row through four different eyes, and the
+	// two things worth knowing here both come out of that, without any node writing anything.
+	//
+	// LIVENESS IS NOT IN THE ROW. `statusChangedTime` is when the status last moved, and a busy
+	// node holding `queued` legitimately never moves — so no age threshold over it can separate
+	// "healthy and steady" from "dead". But the console just asked every node for this payload,
+	// so it knows exactly which ones answered, as of now. That is the honest liveness signal and
+	// it costs nothing. (Under node scope there is no fan-out and therefore no claim: the field
+	// is left null rather than guessed.)
+	//
+	// DISAGREEMENT IS THE OTHER SIGNAL, and it is the one nothing else can see. All four copies
+	// of a row should be identical once replication has caught up, so a persistent spread means
+	// replication is not delivering that node's writes. Measured in the field: one node's own
+	// copy of its row was 3 hours newer than every peer's, because its outbound replication for
+	// that database had been dead since morning while every other database on the same link
+	// flowed. Taking the freshest copy — which is what this merge used to do, silently — hides
+	// precisely that.
+	// Both keys, lowercased and port-stripped: a QueueStatus row is keyed by the node's OWN
+	// `server.hostname`, while a failed result only ever carries the configured origin's host —
+	// so neither alone joins every case. Same two-sided join, for the same reason, as the
+	// per-node throughput column.
+	const asked = new Map(); // hostname -> did it answer
+	const hostKey = (value) => String(value).toLowerCase().split(':')[0];
+	for (const r of results) {
+		for (const key of [r.body?.node, r.hostname]) {
+			if (!key) continue;
+			asked.set(hostKey(key), (asked.get(hostKey(key)) ?? false) || !!r.ok);
 		}
 	}
-	const nodes = [...byHost.values()].sort((a, b) => String(a.hostname).localeCompare(String(b.hostname)));
+
+	const copies = new Map(); // hostname -> [{ reporter, at, status }]
+	for (const { hostname: reporter, b } of bodies) {
+		for (const node of b.nodes ?? []) {
+			if (!copies.has(node.hostname)) copies.set(node.hostname, []);
+			copies.get(node.hostname).push({ reporter, at: msOf(node.statusChangedTime), row: node });
+		}
+	}
+
+	const nodes = [...copies.entries()]
+		.map(([hostname, seen]) => {
+			// Newest copy for the displayed status: it is the one that has actually heard from
+			// the node most recently. The spread beside it is what says whether to trust that.
+			const newest = seen.reduce((best, c) => (!best || !(best.at >= c.at) ? c : best), null);
+			const times = seen.map((c) => c.at).filter(Number.isFinite);
+			const spreadMs = times.length > 1 ? Math.max(...times) - Math.min(...times) : 0;
+			const answered = asked.get(hostKey(hostname));
+			return {
+				...newest.row,
+				// `isThisNode` is meaningless in a cluster view — there is no "this node".
+				isThisNode: false,
+				// null = not one of the configured nodes, so it was never asked and no claim is made.
+				responding: answered === undefined ? null : answered,
+				copies: seen.length,
+				spreadMs,
+				// Which reporters hold a copy older than the newest, and by how far. This is the
+				// replication-gap detail — named reporters, so it points at a link, not a node.
+				behind: seen
+					.filter((c) => Number.isFinite(c.at) && Number.isFinite(newest.at) && newest.at - c.at > 0)
+					.map((c) => ({ reporter: c.reporter, byMs: newest.at - c.at }))
+					.sort((a, b) => b.byMs - a.byMs),
+			};
+		})
+		.sort((a, b) => String(a.hostname).localeCompare(String(b.hostname)));
 
 	// ---- table counts: replicated, so compare rather than add.
 	const freshestCounts = freshest(bodies, (r) => msOf(r.b.countsAsOf));

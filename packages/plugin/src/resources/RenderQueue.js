@@ -98,11 +98,7 @@ async function syncQueueState(force = false, pending = null) {
 	reconcileLeaseGauge();
 
 	const status = deriveQueueStatus(Date.now());
-	// `heartbeat` because this is the PERIODIC path: the row must be rewritten every sync even
-	// when nothing changed, or `updatedTime` degrades from "last reported" to "last changed"
-	// and every steady node reads as stale forever. See QueueState.reportStatus. The hot
-	// callers (the claim pass, the bot serve path) deliberately do not pass it.
-	await QueueState.reportStatus(status, force || liftingPause, { heartbeat: true });
+	await QueueState.reportStatus(status, force || liftingPause);
 	return { status, ...desired };
 }
 
