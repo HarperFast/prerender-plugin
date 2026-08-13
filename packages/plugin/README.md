@@ -570,6 +570,7 @@ this plugin's resources all set `loadAsInstance = false`.
 |                                         | `{ action: "reset-claim-floor" }` (this node)   |              |
 | `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now    | `super_user` |
 | `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node      | `super_user` |
+| `POST /prerender_admin/sweep-orphans`   | `{ dryRun?, maxDeletes? }` → key-rule orphans   | `super_user` |
 | `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now    | `super_user` |
 | `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail | `super_user` |
 | `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots   | `super_user` |
@@ -713,6 +714,36 @@ Restores use the **jittered** initial render time rather than "now" — a sweep 
 many rows at once, and queueing them all immediately would trade a silent outage for a render
 herd. `maxRestores` caps writes per sweep and a truncated sweep says so in the log, so a short
 count is never mistaken for "all clear".
+
+### Cache-key orphans
+
+The mirror-image problem, and the one **changing a `cacheKey.*` option creates**. A target's
+stored `url` _is_ the url-half of its cache key — `Target.put` derives the schedule rows from it
+verbatim, and a render is stored under the schedule row's own key. Nothing re-canonicalizes.
+So after a key-rule change, every target whose stored url is no longer what that url canonicalizes
+to keeps its schedule rows and **renders forever into a key no request can produce**.
+
+Nothing else cleans them up. A sitemap refresh creates the target under the new key and merely
+_unlinks_ the old one (`sitemapUrl → null`), which does not touch its schedule. And the canonical
+verdict cannot retire them either: with the rule applied on both sides, the renderer folds the job
+url and the declared canonical alike and calls it `self`. Measured after enabling
+`cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ~40,400 schedule rows,
+roughly **9.5% of fleet throughput** spent on dead keys, indefinitely.
+
+`POST /prerender_admin/sweep-orphans` is the cleanup. The predicate is the **fixed-point test** —
+`canonicalizeUrl(url, queryAllowlistFor(url)) !== url` — which is the general statement of "no
+request can produce this key", so it is correct after _any_ key-rule change rather than a one-off
+for one option. Two tempting alternatives are wrong: `sitemapUrl === null` also matches every
+legitimately _discovered_ target and would delete live corpus, and a per-character regex encodes
+one rule change and silently misses the next.
+
+It is **manual only, and dry-run by default** — it deletes corpus, and the population it targets
+is created by an operator changing a config option, so it should run when someone decides to run
+it. Same structure as the repair sweep: node-scoped, cursor-free, deletes only after the scan
+closes, and `maxDeletes` bounds deletion while the scan still reports the true population. It also
+**defers any target with a device key currently leased**, so a delete does not land mid-render —
+though correctness does not rest on that, since a result whose target has gone deletes its own
+schedule row rather than resurrecting it.
 
 The Overview panel shows the last sweep's result on that node and can start one on demand.
 

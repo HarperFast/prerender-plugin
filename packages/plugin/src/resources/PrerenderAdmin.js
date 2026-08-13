@@ -38,6 +38,7 @@
  *                                    { action: 'reset-claim-floor' }
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
+ *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
  *   POST /prerender_admin/backlog    recompute the backlog snapshot super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
@@ -89,6 +90,7 @@ import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
+import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
@@ -453,6 +455,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.revalidateUrl(data);
 			case 'reconcile':
 				return PrerenderAdmin.reconcile();
+			case 'sweep-orphans':
+				return PrerenderAdmin.sweepOrphans(data);
 			case 'backlog':
 				return PrerenderAdmin.backlog();
 			case 'sitemap':
@@ -765,6 +769,42 @@ export class PrerenderAdmin extends Resource {
 		// Detached: the sweep outlives this request, so a rejection has to be handled here or
 		// it surfaces as an unhandled rejection.
 		runReconcileOnce().catch((e) => logger.error(e));
+
+		return json({ ...payload, started: true, alreadyRunning: false });
+	}
+
+	/**
+	 * Start a key-rule orphan sweep on THIS node.
+	 *
+	 * Detached and node-scoped for the same reasons as `reconcile`: it walks the whole target
+	 * registry, and it can only answer "is this key in flight" for the keys this node owns, so
+	 * every node has to be swept to cover the keyspace.
+	 *
+	 * `dryRun` defaults to the configured value (itself `true`), so an operator who POSTs this
+	 * without arguments gets a census rather than a deletion. Pass `{ dryRun: false }` to act.
+	 */
+	static sweepOrphans(data) {
+		const lastRun = getLastOrphanSweep();
+		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : config.render.orphanSweep.dryRun;
+		const maxDeletes = Number.isFinite(Number(data?.maxDeletes))
+			? Math.max(1, Math.floor(Number(data.maxDeletes)))
+			: config.render.orphanSweep.maxDeletes;
+
+		const payload = {
+			node: server.hostname,
+			dryRun,
+			maxDeletes,
+			ownerScopeNote: 'Sweeps only the keys this node owns; every node must be swept to cover the keyspace.',
+			lastRun,
+		};
+
+		if (isOrphanSweepRunning()) {
+			return json({ ...payload, started: false, alreadyRunning: true });
+		}
+
+		// Detached: the sweep outlives this request, so a rejection has to be handled here or it
+		// surfaces as an unhandled rejection.
+		runOrphanSweepOnce({ dryRun, maxDeletes }).catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}

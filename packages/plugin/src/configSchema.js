@@ -936,6 +936,41 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
+
+		orphanSweep: group(
+			'Deletion of targets orphaned by a CACHE-KEY RULE CHANGE — targets whose stored url is no ' +
+				'longer what that url canonicalizes to, so no request can produce their key.\n\n' +
+				'They are invisible to every other repair path: a sitemap refresh creates the target under ' +
+				'the new key and only UNLINKS the old one (`sitemapUrl -> null`), which leaves its schedule ' +
+				'rows due on the normal cadence; and the canonical verdict cannot retire them, because with ' +
+				'the rule applied on both sides the renderer folds the job url and the declared canonical ' +
+				'alike and calls it `self`. So they render forever into keys nothing reads. Measured after ' +
+				'enabling `cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ' +
+				'~40,400 schedule rows, ~9.5% of fleet throughput spent on dead keys.\n\n' +
+				'MANUAL ONLY, BY DESIGN — there is no timer. This deletes corpus, and the population it ' +
+				'targets is created by an operator changing a `cacheKey` option, so it should run when ' +
+				'someone decides to run it (POST /prerender_admin/sweep-orphans) rather than on a schedule ' +
+				'that could act on a config change nobody meant to make permanent. Run it with `dryRun` ' +
+				'first and reconcile the count against what you expect the rule change to have re-keyed.\n\n' +
+				'Node-scoped: each node sweeps only the keys it owns, because the in-flight check reads ' +
+				'this node’s lease buffer. Every node must be swept to cover the keyspace.',
+			{
+				maxDeletes: option(
+					5000,
+					'Ceiling on targets DELETED per sweep. The scan always runs to completion, so the reported ' +
+						'`orphaned` count is the true size of the population even when only this many were removed ' +
+						'— a rule change can orphan a large slice of the keyspace at once, and deleting millions of ' +
+						'rows in one pass would be its own outage. Re-run until `truncated` is false.',
+					{ min: 1 }
+				),
+				dryRun: option(
+					true,
+					'Count and report without deleting anything. Defaults ON: the safe direction for a ' +
+						'destructive sweep is that an operator who triggers it without reading this gets a census, ' +
+						'not a deletion. A run always reports which mode it was in.'
+				),
+			}
+		),
 	}),
 
 	scan: group(
