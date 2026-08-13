@@ -1,15 +1,17 @@
 # Harper Prerender
 
 A configurable prerendering system for [Harper](https://www.harpersystems.dev/) that serves
-crawler/bot traffic with prerendered, cacheable HTML. This is a monorepo with two packages:
+crawler/bot traffic with prerendered, cacheable HTML. This is a monorepo with three packages:
 
-| Package                                             | What it is                                                                                                                                                                                 |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`@harperfast/prerender`](packages/plugin)          | The Harper **plugin**: bot HTTP handler, render queue/scheduler, sitemap ingestion, and page cache. Fully configurable via the host app's `config.yaml`.                                   |
-| [`@harperfast/prerender-browser`](packages/browser) | The render **browser**: a Puppeteer-based service that claims jobs from the plugin's queue, renders pages in headless Chrome, and posts the HTML back. Per-site rendering is configurable. |
+| Package                                             | What it is                                                                                                                                                                                                                   |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`@harperfast/prerender`](packages/plugin)          | The Harper **plugin**: bot HTTP handler, render queue/scheduler, sitemap ingestion, and page cache. Fully configurable via the host app's `config.yaml`.                                                                     |
+| [`@harperfast/prerender-browser`](packages/browser) | The render **browser**: a Puppeteer-based service that claims jobs from the plugin's queue, renders pages in headless Chrome, and posts the HTML back. Per-site rendering is configurable.                                   |
+| [`@harperfast/prerender-console`](packages/console) | The management **console**: a standalone Harper component serving the operator UI, proxying to the plugin's `/prerender_admin` API (which is API-only since plugin v0.47.0) on whichever configured node the operator picks. |
 
 The plugin runs inside Harper; the render browser runs as one or more separate worker processes that
-connect to it over HTTP/MQTT.
+connect to it over HTTP/MQTT; the console runs on any Harper instance (the prerender cluster itself,
+an ops cluster, or a laptop) and talks to the plugin's API.
 
 ## Layout
 
@@ -17,6 +19,7 @@ connect to it over HTTP/MQTT.
 packages/
   plugin/    @harperfast/prerender          (Harper plugin — JavaScript)
   browser/   @harperfast/prerender-browser  (render service — TypeScript)
+  console/   @harperfast/prerender-console  (management console — JavaScript)
 ```
 
 ## Getting started
@@ -24,7 +27,7 @@ packages/
 This repo uses npm workspaces.
 
 ```sh
-npm install                 # install both packages
+npm install                 # install all packages
 npm run lint                # lint everything
 npm test --workspaces       # run package tests
 ```
@@ -33,6 +36,7 @@ See each package's README for configuration and usage:
 
 - [Plugin configuration & API](packages/plugin/README.md)
 - [Render service setup](packages/browser/README.md)
+- [Console deployment & options](packages/console/README.md)
 - [Metrics & observability](packages/plugin/METRICS.md) — the metric catalog, and everything else
   worth watching, for building dashboards and alerts
 
@@ -41,8 +45,10 @@ to authenticate the renderer.
 
 ## Releasing
 
-Both packages live in monorepo subdirectories, and npm can't install a subdirectory from a plain git
+The packages live in monorepo subdirectories, and npm can't install a subdirectory from a plain git
 URL — so they are distributed as **GitHub Release tarballs** and consumers reference the asset URLs.
+Release tags are per package: `vX.Y.Z` (browser), `prerender-vX.Y.Z` (plugin),
+`prerender-console-vX.Y.Z` (console).
 
 ### Update + cut a release
 
@@ -54,8 +60,8 @@ URL — so they are distributed as **GitHub Release tarballs** and consumers ref
    npm test --workspaces
    ```
 
-2. Bump the version of the package(s) you changed (`packages/plugin/package.json` and/or
-   `packages/browser/package.json`) following semver.
+2. Bump the version of the package(s) you changed (`packages/<pkg>/package.json`) following
+   semver.
 3. Merge to `main` and push.
 4. Tag and create the release (use the bumped version):
 
@@ -66,8 +72,9 @@ URL — so they are distributed as **GitHub Release tarballs** and consumers ref
    ```
 
    Publishing the release triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
-   which builds and attaches `harperfast-prerender-<version>.tgz` and
-   `harperfast-prerender-browser-<version>.tgz` as release assets.
+   which builds and attaches `harperfast-prerender-<version>.tgz`,
+   `harperfast-prerender-browser-<version>.tgz` and `harperfast-prerender-console-<version>.tgz`
+   as release assets.
 
 ### Reference a release from a consumer
 
