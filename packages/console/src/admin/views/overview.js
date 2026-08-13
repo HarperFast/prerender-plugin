@@ -83,6 +83,7 @@ export function render(ctx) {
 		upcoming(ctx, data),
 		el('div', { cls: 'cols' }, [nodes(ctx, data), failures(ctx)]),
 		repair(ctx, data),
+		orphans(ctx, data),
 	];
 }
 
@@ -476,6 +477,78 @@ function repair(ctx, data) {
 				// Reload rather than render an acknowledgement: the sweep is detached, so the
 				// refreshed overview (running / lastRun) is the honest view of it.
 				onclick: () => ctx.run(() => ctx.post('reconcile', {})),
+			}),
+		],
+		body,
+	});
+}
+
+// Targets orphaned by a CACHE-KEY RULE CHANGE: their stored url no longer canonicalizes to the
+// key they are filed under, so no request can ever produce it. They render forever into keys
+// nothing reads, and no other repair path can see them — which is exactly why the sweep's last
+// result belongs on the dashboard rather than only in the response to its own POST.
+//
+// MANUAL by design: there is no timer, because the population is created by an operator
+// changing a `cacheKey` option, and this deletes corpus.
+function orphans(ctx, data) {
+	const info = data.orphanSweep ?? {};
+	const last = info.lastRun;
+	const clusterScope = isMerged(ctx.data.overview);
+
+	const body = [];
+
+	if (last?.error) {
+		body.push(el('div', { cls: 'note bad', text: `Last sweep failed: ${last.error}` }));
+	} else if (last) {
+		const stranded = (last.orphaned ?? 0) - (last.leaseSkipped ?? 0) - (last.deleted ?? 0);
+		body.push(
+			kv([
+				['Last sweep', `${ago(last.finishedAt)}${last.dryRun ? ' (dry run — nothing deleted)' : ''}`],
+				['Targets examined', num(last.examined)],
+				['Owned by this node', num(last.owned)],
+				['Key-rule orphans found', last.orphaned ? pill(num(last.orphaned), 'warn') : pill('0', 'ok')],
+				['Deleted', last.dryRun ? muted('none — dry run') : num(last.deleted)],
+				// Deferred is not a failure: a key mid-render is skipped and caught next pass.
+				last.leaseSkipped ? ['Deferred as in-flight', pill(num(last.leaseSkipped), '')] : null,
+				last.truncated
+					? ['Truncated', pill(`hit the ${num(info.maxDeletes)} delete cap — ~${num(stranded)} remain`, 'bad')]
+					: null,
+			])
+		);
+	} else {
+		body.push(muted('No sweep has run on this node since startup. It has no timer — it runs when you run it.'));
+	}
+
+	body.push(
+		el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
+			'Run this after changing a ',
+			el('code', { text: 'cacheKey' }),
+			' option, and run it with the dry run first: the scan always completes, so the orphan count is ' +
+				'the true size of the population even when the delete cap stopped the removals. Each node ' +
+				'sweeps only the keys IT owns — the in-flight check reads that node’s own lease buffer — so ' +
+				'every node has to be swept to cover the keyspace.',
+		])
+	);
+
+	return card('Key-rule orphans', {
+		head: [
+			pill('manual — no timer'),
+			info.running && pill('running now', 'warn'),
+			spacer(),
+			el('button', {
+				text: clusterScope ? 'Sweep (pick a node)' : info.running ? 'Sweep running…' : 'Dry run',
+				disabled: ctx.busy || info.running || clusterScope,
+				title: clusterScope ? 'A sweep deletes among the keys one node owns. Switch to a node to run it there.' : null,
+				// Always an explicit dryRun: the button that deletes corpus should not be the one
+				// you reach by default, and the plugin's own default can be configured either way.
+				onclick: () => ctx.run(() => ctx.post('sweep-orphans', { dryRun: true })),
+			}),
+			el('button', {
+				cls: 'danger',
+				text: 'Delete orphans',
+				disabled: ctx.busy || info.running || clusterScope || !last || last.error || !last.orphaned,
+				title: !last?.orphaned ? 'Run a dry run first — this acts on what that census found.' : null,
+				onclick: () => ctx.run(() => ctx.post('sweep-orphans', { dryRun: false })),
 			}),
 		],
 		body,

@@ -127,6 +127,29 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 		assert.ok(pluginServes.has(route), `the proxy forwards "${route}" but PrerenderAdmin does not dispatch it`);
 	}
 
+	// AND THE OTHER DIRECTION. Checking only that the console's routes exist upstream leaves the
+	// failure this test was written to prevent wide open in the opposite sense: the plugin adds a
+	// route, the console — a separately versioned package — never learns about it, and the
+	// capability ships unreachable with nothing failing. That is how `sweep-orphans` arrived in
+	// plugin v0.48.0 and sat unreachable from console v0.2.x: no client call, no proxy entry, no
+	// panel, and a green suite.
+	//
+	// A new plugin route therefore has to be wired here or named below, with the reason.
+	//
+	// Currently empty: every route the plugin dispatches is reachable. Note the bar is
+	// REACHABLE, not "has a button" — `schedule` is a leaf for peer `explain` calls that the UI
+	// never invokes, but it is proxied, so a deliberate node-named call works and it belongs in
+	// the allowlist rather than here.
+	const DELIBERATELY_NOT_EXPOSED = new Set([]);
+	for (const route of pluginServes) {
+		if (DELIBERATELY_NOT_EXPOSED.has(route)) continue;
+		assert.ok(
+			served.includes(route),
+			`PrerenderAdmin dispatches "${route}" but the console cannot reach it — add it to PROXIED_GET/PROXIED_POST ` +
+				'(and give it a UI), or name it in DELIBERATELY_NOT_EXPOSED with the reason'
+		);
+	}
+
 	const called = [];
 	for (const source of clientSources.values()) {
 		for (const [, route] of source.matchAll(/\b(?:get|post)\(\s*'([a-z-]+)'/g)) called.push(route);

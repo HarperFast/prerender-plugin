@@ -65,14 +65,18 @@ export const SHARED_NOTE = Object.freeze({
  * already says which node(s) it applies to.
  */
 export const NODE_LOCAL_POST = Object.freeze({
-	reconcile: 'The repair sweep runs over the keys ONE node owns. Pick a node to sweep it.',
-	backlog: 'A backlog snapshot covers the keys ONE node owns. Pick a node to recompute it.',
+	'reconcile': 'The repair sweep runs over the keys ONE node owns. Pick a node to sweep it.',
+	// Node-scoped for a second reason on top of residency: the in-flight check reads THIS node's
+	// lease buffer, so asked of a non-owner it cannot tell an orphan from a key mid-render — and
+	// this sweep deletes.
+	'sweep-orphans': 'The orphan sweep deletes among the keys ONE node owns. Pick a node to sweep it.',
+	'backlog': 'A backlog snapshot covers the keys ONE node owns. Pick a node to recompute it.',
 	// `schedule` reads RenderSchedule node-locally (replicateFrom: false, because the table is
 	// residency-pinned and a cross-node read has no timeout). Asked of a node that does not own
 	// the key it truthfully answers "no row" — which reads as "this URL will never render". The
 	// UI never calls it (it is the peer endpoint `explain` uses, and `explain` already proxies
 	// to the owner itself); a caller reaching it directly has to name the node they mean.
-	schedule:
+	'schedule':
 		'A schedule row is only readable on the node that owns the key. Pick a node — or use explain, which finds the owner for you.',
 });
 
