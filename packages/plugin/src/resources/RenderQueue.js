@@ -421,7 +421,19 @@ export class RenderQueue extends Resource {
 		} else if (outcome === 'non-indexable') {
 			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
 			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
-			// render is broken", which read identically without it. The verdict SUPPRESSES the
+			// render is broken", which read identically without it. Browser ≥ v1.17.0 adds
+			// 'canonical-variant': the canonical names this very document RE-SPELLED as a
+			// different cache key, so the target duplicates one we already render rather than
+			// being a page that disowns itself. Suppressed identically — the split exists so a
+			// wave of duplicate spellings is legible as such rather than reading as an origin
+			// that stopped believing in its own pages.
+			//
+			// Note which urls can reach here at all: a sitemap-listed one is serialized even when
+			// non-indexable, so its result arrives with content and `rendered` wins the outcome
+			// above — the declared corpus is structurally out of this branch's reach, and only
+			// urls we DISCOVERED can be suppressed by a canonical verdict.
+			//
+			// The verdict SUPPRESSES the
 			// target (state + recheck schedule) rather than deleting it — see Target.suppress,
 			// which also grades http-error verdicts by status (404/410 recheck less, die sooner).
 			//
