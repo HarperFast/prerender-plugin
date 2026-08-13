@@ -123,8 +123,12 @@ type QueueStatus @table(database: "render_service") @sealed @export(name: "queue
 
 # Desired pause state — the *intent*, as opposed to QueueStatus's *observed* status.
 #
-# QueueStatus can't carry this: each node rewrites its own row every status sync, so an
-# intent written there by another node would be clobbered. This table is replicated
+# QueueStatus can't carry this: a node owns the row keyed by its own hostname and rewrites it
+# whenever its status changes, so an intent written there by another node would be clobbered.
+# (It rewrites on a CHANGE, not on every sync — `reportStatus` guards the write behind a
+# compareExchange on a node-local shared buffer so the per-request and per-claim-pass callers
+# never turn into replicated writes. `updatedTime` therefore means "status last changed", and
+# nothing should read it as a heartbeat.) This table is replicated
 # (the default), so a write on any node reaches every node, and each node's periodic
 # refreshQueueStatus resolves it onto its local (non-replicated) queue-state flag.
 #
