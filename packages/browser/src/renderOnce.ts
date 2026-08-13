@@ -95,7 +95,7 @@ export interface RenderResult {
 	outcome: RenderOutcome;
 	statusCode: number | undefined;
 	isIndexable: boolean | undefined;
-	/** Why no cacheable content: 'noindex' | 'canonical-mismatch' | 'http-error' | 'redirect-loop' | 'redirect' | 'error'. */
+	/** Why no cacheable content: 'noindex' | 'canonical-mismatch' | 'canonical-variant' | 'http-error' | 'redirect-loop' | 'redirect' | 'error'. */
 	reason: string | undefined;
 	/** Normalized redirect target (job.redirectedTo), if the final URL canonically differs. */
 	redirectedTo: string | undefined;

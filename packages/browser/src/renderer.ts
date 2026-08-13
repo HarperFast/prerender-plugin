@@ -3,7 +3,7 @@ import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
-import { canonicalizeUrl, canonicalAllowsIndex } from './util/url.js';
+import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 
 const noop = () => {};
@@ -450,8 +450,19 @@ const renderer: Renderer = async (page, job) => {
 
 		if (statusCode === 200) {
 			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
-			job.isIndexable = !noindex && canonicalAllowsIndex(canonicalHref, rawPageUrl);
-			if (!job.isIndexable) job.reason = noindex ? 'noindex' : 'canonical-mismatch';
+			// A canonical naming a DIFFERENT document always disowns the page — invariable, every
+			// site. A canonical naming this very document RE-SPELLED as another cache key
+			// ('variant') is only a duplicate if the site's origin cannot tell the two spellings
+			// apart, which is a property of its query parser, not of the URLs — so that half is
+			// config, defaulting to the historical lenient reading. See config.canonical.strict.
+			// Either way the reason slug is distinct, so duplicate spellings stay legible next to
+			// genuine mismatches.
+			const verdict = canonicalVerdict(canonicalHref, rawPageUrl);
+			const disowned = verdict === 'elsewhere' || (verdict === 'variant' && config.canonical.strict);
+			job.isIndexable = !noindex && !disowned;
+			if (!job.isIndexable) {
+				job.reason = noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
+			}
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const ppStart = Date.now();

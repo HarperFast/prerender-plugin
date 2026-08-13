@@ -198,6 +198,52 @@ export type WaitForRule = {
 	pathPattern?: string;
 };
 
+/**
+ * How to read a page's `<link rel="canonical">` — see `canonicalVerdict` in util/url.ts.
+ *
+ * A canonical that names a DIFFERENT document always makes the page non-indexable; that much is
+ * invariable. The open question is the re-spelling: a canonical that names this very document
+ * under a different cache key ('variant'), which happens when a site writes a space as `+` where
+ * its sitemap writes `%20`, or vice versa. Whether those two spellings are one resource is a fact
+ * about the SITE's query parsing, not about the URLs — a form-decoding origin cannot tell them
+ * apart, an RFC-3986 one can — so it is config, not a hardcoded assumption.
+ *
+ * `strict: false` (default) reproduces the historical reading exactly: a re-spelling counts as
+ * self-canonical and gets its own target. `strict: true` calls it a duplicate key and reports
+ * `canonical-variant`, so the plugin retires it instead of rendering the same bytes twice forever.
+ *
+ * Turn it on only for a site whose origin form-decodes its query. One request settles that for a
+ * given parameter, for every URL: ask for a value containing a literal `+` (`?f=A%2BB`) and then
+ * the same value with a raw `+` (`?f=A+B`). If the origin resolves the second as a SPACE — its
+ * canonical comes back `A%20B`, or it simply serves what `A B` names — it form-decodes, and the
+ * two spellings can never name different resources.
+ */
+export type CanonicalConfig = {
+	/** Treat a re-spelled self-canonical as a duplicate cache key (non-indexable). Default false. */
+	strict: boolean;
+};
+
+/**
+ * The parts of the plugin's `cacheKey` policy that change WHICH URLS ARE THE SAME KEY, mirrored
+ * here because the renderer must agree with the plugin about identity or it retires healthy URLs.
+ *
+ * Only these two. The plugin's `decodeReserved` deliberately has no twin: it changes the bytes of
+ * a key, but the browser never builds one — it only compares two URLs it normalized itself
+ * (`page.url()` vs the job URL for redirect detection; canonical vs `page.url()` for the
+ * indexability verdict), and both sides of every comparison go through the same function. These
+ * two are different: a job URL keyed under a folded (or slash-preserved) spelling gets compared
+ * against a canonical spelled the plugin's way, so a renderer configured differently from the
+ * plugin reads healthy pages as canonicalizing elsewhere and reports them non-indexable.
+ *
+ * Keep both in step with the plugin's config, and deploy the two together.
+ */
+export type CacheKeyConfig = {
+	/** Fold `%20` to `+` in the query (plugin: `cacheKey.plusIsSpace`). Default false. */
+	plusIsSpace: boolean;
+	/** Whether `/a/` and `/a` are one key (plugin: `cacheKey.trailingSlash`). Default 'strip'. */
+	trailingSlash: 'strip' | 'preserve';
+};
+
 export type PrerenderConfig = {
 	/** Device profiles keyed by the job's `deviceType`; unknown types fall back to `defaultDevice`. */
 	devices: Record<string, DeviceProfile>;
@@ -206,6 +252,8 @@ export type PrerenderConfig = {
 	navigation: NavigationConfig;
 	scroll: ScrollConfig;
 	postProcess: PostProcessConfig;
+	canonical: CanonicalConfig;
+	cacheKey: CacheKeyConfig;
 	/**
 	 * Optional declarative "wait for content" rules applied after scroll/settle and before the
 	 * snapshot (see {@link WaitForRule}). Absent by default → a complete no-op, so existing
@@ -255,6 +303,8 @@ export const defaultConfig = (): PrerenderConfig => ({
 		stripBlockedResources: false,
 		resolveLazyImages: false,
 	},
+	canonical: { strict: false },
+	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
 });

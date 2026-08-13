@@ -178,6 +178,50 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'In forwarded mode a matched route’s own `queryParams` takes precedence.',
 				{ movedFrom: 'url.queryParams', itemType: 'string' }
 			),
+			decodeReserved: option(
+				[':', ',', '@'],
+				'RESERVED characters to decode when they appear percent-encoded, so one logical URL ' +
+					'spelled two ways is one cache key. The UNRESERVED set (letters, digits, `- . _ ~`) is ' +
+					'always decoded — RFC 3986 says those escapes denote the same character, so it holds for ' +
+					'every site. These do not: whether `%3A` and `:` name the same page is a fact about how ' +
+					'your origin parses URLs.\n' +
+					'  [":", ",", "@"] — the characters WHATWG `new URL()` and Chrome emit literally in a ' +
+					'query, so a sitemap loc, a CDN-forwarded request and a Chrome redirect target agree (default)\n' +
+					'  [] — decode nothing beyond the unreserved set (what a CDN does)\n' +
+					'Structural characters are refused: decoding `&` `=` `+` `#` `/` `%` or `|` would reparse ' +
+					'the URL into a different shape. Beware list-valued params — an API that reads `?ids=1,2,3` ' +
+					'as three values and `%2C` as a literal comma inside one is a site where `,` must be removed ' +
+					'from this list.',
+				{ itemType: 'string', itemEnum: [':', ',', '@', ';', '$', "'", '(', ')', '!', '*'] }
+			),
+			trailingSlash: option(
+				'strip',
+				'Whether `/a/` and `/a` are one cache key.\n' +
+					'  strip — drop a trailing slash on a non-root path, so they collapse (default)\n' +
+					'  preserve — keep them apart, and answer each with what the origin says about it\n' +
+					'No standard makes them one resource, and it can differ per ROUTE on one site: an origin ' +
+					'that 404s or 403s the slashed form is giving a different answer, and stripping has us ' +
+					'reply on its behalf with a page it refused. Check before choosing — request both ' +
+					'spellings of a path on each route shape you serve.',
+				{ enum: ['strip', 'preserve'] }
+			),
+			plusIsSpace: option(
+				false,
+				'Treat `%20` and `+` in the QUERY as one spelling of a space (folded to `+`), so a ' +
+					'crawler-invented re-encoding is the same cache key as the URL your sitemap declares — ' +
+					'not a second target rendering the same page forever.\n' +
+					'Only enable it for an origin that FORM-DECODES its query, where `+` means space and the ' +
+					'two spellings cannot name different resources. One request per allowlisted parameter ' +
+					'settles that for every URL on the site: ask for a value containing a literal plus ' +
+					'(`?f=A%2BB`), then the same value with a raw `+` (`?f=A+B`). If the second resolves as a ' +
+					'SPACE (its canonical comes back `A%20B`), the origin form-decodes. If the two return ' +
+					'different pages, leave this off — folding would serve one page under the other’s URL.\n' +
+					'`%2B` is never folded: a literal plus inside a value is a different value.\n' +
+					'MIRROR THIS IN THE RENDERER (`@harperfast/prerender-browser` `cacheKey.plusIsSpace`). It ' +
+					'changes which URLs are the same key, so a renderer left unfolded reads every folded URL ' +
+					'as canonicalizing elsewhere and retires it.\n' +
+					'Enabling re-keys every affected URL: their cached pages are orphaned and re-render.'
+			),
 		}
 	),
 
@@ -1291,7 +1335,7 @@ export const describeConfigSchema = () => {
 		if (isOption(node)) {
 			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
 			out.default = clone(node.default);
-			for (const key of ['enum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
+			for (const key of ['enum', 'itemEnum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
 				if (node[key] !== undefined) out[key] = node[key];
 			}
 			return out;

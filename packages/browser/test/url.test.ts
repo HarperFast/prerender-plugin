@@ -1,22 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import {
-	canonicalizeUrl,
-	normalizeUrlForCompare,
-	normalizeCanonicalUrl,
-	canonicalAllowsIndex,
-} from '../dist/util/url.js';
+import { canonicalizeUrl, normalizeUrlForCompare, normalizeCanonicalUrl, canonicalVerdict } from '../dist/util/url.js';
+import { settings } from '../dist/settings.js';
 
 // The single shared vector, asserted by BOTH the browser (this file) and the plugin suite,
 // so the two canonicalizeUrl copies (TS here, JS in the plugin) cannot drift.
-const VECTORS: { url: string; allowlist: string[]; expected: string }[] = JSON.parse(
-	readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url), 'utf8')
-);
+const VECTORS: {
+	url: string;
+	allowlist: string[];
+	expected: string;
+	options?: Partial<typeof settings.config.cacheKey>;
+}[] = JSON.parse(readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url), 'utf8'));
 
 test('canonicalizeUrl matches every shared cache-key vector (must equal the plugin)', () => {
-	for (const { url, allowlist, expected } of VECTORS) {
-		assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
+	const original = { ...settings.config.cacheKey };
+	try {
+		for (const { url, allowlist, expected, options } of VECTORS) {
+			// A vector may pin a non-default cacheKey policy — the mirrored options, which the
+			// renderer must read the same way the plugin does or it disagrees about identity.
+			Object.assign(settings.config.cacheKey, original, options ?? {});
+			assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
+		}
+	} finally {
+		Object.assign(settings.config.cacheKey, original);
 	}
 });
 
@@ -31,42 +38,92 @@ test('canonicalizeUrl does not flag a non-redirect (encoding / trailing slash / 
 	assert.equal(canonicalizeUrl('https://example.com/a?f=X:Y'), canonicalizeUrl('https://example.com/a?f=X%3AY'));
 });
 
-// --- indexability (self-canonical) comparison — separate from the cache key ---
+// --- canonical verdict: read against the CACHE KEY, not the document ---
 
 // The request carries %3A (encoded colon) while the page's canonical uses the literal ':'.
-// They name the same resource, so the page is self-canonical → indexable.
+// canonicalizeUrl decodes both to ':', so they are one key → self-canonical → indexable.
 test('canonical with a decoded reserved char (: vs %3A) counts as self-canonical', () => {
 	const requested = 'https://example.com/c/page.jsp?f=A%3AB+g%3AC';
 	const canonical = 'https://example.com/c/page.jsp?f=A:B+g:C';
-	assert.equal(canonicalAllowsIndex(canonical, requested), true);
+	assert.equal(canonicalVerdict(canonical, requested), 'self');
 });
 
-test('a genuinely different canonical is NOT self-canonical (stays non-indexable)', () => {
+test('a genuinely different canonical points elsewhere (stays non-indexable)', () => {
 	const requested = 'https://example.com/c/page-a.jsp?f=A%3AB';
 	const canonical = 'https://example.com/c/page-b.jsp?f=X%3AY';
-	assert.equal(canonicalAllowsIndex(canonical, requested), false);
+	assert.equal(canonicalVerdict(canonical, requested), 'elsewhere');
 });
 
-test('no canonical → indexable', () => {
-	assert.equal(canonicalAllowsIndex(null, 'https://example.com/x'), true);
-	assert.equal(canonicalAllowsIndex(undefined, 'https://example.com/x'), true);
-	assert.equal(canonicalAllowsIndex('', 'https://example.com/x'), true);
+test('no canonical → self (indexable)', () => {
+	assert.equal(canonicalVerdict(null, 'https://example.com/x'), 'self');
+	assert.equal(canonicalVerdict(undefined, 'https://example.com/x'), 'self');
+	assert.equal(canonicalVerdict('', 'https://example.com/x'), 'self');
 });
 
 test('param order, trailing slash, and hash differences do not break self-canonical', () => {
 	const current = 'https://example.com/p?b=2&a=1';
-	assert.equal(canonicalAllowsIndex('https://example.com/p?a=1&b=2', current), true); // order
-	assert.equal(canonicalAllowsIndex('https://example.com/p/?b=2&a=1', current), true); // trailing slash
-	assert.equal(canonicalAllowsIndex('https://example.com/p?b=2&a=1#frag', current), true); // hash
+	assert.equal(canonicalVerdict('https://example.com/p?a=1&b=2', current), 'self'); // order
+	assert.equal(canonicalVerdict('https://example.com/p/?b=2&a=1', current), 'self'); // trailing slash
+	assert.equal(canonicalVerdict('https://example.com/p?b=2&a=1#frag', current), 'self'); // hash
 });
 
 test('a relative canonical resolves against the current URL', () => {
 	const current = 'https://example.com/c/page.jsp?f=A%3AB';
-	assert.equal(canonicalAllowsIndex('/c/page.jsp?f=A:B', current), true);
+	assert.equal(canonicalVerdict('/c/page.jsp?f=A:B', current), 'self');
 });
 
 test('a malformed canonical fails open (does not drop indexability)', () => {
-	assert.equal(canonicalAllowsIndex('http://[bad', 'https://example.com/x'), true);
+	assert.equal(canonicalVerdict('http://[bad', 'https://example.com/x'), 'self');
+});
+
+// THE CASE THIS VERDICT EXISTS FOR. A faceted origin resolves `+`, `%2B` and `%20` between
+// facets to the same page and canonicalizes all of them to the `+` spelling — but each spelling
+// is its own cache key, so without this verdict every crawler-invented re-encoding becomes a
+// second recurring target holding byte-identical content. The form-encoding comparison cannot
+// see it: `%20` and `+` collapse to the same string there, which is exactly why the verdict is
+// taken on canonicalizeUrl instead.
+test('a %20-for-+ separator re-spelling is a duplicate KEY, not a self-canonical page', () => {
+	const canonical = 'https://example.com/c/page.jsp?f=Color:Black+Size:Large';
+	const respelled = 'https://example.com/c/page.jsp?f=Color:Black%20Size:Large';
+	assert.notEqual(canonicalizeUrl(respelled, ['f']), canonicalizeUrl(canonical, ['f']));
+	assert.equal(normalizeCanonicalUrl(respelled), normalizeCanonicalUrl(canonical)); // same document…
+	assert.equal(canonicalVerdict(canonical, respelled), 'variant'); // …different key ⇒ suppress
+});
+
+test('a %2B-for-+ separator re-spelling is also non-indexable', () => {
+	const canonical = 'https://example.com/c/page.jsp?f=Color:Black+Size:Large';
+	const respelled = 'https://example.com/c/page.jsp?f=Color:Black%2BSize:Large';
+	assert.notEqual(canonicalVerdict(canonical, respelled), 'self');
+});
+
+test('facet values in another order are not self-canonical', () => {
+	const canonical = 'https://example.com/c/page.jsp?f=Color:Black+Size:Large';
+	const reordered = 'https://example.com/c/page.jsp?f=Size:Large+Color:Black';
+	assert.equal(canonicalVerdict(canonical, reordered), 'elsewhere');
+});
+
+// The mirror image, and the reason this must not be solved by folding `+` and `%2B` in the
+// cache key: in VALUE position they are different values (`BLACK+DECKER` the brand vs the two
+// facets `BLACK` and `DECKER`). A self-canonical page keeping `%2B` must stay indexable.
+test('a %2B inside a facet VALUE is self-canonical and must not be flagged', () => {
+	const url = 'https://example.com/c/page.jsp?f=Brand:ACME%2BCO';
+	assert.equal(canonicalVerdict(url, url), 'self');
+	assert.equal(canonicalVerdict('/c/page.jsp?f=Brand:ACME%2BCO', url), 'self');
+});
+
+// The rendered URL is already route-filtered, so params the route drops must not be able to
+// manufacture a mismatch — the plugin would never have keyed them in the first place.
+test('a param the route dropped cannot create a mismatch', () => {
+	const current = 'https://example.com/c/page.jsp?f=A:B';
+	assert.equal(canonicalVerdict('https://example.com/c/page.jsp?f=A:B&utm_source=x', current), 'self');
+	// …and a query-less request (a route that drops everything) ignores the canonical's query.
+	assert.equal(canonicalVerdict('https://example.com/p/prd-1?color=red', 'https://example.com/p/prd-1'), 'self');
+});
+
+// The reverse is a real verdict: the origin saying "the canonical of this filtered page is the
+// unfiltered one" means this key duplicates that one.
+test('a canonical that drops a param the request kept is not self', () => {
+	assert.notEqual(canonicalVerdict('https://example.com/c/page.jsp', 'https://example.com/c/page.jsp?f=A:B'), 'self');
 });
 
 test('normalizeCanonicalUrl canonicalizes encoding, param order, hash, and trailing slash', () => {
@@ -93,5 +150,22 @@ test('malformed percent-encoding falls back to raw instead of throwing', () => {
 		assert.doesNotThrow(() => normalizeCanonicalUrl(bad));
 		assert.doesNotThrow(() => canonicalizeUrl(bad));
 	}
-	assert.doesNotThrow(() => canonicalAllowsIndex('https://x.com/a', 'https://x.com/%E0%A0/a'));
+	assert.doesNotThrow(() => canonicalVerdict('https://x.com/a', 'https://x.com/%E0%A0/a'));
+});
+
+// The renderer must agree with the plugin about identity or it retires healthy pages: with the
+// fold ON in the plugin, a job URL is keyed `Bath+Rugs` while the page canonicalizes to
+// `Bath%20Rugs`. A renderer left unfolded reads that as a duplicate key and reports the page
+// non-indexable — which is why cacheKey.plusIsSpace is mirrored here and deployed together.
+test('with plusIsSpace mirrored, a folded job URL is self-canonical against the declared spelling', () => {
+	const jobUrl = 'https://example.com/c/page?f=Color:Blue+Silhouette:Bath+Rugs';
+	const canonical = 'https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs';
+	const original = { ...settings.config.cacheKey };
+	try {
+		assert.equal(canonicalVerdict(canonical, jobUrl), 'variant', 'unfolded: reads as a duplicate key');
+		settings.config.cacheKey.plusIsSpace = true;
+		assert.equal(canonicalVerdict(canonical, jobUrl), 'self', 'mirrored: one key, so indexable');
+	} finally {
+		Object.assign(settings.config.cacheKey, original);
+	}
 });

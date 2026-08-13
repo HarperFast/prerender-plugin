@@ -113,7 +113,9 @@ export default class RenderJob {
 	/**
 	 * Why this render produced no cacheable content — one slug across every no-content class,
 	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
-	 * 'canonical-mismatch' (page canonicalizes elsewhere), 'http-error' (non-200 document),
+	 * 'canonical-mismatch' (page canonicalizes to a different URL), 'canonical-variant'
+	 * (canonicalizes to the same URL RE-SPELLED — one document, two cache keys), 'http-error'
+	 * (non-200 document),
 	 * 'redirect-loop', 'redirect' (bailed at navigation), or 'error' (renderer threw — details
 	 * ride in the posted `error`). Unset when content was produced; sendResult derives the
 	 * redirect/error fallbacks so callers only set the values they alone can know.

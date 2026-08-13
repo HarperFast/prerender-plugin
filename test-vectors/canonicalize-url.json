@@ -78,5 +78,80 @@
 		"url": "https://example.com/a?z=1&m=2&a=3",
 		"allowlist": ["*"],
 		"expected": "https://example.com/a?a=3&m=2&z=1"
+	},
+	{
+		"note": "RFC 3986 §6.2.2.2 — an unreserved escape denotes the same character, so this is ONE resource, for every origin. No CDN would key these apart and neither do we.",
+		"url": "https://example.com/%68ello/w%6Frld?f=A%2Db",
+		"allowlist": ["f"],
+		"expected": "https://example.com/hello/world?f=A-b"
+	},
+	{
+		"note": "A %2E that survives parsing is inside a real segment, so it decodes like any unreserved escape. (The dot-segment spellings never survive: WHATWG new URL() resolves /%2E%2E/ and /%2e/ before we see the path — RFC 3986 §6.2.2.3 in the parser.)",
+		"url": "https://example.com/a%2Eb/x?f=y%2Ez",
+		"allowlist": ["f"],
+		"expected": "https://example.com/a.b/x?f=y.z"
+	},
+	{
+		"note": "Structural escapes are never decoded — %26 would split the query into two params and %2F would invent a path segment.",
+		"url": "https://example.com/c/page?f=Coats%20%26%20Jackets%2FOuterwear",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=Coats%20%26%20Jackets%2FOuterwear"
+	},
+	{
+		"note": "Escape hex is upper-cased whatever happens to it (RFC 3986 §6.2.2.1).",
+		"url": "https://example.com/c/page?f=a%2fb%26c",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=a%2Fb%26c"
+	},
+	{
+		"note": "plusIsSpace OFF (default): the two spellings of a space stay two keys — the historical behavior, and the only safe reading for an origin that does not form-decode.",
+		"url": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs"
+	},
+	{
+		"note": "plusIsSpace ON: %20 folds to + in the QUERY, so a crawler's re-encoding lands on the sitemap URL's key. %2B is untouched — a literal plus in a value is a different value.",
+		"url": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs+Brand:ACME%2BCO",
+		"allowlist": ["f"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath+Rugs+Brand:ACME%2BCO"
+	},
+	{
+		"note": "plusIsSpace ON folds before sorting, so two spellings of one multi-param query produce the SAME key (folding after would order them differently: %25 < %2B).",
+		"url": "https://example.com/c/page?b=x%20y&a=1",
+		"allowlist": ["*"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/c/page?a=1&b=x+y"
+	},
+	{
+		"note": "plusIsSpace is query-scoped: a path keeps %20, because form-decoding is a query rule and `+` in a path is a literal plus.",
+		"url": "https://example.com/a%20b/c?f=x%20y",
+		"allowlist": ["f"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/a%20b/c?f=x+y"
+	},
+	{
+		"note": "trailingSlash: preserve keeps /a/ and /a apart, so each is answered with what the origin says about it.",
+		"url": "https://example.com/a/?f=1",
+		"allowlist": ["f"],
+		"options": {
+			"trailingSlash": "preserve"
+		},
+		"expected": "https://example.com/a/?f=1"
+	},
+	{
+		"note": "trailingSlash: preserve still leaves the root alone (there is no slash to preserve or strip).",
+		"url": "https://example.com/",
+		"allowlist": [],
+		"options": {
+			"trailingSlash": "preserve"
+		},
+		"expected": "https://example.com/"
 	}
 ]

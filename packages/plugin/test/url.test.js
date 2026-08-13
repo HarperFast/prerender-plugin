@@ -11,9 +11,12 @@ beforeEach(() => applyOptions({}));
 const VECTORS = JSON.parse(readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url)));
 
 test('canonicalizeUrl matches every shared cache-key vector', () => {
-	for (const { url, allowlist, expected } of VECTORS) {
+	for (const { url, allowlist, expected, options } of VECTORS) {
+		// A vector may pin a non-default cacheKey policy; both suites apply it their own way.
+		applyOptions(options ? { cacheKey: options } : {});
 		assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
 	}
+	applyOptions({});
 });
 
 test('default allowlist keeps only the page param and drops the hash', () => {
@@ -75,4 +78,113 @@ test('the returned half round-trips through new URL() unchanged (safe to build a
 test('accepts a URL object and an explicit allowlist overrides the global policy', () => {
 	applyOptions({ cacheKey: { queryParams: ['page'] } });
 	assert.equal(canonicalizeUrl(new URL('https://x.com/a?page=2&f=foo&utm=z'), ['f']), 'https://x.com/a?f=foo');
+});
+
+// --- RFC 3986 §6.2.2 normalization: the part no site can disagree with ---
+
+test('unreserved escapes are always decoded (percent-encoding normalization)', () => {
+	// ALPHA / DIGIT / - . _ ~ — `/%68ello` and `/hello` are the same resource by definition,
+	// so keying them apart would be a duplicate for every origin that exists.
+	assert.equal(canonicalizeUrl('https://x.com/%68ello/w%6Frld', []), 'https://x.com/hello/world');
+	assert.equal(canonicalizeUrl('https://x.com/a?f=%41%2D%5F%7E%39', ['f']), 'https://x.com/a?f=A-_~9');
+});
+
+test('%2E needs no special case — the parser resolved dot segments first', () => {
+	// The worry is that decoding %2E manufactures a `.`/`..` segment and re-points the path.
+	// It cannot: WHATWG new URL() resolves dot segments in their ENCODED spellings too, so
+	// they are gone before this runs, and what survives is inside a real segment.
+	assert.equal(canonicalizeUrl('https://x.com/p/%2E%2E/x', []), 'https://x.com/x'); // .. popped `p`
+	assert.equal(canonicalizeUrl('https://x.com/a%2Eb', []), 'https://x.com/a.b');
+	assert.equal(canonicalizeUrl('https://x.com/a?f=1%2E5', ['f']), 'https://x.com/a?f=1.5');
+});
+
+test('structural escapes are never decoded, whatever the config says', () => {
+	// %26 would split the query in two, %2F would invent a path segment, %2B would change a
+	// facet separator into a literal plus. The schema refuses them in decodeReserved (below).
+	assert.equal(
+		canonicalizeUrl('https://x.com/a?f=Coats%20%26%20Jackets%2FOuterwear%2Bx', ['f']),
+		'https://x.com/a?f=Coats%20%26%20Jackets%2FOuterwear%2Bx'
+	);
+});
+
+// --- decodeReserved: the part that IS a claim about one origin ---
+
+test('decodeReserved defaults to the WHATWG/Chrome-literal set', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC%40D', ['f']), 'https://x.com/a?f=A:B,C@D');
+});
+
+test('decodeReserved: [] decodes nothing beyond unreserved (what a CDN does)', () => {
+	applyOptions({ cacheKey: { decodeReserved: [] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC%40D', ['f']), 'https://x.com/a?f=A%3AB%2CC%40D');
+	// …while the standards-mandated half is unaffected by config.
+	assert.equal(canonicalizeUrl('https://x.com/%68i', []), 'https://x.com/hi');
+});
+
+test('decodeReserved can drop the comma alone — for a site with list-valued params', () => {
+	applyOptions({ cacheKey: { decodeReserved: [':', '@'] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC', ['f']), 'https://x.com/a?f=A:B%2CC');
+});
+
+test('a structural character in decodeReserved is refused and the default kept', () => {
+	// Whole-list rejection: `&` in the set would decode a separator into every key, and a
+	// half-applied key policy is worse than the default one.
+	applyOptions({ cacheKey: { decodeReserved: [':', '&'] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%26C', ['f']), 'https://x.com/a?f=A:B%26C');
+});
+
+test('a live decodeReserved change takes effect (the cached set is rebuilt on apply)', () => {
+	// The set is cached across calls because this runs per URL on the read path and per URL on
+	// sitemap ingestion; the cache must not outlive a config apply.
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A:B');
+	applyOptions({ cacheKey: { decodeReserved: [] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A%3AB');
+	applyOptions({});
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A:B');
+});
+
+// --- trailingSlash: /a/ vs /a is a per-site fact, so it is a policy, not a rule ---
+
+test('trailingSlash strips by default and preserves when told to', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a');
+	applyOptions({ cacheKey: { trailingSlash: 'preserve' } });
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a/');
+	assert.equal(canonicalizeUrl('https://x.com/a', []), 'https://x.com/a');
+	// The root has no trailing slash to argue about under either policy.
+	assert.equal(canonicalizeUrl('https://x.com/', []), 'https://x.com/');
+});
+
+test('an unknown trailingSlash value is refused and the default kept', () => {
+	applyOptions({ cacheKey: { trailingSlash: 'sometimes' } });
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a');
+});
+
+// --- plusIsSpace: only true where the origin form-decodes, so off by default ---
+
+test('plusIsSpace folds %20 to + in the query, and only there', () => {
+	const respelled = 'https://x.com/a%20b/c?f=Color:Blue+Silhouette:Bath%20Rugs';
+	const declared = 'https://x.com/a%20b/c?f=Color:Blue+Silhouette:Bath+Rugs';
+	// Off: two spellings, two keys — a duplicate target for the same page.
+	assert.notEqual(canonicalizeUrl(respelled, ['f']), canonicalizeUrl(declared, ['f']));
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	assert.equal(canonicalizeUrl(respelled, ['f']), canonicalizeUrl(declared, ['f']));
+	// The PATH keeps its %20: form-decoding is a query rule, and `+` in a path is a literal plus.
+	assert.match(canonicalizeUrl(respelled, ['f']), /\/a%20b\/c/);
+});
+
+test('plusIsSpace never folds %2B — a literal plus in a value is a different value', () => {
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	// Brand:ACME+CO (two facets) and Brand:ACME%2BCO (one brand) must stay different keys.
+	assert.notEqual(
+		canonicalizeUrl('https://x.com/a?f=Brand:ACME%2BCO', ['f']),
+		canonicalizeUrl('https://x.com/a?f=Brand:ACME+CO', ['f'])
+	);
+	assert.equal(canonicalizeUrl('https://x.com/a?f=Brand:ACME%2BCO', ['f']), 'https://x.com/a?f=Brand:ACME%2BCO');
+});
+
+test('plusIsSpace folds before sorting, so re-spellings of a multi-param query agree', () => {
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	assert.equal(
+		canonicalizeUrl('https://x.com/a?b=x%20y&a=1', ['*']),
+		canonicalizeUrl('https://x.com/a?a=1&b=x+y', ['*'])
+	);
 });
