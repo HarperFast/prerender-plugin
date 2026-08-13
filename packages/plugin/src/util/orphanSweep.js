@@ -18,8 +18,15 @@
  *     is `self` and the suppression path never fires.
  *
  * Measured after enabling `cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls
- * re-keyed, i.e. ~40,400 schedule rows still rendering every 6h into keys no request can
- * produce — about 9.5% of the fleet's measured throughput ceiling, indefinitely.
+ * re-keyed, i.e. ~40,400 schedule rows rendering into keys no request can produce.
+ *
+ * THE NOMINAL INTERVAL IS NOT THE RATE, so don't size this by dividing rows by interval.
+ * `nextRenderTime` is stamped at COMPLETION, so a row rendered `L` behind its due time has its
+ * next render set `interval` after that: the realized cycle is `interval + L`, and the lag is
+ * carried forward rather than caught up. At the 8.2h lag observed there, orphans on a 6h
+ * interval ran a ~14h cycle — ~2,900 renders/hr, ~4% of the measured ceiling. Against the work
+ * the fleet was actually completing (every class stretched by the same `interval + L`) they
+ * were ~8%, which is the number that matters while it is saturated.
  *
  * THE PREDICATE IS THE FIXED-POINT TEST, NOT "unlinked". A target is orphaned iff
  * `canonicalizeUrl(url, queryAllowlistFor(url))` differs from its stored `url` — that is the

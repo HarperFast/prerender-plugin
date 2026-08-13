@@ -727,8 +727,16 @@ Nothing else cleans them up. A sitemap refresh creates the target under the new 
 _unlinks_ the old one (`sitemapUrl → null`), which does not touch its schedule. And the canonical
 verdict cannot retire them either: with the rule applied on both sides, the renderer folds the job
 url and the declared canonical alike and calls it `self`. Measured after enabling
-`cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ~40,400 schedule rows,
-roughly **9.5% of fleet throughput** spent on dead keys, indefinitely.
+`cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ~40,400 schedule rows.
+
+Sizing that cost needs care, because the nominal interval is **not** the rate. `nextRenderTime` is
+stamped at _completion_, so a row rendered `L` behind its due time has its next render set `interval`
+after that: the realized cycle is `interval + L`, and the lag is carried into every subsequent cycle
+rather than caught up. With the queue ~8.2h behind and catalog on a 6h interval, those orphans run a
+~14h cycle, not 6h — ~2,900 renders/hr, about **4% of the measured throughput ceiling**. But the
+ceiling is the wrong denominator while the fleet is saturated: against the work it is actually
+completing (every class stretched by the same `interval + L`) the orphans are ~**8%**. Deleting them
+also shortens `L` for everything else, which shortens every class's realized cycle in turn.
 
 `POST /prerender_admin/sweep-orphans` is the cleanup. The predicate is the **fixed-point test** —
 `canonicalizeUrl(url, queryAllowlistFor(url)) !== url` — which is the general statement of "no

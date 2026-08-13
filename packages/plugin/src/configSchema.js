@@ -946,7 +946,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'the rule applied on both sides the renderer folds the job url and the declared canonical ' +
 				'alike and calls it `self`. So they render forever into keys nothing reads. Measured after ' +
 				'enabling `cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ' +
-				'~40,400 schedule rows, ~9.5% of fleet throughput spent on dead keys.\n\n' +
+				'~40,400 schedule rows. Sizing that needs care: `nextRenderTime` is stamped at COMPLETION, ' +
+				'so a row rendered `L` behind its due time next renders `interval` after that — the realized ' +
+				'cycle is `interval + L`, not `interval`. At the 8.2h lag observed there, those orphans ran a ' +
+				'~14h cycle (~2,900 renders/hr, ~4% of the throughput ceiling) — but ~8% of the work the ' +
+				'fleet was actually completing, which is the number that matters while it is saturated.\n\n' +
 				'MANUAL ONLY, BY DESIGN — there is no timer. This deletes corpus, and the population it ' +
 				'targets is created by an operator changing a `cacheKey` option, so it should run when ' +
 				'someone decides to run it (POST /prerender_admin/sweep-orphans) rather than on a schedule ' +
