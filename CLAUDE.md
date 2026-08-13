@@ -121,7 +121,7 @@ CDN ──bot/crawler traffic──▶  <customer>-pr  (Harper component + @harp
 
 | Repo                 | Role                                                   | Branch model                                                                           | Dep on the monorepo                              |
 | -------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| **prerender-plugin** | source monorepo (three packages)                         | PRs → `main`                                                                           | —                                                |
+| **prerender-plugin** | source monorepo (three packages)                       | PRs → `main`                                                                           | —                                                |
 | **`<customer>-pr`**  | Harper component, serves bot traffic behind the CDN    | PRs → `main`                                                                           | `@harperfast/prerender` tarball (`prerender-v*`) |
 | **render-service**   | headless-browser render fleet, one branch per customer | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`)   |
 
