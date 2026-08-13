@@ -505,3 +505,112 @@ test('config: identical nodes report no divergence, and warnings are tagged by n
 		['a.example.com:9926', 'b.example.com:9926']
 	);
 });
+
+// ---- orphan sweep: node-scoped like reconcile, but MANUAL, which changes the merge ----
+
+test('mergeOverview sums orphan sweeps and names the nodes nobody has swept', () => {
+	// The shortfall that matters here is the opposite of reconcile's. There is no cadence to be
+	// "disabled" on — the sweep has no timer at all — so the hole is a node that has simply never
+	// been swept. It contributes zero to every total, which is indistinguishable from a node that
+	// came back clean, and unlike a scheduled sweep nothing will ever fill it in on its own.
+	const node = (hostname, lastRun) => ({
+		ok: true,
+		status: 200,
+		origin: `https://${hostname}:9926`,
+		hostname,
+		body: {
+			generatedAt: 1000,
+			nodes: [],
+			counts: {},
+			backlog: {},
+			control: {},
+			orphanSweep: { maxDeletes: 5000, dryRunDefault: true, running: false, lastRun },
+		},
+	});
+
+	const merged = mergeOverview([
+		node('a', { examined: 100, owned: 40, orphaned: 6, deleted: 6, leaseSkipped: 0, dryRun: false, finishedAt: 500 }),
+		node('b', { examined: 200, owned: 60, orphaned: 4, deleted: 0, leaseSkipped: 4, dryRun: true, finishedAt: 900 }),
+		node('c', null),
+	]).body.orphanSweep;
+
+	assert.equal(merged.lastRun.examined, 300);
+	assert.equal(merged.lastRun.owned, 100);
+	assert.equal(merged.lastRun.orphaned, 10);
+	assert.equal(merged.lastRun.deleted, 6);
+	assert.equal(merged.lastRun.leaseSkipped, 4);
+	assert.equal(merged.lastRun.nodes, 2, 'only the nodes that actually swept');
+	assert.equal(merged.lastRun.finishedAt, 500, 'as of the OLDEST sweep, not the newest');
+	// One node really deleted, so the cluster figure is not a dry run — reporting "nothing was
+	// deleted" because the majority were would be exactly backwards on a destructive action.
+	assert.equal(merged.lastRun.dryRun, false);
+	assert.deepEqual(merged.sweptNodes, 2);
+	assert.deepEqual(merged.unsweptNodes, ['c']);
+});
+
+// ---- node rows: liveness from the fan-out, replication gaps from the disagreement ----
+
+test('mergeOverview reads liveness from who ANSWERED, not from the row timestamp', () => {
+	// The row says when the status last CHANGED, and a busy node holding `queued` legitimately
+	// never changes — so an age threshold over it cannot tell healthy-and-steady from dead. The
+	// console just asked every node for this payload, so it knows which ones answered right now.
+	const body = (nodes) => ({ generatedAt: 1000, nodes, counts: {}, backlog: {}, control: {} });
+	const row = (hostname, statusChangedTime) => ({ hostname, status: 'queued', statusChangedTime });
+
+	const merged = mergeOverview([
+		{
+			ok: true,
+			status: 200,
+			origin: 'https://a:9926',
+			hostname: 'a',
+			body: { ...body([row('a', 1000), row('b', 5)]), node: 'a' },
+		},
+		{ ok: false, status: 0, origin: 'https://b:9926', hostname: 'b', error: 'connect ECONNREFUSED' },
+	]).body.nodes;
+
+	const [a, b] = merged;
+	assert.equal(a.responding, true);
+	// `b`'s row is ancient AND b is genuinely down — but those are two independent facts, and only
+	// the fan-out establishes the second one.
+	assert.equal(b.responding, false, 'b never answered, so it is not responding');
+	assert.equal(a.statusChangedTime, 1000, 'an old change time is not evidence of anything by itself');
+});
+
+test('mergeOverview surfaces a node whose row every PEER holds an older copy of', () => {
+	// The field signature of a one-way replication gap: the node's own copy of its row is hours
+	// newer than every peer's, because its outbound replication for that database has stopped
+	// while everything else on the link keeps flowing. Taking the freshest copy — which is what
+	// this merge used to do — hides exactly this.
+	const body = (reporter, v3tAt) => ({
+		generatedAt: 1000,
+		node: reporter,
+		nodes: [
+			{ hostname: 'yc0', status: 'queued', statusChangedTime: 900 },
+			{ hostname: 'v3t', status: 'queued', statusChangedTime: v3tAt },
+		],
+		counts: {},
+		backlog: {},
+		control: {},
+	});
+	const ok = (hostname, v3tAt) => ({
+		ok: true,
+		status: 200,
+		origin: `https://${hostname}:9926`,
+		hostname,
+		body: body(hostname, v3tAt),
+	});
+
+	const merged = mergeOverview([ok('yc0', 100), ok('v3t', 20_000)]).body.nodes;
+	const v3t = merged.find((n) => n.hostname === 'v3t');
+	const yc0 = merged.find((n) => n.hostname === 'yc0');
+
+	assert.equal(v3t.spreadMs, 19_900, "v3t's own copy is far newer than yc0's");
+	assert.deepEqual(
+		v3t.behind.map((x) => x.reporter),
+		['yc0'],
+		'and the reporter holding the stale copy is NAMED — that points at a link, not at a node'
+	);
+	assert.equal(v3t.responding, true, 'v3t is answering fine; this is replication, not liveness');
+	assert.equal(yc0.spreadMs, 0, 'a healthy row: every copy agrees');
+	assert.equal(yc0.behind.length, 0);
+});

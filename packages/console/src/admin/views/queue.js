@@ -35,7 +35,7 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
-import { statusPill } from './overview.js';
+import { nodeAge, statusPill } from './overview.js';
 
 export const meta = { id: 'queue', label: 'Queue & nodes', crumb: 'queue', icon: ICONS.queue };
 
@@ -233,7 +233,7 @@ function nodeTable(ctx, data, setPause) {
 				cls: 'mono' + (rateFor(node.hostname) ? '' : ' muted'),
 				text: rateFor(node.hostname) ?? '—',
 			}),
-			el('td', null, [el('span', { cls: node.stale ? 'pill warn' : 'muted', text: ago(node.updatedTime) })]),
+			el('td', null, [node.responding === false ? pill('not responding', 'bad') : nodeAge(node)]),
 			el('td', null, [
 				node.override
 					? node.override.paused
@@ -268,7 +268,7 @@ function nodeTable(ctx, data, setPause) {
 
 	return el('div', { cls: 'card' }, [
 		table(
-			['node', 'observed status', 'throughput', 'last report', 'intent', { text: 'actions', right: true }],
+			['node', 'observed status', 'throughput', 'status since', 'intent', { text: 'actions', right: true }],
 			rows,
 			'No nodes have reported queue status yet.'
 		),

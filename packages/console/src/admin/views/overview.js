@@ -55,6 +55,11 @@ import {
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
+// Row cap for the on-demand "Deep recompute". Sized to see past a backlog that has swallowed a
+// production-sized `management.scanCap` while staying well under the plugin's own 100k ceiling —
+// the point is to LEARN the real overdue figure once, not to make the deep walk routine.
+const DEEP_SCAN_CAP = 50_000;
+
 export async function load(ctx) {
 	const [res, analyticsRes] = await Promise.all([
 		ctx.get('overview'),
@@ -83,6 +88,7 @@ export function render(ctx) {
 		upcoming(ctx, data),
 		el('div', { cls: 'cols' }, [nodes(ctx, data), failures(ctx)]),
 		repair(ctx, data),
+		orphans(ctx, data),
 	];
 }
 
@@ -238,6 +244,19 @@ function upcoming(ctx, data) {
 		onclick: () => ctx.run(() => ctx.post('backlog', {})),
 	});
 
+	// A DEEPER walk, for this run only. Offered only when the last one truncated, because that
+	// is the state where the panel stops answering the question: the ascending scan spends its
+	// whole budget on overdue rows, so `overdue` reports the cap instead of a count and the
+	// histogram below is empty — not because nothing is due, but because the scan never got
+	// there. `management.scanCap` is sized for a walk that repeats every interval; this is the
+	// one-off that tells you what to size it to.
+	const deepen = el('button', {
+		text: 'Deep recompute',
+		disabled: ctx.busy || running || clusterScope,
+		title: `One deliberate ${num(DEEP_SCAN_CAP)}-row walk, this run only — the scheduled snapshot keeps using management.scanCap.`,
+		onclick: () => ctx.run(() => ctx.post('backlog', { cap: DEEP_SCAN_CAP })),
+	});
+
 	const body = [];
 
 	// THE ALARM FOR THE FAILURE MODE THE CLAIM FLOOR INTRODUCES. A row whose due time sits below
@@ -284,8 +303,10 @@ function upcoming(ctx, data) {
 	} else if (lastRun.truncated) {
 		body.push(
 			el('div', { cls: 'note warn' }, [
-				`The scan hit its ${num(lastRun.cap)}-row cap on the overdue backlog, so this distribution is ` +
-					'incomplete. Clear the backlog (or raise management.scanCap) to see the shape.',
+				`The scan hit its ${num(lastRun.cap)}-row cap on the overdue backlog, so the count above is a ` +
+					'FLOOR, not a total, and the histogram below is empty because the walk never reached a ' +
+					'not-yet-due row. "Deep recompute" runs one deeper walk to find the real figure — size ' +
+					'management.scanCap from what it reports.',
 			])
 		);
 	} else if (!buckets.some((bucket) => bucket.count)) {
@@ -317,6 +338,7 @@ function upcoming(ctx, data) {
 			enabled ? muted(`recomputed every ${duration(interval)}`) : pill('automatic snapshot disabled', 'warn'),
 			lastRun && muted(`as of ${ago(lastRun.finishedAt)}`),
 			recompute,
+			lastRun?.truncated && deepen,
 		],
 		body,
 	});
@@ -327,15 +349,33 @@ function nodes(ctx, data) {
 		el('tr', null, [
 			el('td', { cls: 'mono' }, [node.hostname, node.isThisNode && muted(' (this node)')]),
 			el('td', null, [statusPill(node.status)]),
-			el('td', { cls: 'right' }, [
-				el('span', { cls: node.stale ? 'pill warn' : 'muted', text: ago(node.updatedTime) }),
-			]),
+			// LIVENESS, and it is a live fact: whether this node answered the fan-out that built
+			// this page. Never inferred from the timestamp beside it — see nodeAge.
+			el('td', null, [node.responding === false ? pill('not responding', 'bad') : null]),
+			el('td', { cls: 'right' }, [nodeAge(node)]),
 		])
 	);
+
+	// A row every peer holds an older copy of means replication is not delivering that node's
+	// writes — the one thing this table can see that nothing else can, since it is the only place
+	// four copies of the same replicated row are compared side by side.
+	const diverged = data.nodes.filter((n) => n.behind?.length);
 
 	return card('Nodes', {
 		head: [spacer(), link('open queue →', () => ctx.go('queue'))],
 		body: [
+			diverged.length &&
+				el('div', { cls: 'note bad' }, [
+					'Replication gap: ' +
+						diverged
+							.map(
+								(n) =>
+									`${n.hostname}'s row is ${duration(n.spreadMs)} behind on ${n.behind.map((b) => b.reporter).join(', ')}`
+							)
+							.join('; ') +
+						'. Those nodes are not receiving that node’s writes to render_service — which also carries ' +
+						'Target, so URLs it discovers are not reaching them either.',
+				]),
 			el('div', { cls: 'scroll' }, [
 				el('table', null, [
 					el(
@@ -348,7 +388,14 @@ function nodes(ctx, data) {
 				]),
 			]),
 		],
-		foot: [muted('Per-node throughput, pause intent and claim health are on Queue & nodes.')],
+		foot: [
+			muted(
+				'“Status since” is when that node’s queue status last CHANGED — the row is written only on a ' +
+					'change, so a steady node showing hours is healthy, not stale. Liveness is the column beside ' +
+					'it: whether the node answered this page load. Per-node throughput, pause intent and claim ' +
+					'health are on Queue & nodes.'
+			),
+		],
 	});
 }
 
@@ -481,6 +528,108 @@ function repair(ctx, data) {
 		body,
 	});
 }
+
+// Targets orphaned by a CACHE-KEY RULE CHANGE: their stored url no longer canonicalizes to the
+// key they are filed under, so no request can ever produce it. They render forever into keys
+// nothing reads, and no other repair path can see them — which is exactly why the sweep's last
+// result belongs on the dashboard rather than only in the response to its own POST.
+//
+// MANUAL by design: there is no timer, because the population is created by an operator
+// changing a `cacheKey` option, and this deletes corpus.
+function orphans(ctx, data) {
+	const info = data.orphanSweep ?? {};
+	const last = info.lastRun;
+	const clusterScope = isMerged(ctx.data.overview);
+
+	const body = [];
+
+	// A node nobody has swept contributes ZERO to every total below, which is indistinguishable
+	// from a node that came back clean. Under cluster scope that is the shortfall worth naming —
+	// there is no schedule to fall back on, so an unswept node stays unswept until someone acts.
+	if (info.unsweptNodes?.length) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				`Never swept on ${info.unsweptNodes.join(', ')} — those nodes' keys are not represented in the ` +
+					'counts below, so the real orphan count is larger than shown.',
+			])
+		);
+	}
+
+	if (last?.error) {
+		body.push(el('div', { cls: 'note bad', text: `Last sweep failed: ${last.error}` }));
+	} else if (last) {
+		const stranded = (last.orphaned ?? 0) - (last.leaseSkipped ?? 0) - (last.deleted ?? 0);
+		body.push(
+			kv([
+				[
+					last.nodes > 1 ? `Oldest of ${last.nodes} sweeps` : 'Last sweep',
+					`${last.finishedAt ? ago(last.finishedAt) : 'unknown'}${last.dryRun ? ' (dry run — nothing deleted)' : ''}`,
+				],
+				['Targets examined', num(last.examined)],
+				[last.nodes > 1 ? 'Owned across nodes' : 'Owned by this node', num(last.owned)],
+				['Key-rule orphans found', last.orphaned ? pill(num(last.orphaned), 'warn') : pill('0', 'ok')],
+				['Deleted', last.dryRun ? muted('none — dry run') : num(last.deleted)],
+				// Deferred is not a failure: a key mid-render is skipped and caught next pass.
+				last.leaseSkipped ? ['Deferred as in-flight', pill(num(last.leaseSkipped), '')] : null,
+				last.truncated
+					? ['Truncated', pill(`hit the ${num(info.maxDeletes)} delete cap — ~${num(stranded)} remain`, 'bad')]
+					: null,
+			])
+		);
+	} else {
+		body.push(muted('No sweep has run on this node since startup. It has no timer — it runs when you run it.'));
+	}
+
+	body.push(
+		el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
+			'Run this after changing a ',
+			el('code', { text: 'cacheKey' }),
+			' option, and run it with the dry run first: the scan always completes, so the orphan count is ' +
+				'the true size of the population even when the delete cap stopped the removals. Each node ' +
+				'sweeps only the keys IT owns — the in-flight check reads that node’s own lease buffer — so ' +
+				'every node has to be swept to cover the keyspace.',
+		])
+	);
+
+	return card('Key-rule orphans', {
+		head: [
+			pill('manual — no timer'),
+			info.running && pill('running now', 'warn'),
+			spacer(),
+			el('button', {
+				text: clusterScope ? 'Sweep (pick a node)' : info.running ? 'Sweep running…' : 'Dry run',
+				disabled: ctx.busy || info.running || clusterScope,
+				title: clusterScope ? 'A sweep deletes among the keys one node owns. Switch to a node to run it there.' : null,
+				// Always an explicit dryRun: the button that deletes corpus should not be the one
+				// you reach by default, and the plugin's own default can be configured either way.
+				onclick: () => ctx.run(() => ctx.post('sweep-orphans', { dryRun: true })),
+			}),
+			el('button', {
+				cls: 'danger',
+				text: 'Delete orphans',
+				disabled: ctx.busy || info.running || clusterScope || !last || last.error || !last.orphaned,
+				title: !last?.orphaned ? 'Run a dry run first — this acts on what that census found.' : null,
+				onclick: () => ctx.run(() => ctx.post('sweep-orphans', { dryRun: false })),
+			}),
+		],
+		body,
+	});
+}
+
+/**
+ * How long a node has HELD its current queue status — never "how long since it reported".
+ *
+ * The QueueStatus row is written only when the status actually moves: `reportStatus` is called
+ * per bot request and per claim pass, and the node-local shared buffer exists so those paths do
+ * not each become a replicated write. So an old timestamp on a busy node means "it has been
+ * queued for three hours", which is health, not silence — and this used to render as an amber
+ * "stale" pill on every node in the cluster, permanently, which made the one node that had
+ * genuinely stopped indistinguishable from the three that were fine.
+ */
+export const nodeAge = (node) =>
+	Number.isFinite(node.statusChangedTime)
+		? muted(`since ${ago(node.statusChangedTime)}`)
+		: muted('status never recorded');
 
 export const statusPill = (status) =>
 	pill(

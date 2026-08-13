@@ -34,6 +34,7 @@ export const PROXIED_POST = Object.freeze([
 	'invalidate',
 	'revalidate',
 	'reconcile',
+	'sweep-orphans',
 	'backlog',
 	'sitemap',
 	'sitemap-refresh',

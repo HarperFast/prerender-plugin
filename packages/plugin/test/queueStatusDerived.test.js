@@ -191,6 +191,38 @@ test('a forced refresh writes the QueueStatus row', async () => {
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
 
+// ---- the status row is written ONLY on a CHANGE ----
+// `reportStatus` is called per bot request and per claim pass, and the node-local shared buffer
+// exists precisely so those paths do not each become a replicated write. A steady node therefore
+// writes nothing, and `updatedTime` means "status last CHANGED" — not "last reported".
+//
+// A heartbeat here was tried and reverted: it would have made every node's liveness legible at the
+// cost of a replicated write per node per interval forever, to re-derive something the console
+// already knows for free (whether the node answered its fan-out). Don't add it back. What the
+// console needed instead was to stop inferring liveness from this timestamp at all.
+
+test('a steady status writes NOTHING, however many syncs run', async () => {
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	await RenderQueue.refreshQueueStatus();
+	const first = statuses.get('node-a');
+	assert.equal(first?.status, 'queued', 'the flip to queued wrote once');
+
+	statuses.clear();
+	for (let i = 0; i < 5; i++) await RenderQueue.refreshQueueStatus();
+
+	assert.equal(statuses.size, 0, 'five more syncs at an unchanged status must not write at all');
+});
+
+test('a real change still writes, in both directions', async () => {
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'queued');
+
+	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'empty');
+});
+
 // ---- the lease-gauge walk rides on the status sync ----
 
 test('the status refresh reconciles the lease gauge, which otherwise climbs without bound', async () => {
