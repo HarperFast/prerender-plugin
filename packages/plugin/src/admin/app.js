@@ -14,13 +14,29 @@
 import { el, harperMark, icon, muted, pill, spacer } from './ui.js';
 import { get, post, setExpiredHandler } from './api.js';
 import * as overview from './views/overview.js';
+import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
 import * as sitemaps from './views/sitemaps.js';
 import * as pages from './views/pages.js';
+import * as invalidations from './views/invalidations.js';
 import * as explain from './views/explain.js';
+import * as metricsref from './views/metricsref.js';
 import * as config from './views/config.js';
 
-const VIEWS = [overview, sitemaps, pages, queue, null /* divider */, explain, config];
+// Ordered as an operator triages: is it working (overview, traffic), what is it working on
+// (sitemaps, pages), is the machinery healthy (queue), then actions and reference.
+const VIEWS = [
+	overview,
+	traffic,
+	sitemaps,
+	pages,
+	queue,
+	invalidations,
+	null /* divider */,
+	explain,
+	metricsref,
+	config,
+];
 const BY_ID = new Map(VIEWS.filter(Boolean).map((view) => [view.meta.id, view]));
 
 const state = {

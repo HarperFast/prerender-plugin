@@ -488,6 +488,38 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'per-entry state lookups a sitemap detail performs (point reads, one per row).',
 				{ min: 1 }
 			),
+			analytics: group(
+				'The console’s Traffic/queue-health charts: ONE bounded primary-key scan of this node’s ' +
+					'`system.hdb_analytics` per refresh (never one scan per metric name — the table is ' +
+					'indexed only by time, so a name is a scan and a series is a row), bucketed ' +
+					'server-side and cached per worker. The console never polls; a scan happens only when ' +
+					'an operator loads a view whose cached window has expired.',
+				{
+					enabled: option(true, 'Serve GET /prerender_admin/analytics and the console panels that read it.'),
+					maxRange: option(
+						DAY,
+						'Ceiling on the window one analytics request may ask for. The scan cost scales ' +
+							'directly with the window (rows = active metric combos × aggregate periods), so ' +
+							'this is the knob that bounds the worst read an operator can trigger.',
+						{ unit: 'ms', min: MINUTE }
+					),
+					cacheTtl: option(
+						MINUTE,
+						'How long a scanned window is served from the per-worker cache before a refresh ' +
+							're-scans. Matches Harper’s default analytics aggregation period — refreshing ' +
+							'faster cannot surface new rows, only repeat the scan.',
+						{ unit: 'ms', min: 0 }
+					),
+					scanCap: option(
+						150000,
+						'Ceiling on rows one analytics scan walks. The walk runs NEWEST-FIRST, so past the ' +
+							'cap it is the oldest end of the window that is shed, and the response reports ' +
+							'the window it actually covered rather than presenting a partial range as the ' +
+							'full one.',
+						{ min: 1000 }
+					),
+				}
+			),
 		}
 	),
 

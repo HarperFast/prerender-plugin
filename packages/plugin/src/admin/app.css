@@ -789,6 +789,196 @@ td .row-actions {
 	color: var(--fg-3);
 }
 
+/* ---------- Analytics charts (charts.js) ----------
+ *
+ * Series colors live in charts.js next to the assignment rules (they are validated as a
+ * set, so they change together or not at all); everything structural is here. Marks are
+ * thin with 2px surface gaps so stacked segments stay separable without relying on hue.
+ */
+
+.tchart {
+	display: flex;
+	align-items: flex-end;
+	gap: 2px;
+	height: 150px;
+	border-bottom: 1px solid var(--border-2);
+}
+.tchart .col {
+	flex: 1;
+	min-width: 0;
+	height: 100%;
+	display: flex;
+	/* Stacks build bottom-up: first appended segment sits on the baseline. */
+	flex-direction: column-reverse;
+	gap: 2px;
+}
+.tchart .col:hover {
+	background: rgba(255, 255, 255, 0.04);
+}
+.tchart .seg {
+	border-radius: 2px;
+	min-height: 2px;
+}
+
+.tchart-wrap {
+	position: relative;
+	height: 150px;
+	border-bottom: 1px solid var(--border-2);
+}
+.tline {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	display: block;
+}
+.tline .grid {
+	stroke: var(--border-1);
+	stroke-width: 1;
+	vector-effect: non-scaling-stroke;
+}
+.tline .band {
+	stroke: var(--fg-3);
+	stroke-width: 1;
+	stroke-dasharray: 4 4;
+	vector-effect: non-scaling-stroke;
+}
+.hover-cells {
+	position: absolute;
+	inset: 0;
+	display: flex;
+}
+.hover-cells .cell {
+	flex: 1;
+	min-width: 0;
+}
+.hover-cells .cell:hover {
+	background: rgba(255, 255, 255, 0.05);
+}
+.tchart-wrap .ymax {
+	position: absolute;
+	top: 2px;
+	right: 4px;
+	font-size: 10px;
+	color: var(--fg-3);
+	pointer-events: none;
+}
+
+.taxis {
+	display: flex;
+	justify-content: space-between;
+	margin-top: 6px;
+	font-size: 10px;
+	color: var(--fg-3);
+}
+
+.legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 12px;
+	align-items: center;
+	font-size: 11px;
+	color: var(--fg-2);
+}
+.legend .key {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	white-space: nowrap;
+}
+.legend .swatch {
+	width: 8px;
+	height: 8px;
+	border-radius: 2px;
+	flex: none;
+}
+
+.barlist {
+	display: flex;
+	flex-direction: column;
+	gap: 7px;
+}
+.barlist .brow {
+	display: grid;
+	grid-template-columns: minmax(90px, 160px) 1fr 56px auto;
+	align-items: center;
+	gap: 10px;
+}
+.barlist .blabel {
+	font-size: 12px;
+	color: var(--fg-2);
+}
+.barlist .btrack {
+	height: 10px;
+	border-radius: 3px;
+	background: var(--bg-3);
+	overflow: hidden;
+}
+.barlist .bfill {
+	display: block;
+	height: 100%;
+	border-radius: 3px;
+}
+.barlist .bvalue {
+	font-size: 12px;
+	text-align: right;
+}
+.barlist .bsub {
+	font-size: 11px;
+	white-space: nowrap;
+}
+
+/* Segmented range picker, sized like a small button group. */
+.segctl {
+	display: inline-flex;
+	border: 1px solid var(--border-2);
+	border-radius: var(--r-md);
+	overflow: hidden;
+}
+.segctl button {
+	border: none;
+	border-radius: 0;
+	padding: 5px 12px;
+	background: transparent;
+}
+.segctl button + button {
+	border-left: 1px solid var(--border-2);
+}
+.segctl button.on {
+	background: var(--bg-4);
+	color: var(--fg-0);
+}
+
+/* A denser stat row for inside a card (the overview serve strip). */
+.stat-grid.tight {
+	margin-bottom: 14px;
+}
+.stat-grid.tight .value {
+	font-size: 20px;
+}
+
+.chart-note {
+	margin: 12px 0 0;
+	font-size: 12px;
+}
+.panel-sub {
+	font-size: 11px;
+	color: var(--fg-3);
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	margin-bottom: 8px;
+}
+.scan-foot {
+	display: flex;
+	justify-content: flex-end;
+	font-size: 11px;
+}
+.limits {
+	margin: 10px 0 0;
+	padding-left: 18px;
+	font-size: 12px;
+}
+
 .meter {
 	height: 6px;
 	border-radius: 3px;

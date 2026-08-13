@@ -1,18 +1,23 @@
 /**
- * Overview: scale, the upcoming-render shape, node status, and the schedule-repair result.
+ * Overview: scale, serve health, the upcoming-render shape, node status, and the
+ * schedule-repair result.
  *
- * NOTHING ON THIS VIEW SCANS OR COUNTS ON LOAD. The table counts AND the backlog/histogram
- * come from a snapshot computed on a background cadence — `claim` does a sorted range read on
- * `RenderSchedule.nextRenderTime` from every worker every few seconds and every completed
- * render writes back to it, and even a time-bounded `getRecordCount` is scanning work a
- * dashboard refresh has no business doing on a worker that serves bot traffic. Loading this
- * view costs two node-sized table walks and one point read; recomputing is an explicit click.
+ * NOTHING ON THIS VIEW WALKS THE PLUGIN'S TABLES ON LOAD. The table counts AND the
+ * backlog/histogram come from a snapshot computed on a background cadence — `claim` does a
+ * sorted range read on `RenderSchedule.nextRenderTime` from every worker every few seconds
+ * and every completed render writes back to it, and even a time-bounded `getRecordCount` is
+ * scanning work a dashboard refresh has no business doing on a worker that serves bot
+ * traffic. THE ONE READ THAT ISN'T POINT-SHAPED is the serve-health strip: a bounded,
+ * row-capped primary-key scan of `hdb_analytics` (a different table entirely — never the
+ * claim path), answered from a per-worker cache for management.analytics.cacheTtl, so
+ * action-reloads and view switches re-use it rather than re-scanning.
  *
  * TWO CLOCKS ON ONE SCREEN, and they must stay visibly separate. The snapshot numbers can be
  * fifteen minutes old; the claim-floor and in-flight numbers are atomic loads read at request
  * time. Every snapshot-sourced stat carries a "snapshot Nm ago" subtitle and every live one says
  * "live", and NOTHING here subtracts one from the other — a difference computed across those two
- * clocks would look authoritative and mean nothing.
+ * clocks would look authoritative and mean nothing. (The serve strip is a third clock — a
+ * bucketed window labelled with its own range — and joins nothing either.)
  */
 
 import {
@@ -26,18 +31,37 @@ import {
 	link,
 	muted,
 	num,
+	pct,
 	pill,
 	shortUrl,
 	spacer,
 	stat,
-	unwired,
 } from '../ui.js';
+import {
+	CACHE_STATUS_COLORS,
+	colorFor,
+	emptyNote,
+	fmtMs,
+	legend,
+	pick,
+	stackBy,
+	stackedBars,
+	sumCount,
+	weighted,
+	windowEmpty,
+} from '../charts.js';
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
 export async function load(ctx) {
-	const res = await ctx.get('overview');
+	const [res, analyticsRes] = await Promise.all([
+		ctx.get('overview'),
+		// The same range key Traffic and Queue default to, so all three views share one
+		// worker-cached scan instead of each paying their own.
+		ctx.get('analytics', { range: 3_600_000 }),
+	]);
 	ctx.data.overview = res.ok ? res.body : null;
+	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load the overview (${res.status})`);
 }
 
@@ -53,9 +77,9 @@ export function render(ctx) {
 			el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
 		]),
 		counts(ctx, data),
-		traffic(),
+		traffic(ctx),
 		upcoming(ctx, data),
-		el('div', { cls: 'cols' }, [nodes(ctx, data), failures()]),
+		el('div', { cls: 'cols' }, [nodes(ctx, data), failures(ctx)]),
 		repair(ctx, data),
 	];
 }
@@ -135,22 +159,53 @@ function counts(ctx, data) {
 }
 
 /**
- * Bot traffic is the one number that says whether any of this is working, and it is the panel
- * this console most obviously wants. The serving path now records everything it needs — the
- * `bot_serve` metric (source / cacheStatus / botName, see http_handlers/bot_request.js) splits
- * hit from stale from miss with the crawler breakdown, and `page_age` carries freshness. Left
- * declared and empty until the remaining decision is made: reading node-local hdb_analytics
- * vs aggregating across the cluster.
+ * Bot traffic is the one number that says whether any of this is working. Wired to the
+ * node-local analytics window (the decision this panel was waiting on landed with the
+ * external collector: read each node's own hdb_analytics, never a replicated fan-out — the
+ * console charts THIS node's slice and says so; ratios are representative, totals are 1/N).
+ * The Traffic view carries the full breakdown; this strip is the "is it working" read.
  */
-const traffic = () =>
-	card('Bot traffic served, last 24h', {
+function traffic(ctx) {
+	const data = ctx.data.analytics;
+	const open = link('open traffic →', () => ctx.go('traffic'));
+
+	if (!data || data.available === false || windowEmpty(data)) {
+		return card('Bot serves — this node, last hour', {
+			head: [spacer(), open],
+			body: [emptyNote('bot_serve')],
+		});
+	}
+
+	const serves = pick(data, 'bot_serve');
+	const total = sumCount(serves);
+	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
+	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
+	const ageP95 = weighted(pick(data, 'page_age'), 'p95');
+	const interval = data.intervals?.defaultRenderInterval;
+
+	const { keys, stacks } = stackBy(serves, 'method', data.bucketCount);
+
+	return card('Bot serves — this node, last hour', {
+		head: [
+			spacer(),
+			legend(keys.slice(0, 5).map((k) => ({ label: k, color: colorFor(CACHE_STATUS_COLORS, k) }))),
+			open,
+		],
 		body: [
-			unwired(
-				'Requests served to bots, split by cache hit / stale / miss, with the crawler breakdown.',
-				'a decision on reading node-local hdb_analytics vs aggregating across the cluster (the bot_serve and page_age metrics are recorded as of v0.26.0)'
-			),
+			el('div', { cls: 'stat-grid tight' }, [
+				stat('Serves', num(total)),
+				stat('Origin offload', pct(total - originServes, total), null, {
+					warn: total > 0 && originServes > total / 2,
+				}),
+				stat('Cache-served', pct(cacheServes, total)),
+				stat('Page age p95', fmtMs(ageP95), 'cache serves only ≈', {
+					warn: Number.isFinite(ageP95) && Number.isFinite(interval) && ageP95 > interval,
+				}),
+			]),
+			total > 0 ? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k)) : null,
 		],
 	});
+}
 
 function upcoming(ctx, data) {
 	const { enabled, interval, running, lastRun } = data.backlog;
@@ -259,28 +314,65 @@ function nodes(ctx, data) {
 				]),
 			]),
 		],
-		foot: [muted('Throughput and render latency per node are not shown — see Queue & nodes.')],
+		foot: [muted('This node’s render throughput and claim health are on Queue & nodes; peers chart their own.')],
 	});
 }
 
 /**
- * Renders that fail leave a log line and nothing else: `processJobResult` warns and either
- * leaves the job to retry or drops an orphaned schedule row. Nothing persists what failed or
- * why, so there is nothing to list here yet.
- *
- * THE LEASE TABLE DOES NOT WIRE THIS PANEL. A lease says a key is currently being rendered, not
- * that its last render failed, and the whole table evaporates on a worker restart. Filling this
- * card from it would put a list of in-flight renders under the heading "Failing renders".
+ * Render failures IN AGGREGATE, from the `render` outcome metric — how many results failed,
+ * were auth-refused, or bounced, this node, this hour. The aggregate is the alarm; the
+ * per-URL list this card originally asked for still has no data path (a failure leaves a log
+ * line, not a queryable record), so that part stays declared rather than faked: the panel
+ * never shows a URL it cannot actually know.
  */
-const failures = () =>
-	card('Failing renders', {
+function failures(ctx) {
+	const data = ctx.data.analytics;
+	const openQueue = link('open queue →', () => ctx.go('queue'));
+
+	if (!data || data.available === false || windowEmpty(data)) {
+		return card('Render outcomes — this node, last hour', {
+			head: [spacer(), openQueue],
+			body: [emptyNote('render')],
+		});
+	}
+
+	// Pill severity mirrors the chart colors: rendered good, hard failures bad, retried warn,
+	// verdicts (suppressed/redirect) neutral — they are outcomes, not faults.
+	const outcomeKind = (outcome) =>
+		outcome === 'rendered'
+			? 'ok'
+			: outcome === 'failed' || outcome === 'auth-failure'
+				? 'bad'
+				: outcome === 'transient'
+					? 'warn'
+					: '';
+
+	const outcomes = pick(data, 'render', (s) => s.path === 'outcome');
+	const total = sumCount(outcomes);
+	// A plain object, not a Map: the asset test pins `get('…')` literals as API routes, and
+	// outcome names are a closed set from the metric catalog, so untrusted-key traps don't apply.
+	const byOutcome = {};
+	for (const s of outcomes) byOutcome[s.method] = (byOutcome[s.method] ?? 0) + s.count;
+	const bad = (byOutcome['failed'] ?? 0) + (byOutcome['auth-failure'] ?? 0);
+
+	return card('Render outcomes — this node, last hour', {
+		head: [spacer(), openQueue],
 		body: [
-			unwired(
-				'URLs whose last render failed, with the error and how many times it has repeated.',
-				'a persisted render-failure record — processJobResult currently only logs, so a failure leaves no queryable trace'
-			),
+			total === 0
+				? el('div', { cls: 'note', text: 'No render results were processed on this node in the window.' })
+				: kv(
+						Object.entries(byOutcome)
+							.sort((a, b) => b[1] - a[1])
+							.map(([outcome, count]) => [outcome, pill(`${num(count)} · ${pct(count, total)}`, outcomeKind(outcome))])
+					),
+			bad > 0 &&
+				el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
+					'WHICH urls are failing is not recorded anywhere queryable yet (a failure leaves a log ',
+					'line only) — grep the node log for "processJobResult" until a failure record exists.',
+				]),
 		],
 	});
+}
 
 // A target whose RenderSchedule row is missing renders nothing, forever, with no error to
 // notice it by — so the repair sweep's last result belongs on the dashboard whether or not

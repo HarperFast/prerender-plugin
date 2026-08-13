@@ -95,6 +95,16 @@ Two hazards worth knowing before pointing anything at a production cluster:
   also the most expensive to sweep. If a collector gets slow, exclude them from the fast loop
   rather than lengthening every interval.
 
+**Sweeping many names? Scan the window once, not once per name.** Fact 3 cuts both ways: since
+`get_analytics` re-walks the same PK window for every name, a collector reading N names pays N
+scans of identical rows. One `search_by_conditions` over the `id` (time) range — with the name
+filter riding as a second condition or applied client-side — returns the identical row set for
+every name in a single walk (verified row-identical against per-name `get_analytics`; ~6× faster
+for a dozen names, and dynamic `response_*` names come along free). This is exactly what the
+console's `GET /prerender_admin/analytics` does in-process (`src/util/analyticsRead.js`); an
+external collector can do the same over the operations API. Bound the range on BOTH ends so the
+PK drives the scan (an open range can make the planner walk a metric's entire history — harper#1796).
+
 ### The four questions dashboards actually ask
 
 | Question                                 | Read this                                                                                                                                                                 |
@@ -212,6 +222,7 @@ Point reads, safe to poll at dashboard cadence unless noted. See the README's
 | `GET overview`                    | The last backlog snapshot: overdue count, in-flight leases, below-floor rows, claim-floor state, a **next-24h render histogram** (nowhere in metrics), and table counts (targets / pages / sitemaps / suppressed). Computed on a timer — the endpoint is a point read of the stored result, with its timestamp. |
 | `GET config`                      | Effective config (redacted), the full option schema, config **warnings**, and restart-pending changes. The warnings list is the cheapest misconfiguration check there is.                                                                                                                                       |
 | `GET metrics`                     | This catalog, from the running version.                                                                                                                                                                                                                                                                         |
+| `GET analytics?range=<ms>`        | **The console's own read of this table**: every catalog metric (plus `duration`/`success`/`response_*` at `path: 'p'`) in ONE bounded PK scan, bucketed server-side, per-worker cached (`management.analytics.*`). Node-local by construction; the payload carries the scan cost and the covered window.        |
 | `GET unrouted`                    | Paths served without prerendering, bucketed by first path segment: CDN over-forwarding vs. missing routes. **Per-worker in-process counters** — the response says which worker's slice it is, so a cluster view must fan out over nodes _and_ workers.                                                          |
 | `GET crawl-breadth?days=7`        | **Distinct URLs crawled per bot per day** (HyperLogLog). Crawl breadth is not derivable from `bot_request`, which counts requests.                                                                                                                                                                              |
 | `GET invalidations`               | Active invalidation rows with scope, instant and reason. Pair with `prerender_ops` series `invalidation_error`.                                                                                                                                                                                                 |

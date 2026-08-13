@@ -120,6 +120,11 @@ test('the client calls only routes the server dispatches', () => {
 		'pages',
 		'page-content',
 		'unrouted',
+		'analytics',
+		'crawl-breadth',
+		'invalidations',
+		'invalidate',
+		'metrics',
 		'explain',
 		'schedule',
 		'queue',
@@ -142,7 +147,16 @@ test('the client calls only routes the server dispatches', () => {
 		assert.ok(served.includes(route), `client calls unknown route "${route}"`);
 	}
 	// The actions this console exists for must actually be wired up.
-	for (const required of ['revalidate', 'reconcile', 'backlog', 'sitemap', 'pages', 'page-content']) {
+	for (const required of [
+		'revalidate',
+		'reconcile',
+		'backlog',
+		'sitemap',
+		'pages',
+		'page-content',
+		'analytics',
+		'invalidate',
+	]) {
 		assert.ok(called.includes(required), `no client module calls "${required}"`);
 	}
 });
