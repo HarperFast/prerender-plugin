@@ -24,6 +24,7 @@
  *   GET  /prerender_admin/pages      ?prefix&cursor&limit           super_user
  *   GET  /prerender_admin/page-content ?cacheKey (text/plain)       super_user
  *   GET  /prerender_admin/unrouted   this worker's unrouted tally   super_user
+ *   GET  /prerender_admin/analytics  ?range (ms) — bucketed series  super_user
  *   GET  /prerender_admin/crawl-breadth ?days (default 7, max 31)   super_user
  *   POST /prerender_admin/explain    { url, deviceType }            super_user
  *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
@@ -86,6 +87,7 @@ import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlog
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
+import { readAnalyticsWindow } from '../util/analyticsRead.js';
 import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
@@ -444,6 +446,8 @@ export class PrerenderAdmin extends Resource {
 					interval: config.ingress.report.interval,
 					report: peekUnroutedReport(),
 				});
+			case 'analytics':
+				return PrerenderAdmin.analytics(target);
 			case 'crawl-breadth':
 				return PrerenderAdmin.crawlBreadth(target);
 			case 'metrics':
@@ -1421,6 +1425,46 @@ export class PrerenderAdmin extends Resource {
 	// days × bots-with-traffic × nodes 16 KB rows (a week on a 4-node cluster is a few
 	// hundred rows), capped below and reported truncated rather than presented as complete.
 	// Never touches the render queue or the page cache.
+	/**
+	 * Bucketed analytics series for the console's charts — this node (or the cluster, when the
+	 * deployment replicates `hdb_analytics`; the payload says which).
+	 *
+	 * ONE bounded primary-key scan per refresh for EVERY metric the console charts, never one
+	 * per metric name (`util/analyticsRead.js` has the arithmetic), answered from a per-worker
+	 * cache inside `management.analytics.cacheTtl`. It still takes a heavy slot: a cache miss
+	 * is a real scan, and two operators refreshing distinct ranges is two of them.
+	 */
+	static analytics(target) {
+		return withHeavySlot(() => this.analyticsInner(target));
+	}
+
+	static async analyticsInner(target) {
+		const opts = config.management.analytics;
+		if (!opts.enabled) return json({ error: 'management.analytics.enabled is false' }, 404);
+
+		const requested = Number(target?.get?.('range'));
+		const rangeMs = Math.min(Math.max(60_000, Number.isFinite(requested) ? requested : 3_600_000), opts.maxRange);
+
+		try {
+			const window = await readAnalyticsWindow(rangeMs);
+			return json({
+				node: server.hostname,
+				workerIndex: server.workerIndex,
+				rangeMs,
+				// Reference bands for the charts: what "healthy" sits under, so the lines carry
+				// their own yardstick instead of the operator recalling config values.
+				intervals: {
+					defaultRenderInterval: config.render.defaultInterval,
+					jobLeaseTime: config.queue.jobLeaseTime,
+				},
+				...window,
+			});
+		} catch (e) {
+			logger.warn?.(`[prerender] admin analytics scan failed: ${e?.message ?? String(e)}`);
+			return json({ error: `Analytics scan failed: ${e?.message ?? String(e)}` }, 500);
+		}
+	}
+
 	static crawlBreadth(target) {
 		return withHeavySlot(() => this.crawlBreadthInner(target));
 	}

@@ -9,7 +9,8 @@ crawlers. It provides:
   render service (see [`@harperfast/prerender-browser`](../browser)) claims jobs from and posts results
   back to.
 - Sitemap ingestion (`Sitemap`) that discovers URLs and schedules them for rendering.
-- A prerendered-page cache (`PrerenderedPage`) and indexability signals (`NonIndexable`).
+- A prerendered-page cache (`PrerenderedPage`); non-indexable verdicts live on the target
+  itself (`Target.state: suppressed`).
 - A management API + UI at `/prerender_admin` (see [Management UI](#management-ui-prerender_admin)),
   authenticated with Harper users and restricted to `super_user`.
 
@@ -140,6 +141,11 @@ rest: true # required for the @export-ed table REST endpoints
     peerTimeoutMs: 2500 # deadline on that peer call
     backlogSnapshotInterval: 900000 # 15m — backlog/histogram recompute cadence; 0 = manual only
     pageSize: 50 # rows per page in the console's sitemap-entry and page-cache tables
+    analytics: # the console's Traffic / queue-health charts (GET /prerender_admin/analytics)
+      enabled: true # one bounded PK scan of this node's hdb_analytics per refresh, cached per worker
+      maxRange: 86400000 # 24h — ceiling on the window one request may ask for (scan cost scales with it)
+      cacheTtl: 60000 # 1m — how long a scanned window answers from the per-worker cache
+      scanCap: 150000 # rows one scan may walk; newest-first, so overflow sheds the oldest end
 
   analytics:
     enabled: true # record bot analytics at all: bot_request, bot_serve, route_serve, page_age,
@@ -409,14 +415,15 @@ Database/table names are fixed. Tables are split across databases by write-trans
 Harper serializes writes per database and commits each database independently, so the hot, high-write
 queue table is isolated and bursty/heavy writes don't serialize against it:
 
-| Database          | Tables                                        | Notes                                            |
-| ----------------- | --------------------------------------------- | ------------------------------------------------ |
-| `render_schedule` | `RenderSchedule`                              | the hot render queue — isolated                  |
-| `render_service`  | `RenderTarget`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status |
-| `page_cache`      | `PrerenderedPage`                             | rendered-HTML cache (heavy blob writes)          |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`                   | sitemap data + per-root refresh progress         |
-| `signals`         | `NonIndexable`                                | indexability signals                             |
-| `coordination`    | `SharedBuffer`                                | node-local cross-worker SAB (never replicated)   |
+| Database          | Tables                                  | Notes                                             |
+| ----------------- | --------------------------------------- | ------------------------------------------------- |
+| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                   |
+| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status  |
+| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)           |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress          |
+| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)      |
+| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom |
+| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)    |
 
 Because `RenderTarget` and `RenderSchedule` now live in separate databases, a target and its schedule
 are written as two independent commits (target first). The brief window where a target exists without a
@@ -552,6 +559,7 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
 | `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
 | `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
+| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached   | `super_user` |
 | `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                    | `super_user` |
 | `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day  | `super_user` |
 | `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)              | `super_user` |
@@ -605,6 +613,16 @@ execute it against the operator's super-user session.
   coordination database) and the page shows it with its age. _Recompute_ triggers a one-off
   pass; a dashboard refresh never touches the index.
 
+- **Traffic** — the delivery half of [METRICS.md](METRICS.md)'s catalog, charted: origin
+  offload, cache-served and fresh-hit rates, serves by freshness state over time, the per-bot
+  and status-code mix, origin-fetch cost and reasons, page age against the render interval,
+  a per-route cadence table, and on-demand crawl breadth. **Everything is this node's slice**
+  (analytics rows are node-local): ratios are representative of the cluster, totals are 1/N.
+  All of it comes from ONE bounded, row-capped primary-key scan of `hdb_analytics` per
+  refresh — never one scan per metric name — answered from a per-worker cache for
+  `management.analytics.cacheTtl`, and the page footer states what the refresh actually cost.
+  The Overview's serve strip and the Queue view's render panels read the same cached window,
+  so opening all three costs one scan, not three.
 - **Sitemaps** — the root list with per-root refresh state (running / failed, with the child
   failures), a capped count of targets attributed to the selected sitemap, and a paged entry
   table with per-entry state (`cached` / `stale` / `scheduled` / `filtered` /
@@ -617,13 +635,23 @@ execute it against the operator's super-user session.
   page only and say so — those fields have no index, and the console never pretends
   otherwise. _view HTML_ streams the stored bytes as `text/plain`; _explain_ hands the row to
   the URL explainer.
+- **Queue & nodes** — cluster/per-node pause controls (intent vs. observed, see "Queue
+  control"), plus this node's supply side from the shared analytics window: render outcomes
+  over time (the "renders are failing" shape as it develops, with the auth-failure-vs-
+  suppressed signature called out), render time and claim-scan p95 trends, and a ranked
+  outcome-detail list.
+- **Invalidations** — the active bulk-invalidation rows (an unresolvable scope — one that no
+  longer names a configured route — is flagged as loudly as it deserves), and the record flow
+  with **preview-first UX**: the primary button is a `dryRun` that shows coverage, overlapping
+  scopes, precedence and the operation's limits; the actual write is a second, explicit click
+  from inside the preview. Clearing surfaces the server's partial-undo warning.
 - **URL explainer** — paste a URL and see the ingress route that matched, the query allowlist
   it selected, the canonical URL, the resulting cache key, and the live
-  `RenderTarget`/`RenderSchedule`/`PrerenderedPage`/`NonIndexable` rows under it. It also
+  `Target`/`RenderSchedule`/`PrerenderedPage` rows under it (including the target's
+  suppression state, which otherwise removes a URL from rotation silently). It also
   reports the key the URL would get under the global `cacheKey.queryParams`, and flags a
   difference — that divergence is the usual fingerprint of a permanent cache miss caused by a
-  missing or misordered route. It surfaces a `NonIndexable` suppression too, which otherwise
-  removes a URL from rotation silently.
+  missing or misordered route.
 - **Config** — the effective merge of defaults and host overrides, with secrets shown only as
   whether they are set, alongside the risky-config warnings that previously existed only as
   startup log lines (empty security token, staging passthrough enabled, `renderNow` without a
