@@ -74,6 +74,11 @@ export const createSketch = (p = HLL_P) => new Uint8Array(1 << p);
  * argument makes the wrong thing look right: an accumulator built at `HLL_P` silently skips
  * (see `mergeSketch`) every sketch a deployment wrote at a configured `crawlStats.precision`,
  * and a sketch that merged nothing estimates as 0 — a real-looking number, not an error.
+ *
+ * Which is why there is deliberately NO fallback here. A missing `src` throws, immediately and
+ * at the call site; defaulting to `HLL_P` would swap that for a plausible zero on every
+ * deployment that is not at the default precision — reinstating exactly the bug this function
+ * was added to remove. Callers filter empty rows before they get here.
  */
 export const createSketchLike = (src) => new Uint8Array(src.length);
 

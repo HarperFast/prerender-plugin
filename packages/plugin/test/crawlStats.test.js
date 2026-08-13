@@ -231,28 +231,37 @@ test('computeBreadth reads rows written at a NON-DEFAULT precision', () => {
 	assert.equal(breadth[0].mismatchedShards, 0);
 });
 
-test('shards of another precision are counted as mismatched, never merged as garbage', () => {
+test('the FIRST shard of a (day, bot) sets the register space; others are mismatched, not merged', () => {
 	// The day `crawlStats.precision` changes, a node that has not rolled over yet still writes
 	// the old shape. Those registers describe a different hash slice per index, so merging them
 	// would be a plausible-looking wrong number — the undercount is correct, but it has to be
 	// visible, which is the whole lesson of the bug above.
+	//
+	// Which shape survives is FIRST-ROW-WINS, and deliberately so: the accumulator is fed from a
+	// streaming cursor precisely so a day's rows are never all resident at once, which rules out
+	// picking the majority shape. So this is asserted in BOTH orders — the rule is the contract,
+	// not an artifact of how these fixtures happen to be listed.
 	const urls = (p, from, to) => {
 		const s = createSketch(p);
 		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
 		return s;
 	};
-	const breadth = computeBreadth([
-		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(12, 0, 1000) },
-		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(14, 0, 5000) }, // old-shape straggler
-	]);
+	const newShape = () => ({ day: '2026-08-13', bot: 'Googlebot', registers: urls(12, 0, 1000) });
+	const oldShape = () => ({ day: '2026-08-13', bot: 'Googlebot', registers: urls(14, 0, 5000) });
 
-	const [google] = breadth[0].bots;
-	assert.equal(google.shards, 1, 'only the mergeable shard counted');
-	assert.equal(breadth[0].mismatchedShards, 1);
-	assert.ok(
-		Math.abs(google.distinctUrls - 1000) / 1000 <= 0.05,
-		`distinctUrls ${google.distinctUrls} — the 5000-URL sketch of another shape must not leak in`
-	);
+	for (const [label, rows, expected] of [
+		['new shape first', [newShape(), oldShape()], 1000],
+		['old-shape straggler first', [oldShape(), newShape()], 5000],
+	]) {
+		const [day] = computeBreadth(rows);
+		const [google] = day.bots;
+		assert.equal(google.shards, 1, `${label}: only the mergeable shard counted`);
+		assert.equal(day.mismatchedShards, 1, `${label}: the unmergeable one is reported, not dropped`);
+		assert.ok(
+			Math.abs(google.distinctUrls - expected) / expected <= 0.05,
+			`${label}: distinctUrls ${google.distinctUrls} — a sketch of another shape must not leak in`
+		);
+	}
 });
 
 // ── one writer per node (#87) + configurable precision ───────────────────────────────────────
