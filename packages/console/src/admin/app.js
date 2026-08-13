@@ -12,7 +12,7 @@
  */
 
 import { el, harperMark, icon, muted, pill, spacer } from './ui.js';
-import { get, post, setExpiredHandler, setNode } from './api.js';
+import { CLUSTER, get, post, setExpiredHandler, setNode } from './api.js';
 import * as overview from './views/overview.js';
 import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
@@ -127,6 +127,7 @@ function render() {
 				el('main', { cls: 'main' }, [
 					el('div', { cls: 'view' }, [
 						state.error && el('div', { cls: 'note bad', text: state.error }),
+						...incompleteSources(),
 						view.render(ctx),
 					]),
 				]),
@@ -188,37 +189,87 @@ function renderTopbar(view) {
 }
 
 /**
- * Which prerender node this console is looking at. Every panel is that node's slice —
- * analytics, queue state, the unrouted tally are all node-local — so switching nodes
- * DROPS all per-view state: stale data from the previous node must never render under the
- * new node's name. A node the sign-in didn't reach is still offered (picking it lands on
- * the sign-in form, which is the honest next step), but labelled.
+ * What this console is looking at: the whole cluster (the default) or one node.
+ *
+ * CLUSTER IS FIRST AND IS THE DEFAULT because it is the question an operator actually has.
+ * Almost everything here is node-local — analytics rows, the backlog snapshot's owned-key
+ * slice, the claim floor — so a per-node console answered "how is one quarter of the cluster",
+ * and the cluster answer had to be assembled by hand across four browser tabs. The proxy fans
+ * the read out and merges it (util/aggregate.js); a single node stays one click away for the
+ * drill-down, and for the panels that are genuinely per-node.
+ *
+ * Switching scope DROPS all per-view state: stale data from the previous scope must never
+ * render under the new scope's name. A node the sign-in didn't reach is still offered (picking
+ * it lands on the sign-in form, which is the honest next step), but labelled.
  */
 function nodePicker() {
 	const nodes = state.session.nodes ?? [];
 	if (nodes.length === 0) return el('span', { cls: 'muted mono nowrap', text: state.session.node ?? '' });
 	if (nodes.length === 1) return el('span', { cls: 'muted mono nowrap', text: nodes[0].hostname });
 
-	const selected = state.session.selected ?? nodes[0].origin;
+	const selected = state.session.selected ?? CLUSTER;
+	const signedInCount = nodes.filter((node) => node.signedIn).length;
+
 	return el(
 		'select',
 		{
 			cls: 'node-picker mono',
-			title: 'Which prerender node this console reads. Every panel is that node’s own slice.',
+			title:
+				'What this console reads. “All nodes” merges every node’s answer server-side; ' +
+				'a single node shows that node’s own slice.',
 			onchange: (event) => {
 				setNode(event.target.value);
 				state.views = {};
 				load();
 			},
 		},
-		nodes.map(({ origin, hostname, signedIn }) =>
+		[
 			el('option', {
-				value: origin,
-				selected: origin === selected ? '' : null,
-				text: hostname + (signedIn ? '' : ' (signed out)'),
-			})
-		)
+				value: CLUSTER,
+				selected: selected === CLUSTER ? '' : null,
+				text: `all nodes (${signedInCount}/${nodes.length})`,
+			}),
+			...nodes.map(({ origin, hostname, signedIn }) =>
+				el('option', {
+					value: origin,
+					selected: origin === selected ? '' : null,
+					text: hostname + (signedIn ? '' : ' (signed out)'),
+				})
+			),
+		]
 	);
+}
+
+/**
+ * The one banner that must appear no matter which view is open: a cluster answer that is
+ * MISSING A NODE.
+ *
+ * A sum short by one node is not a smaller number, it is a wrong one — and it is
+ * indistinguishable from a genuine drop in traffic, a shrinking backlog, or a cluster that
+ * quietly stopped rendering. Rather than making every view remember to check, this walks
+ * whatever the current view loaded and surfaces any incomplete `sources` envelope it finds; a
+ * view that adds a new fetch is covered automatically.
+ */
+function incompleteSources() {
+	const seen = new Set();
+	const banners = [];
+	for (const value of Object.values(scratch(state.view))) {
+		const sources = value?.sources;
+		if (!sources || sources.complete !== false) continue;
+		const missing = (sources.nodes ?? []).filter((node) => !node.ok);
+		const key = missing.map((node) => node.hostname).join(',');
+		if (seen.has(key)) continue;
+		seen.add(key);
+		banners.push(
+			el('div', { cls: 'note warn' }, [
+				el('strong', { text: `${sources.answered} of ${sources.configured} nodes answered. ` }),
+				'Every cluster total on this page is missing ' +
+					missing.map((node) => `${node.hostname} (${node.error ?? `HTTP ${node.status}`})`).join(', ') +
+					'. Treat the numbers as a floor, not a measurement — a missing node looks exactly like a drop.',
+			])
+		);
+	}
+	return banners;
 }
 
 function renderSignIn() {

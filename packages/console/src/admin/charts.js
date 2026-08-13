@@ -342,10 +342,14 @@ export function rangePicker(ranges, currentMs, onPick) {
  */
 export function scanFooter(data) {
 	const parts = [];
-	parts.push(data.scope === 'cluster' ? 'cluster-wide (analytics replicate)' : `this node (${data.node})`);
+	const scans = data.scan?.scans ?? 1;
+	if (data.sources?.mode === 'merged') parts.push(`${data.sources.answered} nodes merged`);
+	else if (data.sources?.mode === 'shared') parts.push(`${data.sources.servedBy} (${data.sources.note})`);
+	else parts.push(data.scope === 'cluster' ? 'cluster-wide (analytics replicate)' : `this node (${data.node})`);
 	if (data.scan) {
 		parts.push(
-			`one scan: ${data.scan.kept.toLocaleString()} of ${data.scan.scanned.toLocaleString()} rows in ${data.scan.ms}ms`
+			`${scans === 1 ? 'one scan' : `${scans} scans`}: ${data.scan.kept.toLocaleString()} of ` +
+				`${data.scan.scanned.toLocaleString()} rows in ${scans === 1 ? '' : '≤'}${data.scan.ms}ms`
 		);
 	}
 	if (data.truncated) {
@@ -361,14 +365,33 @@ export function scanFooter(data) {
 	return el('span', { cls: 'muted mono', text: parts.join(' · ') });
 }
 
+/**
+ * What a payload's numbers actually cover, for card titles and eyebrows: "all N nodes", or the
+ * node's own hostname. Panels say this out loud on EVERY card that carries a total, because the
+ * same tile means something very different at 1/N scale — an operator who reads a per-node
+ * serve rate as the cluster's will conclude the deployment is doing a quarter of its work.
+ */
+export function scopeLabel(data) {
+	const sources = data?.sources;
+	if (sources?.mode === 'merged') {
+		return sources.complete ? `all ${sources.configured} nodes` : `${sources.answered} of ${sources.configured} nodes`;
+	}
+	if (sources?.mode === 'shared') return `cluster · read from ${sources.servedBy}`;
+	if (data?.scope === 'cluster') return 'cluster-wide';
+	return data?.node ? `node ${data.node}` : 'this node';
+}
+
+/** True when the payload is a cluster merge rather than one node's slice. */
+export const isMerged = (data) => data?.sources?.mode === 'merged';
+
 /** True when the window has no rows at all — the "is analytics even on" empty state. */
 export const windowEmpty = (data) => !data?.series?.length;
 
 /** Shared empty-state copy for a window with no rows. */
-export const emptyNote = (what) =>
+export const emptyNote = (what, data) =>
 	el('div', { cls: 'note' }, [
-		`No ${what} rows in this window on this node. Either no matching traffic arrived here, `,
-		'the window is too narrow, or analytics is off (',
+		`No ${what} rows in this window on ${isMerged(data) ? 'any node' : 'this node'}. Either no matching traffic `,
+		'arrived, the window is too narrow, or analytics is off (',
 		el('code', { text: 'analytics.enabled' }),
-		' gates recording). Analytics rows are node-local: each node charts its own slice.',
+		' gates recording). Analytics rows are node-local; a cluster view sums every node’s own slice.',
 	]);

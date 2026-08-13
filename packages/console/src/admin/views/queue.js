@@ -1,17 +1,17 @@
 /**
  * Queue & nodes: cluster-wide pause/resume plus per-node overrides, and the supply side —
- * this node's render outcomes, render time, and claim-scan health from the shared analytics
- * window (one cached scan, the same one the Traffic view reads).
+ * render outcomes, render time, and claim-scan health from the shared analytics window (the
+ * same cached scan the Traffic view reads).
  *
  * The wording here is load-bearing. `QueueControl` is replicated INTENT; `QueueStatus` is what
  * each node last OBSERVED. Per-node overrides win over the cluster scope in both directions,
  * and a control write converges within one statusSyncInterval — so the table shows both columns
  * separately, or operators conclude a pause failed and click it repeatedly.
  *
- * The render/claim panels are THIS NODE's slice (analytics rows are node-local): render rows
- * land on whichever node processed the job result, so per-node numbers here are real per-node
- * throughput — but another node's slice is only visible in its own console or the external
- * collector, which is why the node table's throughput column stays honest about that.
+ * Render rows land on whichever node processed the job result, so the per-node numbers ARE real
+ * per-node throughput. Under cluster scope the proxy reads every node's window and hands back
+ * both the merged series (the charts) and per-node totals (the table's throughput column);
+ * under node scope only that node's row is filled, because the others' rows live on them.
  */
 
 import { ago, card, duration, el, ICONS, muted, num, pill, spacer, stat, table } from '../ui.js';
@@ -26,6 +26,7 @@ import {
 	OUTCOME_COLORS,
 	pick,
 	scanFooter,
+	scopeLabel,
 	SERIES,
 	stackBy,
 	stackedBars,
@@ -67,8 +68,8 @@ export function render(ctx) {
 function supply(ctx) {
 	const data = ctx.data.analytics;
 	if (!data || data.available === false || windowEmpty(data)) {
-		return card('Renders & claim health — this node, last hour', {
-			body: [emptyNote('render / queue_health')],
+		return card(`Renders & claim health — ${scopeLabel(data)}, last hour`, {
+			body: [emptyNote('render / queue_health', data)],
 		});
 	}
 
@@ -81,7 +82,7 @@ function supply(ctx) {
 	const rangeHours = data.rangeMs / 3_600_000;
 
 	const kpis = el('div', { cls: 'stat-grid' }, [
-		stat('Results processed', num(total), `≈ ${fmtCount(total / rangeHours)}/h on this node`),
+		stat('Results processed', num(total), `≈ ${fmtCount(total / rangeHours)}/h across ${scopeLabel(data)}`),
 		stat('Failed or auth-failed', num(failedLike), 'kept and retried — watch for a step', {
 			// One-in-ten failing is past tail noise for any healthy corpus.
 			warn: total > 0 && failedLike > total / 10,
@@ -95,7 +96,7 @@ function supply(ctx) {
 	const outcomeChart = card('Render outcomes', {
 		head: [spacer(), legend(keys.map((k) => ({ label: k, color: colorFor(OUTCOME_COLORS, k) })))],
 		body: [
-			outcomes.length ? stackedBars(data, keys, stacks, (k) => colorFor(OUTCOME_COLORS, k)) : emptyNote('render'),
+			outcomes.length ? stackedBars(data, keys, stacks, (k) => colorFor(OUTCOME_COLORS, k)) : emptyNote('render', data),
 			el('p', { cls: 'muted chart-note' }, [
 				'One row per posted result. A rising auth-failure share with steady suppressed is the broken-',
 				'bypass-token signature; suppressed climbing on its own is the corpus being mass-suppressed.',
@@ -112,7 +113,7 @@ function supply(ctx) {
 		body: [
 			timeSeries.some((s) => s.points.some((p) => Number.isFinite(p)))
 				? lineChart(data, timeSeries)
-				: emptyNote('render time / claim_scan_ms'),
+				: emptyNote('render time / claim_scan_ms', data),
 			el('p', { cls: 'muted chart-note' }, [
 				'Render time is fleet capacity (renders/hour = concurrency ÷ time). The claim scan degrades ',
 				'BEFORE any backlog shows — measured 17× once — so its trend matters more than its level.',
@@ -138,13 +139,13 @@ function supply(ctx) {
 							color: colorFor(OUTCOME_COLORS, method),
 						}))
 					)
-				: emptyNote('render outcomes'),
+				: emptyNote('render outcomes', data),
 		],
 	});
 
 	return el('div', null, [
 		el('div', { cls: 'view-head', style: { marginTop: '20px' } }, [
-			el('span', { cls: 'eyebrow', text: 'This node · last hour' }),
+			el('span', { cls: 'eyebrow', text: `${scopeLabel(data)} · last hour` }),
 			spacer(),
 			scanFooter(data),
 		]),
@@ -176,23 +177,51 @@ function cluster(ctx, data, setPause) {
 }
 
 function nodeTable(ctx, data, setPause) {
-	// This node's processed-result rate, from the shared analytics window. OTHER nodes stay
-	// '—', not zero: their analytics rows live on them, and a real-looking 0/h on a peer would
-	// read as "that node is idle" when the truth is "not visible from here".
+	// PER-NODE THROUGHPUT, from the analytics window.
+	//
+	// Under cluster scope the proxy fans the window out and returns a per-node totals block
+	// alongside the merged series, so every row here gets its own rate — the column used to be
+	// '—' for every node but the one being read, because analytics rows are node-local and a
+	// peer's blank rendered as zero would read as "that node is idle". Now the blank means
+	// exactly one thing: that node did not answer. Reading a single node still fills only its
+	// own row, for the same original reason.
 	const analytics = ctx.data.analytics;
-	const thisNodeRate = (() => {
-		if (!analytics || analytics.available === false) return null;
-		const total = sumCount(pick(analytics, 'render', (s) => s.path === 'outcome'));
-		return total > 0 ? `≈${fmtCount(total / (analytics.rangeMs / 3_600_000))}/h` : null;
-	})();
+	const rateOf = (counts, rangeMs) => {
+		const total = counts.reduce((acc, s) => acc + s.count, 0);
+		return total > 0 && rangeMs > 0 ? `≈${fmtCount(total / (rangeMs / 3_600_000))}/h` : null;
+	};
+
+	const rates = new Map();
+	if (analytics && analytics.available !== false) {
+		if (analytics.byNode) {
+			for (const entry of analytics.byNode) {
+				const outcomes = (entry.totals ?? []).filter((s) => s.metric === 'render' && s.path === 'outcome');
+				const rate = rateOf(outcomes, entry.rangeMs ?? analytics.rangeMs);
+				// Key on the node's OWN hostname (what QueueStatus rows use); the configured
+				// origin's host carries a port and would never match. Both are indexed so a
+				// deployment whose origins happen to be bare hostnames still joins.
+				if (entry.node) rates.set(entry.node, rate);
+				rates.set(entry.hostname, rate);
+			}
+		} else if (analytics.node) {
+			rates.set(
+				analytics.node,
+				rateOf(
+					pick(analytics, 'render', (s) => s.path === 'outcome'),
+					analytics.rangeMs
+				)
+			);
+		}
+	}
+	const rateFor = (hostname) => rates.get(hostname) ?? null;
 
 	const rows = data.nodes.map((node) =>
 		el('tr', null, [
 			el('td', { cls: 'mono' }, [node.hostname, node.isThisNode && muted(' (this node)')]),
 			el('td', null, [statusPill(node.status)]),
 			el('td', {
-				cls: 'mono' + (node.isThisNode && thisNodeRate ? '' : ' muted'),
-				text: (node.isThisNode && thisNodeRate) || '—',
+				cls: 'mono' + (rateFor(node.hostname) ? '' : ' muted'),
+				text: rateFor(node.hostname) ?? '—',
 			}),
 			el('td', null, [el('span', { cls: node.stale ? 'pill warn' : 'muted', text: ago(node.updatedTime) })]),
 			el('td', null, [
@@ -235,9 +264,9 @@ function nodeTable(ctx, data, setPause) {
 		),
 		el('div', { cls: 'card-foot' }, [
 			muted(
-				'Throughput shows for THIS node only (in the panels below): render analytics are node-local, ' +
-					'so another node’s rate is visible in its own console or the external collector, not here. ' +
-					'Presenting a peer’s blank as zero would read as "idle", so the column stays empty instead.'
+				'Throughput is each node’s own processed-result rate — analytics rows are node-local, so the ' +
+					'cluster view reads all of them and attributes each to its node. A blank means that node ' +
+					'did not answer, never that it is idle; presenting it as zero would read as "idle".'
 			),
 		]),
 	]);

@@ -42,8 +42,10 @@ import {
 	colorFor,
 	emptyNote,
 	fmtMs,
+	isMerged,
 	legend,
 	pick,
+	scopeLabel,
 	stackBy,
 	stackedBars,
 	sumCount,
@@ -90,8 +92,16 @@ function counts(ctx, data) {
 	const tables = data.counts;
 	const asOf = data.countsAsOf ? `as of ${ago(data.countsAsOf)}` : 'no snapshot yet';
 	const value = (count) => (count ? num(count.recordCount) : '—');
+	// THESE TABLES REPLICATE, so they are NOT summed across nodes — every node counts the same
+	// corpus. A persistent spread between nodes is therefore not rounding, it is a replication
+	// gap, and it is worth more than the count itself: say so on the tile rather than silently
+	// showing one node's number as the cluster's.
 	const sub = (count) =>
-		count?.estimatedRange ? `estimate ±${num(count.estimatedRange)} · ${asOf}` : (count?.error ?? asOf);
+		count?.divergent
+			? `nodes disagree: ${num(count.spread.low)}–${num(count.spread.high)} · replication gap? · ${asOf}`
+			: count?.estimatedRange
+				? `estimate ±${num(count.estimatedRange)} · ${asOf}`
+				: (count?.error ?? asOf);
 
 	const backlog = data.backlog.lastRun;
 	const floor = data.claimFloor ?? {};
@@ -109,8 +119,8 @@ function counts(ctx, data) {
 	const dueBeyondInFlight = backlog && !backlog.error && Number.isFinite(inFlight) && backlog.overdue - inFlight > 0;
 
 	return el('div', { cls: 'stat-grid' }, [
-		stat('Render targets', value(tables?.targets), sub(tables?.targets)),
-		stat('Cached pages', value(tables?.pages), sub(tables?.pages)),
+		stat('Render targets', value(tables?.targets), sub(tables?.targets), { warn: !!tables?.targets?.divergent }),
+		stat('Cached pages', value(tables?.pages), sub(tables?.pages), { warn: !!tables?.pages?.divergent }),
 		stat(
 			'Due now',
 			backlog && !backlog.error ? num(backlog.overdue) + (backlog.truncated ? '+' : '') : '—',
@@ -127,21 +137,26 @@ function counts(ctx, data) {
 			inFlightLive ? 'leased to a renderer · live' : `leased to a renderer · snapshot ${ago(backlog?.finishedAt)}`
 		),
 		stat(
-			'Claim floor lag',
+			// Across a cluster this is the WORST node's lag, not an average: the queue is only as
+			// healthy as its most-pinned node, and averaging four floors would hide the one that
+			// has stopped moving. `worstNode` names it.
+			floor.worstNode ? `Claim floor lag · worst (${floor.worstNode})` : 'Claim floor lag',
 			floor.enabled === false ? 'disabled' : Number.isFinite(floor.lagMs) ? duration(floor.lagMs) : '—',
 			floor.enabled === false
 				? 'queue.claimFloor.enabled is false'
-				: // NAME THE ROW, AND SAY HOW LONG IT HAS HELD. A lag figure alone sends an operator
-					// hunting; the floor sits at the due minute of one row, and only a claim pass can say
-					// which — so the key is what this worker's last pass saw. The duration beside it is
-					// NODE-WIDE (it lives in the shared buffer), and it is the number that separates a
-					// render legitimately in flight from one that never posts a result: past
-					// queue.claimFloor.unpinAfter the claim pass writes that row forward itself.
-					floor.floorHeldBy
-					? `held by ${shortUrl(floor.floorHeldBy)}${
-							floor.floorPinnedForMs > 0 ? ` for ${duration(floor.floorPinnedForMs)}` : ''
-						} · this worker’s last claim`
-					: 'how far back the claim scan starts · live',
+				: floor.disabledOn?.length
+					? `disabled on ${floor.disabledOn.join(', ')}`
+					: // NAME THE ROW, AND SAY HOW LONG IT HAS HELD. A lag figure alone sends an operator
+						// hunting; the floor sits at the due minute of one row, and only a claim pass can say
+						// which — so the key is what this worker's last pass saw. The duration beside it is
+						// NODE-WIDE (it lives in the shared buffer), and it is the number that separates a
+						// render legitimately in flight from one that never posts a result: past
+						// queue.claimFloor.unpinAfter the claim pass writes that row forward itself.
+						floor.floorHeldBy
+						? `held by ${shortUrl(floor.floorHeldBy)}${
+								floor.floorPinnedForMs > 0 ? ` for ${duration(floor.floorPinnedForMs)}` : ''
+							} · this worker’s last claim`
+						: 'how far back the claim scan starts · live',
 			// The floor cannot advance past the oldest DUE ROW, and only that row's own result moves
 			// it — a lease expiring does not — so a lag well past one lease means a render is holding
 			// it and everything behind it is waiting. The subtitle names the row.
@@ -168,11 +183,12 @@ function counts(ctx, data) {
 function traffic(ctx) {
 	const data = ctx.data.analytics;
 	const open = link('open traffic →', () => ctx.go('traffic'));
+	const title = `Bot serves — ${scopeLabel(data)}, last hour`;
 
 	if (!data || data.available === false || windowEmpty(data)) {
-		return card('Bot serves — this node, last hour', {
+		return card(title, {
 			head: [spacer(), open],
-			body: [emptyNote('bot_serve')],
+			body: [emptyNote('bot_serve', data)],
 		});
 	}
 
@@ -185,7 +201,7 @@ function traffic(ctx) {
 
 	const { keys, stacks } = stackBy(serves, 'method', data.bucketCount);
 
-	return card('Bot serves — this node, last hour', {
+	return card(title, {
 		head: [
 			spacer(),
 			legend(keys.slice(0, 5).map((k) => ({ label: k, color: colorFor(CACHE_STATUS_COLORS, k) }))),
@@ -211,9 +227,14 @@ function upcoming(ctx, data) {
 	const { enabled, interval, running, lastRun } = data.backlog;
 	const buckets = lastRun?.buckets ?? [];
 
+	// A snapshot covers ONE node's owned keys, so "recompute" has no cluster meaning — the proxy
+	// refuses it under cluster scope rather than silently recomputing a quarter of the picture.
+	// Say that on the button instead of letting the click produce an error banner.
+	const clusterScope = isMerged(data);
 	const recompute = el('button', {
-		text: running ? 'Computing…' : 'Recompute',
-		disabled: ctx.busy || running,
+		text: clusterScope ? 'Recompute (pick a node)' : running ? 'Computing…' : 'Recompute',
+		disabled: ctx.busy || running || clusterScope,
+		title: clusterScope ? 'Each node snapshots the keys it owns. Switch to a node to recompute its slice.' : null,
 		onclick: () => ctx.run(() => ctx.post('backlog', {})),
 	});
 
@@ -224,15 +245,28 @@ function upcoming(ctx, data) {
 	// EXISTENCE and the row exists, the URL simply stops rendering. This snapshot is the only
 	// reader that still scans from the absolute index minimum, which makes it the only detector.
 	if (lastRun?.belowFloor > 0) {
+		const whose = lastRun.nodes > 1 ? `the claim floor of one of ${lastRun.nodes} nodes` : "this node's claim floor";
 		body.push(
 			el('div', { cls: 'note bad' }, [
-				`${num(lastRun.belowFloor)} schedule row(s) sit BELOW this node's claim floor` +
+				`${num(lastRun.belowFloor)} schedule row(s) sit BELOW ${whose}` +
 					(lastRun.oldestBelowFloorMs ? ` (oldest was due ${ago(lastRun.oldestBelowFloorMs)})` : '') +
 					'. Nothing will claim those keys, and they report no error. They are recovered when the floor ' +
 					'resets (queue.claimFloor.resetInterval), or immediately with the queue action ' +
-					'reset-claim-floor on this node. A due time written straight to the table — the operations API ' +
+					'reset-claim-floor — run on the node that owns them, which is why this count is worth ' +
+					'drilling into per node. A due time written straight to the table — the operations API ' +
 					'or the exported RenderSchedule endpoint — is the usual cause; nothing in the plugin can see ' +
 					'those writes.',
+			])
+		);
+	}
+
+	// A node that has never snapshotted contributes ZERO to this sum, which is indistinguishable
+	// from a node with nothing due. Name it — the histogram is short by that node's whole slice.
+	if (lastRun?.missing?.length) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				`No snapshot yet from ${lastRun.missing.join(', ')} — the totals and the histogram below are ` +
+					`the other ${lastRun.nodes} node(s) only, so the real backlog is larger than shown.`,
 			])
 		);
 	}
@@ -314,7 +348,7 @@ function nodes(ctx, data) {
 				]),
 			]),
 		],
-		foot: [muted('This node’s render throughput and claim health are on Queue & nodes; peers chart their own.')],
+		foot: [muted('Per-node throughput, pause intent and claim health are on Queue & nodes.')],
 	});
 }
 
@@ -328,11 +362,12 @@ function nodes(ctx, data) {
 function failures(ctx) {
 	const data = ctx.data.analytics;
 	const openQueue = link('open queue →', () => ctx.go('queue'));
+	const title = `Render outcomes — ${scopeLabel(data)}, last hour`;
 
 	if (!data || data.available === false || windowEmpty(data)) {
-		return card('Render outcomes — this node, last hour', {
+		return card(title, {
 			head: [spacer(), openQueue],
-			body: [emptyNote('render')],
+			body: [emptyNote('render', data)],
 		});
 	}
 
@@ -355,11 +390,14 @@ function failures(ctx) {
 	for (const s of outcomes) byOutcome[s.method] = (byOutcome[s.method] ?? 0) + s.count;
 	const bad = (byOutcome['failed'] ?? 0) + (byOutcome['auth-failure'] ?? 0);
 
-	return card('Render outcomes — this node, last hour', {
+	return card(title, {
 		head: [spacer(), openQueue],
 		body: [
 			total === 0
-				? el('div', { cls: 'note', text: 'No render results were processed on this node in the window.' })
+				? el('div', {
+						cls: 'note',
+						text: `No render results were processed on ${isMerged(data) ? 'any node' : 'this node'} in the window.`,
+					})
 				: kv(
 						Object.entries(byOutcome)
 							.sort((a, b) => b[1] - a[1])
@@ -383,12 +421,18 @@ function repair(ctx, data) {
 
 	const body = [];
 
+	// ONE node with the sweep off is the finding, not "the cluster has it on". Each node repairs
+	// only the keys it owns, so a single disabled node leaves roughly 1/N of the corpus with no
+	// repair at all — and every other panel keeps looking healthy.
 	if (!info.enabled) {
 		body.push(
 			el('div', { cls: 'note bad' }, [
 				el('code', { text: 'render.reconcile.enabled' }),
-				' is false. Nothing will repair a target whose schedule row goes missing, and such a URL ' +
-					'stops rendering permanently and silently.',
+				info.disabledOn?.length
+					? ` is false on ${info.disabledOn.join(', ')}. The keys those nodes own have no repair sweep: ` +
+						'a target whose schedule row goes missing there stops rendering permanently and silently.'
+					: ' is false. Nothing will repair a target whose schedule row goes missing, and such a URL ' +
+						'stops rendering permanently and silently.',
 			])
 		);
 	}
@@ -398,34 +442,37 @@ function repair(ctx, data) {
 	} else if (last) {
 		body.push(
 			kv([
-				['Last sweep', ago(last.finishedAt)],
+				[last.nodes > 1 ? `Oldest of ${last.nodes} sweeps` : 'Last sweep', ago(last.finishedAt)],
 				['Targets examined', num(last.examined)],
-				['Owned by this node', num(last.owned)],
+				[last.nodes > 1 ? 'Owned across nodes' : 'Owned by this node', num(last.owned)],
 				['Schedule rows restored', last.restored ? pill(num(last.restored), 'warn') : pill('0', 'ok')],
 				last.truncated ? ['Truncated', pill('hit the restore cap — more may remain', 'bad')] : null,
 			])
 		);
 	} else {
-		body.push(muted('No sweep has run on this node yet since it started.'));
+		body.push(muted('No sweep has run yet since startup.'));
 	}
 
 	body.push(
 		el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
 			'A target and its schedule are two writes in two databases, and the schedule is routed to the ' +
-				'node owning the URL — so the pair can end up half-written. This sweep repairs only the keys ' +
-				'THIS node owns (a node can only read its own residency-pinned rows without a cross-node ' +
-				'fetch); every node sweeps its own slice.',
+				'node owning the URL — so the pair can end up half-written. Each node repairs only the keys ' +
+				'IT owns (a node can only read its own residency-pinned rows without a cross-node fetch), so ' +
+				'the cluster figure above is the sum of every node’s own slice, and a sweep is always run ' +
+				'against one node.',
 		])
 	);
 
+	const clusterScope = isMerged(ctx.data.overview);
 	return card('Schedule repair', {
 		head: [
 			info.enabled ? pill(`every ${duration(info.interval)}`, 'ok') : pill('disabled', 'bad'),
 			info.running && pill('running now', 'warn'),
 			spacer(),
 			el('button', {
-				text: info.running ? 'Sweep running…' : 'Run repair sweep',
-				disabled: ctx.busy || info.running,
+				text: clusterScope ? 'Run sweep (pick a node)' : info.running ? 'Sweep running…' : 'Run repair sweep',
+				disabled: ctx.busy || info.running || clusterScope,
+				title: clusterScope ? 'A sweep covers the keys one node owns. Switch to a node to run it there.' : null,
 				// Reload rather than render an acknowledgement: the sweep is detached, so the
 				// refreshed overview (running / lastRun) is the honest view of it.
 				onclick: () => ctx.run(() => ctx.post('reconcile', {})),

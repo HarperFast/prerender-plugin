@@ -116,17 +116,25 @@ function assembleUnrouted(data, all) {
 			spacer(),
 			el('span', {
 				cls: 'muted mono',
-				text: `worker ${data.workerIndex} on ${data.node} · since its last flush (every ${duration(data.interval)})`,
+				text: data.workers
+					? `one worker on each of ${data.workers} nodes · since their last flush (every ${duration(data.interval)})`
+					: `worker ${data.workerIndex} on ${data.node} · since its last flush (every ${duration(data.interval)})`,
 			}),
 		]),
 		el('div', { cls: 'card-body' }, [
 			all.length === 0
-				? el('div', { cls: 'note ok', text: 'This worker has served nothing unrouted since its last flush.' })
+				? el('div', {
+						cls: 'note ok',
+						text: data.workers
+							? `No unrouted traffic on the ${data.workers} sampled workers since their last flush.`
+							: 'This worker has served nothing unrouted since its last flush.',
+					})
 				: null,
 			el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-				'Counters are per-worker and reset on every flush — this is one worker’s slice, not a cluster ' +
-					'total. unclassified = the CDN forwarded a path no route declares; passthrough = declared, ' +
-					'deliberately proxied live.',
+				'Counters are per-worker and reset on every flush, so this is a SAMPLE — one worker per node, ' +
+					'not a cluster total. It answers “is anything hitting a route we don’t classify”, never ' +
+					'“how much”. unclassified = the CDN forwarded a path no route declares; passthrough = ' +
+					'declared, deliberately proxied live.',
 			]),
 		]),
 		all.length > 0 &&
