@@ -8,8 +8,38 @@
 
 // `location.pathname` may or may not carry the trailing slash and may carry an asset path when
 // the module is loaded (it never is — modules resolve against their own URL — but strip
-// defensively so a future `/prerender_admin/#/pages` style route can't break the base).
+// defensively so a future `/prerender_console/#/pages` style route can't break the base).
 const BASE = location.pathname.replace(/\/+$/, '');
+
+// ---- node selection ----
+//
+// The console proxies to ONE prerender node at a time (analytics, queue state and the
+// unrouted tally are all node-local, so mixing nodes would be incoherent). The selection
+// rides every request as a `node` query parameter; the server validates it against its
+// CONFIGURED list, so this value is a preference, never an address. Persisted so a reload
+// keeps the operator on the node they were investigating.
+
+const NODE_KEY = 'prerender-console-node';
+
+let node = '';
+try {
+	node = localStorage.getItem(NODE_KEY) ?? '';
+} catch {
+	/* storage may be unavailable; the default node is fine */
+}
+
+export const getNode = () => node;
+
+export const setNode = (value) => {
+	node = value ?? '';
+	try {
+		localStorage.setItem(NODE_KEY, node);
+	} catch {
+		/* selection just won't survive a reload */
+	}
+};
+
+const withNode = (url) => (node ? `${url}${url.includes('?') ? '&' : '?'}node=${encodeURIComponent(node)}` : url);
 
 /**
  * Notified when any request comes back 401/403, so a session that lapses mid-use drops straight
@@ -28,7 +58,7 @@ export const setExpiredHandler = (fn) => {
 async function request(path, options) {
 	let res;
 	try {
-		res = await fetch(`${BASE}/${path}`, options);
+		res = await fetch(withNode(`${BASE}/${path}`), options);
 	} catch (e) {
 		return { ok: false, status: 0, body: { error: `Request failed: ${e?.message ?? String(e)}` } };
 	}
@@ -54,4 +84,4 @@ export const post = (path, data) =>
 	});
 
 /** The URL of a stored page's HTML. Opened in a tab; served as text/plain, never text/html. */
-export const pageContentUrl = (cacheKey) => `${BASE}/page-content?cacheKey=${encodeURIComponent(cacheKey)}`;
+export const pageContentUrl = (cacheKey) => withNode(`${BASE}/page-content?cacheKey=${encodeURIComponent(cacheKey)}`);

@@ -1,0 +1,13 @@
+# Harper component configuration for the prerender console.
+#
+# This component has NO tables and NO schema: it serves the console UI and proxies its
+# API calls to a prerender deployment's /prerender_admin endpoints. Per-deployment
+# options (the upstream node list, timeouts, TLS) are supplied by the HOST app under
+# this component's key in its own config.yaml — see README.md.
+
+rest: true
+
+jsResource:
+  files: 'src/index.js'
+
+pluginModule: 'extension.js'

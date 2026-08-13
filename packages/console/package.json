@@ -1,8 +1,8 @@
 {
-	"name": "@harperfast/prerender",
-	"version": "0.47.0",
+	"name": "@harperfast/prerender-console",
+	"version": "0.1.0",
 	"type": "module",
-	"description": "Configurable Harper plugin for prerendering pages for bots and crawlers",
+	"description": "Standalone Harper component serving the prerender management console UI, proxying to a prerender deployment's /prerender_admin API",
 	"license": "Apache-2.0",
 	"main": "extension.js",
 	"homepage": "https://harpersystems.dev/",
@@ -18,20 +18,16 @@
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/HarperFast/prerender-plugin.git",
-		"directory": "packages/plugin"
+		"directory": "packages/console"
 	},
 	"scripts": {
 		"test": "node --test"
 	},
 	"dependencies": {
-		"fast-xml-parser": "^5.0.9",
 		"undici": "^7.18.2"
 	},
 	"peerDependencies": {
 		"harper": ">=5.0.15"
-	},
-	"devDependencies": {
-		"harper": "^5.0.21"
 	},
 	"engines": {
 		"node": ">=20.17"

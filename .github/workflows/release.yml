@@ -1,7 +1,8 @@
 name: Release tarballs
 
 # When a GitHub Release is published, build and attach the package tarballs
-# (@harperfast/prerender and @harperfast/prerender-browser) as release assets.
+# (@harperfast/prerender, @harperfast/prerender-browser and
+# @harperfast/prerender-console) as release assets.
 # Consumers reference these tarball URLs because the packages live in monorepo
 # subdirectories that npm can't install from a plain git URL.
 
@@ -30,7 +31,7 @@ jobs:
       - run: npm run build --workspace @harperfast/prerender-browser
 
       - name: Pack packages
-        run: npm pack --workspace @harperfast/prerender --workspace @harperfast/prerender-browser
+        run: npm pack --workspace @harperfast/prerender --workspace @harperfast/prerender-browser --workspace @harperfast/prerender-console
 
       - name: Attach tarballs to the release
         env:

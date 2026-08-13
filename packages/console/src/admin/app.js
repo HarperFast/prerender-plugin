@@ -12,7 +12,7 @@
  */
 
 import { el, harperMark, icon, muted, pill, spacer } from './ui.js';
-import { get, post, setExpiredHandler } from './api.js';
+import { get, post, setExpiredHandler, setNode } from './api.js';
 import * as overview from './views/overview.js';
 import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
@@ -182,9 +182,43 @@ function renderTopbar(view) {
 			el('span', { cls: 'here', text: view.meta.crumb }),
 		]),
 		spacer(),
-		el('span', { cls: 'muted mono nowrap', text: state.session.node ?? '' }),
+		nodePicker(),
 		cluster ? (cluster.paused ? pill('queue paused · cluster', 'bad', true) : pill('queue running', 'ok', true)) : null,
 	]);
+}
+
+/**
+ * Which prerender node this console is looking at. Every panel is that node's slice —
+ * analytics, queue state, the unrouted tally are all node-local — so switching nodes
+ * DROPS all per-view state: stale data from the previous node must never render under the
+ * new node's name. A node the sign-in didn't reach is still offered (picking it lands on
+ * the sign-in form, which is the honest next step), but labelled.
+ */
+function nodePicker() {
+	const nodes = state.session.nodes ?? [];
+	if (nodes.length === 0) return el('span', { cls: 'muted mono nowrap', text: state.session.node ?? '' });
+	if (nodes.length === 1) return el('span', { cls: 'muted mono nowrap', text: nodes[0].hostname });
+
+	const selected = state.session.selected ?? nodes[0].origin;
+	return el(
+		'select',
+		{
+			cls: 'node-picker mono',
+			title: 'Which prerender node this console reads. Every panel is that node’s own slice.',
+			onchange: (event) => {
+				setNode(event.target.value);
+				state.views = {};
+				load();
+			},
+		},
+		nodes.map(({ origin, hostname, signedIn }) =>
+			el('option', {
+				value: origin,
+				selected: origin === selected ? '' : null,
+				text: hostname + (signedIn ? '' : ' (signed out)'),
+			})
+		)
+	);
 }
 
 function renderSignIn() {
@@ -219,10 +253,20 @@ function renderSignIn() {
 			cls: 'note bad',
 			text: `Signed in as ${state.session.username ?? 'a user'}, but this account is not a super_user.`,
 		});
+	} else if ((state.session?.nodes?.length ?? -1) === 0) {
+		notice = el('div', {
+			cls: 'note bad',
+			text: 'No prerender nodes are configured for this console — set `nodes` in the component options.',
+		});
 	} else if (state.session?.sessionsEnabled === false) {
 		notice = el('div', {
 			cls: 'note bad',
-			text: 'Cookie sessions are disabled on this instance. Set authentication.enableSessions: true in the Harper config.',
+			text: 'Cookie sessions are disabled on the prerender instance. Set authentication.enableSessions: true in its Harper config.',
+		});
+	} else if (state.session?.unreachable) {
+		notice = el('div', {
+			cls: 'note warn',
+			text: `${state.session.unreachable} did not answer the session check — it may be down, or you may need to sign in again.`,
 		});
 	}
 
@@ -232,7 +276,10 @@ function renderSignIn() {
 				harperMark(28),
 				el('div', null, [
 					el('div', { cls: 'wordmark', text: 'Prerender Console' }),
-					el('div', { cls: 'sub', text: 'harper super_user required' }),
+					el('div', {
+						cls: 'sub',
+						text: 'super_user on the prerender cluster — credentials are forwarded, never stored',
+					}),
 				]),
 			]),
 			el('div', { cls: 'card' }, [

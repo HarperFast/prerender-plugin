@@ -11,8 +11,9 @@ crawlers. It provides:
 - Sitemap ingestion (`Sitemap`) that discovers URLs and schedules them for rendering.
 - A prerendered-page cache (`PrerenderedPage`); non-indexable verdicts live on the target
   itself (`Target.state: suppressed`).
-- A management API + UI at `/prerender_admin` (see [Management UI](#management-ui-prerender_admin)),
-  authenticated with Harper users and restricted to `super_user`.
+- A management API at `/prerender_admin` (see [Management API](#management-api-prerender_admin)),
+  authenticated with Harper users and restricted to `super_user`. The console UI consuming it is
+  the separate [`@harperfast/prerender-console`](../console) component.
 
 Everything that used to be hardcoded — domains, security token, device types, render/refresh
 schedules, user-agent strings, TTLs — is supplied per deployment through the host application's
@@ -134,9 +135,9 @@ rest: true # required for the @export-ed table REST endpoints
       resetInterval: 300000 # 5m — how often the floor is reset and re-derived from the index
       unpinAfter: 3600000 # 1h — a row holding the floor this long is written forward (0 = never)
 
-  management: # the admin API + UI at /prerender_admin
+  management: # the management API at /prerender_admin
     enabled: true # false makes every management route 404
-    scanCap: 20000 # ceiling on rows an overview scan walks (see "Management UI")
+    scanCap: 20000 # ceiling on rows an overview scan walks (see "Management API")
     proxyToOwner: true # ask the owning node for a residency-pinned schedule row (see below)
     peerTimeoutMs: 2500 # deadline on that peer call
     backlogSnapshotInterval: 900000 # 15m — backlog/histogram recompute cadence; 0 = manual only
@@ -521,14 +522,16 @@ else; leases stay where they are either way.
 | `GET /sitemap_refresh/<root-url>`            | Progress + outcome of a background sitemap walk                     |
 | `GET /queue_status`                          | Read per-node queue status (**observed**)                           |
 | `GET /queue_control`                         | Read the desired pause state (**intent**)                           |
-| `GET /prerender_admin`                       | Management UI + API — see below                                     |
+| `GET /prerender_admin`                       | Management API — see below (UI: @harperfast/prerender-console)      |
 | `GET /prerender_admin/metrics`               | The metric catalog — see [METRICS.md](METRICS.md)                   |
 
-## Management UI (`/prerender_admin`)
+## Management API (`/prerender_admin`)
 
-A single self-contained page (no build step, no external requests) plus the JSON API behind
-it. Open `https://<host>:<port>/prerender_admin` and sign in with a Harper username and
-password.
+The JSON management surface. **API-only since v0.47.0**: the console UI that consumes it is
+the separate [`@harperfast/prerender-console`](../console) component, deployable on this
+cluster, another cluster, or a laptop — it forwards the operator's sign-in to these routes
+per node and proxies every call, so this resource stays the sole authenticator and the
+route table below stays the whole contract.
 
 **Authentication is Harper's own.** `POST /prerender_admin/login` calls Harper's
 `context.login()`, which authenticates against Harper users and sets the `hdb-session`
@@ -545,33 +548,31 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                           | Purpose                                          | Gate         |
-| --------------------------------------- | ------------------------------------------------ | ------------ |
-| `GET /prerender_admin/`                 | the console shell (contains no data)             | public       |
-| `GET /prerender_admin`                  | `308` → `prerender_admin/` (relative asset URLs) | public       |
-| `GET /prerender_admin/<asset>`          | `app.css`, `app.js`, `views/*.js`, `fonts/*`     | public       |
-| `GET /prerender_admin/session`          | who am I                                         | public       |
-| `POST /prerender_admin/login`           | `{ username, password }`                         | public       |
-| `POST /prerender_admin/logout`          | end the session                                  | session      |
-| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                  | `super_user` |
-| `GET /prerender_admin/config`           | effective config + warnings                      | `super_user` |
-| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`)  | `super_user` |
-| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
-| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
-| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
-| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached   | `super_user` |
-| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                    | `super_user` |
-| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day  | `super_user` |
-| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)              | `super_user` |
-| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
-| `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row  | `super_user` |
-| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or          | `super_user` |
-|                                         | `{ action: "reset-claim-floor" }` (this node)    |              |
-| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now     | `super_user` |
-| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node       | `super_user` |
-| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now     | `super_user` |
-| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
-| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots    | `super_user` |
+| Method & path                           | Purpose                                         | Gate         |
+| --------------------------------------- | ----------------------------------------------- | ------------ |
+| `GET /prerender_admin[/]`               | API index: what this is, where the UI lives     | public       |
+| `GET /prerender_admin/session`          | who am I                                        | public       |
+| `POST /prerender_admin/login`           | `{ username, password }`                        | public       |
+| `POST /prerender_admin/logout`          | end the session                                 | session      |
+| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                 | `super_user` |
+| `GET /prerender_admin/config`           | effective config + warnings                     | `super_user` |
+| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`) | `super_user` |
+| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse      | `super_user` |
+| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`  | `super_user` |
+| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)        | `super_user` |
+| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached  | `super_user` |
+| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                   | `super_user` |
+| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day | `super_user` |
+| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)             | `super_user` |
+| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace         | `super_user` |
+| `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row | `super_user` |
+| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or         | `super_user` |
+|                                         | `{ action: "reset-claim-floor" }` (this node)   |              |
+| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now    | `super_user` |
+| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node      | `super_user` |
+| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now    | `super_user` |
+| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail | `super_user` |
+| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots   | `super_user` |
 
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the
 same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
@@ -582,7 +583,11 @@ like the shell — they ship in the package and carry no data; every data route 
 stored markup is origin-influenced content, and serving it as HTML from this origin would
 execute it against the operator's super-user session.
 
-### What it shows
+### What the console shows
+
+(The views live in `@harperfast/prerender-console`; they are documented here because every
+panel is a reading of THIS package's data model, and the concepts below — snapshots, the
+claim floor, schedule repair — are plugin behavior.)
 
 - **Overview** — per-node queue status with staleness, table counts, the due-now backlog, the
   in-flight count, the claim-floor lag, and a next-24h histogram of `nextRenderTime`. That

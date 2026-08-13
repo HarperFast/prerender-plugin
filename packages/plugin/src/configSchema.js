@@ -436,11 +436,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 	),
 
 	management: group(
-		'Management API + UI, served at the fixed path `/prerender_admin` (resource endpoint names are ' +
+		'Management API, served at the fixed path `/prerender_admin` (resource endpoint names are ' +
 			'fixed, like the database/table names). Gated on Harper’s own authentication: every endpoint ' +
-			'except the login/session/page routes requires a `super_user`.',
+			'except the login/session/index routes requires a `super_user`. The console UI consuming this ' +
+			'API is the separate `@harperfast/prerender-console` component.',
 		{
-			enabled: option(true, 'Serve the management API and console.'),
+			enabled: option(true, 'Serve the management API (and therefore anything the console can show).'),
 			proxyToOwner: option(
 				true,
 				'The URL explainer reads node-locally (a cross-node point read on the residency-pinned ' +
