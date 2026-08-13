@@ -1310,7 +1310,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'the bots involved (and, during a staggered rollout, to ignore shards from nodes ' +
 					'still on the old value) until the next UTC day rollover starts every sketch fresh. ' +
 					'Nothing is corrupted and nothing needs migrating; one day of breadth numbers is ' +
-					'soft. Prefer changing it at a day boundary.',
+					'soft. Prefer changing it at a day boundary. The crawl-breadth response reports the ' +
+					'shards it had to ignore as `mismatchedShards`, so that undercount is a number an ' +
+					'operator can see rather than a smaller-looking day.',
 				{ min: 8, max: 16 }
 			),
 			maxBotsPerThread: option(

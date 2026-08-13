@@ -383,6 +383,23 @@ function breadth(ctx) {
 			// distinct URLs — how much of the corpus gets walked per day) and the newest
 			// day's per-bot split.
 			const latest = days[0];
+			// Shards the plugin could not merge, because they were written at a different
+			// `crawlStats.precision` — a different register space, not a mergeable sketch. It
+			// resolves itself at the next UTC rollover, but until then the day undercounts, and
+			// an unmerged sketch reads as a flat zero rather than as an error. Say so: a breadth
+			// number that is quietly missing a node's shards looks exactly like a quiet crawler.
+			const mismatched = days.reduce((acc, d) => acc + (d.mismatchedShards ?? 0), 0);
+			if (mismatched) {
+				body.push(
+					el('div', {
+						cls: 'note warn',
+						text:
+							`${mismatched} sketch shard${mismatched === 1 ? '' : 's'} could not be merged — written at a ` +
+							'different crawlStats.precision. Those days undercount until every node has rolled over to ' +
+							'the new value (one UTC day).',
+					})
+				);
+			}
 			body.push(
 				el('div', { cls: 'cols' }, [
 					el('div', null, [
