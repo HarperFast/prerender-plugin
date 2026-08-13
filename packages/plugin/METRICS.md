@@ -215,7 +215,8 @@ carry numbers that have no metric at all.
 ### 4a. Management API (`/prerender_admin/*`, super-user)
 
 Point reads, safe to poll at dashboard cadence unless noted. See the README's
-[Management UI](README.md#management-ui-prerender_admin) section for the full contract.
+[Management API](README.md#management-api-prerender_admin) section for the full contract; the
+console UI consuming these routes is the separate `@harperfast/prerender-console` component.
 
 | Endpoint                          | What it adds over metrics                                                                                                                                                                                                                                                                                       |
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

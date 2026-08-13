@@ -440,6 +440,14 @@ select:focus {
 	border-color: rgba(45, 212, 160, 0.5);
 }
 
+/* The topbar's node selector: compact and mono, sized like the pills beside it. */
+.node-picker {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	padding: 5px 8px;
+	max-width: 320px;
+}
+
 .searchbox {
 	display: flex;
 	align-items: center;

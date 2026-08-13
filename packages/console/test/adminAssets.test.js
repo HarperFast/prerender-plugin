@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { adminAssetIds, getAdminAsset, renderAdminPage } from '../src/admin/index.js';
+import { PROXIED_GET, PROXIED_POST } from '../src/util/proxy.js';
 
 const adminDir = fileURLToPath(new URL('../src/admin/', import.meta.url));
 
@@ -106,34 +107,25 @@ test('the API base is derived from the page location, not hardcoded', () => {
 	}
 });
 
-test('the client calls only routes the server dispatches', () => {
-	// The route names are the contract between the client and PrerenderAdmin's switch. A typo
-	// fails only in a browser, so pin the set: every path the client requests must be one the
-	// resource handles.
-	const served = [
-		'session',
-		'login',
-		'logout',
-		'overview',
-		'config',
-		'sitemaps',
-		'pages',
-		'page-content',
-		'unrouted',
-		'analytics',
-		'crawl-breadth',
-		'invalidations',
-		'invalidate',
-		'metrics',
-		'explain',
-		'schedule',
-		'queue',
-		'revalidate',
-		'reconcile',
-		'backlog',
-		'sitemap',
-		'sitemap-refresh',
-	];
+test('client → proxy → plugin: every layer speaks a route the next one dispatches', () => {
+	// The route names are the contract across THREE files in TWO packages: the client's
+	// fetches, this component's proxy allowlists (util/proxy.js), and PrerenderAdmin's
+	// dispatch over in packages/plugin. A typo anywhere fails only in a browser, so pin all
+	// three against each other — the monorepo is what makes the cross-package read cheap.
+	const served = [...PROXIED_GET, ...PROXIED_POST, 'login', 'logout'];
+
+	// The plugin's dispatch, extracted from its source: the `case '<route>':` labels of the
+	// two switches plus the specially-dispatched auth/index routes.
+	const adminSource = readFileSync(
+		fileURLToPath(new URL('../../plugin/src/resources/PrerenderAdmin.js', import.meta.url)),
+		'utf8'
+	);
+	const pluginServes = new Set(['session', 'login', 'logout']);
+	for (const [, route] of adminSource.matchAll(/^\t\t\tcase '([a-z-]+)':/gm)) pluginServes.add(route);
+
+	for (const route of served) {
+		assert.ok(pluginServes.has(route), `the proxy forwards "${route}" but PrerenderAdmin does not dispatch it`);
+	}
 
 	const called = [];
 	for (const source of clientSources.values()) {
@@ -144,7 +136,7 @@ test('the client calls only routes the server dispatches', () => {
 
 	assert.ok(called.length > 0, 'expected the client to call at least one route');
 	for (const route of called) {
-		assert.ok(served.includes(route), `client calls unknown route "${route}"`);
+		assert.ok(served.includes(route), `client calls route "${route}" that the proxy does not forward`);
 	}
 	// The actions this console exists for must actually be wired up.
 	for (const required of [

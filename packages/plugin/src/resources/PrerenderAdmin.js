@@ -1,9 +1,17 @@
 /**
- * Management API + UI, exported at `/prerender_admin`.
+ * Management API, exported at `/prerender_admin`.
+ *
+ * API-ONLY SINCE v0.47.0: the console UI lives in `@harperfast/prerender-console`
+ * (packages/console), a separate Harper component that serves the same UI these routes
+ * used to ship and proxies to them — deployable on this cluster, another cluster, or a
+ * laptop. The route contract below is exactly what that console consumes, and its test
+ * suite pins itself against this file's dispatch, so the two cannot drift silently.
  *
  * Authentication is Harper's own: `POST /prerender_admin/login` calls `context.login()`,
  * which authenticates against Harper users and sets the `hdb-session` cookie, and every
- * data/action route then requires `role.permission.super_user`.
+ * data/action route then requires `role.permission.super_user`. `login`/`session`/`logout`
+ * stay here — the console forwards the operator's sign-in to THIS endpoint per node and
+ * re-homes each node's session cookie, so this resource remains the sole authenticator.
  *
  * That super-user check is written out explicitly on every route rather than left to
  * Harper's `allowRead`/`allowCreate` hooks, because this resource — like the others in this
@@ -11,10 +19,8 @@
  * `loadAsInstance !== false` (see `resources/Resource.ts`). Inheriting the default gate
  * here would look secure and enforce nothing.
  *
- * Routes (data responses are `no-store`; static assets carry cache headers of their own):
- *   GET  /prerender_admin/           the UI shell                   public (contains no data)
- *   GET  /prerender_admin            308 → ./prerender_admin/       public
- *   GET  /prerender_admin/<asset>    app.css/app.js/views/fonts     public (contain no data)
+ * Routes (all responses are JSON and `no-store`, except page-content's text/plain):
+ *   GET  /prerender_admin[/]         API index (name + route list)  public (contains no data)
  *   GET  /prerender_admin/session    who am I                       public
  *   POST /prerender_admin/login      { username, password }         public
  *   POST /prerender_admin/logout     end the session                session required
@@ -93,7 +99,6 @@ import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { startSitemapRefreshInBackground } from './Sitemap.js';
 import { currentMinuteMs, numberOf } from '../util/time.js';
-import { getAdminAsset, renderAdminPage } from '../admin/index.js';
 
 const {
 	render_schedule: { RenderSchedule },
@@ -196,39 +201,6 @@ const json = (data, status = 200) =>
 		status,
 		headers: noStore({ 'content-type': 'application/json; charset=utf-8' }),
 	});
-
-const html = (body) =>
-	new Response(body, {
-		status: 200,
-		headers: noStore({
-			'content-type': 'text/html; charset=utf-8',
-			'x-content-type-options': 'nosniff',
-			'referrer-policy': 'no-referrer',
-			// The console is fully self-contained: its stylesheet, scripts and fonts are served
-			// from this same resource, and everything else is same-origin fetch. No inline
-			// script or style anywhere, so no 'unsafe-inline'.
-			'content-security-policy':
-				"default-src 'none'; style-src 'self'; script-src 'self'; font-src 'self'; connect-src 'self'; img-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
-		}),
-	});
-
-/**
- * One static asset. Public like the shell itself — these files ship in the package and carry
- * no data. Code assets are `no-cache` (always revalidated, answered 304 via ETag), fonts are
- * immutable (their bytes are pinned to their filename; a changed font gets a new name).
- */
-const assetResponse = (asset, requestHeaders) => {
-	const headers = {
-		'content-type': asset.contentType,
-		'etag': asset.etag,
-		'cache-control': asset.immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
-		'x-content-type-options': 'nosniff',
-	};
-	if (requestHeaders?.get?.('if-none-match') === asset.etag) {
-		return new Response(null, { status: 304, headers });
-	}
-	return new Response(asset.body, { status: 200, headers });
-};
 
 // Harper's RequestTarget leaves `id` undefined for `/prerender_admin` but sets it to `null`
 // for `/prerender_admin/` (a trailing slash marks a collection). Both mean "the root", so
@@ -380,23 +352,15 @@ export class PrerenderAdmin extends Resource {
 		const user = context?.user;
 
 		if (route === '') {
-			// The shell's asset URLs are relative, so it must be served under the trailing-slash
-			// URL. `isCollection` is how RequestTarget distinguishes `/prerender_admin/` from
-			// `/prerender_admin`; the Location is relative (resolved by the browser against the
-			// request URL), so a deployment base-URL prefix is preserved without knowing it here.
-			if (!target?.isCollection) {
-				return new Response(null, { status: 308, headers: noStore({ location: 'prerender_admin/' }) });
-			}
-			// The page itself carries no data — it renders a login form and fetches everything
-			// through the gated routes below.
-			return html(renderAdminPage());
+			// API-only: no shell, no assets. Answer with what this IS and where the UI went —
+			// an operator hitting this URL in a browser is following a pre-v0.47.0 habit, and a
+			// bare 404 would read as "the management surface is gone".
+			return json({
+				name: '@harperfast/prerender management API',
+				ui: 'The console UI is the @harperfast/prerender-console component — deploy it pointing at this node.',
+				node: server.hostname,
+			});
 		}
-
-		// Static assets, public like the shell: they ship in the package and carry no data.
-		// getAdminAsset resolves ONLY allowlisted ids — the id arrives percent-decoded, so a
-		// traversal attempt is just an unknown id and falls through to the 404 below.
-		const asset = getAdminAsset(route);
-		if (asset) return assetResponse(asset, context?.headers);
 
 		if (route === 'session') {
 			return json({

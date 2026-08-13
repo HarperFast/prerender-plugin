@@ -7,14 +7,19 @@ plain git URL — hence the tarball).
 
 ## Packages
 
-| Path               | Package                         | Release tag        | Build              |
-| ------------------ | ------------------------------- | ------------------ | ------------------ |
-| `packages/browser` | `@harperfast/prerender-browser` | `vX.Y.Z`           | TypeScript → `tsc` |
-| `packages/plugin`  | `@harperfast/prerender`         | `prerender-vX.Y.Z` | plain JS, no build |
+| Path               | Package                         | Release tag                | Build              |
+| ------------------ | ------------------------------- | -------------------------- | ------------------ |
+| `packages/browser` | `@harperfast/prerender-browser` | `vX.Y.Z`                   | TypeScript → `tsc` |
+| `packages/plugin`  | `@harperfast/prerender`         | `prerender-vX.Y.Z`         | plain JS, no build |
+| `packages/console` | `@harperfast/prerender-console` | `prerender-console-vX.Y.Z` | plain JS, no build |
 
 `packages/browser` is the headless-Chrome render library that **render-service** embeds and drives
 (claims jobs from the queue, renders, posts HTML back). `packages/plugin` is the Harper component
-(REST resources + schema) that runs _inside_ Harper and serves the render queue.
+(REST resources + schema) that runs _inside_ Harper and serves the render queue. `packages/console`
+is the standalone management-console component: it serves the operator UI and proxies to the
+plugin's `/prerender_admin` API (API-only since plugin v0.47.0) — deployable on the prerender
+cluster itself or anywhere else; sign-in fans out to the configured nodes and forwards the
+operator's own credentials, never a stored secret.
 
 - **`dist/` is gitignored — never commit build output.** CI builds it at release time.
 - Node 24 in use (`engines: >=20`; the `.ts` tests need ≥ 22 for type-stripping).
@@ -29,7 +34,7 @@ npm run lint && npm run format:check                      # root, all workspaces
 
 ## Commit convention
 
-`type(scope): summary; vX.Y.Z` — scope is `browser` or `plugin`; append the new package version on
+`type(scope): summary; vX.Y.Z` — scope is `browser`, `plugin` or `console`; append the new package version on
 the bump commit. e.g. `fix(browser): claim over https (queue port is TLS); v1.5.1`.
 
 ## Contributing flow
@@ -48,14 +53,14 @@ packages, and uploads the `.tgz` assets to that release tag.
 
 1. Merge the version-bump PR to `main`.
 2. `gh release create vX.Y.Z --target main --title "vX.Y.Z — @harperfast/prerender-browser" --notes "…"`
-   (plugin releases use the tag `prerender-vX.Y.Z`).
+   (plugin releases use the tag `prerender-vX.Y.Z`; console releases `prerender-console-vX.Y.Z`).
 3. Wait for the _Release tarballs_ run, then confirm the asset:
    `gh release view vX.Y.Z --json assets --jq '.assets[].name'`
 4. Consumers reference
    `https://github.com/HarperFast/prerender-plugin/releases/download/vX.Y.Z/harperfast-prerender-browser-X.Y.Z.tgz`.
 
-The workflow packs both packages, so a browser release also (harmlessly) re-attaches the current
-plugin tarball to that release, and vice-versa.
+The workflow packs all three packages, so any release also (harmlessly) re-attaches the other
+packages' current tarballs to that release tag.
 
 ## Hard-won lessons
 
@@ -116,7 +121,7 @@ CDN ──bot/crawler traffic──▶  <customer>-pr  (Harper component + @harp
 
 | Repo                 | Role                                                   | Branch model                                                                           | Dep on the monorepo                              |
 | -------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| **prerender-plugin** | source monorepo (two packages)                         | PRs → `main`                                                                           | —                                                |
+| **prerender-plugin** | source monorepo (three packages)                       | PRs → `main`                                                                           | —                                                |
 | **`<customer>-pr`**  | Harper component, serves bot traffic behind the CDN    | PRs → `main`                                                                           | `@harperfast/prerender` tarball (`prerender-v*`) |
 | **render-service**   | headless-browser render fleet, one branch per customer | version bumps commit **directly** to the customer branch; feature work via `feat/*` PR | `@harperfast/prerender-browser` tarball (`v*`)   |
 
