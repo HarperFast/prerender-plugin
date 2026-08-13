@@ -1,24 +1,27 @@
 /**
  * Traffic: what crawlers got, from where, how fast, how fresh — the delivery half of the
- * metric catalog, charted from ONE bounded node-local analytics scan per refresh.
+ * metric catalog, charted from ONE bounded analytics scan per node per refresh.
  *
  * THE FOUR QUESTIONS this view answers are the catalog's own (METRICS.md §1): are we taking
  * load off the origin (bot_serve source), is the cache hit and fresh (bot_serve status +
  * page_age), what does a non-cache serve cost (origin_fetch), and which route's cadence
  * should move (route_serve / route_page_age). The panels are ordered exactly that way.
  *
- * LOAD DISCIPLINE. Every number on this view comes from a single `analytics` request; the
- * server answers it from a per-worker cache inside `management.analytics.cacheTtl`, so
- * switching ranges back and forth, or a second operator, does not multiply scans. Crawl
- * breadth is the one extra query (its own capped scan of the sketch table) and loads only on
- * an explicit click. The footer states what the refresh actually cost — this console shares
- * its workers with bot traffic, and a dashboard that can slow a node down owes the operator
- * the number.
+ * LOAD DISCIPLINE. Every number on this view comes from a single `analytics` request; each
+ * node answers it from a per-worker cache inside `management.analytics.cacheTtl`, so switching
+ * ranges back and forth, a view switch, or a second operator does not multiply scans. Under
+ * cluster scope that is one cached scan PER NODE — N times a bounded read, not N times a
+ * table walk — and the footer states what the refresh actually cost on every node. This
+ * console shares its upstreams' workers with bot traffic, and a dashboard that can slow a node
+ * down owes the operator the number. Crawl breadth is the one extra query (its own capped scan
+ * of the sketch table); the sketches replicate, so it is read from one node and loads only on
+ * an explicit click.
  *
- * SCOPE HONESTY. Analytics rows are node-local (unless the deployment replicates them — the
- * footer says which): ratios here are representative of the cluster, totals are this node's
- * slice. Cluster-wide totals are the external collector's job, not a fan-out this console
- * should be adding to a serving path.
+ * SCOPE HONESTY. Analytics rows are node-local, so a cluster total is a SUM the proxy computes
+ * from every node's window (util/aggregate.js) — and a sum missing a node is a wrong number,
+ * not a small one, which is why an incomplete fan-out banners the whole view. Merged
+ * percentiles are count-weighted approximations and are always written "≈". Every card names
+ * its scope; the footer names the nodes.
  */
 
 import { card, el, ICONS, link, num, pct, spacer, stat, table } from '../ui.js';
@@ -76,7 +79,7 @@ export function render(ctx) {
 	if (data.available === false) return [head, el('div', { cls: 'note bad', text: data.error })];
 
 	if (windowEmpty(data)) {
-		return [head, card('No traffic recorded', { body: [emptyNote('analytics')] })];
+		return [head, card('No traffic recorded', { body: [emptyNote('analytics', data)] })];
 	}
 
 	const serves = pick(data, 'bot_serve');
@@ -85,7 +88,7 @@ export function render(ctx) {
 		head,
 		kpis(data, serves),
 		el('div', { cls: 'cols' }, [freshness(data, serves), latency(data)]),
-		el('div', { cls: 'cols' }, [bots(serves), statusCodes(data)]),
+		el('div', { cls: 'cols' }, [bots(serves, data), statusCodes(data)]),
 		el('div', { cls: 'cols' }, [originFetch(data), pageAge(data)]),
 		routes(ctx, data),
 		breadth(ctx),
@@ -154,7 +157,7 @@ function latency(data) {
 	return card('Serve time (p95 ≈)', {
 		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
 		body: [
-			any ? lineChart(data, series) : emptyNote('duration'),
+			any ? lineChart(data, series) : emptyNote('duration', data),
 			el('p', { cls: 'muted chart-note' }, [
 				'Harper’s own per-request timing for bot traffic, split by its independent cache verdict — ',
 				'a cross-check on the freshness panel. Percentiles are count-weighted merges: trend, not SLO.',
@@ -164,7 +167,7 @@ function latency(data) {
 }
 
 /** Who is crawling, and how much of each bot's traffic still reaches the origin. */
-function bots(serves) {
+function bots(serves, data) {
 	const byBot = new Map();
 	for (const s of serves) {
 		const bot = s.type ?? 'other';
@@ -188,7 +191,7 @@ function bots(serves) {
 		rows.push({ label: `other (${rest.length})`, value: total, sub: `${pct(total - origin, total)} offloaded` });
 	}
 	return card('Serves by bot', {
-		body: [rows.length ? barList(rows) : emptyNote('bot_serve')],
+		body: [rows.length ? barList(rows) : emptyNote('bot_serve', data)],
 	});
 }
 
@@ -210,7 +213,7 @@ function statusCodes(data) {
 							color: statusCodeColor(code),
 						}))
 					)
-				: emptyNote('response_*'),
+				: emptyNote('response_*', data),
 			el('p', { cls: 'muted chart-note' }, [
 				'A metric exists only for codes that occurred — an absent code is zero, not unknown.',
 			]),
@@ -259,7 +262,7 @@ function originFetch(data) {
 						'renderNow falling back — the fleet not keeping up with on-demand requests.',
 					]),
 				]
-			: [emptyNote('origin_fetch')],
+			: [emptyNote('origin_fetch', data)],
 	});
 }
 
@@ -275,7 +278,7 @@ function pageAge(data) {
 	return card('Page age at serve (≈)', {
 		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
 		body: [
-			any ? lineChart(data, series, { band: interval }) : emptyNote('page_age'),
+			any ? lineChart(data, series, { band: interval }) : emptyNote('page_age', data),
 			el('p', { cls: 'muted chart-note' }, [
 				'Cache serves only, so origin proxies cannot drag it toward zero. The dashed line is the ',
 				'default render interval — a p95 above it means the fleet is not keeping the cadence. ',

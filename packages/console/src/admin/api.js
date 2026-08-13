@@ -11,27 +11,37 @@
 // defensively so a future `/prerender_console/#/pages` style route can't break the base).
 const BASE = location.pathname.replace(/\/+$/, '');
 
-// ---- node selection ----
+// ---- scope selection ----
 //
-// The console proxies to ONE prerender node at a time (analytics, queue state and the
-// unrouted tally are all node-local, so mixing nodes would be incoherent). The selection
-// rides every request as a `node` query parameter; the server validates it against its
-// CONFIGURED list, so this value is a preference, never an address. Persisted so a reload
-// keeps the operator on the node they were investigating.
+// The console reads THE CLUSTER by default and one node on demand. Analytics, the backlog
+// snapshot and the claim floor are all node-local, so a cluster answer is a fan-out merged
+// server-side (see util/aggregate.js) — which is why this is one value, not a multi-select:
+// the proxy does the work and hands back a single payload either way.
+//
+// The selection rides every request as a `node` query parameter; the server validates it
+// against its CONFIGURED list, so this value is a preference, never an address. Persisted so a
+// reload keeps the operator on the scope they were investigating.
 
 const NODE_KEY = 'prerender-console-node';
 
-let node = '';
+/** The cluster sentinel, matching util/aggregate.js. Never a hostname. */
+export const CLUSTER = 'cluster';
+
+let node = CLUSTER;
 try {
-	node = localStorage.getItem(NODE_KEY) ?? '';
+	// An empty stored value is a pre-cluster-scope selection: those consoles stored '' for
+	// "the default node". Reading it back as the cluster is the intended upgrade.
+	node = localStorage.getItem(NODE_KEY) || CLUSTER;
 } catch {
-	/* storage may be unavailable; the default node is fine */
+	/* storage may be unavailable; the cluster default is fine */
 }
 
 export const getNode = () => node;
 
+export const isCluster = () => node === CLUSTER;
+
 export const setNode = (value) => {
-	node = value ?? '';
+	node = value || CLUSTER;
 	try {
 		localStorage.setItem(NODE_KEY, node);
 	} catch {

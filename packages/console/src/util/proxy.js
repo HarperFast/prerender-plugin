@@ -1,7 +1,12 @@
 /**
- * Pure helpers for the console's upstream proxy: the session-cookie codec, node
+ * Pure helpers for the console's upstream proxy: the session-cookie codec, scope/node
  * resolution, and set-cookie capture. No I/O — everything here is unit-tested directly.
+ *
+ * The cluster MERGE math lives next door in aggregate.js; this module only decides WHICH
+ * upstream(s) a request is allowed to reach.
  */
+
+import { CLUSTER } from './aggregate.js';
 
 /**
  * The routes the proxy will forward — nothing else leaves this component. Lives here (not
@@ -82,12 +87,32 @@ export function readCookie(cookieHeader, name) {
 }
 
 /**
+ * Resolve the browser-supplied `node` parameter to a SCOPE: the whole cluster, or one node.
+ *
+ * `cluster` is the default and the sentinel — the console's headline view is the cluster, and a
+ * single node is the drill-down. It is a literal, never an address: it cannot collide with a
+ * configured origin (those are absolute URLs) and it never reaches `resolveNode`, so the SSRF
+ * gate below is untouched by it. With one node configured there is no cluster to aggregate, so
+ * the sentinel collapses to that node and the UI drops the picker entirely.
+ *
+ * Returns `{ cluster: true }`, `{ cluster: false, origin }`, or null for an unknown node.
+ */
+export function resolveScope(param, nodes) {
+	if (!nodes?.length) return null;
+	const wanted = param === null || param === undefined || param === '' ? CLUSTER : String(param).toLowerCase();
+	if (wanted === CLUSTER) return nodes.length > 1 ? { cluster: true } : { cluster: false, origin: nodes[0] };
+	const origin = resolveNode(param, nodes);
+	return origin ? { cluster: false, origin } : null;
+}
+
+/**
  * Resolve the browser-supplied node parameter to a configured origin.
  *
  * THE PARAMETER NEVER BECOMES A URL. It is matched — as a full origin or a bare hostname —
  * against the configured list, and anything else resolves to null (answered 400 upstream of
  * any fetch). This is the SSRF gate: the browser picks FROM the list, it cannot extend it.
- * Absent parameter = the first configured node, so a fresh session lands somewhere stable.
+ * Absent parameter = the first configured node, so a caller that resolved a node directly
+ * (rather than through `resolveScope`) still lands somewhere stable.
  */
 export function resolveNode(param, nodes) {
 	if (!nodes?.length) return null;
