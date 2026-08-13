@@ -191,20 +191,30 @@ function nodeTable(ctx, data, setPause) {
 		return total > 0 && rangeMs > 0 ? `≈${fmtCount(total / (rangeMs / 3_600_000))}/h` : null;
 	};
 
+	// Hostnames are case-insensitive, so both sides of this join are lowercased — the same rule
+	// resolveNode follows. The two keys reach it having been through different hands: `node` is
+	// the node's own `server.hostname` (verbatim from its Harper config, whatever case that was
+	// written in) and `hostname` is the configured origin's host, which `new URL()` has already
+	// lowercased. Matching them raw would drop the fallback join for any deployment that spells
+	// its hostname with a capital, and the symptom would be a blank throughput cell that reads
+	// as "this node didn't answer".
 	const rates = new Map();
+	const setRate = (key, rate) => {
+		if (key) rates.set(String(key).toLowerCase(), rate);
+	};
 	if (analytics && analytics.available !== false) {
 		if (analytics.byNode) {
 			for (const entry of analytics.byNode) {
 				const outcomes = (entry.totals ?? []).filter((s) => s.metric === 'render' && s.path === 'outcome');
 				const rate = rateOf(outcomes, entry.rangeMs ?? analytics.rangeMs);
-				// Key on the node's OWN hostname (what QueueStatus rows use); the configured
+				// The node's OWN hostname is the join key QueueStatus rows use; the configured
 				// origin's host carries a port and would never match. Both are indexed so a
 				// deployment whose origins happen to be bare hostnames still joins.
-				if (entry.node) rates.set(entry.node, rate);
-				rates.set(entry.hostname, rate);
+				setRate(entry.node, rate);
+				setRate(entry.hostname, rate);
 			}
 		} else if (analytics.node) {
-			rates.set(
+			setRate(
 				analytics.node,
 				rateOf(
 					pick(analytics, 'render', (s) => s.path === 'outcome'),
@@ -213,7 +223,7 @@ function nodeTable(ctx, data, setPause) {
 			);
 		}
 	}
-	const rateFor = (hostname) => rates.get(hostname) ?? null;
+	const rateFor = (hostname) => (hostname ? (rates.get(String(hostname).toLowerCase()) ?? null) : null);
 
 	const rows = data.nodes.map((node) =>
 		el('tr', null, [
