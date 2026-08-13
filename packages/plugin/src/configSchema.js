@@ -178,6 +178,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'In forwarded mode a matched route’s own `queryParams` takes precedence.',
 				{ movedFrom: 'url.queryParams', itemType: 'string' }
 			),
+			decodeReserved: option(
+				[':', ',', '@'],
+				'RESERVED characters to decode when they appear percent-encoded, so one logical URL ' +
+					'spelled two ways is one cache key. The UNRESERVED set (letters, digits, `- . _ ~`) is ' +
+					'always decoded — RFC 3986 says those escapes denote the same character, so it holds for ' +
+					'every site. These do not: whether `%3A` and `:` name the same page is a fact about how ' +
+					'your origin parses URLs.\n' +
+					'  [":", ",", "@"] — the characters WHATWG `new URL()` and Chrome emit literally in a ' +
+					'query, so a sitemap loc, a CDN-forwarded request and a Chrome redirect target agree (default)\n' +
+					'  [] — decode nothing beyond the unreserved set (what a CDN does)\n' +
+					'Structural characters are refused: decoding `&` `=` `+` `#` `/` `%` or `|` would reparse ' +
+					'the URL into a different shape. Beware list-valued params — an API that reads `?ids=1,2,3` ' +
+					'as three values and `%2C` as a literal comma inside one is a site where `,` must be removed ' +
+					'from this list.',
+				{ itemType: 'string', itemEnum: [':', ',', '@', ';', '$', "'", '(', ')', '!', '*'] }
+			),
 		}
 	),
 

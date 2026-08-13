@@ -200,6 +200,18 @@ const enforceSchemaConstraints = (fresh) => {
 			reject(path, node, `must be one of ${node.enum.map((v) => `'${v}'`).join(' | ')}`);
 			return;
 		}
+		// `itemEnum` is `enum` for a list, and exists for options where a rogue entry is not
+		// merely wrong but corrupting: `cacheKey.decodeReserved` with `&` in it would decode a
+		// separator into every key and reparse the URL. Whole-list rejection (rather than
+		// dropping the bad entry) keeps the config one statement — a half-applied key policy is
+		// worse than the default one.
+		if (node.itemEnum && Array.isArray(value)) {
+			const bad = value.filter((entry) => !node.itemEnum.includes(entry));
+			if (bad.length) {
+				reject(path, node, `${bad.map((v) => `'${v}'`).join(', ')} not allowed here`);
+				return;
+			}
+		}
 		// null/undefined can't actually reach here through applyOptions (mergeInto skips
 		// null/undefined overrides, and every schema path exists in the defaults), but the
 		// validator shouldn't depend on the merge layer's behavior to be safe.

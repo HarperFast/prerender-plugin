@@ -78,5 +78,29 @@
 		"url": "https://example.com/a?z=1&m=2&a=3",
 		"allowlist": ["*"],
 		"expected": "https://example.com/a?a=3&m=2&z=1"
+	},
+	{
+		"note": "RFC 3986 §6.2.2.2 — an unreserved escape denotes the same character, so this is ONE resource, for every origin. No CDN would key these apart and neither do we.",
+		"url": "https://example.com/%68ello/w%6Frld?f=A%2Db",
+		"allowlist": ["f"],
+		"expected": "https://example.com/hello/world?f=A-b"
+	},
+	{
+		"note": "A %2E that survives parsing is inside a real segment, so it decodes like any unreserved escape. (The dot-segment spellings never survive: WHATWG new URL() resolves /%2E%2E/ and /%2e/ before we see the path — RFC 3986 §6.2.2.3 in the parser.)",
+		"url": "https://example.com/a%2Eb/x?f=y%2Ez",
+		"allowlist": ["f"],
+		"expected": "https://example.com/a.b/x?f=y.z"
+	},
+	{
+		"note": "Structural escapes are never decoded — %26 would split the query into two params and %2F would invent a path segment.",
+		"url": "https://example.com/c/page?f=Coats%20%26%20Jackets%2FOuterwear",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=Coats%20%26%20Jackets%2FOuterwear"
+	},
+	{
+		"note": "Escape hex is upper-cased whatever happens to it (RFC 3986 §6.2.2.1).",
+		"url": "https://example.com/c/page?f=a%2fb%26c",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=a%2Fb%26c"
 	}
 ]

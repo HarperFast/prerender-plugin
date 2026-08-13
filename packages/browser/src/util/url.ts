@@ -35,7 +35,27 @@ const safeDecodeURI = (s: string): string => {
  * redirect detection keeping every param is the conservative choice; the plugin re-keys with
  * the real per-route allowlist.
  */
-const FIXED_DECODE: Record<string, string> = { '%3a': ':', '%2c': ',', '%40': '@' };
+const UNRESERVED = /[A-Za-z0-9\-._~]/;
+
+/**
+ * The plugin's `cacheKey.decodeReserved` default. Fixed here on purpose: the browser never
+ * BUILDS a key, it only ever compares two URLs it normalizes itself (page.url() vs the job URL
+ * for redirect detection, canonical vs page.url() for the indexability verdict), so a deployment
+ * that changes the plugin's set does not have to mirror it — both sides of every comparison go
+ * through this same function. An option that changes which URLs are the SAME KEY (e.g. folding
+ * `+` and `%20`) is the opposite: it must be mirrored here, or a job URL keyed under the folded
+ * spelling reads as a mismatch against its own canonical.
+ */
+const DECODE_RESERVED = new Set([':', ',', '@']);
+
+/** See the plugin's `normalizeEscapes` for why the unreserved decode is unconditional, and why
+ *  `%2E` needs no special case (the URL parser has already resolved dot segments). */
+const normalizeEscapes = (s: string): string =>
+	s.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
+		const char = String.fromCharCode(parseInt(m.slice(1), 16));
+		if (UNRESERVED.test(char)) return char;
+		return DECODE_RESERVED.has(char) ? char : m.toUpperCase();
+	});
 
 export const canonicalizeUrl = (url: string | URL, queryParams: string[] = ['*']): string => {
 	const parsed = url instanceof URL ? new URL(url.href) : new URL(url);
@@ -65,9 +85,7 @@ export const canonicalizeUrl = (url: string | URL, queryParams: string[] = ['*']
 	const path =
 		parsed.pathname !== '/' && parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
 
-	let half = `${parsed.protocol}//${parsed.host}${path}${query}`;
-	half = half.replace(/%(?:3a|2c|40)/gi, (m) => FIXED_DECODE[m.toLowerCase()]);
-	half = half.replace(/%[0-9a-f]{2}/gi, (m) => m.toUpperCase());
+	let half = normalizeEscapes(`${parsed.protocol}//${parsed.host}${path}${query}`);
 	half = half.replace(/\|/g, '%7C');
 	return half;
 };

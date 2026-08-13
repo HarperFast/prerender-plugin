@@ -76,3 +76,55 @@ test('accepts a URL object and an explicit allowlist overrides the global policy
 	applyOptions({ cacheKey: { queryParams: ['page'] } });
 	assert.equal(canonicalizeUrl(new URL('https://x.com/a?page=2&f=foo&utm=z'), ['f']), 'https://x.com/a?f=foo');
 });
+
+// --- RFC 3986 §6.2.2 normalization: the part no site can disagree with ---
+
+test('unreserved escapes are always decoded (percent-encoding normalization)', () => {
+	// ALPHA / DIGIT / - . _ ~ — `/%68ello` and `/hello` are the same resource by definition,
+	// so keying them apart would be a duplicate for every origin that exists.
+	assert.equal(canonicalizeUrl('https://x.com/%68ello/w%6Frld', []), 'https://x.com/hello/world');
+	assert.equal(canonicalizeUrl('https://x.com/a?f=%41%2D%5F%7E%39', ['f']), 'https://x.com/a?f=A-_~9');
+});
+
+test('%2E needs no special case — the parser resolved dot segments first', () => {
+	// The worry is that decoding %2E manufactures a `.`/`..` segment and re-points the path.
+	// It cannot: WHATWG new URL() resolves dot segments in their ENCODED spellings too, so
+	// they are gone before this runs, and what survives is inside a real segment.
+	assert.equal(canonicalizeUrl('https://x.com/p/%2E%2E/x', []), 'https://x.com/x'); // .. popped `p`
+	assert.equal(canonicalizeUrl('https://x.com/a%2Eb', []), 'https://x.com/a.b');
+	assert.equal(canonicalizeUrl('https://x.com/a?f=1%2E5', ['f']), 'https://x.com/a?f=1.5');
+});
+
+test('structural escapes are never decoded, whatever the config says', () => {
+	// %26 would split the query in two, %2F would invent a path segment, %2B would change a
+	// facet separator into a literal plus. The schema refuses them in decodeReserved (below).
+	assert.equal(
+		canonicalizeUrl('https://x.com/a?f=Coats%20%26%20Jackets%2FOuterwear%2Bx', ['f']),
+		'https://x.com/a?f=Coats%20%26%20Jackets%2FOuterwear%2Bx'
+	);
+});
+
+// --- decodeReserved: the part that IS a claim about one origin ---
+
+test('decodeReserved defaults to the WHATWG/Chrome-literal set', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC%40D', ['f']), 'https://x.com/a?f=A:B,C@D');
+});
+
+test('decodeReserved: [] decodes nothing beyond unreserved (what a CDN does)', () => {
+	applyOptions({ cacheKey: { decodeReserved: [] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC%40D', ['f']), 'https://x.com/a?f=A%3AB%2CC%40D');
+	// …while the standards-mandated half is unaffected by config.
+	assert.equal(canonicalizeUrl('https://x.com/%68i', []), 'https://x.com/hi');
+});
+
+test('decodeReserved can drop the comma alone — for a site with list-valued params', () => {
+	applyOptions({ cacheKey: { decodeReserved: [':', '@'] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%2CC', ['f']), 'https://x.com/a?f=A:B%2CC');
+});
+
+test('a structural character in decodeReserved is refused and the default kept', () => {
+	// Whole-list rejection: `&` in the set would decode a separator into every key, and a
+	// half-applied key policy is worse than the default one.
+	applyOptions({ cacheKey: { decodeReserved: [':', '&'] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%26C', ['f']), 'https://x.com/a?f=A:B%26C');
+});

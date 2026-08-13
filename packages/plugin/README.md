@@ -61,6 +61,10 @@ rest: true # required for the @export-ed table REST endpoints
     delimiter: '|'
     attributes: [url, deviceType]
     queryParams: [page] # query params kept in the cache key; ['*'] = keep all, [] = drop all
+    decodeReserved: [':', ',', '@'] # RESERVED chars decoded so one URL spelled two ways is one key
+    # (unreserved escapes — letters, digits, `- . _ ~` — are ALWAYS decoded: RFC 3986 says those
+    #  escapes denote the same character, so it holds for every site. These do not, so they are
+    #  config: [] decodes nothing beyond unreserved, which is what a CDN does.)
 
   origin: # how Harper fetches from the origin
     securityToken: # shared secret sent to the origin; must match the render client
