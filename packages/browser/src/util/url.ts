@@ -146,7 +146,7 @@ export const canonicalVerdict = (canonicalHref: string | null | undefined, curre
 	try {
 		const current = new URL(currentUrl);
 		const canonical = new URL(canonicalHref, current);
-		const allowlist = [...new URLSearchParams(current.search).keys()];
+		const allowlist = [...current.searchParams.keys()];
 		if (canonicalizeUrl(canonical, allowlist) === canonicalizeUrl(current, allowlist)) return 'self';
 		return normalizeCanonicalUrl(canonical) === normalizeCanonicalUrl(current) ? 'variant' : 'elsewhere';
 	} catch {
