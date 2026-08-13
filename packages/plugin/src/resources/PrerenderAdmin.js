@@ -39,7 +39,7 @@
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
- *   POST /prerender_admin/backlog    recompute the backlog snapshot super_user
+ *   POST /prerender_admin/backlog    { cap? } recompute the snapshot    super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
  *
@@ -91,7 +91,7 @@ import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
-import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
+import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
@@ -464,7 +464,7 @@ export class PrerenderAdmin extends Resource {
 			case 'sweep-orphans':
 				return PrerenderAdmin.sweepOrphans(data);
 			case 'backlog':
-				return PrerenderAdmin.backlog();
+				return PrerenderAdmin.backlog(data);
 			case 'sitemap':
 				return PrerenderAdmin.sitemapDetail(data);
 			case 'sitemap-refresh':
@@ -1221,13 +1221,19 @@ export class PrerenderAdmin extends Resource {
 	 * can take a while against a large backlog and nothing is gained holding the request open),
 	 * and a scan already in flight reports itself rather than implying a second one started.
 	 */
-	static async backlog() {
+	static async backlog(data) {
 		const { running, lastRun } = await getBacklogSnapshotState();
-		const payload = { node: server.hostname, lastRun };
+		// An explicit deeper walk for this run only — the scheduled snapshot keeps using
+		// `management.scanCap`. See runBacklogSnapshotOnce: when the configured cap is smaller
+		// than the backlog, `overdue` reports the cap instead of a count and the histogram comes
+		// back empty, and this is how an operator learns the real number without a config
+		// round-trip. Clamped upstream.
+		const cap = data?.cap;
+		const payload = { node: server.hostname, lastRun, cap: resolveScanCap(cap, config.management.scanCap) };
 
 		if (running) return json({ ...payload, started: false, alreadyRunning: true });
 
-		runBacklogSnapshotOnce().catch((e) => logger.error(e));
+		runBacklogSnapshotOnce({ cap }).catch((e) => logger.error(e));
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
 

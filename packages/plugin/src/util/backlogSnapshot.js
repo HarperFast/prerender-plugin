@@ -56,6 +56,31 @@ const ROW_KEY = 'backlog_snapshot';
 // taken over. Generous next to a real scan, which is a single capped index walk.
 const STALE_RUN_MS = 5 * MINUTE;
 
+// Ceiling on an on-demand `cap` override. High enough to see past a large backlog, low enough
+// that a mistyped request cannot turn into an unbounded walk of the queue index beside bot
+// traffic. Measured cost to calibrate against: ~3.5s per 2,000 rows, so this is ~3 minutes of
+// yielding walk in the worst case — deliberate, operator-initiated, and single-flighted.
+const MAX_ON_DEMAND_CAP = 100_000;
+
+/**
+ * The row cap one scan will use: the on-demand override when a usable one was given, else the
+ * configured cap.
+ *
+ * ABSENCE IS CHECKED BEFORE `Number`, deliberately. `Number(null)` and `Number('')` are both
+ * `0`, and `0` is finite — so a request carrying `cap: null` (or an empty form field) would
+ * pass a naive finite check, clamp up to the floor of 1, and run a ONE-ROW scan that reports
+ * `overdue: 1, truncated: true`. That is a plausible-looking answer, which makes it the worst
+ * kind of wrong. Exactly the trap that put the analytics range on its 1-minute floor in
+ * v0.47.1; the same guard, in the same order, is why this is a named function with tests.
+ */
+export function resolveScanCap(cap, configured) {
+	const fallback = Math.max(1, configured | 0);
+	if (cap === null || cap === undefined || cap === '') return fallback;
+	const n = Number(cap);
+	if (!Number.isFinite(n) || n < 1) return fallback;
+	return Math.min(Math.floor(n), MAX_ON_DEMAND_CAP);
+}
+
 const table = () => databases.coordination.SharedBuffer;
 
 /**
@@ -206,7 +231,7 @@ export const getBacklogSnapshotState = async () => {
  * console's Recompute button share this, so a click can never stack a second scan onto the
  * scheduled one.
  */
-export const runBacklogSnapshotOnce = async () => {
+export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
 	const existing = await readRow();
 	if (isRunning(existing)) {
 		return { skipped: true, reason: 'a backlog scan is already running', lastRun: existing?.lastRun ?? null };
@@ -218,7 +243,18 @@ export const runBacklogSnapshotOnce = async () => {
 
 	let lastRun;
 	try {
-		const stats = await scanUpcoming(startedAt, Math.max(1, config.management.scanCap | 0));
+		// The scheduled snapshot always uses the configured cap. `cap` is the ON-DEMAND override:
+		// `management.scanCap` has to be sized for a walk that runs every interval beside bot
+		// traffic, and that budget is often far below the backlog itself — at which point the
+		// walk is spent entirely on overdue rows, `overdue` reports the cap rather than a count,
+		// and the 24-hour histogram comes back empty because the scan never reached a
+		// not-yet-due row. Measured in the field at `scanCap: 2000`: every node reporting
+		// "2000+ overdue" and 24 empty hour buckets, with no way to learn the real number short
+		// of deploying a config change, reading it, and deploying it back.
+		//
+		// One deliberate deeper walk answers that. It is clamped, it is never the scheduled
+		// path, and it takes the same single-flight claim as everything else, so it cannot stack.
+		const stats = await scanUpcoming(startedAt, resolveScanCap(cap, config.management.scanCap));
 
 		// The table counts ride in the same snapshot for the same reason as the histogram:
 		// getRecordCount is bounded (and yields internally), but it is still scanning work, and

@@ -55,6 +55,11 @@ import {
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
+// Row cap for the on-demand "Deep recompute". Sized to see past a backlog that has swallowed a
+// production-sized `management.scanCap` while staying well under the plugin's own 100k ceiling —
+// the point is to LEARN the real overdue figure once, not to make the deep walk routine.
+const DEEP_SCAN_CAP = 50_000;
+
 export async function load(ctx) {
 	const [res, analyticsRes] = await Promise.all([
 		ctx.get('overview'),
@@ -239,6 +244,19 @@ function upcoming(ctx, data) {
 		onclick: () => ctx.run(() => ctx.post('backlog', {})),
 	});
 
+	// A DEEPER walk, for this run only. Offered only when the last one truncated, because that
+	// is the state where the panel stops answering the question: the ascending scan spends its
+	// whole budget on overdue rows, so `overdue` reports the cap instead of a count and the
+	// histogram below is empty — not because nothing is due, but because the scan never got
+	// there. `management.scanCap` is sized for a walk that repeats every interval; this is the
+	// one-off that tells you what to size it to.
+	const deepen = el('button', {
+		text: 'Deep recompute',
+		disabled: ctx.busy || running || clusterScope,
+		title: `One deliberate ${num(DEEP_SCAN_CAP)}-row walk, this run only — the scheduled snapshot keeps using management.scanCap.`,
+		onclick: () => ctx.run(() => ctx.post('backlog', { cap: DEEP_SCAN_CAP })),
+	});
+
 	const body = [];
 
 	// THE ALARM FOR THE FAILURE MODE THE CLAIM FLOOR INTRODUCES. A row whose due time sits below
@@ -285,8 +303,10 @@ function upcoming(ctx, data) {
 	} else if (lastRun.truncated) {
 		body.push(
 			el('div', { cls: 'note warn' }, [
-				`The scan hit its ${num(lastRun.cap)}-row cap on the overdue backlog, so this distribution is ` +
-					'incomplete. Clear the backlog (or raise management.scanCap) to see the shape.',
+				`The scan hit its ${num(lastRun.cap)}-row cap on the overdue backlog, so the count above is a ` +
+					'FLOOR, not a total, and the histogram below is empty because the walk never reached a ' +
+					'not-yet-due row. "Deep recompute" runs one deeper walk to find the real figure — size ' +
+					'management.scanCap from what it reports.',
 			])
 		);
 	} else if (!buckets.some((bucket) => bucket.count)) {
@@ -318,6 +338,7 @@ function upcoming(ctx, data) {
 			enabled ? muted(`recomputed every ${duration(interval)}`) : pill('automatic snapshot disabled', 'warn'),
 			lastRun && muted(`as of ${ago(lastRun.finishedAt)}`),
 			recompute,
+			lastRun?.truncated && deepen,
 		],
 		body,
 	});
