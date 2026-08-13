@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bucketize, bucketWidthFor } from '../src/util/analyticsRead.js';
+import { bucketize, bucketWidthFor, clampRange } from '../src/util/analyticsRead.js';
 
 // Rows as they come off system.hdb_analytics directly: the PK is the raw composite
 // [epochMs, nodeId] — get_analytics flattens it, the console reader must do its own.
@@ -105,4 +105,17 @@ test('a null mean is excluded from the weighting entirely, not counted as zero',
 	assert.equal(series[0].mean, 300);
 	assert.equal(series[0].p95, 400);
 	assert.equal(series[0].means[0], 300);
+});
+
+test('clampRange: absence means the one-hour default, never the one-minute floor', () => {
+	const MAX = 24 * 3_600_000;
+	// The Number(null)-is-0 trap: an absent parameter must not clamp to the floor.
+	assert.equal(clampRange(null, MAX), 3_600_000);
+	assert.equal(clampRange(undefined, MAX), 3_600_000);
+	assert.equal(clampRange('', MAX), 3_600_000);
+	assert.equal(clampRange('garbage', MAX), 3_600_000);
+	// Explicit values clamp to [1 minute, maxRange].
+	assert.equal(clampRange('900000', MAX), 900_000);
+	assert.equal(clampRange('5', MAX), 60_000);
+	assert.equal(clampRange(String(48 * 3_600_000), MAX), MAX);
 });
