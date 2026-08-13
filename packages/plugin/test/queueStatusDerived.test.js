@@ -191,6 +191,64 @@ test('a forced refresh writes the QueueStatus row', async () => {
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
 
+// ---- the periodic sync is a HEARTBEAT ----
+// `updatedTime` has to mean "last reported", not "last CHANGED". Everything downstream reads it
+// that way: the QueueControl schema comment says each node rewrites its row every status sync,
+// and PrerenderAdmin calls a row stale after two sync intervals. When the write only happened on
+// a status CHANGE, a healthy node holding `queued` went stale after two minutes and stayed there
+// — measured on a 4-node cluster as all four permanently stale, rows 8.7 minutes to 5.4 hours
+// old, every node alive and claiming. The flag's one real use, spotting a node that stopped
+// reporting, was buried in a signal that was always on.
+
+test('an UNCHANGED status is still rewritten every sync, with a fresh updatedTime', async () => {
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	await RenderQueue.refreshQueueStatus();
+	const first = statuses.get('node-a');
+	assert.equal(first?.status, 'queued');
+
+	// Nothing changes between the two refreshes: same derivation, same flag. The row must move
+	// anyway — this is the entire liveness signal.
+	await new Promise((resolve) => setTimeout(resolve, 2));
+	await RenderQueue.refreshQueueStatus();
+	const second = statuses.get('node-a');
+
+	assert.equal(second.status, 'queued', 'still queued');
+	assert.ok(
+		second.updatedTime > first.updatedTime,
+		`updatedTime must advance (${first.updatedTime} -> ${second.updatedTime})`
+	);
+});
+
+test('a heartbeat publishes the flag it HOLDS, never the status that was requested', async () => {
+	// Requesting `queued` while this node holds `paused` is a no-op by design — the
+	// compareExchange cannot move a flag holding `paused`. A heartbeat that wrote the argument
+	// instead of the flag would publish `queued` for a paused node: a liveness fix that
+	// invented a false status.
+	controls.set('all', { scope: 'all', paused: true });
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'paused');
+
+	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	await RenderQueue.refreshQueueStatus();
+
+	assert.equal(QueueState.status, 'paused', 'still paused');
+	assert.equal(statuses.get('node-a')?.status, 'paused', 'the heartbeat must not publish queued for a paused node');
+});
+
+test('the HOT callers still do not write when nothing changed', async () => {
+	// The claim pass and the bot serve path call reportStatus without `heartbeat`. They run per
+	// request and per pass; a replicated write behind each one is exactly what the
+	// change-only path exists to avoid.
+	QueueState.reportStatus('queued', true);
+	statuses.clear();
+
+	QueueState.reportStatus('queued');
+	assert.equal(statuses.size, 0, 'an unchanged status must not write outside the periodic sync');
+
+	QueueState.reportStatus('empty');
+	assert.equal(statuses.get('node-a')?.status, 'empty', 'a real change still writes');
+});
+
 // ---- the lease-gauge walk rides on the status sync ----
 
 test('the status refresh reconciles the lease gauge, which otherwise climbs without bound', async () => {

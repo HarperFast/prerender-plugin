@@ -111,6 +111,12 @@ const {
 
 // How long after a node's last status report we call its row stale. Two sync intervals,
 // so a single missed tick doesn't flap the UI.
+//
+// This depends on the periodic sync REWRITING the row every interval even when nothing
+// changed (QueueState.reportStatus's `heartbeat`). If that ever reverts to writing only on a
+// status change, this check silently inverts: every healthy node goes stale within two
+// intervals and stays there, and the node that actually stopped reporting is the one thing it
+// can no longer distinguish.
 const nodeStaleAfter = () => config.queue.statusSyncInterval * 2;
 
 // Delay applied to a rejected login. Not real rate limiting (there is no cross-worker
@@ -955,6 +961,17 @@ export class PrerenderAdmin extends Resource {
 				interval: config.render.reconcile.interval,
 				running: isReconcileRunning(),
 				lastRun: getLastReconcile(),
+			},
+			// Ditto for the key-rule orphan sweep — same node scope, but MANUAL: there is no timer,
+			// so `lastRun` is null until someone runs it and there is no cadence to report. It is
+			// surfaced here anyway because its result is what an operator needs after a `cacheKey`
+			// rule change, and a sweep whose outcome lives only in the response to its own POST is
+			// one nobody sees twice.
+			orphanSweep: {
+				dryRunDefault: config.render.orphanSweep.dryRun,
+				maxDeletes: config.render.orphanSweep.maxDeletes,
+				running: isOrphanSweepRunning(),
+				lastRun: getLastOrphanSweep(),
 			},
 		};
 	}
