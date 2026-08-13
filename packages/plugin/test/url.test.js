@@ -128,3 +128,13 @@ test('a structural character in decodeReserved is refused and the default kept',
 	applyOptions({ cacheKey: { decodeReserved: [':', '&'] } });
 	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB%26C', ['f']), 'https://x.com/a?f=A:B%26C');
 });
+
+test('a live decodeReserved change takes effect (the cached set is rebuilt on apply)', () => {
+	// The set is cached across calls because this runs per URL on the read path and per URL on
+	// sitemap ingestion; the cache must not outlive a config apply.
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A:B');
+	applyOptions({ cacheKey: { decodeReserved: [] } });
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A%3AB');
+	applyOptions({});
+	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A:B');
+});

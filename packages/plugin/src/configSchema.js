@@ -1307,7 +1307,7 @@ export const describeConfigSchema = () => {
 		if (isOption(node)) {
 			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
 			out.default = clone(node.default);
-			for (const key of ['enum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
+			for (const key of ['enum', 'itemEnum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
 				if (node[key] !== undefined) out[key] = node[key];
 			}
 			return out;

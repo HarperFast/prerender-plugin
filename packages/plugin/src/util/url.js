@@ -1,4 +1,4 @@
-import { config } from '../config.js';
+import { config, onConfigApplied } from '../config.js';
 
 /**
  * Build the canonical URL-half of a cache key.
@@ -71,6 +71,13 @@ const UNRESERVED = /[A-Za-z0-9\-._~]/;
  * decoding them is a claim about how one origin parses its URLs, not a standards truth — see
  * the option's description.
  */
+// Rebuilt on config apply rather than per call: this runs on the bot read path and on sitemap
+// ingestion, where one allocation per URL is one allocation per million.
+let decodeReserved = null;
+onConfigApplied(() => {
+	decodeReserved = new Set(config.cacheKey.decodeReserved);
+});
+
 const normalizeEscapes = (s, extra) =>
 	s.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
 		const char = String.fromCharCode(parseInt(m.slice(1), 16));
@@ -108,8 +115,9 @@ export const canonicalizeUrl = (url, queryParams = config.cacheKey.queryParams) 
 		parsed.pathname !== '/' && parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
 
 	// Reconstruct by hand so no serialization step re-touches the (already filtered and sorted)
-	// query, then rewrite every escape in a single pass.
-	const extra = new Set(config.cacheKey.decodeReserved);
+	// query, then rewrite every escape in a single pass. The `??=` covers the window before the
+	// first applyOptions, since this module can be imported before config is applied.
+	const extra = (decodeReserved ??= new Set(config.cacheKey.decodeReserved));
 	let half = normalizeEscapes(`${parsed.protocol}//${parsed.host}${path}${query}`, extra);
 	half = half.replace(/\|/g, '%7C');
 	return half;
