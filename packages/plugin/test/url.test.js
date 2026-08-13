@@ -11,9 +11,12 @@ beforeEach(() => applyOptions({}));
 const VECTORS = JSON.parse(readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url)));
 
 test('canonicalizeUrl matches every shared cache-key vector', () => {
-	for (const { url, allowlist, expected } of VECTORS) {
+	for (const { url, allowlist, expected, options } of VECTORS) {
+		// A vector may pin a non-default cacheKey policy; both suites apply it their own way.
+		applyOptions(options ? { cacheKey: options } : {});
 		assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
 	}
+	applyOptions({});
 });
 
 test('default allowlist keeps only the page param and drops the hash', () => {
@@ -137,4 +140,51 @@ test('a live decodeReserved change takes effect (the cached set is rebuilt on ap
 	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A%3AB');
 	applyOptions({});
 	assert.equal(canonicalizeUrl('https://x.com/a?f=A%3AB', ['f']), 'https://x.com/a?f=A:B');
+});
+
+// --- trailingSlash: /a/ vs /a is a per-site fact, so it is a policy, not a rule ---
+
+test('trailingSlash strips by default and preserves when told to', () => {
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a');
+	applyOptions({ cacheKey: { trailingSlash: 'preserve' } });
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a/');
+	assert.equal(canonicalizeUrl('https://x.com/a', []), 'https://x.com/a');
+	// The root has no trailing slash to argue about under either policy.
+	assert.equal(canonicalizeUrl('https://x.com/', []), 'https://x.com/');
+});
+
+test('an unknown trailingSlash value is refused and the default kept', () => {
+	applyOptions({ cacheKey: { trailingSlash: 'sometimes' } });
+	assert.equal(canonicalizeUrl('https://x.com/a/', []), 'https://x.com/a');
+});
+
+// --- plusIsSpace: only true where the origin form-decodes, so off by default ---
+
+test('plusIsSpace folds %20 to + in the query, and only there', () => {
+	const respelled = 'https://x.com/a%20b/c?f=Color:Blue+Silhouette:Bath%20Rugs';
+	const declared = 'https://x.com/a%20b/c?f=Color:Blue+Silhouette:Bath+Rugs';
+	// Off: two spellings, two keys — a duplicate target for the same page.
+	assert.notEqual(canonicalizeUrl(respelled, ['f']), canonicalizeUrl(declared, ['f']));
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	assert.equal(canonicalizeUrl(respelled, ['f']), canonicalizeUrl(declared, ['f']));
+	// The PATH keeps its %20: form-decoding is a query rule, and `+` in a path is a literal plus.
+	assert.match(canonicalizeUrl(respelled, ['f']), /\/a%20b\/c/);
+});
+
+test('plusIsSpace never folds %2B — a literal plus in a value is a different value', () => {
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	// Brand:ACME+CO (two facets) and Brand:ACME%2BCO (one brand) must stay different keys.
+	assert.notEqual(
+		canonicalizeUrl('https://x.com/a?f=Brand:ACME%2BCO', ['f']),
+		canonicalizeUrl('https://x.com/a?f=Brand:ACME+CO', ['f'])
+	);
+	assert.equal(canonicalizeUrl('https://x.com/a?f=Brand:ACME%2BCO', ['f']), 'https://x.com/a?f=Brand:ACME%2BCO');
+});
+
+test('plusIsSpace folds before sorting, so re-spellings of a multi-param query agree', () => {
+	applyOptions({ cacheKey: { plusIsSpace: true } });
+	assert.equal(
+		canonicalizeUrl('https://x.com/a?b=x%20y&a=1', ['*']),
+		canonicalizeUrl('https://x.com/a?a=1&b=x+y', ['*'])
+	);
 });

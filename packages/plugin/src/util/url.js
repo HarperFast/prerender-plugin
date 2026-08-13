@@ -18,7 +18,11 @@ import { config, onConfigApplied } from '../config.js';
  *     space and re-emits every space as `+`, which destroys faceted-query grammars where
  *     `+` is a value SEPARATOR and `%20` a literal space. Splitting the raw query keeps
  *     each value byte-for-byte, so the key stays losslessly navigable.
- *  3. Drop a trailing slash on a non-root path so `/a` and `/a/` collapse.
+ *  3. Apply `cacheKey.trailingSlash`: `strip` (default) drops a trailing slash on a non-root path
+ *     so `/a` and `/a/` collapse; `preserve` keeps them apart. Configurable because no standard
+ *     makes them one resource — it is a per-site, even per-route fact (an origin that 404s or
+ *     403s the slashed form is serving a DIFFERENT answer, and stripping would have us reply on
+ *     its behalf with a page it refused).
  *  4. Decode the UNRESERVED escapes — `ALPHA / DIGIT / - . _ ~`. This is RFC 3986 §6.2.2.2
  *     percent-encoding normalization: those escapes denote the same character by definition, so
  *     `/%68ello` and `/hello` are one resource for every origin that exists. It is what a CDN
@@ -36,9 +40,15 @@ import { config, onConfigApplied } from '../config.js';
  *  7. Percent-encode any literal `|` → `%7C` so the cache-key delimiter can never appear in
  *     the URL-half (keeps `CacheKey.parse`/`extractUrl` unambiguous with an index split).
  *
- * What this deliberately does NOT do: fold `+` and `%20` (equivalent only if the origin
- * form-decodes — a per-site fact), collapse duplicate slashes, or treat `/a/` and `/a` as one
- * resource beyond rule 3's trailing-slash strip. Each is a claim no standard supports.
+ *  8. Apply `cacheKey.plusIsSpace`: when on, `%20` folds to `+` in the QUERY, so the two
+ *     spellings of a space are one key. Off by default and query-scoped, because the equivalence
+ *     holds only where the origin form-decodes (`+` → space) — true of most server stacks, false
+ *     of an RFC-3986 reader, and never true in a path. `%2B` is untouched either way: a literal
+ *     plus inside a value is a different value, not a separator.
+ *
+ * What this deliberately does NOT do: collapse duplicate slashes (an empty path segment is legal
+ * and a site may route on it), or decode structural escapes. Both are claims no standard supports
+ * and no CDN makes by default.
  *
  * `queryParams` is the allowlist of params to keep: `['*']` keeps all, `[]` drops all,
  * `['CN']` keeps only `CN`. Callers pass the per-route allowlist (forwarded mode) or the
@@ -94,6 +104,10 @@ export const canonicalizeUrl = (url, queryParams = config.cacheKey.queryParams) 
 	if (rawQuery) {
 		const keepAll = queryParams.includes('*');
 		const keep = keepAll ? null : new Set(queryParams);
+		// The fold runs BEFORE the sort, or it defeats itself: `%20` and `+` sort to different
+		// positions (0x25 vs 0x2B), so folding afterwards would order two spellings of one query
+		// differently and hand them different keys.
+		const foldSpace = config.cacheKey.plusIsSpace;
 		const segments = rawQuery.split('&').filter((seg) => {
 			if (seg === '') return false;
 			if (keepAll) return true;
@@ -107,12 +121,17 @@ export const canonicalizeUrl = (url, queryParams = config.cacheKey.queryParams) 
 			}
 			return keep.has(key);
 		});
+		if (foldSpace) {
+			for (let i = 0; i < segments.length; i++) segments[i] = segments[i].replace(/%20/gi, '+');
+		}
 		segments.sort();
 		if (segments.length) query = `?${segments.join('&')}`;
 	}
 
 	const path =
-		parsed.pathname !== '/' && parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
+		config.cacheKey.trailingSlash === 'strip' && parsed.pathname !== '/' && parsed.pathname.endsWith('/')
+			? parsed.pathname.slice(0, -1)
+			: parsed.pathname;
 
 	// Reconstruct by hand so no serialization step re-touches the (already filtered and sorted)
 	// query, then rewrite every escape in a single pass. The `??=` covers the window before the

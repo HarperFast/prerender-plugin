@@ -2,16 +2,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { canonicalizeUrl, normalizeUrlForCompare, normalizeCanonicalUrl, canonicalVerdict } from '../dist/util/url.js';
+import { settings } from '../dist/settings.js';
 
 // The single shared vector, asserted by BOTH the browser (this file) and the plugin suite,
 // so the two canonicalizeUrl copies (TS here, JS in the plugin) cannot drift.
-const VECTORS: { url: string; allowlist: string[]; expected: string }[] = JSON.parse(
-	readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url), 'utf8')
-);
+const VECTORS: {
+	url: string;
+	allowlist: string[];
+	expected: string;
+	options?: Partial<typeof settings.config.cacheKey>;
+}[] = JSON.parse(readFileSync(new URL('../../../test-vectors/canonicalize-url.json', import.meta.url), 'utf8'));
 
 test('canonicalizeUrl matches every shared cache-key vector (must equal the plugin)', () => {
-	for (const { url, allowlist, expected } of VECTORS) {
-		assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
+	const original = { ...settings.config.cacheKey };
+	try {
+		for (const { url, allowlist, expected, options } of VECTORS) {
+			// A vector may pin a non-default cacheKey policy — the mirrored options, which the
+			// renderer must read the same way the plugin does or it disagrees about identity.
+			Object.assign(settings.config.cacheKey, original, options ?? {});
+			assert.equal(canonicalizeUrl(url, allowlist), expected, `vector: ${url} @ ${JSON.stringify(allowlist)}`);
+		}
+	} finally {
+		Object.assign(settings.config.cacheKey, original);
 	}
 });
 
@@ -139,4 +151,21 @@ test('malformed percent-encoding falls back to raw instead of throwing', () => {
 		assert.doesNotThrow(() => canonicalizeUrl(bad));
 	}
 	assert.doesNotThrow(() => canonicalVerdict('https://x.com/a', 'https://x.com/%E0%A0/a'));
+});
+
+// The renderer must agree with the plugin about identity or it retires healthy pages: with the
+// fold ON in the plugin, a job URL is keyed `Bath+Rugs` while the page canonicalizes to
+// `Bath%20Rugs`. A renderer left unfolded reads that as a duplicate key and reports the page
+// non-indexable — which is why cacheKey.plusIsSpace is mirrored here and deployed together.
+test('with plusIsSpace mirrored, a folded job URL is self-canonical against the declared spelling', () => {
+	const jobUrl = 'https://example.com/c/page?f=Color:Blue+Silhouette:Bath+Rugs';
+	const canonical = 'https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs';
+	const original = { ...settings.config.cacheKey };
+	try {
+		assert.equal(canonicalVerdict(canonical, jobUrl), 'variant', 'unfolded: reads as a duplicate key');
+		settings.config.cacheKey.plusIsSpace = true;
+		assert.equal(canonicalVerdict(canonical, jobUrl), 'self', 'mirrored: one key, so indexable');
+	} finally {
+		Object.assign(settings.config.cacheKey, original);
+	}
 });

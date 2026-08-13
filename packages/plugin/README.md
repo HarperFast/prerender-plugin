@@ -61,6 +61,9 @@ rest: true # required for the @export-ed table REST endpoints
     delimiter: '|'
     attributes: [url, deviceType]
     queryParams: [page] # query params kept in the cache key; ['*'] = keep all, [] = drop all
+    trailingSlash: strip # strip|preserve — whether /a/ and /a are one key (no standard says they are)
+    plusIsSpace: false # fold %20 to + in the QUERY — only for an origin that form-decodes; MIRROR
+    # in the renderer's cacheKey.plusIsSpace, and note that enabling it re-keys every affected URL
     decodeReserved: [':', ',', '@'] # RESERVED chars decoded so one URL spelled two ways is one key
     # (unreserved escapes — letters, digits, `- . _ ~` — are ALWAYS decoded: RFC 3986 says those
     #  escapes denote the same character, so it holds for every site. These do not, so they are

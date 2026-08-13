@@ -223,6 +223,27 @@ export type CanonicalConfig = {
 	strict: boolean;
 };
 
+/**
+ * The parts of the plugin's `cacheKey` policy that change WHICH URLS ARE THE SAME KEY, mirrored
+ * here because the renderer must agree with the plugin about identity or it retires healthy URLs.
+ *
+ * Only these two. The plugin's `decodeReserved` deliberately has no twin: it changes the bytes of
+ * a key, but the browser never builds one — it only compares two URLs it normalized itself
+ * (`page.url()` vs the job URL for redirect detection; canonical vs `page.url()` for the
+ * indexability verdict), and both sides of every comparison go through the same function. These
+ * two are different: a job URL keyed under a folded (or slash-preserved) spelling gets compared
+ * against a canonical spelled the plugin's way, so a renderer configured differently from the
+ * plugin reads healthy pages as canonicalizing elsewhere and reports them non-indexable.
+ *
+ * Keep both in step with the plugin's config, and deploy the two together.
+ */
+export type CacheKeyConfig = {
+	/** Fold `%20` to `+` in the query (plugin: `cacheKey.plusIsSpace`). Default false. */
+	plusIsSpace: boolean;
+	/** Whether `/a/` and `/a` are one key (plugin: `cacheKey.trailingSlash`). Default 'strip'. */
+	trailingSlash: 'strip' | 'preserve';
+};
+
 export type PrerenderConfig = {
 	/** Device profiles keyed by the job's `deviceType`; unknown types fall back to `defaultDevice`. */
 	devices: Record<string, DeviceProfile>;
@@ -232,6 +253,7 @@ export type PrerenderConfig = {
 	scroll: ScrollConfig;
 	postProcess: PostProcessConfig;
 	canonical: CanonicalConfig;
+	cacheKey: CacheKeyConfig;
 	/**
 	 * Optional declarative "wait for content" rules applied after scroll/settle and before the
 	 * snapshot (see {@link WaitForRule}). Absent by default → a complete no-op, so existing
@@ -282,6 +304,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		resolveLazyImages: false,
 	},
 	canonical: { strict: false },
+	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
 });

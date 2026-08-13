@@ -102,5 +102,56 @@
 		"url": "https://example.com/c/page?f=a%2fb%26c",
 		"allowlist": ["f"],
 		"expected": "https://example.com/c/page?f=a%2Fb%26c"
+	},
+	{
+		"note": "plusIsSpace OFF (default): the two spellings of a space stay two keys — the historical behavior, and the only safe reading for an origin that does not form-decode.",
+		"url": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs",
+		"allowlist": ["f"],
+		"expected": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs"
+	},
+	{
+		"note": "plusIsSpace ON: %20 folds to + in the QUERY, so a crawler's re-encoding lands on the sitemap URL's key. %2B is untouched — a literal plus in a value is a different value.",
+		"url": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath%20Rugs+Brand:ACME%2BCO",
+		"allowlist": ["f"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/c/page?f=Color:Blue+Silhouette:Bath+Rugs+Brand:ACME%2BCO"
+	},
+	{
+		"note": "plusIsSpace ON folds before sorting, so two spellings of one multi-param query produce the SAME key (folding after would order them differently: %25 < %2B).",
+		"url": "https://example.com/c/page?b=x%20y&a=1",
+		"allowlist": ["*"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/c/page?a=1&b=x+y"
+	},
+	{
+		"note": "plusIsSpace is query-scoped: a path keeps %20, because form-decoding is a query rule and `+` in a path is a literal plus.",
+		"url": "https://example.com/a%20b/c?f=x%20y",
+		"allowlist": ["f"],
+		"options": {
+			"plusIsSpace": true
+		},
+		"expected": "https://example.com/a%20b/c?f=x+y"
+	},
+	{
+		"note": "trailingSlash: preserve keeps /a/ and /a apart, so each is answered with what the origin says about it.",
+		"url": "https://example.com/a/?f=1",
+		"allowlist": ["f"],
+		"options": {
+			"trailingSlash": "preserve"
+		},
+		"expected": "https://example.com/a/?f=1"
+	},
+	{
+		"note": "trailingSlash: preserve still leaves the root alone (there is no slash to preserve or strip).",
+		"url": "https://example.com/",
+		"allowlist": [],
+		"options": {
+			"trailingSlash": "preserve"
+		},
+		"expected": "https://example.com/"
 	}
 ]

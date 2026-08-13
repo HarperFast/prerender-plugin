@@ -1,3 +1,5 @@
+import { settings } from '../settings.js';
+
 /**
  * URL normalization for the renderer's equality checks. Kept here — not inlined in a
  * `page.evaluate()` function — so it is unit-tested and single-source. The bug this guards
@@ -37,6 +39,10 @@ const safeDecodeURI = (s: string): string => {
  */
 const UNRESERVED = /[A-Za-z0-9\-._~]/;
 
+// Read lazily off the live settings object so a worker that resolves config after this module is
+// imported still gets the right policy. See CacheKeyConfig for why only these two are mirrored.
+const cacheKeyPolicy = () => settings.config?.cacheKey ?? { plusIsSpace: false, trailingSlash: 'strip' as const };
+
 /**
  * The plugin's `cacheKey.decodeReserved` default. Fixed here on purpose: the browser never
  * BUILDS a key, it only ever compares two URLs it normalizes itself (page.url() vs the job URL
@@ -66,6 +72,8 @@ export const canonicalizeUrl = (url: string | URL, queryParams: string[] = ['*']
 	if (rawQuery) {
 		const keepAll = queryParams.includes('*');
 		const keep = keepAll ? null : new Set(queryParams);
+		// Fold BEFORE sorting, or it defeats itself: `%20` and `+` sort to different positions.
+		const { plusIsSpace } = cacheKeyPolicy();
 		const segments = rawQuery.split('&').filter((seg) => {
 			if (seg === '') return false;
 			if (keepAll) return true;
@@ -78,12 +86,17 @@ export const canonicalizeUrl = (url: string | URL, queryParams: string[] = ['*']
 			}
 			return keep!.has(key);
 		});
+		if (plusIsSpace) {
+			for (let i = 0; i < segments.length; i++) segments[i] = segments[i].replace(/%20/gi, '+');
+		}
 		segments.sort();
 		if (segments.length) query = `?${segments.join('&')}`;
 	}
 
 	const path =
-		parsed.pathname !== '/' && parsed.pathname.endsWith('/') ? parsed.pathname.slice(0, -1) : parsed.pathname;
+		cacheKeyPolicy().trailingSlash === 'strip' && parsed.pathname !== '/' && parsed.pathname.endsWith('/')
+			? parsed.pathname.slice(0, -1)
+			: parsed.pathname;
 
 	let half = normalizeEscapes(`${parsed.protocol}//${parsed.host}${path}${query}`);
 	half = half.replace(/\|/g, '%7C');
