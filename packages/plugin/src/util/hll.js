@@ -66,6 +66,17 @@ export function hash53(str, seed = 0) {
 /** A zeroed sketch at precision `p` (m = 2^p registers = 2^p bytes). */
 export const createSketch = (p = HLL_P) => new Uint8Array(1 << p);
 
+/**
+ * A zeroed sketch in the SAME register space as `src` — the shape any accumulator that is
+ * going to merge `src` must have.
+ *
+ * This exists to be reached for instead of `createSketch()` on every read path. The default
+ * argument makes the wrong thing look right: an accumulator built at `HLL_P` silently skips
+ * (see `mergeSketch`) every sketch a deployment wrote at a configured `crawlStats.precision`,
+ * and a sketch that merged nothing estimates as 0 — a real-looking number, not an error.
+ */
+export const createSketchLike = (src) => new Uint8Array(src.length);
+
 /** Observe one value. The entire hot-path cost of the crawl-breadth metric lives here. */
 export function addToSketch(registers, value) {
 	const m = registers.length;

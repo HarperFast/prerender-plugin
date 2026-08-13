@@ -201,6 +201,58 @@ test('computeBreadth merges shards per bot and reports the cross-bot union', () 
 	assert.equal(breadth[1].bots[0].distinctUrls, 100);
 	// estimateSketch sanity on the exported surface used by the admin route.
 	assert.equal(estimateSketch(createSketch()), 0);
+	assert.equal(breadth[0].mismatchedShards, 0);
+});
+
+test('computeBreadth reads rows written at a NON-DEFAULT precision', () => {
+	// The field failure this pins (#102). Every read-side accumulator used to be built at the
+	// module default, and `mergeSketch` refuses to merge across register spaces — so a
+	// deployment running `crawlStats.precision: 12` merged nothing, and a sketch that merged
+	// nothing estimates as exactly 0. The panel showed the rows, their shard counts, and zero
+	// distinct URLs for every bot: indistinguishable from a day no crawler visited.
+	const urls = (p, from, to) => {
+		const s = createSketch(p);
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const breadth = computeBreadth([
+		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(12, 0, 1000) },
+		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(12, 500, 1500) },
+		{ day: '2026-08-13', bot: 'GPTBot', registers: urls(12, 0, 300) },
+	]);
+
+	const [google, gpt] = breadth[0].bots;
+	assert.equal(google.shards, 2);
+	assert.ok(Math.abs(google.distinctUrls - 1500) / 1500 <= 0.05, `distinctUrls ${google.distinctUrls}`);
+	assert.ok(gpt.distinctUrls > 0, 'every bot estimated, not just the first');
+	// The union is the other accumulator that was pinned to the default: it zeroed the day
+	// total even when the per-bot numbers were right.
+	assert.ok(Math.abs(breadth[0].total - 1500) / 1500 <= 0.05, `total ${breadth[0].total}`);
+	assert.equal(breadth[0].mismatchedShards, 0);
+});
+
+test('shards of another precision are counted as mismatched, never merged as garbage', () => {
+	// The day `crawlStats.precision` changes, a node that has not rolled over yet still writes
+	// the old shape. Those registers describe a different hash slice per index, so merging them
+	// would be a plausible-looking wrong number — the undercount is correct, but it has to be
+	// visible, which is the whole lesson of the bug above.
+	const urls = (p, from, to) => {
+		const s = createSketch(p);
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const breadth = computeBreadth([
+		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(12, 0, 1000) },
+		{ day: '2026-08-13', bot: 'Googlebot', registers: urls(14, 0, 5000) }, // old-shape straggler
+	]);
+
+	const [google] = breadth[0].bots;
+	assert.equal(google.shards, 1, 'only the mergeable shard counted');
+	assert.equal(breadth[0].mismatchedShards, 1);
+	assert.ok(
+		Math.abs(google.distinctUrls - 1000) / 1000 <= 0.05,
+		`distinctUrls ${google.distinctUrls} — the 5000-URL sketch of another shape must not leak in`
+	);
 });
 
 // ── one writer per node (#87) + configurable precision ───────────────────────────────────────
