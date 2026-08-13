@@ -52,6 +52,9 @@ test('resolveNode: configured origins and hostnames resolve, everything else is 
 	// Same hostname on two ports: the host match keeps them distinct.
 	const samehost = ['https://x.example.com:9926', 'https://x.example.com:9927'];
 	assert.equal(resolveNode('x.example.com:9927', samehost), samehost[1]);
+	// Hostnames are case-insensitive; the configured origins are already lowercased.
+	assert.equal(resolveNode('Node-B.Example.COM', NODES), NODES[1]);
+	assert.equal(resolveNode('HTTPS://NODE-B.EXAMPLE.COM:9926', NODES), NODES[1]);
 	// The SSRF gate: anything not on the list resolves to nothing, never to a URL.
 	assert.equal(resolveNode('https://evil.example.net', NODES), null);
 	assert.equal(resolveNode('node-a.example.com.evil.net', NODES), null);
@@ -95,6 +98,10 @@ test('applyOptions: invalid node URLs are dropped, valid ones normalize to origi
 		});
 		// The path is stripped — only the origin is a proxy target — and junk never lands.
 		assert.deepEqual(config.nodes, ['https://node-a.example.com:9926']);
+		assert.equal(config.requestTimeout, 5000);
+		// Past the 32-bit timer limit the value is refused, not stored: Node would fire the
+		// timeout after 1ms and every proxied request would fail.
+		applyOptions({ requestTimeout: 2147483648 });
 		assert.equal(config.requestTimeout, 5000);
 	} finally {
 		Object.assign(config, before);

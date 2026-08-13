@@ -92,9 +92,12 @@ export function readCookie(cookieHeader, name) {
 export function resolveNode(param, nodes) {
 	if (!nodes?.length) return null;
 	if (param === null || param === undefined || param === '') return nodes[0];
-	const wanted = String(param);
+	// Hostnames are case-insensitive, and `new URL()` already lowercased the configured
+	// origins in applyOptions — lowercase the parameter too, or a mixed-case hostname from
+	// the client would never match anything.
+	const wanted = String(param).toLowerCase();
 	for (const origin of nodes) {
-		if (origin === wanted) return origin;
+		if (origin.toLowerCase() === wanted) return origin;
 		try {
 			// Match host (hostname:port) before bare hostname: two nodes can share a hostname
 			// and differ by port, and the bare-hostname match would silently pick the first.

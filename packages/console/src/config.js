@@ -66,8 +66,11 @@ export function applyOptions(options = {}) {
 				break;
 			}
 			case 'requestTimeout': {
+				// Capped at 2^31-1 like the plugin's own timeout options: Node stores timer delays
+				// as a signed 32-bit int, so a larger value doesn't mean "effectively never" — it
+				// fires after 1ms, which would time out EVERY proxied request.
 				const ms = Number(value);
-				if (Number.isFinite(ms) && ms > 0) config.requestTimeout = ms;
+				if (Number.isFinite(ms) && ms > 0 && ms <= 2147483647) config.requestTimeout = ms;
 				else log.error(`[prerender-console] ignoring invalid requestTimeout: ${JSON.stringify(value)}`);
 				break;
 			}
