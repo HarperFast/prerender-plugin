@@ -93,7 +93,7 @@ import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlog
 import { peekUnroutedReport } from '../util/unrouted.js';
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
-import { readAnalyticsWindow } from '../util/analyticsRead.js';
+import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
 import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
@@ -1406,8 +1406,7 @@ export class PrerenderAdmin extends Resource {
 		const opts = config.management.analytics;
 		if (!opts.enabled) return json({ error: 'management.analytics.enabled is false' }, 404);
 
-		const requested = Number(target?.get?.('range'));
-		const rangeMs = Math.min(Math.max(60_000, Number.isFinite(requested) ? requested : 3_600_000), opts.maxRange);
+		const rangeMs = clampRange(target?.get?.('range'), opts.maxRange);
 
 		try {
 			const window = await readAnalyticsWindow(rangeMs);
