@@ -416,15 +416,26 @@ Database/table names are fixed. Tables are split across databases by write-trans
 Harper serializes writes per database and commits each database independently, so the hot, high-write
 queue table is isolated and bursty/heavy writes don't serialize against it:
 
-| Database          | Tables                                  | Notes                                             |
-| ----------------- | --------------------------------------- | ------------------------------------------------- |
-| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                   |
-| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status  |
-| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)           |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress          |
-| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)      |
-| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom |
-| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)    |
+| Database          | Tables                                  | Notes                                                             |
+| ----------------- | --------------------------------------- | ----------------------------------------------------------------- |
+| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                                   |
+| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status                  |
+| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)                           |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress                          |
+| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)                      |
+| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom                 |
+| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)                    |
+| `config`          | `ConfigOverride`                        | operator-set config overrides — isolated because it is SUBSCRIBED |
+
+`config` is alone in its database for a reason that is not write volume — the table is written a few
+times a week. **A subscription is a per-database cost.** Harper's audit log spans every table in a
+database (each reader filters on `auditRecord.tableId`), so `addSubscription` attaches its `committed`
+listener to the _database's_ audit store, and every commit there schedules a pass that iterates the
+transaction log. Living in `render_service` would have made every `Target` and `QueueStatus` write pay
+for a subscription to a table nobody writes — on every worker, since every worker subscribes — which is
+the same rocksdb txn-log iteration that has pegged worker threads in this deployment before. Write
+serialization says the same thing from the other side: a config write would otherwise queue behind the
+URL registry, and vice versa, for two tables that never need to be atomic with each other.
 
 Because `RenderTarget` and `RenderSchedule` now live in separate databases, a target and its schedule
 are written as two independent commits (target first). The brief window where a target exists without a
@@ -851,7 +862,8 @@ never a snapshot of the whole config. That distinction is the entire design:
 - Clearing one row reverts **one option** to the deployed value. Clearing every row returns the
   cluster to exactly its deployed state — which is the rollback story, and it is one delete.
 
-The rows live in `render_service.ConfigOverride` and **replicate**, so the console writes once, on
+The rows live in `config.ConfigOverride` — alone in that database, because a subscription is a
+per-database cost — and **replicate**, so the console writes once, on
 whichever node it reached, and every node converges — including a node that was down when the write
 happened and a node added to the cluster next month. The alternative, a console fanning a write out
 to N nodes, has no convergence at all: a node mid-restart for one write diverges permanently, and

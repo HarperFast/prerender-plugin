@@ -427,7 +427,7 @@ const normalizeOverrides = (overrides) => {
  * Build a config from its layers WITHOUT touching the live one.
  *
  * Precedence, lowest first: schema defaults < host options (config.yaml) < stored overrides
- * (`render_service.ConfigOverride`, written from the console). Both upper layers go through the
+ * (`config.ConfigOverride`, written from the console). Both upper layers go through the
  * same `mergeInto` type checks and the same `enforceSchemaConstraints` pass, so an override
  * cannot enter by a route that skips validation — the console is not a second, weaker door into
  * the config.

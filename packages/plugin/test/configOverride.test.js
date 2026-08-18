@@ -228,7 +228,7 @@ test('inspectRoutes counts a blank exclude pattern as absent rather than as a dr
 test('readOverrides maps rows to a path -> value set, skipping a row that carries no value', async () => {
 	const calls = [];
 	globalThis.databases = {
-		render_service: {
+		config: {
 			ConfigOverride: {
 				search: (...args) => {
 					calls.push(args);
@@ -258,7 +258,7 @@ test('readOverrides maps rows to a path -> value set, skipping a row that carrie
 
 test('readOverrides fails open: a table that throws leaves the deployed config running', async () => {
 	globalThis.databases = {
-		render_service: {
+		config: {
 			ConfigOverride: {
 				search: () => {
 					throw new Error('store closed');
@@ -283,7 +283,7 @@ test('writeOverrides validates the whole batch before writing any of it', async 
 	const puts = [];
 	const deletes = [];
 	globalThis.databases = {
-		render_service: {
+		config: {
 			ConfigOverride: {
 				put: (path, row) => puts.push([path, row]),
 				delete: (path) => deletes.push(path),

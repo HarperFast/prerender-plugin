@@ -260,7 +260,7 @@ export const loading = () => el('p', { cls: 'muted', text: 'Loading…' });
 
 // ---- configuration editing -------------------------------------------------------------------
 //
-// The console can write the plugin's config: `render_service.ConfigOverride` holds one row per
+// The console can write the plugin’s config: `config.ConfigOverride` holds one row per
 // option path, layered over the deployed `config.yaml`. Everything below renders that, and the
 // hard part is not the inputs — it is never letting a value look like it took effect when it did
 // not. Four states have to stay visually distinct: what the deployed file says, what an override

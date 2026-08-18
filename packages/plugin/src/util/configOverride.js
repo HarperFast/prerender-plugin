@@ -2,7 +2,7 @@
  * The stored-override layer: reading it, validating a write, and noticing a change.
  *
  * Config resolves in three layers — schema defaults, then the deployed `config.yaml`, then the rows
- * in `render_service.ConfigOverride` written from the console. This module owns everything about
+ * in `config.ConfigOverride` written from the console. This module owns everything about
  * that third layer except the merge itself, which is `config.js`'s `resolveConfig`.
  *
  * WHY DELTAS AND NOT A SNAPSHOT. Each row is one option path. A snapshot of the whole config would
@@ -36,7 +36,7 @@
 import { config, getLogger, onConfigApplied, resolveConfig } from '../config.js';
 import { aliasPaths, checkUiEditable } from '../configSchema.js';
 
-const table = () => databases.render_service.ConfigOverride;
+const table = () => databases.config.ConfigOverride;
 
 /**
  * Ceiling on rows one read will take. There are ~130 valid option paths and the path is the primary

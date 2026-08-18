@@ -467,7 +467,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			overrides: group(
 				'Operator-set config overrides — the layer between the deployed `config.yaml` and the ' +
-					'running config, stored one row per option path in `render_service.ConfigOverride` and ' +
+					'running config, stored one row per option path in `config.ConfigOverride` and ' +
 					'written from the console.\n\n' +
 					'Precedence is `schema defaults < config.yaml < these rows`. A deployed file change still ' +
 					'takes effect for every option nobody has overridden, clearing an override reverts that one ' +

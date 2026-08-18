@@ -7,8 +7,9 @@
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
 #   render_service   Target, QueueStatus,            — URL registry (incl. indexability
-#                    QueueControl, ConfigOverride      verdicts) + queue status + pause intent
-#                                                      + operator-set config overrides
+#                    QueueControl                      verdicts) + queue status + pause intent
+#   config           ConfigOverride                  — operator-set config overrides (isolated
+#                                                      because it is SUBSCRIBED; see the type)
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
 #   coordination     SharedBuffer                    — node-local SAB, never replicated
@@ -156,6 +157,21 @@ type QueueControl @table(database: "render_service") @sealed @export(name: "queu
 # pinned, deleting a row reverts that path to the deployed value, and deleting every row returns the
 # cluster to exactly its deployed state — which is the whole rollback story.
 #
+# ALONE IN ITS OWN DATABASE, AND THAT IS THE POINT — this table is SUBSCRIBED, and a subscription is
+# a per-database cost, not a per-table one. Harper's audit log spans every table in a database (each
+# reader filters on `auditRecord.tableId`), so `addSubscription` attaches its `committed` listener to
+# the DATABASE's audit store and every commit there schedules a pass that iterates the transaction
+# log. In `render_service` that would mean every Target and QueueStatus write paying for a
+# subscription to a table nobody writes — on every worker, since every worker subscribes — which is
+# the same rocksdb txn-log iteration that has pegged worker threads here before.
+#
+# Write serialization says the same thing from the other side: Harper serializes writes per database,
+# so a config write would queue behind whatever the URL registry is doing, and a burst of Target
+# writes would sit behind a config write. Neither table needs the other to be atomic with it.
+#
+# The cost of a separate database is one more replication stream. It carries a replicable table, so
+# it is not the empty-database case that spins on subscribe/retry.
+#
 # Replicated (the default) and deliberately NOT residency-pinned, so the console writes ONCE on
 # whichever node it reached and every node converges. The alternative — the console fanning a write
 # out to N nodes — has no convergence: a node that was mid-restart for one write would diverge
@@ -167,10 +183,10 @@ type QueueControl @table(database: "render_service") @sealed @export(name: "queu
 # validates the path against the schema, type-checks the value, records who set it, and can preview
 # the change; a bare REST PUT would happily store a row that `applyOptions` then rejects at apply
 # time, which shows up as an override the console lists but the cluster does not honor. The
-# operations API (`insert`/`delete` on `render_service.ConfigOverride`) remains available as the
+# operations API (`insert`/`delete` on `config.ConfigOverride`) remains available as the
 # break-glass path, and `management.overrides.enabled: false` in the config file is the kill switch
 # that makes this whole layer inert without deleting anything.
-type ConfigOverride @table(database: "render_service") @sealed {
+type ConfigOverride @table(database: "config") @sealed {
 	# Dotted option path exactly as it appears in configSchema.js (e.g. `queue.jobLeaseTime`).
 	# Validated against the schema before the row is written, so an unknown, secret, or
 	# non-UI-editable path never lands. A path that MOVES in a later release is remapped through the
