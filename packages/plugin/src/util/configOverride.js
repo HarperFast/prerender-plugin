@@ -410,8 +410,17 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 			// iterator, which emits 'close', which unregisters the subscription permanently — a worker
 			// that silently stops seeing config changes, with nothing logged and nothing to re-add it.
 			//
-			// `omitCurrent` skips the retained replay of current rows: the caller reads the table itself
-			// right after this, so replaying it here would just be the same rows twice.
+			// `omitCurrent`, because the retained replay CANNOT be used to load the layer, however
+			// naturally that reads. Harper starts the replay in an IIFE it never awaits — `subscribe()`
+			// resolves with the subscription while the replay is still running — and the replay yields
+			// to the event loop every 100 rows (a `setImmediate`) while the caller resumes on a
+			// microtask. A caller awaiting `subscribe()` therefore holds the first 100 rows and no
+			// signal that more are coming. Under 100 rows it completes synchronously and looks perfect,
+			// which is precisely what makes it a trap: it would pass every test and begin flapping the
+			// config at boot on the first cluster to cross 100 overrides. Skipping the replay also
+			// makes that IIFE a no-op, so the subscription is fully armed the moment this resolves —
+			// which is what lets the boot read below be an ordinary bounded search with no window
+			// between the two.
 			// Deadline, because this is on the boot path: `handleApplication` is raced against a hard
 			// timeout (30s by default) and blowing it FAILS the component rather than delaying it. A
 			// subscription that will not establish must cost a warning and the backstop poll, never the
