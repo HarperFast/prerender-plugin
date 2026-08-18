@@ -32,6 +32,21 @@ import { card, el, muted, note, settingRow, spacer, stagedTray } from '../ui.js'
 const edit = { staged: {}, cleared: {}, invalid: {} };
 
 /**
+ * Drop the unwritten edit.
+ *
+ * Called when the SESSION ends — sign-out, or an expired cookie — and not when the scope changes.
+ * Surviving a scope switch is the whole point of holding this outside scratch, but surviving a
+ * change of operator is not: the edit is unwritten intent that would be applied under whoever signs
+ * in next, and on a shared operations machine that is somebody else's change going out under your
+ * name. Scratch is cleared by the shell on both paths; this is the half the shell cannot reach.
+ */
+export const discardEdit = () => {
+	edit.staged = {};
+	edit.cleared = {};
+	edit.invalid = {};
+};
+
+/**
  * The config surface's state: the unwritten edit (session-scoped, above) joined to the payload and
  * the server's preview (node-scoped, and therefore correctly dropped on a scope change).
  */

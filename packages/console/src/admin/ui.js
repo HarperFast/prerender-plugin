@@ -157,7 +157,9 @@ export const link = (text, onclick) => el('button', { cls: 'link', text, onclick
 
 export function card(title, { head = [], body = null, foot = null, cls = '' } = {}) {
 	return el('div', { cls: `card ${cls}`.trim() }, [
-		(title || head.length) &&
+		// `!!` because `head.length` of an empty head is the NUMBER 0, and `append` skips null/false/''
+		// but not 0 — a title-less, head-less card rendered a literal "0" above its body.
+		!!(title || head.length) &&
 			el('div', { cls: 'card-head' }, [title && el('div', { cls: 'title', text: title }), head]),
 		body && el('div', { cls: 'card-body' }, body),
 		foot && el('div', { cls: 'card-foot' }, foot),
@@ -336,7 +338,7 @@ export function durationInput(ms, { min, max, onChange, invalid = false } = {}) 
 		value: Number.isFinite(ms) ? String(ms / unitSize) : '',
 		min: Number.isFinite(min) ? String(min / unitSize) : null,
 		max: Number.isFinite(max) ? String(max / unitSize) : null,
-		oninput: () => emit(),
+		oninput: () => emit(true),
 	});
 	const unit = el(
 		'select',
@@ -345,10 +347,15 @@ export function durationInput(ms, { min, max, onChange, invalid = false } = {}) 
 	);
 	const readout = el('span', { cls: 'dur-ms muted mono' });
 
-	const emit = () => {
+	// `notify` separates "redraw the readout" from "tell the caller the value changed", and the
+	// separation is load-bearing. Rendering is a full rebuild on every state change, so a construction
+	// -time emit that called onChange staged a value, which re-rendered, which rebuilt this control,
+	// which emitted again — unbounded recursion that blew the stack before any view owning a
+	// millisecond option could finish drawing. Only real input notifies.
+	const emit = (notify) => {
 		const next = Number(amount.value) * unitSize;
 		readout.textContent = Number.isFinite(next) ? `${next.toLocaleString()} ms` : '';
-		onChange?.(Number.isFinite(next) ? next : null);
+		if (notify) onChange?.(Number.isFinite(next) ? next : null);
 	};
 	// Changing the unit re-expresses the SAME duration rather than reinterpreting the number: going
 	// from `30 m` to hours must mean 0.5h, not 30h. Silently multiplying by 60 here would be a
@@ -359,10 +366,12 @@ export function durationInput(ms, { min, max, onChange, invalid = false } = {}) 
 		amount.value = String(current / unitSize);
 		if (Number.isFinite(min)) amount.setAttribute('min', String(min / unitSize));
 		if (Number.isFinite(max)) amount.setAttribute('max', String(max / unitSize));
-		emit();
+		// Display-only: the duration is unchanged, so there is nothing to report and no reason to make
+		// the caller rebuild — which would also cost the operator their caret.
+		emit(false);
 	};
 
-	emit();
+	emit(false);
 	return el('span', { cls: 'dur' }, [amount, unit, readout]);
 }
 

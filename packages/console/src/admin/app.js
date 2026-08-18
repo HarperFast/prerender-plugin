@@ -18,29 +18,45 @@ import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
 import * as nodes from './views/nodes.js';
 import * as sitemaps from './views/sitemaps.js';
-import * as pages from './views/pages.js';
 import * as invalidations from './views/invalidations.js';
-import * as explain from './views/explain.js';
+import * as inspect from './views/inspect.js';
 import * as metricsref from './views/metricsref.js';
 import * as config from './views/config.js';
+import { discardEdit } from './views/_configEdit.js';
 
 // Ordered as an operator triages: is it working (overview, traffic), what is it working on
-// (sitemaps, pages), is the machinery healthy (queue, then the nodes running it), then actions
-// and reference.
+// (sitemaps), is the machinery healthy (queue, then the nodes running it), then actions and
+// reference. `inspect` sits below the divider because it is not a place you patrol — it is the
+// drill-down every other view hands a URL to.
 const VIEWS = [
 	overview,
 	traffic,
 	sitemaps,
-	pages,
 	queue,
 	nodes,
 	invalidations,
 	null /* divider */,
-	explain,
+	inspect,
 	metricsref,
 	config,
 ];
 const BY_ID = new Map(VIEWS.filter(Boolean).map((view) => [view.meta.id, view]));
+
+/**
+ * Retired view ids, mapped to the view that absorbed them.
+ *
+ * `explain` and `pages` merged into `inspect` (see views/inspect.js for why). Resolving the
+ * alias here means every call site that hands a URL to the explainer keeps working untouched —
+ * the sitemap entry table, the traffic per-route card, the unrouted report on the config view,
+ * and that view's owner map, which is keyed by view id and so names `pages` without any link
+ * text to make it look like a link. An id that is neither a view nor an alias still falls back
+ * to the overview, which is the right answer for a genuine typo but the WRONG one for a retired
+ * id: the console would look like it had simply lost the page, with nothing logged anywhere.
+ */
+const ALIAS = new Map([
+	['explain', 'inspect'],
+	['pages', 'inspect'],
+]);
 
 const state = {
 	view: 'overview',
@@ -75,7 +91,10 @@ const ctx = {
 
 	/** Switch views. The target's `load` runs before anything is drawn for it. */
 	go(id, patch) {
-		state.view = BY_ID.has(id) ? id : 'overview';
+		// The patch still lands in whatever view actually renders, so an aliased call site's
+		// scratch (a pre-filled URL, a selected sitemap) reaches the merged view unchanged.
+		const target = ALIAS.get(id) ?? id;
+		state.view = BY_ID.has(target) ? target : 'overview';
 		state.error = null;
 		if (patch) Object.assign(scratch(state.view), patch);
 		load();
@@ -352,6 +371,11 @@ function renderSignIn() {
 async function signOut() {
 	await post('logout', {});
 	state.views = {};
+	// An unwritten config edit deliberately outlives a scope switch — an override is cluster-wide, so
+	// changing which node you are reading must not discard it. It must NOT outlive the operator: it
+	// would be applied under whoever signs in next, which on a shared operations machine is somebody
+	// else's change going out under your name.
+	discardEdit();
 	load();
 }
 
@@ -383,6 +407,9 @@ async function load() {
 setExpiredHandler(() => {
 	state.session = { authenticated: false };
 	state.views = {};
+	// Same reasoning as signOut: an expired session is a session that ended, and the next sign-in may
+	// be a different person.
+	discardEdit();
 });
 
 load();

@@ -84,12 +84,12 @@ const OWN_GROUPS = [
  * never become an option the console has no page for.
  */
 const ELSEWHERE = {
-	cacheKey: { id: 'pages', label: 'Page cache' },
-	page: { id: 'pages', label: 'Page cache' },
+	cacheKey: { id: 'inspect', label: 'Inspect' },
+	page: { id: 'inspect', label: 'Inspect' },
 	invalidation: { id: 'invalidations', label: 'Invalidations' },
-	render: { id: 'queue', label: 'Queue & nodes' },
-	scan: { id: 'queue', label: 'Queue & nodes' },
-	queue: { id: 'queue', label: 'Queue & nodes' },
+	render: { id: 'queue', label: 'Queue' },
+	scan: { id: 'queue', label: 'Queue' },
+	queue: { id: 'queue', label: 'Queue' },
 	sitemap: { id: 'sitemaps', label: 'Sitemaps' },
 	analytics: { id: 'traffic', label: 'Traffic' },
 	crawlStats: { id: 'traffic', label: 'Traffic' },
