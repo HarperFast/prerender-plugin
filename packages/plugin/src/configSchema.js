@@ -19,6 +19,13 @@
  *   nonEmpty  true — an empty string/array is rejected at apply time (default kept).
  *             Reserved for values where empty is catastrophic rather than unwise.
  *   itemType  Display hint for array options ('string' | 'object').
+ *   uiEditable
+ *             false — the console must refuse to write this option, and says so instead of
+ *             offering a control. Inherited by a group's children, like `scope`. Reserved for
+ *             options whose own edit would remove the ability to edit (`management.enabled`
+ *             locks the console out; the `management.overrides` group is the machinery the
+ *             console writes THROUGH). `secret: true` implies it — a secret comes from its
+ *             environment variable, so there is nothing for a form to set.
  *   movedFrom Dotted path this option (or group) lived at before the v0.25.0
  *             reorganization. The old path still applies with a deprecation warning.
  *
@@ -441,7 +448,55 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'except the login/session/index routes requires a `super_user`. The console UI consuming this ' +
 			'API is the separate `@harperfast/prerender-console` component.',
 		{
-			enabled: option(true, 'Serve the management API (and therefore anything the console can show).'),
+			enabled: option(
+				true,
+				'Serve the management API (and therefore anything the console can show).',
+				// Not editable from the console for the obvious reason: one click would take the console
+				// away, and getting it back needs a config-file edit. It stays live-reloadable from the
+				// file, which is the right place for a switch whose off position is unreachable.
+				{ uiEditable: false }
+			),
+			overrides: group(
+				'Operator-set config overrides — the layer between the deployed `config.yaml` and the ' +
+					'running config, stored one row per option path in `render_service.ConfigOverride` and ' +
+					'written from the console.\n\n' +
+					'Precedence is `schema defaults < config.yaml < these rows`. A deployed file change still ' +
+					'takes effect for every option nobody has overridden, clearing an override reverts that one ' +
+					'option to the deployed value, and clearing all of them returns the cluster to exactly its ' +
+					'deployed state. The rows replicate, so the console writes once on whichever node it ' +
+					'reached and every node converges.\n\n' +
+					'This whole group is file-only: it is the machinery the console writes through, and ' +
+					'editing the mechanism with the mechanism is how you end up locked out of both.',
+				{
+					enabled: option(
+						true,
+						'Honor stored overrides. FALSE IS THE KILL SWITCH: the rows are left in place but ' +
+							'ignored, so the cluster runs exactly its deployed `config.yaml` again. This is the ' +
+							'recovery path for an override that broke something, and the reason it has to live in ' +
+							'the file — an override you need to undo is a poor thing to undo through the override ' +
+							'layer.'
+					),
+					subscribe: option(
+						true,
+						'Watch the override table so a console edit converges in about a second instead of ' +
+							'waiting out `syncInterval`. Subscribing requires the table’s audit log (Harper turns ' +
+							'it on when you subscribe) and attaches its commit listener to THAT table only, so it ' +
+							'adds no work to the hot target/schedule write paths. False leaves the backstop poll as ' +
+							'the only path, which is correct behavior, just slower.'
+					),
+					syncInterval: option(
+						30 * SECOND,
+						'Backstop re-read cadence for the override table (worker 0 of each node). The live path ' +
+							'is the subscription above; this exists so a subscription that was never established, ' +
+							'or a worker whose boot read failed, still converges — the layer gets a bound on how ' +
+							'stale it can be that does not depend on a callback firing. A re-read whose result is ' +
+							'unchanged does not re-apply, so the steady-state cost is one bounded scan of a table ' +
+							'with at most a few dozen rows. 0 disables the backstop.',
+						{ unit: 'ms', min: 0 }
+					),
+				},
+				{ uiEditable: false }
+			),
 			proxyToOwner: option(
 				true,
 				'The URL explainer reads node-locally (a cross-node point read on the residency-pinned ' +
@@ -1350,7 +1405,11 @@ export const defaultConfig = () => {
  * Walk every option in the schema, calling `visit(path, node, inheritedScope)` with the
  * dotted path (no `prerender.` prefix) and the option's effective scope.
  */
-const walkOptions = (visit) => {
+/**
+ * Visit every option in the schema as `(dottedPath, node, scope)`, depth-first in declaration
+ * order. Public because config.js walks it to build the per-option layer/provenance view.
+ */
+export const walkOptions = (visit) => {
 	const walk = (node, path, inheritedScope) => {
 		const scope = node.scope ?? inheritedScope;
 		if (isOption(node)) return visit(path, node, scope);
@@ -1404,24 +1463,68 @@ const typeOf = (defaultValue) => (Array.isArray(defaultValue) ? 'array' : typeof
  * Secret defaults are all empty strings, so defaults are safe to serve as-is.
  */
 export const describeConfigSchema = () => {
-	const describe = (node, inheritedScope) => {
+	const describe = (node, inheritedScope, inheritedEditable) => {
 		const scope = node.scope ?? inheritedScope;
+		// `uiEditable` inherits downward exactly like `scope`, so marking a group file-only covers
+		// every option inside it without repeating the marker (and without a later addition to that
+		// group silently becoming editable).
+		const groupEditable = node.uiEditable ?? inheritedEditable;
 		if (isOption(node)) {
 			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
 			out.default = clone(node.default);
 			for (const key of ['enum', 'itemEnum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
 				if (node[key] !== undefined) out[key] = node[key];
 			}
+			// Resolved rather than raw: the console renders a control from this, so it must not have to
+			// re-derive the secret rule or walk back up for an ancestor's marker.
+			out.uiEditable = groupEditable !== false && !node.secret;
 			return out;
 		}
 		const children = {};
-		for (const [key, child] of Object.entries(node.children)) children[key] = describe(child, scope);
+		for (const [key, child] of Object.entries(node.children)) {
+			children[key] = describe(child, scope, groupEditable);
+		}
 		const out = { kind: 'group', description: node.description, children };
 		if (node.scope) out.scope = node.scope;
+		if (node.uiEditable === false) out.uiEditable = false;
 		if (node.movedFrom) out.movedFrom = node.movedFrom;
 		return out;
 	};
-	return describe(configSchema, 'live');
+	return describe(configSchema, 'live', true);
+};
+
+/**
+ * May the console write this path, and if not, why not?
+ *
+ * The refusal reason is returned rather than logged because it is shown to the operator who tried:
+ * "that is a secret, set the environment variable" and "that option is deliberately file-only" are
+ * different problems with different fixes, and both are different from a typo'd path.
+ *
+ * @param {string} path dotted option path
+ * @returns {{ ok: true, node: object } | { ok: false, reason: string }}
+ */
+export const checkUiEditable = (path) => {
+	let node = configSchema;
+	let editable = configSchema.uiEditable ?? true;
+	for (const segment of String(path ?? '').split('.')) {
+		if (!isGroup(node)) return { ok: false, reason: `${path} is not a configuration option` };
+		node = node.children[segment];
+		if (!node) return { ok: false, reason: `${path} is not a configuration option` };
+		if (node.uiEditable === false) editable = false;
+	}
+	if (!isOption(node)) {
+		return { ok: false, reason: `${path} is a group of options, not a single option` };
+	}
+	if (node.secret) {
+		return {
+			ok: false,
+			reason: `${path} is a secret — set it through its environment variable, not from the console`,
+		};
+	}
+	if (!editable) {
+		return { ok: false, reason: `${path} is deliberately not editable from the console` };
+	}
+	return { ok: true, node };
 };
 
 /** Look up the schema node (option or group) at a dotted path, or undefined. */

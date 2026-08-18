@@ -7,7 +7,8 @@
 #
 #   render_schedule  RenderSchedule                  — the hot render queue (isolated)
 #   render_service   Target, QueueStatus,            — URL registry (incl. indexability
-#                    QueueControl                      verdicts) + queue status + pause intent
+#                    QueueControl, ConfigOverride      verdicts) + queue status + pause intent
+#                                                      + operator-set config overrides
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
 #   coordination     SharedBuffer                    — node-local SAB, never replicated
@@ -140,6 +141,53 @@ type QueueControl @table(database: "render_service") @sealed @export(name: "queu
 	paused: Boolean
 	updatedTime: Date @updatedTime
 	updatedBy: String
+}
+
+# Operator-set config overrides — the layer between the deployed `config.yaml` and the running config.
+#
+# Config resolves in three layers, lowest precedence first:
+#
+#   schema defaults  <  config.yaml (git-deployed)  <  these rows (set from the console)
+#
+# ONE ROW PER OPTION PATH, HOLDING A DELTA — never a snapshot of the whole config. A snapshot would
+# freeze every option an operator ever touched against future deploys: ship a corrected default or a
+# fixed route and the stale snapshot silently shadows it, with nothing to indicate why the deploy did
+# nothing. One row per path means a `config.yaml` change still takes effect for every path nobody
+# pinned, deleting a row reverts that path to the deployed value, and deleting every row returns the
+# cluster to exactly its deployed state — which is the whole rollback story.
+#
+# Replicated (the default) and deliberately NOT residency-pinned, so the console writes ONCE on
+# whichever node it reached and every node converges. The alternative — the console fanning a write
+# out to N nodes — has no convergence: a node that was mid-restart for one write would diverge
+# permanently, and config divergence is the one thing this cluster treats as a deploy failure rather
+# than a preference (see the Config view in @harperfast/prerender-console). Reads are bounded and pass
+# `replicateFrom: false` (util/configOverride.js).
+#
+# NOT `@export`ed, unlike QueueControl. The management API is the write path because it is what
+# validates the path against the schema, type-checks the value, records who set it, and can preview
+# the change; a bare REST PUT would happily store a row that `applyOptions` then rejects at apply
+# time, which shows up as an override the console lists but the cluster does not honor. The
+# operations API (`insert`/`delete` on `render_service.ConfigOverride`) remains available as the
+# break-glass path, and `management.overrides.enabled: false` in the config file is the kill switch
+# that makes this whole layer inert without deleting anything.
+type ConfigOverride @table(database: "render_service") @sealed {
+	# Dotted option path exactly as it appears in configSchema.js (e.g. `queue.jobLeaseTime`).
+	# Validated against the schema before the row is written, so an unknown, secret, or
+	# non-UI-editable path never lands. A path that MOVES in a later release is remapped through the
+	# schema's `movedFrom` aliases on apply, exactly like a legacy path in config.yaml.
+	path: String @primaryKey
+
+	# `Any`, so a number stays a number and a boolean stays a boolean. The merge in config.js
+	# type-checks each override against its schema default, so a stringified "3600000" is rejected
+	# rather than coerced — storing everything as text would turn every option into a parse.
+	value: Any
+
+	updatedTime: Date @updatedTime
+	updatedBy: String
+
+	# Why this override exists. It outlives the operator who set it, and an unexplained override that
+	# contradicts the deployed file is precisely the row the next person cannot safely revert.
+	note: String
 }
 
 # Bulk cache invalidation. "Everything of this kind is wrong as of now; stop serving it."

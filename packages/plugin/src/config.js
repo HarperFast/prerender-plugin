@@ -24,12 +24,16 @@ import {
 	defaultConfig,
 	aliasPaths,
 	restartPaths,
+	secretPaths,
+	walkOptions,
+	schemaNodeAt,
 	isOption,
 	SECOND,
 	MINUTE,
 	HOUR,
 	DAY,
 } from './configSchema.js';
+import { describeSecret } from './util/redact.js';
 // Cyclic by design, and safe: routeClass.js imports `config`/`getLogger` from here, and this
 // module calls back into it only from inside `collectConfigWarnings` — never at module
 // evaluation time. The count has to come from the compiler rather than from raw config,
@@ -46,6 +50,32 @@ export const getLogger = () => (typeof logger !== 'undefined' && logger ? logger
 export const config = defaultConfig();
 
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * Where merge/validation warnings go.
+ *
+ * Normally the log. During `resolveConfig` they are captured instead, because that path also
+ * serves the management API's dry run: previewing a change must not write "Ignoring
+ * prerender.x" into the http log for a value that was never applied — a log line that says a
+ * setting was rejected, emitted while nothing was written, is worse than no preview at all.
+ * Resolution is synchronous end to end, so a single module-level sink cannot interleave; the
+ * save/restore still nests correctly if that ever stops being true.
+ */
+let warnSink = null;
+const warn = (message) => {
+	if (warnSink) warnSink.push(message);
+	else getLogger().warn?.(message);
+};
+
+const captureWarnings = (fn) => {
+	const previous = warnSink;
+	const sink = (warnSink = []);
+	try {
+		return { result: fn(), warnings: sink };
+	} finally {
+		warnSink = previous;
+	}
+};
 
 const getPath = (obj, path) => {
 	let node = obj;
@@ -101,11 +131,11 @@ const remapLegacyPaths = (options) => {
 		if (value === undefined) continue;
 		if (getPath(copy, newPath) === undefined) {
 			setPath(copy, newPath, value);
-			getLogger().warn?.(
+			warn(
 				`[prerender] prerender.${oldPath} moved to prerender.${newPath} — update the config (the old path still works for now)`
 			);
 		} else {
-			getLogger().warn?.(
+			warn(
 				`[prerender] prerender.${oldPath} moved to prerender.${newPath}, which is also set — using prerender.${newPath} and ignoring the old path`
 			);
 		}
@@ -120,7 +150,7 @@ const remapLegacyPaths = (options) => {
  * match the default's type, otherwise the override is rejected with a warning and
  * the default is kept. Arrays are replaced wholesale (not merged element-wise).
  */
-const mergeInto = (target, source, path = 'prerender') => {
+const mergeInto = (target, source, path = 'prerender', origin = null) => {
 	if (!isPlainObject(source)) return;
 
 	for (const key of Object.keys(target)) {
@@ -134,22 +164,20 @@ const mergeInto = (target, source, path = 'prerender') => {
 
 		if (Array.isArray(defaultValue)) {
 			if (!Array.isArray(overrideValue)) {
-				getLogger().warn?.(`[prerender] Ignoring ${keyPath}: expected an array`);
+				warn(`[prerender] Ignoring ${keyPath}: expected an array`);
 				continue;
 			}
 			target[key] = overrideValue.slice();
 		} else if (isPlainObject(defaultValue)) {
 			if (!isPlainObject(overrideValue)) {
-				getLogger().warn?.(`[prerender] Ignoring ${keyPath}: expected an object`);
+				warn(`[prerender] Ignoring ${keyPath}: expected an object`);
 				continue;
 			}
-			mergeInto(defaultValue, overrideValue, keyPath);
+			mergeInto(defaultValue, overrideValue, keyPath, origin);
 		} else if (typeof defaultValue === typeof overrideValue) {
 			target[key] = overrideValue;
 		} else {
-			getLogger().warn?.(
-				`[prerender] Ignoring ${keyPath}: expected ${typeof defaultValue}, got ${typeof overrideValue}`
-			);
+			warn(`[prerender] Ignoring ${keyPath}: expected ${typeof defaultValue}, got ${typeof overrideValue}`);
 		}
 	}
 
@@ -171,7 +199,13 @@ const mergeInto = (target, source, path = 'prerender') => {
 		) {
 			continue;
 		}
-		if (path === 'prerender') getLogger().warn?.(`[prerender] Unknown configuration key: ${path}.${key}`);
+		if (path === 'prerender') {
+			// `origin` names the layer, because the fix differs: an unknown key in config.yaml is a
+			// typo to correct in git, while an unknown key in a stored override is a row left behind
+			// by an option that was renamed or removed in a later release — which nobody would find
+			// by grepping the repo.
+			warn(`[prerender] Unknown configuration key: ${path}.${key}${origin ? ` (from ${origin})` : ''}`);
+		}
 	}
 };
 
@@ -184,10 +218,21 @@ const mergeInto = (target, source, path = 'prerender') => {
  * seed onto the empty string) — so the default wins. Distinct from
  * `collectConfigWarnings`, which reports settings that are merely risky.
  */
-const enforceSchemaConstraints = (fresh) => {
+const enforceSchemaConstraints = (fresh, fallback = null) => {
+	// `fallback` is the config as it stood BEFORE the layer being validated — the file layer, when
+	// validating overrides on top of it. Without it a rejected override reverts its option all the
+	// way to the schema default, which means one typo'd override silently discards a value the
+	// deployed config.yaml sets deliberately: the operator gets neither their new value nor the one
+	// that was running, and nothing says the deployed setting was collateral. Type mismatches are
+	// already safe this way (`mergeInto` simply never overwrites), so this makes the two rejection
+	// paths agree.
 	const reject = (path, node, why) => {
-		getLogger().warn?.(`[prerender] Ignoring prerender.${path}: ${why} — keeping the default`);
-		setPath(fresh, path, deepClone(node.default));
+		const restored = fallback ? getPath(fallback, path) : undefined;
+		const useFallback = restored !== undefined;
+		warn(
+			`[prerender] Ignoring prerender.${path}: ${why} — keeping the ${useFallback ? 'configured' : 'default'} value`
+		);
+		setPath(fresh, path, deepClone(useFallback ? restored : node.default));
 	};
 
 	const walk = (node, path) => {
@@ -263,15 +308,147 @@ const trackRestartScopedChanges = () => {
 	}
 };
 
+// The two input layers, kept exactly as they were last handed over, so the management API can
+// answer "where did this value come from" without re-deriving it from the merged result — which
+// cannot be done, since a merged value that equals the default is indistinguishable from one
+// nobody set.
+let lastHostOptions = {};
+let lastOverrides = {};
+
 /**
- * Apply host-provided options onto the live `config`, with validation. Safe to
- * call repeatedly (e.g. on every options `change`). Resets to defaults first so
- * removed keys revert.
+ * Rewrite one dotted path through the schema's `movedFrom` aliases.
+ *
+ * Done at the PATH level rather than by handing the nested object to `remapLegacyPaths`, because a
+ * group-level marker has to rewrite a prefix: with `url` moved to `cacheKey`, a stored override of
+ * `url.queryParams` belongs at `cacheKey.queryParams`, and only prefix matching gets there.
  */
-export const applyOptions = (options) => {
-	const fresh = defaultConfig();
-	if (isPlainObject(options)) mergeInto(fresh, remapLegacyPaths(options));
-	enforceSchemaConstraints(fresh);
+const remapOverridePath = (path, aliases) => {
+	if (aliases[path]) return aliases[path];
+	for (const [oldPath, newPath] of Object.entries(aliases)) {
+		if (path.startsWith(`${oldPath}.`)) return newPath + path.slice(oldPath.length);
+	}
+	return path;
+};
+
+/**
+ * `{ 'queue.jobLeaseTime': 90000 }` -> `{ queue: { jobLeaseTime: 90000 } }`, dropping — loudly —
+ * any path that is not an option in this release.
+ *
+ * The loudness is the point. `mergeInto` only reports an unknown key at the TOP level, so a stale
+ * override nested under a valid group (`queue.somethingRenamed`) would otherwise be discarded in
+ * total silence: the row stays in the table, the console lists it, and it does nothing. It is also
+ * invisible to `describeConfigLayers`, which walks the schema and therefore cannot show a path the
+ * schema no longer has. An option renamed a release ago would quietly un-set itself on upgrade,
+ * which is the worst moment for a setting to disappear without a word.
+ */
+const overridesToNested = (overrides) => {
+	const nested = {};
+	const aliases = aliasPaths();
+
+	for (const [rawPath, value] of overrideEntries(overrides)) {
+		const path = remapOverridePath(rawPath, aliases);
+		if (path !== rawPath) {
+			warn(`[prerender] Stored override ${rawPath} moved to ${path} — applying it there (update it to silence this)`);
+		}
+
+		const node = schemaNodeAt(path);
+		if (!node || !isOption(node)) {
+			warn(
+				`[prerender] Ignoring stored override ${rawPath}: not an option in this release — it is a row left ` +
+					`behind by an option that was renamed or removed, and it is doing nothing. Clear it from the console.`
+			);
+			continue;
+		}
+
+		setPath(nested, path, deepClone(value));
+	}
+
+	return nested;
+};
+
+// Accepts a Map (what a table read produces) or a plain object, and skips anything that is not a
+// usable path/value pair rather than letting it become a `{ undefined: ... }` key deep in the merge.
+const overrideEntries = (overrides) => {
+	if (!overrides) return [];
+	const entries = overrides instanceof Map ? [...overrides.entries()] : Object.entries(overrides);
+	return entries.filter(([path, value]) => typeof path === 'string' && path !== '' && value !== undefined);
+};
+
+/**
+ * Index the override layer by the path it applies to, not the path it is stored under.
+ *
+ * They differ for a row written before an option moved. The merge already remaps those, so the
+ * value takes effect — but `describeConfigLayers` looks up provenance by current path, and keyed
+ * on the raw path it would report `source: 'default'` for an option that is in fact overridden.
+ * A layers view that says "nobody set this" about a value somebody set is worse than no layers
+ * view, so the remap happens once, here, and everything downstream sees current paths.
+ */
+const normalizeOverrides = (overrides) => {
+	const aliases = aliasPaths();
+	const out = {};
+	for (const [path, value] of overrideEntries(overrides)) {
+		out[remapOverridePath(path, aliases)] = deepClone(value);
+	}
+	return out;
+};
+
+/**
+ * Build a config from its layers WITHOUT touching the live one.
+ *
+ * Precedence, lowest first: schema defaults < host options (config.yaml) < stored overrides
+ * (`render_service.ConfigOverride`, written from the console). Both upper layers go through the
+ * same `mergeInto` type checks and the same `enforceSchemaConstraints` pass, so an override
+ * cannot enter by a route that skips validation — the console is not a second, weaker door into
+ * the config.
+ *
+ * Legacy-path remapping runs over the override layer too. A stored override is keyed by the path
+ * that was current when an operator set it, so an option that MOVES in a later release would
+ * otherwise turn every override of it into an unknown key on upgrade — silently reverting a
+ * deliberate setting at exactly the moment nobody is looking for it.
+ *
+ * Pure, and warnings are returned rather than logged, because this also serves the management
+ * API's dry run.
+ *
+ * @returns {{ config: object, warnings: string[] }}
+ */
+export const resolveConfig = (options, overrides) => {
+	const { result, warnings } = captureWarnings(() => {
+		const fresh = defaultConfig();
+		if (isPlainObject(options)) mergeInto(fresh, remapLegacyPaths(options));
+
+		// The file layer is validated on its own FIRST, and the result kept, so that it can be the
+		// fallback when an override is rejected below. Validating only once at the end would leave
+		// no record of what was running before the override, and a rejected override would take the
+		// deployed value down with it.
+		enforceSchemaConstraints(fresh);
+
+		// Already alias-remapped and schema-checked path by path, so it does NOT go through
+		// `remapLegacyPaths` again — doing so would rewrite nothing and only risk double-reporting.
+		const nested = overridesToNested(overrides);
+		if (Object.keys(nested).length > 0) {
+			const fileLayer = deepClone(fresh);
+			mergeInto(fresh, nested, 'prerender', 'a stored override');
+			enforceSchemaConstraints(fresh, fileLayer);
+		}
+
+		// After the merge, so an env-sourced secret still wins over a literal in either layer.
+		resolveSecretsFromEnv(fresh);
+		return fresh;
+	});
+	return { config: result, warnings };
+};
+
+/**
+ * Apply the config layers onto the live `config`, with validation. Safe to call repeatedly (on
+ * every options `change`, and on every override-table change). Resets to defaults first so
+ * removed keys — and cleared overrides — revert.
+ *
+ * @param options    host options (`scope.options.getAll()`)
+ * @param overrides  stored overrides as dotted path -> value (Map or plain object)
+ */
+export const applyOptions = (options, overrides) => {
+	const { config: fresh, warnings } = resolveConfig(options, overrides);
+	for (const message of warnings) getLogger().warn?.(message);
 
 	const previous = deepClone(config);
 
@@ -279,7 +456,8 @@ export const applyOptions = (options) => {
 	for (const key of Object.keys(config)) delete config[key];
 	Object.assign(config, fresh);
 
-	resolveSecretsFromEnv();
+	lastHostOptions = isPlainObject(options) ? deepClone(options) : {};
+	lastOverrides = normalizeOverrides(overrides);
 
 	// The first apply is boot: everything takes effect, nothing is pending-restart.
 	if (!bootConfig) bootConfig = deepClone(config);
@@ -297,22 +475,82 @@ export const applyOptions = (options) => {
 	return config;
 };
 
+/** The override layer as last applied: dotted path -> value. */
+export const activeOverrides = () => deepClone(lastOverrides);
+
+/** The host-options layer as last handed over (the deployed `config.yaml`). */
+export const hostOptions = () => deepClone(lastHostOptions);
+
+const sameValue = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * Per-option provenance: what each layer says, which one won, and whether a stored override is
+ * actually in effect.
+ *
+ * `source: 'override-rejected'` is the state this exists for. An override whose value fails the
+ * type check or a schema constraint is kept in the table and listed in the console, while the
+ * running config quietly holds the file value — so the operator sees their setting on screen and
+ * the cluster does not have it. Without this row the two are indistinguishable.
+ *
+ * Secrets are reported as presence per layer and never by value: the console renders straight
+ * from this, and a layers view that showed what `redactConfig` hides would be a hole in the one
+ * place an operator is most likely to screenshot.
+ */
+export const describeConfigLayers = () => {
+	const defaults = defaultConfig();
+	const fileConfig = resolveConfig(lastHostOptions, null).config;
+	const secrets = new Set(secretPaths());
+	const rows = [];
+
+	walkOptions((path, node, scope) => {
+		const secret = secrets.has(path) || !!node.secret;
+		const show = (value) => (secret ? describeSecret(value) : value);
+
+		const defaultValue = getPath(defaults, path);
+		const fileValue = getPath(fileConfig, path);
+		const effective = getPath(config, path);
+		const overridden = Object.hasOwn(lastOverrides, path);
+		const overrideValue = overridden ? lastOverrides[path] : undefined;
+
+		let source;
+		if (overridden && sameValue(effective, overrideValue)) source = 'override';
+		else if (overridden) source = 'override-rejected';
+		else if (!sameValue(fileValue, defaultValue)) source = 'file';
+		else source = 'default';
+
+		rows.push({
+			path,
+			scope,
+			secret,
+			source,
+			overridden,
+			fileDiffersFromDefault: !sameValue(fileValue, defaultValue),
+			default: show(defaultValue),
+			file: show(fileValue),
+			override: overridden ? show(overrideValue) : undefined,
+			effective: show(effective),
+		});
+	});
+
+	return rows;
+};
+
 // Source the security token from an environment variable when `valueEnv` is set,
 // so the shared secret never has to live in config.yaml. Runs after the merge so
 // it overrides any literal `value`. (loadEnv populates process.env before the
 // plugin applies options.)
-const resolveSecretsFromEnv = () => {
-	const { valueEnv } = config.origin.securityToken;
+const resolveSecretsFromEnv = (target) => {
+	const { valueEnv } = target.origin.securityToken;
 	if (valueEnv && process.env[valueEnv]) {
-		config.origin.securityToken.value = process.env[valueEnv];
+		target.origin.securityToken.value = process.env[valueEnv];
 	}
-	const renderNowEnv = config.renderNow.valueEnv;
+	const renderNowEnv = target.renderNow.valueEnv;
 	if (renderNowEnv && process.env[renderNowEnv]) {
-		config.renderNow.token = process.env[renderNowEnv];
+		target.renderNow.token = process.env[renderNowEnv];
 	}
-	const peerRescueEnv = config.peerRescue.valueEnv;
+	const peerRescueEnv = target.peerRescue.valueEnv;
 	if (peerRescueEnv && process.env[peerRescueEnv]) {
-		config.peerRescue.token = process.env[peerRescueEnv];
+		target.peerRescue.token = process.env[peerRescueEnv];
 	}
 };
 
@@ -323,21 +561,27 @@ const resolveSecretsFromEnv = () => {
  * wrong). `severity` is 'warn' for a misconfiguration and 'info' for a
  * dangerous-but-deliberate mode that is worth showing prominently.
  */
-export const collectConfigWarnings = () => {
+export const collectConfigWarnings = (target = config, { prerenderRoutes } = {}) => {
 	const findings = [];
+	// Defaults to the live compiled count. A caller checking a PROSPECTIVE config (the management
+	// API's dry run) must pass its own, because the compiled route list is memoized from the live
+	// config — reading it here would answer the previewed `ingress.routes` change with the count
+	// that is currently running, which is exactly backwards for the one finding that matters most
+	// when editing routes.
+	const routeCount = prerenderRoutes ?? prerenderRouteCount();
 	const add = (severity, key, message) => findings.push({ severity, key, message });
 
-	if (!config.origin.securityToken.value) {
+	if (!target.origin.securityToken.value) {
 		add(
 			'warn',
 			'origin.securityToken.value',
 			'origin.securityToken.value is empty — the origin cannot authenticate prerender requests'
 		);
 	}
-	if (config.domains.length === 0) {
+	if (target.domains.length === 0) {
 		add('warn', 'domains', 'domains allowlist is empty — all hosts will be treated as indexable');
 	}
-	if (config.ingress.mode === 'forwarded' && prerenderRouteCount() === 0) {
+	if (target.ingress.mode === 'forwarded' && routeCount === 0) {
 		// Nothing is prerendered in this state: every forwarded request classifies as
 		// unclassified and is proxied straight through. Silent before — the plugin looked
 		// healthy while serving zero cached pages. It is also the state a single typo in
@@ -350,7 +594,7 @@ export const collectConfigWarnings = () => {
 				'check ingress.routes for entries dropped as invalid'
 		);
 	}
-	const { staging } = config.origin;
+	const { staging } = target.origin;
 	if (staging.ip) {
 		// Mirror stagingTargetIp's gate (ip AND header AND valid ip) so the finding never
 		// claims the feature is on when it is actually disabled.
@@ -374,14 +618,14 @@ export const collectConfigWarnings = () => {
 			);
 		}
 	}
-	if (config.renderNow.enabled) {
-		if (!config.renderNow.header) {
+	if (target.renderNow.enabled) {
+		if (!target.renderNow.header) {
 			add('warn', 'renderNow.header', 'renderNow.enabled but renderNow.header is empty — on-demand render is disabled');
-		} else if (!config.renderNow.token) {
+		} else if (!target.renderNow.token) {
 			// Inert, not open: isRenderNowAuthorized fails closed without a token. Still worth
 			// reporting, because the operator asked for a feature that is not actually on — and
 			// naming the unresolved variable is the difference between a five-second fix and a hunt.
-			const { valueEnv } = config.renderNow;
+			const { valueEnv } = target.renderNow;
 			add(
 				'warn',
 				'renderNow.token',
@@ -391,10 +635,10 @@ export const collectConfigWarnings = () => {
 			);
 		}
 	}
-	if (config.peerRescue.enabled && !config.peerRescue.token) {
+	if (target.peerRescue.enabled && !target.peerRescue.token) {
 		// Inert, not open: both the rescue client and the endpoint fail closed without a token.
 		// Same shape as the renderNow finding — the operator asked for a feature that is not on.
-		const { valueEnv } = config.peerRescue;
+		const { valueEnv } = target.peerRescue;
 		add(
 			'warn',
 			'peerRescue.token',
@@ -403,7 +647,7 @@ export const collectConfigWarnings = () => {
 				: 'peerRescue.enabled is true but no peerRescue.token is configured — peer rescue is DISABLED (it fails closed rather than serving cached pages unauthenticated); set peerRescue.token or peerRescue.valueEnv'
 		);
 	}
-	if (config.invalidation.enabled && config.invalidation.pad < config.queue.jobLeaseTime) {
+	if (target.invalidation.enabled && target.invalidation.pad < target.queue.jobLeaseTime) {
 		// Cross-option, like spreadWindow below. The pad's config text calls in-flight renders "the
 		// certain one" of the two things it covers — but a job legitimately holds its claim for up to
 		// jobLeaseTime, and a render that posts back later than the pad stamps lastCached after
@@ -416,14 +660,14 @@ export const collectConfigWarnings = () => {
 		add(
 			'warn',
 			'invalidation.pad',
-			`invalidation.pad (${config.invalidation.pad}ms) is below queue.jobLeaseTime ` +
-				`(${config.queue.jobLeaseTime}ms) — a render claimed just before an invalidation may post back ` +
+			`invalidation.pad (${target.invalidation.pad}ms) is below queue.jobLeaseTime ` +
+				`(${target.queue.jobLeaseTime}ms) — a render claimed just before an invalidation may post back ` +
 				`after the pad, stamping pre-change content as healed for a full render interval. Set pad >= ` +
 				`jobLeaseTime unless post-back latency is known to be seconds.`
 		);
 	}
-	const { reenqueue } = config.invalidation;
-	if (reenqueue.enabled && reenqueue.spreadWindow < config.queue.jobLeaseTime) {
+	const { reenqueue } = target.invalidation;
+	if (reenqueue.enabled && reenqueue.spreadWindow < target.queue.jobLeaseTime) {
 		// Cross-option, so it cannot live in the schema's per-option constraints — and it is a warning
 		// plus a clamp at use time rather than a rejection, because rejecting back to the default would
 		// silently WIDEN the window an operator deliberately narrowed.
@@ -440,9 +684,9 @@ export const collectConfigWarnings = () => {
 			'warn',
 			'invalidation.reenqueue.spreadWindow',
 			`invalidation.reenqueue.spreadWindow (${reenqueue.spreadWindow}ms) is below queue.jobLeaseTime ` +
-				`(${config.queue.jobLeaseTime}ms) — that squeezes every accelerated due time onto a handful of ` +
+				`(${target.queue.jobLeaseTime}ms) — that squeezes every accelerated due time onto a handful of ` +
 				`minutes, and a pile of rows at the minute the claim scan seeks takes that scan from 0.36ms to ` +
-				`11.59ms. The accelerator is using ${config.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
+				`11.59ms. The accelerator is using ${target.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
 				`least that to silence this.`
 		);
 	}

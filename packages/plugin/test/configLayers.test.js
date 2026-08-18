@@ -1,0 +1,335 @@
+/**
+ * The three-layer config merge: schema defaults < the deployed `config.yaml` (host options) <
+ * the stored overrides written from the console.
+ *
+ * These pin the two things an operator's rollback rests on — clearing one override reverts that
+ * ONE option to the DEPLOYED value rather than to the schema default, and an override that fails
+ * validation leaves the lower layer running — plus the `override-rejected` provenance that is the
+ * whole reason `describeConfigLayers` exists: without it, "the console lists my setting and the
+ * cluster is not honouring it" is indistinguishable from "the cluster is honouring it".
+ */
+import { test, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+	activeOverrides,
+	applyOptions,
+	collectConfigWarnings,
+	config,
+	describeConfigLayers,
+	hostOptions,
+	resolveConfig,
+} from '../src/config.js';
+
+const MINUTE = 60_000;
+const DAY = 24 * 60 * 60 * 1000;
+
+// Harper's `logger` does not exist out here and config.js falls back to `console`, which would
+// print a line for every deliberately-rejected value below. Capturing it is also what makes
+// "resolveConfig returns its warnings instead of logging them" assertable at all.
+const logged = [];
+globalThis.logger = { debug() {}, info() {}, warn: (message) => logged.push(String(message)), error() {} };
+
+const layerFor = (path) => describeConfigLayers().find((row) => row.path === path);
+
+beforeEach(() => {
+	applyOptions({});
+	logged.length = 0;
+});
+
+test('an override beats the file layer, and the file layer beats the schema default', () => {
+	applyOptions({}, {});
+	assert.equal(config.page.ttl, DAY);
+
+	applyOptions({ page: { ttl: 5000 } }, {});
+	assert.equal(config.page.ttl, 5000);
+
+	applyOptions({ page: { ttl: 5000 } }, { 'page.ttl': 7000 });
+	assert.equal(config.page.ttl, 7000);
+	assert.equal(layerFor('page.ttl').source, 'override');
+});
+
+test('overrides are a set of deltas: an option nobody overrode still follows the deployed file', () => {
+	applyOptions({ page: { ttl: 5000, swrTtl: 60_000 } }, { 'page.ttl': 7000 });
+	assert.equal(config.page.ttl, 7000);
+	assert.equal(config.page.swrTtl, 60_000, 'a file value nobody pinned must still take effect');
+
+	// A later deploy moves the file value of the un-overridden option; the pinned one stays pinned.
+	applyOptions({ page: { ttl: 5000, swrTtl: 90_000 } }, { 'page.ttl': 7000 });
+	assert.equal(config.page.swrTtl, 90_000);
+	assert.equal(config.page.ttl, 7000);
+});
+
+test('clearing an override reverts that option to the deployed file value, not to the default', () => {
+	const file = { page: { ttl: 5000, swrTtl: 60_000 } };
+
+	applyOptions(file, { 'page.ttl': 7000, 'page.swrTtl': 90_000 });
+	assert.equal(config.page.ttl, 7000);
+	assert.equal(config.page.swrTtl, 90_000);
+
+	// Clearing ONE row leaves the other in force.
+	applyOptions(file, { 'page.swrTtl': 90_000 });
+	assert.equal(config.page.ttl, 5000, 'a cleared override reverts to the deployed value');
+	assert.equal(config.page.swrTtl, 90_000);
+	assert.equal(layerFor('page.ttl').source, 'file');
+
+	// Clearing all of them returns the cluster to exactly its deployed state.
+	applyOptions(file, {});
+	assert.equal(config.page.ttl, 5000);
+	assert.equal(config.page.swrTtl, 60_000);
+	assert.deepEqual(activeOverrides(), {});
+});
+
+test('clearing an override reverts to the schema default when the file never set that option', () => {
+	applyOptions({}, { 'page.ttl': 7000 });
+	assert.equal(config.page.ttl, 7000);
+
+	applyOptions({}, {});
+	assert.equal(config.page.ttl, DAY);
+	assert.equal(layerFor('page.ttl').source, 'default');
+});
+
+test('an override of the wrong type is rejected and the file value keeps running', () => {
+	applyOptions({ page: { ttl: 5000 } }, { 'page.ttl': 'lots' });
+
+	assert.equal(config.page.ttl, 5000, 'a rejected override must not unset the deployed value');
+
+	const row = layerFor('page.ttl');
+	assert.equal(row.source, 'override-rejected');
+	assert.equal(row.overridden, true, 'the row is still listed — it exists, it just is not in effect');
+	assert.equal(row.override, 'lots');
+	assert.equal(row.file, 5000);
+	assert.equal(row.effective, 5000);
+});
+
+test('an override violating enum, min, max, nonEmpty or itemEnum is rejected and reported as override-rejected', () => {
+	const cases = [
+		{ path: 'ingress.mode', file: { ingress: { mode: 'forwarded' } }, bad: 'sideways' },
+		{ path: 'queue.jobLeaseTime', file: { queue: { jobLeaseTime: 15 * MINUTE } }, bad: 1 },
+		{ path: 'sitemap.filteredWarnPercent', file: { sitemap: { filteredWarnPercent: 80 } }, bad: 1000 },
+		{ path: 'cacheKey.delimiter', file: { cacheKey: { delimiter: '#' } }, bad: '' },
+		{ path: 'cacheKey.decodeReserved', file: { cacheKey: { decodeReserved: [':'] } }, bad: [':', '&'] },
+	];
+
+	for (const { path, file, bad } of cases) {
+		applyOptions(file, { [path]: bad });
+		const row = layerFor(path);
+
+		assert.equal(row.source, 'override-rejected', `${path}: a value the schema refuses must report as rejected`);
+		assert.notDeepEqual(row.effective, bad, `${path}: the refused value must not be running`);
+		// A refused override falls back to THE LAYER BELOW IT, not to the schema default. The two
+		// rejection paths therefore agree: a type mismatch never reaches the merged config, and a
+		// constraint violation is restored from the file layer that was validated before the
+		// overrides were merged on top. The distinction is not academic — reverting to the default
+		// here would mean one typo'd override silently discarding a value config.yaml sets
+		// deliberately, leaving the operator with neither their new value nor the one that was
+		// running, and nothing to say the deployed setting was collateral damage.
+		assert.deepEqual(row.effective, row.file, `${path}: a refused constraint keeps the configured value`);
+		assert.notDeepEqual(row.file, row.default, `${path}: the case is only meaningful if the file moved it`);
+	}
+});
+
+test('describeConfigLayers names the layer that actually won for each option', () => {
+	applyOptions({ page: { ttl: 5000 } }, { 'queue.jobLeaseTime': 15 * MINUTE, 'domains': 'not-an-array' });
+
+	assert.equal(layerFor('page.swrTtl').source, 'default', 'nobody touched it');
+	assert.equal(layerFor('page.ttl').source, 'file');
+	assert.equal(layerFor('queue.jobLeaseTime').source, 'override');
+	assert.equal(layerFor('domains').source, 'override-rejected');
+
+	assert.equal(layerFor('page.ttl').fileDiffersFromDefault, true);
+	assert.equal(layerFor('page.swrTtl').fileDiffersFromDefault, false);
+	assert.equal(layerFor('queue.jobLeaseTime').effective, 15 * MINUTE);
+	assert.deepEqual(layerFor('domains').effective, [], 'the refused array left the default in place');
+
+	// Those four are the whole vocabulary — a fifth value would be a source the console cannot render.
+	const sources = new Set(describeConfigLayers().map((row) => row.source));
+	assert.deepEqual([...sources].sort(), ['default', 'file', 'override', 'override-rejected']);
+});
+
+test('secret options are reported as presence markers in every layer, never by value', () => {
+	const FILE_TOKEN = 'file-origin-token-value';
+	const OVERRIDE_TOKEN = 'override-peer-rescue-token';
+
+	applyOptions({ origin: { securityToken: { value: FILE_TOKEN } } }, { 'peerRescue.token': OVERRIDE_TOKEN });
+
+	const token = layerFor('origin.securityToken.value');
+	assert.equal(token.secret, true);
+	assert.equal(token.default, '<empty>', 'an unset secret must read as empty, not as configured');
+	assert.equal(token.file, `<set: ${FILE_TOKEN.length} chars>`);
+	assert.equal(token.effective, `<set: ${FILE_TOKEN.length} chars>`);
+
+	// Even the override layer — a row `validateOverride` refuses to create, but which the layers
+	// view must still be able to render without disclosing it.
+	const peer = layerFor('peerRescue.token');
+	assert.equal(peer.secret, true);
+	assert.equal(peer.override, `<set: ${OVERRIDE_TOKEN.length} chars>`);
+	assert.equal(peer.effective, `<set: ${OVERRIDE_TOKEN.length} chars>`);
+});
+
+test('a configured secret appears nowhere by value in the serialized layers view', () => {
+	const secrets = {
+		'origin.securityToken.value': 'origin-token-3f9a2b7c',
+		'renderNow.token': 'render-now-token-88c1d4',
+		'peerRescue.token': 'peer-rescue-token-4d20ef',
+	};
+
+	applyOptions(
+		{
+			origin: { securityToken: { value: secrets['origin.securityToken.value'] } },
+			renderNow: { enabled: true, token: secrets['renderNow.token'] },
+			peerRescue: { enabled: true, token: secrets['peerRescue.token'] },
+		},
+		{ 'renderNow.token': 'override-render-now-token' }
+	);
+
+	const serialized = JSON.stringify(describeConfigLayers());
+	for (const [path, value] of Object.entries(secrets)) {
+		assert.equal(layerFor(path).secret, true, `${path} must be marked secret`);
+		assert.equal(serialized.includes(value), false, `${path} disclosed its value in the layers view`);
+	}
+	assert.equal(serialized.includes('override-render-now-token'), false, 'an overridden secret leaked');
+
+	// Not vacuous: the markers themselves ARE in the output, so the absence above is redaction
+	// rather than a row that failed to render.
+	assert.ok(
+		serialized.includes(`<set: ${secrets['origin.securityToken.value'].length} chars>`),
+		serialized.slice(0, 200)
+	);
+});
+
+test('a stored override keyed by a legacy path is remapped onto the option it moved to', () => {
+	// `origin.staging` carries movedFrom: 'staging', so the whole subtree relocates by PREFIX;
+	// `sitemap.userAgent` carries movedFrom: 'sitemapUserAgent', a single-option move.
+	applyOptions({}, { 'staging.header': 'x-legacy-staging', 'sitemapUserAgent': 'LegacyBot/1.0' });
+	assert.equal(config.origin.staging.header, 'x-legacy-staging');
+	assert.equal(config.sitemap.userAgent, 'LegacyBot/1.0');
+
+	// Remapped loudly, not silently: an operator has to be told the row needs rewriting.
+	const { warnings } = resolveConfig({}, { 'staging.header': 'x-legacy-staging', 'sitemapUserAgent': 'LegacyBot/1.0' });
+	assert.ok(
+		warnings.some((line) => line.includes('staging.header moved to origin.staging.header')),
+		warnings.join('\n')
+	);
+	assert.ok(
+		warnings.some((line) => line.includes('sitemapUserAgent moved to sitemap.userAgent')),
+		warnings.join('\n')
+	);
+});
+
+test('an override path that is not an option in this release is dropped with a warning, not in silence', () => {
+	// The nested case is the one that matters: `mergeInto` only reports an unknown key at the TOP
+	// level, so `queue.somethingRenamed` would otherwise vanish without a word while the row stays
+	// in the table and the console keeps listing it.
+	const { warnings } = resolveConfig({}, { 'queue.somethingRenamed': 1, 'notAGroup.atAll': 2 });
+
+	for (const path of ['queue.somethingRenamed', 'notAGroup.atAll']) {
+		assert.ok(
+			warnings.some((line) => line.includes(`Ignoring stored override ${path}`) && line.includes('not an option')),
+			`${path} was dropped silently: ${warnings.join('\n')}`
+		);
+	}
+
+	// It is dropped, not merged in as a junk key.
+	applyOptions({}, { 'queue.somethingRenamed': 1 });
+	assert.equal('somethingRenamed' in config.queue, false);
+});
+
+test('resolveConfig is pure: it returns a prospective config and its warnings without touching the live one', () => {
+	applyOptions({ page: { ttl: 5000 } }, {});
+	// applyOptions DOES log its warnings, which is what makes the empty log below meaningful
+	// rather than a sink nothing is wired to.
+	assert.ok(logged.length > 0, 'the log sink must be live for the assertion below to mean anything');
+	logged.length = 0;
+
+	const { config: prospective, warnings } = resolveConfig(
+		{ page: { ttl: 9999 }, nonsenseKey: true },
+		{ 'page.ttl': 'lots' }
+	);
+
+	assert.equal(prospective.page.ttl, 9999, 'the rejected override leaves the previewed file value');
+	assert.equal(config.page.ttl, 5000, 'the live config must not move during a dry run');
+	assert.deepEqual(activeOverrides(), {}, 'a dry run must not become the applied override layer');
+	assert.notEqual(prospective, config, 'a dry run must not hand back the live object');
+
+	// A preview that wrote "Ignoring prerender.page.ttl" into the log for a value nobody applied is
+	// worse than no preview at all.
+	assert.deepEqual(logged, [], `a dry run must not log: ${logged.join('\n')}`);
+	assert.ok(
+		warnings.some((line) => line.includes('Unknown configuration key: prerender.nonsenseKey')),
+		warnings.join('\n')
+	);
+	assert.ok(
+		warnings.some((line) => line.includes('Ignoring prerender.page.ttl')),
+		warnings.join('\n')
+	);
+});
+
+test('applyOptions with no override argument behaves exactly as it did before the layer existed', () => {
+	applyOptions({ page: { ttl: 5000 } }, { 'page.ttl': 7000 });
+	assert.equal(config.page.ttl, 7000);
+
+	// Every pre-existing caller passes one argument. That must resolve the file layer alone —
+	// dropping the override layer rather than silently carrying the last one forward.
+	applyOptions({ page: { ttl: 5000 } });
+	assert.equal(config.page.ttl, 5000);
+	assert.deepEqual(activeOverrides(), {});
+	assert.equal(layerFor('page.ttl').source, 'file');
+
+	applyOptions({});
+	assert.equal(config.page.ttl, DAY);
+	assert.equal(layerFor('page.ttl').source, 'default');
+});
+
+test('the override layer accepts the Map a table read produces as well as a plain object', () => {
+	applyOptions({}, new Map([['page.ttl', 7000]]));
+	assert.equal(config.page.ttl, 7000);
+	assert.deepEqual(activeOverrides(), { 'page.ttl': 7000 });
+	assert.equal(layerFor('page.ttl').source, 'override');
+});
+
+test('collectConfigWarnings evaluates the config it is handed, not the live one', () => {
+	applyOptions({ domains: ['example.com'], origin: { securityToken: { value: 'file-token' } } });
+	assert.deepEqual(
+		collectConfigWarnings().map((finding) => finding.key),
+		[]
+	);
+
+	const prospective = resolveConfig(
+		{ domains: [], origin: { securityToken: { value: 'file-token' } }, ingress: { mode: 'forwarded' } },
+		{}
+	).config;
+
+	assert.deepEqual(
+		collectConfigWarnings(prospective, { prerenderRoutes: 0 })
+			.map((finding) => finding.key)
+			.sort(),
+		['domains', 'ingress.routes']
+	);
+	// The route count has to come from the CALLER: the compiled route list is memoized off the LIVE
+	// config, so reading it here would answer a previewed `ingress.routes` edit with the count that
+	// is currently running.
+	assert.deepEqual(
+		collectConfigWarnings(prospective, { prerenderRoutes: 2 }).map((finding) => finding.key),
+		['domains']
+	);
+
+	// And the live config is still the clean one it was.
+	assert.deepEqual(
+		collectConfigWarnings().map((finding) => finding.key),
+		[]
+	);
+});
+
+test('activeOverrides and hostOptions hand back copies, not the live layers', () => {
+	applyOptions({ domains: ['example.com'] }, { 'page.ttl': 7000 });
+
+	assert.deepEqual(hostOptions(), { domains: ['example.com'] });
+	assert.deepEqual(activeOverrides(), { 'page.ttl': 7000 });
+
+	hostOptions().domains.push('evil.example');
+	activeOverrides()['page.ttl'] = 1;
+
+	assert.deepEqual(hostOptions(), { domains: ['example.com'] });
+	assert.deepEqual(activeOverrides(), { 'page.ttl': 7000 });
+	assert.equal(config.page.ttl, 7000);
+});

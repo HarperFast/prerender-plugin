@@ -3,11 +3,18 @@
  *
  * `handleApplication` runs once per worker after the plugin's resources and
  * schema have loaded. It reads the host app's scoped options (`scope.options`),
- * applies them onto the live `config`, re-applies on every change (live reload),
- * and starts the background schedulers once config is in effect.
+ * merges the stored override layer on top, applies the result onto the live
+ * `config`, re-applies on every change to either layer (live reload), and starts
+ * the background schedulers once config is in effect.
  */
 
-import { applyOptions } from './src/config.js';
+import { applyOptions, resolveConfig } from './src/config.js';
+import {
+	loadOverrideLayer,
+	overridesEnabledFor,
+	seedOverrideFingerprint,
+	startOverrideWatch,
+} from './src/util/configOverride.js';
 import { startQueueStatusSync } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
@@ -18,7 +25,39 @@ import { startInvalidationWatch } from './src/util/invalidation.js';
 export async function handleApplication(scope) {
 	await scope.ready;
 
-	applyOptions(scope.options.getAll());
+	const hostOptions = () => scope.options.getAll();
+
+	// The stored-override layer, as the table last reported it. Held raw — the kill switch is
+	// consulted at apply time rather than here, so flipping `management.overrides.enabled` in the
+	// config file takes effect on the next apply without having to re-read the table.
+	let overrides = {};
+
+	// BOTH LAYERS ON EVERY APPLY. `applyOptions` rebuilds the whole config from defaults each time,
+	// so applying one layer alone silently drops the other: a config.yaml edit would wipe every
+	// override until the next override change, and vice versa.
+	const apply = () => applyOptions(hostOptions(), overridesEnabledFor(hostOptions()) ? overrides : {});
+
+	// SUBSCRIBE BEFORE READING. A write that lands between the read and a later subscribe is seen by
+	// neither, and the resulting staleness would persist — invisibly — until the backstop poll. The
+	// watcher's own settings come from a pure resolve of the file layer, because nothing has been
+	// applied yet and reading the live config here would see schema defaults.
+	await startOverrideWatch((next) => {
+		overrides = next;
+		apply();
+	}, resolveConfig(hostOptions(), null).config.management.overrides);
+
+	// Requests cannot reach this worker until handleApplication resolves — the worker's socket
+	// delivery is wired inside loadRootComponents().then(...) — so awaiting the override read here is
+	// what guarantees no request and no timer ever observes a pre-override config. The read is
+	// bounded and fails open for the same reason it has to be awaited: component load is raced
+	// against a hard timeout, and overrunning it fails the component rather than delaying it.
+	const layer = await loadOverrideLayer(hostOptions());
+	overrides = layer.overrides;
+	apply();
+	// Seeded from what the TABLE says, not from what was applied, so a change made while the kill
+	// switch is off is still detected as a change (and still correctly ignored) rather than being
+	// mistaken for the steady state.
+	seedOverrideFingerprint(layer.overrides);
 
 	// Live reload: re-apply whenever the host config changes. The background schedulers
 	// below subscribe to applyOptions (onConfigApplied) and re-arm themselves, so their
@@ -27,7 +66,7 @@ export async function handleApplication(scope) {
 	// re-apply and reported via pendingRestartChanges instead of taking effect silently.
 	scope.options.on('change', () => {
 		try {
-			applyOptions(scope.options.getAll());
+			apply();
 		} catch (e) {
 			scope.logger.error(e);
 		}
