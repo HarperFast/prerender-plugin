@@ -1035,6 +1035,159 @@ td .row-actions {
 
 /* ---------- Narrow screens ---------- */
 
+/* ---- configuration editing ---------------------------------------------------- */
+
+.setting {
+	padding: 12px 0;
+	border-top: 1px solid var(--border-1);
+}
+.setting:first-child {
+	border-top: 0;
+}
+.setting-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+.setting-head .path {
+	font-weight: 600;
+}
+.setting-desc {
+	margin: 6px 0 8px;
+	color: var(--fg-3);
+	max-width: 78ch;
+	white-space: pre-wrap;
+}
+.setting-ctl {
+	margin: 8px 0;
+}
+/* A staged edit is tinted and rail-marked rather than merely showing its new value: the whole
+   hazard of a config editor is a pending change that reads as an applied one. */
+.setting.staged {
+	background: rgba(45, 212, 160, 0.08);
+	box-shadow: inset 3px 0 0 var(--teal-400);
+	padding-left: 10px;
+}
+.setting.invalid {
+	box-shadow: inset 3px 0 0 var(--bad);
+	padding-left: 10px;
+}
+
+.layers {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	flex-wrap: wrap;
+	font-size: 12px;
+}
+.layers .layer {
+	display: inline-flex;
+	gap: 6px;
+	align-items: baseline;
+}
+
+.ctl-locked {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 4px;
+	flex-wrap: wrap;
+}
+
+.toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+}
+.checkset {
+	display: flex;
+	gap: 14px;
+	flex-wrap: wrap;
+}
+.checkset label {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	cursor: pointer;
+}
+
+.dur {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+.dur .dur-amount {
+	width: 9ch;
+}
+.dur .dur-unit {
+	width: 6ch;
+}
+.dur .dur-ms {
+	font-size: 12px;
+}
+
+.list-editor {
+	width: 100%;
+	max-width: 60ch;
+	font-family: var(--font-mono);
+	font-size: 13px;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: 1px solid var(--border-1);
+	background: var(--bg-1);
+	color: var(--fg-1);
+	resize: vertical;
+}
+.list-editor:focus {
+	outline: none;
+	border-color: var(--teal-400);
+}
+input.invalid,
+select.invalid,
+textarea.invalid {
+	border-color: var(--bad);
+}
+input.num {
+	width: 12ch;
+}
+
+mark {
+	background: rgba(45, 212, 160, 0.08);
+	color: var(--fg-1);
+	border-radius: 3px;
+	padding: 0 2px;
+}
+
+/* The tray is sticky because the staged set is the thing you must not lose track of while
+   scrolling a list of 133 options. */
+.tray {
+	position: sticky;
+	bottom: 0;
+	z-index: 5;
+	margin-top: 16px;
+	border: 1px solid var(--teal-400);
+	border-radius: 10px;
+	background: var(--bg-2);
+	box-shadow: 0 -6px 20px rgb(0 0 0 / 22%);
+}
+.tray-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 10px 14px;
+	flex-wrap: wrap;
+}
+.tray-preview {
+	padding: 0 14px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	max-height: 52vh;
+	overflow-y: auto;
+}
+
 @media (max-width: 860px) {
 	.app {
 		height: auto;

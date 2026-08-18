@@ -12,17 +12,23 @@
 
 import { ago, card, el, ICONS, link, num, pill, spacer, table, unwired } from '../ui.js';
 import { pageContentUrl } from '../api.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'pages', label: 'Page cache', crumb: 'page cache', icon: ICONS.pages };
 
 const PAGE_SIZE = 50;
 
 export async function load(ctx) {
-	const res = await ctx.get('pages', {
-		prefix: ctx.data.prefix ?? '',
-		cursor: ctx.data.cursor ?? '',
-		limit: PAGE_SIZE,
-	});
+	const [res] = await Promise.all([
+		ctx.get('pages', {
+			prefix: ctx.data.prefix ?? '',
+			cursor: ctx.data.cursor ?? '',
+			limit: PAGE_SIZE,
+		}),
+		// Concurrent with the browse: paging through the cache must not pay for a config read it
+		// almost always already has in the shared scratch.
+		loadConfig(ctx),
+	]);
 	ctx.data.page = res.ok ? res.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load the page cache (${res.status})`);
 }
@@ -40,8 +46,11 @@ export function render(ctx) {
 			}),
 			spacer(),
 		]),
+		appliedNote(ctx),
 		browser(ctx, data),
 		quality(),
+		settings(ctx),
+		editTray(ctx),
 	];
 }
 
@@ -188,3 +197,43 @@ const quality = () =>
 			),
 		],
 	});
+
+// ---- settings ---------------------------------------------------------------
+//
+// The lifetime and cache-key groups fail in opposite directions and the descriptions have to say
+// so. A lifetime change is cheap and reversible; a cache-key change orphans the whole stored corpus
+// at once, and the orphaning is INVISIBLE in the table above — the rows are still there, they are
+// just under keys nothing computes any more.
+
+const settings = (ctx) => [
+	settingsCard(ctx, {
+		title: 'Cached-page lifetimes',
+		prefix: 'page',
+		description:
+			'The freshness column above is these values read against each row. ttl and minTtl are stamped onto ' +
+			'a target as its render interval when a sitemap is ingested, so changing them reaches the corpus at ' +
+			'the next refresh rather than now; swrTtl is applied at serve time, so it re-dates what counts as ' +
+			'stale on the very next read. None of the three evicts a page or schedules a render. blobReadBudgetMs is the ' +
+			'serve path only — how long a hit may spend reading the stored body before falling back to the ' +
+			'origin — and has no bearing on this table.',
+	}),
+	settingsCard(ctx, {
+		title: 'Cache-key identity',
+		prefix: 'cacheKey',
+		description:
+			'How a URL becomes the cache key in the first column above. A change reshapes every key at once: ' +
+			'stored pages keep the keys they were written under, so they are orphaned rather than migrated — ' +
+			'not deleted, just never found again — and the corpus effectively rebuilds from empty as pages ' +
+			're-render. The prefix search above is a primary-key range, so after a change it can only find the ' +
+			'new shape.',
+	}),
+	settingsCard(ctx, {
+		title: 'Console page size',
+		prefix: 'management.pageSize',
+		description:
+			'A ceiling on the rows one fetch returns — this view asks for 50, and a lower value here clamps it ' +
+			'(it also bounds the sitemap-entry table and the per-entry point reads a sitemap detail does). It ' +
+			'changes what one browse click costs, never what is stored, and the dropdowns above still filter ' +
+			'only the rows that came back.',
+	}),
+];

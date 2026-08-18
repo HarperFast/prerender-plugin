@@ -1,20 +1,22 @@
 /**
- * Queue & nodes: cluster-wide pause/resume plus per-node overrides, and the supply side —
- * render outcomes, render time, and claim-scan health from the shared analytics window (the
- * same cached scan the Traffic view reads).
+ * Queue: cluster-wide pause/resume, the supply side — render outcomes, render time and claim-scan
+ * health from the shared analytics window (the same cached scan the Traffic view reads) — and the
+ * options that shape all three.
  *
- * The wording here is load-bearing. `QueueControl` is replicated INTENT; `QueueStatus` is what
- * each node last OBSERVED. Per-node overrides win over the cluster scope in both directions,
- * and a control write converges within one statusSyncInterval — so the table shows both columns
- * separately, or operators conclude a pause failed and click it repeatedly.
+ * The pause wording is load-bearing. `QueueControl` is replicated INTENT; `QueueStatus` is what
+ * each node last OBSERVED. A control write converges within one statusSyncInterval, so the two are
+ * never conflated, or operators conclude a pause failed and click it repeatedly. The per-node half
+ * of that — observed status, per-node intent, throughput, liveness — moved to Nodes, which is where
+ * every other per-node answer already had to be read from.
  *
- * Render rows land on whichever node processed the job result, so the per-node numbers ARE real
- * per-node throughput. Under cluster scope the proxy reads every node's window and hands back
- * both the merged series (the charts) and per-node totals (the table's throughput column);
- * under node scope only that node's row is filled, because the others' rows live on them.
+ * THE DATA COMES FIRST AND THE KNOBS SECOND. `queue`, `render` and `scan` are edited here rather
+ * than on a settings screen because an option is only intelligible beside the numbers it moves: a
+ * lease time means nothing until you are looking at the claim-scan trend it feeds. The staged set
+ * is shared with every other config surface (see _configEdit.js), so the tray at the bottom shows
+ * changes staged under Sitemaps too — one document, one write.
  */
 
-import { ago, card, duration, el, ICONS, muted, num, pill, spacer, stat, table } from '../ui.js';
+import { ago, card, duration, el, ICONS, link, muted, num, pill, spacer, stat } from '../ui.js';
 import {
 	barList,
 	colorFor,
@@ -35,15 +37,18 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
-import { nodeAge, statusPill } from './overview.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
-export const meta = { id: 'queue', label: 'Queue & nodes', crumb: 'queue', icon: ICONS.queue };
+export const meta = { id: 'queue', label: 'Queue', crumb: 'queue', icon: ICONS.queue };
 
 export async function load(ctx) {
 	const [res, analyticsRes] = await Promise.all([
 		ctx.get('overview'),
 		// Same range key the Traffic view defaults to, so the two views share the worker cache.
 		ctx.get('analytics', { range: 3_600_000 }),
+		// The settings cards below render from this. It goes through the shared config scratch, so
+		// arriving here from another settings surface reuses the payload rather than re-fanning out.
+		loadConfig(ctx),
 	]);
 	ctx.data.overview = res.ok ? res.body : null;
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
@@ -57,12 +62,24 @@ export function render(ctx) {
 	const setPause = (scope, paused) => ctx.run(() => ctx.post('queue', { scope, paused }));
 
 	return [
-		el('div', { cls: 'view-head' }, [el('span', { cls: 'eyebrow', text: 'Queue & nodes' }), spacer()]),
+		el('div', { cls: 'view-head' }, [el('span', { cls: 'eyebrow', text: 'Queue' }), spacer()]),
+		// Near the top, because it explains a value further down that may still read as the old one.
+		appliedNote(ctx),
 		cluster(ctx, data, setPause),
-		nodeTable(ctx, data, setPause),
+		nodesPointer(ctx),
 		supply(ctx),
+		settings(ctx),
+		// The tray shows the WHOLE staged set, including anything staged on another view.
+		editTray(ctx),
 	];
 }
+
+/** Where the per-node table went. One line, because the answer is a click and not a summary. */
+const nodesPointer = (ctx) =>
+	el('div', { cls: 'note' }, [
+		'Per-node observed status, pause intent, throughput and liveness are on ',
+		link('Nodes →', () => ctx.go('nodes')),
+	]);
 
 /** The render fleet as this node sees it, from the shared analytics window. */
 function supply(ctx) {
@@ -176,108 +193,44 @@ function cluster(ctx, data, setPause) {
 	});
 }
 
-function nodeTable(ctx, data, setPause) {
-	// PER-NODE THROUGHPUT, from the analytics window.
-	//
-	// Under cluster scope the proxy fans the window out and returns a per-node totals block
-	// alongside the merged series, so every row here gets its own rate — the column used to be
-	// '—' for every node but the one being read, because analytics rows are node-local and a
-	// peer's blank rendered as zero would read as "that node is idle". Now the blank means
-	// exactly one thing: that node did not answer. Reading a single node still fills only its
-	// own row, for the same original reason.
-	const analytics = ctx.data.analytics;
-	const rateOf = (counts, rangeMs) => {
-		const total = counts.reduce((acc, s) => acc + s.count, 0);
-		return total > 0 && rangeMs > 0 ? `≈${fmtCount(total / (rangeMs / 3_600_000))}/h` : null;
-	};
-
-	// Hostnames are case-insensitive, so both sides of this join are lowercased — the same rule
-	// resolveNode follows. The two keys reach it having been through different hands: `node` is
-	// the node's own `server.hostname` (verbatim from its Harper config, whatever case that was
-	// written in) and `hostname` is the configured origin's host, which `new URL()` has already
-	// lowercased. Matching them raw would drop the fallback join for any deployment that spells
-	// its hostname with a capital, and the symptom would be a blank throughput cell that reads
-	// as "this node didn't answer".
-	const rates = new Map();
-	const setRate = (key, rate) => {
-		if (key) rates.set(String(key).toLowerCase(), rate);
-	};
-	if (analytics && analytics.available !== false) {
-		if (analytics.byNode) {
-			for (const entry of analytics.byNode) {
-				const outcomes = (entry.totals ?? []).filter((s) => s.metric === 'render' && s.path === 'outcome');
-				const rate = rateOf(outcomes, entry.rangeMs ?? analytics.rangeMs);
-				// The node's OWN hostname is the join key QueueStatus rows use; the configured
-				// origin's host carries a port and would never match. Both are indexed so a
-				// deployment whose origins happen to be bare hostnames still joins.
-				setRate(entry.node, rate);
-				setRate(entry.hostname, rate);
-			}
-		} else if (analytics.node) {
-			setRate(
-				analytics.node,
-				rateOf(
-					pick(analytics, 'render', (s) => s.path === 'outcome'),
-					analytics.rangeMs
-				)
-			);
-		}
-	}
-	const rateFor = (hostname) => (hostname ? (rates.get(String(hostname).toLowerCase()) ?? null) : null);
-
-	const rows = data.nodes.map((node) =>
-		el('tr', null, [
-			el('td', { cls: 'mono' }, [node.hostname, node.isThisNode && muted(' (this node)')]),
-			el('td', null, [statusPill(node.status)]),
-			el('td', {
-				cls: 'mono' + (rateFor(node.hostname) ? '' : ' muted'),
-				text: rateFor(node.hostname) ?? '—',
-			}),
-			el('td', null, [node.responding === false ? pill('not responding', 'bad') : nodeAge(node)]),
-			el('td', null, [
-				node.override
-					? node.override.paused
-						? pill('override: paused', 'bad')
-						: pill('override: force run', 'ok')
-					: pill('inherits cluster'),
-			]),
-			el('td', null, [
-				el('div', { cls: 'row-actions' }, [
-					el('button', {
-						cls: 'danger small',
-						text: 'Pause',
-						disabled: ctx.busy,
-						onclick: () => setPause(node.hostname, true),
-					}),
-					el('button', {
-						cls: 'small',
-						text: 'Force run',
-						disabled: ctx.busy,
-						onclick: () => setPause(node.hostname, false),
-					}),
-					el('button', {
-						cls: 'small',
-						text: 'Inherit',
-						disabled: ctx.busy,
-						onclick: () => setPause(node.hostname, null),
-					}),
-				]),
-			]),
-		])
-	);
-
-	return el('div', { cls: 'card' }, [
-		table(
-			['node', 'observed status', 'throughput', 'status since', 'intent', { text: 'actions', right: true }],
-			rows,
-			'No nodes have reported queue status yet.'
-		),
-		el('div', { cls: 'card-foot' }, [
-			muted(
-				'Throughput is each node’s own processed-result rate — analytics rows are node-local, so the ' +
-					'cluster view reads all of them and attributes each to its node. A blank means that node ' +
-					'did not answer, never that it is idle; presenting it as zero would read as "idle".'
-			),
+/**
+ * The options that shape everything above, in the order an operator reaches for them: the queue
+ * mechanics, then what feeds the queue, then the budgets the scans behind these panels run under.
+ *
+ * Every card is rendered by the shared editor, so a value here is never shown as though it took
+ * effect when it did not — deployed, overridden, staged and running are four distinct states, and
+ * telling them apart is the whole job (see _configEdit.js and ui.js's settingRow).
+ */
+function settings(ctx) {
+	return el('div', null, [
+		el('div', { cls: 'view-head', style: { marginTop: '20px' } }, [
+			el('span', { cls: 'eyebrow', text: 'Settings' }),
+			spacer(),
+			muted('staged in this browser until you preview and apply'),
 		]),
+		settingsCard(ctx, {
+			title: 'Queue mechanics',
+			prefix: 'queue',
+			description:
+				'How work is handed to the render fleet: lease length, claim batch size, and the claim floor. ' +
+				'These move the claim-scan and throughput numbers above; none of them changes what is in the ' +
+				'corpus, only how fast it is worked through.',
+		}),
+		settingsCard(ctx, {
+			title: 'Render scheduling',
+			prefix: 'render',
+			description:
+				'What arrives in the queue at all: the render cadence, how a failure is retried or suppressed, ' +
+				'and the repair sweep that restores a target whose schedule row went missing. A cadence change ' +
+				'reshapes the "renders due" histogram on the overview, not this page.',
+		}),
+		settingsCard(ctx, {
+			title: 'Scan budgets',
+			prefix: 'scan',
+			description:
+				'The bounds every registry walk runs under. The backlog snapshot and both sweeps use them, so a ' +
+				'cap set below the real backlog makes those panels report a floor rather than a count — which ' +
+				'reads as a healthy number.',
+		}),
 	]);
 }

@@ -80,6 +80,25 @@ export const NODE_LOCAL_POST = Object.freeze({
 		'A schedule row is only readable on the node that owns the key. Pick a node — or use explain, which finds the owner for you.',
 });
 
+/**
+ * POST routes whose cluster-scoped answer carries a provenance envelope, and the reason one node
+ * is the whole write. The read side's SHARED_NOTE, pointed the other way.
+ *
+ * This is NOT the inverse of NODE_LOCAL_POST. Every route absent from that map already lands on a
+ * single node (see `writeNode`); membership here only adds the envelope naming which node took it
+ * and why that is cluster-wide.
+ *
+ * `config-override` is here and an invalidation is not, because of what reads the answer next. A
+ * config write is followed, seconds later, by the one panel that treats nodes disagreeing as a
+ * DEPLOY FAILURE — and until the write replicates the nodes do disagree. The response has to have
+ * already said "one node took this, the rows replicate, the others converge", or the console's own
+ * write path reads as the alarm it exists to raise. Nothing reads an invalidation's answer that
+ * way, so those keep their byte-exact pass-through.
+ */
+export const REPLICATED_POST_NOTE = Object.freeze({
+	'config-override': 'stored config overrides replicate — one node takes the write and every node converges',
+});
+
 // ---------------------------------------------------------------- small helpers
 
 const num = (v) => (Number.isFinite(v) ? v : null);
@@ -770,12 +789,101 @@ function flatten(value, prefix = '', out = new Map()) {
 }
 
 /**
+ * Every option path some node reports a stored override for.
+ *
+ * TWO SOURCES, and both are load-bearing, because they disagree in exactly the window this
+ * function exists to explain. `overrides.rows` is the replicated TABLE as that node last read it;
+ * `layers[].overridden` is the layer that node has actually APPLIED. A set still in flight is a
+ * row nobody has applied yet (table only); a CLEAR still in flight is a node running an override
+ * no row backs any more (applied layer only). Reading either alone misfiles one of the two as a
+ * deploy failure — see the classification below.
+ */
+function overriddenPaths(usable) {
+	const paths = new Set();
+	for (const r of usable) {
+		for (const row of r.body.overrides?.rows ?? []) {
+			if (typeof row?.path === 'string' && row.path) paths.add(row.path);
+		}
+		for (const layer of r.body.layers ?? []) {
+			if (layer?.overridden && typeof layer.path === 'string' && layer.path) paths.add(layer.path);
+		}
+	}
+	return paths;
+}
+
+/**
+ * The override layer, cluster-wide.
+ *
+ * The ROWS replicate, so they are the union and `missingOn` names any node a row has not reached —
+ * the direct readout of "the edit is still landing" that keeps an operator from reading the
+ * divergence list as a broken deploy.
+ *
+ * The WATCH STATE does not replicate and is per node and per worker: whether that node's
+ * subscription is live, when its backstop last re-read, and whether either is erroring. It is
+ * therefore reported per node and the scalar `watch` is deliberately ABSENT from the cluster
+ * answer — a single watch object here would be node one's, and a node whose override watch has
+ * died is precisely the node that silently stops honouring every edit made from this console.
+ * `degraded` rolls up as ANY, for the same reason.
+ *
+ * Returns null for a plugin that predates the override layer, so the reference body passes
+ * through untouched rather than growing an empty section.
+ */
+function mergeOverrides(usable) {
+	if (!usable.some((r) => r.body.overrides && typeof r.body.overrides === 'object')) return null;
+
+	const hostnames = usable.map((r) => r.hostname);
+	const rows = new Map();
+	for (const r of usable) {
+		for (const row of r.body.overrides?.rows ?? []) {
+			if (typeof row?.path !== 'string' || !row.path) continue;
+			let entry = rows.get(row.path);
+			if (!entry) rows.set(row.path, (entry = { row, presentOn: [] }));
+			entry.presentOn.push(r.hostname);
+		}
+	}
+
+	return {
+		// True only if EVERY node honours the layer: the kill switch is a file option, so a node
+		// where it is off is running the deployed config while the console lists rows it obeys.
+		// (That difference is also a real config divergence, and shows up as one.)
+		enabled: usable.every((r) => r.body.overrides?.enabled !== false),
+		rows: [...rows.values()].map(({ row, presentOn }) => ({
+			...row,
+			missingOn: hostnames.filter((hostname) => !presentOn.includes(hostname)),
+		})),
+		degraded: usable.some((r) => r.body.overrides?.degraded === true),
+		truncated: usable.some((r) => r.body.overrides?.truncated === true),
+		error: usable.map((r) => r.body.overrides?.error).find((error) => error) ?? null,
+		nodes: usable.map((r) => ({
+			hostname: r.hostname,
+			enabled: r.body.overrides?.enabled ?? null,
+			degraded: r.body.overrides?.degraded ?? null,
+			truncated: r.body.overrides?.truncated ?? null,
+			error: r.body.overrides?.error ?? null,
+			rowCount: (r.body.overrides?.rows ?? []).length,
+			watch: r.body.overrides?.watch ?? null,
+		})),
+	};
+}
+
+/**
  * Compare each node's effective config against the first node's.
  *
  * THIS IS THE ONE PLACE A HALF-APPLIED DEPLOY IS VISIBLE. A component deploy that restarts
  * three nodes and silently skips the fourth leaves a cluster running two versions of its own
  * configuration, and every other panel keeps looking healthy — the skipped node serves traffic,
  * reports queue status, and answers this API. The only symptom is that its options differ.
+ *
+ * SINCE THE OVERRIDE LAYER, DISAGREEMENT HAS A SECOND CAUSE, and it is a benign one. An override
+ * written from this console commits on one node and reaches the rest by replication, so between
+ * the write and every node re-reading the table the cluster genuinely disagrees about that path —
+ * a state that ends by itself in about a second, or by `management.overrides.syncInterval` if a
+ * node's subscription never established. Left unclassified, every config edit an operator makes
+ * here raises the alarm that means "a deploy skipped a node", and an alarm that fires on its own
+ * console's normal operation stops being read at all. So each divergence carries `overridden`:
+ * true means some node has an override in play at that path and this is the layer converging (or,
+ * if it persists, an override one node is refusing — the `override-rejected` state, visible in
+ * that node's `layers`); false is the original finding, unchanged and still a deploy failure.
  */
 export function mergeConfig(results) {
 	const usable = okBodies(results);
@@ -783,6 +891,7 @@ export function mergeConfig(results) {
 
 	const reference = usable[0];
 	const referenceFlat = flatten(reference.body.config ?? {});
+	const overridden = overriddenPaths(usable);
 
 	const divergences = [];
 	let truncated = false;
@@ -797,7 +906,11 @@ export function mergeConfig(results) {
 			}
 			let entry = divergences.find((d) => d.path === path);
 			if (!entry) {
-				entry = { path, values: [{ hostname: reference.hostname, value: referenceFlat.get(path) ?? null }] };
+				entry = {
+					path,
+					overridden: overridden.has(path),
+					values: [{ hostname: reference.hostname, value: referenceFlat.get(path) ?? null }],
+				};
 				divergences.push(entry);
 			}
 			entry.values.push({ hostname: r.hostname, value: flat.get(path) ?? null });
@@ -805,6 +918,7 @@ export function mergeConfig(results) {
 	}
 
 	const tagged = (key) => usable.flatMap((r) => (r.body[key] ?? []).map((item) => ({ ...item, hostname: r.hostname })));
+	const overrides = mergeOverrides(usable);
 
 	return {
 		status: 200,
@@ -814,12 +928,17 @@ export function mergeConfig(results) {
 			node: null,
 			workerIndex: null,
 			// The reference node's own config, named — the pre view is one node's truth, and
-			// pretending it is "the cluster's config" is exactly what divergence disproves.
+			// pretending it is "the cluster's config" is exactly what divergence disproves. `layers`
+			// rides along from the same node and is covered by the same caveat: it is that node's
+			// per-option provenance, including its own `override-rejected` verdicts. Publishing all N
+			// nodes' layers would be N×~130 rows to say what the divergence list already says in the
+			// only terms that matter — the values that actually differ.
 			configFrom: reference.hostname,
 			divergences,
 			divergencesTruncated: truncated,
 			warnings: tagged('warnings'),
 			pendingRestart: tagged('pendingRestart'),
+			...(overrides ? { overrides } : {}),
 			sources: sourcesOf(results, { mode: 'compared' }),
 		},
 	};

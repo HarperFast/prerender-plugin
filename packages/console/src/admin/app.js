@@ -16,6 +16,7 @@ import { CLUSTER, get, post, setExpiredHandler, setNode } from './api.js';
 import * as overview from './views/overview.js';
 import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
+import * as nodes from './views/nodes.js';
 import * as sitemaps from './views/sitemaps.js';
 import * as pages from './views/pages.js';
 import * as invalidations from './views/invalidations.js';
@@ -24,13 +25,15 @@ import * as metricsref from './views/metricsref.js';
 import * as config from './views/config.js';
 
 // Ordered as an operator triages: is it working (overview, traffic), what is it working on
-// (sitemaps, pages), is the machinery healthy (queue), then actions and reference.
+// (sitemaps, pages), is the machinery healthy (queue, then the nodes running it), then actions
+// and reference.
 const VIEWS = [
 	overview,
 	traffic,
 	sitemaps,
 	pages,
 	queue,
+	nodes,
 	invalidations,
 	null /* divider */,
 	explain,

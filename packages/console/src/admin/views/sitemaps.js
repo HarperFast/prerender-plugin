@@ -10,13 +10,14 @@
  */
 
 import { ago, card, duration, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, table } from '../ui.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'sitemaps', label: 'Sitemaps', crumb: 'sitemaps', icon: ICONS.sitemaps };
 
 const PAGE_SIZE = 50;
 
 export async function load(ctx) {
-	const [res, unroutedRes] = await Promise.all([ctx.get('sitemaps'), ctx.get('unrouted')]);
+	const [res, unroutedRes] = await Promise.all([ctx.get('sitemaps'), ctx.get('unrouted'), loadConfig(ctx)]);
 	ctx.data.unrouted = unroutedRes.ok ? unroutedRes.body : null;
 	if (!res.ok) {
 		ctx.data.list = null;
@@ -62,6 +63,7 @@ export function render(ctx) {
 				onclick: () => ctx.run(() => ctx.post('sitemap-refresh', {})),
 			}),
 		]),
+		appliedNote(ctx),
 		roots.length === 0
 			? el('div', { cls: 'note' }, [
 					'No sitemaps are registered. Add one by POSTing its URL to the ',
@@ -75,6 +77,8 @@ export function render(ctx) {
 					]),
 				]),
 		unroutedCard(ctx),
+		settings(ctx),
+		editTray(ctx),
 	];
 }
 
@@ -376,3 +380,23 @@ function shortPath(url) {
 		return String(url ?? '');
 	}
 }
+
+/**
+ * Ingestion settings, below the state they produce.
+ *
+ * The distinction worth stating on this view is SCHEDULE versus WALK: everything here changes when
+ * or how the next pass runs, and nothing here runs one — the buttons above are still the only way
+ * to make a walk happen now.
+ */
+const settings = (ctx) =>
+	settingsCard(ctx, {
+		title: 'Sitemap ingestion',
+		prefix: 'sitemap',
+		description:
+			'When the daily pass runs and how a walk behaves. refreshTime, timezone, node and workerIndex move ' +
+			'only the schedule — an empty node disables the periodic refresh entirely and leaves the Refresh ' +
+			'buttons above as the only trigger — and changing any of them never starts a walk now. ' +
+			'filteredWarnPercent changes the severity a refresh REPORTS when most of a sitemap is filtered out, ' +
+			'not what gets filtered: that is ingress.routes, and the Served without prerendering panel above is ' +
+			'the other half of the same question.',
+	});

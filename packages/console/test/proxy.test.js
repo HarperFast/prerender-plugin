@@ -7,6 +7,7 @@ import {
 	forwardedQuery,
 	readCookie,
 	resolveNode,
+	writeNode,
 } from '../src/util/proxy.js';
 import { applyOptions, config } from '../src/config.js';
 
@@ -61,6 +62,32 @@ test('resolveNode: configured origins and hostnames resolve, everything else is 
 	assert.equal(resolveNode('node-a.example.com/../../x', NODES), null);
 	assert.equal(resolveNode('anything', []), null);
 	assert.equal(resolveNode(undefined, []), null);
+});
+
+test('writeNode: a cluster-scoped write goes to exactly ONE node, and keeps going to the same one', () => {
+	const both = { [NODES[0]]: 'hdb-session=a', [NODES[1]]: 'hdb-session=b' };
+
+	// The FIRST configured node holding a session — never a list. Every cluster-scoped write this
+	// proxy forwards lands in a replicated table, so one commit reaches every node; fanning it out
+	// would be N racing writes to the same rows, and a partial failure would report an error for a
+	// write that in fact succeeded and replicated.
+	assert.equal(writeNode({ cluster: true }, both, NODES), NODES[0]);
+	// Stable across calls, so a sequence of edits lands in one place in one order rather than
+	// racing itself around the cluster. It is also the answer for a node that is signed in but
+	// DOWN: a write that failed in transit may already have committed and replicated, so there is
+	// deliberately no reachability channel into this decision — the caller 502s and names the node,
+	// and the operator retries somewhere deliberately.
+	assert.equal(writeNode({ cluster: true }, both, NODES), NODES[0]);
+
+	// One reason, and one only, to skip a node: no session there to write with.
+	assert.equal(writeNode({ cluster: true }, { [NODES[1]]: 'hdb-session=b' }, NODES), NODES[1]);
+	assert.equal(writeNode({ cluster: true }, {}, NODES), null, 'nowhere to send it — the caller answers 401');
+	assert.equal(writeNode({ cluster: true }, both, []), null);
+
+	// Node scope is the operator's own pick, returned as-is; the caller re-checks the session and
+	// answers 401 for that node rather than quietly writing somewhere else.
+	assert.equal(writeNode({ cluster: false, origin: NODES[1] }, {}, NODES), NODES[1]);
+	assert.equal(writeNode(null, both, NODES), null);
 });
 
 test('cookiePairsFrom keeps name=value pairs and drops attributes', () => {

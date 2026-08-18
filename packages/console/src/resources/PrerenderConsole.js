@@ -47,8 +47,9 @@ import {
 	PROXIED_POST as PROXIED_POST_LIST,
 	readCookie,
 	resolveScope,
+	writeNode,
 } from '../util/proxy.js';
-import { CLUSTER, mergerFor, NODE_LOCAL_POST, SHARED_NOTE } from '../util/aggregate.js';
+import { CLUSTER, mergerFor, NODE_LOCAL_POST, REPLICATED_POST_NOTE, SHARED_NOTE } from '../util/aggregate.js';
 
 // GET routes forwarded upstream (everything else under GET is shell/assets or a 404), and
 // POST routes likewise — `login`/`logout` are handled here, never forwarded blind. The
@@ -247,6 +248,32 @@ async function firstReachable(route, { tokens, query = '', signedIn }) {
 }
 
 /**
+ * The provenance envelope for an answer ONE node gave on the whole cluster's behalf.
+ *
+ * `complete: true` because for replicated data one node IS the whole answer — this envelope
+ * exists to name the node and the reason, not to confess a shortfall. (It also keeps the
+ * "N of M nodes answered" banner off a page where nothing is missing: that banner reads
+ * `complete === false` on every payload a view loaded.)
+ */
+const oneNodeSources = (mode, origin, tokens, note, skipped) => ({
+	mode,
+	scope: 'cluster',
+	servedBy: hostOf(origin),
+	note,
+	answered: 1,
+	configured: config.nodes.length,
+	complete: true,
+	nodes: config.nodes.map((node) => ({
+		origin: node,
+		hostname: hostOf(node),
+		ok: node === origin,
+		status: node === origin ? 200 : 0,
+		error: node === origin ? null : tokens[node] ? skipped : 'not signed in to this node',
+		ms: null,
+	})),
+});
+
+/**
  * Attach the provenance envelope to a shared (single-node) JSON answer, so "cluster" never
  * implies a fan-out that did not happen. A non-JSON body is passed through untouched —
  * `page-content` serves a stored page as text and must stay byte-exact.
@@ -259,25 +286,42 @@ async function sharedResponse(route, origin, res, tokens) {
 	return json({
 		...payload,
 		scope: 'cluster',
-		// `complete: true` because for replicated data one node IS the whole answer — this
-		// envelope exists to name the node and the reason, not to confess a shortfall.
-		sources: {
-			mode: 'shared',
-			scope: 'cluster',
-			servedBy: hostOf(origin),
-			note: SHARED_NOTE[route] ?? 'this data is the same on every node',
-			answered: 1,
-			configured: config.nodes.length,
-			complete: true,
-			nodes: config.nodes.map((node) => ({
-				origin: node,
-				hostname: hostOf(node),
-				ok: node === origin,
-				status: node === origin ? 200 : 0,
-				error: node === origin ? null : tokens[node] ? 'not queried (replicated data)' : 'not signed in to this node',
-				ms: null,
-			})),
-		},
+		sources: oneNodeSources(
+			'shared',
+			origin,
+			tokens,
+			SHARED_NOTE[route] ?? 'this data is the same on every node',
+			'not queried (replicated data)'
+		),
+	});
+}
+
+/**
+ * The same envelope for a cluster-scoped WRITE that one node accepted for the cluster.
+ *
+ * Deliberately no top-level `scope: 'cluster'` here, unlike the read. A write's payload is the
+ * plugin's own answer about what it did, and some of those answers already own that key with a
+ * different meaning — a queue-control write reports the `scope` the PAUSE applies to. Turning
+ * that into "cluster" would rewrite the operator's answer about what they just did. Everything
+ * this envelope adds therefore lives under `sources`, which no write response carries.
+ *
+ * A non-200 passes through untouched: it is the node's real answer, and a refusal wearing a
+ * cluster envelope reads as though the cluster refused.
+ */
+async function replicatedWriteResponse(route, origin, res, tokens) {
+	if (res.statusCode !== 200) return passThrough(res);
+	const payload = await res.body.json().catch(() => null);
+	if (!payload || typeof payload !== 'object')
+		return json({ error: 'The prerender node sent an unreadable body' }, 502);
+	return json({
+		...payload,
+		sources: oneNodeSources(
+			'write-once',
+			origin,
+			tokens,
+			REPLICATED_POST_NOTE[route],
+			'not written (the row replicates)'
+		),
 	});
 }
 
@@ -382,25 +426,29 @@ export class PrerenderConsole extends Resource {
 		 * ACTIONS ARE NEVER FANNED OUT. A read can be summed; a write cannot be "summed", and
 		 * running one four times is a different act from running it once.
 		 *
-		 * Under cluster scope a write lands on ONE node, which is correct for everything that
-		 * writes a replicated table (an invalidation, a revalidation, a queue-control row — the
-		 * write replicates and the `scope` field inside it already says who it applies to). The
-		 * exceptions are the routes that act on a single node's OWN state; those refuse and say
-		 * to pick a node, because a "Run repair sweep" button that silently swept one node of
-		 * four while the console read "all nodes" is a lie an operator would only catch later.
+		 * Under cluster scope a write lands on ONE node (`writeNode`), which is correct for
+		 * everything that writes a replicated table (an invalidation, a revalidation, a
+		 * queue-control row, a config override — the write replicates, and what it applies to is
+		 * the row's business, not the console's). The exceptions are the routes that act on a
+		 * single node's OWN state; those refuse and say to pick a node, because a "Run repair
+		 * sweep" button that silently swept one node of four while the console read "all nodes" is
+		 * a lie an operator would only catch later.
 		 */
-		let node = scope.origin;
 		if (scope.cluster) {
 			const refusal = NODE_LOCAL_POST[route];
 			if (refusal) return json({ error: refusal, needsNode: true, nodes: nodesFor(tokens) }, 409);
-			node = config.nodes.find((origin) => tokens[origin]) ?? null;
-			if (!node) return json({ error: 'Not signed in to any node', authenticated: false }, 401);
 		}
+		const node = writeNode(scope, tokens, config.nodes);
+		if (!node) return json({ error: 'Not signed in to any node', authenticated: false }, 401);
 		if (!tokens[node]) return json({ error: 'Not signed in to this node', authenticated: false }, 401);
 
 		try {
 			const res = await upstream(node, route, { method: 'POST', body: data ?? {}, cookie: tokens[node] });
-			return await passThrough(res);
+			// Only under cluster scope: asked of a named node, the operator already knows where the
+			// write went, and the answer stays byte-exact.
+			return scope.cluster && REPLICATED_POST_NOTE[route]
+				? await replicatedWriteResponse(route, node, res, tokens)
+				: await passThrough(res);
 		} catch (e) {
 			return PrerenderConsole.upstreamError(node, e);
 		}

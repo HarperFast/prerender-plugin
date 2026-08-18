@@ -36,9 +36,13 @@ const ASSETS = new Map([
 	['ui.js', ['ui.js', JS]],
 	['api.js', ['api.js', JS]],
 	['charts.js', ['charts.js', JS]],
+	// Shared config-editing behaviour rather than a view. It is imported by every view that owns
+	// settings, so it has to be served even though the router never names it.
+	['views/_configEdit.js', ['views/_configEdit.js', JS]],
 	['views/overview.js', ['views/overview.js', JS]],
 	['views/traffic.js', ['views/traffic.js', JS]],
 	['views/queue.js', ['views/queue.js', JS]],
+	['views/nodes.js', ['views/nodes.js', JS]],
 	['views/sitemaps.js', ['views/sitemaps.js', JS]],
 	['views/pages.js', ['views/pages.js', JS]],
 	['views/invalidations.js', ['views/invalidations.js', JS]],

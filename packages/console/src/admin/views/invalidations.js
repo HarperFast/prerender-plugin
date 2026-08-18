@@ -16,11 +16,12 @@
  */
 
 import { ago, card, el, ICONS, kv, mono, muted, num, pill, spacer, table } from '../ui.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'invalidations', label: 'Invalidations', crumb: 'invalidations', icon: ICONS.invalidations };
 
 export async function load(ctx) {
-	const res = await ctx.get('invalidations');
+	const [res] = await Promise.all([ctx.get('invalidations'), loadConfig(ctx)]);
 	ctx.data.list = res.ok ? res.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load invalidations (${res.status})`);
 }
@@ -36,6 +37,7 @@ export function render(ctx) {
 			data.enabled ? pill('enforcement on', 'ok', true) : pill('invalidation.enabled is FALSE', 'bad', true),
 			el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
 		]),
+		appliedNote(ctx),
 		data.killSwitchHidingRows &&
 			el('div', { cls: 'note bad' }, [
 				'Rows exist but ',
@@ -44,6 +46,8 @@ export function render(ctx) {
 			]),
 		active(ctx, data),
 		record(ctx, data),
+		settings(ctx),
+		editTray(ctx),
 	];
 }
 
@@ -190,3 +194,24 @@ function record(ctx, data) {
 }
 
 const describeCoverage = (coverage) => (typeof coverage === 'string' ? coverage : (coverage?.covers ?? '—'));
+
+/**
+ * The knobs, deliberately BELOW the record form and outside it.
+ *
+ * `invalidation.enabled` is the pill in this view's header and the kill switch behind the banner
+ * above, so it has to be reachable from here — but it is a config write with its own
+ * preview-then-apply, not a step in recording an invalidation. Keeping it in its own card below
+ * the form is what stops the two flows from reading as one.
+ */
+const settings = (ctx) =>
+	settingsCard(ctx, {
+		title: 'Invalidation behaviour',
+		prefix: 'invalidation',
+		description:
+			'How the rows in Active invalidations above are applied. enabled is the header pill: false leaves ' +
+			'every row stored and stops honouring all of them at once, so the corpus serves pre-invalidation ' +
+			'bytes again — it does not clear anything. maxScopes is the slot count on that panel. pad only ' +
+			'widens the comparison toward invalidating (its cost is at most one extra render per page), and the ' +
+			'reenqueue options decide whether a bot request for an invalidated page pulls that URL forward in ' +
+			'the queue instead of waiting out its own cadence. Nothing here rewrites a cached page.',
+	});
