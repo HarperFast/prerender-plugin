@@ -245,7 +245,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'If set, the token is sourced from this environment variable at config-apply time and takes ' +
 						'precedence over `value` (keeps the secret out of config.yaml). The environment itself is ' +
 						'loaded once at boot (loadEnv), so changing the variable’s VALUE still needs a restart; ' +
-						'changing which variable is read does not.'
+						'changing which variable is read does not.',
+					// FILE-ONLY, exactly like the secret it selects. Writing this from the console would set the
+					// token by proxy: point it at an environment variable whose value you already know and the
+					// secret becomes that value. That is the bypass `secret: true` exists to prevent, so the
+					// pointer has to be as unwritable as the target.
+					{ uiEditable: false }
 				),
 			},
 			{ movedFrom: 'securityToken' }
@@ -366,7 +371,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 			valueEnv: option(
 				'',
 				'If set, the token is sourced from this environment variable at config-apply time and takes ' +
-					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.'
+					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.',
+				// File-only for the same reason as `origin.securityToken.valueEnv`: it sets the token by proxy.
+				{ uiEditable: false }
 			),
 			missHeader: option('x-harper-render-miss', "Request header picking miss behavior: 'prerender' | 'origin'."),
 			defaultMissMode: option('prerender', 'Miss behavior when `missHeader` is absent.', {
@@ -427,7 +434,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 			valueEnv: option(
 				'',
 				'If set, the token is sourced from this environment variable at config-apply time and takes ' +
-					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.'
+					'precedence over `token`. Same boot-time caveat as `origin.securityToken.valueEnv`.',
+				// File-only for the same reason as `origin.securityToken.valueEnv`: it sets the token by proxy.
+				{ uiEditable: false }
 			),
 			timeoutMs: option(
 				500,
@@ -486,7 +495,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 					syncInterval: option(
 						30 * SECOND,
-						'Backstop re-read cadence for the override table (worker 0 of each node). The live path ' +
+						'Backstop re-read cadence for the override table, run on EVERY worker rather than one per ' +
+							'node: each worker holds its own config object, and the failure this covers — that ' +
+							'worker\u2019s subscription is gone — is per-worker by definition. The live path ' +
 							'is the subscription above; this exists so a subscription that was never established, ' +
 							'or a worker whose boot read failed, still converges — the layer gets a bound on how ' +
 							'stale it can be that does not depend on a callback firing. A re-read whose result is ' +

@@ -16,7 +16,7 @@ import { installDom, find } from './domShim.js';
 
 installDom();
 
-const { control, durationInput, card, listEditor, originPill, highlight, formatValue } = await import(
+const { el, control, durationInput, card, listEditor, originPill, highlight, formatValue } = await import(
 	'../src/admin/ui.js'
 );
 
@@ -161,4 +161,64 @@ test('formatValue distinguishes an empty string from an unset value', () => {
 	assert.equal(formatValue(''), '(empty)');
 	assert.equal(formatValue(0), '0');
 	assert.equal(formatValue(false), 'false');
+});
+
+test('a falsy boolean attribute is DROPPED, because HTML treats a present one as true', () => {
+	// `disabled: ctx.busy` is written throughout this client. With `setAttribute('disabled','false')`
+	// the attribute is present, so the browser disables the control — and `busy` is false almost
+	// always, which made Refresh, Clear, Pause, Preview and Apply permanently unclickable.
+	assert.deepEqual(el('button', { text: 'Preview', disabled: false }).attributes, {});
+	assert.equal(el('button', { text: 'Preview', disabled: true }).attributes.disabled, '');
+	assert.equal(el('input', { type: 'checkbox', checked: false }).attributes.checked, undefined);
+});
+
+test('an option whose default is an empty array is edited as TEXT, not as numbers', () => {
+	// `[].every(...)` is true, so inferring "numeric" from the default alone made every option
+	// defaulting to `[]` a number list — a hostname typed into `domains` became `[null]`.
+	const staged = [];
+	const node = control(
+		{ path: 'domains', type: 'array', default: [], itemType: 'string', uiEditable: true },
+		['a.com'],
+		(value) => staged.push(value)
+	);
+	node.value = 'example.com';
+	node.fire('input', { target: node });
+	assert.deepEqual(staged.at(-1), ['example.com'], 'a hostname must survive being typed');
+});
+
+test('a numeric list is still edited as numbers when something actually says so', () => {
+	const staged = [];
+	const node = control(
+		{ path: 'render.demand.ladder', type: 'array', default: [21600000, 43200000], uiEditable: true },
+		[21600000],
+		(value) => staged.push(value)
+	);
+	node.value = '3600000\n7200000';
+	node.fire('input', { target: node });
+	assert.deepEqual(staged.at(-1), [3600000, 7200000]);
+});
+
+test('an array of objects gets a JSON editor that preserves order and refuses half-typed input', () => {
+	// ingress.routes is FIRST MATCH WINS, so order is semantics. A line-per-entry editor rendered
+	// these as "[object Object]" and parsing that back destroyed the option.
+	const staged = [];
+	const routes = [
+		{ match: 'prefix', path: '/a', mode: 'prerender' },
+		{ match: 'prefix', path: '/b', mode: 'passthrough' },
+	];
+	const node = control(
+		{ path: 'ingress.routes', type: 'array', default: [], itemType: 'object', uiEditable: true },
+		routes,
+		(value) => staged.push(value)
+	);
+	const area = find(node, (n) => n.tagName === 'TEXTAREA');
+	assert.match(area.value, /"match": "prefix"/, 'the stored value is shown as itself, not as [object Object]');
+
+	area.value = JSON.stringify([routes[1], routes[0]]);
+	area.fire('input', { target: area });
+	assert.deepEqual(staged.at(-1), [routes[1], routes[0]], 'order is preserved exactly as typed');
+
+	area.value = '[{"match":';
+	area.fire('input', { target: area });
+	assert.equal(staged.at(-1), null, 'unparseable text must report null rather than a value');
 });

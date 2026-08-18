@@ -69,12 +69,18 @@ export async function handleApplication(scope) {
 	// bounded and fails open for the same reason it has to be awaited: component load is raced
 	// against a hard timeout, and overrunning it fails the component rather than delaying it.
 	const layer = await loadOverrideLayer(hostOptions());
-	overrides = layer.overrides;
-	apply();
 	// Seeded from what the TABLE says, not from what was applied, so a change made while the kill
-	// switch is off is still detected as a change (and still correctly ignored) rather than being
-	// mistaken for the steady state.
-	seedOverrideFingerprint(layer.overrides);
+	// switch is off is still detected as a change (and still correctly ignored) rather than mistaken
+	// for the steady state.
+	//
+	// It returns false when the watcher already applied something while this read was in flight — the
+	// doorbell fired in the window that subscribing early exists to cover. In that case the watcher
+	// has strictly fresher data and this boot read must NOT overwrite it; applying anyway would
+	// reinstate the pre-edit config and file it under a fingerprint that says nothing is pending.
+	if (seedOverrideFingerprint(layer.overrides)) {
+		overrides = layer.overrides;
+		apply();
+	}
 
 	// Live reload: re-apply whenever the host config changes. The background schedulers
 	// below subscribe to applyOptions (onConfigApplied) and re-arm themselves, so their

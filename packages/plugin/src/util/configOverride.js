@@ -34,7 +34,7 @@
  */
 
 import { config, getLogger, onConfigApplied, resolveConfig } from '../config.js';
-import { checkUiEditable } from '../configSchema.js';
+import { aliasPaths, checkUiEditable } from '../configSchema.js';
 
 const table = () => databases.render_service.ConfigOverride;
 
@@ -53,8 +53,14 @@ const MAX_OVERRIDE_ROWS = 500;
  * timeout at all. This table is deliberately not pinned and the walk is a local one-sided PK range,
  * so the deadline should never fire — it is here so that "should never" is not the only thing
  * standing between a slow read and a component that will not load.
+ *
+ * IT HAS TO BE SMALL BECAUSE IT AGGREGATES. `handleApplication` runs one thread at a time per plugin
+ * (componentLoader takes a cross-thread lock), so a node with many workers pays this deadline
+ * SERIALLY in the worst case, against a single 30s component-load budget and a lock wait that gives
+ * up at timeout + 5s. At 5s a 14-worker node could push the later threads past both. Two seconds is
+ * ~2000x a healthy read of a few dozen rows and keeps the aggregate inside the budget.
  */
-const READ_TIMEOUT_MS = 5000;
+const READ_TIMEOUT_MS = 2000;
 
 /** Ceiling on entries in one write request. A config edit is a handful of paths, never hundreds. */
 export const MAX_WRITE_ENTRIES = 200;
@@ -262,8 +268,21 @@ export const writeOverrides = async ({ set = [], clear = [], updatedBy = null } 
 	const written = [];
 	const cleared = [];
 
+	// CLEAR THE ALIASES TOO. The layer is indexed by the path an option lives at NOW, so a row
+	// written before that option moved is reported to the console under its current name — and a
+	// delete of the current name removes a row that does not exist while the real one survives. The
+	// console would show the revert succeeding, the value would not change, and the next read would
+	// put the override straight back.
+	const aliases = aliasPaths();
+	const legacyKeysFor = (path) =>
+		Object.entries(aliases)
+			.filter(([, current]) => current === path || path.startsWith(`${current}.`))
+			.map(([legacy, current]) => (current === path ? legacy : legacy + path.slice(current.length)));
+
 	for (const path of clear) {
-		await overrides.delete(path);
+		for (const key of [path, ...legacyKeysFor(path)]) {
+			await overrides.delete(key);
+		}
 		cleared.push(path);
 	}
 	for (const entry of set) {
@@ -289,6 +308,8 @@ let debounceTimer = null;
 let lastReadAt = null;
 let lastFingerprint = null;
 let lastError = null;
+let inFlight = null;
+let generation = 0;
 
 /** What the watcher is doing, for the management API. */
 export const overrideWatchState = () => ({
@@ -305,8 +326,17 @@ export const overrideWatchState = () => ({
  * override as new and re-apply a config that is already correct.
  */
 export const seedOverrideFingerprint = (overrides) => {
+	// Only when the watcher has not already applied something. A doorbell can fire between subscribe
+	// and this call — that window is exactly why subscribing happens first — and seeding over its
+	// result would file a NEWER applied set under an OLDER fingerprint. The backstop would then read
+	// the table, match the stale fingerprint, and conclude nothing had changed, so the edit would stay
+	// lost with every signal saying it had landed.
+	//
+	// Returns whether it seeded, so the caller knows whether its own boot apply is still wanted.
+	if (lastFingerprint !== null) return false;
 	lastFingerprint = fingerprintOverrides(overrides);
 	lastReadAt = Date.now();
+	return true;
 };
 
 /**
@@ -328,22 +358,39 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 	// by both. `management.overrides` is file-only precisely so it can be resolved this early.
 	const settings = bootSettings ?? config.management.overrides;
 
+	// SERIALIZED, and superseded calls drop out. The doorbell and the backstop poll fire
+	// independently, so two reads can be in flight at once — and whichever COMPLETES last wins, which
+	// is not the one that READ last. That is a genuine reordering: a poll started before an edit can
+	// finish after the doorbell that announced it and quietly restore the pre-edit config, with the
+	// fingerprint then agreeing that nothing more is pending. Chaining makes "the newest read wins"
+	// true by construction, and a call already superseded while queued skips entirely, because the
+	// newer one is about to read strictly fresher data.
 	const reread = async (reason) => {
-		const { overrides, degraded, error } = await readOverrides();
-		lastReadAt = Date.now();
-		lastError = error;
-		if (degraded) return;
+		const mine = ++generation;
+		inFlight = (inFlight ?? Promise.resolve()).then(async () => {
+			if (mine !== generation) return;
 
-		const fingerprint = fingerprintOverrides(overrides);
-		if (fingerprint === lastFingerprint) return;
-		lastFingerprint = fingerprint;
+			const { overrides, degraded, error } = await readOverrides();
+			lastReadAt = Date.now();
+			lastError = error;
+			if (degraded) return;
 
-		getLogger().info?.(`[prerender] Config overrides changed (${reason}) — reapplying`);
-		try {
-			await onOverrides(overrides);
-		} catch (e) {
-			getLogger().error?.(e);
-		}
+			const fingerprint = fingerprintOverrides(overrides);
+			if (fingerprint === lastFingerprint) return;
+
+			getLogger().info?.(`[prerender] Config overrides changed (${reason}) — reapplying`);
+			try {
+				await onOverrides(overrides);
+				// AFTER the apply, never before. Recording it first means an apply that threw is filed as
+				// done: the backstop then sees "no change" on every subsequent tick and the worker runs
+				// the old config indefinitely, which is precisely the state the backstop exists to end.
+				lastFingerprint = fingerprint;
+			} catch (e) {
+				lastError = e.message;
+				getLogger().error?.(e);
+			}
+		});
+		return inFlight;
 	};
 
 	const ring = (reason) => {
@@ -390,9 +437,14 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 	// Reads the LIVE config, unlike the subscribe decision above: this is re-run from
 	// `onConfigApplied`, which by definition only fires after an apply, and re-arming on the live
 	// value is what makes the interval editable without a restart.
+	// `Math.trunc(Number(...))`, never `| 0`: the bitwise coercion wraps at 2^31, so a syncInterval of
+	// 2^31+1 ms became NEGATIVE and disabled the backstop while the schema, the API and the console
+	// all went on reporting the configured value.
+	const intervalOf = (settings) =>
+		settings.enabled === false ? 0 : Math.max(0, Math.trunc(Number(settings.syncInterval)) || 0);
+
 	const syncPollTimer = () => {
-		const live = config.management.overrides;
-		const wanted = live.enabled === false ? 0 : live.syncInterval | 0;
+		const wanted = intervalOf(config.management.overrides);
 		if (wanted === armedInterval) return;
 		clearInterval(pollTimer);
 		pollTimer = null;
@@ -405,7 +457,7 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 	};
 
 	const armFromBoot = () => {
-		const wanted = settings.enabled === false ? 0 : settings.syncInterval | 0;
+		const wanted = intervalOf(settings);
 		armedInterval = wanted > 0 ? wanted : null;
 		if (!armedInterval) return;
 		pollTimer = setInterval(() => {
@@ -423,6 +475,8 @@ export const resetOverrideWatchForTests = () => {
 	clearTimeout(debounceTimer);
 	clearInterval(pollTimer);
 	watchStarted = false;
+	inFlight = null;
+	generation = 0;
 	subscribed = false;
 	subscribeError = null;
 	armedInterval = null;

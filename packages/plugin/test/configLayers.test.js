@@ -158,12 +158,48 @@ test('secret options are reported as presence markers in every layer, never by v
 	assert.equal(token.file, `<set: ${FILE_TOKEN.length} chars>`);
 	assert.equal(token.effective, `<set: ${FILE_TOKEN.length} chars>`);
 
-	// Even the override layer — a row `validateOverride` refuses to create, but which the layers
-	// view must still be able to render without disclosing it.
+	// A stored row for a secret is REFUSED BY THE MERGE, not merely by the API. The management API
+	// cannot create one, but the table is also reachable through the operations API, and a row that
+	// arrived that way used to be applied — which would let anyone with table access set the origin
+	// token. The row is ignored, the option keeps the value its layers give it, and the refusal is
+	// reported rather than silent.
 	const peer = layerFor('peerRescue.token');
 	assert.equal(peer.secret, true);
-	assert.equal(peer.override, `<set: ${OVERRIDE_TOKEN.length} chars>`);
-	assert.equal(peer.effective, `<set: ${OVERRIDE_TOKEN.length} chars>`);
+	assert.equal(peer.effective, '<empty>', 'a secret set by a stored row must not take effect');
+	assert.equal(peer.override, `<set: ${OVERRIDE_TOKEN.length} chars>`, 'and is still rendered without disclosure');
+	assert.equal(peer.source, 'override-rejected', 'the row exists and is not honoured — exactly that state');
+});
+
+test('a stored row cannot set an option the console is forbidden to write, whatever route it arrived by', () => {
+	// The write door refuses these; the merge has to as well, because the table is reachable through
+	// the operations API. `management.enabled: false` is the sharpest case — it disables the
+	// management API cluster-wide, and undoing it would have to go through the API it just switched
+	// off. `*.valueEnv` is the subtlest: it sets a secret BY PROXY, by naming an environment variable
+	// whose value the writer already knows.
+	process.env.CONFIG_LAYERS_PROBE = 'a-value-the-writer-knows';
+
+	const refused = {
+		'management.enabled': false,
+		'management.overrides.enabled': false,
+		'renderNow.valueEnv': 'CONFIG_LAYERS_PROBE',
+		'origin.securityToken.value': 'set-by-a-row',
+	};
+
+	for (const [path, value] of Object.entries(refused)) {
+		const { config: resolved, warnings } = resolveConfig({}, { [path]: value });
+		const effective = path.split('.').reduce((node, segment) => node?.[segment], resolved);
+		assert.notDeepEqual(effective, value, `${path} must not be settable by a stored row`);
+		assert.ok(
+			warnings.some((warning) => warning.includes(path)),
+			`${path} must be reported as refused, not dropped in silence`
+		);
+	}
+
+	// And the proxy attack specifically: the token must not become the named variable's value.
+	const viaEnv = resolveConfig({}, { 'renderNow.valueEnv': 'CONFIG_LAYERS_PROBE' });
+	assert.equal(viaEnv.config.renderNow.token, '', 'a refused valueEnv must not source the token');
+
+	delete process.env.CONFIG_LAYERS_PROBE;
 });
 
 test('a configured secret appears nowhere by value in the serialized layers view', () => {

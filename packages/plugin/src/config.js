@@ -27,6 +27,7 @@ import {
 	secretPaths,
 	walkOptions,
 	schemaNodeAt,
+	checkUiEditable,
 	isOption,
 	SECOND,
 	MINUTE,
@@ -370,6 +371,22 @@ const overridesToNested = (overrides) => {
 			warn(
 				`[prerender] Ignoring stored override ${rawPath}: not an option in this release — it is a row left ` +
 					`behind by an option that was renamed or removed, and it is doing nothing. Clear it from the console.`
+			);
+			continue;
+		}
+
+		// THE SAME REFUSAL AT APPLY AS AT THE DOOR. `checkUiEditable` gates the management API, but the
+		// table is also reachable through the operations API — the break-glass path the schema comment
+		// advertises — and a row written that way was being merged. That is not a theoretical gap: a row
+		// for `management.enabled: false` disabled the management API on every node, and the console
+		// could not undo it because undoing it goes through the API it just switched off. A secret is
+		// the same shape of problem, one layer down. Anything the console may not write, the merge will
+		// not honour, whatever route the row arrived by.
+		const editable = checkUiEditable(path);
+		if (!editable.ok) {
+			warn(
+				`[prerender] Ignoring stored override ${rawPath}: ${editable.reason}. A row for this option is ` +
+					`only settable in config.yaml, so it is being ignored rather than applied.`
 			);
 			continue;
 		}

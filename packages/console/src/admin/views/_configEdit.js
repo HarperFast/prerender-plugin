@@ -202,18 +202,36 @@ export function settingsCard(ctx, { title, prefix, paths, description, head = []
  * operator applies a write they no longer want.
  */
 function stage(ctx, path, value) {
+	// A control reports `null` while its text is not yet a value — JSON mid-keystroke, a number field
+	// the operator has just emptied. That is not an edit. Staging it would queue a write of something
+	// nobody has finished expressing, and for the structured options it would replace a route list
+	// with nothing.
+	if (value === null) return;
+
 	const state = configState(ctx);
 	const option = optionIndex(state.payload).get(path);
 	const unchanged = JSON.stringify(value) === JSON.stringify(option?.effective);
 
+	const wasStaged = Object.hasOwn(state.staged, path);
 	if (unchanged) delete state.staged[path];
 	else state.staged[path] = value;
 	delete state.invalid[path];
 
-	// A control re-rendered from scratch on every keystroke would lose the caret, so only the tray
-	// (whose count and buttons changed) is redrawn — the control already holds the value the
-	// operator typed.
-	ctx.render();
+	// Editing a path cancels a pending revert of the SAME path. Otherwise the write carries it in
+	// both `set` and `clear`, which the server refuses outright — and the refusal names a conflict
+	// the operator cannot see, because the row shows the staged edit and nothing shows the clear.
+	const hadClear = Object.hasOwn(state.cleared, path);
+	delete state.cleared[path];
+
+	// Re-render only when the CHANGESET changed — a path entering or leaving it, or a clear being
+	// cancelled. Rendering is a full rebuild of #app, so redrawing on every keystroke tears the
+	// control out from under the cursor and the operator loses focus after one character. When a
+	// path is already staged and only its value moved, nothing on screen is stale: the control holds
+	// what was typed and the tray's count is unchanged.
+	const changed = wasStaged !== Object.hasOwn(state.staged, path) || hadClear;
+	// A stale success banner sitting above a fresh edit reads as though this edit was applied.
+	if (changed && state.applied) state.applied = null;
+	if (changed) ctx.render();
 }
 
 /** Clearing an override is a write, so it goes through the same preview-then-apply path. */
@@ -289,13 +307,33 @@ export function editTray(ctx) {
 /** The banner shown after an apply, explaining why a value may still read as the old one. */
 export function appliedNote(ctx) {
 	const state = configState(ctx);
-	if (!state.applied) return null;
-	const seconds = Math.round((state.applied.appliesRemotelyWithinMs ?? 30000) / 1000);
+	const applied = state.applied;
+	if (!applied) return null;
+
+	// `servedBy` is on the proxy's `sources` envelope, not at the top level — the plugin answers with
+	// its own `node`, and only the console knows which upstream it chose under cluster scope. Reading
+	// the wrong one silently dropped the node name from every banner.
+	const by = applied.sources?.servedBy ?? applied.node;
+	const withinMs = applied.appliesRemotelyWithinMs;
+	const convergence =
+		Number.isFinite(withinMs) && withinMs > 0
+			? `every node converges in about a second — or within ${Math.round(withinMs / 1000)}s if a node's override subscription is not live`
+			: `every node with a live override subscription converges in about a second. The backstop re-read is disabled, so a node whose subscription is not live will not pick this up`;
+
 	return note('ok', [
 		el('strong', { text: 'Applied. ' }),
-		`${state.applied.servedBy ? `${state.applied.servedBy} took the write; ` : ''}` +
-			`the rows replicate, so every node converges in about a second — or within ${seconds}s if a node's ` +
-			`override subscription is not live. A value that still reads as the old one here is a node that has ` +
-			`not caught up yet, not a write that failed.`,
+		`${by ? `${by} took the write; ` : ''}the rows replicate, so ${convergence}. A value that still reads ` +
+			`as the old one here is a node that has not caught up yet, not a write that failed.`,
+		spacer(),
+		// Dismissable, and cleared by the next edit. Without either it sat on six views for the rest of
+		// the session, so the second edit an operator makes is announced as already applied.
+		el('button', {
+			cls: 'link',
+			text: 'dismiss',
+			onclick: () => {
+				state.applied = null;
+				ctx.render();
+			},
+		}),
 	]);
 }

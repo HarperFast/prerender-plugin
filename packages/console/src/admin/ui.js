@@ -24,7 +24,13 @@ export function el(tag, props, children) {
 			else if (key === 'cls') node.className = value;
 			else if (key === 'style') Object.assign(node.style, value);
 			else if (key.startsWith('on')) node.addEventListener(key.slice(2).toLowerCase(), value);
-			else node.setAttribute(key, value === true ? '' : value);
+			// `false` is dropped, exactly like null/undefined, because every attribute this console sets
+			// conditionally is a BOOLEAN attribute — disabled, checked, selected, autofocus — and HTML
+			// treats those as true whenever the attribute is PRESENT, whatever its value. Setting
+			// `disabled="false"` disables the button. `disabled: ctx.busy` is written throughout this
+			// client, so with `busy` false — which is almost always — Refresh, Clear, Pause, Preview and
+			// Apply were all permanently unclickable.
+			else if (value !== false) node.setAttribute(key, value === true ? '' : value);
 		}
 	}
 	append(node, children);
@@ -471,7 +477,18 @@ export function control(opt, value, onChange, { invalid = false } = {}) {
 				)
 			);
 		}
-		const numeric = Array.isArray(opt.default) && opt.default.every((entry) => typeof entry === 'number');
+		// Structured entries get a JSON editor: joining objects with newlines renders `[object Object]`,
+		// and parsing that back destroys the option. `ingress.routes` is ORDERED (first match wins), so
+		// the editor has to preserve order, which text does naturally.
+		if (opt.itemType === 'object' || (opt.default ?? []).some((entry) => entry && typeof entry === 'object')) {
+			return jsonEditor(value, { onChange, invalid });
+		}
+
+		// `.every()` on an EMPTY array is true, so inferring "numeric" from the default alone made every
+		// option defaulting to `[]` a number list — typing a hostname into `domains` stored `[null]`
+		// cluster-wide. A list is numeric only if something actually says so.
+		const sample = [opt.default, value].flat().filter((entry) => entry !== undefined && entry !== null);
+		const numeric = sample.length > 0 && sample.every((entry) => typeof entry === 'number');
 		return listEditor(value, { numeric, placeholder: 'one per line', onChange, invalid });
 	}
 
@@ -481,6 +498,41 @@ export function control(opt, value, onChange, { invalid = false } = {}) {
 		value: value ?? '',
 		oninput: (e) => onChange(e.target.value),
 	});
+}
+
+/**
+ * An ordered list of STRUCTURED entries, edited as JSON.
+ *
+ * The two options that need this — `ingress.routes` and `analytics.bots` — are arrays of objects
+ * whose item shape the schema does not describe, so there is nothing to build a form from. JSON is
+ * the honest control: it shows exactly what is stored, it preserves order (which `ingress.routes`
+ * depends on entirely — first match wins), and unparseable text reports itself instead of silently
+ * becoming a different value.
+ *
+ * It reports `null` while the text does not parse, which the caller treats as "not stageable" rather
+ * than as a value. Half-typed JSON must never reach the staged set.
+ */
+export function jsonEditor(value, { onChange, invalid = false } = {}) {
+	const status = el('div', { cls: 'muted mono json-status' });
+	const area = el('textarea', {
+		cls: `list-editor${invalid ? ' invalid' : ''}`,
+		rows: '10',
+		spellcheck: 'false',
+		oninput: (event) => {
+			try {
+				const parsed = JSON.parse(event.target.value);
+				if (!Array.isArray(parsed)) throw new Error('expected a list');
+				status.textContent = `${parsed.length} entr${parsed.length === 1 ? 'y' : 'ies'}`;
+				onChange?.(parsed);
+			} catch (e) {
+				status.textContent = `not valid JSON — ${e.message}`;
+				onChange?.(null);
+			}
+		},
+	});
+	area.value = JSON.stringify(value ?? [], null, 2);
+	status.textContent = `${(value ?? []).length} entr${(value ?? []).length === 1 ? 'y' : 'ies'}`;
+	return el('div', null, [area, status]);
 }
 
 /** Render any config value for display. Objects and arrays are shown as compact JSON. */
@@ -573,6 +625,27 @@ export function stagedTray({ count, invalid, preview, busy, onPreview, onApply, 
 	]);
 }
 
+/**
+ * How long the cluster takes to agree, stated honestly for both cases.
+ *
+ * 0 is not "instant" — it means `management.overrides.syncInterval` is 0, so the backstop re-read is
+ * disabled and the subscription is the ONLY path. That is a materially different promise, because a
+ * node whose subscription is not live then never converges at all. Rendering it as "within 0s", or
+ * defaulting it to 30, would both misstate the one thing this sentence exists to say.
+ */
+const convergenceNote = (withinMs) => {
+	const base = 'One node takes the write and the rows replicate, so every node converges in about a second';
+	if (!Number.isFinite(withinMs)) return null;
+	return el('p', {
+		cls: 'muted chart-note',
+		text:
+			withinMs > 0
+				? `${base} — or within ${Math.round(withinMs / 1000)}s if a node's subscription is not live.`
+				: `${base}. The backstop re-read is disabled (management.overrides.syncInterval is 0), so a node ` +
+					`whose subscription is not live will NOT pick this up at all.`,
+	});
+};
+
 const previewBody = (preview, { busy, onApply }) => {
 	if (preview.error) return el('div', { cls: 'note bad', text: preview.error });
 
@@ -614,14 +687,7 @@ const previewBody = (preview, { busy, onApply }) => {
 				warning.message,
 			])
 		),
-		preview.appliesRemotelyWithinMs
-			? el('p', {
-					cls: 'muted chart-note',
-					text:
-						`One node takes the write and the rows replicate; every node converges in about a second, ` +
-						`or within ${Math.round(preview.appliesRemotelyWithinMs / 1000)}s if a node's subscription is not live.`,
-				})
-			: null,
+		convergenceNote(preview.appliesRemotelyWithinMs),
 		el('div', { cls: 'toolbar' }, [
 			spacer(),
 			el('button', { cls: 'danger', text: 'Apply to the cluster', disabled: busy, onclick: onApply }),

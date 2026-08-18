@@ -7,10 +7,35 @@
  * value typed back to the running one must unstage rather than queue a pointless write).
  */
 
-import { test } from 'node:test';
+import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { configState, optionIndex, pathsUnder } from '../src/admin/views/_configEdit.js';
+import { configState, discardEdit, optionIndex, pathsUnder, settingsCard } from '../src/admin/views/_configEdit.js';
+import { installDom, find } from './domShim.js';
+
+installDom();
+
+// The unwritten edit is module state ON PURPOSE — it has to outlive a node-scope switch — which
+// means it also outlives a test. `discardEdit` is the same hook the shell calls when a session ends.
+beforeEach(discardEdit);
+
+/**
+ * Stage through the real control, not by poking the object: `stage()` is module-private on purpose,
+ * and reaching past the control would test a code path the UI never takes.
+ */
+function stageFor(ctx, path, value) {
+	const card = settingsCard(ctx, { title: 'probe', paths: [path] });
+	const input = find(card, (n) => n.tagName === 'INPUT' || n.tagName === 'SELECT' || n.tagName === 'TEXTAREA');
+	// queue.* options are `unit: 'ms'` durations: the amount input is the first field, and its unit
+	// select follows, so a raw millisecond value is set by switching to ms first.
+	const unit = find(card, (n) => n.tagName === 'SELECT');
+	if (unit) {
+		unit.value = 'ms';
+		unit.fire('change');
+	}
+	input.value = String(value);
+	input.fire('input', { target: input });
+}
 
 // The shell's contract, reduced to what this module touches: per-view scratch keyed by view id,
 // which app.js REPLACES wholesale when the node scope changes.
@@ -130,4 +155,46 @@ test('pathsUnder matches a whole group and also a leaf option named exactly by i
 test('an empty payload yields an empty index rather than throwing', () => {
 	assert.equal(optionIndex(null).size, 0);
 	assert.equal(optionIndex({}).size, 0);
+});
+
+test('editing a path cancels a pending revert of that path, so a write never carries it in both set and clear', () => {
+	const shell = makeShell(PAYLOAD);
+	const state = configState(shell.ctx);
+	state.cleared['queue.jobLeaseTime'] = true;
+
+	// Restaging the same path must retract the clear. The server refuses a request naming a path in
+	// both lists, and the refusal describes a conflict the operator cannot see on screen.
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 300000);
+
+	assert.equal(configState(shell.ctx).staged['queue.jobLeaseTime'], 300000);
+	assert.equal(Object.hasOwn(configState(shell.ctx).cleared, 'queue.jobLeaseTime'), false);
+});
+
+test('typing into an already-staged option does not re-render, so the caret survives', () => {
+	// Rendering is a full rebuild of #app: redrawing on every keystroke tears the input out from
+	// under the cursor and focus is lost after one character.
+	const shell = makeShell(PAYLOAD);
+	let renders = 0;
+	shell.ctx.render = () => renders++;
+
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 300000);
+	const afterFirst = renders;
+	assert.equal(afterFirst, 1, 'the first keystroke adds a row to the changeset, which the tray must show');
+
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 300001);
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 300002);
+	assert.equal(renders, afterFirst, 'subsequent keystrokes change no membership and must not redraw');
+
+	// Returning the value to what the cluster runs REMOVES it from the changeset, which is a
+	// membership change and must redraw.
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 120000);
+	assert.equal(renders, afterFirst + 1);
+	assert.equal(Object.hasOwn(configState(shell.ctx).staged, 'queue.jobLeaseTime'), false);
+});
+
+test('a fresh edit clears the "Applied" banner, so it never sits above a change it did not apply', () => {
+	const shell = makeShell(PAYLOAD);
+	configState(shell.ctx).applied = { node: 'a' };
+	stageFor(shell.ctx, 'queue.jobLeaseTime', 300000);
+	assert.equal(configState(shell.ctx).applied, null);
 });
