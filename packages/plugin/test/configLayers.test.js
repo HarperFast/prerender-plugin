@@ -333,3 +333,60 @@ test('activeOverrides and hostOptions hand back copies, not the live layers', ()
 	assert.deepEqual(activeOverrides(), { 'page.ttl': 7000 });
 	assert.equal(config.page.ttl, 7000);
 });
+
+// ---- hostile override rows ---------------------------------------------------------------------
+//
+// These rows cannot be created through the management API — `checkUiEditable` refuses them — so they
+// arrive only from a direct table write (the operations-socket escape hatch) or from a future code
+// path. They are pinned anyway because the failure they used to cause was not a bad value, it was a
+// THROW out of applyOptions, out of handleApplication, and into `lifecycle.failed` on every worker
+// of every node. A replicated table plus a fatal parse is a cluster-wide outage from one row.
+
+test('a prototype-chain key stored as an override path is ignored, not fatal, and leaves the file value running', () => {
+	for (const path of ['__proto__', 'constructor', 'queue.__proto__.injected', 'constructor.prototype.x']) {
+		const overrides = {};
+		Object.defineProperty(overrides, path, { value: 'PWNED', enumerable: true, configurable: true });
+
+		assert.doesNotThrow(
+			() => applyOptions({ queue: { jobLeaseTime: 15 * MINUTE } }, overrides),
+			`an override row keyed "${path}" must never throw — a throw here fails component load`
+		);
+		assert.equal(config.queue.jobLeaseTime, 15 * MINUTE, `"${path}" must leave the deployed configuration untouched`);
+	}
+});
+
+test('Object.prototype is never mutated by an override path or value', () => {
+	const probe = () => ({}).injected;
+	assert.equal(probe(), undefined, 'precondition: nothing is polluted yet');
+
+	applyOptions({}, { '__proto__.injected': 'PWNED', 'constructor.prototype.injected': 'PWNED' });
+	assert.equal(probe(), undefined, 'an override path must not reach Object.prototype');
+
+	// A VALUE carrying the key is the other half: `clone['__proto__'] = x` reassigns the clone's
+	// prototype rather than adding a key, so the entry would inherit fields it does not own.
+	applyOptions(
+		{},
+		{ 'ingress.routes': [JSON.parse('{"__proto__":{"mode":"passthrough"},"match":"prefix","path":"/x"}')] }
+	);
+	assert.equal(probe(), undefined, 'an override value must not reach Object.prototype');
+	assert.equal(
+		config.ingress.routes[0].mode,
+		undefined,
+		'a route entry must not inherit `mode` from an injected prototype — it would silently stop being prerendered'
+	);
+	assert.deepEqual(Object.keys(config.ingress.routes[0]).sort(), ['match', 'path']);
+});
+
+test('an alias lookup cannot be answered by the prototype chain', async () => {
+	// `aliases['__proto__']` used to return Object.prototype — truthy, and not a string — so the
+	// remapped "path" was an object and the schema walk threw on `.split`.
+	const { resolveConfig: resolve } = await import('../src/config.js');
+	const overrides = {};
+	Object.defineProperty(overrides, '__proto__', { value: 'x', enumerable: true, configurable: true });
+	const result = resolve({}, overrides);
+	assert.ok(result.config, 'resolution must complete');
+	assert.ok(
+		result.warnings.some((warning) => warning.includes('__proto__')),
+		'and must say the row was ignored rather than failing silently'
+	);
+});

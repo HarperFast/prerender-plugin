@@ -113,7 +113,14 @@ const deepClone = (value) => {
 	if (Array.isArray(value)) return value.map(deepClone);
 	if (isPlainObject(value)) {
 		const out = {};
-		for (const [key, inner] of Object.entries(value)) out[key] = deepClone(inner);
+		for (const [key, inner] of Object.entries(value)) {
+			// `out['__proto__'] = x` REASSIGNS the clone's prototype instead of adding a key, so a stored
+			// value carrying that key would silently give the clone inherited properties — an
+			// `ingress.routes` entry could arrive with no own `mode` and still read as passthrough,
+			// which is a route that stops being prerendered for a reason not visible in the row.
+			if (key === '__proto__') continue;
+			out[key] = deepClone(inner);
+		}
 		return out;
 	}
 	return value;
@@ -323,7 +330,14 @@ let lastOverrides = {};
  * `url.queryParams` belongs at `cacheKey.queryParams`, and only prefix matching gets there.
  */
 const remapOverridePath = (path, aliases) => {
-	if (aliases[path]) return aliases[path];
+	// `Object.hasOwn`, never a bare lookup. The alias map is a plain object, so `aliases['__proto__']`
+	// resolves to Object.prototype through the prototype chain — truthy, and NOT a string. Returning
+	// it made `schemaNodeAt` call `.split` on an object and throw, and that throw travelled out of
+	// applyOptions, out of handleApplication, and FAILED THE COMPONENT on every worker of every node.
+	// One row in a replicated table, written by anything that bypasses the API's own validation, and
+	// the cluster stops loading the plugin — the exact opposite of the fail-open property this layer
+	// is supposed to have.
+	if (Object.hasOwn(aliases, path)) return aliases[path];
 	for (const [oldPath, newPath] of Object.entries(aliases)) {
 		if (path.startsWith(`${oldPath}.`)) return newPath + path.slice(oldPath.length);
 	}

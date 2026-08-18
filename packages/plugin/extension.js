@@ -35,7 +35,24 @@ export async function handleApplication(scope) {
 	// BOTH LAYERS ON EVERY APPLY. `applyOptions` rebuilds the whole config from defaults each time,
 	// so applying one layer alone silently drops the other: a config.yaml edit would wipe every
 	// override until the next override change, and vice versa.
-	const apply = () => applyOptions(hostOptions(), overridesEnabledFor(hostOptions()) ? overrides : {});
+	// FAILING OPEN IS THE WHOLE CONTRACT, and it has to hold for a throw as well as for a read that
+	// times out. Component load is raced against a hard timeout and an exception here does not merely
+	// delay it — `handleApplication` rejecting marks the component failed on this worker, so a single
+	// unusable override row would take the plugin down across the cluster rather than degrade it. A
+	// deployment running its committed config.yaml with a loud warning is always the better outcome,
+	// so the override layer is dropped rather than allowed to be fatal.
+	const apply = () => {
+		try {
+			return applyOptions(hostOptions(), overridesEnabledFor(hostOptions()) ? overrides : {});
+		} catch (e) {
+			scope.logger.error(
+				`[prerender] Could not apply stored config overrides (${e.message}) — running the deployed ` +
+					`configuration without them. Fix or clear the offending row; the layer stays inert until then.`
+			);
+			overrides = {};
+			return applyOptions(hostOptions(), {});
+		}
+	};
 
 	// SUBSCRIBE BEFORE READING. A write that lands between the read and a later subscribe is seen by
 	// neither, and the resulting staleness would persist — invisibly — until the backstop poll. The

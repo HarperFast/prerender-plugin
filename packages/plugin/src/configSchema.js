@@ -1507,7 +1507,11 @@ export const checkUiEditable = (path) => {
 	let node = configSchema;
 	let editable = configSchema.uiEditable ?? true;
 	for (const segment of String(path ?? '').split('.')) {
-		if (!isGroup(node)) return { ok: false, reason: `${path} is not a configuration option` };
+		// Own-key check for the same reason as `schemaNodeAt`: `children['constructor']` is truthy and
+		// is not an option, and answering a refusal is only correct if the walk cannot be fooled.
+		if (!isGroup(node) || !Object.hasOwn(node.children, segment)) {
+			return { ok: false, reason: `${path} is not a configuration option` };
+		}
 		node = node.children[segment];
 		if (!node) return { ok: false, reason: `${path} is not a configuration option` };
 		if (node.uiEditable === false) editable = false;
@@ -1529,9 +1533,13 @@ export const checkUiEditable = (path) => {
 
 /** Look up the schema node (option or group) at a dotted path, or undefined. */
 export const schemaNodeAt = (path) => {
+	// Coerced and own-key-checked because callers feed this paths that came from a database row. A
+	// bare `children[segment]` lookup answers `__proto__` and `constructor` from the prototype chain
+	// — truthy values that are not schema nodes — and a non-string path would throw on `.split`.
+	// Anything that is not an actual declared node is simply not an option.
 	let node = configSchema;
-	for (const segment of path.split('.')) {
-		if (!isGroup(node)) return undefined;
+	for (const segment of String(path ?? '').split('.')) {
+		if (!isGroup(node) || !Object.hasOwn(node.children, segment)) return undefined;
 		node = node.children[segment];
 		if (!node) return undefined;
 	}
