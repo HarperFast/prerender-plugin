@@ -77,7 +77,7 @@ import {
 	activeOverrides,
 	hostOptions,
 } from '../config.js';
-import { describeConfigSchema } from '../configSchema.js';
+import { describeConfigSchema, secretPaths } from '../configSchema.js';
 import { describeMetrics } from '../metrics.js';
 import { redactConfig, describeSecret } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
@@ -208,6 +208,11 @@ const describeScheduleRow = (row, now) => {
 		belowClaimFloor: due && floor.floorMinute > 0 && minuteOf(at) < floor.floorMinute,
 	};
 };
+
+// Dotted paths whose stored value must never be echoed, whatever route the row arrived by. Taken
+// from the schema rather than listed here, so an option that becomes secret later is covered by the
+// declaration that made it secret.
+const secretOverridePaths = new Set(secretPaths());
 
 const noStore = (extra = {}) => ({ 'cache-control': 'no-store', ...extra });
 
@@ -535,7 +540,15 @@ export class PrerenderAdmin extends Resource {
 				// the thing it switches off is not a switch. False means the rows below are stored
 				// and inert, which is a different state from "nobody has set anything".
 				enabled: config.management.overrides.enabled,
-				rows: overrides.rows,
+				// REDACTED, like every other view of a value in this response. A row for a secret cannot
+				// be created through this API and is no longer honoured by the merge, but it can still
+				// EXIST — the operations API is the documented break-glass path — and passing `value`
+				// through raw disclosed it in cleartext beside the same value redacted in `layers`.
+				// The console renders these rows into a table, so it is the config page an operator
+				// screenshots.
+				rows: overrides.rows.map((row) =>
+					secretOverridePaths.has(row.path) ? { ...row, value: describeSecret(row.value) } : row
+				),
 				// Read failures fail open (the deployed config.yaml keeps running), so an empty list
 				// with `degraded` set must never be rendered as "no overrides".
 				degraded: overrides.degraded,
