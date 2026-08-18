@@ -8,22 +8,81 @@
  * showing a rejected override as though it were in force. This module is the one implementation
  * of all three; a view supplies a title and a set of option paths and gets the rest.
  *
- * ONE FETCH, ONE STAGING AREA, SHARED ACROSS VIEWS. The payload is per-view scratch everywhere
- * else in this console, but config is a single document: staging `queue.jobLeaseTime` under Queue
- * and `sitemap.refreshTime` under Sitemaps has to produce ONE preview and ONE write, or an
- * operator making a coherent change to two related options gets two half-applied ones. So the
- * staged set and the loaded config live in the `config` view's scratch and every surface reaches
- * into it (`ctx.scratch('config')`).
+ * ONE FETCH, ONE STAGING AREA, SHARED ACROSS VIEWS. Everything else in this console keeps its data
+ * in per-view scratch, but config is a single document: staging `queue.jobLeaseTime` under Queue and
+ * `sitemap.refreshTime` under Sitemaps has to produce ONE preview and ONE write, or an operator
+ * making a coherent change to two related options gets two half-applied ones. So both live in the
+ * `config` scratch that every surface reaches into — except the unwritten edit itself, which is not
+ * scoped to a node at all and is held at module scope for the reason given below.
  */
 
 import { card, el, muted, note, settingRow, spacer, stagedTray } from '../ui.js';
 
-/** The scratch every config surface shares, whichever view is on screen. */
+/**
+ * The unwritten edit, held OUTSIDE per-view scratch.
+ *
+ * The shell drops every view's scratch when the node scope changes (app.js, the node picker's
+ * onchange), and it is right to: data fetched from node A must never render under node B's name.
+ * A staged edit is not that kind of data. An override applies to the WHOLE CLUSTER — the rows
+ * replicate — so it is scope-independent, and letting the scope switch discard it means an operator
+ * who stages five changes, flips to another node to check something, and flips back finds their
+ * work silently gone. Losing an unwritten intent without saying so is the one thing a form must
+ * never do, so it lives here, at module scope, for the life of the page.
+ */
+const edit = { staged: {}, cleared: {}, invalid: {} };
+
+/**
+ * The config surface's state: the unwritten edit (session-scoped, above) joined to the payload and
+ * the server's preview (node-scoped, and therefore correctly dropped on a scope change).
+ */
 export const configState = (ctx) => {
-	const state = ctx.scratch('config');
-	state.staged ??= {};
-	state.invalid ??= {};
-	return state;
+	const scratch = ctx.scratch('config');
+	return {
+		get payload() {
+			return scratch.payload;
+		},
+		set payload(value) {
+			scratch.payload = value;
+		},
+		get error() {
+			return scratch.error;
+		},
+		set error(value) {
+			scratch.error = value;
+		},
+		// A preview is one node's answer about a prospective config, so it belongs to the scope it was
+		// computed under and must not survive a switch — unlike the edit that produced it.
+		get preview() {
+			return scratch.preview;
+		},
+		set preview(value) {
+			scratch.preview = value;
+		},
+		get applied() {
+			return scratch.applied;
+		},
+		set applied(value) {
+			scratch.applied = value;
+		},
+		get staged() {
+			return edit.staged;
+		},
+		set staged(value) {
+			edit.staged = value;
+		},
+		get cleared() {
+			return edit.cleared;
+		},
+		set cleared(value) {
+			edit.cleared = value;
+		},
+		get invalid() {
+			return edit.invalid;
+		},
+		set invalid(value) {
+			edit.invalid = value;
+		},
+	};
 };
 
 /**
@@ -35,6 +94,8 @@ export const configState = (ctx) => {
  */
 export async function loadConfig(ctx, { force = false } = {}) {
 	const state = configState(ctx);
+	// The cached payload is per scope, so a scope switch always re-fetches — which is the point of
+	// leaving it in scratch while the staged edit sits outside.
 	if (state.payload && !force) return state.payload;
 
 	const res = await ctx.get('config');
@@ -143,7 +204,6 @@ function stage(ctx, path, value) {
 /** Clearing an override is a write, so it goes through the same preview-then-apply path. */
 function revert(ctx, path) {
 	const state = configState(ctx);
-	state.cleared ??= {};
 	state.cleared[path] = true;
 	delete state.staged[path];
 	ctx.render();

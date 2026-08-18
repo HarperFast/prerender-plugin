@@ -400,57 +400,39 @@ function nodeSummary(ctx, data) {
  * line, not a queryable record), so that part stays declared rather than faked: the panel
  * never shows a URL it cannot actually know.
  */
+/**
+ * Render outcomes, demoted to one line.
+ *
+ * This used to be a full card breaking outcomes down by kind. Queue already renders the same
+ * `render` metric as KPIs AND as a stacked series over time, so the card was a strict subset of a
+ * better panel one click away — and a dashboard that restates another page's numbers teaches
+ * operators that the overview is where you look, which is exactly wrong when the detail (which
+ * outcome, trending which way) only exists on the other page.
+ *
+ * What survives is the part an overview owes you: whether the number is bad enough to go and look.
+ * The threshold matches Queue's own (one in ten past tail noise for any healthy corpus), so the two
+ * pages cannot disagree about whether this is fine.
+ */
 function failures(ctx) {
 	const data = ctx.data.analytics;
-	const openQueue = link('open queue →', () => ctx.go('queue'));
-	const title = `Render outcomes — ${scopeLabel(data)}, last hour`;
-
-	if (!data || data.available === false || windowEmpty(data)) {
-		return card(title, {
-			head: [spacer(), openQueue],
-			body: [emptyNote('render', data)],
-		});
-	}
-
-	// Pill severity mirrors the chart colors: rendered good, hard failures bad, retried warn,
-	// verdicts (suppressed/redirect) neutral — they are outcomes, not faults.
-	const outcomeKind = (outcome) =>
-		outcome === 'rendered'
-			? 'ok'
-			: outcome === 'failed' || outcome === 'auth-failure'
-				? 'bad'
-				: outcome === 'transient'
-					? 'warn'
-					: '';
+	const open = link('open queue \u2192', () => ctx.go('queue'));
+	if (!data || data.available === false || windowEmpty(data)) return null;
 
 	const outcomes = pick(data, 'render', (s) => s.path === 'outcome');
 	const total = sumCount(outcomes);
-	// A plain object, not a Map: the asset test pins `get('…')` literals as API routes, and
-	// outcome names are a closed set from the metric catalog, so untrusted-key traps don't apply.
+	if (total === 0) return null;
+
 	const byOutcome = {};
 	for (const s of outcomes) byOutcome[s.method] = (byOutcome[s.method] ?? 0) + s.count;
 	const bad = (byOutcome['failed'] ?? 0) + (byOutcome['auth-failure'] ?? 0);
+	const rate = bad / total;
 
-	return card(title, {
-		head: [spacer(), openQueue],
-		body: [
-			total === 0
-				? el('div', {
-						cls: 'note',
-						text: `No render results were processed on ${isMerged(data) ? 'any node' : 'this node'} in the window.`,
-					})
-				: kv(
-						Object.entries(byOutcome)
-							.sort((a, b) => b[1] - a[1])
-							.map(([outcome, count]) => [outcome, pill(`${num(count)} · ${pct(count, total)}`, outcomeKind(outcome))])
-					),
-			bad > 0 &&
-				el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-					'WHICH urls are failing is not recorded anywhere queryable yet (a failure leaves a log ',
-					'line only) — grep the node log for "processJobResult" until a failure record exists.',
-				]),
-		],
-	});
+	return el('div', { cls: `note ${rate > 0.1 ? 'bad' : ''}`.trim() }, [
+		el('strong', { text: `Render outcomes \u00b7 ${scopeLabel(data)}, last hour: ` }),
+		`${num(bad)} of ${num(total)} failed or auth-failed (${pct(bad, total)})`,
+		rate > 0.1 ? ' \u2014 past tail noise for a healthy corpus. ' : '. ',
+		open,
+	]);
 }
 
 // A target whose RenderSchedule row is missing renders nothing, forever, with no error to

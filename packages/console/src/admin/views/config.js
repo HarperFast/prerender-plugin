@@ -37,6 +37,7 @@ import {
 	el,
 	formatValue,
 	highlight,
+	duration,
 	icon,
 	ICONS,
 	kv,
@@ -44,6 +45,7 @@ import {
 	mono,
 	muted,
 	note,
+	num,
 	originPill,
 	pill,
 	spacer,
@@ -132,7 +134,10 @@ const FILTERS = [
 export async function load(ctx) {
 	// ALWAYS force. A domain view may have filled this scratch minutes ago, and the one page that
 	// reports whether the cluster agrees with itself must never answer from a cache of its own.
-	await loadConfig(ctx, { force: true });
+	const [, unroutedRes] = await Promise.all([loadConfig(ctx, { force: true }), ctx.get('unrouted')]);
+	// Best-effort: the unrouted tally argues for a routing change, it does not gate the config
+	// index. A node that cannot answer it must not take the whole page down with it.
+	ctx.data.unrouted = unroutedRes.ok ? unroutedRes.body : null;
 }
 
 export function render(ctx) {
@@ -527,6 +532,81 @@ function blurb(data, prefix) {
 	return String(node.description ?? '').split('\n\n')[0] || null;
 }
 
+/**
+ * Bot traffic served without prerendering, bucketed by first path segment. Either the CDN is
+ * over-forwarding or the route list is incomplete — both are fixed per prefix, which is why the
+ * report is bucketed the way a CDN rule or an ingress route is written.
+ *
+ * IT RENDERS DIRECTLY ABOVE THE `ingress` EDITOR, and that adjacency is the point. This report
+ * exists for exactly one purpose: to tell an operator what to add to `ingress.routes`. It used to
+ * live on Sitemaps, where it was an orphan — nothing on that page acts on it, and the setting it
+ * argues about was in a different tab, behind a YAML file in another repo. Reading a prefix here
+ * and adding the route for it is now one screen.
+ */
+function unroutedCard(ctx) {
+	const data = ctx.data.unrouted;
+	if (!data) return null;
+
+	const rows = (routeClass) =>
+		(data.report?.[routeClass] ?? []).map((row) =>
+			el('tr', null, [
+				el('td', { cls: 'mono', text: row.bucket }),
+				el('td', null, [pill(routeClass, routeClass === 'unclassified' ? 'warn' : '')]),
+				el('td', { cls: 'mono right', text: num(row.count) }),
+				el('td', {
+					cls: 'mono muted truncate',
+					style: { maxWidth: '300px' },
+					title: row.samplePath,
+					text: row.samplePath,
+				}),
+				el('td', { cls: 'right' }, [
+					link('explain →', () => ctx.go('explain', { input: { url: row.samplePath, deviceType: '' }, result: null })),
+				]),
+			])
+		);
+
+	return assembleUnrouted(data, [...rows('unclassified'), ...rows('passthrough')]);
+}
+
+// Assembled explicitly so the table sits between head and foot.
+function assembleUnrouted(data, all) {
+	return el('div', { cls: 'card' }, [
+		el('div', { cls: 'card-head' }, [
+			el('div', { cls: 'title', text: 'Served without prerendering' }),
+			spacer(),
+			el('span', {
+				cls: 'muted mono',
+				text: data.workers
+					? `one worker on each of ${data.workers} nodes · since their last flush (every ${duration(data.interval)})`
+					: `worker ${data.workerIndex} on ${data.node} · since its last flush (every ${duration(data.interval)})`,
+			}),
+		]),
+		el('div', { cls: 'card-body' }, [
+			all.length === 0
+				? el('div', {
+						cls: 'note ok',
+						text: data.workers
+							? `No unrouted traffic on the ${data.workers} sampled workers since their last flush.`
+							: 'This worker has served nothing unrouted since its last flush.',
+					})
+				: null,
+			el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
+				'Counters are per-worker and reset on every flush, so this is a SAMPLE — one worker per node, ' +
+					'not a cluster total. It answers “is anything hitting a route we don’t classify”, never ' +
+					'“how much”. unclassified = the CDN forwarded a path no route declares; passthrough = ' +
+					'declared, deliberately proxied live.',
+			]),
+		]),
+		all.length > 0 &&
+			table(['path bucket', 'class', { text: 'requests', right: true }, 'sample', { text: '', right: true }], all),
+		data.report?.overflowed
+			? el('div', { cls: 'card-foot' }, [
+					`${num(data.report.overflowed)} request(s) fell outside the bucket cap and are not broken down above.`,
+				])
+			: null,
+	]);
+}
+
 /** No search, no filter: the groups this view owns, plus a pointer to where the rest are. */
 function browse(ctx, data, options) {
 	const owned = new Set(OWN_GROUPS);
@@ -534,10 +614,16 @@ function browse(ctx, data, options) {
 	// group added to the schema upstream cannot end up with no page in the console at all.
 	const unclaimed = groupsOf(options.keys()).filter((prefix) => !owned.has(prefix) && !ELSEWHERE[prefix]);
 
+	// A group may be preceded by the panel that argues for changing it. `ingress` is the only one so
+	// far, and it is the clearest case in the whole config: the unrouted tally is a list of prefixes
+	// nobody has written a route for.
+	const EVIDENCE = { ingress: unroutedCard };
+
 	return [
-		...[...OWN_GROUPS, ...unclaimed].map((prefix) =>
-			settingsCard(ctx, { title: TITLES[prefix] ?? prefix, prefix, description: blurb(data, prefix) })
-		),
+		...[...OWN_GROUPS, ...unclaimed].flatMap((prefix) => [
+			EVIDENCE[prefix]?.(ctx) ?? null,
+			settingsCard(ctx, { title: TITLES[prefix] ?? prefix, prefix, description: blurb(data, prefix) }),
+		]),
 		elsewhere(ctx, options),
 	];
 }
