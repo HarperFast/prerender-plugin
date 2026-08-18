@@ -45,6 +45,7 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'traffic', label: 'Traffic', crumb: 'traffic', icon: ICONS.traffic };
 
@@ -57,7 +58,9 @@ const RANGES = [
 
 export async function load(ctx) {
 	ctx.data.rangeMs ??= 3_600_000;
-	const res = await ctx.get('analytics', { range: ctx.data.rangeMs });
+	// Concurrent because the two are unrelated: the config read is usually already satisfied from
+	// the shared scratch, and when it is not it must still not add a round trip to the range switch.
+	const [res] = await Promise.all([ctx.get('analytics', { range: ctx.data.rangeMs }), loadConfig(ctx)]);
 	ctx.data.analytics = res.ok ? res.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load analytics (${res.status})`);
 }
@@ -75,17 +78,30 @@ export function render(ctx) {
 		el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
 	]);
 
-	if (!data) return [head, el('div', { cls: 'note bad', text: ctx.data.error ?? 'No analytics data.' })];
-	if (data.available === false) return [head, el('div', { cls: 'note bad', text: data.error })];
+	// The settings ride along on the EMPTY exits too, not just the charted one. `analytics.enabled`
+	// is the likeliest reason this view has nothing to show, so the card that flips it belongs on
+	// the screen reporting the emptiness rather than a view away.
+	const knobs = [...settings(ctx), editTray(ctx)];
+
+	if (!data)
+		return [
+			head,
+			appliedNote(ctx),
+			el('div', { cls: 'note bad', text: ctx.data.error ?? 'No analytics data.' }),
+			knobs,
+		];
+	if (data.available === false)
+		return [head, appliedNote(ctx), el('div', { cls: 'note bad', text: data.error }), knobs];
 
 	if (windowEmpty(data)) {
-		return [head, card('No traffic recorded', { body: [emptyNote('analytics', data)] })];
+		return [head, appliedNote(ctx), card('No traffic recorded', { body: [emptyNote('analytics', data)] }), knobs];
 	}
 
 	const serves = pick(data, 'bot_serve');
 
 	return [
 		head,
+		appliedNote(ctx),
 		kpis(data, serves),
 		el('div', { cls: 'cols' }, [freshness(data, serves), latency(data)]),
 		el('div', { cls: 'cols' }, [bots(serves, data), statusCodes(data)]),
@@ -93,6 +109,7 @@ export function render(ctx) {
 		routes(ctx, data),
 		breadth(ctx),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
+		knobs,
 	];
 }
 
@@ -426,3 +443,41 @@ function breadth(ctx) {
 
 	return card('Crawl breadth', { body });
 }
+
+// ---- settings ---------------------------------------------------------------
+//
+// Below the panels, because the reading comes first: an operator arrives with a number, and the
+// knob that produced it is the answer to "why is it that". Two of these groups decide what gets
+// RECORDED and one decides what this console may READ — a distinction the descriptions have to
+// carry, since a recording change leaves history intact and a read change leaves nothing at all.
+
+const settings = (ctx) => [
+	settingsCard(ctx, {
+		title: 'Analytics recording',
+		prefix: 'analytics',
+		description:
+			'What the plugin records for bot traffic, and under which names. Turning recording off empties ' +
+			'every panel above from the moment it takes effect — it does not delete rows already recorded, ' +
+			'and it changes nothing about what bots are served. The bot registry and deriveUnknownBots decide ' +
+			'the labels in Serves by bot: a crawler missing there is an unmatched User-Agent, not zero traffic.',
+	}),
+	settingsCard(ctx, {
+		title: 'Crawl-breadth sketches',
+		prefix: 'crawlStats',
+		description:
+			'The sketch behind Crawl breadth above; nothing else reads it. Recording is gated by analytics ' +
+			'recording as well as by this group — with no bot name there is nothing to attribute a sketch to. ' +
+			'precision changes the register space, so days already written at the old value stop merging with ' +
+			'new ones until the next UTC rollover (that panel says so when it happens), and retentionDays only ' +
+			'prunes stored sketches.',
+	}),
+	settingsCard(ctx, {
+		title: 'Analytics reads (this console)',
+		prefix: 'management.analytics',
+		description:
+			'What this console is allowed to scan for the panels above — the cost of looking, never what was ' +
+			'recorded. cacheTtl is why switching ranges back and forth does not multiply scans, maxRange bounds ' +
+			'the range picker, and scanCap sheds the OLDEST end of a window rather than failing; the scan footer ' +
+			'reports the window a refresh actually covered.',
+	}),
+];

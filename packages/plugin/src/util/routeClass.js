@@ -117,9 +117,9 @@ const compileEntry = (raw, source, warn) => {
  * string, and route matching is path-only. A pattern that only makes sense against a query
  * string is warned about rather than silently never matching.
  */
-const compileRoutes = (routes, excludePatterns) => {
+const compileRoutes = (routes, excludePatterns, collect = null) => {
 	const log = getLogger();
-	const warn = (message) => log.warn?.(`[prerender] ${message}`);
+	const warn = collect ? (message) => collect.push(message) : (message) => log.warn?.(`[prerender] ${message}`);
 	const compiled = [];
 	// Both loops push through this, so a `null` from `compileEntry` can never reach the
 	// compiled list. Not currently reachable from the exclude loop (the guard below leaves
@@ -166,6 +166,40 @@ const getRoutes = () => {
 	}
 	return compiled;
 };
+
+/**
+ * Compile a PROSPECTIVE `routes` / `excludePathPatterns` pair and report what it would produce,
+ * without touching the memo and without logging.
+ *
+ * This exists because an invalid route entry is DROPPED rather than rejected — `compileEntry`
+ * returns null for a bad `match`/`path`/`mode` and the entry simply is not there. From the
+ * outside that is indistinguishable from a route nobody wrote: the config still lists it, the
+ * plugin still starts, and the paths it was supposed to cover quietly stop being prerendered.
+ * A config editor that previewed such a change by echoing back what the operator typed would
+ * confirm a route that is about to vanish, so the preview compiles it here instead and reports
+ * the drop.
+ *
+ * @returns {{ total: number, prerender: number, passthrough: number, dropped: number, warnings: string[] }}
+ */
+export const inspectRoutes = (routes, excludePatterns) => {
+	const warnings = [];
+	const compiled = compileRoutes(routes, excludePatterns, warnings);
+	const declared = (Array.isArray(routes) ? routes.length : 0) + countUsableExcludes(excludePatterns);
+	return {
+		total: compiled.length,
+		prerender: compiled.filter((entry) => entry.mode === PRERENDER).length,
+		passthrough: compiled.filter((entry) => entry.mode === PASSTHROUGH).length,
+		dropped: Math.max(0, declared - compiled.length),
+		warnings,
+	};
+};
+
+// Mirrors the guard in compileRoutes' exclude loop, so `dropped` counts only entries the
+// compiler actually refused rather than blanks it never tried.
+const countUsableExcludes = (excludePatterns) =>
+	(Array.isArray(excludePatterns) ? excludePatterns : []).filter(
+		(pattern) => typeof pattern === 'string' && pattern !== ''
+	).length;
 
 /**
  * First matching compiled entry for `path`, or null. First match wins, so entries should be

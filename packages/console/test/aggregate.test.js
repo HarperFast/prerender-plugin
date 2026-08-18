@@ -9,6 +9,7 @@ import {
 	mergeOverview,
 	mergeUnrouted,
 	NODE_LOCAL_POST,
+	REPLICATED_POST_NOTE,
 	SHARED_NOTE,
 	sourcesOf,
 } from '../src/util/aggregate.js';
@@ -63,6 +64,23 @@ test('node-local POST routes are refused under cluster scope, and are real route
 	}
 	// `queue` must NOT be here: a control write is replicated intent and carries its own scope.
 	assert.equal('queue' in NODE_LOCAL_POST, false);
+});
+
+test('a replicated POST is routed to one node and says so, and is never also node-local', () => {
+	for (const [route, note] of Object.entries(REPLICATED_POST_NOTE)) {
+		assert.ok(PROXIED_POST.includes(route), `REPLICATED_POST_NOTE names "${route}", which the proxy does not forward`);
+		// The two maps are opposite verdicts on the same question. A route in both would be
+		// refused under cluster scope by one and given a "the whole cluster has it" envelope by
+		// the other, and which one won would depend on statement order.
+		assert.equal(route in NODE_LOCAL_POST, false, `"${route}" cannot be both node-local and replicated`);
+		assert.ok(note && note.length > 20, `"${route}" needs a reason an operator can read`);
+	}
+	// A config override is a row in a REPLICATED table. Fanning that write out would be N racing
+	// writes to the same rows, and a partial failure would report an error for a write that in fact
+	// succeeded and replicated — the report an operator acts on by writing it again.
+	assert.ok('config-override' in REPLICATED_POST_NOTE);
+	assert.equal('config-override' in NODE_LOCAL_POST, false, 'a cluster-scoped config edit must not be refused');
+	assert.ok(PROXIED_POST.includes('config-override'));
 });
 
 test('resolveScope: cluster is the default, a node is opt-in, anything else is refused', () => {
@@ -504,6 +522,160 @@ test('config: identical nodes report no divergence, and warnings are tagged by n
 		merged.body.warnings.map((w) => w.hostname),
 		['a.example.com:9926', 'b.example.com:9926']
 	);
+});
+
+// ---- the override layer: the second, benign reason nodes can disagree about config ----
+
+const overrideRow = (path, value, over = {}) => ({
+	path,
+	value,
+	updatedTime: 1_700_000_000_000,
+	updatedBy: 'operator',
+	note: null,
+	...over,
+});
+
+/** Per node and per worker, and the only place a node that stopped honouring edits shows up. */
+const watchState = (over = {}) => ({
+	enabled: true,
+	subscribed: true,
+	subscribeError: null,
+	syncInterval: 30_000,
+	lastReadAt: 1_700_000_000_000,
+	lastError: null,
+	...over,
+});
+
+const overrideBlock = (over = {}) => ({
+	enabled: true,
+	rows: [],
+	degraded: false,
+	truncated: false,
+	error: null,
+	watch: watchState(),
+	...over,
+});
+
+const configBody = (node, over = {}) => ({
+	config: { page: { swrTtl: 21_600_000 }, render: { defaultInterval: 86_400_000 } },
+	layers: [],
+	overrides: overrideBlock(),
+	warnings: [],
+	pendingRestart: [],
+	node,
+	workerIndex: 0,
+	...over,
+});
+
+test('config: an override still landing is tagged, so the deploy alarm keeps its meaning', () => {
+	// The write commits on one node and reaches the rest by replication, so for a second or so the
+	// cluster genuinely disagrees about that path. Unclassified, every config edit made from this
+	// console raises the alarm that means "a deploy skipped a node" — and an alarm that fires on
+	// its own console's normal operation stops being read.
+	const a = configBody('a', {
+		config: { page: { swrTtl: 3_600_000 }, render: { defaultInterval: 86_400_000 } },
+		layers: [{ path: 'page.swrTtl', overridden: true, source: 'override' }],
+		overrides: overrideBlock({ rows: [overrideRow('page.swrTtl', 3_600_000)] }),
+	});
+	const b = configBody('b', {
+		// Neither the row nor the applied value has reached b yet — and its render interval is a
+		// genuinely different deployed value.
+		config: { page: { swrTtl: 21_600_000 }, render: { defaultInterval: 3_600_000 } },
+		layers: [{ path: 'page.swrTtl', overridden: false, source: 'file' }],
+	});
+	const merged = mergeConfig([ok('a', a), ok('b', b)]);
+
+	const byPath = new Map(merged.body.divergences.map((d) => [d.path, d]));
+	assert.equal(byPath.size, 2);
+	assert.equal(byPath.get('page.swrTtl').overridden, true, 'the console just wrote this — it is converging');
+	assert.equal(
+		byPath.get('render.defaultInterval').overridden,
+		false,
+		'nobody overrode this one: it is still a deploy that did not reach every node'
+	);
+	assert.deepEqual(merged.body.overrides.rows[0].missingOn, ['b.example.com:9926'], 'names who is behind');
+});
+
+test('config: a CLEAR still in flight is read from the node that still applies it', () => {
+	// The row is already deleted, so the TABLE says nothing on any node. The only trace that this
+	// disagreement is the override layer converging — rather than a deploy that skipped a node —
+	// is that one node still carries the path in its APPLIED layer. Reading only the rows would
+	// misfile every clear as a failed deploy.
+	const a = configBody('a', {
+		config: { page: { swrTtl: 21_600_000 } },
+		layers: [{ path: 'page.swrTtl', overridden: false, source: 'file' }],
+	});
+	const b = configBody('b', {
+		config: { page: { swrTtl: 3_600_000 } },
+		layers: [{ path: 'page.swrTtl', overridden: true, source: 'override' }],
+	});
+	const merged = mergeConfig([ok('a', a), ok('b', b)]);
+
+	assert.equal(merged.body.divergences.length, 1);
+	assert.equal(merged.body.divergences[0].path, 'page.swrTtl');
+	assert.equal(merged.body.divergences[0].overridden, true);
+	assert.deepEqual(merged.body.overrides.rows, [], 'the row is gone from the table — that is the whole point');
+});
+
+test('config: the override layer unions the rows and never hides a node whose watch has died', () => {
+	const a = configBody('a', { overrides: overrideBlock({ rows: [overrideRow('page.swrTtl', 3_600_000)] }) });
+	const b = configBody('b', {
+		overrides: overrideBlock({
+			// The kill switch is off on THIS node only: it runs the deployed file while the console
+			// lists rows it believes are in force.
+			enabled: false,
+			rows: [overrideRow('page.swrTtl', 3_600_000), overrideRow('queue.jobLeaseTime', 90_000)],
+			degraded: true,
+			truncated: true,
+			error: 'ConfigOverride read timed out',
+			watch: watchState({ subscribed: false, subscribeError: 'subscribe failed', lastError: 'read timed out' }),
+		}),
+	});
+	const merged = mergeConfig([ok('a', a), ok('b', b)]);
+	const overrides = merged.body.overrides;
+
+	assert.deepEqual(
+		overrides.rows.map((row) => row.path),
+		['page.swrTtl', 'queue.jobLeaseTime']
+	);
+	assert.deepEqual(overrides.rows[0].missingOn, []);
+	assert.deepEqual(overrides.rows[1].missingOn, ['a.example.com:9926'], 'a has not seen this row yet');
+
+	// Every rollup takes the pessimistic reading: one node not honouring the layer is the cluster
+	// not honouring it, and a cheerful aggregate would be the last thing an operator sees before
+	// wondering why their edit did nothing on one node.
+	assert.equal(overrides.enabled, false);
+	assert.equal(overrides.degraded, true);
+	assert.equal(overrides.truncated, true);
+	assert.equal(overrides.error, 'ConfigOverride read timed out');
+
+	// The watch state does not replicate. A single one here would be node a's — healthy — while b
+	// silently stops honouring every edit made from this console, so it is per node or nothing.
+	assert.equal('watch' in overrides, false);
+	assert.deepEqual(
+		overrides.nodes.map((n) => [n.hostname, n.enabled, n.degraded, n.rowCount, n.watch.subscribed]),
+		[
+			['a.example.com:9926', true, false, 1, true],
+			['b.example.com:9926', false, true, 2, false],
+		]
+	);
+});
+
+test('config: a plugin with no override layer gets no override section invented for it', () => {
+	// The console and the plugin are separately versioned packages, so a console can always be
+	// ahead. An empty section here would read as "nobody has set any overrides", which is a claim
+	// about a feature the node does not have.
+	const body = (node) => ({
+		config: { page: { swrTtl: 100 } },
+		warnings: [],
+		pendingRestart: [],
+		node,
+		workerIndex: 0,
+	});
+	const merged = mergeConfig([ok('a', body('a')), ok('b', body('b'))]);
+
+	assert.equal('overrides' in merged.body, false);
+	assert.deepEqual(merged.body.divergences, []);
 });
 
 // ---- orphan sweep: node-scoped like reconcile, but MANUAL, which changes the merge ----

@@ -38,6 +38,7 @@ export const PROXIED_POST = Object.freeze([
 	'backlog',
 	'sitemap',
 	'sitemap-refresh',
+	'config-override',
 ]);
 
 /**
@@ -134,6 +135,33 @@ export function resolveNode(param, nodes) {
 		}
 	}
 	return null;
+}
+
+/**
+ * The ONE node a write goes to. Never a list — this is the whole of the console's write routing.
+ *
+ * Under node scope it is the node the operator picked. Under CLUSTER scope it is the first
+ * configured node holding a session, and the significant word is "first": the cluster-scoped
+ * writes this console forwards all land in REPLICATED tables (an invalidation, a queue-control
+ * row, a config override), so one node's commit reaches every node on its own. Fanning the write
+ * out would be N racing writes to the same rows — and worse, a partial failure would report an
+ * error for a write that in fact succeeded and replicated, which is the report an operator acts
+ * on by writing it again.
+ *
+ * Configured order also makes the choice STABLE: the same node takes every cluster-scoped write
+ * for as long as it holds a session, so a sequence of edits lands in one place in one order
+ * rather than racing itself across the cluster.
+ *
+ * Null means nowhere to send it — no session anywhere (the caller answers 401). A node that is
+ * signed in but unreachable is NOT stepped over: unlike a read, a write that failed in transit
+ * may still have been committed and replicated before the connection dropped, so retrying it
+ * elsewhere is a decision about a write of unknown status, not a fallback. The operator gets the
+ * 502 naming the node and can pick another one deliberately.
+ */
+export function writeNode(scope, tokens, nodes) {
+	if (!scope) return null;
+	if (!scope.cluster) return scope.origin;
+	return nodes?.find((origin) => tokens?.[origin]) ?? null;
 }
 
 /**

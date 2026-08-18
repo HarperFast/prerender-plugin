@@ -25,7 +25,8 @@
  *   POST /prerender_admin/login      { username, password }         public
  *   POST /prerender_admin/logout     end the session                session required
  *   GET  /prerender_admin/overview   nodes, counts, backlog shape   super_user
- *   GET  /prerender_admin/config     effective config + warnings    super_user
+ *   GET  /prerender_admin/config     effective config + warnings,   super_user
+ *                                    layers + stored overrides
  *   GET  /prerender_admin/sitemaps   root sitemaps + refresh state  super_user
  *   GET  /prerender_admin/pages      ?prefix&cursor&limit           super_user
  *   GET  /prerender_admin/page-content ?cacheKey (text/plain)       super_user
@@ -42,6 +43,7 @@
  *   POST /prerender_admin/backlog    { cap? } recompute the snapshot    super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
+ *   POST /prerender_admin/config-override { set?, clear?, dryRun? } super_user
  *
  * QUERY-COST RULES for every route here (this console shares the server with bot traffic):
  *   - Nothing walks `RenderSchedule.nextRenderTime` on page load — `claim` reads that index
@@ -66,10 +68,18 @@
  */
 
 import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promises';
-import { config, collectConfigWarnings, pendingRestartChanges } from '../config.js';
-import { describeConfigSchema } from '../configSchema.js';
+import {
+	config,
+	collectConfigWarnings,
+	pendingRestartChanges,
+	describeConfigLayers,
+	resolveConfig,
+	activeOverrides,
+	hostOptions,
+} from '../config.js';
+import { describeConfigSchema, secretPaths } from '../configSchema.js';
 import { describeMetrics } from '../metrics.js';
-import { redactConfig } from '../util/redact.js';
+import { redactConfig, describeSecret } from '../util/redact.js';
 import { explainCacheKey } from '../util/explain.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
@@ -85,7 +95,7 @@ import {
 	MAX_REASON_LENGTH,
 	CLUSTER_SCOPE as CLUSTER_INVALIDATION,
 } from '../util/invalidation.js';
-import { routeScopes, routeScopeForUrl } from '../util/routeClass.js';
+import { inspectRoutes, routeScopes, routeScopeForUrl } from '../util/routeClass.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -93,6 +103,13 @@ import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
 import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
+import {
+	MAX_WRITE_ENTRIES,
+	overrideWatchState,
+	readOverrides,
+	validateOverride,
+	writeOverrides,
+} from '../util/configOverride.js';
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
@@ -192,6 +209,11 @@ const describeScheduleRow = (row, now) => {
 	};
 };
 
+// Dotted paths whose stored value must never be echoed, whatever route the row arrived by. Taken
+// from the schema rather than listed here, so an option that becomes secret later is covered by the
+// declaration that made it secret.
+const secretOverridePaths = new Set(secretPaths());
+
 const noStore = (extra = {}) => ({ 'cache-control': 'no-store', ...extra });
 
 const json = (data, status = 200) =>
@@ -207,6 +229,25 @@ const routeOf = (target) => {
 	const id = target?.id;
 	return id === null || id === undefined ? '' : String(id);
 };
+
+/**
+ * Read a dotted option path out of a config object. Config is plain data, so this is the whole of
+ * it — but it has to tolerate a path that names nothing, because a CLEAR may legitimately name an
+ * option that no longer exists in this release (that row is exactly the one that needs deleting).
+ */
+const valueAt = (obj, path) => {
+	let node = obj;
+	for (const segment of String(path).split('.')) {
+		if (node === null || typeof node !== 'object') return undefined;
+		node = node[segment];
+	}
+	return node;
+};
+
+// Structural equality over config values, which are scalars or arrays of them — never functions,
+// dates or cycles. `?? null` so `undefined` (a path this release does not have) compares equal to
+// an explicit null rather than serializing away and matching everything.
+const sameValue = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /**
  * One-slot per-worker cache of the last sitemap row read for the detail view.
@@ -387,18 +428,7 @@ export class PrerenderAdmin extends Resource {
 			case 'overview':
 				return json(await PrerenderAdmin.overview());
 			case 'config':
-				// `schema` is the full option catalog (descriptions, types, defaults, live-vs-restart
-				// scope, validation hints) — the contract a config editor renders from.
-				// `pendingRestart` lists restart-scoped options changed since boot: the new value is
-				// in `config` but the running behavior still reflects the boot value.
-				return json({
-					config: redactConfig(config),
-					schema: describeConfigSchema(),
-					warnings: collectConfigWarnings(),
-					pendingRestart: pendingRestartChanges(),
-					node: server.hostname,
-					workerIndex: server.workerIndex,
-				});
+				return PrerenderAdmin.configView();
 			case 'invalidations':
 				return PrerenderAdmin.listInvalidationsRoute();
 			case 'sitemaps':
@@ -469,9 +499,318 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.sitemapDetail(data);
 			case 'sitemap-refresh':
 				return PrerenderAdmin.sitemapRefresh(data);
+			case 'config-override':
+				return PrerenderAdmin.configOverride(data, context);
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
+	}
+
+	/**
+	 * The whole configuration surface a config editor renders from, in one request.
+	 *
+	 *   config          the effective config, secrets reported as presence only
+	 *   schema          the option catalog: descriptions, types, defaults, live-vs-restart scope,
+	 *                   validation hints, and whether the console may write each option
+	 *   warnings        cross-option findings against the RUNNING config
+	 *   pendingRestart  restart-scoped options changed since boot — the new value is in `config`,
+	 *                   but the running behavior still reflects the boot value
+	 *   layers          per option, what each layer says and which one won
+	 *   overrides       the stored rows, and whether this node is keeping up with them
+	 *
+	 * `layers` is the answer to "why is this value what it is", which the merged `config` cannot
+	 * give: a merged value that equals the default is indistinguishable from one nobody set. It is
+	 * also the only place `source: 'override-rejected'` shows up — a row that is stored and listed
+	 * while the cluster quietly runs the file value.
+	 *
+	 * Query cost: `layers` and `schema` are pure schema walks over ~130 options, and the override
+	 * read is a bounded one-sided PK range over a table with at most a few dozen rows. Nothing here
+	 * touches the render queue or the page cache.
+	 */
+	static async configView() {
+		const overrides = await readOverrides();
+		return json({
+			config: redactConfig(config),
+			schema: describeConfigSchema(),
+			warnings: collectConfigWarnings(),
+			pendingRestart: pendingRestartChanges(),
+			layers: describeConfigLayers(),
+			overrides: {
+				// From the FILE layer, and file-only by schema: a kill switch reachable only through
+				// the thing it switches off is not a switch. False means the rows below are stored
+				// and inert, which is a different state from "nobody has set anything".
+				enabled: config.management.overrides.enabled,
+				// REDACTED, like every other view of a value in this response. A row for a secret cannot
+				// be created through this API and is no longer honoured by the merge, but it can still
+				// EXIST — the operations API is the documented break-glass path — and passing `value`
+				// through raw disclosed it in cleartext beside the same value redacted in `layers`.
+				// The console renders these rows into a table, so it is the config page an operator
+				// screenshots.
+				rows: overrides.rows.map((row) =>
+					secretOverridePaths.has(row.path) ? { ...row, value: describeSecret(row.value) } : row
+				),
+				// Read failures fail open (the deployed config.yaml keeps running), so an empty list
+				// with `degraded` set must never be rendered as "no overrides".
+				degraded: overrides.degraded,
+				truncated: overrides.truncated,
+				error: overrides.error,
+				// PER-NODE and per-worker: whether this worker's subscription is live, when it last
+				// re-read, and the backstop cadence. Deliberately a sibling of `config` rather than a
+				// field inside it — the console flags any disagreement between nodes' `config` as a
+				// deploy failure, and node-local timestamps in there would make that alarm permanent
+				// noise.
+				watch: overrideWatchState(),
+			},
+			node: server.hostname,
+			workerIndex: server.workerIndex,
+		});
+	}
+
+	/**
+	 * Preview or apply a change to the stored override layer.
+	 *
+	 *   { set: [{ path, value, note? }], clear: [path], dryRun: true }   preview — writes nothing
+	 *   { set: [...], clear: [...] }                                     apply
+	 *
+	 * THE DRY RUN IS THE POINT. A config edit's failure mode is not an error, it is a value that
+	 * lands in the table, lists in the console, and is not what the cluster runs: refused by the
+	 * merge (the `override-rejected` state), restart-scoped and therefore staged rather than
+	 * applied, or simply identical to what was already effective. All three look like success
+	 * afterwards, and the third one is worse than it looks — a pointless override still shadows
+	 * that path against every future `config.yaml` deploy. So the preview resolves the prospective
+	 * layers through the SAME `resolveConfig` the live apply uses and names each case, in the same
+	 * body shape the apply returns: "what would this do" and "what did this do" cannot drift apart.
+	 *
+	 * The preview also COMPILES a prospective `ingress.routes` rather than echoing it. An invalid
+	 * route entry is dropped, not rejected — from the outside indistinguishable from a route nobody
+	 * wrote — so echoing the operator's input back would confirm a route that is about to vanish.
+	 */
+	static async configOverride(data, context) {
+		// 409, not a silent write, and the same refusal `invalidate` gives for `invalidation.enabled`:
+		// with the layer switched off every node ignores these rows, so the write would be stored,
+		// listed in the console, and honored nowhere.
+		if (!config.management.overrides.enabled) {
+			return json(
+				{
+					error:
+						'management.overrides.enabled is false in the deployed config file, so a stored override ' +
+						"would be ignored on every node. That flag is this feature's kill switch and is deliberately " +
+						'file-only — an override you need to undo is a poor thing to undo through the override layer. ' +
+						'Re-enable it in config.yaml to edit configuration from here.',
+				},
+				409
+			);
+		}
+
+		const rawSet = data?.set ?? [];
+		const rawClear = data?.clear ?? [];
+		const dryRun = data?.dryRun === true;
+
+		if (!Array.isArray(rawSet) || !Array.isArray(rawClear)) {
+			return json({ error: 'set must be an array of { path, value, note? }, clear an array of option paths' }, 400);
+		}
+		if (rawSet.length === 0 && rawClear.length === 0) {
+			return json({ error: 'Nothing to do — supply set, clear, or both' }, 400);
+		}
+		// Shared with the writer so the door and the write path cannot disagree about the ceiling. The
+		// bound is on blast radius, not on the table: a request rewriting hundreds of options is not a
+		// config edit, it is a deploy, and a deploy belongs in config.yaml where it gets reviewed.
+		if (rawSet.length + rawClear.length > MAX_WRITE_ENTRIES) {
+			const total = rawSet.length + rawClear.length;
+			return json({ error: `A request may touch at most ${MAX_WRITE_ENTRIES} option paths (got ${total}).` }, 400);
+		}
+
+		const invalid = [];
+		const clears = [];
+		for (const path of rawClear) {
+			// Deliberately NOT schema-validated, for the same reason `invalidate` clears before it
+			// checks its closed set: the row that most needs clearing is one whose path stopped being
+			// an option — renamed or removed by an upgrade — and validating here would make exactly
+			// that row undeletable through the only authenticated door. Deleting a path that was never
+			// set is harmless; the response reports it as a no-op.
+			if (typeof path !== 'string' || !path) {
+				invalid.push({ path: path ?? null, reason: 'clear entries must be non-empty option paths' });
+			} else {
+				clears.push(path);
+			}
+		}
+
+		const sets = [];
+		for (const entry of rawSet) {
+			const path = entry?.path;
+			if (typeof path !== 'string' || !path) {
+				invalid.push({ path: path ?? null, reason: 'set entries must be { path, value, note? }' });
+				continue;
+			}
+			const verdict = validateOverride(path, entry.value);
+			if (!verdict.ok) {
+				invalid.push({ path, reason: verdict.reason });
+				continue;
+			}
+			// The validator's value, not the caller's: it is entitled to normalize, and previewing one
+			// value while storing another is the single bug a preview cannot survive.
+			sets.push({ path, value: verdict.value, note: typeof entry.note === 'string' ? entry.note : null });
+		}
+
+		// Both readings of "set it and clear it" are wrong, and picking one would apply half of what
+		// was asked without saying so. Same for one path carrying two values.
+		const clearing = new Set(clears);
+		const seen = new Set();
+		for (const entry of sets) {
+			if (clearing.has(entry.path)) invalid.push({ path: entry.path, reason: 'appears in both set and clear' });
+			if (seen.has(entry.path)) invalid.push({ path: entry.path, reason: 'appears more than once in set' });
+			seen.add(entry.path);
+		}
+
+		// ALL OR NOTHING. A half-applied config edit leaves the cluster in a state nobody asked for and
+		// nobody can name — strictly worse than the edit not happening, and much harder to undo than a
+		// rejection an operator can read and retry.
+		if (invalid.length) {
+			return json({ error: 'Nothing was written — some entries are invalid', invalid, applied: false }, 400);
+		}
+
+		// The base is what THIS node is RUNNING, not what the table holds. The two agree except in the
+		// window between a peer's write and this worker's re-read, which is why `watch` travels with
+		// the answer: a preview computed on a node whose subscription died is a preview of a stale base.
+		const current = activeOverrides();
+		const prospective = { ...current };
+		for (const entry of sets) prospective[entry.path] = entry.value;
+		for (const path of clears) delete prospective[path];
+
+		const resolved = resolveConfig(hostOptions(), prospective);
+
+		// Scope and secrecy per path, resolved (both inherit from groups), so neither has to be
+		// re-derived here from the raw schema.
+		const layers = new Map(describeConfigLayers().map((row) => [row.path, row]));
+		const setByPath = new Map(sets.map((entry) => [entry.path, entry]));
+		const touched = [...sets.map((entry) => entry.path), ...clears];
+
+		const changes = [];
+		const noop = [];
+		for (const path of touched) {
+			const row = layers.get(path);
+			const scope = row?.scope ?? null;
+			// Belt and braces. `checkUiEditable` refuses every secret path on the set side, so this can
+			// only be true for a clear of a row planted through the operations API — and even then the
+			// response reports presence, never the value.
+			const show = (value) => (row?.secret ? describeSecret(value) : value);
+			const from = valueAt(config, path);
+			const to = valueAt(resolved.config, path);
+
+			if (sameValue(from, to)) {
+				noop.push({
+					path,
+					value: show(from),
+					scope,
+					reason: setByPath.has(path)
+						? 'already the effective value — storing this changes nothing now, and it pins this path ' +
+							'against every future config.yaml deploy'
+						: Object.hasOwn(current, path)
+							? 'the stored override was not changing this value — clearing it changes nothing'
+							: 'no override is stored for this path',
+				});
+				continue;
+			}
+
+			changes.push({
+				path,
+				from: show(from),
+				to: show(to),
+				scope,
+				// A restart-scoped option STAGES: the new value lands in `config` immediately and the
+				// running behavior stays at the boot value until the component restarts. Reporting that
+				// as applied is how an operator concludes a setting did not work and changes something
+				// else on top of it.
+				willTakeEffect: scope !== 'restart',
+			});
+		}
+
+		// The `override-rejected` state, detected BEFORE the write instead of found afterwards. The
+		// merge type-checks and the constraint pass clamps back to the default, and a value they refuse
+		// leaves the file value running while the row sits in the table looking applied.
+		// `validateOverride` applies the same rules at the door, so anything surfacing here failed
+		// something only the full resolve can see.
+		const rejected = [];
+		for (const entry of sets) {
+			const effective = valueAt(resolved.config, entry.path);
+			if (sameValue(effective, entry.value)) continue;
+			const secret = !!layers.get(entry.path)?.secret;
+			rejected.push({
+				path: entry.path,
+				requested: secret ? describeSecret(entry.value) : entry.value,
+				effective: secret ? describeSecret(effective) : effective,
+				reason: 'the resolved config does not hold this value — it would be stored and never honored',
+			});
+		}
+
+		// Compiled from the PROSPECTIVE config every time, because `collectConfigWarnings` needs the
+		// prospective prerender-route count: the compiled route list is memoized off the live config,
+		// so letting it default would answer a routes edit with the count that is currently running —
+		// backwards for the one finding that matters most while editing routes.
+		const routes = inspectRoutes(resolved.config.ingress.routes, resolved.config.ingress.excludePathPatterns);
+		const touchesRoutes = touched.some((path) => path === 'ingress.routes' || path === 'ingress.excludePathPatterns');
+
+		const body = {
+			node: server.hostname,
+			dryRun,
+			set: sets.map((entry) => entry.path),
+			clear: clears,
+			changes,
+			noop,
+			rejected,
+			warnings: [
+				// The lines `applyOptions` would have LOGGED. A preview must not write "Ignoring
+				// prerender.x" into the log for a value it never applied, so `resolveConfig` hands them
+				// back instead — and they are the only place a dropped or unknown key is named at all.
+				...resolved.warnings.map((message) => ({ severity: 'warn', key: 'resolve', message })),
+				...collectConfigWarnings(resolved.config, { prerenderRoutes: routes.prerender }),
+			],
+			// Only when the edit touches them, since that is the only time the numbers mean anything
+			// the operator did not already know. `dropped` is the one to read: those entries are in the
+			// config and not in the router.
+			routes: touchesRoutes ? routes : null,
+			// Which of the CHANGES above will not be running after this write. Distinct from the
+			// `pendingRestart` on GET /config, which is the whole config's boot-vs-now drift; this is
+			// only what this one edit stages.
+			restartPending: changes.filter((change) => change.scope === 'restart').map((change) => change.path),
+			// Other nodes converge on the override subscription (about a second). This is the bound
+			// that holds when a node's subscription was never established.
+			appliesRemotelyWithinMs: config.management.overrides.syncInterval,
+			// Whether THIS node's override layer is current — the base every number above was computed
+			// against.
+			watch: overrideWatchState(),
+		};
+
+		if (dryRun) return json({ ...body, applied: false });
+
+		// Refuse rather than store a row the merge will not honor: an override the console lists and
+		// the cluster ignores is the exact state this route exists to keep out of the table, and
+		// nothing is lost by making the operator look at it first.
+		if (rejected.length) {
+			return json(
+				{
+					...body,
+					applied: false,
+					error:
+						'Nothing was written — one or more values would be stored and then ignored by the merge ' +
+						'(see `rejected`), which is the one outcome that looks like success from the console.',
+				},
+				409
+			);
+		}
+
+		const written = await writeOverrides({
+			set: sets,
+			clear: clears,
+			updatedBy: usernameOf(context?.user) ?? 'prerender_admin',
+		});
+
+		logger.warn(
+			`[prerender] config overrides changed by ${usernameOf(context?.user) ?? 'unknown'}: ` +
+				`set [${written.written.join(', ')}], cleared [${written.cleared.join(', ')}]`
+		);
+
+		return json({ ...body, applied: true, ...written });
 	}
 
 	/**

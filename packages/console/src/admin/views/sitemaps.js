@@ -9,15 +9,15 @@
  * and is labelled as such.
  */
 
-import { ago, card, duration, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, table } from '../ui.js';
+import { ago, card, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, table } from '../ui.js';
+import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'sitemaps', label: 'Sitemaps', crumb: 'sitemaps', icon: ICONS.sitemaps };
 
 const PAGE_SIZE = 50;
 
 export async function load(ctx) {
-	const [res, unroutedRes] = await Promise.all([ctx.get('sitemaps'), ctx.get('unrouted')]);
-	ctx.data.unrouted = unroutedRes.ok ? unroutedRes.body : null;
+	const [res] = await Promise.all([ctx.get('sitemaps'), loadConfig(ctx)]);
 	if (!res.ok) {
 		ctx.data.list = null;
 		ctx.data.error = res.body?.error ?? `Could not load sitemaps (${res.status})`;
@@ -62,6 +62,7 @@ export function render(ctx) {
 				onclick: () => ctx.run(() => ctx.post('sitemap-refresh', {})),
 			}),
 		]),
+		appliedNote(ctx),
 		roots.length === 0
 			? el('div', { cls: 'note' }, [
 					'No sitemaps are registered. Add one by POSTing its URL to the ',
@@ -74,77 +75,9 @@ export function render(ctx) {
 						detail(ctx),
 					]),
 				]),
-		unroutedCard(ctx),
+		settings(ctx),
+		editTray(ctx),
 	];
-}
-
-/**
- * Bot traffic served without prerendering, bucketed by first path segment. Either the CDN is
- * over-forwarding or the route list is incomplete — both are fixed per prefix, which is why
- * the report is bucketed the way a CDN rule or an ingress route is written.
- */
-function unroutedCard(ctx) {
-	const data = ctx.data.unrouted;
-	if (!data) return null;
-
-	const rows = (routeClass) =>
-		(data.report?.[routeClass] ?? []).map((row) =>
-			el('tr', null, [
-				el('td', { cls: 'mono', text: row.bucket }),
-				el('td', null, [pill(routeClass, routeClass === 'unclassified' ? 'warn' : '')]),
-				el('td', { cls: 'mono right', text: num(row.count) }),
-				el('td', {
-					cls: 'mono muted truncate',
-					style: { maxWidth: '300px' },
-					title: row.samplePath,
-					text: row.samplePath,
-				}),
-				el('td', { cls: 'right' }, [
-					link('explain →', () => ctx.go('explain', { input: { url: row.samplePath, deviceType: '' }, result: null })),
-				]),
-			])
-		);
-
-	return assembleUnrouted(data, [...rows('unclassified'), ...rows('passthrough')]);
-}
-
-// Assembled explicitly so the table sits between head and foot.
-function assembleUnrouted(data, all) {
-	return el('div', { cls: 'card' }, [
-		el('div', { cls: 'card-head' }, [
-			el('div', { cls: 'title', text: 'Served without prerendering' }),
-			spacer(),
-			el('span', {
-				cls: 'muted mono',
-				text: data.workers
-					? `one worker on each of ${data.workers} nodes · since their last flush (every ${duration(data.interval)})`
-					: `worker ${data.workerIndex} on ${data.node} · since its last flush (every ${duration(data.interval)})`,
-			}),
-		]),
-		el('div', { cls: 'card-body' }, [
-			all.length === 0
-				? el('div', {
-						cls: 'note ok',
-						text: data.workers
-							? `No unrouted traffic on the ${data.workers} sampled workers since their last flush.`
-							: 'This worker has served nothing unrouted since its last flush.',
-					})
-				: null,
-			el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-				'Counters are per-worker and reset on every flush, so this is a SAMPLE — one worker per node, ' +
-					'not a cluster total. It answers “is anything hitting a route we don’t classify”, never ' +
-					'“how much”. unclassified = the CDN forwarded a path no route declares; passthrough = ' +
-					'declared, deliberately proxied live.',
-			]),
-		]),
-		all.length > 0 &&
-			table(['path bucket', 'class', { text: 'requests', right: true }, 'sample', { text: '', right: true }], all),
-		data.report?.overflowed
-			? el('div', { cls: 'card-foot' }, [
-					`${num(data.report.overflowed)} request(s) fell outside the bucket cap and are not broken down above.`,
-				])
-			: null,
-	]);
 }
 
 function rootList(ctx, roots) {
@@ -376,3 +309,23 @@ function shortPath(url) {
 		return String(url ?? '');
 	}
 }
+
+/**
+ * Ingestion settings, below the state they produce.
+ *
+ * The distinction worth stating on this view is SCHEDULE versus WALK: everything here changes when
+ * or how the next pass runs, and nothing here runs one — the buttons above are still the only way
+ * to make a walk happen now.
+ */
+const settings = (ctx) =>
+	settingsCard(ctx, {
+		title: 'Sitemap ingestion',
+		prefix: 'sitemap',
+		description:
+			'When the daily pass runs and how a walk behaves. refreshTime, timezone, node and workerIndex move ' +
+			'only the schedule — an empty node disables the periodic refresh entirely and leaves the Refresh ' +
+			'buttons above as the only trigger — and changing any of them never starts a walk now. ' +
+			'filteredWarnPercent changes the severity a refresh REPORTS when most of a sitemap is filtered out, ' +
+			'not what gets filtered: that is ingress.routes, and the Served without prerendering panel above is ' +
+			'the other half of the same question.',
+	});

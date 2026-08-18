@@ -416,15 +416,26 @@ Database/table names are fixed. Tables are split across databases by write-trans
 Harper serializes writes per database and commits each database independently, so the hot, high-write
 queue table is isolated and bursty/heavy writes don't serialize against it:
 
-| Database          | Tables                                  | Notes                                             |
-| ----------------- | --------------------------------------- | ------------------------------------------------- |
-| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                   |
-| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status  |
-| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)           |
-| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress          |
-| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)      |
-| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom |
-| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)    |
+| Database          | Tables                                  | Notes                                                             |
+| ----------------- | --------------------------------------- | ----------------------------------------------------------------- |
+| `render_schedule` | `RenderSchedule`                        | the hot render queue — isolated                                   |
+| `render_service`  | `Target`, `QueueStatus`, `QueueControl` | target registry, observed status, desired status                  |
+| `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)                           |
+| `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress                          |
+| `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)                      |
+| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom                 |
+| `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)                    |
+| `config`          | `ConfigOverride`                        | operator-set config overrides — isolated because it is SUBSCRIBED |
+
+`config` is alone in its database for a reason that is not write volume — the table is written a few
+times a week. **A subscription is a per-database cost.** Harper's audit log spans every table in a
+database (each reader filters on `auditRecord.tableId`), so `addSubscription` attaches its `committed`
+listener to the _database's_ audit store, and every commit there schedules a pass that iterates the
+transaction log. Living in `render_service` would have made every `Target` and `QueueStatus` write pay
+for a subscription to a table nobody writes — on every worker, since every worker subscribes — which is
+the same rocksdb txn-log iteration that has pegged worker threads in this deployment before. Write
+serialization says the same thing from the other side: a config write would otherwise queue behind the
+URL registry, and vice versa, for two tables that never need to be atomic with each other.
 
 Because `RenderTarget` and `RenderSchedule` now live in separate databases, a target and its schedule
 are written as two independent commits (target first). The brief window where a target exists without a
@@ -555,7 +566,7 @@ this plugin's resources all set `loadAsInstance = false`.
 | `POST /prerender_admin/login`           | `{ username, password }`                        | public       |
 | `POST /prerender_admin/logout`          | end the session                                 | session      |
 | `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                 | `super_user` |
-| `GET /prerender_admin/config`           | effective config + warnings                     | `super_user` |
+| `GET /prerender_admin/config`           | effective config, layers, overrides, warnings   | `super_user` |
 | `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`) | `super_user` |
 | `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse      | `super_user` |
 | `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`  | `super_user` |
@@ -833,6 +844,94 @@ that interval now also carries the periodic claim-floor reset.
 `loadAsInstance = false` and therefore enforces no authentication of its own, so it must not
 be able to stop the whole fleet. Cluster-scoped control is only reachable through the
 super-user-gated admin route.
+
+### Editable configuration: the override layer
+
+Configuration resolves in three layers, lowest precedence first:
+
+```
+schema defaults  <  config.yaml (deployed from git)  <  ConfigOverride rows (set from the console)
+```
+
+The console writes the third layer. Each row is **one option path holding one value** — a delta,
+never a snapshot of the whole config. That distinction is the entire design:
+
+- A `config.yaml` change still takes effect for **every option nobody has overridden**. Ship a
+  corrected default or a fixed route and it lands. A stored snapshot would shadow it silently, and
+  the deploy would appear to do nothing with nothing to say why.
+- Clearing one row reverts **one option** to the deployed value. Clearing every row returns the
+  cluster to exactly its deployed state — which is the rollback story, and it is one delete.
+
+The rows live in `config.ConfigOverride` — alone in that database, because a subscription is a
+per-database cost — and **replicate**, so the console writes once, on
+whichever node it reached, and every node converges — including a node that was down when the write
+happened and a node added to the cluster next month. The alternative, a console fanning a write out
+to N nodes, has no convergence at all: a node mid-restart for one write diverges permanently, and
+config divergence between nodes is precisely what this system treats as a failed deploy rather than
+a preference.
+
+**A change propagates in about a second.** Each worker subscribes to the table and treats an event
+as a _doorbell_: any event triggers a re-read of the whole (tiny) table, which is then re-merged.
+The event's own payload is deliberately ignored — Harper subscriptions do not dedupe and may deliver
+out of order, whereas a full re-read is idempotent. A backstop poll
+(`management.overrides.syncInterval`, default 30s) covers a subscription that was never established
+or a worker whose boot read failed, so staleness has a bound that does not depend on a callback
+firing. A re-read that finds nothing changed does **not** re-apply, so it never re-arms the
+schedulers.
+
+Every worker subscribes and polls, unlike the schedulers in this plugin which pin to one node and
+worker. Each worker holds its own `config`, so each has to learn about a change itself.
+
+**Boot ordering is guaranteed, not hoped for.** `handleApplication` awaits the override read before
+the first `applyOptions` and before any scheduler starts, and a worker does not receive requests
+until component load resolves — so no request and no timer ever observes a pre-override config. The
+read is bounded (5s deadline, 500-row cap) and **fails open**: component load is raced against a
+hard timeout, and overrunning it fails the component rather than delaying it, so a read that cannot
+complete leaves the cluster running its deployed `config.yaml` and reports the degradation.
+
+#### What cannot be edited from the console
+
+| Refused                    | Why                                                                                 |
+| -------------------------- | ----------------------------------------------------------------------------------- |
+| the three `secret` options | they come from environment variables; the API only ever reports whether one is set  |
+| `management.enabled`       | one click would take the console away, and getting it back needs a config-file edit |
+| `management.overrides.*`   | it is the machinery the console writes _through_ — including its own kill switch    |
+
+`management.overrides.enabled: false` in `config.yaml` is the **kill switch**: rows are left in
+place but ignored, and the cluster runs exactly its deployed configuration again. It lives in the
+file because an override you need to undo is a poor thing to undo through the override layer.
+
+Restart-scoped options (`scope: 'restart'` in the schema) can be overridden, but the write **stages**
+rather than applies — the new value is in `config` while the running behavior stays at boot. Those
+are reported through `pendingRestartChanges()` and the console shows them as pending rather than
+letting the write look like it took effect.
+
+#### Previewing a change
+
+`dryRun` returns exactly the body the real call would, minus the write — the same contract as
+invalidation:
+
+```sh
+POST /prerender_admin/config-override
+{"set":[{"path":"page.swrTtl","value":21600000}],"dryRun":true}
+```
+
+The preview is computed by resolving a **prospective** config through the same merge and the same
+schema constraints the real apply uses, so it reports three things an echo of the submitted value
+could not:
+
+- **`rejected`** — a value that would not survive validation. Without this the row lands, the console
+  lists it, and the cluster does not honour it; `describeConfigLayers()` calls that state
+  `override-rejected`, and it is far better prevented than diagnosed. A rejected override falls back
+  to **the layer below it**, not to the schema default: a value `config.yaml` sets deliberately
+  survives a typo'd override of the same option, which is what stops one bad edit from taking a
+  deployed setting down with it.
+- **`noop`** — a change whose prospective effective value equals the current one, e.g. an override
+  that merely restates what the file already says.
+- **dropped routes** — an `ingress.routes` edit is compiled by `inspectRoutes()` during the preview.
+  An invalid route entry is _dropped_, not rejected, so from the outside it is indistinguishable
+  from a route nobody wrote: the config lists it, the plugin starts, and the paths it covered
+  quietly stop being prerendered. The preview compiles it and reports the drop.
 
 ### Bulk cache invalidation
 

@@ -74,11 +74,48 @@ Three properties worth knowing:
   the cluster by N.
 - **Actions are never fanned out.** A write under cluster scope lands on one node, which is
   correct for the replicated tables they touch. The routes that act on a single node's own state
-  — `reconcile`, `backlog`, `schedule` — refuse and ask for a node instead.
+  — `reconcile`, `backlog`, `schedule` — refuse and ask for a node instead. A write whose result
+  is read back moments later by a panel that alarms on nodes disagreeing (today: `config-override`)
+  additionally carries an envelope naming the node that accepted it and saying the rows replicate,
+  so the console's own write path does not read as the failure that panel exists to raise.
 
 Cost: one bounded, per-worker-cached read per node per refresh, off the crawler serve path. The
 `analytics` cache TTL (`management.analytics.cacheTtl` on the prerender side) absorbs view
 switches and second operators, and the fan-out is capped at 6 concurrent upstream requests.
+
+## Editing configuration
+
+The console writes the plugin's config. Values resolve in three layers — schema defaults, the
+deployed `config.yaml`, then override rows the console writes — and the console shows all three per
+option, so "what is this cluster running, and who decided that" is answerable without a git
+checkout on another machine.
+
+**Preview is the default path**, as it is for invalidations. Edits stage locally; the primary
+button is a dry run that the _plugin_ computes by resolving a prospective config through the same
+merge and the same schema constraints a real apply uses. That is what lets the preview report the
+three things a client-side diff cannot:
+
+- a value that would be **rejected** and stored without taking effect,
+- a change that is a **no-op** (an override merely restating the deployed value),
+- **routes that would be silently dropped** — an invalid `ingress.routes` entry is discarded rather
+  than refused, so without this the preview would confirm a route about to vanish.
+
+Applying is a second, explicit click from inside that answer.
+
+**One write, not a fan-out.** The rows replicate, so the edit goes to a single node and every node
+converges — in about a second via each worker's table subscription, or within
+`management.overrides.syncInterval` if a node's subscription is not live. During that window nodes
+genuinely disagree, which is why config divergences now carry `overridden`: a divergence at an
+overridden path is the layer converging, not the deploy failure the un-tagged kind still means.
+
+**What the console refuses to edit**, and says so rather than offering a dead control: the three
+secret options (the API only ever returns `<set: N chars>`, so a form round-trip would store the
+redaction marker as the token), `management.enabled` (one click would remove the console), and the
+`management.overrides` group itself (the machinery these writes go through, including its own kill
+switch — `management.overrides.enabled: false` in the config file makes the whole layer inert).
+
+Restart-scoped options can be set, but the write **stages**: the console shows them as pending a
+restart rather than letting a value that is not running look applied.
 
 ## How it works
 
@@ -110,10 +147,29 @@ The view-by-view tour lives in the plugin README's
 [Management API](../plugin/README.md#management-api-prerender_admin) section alongside the
 API contract; the short version: **Overview** (scale, serve health, backlog shape, claim
 floor, schedule repair), **Traffic** (offload/hit-rate/freshness charts from one bounded
-analytics scan per node), **Sitemaps**, **Page cache**, **Queue & nodes** (pause controls plus
-render/claim health, with per-node throughput), **Invalidations** (preview-first record/clear),
-**URL explainer**, **Metrics** (the live catalog), **Config** (including cross-node divergence —
-the only place a deploy that skipped a node is visible).
+analytics scan per node), **Sitemaps**, **Page cache**, **Queue** (render/claim health and the
+backlog), **Nodes**, **Invalidations** (preview-first record/clear), **URL explainer**,
+**Metrics** (the live catalog), **Config**.
+
+Two of those changed shape when configuration became editable:
+
+- **Nodes is new**, and it exists because "is this node healthy" had four homes: liveness and the
+  replication gap on Overview, observed status and pause intent on Queue, config divergence on
+  Config, and the topbar picker. The tell was that Queue imported the overview's own node-cell
+  helpers to draw a second node table. It now owns all of it, plus the two per-node questions the
+  override layer adds — did my edit reach this node, and is this node's override subscription
+  still live. A node whose subscription has died silently stops honouring every edit made from
+  this console, so that is the headline of the panel rather than a footnote.
+- **Config** stopped being a JSON dump and became the searchable index of all 133 options: every
+  option's default, deployed and override values, which layer won, and a filter for the questions
+  operators actually arrive with (what is overridden, what differs from the repo, what is pending
+  a restart). Divergence stays first, and stays the alarm it always was — a divergence at a path
+  nobody overrides is still a deploy that skipped a node.
+
+Each domain view owns the options that govern the data it shows — `sitemap.*` under Sitemaps,
+`queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Page cache, `analytics`/`crawlStats`
+under Traffic, `invalidation` under Invalidations — while Config remains exhaustive, so a setting
+can be found either by where it acts or by name.
 
 ## Development
 

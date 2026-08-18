@@ -24,7 +24,13 @@ export function el(tag, props, children) {
 			else if (key === 'cls') node.className = value;
 			else if (key === 'style') Object.assign(node.style, value);
 			else if (key.startsWith('on')) node.addEventListener(key.slice(2).toLowerCase(), value);
-			else node.setAttribute(key, value === true ? '' : value);
+			// `false` is dropped, exactly like null/undefined, because every attribute this console sets
+			// conditionally is a BOOLEAN attribute — disabled, checked, selected, autofocus — and HTML
+			// treats those as true whenever the attribute is PRESENT, whatever its value. Setting
+			// `disabled="false"` disables the button. `disabled: ctx.busy` is written throughout this
+			// client, so with `busy` false — which is almost always — Refresh, Clear, Pause, Preview and
+			// Apply were all permanently unclickable.
+			else if (value !== false) node.setAttribute(key, value === true ? '' : value);
 		}
 	}
 	append(node, children);
@@ -157,7 +163,9 @@ export const link = (text, onclick) => el('button', { cls: 'link', text, onclick
 
 export function card(title, { head = [], body = null, foot = null, cls = '' } = {}) {
 	return el('div', { cls: `card ${cls}`.trim() }, [
-		(title || head.length) &&
+		// `!!` because `head.length` of an empty head is the NUMBER 0, and `append` skips null/false/''
+		// but not 0 — a title-less, head-less card rendered a literal "0" above its body.
+		!!(title || head.length) &&
 			el('div', { cls: 'card-head' }, [title && el('div', { cls: 'title', text: title }), head]),
 		body && el('div', { cls: 'card-body' }, body),
 		foot && el('div', { cls: 'card-foot' }, foot),
@@ -249,3 +257,440 @@ export const unwired = (what, needs) =>
 	]);
 
 export const loading = () => el('p', { cls: 'muted', text: 'Loading…' });
+
+// ---- configuration editing -------------------------------------------------------------------
+//
+// The console can write the plugin’s config: `config.ConfigOverride` holds one row per
+// option path, layered over the deployed `config.yaml`. Everything below renders that, and the
+// hard part is not the inputs — it is never letting a value look like it took effect when it did
+// not. Four states have to stay visually distinct: what the deployed file says, what an override
+// says, what is STAGED in this browser and not yet written, and what the cluster is actually
+// running. A control that showed only the last of those would be a config editor that lies during
+// exactly the minute an operator is changing something.
+
+/**
+ * Which layer produced the running value.
+ *
+ * `override-rejected` is the one that matters: the row exists, the console lists it, and the
+ * cluster is NOT honouring it because the value failed validation. It reads as bad, not as a
+ * variant of "override", because the operator's setting is not in force.
+ */
+export const originPill = (source) =>
+	({
+		'default': () => muted('default'),
+		'file': () => pill('config.yaml', 'info'),
+		'override': () => pill('override', 'warn'),
+		'override-rejected': () => pill('override REJECTED — not in effect', 'bad'),
+	})[source]?.() ?? muted(String(source ?? '—'));
+
+/**
+ * Split `text` on `term` into text nodes and `<mark>` runs.
+ *
+ * Exists so that highlighting a search match never becomes a reason to reach for an HTML string —
+ * the one rule this whole client is built on.
+ */
+export function highlight(text, term) {
+	const value = String(text ?? '');
+	if (!term) return [value];
+	const parts = [];
+	const needle = term.toLowerCase();
+	let index = 0;
+	for (;;) {
+		const at = value.toLowerCase().indexOf(needle, index);
+		if (at === -1) break;
+		if (at > index) parts.push(value.slice(index, at));
+		parts.push(el('mark', { text: value.slice(at, at + needle.length) }));
+		index = at + needle.length;
+	}
+	parts.push(value.slice(index));
+	return parts;
+}
+
+// Units an operator actually thinks in. The canonical stored value is always milliseconds; this is
+// only how it is typed and read back, so that `86400000` is entered and reviewed as `1d`.
+const DURATIONS = [
+	['ms', 1],
+	['s', 1000],
+	['m', 60000],
+	['h', 3600000],
+	['d', 86400000],
+];
+
+/** The largest unit that divides `ms` exactly, so a round value round-trips as a round value. */
+const bestDurationUnit = (ms) => {
+	for (let i = DURATIONS.length - 1; i > 0; i--) {
+		const [, size] = DURATIONS[i];
+		if (Number.isFinite(ms) && ms !== 0 && ms % size === 0) return DURATIONS[i];
+	}
+	return DURATIONS[0];
+};
+
+/**
+ * A duration as a number plus a unit, staging canonical milliseconds.
+ *
+ * Most of this plugin's numeric options are `unit: 'ms'` and several are days expressed as eight
+ * digits. Typing those by hand is how a TTL becomes 10x what was meant, and the schema's `min`/`max`
+ * cannot catch it because the wrong value is usually in range.
+ */
+export function durationInput(ms, { min, max, onChange, invalid = false } = {}) {
+	let [unitName, unitSize] = bestDurationUnit(ms);
+	// Both bounds are re-expressed in the CURRENT unit, so the browser's own validation stays true
+	// after a unit switch. `page.blobReadBudgetMs` is the reason `max` matters: past 2147483647 a
+	// setTimeout delay overflows its signed 32-bit field and fires after 1ms instead of never, which
+	// would time out every cache hit and send all traffic to the origin.
+	const amount = el('input', {
+		type: 'number',
+		cls: `dur-amount${invalid ? ' invalid' : ''}`,
+		value: Number.isFinite(ms) ? String(ms / unitSize) : '',
+		min: Number.isFinite(min) ? String(min / unitSize) : null,
+		max: Number.isFinite(max) ? String(max / unitSize) : null,
+		oninput: () => emit(true),
+	});
+	const unit = el(
+		'select',
+		{ cls: 'dur-unit', onchange: () => switchUnit() },
+		DURATIONS.map(([name]) => el('option', { value: name, selected: name === unitName ? '' : null, text: name }))
+	);
+	const readout = el('span', { cls: 'dur-ms muted mono' });
+
+	// `notify` separates "redraw the readout" from "tell the caller the value changed", and the
+	// separation is load-bearing. Rendering is a full rebuild on every state change, so a construction
+	// -time emit that called onChange staged a value, which re-rendered, which rebuilt this control,
+	// which emitted again — unbounded recursion that blew the stack before any view owning a
+	// millisecond option could finish drawing. Only real input notifies.
+	const emit = (notify) => {
+		const next = Number(amount.value) * unitSize;
+		readout.textContent = Number.isFinite(next) ? `${next.toLocaleString()} ms` : '';
+		if (notify) onChange?.(Number.isFinite(next) ? next : null);
+	};
+	// Changing the unit re-expresses the SAME duration rather than reinterpreting the number: going
+	// from `30 m` to hours must mean 0.5h, not 30h. Silently multiplying by 60 here would be a
+	// config editor that changes a value nobody edited.
+	const switchUnit = () => {
+		const current = Number(amount.value) * unitSize;
+		[unitName, unitSize] = DURATIONS.find(([name]) => name === unit.value) ?? DURATIONS[0];
+		amount.value = String(current / unitSize);
+		if (Number.isFinite(min)) amount.setAttribute('min', String(min / unitSize));
+		if (Number.isFinite(max)) amount.setAttribute('max', String(max / unitSize));
+		// Display-only: the duration is unchanged, so there is nothing to report and no reason to make
+		// the caller rebuild — which would also cost the operator their caret.
+		emit(false);
+	};
+
+	emit(false);
+	return el('span', { cls: 'dur' }, [amount, unit, readout]);
+}
+
+/**
+ * An ordered list of scalars, one per line.
+ *
+ * A textarea rather than a row of inputs: every one of these options is a short list an operator
+ * pastes or reorders wholesale, and line-per-entry is both the fastest edit and the shape the YAML
+ * they already know uses. Empty lines are dropped rather than stored as empty strings, which
+ * several of these options reject outright.
+ */
+export function listEditor(values, { numeric = false, placeholder = '', onChange, invalid = false } = {}) {
+	const area = el('textarea', {
+		cls: `list-editor${invalid ? ' invalid' : ''}`,
+		rows: String(Math.min(10, Math.max(3, (values?.length ?? 0) + 1))),
+		placeholder,
+		oninput: (event) => {
+			const lines = event.target.value
+				.split('\n')
+				.map((line) => line.trim())
+				.filter((line) => line !== '');
+			onChange?.(numeric ? lines.map(Number) : lines);
+		},
+	});
+	area.value = (values ?? []).join('\n');
+	return area;
+}
+
+/**
+ * The control for one option, chosen from its schema node.
+ *
+ * NEVER returns an editable node for an option the server marked `uiEditable: false`. That is not
+ * a cosmetic disable: the two reasons an option carries the flag are that it is a secret (the API
+ * only ever sends back `<set: N chars>`, so a form round-trip would store the redaction marker as
+ * the token) and that editing it removes the ability to edit (`management.enabled`, and the
+ * override machinery itself). Both are refused server-side too; this is the half that explains why.
+ */
+export function control(opt, value, onChange, { invalid = false } = {}) {
+	if (opt.uiEditable === false) {
+		return el('span', { cls: 'ctl-locked' }, [
+			mono(formatValue(value)),
+			muted(
+				opt.secret ? ' — secret, set through its environment variable' : ' — deliberately not editable from the console'
+			),
+		]);
+	}
+
+	if (opt.type === 'boolean') {
+		return el('label', { cls: 'toggle' }, [
+			el('input', { type: 'checkbox', checked: value ? '' : null, onchange: (e) => onChange(e.target.checked) }),
+			el('span', { text: value ? 'on' : 'off' }),
+		]);
+	}
+
+	if (opt.enum) {
+		return el(
+			'select',
+			{ cls: invalid ? 'invalid' : null, onchange: (e) => onChange(e.target.value) },
+			opt.enum.map((choice) => el('option', { value: choice, selected: choice === value ? '' : null, text: choice }))
+		);
+	}
+
+	if (opt.type === 'number') {
+		if (opt.unit === 'ms') return durationInput(value, { min: opt.min, max: opt.max, onChange, invalid });
+		return el('input', {
+			type: 'number',
+			cls: `num${invalid ? ' invalid' : ''}`,
+			value: String(value ?? ''),
+			min: opt.min ?? null,
+			max: opt.max ?? null,
+			oninput: (e) => onChange(e.target.value === '' ? null : Number(e.target.value)),
+		});
+	}
+
+	if (opt.type === 'array') {
+		// A closed item set is a checkbox set, not free text: `cacheKey.decodeReserved` rejects the
+		// WHOLE list when one entry is not allowed, so an editor that lets you type a rogue entry is
+		// an editor whose mistakes cost the entire option.
+		if (opt.itemEnum) {
+			const selected = new Set(value ?? []);
+			return el(
+				'div',
+				{ cls: 'checkset' },
+				opt.itemEnum.map((item) =>
+					el('label', null, [
+						el('input', {
+							type: 'checkbox',
+							checked: selected.has(item) ? '' : null,
+							onchange: (e) => {
+								if (e.target.checked) selected.add(item);
+								else selected.delete(item);
+								onChange(opt.itemEnum.filter((entry) => selected.has(entry)));
+							},
+						}),
+						mono(item),
+					])
+				)
+			);
+		}
+		// Structured entries get a JSON editor: joining objects with newlines renders `[object Object]`,
+		// and parsing that back destroys the option. `ingress.routes` is ORDERED (first match wins), so
+		// the editor has to preserve order, which text does naturally.
+		if (opt.itemType === 'object' || (opt.default ?? []).some((entry) => entry && typeof entry === 'object')) {
+			return jsonEditor(value, { onChange, invalid });
+		}
+
+		// `.every()` on an EMPTY array is true, so inferring "numeric" from the default alone made every
+		// option defaulting to `[]` a number list — typing a hostname into `domains` stored `[null]`
+		// cluster-wide. A list is numeric only if something actually says so.
+		const sample = [opt.default, value].flat().filter((entry) => entry !== undefined && entry !== null);
+		const numeric = sample.length > 0 && sample.every((entry) => typeof entry === 'number');
+		return listEditor(value, { numeric, placeholder: 'one per line', onChange, invalid });
+	}
+
+	return el('input', {
+		type: 'text',
+		cls: `mono${invalid ? ' invalid' : ''}`,
+		value: value ?? '',
+		oninput: (e) => onChange(e.target.value),
+	});
+}
+
+/**
+ * An ordered list of STRUCTURED entries, edited as JSON.
+ *
+ * The two options that need this — `ingress.routes` and `analytics.bots` — are arrays of objects
+ * whose item shape the schema does not describe, so there is nothing to build a form from. JSON is
+ * the honest control: it shows exactly what is stored, it preserves order (which `ingress.routes`
+ * depends on entirely — first match wins), and unparseable text reports itself instead of silently
+ * becoming a different value.
+ *
+ * It reports `null` while the text does not parse, which the caller treats as "not stageable" rather
+ * than as a value. Half-typed JSON must never reach the staged set.
+ */
+export function jsonEditor(value, { onChange, invalid = false } = {}) {
+	const status = el('div', { cls: 'muted mono json-status' });
+	const area = el('textarea', {
+		cls: `list-editor${invalid ? ' invalid' : ''}`,
+		rows: '10',
+		spellcheck: 'false',
+		oninput: (event) => {
+			try {
+				const parsed = JSON.parse(event.target.value);
+				if (!Array.isArray(parsed)) throw new Error('expected a list');
+				status.textContent = `${parsed.length} entr${parsed.length === 1 ? 'y' : 'ies'}`;
+				onChange?.(parsed);
+			} catch (e) {
+				status.textContent = `not valid JSON — ${e.message}`;
+				onChange?.(null);
+			}
+		},
+	});
+	area.value = JSON.stringify(value ?? [], null, 2);
+	status.textContent = `${(value ?? []).length} entr${(value ?? []).length === 1 ? 'y' : 'ies'}`;
+	return el('div', null, [area, status]);
+}
+
+/** Render any config value for display. Objects and arrays are shown as compact JSON. */
+export const formatValue = (value) => {
+	if (value === undefined) return '—';
+	if (typeof value === 'string') return value === '' ? '(empty)' : value;
+	return JSON.stringify(value);
+};
+
+/**
+ * The layer strip: what each layer says, and a revert when an override is in play.
+ *
+ * The file value is shown even when an override wins, because "what does the repo say" is the
+ * question an operator has right before deciding whether the override is still wanted — and the
+ * answer is otherwise only in a git checkout on another machine.
+ */
+export function layerStrip(row, { onRevert, busy } = {}) {
+	const cells = [['default', row.default]];
+	if (row.fileDiffersFromDefault) cells.push(['config.yaml', row.file]);
+	if (row.overridden) cells.push(['override', row.override]);
+
+	return el('div', { cls: 'layers' }, [
+		...cells.map(([label, value]) => el('span', { cls: 'layer' }, [muted(label), mono(formatValue(value))])),
+		row.overridden &&
+			el('button', {
+				cls: 'link',
+				text: 'revert to config.yaml',
+				disabled: busy,
+				title: 'Deletes the stored override for this option. The deployed value takes over.',
+				onclick: () => onRevert?.(row.path),
+			}),
+	]);
+}
+
+/**
+ * One option: identity, control, provenance, and every way it can be not-what-it-looks-like.
+ *
+ * `staged` is a pending edit in this browser that has not been written. It is rendered as a
+ * distinct state rather than by just showing the new value, because a staged edit and an applied
+ * one are the difference between "I am about to do this" and "the cluster is doing this".
+ */
+export function settingRow(opt, { staged, invalid, pendingRestart, divergent, busy, onStage, onRevert } = {}) {
+	const isStaged = staged !== undefined;
+	const shown = isStaged ? staged : opt.effective;
+
+	return el('div', { cls: `setting${isStaged ? ' staged' : ''}${invalid ? ' invalid' : ''}` }, [
+		el('div', { cls: 'setting-head' }, [
+			el('code', { cls: 'path', text: opt.path }),
+			originPill(opt.source),
+			opt.scope === 'restart' && pill('restart to take effect', 'warn'),
+			pendingRestart && pill('changed — still running the boot value', 'bad'),
+			divergent && pill('differs between nodes', 'bad'),
+			isStaged && pill('staged, not written', 'info'),
+		]),
+		opt.description && el('p', { cls: 'setting-desc', text: opt.description }),
+		el('div', { cls: 'setting-ctl' }, [
+			control(opt, shown, (next) => onStage?.(opt.path, next), { invalid: !!invalid }),
+		]),
+		invalid && el('div', { cls: 'note bad', text: invalid }),
+		layerStrip(opt, { onRevert, busy }),
+	]);
+}
+
+/**
+ * The staged-change tray: what is about to be written, and the two-step that writes it.
+ *
+ * PREVIEW IS THE PRIMARY ACTION, matching the invalidation flow. The preview is not a local diff —
+ * it is the server resolving a prospective config through the same merge and the same schema
+ * constraints the real apply uses, so it reports the three things a client-side diff cannot: a
+ * value that would be REJECTED, a change that is a no-op, and routes that would be silently
+ * dropped as invalid. Applying is a second, explicit click from inside that answer.
+ */
+export function stagedTray({ count, invalid, preview, busy, onPreview, onApply, onDiscard }) {
+	if (!count) return null;
+
+	return el('div', { cls: 'tray' }, [
+		el('div', { cls: 'tray-head' }, [
+			el('strong', { text: `${count} staged change${count === 1 ? '' : 's'}` }),
+			invalid > 0 && pill(`${invalid} invalid`, 'bad'),
+			spacer(),
+			el('button', { cls: 'link', text: 'Discard', disabled: busy, onclick: onDiscard }),
+			el('button', {
+				cls: 'primary',
+				text: 'Preview (writes nothing)',
+				disabled: busy || invalid > 0,
+				onclick: onPreview,
+			}),
+		]),
+		preview && previewBody(preview, { busy, onApply }),
+	]);
+}
+
+/**
+ * How long the cluster takes to agree, stated honestly for both cases.
+ *
+ * 0 is not "instant" — it means `management.overrides.syncInterval` is 0, so the backstop re-read is
+ * disabled and the subscription is the ONLY path. That is a materially different promise, because a
+ * node whose subscription is not live then never converges at all. Rendering it as "within 0s", or
+ * defaulting it to 30, would both misstate the one thing this sentence exists to say.
+ */
+const convergenceNote = (withinMs) => {
+	const base = 'One node takes the write and the rows replicate, so every node converges in about a second';
+	if (!Number.isFinite(withinMs)) return null;
+	return el('p', {
+		cls: 'muted chart-note',
+		text:
+			withinMs > 0
+				? `${base} — or within ${Math.round(withinMs / 1000)}s if a node's subscription is not live.`
+				: `${base}. The backstop re-read is disabled (management.overrides.syncInterval is 0), so a node ` +
+					`whose subscription is not live will NOT pick this up at all.`,
+	});
+};
+
+const previewBody = (preview, { busy, onApply }) => {
+	if (preview.error) return el('div', { cls: 'note bad', text: preview.error });
+
+	const rows = (preview.changes ?? []).map((change) =>
+		el('tr', null, [
+			el('td', { cls: 'mono', text: change.path }),
+			el('td', { cls: 'mono muted', text: formatValue(change.from) }),
+			el('td', { cls: 'mono', text: formatValue(change.to) }),
+			el('td', null, [change.willTakeEffect ? pill('live', 'ok') : pill('staged until restart', 'warn')]),
+		])
+	);
+
+	return el('div', { cls: 'tray-preview' }, [
+		el('div', { cls: 'note info' }, [
+			el('strong', { text: 'Preview — nothing has been written. ' }),
+			'This is the same body the write returns.',
+		]),
+		table(['option', 'from', 'to', 'effect'], rows, 'No effective change.'),
+		...(preview.noop ?? []).map((path) =>
+			note('warn', [
+				el('strong', { text: `${path} is already this value. ` }),
+				'Writing it would store an override that changes nothing.',
+			])
+		),
+		...(preview.rejected ?? []).map((entry) =>
+			note('bad', [
+				el('strong', { text: `${entry.path ?? entry} would be rejected. ` }),
+				'It would be stored and NOT honoured — the cluster would keep the value it has.',
+			])
+		),
+		preview.routes?.dropped > 0 &&
+			note('bad', [
+				el('strong', { text: `${preview.routes.dropped} route(s) would be dropped as invalid. ` }),
+				'An invalid route is discarded, not rejected — the paths it covers would silently stop being prerendered.',
+			]),
+		...(preview.warnings ?? []).map((warning) =>
+			note(warning.severity === 'warn' ? 'warn' : 'info', [
+				el('strong', { cls: 'mono', text: `${warning.key}: ` }),
+				warning.message,
+			])
+		),
+		convergenceNote(preview.appliesRemotelyWithinMs),
+		el('div', { cls: 'toolbar' }, [
+			spacer(),
+			el('button', { cls: 'danger', text: 'Apply to the cluster', disabled: busy, onclick: onApply }),
+		]),
+	]);
+};

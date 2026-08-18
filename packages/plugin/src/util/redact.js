@@ -13,8 +13,9 @@ import { secretPaths } from '../configSchema.js';
 const SECRET_PATHS = secretPaths();
 
 // A secret is reported only as whether it is set, and how long it is — enough to spot a
-// truncated/whitespace-mangled value without disclosing it.
-const describeSecret = (value) => {
+// truncated/whitespace-mangled value without disclosing it. Exported because the management
+// API's per-option layers view redacts one value at a time rather than a whole config object.
+export const describeSecret = (value) => {
 	if (typeof value !== 'string' || value.length === 0) return '<empty>';
 	return `<set: ${value.length} chars>`;
 };

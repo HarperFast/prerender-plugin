@@ -1,6 +1,6 @@
 /**
- * Overview: scale, serve health, the upcoming-render shape, node status, and the
- * schedule-repair result.
+ * Overview: scale, serve health, the upcoming-render shape, and the schedule-repair result.
+ * Node health is one line here and a whole view (Nodes) behind it — see nodeSummary.
  *
  * NOTHING ON THIS VIEW WALKS THE PLUGIN'S TABLES ON LOAD. The table counts AND the
  * backlog/histogram come from a snapshot computed on a background cadence — `claim` does a
@@ -52,6 +52,7 @@ import {
 	weighted,
 	windowEmpty,
 } from '../charts.js';
+import { configState } from './_configEdit.js';
 
 export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon: ICONS.overview };
 
@@ -86,7 +87,8 @@ export function render(ctx) {
 		counts(ctx, data),
 		traffic(ctx),
 		upcoming(ctx, data),
-		el('div', { cls: 'cols' }, [nodes(ctx, data), failures(ctx)]),
+		nodeSummary(ctx, data),
+		failures(ctx),
 		repair(ctx, data),
 		orphans(ctx, data),
 	];
@@ -344,59 +346,51 @@ function upcoming(ctx, data) {
 	});
 }
 
-function nodes(ctx, data) {
-	const rows = data.nodes.map((node) =>
-		el('tr', null, [
-			el('td', { cls: 'mono' }, [node.hostname, node.isThisNode && muted(' (this node)')]),
-			el('td', null, [statusPill(node.status)]),
-			// LIVENESS, and it is a live fact: whether this node answered the fan-out that built
-			// this page. Never inferred from the timestamp beside it — see nodeAge.
-			el('td', null, [node.responding === false ? pill('not responding', 'bad') : null]),
-			el('td', { cls: 'right' }, [nodeAge(node)]),
-		])
-	);
+/**
+ * Node health in one line, with the detail a click away on Nodes.
+ *
+ * The nodes card used to live here, and its table was already the second copy of the one on Queue.
+ * What this page actually needs from it is whether anything about the nodes should pull an operator
+ * off the rest of the dashboard — so every clause is a thing that should be true, and the line turns
+ * into an alarm the moment one of them is not. Nothing is dropped by shortening it: the table, the
+ * replication detail and the per-node config answers all moved to Nodes rather than disappearing.
+ */
+function nodeSummary(ctx, data) {
+	const nodes = data.nodes ?? [];
+	// `responding` is null under node scope (there was no fan-out to answer it) and only ever false
+	// when a configured node was asked and did not reply — so the count is of nodes NOT known bad,
+	// never of nodes proven good.
+	const responding = nodes.filter((node) => node.responding !== false).length;
+	const paused = nodes.filter((node) => node.status === 'paused').length;
+	const behind = nodes.filter((node) => node.behind?.length).length;
 
-	// A row every peer holds an older copy of means replication is not delivering that node's
-	// writes — the one thing this table can see that nothing else can, since it is the only place
-	// four copies of the same replicated row are compared side by side.
-	const diverged = data.nodes.filter((n) => n.behind?.length);
+	const clauses = [
+		[`${num(nodes.length)} node${nodes.length === 1 ? '' : 's'}`, nodes.length > 0],
+		[`${num(responding)} responding`, responding === nodes.length],
+		[`${num(paused)} paused`, paused === 0],
+		behind ? [`${num(behind)} behind on replication`, false] : ['replication converged', true],
+	];
 
-	return card('Nodes', {
-		head: [spacer(), link('open queue →', () => ctx.go('queue'))],
-		body: [
-			diverged.length &&
-				el('div', { cls: 'note bad' }, [
-					'Replication gap: ' +
-						diverged
-							.map(
-								(n) =>
-									`${n.hostname}'s row is ${duration(n.spreadMs)} behind on ${n.behind.map((b) => b.reporter).join(', ')}`
-							)
-							.join('; ') +
-						'. Those nodes are not receiving that node’s writes to render_service — which also carries ' +
-						'Target, so URLs it discovers are not reaching them either.',
-				]),
-			el('div', { cls: 'scroll' }, [
-				el('table', null, [
-					el(
-						'tbody',
-						null,
-						rows.length
-							? rows
-							: [el('tr', null, [el('td', { cls: 'muted', text: 'No nodes have reported queue status yet.' })])]
-					),
-				]),
-			]),
-		],
-		foot: [
-			muted(
-				'“Status since” is when that node’s queue status last CHANGED — the row is written only on a ' +
-					'change, so a steady node showing hours is healthy, not stale. Liveness is the column beside ' +
-					'it: whether the node answered this page load. Per-node throughput, pause intent and claim ' +
-					'health are on Queue & nodes.'
-			),
-		],
-	});
+	// The config clause is claimed ONLY when a config payload happens to be in the shared scratch —
+	// Nodes and Queue load it, this view deliberately does not, because a fan-out for one clause is
+	// not worth it on the page that is already the heaviest. Saying nothing is the honest state for a
+	// question this page never asked; a green "config identical" derived from no data is exactly the
+	// failure mode this console keeps being widened to prevent.
+	const payload = configState(ctx).payload;
+	if (payload?.configFrom) {
+		// Only the unexplained ones. A divergence the merge tagged `overridden` is the override layer
+		// converging — normally because of a write this console just made — and raising the
+		// deploy-failure alarm for it here is how that alarm stops being read.
+		const differ = (payload.divergences ?? []).filter((entry) => !entry.overridden).length;
+		clauses.push(differ ? [`${num(differ)} option(s) differ between nodes`, false] : ['config identical', true]);
+	}
+
+	const bad = clauses.some(([, ok]) => !ok);
+	return el('div', { cls: `note ${bad ? 'bad' : ''}`.trim() }, [
+		clauses.map(([text], index) => [index > 0 && ' · ', text]),
+		' — ',
+		link('open nodes →', () => ctx.go('nodes')),
+	]);
 }
 
 /**
@@ -406,57 +400,39 @@ function nodes(ctx, data) {
  * line, not a queryable record), so that part stays declared rather than faked: the panel
  * never shows a URL it cannot actually know.
  */
+/**
+ * Render outcomes, demoted to one line.
+ *
+ * This used to be a full card breaking outcomes down by kind. Queue already renders the same
+ * `render` metric as KPIs AND as a stacked series over time, so the card was a strict subset of a
+ * better panel one click away — and a dashboard that restates another page's numbers teaches
+ * operators that the overview is where you look, which is exactly wrong when the detail (which
+ * outcome, trending which way) only exists on the other page.
+ *
+ * What survives is the part an overview owes you: whether the number is bad enough to go and look.
+ * The threshold matches Queue's own (one in ten past tail noise for any healthy corpus), so the two
+ * pages cannot disagree about whether this is fine.
+ */
 function failures(ctx) {
 	const data = ctx.data.analytics;
-	const openQueue = link('open queue →', () => ctx.go('queue'));
-	const title = `Render outcomes — ${scopeLabel(data)}, last hour`;
-
-	if (!data || data.available === false || windowEmpty(data)) {
-		return card(title, {
-			head: [spacer(), openQueue],
-			body: [emptyNote('render', data)],
-		});
-	}
-
-	// Pill severity mirrors the chart colors: rendered good, hard failures bad, retried warn,
-	// verdicts (suppressed/redirect) neutral — they are outcomes, not faults.
-	const outcomeKind = (outcome) =>
-		outcome === 'rendered'
-			? 'ok'
-			: outcome === 'failed' || outcome === 'auth-failure'
-				? 'bad'
-				: outcome === 'transient'
-					? 'warn'
-					: '';
+	const open = link('open queue \u2192', () => ctx.go('queue'));
+	if (!data || data.available === false || windowEmpty(data)) return null;
 
 	const outcomes = pick(data, 'render', (s) => s.path === 'outcome');
 	const total = sumCount(outcomes);
-	// A plain object, not a Map: the asset test pins `get('…')` literals as API routes, and
-	// outcome names are a closed set from the metric catalog, so untrusted-key traps don't apply.
+	if (total === 0) return null;
+
 	const byOutcome = {};
 	for (const s of outcomes) byOutcome[s.method] = (byOutcome[s.method] ?? 0) + s.count;
 	const bad = (byOutcome['failed'] ?? 0) + (byOutcome['auth-failure'] ?? 0);
+	const rate = bad / total;
 
-	return card(title, {
-		head: [spacer(), openQueue],
-		body: [
-			total === 0
-				? el('div', {
-						cls: 'note',
-						text: `No render results were processed on ${isMerged(data) ? 'any node' : 'this node'} in the window.`,
-					})
-				: kv(
-						Object.entries(byOutcome)
-							.sort((a, b) => b[1] - a[1])
-							.map(([outcome, count]) => [outcome, pill(`${num(count)} · ${pct(count, total)}`, outcomeKind(outcome))])
-					),
-			bad > 0 &&
-				el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-					'WHICH urls are failing is not recorded anywhere queryable yet (a failure leaves a log ',
-					'line only) — grep the node log for "processJobResult" until a failure record exists.',
-				]),
-		],
-	});
+	return el('div', { cls: `note ${rate > 0.1 ? 'bad' : ''}`.trim() }, [
+		el('strong', { text: `Render outcomes \u00b7 ${scopeLabel(data)}, last hour: ` }),
+		`${num(bad)} of ${num(total)} failed or auth-failed (${pct(bad, total)})`,
+		rate > 0.1 ? ' \u2014 past tail noise for a healthy corpus. ' : '. ',
+		open,
+	]);
 }
 
 // A target whose RenderSchedule row is missing renders nothing, forever, with no error to
