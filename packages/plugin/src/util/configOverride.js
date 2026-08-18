@@ -39,6 +39,15 @@ import { aliasPaths, checkUiEditable } from '../configSchema.js';
 const table = () => databases.config.ConfigOverride;
 
 /**
+ * `e?.message`, never `e.message`: anything can be thrown, and `null.message` is a TypeError raised
+ * from inside the very catch block that exists to keep this path from failing. On this module that
+ * is not a cosmetic difference — every one of these catches runs inside `handleApplication`, so an
+ * exception escaping one turns a degraded override read into a component that will not load, on
+ * every node at once.
+ */
+const messageOf = (e) => e?.message ?? String(e);
+
+/**
  * Ceiling on rows one read will take. There are ~130 valid option paths and the path is the primary
  * key, so a table past this has accumulated rows for options that no longer exist — junk, not
  * configuration. The cap exists because `handleApplication` has a hard timeout (30s by default) and
@@ -46,6 +55,16 @@ const table = () => databases.config.ConfigOverride;
  * this path has to be bounded by construction.
  */
 const MAX_OVERRIDE_ROWS = 500;
+
+/**
+ * Node's `setInterval` ceiling. Past 2^31-1 ms the delay overflows: node warns and then fires the
+ * callback after ONE MILLISECOND. So an over-large interval does not merely slow the backstop down,
+ * it converts it into a hot loop re-reading the override table on every worker of every node — the
+ * opposite of what the number asked for, and a far worse failure than the 32-bit wrap this used to
+ * have. The schema rejects anything larger with a warning, which is the loud path; this clamp is
+ * here so that the loud path working is not the only thing standing between a typo and that loop.
+ */
+const MAX_TIMER_MS = 2147483647;
 
 /**
  * Deadline for a single override read. Same reasoning as the row cap, for the other failure mode:
@@ -148,10 +167,10 @@ export const readOverrides = async () => {
 		return { overrides, rows: kept, degraded: false, truncated, error: null };
 	} catch (e) {
 		getLogger().warn?.(
-			`[prerender] Could not read stored config overrides (${e.message}) — running the deployed ` +
+			`[prerender] Could not read stored config overrides (${messageOf(e)}) — running the deployed ` +
 				`configuration for now; the backstop re-read will pick them up.`
 		);
-		return { ...empty, error: e.message };
+		return { ...empty, error: messageOf(e) };
 	}
 };
 
@@ -386,7 +405,7 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 				// the old config indefinitely, which is precisely the state the backstop exists to end.
 				lastFingerprint = fingerprint;
 			} catch (e) {
-				lastError = e.message;
+				lastError = messageOf(e);
 				getLogger().error?.(e);
 			}
 		});
@@ -434,9 +453,9 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 			subscribed = true;
 		} catch (e) {
 			subscribed = false;
-			subscribeError = e.message;
+			subscribeError = messageOf(e);
 			getLogger().warn?.(
-				`[prerender] Could not subscribe to config overrides (${e.message}) — falling back to the ` +
+				`[prerender] Could not subscribe to config overrides (${messageOf(e)}) — falling back to the ` +
 					`backstop poll, so a console edit converges within management.overrides.syncInterval instead ` +
 					`of about a second.`
 			);
@@ -448,9 +467,12 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 	// value is what makes the interval editable without a restart.
 	// `Math.trunc(Number(...))`, never `| 0`: the bitwise coercion wraps at 2^31, so a syncInterval of
 	// 2^31+1 ms became NEGATIVE and disabled the backstop while the schema, the API and the console
-	// all went on reporting the configured value.
+	// all went on reporting the configured value. Clamped at the far end for the reason MAX_TIMER_MS
+	// gives — over the ceiling, node fires the timer every millisecond instead of never.
 	const intervalOf = (settings) =>
-		settings.enabled === false ? 0 : Math.max(0, Math.trunc(Number(settings.syncInterval)) || 0);
+		settings.enabled === false
+			? 0
+			: Math.min(MAX_TIMER_MS, Math.max(0, Math.trunc(Number(settings.syncInterval)) || 0));
 
 	const syncPollTimer = () => {
 		const wanted = intervalOf(config.management.overrides);

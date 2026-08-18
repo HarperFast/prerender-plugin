@@ -489,9 +489,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 						true,
 						'Watch the override table so a console edit converges in about a second instead of ' +
 							'waiting out `syncInterval`. Subscribing requires the table’s audit log (Harper turns ' +
-							'it on when you subscribe) and attaches its commit listener to THAT table only, so it ' +
-							'adds no work to the hot target/schedule write paths. False leaves the backstop poll as ' +
-							'the only path, which is correct behavior, just slower.'
+							'it on when you subscribe) and attaches its commit listener to the whole DATABASE’s ' +
+							'audit store, which is why this table lives alone in `config`: every commit in a ' +
+							'subscribed table’s database schedules a pass over the transaction log, so a ' +
+							'subscription sharing a database with the hot target/schedule tables would tax every ' +
+							'write to them. False leaves the backstop poll as the only path, which is correct ' +
+							'behavior, just slower.'
 					),
 					syncInterval: option(
 						30 * SECOND,
@@ -502,8 +505,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'or a worker whose boot read failed, still converges — the layer gets a bound on how ' +
 							'stale it can be that does not depend on a callback firing. A re-read whose result is ' +
 							'unchanged does not re-apply, so the steady-state cost is one bounded scan of a table ' +
-							'with at most a few dozen rows. 0 disables the backstop.',
-						{ unit: 'ms', min: 0 }
+							'with at most a few dozen rows. 0 disables the backstop, and the ceiling is node’s own ' +
+							'timer limit of 2^31-1 ms (~24.8 days) — past it a timer fires every millisecond ' +
+							'rather than never.',
+						{ unit: 'ms', min: 0, max: 2147483647 }
 					),
 				},
 				{ uiEditable: false }

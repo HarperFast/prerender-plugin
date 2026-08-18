@@ -128,6 +128,24 @@ test('an override violating enum, min, max, nonEmpty or itemEnum is rejected and
 	}
 });
 
+test('a backstop interval past node’s timer ceiling is refused rather than armed', () => {
+	// Over 2^31-1 ms, `setInterval` does not fire late or never — node warns and fires the callback
+	// after ONE MILLISECOND. So the value that reads as "poll about once a month" arms a hot loop
+	// re-reading the override table on every worker of every node. Refusing it in the schema is the
+	// loud half of the fix; `MAX_TIMER_MS` in configOverride.js clamps whatever still reaches a timer.
+	const { config: resolved, warnings } = resolveConfig({ management: { overrides: { syncInterval: 3e9 } } }, null);
+
+	assert.equal(
+		resolved.management.overrides.syncInterval,
+		30_000,
+		'an interval node cannot express must fall back to one it can'
+	);
+	assert.ok(
+		warnings.some((w) => w.includes('management.overrides.syncInterval')),
+		'and the operator has to be told, because the configured value is not the running one'
+	);
+});
+
 test('describeConfigLayers names the layer that actually won for each option', () => {
 	applyOptions({ page: { ttl: 5000 } }, { 'queue.jobLeaseTime': 15 * MINUTE, 'domains': 'not-an-array' });
 
