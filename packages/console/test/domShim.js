@@ -20,6 +20,8 @@ class ShimNode {
 		this.style = {};
 		this.listeners = {};
 		this.ownText = '';
+		// The shell restores this across a rebuild; a plain field is all that behaviour needs.
+		this.scrollTop = 0;
 	}
 
 	get textContent() {
@@ -77,14 +79,35 @@ class ShimNode {
 	get classList() {
 		return { add: () => {}, remove: () => {}, toggle: () => {} };
 	}
-	querySelector() {
+
+	/**
+	 * Depth-first, first match, and ONLY the `.class` form — the single selector shape this client
+	 * uses. A stub returning null was fine while nothing depended on the answer; the shell now finds
+	 * its scroll container this way, and a stub would have made that code untestable while looking
+	 * like it passed.
+	 */
+	querySelector(selector) {
+		if (typeof selector !== 'string' || !selector.startsWith('.')) return null;
+		const wanted = selector.slice(1);
+		for (const child of this.children) {
+			if (
+				String(child.attributes?.class ?? '')
+					.split(/\s+/)
+					.includes(wanted)
+			)
+				return child;
+			const hit = child.querySelector?.(selector);
+			if (hit) return hit;
+		}
 		return null;
 	}
+
 	focus() {}
 }
 
 /** Install the shim. Idempotent, so every test file can call it. */
 export function installDom() {
+	const roots = new Map();
 	globalThis.document = {
 		createElement: (tag) => new ShimNode(tag),
 		createElementNS: (_ns, tag) => new ShimNode(tag),
@@ -93,7 +116,15 @@ export function installDom() {
 			node.textContent = text;
 			return node;
 		},
-		getElementById: () => new ShimNode('div'),
+		// MEMOIZED, because a browser's #app persists across renders and the console's whole render
+		// model is "replace the children of that one node". Handing out a fresh node per call made
+		// every render start from a tree nobody could observe — including the previous one, which
+		// is where the shell reads the scroll position it is about to restore.
+		getElementById: (id) => {
+			let node = roots.get(id);
+			if (!node) roots.set(id, (node = new ShimNode('div')));
+			return node;
+		},
 	};
 	globalThis.location ??= { pathname: '/prerender_console' };
 	globalThis.localStorage ??= { getItem: () => null, setItem: () => {} };

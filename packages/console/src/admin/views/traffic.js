@@ -18,6 +18,15 @@
  * it costs no request), falling back to `render.defaultInterval`. Absolute milliseconds stay one
  * click away, and the KPI carries both.
  *
+ * AND NOT EVERY MISS IS OURS. A miss whose origin fetch came back 404 or 410 is a URL that does
+ * not exist anywhere — there is nothing for the cache to be missing, and it can never improve,
+ * because only a 200 is ever scheduled for prerendering. Left in the coverage number those URLs
+ * make a complete corpus look broken, and at crawler volume they are not a rounding error. So the
+ * coverage figures are stated NET of them, with the excluded population shown beside the number
+ * rather than quietly dropped. The netting is exact — a miss that proxies emits one bot_serve row
+ * and one origin_fetch row — except under a bot filter, where origin_fetch carries no bot name;
+ * there the tile says it is not netted instead of scaling one population by the other's share.
+ *
  * NOT EVERY NON-HIT IS A MISS. "miss" is one of nine freshness verdicts and the only one that
  * means what the word implies — nothing cached under the key. The others are a page served past
  * its cadence (`swr`), one past the SWR window entirely (`stale`), a body that could not be read
@@ -349,7 +358,7 @@ function kpis(data, scope) {
 	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
 	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
 	const freshHits = sumCount(serves.filter((s) => s.method === 'hit'));
-	const coverageMiss = sumCount(serves.filter((s) => s.method === 'miss'));
+	const coverage = coverageSplit({ serves, costs: originCostByReason(data), filter });
 	const arrived = sumCount(requests);
 
 	const durations = pick(data, 'duration');
@@ -389,7 +398,17 @@ function kpis(data, scope) {
 		),
 		stat('Cache-served', pct(cacheServes, total), 'stored snapshot answered'),
 		stat('Fresh hits', pct(freshHits, total), 'inside the configured cadence'),
-		stat('Coverage miss', pct(coverageMiss, total), 'nothing cached under the key'),
+		stat(
+			'Coverage miss',
+			pct(coverage.net, total),
+			coverage.netable
+				? `${num(coverage.absent)} excluded — the origin has no such page`
+				: coverage.absent > 0
+					? 'not netted: the origin 404 split is all-bots'
+					: 'nothing cached under the key',
+			// A miss the origin CAN serve is the corpus gap; the netted figure is the one worth a flag.
+			{ warn: total > 0 && coverage.net > total / 3 }
+		),
 		stat('Serve p95', fmtMs(p95), filter ? 'server-side · all bots' : 'server-side, bot requests'),
 		stat(
 			normalizable ? 'Staleness p95' : 'Page age p95',
@@ -588,21 +607,102 @@ export function notHitRows(serves) {
 	return [...byStatus.values()].sort((a, b) => b.count - a.count);
 }
 
-/** Origin-side cost keyed by the cache status that sent the request there (the reason slot). */
-function originCostByReason(data) {
+/**
+ * What the origin's answer MEANS, for a status code in `origin_fetch.path`.
+ *
+ * `absent` is the one that changes a number rather than describing it. A 404 or 410 says the page
+ * does not exist at the origin, so the cache having nothing for it is not a coverage gap — there
+ * is nothing to cover. It is also permanent: only a 200 is ever scheduled for prerendering
+ * (`maybeSchedule`), so a URL the origin does not have misses on every single crawl, forever.
+ * Folding those into "coverage miss" is what makes a corpus look broken when it is complete, and
+ * the usual source is crawler-invented URLs rather than anything this deployment did.
+ */
+export function originVerdict(code) {
+	const n = Number(code);
+	if (!Number.isFinite(n) || n <= 0) return 'connect-fail';
+	if (n === 404 || n === 410) return 'absent';
+	if (n >= 500) return 'server-error';
+	if (n >= 400) return 'client-error';
+	return 'served';
+}
+
+/** Colors follow the status classes they summarize; `absent` is not a fault, so it is neutral. */
+const VERDICT_COLORS = {
+	'served': 'var(--ok)',
+	'absent': 'var(--fg-3)',
+	'client-error': 'var(--warn)',
+	'server-error': 'var(--bad)',
+	'connect-fail': 'var(--bad)',
+};
+
+/**
+ * Origin-side cost keyed by the cache status that sent the request there (the reason slot),
+ * with what the origin actually answered.
+ */
+export function originCostByReason(data) {
 	const costs = new Map();
 	for (const s of pick(data, 'origin_fetch')) {
 		const reason = s.method ?? 'unknown';
 		let row = costs.get(reason);
-		if (!row) costs.set(reason, (row = { combos: [], count: 0, failures: 0 }));
+		if (!row) costs.set(reason, (row = { combos: [], count: 0, failures: 0, absent: 0, verdicts: new Map() }));
 		row.combos.push(s);
 		row.count += s.count;
-		const code = Number(s.path);
-		if (!Number.isFinite(code) || code <= 0 || code >= 500) row.failures += s.count;
+		const verdict = originVerdict(s.path);
+		row.verdicts.set(verdict, (row.verdicts.get(verdict) ?? 0) + s.count);
+		if (verdict === 'server-error' || verdict === 'connect-fail') row.failures += s.count;
+		if (verdict === 'absent') row.absent += s.count;
 	}
 	for (const row of costs.values()) row.p95 = weighted(row.combos, 'p95');
 	return costs;
 }
+
+/**
+ * The one verdict name shared by two metrics: `bot_serve.method` and `origin_fetch.method` (the
+ * reason slot) both call it `miss`, which is exactly what lets the two populations be joined.
+ *
+ * A constant rather than a string literal at the Map lookup: the route-contract test scans client
+ * modules for get/post calls taking a quoted name, and a bare lookup written that way reads to it
+ * as a fetch of a route called "miss". That scan is worth far more than the characters it costs to
+ * stay out of its way — it is what catches a route the console can no longer reach.
+ */
+const MISS = 'miss';
+
+/**
+ * The coverage number, split into the part we own and the part we do not.
+ *
+ * `absent` is counted on the origin_fetch side and `missServes` on the bot_serve side. They are
+ * both per-request counters over the same window and a miss that proxies emits exactly one of
+ * each, so subtracting is sound — EXCEPT under a bot filter, because origin_fetch carries no bot
+ * name. Rather than scale one population by the other's share and call the estimate a KPI, the
+ * netting is switched off there and the tile says so.
+ */
+export function coverageSplit({ serves, costs, filter }) {
+	const missServes = sumCount(serves.filter((s) => s.method === MISS));
+	const absent = costs.get(MISS)?.absent ?? 0;
+	const netable = !filter && absent > 0;
+	return { missServes, absent, netable, net: netable ? Math.max(0, missServes - absent) : missServes };
+}
+
+/**
+ * What the origin answered, as shares — the column that turns "40% miss" into an action.
+ *
+ * Read as a sentence: `served 88% · absent 12%` means nine in ten of those misses are pages the
+ * origin has and we did not, and one in ten are pages nobody has.
+ */
+const verdictMix = (cost) =>
+	el(
+		'span',
+		{ cls: 'mono', style: { fontSize: '11px' } },
+		[...cost.verdicts.entries()]
+			.sort((a, b) => b[1] - a[1])
+			.flatMap(([verdict, count], index) => [
+				index > 0 && muted(' · '),
+				el('span', {
+					style: { color: VERDICT_COLORS[verdict] ?? 'var(--fg-2)' },
+					text: `${verdict} ${pct(count, cost.count)}`,
+				}),
+			])
+	);
 
 function notFreshHit(data, { serves, filter }) {
 	const total = sumCount(serves);
@@ -612,6 +712,12 @@ function notFreshHit(data, { serves, filter }) {
 
 	const byFamily = new Map();
 	for (const row of rows) byFamily.set(row.family, (byFamily.get(row.family) ?? 0) + row.count);
+
+	// Coverage is the one family that is not purely a bot_serve verdict: the part of it the origin
+	// answered 404/410 is not a gap in our corpus. Netting it here keeps this strip agreeing with
+	// the KPI above rather than shouting a bigger number two inches below a smaller one.
+	const coverage = coverageSplit({ serves, costs, filter });
+	if (coverage.netable) byFamily.set('coverage', coverage.net);
 
 	const head = [
 		spacer(),
@@ -652,9 +758,7 @@ function notFreshHit(data, { serves, filter }) {
 					? `${num(cost.count)} origin fetches under reason "${row.status}"`
 					: 'no origin fetch carried this reason',
 			}),
-			el('td', { cls: 'right' }, [
-				cost?.failures ? el('span', { cls: 'pill bad', text: num(cost.failures) }) : muted('—'),
-			]),
+			el('td', null, [cost ? verdictMix(cost) : muted('—')]),
 		]);
 	});
 
@@ -674,6 +778,13 @@ function notFreshHit(data, { serves, filter }) {
 				]
 					.filter((family) => byFamily.has(family.key))
 					.map((family) => stat(family.label, pct(byFamily.get(family.key), total), family.hint))
+					// The part carved out of Coverage, shown rather than silently dropped: the two tiles
+					// have to add back up to the miss share or the strip is just wrong by a different amount.
+					.concat(
+						coverage.netable
+							? [stat('Not found at origin', pct(coverage.absent, total), 'no such page — not a coverage gap')]
+							: []
+					)
 			),
 			table(
 				[
@@ -682,16 +793,32 @@ function notFreshHit(data, { serves, filter }) {
 					{ text: 'share', right: true },
 					'answered from',
 					{ text: `origin p95 ≈${filter ? ' *' : ''}`, right: true },
-					{ text: 'origin failed', right: true },
+					`origin answered${filter ? ' *' : ''}`,
 				],
 				body
 			),
+			coverage.absent > 0 &&
+				el('div', { cls: 'note' }, [
+					el('strong', {
+						text: `${num(coverage.absent)} of the misses (${pct(coverage.absent, coverage.missServes)}) were 404 or 410 at the origin. `,
+					}),
+					'Those URLs do not exist, so there is nothing for the cache to be missing — they are not a ',
+					'coverage gap, and ',
+					coverage.netable
+						? 'they are excluded from the Coverage figures above'
+						: 'they would be excluded but for the bot filter',
+					'. They also cannot improve: only a 200 is ever scheduled for prerendering, so the same URL ',
+					'misses on every crawl. A large or growing population here is usually crawler-invented URLs ',
+					'rather than anything this deployment did — the crawler sees the origin’s own 404, which is ',
+					'counted in the status panel below.',
+				]),
 			el('p', { cls: 'muted chart-note' }, [
 				'One row per freshness verdict, because they are four different problems: coverage is fixed in the ',
 				'corpus (discovery, sitemaps), cadence by render capacity or a longer interval, integrity is blob ',
 				'health and never a caching question, and the last two are working as configured. ',
 				'“origin p95” is that verdict’s own origin_fetch latency — the cost side of the same request — and ',
-				'“origin failed” counts 5xx and connect failures only, so a 404 is not in it.',
+				'“origin answered” is what came back: `absent` (404/410) is a page nobody has, `server-error` and ',
+				'`connect-fail` are the origin in trouble, and only `served` is a page we could have had cached.',
 				filter ? ' * origin_fetch carries no bot dimension: those two columns are all bots.' : '',
 			]),
 		],

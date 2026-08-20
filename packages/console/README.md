@@ -148,7 +148,8 @@ The view-by-view tour lives in the plugin README's
 API contract; the short version: **Overview** (scale, serve health, backlog shape, claim
 floor, schedule repair), **Traffic** (offload/hit-rate charts from one bounded analytics scan per
 node, freshness reported relative to each route's own render cadence, the non-hit verdicts broken
-out by what would fix them, and a client-side bot filter), **Sitemaps**, **Page cache**, **Queue**
+out by what would fix them — coverage stated net of URLs the origin does not have — and a
+client-side bot filter), **Sitemaps**, **Page cache**, **Queue**
 (render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first record/clear),
 **URL explainer**, **Metrics** (the live catalog), **Config**.
 

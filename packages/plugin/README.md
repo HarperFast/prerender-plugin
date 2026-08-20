@@ -640,7 +640,11 @@ claim floor, schedule repair — are plugin behavior.)
   broken out by **what would fix them** — coverage (`miss`), cadence (`swr`/`stale`), blob
   integrity (`blob-*`, `peer-rescue`), invalidation, and requests that were never cacheable —
   each with the origin latency it cost, because "miss rate" folds five different problems into
-  one number. A **bot filter** narrows every panel whose metric carries a bot name
+  one number. The coverage figures are stated **net of URLs the origin does not have**: a miss
+  whose origin fetch came back 404/410 is not a gap in the corpus (and can never close, since only
+  a 200 is ever scheduled), so it is carved out and shown beside the number rather than inflating
+  it — the netting is exact, and is switched off with a label under a bot filter, where
+  `origin_fetch` carries no bot name. A **bot filter** narrows every panel whose metric carries a bot name
   (`bot_request`, `bot_serve`, `page_age`, the crawl sketches) purely client-side, never a
   refetch; the panels whose metrics have no bot dimension say "all bots" on their face.
   **Everything is this node's slice**
@@ -653,7 +657,12 @@ claim floor, schedule repair — are plugin behavior.)
 - **Sitemaps** — the root list with per-root refresh state (running / failed, with the child
   failures), a capped count of targets attributed to the selected sitemap, and a paged entry
   table with per-entry state (`cached` / `stale` / `scheduled` / `filtered` /
-  `non-indexable`). A `filtered` verdict costs no reads — it comes from the same route
+  `non-indexable`). A sitemap **index** is presented as what it is: its entries are child
+  sitemaps, so they get a drill-in rather than the page columns (`changefreq`, `priority`, cache
+  state and the cache-key explainer are all meaningless for an XML document that is never
+  prerendered), and its target count is omitted rather than reported as zero — a walk attributes
+  every Target to the child that listed the URL, never to the index. A child opens in place with
+  a link back to its parent, which is the only way to reach one: the list is roots only. A `filtered` verdict costs no reads — it comes from the same route
   classifier the serving path uses. Alongside it, the unrouted-path tally: bot traffic served
   without prerendering, bucketed by first path segment, labelled with the worker whose slice
   it is.
