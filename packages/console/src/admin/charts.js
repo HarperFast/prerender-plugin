@@ -115,6 +115,15 @@ const clock = (ms) => {
 // The analytics payload is `series`: one entry per (metric, path, method, type) combo, each
 // carrying totals plus fixed-width bucket arrays. These helpers shape combos into charts and
 // KPIs; they never fetch.
+//
+// EVERY NUMBER HERE IS ALREADY A JS NUMBER, and deliberately so — nothing below re-coerces.
+// These modules run in the browser and their only input is `res.json()`, so a database Long or
+// BigInt cannot reach them (JSON has no such type, and stringifying one throws at the source).
+// The coercion belongs where the database is actually read, and lives there: `bucketize()` in
+// the plugin's `util/analyticsRead.js` runs every column through `numberOf()` — which also
+// keeps `Number(null) === 0` from flooring a weighted average — and the console's cluster merge
+// (`util/aggregate.js`) does the same with its own `finite()`. Coercing a second time here would
+// imply the payload is untrusted in a way it is not, and would hide which layer owns the rule.
 
 export const pick = (data, metric, filter) =>
 	(data?.series ?? []).filter((s) => s.metric === metric && (!filter || filter(s)));
