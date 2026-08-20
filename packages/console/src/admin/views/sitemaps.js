@@ -26,12 +26,29 @@ export async function load(ctx) {
 	ctx.data.list = res.body;
 	ctx.data.error = null;
 
-	// Keep the selection when it still exists; else select the first root.
+	// KEEP THE SELECTION EVEN WHEN IT IS NOT A ROOT. The list is roots only, but a child sitemap is
+	// a perfectly good selection — it is how an index is explored, and the detail endpoint reads any
+	// stored sitemap by URL. Requiring the selection to appear in the root list snapped every
+	// drill-into-a-child straight back to the first root on the reload that followed the click.
 	const roots = res.body.sitemaps ?? [];
-	if (!roots.some((sitemap) => sitemap.url === ctx.data.selected)) {
-		ctx.data.selected = roots[0]?.url ?? null;
-	}
+	ctx.data.selected ??= roots[0]?.url ?? null;
 	await loadDetail(ctx);
+
+	// A selection that no longer resolves (a child that left its index between walks, a sitemap
+	// removed) falls back to the first root rather than leaving a dead pane with a stale URL in it.
+	if (!ctx.data.detail && ctx.data.selected && ctx.data.selected !== roots[0]?.url) {
+		ctx.data.selected = roots[0]?.url ?? null;
+		ctx.data.offset = 0;
+		await loadDetail(ctx);
+	}
+}
+
+/** Select a sitemap — a root from the list, or a child reached from its parent index. */
+function open(ctx, url) {
+	ctx.data.selected = url;
+	ctx.data.offset = 0;
+	ctx.data.filter = '';
+	ctx.reload();
 }
 
 async function loadDetail(ctx) {
@@ -108,11 +125,7 @@ function rootList(ctx, roots) {
 						borderColor: selected ? 'rgba(45,212,160,0.35)' : undefined,
 						background: selected ? 'rgba(45,212,160,0.08)' : undefined,
 					},
-					onclick: () => {
-						ctx.data.selected = sitemap.url;
-						ctx.data.offset = 0;
-						ctx.reload();
-					},
+					onclick: () => open(ctx, sitemap.url),
 				},
 				[
 					el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
@@ -137,12 +150,21 @@ function detail(ctx) {
 
 	const header = card(null, {
 		body: [
+			// A child sitemap is only reachable through its parent, so it is the one place in this
+			// console that needs a way back — the root list cannot select it and cannot show it as
+			// selected either.
+			sitemap.parentUrl &&
+				el('div', { style: { marginBottom: '10px' } }, [
+					link(`↑ ${shortPath(sitemap.parentUrl)}`, () => open(ctx, sitemap.parentUrl)),
+					muted(' — the index that lists this sitemap'),
+				]),
 			el('div', { cls: 'toolbar' }, [
 				el('div', {
 					cls: 'mono break',
 					style: { fontSize: '14px', color: 'var(--fg-0)', minWidth: '0' },
 					text: sitemap.url,
 				}),
+				sitemap.isIndex && pill('index', 'info'),
 				spacer(),
 				el('button', {
 					text: 'Refresh now',
@@ -186,33 +208,45 @@ function statsRow(detail) {
 	const { sitemap, targetCount } = detail;
 	const entryCount = sitemap.entryCount ?? 0;
 
-	return el(
-		'div',
-		{
-			style: {
-				display: 'grid',
-				gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
-				gap: '16px',
-				marginTop: '16px',
-			},
-		},
-		[
-			statCell('Entries', num(entryCount), meter(1)),
-			// targetCount is a capped count of Target rows whose sitemapUrl matches (an
-			// indexed equality). Null when the count timed out — shown as unknown, not zero.
+	// AN INDEX HAS NO TARGETS OF ITS OWN, structurally: a walk attributes each Target to the
+	// sitemap that actually listed the URL, which is always a child. So "Targets 0 / Coverage 0%"
+	// on an index is not a finding, it is the shape of the data — and it reads as a total failure
+	// of the largest sitemap in the deployment. Count what an index does have instead.
+	if (sitemap.isIndex) {
+		return el('div', { style: STATS_GRID }, [
+			statCell('Child sitemaps', num(entryCount), muted('listed by this index')),
 			statCell(
-				'Targets',
-				targetCount === null ? '—' : num(targetCount.count) + (targetCount.truncated ? '+' : ''),
-				targetCount === null ? muted('count timed out') : meter(entryCount ? targetCount.count / entryCount : 0)
+				'Last walked',
+				sitemap.lastRefreshed ? ago(new Date(sitemap.lastRefreshed).getTime()) : 'never',
+				muted('this document, not its children')
 			),
-			statCell(
-				'Coverage',
-				targetCount === null || !entryCount ? '—' : pct(Math.min(targetCount.count, entryCount), entryCount),
-				muted('entries with a render target')
-			),
-		]
-	);
+			statCell('Entries', '—', muted('an index lists sitemaps, not URLs — open one below')),
+		]);
+	}
+
+	return el('div', { style: STATS_GRID }, [
+		statCell('Entries', num(entryCount), meter(1)),
+		// targetCount is a capped count of Target rows whose sitemapUrl matches (an
+		// indexed equality). Null when the count timed out — shown as unknown, not zero.
+		statCell(
+			'Targets',
+			targetCount === null ? '—' : num(targetCount.count) + (targetCount.truncated ? '+' : ''),
+			targetCount === null ? muted('count timed out') : meter(entryCount ? targetCount.count / entryCount : 0)
+		),
+		statCell(
+			'Coverage',
+			targetCount === null || !entryCount ? '—' : pct(Math.min(targetCount.count, entryCount), entryCount),
+			muted('entries with a render target')
+		),
+	]);
 }
+
+const STATS_GRID = {
+	display: 'grid',
+	gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+	gap: '16px',
+	marginTop: '16px',
+};
 
 const statCell = (label, value, extra) =>
 	el('div', null, [
@@ -233,24 +267,60 @@ function entryTable(ctx, detail, entries) {
 	const search = el('input', {
 		type: 'text',
 		value: filter,
-		placeholder: `Filter the ${entries.length} entries on this page`,
+		placeholder: `Filter the ${entries.length} ${detail.sitemap.isIndex ? 'child sitemaps' : 'entries'} on this page`,
 	});
 	search.addEventListener('input', () => {
 		ctx.data.filter = search.value;
 		ctx.render();
 	});
 
+	// AN INDEX'S ENTRIES ARE SITEMAPS, NOT PAGES, and almost nothing on the URL table means
+	// anything for one. `<changefreq>` and `<priority>` are not part of the sitemapindex schema at
+	// all, so those columns are structurally empty. The state pill is worse than empty: it is the
+	// answer to "is this URL cached and scheduled", asked of an XML document that is never
+	// prerendered — so every row reads `no target` or `filtered`, which looks like a fault and is
+	// not one. And `explain` explains the cache key of a sitemap file nobody will ever request.
+	//
+	// What an operator actually wants from an index row is to open that child, which until now was
+	// impossible from this console: the list is roots only, so children were reachable in the
+	// comments and nowhere else.
+	const isIndex = !!detail.sitemap.isIndex;
+	// `lastmod` is the one field the index schema does carry. The plugin does not return it yet, so
+	// the column appears only if it is there — it lights up on its own when that lands, rather than
+	// standing as a permanently empty column now.
+	const anyLastmod = isIndex && visible.some((entry) => entry.lastmod);
+
 	const rows = visible.map((entry) =>
-		el('tr', null, [
-			el('td', { cls: 'mono truncate', style: { maxWidth: '380px' }, title: entry.loc, text: shortPath(entry.loc) }),
-			el('td', { cls: 'muted', text: entry.changefreq ?? '—' }),
-			el('td', { cls: 'mono muted', text: entry.priority ?? '—' }),
-			el('td', null, [entryState(entry)]),
-			el('td', { cls: 'right' }, [
-				link('explain →', () => ctx.go('explain', { input: { url: entry.loc, deviceType: '' }, result: null })),
-			]),
-		])
+		isIndex
+			? el('tr', null, [
+					el('td', {
+						cls: 'mono truncate',
+						style: { maxWidth: '460px' },
+						title: entry.loc,
+						text: shortPath(entry.loc),
+					}),
+					anyLastmod && el('td', { cls: 'mono muted', text: entry.lastmod ?? '—' }),
+					el('td', { cls: 'right' }, [link('open →', () => open(ctx, entry.loc))]),
+				])
+			: el('tr', null, [
+					el('td', {
+						cls: 'mono truncate',
+						style: { maxWidth: '380px' },
+						title: entry.loc,
+						text: shortPath(entry.loc),
+					}),
+					el('td', { cls: 'muted', text: entry.changefreq ?? '—' }),
+					el('td', { cls: 'mono muted', text: entry.priority ?? '—' }),
+					el('td', null, [entryState(entry)]),
+					el('td', { cls: 'right' }, [
+						link('explain →', () => ctx.go('explain', { input: { url: entry.loc, deviceType: '' }, result: null })),
+					]),
+				])
 	);
+
+	const headers = isIndex
+		? ['child sitemap', anyLastmod && 'lastmod', { text: '', right: true }].filter(Boolean)
+		: ['url', 'changefreq', 'priority', 'state', { text: '', right: true }];
 
 	const offset = detail.offset ?? 0;
 	const total = detail.sitemap.entryCount ?? entries.length;
@@ -267,9 +337,11 @@ function entryTable(ctx, detail, entries) {
 			spacer(),
 		]),
 		table(
-			['url', 'changefreq', 'priority', 'state', { text: '', right: true }],
+			headers,
 			rows,
-			filter ? 'No entries on this page match the filter.' : 'This sitemap has no entries.'
+			filter
+				? `No ${isIndex ? 'child sitemaps' : 'entries'} on this page match the filter.`
+				: `This ${isIndex ? 'index lists no sitemaps' : 'sitemap has no entries'}.`
 		),
 		el('div', { cls: 'card-foot' }, [
 			el('span', { text: `${num(Math.min(offset + 1, total))}–${num(offset + entries.length)} of ${num(total)}` }),

@@ -132,8 +132,29 @@ const ctx = {
 
 // ---- shell ----
 
+/**
+ * Where the operator was looking, carried across the rebuild.
+ *
+ * Rendering replaces the entire tree, `main` included, so without this every click — a filter
+ * chip, a pause toggle, a page of a table, the one-second busy render an action does before its
+ * result lands — silently teleported the page back to the top. On views that are several screens
+ * long (Traffic, Config) that made the panels near the bottom effectively unusable: act on one,
+ * and you have to find your place again. The scroll lives on `.main` rather than the window (the
+ * shell is a `100vh` flex column with the content pane scrolling inside it), which is why
+ * restoring `window.scrollY` would have done nothing.
+ *
+ * A view CHANGE still starts at the top — that is a new page, and arriving halfway down it is its
+ * own kind of disorienting.
+ */
+let scrollTop = 0;
+let scrolledView = null;
+
 function render() {
 	const app = document.getElementById('app');
+	// Read before the tree goes away. `querySelector` is guarded because the DOM shim the tests
+	// render through implements only what `el()` needs.
+	const live = app.querySelector?.('.main');
+	if (live) scrollTop = live.scrollTop;
 	app.textContent = '';
 
 	if (!state.session)
@@ -141,21 +162,22 @@ function render() {
 	if (!state.session.authenticated || !state.session.superUser) return void app.appendChild(renderSignIn());
 
 	const view = currentView();
+	const main = el('main', { cls: 'main' }, [
+		el('div', { cls: 'view' }, [
+			state.error && el('div', { cls: 'note bad', text: state.error }),
+			...incompleteSources(),
+			view.render(ctx),
+		]),
+	]);
 	app.appendChild(
-		el('div', { cls: 'app' }, [
-			renderSidebar(),
-			el('div', { cls: 'content' }, [
-				renderTopbar(view),
-				el('main', { cls: 'main' }, [
-					el('div', { cls: 'view' }, [
-						state.error && el('div', { cls: 'note bad', text: state.error }),
-						...incompleteSources(),
-						view.render(ctx),
-					]),
-				]),
-			]),
-		])
+		el('div', { cls: 'app' }, [renderSidebar(), el('div', { cls: 'content' }, [renderTopbar(view), main])])
 	);
+
+	if (state.view !== scrolledView) scrollTop = 0;
+	scrolledView = state.view;
+	// Assigning past the new content's height clamps, so a rebuild that produced a shorter page
+	// lands at its bottom rather than throwing.
+	main.scrollTop = scrollTop;
 }
 
 function renderSidebar() {

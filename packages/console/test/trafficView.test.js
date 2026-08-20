@@ -26,7 +26,8 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render, cadenceIndex, cadenceFor, notHitRows } = await import('../src/admin/views/traffic.js');
+const { load, render, cadenceIndex, cadenceFor, notHitRows, originVerdict, originCostByReason, coverageSplit } =
+	await import('../src/admin/views/traffic.js');
 
 const HOUR = 3_600_000;
 const BUCKETS = 4;
@@ -92,8 +93,10 @@ const ANALYTICS = {
 		combo('route_serve', '/product/', 'miss', 'desktop', 200),
 		combo('route_serve', '/search/', 'miss', 'desktop', 100),
 		combo('route_serve', 'unclassified', 'miss', 'desktop', 60),
-		// origin_fetch: path=statusCode, method=reason
-		combo('origin_fetch', '200', 'miss', null, 240, 800),
+		// origin_fetch: path=statusCode, method=reason. 100 of the 250 misses are pages the origin
+		// does not have — the population that makes a complete corpus look broken.
+		combo('origin_fetch', '200', 'miss', null, 140, 800),
+		combo('origin_fetch', '404', 'miss', null, 100, 120),
 		combo('origin_fetch', '503', 'miss', null, 10, 3000),
 		combo('origin_fetch', '200', 'blob-timeout', null, 10, 700),
 		// Harper's own per-request metrics, bot traffic only (handlerPath 'p')
@@ -249,11 +252,81 @@ test('the whole view renders, and reports staleness against each route’s own c
 test('the KPI strip separates a coverage miss from every other non-hit', async () => {
 	const ctx = await ready();
 	const text = textOf(ctx);
-	// 250 misses of 1010 serves.
+	// 250 misses of 1,010 serves, but 100 of them 404 at the origin: 150/1010 = 15% is the number
+	// this deployment can actually act on.
 	assert.match(text, /Coverage miss/);
-	assert.match(text, /25%/);
+	assert.match(text, /15%/);
 	// And the families are all named, each with its own fix.
 	for (const family of ['Coverage', 'Cadence', 'Integrity']) assert.match(text, new RegExp(family));
+});
+
+// ---- misses the origin cannot serve -----------------------------------------
+
+test('originVerdict separates "nobody has this page" from "the origin is broken"', () => {
+	assert.equal(originVerdict(200), 'served');
+	assert.equal(originVerdict(301), 'served');
+	assert.equal(originVerdict(404), 'absent');
+	assert.equal(originVerdict(410), 'absent');
+	assert.equal(originVerdict(403), 'client-error');
+	assert.equal(originVerdict(503), 'server-error');
+	// 0 is the emitter's "the fetch itself failed before any status arrived".
+	assert.equal(originVerdict(0), 'connect-fail');
+	assert.equal(originVerdict(null), 'connect-fail');
+	assert.equal(originVerdict('nonsense'), 'connect-fail');
+});
+
+test('coverage is netted of pages the origin does not have', () => {
+	const serves = ANALYTICS.series.filter((s) => s.metric === 'bot_serve');
+	const split = coverageSplit({ serves, costs: originCostByReason(ANALYTICS), filter: null });
+	assert.equal(split.missServes, 250);
+	assert.equal(split.absent, 100);
+	assert.equal(split.net, 150);
+	assert.equal(split.netable, true);
+});
+
+test('a 5xx from the origin is NOT netted out — that one is a real problem, just not ours to cache', () => {
+	const serves = ANALYTICS.series.filter((s) => s.metric === 'bot_serve');
+	const { net } = coverageSplit({ serves, costs: originCostByReason(ANALYTICS), filter: null });
+	// 250 − 100 absent = 150. The ten 503s stay in, because a page the origin failed to serve is
+	// still a page that exists.
+	assert.equal(net, 150);
+});
+
+test('under a bot filter the netting is switched OFF rather than estimated', () => {
+	const serves = ANALYTICS.series.filter((s) => s.metric === 'bot_serve' && s.type === 'bingbot');
+	const split = coverageSplit({ serves, costs: originCostByReason(ANALYTICS), filter: new Set(['bingbot']) });
+	// origin_fetch carries no bot, so its 100 absent rows are all-bots and cannot be subtracted
+	// from one bot's 150 misses. Scaling one population by the other's share would be a guess
+	// wearing a KPI's clothes — and it could even go negative.
+	assert.equal(split.netable, false);
+	assert.equal(split.net, split.missServes);
+});
+
+test('the excluded population is shown, explained, and never silently dropped', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	assert.match(text, /Not found at origin/);
+	assert.match(text, /100 of the misses \(40%\) were 404 or 410 at the origin/);
+	// The two things that make it actionable: it is not a corpus gap, and it cannot improve.
+	assert.match(text, /not a\s+coverage gap/);
+	assert.match(text, /only a 200 is ever scheduled/);
+});
+
+test('each verdict says what the origin actually answered', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// 140 served / 100 absent / 10 server-error of 250 miss-driven fetches.
+	assert.match(text, /served 56%/);
+	assert.match(text, /absent 40%/);
+	assert.match(text, /server-error 4%/);
+});
+
+test('a filtered window says the origin columns are all-bots rather than quietly mixing them', async () => {
+	const ctx = await ready();
+	ctx.data.bots = ['bingbot'];
+	const text = textOf(ctx);
+	assert.match(text, /not netted: the origin 404 split is all-bots/);
+	assert.match(text, /origin_fetch carries no bot dimension/);
 });
 
 test('the serve tile carries a rate, so two ranges can be compared at all', async () => {
