@@ -146,10 +146,11 @@ browser ── same-origin (cookies, CSP 'self') ──▶ prerender-console com
 The view-by-view tour lives in the plugin README's
 [Management API](../plugin/README.md#management-api-prerender_admin) section alongside the
 API contract; the short version: **Overview** (scale, serve health, backlog shape, claim
-floor, schedule repair), **Traffic** (offload/hit-rate/freshness charts from one bounded
-analytics scan per node), **Sitemaps**, **Page cache**, **Queue** (render/claim health and the
-backlog), **Nodes**, **Invalidations** (preview-first record/clear), **URL explainer**,
-**Metrics** (the live catalog), **Config**.
+floor, schedule repair), **Traffic** (offload/hit-rate charts from one bounded analytics scan per
+node, freshness reported relative to each route's own render cadence, the non-hit verdicts broken
+out by what would fix them, and a client-side bot filter), **Sitemaps**, **Page cache**, **Queue**
+(render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first record/clear),
+**URL explainer**, **Metrics** (the live catalog), **Config**.
 
 Two of those changed shape when configuration became editable:
 

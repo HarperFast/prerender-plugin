@@ -84,6 +84,19 @@ export function fmtMs(v) {
 	return `${(v / 3_600_000).toFixed(1)}h`;
 }
 
+/**
+ * A dimensionless ratio, for anything measured against its own yardstick — a served age against
+ * the cadence that page was supposed to be re-rendered on, above all. Two decimals under 10 so
+ * "just past due" (1.04x) is distinguishable from "twice the cadence", coarser above it where the
+ * exact figure has stopped mattering.
+ */
+export function fmtRatio(v) {
+	if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+	if (v >= 100) return `${Math.round(v)}×`;
+	if (v >= 10) return `${v.toFixed(1)}×`;
+	return `${v.toFixed(2)}×`;
+}
+
 export function fmtCount(v) {
 	if (v === null || v === undefined || !Number.isFinite(v)) return '—';
 	if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
@@ -102,6 +115,15 @@ const clock = (ms) => {
 // The analytics payload is `series`: one entry per (metric, path, method, type) combo, each
 // carrying totals plus fixed-width bucket arrays. These helpers shape combos into charts and
 // KPIs; they never fetch.
+//
+// EVERY NUMBER HERE IS ALREADY A JS NUMBER, and deliberately so — nothing below re-coerces.
+// These modules run in the browser and their only input is `res.json()`, so a database Long or
+// BigInt cannot reach them (JSON has no such type, and stringifying one throws at the source).
+// The coercion belongs where the database is actually read, and lives there: `bucketize()` in
+// the plugin's `util/analyticsRead.js` runs every column through `numberOf()` — which also
+// keeps `Number(null) === 0` from flooring a weighted average — and the console's cluster merge
+// (`util/aggregate.js`) does the same with its own `finite()`. Coercing a second time here would
+// imply the payload is untrusted in a way it is not, and would hide which layer owns the rule.
 
 export const pick = (data, metric, filter) =>
 	(data?.series ?? []).filter((s) => s.metric === metric && (!filter || filter(s)));
@@ -127,29 +149,48 @@ export function stackBy(combos, dim, bucketCount) {
 
 const sum = (a, b) => a + b;
 
-/** Count-weighted merge of a distribution stat across combos (approximate by construction). */
-export function weighted(combos, stat) {
+/**
+ * Count-weighted merge of a distribution stat across combos (approximate by construction).
+ *
+ * `scaleOf` divides each combo's value by its OWN yardstick before the merge, which is what makes
+ * a mixed population comparable: a 2h-cadence route and a 24h-cadence route both express their
+ * staleness as "x of the cadence I was configured for", and the merged number means something.
+ * A combo whose yardstick is unusable (absent, zero) is EXCLUDED rather than merged raw — mixing
+ * ratios with milliseconds would produce a number with no unit at all. Callers that can't
+ * guarantee a yardstick for everything must say so; see the staleness panel's fallback.
+ */
+export function weighted(combos, stat, scaleOf) {
 	let total = 0;
 	let weight = 0;
 	for (const combo of combos) {
-		if (Number.isFinite(combo[stat]) && combo.count > 0) {
-			total += combo[stat] * combo.count;
-			weight += combo.count;
+		if (!Number.isFinite(combo[stat]) || !(combo.count > 0)) continue;
+		let value = combo[stat];
+		if (scaleOf) {
+			const yardstick = scaleOf(combo);
+			if (!Number.isFinite(yardstick) || yardstick <= 0) continue;
+			value /= yardstick;
 		}
+		total += value * combo.count;
+		weight += combo.count;
 	}
 	return weight > 0 ? total / weight : null;
 }
 
-/** Per-bucket count-weighted merge of `means`/`p95s` arrays across combos. */
-export function weightedBuckets(combos, stat, bucketCount) {
+/** Per-bucket count-weighted merge of `means`/`p95s` arrays across combos; `scaleOf` as above. */
+export function weightedBuckets(combos, stat, bucketCount, scaleOf) {
 	const sums = new Array(bucketCount).fill(0);
 	const weights = new Array(bucketCount).fill(0);
 	for (const combo of combos) {
 		const values = combo[stat];
 		if (!values) continue;
+		let yardstick = 1;
+		if (scaleOf) {
+			yardstick = scaleOf(combo);
+			if (!Number.isFinite(yardstick) || yardstick <= 0) continue;
+		}
 		for (let i = 0; i < bucketCount; i++) {
 			if (Number.isFinite(values[i]) && combo.counts[i] > 0) {
-				sums[i] += values[i] * combo.counts[i];
+				sums[i] += (values[i] / yardstick) * combo.counts[i];
 				weights[i] += combo.counts[i];
 			}
 		}
@@ -213,7 +254,10 @@ export function lineChart(data, series, { format = fmtMs, band } = {}) {
 	const W = 600;
 	const H = 150;
 	const PAD = 4;
-	const max = Math.max(...series.flatMap((s) => s.points.filter((p) => Number.isFinite(p))), band ?? 0, 1);
+	// One reference line or several: a normalized chart has two worth drawing (due, and the point
+	// the page stops being servable at all), and they are the same kind of mark.
+	const bands = [band].flat().filter((v) => Number.isFinite(v));
+	const max = Math.max(...series.flatMap((s) => s.points.filter((p) => Number.isFinite(p))), ...bands, 1);
 	const bucketCount = data.bucketCount;
 	const x = (i) => PAD + (i / Math.max(1, bucketCount - 1)) * (W - 2 * PAD);
 	const y = (v) => H - PAD - (v / max) * (H - 2 * PAD);
@@ -234,13 +278,14 @@ export function lineChart(data, series, { format = fmtMs, band } = {}) {
 		svg.appendChild(line);
 	}
 
-	// A reference band (e.g. a lease time or an interval) the values should sit under.
-	if (Number.isFinite(band)) {
+	// Reference bands (e.g. a lease time, an interval, or 1.0 on a normalized chart) the values
+	// should sit under.
+	for (const at of bands) {
 		const line = document.createElementNS(ns, 'line');
 		line.setAttribute('x1', PAD);
 		line.setAttribute('x2', W - PAD);
-		line.setAttribute('y1', y(band));
-		line.setAttribute('y2', y(band));
+		line.setAttribute('y1', y(at));
+		line.setAttribute('y2', y(at));
 		line.setAttribute('class', 'band');
 		svg.appendChild(line);
 	}
@@ -323,13 +368,53 @@ function timeAxis(data) {
 	]);
 }
 
-/** Segmented range picker. `ranges`: `[{ label, ms }]`. */
-export function rangePicker(ranges, currentMs, onPick) {
+/** Segmented single-choice control. `items`: `[{ label, value, title }]`. */
+export function segmented(items, current, onPick) {
 	return el(
 		'div',
 		{ cls: 'segctl', role: 'group' },
-		ranges.map(({ label, ms }) =>
-			el('button', { cls: ms === currentMs ? 'on' : '', text: label, onclick: () => onPick(ms) })
+		items.map(({ label, value, title }) =>
+			el('button', { cls: value === current ? 'on' : '', text: label, title, onclick: () => onPick(value) })
+		)
+	);
+}
+
+/** Segmented range picker. `ranges`: `[{ label, ms }]`. */
+export const rangePicker = (ranges, currentMs, onPick) =>
+	segmented(
+		ranges.map(({ label, ms }) => ({ label, value: ms })),
+		currentMs,
+		onPick
+	);
+
+/**
+ * A multi-select filter row. `items`: `[{ label, value, sub, color, title }]`.
+ *
+ * Toggling one is a CLIENT-SIDE narrowing of a payload already fetched — never a refetch. That is
+ * the whole reason the console can offer this filter at all: the analytics window is one bounded
+ * scan shared by every panel and every operator inside the cache TTL, and a filter that re-queried
+ * per selection would turn an idle dashboard into a scan generator on workers that also serve bot
+ * traffic. Callers re-render; they must not reload.
+ */
+export function chips(items, { isOn, onToggle }) {
+	return el(
+		'div',
+		{ cls: 'chips' },
+		items.map((item) =>
+			el(
+				'button',
+				{
+					'cls': `chip${isOn(item.value) ? ' on' : ''}`,
+					'title': item.title,
+					'aria-pressed': isOn(item.value) ? 'true' : 'false',
+					'onclick': () => onToggle(item.value),
+				},
+				[
+					item.color && el('span', { cls: 'swatch', style: { background: item.color } }),
+					el('span', { text: item.label }),
+					item.sub !== undefined && item.sub !== null && el('span', { cls: 'chip-sub mono', text: item.sub }),
+				]
+			)
 		)
 	);
 }

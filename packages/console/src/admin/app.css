@@ -957,6 +957,51 @@ td .row-actions {
 	color: var(--fg-0);
 }
 
+/* Multi-select filter chips (the Traffic view's bot filter). Wraps: a crawl can involve a dozen
+   named bots and the row must not force a horizontal scrollbar onto the page. */
+.chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+}
+.chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 10px;
+	border: 1px solid var(--border-2);
+	border-radius: var(--r-pill);
+	background: transparent;
+	color: var(--fg-2);
+	font-size: 12px;
+}
+.chip.on {
+	background: var(--bg-4);
+	border-color: var(--fg-4);
+	color: var(--fg-0);
+}
+.chip .chip-sub {
+	font-size: 11px;
+	color: var(--fg-3);
+}
+.chip.on .chip-sub {
+	color: var(--fg-2);
+}
+.filterbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 16px;
+}
+.filterbar .filter-label {
+	font-size: 11px;
+	color: var(--fg-3);
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+}
+
 /* A denser stat row for inside a card (the overview serve strip). */
 .stat-grid.tight {
 	margin-bottom: 14px;
