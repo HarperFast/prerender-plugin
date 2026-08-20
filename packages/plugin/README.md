@@ -631,9 +631,19 @@ claim floor, schedule repair — are plugin behavior.)
   pass; a dashboard refresh never touches the index.
 
 - **Traffic** — the delivery half of [METRICS.md](METRICS.md)'s catalog, charted: origin
-  offload, cache-served and fresh-hit rates, serves by freshness state over time, the per-bot
-  and status-code mix, origin-fetch cost and reasons, page age against the render interval,
-  a per-route cadence table, and on-demand crawl breadth. **Everything is this node's slice**
+  offload, cache-served and fresh-hit rates, serves by freshness state over time, the per-bot,
+  per-device and status-code mix, origin-fetch cost and reasons, a per-route cadence table, and
+  on-demand crawl breadth. Freshness is reported **relative to the cadence each route is
+  configured for** (`page_age` ÷ that route's `renderInterval`, since a page expires one interval
+  after it is stored), so 1.0 means "exactly due" on every route and a 2h-cadence route is
+  directly comparable to a 24h one; absolute age is one click away. The non-hit verdicts are
+  broken out by **what would fix them** — coverage (`miss`), cadence (`swr`/`stale`), blob
+  integrity (`blob-*`, `peer-rescue`), invalidation, and requests that were never cacheable —
+  each with the origin latency it cost, because "miss rate" folds five different problems into
+  one number. A **bot filter** narrows every panel whose metric carries a bot name
+  (`bot_request`, `bot_serve`, `page_age`, the crawl sketches) purely client-side, never a
+  refetch; the panels whose metrics have no bot dimension say "all bots" on their face.
+  **Everything is this node's slice**
   (analytics rows are node-local): ratios are representative of the cluster, totals are 1/N.
   All of it comes from ONE bounded, row-capped primary-key scan of `hdb_analytics` per
   refresh — never one scan per metric name — answered from a per-worker cache for

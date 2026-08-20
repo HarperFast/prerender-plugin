@@ -7,11 +7,38 @@
  * page_age), what does a non-cache serve cost (origin_fetch), and which route's cadence
  * should move (route_serve / route_page_age). The panels are ordered exactly that way.
  *
+ * FRESHNESS IS SHOWN RELATIVE, because an age in milliseconds is not a verdict. A snapshot two
+ * hours old is healthy on a 6h route and two hours overdue on an hourly one, and this deployment
+ * runs both. `expiresAt` is written as `now + interval` when a render lands (RenderQueue), so the
+ * served age divided by that route's configured cadence is a number with a fixed meaning
+ * everywhere: under 1.0 the page was inside the window it was rendered for, at 1.0 it was due,
+ * and past it the fleet is not keeping the cadence — the same threshold on every route, which is
+ * what makes routes comparable at a glance and what the old absolute chart could not do. The
+ * cadence comes from `ingress.routes[].renderInterval` (already loaded for the settings cards, so
+ * it costs no request), falling back to `render.defaultInterval`. Absolute milliseconds stay one
+ * click away, and the KPI carries both.
+ *
+ * NOT EVERY NON-HIT IS A MISS. "miss" is one of nine freshness verdicts and the only one that
+ * means what the word implies — nothing cached under the key. The others are a page served past
+ * its cadence (`swr`), one past the SWR window entirely (`stale`), a body that could not be read
+ * although the key is cached and scheduled (`blob-missing` / `blob-timeout`, rescued or not), a
+ * serve a bulk invalidation cost us (`invalidated`), and requests where the cache was never
+ * consulted at all (`skip`, `bypass`). They have four different fixes — corpus coverage, render
+ * cadence, blob integrity, and nothing-to-fix — so they get their own panel rather than one bar
+ * labelled "miss", with what each one cost at the origin beside it.
+ *
+ * THE BOT FILTER IS CLIENT-SIDE, ALWAYS. Selecting bots re-renders from the payload already in
+ * hand; it never refetches, because the load discipline below is the whole reason this view can
+ * afford to be this detailed. Three metrics carry a bot (`bot_request`, `bot_serve`, `page_age`)
+ * and the rest do not — `route_serve`, `origin_fetch`, `duration` and `response_*` have no bot
+ * dimension at all — so a panel that CANNOT honour the filter says "all bots" on its face rather
+ * than quietly showing every crawler's numbers under one crawler's name.
+ *
  * LOAD DISCIPLINE. Every number on this view comes from a single `analytics` request; each
  * node answers it from a per-worker cache inside `management.analytics.cacheTtl`, so switching
- * ranges back and forth, a view switch, or a second operator does not multiply scans. Under
- * cluster scope that is one cached scan PER NODE — N times a bounded read, not N times a
- * table walk — and the footer states what the refresh actually cost on every node. This
+ * ranges back and forth, a view switch, a bot selection, or a second operator does not multiply
+ * scans. Under cluster scope that is one cached scan PER NODE — N times a bounded read, not N
+ * times a table walk — and the footer states what the refresh actually cost on every node. This
  * console shares its upstreams' workers with bot traffic, and a dashboard that can slow a node
  * down owes the operator the number. Crawl breadth is the one extra query (its own capped scan
  * of the sketch table); the sketches replicate, so it is read from one node and loads only on
@@ -24,18 +51,22 @@
  * its scope; the footer names the nodes.
  */
 
-import { card, el, ICONS, link, num, pct, spacer, stat, table } from '../ui.js';
+import { card, el, ICONS, link, muted, num, pct, pill, spacer, stat, table } from '../ui.js';
 import {
 	barList,
 	CACHE_STATUS_COLORS,
+	chips,
 	colorFor,
 	emptyNote,
+	fmtCount,
 	fmtMs,
+	fmtRatio,
 	legend,
 	lineChart,
 	pick,
 	rangePicker,
 	scanFooter,
+	segmented,
 	SERIES,
 	stackBy,
 	stackedBars,
@@ -45,7 +76,7 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
-import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
+import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'traffic', label: 'Traffic', crumb: 'traffic', icon: ICONS.traffic };
 
@@ -58,6 +89,10 @@ const RANGES = [
 
 export async function load(ctx) {
 	ctx.data.rangeMs ??= 3_600_000;
+	// Relative by default: "1.4x the cadence" is a verdict, "4h" is a number the operator then has
+	// to look a config value up for. Absolute stays one click away in the panel head.
+	ctx.data.ageMode ??= 'ratio';
+	ctx.data.bots ??= [];
 	// Concurrent because the two are unrelated: the config read is usually already satisfied from
 	// the shared scratch, and when it is not it must still not add a round trip to the range switch.
 	const [res] = await Promise.all([ctx.get('analytics', { range: ctx.data.rangeMs }), loadConfig(ctx)]);
@@ -97,38 +132,254 @@ export function render(ctx) {
 		return [head, appliedNote(ctx), card('No traffic recorded', { body: [emptyNote('analytics', data)] }), knobs];
 	}
 
-	const serves = pick(data, 'bot_serve');
+	const filter = botFilter(ctx);
+	const serves = pick(data, 'bot_serve', (s) => keepBot(filter, s.type));
+	const requests = pick(data, 'bot_request', (s) => keepBot(filter, s.method));
+	const ages = pick(data, 'page_age', (s) => keepBot(filter, s.path));
+	const cadences = cadenceIndex(configState(ctx).payload, data.intervals?.defaultRenderInterval);
+	const scope = { serves, requests, ages, cadences, filter };
 
 	return [
 		head,
 		appliedNote(ctx),
-		kpis(data, serves),
-		el('div', { cls: 'cols' }, [freshness(data, serves), latency(data)]),
-		el('div', { cls: 'cols' }, [bots(serves, data), statusCodes(data)]),
-		el('div', { cls: 'cols' }, [originFetch(data), pageAge(data)]),
-		routes(ctx, data),
-		breadth(ctx),
+		botBar(ctx, data, filter),
+		filter && !serves.length ? el('div', { cls: 'note warn', text: noSelectedBotTraffic(filter) }) : null,
+		kpis(data, scope),
+		el('div', { cls: 'cols' }, [freshness(data, scope), staleness(ctx, data, scope)]),
+		notFreshHit(data, scope),
+		el('div', { cls: 'cols' }, [originFetch(data, filter), latency(data, filter)]),
+		el('div', { cls: 'cols' }, [crawlers(data, scope), statusCodes(data, filter)]),
+		routes(ctx, data, cadences, filter),
+		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
 	];
 }
 
+// ---- the bot filter ---------------------------------------------------------
+//
+// A selection, not a query. It narrows what is already in `ctx.data.analytics`, so every panel
+// below re-renders from the same bytes and the upstream nodes see nothing at all.
+
+/** Chips beyond this are tail traffic; the note says how many were left off. */
+const MAX_BOT_CHIPS = 14;
+
+/** The selected bots as a Set, or null for "all" — the shape every panel tests against. */
+const botFilter = (ctx) => {
+	const selected = new Set(ctx.data.bots ?? []);
+	return selected.size ? selected : null;
+};
+
+/**
+ * Does this combo belong to the selection? `name` is whichever slot carries the bot on that
+ * metric (they differ — see the catalog), and an absent name is the plugin's own 'other' bucket.
+ */
+const keepBot = (filter, name) => !filter || filter.has(name ?? 'other');
+
+const noSelectedBotTraffic = (filter) =>
+	`No serves from ${[...filter].join(', ')} in this window. The panels below are empty because of the ` +
+	'filter, not because nothing was served — clear it, or widen the range.';
+
+/** Every bot in the window, ranked by serves, with its ingress count alongside. */
+function botTotals(data) {
+	const totals = new Map();
+	const entry = (bot) => {
+		let row = totals.get(bot);
+		if (!row) totals.set(bot, (row = { bot, serves: 0, requests: 0 }));
+		return row;
+	};
+	for (const s of pick(data, 'bot_serve')) entry(s.type ?? 'other').serves += s.count;
+	for (const s of pick(data, 'bot_request')) entry(s.method ?? 'other').requests += s.count;
+	return [...totals.values()].sort((a, b) => b.serves - a.serves || b.requests - a.requests);
+}
+
+function botBar(ctx, data, filter) {
+	const ranked = botTotals(data);
+	if (!ranked.length) return null;
+
+	const shown = ranked.slice(0, MAX_BOT_CHIPS);
+	// A SELECTED bot always gets a chip, even when it has fallen out of the top N or out of the
+	// window entirely on a range switch. Otherwise the only control that can clear the filter
+	// disappears and the operator is left with panels that look empty for no visible reason.
+	for (const bot of ctx.data.bots ?? []) {
+		if (!shown.some((row) => row.bot === bot)) shown.push(ranked.find((row) => row.bot === bot) ?? { bot, serves: 0 });
+	}
+	const shownBots = new Set(shown.map((row) => row.bot));
+	const hidden = ranked.filter((row) => !shownBots.has(row.bot)).length;
+
+	const toggle = (bot) => {
+		const next = new Set(ctx.data.bots ?? []);
+		if (next.has(bot)) next.delete(bot);
+		else next.add(bot);
+		ctx.data.bots = [...next];
+		// RENDER, never reload: the payload in hand already holds every bot's rows.
+		ctx.render();
+	};
+
+	return el('div', { cls: 'filterbar' }, [
+		el('span', { cls: 'filter-label', text: 'Bots' }),
+		el('button', {
+			cls: `chip${filter ? '' : ' on'}`,
+			text: 'all',
+			title: 'Clear the filter — every crawler in the window.',
+			onclick: () => {
+				ctx.data.bots = [];
+				ctx.render();
+			},
+		}),
+		chips(
+			shown.map(({ bot, serves }) => ({
+				value: bot,
+				label: bot,
+				sub: fmtCount(serves),
+				title: `${bot}: ${num(serves)} serves in this window`,
+			})),
+			{ isOn: (bot) => !!filter?.has(bot), onToggle: toggle }
+		),
+		hidden > 0 && muted(`+${hidden} smaller`),
+		filter &&
+			muted('filters serves, freshness, staleness, page age and the crawler mix — panels marked "all bots" cannot'),
+	]);
+}
+
+/** The tag an unfilterable panel wears while a filter is on, so its numbers are not misread. */
+const allBotsTag = (filter, why) =>
+	filter &&
+	el('span', { title: `${why} — this metric has no bot dimension, so the filter cannot apply.` }, [
+		pill('all bots', 'info'),
+	]);
+
+// ---- cadence (the yardstick every freshness number is measured against) -----
+
+/** Route labels that are a CLASS rather than a configured route (see recordServeOutcome). */
+const CLASS_LABELS = {
+	unclassified: 'unclassified',
+	unrouted: 'unrouted',
+	passthrough: 'passthrough',
+	prerender: 'prerender',
+};
+
+/**
+ * Route label → `{ mode, interval, inherited }`, built from the config payload this view already
+ * loaded for its settings cards.
+ *
+ * The label a serve was recorded under is the matched route's own `path` (metrics.js), so the
+ * join is exact rather than a re-implementation of the plugin's matcher — this never has to
+ * decide which route a URL matched, only what the route it already matched is configured to do.
+ *
+ * `excludePathPatterns` entries come FIRST because the plugin PREPENDS them to the compiled route
+ * list and first match wins: a path that is both excluded and declared prerender is served as a
+ * passthrough, and a table that read the prerender entry would flag its (entirely expected) miss
+ * rate as a coverage failure.
+ */
+export function cadenceIndex(configPayload, defaultInterval) {
+	const index = new Map();
+	const options = optionIndex(configPayload);
+
+	const add = (path, mode, renderInterval) => {
+		if (typeof path !== 'string' || path === '' || index.has(path)) return;
+		const own = mode === 'prerender' && Number.isFinite(renderInterval) && renderInterval > 0;
+		index.set(path, { mode, interval: own ? renderInterval : defaultInterval, inherited: !own });
+	};
+
+	for (const pattern of options.get('ingress.excludePathPatterns')?.effective ?? []) add(pattern, 'passthrough');
+	for (const entry of options.get('ingress.routes')?.effective ?? []) {
+		if (!entry || typeof entry !== 'object') continue;
+		add(entry.path, entry.mode === 'passthrough' ? 'passthrough' : 'prerender', Number(entry.renderInterval));
+	}
+	return index;
+}
+
+/**
+ * The cadence one route label is measured against. An unmatched label is a CLASS (the plugin fell
+ * back to `routeClass` because no route matched), and those inherit the default interval — which
+ * is only meaningful for the ones that are cached at all.
+ */
+export const cadenceFor = (index, label, defaultInterval) =>
+	index.get(label) ?? {
+		mode: CLASS_LABELS[label] ?? 'unknown',
+		interval: defaultInterval,
+		inherited: true,
+	};
+
+/** Whether a route's staleness is a verdict about US, or just a fact about a path we never cache. */
+const isPrerender = (cadence) => cadence.mode === 'prerender' || cadence.mode === 'unknown';
+
+/**
+ * The combos, and the divisor to normalize each one by.
+ *
+ * Unfiltered, `route_page_age` is the better source for the same samples: it is emitted beside
+ * `page_age` on every cache serve, so the population is identical, but it carries the route — and
+ * therefore each sample's OWN cadence rather than one global default. Filtered by bot, only
+ * `page_age` carries the bot, and the default interval is the only yardstick available; the panel
+ * says which of the two it used.
+ */
+function stalenessBasis(data, { ages, cadences, filter }) {
+	const fallback = data.intervals?.defaultRenderInterval;
+	// Every route falls back to the default when it sets no cadence of its own, so ONE missing
+	// default is the whole yardstick missing. Without it a ratio could still be computed over the
+	// routes that do set an interval — a number covering part of the traffic, presented as if it
+	// covered all of it. Both readers of this basis check the flag and show milliseconds instead.
+	const normalizable = Number.isFinite(fallback) && fallback > 0;
+	const routed = pick(data, 'route_page_age');
+	if (!filter && routed.length) {
+		return {
+			combos: routed,
+			scaleOf: (s) => cadenceFor(cadences, s.path, fallback).interval,
+			basis: 'route',
+			fallback,
+			normalizable,
+		};
+	}
+	return { combos: ages, scaleOf: () => fallback, basis: 'default', fallback, normalizable };
+}
+
+/** The span the numbers actually cover — the truncated window when the scan hit its cap. */
+const coveredMs = (data) => {
+	const from = data.coveredFromMs ?? data.startMs;
+	const to = data.coveredToMs ?? data.endMs;
+	return Number.isFinite(from) && Number.isFinite(to) && to > from ? to - from : null;
+};
+
 // ---- KPIs -------------------------------------------------------------------
 
-function kpis(data, serves) {
+function kpis(data, scope) {
+	const { serves, requests, filter } = scope;
 	const total = sumCount(serves);
 	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
 	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
 	const freshHits = sumCount(serves.filter((s) => s.method === 'hit'));
-	const requests = sumCount(pick(data, 'bot_request'));
+	const coverageMiss = sumCount(serves.filter((s) => s.method === 'miss'));
+	const arrived = sumCount(requests);
 
 	const durations = pick(data, 'duration');
 	const p95 = weighted(durations, 'p95');
-	const ageP95 = weighted(pick(data, 'page_age'), 'p95');
-	const interval = data.intervals?.defaultRenderInterval;
+
+	const { combos, scaleOf, basis, fallback, normalizable } = stalenessBasis(data, scope);
+	const ageP95 = weighted(combos, 'p95');
+	const stalenessP95 = normalizable ? weighted(combos, 'p95', scaleOf) : null;
+
+	// `bot_serve` is emitted once per request that RESOLVED to a resource, `bot_request` once per
+	// request that arrived — both under the same gate. A gap is therefore requests that never
+	// reached a serve outcome (an unusable forwarded host, a handler throw), which is invisible
+	// everywhere else on this page: the serve panels can only ever chart what was served.
+	const unresolved = arrived - total;
+	const unresolvedShare = arrived > 0 ? unresolved / arrived : 0;
+	const window = coveredMs(data);
+	const perMinute = window ? total / (window / 60_000) : null;
+	// A rate is what makes two ranges comparable — 40k serves means nothing until you know whether
+	// it was an hour or a day. Sub-10 keeps a decimal: fmtCount would round a quiet crawl to "0/min".
+	const rate = perMinute === null ? '—' : `${perMinute < 10 ? perMinute.toFixed(1) : fmtCount(perMinute)}/min`;
 
 	return el('div', { cls: 'stat-grid' }, [
-		stat('Bot serves', num(total), `${num(requests)} requests at ingress`),
+		stat(
+			'Bot serves',
+			num(total),
+			unresolvedShare > 0.02
+				? `${num(unresolved)} of ${num(arrived)} never reached a serve`
+				: `${num(arrived)} at ingress · ${rate}`,
+			{ warn: unresolvedShare > 0.02 }
+		),
 		stat(
 			'Origin offload',
 			pct(total - originServes, total),
@@ -137,33 +388,318 @@ function kpis(data, serves) {
 			{ warn: total > 0 && originServes > total / 2 }
 		),
 		stat('Cache-served', pct(cacheServes, total), 'stored snapshot answered'),
-		stat('Fresh hits', pct(freshHits, total), 'inside the configured TTL'),
-		stat('Serve p95', fmtMs(p95), 'server-side, bot requests'),
-		stat('Page age p95', fmtMs(ageP95), interval ? `render interval ${fmtMs(interval)}` : 'cache serves only', {
-			warn: Number.isFinite(ageP95) && Number.isFinite(interval) && ageP95 > interval,
-		}),
+		stat('Fresh hits', pct(freshHits, total), 'inside the configured cadence'),
+		stat('Coverage miss', pct(coverageMiss, total), 'nothing cached under the key'),
+		stat('Serve p95', fmtMs(p95), filter ? 'server-side · all bots' : 'server-side, bot requests'),
+		stat(
+			normalizable ? 'Staleness p95' : 'Page age p95',
+			normalizable ? fmtRatio(stalenessP95) : fmtMs(ageP95),
+			// Both numbers, because the ratio is the verdict and the duration is what an operator
+			// quotes: "1.4x" says the fleet is behind, "4h 12m" is what that means for the crawler.
+			normalizable
+				? `${fmtMs(ageP95)} against ${basis === 'route' ? 'each route’s cadence' : fmtMs(fallback)}`
+				: 'no render interval in the payload',
+			{ warn: Number.isFinite(stalenessP95) && stalenessP95 > 1 }
+		),
 	]);
 }
 
 // ---- panels -----------------------------------------------------------------
 
 /** Serves over time, stacked by freshness verdict — the cache doing (or not doing) its job. */
-function freshness(data, serves) {
+function freshness(data, { serves, filter }) {
 	const { keys, stacks } = stackBy(serves, 'method', data.bucketCount);
 	return card('Serves by freshness', {
 		head: [spacer(), legend(keys.map((k) => ({ label: k, color: colorFor(CACHE_STATUS_COLORS, k) })))],
 		body: [
-			stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k)),
+			serves.length
+				? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k))
+				: emptyNote('bot_serve', data),
 			el('p', { cls: 'muted chart-note' }, [
-				'hit + swr is cache-served. A rising miss share is a coverage problem; a rising swr share is ',
-				'the fleet not keeping the configured cadence; blob-* should sit at zero.',
+				'hit + swr + peer-rescue is cache-served. A rising miss share is a coverage problem; a rising ',
+				'swr share is the fleet not keeping the configured cadence; blob-* should sit at zero. What each ',
+				'verdict costs, and which of them are the same problem, is the panel below.',
+			]),
+			filter && muted(`Filtered to ${[...filter].join(', ')}.`),
+		],
+	});
+}
+
+/**
+ * Delivered freshness against the cadence each page was rendered for.
+ *
+ * Relative by default (see the module header). The absolute view is kept a click away rather than
+ * deleted: a ratio answers "is the fleet keeping up", and an operator sizing an interval or
+ * quoting an age to someone else still needs the milliseconds.
+ */
+function staleness(ctx, data, scope) {
+	const { combos, scaleOf, basis, fallback, normalizable } = stalenessBasis(data, scope);
+	// A payload with no interval in it (an older plugin) cannot express a ratio at all. Fall back
+	// rather than draw an empty chart, and say why below.
+	const mode = normalizable && ctx.data.ageMode === 'ratio' ? 'ratio' : 'ms';
+
+	const points = (stat) => weightedBuckets(combos, stat, data.bucketCount, mode === 'ratio' ? scaleOf : undefined);
+	const series = [
+		{ label: 'p95', color: SERIES[2], points: points('p95s') },
+		{ label: 'mean', color: SERIES[1], points: points('means') },
+	];
+	const any = series.some((s) => s.points.some((p) => Number.isFinite(p)));
+
+	// On the relative chart both reference lines are fixed for every route at once: 1.0 is due,
+	// and 1 + swrTtl/interval is where a page stops being servable and the next request falls
+	// through to the origin. On the absolute chart only the default interval can be drawn.
+	const swrTtl = Number(optionIndex(configState(ctx).payload).get('page.swrTtl')?.effective);
+	// The SWR ceiling is only a single line when a single interval is the divisor. Normalized per
+	// route it lands somewhere different for every route, so it is not drawn — and the note below
+	// must not describe a line that isn't there.
+	const swrBand = mode === 'ratio' && basis === 'default' && Number.isFinite(swrTtl) ? 1 + swrTtl / fallback : null;
+	const bands = mode === 'ratio' ? [1, swrBand].filter(Number.isFinite) : fallback;
+
+	// Ages that computed NEGATIVE are dropped at the emit site (cross-node clock skew), so the
+	// distribution above is missing them. Silence would make a skewed cluster look like a healthy
+	// one with fewer samples.
+	const discarded = sumCount(pick(data, 'prerender_ops', (s) => s.path === 'page_age_negative'));
+
+	return card(mode === 'ratio' ? 'Staleness at serve (÷ cadence, ≈)' : 'Page age at serve (≈)', {
+		head: [
+			spacer(),
+			legend(series.map(({ label, color }) => ({ label, color }))),
+			segmented(
+				[
+					{ label: '÷ cadence', value: 'ratio', title: 'Served age divided by the render interval for that route.' },
+					{ label: 'absolute', value: 'ms', title: 'Served age in milliseconds.' },
+				],
+				mode,
+				(next) => {
+					ctx.data.ageMode = next;
+					ctx.render();
+				}
+			),
+		],
+		body: [
+			any
+				? lineChart(data, series, { band: bands, format: mode === 'ratio' ? fmtRatio : fmtMs })
+				: emptyNote('page_age', data),
+			el('p', { cls: 'muted chart-note' }, [
+				mode === 'ratio'
+					? 'Cache serves only, so origin proxies cannot drag it toward zero. 1.0 is “exactly due”: a page ' +
+						'expires one render interval after it was stored, so above the line the fleet is not keeping ' +
+						'the cadence. ' +
+						(swrBand
+							? `The upper line is ${fmtRatio(swrBand)} — interval + page.swrTtl, past which a page stops ` +
+								'being served at all and the next request falls through to the origin. '
+							: '')
+					: 'Cache serves only, so origin proxies cannot drag it toward zero. The dashed line is the default ' +
+						'render interval — a p95 above it means the fleet is not keeping the cadence. ',
+				basis === 'route'
+					? 'Each sample is measured against its own route’s renderInterval (route_page_age), so routes on ' +
+						'different cadences are comparable; the demand ladder can shorten an individual target’s ' +
+						'interval within that, which makes this read slightly generous.'
+					: `Measured against ${fmtMs(fallback)}, the default interval — page_age carries the bot, not the ` +
+						'route, so a per-route cadence cannot be applied to a bot-filtered window.',
+				' “mean” charts the bucket mean (count-weighted).',
+			]),
+			!normalizable &&
+				el('div', {
+					cls: 'note',
+					text: 'This node’s analytics payload carries no render interval, so only absolute age can be shown.',
+				}),
+			discarded > 0 &&
+				el('div', {
+					cls: 'note warn',
+					text:
+						`${num(discarded)} served page(s) reported a NEGATIVE age and were discarded from this ` +
+						'distribution — a snapshot stamped in this node’s future, i.e. cross-node clock skew.',
+				}),
+		],
+	});
+}
+
+// ---- what a non-hit actually was ---------------------------------------------
+//
+// The taxonomy this panel exists for. Each family is a different FIX, which is the only grouping
+// worth putting on a dashboard: an operator arriving with "our miss rate is 40%" needs to know
+// within one screen whether to widen the corpus, add render capacity, chase blob integrity, or
+// stop worrying.
+
+const FAMILIES = [
+	{
+		key: 'coverage',
+		label: 'Coverage',
+		hint: 'the corpus does not have it',
+	},
+	{
+		key: 'cadence',
+		label: 'Cadence',
+		hint: 'cached, but behind its render interval',
+	},
+	{
+		key: 'integrity',
+		label: 'Integrity',
+		hint: 'cached and scheduled; the body could not be read',
+	},
+	{
+		key: 'invalidated',
+		label: 'Invalidated',
+		hint: 'a bulk invalidation cost the serve',
+	},
+	{
+		key: 'not-cacheable',
+		label: 'Not cacheable',
+		hint: 'the cache was never consulted',
+	},
+];
+
+/**
+ * Every freshness verdict except `hit`, with the family it belongs to and what it means. Anything
+ * absent here (a verdict a newer plugin emits) falls through to an "other" family rather than
+ * being silently folded into one of these — a new value must never inherit someone else's fix.
+ */
+const NOT_HIT = {
+	'miss': ['coverage', 'nothing cached under this key — it has never rendered, or it is not in the corpus'],
+	'swr': ['cadence', 'past due, inside the stale-while-revalidate window — still served from cache'],
+	'stale': ['cadence', 'past the SWR window — nothing servable was left, so we went elsewhere'],
+	'blob-missing': ['integrity', 'the record is cached, but its stored body is gone (dangling blob)'],
+	'blob-timeout': ['integrity', 'the body was still arriving when page.blobReadBudgetMs ran out'],
+	'peer-rescue': [
+		'integrity',
+		'the local body failed and the residency owner’s copy answered it — still a cache serve',
+	],
+	'invalidated': ['invalidated', 'a bulk invalidation demoted a page that would otherwise have served'],
+	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
+	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD)'],
+};
+
+/** Fold the non-hit serves into one row per verdict, carrying what answered each of them. */
+export function notHitRows(serves) {
+	const byStatus = new Map();
+	for (const s of serves) {
+		const status = s.method ?? 'unknown';
+		if (status === 'hit') continue;
+		let row = byStatus.get(status);
+		if (!row) {
+			const [family, means] = NOT_HIT[status] ?? ['other', 'an outcome this console does not know about'];
+			byStatus.set(status, (row = { status, family, means, count: 0, sources: new Map() }));
+		}
+		row.count += s.count;
+		const source = s.path ?? 'unknown';
+		row.sources.set(source, (row.sources.get(source) ?? 0) + s.count);
+	}
+	return [...byStatus.values()].sort((a, b) => b.count - a.count);
+}
+
+/** Origin-side cost keyed by the cache status that sent the request there (the reason slot). */
+function originCostByReason(data) {
+	const costs = new Map();
+	for (const s of pick(data, 'origin_fetch')) {
+		const reason = s.method ?? 'unknown';
+		let row = costs.get(reason);
+		if (!row) costs.set(reason, (row = { combos: [], count: 0, failures: 0 }));
+		row.combos.push(s);
+		row.count += s.count;
+		const code = Number(s.path);
+		if (!Number.isFinite(code) || code <= 0 || code >= 500) row.failures += s.count;
+	}
+	for (const row of costs.values()) row.p95 = weighted(row.combos, 'p95');
+	return costs;
+}
+
+function notFreshHit(data, { serves, filter }) {
+	const total = sumCount(serves);
+	const rows = notHitRows(serves);
+	const notHit = rows.reduce((acc, row) => acc + row.count, 0);
+	const costs = originCostByReason(data);
+
+	const byFamily = new Map();
+	for (const row of rows) byFamily.set(row.family, (byFamily.get(row.family) ?? 0) + row.count);
+
+	const head = [
+		spacer(),
+		filter && muted(`${[...filter].join(', ')} only`),
+		pill(`${pct(notHit, total)} of serves`, notHit > total / 2 ? 'warn' : ''),
+	];
+
+	if (!total) {
+		return card('Not a fresh hit — what, and what it cost', { head, body: [emptyNote('bot_serve', data)] });
+	}
+	if (!rows.length) {
+		return card('Every serve was a fresh hit', {
+			head,
+			body: [
+				el('div', { cls: 'note ok' }, [
+					'Every bot serve in this window was answered from cache inside its render interval — no misses, ',
+					'no stale pages, no blob faults, nothing proxied.',
+				]),
+			],
+		});
+	}
+
+	const body = rows.map((row) => {
+		const cost = costs.get(row.status);
+		const answered = [...row.sources.entries()]
+			.sort((a, b) => b[1] - a[1])
+			.map(([source, count]) => `${source} ${pct(count, row.count)}`)
+			.join(' · ');
+		return el('tr', null, [
+			el('td', null, [pill(row.status), el('div', { cls: 'muted', text: row.means })]),
+			el('td', { cls: 'right mono', text: num(row.count) }),
+			el('td', { cls: 'right mono', text: pct(row.count, total) }),
+			el('td', { cls: 'mono', text: answered }),
+			el('td', {
+				cls: 'right mono',
+				text: cost ? fmtMs(cost.p95) : '—',
+				title: cost
+					? `${num(cost.count)} origin fetches under reason "${row.status}"`
+					: 'no origin fetch carried this reason',
+			}),
+			el('td', { cls: 'right' }, [
+				cost?.failures ? el('span', { cls: 'pill bad', text: num(cost.failures) }) : muted('—'),
+			]),
+		]);
+	});
+
+	return card('Not a fresh hit — what, and what it cost', {
+		head,
+		body: [
+			el(
+				'div',
+				{ cls: 'stat-grid tight' },
+				[
+					...FAMILIES,
+					// A verdict this console has no entry for still gets a tile, so the families always sum
+					// to the non-hit total instead of quietly losing a new plugin's new outcome.
+					...(byFamily.has('other')
+						? [{ key: 'other', label: 'Other', hint: 'a verdict this console has no entry for' }]
+						: []),
+				]
+					.filter((family) => byFamily.has(family.key))
+					.map((family) => stat(family.label, pct(byFamily.get(family.key), total), family.hint))
+			),
+			table(
+				[
+					'verdict',
+					{ text: 'serves', right: true },
+					{ text: 'share', right: true },
+					'answered from',
+					{ text: `origin p95 ≈${filter ? ' *' : ''}`, right: true },
+					{ text: 'origin failed', right: true },
+				],
+				body
+			),
+			el('p', { cls: 'muted chart-note' }, [
+				'One row per freshness verdict, because they are four different problems: coverage is fixed in the ',
+				'corpus (discovery, sitemaps), cadence by render capacity or a longer interval, integrity is blob ',
+				'health and never a caching question, and the last two are working as configured. ',
+				'“origin p95” is that verdict’s own origin_fetch latency — the cost side of the same request — and ',
+				'“origin failed” counts 5xx and connect failures only, so a 404 is not in it.',
+				filter ? ' * origin_fetch carries no bot dimension: those two columns are all bots.' : '',
 			]),
 		],
 	});
 }
 
 /** Server-side latency by Harper's own cache verdict — an independent read on the hit rate. */
-function latency(data) {
+function latency(data, filter) {
 	const hits = pick(data, 'duration', (s) => s.type === 'cache-hit');
 	const misses = pick(data, 'duration', (s) => s.type !== 'cache-hit');
 	const series = [
@@ -172,7 +708,11 @@ function latency(data) {
 	];
 	const any = series.some((s) => s.points.some((p) => Number.isFinite(p)));
 	return card('Serve time (p95 ≈)', {
-		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
+		head: [
+			spacer(),
+			allBotsTag(filter, 'Harper’s per-request timing'),
+			legend(series.map(({ label, color }) => ({ label, color }))),
+		],
 		body: [
 			any ? lineChart(data, series) : emptyNote('duration', data),
 			el('p', { cls: 'muted chart-note' }, [
@@ -183,8 +723,8 @@ function latency(data) {
 	});
 }
 
-/** Who is crawling, and how much of each bot's traffic still reaches the origin. */
-function bots(serves, data) {
+/** Who is crawling, on what, and how much of it still reaches the origin. */
+function crawlers(data, { serves, requests, filter }) {
 	const byBot = new Map();
 	for (const s of serves) {
 		const bot = s.type ?? 'other';
@@ -207,20 +747,76 @@ function bots(serves, data) {
 		const origin = rest.reduce((acc, [, e]) => acc + e.origin, 0);
 		rows.push({ label: `other (${rest.length})`, value: total, sub: `${pct(total - origin, total)} offloaded` });
 	}
-	return card('Serves by bot', {
-		body: [rows.length ? barList(rows) : emptyNote('bot_serve', data)],
+
+	// Device and host come off bot_request, which carries the bot in another slot — so both honour
+	// the filter. The device split is here because mobile-first indexing makes "which device type
+	// is the crawler asking as" a question about what gets indexed, and it appears nowhere else in
+	// this console; the host split only appears when a deployment actually serves more than one,
+	// where a host nobody expected is a CDN forwarding rule that should not exist.
+	const tally = (dim) => {
+		const totals = new Map();
+		for (const s of requests) totals.set(s[dim] ?? 'unknown', (totals.get(s[dim] ?? 'unknown') ?? 0) + s.count);
+		return [...totals.entries()].sort((a, b) => b[1] - a[1]);
+	};
+	const devices = tally('type');
+	const hosts = tally('path');
+
+	return card('Crawlers', {
+		head: [spacer(), filter && muted(`${[...filter].join(', ')} only`)],
+		body: [
+			el('div', { cls: 'cols' }, [
+				el('div', null, [
+					el('div', { cls: 'panel-sub', text: 'serves by bot' }),
+					rows.length ? barList(rows) : emptyNote('bot_serve', data),
+				]),
+				el('div', null, [
+					el('div', { cls: 'panel-sub', text: 'requests by device' }),
+					devices.length
+						? barList(
+								devices.map(([device, count]) => ({ label: device, value: count })),
+								{ color: SERIES[2] }
+							)
+						: emptyNote('bot_request', data),
+					hosts.length > 1 && el('div', { cls: 'panel-sub', style: { marginTop: '14px' }, text: 'requests by host' }),
+					hosts.length > 1 &&
+						barList(
+							hosts.map(([host, count]) => ({ label: host, value: count })),
+							{ color: SERIES[3] }
+						),
+				]),
+			]),
+			el('p', { cls: 'muted chart-note' }, [
+				'Narrow every filterable panel to one crawler with the bot chips at the top of the page. A crawler ',
+				'missing from this list is an unmatched User-Agent, not zero traffic — the registry and ',
+				'analytics.deriveUnknownBots decide the labels.',
+			]),
+		],
 	});
 }
 
 /** The status mix as crawlers saw it — names discovered from the scan, never hardcoded. */
-function statusCodes(data) {
+function statusCodes(data, filter) {
 	const rows = (data.series ?? [])
 		.filter((s) => s.metric.startsWith('response_'))
 		.map((s) => ({ code: s.metric.slice('response_'.length), count: s.count }));
 	const byCode = new Map();
 	for (const { code, count } of rows) byCode.set(code, (byCode.get(code) ?? 0) + count);
 	const ranked = [...byCode.entries()].sort((a, b) => b[1] - a[1]);
+
+	// Class subtotals, because the individual codes are what happened and the class is what it
+	// means. A 5xx share is the one number here that is an alarm rather than a mix.
+	const total = ranked.reduce((acc, [, count]) => acc + count, 0);
+	const classShare = (test) => ranked.filter(([code]) => test(Number(code))).reduce((acc, [, count]) => acc + count, 0);
+	const serverErrors = classShare((n) => !Number.isFinite(n) || n >= 500);
+	const classes = [
+		['2xx', classShare((n) => n >= 200 && n < 300)],
+		['3xx', classShare((n) => n >= 300 && n < 400)],
+		['4xx', classShare((n) => n >= 400 && n < 500)],
+		['5xx', serverErrors],
+	].filter(([, count]) => count > 0);
+
 	return card('Status codes served to bots', {
+		head: [spacer(), allBotsTag(filter, 'Harper’s per-response counters')],
 		body: [
 			ranked.length
 				? barList(
@@ -231,6 +827,15 @@ function statusCodes(data) {
 						}))
 					)
 				: emptyNote('response_*', data),
+			ranked.length &&
+				el('p', { cls: 'muted chart-note mono' }, [
+					classes.map(([label, count]) => `${label} ${pct(count, total)}`).join(' · '),
+				]),
+			serverErrors > total / 100 &&
+				el('div', {
+					cls: 'note bad',
+					text: `${pct(serverErrors, total)} of responses to crawlers were 5xx (${num(serverErrors)}).`,
+				}),
 			el('p', { cls: 'muted chart-note' }, [
 				'A metric exists only for codes that occurred — an absent code is zero, not unknown.',
 			]),
@@ -238,83 +843,66 @@ function statusCodes(data) {
 	});
 }
 
-/** What a non-cache serve costs: why the origin was consulted, how slowly it answered. */
-function originFetch(data) {
+/** What a non-cache serve costs: why the origin was consulted, how slowly it answered, and with what. */
+function originFetch(data, filter) {
 	const fetches = pick(data, 'origin_fetch');
-	const byReason = new Map();
-	for (const s of fetches) {
-		const reason = s.method ?? 'unknown';
-		const entry = byReason.get(reason) ?? { count: 0, failures: 0 };
-		entry.count += s.count;
-		const code = Number(s.path);
-		if (!Number.isFinite(code) || code <= 0 || code >= 500) entry.failures += s.count;
-		byReason.set(reason, entry);
-	}
-	const ranked = [...byReason.entries()].sort((a, b) => b[1].count - a[1].count);
+	const costs = originCostByReason(data);
+	const ranked = [...costs.entries()].sort((a, b) => b[1].count - a[1].count);
 
-	const p95Points = weightedBuckets(fetches, 'p95s', data.bucketCount);
-	const meanPoints = weightedBuckets(fetches, 'means', data.bucketCount);
 	const series = [
-		{ label: 'p95', color: SERIES[3], points: p95Points },
-		{ label: 'mean', color: SERIES[0], points: meanPoints },
+		{ label: 'p95', color: SERIES[3], points: weightedBuckets(fetches, 'p95s', data.bucketCount) },
+		{ label: 'mean', color: SERIES[0], points: weightedBuckets(fetches, 'means', data.bucketCount) },
 	];
 
+	// The status mix, which the reason breakdown hides: a 404-heavy proxy is a corpus problem the
+	// failure count deliberately does not flag (a 404 is an answer), and it is invisible otherwise.
+	const byCode = new Map();
+	for (const s of fetches) byCode.set(s.path ?? '0', (byCode.get(s.path ?? '0') ?? 0) + s.count);
+	const totalFetches = sumCount(fetches);
+	const codes = [...byCode.entries()]
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 6)
+		.map(([code, count]) => `${code === '0' ? 'connect-fail' : code} ${pct(count, totalFetches)}`);
+
 	return card('Origin fetches', {
-		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
+		head: [spacer(), allBotsTag(filter, 'origin_fetch'), legend(series.map(({ label, color }) => ({ label, color })))],
 		body: fetches.length
 			? [
 					lineChart(data, series),
 					barList(
-						ranked.map(([reason, { count, failures }]) => ({
+						ranked.map(([reason, { count, failures, p95 }]) => ({
 							label: reason,
 							value: count,
-							sub: failures ? `${num(failures)} failed` : '',
+							sub: `${fmtMs(p95)}${failures ? ` · ${num(failures)} failed` : ''}`,
 							color: failures > count / 2 ? 'var(--bad)' : SERIES[0],
-							title: `${reason}: ${num(count)} fetches, ${num(failures)} failed (5xx/connect)`,
+							title: `${reason}: ${num(count)} fetches, p95 ${fmtMs(p95)}, ${num(failures)} failed (5xx/connect)`,
 						})),
 						{}
 					),
+					el('p', { cls: 'muted chart-note mono' }, [`origin answered: ${codes.join(' · ')}`]),
 					el('p', { cls: 'muted chart-note' }, [
-						'Time to response headers, by why the origin was consulted. render-timeout rows are ',
-						'renderNow falling back — the fleet not keeping up with on-demand requests.',
+						'Time to response headers, by why the origin was consulted — the same reasons as the ',
+						'freshness verdicts above, plus render-timeout, which is renderNow falling back because the ',
+						'fleet did not land an on-demand render in time.',
 					]),
 				]
 			: [emptyNote('origin_fetch', data)],
 	});
 }
 
-/** Freshness as delivered, against the configured cadence. */
-function pageAge(data) {
-	const ages = pick(data, 'page_age');
-	const interval = data.intervals?.defaultRenderInterval;
-	const series = [
-		{ label: 'p95', color: SERIES[2], points: weightedBuckets(ages, 'p95s', data.bucketCount) },
-		{ label: 'median', color: SERIES[1], points: weightedBuckets(ages, 'means', data.bucketCount) },
-	];
-	const any = series.some((s) => s.points.some((p) => Number.isFinite(p)));
-	return card('Page age at serve (≈)', {
-		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
-		body: [
-			any ? lineChart(data, series, { band: interval }) : emptyNote('page_age', data),
-			el('p', { cls: 'muted chart-note' }, [
-				'Cache serves only, so origin proxies cannot drag it toward zero. The dashed line is the ',
-				'default render interval — a p95 above it means the fleet is not keeping the cadence. ',
-				'“median” here charts the bucket mean (count-weighted).',
-			]),
-		],
-	});
-}
-
-/** Which route's cadence should move — the per-route serve mix and delivered age. */
-function routes(ctx, data) {
+/** Which route's cadence should move — the per-route serve mix, delivered age, and staleness. */
+function routes(ctx, data, cadences, filter) {
+	const fallback = data.intervals?.defaultRenderInterval;
 	const byRoute = new Map();
 	for (const s of pick(data, 'route_serve')) {
 		const route = s.path ?? 'unrouted';
-		const entry = byRoute.get(route) ?? { total: 0, cache: 0, miss: 0, aging: 0 };
+		const entry = byRoute.get(route) ?? { total: 0, cache: 0, miss: 0, aging: 0, integrity: 0 };
 		entry.total += s.count;
 		if (s.method === 'hit' || s.method === 'swr' || s.method === 'peer-rescue') entry.cache += s.count;
 		if (s.method === 'miss') entry.miss += s.count;
 		if (s.method === 'swr' || s.method === 'stale') entry.aging += s.count;
+		if (s.method === 'blob-missing' || s.method === 'blob-timeout' || s.method === 'peer-rescue')
+			entry.integrity += s.count;
 		byRoute.set(route, entry);
 	}
 	const ageByRoute = new Map();
@@ -328,46 +916,102 @@ function routes(ctx, data) {
 	const ranked = [...byRoute.entries()].sort((a, b) => b[1].total - a[1].total);
 	if (!ranked.length) return null;
 
-	const rows = ranked.map(([route, { total, cache, miss, aging }]) => {
+	const total = ranked.reduce((acc, [, entry]) => acc + entry.total, 0);
+	// Only worth a column when the deployment has any: it is a fault class that should read zero.
+	const anyIntegrity = ranked.some(([, entry]) => entry.integrity > 0);
+	const unclassified = ranked
+		.filter(([route]) => cadenceFor(cadences, route, fallback).mode === 'unclassified')
+		.reduce((acc, [, entry]) => acc + entry.total, 0);
+
+	const rows = ranked.map(([route, { total: routeTotal, cache, miss, aging, integrity }]) => {
+		const cadence = cadenceFor(cadences, route, fallback);
+		const prerender = isPrerender(cadence);
 		const ageP95 = weighted(ageByRoute.get(route) ?? [], 'p95');
+		const ratio = Number.isFinite(ageP95) && cadence.interval > 0 ? ageP95 / cadence.interval : null;
 		return el('tr', null, [
 			el('td', { cls: 'mono', text: route }),
-			el('td', { cls: 'right mono', text: num(total) }),
-			el('td', { cls: 'right mono', text: pct(cache, total) }),
-			el('td', { cls: 'right' }, [
-				// Miss share is the coverage number; past a third it stops being tail noise.
-				el('span', { cls: total > 0 && miss > total / 3 ? 'pill warn' : 'mono', text: pct(miss, total) }),
+			el('td', null, [
+				cadence.mode === 'prerender'
+					? muted('prerender')
+					: // `unknown` means the config payload could not be read, not that the route is odd — a
+						// pill on every row would read as a finding about the deployment.
+						cadence.mode === 'unknown'
+						? muted('—')
+						: pill(cadence.mode, cadence.mode === 'unclassified' ? 'warn' : ''),
 			]),
-			el('td', { cls: 'right mono', text: pct(aging, total) }),
+			el('td', { cls: 'right mono', text: num(routeTotal) }),
+			el('td', { cls: 'right mono', text: pct(cache, routeTotal) }),
+			el('td', { cls: 'right' }, [
+				// Miss share is the coverage number; past a third it stops being tail noise — but ONLY
+				// on a route we actually cache. A passthrough route is proxied live by definition, so
+				// its 100% miss rate is the configuration working, and flagging it trains the operator
+				// to ignore the flag on the routes where it means something.
+				el('span', {
+					cls: prerender && routeTotal > 0 && miss > routeTotal / 3 ? 'pill warn' : 'mono',
+					text: pct(miss, routeTotal),
+				}),
+			]),
+			el('td', { cls: 'right mono', text: pct(aging, routeTotal) }),
+			anyIntegrity &&
+				el('td', { cls: 'right' }, [
+					integrity ? el('span', { cls: 'pill bad', text: pct(integrity, routeTotal) }) : muted('—'),
+				]),
+			el('td', { cls: 'right mono' }, [
+				prerender ? fmtMs(cadence.interval) : '—',
+				prerender && cadence.inherited ? muted(' default') : null,
+			]),
 			el('td', { cls: 'right mono', text: fmtMs(ageP95) }),
+			el('td', { cls: 'right' }, [
+				prerender && ratio !== null
+					? el('span', { cls: ratio > 1 ? 'pill warn' : 'mono', text: fmtRatio(ratio) })
+					: muted('—'),
+			]),
 		]);
 	});
 
 	return card('Per route', {
-		head: [spacer(), link('explain a url →', () => ctx.go('explain'))],
+		head: [
+			spacer(),
+			allBotsTag(filter, 'route_serve carries the route in the slot bot_serve uses for the bot'),
+			link('explain a url →', () => ctx.go('explain')),
+		],
 		body: [
 			table(
 				[
 					'route',
+					'mode',
 					{ text: 'serves', right: true },
 					{ text: 'cache-served', right: true },
 					{ text: 'miss', right: true },
 					{ text: 'swr+stale', right: true },
+					anyIntegrity && { text: 'blob', right: true },
+					{ text: 'cadence', right: true },
 					{ text: 'age p95 ≈', right: true },
-				],
+					{ text: '÷ cadence', right: true },
+				].filter(Boolean),
 				rows
 			),
 			el('p', { cls: 'muted chart-note' }, [
-				'The cadence-tuning table: a high swr+stale share means that route’s renderInterval is not ',
-				'being delivered; a high miss share means its corpus isn’t covered; compare age p95 to the ',
-				'route’s own interval before moving it.',
+				'The cadence-tuning table. “÷ cadence” is that route’s age p95 measured against its own ',
+				'renderInterval, so every row is comparable and above 1.0 always means the same thing: the fleet ',
+				'is not delivering the cadence this route is configured for. A high miss share means its corpus ',
+				'isn’t covered — flagged only on routes we actually cache, since a passthrough is proxied live by ',
+				'design. Cadence is read from ingress.routes; “default” means the route sets none and inherits ',
+				'render.defaultInterval.',
 			]),
+			unclassified > 0 &&
+				el('div', { cls: 'note warn' }, [
+					`${pct(unclassified, total)} of route-attributed serves matched no route at all. Either the CDN is `,
+					'forwarding paths nobody declared or the route list is incomplete — the unrouted report on ',
+					link('Config', () => ctx.go('config')),
+					' buckets them by first path segment.',
+				]),
 		],
 	});
 }
 
 /** Distinct URLs per bot per day — how much of the corpus crawlers actually walk. */
-function breadth(ctx) {
+function breadth(ctx, filter) {
 	const state = ctx.data.breadth;
 
 	const loadBreadth = async () => {
@@ -427,8 +1071,16 @@ function breadth(ctx) {
 						),
 					]),
 					el('div', null, [
-						el('div', { cls: 'panel-sub', text: `by bot, ${latest.day}` }),
-						barList(latest.bots.slice(0, 8).map(({ bot, distinctUrls }) => ({ label: bot, value: distinctUrls }))),
+						el('div', { cls: 'panel-sub', text: `by bot, ${latest.day}${filter ? ' (filtered)' : ''}` }),
+						// The per-bot column narrows with the filter; the day total beside it cannot, because it
+						// is a UNION of the day's sketches and not a sum — subtracting bots from it is not an
+						// operation HyperLogLog offers a reader.
+						barList(
+							latest.bots
+								.filter(({ bot }) => keepBot(filter, bot))
+								.slice(0, 8)
+								.map(({ bot, distinctUrls }) => ({ label: bot, value: distinctUrls }))
+						),
 					]),
 				]),
 				el('p', { cls: 'muted chart-note' }, [
@@ -459,7 +1111,7 @@ const settings = (ctx) => [
 			'What the plugin records for bot traffic, and under which names. Turning recording off empties ' +
 			'every panel above from the moment it takes effect — it does not delete rows already recorded, ' +
 			'and it changes nothing about what bots are served. The bot registry and deriveUnknownBots decide ' +
-			'the labels in Serves by bot: a crawler missing there is an unmatched User-Agent, not zero traffic.',
+			'the labels in the bot filter: a crawler missing there is an unmatched User-Agent, not zero traffic.',
 	}),
 	settingsCard(ctx, {
 		title: 'Crawl-breadth sketches',
