@@ -8,4 +8,9 @@ rest: true
 graphqlSchema:
   files: 'schema.graphql'
 
-pluginModule: 'bench.js'
+# `jsResource`, NOT `pluginModule`. `handleApplication` is the hook Harper calls on a component that
+# another component USES as an extension — a root component declaring it is simply never invoked, and
+# the server comes up perfectly healthy having run nothing. A jsResource module runs on load, which is
+# what a one-shot harness wants.
+jsResource:
+  files: 'bench.js'

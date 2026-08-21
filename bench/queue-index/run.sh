@@ -28,9 +28,14 @@ if [[ "$MODE" == "docker" ]]; then
 	CONTAINER="${BENCH_CONTAINER:-prerender-queue-bench}"
 	docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 	echo "run.sh: starting harperfast/harper:$HDB_VERSION as $CONTAINER on $PORT"
-	# The component is MOUNTED rather than deployed: `harper deploy` packs and installs, which is the
-	# right thing for a real component and pointless overhead for a harness that only needs its two
-	# files visible. If the image's component root differs, override BENCH_COMPONENT_DIR.
+	# STAGED INTO A TEMP DIR AND MOUNTED READ-WRITE, not mounted read-only from the repo. Harper's
+	# component loader creates `node_modules` inside the component directory to symlink the `harper`
+	# module, so a read-only mount fails the whole component with EROFS and the server comes up
+	# perfectly happy with nothing loaded. Staging keeps that write out of the working tree.
+	STAGE="$(mktemp -d)"
+	cp "$HERE"/config.yaml "$HERE"/schema.graphql "$HERE"/bench.js "$STAGE/"
+	trap 'rm -rf "$STAGE"' EXIT
+
 	docker run --rm \
 		--name "$CONTAINER" \
 		-e HDB_ADMIN_USERNAME=bench_admin \
@@ -39,7 +44,7 @@ if [[ "$MODE" == "docker" ]]; then
 		-e THREADS_COUNT=1 \
 		-e ROWS="$ROWS" -e REPEATS="$REPEATS" -e CHURN="$CHURN" \
 		-p "$PORT:9926" \
-		-v "$HERE:${BENCH_COMPONENT_DIR:-/hdb/components/queue-index}:ro" \
+		-v "$STAGE:${BENCH_COMPONENT_DIR:-/home/harperdb/harper/components/queue-index}" \
 		"harperfast/harper:$HDB_VERSION"
 	exit $?
 fi

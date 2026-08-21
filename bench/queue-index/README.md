@@ -38,9 +38,17 @@ hundreds of thousands of rows, and it refuses to run against `~/hdb`.
 `ROWS` defaults to 200,000 to match #80 so the numbers are comparable. Production is 1,619,000 keys
 (814,200 targets × 2 device types) — per-row costs are what transfer, not totals.
 
-> **Neither mode has been run end to end yet.** Docker was unavailable where this was written, and
-> local mode failed in Harper's `checkForExistingInstall` against a fresh root. Treat the first run
-> as calibration.
+Docker mode is the verified path (Harper 5.2.4, `ROWS=200000`). Two things about it are worth
+knowing before you edit the harness:
+
+- The component is **staged into a temp dir and mounted read-write.** Harper's component loader
+  creates `node_modules` inside the component directory to symlink the `harper` module, so a
+  read-only mount fails the component with `EROFS` — and the server then comes up perfectly happy
+  having loaded nothing.
+- The entry point is **`jsResource`, not `pluginModule`.** `handleApplication` is the hook Harper
+  calls on a component another component *uses* as an extension; a root component declaring it is
+  simply never invoked. Same silent-success failure.
+- Harper **intercepts `process.exit`**, so the harness signals itself instead.
 
 ## What it answers, and what each answer decides
 

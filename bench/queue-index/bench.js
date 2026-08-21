@@ -155,7 +155,22 @@ const seed = async (table, shape) => {
 	return performance.now() - started;
 };
 
-export async function handleApplication() {
+// Runs on load. `jsResource` modules are imported after the schema is applied, so `databases.bench`
+// is populated by the time this executes; the retry below exists only so a load-order change in
+// Harper reports itself as a wait rather than as a TypeError on `databases.bench`.
+const tablesReady = async () => {
+	for (let i = 0; i < 50; i++) {
+		if (databases?.bench?.BenchA) return true;
+		await new Promise((resolve) => setTimeout(resolve, 200));
+	}
+	return false;
+};
+
+async function main() {
+	if (!(await tablesReady())) {
+		console.error('[bench] databases.bench never appeared — the schema did not load');
+		process.exit(1);
+	}
 	const { BenchA, BenchB, BenchC } = databases.bench;
 	const out = { rows: ROWS, repeats: REPEATS, harper: server?.version ?? 'unknown', phases: {} };
 	const log = (...args) => console.log(...args);
@@ -222,23 +237,41 @@ export async function handleApplication() {
 	};
 	log('[bench] lanes:', JSON.stringify(out.phases.lanes, null, 2));
 
-	// ---- Q6: two-sided range, fillable and not ---------------------------------------------------
-	const fillable = await time('twoSided, limit fills', () => drain(twoSided(BenchA, floor, now, 20)));
-	// A window with almost nothing in it, so the limit can never fill — the "nothing is due" steady
-	// state, which is where the 480x regression was measured.
-	const empty = await time('twoSided, limit cannot fill', () =>
-		drain(twoSided(BenchA, now + 10 * MINUTE, now + 11 * MINUTE, 20))
+	// ---- Q6: two-sided range, and it has to be set up correctly to mean anything -----------------
+	//
+	// THE FIRST VERSION OF THIS TEST WAS WORTHLESS and it is worth saying why, because it looked like
+	// a refutation. It used a window ABOVE every seeded row (`now+10min .. now+11min`), so there were
+	// no rows above the lower bound at all — and the described failure mode is precisely
+	// "O(rows above the lower bound)". It measured an empty seek and reported it as cheap.
+	//
+	// To exercise the post-filter the window must be LOW (so almost the whole table sits above the
+	// lower bound) and NARROW (so the matching rows run out), with a limit LARGER than the number of
+	// matches — then the engine keeps walking past the window hunting for matches that do not exist.
+	// Due times here are minute-floored across 1,440 distinct minutes, so one minute holds about
+	// ROWS/1440 rows; a limit well above that cannot fill.
+	const oldest = dueFor(ROWS - 1);
+	const perMinute = Math.ceil(ROWS / 1440);
+	const cannotFillLimit = perMinute * 10;
+	const narrowTwoSided = await time(`twoSided, low+narrow window, limit ${cannotFillLimit} cannot fill`, () =>
+		drain(twoSided(BenchA, oldest, oldest + MINUTE, cannotFillLimit))
 	);
-	const emptyOneSided = await time('oneSided, same empty window', () =>
-		drain(oneSided(BenchA, now + 10 * MINUTE, 20))
+	const sameOneSided = await time(`oneSided, same lower bound, limit ${cannotFillLimit}`, () =>
+		drain(oneSided(BenchA, oldest, cannotFillLimit))
 	);
+	const fillable = await time('twoSided, wide window, limit fills', () => drain(twoSided(BenchA, floor, now, 20)));
 	out.phases.twoSided = {
 		note: 'Q6 — `claimSchedules` keeps the `<= now` half in application code because a two-sided range '
 			+ 'measured 1,128-2,977ms when the limit cannot fill (only the first condition becomes the index '
-			+ 'range; the second is a post-filter). This is that comparison.',
-		fillable_ms: fillable.minMs,
-		cannotFill_ms: empty.minMs,
-		cannotFill_oneSided_ms: emptyOneSided.minMs,
+			+ 'range, the second is a post-filter, so the cost is O(rows above the lower bound)). The window '
+			+ 'must be low and narrow with an unfillable limit or the test does not touch that path.',
+		rowsAboveLowerBound: ROWS,
+		matchesInWindow: perMinute,
+		limitThatCannotFill: cannotFillLimit,
+		twoSided_cannotFill_ms: narrowTwoSided.minMs,
+		twoSided_cannotFill_rowsReturned: narrowTwoSided.rows.n,
+		oneSided_sameLowerBound_ms: sameOneSided.minMs,
+		oneSided_rowsReturned: sameOneSided.rows.n,
+		twoSided_fillable_ms: fillable.minMs,
 	};
 	log('[bench] twoSided:', JSON.stringify(out.phases.twoSided, null, 2));
 
@@ -246,38 +279,73 @@ export async function handleApplication() {
 	// The reschedule pattern: read the head, move those rows into the future, repeat. This is what
 	// leaves dead index entries AT the seek point, and it is the measurement the claim floor exists
     // to answer (0.36 -> 6.25ms over 40,000 reschedules, permanent).
+	// PRODUCTION-SHAPED CHURN, which the first version of this was not. It patched keys 0..N in key
+	// order; production repeatedly CLAIMS THE HEAD of the index and writes those rows into the future,
+	// so the dead entries accumulate at the seek point rather than being spread over a key range. The
+	// difference matters exactly for the effect being measured, so this reads the head, moves what it
+	// read, and repeats — and samples the seek cost as it goes, so a trend is visible rather than only
+	// a before/after pair that one cold page can dominate.
+	//
+	// The floored seek is also fixed. Pinning it at `now - 60min` put it in the region the churn had
+	// just rewritten, which is why it measured SLOWER than the unfloored seek; production's floor
+	// tracks the oldest row still due, so that is what is tracked here.
 	const churn = Math.min(ROWS, Number(process.env.CHURN) || 40_000);
-	const headSeekBefore = await time('unfloored head seek, before churn', () =>
-		drain(oneSided(BenchA, 0, 20))
-	);
+	const batch = 20;
+	const trend = [];
 	let moved = 0;
-	const churnStarted = performance.now();
-	for (let i = 0; i < churn; i++) {
-		// Single-attribute update, not a whole-record put: Q4. If this is materially cheaper than the
-		// seed's per-row put, then an in-place lane change is cheap and the encoding is a good deal.
-		await BenchA.patch(keyFor(i), { nextRenderTime: now + (i % (24 * 60)) * MINUTE });
-		moved++;
-		if (i % 2_000 === 0) await new Promise((resolve) => setImmediate(resolve));
+	let churnMs = 0;
+	let floorValue = 0;
+
+	const sampleSeek = async () => ({
+		unfloored: (await time('unfloored', () => drain(oneSided(BenchA, 0, batch)))).minMs,
+		floored: (await time('floored', () => drain(oneSided(BenchA, floorValue, batch)))).minMs,
+	});
+	trend.push({ reschedules: 0, ...(await sampleSeek()) });
+
+	while (moved < churn) {
+		// Read the head the way `claim` does...
+		const head = [];
+		for await (const row of oneSided(BenchA, floorValue, batch)) head.push(row);
+		if (head.length === 0) break;
+		// ...and let the floor follow the first row observed, which is the production rule.
+		floorValue = Number(head[0].nextRenderTime);
+
+		const started = performance.now();
+		for (const row of head) {
+			// Whole-record put, matching `processJobResult`: one write per completed render, moving the
+			// row a full interval into the future.
+			await BenchA.put(row.cacheKey, {
+				nextRenderTime: now + 24 * 60 * MINUTE + moved * MINUTE,
+				fromSitemap: row.fromSitemap,
+			});
+			moved++;
+		}
+		churnMs += performance.now() - started;
+		if (moved % 2_000 < batch) {
+			await new Promise((resolve) => setImmediate(resolve));
+			trend.push({ reschedules: moved, ...(await sampleSeek()) });
+		}
 	}
-	const churnMs = performance.now() - churnStarted;
-	const headSeekAfter = await time('unfloored head seek, after churn', () => drain(oneSided(BenchA, 0, 20)));
-	const flooredSeekAfter = await time('FLOORED seek, after churn', () =>
-		drain(oneSided(BenchA, now - 60 * MINUTE, 20))
-	);
+	trend.push({ reschedules: moved, ...(await sampleSeek()) });
+
 	out.phases.churn = {
-		note: 'Q4/Q7 — per-row single-attribute patch cost (vs the whole-record put above), and whether the '
-			+ 'seek point degrades as rows churn away from it. A floored seek should be immune; an unfloored '
-			+ 'one should not.',
+		note: 'Q7 — does the seek point degrade as rows churn away from it (the 0.36 -> 6.25ms finding the '
+			+ 'claim floor exists to fix), and is a floored seek immune? Head-claim-then-reschedule, the '
+			+ 'production shape, sampling both seeks as it goes. Also Q4: per-row put on the reschedule path.',
 		reschedules: moved,
-		patch_usPerRow: (churnMs * 1000) / Math.max(1, moved),
-		unflooredSeekBefore_ms: headSeekBefore.minMs,
-		unflooredSeekAfter_ms: headSeekAfter.minMs,
-		flooredSeekAfter_ms: flooredSeekAfter.minMs,
+		put_usPerRow: (churnMs * 1000) / Math.max(1, moved),
+		trend,
 	};
 	log('[bench] churn:', JSON.stringify(out.phases.churn, null, 2));
 
 	log('\n[bench] RESULT\n' + JSON.stringify(out, null, 2));
-	// Exit rather than leave a server up: this is a one-shot measurement, and the numbers above are
-	// only valid while nothing else is touching the tables.
-	process.exit(0);
+	// Harper INTERCEPTS `process.exit`, so a one-shot harness cannot end itself that way — it printed
+	// its results and then sat there as a running server. Signal the process instead.
+	console.log('[bench] done');
+	process.kill(process.pid, 'SIGTERM');
 }
+
+main().catch((e) => {
+	console.error('[bench] failed', e);
+	process.exit(1);
+});
