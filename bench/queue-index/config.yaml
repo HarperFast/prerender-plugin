@@ -1,0 +1,16 @@
+# Benchmark component for the RenderSchedule queue index.
+#
+# NOT SHIPPED. This is a dev harness, declared as its own Harper component so it runs against a real
+# Harper storage engine rather than against a mock — the whole point is to price the storage layer,
+# which is the one thing a unit test cannot tell you.
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+# `jsResource`, NOT `pluginModule`. `handleApplication` is the hook Harper calls on a component that
+# another component USES as an extension — a root component declaring it is simply never invoked, and
+# the server comes up perfectly healthy having run nothing. A jsResource module runs on load, which is
+# what a one-shot harness wants.
+jsResource:
+  files: 'bench.js'

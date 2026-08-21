@@ -1,0 +1,29 @@
+# Three candidate shapes for the render queue's schedule table. Same row count, same key shape, same
+# access patterns — the only variable is how the scheduling order is stored and indexed.
+
+# A — TODAY. One indexed Long that is BOTH the freshness deadline and the queue position.
+type BenchA @table(database: "bench") @export {
+	cacheKey: String @primaryKey
+	nextRenderTime: Long @indexed
+	fromSitemap: Boolean
+}
+
+# B — THE SPLIT. The queue position is its own indexed column; the deadline is a plain unindexed
+# timestamp that nothing has to decode. Same NUMBER of indexed attributes as A, so if A and B write
+# at the same rate then separating the two concepts is free.
+type BenchB @table(database: "bench") @export {
+	cacheKey: String @primaryKey
+	queueKey: Long @indexed
+	dueAt: Long
+	fromSitemap: Boolean
+}
+
+# C — BOTH INDEXED. Prices the second index on the hot write path, which is the claim in #80 that
+# "the existing secondary index is 39-48% of reschedule wall clock" and therefore that a per-lane
+# index or table roughly doubles it.
+type BenchC @table(database: "bench") @export {
+	cacheKey: String @primaryKey
+	queueKey: Long @indexed
+	dueAt: Long @indexed
+	fromSitemap: Boolean
+}
