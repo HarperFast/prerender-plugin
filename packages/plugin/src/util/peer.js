@@ -23,7 +23,7 @@
  */
 
 import { config } from '../config.js';
-import { nodes } from './residency.js';
+import { getNodes } from './residency.js';
 
 // Peers are reached over TLS: the Harper HTTP port serves TLS in every real deployment, and
 // the node certificates chain to a publicly-trusted CA, so standard validation applies (no
@@ -57,7 +57,7 @@ export const peerOrigin = (hostname) => {
  * not weaken the guard — membership in the known set is still required.
  */
 export const isKnownNode = (hostname) =>
-	typeof hostname === 'string' && nodes.some((node) => node.toLowerCase() === hostname.toLowerCase());
+	typeof hostname === 'string' && getNodes().some((node) => node.toLowerCase() === hostname.toLowerCase());
 
 /**
  * The subset of the caller's headers to forward. Only credentials, nothing else — the peer

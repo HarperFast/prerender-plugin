@@ -830,6 +830,21 @@ land where no claim will look. Such a row is recovered only on the next floor re
 (`queue.claimFloor.resetInterval`), and until then the URL silently does not render. Use
 `POST /prerender_admin/revalidate` — or the button — which writes through the funnel.
 
+### Where residency comes from
+
+Ownership is rendezvous-hashed over the cluster's node names, read from `server.nodes` on every
+call. It is read per call, and never snapshotted, because `server.nodes` is not a stable list:
+Harper initialises it empty and fills it asynchronously from `hdb_nodes`, replaces it while
+rebuilding after a subscription restart, and briefly drops a node while applying an update to it.
+
+**An empty peer list is treated as "not known yet", never as "this node is alone."** With no
+peers, rendezvous hashing makes the local node the owner of every URL — so every schedule row
+would be stored locally rather than routed, where nothing claims it correctly and nothing removes
+it. The last non-empty list therefore wins over an empty one, while any non-empty list is adopted
+at once so a real membership change still takes effect. A node that has never seen a peer logs a
+warning and owns everything, which is correct for a single-node deployment and a misconfiguration
+on a cluster.
+
 ### Schedule repair: the half-written target
 
 A `RenderTarget` and its `RenderSchedule` row live in **separate databases**, so creating a
