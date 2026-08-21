@@ -314,6 +314,7 @@ export function mergeAnalytics(results) {
 					p95Sum: 0,
 					statWeight: 0,
 					meanSums: new Array(bucketCount).fill(0),
+					medianSums: new Array(bucketCount).fill(0),
 					p95Sums: new Array(bucketCount).fill(0),
 					statWeights: new Array(bucketCount).fill(0),
 				};
@@ -348,6 +349,11 @@ export function mergeAnalytics(results) {
 					if (Number.isFinite(m) && Number.isFinite(weight) && weight > 0) {
 						acc.meanSums[i] += m * weight;
 						acc.statWeights[i] += weight;
+						// Carried through the cluster merge as well, or the typical-case line exists on one
+						// node and vanishes the moment an operator switches to cluster scope — which is the
+						// default view, so it would effectively not exist at all.
+						const med = finite(s.medians?.[i]);
+						if (Number.isFinite(med)) acc.medianSums[i] += med * weight;
 						const p = finite(s.p95s?.[i]);
 						if (Number.isFinite(p)) acc.p95Sums[i] += p * weight;
 					}
@@ -371,6 +377,7 @@ export function mergeAnalytics(results) {
 			out.median = acc.medianSum / acc.statWeight;
 			out.p95 = acc.p95Sum / acc.statWeight;
 			out.means = acc.statWeights.map((w, i) => (w > 0 ? acc.meanSums[i] / w : null));
+			out.medians = acc.statWeights.map((w, i) => (w > 0 ? acc.medianSums[i] / w : null));
 			out.p95s = acc.statWeights.map((w, i) => (w > 0 ? acc.p95Sums[i] / w : null));
 		}
 		return out;

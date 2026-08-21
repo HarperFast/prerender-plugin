@@ -69,6 +69,13 @@ test('value combos: count-weighted mean/p95, gaps stay null (never zero)', () =>
 	assert.equal(ages.means[3], 50);
 	// Overall stats are weighted across the whole window.
 	assert.equal(ages.mean, (100 * 3 + 500 * 1 + 50 * 2) / 6);
+
+	// The MEDIAN is bucketed too, not only summarized. A console that can put a median in a tile
+	// but never in a trend line ends up charting p95s and calling them typical.
+	assert.equal(ages.medians[0], (90 * 3 + 480 * 1) / 4);
+	assert.equal(ages.medians[1], null);
+	assert.equal(ages.medians[3], 40);
+	assert.equal(ages.median, (90 * 3 + 480 * 1 + 40 * 2) / 6);
 });
 
 test('rows outside the window and rows with junk are dropped, not misfiled', () => {
