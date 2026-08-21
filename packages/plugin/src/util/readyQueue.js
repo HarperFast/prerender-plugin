@@ -15,8 +15,9 @@
  * The fix is to stop deciding from a window. A background sweep scores the WHOLE due set and keeps
  * the best few thousand here; `claim` then pops from this in priority order and touches no index at
  * all. That is affordable because of one measured fact (#119): a projected one-sided read costs
- * ~2.4 us/row, flat from 200 to 20,000 rows, and yielding every 200 rows is free — so scoring
- * 200,000 rows costs ~480 ms, and even a 500k-row overdue set is ~1.2 s. Writes, by contrast, are
+ * ~2.4 us/row on a freshly-written 200k-row bench corpus — but ~55 us/row warm on the production
+ * corpus of 1.3M churned rows, where a ~300k-row due set is a ~27s sweep (see
+ * `util/renderPriority.js`). Writes, by contrast, are
  * 76-89 us/row, i.e. 32x a read. Reading liberally and writing not at all is the cheap direction, and
  * this structure adds ZERO writes.
  *

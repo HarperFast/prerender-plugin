@@ -100,6 +100,9 @@ const drain = async (iterable) => {
 /** The same drain, yielding to the event loop every `every` rows — backlogSnapshot's shape. */
 const drainYielding = async (iterable, every = 200) => {
 	let n = 0;
+	// The row is deliberately unread: this measures the cost of DRAINING the cursor, so reaching into
+	// the value would put decode work inside the measurement.
+	// eslint-disable-next-line no-unused-vars
 	for await (const _row of iterable) {
 		if (++n % every === 0) await new Promise((resolve) => setImmediate(resolve));
 	}

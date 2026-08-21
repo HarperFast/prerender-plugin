@@ -488,3 +488,72 @@ test('a BigInt carried cadence from a Long column is used, not discarded', async
 		['https://www.kohls.com/product/prd-promoted/x|desktop']
 	);
 });
+
+test('THE SWEEP STOPS AT THE DUE BOUNDARY instead of draining the window', async () => {
+	// The query is one-sided (`>= floor`), so it keeps returning rows past the due set. Reading them
+	// to the cap and discarding them was 40% of the scan on the production corpus — ~198k of 500k rows,
+	// about 11s of a 27s sweep on RocksDB. Rows arrive ascending, so the first not-yet-due row proves
+	// the rest of the window is not due either.
+	const rows = [];
+	for (let i = 0; i < 10; i++)
+		rows.push(row(`https://www.kohls.com/product/prd-${i}/x`, 'desktop', T0 - (i + 1) * HOUR));
+	for (let i = 0; i < 500; i++)
+		rows.push(row(`https://www.kohls.com/product/prd-f${i}/x`, 'desktop', T0 + (i + 1) * HOUR));
+	seed(rows);
+
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.due, 10, 'every due row is still seen');
+	assert.equal(sweep.scanned, 11, 'ten due rows plus the ONE not-yet-due row that ended the walk');
+	assert.equal(sweep.published, 10);
+	assert.equal(sweep.truncated, false, 'reaching a not-yet-due row is the opposite of truncation');
+});
+
+test('...and a caught-up node reads ONE row, not its whole window', async () => {
+	// The steady state the queue spends most of its time in. This is the case that went from `cap` rows
+	// to a single row.
+	seed(
+		Array.from({ length: 300 }, (_, i) =>
+			row(`https://www.kohls.com/product/prd-${i}/x`, 'desktop', T0 + (i + 1) * HOUR)
+		)
+	);
+
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.due, 0);
+	assert.equal(sweep.scanned, 1, 'one row read to learn nothing is due');
+	assert.equal(sweep.published, 0);
+	assert.equal(
+		sweep.earliestNotYetDueMinute,
+		minuteOf(T0 + HOUR),
+		'and it is the EARLIEST not-yet-due minute, which is what flips a node from empty to queued'
+	);
+});
+
+test('breaking early still reports the earliest not-yet-due minute, not a later one', async () => {
+	// Ascending order is what makes the first one the earliest. If the walk ever stopped being ordered
+	// this assertion is what catches it — a later minute here would make a node with work coming in
+	// thirty seconds tell the fleet to go idle for longer than it should.
+	seed([
+		row('https://www.kohls.com/', 'desktop', T0 - 2 * HOUR),
+		row('https://www.kohls.com/product/prd-1/x', 'desktop', T0 + 5 * MINUTE),
+		row('https://www.kohls.com/product/prd-2/x', 'desktop', T0 + 90 * MINUTE),
+	]);
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.due, 1);
+	assert.equal(sweep.scanned, 2, 'stopped at the +5m row, never read the +90m one');
+	assert.equal(sweep.earliestNotYetDueMinute, minuteOf(T0 + 5 * MINUTE));
+});
+
+test('a due set that fills the cap is still reported truncated', async () => {
+	// The break must not mask truncation: if EVERY row in the window is due, the walk ends on the cap
+	// having never seen a not-yet-due row, and the ordering covers only a prefix of the backlog.
+	config.queue.ready.sweepCap = 25;
+	seed(
+		Array.from({ length: 60 }, (_, i) =>
+			row(`https://www.kohls.com/product/prd-${i}/x`, 'desktop', T0 - (i + 1) * HOUR)
+		)
+	);
+
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.scanned, 25, 'read exactly the cap');
+	assert.equal(sweep.truncated, true, 'never reached a not-yet-due row, so the ordering is over a prefix');
+});

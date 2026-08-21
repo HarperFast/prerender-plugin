@@ -1,5 +1,31 @@
 # `bench/queue-index` — what the render queue's storage actually costs
 
+> ## READ THIS BEFORE QUOTING ANY NUMBER BELOW
+>
+> **Every absolute per-row cost here is a FLOOR measured on a fresh corpus, not a steady state.** This
+> harness writes ~200k rows and reads them immediately. Production holds **1.3M rows that have been
+> rewritten on every render for months**, and on an LSM store that is the whole difference: each
+> reschedule is a `put` superseding the old value, and a range scan walks past every superseded version
+> until compaction removes it.
+>
+> Measured here: a projected one-sided read at **~2.4 µs/row**. Measured on the live cluster
+> (2026-08-21) — **same storage engine both times**, RocksDB, Harper's default — the sweep runs
+> **~55 µs/row warm and ~80 µs/row cold**, roughly 20–30× more.
+>
+> **This harness already told us that, and it was read too narrowly.** Q6 below measures an unfloored
+> seek degrading **0.073 → 5.60 ms after 40,000 head reschedules — 77×** — same engine, same corpus,
+> churn alone. That result got filed as "the claim floor is justified" when it was also saying _every
+> other number on this page decays with churn_.
+>
+> It cost something real: the ready-set sweep (#120) was sized from 2.4 µs/row and expected to run
+> sub-second over a ~300k-row due set. It measured **27 s warm, 40–46 s cold**, and the fix (#124) was
+> to stop reading past the due boundary — a change nobody would have bothered with at 0.5 s of waste.
+>
+> The _comparative_ results all still hold and are the reason to keep this: writes cost ~32× a read,
+> `patch` is worse than `put`, a second index is ~13%, a two-sided range that cannot fill its limit is
+> catastrophic. **Ratios travel; absolute per-row costs do not.** To size something for production,
+> either run this at production row count WITH churn, or measure production.
+
 Every scheduling decision in this package is justified by a number, and the two numbers the queue
 design rests on **cannot be reproduced**: prerender-plugin#80 cites `20-lanesim.mjs` and
 `21-duerank.mjs`, neither of which is in this repository. This harness exists so the next schema
