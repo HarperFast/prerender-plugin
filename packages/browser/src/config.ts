@@ -86,6 +86,16 @@ export type NavigationConfig = {
 	domStableTimeoutMs: number;
 	domStablePollMs: number;
 	domStableTolerance: number;
+	/**
+	 * Decide indexability against the pre-settle DOM and skip the settle phase when the answer is
+	 * already "not indexable" — the plugin can never store such a page, so settling it is waste,
+	 * and settle is the dominant cost of a render. See the bail in `renderer.ts` for what it does
+	 * and does not cover.
+	 *
+	 * Default false: a site whose canonical or robots tag is written by script rather than served
+	 * in the document would see pages skipped that a full render would have kept.
+	 */
+	skipSettleWhenNonIndexable: boolean;
 };
 
 export type ScrollConfig = {
@@ -286,6 +296,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStableTimeoutMs: 8000,
 		domStablePollMs: 250,
 		domStableTolerance: 8,
+		skipSettleWhenNonIndexable: false,
 	},
 	scroll: {
 		enabled: true,

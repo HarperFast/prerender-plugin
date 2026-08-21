@@ -265,6 +265,44 @@ const renderer: Renderer = async (page, job) => {
 		}
 	}
 
+	// Settle dominates a render's cost, and the plugin's store guard is `statusCode === 200 &&
+	// content` — so a document that already disowns itself can never be stored however long it
+	// settles. Decide against the pre-settle DOM and skip the settle when the answer is already no.
+	//
+	// Can only ever SKIP a render: anything that survives falls through to the post-settle check,
+	// which stays authoritative because script-injected canonical/robots tags land after this point.
+	// A non-200 is decided on the status alone. The `status >= 400` response handler above calls
+	// `ac.abort()`, but that only stops SUBRESOURCE interception (see the `ac.signal.aborted` guards
+	// in the request handlers) — the main document has already answered by then, so `goto` resolves
+	// normally and a 404 would otherwise settle in full. Verified by test, not by reading: an
+	// earlier review argued `goto` rejects here and the suite disproved it.
+	//
+	// Sitemap jobs are exempt: their content is stored even when non-indexable, so bailing would
+	// change WHAT gets cached rather than only how long it took.
+	if (config.navigation.skipSettleWhenNonIndexable && finalRes && !job.isFromSitemap) {
+		const statusCode = finalRes.status();
+		// A client-side redirect can fire before DOMContentLoaded, so these signals may already be
+		// the destination's — which is the document a settle would have snapshotted anyway. The
+		// evaluate can also lose its execution context to a navigation still in flight; falling
+		// through to settle on that keeps the pre-flag behavior exactly.
+		const signals = statusCode === 200 ? await page.evaluate(extractIndexSignals).catch(() => null) : null;
+		const verdict =
+			statusCode === 200
+				? signals && indexVerdict(signals, page.url(), config.canonical.strict)
+				: { isIndexable: false, reason: 'http-error' as const };
+		if (verdict && !verdict.isIndexable) {
+			// Report the landed url as the post-settle path does; without it a bail would swallow a
+			// client-side redirect and the plugin would suppress the source instead of adopting the
+			// destination as its own target.
+			const landedUrl = page.url();
+			if (canonicalizeUrl(landedUrl) !== canonicalizeUrl(job.url)) job.redirectedTo = landedUrl;
+			job.httpResponse = { statusCode, headers: finalRes.headers() };
+			job.isIndexable = false;
+			job.reason = verdict.reason;
+			return;
+		}
+	}
+
 	const settleStart = Date.now();
 
 	const networkIdle = () =>
@@ -457,11 +495,10 @@ const renderer: Renderer = async (page, job) => {
 			// config, defaulting to the historical lenient reading. See config.canonical.strict.
 			// Either way the reason slug is distinct, so duplicate spellings stay legible next to
 			// genuine mismatches.
-			const verdict = canonicalVerdict(canonicalHref, rawPageUrl);
-			const disowned = verdict === 'elsewhere' || (verdict === 'variant' && config.canonical.strict);
-			job.isIndexable = !noindex && !disowned;
-			if (!job.isIndexable) {
-				job.reason = noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
+			const verdict = indexVerdict({ canonicalHref, noindex }, rawPageUrl, config.canonical.strict);
+			job.isIndexable = verdict.isIndexable;
+			if (!verdict.isIndexable) {
+				job.reason = verdict.reason;
 			}
 
 			if (job.isIndexable || job.isFromSitemap) {
@@ -592,6 +629,25 @@ function countMatchingElements(selector: string): number {
 // lives in Node (util/url.ts) so it is unit-tested and can't drift from the redirect
 // normalizer. (That drift is exactly what marked self-canonical pages non-indexable: the
 // canonical's literal `:` never matched the request's `%3A`.)
+// Shared by the pre-settle bail and the post-settle check so the two can never disagree about
+// what "non-indexable" means. A canonical naming a DIFFERENT document always disowns the page;
+// a canonical naming this very document RE-SPELLED is only a duplicate when the site's origin
+// cannot tell the spellings apart, which is config, not a property of the URLs — see
+// config.canonical.strict.
+export function indexVerdict(
+	signals: { canonicalHref: string | null; noindex: boolean },
+	pageUrl: string,
+	strict: boolean
+): { isIndexable: boolean; reason?: 'noindex' | 'canonical-variant' | 'canonical-mismatch' } {
+	const verdict = canonicalVerdict(signals.canonicalHref, pageUrl);
+	const disowned = verdict === 'elsewhere' || (verdict === 'variant' && strict);
+	if (!signals.noindex && !disowned) return { isIndexable: true };
+	return {
+		isIndexable: false,
+		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
+	};
+}
+
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
 	let canonicalHref: string | null = null;
 	let noindex = false;
