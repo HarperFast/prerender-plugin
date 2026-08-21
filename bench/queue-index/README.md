@@ -48,7 +48,16 @@ knowing before you edit the harness:
 - The entry point is **`jsResource`, not `pluginModule`.** `handleApplication` is the hook Harper
   calls on a component another component *uses* as an extension; a root component declaring it is
   simply never invoked. Same silent-success failure.
-- Harper **intercepts `process.exit`**, so the harness signals itself instead.
+- The staged dir is **`chmod 777`.** `mktemp -d` is 0700 owned by the host user, and the container runs
+  as `harperdb` and has to *create* `node_modules` inside the mount — so without it the component
+  fails with `EACCES` and, again, the server comes up healthy having loaded nothing. Docker Desktop on
+  macOS remaps ownership and hides this; Linux and CI do not.
+- Harper **intercepts `process.exit`**, so the harness signals itself instead — on the failure paths as
+  well as the success one, or a failed run hangs and looks exactly like a slow one.
+
+The pattern is the thing to watch, not any individual cause: **every one of these fails by succeeding.**
+Harper starts, reports healthy, and runs none of the harness. If a run prints no `[bench]` lines, assume
+the component did not load rather than that the measurement is slow.
 
 ## What it answers, and what each answer decides
 
