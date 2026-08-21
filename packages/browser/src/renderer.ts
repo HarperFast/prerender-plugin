@@ -265,34 +265,35 @@ const renderer: Renderer = async (page, job) => {
 		}
 	}
 
-	// The settle phase is ~80% of a render (kohls: 8.9s of 10.9s), and the plugin's store guard is
-	// `statusCode === 200 && content` — so a document that already disowns itself can never be
-	// stored no matter how long it settles. Decide now and skip the settle when the answer is no.
+	// Settle dominates a render's cost, and the plugin's store guard is `statusCode === 200 &&
+	// content` — so a document that already disowns itself can never be stored however long it
+	// settles. Decide against the pre-settle DOM and skip the settle when the answer is already no.
 	//
-	// This is deliberately NOT an abort at the HTTP response. Navigation is only ~13% of a render
-	// (navTotal 1.45s), so intercepting the body would save ~1s more per bail while deciding on
-	// pre-parse HTML and duplicating a check the post-settle path already makes against the DOM.
+	// Can only ever SKIP a render: anything that survives falls through to the post-settle check,
+	// which stays authoritative because script-injected canonical/robots tags land after this point.
+	// A non-200 is decided on the status alone. The `status >= 400` response handler above calls
+	// `ac.abort()`, but that only stops SUBRESOURCE interception (see the `ac.signal.aborted` guards
+	// in the request handlers) — the main document has already answered by then, so `goto` resolves
+	// normally and a 404 would otherwise settle in full. Verified by test, not by reading: an
+	// earlier review argued `goto` rejects here and the suite disproved it.
 	//
-	// Only ever skips a render: everything that survives falls through to the post-settle check,
-	// which remains authoritative because script-injected canonical/robots tags land after this
-	// point. Sitemap jobs are exempt — their content is stored even when non-indexable, so bailing
-	// would change WHAT gets cached rather than only how long it took.
+	// Sitemap jobs are exempt: their content is stored even when non-indexable, so bailing would
+	// change WHAT gets cached rather than only how long it took.
 	if (config.navigation.skipSettleWhenNonIndexable && finalRes && !job.isFromSitemap) {
 		const statusCode = finalRes.status();
-		// A client-side redirect can fire before DOMContentLoaded, so the signals may already have
-		// been read off the DESTINATION document. Reading them is still correct — that is the
-		// document a settle would have snapshotted — but the evaluate can also lose its execution
-		// context to a navigation in flight. Falling through to settle on that failure keeps the
-		// pre-flag behavior exactly (the post-settle evaluate then fails the same way, or succeeds).
+		// A client-side redirect can fire before DOMContentLoaded, so these signals may already be
+		// the destination's — which is the document a settle would have snapshotted anyway. The
+		// evaluate can also lose its execution context to a navigation still in flight; falling
+		// through to settle on that keeps the pre-flag behavior exactly.
 		const signals = statusCode === 200 ? await page.evaluate(extractIndexSignals).catch(() => null) : null;
 		const verdict =
 			statusCode === 200
 				? signals && indexVerdict(signals, page.url(), config.canonical.strict)
 				: { isIndexable: false, reason: 'http-error' as const };
 		if (verdict && !verdict.isIndexable) {
-			// Report the landed url the same way the post-settle path does. Without this a bail
-			// would swallow a client-side redirect, and the plugin would suppress the source
-			// instead of adopting the destination as its own target.
+			// Report the landed url as the post-settle path does; without it a bail would swallow a
+			// client-side redirect and the plugin would suppress the source instead of adopting the
+			// destination as its own target.
 			const landedUrl = page.url();
 			if (canonicalizeUrl(landedUrl) !== canonicalizeUrl(job.url)) job.redirectedTo = landedUrl;
 			job.httpResponse = { statusCode, headers: finalRes.headers() };

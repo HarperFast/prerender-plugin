@@ -39,6 +39,8 @@ before(async () => {
 			// the bail must still report where it landed.
 			case '/client-redirect':
 				return html('', `<script>location.replace('/noindex');</script>`);
+			case '/client-redirect-ok':
+				return html('', `<script>location.replace('/fine');</script>`);
 			case '/late-noindex':
 				return html(
 					'',
@@ -94,6 +96,10 @@ test('a canonical naming another document skips the settle phase', async () => {
 	assert.equal(result.timings.settle, undefined);
 });
 
+// A 404's settle is skipped BY THE BAIL, not by the `status >= 400` abort: that abort only stops
+// subresource interception, so `goto` still resolves and the page would otherwise settle in full.
+// An earlier review argued the opposite (that `goto` rejects, making this arm dead code); this test
+// is what disproved it, so keep it — it is the guard against the arm being removed as unreachable.
 test('a non-200 skips the settle phase and still posts its status', async () => {
 	const result = await render('/gone');
 	await result.close();
@@ -101,7 +107,8 @@ test('a non-200 skips the settle phase and still posts its status', async () => 
 	assert.equal(result.statusCode, 404, 'the plugin needs the status to pick its suppression cadence');
 	assert.equal(result.isIndexable, false);
 	assert.equal(result.reason, 'http-error');
-	assert.equal(result.timings.settle, undefined);
+	assert.ok(result.timings.navTotal, 'goto RESOLVED — the >= 400 abort does not reject it');
+	assert.equal(result.timings.settle, undefined, 'so the bail is what skipped the settle');
 });
 
 test('an indexable document is unaffected — it settles and serializes', async () => {
@@ -189,4 +196,16 @@ test('a bail still reports a client-side redirect it landed on', async () => {
 	assert.equal(result.reason, 'noindex', 'the verdict is read off the document it landed on');
 	assert.equal(new URL(result.redirectedTo!).pathname, '/noindex', 'the landed url must survive the bail');
 	assert.equal(result.timings.settle, undefined, 'and it still skipped the settle');
+});
+
+// redirect.test.ts pins that a client-side redirect renders through — but never with this flag on,
+// which is precisely the configuration where a careless bail would stop it holding.
+test('with the flag on, a client-side redirect to an INDEXABLE page still renders through', async () => {
+	const result = await render('/client-redirect-ok');
+	await result.close();
+
+	assert.equal(result.isIndexable, true);
+	assert.match(result.html ?? '', /OK/, 'the destination must still be serialized');
+	assert.equal(new URL(result.redirectedTo!).pathname, '/fine');
+	assert.notEqual(result.timings.settle, undefined, 'and it must still settle');
 });
