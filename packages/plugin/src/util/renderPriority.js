@@ -63,11 +63,25 @@
  * scored, and a negative score from a clock skew would sort a due row BELOW rows that are exactly on
  * time, which is the one ordering that makes no sense at all.
  *
- * The only guard is the division. A zero or negative interval would produce Infinity or a sign flip,
- * so it degrades to raw lateness — which still orders sensibly among rows that share the problem.
+ * Two guards, and they are guarding different things. The DUE TIME is validated because an absent one
+ * does not degrade gracefully — `nowMs - null` is `nowMs`, a lateness of ~1.8e12 that sorts a broken
+ * row straight to the head. The INTERVAL is only compared, not validated, because `> 0` is already
+ * false for every unusable value; a zero or negative one would produce Infinity or a sign flip, so it
+ * degrades to raw lateness, which still orders sensibly among rows that share the problem.
  */
 export const scoreOf = ({ dueAt, fromSitemap }, { nowMs, intervalMs, sitemapBoost = 1 }) => {
+	// THE DUE TIME IS GUARDED, AND IT IS THE DANGEROUS ONE. `nowMs - null` is `nowMs`, so an absent
+	// due time does not produce a small score or a NaN — it produces a lateness of ~1.8e12, which sorts
+	// straight to the head of the set and hands the next lease to a broken row. `sweepReadySet` filters
+	// non-finite due times before it gets here, but this is exported and scored by callers that have
+	// not, so the guard belongs with the arithmetic. Zero is the right answer: a row with no due time
+	// makes no claim to urgency.
+	if (!Number.isFinite(dueAt) || !Number.isFinite(nowMs)) return 0;
 	const lateness = Math.max(0, nowMs - dueAt);
+	// The interval needs no such guard, and deliberately does not get one: `> 0` is already false for
+	// null, undefined, NaN, 0 and every negative, so the `Number(null) === 0` trap is closed by the
+	// comparison rather than by a coercion. Adding a `typeof` check would only change behaviour for a
+	// numeric STRING interval, which works correctly today.
 	const ratio = intervalMs > 0 ? lateness / intervalMs : lateness;
 	return fromSitemap ? ratio * sitemapBoost : ratio;
 };

@@ -1328,8 +1328,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'which is the only way to know it — the backlog snapshot cannot tell you the due-set size ' +
 						'either, because `overdue` saturates at `management.scanCap` (observed pinned at 2,000).\n\n' +
 						'`0` disables the sweep, which leaves the set to go stale and then empty; claims fall back ' +
-						'to the index scan as they always do.',
-					{ unit: 'ms', min: 0 }
+						'to the index scan as they always do. The ceiling is node\u2019s own timer limit of 2^31-1 ms ' +
+						'(~24.8 days) \u2014 past it a timer fires every millisecond rather than never, which would ' +
+						'turn the sweep into a hot loop over the due set.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
 				),
 				sweepCap: option(
 					500_000,

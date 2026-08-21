@@ -233,7 +233,15 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 					// Do not let the cursor run away past the count while a set is exhausted: it is an
 					// Int32 and a busy node claims several times a second, so an unbounded increment would
 					// wrap in about eight days of idling and start handing out valid indices again.
-					Atomics.store(i32, H_CURSOR, count);
+					//
+					// A COMPARE-EXCHANGE, NOT A STORE, and the difference is a whole generation. A plain
+					// store here races `publish`: publish resets the cursor to 0 and flips the slot, and a
+					// store landing just after that rewinds it to the PREVIOUS generation's count — so every
+					// entry of the fresh set is skipped, silently, until the next sweep replaces it. The CAS
+					// only clamps if the cursor is still where this call's own increment left it, so a
+					// concurrent reset always wins. (Two threads are needed to hit it, which is why no test
+					// here can: single-threaded, nothing can interleave between the add and the clamp.)
+					Atomics.compareExchange(i32, H_CURSOR, index + 1, count);
 					break;
 				}
 				const entry = readEntry(slot, index);

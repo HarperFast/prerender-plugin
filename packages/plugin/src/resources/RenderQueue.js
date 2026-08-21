@@ -956,6 +956,22 @@ let queueStatusSyncStarted = false;
  */
 let readySweepStarted = false;
 
+/**
+ * `e?.message`, never `e.message`: anything can be thrown, and `null.message` is a TypeError raised
+ * from inside the very handler that exists to keep this path alive. Same helper and same reasoning as
+ * `util/configOverride.js`.
+ */
+const messageOf = (e) => e?.message ?? String(e);
+
+/**
+ * Node's `setInterval` ceiling. Past 2^31-1 ms the delay overflows: node warns and then fires the
+ * callback after ONE MILLISECOND. So an over-large sweep interval does not merely slow the sweep
+ * down, it converts it into a hot loop re-reading the due set on worker 0 — the opposite of what the
+ * number asked for. The schema rejects anything larger with a warning, which is the loud path; this
+ * clamp is here so that the loud path working is not the only thing between a typo and that loop.
+ */
+const MAX_TIMER_MS = 2147483647;
+
 export function startReadySweep() {
 	if (server.workerIndex !== 0 || readySweepStarted) return;
 	readySweepStarted = true;
@@ -966,43 +982,57 @@ export function startReadySweep() {
 		if (sweeping || !config.queue.ready.enabled) return;
 		sweeping = true;
 		const started = performance.now();
-		sweepReadySet()
-			.then((result) => {
-				if (result?.skipped) return;
-				metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
-				metrics.readyPublished(result.published);
-				if (result.truncated) {
-					// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
-					// unranked — precisely the pages this feature exists to protect. That makes it a warning
-					// rather than a statistic.
-					logger.warn(
-						`[prerender] ready-set sweep read its ${config.queue.ready.sweepCap}-row cap without reaching a ` +
-							`not-yet-due row: ${result.due} due row(s) seen, ${result.published} published. The ordering ` +
-							`covers only the oldest part of the backlog, so recently-due pages are going unranked. Raise ` +
-							`queue.ready.sweepCap, or reduce the backlog.`
-					);
-				}
-			})
-			.catch(logger.error)
-			.finally(() => {
-				sweeping = false;
-			});
+		// THE SYNCHRONOUS INVOCATION IS INSIDE THE TRY, not just the promise chain. `sweeping` is a
+		// latch: if the call throws before returning a promise, `finally` never runs, the latch is never
+		// released, and the sweep is permanently dead for the life of the process — with claims quietly
+		// falling back to the index scan and nothing saying why. That silent-forever failure is worth
+		// more than the narrow chance of the throw.
+		try {
+			sweepReadySet()
+				.then((result) => {
+					if (result?.skipped) return;
+					metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
+					metrics.readyPublished(result.published);
+					if (result.truncated) {
+						// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
+						// unranked — precisely the pages this feature exists to protect. That makes it a warning
+						// rather than a statistic.
+						logger.warn(
+							`[prerender] ready-set sweep read its ${config.queue.ready.sweepCap}-row cap without reaching a ` +
+								`not-yet-due row: ${result.due} due row(s) seen, ${result.published} published. The ordering ` +
+								`covers only the oldest part of the backlog, so recently-due pages are going unranked. Raise ` +
+								`queue.ready.sweepCap, or reduce the backlog.`
+						);
+					}
+				})
+				.catch((e) => logger.error(messageOf(e)))
+				.finally(() => {
+					sweeping = false;
+				});
+		} catch (e) {
+			logger.error(messageOf(e));
+			sweeping = false;
+		}
 	};
 
 	// Once immediately, so a restarted worker generation does not serve a whole interval of claims
 	// from the index before the set exists.
 	sweep();
 
+	const arm = (ms) => {
+		const timer = ms > 0 ? setInterval(sweep, Math.min(MAX_TIMER_MS, ms)) : null;
+		timer?.unref?.();
+		return timer;
+	};
+
 	let armed = config.queue.ready.sweepInterval;
-	let timer = armed > 0 ? setInterval(sweep, armed) : null;
-	timer?.unref?.();
+	let timer = arm(armed);
 
 	onConfigApplied(() => {
 		if (config.queue.ready.sweepInterval === armed) return;
 		if (timer) clearInterval(timer);
 		armed = config.queue.ready.sweepInterval;
-		timer = armed > 0 ? setInterval(sweep, armed) : null;
-		timer?.unref?.();
+		timer = arm(armed);
 	});
 }
 

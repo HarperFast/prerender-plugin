@@ -69,6 +69,21 @@ test('a zero or negative interval degrades to raw lateness rather than Infinity 
 	assert.equal(scoreOf({ dueAt: T0 - 5 }, { nowMs: T0, intervalMs: -HOUR }), 5);
 });
 
+test('an ABSENT due time scores 0, not the epoch — it must not sort to the head', () => {
+	// `nowMs - null` is `nowMs`, so the naive form gives a lateness of ~1.8e12 and a broken row wins
+	// the next lease outright. This is the trap that actually bites; the interval's `> 0` guard already
+	// closes the divisor half.
+	for (const dueAt of [null, undefined, Number.NaN, 'x']) {
+		assert.equal(scoreOf({ dueAt }, { nowMs: T0, intervalMs: HOUR }), 0, `dueAt=${dueAt}`);
+	}
+	// ...and a genuinely late row still scores, so the guard has not swallowed the real case.
+	assert.equal(scoreOf({ dueAt: T0 - HOUR }, { nowMs: T0, intervalMs: HOUR }), 1);
+});
+
+test('a numeric-string interval still divides — the guard is a comparison, not a typeof check', () => {
+	assert.equal(scoreOf({ dueAt: T0 - HOUR }, { nowMs: T0, intervalMs: String(HOUR) }), 1);
+});
+
 test('a row scored at or before its due moment is 0, never negative', () => {
 	assert.equal(scoreOf({ dueAt: T0 }, { nowMs: T0, intervalMs: HOUR }), 0);
 	assert.equal(scoreOf({ dueAt: T0 + HOUR }, { nowMs: T0, intervalMs: HOUR }), 0);
