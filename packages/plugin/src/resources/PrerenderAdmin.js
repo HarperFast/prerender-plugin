@@ -36,7 +36,8 @@
  *   POST /prerender_admin/explain    { url, deviceType }            super_user
  *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
  *   POST /prerender_admin/queue      { scope, paused } |            super_user
- *                                    { action: 'reset-claim-floor' }
+ *                                    { action: 'reset-claim-floor' } |
+ *                                    { action: 'restamp-lanes', limit?, force? }
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
@@ -110,7 +111,7 @@ import {
 	validateOverride,
 	writeOverrides,
 } from '../util/configOverride.js';
-import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
+import { floorState, leaseInfo, minuteOf, restampLanes, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
 import { decode } from '../util/contentEncoding.js';
@@ -1065,7 +1066,11 @@ export class PrerenderAdmin extends Resource {
 		const nextRenderTime = currentMinuteMs();
 		// The write is residency-routed, so this reaches the owning node from any node — and it
 		// goes through the funnel, which lowers this node's claim floor to cover it.
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!target.sitemapUrl });
+		// URGENT. This is the admin "render this now" action — an explicit operator statement, which is
+		// exactly what lane 0 is for, and what retires the `nextRenderTime = 1` trick this endpoint used
+		// to be an alternative to. Bounded by `queue.lanes.urgentMaxShare`, so a bulk re-render cannot
+		// take more than that fraction of any claim batch however many rows it files here.
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!target.sitemapUrl, urgent: true });
 
 		// `claim` reads a node-local flag, so waking consumers only helps on the node that owns
 		// the row. When another node owns it, what makes the row claimable there is the CLAIM
@@ -1518,6 +1523,16 @@ export class PrerenderAdmin extends Resource {
 		// turns a five-minute wait into an immediate one. Node-scoped, like the floor itself.
 		if (data?.action === 'reset-claim-floor') {
 			return json(await RenderQueue.resetClaimFloor());
+		}
+
+		// The lane migration. BOUNDED AND REPEATABLE rather than a background walk with a progress row:
+		// a restamped row leaves the range the pass queries, so calling this until `done` makes
+		// progress with no cursor to go stale and no partial state to resume from. Call it in a loop;
+		// `done` is false while a pass fills its window, which is what says more remains.
+		if (data?.action === 'restamp-lanes') {
+			const limit = Number.isFinite(data.limit) && data.limit > 0 ? Math.min(data.limit | 0, 50_000) : 5_000;
+			const result = await restampLanes({ limit, force: data.force === true });
+			return json(result, result.error ? 409 : 200);
 		}
 
 		const scope = data?.scope ?? server.hostname;

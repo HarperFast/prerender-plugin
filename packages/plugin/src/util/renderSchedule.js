@@ -130,6 +130,19 @@ import { CacheKey } from './cacheKey.js';
 import { resolveRenderInterval } from './routeClass.js';
 import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
+import { LANE_FLOOR_SAB_KEY, createLaneFloors, laneFloorBufferBytes } from './laneFloor.js';
+import { restampGuard, restampPass, unstampedQuery } from './laneRestamp.js';
+import {
+	LANE_STRIDE,
+	classOfLane,
+	createLaneBudget,
+	dueAtOf,
+	encodeDueAt,
+	laneCount,
+	laneFor,
+	laneLabel,
+	laneOf,
+} from './renderLane.js';
 
 /**
  * The live lease table + claim floor, over one named buffer shared by every worker on this node.
@@ -181,6 +194,61 @@ export const leaseTable = () => {
 	return liveLeaseTable;
 };
 
+/**
+ * The per-lane claim watermarks, over a named buffer of their own.
+ *
+ * SEPARATE FROM THE LEASE BUFFER ON PURPOSE — see the module comment in `util/laneFloor.js`. In
+ * short: a named shared buffer is sized by its FIRST allocation, so widening the lease header would
+ * hand a new worker generation a correctly-sized-looking view of the old layout with every slot
+ * shifted, in the module that decides which URLs render. A second key cannot do that.
+ *
+ * Allocated on first use for the same reason `leaseTable` is: `laneCount()` reads
+ * `queue.lanes.ttlBands`, and module scope precedes `applyOptions`.
+ *
+ * SIZED FOR THE CEILING, NOT FOR THE CURRENT BAND LIST. `laneCount()` moves when an operator edits
+ * `ttlBands`, and the buffer cannot be resized within a process — so it is allocated at the maximum
+ * this build supports and only the first `laneCount()` entries are ever touched. That makes a live
+ * band-list edit a matter of which entries are USED rather than of reallocating shared memory, and
+ * it means a band added at runtime gets a zeroed (unbounded) floor, which is exactly right: a lane
+ * nothing has ever scanned should re-derive from the bottom of its slice.
+ */
+const MAX_SUPPORTED_LANES = 64;
+let liveLaneFloors = null;
+
+export const laneFloors = () => {
+	if (liveLaneFloors) return liveLaneFloors;
+	const buffer = getSab(LANE_FLOOR_SAB_KEY, laneFloorBufferBytes(MAX_SUPPORTED_LANES));
+	liveLaneFloors = createLaneFloors({ buffer, lanes: MAX_SUPPORTED_LANES, now: () => Date.now() });
+	if (laneCount() > liveLaneFloors.laneCount) {
+		logger.error(
+			`[prerender] queue.lanes.ttlBands implies ${laneCount()} lanes but the lane-floor buffer holds ` +
+				`${liveLaneFloors.laneCount}. Lanes above that share the last watermark and will scan from a floor ` +
+				`that is not theirs. Reduce ttlBands or raise MAX_SUPPORTED_LANES.`
+		);
+	}
+	return liveLaneFloors;
+};
+
+/**
+ * `runClaimPass` wants an object with a floor; this binds one lane's watermark into that shape.
+ *
+ * A thin adapter rather than teaching `laneFloor.js` the interface, so that module stays a data
+ * structure over lane INDICES and the coupling to the claim pass lives here, with the rest of the
+ * Harper-aware code.
+ */
+const floorsForLane = (lane) => {
+	const table = laneFloors();
+	return {
+		readFloorMinute: (nowMinute, guard) => table.readFloorMinute(lane, nowMinute, guard),
+		advanceFloor: (from, to) => table.advanceFloor(lane, from, to),
+		resetFloor: () => table.resetFloor(lane),
+		notePinnedBy: (cacheKey) => table.notePinnedBy(lane, cacheKey),
+		// Deliberately no `recordPassOutcome`: `sawDue` / `earliestNotYetDue` drive the node's
+		// queue-status derivation, which is one answer for the whole node rather than one per lane.
+		// The orchestrator ORs the lanes' results and records that once, on the lease table.
+	};
+};
+
 // Resolved per call rather than destructured at module load, matching `util/reconcile.js` and
 // `util/backlogSnapshot.js`. This module is imported by almost everything (Target → Sitemap →
 // RenderQueue → the handlers), so a module-scope capture would make the import order of the whole
@@ -201,7 +269,7 @@ const guardMinutes = () => Math.max(0, Math.round(config.queue.claimFloor.guard 
  * 14× actually lives: a lowering on every completed render would rewind the floor to the current
  * minute continuously and the whole win would evaporate.
  */
-const lowerFloorFor = (nextRenderTime) => {
+const lowerFloorFor = (nextRenderTime, lane = 0) => {
 	// `numberOf`, not `Number`: `Number(null)` is 0, 0 is finite, and `lowerFloorTo(0)` means NO FLOOR
 	// — so a single missing due time would silently put the scan back to seeking the absolute index
 	// minimum, which is the degraded 6.25 ms seek this whole release exists to remove. A REAL 0 still
@@ -213,6 +281,12 @@ const lowerFloorFor = (nextRenderTime) => {
 		logger.warn(`[prerender] schedule write with a non-numeric nextRenderTime (${nextRenderTime}) — floor not lowered`);
 		return;
 	}
+	// BOTH, and the asymmetry matters. The lane watermark takes the DECODED minute (a lane's floor is
+	// a due minute, so floors stay comparable across lanes); the global floor takes the ENCODED value
+	// it would actually be compared against, because that is the number the un-laned seek uses. Both
+	// are lowered on every write regardless of which mode is live, so flipping `queue.lanes.enabled`
+	// never leaves the mode being switched TO with a floor above rows it now has to find.
+	laneFloors().lowerFloorTo(lane, minuteOf(dueAtOf(at)));
 	leaseTable().lowerFloorTo(minuteOf(at));
 };
 
@@ -240,13 +314,32 @@ const lowerFloorFor = (nextRenderTime) => {
  * in 10.7 ms, mean 0.021 ms, against residency pinned to a node that does not exist). v0.15.0
  * assumed the read/write symmetry and wrapped these in a deadline that could never fire.
  */
-export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = {}) => {
+export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, renderInterval, urgent, cold } = {}) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 	}
-	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
-	lowerFloorFor(nextRenderTime);
+	const lane = laneToWrite({ fromSitemap, renderInterval, urgent, cold });
+	const stored = encodeDueAt(nextRenderTime, lane);
+	await scheduleTable().put(cacheKey, { nextRenderTime: stored, fromSitemap });
+	lowerFloorFor(stored, lane);
 };
+
+/**
+ * The lane a write should file into, or 0 when lanes are off.
+ *
+ * DERIVED HERE AND NOWHERE ELSE. Every schedule write in the plugin already funnels through this
+ * module, which is what makes "resolve the lane at write time" a single line rather than a
+ * discipline sixteen call sites have to remember — the same reason the floor lowering lives here.
+ * Deriving (rather than storing a lane column) is what makes a config change — a new band cut, a
+ * route moved to a different cadence — retroactive on each key's next render with no sweep.
+ *
+ * `renderInterval` is the EFFECTIVE cadence and it is what bands the row. A caller that does not
+ * have it hands in nothing, and `bandOf` puts the row in the SLOWEST band — deliberately, because
+ * an absent interval is an absent claim to urgency and the alternative would let any row that lost
+ * its cadence jump ahead of the homepage.
+ */
+const laneToWrite = ({ fromSitemap, renderInterval, urgent, cold }) =>
+	config.queue.lanes.enabled ? laneFor({ fromSitemap, renderInterval, urgent, cold }) : 0;
 
 /**
  * The batch form, for the fan-out writers (a target's device variants, `Target.revalidate`,
@@ -259,18 +352,27 @@ export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = 
  * earlier rows applied — the same semantics as before, and deletes/puts here are idempotent.
  */
 export const writeSchedules = async (rows = []) => {
-	let lowest = Number.POSITIVE_INFINITY;
-	for (const { cacheKey, nextRenderTime, fromSitemap } of rows) {
+	// PER LANE, not one minimum for the batch. A fan-out can legitimately span lanes — a device pair
+	// shares a lane, but `Target.revalidate` over a sitemap walk and a reconcile repair both write
+	// mixed provenance — and one global minimum would lower whichever lane happened to own the
+	// earliest row while leaving the others' floors above rows they now have to find. That is the
+	// stranding this funnel exists to prevent, so the minimum is tracked per lane.
+	const lowestByLane = new Map();
+	for (const { cacheKey, nextRenderTime, fromSitemap, renderInterval, urgent, cold } of rows) {
 		if (fromSitemap === undefined) {
 			throw new Error(`writeSchedules(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 		}
-		await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
+		const lane = laneToWrite({ fromSitemap, renderInterval, urgent, cold });
+		const stored = encodeDueAt(nextRenderTime, lane);
+		await scheduleTable().put(cacheKey, { nextRenderTime: stored, fromSitemap });
 		// Same trap as `lowerFloorFor`, and WORSE here: with a bare `Number` a single null row anywhere
 		// in the batch becomes 0, wins the minimum, and unbounds the floor for the whole fan-out.
-		const at = numberOf(nextRenderTime);
-		if (Number.isFinite(at) && at < lowest) lowest = at;
+		const at = numberOf(stored);
+		if (Number.isFinite(at) && at < (lowestByLane.get(lane) ?? Number.POSITIVE_INFINITY)) {
+			lowestByLane.set(lane, at);
+		}
 	}
-	if (lowest !== Number.POSITIVE_INFINITY) lowerFloorFor(lowest);
+	for (const [lane, lowest] of lowestByLane) lowerFloorFor(lowest, lane);
 };
 
 /** Drop a schedule row. Lowers nothing, releases nothing — see the module comment. */
@@ -283,8 +385,17 @@ export const deleteSchedule = async (cacheKey) => {
  * residency-pinned, so a point read of a key this node does not own takes Harper's replication
  * fetch, which has NO TIMEOUT and can hang the caller forever.
  */
-export const getScheduleRow = (cacheKey, select) =>
-	scheduleTable().get({ id: cacheKey, select }, { replicateFrom: false });
+export const getScheduleRow = async (cacheKey, select) => {
+	const row = await scheduleTable().get({ id: cacheKey, select }, { replicateFrom: false });
+	// DECODED ON THE WAY OUT, ALWAYS — including while `queue.lanes.enabled` is false. Every reader
+	// in the plugin treats `nextRenderTime` as a timestamp (the invalidation accelerator does
+	// `nextRenderTime - interval` arithmetic on it; the console renders it as a date), and an encoded
+	// value used as one is a date ~139 years per lane in the future: plausible-looking, and wrong.
+	// Decoding unconditionally is also what makes disabling lanes a survivable rollback rather than a
+	// corpus-wide stranding — rows written while it was on still read as their real due times.
+	if (!row || row.nextRenderTime === undefined || row.nextRenderTime === null) return row;
+	return { ...row, nextRenderTime: dueAtOf(row.nextRenderTime), lane: laneOf(row.nextRenderTime) };
+};
 
 // ---- the claim pass -------------------------------------------------------------------------
 
@@ -307,9 +418,28 @@ export const runClaimPass = async ({
 	leaseTimeMs,
 	floorEnabled = true,
 	floorRule = 'first-due-observed',
+	// ---- lane awareness. Every one of these defaults to the pre-lane behaviour, so an unlaned
+	// call is byte-for-byte the function that existed before `util/renderLane.js`, and every
+	// existing trace through it still describes it exactly.
+	//
+	// `lane` is passed through to `searchSchedules` (which builds the lane-scoped seek bound) and
+	// used to recognize SPILL: the seek has one condition and no upper bound — a two-sided range
+	// costs 1,128-2,977 ms on this index, so the upper bound stays in application code — which
+	// means a sparse lane's window runs on into the next lane's rows. Those are recognized and
+	// dropped, not granted.
+	//
+	// `floors` is whatever owns this lane's watermark. It defaults to `leases` because the single
+	// global floor lives in the lease buffer; a laned pass hands in an adapter over
+	// `util/laneFloor.js` instead. The three methods used are the same either way.
+	lane = 0,
+	floors = null,
+	decode = null,
 } = {}) => {
+	const watermark = floors ?? leases;
+	// Identity by default: an unencoded value IS its due time, in lane 0.
+	const readRow = decode ?? ((raw) => ({ lane: 0, dueAt: numberOf(raw) }));
 	const nowMinute = minuteOf(nowMs);
-	const floorFrom = floorEnabled ? leases.readFloorMinute(nowMinute, guard) : 0;
+	const floorFrom = floorEnabled ? watermark.readFloorMinute(nowMinute, guard) : 0;
 
 	// A leased row keeps its overdue position in the index now, so the pass must read PAST the
 	// in-flight pile to find grantable rows: grantLimit to cover the pile's own head, the pile
@@ -324,7 +454,7 @@ export const runClaimPass = async ({
 	// iterator leaves its read transaction unreleased (util/reconcile.js:60-64). The app-side cut
 	// at "past now" is applied to the drained array below, not by walking away from the cursor.
 	const rows = [];
-	for await (const row of searchSchedules({ floorMinute: floorFrom, limit: scanLimit })) rows.push(row);
+	for await (const row of searchSchedules({ lane, floorMinute: floorFrom, limit: scanLimit })) rows.push(row);
 
 	const jobs = [];
 	let sawDue = false;
@@ -343,14 +473,24 @@ export const runClaimPass = async ({
 	let leaseRefused = false;
 	let skippedLeased = 0;
 	let nonFinite = 0;
+	let spilled = 0;
 
 	for (const row of rows) {
 		// `numberOf` because `Number(null)` is 0, which reads as "due since 1970" and would make an
 		// absent due time the oldest due row in the corpus — pinning the floor at the epoch and naming
 		// the wrong key as the row holding it. A missing due time is skipped and counted, not coerced.
-		const at = numberOf(row.nextRenderTime);
+		const { lane: rowLane, dueAt: at } = readRow(row.nextRenderTime);
 		if (!Number.isFinite(at)) {
 			nonFinite++;
+			continue;
+		}
+
+		// SPILL. Rows arrive ascending by the ENCODED value, so every row of this lane precedes every
+		// row of the next one — the first foreign row means this lane is exhausted. Counted separately
+		// from `nonFinite` because it is not a defect: it is the read cost of keeping the query to one
+		// condition, and it is the number that says whether a lane's scan limit is being wasted.
+		if (rowLane !== lane) {
+			spilled++;
 			continue;
 		}
 
@@ -396,27 +536,29 @@ export const runClaimPass = async ({
 	if (floorEnabled) {
 		// CAS against the value this pass started from, and ABANDON on conflict — a conflict means
 		// a funnel write lowered the floor for a row this pass never saw. The next pass re-advances.
-		floorAdvanced = leases.advanceFloor(floorFrom, floorTo);
+		floorAdvanced = watermark.advanceFloor(floorFrom, floorTo);
 	} else {
 		// The kill switch forces the floor to 0 and changes nothing else, so re-enabling it starts
 		// from a full seek rather than from a value that has been going stale.
-		leases.resetFloor();
+		watermark.resetFloor();
 	}
 
-	leases.recordPassOutcome({ sawDue, earliestNotYetDueMinute });
+	watermark.recordPassOutcome?.({ sawDue, earliestNotYetDueMinute });
 
 	// How long the SAME row has been holding the floor, node-wide. Recorded here rather than derived
 	// by a caller because this is the only place that knows which row the floor rule actually picked,
 	// and it is what both the wedged-row warning and the unpin escape hatch key off. `null` clears it,
 	// so a pass that finds nothing due does not leave a stale pin ageing forever.
-	const floorPinnedForMs = leases.notePinnedBy(floorHeldBy);
+	const floorPinnedForMs = watermark.notePinnedBy(floorHeldBy);
 
 	return {
+		lane,
 		jobs,
 		sawDue,
 		granted: jobs.length,
 		skippedLeased,
 		nonFinite,
+		spilled,
 		earliestNotYetDueMinute,
 		floorFrom,
 		floorTo,
@@ -484,7 +626,7 @@ let lastFloorHeldByAt = 0;
  * future minute, so it changes nothing. A failure here is logged and swallowed: the claim must not 500
  * because a repair could not be written, and the next pass simply tries again.
  */
-const maybeUnpinFloor = async (pass) => {
+const maybeUnpinFloor = async (pass, lane = null) => {
 	const unpinAfter = config.queue.claimFloor.unpinAfter;
 	if (!(unpinAfter > 0)) return null;
 	if (!config.queue.claimFloor.enabled) return null;
@@ -520,7 +662,11 @@ const maybeUnpinFloor = async (pass) => {
 
 	// Clear the pin so the promoted row starts its own clock from this pass rather than inheriting
 	// this one's age — without it the next pass would qualify immediately and unpin a healthy row.
-	leaseTable().notePinnedBy(null);
+	// Cleared on whichever watermark the pin was recorded against: a laned pass pins per lane, and
+	// clearing the global one instead would leave the lane's pin ageing forever while the hatch
+	// re-fired on a healthy row every interval.
+	if (lane === null) leaseTable().notePinnedBy(null);
+	else laneFloors().notePinnedBy(lane, null);
 
 	logger.warn(
 		`[prerender] ${cacheKey} held the claim queue's floor for ${Math.round(pass.floorPinnedForMs / 60_000)} minute(s) ` +
@@ -533,9 +679,9 @@ const maybeUnpinFloor = async (pass) => {
 };
 
 /** `runClaimPass` bound to the live table and config. Called by `RenderQueue.claim`. */
-export const claimSchedules = async ({ grantLimit } = {}) => {
+const claimOneLane = async ({ grantLimit, lane = 0, laned = false }) => {
 	const pass = await runClaimPass({
-		searchSchedules: ({ floorMinute, limit }) =>
+		searchSchedules: ({ lane: seekLane, floorMinute, limit }) =>
 			scheduleTable().search(
 				{
 					// EXACTLY ONE CONDITION, and it stays present even at floorMinute 0 (`>= 0` is the
@@ -555,7 +701,17 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 					// of its time in. The `<= now` half stays in application code, where it is free.
 					// (On a PRIMARY key a two-sided range collapses to a filtered intersection —
 					// 289–1490 ms — which is why the shape of this query is worth a comment at all.)
-					conditions: [{ attribute: 'nextRenderTime', comparator: 'greater_than_equal', value: floorMinute * MINUTE }],
+					// LANE-SCOPED, STILL ONE CONDITION. The lane's slice starts at `lane * LANE_STRIDE`, so
+					// its seek bound is that plus the lane's own watermark. There is deliberately no upper
+					// bound: adding one is the two-sided range measured above, so a sparse lane's window
+					// runs on into the next lane's rows and `runClaimPass` drops them as SPILL instead.
+					conditions: [
+						{
+							attribute: 'nextRenderTime',
+							comparator: 'greater_than_equal',
+							value: seekLane * LANE_STRIDE + floorMinute * MINUTE,
+						},
+					],
 					sort: { attribute: 'nextRenderTime' },
 					// ARRAY select. A string `select` returns the bare scalar rather than a record —
 					// the trap that has caused two silent bugs in this package already.
@@ -571,18 +727,219 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 		scanCap: Math.max(1, config.queue.claimScanCap | 0),
 		leaseTimeMs: config.queue.jobLeaseTime,
 		floorEnabled: config.queue.claimFloor.enabled,
+		lane,
+		// The un-laned path keeps the GLOBAL floor and the identity decode, so it is the function that
+		// existed before lanes, byte for byte. The laned path swaps in that lane's watermark and the
+		// real decoder — and note the decode is only swapped for the CLAIM; `getScheduleRow` decodes
+		// unconditionally, because a reader that gets this wrong is silently 139 years out.
+		floors: laned ? floorsForLane(lane) : null,
+		decode: laned ? (raw) => ({ lane: laneOf(raw), dueAt: dueAtOf(raw) }) : null,
 	});
 
 	// Whatever this pass saw, including `null` for "nothing is due": a stale key here would name an
 	// innocent URL as the thing pinning the queue.
-	lastFloorHeldBy = pass.floorHeldBy;
-	lastFloorHeldByAt = Date.now();
+	//
+	// NOT SET BY A LANE PASS. A laned claim runs this function once per lane, and the last lane is
+	// usually `cold` with nothing due — so recording here would overwrite a genuinely pinned lane's
+	// key with the empty lane's `null` on every claim, and `floorState` (and therefore the console's
+	// "Claim floor lag") would report that nothing is pinned while a lane was wedged. The laned path
+	// records once, from `mergeLanePasses`, which is the only place that knows which lane's pin is the
+	// one worth naming.
+	if (!laned) {
+		lastFloorHeldBy = pass.floorHeldBy;
+		lastFloorHeldByAt = Date.now();
+	}
 
 	// AFTER the pass, never inside it: `runClaimPass` takes all its I/O as arguments precisely so the
 	// floor algebra has no database in it, and a write issued mid-pass would also be a write with the
 	// scan cursor still open (see the drain note above).
-	const floorUnpinned = await maybeUnpinFloor(pass);
+	const floorUnpinned = await maybeUnpinFloor(pass, laned ? lane : null);
 	return floorUnpinned ? { ...pass, floorUnpinned } : pass;
+};
+
+/**
+ * ONE CLAIM, ACROSS LANES.
+ *
+ * With `queue.lanes.enabled` false this is one call to `claimOneLane` and nothing else — the same
+ * single pass, the same global floor, the same numbers. Everything below only happens when lanes
+ * are on.
+ *
+ * ── WHY A SEEK PER LANE RATHER THAN ONE SCAN ────────────────────────────────────────────────────
+ *
+ * Because the whole problem is that one scan can only start in one place. The claim window is
+ * anchored at the oldest due time in the corpus, and under a backlog every row in it is ancient —
+ * so a homepage two of its own cadences late is nowhere near the window, and no amount of
+ * re-ranking inside it can find a row it never reads. A lane is a disjoint slice of the same index
+ * with a watermark of its own, so its head is ITS oldest row, not the corpus's.
+ *
+ * Measured (#80): three lanes interleaved in one index, each with its own watermark, 0.29-0.32 ms
+ * per lane. The same lane without a watermark, 3.46 ms. Interleaving is free; the watermark is the
+ * win. That is what makes N seeks cheaper than the one degraded seek this replaces.
+ *
+ * ── HOW THE BATCH IS DIVIDED ────────────────────────────────────────────────────────────────────
+ *
+ * Lane order, with `urgent` capped by its drain share and the protected classes floored — see
+ * `createLaneBudget` for why floors rather than fixed shares, and why strict priority is not an
+ * option at any capacity level. The TOP-UP sweep at the end is what makes a floor a minimum rather
+ * than an entitlement: a class with fewer due rows than its floor releases the difference back to
+ * lane order instead of leaving that slice of the batch unspent.
+ *
+ * The sweep is skipped whenever the first pass spent the batch, which is the backlogged case — so
+ * the extra seeks happen exactly when the queue is caught up and they are cheapest.
+ */
+export const claimSchedules = async ({ grantLimit } = {}) => {
+	if (!config.queue.lanes.enabled) return claimOneLane({ grantLimit });
+
+	const { urgentMaxShare, minShare } = config.queue.lanes;
+	const budget = createLaneBudget({ grantLimit, urgentMaxShare, minShare });
+	const order = Array.from({ length: laneCount() }, (_, lane) => lane);
+	const passes = [];
+
+	for (const lane of order) {
+		const allowance = budget.allowanceFor(lane);
+		if (allowance <= 0) continue;
+		const pass = await claimOneLane({ grantLimit: allowance, lane, laned: true });
+		budget.record(lane, pass.granted);
+		passes.push(pass);
+	}
+
+	// Release unclaimed reservations and sweep again, in lane order.
+	if (budget.remaining > 0) {
+		budget.topUp();
+		for (const lane of order) {
+			const allowance = budget.allowanceFor(lane);
+			if (allowance <= 0) continue;
+			const pass = await claimOneLane({ grantLimit: allowance, lane, laned: true });
+			budget.record(lane, pass.granted);
+			passes.push(pass);
+		}
+	}
+
+	return mergeLanePasses(passes, grantLimit);
+};
+
+/**
+ * Fold the per-lane passes into the one shape `RenderQueue.claim` consumes.
+ *
+ * The interesting choice is WHICH LANE'S FLOOR gets reported as "the" floor, because the console
+ * shows one number and the wedged-row warning names one URL. It reports the lane that has been
+ * PINNED LONGEST, not the lane with the oldest floor: an old floor on a lane that is draining is
+ * normal (that is what a backlog looks like), whereas a floor that has not moved is the one failure
+ * this reporting exists to catch. Ties go to the older floor. Per-lane detail rides along in
+ * `lanes` so nothing is hidden behind that choice.
+ */
+const mergeLanePasses = (passes, grantLimit) => {
+	if (passes.length === 0) {
+		return {
+			jobs: [],
+			sawDue: false,
+			granted: 0,
+			skippedLeased: 0,
+			nonFinite: 0,
+			spilled: 0,
+			earliestNotYetDueMinute: 0,
+			floorFrom: 0,
+			floorTo: 0,
+			floorHeldBy: null,
+			floorHeldByRow: null,
+			floorPinnedForMs: 0,
+			floorAdvanced: false,
+			scanned: 0,
+			scanLimit: 0,
+			scanTruncated: false,
+			leaseRefused: false,
+			occupancy: leaseTable().occupancy(),
+			lanes: [],
+			grantLimit,
+		};
+	}
+
+	// A pass with no due row has no pin to report, so it must not win the "longest pinned" contest
+	// with a floorPinnedForMs of 0 against a lane that genuinely has one.
+	const pinned = passes.filter((p) => p.floorHeldBy);
+	const worst =
+		pinned.length === 0
+			? passes[0]
+			: pinned.reduce((a, b) =>
+					b.floorPinnedForMs > a.floorPinnedForMs ||
+					(b.floorPinnedForMs === a.floorPinnedForMs && b.floorTo < a.floorTo)
+						? b
+						: a
+				);
+
+	const sum = (key) => passes.reduce((total, p) => total + (p[key] || 0), 0);
+
+	lastFloorHeldBy = worst.floorHeldBy ?? null;
+	lastFloorHeldByAt = Date.now();
+
+	return {
+		jobs: passes.flatMap((p) => p.jobs),
+		sawDue: passes.some((p) => p.sawDue),
+		granted: sum('granted'),
+		skippedLeased: sum('skippedLeased'),
+		nonFinite: sum('nonFinite'),
+		spilled: sum('spilled'),
+		// The soonest anything is due anywhere, ignoring lanes that saw nothing at all (0 is "unknown"
+		// in this field, not "the epoch"), because it feeds the node's empty-vs-queued derivation.
+		earliestNotYetDueMinute: Math.min(...passes.map((p) => p.earliestNotYetDueMinute || Infinity)) || 0,
+		floorFrom: worst.floorFrom,
+		floorTo: worst.floorTo,
+		floorHeldBy: worst.floorHeldBy,
+		floorHeldByRow: worst.floorHeldByRow,
+		floorPinnedForMs: worst.floorPinnedForMs,
+		floorLane: worst.lane,
+		floorAdvanced: passes.some((p) => p.floorAdvanced),
+		scanned: sum('scanned'),
+		scanLimit: Math.max(...passes.map((p) => p.scanLimit)),
+		scanTruncated: passes.some((p) => p.scanTruncated),
+		leaseRefused: passes.some((p) => p.leaseRefused),
+		occupancy: leaseTable().occupancy(),
+		floorUnpinned: passes.find((p) => p.floorUnpinned)?.floorUnpinned,
+		lanes: passes.map((p) => ({
+			lane: p.lane,
+			label: laneLabel(p.lane),
+			class: classOfLane(p.lane),
+			granted: p.granted,
+			sawDue: p.sawDue,
+			scanned: p.scanned,
+			spilled: p.spilled,
+			skippedLeased: p.skippedLeased,
+			floorTo: p.floorTo,
+			floorHeldBy: p.floorHeldBy,
+			floorPinnedForMs: p.floorPinnedForMs,
+		})),
+		grantLimit,
+	};
+};
+
+/**
+ * Run one bounded lane-restamp pass. See `util/laneRestamp.js` for what this is for and why it is
+ * needed at all given that lanes are otherwise derived at write time.
+ *
+ * The I/O lives HERE because this module is the only file allowed to touch `RenderSchedule` — the
+ * same rule that keeps the floor lowering inseparable from the due-time write, enforced by
+ * `test/queueFunnel.test.js`. `laneRestamp.js` owns the decision; this owns the table.
+ */
+export const restampLanes = async ({ limit = 5000, force = false } = {}) => {
+	const guard = restampGuard({ force });
+	if (!guard.allowed) return { error: guard.reason };
+
+	const result = await restampPass({
+		limit,
+		searchUnstamped: ({ limit: cap }) => scheduleTable().search(unstampedQuery(cap), { replicateFrom: false }),
+		// Through `writeSchedules`, not a raw put, so each batch lowers its lane's watermark with the
+		// batch minimum. A raw write here would file every restamped row BELOW the lane floor the very
+		// first pass then establishes — the terminal render gap, applied to the whole corpus at once.
+		writeRow: (rows) => writeSchedules(rows),
+	});
+
+	if (result.restamped) {
+		logger.info(
+			`[prerender] lane restamp: moved ${result.restamped} of ${result.examined} row(s) ` +
+				`(${result.lanes.map((l) => `${l.label}=${l.rows}`).join(' ')})${result.done ? ' — nothing left to move' : ''}`
+		);
+	}
+	return result;
 };
 
 // ---- lease lifecycle exposed to the result path ---------------------------------------------

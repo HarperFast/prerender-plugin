@@ -108,6 +108,10 @@ export class Target extends TargetTable {
 						? nextRenderTime
 						: getInitialRenderTime(cacheKey, interval),
 				fromSitemap,
+				// Bands the lane. Route > stored > default here; the demand rung does not exist yet for a
+				// brand-new target, so the first cycle bands at the route's ceiling and the post-render
+				// write corrects it.
+				renderInterval: interval,
 			}))
 		);
 
@@ -200,6 +204,13 @@ export class Target extends TargetTable {
 					cacheKey,
 					nextRenderTime: recheckAt,
 					fromSitemap: !!existing?.sitemapUrl,
+					// COLD. A suppressed target has said it does not want to be indexed; its recheck is
+					// speculative work, and it must not compete for capacity with pages that are actually
+					// served. This is the single biggest slice of avoidable priority in the corpus — a
+					// recheck is scheduled for every suppressed URL on `suppression.recheckInterval`
+					// forever — and the cold lane is where it belongs.
+					cold: true,
+					renderInterval: resolveRenderInterval(url, existing?.renderInterval),
 				}))
 			),
 			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
@@ -304,7 +315,18 @@ export class Target extends TargetTable {
 				// that changes nothing. Hoisting the lowering out of the loop would mean carrying the
 				// batch's rows in memory to no measurable end.
 				await writeSchedules(
-					cacheKeysOf(url).map((cacheKey) => ({ cacheKey, nextRenderTime, fromSitemap: !!sitemapUrl }))
+					cacheKeysOf(url).map((cacheKey) => ({
+						cacheKey,
+						nextRenderTime,
+						fromSitemap: !!sitemapUrl,
+						// Route-resolved, because this projection deliberately carries only `url` and
+						// `sitemapUrl` (see the note above on keeping the scan narrow). It is one term short of
+						// the post-render write — a stored `changefreq` interval is invisible here — and the
+						// consequence is bounded: the row is banded at its route's cadence for one cycle and
+						// re-banded correctly when it renders. Passing nothing would be far worse, since that
+						// bands every revalidated row into the SLOWEST lane.
+						renderInterval: resolveRenderInterval(url, null),
+					}))
 				);
 			},
 		});

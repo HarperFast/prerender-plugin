@@ -518,6 +518,95 @@ The floor advances to **the first due row a pass observed**, which is the same t
 Set `queue.claimFloor.enabled: false` to roll the floor back to the old full seek. It changes nothing
 else; leases stay where they are either way.
 
+#### Render lanes: which due row goes first
+
+The floor decides _where the scan starts_. `queue.lanes` decides _which scan_ — and that distinction
+is the whole feature, because a single scan can only start in one place.
+
+`claim` is strictly `nextRenderTime`-ascending, so under any capacity deficit the queue serves
+whatever is oldest-due. Two production measurements say that is the wrong order
+([#80](https://github.com/HarperFast/prerender-plugin/issues/80)):
+
+- **Provenance.** During a multi-hour backlog, **239,090 of 521,929 overdue rows (~46%)** were
+  bot-discovered rather than sitemap-submitted — half the capacity going to pages nobody submitted
+  while submitted pages aged out of their SWR window.
+- **TTL-blindness**, which is sharper. Absolute due time treats a 1 h-TTL homepage 3 h overdue exactly
+  like a 48 h-TTL product page 3 h overdue. The first is 300% stale, the second 6%. Simulated over the
+  real corpus, the 1 h route sits at **4.78× its own TTL even at full capacity** and 48.83× at half,
+  against 1.08× / 2.00× for the 48 h route.
+
+**Why not just rank the due window by relative lateness.** Because it cannot be an _order_:
+`(t − dueAt) / interval` is linear in `t` with slope `1/interval`, so two rows with different
+intervals cross exactly once, and no stored key can express an order that changes with the clock.
+Re-ranking inside the claim window does not rescue it either — the window is anchored at the _oldest_
+due time and is already an EDF prefix, so a homepage 600 minutes down the queue is never read at all.
+Widening the window does not help for the same reason.
+
+So relative lateness is the _rationale_ for which lane a row is in, never the comparator. Lanes are
+cut so intervals inside one are similar; within a lane the order is unchanged (earliest due first),
+which is optimal for maximum lateness.
+
+**The encoding is `nextRenderTime = lane × 2^42 + dueAt`.** One column, the existing index, no schema
+change, no second index, no migration — every pre-existing row is already a valid lane-0 row, and a
+lane change is an in-place numeric update. Measured: three lanes interleaved in one index, each with
+its own watermark, read in **0.29–0.32 ms per lane**; the same lane with its watermark reset costs
+**3.46 ms**. Interleaving is free — the watermark is the entire win, which is why each lane gets one
+(in its own shared buffer, so `renderLease.js` keeps its layout and its invariants).
+
+Lanes, in priority order, all **derived at write time** from provenance, cadence and failure count —
+so a band or route change applies on each URL's next render with no sweep:
+
+| lane               | from                                                                           |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `urgent`           | operator intent — the admin re-render action, and an authenticated `renderNow` |
+| `submitted/b0…bN`  | has a `sitemapUrl`, banded by `queue.lanes.ttlBands`                           |
+| `discovered/b0…bN` | crawler-found, banded the same way                                             |
+| `cold`             | past the fast-retry lane, or a suppressed target's recheck                     |
+
+**Fairness is scheduler policy, deliberately not part of the key** — so it is tunable live with no
+rewriting of stored rows. `urgentMaxShare` caps lane 0's _drain share_ rather than its admission: a
+hard structural bound that needs no token bucket, so a bulk force-render cannot take more than that
+fraction of any batch. `minShare` reserves **floors**, not fixed shares: strict priority starves the
+tail at _every_ capacity level including 100% (and its lag numbers look good precisely because it
+drops work — starvation is invisible in a lag metric), while fixed shares summing to 1.0 leave nothing
+for the priority order to spend. Floors measured far better in the tail — discovery reaching 71 h
+instead of 133 h at 50% capacity. An unclaimed floor is released back to lane order within the same
+pass, so a floor for a class with nothing due costs nothing.
+
+**Enabling it is two steps, and the order matters.** Lane 0 is `urgent` _and_ lane 0 is the unencoded
+value — that is what makes the encoding migration-free, and it is also the trap: on a fresh deploy the
+whole corpus reads as urgent, and `urgentMaxShare` would ration the queue to a fifth of capacity. So:
+
+```sh
+# 1. re-stamp: rewrites each due time into its derived lane, in place, changing NO due time.
+#    Bounded and repeatable — call until "done": true.
+curl -sk -X POST https://<node>:9926/prerender_admin/queue -u <super-user>   -H 'content-type: application/json' -d '{"action":"restamp-lanes","limit":5000}'
+```
+
+```yaml
+# 2. then, in config.yaml:
+queue:
+  lanes:
+    enabled: true
+```
+
+The re-stamp refuses to run once `enabled` is true, because at that point a lane-0 row can no longer
+be told apart from one an operator deliberately marked urgent. It cannot derive a stored `changefreq`
+interval, a demand-ladder rung or `cold` (those live on the Target, and reading it would be a point
+read per row on an 814k corpus), so a promoted catalog page is stamped one band slow and a suppressed
+URL one lane fast — both corrected on that row's next render. Being one band optimistic for one cycle
+is the right direction to be wrong in.
+
+**Disabling is not an instant rollback.** Rows already encoded stay encoded until each renders again,
+and while lanes are off they sort after every unencoded row, so they drain slowly rather than
+promptly. Nothing is stranded — reads decode unconditionally — but to get the old behaviour back at
+once, re-stamp with lanes disabled, which writes every row back to lane 0.
+
+Watch `queue_health` `lane_granted` (jobs granted per pass, lane in the method slot). Lanes
+redistribute a fixed amount of work, so no total moves when they engage and this is the only series
+that shows the split — a lane sitting at zero while its backlog is non-empty is the failure to look
+for, and it is indistinguishable from health anywhere else.
+
 ## HTTP & resource API
 
 | Method & path                                | Purpose                                                             |

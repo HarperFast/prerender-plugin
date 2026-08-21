@@ -384,7 +384,15 @@ export class RenderQueue extends Resource {
 				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
 				// lowering on every completed render would rewind the floor to the current minute
 				// continuously and the whole 14× seek win would evaporate.
-				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+				// `interval` — the DEMAND-RESOLVED cadence, not `base` — is what bands this row into a lane.
+				// This is the only writer that knows the ladder's answer, so it is the one that has to
+				// pass it: `laneFor` with no interval files into the SLOWEST band, so a promoted catalog
+				// page would sit in the 48h lane and the promotion would be undone by the scheduler.
+				await writeSchedule(cacheKey, {
+					nextRenderTime,
+					fromSitemap: !!renderTarget.sitemapUrl,
+					renderInterval: interval,
+				});
 
 				// Persist the rung ONLY on an actual move. 'held' must not write even when the
 				// stored field is absent — absence already resolves to the base ceiling, so writing
@@ -724,7 +732,12 @@ export class RenderQueue extends Resource {
 			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+		// THE CADENCE, NOT THE BACKOFF, bands the lane — `wait` is how far this failure pushed the row
+		// out, `interval` is still what it renders at. And `cold`, which is the point of this branch:
+		// a row past the fast-retry lane has failed repeatedly, so it belongs in the lane that is
+		// floored rather than prioritized. Without it, a broad origin outage walks the whole corpus
+		// through the fast lanes at full priority while every render fails.
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, renderInterval: interval, cold: true });
 		return 'slow';
 	}
 
@@ -754,6 +767,7 @@ export class RenderQueue extends Resource {
 		await writeSchedule(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
+			renderInterval: interval,
 		});
 	}
 
@@ -799,6 +813,10 @@ export class RenderQueue extends Resource {
 			performance.now() - scanStarted,
 			pass.scanTruncated ? 'capped' : pass.jobs.length ? 'granted' : 'empty'
 		);
+
+		// One emit per lane the pass visited. `pass.lanes` is absent when lanes are off, so the series
+		// simply does not exist until the feature does — rather than reporting a single fabricated lane.
+		for (const laneResult of pass.lanes ?? []) metrics.claimLane(laneResult.granted, laneResult.label);
 
 		const jobs = [];
 		let notOwnedHere = 0;

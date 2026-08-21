@@ -377,15 +377,22 @@ export const METRICS = Object.freeze({
 					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
 					'alertable without polling the REST surface. ' +
 					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
+					'lane_granted = jobs granted per claim pass to each render lane (queue.lanes), with the lane in ' +
+					'the method slot — `urgent`, `cold`, or `submitted/bN` / `discovered/bN` for the TTL bands. ' +
+					'Lanes redistribute a fixed amount of work, so no total moves when they engage and this is the ' +
+					'only series that shows the split. A lane sitting at zero while its backlog is non-empty is the ' +
+					'failure to look for (a minShare floor too low, or a ttlBands list that put two very different ' +
+					'cadences in one band); it is indistinguishable from health anywhere else. ' +
 					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
 					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
 					'something is CREATING gaps, and the reconcile log line names the URLs.',
 			},
 			method: {
-				name: 'result (claim_scan_ms only)',
-				values: ['granted', 'empty', 'capped'],
+				name: 'result (claim_scan_ms) | lane (lane_granted)',
+				values: ['granted', 'empty', 'capped', 'urgent', 'submitted/bN', 'discovered/bN', 'cold'],
 				description:
-					'Only claim_scan_ms uses this slot: granted = jobs handed out, empty = nothing due, capped = the ' +
+					'claim_scan_ms and lane_granted use this slot. On claim_scan_ms: ' +
+					'granted = jobs handed out, empty = nothing due, capped = the ' +
 					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
 					'window). Every other series emits null here.',
 			},
@@ -640,6 +647,20 @@ export const metrics = Object.freeze({
 
 	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
 	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
+
+	/**
+	 * Jobs granted to one lane by one claim pass, labelled by lane.
+	 *
+	 * WITHOUT THIS THERE IS NO WAY TO ANSWER "IS PRIORITISATION WORKING". The whole mechanism is a
+	 * redistribution of a fixed amount of work, so no total moves when it engages — only the split
+	 * does, and the split is invisible in every existing series. A lane whose share collapses to zero
+	 * while it still has due rows is the failure mode (a floor set too low, a band list that put two
+	 * cadences in one lane), and it looks exactly like health from the outside.
+	 *
+	 * Emitted per lane per pass rather than per job: a pass grants at most `maxClaimLimit` jobs across
+	 * a handful of lanes, so this is a few emits per claim rather than one per render.
+	 */
+	claimLane: (granted, laneLabel) => server.recordAnalytics(granted, 'queue_health', 'lane_granted', laneLabel, null),
 
 	/** One origin proxy on the serve path: time to response headers, status, and why. */
 	originFetch: (durationMs, statusCode, reason) =>

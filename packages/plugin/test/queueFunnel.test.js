@@ -115,8 +115,15 @@ test('the funnel owns the claim floor: nothing else touches the lease table’s 
 	// `resetFloorNow`, and the console reads through `floorState`, so neither needs these.)
 	const primitives = /\b(?:advanceFloor|lowerFloorTo|resetFloor)\s*\(/;
 
+	// `util/renderLease.js` and `util/laneFloor.js` DEFINE these primitives — one for the single
+	// global floor, one for the per-lane watermarks — so they are the two files the rule cannot
+	// apply to. Both are dependency-free data structures over a plain ArrayBuffer for exactly this
+	// reason: the CAS rules live somewhere testable, and the decision about when to invoke them
+	// lives in the funnel and nowhere else.
+	const DEFINERS = new Set(['util/renderLease.js', 'util/laneFloor.js']);
+
 	for (const [path, source] of sources) {
-		if (path === FUNNEL || path === 'util/renderLease.js') continue;
+		if (path === FUNNEL || DEFINERS.has(path)) continue;
 		assert.equal(
 			primitives.test(source),
 			false,

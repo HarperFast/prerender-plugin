@@ -121,6 +121,9 @@ export const reconcileSchedules = async ({
 			// repaired row would be filed one step behind the floor and this sweep would restore
 			// rows into the very silent gap it exists to close.
 			nextRenderTime: getInitialRenderTime(cacheKey, resolveRenderInterval(target.url, target.renderInterval)),
+			// Bands the restored row's lane. Same resolution the row's own reschedule will use, so a
+			// repair does not park a fast route in the slow lane until its next render.
+			renderInterval: resolveRenderInterval(target.url, target.renderInterval),
 			fromSitemap: !!target.sitemapUrl,
 		});
 		stats.restored++;

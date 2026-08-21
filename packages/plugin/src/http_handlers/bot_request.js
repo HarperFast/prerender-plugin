@@ -383,7 +383,15 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
 	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
 	// keeps the row above the owner's floor and therefore claimable.
-	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: !!renderTarget?.sitemapUrl });
+	// URGENT, because that is precisely what this path is: an authenticated request that says render
+	// this page now and wait for it. It is rate-limited by `queue.lanes.urgentMaxShare` like every
+	// other lane-0 write, so a spammed debug header degrades to slow render-nows rather than to a
+	// stalled queue.
+	await writeSchedule(cacheKey, {
+		nextRenderTime: currentMinuteMs(),
+		fromSitemap: !!renderTarget?.sitemapUrl,
+		urgent: true,
+	});
 
 	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
 	// so a paused queue stays paused (the render then simply times out to the fallback).

@@ -316,7 +316,16 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
 		// schedule row we just read: `put` REPLACES the record, and the target is the field's source of
 		// truth, so this self-corrects a row whose flag went stale (same choice as the reschedule path).
 		await writeSchedules(
-			eligible.map((row) => ({ cacheKey: row.cacheKey, nextRenderTime: dueAt, fromSitemap: !!target.sitemapUrl }))
+			eligible.map((row) => ({
+				cacheKey: row.cacheKey,
+				nextRenderTime: dueAt,
+				fromSitemap: !!target.sitemapUrl,
+				// Already resolved above for the eligibility arithmetic, so banding the lane costs nothing
+				// here. NOT urgent: an invalidation accelerates a page's cadence, it is not an operator
+				// asking for one page now, and routing a bulk epoch through lane 0 would spend the whole
+				// urgent share on it.
+				renderInterval: interval,
+			}))
 		);
 	} catch (e) {
 		logger.error(e, `[prerender] could not accelerate ${cacheKey} after an invalidation`);

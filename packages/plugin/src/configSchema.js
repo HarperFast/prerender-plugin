@@ -1262,6 +1262,94 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'about could not be detected.',
 			{ min: 1, scope: 'restart' }
 		),
+		lanes: group(
+			'RENDER PRIORITY. `claim` is strictly `nextRenderTime`-ascending, so under any capacity ' +
+				'deficit the queue serves whatever is oldest-due — regardless of whether the site owner ' +
+				'submitted the page or a crawler found it, and regardless of how tight its freshness ' +
+				'budget is. Two production measurements say that is the wrong order (see ' +
+				'prerender-plugin#80):\n\n' +
+				'  PROVENANCE: during a multi-hour backlog, 239,090 of 521,929 overdue rows (~46%) were ' +
+				'bot-discovered rather than sitemap-submitted — half the render capacity spent on pages ' +
+				'nobody submitted, while submitted pages aged out of their SWR window.\n\n' +
+				'  TTL-BLINDNESS: absolute due time treats a 1h-TTL homepage 3h overdue exactly like a ' +
+				'48h-TTL product page 3h overdue. The first is 300% stale, the second 6%. Simulated over ' +
+				'the real corpus, the 1h route sits at 4.78x its own TTL even at FULL capacity and ' +
+				'48.83x at half, against 1.08x / 2.00x for the 48h route.\n\n' +
+				'Lanes fix the ORDER, never the volume: the same number of pages render either way. A ' +
+				'lane is encoded in the high bits of `nextRenderTime` (`lane x 2^42 + dueAt`), so there ' +
+				'is no schema change, no second index and no migration — every pre-existing row is ' +
+				'already a valid lane-0 row. Within a lane the order is unchanged (earliest due first), ' +
+				'which is optimal for maximum lateness; lanes are cut so the intervals inside one are ' +
+				'similar, and the lane a row belongs to is DERIVED at write time from its provenance, ' +
+				'its cadence and its failure count, so a config change here applies on each URL’s next ' +
+				'render with no sweep.\n\n' +
+				'READ `enabled` BEFORE TURNING THIS ON. The rollout is two steps and the order matters.',
+			{
+				enabled: option(
+					false,
+					'Off by default, and enabling it is a TWO-STEP OPERATION.\n\n' +
+						'Lane 0 is `urgent` and lane 0 is the UNENCODED value — which is what makes the encoding ' +
+						'migration-free, and is also the trap: every row written before lanes existed is ' +
+						'numerically in lane 0, so on a fresh deploy the WHOLE CORPUS reads as urgent and ' +
+						'`urgentMaxShare` would ration the entire queue down to a fifth of capacity.\n\n' +
+						'So: (1) `POST /prerender_admin/queue {"action":"restamp-lanes"}` and let it finish — it ' +
+						'walks the schedule rows and rewrites each due time into its derived lane, in place, ' +
+						'changing no due time; (2) set this true. Both steps are safe in either order in the ' +
+						'sense that nothing is lost, but doing (2) first means running with the whole corpus in ' +
+						'lane 0 until (1) completes.\n\n' +
+						'DISABLING IS NOT AN INSTANT ROLLBACK. Rows already encoded stay encoded until each one ' +
+						'renders again, and while this is false they sort after every unencoded row — so they ' +
+						'drain slowly rather than promptly. Nothing is stranded (reads decode unconditionally), ' +
+						'but if you need the old behaviour back at once, re-stamp with lanes disabled, which ' +
+						'writes every row back to lane 0.'
+				),
+				ttlBands: option(
+					[HOUR, 12 * HOUR],
+					'Cadence cuts (ms, ascending) that split `submitted` and `discovered` into lanes. A row ' +
+						'goes in the first band its render interval does not exceed; anything slower lands in the ' +
+						'overflow band, so N cuts make N+1 bands.\n\n' +
+						'This is the half that fixes TTL-blindness, and it is why the coarse classes alone are ' +
+						'not enough: a class whose intervals are NOT similar reproduces the problem inside itself. ' +
+						'At the default, a 1h homepage, a 6-12h catalog page and a 48h product page occupy three ' +
+						'different lanes, so the homepage stops queueing behind product pages that are older in ' +
+						'absolute terms but barely stale in their own terms.\n\n' +
+						'Set cuts at your ACTUAL route cadences, not at round numbers — a band that contains two ' +
+						'route cadences an order of magnitude apart is a band that does nothing. An empty list ' +
+						'leaves one band per class, i.e. provenance-only priority.',
+					{ unit: 'ms' }
+				),
+				urgentMaxShare: option(
+					0.2,
+					'Ceiling on the fraction of one claim batch the `urgent` lane may take.\n\n' +
+						'A DRAIN-SHARE cap, not an admission limit: urgent is served strictly first but never ' +
+						'gets more than this share of a batch, so the lanes below always get at least ' +
+						'`1 - urgentMaxShare`. That is a hard structural bound with no token bucket and no ' +
+						'admission bookkeeping to get wrong, and it is what stops a bulk "re-render everything ' +
+						'now" from becoming a queue-wide outage. Earliest-due-first within the lane, so a flood ' +
+						'is still served oldest-first.\n\n' +
+						'`0` disables the lane entirely. Any share small enough to floor to zero jobs still ' +
+						'admits one, because a cap of zero would make an operator’s force-render silently never ' +
+						'run.',
+					{ min: 0, max: 1 }
+				),
+				minShare: option(
+					{ discovered: 0.1, cold: 0.02 },
+					'Minimum share of each claim batch reserved for a coarse class, keyed by name ' +
+						'(`urgent`, `submitted`, `discovered`, `cold`).\n\n' +
+						'FLOORS, NOT FIXED SHARES, and the simulation is unambiguous about why. Strict lane ' +
+						'priority starves the tail at EVERY capacity level including 100%, and its lag numbers ' +
+						'look good precisely because it drops work — starvation is invisible in a lag metric. ' +
+						'But fixed shares summing to 1.0 are also wrong: they leave nothing for the priority ' +
+						'order to spend, and deviating from earliest-due-first only ever costs. Reserving a ' +
+						'MINIMUM for the classes that need protecting and letting the rest compete in lane ' +
+						'order measured far better in the tail — discovery reaching 71h instead of 133h at 50% ' +
+						'capacity, 29h instead of 40h at 75%.\n\n' +
+						'A reservation that goes unclaimed is released back to lane order within the same pass, ' +
+						'so a floor for a class with nothing due costs nothing. Shares are of the batch, so they ' +
+						'need not sum to 1; a sum above 1 is clamped by the batch size itself.'
+				),
+			}
+		),
 		claimScanCap: option(
 			1000,
 			'Ceiling on schedule rows read per claim pass. A leased row keeps its overdue position in the ' +
