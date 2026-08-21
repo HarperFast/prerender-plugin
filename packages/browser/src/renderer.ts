@@ -5,6 +5,7 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
+import type { Page } from 'puppeteer';
 
 const noop = () => {};
 
@@ -265,6 +266,49 @@ const renderer: Renderer = async (page, job) => {
 		}
 	}
 
+	// ── DECIDE WHAT IS ALREADY DECIDABLE, BEFORE PAYING FOR THE SETTLE ──────────────────────────
+	//
+	// The settle phase is where a render's cost is. Measured on this deployment the scroll-settle
+	// passes alone are ~78% of render time and the bulk of per-render CPU, and a page that ends up
+	// non-indexable pays all of it and then has its bytes discarded — and pays it again on every
+	// suppression recheck for as long as the target exists. Two verdicts are already final here:
+	//
+	//   1. A NON-200. The status cannot change during the settle, and the post-settle branch does
+	//      nothing with a non-200 except set `isIndexable = false` / `reason: 'http-error'` and
+	//      return no content — for a sitemap-listed url too. So this is behaviour-identical by
+	//      construction rather than merely close, which is why it needs no sitemap exemption.
+	//   2. A DOCUMENT THAT ALREADY DISOWNS ITSELF. The signals come from the same
+	//      `readIndexVerdict` the post-settle check uses, so this is the verdict that check would
+	//      have reached — UNLESS the page mutates its own `<head>` during the settle. That is the
+	//      entire scope of the difference between the two, and the reason this half has its own
+	//      switch while the status half does not.
+	//
+	// A SITEMAP-LISTED URL IS NOT ELIGIBLE for (2), and that exemption is load-bearing rather than
+	// cautious: such a page is serialized even when non-indexable (see the `job.isFromSitemap`
+	// branch below), so its settle is not wasted work and bailing would replace a served page with
+	// nothing at all. The plugin's own suppression branch never sees those urls either — only urls
+	// it discovered are retirable this way.
+	if (finalRes) {
+		const status = finalRes.status();
+
+		if (config.suppression.earlyErrorStatus && status !== 200) {
+			job.httpResponse = { statusCode: status, headers: finalRes.headers() };
+			job.isIndexable = false;
+			job.reason = 'http-error';
+			return;
+		}
+
+		if (config.suppression.earlyNonIndexable && status === 200 && !job.isFromSitemap) {
+			const { indexable, reason } = await readIndexVerdict(page, config.canonical.strict);
+			if (!indexable) {
+				job.httpResponse = { statusCode: status, headers: finalRes.headers() };
+				job.isIndexable = false;
+				job.reason = reason ?? undefined;
+				return;
+			}
+		}
+	}
+
 	const settleStart = Date.now();
 
 	const networkIdle = () =>
@@ -449,20 +493,9 @@ const renderer: Renderer = async (page, job) => {
 		}
 
 		if (statusCode === 200) {
-			const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
-			// A canonical naming a DIFFERENT document always disowns the page — invariable, every
-			// site. A canonical naming this very document RE-SPELLED as another cache key
-			// ('variant') is only a duplicate if the site's origin cannot tell the two spellings
-			// apart, which is a property of its query parser, not of the URLs — so that half is
-			// config, defaulting to the historical lenient reading. See config.canonical.strict.
-			// Either way the reason slug is distinct, so duplicate spellings stay legible next to
-			// genuine mismatches.
-			const verdict = canonicalVerdict(canonicalHref, rawPageUrl);
-			const disowned = verdict === 'elsewhere' || (verdict === 'variant' && config.canonical.strict);
-			job.isIndexable = !noindex && !disowned;
-			if (!job.isIndexable) {
-				job.reason = noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch';
-			}
+			const { indexable, reason } = await readIndexVerdict(page, config.canonical.strict);
+			job.isIndexable = indexable;
+			if (reason) job.reason = reason;
 
 			if (job.isIndexable || job.isFromSitemap) {
 				const ppStart = Date.now();
@@ -592,6 +625,35 @@ function countMatchingElements(selector: string): number {
 // lives in Node (util/url.ts) so it is unit-tested and can't drift from the redirect
 // normalizer. (That drift is exactly what marked self-canonical pages non-indexable: the
 // canonical's literal `:` never matched the request's `%3A`.)
+/**
+ * The page's own statement about whether it should be indexed, read off the live DOM.
+ *
+ * ONE function for both the post-navigation check and the post-settle one, deliberately. They ask
+ * the identical question of a page at two different moments, and the only difference that is
+ * supposed to exist between their answers is the page having changed its own head in between. Two
+ * copies of this reasoning would add a second difference nobody would notice.
+ *
+ * A canonical naming a DIFFERENT document always disowns the page — invariable, every site. A
+ * canonical naming this very document RE-SPELLED as another cache key ('variant') is only a
+ * duplicate if the site's origin cannot tell the two spellings apart, which is a property of its
+ * query parser, not of the URLs — so that half is config, defaulting to the historical lenient
+ * reading. See config.canonical.strict. Either way the reason slug is distinct, so duplicate
+ * spellings stay legible next to genuine mismatches.
+ */
+async function readIndexVerdict(
+	page: Page,
+	canonicalStrict: boolean
+): Promise<{ indexable: boolean; reason: string | null }> {
+	const { canonicalHref, noindex } = await page.evaluate(extractIndexSignals);
+	const verdict = canonicalVerdict(canonicalHref, page.url());
+	const disowned = verdict === 'elsewhere' || (verdict === 'variant' && canonicalStrict);
+	if (!noindex && !disowned) return { indexable: true, reason: null };
+	return {
+		indexable: false,
+		reason: noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
+	};
+}
+
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
 	let canonicalHref: string | null = null;
 	let noindex = false;

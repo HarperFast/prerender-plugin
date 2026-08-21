@@ -218,6 +218,39 @@ export type WaitForRule = {
  * canonical comes back `A%20B`, or it simply serves what `A B` names — it form-decodes, and the
  * two spellings can never name different resources.
  */
+/**
+ * How much of a render to pay for before accepting that the page will not be served.
+ *
+ * The settle phase is a render's cost — measured on the reference deployment, the scroll-settle
+ * passes alone are ~78% of render time and the bulk of per-render CPU. Everything a non-indexable
+ * page spends there is discarded, and it is spent again on every `render.suppression.recheck`
+ * for as long as the plugin keeps the target. Both switches move the verdict to immediately after
+ * the navigation, where the answer is already available.
+ *
+ * They are separate because their risk is not the same:
+ *
+ *   `earlyErrorStatus` is behaviour-identical BY CONSTRUCTION. An HTTP status cannot change during
+ *   the settle, and the post-settle branch does nothing with a non-200 but report it with no
+ *   content — for a sitemap-listed url as well. There is no case in which settling first would
+ *   have produced a different result, which is why it needs no sitemap exemption and why turning
+ *   it off buys nothing but latency.
+ *
+ *   `earlyNonIndexable` reads the page's own `noindex`/canonical off the initial DOM instead of the
+ *   settled one. Those agree unless the page MUTATES ITS OWN HEAD during the settle — adding a
+ *   canonical from client-side routing, or removing a server-rendered `noindex`. The second
+ *   direction is the one that costs something: the page would be suppressed on evidence it was
+ *   about to withdraw. It is rare enough to default on and specific enough to be worth its own
+ *   switch. Sitemap-listed urls are never eligible for it: they are serialized even when
+ *   non-indexable, so their settle is not wasted and bailing would replace a served page with
+ *   nothing.
+ */
+export type SuppressionConfig = {
+	/** Post the verdict right after navigation when the status is not 200. Default true. */
+	earlyErrorStatus: boolean;
+	/** ...and when a non-sitemap page's initial DOM already disowns it. Default true. */
+	earlyNonIndexable: boolean;
+};
+
 export type CanonicalConfig = {
 	/** Treat a re-spelled self-canonical as a duplicate cache key (non-indexable). Default false. */
 	strict: boolean;
@@ -253,6 +286,7 @@ export type PrerenderConfig = {
 	scroll: ScrollConfig;
 	postProcess: PostProcessConfig;
 	canonical: CanonicalConfig;
+	suppression: SuppressionConfig;
 	cacheKey: CacheKeyConfig;
 	/**
 	 * Optional declarative "wait for content" rules applied after scroll/settle and before the
@@ -304,6 +338,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		resolveLazyImages: false,
 	},
 	canonical: { strict: false },
+	suppression: { earlyErrorStatus: true, earlyNonIndexable: true },
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},

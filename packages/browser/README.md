@@ -117,11 +117,40 @@ include what you change:
 	},
 	"injectWebComponentsPolyfill": true, // force ShadyDOM/ShadyCSS so shadow-DOM CSS serializes
 	"extraHeaders": {}, // extra request headers on the navigation request
+	// How much of a render to pay for before accepting the page will not be served. Both decide
+	// right after navigation instead of after the settle phase — see "Early suppression" below.
+	"suppression": { "earlyErrorStatus": true, "earlyNonIndexable": true },
 }
 ```
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### Early suppression
+
+The settle phase is where a render's cost is — on the reference deployment the scroll-settle passes
+alone are **~78% of render time** and the bulk of per-render CPU. A page that turns out to be
+non-indexable pays all of it, has its bytes discarded, and then pays it again on every
+`render.suppression.recheck` for as long as the plugin keeps the target. Two verdicts are already
+final immediately after navigation, so `suppression` takes them there.
+
+The two switches are separate because their risk is not the same:
+
+- **`earlyErrorStatus`** is behaviour-identical _by construction_. An HTTP status cannot change during
+  the settle, and the post-settle branch does nothing with a non-200 but report it with no content —
+  for a sitemap-listed URL as well. There is no case where settling first produces a different result,
+  which is why it needs no sitemap exemption and why turning it off buys nothing but latency.
+- **`earlyNonIndexable`** reads the page's own `noindex` / `<link rel=canonical>` off the _initial_
+  DOM rather than the settled one. Those agree unless the page mutates its own `<head>` during the
+  settle — adding a canonical from client-side routing, or removing a server-rendered `noindex`. The
+  second direction is the one that costs something, so it gets its own switch. The post-settle check
+  remains the backstop either way: a page that adds its `noindex` late is still caught, it just pays
+  for the settle to be caught.
+
+**Sitemap-listed URLs are never eligible for `earlyNonIndexable`.** They are serialized even when
+non-indexable, so their settle is not wasted work and bailing would replace a served page with
+nothing. (`renderOnce` maps `captureNonIndexable` onto `job.isFromSitemap`, so an inspection render
+settles by default.)
 
 ## Custom renderer
 
