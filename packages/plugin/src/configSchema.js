@@ -457,6 +457,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'except the login/session/index routes requires a `super_user`. The console UI consuming this ' +
 			'API is the separate `@harperfast/prerender-console` component.',
 		{
+			eventLoopLagInterval: option(
+				60_000,
+				'How often each worker reports its own event-loop delay, in ms. `0` disables it.\n\n' +
+					'Reported PER WORKER on purpose. Analytics rows are per-thread, so one worker standing out ' +
+					'against its peers localises a stall to whatever only that worker does — for this plugin the ' +
+					'ready-set sweep, the queue-status sync and the reconciler, all pinned to `workerIndex 0`. A ' +
+					'single cluster-wide number averages exactly that signal away.\n\n' +
+					'Cheap: the histogram samples in libuv at 20ms and the reporter is one timer per worker. It ' +
+					'emits two `prerender_ops` `event_loop_lag` rows per worker per window (p99 and max), so the ' +
+					'cost of shortening it is analytics rows, not runtime.',
+				{ min: 0 }
+			),
 			enabled: option(
 				true,
 				'Serve the management API (and therefore anything the console can show).',
@@ -1355,6 +1367,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'soon as its ratio passes `sitemapBoost x` the highest sitemap ratio in the set. With ' +
 						'sitemap pages held ~1.2 cadences late, a discovered page is served within ~2.4 cadences ' +
 						'of its own interval at the default.',
+					{ min: 1 }
+				),
+				yieldBudget: option(
+					2,
+					'Milliseconds the sweep may hold the event loop before yielding, in ms.\n\n' +
+						'THE SWEEP RUNS ON A WORKER THAT ALSO SERVES BOT TRAFFIC, so this is the knob that decides ' +
+						'how long a crawler request can sit behind it. It replaced a fixed "yield every 200 rows", ' +
+						'which was chosen when `bench/queue-index` measured a row at ~2.4us — 200 rows was ~0.5ms ' +
+						'of held loop, invisible beside a ~1.6ms cache hit. On the production corpus a row costs ' +
+						'~55us, so those same 200 rows held the loop ~11ms and every request landing in that slice ' +
+						'waited for it. A row count cannot express "do not stall a request"; a time budget can, and ' +
+						'it stays correct when the per-row cost moves.\n\n' +
+						'The default is set just above a cache hit (~1.6ms served), so a request delayed by the ' +
+						'sweep is delayed by about the time it would take to serve. Raising it trades crawler ' +
+						'latency for slightly fewer yields, which buys almost nothing: yielding measured free ' +
+						'(2.375 vs 2.387us/row at 20,000 rows). Lower it if `event_loop_lag` on the sweeping ' +
+						'worker is worse than the p99 you want for `duration` (`path: p`).\n\n' +
+						'Granularity is bounded by an internal 32-row check interval, so the actual slice lands ' +
+						'between this and roughly this plus 2ms on the current corpus.',
 					{ min: 1 }
 				),
 			}

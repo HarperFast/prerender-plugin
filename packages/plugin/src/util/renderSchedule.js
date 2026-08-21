@@ -505,6 +505,13 @@ export const runClaimPass = async ({
  * they resolved a cadence differently the push distance would stop matching the number the row was
  * ranked by. `Number` first for the BigInt-from-`Long` coercion; `> 0` rejects null/NaN/negatives.
  */
+/**
+ * How often the walk consults the clock. Not a tuning knob — it only bounds the OVERSHOOT past the
+ * time budget: at ~55us/row, 32 rows is ~1.8ms of granularity, so a 2ms budget yields somewhere in
+ * 2-4ms. Lowering it buys precision nobody needs; raising it makes the budget a suggestion.
+ */
+const YIELD_CHECK_ROWS = 32;
+
 const carriedCadence = (effectiveInterval) => {
 	const ms = Number(effectiveInterval);
 	return Number.isFinite(ms) && ms > 0 ? ms : null;
@@ -739,6 +746,10 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		return interval;
 	};
 
+	// Time budget for one uninterrupted slice of the walk. Read once per sweep: a live change applies
+	// to the next sweep, and re-reading config inside the loop is work per row for no benefit.
+	const yieldBudgetMs = Math.max(1, config.queue.ready.yieldBudget | 0);
+	let lastYieldAt = performance.now();
 	let scanned = 0;
 	let due = 0;
 	let nonFinite = 0;
@@ -825,9 +836,22 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		const intervalMs = carried ?? intervalFor(CacheKey.extractUrl(row.cacheKey));
 		const score = scoreOf({ dueAt, fromSitemap: !!row.fromSitemap }, { nowMs, intervalMs, sitemapBoost });
 		heap.offer(score, { cacheKey: row.cacheKey, dueAt, fromSitemap: !!row.fromSitemap });
-		// Yielding is free (measured: 2.375 vs 2.387 us/row at 20,000 rows) and this runs beside bot
-		// traffic on a worker that also serves requests, so it must not hold the loop for a whole sweep.
-		if (scanned % 200 === 0) await yieldNow();
+		// YIELD ON ELAPSED TIME, NOT ON A ROW COUNT — and the difference is the whole point of this
+		// clause. It used to yield every 200 rows, chosen when `bench/queue-index` said a row cost
+		// ~2.4us: 200 rows was ~0.5ms of held loop, invisible next to a ~1.6ms cache hit. On the real
+		// corpus a row costs ~55us, so the same 200 rows hold the loop for ~11ms — and this worker also
+		// serves bot traffic, so every request landing inside that slice waits for it. A row count
+		// cannot express "do not stall a request"; a time budget can, and it re-derives itself when the
+		// per-row cost moves instead of needing a constant re-tuned by hand.
+		//
+		// The clock is read every `YIELD_CHECK_ROWS` rows rather than every row. `performance.now()` is
+		// tens of nanoseconds against ~55us of work, so per-row would be free TODAY — but the reason
+		// this clause is being rewritten at all is that a per-row cost moved 20x, and at 2.4us/row a
+		// per-row clock read would be ~2%. Sampling costs nothing and does not care.
+		if (scanned % YIELD_CHECK_ROWS === 0 && performance.now() - lastYieldAt >= yieldBudgetMs) {
+			await yieldNow();
+			lastYieldAt = performance.now();
+		}
 	}
 
 	const published = queue.publish(heap.drainDescending(), { scannedRows: scanned });

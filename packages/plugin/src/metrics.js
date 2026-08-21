@@ -690,6 +690,22 @@ export const metrics = Object.freeze({
 	originFetch: (durationMs, statusCode, reason) =>
 		server.recordAnalytics(durationMs, 'origin_fetch', statusCode, reason, null),
 
+	/**
+	 * Event-loop delay for ONE worker over the last window, in ms — a prerender_ops series.
+	 *
+	 * EMITTED BY EVERY WORKER, not just the sweeping one, and that is the entire point. Analytics rows
+	 * are per-thread, so a fleet where one worker's lag stands out against fifteen others localises a
+	 * stall to whatever only that worker does — which for this plugin means the ready-set sweep, the
+	 * queue-status sync and the reconciler, all of which self-gate to `workerIndex === 0`. A single
+	 * cluster-wide number would average exactly that signal away.
+	 *
+	 * `detail` is the statistic (`p99`/`max`), `context` the worker index as a string. The worker index
+	 * is closed and small, so it is safe as a dimension — cardinality is a year-long cost and this is
+	 * the one place a per-thread identity is worth paying for.
+	 */
+	eventLoopLag: (ms, statistic, workerIndex) =>
+		server.recordAnalytics(ms, 'prerender_ops', 'event_loop_lag', statistic, String(workerIndex)),
+
 	/** A committed response whose body failed on the way out — a prerender_ops series. */
 	serveError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'serve_error', kind, null),
 
