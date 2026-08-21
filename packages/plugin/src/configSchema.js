@@ -1291,7 +1291,14 @@ export const configSchema = group('Prerender plugin configuration.', {
 					5000,
 					'Entries the ready set holds. Sized to cover several sweep intervals of claims so the set ' +
 						'does not run dry between sweeps: at the recorded fleet throughput a node grants roughly ' +
-						'5 jobs a second, so 5,000 entries is about 16 minutes of work.\n\n' +
+						'5 jobs a second (observed live: ~70-75 claims a minute), so 5,000 entries is about 16 ' +
+						'minutes of work — three sweep intervals at the default.\n\n' +
+						'DO NOT RAISE THIS CASUALLY. The reference cluster runs with 4.6GB of swap in use and 5.2GB ' +
+						'free of 33.6GB, so shared memory on these nodes is not free. A larger set does not improve ' +
+						'the ordering either — the sweep already scores every due row and keeps the best of them, so ' +
+						'this only buys time between sweeps. What makes the sweep safe on a swapping node is that ' +
+						'its own memory is a function of THIS number and not of the due set: it streams rows through ' +
+						'a bounded heap and retains only the best `capacity`.\n\n' +
 						'Costs `capacity x ~276 x 2` bytes of shared memory — two slots, so ~2.8MB at the default. ' +
 						'Raising it does ' +
 						'NOT make the ordering better — the sweep already scores every due row and keeps the best ' +
@@ -1302,12 +1309,24 @@ export const configSchema = group('Prerender plugin configuration.', {
 					{ min: 0, scope: 'restart' }
 				),
 				sweepInterval: option(
-					MINUTE,
+					5 * MINUTE,
 					'How often worker 0 re-scores the due set and republishes.\n\n' +
 						'This is the ORDERING STALENESS: a row that becomes due just after a sweep waits up to one ' +
-						'interval before it can be ranked. One minute against cadences of an hour and up is a ' +
-						'rounding error, and the cost is one read of the due set — ~480ms per 200,000 due rows, on ' +
-						'a worker that yields every 200 rows (measured free) so it never holds the loop.\n\n' +
+						'interval before it can be ranked. Five minutes against cadences of an hour and up is a ' +
+						'rounding error, and `capacity` covers roughly three of these intervals of claims, so the ' +
+						'set does not run dry between sweeps.\n\n' +
+						'FIVE MINUTES RATHER THAN ONE, on production evidence. A synthetic benchmark puts a ' +
+						'projected one-sided read at ~2.4us/row, which would make a sweep sub-second — but the live ' +
+						'cluster reports `claim_scan_ms` at a 5-6ms median over a window of roughly 205 rows ' +
+						'(grantLimit + in-flight + grantLimit, at an observed lease occupancy of 75-155), and ' +
+						'`empty` passes at a 25ms mean with 47ms observed, which are seek-dominated. So the real ' +
+						'marginal per-row cost sits somewhere between 2.4us and ~25us — an order of magnitude of ' +
+						'uncertainty — and the sweep shares a worker with bot traffic. At the wide end a ' +
+						'one-minute interval would spend a noticeable fraction of a core continuously, for no ' +
+						'benefit: the ordering does not go stale that fast.\n\n' +
+						'WATCH `ready_sweep_ms` AND TIGHTEN FROM THERE. It reports the real number for your corpus, ' +
+						'which is the only way to know it — the backlog snapshot cannot tell you the due-set size ' +
+						'either, because `overdue` saturates at `management.scanCap` (observed pinned at 2,000).\n\n' +
 						'`0` disables the sweep, which leaves the set to go stale and then empty; claims fall back ' +
 						'to the index scan as they always do.',
 					{ unit: 'ms', min: 0 }

@@ -584,6 +584,31 @@ raise `queue.ready.sweepCap`.
 
 `queue.ready.enabled: false` claims straight from the index scan and stops the sweep — a true revert.
 
+##### What the live cluster says about the defaults
+
+Checked against the reference deployment (4 nodes, 16 workers, Harper Pro 5.2.3) before rollout:
+
+- **`claim_scan_ms` reports `method: capped` on essentially every pass** — 280 samples over six hours.
+  `capped` means the pass read its whole window and never reached a not-yet-due row. With
+  `lease_occupancy` at 75–155 the window is ~205 rows, so the queue is choosing ~4 jobs out of ~205
+  rows that are all ancient and never seeing the rest of the due set. That is the anchoring problem
+  this section describes, measured in production rather than argued from a simulation.
+- **The marginal per-row read cost is uncertain by an order of magnitude.** A synthetic benchmark says
+  ~2.4 µs/row; live, a ~205-row window takes a 5–6 ms median (p95 9–12 ms) and `empty` passes average
+  25 ms with 47 ms observed, which are seek-dominated. That is why `sweepInterval` defaults to five
+  minutes rather than one, and why `ready_sweep_ms` exists — it is the only thing that will tell you
+  the real number for your corpus.
+- **The due-set size cannot be read from the backlog snapshot.** `overdue` saturates at
+  `management.scanCap` (observed pinned at 2,000), so "how many rows will the sweep walk" is answered
+  by `ready_sweep_ms` and the sweep's own `scanned` count, not by the overview.
+- **The nodes swap** (4.6 GB in use, 5.2 GB free of 33.6 GB). This is why the sweep streams rows
+  through a bounded heap and retains only `capacity` of them: its memory is a function of the set
+  size, never of the due set. A design that sorted the due set would be actively unsafe here, and it
+  is why `capacity` should not be raised casually.
+- **The sweep cannot make a cross-node request.** It reuses the same query the claim scan uses, which
+  carries `replicateFrom: false`, and it performs no point reads at all — so it cannot take the
+  untimed replication fetch that an unowned point read on this residency-pinned table would.
+
 ## HTTP & resource API
 
 | Method & path                                | Purpose                                                             |
