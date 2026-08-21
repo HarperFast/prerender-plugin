@@ -93,6 +93,9 @@ function supply(ctx) {
 	const outcomes = pick(data, 'render', (s) => s.path === 'outcome');
 	const times = pick(data, 'render', (s) => s.path === 'time_ms');
 	const claims = pick(data, 'queue_health', (s) => s.path === 'claim_scan_ms');
+	// `candidate` is a render whose result was actually stored — the work that produces a cached
+	// page, as opposed to a settle-skipping bail on a page we were never going to keep.
+	const candidateTimes = pick(data, 'render', (s) => s.path === 'time_ms' && s.type === 'candidate');
 
 	const total = sumCount(outcomes);
 	const failedLike = sumCount(outcomes.filter((s) => s.method === 'failed' || s.method === 'auth-failure'));
@@ -104,8 +107,34 @@ function supply(ctx) {
 			// One-in-ten failing is past tail noise for any healthy corpus.
 			warn: total > 0 && failedLike > total / 10,
 		}),
-		stat('Render p95', fmtMs(weighted(times, 'p95')), 'browser-reported duration ≈'),
-		stat('Claim scan p95', fmtMs(weighted(claims, 'p95')), 'the leading indicator — watch the trend ≈'),
+		// THE MEAN, because this tile is the capacity number and capacity is governed by the mean:
+		// renders/hour is concurrency ÷ MEAN render time (a queue's throughput follows the average
+		// service time, not its tail). Sizing off the p95 understates the fleet by whatever the tail
+		// is worth — measured here, 16.0s against a mean of 11.0s, a third of the fleet's capacity
+		// argued away.
+		//
+		// AND THE POOLED MEAN IS NOW TWO MODES. Since browser v1.18.0,
+		// `navigation.skipSettleWhenNonIndexable` returns a page that already disowns itself at
+		// DOMContentLoaded without settling — ~1.7s against ~10.9s — so the fleet runs cheap bails
+		// beside full renders. Pooled, that mean falls as the BAIL RATE rises, which is a real
+		// throughput gain and not a faster settle; read alone it looks like the renderer got quicker.
+		// The candidacy slot already separates them (a bail posts a non-indexable verdict), so the
+		// subtitle carries the mean of the renders that actually produced a stored page. Capacity
+		// still uses the pooled mean: a bail occupies a worker slot like anything else.
+		stat(
+			'Render time',
+			fmtMs(weighted(times, 'mean')),
+			`mean, all renders — capacity is concurrency ÷ this${
+				candidateTimes.length && candidateTimes.length !== times.length
+					? ` · stored ${fmtMs(weighted(candidateTimes, 'mean'))}`
+					: ''
+			} · p95 ${fmtMs(weighted(times, 'p95'))}`
+		),
+		stat(
+			'Claim scan p95',
+			fmtMs(weighted(claims, 'p95')),
+			`the leading indicator — watch the trend ≈ · median ${fmtMs(weighted(claims, 'median'))}`
+		),
 	]);
 
 	// Outcomes stacked over time: the shape of "renders are failing" as it develops.
@@ -132,8 +161,10 @@ function supply(ctx) {
 				? lineChart(data, timeSeries)
 				: emptyNote('render time / claim_scan_ms', data),
 			el('p', { cls: 'muted chart-note' }, [
-				'Render time is fleet capacity (renders/hour = concurrency ÷ time). The claim scan degrades ',
-				'BEFORE any backlog shows — measured 17× once — so its trend matters more than its level.',
+				'These are TAILS, not the capacity figure: renders/hour is concurrency ÷ the MEAN render time, ',
+				'which is the tile above — a p95 line answers "are some renders pathological", never "how many ',
+				'can the fleet do". The claim scan degrades BEFORE any backlog shows — measured 17× once — so ',
+				'its trend matters more than its level.',
 			]),
 		],
 	});

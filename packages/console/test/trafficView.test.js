@@ -28,12 +28,18 @@ installDom();
 const { el } = await import('../src/admin/ui.js');
 const { load, render, cadenceIndex, cadenceFor, notHitRows, originVerdict, originCostByReason, coverageSplit } =
 	await import('../src/admin/views/traffic.js');
+const { ratioOf } = await import('../src/admin/charts.js');
 
 const HOUR = 3_600_000;
 const BUCKETS = 4;
 
-/** One analytics combo, shaped like `util/analyticsRead.js` emits it. */
-function combo(metric, path, method, type, count, value) {
+/**
+ * One analytics combo, shaped like `util/analyticsRead.js` emits it.
+ *
+ * `p95` defaults to `value` but is worth setting: with a flat distribution no test can tell which
+ * statistic a panel used, and "which statistic" is exactly what several of them now assert.
+ */
+function combo(metric, path, method, type, count, value, p95 = value) {
 	const row = {
 		metric,
 		path,
@@ -46,9 +52,9 @@ function combo(metric, path, method, type, count, value) {
 	if (value !== undefined) {
 		row.mean = value;
 		row.median = value;
-		row.p95 = value;
+		row.p95 = p95;
 		row.means = new Array(BUCKETS).fill(value);
-		row.p95s = new Array(BUCKETS).fill(value);
+		row.p95s = new Array(BUCKETS).fill(p95);
 	}
 	return row;
 }
@@ -83,11 +89,11 @@ const ANALYTICS = {
 		combo('bot_request', 'www.example.com', 'googlebot', 'mobile', 310),
 		combo('bot_request', 'www.example.com', 'bingbot', 'desktop', 200),
 		// page_age: path=botName, method=deviceType
-		combo('page_age', 'googlebot', 'desktop', null, 700, 3 * HOUR),
-		combo('page_age', 'bingbot', 'desktop', null, 50, 12 * HOUR),
-		// route_page_age: path=route, method=cacheStatus, type=deviceType
-		combo('route_page_age', '/product/', 'hit', 'desktop', 600, 3 * HOUR),
-		combo('route_page_age', '/', 'hit', 'desktop', 150, 3 * HOUR),
+		combo('page_age', 'googlebot', 'desktop', null, 700, 3 * HOUR, 9 * HOUR),
+		combo('page_age', 'bingbot', 'desktop', null, 50, 12 * HOUR, 18 * HOUR),
+		// route_page_age: path=route, method=cacheStatus, type=deviceType. Median 3h, tail 9h.
+		combo('route_page_age', '/product/', 'hit', 'desktop', 600, 3 * HOUR, 9 * HOUR),
+		combo('route_page_age', '/', 'hit', 'desktop', 150, 3 * HOUR, 9 * HOUR),
 		// route_serve: path=route, method=cacheStatus, type=deviceType
 		combo('route_serve', '/product/', 'hit', 'desktop', 600),
 		combo('route_serve', '/product/', 'miss', 'desktop', 200),
@@ -100,8 +106,10 @@ const ANALYTICS = {
 		combo('origin_fetch', '503', 'miss', null, 10, 3000),
 		combo('origin_fetch', '200', 'blob-timeout', null, 10, 700),
 		// Harper's own per-request metrics, bot traffic only (handlerPath 'p')
-		combo('duration', 'p', 'GET', 'cache-hit', 750, 5),
-		combo('duration', 'p', 'GET', 'cache-miss', 260, 900),
+		// A cache hit is single-digit ms with a tail; an origin proxy is two orders of magnitude
+		// slower. Pooling the two is the thing the serve-time tile must not do.
+		combo('duration', 'p', 'GET', 'cache-hit', 750, 5, 40),
+		combo('duration', 'p', 'GET', 'cache-miss', 260, 900, 2400),
 		combo('response_200', 'p', 'GET', null, 950),
 		combo('response_500', 'p', 'GET', null, 60),
 		// A served page whose age computed negative — dropped from the distribution above
@@ -242,11 +250,93 @@ test('the whole view renders, and reports staleness against each route’s own c
 	// route_page_age: 600 serves at 3h on a 1h route (3.0x) and 150 at 3h on the 6h default
 	// (0.5x) => count-weighted 2.5. Against the default interval alone it would read 0.5x, which
 	// is the entire point: the fleet is three hours behind on the route that matters.
-	assert.match(text, /Staleness p95/);
+	assert.match(text, /Staleness/);
 	assert.match(text, /2\.50×/);
 	assert.match(text, /each route’s cadence/);
 	// Absolute is still carried, because a ratio is not what anyone quotes.
 	assert.match(text, /3\.0h/);
+});
+
+// ---- one statistic per question ---------------------------------------------
+
+test('staleness leads with the MEDIAN and carries the p95 beside it', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// route_page_age: median 3h on a 1h route (3.00x) and on the 6h default (0.50x), count-weighted
+	// over 600/150 => 2.50x. The tail is 9h, which would read 7.50x — three times as alarming, on
+	// the same healthy window.
+	assert.match(text, /Staleness2\.50×median · p95 7\.50×/);
+});
+
+test('a p95 that would warn does not warn when the median is fine', async () => {
+	const ctx = await ready();
+	// The tile warns on the median (2.50x here, genuinely bad). Prove the threshold is on the
+	// median by making the median healthy while the tail stays high.
+	ctx.data.analytics = {
+		...ANALYTICS,
+		series: ANALYTICS.series.map((s) =>
+			s.metric === 'route_page_age' ? combo(s.metric, s.path, s.method, s.type, s.count, 0.4 * HOUR, 5 * HOUR) : s
+		),
+	};
+	const warned = find(draw(ctx), (n) => n.attributes?.class === 'value warn');
+	assert.equal(warned, null, 'an evenly aged corpus has a p95 near its ceiling — that is not an alarm');
+});
+
+test('serve time reports the two populations separately, never pooled', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// 750 hits at 5ms and 260 origin serves at 900ms. Pooled that is 235ms — a number that moves
+	// with the hit rate rather than with how fast anything is.
+	assert.match(text, /Serve time · cache hit5msmedian · p95 40ms · origin-served 900ms/);
+	assert.doesNotMatch(text, /235ms/);
+});
+
+test('the per-route table and the staleness tile use the SAME statistic', async () => {
+	const ctx = await ready();
+	const product = rowFor(draw(ctx), '/product/');
+	// Median 3h on a 1h cadence. The p95 (9h) would have read 9.00x in a table sitting inches
+	// below a tile saying 2.50x, with nothing on screen to reconcile them.
+	assert.match(product.textContent, /3\.00×/);
+	assert.doesNotMatch(product.textContent, /9\.00×/);
+});
+
+test('a missing measurement is not a confident zero', () => {
+	// `null / 48h` is 0 in JavaScript, not NaN, so an absent p95 divided by a present cadence
+	// formats as "0.00×" — the most flattering possible reading of "we have no data". Same trap as
+	// `Number(null) === 0`, arriving through division instead of coercion.
+	assert.equal(ratioOf(null, 48 * HOUR), null);
+	assert.equal(ratioOf(undefined, 48 * HOUR), null);
+	assert.equal(ratioOf(3 * HOUR, null), null);
+	assert.equal(ratioOf(3 * HOUR, 0), null, 'a zero cadence is not a yardstick');
+	assert.equal(ratioOf(3 * HOUR, -1), null);
+	assert.equal(ratioOf(3 * HOUR, 6 * HOUR), 0.5);
+	assert.equal(ratioOf(0, 6 * HOUR), 0, 'a measured zero IS an answer');
+});
+
+test('a route whose tail could not be merged shows no tail, rather than 0.00×', async () => {
+	const ctx = await ready();
+	// A distribution the payload carried without a p95 — the shape `weighted` answers null for.
+	ctx.data.analytics = {
+		...ANALYTICS,
+		series: ANALYTICS.series.map((s) => {
+			if (s.metric !== 'route_page_age' || s.path !== '/product/') return s;
+			const { p95, p95s, ...rest } = s;
+			return rest;
+		}),
+	};
+	const product = rowFor(draw(ctx), '/product/');
+	const tail = find(product, (n) => String(n.attributes?.title ?? '').startsWith('p95 '));
+	assert.equal(tail.attributes.title, 'p95 —', 'an absent tail must read as absent');
+	// The median is unaffected, so the row still says what it does know.
+	assert.match(product.textContent, /3\.00×/);
+});
+
+test('the origin cost column is what a miss typically costs, not its tail', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// miss-reason fetches: 140 at 800ms, 100 at 120ms, 10 at 3000ms => median 616ms.
+	assert.match(text, /origin median/);
+	assert.match(text, /616ms/);
 });
 
 test('the KPI strip separates a coverage miss from every other non-hit', async () => {

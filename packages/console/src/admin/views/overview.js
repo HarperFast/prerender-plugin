@@ -204,7 +204,9 @@ function traffic(ctx) {
 	const total = sumCount(serves);
 	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
 	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
-	const ageP95 = weighted(pick(data, 'page_age'), 'p95');
+	// The median, matching Traffic: an evenly refreshed corpus puts its p95 within a whisker of the
+	// interval by construction, so a p95 tile here would read as "behind" on a healthy fleet.
+	const ageMedian = weighted(pick(data, 'page_age'), 'median');
 	const interval = data.intervals?.defaultRenderInterval;
 
 	const { keys, stacks } = stackBy(serves, 'method', data.bucketCount);
@@ -222,8 +224,8 @@ function traffic(ctx) {
 					warn: total > 0 && originServes > total / 2,
 				}),
 				stat('Cache-served', pct(cacheServes, total)),
-				stat('Page age p95', fmtMs(ageP95), 'cache serves only ≈', {
-					warn: Number.isFinite(ageP95) && Number.isFinite(interval) && ageP95 > interval,
+				stat('Page age', fmtMs(ageMedian), 'median, cache serves only ≈', {
+					warn: Number.isFinite(ageMedian) && Number.isFinite(interval) && ageMedian > interval,
 				}),
 			]),
 			total > 0 ? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k)) : null,

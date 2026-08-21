@@ -97,6 +97,18 @@ export function fmtRatio(v) {
 	return `${v.toFixed(2)}×`;
 }
 
+/**
+ * A ratio, or null when either side is missing — never a number that only looks like an answer.
+ *
+ * `null / 48h` is **0**, not NaN, so a missing measurement divided by a present yardstick formats
+ * as a confident "0.00×" — the most flattering possible reading of "we have no data". It is the
+ * same `Number(null) === 0` trap the plugin's own `numberOf()` exists for, arriving through
+ * division instead of coercion. Every ÷-cadence figure on the Traffic view goes through here so
+ * the guard cannot be forgotten at one call site out of four.
+ */
+export const ratioOf = (value, yardstick) =>
+	Number.isFinite(value) && Number.isFinite(yardstick) && yardstick > 0 ? value / yardstick : null;
+
 export function fmtCount(v) {
 	if (v === null || v === undefined || !Number.isFinite(v)) return '—';
 	if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
@@ -150,7 +162,25 @@ export function stackBy(combos, dim, bucketCount) {
 const sum = (a, b) => a + b;
 
 /**
- * Count-weighted merge of a distribution stat across combos (approximate by construction).
+ * Count-weighted merge of a distribution stat across combos.
+ *
+ * WHICH STATISTIC TO ASK FOR, because the three this payload carries answer different questions
+ * and the console gets one of them wrong per panel if nobody says this out loud:
+ *
+ *   `mean`   — the only one that merges EXACTLY. A count-weighted mean of means is the true mean
+ *              of the pooled population, across combos, buckets and nodes alike. It is also the
+ *              statistic that governs throughput: renders/hour is concurrency ÷ MEAN render time,
+ *              never ÷ p95. Use it for capacity and for anything that has to add up.
+ *   `median` — the typical experience, and the one to lead with when the question is "what does a
+ *              crawler normally get". Robust to a tail that a mean would swallow.
+ *   `p95`    — the tail, and ONLY the tail. It is the right alarm for a pathology that hides
+ *              behind a healthy middle (a cohort of cache hits at 13.6s while the median stayed
+ *              at 2.3ms), and the wrong headline for anything else — including any distribution
+ *              with a natural ceiling, where a perfectly healthy population already sits near it.
+ *
+ * A merged median or p95 is a count-weighted average of per-row percentiles, which is NOT the
+ * percentile of the pooled population — close in practice, wrong in principle, and always written
+ * "≈". Only the mean escapes that.
  *
  * `scaleOf` divides each combo's value by its OWN yardstick before the merge, which is what makes
  * a mixed population comparable: a 2h-cadence route and a 24h-cadence route both express their
