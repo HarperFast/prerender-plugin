@@ -197,12 +197,57 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 	// something records it, and the two can drift (they did — the prose and METRICS.md carried the
 	// new series while the machine-readable `values` array did not).
 	const metricsSource = readFileSync(fileURLToPath(new URL('../../plugin/src/metrics.js', import.meta.url)), 'utf8');
-	// `recordAnalytics(value, 'metric', 'series'` — only emitters whose series name is a literal.
-	// A dynamic one (`queueHealth(value, gauge)`, the `sitemap_${series}` template) names its
-	// series at the CALL site and is out of scope here; those are covered by their callers.
-	const emitted = [...metricsSource.matchAll(/recordAnalytics\([^,]+,\s*'([a-z_]+)',\s*'([a-z_0-9]+)'/g)].map(
-		([, metric, series]) => `${metric}.${series}`
-	);
+	// EVERY emit site is accounted for, not just the ones a regex happens to match. A scanner that
+	// silently skips what it cannot parse is worse than no scanner: it reports "all covered" while
+	// covering less each time someone writes an emitter in a new shape.
+	//
+	// So each `recordAnalytics(value, metric, series, …)` is classified by its THIRD slot. A quoted
+	// literal is a series name this console should be charting. Anything else is either a metric
+	// whose path slot carries a dimension rather than a series (`bot_serve`'s source, `page_age`'s
+	// bot) or a series named at the call site (`queueHealth(value, gauge)`, the
+	// `sitemap_${series}` templates) — legitimate, but it has to be a NAMED exception below, so a
+	// new one shows up here as a failing test rather than as silence.
+	const DYNAMIC_SERIES_SLOT = new Set([
+		'botRequest',
+		'botServe',
+		'routeServe',
+		'pageAge',
+		'routePageAge',
+		'pageAgeNegative',
+		'renderTime',
+		'renderOutcome',
+		'originFetch',
+		'serveError',
+		'unrouted',
+		'sitemapRun',
+		'reconcile',
+		'queueHealth',
+		'demandLadder',
+		'invalidationError',
+		'invalidationReenqueue',
+	]);
+
+	const emitted = [];
+	const calls = [...metricsSource.matchAll(/server\.recordAnalytics\(\s*[^,]+,\s*(['"])([a-z_]+)\1,\s*([^,]+),/g)];
+	assert.ok(calls.length > 5, 'expected to find the emit sites at all — has metrics.js been restructured?');
+
+	for (const call of calls) {
+		const [, , metric, third] = call;
+		const literal = third.match(/^(['"])([a-z_0-9]+)\1$/);
+		if (literal) {
+			emitted.push(`${metric}.${literal[2]}`);
+			continue;
+		}
+		// Name the emitter this call belongs to: the nearest `name: (` above it.
+		const preceding = metricsSource.slice(0, call.index);
+		const owner = [...preceding.matchAll(/\n\t([a-zA-Z]+): \(/g)].pop()?.[1];
+		assert.ok(
+			DYNAMIC_SERIES_SLOT.has(owner),
+			`metrics.${owner} names its series dynamically (\`${third.trim()}\`). If that slot is a dimension ` +
+				'rather than a series, add it to DYNAMIC_SERIES_SLOT; if it is a series, this test cannot see ' +
+				'it and the console needs checking by hand'
+		);
+	}
 	assert.ok(emitted.length > 0, 'expected to find literal metric emit sites');
 
 	// A series may legitimately have no panel — but it has to be a decision, written down here,
