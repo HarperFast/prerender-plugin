@@ -1262,6 +1262,63 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'about could not be detected.',
 			{ min: 1, scope: 'restart' }
 		),
+		priority: group(
+			'WHICH of the due rows the next leases go to. Ordering only — this changes no cadence, ' +
+				'creates no work and cannot change total render volume, because it reorders rows that are ' +
+				'ALREADY due inside a single claim pass.\n\n' +
+				'The queue seeks from the claim floor along one index (`nextRenderTime`) and that stays ' +
+				'true. What changes is the comparison used to pick from the rows it drained: instead of ' +
+				'absolute due time, a row is ranked by how overdue it is RELATIVE TO ITS OWN cadence — ' +
+				'`(now - dueAt) / renderInterval` — with sitemap-sourced rows multiplied by ' +
+				'`sitemapBoost`. Absolute due time cannot express this: a 48h PDP due 3h ago outranks a ' +
+				'1h homepage due 2h ago even though the homepage is 2 cadences late and the PDP is 6% ' +
+				'late, so under any backlog the short-cadence routes sit behind a wall of long-cadence ' +
+				'ones and the only symptom is a served age of `interval + swrTtl` that is many multiples ' +
+				'of a fast route’s interval and a fraction of a slow one’s.\n\n' +
+				'IT REORDERS A WINDOW, NOT THE BACKLOG. The pass drains ' +
+				'`min(grantLimit + in-flight + grantLimit, queue.claimScanCap)` rows, so it chooses ~25 ' +
+				'out of a few hundred, not out of the whole due set. It is a latency fix, not a capacity ' +
+				'fix: if a route is short of capacity outright, `renderInterval` and fleet size are the ' +
+				'levers. Raise `queue.claimScanCap` to widen the pool it chooses from.',
+			{
+				enabled: option(
+					true,
+					'Kill switch. `false` grants in index order (absolute due time), exactly as before ' +
+						'v0.50.0 — the claim pass then walks and stops at `grantLimit` as it used to, so this ' +
+						'is a true revert of the behaviour and not a neutral weighting of it.'
+				),
+				sitemapBoost: option(
+					2,
+					'How much a sitemap-sourced row outranks a discovered one at the same overdue ratio. ' +
+						'`1` disables the preference and leaves ordering on overdue ratio alone.\n\n' +
+						'A MULTIPLIER, not a tier, so it cannot starve discovered URLs: an unserved row’s ' +
+						'overdue ratio grows without bound while the boost stays constant, so a discovered row ' +
+						'wins as soon as its ratio passes `sitemapBoost x` the highest sitemap ratio in the ' +
+						'window. With sitemap pages held ~1.2 cadences late, a discovered page is therefore ' +
+						'served within ~`2 x 1.2` cadences of its own interval at the default. Raising this ' +
+						'raises that bound proportionally.',
+					{ min: 1 }
+				),
+				candidatePool: option(
+					8,
+					'How many times `limit` grantable rows a claim pass tries to choose from, as a multiple ' +
+						'of the batch it is granting.\n\n' +
+						'WITHOUT THIS THE ORDERING HAS ALMOST NOTHING TO ORDER. The scan window exists to read ' +
+						'PAST the in-flight lease pile — `limit` + pile + `limit` — so beyond the pile it holds ' +
+						'about as many grantable rows as the pass is about to hand out, and "pick the best 25" ' +
+						'degenerates to "take the 25 that were there". This widens only that last term, so the ' +
+						'pass reads `limit x candidatePool` rows past the pile and grants the most overdue ' +
+						'`limit` of them.\n\n' +
+						'COST: index-ordered reads inside a window the seek has already landed in, and still ' +
+						'hard-capped by `queue.claimScanCap` — which is the ceiling to watch, because the pile ' +
+						'is counted first, so a large pile can consume the cap and leave the pool no room. If ' +
+						'the truncation warning starts naming the cap, raise `claimScanCap` before raising ' +
+						'this. `1` keeps the historical window (and makes the ordering close to a no-op); `0` ' +
+						'is treated as `1`.',
+					{ min: 0 }
+				),
+			}
+		),
 		claimScanCap: option(
 			1000,
 			'Ceiling on schedule rows read per claim pass. A leased row keeps its overdue position in the ' +

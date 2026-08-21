@@ -377,15 +377,23 @@ export const METRICS = Object.freeze({
 					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
 					'alertable without polling the REST surface. ' +
 					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
+					'claim_lateness_pct = how overdue each GRANTED job was as a percentage of ITS OWN render ' +
+					'interval (100 = one cadence late), split sitemap/discovered in the method slot — the ' +
+					'normalized companion to route_page_age, and the measure of whether queue.priority is ' +
+					'keeping short-cadence routes on time. A p95 that sits well above 100 for every route at ' +
+					'once is a capacity shortfall, not an ordering problem, and no ordering fixes it. Emitted ' +
+					'only while queue.priority.enabled is on, because the ratio is a by-product of the ' +
+					'ordering pass. ' +
 					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
 					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
 					'something is CREATING gaps, and the reconcile log line names the URLs.',
 			},
 			method: {
-				name: 'result (claim_scan_ms only)',
-				values: ['granted', 'empty', 'capped'],
+				name: 'result (claim_scan_ms) | source (claim_lateness_pct)',
+				values: ['granted', 'empty', 'capped', 'sitemap', 'discovered'],
 				description:
-					'Only claim_scan_ms uses this slot: granted = jobs handed out, empty = nothing due, capped = the ' +
+					'claim_lateness_pct uses this slot for sitemap | discovered. On claim_scan_ms: ' +
+					'granted = jobs handed out, empty = nothing due, capped = the ' +
 					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
 					'window). Every other series emits null here.',
 			},
@@ -640,6 +648,20 @@ export const metrics = Object.freeze({
 
 	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
 	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
+
+	/**
+	 * How overdue one GRANTED job was, in hundredths of its own render interval, split by whether the
+	 * URL is sitemap-listed. 100 = exactly one cadence late.
+	 *
+	 * This is the outcome measure for `queue.priority`, and it is normalized on purpose: `page_age`
+	 * and `route_page_age` are absolute, so a 48h route and a 1h route are not comparable in them and
+	 * a regression on the fast route hides inside the slow route's numbers. Here every route shares
+	 * one scale — its own cadence — so one p95 covers the whole corpus, and "the fleet cannot keep up
+	 * with what has been asked of it" is a level (well above 100) rather than something to be
+	 * inferred by dividing two dashboards.
+	 */
+	claimPriority: (ratioPct, source) =>
+		server.recordAnalytics(ratioPct, 'queue_health', 'claim_lateness_pct', source, null),
 
 	/** One origin proxy on the serve path: time to response headers, status, and why. */
 	originFetch: (durationMs, statusCode, reason) =>

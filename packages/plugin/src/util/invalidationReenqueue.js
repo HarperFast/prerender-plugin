@@ -316,7 +316,15 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
 		// schedule row we just read: `put` REPLACES the record, and the target is the field's source of
 		// truth, so this self-corrects a row whose flag went stale (same choice as the reschedule path).
 		await writeSchedules(
-			eligible.map((row) => ({ cacheKey: row.cacheKey, nextRenderTime: dueAt, fromSitemap: !!target.sitemapUrl }))
+			eligible.map((row) => ({
+				cacheKey: row.cacheKey,
+				nextRenderTime: dueAt,
+				fromSitemap: !!target.sitemapUrl,
+				// Already resolved above for the eligibility arithmetic, so recording it costs nothing
+				// and keeps an accelerated row's priority cadence rather than clearing it — `put`
+				// replaces the record, and a cleared field falls back to the route's interval.
+				renderInterval: interval,
+			}))
 		);
 	} catch (e) {
 		logger.error(e, `[prerender] could not accelerate ${cacheKey} after an invalidation`);

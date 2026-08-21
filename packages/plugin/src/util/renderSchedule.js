@@ -128,6 +128,7 @@ import { config } from '../config.js';
 import { getSab } from './coordination.js';
 import { CacheKey } from './cacheKey.js';
 import { resolveRenderInterval } from './routeClass.js';
+import { orderByPriority } from './renderPriority.js';
 import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 
@@ -217,6 +218,20 @@ const lowerFloorFor = (nextRenderTime) => {
 };
 
 /**
+ * The cadence to store on a row, or `undefined` to store nothing.
+ *
+ * Nonsense is dropped rather than stored or thrown on: this field exists only to make the claim
+ * pass's priority ordering accurate, so a bad value must degrade that row to the route-resolved
+ * fallback and must never be able to fail a schedule write that is otherwise correct. `Number`
+ * first because a `Long` column round-trips as a BigInt, which `Number.isFinite` rejects outright.
+ */
+const intervalToStore = (renderInterval) => {
+	if (renderInterval === undefined || renderInterval === null) return undefined;
+	const ms = Number(renderInterval);
+	return Number.isFinite(ms) && ms > 0 ? Math.round(ms) : undefined;
+};
+
+/**
  * Write one schedule row and lower the floor to match.
  *
  * `fromSitemap` is REQUIRED, not optional: `put` REPLACES the record, so omitting it clears the
@@ -240,11 +255,11 @@ const lowerFloorFor = (nextRenderTime) => {
  * in 10.7 ms, mean 0.021 ms, against residency pinned to a node that does not exist). v0.15.0
  * assumed the read/write symmetry and wrapped these in a deadline that could never fire.
  */
-export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = {}) => {
+export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, renderInterval } = {}) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 	}
-	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
+	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap, renderInterval: intervalToStore(renderInterval) });
 	lowerFloorFor(nextRenderTime);
 };
 
@@ -260,11 +275,15 @@ export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = 
  */
 export const writeSchedules = async (rows = []) => {
 	let lowest = Number.POSITIVE_INFINITY;
-	for (const { cacheKey, nextRenderTime, fromSitemap } of rows) {
+	for (const { cacheKey, nextRenderTime, fromSitemap, renderInterval } of rows) {
 		if (fromSitemap === undefined) {
 			throw new Error(`writeSchedules(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 		}
-		await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
+		await scheduleTable().put(cacheKey, {
+			nextRenderTime,
+			fromSitemap,
+			renderInterval: intervalToStore(renderInterval),
+		});
 		// Same trap as `lowerFloorFor`, and WORSE here: with a bare `Number` a single null row anywhere
 		// in the batch becomes 0, wins the minimum, and unbounds the floor for the whole fan-out.
 		const at = numberOf(nextRenderTime);
@@ -296,6 +315,12 @@ export const getScheduleRow = (cacheKey, select) =>
  *
  * `floorRule` exists solely so the regression test can drive the SAME trace through the rejected
  * `'last-granted'` rule and assert that it strands rows. Production never sets it.
+ *
+ * `prioritize(candidates, nowMs)` reorders the grantable due rows in place, and is the ONLY thing
+ * that decides which of them get the leases. Omitted (the default) the pass walks and grants in
+ * index order and stops at `grantLimit`, which is byte-for-byte the behaviour that predates
+ * `util/renderPriority.js` — so every existing trace through this function still describes it, and
+ * the config kill switch is expressed by simply not passing an orderer.
  */
 export const runClaimPass = async ({
 	searchSchedules,
@@ -304,18 +329,28 @@ export const runClaimPass = async ({
 	grantLimit = 20,
 	guardMinutes: guard = 5,
 	scanCap = 1000,
+	candidatePool = 0,
 	leaseTimeMs,
 	floorEnabled = true,
 	floorRule = 'first-due-observed',
+	prioritize = null,
 } = {}) => {
 	const nowMinute = minuteOf(nowMs);
 	const floorFrom = floorEnabled ? leases.readFloorMinute(nowMinute, guard) : 0;
 
 	// A leased row keeps its overdue position in the index now, so the pass must read PAST the
 	// in-flight pile to find grantable rows: grantLimit to cover the pile's own head, the pile
-	// itself, and grantLimit to actually grant. Capped, because during a broad failure event the
-	// pile is the entire fleet's worth of jobs and this must not become an unbounded read.
-	const scanLimit = Math.min(grantLimit + leases.occupancy() + grantLimit, scanCap);
+	// itself, and enough beyond it to actually grant. Capped, because during a broad failure event
+	// the pile is the entire fleet's worth of jobs and this must not become an unbounded read.
+	//
+	// `candidatePool` is what that last term becomes when the pass is CHOOSING rather than just
+	// taking. Ordering by priority is worth nothing if the window holds barely more rows than the
+	// leases it is handing out — and the pre-existing window is exactly that shape: `grantLimit` past
+	// the pile, so ~25 grantable rows to pick 25 from. Widening it is the difference between "the
+	// best of what happened to be at the head of the index" and an actual choice, and the extra rows
+	// are index-ordered reads inside a window the seek already landed in. Zero (the default) keeps
+	// the historical `2 x grantLimit + pile`.
+	const scanLimit = Math.min(grantLimit + leases.occupancy() + Math.max(grantLimit, candidatePool), scanCap);
 
 	// DRAIN THE WHOLE ITERABLE FIRST. No write, no Atomics store and no lease grant while the
 	// cursor is open: Harper's long-transaction monitor ABORTS (and poisons) a transaction that
@@ -344,6 +379,16 @@ export const runClaimPass = async ({
 	let skippedLeased = 0;
 	let nonFinite = 0;
 
+	// PHASE 1 — DERIVE THE FLOOR AND COLLECT THE GRANTABLE ROWS, IN INDEX ORDER, ALWAYS.
+	//
+	// The floor rule is defined over the order the SCAN delivered, and it stays that way whatever
+	// `prioritize` does downstream: the floor is a VALUE — the due minute of the first due row this
+	// pass observed — and the first row in index order is by construction the minimum due minute in
+	// the window. So reordering which rows get the leases cannot move the floor, and phase 2 is free
+	// to grant in any order it likes. Deriving the floor from a PRIORITY-ordered walk instead would
+	// hand it the minute of the most-overdue-by-ratio row, which is not the minimum, and every row
+	// below it would be stranded — the terminal render gap this module exists to prevent.
+	const candidates = [];
 	for (const row of rows) {
 		// `numberOf` because `Number(null)` is 0, which reads as "due since 1970" and would make an
 		// absent due time the oldest due row in the corpus — pinning the floor at the epoch and naming
@@ -372,10 +417,33 @@ export const runClaimPass = async ({
 			skippedLeased++;
 			continue;
 		}
+		// WITHOUT PRIORITY, STOP AT `grantLimit` EXACTLY WHERE THE SINGLE-PASS LOOP USED TO — after the
+		// leased check, before the grant — so an unprioritized pass walks the identical prefix and
+		// produces the identical result. WITH priority the walk has to continue: the whole point is to
+		// choose `grantLimit` rows out of the window, and stopping at the first `grantLimit` grantable
+		// ones would be choosing out of nothing.
+		if (!prioritize && candidates.length >= grantLimit) break;
+		// `nextRenderTime: at`, not `row.nextRenderTime`: a `Long` column can surface the due time as a
+		// BigInt, and mixing one into the scoring arithmetic throws on the first `-` against a Number.
+		candidates.push({
+			cacheKey: row.cacheKey,
+			nextRenderTime: at,
+			dueMinute,
+			fromSitemap: !!row.fromSitemap,
+			// `numberOf` for the BigInt a `Long` column round-trips as; an absent or unusable value
+			// stays absent, and `orderByPriority` resolves the route interval for it instead.
+			renderInterval: numberOf(row.renderInterval),
+		});
+	}
+
+	// PHASE 2 — GRANT. Priority ordering, when enabled, applies here and only here.
+	if (prioritize && candidates.length > 1) prioritize(candidates, nowMs);
+
+	for (const candidate of candidates) {
 		if (jobs.length >= grantLimit) break;
 
 		const expiresAtMs = nowMs + leaseTimeMs;
-		if (!leases.grant(row.cacheKey, { dueMinute, leaseExpiryMs: expiresAtMs })) {
+		if (!leases.grant(candidate.cacheKey, { dueMinute: candidate.dueMinute, leaseExpiryMs: expiresAtMs })) {
 			// No slot, no job. A granted-but-unrecorded job is a double render AND an untracked
 			// hold on the floor; refusing to hand it out is the only safe answer.
 			//
@@ -385,8 +453,16 @@ export const runClaimPass = async ({
 			leaseRefused = true;
 			break;
 		}
-		lastGrantedMinute = dueMinute;
-		jobs.push({ cacheKey: row.cacheKey, dueMinute, expiresAtMs, fromSitemap: !!row.fromSitemap });
+		lastGrantedMinute = candidate.dueMinute;
+		jobs.push({
+			cacheKey: candidate.cacheKey,
+			dueMinute: candidate.dueMinute,
+			expiresAtMs,
+			fromSitemap: candidate.fromSitemap,
+			// Undefined when the pass did not order (the kill switch), which is what keeps the metric
+			// silent rather than reporting a zero it never computed.
+			priority: candidate.priority,
+		});
 	}
 
 	const observed = floorRule === 'last-granted' ? lastGrantedMinute : firstDueMinute;
@@ -533,6 +609,41 @@ const maybeUnpinFloor = async (pass) => {
 };
 
 /** `runClaimPass` bound to the live table and config. Called by `RenderQueue.claim`. */
+/**
+ * The in-place orderer `runClaimPass` grants from, or `null` for index order.
+ *
+ * Built per pass rather than once, because `queue.priority` is live-reloadable and a captured
+ * closure would keep serving the boot-time boost after an operator changed it.
+ *
+ * THE MEMO IS PER PASS, DELIBERATELY, and it is not a cache. `cacheKeysOf` fans one URL out to one
+ * row per device type, so both variants of a page sit in the same window and share one route
+ * resolution — that is the whole win, and it is exactly the locality a per-pass map captures. A
+ * process-lifetime cache would instead accumulate an entry per URL in a 814k-target corpus to serve
+ * a window of ~550, and it would have to be invalidated on every config apply (the route list is
+ * live-reloadable) or it would answer with the previous cadence indefinitely.
+ */
+const priorityOrderer = () => {
+	const { enabled, sitemapBoost } = config.queue.priority;
+	if (!enabled) return null;
+
+	return (candidates, nowMs) => {
+		const memo = new Map();
+		const intervalFor = (cacheKey) => {
+			const url = CacheKey.extractUrl(cacheKey);
+			let interval = memo.get(url);
+			if (interval === undefined) {
+				// No stored interval to pass: `claim` takes no Target read, which is the point of
+				// denormalizing the cadence onto the row in the first place. This is the fallback for a
+				// row that has none — see `intervalOf` in util/renderPriority.js.
+				interval = resolveRenderInterval(url, undefined);
+				memo.set(url, interval);
+			}
+			return interval;
+		};
+		orderByPriority(candidates, intervalFor, { nowMs, sitemapBoost });
+	};
+};
+
 export const claimSchedules = async ({ grantLimit } = {}) => {
 	const pass = await runClaimPass({
 		searchSchedules: ({ floorMinute, limit }) =>
@@ -559,7 +670,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 					sort: { attribute: 'nextRenderTime' },
 					// ARRAY select. A string `select` returns the bare scalar rather than a record —
 					// the trap that has caused two silent bugs in this package already.
-					select: ['cacheKey', 'nextRenderTime', 'fromSitemap'],
+					select: ['cacheKey', 'nextRenderTime', 'fromSitemap', 'renderInterval'],
 					limit,
 				},
 				{ replicateFrom: false }
@@ -569,8 +680,14 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 		grantLimit,
 		guardMinutes: guardMinutes(),
 		scanCap: Math.max(1, config.queue.claimScanCap | 0),
+		// Only when the pass is actually ordering: with priority off there is nothing to choose
+		// between, so the wider read would be pure cost.
+		candidatePool: config.queue.priority.enabled
+			? Math.max(0, grantLimit * (config.queue.priority.candidatePool | 0))
+			: 0,
 		leaseTimeMs: config.queue.jobLeaseTime,
 		floorEnabled: config.queue.claimFloor.enabled,
+		prioritize: priorityOrderer(),
 	});
 
 	// Whatever this pass saw, including `null` for "nothing is due": a stale key here would name an

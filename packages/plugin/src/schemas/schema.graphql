@@ -114,6 +114,19 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# cross-database read just to flag sitemap-sourced jobs. Refreshed on every
 	# reschedule (job result), so it self-corrects when a URL leaves its sitemap.
 	fromSitemap: Boolean
+	# The EFFECTIVE cadence (ms) this due time was scheduled at — route interval, stored
+	# interval and demand-ladder rung already resolved. Denormalized for the same reason as
+	# `fromSitemap`: `claim` orders the due set by how overdue each row is RELATIVE TO ITS OWN
+	# cadence (util/renderPriority.js), and reading it per row would be a cross-database Target
+	# read on the hot claim path for every candidate in the window.
+	#
+	# OPTIONAL, unlike `fromSitemap`, and the asymmetry is deliberate. `put` replaces the record,
+	# so a writer that omits either field clears it — but omitting `fromSitemap` makes the
+	# renderer stop serializing a non-indexable sitemap page (a silent stop-caching bug), whereas
+	# omitting this one only makes the claim pass fall back to the ROUTE-resolved interval for
+	# that row's priority. That degrades ordering until the row's next render re-stamps it, and
+	# degrades nothing else — so it is an optional argument rather than a required one.
+	renderInterval: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {

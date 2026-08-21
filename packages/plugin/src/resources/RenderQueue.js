@@ -384,7 +384,16 @@ export class RenderQueue extends Resource {
 				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
 				// lowering on every completed render would rewind the floor to the current minute
 				// continuously and the whole 14× seek win would evaporate.
-				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+				// `interval` — the DEMAND-RESOLVED cadence, not `base` — is what the claim pass scores this
+				// row's lateness against (util/renderPriority.js). This is the only writer that knows the
+				// ladder's answer, so it is the one that has to record it: `resolveRenderInterval` at claim
+				// time sees the route's ceiling and would rank a promoted catalog page as if it were still
+				// on 24h, which is the opposite of what promoting it was for.
+				await writeSchedule(cacheKey, {
+					nextRenderTime,
+					fromSitemap: !!renderTarget.sitemapUrl,
+					renderInterval: interval,
+				});
 
 				// Persist the rung ONLY on an actual move. 'held' must not write even when the
 				// stored field is absent — absence already resolves to the base ceiling, so writing
@@ -724,7 +733,12 @@ export class RenderQueue extends Resource {
 			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+		// THE CADENCE, NOT THE BACKOFF. `wait` is how long this failing key is being pushed out for;
+		// `interval` is still what it is supposed to render at, and it is the cadence the claim pass
+		// measures lateness against. Recording `wait` instead would give a backed-off row an interval
+		// several times its real one, hence a near-zero overdue ratio, hence a permanent seat at the
+		// back of the queue — a deprioritization the backoff already applied once, compounding.
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, renderInterval: interval });
 		return 'slow';
 	}
 
@@ -754,6 +768,7 @@ export class RenderQueue extends Resource {
 		await writeSchedule(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
+			renderInterval: interval,
 		});
 	}
 
@@ -813,6 +828,13 @@ export class RenderQueue extends Resource {
 			// the repair to `render.reconcile` (which restores the row on the new owner) until this
 			// number proves it happens.
 			if (getResidencyByUrl(url) !== server.hostname) notOwnedHere++;
+
+			// One emit per granted job — ~25 per pass on a path that runs a fraction of a time per
+			// second, so it stays off any hot loop. `undefined` when the pass granted in index order and
+			// therefore never scored anything; reporting a 0 there would read as "everything is on time".
+			if (granted.priority !== undefined) {
+				metrics.claimPriority(Math.round(granted.priority * 100), granted.fromSitemap ? 'sitemap' : 'discovered');
+			}
 
 			jobs.push({
 				id: granted.cacheKey,

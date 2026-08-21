@@ -108,6 +108,12 @@ export class Target extends TargetTable {
 						? nextRenderTime
 						: getInitialRenderTime(cacheKey, interval),
 				fromSitemap,
+				// The cadence the claim pass ranks this row's lateness against. Route > stored > default
+				// here, which is one term better than the fallback `claim` can compute on its own (it has
+				// no Target read, so it never sees a stored sitemap `changefreq` interval). The demand
+				// ladder's rung is not known yet — a target has none until it has rendered — so the first
+				// cycle scores at the ceiling and the post-render write corrects it.
+				renderInterval: interval,
 			}))
 		);
 

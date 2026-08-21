@@ -129,6 +129,10 @@ rest: true # required for the @export-ed table REST endpoints
     statusSyncInterval: 60000 # 1m  — pause convergence, status broadcast, claim-floor reset
     maxLeases: 4096 # lease slots in the node-local shared buffer (restart-scoped)
     claimScanCap: 1000 # ceiling on schedule rows read per claim pass
+    priority: # WHICH of the due rows the next leases go to (ordering only, no cadence change)
+      enabled: true # false = grant in index order (absolute due time), as before v0.50.0
+      sitemapBoost: 2 # how much a sitemap row outranks a discovered one at equal overdue ratio
+      candidatePool: 8 # multiples of `limit` to choose from; 1 keeps the pre-0.50.0 window
     claimFloor: # the lower bound the claim scan seeks from (see "The claim floor")
       enabled: true # false = seek the absolute index minimum, as before v0.34.0
       guard: 300000 # 5m — the floor is always held at least this far behind now
@@ -517,6 +521,63 @@ The floor advances to **the first due row a pass observed**, which is the same t
 
 Set `queue.claimFloor.enabled: false` to roll the floor back to the old full seek. It changes nothing
 else; leases stay where they are either way.
+
+#### Which of the due rows goes first
+
+The floor decides _where the scan starts_. `queue.priority` decides which of the rows it drained get
+the leases — and only that. It changes no cadence, creates no work, and cannot move total render
+volume, because every row it reorders is already due.
+
+Absolute due time cannot express this, which is the whole reason the option exists:
+
+| page | cadence | due    | overdue, in its own cadence |
+| ---- | ------- | ------ | --------------------------- |
+| home | 1h      | 2h ago | **2.0 intervals**           |
+| PDP  | 48h     | 3h ago | 0.06 intervals              |
+
+Index order hands the lease to the PDP, because 3h > 2h. Nothing looks wrong while it does: the floor
+advances, the scan stays fast, no row is wedged. The only symptom is the one the served-age numbers
+already show — worst-case age is `interval + swrTtl`, which is several multiples of a fast route's
+cadence and a fraction of a slow one's — and it is easy to spend that incident tuning
+`renderInterval`.
+
+So a due row is ranked by `(now − dueAt) / renderInterval`, i.e. how late it is **relative to its own
+cadence**, with sitemap-sourced rows multiplied by `queue.priority.sitemapBoost`. Three details are
+load-bearing:
+
+- **Lateness, not age.** `dueAt − interval` is not when the page last rendered: `Target.suppress`
+  schedules `render.suppression.recheckInterval` (7 days), `backoffWait` schedules up to
+  `maxBackoff`, and the unpin hatch pushes by `render.defaultInterval`. An age-based ratio would put
+  a 7-day suppression recheck on a 48h route at the _head_ of the queue reading as 3.5 cadences
+  stale. Lateness is zero the moment any row comes due, whatever gap preceded it, so those rows enter
+  at the back and climb like anything else.
+- **The cadence is read off the row.** `renderInterval` is denormalized onto `RenderSchedule` for the
+  same reason `fromSitemap` is: `claim` takes no `RenderTarget` read. It matters because the
+  effective cadence includes the demand ladder's rung, and resolving the route at claim time would
+  rank a promoted catalog page at its 24h _ceiling_ — the opposite of what promoting it was for. The
+  field is optional; a row written by a path that does not have it (a reconcile repair, an
+  invalidation re-enqueue, a render-now one-off) falls back to the route-resolved interval until that
+  URL's next completed render re-stamps it.
+- **The boost is a multiplier, never a lane.** An unserved row's ratio grows without bound while the
+  boost stays constant, so a discovered URL wins as soon as its ratio passes `sitemapBoost ×` the
+  highest sitemap ratio in the window. With sitemap pages held ~1.2 cadences late that is ~2.4
+  cadences at the default — bounded, and it scales with the boost.
+
+`queue.priority.candidatePool` is the part to actually think about. The scan window exists to read
+_past_ the in-flight lease pile (`limit` + pile + `limit`), so beyond the pile it holds about as many
+grantable rows as the pass is about to hand out — "pick the best 25" out of 25. `candidatePool`
+widens only that last term, to `limit × candidatePool` rows past the pile, still hard-capped by
+`queue.claimScanCap`. The pile is counted first, so a large pile can consume the cap and leave the
+pool no room: if the truncation warning starts naming the cap, raise `claimScanCap` before raising
+`candidatePool`.
+
+Watch `queue_health` `claim_lateness_pct` — how overdue each _granted_ job was as a percentage of its
+own interval, split sitemap/discovered. It is the normalized companion to `route_page_age`: one p95
+covers every route, so a p95 well above 100 across the board reads as a capacity shortfall rather
+than something to infer by dividing two dashboards. No ordering fixes that one.
+
+`queue.priority.enabled: false` grants in index order and walks the old, narrower window — a revert
+of the behaviour, not a neutral weighting of it.
 
 ## HTTP & resource API
 
