@@ -104,8 +104,22 @@ function supply(ctx) {
 			// One-in-ten failing is past tail noise for any healthy corpus.
 			warn: total > 0 && failedLike > total / 10,
 		}),
-		stat('Render p95', fmtMs(weighted(times, 'p95')), 'browser-reported duration ≈'),
-		stat('Claim scan p95', fmtMs(weighted(claims, 'p95')), 'the leading indicator — watch the trend ≈'),
+		// THE MEAN, because this tile is the capacity number and capacity is governed by the mean:
+		// renders/hour is concurrency ÷ MEAN render time (a queue's throughput follows the average
+		// service time, not its tail). Sizing off the p95 understates the fleet by whatever the tail
+		// is worth — measured here, 16.0s against a mean of 11.0s, a third of the fleet's capacity
+		// argued away. The p95 rides along because a widening gap between the two is the tell that
+		// some renders are pathological rather than the whole fleet being slower.
+		stat(
+			'Render time',
+			fmtMs(weighted(times, 'mean')),
+			`mean — capacity is concurrency ÷ this · p95 ${fmtMs(weighted(times, 'p95'))}`
+		),
+		stat(
+			'Claim scan p95',
+			fmtMs(weighted(claims, 'p95')),
+			`the leading indicator — watch the trend ≈ · median ${fmtMs(weighted(claims, 'median'))}`
+		),
 	]);
 
 	// Outcomes stacked over time: the shape of "renders are failing" as it develops.
@@ -132,8 +146,10 @@ function supply(ctx) {
 				? lineChart(data, timeSeries)
 				: emptyNote('render time / claim_scan_ms', data),
 			el('p', { cls: 'muted chart-note' }, [
-				'Render time is fleet capacity (renders/hour = concurrency ÷ time). The claim scan degrades ',
-				'BEFORE any backlog shows — measured 17× once — so its trend matters more than its level.',
+				'These are TAILS, not the capacity figure: renders/hour is concurrency ÷ the MEAN render time, ',
+				'which is the tile above — a p95 line answers "are some renders pathological", never "how many ',
+				'can the fleet do". The claim scan degrades BEFORE any backlog shows — measured 17× once — so ',
+				'its trend matters more than its level.',
 			]),
 		],
 	});

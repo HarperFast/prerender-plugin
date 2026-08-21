@@ -361,11 +361,24 @@ function kpis(data, scope) {
 	const coverage = coverageSplit({ serves, costs: originCostByReason(data), filter });
 	const arrived = sumCount(requests);
 
-	const durations = pick(data, 'duration');
-	const p95 = weighted(durations, 'p95');
+	// SERVE TIME IS TWO POPULATIONS, and one number over both is a number about the hit rate. A
+	// cache hit is single-digit milliseconds and an origin proxy is hundreds; pooling them produces
+	// a figure that improves when offload improves and says nothing about how fast either path is.
+	// Measured on this deployment: hits median 1.8ms, origin-proxied median 371ms, pooled 171ms —
+	// where the pooled number moves with the 54/46 split, not with speed.
+	const hitDurations = pick(data, 'duration', (s) => s.type === 'cache-hit');
+	const otherDurations = pick(data, 'duration', (s) => s.type !== 'cache-hit');
+	const hitMedian = weighted(hitDurations, 'median');
+	const hitP95 = weighted(hitDurations, 'p95');
+	const otherMedian = weighted(otherDurations, 'median');
 
 	const { combos, scaleOf, basis, fallback, normalizable } = stalenessBasis(data, scope);
-	const ageP95 = weighted(combos, 'p95');
+	const ageMedian = weighted(combos, 'median');
+	// The MEDIAN leads here. A page's age walks 0 → its interval and is re-rendered, so an evenly
+	// refreshed corpus sits at 0.5x by construction and its p95 already sits at ~0.95x — which
+	// leaves the p95 no headroom at all before it reads as "behind" on a fleet that is not.
+	// Above 1.0 the median means something unambiguous instead: most cache serves were past due.
+	const stalenessMedian = normalizable ? weighted(combos, 'median', scaleOf) : null;
 	const stalenessP95 = normalizable ? weighted(combos, 'p95', scaleOf) : null;
 
 	// `bot_serve` is emitted once per request that RESOLVED to a resource, `bot_request` once per
@@ -409,16 +422,24 @@ function kpis(data, scope) {
 			// A miss the origin CAN serve is the corpus gap; the netted figure is the one worth a flag.
 			{ warn: total > 0 && coverage.net > total / 3 }
 		),
-		stat('Serve p95', fmtMs(p95), filter ? 'server-side · all bots' : 'server-side, bot requests'),
 		stat(
-			normalizable ? 'Staleness p95' : 'Page age p95',
-			normalizable ? fmtRatio(stalenessP95) : fmtMs(ageP95),
-			// Both numbers, because the ratio is the verdict and the duration is what an operator
-			// quotes: "1.4x" says the fleet is behind, "4h 12m" is what that means for the crawler.
+			'Serve time · cache hit',
+			fmtMs(hitMedian),
+			`median · p95 ${fmtMs(hitP95)} · origin-served ${fmtMs(otherMedian)}${filter ? ' · all bots' : ''}`
+		),
+		stat(
+			normalizable ? 'Staleness' : 'Page age',
+			normalizable ? fmtRatio(stalenessMedian) : fmtMs(ageMedian),
+			// Three numbers, because each answers a different question: the ratio is the verdict, the
+			// p95 is the tail, and the duration is what an operator quotes to someone else.
 			normalizable
-				? `${fmtMs(ageP95)} against ${basis === 'route' ? 'each route’s cadence' : fmtMs(fallback)}`
-				: 'no render interval in the payload',
-			{ warn: Number.isFinite(stalenessP95) && stalenessP95 > 1 }
+				? `median · p95 ${fmtRatio(stalenessP95)} · ${fmtMs(ageMedian)} against ${
+						basis === 'route' ? 'each route’s cadence' : fmtMs(fallback)
+					}`
+				: 'median · no render interval in the payload',
+			// On the MEDIAN, not the p95: half the serves past their own cadence is unambiguous,
+			// where a p95 over 1.0 is where an evenly aged corpus lives anyway.
+			{ warn: Number.isFinite(stalenessMedian) && stalenessMedian > 1 }
 		),
 	]);
 }
@@ -453,10 +474,13 @@ function freshness(data, { serves, filter }) {
  */
 function staleness(ctx, data, scope) {
 	const { combos, scaleOf, basis, fallback, normalizable } = stalenessBasis(data, scope);
+	const { serves } = scope;
 	// A payload with no interval in it (an older plugin) cannot express a ratio at all. Fall back
 	// rather than draw an empty chart, and say why below.
 	const mode = normalizable && ctx.data.ageMode === 'ratio' ? 'ratio' : 'ms';
 
+	const ratioP95 = normalizable ? weighted(combos, 'p95', scaleOf) : null;
+	const ratioMedian = normalizable ? weighted(combos, 'median', scaleOf) : null;
 	const points = (stat) => weightedBuckets(combos, stat, data.bucketCount, mode === 'ratio' ? scaleOf : undefined);
 	const series = [
 		{ label: 'p95', color: SERIES[2], points: points('p95s') },
@@ -478,6 +502,19 @@ function staleness(ctx, data, scope) {
 	// distribution above is missing them. Silence would make a skewed cluster look like a healthy
 	// one with fewer samples.
 	const discarded = sumCount(pick(data, 'prerender_ops', (s) => s.path === 'page_age_negative'));
+
+	// THE VERDICTS ARE THE AUTHORITY, AND THIS RATIO IS A PROXY. `hit` / `swr` / `stale` are decided
+	// per request against that page's OWN expiry, which is `lastCached + the interval it actually
+	// ran on`. This panel can only divide by the interval the ROUTE is configured with, and those
+	// differ whenever a target's cadence comes from its stored value (a sitemap `changefreq`)
+	// instead — a case no metric exposes. When the two disagree, the verdicts win and the divisor
+	// is what is wrong, so say that rather than let a config gap read as a fleet failure.
+	const cacheServed = sumCount(
+		serves.filter((x) => x.method === 'hit' || x.method === 'swr' || x.method === 'peer-rescue')
+	);
+	const pastDue = sumCount(serves.filter((x) => x.method === 'swr' || x.method === 'stale'));
+	const contradicted =
+		normalizable && Number.isFinite(ratioP95) && ratioP95 > 1 && cacheServed > 0 && pastDue / cacheServed < 0.01;
 
 	return card(mode === 'ratio' ? 'Staleness at serve (÷ cadence, ≈)' : 'Page age at serve (≈)', {
 		head: [
@@ -516,8 +553,27 @@ function staleness(ctx, data, scope) {
 						'interval within that, which makes this read slightly generous.'
 					: `Measured against ${fmtMs(fallback)}, the default interval — page_age carries the bot, not the ` +
 						'route, so a per-route cadence cannot be applied to a bot-filtered window.',
-				' “mean” charts the bucket mean (count-weighted).',
+				mode === 'ratio' && Number.isFinite(ratioMedian)
+					? `This window: median ${fmtRatio(ratioMedian)}, p95 ${fmtRatio(ratioP95)}. An evenly refreshed corpus ` +
+						'sits at median 0.50× and p95 ~0.95× by construction — a page’s age walks from zero to its ' +
+						'interval and is re-rendered — so the MEDIAN is the number with headroom, and the p95 is ' +
+						'near the ceiling even when nothing is wrong. '
+					: '',
+				'The lines are the p95 and the MEAN: per-bucket medians are not in the analytics payload (only ',
+				'means and p95s are), so the median is a tile figure here rather than a trend.',
 			]),
+			contradicted &&
+				el('div', { cls: 'note' }, [
+					el('strong', { text: 'The freshness verdicts disagree with this ratio, and they are the authority. ' }),
+					`Only ${pct(pastDue, cacheServed)} of cache serves were past due (swr + stale), which is decided per `,
+					'request against that page’s own expiry — so these pages are fresh and the divisor is short. That ',
+					'happens when a target’s cadence comes from its stored interval (a sitemap ',
+					el('code', { text: 'changefreq' }),
+					') rather than from ',
+					el('code', { text: 'ingress.routes' }),
+					', which is the only cadence this console can see. Set the route’s renderInterval to make this ',
+					'panel agree with reality.',
+				]),
 			!normalizable &&
 				el('div', {
 					cls: 'note',
@@ -652,7 +708,12 @@ export function originCostByReason(data) {
 		if (verdict === 'server-error' || verdict === 'connect-fail') row.failures += s.count;
 		if (verdict === 'absent') row.absent += s.count;
 	}
-	for (const row of costs.values()) row.p95 = weighted(row.combos, 'p95');
+	for (const row of costs.values()) {
+		// Both, because "what does a miss typically cost" and "how bad does it get" are different
+		// questions, and this one row is where each verdict answers them.
+		row.median = weighted(row.combos, 'median');
+		row.p95 = weighted(row.combos, 'p95');
+	}
 	return costs;
 }
 
@@ -753,9 +814,9 @@ function notFreshHit(data, { serves, filter }) {
 			el('td', { cls: 'mono', text: answered }),
 			el('td', {
 				cls: 'right mono',
-				text: cost ? fmtMs(cost.p95) : '—',
+				text: cost ? fmtMs(cost.median) : '—',
 				title: cost
-					? `${num(cost.count)} origin fetches under reason "${row.status}"`
+					? `${num(cost.count)} origin fetches under reason "${row.status}" — median ${fmtMs(cost.median)}, p95 ${fmtMs(cost.p95)}`
 					: 'no origin fetch carried this reason',
 			}),
 			el('td', null, [cost ? verdictMix(cost) : muted('—')]),
@@ -792,7 +853,7 @@ function notFreshHit(data, { serves, filter }) {
 					{ text: 'serves', right: true },
 					{ text: 'share', right: true },
 					'answered from',
-					{ text: `origin p95 ≈${filter ? ' *' : ''}`, right: true },
+					{ text: `origin median ≈${filter ? ' *' : ''}`, right: true },
 					`origin answered${filter ? ' *' : ''}`,
 				],
 				body
@@ -816,7 +877,7 @@ function notFreshHit(data, { serves, filter }) {
 				'One row per freshness verdict, because they are four different problems: coverage is fixed in the ',
 				'corpus (discovery, sitemaps), cadence by render capacity or a longer interval, integrity is blob ',
 				'health and never a caching question, and the last two are working as configured. ',
-				'“origin p95” is that verdict’s own origin_fetch latency — the cost side of the same request — and ',
+				'“origin median” is what that verdict typically costs at the origin, with its p95 in the tooltip — and ',
 				'“origin answered” is what came back: `absent` (404/410) is a page nobody has, `server-error` and ',
 				'`connect-fail` are the origin in trouble, and only `served` is a page we could have had cached.',
 				filter ? ' * origin_fetch carries no bot dimension: those two columns are all bots.' : '',
@@ -997,12 +1058,12 @@ function originFetch(data, filter) {
 			? [
 					lineChart(data, series),
 					barList(
-						ranked.map(([reason, { count, failures, p95 }]) => ({
+						ranked.map(([reason, { count, failures, median, p95 }]) => ({
 							label: reason,
 							value: count,
-							sub: `${fmtMs(p95)}${failures ? ` · ${num(failures)} failed` : ''}`,
+							sub: `${fmtMs(median)}${failures ? ` · ${num(failures)} failed` : ''}`,
 							color: failures > count / 2 ? 'var(--bad)' : SERIES[0],
-							title: `${reason}: ${num(count)} fetches, p95 ${fmtMs(p95)}, ${num(failures)} failed (5xx/connect)`,
+							title: `${reason}: ${num(count)} fetches, median ${fmtMs(median)}, p95 ${fmtMs(p95)}, ${num(failures)} failed (5xx/connect)`,
 						})),
 						{}
 					),
@@ -1053,8 +1114,13 @@ function routes(ctx, data, cadences, filter) {
 	const rows = ranked.map(([route, { total: routeTotal, cache, miss, aging, integrity }]) => {
 		const cadence = cadenceFor(cadences, route, fallback);
 		const prerender = isPrerender(cadence);
-		const ageP95 = weighted(ageByRoute.get(route) ?? [], 'p95');
-		const ratio = Number.isFinite(ageP95) && cadence.interval > 0 ? ageP95 / cadence.interval : null;
+		// The MEDIAN, so this column and the Staleness tile are the same statistic. They were not:
+		// the tile is what an operator reads first and the table is where they act, and one saying
+		// 0.34x while the other says 0.89x for the same route is worse than either alone.
+		const ageRows = ageByRoute.get(route) ?? [];
+		const ageMedian = weighted(ageRows, 'median');
+		const ageTailP95 = weighted(ageRows, 'p95');
+		const ratio = Number.isFinite(ageMedian) && cadence.interval > 0 ? ageMedian / cadence.interval : null;
 		return el('tr', null, [
 			el('td', { cls: 'mono', text: route }),
 			el('td', null, [
@@ -1087,10 +1153,18 @@ function routes(ctx, data, cadences, filter) {
 				prerender ? fmtMs(cadence.interval) : '—',
 				prerender && cadence.inherited ? muted(' default') : null,
 			]),
-			el('td', { cls: 'right mono', text: fmtMs(ageP95) }),
+			el('td', {
+				cls: 'right mono',
+				text: fmtMs(ageMedian),
+				title: `median ${fmtMs(ageMedian)} · p95 ${fmtMs(ageTailP95)}`,
+			}),
 			el('td', { cls: 'right' }, [
 				prerender && ratio !== null
-					? el('span', { cls: ratio > 1 ? 'pill warn' : 'mono', text: fmtRatio(ratio) })
+					? el('span', {
+							cls: ratio > 1 ? 'pill warn' : 'mono',
+							text: fmtRatio(ratio),
+							title: `p95 ${fmtRatio(cadence.interval > 0 ? ageTailP95 / cadence.interval : NaN)}`,
+						})
 					: muted('—'),
 			]),
 		]);
@@ -1113,15 +1187,17 @@ function routes(ctx, data, cadences, filter) {
 					{ text: 'swr+stale', right: true },
 					anyIntegrity && { text: 'blob', right: true },
 					{ text: 'cadence', right: true },
-					{ text: 'age p95 ≈', right: true },
+					{ text: 'age median ≈', right: true },
 					{ text: '÷ cadence', right: true },
 				].filter(Boolean),
 				rows
 			),
 			el('p', { cls: 'muted chart-note' }, [
-				'The cadence-tuning table. “÷ cadence” is that route’s age p95 measured against its own ',
-				'renderInterval, so every row is comparable and above 1.0 always means the same thing: the fleet ',
-				'is not delivering the cadence this route is configured for. A high miss share means its corpus ',
+				'The cadence-tuning table. “÷ cadence” is that route’s MEDIAN served age against its own ',
+				'renderInterval, so every row is comparable and 1.0 means the same thing everywhere: half that ',
+				'route’s serves were past due. An evenly refreshed route sits near 0.50×, and its p95 — in the ',
+				'cell’s tooltip — sits near 0.95× by construction, which is why the tail is not what you tune ',
+				'against. A high miss share means its corpus ',
 				'isn’t covered — flagged only on routes we actually cache, since a passthrough is proxied live by ',
 				'design. Cadence is read from ingress.routes; “default” means the route sets none and inherits ',
 				'render.defaultInterval.',

@@ -647,6 +647,18 @@ claim floor, schedule repair — are plugin behavior.)
   `origin_fetch` carries no bot name. A **bot filter** narrows every panel whose metric carries a bot name
   (`bot_request`, `bot_serve`, `page_age`, the crawl sketches) purely client-side, never a
   refetch; the panels whose metrics have no bot dimension say "all bots" on their face.
+
+  **The statistic follows the question, per panel.** `hdb_analytics` carries mean, median and p95;
+  they answer different things and the console picks deliberately. Capacity uses the **mean**
+  (renders/hour is concurrency ÷ mean render time, never ÷ p95 — and the mean is also the only
+  statistic that merges exactly across combos, buckets and nodes). "What does a crawler normally
+  get" uses the **median** — serve time, origin cost, served age. **p95** is kept for the tail
+  alone, where a pathology hides behind a healthy middle (a cohort of cache hits at 13.6s while
+  the median stayed at 2.3ms). Two consequences worth knowing: serve time is reported per cache
+  verdict rather than pooled, because a single figure over a 2ms population and a 400ms one tracks
+  the hit rate rather than any latency; and staleness is judged on the median, because a page's
+  age walks from zero to its interval, so an evenly refreshed corpus sits at 0.50× with its p95
+  already at ~0.95× — a p95 threshold would flag a healthy fleet.
   **Everything is this node's slice**
   (analytics rows are node-local): ratios are representative of the cluster, totals are 1/N.
   All of it comes from ONE bounded, row-capped primary-key scan of `hdb_analytics` per
@@ -654,6 +666,7 @@ claim floor, schedule repair — are plugin behavior.)
   `management.analytics.cacheTtl`, and the page footer states what the refresh actually cost.
   The Overview's serve strip and the Queue view's render panels read the same cached window,
   so opening all three costs one scan, not three.
+
 - **Sitemaps** — the root list with per-root refresh state (running / failed, with the child
   failures), a capped count of targets attributed to the selected sitemap, and a paged entry
   table with per-entry state (`cached` / `stale` / `scheduled` / `filtered` /
