@@ -14,6 +14,7 @@ import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import {
 	claimSchedules,
+	sweepReadySet,
 	deleteSchedule,
 	deriveQueueStatus,
 	maybeResetFloor,
@@ -800,6 +801,12 @@ export class RenderQueue extends Resource {
 			pass.scanTruncated ? 'capped' : pass.jobs.length ? 'granted' : 'empty'
 		);
 
+		// WHERE the batch came from. Two emits per claim at most, on a path that runs a few times a
+		// second — and the only evidence that the ready set is doing anything, since it moves no totals.
+		const fromReady = pass.fromReady ?? 0;
+		if (fromReady > 0) metrics.claimSource(fromReady, 'ready');
+		if (pass.jobs.length - fromReady > 0) metrics.claimSource(pass.jobs.length - fromReady, 'index');
+
 		const jobs = [];
 		let notOwnedHere = 0;
 
@@ -933,6 +940,72 @@ let queueStatusSyncStarted = false;
  * handleApplication after config is applied (so the interval reflects overrides).
  * Idempotent. The interval follows `queue.statusSyncInterval` changes without a restart.
  */
+/**
+ * The ready-set sweep, on worker 0, on its own interval.
+ *
+ * SEPARATE FROM `startQueueStatusSync` DESPITE THE SIMILAR SHAPE, and the reason is the claim mutex.
+ * The status sync deliberately runs inside it — the floor reset and the lease-gauge walk both need
+ * that serialization. The sweep must NOT: it holds a read cursor over the due set for hundreds of
+ * milliseconds, and taking the claim mutex for that long would block every claim on the node for the
+ * duration of a scan whose entire purpose is to keep claims off the index.
+ *
+ * It needs no mutex of its own either. It writes nothing to the database, and its only shared-memory
+ * write is `publish`, which fills the inactive slot and flips one atomic — so a concurrent claim
+ * either sees the previous generation or the next one, never a partial set. Two overlapping sweeps
+ * would merely duplicate work, and `sweeping` prevents that within a worker.
+ */
+let readySweepStarted = false;
+
+export function startReadySweep() {
+	if (server.workerIndex !== 0 || readySweepStarted) return;
+	readySweepStarted = true;
+
+	let sweeping = false;
+
+	const sweep = () => {
+		if (sweeping || !config.queue.ready.enabled) return;
+		sweeping = true;
+		const started = performance.now();
+		sweepReadySet()
+			.then((result) => {
+				if (result?.skipped) return;
+				metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
+				metrics.readyPublished(result.published);
+				if (result.truncated) {
+					// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
+					// unranked — precisely the pages this feature exists to protect. That makes it a warning
+					// rather than a statistic.
+					logger.warn(
+						`[prerender] ready-set sweep read its ${config.queue.ready.sweepCap}-row cap without reaching a ` +
+							`not-yet-due row: ${result.due} due row(s) seen, ${result.published} published. The ordering ` +
+							`covers only the oldest part of the backlog, so recently-due pages are going unranked. Raise ` +
+							`queue.ready.sweepCap, or reduce the backlog.`
+					);
+				}
+			})
+			.catch(logger.error)
+			.finally(() => {
+				sweeping = false;
+			});
+	};
+
+	// Once immediately, so a restarted worker generation does not serve a whole interval of claims
+	// from the index before the set exists.
+	sweep();
+
+	let armed = config.queue.ready.sweepInterval;
+	let timer = armed > 0 ? setInterval(sweep, armed) : null;
+	timer?.unref?.();
+
+	onConfigApplied(() => {
+		if (config.queue.ready.sweepInterval === armed) return;
+		if (timer) clearInterval(timer);
+		armed = config.queue.ready.sweepInterval;
+		timer = armed > 0 ? setInterval(sweep, armed) : null;
+		timer?.unref?.();
+	});
+}
+
 export function startQueueStatusSync() {
 	if (server.workerIndex !== 0 || queueStatusSyncStarted) return;
 	queueStatusSyncStarted = true;

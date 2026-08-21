@@ -124,12 +124,15 @@
  * mis-set — without it an operator will spend the incident tuning `renderInterval`.
  */
 
+import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config } from '../config.js';
 import { getSab } from './coordination.js';
 import { CacheKey } from './cacheKey.js';
 import { resolveRenderInterval } from './routeClass.js';
 import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
+import { READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
+import { createTopK, scoreOf } from './renderPriority.js';
 
 /**
  * The live lease table + claim floor, over one named buffer shared by every worker on this node.
@@ -186,6 +189,34 @@ export const leaseTable = () => {
 // RenderQueue → the handlers), so a module-scope capture would make the import order of the whole
 // package depend on when `databases` was populated.
 const scheduleTable = () => databases.render_schedule.RenderSchedule;
+
+/**
+ * The node's ready set, over one named buffer shared by every worker.
+ *
+ * Allocated on first use for the same reason `leaseTable` is: `queue.ready.capacity` sizes it, and
+ * module scope precedes the host applying its options. Restart-scoped for the same reason too — a
+ * named shared buffer's size is fixed by its first allocation, so a later worker asking for a
+ * different size gets a view of the first size. A mismatch is logged loudly and then honoured, since
+ * deriving the capacity from the buffer we actually got is merely a smaller set, and a smaller set
+ * degrades to the fallback scan rather than to anything unsafe.
+ */
+let liveReadyQueue = null;
+
+export const readyQueue = () => {
+	if (liveReadyQueue) return liveReadyQueue;
+	const wanted = Math.max(0, config.queue.ready.capacity | 0);
+	const buffer = getSab(READY_SAB_KEY, readyBufferBytes(Math.max(1, wanted)));
+	if (wanted > 0 && readyCapacityIn(buffer.byteLength) < wanted) {
+		logger.error(
+			`[prerender] ready-set buffer holds ${readyCapacityIn(buffer.byteLength)} entries but ` +
+				`queue.ready.capacity=${wanted}. The named shared buffer was sized by an earlier worker generation — ` +
+				`this node runs with the smaller set until it restarts. queue.ready.capacity is restart-scoped for ` +
+				`exactly that reason; the only effect is that more claims fall through to the index scan.`
+		);
+	}
+	liveReadyQueue = createReadyQueue({ buffer, now: () => Date.now() });
+	return liveReadyQueue;
+};
 
 /** Minutes since the epoch. Every due time in the system is already minute-floored. */
 export const minuteOf = (ms) => Math.floor(ms / MINUTE);
@@ -532,38 +563,47 @@ const maybeUnpinFloor = async (pass) => {
 	return { cacheKey, pinnedForMs: pass.floorPinnedForMs, nextRenderTime };
 };
 
-/** `runClaimPass` bound to the live table and config. Called by `RenderQueue.claim`. */
-export const claimSchedules = async ({ grantLimit } = {}) => {
+/**
+ * THE ONE QUERY SHAPE, shared by the claim scan and the ready-set sweep.
+ *
+ * Extracted rather than written twice because the two callers must agree about it exactly: they read
+ * the same index for the same rows, and a difference between them would show up as the sweep and the
+ * fallback disagreeing about what is due — which is unfalsifiable from either site.
+ */
+const searchSchedulesFrom = ({ floorMinute, limit }) =>
+	scheduleTable().search(
+		{
+			// EXACTLY ONE CONDITION, and it stays present even at floorMinute 0 (`>= 0` is the
+			// same seek-from-the-absolute-minimum). Dropping the conditions array entirely
+			// would leave Harper to inject its own primary-key full-scan condition beside a
+			// sort on a secondary attribute, and whether that still resolves to an
+			// index-ordered walk of `nextRenderTime` is unverified — on 1.6M rows a wrong
+			// answer there is a full table scan plus a sort on the claim path.
+			//
+			// ONE-SIDED, AND A TWO-SIDED RANGE IS NOT A SAFE ALTERNATIVE HERE. Adding the
+			// `<= now` half measures fine (0.74 ms) only while the window can FILL the limit.
+			// Measured on 400k rows when it cannot — which is the normal steady state, "nothing
+			// is due" — it costs 1,128–2,977 ms: only the FIRST condition becomes the index
+			// range and the second is applied as a post-filter, so the cost is O(rows above the
+			// lower bound) rather than O(window), and the limit can never short-circuit it.
+			// That is a ~480× regression on the claim path, in the state the queue spends most
+			// of its time in. The `<= now` half stays in application code, where it is free.
+			// (On a PRIMARY key a two-sided range collapses to a filtered intersection —
+			// 289–1490 ms — which is why the shape of this query is worth a comment at all.)
+			conditions: [{ attribute: 'nextRenderTime', comparator: 'greater_than_equal', value: floorMinute * MINUTE }],
+			sort: { attribute: 'nextRenderTime' },
+			// ARRAY select. A string `select` returns the bare scalar rather than a record —
+			// the trap that has caused two silent bugs in this package already.
+			select: ['cacheKey', 'nextRenderTime', 'fromSitemap'],
+			limit,
+		},
+		{ replicateFrom: false }
+	);
+
+/** `runClaimPass` bound to the live table and config — the FALLBACK path behind the ready set. */
+const claimFromIndex = async ({ grantLimit } = {}) => {
 	const pass = await runClaimPass({
-		searchSchedules: ({ floorMinute, limit }) =>
-			scheduleTable().search(
-				{
-					// EXACTLY ONE CONDITION, and it stays present even at floorMinute 0 (`>= 0` is the
-					// same seek-from-the-absolute-minimum). Dropping the conditions array entirely
-					// would leave Harper to inject its own primary-key full-scan condition beside a
-					// sort on a secondary attribute, and whether that still resolves to an
-					// index-ordered walk of `nextRenderTime` is unverified — on 1.6M rows a wrong
-					// answer there is a full table scan plus a sort on the claim path.
-					//
-					// ONE-SIDED, AND A TWO-SIDED RANGE IS NOT A SAFE ALTERNATIVE HERE. Adding the
-					// `<= now` half measures fine (0.74 ms) only while the window can FILL the limit.
-					// Measured on 400k rows when it cannot — which is the normal steady state, "nothing
-					// is due" — it costs 1,128–2,977 ms: only the FIRST condition becomes the index
-					// range and the second is applied as a post-filter, so the cost is O(rows above the
-					// lower bound) rather than O(window), and the limit can never short-circuit it.
-					// That is a ~480× regression on the claim path, in the state the queue spends most
-					// of its time in. The `<= now` half stays in application code, where it is free.
-					// (On a PRIMARY key a two-sided range collapses to a filtered intersection —
-					// 289–1490 ms — which is why the shape of this query is worth a comment at all.)
-					conditions: [{ attribute: 'nextRenderTime', comparator: 'greater_than_equal', value: floorMinute * MINUTE }],
-					sort: { attribute: 'nextRenderTime' },
-					// ARRAY select. A string `select` returns the bare scalar rather than a record —
-					// the trap that has caused two silent bugs in this package already.
-					select: ['cacheKey', 'nextRenderTime', 'fromSitemap'],
-					limit,
-				},
-				{ replicateFrom: false }
-			),
+		searchSchedules: searchSchedulesFrom,
 		leases: leaseTable(),
 		nowMs: Date.now(),
 		grantLimit,
@@ -583,6 +623,241 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 	// scan cursor still open (see the drain note above).
 	const floorUnpinned = await maybeUnpinFloor(pass);
 	return floorUnpinned ? { ...pass, floorUnpinned } : pass;
+};
+
+/**
+ * THE SWEEP — score the whole due set and publish the best of it.
+ *
+ * This is the part that makes priority possible at all, and the reason it can exist is one measured
+ * fact (#119): a projected one-sided read is ~2.4 us/row, FLAT from 200 to 20,000 rows, and yielding
+ * every 200 rows costs nothing. So 200,000 rows cost ~480 ms and a 500k-row overdue set ~1.2 s — on a
+ * timer, off the claim path, with zero writes. The claim path meanwhile stops reading the index at
+ * all. Reads are 2.4 us and writes are 76-89 us; reading liberally and writing not at all is the
+ * cheap direction.
+ *
+ * ── IT OWNS THE FLOOR NOW, AND THAT IS NOT INCIDENTAL ─────────────────────────────────────────
+ *
+ * The claim floor only advances when something OBSERVES the head of the index. Once claims are served
+ * from memory they observe nothing, so a floor left to the claim path would freeze — and a frozen
+ * floor is precisely the degradation it exists to prevent: measured, an unfloored seek goes 0.073 ->
+ * 5.60 ms over 40,000 reschedules while a floored one stays flat at 0.07 ms. So the sweep applies the
+ * same floor rule the claim pass applies, and it is strictly better informed while doing it: it
+ * observes EVERY due row rather than a window, so "the first due row observed" is the true minimum
+ * rather than the minimum of a window.
+ *
+ * ── WHAT IT DELIBERATELY DOES NOT DO ─────────────────────────────────────────────────────────
+ *
+ * No writes, no lease grants, and no `<= now` in the query. The cut at "past now" is applied in
+ * application code because the two-sided form is 256x slower when its limit cannot fill (739 ms
+ * against 2.89 ms, measured) — which is the state a caught-up queue is in essentially always.
+ *
+ * It also does not skip leased rows. A row being rendered right now is still a row that is due, and
+ * excluding it would let the floor advance past a lease whose result has not landed. It is scored,
+ * published, and refused at grant time by the lease CAS — one wasted array slot, versus a floor rule
+ * that no longer holds.
+ */
+export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
+	const { enabled, capacity, sweepCap, sitemapBoost } = config.queue.ready;
+	if (!enabled || capacity <= 0) return { skipped: 'disabled' };
+
+	const queue = readyQueue();
+	if (queue.capacity === 0) return { skipped: 'no-capacity' };
+
+	const leases = leaseTable();
+	const nowMinute = minuteOf(nowMs);
+	const floorEnabled = config.queue.claimFloor.enabled;
+	const floorFrom = floorEnabled ? leases.readFloorMinute(nowMinute, guardMinutes()) : 0;
+	const cap = Math.max(1, sweepCap | 0);
+
+	const heap = createTopK(queue.capacity);
+	// Route resolution parses a URL and walks the route list, and a URL's device variants share both —
+	// so this memo halves the work at minimum, on the one loop that sees every due row on the node.
+	// Per sweep rather than process-lifetime: the route list is live-reloadable, and a cache keyed by
+	// URL over an 814k-target corpus to serve one sweep is the unbounded-structure mistake this node
+	// has already been taken down by twice.
+	const intervals = new Map();
+	const intervalFor = (url) => {
+		let interval = intervals.get(url);
+		if (interval === undefined) {
+			interval = resolveRenderInterval(url, null);
+			intervals.set(url, interval);
+		}
+		return interval;
+	};
+
+	let scanned = 0;
+	let due = 0;
+	let nonFinite = 0;
+	let firstDueMinute = null;
+	let firstDueKey = null;
+	let reachedNotYetDue = false;
+
+	// DRAINED WITH NO WRITES AND NO ATOMICS INSIDE THE LOOP. Harper's long-transaction monitor aborts
+	// a transaction that has pending writes when it fires, and a cursor left open across writes is
+	// that shape; the publish below is atomics-only and happens after the cursor is done. And no
+	// `break` out of the `for await` either — an abandoned iterator leaves its read transaction
+	// unreleased (see util/reconcile.js). The cut at "past now" is applied per row instead.
+	for await (const row of searchSchedulesFrom({ floorMinute: floorFrom, limit: cap })) {
+		scanned++;
+		const dueAt = numberOf(row.nextRenderTime);
+		if (!Number.isFinite(dueAt)) {
+			nonFinite++;
+			continue;
+		}
+		if (dueAt > nowMs) {
+			// Rows arrive ascending, so the first not-yet-due row means the due set is exhausted —
+			// recorded, but the cursor is still drained to the end rather than abandoned.
+			reachedNotYetDue = true;
+			continue;
+		}
+		due++;
+		if (firstDueMinute === null) {
+			firstDueMinute = minuteOf(dueAt);
+			firstDueKey = row.cacheKey;
+		}
+		const url = CacheKey.extractUrl(row.cacheKey);
+		const score = scoreOf(
+			{ dueAt, fromSitemap: !!row.fromSitemap },
+			{ nowMs, intervalMs: intervalFor(url), sitemapBoost }
+		);
+		heap.offer(score, { cacheKey: row.cacheKey, dueAt, fromSitemap: !!row.fromSitemap });
+		// Yielding is free (measured: 2.375 vs 2.387 us/row at 20,000 rows) and this runs beside bot
+		// traffic on a worker that also serves requests, so it must not hold the loop for a whole sweep.
+		if (scanned % 200 === 0) await yieldNow();
+	}
+
+	const published = queue.publish(heap.drainDescending(), { scannedRows: scanned });
+
+	// THE FLOOR, on the same rule the claim pass uses: the due minute of the first due row observed,
+	// or `nowMinute - guard` when nothing was due. CAS against the value this sweep started from and
+	// abandon on conflict — a conflict means a funnel write lowered the floor for a row this sweep
+	// never saw, and re-advancing over it would strand that row until the next sweep.
+	let floorAdvanced = false;
+	if (floorEnabled) {
+		floorAdvanced = leases.advanceFloor(floorFrom, Math.max(0, firstDueMinute ?? nowMinute - guardMinutes()));
+	}
+	leases.recordPassOutcome({ sawDue: due > 0, earliestNotYetDueMinute: 0 });
+
+	return {
+		scanned,
+		due,
+		nonFinite,
+		published,
+		capacity: queue.capacity,
+		floorFrom,
+		floorAdvanced,
+		firstDueKey,
+		// `scanned >= cap` alone says nothing — the query is one-sided, so on any real corpus the window
+		// fills. Reaching a not-yet-due row is what proves the due set was seen to its end, and only its
+		// absence means the sweep was truncated and the ordering is over a prefix of the backlog.
+		truncated: scanned >= cap && !reachedNotYetDue,
+	};
+};
+
+/**
+ * Grant up to `grantLimit` jobs — the ready set first, the index scan for whatever is left.
+ *
+ * THE FALLBACK IS THE WHOLE SAFETY ARGUMENT. A cold set (a fresh worker generation), an exhausted one
+ * (claims outrunning the sweep), a disabled one, or a buffer sized to nothing all land on
+ * `claimFromIndex`, which is the path this queue has always used. So every failure mode of the ready
+ * set degrades to TODAY'S ORDERING rather than to a stalled queue — which is also why it can ship on
+ * by default.
+ *
+ * The ready set is a CACHE, never a source of truth. An entry naming a row that has since been
+ * rescheduled or deleted costs at most one redundant render: the lease CAS refuses a duplicate, and
+ * `processJobResult` already drops a result whose target is gone. Nothing here can lose a page,
+ * because the next sweep re-reads the table — which is a categorically weaker invariant than the
+ * claim floor's, where a row filed below it is never read again, silently and terminally.
+ */
+export const claimSchedules = async ({ grantLimit } = {}) => {
+	const wanted = Math.max(0, grantLimit | 0);
+	if (!config.queue.ready.enabled || wanted === 0) return claimFromIndex({ grantLimit });
+
+	const queue = readyQueue();
+	const leases = leaseTable();
+	const nowMs = Date.now();
+	const leaseTimeMs = config.queue.jobLeaseTime;
+
+	const jobs = [];
+	let skippedLeased = 0;
+	let leaseRefused = false;
+
+	// Over-take, because an entry may name a row that is already leased — the set does not exclude
+	// leased rows on purpose (see `sweepReadySet`), so a run of them must not end the attempt while the
+	// set still holds grantable work. Bounded, so an entirely-leased set costs a fixed number of
+	// atomic loads rather than draining the whole thing.
+	const attempts = Math.min(queue.capacity, wanted * 4);
+	for (let taken = 0; jobs.length < wanted && taken < attempts; ) {
+		const batch = queue.take(Math.min(wanted - jobs.length, attempts - taken));
+		if (batch.length === 0) break;
+		taken += batch.length;
+		for (const entry of batch) {
+			if (jobs.length >= wanted) break;
+			if (leases.isLeased(entry.cacheKey)) {
+				skippedLeased++;
+				continue;
+			}
+			const expiresAtMs = nowMs + leaseTimeMs;
+			if (!leases.grant(entry.cacheKey, { dueMinute: minuteOf(entry.dueAt), leaseExpiryMs: expiresAtMs })) {
+				// No slot, no job — a granted-but-unrecorded job is a double render.
+				leaseRefused = true;
+				break;
+			}
+			jobs.push({
+				cacheKey: entry.cacheKey,
+				dueMinute: minuteOf(entry.dueAt),
+				expiresAtMs,
+				// Carried through from the sweep, NOT left absent. The renderer serializes a non-indexable
+				// page only when the url is sitemap-listed, so a job reporting `false` for a listed page
+				// silently stops it being cached — the bug this package has shipped twice.
+				fromSitemap: entry.fromSitemap,
+				score: entry.score,
+			});
+		}
+		if (leaseRefused) break;
+	}
+
+	if (jobs.length >= wanted) {
+		// Filled entirely from memory: no index read at all on this claim. The floor is not advanced
+		// here and does not need to be — `sweepReadySet` owns it precisely because this path observes
+		// nothing.
+		const floor = floorState(nowMs);
+		return {
+			jobs,
+			sawDue: true,
+			granted: jobs.length,
+			skippedLeased,
+			nonFinite: 0,
+			earliestNotYetDueMinute: 0,
+			floorFrom: floor.floorMinute,
+			floorTo: floor.floorMinute,
+			floorHeldBy: lastFloorHeldBy,
+			floorHeldByRow: null,
+			floorPinnedForMs: floor.floorPinnedForMs ?? 0,
+			floorAdvanced: false,
+			scanned: 0,
+			scanLimit: 0,
+			scanTruncated: false,
+			leaseRefused,
+			occupancy: leases.occupancy(),
+			fromReady: jobs.length,
+			ready: queue.state(),
+		};
+	}
+
+	// Short. Take the remainder from the index, which also lets the floor advance and the wedged-row
+	// warning fire on a node whose ready set is doing most of the work.
+	const pass = await claimFromIndex({ grantLimit: wanted - jobs.length });
+	return {
+		...pass,
+		jobs: [...jobs, ...pass.jobs],
+		granted: jobs.length + pass.granted,
+		skippedLeased: skippedLeased + pass.skippedLeased,
+		leaseRefused: leaseRefused || pass.leaseRefused,
+		sawDue: jobs.length > 0 || pass.sawDue,
+		fromReady: jobs.length,
+		ready: queue.state(),
+	};
 };
 
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
