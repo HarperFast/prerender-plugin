@@ -4,7 +4,13 @@ import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
+import {
+	classifyPath,
+	queryAllowlistFor,
+	resolveEffectiveInterval,
+	resolveRenderInterval,
+	PRERENDER,
+} from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
@@ -385,7 +391,15 @@ export class RenderQueue extends Resource {
 				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
 				// lowering on every completed render would rewind the floor to the current minute
 				// continuously and the whole 14× seek win would evaporate.
-				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+				await writeSchedule(cacheKey, {
+					nextRenderTime,
+					fromSitemap: !!renderTarget.sitemapUrl,
+					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
+					// the writer every target passes through on every cycle, so it is what backfills the
+					// cadence across the corpus, and it is the only site holding a rung fresher than the
+					// stored one. The ready-set sweep divides lateness by this to rank the row.
+					effectiveInterval: interval,
+				});
 
 				// Persist the rung ONLY on an actual move. 'held' must not write even when the
 				// stored field is absent — absence already resolves to the base ceiling, so writing
@@ -641,7 +655,12 @@ export class RenderQueue extends Resource {
 	static async recordRedirectStrike(cacheKey, why) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
 		// One read serves both the strike decision and the reschedule below.
-		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		const renderTarget = await Target.get({
+			id: sourceUrl,
+			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
+			// on the schedule row is the ladder's rung rather than the route ceiling.
+			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
+		});
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
 			return;
@@ -703,7 +722,12 @@ export class RenderQueue extends Resource {
 	 */
 	static async retryAfterFailure(cacheKey) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
-		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		const renderTarget = await Target.get({
+			id: sourceUrl,
+			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
+			// on the schedule row is the ladder's rung rather than the route ceiling.
+			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
+		});
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
 			return 'dropped';
@@ -720,12 +744,17 @@ export class RenderQueue extends Resource {
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const fromSitemap = !!renderTarget.sitemapUrl;
 		const wait = backoffWait(interval, strikes, fromSitemap);
+		// THE CADENCE, NOT `wait`. The backoff is how long until the retry; the cadence is how often the
+		// page wants to render. Filing `wait` here would tell the sweep a repeatedly-failing 1h page is
+		// on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority on
+		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
+		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		const nextRenderTime = currentMinuteMs() + wait;
 		logger.debug(
 			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval: cadence });
 		return 'slow';
 	}
 
@@ -744,7 +773,7 @@ export class RenderQueue extends Resource {
 			preloaded ??
 			(await Target.get({
 				id: sourceUrl,
-				select: ['renderInterval', 'sitemapUrl'],
+				select: ['renderInterval', 'sitemapUrl', 'demandInterval'],
 			}));
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
@@ -755,6 +784,12 @@ export class RenderQueue extends Resource {
 		await writeSchedule(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
+			// The ladder rung when the row carried one, else the ceiling. A caller-supplied `preloaded`
+			// row is documented as "at least renderInterval + sitemapUrl", so an absent `demandInterval`
+			// means "not read" rather than "not promoted" — resolving to the ceiling is the safe reading,
+			// and the next render files the true rung either way. (`recordRedirectStrike`, the one
+			// in-tree preloader, now selects it.)
+			effectiveInterval: resolveEffectiveInterval(sourceUrl, renderTarget),
 		});
 	}
 
@@ -993,6 +1028,10 @@ export function startReadySweep() {
 					if (result?.skipped) return;
 					metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
 					metrics.readyPublished(result.published);
+					// Both halves, every sweep, so the ratio is readable without needing the total from a
+					// second series — and so `carried: 0` is an explicit observation rather than an absence.
+					metrics.readyCadenceSource(result.cadenceCarried, 'carried');
+					metrics.readyCadenceSource(result.due - result.cadenceCarried, 'resolved');
 					if (result.truncated) {
 						// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
 						// unranked — precisely the pages this feature exists to protect. That makes it a warning

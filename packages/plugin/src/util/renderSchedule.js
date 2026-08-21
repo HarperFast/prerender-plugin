@@ -271,11 +271,19 @@ const lowerFloorFor = (nextRenderTime) => {
  * in 10.7 ms, mean 0.021 ms, against residency pinned to a node that does not exist). v0.15.0
  * assumed the read/write symmetry and wrapped these in a deadline that could never fire.
  */
-export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = {}) => {
+export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, effectiveInterval } = {}) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 	}
-	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
+	// REQUIRED FOR THE SAME REASON, AND IT IS THE SAME HAZARD. `put` replaces the record, so a writer
+	// that omits this does not leave the old value alone — it ERASES a correct cadence off a row that
+	// had one, and the ready-set sweep then scores that page against its route ceiling instead of its
+	// ladder rung. `null` is the legitimate explicit answer for a writer with no cadence in hand (a
+	// render-now one-off has no cadence at all); what must not be possible is forgetting.
+	if (effectiveInterval === undefined) {
+		throw new Error(`writeSchedule(${cacheKey}) needs an explicit effectiveInterval — put replaces the record`);
+	}
+	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval });
 	lowerFloorFor(nextRenderTime);
 };
 
@@ -291,11 +299,14 @@ export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap } = 
  */
 export const writeSchedules = async (rows = []) => {
 	let lowest = Number.POSITIVE_INFINITY;
-	for (const { cacheKey, nextRenderTime, fromSitemap } of rows) {
+	for (const { cacheKey, nextRenderTime, fromSitemap, effectiveInterval } of rows) {
 		if (fromSitemap === undefined) {
 			throw new Error(`writeSchedules(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 		}
-		await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap });
+		if (effectiveInterval === undefined) {
+			throw new Error(`writeSchedules(${cacheKey}) needs an explicit effectiveInterval — put replaces the record`);
+		}
+		await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval });
 		// Same trap as `lowerFloorFor`, and WORSE here: with a bare `Number` a single null row anywhere
 		// in the batch becomes 0, wins the minimum, and unbounds the floor for the whole fan-out.
 		const at = numberOf(nextRenderTime);
@@ -396,7 +407,15 @@ export const runClaimPass = async ({
 		if (firstDueMinute === null) {
 			firstDueMinute = dueMinute;
 			floorHeldBy = row.cacheKey;
-			floorHeldByRow = { cacheKey: row.cacheKey, dueMinute, fromSitemap: !!row.fromSitemap };
+			floorHeldByRow = {
+				cacheKey: row.cacheKey,
+				dueMinute,
+				fromSitemap: !!row.fromSitemap,
+				// Carried so the unpin hatch can PRESERVE it: `put` replaces the record, so a push that
+				// rewrote this row without the field would strip the cadence off the one row already known
+				// to be in trouble.
+				effectiveInterval: row.effectiveInterval,
+			};
 		}
 
 		if (leases.isLeased(row.cacheKey)) {
@@ -478,6 +497,19 @@ export const runClaimPass = async ({
  * rather than somebody else's answer. `null` also legitimately means "the last pass saw no due row",
  * i.e. nothing is holding the floor.
  */
+/**
+ * The cadence a schedule row carries, or `null` when it carries none.
+ *
+ * One helper rather than the check inlined twice, because the two callers must agree: the sweep
+ * divides lateness by this to score, and `maybeUnpinFloor` pushes a wedged row forward by it. If
+ * they resolved a cadence differently the push distance would stop matching the number the row was
+ * ranked by. `Number` first for the BigInt-from-`Long` coercion; `> 0` rejects null/NaN/negatives.
+ */
+const carriedCadence = (effectiveInterval) => {
+	const ms = Number(effectiveInterval);
+	return Number.isFinite(ms) && ms > 0 ? ms : null;
+};
+
 let lastFloorHeldBy = null;
 let lastFloorHeldByAt = 0;
 
@@ -521,7 +553,7 @@ const maybeUnpinFloor = async (pass) => {
 	if (!config.queue.claimFloor.enabled) return null;
 	if (!pass.floorHeldByRow || !(pass.floorPinnedForMs >= unpinAfter)) return null;
 
-	const { cacheKey, fromSitemap } = pass.floorHeldByRow;
+	const { cacheKey, fromSitemap, effectiveInterval } = pass.floorHeldByRow;
 	// ONE RENDER INTERVAL, RESOLVED THE WAY EVERY OTHER SCHEDULE WRITER RESOLVES IT — not a flat
 	// `render.defaultInterval`. Two reasons, and the second one is a bug this used to cause:
 	//
@@ -535,15 +567,26 @@ const maybeUnpinFloor = async (pass) => {
 	//     fixing now: the row is the only record, it outlives the pass that wrote it, and a later
 	//     reader has no way to know this particular value was synthetic.
 	//
-	// Route > default here, where `processJobResult` resolves route > the target's stored interval >
-	// default: reading the Target from the funnel would mean a point read on the claim path and an
-	// import cycle (`resources/Target.js` imports this module). The residual, stated because it is
-	// invisible from either site: a target whose STORED interval differs from the default with no route
-	// interval to override it still desynchronises the two by that difference. Cost of that residual is
-	// one extra render per crawl of one URL, rate-limited by the accelerator's own budget.
-	const nextRenderTime = Date.now() + resolveRenderInterval(CacheKey.extractUrl(cacheKey), null);
+	// THE ROW'S OWN CADENCE FIRST, which closes a residual this comment used to have to state. Reading
+	// the Target from the funnel is still out of the question — a point read on the claim path, and an
+	// import cycle (`resources/Target.js` imports this module) — but the cadence now travels ON the row,
+	// so the push distance matches what the writer actually scheduled by, including a demand-ladder rung
+	// that config cannot see at all. Falling back to route > default leaves the old residual only for
+	// rows written before this field existed: a target whose STORED interval differs from the default
+	// with no route interval to override it is pushed by that difference. Cost of that residual is one
+	// extra render per crawl of one URL, rate-limited by the accelerator's own budget.
+	const interval = carriedCadence(effectiveInterval) ?? resolveRenderInterval(CacheKey.extractUrl(cacheKey), null);
+	const nextRenderTime = Date.now() + interval;
 	try {
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+		// `interval`, NOT the raw `effectiveInterval` off the row — and the difference is a silent
+		// regression that only shows up on the first deploy. Every row written before this field existed
+		// carries `undefined`, which the funnel now REFUSES; the refusal lands inside this try, is logged
+		// and swallowed, and the hatch does nothing while looking healthy. So on a node where no row has
+		// re-rendered yet — i.e. every node, for one full cadence after an upgrade — the one mechanism
+		// that bounds a wedged row would have been dead. Filing the resolved cadence instead also keeps
+		// `nextRenderTime - effectiveInterval === now`, the arithmetic the comment above is about, and
+		// leaves the row self-describing for the next sweep.
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval: interval });
 	} catch (e) {
 		logger.error(e, `[prerender] could not unpin the claim floor from ${cacheKey}`);
 		return null;
@@ -594,7 +637,13 @@ const searchSchedulesFrom = ({ floorMinute, limit }) =>
 			sort: { attribute: 'nextRenderTime' },
 			// ARRAY select. A string `select` returns the bare scalar rather than a record —
 			// the trap that has caused two silent bugs in this package already.
-			select: ['cacheKey', 'nextRenderTime', 'fromSitemap'],
+			//
+			// `effectiveInterval` rides along so the sweep can score a row without a per-row read of
+			// RenderTarget — which on a residency-pinned table would be a replication fetch for ~75% of
+			// keys, over the whole due set. The claim path shares this select and ignores the field: one
+			// more decoded Long across `queue.claimScanCap` rows, against the guarantee that the two
+			// paths cannot drift onto different queries.
+			select: ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'],
 			limit,
 		},
 		{ replicateFrom: false }
@@ -670,6 +719,10 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	const cap = Math.max(1, sweepCap | 0);
 
 	const heap = createTopK(queue.capacity);
+	// THE FALLBACK PATH ONLY. A row that carries its own `effectiveInterval` never reaches this — no URL
+	// parse, no route walk — so once the corpus has re-rendered once this memo serves the remainder:
+	// pre-upgrade rows and the writers with no cadence in hand.
+	//
 	// Route resolution parses a URL and walks the route list, and a URL's device variants share both —
 	// so this memo halves the work at minimum, on the one loop that sees every due row on the node.
 	// Per sweep rather than process-lifetime: the route list is live-reloadable, and a cache keyed by
@@ -688,6 +741,11 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	let scanned = 0;
 	let due = 0;
 	let nonFinite = 0;
+	// How much of the due set could be scored against its REAL cadence. Reported because it is the only
+	// way to see the backfill land: this reads 0 on the first sweep after an upgrade and climbs toward
+	// `due` as rows re-render, and a value that stays low means writers are filing rows without a
+	// cadence rather than that the field is not working.
+	let cadenceCarried = 0;
 	let firstDueMinute = null;
 	let firstDueKey = null;
 	let firstDueRow = null;
@@ -726,13 +784,22 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 			// The row itself, because `maybeUnpinFloor` has to REWRITE it and `put` replaces the record —
 			// so it needs the `fromSitemap` flag this sweep already has in hand. Re-reading the row to
 			// recover a flag that was in hand is how `Target.revalidate` silently cleared it for a year.
-			firstDueRow = { cacheKey: row.cacheKey, dueMinute: firstDueMinute, fromSitemap: !!row.fromSitemap };
+			firstDueRow = {
+				cacheKey: row.cacheKey,
+				dueMinute: firstDueMinute,
+				fromSitemap: !!row.fromSitemap,
+				effectiveInterval: row.effectiveInterval,
+			};
 		}
-		const url = CacheKey.extractUrl(row.cacheKey);
-		const score = scoreOf(
-			{ dueAt, fromSitemap: !!row.fromSitemap },
-			{ nowMs, intervalMs: intervalFor(url), sitemapBoost }
-		);
+		// THE ROW'S OWN CADENCE, NOT THE ROUTE'S. They differ wherever the demand ladder has promoted a
+		// target beneath its route ceiling — a `/catalog/` page on the 6h rung is scheduled 6h out while
+		// the route still grants 24h, so resolving from config alone would divide by 24h and report a
+		// quarter of its true lateness, on exactly the pages the ladder singled out as worth rendering
+		// more often. Config resolution stays as the fallback for rows that carry nothing.
+		const carried = carriedCadence(row.effectiveInterval);
+		if (carried !== null) cadenceCarried++;
+		const intervalMs = carried ?? intervalFor(CacheKey.extractUrl(row.cacheKey));
+		const score = scoreOf({ dueAt, fromSitemap: !!row.fromSitemap }, { nowMs, intervalMs, sitemapBoost });
 		heap.offer(score, { cacheKey: row.cacheKey, dueAt, fromSitemap: !!row.fromSitemap });
 		// Yielding is free (measured: 2.375 vs 2.387 us/row at 20,000 rows) and this runs beside bot
 		// traffic on a worker that also serves requests, so it must not hold the loop for a whole sweep.
@@ -775,6 +842,7 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		scanned,
 		due,
 		nonFinite,
+		cadenceCarried,
 		published,
 		capacity: queue.capacity,
 		floorFrom,

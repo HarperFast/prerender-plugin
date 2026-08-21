@@ -7,6 +7,7 @@ import {
 	matchRoute,
 	prerenderRouteCount,
 	queryAllowlistFor,
+	resolveEffectiveInterval,
 	resolveRenderInterval,
 	PASSTHROUGH,
 	PRERENDER,
@@ -274,4 +275,50 @@ test('a per-URL cadence exception is an exact route above its class prefix', () 
 	const base = 'https://www.example.com';
 	assert.equal(resolveRenderInterval(`${base}/catalog/hot-deals.jsp`, null), HOUR_MS);
 	assert.equal(resolveRenderInterval(`${base}/catalog/girls.jsp`, null), 6 * HOUR_MS);
+});
+
+test('resolveEffectiveInterval applies the demand ladder rung the route ceiling hides', () => {
+	// The gap this exists to close. A route grants a CEILING and `render.demand` promotes visited
+	// targets beneath it, storing the rung on the target — so route resolution alone reports 24h for a
+	// page really on 6h. Anything dividing lateness by a cadence has to divide by the rung.
+	const DAY_MS = 24 * HOUR_MS;
+	forwarded({
+		routes: [
+			{ match: 'prefix', path: '/catalog/', queryParams: ['CN'], renderInterval: DAY_MS },
+			{ match: 'exact', path: '/', queryParams: [] },
+		],
+	});
+	const catalog = 'https://www.example.com/catalog/girls.jsp';
+
+	assert.equal(resolveRenderInterval(catalog, null), DAY_MS, 'the route ceiling, as before');
+	assert.equal(
+		resolveEffectiveInterval(catalog, { demandInterval: 6 * HOUR_MS }),
+		6 * HOUR_MS,
+		'a promoted target is on its rung, not on the ceiling'
+	);
+
+	// CLAMPED, because a rung outlives the config that produced it: lower a route's cadence and every
+	// target still carries a rung from the old, slower ladder until its next render. `decideInterval`
+	// clamps to the ceiling the same way, so a stale rung must not read as SLOWER than the route.
+	assert.equal(
+		resolveEffectiveInterval(catalog, { demandInterval: 7 * DAY_MS }),
+		DAY_MS,
+		'a stale rung slower than the ceiling reads as the ceiling'
+	);
+
+	// Unevaluated is most of the corpus until the ladder reaches it, and the absent forms differ:
+	// `Number(null)` is 0 and `Number(undefined)` is NaN. Both must fall through, not become 0.
+	for (const absent of [null, undefined, 0, -1, NaN, 'nonsense']) {
+		assert.equal(resolveEffectiveInterval(catalog, { demandInterval: absent }), DAY_MS, `absent: ${absent}`);
+	}
+	assert.equal(resolveEffectiveInterval(catalog), DAY_MS, 'and no target at all resolves to the route');
+
+	// Stored interval still loses to the route, and the rung still beats both — the full precedence.
+	assert.equal(
+		resolveEffectiveInterval(catalog, { renderInterval: 3 * DAY_MS, demandInterval: 12 * HOUR_MS }),
+		12 * HOUR_MS,
+		'rung > route > stored'
+	);
+	// A BigInt from a `Long` column, which `Number.isFinite` rejects outright without the coercion.
+	assert.equal(resolveEffectiveInterval(catalog, { demandInterval: BigInt(6 * HOUR_MS) }), 6 * HOUR_MS);
 });

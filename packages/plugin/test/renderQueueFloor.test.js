@@ -22,6 +22,9 @@ import assert from 'node:assert/strict';
  */
 
 const MINUTE = 60_000;
+// A stand-in cadence for the write shapes below. These tests are about the FLOOR, so the value only
+// has to be present and plausible — `writeSchedule` requires it explicitly.
+const HOUR = 60 * MINUTE;
 const T0 = 1_700_000_400_000; // a whole minute
 const minuteOf = (ms) => Math.floor(ms / MINUTE);
 
@@ -336,7 +339,7 @@ test('every write shape lowers the floor only when it should', async () => {
 		funnel.resetRenderQueueState();
 		assert.equal(funnel.leaseTable().advanceFloor(0, nowMinute), true, 'precondition: establish a floor');
 
-		await funnel.writeSchedule('k|desktop', { nextRenderTime, fromSitemap: false });
+		await funnel.writeSchedule('k|desktop', { nextRenderTime, fromSitemap: false, effectiveInterval: HOUR });
 
 		const raw = funnel.leaseTable().rawFloorMinute();
 		if (shouldLower) {
@@ -353,9 +356,9 @@ test('writeSchedules lowers ONCE, with the batch minimum', async () => {
 	funnel.leaseTable().advanceFloor(0, nowMinute);
 
 	await funnel.writeSchedules([
-		{ cacheKey: 'a|desktop', nextRenderTime: T0 + 90 * MINUTE, fromSitemap: false },
-		{ cacheKey: 'b|desktop', nextRenderTime: T0 - 3 * MINUTE, fromSitemap: false },
-		{ cacheKey: 'c|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false },
+		{ cacheKey: 'a|desktop', nextRenderTime: T0 + 90 * MINUTE, fromSitemap: false, effectiveInterval: HOUR },
+		{ cacheKey: 'b|desktop', nextRenderTime: T0 - 3 * MINUTE, fromSitemap: false, effectiveInterval: HOUR },
+		{ cacheKey: 'c|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false, effectiveInterval: HOUR },
 	]);
 
 	assert.equal(funnel.leaseTable().rawFloorMinute(), minuteOf(T0 - 3 * MINUTE), 'the batch minimum, not the last row');
@@ -578,21 +581,21 @@ test('an ABSENT nextRenderTime does not unbound the floor, but a real 0 still do
 	funnel.leaseTable().advanceFloor(0, established);
 	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'precondition: a floor exists');
 
-	await funnel.writeSchedule('a|desktop', { nextRenderTime: null, fromSitemap: false });
+	await funnel.writeSchedule('a|desktop', { nextRenderTime: null, fromSitemap: false, effectiveInterval: HOUR });
 	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'a null due time lowers nothing');
 
-	await funnel.writeSchedule('b|desktop', { nextRenderTime: undefined, fromSitemap: false });
+	await funnel.writeSchedule('b|desktop', { nextRenderTime: undefined, fromSitemap: false, effectiveInterval: HOUR });
 	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'nor an undefined one');
 
 	// The batch form is the worse case: one null row would win the minimum for the whole fan-out.
 	await funnel.writeSchedules([
-		{ cacheKey: 'c|desktop', nextRenderTime: null, fromSitemap: false },
-		{ cacheKey: 'd|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false },
+		{ cacheKey: 'c|desktop', nextRenderTime: null, fromSitemap: false, effectiveInterval: HOUR },
+		{ cacheKey: 'd|desktop', nextRenderTime: T0 + 10 * MINUTE, fromSitemap: false, effectiveInterval: HOUR },
 	]);
 	assert.equal(funnel.leaseTable().rawFloorMinute(), established, 'and one null row cannot unbound a batch');
 
 	// ...while an explicit epoch due time is honoured, because that is a real request.
-	await funnel.writeSchedule('e|desktop', { nextRenderTime: 0, fromSitemap: false });
+	await funnel.writeSchedule('e|desktop', { nextRenderTime: 0, fromSitemap: false, effectiveInterval: HOUR });
 	assert.equal(funnel.leaseTable().rawFloorMinute(), 0, 'a due time AT the epoch unbounds the scan on purpose');
 });
 
@@ -737,7 +740,11 @@ test('ONE schedule write per render, claim to result — the halved audit volume
 	assert.equal(puts.length, 0, 'claiming writes NOTHING to the table now');
 
 	// The result lands and reschedules.
-	await funnel.writeSchedule('a|desktop', { nextRenderTime: T0 + 24 * 60 * MINUTE, fromSitemap: false });
+	await funnel.writeSchedule('a|desktop', {
+		nextRenderTime: T0 + 24 * 60 * MINUTE,
+		fromSitemap: false,
+		effectiveInterval: HOUR,
+	});
 	assert.equal(puts.length, 1, 'exactly one write for the whole cycle');
 });
 
@@ -828,6 +835,25 @@ test('deleteSchedule lowers nothing and releases nothing', async () => {
 test('writeSchedule refuses a write with no explicit fromSitemap (put REPLACES the record)', async () => {
 	await assert.rejects(() => funnel.writeSchedule('a|desktop', { nextRenderTime: T0 }), /fromSitemap/);
 	await assert.rejects(() => funnel.writeSchedules([{ cacheKey: 'a|desktop', nextRenderTime: T0 }]), /fromSitemap/);
+});
+
+test('writeSchedule refuses a write with no explicit effectiveInterval (same hazard)', async () => {
+	// Same reason as `fromSitemap`, one step worse in its consequence: `put` replaces the record, so a
+	// writer that omits the cadence strips it off a row that had one and the ready-set sweep then ranks
+	// that page by its route ceiling instead of its demand-ladder rung. `null` is a legal answer — a
+	// render-now one-off has no cadence — so the guard is on `undefined` alone.
+	await assert.rejects(
+		() => funnel.writeSchedule('a|desktop', { nextRenderTime: T0, fromSitemap: false }),
+		/effectiveInterval/
+	);
+	await assert.rejects(
+		() => funnel.writeSchedules([{ cacheKey: 'a|desktop', nextRenderTime: T0, fromSitemap: false }]),
+		/effectiveInterval/
+	);
+	await funnel.writeSchedule('a|desktop', { nextRenderTime: T0, fromSitemap: false, effectiveInterval: null });
+	await funnel.writeSchedules([
+		{ cacheKey: 'b|desktop', nextRenderTime: T0, fromSitemap: false, effectiveInterval: null },
+	]);
 });
 
 test('maybeResetFloor honours its interval and is a no-op at 0', () => {

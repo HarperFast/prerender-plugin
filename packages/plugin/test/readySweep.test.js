@@ -23,6 +23,11 @@ import assert from 'node:assert/strict';
  *     sitemap-listed, so a job reporting `false` for a listed page silently stops it being cached.
  *     That bug has shipped twice in this package.
  *   - A NOT-YET-DUE ROW IS NEVER PUBLISHED, however urgent its cadence would make it.
+ *   - THE ROW'S OWN CADENCE WINS OVER THE ROUTE'S. `render.demand` promotes visited targets beneath
+ *     their route ceiling and files the rung on the schedule row; scoring from the route alone
+ *     divides a promoted page's lateness by up to 4x too much, deprioritising exactly the pages the
+ *     ladder singled out as worth rendering more often. Nothing else in this suite can see it — the
+ *     route resolves identically either way.
  */
 
 const MINUTE = 60_000;
@@ -99,11 +104,21 @@ const seed = (rows) => {
 	table = new Map(rows.map((r) => [r.cacheKey, r]));
 };
 
-const row = (url, device, dueAt, fromSitemap = true) => ({
+const row = (url, device, dueAt, fromSitemap = true, effectiveInterval = undefined) => ({
 	cacheKey: `${url}|${device}`,
 	nextRenderTime: dueAt,
 	fromSitemap,
+	// Absent unless a test asks for it, which is also the shape of every row written before the field
+	// existed — so the default here exercises the upgrade path.
+	...(effectiveInterval === undefined ? {} : { effectiveInterval }),
 });
+
+// The reset `beforeEach` performs, extracted so a test that claims more than once can repeat it.
+// Claims LEASE what they grant, and leases outlive an iteration in shared memory — so a loop that
+// re-seeds the table but not the buffers silently starts skipping the row it granted last time.
+const resetShared = () => {
+	for (const buffer of sabs.values()) new Uint8Array(buffer).fill(0);
+};
 
 beforeEach(() => {
 	withRoutes();
@@ -113,7 +128,7 @@ beforeEach(() => {
 	// earlier test's claim make the fallback scan skip rows and start further down the index. Zeroing
 	// the bytes resets the floor, the leases, the occupancy gauge and the set in one step, and the
 	// views the modules hold stay valid because only the contents change.
-	for (const buffer of sabs.values()) new Uint8Array(buffer).fill(0);
+	resetShared();
 	config.queue.ready.enabled = true;
 	config.queue.ready.sweepCap = 500_000;
 	config.queue.ready.sitemapBoost = 2;
@@ -388,4 +403,88 @@ test('the sweep notes the pin AND runs the unpin hatch, so one wedged row cannot
 	} finally {
 		config.queue.claimFloor.unpinAfter = previous;
 	}
+});
+
+test('THE LADDER GAP: a promoted row outranks one that is later in absolute AND route-relative terms', async () => {
+	// Both on the 48h product route, both sitemap-listed, so the route and the boost are identical and
+	// the carried cadence is the only thing that can separate them.
+	//
+	//   promoted   6h late, cadence 6h (the ladder's rung)  ->  1.00 cadences late
+	//   ceiling   12h late, cadence 48h (the route)         ->  0.25 cadences late
+	//
+	// Scoring from the route alone reverses this: 6/48 = 0.125 loses to 12/48 = 0.25. So this fails on
+	// the version that resolves every row from config, which is the bug being fixed.
+	seed([
+		row('https://www.kohls.com/product/prd-promoted/x', 'desktop', T0 - 6 * HOUR, true, 6 * HOUR),
+		row('https://www.kohls.com/product/prd-ceiling/x', 'desktop', T0 - 12 * HOUR, true),
+	]);
+
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.due, 2);
+	assert.equal(sweep.cadenceCarried, 1, 'one row carried a cadence, one fell back to config');
+
+	const pass = await funnel.claimSchedules({ grantLimit: 1 });
+	assert.deepEqual(
+		pass.jobs.map((j) => j.cacheKey),
+		['https://www.kohls.com/product/prd-promoted/x|desktop'],
+		'a full cadence late on its 6h rung beats a quarter of a cadence late on the 48h ceiling'
+	);
+});
+
+test('a row carrying no cadence is scored from config — the upgrade path, and the default here', async () => {
+	// Every row on a node is in this state immediately after an upgrade, so "falls back correctly" is
+	// the behaviour that has to hold on deploy day.
+	seed(backlogWithLateHome());
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.cadenceCarried, 0, 'nothing carried, so the count reports the backfill has not landed');
+
+	const pass = await funnel.claimSchedules({ grantLimit: 1 });
+	assert.deepEqual(
+		pass.jobs.map((j) => j.cacheKey),
+		['https://www.kohls.com/|desktop'],
+		'and the ordering is still right, from route resolution alone'
+	);
+});
+
+test('an unusable carried cadence falls back instead of producing an infinite score', async () => {
+	// `0` is the dangerous one: dividing by it yields Infinity, which would sort a junk row to the head
+	// of the set and hand it every lease. `carriedCadence` requires `> 0`, so each of these resolves
+	// from the route instead, leaving the genuinely late homepage in front.
+	for (const junk of [0, -1, null, NaN, 'nonsense']) {
+		// Per iteration, not per test: the previous iteration LEASED the homepage it granted, and a
+		// leased row is skipped — so without this the second iteration grants the junk row and the
+		// assertion "fails" for a reason that has nothing to do with the cadence.
+		resetShared();
+		seed([
+			row('https://www.kohls.com/product/prd-junk/x', 'desktop', T0 - 30 * MINUTE, true, junk),
+			row('https://www.kohls.com/', 'desktop', T0 - 2 * HOUR, true, HOUR),
+		]);
+		const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+		assert.equal(sweep.cadenceCarried, 1, `only the homepage carries a usable cadence (junk: ${junk})`);
+
+		const pass = await funnel.claimSchedules({ grantLimit: 1 });
+		assert.deepEqual(
+			pass.jobs.map((j) => j.cacheKey),
+			['https://www.kohls.com/|desktop'],
+			`a junk cadence does not jump the queue (junk: ${junk})`
+		);
+	}
+});
+
+test('a BigInt carried cadence from a Long column is used, not discarded', async () => {
+	// Same coercion trap as the due time: `Number.isFinite` rejects a BigInt outright, so without the
+	// `Number()` first every promoted row would silently fall back to its route ceiling — the exact bug
+	// this field exists to fix, reintroduced invisibly.
+	seed([
+		row('https://www.kohls.com/product/prd-promoted/x', 'desktop', T0 - 6 * HOUR, true, BigInt(6 * HOUR)),
+		row('https://www.kohls.com/product/prd-ceiling/x', 'desktop', T0 - 12 * HOUR, true),
+	]);
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(sweep.cadenceCarried, 1);
+
+	const pass = await funnel.claimSchedules({ grantLimit: 1 });
+	assert.deepEqual(
+		pass.jobs.map((j) => j.cacheKey),
+		['https://www.kohls.com/product/prd-promoted/x|desktop']
+	);
 });

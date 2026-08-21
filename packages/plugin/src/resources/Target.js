@@ -108,6 +108,11 @@ export class Target extends TargetTable {
 						? nextRenderTime
 						: getInitialRenderTime(cacheKey, interval),
 				fromSitemap,
+				// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
+				// target row, so a put clears `demandInterval` along with the suppression fields; the
+				// target genuinely restarts at its route/stored cadence and this records that. Reading
+				// the old rung to carry it forward would file a cadence the target no longer has.
+				effectiveInterval: interval,
 			}))
 		);
 
@@ -200,6 +205,13 @@ export class Target extends TargetTable {
 					cacheKey,
 					nextRenderTime: recheckAt,
 					fromSitemap: !!existing?.sitemapUrl,
+					// THE CADENCE, NOT `recheckInterval` — this is the case `util/renderPriority.js` calls
+					// out by name. A 7-day recheck filed as a cadence would make a suppressed 48h page read
+					// as 3.5 cadences stale the moment it comes due and outrank a genuinely late homepage,
+					// promoting exactly the rows worth deprioritizing. No rung applied for the same reason
+					// as `put`: the `TargetTable.put` above omits `demandInterval`, so the rung is cleared
+					// with it and the target resumes at its route/stored cadence.
+					effectiveInterval: resolveRenderInterval(url, existing?.renderInterval ?? null),
 				}))
 			),
 			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
@@ -304,7 +316,18 @@ export class Target extends TargetTable {
 				// that changes nothing. Hoisting the lowering out of the loop would mean carrying the
 				// batch's rows in memory to no measurable end.
 				await writeSchedules(
-					cacheKeysOf(url).map((cacheKey) => ({ cacheKey, nextRenderTime, fromSitemap: !!sitemapUrl }))
+					cacheKeysOf(url).map((cacheKey) => ({
+						cacheKey,
+						nextRenderTime,
+						fromSitemap: !!sitemapUrl,
+						// `null` — the sweep resolves from config instead, which is what it did before this
+						// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and
+						// an API-facing guard enforces exactly those two), so carrying a cadence here would
+						// mean widening that contract. It cannot affect this row's ranking anyway: every row
+						// is filed at the current minute, so its lateness is ~0 whatever the denominator,
+						// and the render it is being queued for refills the cadence on completion.
+						effectiveInterval: null,
+					}))
 				);
 			},
 		});

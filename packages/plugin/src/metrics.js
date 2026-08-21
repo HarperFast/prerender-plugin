@@ -659,6 +659,20 @@ export const metrics = Object.freeze({
 	readyPublished: (count) => server.recordAnalytics(count, 'queue_health', 'ready_published', null, null),
 
 	/**
+	 * How much of the due set the last sweep could score against its REAL cadence, `carried` vs
+	 * `resolved`.
+	 *
+	 * The backfill gauge, and the only way to see it land. `effectiveInterval` is written by the
+	 * schedule writers, so it is absent on every row until that row re-renders: this reads all
+	 * `resolved` on the first sweep after an upgrade and should cross over within one cadence. A ratio
+	 * that STAYS low is the interesting signal — it means rows are being filed without a cadence (a
+	 * writer passing `null`, a corpus that is not re-rendering) and the demand ladder's promotions are
+	 * being scored against their route ceilings, which is the exact bug this field exists to fix. It
+	 * cannot be inferred from anything else: the ordering still works in both states, just less well.
+	 */
+	readyCadenceSource: (count, source) => server.recordAnalytics(count, 'queue_health', 'ready_cadence', source, null),
+
+	/**
 	 * Jobs granted per claim, split by WHERE they came from: the ready set or the fallback index scan.
 	 *
 	 * This is the series that says whether prioritisation is actually happening. The ready set reorders

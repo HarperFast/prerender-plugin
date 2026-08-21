@@ -325,3 +325,48 @@ test('the escape hatch is off with the floor off: an unfloored scan is not held 
 		config.queue.claimFloor.enabled = original;
 	}
 });
+
+test('THE UPGRADE PATH: the hatch still fires for a row carrying no cadence, and files one', async () => {
+	// `seed` writes rows with no `effectiveInterval`, which is the shape of EVERY row on a node until
+	// it has re-rendered once — so this is the state of the whole corpus on deploy day.
+	//
+	// The bug this pins was invisible in every other test here: the hatch reads the cadence off the row
+	// and hands it back to `writeSchedule`, whose guard REFUSES `undefined`. The refusal lands inside
+	// the hatch's own try/catch, is logged and swallowed, and the hatch does nothing while reporting
+	// nothing — so the one mechanism that bounds a wedged row would have been dead on arrival, on every
+	// node, for a full cadence after the upgrade.
+	seed();
+	assert.equal(schedule.get(WEDGED).effectiveInterval, undefined, 'precondition: a pre-upgrade row');
+
+	await RenderQueue.claim({ limit: 5 });
+	nowMs += config.queue.claimFloor.unpinAfter + MINUTE;
+	await RenderQueue.claim({ limit: 5 });
+
+	assert.equal(unpinWarnings().length, 1, 'the hatch fired');
+	const row = schedule.get(WEDGED);
+	assert.equal(Number(row.nextRenderTime), nowMs + config.render.defaultInterval, 'pushed by the resolved cadence');
+	// And the row is left self-describing, so the sweep that ranks it next does not have to resolve it
+	// again — and `nextRenderTime - effectiveInterval` still reads back as "completed now".
+	assert.equal(Number(row.effectiveInterval), config.render.defaultInterval, 'the push records the cadence it used');
+	assert.equal(Number(row.nextRenderTime) - Number(row.effectiveInterval), nowMs);
+});
+
+test('...and a row that DOES carry a cadence is pushed by that, not by the route', async () => {
+	// The residual the hatch used to have to state in a comment: it resolved route > default only, so a
+	// target whose cadence came from anywhere else (a stored `changefreq`, a demand-ladder rung) was
+	// pushed by the wrong distance. A carried cadence closes it — 6h here, against the target's stored
+	// DAY and no route interval at all.
+	seed();
+	schedule.get(WEDGED).effectiveInterval = 6 * 60 * MINUTE;
+
+	await RenderQueue.claim({ limit: 5 });
+	nowMs += config.queue.claimFloor.unpinAfter + MINUTE;
+	await RenderQueue.claim({ limit: 5 });
+
+	assert.equal(unpinWarnings().length, 1);
+	assert.equal(
+		Number(schedule.get(WEDGED).nextRenderTime),
+		nowMs + 6 * 60 * MINUTE,
+		"the row's own cadence, not render.defaultInterval and not the target's stored DAY"
+	);
+});

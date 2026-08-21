@@ -548,11 +548,28 @@ reads no index at all. That is affordable because of one measured fact
 cost ~480 ms and a 500k-row overdue set ~1.2 s, with **zero writes**. Writes are 76–89 µs/row, 32× a
 read, so reading liberally and writing not at all is the cheap direction.
 
-The score is `max(0, now − dueAt) / renderInterval`, multiplied by `queue.ready.sitemapBoost` for a
+The score is `max(0, now − dueAt) / effectiveInterval`, multiplied by `queue.ready.sitemapBoost` for a
 sitemap-sourced row. Lateness rather than age, deliberately: `dueAt − interval` is not when the page
 last rendered for every row — suppression rechecks schedule 7 days, `backoffWait` up to `maxBackoff`,
 the unpin hatch a `defaultInterval` — so an age-based ratio would put a 7-day recheck on a 48 h route
 at the _head_ of the queue reading as 3.5 cadences stale.
+
+**The cadence is the row's own, not the route's** — and this is load-bearing rather than a detail.
+A route grants a _ceiling_ (`/catalog/` at 24 h) and `render.demand` promotes bot-visited targets
+beneath it to 12 h or 6 h, writing `now + rung` as the due time. Resolving the denominator from config
+would therefore divide a promoted page's lateness by 24 h when it is really on 6 h — a **4× under-
+statement, on precisely the pages the ladder singled out as worth rendering more often**, silently
+undoing the ladder's work. So every schedule writer files the cadence it used onto the row as
+`effectiveInterval` (`resolveEffectiveInterval`: rung > route > stored > default, the rung clamped to
+the ceiling so a stale one cannot read as slower), and the sweep divides by that. It rides along in a
+projection the sweep already pays for, so it costs no extra read — recovering it from `RenderTarget`
+instead would be a cross-database point read per row over the whole due set, ~75% of them replication
+fetches on a residency-pinned table.
+
+The field is **absent and self-healing** on rows written before it existed, and on the writers with no
+cadence in hand: the sweep falls back to resolving from config, which is exactly what it did before,
+and each row fills in when it next renders. `queue_health` `ready_cadence` (`carried`/`resolved`) is
+the gauge — all `resolved` on the first sweep after an upgrade, crossing over within one cadence.
 
 Three properties are worth knowing:
 
