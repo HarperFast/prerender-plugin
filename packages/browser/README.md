@@ -94,6 +94,13 @@ include what you change:
 		"navigationTimeoutMs": 0,
 		"networkIdleMs": 300,
 		"networkIdleTimeoutMs": 1000,
+		// Skip the settle phase when the pre-settle DOM already proves the page non-indexable
+		// (non-200, `noindex`, or a canonical naming another document). The plugin can never store
+		// such a page, so settling it is waste — settle is ~80% of a render. Only ever SKIPS a
+		// render: a verdict that appears after DOMContentLoaded is still caught post-settle, and
+		// sitemap-listed urls are exempt. Default false — enable it if your canonical and robots
+		// tags are served in the document rather than written by script.
+		"skipSettleWhenNonIndexable": false,
 	},
 	"scroll": { "enabled": true, "stepMs": 200, "topSettleMs": 300 }, // scroll to bottom for lazy content; topSettleMs lets scroll-reactive headers re-reveal at the top before serializing
 	// optional: AFTER the normal scroll-settle (which still runs and triggers all other lazy content),

@@ -86,6 +86,26 @@ export type NavigationConfig = {
 	domStableTimeoutMs: number;
 	domStablePollMs: number;
 	domStableTolerance: number;
+	/**
+	 * Decide indexability against the pre-settle DOM and skip the settle phase when the answer
+	 * is already "not indexable". The plugin's store guard is `statusCode === 200 && content`,
+	 * so a page the initial document already disowns (non-200, `noindex`, or a canonical naming
+	 * another document) can never be stored no matter how long it settles — the settle is pure
+	 * waste. Measured on kohls: settle is 8.9s of a 10.9s render (81%), navigation 1.45s, so a
+	 * pre-settle bail costs ~1.7s instead of ~10.9s.
+	 *
+	 * The post-settle check still runs for everything that survives, and it stays authoritative:
+	 * script-injected canonical/robots tags appear after this point, so this can only skip a
+	 * render, never mark one indexable that the settled DOM would have rejected.
+	 *
+	 * Sitemap jobs are exempt — the post-settle path stores their content even when
+	 * non-indexable, so bailing would change what gets cached rather than only how long it took.
+	 *
+	 * Default false (preserves prior behavior): a site whose canonical or robots tag is written
+	 * by script rather than served in the document would see pages skipped that a full render
+	 * would have kept.
+	 */
+	skipSettleWhenNonIndexable: boolean;
 };
 
 export type ScrollConfig = {
@@ -286,6 +306,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStableTimeoutMs: 8000,
 		domStablePollMs: 250,
 		domStableTolerance: 8,
+		skipSettleWhenNonIndexable: false,
 	},
 	scroll: {
 		enabled: true,
