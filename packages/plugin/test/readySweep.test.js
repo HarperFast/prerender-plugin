@@ -34,6 +34,7 @@ let funnel, config, applyOptions;
 const sabs = new Map();
 let table = new Map();
 let searches = 0;
+let puts = [];
 
 before(async () => {
 	globalThis.server = { hostname: 'test-node', workerIndex: 0, nodes: [], config: { http: { port: 9926 } } };
@@ -53,7 +54,9 @@ before(async () => {
 		},
 		render_schedule: {
 			RenderSchedule: {
-				put: async () => {},
+				put: async (cacheKey, row) => {
+					puts.push({ cacheKey, ...row });
+				},
 				delete: async () => {},
 				get: async () => undefined,
 				// The one-sided ascending walk the real query performs: `>= value`, sorted, limited.
@@ -115,6 +118,7 @@ beforeEach(() => {
 	config.queue.ready.sweepCap = 500_000;
 	config.queue.ready.sitemapBoost = 2;
 	searches = 0;
+	puts = [];
 });
 
 // A backlog of 48h-cadence product pages that are older in absolute terms, plus a 1h homepage that
@@ -315,4 +319,73 @@ test('a BigInt due time from a Long column is scored, not thrown on', async () =
 	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
 	assert.equal(sweep.due, 1);
 	assert.equal(funnel.readyQueue().peek(1)[0].cacheKey, 'https://www.kohls.com/a|desktop');
+});
+
+// ---- what the sweep took over, and therefore has to keep reporting ---------------------------
+//
+// These four are the findings of a self-review, and every one of them passed the 750-test suite
+// while broken. The shape of the mistake is the same each time: the sweep took over OBSERVING the
+// index, and three separate signals were quietly derived from the fact that a CLAIM did the
+// observing. On a node serving every claim from the ready set, nothing observed the index at all.
+
+test('the sweep carries the earliest NOT-YET-DUE minute, so a node does not report empty with work coming', async () => {
+	// `deriveQueueStatus` flips `empty` -> `queued` the moment that minute arrives, at zero database
+	// cost, and there is a test elsewhere pinning that it needs no search. The sweep runs every minute
+	// and OVERWRITES the recorded outcome, so reporting 0 here would wipe the mechanism and tell the
+	// whole fleet to idle while a row was seconds from being due.
+	seed([row('https://www.kohls.com/a', 'desktop', T0 + 30 * MINUTE)]);
+	const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+
+	assert.equal(sweep.due, 0, 'nothing is due yet...');
+	assert.equal(sweep.earliestNotYetDueMinute, minuteOf(T0 + 30 * MINUTE), '...but the sweep knows when it will be');
+	assert.equal(funnel.deriveQueueStatus(T0), 'empty', 'empty before that minute arrives');
+	assert.equal(
+		funnel.deriveQueueStatus(T0 + 31 * MINUTE),
+		'queued',
+		'and queued once it has, with no scan — the mechanism the sweep must not wipe'
+	);
+});
+
+// The fourth finding — that the sweep must call `notePinnedBy`, or the pin age never advances and
+// both the wedged-row warning and the unpin hatch become unreachable — has no test of its own on
+// purpose. The obvious one (assert a pin age is reported) passes against the broken code, because the
+// age is stored in whole seconds and a same-tick pin is legitimately 0. The unpin test below is the
+// real coverage: `floorPinnedForMs >= 1000` across two sweeps is only reachable if the sweep noted
+// the pin with a stable key both times.
+
+test('...and it publishes WHICH row, so the warning cannot name an innocent URL', async () => {
+	seed(backlogWithLateHome());
+	await funnel.sweepReadySet({ nowMs: T0 });
+	assert.equal(
+		funnel.floorState().floorHeldBy,
+		'https://www.kohls.com/product/prd-0/x|desktop',
+		'floorState is what the console and the warning read; stale here names the wrong page'
+	);
+});
+
+test('the sweep notes the pin AND runs the unpin hatch, so one wedged row cannot hold the floor forever', async () => {
+	// `unpinAfter` is the bound on a row whose render never posts a result. It is reached from the
+	// claim path today; if the ready set serves every claim, the sweep has to reach it instead.
+	const previous = config.queue.claimFloor.unpinAfter;
+	config.queue.claimFloor.unpinAfter = 1;
+	try {
+		seed([row('https://www.kohls.com/product/prd-0/x', 'desktop', T0 - 10 * 24 * HOUR)]);
+		// First sweep starts the pin clock; the hatch needs the pin to have LASTED, and the age is
+		// stored in whole seconds, so this waits past a second boundary rather than faking a clock the
+		// lease table does not take.
+		await funnel.sweepReadySet({ nowMs: T0 });
+		await new Promise((resolve) => setTimeout(resolve, 1100));
+		puts = [];
+		const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+
+		assert.ok(sweep.floorPinnedForMs >= 1000, `pin should have aged, got ${sweep.floorPinnedForMs}`);
+		assert.ok(sweep.floorUnpinned, 'the hatch must fire from the sweep path');
+		assert.equal(sweep.floorUnpinned.cacheKey, 'https://www.kohls.com/product/prd-0/x|desktop');
+		// It moves the row FORWARD — the whole point is to let the floor advance past it.
+		const written = puts.find((p) => p.cacheKey === 'https://www.kohls.com/product/prd-0/x|desktop');
+		assert.ok(written, 'the hatch writes the row');
+		assert.ok(Number(written.nextRenderTime) > T0, 'and writes it into the future');
+	} finally {
+		config.queue.claimFloor.unpinAfter = previous;
+	}
 });

@@ -1292,7 +1292,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'Entries the ready set holds. Sized to cover several sweep intervals of claims so the set ' +
 						'does not run dry between sweeps: at the recorded fleet throughput a node grants roughly ' +
 						'5 jobs a second, so 5,000 entries is about 16 minutes of work.\n\n' +
-						'Costs `capacity x ~276` bytes of shared memory (1.4MB at the default). Raising it does ' +
+						'Costs `capacity x ~276 x 2` bytes of shared memory — two slots, so ~2.8MB at the default. ' +
+						'Raising it does ' +
 						'NOT make the ordering better — the sweep already scores every due row and keeps the best ' +
 						'of them — it only makes the set last longer between sweeps.\n\n' +
 						'Restart-scoped: a named shared buffer is sized by its first allocation, so a live change ' +

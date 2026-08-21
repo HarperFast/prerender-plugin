@@ -690,6 +690,8 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	let nonFinite = 0;
 	let firstDueMinute = null;
 	let firstDueKey = null;
+	let firstDueRow = null;
+	let earliestNotYetDueMinute = 0;
 	let reachedNotYetDue = false;
 
 	// DRAINED WITH NO WRITES AND NO ATOMICS INSIDE THE LOOP. Harper's long-transaction monitor aborts
@@ -707,6 +709,13 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		if (dueAt > nowMs) {
 			// Rows arrive ascending, so the first not-yet-due row means the due set is exhausted —
 			// recorded, but the cursor is still drained to the end rather than abandoned.
+			//
+			// ITS MINUTE IS CARRIED, not discarded. `deriveQueueStatus` uses it to flip a node from
+			// `empty` to `queued` the moment that minute arrives, with zero database cost — so a sweep
+			// that reported 0 here would WIPE that (it runs every minute and overwrites whatever the
+			// claim pass recorded), and a node with nothing due but a row due in thirty seconds would
+			// tell the whole fleet to go idle.
+			if (!reachedNotYetDue) earliestNotYetDueMinute = minuteOf(dueAt);
 			reachedNotYetDue = true;
 			continue;
 		}
@@ -714,6 +723,10 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		if (firstDueMinute === null) {
 			firstDueMinute = minuteOf(dueAt);
 			firstDueKey = row.cacheKey;
+			// The row itself, because `maybeUnpinFloor` has to REWRITE it and `put` replaces the record —
+			// so it needs the `fromSitemap` flag this sweep already has in hand. Re-reading the row to
+			// recover a flag that was in hand is how `Target.revalidate` silently cleared it for a year.
+			firstDueRow = { cacheKey: row.cacheKey, dueMinute: firstDueMinute, fromSitemap: !!row.fromSitemap };
 		}
 		const url = CacheKey.extractUrl(row.cacheKey);
 		const score = scoreOf(
@@ -736,7 +749,27 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	if (floorEnabled) {
 		floorAdvanced = leases.advanceFloor(floorFrom, Math.max(0, firstDueMinute ?? nowMinute - guardMinutes()));
 	}
-	leases.recordPassOutcome({ sawDue: due > 0, earliestNotYetDueMinute: 0 });
+	leases.recordPassOutcome({ sawDue: due > 0, earliestNotYetDueMinute });
+
+	// THE SWEEP TOOK OVER OBSERVING THE INDEX, SO IT HAS TO TAKE OVER THE REPORTING THAT DEPENDS ON
+	// OBSERVING IT. The pin age only advances when something calls `notePinnedBy`, and the wedged-row
+	// warning and `maybeUnpinFloor` both key off it — so on a node serving every claim from the ready
+	// set, neither would ever fire and a permanently failing URL would pin the floor with no warning
+	// and no automatic push. That is precisely the unbounded case `queue.claimFloor.unpinAfter` exists
+	// to bound, so it cannot be allowed to depend on which path served the last claim.
+	const floorPinnedForMs = leases.notePinnedBy(firstDueKey);
+	// ...and the KEY, for the same reason. `floorState` reads this, so a stale value would name an
+	// innocent URL as the thing pinning the queue.
+	lastFloorHeldBy = firstDueKey;
+	lastFloorHeldByAt = Date.now();
+
+	// AFTER the cursor is closed, never inside the drain: the hatch WRITES, and a write issued with a
+	// scan cursor still open is the shape Harper's long-transaction monitor aborts.
+	const floorUnpinned = await maybeUnpinFloor({
+		floorHeldByRow: firstDueRow,
+		floorPinnedForMs,
+		floorTo: firstDueMinute,
+	});
 
 	return {
 		scanned,
@@ -746,6 +779,9 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		capacity: queue.capacity,
 		floorFrom,
 		floorAdvanced,
+		floorPinnedForMs,
+		floorUnpinned,
+		earliestNotYetDueMinute,
 		firstDueKey,
 		// `scanned >= cap` alone says nothing — the query is one-sided, so on any real corpus the window
 		// fills. Reaching a not-yet-due row is what proves the due set was seen to its end, and only its
