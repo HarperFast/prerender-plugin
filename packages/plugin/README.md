@@ -654,7 +654,11 @@ claim floor, schedule repair — are plugin behavior.)
   statistic that merges exactly across combos, buckets and nodes). "What does a crawler normally
   get" uses the **median** — serve time, origin cost, served age. **p95** is kept for the tail
   alone, where a pathology hides behind a healthy middle (a cohort of cache hits at 13.6s while
-  the median stayed at 2.3ms). Two consequences worth knowing: serve time is reported per cache
+  the median stayed at 2.3ms). The render-time tile carries a second figure for the same reason:
+  since browser v1.18.0 a non-indexable page can bail without settling, so the pooled mean falls as
+  the BAIL RATE rises — a real throughput gain, but not a faster settle — and the mean of the
+  renders that actually produced a stored page is shown beside it. Two further consequences worth
+  knowing: serve time is reported per cache
   verdict rather than pooled, because a single figure over a 2ms population and a 400ms one tracks
   the hit rate rather than any latency; and staleness is judged on the median, because a page's
   age walks from zero to its interval, so an evenly refreshed corpus sits at 0.50× with its p95

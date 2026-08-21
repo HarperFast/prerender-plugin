@@ -97,6 +97,18 @@ export function fmtRatio(v) {
 	return `${v.toFixed(2)}×`;
 }
 
+/**
+ * A ratio, or null when either side is missing — never a number that only looks like an answer.
+ *
+ * `null / 48h` is **0**, not NaN, so a missing measurement divided by a present yardstick formats
+ * as a confident "0.00×" — the most flattering possible reading of "we have no data". It is the
+ * same `Number(null) === 0` trap the plugin's own `numberOf()` exists for, arriving through
+ * division instead of coercion. Every ÷-cadence figure on the Traffic view goes through here so
+ * the guard cannot be forgotten at one call site out of four.
+ */
+export const ratioOf = (value, yardstick) =>
+	Number.isFinite(value) && Number.isFinite(yardstick) && yardstick > 0 ? value / yardstick : null;
+
 export function fmtCount(v) {
 	if (v === null || v === undefined || !Number.isFinite(v)) return '—';
 	if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;

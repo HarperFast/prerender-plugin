@@ -74,6 +74,7 @@ import {
 	lineChart,
 	pick,
 	rangePicker,
+	ratioOf,
 	scanFooter,
 	segmented,
 	SERIES,
@@ -495,7 +496,8 @@ function staleness(ctx, data, scope) {
 	// The SWR ceiling is only a single line when a single interval is the divisor. Normalized per
 	// route it lands somewhere different for every route, so it is not drawn — and the note below
 	// must not describe a line that isn't there.
-	const swrBand = mode === 'ratio' && basis === 'default' && Number.isFinite(swrTtl) ? 1 + swrTtl / fallback : null;
+	const swrOverInterval = ratioOf(swrTtl, fallback);
+	const swrBand = mode === 'ratio' && basis === 'default' && swrOverInterval !== null ? 1 + swrOverInterval : null;
 	const bands = mode === 'ratio' ? [1, swrBand].filter(Number.isFinite) : fallback;
 
 	// Ages that computed NEGATIVE are dropped at the emit site (cross-node clock skew), so the
@@ -1120,7 +1122,8 @@ function routes(ctx, data, cadences, filter) {
 		const ageRows = ageByRoute.get(route) ?? [];
 		const ageMedian = weighted(ageRows, 'median');
 		const ageTailP95 = weighted(ageRows, 'p95');
-		const ratio = Number.isFinite(ageMedian) && cadence.interval > 0 ? ageMedian / cadence.interval : null;
+		const ratio = ratioOf(ageMedian, cadence.interval);
+		const tailRatio = ratioOf(ageTailP95, cadence.interval);
 		return el('tr', null, [
 			el('td', { cls: 'mono', text: route }),
 			el('td', null, [
@@ -1163,7 +1166,7 @@ function routes(ctx, data, cadences, filter) {
 					? el('span', {
 							cls: ratio > 1 ? 'pill warn' : 'mono',
 							text: fmtRatio(ratio),
-							title: `p95 ${fmtRatio(cadence.interval > 0 ? ageTailP95 / cadence.interval : NaN)}`,
+							title: `p95 ${fmtRatio(tailRatio)}`,
 						})
 					: muted('—'),
 			]),

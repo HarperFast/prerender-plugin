@@ -28,6 +28,7 @@ installDom();
 const { el } = await import('../src/admin/ui.js');
 const { load, render, cadenceIndex, cadenceFor, notHitRows, originVerdict, originCostByReason, coverageSplit } =
 	await import('../src/admin/views/traffic.js');
+const { ratioOf } = await import('../src/admin/charts.js');
 
 const HOUR = 3_600_000;
 const BUCKETS = 4;
@@ -297,6 +298,37 @@ test('the per-route table and the staleness tile use the SAME statistic', async 
 	// below a tile saying 2.50x, with nothing on screen to reconcile them.
 	assert.match(product.textContent, /3\.00×/);
 	assert.doesNotMatch(product.textContent, /9\.00×/);
+});
+
+test('a missing measurement is not a confident zero', () => {
+	// `null / 48h` is 0 in JavaScript, not NaN, so an absent p95 divided by a present cadence
+	// formats as "0.00×" — the most flattering possible reading of "we have no data". Same trap as
+	// `Number(null) === 0`, arriving through division instead of coercion.
+	assert.equal(ratioOf(null, 48 * HOUR), null);
+	assert.equal(ratioOf(undefined, 48 * HOUR), null);
+	assert.equal(ratioOf(3 * HOUR, null), null);
+	assert.equal(ratioOf(3 * HOUR, 0), null, 'a zero cadence is not a yardstick');
+	assert.equal(ratioOf(3 * HOUR, -1), null);
+	assert.equal(ratioOf(3 * HOUR, 6 * HOUR), 0.5);
+	assert.equal(ratioOf(0, 6 * HOUR), 0, 'a measured zero IS an answer');
+});
+
+test('a route whose tail could not be merged shows no tail, rather than 0.00×', async () => {
+	const ctx = await ready();
+	// A distribution the payload carried without a p95 — the shape `weighted` answers null for.
+	ctx.data.analytics = {
+		...ANALYTICS,
+		series: ANALYTICS.series.map((s) => {
+			if (s.metric !== 'route_page_age' || s.path !== '/product/') return s;
+			const { p95, p95s, ...rest } = s;
+			return rest;
+		}),
+	};
+	const product = rowFor(draw(ctx), '/product/');
+	const tail = find(product, (n) => String(n.attributes?.title ?? '').startsWith('p95 '));
+	assert.equal(tail.attributes.title, 'p95 —', 'an absent tail must read as absent');
+	// The median is unaffected, so the row still says what it does know.
+	assert.match(product.textContent, /3\.00×/);
 });
 
 test('the origin cost column is what a miss typically costs, not its tail', async () => {
