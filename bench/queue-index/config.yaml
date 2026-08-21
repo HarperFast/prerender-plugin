@@ -1,0 +1,11 @@
+# Benchmark component for the RenderSchedule queue index.
+#
+# NOT SHIPPED. This is a dev harness, declared as its own Harper component so it runs against a real
+# Harper storage engine rather than against a mock — the whole point is to price the storage layer,
+# which is the one thing a unit test cannot tell you.
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+pluginModule: 'bench.js'
