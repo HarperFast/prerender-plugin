@@ -1275,8 +1275,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'THE OLDEST DUE TIME: under a backlog every row in it is ancient, so the homepage is never ' +
 				'read at all and a wider window is just more ancient rows. So a sweep scores the WHOLE due ' +
 				'set and keeps the best few thousand in shared memory; claims pop from that and touch no ' +
-				'index. Affordable because a projected one-sided read measures ~2.4us/row, flat — 200,000 ' +
-				'rows in ~480ms, with zero writes.\n\n' +
+				'index. Affordable because the read is projected, one-sided and write-free — though HOW affordable ' +
+				'depends on the corpus, not just the query: ~2.4us/row on a fresh 200k-row bench corpus, but ' +
+				'~55us/row over production 1.3M churned rows, where a ~300k due set is a ~27s sweep (measured ' +
+				'live 2026-08-21).\n\n' +
 				'ORDERING ONLY. Total render volume cannot change: every row it reorders is already due. ' +
 				'And it is a CACHE in front of the old path — cold, exhausted or disabled, claims fall back ' +
 				'to the index scan, so every failure mode here is the previous behaviour rather than a ' +
@@ -1316,7 +1318,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'rounding error, and `capacity` covers roughly three of these intervals of claims, so the ' +
 						'set does not run dry between sweeps.\n\n' +
 						'FIVE MINUTES RATHER THAN ONE, on production evidence. A synthetic benchmark puts a ' +
-						'projected one-sided read at ~2.4us/row, which would make a sweep sub-second — but the live ' +
+						'projected one-sided read at ~2.4us/row on a FRESH corpus, which would make a sweep sub-second — but ' +
 						'cluster reports `claim_scan_ms` at a 5-6ms median over a window of roughly 205 rows ' +
 						'(grantLimit + in-flight + grantLimit, at an observed lease occupancy of 75-155), and ' +
 						'`empty` passes at a 25ms mean with 47ms observed, which are seek-dominated. So the real ' +
@@ -1336,7 +1338,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				sweepCap: option(
 					500_000,
 					'Ceiling on rows one sweep reads. The due set cannot exceed the corpus, so this is a ' +
-						'guard against a runaway rather than a tuning knob — at ~2.4us/row the default is ~1.2s of ' +
+						'guard against a runaway rather than a tuning knob — though at the ~55us/row a churned corpus costs, ' +
 						'reading.\n\n' +
 						'If a sweep hits the cap WITHOUT reaching a not-yet-due row it is ordering over a prefix ' +
 						'of the backlog, which is reported and warned about: the rows past the cap are the ' +

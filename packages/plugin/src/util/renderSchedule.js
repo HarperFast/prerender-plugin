@@ -678,7 +678,8 @@ const claimFromIndex = async ({ grantLimit } = {}) => {
  * THE SWEEP — score the whole due set and publish the best of it.
  *
  * This is the part that makes priority possible at all, and the reason it can exist is one measured
- * fact (#119): a projected one-sided read is ~2.4 us/row, FLAT from 200 to 20,000 rows, and yielding
+ * fact — CORPUS-DEPENDENT, see `util/renderPriority.js`: a projected one-sided read is ~2.4 us/row on
+ * a fresh bench corpus but ~55 us/row on production's churned one, and yielding
  * every 200 rows costs nothing. So 200,000 rows cost ~480 ms and a 500k-row overdue set ~1.2 s — on a
  * timer, off the claim path, with zero writes. The claim path meanwhile stops reading the index at
  * all. Reads are 2.4 us and writes are 76-89 us; reading liberally and writing not at all is the
@@ -752,11 +753,32 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	let earliestNotYetDueMinute = 0;
 	let reachedNotYetDue = false;
 
-	// DRAINED WITH NO WRITES AND NO ATOMICS INSIDE THE LOOP. Harper's long-transaction monitor aborts
-	// a transaction that has pending writes when it fires, and a cursor left open across writes is
-	// that shape; the publish below is atomics-only and happens after the cursor is done. And no
-	// `break` out of the `for await` either — an abandoned iterator leaves its read transaction
-	// unreleased (see util/reconcile.js). The cut at "past now" is applied per row instead.
+	// NO WRITES AND NO ATOMICS INSIDE THE LOOP. Harper's long-transaction monitor aborts a transaction
+	// that has pending writes when it fires, and a cursor left open across writes is that shape; the
+	// publish below is atomics-only and happens after the cursor is done.
+	//
+	// IT DOES BREAK EARLY, and the comment this replaces said it must not. That claim conflated two
+	// different things. An ABANDONED iterator — one driven by hand with `.next()` and never returned —
+	// does hold its read transaction open: Harper's own long-transaction test
+	// (`integrationTests/database/longtxn-secondary-index`) uses exactly that as its mechanism, and
+	// states the contract: a `search()` iterator marks the read txn in use and releases it only when
+	// FULLY CONSUMED. But `for await ... of` is not that. On `break` the language calls
+	// `iterator.return()`, and Harper's search iterator implements it (`resources/Table.ts`):
+	//
+	//     return() { if (results.onDone) results.onDone(); return dbIterator.return(); }
+	//
+	// where `onDone` is what calls `txn.doneReadTxn()`. `throw()` does the same. So breaking releases
+	// the transaction on the same path a full drain does.
+	//
+	// WHY IT MATTERS ENOUGH TO REVISIT: the query is one-sided (`>= floor`), so after the due rows it
+	// keeps returning rows that are NOT yet due, and the old code read every one of them to the cap
+	// and discarded them. Measured on the production corpus (RocksDB, 4 nodes, 2026-08-21): ~300k due
+	// rows against a 500k cap, so ~198k rows — 40% of the scan — were read to be thrown away, about
+	// 11s of a 27s sweep. At the ~2.4us/row the bench measured on a FRESH corpus that waste was ~0.5s
+	// and draining was the free, obviously-safe choice; at the ~55us/row a churned 1.3M-row corpus
+	// actually costs, it is the single largest cost in the sweep. And the
+	// caught-up case, which is where the queue spends most of its time, goes from reading `cap` rows to
+	// reading one.
 	for await (const row of searchSchedulesFrom({ floorMinute: floorFrom, limit: cap })) {
 		scanned++;
 		const dueAt = numberOf(row.nextRenderTime);
@@ -765,17 +787,19 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 			continue;
 		}
 		if (dueAt > nowMs) {
-			// Rows arrive ascending, so the first not-yet-due row means the due set is exhausted —
-			// recorded, but the cursor is still drained to the end rather than abandoned.
+			// Rows arrive ascending, so the FIRST not-yet-due row means the due set is exhausted and
+			// every remaining row in the window is also not due. Nothing after this point can change
+			// the ranking, the floor, or any counter — so stop reading.
 			//
 			// ITS MINUTE IS CARRIED, not discarded. `deriveQueueStatus` uses it to flip a node from
 			// `empty` to `queued` the moment that minute arrives, with zero database cost — so a sweep
 			// that reported 0 here would WIPE that (it runs every minute and overwrites whatever the
 			// claim pass recorded), and a node with nothing due but a row due in thirty seconds would
-			// tell the whole fleet to go idle.
-			if (!reachedNotYetDue) earliestNotYetDueMinute = minuteOf(dueAt);
+			// tell the whole fleet to go idle. Breaking on the first such row is what makes this the
+			// EARLIEST one, which is the value that flip needs.
+			earliestNotYetDueMinute = minuteOf(dueAt);
 			reachedNotYetDue = true;
-			continue;
+			break;
 		}
 		due++;
 		if (firstDueMinute === null) {

@@ -21,11 +21,28 @@
  * `1/interval`, so two rows with different intervals cross exactly once — no stored key can express
  * an order that changes with the clock, and #80 rejected it as a comparator for exactly that reason.
  *
- * That objection is fatal to an index and irrelevant to a function that is re-evaluated. Measured
- * (#119): a projected one-sided read costs ~2.4 us/row, flat from 200 to 20,000 rows, and yielding
- * every 200 rows is free. So re-scoring the whole due set costs ~480 ms per 200,000 rows — cheap
- * enough to redo on a timer, which is what `util/readyQueue.js` does. Nothing is stored, so the
- * crossing never has to be represented.
+ * That objection is fatal to an index and irrelevant to a function that is re-evaluated. Re-scoring
+ * the whole due set on a timer is affordable because the read is projected, one-sided and write-free.
+ * HOW affordable was badly mis-estimated, and the correction is worth carrying because it is a trap
+ * anyone re-running the harness will fall into.
+ *
+ * `bench/queue-index` (#119) measured ~2.4 us/row. MEASURED ON THE PRODUCTION CORPUS (2026-08-21) the
+ * sweep runs ~55 us/row warm, ~80 us/row cold — a ~300k-row due set is a ~27s sweep, not the
+ * sub-second one the bench predicted. Same storage engine in both cases (RocksDB, Harper's default).
+ * What differs is the CORPUS: the bench wrote 200k rows fresh and read them immediately, where
+ * production holds 1.3M rows that have been rewritten on every render for months.
+ *
+ * On an LSM store that difference is the whole cost. Every reschedule is a `put` that supersedes the
+ * old value, and a range scan has to walk past superseded entries until compaction removes them — the
+ * same shape as the dead-index-entry degradation the claim floor exists to bound. The harness ALREADY
+ * measured this and it was read too narrowly: an unfloored seek after 40,000 head reschedules went
+ * 0.073 -> 5.60 ms, 77x, on the same engine and corpus. 2.4 us/row was a FLOOR for a fresh corpus,
+ * never a steady state.
+ *
+ * The ARGUMENT survives intact: reads are still vastly cheaper than writes (76-89 us/row, and `patch`
+ * worse than `put`), so recomputing in memory still beats encoding priority into `nextRenderTime`,
+ * which would have made every policy change a rewrite of 1.3M rows. What does not survive is sizing
+ * anything off a fresh-corpus number.
  *
  * The consequence worth stating plainly: BECAUSE THIS IS NOT IN THE KEY, changing the policy is a
  * config change with no data migration. Encoding priority into `nextRenderTime` (the rejected

@@ -544,8 +544,22 @@ So the ordering moved out of the index. A background sweep on worker 0 scores th
 and publishes the best few thousand into a shared buffer; `claim` pops from that in priority order and
 reads no index at all. That is affordable because of one measured fact
 ([#119](https://github.com/HarperFast/prerender-plugin/pull/119)): a projected one-sided read costs
-**~2.4 µs/row, flat** from 200 to 20,000 rows, and yielding every 200 rows is free — so 200,000 rows
-cost ~480 ms and a 500k-row overdue set ~1.2 s, with **zero writes**. Writes are 76–89 µs/row, 32× a
+**~2.4 µs/row, flat** from 200 to 20,000 rows, and yielding every 200 rows is free, with **zero
+writes**.
+
+> **That figure is a floor for a FRESH corpus and does not describe production.** Measured on the
+> live cluster (2026-08-21) the sweep runs **~55 µs/row warm, ~80 µs/row cold** — a ~300k-row due set
+> is a **~27 s sweep**, not the sub-second one the bench predicted. Same storage engine both times
+> (RocksDB, Harper's default); what differs is the corpus. The bench wrote 200k rows and read them
+> immediately; production holds 1.3M rows rewritten on every render for months, and on an LSM store a
+> range scan walks past every superseded version until compaction removes it.
+>
+> The harness already measured this and it was read too narrowly: an unfloored seek after 40,000 head
+> reschedules went **0.073 → 5.60 ms, 77×**, same engine, same corpus. The design argument still holds
+> (reads remain far cheaper than writes, so recomputing beats a 1.3M-row restamp) — but size nothing
+> off a fresh-corpus number.
+
+Writes are 76–89 µs/row, 32× a
 read, so reading liberally and writing not at all is the cheap direction.
 
 The score is `max(0, now − dueAt) / effectiveInterval`, multiplied by `queue.ready.sitemapBoost` for a
