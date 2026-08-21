@@ -16,7 +16,7 @@
  * changes staged under Sitemaps too — one document, one write.
  */
 
-import { ago, card, duration, el, ICONS, link, muted, num, pill, spacer, stat } from '../ui.js';
+import { ago, card, duration, el, ICONS, link, muted, num, pct, pill, spacer, stat } from '../ui.js';
 import {
 	barList,
 	colorFor,
@@ -33,6 +33,7 @@ import {
 	stackBy,
 	stackedBars,
 	sumCount,
+	sumValues,
 	weighted,
 	weightedBuckets,
 	windowEmpty,
@@ -68,6 +69,7 @@ export function render(ctx) {
 		cluster(ctx, data, setPause),
 		nodesPointer(ctx),
 		supply(ctx),
+		prioritisation(ctx),
 		settings(ctx),
 		// The tray shows the WHOLE staged set, including anything staged on another view.
 		editTray(ctx),
@@ -82,6 +84,118 @@ const nodesPointer = (ctx) =>
 	]);
 
 /** The render fleet as this node sees it, from the shared analytics window. */
+/**
+ * Whether the render ORDER is actually being decided, and by what.
+ *
+ * Plugin v0.50.0 ranks the due set by lateness relative to each row's own cadence and claims from
+ * that ready set, falling back to the index scan when it is dry. The catch, in the metric
+ * catalog's own words: the ready set REORDERS A FIXED AMOUNT OF WORK AND MOVES NO TOTAL. Every
+ * other number on this page — throughput, backlog, claim-scan time, render outcomes — reads
+ * exactly the same whether prioritisation is working perfectly or not running at all. A node
+ * quietly serving every claim from the fallback index is indistinguishable from a healthy one
+ * unless something looks at `claim_granted`, which is what this panel is for.
+ *
+ * The three failures worth naming, all from METRICS.md's interpretation table:
+ *   - every grant from `index` — the sweep is failing, the buffer could not be sized (capacity is
+ *     restart-scoped), or the set is always dry;
+ *   - `ready_sweep_ms` coming back `capped` — the sweep never reached a not-yet-due row, so it
+ *     ordered the OLDEST part of the backlog and skipped the recently-due pages the ordering
+ *     exists to protect;
+ *   - `ready_published` at zero against a non-empty backlog — the sweep runs and finds nothing.
+ *
+ * `ready_cadence` is the fourth, and it is a migration gauge rather than an alarm: rows carry
+ * their own `effectiveInterval` only once they re-render, so this reads all-`resolved` right
+ * after an upgrade and should cross over within one cadence. Staying low is the signal — rows
+ * being filed with no cadence get scored against their route's ceiling instead of their own rung.
+ */
+function prioritisation(ctx) {
+	const data = ctx.data.analytics;
+	if (!data || data.available === false || windowEmpty(data)) return null;
+
+	const series = (name) => pick(data, 'queue_health', (s) => s.path === name);
+	const granted = series('claim_granted');
+	const sweeps = series('ready_sweep_ms');
+	const published = series('ready_published');
+	const cadence = series('ready_cadence');
+	// Nothing has been emitted at all: an older plugin, or no claim has run in this window. Say
+	// which rather than rendering a grid of dashes.
+	if (!granted.length && !sweeps.length && !published.length) return null;
+
+	// sumVALUES, not sumCount: `claim_granted` emits once per claim pass carrying the number of jobs,
+	// so counting emits would report how many claims ran and call it a job count.
+	const bySource = (name) => sumValues(granted.filter((s) => s.method === name));
+	const fromReady = bySource('ready');
+	const fromIndex = bySource('index');
+	const grants = fromReady + fromIndex;
+
+	// `ready_sweep_ms` is one emit per sweep, so its emits ARE the sweeps — sumCount is right here.
+	const capped = sumCount(sweeps.filter((s) => s.method === 'capped'));
+	// `ready_cadence` carries a row count per sweep, so it is a value sum like the grants above.
+	const carried = sumValues(cadence.filter((s) => s.method === 'carried'));
+	const resolved = sumValues(cadence.filter((s) => s.method === 'resolved'));
+
+	// `ready_published` is a per-sweep count, so its MEAN is "entries per sweep" — summing it would
+	// multiply by however many sweeps landed in the window.
+	const perSweep = weighted(published, 'mean');
+	const backlog = ctx.data.overview?.backlog?.lastRun?.overdue ?? null;
+
+	const { keys, stacks } = stackBy(granted, 'method', data.bucketCount, { values: true });
+	const sourceColor = (key) => (key === 'ready' ? 'var(--ok)' : SERIES[0]);
+
+	return card(`Render prioritisation — ${scopeLabel(data)}`, {
+		head: [spacer(), legend(keys.map((k) => ({ label: k, color: sourceColor(k) })))],
+		body: [
+			el('div', { cls: 'stat-grid tight' }, [
+				stat(
+					'Prioritised grants',
+					pct(fromReady, grants),
+					`${num(fromReady)} of ${num(grants)} jobs came from the ready set`,
+					// The failure this panel exists for. Only meaningful once something was granted.
+					{ warn: grants > 0 && fromReady === 0 }
+				),
+				stat('Ready set supply', perSweep === null ? '—' : fmtCount(perSweep), 'entries published per sweep', {
+					warn: perSweep === 0 && backlog > 0,
+				}),
+				stat('Sweep time', fmtMs(weighted(sweeps, 'mean')), sweeps.length ? 'mean per sweep' : 'no sweep in window'),
+				stat(
+					'Cadence carried',
+					pct(carried, carried + resolved),
+					'rows scored against their own cadence',
+					// Not an alarm on its own — see the header. Flagged only once the backfill has had
+					// a chance and still has not happened.
+					{ warn: carried + resolved > 0 && carried === 0 }
+				),
+			]),
+			grants > 0
+				? stackedBars(data, keys, stacks, sourceColor)
+				: el('div', { cls: 'note', text: 'No jobs were granted in this window, so there is no ordering to show.' }),
+			capped > 0 &&
+				el('div', { cls: 'note warn' }, [
+					`${num(capped)} sweep(s) hit `,
+					el('code', { text: 'queue.ready.sweepCap' }),
+					' without reaching a not-yet-due row. The ordering therefore covers the OLDEST part of the ',
+					'backlog only — the rows it skipped are the youngest, which is exactly the recently-due set ',
+					'the ordering exists to protect.',
+				]),
+			grants > 0 &&
+				fromReady === 0 &&
+				el('div', { cls: 'note bad' }, [
+					'Every job this window was granted from the fallback index scan, so nothing is being ',
+					'prioritised. The sweep is failing, ',
+					el('code', { text: 'queue.ready.capacity' }),
+					' could not be sized at boot (it is restart-scoped, so a change needs a restart), or the set ',
+					'is always dry. No other number on this page moves when this happens.',
+				]),
+			el('p', { cls: 'muted chart-note' }, [
+				'The ready set reorders a fixed amount of work and moves no total, so this is the only panel that ',
+				'can tell prioritisation working from prioritisation switched off. “Cadence carried” is a ',
+				'migration gauge, not an alarm: a row carries its own interval once it re-renders, so it reads ',
+				'low right after an upgrade and should cross over within one cadence.',
+			]),
+		],
+	});
+}
+
 function supply(ctx) {
 	const data = ctx.data.analytics;
 	if (!data || data.available === false || windowEmpty(data)) {
@@ -243,9 +357,11 @@ function settings(ctx) {
 			title: 'Queue mechanics',
 			prefix: 'queue',
 			description:
-				'How work is handed to the render fleet: lease length, claim batch size, and the claim floor. ' +
-				'These move the claim-scan and throughput numbers above; none of them changes what is in the ' +
-				'corpus, only how fast it is worked through.',
+				'How work is handed to the render fleet: lease length, claim batch size, the claim floor, and ' +
+				'the ready set that decides the ORDER (queue.ready.*). These move the claim-scan and throughput ' +
+				'numbers above; none of them changes what is in the corpus, only how fast — and in what order — ' +
+				'it is worked through. queue.ready.capacity is restart-scoped: changing it here leaves the ' +
+				'running buffer at its boot size, and the prioritisation panel above is where that shows.',
 		}),
 		settingsCard(ctx, {
 			title: 'Render scheduling',

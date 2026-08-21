@@ -797,7 +797,12 @@ claim floor, schedule repair — are plugin behavior.)
   otherwise. _view HTML_ streams the stored bytes as `text/plain`; _explain_ hands the row to
   the URL explainer.
 - **Queue & nodes** — cluster/per-node pause controls (intent vs. observed, see "Queue
-  control"), plus this node's supply side from the shared analytics window: render outcomes
+  control"), a **render-prioritisation** panel (v0.50.0's ready set: the share of grants that came
+  from the scored set rather than the fallback index scan, sweep health and cap, entries published
+  per sweep, and the `effectiveInterval` backfill) — which exists because the ready set reorders a
+  fixed amount of work and moves no total, so every other number on the page reads identically
+  whether prioritisation is engaging or not running at all — plus this node's supply side from the
+  shared analytics window: render outcomes
   over time (the "renders are failing" shape as it develops, with the auth-failure-vs-
   suppressed signature called out), render time and claim-scan p95 trends, and a ranked
   outcome-detail list.

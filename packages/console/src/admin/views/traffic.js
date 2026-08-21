@@ -483,9 +483,16 @@ function staleness(ctx, data, scope) {
 	const ratioP95 = normalizable ? weighted(combos, 'p95', scaleOf) : null;
 	const ratioMedian = normalizable ? weighted(combos, 'median', scaleOf) : null;
 	const points = (stat) => weightedBuckets(combos, stat, data.bucketCount, mode === 'ratio' ? scaleOf : undefined);
+	// Plugin v0.51.0 buckets the median too. Before it, the payload carried per-bucket means and
+	// p95s only — so the typical line had to be a mean, and this chart said so. Detected rather
+	// than assumed: this console runs against whatever plugin a deployment has.
+	const hasMedians = combos.some((c) => Array.isArray(c.medians));
+	const typical = hasMedians
+		? { label: 'median', points: points('medians') }
+		: { label: 'mean', points: points('means') };
 	const series = [
 		{ label: 'p95', color: SERIES[2], points: points('p95s') },
-		{ label: 'mean', color: SERIES[1], points: points('means') },
+		{ label: typical.label, color: SERIES[1], points: typical.points },
 	];
 	const any = series.some((s) => s.points.some((p) => Number.isFinite(p)));
 
@@ -561,8 +568,11 @@ function staleness(ctx, data, scope) {
 						'interval and is re-rendered — so the MEDIAN is the number with headroom, and the p95 is ' +
 						'near the ceiling even when nothing is wrong. '
 					: '',
-				'The lines are the p95 and the MEAN: per-bucket medians are not in the analytics payload (only ',
-				'means and p95s are), so the median is a tile figure here rather than a trend.',
+				hasMedians
+					? 'The lines are the p95 and the median — the same two statistics as the tile, so the trend and ' +
+						'the headline cannot disagree.'
+					: 'The lines are the p95 and the MEAN: this node’s plugin predates per-bucket medians (v0.51.0), ' +
+						'so the typical case is a tile figure here rather than a trend.',
 			]),
 			contradicted &&
 				el('div', { cls: 'note' }, [

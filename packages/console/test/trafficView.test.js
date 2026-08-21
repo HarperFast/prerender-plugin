@@ -54,9 +54,16 @@ function combo(metric, path, method, type, count, value, p95 = value) {
 		row.median = value;
 		row.p95 = p95;
 		row.means = new Array(BUCKETS).fill(value);
+		row.medians = new Array(BUCKETS).fill(value);
 		row.p95s = new Array(BUCKETS).fill(p95);
 	}
 	return row;
+}
+
+/** The same combo as a pre-v0.51.0 plugin would send it: no per-bucket medians. */
+function withoutBucketMedians(row) {
+	const { medians, ...rest } = row;
+	return rest;
 }
 
 // A window with something of everything: two bots, two devices, a cache-served majority, a real
@@ -329,6 +336,26 @@ test('a route whose tail could not be merged shows no tail, rather than 0.00×',
 	assert.equal(tail.attributes.title, 'p95 —', 'an absent tail must read as absent');
 	// The median is unaffected, so the row still says what it does know.
 	assert.match(product.textContent, /3\.00×/);
+});
+
+test('the staleness trend charts the median once the plugin buckets it', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	assert.match(text, /p95mean÷ cadence|p95median÷ cadence/, 'the legend should name the two lines');
+	assert.match(text, /the p95 and the median/);
+	assert.doesNotMatch(text, /predates per-bucket medians/);
+});
+
+test('an older plugin still gets a trend line, labelled as the mean it is', async () => {
+	const ctx = await ready();
+	ctx.data.analytics = {
+		...ANALYTICS,
+		series: ANALYTICS.series.map((s) => (s.metric === 'route_page_age' ? withoutBucketMedians(s) : s)),
+	};
+	const text = textOf(ctx);
+	assert.match(text, /predates per-bucket medians/);
+	// And it still draws something, rather than an empty chart.
+	assert.match(text, /2\.50×/);
 });
 
 test('the origin cost column is what a miss typically costs, not its tail', async () => {

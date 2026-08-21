@@ -143,17 +143,41 @@ export const pick = (data, metric, filter) =>
 export const sumCount = (combos) => combos.reduce((acc, s) => acc + s.count, 0);
 
 /**
+ * What a VALUE metric actually recorded, as opposed to how many times it recorded.
+ *
+ * `count` is the number of EMITS. For most value metrics that is what you want (750 durations),
+ * but several of them record a count as their value — `claim_granted` emits once per claim pass
+ * carrying the number of jobs, `ready_cadence` once per sweep carrying a number of rows — and
+ * there `sumCount` answers "how many claim passes ran", which is a different question with a
+ * plausible-looking answer.
+ *
+ * Reconstructed as Σ(mean × count) rather than read off `total`: the row schema has a `total`
+ * column, but Harper populates it only for BOOLEAN counters. Every distribution row in a live
+ * payload carries `total: 0` alongside a perfectly good mean (verified against production — 82 of
+ * 142 series had a non-zero total, and not one of them was a distribution). Since each row's mean
+ * is exact over its own samples, the product is the true sum.
+ */
+export const sumValues = (combos) =>
+	combos.reduce((acc, s) => (Number.isFinite(s.mean) && s.count > 0 ? acc + s.mean * s.count : acc), 0);
+
+/**
  * Stack combos by one dimension: returns `{ keys, stacks }` where `stacks[key]` is a
  * per-bucket count array summed over every combo whose `dim` equals `key`. Keys are ordered
  * by total, biggest first, so legends and stacking order match visual weight.
  */
-export function stackBy(combos, dim, bucketCount) {
+export function stackBy(combos, dim, bucketCount, { values = false } = {}) {
 	const stacks = new Map();
 	for (const combo of combos) {
 		const key = combo[dim] ?? 'unknown';
 		let arr = stacks.get(key);
 		if (!arr) stacks.set(key, (arr = new Array(bucketCount).fill(0)));
-		for (let i = 0; i < combo.counts.length && i < bucketCount; i++) arr[i] += combo.counts[i];
+		for (let i = 0; i < combo.counts.length && i < bucketCount; i++) {
+			// `values` is the per-bucket form of sumValues above: for a metric whose recorded value is
+			// itself a count, stacking the emit counts charts how often it was recorded rather than
+			// what it recorded.
+			if (!values) arr[i] += combo.counts[i];
+			else if (Number.isFinite(combo.means?.[i]) && combo.counts[i] > 0) arr[i] += combo.means[i] * combo.counts[i];
+		}
 	}
 	const keys = [...stacks.keys()].sort((a, b) => stacks.get(b).reduce(sum, 0) - stacks.get(a).reduce(sum, 0));
 	return { keys, stacks };

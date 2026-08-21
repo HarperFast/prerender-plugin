@@ -184,3 +184,90 @@ test('font licenses ship beside the vendored fonts', () => {
 		assert.ok(text.length > 500, `${license} is missing or empty`);
 	}
 });
+
+test('a metric the plugin emits is charted by the console, or waived with a reason', () => {
+	// THE SAME FAILURE AS THE ROUTE CONTRACT ABOVE, one layer down. The plugin adds a metric, the
+	// console — a separately versioned package — never learns about it, and the signal ships
+	// invisible with a green suite on both sides. It has already happened: v0.50.0 added four
+	// `queue_health` series, one of which (`claim_granted`) the catalog itself describes as the
+	// ONLY way to see whether render prioritisation is engaging, because the ready set reorders a
+	// fixed amount of work and moves no total. Nothing failed when no panel read it.
+	//
+	// Ground truth is the EMIT SITES, not the catalog's `values` list: a series is real once
+	// something records it, and the two can drift (they did — the prose and METRICS.md carried the
+	// new series while the machine-readable `values` array did not).
+	const metricsSource = readFileSync(fileURLToPath(new URL('../../plugin/src/metrics.js', import.meta.url)), 'utf8');
+	// EVERY emit site is accounted for, not just the ones a regex happens to match. A scanner that
+	// silently skips what it cannot parse is worse than no scanner: it reports "all covered" while
+	// covering less each time someone writes an emitter in a new shape.
+	//
+	// So each `recordAnalytics(value, metric, series, …)` is classified by its THIRD slot. A quoted
+	// literal is a series name this console should be charting. Anything else is either a metric
+	// whose path slot carries a dimension rather than a series (`bot_serve`'s source, `page_age`'s
+	// bot) or a series named at the call site (`queueHealth(value, gauge)`, the
+	// `sitemap_${series}` templates) — legitimate, but it has to be a NAMED exception below, so a
+	// new one shows up here as a failing test rather than as silence.
+	const DYNAMIC_SERIES_SLOT = new Set([
+		'botRequest',
+		'botServe',
+		'routeServe',
+		'pageAge',
+		'routePageAge',
+		'pageAgeNegative',
+		'renderTime',
+		'renderOutcome',
+		'originFetch',
+		'serveError',
+		'unrouted',
+		'sitemapRun',
+		'reconcile',
+		'queueHealth',
+		'demandLadder',
+		'invalidationError',
+		'invalidationReenqueue',
+	]);
+
+	const emitted = [];
+	const calls = [...metricsSource.matchAll(/server\.recordAnalytics\(\s*[^,]+,\s*(['"])([a-z_]+)\1,\s*([^,]+),/g)];
+	assert.ok(calls.length > 5, 'expected to find the emit sites at all — has metrics.js been restructured?');
+
+	for (const call of calls) {
+		const [, , metric, third] = call;
+		const literal = third.match(/^(['"])([a-z_0-9]+)\1$/);
+		if (literal) {
+			emitted.push(`${metric}.${literal[2]}`);
+			continue;
+		}
+		// Name the emitter this call belongs to: the nearest `name: (` above it.
+		const preceding = metricsSource.slice(0, call.index);
+		const owner = [...preceding.matchAll(/\n\t([a-zA-Z]+): \(/g)].pop()?.[1];
+		assert.ok(
+			DYNAMIC_SERIES_SLOT.has(owner),
+			`metrics.${owner} names its series dynamically (\`${third.trim()}\`). If that slot is a dimension ` +
+				'rather than a series, add it to DYNAMIC_SERIES_SLOT; if it is a series, this test cannot see ' +
+				'it and the console needs checking by hand'
+		);
+	}
+	assert.ok(emitted.length > 0, 'expected to find literal metric emit sites');
+
+	// A series may legitimately have no panel — but it has to be a decision, written down here,
+	// not an oversight nobody noticed.
+	const NOT_CHARTED = new Map([
+		['prerender_ops.page_age_negative', 'surfaced as a discard warning on Traffic, not as a series of its own'],
+		['prerender_ops.serve_error', 'blob-fault counter; the serve-side view of it is bot_serve blob-* on Traffic'],
+		['prerender_ops.unrouted', 'has its own endpoint and panel (the unrouted report), not the analytics window'],
+		['prerender_ops.config_warnings', 'the Config view reads the warnings themselves, which say more than a count'],
+		['prerender_ops.invalidation_error', 'the Invalidations view reads the rows; a failure count adds nothing'],
+		['prerender_ops.invalidation_reenqueue', 'demand-driven heal is off by default and has no panel yet'],
+	]);
+
+	const client = [...clientSources.values()].join('\n');
+	for (const series of new Set(emitted)) {
+		const [, name] = series.split('.');
+		if (NOT_CHARTED.has(series)) continue;
+		assert.ok(
+			client.includes(`'${name}'`),
+			`the plugin emits ${series} and no console view reads it — chart it, or add it to NOT_CHARTED with the reason`
+		);
+	}
+});

@@ -1651,12 +1651,27 @@ export class PrerenderAdmin extends Resource {
 		// would double this view's cost — it is already a fan-out inside a heavy slot — and the path
 		// of least resistance would have been to pass only the cluster epoch and silently miss every
 		// route scope.
-		const activeInvalidations =
-			(await readWithTimeout('invalidations', timedOutReads, () => listInvalidations()))?.rows ?? [];
+		// Read for `entryState` alone, so an index — which does no per-entry state at all — skips it.
+		const activeInvalidations = sitemap.isIndex
+			? []
+			: ((await readWithTimeout('invalidations', timedOutReads, () => listInvalidations()))?.rows ?? []);
 
+		// AN INDEX'S ENTRIES ARE SITEMAPS, so there is nothing to ask the page cache about them. Every
+		// per-entry read below answers "is this URL cached and scheduled", which for an XML document
+		// that is never prerendered is a question with a misleading answer (`no target`, or
+		// `filtered`) bought with two point reads and a route classification EACH — a page of 50 of
+		// them is ~100 reads on a worker that also serves bot traffic, spent to produce a column the
+		// console v0.5.0+ no longer displays.
+		//
+		// `lastmod` is the one field the sitemapindex schema actually carries, so index entries
+		// return that instead. The console shows the column only when it is present, which is what
+		// makes an older console safe against this change.
+		const isIndex = !!sitemap.isIndex;
 		const [targetCount, entries] = await Promise.all([
-			this.countTargetsFor(url),
-			Promise.all(pageOfEntries.map((entry) => this.entryState(entry, activeInvalidations))),
+			isIndex ? null : this.countTargetsFor(url),
+			isIndex
+				? pageOfEntries.map((entry) => ({ loc: entry?.loc ?? null, lastmod: entry?.lastmod ?? null }))
+				: Promise.all(pageOfEntries.map((entry) => this.entryState(entry, activeInvalidations))),
 		]);
 
 		return json({
@@ -1669,6 +1684,9 @@ export class PrerenderAdmin extends Resource {
 				parentUrl: sitemap.parentUrl ?? null,
 			},
 			refresh: refresh ?? null,
+			// null for an index, which owns no targets by construction: a walk attributes every Target
+			// to the CHILD that listed the URL. Reporting the 0 that a count would truthfully return
+			// reads as "this sitemap covers nothing" on the largest document in a deployment.
 			targetCount,
 			entries,
 			offset,
