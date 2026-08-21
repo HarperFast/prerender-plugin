@@ -279,11 +279,22 @@ const renderer: Renderer = async (page, job) => {
 	// would change WHAT gets cached rather than only how long it took.
 	if (config.navigation.skipSettleWhenNonIndexable && finalRes && !job.isFromSitemap) {
 		const statusCode = finalRes.status();
+		// A client-side redirect can fire before DOMContentLoaded, so the signals may already have
+		// been read off the DESTINATION document. Reading them is still correct — that is the
+		// document a settle would have snapshotted — but the evaluate can also lose its execution
+		// context to a navigation in flight. Falling through to settle on that failure keeps the
+		// pre-flag behavior exactly (the post-settle evaluate then fails the same way, or succeeds).
+		const signals = statusCode === 200 ? await page.evaluate(extractIndexSignals).catch(() => null) : null;
 		const verdict =
 			statusCode === 200
-				? indexVerdict(await page.evaluate(extractIndexSignals), page.url(), config.canonical.strict)
+				? signals && indexVerdict(signals, page.url(), config.canonical.strict)
 				: { isIndexable: false, reason: 'http-error' as const };
-		if (!verdict.isIndexable) {
+		if (verdict && !verdict.isIndexable) {
+			// Report the landed url the same way the post-settle path does. Without this a bail
+			// would swallow a client-side redirect, and the plugin would suppress the source
+			// instead of adopting the destination as its own target.
+			const landedUrl = page.url();
+			if (canonicalizeUrl(landedUrl) !== canonicalizeUrl(job.url)) job.redirectedTo = landedUrl;
 			job.httpResponse = { statusCode, headers: finalRes.headers() };
 			job.isIndexable = false;
 			job.reason = verdict.reason;

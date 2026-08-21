@@ -35,6 +35,10 @@ before(async () => {
 				return html('<meta name="robots" content="noindex">', 'GONE');
 			// noindex injected AFTER DOMContentLoaded, so the pre-settle DOM looks clean. Proves
 			// the post-settle check stays authoritative.
+			// Client-side redirect (fires before DOMContentLoaded) onto a noindex destination —
+			// the bail must still report where it landed.
+			case '/client-redirect':
+				return html('', `<script>location.replace('/noindex');</script>`);
 			case '/late-noindex':
 				return html(
 					'',
@@ -173,4 +177,16 @@ test('indexVerdict: the shared verdict both paths use', () => {
 		isIndexable: false,
 		reason: 'noindex',
 	});
+});
+
+// A bail must not swallow a redirect: the plugin adopts the destination as its own target off
+// `redirectedTo`, and without it a client-side move reads as "the source disowned itself".
+test('a bail still reports a client-side redirect it landed on', async () => {
+	const result = await render('/client-redirect');
+	await result.close();
+
+	assert.equal(result.isIndexable, false);
+	assert.equal(result.reason, 'noindex', 'the verdict is read off the document it landed on');
+	assert.equal(new URL(result.redirectedTo!).pathname, '/noindex', 'the landed url must survive the bail');
+	assert.equal(result.timings.settle, undefined, 'and it still skipped the settle');
 });
