@@ -1651,8 +1651,9 @@ export class PrerenderAdmin extends Resource {
 		// would double this view's cost — it is already a fan-out inside a heavy slot — and the path
 		// of least resistance would have been to pass only the cluster epoch and silently miss every
 		// route scope.
+		const isIndex = !!sitemap.isIndex;
 		// Read for `entryState` alone, so an index — which does no per-entry state at all — skips it.
-		const activeInvalidations = sitemap.isIndex
+		const activeInvalidations = isIndex
 			? []
 			: ((await readWithTimeout('invalidations', timedOutReads, () => listInvalidations()))?.rows ?? []);
 
@@ -1666,7 +1667,6 @@ export class PrerenderAdmin extends Resource {
 		// `lastmod` is the one field the sitemapindex schema actually carries, so index entries
 		// return that instead. The console shows the column only when it is present, which is what
 		// makes an older console safe against this change.
-		const isIndex = !!sitemap.isIndex;
 		const [targetCount, entries] = await Promise.all([
 			isIndex ? null : this.countTargetsFor(url),
 			isIndex

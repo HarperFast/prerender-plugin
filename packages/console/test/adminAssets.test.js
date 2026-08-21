@@ -253,7 +253,6 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 	// A series may legitimately have no panel — but it has to be a decision, written down here,
 	// not an oversight nobody noticed.
 	const NOT_CHARTED = new Map([
-		['prerender_ops.page_age_negative', 'surfaced as a discard warning on Traffic, not as a series of its own'],
 		['prerender_ops.serve_error', 'blob-fault counter; the serve-side view of it is bot_serve blob-* on Traffic'],
 		['prerender_ops.unrouted', 'has its own endpoint and panel (the unrouted report), not the analytics window'],
 		['prerender_ops.config_warnings', 'the Config view reads the warnings themselves, which say more than a count'],
