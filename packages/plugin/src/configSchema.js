@@ -1262,6 +1262,101 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'about could not be detected.',
 			{ min: 1, scope: 'restart' }
 		),
+		ready: group(
+			'THE READY SET — which of the due rows the next leases go to, decided by a background sweep ' +
+				'instead of by the order the index happens to be in.\n\n' +
+				'WHY: `claim` takes the first rows it finds from the claim floor, so the queue serves ' +
+				'whatever is oldest-due. Two production measurements say that is the wrong order under ' +
+				'scarcity (prerender-plugin#80): ~46% of a 521,929-row overdue queue was bot-discovered ' +
+				'rather than sitemap-submitted, and absolute due time treats a 1h-TTL homepage 3h overdue ' +
+				'exactly like a 48h-TTL product page 3h overdue — 300% stale against 6%. Simulated over ' +
+				'the real corpus the 1h route sits at 4.78x its own TTL even at FULL capacity.\n\n' +
+				'It could not be fixed by re-sorting the claim window, because the window is ANCHORED AT ' +
+				'THE OLDEST DUE TIME: under a backlog every row in it is ancient, so the homepage is never ' +
+				'read at all and a wider window is just more ancient rows. So a sweep scores the WHOLE due ' +
+				'set and keeps the best few thousand in shared memory; claims pop from that and touch no ' +
+				'index. Affordable because a projected one-sided read measures ~2.4us/row, flat — 200,000 ' +
+				'rows in ~480ms, with zero writes.\n\n' +
+				'ORDERING ONLY. Total render volume cannot change: every row it reorders is already due. ' +
+				'And it is a CACHE in front of the old path — cold, exhausted or disabled, claims fall back ' +
+				'to the index scan, so every failure mode here is the previous behaviour rather than a ' +
+				'stalled queue.',
+			{
+				enabled: option(
+					true,
+					'Kill switch. `false` claims straight from the index scan, exactly as before v0.50.0. The ' +
+						'sweep also stops, so nothing is spent maintaining a set nothing reads.'
+				),
+				capacity: option(
+					5000,
+					'Entries the ready set holds. Sized to cover several sweep intervals of claims so the set ' +
+						'does not run dry between sweeps: at the recorded fleet throughput a node grants roughly ' +
+						'5 jobs a second (observed live: ~70-75 claims a minute), so 5,000 entries is about 16 ' +
+						'minutes of work — three sweep intervals at the default.\n\n' +
+						'DO NOT RAISE THIS CASUALLY. The reference cluster runs with 4.6GB of swap in use and 5.2GB ' +
+						'free of 33.6GB, so shared memory on these nodes is not free. A larger set does not improve ' +
+						'the ordering either — the sweep already scores every due row and keeps the best of them, so ' +
+						'this only buys time between sweeps. What makes the sweep safe on a swapping node is that ' +
+						'its own memory is a function of THIS number and not of the due set: it streams rows through ' +
+						'a bounded heap and retains only the best `capacity`.\n\n' +
+						'Costs `capacity x ~276 x 2` bytes of shared memory — two slots, so ~2.8MB at the default. ' +
+						'Raising it does ' +
+						'NOT make the ordering better — the sweep already scores every due row and keeps the best ' +
+						'of them — it only makes the set last longer between sweeps.\n\n' +
+						'Restart-scoped: a named shared buffer is sized by its first allocation, so a live change ' +
+						'would give workers in one generation differently-sized views of the same buffer. A ' +
+						'mismatch is logged and the smaller size honoured.',
+					{ min: 0, scope: 'restart' }
+				),
+				sweepInterval: option(
+					5 * MINUTE,
+					'How often worker 0 re-scores the due set and republishes.\n\n' +
+						'This is the ORDERING STALENESS: a row that becomes due just after a sweep waits up to one ' +
+						'interval before it can be ranked. Five minutes against cadences of an hour and up is a ' +
+						'rounding error, and `capacity` covers roughly three of these intervals of claims, so the ' +
+						'set does not run dry between sweeps.\n\n' +
+						'FIVE MINUTES RATHER THAN ONE, on production evidence. A synthetic benchmark puts a ' +
+						'projected one-sided read at ~2.4us/row, which would make a sweep sub-second — but the live ' +
+						'cluster reports `claim_scan_ms` at a 5-6ms median over a window of roughly 205 rows ' +
+						'(grantLimit + in-flight + grantLimit, at an observed lease occupancy of 75-155), and ' +
+						'`empty` passes at a 25ms mean with 47ms observed, which are seek-dominated. So the real ' +
+						'marginal per-row cost sits somewhere between 2.4us and ~25us — an order of magnitude of ' +
+						'uncertainty — and the sweep shares a worker with bot traffic. At the wide end a ' +
+						'one-minute interval would spend a noticeable fraction of a core continuously, for no ' +
+						'benefit: the ordering does not go stale that fast.\n\n' +
+						'WATCH `ready_sweep_ms` AND TIGHTEN FROM THERE. It reports the real number for your corpus, ' +
+						'which is the only way to know it — the backlog snapshot cannot tell you the due-set size ' +
+						'either, because `overdue` saturates at `management.scanCap` (observed pinned at 2,000).\n\n' +
+						'`0` disables the sweep, which leaves the set to go stale and then empty; claims fall back ' +
+						'to the index scan as they always do. The ceiling is node\u2019s own timer limit of 2^31-1 ms ' +
+						'(~24.8 days) \u2014 past it a timer fires every millisecond rather than never, which would ' +
+						'turn the sweep into a hot loop over the due set.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
+				),
+				sweepCap: option(
+					500_000,
+					'Ceiling on rows one sweep reads. The due set cannot exceed the corpus, so this is a ' +
+						'guard against a runaway rather than a tuning knob — at ~2.4us/row the default is ~1.2s of ' +
+						'reading.\n\n' +
+						'If a sweep hits the cap WITHOUT reaching a not-yet-due row it is ordering over a prefix ' +
+						'of the backlog, which is reported and warned about: the rows past the cap are the ' +
+						'youngest, so the effect is that recently-due pages go unranked — exactly the pages this ' +
+						'exists to protect.',
+					{ min: 1 }
+				),
+				sitemapBoost: option(
+					2,
+					'How much a sitemap-sourced row outranks a discovered one at the same overdue ratio. `1` ' +
+						'disables the preference and orders on overdue ratio alone.\n\n' +
+						'A MULTIPLIER, not a tier, so it cannot starve discovered URLs: an unserved row\u2019s ' +
+						'lateness grows without bound while the boost stays constant, so a discovered row wins as ' +
+						'soon as its ratio passes `sitemapBoost x` the highest sitemap ratio in the set. With ' +
+						'sitemap pages held ~1.2 cadences late, a discovered page is served within ~2.4 cadences ' +
+						'of its own interval at the default.',
+					{ min: 1 }
+				),
+			}
+		),
 		claimScanCap: option(
 			1000,
 			'Ceiling on schedule rows read per claim pass. A leased row keeps its overdue position in the ' +

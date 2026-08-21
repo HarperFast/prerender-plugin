@@ -15,7 +15,7 @@ import {
 	seedOverrideFingerprint,
 	startOverrideWatch,
 } from './src/util/configOverride.js';
-import { startQueueStatusSync } from './src/resources/RenderQueue.js';
+import { startQueueStatusSync, startReadySweep } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
@@ -99,6 +99,7 @@ export async function handleApplication(scope) {
 	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
 	// every node repairs the schedule rows it owns (see util/reconcile.js).
 	startQueueStatusSync();
+	startReadySweep();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();
 	// Keeps the console's backlog histogram off the page-load path: the scan walks the same

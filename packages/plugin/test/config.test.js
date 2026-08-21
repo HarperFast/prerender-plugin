@@ -267,6 +267,8 @@ test('secret and restart paths are what the schema declares', () => {
 		// The render-lease shared buffer is sized by the first allocation in the process, so a live
 		// change would give workers in one generation differently-sized views of the same buffer.
 		'queue.maxLeases',
+		// Same reason, same mechanism: the ready set is a named shared buffer too.
+		'queue.ready.capacity',
 		'render.reconcile.startDelay',
 		'render.reconcile.startJitter',
 	]);

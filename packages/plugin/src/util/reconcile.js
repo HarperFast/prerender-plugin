@@ -104,6 +104,9 @@ export const reconcileSchedules = async ({
 
 	// Phase 2 — writes, with the scan's cursor now closed.
 	for (const { cacheKey, target } of toRestore) {
+		// Hoisted because the jittered time and the recorded cadence must be the same number — see both
+		// comments below.
+		const interval = resolveRenderInterval(target.url, target.renderInterval);
 		await putSchedule(cacheKey, {
 			// The jittered initial time, NOT "now": a repair pass can restore a great many rows at
 			// once, and scheduling them all immediately would replace a silent outage with a
@@ -120,8 +123,15 @@ export const reconcileSchedules = async ({
 			// inclusive (`greater_than_equal`). If that comparator were ever made exclusive, every
 			// repaired row would be filed one step behind the floor and this sweep would restore
 			// rows into the very silent gap it exists to close.
-			nextRenderTime: getInitialRenderTime(cacheKey, resolveRenderInterval(target.url, target.renderInterval)),
+			nextRenderTime: getInitialRenderTime(cacheKey, interval),
 			fromSitemap: !!target.sitemapUrl,
+			// The same cadence the jitter above was drawn from, so a repaired row is ranked by the
+			// window it was actually spread across. No ladder rung applied: `streamTargets` is an
+			// unconstrained scan of the whole target corpus and `demandInterval` would widen it by a
+			// fourth attribute on every row, to refine the ranking of rows that are (a) rare — this
+			// only fires on a missing row — and (b) filed at a FUTURE jittered time, so not yet
+			// competing for anything. The row's next render files the true rung.
+			effectiveInterval: interval,
 		});
 		stats.restored++;
 	}

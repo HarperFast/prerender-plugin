@@ -518,6 +518,114 @@ The floor advances to **the first due row a pass observed**, which is the same t
 Set `queue.claimFloor.enabled: false` to roll the floor back to the old full seek. It changes nothing
 else; leases stay where they are either way.
 
+#### The ready set: which of the due rows goes first
+
+The floor decides _where the scan starts_. `queue.ready` decides _which rows get the leases_ — and it
+had to stop being a property of the scan at all.
+
+`claim` takes the first rows it finds from the floor, so the queue serves whatever is oldest-due. Two
+production measurements say that is the wrong order under scarcity
+([#80](https://github.com/HarperFast/prerender-plugin/issues/80)):
+
+- **Provenance.** During a multi-hour backlog, **239,090 of 521,929 overdue rows (~46%)** were
+  bot-discovered rather than sitemap-submitted.
+- **TTL-blindness.** Absolute due time treats a 1 h-TTL homepage 3 h overdue exactly like a 48 h-TTL
+  product page 3 h overdue — 300% stale against 6%. Simulated over the real corpus the 1 h route sits
+  at **4.78× its own TTL even at full capacity**, and 48.83× at half.
+
+**Why it cannot be fixed by re-sorting the claim window.** The window is anchored at the _oldest_ due
+time and is already an EDF prefix. Under a backlog every row in it is ancient, so a homepage two of
+its own cadences late is never read at all — and a wider window anchored in the same place is just
+more ancient rows. (Ranking by relative lateness also cannot be an _index_: `(t − dueAt) / interval`
+has slope `1/interval`, so two rows with different intervals cross exactly once and no stored key can
+express an order that changes with the clock.)
+
+So the ordering moved out of the index. A background sweep on worker 0 scores the **whole** due set
+and publishes the best few thousand into a shared buffer; `claim` pops from that in priority order and
+reads no index at all. That is affordable because of one measured fact
+([#119](https://github.com/HarperFast/prerender-plugin/pull/119)): a projected one-sided read costs
+**~2.4 µs/row, flat** from 200 to 20,000 rows, and yielding every 200 rows is free — so 200,000 rows
+cost ~480 ms and a 500k-row overdue set ~1.2 s, with **zero writes**. Writes are 76–89 µs/row, 32× a
+read, so reading liberally and writing not at all is the cheap direction.
+
+The score is `max(0, now − dueAt) / effectiveInterval`, multiplied by `queue.ready.sitemapBoost` for a
+sitemap-sourced row. Lateness rather than age, deliberately: `dueAt − interval` is not when the page
+last rendered for every row — suppression rechecks schedule 7 days, `backoffWait` up to `maxBackoff`,
+the unpin hatch a `defaultInterval` — so an age-based ratio would put a 7-day recheck on a 48 h route
+at the _head_ of the queue reading as 3.5 cadences stale.
+
+**The cadence is the row's own, not the route's** — and this is load-bearing rather than a detail.
+A route grants a _ceiling_ (`/catalog/` at 24 h) and `render.demand` promotes bot-visited targets
+beneath it to 12 h or 6 h, writing `now + rung` as the due time. Resolving the denominator from config
+would therefore divide a promoted page's lateness by 24 h when it is really on 6 h — a **4× under-
+statement, on precisely the pages the ladder singled out as worth rendering more often**, silently
+undoing the ladder's work. So every schedule writer files the cadence it used onto the row as
+`effectiveInterval` (`resolveEffectiveInterval`: rung > route > stored > default, the rung clamped to
+the ceiling so a stale one cannot read as slower), and the sweep divides by that. It rides along in a
+projection the sweep already pays for, so it costs no extra read — recovering it from `RenderTarget`
+instead would be a cross-database point read per row over the whole due set, ~75% of them replication
+fetches on a residency-pinned table.
+
+The field is **absent and self-healing** on rows written before it existed, and on the writers with no
+cadence in hand: the sweep falls back to resolving from config, which is exactly what it did before,
+and each row fills in when it next renders. `queue_health` `ready_cadence` (`carried`/`resolved`) is
+the gauge — all `resolved` on the first sweep after an upgrade, crossing over within one cadence.
+
+Three properties are worth knowing:
+
+- **It is a cache in front of the old path, not a replacement.** Cold (a fresh worker generation),
+  exhausted (claims outrunning the sweep), disabled, or a buffer that could not be sized — all of them
+  fall through to the floored index scan. Every failure mode is _the previous behaviour_, which is why
+  it ships on by default.
+- **Nothing here is a correctness invariant.** An entry naming a row that has since been rescheduled
+  or deleted costs at most one redundant render: the lease CAS refuses a duplicate and
+  `processJobResult` already drops a result whose target is gone. It cannot lose a page, because the
+  next sweep re-reads the table. Compare the claim floor, where a row filed below it is never read
+  again — silently and terminally.
+- **The sweep owns the floor now.** Once claims are served from memory they observe nothing, and a
+  floor nothing observes freezes — measured, an unfloored seek degrades **0.073 → 5.60 ms over 40,000
+  reschedules** while a floored one stays flat at 0.07 ms. So the sweep applies the same floor rule,
+  and is better informed doing it: it sees every due row, so "the first due row observed" is the true
+  minimum rather than the minimum of a window.
+
+`sitemapBoost` is a multiplier and never a tier, so it cannot starve discovered URLs: an unserved
+row's lateness grows without bound while the boost stays constant, so a discovered page is served
+within roughly `sitemapBoost ×` the worst sitemap ratio.
+
+Watch `queue_health` `claim_granted` (jobs per claim, split `ready`/`index`). The ready set reorders a
+fixed amount of work and moves no total, so this is the only series that shows whether prioritisation
+is engaging — a node quietly serving every claim from `index` looks identical to a healthy one
+everywhere else. `ready_sweep_ms` with method `capped` means the sweep never reached a not-yet-due row,
+so it is ordering over the oldest part of the backlog only and recently-due pages are going unranked;
+raise `queue.ready.sweepCap`.
+
+`queue.ready.enabled: false` claims straight from the index scan and stops the sweep — a true revert.
+
+##### What the live cluster says about the defaults
+
+Checked against the reference deployment (4 nodes, 16 workers, Harper Pro 5.2.3) before rollout:
+
+- **`claim_scan_ms` reports `method: capped` on essentially every pass** — 280 samples over six hours.
+  `capped` means the pass read its whole window and never reached a not-yet-due row. With
+  `lease_occupancy` at 75–155 the window is ~205 rows, so the queue is choosing ~4 jobs out of ~205
+  rows that are all ancient and never seeing the rest of the due set. That is the anchoring problem
+  this section describes, measured in production rather than argued from a simulation.
+- **The marginal per-row read cost is uncertain by an order of magnitude.** A synthetic benchmark says
+  ~2.4 µs/row; live, a ~205-row window takes a 5–6 ms median (p95 9–12 ms) and `empty` passes average
+  25 ms with 47 ms observed, which are seek-dominated. That is why `sweepInterval` defaults to five
+  minutes rather than one, and why `ready_sweep_ms` exists — it is the only thing that will tell you
+  the real number for your corpus.
+- **The due-set size cannot be read from the backlog snapshot.** `overdue` saturates at
+  `management.scanCap` (observed pinned at 2,000), so "how many rows will the sweep walk" is answered
+  by `ready_sweep_ms` and the sweep's own `scanned` count, not by the overview.
+- **The nodes swap** (4.6 GB in use, 5.2 GB free of 33.6 GB). This is why the sweep streams rows
+  through a bounded heap and retains only `capacity` of them: its memory is a function of the set
+  size, never of the due set. A design that sorted the due set would be actively unsafe here, and it
+  is why `capacity` should not be raised casually.
+- **The sweep cannot make a cross-node request.** It reuses the same query the claim scan uses, which
+  carries `replicateFrom: false`, and it performs no point reads at all — so it cannot take the
+  untimed replication fetch that an unowned point read on this residency-pinned table would.
+
 ## HTTP & resource API
 
 | Method & path                                | Purpose                                                             |

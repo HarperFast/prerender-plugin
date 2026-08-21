@@ -95,7 +95,7 @@ import {
 	MAX_REASON_LENGTH,
 	CLUSTER_SCOPE as CLUSTER_INVALIDATION,
 } from '../util/invalidation.js';
-import { inspectRoutes, routeScopes, routeScopeForUrl } from '../util/routeClass.js';
+import { inspectRoutes, resolveEffectiveInterval, routeScopes, routeScopeForUrl } from '../util/routeClass.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -1047,7 +1047,7 @@ export class PrerenderAdmin extends Resource {
 
 		const timedOutReads = [];
 		const target = await readWithTimeout('renderTarget', timedOutReads, () =>
-			Target.get({ id: canonicalUrl, select: ['url', 'sitemapUrl'] })
+			Target.get({ id: canonicalUrl, select: ['url', 'sitemapUrl', 'renderInterval', 'demandInterval'] })
 		);
 		if (timedOutReads.length) return json({ error: 'target read timed out' }, 504);
 
@@ -1065,7 +1065,13 @@ export class PrerenderAdmin extends Resource {
 		const nextRenderTime = currentMinuteMs();
 		// The write is residency-routed, so this reaches the owning node from any node — and it
 		// goes through the funnel, which lowers this node's claim floor to cover it.
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!target.sitemapUrl });
+		await writeSchedule(cacheKey, {
+			nextRenderTime,
+			fromSitemap: !!target.sitemapUrl,
+			// The target's real cadence, off the point read above — an admin rejoin should not cost the
+			// page its ranking on the way back into rotation.
+			effectiveInterval: resolveEffectiveInterval(canonicalUrl, target),
+		});
 
 		// `claim` reads a node-local flag, so waking consumers only helps on the node that owns
 		// the row. When another node owns it, what makes the row claimable there is the CLAIM

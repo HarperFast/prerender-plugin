@@ -114,6 +114,24 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# cross-database read just to flag sitemap-sourced jobs. Refreshed on every
 	# reschedule (job result), so it self-corrects when a URL leaves its sitemap.
 	fromSitemap: Boolean
+	# The page's CADENCE in ms — route > stored > default with the demand ladder's rung applied
+	# (`resolveEffectiveInterval`). How often this page should render, which is NOT the same as the
+	# gap `nextRenderTime` was actually written with: a suppression recheck files 7 days out and a
+	# failure backoff files its backoff, and neither is a cadence. The distinction is the whole
+	# reason `util/renderPriority.js` scores lateness rather than age — the numerator is how far
+	# past due the row is, the denominator is how often it wants to render. Writers file the
+	# cadence here even when the gap they wrote differs. Denormalized for the same reason
+	# `fromSitemap` is: the ready-set sweep scores every due row on the node by lateness RELATIVE
+	# TO CADENCE, and recovering that per row from RenderTarget would be a cross-database point
+	# read per row over the whole due set — on a residency-pinned table, ~75% of them replication
+	# fetches. NOT @indexed: it is only ever read alongside a row already selected by
+	# `nextRenderTime`, and a second index costs ~13% on every write (bench/queue-index).
+	#
+	# Absent is legal and self-healing — pre-upgrade rows, and the writers that genuinely have no
+	# cadence in hand (a render-now one-off) — and the sweep falls back to resolving from config,
+	# which is what it did before this field existed. Every row re-renders on its own cadence, so
+	# the active corpus fills in within one cycle.
+	effectiveInterval: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {

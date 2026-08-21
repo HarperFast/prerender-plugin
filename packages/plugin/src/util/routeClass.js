@@ -392,3 +392,30 @@ export const resolveRenderInterval = (url, storedInterval) => {
 	const stored = Number(storedInterval);
 	return Number.isFinite(stored) && stored > 0 ? stored : config.render.defaultInterval;
 };
+
+/**
+ * The cadence a target's `nextRenderTime` is ACTUALLY computed from — `resolveRenderInterval`
+ * with the demand ladder's current rung applied on top.
+ *
+ * THE LADDER IS NOT VISIBLE TO CONFIG, and that is the whole reason this exists. A route grants a
+ * CEILING (`/catalog/` grants 24h) and `render.demand` promotes bot-visited targets beneath it to
+ * 12h or 6h, storing the rung on the target as `demandInterval`. So `resolveRenderInterval` alone
+ * reports 24h for a page that is really on a 6h cadence — a 4x overstatement, on precisely the
+ * pages the ladder singled out as worth rendering more often. Anything dividing by a cadence
+ * (see `util/renderPriority.js`) must divide by this one, or it discounts every promotion the
+ * ladder made.
+ *
+ * CLAMPED TO THE CEILING, because the stored rung can outlive the config that produced it: lower a
+ * route's `renderInterval` and every target still carries a rung from the old, slower ladder until
+ * its next render. `decideInterval` clamps the same way (`Math.min(rungIndexOf(...), ceiling)`), so
+ * a stale rung reads as "at the ceiling" here exactly as it does there rather than understating the
+ * cadence.
+ */
+export const resolveEffectiveInterval = (url, { renderInterval, demandInterval } = {}) => {
+	const base = resolveRenderInterval(url, renderInterval);
+	// Same BigInt-from-`Long` coercion as above, and the same reason `> 0` rather than a typeof
+	// check: `Number(null)` is 0 and `Number(undefined)` is NaN, so an unevaluated target — which
+	// is most of the corpus until the ladder reaches it — falls through to the ceiling.
+	const rung = Number(demandInterval);
+	return Number.isFinite(rung) && rung > 0 ? Math.min(rung, base) : base;
+};

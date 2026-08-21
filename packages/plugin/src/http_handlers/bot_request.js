@@ -6,7 +6,13 @@ import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { resolveForwardedRequest } from '../util/ingress.js';
-import { classifyPath, isForwardedMode, routeScopeForEntry, PRERENDER } from '../util/routeClass.js';
+import {
+	classifyPath,
+	isForwardedMode,
+	resolveEffectiveInterval,
+	routeScopeForEntry,
+	PRERENDER,
+} from '../util/routeClass.js';
 import { Target } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
 import { fetchOriginResource } from '../util/upstream.js';
@@ -371,7 +377,7 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// The target is the field's source of truth (`RenderQueue` re-derives it from there on every
 	// reschedule for exactly that reason). NO target is the legitimate render-now one-off shape, where
 	// `false` is the true answer.
-	const renderTarget = await Target.get({ id: cacheUrl, select: ['sitemapUrl'] });
+	const renderTarget = await Target.get({ id: cacheUrl, select: ['sitemapUrl', 'renderInterval', 'demandInterval'] });
 
 	// Force an immediately-claimable, one-off schedule. No Target is created, so
 	// processJobResult won't reschedule it — and drops the schedule row once the result
@@ -383,7 +389,17 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
 	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
 	// keeps the row above the owner's floor and therefore claimable.
-	await writeSchedule(cacheKey, { nextRenderTime: currentMinuteMs(), fromSitemap: !!renderTarget?.sitemapUrl });
+	await writeSchedule(cacheKey, {
+		nextRenderTime: currentMinuteMs(),
+		fromSitemap: !!renderTarget?.sitemapUrl,
+		// PRESERVED WHEN THERE IS A TARGET, `null` WHEN THERE IS NOT — and the difference matters because
+		// `put` replaces the record. This key may be a real target's recurring row (a warm-on-demand
+		// render-now), and filing `null` there would strip its cadence and demote the page in the next
+		// sweep. With no target this is the render-now one-off shape, which has no cadence to record: the
+		// row is dropped once the result lands. Either way it is due at the current minute, so its own
+		// ranking is unaffected — this is about not damaging the row on the way past.
+		effectiveInterval: renderTarget ? resolveEffectiveInterval(cacheUrl, renderTarget) : null,
+	});
 
 	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
 	// so a paused queue stays paused (the render then simply times out to the fallback).

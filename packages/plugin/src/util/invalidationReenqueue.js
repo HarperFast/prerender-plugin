@@ -116,7 +116,7 @@ import { QueueState } from '../resources/QueueState.js';
 import { getSab } from './coordination.js';
 import { getScheduleRow, leaseInfo, writeSchedules } from './renderSchedule.js';
 import { getResidencyByUrl } from './residency.js';
-import { PRERENDER, resolveRenderInterval } from './routeClass.js';
+import { PRERENDER, resolveEffectiveInterval, resolveRenderInterval } from './routeClass.js';
 import { MINUTE, getInitialRenderTime, numberOf } from './time.js';
 import { metrics } from '../metrics.js';
 
@@ -257,7 +257,7 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
 	for (const key of keys) if (leaseInfo(key)) return refuse('leased', { leasedKey: key });
 
 	const [target, ...rows] = await Promise.all([
-		Target.get({ id: url, select: ['url', 'strikes', 'renderInterval', 'sitemapUrl'] }),
+		Target.get({ id: url, select: ['url', 'strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'] }),
 		// `replicateFrom: false` rides along inside the funnel's reader. Ownership makes this read
 		// AUTHORITATIVE; only the option makes it LOCAL, and an unowned point read on this
 		// residency-pinned table takes Harper's untimed replication fetch — inside a `setImmediate`,
@@ -316,7 +316,15 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
 		// schedule row we just read: `put` REPLACES the record, and the target is the field's source of
 		// truth, so this self-corrects a row whose flag went stale (same choice as the reschedule path).
 		await writeSchedules(
-			eligible.map((row) => ({ cacheKey: row.cacheKey, nextRenderTime: dueAt, fromSitemap: !!target.sitemapUrl }))
+			eligible.map((row) => ({
+				cacheKey: row.cacheKey,
+				nextRenderTime: dueAt,
+				fromSitemap: !!target.sitemapUrl,
+				// The cadence, not the acceleration. `dueAt` is when the invalidation wants this rendered;
+				// how often the page renders is unchanged by being accelerated, and it is what the sweep
+				// ranks by. Same source as `interval` above, with the ladder rung applied.
+				effectiveInterval: resolveEffectiveInterval(url, target),
+			}))
 		);
 	} catch (e) {
 		logger.error(e, `[prerender] could not accelerate ${cacheKey} after an invalidation`);

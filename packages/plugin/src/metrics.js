@@ -377,15 +377,25 @@ export const METRICS = Object.freeze({
 					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
 					'alertable without polling the REST surface. ' +
 					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
+					'ready_sweep_ms = duration of the ready-set sweep (method complete|capped); `capped` means it ' +
+					'never reached a not-yet-due row, so the ordering covers only the oldest part of the backlog ' +
+					'and recently-due pages are going unranked. ' +
+					'ready_published = entries the last sweep published — the ordering’s supply; a persistent 0 ' +
+					'with a non-empty backlog means the sweep is failing. ' +
+					'claim_granted = jobs granted per claim split by source (ready|index) — the only series that ' +
+					'shows whether prioritisation is engaging, since it reorders a fixed amount of work and moves ' +
+					'no total. All-`index` is the failure to look for and is indistinguishable from health ' +
+					'elsewhere. ' +
 					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
 					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
 					'something is CREATING gaps, and the reconcile log line names the URLs.',
 			},
 			method: {
-				name: 'result (claim_scan_ms only)',
-				values: ['granted', 'empty', 'capped'],
+				name: 'result (claim_scan_ms) | outcome (ready_sweep_ms) | source (claim_granted)',
+				values: ['granted', 'empty', 'capped', 'complete', 'ready', 'index'],
 				description:
-					'Only claim_scan_ms uses this slot: granted = jobs handed out, empty = nothing due, capped = the ' +
+					'claim_scan_ms, ready_sweep_ms and claim_granted use this slot. On claim_scan_ms: ' +
+					'granted = jobs handed out, empty = nothing due, capped = the ' +
 					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
 					'window). Every other series emits null here.',
 			},
@@ -640,6 +650,37 @@ export const metrics = Object.freeze({
 
 	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
 	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
+
+	/** One ready-set sweep: how long it took, and whether it saw the whole due set or hit its cap. */
+	readySweep: (durationMs, outcome) =>
+		server.recordAnalytics(durationMs, 'queue_health', 'ready_sweep_ms', outcome, null),
+
+	/** How many entries the last sweep published — the ordering's supply. */
+	readyPublished: (count) => server.recordAnalytics(count, 'queue_health', 'ready_published', null, null),
+
+	/**
+	 * How much of the due set the last sweep could score against its REAL cadence, `carried` vs
+	 * `resolved`.
+	 *
+	 * The backfill gauge, and the only way to see it land. `effectiveInterval` is written by the
+	 * schedule writers, so it is absent on every row until that row re-renders: this reads all
+	 * `resolved` on the first sweep after an upgrade and should cross over within one cadence. A ratio
+	 * that STAYS low is the interesting signal — it means rows are being filed without a cadence (a
+	 * writer passing `null`, a corpus that is not re-rendering) and the demand ladder's promotions are
+	 * being scored against their route ceilings, which is the exact bug this field exists to fix. It
+	 * cannot be inferred from anything else: the ordering still works in both states, just less well.
+	 */
+	readyCadenceSource: (count, source) => server.recordAnalytics(count, 'queue_health', 'ready_cadence', source, null),
+
+	/**
+	 * Jobs granted per claim, split by WHERE they came from: the ready set or the fallback index scan.
+	 *
+	 * This is the series that says whether prioritisation is actually happening. The ready set reorders
+	 * a fixed amount of work, so no total moves when it engages — and a node quietly serving every
+	 * claim from `index` (a sweep that is failing, a buffer that could not be sized, a set that is
+	 * always dry) looks identical to a healthy one in every other number.
+	 */
+	claimSource: (count, source) => server.recordAnalytics(count, 'queue_health', 'claim_granted', source, null),
 
 	/** One origin proxy on the serve path: time to response headers, status, and why. */
 	originFetch: (durationMs, statusCode, reason) =>

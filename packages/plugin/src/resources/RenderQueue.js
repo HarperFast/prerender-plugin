@@ -4,7 +4,13 @@ import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { canonicalizeUrl } from '../util/url.js';
-import { classifyPath, queryAllowlistFor, resolveRenderInterval, PRERENDER } from '../util/routeClass.js';
+import {
+	classifyPath,
+	queryAllowlistFor,
+	resolveEffectiveInterval,
+	resolveRenderInterval,
+	PRERENDER,
+} from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
@@ -14,6 +20,7 @@ import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import {
 	claimSchedules,
+	sweepReadySet,
 	deleteSchedule,
 	deriveQueueStatus,
 	maybeResetFloor,
@@ -384,7 +391,15 @@ export class RenderQueue extends Resource {
 				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
 				// lowering on every completed render would rewind the floor to the current minute
 				// continuously and the whole 14× seek win would evaporate.
-				await writeSchedule(cacheKey, { nextRenderTime, fromSitemap: !!renderTarget.sitemapUrl });
+				await writeSchedule(cacheKey, {
+					nextRenderTime,
+					fromSitemap: !!renderTarget.sitemapUrl,
+					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
+					// the writer every target passes through on every cycle, so it is what backfills the
+					// cadence across the corpus, and it is the only site holding a rung fresher than the
+					// stored one. The ready-set sweep divides lateness by this to rank the row.
+					effectiveInterval: interval,
+				});
 
 				// Persist the rung ONLY on an actual move. 'held' must not write even when the
 				// stored field is absent — absence already resolves to the base ceiling, so writing
@@ -640,7 +655,12 @@ export class RenderQueue extends Resource {
 	static async recordRedirectStrike(cacheKey, why) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
 		// One read serves both the strike decision and the reschedule below.
-		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		const renderTarget = await Target.get({
+			id: sourceUrl,
+			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
+			// on the schedule row is the ladder's rung rather than the route ceiling.
+			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
+		});
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
 			return;
@@ -702,7 +722,12 @@ export class RenderQueue extends Resource {
 	 */
 	static async retryAfterFailure(cacheKey) {
 		const sourceUrl = CacheKey.extractUrl(cacheKey);
-		const renderTarget = await Target.get({ id: sourceUrl, select: ['strikes', 'renderInterval', 'sitemapUrl'] });
+		const renderTarget = await Target.get({
+			id: sourceUrl,
+			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
+			// on the schedule row is the ladder's rung rather than the route ceiling.
+			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
+		});
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
 			return 'dropped';
@@ -719,12 +744,17 @@ export class RenderQueue extends Resource {
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const fromSitemap = !!renderTarget.sitemapUrl;
 		const wait = backoffWait(interval, strikes, fromSitemap);
+		// THE CADENCE, NOT `wait`. The backoff is how long until the retry; the cadence is how often the
+		// page wants to render. Filing `wait` here would tell the sweep a repeatedly-failing 1h page is
+		// on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority on
+		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
+		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		const nextRenderTime = currentMinuteMs() + wait;
 		logger.debug(
 			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap });
+		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval: cadence });
 		return 'slow';
 	}
 
@@ -743,7 +773,7 @@ export class RenderQueue extends Resource {
 			preloaded ??
 			(await Target.get({
 				id: sourceUrl,
-				select: ['renderInterval', 'sitemapUrl'],
+				select: ['renderInterval', 'sitemapUrl', 'demandInterval'],
 			}));
 		if (!renderTarget) {
 			await deleteSchedule(cacheKey);
@@ -754,6 +784,12 @@ export class RenderQueue extends Resource {
 		await writeSchedule(cacheKey, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
+			// The ladder rung when the row carried one, else the ceiling. A caller-supplied `preloaded`
+			// row is documented as "at least renderInterval + sitemapUrl", so an absent `demandInterval`
+			// means "not read" rather than "not promoted" — resolving to the ceiling is the safe reading,
+			// and the next render files the true rung either way. (`recordRedirectStrike`, the one
+			// in-tree preloader, now selects it.)
+			effectiveInterval: resolveEffectiveInterval(sourceUrl, renderTarget),
 		});
 	}
 
@@ -799,6 +835,12 @@ export class RenderQueue extends Resource {
 			performance.now() - scanStarted,
 			pass.scanTruncated ? 'capped' : pass.jobs.length ? 'granted' : 'empty'
 		);
+
+		// WHERE the batch came from. Two emits per claim at most, on a path that runs a few times a
+		// second — and the only evidence that the ready set is doing anything, since it moves no totals.
+		const fromReady = pass.fromReady ?? 0;
+		if (fromReady > 0) metrics.claimSource(fromReady, 'ready');
+		if (pass.jobs.length - fromReady > 0) metrics.claimSource(pass.jobs.length - fromReady, 'index');
 
 		const jobs = [];
 		let notOwnedHere = 0;
@@ -933,6 +975,106 @@ let queueStatusSyncStarted = false;
  * handleApplication after config is applied (so the interval reflects overrides).
  * Idempotent. The interval follows `queue.statusSyncInterval` changes without a restart.
  */
+/**
+ * The ready-set sweep, on worker 0, on its own interval.
+ *
+ * SEPARATE FROM `startQueueStatusSync` DESPITE THE SIMILAR SHAPE, and the reason is the claim mutex.
+ * The status sync deliberately runs inside it — the floor reset and the lease-gauge walk both need
+ * that serialization. The sweep must NOT: it holds a read cursor over the due set for hundreds of
+ * milliseconds, and taking the claim mutex for that long would block every claim on the node for the
+ * duration of a scan whose entire purpose is to keep claims off the index.
+ *
+ * It needs no mutex of its own either. It writes nothing to the database, and its only shared-memory
+ * write is `publish`, which fills the inactive slot and flips one atomic — so a concurrent claim
+ * either sees the previous generation or the next one, never a partial set. Two overlapping sweeps
+ * would merely duplicate work, and `sweeping` prevents that within a worker.
+ */
+let readySweepStarted = false;
+
+/**
+ * `e?.message`, never `e.message`: anything can be thrown, and `null.message` is a TypeError raised
+ * from inside the very handler that exists to keep this path alive. Same helper and same reasoning as
+ * `util/configOverride.js`.
+ */
+const messageOf = (e) => e?.message ?? String(e);
+
+/**
+ * Node's `setInterval` ceiling. Past 2^31-1 ms the delay overflows: node warns and then fires the
+ * callback after ONE MILLISECOND. So an over-large sweep interval does not merely slow the sweep
+ * down, it converts it into a hot loop re-reading the due set on worker 0 — the opposite of what the
+ * number asked for. The schema rejects anything larger with a warning, which is the loud path; this
+ * clamp is here so that the loud path working is not the only thing between a typo and that loop.
+ */
+const MAX_TIMER_MS = 2147483647;
+
+export function startReadySweep() {
+	if (server.workerIndex !== 0 || readySweepStarted) return;
+	readySweepStarted = true;
+
+	let sweeping = false;
+
+	const sweep = () => {
+		if (sweeping || !config.queue.ready.enabled) return;
+		sweeping = true;
+		const started = performance.now();
+		// THE SYNCHRONOUS INVOCATION IS INSIDE THE TRY, not just the promise chain. `sweeping` is a
+		// latch: if the call throws before returning a promise, `finally` never runs, the latch is never
+		// released, and the sweep is permanently dead for the life of the process — with claims quietly
+		// falling back to the index scan and nothing saying why. That silent-forever failure is worth
+		// more than the narrow chance of the throw.
+		try {
+			sweepReadySet()
+				.then((result) => {
+					if (result?.skipped) return;
+					metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
+					metrics.readyPublished(result.published);
+					// Both halves, every sweep, so the ratio is readable without needing the total from a
+					// second series — and so `carried: 0` is an explicit observation rather than an absence.
+					metrics.readyCadenceSource(result.cadenceCarried, 'carried');
+					metrics.readyCadenceSource(result.due - result.cadenceCarried, 'resolved');
+					if (result.truncated) {
+						// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
+						// unranked — precisely the pages this feature exists to protect. That makes it a warning
+						// rather than a statistic.
+						logger.warn(
+							`[prerender] ready-set sweep read its ${config.queue.ready.sweepCap}-row cap without reaching a ` +
+								`not-yet-due row: ${result.due} due row(s) seen, ${result.published} published. The ordering ` +
+								`covers only the oldest part of the backlog, so recently-due pages are going unranked. Raise ` +
+								`queue.ready.sweepCap, or reduce the backlog.`
+						);
+					}
+				})
+				.catch((e) => logger.error(messageOf(e)))
+				.finally(() => {
+					sweeping = false;
+				});
+		} catch (e) {
+			logger.error(messageOf(e));
+			sweeping = false;
+		}
+	};
+
+	// Once immediately, so a restarted worker generation does not serve a whole interval of claims
+	// from the index before the set exists.
+	sweep();
+
+	const arm = (ms) => {
+		const timer = ms > 0 ? setInterval(sweep, Math.min(MAX_TIMER_MS, ms)) : null;
+		timer?.unref?.();
+		return timer;
+	};
+
+	let armed = config.queue.ready.sweepInterval;
+	let timer = arm(armed);
+
+	onConfigApplied(() => {
+		if (config.queue.ready.sweepInterval === armed) return;
+		if (timer) clearInterval(timer);
+		armed = config.queue.ready.sweepInterval;
+		timer = arm(armed);
+	});
+}
+
 export function startQueueStatusSync() {
 	if (server.workerIndex !== 0 || queueStatusSyncStarted) return;
 	queueStatusSyncStarted = true;
