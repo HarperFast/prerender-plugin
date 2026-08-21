@@ -557,3 +557,29 @@ test('a due set that fills the cap is still reported truncated', async () => {
 	assert.equal(sweep.scanned, 25, 'read exactly the cap');
 	assert.equal(sweep.truncated, true, 'never reached a not-yet-due row, so the ordering is over a prefix');
 });
+
+test('the yield budget changes WHEN the walk pauses, never what it produces', async () => {
+	// The yield used to fire every 200 rows; it now fires on elapsed time. That is a change to
+	// scheduling, and the invariant worth pinning is that it is ONLY that — a sweep must publish the
+	// same set whether it pauses constantly or barely at all. A budget of 1ms yields on nearly every
+	// check at any realistic per-row cost; 1e9 never yields at all.
+	const rows = backlogWithLateHome();
+	const run = async (yieldBudget) => {
+		resetShared();
+		config.queue.ready.yieldBudget = yieldBudget;
+		seed(rows);
+		const sweep = await funnel.sweepReadySet({ nowMs: T0 });
+		const pass = await funnel.claimSchedules({ grantLimit: 3 });
+		return { sweep, keys: pass.jobs.map((j) => j.cacheKey) };
+	};
+
+	const chatty = await run(1);
+	const never = await run(1_000_000_000);
+	config.queue.ready.yieldBudget = 2;
+
+	assert.equal(chatty.sweep.due, never.sweep.due);
+	assert.equal(chatty.sweep.scanned, never.sweep.scanned, 'the same rows are read either way');
+	assert.equal(chatty.sweep.published, never.sweep.published);
+	assert.deepEqual(chatty.keys, never.keys, 'and the same jobs are granted, in the same order');
+	assert.deepEqual(chatty.keys[0], 'https://www.kohls.com/|desktop', 'still the late homepage first');
+});
