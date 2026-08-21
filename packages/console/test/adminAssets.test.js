@@ -184,3 +184,45 @@ test('font licenses ship beside the vendored fonts', () => {
 		assert.ok(text.length > 500, `${license} is missing or empty`);
 	}
 });
+
+test('a metric the plugin emits is charted by the console, or waived with a reason', () => {
+	// THE SAME FAILURE AS THE ROUTE CONTRACT ABOVE, one layer down. The plugin adds a metric, the
+	// console — a separately versioned package — never learns about it, and the signal ships
+	// invisible with a green suite on both sides. It has already happened: v0.50.0 added four
+	// `queue_health` series, one of which (`claim_granted`) the catalog itself describes as the
+	// ONLY way to see whether render prioritisation is engaging, because the ready set reorders a
+	// fixed amount of work and moves no total. Nothing failed when no panel read it.
+	//
+	// Ground truth is the EMIT SITES, not the catalog's `values` list: a series is real once
+	// something records it, and the two can drift (they did — the prose and METRICS.md carried the
+	// new series while the machine-readable `values` array did not).
+	const metricsSource = readFileSync(fileURLToPath(new URL('../../plugin/src/metrics.js', import.meta.url)), 'utf8');
+	// `recordAnalytics(value, 'metric', 'series'` — only emitters whose series name is a literal.
+	// A dynamic one (`queueHealth(value, gauge)`, the `sitemap_${series}` template) names its
+	// series at the CALL site and is out of scope here; those are covered by their callers.
+	const emitted = [...metricsSource.matchAll(/recordAnalytics\([^,]+,\s*'([a-z_]+)',\s*'([a-z_0-9]+)'/g)].map(
+		([, metric, series]) => `${metric}.${series}`
+	);
+	assert.ok(emitted.length > 0, 'expected to find literal metric emit sites');
+
+	// A series may legitimately have no panel — but it has to be a decision, written down here,
+	// not an oversight nobody noticed.
+	const NOT_CHARTED = new Map([
+		['prerender_ops.page_age_negative', 'surfaced as a discard warning on Traffic, not as a series of its own'],
+		['prerender_ops.serve_error', 'blob-fault counter; the serve-side view of it is bot_serve blob-* on Traffic'],
+		['prerender_ops.unrouted', 'has its own endpoint and panel (the unrouted report), not the analytics window'],
+		['prerender_ops.config_warnings', 'the Config view reads the warnings themselves, which say more than a count'],
+		['prerender_ops.invalidation_error', 'the Invalidations view reads the rows; a failure count adds nothing'],
+		['prerender_ops.invalidation_reenqueue', 'demand-driven heal is off by default and has no panel yet'],
+	]);
+
+	const client = [...clientSources.values()].join('\n');
+	for (const series of new Set(emitted)) {
+		const [, name] = series.split('.');
+		if (NOT_CHARTED.has(series)) continue;
+		assert.ok(
+			client.includes(`'${name}'`),
+			`the plugin emits ${series} and no console view reads it — chart it, or add it to NOT_CHARTED with the reason`
+		);
+	}
+});
