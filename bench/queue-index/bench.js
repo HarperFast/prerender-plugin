@@ -169,7 +169,10 @@ const tablesReady = async () => {
 async function main() {
 	if (!(await tablesReady())) {
 		console.error('[bench] databases.bench never appeared — the schema did not load');
-		process.exit(1);
+		// SIGTERM, not `process.exit`: Harper intercepts exit, so this path would print and then hang as
+		// a running server. Same reason as the success path at the end of `main`.
+		process.kill(process.pid, 'SIGTERM');
+		return;
 	}
 	const { BenchA, BenchB, BenchC } = databases.bench;
 	const out = { rows: ROWS, repeats: REPEATS, harper: server?.version ?? 'unknown', phases: {} };
@@ -347,5 +350,7 @@ async function main() {
 
 main().catch((e) => {
 	console.error('[bench] failed', e);
-	process.exit(1);
+	// SIGTERM for the same reason: an intercepted `process.exit` leaves a failed run hanging, which
+	// looks exactly like a slow one.
+	process.kill(process.pid, 'SIGTERM');
 });

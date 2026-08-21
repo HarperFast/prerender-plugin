@@ -33,6 +33,13 @@ if [[ "$MODE" == "docker" ]]; then
 	# module, so a read-only mount fails the whole component with EROFS and the server comes up
 	# perfectly happy with nothing loaded. Staging keeps that write out of the working tree.
 	STAGE="$(mktemp -d)"
+	# WORLD-WRITABLE ON PURPOSE. `mktemp -d` is 0700 owned by the host user; the container runs as
+	# `harperdb`, and Harper's component loader has to CREATE `node_modules` inside the mount to symlink
+	# itself. Without this the component fails with EROFS/EACCES and the server comes up perfectly
+	# healthy having loaded nothing — the silent-success failure this harness has already hit once.
+	# (Docker Desktop on macOS remaps ownership and hides it; on Linux and in CI it does not.) Safe
+	# here: a throwaway directory holding three harness files, removed on exit.
+	chmod 777 "$STAGE"
 	cp "$HERE"/config.yaml "$HERE"/schema.graphql "$HERE"/bench.js "$STAGE/"
 	trap 'rm -rf "$STAGE"' EXIT
 
