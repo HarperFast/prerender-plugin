@@ -7,10 +7,10 @@ change is argued from figures anyone can regenerate.
 
 It also exists because the two figures currently in the tree **disagree by 80x**:
 
-| source | claim | implied |
-| --- | --- | --- |
-| `src/util/renderSchedule.js` | the claim scan returns 20 keys in 0.43 ms | ~21 µs/row |
-| `src/util/backlogSnapshot.js` | "~3.5s per 2,000 rows" | ~1.75 ms/row |
+| source                        | claim                                     | implied      |
+| ----------------------------- | ----------------------------------------- | ------------ |
+| `src/util/renderSchedule.js`  | the claim scan returns 20 keys in 0.43 ms | ~21 µs/row   |
+| `src/util/backlogSnapshot.js` | "~3.5s per 2,000 rows"                    | ~1.75 ms/row |
 
 Both describe a one-sided ascending range read over the same index on the same table, and which one
 is right decides the architecture:
@@ -21,8 +21,8 @@ is right decides the architecture:
 - At **1.75 ms/row**, a 500k-row due set takes ~15 minutes to walk. Every design that reads the due
   set is dead, and priority has to be expressed in the index itself.
 
-The likely reconciliation is that `backlogSnapshot` yields to the event loop every 200 rows *beside
-bot traffic* and seeks the absolute index minimum, while the claim scan seeks a floor and never
+The likely reconciliation is that `backlogSnapshot` yields to the event loop every 200 rows _beside
+bot traffic_ and seeks the absolute index minimum, while the claim scan seeks a floor and never
 yields — so the harness measures yielding as an explicit variable rather than assuming it.
 
 ## Running it
@@ -46,10 +46,10 @@ knowing before you edit the harness:
   read-only mount fails the component with `EROFS` — and the server then comes up perfectly happy
   having loaded nothing.
 - The entry point is **`jsResource`, not `pluginModule`.** `handleApplication` is the hook Harper
-  calls on a component another component *uses* as an extension; a root component declaring it is
+  calls on a component another component _uses_ as an extension; a root component declaring it is
   simply never invoked. Same silent-success failure.
 - The staged dir is **`chmod 777`.** `mktemp -d` is 0700 owned by the host user, and the container runs
-  as `harperdb` and has to *create* `node_modules` inside the mount — so without it the component
+  as `harperdb` and has to _create_ `node_modules` inside the mount — so without it the component
   fails with `EACCES` and, again, the server comes up healthy having loaded nothing. Docker Desktop on
   macOS remaps ownership and hides this; Linux and CI do not.
 - Harper **intercepts `process.exit`**, so the harness signals itself instead — on the failure paths as
@@ -61,17 +61,17 @@ the component did not load rather than that the measurement is slow.
 
 ## What it answers, and what each answer decides
 
-| | question | if the answer is… | then |
-| --- | --- | --- | --- |
-| Q1 | per-row cost of the claim-shaped read at limits 20 → 20,000 | small (~tens of µs) | a background sweep of the due set is affordable; exact ordering is on the table |
-| | | large (~ms) | priority must live in the index; no design may read the due set |
-| Q2 | how much of Q1 is the yielding, not the engine | yielding dominates | the 80× is an artefact and Q1's plain number is the real one |
-| Q3 | K per-lane seeks vs one large seek | per-lane ≈ free | the interleaved-lane design in #116 is sound |
-| Q4 | single-attribute update vs whole-record `put` | update much cheaper | an in-place lane change is cheap; encoding is a good deal |
-| Q5 | one indexed attribute vs two, on the write | ≈ equal | #80's "a second index doubles the hot write" is wrong, and a per-lane **table** becomes viable |
-| | | two much slower | splitting `dueAt` out of the queue key must keep `dueAt` **unindexed** |
-| Q6 | two-sided vs one-sided range, limit fillable and not | two-sided catastrophic when it cannot fill | keep the `<= now` half in application code, as `claimSchedules` does |
-| Q7 | does the seek point degrade as rows churn away from it | yes, and a floored seek is immune | the claim floor stays load-bearing under any new design |
+|     | question                                                    | if the answer is…                          | then                                                                                           |
+| --- | ----------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Q1  | per-row cost of the claim-shaped read at limits 20 → 20,000 | small (~tens of µs)                        | a background sweep of the due set is affordable; exact ordering is on the table                |
+|     |                                                             | large (~ms)                                | priority must live in the index; no design may read the due set                                |
+| Q2  | how much of Q1 is the yielding, not the engine              | yielding dominates                         | the 80× is an artefact and Q1's plain number is the real one                                   |
+| Q3  | K per-lane seeks vs one large seek                          | per-lane ≈ free                            | the interleaved-lane design in #116 is sound                                                   |
+| Q4  | single-attribute update vs whole-record `put`               | update much cheaper                        | an in-place lane change is cheap; encoding is a good deal                                      |
+| Q5  | one indexed attribute vs two, on the write                  | ≈ equal                                    | #80's "a second index doubles the hot write" is wrong, and a per-lane **table** becomes viable |
+|     |                                                             | two much slower                            | splitting `dueAt` out of the queue key must keep `dueAt` **unindexed**                         |
+| Q6  | two-sided vs one-sided range, limit fillable and not        | two-sided catastrophic when it cannot fill | keep the `<= now` half in application code, as `claimSchedules` does                           |
+| Q7  | does the seek point degrade as rows churn away from it      | yes, and a floored seek is immune          | the claim floor stays load-bearing under any new design                                        |
 
 Q4 and Q5 together decide the change I'd otherwise make on correctness grounds alone: giving the
 queue its **own** indexed column and leaving the freshness deadline as a plain unindexed timestamp,

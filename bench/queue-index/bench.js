@@ -185,9 +185,10 @@ async function main() {
 	const seedB = await seed(BenchB, 'B');
 	const seedC = await seed(BenchC, 'C');
 	out.phases.write = {
-		note: 'Q5 — per-row put cost. A and B have ONE indexed attribute, C has two. If C is materially '
-			+ 'slower than B, a second index really does cost what #80 says and a per-lane table is expensive; '
-			+ 'if A and B match, splitting the deadline out of the queue key is free.',
+		note:
+			'Q5 — per-row put cost. A and B have ONE indexed attribute, C has two. If C is materially ' +
+			'slower than B, a second index really does cost what #80 says and a per-lane table is expensive; ' +
+			'if A and B match, splitting the deadline out of the queue key is free.',
 		A_oneIndex_usPerRow: (seedA * 1000) / ROWS,
 		B_oneIndex_split_usPerRow: (seedB * 1000) / ROWS,
 		C_twoIndexes_usPerRow: (seedC * 1000) / ROWS,
@@ -213,10 +214,11 @@ async function main() {
 		});
 	}
 	out.phases.read = {
-		note: 'Q1/Q2 — per-row cost of the claim-shaped read, plain vs yielding every 200 rows. The tree '
-			+ 'holds two figures for this that differ 80x (21us/row in renderSchedule.js, 1.75ms/row in '
-			+ 'backlogSnapshot.js). If the plain number is the small one and yielding explains the rest, then '
-			+ 'a background sweep of the due set is affordable and a ready-set design is on the table.',
+		note:
+			'Q1/Q2 — per-row cost of the claim-shaped read, plain vs yielding every 200 rows. The tree ' +
+			'holds two figures for this that differ 80x (21us/row in renderSchedule.js, 1.75ms/row in ' +
+			'backlogSnapshot.js). If the plain number is the small one and yielding explains the rest, then ' +
+			'a background sweep of the due set is affordable and a ready-set design is on the table.',
 		samples: reads,
 	};
 	log('[bench] read:', JSON.stringify(out.phases.read, null, 2));
@@ -233,8 +235,9 @@ async function main() {
 	});
 	const oneBig = await time('1 seek, limit 60', () => drain(oneSided(BenchB, floor, 60, 'queueKey')));
 	out.phases.lanes = {
-		note: 'Q3 — the interleaved-lane design pays one seek per lane. #80 measured 0.29-0.32ms per lane '
-			+ 'and claimed interleaving is free; this is that claim against one seek for the same row count.',
+		note:
+			'Q3 — the interleaved-lane design pays one seek per lane. #80 measured 0.29-0.32ms per lane ' +
+			'and claimed interleaving is free; this is that claim against one seek for the same row count.',
 		threeLaneSeeks_ms: perLane.minMs,
 		oneSeekSameRows_ms: oneBig.minMs,
 	};
@@ -263,10 +266,11 @@ async function main() {
 	);
 	const fillable = await time('twoSided, wide window, limit fills', () => drain(twoSided(BenchA, floor, now, 20)));
 	out.phases.twoSided = {
-		note: 'Q6 — `claimSchedules` keeps the `<= now` half in application code because a two-sided range '
-			+ 'measured 1,128-2,977ms when the limit cannot fill (only the first condition becomes the index '
-			+ 'range, the second is a post-filter, so the cost is O(rows above the lower bound)). The window '
-			+ 'must be low and narrow with an unfillable limit or the test does not touch that path.',
+		note:
+			'Q6 — `claimSchedules` keeps the `<= now` half in application code because a two-sided range ' +
+			'measured 1,128-2,977ms when the limit cannot fill (only the first condition becomes the index ' +
+			'range, the second is a post-filter, so the cost is O(rows above the lower bound)). The window ' +
+			'must be low and narrow with an unfillable limit or the test does not touch that path.',
 		rowsAboveLowerBound: ROWS,
 		matchesInWindow: perMinute,
 		limitThatCannotFill: cannotFillLimit,
@@ -281,7 +285,7 @@ async function main() {
 	// ---- Q4 / Q7: reschedule churn, and whether the seek point degrades --------------------------
 	// The reschedule pattern: read the head, move those rows into the future, repeat. This is what
 	// leaves dead index entries AT the seek point, and it is the measurement the claim floor exists
-    // to answer (0.36 -> 6.25ms over 40,000 reschedules, permanent).
+	// to answer (0.36 -> 6.25ms over 40,000 reschedules, permanent).
 	// PRODUCTION-SHAPED CHURN, which the first version of this was not. It patched keys 0..N in key
 	// order; production repeatedly CLAIMS THE HEAD of the index and writes those rows into the future,
 	// so the dead entries accumulate at the seek point rather than being spread over a key range. The
@@ -332,9 +336,10 @@ async function main() {
 	trend.push({ reschedules: moved, ...(await sampleSeek()) });
 
 	out.phases.churn = {
-		note: 'Q7 — does the seek point degrade as rows churn away from it (the 0.36 -> 6.25ms finding the '
-			+ 'claim floor exists to fix), and is a floored seek immune? Head-claim-then-reschedule, the '
-			+ 'production shape, sampling both seeks as it goes. Also Q4: per-row put on the reschedule path.',
+		note:
+			'Q7 — does the seek point degrade as rows churn away from it (the 0.36 -> 6.25ms finding the ' +
+			'claim floor exists to fix), and is a floored seek immune? Head-claim-then-reschedule, the ' +
+			'production shape, sampling both seeks as it goes. Also Q4: per-row put on the reschedule path.',
 		reschedules: moved,
 		put_usPerRow: (churnMs * 1000) / Math.max(1, moved),
 		trend,
