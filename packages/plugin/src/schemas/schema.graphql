@@ -12,7 +12,10 @@
 #                                                      because it is SUBSCRIBED; see the type)
 #   page_cache       PrerenderedPage                 — rendered-HTML cache (blob writes)
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
-#   coordination     SharedBuffer                    — node-local SAB, never replicated
+#   coordination     SharedBuffer,                   — node-local SAB, never replicated
+#                    CoordinationAnchor                (+ an empty replicated anchor, see the type)
+#   probe_state      ProbeState, ProbeStateAnchor    — change-probe baselines (node-local,
+#                                                      isolated for reseed write bursts)
 #   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
 #                                                      serve path; isolated, see the type)
 
@@ -105,15 +108,6 @@ type Target @table(database: "render_service") @export {
 	# never been evaluated and starts from its route/stored interval. Written ONLY when the rung
 	# actually changes, so a converged corpus pays no write — same discipline as `strikes`.
 	demandInterval: Long
-	# The change probe's last observed content signature for this URL (util/changeProbe.js) —
-	# canonical JSON of the watched fields, compared as an opaque string. Written only when the
-	# observation differs from what is stored (seed or change), so a converged corpus pays no
-	# write per probe — the `demandInterval` discipline. Absent = never probed, and the next
-	# probe SEEDS rather than triggers. `Target.put` REPLACES the row and clears this with it,
-	# deliberately: a re-put target restarts its probe baseline exactly as it restarts its
-	# suppression state and ladder rung.
-	probeSignature: String
-	probedAt: Date
 }
 
 type RenderSchedule @table(database: "render_schedule") @export {
@@ -298,6 +292,49 @@ type PrerenderedPage @table(database: "page_cache") @export {
 
 type SharedBuffer @table(database: "coordination", replicate: false) {
 	key: Any @primaryKey
+}
+
+# DELIBERATELY EMPTY, AND REPLICATED — the anchor that keeps this database subscribable.
+#
+# Replication subscribes every database (`databases: "*"`), and a database whose tables are all
+# `replicate: false` gives that subscription nothing to attach to: the link enters a
+# disconnect/retry loop measured at ~4,300 cycles per node per day on this very database
+# (harper-pro#685). One replicated table — never written, so it costs zero replication traffic
+# and zero storage — turns that loop into an ordinary idle stream. Remove it only once the
+# cluster runs a Harper release with that issue fixed.
+type CoordinationAnchor @table(database: "coordination") @sealed {
+	id: Int @primaryKey
+}
+
+# The change probe's last observed content signature per URL (util/changeProbe.js) — canonical
+# JSON of the watched fields, compared as an opaque string. Written only when the observation
+# differs from what is stored (seed or change), so a converged corpus pays no write per probe.
+#
+# NODE-LOCAL BY CONSTRUCTION, hence `replicate: false`: the probe sweep is owner-scoped —
+# a URL's signature is only ever read and written by the node residency assigns it to — so
+# replication would ship every baseline to three nodes that never consult it. The corpus-scale
+# seeding pass and every post-trip reseed then cost zero replication and a quarter of the audit.
+# The trade is that the state does not survive an ownership move or a node rebuild — and that is
+# the safe direction: a missing row re-SEEDS on the next pass (baseline stored, nothing
+# triggered).
+#
+# ITS OWN DATABASE: probe writes are corpus-scale during seeding and post-trip reseeds, and
+# Harper serializes writes per database — no other table should queue behind a reseed, and a
+# reseed should queue behind nothing. The anchor below is what makes a database of node-local
+# tables safe to create at all.
+#
+# Absent row = never probed (or moved/rebuilt/deleted) — the next probe seeds rather than
+# triggers. `Target.delete` removes the row alongside the cached pages.
+type ProbeState @table(database: "probe_state", replicate: false) @sealed {
+	url: String @primaryKey
+	signature: String
+	probedAt: Date
+}
+
+# Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a
+# database with zero replicable tables spins the replication subscription (harper-pro#685).
+type ProbeStateAnchor @table(database: "probe_state") @sealed {
+	id: Int @primaryKey
 }
 
 # One HyperLogLog register array per (UTC day, bot, node) — this node's shard of that day's

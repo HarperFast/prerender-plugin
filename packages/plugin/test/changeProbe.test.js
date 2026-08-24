@@ -47,6 +47,7 @@ beforeEach(async () => {
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {}, notify() {} };
 	globalThis.databases = {
 		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		probe_state: { ProbeState: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },
 		render_schedule: { RenderSchedule: FakeTable },
@@ -79,8 +80,17 @@ async function* stream(rows) {
 	yield* rows;
 }
 
-/** Run one pass with everything faked; `answers` maps url -> signature | Error | null. */
-const runPass = async ({ rows, answers, dryRun = false, maxTriggers = 100, owners = {}, ...overrides }) => {
+/** Run one pass with everything faked; `answers` maps url -> signature | Error | null,
+ *  `stored` is the ProbeState the read port answers from. */
+const runPass = async ({
+	rows,
+	answers,
+	stored = {},
+	dryRun = false,
+	maxTriggers = 100,
+	owners = {},
+	...overrides
+}) => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const written = [];
 	const triggered = [];
@@ -94,6 +104,7 @@ const runPass = async ({ rows, answers, dryRun = false, maxTriggers = 100, owner
 			if (answer instanceof Error) throw answer;
 			return answer ?? null;
 		},
+		read: async (url) => stored[url] ?? null,
 		write: async (url, signature) => written.push({ url, signature }),
 		trigger: async (target) => triggered.push(target.url),
 		dryRun,
@@ -132,7 +143,8 @@ test('only owned, unsuppressed, rule-matched rows are probed', async () => {
 
 test('the state machine: seed, unchanged, changed', async () => {
 	const { stats, written, triggered } = await runPass({
-		rows: [row(URL_A), row(URL_B, { probeSignature: '[1]' }), row(URL_C, { probeSignature: '[1]' })],
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_B]: '[1]', [URL_C]: '[1]' },
 		answers: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[2]' },
 	});
 	assert.equal(stats.seeded, 1);
@@ -146,7 +158,8 @@ test('the state machine: seed, unchanged, changed', async () => {
 
 test('dry run counts and re-baselines but never triggers', async () => {
 	const { stats, written, triggered } = await runPass({
-		rows: [row(URL_A, { probeSignature: '[1]' })],
+		rows: [row(URL_A)],
+		stored: { [URL_A]: '[1]' },
 		answers: { [URL_A]: '[2]' },
 		dryRun: true,
 	});
@@ -159,7 +172,8 @@ test('dry run counts and re-baselines but never triggers', async () => {
 
 test('a probe failure changes NOTHING: no write, no trigger, counted, sampled', async () => {
 	const { stats, written, triggered } = await runPass({
-		rows: [row(URL_A, { probeSignature: '[1]' }), row(URL_B, { probeSignature: '[1]' })],
+		rows: [row(URL_A), row(URL_B)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]' },
 		answers: { [URL_A]: new Error('HTTP 500'), [URL_B]: null }, // fetch failure and all-null extraction
 	});
 	assert.equal(stats.failed, 2);
@@ -172,7 +186,8 @@ test('a probe failure changes NOTHING: no write, no trigger, counted, sampled', 
 
 test('past the trigger budget a change DEFERS: signature left stale so the next pass retries', async () => {
 	const { stats, written, triggered } = await runPass({
-		rows: [row(URL_A, { probeSignature: '[1]' }), row(URL_B, { probeSignature: '[1]' })],
+		rows: [row(URL_A), row(URL_B)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]' },
 		answers: { [URL_A]: '[2]', [URL_B]: '[2]' },
 		maxTriggers: 1,
 		concurrency: 1, // deterministic order: A triggers, B defers
@@ -187,11 +202,12 @@ test('a failed trigger write keeps the signature stale too', async () => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const written = [];
 	const stats = await changeProbe.runProbePass({
-		rows: stream([row(URL_A, { probeSignature: '[1]' })]),
+		rows: stream([row(URL_A)]),
 		rules: compileProbeRules(RULES_RAW),
 		ownerOf: () => 'node-a',
 		hostname: 'node-a',
 		probe: async () => '[2]',
+		read: async () => '[1]',
 		write: async (url, signature) => written.push({ url, signature }),
 		trigger: async () => {
 			throw new Error('write refused');

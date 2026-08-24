@@ -69,13 +69,15 @@ import {
 const targetTable = () => databases.render_service.Target;
 const pageTable = () => databases.page_cache.PrerenderedPage;
 const invalidationTable = () => databases.invalidation.Invalidation;
+const probeStateTable = () => databases.probe_state.ProbeState;
 
 // Rows scanned between event-loop yields (util/reconcile.js's cadence).
 const YIELD_EVERY = 200;
 
-// What every probe read of the registry projects. `probeSignature` is the stored comparison
-// state; the rest is what the trigger needs (writeSchedules wants fromSitemap + the cadence).
-const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state', 'probeSignature'];
+// What every probe read of the registry projects — what matching and the trigger need
+// (writeSchedules wants fromSitemap + the cadence). The stored signature is NOT here: it lives
+// in the node-local ProbeState table (see schema.graphql), read per probed URL.
+const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state'];
 
 // Compile + memoize the rule list, keyed on config identity — applyOptions rebuilds config from
 // defaults on every change, so a fresh array means a reload (the routeClass memo pattern).
@@ -233,8 +235,12 @@ const triggerRevalidate = async (row) => {
 	);
 };
 
-const writeSignature = (url, signature) =>
-	targetTable().patch(url, { probeSignature: signature, probedAt: new Date() });
+// ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
+// a missing row (never probed, ownership moved, node rebuilt, target deleted) reads as null and
+// the state machine SEEDS, which is the safe direction everywhere this can happen.
+const readSignature = async (url) =>
+	(await probeStateTable().get({ id: url, select: ['url', 'signature'] }))?.signature ?? null;
+const writeSignature = (url, signature) => probeStateTable().put(url, { url, signature, probedAt: new Date() });
 
 /**
  * Probe a stream of target rows and act on what changed. ALL I/O is injected, so the decision
@@ -251,6 +257,7 @@ export const runProbePass = async ({
 	ownerOf,
 	hostname,
 	probe,
+	read,
 	write,
 	trigger,
 	dryRun,
@@ -282,7 +289,9 @@ export const runProbePass = async ({
 			stats.failed++;
 			return;
 		}
-		const stored = row.probeSignature ?? null;
+		// Read AFTER the probe: a failed probe never needs the stored state, and the read is a
+		// node-local point get either way.
+		const stored = (await read(row.url)) ?? null;
 		if (stored === observed) {
 			stats.unchanged++;
 			return;
@@ -463,6 +472,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 			ownerOf: getResidencyByUrl,
 			hostname: server.hostname,
 			probe: probeOnce,
+			read: readSignature,
 			write: writeSignature,
 			trigger: triggerRevalidate,
 			...limits,
@@ -650,6 +660,7 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				// URL, so re-hashing every member per pass buys nothing.
 				ownershipChecked: true,
 				probe: probeOnce,
+				read: readSignature,
 				write: writeSignature,
 				trigger: triggerRevalidate,
 				...limits,

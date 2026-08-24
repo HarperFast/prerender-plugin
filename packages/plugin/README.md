@@ -1193,9 +1193,11 @@ A **rule** (`changeProbe.rules`) says what to watch for the URLs its `pathPatter
   page's origin** — a rule naming a third-party host gets a plain fetch, never the bypass secret.
   Redirects are not followed; a redirecting endpoint counts as a failed probe.
 
-The extracted values are reduced to a **signature** stored on the target (`probeSignature`); a
-probe that observes a different signature expires the URL's cached pages and files every device row
-due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
+The extracted values are reduced to a **signature** stored in the node-local `ProbeState` table
+(`replicate: false` — the sweep is owner-scoped, so a URL's baseline is only ever read and written
+by its owner node, and replicating it would ship every baseline to nodes that never consult it; a
+lost baseline just re-seeds). A probe that observes a different signature expires the URL's cached
+pages and files every device row due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
 content actually changes:
 
 - The **sweep** (`sweepInterval`) walks each node's owned slice of the registry, paced

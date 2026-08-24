@@ -115,6 +115,8 @@ before(async () => {
 	};
 	globalThis.createBlob = (buf) => buf;
 	globalThis.databases = {
+		// Target.delete removes the probe baseline alongside the cached pages.
+		probe_state: { ProbeState: { delete: async () => {} } },
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
