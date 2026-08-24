@@ -138,10 +138,11 @@ const CONFIG = {
 		{
 			path: 'ingress.routes',
 			effective: [
-				{ match: 'prefix', path: '/product/', renderInterval: HOUR },
+				{ match: 'prefix', path: '/product/', renderInterval: HOUR, demandFloor: 30 * 60_000 },
 				{ match: 'exact', path: '/' },
 				{ match: 'prefix', path: '/search/', renderInterval: 60_000 },
 				{ match: 'prefix', path: '/legal/', mode: 'passthrough' },
+				{ match: 'prefix', path: '/catalog/', renderInterval: 2 * HOUR, discoverTargets: false },
 			],
 		},
 		{ path: 'ingress.excludePathPatterns', effective: ['/search/'] },
@@ -197,13 +198,44 @@ const ready = async () => {
 
 test('an excluded path is passthrough even when ingress.routes also declares it', () => {
 	const index = cadenceIndex(CONFIG, 6 * HOUR);
-	assert.deepEqual(index.get('/search/'), { mode: 'passthrough', interval: 6 * HOUR, inherited: true });
+	assert.deepEqual(index.get('/search/'), {
+		mode: 'passthrough',
+		interval: 6 * HOUR,
+		inherited: true,
+	});
 });
 
 test('a route with its own renderInterval is measured against it, one without inherits the default', () => {
 	const index = cadenceIndex(CONFIG, 6 * HOUR);
-	assert.deepEqual(index.get('/product/'), { mode: 'prerender', interval: HOUR, inherited: false });
-	assert.deepEqual(index.get('/'), { mode: 'prerender', interval: 6 * HOUR, inherited: true });
+	assert.deepEqual(index.get('/product/'), {
+		mode: 'prerender',
+		interval: HOUR,
+		inherited: false,
+		discoverTargets: true,
+		demandFloor: 30 * 60_000,
+	});
+	assert.deepEqual(index.get('/'), {
+		mode: 'prerender',
+		interval: 6 * HOUR,
+		inherited: true,
+		discoverTargets: true,
+		demandFloor: null,
+	});
+});
+
+test('the discovery gate and the demand floor ride on the same join as the cadence', () => {
+	const index = cadenceIndex(CONFIG, 6 * HOUR);
+	// `discoverTargets` defaults to TRUE upstream, so an ABSENT flag is an open route and only an
+	// explicit false is a gate. Reporting "unknown" for the common case would put a dash in the
+	// column on every route of every deployment that has never used the feature.
+	assert.equal(index.get('/catalog/').discoverTargets, false);
+	assert.equal(index.get('/product/').discoverTargets, true);
+	// A CLASS label matched no route at all, so it carries no route flag — null, never the default.
+	assert.equal(cadenceFor(index, 'unclassified', HOUR).discoverTargets, null);
+	assert.equal(cadenceFor(index, 'unclassified', HOUR).demandFloor, null);
+	// A floor is only reported when it is a usable interval; anything else is "no floor set".
+	assert.equal(index.get('/product/').demandFloor, 30 * 60_000);
+	assert.equal(index.get('/catalog/').demandFloor, null);
 });
 
 test('a route label that is a CLASS, not a configured path, resolves to that class', () => {
@@ -582,4 +614,80 @@ test('an unavailable or failed analytics read still renders the knob that turns 
 	const ctx = makeCtx({ analytics: { available: false, error: 'management.analytics.enabled is false' } });
 	await load(ctx);
 	assert.match(textOf(ctx), /management\.analytics\.enabled is false/);
+});
+
+// ---- the discovery gate ------------------------------------------------------
+//
+// A gated request is still SERVED — it just never enters the render rotation — so nothing about
+// this panel is a failure count. What it has to keep straight is that the number is gated MISSES
+// (repeat misses on an already-refused URL included), not URLs prevented, and that a deployment
+// which has never configured a gate gets the capability described rather than an empty chart.
+
+const gated = (reason, bot, count) => combo('prerender_ops', 'discovery_gated', reason, bot, count);
+
+test('the gate panel splits the two gates and ranks the bots behind them', async () => {
+	const ctx = makeCtx({
+		analytics: {
+			...ANALYTICS,
+			series: [...ANALYTICS.series, gated('route', 'Googlebot', 900), gated('bot', 'SomeCrawler', 300)],
+		},
+	});
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /Gated misses/);
+	assert.match(text, /1\.2k/);
+	assert.match(text, /SomeCrawler/);
+	// The two gates answer different questions — a route whose URL space is combinatorial, versus a
+	// crawler that should not be minting at all — and they are fixed in different places.
+	assert.match(text, /discoverTargets: false/);
+	assert.match(text, /ingress.discoveryBots/);
+});
+
+test('a gated miss is counted as traffic held out, never as a URL prevented', async () => {
+	const ctx = makeCtx({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, gated('route', 'Googlebot', 900)] },
+	});
+	await load(ctx);
+	assert.match(textOf(ctx), /not a count of URLs prevented/);
+});
+
+test('the bot filter narrows the gate panel, because discovery_gated carries the bot', async () => {
+	const ctx = makeCtx({
+		analytics: {
+			...ANALYTICS,
+			series: [...ANALYTICS.series, gated('route', 'Googlebot', 900), gated('route', 'SomeCrawler', 300)],
+		},
+	});
+	await load(ctx);
+	ctx.data.bots = ['SomeCrawler'];
+	const text = textOf(ctx);
+	assert.match(text, /300/);
+	assert.doesNotMatch(text, /1\.2k/, 'the filtered total must not include the bot that was filtered out');
+});
+
+test('a deployment with no gate configured is told what the gate is for, not shown an empty chart', async () => {
+	const ctx = await ready();
+	// CONFIG gates /catalog/, so start from a config that gates nothing at all.
+	const open = {
+		...CONFIG,
+		layers: CONFIG.layers.map((layer) =>
+			layer.path === 'ingress.routes'
+				? { ...layer, effective: layer.effective.map(({ discoverTargets, ...rest }) => rest) }
+				: layer
+		),
+	};
+	const plain = makeCtx({ config: open });
+	await load(plain);
+	const text = textOf(plain);
+	assert.match(text, /not configured/);
+	assert.match(text, /crawlers walk novel combinations into permanent render load/);
+	assert.ok(ctx);
+});
+
+test('a configured gate that refused nothing says so, rather than reading as unconfigured', async () => {
+	// CONFIG gates /catalog/ and the window carries no discovery_gated rows.
+	const ctx = await ready();
+	const text = textOf(ctx);
+	assert.match(text, /1 route gated/);
+	assert.match(text, /refused nothing in this window/);
 });

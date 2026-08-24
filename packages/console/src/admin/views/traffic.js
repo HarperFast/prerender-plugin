@@ -38,8 +38,8 @@
  *
  * THE BOT FILTER IS CLIENT-SIDE, ALWAYS. Selecting bots re-renders from the payload already in
  * hand; it never refetches, because the load discipline below is the whole reason this view can
- * afford to be this detailed. Three metrics carry a bot (`bot_request`, `bot_serve`, `page_age`)
- * and the rest do not — `route_serve`, `origin_fetch`, `duration` and `response_*` have no bot
+ * afford to be this detailed. Four metrics carry a bot (`bot_request`, `bot_serve`, `page_age`,
+ * and `prerender_ops`'s `discovery_gated`) and the rest do not — `route_serve`, `origin_fetch`, `duration` and `response_*` have no bot
  * dimension at all — so a panel that CANNOT honour the filter says "all bots" on its face rather
  * than quietly showing every crawler's numbers under one crawler's name.
  *
@@ -76,6 +76,7 @@ import {
 	rangePicker,
 	ratioOf,
 	scanFooter,
+	scopeLabel,
 	segmented,
 	SERIES,
 	stackBy,
@@ -160,6 +161,7 @@ export function render(ctx) {
 		el('div', { cls: 'cols' }, [originFetch(data, filter), latency(data, filter)]),
 		el('div', { cls: 'cols' }, [crawlers(data, scope), statusCodes(data, filter)]),
 		routes(ctx, data, cadences, filter),
+		discoveryGate(ctx, data, filter),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -248,7 +250,10 @@ function botBar(ctx, data, filter) {
 		),
 		hidden > 0 && muted(`+${hidden} smaller`),
 		filter &&
-			muted('filters serves, freshness, staleness, page age and the crawler mix — panels marked "all bots" cannot'),
+			muted(
+				'filters serves, freshness, staleness, page age, the crawler mix and the discovery gate — panels ' +
+					'marked "all bots" cannot'
+			),
 	]);
 }
 
@@ -286,16 +291,23 @@ export function cadenceIndex(configPayload, defaultInterval) {
 	const index = new Map();
 	const options = optionIndex(configPayload);
 
-	const add = (path, mode, renderInterval) => {
+	const add = (path, mode, renderInterval, extra = {}) => {
 		if (typeof path !== 'string' || path === '' || index.has(path)) return;
 		const own = mode === 'prerender' && Number.isFinite(renderInterval) && renderInterval > 0;
-		index.set(path, { mode, interval: own ? renderInterval : defaultInterval, inherited: !own });
+		index.set(path, { mode, interval: own ? renderInterval : defaultInterval, inherited: !own, ...extra });
 	};
 
 	for (const pattern of options.get('ingress.excludePathPatterns')?.effective ?? []) add(pattern, 'passthrough');
 	for (const entry of options.get('ingress.routes')?.effective ?? []) {
 		if (!entry || typeof entry !== 'object') continue;
-		add(entry.path, entry.mode === 'passthrough' ? 'passthrough' : 'prerender', Number(entry.renderInterval));
+		add(entry.path, entry.mode === 'passthrough' ? 'passthrough' : 'prerender', Number(entry.renderInterval), {
+			// Both default to "unset", and the difference matters: `discoverTargets` defaults to TRUE
+			// upstream, so an absent flag is an OPEN route, not an unknown one. `demandFloor` has no
+			// default — absent means the demand ladder may take this route's pages to any rung.
+			discoverTargets: entry.discoverTargets !== false,
+			demandFloor:
+				Number.isFinite(Number(entry.demandFloor)) && Number(entry.demandFloor) > 0 ? Number(entry.demandFloor) : null,
+		});
 	}
 	return index;
 }
@@ -310,6 +322,10 @@ export const cadenceFor = (index, label, defaultInterval) =>
 		mode: CLASS_LABELS[label] ?? 'unknown',
 		interval: defaultInterval,
 		inherited: true,
+		// Null, not `true`: no route matched, so there is no route flag to report. Printing the
+		// upstream default here would claim a configuration this label does not have.
+		discoverTargets: null,
+		demandFloor: null,
 	};
 
 /** Whether a route's staleness is a verdict about US, or just a fact about a path we never cache. */
@@ -1162,9 +1178,16 @@ function routes(ctx, data, cadences, filter) {
 				el('td', { cls: 'right' }, [
 					integrity ? el('span', { cls: 'pill bad', text: pct(integrity, routeTotal) }) : muted('—'),
 				]),
+			el('td', null, [
+				cadence.discoverTargets === null ? muted('—') : cadence.discoverTargets ? muted('open') : pill('gated', 'info'),
+			]),
 			el('td', { cls: 'right mono' }, [
 				prerender ? fmtMs(cadence.interval) : '—',
 				prerender && cadence.inherited ? muted(' default') : null,
+				// The floor bounds how far the demand ladder may accelerate this route's pages, so it
+				// belongs beside the cadence it modifies rather than in a column of its own that would
+				// be empty on every deployment that has not set one.
+				prerender && cadence.demandFloor ? muted(` · floor ${fmtMs(cadence.demandFloor)}`) : null,
 			]),
 			el('td', {
 				cls: 'right mono',
@@ -1199,6 +1222,7 @@ function routes(ctx, data, cadences, filter) {
 					{ text: 'miss', right: true },
 					{ text: 'swr+stale', right: true },
 					anyIntegrity && { text: 'blob', right: true },
+					'discovery',
 					{ text: 'cadence', right: true },
 					{ text: 'age median ≈', right: true },
 					{ text: '÷ cadence', right: true },
@@ -1213,7 +1237,9 @@ function routes(ctx, data, cadences, filter) {
 				'against. A high miss share means its corpus ',
 				'isn’t covered — flagged only on routes we actually cache, since a passthrough is proxied live by ',
 				'design. Cadence is read from ingress.routes; “default” means the route sets none and inherits ',
-				'render.defaultInterval.',
+				'render.defaultInterval, and “floor” is the fastest rung the demand ladder may grant it. ',
+				'“Gated” means the route no longer mints a target for an unknown URL a bot asks for — those ',
+				'requests are still served from the origin, they just never enter the render rotation.',
 			]),
 			unclassified > 0 &&
 				el('div', { cls: 'note warn' }, [
@@ -1222,6 +1248,103 @@ function routes(ctx, data, cadences, filter) {
 					link('Config', () => ctx.go('config')),
 					' buckets them by first path segment.',
 				]),
+		],
+	});
+}
+
+/**
+ * What the discovery gate is holding out of the render rotation.
+ *
+ * READ IT AS TRAFFIC, NOT AS DENIED MINTS. The plugin counts every cacheable MISS whose target
+ * creation the gate refused, which includes repeat misses on URLs it has already refused — so this
+ * is "requests on URLs held out of the rotation", not "URLs prevented". That is the more useful
+ * number anyway: it is the crawl pressure the gate is absorbing, and its shape over the window is
+ * what says whether a crawler has moved on or is still walking the same combinatorial space.
+ *
+ * NOTHING HERE IS A FAILURE. A gated request is still SERVED — proxied live from the origin, with
+ * the miss counted on the route table above — it simply never enters the render rotation. The
+ * panel exists because the alternative to gating is a corpus that grows faster than the fleet can
+ * keep it fresh, and that shows up nowhere until the whole queue is late.
+ */
+// The two gate reasons, as named constants rather than quoted literals at the lookup. The
+// cross-package route scanner in adminAssets.test.js reads any Map lookup written with a quoted
+// name as a call to an admin route of that name — including one inside a comment, which is why
+// this one describes the shape instead of showing it. The scanner is deliberately blunt: a
+// mistyped route name has to fail in the suite rather than in a browser, and the cost of that is
+// spelling lookup keys out as constants here.
+const GATE_ROUTE_FLAG = 'route';
+const GATE_BOT_ALLOWLIST = 'bot';
+
+function discoveryGate(ctx, data, filter) {
+	const gated = pick(data, 'prerender_ops', (s) => s.path === 'discovery_gated' && keepBot(filter, s.type));
+	const options = optionIndex(configState(ctx).payload);
+	const bots = options.get('ingress.discoveryBots')?.effective ?? ['*'];
+	const gatedRoutes = (options.get('ingress.routes')?.effective ?? []).filter(
+		(entry) => entry && typeof entry === 'object' && entry.discoverTargets === false
+	);
+	const botGateOn = Array.isArray(bots) && !(bots.length === 1 && bots[0] === '*');
+	const total = sumCount(gated);
+
+	// Nothing gated AND nothing configured to gate: describe the capability rather than drawing an
+	// empty chart, which would read as a subsystem that is on and quiet.
+	if (!total && !botGateOn && !gatedRoutes.length) {
+		return card('Discovery gate', {
+			head: [spacer(), pill('not configured', '')],
+			body: [
+				el('p', { cls: 'muted chart-note' }, [
+					'Every route mints a target for any unknown URL a bot asks for, and every bot is trusted to do ',
+					'it. On a route whose URL space is combinatorial — facets, filter and sort permutations — that ',
+					'is unbounded: crawlers walk novel combinations into permanent render load. ',
+					el('code', { text: 'discoverTargets' }),
+					' on a route, and ',
+					el('code', { text: 'ingress.discoveryBots' }),
+					', are the two gates; both are under Request ingestion on ',
+					link('Config →', () => ctx.go('config')),
+					'.',
+				]),
+			],
+		});
+	}
+
+	const byGate = new Map();
+	const byBot = new Map();
+	for (const s of gated) {
+		byGate.set(s.method ?? 'unknown', (byGate.get(s.method ?? 'unknown') ?? 0) + s.count);
+		byBot.set(s.type ?? 'other', (byBot.get(s.type ?? 'other') ?? 0) + s.count);
+	}
+	const ranked = [...byBot.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+
+	return card(`Discovery gate — ${scopeLabel(data)}`, {
+		head: [
+			gatedRoutes.length
+				? pill(`${gatedRoutes.length} route${gatedRoutes.length === 1 ? '' : 's'} gated`, 'info')
+				: null,
+			botGateOn ? pill(bots.length ? `minting: ${bots.join(', ')}` : 'sitemap-only corpus', 'info') : null,
+			spacer(),
+			link('purge what is already in →', () => ctx.go('overview')),
+		],
+		body: [
+			el('div', { cls: 'stats' }, [
+				stat('Gated misses', fmtCount(total), 'served from the origin, never scheduled'),
+				stat('By route flag', fmtCount(byGate.get(GATE_ROUTE_FLAG) ?? 0), 'discoverTargets: false'),
+				stat('By bot allowlist', fmtCount(byGate.get(GATE_BOT_ALLOWLIST) ?? 0), 'ingress.discoveryBots'),
+			]),
+			ranked.length
+				? barList(
+						ranked.map(([bot, count]) => ({ label: bot, value: count })),
+						{ format: fmtCount }
+					)
+				: el('p', { cls: 'muted chart-note' }, [
+						'The gate is configured and refused nothing in this window — no bot asked for an unknown URL ',
+						'on a gated route. That is the steady state once crawlers have stopped exploring; it is also ',
+						'what a range too narrow to contain a crawl looks like.',
+					]),
+			el('p', { cls: 'muted chart-note' }, [
+				'Counted per gated MISS, so a URL refused a hundred times counts a hundred — this is the crawl ',
+				'pressure the gate is absorbing, not a count of URLs prevented. Gating stops NEW targets only: ',
+				'everything minted before the flag went on keeps rendering until it is purged, and the ',
+				'sitemap pipeline is untouched, so declared URLs on a gated route still schedule normally.',
+			]),
 		],
 	});
 }

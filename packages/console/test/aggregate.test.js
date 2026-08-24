@@ -786,3 +786,193 @@ test('mergeOverview surfaces a node whose row every PEER holds an older copy of'
 	assert.equal(yc0.spreadMs, 0, 'a healthy row: every copy agrees');
 	assert.equal(yc0.behind.length, 0);
 });
+
+// ------------------------------------------------------------------ change probe
+
+const probeStats = (over = {}) => ({
+	examined: 10_000,
+	owned: 2500,
+	matched: 1000,
+	probed: 1000,
+	seeded: 200,
+	unchanged: 700,
+	changed: 100,
+	triggered: 90,
+	deferred: 10,
+	failed: 100,
+	errors: 0,
+	failureSamples: [],
+	...over,
+});
+
+const probeBody = (node, over = {}) => ({
+	enabled: true,
+	dryRun: true,
+	node: `${node}.example.com:9926`,
+	ownerScopeNote: 'Probes only the URLs this node owns; every node sweeps its own slice.',
+	rules: [{ label: 'price', pathPattern: '^/product/', source: 'request', invalidateScope: 'route:prefix:/product/' }],
+	sweep: {
+		running: false,
+		armedInterval: 86_400_000,
+		lastRun: { ...probeStats(), dryRun: true, node, startedAt: 1000, finishedAt: 2000, error: null },
+	},
+	canary: { running: false, armedInterval: 1_800_000, cohortSizes: { price: 500 }, lastRun: null },
+	...over,
+});
+
+test('change probe: pass counters SUM, because each node probes a disjoint slice of the keyspace', () => {
+	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b'))]);
+	assert.equal(body.sweep.lastRun.probed, 2000);
+	assert.equal(body.sweep.lastRun.changed, 200);
+	assert.equal(body.sweep.lastRun.nodes, 2);
+	assert.equal(body.scope, 'cluster');
+});
+
+test('change probe: the summary is stamped with the OLDEST pass, never the freshest', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a')),
+		ok(
+			'b',
+			probeBody('b', {
+				sweep: {
+					running: false,
+					armedInterval: 86_400_000,
+					lastRun: { ...probeStats(), dryRun: true, startedAt: 500_000, finishedAt: 900_000, error: null },
+				},
+			})
+		),
+	]);
+	// b's pass is much newer. Stamping the sum with it would present a figure that is stale on
+	// every other node as current.
+	assert.equal(body.sweep.lastRun.finishedAt, 2000);
+});
+
+test('change probe: a node that has not swept is NAMED, not folded into the totals as a zero', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a')),
+		ok('b', probeBody('b', { sweep: { running: false, armedInterval: 86_400_000, lastRun: null } })),
+	]);
+	assert.deepEqual(body.sweep.unsweptNodes, ['b.example.com:9926']);
+	assert.equal(body.sweep.lastRun.nodes, 1);
+	assert.equal(body.sweep.lastRun.probed, 1000);
+});
+
+test('change probe: ONE node running live makes the cluster "not a dry run"', () => {
+	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b', { dryRun: false }))]);
+	assert.equal(body.dryRun, false);
+	assert.deepEqual(body.liveOn, ['b.example.com:9926']);
+});
+
+test('change probe: ONE node with the probe off is the finding, not "the cluster has it on"', () => {
+	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b', { enabled: false }))]);
+	assert.equal(body.enabled, true);
+	assert.deepEqual(body.disabledOn, ['b.example.com:9926']);
+});
+
+test('change probe: a canary TRIP names the nodes that tripped — a verdict is per cohort', () => {
+	const canaryRun = (tripped, changed) => ({
+		running: false,
+		armedInterval: 1_800_000,
+		cohortSizes: { price: 500 },
+		lastRun: {
+			perRule: [
+				{
+					rule: 'price',
+					cohort: 500,
+					...probeStats({ changed, unchanged: 500 - changed, probed: 500, seeded: 0, failed: 0 }),
+					compared: 500,
+					fraction: changed / 500,
+					tripped,
+					action: tripped ? { acted: true, scope: 'route:prefix:/product/' } : null,
+				},
+			],
+			dryRun: false,
+			startedAt: 1000,
+			finishedAt: 2000,
+			error: null,
+		},
+	});
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { canary: canaryRun(true, 250) })),
+		ok('b', probeBody('b', { canary: canaryRun(false, 10) })),
+	]);
+	const [rule] = body.canary.lastRun.perRule;
+	assert.deepEqual(rule.trippedOn, ['a.example.com:9926']);
+	// Pooled over the union of the two cohorts: 260 of 1000, not the average of 50% and 2%.
+	assert.equal(rule.compared, 1000);
+	assert.equal(rule.fraction, 0.26);
+	assert.deepEqual(
+		rule.actions.map((action) => action.hostname),
+		['a.example.com:9926']
+	);
+});
+
+test('change probe: rules disagreeing is flagged — the rest of the page is one node’s list', () => {
+	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b', { rules: [] }))]);
+	assert.equal(body.rulesDiverge, true);
+	assert.equal(body.rules.length, 1);
+});
+
+test('change probe: nothing answering is a 502, never an idle-looking probe', () => {
+	const { status, body } = mergerFor('change-probe')([down('a'), down('b')]);
+	assert.equal(status, 502);
+	assert.equal(body.sources.answered, 0);
+});
+
+// ------------------------------------------------------------------ discovery purge
+
+const purgeBody = (node, over = {}) => ({
+	node: `${node}.example.com:9926`,
+	running: false,
+	urlPrefix: 'https://www.example.com/catalog/',
+	dryRun: true,
+	ratePerSecond: 200,
+	startedAt: 1000,
+	finishedAt: 5000,
+	error: null,
+	examined: 100_000,
+	owned: 25_000,
+	discovered: 9000,
+	leaseSkipped: 12,
+	deleted: 9000,
+	canceled: false,
+	...over,
+});
+
+test('discovery purge: the per-node rows are the answer, and the totals are only a tally', () => {
+	const { body } = mergerFor('discovery-purge')([ok('a', purgeBody('a')), ok('b', purgeBody('b'))]);
+	assert.equal(body.totals.discovered, 18_000);
+	assert.equal(body.byNode.length, 2);
+	assert.equal(body.ranNodes, 2);
+	assert.equal(body.urlPrefix, 'https://www.example.com/catalog/');
+});
+
+test('discovery purge: a node that has never run is named — its targets are still rendering', () => {
+	const { body } = mergerFor('discovery-purge')([ok('a', purgeBody('a')), ok('b', { node: 'b', running: false })]);
+	assert.deepEqual(body.unrunNodes, ['b.example.com:9926']);
+	assert.equal(body.totals.deleted, 9000);
+});
+
+test('discovery purge: ONE node that actually deleted makes "nothing was deleted" false', () => {
+	const { body } = mergerFor('discovery-purge')([ok('a', purgeBody('a')), ok('b', purgeBody('b', { dryRun: false }))]);
+	assert.equal(body.dryRun, false);
+});
+
+test('discovery purge: two prefixes are not silently added together', () => {
+	const { body } = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a')),
+		ok('b', purgeBody('b', { urlPrefix: 'https://www.example.com/deals/' })),
+	]);
+	assert.equal(body.urlPrefix, null);
+	assert.equal(body.urlPrefixes.length, 2);
+});
+
+test('discovery purge: a pass still running has no finish time, on any node', () => {
+	const { body } = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a')),
+		ok('b', purgeBody('b', { running: true, finishedAt: null })),
+	]);
+	assert.equal(body.running, true);
+	assert.deepEqual(body.runningOn, ['b.example.com:9926']);
+	assert.equal(body.finishedAt, null);
+});

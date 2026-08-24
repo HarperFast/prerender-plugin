@@ -54,9 +54,15 @@ part of the contract:
 
 | Class      | Routes                                                                           | What happens                                                     |
 | ---------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| **merged** | `overview`, `analytics`, `unrouted`, `config`                                    | fanned out and summed (or, for config, compared)                 |
+| **merged** | `overview`, `analytics`, `unrouted`, `config`, `change-probe`, `discovery-purge` | fanned out and summed (or, for config, compared)                 |
 | **shared** | `pages`, `page-content`, `sitemaps`, `invalidations`, `crawl-breadth`, `metrics` | replicated data — **one** node answers, and the payload names it |
 | **single** | every POST                                                                       | writes are never fanned out                                      |
+
+The last two merged routes are owner-scoped passes rather than sums: a probe pass and a purge pass
+each cover the keys one node owns, so what the merge produces is every node's own slice side by
+side plus the running tally, and the nodes that have not run are named. One node's "deleted
+240,118" answered under a cluster label would read as done when three quarters of the keyspace has
+not been touched.
 
 A test pins every proxied GET to a class, so adding a route without deciding how it aggregates
 fails CI rather than silently answering from one node under an "all nodes" label.
@@ -74,7 +80,10 @@ Three properties worth knowing:
   the cluster by N.
 - **Actions are never fanned out.** A write under cluster scope lands on one node, which is
   correct for the replicated tables they touch. The routes that act on a single node's own state
-  — `reconcile`, `backlog`, `schedule` — refuse and ask for a node instead. A write whose result
+  — `reconcile`, `backlog`, `schedule`, `sweep-orphans`, `change-probe`, `discovery-purge` — refuse
+  and ask for a node instead. A probe pass refuses for a second reason on top of residency: its
+  rate cap is a promise made to whoever runs the origin, **per node**, and fanning the pass out
+  would spend it N times over. A write whose result
   is read back moments later by a panel that alarms on nodes disagreeing (today: `config-override`)
   additionally carries an envelope naming the node that accepted it and saying the rows replicate,
   so the console's own write path does not read as the failure that panel exists to raise.
@@ -146,14 +155,30 @@ browser ── same-origin (cookies, CSP 'self') ──▶ prerender-console com
 The view-by-view tour lives in the plugin README's
 [Management API](../plugin/README.md#management-api-prerender_admin) section alongside the
 API contract; the short version: **Overview** (scale, serve health, backlog shape, claim
-floor, schedule repair), **Traffic** (offload/hit-rate charts from one bounded analytics scan per
-node, freshness reported relative to each route's own render cadence, the non-hit verdicts broken
-out by what would fix them — coverage stated net of URLs the origin does not have — and a
-client-side bot filter), **Sitemaps**, **Page cache**, **Queue**
-(render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first record/clear),
-**URL explainer**, **Metrics** (the live catalog), **Config**.
+floor, schedule repair, and the discovered-target purge), **Traffic** (offload/hit-rate charts from
+one bounded analytics scan per node, freshness reported relative to each route's own render cadence,
+the non-hit verdicts broken out by what would fix them — coverage stated net of URLs the origin does
+not have — the discovery gate, and a client-side bot filter), **Sitemaps**, **Page cache**,
+**Queue** (render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first
+record/clear), **Change probe**, **URL explainer**, **Metrics** (the live catalog), **Config**.
 
-Two of those changed shape when configuration became editable:
+**Change probe is new** (plugin v0.53.0+), and it is the one freshness surface that does not measure
+pages against a cadence. It reads what the probe is actually detecting — the change rate against the
+probes that HAD a baseline, not against every probe, because a pass that is mostly seeding has
+compared nothing — beside the failure share, because those two numbers are only meaningful
+together: a probe whose endpoint has changed shape reports zero changes, triggers nothing, and is
+indistinguishable from a catalogue that is not moving. The canary's verdict is reported per node,
+since a trip is a threshold crossed against one node's own cohort, and a trip that recorded no
+invalidation says which of the three reasons it was.
+
+**The discovery gate** is split across the two views that own its halves: how much crawl traffic
+the gate is holding out of the render rotation is on Traffic (it carries a bot, so the bot filter
+applies), while the purge that removes what got in before the gate went on sits on Overview beside
+the key-rule orphan sweep — the console's other corpus-deleting action. The card states the
+gate-first interlock rather than leaving it to the plugin's 400: with the route still discovering,
+crawlers re-mint exactly what a purge removes.
+
+Two more changed shape when configuration became editable:
 
 - **Nodes is new**, and it exists because "is this node healthy" had four homes: liveness and the
   replication gap on Overview, observed status and pause intent on Queue, config divergence on
@@ -162,7 +187,7 @@ Two of those changed shape when configuration became editable:
   override layer adds — did my edit reach this node, and is this node's override subscription
   still live. A node whose subscription has died silently stops honouring every edit made from
   this console, so that is the headline of the panel rather than a footnote.
-- **Config** stopped being a JSON dump and became the searchable index of all 133 options: every
+- **Config** stopped being a JSON dump and became the searchable index of all 156 options: every
   option's default, deployed and override values, which layer won, and a filter for the questions
   operators actually arrive with (what is overridden, what differs from the repo, what is pending
   a restart). Divergence stays first, and stays the alarm it always was — a divergence at a path
@@ -170,8 +195,8 @@ Two of those changed shape when configuration became editable:
 
 Each domain view owns the options that govern the data it shows — `sitemap.*` under Sitemaps,
 `queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Page cache, `analytics`/`crawlStats`
-under Traffic, `invalidation` under Invalidations — while Config remains exhaustive, so a setting
-can be found either by where it acts or by name.
+under Traffic, `invalidation` under Invalidations, `changeProbe` under Change probe — while Config
+remains exhaustive, so a setting can be found either by where it acts or by name.
 
 ## Development
 

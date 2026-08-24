@@ -25,6 +25,11 @@ export const PROXIED_GET = Object.freeze([
 	'analytics',
 	'crawl-breadth',
 	'metrics',
+	// Both are node-local reads with a merger of their own (aggregate.js): a probe pass and a
+	// purge pass act on the keys ONE node owns, so "the cluster" here is every node's own slice
+	// side by side, never one node's answer wearing a cluster label.
+	'change-probe',
+	'discovery-purge',
 ]);
 
 export const PROXIED_POST = Object.freeze([
@@ -39,6 +44,8 @@ export const PROXIED_POST = Object.freeze([
 	'sitemap',
 	'sitemap-refresh',
 	'config-override',
+	'change-probe',
+	'discovery-purge',
 ]);
 
 /**
