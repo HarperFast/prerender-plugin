@@ -51,6 +51,7 @@
 
 import { config, onConfigApplied } from '../config.js';
 import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged, newestFill } from './visitFilter.js';
+import { demandFloorFor } from './routeClass.js';
 import { metrics } from '../metrics.js';
 
 // Normalized rungs, recomputed only when config changes — decideInterval runs on the
@@ -71,7 +72,11 @@ export const rungs = () => cachedRungs;
 
 /**
  * The ladder a given base interval actually offers: every configured rung STRICTLY faster
- * than base, with base itself as the top (slowest) rung.
+ * than base, with base itself as the top (slowest) rung. A route's `demandFloor` (second
+ * argument) removes the rungs faster than it — the floor is the fastest cadence that route's
+ * pages may be granted, so a deployment can keep fast global rungs for one route's corpus
+ * without a breadth-sweeping crawler dragging another route onto them. A floor at or above
+ * the base leaves a single-rung ladder: the route rests at its granted cadence.
  *
  * Base is the resting state, and an off-ladder base is deliberately never snapped to a
  * configured rung — in either direction. Snapping UP schedules slower than the route granted
@@ -85,12 +90,16 @@ export const rungs = () => cachedRungs;
  * Memoized per base: bases come from routes/changefreq/default — a handful of distinct
  * values — and this runs per reschedule. Bounded anyway so a caller bug cannot grow it.
  */
-export const effectiveLadder = (base) => {
-	let list = effectiveLadders.get(base);
+export const effectiveLadder = (base, floor = null) => {
+	// Composite key: bases and floors both come from a handful of route/config values, so the
+	// memo stays single-digit; a route's floor CHANGE arrives as a different key, never as
+	// stale content under an old one.
+	const key = `${base}|${floor ?? ''}`;
+	let list = effectiveLadders.get(key);
 	if (!list) {
 		if (effectiveLadders.size >= 64) effectiveLadders.clear();
-		list = [...cachedRungs.filter((r) => r < base), base];
-		effectiveLadders.set(base, list);
+		list = [...cachedRungs.filter((r) => r < base && (floor === null || r >= floor)), base];
+		effectiveLadders.set(key, list);
 	}
 	return list;
 };
@@ -171,7 +180,10 @@ export function decideInterval(url, base, current, nowMs = Date.now(), probe = v
 	// granted cadence — nothing to reallocate, so skip the probe (and the cold hold: there
 	// is no move to hold back). Counted apart from `held`: the ladder did not hold this
 	// target at its rung, it was never offered another one.
-	const list = effectiveLadder(Number(base));
+	// The matched route's demandFloor bounds how fast this URL may be granted. Derived here
+	// rather than threaded from the caller so every decision site gets it for free; classify
+	// is a memoized-compile linear scan over a handful of routes, on a ~20x/s path.
+	const list = effectiveLadder(Number(base), demandFloorFor(url));
 	if (list.length === 1) {
 		stats.singleRung++;
 		return { interval: base, level: base, action: 'single-rung' };

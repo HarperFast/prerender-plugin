@@ -122,7 +122,26 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
-	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, discoverTargets, source };
+	// Optional per-route demand-ladder floor (ms) — the FASTEST cadence the ladder may grant
+	// this route's pages (see util/demandLadder.js). Same drop-the-FIELD rule as the two above.
+	let demandFloor = null;
+	if (raw.demandFloor !== undefined && raw.demandFloor !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring demandFloor on passthrough route "${raw.match} ${raw.path}" — a passthrough route is ` +
+					`never scheduled, so it has no cadence to floor`
+			);
+		} else if (Number.isFinite(raw.demandFloor) && raw.demandFloor > 0) {
+			demandFloor = raw.demandFloor;
+		} else {
+			warn(
+				`ignoring demandFloor on route "${raw.match} ${raw.path}" — expected a positive number of ` +
+					`milliseconds, got ${String(raw.demandFloor)}`
+			);
+		}
+	}
+
+	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, discoverTargets, demandFloor, source };
 };
 
 /**
@@ -402,8 +421,9 @@ export const queryAllowlistFor = (rawUrl) => classifyUrl(rawUrl).queryParams;
  * Same contract as `classifyUrl`: `url` is a device-free public URL (the Target primary key
  * / the url-half of a cacheKey).
  */
-export const resolveRenderInterval = (url, storedInterval) => {
-	const { entry } = classifyUrl(url);
+export const resolveRenderInterval = (url, storedInterval) => baseInterval(classifyUrl(url).entry, storedInterval);
+
+const baseInterval = (entry, storedInterval) => {
 	if (entry && entry.renderInterval !== null && entry.renderInterval !== undefined) return entry.renderInterval;
 	// Coerce before the finite check: `Long` columns can surface the stored interval as a
 	// BigInt, which `Number.isFinite` rejects outright — without this, every such target
@@ -412,6 +432,18 @@ export const resolveRenderInterval = (url, storedInterval) => {
 	const stored = Number(storedInterval);
 	return Number.isFinite(stored) && stored > 0 ? stored : config.render.defaultInterval;
 };
+
+const entryFloor = (entry) => {
+	const floor = entry ? Number(entry.demandFloor) : NaN;
+	return Number.isFinite(floor) && floor > 0 ? floor : null;
+};
+
+/**
+ * The demand-ladder floor the matched route sets for a URL, or null (no floor). The ladder
+ * consults this per decision (`util/demandLadder.js#decideInterval`), so a route's floor is
+ * live config like its `renderInterval` — no data migration on change.
+ */
+export const demandFloorFor = (url) => entryFloor(classifyUrl(url).entry);
 
 /**
  * The cadence a target's `nextRenderTime` is ACTUALLY computed from — `resolveRenderInterval`
@@ -430,12 +462,20 @@ export const resolveRenderInterval = (url, storedInterval) => {
  * its next render. `decideInterval` clamps the same way (`Math.min(rungIndexOf(...), ceiling)`), so
  * a stale rung reads as "at the ceiling" here exactly as it does there rather than understating the
  * cadence.
+ *
+ * CLAMPED TO THE ROUTE'S `demandFloor` for the same staleness reason in the other direction:
+ * raise a route's floor and every target below it still carries its old, faster rung until the
+ * ladder re-decides. The ladder will snap it into the floored list on its next decision; until
+ * then this must not credit a cadence the ladder no longer grants.
  */
 export const resolveEffectiveInterval = (url, { renderInterval, demandInterval } = {}) => {
-	const base = resolveRenderInterval(url, renderInterval);
+	const { entry } = classifyUrl(url);
+	const base = baseInterval(entry, renderInterval);
 	// Same BigInt-from-`Long` coercion as above, and the same reason `> 0` rather than a typeof
 	// check: `Number(null)` is 0 and `Number(undefined)` is NaN, so an unevaluated target — which
 	// is most of the corpus until the ladder reaches it — falls through to the ceiling.
 	const rung = Number(demandInterval);
-	return Number.isFinite(rung) && rung > 0 ? Math.min(rung, base) : base;
+	if (!(Number.isFinite(rung) && rung > 0)) return base;
+	const floor = entryFloor(entry);
+	return Math.min(floor !== null ? Math.max(rung, floor) : rung, base);
 };

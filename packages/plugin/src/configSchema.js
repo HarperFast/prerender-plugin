@@ -104,7 +104,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				[],
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
-					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean }.\n\n' +
+					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -129,6 +129,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'must be kept aligned BY HAND — rendering much faster than the edge TTL burns renders the edge ' +
 					'never serves, and much slower means the edge re-fetches stale content. Neither side can see ' +
 					'the other drift.\n\n' +
+					'`demandFloor` (ms, prerender routes only) — the FASTEST cadence the demand ladder ' +
+					"(`render.demand`) may grant this route's pages: rungs faster than the floor are unreachable " +
+					'for them. This is how a deployment keeps fast global rungs for a corpus that earns them ' +
+					'(listing pages that churn intraday) without a breadth-sweeping crawler promoting a much ' +
+					'larger corpus onto the same rungs — a crawler that recrawls EVERYTHING daily makes ' +
+					'"visited" true everywhere, and without a floor the ladder would grant the whole route the ' +
+					'fast cadence at corpus scale. A floor at or above the granted cadence leaves the route ' +
+					'resting at that cadence (single-rung). Stored rungs below a newly-raised floor read as the ' +
+					'floor immediately and re-stamp on their next ladder decision. Live, like renderInterval.\n\n' +
 					'`discoverTargets` (default true, prerender routes only) — whether a bot visiting an UNKNOWN ' +
 					'URL on this route creates a target for it. Set false on routes whose URL space is ' +
 					'combinatorial (faceted navigation, filter/sort permutations): crawlers walking those links ' +
@@ -980,7 +989,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'6h, or a weekly sitemap route pulled to 48h at 3.5x its granted render budget). ' +
 						'Bottoming out at 6h rather than 1h is deliberate: 1h buys ' +
 						'~0.04% availability error against 6h\u2019s ~0.24% for six times the render cost, and the ' +
-						'fast rungs are where a runaway hot set becomes unaffordable.',
+						'fast rungs are where a runaway hot set becomes unaffordable. A route can bound how much ' +
+						'of this ladder its pages may use with `ingress.routes[].demandFloor` \u2014 rungs faster than ' +
+						'a route\u2019s floor are unreachable for that route.',
 					{ unit: 'ms' }
 				),
 				promoteWindows: option(
