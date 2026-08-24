@@ -10,7 +10,9 @@ export default [
 	// Your custom configuration here
 	{
 		rules: {
-			// Override or add custom rules
+			// Rest-destructuring to OMIT keys (`const { medians, ...rest } = row`) is the idiom the
+			// console tests use to build downgraded fixtures — the unused bindings are the point.
+			'no-unused-vars': ['error', { ignoreRestSiblings: true }],
 		},
 	},
 	{
