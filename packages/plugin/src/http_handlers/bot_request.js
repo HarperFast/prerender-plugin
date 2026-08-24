@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
-import { getBotName } from '../util/userAgent.js';
+import { getBotName, botMayDiscover } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
@@ -66,7 +66,7 @@ export async function handleBotRequest(request) {
 		const info = { route, routeClass };
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
-		maybeSchedule(resource, routeClass);
+		maybeSchedule(resource, routeClass, route, request.botName);
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
 		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
 		// only when the page would otherwise have been served). Detached inside, like maybeSchedule —
@@ -356,10 +356,22 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 // didn't already have cached). Only a `prerender` path is ever scheduled — which now also
 // covers what `excludePathPatterns` used to gate separately, since those patterns compile
 // into passthrough routes (see util/routeClass.js).
-function maybeSchedule(resource, routeClass) {
-	if (routeClass === PRERENDER && resource.miss && resource.statusCode === 200) {
-		setImmediate(handlePageScheduling, resource);
+//
+// The discovery gates sit HERE, not in handlePageScheduling: a gated miss skips the detached
+// Target.get entirely, which matters on a gated combinatorial route where misses are most of
+// the traffic. The gates stop target CREATION only — an existing target's miss was a no-op in
+// handlePageScheduling anyway — so `discovery_gated` counts gated misses, not denied mints.
+function maybeSchedule(resource, routeClass, route, botName) {
+	if (routeClass !== PRERENDER || !resource.miss || resource.statusCode !== 200) return;
+	if (route && route.discoverTargets === false) {
+		metrics.discoveryGated('route', botName);
+		return;
 	}
+	if (!botMayDiscover(botName)) {
+		metrics.discoveryGated('bot', botName);
+		return;
+	}
+	setImmediate(handlePageScheduling, resource);
 }
 
 // On-demand render: force an immediate one-off render and wait for the fresh result,

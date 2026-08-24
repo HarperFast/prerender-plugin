@@ -102,7 +102,27 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
-	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, source };
+	// Optional per-route discovery gate. Same drop-the-FIELD rule as renderInterval: rejecting
+	// the whole entry over a gate typo would silently change how the path is SERVED, which is a
+	// far worse failure than falling back to the default (discovery allowed).
+	let discoverTargets = true;
+	if (raw.discoverTargets !== undefined && raw.discoverTargets !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring discoverTargets on passthrough route "${raw.match} ${raw.path}" — a passthrough route is ` +
+					`never scheduled, so it never discovers targets`
+			);
+		} else if (typeof raw.discoverTargets === 'boolean') {
+			discoverTargets = raw.discoverTargets;
+		} else {
+			warn(
+				`ignoring discoverTargets on route "${raw.match} ${raw.path}" — expected a boolean, got ` +
+					String(raw.discoverTargets)
+			);
+		}
+	}
+
+	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, discoverTargets, source };
 };
 
 /**

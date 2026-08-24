@@ -178,3 +178,37 @@ export function deriveBotName(ua) {
 
 	return null;
 }
+
+// ---- discovery allowlist -------------------------------------------------------------------
+
+let discoverySet = null; // lowercase Set, or null meaning "every bot" ('*' present)
+let discoveryFrom; // the config array the current set was built from
+
+const compileDiscovery = (bots) => {
+	const names = (Array.isArray(bots) ? bots : []).filter((name) => typeof name === 'string' && name !== '');
+	if (names.some((name) => name === '*')) return null;
+	return new Set(names.map((name) => name.toLowerCase()));
+};
+
+/**
+ * May a visit labeled `botName` create a NEW target (traffic discovery)?
+ *
+ * `ingress.discoveryBots` names the bots whose visits are trusted to mint corpus: `['*']`
+ * (default) trusts every bot, `[]` trusts none (sitemap-only target creation site-wide), a
+ * list trusts exactly those names. Names are the labels `getBotName` produces — registry
+ * names, derived self-identifications, or the literal 'other' — compared case-insensitively
+ * so a config spelling like 'googlebot' still matches the registry's 'Googlebot'.
+ *
+ * This gates CREATION only. Serving is untouched (an unminted URL still proxies to the
+ * origin), and so is everything keyed on targets that already exist: the demand ladder's
+ * visit signal, invalidation reenqueue, and the sitemap pipeline (its targets are declared,
+ * not discovered).
+ */
+export const botMayDiscover = (botName) => {
+	if (config.ingress.discoveryBots !== discoveryFrom) {
+		discoverySet = compileDiscovery(config.ingress.discoveryBots);
+		discoveryFrom = config.ingress.discoveryBots;
+	}
+	if (discoverySet === null) return true;
+	return typeof botName === 'string' && discoverySet.has(botName.toLowerCase());
+};
