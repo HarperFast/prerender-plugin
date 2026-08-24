@@ -41,6 +41,9 @@ import { describeSecret } from './util/redact.js';
 // because the finding's whole job is to catch entries the compiler REJECTED (a typo'd
 // `match`), which the raw array still contains.
 import { prerenderRouteCount } from './util/routeClass.js';
+// NOT cyclic, on purpose: changeProbeSpec.js is the probe's pure half and imports nothing of the
+// runtime, precisely so this module can compile prospective rules inside collectConfigWarnings.
+import { inspectProbeRules } from './util/changeProbeSpec.js';
 
 // Returns the Harper logger when running inside Harper, otherwise the console.
 // Unit tests run outside Harper where `logger` is undefined.
@@ -720,6 +723,43 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				`11.59ms. The accelerator is using ${target.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
 				`least that to silence this.`
 		);
+	}
+	if (target.changeProbe.enabled) {
+		// Rule problems are individually warned at compile time, but a probe left with NOTHING to do
+		// is the state a single dropped rule can silently produce — the ingress.routes lesson.
+		const rules = inspectProbeRules(target.changeProbe.rules);
+		if (rules.usable === 0) {
+			add(
+				'warn',
+				'changeProbe.rules',
+				rules.total === 0
+					? 'changeProbe.enabled with no rules — the probe will probe nothing; add changeProbe.rules'
+					: `changeProbe.enabled but all ${rules.total} rule(s) were dropped as invalid — the probe will ` +
+							`probe nothing: ${rules.warnings.join('; ')}`
+			);
+		}
+		if (target.changeProbe.dryRun && rules.usable > 0) {
+			add(
+				'info',
+				'changeProbe.dryRun',
+				'change probe is in DRY RUN — probes run and change rates are measured (probe_* metrics), but ' +
+					'nothing is re-rendered and nothing is invalidated until dryRun is turned off'
+			);
+		}
+		// The canary's bulk action needs the invalidation read path on; the mismatch would otherwise
+		// surface only at trip time, which is 4am during the exact event the operator configured for.
+		if (
+			!target.invalidation.enabled &&
+			Array.isArray(target.changeProbe.rules) &&
+			target.changeProbe.rules.some((rule) => rule?.invalidateScope)
+		) {
+			add(
+				'warn',
+				'invalidation.enabled',
+				'a changeProbe rule sets invalidateScope but invalidation.enabled is false — a canary trip ' +
+					'will refuse to record the bulk invalidation and pre-change snapshots will keep serving'
+			);
+		}
 	}
 
 	return findings;

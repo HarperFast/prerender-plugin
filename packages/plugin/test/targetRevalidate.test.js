@@ -80,6 +80,8 @@ before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], config: { http: { port: 9926 } } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.databases = {
+		// Target.delete removes the probe baseline alongside the cached pages.
+		probe_state: { ProbeState: { delete: async () => {} } },
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {

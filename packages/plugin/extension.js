@@ -18,6 +18,7 @@ import {
 import { startQueueStatusSync, startReadySweep } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
+import { startChangeProbeScheduler } from './src/util/changeProbe.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
 import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
 import { startInvalidationWatch } from './src/util/invalidation.js';
@@ -102,6 +103,9 @@ export async function handleApplication(scope) {
 	startReadySweep();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();
+	// Owner-scoped on every node, like the reconciler: each node probes the URLs it owns.
+	// Inert unless changeProbe.enabled with at least one usable rule.
+	startChangeProbeScheduler();
 	// Keeps the console's backlog histogram off the page-load path: the scan walks the same
 	// nextRenderTime index `claim` reads from, so it recomputes on this slow cadence instead.
 	startBacklogSnapshotter();

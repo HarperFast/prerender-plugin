@@ -128,9 +128,15 @@ export class Target extends TargetTable {
 		// the target still exists, so an orphaned schedule row would be claimed and re-rendered
 		// until its own result drops it. Deletes are idempotent; a visible failure the caller
 		// can retry is the right outcome.
-		await Promise.all(
-			cacheKeysOf(url).flatMap((cacheKey) => [deleteSchedule(cacheKey), PrerenderedPage.delete(cacheKey)])
-		);
+		//
+		// The probe baseline goes with the target. ProbeState is node-local, so this delete only
+		// lands on the node it runs on — an owner-node row deleted elsewhere is left behind, and
+		// that is fine: an orphaned baseline is never walked again (the sweep walks Targets), and
+		// a re-created target on a new owner seeds fresh regardless.
+		await Promise.all([
+			...cacheKeysOf(url).flatMap((cacheKey) => [deleteSchedule(cacheKey), PrerenderedPage.delete(cacheKey)]),
+			databases.probe_state.ProbeState.delete(url),
+		]);
 
 		return super.delete(...arguments);
 	}

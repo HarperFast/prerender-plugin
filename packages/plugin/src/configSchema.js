@@ -742,6 +742,174 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	changeProbe: group(
+		'CHANGE-DRIVEN RE-RENDERING. Instead of guessing how often a page changes with an interval, ask ' +
+			'the origin — cheaply — whether the fields bots care about actually changed, and re-render only ' +
+			'then. A probe is one small HTTP request per URL: either an endpoint the page itself consults ' +
+			'(`source: request` — e.g. a product price/availability API, typically thousands of times ' +
+			'cheaper than a render), or the page document’s own schema.org JSON-LD Product offers ' +
+			'(`source: document` — nothing site-specific to configure). The extracted fields are reduced to ' +
+			'a signature stored on the target; a later probe that observes a different signature expires the ' +
+			'cached pages and files the URL due now.\n\n' +
+			'TWO CADENCES FOR TWO KINDS OF CHANGE. The rolling SWEEP (sweepInterval) walks the whole ' +
+			'registry and catches continuous, per-URL drift — availability sell-through, item-level price ' +
+			'moves. The CANARY (canary.*) probes a small fixed cohort every few minutes, because commerce ' +
+			'price does not drift — it STEPS at promotional events, most of a catalog at once, which a ' +
+			'sample of hundreds sees within minutes while a full sweep is still hours away. On a canary ' +
+			'trip the rule’s `invalidateScope` records a bulk invalidation: pre-change snapshots stop ' +
+			'serving immediately (bots get origin content, which is correct by definition) while ' +
+			're-renders refill on their own machinery. Detection and response are different mechanisms on ' +
+			'purpose — re-rendering a large corpus takes the fleet hours; invalidating it takes one row.\n\n' +
+			'A PROBE FAILURE CHANGES NOTHING, by design: fetch errors, non-2xx, unparseable bodies and ' +
+			'extractions that yield no values leave the stored signature untouched and trigger nothing. ' +
+			'The probe is an accelerator on top of the baseline render cadence, never a gate on it — the ' +
+			'failure mode to survive is the origin replatforming under a rule, which surfaces as a high ' +
+			'probe_failed share and a loud log line, not as schedule churn. Probes run owner-scoped on ' +
+			'worker 0 of every node (each node probes the URLs it owns), carry the same User-Agent and ' +
+			'security token as every other origin fetch, and are rate-capped per node — AGREE THE RATE ' +
+			'WITH WHOEVER RUNS THE ORIGIN before enabling a sweep over a large corpus: probe endpoints ' +
+			'are typically uncached, so every request is origin backend work.',
+		{
+			enabled: option(false, 'Master switch. Off = no probes, no timers, nothing stored.'),
+			dryRun: option(
+				true,
+				'Probe, count and log every decision — but re-render nothing and invalidate nothing. ' +
+					'Signatures ARE written in dry run (the demand-ladder precedent), so each pass reports fresh ' +
+					'changes and a measured week converges on the true change rate instead of re-reporting the ' +
+					'same delta. Default ON: enabling `enabled` alone changes no schedule until this is turned off.'
+			),
+			rules: option(
+				[],
+				'What to probe and how — an array of rule objects; the FIRST rule whose pathPattern matches a ' +
+					'target’s URL path claims it (order most-specific first). Invalid rules are dropped ' +
+					'individually with a warning, like ingress.routes entries.\n\n' +
+					'Rule shape:\n' +
+					'  pathPattern      (required) regular expression matched against the URL path; capture ' +
+					'groups feed the template.\n' +
+					'  source           "document" (default): GET the page itself and extract its JSON-LD ' +
+					'Product offers (price, currency, availability) — generic, works for any site with ' +
+					'standard product markup. "request": probe a configured endpoint instead.\n' +
+					'  request.urlTemplate  (request mode, required) absolute URL with $1..$9 replaced by ' +
+					'pathPattern’s capture groups, URI-component-encoded. The origin security token and the ' +
+					'staging-IP pin are attached ONLY when this endpoint shares the probed page’s origin — a ' +
+					'third-party host gets a plain fetch, never the bypass secret. Redirects are not followed ' +
+					'(a redirecting endpoint is a failed probe, and the failure metrics say so).\n' +
+					'  request.method   GET (default) | POST.\n' +
+					'  request.headers  extra request headers, e.g. { accept: "application/json" } — many JSON ' +
+					'endpoints require an explicit accept and fail with a 200-shaped error without it.\n' +
+					'  request.body     request body string (e.g. "{}").\n' +
+					'  extract          (request mode, required) value paths into the JSON response, e.g. ' +
+					'"payload.products[0].prices[0].salePrice" — the extracted values ARE the watched content; ' +
+					'everything else in the response is ignored. An extraction where every path yields null is a ' +
+					'FAILED probe, never a new signature, so an endpoint shape change cannot mass-trigger.\n' +
+					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
+					'records on a mass change. Empty = the canary detects and logs only.\n' +
+					'  label            optional name for logs and the admin surface.',
+				{ itemType: 'object' }
+			),
+			sweepInterval: option(DAY, 'How often each node walks its slice of the registry probing every matched URL.', {
+				unit: 'ms',
+				min: MINUTE,
+				// setInterval stores its delay as a signed 32-bit int; past this it fires immediately
+				// and the sweep hot-loops (the page.blobReadBudgetMs lesson).
+				max: 2147483647,
+			}),
+			ratePerSecond: option(
+				10,
+				'Sustained probe-request ceiling per node. THE ORIGIN-PROTECTION KNOB: probe endpoints are ' +
+					'typically no-store, so every probe is backend work for the origin — size this with the ' +
+					'origin’s operator, not from what the fleet can send. Also what sizes a sweep: a 200k-URL ' +
+					'node slice at 10/s is ~5.6h per pass.',
+				{ min: 1 }
+			),
+			concurrency: option(
+				4,
+				'Probe requests in flight at once per node. Bounds burstiness within the rate cap — the pacing ' +
+					'holds the sustained rate to ratePerSecond whatever origin latency does.',
+				{ min: 1 }
+			),
+			chunkSize: option(
+				2000,
+				'Registry rows collected per read transaction during a sweep. Each chunk’s cursor opens, ' +
+					'fills, and closes BEFORE any probe or write runs — a paced pass takes hours and no read ' +
+					'transaction may live anywhere near that long (see the scan group).',
+				{ min: 10 }
+			),
+			maxTriggersPerSweep: option(
+				5000,
+				'Ceiling on re-renders one sweep pass may file (per node). Changes past it stay detected but ' +
+					'DEFERRED — the signature is left stale so the next pass retries — bounding how much queue ' +
+					'injection a widespread change can cause. A genuinely mass change is the canary’s job, where ' +
+					'one invalidation row replaces thousands of due-now writes.',
+				{ min: 1 }
+			),
+			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
+				unit: 'ms',
+				min: SECOND,
+			}),
+			maxResponseBytes: option(
+				5 * 1024 * 1024,
+				'Largest probe response read before the probe is failed. Bounds document-mode reads; API-mode ' +
+					'responses are typically a few KB.',
+				{ min: 1024 }
+			),
+			startDelay: option(5 * MINUTE, 'Grace after boot before the first sweep.', {
+				unit: 'ms',
+				min: 0,
+				// Bounded so startDelay + startJitter can never exceed setTimeout's signed-32-bit delay.
+				max: DAY,
+				scope: 'restart',
+			}),
+			startJitter: option(
+				5 * MINUTE,
+				'Per-node spread on the first sweep, so a rolling restart doesn’t sync every node’s registry ' +
+					'walk and origin probes.',
+				{ unit: 'ms', min: 0, max: DAY, scope: 'restart' }
+			),
+			canary: group(
+				'The mass-change detector: a fixed per-node cohort probed on a fast cadence, tripping when a ' +
+					'large fraction changed in one pass. Cohort membership is deterministic — the `count` matched ' +
+					'URLs with the smallest hashes, a keyspace-uniform sample rebuilt by every sweep. (The ' +
+					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
+					'replaces it.)',
+				{
+					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
+						unit: 'ms',
+						min: 0,
+						max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
+					}),
+					count: option(
+						500,
+						'Cohort size per rule per node. At the default threshold this resolves a mass change with ' +
+							'comfortable margin while costing ~count probes per interval.',
+						{ min: 10 }
+					),
+					threshold: option(
+						0.1,
+						'Changed fraction of compared canaries (changed / (changed + unchanged)) at or above which ' +
+							'the pass counts as a mass change. Measured promotional events reprice most of a catalog at ' +
+							'once, so the default has a wide gap to per-URL drift noise.',
+						{ min: 0, max: 1 }
+					),
+					minSample: option(
+						50,
+						'Fewest COMPARED canaries (seeds and failures excluded) a pass needs before the threshold ' +
+							'is consulted at all — below it a handful of changes would read as a mass event.',
+						{ min: 1 }
+					),
+					holdoff: option(
+						6 * HOUR,
+						'How long after recording a scope’s invalidation the canary will not re-record it. ' +
+							'Re-stamping is NOT idempotent: it would re-invalidate every page rendered since the trip — ' +
+							'exactly the pages that just healed. A genuine second event inside the holdoff still heals ' +
+							'per-URL via the sweep; past it, a still-tripping canary re-records.',
+						{ unit: 'ms', min: 0 }
+					),
+				}
+			),
+		}
+	),
+
 	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
 		defaultInterval: option(
 			DAY,

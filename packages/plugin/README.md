@@ -707,6 +707,8 @@ this plugin's resources all set `loadAsInstance = false`.
 | `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now    | `super_user` |
 | `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail | `super_user` |
 | `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots   | `super_user` |
+| `GET /prerender_admin/change-probe`     | probe rules + last pass records (this node)     | `super_user` |
+| `POST /prerender_admin/change-probe`    | `{ action?: "sweep"\|"canary", dryRun? }` → run | `super_user` |
 
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the
 same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
@@ -1168,6 +1170,58 @@ so with the numbers attached.
 `invalidation.enabled: false` is a kill switch, and while any row exists it is reported as a log line
 on boot and on every config apply, plus a flag on `GET /invalidations` — silently serving content
 somebody deliberately invalidated is the one outcome this feature must never produce.
+
+### Change-driven re-rendering: the change probe
+
+A render interval bounds staleness blind: it pays a full render per page per interval whether or
+not anything changed, and it still misses every change that lands mid-interval. For the fields that
+actually invalidate a snapshot — price and availability on a commerce page are the canonical case —
+the origin can answer "did it change?" thousands of times cheaper than a render can. `changeProbe`
+(default **off**, and **dry-run** even when on) asks exactly that and re-renders only on change.
+
+A **rule** (`changeProbe.rules`) says what to watch for the URLs its `pathPattern` matches:
+
+- `source: document` (the generic mode) fetches the page itself and extracts its schema.org
+  **JSON-LD `Product` offers** — price, currency, availability — with nothing site-specific to
+  configure.
+- `source: request` probes an endpoint the page's own client-side code consults (`urlTemplate`,
+  with `$1`..`$9` from the pattern's capture groups), extracting configured value paths from the
+  JSON response. Typically a few KB against a render's seconds of CPU — but such endpoints are
+  usually uncached and undocumented, so **agree the probe rate with whoever runs the origin**
+  (`ratePerSecond` is the knob) and expect the endpoint to change shape someday. The origin
+  security token (and the staging-IP pin) ride along **only when the endpoint shares the probed
+  page's origin** — a rule naming a third-party host gets a plain fetch, never the bypass secret.
+  Redirects are not followed; a redirecting endpoint counts as a failed probe.
+
+The extracted values are reduced to a **signature** stored in the node-local `ProbeState` table
+(`replicate: false` — the sweep is owner-scoped, so a URL's baseline is only ever read and written
+by its owner node, and replicating it would ship every baseline to nodes that never consult it; a
+lost baseline just re-seeds). A probe that observes a different signature expires the URL's cached
+pages and files every device row due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
+content actually changes:
+
+- The **sweep** (`sweepInterval`) walks each node's owned slice of the registry, paced
+  (`ratePerSecond`, `concurrency`), catching continuous per-URL drift — availability sell-through,
+  item-level price moves. Re-renders per pass are capped (`maxTriggersPerSweep`); changes past the
+  cap stay detected and retry next pass.
+- The **canary** (`canary.*`) probes a small fixed cohort every few minutes, because commerce price
+  does not drift — it **steps at promotional events**, most of a catalog at once, which a sample of
+  hundreds sees within minutes. On a trip, the rule's `invalidateScope` records a **bulk
+  invalidation** (above): pre-change snapshots stop serving immediately — bots get origin content,
+  which is correct by definition — while re-renders refill on their own machinery. Detection and
+  response are different mechanisms on purpose: re-rendering a large corpus takes a render fleet
+  hours; invalidating it takes one row.
+
+**A probe failure changes nothing** — no signature write, no trigger. The probe is an accelerator
+on top of the baseline cadence, never a gate on it: an endpoint that breaks (or replatforms) shows
+up as a `probe_failed` share and a loud log line, not as schedule churn. An extraction where every
+path yields null is a failure too, so a shape change cannot flip every signature at once and
+mass-trigger. Suppressed targets are skipped — suppression owns its own recheck cadence.
+
+Once a probe rule covers a route's volatile fields, that route's `renderInterval` can usually be
+raised substantially — the interval then only bounds what the probe cannot see (client-side
+content: reviews, image sets), and the render budget freed is what pays for the burst of
+re-renders a mass change triggers. Status and manual runs: `GET`/`POST /prerender_admin/change-probe`.
 
 ## Metrics & observability
 

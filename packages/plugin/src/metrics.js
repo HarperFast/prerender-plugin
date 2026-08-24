@@ -411,11 +411,13 @@ export const METRICS = Object.freeze({
 		kind: 'value',
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
-			'util/demandLadder.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js',
+			'util/demandLadder.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
+			'util/changeProbe.js',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
-			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue)',
+			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
+			'per finished probe pass (probe_*)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -439,12 +441,20 @@ export const METRICS = Object.freeze({
 			'(the serve path falls back per-worker, so these are invisible in serve metrics); expect zero, ' +
 			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
 			'its outcome — `lowered` is work accepted, everything else is a refusal with its reason; the feature ' +
-			'is off by default, so no rows means disabled.',
+			'is off by default, so no rows means disabled. ' +
+			'probe_* = the change probe, per finished pass (sweep and canary alike): probed = attempts, of which ' +
+			'seeded (first observation stored) + changed + failed, the remainder unchanged; triggered = changes ' +
+			'that filed a re-render, deferred = changes past maxTriggersPerSweep (retried next pass); ' +
+			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
+			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
+			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
+			'without a matching invalidated emit was dry-run, holdoff, or a mis-configured scope — the log ' +
+			'line says which).',
 		caveats:
-			'Value semantics per series: unrouted, sitemap_* and the demand_* decision counters ' +
+			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
-			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error and ' +
-			'invalidation_reenqueue are counters; config_warnings is a slow gauge (latest value); ' +
+			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
+			'invalidation_reenqueue, probe_canary_trip and probe_invalidated are counters; config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-worker gauge — average it, never sum ' +
 			'(fill = set-bit fraction of the newest visit-filter slot; a k=7 probe false-positives at ~fill^7, ' +
 			'and false positives promote pages nobody visited — watch it before trusting the histogram). ' +
@@ -475,6 +485,14 @@ export const METRICS = Object.freeze({
 					'demand_fill',
 					'invalidation_error',
 					'invalidation_reenqueue',
+					'probe_probed',
+					'probe_seeded',
+					'probe_changed',
+					'probe_triggered',
+					'probe_deferred',
+					'probe_failed',
+					'probe_canary_trip',
+					'probe_invalidated',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -485,7 +503,8 @@ export const METRICS = Object.freeze({
 					'single_rung are the two paths where no decision was possible), fast/graded = the ' +
 					'guardrail ratio\u2019s two halves, promoted_fast = promotions onto a fast rung, plus the ' +
 					'fill sizing gauge. ' +
-					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes.',
+					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
+					'probe_* = change-probe pass counters (see usefulFor).',
 			},
 			method: {
 				name: 'detail',
@@ -718,4 +737,7 @@ export const metrics = Object.freeze({
 	/** The outcome of one demand-driven heal attempt — a prerender_ops series. */
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
+
+	/** One series of a finished change-probe pass — prerender_ops `probe_<series>`. */
+	changeProbe: (value, series) => server.recordAnalytics(value, 'prerender_ops', `probe_${series}`, null, null),
 });
