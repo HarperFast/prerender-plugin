@@ -131,9 +131,20 @@ export const compileProbeRules = (rules, collect = null) => {
 		? (message) => collect.push(message)
 		: (message) => globalThis.logger?.warn?.(`[prerender] ${message}`);
 	const compiled = [];
+	const labels = new Set();
 	for (const [index, raw] of (Array.isArray(rules) ? rules : []).entries()) {
 		const rule = compileRule(raw, index, warn);
-		if (rule) compiled.push(rule);
+		if (!rule) continue;
+		// Labels key everything downstream — canary cohorts, pass records, log lines — so a
+		// collision would silently merge two rules' cohorts and mis-attribute their passes.
+		// Uniquified rather than dropped: losing probe coverage over a naming clash is the worse trade.
+		if (labels.has(rule.label)) {
+			const unique = `${rule.label}#${index}`;
+			warn(`change-probe ${rule.label}: duplicate label — this rule is reported as "${unique}"`);
+			rule.label = unique;
+		}
+		labels.add(rule.label);
+		compiled.push(rule);
 	}
 	return compiled;
 };

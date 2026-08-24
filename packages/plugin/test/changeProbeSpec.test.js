@@ -208,3 +208,22 @@ test('isSameProbeOrigin gates the token: same origin only, fail-safe on garbage'
 	assert.equal(isSameProbeOrigin('not a url', 'https://www.example.com/x'), false);
 	assert.equal(isSameProbeOrigin(page, 'not a url'), false);
 });
+
+test('duplicate labels are uniquified, never silently merged', () => {
+	// Cohorts, pass records, and logs are keyed by label — a collision would merge two rules'
+	// canary cohorts and mis-attribute their passes.
+	const warnings = [];
+	const rules = compileProbeRules(
+		[
+			{ ...REQUEST_RULE, label: 'pdp' },
+			{ ...REQUEST_RULE, pathPattern: '^/product/prd-x', label: 'pdp' },
+		],
+		warnings
+	);
+	assert.deepEqual(
+		rules.map((rule) => rule.label),
+		['pdp', 'pdp#1']
+	);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /duplicate label/);
+});
