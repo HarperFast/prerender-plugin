@@ -322,3 +322,33 @@ test('resolveEffectiveInterval applies the demand ladder rung the route ceiling 
 	// A BigInt from a `Long` column, which `Number.isFinite` rejects outright without the coercion.
 	assert.equal(resolveEffectiveInterval(catalog, { demandInterval: BigInt(6 * HOUR_MS) }), 6 * HOUR_MS);
 });
+
+test('route discoverTargets: false kept, an invalid value drops the FIELD but never the route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/', discoverTargets: false },
+				{ match: 'prefix', path: '/product/prd-', discoverTargets: 'no' }, // invalid → field dropped
+			],
+		},
+	});
+	assert.equal(matchRoute('/catalog/girls.jsp').discoverTargets, false);
+	// The route still classifies (a gate typo must not unroute a served path)…
+	assert.equal(classifyPath('/product/prd-1').routeClass, PRERENDER);
+	// …it just keeps the default: discovery allowed.
+	assert.equal(matchRoute('/product/prd-1').discoverTargets, true);
+});
+
+test('route discoverTargets defaults to true and is ignored on a passthrough route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/' },
+				{ match: 'prefix', path: '/help/', mode: 'passthrough', discoverTargets: false },
+			],
+		},
+	});
+	assert.equal(matchRoute('/catalog/x').discoverTargets, true);
+	// A passthrough route never schedules, so the field is warned about and ignored.
+	assert.equal(matchRoute('/help/contact-us').discoverTargets, true);
+});

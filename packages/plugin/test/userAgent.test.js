@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { getBotName } from '../src/util/userAgent.js';
+import { getBotName, botMayDiscover } from '../src/util/userAgent.js';
 
 // Minimal stand-in for a WHATWG Headers object.
 const headers = (map) => ({ get: (k) => map[k.toLowerCase()] ?? null });
@@ -126,4 +126,28 @@ test('registry match wins over derivation', () => {
 test('deriveUnknownBots: false restores the strict registry-or-other behavior', () => {
 	applyOptions({ analytics: { deriveUnknownBots: false } });
 	assert.equal(getBotName(headers({ 'user-agent': 'ExampleBot/2.1 (+https://example.com/bot)' })), 'other');
+});
+
+test('botMayDiscover: the default trusts every bot', () => {
+	assert.equal(botMayDiscover('Googlebot'), true);
+	assert.equal(botMayDiscover('other'), true);
+	assert.equal(botMayDiscover('Anything At All'), true);
+});
+
+test('botMayDiscover: a list gates case-insensitively and follows a live config change', () => {
+	applyOptions({ ingress: { discoveryBots: ['googlebot', 'Bingbot'] } });
+	assert.equal(botMayDiscover('Googlebot'), true);
+	assert.equal(botMayDiscover('BINGBOT'), true);
+	assert.equal(botMayDiscover('AhrefsBot'), false);
+	assert.equal(botMayDiscover('other'), false);
+	assert.equal(botMayDiscover(undefined), false);
+	// '*' anywhere in the list restores trust-everyone.
+	applyOptions({ ingress: { discoveryBots: ['*'] } });
+	assert.equal(botMayDiscover('AhrefsBot'), true);
+});
+
+test('botMayDiscover: an empty list turns traffic discovery off for every bot', () => {
+	applyOptions({ ingress: { discoveryBots: [] } });
+	assert.equal(botMayDiscover('Googlebot'), false);
+	assert.equal(botMayDiscover('other'), false);
 });

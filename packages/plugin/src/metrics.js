@@ -417,7 +417,7 @@ export const METRICS = Object.freeze({
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
-			'per finished probe pass (probe_*)',
+			'per finished probe pass (probe_*), per gated cacheable miss (discovery_gated)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -449,12 +449,16 @@ export const METRICS = Object.freeze({
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
 			'without a matching invalidated emit was dry-run, holdoff, or a mis-configured scope — the log ' +
-			'line says which).',
+			'line says which). ' +
+			'discovery_gated = cacheable misses whose target creation the discovery gate refused, split by ' +
+			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
+			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
+			'render rotation", the corpus growth the gate is preventing.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
-			'invalidation_reenqueue, probe_canary_trip and probe_invalidated are counters; config_warnings is a slow gauge (latest value); ' +
+			'invalidation_reenqueue, probe_canary_trip, probe_invalidated and discovery_gated are counters; config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-worker gauge — average it, never sum ' +
 			'(fill = set-bit fraction of the newest visit-filter slot; a k=7 probe false-positives at ~fill^7, ' +
 			'and false positives promote pages nobody visited — watch it before trusting the histogram). ' +
@@ -493,6 +497,7 @@ export const METRICS = Object.freeze({
 					'probe_failed',
 					'probe_canary_trip',
 					'probe_invalidated',
+					'discovery_gated',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -504,7 +509,7 @@ export const METRICS = Object.freeze({
 					'guardrail ratio\u2019s two halves, promoted_fast = promotions onto a fast rung, plus the ' +
 					'fill sizing gauge. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
-					'probe_* = change-probe pass counters (see usefulFor).',
+					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses.',
 			},
 			method: {
 				name: 'detail',
@@ -520,14 +525,15 @@ export const METRICS = Object.freeze({
 					'unusable), unknown-mode (treated as hard). invalidation_reenqueue: the outcome — lowered ' +
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
-					'not-sooner, throttled, error. Other series: null.',
+					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
+					"route's discoverTargets, 'bot' = ingress.discoveryBots). Other series: null.",
 			},
 			type: {
 				name: 'context',
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. Other series: null.',
+					'that triggered the heal. discovery_gated: the bot name. Other series: null.',
 			},
 		},
 	}),
@@ -715,6 +721,10 @@ export const metrics = Object.freeze({
 	/** One flush-interval's count for one unrouted bucket (read `total` for the request sum). */
 	unrouted: (count, routeClass, bucket) =>
 		server.recordAnalytics(count, 'prerender_ops', 'unrouted', routeClass, bucket),
+
+	/** A cacheable miss the discovery gate held out of target creation — a prerender_ops series. */
+	discoveryGated: (reason, botName) =>
+		server.recordAnalytics(true, 'prerender_ops', 'discovery_gated', reason, botName ?? null),
 
 	/** One series of a finished sitemap refresh run — prerender_ops `sitemap_<series>`. */
 	sitemapRun: (value, series) => server.recordAnalytics(value, 'prerender_ops', `sitemap_${series}`, null, null),

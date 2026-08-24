@@ -59,6 +59,7 @@ import { canonicalizeUrl } from './url.js';
 import { queryAllowlistFor } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
+import { Target } from '../resources/Target.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread. Same value, and the same reason, as reconcile.
@@ -167,22 +168,22 @@ export const sweepKeyRuleOrphans = async ({
 	maxDeletes = config.render.orphanSweep.maxDeletes,
 	dryRun = config.render.orphanSweep.dryRun,
 } = {}) => {
-	const {
-		render_service: { Target },
-	} = databases;
-
 	return sweepOrphanedTargets({
 		// One unconstrained streamed scan, for the reasons spelled out on `reconcileScheduleGaps`:
 		// no `sort` (a sort on the un-indexed primary key is rejected), no conditions (Harper
 		// injects the full-scan condition itself), no `limit` (the caller streams and never
 		// resumes). `url` is the only column the predicate needs.
-		streamTargets: () => Target.search({ select: ['url'] }),
+		streamTargets: () => databases.render_service.Target.search({ select: ['url'] }),
 		// Node-local shared-buffer lookup, which is exactly why this sweep is owner-scoped.
 		isLeased: (cacheKey) => Boolean(leaseInfo(cacheKey)),
-		// `Target.delete` fans out to `deleteSchedule` + `PrerenderedPage.delete` for every device
-		// key, so the schedule rows and the unreadable page go with the target in one call. It
-		// derives those keys from the target's OWN stored url, so it can only ever remove the
-		// orphaned spelling — the live folded key belongs to a different target and is untouched.
+		// The RESOURCE class delete, never `databases.render_service.Target`'s (the raw table,
+		// which this used to bind): only the resource override fans out to `deleteSchedule` +
+		// `PrerenderedPage.delete` for every device key and the probe baseline, so the schedule
+		// rows and the unreadable page go with the target in one call. A raw delete leaves
+		// schedule rows that each re-render once before retiring themselves, and page blobs
+		// nothing ever reclaims. It derives those keys from the target's OWN stored url, so it
+		// can only ever remove the orphaned spelling — the live folded key belongs to a
+		// different target and is untouched.
 		deleteTarget: (url) => Target.delete(url),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,

@@ -38,10 +38,30 @@ const sharedBufferStub = {
 
 let orphanSweep;
 
+// resources/Target.js (imported for the CASCADING delete) extends the raw table class and
+// destructures PrerenderedPage at module scope, so the table stubs must be classes and must
+// exist before the import.
+class FakeTable {
+	static async get() {}
+	static async put() {}
+	static async patch() {}
+	static async delete() {}
+	static search() {
+		return [];
+	}
+}
+
 beforeEach(async () => {
 	globalThis.server = { hostname: 'node-a', nodes: [], config: { http: {} } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
-	globalThis.databases = { coordination: { SharedBuffer: { primaryStore: sharedBufferStub } } };
+	globalThis.Resource = class {};
+	globalThis.databases = {
+		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		probe_state: { ProbeState: FakeTable },
+		render_service: { Target: FakeTable },
+		page_cache: { PrerenderedPage: FakeTable },
+		render_schedule: { RenderSchedule: FakeTable },
+	};
 	orphanSweep = await import('../src/util/orphanSweep.js');
 });
 

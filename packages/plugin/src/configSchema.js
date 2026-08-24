@@ -104,7 +104,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				[],
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
-					'queryParams?: string[], renderInterval?: number }.\n\n' +
+					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -128,8 +128,29 @@ export const configSchema = group('Prerender plugin configuration.', {
 					"property settings (not from our response headers), that TTL and the route's renderInterval " +
 					'must be kept aligned BY HAND — rendering much faster than the edge TTL burns renders the edge ' +
 					'never serves, and much slower means the edge re-fetches stale content. Neither side can see ' +
-					'the other drift.',
+					'the other drift.\n\n' +
+					'`discoverTargets` (default true, prerender routes only) — whether a bot visiting an UNKNOWN ' +
+					'URL on this route creates a target for it. Set false on routes whose URL space is ' +
+					'combinatorial (faceted navigation, filter/sort permutations): crawlers walking those links ' +
+					'mint every novel combination into permanent render load, and the corpus grows without bound. ' +
+					'Gated URLs are still served (origin proxy on a miss) — they just never enter the render ' +
+					'rotation; the sitemap pipeline is unaffected, so declared URLs on the route still schedule. ' +
+					'NOTE: flipping this false stops NEW targets only. Existing discovered targets keep rendering ' +
+					'until deleted — see the discovery-purge admin action, and gate BEFORE purging or crawlers ' +
+					're-mint what the purge removes.',
 				{ itemType: 'object' }
+			),
+			discoveryBots: option(
+				['*'],
+				'Bots whose visits may create NEW targets (traffic discovery), by the bot name the analytics ' +
+					"registry resolves (analytics.bots / derived names / the literal 'other'), compared " +
+					"case-insensitively. ['*'] (default) trusts every bot; [] disables traffic discovery " +
+					'site-wide (sitemap-only corpus); a list trusts exactly those names. Third-party crawlers ' +
+					'with broken link extractors invent malformed URLs from rendered markup and re-request them ' +
+					'forever — restricting minting to the search engines that matter ends that class at the ' +
+					'source. Creation-only: serving, the demand ladder, invalidation reenqueue, and sitemap ' +
+					'ingestion are all unaffected.',
+				{ itemType: 'string' }
 			),
 			excludePathPatterns: option(
 				['/search/'],

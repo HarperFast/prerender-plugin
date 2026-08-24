@@ -40,6 +40,10 @@
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
+ *   GET  /prerender_admin/discovery-purge  this node's purge state super_user
+ *   POST /prerender_admin/discovery-purge { urlPrefix, dryRun?,    super_user
+ *                                    ratePerSecond?, force? } |
+ *                                    { action: 'stop' }
  *   POST /prerender_admin/backlog    { cap? } recompute the snapshot    super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
@@ -101,6 +105,7 @@ import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
+import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
 import {
 	changeProbeStatus,
 	isProbeCanaryRunning,
@@ -471,6 +476,10 @@ export class PrerenderAdmin extends Resource {
 				// Node-local, like reconcile: each node probes only the keys it owns, so cohort sizes
 				// and pass records here describe THIS node's slice. The console fans out.
 				return json(changeProbeStatus());
+			case 'discovery-purge':
+				// Live progress of THIS node's purge pass (it mutates its stats in place), or the
+				// last finished pass. Owner-scoped like sweep-orphans: query every node.
+				return json({ node: server.hostname, ...getDiscoveredPurgeState() });
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -504,6 +513,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.reconcile();
 			case 'sweep-orphans':
 				return PrerenderAdmin.sweepOrphans(data);
+			case 'discovery-purge':
+				return PrerenderAdmin.discoveryPurge(data);
 			case 'change-probe':
 				return PrerenderAdmin.changeProbe(data);
 			case 'backlog':
@@ -1171,6 +1182,37 @@ export class PrerenderAdmin extends Resource {
 		runOrphanSweepOnce({ dryRun, maxDeletes }).catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
+	}
+
+	/**
+	 * Start (or stop) a discovered-target purge on THIS node — the cleanup half of the discovery
+	 * gate; see util/discoveredPurge.js for the predicate, the owner scope and the GATE FIRST
+	 * interlock. `dryRun` defaults to TRUE, so a bare start is a census: `deleted` then counts
+	 * what a real run would remove. The pass is detached and paced (`ratePerSecond` targets per
+	 * second, default 200); progress is on GET /prerender_admin/discovery-purge, and
+	 * `{ action: 'stop' }` ends it at the next row.
+	 */
+	static discoveryPurge(data) {
+		if (data?.action === 'stop') {
+			return json({ node: server.hostname, ...stopDiscoveredPurge() });
+		}
+		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : true;
+		const ratePerSecond = Number.isFinite(Number(data?.ratePerSecond))
+			? Math.max(1, Math.floor(Number(data.ratePerSecond)))
+			: 200;
+		try {
+			const result = startDiscoveredPurge({
+				urlPrefix: data?.urlPrefix,
+				dryRun,
+				ratePerSecond,
+				force: data?.force === true,
+			});
+			return json({ node: server.hostname, ...result });
+		} catch (e) {
+			// The validation refusals (bad prefix, ungated route) are operator input, not faults.
+			if (e?.statusCode === 400) return json({ error: e.message }, 400);
+			throw e;
+		}
 	}
 
 	/**
