@@ -45,7 +45,7 @@
  * but nothing is re-rendered and nothing is invalidated.
  */
 
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setImmediate as yieldNow, setTimeout as sleep } from 'node:timers/promises';
 import { gunzipSync } from 'node:zlib';
 import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
@@ -69,6 +69,9 @@ import {
 const targetTable = () => databases.render_service.Target;
 const pageTable = () => databases.page_cache.PrerenderedPage;
 const invalidationTable = () => databases.invalidation.Invalidation;
+
+// Rows scanned between event-loop yields (util/reconcile.js's cadence).
+const YIELD_EVERY = 200;
 
 // What every probe read of the registry projects. `probeSignature` is the stored comparison
 // state; the rest is what the trigger needs (writeSchedules wants fromSitemap + the cadence).
@@ -259,6 +262,7 @@ export const runProbePass = async ({
 	isCanceled = () => false,
 	collectCohort = null,
 	ownershipChecked = false,
+	onYield = () => yieldNow(),
 } = {}) => {
 	const stats = newStats();
 	const batch = [];
@@ -332,6 +336,10 @@ export const runProbePass = async ({
 			break;
 		}
 		stats.examined++;
+		// Skipped rows (unowned, unmatched — most of a multi-node registry) never reach the paced
+		// flush, so without this a chunk of pure skips runs as one synchronous burst. Same
+		// discipline, same cadence as util/reconcile.js's walk.
+		if (stats.examined % YIELD_EVERY === 0) await onYield();
 		if (!ownershipChecked && ownerOf(row.url) !== hostname) continue;
 		stats.owned++;
 		if (row.state === 'suppressed') continue;

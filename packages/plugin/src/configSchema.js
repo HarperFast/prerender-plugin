@@ -810,6 +810,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 			sweepInterval: option(DAY, 'How often each node walks its slice of the registry probing every matched URL.', {
 				unit: 'ms',
 				min: MINUTE,
+				// setInterval stores its delay as a signed 32-bit int; past this it fires immediately
+				// and the sweep hot-loops (the page.blobReadBudgetMs lesson).
+				max: 2147483647,
 			}),
 			ratePerSecond: option(
 				10,
@@ -853,13 +856,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			startDelay: option(5 * MINUTE, 'Grace after boot before the first sweep.', {
 				unit: 'ms',
 				min: 0,
+				// Bounded so startDelay + startJitter can never exceed setTimeout's signed-32-bit delay.
+				max: DAY,
 				scope: 'restart',
 			}),
 			startJitter: option(
 				5 * MINUTE,
 				'Per-node spread on the first sweep, so a rolling restart doesn’t sync every node’s registry ' +
 					'walk and origin probes.',
-				{ unit: 'ms', min: 0, scope: 'restart' }
+				{ unit: 'ms', min: 0, max: DAY, scope: 'restart' }
 			),
 			canary: group(
 				'The mass-change detector: a fixed per-node cohort probed on a fast cadence, tripping when a ' +
@@ -871,6 +876,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
 						unit: 'ms',
 						min: 0,
+						max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
 					}),
 					count: option(
 						500,
