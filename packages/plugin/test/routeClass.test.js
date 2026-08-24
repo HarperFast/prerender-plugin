@@ -9,6 +9,7 @@ import {
 	queryAllowlistFor,
 	resolveEffectiveInterval,
 	resolveRenderInterval,
+	demandFloorFor,
 	PASSTHROUGH,
 	PRERENDER,
 	UNCLASSIFIED,
@@ -351,4 +352,48 @@ test('route discoverTargets defaults to true and is ignored on a passthrough rou
 	assert.equal(matchRoute('/catalog/x').discoverTargets, true);
 	// A passthrough route never schedules, so the field is warned about and ignored.
 	assert.equal(matchRoute('/help/contact-us').discoverTargets, true);
+});
+
+test('route demandFloor: valid values kept, invalid values drop the FIELD but never the route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/', demandFloor: 12 * HOUR_MS },
+				{ match: 'prefix', path: '/product/prd-', demandFloor: 'fast' }, // invalid → field dropped
+				{ match: 'prefix', path: '/help/', mode: 'passthrough', demandFloor: HOUR_MS }, // ignored
+			],
+		},
+	});
+	assert.equal(matchRoute('/catalog/x').demandFloor, 12 * HOUR_MS);
+	assert.equal(classifyPath('/product/prd-1').routeClass, PRERENDER);
+	assert.equal(matchRoute('/product/prd-1').demandFloor, null);
+	assert.equal(matchRoute('/help/contact-us').demandFloor, null);
+	assert.equal(demandFloorFor('https://www.example.com/catalog/x'), 12 * HOUR_MS);
+	assert.equal(demandFloorFor('https://www.example.com/product/prd-1'), null);
+	assert.equal(demandFloorFor('https://www.example.com/unrouted'), null);
+});
+
+test('resolveEffectiveInterval clamps a stored rung UP to the route demandFloor', () => {
+	const DAY_MS = 24 * HOUR_MS;
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/', renderInterval: DAY_MS, demandFloor: 12 * HOUR_MS },
+				{ match: 'prefix', path: '/product/prd-', renderInterval: 4 * DAY_MS },
+			],
+		},
+	});
+	const catalog = 'https://www.example.com/catalog/x';
+	// A stale sub-floor stamp must not be credited: reads as the floor until the ladder re-stamps.
+	assert.equal(resolveEffectiveInterval(catalog, { demandInterval: 6 * HOUR_MS }), 12 * HOUR_MS);
+	// At or above the floor, the rung stands (still ceiling-clamped).
+	assert.equal(resolveEffectiveInterval(catalog, { demandInterval: 12 * HOUR_MS }), 12 * HOUR_MS);
+	assert.equal(resolveEffectiveInterval(catalog, { demandInterval: 3 * DAY_MS }), DAY_MS);
+	// No floor on the route → unchanged behavior.
+	assert.equal(
+		resolveEffectiveInterval('https://www.example.com/product/prd-1', { demandInterval: 6 * HOUR_MS }),
+		6 * HOUR_MS
+	);
+	// Unset rung stays at the ceiling regardless of the floor.
+	assert.equal(resolveEffectiveInterval(catalog, {}), DAY_MS);
 });

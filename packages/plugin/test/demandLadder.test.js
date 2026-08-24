@@ -285,3 +285,41 @@ test('config defaults ship inert: enabled off and dryRun on', () => {
 	assert.equal(d.render.demand.dryRun, true);
 	assert.equal(config.render.demand.enabled, true, 'test override applied on top of defaults');
 });
+
+test('a route demandFloor bounds promotion, heals sub-floor stamps, and leaves other routes alone', () => {
+	const T = 1_700_000_000_000;
+	applyOptions({
+		render: {
+			demand: {
+				enabled: true,
+				dryRun: false,
+				ladder: [6 * H, 12 * H, 24 * H, 48 * H],
+				promoteWindows: 2,
+				maxFastInterval: 12 * H,
+				maxFastFraction: 0.05,
+			},
+		},
+		ingress: {
+			mode: 'forwarded',
+			routes: [
+				{ match: 'prefix', path: '/product/prd-', renderInterval: 96 * H, demandFloor: 48 * H },
+				{ match: 'prefix', path: '/catalog/', renderInterval: 24 * H, demandFloor: 48 * H },
+			],
+		},
+	});
+	const pdp = 'https://www.example.com/product/prd-1';
+	// Promotion stops at the floor: the only rung under the 96h base is 48h.
+	assert.deepEqual(decideInterval(pdp, 96 * H, undefined, T, always), {
+		interval: 48 * H,
+		level: 48 * H,
+		action: 'promoted',
+	});
+	// A stored rung below the floor snaps INTO the floored list and cannot promote past it.
+	const healed = decideInterval(pdp, 96 * H, 6 * H, T, always);
+	assert.equal(healed.level, 48 * H);
+	assert.equal(healed.action, 'held');
+	// A floor at or above the granted cadence leaves a single-rung ladder: rest at the grant.
+	assert.equal(decideInterval('https://www.example.com/catalog/x', 24 * H, undefined, T, always).action, 'single-rung');
+	// A URL matching no route keeps the full ladder.
+	assert.equal(decideInterval('https://www.example.com/other', 96 * H, 48 * H, T, always).interval, 24 * H);
+});
