@@ -1,0 +1,722 @@
+/**
+ * CHANGE PROBE — re-render when the origin says the page changed, instead of guessing with an
+ * interval. See util/changeProbeSpec.js for the pure half (rules, templating, extraction).
+ *
+ * WHY THIS EXISTS. A render interval bounds staleness blind: it costs a full headless-Chrome
+ * render (~seconds of CPU) per page per interval whether or not anything changed, and it still
+ * misses every change that lands mid-interval. For the fields that actually invalidate a snapshot
+ * — price and availability on a commerce PDP — the origin can answer "did it change?" thousands of
+ * times cheaper: one small fetch of an endpoint the page itself consults (`source: request`), or
+ * of the document's own JSON-LD Product offers (`source: document`, the generic contract). The
+ * probe reduces that answer to a signature stored on the target and re-renders ONLY on change —
+ * which also keeps the byte-change signal crawlers schedule recrawls on aligned with reality.
+ *
+ * TWO CADENCES, TWO CHANGE MODES:
+ *
+ *   THE SWEEP walks the whole registry every `sweepInterval`, probing owned, rule-matched targets
+ *   at a capped rate. It catches CONTINUOUS drift — sell-through availability, item-level price
+ *   moves — where per-URL detection is the only detection there is.
+ *
+ *   THE CANARY probes a small fixed cohort every `canary.interval`. It exists because commerce
+ *   price does NOT drift continuously — it steps at promotional events, most of a catalog at once
+ *   (measured: 81% of PDPs repriced in one event) — and a mass change is visible in a sample of
+ *   hundreds within minutes, at negligible cost. On a trip it can record a BULK INVALIDATION
+ *   (`invalidateScope`), which stops serving every pre-change snapshot in the scope immediately —
+ *   bots get origin content, which carries the correct fields by definition — while re-renders
+ *   refill the cache on their own machinery (cadence + the invalidation accelerator). Detection
+ *   and response are deliberately different mechanisms: re-rendering an entire corpus takes the
+ *   fleet the better part of a day; invalidating it takes one 102-byte row.
+ *
+ * OWNER-SCOPED, LIKE EVERY SWEEP HERE. Each node probes only the URLs residency assigns to it:
+ * the trigger writes due-now schedule rows, and a due-now row is only claimable where the writing
+ * node's own claim floor covers it (see util/invalidationReenqueue.js for the measured failure of
+ * non-owner lowering). Every node running the same sweep covers the keyspace with no coordination.
+ *
+ * WHAT A PROBE FAILURE MEANS: NOTHING. A fetch error, a non-2xx, an unparseable body, or an
+ * extraction that yields no values leaves the stored signature untouched and triggers nothing —
+ * the probe is an ACCELERATOR on top of the baseline render cadence, never a gate on it. The
+ * failure the design must survive is the origin replatforming under the rule (the exact event
+ * that motivated this feature twice over): that surfaces as a high failure share, which is
+ * counted, logged loudly at >50%, and changes no schedule.
+ *
+ * DRY RUN measures before it acts, like render.demand: every probe runs, every decision is
+ * counted and logged, signatures are written (so per-pass change counts converge to the true
+ * change RATE rather than re-reporting the same changes forever — the demandInterval precedent),
+ * but nothing is re-rendered and nothing is invalidated.
+ */
+
+import { setTimeout as sleep } from 'node:timers/promises';
+import { gunzipSync } from 'node:zlib';
+import { config, onConfigApplied } from '../config.js';
+import { metrics } from '../metrics.js';
+import { fnv1a32 } from './hash.js';
+import { epochMsOf, currentMinuteMs } from './time.js';
+import { getResidencyByUrl } from './residency.js';
+import { resolveEffectiveInterval } from './routeClass.js';
+import { writeSchedules } from './renderSchedule.js';
+import { recordInvalidation, isScopeResolvable } from './invalidation.js';
+import { dispatcherFor, configuredStagingIp } from './upstream.js';
+import { cacheKeysOf } from '../resources/Target.js';
+import {
+	compileProbeRules,
+	buildProbeRequest,
+	extractValues,
+	extractJsonLdOffers,
+	signatureOf,
+} from './changeProbeSpec.js';
+
+const targetTable = () => databases.render_service.Target;
+const pageTable = () => databases.page_cache.PrerenderedPage;
+const invalidationTable = () => databases.invalidation.Invalidation;
+
+// What every probe read of the registry projects. `probeSignature` is the stored comparison
+// state; the rest is what the trigger needs (writeSchedules wants fromSitemap + the cadence).
+const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state', 'probeSignature'];
+
+// Compile + memoize the rule list, keyed on config identity — applyOptions rebuilds config from
+// defaults on every change, so a fresh array means a reload (the routeClass memo pattern).
+let compiledRules = null;
+let compiledFrom;
+export const probeRules = () => {
+	if (config.changeProbe.rules !== compiledFrom) {
+		compiledRules = compileProbeRules(config.changeProbe.rules);
+		compiledFrom = config.changeProbe.rules;
+	}
+	return compiledRules;
+};
+
+/**
+ * One canary cohort per rule label, selected deterministically: every URL whose hash lands on the
+ * stride. 1-in-16 spreads membership across the keyspace while letting the lazy build (below)
+ * stop after examining only ~16x the cohort size instead of walking the whole registry.
+ */
+const CANARY_STRIDE = 16;
+const isCanaryCandidate = (url) => fnv1a32(url) % CANARY_STRIDE === 0;
+let cohorts = new Map(); // rule label -> urls this node owns
+
+const newStats = () => ({
+	examined: 0, // rows scanned
+	owned: 0, // rows this node owns
+	matched: 0, // owned rows a rule matched (suppressed excluded)
+	probed: 0, // probes attempted = seeded + unchanged + changed + failed
+	seeded: 0, // first observation stored, nothing compared
+	unchanged: 0,
+	changed: 0,
+	triggered: 0, // changes that scheduled a re-render
+	deferred: 0, // changes past maxTriggersPerSweep — signature kept stale so the next pass retries
+	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
+	errors: 0, // trigger writes that threw
+	failureSamples: [], // first few failures, for the admin surface
+});
+
+const readBounded = async (stream, maxBytes) => {
+	const chunks = [];
+	let total = 0;
+	for await (const chunk of stream) {
+		total += chunk.length;
+		if (total > maxBytes) {
+			stream.destroy?.();
+			throw new Error(`response exceeded changeProbe.maxResponseBytes (${maxBytes})`);
+		}
+		chunks.push(chunk);
+	}
+	return Buffer.concat(chunks);
+};
+
+/**
+ * One probe HTTP request. Same identity as every other origin fetch this plugin makes — the
+ * configured desktop User-Agent plus the security token (probes are per-URL, not per-device:
+ * the premise of watching these fields is that they are device-invariant) — and the same
+ * staging-IP pinning the sitemap refresh uses, so the probe watches the origin the plugin serves.
+ */
+const probeFetch = async ({ url, method, headers, body }) => {
+	const urlObj = new URL(url);
+	const timeout = config.changeProbe.requestTimeout;
+	const response = await dispatcherFor(configuredStagingIp()).request({
+		origin: urlObj.origin,
+		path: urlObj.pathname + urlObj.search,
+		method,
+		headers: {
+			'user-agent': config.origin.userAgents.desktop,
+			[config.origin.securityToken.header]: config.origin.securityToken.value,
+			'accept-encoding': 'gzip',
+			...headers,
+		},
+		body: body ?? undefined,
+		headersTimeout: timeout,
+		bodyTimeout: timeout,
+	});
+	const raw = await readBounded(response.body, config.changeProbe.maxResponseBytes);
+	// maxOutputLength so a pathological gzip body cannot expand past what the raw cap allows.
+	const buffer =
+		response.headers['content-encoding'] === 'gzip'
+			? gunzipSync(raw, { maxOutputLength: config.changeProbe.maxResponseBytes * 16 })
+			: raw;
+	return { statusCode: response.statusCode, body: buffer.toString('utf8') };
+};
+
+/**
+ * Probe one URL under one rule: fetch, extract, sign. Returns the signature, or null when the
+ * response yielded no usable observation (the all-null rule); throws on fetch/HTTP failure.
+ * A 404 is a failure like any other — target retirement is suppression's job, not the probe's.
+ */
+const probeOnce = async (rule, url) => {
+	const request = buildProbeRequest(rule, url);
+	if (!request) return null;
+	const { statusCode, body } = await probeFetch(request);
+	if (statusCode < 200 || statusCode >= 300) throw new Error(`HTTP ${statusCode}`);
+	if (rule.source === 'request') return signatureOf(extractValues(JSON.parse(body), rule.extract));
+	const offers = extractJsonLdOffers(body);
+	return offers ? signatureOf(offers) : null;
+};
+
+/**
+ * Re-render one changed URL now — the same shape as `Target.revalidate`'s per-URL apply: expire
+ * the cached pages (they leave the fresh window and serve stale-while-revalidate until the render
+ * lands) and file every device row at the current minute. Owner-scoped by the sweep, so the
+ * funnel's floor lowering covers these keys on the node whose claim scan reads them.
+ */
+const triggerRevalidate = async (row) => {
+	const keys = cacheKeysOf(row.url);
+	await Promise.all(
+		keys.map(async (cacheKey) => {
+			const page = await pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+			if (page) await pageTable().patch(cacheKey, { expiresAt: Date.now() });
+		})
+	);
+	// The current minute PER TRIGGER, never captured once for a whole pass — a paced sweep runs for
+	// hours, and a stale minute files rows below other nodes' claim-floor guard bands (the
+	// Target.revalidate lesson).
+	const nextRenderTime = currentMinuteMs();
+	await writeSchedules(
+		keys.map((cacheKey) => ({
+			cacheKey,
+			nextRenderTime,
+			fromSitemap: !!row.sitemapUrl,
+			effectiveInterval: resolveEffectiveInterval(row.url, row),
+		}))
+	);
+};
+
+const writeSignature = (url, signature) =>
+	targetTable().patch(url, { probeSignature: signature, probedAt: new Date() });
+
+/**
+ * Probe a stream of target rows and act on what changed. ALL I/O is injected, so the decision
+ * logic — ownership, matching, the seed/changed/deferred/failed state machine, pacing, the
+ * trigger budget, dry-run — is testable without Harper globals (the reconcileSchedules pattern).
+ *
+ * `rows` must never hold an open read cursor while this runs: the sweep feeds it from
+ * already-collected chunks and the canary from point reads, so probe latency and schedule writes
+ * happen with every cursor closed (see util/scan.js for why that discipline is structural).
+ */
+export const runProbePass = async ({
+	rows,
+	rules,
+	ownerOf,
+	hostname,
+	probe,
+	write,
+	trigger,
+	dryRun,
+	maxTriggers,
+	concurrency,
+	ratePerSecond,
+	pause = sleep,
+	now = Date.now,
+	isCanceled = () => false,
+	collectCohort = null,
+	ownershipChecked = false,
+} = {}) => {
+	const stats = newStats();
+	const batch = [];
+
+	const processOne = async ({ row, rule }) => {
+		stats.probed++;
+		let observed;
+		try {
+			observed = await probe(rule, row.url);
+		} catch (e) {
+			observed = null;
+			if (stats.failureSamples.length < 3) {
+				stats.failureSamples.push({ url: row.url, rule: rule.label, error: e?.message ?? String(e) });
+			}
+		}
+		if (observed === null || observed === undefined) {
+			stats.failed++;
+			return;
+		}
+		const stored = row.probeSignature ?? null;
+		if (stored === observed) {
+			stats.unchanged++;
+			return;
+		}
+		if (!stored) {
+			// First observation: baseline it, trigger nothing — the page's content is not known to
+			// have changed, the probe just hadn't seen it before.
+			stats.seeded++;
+			await write(row.url, observed);
+			return;
+		}
+		stats.changed++;
+		if (dryRun) {
+			// Signature written in dry-run ON PURPOSE: each pass then reports fresh changes — the
+			// true change rate — instead of re-reporting the same delta forever. Demand-ladder
+			// precedent (its dry run persists rung moves for the same reason).
+			await write(row.url, observed);
+			return;
+		}
+		if (stats.triggered >= maxTriggers) {
+			// Budget spent: leave the signature STALE so the next pass re-detects and retries.
+			// Bounds how much queue injection one pass can do (a mass change is the canary's job).
+			stats.deferred++;
+			return;
+		}
+		try {
+			await trigger(row);
+			stats.triggered++;
+			await write(row.url, observed);
+		} catch (e) {
+			stats.errors++;
+			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
+		}
+	};
+
+	// Pacing: batches of `concurrency`, each batch held to the window `ratePerSecond` implies for
+	// its size — so the sustained request rate is capped whatever the origin's latency does.
+	const flush = async () => {
+		if (!batch.length) return;
+		const started = now();
+		await Promise.all(batch.map(processOne));
+		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000;
+		const elapsed = now() - started;
+		batch.length = 0;
+		if (elapsed < window) await pause(window - elapsed);
+	};
+
+	for await (const row of rows) {
+		if (isCanceled()) {
+			stats.aborted = true;
+			break;
+		}
+		stats.examined++;
+		if (!ownershipChecked && ownerOf(row.url) !== hostname) continue;
+		stats.owned++;
+		if (row.state === 'suppressed') continue;
+		let rule = null;
+		for (const candidate of rules) {
+			if (buildProbeRequest(candidate, row.url)) {
+				rule = candidate;
+				break;
+			}
+		}
+		if (!rule) continue;
+		stats.matched++;
+		collectCohort?.(rule, row.url);
+		batch.push({ row, rule });
+		if (batch.length >= Math.max(1, concurrency)) await flush();
+	}
+	await flush();
+
+	return stats;
+};
+
+/**
+ * The registry, streamed in cursor-bounded chunks: each chunk's read transaction opens, fills an
+ * array, and closes BEFORE any probe or write runs — a paced pass over a large registry takes
+ * hours, and no cursor may live anywhere near that long. One-sided PK range, the only shape a
+ * string-PK walk should take here (a two-sided range collapses to a filtered intersection).
+ */
+async function* walkTargets(chunkSize) {
+	let cursor = '';
+	while (true) {
+		const chunk = [];
+		for await (const row of targetTable().search({
+			conditions: [{ attribute: 'url', comparator: 'greater_than', value: cursor }],
+			sort: { attribute: 'url' },
+			select: TARGET_SELECT,
+			limit: chunkSize,
+		})) {
+			chunk.push(row);
+		}
+		if (!chunk.length) return;
+		cursor = chunk[chunk.length - 1].url;
+		yield* chunk;
+		if (chunk.length < chunkSize) return;
+	}
+}
+
+/** The canary cohort, re-read fresh: membership is remembered, rows are not. */
+async function* readCohortRows(urls) {
+	for (const url of urls) {
+		const row = await targetTable().get({ id: url, select: TARGET_SELECT });
+		if (row) yield row;
+	}
+}
+
+const emitStats = (stats, kind) => {
+	try {
+		metrics.changeProbe(stats.probed, 'probed');
+		metrics.changeProbe(stats.seeded, 'seeded');
+		metrics.changeProbe(stats.changed, 'changed');
+		metrics.changeProbe(stats.triggered, 'triggered');
+		metrics.changeProbe(stats.deferred, 'deferred');
+		metrics.changeProbe(stats.failed, 'failed');
+	} catch (e) {
+		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
+	}
+};
+
+const logPass = (stats, kind, dryRun) => {
+	const line = { kind, dryRun, ...stats };
+	// >50% failures is the replatform signature: the endpoint or markup this rule was written
+	// against has probably changed shape, and every failed probe is a page silently back on
+	// interval-only freshness.
+	if (stats.probed > 0 && stats.failed / stats.probed > 0.5) {
+		logger.warn(
+			`[prerender] change-probe ${kind}: ${stats.failed} of ${stats.probed} probes failed — the probed ` +
+				`endpoint or markup has likely changed shape; re-verify the rule (failures change nothing, so ` +
+				`these pages are back to interval-only freshness until it is fixed)`,
+			line
+		);
+	} else {
+		(logger.notify ?? logger.info).call(logger, `[prerender] change-probe ${kind} ${JSON.stringify(line)}`);
+	}
+};
+
+// ---- the two passes ----------------------------------------------------------------------------
+
+let sweepRunning = false;
+let canaryRunning = false;
+let lastSweep = null;
+let lastCanary = null;
+
+const passLimits = (dryRunOverride) => ({
+	dryRun: typeof dryRunOverride === 'boolean' ? dryRunOverride : config.changeProbe.dryRun,
+	maxTriggers: config.changeProbe.maxTriggersPerSweep,
+	concurrency: config.changeProbe.concurrency,
+	ratePerSecond: config.changeProbe.ratePerSecond,
+});
+
+/** One full registry pass on THIS node. Rebuilds the canary cohorts as it walks. */
+export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
+	if (sweepRunning) return { skipped: true, reason: 'a probe sweep is already running', lastRun: lastSweep };
+	sweepRunning = true;
+	const startedAt = Date.now();
+	const limits = passLimits(dryRun);
+	try {
+		const rules = probeRules();
+		const nextCohorts = new Map(rules.map((rule) => [rule.label, []]));
+		const count = Math.max(1, config.changeProbe.canary.count | 0);
+		const stats = await runProbePass({
+			rows: walkTargets(config.changeProbe.chunkSize),
+			rules,
+			ownerOf: getResidencyByUrl,
+			hostname: server.hostname,
+			probe: probeOnce,
+			write: writeSignature,
+			trigger: triggerRevalidate,
+			...limits,
+			isCanceled: () => !config.changeProbe.enabled,
+			collectCohort: (rule, url) => {
+				const cohort = nextCohorts.get(rule.label);
+				if (cohort.length < count && isCanaryCandidate(url)) cohort.push(url);
+			},
+		});
+		cohorts = nextCohorts;
+		emitStats(stats, 'sweep');
+		logPass(stats, 'sweep', limits.dryRun);
+		lastSweep = {
+			...stats,
+			dryRun: limits.dryRun,
+			label,
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			error: null,
+		};
+		return lastSweep;
+	} catch (e) {
+		lastSweep = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		throw e;
+	} finally {
+		sweepRunning = false;
+	}
+};
+
+/**
+ * Build the cohorts without probing — a read-only walk that stops as soon as every rule's cohort
+ * is full. Runs once per process at most (the sweep rebuilds them properly): after a restart the
+ * canary must not sit dark for the hours a full sweep takes.
+ */
+let cohortBuildDone = false;
+const ensureCohorts = async () => {
+	if (cohortBuildDone || [...cohorts.values()].some((urls) => urls.length)) return;
+	cohortBuildDone = true;
+	const rules = probeRules();
+	const count = Math.max(1, config.changeProbe.canary.count | 0);
+	const next = new Map(rules.map((rule) => [rule.label, []]));
+	for await (const row of walkTargets(config.changeProbe.chunkSize)) {
+		if (!config.changeProbe.enabled) break;
+		if (getResidencyByUrl(row.url) !== server.hostname) continue;
+		if (row.state === 'suppressed' || !isCanaryCandidate(row.url)) continue;
+		const match = rules.find((rule) => buildProbeRequest(rule, row.url));
+		if (!match) continue;
+		const cohort = next.get(match.label);
+		if (cohort.length < count) cohort.push(row.url);
+		if ([...next.values()].every((urls) => urls.length >= count)) break;
+	}
+	cohorts = next;
+};
+
+/**
+ * The mass-change verdict for one rule's canary pass, pure so the threshold arithmetic is
+ * testable: changed / (changed + unchanged), over at least `minSample` compared observations.
+ * Seeds and failures are excluded from BOTH sides — a cold cohort or a broken endpoint must read
+ * as "no verdict", never as "nothing changed".
+ */
+export const canaryVerdict = (stats, { threshold, minSample }) => {
+	const compared = stats.changed + stats.unchanged;
+	if (compared < Math.max(1, minSample)) return { tripped: false, compared, fraction: null };
+	const fraction = stats.changed / compared;
+	return { tripped: fraction >= threshold, compared, fraction };
+};
+
+/**
+ * Act on a canary trip: record the rule's bulk invalidation, if everything about doing so is
+ * sound — and say exactly why not otherwise, because a mass price change the operator configured
+ * a response for is the one event this feature exists to catch.
+ */
+const actOnTrip = async (rule, fraction) => {
+	const scope = rule.invalidateScope;
+	if (!scope) {
+		logger.warn(
+			`[prerender] change-probe canary TRIPPED for ${rule.label} (${(fraction * 100).toFixed(1)}% changed) — ` +
+				`no invalidateScope configured, so this is detection-only; pages heal per-URL as the sweep reaches them`
+		);
+		return { acted: false, reason: 'no-scope' };
+	}
+	if (!isScopeResolvable(scope)) {
+		logger.error(
+			`[prerender] change-probe canary tripped for ${rule.label} but invalidateScope "${scope}" names no ` +
+				`configured prerender route — NOTHING was invalidated. Fix changeProbe.rules or ingress.routes.`
+		);
+		return { acted: false, reason: 'unresolvable-scope' };
+	}
+	if (!config.invalidation.enabled) {
+		logger.error(
+			`[prerender] change-probe canary tripped for ${rule.label} but invalidation.enabled is FALSE — ` +
+				`NOTHING was invalidated and pre-change snapshots keep serving until pages re-render on cadence.`
+		);
+		return { acted: false, reason: 'invalidation-disabled' };
+	}
+	// The holdoff stops a slow refill from re-stamping the epoch every canary interval. A
+	// re-stamp is not idempotent: it would re-invalidate every page rendered SINCE the trip —
+	// exactly the pages that just healed.
+	const existing = await invalidationTable().get({ id: scope, select: ['scope', 'invalidatedAt'] });
+	const at = epochMsOf(existing?.invalidatedAt);
+	if (Number.isFinite(at) && Date.now() - at < config.changeProbe.canary.holdoff) {
+		logger.info(
+			`[prerender] change-probe canary for ${rule.label} still trips but "${scope}" was invalidated ` +
+				`${Math.round((Date.now() - at) / 60000)}m ago — inside canary.holdoff, not re-stamping`
+		);
+		return { acted: false, reason: 'holdoff' };
+	}
+	const reason = `change probe ${rule.label}: ${(fraction * 100).toFixed(1)}% of canary changed`.slice(0, 200);
+	await recordInvalidation({ scope, reason, updatedBy: `change-probe@${server.hostname}` });
+	try {
+		metrics.changeProbe(1, 'invalidated');
+	} catch {
+		// counted best-effort; the log line below is the record
+	}
+	logger.warn(
+		`[prerender] change-probe canary for ${rule.label} invalidated "${scope}" (${reason}) — bots serve ` +
+			`origin for that scope until pages re-render; a reseed sweep is re-baselining signatures now`
+	);
+	// A mass change makes the whole stored diff stale, so re-baseline NOW rather than waiting out
+	// sweepInterval — as a RESEED (dry-run semantics: probe + write signatures, trigger nothing).
+	// Per-URL triggers would be redundant with the invalidation just recorded — pages already heal
+	// on cadence plus the invalidation accelerator — and worse than redundant: at corpus scale the
+	// changed set dwarfs maxTriggersPerSweep, so a triggering sweep would leave most signatures
+	// stale and then drip re-renders of ALREADY-HEALED pages (a render never updates the
+	// signature; only a probe does) pass after pass until the baseline caught up.
+	runProbeSweepOnce({ dryRun: true, label: `reseed after invalidating ${scope}` }).catch((e) => logger.error(e));
+	return { acted: true, scope };
+};
+
+/**
+ * One canary pass over every rule's cohort on THIS node.
+ *
+ * DELIBERATELY NOT SKIPPED WHILE A SWEEP RUNS: a full sweep takes hours at production scale, and
+ * the canary is the only fast detector for exactly the event most likely to land mid-sweep (a
+ * scheduled promotion). The cost of overlap is one cohort's worth of probes at up to double the
+ * configured rate for under a minute; both passes write the same observed signature for a shared
+ * URL, so the race is value-idempotent.
+ */
+export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
+	if (canaryRunning) {
+		return { skipped: true, reason: 'a canary pass is already running' };
+	}
+	canaryRunning = true;
+	const startedAt = Date.now();
+	const limits = passLimits(dryRun);
+	const canary = config.changeProbe.canary;
+	try {
+		await ensureCohorts();
+		const rules = probeRules();
+		const perRule = [];
+		for (const rule of rules) {
+			const urls = cohorts.get(rule.label) ?? [];
+			if (!urls.length) {
+				perRule.push({ rule: rule.label, cohort: 0, skipped: 'empty cohort' });
+				continue;
+			}
+			const stats = await runProbePass({
+				rows: readCohortRows(urls),
+				rules: [rule],
+				// Membership was owner-filtered when the cohort was built; ownership is stable for a
+				// URL, so re-hashing every member per pass buys nothing.
+				ownershipChecked: true,
+				probe: probeOnce,
+				write: writeSignature,
+				trigger: triggerRevalidate,
+				...limits,
+				isCanceled: () => !config.changeProbe.enabled,
+			});
+			emitStats(stats, 'canary');
+			const verdict = canaryVerdict(stats, { threshold: canary.threshold, minSample: canary.minSample });
+			let action = null;
+			if (verdict.tripped) {
+				try {
+					metrics.changeProbe(1, 'canary_trip');
+				} catch {
+					// counted best-effort
+				}
+				action = limits.dryRun ? { acted: false, reason: 'dry-run' } : await actOnTrip(rule, verdict.fraction);
+				if (limits.dryRun) {
+					logger.warn(
+						`[prerender] change-probe canary WOULD TRIP for ${rule.label} ` +
+							`(${(verdict.fraction * 100).toFixed(1)}% of ${verdict.compared} changed) — dry run, nothing done`
+					);
+				}
+			}
+			perRule.push({ rule: rule.label, cohort: urls.length, ...stats, ...verdict, action });
+		}
+		lastCanary = {
+			perRule,
+			dryRun: limits.dryRun,
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			error: null,
+		};
+		return lastCanary;
+	} catch (e) {
+		lastCanary = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		throw e;
+	} finally {
+		canaryRunning = false;
+	}
+};
+
+// ---- scheduler + admin surface -------------------------------------------------------------
+
+export const isProbeSweepRunning = () => sweepRunning;
+export const isProbeCanaryRunning = () => canaryRunning;
+
+export const changeProbeStatus = () => ({
+	enabled: config.changeProbe.enabled,
+	dryRun: config.changeProbe.dryRun,
+	node: server.hostname,
+	ownerScopeNote: 'Probes only the URLs this node owns; every node sweeps its own slice.',
+	rules: probeRules().map((rule) => ({
+		label: rule.label,
+		pathPattern: rule.patternSource,
+		source: rule.source,
+		invalidateScope: rule.invalidateScope,
+	})),
+	sweep: { running: sweepRunning, lastRun: lastSweep, armedInterval: armedSweep },
+	canary: {
+		running: canaryRunning,
+		lastRun: lastCanary,
+		armedInterval: armedCanary,
+		cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
+	},
+});
+
+let schedulerStarted = false;
+let bootTimer = null;
+let sweepTimer = null;
+let canaryTimer = null;
+let armedSweep = null;
+let armedCanary = null;
+
+const clearProbeTimers = () => {
+	if (bootTimer) clearTimeout(bootTimer);
+	if (sweepTimer) clearInterval(sweepTimer);
+	if (canaryTimer) clearInterval(canaryTimer);
+	bootTimer = sweepTimer = canaryTimer = null;
+};
+
+const armIntervals = () => {
+	sweepTimer = setInterval(() => runProbeSweepOnce().catch((e) => logger.error(e)), armedSweep);
+	sweepTimer.unref?.();
+	if (armedCanary) {
+		canaryTimer = setInterval(() => runProbeCanaryOnce().catch((e) => logger.error(e)), armedCanary);
+		canaryTimer.unref?.();
+	}
+};
+
+// (Re)arm to match config; enable/disable and both intervals are live (reconcile's shape).
+const syncProbeTimers = () => {
+	const enabled = config.changeProbe.enabled && probeRules().length > 0;
+	const desiredSweep = enabled ? config.changeProbe.sweepInterval : null;
+	const desiredCanary = enabled && config.changeProbe.canary.interval > 0 ? config.changeProbe.canary.interval : null;
+	if (desiredSweep === armedSweep && desiredCanary === armedCanary) return;
+
+	const wasEnabled = armedSweep !== null;
+	clearProbeTimers();
+	armedSweep = desiredSweep;
+	armedCanary = desiredCanary;
+	if (desiredSweep === null) return;
+
+	if (wasEnabled) {
+		armIntervals();
+		return;
+	}
+
+	// First arming is boot-shaped: delay + per-node stagger, so a rolling restart or a cluster-wide
+	// config apply doesn't start every node's registry walk (and origin probes) at the same moment.
+	const stagger = fnv1a32(server.hostname) % Math.max(1, config.changeProbe.startJitter | 0);
+	bootTimer = setTimeout(() => {
+		runProbeSweepOnce().catch((e) => logger.error(e));
+		armIntervals();
+	}, config.changeProbe.startDelay + stagger);
+	bootTimer.unref?.();
+};
+
+export const probeTimerState = () => ({ started: schedulerStarted, armedSweep, armedCanary });
+
+/**
+ * Start the probe scheduler on worker 0 of EVERY node — owner-scoped like the reconciler, for the
+ * same reason (each node can only act on the keys it owns). Idempotent; follows config live.
+ */
+export function startChangeProbeScheduler() {
+	if (server.workerIndex !== 0 || schedulerStarted) return;
+	schedulerStarted = true;
+	syncProbeTimers();
+	onConfigApplied(syncProbeTimers);
+}
+
+/** Tests only — module state that outlives a beforeEach. */
+export const resetChangeProbeState = () => {
+	clearProbeTimers();
+	schedulerStarted = false;
+	armedSweep = armedCanary = null;
+	sweepRunning = canaryRunning = false;
+	lastSweep = lastCanary = null;
+	cohorts = new Map();
+	cohortBuildDone = false;
+	compiledRules = null;
+	compiledFrom = undefined;
+};

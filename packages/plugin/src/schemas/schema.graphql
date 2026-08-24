@@ -105,6 +105,15 @@ type Target @table(database: "render_service") @export {
 	# never been evaluated and starts from its route/stored interval. Written ONLY when the rung
 	# actually changes, so a converged corpus pays no write — same discipline as `strikes`.
 	demandInterval: Long
+	# The change probe's last observed content signature for this URL (util/changeProbe.js) —
+	# canonical JSON of the watched fields, compared as an opaque string. Written only when the
+	# observation differs from what is stored (seed or change), so a converged corpus pays no
+	# write per probe — the `demandInterval` discipline. Absent = never probed, and the next
+	# probe SEEDS rather than triggers. `Target.put` REPLACES the row and clears this with it,
+	# deliberately: a re-put target restarts its probe baseline exactly as it restarts its
+	# suppression state and ladder rung.
+	probeSignature: String
+	probedAt: Date
 }
 
 type RenderSchedule @table(database: "render_schedule") @export {

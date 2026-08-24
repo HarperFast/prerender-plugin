@@ -101,6 +101,13 @@ import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
+import {
+	changeProbeStatus,
+	isProbeCanaryRunning,
+	isProbeSweepRunning,
+	runProbeCanaryOnce,
+	runProbeSweepOnce,
+} from '../util/changeProbe.js';
 import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import {
@@ -460,6 +467,10 @@ export class PrerenderAdmin extends Resource {
 				// version rather than guess which release a doc describes. Static, so it costs nothing
 				// and cannot be a load surface.
 				return json({ metrics: describeMetrics(), node: server.hostname });
+			case 'change-probe':
+				// Node-local, like reconcile: each node probes only the keys it owns, so cohort sizes
+				// and pass records here describe THIS node's slice. The console fans out.
+				return json(changeProbeStatus());
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -493,6 +504,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.reconcile();
 			case 'sweep-orphans':
 				return PrerenderAdmin.sweepOrphans(data);
+			case 'change-probe':
+				return PrerenderAdmin.changeProbe(data);
 			case 'backlog':
 				return PrerenderAdmin.backlog(data);
 			case 'sitemap':
@@ -1156,6 +1169,36 @@ export class PrerenderAdmin extends Resource {
 		// Detached: the sweep outlives this request, so a rejection has to be handled here or it
 		// surfaces as an unhandled rejection.
 		runOrphanSweepOnce({ dryRun, maxDeletes }).catch((e) => logger.error(e));
+
+		return json({ ...payload, started: true, alreadyRunning: false });
+	}
+
+	/**
+	 * Start a change-probe pass on THIS node — `action: 'sweep'` (default) walks the full owned
+	 * slice, `action: 'canary'` probes the canary cohorts once. Detached and node-scoped for the
+	 * reconcile/sweep-orphans reasons: a paced sweep outlives any request, and a node can only act
+	 * on the keys it owns. `dryRun` (boolean) overrides the configured value for this run only —
+	 * the safe direction is inherited from config, where it defaults on.
+	 */
+	static changeProbe(data) {
+		if (!config.changeProbe.enabled) {
+			return json({ error: 'changeProbe.enabled is false', node: server.hostname }, 409);
+		}
+		const action = data?.action === undefined ? 'sweep' : data.action;
+		if (action !== 'sweep' && action !== 'canary') {
+			return json({ error: `action must be "sweep" or "canary", got ${String(data?.action)}` }, 400);
+		}
+		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : config.changeProbe.dryRun;
+		const status = changeProbeStatus();
+		const payload = { node: server.hostname, action, dryRun, ownerScopeNote: status.ownerScopeNote, status };
+
+		const running = action === 'sweep' ? isProbeSweepRunning() : isProbeCanaryRunning();
+		if (running) return json({ ...payload, started: false, alreadyRunning: true });
+
+		// Detached: the pass outlives this request, so a rejection has to be handled here or it
+		// surfaces as an unhandled rejection.
+		const run = action === 'sweep' ? runProbeSweepOnce({ dryRun }) : runProbeCanaryOnce({ dryRun });
+		run.catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
