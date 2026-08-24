@@ -88,6 +88,8 @@ export const ICONS = {
 	],
 	search: ['M13.5 13.5l3.5 3.5', 'M4 9a5 5 0 1010 0A5 5 0 004 9'],
 	refresh: ['M16.5 8A6.5 6.5 0 105 14.6', 'M16.5 3.5V8h-4.5'],
+	// A signal going out and coming back: the probe asks the origin whether anything moved.
+	probe: ['M10 12.5a1.5 1.5 0 100-3 1.5 1.5 0 100 3', 'M6.6 7.6a4.8 4.8 0 016.8 0M4 5a8.4 8.4 0 0112 0'],
 };
 
 /** The Harper mark: three stacked layers, drawn rather than shipped as a binary. */

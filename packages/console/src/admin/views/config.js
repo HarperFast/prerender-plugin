@@ -93,6 +93,7 @@ const ELSEWHERE = {
 	sitemap: { id: 'sitemaps', label: 'Sitemaps' },
 	analytics: { id: 'traffic', label: 'Traffic' },
 	crawlStats: { id: 'traffic', label: 'Traffic' },
+	changeProbe: { id: 'probe', label: 'Change probe' },
 };
 
 /** Card titles. The dotted prefix is the fallback, and it is never wrong — only terse. */
@@ -114,6 +115,7 @@ const TITLES = {
 	queue: 'Render queue',
 	analytics: 'Analytics',
 	crawlStats: 'Crawl stats',
+	changeProbe: 'Change probe',
 };
 
 /**

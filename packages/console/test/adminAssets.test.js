@@ -225,6 +225,8 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'demandLadder',
 		'invalidationError',
 		'invalidationReenqueue',
+		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe view.
+		'changeProbe',
 	]);
 
 	const emitted = [];

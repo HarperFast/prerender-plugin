@@ -62,14 +62,19 @@ export const meta = { id: 'overview', label: 'Overview', crumb: 'overview', icon
 const DEEP_SCAN_CAP = 50_000;
 
 export async function load(ctx) {
-	const [res, analyticsRes] = await Promise.all([
+	const [res, analyticsRes, purgeRes] = await Promise.all([
 		ctx.get('overview'),
 		// The same range key Traffic and Queue default to, so all three views share one
 		// worker-cached scan instead of each paying their own.
 		ctx.get('analytics', { range: 3_600_000 }),
+		// In-memory state, no scan — the same argument the orphan sweep's last result rides on:
+		// a destructive pass that is RUNNING has to be visible on the page an operator lands on,
+		// not on one they would have to think to open.
+		ctx.get('discovery-purge'),
 	]);
 	ctx.data.overview = res.ok ? res.body : null;
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
+	ctx.data.purge = purgeRes.ok ? purgeRes.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load the overview (${res.status})`);
 }
 
@@ -91,6 +96,7 @@ export function render(ctx) {
 		failures(ctx),
 		repair(ctx, data),
 		orphans(ctx, data),
+		discovered(ctx),
 	];
 }
 
@@ -589,6 +595,147 @@ function orphans(ctx, data) {
 				title: !last?.orphaned ? 'Run a dry run first — this acts on what that census found.' : null,
 				onclick: () => ctx.run(() => ctx.post('sweep-orphans', { dryRun: false })),
 			}),
+		],
+		body,
+	});
+}
+
+/**
+ * Targets that entered the corpus from TRAFFIC rather than from a sitemap, and the paced,
+ * owner-scoped pass that removes them.
+ *
+ * WHY THIS IS A DIFFERENT POPULATION FROM THE ORPHANS ABOVE. A key-rule orphan is a bookkeeping
+ * fault — a row nothing can ever ask for. A discovered target is a URL a crawler genuinely asked
+ * for, which the plugin then minted and has been re-rendering on cadence ever since. On a route
+ * whose URL space is combinatorial (facets, filter and sort permutations) that is unbounded: every
+ * novel combination a crawler walks becomes permanent render load, and the corpus grows faster
+ * than the fleet can keep it fresh.
+ *
+ * GATE BEFORE PURGING, and the plugin refuses the other order rather than trusting anyone to
+ * remember it: with `ingress.routes[].discoverTargets` still true on the matched route, crawlers
+ * re-mint exactly what the purge removed, so the pass is a rate-limited way to delete corpus and
+ * change nothing. The refusal is a 400 with that sentence in it, and `force` is the deliberate
+ * override.
+ */
+function discovered(ctx) {
+	const state = ctx.data.purge;
+	const clusterScope = isMerged(ctx.data.overview);
+	const busy = ctx.busy || !!state?.running;
+
+	// Kept in view scratch so the prefix survives the reload every action triggers.
+	const input = el('input', {
+		cls: 'mono',
+		type: 'text',
+		value: ctx.data.purgePrefix ?? '',
+		placeholder: 'https://www.example.com/catalog/',
+		style: { flex: '1', minWidth: '260px' },
+	});
+	const remember = () => {
+		ctx.data.purgePrefix = input.value.trim();
+		return ctx.data.purgePrefix;
+	};
+	const start = (dryRun) => {
+		const urlPrefix = remember();
+		if (!urlPrefix) return;
+		return ctx.run(() => ctx.post('discovery-purge', { urlPrefix, dryRun }));
+	};
+
+	const body = [
+		el('div', { cls: 'toolbar' }, [
+			input,
+			el('button', {
+				text: clusterScope ? 'Census (pick a node)' : 'Dry-run census',
+				disabled: busy || clusterScope,
+				title: clusterScope
+					? 'A purge walks the keys one node owns. Switch to a node to run it, and run every node to cover the keyspace.'
+					: 'Counts what a real pass would delete. Nothing is removed.',
+				onclick: () => start(true),
+			}),
+			el('button', {
+				cls: 'danger',
+				text: 'Purge discovered',
+				disabled: busy || clusterScope || !state?.startedAt || state?.dryRun === false,
+				title: !state?.startedAt
+					? 'Run the census first — this deletes what that census counted.'
+					: 'Deletes every discovered target under the prefix on this node.',
+				onclick: () => start(false),
+			}),
+			state?.running &&
+				el('button', {
+					text: 'Stop',
+					disabled: ctx.busy || clusterScope,
+					onclick: () => ctx.run(() => ctx.post('discovery-purge', { action: 'stop' })),
+				}),
+		]),
+	];
+
+	if (state?.error) body.push(el('div', { cls: 'note bad', text: `Last pass failed: ${state.error}` }));
+
+	// `startedAt` is what separates "has run" from "never run": a node that has never run answers
+	// `{ running: false }` and nothing else, and rendering that as a row of zeroes would read as a
+	// clean census.
+	const totals = state?.totals ?? state;
+	if (state?.startedAt) {
+		const stranded = (totals.discovered ?? 0) - (totals.leaseSkipped ?? 0) - (totals.deleted ?? 0);
+		body.push(
+			kv([
+				[
+					state.ranNodes > 1 ? `Oldest of ${state.ranNodes} passes` : state.running ? 'Started' : 'Last pass',
+					`${state.running ? ago(state.startedAt) + ' — still running' : state.finishedAt ? ago(state.finishedAt) : 'unknown'}` +
+						`${state.dryRun ? ' (census — nothing deleted)' : ''}${state.canceled ? ' · stopped early' : ''}`,
+				],
+				['Prefix', state.urlPrefix ?? (state.urlPrefixes?.length ? state.urlPrefixes.join(', ') : '—')],
+				['Rows examined', num(totals.examined)],
+				[state.ranNodes > 1 ? 'Owned across nodes' : 'Owned by this node', num(totals.owned)],
+				['Discovered (never in a sitemap)', totals.discovered ? pill(num(totals.discovered), 'warn') : pill('0', 'ok')],
+				['Deleted', state.dryRun ? muted('none — census') : num(totals.deleted)],
+				totals.leaseSkipped ? ['Deferred as in-flight', pill(num(totals.leaseSkipped), '')] : null,
+				state.canceled && stranded > 0
+					? ['Not reached', pill(`~${num(stranded)} left under this prefix`, 'warn')]
+					: null,
+			])
+		);
+	} else {
+		body.push(muted('No purge has run on this node since startup. It has no timer — it runs when you run it.'));
+	}
+
+	if (state?.unrunNodes?.length) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				`Never run on ${state.unrunNodes.join(', ')} — those nodes' keys are not represented above, and their ` +
+					'discovered targets are still rendering.',
+			])
+		);
+	}
+
+	if (state?.urlPrefixes?.length > 1) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				'The nodes last ran DIFFERENT prefixes, so the totals above add up two populations. The per-node ' +
+					'figures are the answer until every node has run the same one.',
+			])
+		);
+	}
+
+	body.push(
+		el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
+			'Gate the route first — set ',
+			el('code', { text: 'discoverTargets: false' }),
+			' on it under Request ingestion — or crawlers re-mint what this removes; the plugin refuses an ' +
+				'ungated prefix for that reason, and refuses a bare origin always. A sitemap-declared URL is never ' +
+				'touched whatever its traffic looks like: the sitemap is the operator’s statement of what should ' +
+				'exist. ',
+			link('See how much traffic the gate is holding out →', () => ctx.go('traffic')),
+		])
+	);
+
+	return card('Discovered targets', {
+		head: [
+			pill('manual — no timer'),
+			state?.running &&
+				pill(state.runningOn?.length ? `running on ${state.runningOn.join(', ')}` : 'running now', 'warn'),
+			spacer(),
+			state?.ratePerSecond ? muted(`${num(state.ratePerSecond)}/s`) : null,
 		],
 		body,
 	});

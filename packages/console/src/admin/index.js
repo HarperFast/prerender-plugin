@@ -45,6 +45,7 @@ const ASSETS = new Map([
 	['views/nodes.js', ['views/nodes.js', JS]],
 	['views/sitemaps.js', ['views/sitemaps.js', JS]],
 	['views/invalidations.js', ['views/invalidations.js', JS]],
+	['views/probe.js', ['views/probe.js', JS]],
 	['views/inspect.js', ['views/inspect.js', JS]],
 	['views/metricsref.js', ['views/metricsref.js', JS]],
 	['views/config.js', ['views/config.js', JS]],

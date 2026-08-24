@@ -19,6 +19,7 @@ import * as queue from './views/queue.js';
 import * as nodes from './views/nodes.js';
 import * as sitemaps from './views/sitemaps.js';
 import * as invalidations from './views/invalidations.js';
+import * as probe from './views/probe.js';
 import * as inspect from './views/inspect.js';
 import * as metricsref from './views/metricsref.js';
 import * as config from './views/config.js';
@@ -27,7 +28,9 @@ import { discardEdit } from './views/_configEdit.js';
 // Ordered as an operator triages: is it working (overview, traffic), what is it working on
 // (sitemaps), is the machinery healthy (queue, then the nodes running it), then actions and
 // reference. `inspect` sits below the divider because it is not a place you patrol — it is the
-// drill-down every other view hands a URL to.
+// drill-down every other view hands a URL to. The change probe sits after Invalidations because
+// that is what its canary produces: a mass change is answered with one invalidation row, not with
+// thousands of re-renders.
 const VIEWS = [
 	overview,
 	traffic,
@@ -35,6 +38,7 @@ const VIEWS = [
 	queue,
 	nodes,
 	invalidations,
+	probe,
 	null /* divider */,
 	inspect,
 	metricsref,

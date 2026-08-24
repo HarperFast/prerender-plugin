@@ -39,7 +39,20 @@ export const CLUSTER = 'cluster';
  * Routes whose numbers are node-local and additive. Everything else in PROXIED_GET reads a
  * replicated table (or is static), so it is answered by ONE node — see SHARED_NOTE.
  */
-export const MERGED_GET = Object.freeze(['overview', 'analytics', 'unrouted', 'config']);
+export const MERGED_GET = Object.freeze([
+	'overview',
+	'analytics',
+	'unrouted',
+	'config',
+	// Neither of these ADDS the way analytics does — a probe pass and a purge pass are run one node
+	// at a time over the keys that node owns, so what the merge produces is every node's own slice
+	// side by side plus the running tally. They are here rather than in SHARED_NOTE because the
+	// alternative is worse in the one way this classification exists to prevent: one node's
+	// "deleted 240,118" answered under a cluster label reads as done when three quarters of the
+	// keyspace has not been touched.
+	'change-probe',
+	'discovery-purge',
+]);
 
 /**
  * Why a route is answered by a single node under cluster scope, keyed by route. Shown in the
@@ -71,6 +84,15 @@ export const NODE_LOCAL_POST = Object.freeze({
 	// this sweep deletes.
 	'sweep-orphans': 'The orphan sweep deletes among the keys ONE node owns. Pick a node to sweep it.',
 	'backlog': 'A backlog snapshot covers the keys ONE node owns. Pick a node to recompute it.',
+	// A probe pass walks the registry rows THIS node owns and writes their baselines, and the
+	// canary probes the cohort built from that same slice. Fanned out it would be N passes at N
+	// times the agreed origin rate, which is the one thing changeProbe.ratePerSecond exists to
+	// stop — the rate is a promise made to whoever runs the origin, per node.
+	'change-probe':
+		'A probe pass covers the URLs ONE node owns, at that node’s agreed probe rate. Pick a node to run it.',
+	// Deletes, owner-scoped, and paced per node — the sweep-orphans argument exactly.
+	'discovery-purge':
+		'A purge deletes among the keys ONE node owns. Pick a node to run it, and run every node to cover the keyspace.',
 	// `schedule` reads RenderSchedule node-locally (replicateFrom: false, because the table is
 	// residency-pinned and a cross-node read has no timeout). Asked of a node that does not own
 	// the key it truthfully answers "no row" — which reads as "this URL will never render". The
@@ -951,13 +973,247 @@ export function mergeConfig(results) {
 	};
 }
 
+// ---------------------------------------------------------------- change probe
+
+/** Pass counters that ADD across nodes: each node probes a disjoint slice of the keyspace. */
+const PROBE_COUNTERS = [
+	'examined',
+	'owned',
+	'matched',
+	'probed',
+	'seeded',
+	'unchanged',
+	'changed',
+	'triggered',
+	'deferred',
+	'failed',
+	'errors',
+];
+
+/** Bound on the pooled failure samples — they exist to name a shape change, not to be a log. */
+const MAX_FAILURE_SAMPLES = 6;
+
+const sumCounters = (runs, keys) => Object.fromEntries(keys.map((key) => [key, sumOf(runs, (r) => r[key])]));
+
+/**
+ * Merge the change-probe status of every node into one cluster answer.
+ *
+ * THE COUNTERS ADD, THE VERDICTS DO NOT. A probe pass is owner-scoped — each node walks the
+ * registry rows it owns — so `probed`, `changed` and the rest partition the corpus and summing
+ * them is the only way to get a cluster change rate at all. The canary's TRIP is the opposite: it
+ * is a threshold crossed against ONE node's cohort, and a cluster-wide "tripped: true" folded out
+ * of four independent verdicts would name no node and match no log line. So trips are reported as
+ * the nodes that tripped, and the pooled fraction rides alongside as the wider sample it is.
+ *
+ * TIME IS TAKEN AS THE OLDEST, never the newest — the same rule the orphan sweep merge follows.
+ * Nodes stagger their first sweep on purpose (`startJitter`), so their last passes finished at
+ * different times, and a summary stamped with the freshest of them would present a figure that is
+ * hours stale on three nodes out of four as current.
+ *
+ * A NODE THAT HAS NOT SWEPT CONTRIBUTES ZERO TO EVERY SUM, which is indistinguishable from a node
+ * that swept and found nothing. `unsweptNodes` is what separates them, and the UI says so rather
+ * than letting the shortfall read as a smaller change rate.
+ */
+export function mergeChangeProbe(results) {
+	const usable = okBodies(results);
+	if (!usable.length) return allFailed(results, 'merged');
+
+	const bodies = usable.map((r) => ({ hostname: r.hostname, b: r.body }));
+
+	const sweeps = bodies
+		.map((r) => ({ hostname: r.hostname, ...(r.b.sweep?.lastRun ?? {}) }))
+		.filter((r) => r.startedAt);
+	const canaries = bodies
+		.map((r) => ({ hostname: r.hostname, ...(r.b.canary?.lastRun ?? {}) }))
+		.filter((r) => r.startedAt);
+
+	// Rules are configuration, so they are identical by intent and one node's copy is the answer.
+	// A disagreement is a deploy that skipped a node, which is the Config view's finding and not
+	// this one's — flagged here, diagnosed there.
+	const ruleJson = bodies.map((r) => JSON.stringify(r.b.rules ?? []));
+	const rules = bodies.find((r) => (r.b.rules ?? []).length)?.b.rules ?? [];
+
+	// Per RULE, across nodes: the counters add (disjoint cohorts), the verdict is named per node.
+	const perRule = new Map();
+	for (const run of canaries) {
+		for (const entry of run.perRule ?? []) {
+			const merged = perRule.get(entry.rule) ?? {
+				rule: entry.rule,
+				cohort: 0,
+				...Object.fromEntries(PROBE_COUNTERS.map((key) => [key, 0])),
+				compared: 0,
+				trippedOn: [],
+				actions: [],
+				emptyCohortOn: [],
+			};
+			merged.cohort += finite(entry.cohort) || 0;
+			for (const key of PROBE_COUNTERS) merged[key] += finite(entry[key]) || 0;
+			merged.compared += finite(entry.compared) || 0;
+			if (entry.tripped) merged.trippedOn.push(run.hostname);
+			if (entry.skipped) merged.emptyCohortOn.push(run.hostname);
+			if (entry.action) merged.actions.push({ hostname: run.hostname, ...entry.action });
+			perRule.set(entry.rule, merged);
+		}
+	}
+	// Pooled over the union of the nodes' cohorts: a wider sample of the same population, and the
+	// number to read when one node's cohort is too small to decide anything on its own.
+	for (const entry of perRule.values()) {
+		entry.fraction = entry.compared > 0 ? entry.changed / entry.compared : null;
+	}
+
+	const failureSamples = sweeps
+		.flatMap((run) => (run.failureSamples ?? []).map((sample) => ({ hostname: run.hostname, ...sample })))
+		.slice(0, MAX_FAILURE_SAMPLES);
+
+	return {
+		status: 200,
+		body: {
+			node: null,
+			workerIndex: null,
+			scope: 'cluster',
+			// ONE node with the probe off is the finding, not "the cluster has it on": that node's
+			// owned slice is never probed and every panel here keeps looking healthy.
+			enabled: bodies.some((r) => r.b.enabled),
+			disabledOn: bodies.filter((r) => r.b.enabled === false).map((r) => r.hostname),
+			// Dry run only if EVERY node is: one node acting makes "nothing is being triggered" false.
+			dryRun: bodies.every((r) => r.b.dryRun !== false),
+			liveOn: bodies.filter((r) => r.b.dryRun === false).map((r) => r.hostname),
+			ownerScopeNote: bodies[0].b.ownerScopeNote ?? null,
+			rules,
+			rulesDiverge: new Set(ruleJson).size > 1,
+			sweep: {
+				running: bodies.some((r) => r.b.sweep?.running),
+				runningOn: bodies.filter((r) => r.b.sweep?.running).map((r) => r.hostname),
+				armedInterval: bodies.find((r) => Number.isFinite(r.b.sweep?.armedInterval))?.b.sweep.armedInterval ?? null,
+				sweptNodes: sweeps.length,
+				unsweptNodes: bodies.filter((r) => !r.b.sweep?.lastRun?.startedAt).map((r) => r.hostname),
+				lastRun: sweeps.length
+					? {
+							...sumCounters(sweeps, PROBE_COUNTERS),
+							dryRun: sweeps.every((run) => run.dryRun !== false),
+							aborted: sweeps.some((run) => run.aborted),
+							startedAt: minOf(sweeps, (run) => msOf(run.startedAt)),
+							finishedAt: minOf(sweeps, (run) => msOf(run.finishedAt)),
+							error: sweeps.find((run) => run.error)?.error ?? null,
+							nodes: sweeps.length,
+							failureSamples,
+						}
+					: null,
+			},
+			canary: {
+				running: bodies.some((r) => r.b.canary?.running),
+				armedInterval: bodies.find((r) => Number.isFinite(r.b.canary?.armedInterval))?.b.canary.armedInterval ?? null,
+				cohortSizes: bodies.reduce((acc, r) => {
+					for (const [label, size] of Object.entries(r.b.canary?.cohortSizes ?? {})) {
+						acc[label] = (acc[label] ?? 0) + (finite(size) || 0);
+					}
+					return acc;
+				}, {}),
+				ranNodes: canaries.length,
+				unrunNodes: bodies.filter((r) => !r.b.canary?.lastRun?.startedAt).map((r) => r.hostname),
+				lastRun: canaries.length
+					? {
+							perRule: [...perRule.values()],
+							dryRun: canaries.every((run) => run.dryRun !== false),
+							startedAt: minOf(canaries, (run) => msOf(run.startedAt)),
+							finishedAt: minOf(canaries, (run) => msOf(run.finishedAt)),
+							error: canaries.find((run) => run.error)?.error ?? null,
+							nodes: canaries.length,
+						}
+					: null,
+			},
+			// Every node's own slice, unsummed — the purge/sweep actions are run per node, so this
+			// is the table an operator works down.
+			byNode: bodies.map((r) => ({
+				hostname: r.hostname,
+				enabled: r.b.enabled ?? null,
+				dryRun: r.b.dryRun ?? null,
+				sweepRunning: !!r.b.sweep?.running,
+				canaryRunning: !!r.b.canary?.running,
+				sweepFinishedAt: msOf(r.b.sweep?.lastRun?.finishedAt) || null,
+				canaryFinishedAt: msOf(r.b.canary?.lastRun?.finishedAt) || null,
+				probed: num(r.b.sweep?.lastRun?.probed),
+				changed: num(r.b.sweep?.lastRun?.changed),
+				failed: num(r.b.sweep?.lastRun?.failed),
+				error: r.b.sweep?.lastRun?.error ?? r.b.canary?.lastRun?.error ?? null,
+			})),
+			sources: sourcesOf(results, { mode: 'merged' }),
+		},
+	};
+}
+
+// ---------------------------------------------------------------- discovery purge
+
+const PURGE_COUNTERS = ['examined', 'owned', 'discovered', 'leaseSkipped', 'deleted'];
+
+/**
+ * Merge every node's discovered-target purge state.
+ *
+ * A PURGE IS RUN PER NODE, ONE AT A TIME, and the keyspace is only covered once every node has
+ * run — so `byNode` is the substance here and the totals are the running tally, not a result. The
+ * merge exists to stop the alternative: a single node's "deleted 240,118" answered under a
+ * "cluster" label, which reads as done when three quarters of the corpus has not been touched.
+ *
+ * DIFFERENT NODES MAY HAVE RUN DIFFERENT PREFIXES, and a total summed across two prefixes answers
+ * a question nobody asked. `urlPrefix` is therefore only reported when every node that ran used
+ * the same one; otherwise the per-node rows are the whole answer and the UI says so.
+ */
+export function mergeDiscoveryPurge(results) {
+	const usable = okBodies(results);
+	if (!usable.length) return allFailed(results, 'merged');
+
+	const bodies = usable.map((r) => ({ hostname: r.hostname, b: r.body }));
+	const runs = bodies.map((r) => ({ hostname: r.hostname, ...r.b })).filter((run) => run.startedAt);
+	const prefixes = [...new Set(runs.map((run) => run.urlPrefix).filter(Boolean))];
+
+	return {
+		status: 200,
+		body: {
+			node: null,
+			scope: 'cluster',
+			running: bodies.some((r) => r.b.running),
+			runningOn: bodies.filter((r) => r.b.running).map((r) => r.hostname),
+			ranNodes: runs.length,
+			unrunNodes: bodies.filter((r) => !r.b.startedAt).map((r) => r.hostname),
+			urlPrefix: prefixes.length === 1 ? prefixes[0] : null,
+			urlPrefixes: prefixes,
+			// A cluster figure counts as a dry run only if every node's was — one node that actually
+			// deleted makes "nothing was deleted" false.
+			dryRun: runs.length ? runs.every((run) => run.dryRun !== false) : true,
+			canceled: runs.some((run) => run.canceled),
+			startedAt: minOf(runs, (run) => msOf(run.startedAt)),
+			// Oldest, and null while any node is still running: a finish time for a pass three nodes
+			// are still in the middle of is the wrong shape of answer.
+			finishedAt: runs.some((run) => run.running) ? null : minOf(runs, (run) => msOf(run.finishedAt)),
+			error: runs.find((run) => run.error)?.error ?? null,
+			totals: runs.length ? sumCounters(runs, PURGE_COUNTERS) : null,
+			ownerScopeNote: bodies[0].b.ownerScopeNote ?? null,
+			byNode: bodies.map((r) => ({
+				hostname: r.hostname,
+				running: !!r.b.running,
+				urlPrefix: r.b.urlPrefix ?? null,
+				dryRun: r.b.dryRun ?? null,
+				ratePerSecond: num(r.b.ratePerSecond),
+				startedAt: msOf(r.b.startedAt) || null,
+				finishedAt: msOf(r.b.finishedAt) || null,
+				canceled: !!r.b.canceled,
+				error: r.b.error ?? null,
+				...Object.fromEntries(PURGE_COUNTERS.map((key) => [key, num(r.b[key])])),
+			})),
+			sources: sourcesOf(results, { mode: 'merged' }),
+		},
+	};
+}
+
 // ---------------------------------------------------------------- dispatch
 
 const MERGERS = {
-	overview: mergeOverview,
-	analytics: mergeAnalytics,
-	unrouted: mergeUnrouted,
-	config: mergeConfig,
+	'overview': mergeOverview,
+	'analytics': mergeAnalytics,
+	'unrouted': mergeUnrouted,
+	'config': mergeConfig,
+	'change-probe': mergeChangeProbe,
+	'discovery-purge': mergeDiscoveryPurge,
 };
 
 export const mergerFor = (route) => MERGERS[route] ?? null;
