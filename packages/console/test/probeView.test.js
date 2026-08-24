@@ -336,3 +336,44 @@ test('the status read failing still renders the card that turns the probe on', a
 	const ctx = await ready({ status: null });
 	assert.match(draw(ctx).textContent, /changeProbe.enabled is false/);
 });
+
+test('one node throwing does not delete the three that swept — both are reported', async () => {
+	// The merge takes the first error it finds across nodes, so an error and a full set of counters
+	// arrive together whenever the cluster is partly healthy. Showing only the error was dropping
+	// three good slices; showing only the counters hid that a quarter of the keyspace was missed.
+	const ctx = await ready({
+		status: {
+			...STATUS,
+			sweep: {
+				...STATUS.sweep,
+				lastRun: { ...STATUS.sweep.lastRun, nodes: 4, error: 'read transaction expired' },
+			},
+		},
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /read transaction expired/);
+	assert.match(text, /only the passes that did finish/);
+	assert.match(text, /Rows examined/);
+});
+
+test('an errored pass that counted nothing shows the error alone, not a row of dashes', async () => {
+	const ctx = await ready({
+		status: {
+			...STATUS,
+			sweep: {
+				...STATUS.sweep,
+				lastRun: { node: 'node-a', startedAt: 1000, finishedAt: 2000, error: 'boom' },
+			},
+		},
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /Last sweep failed: boom/);
+	assert.doesNotMatch(text, /Rows examined/);
+	assert.doesNotMatch(text, /No sweep has finished since startup/);
+});
+
+test('the failure threshold is compared explicitly, so an empty window never reads as failing', async () => {
+	// probed 0 makes the ratio null. Nothing may turn that into a "probe failures dominate" verdict.
+	const ctx = await ready({ analytics: { ...ANALYTICS, series: [passes('failed', 1, 0)] } });
+	assert.doesNotMatch(draw(ctx).textContent, /probe failures dominate/);
+});

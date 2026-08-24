@@ -32,6 +32,7 @@ import {
 	legend,
 	pick,
 	rangePicker,
+	ratioOf,
 	scanFooter,
 	scopeLabel,
 	segmented,
@@ -311,7 +312,12 @@ function drift(ctx) {
 	// Compared = probes that had a baseline to compare against. Seeds and failures had none, so
 	// including them in the denominator understates the drift rate by exactly the seeding backlog.
 	const compared = Math.max(0, probed - seeded - failed);
-	const failing = probed > 0 && failed / probed > FAILURE_ALARM;
+	// Through `ratioOf` like every other ÷ figure in this console, and NOT because these two can be
+	// null — `sumValues` reduces from 0 over finite products, so they are always numbers. It is that
+	// the guard belongs at the site by convention rather than by an argument a reader has to
+	// reconstruct from the helper's contract. Compared explicitly, so nothing rests on `null > 0.5`.
+	const failureShare = ratioOf(failed, probed);
+	const failing = failureShare !== null && failureShare > FAILURE_ALARM;
 
 	const bucketCount = data.bucketCount ?? 0;
 	const { keys, stacks } = stackBy(
@@ -384,9 +390,20 @@ function sweepCard(ctx, status) {
 		);
 	}
 
+	// The merge takes the FIRST error it finds across nodes, so an error and a full set of counters
+	// can arrive together: three nodes swept and one threw. Treating the error as the whole answer
+	// would drop the three good slices, and treating the counters as the whole answer would hide
+	// that a quarter of the keyspace was not covered. Both are shown, and the error says so.
+	const hasCounters = Number.isFinite(last?.probed);
 	if (last?.error) {
-		body.push(note('bad', [`Last sweep failed: ${last.error}`]));
-	} else if (last) {
+		body.push(
+			note('bad', [
+				`Last sweep failed: ${last.error}`,
+				hasCounters ? ' — the counters below cover only the passes that did finish.' : '',
+			])
+		);
+	}
+	if (hasCounters) {
 		const compared = Math.max(0, (last.probed ?? 0) - (last.seeded ?? 0) - (last.failed ?? 0));
 		body.push(
 			kv([
@@ -409,7 +426,7 @@ function sweepCard(ctx, status) {
 				last.aborted ? ['Interrupted', pill('stood down for a reseed, or the probe was disabled', '')] : null,
 			])
 		);
-	} else {
+	} else if (!last) {
 		body.push(muted('No sweep has finished since startup. The first one runs after changeProbe.startDelay.'));
 	}
 
