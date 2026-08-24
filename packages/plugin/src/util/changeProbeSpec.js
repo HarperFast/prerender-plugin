@@ -25,7 +25,9 @@
  */
 
 const VALID_SOURCES = new Set(['request', 'document']);
-const VALID_METHODS = new Set(['GET', 'POST', 'HEAD']);
+// No HEAD: extraction parses the response body, and a HEAD probe has none — it would validate
+// here and then fail on every single probe, which is the config shape this compiler exists to refuse.
+const VALID_METHODS = new Set(['GET', 'POST']);
 
 /**
  * Validate + normalize one raw rule. Returns null for a rule that can't be used, so a single typo
@@ -81,7 +83,7 @@ const compileRule = (raw, index, warn) => {
 		}
 		const method = raw.request.method === undefined ? 'GET' : String(raw.request.method).toUpperCase();
 		if (!VALID_METHODS.has(method)) {
-			warn(`change-probe ${label}: request.method must be GET, POST or HEAD, got ${String(raw.request.method)}`);
+			warn(`change-probe ${label}: request.method must be GET or POST, got ${String(raw.request.method)}`);
 			return null;
 		}
 		const body = raw.request.body === undefined || raw.request.body === null ? null : raw.request.body;
@@ -245,6 +247,19 @@ export const extractJsonLdOffers = (html) => {
 	if (!offers.length) return null;
 	offers.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 	return offers.flat();
+};
+
+/**
+ * Whether a probe request targets the SAME ORIGIN as the page it is probing for. This gates the
+ * origin security token and the staging-IP DNS pin: both belong to the served origin and MUST NOT
+ * reach a third-party host a rule happens to name — the same scoping rule the renderer applies to
+ * its bypass token (see the repo guide's origin-bypass lesson). Unparseable input reads as
+ * cross-origin, the fail-safe direction.
+ */
+export const isSameProbeOrigin = (targetUrl, probeUrl) => {
+	const target = URL.parse(targetUrl);
+	const probe = URL.parse(probeUrl);
+	return !!target && !!probe && target.origin === probe.origin;
 };
 
 /**

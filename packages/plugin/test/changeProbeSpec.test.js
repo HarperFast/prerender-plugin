@@ -22,6 +22,7 @@ import {
 	signatureOf,
 	extractJsonLdOffers,
 	buildProbeRequest,
+	isSameProbeOrigin,
 } from '../src/util/changeProbeSpec.js';
 
 const REQUEST_RULE = {
@@ -66,6 +67,14 @@ test('one invalid rule drops alone, with a warning naming it', () => {
 				request: { urlTemplate: 'https://x/$1', method: 'PUT' },
 				extract: ['a'],
 			},
+			// HEAD is refused at compile: extraction parses the body and a HEAD probe has none,
+			// so it would validate and then fail on every probe.
+			{
+				pathPattern: '^/f/',
+				source: 'request',
+				request: { urlTemplate: 'https://x/$1', method: 'HEAD' },
+				extract: ['a'],
+			},
 			{ pathPattern: '^/e/', request: { headers: { a: 1 } } }, // non-string header
 			{ ...REQUEST_RULE, label: 'good' }, // survives
 		],
@@ -73,7 +82,7 @@ test('one invalid rule drops alone, with a warning naming it', () => {
 	);
 	assert.equal(rules.length, 1);
 	assert.equal(rules[0].label, 'good');
-	assert.equal(warnings.length, 6);
+	assert.equal(warnings.length, 7);
 	assert.match(warnings[0], /rule\[0\]/);
 });
 
@@ -185,4 +194,17 @@ test('buildProbeRequest: request mode templates the endpoint, document mode prob
 	assert.equal(doc.body, null);
 
 	assert.equal(buildProbeRequest(requestRule, 'https://example.com/catalog/'), null);
+});
+
+test('isSameProbeOrigin gates the token: same origin only, fail-safe on garbage', () => {
+	// The security token and staging pin belong to the served origin; a rule naming a
+	// third-party endpoint must produce a PLAIN fetch. Unparseable input reads as cross-origin.
+	const page = 'https://www.example.com/product/prd-1/x';
+	assert.equal(isSameProbeOrigin(page, 'https://www.example.com/web/api/1?store=1'), true);
+	assert.equal(isSameProbeOrigin(page, 'https://api.example.com/price/1'), false); // subdomain differs
+	assert.equal(isSameProbeOrigin(page, 'http://www.example.com/web/api/1'), false); // scheme differs
+	assert.equal(isSameProbeOrigin(page, 'https://www.example.com:8443/web/api/1'), false); // port differs
+	assert.equal(isSameProbeOrigin(page, 'https://third-party.example/price/1'), false);
+	assert.equal(isSameProbeOrigin('not a url', 'https://www.example.com/x'), false);
+	assert.equal(isSameProbeOrigin(page, 'not a url'), false);
 });

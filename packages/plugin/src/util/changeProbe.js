@@ -62,6 +62,7 @@ import {
 	buildProbeRequest,
 	extractValues,
 	extractJsonLdOffers,
+	isSameProbeOrigin,
 	signatureOf,
 } from './changeProbeSpec.js';
 
@@ -86,13 +87,35 @@ export const probeRules = () => {
 };
 
 /**
- * One canary cohort per rule label, selected deterministically: every URL whose hash lands on the
- * stride. 1-in-16 spreads membership across the keyspace while letting the lazy build (below)
- * stop after examining only ~16x the cohort size instead of walking the whole registry.
+ * One canary cohort per rule label. A sweep-built cohort is the `count` matched URLs with the
+ * SMALLEST hashes — a deterministic, keyspace-uniform sample (taking the first `count` in key
+ * order would sample the alphabetical head of the corpus instead, i.e. the oldest product IDs on
+ * a commerce catalog). The bootstrap build (`ensureCohorts`) still uses a 1-in-16 hash stride so
+ * it can stop after ~16x the cohort size instead of walking the whole registry — its key-order
+ * bias is deliberate and temporary, replaced by the first sweep's sample.
  */
 const CANARY_STRIDE = 16;
 const isCanaryCandidate = (url) => fnv1a32(url) % CANARY_STRIDE === 0;
 let cohorts = new Map(); // rule label -> urls this node owns
+
+/** Bounded lowest-N-by-hash selection; prunes at 4x so an unbounded registry stays O(count) memory. */
+export const cohortCollector = (count) => {
+	const entries = [];
+	const prune = () => {
+		entries.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : 1));
+		entries.length = Math.min(entries.length, count);
+	};
+	return {
+		add(url) {
+			entries.push([fnv1a32(url), url]);
+			if (entries.length > count * 4) prune();
+		},
+		list() {
+			prune();
+			return entries.map(([, url]) => url);
+		},
+	};
+};
 
 const newStats = () => ({
 	examined: 0, // rows scanned
@@ -124,21 +147,24 @@ const readBounded = async (stream, maxBytes) => {
 };
 
 /**
- * One probe HTTP request. Same identity as every other origin fetch this plugin makes — the
- * configured desktop User-Agent plus the security token (probes are per-URL, not per-device:
- * the premise of watching these fields is that they are device-invariant) — and the same
- * staging-IP pinning the sitemap refresh uses, so the probe watches the origin the plugin serves.
+ * One probe HTTP request. The configured desktop User-Agent always rides along (probes are
+ * per-URL, not per-device: the premise of watching these fields is that they are
+ * device-invariant). The origin SECURITY TOKEN and the staging-IP DNS pin ride along ONLY for a
+ * same-origin probe — both belong to the served origin, and a `request`-mode rule may name any
+ * host, so sending them unconditionally would hand the bypass secret to (and mis-route DNS for) a
+ * third party. Same scoping rule the renderer applies to its own bypass token.
  */
-const probeFetch = async ({ url, method, headers, body }) => {
+const probeFetch = async ({ url, method, headers, body }, targetUrl) => {
 	const urlObj = new URL(url);
 	const timeout = config.changeProbe.requestTimeout;
-	const response = await dispatcherFor(configuredStagingIp()).request({
+	const sameOrigin = isSameProbeOrigin(targetUrl, url);
+	const response = await dispatcherFor(sameOrigin ? configuredStagingIp() : undefined).request({
 		origin: urlObj.origin,
 		path: urlObj.pathname + urlObj.search,
 		method,
 		headers: {
 			'user-agent': config.origin.userAgents.desktop,
-			[config.origin.securityToken.header]: config.origin.securityToken.value,
+			...(sameOrigin ? { [config.origin.securityToken.header]: config.origin.securityToken.value } : {}),
 			'accept-encoding': 'gzip',
 			...headers,
 		},
@@ -163,7 +189,13 @@ const probeFetch = async ({ url, method, headers, body }) => {
 const probeOnce = async (rule, url) => {
 	const request = buildProbeRequest(rule, url);
 	if (!request) return null;
-	const { statusCode, body } = await probeFetch(request);
+	const { statusCode, body } = await probeFetch(request, url);
+	if (statusCode >= 300 && statusCode < 400) {
+		// Fail-closed rather than followed: a silently followed redirect can move the probe onto a
+		// host the operator never named (and same-origin gating above would then be deciding about
+		// the wrong URL). A redirecting endpoint is a rule to fix, and the failure metrics say so.
+		throw new Error(`HTTP ${statusCode} (redirects are not followed — probe endpoints must answer directly)`);
+	}
 	if (statusCode < 200 || statusCode >= 300) throw new Error(`HTTP ${statusCode}`);
 	if (rule.source === 'request') return signatureOf(extractValues(JSON.parse(body), rule.extract));
 	const offers = extractJsonLdOffers(body);
@@ -354,6 +386,15 @@ async function* readCohortRows(urls) {
 	}
 }
 
+// Metric emission must never cost the pass or the trip action its outcome.
+const countProbe = (series) => {
+	try {
+		metrics.changeProbe(1, series);
+	} catch (e) {
+		logger.warn(`[prerender] change-probe ${series} not recorded: ${e?.message ?? String(e)}`);
+	}
+};
+
 const emitStats = (stats, kind) => {
 	try {
 		metrics.changeProbe(stats.probed, 'probed');
@@ -406,8 +447,8 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 	const limits = passLimits(dryRun);
 	try {
 		const rules = probeRules();
-		const nextCohorts = new Map(rules.map((rule) => [rule.label, []]));
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
+		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		const stats = await runProbePass({
 			rows: walkTargets(config.changeProbe.chunkSize),
 			rules,
@@ -417,13 +458,13 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 			write: writeSignature,
 			trigger: triggerRevalidate,
 			...limits,
-			isCanceled: () => !config.changeProbe.enabled,
-			collectCohort: (rule, url) => {
-				const cohort = nextCohorts.get(rule.label);
-				if (cohort.length < count && isCanaryCandidate(url)) cohort.push(url);
-			},
+			// A pending reseed cancels too: the pass that must stand down for it is this one.
+			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
+			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 		});
-		cohorts = nextCohorts;
+		// An interrupted pass keeps the OLD cohorts — a partial walk's sample covers only the key
+		// range it reached, and the chained reseed rebuilds them properly.
+		if (!stats.aborted) cohorts = new Map(rules.map((rule) => [rule.label, collectors.get(rule.label).list()]));
 		emitStats(stats, 'sweep');
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
@@ -441,7 +482,34 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 		throw e;
 	} finally {
 		sweepRunning = false;
+		// The trip's reseed, chained after this pass stood down for it. Cleared BEFORE the chained
+		// pass starts so the reseed does not cancel itself.
+		const chained = sweepInterrupt;
+		sweepInterrupt = null;
+		if (chained) runProbeSweepOnce({ dryRun: true, label: chained }).catch((e) => logger.error(e));
 	}
+};
+
+// The label of a reseed waiting for the running sweep to stand down, or null. See
+// `requestSweepReseed` — a plain "skip if running" here was the wrong shape, because a canary
+// trip lands DURING a sweep in exactly the scenario the canary exists for.
+let sweepInterrupt = null;
+
+/**
+ * Run a signature RESEED sweep (dry-run semantics: probe + re-baseline, trigger nothing) as soon
+ * as possible: immediately when no sweep is running, otherwise by interrupting the running pass —
+ * which notices via its cancellation check within a batch — and chaining the reseed when it
+ * exits. Without the interrupt, a trip mid-sweep silently kept the LIVE sweep dripping redundant
+ * re-renders of pages the invalidation already covers, and no reseed ever ran.
+ */
+export const requestSweepReseed = (label) => {
+	if (sweepRunning) {
+		sweepInterrupt = label;
+		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
+		return { chained: true };
+	}
+	runProbeSweepOnce({ dryRun: true, label }).catch((e) => logger.error(e));
+	return { chained: false };
 };
 
 /**
@@ -524,11 +592,7 @@ const actOnTrip = async (rule, fraction) => {
 	}
 	const reason = `change probe ${rule.label}: ${(fraction * 100).toFixed(1)}% of canary changed`.slice(0, 200);
 	await recordInvalidation({ scope, reason, updatedBy: `change-probe@${server.hostname}` });
-	try {
-		metrics.changeProbe(1, 'invalidated');
-	} catch {
-		// counted best-effort; the log line below is the record
-	}
+	countProbe('invalidated');
 	logger.warn(
 		`[prerender] change-probe canary for ${rule.label} invalidated "${scope}" (${reason}) — bots serve ` +
 			`origin for that scope until pages re-render; a reseed sweep is re-baselining signatures now`
@@ -540,8 +604,8 @@ const actOnTrip = async (rule, fraction) => {
 	// changed set dwarfs maxTriggersPerSweep, so a triggering sweep would leave most signatures
 	// stale and then drip re-renders of ALREADY-HEALED pages (a render never updates the
 	// signature; only a probe does) pass after pass until the baseline caught up.
-	runProbeSweepOnce({ dryRun: true, label: `reseed after invalidating ${scope}` }).catch((e) => logger.error(e));
-	return { acted: true, scope };
+	const { chained } = requestSweepReseed(`reseed after invalidating ${scope}`);
+	return { acted: true, scope, reseedChained: chained };
 };
 
 /**
@@ -587,11 +651,7 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 			const verdict = canaryVerdict(stats, { threshold: canary.threshold, minSample: canary.minSample });
 			let action = null;
 			if (verdict.tripped) {
-				try {
-					metrics.changeProbe(1, 'canary_trip');
-				} catch {
-					// counted best-effort
-				}
+				countProbe('canary_trip');
 				action = limits.dryRun ? { acted: false, reason: 'dry-run' } : await actOnTrip(rule, verdict.fraction);
 				if (limits.dryRun) {
 					logger.warn(
@@ -714,6 +774,7 @@ export const resetChangeProbeState = () => {
 	schedulerStarted = false;
 	armedSweep = armedCanary = null;
 	sweepRunning = canaryRunning = false;
+	sweepInterrupt = null;
 	lastSweep = lastCanary = null;
 	cohorts = new Map();
 	cohortBuildDone = false;

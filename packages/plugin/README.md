@@ -1188,7 +1188,10 @@ A **rule** (`changeProbe.rules`) says what to watch for the URLs its `pathPatter
   with `$1`..`$9` from the pattern's capture groups), extracting configured value paths from the
   JSON response. Typically a few KB against a render's seconds of CPU — but such endpoints are
   usually uncached and undocumented, so **agree the probe rate with whoever runs the origin**
-  (`ratePerSecond` is the knob) and expect the endpoint to change shape someday.
+  (`ratePerSecond` is the knob) and expect the endpoint to change shape someday. The origin
+  security token (and the staging-IP pin) ride along **only when the endpoint shares the probed
+  page's origin** — a rule naming a third-party host gets a plain fetch, never the bypass secret.
+  Redirects are not followed; a redirecting endpoint counts as a failed probe.
 
 The extracted values are reduced to a **signature** stored on the target (`probeSignature`); a
 probe that observes a different signature expires the URL's cached pages and files every device row

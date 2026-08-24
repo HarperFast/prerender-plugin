@@ -30,12 +30,14 @@ const sharedBufferStub = {
 };
 
 // resources/Target.js extends the raw table class at module scope, so it must be a class.
+// `search` returns an ITERABLE, not a promise of one — Harper's does, and `for await` over a
+// promise throws.
 class FakeTable {
 	static async get() {}
 	static async put() {}
 	static async patch() {}
 	static async delete() {}
-	static async search() {
+	static search() {
 		return [];
 	}
 }
@@ -151,8 +153,7 @@ test('dry run counts and re-baselines but never triggers', async () => {
 	assert.equal(stats.changed, 1);
 	assert.equal(stats.triggered, 0);
 	assert.deepEqual(triggered, []);
-	// Written in dry-run ON PURPOSE: each pass then reports fresh changes — the true change
-	// rate — instead of re-reporting the same delta forever (the demand-ladder precedent).
+	// Written in dry-run on purpose — see processOne in util/changeProbe.js for why.
 	assert.deepEqual(written, [{ url: URL_A, signature: '[2]' }]);
 });
 
@@ -257,4 +258,70 @@ test('canaryVerdict: no verdict below minSample, seeds and failures excluded fro
 	assert.equal(tripped.fraction, 0.1);
 	const held = canaryVerdict({ changed: 9, unchanged: 91 }, { threshold: 0.1, minSample: 50 });
 	assert.equal(held.tripped, false);
+});
+
+test('cohortCollector picks the lowest hashes — a keyspace sample, not the alphabetical head', async () => {
+	const { fnv1a32 } = await import('../src/util/hash.js');
+	const urls = Array.from({ length: 200 }, (_, i) => `https://example.com/product/prd-${i}/x`);
+	const expected = [...urls].sort((a, b) => fnv1a32(a) - fnv1a32(b) || (a < b ? -1 : 1)).slice(0, 5);
+
+	const forward = changeProbe.cohortCollector(5);
+	for (const url of urls) forward.add(url);
+	assert.deepEqual(forward.list(), expected);
+
+	// Insertion order must not matter (pruning at 4x count included), or two nodes walking
+	// different key ranges first would disagree about "the" sample.
+	const reversed = changeProbe.cohortCollector(5);
+	for (const url of [...urls].reverse()) reversed.add(url);
+	assert.deepEqual(reversed.list(), expected);
+});
+
+test('requestSweepReseed runs immediately when no sweep is running', async () => {
+	const status = () => changeProbe.changeProbeStatus();
+	assert.equal(status().sweep.lastRun, null);
+	const { chained } = changeProbe.requestSweepReseed('reseed-now');
+	assert.equal(chained, false);
+	while (!status().sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(status().sweep.lastRun.label, 'reseed-now');
+	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never trigger.
+	assert.equal(status().sweep.lastRun.dryRun, true);
+});
+
+test('requestSweepReseed interrupts a running sweep and chains the reseed after it stands down', async () => {
+	const { config } = await import('../src/config.js');
+	const savedChunk = config.changeProbe.chunkSize;
+	config.changeProbe.chunkSize = 3;
+	let releaseGate;
+	const gate = new Promise((resolve) => (releaseGate = resolve));
+	let searchCalls = 0;
+	globalThis.databases.render_service.Target = class extends FakeTable {
+		static async *search({ limit }) {
+			searchCalls++;
+			if (searchCalls === 1) {
+				// Exactly `limit` rows, so the walk comes back for a second chunk — and blocks there.
+				for (let i = 0; i < limit; i++) yield row(`https://example.com/other/${i}`);
+				return;
+			}
+			await gate;
+		}
+	};
+	try {
+		const live = changeProbe.runProbeSweepOnce({ label: 'live' });
+		while (!changeProbe.isProbeSweepRunning()) await new Promise((resolve) => setImmediate(resolve));
+
+		const { chained } = changeProbe.requestSweepReseed('reseed-after-trip');
+		assert.equal(chained, true);
+
+		releaseGate();
+		await live;
+		// The chained reseed is detached from the live pass's finally; wait for its record.
+		const status = () => changeProbe.changeProbeStatus();
+		while (status().sweep.lastRun?.label !== 'reseed-after-trip') {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.equal(status().sweep.lastRun.dryRun, true);
+	} finally {
+		config.changeProbe.chunkSize = savedChunk;
+		globalThis.databases.render_service.Target = FakeTable;
+	}
 });

@@ -790,8 +790,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'Product offers (price, currency, availability) — generic, works for any site with ' +
 					'standard product markup. "request": probe a configured endpoint instead.\n' +
 					'  request.urlTemplate  (request mode, required) absolute URL with $1..$9 replaced by ' +
-					'pathPattern’s capture groups, URI-component-encoded.\n' +
-					'  request.method   GET (default) | POST | HEAD.\n' +
+					'pathPattern’s capture groups, URI-component-encoded. The origin security token and the ' +
+					'staging-IP pin are attached ONLY when this endpoint shares the probed page’s origin — a ' +
+					'third-party host gets a plain fetch, never the bypass secret. Redirects are not followed ' +
+					'(a redirecting endpoint is a failed probe, and the failure metrics say so).\n' +
+					'  request.method   GET (default) | POST.\n' +
 					'  request.headers  extra request headers, e.g. { accept: "application/json" } — many JSON ' +
 					'endpoints require an explicit accept and fail with a 200-shaped error without it.\n' +
 					'  request.body     request body string (e.g. "{}").\n' +
@@ -860,8 +863,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			canary: group(
 				'The mass-change detector: a fixed per-node cohort probed on a fast cadence, tripping when a ' +
-					'large fraction changed in one pass. Cohort membership is deterministic (a 1-in-16 keyspace ' +
-					'sample, first `count` per rule per node) and rebuilt by every sweep.',
+					'large fraction changed in one pass. Cohort membership is deterministic — the `count` matched ' +
+					'URLs with the smallest hashes, a keyspace-uniform sample rebuilt by every sweep. (The ' +
+					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
+					'replaces it.)',
 				{
 					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
 						unit: 'ms',
