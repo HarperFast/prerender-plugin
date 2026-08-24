@@ -15,6 +15,7 @@ import {
 	seedOverrideFingerprint,
 	startOverrideWatch,
 } from './src/util/configOverride.js';
+import { startEventLoopLagMonitor } from './src/util/eventLoopLag.js';
 import { startQueueStatusSync, startReadySweep } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
@@ -99,6 +100,10 @@ export async function handleApplication(scope) {
 	// Start background work now that config is applied. All are idempotent and
 	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
 	// every node repairs the schedule rows it owns (see util/reconcile.js).
+	// EVERY WORKER, deliberately unlike the rest of these. The others self-gate to `workerIndex === 0`;
+	// this one has to run everywhere, because its whole purpose is to tell the worker that sweeps apart
+	// from the fifteen that do not. See util/eventLoopLag.js.
+	startEventLoopLagMonitor();
 	startQueueStatusSync();
 	startReadySweep();
 	startSitemapRefreshScheduler();
