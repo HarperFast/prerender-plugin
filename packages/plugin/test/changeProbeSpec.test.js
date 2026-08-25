@@ -23,6 +23,7 @@ import {
 	extractJsonLdOffers,
 	buildProbeRequest,
 	isSameProbeOrigin,
+	statusSignalFor,
 } from '../src/util/changeProbeSpec.js';
 
 const REQUEST_RULE = {
@@ -226,4 +227,59 @@ test('duplicate labels are uniquified, never silently merged', () => {
 	);
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /duplicate label/);
+});
+
+test('statusSignals: compiled in order, 2xx rejected, malformed entries dropped individually', () => {
+	const warnings = [];
+	const [rule] = compileProbeRules(
+		[
+			{
+				label: 'inventory',
+				pathPattern: '^/product/prd-([^/]+)',
+				source: 'request',
+				request: { urlTemplate: 'https://api.example.com/inv/$1' },
+				extract: ['price'],
+				statusSignals: [
+					{ status: 404, signature: 'gone' },
+					{ status: 400, contains: 'OOS_CODE', signature: 'unavailable' },
+					{ status: 200, signature: 'ignored' }, // 2xx is extracted normally
+					{ status: 999, signature: 'bad-status' },
+					{ status: 410, signature: '' }, // empty signature
+				],
+			},
+		],
+		warnings
+	);
+	assert.deepEqual(
+		rule.statusSignals,
+		[
+			{ status: 404, contains: null, signature: 'gone' },
+			{ status: 400, contains: 'OOS_CODE', signature: 'unavailable' },
+		],
+		'only the two well-formed non-2xx entries survive, in declared order'
+	);
+	assert.equal(warnings.length, 3, 'each dropped entry warned');
+	assert.ok(warnings.some((w) => /2xx/.test(w)));
+});
+
+test('statusSignalFor: first match wins and the contains guard is required to match', () => {
+	const [rule] = compileProbeRules([
+		{
+			label: 'inventory',
+			pathPattern: '^/p/(.+)',
+			source: 'request',
+			request: { urlTemplate: 'https://api.example.com/$1' },
+			extract: ['price'],
+			statusSignals: [
+				{ status: 400, contains: 'OOS_CODE', signature: 'unavailable' },
+				{ status: 400, signature: 'generic-400' },
+			],
+		},
+	]);
+	assert.equal(statusSignalFor(rule, 400, '{"errors":[{"code":"OOS_CODE"}]}'), 'unavailable');
+	// Same status, guard absent from the body -> falls through to the unguarded entry.
+	assert.equal(statusSignalFor(rule, 400, '{"errors":[{"code":"SOMETHING_ELSE"}]}'), 'generic-400');
+	assert.equal(statusSignalFor(rule, 503, 'anything'), null, 'undeclared status carries no signal');
+	assert.equal(statusSignalFor({ statusSignals: [] }, 400, 'x'), null);
+	assert.equal(statusSignalFor({}, 400, 'x'), null, 'a rule with no signals never throws');
 });

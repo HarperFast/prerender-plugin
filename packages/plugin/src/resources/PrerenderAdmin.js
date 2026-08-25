@@ -42,7 +42,7 @@
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
  *   GET  /prerender_admin/discovery-purge  this node's purge state super_user
  *   POST /prerender_admin/discovery-purge { urlPrefix, dryRun?,    super_user
- *                                    ratePerSecond?, force? } |
+ *                                    ratePerSecond?, force?, skipVisited? } |
  *                                    { action: 'stop' }
  *   POST /prerender_admin/backlog    { cap? } recompute the snapshot    super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
@@ -1188,9 +1188,11 @@ export class PrerenderAdmin extends Resource {
 	 * Start (or stop) a discovered-target purge on THIS node — the cleanup half of the discovery
 	 * gate; see util/discoveredPurge.js for the predicate, the owner scope and the GATE FIRST
 	 * interlock. `dryRun` defaults to TRUE, so a bare start is a census: `deleted` then counts
-	 * what a real run would remove. The pass is detached and paced (`ratePerSecond` targets per
-	 * second, default 200); progress is on GET /prerender_admin/discovery-purge, and
-	 * `{ action: 'stop' }` ends it at the next row.
+	 * what a real run would remove. `skipVisited` spares targets the demand ladder has promoted —
+	 * durable evidence of repeat crawler demand on a page no sitemap declares; see
+	 * util/discoveredPurge.js for why that test is deliberately one-sided. The pass is detached and
+	 * paced (`ratePerSecond` targets per second, default 200); progress is on
+	 * GET /prerender_admin/discovery-purge, and `{ action: 'stop' }` ends it at the next row.
 	 */
 	static discoveryPurge(data) {
 		if (data?.action === 'stop') {
@@ -1206,6 +1208,7 @@ export class PrerenderAdmin extends Resource {
 				dryRun,
 				ratePerSecond,
 				force: data?.force === true,
+				skipVisited: data?.skipVisited === true,
 			});
 			return json({ node: server.hostname, ...result });
 		} catch (e) {

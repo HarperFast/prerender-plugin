@@ -118,7 +118,79 @@ const compileRule = (raw, index, warn) => {
 		invalidateScope = raw.invalidateScope;
 	}
 
-	return { label, pathPattern, patternSource: raw.pathPattern, source, request, extract, invalidateScope };
+	// Statuses this endpoint uses to SAY something, rather than to fail. Compiled in declared
+	// order; the first whose status matches (and whose `contains` guard, if given, is present in
+	// the body) supplies the signature. Dropped individually so one malformed entry does not cost
+	// the rule its whole probe.
+	const statusSignals = [];
+	if (raw.statusSignals !== undefined && raw.statusSignals !== null) {
+		if (!Array.isArray(raw.statusSignals)) {
+			warn(`change-probe ${label}: statusSignals must be an array of { status, signature, contains? }`);
+			return null;
+		}
+		for (const [i, sig] of raw.statusSignals.entries()) {
+			const status = Number(sig?.status);
+			if (!Number.isInteger(status) || status < 100 || status > 599) {
+				warn(`change-probe ${label}: statusSignals[${i}].status must be an HTTP status 100-599`);
+				continue;
+			}
+			// A 2xx already runs normal extraction; letting a signal shadow it would silently
+			// replace real values with a constant and hide a broken extract path.
+			if (status >= 200 && status < 300) {
+				warn(
+					`change-probe ${label}: statusSignals[${i}] declares a 2xx status — 2xx responses are extracted ` +
+						`normally, so this signal is ignored`
+				);
+				continue;
+			}
+			if (typeof sig.signature !== 'string' || sig.signature === '') {
+				warn(`change-probe ${label}: statusSignals[${i}].signature must be a non-empty string`);
+				continue;
+			}
+			if (sig.contains !== undefined && sig.contains !== null && typeof sig.contains !== 'string') {
+				warn(`change-probe ${label}: statusSignals[${i}].contains must be a string`);
+				continue;
+			}
+			statusSignals.push({
+				status,
+				contains: sig.contains === undefined || sig.contains === null || sig.contains === '' ? null : sig.contains,
+				signature: sig.signature,
+			});
+		}
+	}
+
+	return {
+		label,
+		pathPattern,
+		patternSource: raw.pathPattern,
+		source,
+		request,
+		extract,
+		invalidateScope,
+		statusSignals,
+	};
+};
+
+/**
+ * The signature a declared status signal assigns to this response, or null when none applies.
+ *
+ * WHY THIS EXISTS. An endpoint's non-2xx is not always a failure: some APIs answer a legitimate
+ * state with an error status — most usefully "this product is sold out" as a 4xx with an error
+ * code in the body. Without this the probe reads that as a failed probe, leaves the signature
+ * untouched and triggers nothing, so the one transition that most needs detecting (available ->
+ * unavailable) is exactly the one it cannot see.
+ *
+ * The signature is an OPAQUE LITERAL, compared for equality like any other. That is what makes the
+ * transition detectable in both directions: an in-stock product's extracted values differ from the
+ * literal, so selling out changes the signature, and restocking changes it back.
+ */
+export const statusSignalFor = (rule, statusCode, body) => {
+	for (const signal of rule?.statusSignals ?? []) {
+		if (signal.status !== statusCode) continue;
+		if (signal.contains !== null && !String(body ?? '').includes(signal.contains)) continue;
+		return signal.signature;
+	}
+	return null;
 };
 
 /**

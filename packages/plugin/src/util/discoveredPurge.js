@@ -38,6 +38,18 @@ import { Target, cacheKeysOf } from '../resources/Target.js';
 import { classifyUrl, PRERENDER } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
+import { walkUrlRange } from './urlWalk.js';
+
+/**
+ * Has the demand ladder stamped a rung on this target? Coerced before the finite check for the
+ * reason `resolveRenderInterval` does it: a `Long` column can surface as a BigInt, which
+ * `Number.isFinite` rejects outright — and here that would read a VISITED page as unvisited and
+ * delete it, so the coercion is load-bearing rather than tidy.
+ */
+const isVisited = (demandInterval) => {
+	const rung = Number(demandInterval);
+	return Number.isFinite(rung) && rung > 0;
+};
 
 const YIELD_EVERY = 200;
 const CHUNK_SIZE = 10_000;
@@ -47,32 +59,20 @@ const DELETE_BATCH = 20;
 const MAX_CONSECUTIVE_ERRORS = 25;
 
 /** The registry slice under `urlPrefix`, streamed in cursor-bounded chunks (see module comment). */
-export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE) {
-	let cursor = null;
-	while (true) {
-		const chunk = [];
-		for await (const row of table.search({
-			conditions: [
-				{
-					attribute: 'url',
-					comparator: cursor === null ? 'greater_than_equal' : 'greater_than',
-					value: cursor ?? urlPrefix,
-				},
-			],
-			sort: { attribute: 'url' },
-			select: ['url', 'sitemapUrl'],
-			limit: chunkSize,
-		})) {
-			chunk.push(row);
-		}
-		if (!chunk.length) return;
-		for (const row of chunk) {
-			// Rows are key-ordered, so the first URL outside the prefix ends the whole walk.
-			if (!row.url.startsWith(urlPrefix)) return;
-			yield row;
-		}
-		if (chunk.length < chunkSize) return;
-		cursor = chunk[chunk.length - 1].url;
+export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE, onUnreadable) {
+	// The exclusive upper key for the verification probes: the prefix with its last character
+	// incremented, so a row from the NEXT keyspace region can neither resume nor fail this walk.
+	const endBound = urlPrefix.slice(0, -1) + String.fromCharCode(urlPrefix.charCodeAt(urlPrefix.length - 1) + 1);
+	for await (const row of walkUrlRange(table, {
+		startAt: urlPrefix,
+		select: ['url', 'sitemapUrl', 'demandInterval'],
+		chunkSize,
+		onUnreadable,
+		endBound,
+	})) {
+		// Rows are key-ordered, so the first URL outside the prefix ends the whole walk.
+		if (!row.url.startsWith(urlPrefix)) return;
+		yield row;
 	}
 }
 
@@ -93,6 +93,7 @@ export const purgeDiscoveredTargets = async ({
 	deleteTarget,
 	dryRun,
 	ratePerSecond,
+	skipVisited = false,
 	batchSize = DELETE_BATCH,
 	isCanceled = () => false,
 	now = Date.now,
@@ -170,6 +171,22 @@ export const purgeDiscoveredTargets = async ({
 		if (row.sitemapUrl !== null && row.sitemapUrl !== undefined && row.sitemapUrl !== '') continue;
 		stats.discovered++;
 
+		// `skipVisited` spares anything the demand ladder has PROMOTED. A stored `demandInterval`
+		// is not a guess: the ladder writes a rung only after a bot visited the URL in each of
+		// `promoteWindows` consecutive windows, so it is durable evidence of repeat crawler demand
+		// on a page no sitemap declares. Measured on a commerce corpus, 40% of never-declared
+		// product pages carried one — deleting those would discard live, served pages and let the
+		// crawler re-mint them, paying a delete and a re-render to arrive back where we started.
+		//
+		// It is a ONE-SIDED test, deliberately: a stamp proves demand, its absence only means no
+		// repeat visit was observed within the ladder's windows. That asymmetry is the safe
+		// direction here — the cost of sparing a dead page is one row, the cost of deleting a live
+		// one is a re-mint cycle and a cache miss for whoever asked.
+		if (skipVisited && isVisited(row.demandInterval)) {
+			stats.visitedSkipped++;
+			continue;
+		}
+
 		// Defer anything in flight, exactly as the orphan sweep does: correctness does not
 		// depend on it (a result whose target is gone retires its own schedule row), but the
 		// un-target-guarded PrerenderedPage.put on that path would strand a page record.
@@ -190,10 +207,12 @@ export const purgeDiscoveredTargets = async ({
 
 const newStats = () => ({
 	examined: 0,
+	unreadable: 0,
 	owned: 0,
 	discovered: 0,
 	leaseSkipped: 0,
 	deleted: 0,
+	visitedSkipped: 0,
 	errors: 0,
 	errorSamples: [],
 	abortedOnErrors: false,
@@ -248,7 +267,13 @@ const badRequest = (message) => Object.assign(new Error(message), { statusCode: 
  * Start one detached, owner-scoped purge pass on THIS node. Returns the initial state;
  * progress and the outcome live on `getDiscoveredPurgeState`.
  */
-export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond = 200, force = false } = {}) => {
+export const startDiscoveredPurge = ({
+	urlPrefix,
+	dryRun = true,
+	ratePerSecond = 200,
+	force = false,
+	skipVisited = false,
+} = {}) => {
 	if (state?.running) return { started: false, alreadyRunning: true, state };
 	const refusal = validatePurgePrefix(urlPrefix, { force });
 	if (refusal) throw refusal;
@@ -260,6 +285,7 @@ export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond =
 		urlPrefix,
 		dryRun,
 		ratePerSecond,
+		skipVisited,
 		startedAt: Date.now(),
 		finishedAt: null,
 		error: null,
@@ -269,7 +295,9 @@ export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond =
 
 	const stats = state;
 	purgeDiscoveredTargets({
-		rows: walkPrefix(databases.render_service.Target, urlPrefix),
+		rows: walkPrefix(databases.render_service.Target, urlPrefix, undefined, () => {
+			stats.unreadable++;
+		}),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
 		// Any leased device key defers the whole target — the delete takes every device with it.
@@ -280,6 +308,7 @@ export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond =
 		deleteTarget: (url) => Target.delete(url),
 		dryRun,
 		ratePerSecond,
+		skipVisited,
 		isCanceled: () => cancelRequested,
 		stats,
 	})
@@ -298,6 +327,8 @@ export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond =
 					// Skipped rows are retried by the next pass, so a pass that ended with them is
 					// INCOMPLETE for its prefix even when it reports no error — say so here rather
 					// than leaving an operator to infer it from a count that does not add up.
+					`${stats.visitedSkipped ? `, ${stats.visitedSkipped} spared as bot-visited` : ''}` +
+					`${stats.unreadable ? `, ${stats.unreadable} unreadable row(s) skipped` : ''}` +
 					`${stats.errors ? `, ${stats.errors} failed and left for the next pass` : ''})` +
 					`${stats.error ? ` — error: ${stats.error}` : ''}`
 			);

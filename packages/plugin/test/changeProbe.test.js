@@ -578,3 +578,29 @@ test('origin backoff: the pacing wait can never exceed setTimeout’s 32-bit cap
 	assert.equal(waits.length, 1);
 	assert.ok(waits[0] <= 2147483647, `wait was ${waits[0]}`);
 });
+
+test('a trip hard-expires the page PAST the swr window — a known-wrong page is never served again', async () => {
+	// The real trigger, not the injected port: the property under test is the expiry VALUE it
+	// writes. A trip means the probed fields provably changed, so the page must not ride the
+	// stale-while-revalidate window the way a merely-late re-render does — the patched expiresAt
+	// has to land at least swrTtl in the past, where resolveServeStatus refuses it outright.
+	const { config } = await import('../src/config.js');
+	const patched = [];
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get({ id }) {
+			return { cacheKey: id, expiresAt: Date.now() + HOUR };
+		}
+		static async patch(id, fields) {
+			patched.push({ id, ...fields });
+		}
+	};
+	const before = Date.now();
+	await changeProbe.triggerRevalidate(row('https://example.com/product/prd-a/'));
+	assert.ok(patched.length >= 1, 'at least one device cacheKey was expired');
+	for (const p of patched) {
+		assert.ok(
+			p.expiresAt <= before - config.page.swrTtl,
+			`expiresAt ${p.expiresAt} is not backdated past swrTtl (${config.page.swrTtl}) from ${before}`
+		);
+	}
+});

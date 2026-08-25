@@ -832,6 +832,20 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'"payload.products[0].prices[0].salePrice" — the extracted values ARE the watched content; ' +
 					'everything else in the response is ignored. An extraction where every path yields null is a ' +
 					'FAILED probe, never a new signature, so an endpoint shape change cannot mass-trigger.\n' +
+					'  statusSignals    optional [{ status, signature, contains? }] — statuses this endpoint uses ' +
+					'to SAY something rather than to fail, mapped to a fixed signature. An endpoint that answers ' +
+					'a legitimate state with an error status (most usefully "no longer available" as a 4xx with ' +
+					'a code in the body) is otherwise read as a failed probe, which leaves the signature ' +
+					'untouched and triggers nothing — so the one transition that most needs detecting, ' +
+					'available -> unavailable, is exactly the one the probe cannot see. The signature is an ' +
+					'opaque literal compared for equality like any other, so the transition is detected in BOTH ' +
+					'directions. `contains` guards on a body substring (match the endpoint’s error CODE, not its ' +
+					'prose, which gets reworded). Only non-2xx statuses may carry a signal; a 2xx is extracted ' +
+					'normally. A declared signal outranks the origin-pushback classification, so do not declare ' +
+					'one for 429/503 unless that status really is a state on this endpoint rather than an ' +
+					'overloaded origin. CAUTION: if the endpoint starts answering the signaled status for ' +
+					'EVERYTHING, every matched URL flips to the same signature at once — bounded by ' +
+					'`maxTriggersPerSweep`, and the canary treats it as the mass change it looks like.\n' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
 					'records on a mass change. Empty = the canary detects and logs only.\n' +
 					'  label            optional name for logs and the admin surface.',
