@@ -270,17 +270,25 @@ const probeOnce = async (rule, url) => {
 };
 
 /**
- * Re-render one changed URL now — the same shape as `Target.revalidate`'s per-URL apply: expire
- * the cached pages (they leave the fresh window and serve stale-while-revalidate until the render
- * lands) and file every device row at the current minute. Owner-scoped by the sweep, so the
- * funnel's floor lowering covers these keys on the node whose claim scan reads them.
+ * Re-render one changed URL now: hard-expire the cached pages and file every device row at the
+ * current minute. Owner-scoped by the sweep, so the funnel's floor lowering covers these keys on
+ * the node whose claim scan reads them.
+ *
+ * The expiry is backdated PAST the stale-while-revalidate window, not set to now. A trip means
+ * the page's probed fields (price/availability) provably changed, so one more serve is a served
+ * mismatch — the swr window exists to smooth over a LATE re-render of content that is presumed
+ * still right, and a tripped page is the one case where it is known wrong. This matches the hard
+ * stop the canary's bulk-invalidation epoch already applies (`resolveServeStatus` refuses an
+ * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
+ * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
-const triggerRevalidate = async (row) => {
+export const triggerRevalidate = async (row) => {
 	const keys = cacheKeysOf(row.url);
+	const hardExpiredAt = Date.now() - config.page.swrTtl;
 	await Promise.all(
 		keys.map(async (cacheKey) => {
 			const page = await pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
-			if (page) await pageTable().patch(cacheKey, { expiresAt: Date.now() });
+			if (page) await pageTable().patch(cacheKey, { expiresAt: hardExpiredAt });
 		})
 	);
 	// The current minute PER TRIGGER, never captured once for a whole pass — a paced sweep runs for
