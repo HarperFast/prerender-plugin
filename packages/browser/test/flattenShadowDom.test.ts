@@ -27,15 +27,38 @@ const SHADOW_FIXTURE = `<!doctype html><html><head><title>shadow</title>
 </script>
 </body></html>`;
 
+// The INBOUND direction: a page-level reset that could never reach shadow content while the
+// boundary existed, plus slotted content that the page legitimately styles and must keep styling.
+const INBOUND_FIXTURE = `<!doctype html><html><head><title>inbound</title>
+<style>
+  svg { display: block; }                 /* a Preflight-style reset — the canonical leak */
+  .page-tint { color: rgb(0, 128, 0); }   /* page styling for SLOTTED content */
+  p { margin-left: 40px; }                /* element-level page rule */
+</style>
+</head><body>
+<div id="widget"><span class="page-tint" id="slotted">slotted text</span></div>
+<script>
+  const host = document.getElementById('widget');
+  const sr = host.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = 'p { margin-left: 7px; } .inner { letter-spacing: 3px; }';
+  sr.appendChild(style);
+  sr.innerHTML += '<span id="stars">' +
+    '<svg id="s1" width="10" height="10"></svg><svg id="s2" width="10" height="10"></svg>' +
+    '<svg id="s3" width="10" height="10"></svg></span>' +
+    '<p id="para">shadow paragraph</p><div class="inner" id="inner">inner</div><slot></slot>';
+</script>
+</body></html>`;
+
 const NO_SCROLL = { scroll: { enabled: false } } as const;
 
 let server: http.Server;
 let base = '';
 
 before(async () => {
-	server = http.createServer((_req, res) => {
+	server = http.createServer((req, res) => {
 		res.setHeader('content-type', 'text/html; charset=utf-8');
-		res.end(SHADOW_FIXTURE);
+		res.end(req.url?.startsWith('/inbound') ? INBOUND_FIXTURE : SHADOW_FIXTURE);
 	});
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 	base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -97,4 +120,57 @@ test('the scoping token is minted per host and is compact', async () => {
 	// multiplied by the rule count of the whole page — it is deliberately short, and never quoted.
 	assert.ok(!r.html.includes('data-shadow-host'), 'the long legacy spelling must not come back');
 	assert.ok(!/\[data-sh="/.test(r.html), 'the selector form stays unquoted');
+});
+
+test('page CSS does not reach flattened shadow content, but still styles slotted content', async () => {
+	const r = await renderOnce({
+		url: `${base}/inbound`,
+		config: { ...NO_SCROLL, postProcess: { flattenShadowDom: true } },
+	});
+	assert.match(
+		r.html,
+		/\[data-sh=s\d+\] \*:where\(:not\(\[data-sl\],\[data-sl\] \*\)\)\{all:revert\}/,
+		'the scoped reset is emitted'
+	);
+
+	// Re-render the serialized output and check what actually computes.
+	const replay = http.createServer((_q, res) => {
+		res.setHeader('content-type', 'text/html; charset=utf-8');
+		res.end(r.html);
+	});
+	await new Promise<void>((resolve) => replay.listen(0, '127.0.0.1', resolve));
+	try {
+		const check = await renderOnce({
+			url: `http://127.0.0.1:${(replay.address() as AddressInfo).port}/`,
+			config: NO_SCROLL,
+			probes: {
+				computed: ({ page }) =>
+					page.evaluate(() => {
+						const cs = (id: string) => getComputedStyle(document.getElementById(id)!);
+						const svgs = ['s1', 's2', 's3'].map((id) => document.getElementById(id)!.getBoundingClientRect().top);
+						return {
+							svgDisplay: cs('s1').display,
+							starsHorizontal: new Set(svgs.map(Math.round)).size === 1,
+							paraMargin: cs('para').marginLeft,
+							innerSpacing: cs('inner').letterSpacing,
+							slottedColor: cs('slotted').color,
+						};
+					}),
+			},
+		});
+		const c = check.probes.computed as Record<string, unknown>;
+
+		// 1. The page's `svg{display:block}` must NOT reach the flattened widget.
+		assert.equal(c.svgDisplay, 'inline', "the page's svg reset must not reach flattened content");
+		assert.equal(c.starsHorizontal, true, 'the three svgs stay on one line');
+
+		// 2. The shadow root's OWN rules must still beat the reset — both element and class form.
+		assert.equal(c.paraMargin, '7px', "the shadow's own `p` rule must beat both the page rule and the reset");
+		assert.equal(c.innerSpacing, '3px', "the shadow's own class rule must survive the reset");
+
+		// 3. Slotted content was always light DOM — the page must still style it.
+		assert.equal(c.slottedColor, 'rgb(0, 128, 0)', 'slotted content keeps its page styling');
+	} finally {
+		replay.close();
+	}
 });

@@ -761,7 +761,12 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 					const assigned = slot.assignedNodes();
 					const replacement = document.createDocumentFragment();
 					if (assigned.length > 0) {
-						for (const node of assigned) replacement.appendChild(node);
+						// Slotted nodes were ALWAYS light DOM and were always styled by the page, so
+						// they must be exempt from the author-style reset below. Mark their roots.
+						for (const node of assigned) {
+							if (node.nodeType === 1) (node as Element).setAttribute('data-sl', '');
+							replacement.appendChild(node);
+						}
 					} else {
 						while (slot.firstChild) replacement.appendChild(slot.firstChild);
 					}
@@ -771,11 +776,27 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				// then move the resolved shadow tree into the host as direct children — so
 				// `:host > x` / descendant relationships survive (a wrapper would break `>`).
 				while (host.firstChild) host.removeChild(host.firstChild);
-				if (css) {
-					const style = document.createElement('style');
-					style.textContent = css;
-					host.appendChild(style);
-				}
+				// Restore the INBOUND half of the encapsulation the boundary provided. Outbound is
+				// handled by prefixing every shadow rule with `hostSel`; inbound is this. Without
+				// it the page's own rules — which could never reach this markup while it sat behind
+				// a shadow root — apply the moment it lands in the light DOM. A Tailwind Preflight
+				// `svg{display:block}` is the canonical case: it turns a five-star rating widget
+				// into a vertical column, because inside the shadow root it never applied.
+				//
+				// `all: revert` drops author-level declarations, which is exactly what the boundary
+				// did, while inherited properties still inherit (as they do through a real boundary).
+				//
+				// The specificity is load-bearing and deliberately (0,1,0):
+				//   - it BEATS the page's element-selector resets (0,0,1), which is the whole point;
+				//   - it LOSES to every rewritten shadow rule — `[data-sh] button` (0,1,1) and
+				//     `[data-sh] .cls` (0,2,0) — so the component's own styling still wins;
+				//   - the `:not()` is wrapped in `:where()` so the exemption contributes NOTHING to
+				//     specificity. Written bare, `:not([data-sl] *)` would raise this to (0,2,0) and
+				//     start beating the shadow rules it must lose to.
+				const reset = `${hostSel} *:where(:not([data-sl],[data-sl] *)){all:revert}\n`;
+				const style = document.createElement('style');
+				style.textContent = reset + css;
+				host.appendChild(style);
 				for (const node of [...sr.childNodes]) {
 					if (captured.has(node)) continue; // its rules are already in the scoped block
 					host.appendChild(node);
