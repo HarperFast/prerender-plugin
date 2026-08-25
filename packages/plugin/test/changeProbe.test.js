@@ -711,19 +711,52 @@ test('a page disagreement still triggers on a URL the probe has never baselined'
 	assert.deepEqual(triggered, [URL_A]);
 });
 
-test('a signature write PRESERVES the page claim — put replaces the row, so it must carry it', async () => {
-	// writeSignature is a put (patch cannot create, and the seed write is by definition to a
-	// missing row). put replaces, so an unrelated signature write must not erase the claim the
-	// render path owns — otherwise the very next pass has nothing to compare and the feature
-	// silently stops detecting.
+test('the SEED write carries the page claim through — put replaces the row it seeds', async () => {
+	// A row created by recordPageClaim has a claim but no signature. The probe's first pass over
+	// it takes the seed path, and writeSignature is a put (patch cannot create) — so the seed must
+	// carry the render path's claim or seeding would erase it and the feature would silently stop
+	// detecting on exactly the freshly-rendered pages it exists for.
 	const claim = JSON.stringify([['35.99'], true]);
-	const { written } = await runPageCheckPass({
+	const { stats, written, triggered } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: JSON.stringify([39.99, 35.99, 35.99, true]) },
+		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: claim } },
+	});
+	assert.equal(stats.seeded, 1);
+	assert.deepEqual(triggered, []);
+	assert.equal(written.length, 1);
+	assert.equal(written[0].pageSignature, claim, 'the seed write must carry the page claim through');
+});
+
+test('ANY acted trip clears the claim — a drift trip too, not just a page disagreement', async () => {
+	// The trip hard-expired the page, so its claim no longer describes anything served — and a
+	// preserved claim disagrees with the NEW baseline by construction on a price drift, which
+	// would re-trip the same (already expired, already filed) page on every subsequent pass until
+	// its re-render lands.
+	const claim = JSON.stringify([['35.99'], true]); // agrees with the CURRENT origin answer
+	const { stats, written, triggered } = await runPageCheckPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: JSON.stringify([39.99, 35.99, 35.99, true]) },
 		stored: { [URL_A]: { signature: JSON.stringify([1, 2, 3, true]), probedAt: NaN, pageSignature: claim } },
 	});
+	assert.equal(stats.changed, 1);
+	assert.equal(stats.pageMismatch, 0, 'the page agrees with the origin — this is drift only');
+	assert.deepEqual(triggered, [URL_A]);
 	assert.equal(written.length, 1);
-	assert.equal(written[0].pageSignature, claim, 'a drift write must carry the page claim through');
+	assert.equal(written[0].pageSignature, null, 'an acted trip must clear the claim');
+});
+
+test('a DRY-RUN drift write preserves the claim — nothing was expired, the gauge must keep reading', async () => {
+	const claim = JSON.stringify([['29.99'], true]);
+	const { written, triggered } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: JSON.stringify([39.99, 35.99, 35.99, true]) },
+		stored: { [URL_A]: { signature: JSON.stringify([1, 2, 3, true]), probedAt: NaN, pageSignature: claim } },
+		dryRun: true,
+	});
+	assert.deepEqual(triggered, []);
+	assert.equal(written.length, 1);
+	assert.equal(written[0].pageSignature, claim, 'dry-run must not clear the claim');
 });
 
 /**

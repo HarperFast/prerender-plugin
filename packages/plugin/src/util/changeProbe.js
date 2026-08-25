@@ -523,12 +523,14 @@ export const runProbePass = async ({
 		try {
 			await trigger(row);
 			stats.triggered++;
-			// The page's claim is CLEARED when we acted on a disagreement — otherwise every
-			// subsequent pass re-detects the same one and re-spends the trigger budget on a page
-			// already expired and already filed. The next render writes a fresh claim; until then
-			// there is nothing to compare, which is the correct "I don't know" state. Folded into
-			// this write so it costs no second round trip.
-			await write(row.url, observed, pageDisagrees ? null : (stored?.pageSignature ?? null));
+			// The page's claim is CLEARED on EVERY acted trip, not just a page disagreement: the
+			// trip hard-expired the page, so whatever the claim described is no longer served — and
+			// a preserved claim would re-detect against the NEW baseline on the next pass (a price
+			// drift's old claim disagrees with the new price by construction) and re-spend the
+			// trigger budget on a page already expired and already filed. The next render writes a
+			// fresh claim; until then there is nothing to compare, which is the correct "I don't
+			// know" state. Folded into this write so it costs no second round trip.
+			await write(row.url, observed, null);
 		} catch (e) {
 			stats.errors++;
 			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
