@@ -232,14 +232,26 @@ page height unchanged.
 | homepage desktop | 0.74 MB | 0.65 MB | −12.1% |
 | homepage mobile  | 0.57 MB | 0.48 MB | −15.7% |
 
-The sixth (homepage desktop) drifts sub-pixel, and it is worth knowing why rather than filing it
-under noise. Nine elements resolve a font-size of `9.99999px` where they had `10px`, which
-propagates into line-height and margins and moves the page by 0.6 px in 7,577 (0.008%). No rule was
-lost — those elements' font-size rules are identical in number and in text on both sides. They are
-`em`-chained (`0.625em`, `0.83333em`), and Chrome accumulates float error through an `em` chain
-differently depending on how computed-style objects are shared. Rewriting a stylesheet at all is
-enough to trigger it: a control that re-serialized the sheets and deleted _nothing_ produced the
-same drift.
+The sixth (homepage desktop) genuinely renders differently, and the honest size of it is: **1.01% of
+fold pixels change** (13,150 px, 2,880 of them strongly), and the page ends 1 px shorter. That is
+larger than a "rounding" story suggests, so here is what it actually is.
+
+Every underlying difference is float precision. Across 3,845 elements, **exactly one** moves 1 px or
+more — an inline `<a>` whose x shifts 5.5 px as accumulated sub-pixel width changes re-break a line.
+The other 1,785 differences are all sub-1px: `width`/`height` by ~0.01 px, nine `font-size` values
+resolving `9.99999px` where they had `10px`, `text-decoration` thickness `1px` → `0.999999px`. Text
+shifted a fraction of a pixel re-rasterises, and re-rasterised glyph edges are what those 13,150
+pixels are.
+
+**No rule is lost.** The font-size rules matching the drifting elements are identical in number and
+in text on both sides; they are `em`-chained (`0.625em`, `0.83333em`), and Chrome accumulates float
+error through an `em` chain differently depending on how computed-style objects are shared —
+deleting rules changes that sharing.
+
+Attribution was checked rather than assumed, because the obvious guess is wrong. Re-serialising the
+sheets is **not** what does it: a control that re-rendered the same stored page with the flag _off_ —
+same extra pass, same re-emission, nothing deleted — differs by **0 px**. Deleting the rules is what
+moves the pixels. Worth knowing before blaming `minifyInlineCss` for a similar drift elsewhere.
 
 Two measurement traps are worth recording, because both manufacture false alarms here.
 Computed-style property **enumeration order is not stable** — Chrome lists custom properties in
