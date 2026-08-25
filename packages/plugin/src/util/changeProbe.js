@@ -341,7 +341,12 @@ const clearPageSignature = (url) => probeStateTable().patch(url, { pageSignature
  */
 export const recordPageClaim = async (url, structuredOffers) => {
 	try {
-		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(new URL(url).pathname));
+		// Parse ONCE, outside the predicate: this runs per render, and `find` would otherwise
+		// re-parse the same URL for every rule it tests. `URL.parse` over `new URL` is the repo
+		// idiom (it returns null instead of throwing on a malformed value).
+		const pathname = URL.parse(url)?.pathname;
+		if (!pathname) return;
+		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(pathname));
 		if (!rule) return;
 		if (!structuredOffers) {
 			// The renderer did not send the page's offers. There is deliberately NO fallback to

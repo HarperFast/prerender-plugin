@@ -270,18 +270,22 @@ export const apiClaimOf = (values, pageCheck) => {
  */
 export const claimsDisagree = (pageClaim, apiClaim) => {
 	if (!pageClaim || !apiClaim) return false;
-	let page, api;
 	try {
-		page = JSON.parse(pageClaim);
-		api = JSON.parse(apiClaim);
+		const page = JSON.parse(pageClaim);
+		const api = JSON.parse(apiClaim);
+		// Shape-check INSIDE the try, and destructure only after. A stored claim is data from a
+		// previous release (or a corrupted row), so it may be any JSON at all — destructuring a
+		// non-array throws, and this runs inside the sweep's per-URL path where an uncaught throw
+		// would end the whole pass. Anything unrecognisable reads as "no comparable claim".
+		if (!Array.isArray(page) || !Array.isArray(api)) return false;
+		const [pagePrices, pageInStock] = page;
+		const [apiPrices, apiInStock] = api;
+		if (!Array.isArray(pagePrices) || !Array.isArray(apiPrices)) return false;
+		if (apiInStock !== pageInStock) return true;
+		return apiPrices.length > 0 && !apiPrices.every((price) => pagePrices.includes(price));
 	} catch {
 		return false;
 	}
-	const [pagePrices, pageInStock] = page;
-	const [apiPrices, apiInStock] = api;
-	if (apiInStock !== pageInStock) return true;
-	if (apiPrices.length && !apiPrices.every((p) => pagePrices.includes(p))) return true;
-	return false;
 };
 
 /**

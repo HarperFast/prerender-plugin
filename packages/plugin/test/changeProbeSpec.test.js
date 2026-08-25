@@ -369,3 +369,13 @@ test('apiClaimOf projects through the mapping; absent mapped fields yield no cla
 	assert.equal(apiClaimOf([null, null, null, null], pc), null);
 	assert.equal(apiClaimOf([1, 2, 3, true], null), null);
 });
+
+test('claimsDisagree survives a corrupted stored claim instead of ending the sweep', async () => {
+	// A stored claim is data from a previous release or a damaged row — it may be any JSON.
+	// Destructuring a non-array would throw inside the sweep's per-URL path and end the pass.
+	const good = JSON.stringify([['35.99'], true]);
+	for (const junk of ['null', '5', '"a string"', '{"not":"an array"}', '[]', '[null,null]', '[{},true]']) {
+		assert.equal(claimsDisagree(junk, good), false, `page claim ${junk} must not throw or disagree`);
+		assert.equal(claimsDisagree(good, junk), false, `api claim ${junk} must not throw or disagree`);
+	}
+});
