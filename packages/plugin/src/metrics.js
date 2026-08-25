@@ -506,6 +506,7 @@ export const METRICS = Object.freeze({
 					'probe_fresh',
 					'probe_throttled',
 					'probe_unreadable',
+					'probe_page_mismatch',
 					'discovery_gated',
 				],
 				description:

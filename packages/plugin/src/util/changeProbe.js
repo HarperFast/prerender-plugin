@@ -66,6 +66,9 @@ import {
 	isSameProbeOrigin,
 	signatureOf,
 	statusSignalFor,
+	apiClaimOf,
+	claimsDisagree,
+	pageClaimFromOffers,
 } from './changeProbeSpec.js';
 
 const targetTable = () => databases.render_service.Target;
@@ -137,6 +140,7 @@ const newStats = () => ({
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
+	pageMismatch: 0, // cached page disagreed with the origin (pageCheck) — OVERLAYS the buckets above, which count by signature outcome alone
 	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
 	throttleLevel: 1, // pacing-window multiplier when the pass ended; 1 means never backed off
 	abortedOnDistress: false, // the pass gave up because the origin refused everything
@@ -312,7 +316,7 @@ export const triggerRevalidate = async (row) => {
 // Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
 // another pass already covered (see `reprobeAfter` in runProbePass).
 const readSignature = async (url) => {
-	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt'] });
+	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt', 'pageSignature'] });
 	if (!row) return null;
 	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
 	// exists for — a BigInt, which `new Date()` REFUSES rather than coerces (TypeError, which here
@@ -321,9 +325,87 @@ const readSignature = async (url) => {
 	// skips: never skip a probe on a value we could not read.
 	const stamp = typeof row.probedAt === 'bigint' ? Number(row.probedAt) : row.probedAt;
 	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
-	return { signature: row.signature ?? null, probedAt };
+	return { signature: row.signature ?? null, probedAt, pageSignature: row.pageSignature ?? null };
 };
-const writeSignature = (url, signature) => probeStateTable().put(url, { url, signature, probedAt: new Date() });
+// The probe's write must NEVER carry the page claim through a whole-row put: `pageSignature`
+// belongs to the render path, and the value read at the top of processOne is a full probe request
+// older than the row by the time this runs — a render landing in that window would have its fresh
+// claim replaced by the stale copy. So an EXISTING row takes a patch naming only the probe's own
+// columns (the claim survives structurally, not by being copied), with clearing the claim on an
+// acted trip as the one explicit exception. Only a MISSING row takes a put — patch does NOT
+// create a missing record (verified against the engine — "updated 0 of 1 records, skipped"), and
+// the seeding write is by definition to a URL with no row yet; a patch there would make every
+// first observation a silent no-op. A row the render path creates between the read and that put
+// loses at most one baseline to the race and re-seeds on the next pass.
+export const writeSignature = (url, signature, { rowExists = false, clearClaim = false } = {}) => {
+	const fields = { signature, probedAt: new Date() };
+	if (clearClaim) fields.pageSignature = null;
+	return rowExists
+		? probeStateTable().patch(url, fields)
+		: probeStateTable().put(url, { url, pageSignature: null, ...fields });
+};
+
+/**
+ * Record what a freshly rendered page CLAIMS, for the probe to compare the origin against.
+ * Called from the render result path (owner-scoped, like the sweep) and deliberately best-effort:
+ * a render must never fail because a probe optimisation could not be recorded. Extraction that
+ * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
+ * trigger by making every page look like a disagreement.
+ */
+export const recordPageClaim = async (url, structuredOffers) => {
+	try {
+		// The master switch gates STORAGE too — "Off = no probes, no timers, nothing stored" is
+		// the config contract, and this is the hottest write path to be skipping work on.
+		if (!config.changeProbe.enabled) return;
+		// Parse ONCE, outside the predicate: this runs per render, and `find` would otherwise
+		// re-parse the same URL for every rule it tests. `URL.parse` over `new URL` is the repo
+		// idiom (it returns null instead of throwing on a malformed value).
+		const pathname = URL.parse(url)?.pathname;
+		if (!pathname) return;
+		// Select the rule EXACTLY as the sweep does — first match of ALL rules — then require
+		// pageCheck on it. Searching for "first match WITH pageCheck" instead would let an earlier
+		// pageCheck-less rule shadow this URL on the sweep side: claims written per render here,
+		// never compared there, and nothing to say so.
+		const rule = probeRules().find((r) => r.pathPattern.test(pathname));
+		if (!rule?.pageCheck) return;
+		if (structuredOffers === undefined) {
+			// The renderer does not know the field at all — it predates 1.20.0. There is
+			// deliberately NO fallback to parsing the stored HTML: recovering the offers here means
+			// a regex scan and a JSON parse of a ~1MB document on the hottest write path in this
+			// process, to reconstruct what the browser had structured in front of it. So pageCheck
+			// is INERT against an older renderer — say so rather than failing silently, since a
+			// config that looks enabled and protects nothing is the worst outcome. `null` is the
+			// other case and is NOT this warn: a >=1.20.0 renderer ran the extraction and the page
+			// declared no Product offers — nothing to record, same rule as a failed probe.
+			warnPageClaimUnsupported();
+			return;
+		}
+		const claim = pageClaimFromOffers(structuredOffers);
+		if (!claim) return;
+		// patch cannot create, and put would clobber the probe's own signature/probedAt — so read
+		// first and choose. The read is a node-local point read on a small table, once per render
+		// of a pageCheck-matched URL.
+		const existing = await probeStateTable().get({ id: url, select: ['url'] });
+		if (existing) await probeStateTable().patch(url, { pageSignature: claim });
+		else await probeStateTable().put(url, { url, pageSignature: claim });
+	} catch (e) {
+		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
+	}
+};
+
+// One line per hour per worker: this fires per RENDER, and a fleet mid-upgrade would otherwise
+// log it thousands of times a minute.
+let lastUnsupportedWarnAt = 0;
+const warnPageClaimUnsupported = () => {
+	const now = Date.now();
+	if (now - lastUnsupportedWarnAt < 3600000) return;
+	lastUnsupportedWarnAt = now;
+	logger.warn?.(
+		`[prerender] changeProbe.pageCheck is enabled but the render result carried no structuredOffers — ` +
+			`the renderer is older than @harperfast/prerender-browser 1.20.0, so page claims are not being ` +
+			`recorded and pageCheck cannot detect anything. Upgrade the render fleet or disable pageCheck.`
+	);
+};
 
 /**
  * Probe a stream of target rows and act on what changed. ALL I/O is injected, so the decision
@@ -401,23 +483,53 @@ export const runProbePass = async ({
 			return;
 		}
 		distressStreak = 0;
-		if (stored?.signature === observed) {
-			stats.unchanged++;
+
+		// ROUND-TRIP BLINDNESS. Everything below compares the origin to the origin, so a value
+		// that changed and changed BACK between two passes is invisible — and a render that landed
+		// inside that window left a page carrying the transient value. `pageSignature` is what the
+		// cached page claims (written by the render, never here), so this asks the question the
+		// signature comparison structurally cannot: does the page still agree with the origin?
+		// Runs BEFORE the unchanged early-return, because "unchanged" is exactly the case it
+		// exists to catch. Only for extracted responses — a status-signal literal carries no
+		// price/availability to project (documented limitation).
+		let pageDisagrees = false;
+		if (rule.pageCheck && stored?.pageSignature) {
+			let values = null;
+			try {
+				const parsed = JSON.parse(observed);
+				if (Array.isArray(parsed)) values = parsed;
+			} catch {
+				values = null; // a status-signal literal, not an extracted array
+			}
+			if (values) pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, rule.pageCheck));
+			if (pageDisagrees) stats.pageMismatch++;
+		}
+
+		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
+		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
+		// `probed = seeded + unchanged + changed + failed` is the documented invariant, and the
+		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
+		// would silently shrink the mass-change sample right when claims are most likely to be
+		// stale. `pageMismatch` OVERLAYS these buckets; it never replaces them.
+		if (signatureChanged) stats.changed++;
+		else if (stored?.signature) stats.unchanged++;
+		else stats.seeded++;
+		if (!signatureChanged && !pageDisagrees) {
+			if (!stored?.signature) {
+				// First observation: baseline it, trigger nothing — the page's content is not known
+				// to have changed, the probe just hadn't seen it before.
+				await write(row.url, observed, { rowExists: stored !== null });
+			}
 			return;
 		}
-		if (!stored?.signature) {
-			// First observation: baseline it, trigger nothing — the page's content is not known to
-			// have changed, the probe just hadn't seen it before.
-			stats.seeded++;
-			await write(row.url, observed);
-			return;
-		}
-		stats.changed++;
 		if (dryRun) {
 			// Signature written in dry-run ON PURPOSE: each pass then reports fresh changes — the
 			// true change rate — instead of re-reporting the same delta forever. Demand-ladder
-			// precedent (its dry run persists rung moves for the same reason).
-			await write(row.url, observed);
+			// precedent (its dry run persists rung moves for the same reason). The page claim is
+			// the opposite case and is deliberately NOT cleared: nothing was expired, so the
+			// disagreement still stands — in dry-run `pageMismatch` reads as a standing gauge of
+			// disagreeing pages per pass, where armed it is a detection rate.
+			await write(row.url, observed, { rowExists: stored !== null });
 			return;
 		}
 		if (stats.triggered >= maxTriggers) {
@@ -429,7 +541,14 @@ export const runProbePass = async ({
 		try {
 			await trigger(row);
 			stats.triggered++;
-			await write(row.url, observed);
+			// The page's claim is CLEARED on EVERY acted trip, not just a page disagreement: the
+			// trip hard-expired the page, so whatever the claim described is no longer served — and
+			// a preserved claim would re-detect against the NEW baseline on the next pass (a price
+			// drift's old claim disagrees with the new price by construction) and re-spend the
+			// trigger budget on a page already expired and already filed. The next render writes a
+			// fresh claim; until then there is nothing to compare, which is the correct "I don't
+			// know" state. Folded into this write so it costs no second round trip.
+			await write(row.url, observed, { rowExists: stored !== null, clearClaim: true });
 		} catch (e) {
 			stats.errors++;
 			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
@@ -548,6 +667,7 @@ const emitStats = (stats, kind) => {
 		metrics.changeProbe(stats.failed, 'failed');
 		metrics.changeProbe(stats.fresh, 'fresh');
 		metrics.changeProbe(stats.throttled, 'throttled');
+		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -946,4 +1066,5 @@ export const resetChangeProbeState = () => {
 	cohortBuildDone = false;
 	compiledRules = null;
 	compiledFrom = undefined;
+	lastUnsupportedWarnAt = 0;
 };

@@ -159,6 +159,41 @@ const compileRule = (raw, index, warn) => {
 		}
 	}
 
+	// Which extracted values correspond to what the PAGE renders, so the probe can ask "does the
+	// cached page still agree with the origin" as well as "did the origin change". Site-specific
+	// by nature: only the operator knows which field of their endpoint is the price the page
+	// prints. Indices into `extract`, so nothing new is fetched. Dropped whole (not per-field) —
+	// a half-configured mapping would compare the wrong column.
+	let pageCheck = null;
+	if (raw.pageCheck !== undefined && raw.pageCheck !== null) {
+		const pc = raw.pageCheck;
+		if (typeof pc !== 'object' || Array.isArray(pc)) {
+			warn(`change-probe ${label}: pageCheck must be an object { enabled, priceFrom, availableFrom }`);
+		} else if (pc.enabled === true) {
+			if (source !== 'request') {
+				// In document mode the stored signature IS the page's own offers, so the page can
+				// never disagree with itself and the comparison is meaningless.
+				warn(`change-probe ${label}: pageCheck applies to source "request" only — ignored`);
+			} else {
+				const inBounds = (v) => Number.isInteger(v) && v >= 0 && v < extract.length;
+				if (!inBounds(pc.priceFrom) || !inBounds(pc.availableFrom)) {
+					warn(
+						`change-probe ${label}: pageCheck.priceFrom and .availableFrom must be integer indices into ` +
+							`extract (0-${extract.length - 1}) — pageCheck ignored`
+					);
+				} else {
+					pageCheck = { priceFrom: pc.priceFrom, availableFrom: pc.availableFrom };
+				}
+			}
+		} else if (pc.enabled) {
+			// `enabled: "true"` (a YAML/JSON string) must not silently disable: a config that LOOKS
+			// enabled while protecting nothing is this feature's worst failure mode.
+			warn(
+				`change-probe ${label}: pageCheck.enabled must be boolean true (got ${JSON.stringify(pc.enabled)}) — pageCheck ignored`
+			);
+		}
+	}
+
 	return {
 		label,
 		pathPattern,
@@ -168,7 +203,132 @@ const compileRule = (raw, index, warn) => {
 		extract,
 		invalidateScope,
 		statusSignals,
+		pageCheck,
 	};
+};
+
+/**
+ * A price as a canonical string, so `35.99` (JSON number, from the endpoint) and `"35.99"`
+ * (JSON-LD string, from the page) compare equal. Anything unparseable is null and never matches,
+ * which keeps a garbled value from reading as agreement.
+ */
+const canonicalPrice = (value) => {
+	// The empty cases are rejected BEFORE Number(): `Number(null)`, `Number('')` and `Number([])`
+	// are all 0, which would turn "this field is absent" into a confident price of 0.00 and make
+	// an absent value compare equal to a genuine zero.
+	if (value === null || value === undefined || value === '') return null;
+	if (typeof value !== 'string' && typeof value !== 'number') return null;
+	const n = typeof value === 'string' ? Number(value.trim()) : value;
+	return Number.isFinite(n) ? n.toFixed(2) : null;
+};
+
+/**
+ * Availability vocabularies, matched after reducing a schema.org URL form to its last segment.
+ * AVAILABLE is Google's own "in stock" reading (InStock, InStoreOnly, OnlineOnly,
+ * LimitedAvailability); UNAVAILABLE is the definitive negative. Everything else — PreOrder,
+ * BackOrder, a site's private vocabulary — is NO verdict: a value the plugin cannot confidently
+ * read must make the claim incomparable, never a guess. A wrong guess here disagrees with the
+ * endpoint on EVERY pass and hard-expires every matched page, forever — the one failure mode this
+ * feature must not have — so an unrecognized vocabulary degrades to "detects nothing" instead.
+ */
+const AVAILABLE = new Set(['instock', 'instoreonly', 'onlineonly', 'limitedavailability']);
+const UNAVAILABLE = new Set(['outofstock', 'soldout', 'discontinued']);
+const availabilityVerdict = (raw) => {
+	if (typeof raw !== 'string') return null;
+	const token = raw.split('/').filter(Boolean).pop()?.toLowerCase() ?? '';
+	if (AVAILABLE.has(token)) return true;
+	if (UNAVAILABLE.has(token)) return false;
+	return null;
+};
+
+/**
+ * What the CACHED PAGE claims, as a comparable claim: the set of offer prices it prints, and an
+ * availability verdict — true when ANY offer is in stock (that is what a reader concludes from the
+ * page), false only when every stated availability is a definitive negative, null when the
+ * vocabulary is mixed or unrecognized (no claim, so never a disagreement).
+ *
+ * The offers come from the RENDERER, which extracts them from its live DOM and posts them with the
+ * result (browser >= 1.20.0) — strictly better than doing it here, where it would mean a regex
+ * scan and JSON parse of a ~1MB document on the hottest write path in the system to recover data
+ * the browser had structured in front of it. There is deliberately no HTML-parsing fallback;
+ * pageCheck is simply inert against an older renderer.
+ *
+ * Shape is the renderer's: a flat [price, currency, availability] triple sequence. Returns null
+ * when nothing comparable can be read — the caller must then leave the stored claim alone,
+ * exactly as a failed probe does.
+ */
+export const pageClaimFromOffers = (flat) => {
+	if (!Array.isArray(flat) || !flat.length) return null;
+	const prices = new Set();
+	let sawAvailable = false;
+	let sawUnavailable = false;
+	let sawUnrecognized = false;
+	for (let i = 0; i + 3 <= flat.length; i += 3) {
+		const price = canonicalPrice(flat[i]);
+		if (price !== null) prices.add(price);
+		const verdict = availabilityVerdict(flat[i + 2]);
+		if (verdict === true) sawAvailable = true;
+		else if (verdict === false) sawUnavailable = true;
+		else if (flat[i + 2] !== null && flat[i + 2] !== undefined) sawUnrecognized = true;
+	}
+	const inStock = sawAvailable ? true : sawUnavailable && !sawUnrecognized ? false : null;
+	if (!prices.size && inStock === null) return null;
+	return JSON.stringify([[...prices].sort(), inStock]);
+};
+
+/**
+ * The same claim shape, projected from the values the probe just extracted from the endpoint.
+ * Availability is a claim only for an unambiguous boolean (true/'true'/false/'false') — any other
+ * type is a mapping the operator got wrong or a field this plugin cannot read, and guessing turns
+ * every probe of every page into a disagreement. Null when neither field yields a claim.
+ */
+export const apiClaimOf = (values, pageCheck) => {
+	if (!pageCheck || !Array.isArray(values)) return null;
+	const price = canonicalPrice(values[pageCheck.priceFrom]);
+	const availableRaw = values[pageCheck.availableFrom];
+	const available =
+		availableRaw === true || availableRaw === 'true'
+			? true
+			: availableRaw === false || availableRaw === 'false'
+				? false
+				: null;
+	if (price === null && available === null) return null;
+	return JSON.stringify([price === null ? [] : [price], available]);
+};
+
+/**
+ * Do the page's claim and the endpoint's claim disagree?
+ *
+ * Asymmetric on price BY DESIGN: the page may legitimately print several offer prices (variants)
+ * while the endpoint reports one, so the test is whether the endpoint's price is ABSENT from the
+ * page's set — not whether the sets are equal. Each dimension compares only when both sides
+ * actually claim it; a null/empty side is "no claim", which is never a disagreement.
+ */
+export const claimsDisagree = (pageClaim, apiClaim) => {
+	if (!pageClaim || !apiClaim) return false;
+	try {
+		const page = JSON.parse(pageClaim);
+		const api = JSON.parse(apiClaim);
+		// Shape-check INSIDE the try, and destructure only after. A stored claim is data from a
+		// previous release (or a corrupted row), so it may be any JSON at all — destructuring a
+		// non-array throws, and this runs inside the sweep's per-URL path where an uncaught throw
+		// would end the whole pass. Anything unrecognisable reads as "no comparable claim".
+		if (!Array.isArray(page) || !Array.isArray(api)) return false;
+		const [pagePrices, pageInStock] = page;
+		const [apiPrices, apiInStock] = api;
+		if (!Array.isArray(pagePrices) || !Array.isArray(apiPrices)) return false;
+		// Availability compares only when BOTH sides hold a boolean verdict — null means that side
+		// makes no availability claim (unrecognized vocabulary, unmapped field), and no claim is
+		// never a disagreement.
+		if (typeof pageInStock === 'boolean' && typeof apiInStock === 'boolean' && apiInStock !== pageInStock) return true;
+		// Price compares only when the page prints at least one price the plugin could read: an
+		// unreadable price format (currency-prefixed strings, an AggregateOffer) must reduce to
+		// "no price claim", not to "disagrees with every endpoint price" — the latter re-expires
+		// the page after every render, forever.
+		return pagePrices.length > 0 && apiPrices.length > 0 && !apiPrices.every((price) => pagePrices.includes(price));
+	} catch {
+		return false;
+	}
 };
 
 /**

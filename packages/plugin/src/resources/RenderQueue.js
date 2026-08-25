@@ -12,6 +12,7 @@ import {
 	PRERENDER,
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
+import { recordPageClaim } from '../util/changeProbe.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { metrics } from '../metrics.js';
@@ -369,6 +370,10 @@ export class RenderQueue extends Resource {
 
 			if (result.content && !discardContent) {
 				result.headers['x-harper-rendered'] = '1';
+				// What this render CLAIMS, for the probe to compare the origin against on its next
+				// pass. Best-effort and awaited only for its (node-local) write: see recordPageClaim
+				// — a render must not fail because a probe optimisation could not be recorded.
+				await recordPageClaim(url, result.structuredOffers);
 				await databases.page_cache.PrerenderedPage.put(cacheKey, {
 					statusCode: result.statusCode,
 					lastCached: Date.now(),
