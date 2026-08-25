@@ -147,8 +147,28 @@ test('config validation rejects malformed removeAttributes rules', () => {
 		() => mergeConfig({ postProcess: { removeAttributes: [{ selector: 'x-island', attributes: [''] }] } }),
 		/removeAttributes\[0\]\.attributes must be a non-empty array/
 	);
+	// A bare string where a list belongs is the likeliest hand-authored mistake, and it is caught
+	// HERE — which is why the in-page loop's matching guard is defence in depth, not the real check.
+	assert.throws(
+		() => mergeConfig({ postProcess: { removeAttributes: [{ selector: 'x-island', attributes: 'props' }] } } as never),
+		/removeAttributes\[0\]\.attributes must be a non-empty array/
+	);
 	assert.throws(
 		() => mergeConfig({ postProcess: { removeAttributes: 'nope' } } as never),
 		/removeAttributes must be an array of rules/
 	);
+});
+
+// `deepMerge` REPLACES a non-plain-object rather than merging into it, so a JSON config can null a
+// whole block out and it reaches validate() intact. That must read as a config error, not as a
+// TypeError from whichever check touched the block first.
+test('a nulled-out config block is a named error, not a TypeError', () => {
+	for (const name of ['devices', 'navigation', 'scroll', 'block', 'postProcess', 'canonical']) {
+		assert.throws(
+			() => mergeConfig({ [name]: null } as never),
+			new RegExp(`prerender config: \`${name}\` must be an object`),
+			`${name}: null should be a named config error`
+		);
+		assert.throws(() => mergeConfig({ [name]: [] } as never), new RegExp(`\`${name}\` must be an object`));
+	}
 });

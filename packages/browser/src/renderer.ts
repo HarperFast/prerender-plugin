@@ -847,6 +847,10 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		} catch {
 			continue; // malformed selector — skip the rule, never fail the render over it
 		}
+		// Same contract as the malformed selector above: a rule that cannot be applied is skipped,
+		// never fatal. `validate()` already guarantees the shape, but this runs inside the page —
+		// a throw here fails the whole render job, out of all proportion to one bad rule.
+		if (!Array.isArray(rule.attributes)) continue;
 		// Split exact names from `prefix*` matches once per rule, not once per element.
 		// A bare '*' yields an empty prefix and is dropped: it would strip every attribute.
 		const exact = new Set<string>();

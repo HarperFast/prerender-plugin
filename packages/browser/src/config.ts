@@ -382,6 +382,17 @@ const deepMerge = <T>(target: T, source: unknown): T => {
 };
 
 const validate = (config: PrerenderConfig): PrerenderConfig => {
+	// Every check below reaches straight into a config block, and a JSON-/API-supplied config can
+	// null one out wholesale — `deepMerge` REPLACES a non-plain-object rather than merging into it,
+	// so `{ postProcess: null }` survives to here intact. Assert the blocks are objects once, up
+	// front, so that surfaces as a named config error rather than as a TypeError from whichever
+	// check happened to touch the block first.
+	for (const name of ['devices', 'navigation', 'scroll', 'block', 'postProcess', 'canonical'] as const) {
+		const block: unknown = config[name];
+		if (!block || typeof block !== 'object' || Array.isArray(block)) {
+			throw new Error(`prerender config: \`${name}\` must be an object`);
+		}
+	}
 	const devices = Object.keys(config.devices);
 	if (devices.length === 0) {
 		throw new Error('prerender config: `devices` must define at least one device profile');
