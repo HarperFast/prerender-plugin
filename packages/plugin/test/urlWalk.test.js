@@ -156,3 +156,74 @@ test('endBound keeps the probes inside the range: a next-region poison row canno
 		/NOT fully covered/
 	);
 });
+
+test('a FULL chunk with no readable row throws instead of looping forever', async () => {
+	// chunkSize consecutive unreadable rows: the cursor can never advance, so re-querying would
+	// return the same chunk forever. The walk must be loud, not livelocked.
+	const rows = [row(U(1)), row(U(2), false), row(U(3), false), row(U(4))];
+	const table = fakeTable(rows);
+	await assert.rejects(
+		collect(walkUrlRange(table, { startAt: '', select: ['url'], chunkSize: 2 })),
+		/NOT fully covered/
+	);
+});
+
+test('unreadable rows in a full chunk tail are not double-counted on the re-read', async () => {
+	// Chunk 1 (size 3) = [U1, U2, poison]: the poison trails the last readable row, so the next
+	// query (greater_than U2) re-reads it in chunk 2 = [poison, U4]. One row, one count.
+	const rows = [row(U(1)), row(U(2)), row(U(3), false), row(U(4))];
+	const table = fakeTable(rows);
+	let unreadable = 0;
+	const urls = await collect(
+		walkUrlRange(table, { startAt: '', select: ['url'], chunkSize: 3, onUnreadable: () => unreadable++ })
+	);
+	assert.deepEqual(urls, [U(1), U(2), U(4)]);
+	assert.equal(unreadable, 1);
+});
+
+test('ambiguous url-less probe row with endBound: the descending probe decides, loud on in-range rows', async () => {
+	// The projected read aborts in front of an unreadable row that is INSIDE the range, with a
+	// readable row beyond it: the forward probe cannot place the unreadable row, the bounded
+	// descending probe finds the readable in-range key above the cursor — rows provably remain.
+	const rows = [row(U(1)), row(U(2), false), row(U(3))];
+	const table = fakeTable(rows, { abortsBefore: new Set([U(2)]) });
+	// Make the FORWARD no-select probe also yield the unreadable row (tolerant), which is the
+	// fakeTable default; U(3) is inside endBound so descending finds it.
+	await assert.rejects(
+		collect(
+			walkUrlRange(table, {
+				startAt: '',
+				select: ['url'],
+				chunkSize: 10,
+				endBound: 'https://example.com/product/prd-9999/',
+			})
+		),
+		/NOT fully covered/
+	);
+});
+
+test('bounded probe shape unsupported: ascending falls back to an unbounded probe filtered in code', async () => {
+	// The store refuses two-condition searches AND its projected reads stop at the region
+	// boundary, so the short chunk needs verifying. The range is genuinely finished (the only row
+	// past the cursor is beyond endBound and readable) — the fallback must prove that instead of
+	// erroring or lying.
+	const inside = row('https://example.com/catalog.jsp?CN=a');
+	const outside = row('https://example.com/product/prd-0001/');
+	const rows = [inside, outside];
+	const base = fakeTable(rows, { abortsBefore: new Set([outside.key]) });
+	const table = {
+		search(q) {
+			if (q.conditions.length > 1) throw new Error('two-condition search unsupported');
+			return base.search.call(base, q);
+		},
+	};
+	const urls = await collect(
+		walkUrlRange(table, {
+			startAt: 'https://example.com/catalog.jsp',
+			select: ['url'],
+			chunkSize: 10,
+			endBound: 'https://example.com/catalog.jsq',
+		})
+	);
+	assert.deepEqual(urls, [inside.key]);
+});
