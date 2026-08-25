@@ -723,14 +723,32 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 			try {
 				const sr = host.shadowRoot as ShadowRoot;
 				const hostId = `s${hostSeq++}`;
-				host.setAttribute('data-shadow-host', hostId);
-				const hostSel = `[data-shadow-host="${hostId}"]`;
+				// Deliberately terse, and unquoted in the selector. This token is private — we mint
+				// it here and consume it in the rules below, within the same document, so nothing
+				// outside reads it and the name carries no contract. It is also repeated once per
+				// SELECTOR (`rewriteSelector` splits comma-separated lists and prefixes each part),
+				// so its length is multiplied by the rule count of every flattened shadow root: on
+				// one measured review-heavy page it appeared 11,589 times, and `data-shadow-host`
+				// with quotes cost 127 KB more than this spelling for identical output. `sN` is
+				// always a valid CSS identifier, so the unquoted form is safe by construction.
+				host.setAttribute('data-sh', hostId);
+				const hostSel = `[data-sh=${hostId}]`;
 
 				let css = '';
 				const sheets = [...sr.styleSheets, ...((sr.adoptedStyleSheets as CSSStyleSheet[]) ?? [])];
+				// Nodes whose rules made it into `css` above. Their originals must NOT be moved into
+				// the light DOM with the rest of the shadow tree: `css` is the SCOPED copy, and the
+				// original is the unscoped one the shadow boundary used to contain. Moving it out
+				// would (a) re-emit every rule a second time and (b) defeat the scoping entirely —
+				// a bare `button {…}` rule, perfectly safe inside a shadow root, would repaint every
+				// button on the page. Only nodes we actually captured are dropped; a sheet that
+				// failed to serialize (cross-origin `<link>`) keeps its element, since losing the
+				// styling outright would be the worse of the two failures.
+				const captured = new Set<Node>();
 				for (const sheet of sheets) {
 					try {
 						css += serializeRules(sheet.cssRules, hostSel);
+						if (sheet.ownerNode) captured.add(sheet.ownerNode);
 					} catch {
 						/* cross-origin stylesheet — cssRules not readable */
 					}
@@ -758,7 +776,10 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 					style.textContent = css;
 					host.appendChild(style);
 				}
-				while (sr.firstChild) host.appendChild(sr.firstChild);
+				for (const node of [...sr.childNodes]) {
+					if (captured.has(node)) continue; // its rules are already in the scoped block
+					host.appendChild(node);
+				}
 			} catch {
 				/* closed shadow root or serialization error — skip */
 			}
