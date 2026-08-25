@@ -104,7 +104,8 @@ const runPass = async ({
 			if (answer instanceof Error) throw answer;
 			return answer ?? null;
 		},
-		read: async (url) => stored[url] ?? null,
+		// The port returns the whole baseline now — `probedAt` is what the freshness skip reads.
+		read: async (url) => (stored[url] == null ? null : { signature: stored[url], probedAt: NaN }),
 		write: async (url, signature) => written.push({ url, signature }),
 		trigger: async (target) => triggered.push(target.url),
 		dryRun,
@@ -120,6 +121,8 @@ const runPass = async ({
 const URL_A = 'https://example.com/product/prd-a/';
 const URL_B = 'https://example.com/product/prd-b/';
 const URL_C = 'https://example.com/product/prd-c/';
+const URL_D = 'https://example.com/product/prd-d/';
+const HOUR = 60 * 60 * 1000;
 
 test('only owned, unsuppressed, rule-matched rows are probed', async () => {
 	const { stats, written, triggered } = await runPass({
@@ -207,7 +210,7 @@ test('a failed trigger write keeps the signature stale too', async () => {
 		ownerOf: () => 'node-a',
 		hostname: 'node-a',
 		probe: async () => '[2]',
-		read: async () => '[1]',
+		read: async () => ({ signature: '[1]', probedAt: NaN }),
 		write: async (url, signature) => written.push({ url, signature }),
 		trigger: async () => {
 			throw new Error('write refused');
@@ -340,4 +343,179 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		config.changeProbe.chunkSize = savedChunk;
 		globalThis.databases.render_service.Target = FakeTable;
 	}
+});
+
+test('freshness skip: a baseline younger than reprobeAfter is not re-probed', async () => {
+	// The restart case: a pass that already covered these URLs died mid-walk, and the pass that
+	// replaces it must not spend origin requests re-confirming what is already stored.
+	const probed = [];
+	const T = 1_700_000_000_000;
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			probed.push(url);
+			return '[9]';
+		},
+		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - 60_000 : T - 20 * HOUR }),
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		now: () => T,
+		reprobeAfter: 12 * HOUR,
+	});
+	assert.deepEqual(probed, [URL_B], 'only the stale baseline was re-probed');
+	assert.equal(stats.fresh, 1);
+	assert.equal(stats.probed, 1);
+});
+
+test('freshness skip: an unparseable or missing probedAt probes rather than skips', async () => {
+	const probed = [];
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			probed.push(url);
+			return '[1]';
+		},
+		// A row with no timestamp, and one that never had a baseline at all.
+		read: async (url) => (url === URL_A ? { signature: '[1]', probedAt: NaN } : null),
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		reprobeAfter: 12 * HOUR,
+	});
+	assert.equal(probed.length, 2, 'unknown age must probe — never skip on a value we cannot read');
+	assert.equal(stats.fresh, 0);
+});
+
+test('origin backoff: a pushback response stretches the pacing window, a clean batch relaxes it', async () => {
+	const waits = [];
+	let call = 0;
+	const distress = Object.assign(new Error('HTTP 503'), { statusCode: 503, distress: true });
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		// Four batches of one: fail, fail, then succeed, succeed.
+		rows: stream([row(URL_A), row(URL_B), row(URL_C), row(URL_D)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => {
+			if (call++ < 2) throw distress;
+			return '[1]';
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1, // a 1000ms base window per single-item batch
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		backoffMax: 64,
+	});
+	// Doubling on each distressed batch, halving back on each clean one.
+	assert.deepEqual(waits, [2000, 4000, 2000, 1000]);
+	assert.equal(stats.throttled, 2);
+	assert.equal(stats.throttleLevel, 1, 'recovered to the configured rate by the end');
+});
+
+test('origin backoff: an explicit Retry-After outranks the computed window', async () => {
+	const waits = [];
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => {
+			throw Object.assign(new Error('HTTP 429'), { statusCode: 429, distress: true, retryAfterMs: 90_000 });
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		backoffMax: 64,
+	});
+	assert.deepEqual(waits, [90_000], 'the origin named a number; we do not guess under it');
+});
+
+test('origin backoff: a fully refusing origin ends the pass instead of crawling', async () => {
+	const rows = [];
+	for (let i = 0; i < 400; i++) rows.push(row(`https://example.com/product/prd-${i}/`));
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => {
+			throw Object.assign(new Error('HTTP 503'), { statusCode: 503, distress: true });
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		backoffMax: 64,
+		abortAfterDistress: 50,
+	});
+	assert.equal(stats.abortedOnDistress, true);
+	assert.equal(stats.aborted, true);
+	assert.ok(stats.probed < 400, `stopped early, probed ${stats.probed} of 400`);
+});
+
+test('origin backoff: a rule/product failure is NOT distress and must not throttle the sweep', async () => {
+	const waits = [];
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		// A 404 is a dead product and a 500 floor is a known per-product condition on this corpus —
+		// neither is the origin asking us to slow down, and treating them as such would throttle a
+		// healthy sweep down to nothing over a stable ~1.7% failure floor.
+		probe: async () => {
+			throw Object.assign(new Error('HTTP 404'), { statusCode: 404, distress: false });
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1,
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		backoffMax: 64,
+		abortAfterDistress: 50,
+	});
+	assert.equal(stats.throttled, 0);
+	assert.equal(stats.failed, 2);
+	assert.deepEqual(waits, [1000, 1000], 'window never stretched');
+	assert.equal(stats.abortedOnDistress, false);
 });
