@@ -373,7 +373,7 @@ export class RenderQueue extends Resource {
 				// What this render CLAIMS, for the probe to compare the origin against on its next
 				// pass. Best-effort and awaited only for its (node-local) write: see recordPageClaim
 				// — a render must not fail because a probe optimisation could not be recorded.
-				await recordPageClaim(url, result.content);
+				await recordPageClaim(url, { offers: result.offers ?? null, html: result.content });
 				await databases.page_cache.PrerenderedPage.put(cacheKey, {
 					statusCode: result.statusCode,
 					lastCached: Date.now(),

@@ -69,6 +69,7 @@ import {
 	apiClaimOf,
 	claimsDisagree,
 	pageClaimOf,
+	pageClaimFromOffers,
 } from './changeProbeSpec.js';
 
 const targetTable = () => databases.render_service.Target;
@@ -339,11 +340,15 @@ const clearPageSignature = (url) => probeStateTable().patch(url, { pageSignature
  * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
  * trigger by making every page look like a disagreement.
  */
-export const recordPageClaim = async (url, html) => {
+export const recordPageClaim = async (url, { offers = null, html = null } = {}) => {
 	try {
 		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(new URL(url).pathname));
 		if (!rule) return;
-		const claim = pageClaimOf(html);
+		// Prefer what the RENDERER extracted from its live DOM (browser >= 1.20.0). Falling back to
+		// parsing the stored HTML costs a regex scan and a JSON parse of a ~1MB document on the
+		// hottest write path here, to recover data the browser already had structured — so the
+		// fallback exists for older renderers, not as the intended path.
+		const claim = offers ? pageClaimFromOffers(offers) : html ? pageClaimOf(html) : null;
 		if (!claim) return;
 		await probeStateTable().patch(url, { url, pageSignature: claim });
 	} catch (e) {
