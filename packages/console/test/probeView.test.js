@@ -377,3 +377,129 @@ test('the failure threshold is compared explicitly, so an empty window never rea
 	const ctx = await ready({ analytics: { ...ANALYTICS, series: [passes('failed', 1, 0)] } });
 	assert.doesNotMatch(draw(ctx).textContent, /probe failures dominate/);
 });
+
+// ---------------------------------------------------------------- origin pressure
+
+// THE ONE ALARM ON THIS PAGE THAT IS NOT ABOUT THE PROBE. Every other signal here reports a probe
+// that has stopped telling the truth; this one reports a probe that is hurting the origin. It is
+// also the only signal that says so: the sweep answers pushback by halving its own rate, so the
+// probe quietly covers less of the corpus per pass while the change rate, the failure share and
+// the trigger count all keep exactly the shape they had.
+test('origin pushback is raised as its own alarm, not buried inside the failure count', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('throttled', 4, 80)] },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /The origin pushed back on 320 probes/);
+	assert.match(text, /429\/502\/503\/504/);
+	assert.match(text, /whoever runs the origin/);
+	assert.match(text, /origin pushing back/, 'and it earns a pill on the card head');
+});
+
+// Throttled probes are a SUBSET of failed ones, and two tiles that look like siblings invite
+// adding them. The tile says which of the two contains the other.
+test('the throttled tile names its relationship to Failed rather than reading as a sibling', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('throttled', 4, 80)] },
+	});
+	assert.match(tile(ctx, 'Throttled').textContent, /inside Failed/i);
+});
+
+test('no pushback raises nothing — a healthy origin is not an amber state', async () => {
+	const text = draw(await ready()).textContent;
+	assert.doesNotMatch(text, /pushed back/);
+	assert.doesNotMatch(text, /origin pushing back/);
+});
+
+// ---------------------------------------------------------------- resumable sweeps
+
+// `fresh` is DISJOINT FROM `probed`: a skipped URL was never attempted. Reported as a share of the
+// probes it would exceed 100% on a heavily-skipped pass, and read as part of them it would make a
+// resumed sweep look like a shrinking corpus.
+test('rows skipped as fresh are counted against what a pass considered, not against its probes', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('fresh', 4, 250)] },
+	});
+	// 4 × 250 = 1,000 skipped, against 4,000 probed = 5,000 considered.
+	assert.match(tile(ctx, 'Skipped as fresh').textContent, /1\.0k/);
+	assert.match(tile(ctx, 'Skipped as fresh').textContent, /of 5\.0k rows considered/);
+});
+
+// A settled deployment that skips most of what it considers is not keeping the cadence its
+// settings describe: reprobeAfter sits too close to sweepInterval, so a URL probed late in one
+// pass is skipped by the next and its true cadence is two sweep intervals. `probed` alone just
+// looks like a smaller corpus.
+test('a sustained skip share is explained as a reprobeAfter/sweepInterval overlap', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('fresh', 4, 5000)] },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /reprobeAfter/);
+	assert.match(text, /two sweep\s+intervals|two sweep intervals/);
+});
+
+// ---------------------------------------------------------------- unreadable rows
+
+// A row the application layer cannot address is a storage-layer fault, and no setting on this page
+// reaches it. It also appears in no other count: those targets are simply never probed.
+test('unreadable registry rows are escalated to the database layer, not shown as a probe setting', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('unreadable', 1, 7)] },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /7 registry rows could not be decoded/);
+	assert.match(text, /database team/);
+});
+
+// ---------------------------------------------------------------- how a pass ended
+
+// Three reasons a pass stops early, and they are not interchangeable: standing down for a reseed
+// and being disabled are routine, while giving up on a refusing origin means the slice was never
+// covered. One "Interrupted" label made the third indistinguishable from the first two.
+test('a pass that gave up on a refusing origin is not labelled the same as one that stood down', async () => {
+	const ctx = await ready({
+		status: {
+			...STATUS,
+			sweep: {
+				...STATUS.sweep,
+				lastRun: { ...STATUS.sweep.lastRun, aborted: true, abortedOnDistress: true, throttled: 640 },
+			},
+		},
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /gave up on a refusing origin/);
+	assert.match(text, /STOPPED EARLY/);
+	assert.match(text, /partial count/);
+	assert.doesNotMatch(text, /stood down for a reseed/);
+});
+
+test('a routine interruption keeps its routine wording', async () => {
+	const ctx = await ready({
+		status: { ...STATUS, sweep: { ...STATUS.sweep, lastRun: { ...STATUS.sweep.lastRun, aborted: true } } },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /stood down for a reseed/);
+	assert.doesNotMatch(text, /gave up on a refusing origin/);
+});
+
+// The pacing window halves back on every clean batch, so a value above 1 when the pass FINISHED
+// means it was still backed off at the end — the pass took longer than sweepInterval implies and
+// the corpus is being re-probed more slowly than the settings say.
+test('a pass that finished still backed off says so, because its duration is not what it looks like', async () => {
+	const ctx = await ready({
+		status: {
+			...STATUS,
+			sweep: { ...STATUS.sweep, lastRun: { ...STATUS.sweep.lastRun, throttled: 40, throttleLevel: 8 } },
+		},
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /8× normal/);
+	assert.match(text, /still backed off/);
+});
+
+test('a pass that never backed off shows no pacing row at all', async () => {
+	const ctx = await ready({
+		status: { ...STATUS, sweep: { ...STATUS.sweep, lastRun: { ...STATUS.sweep.lastRun, throttleLevel: 1 } } },
+	});
+	assert.doesNotMatch(draw(ctx).textContent, /normal — still backed off/);
+});

@@ -975,7 +975,18 @@ export function mergeConfig(results) {
 
 // ---------------------------------------------------------------- change probe
 
-/** Pass counters that ADD across nodes: each node probes a disjoint slice of the keyspace. */
+/**
+ * Pass counters that ADD across nodes: each node probes a disjoint slice of the keyspace.
+ *
+ * THIS LIST IS NOT A PARTITION and summing across it means nothing. `probed` is the total the
+ * outcome counters divide up; `throttled` sits INSIDE `failed` (a pushback response is one kind of
+ * failed probe, tagged with who caused it); `fresh` sits outside `probed` entirely, because a
+ * skipped URL was never attempted. Each entry sums across nodes on its own, and only on its own.
+ *
+ * `unreadable` is deliberately NOT here: it is a fault of the registry WALK, not an outcome of a
+ * pass, and only the sweep produces it. The canary's per-rule merge below iterates this list, and
+ * a walk fault has no per-rule meaning to iterate.
+ */
 const PROBE_COUNTERS = [
 	'examined',
 	'owned',
@@ -987,6 +998,8 @@ const PROBE_COUNTERS = [
 	'triggered',
 	'deferred',
 	'failed',
+	'fresh',
+	'throttled',
 	'errors',
 ];
 
@@ -1090,8 +1103,20 @@ export function mergeChangeProbe(results) {
 				lastRun: sweeps.length
 					? {
 							...sumCounters(sweeps, PROBE_COUNTERS),
+							// A walk fault, summed like a counter but reported apart from the pass outcomes.
+							unreadable: sumOf(sweeps, (run) => run.unreadable),
 							dryRun: sweeps.every((run) => run.dryRun !== false),
 							aborted: sweeps.some((run) => run.aborted),
+							// WHY `some` AND NOT A COUNT. One node that gave up on a refusing origin covered
+							// none of its slice, and every total above is short by that slice — which reads
+							// as a smaller corpus, not as a missing one. The same rule as `unsweptNodes`.
+							abortedOnDistress: sweeps.some((run) => run.abortedOnDistress),
+							distressedOn: sweeps.filter((run) => run.abortedOnDistress).map((run) => run.hostname),
+							// The WORST window any node ended on, never a mean: the question this answers is
+							// "was the probe being held back", and averaging one throttled node against three
+							// healthy ones answers it with a number that was true nowhere.
+							throttleLevel: maxOf(sweeps, (run) => run.throttleLevel),
+							throttledOn: sweeps.filter((run) => run.throttled > 0).map((run) => run.hostname),
 							startedAt: minOf(sweeps, (run) => msOf(run.startedAt)),
 							finishedAt: minOf(sweeps, (run) => msOf(run.finishedAt)),
 							error: sweeps.find((run) => run.error)?.error ?? null,
@@ -1135,6 +1160,11 @@ export function mergeChangeProbe(results) {
 				probed: num(r.b.sweep?.lastRun?.probed),
 				changed: num(r.b.sweep?.lastRun?.changed),
 				failed: num(r.b.sweep?.lastRun?.failed),
+				// Per node BECAUSE THE RATE LIMIT IS PER NODE: a probe rate is agreed with whoever runs
+				// the origin, each node holds its own, and origin pushback is therefore a fact about one
+				// node's pass. Summed into a cluster figure it names nobody to go and look at.
+				throttled: num(r.b.sweep?.lastRun?.throttled),
+				abortedOnDistress: !!r.b.sweep?.lastRun?.abortedOnDistress,
 				error: r.b.sweep?.lastRun?.error ?? r.b.canary?.lastRun?.error ?? null,
 			})),
 			sources: sourcesOf(results, { mode: 'merged' }),
@@ -1144,7 +1174,27 @@ export function mergeChangeProbe(results) {
 
 // ---------------------------------------------------------------- discovery purge
 
-const PURGE_COUNTERS = ['examined', 'owned', 'discovered', 'leaseSkipped', 'deleted'];
+/**
+ * Purge counters that ADD across nodes: each node purges the keys it owns.
+ *
+ * `leaseSkipped`, `visitedSkipped` and `errors` earn their place beside `deleted` because the UI
+ * subtracts all four from `discovered` to say what a pass never reached. A term missing from that
+ * subtraction does not read as a missing term — it reads as rows the pass left behind for no
+ * stated reason, which is the shape of an incomplete pass rather than a deliberate one.
+ *
+ * `unreadable` is summed here too but is NOT part of that subtraction: the walk skips those rows
+ * before anything reads their `sitemapUrl`, so they never entered `discovered` in the first place.
+ */
+const PURGE_COUNTERS = [
+	'examined',
+	'owned',
+	'discovered',
+	'leaseSkipped',
+	'visitedSkipped',
+	'unreadable',
+	'errors',
+	'deleted',
+];
 
 /**
  * Merge every node's discovered-target purge state.
@@ -1181,6 +1231,17 @@ export function mergeDiscoveryPurge(results) {
 			// deleted makes "nothing was deleted" false.
 			dryRun: runs.length ? runs.every((run) => run.dryRun !== false) : true,
 			canceled: runs.some((run) => run.canceled),
+			// Same rule as `dryRun` above: "targets the ladder promoted were spared" is only true of
+			// the cluster if EVERY node that ran spared them. One node that ran without the flag
+			// deleted visited rows in its slice, and the totals cannot say which.
+			skipVisited: runs.length ? runs.every((run) => run.skipVisited === true) : false,
+			skipVisitedOn: runs.filter((run) => run.skipVisited === true).map((run) => run.hostname),
+			// A pass that gave up mid-prefix covered part of its slice; the prefix is not done on
+			// that node whatever the totals look like.
+			abortedOnErrors: runs.some((run) => run.abortedOnErrors),
+			errorSamples: runs
+				.flatMap((run) => (run.errorSamples ?? []).map((sample) => ({ hostname: run.hostname, ...sample })))
+				.slice(0, MAX_FAILURE_SAMPLES),
 			startedAt: minOf(runs, (run) => msOf(run.startedAt)),
 			// Oldest, and null while any node is still running: a finish time for a pass three nodes
 			// are still in the middle of is the wrong shape of answer.
@@ -1197,6 +1258,8 @@ export function mergeDiscoveryPurge(results) {
 				startedAt: msOf(r.b.startedAt) || null,
 				finishedAt: msOf(r.b.finishedAt) || null,
 				canceled: !!r.b.canceled,
+				skipVisited: !!r.b.skipVisited,
+				abortedOnErrors: !!r.b.abortedOnErrors,
 				error: r.b.error ?? null,
 				...Object.fromEntries(PURGE_COUNTERS.map((key) => [key, num(r.b[key])])),
 			})),

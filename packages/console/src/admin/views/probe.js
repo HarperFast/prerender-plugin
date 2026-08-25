@@ -54,14 +54,25 @@ const RANGES = [
 	{ label: '24h', ms: 24 * 3_600_000 },
 ];
 
-/** The pass counters, in the order a pass produces them. */
+/**
+ * The pass counters, in the order a pass produces them.
+ *
+ * THESE ARE SERIES SIDE BY SIDE, NOT A PARTITION, and two of them are deliberately not disjoint:
+ * `probed` is the total the four outcome counters divide up, and `throttled` is the slice of
+ * `failed` the ORIGIN caused rather than the rule. `fresh` is the one that is disjoint from
+ * everything — a skipped URL was never attempted, so it is not inside `probed` at all. The chart
+ * note under the bars says this, because a reader who assumes a partition here reads every share
+ * on the card wrong.
+ */
 const OUTCOMES = [
+	['fresh', 'Skipped (fresh)', '#6b7488'],
 	['probed', 'Probes', '#3d8cff'],
 	['seeded', 'Seeded', '#8a93a6'],
 	['changed', 'Changed', '#f0a02a'],
 	['triggered', 'Triggered', '#10a87e'],
 	['deferred', 'Deferred', '#9d6bff'],
 	['failed', 'Failed', '#e0566f'],
+	['throttled', 'Throttled', '#a32438'],
 ];
 
 const OUTCOME_COLOR = Object.fromEntries(OUTCOMES.map(([key, , color]) => [`probe_${key}`, color]));
@@ -69,6 +80,18 @@ const OUTCOME_LABEL = Object.fromEntries(OUTCOMES.map(([key, label]) => [`probe_
 
 /** >50% of probes failing is the endpoint-changed-shape signature the plugin logs loudly about. */
 const FAILURE_ALARM = 0.5;
+
+/**
+ * A pass that skipped this share of its matched rows is not keeping the cadence it appears to.
+ *
+ * `reprobeAfter` exists so a RESTARTED sweep does not re-probe ground the interrupted pass had
+ * already covered, and right after a restart a large skip share is the feature working. In a
+ * settled deployment it means `reprobeAfter` has been set too close to `sweepInterval`: the URLs
+ * probed late in one pass fall inside the next pass's skip window, so their real re-probe cadence
+ * is two sweep intervals rather than one, and nothing else on this page shows it — `probed` just
+ * looks like a smaller corpus.
+ */
+const FRESH_NOTICE = 0.5;
 
 export async function load(ctx) {
 	ctx.data.rangeMs ??= 24 * 3_600_000;
@@ -308,6 +331,9 @@ function drift(ctx) {
 	const triggered = totalOf('triggered');
 	const trips = totalOf('canary_trip');
 	const invalidated = totalOf('invalidated');
+	const fresh = totalOf('fresh');
+	const throttled = totalOf('throttled');
+	const unreadable = totalOf('unreadable');
 
 	// Compared = probes that had a baseline to compare against. Seeds and failures had none, so
 	// including them in the denominator understates the drift rate by exactly the seeding backlog.
@@ -318,6 +344,10 @@ function drift(ctx) {
 	// reconstruct from the helper's contract. Compared explicitly, so nothing rests on `null > 0.5`.
 	const failureShare = ratioOf(failed, probed);
 	const failing = failureShare !== null && failureShare > FAILURE_ALARM;
+	// Against `fresh + probed` — the rows the pass CONSIDERED — because that is the denominator the
+	// question has: of everything a pass was willing to look at, how much did it decline to probe.
+	const freshShare = ratioOf(fresh, fresh + probed);
+	const skipping = freshShare !== null && freshShare > FRESH_NOTICE;
 
 	const bucketCount = data.bucketCount ?? 0;
 	const { keys, stacks } = stackBy(
@@ -330,6 +360,8 @@ function drift(ctx) {
 	return card(`Probe passes — ${scopeLabel(data)}, last ${duration(data.rangeMs ?? ctx.data.rangeMs)}`, {
 		head: [
 			failing ? pill('probe failures dominate', 'bad') : null,
+			throttled > 0 ? pill('origin pushing back', 'bad') : null,
+			unreadable > 0 ? pill('unreadable rows', 'bad') : null,
 			spacer(),
 			legend(keys.map((key) => ({ label: OUTCOME_LABEL[key], color: OUTCOME_COLOR[key] }))),
 		],
@@ -341,6 +373,51 @@ function drift(ctx) {
 						'stored signature untouched, and those pages are silently back on interval-only freshness. A ' +
 						'failure never triggers and never re-baselines, so nothing else in this console will move.',
 				]),
+			// THE ONE ALARM ON THIS PAGE THAT IS NOT ABOUT THE PROBE. Everything else here reports a
+			// probe that has stopped telling the truth; this reports a probe that is hurting someone
+			// else. Probe endpoints are typically uncached, so every probe is backend work for
+			// whoever runs the origin, and `ratePerSecond` was agreed with them for a HEALTHY origin.
+			// Pushback means that agreement no longer fits what the origin can take — and because the
+			// sweep answers by halving its own rate, the probe covers less of the corpus per pass
+			// while every other number on this card keeps its shape. Nothing else surfaces it.
+			throttled > 0 &&
+				note('bad', [
+					`The origin pushed back on ${fmtCount(throttled)} probe${throttled === 1 ? '' : 's'} ` +
+						`(${pct(throttled, failed)} of all probe failures). Those are 429/502/503/504 responses and ` +
+						'connect or read timeouts — the origin asking for room, not a rule that no longer fits. The ' +
+						'sweep halves its pacing rate for each batch that contains one and recovers by halves, so a ' +
+						'sustained count means passes are taking longer than ',
+					el('code', { text: 'sweepInterval' }),
+					' implies and the corpus is being re-probed more slowly than the settings say. Take it to ' +
+						'whoever runs the origin before raising ',
+					el('code', { text: 'changeProbe.ratePerSecond' }),
+					'.',
+				]),
+			// The application layer cannot address these rows, so no amount of console work reaches
+			// them: this is a database-layer escalation and the note says so rather than implying a
+			// setting would help.
+			unreadable > 0 &&
+				note('bad', [
+					`${fmtCount(unreadable)} registry row${unreadable === 1 ? '' : 's'} could not be decoded, and the ` +
+						'walk stepped over them. Those targets are never probed, never re-rendered on change, and ' +
+						'appear in no other count on this page. Stepping over them is the fix — the walk used to ' +
+						'END at the first one, silently, reporting a finished pass that had covered only the ' +
+						'keyspace before it — so the pass itself is sound. But a row the application layer cannot ' +
+						'address is a storage-layer fault: it belongs with the database team, not with a setting ' +
+						'here.',
+				]),
+			skipping &&
+				note('warn', [
+					`${pct(fresh, fresh + probed)} of the rows these passes considered were skipped because a ` +
+						'stored baseline was still fresh. Right after a restart that is ',
+					el('code', { text: 'reprobeAfter' }),
+					' doing its job — the interrupted pass had already covered that ground. Sustained, it means ',
+					el('code', { text: 'reprobeAfter' }),
+					' sits too close to ',
+					el('code', { text: 'sweepInterval' }),
+					': a URL probed late in one pass is skipped by the next, so its real cadence is two sweep ' +
+						'intervals and nothing else here shows it.',
+				]),
 			el('div', { cls: 'stats' }, [
 				stat('Probes', fmtCount(probed), 'attempts across every finished pass'),
 				stat('Changed', pct(changed, compared), `${fmtCount(changed)} of ${fmtCount(compared)} compared`),
@@ -351,6 +428,13 @@ function drift(ctx) {
 				),
 				stat('Seeded', fmtCount(seeded), 'first observation — nothing to compare yet'),
 				stat('Failed', pct(failed, probed), `${fmtCount(failed)} of ${fmtCount(probed)}`, { warn: failing }),
+				// Not inside `probed`: a skipped URL was never attempted. The sub-label gives the
+				// denominator explicitly so the tile cannot be read as a share of the probes.
+				stat('Skipped as fresh', fmtCount(fresh), `of ${fmtCount(fresh + probed)} rows considered`, {
+					warn: skipping,
+				}),
+				// Inside `failed`, and the sub-label says so — the two tiles are not additive.
+				stat('Throttled', fmtCount(throttled), 'origin pushback — inside Failed', { warn: throttled > 0 }),
 				stat('Canary trips', fmtCount(trips), `${fmtCount(invalidated)} recorded an invalidation`),
 			]),
 			keys.length
@@ -364,9 +448,11 @@ function drift(ctx) {
 				]),
 			el('p', { cls: 'muted chart-note' }, [
 				'One emit per finished pass, sweep and canary alike, so the bars are passes and not probes — a tall ',
-				'bar is a pass that landed in that bucket, not a busier minute. “Changed” is measured against the ',
-				'probes that HAD a baseline; seeds and failures are excluded from that denominator because neither ',
-				'compared anything.',
+				'bar is a pass that landed in that bucket, not a busier minute. These are series side by side and ',
+				'NOT a partition: “Probes” is the total the outcomes divide up, “Throttled” is the slice of ',
+				'“Failed” the origin caused, and “Skipped” sits outside “Probes” entirely because those rows were ',
+				'never attempted. “Changed” is measured against the probes that HAD a baseline; seeds and failures ',
+				'are excluded from that denominator because neither compared anything.',
 			]),
 		],
 		foot: [scanFooter(data)],
@@ -403,6 +489,21 @@ function sweepCard(ctx, status) {
 			])
 		);
 	}
+	// Above the counters, because it changes what they mean: this pass did not cover its slice, so
+	// every figure in it is a partial count of a keyspace region and not a result for the corpus.
+	if (last?.abortedOnDistress) {
+		body.push(
+			note('bad', [
+				'This pass STOPPED EARLY because the origin refused ',
+				el('code', { text: 'changeProbe.abortAfterDistress' }),
+				' probes in a row — an origin that is down rather than busy. It covered only the part of the ' +
+					'owned slice it had reached, so the counters below are a partial count and the rest of the ' +
+					'slice keeps whatever baselines it had. The next scheduled pass is the retry and it starts ' +
+					'clean; nothing needs restarting here. If it repeats, the origin is the thing to look at.',
+			])
+		);
+	}
+
 	if (hasCounters) {
 		const compared = Math.max(0, (last.probed ?? 0) - (last.seeded ?? 0) - (last.failed ?? 0));
 		body.push(
@@ -422,11 +523,40 @@ function sweepCard(ctx, status) {
 				['Re-renders filed', last.triggered ? pill(num(last.triggered), 'ok') : pill('0', '')],
 				last.deferred ? ['Deferred past the trigger cap', pill(num(last.deferred), 'warn')] : null,
 				['Failed probes', last.failed ? pill(num(last.failed), 'warn') : pill('0', 'ok')],
+				// Inside "Failed probes" above, so it is only worth a row when there were any — and
+				// then it is the row that matters, because it names the origin rather than the rule.
+				last.throttled ? ['— of those, origin pushback', pill(num(last.throttled), 'bad')] : null,
+				// The pass's END state, not its worst moment: the window halves back on every clean
+				// batch, so a value above 1 here means the pass was STILL backed off when it finished.
+				last.throttleLevel > 1
+					? ['Pacing window at the end', pill(`${num(last.throttleLevel)}× normal — still backed off`, 'bad')]
+					: null,
+				// Skipped rows are not in `probed`, so without this row the two numbers do not close
+				// and the pass reads as having found less to do than it did.
+				last.fresh ? ['Skipped — baseline still fresh', pill(num(last.fresh), '')] : null,
+				last.unreadable ? ['Unreadable rows stepped over', pill(num(last.unreadable), 'bad')] : null,
 				last.errors ? ['Trigger write errors', pill(num(last.errors), 'bad')] : null,
-				last.aborted ? ['Interrupted', pill('stood down for a reseed, or the probe was disabled', '')] : null,
+				// The three reasons a pass can stop early are not interchangeable: two are routine and
+				// one is an origin that stopped answering, and a single "Interrupted" label made the
+				// third indistinguishable from the first two.
+				last.aborted
+					? [
+							'Interrupted',
+							last.abortedOnDistress
+								? pill(
+										last.distressedOn?.length
+											? `gave up on a refusing origin (${last.distressedOn.join(', ')})`
+											: 'gave up on a refusing origin',
+										'bad'
+									)
+								: pill('stood down for a reseed, or the probe was disabled', ''),
+						]
+					: null,
 			])
 		);
-	} else if (!last) {
+	}
+
+	if (!last) {
 		body.push(muted('No sweep has finished since startup. The first one runs after changeProbe.startDelay.'));
 	}
 
@@ -605,6 +735,7 @@ function nodeTable(status) {
 					{ text: 'probed', right: true },
 					{ text: 'changed', right: true },
 					{ text: 'failed', right: true },
+					{ text: 'throttled', right: true },
 				],
 				rows.map((row) =>
 					el('tr', null, [
@@ -618,10 +749,16 @@ function nodeTable(status) {
 						el('td', null, [
 							row.sweepFinishedAt ? muted(ago(row.sweepFinishedAt)) : muted('never'),
 							row.error && pill('errored', 'bad'),
+							// The pass ended without covering its slice, which no counter in this row says.
+							row.abortedOnDistress && pill('gave up — origin refusing', 'bad'),
 						]),
 						el('td', { cls: 'right mono', text: num(row.probed) }),
 						el('td', { cls: 'right mono', text: num(row.changed) }),
 						el('td', { cls: 'right mono', text: num(row.failed) }),
+						// Belongs in the UNSUMMED table: the probe rate is agreed per node and held per
+						// node, so pushback is a fact about one node's origin conversation. This column is
+						// how an operator picks which node to go and look at.
+						el('td', { cls: 'right mono', text: num(row.throttled) }),
 					])
 				)
 			),
@@ -647,7 +784,10 @@ function settings(ctx) {
 				'for whoever runs the origin, and it also sizes the sweep (a 200k-URL slice at 10/s is about 5.6 ' +
 				'hours per pass). Leave dryRun on until the change rate above has been watched for a while: ' +
 				'signatures are written either way, so a dry-run week converges on the true rate rather than ' +
-				're-reporting the same delta.',
+				're-reporting the same delta. backoffMax and abortAfterDistress are what the sweep does when the ' +
+				'origin pushes back at that rate anyway, and reprobeAfter is what makes a restarted sweep resume ' +
+				'instead of re-probing ground it had already covered — keep it comfortably below sweepInterval, ' +
+				'or passes start skipping work that is genuinely due.',
 		}),
 	]);
 }

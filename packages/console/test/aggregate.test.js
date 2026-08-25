@@ -820,6 +820,73 @@ const probeBody = (node, over = {}) => ({
 	...over,
 });
 
+// `fresh` and `throttled` partition the corpus exactly as the other counters do — each node
+// probes its own slice — so they sum. They are not subsets of one another and must not be folded:
+// `fresh` sits outside `probed` entirely, `throttled` sits inside `failed`.
+/** A sweep block whose lastRun carries `over` on top of the standard stats. */
+const sweepWith = (over) => ({
+	running: false,
+	armedInterval: 86_400_000,
+	lastRun: { ...probeStats(), ...over, dryRun: true, node: 'n', startedAt: 1000, finishedAt: 2000, error: null },
+});
+
+test('change probe: the resumable-sweep and pushback counters sum like every other pass counter', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { sweep: sweepWith({ fresh: 400, throttled: 30 }) })),
+		ok('b', probeBody('b', { sweep: sweepWith({ fresh: 600, throttled: 12 }) })),
+	]);
+	assert.equal(body.sweep.lastRun.fresh, 1000);
+	assert.equal(body.sweep.lastRun.throttled, 42);
+});
+
+// THE WORST WINDOW ANY NODE ENDED ON, never a mean. The question is "was the probe being held
+// back", and averaging one throttled node against three healthy ones answers it with a number that
+// was true on no node — 2.75× describes nothing that happened.
+test('change probe: the pacing window is the worst node’s, not an average across the cluster', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { sweep: sweepWith({ throttleLevel: 1 }) })),
+		ok('b', probeBody('b', { sweep: sweepWith({ throttleLevel: 8 }) })),
+		ok('c', probeBody('c', { sweep: sweepWith({ throttleLevel: 1 }) })),
+	]);
+	assert.equal(body.sweep.lastRun.throttleLevel, 8);
+});
+
+// A node that gave up covered none of the rest of its slice, so every summed counter above is
+// short by that remainder — which reads as a smaller corpus, not as a missing one. Same rule as
+// `unsweptNodes`: name the nodes, do not fold them into a count.
+test('change probe: a node that gave up on a refusing origin is NAMED, not averaged away', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a')),
+		ok('b', probeBody('b', { sweep: sweepWith({ aborted: true, abortedOnDistress: true, throttled: 500 }) })),
+	]);
+	assert.equal(body.sweep.lastRun.abortedOnDistress, true);
+	assert.deepEqual(body.sweep.lastRun.distressedOn, ['b.example.com:9926']);
+	assert.deepEqual(body.sweep.lastRun.throttledOn, ['b.example.com:9926']);
+});
+
+// The probe rate is agreed with the origin's operator PER NODE and held per node, so pushback is a
+// fact about one node's conversation with the origin. The unsummed table is where an operator
+// picks which node to go and look at; a cluster total names nobody.
+test('change probe: per-node rows carry the pushback, because the rate limit is per node', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a')),
+		ok('b', probeBody('b', { sweep: sweepWith({ throttled: 500, abortedOnDistress: true }) })),
+	]);
+	const b = body.byNode.find((row) => row.hostname === 'b.example.com:9926');
+	assert.equal(b.throttled, 500);
+	assert.equal(b.abortedOnDistress, true);
+});
+
+// A walk fault, not a pass outcome — summed, but reported apart from the counters that describe
+// what a probe DID, and never iterated by the per-rule canary merge (it has no per-rule meaning).
+test('change probe: unreadable rows sum but stay out of the per-rule outcome list', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { sweep: sweepWith({ unreadable: 3 }) })),
+		ok('b', probeBody('b', { sweep: sweepWith({ unreadable: 4 }) })),
+	]);
+	assert.equal(body.sweep.lastRun.unreadable, 7);
+});
+
 test('change probe: pass counters SUM, because each node probes a disjoint slice of the keyspace', () => {
 	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b'))]);
 	assert.equal(body.sweep.lastRun.probed, 2000);
@@ -975,4 +1042,57 @@ test('discovery purge: a pass still running has no finish time, on any node', ()
 	assert.equal(body.running, true);
 	assert.deepEqual(body.runningOn, ['b.example.com:9926']);
 	assert.equal(body.finishedAt, null);
+});
+
+// The same class of divergence as two prefixes, one layer in: the nodes ran the SAME prefix under
+// DIFFERENT delete predicates. `skipVisited` follows `dryRun`'s rule — true of the cluster only if
+// every node that ran did it — and the nodes that did are named, because the rows the others
+// deleted are gone and re-running the sparing nodes will not bring them back.
+test('discovery purge: sparing bot-visited targets is a cluster fact only if EVERY node spared them', () => {
+	const all = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a', { skipVisited: true })),
+		ok('b', purgeBody('b', { skipVisited: true })),
+	]).body;
+	assert.equal(all.skipVisited, true);
+
+	const mixed = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a', { skipVisited: true })),
+		ok('b', purgeBody('b', { skipVisited: false })),
+	]).body;
+	assert.equal(mixed.skipVisited, false);
+	assert.deepEqual(mixed.skipVisitedOn, ['a.example.com:9926']);
+});
+
+// Every one of these is a way a discovered row survived the pass, and the "not reached" figure the
+// UI renders is `discovered` minus all of them. A term missing from the sum does not read as a
+// missing term — it reads as keyspace the pass never got to.
+test('discovery purge: every way a row survived the pass is summed, not just the deletes', () => {
+	const { body } = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a', { visitedSkipped: 300, errors: 2, unreadable: 1 })),
+		ok('b', purgeBody('b', { visitedSkipped: 700, errors: 3, unreadable: 4 })),
+	]);
+	assert.equal(body.totals.visitedSkipped, 1000);
+	assert.equal(body.totals.errors, 5);
+	assert.equal(body.totals.unreadable, 5);
+});
+
+// A DIFFERENT FAILURE FROM `error`: that is one pass that threw, this is a pass deciding the
+// storage engine had stopped accepting deletes and stopping itself. The samples pool across nodes
+// because a failed delete leaves a row in the corpus that appears in no other surface.
+test('discovery purge: a self-stopped pass is reported with the samples that explain it', () => {
+	const { body } = mergerFor('discovery-purge')([
+		ok('a', purgeBody('a')),
+		ok(
+			'b',
+			purgeBody('b', {
+				abortedOnErrors: true,
+				errors: 25,
+				errorSamples: [{ url: 'https://www.example.com/catalog/x', error: 'transaction timeout' }],
+			})
+		),
+	]);
+	assert.equal(body.abortedOnErrors, true);
+	assert.equal(body.errorSamples.length, 1);
+	assert.equal(body.errorSamples[0].hostname, 'b.example.com:9926');
+	assert.equal(body.byNode.find((row) => row.hostname === 'b.example.com:9926').abortedOnErrors, true);
 });

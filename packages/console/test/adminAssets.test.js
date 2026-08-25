@@ -225,7 +225,10 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'demandLadder',
 		'invalidationError',
 		'invalidationReenqueue',
-		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe view.
+		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe
+		// view, and guarded by name in the test BELOW: being on this list exempts an emitter from
+		// the scan above, which is how three probe series once shipped with no panel and a green
+		// suite on both sides.
 		'changeProbe',
 	]);
 
@@ -269,6 +272,51 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		assert.ok(
 			client.includes(`'${name}'`),
 			`the plugin emits ${series} and no console view reads it — chart it, or add it to NOT_CHARTED with the reason`
+		);
+	}
+});
+
+/**
+ * The same contract as the test above, for the ONE emitter family the scan above cannot see.
+ *
+ * `DYNAMIC_SERIES_SLOT` exempts an emitter from the literal scan because its series name is built
+ * at the call site — and an exemption is a hole. `metrics.changeProbe` emits `probe_${series}`,
+ * so v0.56.0 and v0.57.0 added `probe_fresh`, `probe_throttled` and `probe_unreadable`, the
+ * console read none of them, and every test on both sides stayed green. `probe_throttled` is the
+ * one the catalog says to ALERT on: it is the only signal that the probe is loading an origin that
+ * cannot take it.
+ *
+ * Ground truth here is the catalog's machine-readable `values` list rather than the emit sites,
+ * because the emit sites are exactly what the regex cannot read. The two can drift — the test
+ * above says so and it has happened — which is why this checks the family the OTHER test is blind
+ * to instead of replacing it. Between them, a new probe series has to be charted or waived.
+ *
+ * WHAT THIS STILL DOES NOT COVER: the other dynamic families (`sitemap_*`, `demand_*`,
+ * `queue_health`'s gauges, `invalidation_*`). Those are legitimately unread from analytics — the
+ * queue gauges are read from the overview endpoint instead, and the demand series have no panel —
+ * so guarding them means a waiver list stating a decision per series, which belongs with whoever
+ * makes those decisions rather than in a catch-up change.
+ */
+test('every probe series the catalog declares is read by the console, or waived with a reason', async () => {
+	const { METRICS } = await import('../../plugin/src/metrics.js');
+	const series = (METRICS.prerender_ops?.dimensions?.path?.values ?? []).filter(
+		(value) => typeof value === 'string' && value.startsWith('probe_')
+	);
+	assert.ok(series.length > 5, 'expected the probe series to be enumerated in the catalog');
+
+	// The probe view holds the SUFFIX — `totalOf('fresh')` builds `probe_fresh` — so a bare
+	// `probe_fresh` literal will not appear anywhere in the client. Both spellings count.
+	const client = [...clientSources.values()].join('\n');
+	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('probe_'.length)}'`);
+
+	const NOT_CHARTED = new Map();
+
+	for (const name of series) {
+		if (NOT_CHARTED.has(name)) continue;
+		assert.ok(
+			isRead(name),
+			`the plugin emits prerender_ops.${name} and no console view reads it — chart it on the Change ` +
+				"probe view, or add it to this test's NOT_CHARTED with the reason"
 		);
 	}
 });

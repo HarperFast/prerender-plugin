@@ -634,10 +634,31 @@ function discovered(ctx) {
 		ctx.data.purgePrefix = input.value.trim();
 		return ctx.data.purgePrefix;
 	};
+
+	// SPARING BOT-VISITED TARGETS IS THE SAFE DEFAULT, so the console defaults it on even though
+	// the plugin's own default is off (a plugin default that changed behaviour for existing callers
+	// would be the wrong kind of change; a console default is a suggestion to a human).
+	//
+	// A stored `demandInterval` is not a guess: the ladder writes a rung only after a bot visited
+	// the URL in each of several consecutive windows, so it is durable evidence of repeat crawler
+	// demand on a page no sitemap declares. Deleting one discards a live, served page and lets the
+	// crawler re-mint it — a delete and a re-render to arrive back where we started. The test is
+	// one-sided on purpose (a stamp proves demand; its absence proves only that no repeat visit was
+	// observed), and that asymmetry points the same way: sparing a dead page costs one row.
+	ctx.data.purgeSkipVisited ??= true;
+	const skipVisited = el('input', {
+		type: 'checkbox',
+		// The house convention for a boolean attribute: present or absent, never `checked="false"`.
+		checked: ctx.data.purgeSkipVisited ? '' : null,
+		onchange: (e) => {
+			ctx.data.purgeSkipVisited = !!e.target.checked;
+		},
+	});
+
 	const start = (dryRun) => {
 		const urlPrefix = remember();
 		if (!urlPrefix) return;
-		return ctx.run(() => ctx.post('discovery-purge', { urlPrefix, dryRun }));
+		return ctx.run(() => ctx.post('discovery-purge', { urlPrefix, dryRun, skipVisited: ctx.data.purgeSkipVisited }));
 	};
 
 	const body = [
@@ -667,16 +688,65 @@ function discovered(ctx) {
 					onclick: () => ctx.run(() => ctx.post('discovery-purge', { action: 'stop' })),
 				}),
 		]),
+		el('label', { cls: 'muted', style: { display: 'flex', alignItems: 'center', gap: '6px', margin: '8px 0 0' } }, [
+			skipVisited,
+			el('span', null, [
+				'Spare targets the demand ladder has promoted — pages a bot came back to across several ' +
+					'windows, which a purge would delete only for the crawler to re-mint. Applies to the census ' +
+					'as well, so the count reflects what the matching purge would remove.',
+			]),
+		]),
 	];
 
 	if (state?.error) body.push(el('div', { cls: 'note bad', text: `Last pass failed: ${state.error}` }));
+
+	// A DIFFERENT FAILURE FROM `state.error`, and it has to say so. `error` is one pass that threw;
+	// this is the pass deciding the storage engine had stopped accepting deletes and stopping
+	// itself. Grinding on would have kept issuing writes the engine was already rejecting.
+	if (state?.abortedOnErrors) {
+		body.push(
+			el('div', { cls: 'note bad' }, [
+				'The pass STOPPED ITSELF after failing to delete many rows in a row — that is the storage engine ' +
+					'refusing, not one bad row. What it had already deleted is deleted; the rest of the prefix is ' +
+					'untouched. Deletes cascade to schedule rows, cached pages and probe baselines, so this is worth ' +
+					'reading as load before starting another pass: re-run it when the node is quieter, and lower ' +
+					'the rate if it recurs.',
+			])
+		);
+	}
+
+	// The samples, because a delete failure appears in no other surface: it is not a render, not a
+	// serve, and the row it names is still in the corpus and still being re-rendered on cadence.
+	if (state?.errorSamples?.length) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				'First delete failures: ',
+				el('span', { cls: 'mono break' }, [
+					state.errorSamples
+						.map((sample) => `${sample.hostname ? sample.hostname + ' ' : ''}${sample.url} — ${sample.error}`)
+						.join(' · '),
+				]),
+			])
+		);
+	}
 
 	// `startedAt` is what separates "has run" from "never run": a node that has never run answers
 	// `{ running: false }` and nothing else, and rendering that as a row of zeroes would read as a
 	// clean census.
 	const totals = state?.totals ?? state;
 	if (state?.startedAt) {
-		const stranded = (totals.discovered ?? 0) - (totals.leaseSkipped ?? 0) - (totals.deleted ?? 0);
+		// EVERY WAY A DISCOVERED ROW SURVIVED THE PASS, subtracted — not just the deletes. A row that
+		// reached the delete decision was deleted, deferred as in-flight, spared as bot-visited, or
+		// it errored; anything left over is what the pass had not reached when it stopped. Omitting a
+		// term inflates this figure by exactly that term, which turns "we spared 40% of the prefix on
+		// purpose" into "~40% was never reached" — a completed pass reported as an interrupted one.
+		//
+		// `unreadable` is NOT a term here, and that is not an omission: those rows are skipped by the
+		// walk before anything reads their sitemapUrl, so they never entered `discovered` and cannot
+		// be subtracted from it. They get their own row below.
+		const accounted =
+			(totals.deleted ?? 0) + (totals.leaseSkipped ?? 0) + (totals.visitedSkipped ?? 0) + (totals.errors ?? 0);
+		const stranded = (totals.discovered ?? 0) - accounted;
 		body.push(
 			kv([
 				[
@@ -690,7 +760,14 @@ function discovered(ctx) {
 				['Discovered (never in a sitemap)', totals.discovered ? pill(num(totals.discovered), 'warn') : pill('0', 'ok')],
 				['Deleted', state.dryRun ? muted('none — census') : num(totals.deleted)],
 				totals.leaseSkipped ? ['Deferred as in-flight', pill(num(totals.leaseSkipped), '')] : null,
-				state.canceled && stranded > 0
+				// Shown whenever the flag was on, INCLUDING at zero: "spared 0" and "did not check"
+				// are different findings, and only one of them says the prefix has no live demand on
+				// it. At zero on a large prefix that is itself worth seeing.
+				state.skipVisited ? ['Spared as bot-visited', pill(num(totals.visitedSkipped ?? 0), 'ok')] : null,
+				totals.unreadable ? ['Unreadable rows stepped over', pill(num(totals.unreadable), 'bad')] : null,
+				totals.errors ? ['Failed — left for the next pass', pill(num(totals.errors), 'bad')] : null,
+				// A pass that stopped early OR gave up on errors left the rest of the prefix in place.
+				(state.canceled || state.abortedOnErrors) && stranded > 0
 					? ['Not reached', pill(`~${num(stranded)} left under this prefix`, 'warn')]
 					: null,
 			])
@@ -717,6 +794,21 @@ function discovered(ctx) {
 		);
 	}
 
+	// The same class of divergence as the prefixes above, and just as invisible in a total: the
+	// nodes applied different DELETE PREDICATES to the same prefix, so "spared as bot-visited" is
+	// true of part of the keyspace and false of the rest — and the rows the other nodes deleted are
+	// gone either way.
+	if (state?.ranNodes > 1 && state.skipVisitedOn?.length && state.skipVisitedOn.length < state.ranNodes) {
+		body.push(
+			el('div', { cls: 'note warn' }, [
+				`Only ${state.skipVisitedOn.join(', ')} spared bot-visited targets — the other nodes deleted theirs. ` +
+					'The totals above therefore sum two different predicates over the same prefix. Re-running the ' +
+					'sparing nodes will not restore what the others removed; crawlers re-mint those URLs if the ' +
+					'route is still discovering.',
+			])
+		);
+	}
+
 	body.push(
 		el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
 			'Gate the route first — set ',
@@ -734,6 +826,12 @@ function discovered(ctx) {
 			pill('manual — no timer'),
 			state?.running &&
 				pill(state.runningOn?.length ? `running on ${state.runningOn.join(', ')}` : 'running now', 'warn'),
+			// Under cluster scope the merge reports `skipVisited` only when EVERY node that ran used it,
+			// so a mixed cluster reads as "deleting" — which is the true half: some nodes did, and
+			// those rows are gone. The note below names which nodes spared theirs. A plugin older
+			// than v0.57.0 has no such flag and also reads as "deleting", which is equally correct.
+			state?.startedAt &&
+				(state.skipVisited ? pill('sparing bot-visited', 'ok') : pill('deleting bot-visited', 'warn')),
 			spacer(),
 			state?.ratePerSecond ? muted(`${num(state.ratePerSecond)}/s`) : null,
 		],

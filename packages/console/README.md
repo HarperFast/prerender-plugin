@@ -171,12 +171,33 @@ indistinguishable from a catalogue that is not moving. The canary's verdict is r
 since a trip is a threshold crossed against one node's own cohort, and a trip that recorded no
 invalidation says which of the three reasons it was.
 
+The same view carries the one alarm here that is not about the probe at all. Plugin v0.56.0 gave
+the sweep an origin backoff, and `probe_throttled` — 429/502/503/504 and connect/read timeouts — is
+the only signal that the probe is loading an origin that cannot take it. The sweep answers pushback
+by halving its own rate, so it covers less of the corpus per pass while the change rate, the failure
+share and the trigger count all keep exactly the shape they had; nothing else surfaces it. Two
+companions sit beside it: rows skipped because a baseline was still fresh (v0.56.0's resumable
+sweeps — counted against the rows a pass _considered_, since a skipped URL was never probed, and
+flagged when a settled deployment skips most of them, which means `reprobeAfter` sits too close to
+`sweepInterval`), and registry rows that could not be decoded, which is a storage-layer escalation
+rather than anything a setting here reaches.
+
 **The discovery gate** is split across the two views that own its halves: how much crawl traffic
 the gate is holding out of the render rotation is on Traffic (it carries a bot, so the bot filter
 applies), while the purge that removes what got in before the gate went on sits on Overview beside
 the key-rule orphan sweep — the console's other corpus-deleting action. The card states the
 gate-first interlock rather than leaving it to the plugin's 400: with the route still discovering,
 crawlers re-mint exactly what a purge removes.
+
+That card defaults to **sparing bot-visited targets** (plugin v0.57.0's `skipVisited`), even though
+the plugin's own default is off — a plugin default that changed behaviour for existing callers
+would be the wrong kind of change, while a console default is a suggestion to a human. A stored
+demand rung is durable evidence that a crawler came back to a page no sitemap declares, and
+deleting one buys a delete plus a re-render to arrive back where we started. The flag rides on the
+census as well as the purge, so the number an operator approves is the number that happens. Every
+way a row survived a pass — deferred, spared, unreadable, failed — is subtracted before the card
+reports what the pass never reached; a missing term there turns "we spared 40% on purpose" into
+"~40% was never reached".
 
 Two more changed shape when configuration became editable:
 
