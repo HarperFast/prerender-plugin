@@ -502,6 +502,13 @@ const renderer: Renderer = async (page, job) => {
 			}
 
 			if (job.isIndexable || job.isFromSitemap) {
+				// Before postProcess: it may strip nodes, and this must describe the page as
+				// rendered. Best-effort — a failure here must never cost the render its content.
+				// null is posted AS null: on the wire, null means "extraction ran, no Product
+				// offers (or it failed benignly)" while an ABSENT field means "renderer predates
+				// this feature" — the consumer alarms on the latter, so collapsing null into
+				// undefined would make every offerless page impersonate an outdated renderer.
+				job.structuredOffers = await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null);
 				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
 				timings.postProcess = Date.now() - ppStart;
@@ -646,6 +653,96 @@ export function indexVerdict(
 		isIndexable: false,
 		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
 	};
+}
+
+// Refusal threshold, not a sample size: a variant-heavy PDP legitimately carries dozens of offer
+// triples, but past this the page posts NO claim rather than a truncated one (see
+// extractStructuredOffers — a deterministic sample can systematically disagree with the
+// consumer's endpoint).
+const STRUCTURED_OFFER_CAP = 200;
+
+/**
+ * The page's schema.org Product offers, flattened to [price, currency, availability] triples and
+ * sorted so the sequence is stable across renders of unchanged content.
+ *
+ * Runs IN THE PAGE against the settled DOM, which is the whole point: the consumer would otherwise
+ * have to regex-scan and JSON-parse the serialized document (~1MB on a commerce PDP) on its hottest
+ * write path to recover values this process can read directly. Returns null when the page declares
+ * no Product offers, so "no structured data" stays distinguishable from "no offers".
+ *
+ * A page carrying MORE offers than the cap also returns null — no claim, never a truncated one. A
+ * deterministic sample that happens to omit the offer the consumer's endpoint reports would
+ * disagree with it on every comparison, and a systematic disagreement means the consumer expires
+ * and re-renders that page forever. "Too many offers to read confidently" degrades to exactly
+ * what "no offers" does: nothing.
+ *
+ * Self-contained (passed to page.evaluate) — no imports, no closure over module scope.
+ */
+function extractStructuredOffers(cap: number): Array<string | null> | null {
+	const triples: Array<Array<string | null>> = [];
+	let overflowed = false;
+	// Field-level byte bound: the cap bounds triple COUNT, so without this a single pathological
+	// field (a megabyte "price" string) would still inflate every posted result for the page. No
+	// legitimate price, currency code, or availability token approaches 64 characters.
+	const bound = (value: string): string | null => (value === '' ? null : value.slice(0, 64));
+	const collect = (node: unknown) => {
+		if (overflowed || !node || typeof node !== 'object') return;
+		const record = node as Record<string, unknown>;
+		const type = record['@type'];
+		const isProduct = type === 'Product' || (Array.isArray(type) && type.includes('Product'));
+		if (!isProduct) return;
+		const raw = record.offers;
+		const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+		for (const entry of list) {
+			if (!entry || typeof entry !== 'object') continue;
+			if (triples.length >= cap) {
+				overflowed = true;
+				return;
+			}
+			const offer = entry as Record<string, unknown>;
+			// filter(Boolean) before pop: a trailing slash (https://schema.org/InStock/) would
+			// otherwise pop the empty segment and read as no availability at all.
+			const availability =
+				typeof offer.availability === 'string'
+					? bound(offer.availability.split('/').filter(Boolean).pop() ?? '')
+					: null;
+			const price = offer.price === undefined || offer.price === null ? null : bound(String(offer.price));
+			const currency = typeof offer.priceCurrency === 'string' ? bound(offer.priceCurrency) : null;
+			triples.push([price, currency, availability]);
+		}
+	};
+	document.querySelectorAll('script[type="application/ld+json"]').forEach((el) => {
+		if (overflowed) return;
+		let data: unknown;
+		try {
+			data = JSON.parse(el.textContent || '');
+		} catch {
+			return; // one malformed block must not cost the page its other blocks
+		}
+		const graph = (data as Record<string, unknown>)?.['@graph'];
+		const nodes = Array.isArray(data) ? data : Array.isArray(graph) ? graph : [data];
+		for (const node of nodes) {
+			if (overflowed) break;
+			collect(node);
+		}
+	});
+	if (overflowed || !triples.length) return null;
+	// Field-wise, not JSON.stringify per comparison: sorting is O(n log n) COMPARISONS, so
+	// stringifying inside the comparator serialises every triple many times over. Code-unit
+	// comparison, not localeCompare: the whole point of the sort is a sequence that is identical
+	// across renders, and collation varies with the browser's locale/ICU.
+	triples.sort((a, b) => {
+		for (let i = 0; i < 3; i++) {
+			const x = a[i];
+			const y = b[i];
+			if (x === y) continue;
+			if (x === null) return -1;
+			if (y === null) return 1;
+			return x < y ? -1 : 1;
+		}
+		return 0;
+	});
+	return triples.flat();
 }
 
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {
