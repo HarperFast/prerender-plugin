@@ -680,7 +680,10 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 		for (const entry of list) {
 			if (!entry || typeof entry !== 'object') continue;
 			const offer = entry as Record<string, unknown>;
-			const availability = typeof offer.availability === 'string' ? offer.availability.split('/').pop()! : null;
+			// filter(Boolean) before pop: a trailing slash (https://schema.org/InStock/) would
+			// otherwise pop the empty segment and read as no availability at all.
+			const availability =
+				typeof offer.availability === 'string' ? (offer.availability.split('/').filter(Boolean).pop() ?? null) : null;
 			const price = offer.price === undefined || offer.price === null ? null : String(offer.price);
 			const currency = typeof offer.priceCurrency === 'string' ? offer.priceCurrency : null;
 			triples.push([price, currency, availability]);
@@ -701,7 +704,19 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 		for (const node of nodes) collect(node);
 	});
 	if (!triples.length) return null;
-	triples.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+	// Field-wise, not JSON.stringify per comparison: sorting is O(n log n) COMPARISONS, so
+	// stringifying inside the comparator serialises every triple many times over.
+	triples.sort((a, b) => {
+		for (let i = 0; i < 3; i++) {
+			const x = a[i];
+			const y = b[i];
+			if (x === y) continue;
+			if (x === null) return -1;
+			if (y === null) return 1;
+			return x.localeCompare(y);
+		}
+		return 0;
+	});
 	return triples.flat();
 }
 

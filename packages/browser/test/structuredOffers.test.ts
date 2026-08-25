@@ -43,6 +43,13 @@ const MALFORMED = page(
 <script type="application/ld+json">${JSON.stringify({ '@type': 'Product', 'offers': { price: 5, availability: 'InStock' } })}</script>`
 );
 
+const TRAILING_SLASH = page(
+	`<script type="application/ld+json">${JSON.stringify({
+		'@type': 'Product',
+		'offers': { price: 7.5, priceCurrency: 'USD', availability: 'https://schema.org/InStock/' },
+	})}</script>`
+);
+
 const NONE = page(`<script type="application/ld+json">${JSON.stringify({ '@type': 'WebPage' })}</script>`);
 
 const NO_SCROLL = { scroll: { enabled: false } } as const;
@@ -91,4 +98,10 @@ test('a page declaring no Product offers reports undefined, not an empty array',
 	body = NONE;
 	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
 	assert.equal(job.structuredOffers, undefined);
+});
+
+test('a trailing slash on the availability URL still yields the verdict, not an empty string', async () => {
+	body = TRAILING_SLASH;
+	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
+	assert.deepEqual(job.structuredOffers, ['7.5', 'USD', 'InStock']);
 });
