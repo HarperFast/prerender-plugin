@@ -862,8 +862,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'had structured), so against an older renderer pageCheck records nothing and detects nothing \u2014 ' +
 					'logged hourly rather than failing silently. `source: request` only: in document mode the stored signature already IS the ' +
 					'page\u2019s offers. A page yielding no Product offers records nothing, exactly as a failed ' +
-					'probe changes nothing, so a markup change cannot make every page look like a disagreement. ' +
-					'Detection is one extra node-local write per render and no extra origin traffic.' +
+					'probe changes nothing, so a markup change cannot make every page look like a disagreement \u2014 ' +
+					'and each dimension compares only when BOTH sides make a readable claim (availability must ' +
+					'reduce to a recognized schema.org verdict on the page and a boolean at the endpoint; price ' +
+					'must parse as a number on the page), so an unrecognized vocabulary or price format degrades ' +
+					'to detecting nothing rather than expiring everything. ' +
+					'Detection is one extra node-local write per render and no extra origin traffic.\n' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
 					'records on a mass change. Empty = the canary detects and logs only.\n' +
 					'  label            optional name for logs and the admin surface.',

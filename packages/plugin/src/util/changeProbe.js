@@ -354,13 +354,15 @@ export const recordPageClaim = async (url, structuredOffers) => {
 		if (!pathname) return;
 		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(pathname));
 		if (!rule) return;
-		if (!structuredOffers) {
-			// The renderer did not send the page's offers. There is deliberately NO fallback to
-			// parsing the stored HTML: recovering them here means a regex scan and a JSON parse of a
-			// ~1MB document on the hottest write path in this process, to reconstruct what the
-			// browser had structured in front of it. So pageCheck is INERT against a renderer older
-			// than 1.20.0 — say so rather than failing silently, since a config that looks enabled
-			// and protects nothing is the worst outcome.
+		if (structuredOffers === undefined) {
+			// The renderer does not know the field at all — it predates 1.20.0. There is
+			// deliberately NO fallback to parsing the stored HTML: recovering the offers here means
+			// a regex scan and a JSON parse of a ~1MB document on the hottest write path in this
+			// process, to reconstruct what the browser had structured in front of it. So pageCheck
+			// is INERT against an older renderer — say so rather than failing silently, since a
+			// config that looks enabled and protects nothing is the worst outcome. `null` is the
+			// other case and is NOT this warn: a >=1.20.0 renderer ran the extraction and the page
+			// declared no Product offers — nothing to record, same rule as a failed probe.
 			warnPageClaimUnsupported();
 			return;
 		}
@@ -505,7 +507,10 @@ export const runProbePass = async ({
 		if (dryRun) {
 			// Signature written in dry-run ON PURPOSE: each pass then reports fresh changes — the
 			// true change rate — instead of re-reporting the same delta forever. Demand-ladder
-			// precedent (its dry run persists rung moves for the same reason).
+			// precedent (its dry run persists rung moves for the same reason). The page claim is
+			// the opposite case and is deliberately NOT cleared: nothing was expired, so the
+			// disagreement still stands — in dry-run `pageMismatch` reads as a standing gauge of
+			// disagreeing pages per pass, where armed it is a detection rate.
 			await write(row.url, observed, stored?.pageSignature ?? null);
 			return;
 		}
@@ -1041,4 +1046,5 @@ export const resetChangeProbeState = () => {
 	cohortBuildDone = false;
 	compiledRules = null;
 	compiledFrom = undefined;
+	lastUnsupportedWarnAt = 0;
 };

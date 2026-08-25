@@ -725,3 +725,94 @@ test('a signature write PRESERVES the page claim — put replaces the row, so it
 	assert.equal(written.length, 1);
 	assert.equal(written[0].pageSignature, claim, 'a drift write must carry the page claim through');
 });
+
+/**
+ * recordPageClaim — the render-path write. This is the function that seeds ProbeState rows, so the
+ * table verb is the contract: patch cannot create a missing record (put must be the seed), and put
+ * on an existing row would clobber the probe's own columns (patch must be the update). The fakes
+ * record WHICH verb ran, because a green `await` on the wrong verb is exactly how a silent-no-op
+ * seeding bug almost shipped in this branch.
+ */
+const CLAIM_URL = 'https://example.com/product/prd-123/thing.jsp';
+const claimHarness = async ({ existing = null } = {}) => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({
+		changeProbe: {
+			rules: [
+				{
+					label: 'pdp',
+					pathPattern: '^/product/prd-',
+					source: 'request',
+					request: { urlTemplate: 'https://api.example.com/x', method: 'POST', body: '{}' },
+					extract: ['a', 'b', 'price', 'available'],
+					pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
+				},
+			],
+		},
+	});
+	const calls = { get: [], put: [], patch: [] };
+	globalThis.databases.probe_state.ProbeState = {
+		async get(query) {
+			calls.get.push(query);
+			return existing;
+		},
+		async put(id, row) {
+			calls.put.push({ id, row });
+		},
+		async patch(id, patch) {
+			calls.patch.push({ id, patch });
+		},
+	};
+	return calls;
+};
+const restoreConfig = async () => (await import('../src/config.js')).applyOptions({});
+
+test('recordPageClaim SEEDS a missing row with put — patch cannot create', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness();
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock']);
+	assert.equal(calls.patch.length, 0);
+	assert.equal(calls.put.length, 1);
+	assert.equal(calls.put[0].id, CLAIM_URL);
+	assert.deepEqual(calls.put[0].row, { url: CLAIM_URL, pageSignature: JSON.stringify([['35.99'], true]) });
+});
+
+test('recordPageClaim UPDATES an existing row with patch — put would clobber the probe baseline', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness({ existing: { url: CLAIM_URL } });
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'OutOfStock']);
+	assert.equal(calls.put.length, 0);
+	assert.equal(calls.patch.length, 1);
+	assert.equal(calls.patch[0].id, CLAIM_URL);
+	assert.deepEqual(calls.patch[0].patch, { pageSignature: JSON.stringify([['35.99'], false]) });
+});
+
+test('recordPageClaim: an ABSENT field means an old renderer — warn once an hour, write nothing', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness();
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	await changeProbe.recordPageClaim(CLAIM_URL, undefined);
+	await changeProbe.recordPageClaim(CLAIM_URL, undefined);
+	assert.equal(warns.length, 1, 'the per-render warn must throttle');
+	assert.match(warns[0], /older than @harperfast\/prerender-browser 1\.20\.0/);
+	assert.equal(calls.get.length + calls.put.length + calls.patch.length, 0);
+});
+
+test('recordPageClaim: null means the extraction RAN and found nothing — silent, no version alarm', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness();
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	await changeProbe.recordPageClaim(CLAIM_URL, null);
+	assert.equal(warns.length, 0, 'an offerless page must not impersonate an outdated renderer');
+	assert.equal(calls.get.length + calls.put.length + calls.patch.length, 0);
+});
+
+test('recordPageClaim ignores URLs no pageCheck rule matches, and never throws into the render path', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness();
+	await changeProbe.recordPageClaim('https://example.com/category/shoes', ['1.00', 'USD', 'InStock']);
+	await changeProbe.recordPageClaim('not a url', ['1.00', 'USD', 'InStock']);
+	assert.equal(calls.get.length + calls.put.length + calls.patch.length, 0);
+});

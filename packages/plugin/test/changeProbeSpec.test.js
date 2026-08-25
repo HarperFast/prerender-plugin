@@ -310,6 +310,17 @@ test('pageCheck compiles only with in-bounds indices, and only for source "reque
 	);
 	assert.equal(compileProbeRules([base])[0].pageCheck, null);
 
+	// enabled must be BOOLEAN true: a truthy non-boolean ("true" from YAML/JSON) is a config that
+	// LOOKS enabled while protecting nothing — that must warn, never pass silently.
+	const warnings = [];
+	const strEnabled = compileProbeRules(
+		[{ ...base, pageCheck: { enabled: 'true', priceFrom: 0, availableFrom: 1 } }],
+		warnings
+	);
+	assert.equal(strEnabled[0].pageCheck, null);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /pageCheck\.enabled must be boolean true/);
+
 	// document mode: the stored signature IS the page's offers, so the check is meaningless
 	const doc = compileProbeRules([
 		{
@@ -345,6 +356,32 @@ test('pageClaimFromOffers reduces offers to (prices, anyInStock); nothing usable
 	assert.equal(pageClaimFromOffers([]), null);
 });
 
+test('availability reduces recognized vocabulary only — anything else is NO verdict, never a guess', async () => {
+	// A URL form or unstripped schema.org prefix still reads (defense against a renderer that
+	// didn't normalize), and Google's own in-stock set counts as available.
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'https://schema.org/InStock'])), [['9.99'], true]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'LimitedAvailability'])), [['9.99'], true]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'SoldOut'])), [['9.99'], false]);
+	// PreOrder (and any private vocabulary) is neither available nor unavailable: the verdict is
+	// null, so availability can never disagree — a wrong guess here would hard-expire every
+	// matched page on every pass.
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'PreOrder'])), [['9.99'], null]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'InventoryLevel:42'])), [['9.99'], null]);
+	// Mixed definitive-negative + unrecognized must NOT read as "unavailable" — the unrecognized
+	// offer might be the buyable one.
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'OutOfStock', '9.99', 'USD', 'PreOrder'])), [
+		['9.99'],
+		null,
+	]);
+	// ...but any recognized available offer wins outright.
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['9.99', 'USD', 'PreOrder', '9.99', 'USD', 'InStock'])), [
+		['9.99'],
+		true,
+	]);
+	// No readable price AND no verdict = no claim at all.
+	assert.equal(pageClaimFromOffers(['$9.99', 'USD', 'PreOrder']), null);
+});
+
 test('claimsDisagree: availability differs, or the origin price is ABSENT from the page', async () => {
 	const page = JSON.stringify([['35.99'], true]);
 	const claim = (p, a) => JSON.stringify([p === null ? [] : [p], a]);
@@ -362,12 +399,33 @@ test('claimsDisagree: availability differs, or the origin price is ABSENT from t
 	assert.equal(claimsDisagree('not json', claim('35.99', true)), false);
 });
 
+test('claimsDisagree compares each dimension only when BOTH sides claim it', async () => {
+	// null availability on either side: never an availability disagreement — but price still
+	// compares, so an unrecognized vocabulary does not cost the price protection.
+	assert.equal(claimsDisagree(JSON.stringify([['35.99'], null]), JSON.stringify([['35.99'], true])), false);
+	assert.equal(claimsDisagree(JSON.stringify([['35.99'], null]), JSON.stringify([['29.99'], true])), true);
+	assert.equal(claimsDisagree(JSON.stringify([['35.99'], true]), JSON.stringify([['35.99'], null])), false);
+	// a page with NO readable prices must not disagree with any endpoint price: that shape is
+	// systematic (a price format the plugin cannot parse), and price-disagreeing on it would
+	// re-expire the page after every render, forever.
+	assert.equal(claimsDisagree(JSON.stringify([[], true]), JSON.stringify([['29.99'], true])), false);
+	// both dimensions unclaimed = never a disagreement
+	assert.equal(claimsDisagree(JSON.stringify([[], null]), JSON.stringify([['29.99'], true])), false);
+});
+
 test('apiClaimOf projects through the mapping; absent mapped fields yield no claim', async () => {
 	const pc = { priceFrom: 2, availableFrom: 3 };
 	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, true], pc)), [['35.99'], true]);
 	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, false], pc)), [['35.99'], false]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'false'], pc)), [['35.99'], false]);
 	assert.equal(apiClaimOf([null, null, null, null], pc), null);
 	assert.equal(apiClaimOf([1, 2, 3, true], null), null);
+	// A non-boolean availability field (a count, a status string) is a mapping the operator got
+	// wrong or a shape the plugin cannot read — availability becomes NO claim rather than a guess
+	// that would disagree with every page on every pass. Price alone still projects.
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'IN_STOCK'], pc)), [['35.99'], null]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 7], pc)), [['35.99'], null]);
+	assert.equal(apiClaimOf([null, null, null, 'IN_STOCK'], pc), null);
 });
 
 test('claimsDisagree survives a corrupted stored claim instead of ending the sweep', async () => {
