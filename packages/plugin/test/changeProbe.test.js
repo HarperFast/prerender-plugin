@@ -604,3 +604,111 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 		);
 	}
 });
+
+/** A rule whose extract maps index 2 -> price and index 3 -> availability, with pageCheck on. */
+const PAGECHECK_RULES = [
+	{
+		...RULES_RAW[0],
+		extract: ['regular', 'sale', 'price', 'available'],
+		pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
+	},
+];
+
+const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const written = [];
+	const triggered = [];
+	const cleared = [];
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules: compileProbeRules(PAGECHECK_RULES),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => answers[url] ?? null,
+		read: async (url) => stored[url] ?? null,
+		write: async (url, signature) => written.push({ url, signature }),
+		clearPageClaim: async (url) => cleared.push(url),
+		trigger: async (target) => triggered.push(target.url),
+		dryRun: false,
+		maxTriggers: 100,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		...overrides,
+	});
+	return { stats, written, triggered, cleared };
+};
+
+test('ROUND-TRIP BLINDNESS: origin matches its own baseline but the PAGE disagrees -> trigger', async () => {
+	// The measured production case: probe stored "available" and the origin still says available,
+	// so the signature comparison sees nothing; the page rendered mid-flip and says OutOfStock.
+	// Without pageCheck this is the `unchanged` early-return and the page stays wrong for a
+	// whole render interval.
+	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
+	const { stats, triggered, cleared } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: {
+			[URL_A]: { signature, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], false]) },
+		},
+	});
+	assert.equal(stats.pageMismatch, 1);
+	assert.equal(stats.unchanged, 0, 'must NOT take the unchanged early-return');
+	assert.equal(stats.changed, 0, 'the origin signature did not change — only the page disagreed');
+	assert.deepEqual(triggered, [URL_A]);
+	// The claim is cleared so the next pass does not re-trigger the same disagreement forever.
+	assert.deepEqual(cleared, [URL_A]);
+});
+
+test('page AGREES with the origin -> unchanged, nothing triggered', async () => {
+	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
+	const { stats, triggered, cleared } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], true]) } },
+	});
+	assert.equal(stats.pageMismatch, 0);
+	assert.equal(stats.unchanged, 1);
+	assert.deepEqual(triggered, []);
+	assert.deepEqual(cleared, []);
+});
+
+test('no stored page claim -> the check is inert (a page nothing has rendered cannot disagree)', async () => {
+	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
+	const { stats, triggered } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, probedAt: NaN, pageSignature: null } },
+	});
+	assert.equal(stats.pageMismatch, 0);
+	assert.equal(stats.unchanged, 1);
+	assert.deepEqual(triggered, []);
+});
+
+test('a status-signal literal carries no price/availability, so it never reads as a disagreement', async () => {
+	// `observed` is an opaque literal (e.g. sold-out via statusSignals), not an extracted array —
+	// projecting it is impossible, and guessing would trigger on every such page.
+	const { stats, triggered } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: 'unavailable' },
+		stored: {
+			[URL_A]: { signature: 'unavailable', probedAt: NaN, pageSignature: JSON.stringify([['35.99'], true]) },
+		},
+	});
+	assert.equal(stats.pageMismatch, 0);
+	assert.deepEqual(triggered, []);
+});
+
+test('a page disagreement still triggers on a URL the probe has never baselined', async () => {
+	// No stored signature (would normally SEED and trigger nothing), but the page provably
+	// disagrees with reality right now — that is worth acting on regardless of probe history.
+	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
+	const { stats, triggered } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], false]) } },
+	});
+	assert.equal(stats.pageMismatch, 1);
+	assert.equal(stats.seeded, 0);
+	assert.deepEqual(triggered, [URL_A]);
+});

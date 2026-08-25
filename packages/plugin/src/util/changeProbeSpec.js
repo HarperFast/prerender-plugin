@@ -159,6 +159,35 @@ const compileRule = (raw, index, warn) => {
 		}
 	}
 
+	// Which extracted values correspond to what the PAGE renders, so the probe can ask "does the
+	// cached page still agree with the origin" as well as "did the origin change". Site-specific
+	// by nature: only the operator knows which field of their endpoint is the price the page
+	// prints. Indices into `extract`, so nothing new is fetched. Dropped whole (not per-field) —
+	// a half-configured mapping would compare the wrong column.
+	let pageCheck = null;
+	if (raw.pageCheck !== undefined && raw.pageCheck !== null) {
+		const pc = raw.pageCheck;
+		if (typeof pc !== 'object' || Array.isArray(pc)) {
+			warn(`change-probe ${label}: pageCheck must be an object { enabled, priceFrom, availableFrom }`);
+		} else if (pc.enabled === true) {
+			if (source !== 'request') {
+				// In document mode the stored signature IS the page's own offers, so the page can
+				// never disagree with itself and the comparison is meaningless.
+				warn(`change-probe ${label}: pageCheck applies to source "request" only — ignored`);
+			} else {
+				const inBounds = (v) => Number.isInteger(v) && v >= 0 && v < extract.length;
+				if (!inBounds(pc.priceFrom) || !inBounds(pc.availableFrom)) {
+					warn(
+						`change-probe ${label}: pageCheck.priceFrom and .availableFrom must be integer indices into ` +
+							`extract (0-${extract.length - 1}) — pageCheck ignored`
+					);
+				} else {
+					pageCheck = { priceFrom: pc.priceFrom, availableFrom: pc.availableFrom };
+				}
+			}
+		}
+	}
+
 	return {
 		label,
 		pathPattern,
@@ -168,7 +197,83 @@ const compileRule = (raw, index, warn) => {
 		extract,
 		invalidateScope,
 		statusSignals,
+		pageCheck,
 	};
+};
+
+/**
+ * A price as a canonical string, so `35.99` (JSON number, from the endpoint) and `"35.99"`
+ * (JSON-LD string, from the page) compare equal. Anything unparseable is null and never matches,
+ * which keeps a garbled value from reading as agreement.
+ */
+const canonicalPrice = (value) => {
+	// The empty cases are rejected BEFORE Number(): `Number(null)`, `Number('')` and `Number([])`
+	// are all 0, which would turn "this field is absent" into a confident price of 0.00 and make
+	// an absent value compare equal to a genuine zero.
+	if (value === null || value === undefined || value === '') return null;
+	if (typeof value !== 'string' && typeof value !== 'number') return null;
+	const n = typeof value === 'string' ? Number(value.trim()) : value;
+	return Number.isFinite(n) ? n.toFixed(2) : null;
+};
+
+/**
+ * What the CACHED PAGE claims, as a comparable claim: the set of offer prices it prints and
+ * whether ANY of its offers is in stock.
+ *
+ * "Any offer in stock" is the right reduction because that is what a reader concludes from the
+ * page: a product whose every SKU reads OutOfStock presents as unavailable, and one with a single
+ * available SKU presents as available. Returns null when the page carries no Product offers —
+ * the caller must then leave the stored claim alone, exactly as a failed probe does.
+ */
+export const pageClaimOf = (html) => {
+	const flat = extractJsonLdOffers(html);
+	if (!flat) return null;
+	const prices = new Set();
+	let anyInStock = false;
+	// extractJsonLdOffers flattens [price, currency, availability] triples.
+	for (let i = 0; i + 3 <= flat.length; i += 3) {
+		const price = canonicalPrice(flat[i]);
+		if (price !== null) prices.add(price);
+		if (typeof flat[i + 2] === 'string' && flat[i + 2].toLowerCase() === 'instock') anyInStock = true;
+	}
+	if (!prices.size && !anyInStock) return null;
+	return JSON.stringify([[...prices].sort(), anyInStock]);
+};
+
+/**
+ * The same claim shape, projected from the values the probe just extracted from the endpoint.
+ * Null when the mapped fields are absent — no claim, so nothing to disagree with.
+ */
+export const apiClaimOf = (values, pageCheck) => {
+	if (!pageCheck || !Array.isArray(values)) return null;
+	const price = canonicalPrice(values[pageCheck.priceFrom]);
+	const availableRaw = values[pageCheck.availableFrom];
+	if (price === null && (availableRaw === null || availableRaw === undefined)) return null;
+	return JSON.stringify([price === null ? [] : [price], availableRaw === true || availableRaw === 'true']);
+};
+
+/**
+ * Do the page's claim and the endpoint's claim disagree?
+ *
+ * Asymmetric on price BY DESIGN: the page may legitimately print several offer prices (variants)
+ * while the endpoint reports one, so the test is whether the endpoint's price is ABSENT from the
+ * page's set — not whether the sets are equal. Availability compares directly. Either side being
+ * null means "no claim", which is never a disagreement.
+ */
+export const claimsDisagree = (pageClaim, apiClaim) => {
+	if (!pageClaim || !apiClaim) return false;
+	let page, api;
+	try {
+		page = JSON.parse(pageClaim);
+		api = JSON.parse(apiClaim);
+	} catch {
+		return false;
+	}
+	const [pagePrices, pageInStock] = page;
+	const [apiPrices, apiInStock] = api;
+	if (apiInStock !== pageInStock) return true;
+	if (apiPrices.length && !apiPrices.every((p) => pagePrices.includes(p))) return true;
+	return false;
 };
 
 /**

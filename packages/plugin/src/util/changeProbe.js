@@ -66,6 +66,9 @@ import {
 	isSameProbeOrigin,
 	signatureOf,
 	statusSignalFor,
+	apiClaimOf,
+	claimsDisagree,
+	pageClaimOf,
 } from './changeProbeSpec.js';
 
 const targetTable = () => databases.render_service.Target;
@@ -137,6 +140,7 @@ const newStats = () => ({
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
+	pageMismatch: 0, // cached page disagreed with the origin (round-trip blindness; pageCheck rules)
 	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
 	throttleLevel: 1, // pacing-window multiplier when the pass ended; 1 means never backed off
 	abortedOnDistress: false, // the pass gave up because the origin refused everything
@@ -312,7 +316,7 @@ export const triggerRevalidate = async (row) => {
 // Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
 // another pass already covered (see `reprobeAfter` in runProbePass).
 const readSignature = async (url) => {
-	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt'] });
+	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt', 'pageSignature'] });
 	if (!row) return null;
 	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
 	// exists for — a BigInt, which `new Date()` REFUSES rather than coerces (TypeError, which here
@@ -321,9 +325,31 @@ const readSignature = async (url) => {
 	// skips: never skip a probe on a value we could not read.
 	const stamp = typeof row.probedAt === 'bigint' ? Number(row.probedAt) : row.probedAt;
 	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
-	return { signature: row.signature ?? null, probedAt };
+	return { signature: row.signature ?? null, probedAt, pageSignature: row.pageSignature ?? null };
 };
-const writeSignature = (url, signature) => probeStateTable().put(url, { url, signature, probedAt: new Date() });
+// PATCH, not put: `put` on this sealed row would drop `pageSignature`, which only the render path
+// writes — the probe must never clobber the page's own claim while recording its baseline.
+const writeSignature = (url, signature) => probeStateTable().patch(url, { url, signature, probedAt: new Date() });
+const clearPageSignature = (url) => probeStateTable().patch(url, { pageSignature: null });
+
+/**
+ * Record what a freshly rendered page CLAIMS, for the probe to compare the origin against.
+ * Called from the render result path (owner-scoped, like the sweep) and deliberately best-effort:
+ * a render must never fail because a probe optimisation could not be recorded. Extraction that
+ * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
+ * trigger by making every page look like a disagreement.
+ */
+export const recordPageClaim = async (url, html) => {
+	try {
+		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(new URL(url).pathname));
+		if (!rule) return;
+		const claim = pageClaimOf(html);
+		if (!claim) return;
+		await probeStateTable().patch(url, { url, pageSignature: claim });
+	} catch (e) {
+		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
+	}
+};
 
 /**
  * Probe a stream of target rows and act on what changed. ALL I/O is injected, so the decision
@@ -343,6 +369,7 @@ export const runProbePass = async ({
 	read,
 	write,
 	trigger,
+	clearPageClaim = async () => {},
 	dryRun,
 	maxTriggers,
 	concurrency,
@@ -401,18 +428,41 @@ export const runProbePass = async ({
 			return;
 		}
 		distressStreak = 0;
-		if (stored?.signature === observed) {
-			stats.unchanged++;
+
+		// ROUND-TRIP BLINDNESS. Everything below compares the origin to the origin, so a value
+		// that changed and changed BACK between two passes is invisible — and a render that landed
+		// inside that window left a page carrying the transient value. `pageSignature` is what the
+		// cached page claims (written by the render, never here), so this asks the question the
+		// signature comparison structurally cannot: does the page still agree with the origin?
+		// Runs BEFORE the unchanged early-return, because "unchanged" is exactly the case it
+		// exists to catch. Only for extracted responses — a status-signal literal carries no
+		// price/availability to project (documented limitation).
+		let pageDisagrees = false;
+		if (rule.pageCheck && stored?.pageSignature) {
+			let values = null;
+			try {
+				const parsed = JSON.parse(observed);
+				if (Array.isArray(parsed)) values = parsed;
+			} catch {
+				values = null; // a status-signal literal, not an extracted array
+			}
+			if (values) pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, rule.pageCheck));
+			if (pageDisagrees) stats.pageMismatch++;
+		}
+
+		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
+		if (!signatureChanged && !pageDisagrees) {
+			if (!stored?.signature) {
+				// First observation: baseline it, trigger nothing — the page's content is not known
+				// to have changed, the probe just hadn't seen it before.
+				stats.seeded++;
+				await write(row.url, observed);
+			} else {
+				stats.unchanged++;
+			}
 			return;
 		}
-		if (!stored?.signature) {
-			// First observation: baseline it, trigger nothing — the page's content is not known to
-			// have changed, the probe just hadn't seen it before.
-			stats.seeded++;
-			await write(row.url, observed);
-			return;
-		}
-		stats.changed++;
+		if (signatureChanged) stats.changed++;
 		if (dryRun) {
 			// Signature written in dry-run ON PURPOSE: each pass then reports fresh changes — the
 			// true change rate — instead of re-reporting the same delta forever. Demand-ladder
@@ -430,6 +480,11 @@ export const runProbePass = async ({
 			await trigger(row);
 			stats.triggered++;
 			await write(row.url, observed);
+			// Clear the page's claim after acting on a disagreement, or every subsequent pass
+			// re-detects the same one and re-spends the trigger budget on a page that is already
+			// expired and already filed. The next render writes a fresh claim; until then there is
+			// simply nothing to compare, which is the correct "I don't know" state.
+			if (pageDisagrees) await clearPageClaim(row.url);
 		} catch (e) {
 			stats.errors++;
 			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
@@ -548,6 +603,7 @@ const emitStats = (stats, kind) => {
 		metrics.changeProbe(stats.failed, 'failed');
 		metrics.changeProbe(stats.fresh, 'fresh');
 		metrics.changeProbe(stats.throttled, 'throttled');
+		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -614,6 +670,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			probe: probeOnce,
 			read: readSignature,
 			write: writeSignature,
+			clearPageClaim: clearPageSignature,
 			trigger: triggerRevalidate,
 			...limits,
 			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
@@ -805,6 +862,7 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				probe: probeOnce,
 				read: readSignature,
 				write: writeSignature,
+				clearPageClaim: clearPageSignature,
 				trigger: triggerRevalidate,
 				...limits,
 				// NEVER skips on baseline age. The cohort is small and deliberately probed on a

@@ -24,6 +24,9 @@ import {
 	buildProbeRequest,
 	isSameProbeOrigin,
 	statusSignalFor,
+	pageClaimOf,
+	apiClaimOf,
+	claimsDisagree,
 } from '../src/util/changeProbeSpec.js';
 
 const REQUEST_RULE = {
@@ -282,4 +285,91 @@ test('statusSignalFor: first match wins and the contains guard is required to ma
 	assert.equal(statusSignalFor(rule, 503, 'anything'), null, 'undeclared status carries no signal');
 	assert.equal(statusSignalFor({ statusSignals: [] }, 400, 'x'), null);
 	assert.equal(statusSignalFor({}, 400, 'x'), null, 'a rule with no signals never throws');
+});
+
+test('pageCheck compiles only with in-bounds indices, and only for source "request"', async () => {
+	const base = {
+		label: 'r',
+		pathPattern: '^/p/',
+		source: 'request',
+		request: { urlTemplate: 'https://api.example.com/x', method: 'POST', body: '{}' },
+		extract: ['a', 'b', 'c', 'd'],
+	};
+	const ok = compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 } }]);
+	assert.deepEqual(ok[0].pageCheck, { priceFrom: 2, availableFrom: 3 });
+
+	// out of bounds -> dropped whole, rule survives (a half-applied mapping compares the wrong column)
+	const oob = compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 2, availableFrom: 9 } }]);
+	assert.equal(oob.length, 1);
+	assert.equal(oob[0].pageCheck, null);
+
+	// disabled and absent both yield null
+	assert.equal(
+		compileProbeRules([{ ...base, pageCheck: { enabled: false, priceFrom: 0, availableFrom: 1 } }])[0].pageCheck,
+		null
+	);
+	assert.equal(compileProbeRules([base])[0].pageCheck, null);
+
+	// document mode: the stored signature IS the page's offers, so the check is meaningless
+	const doc = compileProbeRules([
+		{
+			label: 'd',
+			pathPattern: '^/p/',
+			source: 'document',
+			pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 },
+		},
+	]);
+	assert.equal(doc[0].pageCheck, null);
+});
+
+test('pageClaimOf reduces a page to (prices, anyInStock); no Product offers -> null', async () => {
+	const html = (offers) =>
+		`<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', offers })}</script>`;
+	// number and string prices canonicalize the same way
+	assert.equal(
+		pageClaimOf(html([{ price: 35.99, availability: 'https://schema.org/InStock' }])),
+		pageClaimOf(html([{ price: '35.99', availability: 'InStock' }]))
+	);
+	// every SKU out of stock => the page presents as unavailable
+	const allOut = pageClaimOf(
+		html([
+			{ price: '15.99', availability: 'OutOfStock' },
+			{ price: '15.99', availability: 'OutOfStock' },
+		])
+	);
+	assert.deepEqual(JSON.parse(allOut), [['15.99'], false]);
+	// one available SKU is enough
+	const oneIn = pageClaimOf(
+		html([
+			{ price: '15.99', availability: 'OutOfStock' },
+			{ price: '16.99', availability: 'InStock' },
+		])
+	);
+	assert.deepEqual(JSON.parse(oneIn), [['15.99', '16.99'], true]);
+	assert.equal(pageClaimOf('<html>no structured data</html>'), null);
+});
+
+test('claimsDisagree: availability differs, or the origin price is ABSENT from the page', async () => {
+	const page = JSON.stringify([['35.99'], true]);
+	const claim = (p, a) => JSON.stringify([p === null ? [] : [p], a]);
+	// the measured production case: page says out of stock, origin says available, price equal
+	assert.equal(claimsDisagree(JSON.stringify([['35.99'], false]), claim('35.99', true)), true);
+	// agreement
+	assert.equal(claimsDisagree(page, claim('35.99', true)), false);
+	// origin price the page never prints
+	assert.equal(claimsDisagree(page, claim('29.99', true)), true);
+	// a multi-variant page carrying MORE prices than the origin reports is NOT a disagreement
+	assert.equal(claimsDisagree(JSON.stringify([['29.99', '35.99'], true]), claim('35.99', true)), false);
+	// no claim on either side is never a disagreement
+	assert.equal(claimsDisagree(null, claim('35.99', true)), false);
+	assert.equal(claimsDisagree(page, null), false);
+	assert.equal(claimsDisagree('not json', claim('35.99', true)), false);
+});
+
+test('apiClaimOf projects through the mapping; absent mapped fields yield no claim', async () => {
+	const pc = { priceFrom: 2, availableFrom: 3 };
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, true], pc)), [['35.99'], true]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, false], pc)), [['35.99'], false]);
+	assert.equal(apiClaimOf([null, null, null, null], pc), null);
+	assert.equal(apiClaimOf([1, 2, 3, true], null), null);
 });

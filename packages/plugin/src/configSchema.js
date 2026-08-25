@@ -846,6 +846,20 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'overloaded origin. CAUTION: if the endpoint starts answering the signaled status for ' +
 					'EVERYTHING, every matched URL flips to the same signature at once — bounded by ' +
 					'`maxTriggersPerSweep`, and the canary treats it as the mass change it looks like.\n' +
+					'\n\nPAGE CHECK (`pageCheck`). The comparison above asks "did the origin change since I last ' +
+					'looked", which is structurally blind to a value that changes and changes BACK between two ' +
+					'passes — and if a render landed inside that window, the cached page keeps the transient value ' +
+					'until its interval expires (measured at ~2.7% of served product pages on one deployment, all ' +
+					'of them a page reading OutOfStock for something the origin says is available). Set ' +
+					'`pageCheck: { enabled: true, priceFrom: <i>, availableFrom: <i> }` and the render path records ' +
+					'what each page CLAIMS, so the pass can also ask "does the page still agree with the origin". ' +
+					'The two indices are positions in this rule\u2019s own `extract` array — site-specific by ' +
+					'nature, since only the operator knows which field is the price their page prints — and the ' +
+					'block is dropped whole if either is out of bounds, because a half-applied mapping compares the ' +
+					'wrong column. `source: request` only: in document mode the stored signature already IS the ' +
+					'page\u2019s offers. A page yielding no Product offers records nothing, exactly as a failed ' +
+					'probe changes nothing, so a markup change cannot make every page look like a disagreement. ' +
+					'Detection is one extra node-local write per render and no extra origin traffic.' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
 					'records on a mass change. Empty = the canary detects and logs only.\n' +
 					'  label            optional name for logs and the admin surface.',

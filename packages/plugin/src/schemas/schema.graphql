@@ -329,6 +329,16 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	url: String @primaryKey
 	signature: String
 	probedAt: Date
+	# What the CACHED PAGE claims, written when a render completes (never by the probe), and
+	# compared against the endpoint on the next pass. This is what closes ROUND-TRIP BLINDNESS:
+	# `signature` only ever answers "did the origin change since I last looked", so a value that
+	# changes and changes BACK between two probes is invisible — and if a render landed inside
+	# that window, the page keeps the transient value until its interval expires. Measured at
+	# ~2.7% of served product pages on one deployment. Kept SEPARATE from `signature` rather than
+	# replacing it: the page can only ever express (price, availability), so folding the two would
+	# silently narrow drift detection to those fields and stop catching regular/sale price moves.
+	# Nullable and inert unless a rule sets `pageCheck.enabled`.
+	pageSignature: String
 }
 
 # Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a
