@@ -200,6 +200,37 @@ disappears takes its position in the cascade order with it, and an empty `@media
 a few bytes and risks nothing. `@keyframes` and `@font-face` are never touched, so an animation
 whose rules were pruned still resolves.
 
+**Verification.** Six real pages (product/category/homepage × desktop/mobile) were each rendered
+twice through the full pipeline — this flag off, then on, nothing else changed — and both outputs
+loaded with their real stylesheets. On five of the six, every computed property and every
+`getBoundingClientRect` was identical across all elements, with text, link and image counts and
+page height unchanged.
+
+| page             | before  | after   |        |
+| ---------------- | ------- | ------- | ------ |
+| product desktop  | 1.89 MB | 1.39 MB | −26.6% |
+| product mobile   | 1.61 MB | 1.14 MB | −29.4% |
+| category desktop | 0.88 MB | 0.80 MB | −8.9%  |
+| category mobile  | 0.75 MB | 0.67 MB | −10.4% |
+| homepage desktop | 0.74 MB | 0.65 MB | −12.1% |
+| homepage mobile  | 0.57 MB | 0.48 MB | −15.7% |
+
+The sixth (homepage desktop) drifts sub-pixel, and it is worth knowing why rather than filing it
+under noise. Nine elements resolve a font-size of `9.99999px` where they had `10px`, which
+propagates into line-height and margins and moves the page by 0.6 px in 7,577 (0.008%). No rule was
+lost — those elements' font-size rules are identical in number and in text on both sides. They are
+`em`-chained (`0.625em`, `0.83333em`), and Chrome accumulates float error through an `em` chain
+differently depending on how computed-style objects are shared. Rewriting a stylesheet at all is
+enough to trigger it: a control that re-serialized the sheets and deleted _nothing_ produced the
+same drift.
+
+Two measurement traps are worth recording, because both manufacture false alarms here.
+Computed-style property **enumeration order is not stable** — Chrome lists custom properties in
+stylesheet-registration order, so deleting rules reshuffles the enumeration while every value stays
+identical; compare sorted, or all 9,991 elements look changed when none are. And a page's own
+**running animations** (a `shimmer` placeholder) make computed values time-dependent, so freeze them
+before sampling.
+
 **Cost.** The pass is bounded by `querySelector` calls, and answers are memoized per probe string
 (the DOM cannot change while it runs), so repeated selectors are paid for once. On the flagged
 product page that is 4,387 probes collapsing to 3,144 calls: **81 ms**, against a ~12 s render —
