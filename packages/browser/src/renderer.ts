@@ -502,6 +502,10 @@ const renderer: Renderer = async (page, job) => {
 			}
 
 			if (job.isIndexable || job.isFromSitemap) {
+				// Before postProcess: it may strip nodes, and this must describe the page as
+				// rendered. Best-effort — a failure here must never cost the render its content.
+				job.structuredOffers =
+					(await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null)) ?? undefined;
 				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
 				timings.postProcess = Date.now() - ppStart;
@@ -646,6 +650,59 @@ export function indexVerdict(
 		isIndexable: false,
 		reason: signals.noindex ? 'noindex' : verdict === 'variant' ? 'canonical-variant' : 'canonical-mismatch',
 	};
+}
+
+// Upper bound on posted offer triples: a variant-heavy PDP legitimately carries dozens, and
+// nothing downstream needs more than a representative set to compare price/availability.
+const STRUCTURED_OFFER_CAP = 200;
+
+/**
+ * The page's schema.org Product offers, flattened to [price, currency, availability] triples and
+ * sorted so the sequence is stable across renders of unchanged content.
+ *
+ * Runs IN THE PAGE against the settled DOM, which is the whole point: the consumer would otherwise
+ * have to regex-scan and JSON-parse the serialized document (~1MB on a commerce PDP) on its hottest
+ * write path to recover values this process can read directly. Returns null when the page declares
+ * no Product offers, so "no structured data" stays distinguishable from "no offers".
+ *
+ * Self-contained (passed to page.evaluate) — no imports, no closure over module scope.
+ */
+function extractStructuredOffers(cap: number): Array<string | null> | null {
+	const triples: Array<Array<string | null>> = [];
+	const collect = (node: unknown) => {
+		if (!node || typeof node !== 'object') return;
+		const record = node as Record<string, unknown>;
+		const type = record['@type'];
+		const isProduct = type === 'Product' || (Array.isArray(type) && type.includes('Product'));
+		if (!isProduct) return;
+		const raw = record.offers;
+		const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+		for (const entry of list) {
+			if (!entry || typeof entry !== 'object') continue;
+			const offer = entry as Record<string, unknown>;
+			const availability = typeof offer.availability === 'string' ? offer.availability.split('/').pop()! : null;
+			const price = offer.price === undefined || offer.price === null ? null : String(offer.price);
+			const currency = typeof offer.priceCurrency === 'string' ? offer.priceCurrency : null;
+			triples.push([price, currency, availability]);
+			// A pathological page must not turn a small metadata field into a large one.
+			if (triples.length >= cap) return;
+		}
+	};
+	document.querySelectorAll('script[type="application/ld+json"]').forEach((el) => {
+		if (triples.length >= cap) return;
+		let data: unknown;
+		try {
+			data = JSON.parse(el.textContent || '');
+		} catch {
+			return; // one malformed block must not cost the page its other blocks
+		}
+		const graph = (data as Record<string, unknown>)?.['@graph'];
+		const nodes = Array.isArray(data) ? data : Array.isArray(graph) ? graph : [data];
+		for (const node of nodes) collect(node);
+	});
+	if (!triples.length) return null;
+	triples.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+	return triples.flat();
 }
 
 function extractIndexSignals(): { canonicalHref: string | null; noindex: boolean } {

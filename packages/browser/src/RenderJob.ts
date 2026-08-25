@@ -111,6 +111,16 @@ export default class RenderJob {
 	redirectedTo: string | undefined;
 	isFromSitemap: boolean;
 	/**
+	 * The page's own schema.org Product offers, flattened to [price, currency, availability]
+	 * triples, read off the live DOM at the end of the settle.
+	 *
+	 * WHY THE RENDERER AND NOT THE CONSUMER. The consumer can recover the same values by
+	 * regex-scanning and JSON-parsing the serialized document, but that is ~1MB of work on its
+	 * hottest write path to reconstruct data this process had structured in front of it. Here it is
+	 * one `page.evaluate` against a DOM that is already parsed and already settled.
+	 */
+	structuredOffers: Array<string | null> | undefined;
+	/**
 	 * Why this render produced no cacheable content — one slug across every no-content class,
 	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
 	 * 'canonical-mismatch' (page canonicalizes to a different URL), 'canonical-variant'
@@ -209,6 +219,7 @@ export default class RenderJob {
 			renderTime: undefined as number | undefined,
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
+			structuredOffers: this.structuredOffers,
 			outcome: this.outcome,
 			// One slug for WHY there is no content (see the field doc). The redirect/error
 			// fallbacks are derived here so every no-content result carries a reason without
