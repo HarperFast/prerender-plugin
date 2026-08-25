@@ -127,13 +127,37 @@ test('a census that already deleted does not offer to delete again', async () =>
 test('the census posts a dry run and the purge does not, both carrying the typed prefix', async () => {
 	const ctx = await ready();
 	const card = cardTitled(ctx, 'Discovered targets');
-	const input = find(card, (n) => n.tagName === 'INPUT');
+	const input = find(card, (n) => n.tagName === 'INPUT' && n.attributes.type === 'text');
 	input.value = ' https://www.example.com/catalog/ ';
 	button(card, 'Dry-run census').listeners.click[0]();
 	assert.deepEqual(ctx.calls.posts.at(-1), {
 		route: 'discovery-purge',
-		data: { urlPrefix: 'https://www.example.com/catalog/', dryRun: true },
+		// skipVisited rides on the CENSUS too, and that is the point of sending it explicitly: a
+		// census run under a different predicate from the purge that follows counts a population
+		// nobody is going to delete.
+		data: { urlPrefix: 'https://www.example.com/catalog/', dryRun: true, skipVisited: true },
 	});
+});
+
+// A census that spares bot-visited targets and a purge that does not would delete rows the census
+// never counted — the operator approves one number and a different one happens. The flag is sent
+// on both calls from the same piece of state, so the census is always a preview of the purge.
+test('sparing bot-visited targets is the default, and the census previews the same predicate', async () => {
+	const ctx = await ready();
+	const card = cardTitled(ctx, 'Discovered targets');
+	const box = find(card, (n) => n.tagName === 'INPUT' && n.attributes.type === 'checkbox');
+	assert.equal(box.attributes.checked, '', 'the safe predicate is the default');
+
+	const input = find(card, (n) => n.tagName === 'INPUT' && n.attributes.type === 'text');
+	input.value = 'https://www.example.com/catalog/';
+
+	box.listeners.change[0]({ target: { checked: false } });
+	button(card, 'Dry-run census').listeners.click[0]();
+	assert.equal(ctx.calls.posts.at(-1).data.skipVisited, false, 'unticking it reaches the census');
+
+	box.listeners.change[0]({ target: { checked: true } });
+	button(card, 'Dry-run census').listeners.click[0]();
+	assert.equal(ctx.calls.posts.at(-1).data.skipVisited, true);
 });
 
 test('an empty prefix does nothing at all — a bare origin is refused upstream anyway', async () => {
@@ -213,4 +237,89 @@ test('a pass stopped early reports what it never reached, rather than reading as
 	const text = cardTitled(ctx, 'Discovered targets').textContent;
 	assert.match(text, /stopped early/);
 	assert.match(text, /~6,000 left under this prefix/);
+});
+
+// THE "NOT REACHED" FIGURE IS A SUBTRACTION, and every way a discovered row survived the pass has
+// to be a term in it. A purge that spared 3,000 bot-visited rows on purpose and deferred 12 as
+// in-flight has 3,012 rows it deliberately kept — counting only the deferred ones reports the rest
+// as keyspace the pass never got to, which is a completed pass rendered as an interrupted one.
+test('rows spared on purpose are accounted for, not reported as keyspace the pass never reached', async () => {
+	const spared = {
+		...CENSUS,
+		skipVisited: true,
+		canceled: true,
+		discovered: 9000,
+		deleted: 5988,
+		leaseSkipped: 12,
+		visitedSkipped: 3000,
+		errors: 0,
+	};
+	const card = cardTitled(await ready({ purge: spared }), 'Discovered targets');
+	assert.match(card.textContent, /Spared as bot-visited/);
+	assert.match(card.textContent, /3,000/);
+	assert.doesNotMatch(card.textContent, /Not reached/);
+});
+
+// The counterpart: once the terms DO leave a remainder, the card has to say so — a stopped pass
+// that left 1,000 rows under the prefix has not cleared it, whatever the deleted count looks like.
+test('a genuine remainder is still called out after the new terms are subtracted', async () => {
+	const stopped = {
+		...CENSUS,
+		skipVisited: true,
+		canceled: true,
+		discovered: 9000,
+		deleted: 5000,
+		leaseSkipped: 0,
+		visitedSkipped: 3000,
+		errors: 0,
+	};
+	assert.match(cardTitled(await ready({ purge: stopped }), 'Discovered targets').textContent, /~1,000 left/);
+});
+
+// "Spared 0" and "did not check" are different findings and only one of them says the prefix has
+// no live crawler demand on it. At zero the row still has to appear, or an operator reads a purge
+// that checked and found nothing as one that never applied the predicate.
+test('a sparing pass that spared nothing says so, rather than dropping the row', async () => {
+	const none = { ...CENSUS, skipVisited: true, visitedSkipped: 0 };
+	assert.match(cardTitled(await ready({ purge: none }), 'Discovered targets').textContent, /Spared as bot-visited/);
+
+	const off = { ...CENSUS, skipVisited: false, visitedSkipped: 0 };
+	assert.doesNotMatch(
+		cardTitled(await ready({ purge: off }), 'Discovered targets').textContent,
+		/Spared as bot-visited/
+	);
+});
+
+// A delete that failed is a row STILL IN THE CORPUS and still being re-rendered on cadence — it
+// appears in no render metric, no serve metric and no other console surface. If the card does not
+// name it, nothing does.
+test('delete failures are surfaced with their samples, not folded into the deleted count', async () => {
+	const failed = {
+		...CENSUS,
+		dryRun: false,
+		errors: 25,
+		abortedOnErrors: true,
+		errorSamples: [{ url: 'https://www.example.com/catalog/x', error: 'transaction timeout' }],
+	};
+	const text = cardTitled(await ready({ purge: failed }), 'Discovered targets').textContent;
+	assert.match(text, /Failed — left for the next pass/);
+	assert.match(text, /STOPPED ITSELF/);
+	assert.match(text, /transaction timeout/);
+});
+
+// Under cluster scope the nodes can have run DIFFERENT predicates over the same prefix, and a
+// single total silently sums both. The rows the non-sparing nodes deleted are gone; re-running the
+// sparing ones does not bring them back, so the divergence has to be said out loud.
+test('a cluster where only some nodes spared bot-visited targets is called out', async () => {
+	const mixed = {
+		...CENSUS,
+		scope: 'cluster',
+		ranNodes: 3,
+		skipVisited: false,
+		skipVisitedOn: ['a.example.com:9926'],
+		totals: { examined: 100_000, owned: 25_000, discovered: 9000, leaseSkipped: 0, visitedSkipped: 40, deleted: 8960 },
+	};
+	const text = cardTitled(await ready({ purge: mixed }), 'Discovered targets').textContent;
+	assert.match(text, /Only a\.example\.com:9926 spared bot-visited targets/);
+	assert.match(text, /sum two different predicates/);
 });
