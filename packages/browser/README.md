@@ -185,19 +185,27 @@ one without `stripScripts` is rejected by config validation rather than silently
 **Every uncertainty resolves toward keeping a rule.** The probe strips pseudo-classes and
 pseudo-elements before testing, so `.card:hover` is judged on whether `.card` exists — state is
 never the reason a rule is dropped. Structural pseudos (`:not()`, `:nth-child()`) come off too,
-which only widens the probe. A selector carrying a quoted value is never rewritten (the rewrite
-could cut inside the string) and is kept untested; anything that fails to parse once rewritten is
-kept as well. In a selector list, one matching part keeps the whole rule.
+which only widens the probe. Anything that fails to parse once rewritten is kept untested, and in a
+selector list one matching part keeps the whole rule.
+
+The one case the rewrite cannot handle is a **colon inside a quoted value** —
+`[style*="display: block"]` is the shape a regex strip would cut through the middle of — so those
+selectors are kept untested. Note the distinction: quotes alone are not the hazard. On the flagged
+page 2,674 of 3,589 selectors carry a quote (the reviews widget keys on `[data-bv-show="…"]`) while
+only 2 have a colon inside one, so bailing on every quoted selector would have forfeited most of
+the saving for nothing.
 
 **Grouping rules are recursed into but never deleted**, even when emptied — an `@layer` block that
 disappears takes its position in the cascade order with it, and an empty `@media (…) {}` husk costs
 a few bytes and risks nothing. `@keyframes` and `@font-face` are never touched, so an animation
 whose rules were pruned still resolves.
 
-Measured on six real pages (product/category/homepage × desktop/mobile), rendered with their actual
-stylesheets: every computed property and `getBoundingClientRect` identical for all 36,896 elements,
-page height unchanged, and full-page screenshots pixel-identical. Savings ranged from 8.9% of the
-document (category) to 30.3% (mobile product page).
+**Cost.** The pass is bounded by `querySelector` calls, and answers are memoized per probe string
+(the DOM cannot change while it runs), so repeated selectors are paid for once. On the flagged
+product page that is 4,387 probes collapsing to 3,144 calls: **81 ms**, against a ~12 s render —
+under 1%. Lighter pages are 5–12 ms. A rightmost-compound prefilter would halve it again, but it
+was measured disagreeing with the DOM on two rules and rejected: this pass has to be exactly right,
+not nearly right.
 
 ### `postProcess.removeAttributes` — dropping dead hydration payloads
 
