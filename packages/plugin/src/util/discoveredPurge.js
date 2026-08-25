@@ -38,6 +38,7 @@ import { Target, cacheKeysOf } from '../resources/Target.js';
 import { classifyUrl, PRERENDER } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
+import { walkUrlRange } from './urlWalk.js';
 
 /**
  * Has the demand ladder stamped a rung on this target? Coerced before the finite check for the
@@ -58,32 +59,20 @@ const DELETE_BATCH = 20;
 const MAX_CONSECUTIVE_ERRORS = 25;
 
 /** The registry slice under `urlPrefix`, streamed in cursor-bounded chunks (see module comment). */
-export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE) {
-	let cursor = null;
-	while (true) {
-		const chunk = [];
-		for await (const row of table.search({
-			conditions: [
-				{
-					attribute: 'url',
-					comparator: cursor === null ? 'greater_than_equal' : 'greater_than',
-					value: cursor ?? urlPrefix,
-				},
-			],
-			sort: { attribute: 'url' },
-			select: ['url', 'sitemapUrl', 'demandInterval'],
-			limit: chunkSize,
-		})) {
-			chunk.push(row);
-		}
-		if (!chunk.length) return;
-		for (const row of chunk) {
-			// Rows are key-ordered, so the first URL outside the prefix ends the whole walk.
-			if (!row.url.startsWith(urlPrefix)) return;
-			yield row;
-		}
-		if (chunk.length < chunkSize) return;
-		cursor = chunk[chunk.length - 1].url;
+export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE, onUnreadable) {
+	// The exclusive upper key for the verification probes: the prefix with its last character
+	// incremented, so a row from the NEXT keyspace region can neither resume nor fail this walk.
+	const endBound = urlPrefix.slice(0, -1) + String.fromCharCode(urlPrefix.charCodeAt(urlPrefix.length - 1) + 1);
+	for await (const row of walkUrlRange(table, {
+		startAt: urlPrefix,
+		select: ['url', 'sitemapUrl', 'demandInterval'],
+		chunkSize,
+		onUnreadable,
+		endBound,
+	})) {
+		// Rows are key-ordered, so the first URL outside the prefix ends the whole walk.
+		if (!row.url.startsWith(urlPrefix)) return;
+		yield row;
 	}
 }
 
@@ -218,6 +207,7 @@ export const purgeDiscoveredTargets = async ({
 
 const newStats = () => ({
 	examined: 0,
+	unreadable: 0,
 	owned: 0,
 	discovered: 0,
 	leaseSkipped: 0,
@@ -305,7 +295,9 @@ export const startDiscoveredPurge = ({
 
 	const stats = state;
 	purgeDiscoveredTargets({
-		rows: walkPrefix(databases.render_service.Target, urlPrefix),
+		rows: walkPrefix(databases.render_service.Target, urlPrefix, undefined, () => {
+			stats.unreadable++;
+		}),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
 		// Any leased device key defers the whole target — the delete takes every device with it.
@@ -336,6 +328,7 @@ export const startDiscoveredPurge = ({
 					// INCOMPLETE for its prefix even when it reports no error — say so here rather
 					// than leaving an operator to infer it from a count that does not add up.
 					`${stats.visitedSkipped ? `, ${stats.visitedSkipped} spared as bot-visited` : ''}` +
+					`${stats.unreadable ? `, ${stats.unreadable} unreadable row(s) skipped` : ''}` +
 					`${stats.errors ? `, ${stats.errors} failed and left for the next pass` : ''})` +
 					`${stats.error ? ` — error: ${stats.error}` : ''}`
 			);

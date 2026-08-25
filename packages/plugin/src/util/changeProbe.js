@@ -57,6 +57,7 @@ import { writeSchedules } from './renderSchedule.js';
 import { recordInvalidation, isScopeResolvable } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
+import { walkUrlRange } from './urlWalk.js';
 import {
 	compileProbeRules,
 	buildProbeRequest,
@@ -514,25 +515,11 @@ export const runProbePass = async ({
  * array, and closes BEFORE any probe or write runs — a paced pass over a large registry takes
  * hours, and no cursor may live anywhere near that long. One-sided PK range, the only shape a
  * string-PK walk should take here (a two-sided range collapses to a filtered intersection).
+ * Delegates to walkUrlRange so an unreadable row is skipped and counted rather than silently
+ * ending the sweep as if the registry were exhausted (see util/urlWalk.js).
  */
-async function* walkTargets(chunkSize) {
-	let cursor = '';
-	while (true) {
-		const chunk = [];
-		for await (const row of targetTable().search({
-			conditions: [{ attribute: 'url', comparator: 'greater_than', value: cursor }],
-			sort: { attribute: 'url' },
-			select: TARGET_SELECT,
-			limit: chunkSize,
-		})) {
-			chunk.push(row);
-		}
-		if (!chunk.length) return;
-		cursor = chunk[chunk.length - 1].url;
-		yield* chunk;
-		if (chunk.length < chunkSize) return;
-	}
-}
+const walkTargets = (chunkSize, onUnreadable) =>
+	walkUrlRange(targetTable(), { startAt: '', select: TARGET_SELECT, chunkSize, onUnreadable });
 
 /** The canary cohort, re-read fresh: membership is remembered, rows are not. */
 async function* readCohortRows(urls) {
@@ -615,8 +602,12 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
+		let unreadable = 0;
 		const stats = await runProbePass({
-			rows: walkTargets(config.changeProbe.chunkSize),
+			rows: walkTargets(config.changeProbe.chunkSize, () => {
+				unreadable++;
+				countProbe('unreadable');
+			}),
 			rules,
 			ownerOf: getResidencyByUrl,
 			hostname: server.hostname,
@@ -631,6 +622,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 		});
+		stats.unreadable = unreadable;
 		// An interrupted pass keeps the OLD cohorts — a partial walk's sample covers only the key
 		// range it reached, and the chained reseed rebuilds them properly.
 		if (!stats.aborted) cohorts = new Map(rules.map((rule) => [rule.label, collectors.get(rule.label).list()]));
@@ -693,7 +685,7 @@ const ensureCohorts = async () => {
 	const rules = probeRules();
 	const count = Math.max(1, config.changeProbe.canary.count | 0);
 	const next = new Map(rules.map((rule) => [rule.label, []]));
-	for await (const row of walkTargets(config.changeProbe.chunkSize)) {
+	for await (const row of walkTargets(config.changeProbe.chunkSize, () => countProbe('unreadable'))) {
 		if (!config.changeProbe.enabled) break;
 		if (getResidencyByUrl(row.url) !== server.hostname) continue;
 		if (row.state === 'suppressed' || !isCanaryCandidate(row.url)) continue;
