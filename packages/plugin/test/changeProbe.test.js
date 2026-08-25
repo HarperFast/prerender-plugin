@@ -105,7 +105,7 @@ const runPass = async ({
 			return answer ?? null;
 		},
 		// The port returns the whole baseline now — `probedAt` is what the freshness skip reads.
-		read: async (url) => (stored[url] == null ? null : { signature: stored[url], probedAt: NaN }),
+		read: async (url) => (stored[url] === undefined ? null : { signature: stored[url], probedAt: NaN }),
 		write: async (url, signature) => written.push({ url, signature }),
 		trigger: async (target) => triggered.push(target.url),
 		dryRun,
