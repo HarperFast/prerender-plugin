@@ -20,6 +20,8 @@ const CSS_FIXTURE = `<!doctype html><html><head><title>prune</title>
   [data-note="absent{;}:v"] { color: rgb(6, 6, 6); }
   li:not(.absent-x) { color: rgb(3, 3, 3); }
   .absent-list, .present { outline-color: rgb(5, 5, 5); }
+  .only-in-template { color: rgb(11, 11, 11); }
+  .only-in-noscript { color: rgb(12, 12, 12); }
   @media (min-width: 1px) { .present { padding-top: 4px; } .absent-media { padding-top: 9px; } }
   @media (min-width: 2px) { .absent-only { padding-top: 8px; } }
   @keyframes pulse { from { opacity: 0 } to { opacity: 1 } }
@@ -29,6 +31,8 @@ const CSS_FIXTURE = `<!doctype html><html><head><title>prune</title>
 </head><body>
 <div class="present">kept</div>
 <ul><li>list item</li></ul>
+<template><span class="only-in-template">templated</span></template>
+<noscript><span class="only-in-noscript">no-js fallback</span></noscript>
 </body></html>`;
 
 const NO_SCROLL = { scroll: { enabled: false } } as const;
@@ -94,6 +98,15 @@ test('drops only the rules that can never match', async () => {
 	assert.match(css, /data-note/, 'a quoted attribute value is never rewritten, so it is kept');
 	assert.match(css, /li:not\(\.absent-x\)/, 'a matching base with :not() stays');
 	assert.match(css, /absent-list/, 'a selector list keeps ALL parts when any one part matches');
+
+	// DOM that reaches the output but that document.querySelector cannot see. Both would look
+	// dead to a probe that only asks the live document.
+	assert.match(css, /only-in-template/, '<template> content is serialized, so its rules stay');
+	assert.match(
+		css,
+		/only-in-noscript/,
+		'<noscript> content is inert text here but live DOM for a scripting-off consumer'
+	);
 
 	// At-rules the prune must not touch.
 	assert.match(css, /@keyframes pulse/, '@keyframes survives');

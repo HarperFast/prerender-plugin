@@ -195,6 +195,23 @@ page 2,674 of 3,589 selectors carry a quote (the reviews widget keys on `[data-b
 only 2 have a colon inside one, so bailing on every quoted selector would have forfeited most of
 the saving for nothing.
 
+**DOM the probe cannot see is accounted for explicitly**, because anything hidden from
+`document.querySelector` would make a live rule look dead. There are four such places and they are
+not equivalent:
+
+- **`<template>` content** is serialized into the output but is not in the document tree, and
+  **`<noscript>` content** is inert _text_ while scripting is enabled (which it is, inside the
+  renderer) yet becomes live DOM for any consumer that renders the snapshot with scripting off.
+  Both are probed: template fragments directly, noscript markup via `DOMParser`. Only rules the
+  main document rejects pay for this, and these roots are tiny.
+- **iframes** need nothing. CSS does not cross a browsing context, so a parent sheet never styles
+  iframe content; that content is not in the output either (`outerHTML` emits the tag, not the
+  loaded document); and the iframe's own stylesheets are never touched, since the pass runs in the
+  main frame. Rules styling the `<iframe>` _element_ match in the parent DOM as usual.
+- **shadow roots** need nothing. `flattenShadowDom` has already inlined open roots into the light
+  DOM by the time this runs, so their content is visible to the probe; closed roots reach neither
+  the flatten nor the serializer, so nothing that references them is in the output.
+
 **Grouping rules are recursed into but never deleted**, even when emptied — an `@layer` block that
 disappears takes its position in the cascade order with it, and an empty `@media (…) {}` husk costs
 a few bytes and risks nothing. `@keyframes` and `@font-face` are never touched, so an animation

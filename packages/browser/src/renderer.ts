@@ -1078,6 +1078,28 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		// answer depends on the probe string alone and is worth remembering. Sheets repeat
 		// selectors heavily (a utility framework, a component library scoped to one host), and on
 		// the flagged page this turns 4,387 `querySelector` calls into 3,144: 114ms down to 81ms.
+		// DOM that reaches the serialized output but that `document.querySelector` cannot see, and
+		// so would make a live rule look dead. `<template>` content is never rendered and, with
+		// scripts stripped, can never be cloned — but it is still serialized. `<noscript>` content
+		// is inert TEXT while scripting is enabled (which it is, in here), yet becomes live DOM for
+		// any consumer that renders the snapshot with scripting off. Probe both.
+		//
+		// Not on this list, deliberately: iframes and shadow roots. CSS does not cross a browsing
+		// context, so a parent sheet never styles iframe content — and that content is not in the
+		// output anyway (`outerHTML` emits the tag, not the loaded document). Open shadow roots are
+		// already inlined into the light DOM by `flattenShadowDom` above, and closed ones reach
+		// neither the flatten nor the serializer.
+		const extraRoots: ParentNode[] = [];
+		for (const template of document.querySelectorAll('template')) extraRoots.push(template.content);
+		for (const noscript of document.querySelectorAll('noscript')) {
+			const markup = noscript.textContent ?? '';
+			if (markup.trim() === '') continue;
+			try {
+				extraRoots.push(new DOMParser().parseFromString(markup, 'text/html'));
+			} catch {
+				/* unparseable — the rules that target it simply stay, which is the safe direction */
+			}
+		}
 		const probed = new Map<string, boolean>();
 		const canEverMatch = (selectorText: string): boolean => {
 			for (const part of selectorText.split(',')) {
@@ -1093,6 +1115,9 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				let matched: boolean;
 				try {
 					matched = document.querySelector(probe) !== null;
+					// Only the rules the main document rejects pay for the extra roots, and those
+					// roots are small, so this costs nothing on a page without them.
+					if (!matched) matched = extraRoots.some((root) => root.querySelector(probe) !== null);
 				} catch {
 					matched = true; // unparseable once rewritten — never prune on a broken probe
 				}
