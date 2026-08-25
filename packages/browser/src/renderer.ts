@@ -836,6 +836,43 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		document.querySelectorAll(removeSelectors.join(', ')).forEach((el) => el.remove());
 	}
 
+	// LAST, deliberately: every step above keys on attributes this can remove
+	// (`stripBlockedResources` reads src/href/srcset, a `removeSelectors` entry can match on
+	// an attribute selector), so stripping earlier would change what they match. Nothing below
+	// reads the DOM again — the next statement serializes it.
+	for (const rule of opts.removeAttributes ?? []) {
+		let elements: NodeListOf<Element>;
+		try {
+			elements = document.querySelectorAll(rule.selector);
+		} catch {
+			continue; // malformed selector — skip the rule, never fail the render over it
+		}
+		// Split exact names from `prefix*` matches once per rule, not once per element.
+		// A bare '*' yields an empty prefix and is dropped: it would strip every attribute.
+		const exact = new Set<string>();
+		const prefixes: string[] = [];
+		for (const name of rule.attributes) {
+			const lower = name.trim().toLowerCase();
+			if (lower.endsWith('*')) {
+				const prefix = lower.slice(0, -1);
+				if (prefix) prefixes.push(prefix);
+			} else if (lower) {
+				exact.add(lower);
+			}
+		}
+		if (exact.size === 0 && prefixes.length === 0) continue;
+		for (const el of elements) {
+			// `el.attributes` is a LIVE NamedNodeMap — snapshot it, or removing an attribute
+			// re-indexes the map underneath the loop and skips the next one.
+			for (const attr of [...el.attributes]) {
+				const name = attr.name.toLowerCase();
+				if (exact.has(name) || prefixes.some((prefix) => name.startsWith(prefix))) {
+					el.removeAttribute(attr.name);
+				}
+			}
+		}
+	}
+
 	let content = '';
 	for (const node of document.childNodes) {
 		switch (node) {

@@ -121,6 +121,11 @@ include what you change:
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
 		"removeSelectors": ["link[rel=import]", "link[as=script]", "script#__NEXT_DATA__"],
+		// strip named attributes off matching elements, last, before serialization
+		"removeAttributes": [
+			{ "selector": "astro-island", "attributes": ["props", "component-url", "renderer-url"] },
+			{ "selector": "*", "attributes": ["data-analytics-*"] }, // trailing * = prefix match
+		],
 	},
 	"injectWebComponentsPolyfill": true, // force ShadyDOM/ShadyCSS so shadow-DOM CSS serializes
 	"extraHeaders": {}, // extra request headers on the navigation request
@@ -129,6 +134,40 @@ include what you change:
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### `postProcess.removeAttributes` — dropping dead hydration payloads
+
+Removes named attributes from the elements a selector matches. Empty by default (a no-op, so
+existing deployments serialize byte-identically), and applied **last** — after every other
+post-processing step, so `stripBlockedResources` still sees the `src`/`href` it reads and a
+`removeSelectors` attribute selector still matches.
+
+The case it exists for: a framework's client-side hydration payload. An island/component wrapper
+carries the props its runtime would rehydrate from, serialized as JSON _inside an HTML attribute_ —
+so every `"` becomes `&quot;` and the payload lands at roughly 6× the size of the JSON. With
+`stripScripts` on, that runtime is not in the snapshot and can never read the payload back, which
+makes it pure dead weight. Removing the _element_ is not an option — the wrapper contains the
+server-rendered content — so the attribute is the unit, hence this option rather than
+`removeSelectors`.
+
+Size is not the only stake. Search engines apply a size budget per document (Bing documents a
+125 KB soft limit past which a page "risks not being fully cached"), so dead bytes _ahead of_ the
+content push real content past the cut. Measured on one retail site's product page: the payload was
+12% of the document, and the `<h1>` sat at byte 161,454 — outside that budget. Stripping the
+hydration attributes moved it to 80,125, with the number of links inside the first 125 KB going
+from 19 to 43, and the extracted text, links, images, `ld+json`, headings, classes and inline
+styles all byte-identical to the untouched render.
+
+Attribute names match case-insensitively. A trailing `*` makes an entry a prefix match
+(`data-aue-*` covers `data-aue-prop`, `data-aue-label`, …), which keeps a rule from drifting as a
+framework grows an attribute family. A bare `"*"` is ignored rather than honored — it would strip
+`href`/`src`/`class` off everything the selector matches. A selector that fails to parse skips its
+rule instead of failing the render.
+
+Two things worth checking before adding a rule: an attribute may be **load-bearing for CSS**
+(`[data-state]` selectors are common), and it may be a **diagnostic** — Astro removes `ssr` from
+`<astro-island>` on hydration, so stripping `ssr` would destroy the only marker distinguishing a
+healthy snapshot from an un-hydrated one. Strip what is inert, not what is merely non-visual.
 
 ## Custom renderer
 
