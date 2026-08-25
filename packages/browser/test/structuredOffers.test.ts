@@ -106,3 +106,30 @@ test('a trailing slash on the availability URL still yields the verdict, not an 
 	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
 	assert.deepEqual(job.structuredOffers, ['7.5', 'USD', 'InStock']);
 });
+
+test('more offers than the cap posts null — no claim, never a truncated sample', async () => {
+	// A deterministic sample that omits the offer the consumer's endpoint reports would disagree
+	// with it on every comparison, expiring and re-rendering the page forever. The cap must hold
+	// across @graph nodes too, not just within one offers array — every node used to slip one
+	// more triple past it.
+	const products = Array.from({ length: 250 }, (_, i) => ({
+		'@type': 'Product',
+		'offers': { price: `${i}.99`, priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
+	}));
+	body = page(`<script type="application/ld+json">${JSON.stringify({ '@graph': products })}</script>`);
+	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
+	assert.equal(job.structuredOffers, null);
+});
+
+test('pathological field values are byte-bounded — the cap limits count, this limits size', async () => {
+	body = page(
+		`<script type="application/ld+json">${JSON.stringify({
+			'@type': 'Product',
+			'offers': { price: 'x'.repeat(100000), priceCurrency: 'USD', availability: 'InStock' },
+		})}</script>`
+	);
+	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
+	assert.ok(Array.isArray(job.structuredOffers));
+	assert.equal(job.structuredOffers[0]?.length, 64, 'a 100k-char price must be sliced, not posted');
+	assert.equal(job.structuredOffers[2], 'InStock');
+});

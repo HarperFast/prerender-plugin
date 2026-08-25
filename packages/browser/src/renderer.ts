@@ -655,8 +655,10 @@ export function indexVerdict(
 	};
 }
 
-// Upper bound on posted offer triples: a variant-heavy PDP legitimately carries dozens, and
-// nothing downstream needs more than a representative set to compare price/availability.
+// Refusal threshold, not a sample size: a variant-heavy PDP legitimately carries dozens of offer
+// triples, but past this the page posts NO claim rather than a truncated one (see
+// extractStructuredOffers — a deterministic sample can systematically disagree with the
+// consumer's endpoint).
 const STRUCTURED_OFFER_CAP = 200;
 
 /**
@@ -668,12 +670,23 @@ const STRUCTURED_OFFER_CAP = 200;
  * write path to recover values this process can read directly. Returns null when the page declares
  * no Product offers, so "no structured data" stays distinguishable from "no offers".
  *
+ * A page carrying MORE offers than the cap also returns null — no claim, never a truncated one. A
+ * deterministic sample that happens to omit the offer the consumer's endpoint reports would
+ * disagree with it on every comparison, and a systematic disagreement means the consumer expires
+ * and re-renders that page forever. "Too many offers to read confidently" degrades to exactly
+ * what "no offers" does: nothing.
+ *
  * Self-contained (passed to page.evaluate) — no imports, no closure over module scope.
  */
 function extractStructuredOffers(cap: number): Array<string | null> | null {
 	const triples: Array<Array<string | null>> = [];
+	let overflowed = false;
+	// Field-level byte bound: the cap bounds triple COUNT, so without this a single pathological
+	// field (a megabyte "price" string) would still inflate every posted result for the page. No
+	// legitimate price, currency code, or availability token approaches 64 characters.
+	const bound = (value: string): string | null => (value === '' ? null : value.slice(0, 64));
 	const collect = (node: unknown) => {
-		if (!node || typeof node !== 'object') return;
+		if (overflowed || !node || typeof node !== 'object') return;
 		const record = node as Record<string, unknown>;
 		const type = record['@type'];
 		const isProduct = type === 'Product' || (Array.isArray(type) && type.includes('Product'));
@@ -682,20 +695,24 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 		const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
 		for (const entry of list) {
 			if (!entry || typeof entry !== 'object') continue;
+			if (triples.length >= cap) {
+				overflowed = true;
+				return;
+			}
 			const offer = entry as Record<string, unknown>;
 			// filter(Boolean) before pop: a trailing slash (https://schema.org/InStock/) would
 			// otherwise pop the empty segment and read as no availability at all.
 			const availability =
-				typeof offer.availability === 'string' ? (offer.availability.split('/').filter(Boolean).pop() ?? null) : null;
-			const price = offer.price === undefined || offer.price === null ? null : String(offer.price);
-			const currency = typeof offer.priceCurrency === 'string' ? offer.priceCurrency : null;
+				typeof offer.availability === 'string'
+					? bound(offer.availability.split('/').filter(Boolean).pop() ?? '')
+					: null;
+			const price = offer.price === undefined || offer.price === null ? null : bound(String(offer.price));
+			const currency = typeof offer.priceCurrency === 'string' ? bound(offer.priceCurrency) : null;
 			triples.push([price, currency, availability]);
-			// A pathological page must not turn a small metadata field into a large one.
-			if (triples.length >= cap) return;
 		}
 	};
 	document.querySelectorAll('script[type="application/ld+json"]').forEach((el) => {
-		if (triples.length >= cap) return;
+		if (overflowed) return;
 		let data: unknown;
 		try {
 			data = JSON.parse(el.textContent || '');
@@ -704,9 +721,12 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 		}
 		const graph = (data as Record<string, unknown>)?.['@graph'];
 		const nodes = Array.isArray(data) ? data : Array.isArray(graph) ? graph : [data];
-		for (const node of nodes) collect(node);
+		for (const node of nodes) {
+			if (overflowed) break;
+			collect(node);
+		}
 	});
-	if (!triples.length) return null;
+	if (overflowed || !triples.length) return null;
 	// Field-wise, not JSON.stringify per comparison: sorting is O(n log n) COMPARISONS, so
 	// stringifying inside the comparator serialises every triple many times over. Code-unit
 	// comparison, not localeCompare: the whole point of the sort is a sequence that is identical
