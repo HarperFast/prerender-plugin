@@ -1005,10 +1005,10 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		document.querySelectorAll(removeSelectors.join(', ')).forEach((el) => el.remove());
 	}
 
-	// LAST, deliberately: every step above keys on attributes this can remove
+	// Late, deliberately: every step above keys on attributes this can remove
 	// (`stripBlockedResources` reads src/href/srcset, a `removeSelectors` entry can match on
-	// an attribute selector), so stripping earlier would change what they match. Nothing below
-	// reads the DOM again — the next statement serializes it.
+	// an attribute selector), so stripping earlier would change what they match. Only
+	// `pruneUnmatchedCss` runs after, and it must — it reads the finished DOM.
 	for (const rule of opts.removeAttributes ?? []) {
 		let elements: NodeListOf<Element>;
 		try {
@@ -1043,6 +1043,70 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 					el.removeAttribute(attr.name);
 				}
 			}
+		}
+	}
+
+	if (opts.pruneUnmatchedCss) {
+		// Drop style rules that cannot match anything in the finished document. Runs LAST: every
+		// step above changes what exists to be matched, and `validate()` has already guaranteed
+		// `stripScripts`, so nothing can re-introduce a match after serialization.
+		//
+		// Probe policy is one-directional — every uncertainty keeps the rule:
+		//  * state pseudo-classes and pseudo-elements are stripped before probing, so `.x:hover`
+		//    is judged on whether `.x` exists. Structural pseudos (`:not()`, `:nth-child()`) go
+		//    too, which only widens the probe.
+		//  * a selector carrying a quoted value is never rewritten (the regex could cut inside
+		//    the string) and is kept untested.
+		//  * anything that fails to parse once rewritten — a `:is(a` left by splitting a selector
+		//    list on a comma inside parentheses, say — throws, and a throw keeps the rule.
+		const PSEUDO = /::?[a-zA-Z-]+(\([^()]*\))?/g;
+		const canEverMatch = (selectorText: string): boolean => {
+			for (const part of selectorText.split(',')) {
+				const one = part.trim();
+				if (one === '' || one.includes('"') || one.includes("'")) return true;
+				const probe = one.replace(PSEUDO, '').trim();
+				if (probe === '') return true; // e.g. `::selection` — nothing left to test
+				try {
+					if (document.querySelector(probe)) return true;
+				} catch {
+					return true; // unparseable once rewritten — never prune on a broken probe
+				}
+			}
+			return false;
+		};
+		// Grouping rules (@media/@supports/@layer/@container/@scope) are recursed into but never
+		// deleted, even when emptied: an `@layer` block that disappears takes its position in the
+		// cascade order with it. An empty `@media(){}` husk costs a few bytes and risks nothing.
+		// @keyframes and @font-face have no selectorText and no `cssRules`, so both fall through
+		// untouched — an animation whose rules were pruned still resolves its keyframes.
+		const pruneRules = (owner: { deleteRule(index: number): void }, rules: CSSRuleList): void => {
+			// Backwards: deleteRule re-indexes everything after it.
+			for (let i = rules.length - 1; i >= 0; i--) {
+				const rule = rules[i];
+				// `instanceof` rather than duck-typing on `selectorText`/`cssRules`: CSSKeyframesRule
+				// also has `cssRules` but its `deleteRule` takes a keyframe selector, not an index,
+				// and CSSPageRule also has `selectorText`. Neither is one of these two types.
+				if (rule instanceof CSSStyleRule) {
+					if (!canEverMatch(rule.selectorText)) owner.deleteRule(i);
+					continue;
+				}
+				if (rule instanceof CSSGroupingRule) pruneRules(rule, rule.cssRules);
+			}
+		};
+		for (const style of document.querySelectorAll('style')) {
+			const sheet = style.sheet;
+			if (!sheet) continue;
+			let css = '';
+			try {
+				pruneRules(sheet, sheet.cssRules);
+				for (const rule of sheet.cssRules) css += rule.cssText;
+			} catch {
+				continue; // unreadable (cross-origin) — leave the source text alone
+			}
+			// Same guard as `minifyInlineCss`: never grow the document. A sheet whose rules were
+			// all pruned legitimately serializes to '' — the CSSOM itself says nothing is left —
+			// so an empty result is written, unlike there, where it would mean a parse failure.
+			if (css.length < style.textContent!.length) style.textContent = css;
 		}
 	}
 

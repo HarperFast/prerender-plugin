@@ -121,6 +121,7 @@ include what you change:
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
 		"minifyInlineCss": false, // re-emit inline <style> from the CSSOM (see below)
+		"pruneUnmatchedCss": false, // drop style rules that match nothing (needs stripScripts)
 		"removeSelectors": ["link[rel=import]", "link[as=script]", "script#__NEXT_DATA__"],
 		// strip named attributes off matching elements, last, before serialization
 		"removeAttributes": [
@@ -166,6 +167,38 @@ A sheet is left untouched when it has no readable rules (a cross-origin sheet th
 when re-emission comes back empty, or when the result would not be smaller — so the pass never grows
 a document and is idempotent.
 
+### `postProcess.pruneUnmatchedCss` — dropping CSS the page cannot use
+
+Deletes every style rule whose selector cannot match anything in the finished document. Off by
+default.
+
+A prerendered snapshot ships the whole site's CSS but only one page's DOM, so most of what it
+carries is unreachable. On a review-heavy product page **74% of the style rules matched nothing** —
+533 KB of a 1.89 MB document. This is by some distance the largest remaining lever on these pages,
+and unlike the others it removes nothing the browser would have used.
+
+**Why it is safe here specifically.** A pruned rule is only inert if the DOM can never change
+again, and what guarantees that is `stripScripts`: with no code left in the snapshot, nothing can
+add a class or an element after serialization. So the two options are coupled, and enabling this
+one without `stripScripts` is rejected by config validation rather than silently accepted.
+
+**Every uncertainty resolves toward keeping a rule.** The probe strips pseudo-classes and
+pseudo-elements before testing, so `.card:hover` is judged on whether `.card` exists — state is
+never the reason a rule is dropped. Structural pseudos (`:not()`, `:nth-child()`) come off too,
+which only widens the probe. A selector carrying a quoted value is never rewritten (the rewrite
+could cut inside the string) and is kept untested; anything that fails to parse once rewritten is
+kept as well. In a selector list, one matching part keeps the whole rule.
+
+**Grouping rules are recursed into but never deleted**, even when emptied — an `@layer` block that
+disappears takes its position in the cascade order with it, and an empty `@media (…) {}` husk costs
+a few bytes and risks nothing. `@keyframes` and `@font-face` are never touched, so an animation
+whose rules were pruned still resolves.
+
+Measured on six real pages (product/category/homepage × desktop/mobile), rendered with their actual
+stylesheets: every computed property and `getBoundingClientRect` identical for all 36,896 elements,
+page height unchanged, and full-page screenshots pixel-identical. Savings ranged from 8.9% of the
+document (category) to 30.3% (mobile product page).
+
 ### `postProcess.removeAttributes` — dropping dead hydration payloads
 
 Removes named attributes from the elements a selector matches. Empty by default (a no-op, so
@@ -181,13 +214,15 @@ makes it pure dead weight. Removing the _element_ is not an option — the wrapp
 server-rendered content — so the attribute is the unit, hence this option rather than
 `removeSelectors`.
 
-Size is not the only stake. Search engines apply a size budget per document (Bing documents a
-125 KB soft limit past which a page "risks not being fully cached"), so dead bytes _ahead of_ the
-content push real content past the cut. Measured on one retail site's product page: the payload was
-12% of the document, and the `<h1>` sat at byte 161,454 — outside that budget. Stripping the
-hydration attributes moved it to 80,125, with the number of links inside the first 125 KB going
-from 19 to 43, and the extracted text, links, images, `ld+json`, headings, classes and inline
-styles all byte-identical to the untouched render.
+Size is not the only stake. Search engines apply a size budget per document — Bing's webmaster
+tools flag "HTML size is too long" against a documented **soft limit of 1 MB**, "used for guidance
+to ensure all content & links are available in the page source to be cached by the crawler". Take
+that number from the tool's own issue text; third-party write-ups quote much smaller figures that
+do not match it. Measured on one retail site's product page, the hydration payload was **83% of an
+8.06 MB document** — 27 island wrappers, five of them each carrying a near-identical 1.4 MB
+payload, the same dataset serialized five times over. Stripping those attributes took the document
+to 1.37 MB, with the extracted text, links, images, `ld+json`, headings, classes and inline styles
+all byte-identical to the untouched render.
 
 Attribute names match case-insensitively. A trailing `*` makes an entry a prefix match
 (`data-aue-*` covers `data-aue-prop`, `data-aue-label`, …), which keeps a rule from drifting as a
