@@ -826,6 +826,36 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		}
 	}
 
+	if (opts.minifyInlineCss) {
+		// Re-emit each inline sheet from the CSSOM rather than keeping the origin's source text.
+		// Same operation as `inlineEmptyStyleSheets` above, widened from empty sheets to every one
+		// — and it runs after it deliberately, so a sheet that step just filled is re-emitted from
+		// the same CSSOM it was built from (a no-op) rather than being minified twice.
+		//
+		// The browser has already parsed these rules, so this cannot corrupt CSS the way a regex
+		// minifier can. What it CAN do is drop rules Chrome did not implement (an
+		// `@-moz-document` block, an `-ms-*` declaration) — see the config docs for the measured
+		// scope of that.
+		const serialize = (rules: CSSRuleList): string => {
+			let css = '';
+			for (const rule of rules) css += rule.cssText;
+			return css;
+		};
+		for (const style of document.querySelectorAll('style')) {
+			const sheet = style.sheet;
+			if (!sheet) continue;
+			let css: string;
+			try {
+				css = serialize(sheet.cssRules);
+			} catch {
+				continue; // unreadable (cross-origin) — leave the source text alone
+			}
+			// An empty result on a non-empty sheet means every rule was dropped or the sheet never
+			// parsed; keeping the original is the conservative call. Never grow the document.
+			if (css && css.length < style.textContent!.length) style.textContent = css;
+		}
+	}
+
 	const removeSelectors = [...opts.removeSelectors];
 	if (opts.stripScripts) {
 		// Strip only script tags that contain JavaScript (no type attribute, or a type

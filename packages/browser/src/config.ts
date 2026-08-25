@@ -176,6 +176,28 @@ export type PostProcessConfig = {
 	stripScripts: boolean;
 	/** Inline the text of empty (CSSOM-injected) stylesheets so styles survive serialization. */
 	inlineEmptyStyleSheets: boolean;
+	/**
+	 * Re-emit every inline `<style>` from the CSSOM (`rule.cssText`) instead of the origin's
+	 * source text. This is `inlineEmptyStyleSheets` generalized from empty sheets to all of them,
+	 * and it is a *minifier that cannot corrupt*: the browser has already parsed the sheet, so
+	 * unlike a regex pass there is no way to mangle a `url()` or a quoted string containing
+	 * `{`, `}`, `;` or `:`. A sheet is left untouched if it has no readable rules, or if
+	 * re-emission would not make it smaller.
+	 *
+	 * It IS lossy, in one specific and bounded way: Chrome discards what it does not implement at
+	 * parse time, so re-emitting drops vendor rules for other engines. Measured across three real
+	 * pages, everything dropped was exactly that — an `@-moz-document url-prefix(){…}` block
+	 * (a Firefox-only hack) and an `-ms-overflow-style` declaration. Everything else that looked
+	 * like a loss was shorthand/longhand normalization (`border-left` → `border-left-width`/
+	 * `-style`/`-color`, `top`/`right`/`bottom`/`left` → `inset`). Computed styles and geometry
+	 * were identical for all 16,017 elements across those pages, and `scrollHeight` was unchanged.
+	 *
+	 * So: safe for the snapshot's actual consumers, which render with Chromium — and a smaller
+	 * semantic change than `stripScripts`, which is on by default. Weigh it against the payoff
+	 * before enabling: on those pages it saved ~8% of the CSS, which is ~0.6% of the document.
+	 * Default false.
+	 */
+	minifyInlineCss: boolean;
 	/** Extra CSS selectors whose matching elements are removed before serialization. */
 	removeSelectors: string[];
 	/**
@@ -351,6 +373,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 	postProcess: {
 		stripScripts: true,
 		inlineEmptyStyleSheets: true,
+		minifyInlineCss: false,
 		removeSelectors: ['link[rel=import]', 'link[as=script]', 'script#__NEXT_DATA__'],
 		flattenShadowDom: false,
 		stripBlockedResources: false,

@@ -120,6 +120,7 @@ include what you change:
 	"postProcess": {
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
+		"minifyInlineCss": false, // re-emit inline <style> from the CSSOM (see below)
 		"removeSelectors": ["link[rel=import]", "link[as=script]", "script#__NEXT_DATA__"],
 		// strip named attributes off matching elements, last, before serialization
 		"removeAttributes": [
@@ -134,6 +135,36 @@ include what you change:
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### `postProcess.minifyInlineCss` — re-emitting inline CSS from the CSSOM
+
+Replaces each inline `<style>`'s source text with the browser's own serialization of the parsed
+sheet (`rule.cssText`). This is `inlineEmptyStyleSheets` generalized from empty sheets to every one,
+and it runs immediately after it. Off by default.
+
+**It cannot corrupt CSS**, which is the whole reason to do it this way. A regex minifier splits on
+`{`, `}`, `;` and `:` and therefore mangles any `url()` or quoted string containing one — a real
+hazard in `content:` values and data URIs. Here the browser has already parsed the sheet, so the
+output is by construction valid CSS.
+
+**It is lossy in one bounded way.** Chrome discards what it does not implement at parse time, so
+re-emitting drops vendor rules for other engines. Measured across three real pages, everything
+dropped was exactly that: an `@-moz-document url-prefix(){…}` block (a Firefox-only hack) and an
+`-ms-overflow-style` declaration. Everything else that looks like a loss is shorthand/longhand
+normalization — `border-left` becomes `border-left-width`/`-style`/`-color`, `top`/`right`/`bottom`/
+`left` become `inset`. Computed styles and geometry were identical for all 16,017 elements across
+those pages, and `scrollHeight` was unchanged. If your snapshot is consumed by Chromium-based
+crawlers, that is safe; if something else renders it, weigh the vendor-rule loss.
+
+**Do not expect much.** This is a normalizer, not an aggressive minifier: CSSOM serializes grouping
+rules (`@media`, `@keyframes`) with a newline and two-space indent per inner rule, and that stays.
+Measured saving is 6–13% of the inline CSS, which was ~0.6% of the document on the pages above. It
+is worth enabling alongside `removeAttributes` for the position it buys — on the product page the
+`<h1>` moved from 80,125 to 74,935 — not for the bytes on their own.
+
+A sheet is left untouched when it has no readable rules (a cross-origin sheet throws on `cssRules`),
+when re-emission comes back empty, or when the result would not be smaller — so the pass never grows
+a document and is idempotent.
 
 ### `postProcess.removeAttributes` — dropping dead hydration payloads
 
