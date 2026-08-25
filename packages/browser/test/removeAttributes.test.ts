@@ -106,6 +106,73 @@ test('strips named and prefix-matched attributes without losing content', async 
 	assert.ok(result.htmlBytes < baseline.htmlBytes, 'the strip should shrink the document');
 });
 
+test('exact names and prefixes in one rule remove exactly the same set', async () => {
+	// The loop now handles exact names without reading the element's attribute list, and prefixes
+	// with it. Splitting those paths must not change WHAT is removed — only how it is found.
+	const oneRule = await renderOnce({
+		url: `${base}/`,
+		config: {
+			...NO_SCROLL,
+			postProcess: { removeAttributes: [{ selector: '*', attributes: ['uid', 'props', 'data-aue-*'] }] },
+		},
+	});
+	const twoRules = await renderOnce({
+		url: `${base}/`,
+		config: {
+			...NO_SCROLL,
+			postProcess: {
+				removeAttributes: [
+					{ selector: '*', attributes: ['uid', 'props'] },
+					{ selector: '*', attributes: ['data-aue-*'] },
+				],
+			},
+		},
+	});
+	assert.equal(oneRule.html, twoRules.html, 'a mixed rule must equal the same rules split apart');
+	for (const gone of ['uid=', 'props=', 'data-aue-prop', 'data-aue-label']) {
+		assert.ok(!oneRule.html.includes(gone), `${gone} should be gone`);
+	}
+	assert.ok(oneRule.html.includes('data-keep="yes"'), 'unrelated data-* attributes stay');
+	assert.ok(oneRule.html.includes('component-url='), 'unnamed attributes stay');
+});
+
+test('camelCase attributes are removed from SVG, where names are case-sensitive', async () => {
+	// `removeAttribute` lowercases only for HTML-namespace elements. On SVG, `viewBox` and
+	// `viewbox` are different names — so a fast path that asks for the lowercased spelling
+	// silently leaves the attribute in place. Both spellings in config must work, on both
+	// namespaces, because the rule documents case-insensitive matching.
+	const svgServer = http.createServer((_q, res) => {
+		res.setHeader('content-type', 'text/html; charset=utf-8');
+		res.end(
+			`<!doctype html><html><head><title>svg</title></head><body>` +
+				`<svg id="chart" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid" width="50" height="50" data-keep="y">` +
+				`<path d="M0 0 L10 10"></path></svg>` +
+				`<div id="html" viewBox="not-really" data-keep="y">html</div></body></html>`
+		);
+	});
+	await new Promise<void>((resolve) => svgServer.listen(0, '127.0.0.1', resolve));
+	const svgBase = `http://127.0.0.1:${(svgServer.address() as AddressInfo).port}`;
+	try {
+		for (const attributes of [
+			['viewBox', 'preserveAspectRatio'],
+			['viewbox', 'preserveaspectratio'],
+		]) {
+			const r = await renderOnce({
+				url: `${svgBase}/`,
+				config: { ...NO_SCROLL, postProcess: { removeAttributes: [{ selector: '*', attributes }] } },
+			});
+			const svg = /<svg[^>]*>/.exec(r.html)![0];
+			assert.ok(!/viewBox/i.test(svg), `viewBox must go from SVG (configured as ${attributes[0]})`);
+			assert.ok(!/preserveAspectRatio/i.test(svg), `preserveAspectRatio must go (configured as ${attributes[0]})`);
+			assert.match(svg, /width="50"/, 'unnamed SVG attributes stay');
+			assert.match(svg, /data-keep="y"/, 'unnamed SVG attributes stay');
+			assert.ok(!/viewBox/i.test(/<div[^>]*>/.exec(r.html)![0]), 'and the HTML element loses its too');
+		}
+	} finally {
+		svgServer.close();
+	}
+});
+
 test('a bare "*" attribute entry is ignored rather than stripping everything', async () => {
 	const result = await renderOnce({
 		url: `${base}/`,
