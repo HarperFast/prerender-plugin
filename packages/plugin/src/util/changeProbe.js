@@ -134,6 +134,10 @@ const newStats = () => ({
 	deferred: 0, // changes past maxTriggersPerSweep — signature kept stale so the next pass retries
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
+	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
+	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
+	throttleLevel: 1, // pacing-window multiplier when the pass ended; 1 means never backed off
+	abortedOnDistress: false, // the pass gave up because the origin refused everything
 	failureSamples: [], // first few failures, for the admin surface
 });
 
@@ -183,7 +187,11 @@ const probeFetch = async ({ url, method, headers, body }, targetUrl) => {
 		response.headers['content-encoding'] === 'gzip'
 			? gunzipSync(raw, { maxOutputLength: config.changeProbe.maxResponseBytes * 16 })
 			: raw;
-	return { statusCode: response.statusCode, body: buffer.toString('utf8') };
+	return {
+		statusCode: response.statusCode,
+		body: buffer.toString('utf8'),
+		retryAfterMs: parseRetryAfter(response.headers['retry-after']),
+	};
 };
 
 /**
@@ -191,17 +199,61 @@ const probeFetch = async ({ url, method, headers, body }, targetUrl) => {
  * response yielded no usable observation (the all-null rule); throws on fetch/HTTP failure.
  * A 404 is a failure like any other — target retirement is suppression's job, not the probe's.
  */
+// Status codes that mean THE ORIGIN IS ASKING US TO STOP, as opposed to a bad rule or a dead
+// product. 429 is explicit; 502/503/504 are an origin at or past its limit, and a probe sweep
+// that keeps its rate through them is adding load to something already failing.
+const DISTRESS_STATUS = new Set([429, 502, 503, 504]);
+// undici's timeout/connection failures — the unstated version of the same signal.
+const DISTRESS_CODES = new Set([
+	'UND_ERR_HEADERS_TIMEOUT',
+	'UND_ERR_BODY_TIMEOUT',
+	'UND_ERR_CONNECT_TIMEOUT',
+	'UND_ERR_SOCKET',
+	'ECONNRESET',
+	'ECONNREFUSED',
+	'ETIMEDOUT',
+]);
+
+/** Tag an error with whether it is the origin pushing back, and any Retry-After it named. */
+const probeError = (message, statusCode, retryAfterMs) =>
+	Object.assign(new Error(message), {
+		statusCode,
+		distress: DISTRESS_STATUS.has(statusCode),
+		retryAfterMs: retryAfterMs ?? null,
+	});
+
+/** Is this thrown error the origin pushing back (vs. a rule/product problem)? */
+export const isDistress = (e) =>
+	Boolean(e?.distress) || DISTRESS_CODES.has(e?.code) || DISTRESS_CODES.has(e?.cause?.code);
+
+// `Retry-After` is seconds or an HTTP date; anything else is ignored rather than guessed at.
+const parseRetryAfter = (value) => {
+	if (!value) return null;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+	const at = Date.parse(value);
+	if (!Number.isFinite(at)) return null;
+	return Math.max(0, Math.min(at - Date.now(), MAX_RETRY_AFTER_MS));
+};
+const MAX_RETRY_AFTER_MS = 5 * 60_000;
+// setTimeout stores its delay as a signed 32-bit int; past this it fires after 1ms instead.
+const MAX_TIMER_MS = 2147483647;
+
 const probeOnce = async (rule, url) => {
 	const request = buildProbeRequest(rule, url);
 	if (!request) return null;
-	const { statusCode, body } = await probeFetch(request, url);
+	const { statusCode, body, retryAfterMs } = await probeFetch(request, url);
 	if (statusCode >= 300 && statusCode < 400) {
 		// Fail-closed rather than followed: a silently followed redirect can move the probe onto a
 		// host the operator never named (and same-origin gating above would then be deciding about
 		// the wrong URL). A redirecting endpoint is a rule to fix, and the failure metrics say so.
-		throw new Error(`HTTP ${statusCode} (redirects are not followed — probe endpoints must answer directly)`);
+		throw probeError(
+			`HTTP ${statusCode} (redirects are not followed — probe endpoints must answer directly)`,
+			statusCode,
+			retryAfterMs
+		);
 	}
-	if (statusCode < 200 || statusCode >= 300) throw new Error(`HTTP ${statusCode}`);
+	if (statusCode < 200 || statusCode >= 300) throw probeError(`HTTP ${statusCode}`, statusCode, retryAfterMs);
 	if (rule.source === 'request') return signatureOf(extractValues(JSON.parse(body), rule.extract));
 	const offers = extractJsonLdOffers(body);
 	return offers ? signatureOf(offers) : null;
@@ -238,8 +290,20 @@ const triggerRevalidate = async (row) => {
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
 // a missing row (never probed, ownership moved, node rebuilt, target deleted) reads as null and
 // the state machine SEEDS, which is the safe direction everywhere this can happen.
-const readSignature = async (url) =>
-	(await probeStateTable().get({ id: url, select: ['url', 'signature'] }))?.signature ?? null;
+// Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
+// another pass already covered (see `reprobeAfter` in runProbePass).
+const readSignature = async (url) => {
+	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt'] });
+	if (!row) return null;
+	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
+	// exists for — a BigInt, which `new Date()` REFUSES rather than coerces (TypeError, which here
+	// would take down the whole sweep from a read). Same defence as resolveRenderInterval's, one
+	// type earlier. Anything still unparseable reads as "age unknown", which probes rather than
+	// skips: never skip a probe on a value we could not read.
+	const stamp = typeof row.probedAt === 'bigint' ? Number(row.probedAt) : row.probedAt;
+	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
+	return { signature: row.signature ?? null, probedAt };
+};
 const writeSignature = (url, signature) => probeStateTable().put(url, { url, signature, probedAt: new Date() });
 
 /**
@@ -270,17 +334,45 @@ export const runProbePass = async ({
 	collectCohort = null,
 	ownershipChecked = false,
 	onYield = () => yieldNow(),
+	reprobeAfter = 0,
+	backoffMax = 1,
+	abortAfterDistress = 0,
 } = {}) => {
 	const stats = newStats();
 	const batch = [];
 
+	// The origin-pressure state. `throttle` multiplies the pacing window, so it divides the
+	// effective request rate; `distressStreak` is what ends a pass against an origin that is
+	// simply down. See `flush` for how they move.
+	let throttle = 1;
+	let distressStreak = 0;
+	let batchDistress = 0;
+	let retryAfterMs = 0;
+
 	const processOne = async ({ row, rule }) => {
+		// Read BEFORE the probe now (it used to read after, to skip the read on a failed probe).
+		// The stored baseline carries WHEN it was taken, and a baseline younger than
+		// `reprobeAfter` means another pass already covered this URL — the common case after a
+		// restart, which otherwise re-probes hours of already-seeded ground. Trading a node-local
+		// point read for an origin request is the right way round: the origin request is the
+		// scarce, externally-visible resource.
+		const stored = (await read(row.url)) ?? null;
+		if (reprobeAfter > 0 && Number.isFinite(stored?.probedAt) && now() - stored.probedAt < reprobeAfter) {
+			stats.fresh++;
+			return;
+		}
 		stats.probed++;
 		let observed;
 		try {
 			observed = await probe(rule, row.url);
 		} catch (e) {
 			observed = null;
+			if (isDistress(e)) {
+				stats.throttled++;
+				batchDistress++;
+				distressStreak++;
+				if (e?.retryAfterMs > retryAfterMs) retryAfterMs = e.retryAfterMs;
+			}
 			if (stats.failureSamples.length < 3) {
 				stats.failureSamples.push({ url: row.url, rule: rule.label, error: e?.message ?? String(e) });
 			}
@@ -289,14 +381,12 @@ export const runProbePass = async ({
 			stats.failed++;
 			return;
 		}
-		// Read AFTER the probe: a failed probe never needs the stored state, and the read is a
-		// node-local point get either way.
-		const stored = (await read(row.url)) ?? null;
-		if (stored === observed) {
+		distressStreak = 0;
+		if (stored?.signature === observed) {
 			stats.unchanged++;
 			return;
 		}
-		if (!stored) {
+		if (!stored?.signature) {
 			// First observation: baseline it, trigger nothing — the page's content is not known to
 			// have changed, the probe just hadn't seen it before.
 			stats.seeded++;
@@ -329,19 +419,50 @@ export const runProbePass = async ({
 
 	// Pacing: batches of `concurrency`, each batch held to the window `ratePerSecond` implies for
 	// its size — so the sustained request rate is capped whatever the origin's latency does.
+	//
+	// ON TOP OF THAT CAP, the window stretches when the origin pushes back. `ratePerSecond` is
+	// sized with the origin's operator for a HEALTHY origin; it says nothing about an origin
+	// having a bad afternoon, and a sweep that holds its configured rate through 429s and 503s is
+	// adding load to something already failing. Halving the rate per distressed batch and
+	// recovering by halves keeps the steady state at the configured rate while making the
+	// response to pressure immediate and the recovery slow — the asymmetry a backoff needs.
 	const flush = async () => {
 		if (!batch.length) return;
 		const started = now();
+		batchDistress = 0;
+		retryAfterMs = 0;
 		await Promise.all(batch.map(processOne));
-		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000;
+
+		if (batchDistress > 0) throttle = Math.min(throttle * 2, Math.max(1, backoffMax));
+		else if (throttle > 1) throttle = Math.max(1, throttle / 2);
+		stats.throttleLevel = throttle;
+
+		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000 * throttle;
 		const elapsed = now() - started;
 		batch.length = 0;
-		if (elapsed < window) await pause(window - elapsed);
+		// An explicit Retry-After outranks our own arithmetic: the origin named a number, and
+		// guessing under it is exactly the disrespect the header exists to prevent.
+		//
+		// Clamped to setTimeout's signed-32-bit delay, which the schema caps individual options at
+		// but cannot cap here: this window is the PRODUCT of `concurrency`, `1/ratePerSecond` and
+		// `throttle`, so three separately-sane values can multiply past the limit — and past it
+		// `setTimeout` fires after 1ms instead of waiting, turning the backoff into a hot loop
+		// against an origin already asking for room.
+		const wait = Math.min(Math.max(window - elapsed, retryAfterMs), MAX_TIMER_MS);
+		if (wait > 0) await pause(wait);
 	};
 
 	for await (const row of rows) {
 		if (isCanceled()) {
 			stats.aborted = true;
+			break;
+		}
+		// An origin that has refused every probe for this long is down, not busy. Backing off
+		// further just crawls a doomed pass into the next one's window while holding the sweep
+		// lock; the scheduled pass after this one is the retry, and it starts clean.
+		if (abortAfterDistress > 0 && distressStreak >= abortAfterDistress) {
+			stats.aborted = true;
+			stats.abortedOnDistress = true;
 			break;
 		}
 		stats.examined++;
@@ -420,6 +541,8 @@ const emitStats = (stats, kind) => {
 		metrics.changeProbe(stats.triggered, 'triggered');
 		metrics.changeProbe(stats.deferred, 'deferred');
 		metrics.changeProbe(stats.failed, 'failed');
+		metrics.changeProbe(stats.fresh, 'fresh');
+		metrics.changeProbe(stats.throttled, 'throttled');
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -454,10 +577,18 @@ const passLimits = (dryRunOverride) => ({
 	maxTriggers: config.changeProbe.maxTriggersPerSweep,
 	concurrency: config.changeProbe.concurrency,
 	ratePerSecond: config.changeProbe.ratePerSecond,
+	backoffMax: config.changeProbe.backoffMax,
+	abortAfterDistress: config.changeProbe.abortAfterDistress,
 });
 
-/** One full registry pass on THIS node. Rebuilds the canary cohorts as it walks. */
-export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
+/**
+ * One full registry pass on THIS node. Rebuilds the canary cohorts as it walks.
+ *
+ * `reseed` (set by the canary's chained pass) FORCES a probe of every matched URL: a mass change
+ * has just been absorbed, so every baseline is known-stale and skipping the fresh-looking ones
+ * would leave exactly the pages the trip was about carrying pre-change signatures.
+ */
+export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false } = {}) => {
 	if (sweepRunning) return { skipped: true, reason: 'a probe sweep is already running', lastRun: lastSweep };
 	sweepRunning = true;
 	const startedAt = Date.now();
@@ -476,6 +607,8 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 			write: writeSignature,
 			trigger: triggerRevalidate,
 			...limits,
+			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
+			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
 			// A pending reseed cancels too: the pass that must stand down for it is this one.
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
@@ -504,7 +637,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null } = {}) => {
 		// pass starts so the reseed does not cancel itself.
 		const chained = sweepInterrupt;
 		sweepInterrupt = null;
-		if (chained) runProbeSweepOnce({ dryRun: true, label: chained }).catch((e) => logger.error(e));
+		if (chained) runProbeSweepOnce({ dryRun: true, label: chained, reseed: true }).catch((e) => logger.error(e));
 	}
 };
 
@@ -526,7 +659,7 @@ export const requestSweepReseed = (label) => {
 		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
 		return { chained: true };
 	}
-	runProbeSweepOnce({ dryRun: true, label }).catch((e) => logger.error(e));
+	runProbeSweepOnce({ dryRun: true, label, reseed: true }).catch((e) => logger.error(e));
 	return { chained: false };
 };
 
@@ -664,6 +797,10 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				write: writeSignature,
 				trigger: triggerRevalidate,
 				...limits,
+				// NEVER skips on baseline age. The cohort is small and deliberately probed on a
+				// cadence far tighter than `reprobeAfter` — freshness-skipping here would silence
+				// the mass-change detector between sweeps, which is the one thing it exists for.
+				reprobeAfter: 0,
 				isCanceled: () => !config.changeProbe.enabled,
 			});
 			emitStats(stats, 'canary');

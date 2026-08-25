@@ -858,6 +858,39 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'holds the sustained rate to ratePerSecond whatever origin latency does.',
 				{ min: 1 }
 			),
+			reprobeAfter: option(
+				12 * HOUR,
+				'Skip a URL whose stored baseline is younger than this. What makes a sweep RESUMABLE: the ' +
+					'walk position is in memory, so a restart mid-pass otherwise re-probes every URL the pass ' +
+					'had already covered — hours of origin requests that can only confirm what is already ' +
+					'stored. With this set, a restarted pass skips that ground in seconds and reaches new work ' +
+					'immediately. Keep it comfortably BELOW `sweepInterval` (half is the default) or the skip ' +
+					'starts eating real passes: a URL probed at the very end of one pass would be skipped by ' +
+					'the next one, and its cadence would silently stretch. 0 disables skipping. The canary ' +
+					'never skips (its whole job is the fast cadence), and a canary-triggered RESEED never ' +
+					'skips (every baseline is known-stale after a mass change).',
+				{ unit: 'ms', min: 0 }
+			),
+			backoffMax: option(
+				64,
+				'How far the pacing window may stretch when the origin pushes back, as a multiple of the ' +
+					'normal window. `ratePerSecond` is sized with the origin’s operator for a HEALTHY origin ' +
+					'and says nothing about one having a bad afternoon; a sweep that holds its configured rate ' +
+					'through 429s and 503s adds load to something already failing. On any batch containing a ' +
+					'pushback response (429/502/503/504, connect or read timeouts) the window doubles; on a ' +
+					'clean batch it halves back toward normal — immediate response, gradual recovery. An ' +
+					'explicit `Retry-After` outranks the computed wait. At the default the probe can slow ' +
+					'itself to ~1/64th of its configured rate before giving up. 1 disables backoff.',
+				{ min: 1 }
+			),
+			abortAfterDistress: option(
+				50,
+				'Consecutive pushback/timeout responses that end the pass. An origin refusing this many in a ' +
+					'row is down rather than busy, and backing off further only crawls a doomed pass into the ' +
+					'next one’s window while holding the sweep lock. The next scheduled pass is the retry and ' +
+					'it starts clean. 0 disables the circuit breaker.',
+				{ min: 0 }
+			),
 			chunkSize: option(
 				2000,
 				'Registry rows collected per read transaction during a sweep. Each chunk’s cursor opens, ' +

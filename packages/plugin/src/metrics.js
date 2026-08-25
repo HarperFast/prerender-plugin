@@ -453,7 +453,13 @@ export const METRICS = Object.freeze({
 			'discovery_gated = cacheable misses whose target creation the discovery gate refused, split by ' +
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
 			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
-			'render rotation", the corpus growth the gate is preventing.',
+			'render rotation", the corpus growth the gate is preventing. ' +
+			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
+			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
+			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
+			'sweepInterval and real cadence is being eaten. probe_throttled = probes the origin refused ' +
+			'with pushback (429/502/503/504/timeout), which is what drives the sweep to halve its rate: ' +
+			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
@@ -497,6 +503,8 @@ export const METRICS = Object.freeze({
 					'probe_failed',
 					'probe_canary_trip',
 					'probe_invalidated',
+					'probe_fresh',
+					'probe_throttled',
 					'discovery_gated',
 				],
 				description:
