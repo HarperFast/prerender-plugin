@@ -137,11 +137,67 @@ export type ScrollConfig = {
 	topSettleMs: number;
 };
 
+/**
+ * A rule that strips named attributes off the elements a selector matches, applied last —
+ * after every other post-processing step — and only to the serialized output.
+ *
+ * The motivating case is a framework's client-side hydration payload. An island/component
+ * wrapper carries the props its runtime would rehydrate from, serialized as JSON *inside an
+ * HTML attribute* — so every `"` becomes `&quot;` and the payload lands at roughly 6× the
+ * size of the JSON. With `stripScripts` on, that runtime is gone from the snapshot and can
+ * never read it back, which makes the payload pure dead weight: measured on one retail site
+ * it was 12% of a product page and 33% of a category page. Removing the *element* is not an
+ * option — the wrapper contains the server-rendered content — so the attribute is the unit.
+ *
+ * Byte count is not the only stake. Search engines apply a size budget to a document (Bing
+ * documents a 125 KB soft limit past which a page "risks not being fully cached"), so dead
+ * bytes ahead of the content push real content past the cut. On the product page above, the
+ * `<h1>` sat at byte 161,454 — outside that budget — and moved to 80,809 once the hydration
+ * attributes were dropped.
+ *
+ * Site-specific by nature, hence config rather than a built-in list: which attributes are
+ * inert depends entirely on the framework that produced the page.
+ */
+export type RemoveAttributesRule = {
+	/** CSS selector for the elements to strip. A selector that throws is skipped, not fatal. */
+	selector: string;
+	/**
+	 * Attribute names to remove, matched case-insensitively. A trailing `*` makes an entry a
+	 * prefix match (`data-aue-*` removes `data-aue-prop`, `data-aue-label`, …), which keeps a
+	 * rule from drifting as a framework adds attributes to a family. A bare `"*"` is ignored
+	 * rather than honored — stripping every attribute off an element is never what a caller
+	 * means here, and it would silently delete `href`/`src`/`class`.
+	 */
+	attributes: string[];
+};
+
 export type PostProcessConfig = {
 	/** Remove executable `<script>` tags (data scripts like application/ld+json are kept). */
 	stripScripts: boolean;
 	/** Inline the text of empty (CSSOM-injected) stylesheets so styles survive serialization. */
 	inlineEmptyStyleSheets: boolean;
+	/**
+	 * Re-emit every inline `<style>` from the CSSOM (`rule.cssText`) instead of the origin's
+	 * source text. This is `inlineEmptyStyleSheets` generalized from empty sheets to all of them,
+	 * and it is a *minifier that cannot corrupt*: the browser has already parsed the sheet, so
+	 * unlike a regex pass there is no way to mangle a `url()` or a quoted string containing
+	 * `{`, `}`, `;` or `:`. A sheet is left untouched if it has no readable rules, or if
+	 * re-emission would not make it smaller.
+	 *
+	 * It IS lossy, in one specific and bounded way: Chrome discards what it does not implement at
+	 * parse time, so re-emitting drops vendor rules for other engines. Measured across three real
+	 * pages, everything dropped was exactly that — an `@-moz-document url-prefix(){…}` block
+	 * (a Firefox-only hack) and an `-ms-overflow-style` declaration. Everything else that looked
+	 * like a loss was shorthand/longhand normalization (`border-left` → `border-left-width`/
+	 * `-style`/`-color`, `top`/`right`/`bottom`/`left` → `inset`). Computed styles and geometry
+	 * were identical for all 16,017 elements across those pages, and `scrollHeight` was unchanged.
+	 *
+	 * So: safe for the snapshot's actual consumers, which render with Chromium — and a smaller
+	 * semantic change than `stripScripts`, which is on by default. Weigh it against the payoff
+	 * before enabling: on those pages it saved ~8% of the CSS, which is ~0.6% of the document.
+	 * Default false.
+	 */
+	minifyInlineCss: boolean;
 	/** Extra CSS selectors whose matching elements are removed before serialization. */
 	removeSelectors: string[];
 	/**
@@ -169,6 +225,14 @@ export type PostProcessConfig = {
 	 * page is served. Default false.
 	 */
 	resolveLazyImages: boolean;
+	/**
+	 * Attributes to strip from the serialized HTML, as `{ selector, attributes }` rules
+	 * (see {@link RemoveAttributesRule}). Applied last, so every earlier step still sees the
+	 * attributes it keys on — `stripBlockedResources` reads `src`/`href`, and a `removeSelectors`
+	 * entry may match on an attribute this would remove. Empty by default → a no-op, so existing
+	 * deployments serialize byte-identically.
+	 */
+	removeAttributes: RemoveAttributesRule[];
 };
 
 /**
@@ -309,10 +373,12 @@ export const defaultConfig = (): PrerenderConfig => ({
 	postProcess: {
 		stripScripts: true,
 		inlineEmptyStyleSheets: true,
+		minifyInlineCss: false,
 		removeSelectors: ['link[rel=import]', 'link[as=script]', 'script#__NEXT_DATA__'],
 		flattenShadowDom: false,
 		stripBlockedResources: false,
 		resolveLazyImages: false,
+		removeAttributes: [],
 	},
 	canonical: { strict: false },
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
@@ -339,6 +405,17 @@ const deepMerge = <T>(target: T, source: unknown): T => {
 };
 
 const validate = (config: PrerenderConfig): PrerenderConfig => {
+	// Every check below reaches straight into a config block, and a JSON-/API-supplied config can
+	// null one out wholesale — `deepMerge` REPLACES a non-plain-object rather than merging into it,
+	// so `{ postProcess: null }` survives to here intact. Assert the blocks are objects once, up
+	// front, so that surfaces as a named config error rather than as a TypeError from whichever
+	// check happened to touch the block first.
+	for (const name of ['devices', 'navigation', 'scroll', 'block', 'postProcess', 'canonical'] as const) {
+		const block: unknown = config[name];
+		if (!block || typeof block !== 'object' || Array.isArray(block)) {
+			throw new Error(`prerender config: \`${name}\` must be an object`);
+		}
+	}
 	const devices = Object.keys(config.devices);
 	if (devices.length === 0) {
 		throw new Error('prerender config: `devices` must define at least one device profile');
@@ -376,6 +453,25 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	if (typeof config.scroll.stepFraction !== 'number' || config.scroll.stepFraction <= 0) {
 		throw new Error('prerender config: scroll.stepFraction must be a positive number');
 	}
+	// removeAttributes is API-/JSON-supplied and runs as a raw selector + attribute-name loop
+	// inside the page, so reject malformed rules here rather than silently dropping them there.
+	if (!Array.isArray(config.postProcess.removeAttributes)) {
+		throw new Error('prerender config: postProcess.removeAttributes must be an array of rules');
+	}
+	config.postProcess.removeAttributes.forEach((rule, i) => {
+		if (!rule || typeof rule.selector !== 'string' || rule.selector.trim() === '') {
+			throw new Error(`prerender config: postProcess.removeAttributes[${i}].selector must be a non-empty string`);
+		}
+		if (
+			!Array.isArray(rule.attributes) ||
+			rule.attributes.length === 0 ||
+			rule.attributes.some((name) => typeof name !== 'string' || name.trim() === '')
+		) {
+			throw new Error(
+				`prerender config: postProcess.removeAttributes[${i}].attributes must be a non-empty array of attribute names`
+			);
+		}
+	});
 	// waitFor is optional; when present every rule needs a non-empty selector and non-negative
 	// numeric fields (it is API-/JSON-supplied, so validate before it reaches the in-page waits).
 	if (config.waitFor !== undefined) {

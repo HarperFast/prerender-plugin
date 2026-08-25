@@ -723,14 +723,32 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 			try {
 				const sr = host.shadowRoot as ShadowRoot;
 				const hostId = `s${hostSeq++}`;
-				host.setAttribute('data-shadow-host', hostId);
-				const hostSel = `[data-shadow-host="${hostId}"]`;
+				// Deliberately terse, and unquoted in the selector. This token is private — we mint
+				// it here and consume it in the rules below, within the same document, so nothing
+				// outside reads it and the name carries no contract. It is also repeated once per
+				// SELECTOR (`rewriteSelector` splits comma-separated lists and prefixes each part),
+				// so its length is multiplied by the rule count of every flattened shadow root: on
+				// one measured review-heavy page it appeared 11,589 times, and `data-shadow-host`
+				// with quotes cost 127 KB more than this spelling for identical output. `sN` is
+				// always a valid CSS identifier, so the unquoted form is safe by construction.
+				host.setAttribute('data-sh', hostId);
+				const hostSel = `[data-sh=${hostId}]`;
 
 				let css = '';
 				const sheets = [...sr.styleSheets, ...((sr.adoptedStyleSheets as CSSStyleSheet[]) ?? [])];
+				// Nodes whose rules made it into `css` above. Their originals must NOT be moved into
+				// the light DOM with the rest of the shadow tree: `css` is the SCOPED copy, and the
+				// original is the unscoped one the shadow boundary used to contain. Moving it out
+				// would (a) re-emit every rule a second time and (b) defeat the scoping entirely —
+				// a bare `button {…}` rule, perfectly safe inside a shadow root, would repaint every
+				// button on the page. Only nodes we actually captured are dropped; a sheet that
+				// failed to serialize (cross-origin `<link>`) keeps its element, since losing the
+				// styling outright would be the worse of the two failures.
+				const captured = new Set<Node>();
 				for (const sheet of sheets) {
 					try {
 						css += serializeRules(sheet.cssRules, hostSel);
+						if (sheet.ownerNode) captured.add(sheet.ownerNode);
 					} catch {
 						/* cross-origin stylesheet — cssRules not readable */
 					}
@@ -743,7 +761,12 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 					const assigned = slot.assignedNodes();
 					const replacement = document.createDocumentFragment();
 					if (assigned.length > 0) {
-						for (const node of assigned) replacement.appendChild(node);
+						// Slotted nodes were ALWAYS light DOM and were always styled by the page, so
+						// they must be exempt from the author-style reset below. Mark their roots.
+						for (const node of assigned) {
+							if (node.nodeType === 1) (node as Element).setAttribute('data-sl', '');
+							replacement.appendChild(node);
+						}
 					} else {
 						while (slot.firstChild) replacement.appendChild(slot.firstChild);
 					}
@@ -753,12 +776,31 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				// then move the resolved shadow tree into the host as direct children — so
 				// `:host > x` / descendant relationships survive (a wrapper would break `>`).
 				while (host.firstChild) host.removeChild(host.firstChild);
-				if (css) {
-					const style = document.createElement('style');
-					style.textContent = css;
-					host.appendChild(style);
+				// Restore the INBOUND half of the encapsulation the boundary provided. Outbound is
+				// handled by prefixing every shadow rule with `hostSel`; inbound is this. Without
+				// it the page's own rules — which could never reach this markup while it sat behind
+				// a shadow root — apply the moment it lands in the light DOM. A Tailwind Preflight
+				// `svg{display:block}` is the canonical case: it turns a five-star rating widget
+				// into a vertical column, because inside the shadow root it never applied.
+				//
+				// `all: revert` drops author-level declarations, which is exactly what the boundary
+				// did, while inherited properties still inherit (as they do through a real boundary).
+				//
+				// The specificity is load-bearing and deliberately (0,1,0):
+				//   - it BEATS the page's element-selector resets (0,0,1), which is the whole point;
+				//   - it LOSES to every rewritten shadow rule — `[data-sh] button` (0,1,1) and
+				//     `[data-sh] .cls` (0,2,0) — so the component's own styling still wins;
+				//   - the `:not()` is wrapped in `:where()` so the exemption contributes NOTHING to
+				//     specificity. Written bare, `:not([data-sl] *)` would raise this to (0,2,0) and
+				//     start beating the shadow rules it must lose to.
+				const reset = `${hostSel} *:where(:not([data-sl],[data-sl] *)){all:revert}\n`;
+				const style = document.createElement('style');
+				style.textContent = reset + css;
+				host.appendChild(style);
+				for (const node of [...sr.childNodes]) {
+					if (captured.has(node)) continue; // its rules are already in the scoped block
+					host.appendChild(node);
 				}
-				while (sr.firstChild) host.appendChild(sr.firstChild);
 			} catch {
 				/* closed shadow root or serialization error — skip */
 			}
@@ -826,6 +868,36 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		}
 	}
 
+	if (opts.minifyInlineCss) {
+		// Re-emit each inline sheet from the CSSOM rather than keeping the origin's source text.
+		// Same operation as `inlineEmptyStyleSheets` above, widened from empty sheets to every one
+		// — and it runs after it deliberately, so a sheet that step just filled is re-emitted from
+		// the same CSSOM it was built from (a no-op) rather than being minified twice.
+		//
+		// The browser has already parsed these rules, so this cannot corrupt CSS the way a regex
+		// minifier can. What it CAN do is drop rules Chrome did not implement (an
+		// `@-moz-document` block, an `-ms-*` declaration) — see the config docs for the measured
+		// scope of that.
+		const serialize = (rules: CSSRuleList): string => {
+			let css = '';
+			for (const rule of rules) css += rule.cssText;
+			return css;
+		};
+		for (const style of document.querySelectorAll('style')) {
+			const sheet = style.sheet;
+			if (!sheet) continue;
+			let css: string;
+			try {
+				css = serialize(sheet.cssRules);
+			} catch {
+				continue; // unreadable (cross-origin) — leave the source text alone
+			}
+			// An empty result on a non-empty sheet means every rule was dropped or the sheet never
+			// parsed; keeping the original is the conservative call. Never grow the document.
+			if (css && css.length < style.textContent!.length) style.textContent = css;
+		}
+	}
+
 	const removeSelectors = [...opts.removeSelectors];
 	if (opts.stripScripts) {
 		// Strip only script tags that contain JavaScript (no type attribute, or a type
@@ -834,6 +906,47 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 	}
 	if (removeSelectors.length > 0) {
 		document.querySelectorAll(removeSelectors.join(', ')).forEach((el) => el.remove());
+	}
+
+	// LAST, deliberately: every step above keys on attributes this can remove
+	// (`stripBlockedResources` reads src/href/srcset, a `removeSelectors` entry can match on
+	// an attribute selector), so stripping earlier would change what they match. Nothing below
+	// reads the DOM again — the next statement serializes it.
+	for (const rule of opts.removeAttributes ?? []) {
+		let elements: NodeListOf<Element>;
+		try {
+			elements = document.querySelectorAll(rule.selector);
+		} catch {
+			continue; // malformed selector — skip the rule, never fail the render over it
+		}
+		// Same contract as the malformed selector above: a rule that cannot be applied is skipped,
+		// never fatal. `validate()` already guarantees the shape, but this runs inside the page —
+		// a throw here fails the whole render job, out of all proportion to one bad rule.
+		if (!Array.isArray(rule.attributes)) continue;
+		// Split exact names from `prefix*` matches once per rule, not once per element.
+		// A bare '*' yields an empty prefix and is dropped: it would strip every attribute.
+		const exact = new Set<string>();
+		const prefixes: string[] = [];
+		for (const name of rule.attributes) {
+			const lower = name.trim().toLowerCase();
+			if (lower.endsWith('*')) {
+				const prefix = lower.slice(0, -1);
+				if (prefix) prefixes.push(prefix);
+			} else if (lower) {
+				exact.add(lower);
+			}
+		}
+		if (exact.size === 0 && prefixes.length === 0) continue;
+		for (const el of elements) {
+			// `el.attributes` is a LIVE NamedNodeMap — snapshot it, or removing an attribute
+			// re-indexes the map underneath the loop and skips the next one.
+			for (const attr of [...el.attributes]) {
+				const name = attr.name.toLowerCase();
+				if (exact.has(name) || prefixes.some((prefix) => name.startsWith(prefix))) {
+					el.removeAttribute(attr.name);
+				}
+			}
+		}
 	}
 
 	let content = '';
