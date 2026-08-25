@@ -225,14 +225,12 @@ const canonicalPrice = (value) => {
  * available SKU presents as available. Returns null when the page carries no Product offers —
  * the caller must then leave the stored claim alone, exactly as a failed probe does.
  */
-export const pageClaimOf = (html) => pageClaimFromOffers(extractJsonLdOffers(html));
-
 /**
  * The same reduction, from offers a caller already has. The RENDERER extracts these from its live
  * DOM and posts them with the result (browser >= 1.20.0), which is strictly better than doing it
  * here: the plugin would otherwise regex-scan and JSON-parse a ~1MB document on the hottest write
- * path in the system to recover data the browser had structured in front of it. `pageClaimOf`
- * remains for results from renderers that do not send them.
+ * path in the system to recover data the browser had structured in front of it — so there is
+ * deliberately no HTML-parsing fallback, and pageCheck is simply inert against an older renderer.
  *
  * Shape is `extractJsonLdOffers`'s: a flat [price, currency, availability] triple sequence.
  */

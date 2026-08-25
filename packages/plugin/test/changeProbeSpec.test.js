@@ -24,7 +24,7 @@ import {
 	buildProbeRequest,
 	isSameProbeOrigin,
 	statusSignalFor,
-	pageClaimOf,
+	pageClaimFromOffers,
 	apiClaimOf,
 	claimsDisagree,
 } from '../src/util/changeProbeSpec.js';
@@ -322,31 +322,27 @@ test('pageCheck compiles only with in-bounds indices, and only for source "reque
 	assert.equal(doc[0].pageCheck, null);
 });
 
-test('pageClaimOf reduces a page to (prices, anyInStock); no Product offers -> null', async () => {
-	const html = (offers) =>
-		`<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', offers })}</script>`;
+test('pageClaimFromOffers reduces offers to (prices, anyInStock); nothing usable -> null', async () => {
+	// Shape is the renderer's: flat [price, currency, availability] triples (browser >= 1.20.0).
 	// number and string prices canonicalize the same way
 	assert.equal(
-		pageClaimOf(html([{ price: 35.99, availability: 'https://schema.org/InStock' }])),
-		pageClaimOf(html([{ price: '35.99', availability: 'InStock' }]))
+		JSON.stringify(JSON.parse(pageClaimFromOffers([35.99, 'USD', 'InStock']))),
+		JSON.stringify(JSON.parse(pageClaimFromOffers(['35.99', 'USD', 'InStock'])))
 	);
 	// every SKU out of stock => the page presents as unavailable
-	const allOut = pageClaimOf(
-		html([
-			{ price: '15.99', availability: 'OutOfStock' },
-			{ price: '15.99', availability: 'OutOfStock' },
-		])
-	);
-	assert.deepEqual(JSON.parse(allOut), [['15.99'], false]);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['15.99', 'USD', 'OutOfStock', '15.99', 'USD', 'OutOfStock'])), [
+		['15.99'],
+		false,
+	]);
 	// one available SKU is enough
-	const oneIn = pageClaimOf(
-		html([
-			{ price: '15.99', availability: 'OutOfStock' },
-			{ price: '16.99', availability: 'InStock' },
-		])
-	);
-	assert.deepEqual(JSON.parse(oneIn), [['15.99', '16.99'], true]);
-	assert.equal(pageClaimOf('<html>no structured data</html>'), null);
+	assert.deepEqual(JSON.parse(pageClaimFromOffers(['15.99', 'USD', 'OutOfStock', '16.99', 'USD', 'InStock'])), [
+		['15.99', '16.99'],
+		true,
+	]);
+	// an absent price must NOT become 0.00 (Number(null) === 0)
+	assert.deepEqual(JSON.parse(pageClaimFromOffers([null, null, 'InStock'])), [[], true]);
+	assert.equal(pageClaimFromOffers(null), null);
+	assert.equal(pageClaimFromOffers([]), null);
 });
 
 test('claimsDisagree: availability differs, or the origin price is ABSENT from the page', async () => {

@@ -856,7 +856,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'The two indices are positions in this rule\u2019s own `extract` array — site-specific by ' +
 					'nature, since only the operator knows which field is the price their page prints — and the ' +
 					'block is dropped whole if either is out of bounds, because a half-applied mapping compares the ' +
-					'wrong column. `source: request` only: in document mode the stored signature already IS the ' +
+					'wrong column. REQUIRES @harperfast/prerender-browser >= 1.20.0, which posts the page\u2019s offers ' +
+					'with the render result: there is deliberately NO fallback to parsing the stored HTML (a regex scan ' +
+					'and JSON parse of a ~1MB document on the hottest write path, to recover what the browser already ' +
+					'had structured), so against an older renderer pageCheck records nothing and detects nothing \u2014 ' +
+					'logged hourly rather than failing silently. `source: request` only: in document mode the stored signature already IS the ' +
 					'page\u2019s offers. A page yielding no Product offers records nothing, exactly as a failed ' +
 					'probe changes nothing, so a markup change cannot make every page look like a disagreement. ' +
 					'Detection is one extra node-local write per render and no extra origin traffic.' +

@@ -68,7 +68,6 @@ import {
 	statusSignalFor,
 	apiClaimOf,
 	claimsDisagree,
-	pageClaimOf,
 	pageClaimFromOffers,
 } from './changeProbeSpec.js';
 
@@ -340,20 +339,40 @@ const clearPageSignature = (url) => probeStateTable().patch(url, { pageSignature
  * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
  * trigger by making every page look like a disagreement.
  */
-export const recordPageClaim = async (url, { offers = null, html = null } = {}) => {
+export const recordPageClaim = async (url, structuredOffers) => {
 	try {
 		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(new URL(url).pathname));
 		if (!rule) return;
-		// Prefer what the RENDERER extracted from its live DOM (browser >= 1.20.0). Falling back to
-		// parsing the stored HTML costs a regex scan and a JSON parse of a ~1MB document on the
-		// hottest write path here, to recover data the browser already had structured — so the
-		// fallback exists for older renderers, not as the intended path.
-		const claim = offers ? pageClaimFromOffers(offers) : html ? pageClaimOf(html) : null;
+		if (!structuredOffers) {
+			// The renderer did not send the page's offers. There is deliberately NO fallback to
+			// parsing the stored HTML: recovering them here means a regex scan and a JSON parse of a
+			// ~1MB document on the hottest write path in this process, to reconstruct what the
+			// browser had structured in front of it. So pageCheck is INERT against a renderer older
+			// than 1.20.0 — say so rather than failing silently, since a config that looks enabled
+			// and protects nothing is the worst outcome.
+			warnPageClaimUnsupported();
+			return;
+		}
+		const claim = pageClaimFromOffers(structuredOffers);
 		if (!claim) return;
 		await probeStateTable().patch(url, { url, pageSignature: claim });
 	} catch (e) {
 		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
 	}
+};
+
+// One line per hour per worker: this fires per RENDER, and a fleet mid-upgrade would otherwise
+// log it thousands of times a minute.
+let lastUnsupportedWarnAt = 0;
+const warnPageClaimUnsupported = () => {
+	const now = Date.now();
+	if (now - lastUnsupportedWarnAt < 3600000) return;
+	lastUnsupportedWarnAt = now;
+	logger.warn?.(
+		`[prerender] changeProbe.pageCheck is enabled but the render result carried no structuredOffers — ` +
+			`the renderer is older than @harperfast/prerender-browser 1.20.0, so page claims are not being ` +
+			`recorded and pageCheck cannot detect anything. Upgrade the render fleet or disable pageCheck.`
+	);
 };
 
 /**
