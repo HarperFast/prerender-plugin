@@ -57,7 +57,17 @@ beforeEach(() => {
 	purge.resetDiscoveredPurgeState();
 });
 
-const newStats = () => ({ examined: 0, owned: 0, discovered: 0, leaseSkipped: 0, deleted: 0, canceled: false });
+const newStats = () => ({
+	examined: 0,
+	owned: 0,
+	discovered: 0,
+	leaseSkipped: 0,
+	deleted: 0,
+	errors: 0,
+	errorSamples: [],
+	abortedOnErrors: false,
+	canceled: false,
+});
 const row = (url, sitemapUrl = null) => ({ url, sitemapUrl });
 
 test('runner: the predicate is sitemapUrl-null, owner-scoped, with in-flight deferral', async () => {
@@ -227,4 +237,108 @@ test('startDiscoveredPurge: a detached run completes, reports, and refuses to ov
 	assert.equal(done.examined, 0, 'the FakeTable slice is empty');
 	assert.equal(done.dryRun, true, 'a bare start is a census');
 	assert.equal(typeof done.finishedAt, 'number');
+});
+
+test('runner: deletes are issued ONE AT A TIME, never concurrently', async () => {
+	// The 503 regression this release fixes: a concurrently-issued batch put hundreds of
+	// cascading writes in flight, the commit queue on that thread blew past its limit, and
+	// Harper then rejected the render fleet's job_result posts (deletes themselves are exempt
+	// from the check, so the purge never felt the backpressure it was creating).
+	let inFlight = 0;
+	let maxInFlight = 0;
+	const stats = newStats();
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			for (let i = 0; i < 12; i++) yield row(`https://x.example/catalog/${i}`);
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		deleteTarget: async () => {
+			inFlight++;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise((resolve) => setImmediate(resolve));
+			inFlight--;
+		},
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		batchSize: 6,
+		pause: async () => {},
+		stats,
+	});
+	assert.equal(maxInFlight, 1, 'a second delete must never start before the previous one settles');
+	assert.equal(stats.deleted, 12);
+});
+
+test('runner: a failing delete costs one row, not the pass', async () => {
+	const stats = newStats();
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			for (const name of ['a', 'boom', 'c']) yield row(`https://x.example/catalog/${name}`);
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		deleteTarget: async (url) => {
+			if (url.endsWith('/boom')) throw new Error('Operation aborted: Database closed during transaction');
+		},
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		pause: async () => {},
+		stats,
+	});
+	assert.equal(stats.deleted, 2, 'the rows either side of the fault still deleted');
+	assert.equal(stats.errors, 1);
+	assert.equal(stats.abortedOnErrors, false);
+	assert.match(stats.errorSamples[0].error, /Database closed/);
+	assert.equal(stats.errorSamples[0].url, 'https://x.example/catalog/boom');
+});
+
+test('runner: a fault on every row stops the pass instead of grinding through millions', async () => {
+	const stats = newStats();
+	await assert.rejects(
+		purge.purgeDiscoveredTargets({
+			rows: (async function* () {
+				for (let i = 0; i < 500; i++) yield row(`https://x.example/catalog/${i}`);
+			})(),
+			ownerOf: () => 'node-a',
+			hostname: 'node-a',
+			isLeased: () => false,
+			deleteTarget: async () => {
+				throw new Error('storage is gone');
+			},
+			dryRun: false,
+			ratePerSecond: 1_000_000,
+			pause: async () => {},
+			stats,
+		}),
+		/consecutive delete failures/
+	);
+	assert.equal(stats.abortedOnErrors, true);
+	assert.equal(stats.deleted, 0);
+	assert.ok(stats.errors < 500, 'it stopped early rather than walking the whole stream');
+});
+
+test('runner: an intermittent fault does not trip the consecutive-failure stop', async () => {
+	const stats = newStats();
+	let n = 0;
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			for (let i = 0; i < 200; i++) yield row(`https://x.example/catalog/${i}`);
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		// Every third delete fails — far more than production ever saw, and still not a reason
+		// to abandon the pass: the counter resets on each success.
+		deleteTarget: async () => {
+			if (n++ % 3 === 0) throw new Error('transient');
+		},
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		pause: async () => {},
+		stats,
+	});
+	assert.equal(stats.abortedOnErrors, false);
+	assert.equal(stats.deleted + stats.errors, 200);
 });

@@ -41,7 +41,10 @@ import { leaseInfo } from './renderSchedule.js';
 
 const YIELD_EVERY = 200;
 const CHUNK_SIZE = 10_000;
-const DELETE_BATCH = 50;
+const DELETE_BATCH = 20;
+// Consecutive delete failures that end the pass. One fault is a row for the next pass; a fault
+// on every row in a row is the storage engine saying stop, not something to grind through.
+const MAX_CONSECUTIVE_ERRORS = 25;
 
 /** The registry slice under `urlPrefix`, streamed in cursor-bounded chunks (see module comment). */
 export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE) {
@@ -98,12 +101,51 @@ export const purgeDiscoveredTargets = async ({
 	stats,
 }) => {
 	const batch = [];
+	let consecutiveErrors = 0;
 
 	const flush = async () => {
 		if (!batch.length) return;
 		const started = now();
-		if (!dryRun) await Promise.all(batch.map((url) => deleteTarget(url)));
-		stats.deleted += batch.length;
+		if (dryRun) {
+			stats.deleted += batch.length;
+		} else {
+			// ONE AT A TIME, never `Promise.all` over the batch.
+			//
+			// Each delete cascades to the target's schedule rows, its cached pages and its probe
+			// baseline, so a batch issued concurrently put hundreds of writes in flight at once.
+			// Harper commits those on the request's own thread, and once a commit has been
+			// outstanding past its limit that thread REJECTS every application write on it with
+			// 503 until the commit settles. Deletes and replicated writes are exempt from that
+			// check — so the purge never feels its own backpressure, and what ate the rejections
+			// instead was the render fleet posting results back: ~2,000 completed renders
+			// discarded in 30 minutes, measured, plus a thread left latched in the rejecting
+			// state until the process restarted.
+			//
+			// Serialized, the purge self-limits to what the storage engine can absorb: when
+			// deletes get slower the batch takes longer, the pacing window is already spent, and
+			// the sweep simply proceeds at the achievable rate. `ratePerSecond` stays a CEILING
+			// rather than a target it will chase past the engine's capacity.
+			for (const url of batch) {
+				try {
+					await deleteTarget(url);
+					stats.deleted++;
+					consecutiveErrors = 0;
+				} catch (e) {
+					stats.errors++;
+					consecutiveErrors++;
+					if (stats.errorSamples.length < 3) {
+						stats.errorSamples.push({ url, error: e?.message ?? String(e) });
+					}
+					if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+						stats.abortedOnErrors = true;
+						throw new Error(
+							`discovery purge stopped after ${consecutiveErrors} consecutive delete failures ` +
+								`(last: ${e?.message ?? String(e)})`
+						);
+					}
+				}
+			}
+		}
 		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000;
 		const elapsed = now() - started;
 		batch.length = 0;
@@ -152,6 +194,9 @@ const newStats = () => ({
 	discovered: 0,
 	leaseSkipped: 0,
 	deleted: 0,
+	errors: 0,
+	errorSamples: [],
+	abortedOnErrors: false,
 	canceled: false,
 });
 
@@ -249,7 +294,12 @@ export const startDiscoveredPurge = ({ urlPrefix, dryRun = true, ratePerSecond =
 			logger.warn(
 				`[prerender] discovery purge ${stats.canceled ? 'stopped' : 'finished'}: ${verb} ${stats.deleted} ` +
 					`discovered target(s) under ${stats.urlPrefix} (${stats.owned} owned of ${stats.examined} examined, ` +
-					`${stats.leaseSkipped} deferred as in-flight)${stats.error ? ` — error: ${stats.error}` : ''}`
+					`${stats.leaseSkipped} deferred as in-flight` +
+					// Skipped rows are retried by the next pass, so a pass that ended with them is
+					// INCOMPLETE for its prefix even when it reports no error — say so here rather
+					// than leaving an operator to infer it from a count that does not add up.
+					`${stats.errors ? `, ${stats.errors} failed and left for the next pass` : ''})` +
+					`${stats.error ? ` — error: ${stats.error}` : ''}`
 			);
 		});
 
