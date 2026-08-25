@@ -112,14 +112,17 @@ export default class RenderJob {
 	isFromSitemap: boolean;
 	/**
 	 * The page's own schema.org Product offers, flattened to [price, currency, availability]
-	 * triples, read off the live DOM at the end of the settle.
+	 * triples, read off the live DOM at the end of the settle. `null` means the extraction ran and
+	 * the page declared no Product offers (or it failed benignly) — posted as null, NOT omitted,
+	 * because the consumer reads an ABSENT field as "this renderer predates the feature" and
+	 * alarms on it.
 	 *
 	 * WHY THE RENDERER AND NOT THE CONSUMER. The consumer can recover the same values by
 	 * regex-scanning and JSON-parsing the serialized document, but that is ~1MB of work on its
 	 * hottest write path to reconstruct data this process had structured in front of it. Here it is
 	 * one `page.evaluate` against a DOM that is already parsed and already settled.
 	 */
-	structuredOffers: Array<string | null> | undefined;
+	structuredOffers: Array<string | null> | null | undefined;
 	/**
 	 * Why this render produced no cacheable content — one slug across every no-content class,
 	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),

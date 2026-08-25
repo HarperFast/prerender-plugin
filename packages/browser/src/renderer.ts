@@ -504,8 +504,11 @@ const renderer: Renderer = async (page, job) => {
 			if (job.isIndexable || job.isFromSitemap) {
 				// Before postProcess: it may strip nodes, and this must describe the page as
 				// rendered. Best-effort — a failure here must never cost the render its content.
-				job.structuredOffers =
-					(await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null)) ?? undefined;
+				// null is posted AS null: on the wire, null means "extraction ran, no Product
+				// offers (or it failed benignly)" while an ABSENT field means "renderer predates
+				// this feature" — the consumer alarms on the latter, so collapsing null into
+				// undefined would make every offerless page impersonate an outdated renderer.
+				job.structuredOffers = await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null);
 				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
 				timings.postProcess = Date.now() - ppStart;
@@ -705,7 +708,9 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 	});
 	if (!triples.length) return null;
 	// Field-wise, not JSON.stringify per comparison: sorting is O(n log n) COMPARISONS, so
-	// stringifying inside the comparator serialises every triple many times over.
+	// stringifying inside the comparator serialises every triple many times over. Code-unit
+	// comparison, not localeCompare: the whole point of the sort is a sequence that is identical
+	// across renders, and collation varies with the browser's locale/ICU.
 	triples.sort((a, b) => {
 		for (let i = 0; i < 3; i++) {
 			const x = a[i];
@@ -713,7 +718,7 @@ function extractStructuredOffers(cap: number): Array<string | null> | null {
 			if (x === y) continue;
 			if (x === null) return -1;
 			if (y === null) return 1;
-			return x.localeCompare(y);
+			return x < y ? -1 : 1;
 		}
 		return 0;
 	});

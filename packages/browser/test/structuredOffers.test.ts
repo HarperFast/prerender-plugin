@@ -92,12 +92,13 @@ test('one malformed JSON-LD block does not cost the page its other blocks', asyn
 	assert.deepEqual(job.structuredOffers, ['5', null, 'InStock']);
 });
 
-test('a page declaring no Product offers reports undefined, not an empty array', async () => {
-	// "no structured data" must stay distinguishable from "offers, but none of them" — the plugin
-	// treats absence as "nothing to compare" rather than as a claim.
+test('a page declaring no Product offers reports null — present on the wire, distinct from absent', async () => {
+	// The consumer reads an ABSENT field as "renderer predates the feature" and alarms on it, so
+	// an offerless page must post null (extraction ran, nothing to claim), never omit the field.
 	body = NONE;
 	const { job } = await renderOnce({ url: `${base}/`, config: NO_SCROLL });
-	assert.equal(job.structuredOffers, undefined);
+	assert.equal(job.structuredOffers, null);
+	assert.notEqual(job.structuredOffers, undefined);
 });
 
 test('a trailing slash on the availability URL still yields the verdict, not an empty string', async () => {
