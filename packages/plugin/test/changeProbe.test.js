@@ -618,7 +618,6 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const written = [];
 	const triggered = [];
-	const cleared = [];
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
 		rules: compileProbeRules(PAGECHECK_RULES),
@@ -626,8 +625,7 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		hostname: 'node-a',
 		probe: async (rule, url) => answers[url] ?? null,
 		read: async (url) => stored[url] ?? null,
-		write: async (url, signature) => written.push({ url, signature }),
-		clearPageClaim: async (url) => cleared.push(url),
+		write: async (url, signature, pageSignature) => written.push({ url, signature, pageSignature }),
 		trigger: async (target) => triggered.push(target.url),
 		dryRun: false,
 		maxTriggers: 100,
@@ -636,7 +634,7 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		pause: async () => {},
 		...overrides,
 	});
-	return { stats, written, triggered, cleared };
+	return { stats, written, triggered };
 };
 
 test('ROUND-TRIP BLINDNESS: origin matches its own baseline but the PAGE disagrees -> trigger', async () => {
@@ -645,7 +643,7 @@ test('ROUND-TRIP BLINDNESS: origin matches its own baseline but the PAGE disagre
 	// Without pageCheck this is the `unchanged` early-return and the page stays wrong for a
 	// whole render interval.
 	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
-	const { stats, triggered, cleared } = await runPageCheckPass({
+	const { stats, triggered, written } = await runPageCheckPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: signature },
 		stored: {
@@ -656,13 +654,14 @@ test('ROUND-TRIP BLINDNESS: origin matches its own baseline but the PAGE disagre
 	assert.equal(stats.unchanged, 0, 'must NOT take the unchanged early-return');
 	assert.equal(stats.changed, 0, 'the origin signature did not change — only the page disagreed');
 	assert.deepEqual(triggered, [URL_A]);
-	// The claim is cleared so the next pass does not re-trigger the same disagreement forever.
-	assert.deepEqual(cleared, [URL_A]);
+	// The claim is cleared IN THE SAME WRITE so the next pass does not re-trigger forever.
+	assert.equal(written.length, 1);
+	assert.equal(written[0].pageSignature, null, 'acting on a disagreement must clear the claim');
 });
 
 test('page AGREES with the origin -> unchanged, nothing triggered', async () => {
 	const signature = JSON.stringify([39.99, 35.99, 35.99, true]);
-	const { stats, triggered, cleared } = await runPageCheckPass({
+	const { stats, triggered } = await runPageCheckPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: signature },
 		stored: { [URL_A]: { signature, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], true]) } },
@@ -670,7 +669,6 @@ test('page AGREES with the origin -> unchanged, nothing triggered', async () => 
 	assert.equal(stats.pageMismatch, 0);
 	assert.equal(stats.unchanged, 1);
 	assert.deepEqual(triggered, []);
-	assert.deepEqual(cleared, []);
 });
 
 test('no stored page claim -> the check is inert (a page nothing has rendered cannot disagree)', async () => {
@@ -711,4 +709,19 @@ test('a page disagreement still triggers on a URL the probe has never baselined'
 	assert.equal(stats.pageMismatch, 1);
 	assert.equal(stats.seeded, 0);
 	assert.deepEqual(triggered, [URL_A]);
+});
+
+test('a signature write PRESERVES the page claim — put replaces the row, so it must carry it', async () => {
+	// writeSignature is a put (patch cannot create, and the seed write is by definition to a
+	// missing row). put replaces, so an unrelated signature write must not erase the claim the
+	// render path owns — otherwise the very next pass has nothing to compare and the feature
+	// silently stops detecting.
+	const claim = JSON.stringify([['35.99'], true]);
+	const { written } = await runPageCheckPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: JSON.stringify([39.99, 35.99, 35.99, true]) },
+		stored: { [URL_A]: { signature: JSON.stringify([1, 2, 3, true]), probedAt: NaN, pageSignature: claim } },
+	});
+	assert.equal(written.length, 1);
+	assert.equal(written[0].pageSignature, claim, 'a drift write must carry the page claim through');
 });
