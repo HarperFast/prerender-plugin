@@ -596,11 +596,14 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 	};
 	const before = Date.now();
 	await changeProbe.triggerRevalidate(row('https://example.com/product/prd-a/'));
+	// Bound against a clock read taken AFTER the call: the trigger reads Date.now() itself, so
+	// comparing against `before` alone flakes on any millisecond tick between the two reads.
+	const after = Date.now();
 	assert.ok(patched.length >= 1, 'at least one device cacheKey was expired');
 	for (const p of patched) {
 		assert.ok(
-			p.expiresAt <= before - config.page.swrTtl,
-			`expiresAt ${p.expiresAt} is not backdated past swrTtl (${config.page.swrTtl}) from ${before}`
+			p.expiresAt <= after - config.page.swrTtl && p.expiresAt >= before - config.page.swrTtl,
+			`expiresAt ${p.expiresAt} is not backdated past swrTtl (${config.page.swrTtl}) around [${before}, ${after}]`
 		);
 	}
 });
@@ -625,7 +628,8 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		hostname: 'node-a',
 		probe: async (rule, url) => answers[url] ?? null,
 		read: async (url) => stored[url] ?? null,
-		write: async (url, signature, pageSignature) => written.push({ url, signature, pageSignature }),
+		write: async (url, signature, opts = {}) =>
+			written.push({ url, signature, rowExists: opts.rowExists === true, clearClaim: opts.clearClaim === true }),
 		trigger: async (target) => triggered.push(target.url),
 		dryRun: false,
 		maxTriggers: 100,
@@ -651,12 +655,16 @@ test('ROUND-TRIP BLINDNESS: origin matches its own baseline but the PAGE disagre
 		},
 	});
 	assert.equal(stats.pageMismatch, 1);
-	assert.equal(stats.unchanged, 0, 'must NOT take the unchanged early-return');
+	// Buckets count by SIGNATURE outcome alone (probed = seeded + unchanged + changed + failed,
+	// and the canary's denominator is changed + unchanged) — the mismatch OVERLAYS `unchanged`,
+	// it does not replace it. The row still escapes the early-return and triggers.
+	assert.equal(stats.unchanged, 1, 'the signature was unchanged — the bucket must still say so');
 	assert.equal(stats.changed, 0, 'the origin signature did not change — only the page disagreed');
 	assert.deepEqual(triggered, [URL_A]);
 	// The claim is cleared IN THE SAME WRITE so the next pass does not re-trigger forever.
 	assert.equal(written.length, 1);
-	assert.equal(written[0].pageSignature, null, 'acting on a disagreement must clear the claim');
+	assert.equal(written[0].clearClaim, true, 'acting on a disagreement must clear the claim');
+	assert.equal(written[0].rowExists, true, 'the row exists, so the write must be a patch, not a put');
 });
 
 test('page AGREES with the origin -> unchanged, nothing triggered', async () => {
@@ -707,14 +715,15 @@ test('a page disagreement still triggers on a URL the probe has never baselined'
 		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], false]) } },
 	});
 	assert.equal(stats.pageMismatch, 1);
-	assert.equal(stats.seeded, 0);
+	assert.equal(stats.seeded, 1, 'the first observation still counts as a seed — the mismatch overlays it');
 	assert.deepEqual(triggered, [URL_A]);
 });
 
-test('the SEED write carries the page claim through — put replaces the row it seeds', async () => {
+test('seeding a claim-only row PATCHES around the claim — never a put over it', async () => {
 	// A row created by recordPageClaim has a claim but no signature. The probe's first pass over
-	// it takes the seed path, and writeSignature is a put (patch cannot create) — so the seed must
-	// carry the render path's claim or seeding would erase it and the feature would silently stop
+	// it takes the seed path, and the row EXISTS — so the write must be a patch naming only the
+	// probe's own columns. A whole-row put would erase the render path's claim (or, worse, copy a
+	// stale one over a claim a concurrent render just wrote), and the feature would silently stop
 	// detecting on exactly the freshly-rendered pages it exists for.
 	const claim = JSON.stringify([['35.99'], true]);
 	const { stats, written, triggered } = await runPageCheckPass({
@@ -725,7 +734,8 @@ test('the SEED write carries the page claim through — put replaces the row it 
 	assert.equal(stats.seeded, 1);
 	assert.deepEqual(triggered, []);
 	assert.equal(written.length, 1);
-	assert.equal(written[0].pageSignature, claim, 'the seed write must carry the page claim through');
+	assert.equal(written[0].rowExists, true, 'a claim-only row EXISTS — the seed must patch, never put over the claim');
+	assert.equal(written[0].clearClaim, false, 'seeding must not clear the claim');
 });
 
 test('ANY acted trip clears the claim — a drift trip too, not just a page disagreement', async () => {
@@ -743,7 +753,7 @@ test('ANY acted trip clears the claim — a drift trip too, not just a page disa
 	assert.equal(stats.pageMismatch, 0, 'the page agrees with the origin — this is drift only');
 	assert.deepEqual(triggered, [URL_A]);
 	assert.equal(written.length, 1);
-	assert.equal(written[0].pageSignature, null, 'an acted trip must clear the claim');
+	assert.equal(written[0].clearClaim, true, 'an acted trip must clear the claim');
 });
 
 test('a DRY-RUN drift write preserves the claim — nothing was expired, the gauge must keep reading', async () => {
@@ -756,7 +766,7 @@ test('a DRY-RUN drift write preserves the claim — nothing was expired, the gau
 	});
 	assert.deepEqual(triggered, []);
 	assert.equal(written.length, 1);
-	assert.equal(written[0].pageSignature, claim, 'dry-run must not clear the claim');
+	assert.equal(written[0].clearClaim, false, 'dry-run must not clear the claim');
 });
 
 /**
@@ -771,6 +781,7 @@ const claimHarness = async ({ existing = null } = {}) => {
 	const { applyOptions } = await import('../src/config.js');
 	applyOptions({
 		changeProbe: {
+			enabled: true,
 			rules: [
 				{
 					label: 'pdp',
@@ -848,4 +859,41 @@ test('recordPageClaim ignores URLs no pageCheck rule matches, and never throws i
 	await changeProbe.recordPageClaim('https://example.com/category/shoes', ['1.00', 'USD', 'InStock']);
 	await changeProbe.recordPageClaim('not a url', ['1.00', 'USD', 'InStock']);
 	assert.equal(calls.get.length + calls.put.length + calls.patch.length, 0);
+});
+
+test('recordPageClaim honors the master switch — "off" means nothing stored, not just no probes', async (t) => {
+	t.after(restoreConfig);
+	const calls = await claimHarness();
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: false, rules: [] } });
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock']);
+	assert.equal(calls.get.length + calls.put.length + calls.patch.length, 0);
+});
+
+test('writeSignature: patch for an existing row (claim untouched unless cleared), put only to create', async () => {
+	// The verb choice IS the concurrency contract: a patch names only the probe's own columns, so
+	// a claim a render writes mid-probe survives structurally; a whole-row put would replace it
+	// with the stale copy read before the probe fetch.
+	const calls = { put: [], patch: [] };
+	globalThis.databases.probe_state.ProbeState = {
+		async put(id, rowFields) {
+			calls.put.push({ id, rowFields });
+		},
+		async patch(id, fields) {
+			calls.patch.push({ id, fields });
+		},
+	};
+	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true });
+	assert.equal(calls.put.length, 0);
+	assert.deepEqual(Object.keys(calls.patch[0].fields).sort(), ['probedAt', 'signature']);
+
+	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true, clearClaim: true });
+	assert.deepEqual(Object.keys(calls.patch[1].fields).sort(), ['pageSignature', 'probedAt', 'signature']);
+	assert.equal(calls.patch[1].fields.pageSignature, null);
+
+	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: false });
+	assert.equal(calls.patch.length, 2);
+	assert.equal(calls.put.length, 1);
+	assert.equal(calls.put[0].rowFields.url, URL_A);
+	assert.equal(calls.put[0].rowFields.pageSignature, null, 'a created row starts with no claim');
 });

@@ -140,7 +140,7 @@ const newStats = () => ({
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
-	pageMismatch: 0, // cached page disagreed with the origin (round-trip blindness; pageCheck rules)
+	pageMismatch: 0, // cached page disagreed with the origin (pageCheck) — OVERLAYS the buckets above, which count by signature outcome alone
 	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
 	throttleLevel: 1, // pacing-window multiplier when the pass ended; 1 means never backed off
 	abortedOnDistress: false, // the pass gave up because the origin refused everything
@@ -327,16 +327,23 @@ const readSignature = async (url) => {
 	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
 	return { signature: row.signature ?? null, probedAt, pageSignature: row.pageSignature ?? null };
 };
-// PATCH, not put: `put` on this sealed row would drop `pageSignature`, which only the render path
-// writes — the probe must never clobber the page's own claim while recording its baseline.
-// PUT, not patch: patch does NOT create a missing record (verified against the engine —
-// "updated 0 of 1 records, skipped"), and the seeding write is BY DEFINITION to a URL with no
-// row yet. A patch here would make every first observation a silent no-op, so the probe would
-// re-seed forever and never detect a change. `pageSignature` is carried through explicitly
-// because put replaces the row: the render path owns that field, and dropping it on every
-// signature write would erase the page's claim between passes.
-const writeSignature = (url, signature, pageSignature = null) =>
-	probeStateTable().put(url, { url, signature, probedAt: new Date(), pageSignature });
+// The probe's write must NEVER carry the page claim through a whole-row put: `pageSignature`
+// belongs to the render path, and the value read at the top of processOne is a full probe request
+// older than the row by the time this runs — a render landing in that window would have its fresh
+// claim replaced by the stale copy. So an EXISTING row takes a patch naming only the probe's own
+// columns (the claim survives structurally, not by being copied), with clearing the claim on an
+// acted trip as the one explicit exception. Only a MISSING row takes a put — patch does NOT
+// create a missing record (verified against the engine — "updated 0 of 1 records, skipped"), and
+// the seeding write is by definition to a URL with no row yet; a patch there would make every
+// first observation a silent no-op. A row the render path creates between the read and that put
+// loses at most one baseline to the race and re-seeds on the next pass.
+export const writeSignature = (url, signature, { rowExists = false, clearClaim = false } = {}) => {
+	const fields = { signature, probedAt: new Date() };
+	if (clearClaim) fields.pageSignature = null;
+	return rowExists
+		? probeStateTable().patch(url, fields)
+		: probeStateTable().put(url, { url, pageSignature: null, ...fields });
+};
 
 /**
  * Record what a freshly rendered page CLAIMS, for the probe to compare the origin against.
@@ -347,13 +354,20 @@ const writeSignature = (url, signature, pageSignature = null) =>
  */
 export const recordPageClaim = async (url, structuredOffers) => {
 	try {
+		// The master switch gates STORAGE too — "Off = no probes, no timers, nothing stored" is
+		// the config contract, and this is the hottest write path to be skipping work on.
+		if (!config.changeProbe.enabled) return;
 		// Parse ONCE, outside the predicate: this runs per render, and `find` would otherwise
 		// re-parse the same URL for every rule it tests. `URL.parse` over `new URL` is the repo
 		// idiom (it returns null instead of throwing on a malformed value).
 		const pathname = URL.parse(url)?.pathname;
 		if (!pathname) return;
-		const rule = probeRules().find((r) => r.pageCheck && r.pathPattern.test(pathname));
-		if (!rule) return;
+		// Select the rule EXACTLY as the sweep does — first match of ALL rules — then require
+		// pageCheck on it. Searching for "first match WITH pageCheck" instead would let an earlier
+		// pageCheck-less rule shadow this URL on the sweep side: claims written per render here,
+		// never compared there, and nothing to say so.
+		const rule = probeRules().find((r) => r.pathPattern.test(pathname));
+		if (!rule?.pageCheck) return;
 		if (structuredOffers === undefined) {
 			// The renderer does not know the field at all — it predates 1.20.0. There is
 			// deliberately NO fallback to parsing the stored HTML: recovering the offers here means
@@ -492,18 +506,22 @@ export const runProbePass = async ({
 		}
 
 		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
+		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
+		// `probed = seeded + unchanged + changed + failed` is the documented invariant, and the
+		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
+		// would silently shrink the mass-change sample right when claims are most likely to be
+		// stale. `pageMismatch` OVERLAYS these buckets; it never replaces them.
+		if (signatureChanged) stats.changed++;
+		else if (stored?.signature) stats.unchanged++;
+		else stats.seeded++;
 		if (!signatureChanged && !pageDisagrees) {
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
 				// to have changed, the probe just hadn't seen it before.
-				stats.seeded++;
-				await write(row.url, observed, stored?.pageSignature ?? null);
-			} else {
-				stats.unchanged++;
+				await write(row.url, observed, { rowExists: stored !== null });
 			}
 			return;
 		}
-		if (signatureChanged) stats.changed++;
 		if (dryRun) {
 			// Signature written in dry-run ON PURPOSE: each pass then reports fresh changes — the
 			// true change rate — instead of re-reporting the same delta forever. Demand-ladder
@@ -511,7 +529,7 @@ export const runProbePass = async ({
 			// the opposite case and is deliberately NOT cleared: nothing was expired, so the
 			// disagreement still stands — in dry-run `pageMismatch` reads as a standing gauge of
 			// disagreeing pages per pass, where armed it is a detection rate.
-			await write(row.url, observed, stored?.pageSignature ?? null);
+			await write(row.url, observed, { rowExists: stored !== null });
 			return;
 		}
 		if (stats.triggered >= maxTriggers) {
@@ -530,7 +548,7 @@ export const runProbePass = async ({
 			// trigger budget on a page already expired and already filed. The next render writes a
 			// fresh claim; until then there is nothing to compare, which is the correct "I don't
 			// know" state. Folded into this write so it costs no second round trip.
-			await write(row.url, observed, null);
+			await write(row.url, observed, { rowExists: stored !== null, clearClaim: true });
 		} catch (e) {
 			stats.errors++;
 			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
