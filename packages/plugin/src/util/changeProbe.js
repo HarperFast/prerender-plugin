@@ -236,6 +236,8 @@ const parseRetryAfter = (value) => {
 	return Math.max(0, Math.min(at - Date.now(), MAX_RETRY_AFTER_MS));
 };
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
+// setTimeout stores its delay as a signed 32-bit int; past this it fires after 1ms instead.
+const MAX_TIMER_MS = 2147483647;
 
 const probeOnce = async (rule, url) => {
 	const request = buildProbeRequest(rule, url);
@@ -293,9 +295,13 @@ const triggerRevalidate = async (row) => {
 const readSignature = async (url) => {
 	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt'] });
 	if (!row) return null;
-	// A Date column can surface as a Date, an epoch number, or a string depending on how the row
-	// was written; anything unparseable reads as "age unknown", which probes rather than skips.
-	const probedAt = row.probedAt === undefined || row.probedAt === null ? NaN : new Date(row.probedAt).getTime();
+	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
+	// exists for — a BigInt, which `new Date()` REFUSES rather than coerces (TypeError, which here
+	// would take down the whole sweep from a read). Same defence as resolveRenderInterval's, one
+	// type earlier. Anything still unparseable reads as "age unknown", which probes rather than
+	// skips: never skip a probe on a value we could not read.
+	const stamp = typeof row.probedAt === 'bigint' ? Number(row.probedAt) : row.probedAt;
+	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
 	return { signature: row.signature ?? null, probedAt };
 };
 const writeSignature = (url, signature) => probeStateTable().put(url, { url, signature, probedAt: new Date() });
@@ -436,7 +442,13 @@ export const runProbePass = async ({
 		batch.length = 0;
 		// An explicit Retry-After outranks our own arithmetic: the origin named a number, and
 		// guessing under it is exactly the disrespect the header exists to prevent.
-		const wait = Math.max(window - elapsed, retryAfterMs);
+		//
+		// Clamped to setTimeout's signed-32-bit delay, which the schema caps individual options at
+		// but cannot cap here: this window is the PRODUCT of `concurrency`, `1/ratePerSecond` and
+		// `throttle`, so three separately-sane values can multiply past the limit — and past it
+		// `setTimeout` fires after 1ms instead of waiting, turning the backoff into a hot loop
+		// against an origin already asking for room.
+		const wait = Math.min(Math.max(window - elapsed, retryAfterMs), MAX_TIMER_MS);
 		if (wait > 0) await pause(wait);
 	};
 

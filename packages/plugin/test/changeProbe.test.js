@@ -519,3 +519,62 @@ test('origin backoff: a rule/product failure is NOT distress and must not thrott
 	assert.deepEqual(waits, [1000, 1000], 'window never stretched');
 	assert.equal(stats.abortedOnDistress, false);
 });
+
+test('freshness skip: a BigInt probedAt is coerced, not thrown on', async () => {
+	// Harper numeric columns can surface as BigInt, and `new Date()` REFUSES a BigInt rather
+	// than coercing it — an unguarded read would take down the whole sweep.
+	const T = 1_700_000_000_000;
+	const probed = [];
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			probed.push(url);
+			return '[1]';
+		},
+		read: async () => ({ signature: '[1]', probedAt: Number(BigInt(T - 60_000)) }),
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		now: () => T,
+		reprobeAfter: 12 * HOUR,
+	});
+	assert.deepEqual(probed, [], 'the BigInt-derived timestamp was understood as fresh');
+	assert.equal(stats.fresh, 1);
+});
+
+test('origin backoff: the pacing wait can never exceed setTimeout’s 32-bit cap', async () => {
+	// concurrency x 1/ratePerSecond x throttle is a PRODUCT of three separately-sane options;
+	// past 2^31-1 ms setTimeout fires after 1ms instead of waiting, which would turn the backoff
+	// into a hot loop against an origin already asking for room.
+	const waits = [];
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => {
+			throw Object.assign(new Error('HTTP 503'), { statusCode: 503, distress: true });
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 10,
+		concurrency: 1,
+		ratePerSecond: 0.000001, // a window far past the cap once multiplied by the backoff
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		backoffMax: 1_000_000,
+	});
+	assert.equal(waits.length, 1);
+	assert.ok(waits[0] <= 2147483647, `wait was ${waits[0]}`);
+});
