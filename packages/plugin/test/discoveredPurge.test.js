@@ -63,6 +63,7 @@ const newStats = () => ({
 	discovered: 0,
 	leaseSkipped: 0,
 	deleted: 0,
+	visitedSkipped: 0,
 	errors: 0,
 	errorSamples: [],
 	abortedOnErrors: false,
@@ -341,4 +342,53 @@ test('runner: an intermittent fault does not trip the consecutive-failure stop',
 	});
 	assert.equal(stats.abortedOnErrors, false);
 	assert.equal(stats.deleted + stats.errors, 200);
+});
+
+test('skipVisited: spares ladder-promoted targets, still deletes the unvisited ones', async () => {
+	// A stored demandInterval is durable evidence a bot visited the URL in each of promoteWindows
+	// consecutive windows — on a commerce corpus 40% of never-declared product pages carried one,
+	// and deleting those pays a delete plus a re-mint to arrive back where we started.
+	const deleted = [];
+	const stats = newStats();
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			yield { url: 'https://x.example/product/a', sitemapUrl: null, demandInterval: 43200000 }; // visited
+			yield { url: 'https://x.example/product/b', sitemapUrl: null, demandInterval: null }; // not
+			yield { url: 'https://x.example/product/c', sitemapUrl: null }; // field absent
+			yield { url: 'https://x.example/product/d', sitemapUrl: null, demandInterval: BigInt(86400000) }; // Long
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		deleteTarget: async (url) => deleted.push(url),
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		skipVisited: true,
+		pause: async () => {},
+		stats,
+	});
+	assert.deepEqual(deleted, ['https://x.example/product/b', 'https://x.example/product/c']);
+	assert.equal(stats.visitedSkipped, 2, 'the BigInt rung counts as visited — Long columns surface that way');
+	assert.equal(stats.discovered, 4);
+	assert.equal(stats.deleted, 2);
+});
+
+test('skipVisited: off by default, so the predicate is unchanged for existing callers', async () => {
+	const deleted = [];
+	const stats = newStats();
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			yield { url: 'https://x.example/product/a', sitemapUrl: null, demandInterval: 43200000 };
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		deleteTarget: async (url) => deleted.push(url),
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		pause: async () => {},
+		stats,
+	});
+	assert.deepEqual(deleted, ['https://x.example/product/a']);
+	assert.equal(stats.visitedSkipped, 0);
 });

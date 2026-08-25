@@ -64,6 +64,7 @@ import {
 	extractJsonLdOffers,
 	isSameProbeOrigin,
 	signatureOf,
+	statusSignalFor,
 } from './changeProbeSpec.js';
 
 const targetTable = () => databases.render_service.Target;
@@ -243,6 +244,15 @@ const probeOnce = async (rule, url) => {
 	const request = buildProbeRequest(rule, url);
 	if (!request) return null;
 	const { statusCode, body, retryAfterMs } = await probeFetch(request, url);
+	// A DECLARED status signal outranks every failure path below, including the distress
+	// classification: the operator has said what this status means for THIS endpoint, so it is an
+	// observation rather than a fault, and an endpoint that answers it routinely must not be read
+	// as an origin in trouble. Only non-2xx statuses can carry a signal (the compiler rejects the
+	// rest), so this can never shadow normal extraction.
+	if (statusCode < 200 || statusCode >= 300) {
+		const signaled = statusSignalFor(rule, statusCode, body);
+		if (signaled !== null) return signaled;
+	}
 	if (statusCode >= 300 && statusCode < 400) {
 		// Fail-closed rather than followed: a silently followed redirect can move the probe onto a
 		// host the operator never named (and same-origin gating above would then be deciding about
