@@ -127,4 +127,44 @@ export const getInitialRenderTime = (key, interval) => {
 	return currentMinuteMs(Date.now() + (fnv1a32(jitterSeed(key)) % safeInterval));
 };
 
-export const getNextSitemapRefreshTime = () => getNextTimeOfDay(config.sitemap.refreshTime, config.sitemap.timezone);
+/**
+ * The next sitemap refresh: the next point on a grid of `interval`-spaced slots PHASE-ANCHORED
+ * on `timeStr` in `timezone`.
+ *
+ * Anchoring rather than counting `now + interval` is what makes the interval a schedule instead
+ * of a drift. Three things fall out of it:
+ *
+ *  - `refreshTime` keeps meaning what it has always meant. At the default 24h interval the only
+ *    slot on the grid IS the daily anchor, so this is byte-for-byte the previous behaviour; a 6h
+ *    interval simply adds slots at 06:00/18:00/00:00 around a 12:00 anchor.
+ *  - Slots do not walk. Re-arming from `now + interval` after each run pushes every subsequent
+ *    slot later by however long the walk took (~2 min today) plus timer slop, so "every 6 hours"
+ *    becomes a time-of-day that rotates through the clock over a week. The pinned node also
+ *    re-arms from scratch on restart and on every re-pin, which would re-phase the grid to
+ *    whenever that happened.
+ *  - DST self-corrects. The grid is rebuilt from `getNextTimeOfDay` — which recomputes the
+ *    offset at the target instant — on every arm, so a transition shifts the slots once with
+ *    the anchor rather than accumulating an hour of error.
+ *
+ * The grid is anchored to the NEXT anchor and counted backwards, so an interval that does not
+ * divide 24h re-phases once a day at the anchor: the last slot before it is short, never long.
+ * That is the right way round — the anchor is the guarantee, and a short gap honours it while a
+ * long one would silently miss it.
+ */
+export const getNextIntervalSlot = (timeStr, timezone, intervalMs) => {
+	const nextAnchor = getNextTimeOfDay(timeStr, timezone);
+
+	// A non-positive/non-finite interval is not a schedule; fall back to the plain daily anchor
+	// rather than dividing by it. `config.sitemap.refreshInterval` is schema-clamped, so this is
+	// a guard for direct callers and tests, not an expected path.
+	if (!Number.isFinite(intervalMs) || intervalMs <= 0) return nextAnchor;
+
+	const delta = nextAnchor - Date.now();
+	// Slots are `nextAnchor - k * interval`. The one we want is the smallest of those still in
+	// the future, i.e. the largest k with `k * interval < delta`.
+	const steps = Math.max(0, Math.ceil(delta / intervalMs) - 1);
+	return currentMinuteMs(nextAnchor - steps * intervalMs);
+};
+
+export const getNextSitemapRefreshTime = () =>
+	getNextIntervalSlot(config.sitemap.refreshTime, config.sitemap.timezone, config.sitemap.refreshInterval);

@@ -701,7 +701,7 @@ function snippet(body, max = 200) {
 
 let sitemapSchedulerStarted = false;
 let sitemapPendingTimer = null;
-let sitemapArmedKey = null; // `${refreshTime}|${timezone}` while scheduled, null while not
+let sitemapArmedKey = null; // `${refreshTime}|${timezone}|${refreshInterval}` while scheduled, null while not
 
 // This node+worker runs the scheduled refresh only while it is the pinned one. Live:
 // re-pinning via config (node, workerIndex) starts/stops the scheduler without a restart.
@@ -713,11 +713,17 @@ const isPinnedHere = () =>
 export const sitemapSchedulerState = () => ({ started: sitemapSchedulerStarted, armedKey: sitemapArmedKey });
 
 /**
- * Start the daily sitemap refresh, pinned to the configured node + worker. Called from
+ * Start the scheduled sitemap refresh, pinned to the configured node + worker. Called from
  * handleApplication after config is applied. Every worker subscribes; only the pinned
- * one holds a timer. `sitemap.node`/`workerIndex`/`refreshTime`/`timezone` are all live:
- * changing any of them re-schedules (or stops) the pending refresh on the next
+ * one holds a timer. `sitemap.node`/`workerIndex`/`refreshTime`/`timezone`/`refreshInterval`
+ * are all live: changing any of them re-schedules (or stops) the pending refresh on the next
  * config apply. Idempotent.
+ *
+ * Runs happen on a grid of `refreshInterval`-spaced slots anchored on `refreshTime` — see
+ * `getNextIntervalSlot`. Only ONE timer is ever held (a fresh one is armed after each run),
+ * deliberately, rather than a `setInterval` at the configured period: a walk that outruns its
+ * slot must skip to the next one, and re-computing the slot from the wall clock each time is
+ * also what keeps the schedule from drifting by a walk-length on every pass.
  */
 export function startSitemapRefreshScheduler() {
 	if (sitemapSchedulerStarted) return;
@@ -733,7 +739,7 @@ export function startSitemapRefreshScheduler() {
 			logger.info('Starting sitemap refresh');
 
 			// Roots only, and sequential: an index walks its own children, so including them here
-			// too doubled every fetch, point read and write in the daily pass.
+			// too doubled every fetch, point read and write in the pass.
 			for (const url of await rootSitemapUrls()) {
 				const claim = await claimRefreshRun(url);
 				if (!claim.ok) {
@@ -761,13 +767,15 @@ export function startSitemapRefreshScheduler() {
 		sitemapArmedKey = null;
 		if (!isPinnedHere()) return;
 
-		sitemapArmedKey = `${config.sitemap.refreshTime}|${config.sitemap.timezone}`;
+		sitemapArmedKey = `${config.sitemap.refreshTime}|${config.sitemap.timezone}|${config.sitemap.refreshInterval}`;
 		sitemapPendingTimer = setTimeout(refreshAllSitemaps, getNextSitemapRefreshTime() - Date.now());
 		sitemapPendingTimer.unref?.();
 	};
 
 	const sync = () => {
-		const desiredKey = isPinnedHere() ? `${config.sitemap.refreshTime}|${config.sitemap.timezone}` : null;
+		const desiredKey = isPinnedHere()
+			? `${config.sitemap.refreshTime}|${config.sitemap.timezone}|${config.sitemap.refreshInterval}`
+			: null;
 		if (desiredKey === sitemapArmedKey) return;
 		scheduleNextRefresh();
 	};
