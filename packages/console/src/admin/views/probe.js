@@ -57,18 +57,21 @@ const RANGES = [
 /**
  * The pass counters, in the order a pass produces them.
  *
- * THESE ARE SERIES SIDE BY SIDE, NOT A PARTITION, and two of them are deliberately not disjoint:
- * `probed` is the total the four outcome counters divide up, and `throttled` is the slice of
- * `failed` the ORIGIN caused rather than the rule. `fresh` is the one that is disjoint from
- * everything — a skipped URL was never attempted, so it is not inside `probed` at all. The chart
- * note under the bars says this, because a reader who assumes a partition here reads every share
- * on the card wrong.
+ * THESE ARE SERIES SIDE BY SIDE, NOT A PARTITION, and three of them are deliberately not
+ * disjoint: `probed` is the total the four outcome counters divide up, `throttled` is the slice
+ * of `failed` the ORIGIN caused rather than the rule, and `page_mismatch` OVERLAYS the outcome
+ * buckets entirely — a row whose cached page disagreed with the origin is also inside `changed`
+ * or the unchanged count, because the plugin buckets by signature outcome alone. `fresh` is the
+ * one that is disjoint from everything — a skipped URL was never attempted, so it is not inside
+ * `probed` at all. The chart note under the bars says this, because a reader who assumes a
+ * partition here reads every share on the card wrong.
  */
 const OUTCOMES = [
 	['fresh', 'Skipped (fresh)', '#6b7488'],
 	['probed', 'Probes', '#3d8cff'],
 	['seeded', 'Seeded', '#8a93a6'],
 	['changed', 'Changed', '#f0a02a'],
+	['page_mismatch', 'Page mismatch', '#22b8cf'],
 	['triggered', 'Triggered', '#10a87e'],
 	['deferred', 'Deferred', '#9d6bff'],
 	['failed', 'Failed', '#e0566f'],
@@ -334,6 +337,13 @@ function drift(ctx) {
 	const fresh = totalOf('fresh');
 	const throttled = totalOf('throttled');
 	const unreadable = totalOf('unreadable');
+	const pageMismatch = totalOf('page_mismatch');
+	// What a mismatch MEANS depends on the run mode, which is the status's fact and not the
+	// window's: armed, each one was hard-expired the moment it was seen (a detection rate); dry,
+	// nothing expires them, so the same disagreement is re-reported every pass (a standing gauge).
+	// The merged status is dry only when EVERY node is, which is exactly the reading wanted here —
+	// one live node means mismatches are being acted on somewhere.
+	const mismatchesStanding = pageMismatch > 0 && ctx.data.status?.dryRun !== false;
 
 	// Compared = probes that had a baseline to compare against. Seeds and failures had none, so
 	// including them in the denominator understates the drift rate by exactly the seeding backlog.
@@ -362,6 +372,9 @@ function drift(ctx) {
 			failing ? pill('probe failures dominate', 'bad') : null,
 			throttled > 0 ? pill('origin pushing back', 'bad') : null,
 			unreadable > 0 ? pill('unreadable rows', 'bad') : null,
+			// Only when nothing is expiring them: armed, a mismatch is the feature working and the
+			// tile suffices; standing, wrong pages are being served and re-found every pass.
+			mismatchesStanding ? pill('pages disagree with the origin', 'warn') : null,
 			spacer(),
 			legend(keys.map((key) => ({ label: OUTCOME_LABEL[key], color: OUTCOME_COLOR[key] }))),
 		],
@@ -406,6 +419,23 @@ function drift(ctx) {
 						'address is a storage-layer fault: it belongs with the database team, not with a setting ' +
 						'here.',
 				]),
+			// THE CLASS THE SIGNATURE COMPARISON CANNOT SEE. Everything else on this card asks "did
+			// the origin change since the last look", which is structurally blind to a value that
+			// changed and changed BACK between two passes — and when a render landed inside that
+			// window, the cached page keeps the transient value (an out-of-stock claim for something
+			// the origin sells, a sale price that ended). pageCheck (plugin v0.58.0) compares the
+			// origin against what the PAGE claims, so these are wrong pages found, not changes seen.
+			pageMismatch > 0 &&
+				note(mismatchesStanding ? 'warn' : '', [
+					`${fmtCount(pageMismatch)} probe${pageMismatch === 1 ? '' : 's'} found the cached page disagreeing ` +
+						'with the origin on a field it claims — a transient value the render captured and the ' +
+						'signature comparison could never see, because the origin itself never looked changed. ',
+					mismatchesStanding
+						? 'In dry run nothing expires them, so the same disagreement is re-reported every pass: read ' +
+							'this as a standing count of wrong pages being served, not a rate.'
+						: 'Each one was hard-expired the moment it was seen — bots get origin content until the ' +
+							're-render lands — so read this as a detection rate.',
+				]),
 			skipping &&
 				note('warn', [
 					`${pct(fresh, fresh + probed)} of the rows these passes considered were skipped because a ` +
@@ -421,6 +451,11 @@ function drift(ctx) {
 			el('div', { cls: 'stats' }, [
 				stat('Probes', fmtCount(probed), 'attempts across every finished pass'),
 				stat('Changed', pct(changed, compared), `${fmtCount(changed)} of ${fmtCount(compared)} compared`),
+				// Overlays the outcome buckets — a mismatched row is also inside Changed or the
+				// unchanged remainder — so the sub-label names the relationship instead of a share.
+				stat('Page mismatch', fmtCount(pageMismatch), 'cached page ≠ origin — overlays the buckets', {
+					warn: mismatchesStanding,
+				}),
 				stat(
 					'Triggered',
 					fmtCount(triggered),
@@ -450,9 +485,13 @@ function drift(ctx) {
 				'One emit per finished pass, sweep and canary alike, so the bars are passes and not probes — a tall ',
 				'bar is a pass that landed in that bucket, not a busier minute. These are series side by side and ',
 				'NOT a partition: “Probes” is the total the outcomes divide up, “Throttled” is the slice of ',
-				'“Failed” the origin caused, and “Skipped” sits outside “Probes” entirely because those rows were ',
-				'never attempted. “Changed” is measured against the probes that HAD a baseline; seeds and failures ',
-				'are excluded from that denominator because neither compared anything.',
+				'“Failed” the origin caused, “Page mismatch” overlays the outcome buckets (a mismatched row is ',
+				'also inside “Changed” or the unchanged remainder), and “Skipped” sits outside “Probes” entirely ',
+				'because those rows were never attempted. “Changed” is measured against the probes that HAD a ',
+				'baseline; seeds and failures are excluded from that denominator because neither compared ',
+				'anything. “Page mismatch” stays at zero unless a rule sets pageCheck AND the render fleet posts ',
+				'its pages’ offers (browser 1.20.0+) — enabled against an older fleet it records nothing, and the ',
+				'plugin log says so hourly.',
 			]),
 		],
 		foot: [scanFooter(data)],
@@ -520,6 +559,11 @@ function sweepCard(ctx, status) {
 					'Changed',
 					`${num(last.changed)}${compared ? ` of ${num(compared)} compared (${pct(last.changed, compared)})` : ''}`,
 				],
+				// Overlays the signature buckets — a mismatch row is also inside Changed or the
+				// unchanged remainder — so it joins no subtraction here. Only worth a row when there
+				// were any; the run-mode pill at the top of the page says whether they were expired
+				// on the spot or are still serving.
+				last.pageMismatch ? ['Pages disagreeing with the origin', pill(num(last.pageMismatch), 'warn')] : null,
 				['Re-renders filed', last.triggered ? pill(num(last.triggered), 'ok') : pill('0', '')],
 				last.deferred ? ['Deferred past the trigger cap', pill(num(last.deferred), 'warn')] : null,
 				['Failed probes', last.failed ? pill(num(last.failed), 'warn') : pill('0', 'ok')],
