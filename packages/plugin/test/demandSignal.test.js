@@ -163,10 +163,17 @@ test('a missed non-200 is NOT demand — an origin 404 is not a page', async () 
 });
 
 test('statuses that never looked for a page row cannot claim one', async () => {
-	// 'bypass' is a non-GET; 'skip' is render-now, which is an operator action rather than
-	// crawler demand and must not buy the page a faster rung.
+	// 'bypass' is a non-GET, 'skip' a deliberate cache bypass. Neither is `miss` either — a miss
+	// LOOKED and found nothing — so they take neither branch and record nothing.
 	assert.equal(await wasRecorded({ cacheStatus: 'bypass', resource: { statusCode: 200 } }), false);
 	assert.equal(await wasRecorded({ cacheStatus: 'skip', resource: { statusCode: 200 } }), false);
+});
+
+test('a render-now MISS still records: it looked, found nothing, and mints the target', async () => {
+	// `resolveResource` stamps cacheStatus BEFORE the render-now branch, so an on-demand render
+	// of an unknown URL arrives here as a plain 'miss'. Excluding it would drop genuine crawler
+	// demand wherever a deployment serves misses by rendering rather than proxying.
+	assert.equal(await wasRecorded({ cacheStatus: 'miss', resource: { statusCode: 200 } }), true);
 });
 
 test('a non-prerender class is never demand', async () => {

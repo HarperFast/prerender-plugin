@@ -365,9 +365,11 @@ function maybeSchedule(resource, routeClass, route, botName) {
 }
 
 // Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
-// Target exists: a non-GET (`bypass`) and a deliberate cache skip (`skip`, i.e. render-now).
-// Excluding them is right on the second count too — a forced render is an operator action, not
-// crawler demand, and should not buy the page a faster rung.
+// Target exists: a non-GET (`bypass`) and a deliberate cache skip (`skip`). They are not `miss`
+// either — a miss LOOKED and found nothing — so they take neither branch below and record no
+// demand. That is the conservative reading of an ambiguous request, not a claim that on-demand
+// traffic is illegitimate: a render-now MISS still records, because it looked, found nothing, and
+// is about to mint the Target that makes the URL real.
 const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
 
 // Demand signal for the render ladder (util/visitFilter.js -> util/demandLadder.js). Keyed on
