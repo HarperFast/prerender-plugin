@@ -127,10 +127,58 @@ export async function collectPaint(page: Page): Promise<PaintItem[]> {
 }
 
 /**
+ * Collect over a short observation WINDOW rather than at an instant.
+ *
+ * A single sample is not a safe basis for "this never painted": carousels rotate, sliders
+ * transition, lazy images arrive. But the two sides need OPPOSITE reductions, and getting that
+ * backwards is worse than not sampling at all — reducing both by `max` inflates the reference as
+ * more images load and manufactured 258 false losses on a real homepage.
+ *
+ * - reference (`min`): a mark counts as painting only if it painted in EVERY sample. A slide that
+ *   rotated away, or an image that had not yet loaded, is not held against the snapshot.
+ * - snapshot (`max`): a mark counts as painting if it painted in ANY sample. Catching it
+ *   mid-transition is not evidence that it is missing.
+ *
+ * A key absent from a sample entirely is treated as zero area for `min`, which is the same
+ * conservative direction.
+ */
+export async function collectPaintStable(
+	page: Page,
+	{ samples = 2, gapMs = 1200, reduce = 'max' }: { samples?: number; gapMs?: number; reduce?: 'min' | 'max' } = {}
+): Promise<PaintItem[]> {
+	const rounds: Map<string, PaintItem>[] = [];
+	for (let i = 0; i < Math.max(1, samples); i++) {
+		if (i > 0) await new Promise((resolve) => setTimeout(resolve, gapMs));
+		const round = new Map<string, PaintItem>();
+		for (const item of await collectPaint(page)) {
+			const prev = round.get(item.key);
+			if (!prev || item.area > prev.area) round.set(item.key, item);
+		}
+		rounds.push(round);
+	}
+	if (rounds.length === 1) return [...rounds[0].values()];
+
+	const keys = new Set<string>();
+	for (const round of rounds) for (const key of round.keys()) keys.add(key);
+	const zero = (key: string): PaintItem => ({ key, width: 0, height: 0, area: 0 });
+	const out: PaintItem[] = [];
+	for (const key of keys) {
+		let chosen: PaintItem | undefined;
+		for (const round of rounds) {
+			const item = round.get(key) ?? zero(key);
+			if (!chosen) chosen = item;
+			else if (reduce === 'min' ? item.area < chosen.area : item.area > chosen.area) chosen = item;
+		}
+		if (chosen) out.push(chosen);
+	}
+	return out;
+}
+
+/**
  * Compare two inventories. Pure — no browser, so it is cheap to test directly.
  *
- * @param minArea ignore marks smaller than this at origin (sub-pixel spacers and 1px rules are
- *   noise, and a hairline that rounds to zero on one side is not a finding).
+ * @param minArea ignore marks smaller than this at origin (sub-pixel spacers and hairline rules are
+ *   noise, and a rule that rounds to zero on one side is not a finding).
  */
 export function diffPaint(
 	origin: PaintItem[],
@@ -169,11 +217,11 @@ export function diffPaint(
 		}
 	}
 	// Biggest losses first — they are the ones a human should look at.
-	lost.sort((a, b) => parseFloat(b.origin) * 1 - parseFloat(a.origin) * 1);
+	lost.sort(
+		(a, b) => b.origin.split('x').reduce((x, y) => x * +y, 1) - a.origin.split('x').reduce((x, y) => x * +y, 1)
+	);
 	return { shared, originOnly: o.size - shared, servedOnly: s.size - shared, lost, gained, lostByKind };
 }
-
-export default diffPaint;
 
 // ── orchestration ─────────────────────────────────────────────────────────────────────────────
 
@@ -197,6 +245,10 @@ export interface PaintParityOptions {
 	renderBudgetMs?: number;
 	/** Wall-clock budget for the reference's hydration sweep. Default 20000. */
 	sweepDeadlineMs?: number;
+	/** Inventory samples per side. >1 tolerates carousels and transitions. Default 2. */
+	samples?: number;
+	/** Gap between samples, ms. Default 1200. */
+	sampleGapMs?: number;
 }
 
 export interface PaintParityReport extends PaintParityResult {
@@ -216,7 +268,17 @@ export interface PaintParityReport extends PaintParityResult {
  * defect being hunted cancels out.
  */
 export async function paintParity(o: PaintParityOptions): Promise<PaintParityReport> {
-	const { url, device, base, bypass, minArea = 4, renderBudgetMs = 120000, sweepDeadlineMs = 20000 } = o;
+	const {
+		url,
+		device,
+		base,
+		bypass,
+		minArea = 4,
+		renderBudgetMs = 120000,
+		sweepDeadlineMs = 20000,
+		samples = 2,
+		sampleGapMs = 1200,
+	} = o;
 
 	// 1. The candidate: exactly what the fleet would cache and serve.
 	const candidate =
@@ -254,7 +316,8 @@ export async function paintParity(o: PaintParityOptions): Promise<PaintParityRep
 		probes: {
 			paint: async ({ page }) => {
 				await sweep(page, { deadlineMs: sweepDeadlineMs });
-				return collectPaint(page);
+				// `min`: only marks that painted in EVERY sample are held against the snapshot.
+				return collectPaintStable(page, { samples, gapMs: sampleGapMs, reduce: 'min' });
 			},
 		},
 	});
@@ -273,7 +336,8 @@ export async function paintParity(o: PaintParityOptions): Promise<PaintParityRep
 		});
 		let servedPaint: PaintItem[];
 		try {
-			servedPaint = await collectPaint(page);
+			// `max`: if the snapshot painted it at any point in the window, it is not lost.
+			servedPaint = await collectPaintStable(page, { samples, gapMs: sampleGapMs, reduce: 'max' });
 		} finally {
 			await page.close().catch(() => {});
 		}

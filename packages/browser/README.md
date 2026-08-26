@@ -208,6 +208,19 @@ The inventory walk pierces open shadow roots deliberately — at origin a widget
 encapsulated while the snapshot has it flattened, and a non-piercing walk returns a false zero for
 exactly the content most worth comparing.
 
+**Sampling, and why the two sides reduce differently.** Each side is sampled over a short window
+rather than at an instant, because carousels rotate, sliders transition and lazy images arrive. The
+reductions are deliberately opposite: the reference keeps each mark's _smallest_ showing (it counts
+as painting only if it painted in EVERY sample), the snapshot keeps its _largest_ (if it painted at
+any point, it is not lost). Getting this symmetric is worse than not sampling — reducing both by
+`max` inflates the reference as images load and manufactured 258 false losses on a real homepage.
+
+**Read `gained` alongside `lost`.** Rotating content shows up as a symmetric pair: a hero carousel
+caught on slide A at origin and slide B in the snapshot reports N lost and N gained, all in the same
+region. That is a slide swap, not a defect — verified on a real homepage, where the six "lost"
+shapes render identically on both sides when measured directly. A genuine loss is asymmetric: ink
+disappears and nothing comparable appears in its place.
+
 Two things to hold onto when using it. Marks below `minArea` (default 4px²) at origin are ignored, so
 a hairline that rounds to zero on one side is not a finding. And when you test a detector like this,
 **verify the fault is present in your broken fixture first** — an early version of this check
