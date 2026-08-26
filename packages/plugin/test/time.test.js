@@ -9,6 +9,7 @@ import {
 	getInitialRenderTime,
 	HOUR,
 	MINUTE,
+	SECOND,
 } from '../src/util/time.js';
 
 beforeEach(() => applyOptions({}));
@@ -62,6 +63,19 @@ test('getNextIntervalSlot never returns a slot more than one interval out', () =
 		const slot = getNextIntervalSlot(time, 'UTC', HOUR);
 		assert.ok(slot > Date.now(), `${time}: future`);
 		assert.ok(slot - Date.now() <= HOUR + MINUTE, `${time}: within one interval`);
+	}
+});
+
+test('getNextIntervalSlot never returns a slot in the past, even off the minute grid', () => {
+	// The schema's floor is ONE minute, not a multiple of one, so a 90s interval is configurable.
+	// The anchor is minute-aligned but 90s steps are not, and flooring an off-grid slot can land
+	// up to 59s behind now — which `setTimeout` treats as "fire immediately", not as "wait".
+	for (const interval of [90 * SECOND, 100 * SECOND, 7 * MINUTE + 30 * SECOND]) {
+		for (const time of ['00:00', '07:30', '12:00', '23:59']) {
+			const slot = getNextIntervalSlot(time, 'UTC', interval);
+			assert.ok(slot > Date.now(), `${time} @ ${interval}ms: slot must be in the future, got ${slot - Date.now()}ms`);
+			assert.equal(slot % MINUTE, 0, 'and still minute-aligned');
+		}
 	}
 });
 

@@ -159,11 +159,21 @@ export const getNextIntervalSlot = (timeStr, timezone, intervalMs) => {
 	// a guard for direct callers and tests, not an expected path.
 	if (!Number.isFinite(intervalMs) || intervalMs <= 0) return nextAnchor;
 
-	const delta = nextAnchor - Date.now();
+	const now = Date.now();
+	const delta = nextAnchor - now;
 	// Slots are `nextAnchor - k * interval`. The one we want is the smallest of those still in
 	// the future, i.e. the largest k with `k * interval < delta`.
 	const steps = Math.max(0, Math.ceil(delta / intervalMs) - 1);
-	return currentMinuteMs(nextAnchor - steps * intervalMs);
+	const slot = currentMinuteMs(nextAnchor - steps * intervalMs);
+
+	// `currentMinuteMs` floors, and the anchor is minute-aligned, so for any whole-minute interval
+	// the slot is already exact and this is unreachable. It is reachable for an interval that is
+	// NOT a whole number of minutes (the schema's floor is one minute, not a multiple of one):
+	// there the floor can land up to 59s in the past, and a past slot means a negative
+	// `setTimeout` delay, which fires immediately rather than waiting. Stepping to the next minute
+	// rather than the next INTERVAL is deliberate — it keeps the slot as close to the true grid
+	// point as minute resolution allows instead of skipping the slot entirely.
+	return slot > now ? slot : slot + MINUTE;
 };
 
 export const getNextSitemapRefreshTime = () =>
