@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { getBotName, botMayDiscover } from '../src/util/userAgent.js';
+import { getBotName, botMayDiscover, botCountsAsDemand } from '../src/util/userAgent.js';
 
 // Minimal stand-in for a WHATWG Headers object.
 const headers = (map) => ({ get: (k) => map[k.toLowerCase()] ?? null });
@@ -150,4 +150,37 @@ test('botMayDiscover: an empty list turns traffic discovery off for every bot', 
 	applyOptions({ ingress: { discoveryBots: [] } });
 	assert.equal(botMayDiscover('Googlebot'), false);
 	assert.equal(botMayDiscover('other'), false);
+});
+
+test('botCountsAsDemand: the default counts every bot', () => {
+	assert.equal(botCountsAsDemand('Googlebot'), true);
+	assert.equal(botCountsAsDemand('other'), true);
+	assert.equal(botCountsAsDemand('Anything At All'), true);
+});
+
+test('botCountsAsDemand: a list gates case-insensitively and follows a live config change', () => {
+	applyOptions({ render: { demand: { bots: ['googlebot', 'Bingbot'] } } });
+	assert.equal(botCountsAsDemand('Googlebot'), true);
+	assert.equal(botCountsAsDemand('BINGBOT'), true);
+	assert.equal(botCountsAsDemand('AhrefsBot'), false);
+	assert.equal(botCountsAsDemand('other'), false);
+	assert.equal(botCountsAsDemand(undefined), false);
+	applyOptions({ render: { demand: { bots: ['*'] } } });
+	assert.equal(botCountsAsDemand('AhrefsBot'), true);
+});
+
+test('botCountsAsDemand: an empty list stops the ladder seeing any demand at all', () => {
+	applyOptions({ render: { demand: { bots: [] } } });
+	assert.equal(botCountsAsDemand('Googlebot'), false);
+	assert.equal(botCountsAsDemand('other'), false);
+});
+
+// The two allowlists share a compile helper but must not share STATE: editing one cannot be
+// allowed to answer for the other, which is exactly what a single cached set would do.
+test('the discovery and demand allowlists are independent', () => {
+	applyOptions({ ingress: { discoveryBots: ['Googlebot'] }, render: { demand: { bots: ['Bingbot'] } } });
+	assert.equal(botMayDiscover('Googlebot'), true);
+	assert.equal(botMayDiscover('Bingbot'), false);
+	assert.equal(botCountsAsDemand('Googlebot'), false);
+	assert.equal(botCountsAsDemand('Bingbot'), true);
 });

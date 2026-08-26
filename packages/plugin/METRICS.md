@@ -139,8 +139,18 @@ Notes that bite:
   `analytics.recordUnmatched` for requests whose UA yields no name). No rows ≠ no traffic.
 - **`queue_health`'s snapshot series and `prerender_ops`' `demand_*` are gauges on a slow cadence**, one set per node
   (`management.backlogSnapshotInterval`, `render.demand.statsInterval`). Chart the latest value;
-  never sum a gauge over time. `overdue` sums across nodes and `fill` averages. The ladder's
-  decision counters are NOT gauges — they are per-interval counts and must be summed.
+  never sum a gauge over time. `overdue` sums across nodes; `fill` takes its **peak** (below). The
+  ladder's decision counters are NOT gauges — they are per-interval counts and must be summed.
+- **`demand_fill` is a sawtooth — read max/p95, never the mean.** It is the set-bit fraction of the
+  newest visit-filter slice, which resets to ~0 at each `sliceMs` rollover and climbs until the next
+  one, so an average reports the middle of the ramp while the ladder's decisions land all along it,
+  including at the top. The false-positive rate is `fill^k` (k = `render.demand.hashes`, 7 by
+  default), and that exponent is what makes the distinction matter rather than nitpicking: a mean of
+  0.75 implies 13% false positives, the 0.986 peak of the same slice implies **91%**. A saturated ring
+  reads "visited" for everything, so the ladder promotes the whole corpus to its floor — cadence
+  stops being demand-driven and no other metric says so. Fix it by cutting what goes in
+  (`render.demand.bots`, and the rotation gate that keeps URLs owning no Target out) before raising
+  `bitsPerSlice`, whose row replicates on every flush.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. The scan is capped by `management.scanCap`: a backlog past the cap reports the cap.

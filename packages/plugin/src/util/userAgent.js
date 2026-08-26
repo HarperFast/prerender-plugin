@@ -179,16 +179,20 @@ export function deriveBotName(ua) {
 	return null;
 }
 
-// ---- discovery allowlist -------------------------------------------------------------------
+// ---- bot allowlists ------------------------------------------------------------------------
 
-let discoverySet = null; // lowercase Set, or null meaning "every bot" ('*' present)
-let discoveryFrom; // the config array the current set was built from
-
-const compileDiscovery = (bots) => {
+// Shared by the two allowlists below: `['*']` compiles to null, meaning "every bot", and
+// anything else to a lowercase Set. Both cache on the IDENTITY of the config array they were
+// built from — applyOptions replaces config with a fresh object on every change, so an identity
+// check is enough to notice an edit and cheap enough for the request path.
+const compileAllowlist = (bots) => {
 	const names = (Array.isArray(bots) ? bots : []).filter((name) => typeof name === 'string' && name !== '');
 	if (names.some((name) => name === '*')) return null;
 	return new Set(names.map((name) => name.toLowerCase()));
 };
+
+let discoverySet = null; // lowercase Set, or null meaning "every bot" ('*' present)
+let discoveryFrom; // the config array the current set was built from
 
 /**
  * May a visit labeled `botName` create a NEW target (traffic discovery)?
@@ -200,15 +204,41 @@ const compileDiscovery = (bots) => {
  * so a config spelling like 'googlebot' still matches the registry's 'Googlebot'.
  *
  * This gates CREATION only. Serving is untouched (an unminted URL still proxies to the
- * origin), and so is everything keyed on targets that already exist: the demand ladder's
- * visit signal, invalidation reenqueue, and the sitemap pipeline (its targets are declared,
- * not discovered).
+ * origin), and so are invalidation reenqueue and the sitemap pipeline (its targets are
+ * declared, not discovered). The demand ladder's visit signal has its OWN allowlist —
+ * `botCountsAsDemand` below — because the two questions are different: minting corpus is
+ * permanent, while counting demand only reallocates cadence within a budget that already
+ * exists, so a deployment can reasonably answer them differently.
  */
 export const botMayDiscover = (botName) => {
 	if (config.ingress.discoveryBots !== discoveryFrom) {
-		discoverySet = compileDiscovery(config.ingress.discoveryBots);
+		discoverySet = compileAllowlist(config.ingress.discoveryBots);
 		discoveryFrom = config.ingress.discoveryBots;
 	}
 	if (discoverySet === null) return true;
 	return typeof botName === 'string' && discoverySet.has(botName.toLowerCase());
+};
+
+let demandSet = null; // lowercase Set, or null meaning "every bot" ('*' present)
+let demandFrom; // the config array the current set was built from
+
+/**
+ * Does a visit labeled `botName` count as demand for the render ladder?
+ *
+ * `render.demand.bots` has the same shape and matching rules as `ingress.discoveryBots`:
+ * `['*']` (default) counts every bot, `[]` counts none (every target rests at its route
+ * cadence), a list counts exactly those, compared case-insensitively.
+ *
+ * Cadence is render budget, so whoever this counts decides where that budget goes: a scraper
+ * walking the corpus breadth-first promotes pages no search engine asked for. It also bounds
+ * what reaches the Bloom ring, whose false-positive rate rises with fill — see `recordDemand`
+ * in http_handlers/bot_request.js for why that is a correctness concern and not just a cost.
+ */
+export const botCountsAsDemand = (botName) => {
+	if (config.render.demand.bots !== demandFrom) {
+		demandSet = compileAllowlist(config.render.demand.bots);
+		demandFrom = config.render.demand.bots;
+	}
+	if (demandSet === null) return true;
+	return typeof botName === 'string' && demandSet.has(botName.toLowerCase());
 };

@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
-import { getBotName, botMayDiscover } from '../util/userAgent.js';
+import { getBotName, botMayDiscover, botCountsAsDemand } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
@@ -49,17 +49,6 @@ export async function handleBotRequest(request) {
 			recordCrawl(request.botName, cacheUrl);
 		}
 
-		// Demand signal for the render ladder. Deliberately OUTSIDE the `recordBots` gate: that
-		// gate is about analytics volume, whereas this feeds scheduling — a deployment that turns
-		// analytics down must not silently demote its whole corpus for lack of observed traffic.
-		// Keyed on the device-free URL, since cadence resolves per URL and dropping the device
-		// split halves the distinct count the filter carries. No-op unless render.demand.enabled.
-		// Prerender-class only: those are the only keys the ladder ever probes (proxied and
-		// unclassified paths own no Target), and recording the plentiful junk URLs the CDN
-		// over-forwards would only raise the filter's fill factor — at high fill the
-		// false-positive rate explodes and the ladder degenerates into promoting everything.
-		if (routeClass === PRERENDER) recordVisit(cacheUrl);
-
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
@@ -67,6 +56,7 @@ export async function handleBotRequest(request) {
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		maybeSchedule(resource, routeClass, route, request.botName);
+		recordDemand({ resource, routeClass, route, cacheUrl, botName: request.botName, cacheStatus: info.cacheStatus });
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
 		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
 		// only when the page would otherwise have been served). Detached inside, like maybeSchedule —
@@ -372,6 +362,47 @@ function maybeSchedule(resource, routeClass, route, botName) {
 		return;
 	}
 	setImmediate(handlePageScheduling, resource);
+}
+
+// Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
+// Target exists: a non-GET (`bypass`) and a deliberate cache skip (`skip`, i.e. render-now).
+// Excluding them is right on the second count too — a forced render is an operator action, not
+// crawler demand, and should not buy the page a faster rung.
+const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
+
+// Demand signal for the render ladder (util/visitFilter.js -> util/demandLadder.js). Keyed on
+// the device-free URL, since cadence resolves per URL and dropping the device split halves the
+// distinct count the filter carries. No-op unless `render.demand.enabled`.
+//
+// DELIBERATELY OUTSIDE the `recordBots` analytics gate: that gate is about analytics volume,
+// whereas this feeds scheduling — turning analytics down must not silently demote the corpus for
+// lack of observed traffic.
+//
+// BOTH GATES BELOW EXIST TO HOLD THE RING'S FILL FACTOR DOWN, and that is a correctness concern,
+// not a tidiness one. Fill sets the false-positive rate (~fill^k), and a saturated ring does not
+// fail loudly — it answers "visited" for everything, so the ladder promotes the whole corpus to
+// its floor and the visit signal stops being a signal. `bitsPerSlice` is sized for the URLs the
+// ladder can actually act on, so anything else recorded here is spent budget.
+//
+//   ROTATION. The ladder only ever probes URLs that own a Target. `cacheStatus` is the sharper
+//   test than `resource.miss`: 'stale', 'invalidated', 'blob-missing' and 'blob-timeout' all
+//   served from the origin but FOUND a page row, and a page row exists only where a Target does,
+//   so treating those as unvisited would demote pages that are merely late. 'miss' is the one
+//   status that proves nothing was found, and it still counts when THIS request is what puts the
+//   URL into the rotation — a cacheable 200 on a route that mints targets. It does not when the
+//   route is discovery-gated (combinatorial facet URLs, which own no Target and never will) or
+//   the origin returned no page (404s for URLs that predate the deployment).
+//
+//   BOT. `render.demand.bots`, mirroring `ingress.discoveryBots`. Cadence is render budget, so a
+//   deployment usually wants it allocated by the engines it serves rather than by every crawler
+//   that walks the corpus.
+export function recordDemand({ resource, routeClass, route, cacheUrl, botName, cacheStatus }) {
+	if (routeClass !== PRERENDER) return;
+	const owned = cacheStatus !== 'miss' && !NO_PAGE_LOOKUP.has(cacheStatus);
+	const minting = cacheStatus === 'miss' && resource.statusCode === 200 && route?.discoverTargets !== false;
+	if (!owned && !minting) return;
+	if (!botCountsAsDemand(botName)) return;
+	recordVisit(cacheUrl);
 }
 
 // On-demand render: force an immediate one-off render and wait for the fresh result,
