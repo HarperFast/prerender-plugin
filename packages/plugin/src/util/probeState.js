@@ -30,6 +30,8 @@
  * than against when the pass began.
  */
 
+import { epochMsOf } from './time.js';
+
 const ROW_KEY = 'change_probe';
 
 const table = () => databases.coordination.SharedBuffer;
@@ -50,7 +52,19 @@ export const readProbeState = async () => {
 };
 
 /**
- * Merge `patch` into the row.
+ * Merge `patch` into the row, ONE LEVEL DEEP.
+ *
+ * The depth is not a nicety, it is the difference between this module working and quietly
+ * recreating the bug it exists to fix. Every writer patches a single branch (`sweep`, `canary`,
+ * `scheduler`) with a partial object, so a shallow spread REPLACES that branch: the heartbeat
+ * publishes `{ sweep: { running, startedAt, heartbeatAt, progress } }` with no `lastRun`, and a
+ * shallow merge therefore deletes `lastRun` 30 seconds into a pass and leaves it deleted for the
+ * hours the pass runs. An operator checking on a live sweep would read exactly the "nothing has
+ * ever run here" that this module was written to eliminate.
+ *
+ * One level is enough because the branches are one level deep, and it keeps the rule easy to
+ * state: to CLEAR a field, name it explicitly (`lastRun: null`, `progress: null`) rather than
+ * omitting it. Omission means "leave alone".
  *
  * READ-MODIFY-WRITE, and the race is deliberately tolerated: the writers are the scheduler
  * (arming) and whichever worker holds the pass (progress), so the only interleaving that loses
@@ -64,7 +78,12 @@ export const readProbeState = async () => {
 export const publishProbeState = async (patch) => {
 	try {
 		const existing = (await table().get(ROW_KEY)) ?? {};
-		await table().put(ROW_KEY, { ...existing, ...patch, node: server.hostname, updatedAt: Date.now() });
+		const merged = { ...existing };
+		for (const [key, value] of Object.entries(patch)) {
+			const isBranch = value && typeof value === 'object' && !Array.isArray(value);
+			merged[key] = isBranch ? { ...merged[key], ...value } : value;
+		}
+		await table().put(ROW_KEY, { ...merged, node: server.hostname, updatedAt: Date.now() });
 		return true;
 	} catch (e) {
 		globalThis.logger?.warn?.(`[prerender] could not publish change-probe state: ${e?.message ?? String(e)}`);
@@ -82,7 +101,13 @@ export const publishProbeState = async (patch) => {
 export const isPassRunning = (row, kind, staleMs) => {
 	const pass = row?.[kind];
 	if (!pass?.running) return false;
-	const beat = Number(pass.heartbeatAt ?? pass.startedAt);
+	// `epochMsOf`, not `Number`. A row can carry a timestamp as a number, a Date or an ISO string
+	// depending on how it crossed a serialization boundary, and `Number(null)` is 0 rather than
+	// NaN — so a `running` row with no usable timestamp would read as "beat at the epoch", which
+	// is finite and therefore passes a naive check. Here that happened to land on the safe side
+	// (stale -> taken over), but relying on which side an accident falls is how the next edit
+	// breaks it.
+	const beat = epochMsOf(pass.heartbeatAt ?? pass.startedAt);
 	if (!Number.isFinite(beat)) return false;
 	return Date.now() - beat < staleMs;
 };

@@ -1274,3 +1274,57 @@ test('the re-entrancy guard is set BEFORE the claim await, not after', async () 
 
 	applyOptions({ changeProbe: { enabled: false } });
 });
+
+test('a heartbeat mid-pass must NOT wipe lastRun — the merge is one level deep', async () => {
+	// The regression that nearly shipped inside the fix for the same class of bug. Every writer
+	// patches ONE branch with a partial object; a shallow spread replaces that branch, so the
+	// heartbeat — which carries no `lastRun` — deleted it 30s into a pass and left it deleted for
+	// the hours the pass ran. An operator checking on a live sweep would read exactly the
+	// "nothing has ever run here" this module exists to eliminate.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, lastRun: { label: 'previous' } },
+	});
+
+	// Exactly what `makeHeartbeat` writes: no `lastRun` key at all.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: 2, heartbeatAt: 2, progress: { examinedApprox: 400 } },
+	});
+
+	const row = await changeProbe.readProbeStateForTest();
+	assert.deepEqual(row.sweep.lastRun, { label: 'previous' }, 'the previous result survived the heartbeat');
+	assert.equal(row.sweep.progress.examinedApprox, 400, 'and the new progress landed');
+	assert.equal(row.sweep.running, true);
+});
+
+test('omission means "leave alone"; clearing a field requires naming it', async () => {
+	// The rule the one-level merge implies, pinned so a future writer does not assume otherwise.
+	await changeProbe.publishProbeStateForTest({ sweep: { running: true, progress: { examinedApprox: 9 } } });
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, progress: null } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.progress, null, 'an explicit null clears');
+	assert.equal(row.sweep.running, false);
+});
+
+test('branches are independent: publishing scheduler state leaves pass records alone', async () => {
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, lastRun: { label: 'kept' } } });
+	await changeProbe.publishProbeStateForTest({ scheduler: { armedSweep: 'continuous', sliceSize: 42 } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.deepEqual(row.sweep.lastRun, { label: 'kept' });
+	assert.equal(row.scheduler.sliceSize, 42);
+});
+
+test('a running row with no usable timestamp is not treated as freshly beating', async () => {
+	// `Number(null)` is 0, which is finite — so a naive check reads "beat at the epoch" and the
+	// answer depends on which side of the comparison that accident falls.
+	const { isPassRunning } = await import('../src/util/probeState.js');
+	assert.equal(isPassRunning({ sweep: { running: true } }, 'sweep', 60_000), false);
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: null, startedAt: null } }, 'sweep', 60_000), false);
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: 'nonsense' } }, 'sweep', 60_000), false);
+	// A real, fresh beat still reads as running — the guard must not refuse everything.
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: Date.now() } }, 'sweep', 60_000), true);
+	// And an ISO string, which is how a Date column can come back across a serialization boundary.
+	assert.equal(
+		isPassRunning({ sweep: { running: true, heartbeatAt: new Date().toISOString() } }, 'sweep', 60_000),
+		true
+	);
+});

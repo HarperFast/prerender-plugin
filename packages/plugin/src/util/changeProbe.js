@@ -777,9 +777,16 @@ const claimPass = async (kind) => {
 	return { ok: true, startedAt };
 };
 
-/** Release the claim and publish the finished record. */
+/**
+ * Release the claim and publish the finished record.
+ *
+ * `progress: null` is EXPLICIT because the merge is one level deep and omission means "leave
+ * alone" — without it a finished pass would carry the last mid-pass progress reading forever.
+ */
 const releasePass = async (kind, startedAt, lastRun) => {
-	await publishProbeState({ [kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun } });
+	await publishProbeState({
+		[kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun, progress: null },
+	});
 };
 
 /**
@@ -1256,16 +1263,26 @@ let armedCanary = null;
  * lag monitor's liveness. Only worker 0 ever calls this — it is the only worker that HAS these —
  * and every other worker reads the result.
  */
-const publishScheduler = () =>
-	publishProbeState({
-		scheduler: {
-			armedSweep,
-			armedCanary,
-			sliceSize: measuredSliceSize,
-			cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
-			loadMonitor: loopLagMonitorState(),
-		},
-	});
+const publishScheduler = () => {
+	// The ARGUMENT is built synchronously, so a throw while building it escapes before there is a
+	// promise to reject — and both call sites use `void`, which would turn that into an unhandled
+	// exception on the config-apply path. Nothing in here should throw today; the guard is what
+	// keeps `publishProbeState`'s "observability can never fail a pass" promise true of the whole
+	// call rather than only of its async half.
+	try {
+		void publishProbeState({
+			scheduler: {
+				armedSweep,
+				armedCanary,
+				sliceSize: measuredSliceSize,
+				cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
+				loadMonitor: loopLagMonitorState(),
+			},
+		});
+	} catch (e) {
+		logger.warn(`[prerender] could not publish change-probe scheduler state: ${e?.message ?? String(e)}`);
+	}
+};
 
 const clearProbeTimers = () => {
 	if (bootTimer) clearTimeout(bootTimer);
