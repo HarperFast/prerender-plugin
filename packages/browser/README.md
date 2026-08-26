@@ -167,6 +167,52 @@ A sheet is left untouched when it has no readable rules (a cross-origin sheet th
 when re-emission comes back empty, or when the result would not be smaller — so the pass never grows
 a document and is idempotent.
 
+### `paintParity` — validating that the snapshot still puts ink on screen
+
+`renderAudit` compares the DOM: elements, attributes, text, computed styles. A whole class of
+fidelity bug is invisible to it, because the markup stays perfect and only the _rendering_ is lost —
+see the SVG-geometry case below, where 140 of 140 paths painted nothing while every DOM-level check
+stayed green. `renderAudit` is structurally unable to catch that class at all: its ground-truth
+state deliberately inherits the deployed post-processing, so a post-processing loss is applied to
+both sides and cancels out.
+
+`paintParity` keys on **paint identity** instead — the thing that makes a mark, named by something
+stable enough to match across two independently rendered pages:
+
+| kind  | key                                                     |
+| ----- | ------------------------------------------------------- |
+| `geo` | an SVG shape's own `d` / `points` / geometry attributes |
+| `img` | the image's src basename                                |
+| `bg`  | the `url()` of a background image                       |
+| `txt` | the text string itself                                  |
+
+For every key present on **both** sides it compares rendered area. A key that paints at origin and
+has zero area in the snapshot is **lost ink** — regardless of whether its element, attributes and
+computed styles are all still present. Keys only one side has are counted and reported, never
+failed: that is ordinary content drift on a live site, and conflating the two is what makes naive
+pixel diffing useless here.
+
+```js
+import { paintParity } from '@harperfast/prerender-browser';
+
+const report = await paintParity({ url, base: deployedConfig, bypass });
+// report.lost      -> [{ key, kind, origin: '17.4x17.3', served: '0x0' }, …]
+// report.lostByKind-> { geo: 18, txt: 4 }
+// report.shared / originOnly / servedOnly
+```
+
+The reference is the **non-prerendered** page: JS running, hydrated, post-processing off. The
+snapshot is then loaded at the real URL (via the same `loadServed` path the audit uses) so relative
+references and same-origin subrequests resolve as they do for a crawler fetching the cached bytes.
+The inventory walk pierces open shadow roots deliberately — at origin a widget is often still
+encapsulated while the snapshot has it flattened, and a non-piercing walk returns a false zero for
+exactly the content most worth comparing.
+
+Two things to hold onto when using it. Marks below `minArea` (default 4px²) at origin are ignored, so
+a hairline that rounds to zero on one side is not a finding. And when you test a detector like this,
+**verify the fault is present in your broken fixture first** — an early version of this check
+reported "no regression" because the fixture it was given had never actually been broken.
+
 ### `flattenShadowDom` and SVG geometry
 
 The inbound reset that keeps page CSS out of flattened shadow content is deliberately **not**
