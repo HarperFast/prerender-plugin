@@ -44,8 +44,9 @@ const INBOUND_FIXTURE = `<!doctype html><html><head><title>inbound</title>
   style.textContent = 'p { margin-left: 7px; } .inner { letter-spacing: 3px; }';
   sr.appendChild(style);
   sr.innerHTML += '<span id="stars">' +
-    '<svg id="s1" width="10" height="10"></svg><svg id="s2" width="10" height="10"></svg>' +
-    '<svg id="s3" width="10" height="10"></svg></span>' +
+    '<svg id="s1" width="10" height="10" viewBox="0 0 10 10"><path id="p1" d="M0 0 H10 V10 Z"></path></svg>' +
+    '<svg id="s2" width="10" height="10" viewBox="0 0 10 10"><path d="M0 0 H10 V10 Z"></path></svg>' +
+    '<svg id="s3" width="10" height="10" viewBox="0 0 10 10"><path d="M0 0 H10 V10 Z"></path></svg></span>' +
     '<p id="para">shadow paragraph</p><div class="inner" id="inner">inner</div><slot></slot>';
 </script>
 </body></html>`;
@@ -129,8 +130,13 @@ test('page CSS does not reach flattened shadow content, but still styles slotted
 	});
 	assert.match(
 		r.html,
-		/\[data-sh=s\d+\] \*:where\(:not\(\[data-sl\],\[data-sl\] \*\)\)\{all:revert\}/,
-		'the scoped reset is emitted'
+		/\[data-sh=s\d+\] \*:where\(:not\(\[data-sl\],\[data-sl\] \*,svg,svg \*\)\)\{all:revert\}/,
+		'the scoped reset is emitted, and excludes SVG subtrees'
+	);
+	assert.match(
+		r.html,
+		/\[data-sh=s\d+\] svg:where\(:not\(\[data-sl\] \*\)\)\{display:revert/,
+		'…with the svg leak closed by reverting display rather than everything'
 	);
 
 	// Re-render the serialized output and check what actually computes.
@@ -148,7 +154,10 @@ test('page CSS does not reach flattened shadow content, but still styles slotted
 					page.evaluate(() => {
 						const cs = (id: string) => getComputedStyle(document.getElementById(id)!);
 						const svgs = ['s1', 's2', 's3'].map((id) => document.getElementById(id)!.getBoundingClientRect().top);
+						const pathBox = document.getElementById('p1')!.getBoundingClientRect();
 						return {
+							pathWidth: Math.round(pathBox.width),
+							pathHeight: Math.round(pathBox.height),
 							svgDisplay: cs('s1').display,
 							starsHorizontal: new Set(svgs.map(Math.round)).size === 1,
 							paraMargin: cs('para').marginLeft,
@@ -164,11 +173,17 @@ test('page CSS does not reach flattened shadow content, but still styles slotted
 		assert.equal(c.svgDisplay, 'inline', "the page's svg reset must not reach flattened content");
 		assert.equal(c.starsHorizontal, true, 'the three svgs stay on one line');
 
-		// 2. The shadow root's OWN rules must still beat the reset — both element and class form.
+		// 2. SVG GEOMETRY must survive. `d` is a CSS property in Chrome and a presentation attribute
+		// supplies it from the author origin, so a blanket `all: revert` throws it away and every
+		// flattened path collapses to zero size — which is what shipped in v1.19.0.
+		assert.ok((c.pathWidth as number) > 0, 'the path keeps its width — `d` must survive the reset');
+		assert.ok((c.pathHeight as number) > 0, 'the path keeps its height — `d` must survive the reset');
+
+		// 3. The shadow root's OWN rules must still beat the reset — both element and class form.
 		assert.equal(c.paraMargin, '7px', "the shadow's own `p` rule must beat both the page rule and the reset");
 		assert.equal(c.innerSpacing, '3px', "the shadow's own class rule must survive the reset");
 
-		// 3. Slotted content was always light DOM — the page must still style it.
+		// 4. Slotted content was always light DOM — the page must still style it.
 		assert.equal(c.slottedColor, 'rgb(0, 128, 0)', 'slotted content keeps its page styling');
 	} finally {
 		replay.close();

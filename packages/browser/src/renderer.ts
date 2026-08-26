@@ -890,7 +890,21 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				//   - the `:not()` is wrapped in `:where()` so the exemption contributes NOTHING to
 				//     specificity. Written bare, `:not([data-sl] *)` would raise this to (0,2,0) and
 				//     start beating the shadow rules it must lose to.
-				const reset = `${hostSel} *:where(:not([data-sl],[data-sl] *)){all:revert}\n`;
+				// `all: revert` must NOT reach SVG. `d`, `cx`, `cy`, `r`, `x`, `y`, `width` and
+				// `height` are CSS properties in Chrome, and a presentation attribute supplies them
+				// from the AUTHOR origin — so reverting throws the geometry away and every flattened
+				// `<path>` collapses to zero size. Measured on a review widget: 140 of 140 paths
+				// painted nothing, leaving carousel arrows as empty outlined boxes. Origin paints 96
+				// of 143 there; excluding SVG restores 92 of 140, i.e. parity within render drift.
+				//
+				// The leak this reset exists to stop still has to be stopped, and on `<svg>` it is a
+				// page reset setting `display:block` (which stacks a star row vertically). Undo just
+				// that handful of properties instead of everything. Both rules are `:where()`,
+				// specificity 0, and are emitted before the shadow's own CSS, so the component still
+				// wins wherever it has an opinion.
+				const reset =
+					`${hostSel} *:where(:not([data-sl],[data-sl] *,svg,svg *)){all:revert}\n` +
+					`${hostSel} svg:where(:not([data-sl] *)){display:revert;vertical-align:revert;max-width:revert;width:revert;height:revert}\n`;
 				const style = document.createElement('style');
 				style.textContent = reset + css;
 				host.appendChild(style);

@@ -167,6 +167,25 @@ A sheet is left untouched when it has no readable rules (a cross-origin sheet th
 when re-emission comes back empty, or when the result would not be smaller — so the pass never grows
 a document and is idempotent.
 
+### `flattenShadowDom` and SVG geometry
+
+The inbound reset that keeps page CSS out of flattened shadow content is deliberately **not**
+`all: revert` on everything. `d`, `cx`, `cy`, `r`, `x`, `y`, `width` and `height` are CSS properties
+in Chrome, and a presentation attribute supplies them from the _author_ origin — so a blanket revert
+throws the geometry away and every flattened `<path>` collapses to zero size. Measured on a review
+widget: **140 of 140 paths painted nothing**, leaving carousel arrows as empty outlined boxes while
+the DOM, the text and every byte-level check looked perfect.
+
+So SVG subtrees are excluded from the blanket reset, and the leak that reset exists to stop — a page
+`svg { display: block }` that stacks a star row vertically — is closed by reverting just `display`
+(plus `vertical-align`/`max-width`/`width`/`height`, the rest of what a Preflight-style reset sets on
+`<svg>`). Both rules are `:where()`, specificity 0, emitted before the component's own CSS, so the
+component still wins wherever it has an opinion. Origin paints 96 of 143 paths on that page; this
+restores 92 of 140 — parity within render drift.
+
+This is worth knowing generally: **a fidelity bug can be invisible to DOM- and text-level checks.**
+Nothing was missing from the markup; the geometry was gone.
+
 ### `postProcess.pruneUnmatchedCss` — dropping CSS the page cannot use
 
 Deletes every style rule whose selector cannot match anything in the finished document. Off by
