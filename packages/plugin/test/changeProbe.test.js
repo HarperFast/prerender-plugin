@@ -42,17 +42,40 @@ class FakeTable {
 	}
 }
 
+/**
+ * A node-local table fake that also carries `primaryStore`. The probe's cross-worker state row
+ * lives here; a plain object with only `primaryStore` made every publish throw (swallowed) and
+ * every read return null, which would have let the observability tests pass against no storage.
+ */
+let sharedRows = new Map();
+const probeStateTable = () => {
+	class SharedBufferFake {
+		static primaryStore = sharedBufferStub;
+		static async get(key) {
+			return sharedRows.get(key) ?? undefined;
+		}
+		static async put(key, value) {
+			sharedRows.set(key, value);
+		}
+	}
+	return SharedBufferFake;
+};
+
 beforeEach(async () => {
 	globalThis.server = { hostname: 'node-a', workerIndex: 0, nodes: [], config: { http: {} } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {}, notify() {} };
 	globalThis.databases = {
-		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		// SharedBuffer is BOTH the SAB provider (renderLease, via primaryStore) and a node-local
+		// TABLE — the change probe publishes its cross-worker state as a row here, so the fake has
+		// to answer get/put as well as hand out buffers.
+		coordination: { SharedBuffer: probeStateTable() },
 		probe_state: { ProbeState: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },
 		render_schedule: { RenderSchedule: FakeTable },
 		invalidation: { Invalidation: FakeTable },
 	};
+	sharedRows = new Map();
 	changeProbe = await import('../src/util/changeProbe.js');
 	changeProbe.resetChangeProbeState();
 });
@@ -296,14 +319,16 @@ test('cohortCollector picks the lowest hashes — a keyspace sample, not the alp
 });
 
 test('requestSweepReseed runs immediately when no sweep is running', async () => {
+	// `changeProbeStatus` is async now: it reads the node-local shared row rather than this
+	// worker's module state, which is what makes it answer the same way from all 16 workers.
 	const status = () => changeProbe.changeProbeStatus();
-	assert.equal(status().sweep.lastRun, null);
+	assert.equal((await status()).sweep.lastRun, null);
 	const { chained } = changeProbe.requestSweepReseed('reseed-now');
 	assert.equal(chained, false);
-	while (!status().sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(status().sweep.lastRun.label, 'reseed-now');
+	while (!(await status()).sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal((await status()).sweep.lastRun.label, 'reseed-now');
 	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never trigger.
-	assert.equal(status().sweep.lastRun.dryRun, true);
+	assert.equal((await status()).sweep.lastRun.dryRun, true);
 });
 
 test('requestSweepReseed interrupts a running sweep and chains the reseed after it stands down', async () => {
@@ -335,10 +360,10 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		await live;
 		// The chained reseed is detached from the live pass's finally; wait for its record.
 		const status = () => changeProbe.changeProbeStatus();
-		while (status().sweep.lastRun?.label !== 'reseed-after-trip') {
+		while ((await status()).sweep.lastRun?.label !== 'reseed-after-trip') {
 			await new Promise((resolve) => setImmediate(resolve));
 		}
-		assert.equal(status().sweep.lastRun.dryRun, true);
+		assert.equal((await status()).sweep.lastRun.dryRun, true);
 	} finally {
 		config.changeProbe.chunkSize = savedChunk;
 		globalThis.databases.render_service.Target = FakeTable;
@@ -1144,4 +1169,162 @@ test('cycle pacing belongs to the SWEEP — the canary must never inherit the sw
 	assert.equal(canaryLimits.lagThreshold, sweepLimits.lagThreshold, 'a congested node is congested either way');
 
 	applyOptions({ changeProbe: { enabled: false } });
+});
+
+// ---- cross-worker observability ------------------------------------------------------------
+
+/**
+ * The probe scheduler arms on worker 0 only, but `/prerender_admin/change-probe` is served by all
+ * sixteen. With the state in module variables the endpoint reported a healthy probe as switched
+ * off on ~95% of reads (measured: worker 0 answered 3 of 60), and the POST guard — reading the
+ * same module state — could never fire, so "Run sweep" started a second full-rate sweep beside
+ * the scheduled one.
+ *
+ * These drive the shared row directly, which is what a different worker sees.
+ */
+const otherWorkerSees = async () => {
+	// Everything worker-local is irrelevant to another worker; only the row travels.
+	const row = await changeProbe.readProbeStateForTest();
+	return row;
+};
+
+test('a finished pass is readable from a worker that never ran it', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+
+	await changeProbe.runProbeSweepOnce({ label: 'published' });
+
+	// The row is the whole contract — a second worker has no module state at all.
+	const row = await otherWorkerSees();
+	assert.ok(row, 'the pass published a row');
+	assert.equal(row.sweep.running, false);
+	assert.equal(row.sweep.lastRun.label, 'published');
+	assert.equal(row.node, 'node-a');
+
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.lastRun.label, 'published');
+	assert.equal(status.stateAvailable, true, 'a present row is reported as available');
+
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('no row reads as "nothing has run here", NOT as a failed read', async () => {
+	// The distinction the old shape could not express: `armedInterval: null` meant both "disarmed"
+	// and "you asked a worker that does not know", and an operator cannot act on that.
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.stateAvailable, false);
+	assert.equal(status.sweep.lastRun, null);
+	assert.equal(status.sweep.running, false);
+});
+
+test('the run guard is NODE-WIDE: a claim held by another worker refuses a second pass', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+
+	// Exactly what worker 0's scheduled sweep leaves behind while it runs. This worker's module
+	// state knows nothing about it — which is the situation that used to double the origin rate.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: Date.now(), heartbeatAt: Date.now(), lastRun: null },
+	});
+
+	assert.equal(await changeProbe.isPassRunningOnNode('sweep'), true, 'visible from this worker');
+
+	const result = await changeProbe.runProbeSweepOnce({ label: 'second' });
+	assert.equal(result.skipped, true, 'refused');
+	assert.match(result.reason, /already running/);
+
+	// And the local flag must not be left stuck on by the refusal — that would wedge this worker's
+	// sweep for the life of the process.
+	assert.equal(changeProbe.isProbeSweepRunning(), false);
+
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('a claim whose heartbeat has stopped is taken over, not honoured forever', async () => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+
+	// A worker that crashed mid-sweep. A sweep runs for HOURS, so liveness cannot be inferred from
+	// startedAt — without the heartbeat this row would either disable the probe until a process
+	// restart, or be stolen from a healthy pass.
+	const longAgo = Date.now() - 60 * 60 * 1000;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: longAgo, heartbeatAt: longAgo, lastRun: null },
+	});
+
+	assert.equal(await changeProbe.isPassRunningOnNode('sweep'), false, 'a dead heartbeat is not running');
+	const result = await changeProbe.runProbeSweepOnce({ label: 'takeover' });
+	assert.notEqual(result.skipped, true, 'the stale claim was taken over');
+
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('the re-entrancy guard is set BEFORE the claim await, not after', async () => {
+	// The claim is async, so setting the local flag after it leaves a window where two concurrent
+	// calls on THIS worker both pass the guard. Caught by a hanging test during development.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+
+	const first = changeProbe.runProbeSweepOnce({ label: 'a' });
+	// Synchronously — no await between the call and this check.
+	assert.equal(changeProbe.isProbeSweepRunning(), true, 'the flag is set before any await');
+	const second = await changeProbe.runProbeSweepOnce({ label: 'b' });
+	assert.equal(second.skipped, true, 'the concurrent call is refused');
+	await first;
+
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('a heartbeat mid-pass must NOT wipe lastRun — the merge is one level deep', async () => {
+	// The regression that nearly shipped inside the fix for the same class of bug. Every writer
+	// patches ONE branch with a partial object; a shallow spread replaces that branch, so the
+	// heartbeat — which carries no `lastRun` — deleted it 30s into a pass and left it deleted for
+	// the hours the pass ran. An operator checking on a live sweep would read exactly the
+	// "nothing has ever run here" this module exists to eliminate.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, lastRun: { label: 'previous' } },
+	});
+
+	// Exactly what `makeHeartbeat` writes: no `lastRun` key at all.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: 2, heartbeatAt: 2, progress: { examinedApprox: 400 } },
+	});
+
+	const row = await changeProbe.readProbeStateForTest();
+	assert.deepEqual(row.sweep.lastRun, { label: 'previous' }, 'the previous result survived the heartbeat');
+	assert.equal(row.sweep.progress.examinedApprox, 400, 'and the new progress landed');
+	assert.equal(row.sweep.running, true);
+});
+
+test('omission means "leave alone"; clearing a field requires naming it', async () => {
+	// The rule the one-level merge implies, pinned so a future writer does not assume otherwise.
+	await changeProbe.publishProbeStateForTest({ sweep: { running: true, progress: { examinedApprox: 9 } } });
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, progress: null } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.progress, null, 'an explicit null clears');
+	assert.equal(row.sweep.running, false);
+});
+
+test('branches are independent: publishing scheduler state leaves pass records alone', async () => {
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, lastRun: { label: 'kept' } } });
+	await changeProbe.publishProbeStateForTest({ scheduler: { armedSweep: 'continuous', sliceSize: 42 } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.deepEqual(row.sweep.lastRun, { label: 'kept' });
+	assert.equal(row.scheduler.sliceSize, 42);
+});
+
+test('a running row with no usable timestamp is not treated as freshly beating', async () => {
+	// `Number(null)` is 0, which is finite — so a naive check reads "beat at the epoch" and the
+	// answer depends on which side of the comparison that accident falls.
+	const { isPassRunning } = await import('../src/util/probeState.js');
+	assert.equal(isPassRunning({ sweep: { running: true } }, 'sweep', 60_000), false);
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: null, startedAt: null } }, 'sweep', 60_000), false);
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: 'nonsense' } }, 'sweep', 60_000), false);
+	// A real, fresh beat still reads as running — the guard must not refuse everything.
+	assert.equal(isPassRunning({ sweep: { running: true, heartbeatAt: Date.now() } }, 'sweep', 60_000), true);
+	// And an ISO string, which is how a Date column can come back across a serialization boundary.
+	assert.equal(
+		isPassRunning({ sweep: { running: true, heartbeatAt: new Date().toISOString() } }, 'sweep', 60_000),
+		true
+	);
 });

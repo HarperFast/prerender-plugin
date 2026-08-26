@@ -106,13 +106,7 @@ import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
 import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
-import {
-	changeProbeStatus,
-	isProbeCanaryRunning,
-	isProbeSweepRunning,
-	runProbeCanaryOnce,
-	runProbeSweepOnce,
-} from '../util/changeProbe.js';
+import { changeProbeStatus, isPassRunningOnNode, runProbeCanaryOnce, runProbeSweepOnce } from '../util/changeProbe.js';
 import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import {
@@ -475,7 +469,7 @@ export class PrerenderAdmin extends Resource {
 			case 'change-probe':
 				// Node-local, like reconcile: each node probes only the keys it owns, so cohort sizes
 				// and pass records here describe THIS node's slice. The console fans out.
-				return json(changeProbeStatus());
+				return json(await changeProbeStatus());
 			case 'discovery-purge':
 				// Live progress of THIS node's purge pass (it mutates its stats in place), or the
 				// last finished pass. Owner-scoped like sweep-orphans: query every node.
@@ -1225,7 +1219,7 @@ export class PrerenderAdmin extends Resource {
 	 * on the keys it owns. `dryRun` (boolean) overrides the configured value for this run only —
 	 * the safe direction is inherited from config, where it defaults on.
 	 */
-	static changeProbe(data) {
+	static async changeProbe(data) {
 		if (!config.changeProbe.enabled) {
 			return json({ error: 'changeProbe.enabled is false', node: server.hostname }, 409);
 		}
@@ -1234,11 +1228,17 @@ export class PrerenderAdmin extends Resource {
 			return json({ error: `action must be "sweep" or "canary", got ${String(data?.action)}` }, 400);
 		}
 		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : config.changeProbe.dryRun;
-		const status = changeProbeStatus();
+		const status = await changeProbeStatus();
 		const payload = { node: server.hostname, action, dryRun, ownerScopeNote: status.ownerScopeNote, status };
 
-		const running = action === 'sweep' ? isProbeSweepRunning() : isProbeCanaryRunning();
-		if (running) return json({ ...payload, started: false, alreadyRunning: true });
+		// NODE-WIDE, not this worker's module state. The old check read a variable that only the
+		// scheduler's worker ever wrote, so from any other worker it was permanently false — and
+		// this button then started a second full-rate sweep alongside the scheduled one, doubling
+		// the probe load on an origin whose rate was negotiated. The pass itself re-checks and
+		// claims atomically; this is the early, honest refusal.
+		if (await isPassRunningOnNode(action)) {
+			return json({ ...payload, started: false, alreadyRunning: true });
+		}
 
 		// Detached: the pass outlives this request, so a rejection has to be handled here or it
 		// surfaces as an unhandled rejection.
