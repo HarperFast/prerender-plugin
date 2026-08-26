@@ -890,7 +890,21 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				//   - the `:not()` is wrapped in `:where()` so the exemption contributes NOTHING to
 				//     specificity. Written bare, `:not([data-sl] *)` would raise this to (0,2,0) and
 				//     start beating the shadow rules it must lose to.
-				const reset = `${hostSel} *:where(:not([data-sl],[data-sl] *)){all:revert}\n`;
+				// `all: revert` must NOT reach SVG. `d`, `cx`, `cy`, `r`, `x`, `y`, `width` and
+				// `height` are CSS properties in Chrome, and a presentation attribute supplies them
+				// from the AUTHOR origin — so reverting throws the geometry away and every flattened
+				// `<path>` collapses to zero size. Measured on a review widget: 140 of 140 paths
+				// painted nothing, leaving carousel arrows as empty outlined boxes. Origin paints 96
+				// of 143 there; excluding SVG restores 92 of 140, i.e. parity within render drift.
+				//
+				// The leak this reset exists to stop still has to be stopped, and on `<svg>` it is a
+				// page reset setting `display:block` (which stacks a star row vertically). Undo just
+				// that handful of properties instead of everything. Both rules are `:where()`,
+				// specificity 0, and are emitted before the shadow's own CSS, so the component still
+				// wins wherever it has an opinion.
+				const reset =
+					`${hostSel} *:where(:not([data-sl],[data-sl] *,svg,svg *)){all:revert}\n` +
+					`${hostSel} svg:where(:not([data-sl] *)){display:revert;vertical-align:revert;max-width:revert;width:revert;height:revert}\n`;
 				const style = document.createElement('style');
 				style.textContent = reset + css;
 				host.appendChild(style);
@@ -1005,10 +1019,10 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		document.querySelectorAll(removeSelectors.join(', ')).forEach((el) => el.remove());
 	}
 
-	// LAST, deliberately: every step above keys on attributes this can remove
+	// Late, deliberately: every step above keys on attributes this can remove
 	// (`stripBlockedResources` reads src/href/srcset, a `removeSelectors` entry can match on
-	// an attribute selector), so stripping earlier would change what they match. Nothing below
-	// reads the DOM again — the next statement serializes it.
+	// an attribute selector), so stripping earlier would change what they match. Only
+	// `pruneUnmatchedCss` runs after, and it must — it reads the finished DOM.
 	for (const rule of opts.removeAttributes ?? []) {
 		let elements: NodeListOf<Element>;
 		try {
@@ -1043,6 +1057,135 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 					el.removeAttribute(attr.name);
 				}
 			}
+		}
+	}
+
+	if (opts.pruneUnmatchedCss) {
+		// Drop style rules that cannot match anything in the finished document. Runs LAST: every
+		// step above changes what exists to be matched, and `validate()` has already guaranteed
+		// `stripScripts`, so nothing can re-introduce a match after serialization.
+		//
+		// Probe policy is one-directional — every uncertainty keeps the rule:
+		//  * state pseudo-classes and pseudo-elements are stripped before probing, so `.x:hover`
+		//    is judged on whether `.x` exists. Structural pseudos (`:not()`, `:nth-child()`) go
+		//    too, which only widens the probe.
+		//  * a selector whose quoted value contains a `:` is kept untested. The strip is a regex,
+		//    and `[style*="display: block"]` is exactly the shape it would cut through the middle
+		//    of. Quotes alone are not the hazard — a colon inside them is — and the distinction
+		//    matters: on the flagged page 2,674 of 3,589 selectors carry a quote (the reviews
+		//    widget keys on `[data-bv-show="…"]`), while just 2 have a colon inside one.
+		//  * anything that fails to parse once rewritten — a `:is(a` left by splitting a selector
+		//    list on a comma inside parentheses, say — throws, and a throw keeps the rule.
+		const PSEUDO = /::?[a-zA-Z-]+(\([^()]*\))?/g;
+		const colonInsideQuotes = (selector: string): boolean => {
+			let quote = '';
+			let escaped = false;
+			for (let i = 0; i < selector.length; i++) {
+				const ch = selector[i];
+				// A backslash escape has to be honoured, or `[data-msg="a\"b:c"]` looks like it closes
+				// its quote at the escaped `"`. The `:c` would then read as a pseudo-class, the strip
+				// would rewrite the selector to one that matches nothing, and a rule that DOES match
+				// would be pruned — the one direction this pass must never fail in.
+				if (escaped) {
+					escaped = false;
+					continue;
+				}
+				if (ch === '\\') {
+					escaped = true;
+					continue;
+				}
+				if (quote) {
+					if (ch === quote) quote = '';
+					else if (ch === ':') return true;
+				} else if (ch === '"' || ch === "'") quote = ch;
+			}
+			return false;
+		};
+		// The DOM does not change while this runs — only CSS rules are deleted — so a probe's
+		// answer depends on the probe string alone and is worth remembering. Sheets repeat
+		// selectors heavily (a utility framework, a component library scoped to one host), and on
+		// the flagged page this turns 4,387 `querySelector` calls into 3,144: 114ms down to 81ms.
+		// DOM that reaches the serialized output but that `document.querySelector` cannot see, and
+		// so would make a live rule look dead. `<template>` content is never rendered and, with
+		// scripts stripped, can never be cloned — but it is still serialized. `<noscript>` content
+		// is inert TEXT while scripting is enabled (which it is, in here), yet becomes live DOM for
+		// any consumer that renders the snapshot with scripting off. Probe both.
+		//
+		// Not on this list, deliberately: iframes and shadow roots. CSS does not cross a browsing
+		// context, so a parent sheet never styles iframe content — and that content is not in the
+		// output anyway (`outerHTML` emits the tag, not the loaded document). Open shadow roots are
+		// already inlined into the light DOM by `flattenShadowDom` above, and closed ones reach
+		// neither the flatten nor the serializer.
+		const extraRoots: ParentNode[] = [];
+		for (const template of document.querySelectorAll('template')) extraRoots.push(template.content);
+		for (const noscript of document.querySelectorAll('noscript')) {
+			const markup = noscript.textContent ?? '';
+			if (markup.trim() === '') continue;
+			try {
+				extraRoots.push(new DOMParser().parseFromString(markup, 'text/html'));
+			} catch {
+				/* unparseable — the rules that target it simply stay, which is the safe direction */
+			}
+		}
+		const probed = new Map<string, boolean>();
+		const canEverMatch = (selectorText: string): boolean => {
+			for (const part of selectorText.split(',')) {
+				const one = part.trim();
+				if (one === '' || colonInsideQuotes(one)) return true;
+				const probe = one.replace(PSEUDO, '').trim();
+				if (probe === '') return true; // e.g. `::selection` — nothing left to test
+				const seen = probed.get(probe);
+				if (seen !== undefined) {
+					if (seen) return true;
+					continue;
+				}
+				let matched: boolean;
+				try {
+					matched = document.querySelector(probe) !== null;
+					// Only the rules the main document rejects pay for the extra roots, and those
+					// roots are small, so this costs nothing on a page without them.
+					if (!matched) matched = extraRoots.some((root) => root.querySelector(probe) !== null);
+				} catch {
+					matched = true; // unparseable once rewritten — never prune on a broken probe
+				}
+				probed.set(probe, matched);
+				if (matched) return true;
+			}
+			return false;
+		};
+		// Grouping rules (@media/@supports/@layer/@container/@scope) are recursed into but never
+		// deleted, even when emptied: an `@layer` block that disappears takes its position in the
+		// cascade order with it. An empty `@media(){}` husk costs a few bytes and risks nothing.
+		// @keyframes and @font-face have no selectorText and no `cssRules`, so both fall through
+		// untouched — an animation whose rules were pruned still resolves its keyframes.
+		const pruneRules = (owner: { deleteRule(index: number): void }, rules: CSSRuleList): void => {
+			// Backwards: deleteRule re-indexes everything after it.
+			for (let i = rules.length - 1; i >= 0; i--) {
+				const rule = rules[i];
+				// `instanceof` rather than duck-typing on `selectorText`/`cssRules`: CSSKeyframesRule
+				// also has `cssRules` but its `deleteRule` takes a keyframe selector, not an index,
+				// and CSSPageRule also has `selectorText`. Neither is one of these two types.
+				if (rule instanceof CSSStyleRule) {
+					if (!canEverMatch(rule.selectorText)) owner.deleteRule(i);
+					continue;
+				}
+				if (rule instanceof CSSGroupingRule) pruneRules(rule, rule.cssRules);
+			}
+		};
+		for (const style of document.querySelectorAll('style')) {
+			const sheet = style.sheet;
+			if (!sheet) continue;
+			let css = '';
+			try {
+				pruneRules(sheet, sheet.cssRules);
+				for (const rule of sheet.cssRules) css += rule.cssText;
+			} catch {
+				continue; // unreadable (cross-origin) — leave the source text alone
+			}
+			// Same guard as `minifyInlineCss`: never grow the document. A sheet whose rules were
+			// all pruned legitimately serializes to '' — the CSSOM itself says nothing is left —
+			// so an empty result is written, unlike there, where it would mean a parse failure.
+			if (css.length < style.textContent!.length) style.textContent = css;
 		}
 	}
 

@@ -121,6 +121,7 @@ include what you change:
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
 		"minifyInlineCss": false, // re-emit inline <style> from the CSSOM (see below)
+		"pruneUnmatchedCss": false, // drop style rules that match nothing (needs stripScripts)
 		"removeSelectors": ["link[rel=import]", "link[as=script]", "script#__NEXT_DATA__"],
 		// strip named attributes off matching elements, last, before serialization
 		"removeAttributes": [
@@ -166,6 +167,188 @@ A sheet is left untouched when it has no readable rules (a cross-origin sheet th
 when re-emission comes back empty, or when the result would not be smaller — so the pass never grows
 a document and is idempotent.
 
+### `paintParity` — validating that the snapshot still puts ink on screen
+
+`renderAudit` compares the DOM: elements, attributes, text, computed styles. A whole class of
+fidelity bug is invisible to it, because the markup stays perfect and only the _rendering_ is lost —
+see the SVG-geometry case below, where 140 of 140 paths painted nothing while every DOM-level check
+stayed green. `renderAudit` is structurally unable to catch that class at all: its ground-truth
+state deliberately inherits the deployed post-processing, so a post-processing loss is applied to
+both sides and cancels out.
+
+`paintParity` keys on **paint identity** instead — the thing that makes a mark, named by something
+stable enough to match across two independently rendered pages:
+
+| kind  | key                                                     |
+| ----- | ------------------------------------------------------- |
+| `geo` | an SVG shape's own `d` / `points` / geometry attributes |
+| `img` | the image's src basename                                |
+| `bg`  | the `url()` of a background image                       |
+| `txt` | the text string itself                                  |
+
+For every key present on **both** sides it compares rendered area. A key that paints at origin and
+has zero area in the snapshot is **lost ink** — regardless of whether its element, attributes and
+computed styles are all still present. Keys only one side has are counted and reported, never
+failed: that is ordinary content drift on a live site, and conflating the two is what makes naive
+pixel diffing useless here.
+
+```js
+import { paintParity } from '@harperfast/prerender-browser';
+
+const report = await paintParity({ url, base: deployedConfig, bypass });
+// report.lost      -> [{ key, kind, origin: '17.4x17.3', served: '0x0' }, …]
+// report.lostByKind-> { geo: 18, txt: 4 }
+// report.shared / originOnly / servedOnly
+```
+
+The reference is the **non-prerendered** page: JS running, hydrated, post-processing off. The
+snapshot is then loaded at the real URL (via the same `loadServed` path the audit uses) so relative
+references and same-origin subrequests resolve as they do for a crawler fetching the cached bytes.
+The inventory walk pierces open shadow roots deliberately — at origin a widget is often still
+encapsulated while the snapshot has it flattened, and a non-piercing walk returns a false zero for
+exactly the content most worth comparing.
+
+**Sampling, and why the two sides reduce differently.** Each side is sampled over a short window
+rather than at an instant, because carousels rotate, sliders transition and lazy images arrive. The
+reductions are deliberately opposite: the reference keeps each mark's _smallest_ showing (it counts
+as painting only if it painted in EVERY sample), the snapshot keeps its _largest_ (if it painted at
+any point, it is not lost). Getting this symmetric is worse than not sampling — reducing both by
+`max` inflates the reference as images load and manufactured 258 false losses on a real homepage.
+
+**Read `gained` alongside `lost`.** Rotating content shows up as a symmetric pair: a hero carousel
+caught on slide A at origin and slide B in the snapshot reports N lost and N gained, all in the same
+region. That is a slide swap, not a defect — verified on a real homepage, where the six "lost"
+shapes render identically on both sides when measured directly. A genuine loss is asymmetric: ink
+disappears and nothing comparable appears in its place.
+
+Two things to hold onto when using it. Marks below `minArea` (default 4px²) at origin are ignored, so
+a hairline that rounds to zero on one side is not a finding. And when you test a detector like this,
+**verify the fault is present in your broken fixture first** — an early version of this check
+reported "no regression" because the fixture it was given had never actually been broken.
+
+### `flattenShadowDom` and SVG geometry
+
+The inbound reset that keeps page CSS out of flattened shadow content is deliberately **not**
+`all: revert` on everything. `d`, `cx`, `cy`, `r`, `x`, `y`, `width` and `height` are CSS properties
+in Chrome, and a presentation attribute supplies them from the _author_ origin — so a blanket revert
+throws the geometry away and every flattened `<path>` collapses to zero size. Measured on a review
+widget: **140 of 140 paths painted nothing**, leaving carousel arrows as empty outlined boxes while
+the DOM, the text and every byte-level check looked perfect.
+
+So SVG subtrees are excluded from the blanket reset, and the leak that reset exists to stop — a page
+`svg { display: block }` that stacks a star row vertically — is closed by reverting just `display`
+(plus `vertical-align`/`max-width`/`width`/`height`, the rest of what a Preflight-style reset sets on
+`<svg>`). Both rules are `:where()`, specificity 0, emitted before the component's own CSS, so the
+component still wins wherever it has an opinion. Origin paints 96 of 143 paths on that page; this
+restores 92 of 140 — parity within render drift.
+
+This is worth knowing generally: **a fidelity bug can be invisible to DOM- and text-level checks.**
+Nothing was missing from the markup; the geometry was gone.
+
+### `postProcess.pruneUnmatchedCss` — dropping CSS the page cannot use
+
+Deletes every style rule whose selector cannot match anything in the finished document. Off by
+default.
+
+A prerendered snapshot ships the whole site's CSS but only one page's DOM, so most of what it
+carries is unreachable. On a review-heavy product page **74% of the style rules matched nothing** —
+533 KB of a 1.89 MB document. This is by some distance the largest remaining lever on these pages,
+and unlike the others it removes nothing the browser would have used.
+
+**Why it is safe here specifically.** A pruned rule is only inert if the DOM can never change
+again, and what guarantees that is `stripScripts`: with no code left in the snapshot, nothing can
+add a class or an element after serialization. So the two options are coupled, and enabling this
+one without `stripScripts` is rejected by config validation rather than silently accepted.
+
+**Every uncertainty resolves toward keeping a rule.** The probe strips pseudo-classes and
+pseudo-elements before testing, so `.card:hover` is judged on whether `.card` exists — state is
+never the reason a rule is dropped. Structural pseudos (`:not()`, `:nth-child()`) come off too,
+which only widens the probe. Anything that fails to parse once rewritten is kept untested, and in a
+selector list one matching part keeps the whole rule.
+
+The one case the rewrite cannot handle is a **colon inside a quoted value** —
+`[style*="display: block"]` is the shape a regex strip would cut through the middle of — so those
+selectors are kept untested. Note the distinction: quotes alone are not the hazard. On the flagged
+page 2,674 of 3,589 selectors carry a quote (the reviews widget keys on `[data-bv-show="…"]`) while
+only 2 have a colon inside one, so bailing on every quoted selector would have forfeited most of
+the saving for nothing.
+
+**DOM the probe cannot see is accounted for explicitly**, because anything hidden from
+`document.querySelector` would make a live rule look dead. There are four such places and they are
+not equivalent:
+
+- **`<template>` content** is serialized into the output but is not in the document tree, and
+  **`<noscript>` content** is inert _text_ while scripting is enabled (which it is, inside the
+  renderer) yet becomes live DOM for any consumer that renders the snapshot with scripting off.
+  Both are probed: template fragments directly, noscript markup via `DOMParser`. Only rules the
+  main document rejects pay for this, and these roots are tiny.
+- **iframes** need nothing. CSS does not cross a browsing context, so a parent sheet never styles
+  iframe content; that content is not in the output either (`outerHTML` emits the tag, not the
+  loaded document); and the iframe's own stylesheets are never touched, since the pass runs in the
+  main frame. Rules styling the `<iframe>` _element_ match in the parent DOM as usual.
+- **shadow roots** need nothing. `flattenShadowDom` has already inlined open roots into the light
+  DOM by the time this runs, so their content is visible to the probe; closed roots reach neither
+  the flatten nor the serializer, so nothing that references them is in the output.
+
+**Grouping rules are recursed into but never deleted**, even when emptied — an `@layer` block that
+disappears takes its position in the cascade order with it, and an empty `@media (…) {}` husk costs
+a few bytes and risks nothing. `@keyframes` and `@font-face` are never touched, so an animation
+whose rules were pruned still resolves.
+
+**Verification.** Six real pages (product/category/homepage × desktop/mobile) were each rendered
+twice through the full pipeline — this flag off, then on, nothing else changed — and both outputs
+loaded with their real stylesheets. On five of the six, every computed property and every
+`getBoundingClientRect` was identical across all elements, with text, link and image counts and
+page height unchanged.
+
+| page             | before  | after   |        |
+| ---------------- | ------- | ------- | ------ |
+| product desktop  | 1.89 MB | 1.39 MB | −26.6% |
+| product mobile   | 1.61 MB | 1.14 MB | −29.4% |
+| category desktop | 0.88 MB | 0.80 MB | −8.9%  |
+| category mobile  | 0.75 MB | 0.67 MB | −10.4% |
+| homepage desktop | 0.74 MB | 0.65 MB | −12.1% |
+| homepage mobile  | 0.57 MB | 0.48 MB | −15.7% |
+
+The sixth (homepage desktop) genuinely renders differently, and the honest size of it is: **1.01% of
+fold pixels change** (13,150 px, 2,880 of them strongly), and the page ends 1 px shorter. That is
+larger than a "rounding" story suggests, so here is what it actually is.
+
+Every underlying difference is float precision. Across 3,845 elements, **exactly one** moves 1 px or
+more — an inline `<a>` whose x shifts 5.5 px as accumulated sub-pixel width changes re-break a line.
+The other 1,785 differences are all sub-1px: `width`/`height` by ~0.01 px, nine `font-size` values
+resolving `9.99999px` where they had `10px`, `text-decoration` thickness `1px` → `0.999999px`. Text
+shifted a fraction of a pixel re-rasterises, and re-rasterised glyph edges are what those 13,150
+pixels are.
+
+**No rule is lost.** The font-size rules matching the drifting elements are identical in number and
+in text on both sides; they are `em`-chained (`0.625em`, `0.83333em`), and Chrome accumulates float
+error through an `em` chain differently depending on how computed-style objects are shared —
+deleting rules changes that sharing.
+
+Attribution was checked rather than assumed, because the obvious guess is wrong. Re-serialising the
+sheets is **not** what does it: a control that re-rendered the same stored page with the flag _off_ —
+same extra pass, same re-emission, nothing deleted — differs by **0 px**. Deleting the rules is what
+moves the pixels. Worth knowing before blaming `minifyInlineCss` for a similar drift elsewhere.
+
+Two measurement traps are worth recording, because both manufacture false alarms here.
+Computed-style property **enumeration order is not stable** — Chrome lists custom properties in
+stylesheet-registration order, so deleting rules reshuffles the enumeration while every value stays
+identical; compare sorted, or all 9,991 elements look changed when none are. And a page's own
+**running animations** (a `shimmer` placeholder) make computed values time-dependent, so freeze them
+before sampling.
+
+**Cost.** The pass is bounded by `querySelector` calls, and answers are memoized per probe string
+(the DOM cannot change while it runs), so repeated selectors are paid for once — on the flagged
+product page, 4,387 probes collapse to 3,144 calls.
+
+Measured in place rather than in a bench: the `postProcess` phase goes from **119–128 ms to
+229–230 ms**, so the pass costs about **105 ms** on a ~10 s render — roughly 1%. (An earlier
+figure of 81 ms came from a `setContent` bench and understated it; take the in-place number.)
+Lighter pages are 5–12 ms. A rightmost-compound prefilter would roughly halve it, but it was
+measured disagreeing with the DOM on two rules and rejected: a pass that deletes CSS has to be
+exactly right, not nearly right.
+
 ### `postProcess.removeAttributes` — dropping dead hydration payloads
 
 Removes named attributes from the elements a selector matches. Empty by default (a no-op, so
@@ -181,13 +364,15 @@ makes it pure dead weight. Removing the _element_ is not an option — the wrapp
 server-rendered content — so the attribute is the unit, hence this option rather than
 `removeSelectors`.
 
-Size is not the only stake. Search engines apply a size budget per document (Bing documents a
-125 KB soft limit past which a page "risks not being fully cached"), so dead bytes _ahead of_ the
-content push real content past the cut. Measured on one retail site's product page: the payload was
-12% of the document, and the `<h1>` sat at byte 161,454 — outside that budget. Stripping the
-hydration attributes moved it to 80,125, with the number of links inside the first 125 KB going
-from 19 to 43, and the extracted text, links, images, `ld+json`, headings, classes and inline
-styles all byte-identical to the untouched render.
+Size is not the only stake. Search engines apply a size budget per document — Bing's webmaster
+tools flag "HTML size is too long" against a documented **soft limit of 1 MB**, "used for guidance
+to ensure all content & links are available in the page source to be cached by the crawler". Take
+that number from the tool's own issue text; third-party write-ups quote much smaller figures that
+do not match it. Measured on one retail site's product page, the hydration payload was **83% of an
+8.06 MB document** — 27 island wrappers, five of them each carrying a near-identical 1.4 MB
+payload, the same dataset serialized five times over. Stripping those attributes took the document
+to 1.37 MB, with the extracted text, links, images, `ld+json`, headings, classes and inline styles
+all byte-identical to the untouched render.
 
 Attribute names match case-insensitively. A trailing `*` makes an entry a prefix match
 (`data-aue-*` covers `data-aue-prop`, `data-aue-label`, …), which keeps a rule from drifting as a
