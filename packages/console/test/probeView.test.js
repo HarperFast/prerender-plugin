@@ -554,3 +554,58 @@ test('a pass that never backed off shows no pacing row at all', async () => {
 	});
 	assert.doesNotMatch(draw(ctx).textContent, /normal — still backed off/);
 });
+
+// ---- continuous mode -----------------------------------------------------------------------------
+
+/**
+ * The plugin tags the MODE into `sweep.armedInterval` (the literal 'continuous' instead of a
+ * number), because that field is what its scheduler compares to decide whether to re-arm. Every
+ * console reader of it therefore has to branch — and the failure of not branching is silent:
+ * `duration('continuous')` renders nonsense rather than throwing, so the cadence line would read
+ * as a broken number on exactly the deployments running the new mode.
+ */
+const CONTINUOUS = {
+	...STATUS,
+	mode: 'continuous',
+	sweep: { ...STATUS.sweep, armedInterval: 'continuous', cycleTarget: 12 * HOUR, sliceSize: 237_000 },
+};
+
+test('continuous mode reports its target and slice, not a formatted interval', async () => {
+	const ctx = await ready({ status: CONTINUOUS });
+	const text = draw(ctx).textContent;
+	assert.match(text, /continuous/);
+	assert.match(text, /target 12h/);
+	assert.match(text, /237.0k rows|237,000 rows/);
+	assert.doesNotMatch(text, /every continuous/, 'the interval phrasing must not be applied to the mode string');
+});
+
+test('continuous mode with no measured slice says it is measuring, not nothing', async () => {
+	// The first cycle after a restart runs at the rate ceiling because it has no denominator yet.
+	// Rendering that as a blank would make "measuring" indistinguishable from "behind".
+	const ctx = await ready({
+		status: { ...CONTINUOUS, sweep: { ...CONTINUOUS.sweep, sliceSize: null } },
+	});
+	assert.match(draw(ctx).textContent, /measuring the slice/);
+});
+
+test('interval mode still reads as an interval — the new branch must not capture it', async () => {
+	const ctx = await ready();
+	const text = draw(ctx).textContent;
+	assert.match(text, /every 1d/);
+	assert.doesNotMatch(text, /continuous/);
+});
+
+test('the cycle-behind tile is hidden in interval mode, where there is no target to miss', async () => {
+	// A permanent zero would read as "meeting the target" on a deployment that has none.
+	assert.ok(!tile(await ready(), 'Cycle behind'));
+});
+
+test('continuous mode shows cycle-behind, and warns when the ceiling cannot meet the target', async () => {
+	const ctx = await ready({
+		status: CONTINUOUS,
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('cycle_behind', 4, 35)] },
+	});
+	const behind = tile(ctx, 'Cycle behind');
+	assert.ok(behind, 'expected the tile in continuous mode');
+	assert.match(behind.textContent, /140/);
+});

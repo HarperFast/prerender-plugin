@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/prerender-console",
-	"version": "0.10.0",
+	"version": "0.11.0",
 	"type": "module",
 	"description": "Standalone Harper component serving the prerender management console UI, proxying to a prerender deployment's /prerender_admin API",
 	"license": "Apache-2.0",

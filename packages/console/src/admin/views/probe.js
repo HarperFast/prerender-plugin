@@ -55,6 +55,27 @@ const RANGES = [
 ];
 
 /**
+ * How the sweep is scheduled, in one phrase.
+ *
+ * `armedInterval` is a number in interval mode and the literal 'continuous' in continuous mode —
+ * the plugin tags the mode into that field precisely so a mode switch re-arms — so every reader
+ * of it has to branch. Formatting the string through `duration()` would print nonsense, which is
+ * the failure this helper exists to make impossible rather than to remember not to cause.
+ *
+ * Continuous mode reports the TARGET and, when a cycle has measured it, the slice being paced
+ * against. A missing slice is not a blank: it means no cycle has finished counting yet, which is
+ * exactly when the pass runs flat out at the rate ceiling — worth saying, because "measuring" and
+ * "behind" look identical from the outside otherwise.
+ */
+const sweepCadence = (sweep) => {
+	if (!sweep?.armedInterval) return null;
+	if (sweep.armedInterval !== 'continuous') return `every ${duration(sweep.armedInterval)}`;
+	const target = sweep.cycleTarget ? `target ${duration(sweep.cycleTarget)}` : 'no target';
+	const slice = sweep.sliceSize ? `${num(sweep.sliceSize)} rows` : 'measuring the slice';
+	return `continuous · ${target} · ${slice}`;
+};
+
+/**
  * The pass counters, in the order a pass produces them.
  *
  * THESE ARE SERIES SIDE BY SIDE, NOT A PARTITION, and three of them are deliberately not
@@ -196,7 +217,7 @@ function state(ctx, status) {
 
 	body.push(
 		kv([
-			['Sweep', status.sweep?.armedInterval ? `every ${duration(status.sweep.armedInterval)}` : 'not armed'],
+			['Sweep', sweepCadence(status.sweep) ?? 'not armed'],
 			[
 				'Canary',
 				status.canary?.armedInterval
@@ -338,12 +359,14 @@ function drift(ctx) {
 	const throttled = totalOf('throttled');
 	const unreadable = totalOf('unreadable');
 	const pageMismatch = totalOf('page_mismatch');
+	const cycleBehind = totalOf('cycle_behind');
 	// What a mismatch MEANS depends on the run mode, which is the status's fact and not the
 	// window's: armed, each one was hard-expired the moment it was seen (a detection rate); dry,
 	// nothing expires them, so the same disagreement is re-reported every pass (a standing gauge).
 	// The merged status is dry only when EVERY node is, which is exactly the reading wanted here —
 	// one live node means mismatches are being acted on somewhere.
 	const mismatchesStanding = pageMismatch > 0 && ctx.data.status?.dryRun !== false;
+	const continuous = ctx.data.status?.mode === 'continuous';
 
 	// Compared = probes that had a baseline to compare against. Seeds and failures had none, so
 	// including them in the denominator understates the drift rate by exactly the seeding backlog.
@@ -470,6 +493,16 @@ function drift(ctx) {
 				}),
 				// Inside `failed`, and the sub-label says so — the two tiles are not additive.
 				stat('Throttled', fmtCount(throttled), 'origin pushback — inside Failed', { warn: throttled > 0 }),
+				// CONTINUOUS MODE ONLY, and hidden otherwise rather than shown as a permanent zero:
+				// in interval mode no cycle target exists, so a zero here would read as "meeting the
+				// target" when there is no target to meet. This is the mode's whole accountability
+				// signal — the explicit replacement for a pass that used to overrun and be skipped
+				// with nothing anywhere saying so.
+				continuous
+					? stat('Cycle behind', fmtCount(cycleBehind), 'batches that wanted more than the rate ceiling', {
+							warn: cycleBehind > 0,
+						})
+					: null,
 				stat('Canary trips', fmtCount(trips), `${fmtCount(invalidated)} recorded an invalidation`),
 			]),
 			keys.length
@@ -625,7 +658,7 @@ function sweepCard(ctx, status) {
 
 	return card('Rolling sweep', {
 		head: [
-			sweep.armedInterval ? pill(`every ${duration(sweep.armedInterval)}`, 'ok') : pill('not armed', 'bad'),
+			sweepCadence(sweep) ? pill(sweepCadence(sweep), 'ok') : pill('not armed', 'bad'),
 			sweep.running &&
 				pill(sweep.runningOn?.length ? `running on ${sweep.runningOn.join(', ')}` : 'running now', 'info'),
 			spacer(),

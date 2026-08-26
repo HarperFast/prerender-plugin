@@ -263,6 +263,10 @@ test('defaultConfig returns fresh deep copies (no shared references)', () => {
 test('secret and restart paths are what the schema declares', () => {
 	assert.deepEqual(secretPaths().sort(), ['origin.securityToken.value', 'peerRescue.token', 'renderNow.token']);
 	assert.deepEqual(restartPaths().sort(), [
+		// The event-loop histogram is constructed once per worker, so its resolution is fixed for
+		// the life of the process — and it is the reading's noise floor, so changing it live would
+		// silently re-scale every lag reading the governor has already acted on.
+		'changeProbe.load.resolution',
 		// Boot-shaped like the reconciler's: they only shape the probe scheduler's first arming.
 		'changeProbe.startDelay',
 		'changeProbe.startJitter',

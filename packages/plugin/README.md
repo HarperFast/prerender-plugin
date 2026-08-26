@@ -1204,10 +1204,29 @@ lost baseline just re-seeds). A probe that observes a different signature expire
 pages and files every device row due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
 content actually changes:
 
-- The **sweep** (`sweepInterval`) walks each node's owned slice of the registry, paced
-  (`ratePerSecond`, `concurrency`), catching continuous per-URL drift — availability sell-through,
-  item-level price moves. Re-renders per pass are capped (`maxTriggersPerSweep`); changes past the
-  cap stay detected and retry next pass.
+- The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
+  `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price
+  moves. Re-renders per pass are capped (`maxTriggersPerSweep`); changes past the cap stay detected
+  and retry next pass. It runs in one of two modes (`mode`):
+  - **`interval`** (default) fires a discrete pass every `sweepInterval`. This asks you to solve
+    `sliceSize / effectiveRate <= sweepInterval` by hand and re-solve it whenever the corpus grows
+    or the origin has a bad week — and when the answer stops holding, the overrunning pass is
+    skipped and the cadence silently doubles. It also idles: a slice taking 9h of a 12h interval
+    leaves 3h probing nothing, so detection latency is bimodal.
+  - **`continuous`** never stops walking and never re-solves anything. It derives its rate every
+    batch from remaining rows over remaining budget (`cycleTarget`, the worst-case detection
+    latency you are asking for), so corpus growth and time lost to backoff are absorbed as they
+    happen. `ratePerSecond` stays a hard ceiling — a target that cannot be met at it is reported as
+    `probe_cycle_behind` rather than silently missed. The first cycle after a restart runs at the
+    ceiling because pacing needs a slice size and only a completed cycle knows it.
+
+  Both modes back off when the **origin** pushes back (`backoffMax`, `Retry-After`,
+  `abortAfterDistress`). `load.*` adds a second, independent governor for when the **node itself**
+  is struggling — event-loop delay past `load.lagThreshold` widens the same pacing window. It is
+  off by default and belongs with `continuous`: in interval mode a governor that slows the pass can
+  push it past `sweepInterval`, where it is silently skipped, so a safety feature would degrade the
+  cadence invisibly. Continuous mode has no window to overrun.
+
 - The **canary** (`canary.*`) probes a small fixed cohort every few minutes, because commerce price
   does not drift — it **steps at promotional events**, most of a catalog at once, which a sample of
   hundreds sees within minutes. On a trip, the rule's `invalidateScope` records a **bulk
