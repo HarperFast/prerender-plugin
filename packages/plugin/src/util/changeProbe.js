@@ -50,7 +50,7 @@ import { gunzipSync } from 'node:zlib';
 import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
-import { epochMsOf, currentMinuteMs } from './time.js';
+import { epochMsOf, currentMinuteMs, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { writeSchedules } from './renderSchedule.js';
@@ -60,6 +60,7 @@ import { cacheKeysOf } from '../resources/Target.js';
 import { walkUrlRange } from './urlWalk.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
+import { isPassRunning, publishProbeState, readProbeState } from './probeState.js';
 import {
 	compileProbeRules,
 	buildProbeRequest,
@@ -742,6 +743,62 @@ const logPass = (stats, kind, dryRun) => {
 	}
 };
 
+// A running pass is considered dead if its heartbeat stops for this long. Generous next to the
+// heartbeat interval below (which is what a healthy pass writes), tight enough that a crashed
+// worker does not disable the probe until the process restarts.
+const PASS_STALE_MS = 5 * MINUTE;
+// How often a running pass touches the row. Cheap — one node-local write — but not free, so it
+// is throttled well below the flush cadence rather than written per batch.
+const HEARTBEAT_MS = 30 * SECOND;
+
+/**
+ * Claim a pass for this node, or refuse because one is already live.
+ *
+ * NODE-WIDE, which is the whole point: the guard this replaces read module state on whichever
+ * worker answered the request, so it was ~always false and the console's "Run sweep" could start
+ * a second full-rate sweep alongside the scheduled one. See util/probeState.js.
+ */
+const claimPass = async (kind) => {
+	const row = await readProbeState();
+	if (isPassRunning(row, kind, PASS_STALE_MS)) {
+		return {
+			ok: false,
+			reason: `a probe ${kind} is already running on this node`,
+			lastRun: row?.[kind]?.lastRun ?? null,
+		};
+	}
+	const startedAt = Date.now();
+	// Claim first, keeping the previous result readable while the new pass runs — the backlog
+	// snapshotter's shape, for the same reason: an operator looking mid-pass should see the last
+	// finished one, not a hole.
+	await publishProbeState({
+		[kind]: { running: true, startedAt, heartbeatAt: startedAt, lastRun: row?.[kind]?.lastRun ?? null },
+	});
+	return { ok: true, startedAt };
+};
+
+/** Release the claim and publish the finished record. */
+const releasePass = async (kind, startedAt, lastRun) => {
+	await publishProbeState({ [kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun } });
+};
+
+/**
+ * A throttled heartbeat for a pass in flight.
+ *
+ * A sweep runs for hours, so its liveness cannot be inferred from `startedAt` — that is exactly
+ * the case where a fixed staleness window has to choose between wedging on a crash and letting a
+ * healthy pass be stolen from itself. Touching the row as it goes removes the choice.
+ */
+const makeHeartbeat = (kind, startedAt) => {
+	let last = startedAt;
+	return async (progress) => {
+		const now = Date.now();
+		if (now - last < HEARTBEAT_MS) return;
+		last = now;
+		await publishProbeState({ [kind]: { running: true, startedAt, heartbeatAt: now, progress: progress ?? null } });
+	};
+};
+
 // ---- the two passes ----------------------------------------------------------------------------
 
 let sweepRunning = false;
@@ -807,15 +864,32 @@ const passLimits = (dryRunOverride, { paced = false } = {}) => ({
  * would leave exactly the pages the trip was about carrying pre-change signatures.
  */
 export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false } = {}) => {
+	// Worker-local guard, and it is SET SYNCHRONOUSLY on purpose. The node-wide claim below is an
+	// await, so setting the flag after it would leave a window in which two concurrent calls on
+	// this worker both pass this check before either marks itself running — a re-entrancy race
+	// that the local flag exists precisely to prevent, and which a test caught.
 	if (sweepRunning) return { skipped: true, reason: 'a probe sweep is already running', lastRun: lastSweep };
 	sweepRunning = true;
-	const startedAt = Date.now();
+
+	// Then the NODE-WIDE claim. The local flag alone was the whole guard, which meant a manual run
+	// on any worker but 0 could not see the scheduled sweep and started a second one at full rate
+	// against the origin. See util/probeState.js.
+	const claim = await claimPass('sweep');
+	if (!claim.ok) {
+		// Release the local flag we optimistically took — the `finally` below is not reached from
+		// here, so failing to reset it would wedge this worker's sweep for the life of the process.
+		sweepRunning = false;
+		return { skipped: true, reason: claim.reason, lastRun: claim.lastRun ?? lastSweep };
+	}
+	const startedAt = claim.startedAt;
+	const beat = makeHeartbeat('sweep', startedAt);
 	const limits = passLimits(dryRun, { paced: true });
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		let unreadable = 0;
+		let yields = 0;
 		const stats = await runProbePass({
 			rows: walkTargets(config.changeProbe.chunkSize, () => {
 				unreadable++;
@@ -829,6 +903,17 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			write: writeSignature,
 			trigger: triggerRevalidate,
 			...limits,
+			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
+			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
+			// failure is swallowed by `publishProbeState`: a pass must never die of bookkeeping.
+			onYield: async () => {
+				await yieldNow();
+				// A LOCAL counter, not `stats` — `const stats = await runProbePass({...})` leaves
+				// `stats` in the temporal dead zone while this callback runs, so touching it here
+				// throws a ReferenceError rather than reading undefined.
+				yields++;
+				await beat({ examinedApprox: yields * YIELD_EVERY });
+			},
 			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
 			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
 			// A pending reseed cancels too: the pass that must stand down for it is this one.
@@ -845,6 +930,9 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		// corpus several times smaller than the real one and coast through the budget having
 		// covered a slice of it.
 		if (!stats.aborted) measuredSliceSize = stats.matched;
+		// The slice estimate and the cohorts both moved; republish so a reader sees what the NEXT
+		// cycle will pace against rather than the previous cycle's denominator.
+		if (!stats.aborted) void publishScheduler();
 		emitStats(stats, 'sweep');
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
@@ -856,9 +944,14 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			finishedAt: Date.now(),
 			error: null,
 		};
+		await releasePass('sweep', startedAt, lastSweep);
 		return lastSweep;
 	} catch (e) {
 		lastSweep = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		// A THROWN pass must release too, and must publish the error: leaving the claim held would
+		// wedge the probe until the heartbeat went stale, and dropping the error would make a
+		// crashed pass indistinguishable from one that never ran.
+		await releasePass('sweep', startedAt, lastSweep);
 		throw e;
 	} finally {
 		sweepRunning = false;
@@ -1001,8 +1094,14 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 	if (canaryRunning) {
 		return { skipped: true, reason: 'a canary pass is already running' };
 	}
+	// Synchronous, for the re-entrancy reason documented on the sweep above.
 	canaryRunning = true;
-	const startedAt = Date.now();
+	const claim = await claimPass('canary');
+	if (!claim.ok) {
+		canaryRunning = false;
+		return { skipped: true, reason: claim.reason, lastRun: claim.lastRun ?? lastCanary };
+	}
+	const startedAt = claim.startedAt;
 	const limits = passLimits(dryRun);
 	const canary = config.changeProbe.canary;
 	try {
@@ -1055,9 +1154,11 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 			finishedAt: Date.now(),
 			error: null,
 		};
+		await releasePass('canary', startedAt, lastCanary);
 		return lastCanary;
 	} catch (e) {
 		lastCanary = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		await releasePass('canary', startedAt, lastCanary);
 		throw e;
 	} finally {
 		canaryRunning = false;
@@ -1066,47 +1167,82 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 
 // ---- scheduler + admin surface -------------------------------------------------------------
 
+// Worker-local, and NOT the run guard — see `isPassRunningOnNode` for that. Kept because the
+// re-entrancy check inside each pass is legitimately local: it stops one worker starting a
+// second copy of its own pass, which is cheaper to answer than a table read.
 export const isProbeSweepRunning = () => sweepRunning;
 export const isProbeCanaryRunning = () => canaryRunning;
 
-export const changeProbeStatus = () => ({
-	enabled: config.changeProbe.enabled,
-	dryRun: config.changeProbe.dryRun,
-	node: server.hostname,
-	ownerScopeNote: 'Probes only the URLs this node owns; every node sweeps its own slice.',
-	rules: probeRules().map((rule) => ({
-		label: rule.label,
-		pathPattern: rule.patternSource,
-		source: rule.source,
-		invalidateScope: rule.invalidateScope,
-	})),
-	mode: config.changeProbe.mode,
-	sweep: {
-		running: sweepRunning,
-		lastRun: lastSweep,
-		// In continuous mode this reads 'continuous' rather than a number: there is no gap between
-		// passes to arm, and reporting a stale `sweepInterval` here would describe a schedule that
-		// is not running.
-		armedInterval: armedSweep,
-		// What continuous pacing is working against. `sliceSize: null` means no completed cycle has
-		// measured it yet, which is precisely when the pass runs at the ceiling — worth being able
-		// to see, because "at the ceiling" otherwise looks identical to "behind".
-		cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : null,
-		sliceSize: isContinuous() ? measuredSliceSize : null,
-	},
-	load: {
-		enabled: config.changeProbe.load.enabled,
-		lagThreshold: config.changeProbe.load.lagThreshold,
-		backoffMax: config.changeProbe.load.backoffMax,
-		monitor: loopLagMonitorState(),
-	},
-	canary: {
-		running: canaryRunning,
-		lastRun: lastCanary,
-		armedInterval: armedCanary,
-		cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
-	},
-});
+/**
+ * What this NODE's probe is doing — readable from any worker.
+ *
+ * Everything scheduler- or pass-shaped comes from the shared row rather than module state, for
+ * the reason util/probeState.js documents: the scheduler arms on worker 0 and this endpoint is
+ * served by all sixteen, so module state made the answer a coin flip that reported a healthy
+ * probe as switched off ~95% of the time.
+ *
+ * `enabled`, `dryRun`, `rules`, `mode` and the `load` SETTINGS stay config-derived on purpose —
+ * config is identical on every worker, so reading them locally is correct and costs no round
+ * trip. `load.monitor` is the exception inside that block: it is the histogram's own liveness,
+ * which only exists on the worker that armed it, so it is published like the rest.
+ *
+ * A missing row reads as "nothing has run on this node yet", NOT as "disarmed": `armedInterval`
+ * is null either way, but `stateAvailable: false` tells the console the difference between a
+ * probe that has not started and a state read that failed.
+ */
+export const changeProbeStatus = async () => {
+	const row = await readProbeState();
+	const sweep = row?.sweep ?? null;
+	const canary = row?.canary ?? null;
+	const scheduler = row?.scheduler ?? null;
+
+	return {
+		enabled: config.changeProbe.enabled,
+		dryRun: config.changeProbe.dryRun,
+		node: server.hostname,
+		ownerScopeNote: 'Probes only the URLs this node owns; every node sweeps its own slice.',
+		rules: probeRules().map((rule) => ({
+			label: rule.label,
+			pathPattern: rule.patternSource,
+			source: rule.source,
+			invalidateScope: rule.invalidateScope,
+		})),
+		mode: config.changeProbe.mode,
+		// False only when the row could not be read at all. Distinguishes "the probe has not run
+		// here" from "this answer is not trustworthy", which the old shape could not express.
+		stateAvailable: row !== null,
+		stateUpdatedAt: row?.updatedAt ?? null,
+		sweep: {
+			running: isPassRunning(row, 'sweep', PASS_STALE_MS),
+			lastRun: sweep?.lastRun ?? null,
+			progress: sweep?.running ? (sweep.progress ?? null) : null,
+			// In continuous mode this reads 'continuous' rather than a number: there is no gap
+			// between passes to arm, and reporting a stale `sweepInterval` here would describe a
+			// schedule that is not running.
+			armedInterval: scheduler?.armedSweep ?? null,
+			// What continuous pacing is working against. `sliceSize: null` means no completed cycle
+			// has measured it yet, which is precisely when the pass runs at the ceiling — worth
+			// being able to see, because "at the ceiling" otherwise looks identical to "behind".
+			cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : null,
+			sliceSize: isContinuous() ? (scheduler?.sliceSize ?? null) : null,
+		},
+		load: {
+			enabled: config.changeProbe.load.enabled,
+			lagThreshold: config.changeProbe.load.lagThreshold,
+			backoffMax: config.changeProbe.load.backoffMax,
+			monitor: scheduler?.loadMonitor ?? { running: false, unavailable: false },
+		},
+		canary: {
+			running: isPassRunning(row, 'canary', PASS_STALE_MS),
+			lastRun: canary?.lastRun ?? null,
+			armedInterval: scheduler?.armedCanary ?? null,
+			cohortSizes: scheduler?.cohortSizes ?? {},
+		},
+	};
+};
+
+/** Node-wide, for the admin POST guard. Replaces the worker-local `isProbe*Running` pair. */
+export const isPassRunningOnNode = async (kind) => isPassRunning(await readProbeState(), kind, PASS_STALE_MS);
 
 let schedulerStarted = false;
 let bootTimer = null;
@@ -1114,6 +1250,22 @@ let sweepTimer = null;
 let canaryTimer = null;
 let armedSweep = null;
 let armedCanary = null;
+
+/**
+ * Publish the scheduler's own view: what is armed, the cohort sizes, the measured slice, and the
+ * lag monitor's liveness. Only worker 0 ever calls this — it is the only worker that HAS these —
+ * and every other worker reads the result.
+ */
+const publishScheduler = () =>
+	publishProbeState({
+		scheduler: {
+			armedSweep,
+			armedCanary,
+			sliceSize: measuredSliceSize,
+			cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
+			loadMonitor: loopLagMonitorState(),
+		},
+	});
 
 const clearProbeTimers = () => {
 	if (bootTimer) clearTimeout(bootTimer);
@@ -1226,6 +1378,11 @@ const syncProbeTimers = () => {
 	clearProbeTimers();
 	armedSweep = desiredSweep;
 	armedCanary = desiredCanary;
+	// Publish the arming so every worker can report it. Without this the endpoint answers
+	// `armedInterval: null` from 15 of 16 workers, which reads as "disarmed" rather than as
+	// "asked the wrong worker". Deliberately not awaited: `syncProbeTimers` runs on the config
+	// apply path and must not become async for a write whose failure is already logged.
+	void publishScheduler();
 	if (desiredSweep === null) return;
 
 	if (wasEnabled) {
@@ -1255,6 +1412,10 @@ export function startChangeProbeScheduler() {
 	syncProbeTimers();
 	onConfigApplied(syncProbeTimers);
 }
+
+/** Tests only — the shared row, which is what a DIFFERENT worker would see. */
+export const readProbeStateForTest = readProbeState;
+export const publishProbeStateForTest = publishProbeState;
 
 /** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
 export const __passLimitsForTest = passLimits;
