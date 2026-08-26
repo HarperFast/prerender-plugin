@@ -58,6 +58,8 @@ import { recordInvalidation, isScopeResolvable } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { walkUrlRange } from './urlWalk.js';
+import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
+import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
 import {
 	compileProbeRules,
 	buildProbeRequest,
@@ -142,7 +144,11 @@ const newStats = () => ({
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
 	pageMismatch: 0, // cached page disagreed with the origin (pageCheck) — OVERLAYS the buckets above, which count by signature outcome alone
 	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
-	throttleLevel: 1, // pacing-window multiplier when the pass ended; 1 means never backed off
+	throttleLevel: 1, // ORIGIN pacing-window multiplier when the pass ended; 1 means never backed off
+	loadThrottleLevel: 1, // LOCAL (event-loop) multiplier when the pass ended; 1 means never backed off
+	loopLagMs: null, // last p95 loop-lag excess read, or null when the governor is off/blind
+	pacedRate: null, // requests/sec the last batch was paced at (continuous mode's derived rate)
+	behindBatches: 0, // batches that wanted more than ratePerSecond to hit the cycle target
 	abortedOnDistress: false, // the pass gave up because the origin refused everything
 	failureSamples: [], // first few failures, for the admin surface
 });
@@ -242,8 +248,6 @@ const parseRetryAfter = (value) => {
 	return Math.max(0, Math.min(at - Date.now(), MAX_RETRY_AFTER_MS));
 };
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
-// setTimeout stores its delay as a signed 32-bit int; past this it fires after 1ms instead.
-const MAX_TIMER_MS = 2147483647;
 
 const probeOnce = async (rule, url) => {
 	const request = buildProbeRequest(rule, url);
@@ -438,6 +442,16 @@ export const runProbePass = async ({
 	reprobeAfter = 0,
 	backoffMax = 1,
 	abortAfterDistress = 0,
+	// Continuous mode. `cycleTarget` is the wall-clock budget for covering `sliceSize` matched
+	// rows; with either absent the pass paces at `ratePerSecond` exactly as it always has, which
+	// is what makes interval mode bit-identical rather than merely equivalent.
+	cycleTarget = 0,
+	sliceSize = 0,
+	// The local-load governor. `readLag` returns excess-over-floor ms or null (see util/loopLag.js);
+	// the default reads nothing, so the governor is inert unless a caller wires it up.
+	readLag = () => null,
+	lagThreshold = 0,
+	loadBackoffMax = 1,
 } = {}) => {
 	const stats = newStats();
 	const batch = [];
@@ -449,6 +463,13 @@ export const runProbePass = async ({
 	let distressStreak = 0;
 	let batchDistress = 0;
 	let retryAfterMs = 0;
+
+	// The local-pressure state, tracked SEPARATELY from `throttle` even though the two multiply
+	// into one window. The operator question when a pass is crawling is always which of the two
+	// is responsible — an origin shedding load and a node losing its event loop to the serve path
+	// share a symptom and nothing else — and a single merged multiplier cannot answer it.
+	let loadThrottle = 1;
+	const passStarted = now();
 
 	const processOne = async ({ row, rule }) => {
 		// Read BEFORE the probe now (it used to read after, to skip the read on a failed probe).
@@ -566,27 +587,57 @@ export const runProbePass = async ({
 	// response to pressure immediate and the recovery slow — the asymmetry a backoff needs.
 	const flush = async () => {
 		if (!batch.length) return;
+		const batchSize = batch.length;
 		const started = now();
 		batchDistress = 0;
 		retryAfterMs = 0;
 		await Promise.all(batch.map(processOne));
 
-		if (batchDistress > 0) throttle = Math.min(throttle * 2, Math.max(1, backoffMax));
-		else if (throttle > 1) throttle = Math.max(1, throttle / 2);
+		throttle = stepBackoff(throttle, batchDistress > 0, backoffMax);
 		stats.throttleLevel = throttle;
 
-		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000 * throttle;
+		// The LOCAL governor, read once per batch — the same cadence the origin governor moves on,
+		// so the two stay comparable, and cheap enough at that cadence to be unconditional when
+		// armed (a histogram read plus a reset, no JS-side accumulation).
+		//
+		// An ABSENT reading is not a quiet reading. No monitor, or a window that caught no
+		// samples, means the governor has nothing to say and must leave the multiplier where it
+		// is; treating null as zero would let a probe that cannot measure the loop conclude the
+		// loop is fine and accelerate into a node it is already hurting.
+		if (lagThreshold > 0) {
+			const lag = readLag();
+			if (lag) {
+				loadThrottle = stepBackoff(loadThrottle, lag.p95 > lagThreshold, loadBackoffMax);
+				stats.loopLagMs = lag.p95;
+			}
+		}
+		stats.loadThrottleLevel = loadThrottle;
+
+		// CONTINUOUS MODE: the rate is derived, every batch, from how far behind the walk actually
+		// is — remaining rows over remaining budget — instead of being a constant the operator
+		// re-solves by hand whenever the corpus grows. `ratePerSecond` stays a hard ceiling, so a
+		// target that cannot be met is simply not met and SAYS SO (`behind`), which is the
+		// observable replacement for the interval model's silently-skipped pass.
+		const cycleRate = cycleRatePerSecond({
+			sliceSize,
+			done: stats.matched,
+			elapsed: now() - passStarted,
+			cycleTarget,
+		});
+		const { rate, behind } = pacedRate({ ratePerSecond, cycleRate });
+		if (behind && cycleTarget > 0 && sliceSize > 0) stats.behindBatches++;
+		stats.pacedRate = rate;
+
 		const elapsed = now() - started;
 		batch.length = 0;
-		// An explicit Retry-After outranks our own arithmetic: the origin named a number, and
-		// guessing under it is exactly the disrespect the header exists to prevent.
-		//
-		// Clamped to setTimeout's signed-32-bit delay, which the schema caps individual options at
-		// but cannot cap here: this window is the PRODUCT of `concurrency`, `1/ratePerSecond` and
-		// `throttle`, so three separately-sane values can multiply past the limit — and past it
-		// `setTimeout` fires after 1ms instead of waiting, turning the backoff into a hot loop
-		// against an origin already asking for room.
-		const wait = Math.min(Math.max(window - elapsed, retryAfterMs), MAX_TIMER_MS);
+		const wait = batchPause({
+			batchSize,
+			rate,
+			originThrottle: throttle,
+			loadThrottle,
+			elapsed,
+			retryAfterMs,
+		});
 		if (wait > 0) await pause(wait);
 	};
 
@@ -668,6 +719,7 @@ const emitStats = (stats, kind) => {
 		metrics.changeProbe(stats.fresh, 'fresh');
 		metrics.changeProbe(stats.throttled, 'throttled');
 		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
+		metrics.changeProbe(stats.behindBatches, 'cycle_behind');
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -697,13 +749,54 @@ let canaryRunning = false;
 let lastSweep = null;
 let lastCanary = null;
 
-const passLimits = (dryRunOverride) => ({
+/**
+ * The slice size the last COMPLETED cycle measured, per node-process.
+ *
+ * Continuous pacing needs a denominator and nothing knows it up front: how many of this node's
+ * rows a rule matches is discovered by walking. So a finished cycle publishes what it counted and
+ * the next one paces against it. Only a cycle that ran to completion may update it — an aborted or
+ * interrupted pass walked part of the key range, and its `matched` is a fraction that would make
+ * the next cycle pace to a corpus several times smaller than the real one and finish far early.
+ *
+ * Reset to null (not to a guess) whenever the estimate could be stale for a reason other than
+ * corpus drift, so the mode falls back to "run at the ceiling and measure" rather than to a
+ * confident wrong number.
+ */
+let measuredSliceSize = null;
+
+const isContinuous = () => config.changeProbe.mode === 'continuous';
+
+/**
+ * Shared pass limits.
+ *
+ * `paced` is NOT a convenience flag — CYCLE PACING BELONGS TO THE SWEEP ALONE. The sweep covers
+ * this node's whole slice against a wall-clock budget; the canary re-probes a small fixed cohort
+ * on a deliberately fast cadence and has no budget to spread anything across. Handing it the
+ * sweep's `cycleTarget`/`sliceSize` would pace a 500-URL cohort as though it were 237k rows —
+ * `remaining/left` computed from the sweep's denominator — so the mass-change detector would run
+ * at whatever rate the SWEEP's schedule implied, slowing as the cycle target lengthened. The
+ * canary's whole value is that it is fast, and nothing in its own numbers would have shown it
+ * had stopped being so.
+ */
+const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 	dryRun: typeof dryRunOverride === 'boolean' ? dryRunOverride : config.changeProbe.dryRun,
 	maxTriggers: config.changeProbe.maxTriggersPerSweep,
 	concurrency: config.changeProbe.concurrency,
 	ratePerSecond: config.changeProbe.ratePerSecond,
 	backoffMax: config.changeProbe.backoffMax,
 	abortAfterDistress: config.changeProbe.abortAfterDistress,
+	// Continuous pacing, or zeroes — and zeroes are what make interval mode bit-identical: with
+	// no cycle target `cycleRatePerSecond` is never consulted and the window is the one
+	// `ratePerSecond` has always implied.
+	cycleTarget: paced && isContinuous() ? config.changeProbe.cycleTarget : 0,
+	sliceSize: paced && isContinuous() ? (measuredSliceSize ?? 0) : 0,
+	// The local governor is opt-in and orthogonal to the mode, so it is read from config rather
+	// than gated on `isContinuous()` — an operator who wants it in interval mode has been warned
+	// by the option's own documentation and may have reasons. It applies to the canary too: a
+	// congested node is congested whichever pass is running on it.
+	lagThreshold: config.changeProbe.load.enabled ? config.changeProbe.load.lagThreshold : 0,
+	loadBackoffMax: config.changeProbe.load.backoffMax,
+	readLag: readLoopLagMs,
 });
 
 /**
@@ -717,7 +810,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 	if (sweepRunning) return { skipped: true, reason: 'a probe sweep is already running', lastRun: lastSweep };
 	sweepRunning = true;
 	const startedAt = Date.now();
-	const limits = passLimits(dryRun);
+	const limits = passLimits(dryRun, { paced: true });
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
@@ -746,6 +839,12 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		// An interrupted pass keeps the OLD cohorts — a partial walk's sample covers only the key
 		// range it reached, and the chained reseed rebuilds them properly.
 		if (!stats.aborted) cohorts = new Map(rules.map((rule) => [rule.label, collectors.get(rule.label).list()]));
+		// Publish the denominator for the NEXT cycle's pacing, from completed passes only. A pass
+		// that aborted (cancelled, or the distress breaker) covered part of the key range, so its
+		// `matched` is a fraction — pacing the next cycle against it would derive a rate for a
+		// corpus several times smaller than the real one and coast through the budget having
+		// covered a slice of it.
+		if (!stats.aborted) measuredSliceSize = stats.matched;
 		emitStats(stats, 'sweep');
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
@@ -981,7 +1080,26 @@ export const changeProbeStatus = () => ({
 		source: rule.source,
 		invalidateScope: rule.invalidateScope,
 	})),
-	sweep: { running: sweepRunning, lastRun: lastSweep, armedInterval: armedSweep },
+	mode: config.changeProbe.mode,
+	sweep: {
+		running: sweepRunning,
+		lastRun: lastSweep,
+		// In continuous mode this reads 'continuous' rather than a number: there is no gap between
+		// passes to arm, and reporting a stale `sweepInterval` here would describe a schedule that
+		// is not running.
+		armedInterval: armedSweep,
+		// What continuous pacing is working against. `sliceSize: null` means no completed cycle has
+		// measured it yet, which is precisely when the pass runs at the ceiling — worth being able
+		// to see, because "at the ceiling" otherwise looks identical to "behind".
+		cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : null,
+		sliceSize: isContinuous() ? measuredSliceSize : null,
+	},
+	load: {
+		enabled: config.changeProbe.load.enabled,
+		lagThreshold: config.changeProbe.load.lagThreshold,
+		backoffMax: config.changeProbe.load.backoffMax,
+		monitor: loopLagMonitorState(),
+	},
 	canary: {
 		running: canaryRunning,
 		lastRun: lastCanary,
@@ -1002,11 +1120,78 @@ const clearProbeTimers = () => {
 	if (sweepTimer) clearInterval(sweepTimer);
 	if (canaryTimer) clearInterval(canaryTimer);
 	bootTimer = sweepTimer = canaryTimer = null;
+	stopContinuousLoop();
+};
+
+/**
+ * CONTINUOUS MODE's driver: finish a cycle, start the next one, forever.
+ *
+ * A `setInterval` is the wrong instrument here and not merely an unused one. It fires on a fixed
+ * clock regardless of whether the previous pass finished, which is exactly how the interval model
+ * loses passes: the tick lands mid-walk, `runProbeSweepOnce` sees `sweepRunning` and returns
+ * `{skipped: true}`, and the cadence halves with only a debug line to show for it. A loop that
+ * awaits its own pass cannot overlap and cannot skip — the next cycle starts when there IS a next
+ * cycle.
+ *
+ * `continuousStop` is the cancellation handle. The loop re-reads config every iteration, so a
+ * mode change, a disable, or a rule change stops it at the next cycle boundary; the in-flight
+ * pass finishes under the rules it started with, which is the same contract config changes have
+ * everywhere else here.
+ *
+ * THE FLOOR IS NOT OPTIONAL. A cycle can complete almost instantly — an empty registry, a node
+ * that owns nothing, every rule unmatched, or a `cycleTarget` already satisfied — and without a
+ * floor those cases spin the loop as fast as the event loop allows, which is a busy-wait wearing
+ * a scheduler's clothes. One second is far below any real cadence and far above a hot loop.
+ */
+const CONTINUOUS_FLOOR_MS = 1000;
+// A cycle can also decline to start at all: a canary trip chains a RESEED sweep from
+// `runProbeSweepOnce`'s finally block without awaiting it, so the loop's next call returns
+// `{skipped: true}` immediately and keeps doing so for as long as that reseed runs — hours, on a
+// large slice. Polling that at the 1s floor is thousands of pointless wake-ups; this is the
+// interval for "something else holds the sweep", which is a wait, not a cycle boundary.
+const CONTINUOUS_BUSY_MS = 30_000;
+let continuousStop = null;
+
+const runContinuousLoop = async () => {
+	const stop = { cancelled: false };
+	continuousStop = stop;
+	while (!stop.cancelled) {
+		const startedAt = Date.now();
+		let skipped = false;
+		try {
+			// try/catch around `await` is correct and intentional: awaiting a rejected promise
+			// throws into this frame. The alternative (`.catch()`) would swallow the rejection and
+			// let the loop treat a crashed pass as a completed cycle.
+			const result = await runProbeSweepOnce();
+			skipped = result?.skipped === true;
+		} catch (e) {
+			logger.error(e);
+		}
+		if (stop.cancelled) break;
+		// Config is re-read here rather than captured: this is the boundary a live change acts on.
+		if (!config.changeProbe.enabled || !isContinuous() || probeRules().length === 0) break;
+		const floor = skipped ? CONTINUOUS_BUSY_MS : CONTINUOUS_FLOOR_MS;
+		const spent = Date.now() - startedAt;
+		if (spent < floor) await sleep(floor - spent);
+	}
+	if (continuousStop === stop) continuousStop = null;
+};
+
+const stopContinuousLoop = () => {
+	if (continuousStop) continuousStop.cancelled = true;
+	continuousStop = null;
 };
 
 const armIntervals = () => {
-	sweepTimer = setInterval(() => runProbeSweepOnce().catch((e) => logger.error(e)), armedSweep);
-	sweepTimer.unref?.();
+	// The SWEEP is what the mode changes. The CANARY is orthogonal to it — a fixed cohort on a
+	// fast fixed cadence, whose whole job is to notice a mass change between sweeps — so it arms
+	// identically either way. An early return here would have silently disabled the mass-change
+	// detector for anyone who turned continuous mode on.
+	if (isContinuous()) void runContinuousLoop();
+	else {
+		sweepTimer = setInterval(() => runProbeSweepOnce().catch((e) => logger.error(e)), armedSweep);
+		sweepTimer.unref?.();
+	}
 	if (armedCanary) {
 		canaryTimer = setInterval(() => runProbeCanaryOnce().catch((e) => logger.error(e)), armedCanary);
 		canaryTimer.unref?.();
@@ -1016,9 +1201,26 @@ const armIntervals = () => {
 // (Re)arm to match config; enable/disable and both intervals are live (reconcile's shape).
 const syncProbeTimers = () => {
 	const enabled = config.changeProbe.enabled && probeRules().length > 0;
-	const desiredSweep = enabled ? config.changeProbe.sweepInterval : null;
+	// In continuous mode there is no interval to arm, but the armed value still has to CHANGE when
+	// the mode does, or `syncProbeTimers` sees no difference and leaves an interval timer running
+	// after a switch to continuous (and vice versa). Tagging the mode into the key is what makes
+	// the mode itself live.
+	const desiredSweep = !enabled ? null : isContinuous() ? 'continuous' : config.changeProbe.sweepInterval;
 	const desiredCanary = enabled && config.changeProbe.canary.interval > 0 ? config.changeProbe.canary.interval : null;
 	if (desiredSweep === armedSweep && desiredCanary === armedCanary) return;
+
+	// A mode switch must re-measure. The slice estimate is not wrong across a switch, but it can
+	// be arbitrarily stale (interval mode never maintains it), and pacing a fresh continuous cycle
+	// against a stale denominator is exactly the confident-wrong-number case `measuredSliceSize`
+	// is documented to avoid. Dropping it costs one ceiling-rate cycle and buys a correct one.
+	if (desiredSweep !== armedSweep) measuredSliceSize = null;
+
+	// The histogram follows the governor switch. Sampling costs nothing measurable, but a monitor
+	// left enabled after the governor is turned off is a live handle nothing reads — and one left
+	// UNSTARTED after it is turned on is a governor that silently never fires, which is the more
+	// expensive mistake of the two.
+	if (enabled && config.changeProbe.load.enabled) startLoopLagMonitor(config.changeProbe.load.resolution);
+	else stopLoopLagMonitor();
 
 	const wasEnabled = armedSweep !== null;
 	clearProbeTimers();
@@ -1054,6 +1256,9 @@ export function startChangeProbeScheduler() {
 	onConfigApplied(syncProbeTimers);
 }
 
+/** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
+export const __passLimitsForTest = passLimits;
+
 /** Tests only — module state that outlives a beforeEach. */
 export const resetChangeProbeState = () => {
 	clearProbeTimers();
@@ -1067,4 +1272,6 @@ export const resetChangeProbeState = () => {
 	compiledRules = null;
 	compiledFrom = undefined;
 	lastUnsupportedWarnAt = 0;
+	measuredSliceSize = null;
+	stopLoopLagMonitor();
 };

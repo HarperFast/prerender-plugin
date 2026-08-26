@@ -417,7 +417,7 @@ export const METRICS = Object.freeze({
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
-			'per finished probe pass (probe_*), per gated cacheable miss (discovery_gated)',
+			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -507,6 +507,7 @@ export const METRICS = Object.freeze({
 					'probe_throttled',
 					'probe_unreadable',
 					'probe_page_mismatch',
+					'probe_cycle_behind',
 					'discovery_gated',
 				],
 				description:

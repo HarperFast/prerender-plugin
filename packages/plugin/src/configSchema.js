@@ -873,13 +873,54 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'  label            optional name for logs and the admin surface.',
 				{ itemType: 'object' }
 			),
-			sweepInterval: option(DAY, 'How often each node walks its slice of the registry probing every matched URL.', {
-				unit: 'ms',
-				min: MINUTE,
-				// setInterval stores its delay as a signed 32-bit int; past this it fires immediately
-				// and the sweep hot-loops (the page.blobReadBudgetMs lesson).
-				max: 2147483647,
-			}),
+			mode: option(
+				'interval',
+				'How the sweep is scheduled.\n\n' +
+					'"interval" (default) fires a discrete pass every `sweepInterval`. That model asks the ' +
+					'operator to solve `sliceSize / effectiveRate <= sweepInterval` BY HAND, and to re-solve ' +
+					'it every time the corpus grows or the origin has a bad week — because when the answer ' +
+					'stops holding, the overrunning pass is simply skipped (`sweepRunning` is still set) and ' +
+					'the cadence silently doubles with nothing in metrics saying so. It also idles: a slice ' +
+					'that takes 9h of a 12h interval leaves 3h in which nothing is probed at all, so ' +
+					'detection latency is bimodal rather than uniform.\n\n' +
+					'"continuous" never stops walking and never re-solves anything: it derives its rate each ' +
+					'batch from remaining rows over remaining budget (`cycleTarget`), so corpus growth and ' +
+					'time lost to backoff are absorbed as they happen. `ratePerSecond` stays a hard ceiling. ' +
+					'A target that cannot be met at the ceiling is reported (`probe_cycle_behind`) rather ' +
+					'than silently missed — which is the whole point of the mode.\n\n' +
+					'Switching is safe in both directions and takes effect on the next config apply; a pass ' +
+					'in flight finishes under the rules it started with.',
+				{ enum: ['interval', 'continuous'] }
+			),
+			sweepInterval: option(
+				DAY,
+				'How often each node walks its slice of the registry probing every matched URL. ' +
+					'INTERVAL MODE ONLY — ignored when `mode` is "continuous", where `cycleTarget` sets the ' +
+					'cadence and there is no gap between passes to schedule.',
+				{
+					unit: 'ms',
+					min: MINUTE,
+					// setInterval stores its delay as a signed 32-bit int; past this it fires immediately
+					// and the sweep hot-loops (the page.blobReadBudgetMs lesson).
+					max: 2147483647,
+				}
+			),
+			cycleTarget: option(
+				DAY,
+				'CONTINUOUS MODE ONLY: the wall-clock budget for covering every owned, matched URL once — ' +
+					'i.e. the worst-case detection latency you are asking for. The pass paces itself to land ' +
+					'on it: remaining rows over remaining budget, recomputed every batch.\n\n' +
+					'This is a TARGET, never a licence. `ratePerSecond` is the ceiling agreed with whoever ' +
+					'runs the origin and is never exceeded to hit a target, so an unreachable one is missed ' +
+					'openly — every batch that wants more than the ceiling counts a `probe_cycle_behind`, and ' +
+					'a sustained count means the corpus has outgrown its agreed rate and wants a longer ' +
+					'target or a conversation about the ceiling.\n\n' +
+					'THE FIRST CYCLE AFTER A RESTART RUNS AT THE CEILING. Pacing needs a denominator and the ' +
+					'slice size is only known once a cycle has finished counting it; a cycle target cannot be ' +
+					'honoured against an unknown corpus, and guessing one would pace to a fiction. So the ' +
+					'first cycle measures, and every cycle after it paces.',
+				{ unit: 'ms', min: MINUTE }
+			),
 			ratePerSecond: option(
 				10,
 				'Sustained probe-request ceiling per node. THE ORIGIN-PROTECTION KNOB: probe endpoints are ' +
@@ -918,6 +959,54 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'explicit `Retry-After` outranks the computed wait. At the default the probe can slow ' +
 					'itself to ~1/64th of its configured rate before giving up. 1 disables backoff.',
 				{ min: 1 }
+			),
+			load: group(
+				'The LOCAL-load governor: slow the probe when the node it runs ON is struggling, not just ' +
+					'when the origin it probes is.\n\n' +
+					'The origin backoff cannot see this class of trouble at all. A node losing its event loop ' +
+					'to the serve path returns no 429s and no timeouts, so the probe reads a perfectly healthy ' +
+					'origin and holds its configured rate straight through the congestion it is adding to. ' +
+					'That is survivable for a bounded pass that ends; it is not for a continuous one that ' +
+					'never does, which is why this exists and why it belongs with `mode: continuous`.\n\n' +
+					'OFF BY DEFAULT, AND DELIBERATELY SO IN INTERVAL MODE. In interval mode a governor that ' +
+					'slows the pass can push it past `sweepInterval`, where it is silently skipped and the ' +
+					'cadence halves — so a safety feature would degrade the cadence invisibly. Continuous ' +
+					'mode has no window to overrun: a slowdown just shows up as `probe_cycle_behind`. Turn ' +
+					'this on there.',
+				{
+					enabled: option(false, 'Master switch for the local governor. Off = the lag is never read.'),
+					lagThreshold: option(
+						50,
+						'p95 event-loop delay ABOVE the sampling floor, over one batch, past which the pacing ' +
+							'window widens (and under which it recovers). The floor is subtracted for you — the ' +
+							'raw histogram reads back at roughly its own resolution on a completely idle loop, so ' +
+							'a threshold compared against the raw number would be resolution-dependent and trip on ' +
+							'an idle node (see util/loopLag.js). Measured for calibration: an idle worker reads ' +
+							'~1ms of excess; one held in 40ms synchronous blocks reads ~41ms. The default sits ' +
+							'well clear of idle noise and well under the multi-second native stalls that actually ' +
+							'hurt the serve path.\n\n' +
+							'p95 rather than mean ON PURPOSE: what costs a served request is the tail — one long ' +
+							'synchronous call — and a mean over one batch dilutes exactly that into nothing.',
+						{ unit: 'ms', min: 1 }
+					),
+					backoffMax: option(
+						8,
+						'How far local pressure alone may stretch the pacing window, as a multiple. Lower than ' +
+							'the origin `backoffMax` (64) because the failure modes are not comparable: an origin ' +
+							'shedding load wants to be left alone almost entirely, whereas a busy node still has ' +
+							'to make progress on the corpus — a probe that stalls out completely stops bounding ' +
+							'staleness, which is a different way to serve wrong prices. 1 disables the governor ' +
+							'while still reading the lag (useful for sizing the threshold before arming it).',
+						{ min: 1 }
+					),
+					resolution: option(
+						10,
+						'Sampling resolution of the event-loop histogram. Also its noise floor, which is why it ' +
+							'is subtracted from every reading. Finer resolution samples more often for a slightly ' +
+							'tighter floor; there is little reason to move it.',
+						{ unit: 'ms', min: 1, max: 1000, scope: 'restart' }
+					),
+				}
 			),
 			abortAfterDistress: option(
 				50,

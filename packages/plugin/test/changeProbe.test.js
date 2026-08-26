@@ -897,3 +897,251 @@ test('writeSignature: patch for an existing row (claim untouched unless cleared)
 	assert.equal(calls.put[0].rowFields.url, URL_A);
 	assert.equal(calls.put[0].rowFields.pageSignature, null, 'a created row starts with no claim');
 });
+
+// ---- continuous pacing + the local-load governor ------------------------------------------------
+
+/**
+ * A pass harness that RECORDS the pauses instead of taking them, with a controllable clock.
+ * The pacing is entirely arithmetic on elapsed time, so a fake clock makes it exactly testable —
+ * and the properties below are the ones that decide whether a continuous probe is safe to leave
+ * running: that the origin ceiling is never exceeded, that being behind is reported rather than
+ * silently absorbed, and that a governor which cannot measure does not throttle on a guess.
+ */
+const runPaced = async ({ rows, answers = {}, clockStep = 0, ...overrides }) => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const pauses = [];
+	let clock = 0;
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			clock += clockStep;
+			return answers[url] ?? 'sig';
+		},
+		read: async () => null,
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: true,
+		maxTriggers: 1000,
+		concurrency: 2,
+		ratePerSecond: 10,
+		now: () => clock,
+		pause: async (ms) => {
+			pauses.push(ms);
+			clock += ms;
+		},
+		...overrides,
+	});
+	return { stats, pauses };
+};
+
+const urls = (n) => Array.from({ length: n }, (_, i) => ({ url: `https://x.test/product/prd-${i}` }));
+
+test('interval mode is unchanged: no cycle target means the old ratePerSecond window, exactly', async () => {
+	// The guarantee that makes this shippable to a live, hand-tuned deployment. 2 rows per batch
+	// at 10/s is a 200ms window, and nothing about continuous mode may alter it.
+	const { pauses } = await runPaced({ rows: urls(4), cycleTarget: 0, sliceSize: 0 });
+	assert.deepEqual(pauses, [200, 200]);
+});
+
+test('continuous: a reachable cycle target paces UNDER the origin ceiling', async () => {
+	// 100 rows in 100s wants 1/s; the ceiling is 10/s, so the target governs and the pass slows
+	// to spread the slice across the budget instead of finishing early and idling.
+	const { pauses } = await runPaced({
+		rows: urls(4),
+		cycleTarget: 100_000,
+		sliceSize: 100,
+		ratePerSecond: 10,
+	});
+	assert.ok(
+		pauses.every((ms) => ms > 200),
+		`expected pauses wider than the 200ms ceiling window, got ${JSON.stringify(pauses)}`
+	);
+});
+
+test('continuous: an unreachable target is CLAMPED to the ceiling and reported, never honoured', async () => {
+	// 1,000,000 rows in 1s is not a schedule anyone can keep. The ceiling is the number agreed
+	// with whoever runs the origin, so the target loses — and says so, which is the whole reason
+	// this mode exists instead of the silently-skipped pass.
+	const { stats, pauses } = await runPaced({
+		rows: urls(4),
+		cycleTarget: 1000,
+		sliceSize: 1_000_000,
+		ratePerSecond: 10,
+	});
+	assert.deepEqual(pauses, [200, 200], 'paced at the ceiling, not faster');
+	assert.equal(stats.behindBatches, 2, 'and every such batch is counted for probe_cycle_behind');
+});
+
+test('continuous: no slice estimate runs at the ceiling WITHOUT reporting a missed target', async () => {
+	// The first cycle after a restart. It is measuring, not failing — counting it as behind would
+	// make every restart look like a capacity problem.
+	const { stats, pauses } = await runPaced({ rows: urls(4), cycleTarget: 100_000, sliceSize: 0 });
+	assert.deepEqual(pauses, [200, 200]);
+	assert.equal(stats.behindBatches, 0);
+});
+
+test('the load governor widens the window when the loop is lagging', async () => {
+	const { pauses } = await runPaced({
+		rows: urls(4),
+		lagThreshold: 50,
+		loadBackoffMax: 8,
+		readLag: () => ({ mean: 200, p95: 200, samples: 10 }),
+	});
+	// First batch doubles to 2x, second to 4x, off the 200ms base window.
+	assert.deepEqual(pauses, [400, 800]);
+});
+
+test('the load governor RECOVERS by halves once the loop is quiet again', async () => {
+	let call = 0;
+	const { pauses } = await runPaced({
+		rows: urls(8),
+		lagThreshold: 50,
+		loadBackoffMax: 8,
+		// Two lagging batches, then quiet.
+		readLag: () => ({ mean: 0, p95: call++ < 2 ? 200 : 1, samples: 10 }),
+	});
+	assert.deepEqual(pauses, [400, 800, 400, 200], 'up by doubles, down by halves');
+});
+
+test('a lag reading of NULL leaves the governor where it is — absent is not quiet', async () => {
+	// No monitor, or a window that caught no samples. A probe that cannot measure the loop must
+	// not conclude the loop is fine and accelerate into a node it is already hurting.
+	const { pauses, stats } = await runPaced({
+		rows: urls(4),
+		lagThreshold: 50,
+		loadBackoffMax: 8,
+		readLag: () => null,
+	});
+	assert.deepEqual(pauses, [200, 200], 'unchanged, not recovered');
+	assert.equal(stats.loopLagMs, null);
+});
+
+test('the governor is inert when disabled, and never reads the lag at all', async () => {
+	let reads = 0;
+	const { pauses } = await runPaced({
+		rows: urls(4),
+		lagThreshold: 0,
+		readLag: () => {
+			reads++;
+			return { mean: 999, p95: 999, samples: 10 };
+		},
+	});
+	assert.equal(reads, 0, 'a disabled governor must not even sample');
+	assert.deepEqual(pauses, [200, 200]);
+});
+
+test('both governors compound: a busy node probing a struggling origin backs off for both', async () => {
+	const { pauses } = await runPaced({
+		rows: urls(2),
+		ratePerSecond: 10,
+		backoffMax: 64,
+		lagThreshold: 50,
+		loadBackoffMax: 8,
+		readLag: () => ({ mean: 200, p95: 200, samples: 10 }),
+		// A pushback response drives the ORIGIN governor on the same batch. `distress` is the flag
+		// `isDistress` reads — `probeOnce` sets it on 429/502/503/504 and on connect/read timeouts.
+		probe: async () => {
+			const e = new Error('429 from the origin');
+			e.distress = true;
+			throw e;
+		},
+	});
+	// 200ms base * 2 (origin) * 2 (local) — independent causes, multiplied not maxed.
+	assert.deepEqual(pauses, [800]);
+});
+
+// ---- the scheduler: mode is a live option, and the canary is not collateral ----------------------
+
+/**
+ * `syncProbeTimers` is what makes `mode` switchable without a restart, and the interesting part
+ * is what it must NOT break on the way: the canary is a separate cadence with a separate job
+ * (mass change between sweeps), and an early return for continuous mode would have disabled the
+ * mass-change detector for everyone who turned the new mode on.
+ */
+const applyProbeConfig = async (changeProbeOptions) => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { rules: RULES_RAW, ...changeProbeOptions } });
+};
+
+test('scheduler: mode is live — switching re-arms rather than leaving the old driver running', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+
+	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 0, startJitter: 1 });
+	changeProbe.startChangeProbeScheduler();
+	assert.equal(changeProbe.probeTimerState().armedSweep, 60_000, 'interval mode arms the interval');
+
+	await applyProbeConfig({ enabled: true, mode: 'continuous', cycleTarget: 60_000, startDelay: 0, startJitter: 1 });
+	assert.equal(
+		changeProbe.probeTimerState().armedSweep,
+		'continuous',
+		'the armed value must CHANGE with the mode, or sync sees no difference and leaves the timer up'
+	);
+
+	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 0, startJitter: 1 });
+	assert.equal(changeProbe.probeTimerState().armedSweep, 60_000, 'and back');
+
+	t.mock.timers.reset();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('scheduler: the canary stays armed in continuous mode', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'continuous',
+		cycleTarget: 60_000,
+		canary: { interval: 30_000, count: 5 },
+		startDelay: 0,
+		startJitter: 1,
+	});
+	changeProbe.startChangeProbeScheduler();
+	assert.equal(changeProbe.probeTimerState().armedCanary, 30_000);
+
+	t.mock.timers.reset();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('scheduler: disabling stops the continuous driver, not just the interval timer', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+
+	await applyProbeConfig({ enabled: true, mode: 'continuous', cycleTarget: 60_000, startDelay: 0, startJitter: 1 });
+	changeProbe.startChangeProbeScheduler();
+	assert.equal(changeProbe.probeTimerState().armedSweep, 'continuous');
+
+	await applyProbeConfig({ enabled: false });
+	assert.equal(changeProbe.probeTimerState().armedSweep, null);
+
+	t.mock.timers.reset();
+});
+
+test('cycle pacing belongs to the SWEEP — the canary must never inherit the sweep’s budget', async () => {
+	// The canary re-probes a small fixed cohort on a deliberately fast cadence and has no budget
+	// to spread anything across. Given the sweep's `cycleTarget`/`sliceSize` it would compute
+	// `remaining/left` from the SWEEP's denominator and pace a 500-URL cohort as though it were
+	// the whole slice — slowing further the longer the cycle target gets. Nothing in the canary's
+	// own counters would show it had stopped being fast.
+	//
+	// Asserted on the limits builder both real callers share, so the split is pinned at its
+	// source rather than inferred from a pass's counters.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({
+		changeProbe: { enabled: true, mode: 'continuous', cycleTarget: 8 * 60 * 60 * 1000, rules: RULES_RAW },
+	});
+
+	const sweepLimits = changeProbe.__passLimitsForTest(undefined, { paced: true });
+	const canaryLimits = changeProbe.__passLimitsForTest(undefined);
+
+	assert.equal(sweepLimits.cycleTarget, 8 * 60 * 60 * 1000, 'the sweep paces to the cycle target');
+	assert.equal(canaryLimits.cycleTarget, 0, 'the canary does not');
+	assert.equal(canaryLimits.sliceSize, 0, 'and has no slice denominator to pace against');
+	// Everything else is shared — the fix must not have forked the limits wholesale.
+	assert.equal(canaryLimits.ratePerSecond, sweepLimits.ratePerSecond);
+	assert.equal(canaryLimits.concurrency, sweepLimits.concurrency);
+	assert.equal(canaryLimits.lagThreshold, sweepLimits.lagThreshold, 'a congested node is congested either way');
+
+	applyOptions({ changeProbe: { enabled: false } });
+});
