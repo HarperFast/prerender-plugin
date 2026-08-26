@@ -150,11 +150,18 @@ test('sitemap refresh scheduler starts/stops/re-schedules as the pin and time mo
 	// Pinning this node+worker at runtime arms the daily refresh — the change that used to
 	// require a full restart.
 	applyOptions({ sitemap: { node: 'node-1' } });
-	assert.equal(sitemapSchedulerState().armedKey, '12:00|America/New_York');
+	assert.equal(sitemapSchedulerState().armedKey, '12:00|America/New_York|86400000');
 
 	// Changing the refresh time re-schedules the pending run.
 	applyOptions({ sitemap: { node: 'node-1', refreshTime: '03:30', timezone: 'UTC' } });
-	assert.equal(sitemapSchedulerState().armedKey, '03:30|UTC');
+	assert.equal(sitemapSchedulerState().armedKey, '03:30|UTC|86400000');
+
+	// So does changing the interval alone: the armed key carries it, so moving from one pass a
+	// day to four takes effect on the next config apply rather than at the next restart.
+	applyOptions({
+		sitemap: { node: 'node-1', refreshTime: '03:30', timezone: 'UTC', refreshInterval: 6 * 60 * 60 * 1000 },
+	});
+	assert.equal(sitemapSchedulerState().armedKey, '03:30|UTC|21600000');
 
 	// Re-pinning to another node (or worker) disarms this one.
 	applyOptions({ sitemap: { node: 'node-2' } });

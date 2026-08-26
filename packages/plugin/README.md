@@ -113,8 +113,12 @@ rest: true # required for the @export-ed table REST endpoints
         # truncated sweep still reports the full size of the gap
 
   sitemap:
-    refreshTime: '12:00' # local time-of-day for the daily sitemap refresh
+    refreshTime: '12:00' # local time-of-day the refresh grid is anchored on
     timezone: America/New_York
+    refreshInterval:
+      86400000 # 24h — spacing of the refresh slots, phase-anchored on refreshTime.
+      # 21600000 (6h) with a 12:00 anchor runs at 00:00/06:00/12:00/18:00 local.
+      # Passes never overlap: a slot that arrives mid-walk is skipped and logged.
     filteredWarnPercent: 50 # filtered share of one sitemap that is reported as an ERROR
     node: '' # pin the scheduled refresh to this node ('' disables it)
     workerIndex: 0 # ...and this worker

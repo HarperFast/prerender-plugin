@@ -1,7 +1,16 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { currentMinuteMs, epochMsOf, getNextTimeOfDay, getInitialRenderTime, MINUTE } from '../src/util/time.js';
+import {
+	currentMinuteMs,
+	epochMsOf,
+	getNextTimeOfDay,
+	getNextIntervalSlot,
+	getInitialRenderTime,
+	HOUR,
+	MINUTE,
+	SECOND,
+} from '../src/util/time.js';
 
 beforeEach(() => applyOptions({}));
 
@@ -22,6 +31,59 @@ test('getNextTimeOfDay tolerates a missing minute component', () => {
 	const next = getNextTimeOfDay('12', 'UTC');
 	assert.equal(next % MINUTE, 0);
 	assert.ok(next > Date.now());
+});
+
+test('getNextIntervalSlot at a 24h interval is exactly the daily anchor', () => {
+	// The default. Every slot on a 24h grid anchored at 07:00 IS 07:00, so this must not
+	// differ from the behaviour that shipped before the interval existed.
+	assert.equal(
+		getNextIntervalSlot('07:00', 'America/New_York', 24 * HOUR),
+		getNextTimeOfDay('07:00', 'America/New_York')
+	);
+});
+
+test('getNextIntervalSlot returns the next future slot on an anchored grid', () => {
+	const interval = 6 * HOUR;
+	const anchor = getNextTimeOfDay('12:00', 'UTC');
+	const slot = getNextIntervalSlot('12:00', 'UTC', interval);
+
+	assert.equal(slot % MINUTE, 0);
+	assert.ok(slot > Date.now(), 'slot is in the future');
+	assert.ok(slot <= anchor, 'never later than the anchor it is counted back from');
+	// On the grid: an exact number of intervals before the anchor.
+	assert.equal((anchor - slot) % interval, 0);
+	// And it is the NEXT one — one interval earlier would already have passed.
+	assert.ok(slot - interval <= Date.now(), 'no earlier slot was skipped');
+});
+
+test('getNextIntervalSlot never returns a slot more than one interval out', () => {
+	// The property that actually matters operationally: whatever the anchor, a 1h interval
+	// means a refresh within the hour.
+	for (const time of ['00:00', '07:30', '12:00', '23:59']) {
+		const slot = getNextIntervalSlot(time, 'UTC', HOUR);
+		assert.ok(slot > Date.now(), `${time}: future`);
+		assert.ok(slot - Date.now() <= HOUR + MINUTE, `${time}: within one interval`);
+	}
+});
+
+test('getNextIntervalSlot never returns a slot in the past, even off the minute grid', () => {
+	// The schema's floor is ONE minute, not a multiple of one, so a 90s interval is configurable.
+	// The anchor is minute-aligned but 90s steps are not, and flooring an off-grid slot can land
+	// up to 59s behind now — which `setTimeout` treats as "fire immediately", not as "wait".
+	for (const interval of [90 * SECOND, 100 * SECOND, 7 * MINUTE + 30 * SECOND]) {
+		for (const time of ['00:00', '07:30', '12:00', '23:59']) {
+			const slot = getNextIntervalSlot(time, 'UTC', interval);
+			assert.ok(slot > Date.now(), `${time} @ ${interval}ms: slot must be in the future, got ${slot - Date.now()}ms`);
+			assert.equal(slot % MINUTE, 0, 'and still minute-aligned');
+		}
+	}
+});
+
+test('getNextIntervalSlot falls back to the daily anchor on a non-positive interval', () => {
+	// Schema-clamped in practice; this guards direct callers against a divide-by-zero grid.
+	for (const bad of [0, -1, Number.NaN, undefined]) {
+		assert.equal(getNextIntervalSlot('07:00', 'UTC', bad), getNextTimeOfDay('07:00', 'UTC'));
+	}
 });
 
 test('getInitialRenderTime is minute-aligned within [now, now+interval)', () => {

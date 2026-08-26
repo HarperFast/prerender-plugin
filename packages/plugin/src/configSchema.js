@@ -1335,9 +1335,40 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
-	sitemap: group('Sitemap ingestion: the daily refresh, filtering, and crawler identity.', {
-		refreshTime: option('12:00', 'Local time-of-day ("HH:MM") for the daily sitemap refresh.', { nonEmpty: true }),
+	sitemap: group('Sitemap ingestion: the refresh schedule, filtering, and crawler identity.', {
+		refreshTime: option(
+			'12:00',
+			'Local time-of-day ("HH:MM") the refresh grid is anchored on. With the default 24h ' +
+				'`refreshInterval` this is simply the daily refresh time; at any shorter interval it is the ' +
+				'slot the others are spaced around.',
+			{ nonEmpty: true }
+		),
 		timezone: option('America/New_York', 'IANA timezone `refreshTime` is interpreted in.', { nonEmpty: true }),
+		refreshInterval: option(
+			24 * HOUR,
+			'How often the scheduled refresh runs, as slots spaced this far apart and phase-anchored on ' +
+				'`refreshTime` (6h with a 12:00 anchor runs at 00:00/06:00/12:00/18:00 local). The default of ' +
+				'24h leaves exactly one slot a day, on the anchor.\n\n' +
+				'WHAT A SHORTER INTERVAL BUYS: the sitemap is the only source that attributes a URL to a ' +
+				'sitemap, gives it a `changefreq`-derived render interval, and puts it in the sitemap lane ' +
+				'that `queue.priority.sitemapBoost` ranks above discovered rows. Until a refresh sees it, a ' +
+				'newly-published URL either does not exist here or exists only as a request-path discovery. ' +
+				'Halving the interval halves that worst-case wait.\n\n' +
+				'WHAT IT COSTS, AND WHY IT IS LESS THAN IT LOOKS: a pass re-fetches every child sitemap and ' +
+				'scans the `sitemapUrl` index once per child, but it WRITES ONLY THE DIFF — on a real ~830k ' +
+				'entry corpus 99% of entries resolve to `skipped` with no write, and the created/reattached/' +
+				'removed counts are catalog churn, so a shorter interval splits the same daily total into ' +
+				'smaller passes rather than repeating it. Measured there, a full walk of 31 sitemaps takes ' +
+				'~2 minutes of one worker.\n\n' +
+				'The real reason not to set this very low is the prune scan\u2019s read cursor: scan-seconds ' +
+				'scale linearly with frequency, and long-held snapshots are what retain dead versions. The ' +
+				'returns flatten long before the cost does \u2014 a few passes a day is the useful range.\n\n' +
+				'Passes CANNOT overlap regardless of what is set here: the pinned worker refuses a second ' +
+				'concurrent run, and each root is claimed for the length of its walk (see `staleRunMs`). An ' +
+				'interval shorter than a walk therefore skips a slot and logs it rather than running two ' +
+				'walks at once.',
+			{ unit: 'ms', min: 1 * MINUTE }
+		),
 		filteredWarnPercent: option(
 			50,
 			'A sitemap lists every indexable URL on the site, which is routinely a superset of the paths ' +
