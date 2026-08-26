@@ -1195,6 +1195,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'nothing.',
 					{ min: 0, max: 1 }
 				),
+				bots: option(
+					['*'],
+					'Bots whose visits count as demand, by the bot name the analytics registry resolves ' +
+						"(analytics.bots / derived names / the literal 'other'), compared case-insensitively. " +
+						"['*'] (default) counts every bot; [] counts none, so every target rests at its route " +
+						'cadence; a list counts exactly those. Same shape and matching rules as ' +
+						'`ingress.discoveryBots`, and worth setting for a related reason: cadence is render ' +
+						'budget, so whoever this counts decides where that budget goes, and a third-party ' +
+						'crawler walking the corpus breadth-first promotes pages no search engine asked for. ' +
+						'It is also the first lever on ring saturation — see `bitsPerSlice`.',
+					{ itemType: 'string' }
+				),
 				sliceMs: option(
 					6 * HOUR,
 					'Time resolution of the visit ring. Cannot be coarser than the fastest rung or that rung ' +
@@ -1211,8 +1223,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 					1 << 20,
 					'Bloom filter bits per ring slice, rounded UP to a power of two at use (byte sizing and ' +
 						'probe spread both require it). ~1M bits holds ~100k distinct URLs per slice at ~1% ' +
-						'false positives. False positives promote a page nobody asked for — wasted renders, ' +
-						'never staleness — and there are no false negatives.',
+						'false positives. There are no false negatives, so a visited page is never demoted for ' +
+						'lack of evidence.\n\n' +
+						'SIZE THIS AGAINST THE DISTINCT-URL RATE, and treat overshoot as a correctness problem ' +
+						'rather than a cost one. A slice holding n distinct URLs fills to `1 - e^(-kn/m)`, and ' +
+						'the false-positive rate is `fill^k` — so it degrades not gradually but off a cliff: at ' +
+						'the default k=7 and m=1M, 100k URLs fills to 0.49 (~0.7% false), 320k to 0.88 (~41%), ' +
+						'640k to 0.986 (~91%). Past that the ring answers "visited" for essentially everything, ' +
+						'the ladder promotes the whole corpus to its floor, and nothing about the failure is ' +
+						'loud — the cadence just stops being demand-driven. Watch `demand_fill` at its PEAK, ' +
+						'not its mean (it is a sawtooth that resets each slice).\n\n' +
+						'Raising this is the last lever, not the first: the row is `bitsPerSlice / 8` bytes and ' +
+						'REPLICATES on every flush, which is how the per-worker version of this write produced ' +
+						'a transaction log two orders of magnitude larger than the state it carried. Cut what ' +
+						'goes in first — `bots` above, and the rotation gate in `recordDemand` — since a URL ' +
+						'the ladder can never act on is pure fill.',
 					{ min: 1024 }
 				),
 				hashes: option(7, 'Bloom hash count (k).', { min: 1, max: 32 }),

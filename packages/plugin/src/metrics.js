@@ -465,9 +465,15 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated and discovery_gated are counters; config_warnings is a slow gauge (latest value); ' +
-			'demand_fill is a per-worker gauge — average it, never sum ' +
-			'(fill = set-bit fraction of the newest visit-filter slot; a k=7 probe false-positives at ~fill^7, ' +
-			'and false positives promote pages nobody visited — watch it before trusting the histogram). ' +
+			'demand_fill is a per-worker gauge — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
+			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
+			'and climbs until the next one, so it is a sawtooth: averaging over a window reports the middle ' +
+			'of the ramp while the decisions that matter are made at the top of it. A k=7 probe ' +
+			'false-positives at ~fill^7, so a mean of 0.75 (13%) and a peak of 0.986 (91%) are the same slice ' +
+			'and only the second one is the answer — take max/p95 across buckets. False positives promote ' +
+			'pages nobody visited, and a saturated ring promotes the whole corpus to its floor without ' +
+			'raising any other alarm: watch this before trusting the histogram, and see ' +
+			'`render.demand.bitsPerSlice` for what to do when it is high. ' +
 			'unrouted’s bucket slot is bounded by ingress.report.maxBuckets per class. The per-level ladder ' +
 			'histogram exists only in the demand-ladder log line.',
 		dimensions: {
