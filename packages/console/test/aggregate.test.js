@@ -839,6 +839,17 @@ test('change probe: the resumable-sweep and pushback counters sum like every oth
 	assert.equal(body.sweep.lastRun.throttled, 42);
 });
 
+// pageCheck's counter (plugin v0.58.0) OVERLAYS the outcome buckets — a mismatched row is also
+// inside `changed` or `unchanged` — but each node still counts its own disjoint slice, so across
+// nodes it sums exactly like the rest. What it must never do is join a subtraction.
+test('change probe: page mismatches sum across nodes like every other pass counter', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { sweep: sweepWith({ pageMismatch: 3 }) })),
+		ok('b', probeBody('b', { sweep: sweepWith({ pageMismatch: 9 }) })),
+	]);
+	assert.equal(body.sweep.lastRun.pageMismatch, 12);
+});
+
 // THE WORST WINDOW ANY NODE ENDED ON, never a mean. The question is "was the probe being held
 // back", and averaging one throttled node against three healthy ones answers it with a number that
 // was true on no node — 2.75× describes nothing that happened.

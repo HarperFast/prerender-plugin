@@ -286,6 +286,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
  * one the catalog says to ALERT on: it is the only signal that the probe is loading an origin that
  * cannot take it.
  *
+ * It has since earned its keep: plugin v0.58.0's pageCheck added `probe_page_mismatch`, and this
+ * test — not a reader, not a review — is what said the console was blind to it.
+ *
  * Ground truth here is the catalog's machine-readable `values` list rather than the emit sites,
  * because the emit sites are exactly what the regex cannot read. The two can drift — the test
  * above says so and it has happened — which is why this checks the family the OTHER test is blind

@@ -182,6 +182,17 @@ flagged when a settled deployment skips most of them, which means `reprobeAfter`
 `sweepInterval`), and registry rows that could not be decoded, which is a storage-layer escalation
 rather than anything a setting here reaches.
 
+Plugin v0.58.0's `pageCheck` adds the one counter on that card that is not about the origin
+changing: **page mismatches** — cached pages that disagree with the origin on a field they claim.
+That is the class the signature comparison is structurally blind to (a value that changed and
+changed _back_ between two passes, with a render landing inside the window), and it overlays the
+outcome buckets rather than joining them: a mismatched row is also inside "Changed" or the
+unchanged remainder, so it is never part of any sum on the card. The reading depends on the run
+mode and the view says which applies — armed, each mismatch was hard-expired the moment it was
+seen (a detection rate); in dry run nothing expires them, so the same disagreement is re-reported
+every pass (a standing count of wrong pages being served). It stays at zero unless a rule sets
+`pageCheck` and the render fleet posts its pages' offers (browser 1.20.0+).
+
 **The discovery gate** is split across the two views that own its halves: how much crawl traffic
 the gate is holding out of the render rotation is on Traffic (it carries a bot, so the bot filter
 applies), while the purge that removes what got in before the gate went on sits on Overview beside

@@ -451,6 +451,57 @@ test('unreadable registry rows are escalated to the database layer, not shown as
 	assert.match(text, /database team/);
 });
 
+// ---------------------------------------------------------------- page check (plugin v0.58.0)
+
+// A mismatch means a different thing per run mode, and the counter cannot say which: armed, each
+// one was hard-expired the moment it was seen (a detection rate); dry, nothing expires them, so
+// the same disagreement is re-reported every pass (a standing count of wrong pages being served).
+// The run mode is the STATUS's fact, so the note must read it there rather than guess from the
+// window — and only the standing case warns, because armed the counter is the feature working.
+test('page mismatches in dry run read as a standing count of wrong pages, and warn', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('page_mismatch', 4, 5)] },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /20 probes found the cached page disagreeing/);
+	assert.match(text, /standing count of wrong pages/);
+	assert.match(text, /pages disagree with the origin/, 'earns a pill while nothing is expiring them');
+});
+
+test('page mismatches while armed read as a detection rate, not an alarm', async () => {
+	const ctx = await ready({
+		status: { ...STATUS, dryRun: false },
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('page_mismatch', 4, 5)] },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /hard-expired the moment it was seen/);
+	assert.doesNotMatch(text, /standing count/);
+	assert.doesNotMatch(text, /pages disagree with the origin/);
+});
+
+// Mismatched rows are ALSO inside Changed or the unchanged remainder — the plugin buckets by
+// signature outcome alone — and two tiles that look like siblings invite adding them.
+test('the mismatch tile names the overlay instead of posing as an outcome bucket', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('page_mismatch', 4, 5)] },
+	});
+	assert.match(tile(ctx, 'Page mismatch').textContent, /overlays the buckets/);
+});
+
+test('zero mismatches raise nothing — pageCheck unset and a fleet predating it look identical', async () => {
+	const text = draw(await ready()).textContent;
+	assert.doesNotMatch(text, /found the cached page disagreeing/);
+	assert.doesNotMatch(text, /pages disagree with the origin/);
+});
+
+test('the sweep card reports pages that disagreed, and hides the row when there were none', async () => {
+	const withMismatches = await ready({
+		status: { ...STATUS, sweep: { ...STATUS.sweep, lastRun: { ...STATUS.sweep.lastRun, pageMismatch: 12 } } },
+	});
+	assert.match(draw(withMismatches).textContent, /Pages disagreeing with the origin/);
+	assert.doesNotMatch(draw(await ready()).textContent, /Pages disagreeing with the origin/);
+});
+
 // ---------------------------------------------------------------- how a pass ended
 
 // Three reasons a pass stops early, and they are not interchangeable: standing down for a reseed

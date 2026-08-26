@@ -1000,6 +1000,10 @@ const PROBE_COUNTERS = [
 	'failed',
 	'fresh',
 	'throttled',
+	// OVERLAYS the outcome buckets rather than joining them: a row whose cached page disagreed
+	// with the origin (pageCheck, plugin v0.58.0) is ALSO inside `changed` or `unchanged`, so this
+	// sums on its own and belongs in no subtraction — same footing as `throttled` inside `failed`.
+	'pageMismatch',
 	'errors',
 ];
 
