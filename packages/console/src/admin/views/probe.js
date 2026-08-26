@@ -24,7 +24,24 @@
  * this view prints them, for the same reason the orphan sweep does.
  */
 
-import { ago, card, duration, el, ICONS, kv, link, muted, note, num, pct, pill, spacer, stat, table } from '../ui.js';
+import {
+	ago,
+	card,
+	duration,
+	el,
+	ICONS,
+	kv,
+	link,
+	mono,
+	muted,
+	note,
+	num,
+	pct,
+	pill,
+	spacer,
+	stat,
+	table,
+} from '../ui.js';
 import {
 	emptyNote,
 	fmtCount,
@@ -41,7 +58,7 @@ import {
 	sumValues,
 	windowEmpty,
 } from '../charts.js';
-import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
+import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'probe', label: 'Change probe', crumb: 'change probe', icon: ICONS.probe };
 
@@ -71,7 +88,10 @@ const sweepCadence = (sweep) => {
 	if (!sweep?.armedInterval) return null;
 	if (sweep.armedInterval !== 'continuous') return `every ${duration(sweep.armedInterval)}`;
 	const target = sweep.cycleTarget ? `target ${duration(sweep.cycleTarget)}` : 'no target';
-	const slice = sweep.sliceSize ? `${num(sweep.sliceSize)} rows` : 'measuring the slice';
+	// `typeof`, not truthiness: ZERO IS A MEASURED ANSWER — a node that owns nothing, or whose
+	// rows no rule matches — and rendering it as "measuring" would describe a cycle that has
+	// finished counting as one that has not started.
+	const slice = typeof sweep.sliceSize === 'number' ? `${num(sweep.sliceSize)} rows` : 'measuring the slice';
 	return `continuous · ${target} · ${slice}`;
 };
 
@@ -158,6 +178,7 @@ export function render(ctx) {
 		state(ctx, status),
 		drift(ctx),
 		sweepCard(ctx, status),
+		capacityCard(ctx, status, isMerged(status)),
 		canaryCard(ctx, status),
 		nodeTable(status),
 		...knobs,
@@ -606,7 +627,23 @@ function sweepCard(ctx, status) {
 				// The pass's END state, not its worst moment: the window halves back on every clean
 				// batch, so a value above 1 here means the pass was STILL backed off when it finished.
 				last.throttleLevel > 1
-					? ['Pacing window at the end', pill(`${num(last.throttleLevel)}× normal — still backed off`, 'bad')]
+					? ['Pacing window at the end — origin', pill(`${num(last.throttleLevel)}× normal — still backed off`, 'bad')]
+					: null,
+				// The LOCAL governor, reported apart from the origin one on purpose. A pass crawling
+				// because the origin is shedding load and a pass crawling because this node is losing
+				// its event loop to the serve path share a symptom and nothing else, and the fixes
+				// point in opposite directions — one is a conversation with the origin's operator,
+				// the other is this node's own capacity.
+				last.loadThrottleLevel > 1
+					? [
+							'Pacing window at the end — local load',
+							pill(
+								`${num(last.loadThrottleLevel)}× normal${
+									typeof last.loopLagMs === 'number' ? ` — event loop ${Math.round(last.loopLagMs)}ms behind` : ''
+								}`,
+								'warn'
+							),
+						]
 					: null,
 				// Skipped rows are not in `probed`, so without this row the two numbers do not close
 				// and the pass reads as having found less to do than it did.
@@ -845,6 +882,127 @@ function nodeTable(status) {
 
 // ---------------------------------------------------------------- settings
 
+/**
+ * WHAT IS ACTUALLY LIMITING THE SWEEP — the panel that answers a question the numbers above
+ * cannot.
+ *
+ * A pass is paced by `wait = window - elapsed`, where `window = concurrency / ratePerSecond`. When
+ * a batch's origin latency exceeds that window the wait computes to zero and never fires, so real
+ * throughput is `min(concurrency / latency, ratePerSecond)` — and the two terms fail in opposite
+ * directions with identical symptoms. A slice covered more slowly than expected looks the same
+ * whether the rate ceiling is holding it back or the origin's latency is, and the fixes are
+ * unrelated: one is a conversation with whoever runs the origin, the other is a local concurrency
+ * change that does not touch the agreed peak rate at all.
+ *
+ * Observed throughput settles it. If it sits at the ceiling, the ceiling is binding. If it sits
+ * well under the ceiling with no origin pushback, then `ratePerSecond` IS NEVER REACHED — it is
+ * an inert number, and the real governor is concurrency against per-probe latency. That case is
+ * invisible everywhere else on this page: every counter looks healthy, the pass simply takes
+ * longer than the arithmetic on the settings card predicts, and the operator tunes the one knob
+ * that cannot move it.
+ *
+ * PER NODE, AND ONLY PER NODE. A rate is a property of one node's pass. Merging four nodes'
+ * counters over four different pass durations produces a number with no referent, so under
+ * cluster scope this refuses and says to pick a node — the same discipline the run buttons above
+ * already follow.
+ */
+function capacityCard(ctx, status, clusterScope) {
+	const last = status.sweep?.lastRun;
+	if (!last || !last.startedAt || !last.finishedAt) return null;
+
+	const options = optionIndex(configState(ctx).payload);
+	const numberAt = (path) => {
+		const value = Number(options.get(path)?.effective);
+		return Number.isFinite(value) && value > 0 ? value : null;
+	};
+	const ceiling = numberAt('changeProbe.ratePerSecond');
+	const concurrency = numberAt('changeProbe.concurrency');
+	if (!ceiling || !concurrency) return null;
+
+	if (clusterScope) {
+		return card('Pacing and capacity', {
+			body: [
+				note('', [
+					'A probe rate is one node’s property — its own slice, its own pass duration, its own view of ' +
+						'origin latency. Summing four of them would produce a number that describes no node. ' +
+						'Switch to a node to see what is limiting its sweep.',
+				]),
+			],
+		});
+	}
+
+	const seconds = (new Date(last.finishedAt).getTime() - new Date(last.startedAt).getTime()) / 1000;
+	if (!(seconds > 0) || !(last.probed > 0)) return null;
+
+	const observed = last.probed / seconds;
+	// Below this share of the ceiling the gap is real rather than rounding. A pass that ends while
+	// still backed off, or that saw pushback at all, is explained by the origin governor instead —
+	// low throughput there is the backoff working, not a latency ceiling.
+	const pushedBack = (last.throttled ?? 0) > 0 || (last.throttleLevel ?? 1) > 1;
+	const ceilingBinding = observed >= ceiling * 0.9;
+	// Only meaningful when concurrency is the binding term; derived by inverting
+	// `throughput = concurrency / latency`.
+	const latencyMs = Math.round((concurrency / observed) * 1000);
+
+	const rows = [
+		['Observed throughput', pill(`${observed.toFixed(1)}/s`, ceilingBinding ? 'ok' : '')],
+		['Configured ceiling', mono(`${num(ceiling)}/s`)],
+		['Concurrency', mono(num(concurrency))],
+	];
+
+	let verdict = null;
+	if (pushedBack) {
+		verdict = note('warn', [
+			'The origin pushed back during this pass, so its throughput is the backoff doing its job rather ' +
+				'than a capacity ceiling. Read this again after a pass that ends clean.',
+		]);
+	} else if (ceilingBinding) {
+		verdict = note('', [
+			'The sweep is running at its configured ceiling, so ',
+			el('code', { text: 'ratePerSecond' }),
+			' is what limits it. Covering the slice faster means raising that number, which is a conversation ' +
+				'with whoever runs the origin — not a local change.',
+		]);
+	} else {
+		rows.push(['Implied per-probe latency', mono(`~${num(latencyMs)}ms`)]);
+		rows.push([
+			'Capacity at this concurrency',
+			pill(`${observed.toFixed(1)}/s — below the ${num(ceiling)}/s ceiling`, 'warn'),
+		]);
+		verdict = note('warn', [
+			`This node tops out at ${observed.toFixed(1)}/s, well under its ${num(ceiling)}/s ceiling, with no origin `,
+			'pushback to explain it — so ',
+			el('code', { text: 'ratePerSecond' }),
+			' is never actually reached and raising it would change nothing. Throughput here is ',
+			el('code', { text: 'concurrency' }),
+			` ÷ latency: ${num(concurrency)} in flight against ~${num(latencyMs)}ms per probe. Raising `,
+			el('code', { text: 'concurrency' }),
+			' is the lever, and it does not raise the sustained peak the origin agreed to — that stays capped ',
+			'at the ceiling.',
+		]);
+	}
+
+	// In continuous mode there is a required rate to compare against, which turns the diagnosis
+	// above into an answer: reachable, or reachable at what concurrency.
+	const target = status.sweep?.cycleTarget;
+	const slice = status.sweep?.sliceSize;
+	if (target > 0 && typeof slice === 'number' && slice > 0) {
+		const needed = slice / (target / 1000);
+		const reachable = needed <= Math.min(ceiling, ceilingBinding ? ceiling : observed);
+		rows.push(['Rate the cycle target needs', pill(`${needed.toFixed(1)}/s`, reachable ? 'ok' : 'bad')]);
+		if (!reachable && !pushedBack && !ceilingBinding) {
+			// The concurrency that would clear it, at the latency just derived.
+			const wanted = Math.ceil((needed * latencyMs) / 1000);
+			rows.push(['Concurrency that would reach it', pill(`${num(wanted)} (from ${num(concurrency)})`, 'warn')]);
+		}
+	}
+
+	return card('Pacing and capacity', {
+		head: [muted('this node’s last finished sweep')],
+		body: [kv(rows.filter(Boolean)), verdict],
+	});
+}
+
 function settings(ctx) {
 	return el('div', null, [
 		el('div', { cls: 'view-head', style: { marginTop: '20px' } }, [
@@ -864,7 +1022,12 @@ function settings(ctx) {
 				're-reporting the same delta. backoffMax and abortAfterDistress are what the sweep does when the ' +
 				'origin pushes back at that rate anyway, and reprobeAfter is what makes a restarted sweep resume ' +
 				'instead of re-probing ground it had already covered — keep it comfortably below sweepInterval, ' +
-				'or passes start skipping work that is genuinely due.',
+				'or passes start skipping work that is genuinely due. mode picks how the sweep is scheduled: ' +
+				'"interval" fires a pass every sweepInterval and silently skips one that overruns, so the ' +
+				'sliceSize/rate arithmetic is yours to keep re-checking; "continuous" never stops walking and ' +
+				'paces itself to cycleTarget instead, reporting an unreachable target rather than missing it ' +
+				'quietly. load.* slows the sweep when THIS node is struggling rather than the origin — leave it ' +
+				'off in interval mode, where a slowdown can push a pass past its window and lose it.',
 		}),
 	]);
 }

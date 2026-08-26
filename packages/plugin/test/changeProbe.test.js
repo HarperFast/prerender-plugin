@@ -1117,3 +1117,31 @@ test('scheduler: disabling stops the continuous driver, not just the interval ti
 
 	t.mock.timers.reset();
 });
+
+test('cycle pacing belongs to the SWEEP — the canary must never inherit the sweep’s budget', async () => {
+	// The canary re-probes a small fixed cohort on a deliberately fast cadence and has no budget
+	// to spread anything across. Given the sweep's `cycleTarget`/`sliceSize` it would compute
+	// `remaining/left` from the SWEEP's denominator and pace a 500-URL cohort as though it were
+	// the whole slice — slowing further the longer the cycle target gets. Nothing in the canary's
+	// own counters would show it had stopped being fast.
+	//
+	// Asserted on the limits builder both real callers share, so the split is pinned at its
+	// source rather than inferred from a pass's counters.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({
+		changeProbe: { enabled: true, mode: 'continuous', cycleTarget: 8 * 60 * 60 * 1000, rules: RULES_RAW },
+	});
+
+	const sweepLimits = changeProbe.__passLimitsForTest(undefined, { paced: true });
+	const canaryLimits = changeProbe.__passLimitsForTest(undefined);
+
+	assert.equal(sweepLimits.cycleTarget, 8 * 60 * 60 * 1000, 'the sweep paces to the cycle target');
+	assert.equal(canaryLimits.cycleTarget, 0, 'the canary does not');
+	assert.equal(canaryLimits.sliceSize, 0, 'and has no slice denominator to pace against');
+	// Everything else is shared — the fix must not have forked the limits wholesale.
+	assert.equal(canaryLimits.ratePerSecond, sweepLimits.ratePerSecond);
+	assert.equal(canaryLimits.concurrency, sweepLimits.concurrency);
+	assert.equal(canaryLimits.lagThreshold, sweepLimits.lagThreshold, 'a congested node is congested either way');
+
+	applyOptions({ changeProbe: { enabled: false } });
+});

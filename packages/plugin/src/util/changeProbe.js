@@ -766,7 +766,19 @@ let measuredSliceSize = null;
 
 const isContinuous = () => config.changeProbe.mode === 'continuous';
 
-const passLimits = (dryRunOverride) => ({
+/**
+ * Shared pass limits.
+ *
+ * `paced` is NOT a convenience flag — CYCLE PACING BELONGS TO THE SWEEP ALONE. The sweep covers
+ * this node's whole slice against a wall-clock budget; the canary re-probes a small fixed cohort
+ * on a deliberately fast cadence and has no budget to spread anything across. Handing it the
+ * sweep's `cycleTarget`/`sliceSize` would pace a 500-URL cohort as though it were 237k rows —
+ * `remaining/left` computed from the sweep's denominator — so the mass-change detector would run
+ * at whatever rate the SWEEP's schedule implied, slowing as the cycle target lengthened. The
+ * canary's whole value is that it is fast, and nothing in its own numbers would have shown it
+ * had stopped being so.
+ */
+const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 	dryRun: typeof dryRunOverride === 'boolean' ? dryRunOverride : config.changeProbe.dryRun,
 	maxTriggers: config.changeProbe.maxTriggersPerSweep,
 	concurrency: config.changeProbe.concurrency,
@@ -776,11 +788,12 @@ const passLimits = (dryRunOverride) => ({
 	// Continuous pacing, or zeroes — and zeroes are what make interval mode bit-identical: with
 	// no cycle target `cycleRatePerSecond` is never consulted and the window is the one
 	// `ratePerSecond` has always implied.
-	cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : 0,
-	sliceSize: isContinuous() ? (measuredSliceSize ?? 0) : 0,
+	cycleTarget: paced && isContinuous() ? config.changeProbe.cycleTarget : 0,
+	sliceSize: paced && isContinuous() ? (measuredSliceSize ?? 0) : 0,
 	// The local governor is opt-in and orthogonal to the mode, so it is read from config rather
 	// than gated on `isContinuous()` — an operator who wants it in interval mode has been warned
-	// by the option's own documentation and may have reasons.
+	// by the option's own documentation and may have reasons. It applies to the canary too: a
+	// congested node is congested whichever pass is running on it.
 	lagThreshold: config.changeProbe.load.enabled ? config.changeProbe.load.lagThreshold : 0,
 	loadBackoffMax: config.changeProbe.load.backoffMax,
 	readLag: readLoopLagMs,
@@ -797,7 +810,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 	if (sweepRunning) return { skipped: true, reason: 'a probe sweep is already running', lastRun: lastSweep };
 	sweepRunning = true;
 	const startedAt = Date.now();
-	const limits = passLimits(dryRun);
+	const limits = passLimits(dryRun, { paced: true });
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
@@ -1131,6 +1144,12 @@ const clearProbeTimers = () => {
  * a scheduler's clothes. One second is far below any real cadence and far above a hot loop.
  */
 const CONTINUOUS_FLOOR_MS = 1000;
+// A cycle can also decline to start at all: a canary trip chains a RESEED sweep from
+// `runProbeSweepOnce`'s finally block without awaiting it, so the loop's next call returns
+// `{skipped: true}` immediately and keeps doing so for as long as that reseed runs — hours, on a
+// large slice. Polling that at the 1s floor is thousands of pointless wake-ups; this is the
+// interval for "something else holds the sweep", which is a wait, not a cycle boundary.
+const CONTINUOUS_BUSY_MS = 30_000;
 let continuousStop = null;
 
 const runContinuousLoop = async () => {
@@ -1138,16 +1157,22 @@ const runContinuousLoop = async () => {
 	continuousStop = stop;
 	while (!stop.cancelled) {
 		const startedAt = Date.now();
+		let skipped = false;
 		try {
-			await runProbeSweepOnce();
+			// try/catch around `await` is correct and intentional: awaiting a rejected promise
+			// throws into this frame. The alternative (`.catch()`) would swallow the rejection and
+			// let the loop treat a crashed pass as a completed cycle.
+			const result = await runProbeSweepOnce();
+			skipped = result?.skipped === true;
 		} catch (e) {
 			logger.error(e);
 		}
 		if (stop.cancelled) break;
 		// Config is re-read here rather than captured: this is the boundary a live change acts on.
 		if (!config.changeProbe.enabled || !isContinuous() || probeRules().length === 0) break;
+		const floor = skipped ? CONTINUOUS_BUSY_MS : CONTINUOUS_FLOOR_MS;
 		const spent = Date.now() - startedAt;
-		if (spent < CONTINUOUS_FLOOR_MS) await sleep(CONTINUOUS_FLOOR_MS - spent);
+		if (spent < floor) await sleep(floor - spent);
 	}
 	if (continuousStop === stop) continuousStop = null;
 };
@@ -1230,6 +1255,9 @@ export function startChangeProbeScheduler() {
 	syncProbeTimers();
 	onConfigApplied(syncProbeTimers);
 }
+
+/** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
+export const __passLimitsForTest = passLimits;
 
 /** Tests only — module state that outlives a beforeEach. */
 export const resetChangeProbeState = () => {

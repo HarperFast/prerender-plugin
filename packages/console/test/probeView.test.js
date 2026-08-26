@@ -128,7 +128,19 @@ const STATUS = {
 	},
 };
 
-function makeCtx({ status = STATUS, analytics = ANALYTICS } = {}) {
+const PROBE_CONFIG = (ratePerSecond = 10, concurrency = 4) => ({
+	schema: {
+		children: {
+			changeProbe: { children: { ratePerSecond: { kind: 'option' }, concurrency: { kind: 'option' } } },
+		},
+	},
+	layers: [
+		{ path: 'changeProbe.ratePerSecond', effective: ratePerSecond },
+		{ path: 'changeProbe.concurrency', effective: concurrency },
+	],
+});
+
+function makeCtx({ status = STATUS, analytics = ANALYTICS, config = PROBE_CONFIG() } = {}) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
 	const calls = { posts: [], renders: 0, reloads: 0 };
@@ -145,6 +157,7 @@ function makeCtx({ status = STATUS, analytics = ANALYTICS } = {}) {
 					? { ok: true, body: status }
 					: { ok: false, status: 409, body: { error: 'changeProbe.enabled is false' } };
 			if (route === 'analytics') return { ok: true, body: analytics };
+			if (route === 'config') return { ok: true, body: config };
 			return { ok: true, body: null };
 		},
 		async post(route, data) {
@@ -592,7 +605,10 @@ test('interval mode still reads as an interval — the new branch must not captu
 	const ctx = await ready();
 	const text = draw(ctx).textContent;
 	assert.match(text, /every 1d/);
-	assert.doesNotMatch(text, /continuous/);
+	// Scoped to the CADENCE LABEL's own shape, not to the word anywhere on the page: the settings
+	// card documents both modes, so a bare /continuous/ here would fail on prose rather than on
+	// the thing under test.
+	assert.doesNotMatch(text, /continuous · target/);
 });
 
 test('the cycle-behind tile is hidden in interval mode, where there is no target to miss', async () => {
@@ -608,4 +624,102 @@ test('continuous mode shows cycle-behind, and warns when the ceiling cannot meet
 	const behind = tile(ctx, 'Cycle behind');
 	assert.ok(behind, 'expected the tile in continuous mode');
 	assert.match(behind.textContent, /140/);
+});
+
+// ---- pacing & capacity -------------------------------------------------------------------------
+
+/**
+ * The panel exists because `throughput = min(concurrency / latency, ratePerSecond)` has two terms
+ * that fail with identical symptoms and unrelated fixes. Every case below is one an operator
+ * would otherwise have to derive by hand from a pass's start/finish timestamps.
+ */
+const sweptAt = (probed, seconds, extra = {}) => ({
+	...CONTINUOUS,
+	sweep: {
+		...CONTINUOUS.sweep,
+		lastRun: {
+			...CONTINUOUS.sweep.lastRun,
+			probed,
+			throttled: 0,
+			throttleLevel: 1,
+			startedAt: Date.now() - seconds * 1000,
+			finishedAt: Date.now(),
+			...extra,
+		},
+	},
+});
+
+test('a sweep running AT its ceiling says the ceiling is the limit', async () => {
+	// 1000 probes in 100s = 10/s against a 10/s ceiling. Raising concurrency here buys nothing.
+	const ctx = await ready({ status: sweptAt(1000, 100) });
+	const text = draw(ctx).textContent;
+	assert.match(text, /10\.0\/s/);
+	assert.match(text, /running at its configured ceiling/);
+});
+
+test('a sweep well UNDER its ceiling with no pushback names concurrency, not the rate', async () => {
+	// 750 probes in 100s = 7.5/s against a 10/s ceiling, clean. The ceiling is never reached, so
+	// it is inert — this is the case that would otherwise be diagnosed by hand.
+	const ctx = await ready({ status: sweptAt(750, 100) });
+	const text = draw(ctx).textContent;
+	assert.match(text, /7\.5\/s/);
+	assert.match(text, /never actually reached/);
+	assert.match(text, /concurrency/);
+	// 4 in flight ÷ 7.5/s = ~533ms per probe.
+	assert.match(text, /533ms/);
+});
+
+test('low throughput WITH origin pushback is the backoff working, not a capacity ceiling', async () => {
+	// The same 7.5/s, but the origin pushed back — attributing that to latency would send the
+	// operator to raise concurrency against an origin already shedding load.
+	const ctx = await ready({ status: sweptAt(750, 100, { throttled: 40, throttleLevel: 4 }) });
+	const text = draw(ctx).textContent;
+	assert.match(text, /backoff doing its job/);
+	assert.doesNotMatch(text, /never actually reached/);
+});
+
+test('continuous mode says whether the cycle target is reachable, and at what concurrency', async () => {
+	// 237k rows over an 8h target needs 8.23/s; the node sustains 7.5/s. Unreachable — and the
+	// answer is concurrency 5, not a higher rate ceiling.
+	const status = sweptAt(750, 100);
+	const ctx = await ready({
+		status: { ...status, sweep: { ...status.sweep, cycleTarget: 8 * HOUR, sliceSize: 237_000 } },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /8\.2\/s/, 'the rate the target needs');
+	assert.match(text, /5 \(from 4\)/, 'the concurrency that would reach it');
+});
+
+test('a reachable cycle target is not dressed up as a problem', async () => {
+	// The same node against a 12h target needs 5.5/s, comfortably inside 7.5/s.
+	const status = sweptAt(750, 100);
+	const ctx = await ready({
+		status: { ...status, sweep: { ...status.sweep, cycleTarget: 12 * HOUR, sliceSize: 237_000 } },
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /5\.5\/s/);
+	assert.doesNotMatch(text, /Concurrency that would reach it/);
+});
+
+test('under cluster scope the panel refuses rather than averaging four nodes into a fiction', async () => {
+	// A rate is one node's property: its own slice, its own duration, its own origin latency.
+	const status = sweptAt(750, 100);
+	const ctx = await ready({
+		status: {
+			...status,
+			sources: { mode: 'merged', answered: 4, configured: 4, complete: true, nodes: [] },
+		},
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /Switch to a node/);
+	assert.doesNotMatch(text, /Implied per-probe latency/);
+});
+
+test('the local governor is reported apart from the origin one — the fixes point opposite ways', async () => {
+	const ctx = await ready({
+		status: sweptAt(750, 100, { loadThrottleLevel: 4, loopLagMs: 180 }),
+	});
+	const text = draw(ctx).textContent;
+	assert.match(text, /local load/);
+	assert.match(text, /event loop 180ms behind/);
 });

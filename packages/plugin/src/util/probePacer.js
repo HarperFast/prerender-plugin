@@ -18,6 +18,17 @@
  */
 
 /**
+ * A multiplier or rate, floored at 1 and NaN-proof.
+ *
+ * `Math.max(1, NaN)` is NaN, not 1 — which is the whole reason this exists rather than the inline
+ * `Math.max` it replaces. A NaN anywhere in the window arithmetic propagates to the pause, and
+ * `setTimeout(NaN)` does not throw or wait: it fires on the next tick. The pacing would silently
+ * become no pacing, at full speed, against whatever the probe was pointed at — the single worst
+ * failure this module could have, arriving with no error and no log line.
+ */
+const atLeastOne = (value) => (Number.isFinite(value) && value > 1 ? value : 1);
+
+/**
  * Requests per second needed to finish the rest of the slice inside the rest of the cycle.
  *
  * This is what makes continuous mode a schedule rather than a speed. The interval model asks the
@@ -74,7 +85,7 @@ export const pacedRate = ({ ratePerSecond, cycleRate }) => {
  * load that makes an origin shed requests in the first place.
  */
 export const stepBackoff = (current, pressured, max) => {
-	const ceiling = Math.max(1, max);
+	const ceiling = atLeastOne(max);
 	const at = Number.isFinite(current) && current >= 1 ? current : 1;
 	if (pressured) return Math.min(at * 2, ceiling);
 	return Math.max(1, at / 2);
@@ -99,6 +110,9 @@ export const stepBackoff = (current, pressured, max) => {
 export const MAX_TIMER_MS = 2147483647;
 
 export const batchPause = ({ batchSize, rate, originThrottle, loadThrottle, elapsed, retryAfterMs = 0 }) => {
-	const window = (batchSize / Math.max(1, rate)) * 1000 * Math.max(1, originThrottle) * Math.max(1, loadThrottle);
-	return Math.min(Math.max(window - elapsed, retryAfterMs, 0), MAX_TIMER_MS);
+	const size = Number.isFinite(batchSize) && batchSize > 0 ? batchSize : 0;
+	const window = (size / atLeastOne(rate)) * 1000 * atLeastOne(originThrottle) * atLeastOne(loadThrottle);
+	const spent = Number.isFinite(elapsed) ? elapsed : 0;
+	const floor = Number.isFinite(retryAfterMs) ? retryAfterMs : 0;
+	return Math.min(Math.max(window - spent, floor, 0), MAX_TIMER_MS);
 };
