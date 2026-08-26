@@ -1079,8 +1079,21 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		const PSEUDO = /::?[a-zA-Z-]+(\([^()]*\))?/g;
 		const colonInsideQuotes = (selector: string): boolean => {
 			let quote = '';
+			let escaped = false;
 			for (let i = 0; i < selector.length; i++) {
 				const ch = selector[i];
+				// A backslash escape has to be honoured, or `[data-msg="a\"b:c"]` looks like it closes
+				// its quote at the escaped `"`. The `:c` would then read as a pseudo-class, the strip
+				// would rewrite the selector to one that matches nothing, and a rule that DOES match
+				// would be pruned — the one direction this pass must never fail in.
+				if (escaped) {
+					escaped = false;
+					continue;
+				}
+				if (ch === '\\') {
+					escaped = true;
+					continue;
+				}
 				if (quote) {
 					if (ch === quote) quote = '';
 					else if (ch === ':') return true;

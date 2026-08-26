@@ -18,6 +18,7 @@ const CSS_FIXTURE = `<!doctype html><html><head><title>prune</title>
   .present::after { content: "x"; }
   ::selection { color: rgb(2, 2, 2); }
   [data-note="absent{;}:v"] { color: rgb(6, 6, 6); }
+  [data-msg="a\\"b:c"] { outline-color: rgb(9, 9, 9); }
   li:not(.absent-x) { color: rgb(3, 3, 3); }
   .absent-list, .present { outline-color: rgb(5, 5, 5); }
   .only-in-template { color: rgb(11, 11, 11); }
@@ -30,6 +31,7 @@ const CSS_FIXTURE = `<!doctype html><html><head><title>prune</title>
 </style>
 </head><body>
 <div class="present">kept</div>
+<div id="escaped" data-msg='a"b:c'>escaped quote then colon</div>
 <ul><li>list item</li></ul>
 <template><span class="only-in-template">templated</span></template>
 <noscript><span class="only-in-noscript">no-js fallback</span></noscript>
@@ -96,6 +98,9 @@ test('drops only the rules that can never match', async () => {
 	assert.match(css, /\.present::after/, 'a pseudo-element on a matching base stays');
 	assert.match(css, /::selection/, 'a selector that is ONLY a pseudo-element is kept untested');
 	assert.match(css, /data-note/, 'a quoted attribute value is never rewritten, so it is kept');
+	// An escaped quote must not be read as closing the string: otherwise the `:c` reads as a
+	// pseudo-class, the rewrite produces a selector matching nothing, and a LIVE rule is pruned.
+	assert.match(css, /data-msg/, 'an escaped quote before a colon must not fool the guard');
 	assert.match(css, /li:not\(\.absent-x\)/, 'a matching base with :not() stays');
 	assert.match(css, /absent-list/, 'a selector list keeps ALL parts when any one part matches');
 
@@ -113,6 +118,19 @@ test('drops only the rules that can never match', async () => {
 	assert.match(css, /opacity: 0/, "…and so do its keyframes' declarations");
 	assert.match(css, /@font-face/, '@font-face survives');
 	assert.match(css, /@media \(min-width: 2px\)/, 'an emptied @media keeps its position in the cascade');
+});
+
+test('the escaped-quote rule really does apply, so pruning it would be a real loss', async () => {
+	// Guards the guard: if this selector stopped matching, the assertion above would pass for the
+	// wrong reason and prove nothing.
+	const r = await renderOnce({
+		url: `${base}/`,
+		config: NO_SCROLL,
+		probes: {
+			outline: ({ page }) => page.evaluate(() => getComputedStyle(document.getElementById('escaped')!).outlineColor),
+		},
+	});
+	assert.equal(r.probes.outline, 'rgb(9, 9, 9)', 'the escaped-quote selector matches the element');
 });
 
 test('the pruned CSS still computes to the same styles', async () => {
