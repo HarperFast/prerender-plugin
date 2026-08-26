@@ -339,11 +339,15 @@ identical; compare sorted, or all 9,991 elements look changed when none are. And
 before sampling.
 
 **Cost.** The pass is bounded by `querySelector` calls, and answers are memoized per probe string
-(the DOM cannot change while it runs), so repeated selectors are paid for once. On the flagged
-product page that is 4,387 probes collapsing to 3,144 calls: **81 ms**, against a ~12 s render —
-under 1%. Lighter pages are 5–12 ms. A rightmost-compound prefilter would halve it again, but it
-was measured disagreeing with the DOM on two rules and rejected: this pass has to be exactly right,
-not nearly right.
+(the DOM cannot change while it runs), so repeated selectors are paid for once — on the flagged
+product page, 4,387 probes collapse to 3,144 calls.
+
+Measured in place rather than in a bench: the `postProcess` phase goes from **119–128 ms to
+229–230 ms**, so the pass costs about **105 ms** on a ~10 s render — roughly 1%. (An earlier
+figure of 81 ms came from a `setContent` bench and understated it; take the in-place number.)
+Lighter pages are 5–12 ms. A rightmost-compound prefilter would roughly halve it, but it was
+measured disagreeing with the DOM on two rules and rejected: a pass that deletes CSS has to be
+exactly right, not nearly right.
 
 ### `postProcess.removeAttributes` — dropping dead hydration payloads
 
