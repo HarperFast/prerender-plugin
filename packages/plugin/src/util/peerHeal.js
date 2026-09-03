@@ -116,7 +116,10 @@ export const forwardHeal = async ({ owner, url, cacheKey }) => {
 		// Name read directly rather than via `instanceof Error`: an abort rejects with a DOMException
 		// whose prototype chain differs across runtimes (the classification bug util/peer.js documents).
 		const name = e?.name;
-		return { ok: false, reason: name === 'AbortError' ? 'peer timed out' : `peer fetch failed: ${e?.message ?? e}` };
+		// `String(e)` rather than `e`: anything can be thrown, and a null/undefined rejection would
+		// otherwise render as the literal "null" in the reason. Same idiom as util/peer.js.
+		const message = e?.message ?? String(e);
+		return { ok: false, reason: name === 'AbortError' ? 'peer timed out' : `peer fetch failed: ${message}` };
 	} finally {
 		clearTimeout(timer);
 	}

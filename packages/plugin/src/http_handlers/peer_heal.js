@@ -61,17 +61,26 @@ export async function handlePeerHealRequest(request) {
 	const cacheKey = typeof body?.cacheKey === 'string' ? body.cacheKey : null;
 	if (!url || !cacheKey) return json({ error: 'url and cacheKey are required' }, 400);
 
-	// OUR view of the invalidation, never the caller's. `routeScopeForUrl` re-classifies here rather
-	// than trusting a forwarded scope, for the same reason: a scope is what decides whether a page
-	// stops being served, and it is cheap to derive.
-	const invalidatedBy = await resolveInvalidation(routeScopeForUrl(url));
-	if (!invalidatedBy) return json({ outcome: 'not-invalidated' });
+	try {
+		// OUR view of the invalidation, never the caller's. `routeScopeForUrl` re-classifies here rather
+		// than trusting a forwarded scope, for the same reason: a scope is what decides whether a page
+		// stops being served, and it is cheap to derive.
+		const invalidatedBy = await resolveInvalidation(routeScopeForUrl(url));
+		if (!invalidatedBy) return json({ outcome: 'not-invalidated' });
 
-	// `accelerateHeal` counts its own outcome, so a forwarded heal lands in exactly the same
-	// `invalidation_reenqueue` series as a local one — the owner's metrics stay a complete account of
-	// what it did, regardless of which node the crawler happened to hit.
-	// `forwarded: true` is what enforces the leaf property described above — it stops this node
-	// forwarding onward if it does not consider itself the owner.
-	const result = await accelerateHeal({ url, cacheKey, invalidatedBy, forwarded: true });
-	return json({ outcome: result?.outcome ?? 'unknown' });
+		// `accelerateHeal` counts its own outcome, so a forwarded heal lands in exactly the same
+		// `invalidation_reenqueue` series as a local one — the owner's metrics stay a complete account of
+		// what it did, regardless of which node the crawler happened to hit.
+		// `forwarded: true` is what enforces the leaf property described above — it stops this node
+		// forwarding onward if it does not consider itself the owner.
+		const result = await accelerateHeal({ url, cacheKey, invalidatedBy, forwarded: true });
+		return json({ outcome: result?.outcome ?? 'unknown' });
+	} catch (e) {
+		// ANSWER, never reject. Both calls above already swallow their own faults, so reaching here means
+		// something genuinely unexpected — but an HTTP handler that rejects leaves the caller a hanging
+		// socket to burn its deadline on instead of a verdict, and that caller is a peer holding a
+		// rate-limit slot. A 500 costs it one counted `forward-failed` and frees the slot immediately.
+		logger.error(e, `[prerender] peer heal failed for ${cacheKey}`);
+		return json({ error: 'heal failed' }, 500);
+	}
 }

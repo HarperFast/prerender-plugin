@@ -811,8 +811,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 								2000,
 								'Deadline for one forwarded heal. Generous is pointless here: the request that triggered it has ' +
 									'already been answered, this is a repair running detached, and a peer that cannot answer in ' +
-									'seconds will not heal anything useful. A timeout is counted as `forward-failed`.',
-								{ unit: 'ms', min: 1 }
+									'seconds will not heal anything useful. A timeout is counted as `forward-failed`.\n\n' +
+									'Capped at the 32-bit signed maximum because this value reaches `setTimeout`: past that Node ' +
+									'emits TimeoutOverflowWarning and fires the timer IMMEDIATELY, so a fat-fingered value would ' +
+									'abort every forwarded heal on the spot rather than allowing a long one. The cap turns that ' +
+									'into a rejected value that keeps the default.',
+								{ unit: 'ms', min: 1, max: 2147483647 }
 							),
 						}
 					),
