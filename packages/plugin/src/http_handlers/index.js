@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { handleBotRequest } from './bot_request.js';
 import { handlePeerPageRequest, PEER_PAGE_PATH } from './peer_page.js';
+import { handlePeerHealRequest, PEER_HEAL_PATH } from './peer_heal.js';
 import { resolveForwardedRequest } from '../util/ingress.js';
 import { isForwardedMode } from '../util/routeClass.js';
 
@@ -27,6 +28,7 @@ const isAdminRequest = (request) => {
 // a broad prefix route (or prefix-mode botPathPrefix '/') would otherwise swallow it, and it is
 // needed most in exactly the deployments whose routing is broadest.
 const isPeerPageRequest = (request) => request.url.split('?')[0] === PEER_PAGE_PATH;
+const isPeerHealRequest = (request) => request.url.split('?')[0] === PEER_HEAL_PATH;
 
 const isBotRequest = (request) => {
 	if (isAdminRequest(request)) return false;
@@ -42,6 +44,7 @@ const isBotRequest = (request) => {
 
 server.http((request, nextHandler) => {
 	if (isPeerPageRequest(request)) return handlePeerPageRequest(request);
+	if (isPeerHealRequest(request)) return handlePeerHealRequest(request);
 	if (isBotRequest(request)) return handleBotRequest(request);
 
 	return nextHandler(request);

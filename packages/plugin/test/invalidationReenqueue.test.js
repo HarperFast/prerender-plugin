@@ -38,6 +38,7 @@ const OWNED = 'https://www.example.com/product/prd-owned';
 const SITEMAP = 'https://www.example.com/sitemap.xml';
 
 let accelerator, funnel, config, QueueState, getResidencyByUrl, collectConfigWarnings, getInitialRenderTime;
+let peerHeal;
 let PRERENDER, PASSTHROUGH, UNCLASSIFIED;
 
 const schedule = new Map();
@@ -115,6 +116,7 @@ before(async () => {
 	({ PRERENDER, PASSTHROUGH, UNCLASSIFIED } = await import('../src/util/routeClass.js'));
 	funnel = await import('../src/util/renderSchedule.js');
 	accelerator = await import('../src/util/invalidationReenqueue.js');
+	peerHeal = await import('../src/util/peerHeal.js');
 });
 
 after(() => {
@@ -212,7 +214,7 @@ test('the due time is spread across the window, not collapsed onto the current m
 	);
 });
 
-test('a key another node owns is refused as not-owner — a cross-node write cannot lower the owner’s floor', async () => {
+test('a key another node owns is refused as not-owner while cross-node forwarding is OFF', async () => {
 	const url = foreignUrl();
 	seed(url);
 
@@ -606,4 +608,172 @@ test('a spreadWindow below jobLeaseTime is reported by name AND clamped up to th
 		collectConfigWarnings().some((f) => f.key === 'invalidation.reenqueue.spreadWindow'),
 		false
 	);
+});
+
+// ---- cross-node forwarding (invalidation.reenqueue.crossNode) ---------------------------------
+
+/**
+ * Forwarding exists because the `not-owner` refusal discards 84-85% of all heal attempts in
+ * production, and the "crawlers revisit" fallback cannot recover it where bot traffic is
+ * concentrated on one node (see util/peerHeal.js).
+ *
+ * What is pinned here is that forwarding does not become a NEW hazard:
+ *
+ *   - IT IS A LEAF. A forwarded heal that lands on a node which does not consider itself the owner
+ *     refuses; it must never forward again, or two nodes disagreeing about residency would bounce
+ *     one heal between them.
+ *   - THE SLOT IS RESERVED BEFORE THE CALL, which is the whole cost argument: `maxPerMinute` has to
+ *     bound calls MADE, not just writes accepted, or this is a network call per invalidated request.
+ *   - A TRANSPORT FAILURE IS ITS OWN OUTCOME, never silence and never an owner refusal.
+ *   - THE OWNER'S VERDICT IS NOT RE-COUNTED here. The owner records it in the same series, so
+ *     counting it again would double every forwarded heal cluster-wide.
+ */
+
+let fetchCalls = [];
+let fetchImpl = null;
+const realFetch = globalThis.fetch;
+
+const armCrossNode = (impl) => {
+	config.invalidation.reenqueue.crossNode.enabled = true;
+	config.peerRescue.token = 'shared-secret';
+	config.peerRescue.header = 'x-harper-peer';
+	fetchImpl = impl;
+	globalThis.fetch = async (url, init) => {
+		fetchCalls.push({ url, init });
+		return fetchImpl(url, init);
+	};
+};
+
+const okResponse =
+	(outcome = 'lowered') =>
+	async () => ({
+		ok: true,
+		status: 200,
+		json: async () => ({ outcome }),
+	});
+
+test.afterEach?.(() => {});
+
+test('cross-node OFF: a foreign key is still refused as not-owner and no call is made', async () => {
+	fetchCalls = [];
+	const url = foreignUrl();
+	seed(url);
+	config.invalidation.reenqueue.crossNode.enabled = false;
+
+	const result = await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() });
+	assert.equal(result.outcome, 'not-owner');
+	assert.equal(fetchCalls.length, 0);
+	globalThis.fetch = realFetch;
+});
+
+test('cross-node ON: the heal is forwarded to the owner, carrying only url and cacheKey', async () => {
+	fetchCalls = [];
+	const url = foreignUrl();
+	seed(url);
+	armCrossNode(okResponse('lowered'));
+
+	const result = await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() });
+
+	assert.equal(result.outcome, 'forwarded');
+	assert.equal(result.owner, 'node-b');
+	assert.equal(result.ownerOutcome, 'lowered');
+	assert.equal(fetchCalls.length, 1);
+	assert.match(fetchCalls[0].url, /\/prerender_peer\/heal$/);
+	// THE EPOCH IS NOT SENT. The owner re-resolves it — a forwarded epoch would be a value one node
+	// takes from another to decide what to stop serving.
+	assert.deepEqual(JSON.parse(fetchCalls[0].init.body), { url, cacheKey: keysOf(url)[0] });
+	assert.equal(fetchCalls[0].init.headers['x-harper-peer'], 'shared-secret');
+	// Counted as forwarded — the owner counts its own verdict, so `lowered` must NOT appear here.
+	assert.deepEqual(outcomes(), ['forwarded']);
+	globalThis.fetch = realFetch;
+});
+
+test('a FORWARDED heal never forwards again — the leaf property', async () => {
+	fetchCalls = [];
+	const url = foreignUrl();
+	seed(url);
+	armCrossNode(okResponse());
+
+	const result = await accelerator.accelerateHeal({
+		url,
+		cacheKey: keysOf(url)[0],
+		invalidatedBy: epoch(),
+		forwarded: true,
+	});
+
+	assert.equal(result.outcome, 'not-owner', 'a node that is not the owner refuses rather than bouncing it on');
+	assert.equal(fetchCalls.length, 0, 'two nodes disagreeing about residency must not bounce a heal between them');
+	globalThis.fetch = realFetch;
+});
+
+test('a transport failure is counted as forward-failed, not as silence', async () => {
+	fetchCalls = [];
+	const url = foreignUrl();
+	seed(url);
+	armCrossNode(async () => ({ ok: false, status: 503, json: async () => ({}) }));
+
+	const result = await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() });
+	assert.equal(result.outcome, 'forward-failed');
+	assert.deepEqual(outcomes(), ['forward-failed']);
+	globalThis.fetch = realFetch;
+});
+
+test('a throw in the peer call is caught and counted — never an unhandled rejection', async () => {
+	fetchCalls = [];
+	const url = foreignUrl();
+	seed(url);
+	armCrossNode(async () => {
+		throw new Error('ECONNREFUSED');
+	});
+
+	const result = await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() });
+	assert.equal(result.outcome, 'forward-failed');
+	globalThis.fetch = realFetch;
+});
+
+test('THE SLOT IS RESERVED BEFORE THE CALL: maxPerMinute bounds calls made, not just writes', async () => {
+	fetchCalls = [];
+	const urls = probeUrls(false, 3);
+	for (const url of urls) seed(url);
+	armCrossNode(okResponse());
+	config.invalidation.reenqueue.maxPerMinute = 2;
+
+	const results = [];
+	for (const url of urls) {
+		results.push(await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() }));
+	}
+
+	assert.deepEqual(
+		results.map((r) => r.outcome),
+		['forwarded', 'forwarded', 'throttled']
+	);
+	assert.equal(fetchCalls.length, 2, 'the third request must not reach the network at all');
+	globalThis.fetch = realFetch;
+});
+
+test('a destination outside the cluster node list is refused WITHOUT a request', async () => {
+	// Defence in depth: the owner comes from our own residency function, but validating it against
+	// the node list is what keeps a bug or a config change from turning this into an arbitrary-host
+	// request. Asserted against the transport directly — the accelerator can only ever hand it a
+	// hostname residency produced, so the guard is not reachable from that side.
+	fetchCalls = [];
+	armCrossNode(okResponse());
+
+	const sent = await peerHeal.forwardHeal({ owner: 'attacker.example.com', url: OWNED, cacheKey: `${OWNED}|desktop` });
+	assert.equal(sent.ok, false);
+	assert.match(sent.reason, /unknown node/);
+	assert.equal(fetchCalls.length, 0);
+	globalThis.fetch = realFetch;
+});
+
+test('the transport is inert unless BOTH the flag and a shared secret are configured', async () => {
+	fetchCalls = [];
+	armCrossNode(okResponse());
+	config.peerRescue.token = '';
+
+	const sent = await peerHeal.forwardHeal({ owner: 'node-b', url: OWNED, cacheKey: `${OWNED}|desktop` });
+	assert.equal(sent.ok, false);
+	assert.equal(sent.reason, 'disabled');
+	assert.equal(fetchCalls.length, 0, 'no secret means no request, not an unauthenticated one');
+	globalThis.fetch = realFetch;
 });

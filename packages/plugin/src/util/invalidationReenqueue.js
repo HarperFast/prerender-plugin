@@ -116,6 +116,7 @@ import { QueueState } from '../resources/QueueState.js';
 import { getSab } from './coordination.js';
 import { getScheduleRow, leaseInfo, writeSchedules } from './renderSchedule.js';
 import { getResidencyByUrl } from './residency.js';
+import { forwardHeal, isPeerHealActive } from './peerHeal.js';
 import { PRERENDER, resolveEffectiveInterval, resolveRenderInterval } from './routeClass.js';
 import { MINUTE, getInitialRenderTime, numberOf } from './time.js';
 import { metrics } from '../metrics.js';
@@ -136,6 +137,12 @@ export const REENQUEUE_OUTCOMES = [
 	'not-sooner',
 	'throttled',
 	'error',
+	// Cross-node only (util/peerHeal.js). `forwarded` means this node handed the heal to the owner —
+	// NOT that a row moved; the owner counts its own verdict in this same series, so the two are
+	// deliberately not double-counted. `forward-failed` is a transport fault (peer down, timeout,
+	// non-2xx), never a refusal the owner made.
+	'forwarded',
+	'forward-failed',
 ];
 
 // [minuteSinceEpoch, requestsThisMinute]. Minutes-since-the-epoch is ~29.4M today, so it fits an
@@ -230,7 +237,7 @@ const record = (outcome, scope) => metrics.invalidationReenqueue(outcome, scope)
  * `url` is the canonical URL half of the cache key — the `Target` primary key. `invalidatedBy` is
  * `resolveServeStatus`'s verdict, so `.at` ALREADY INCLUDES `invalidation.pad`.
  */
-export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
+export const accelerateHeal = async ({ url, cacheKey, invalidatedBy, forwarded = false }) => {
 	// No null tolerance here, on purpose: the one production caller (`maybeAccelerateHeal`)
 	// returns before dispatch without a verdict, so a null `invalidatedBy` is a caller bug —
 	// better a loud TypeError on the first property read than a guard that quietly accepts it.
@@ -241,7 +248,31 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy }) => {
 	};
 
 	const owner = getResidencyByUrl(url);
-	if (owner !== server.hostname) return refuse('not-owner', { owner });
+	if (owner !== server.hostname) {
+		// `forwarded` is set by the peer endpoint, and is what makes this a LEAF. If a forwarded heal
+		// arrives at a node that does not consider itself the owner — residency disagreement during a
+		// topology change — it refuses here rather than forwarding again. Without this, two nodes that
+		// disagree could bounce one heal between them until a timeout.
+		if (forwarded || !isPeerHealActive()) return refuse('not-owner', { owner });
+
+		// THE SLOT IS RESERVED BEFORE THE CALL, not before the write as on the local path, and that
+		// inversion is the whole cost argument: it makes `maxPerMinute` bound CALLS MADE (40/min/node
+		// at the current setting) rather than leaving them proportional to invalidated traffic
+		// (~66,000/hr measured). The local path reserves late for the opposite reason — so one
+		// repeatedly-crawled unhealable URL cannot burn the budget before the cheap refusals run —
+		// and that reasoning does not transfer here, because off-owner none of those refusals can be
+		// evaluated at all.
+		if (!reserveSlot()) return refuse('throttled', { owner });
+
+		const sent = await forwardHeal({ owner, url, cacheKey });
+		// The OWNER counted its own outcome in its own `invalidation_reenqueue` series, so counting
+		// the verdict again here would double-count every forwarded heal cluster-wide. This node
+		// records only that it forwarded — the transport step, which is the thing its own metrics can
+		// legitimately claim to know about.
+		if (!sent.ok) return refuse('forward-failed', { owner, reason: sent.reason });
+		record('forwarded', scope);
+		return { outcome: 'forwarded', owner, ownerOutcome: sent.outcome };
+	}
 
 	// One atomic load off the node-local flag every worker shares. A paused node must not accumulate
 	// pulled-forward due times it is not draining — they would all come due at once on resume.
