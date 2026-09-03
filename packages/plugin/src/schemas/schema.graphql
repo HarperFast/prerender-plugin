@@ -278,6 +278,56 @@ type Invalidation @table(database: "invalidation") @sealed {
 	updatedTime: Date @updatedTime
 }
 
+# Per-URL proof that a cached page's OWN CLAIMS still match the origin, so a bulk invalidation can
+# refuse a page for LACKING EVIDENCE rather than merely for predating the epoch. Written by the
+# change probe when `pageCheck` compared the cached page against the origin and they AGREED; read on
+# the serve path only for a page an invalidation would otherwise refuse.
+#
+# WHY THIS IS NOT A FIELD ON PrerenderedPage, where the serve path already holds the row and the read
+# would be free. Harper serializes writes per database, and the `Invalidation` comment above records
+# the measurement: a bulk write to another table in the same database pushed tiny-table read p99 from
+# 0.24 ms to 9.7 ms (max 13.9 ms). `page_cache` is the busiest database here, its commits are the
+# largest (they carry blob bodies), and its transaction log is the one measured pegging worker threads
+# at 85-95% of CPU in the RocksDB log iterator. A ~200k-per-cycle write stream does not belong in it.
+# (A patch does NOT re-stream the blob — the audit stores the delta and `getValue` decodes only that,
+# so `HAS_BLOBS` on a patch entry is a false positive. Cheap replication, still the wrong database.)
+#
+# ITS OWN DATABASE, same two reasons as `Invalidation`: nothing else may queue behind these writes,
+# and this table is read ON THE SERVE PATH. Replicated and NOT residency-pinned, deliberately — the
+# opposite of `ProbeState`. The probe that writes a row runs on the key's owner, but the request that
+# needs it lands wherever the CDN sent it; a node-local table would answer only ~15% of the requests
+# that matter (measured: `invalidation_reenqueue{outcome='not-owner'}` is 84-85%).
+#
+# KEYED BY URL, not cacheKey: the probe's unit is the URL, `triggerRevalidate` hard-expires every
+# device key of a URL together, and one row instead of two halves the write volume. The serve path
+# derives the URL half with `CacheKey.extractUrl`.
+#
+# ABSENT ROW = NOT VERIFIED = STAYS INVALIDATED. Every failure here — never probed, probe failed,
+# read error, unreadable timestamp — must land on that side, because the alternative is serving a page
+# somebody deliberately invalidated. `resolveServeStatus` enforces it with the same `!(a > b)` shape
+# the epoch comparison uses, so NaN fails closed.
+type PageVerification @table(database: "verification", expiration: 604800) @sealed {
+	# The canonical URL half of the cache key (`util/cacheKey.js` `CacheKey.extractUrl`).
+	url: String @primaryKey
+	# When the probe last confirmed the cached page's claims matched the origin. COMPARED against the
+	# invalidation epoch, never displayed as freshness — a verified page is still as old as it was.
+	verifiedAt: Date
+	# The `lastCached` of the render whose claims were verified (`ProbeState.pageClaimAt`), and what
+	# makes a per-URL verification safe for PER-DEVICE pages.
+	#
+	# `pageSignature` is keyed by url and written by whichever device rendered last, so the evidence
+	# is per-URL while the pages are per-cacheKey. On a SPLIT PAIR — a normal state here — desktop
+	# could be verified while mobile still holds a pre-change render, and a bare per-URL exemption
+	# would serve the stale mobile page. Carrying the basis closes that exactly: the serve path
+	# exempts a key only when its OWN `lastCached` is at least this, so the verified render and
+	# anything newer qualify and a lagging sibling does not.
+	#
+	# In the healthy case this costs nothing — `util/time.js` seeds jitter off the URL half precisely
+	# so a URL's device variants land on the same minute, so both keys clear the basis and both are
+	# exempt. Absent (a row written before this field existed) reads as NaN and exempts nothing.
+	basisAt: Date
+}
+
 type PrerenderedPage @table(database: "page_cache") @export {
 	cacheKey: String @primaryKey
 	statusCode: Int!
@@ -339,6 +389,12 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# silently narrow drift detection to those fields and stop catching regular/sale price moves.
 	# Nullable and inert unless a rule sets `pageCheck.enabled`.
 	pageSignature: String
+	# The `lastCached` of the render that wrote `pageSignature` — NOT the moment the claim was
+	# recorded. Those differ by milliseconds, and the difference is load-bearing: this value is
+	# copied onto a verification as the basis it certifies, and a stamp taken a few ms after the page
+	# was written would make the very page it certifies fail its own `lastCached >= basisAt` test.
+	# Written in the SAME patch as `pageSignature`, so it costs no extra read and no extra write.
+	pageClaimAt: Date
 }
 
 # Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a

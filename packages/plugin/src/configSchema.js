@@ -714,6 +714,35 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'the request matched) however many rows exist.',
 				{ min: 1 }
 			),
+			verification: group(
+				'PER-PAGE EXEMPTION. Let a page an invalidation would refuse be served anyway when the change ' +
+					'probe has PROVED it is still current — `pageCheck` compared the cached page\u2019s own claims against ' +
+					'the origin after the epoch and they agreed.\n\n' +
+					'WHY THIS EXISTS. A bulk invalidation refuses everything in scope rendered before the epoch because ' +
+					'it cannot tell what actually changed. Measured during a route-wide trip on a four-node deployment, ' +
+					'only 22-29% of the scope had genuinely moved; the rest were origin-proxied for up to a full render ' +
+					'interval while being byte-for-byte correct. This turns "predates the epoch" into "lacks evidence", ' +
+					'which is the question the invalidation was always asking.\n\n' +
+					'WHAT IT ASSERTS, EXACTLY: the fields the probe rule watches still match. Nothing more. A promo flip ' +
+					'also moves badges, banners and copy no probe looks at, so a verified page is "price and availability ' +
+					'confirmed", never "fresh". Judge whether that is the right bar for what you invalidate FOR.\n\n' +
+					'REQUIRES `changeProbe.pageCheck` on the rule whose `invalidateScope` recorded the invalidation. A ' +
+					'signature match alone is NOT sufficient and is deliberately not accepted: it says the origin has not ' +
+					'moved since the last probe, which says nothing about whether the cached page was ever right.',
+				{
+					enabled: option(
+						false,
+						'Off by default, like `invalidation.reenqueue.enabled` and `render.reconcile.enabled` \u2014 enable it ' +
+							'after one rehearsal, not on the deploy that introduces it. While off, nothing is written and ' +
+							'nothing is read: every page is refused on the epoch comparison alone, exactly as before.\n\n' +
+							'EVERY FAILURE FAILS CLOSED. Absent row, unprobed URL, failed probe, read error, unreadable ' +
+							'timestamp \u2014 all mean NOT VERIFIED, and the page keeps being proxied. That is the opposite of ' +
+							'`invalidation.lkgMaxAge`, which fails OPEN, and the asymmetry is the point: an unknown epoch ' +
+							'almost certainly means "nothing is invalidated", while unknown evidence means "I cannot prove ' +
+							'this page is current".'
+					),
+				}
+			),
 			reenqueue: group(
 				'DEMAND-DRIVEN HEAL. When an invalidation is what made a request non-servable, lower that URL’s ' +
 					'due time so the pages bots actually crawl heal first instead of waiting out their cadence in ' +
