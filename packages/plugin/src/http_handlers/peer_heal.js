@@ -57,18 +57,45 @@ const json = (body, status = 200) => ({
 const MAX_BODY_BYTES = 8192;
 const TOO_LARGE = 'body too large';
 
+/**
+ * One already-materialised body value as a Buffer, or null when it is not one.
+ *
+ * `Buffer.isBuffer` IS NOT ENOUGH, and the difference is a real hazard rather than pedantry: a
+ * `Buffer` is a `Uint8Array` subclass, but a plain `Uint8Array` is not a Buffer, so a bare
+ * `Buffer.isBuffer` check lets one fall through to the streaming branch below — where, because a
+ * `Uint8Array` is a SYNCHRONOUS iterable, `for await` walks it BYTE BY BYTE and hands `Buffer.from`
+ * a number. `ArrayBuffer.isView` covers Buffer, Uint8Array and every other typed-array view in one
+ * test, and the (buffer, byteOffset, byteLength) form is what makes it correct for a view onto a
+ * larger allocation rather than copying the whole backing store.
+ */
+const asBuffer = (value) => {
+	if (Buffer.isBuffer(value)) return value;
+	if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+	if (value instanceof ArrayBuffer) return Buffer.from(value);
+	if (typeof value === 'string') return Buffer.from(value, 'utf8');
+	return null;
+};
+
 const readJsonBody = async (request) => {
 	const source = request.body;
 	// A body-less POST reads as absent rather than as an empty parse error, so the caller gets the
 	// field-validation message below instead of a misleading "must be JSON".
 	if (!source) return null;
-	if (typeof source === 'string') return JSON.parse(source);
-	if (Buffer.isBuffer(source)) return JSON.parse(source.toString('utf8'));
+	// Already materialised (string, Buffer, Uint8Array, ArrayBuffer) — parse it directly and never
+	// iterate it. See `asBuffer`.
+	const whole = asBuffer(source);
+	if (whole) {
+		if (whole.length > MAX_BODY_BYTES) throw new Error(TOO_LARGE);
+		return whole.length ? JSON.parse(whole.toString('utf8')) : null;
+	}
 
 	const chunks = [];
 	let total = 0;
 	for await (const chunk of source) {
-		const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		// A chunk that is neither text nor bytes means this is not a body stream at all — refuse
+		// explicitly rather than letting `Buffer.from` throw something opaque.
+		const buf = asBuffer(chunk);
+		if (!buf) throw new Error('body must be JSON');
 		total += buf.length;
 		if (total > MAX_BODY_BYTES) throw new Error(TOO_LARGE);
 		chunks.push(buf);
@@ -90,7 +117,12 @@ export async function handlePeerHealRequest(request) {
 	try {
 		body = await readJsonBody(request);
 	} catch (e) {
-		return json({ error: e?.message === TOO_LARGE ? TOO_LARGE : 'body must be JSON' }, 400);
+		// 413 for the size refusal, 400 for an unparseable one. The caller folds every non-2xx into
+		// `forward-failed`, but its reason string carries the status verbatim — so "peer responded 413"
+		// names the cause in a log line where a second 400 would be indistinguishable from a malformed
+		// body.
+		if (e?.message === TOO_LARGE) return json({ error: TOO_LARGE }, 413);
+		return json({ error: 'body must be JSON' }, 400);
 	}
 	const url = typeof body?.url === 'string' ? body.url : null;
 	const cacheKey = typeof body?.cacheKey === 'string' ? body.cacheKey : null;

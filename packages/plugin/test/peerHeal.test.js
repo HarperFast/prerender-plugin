@@ -101,7 +101,9 @@ test('an oversized body is REFUSED rather than buffered', async () => {
 	// arbitrary payload. The cap is 8 KiB against a legitimate body of a few hundred bytes.
 	const huge = Readable.from([Buffer.alloc(20_000, 0x41)]);
 	const res = await handler(makeRequest({ body: huge, headers: AUTH }));
-	assert.equal(res.status, 400);
+	// 413, not 400: the caller folds every non-2xx into `forward-failed`, but its reason carries the
+	// status, so this is the difference between a diagnosable log line and an ambiguous one.
+	assert.equal(res.status, 413);
 	assert.match(res.body, /too large/);
 });
 
@@ -148,4 +150,37 @@ test('a wrong token is 403, and the body is never read', async () => {
 test('a non-POST is 405 after auth', async () => {
 	const res = await handler(makeRequest({ method: 'GET', body: null, headers: AUTH }));
 	assert.equal(res.status, 405);
+});
+
+test('a raw Uint8Array body is parsed, NOT iterated byte-by-byte', async () => {
+	// `Buffer.isBuffer(new Uint8Array(...))` is false — a Buffer is a Uint8Array subclass, not the
+	// reverse. A bare isBuffer check let this fall into the streaming branch, where a Uint8Array's
+	// SYNCHRONOUS iterability makes `for await` walk it one byte at a time and hand Buffer.from a
+	// number. Caught in review (gemini-code-assist).
+	const bytes = new Uint8Array(Buffer.from(JSON.stringify(PAYLOAD), 'utf8'));
+	const res = await handler(makeRequest({ body: bytes, headers: AUTH }));
+	assert.notEqual(res.status, 400, 'a Uint8Array body must be parsed whole');
+});
+
+test('a Uint8Array VIEW onto a larger allocation reads only its own bytes', async () => {
+	// The (buffer, byteOffset, byteLength) form matters: copying the whole backing store would
+	// splice neighbouring bytes into the JSON.
+	const json = Buffer.from(JSON.stringify(PAYLOAD), 'utf8');
+	const backing = Buffer.alloc(json.length + 64, 0x7a);
+	json.copy(backing, 32);
+	const view = new Uint8Array(backing.buffer, backing.byteOffset + 32, json.length);
+	const res = await handler(makeRequest({ body: view, headers: AUTH }));
+	assert.notEqual(res.status, 400);
+});
+
+test('an oversized already-materialised body is refused without parsing', async () => {
+	const res = await handler(makeRequest({ body: new Uint8Array(20_000), headers: AUTH }));
+	assert.equal(res.status, 413);
+	assert.match(res.body, /too large/);
+});
+
+test('a stream chunk that is neither text nor bytes is refused explicitly', async () => {
+	const weird = Readable.from([{ not: 'bytes' }], { objectMode: true });
+	const res = await handler(makeRequest({ body: weird, headers: AUTH }));
+	assert.equal(res.status, 400);
 });
