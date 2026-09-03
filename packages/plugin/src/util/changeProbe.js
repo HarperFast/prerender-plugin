@@ -54,10 +54,9 @@ import { epochMsOf, currentMinuteMs, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { writeSchedules } from './renderSchedule.js';
-import { recordInvalidation, isScopeResolvable } from './invalidation.js';
+import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
-import { resolveInvalidation } from './invalidation.js';
 import { writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
@@ -354,10 +353,18 @@ const readSignature = async (url) => {
 // loses at most one baseline to the race and re-seeds on the next pass.
 export const writeSignature = (url, signature, { rowExists = false, clearClaim = false } = {}) => {
 	const fields = { signature, probedAt: new Date() };
-	if (clearClaim) fields.pageSignature = null;
+	// BOTH HALVES OF THE PAIR, always. `pageClaimAt` is the render `pageSignature` came from, and the
+	// two are only meaningful together — a claim with no basis cannot be scoped to a device page, and
+	// a basis with no claim describes nothing. Clearing one and leaving the other is inert today
+	// (the verification write requires `stored.pageSignature`), but it leaves a half-state a later
+	// reader can pick up, which is the shape of bug this module's own comments keep closing.
+	if (clearClaim) {
+		fields.pageSignature = null;
+		fields.pageClaimAt = null;
+	}
 	return rowExists
 		? probeStateTable().patch(url, fields)
-		: probeStateTable().put(url, { url, pageSignature: null, ...fields });
+		: probeStateTable().put(url, { url, pageSignature: null, pageClaimAt: null, ...fields });
 };
 
 /**

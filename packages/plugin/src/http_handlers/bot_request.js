@@ -231,7 +231,6 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		basisAtMs,
 	});
 	info.invalidatedBy = invalidatedBy;
-	info.exemptedBy = exemptedBy;
 
 	if (servable) {
 		// READ THE BODY BEFORE COMMITTING TO THE CACHE SERVE. A record whose blob file is gone

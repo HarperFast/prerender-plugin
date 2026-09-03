@@ -923,8 +923,16 @@ test('writeSignature: patch for an existing row (claim untouched unless cleared)
 	assert.deepEqual(Object.keys(calls.patch[0].fields).sort(), ['probedAt', 'signature']);
 
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true, clearClaim: true });
-	assert.deepEqual(Object.keys(calls.patch[1].fields).sort(), ['pageSignature', 'probedAt', 'signature']);
+	// BOTH halves of the claim pair. `pageClaimAt` is the render `pageSignature` came from; clearing
+	// one and leaving the other is a half-state a verification could later read.
+	assert.deepEqual(Object.keys(calls.patch[1].fields).sort(), [
+		'pageClaimAt',
+		'pageSignature',
+		'probedAt',
+		'signature',
+	]);
 	assert.equal(calls.patch[1].fields.pageSignature, null);
+	assert.equal(calls.patch[1].fields.pageClaimAt, null);
 
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: false });
 	assert.equal(calls.patch.length, 2);
