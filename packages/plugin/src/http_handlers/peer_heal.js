@@ -42,6 +42,68 @@ const json = (body, status = 200) => ({
 	body: JSON.stringify(body),
 });
 
+// Harper's raw `server.http` request exposes its body as `request.body`, a Readable — it has NO
+// `.json()`. The first cut of this handler called `request.json()`, which threw on every request and
+// was converted by the catch below into a 400, so 100% of forwarded heals failed while the endpoint
+// looked healthy from outside (the route answered, auth gated correctly, only the body read was
+// broken). `peer_page.js`, the endpoint this was modelled on, never reads a body, so there was no
+// precedent in this plugin to copy — core reads it this way (`core/server/REST.ts`, and the comment
+// on `graphqlQuerying.ts`'s deserialize: "Read the body through request.body ... it is a
+// Readable-compatible").
+//
+// BOUNDED, because this is a network-facing read: the only legitimate body here is
+// `{ url, cacheKey }`, a few hundred bytes. Anything past the cap is refused rather than buffered,
+// so a bad or hostile caller with a valid token cannot make a worker hold an arbitrary payload.
+const MAX_BODY_BYTES = 8192;
+const TOO_LARGE = 'body too large';
+
+/**
+ * One already-materialised body value as a Buffer, or null when it is not one.
+ *
+ * `Buffer.isBuffer` IS NOT ENOUGH, and the difference is a real hazard rather than pedantry: a
+ * `Buffer` is a `Uint8Array` subclass, but a plain `Uint8Array` is not a Buffer, so a bare
+ * `Buffer.isBuffer` check lets one fall through to the streaming branch below — where, because a
+ * `Uint8Array` is a SYNCHRONOUS iterable, `for await` walks it BYTE BY BYTE and hands `Buffer.from`
+ * a number. `ArrayBuffer.isView` covers Buffer, Uint8Array and every other typed-array view in one
+ * test, and the (buffer, byteOffset, byteLength) form is what makes it correct for a view onto a
+ * larger allocation rather than copying the whole backing store.
+ */
+const asBuffer = (value) => {
+	if (Buffer.isBuffer(value)) return value;
+	if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+	if (value instanceof ArrayBuffer) return Buffer.from(value);
+	if (typeof value === 'string') return Buffer.from(value, 'utf8');
+	return null;
+};
+
+const readJsonBody = async (request) => {
+	const source = request.body;
+	// A body-less POST reads as absent rather than as an empty parse error, so the caller gets the
+	// field-validation message below instead of a misleading "must be JSON".
+	if (!source) return null;
+	// Already materialised (string, Buffer, Uint8Array, ArrayBuffer) — parse it directly and never
+	// iterate it. See `asBuffer`.
+	const whole = asBuffer(source);
+	if (whole) {
+		if (whole.length > MAX_BODY_BYTES) throw new Error(TOO_LARGE);
+		return whole.length ? JSON.parse(whole.toString('utf8')) : null;
+	}
+
+	const chunks = [];
+	let total = 0;
+	for await (const chunk of source) {
+		// A chunk that is neither text nor bytes means this is not a body stream at all — refuse
+		// explicitly rather than letting `Buffer.from` throw something opaque.
+		const buf = asBuffer(chunk);
+		if (!buf) throw new Error('body must be JSON');
+		total += buf.length;
+		if (total > MAX_BODY_BYTES) throw new Error(TOO_LARGE);
+		chunks.push(buf);
+	}
+	if (!total) return null;
+	return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+};
+
 export async function handlePeerHealRequest(request) {
 	// Order matters, exactly as in peer_page.js: existence is not revealed until the caller is
 	// authenticated. Unconfigured answers 404 (the feature does not exist here); a wrong token 403.
@@ -53,8 +115,13 @@ export async function handlePeerHealRequest(request) {
 
 	let body;
 	try {
-		body = await request.json();
-	} catch {
+		body = await readJsonBody(request);
+	} catch (e) {
+		// 413 for the size refusal, 400 for an unparseable one. The caller folds every non-2xx into
+		// `forward-failed`, but its reason string carries the status verbatim — so "peer responded 413"
+		// names the cause in a log line where a second 400 would be indistinguishable from a malformed
+		// body.
+		if (e?.message === TOO_LARGE) return json({ error: TOO_LARGE }, 413);
 		return json({ error: 'body must be JSON' }, 400);
 	}
 	const url = typeof body?.url === 'string' ? body.url : null;
