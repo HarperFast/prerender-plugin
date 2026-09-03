@@ -77,49 +77,70 @@ const URL_A = 'https://example.com/product/a';
 
 // ---- the read: every unknown is a refusal ----------------------------------------------------
 
+const BASIS = new Date(1_000);
+
 test('an absent row is NaN, not 0 — a missing verification must never read as "verified in 1970"', async () => {
-	assert.ok(Number.isNaN(await pv.resolveVerification(URL_A)));
+	const { verifiedAtMs, basisAtMs } = await pv.resolveVerification(URL_A);
+	assert.ok(Number.isNaN(verifiedAtMs));
+	assert.ok(Number.isNaN(basisAtMs));
 });
 
 test('a null verifiedAt is NaN, not epoch 0', async () => {
-	rows.set(URL_A, { url: URL_A, verifiedAt: null });
-	assert.ok(Number.isNaN(await pv.resolveVerification(URL_A)));
+	rows.set(URL_A, { url: URL_A, verifiedAt: null, basisAt: BASIS });
+	assert.ok(Number.isNaN((await pv.resolveVerification(URL_A)).verifiedAtMs));
+});
+
+test('a row with NO basisAt reads NaN — it can never exempt a device key', async () => {
+	// A row written before `basisAt` existed. Without the basis there is nothing to test a per-device
+	// `lastCached` against, so the whole row has to be inert rather than exempt both device keys.
+	rows.set(URL_A, { url: URL_A, verifiedAt: new Date() });
+	assert.ok(Number.isNaN((await pv.resolveVerification(URL_A)).basisAtMs));
 });
 
 test('a read that throws is NaN and is counted — never a throw onto a request that has an answer', async () => {
 	failReads = true;
-	assert.ok(Number.isNaN(await pv.resolveVerification(URL_A)));
+	const { verifiedAtMs, basisAtMs } = await pv.resolveVerification(URL_A);
+	assert.ok(Number.isNaN(verifiedAtMs) && Number.isNaN(basisAtMs));
 	assert.ok(ops.some((o) => o === 'prerender_ops:page_verification:read-error'));
 });
 
 test('disabled reads nothing at all — the feature is inert, not merely ignored', async () => {
 	config.invalidation.verification.enabled = false;
-	rows.set(URL_A, { url: URL_A, verifiedAt: new Date() });
-	assert.ok(Number.isNaN(await pv.resolveVerification(URL_A)));
+	rows.set(URL_A, { url: URL_A, verifiedAt: new Date(), basisAt: BASIS });
+	assert.ok(Number.isNaN((await pv.resolveVerification(URL_A)).verifiedAtMs));
 	assert.equal(reads.length, 0, 'a disabled feature must not pay a storage read');
 });
 
 test('there is NO last-known-good: a second failing read after a good one is still NaN', async () => {
-	rows.set(URL_A, { url: URL_A, verifiedAt: new Date() });
-	assert.ok(Number.isFinite(await pv.resolveVerification(URL_A)));
+	rows.set(URL_A, { url: URL_A, verifiedAt: new Date(), basisAt: BASIS });
+	assert.ok(Number.isFinite((await pv.resolveVerification(URL_A)).verifiedAtMs));
 	failReads = true;
 	assert.ok(
-		Number.isNaN(await pv.resolveVerification(URL_A)),
+		Number.isNaN((await pv.resolveVerification(URL_A)).verifiedAtMs),
 		'unlike invalidation, an unknown verification must not fall back to a remembered value'
 	);
 });
 
 // ---- the write --------------------------------------------------------------------------------
 
-test('a write records verifiedAt and is counted', async () => {
-	await pv.writeVerification(URL_A);
+test('a write records verifiedAt AND the basis it certifies', async () => {
+	await pv.writeVerification(URL_A, BASIS);
 	assert.ok(Number.isFinite(new Date(rows.get(URL_A).verifiedAt).getTime()));
+	assert.equal(rows.get(URL_A).basisAt, BASIS);
 	assert.ok(ops.includes('prerender_ops:page_verification:written'));
+});
+
+test('NO BASIS -> NO ROW: a verification that cannot be scoped to a render must not be written', async () => {
+	// A row with no basis would exempt EVERY device key of the URL, which is exactly the split-pair
+	// bug the field exists to close. Refusing to write is the fail-closed direction.
+	await pv.writeVerification(URL_A, null);
+	assert.equal(rows.has(URL_A), false);
+	assert.equal(ops.length, 0, 'nothing was written, so nothing is counted');
 });
 
 test('a failed write is swallowed and counted — it costs a page one cycle, never the probe pass', async () => {
 	failWrites = true;
-	await pv.writeVerification(URL_A);
+	await pv.writeVerification(URL_A, BASIS);
 	assert.ok(ops.includes('prerender_ops:page_verification:write-error'));
 });
 
@@ -132,6 +153,9 @@ const serve = (over = {}) =>
 		swrTtl: MINUTE,
 		now: 5_000,
 		epoch: { scope: 'route:prefix:/product/', at: 2_000 },
+		// The render this URL's verification certifies. `lastCachedMs` defaults to it, so the default
+		// fixture is the healthy case: the key under test IS the verified render.
+		basisAtMs: 1_000,
 		...over,
 	});
 
@@ -186,4 +210,42 @@ test('with no epoch at all, a verification changes nothing', () => {
 	const r = serve({ epoch: null, verifiedAtMs: 9_000 });
 	assert.equal(r.status, 'hit');
 	assert.equal(r.exemptedBy, null);
+});
+
+// ---- the per-device basis: what makes a per-URL verification safe for per-cacheKey pages --------
+
+/**
+ * `pageSignature` is keyed by url and written by whichever device rendered LAST, so the proof
+ * belongs to one render while the pages are per-cacheKey. A SPLIT PAIR is a normal state here —
+ * `PrerenderAdmin.revalidateUrl` and `renderNow` each write one device key on purpose, reconcile
+ * repairs a missing row with fresh jitter, and every per-device retry lane diverges the pair. So a
+ * bare per-URL exemption would serve a stale sibling on the strength of the other device's proof.
+ */
+
+test('the VERIFIED render is exempt', () => {
+	assert.equal(serve({ lastCachedMs: 1_000, basisAtMs: 1_000, verifiedAtMs: 3_000 }).servable, true);
+});
+
+test('a device page NEWER than the basis is exempt — it cannot be staler than what was proved', () => {
+	assert.equal(serve({ lastCachedMs: 1_800, basisAtMs: 1_000, verifiedAtMs: 3_000 }).servable, true);
+});
+
+test('a LAGGING sibling is refused: the proof belongs to the other device`s render', () => {
+	const r = serve({ lastCachedMs: 500, basisAtMs: 1_000, verifiedAtMs: 3_000 });
+	assert.equal(r.status, 'invalidated');
+	assert.equal(r.servable, false);
+	assert.equal(r.exemptedBy, null);
+});
+
+test('a missing basis exempts nothing, however good the verification looks', () => {
+	assert.equal(serve({ lastCachedMs: 1_900, basisAtMs: NaN, verifiedAtMs: 3_000 }).status, 'invalidated');
+});
+
+test('the healthy case costs nothing: variants share a minute, so both keys clear the basis', () => {
+	// util/time.js seeds jitter off the URL half precisely so a URL's device variants land on the
+	// same minute — so in the normal case there is no split and the basis refuses nobody.
+	const at = 1_500;
+	for (const lastCachedMs of [at, at]) {
+		assert.equal(serve({ lastCachedMs, basisAtMs: at, verifiedAtMs: 3_000 }).servable, true);
+	}
 });

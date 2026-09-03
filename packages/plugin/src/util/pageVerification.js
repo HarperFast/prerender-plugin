@@ -45,6 +45,9 @@
 import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 
+/** No usable verification. Shared frozen object so the common path allocates nothing. */
+const NONE = Object.freeze({ verifiedAtMs: NaN, basisAtMs: NaN });
+
 const table = () => databases.verification.PageVerification;
 
 /**
@@ -52,9 +55,9 @@ const table = () => databases.verification.PageVerification;
  * anything unreadable yields NaN — which every caller treats as "not verified". Mirrors the coercion
  * the serve path already applies to `lastCached`/`expiresAt`.
  */
-const verifiedAtMsOf = (row) => {
-	if (!row || row.verifiedAt === undefined || row.verifiedAt === null) return NaN;
-	return new Date(row.verifiedAt).getTime();
+const msOf = (value) => {
+	if (value === undefined || value === null) return NaN;
+	return new Date(value).getTime();
 };
 
 /**
@@ -65,16 +68,16 @@ const verifiedAtMsOf = (row) => {
  * row read as absent, i.e. the feature would appear enabled and exempt nothing.
  */
 export const resolveVerification = async (url) => {
-	if (!config.invalidation.verification.enabled) return NaN;
+	if (!config.invalidation.verification.enabled) return NONE;
 	try {
-		const row = await table().get({ id: url, select: ['url', 'verifiedAt'] });
-		return verifiedAtMsOf(row);
+		const row = await table().get({ id: url, select: ['url', 'verifiedAt', 'basisAt'] });
+		return { verifiedAtMs: msOf(row?.verifiedAt), basisAtMs: msOf(row?.basisAt) };
 	} catch (e) {
 		// Counted and logged, never thrown: this runs on a request that already has an answer
 		// available (the origin), so a storage fault here must degrade to "not verified", not to a 500.
 		logger.error(e, `[prerender] page verification read failed for ${url}`);
 		metrics.pageVerification('read-error');
-		return NaN;
+		return NONE;
 	}
 };
 
@@ -85,9 +88,14 @@ export const resolveVerification = async (url) => {
  * compare, and that the comparison agreed. This helper deliberately takes no opinion on either — it
  * cannot re-derive them, and a helper that guessed would be the silent-verification bug above.
  */
-export const writeVerification = async (url) => {
+export const writeVerification = async (url, basisAt) => {
+	// NO BASIS, NO VERIFICATION. `basisAt` is what makes a per-URL row safe for per-device pages, so a
+	// claim recorded before that field existed (or by a path that did not stamp it) must not produce a
+	// row at all — a verification with no basis would exempt every device key of the URL, which is the
+	// split-pair bug this field exists to close.
+	if (basisAt === undefined || basisAt === null) return;
 	try {
-		await table().put(url, { url, verifiedAt: new Date() });
+		await table().put(url, { url, verifiedAt: new Date(), basisAt });
 		metrics.pageVerification('written');
 	} catch (e) {
 		// A failed verification write costs a page one cycle of continued origin proxying — the

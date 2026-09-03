@@ -323,7 +323,10 @@ export const triggerRevalidate = async (row) => {
 // Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
 // another pass already covered (see `reprobeAfter` in runProbePass).
 const readSignature = async (url) => {
-	const row = await probeStateTable().get({ id: url, select: ['url', 'signature', 'probedAt', 'pageSignature'] });
+	const row = await probeStateTable().get({
+		id: url,
+		select: ['url', 'signature', 'probedAt', 'pageSignature', 'pageClaimAt'],
+	});
 	if (!row) return null;
 	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
 	// exists for — a BigInt, which `new Date()` REFUSES rather than coerces (TypeError, which here
@@ -332,7 +335,12 @@ const readSignature = async (url) => {
 	// skips: never skip a probe on a value we could not read.
 	const stamp = typeof row.probedAt === 'bigint' ? Number(row.probedAt) : row.probedAt;
 	const probedAt = stamp === undefined || stamp === null ? NaN : new Date(stamp).getTime();
-	return { signature: row.signature ?? null, probedAt, pageSignature: row.pageSignature ?? null };
+	return {
+		signature: row.signature ?? null,
+		probedAt,
+		pageSignature: row.pageSignature ?? null,
+		pageClaimAt: row.pageClaimAt ?? null,
+	};
 };
 // The probe's write must NEVER carry the page claim through a whole-row put: `pageSignature`
 // belongs to the render path, and the value read at the top of processOne is a full probe request
@@ -359,7 +367,7 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
  * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
  * trigger by making every page look like a disagreement.
  */
-export const recordPageClaim = async (url, structuredOffers) => {
+export const recordPageClaim = async (url, structuredOffers, cachedAt = Date.now()) => {
 	try {
 		// The master switch gates STORAGE too — "Off = no probes, no timers, nothing stored" is
 		// the config contract, and this is the hottest write path to be skipping work on.
@@ -393,8 +401,13 @@ export const recordPageClaim = async (url, structuredOffers) => {
 		// first and choose. The read is a node-local point read on a small table, once per render
 		// of a pageCheck-matched URL.
 		const existing = await probeStateTable().get({ id: url, select: ['url'] });
-		if (existing) await probeStateTable().patch(url, { pageSignature: claim });
-		else await probeStateTable().put(url, { url, pageSignature: claim });
+		// `pageClaimAt` rides in the SAME write — no extra read, no extra write — and is the render's
+		// own `lastCached`, not the moment this ran. See the schema comment: it becomes the basis a
+		// verification certifies, and a stamp taken milliseconds later would exclude the very page it
+		// is certifying.
+		const claimAt = new Date(cachedAt);
+		if (existing) await probeStateTable().patch(url, { pageSignature: claim, pageClaimAt: claimAt });
+		else await probeStateTable().put(url, { url, pageSignature: claim, pageClaimAt: claimAt });
 	} catch (e) {
 		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
 	}
@@ -613,7 +626,7 @@ export const runProbePass = async ({
 				//
 				// Awaited, not detached: it shares the pass's pacing budget, and a write storm that
 				// outruns the probe is exactly what the paced sweep exists to prevent.
-				await verify(row.url);
+				await verify(row.url, stored.pageClaimAt);
 			}
 			return;
 		}

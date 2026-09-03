@@ -40,7 +40,7 @@ export function resolveServeStatus(args) {
 	if (!args || !('epoch' in args) || args.epoch === undefined) {
 		throw new TypeError('resolveServeStatus: `epoch` is required (pass null when none applies)');
 	}
-	const { expiresAtMs, lastCachedMs, swrTtl, now, epoch, verifiedAtMs = NaN } = args;
+	const { expiresAtMs, lastCachedMs, swrTtl, now, epoch, verifiedAtMs = NaN, basisAtMs = NaN } = args;
 
 	const base = expiresAtMs > now ? 'hit' : expiresAtMs + swrTtl > now ? 'swr' : null;
 
@@ -49,7 +49,12 @@ export function resolveServeStatus(args) {
 	// Forgetting a verification only keeps a page invalidated, which is what would have happened
 	// anyway: the pre-feature answer, reached honestly. A default is safe exactly when omitting the
 	// argument cannot produce a serve that would otherwise have been refused.
-	const verified = verifiedAtMs > epoch?.at;
+	// TWO conditions, and the second is what makes a PER-URL verification safe for PER-DEVICE pages.
+	// `pageSignature` is written by whichever device rendered last, so the proof belongs to one
+	// render; `basisAtMs` is that render's `lastCached`. Requiring this key to be at least that new
+	// exempts the verified render and anything newer, and refuses a lagging sibling — the split-pair
+	// case, which is normal here. Both NaN-safe: an absent basis exempts nothing.
+	const verified = verifiedAtMs > epoch?.at && lastCachedMs >= basisAtMs;
 
 	if (epoch && !(lastCachedMs > epoch.at) && !verified) {
 		// `!(a > b)`, never `<=`. `lastCached` is nullable and an unreadable value yields NaN, and

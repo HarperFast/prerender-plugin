@@ -370,13 +370,18 @@ export class RenderQueue extends Resource {
 
 			if (result.content && !discardContent) {
 				result.headers['x-harper-rendered'] = '1';
+				// ONE timestamp for the page and for the claim recorded alongside it. Taken here rather
+				// than at each use because `recordPageClaim` stores it as the basis a per-URL verification
+				// certifies, and the serve path tests a device key with `lastCached >= basisAt` — two
+				// separate `Date.now()` calls milliseconds apart would make the page fail its own test.
+				const cachedAt = Date.now();
 				// What this render CLAIMS, for the probe to compare the origin against on its next
 				// pass. Best-effort and awaited only for its (node-local) write: see recordPageClaim
 				// — a render must not fail because a probe optimisation could not be recorded.
-				await recordPageClaim(url, result.structuredOffers);
+				await recordPageClaim(url, result.structuredOffers, cachedAt);
 				await databases.page_cache.PrerenderedPage.put(cacheKey, {
 					statusCode: result.statusCode,
-					lastCached: Date.now(),
+					lastCached: cachedAt,
 					content: createBlob(result.content),
 					headers: JSON.stringify(result.headers),
 					expiresAt: nextRenderTime,

@@ -312,6 +312,20 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 	# When the probe last confirmed the cached page's claims matched the origin. COMPARED against the
 	# invalidation epoch, never displayed as freshness — a verified page is still as old as it was.
 	verifiedAt: Date
+	# The `lastCached` of the render whose claims were verified (`ProbeState.pageClaimAt`), and what
+	# makes a per-URL verification safe for PER-DEVICE pages.
+	#
+	# `pageSignature` is keyed by url and written by whichever device rendered last, so the evidence
+	# is per-URL while the pages are per-cacheKey. On a SPLIT PAIR — a normal state here — desktop
+	# could be verified while mobile still holds a pre-change render, and a bare per-URL exemption
+	# would serve the stale mobile page. Carrying the basis closes that exactly: the serve path
+	# exempts a key only when its OWN `lastCached` is at least this, so the verified render and
+	# anything newer qualify and a lagging sibling does not.
+	#
+	# In the healthy case this costs nothing — `util/time.js` seeds jitter off the URL half precisely
+	# so a URL's device variants land on the same minute, so both keys clear the basis and both are
+	# exempt. Absent (a row written before this field existed) reads as NaN and exempts nothing.
+	basisAt: Date
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {
@@ -375,6 +389,12 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# silently narrow drift detection to those fields and stop catching regular/sale price moves.
 	# Nullable and inert unless a rule sets `pageCheck.enabled`.
 	pageSignature: String
+	# The `lastCached` of the render that wrote `pageSignature` — NOT the moment the claim was
+	# recorded. Those differ by milliseconds, and the difference is load-bearing: this value is
+	# copied onto a verification as the basis it certifies, and a stamp taken a few ms after the page
+	# was written would make the very page it certifies fail its own `lastCached >= basisAt` test.
+	# Written in the SAME patch as `pageSignature`, so it costs no extra read and no extra write.
+	pageClaimAt: Date
 }
 
 # Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a

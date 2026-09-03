@@ -839,21 +839,31 @@ const restoreConfig = async () => (await import('../src/config.js')).applyOption
 test('recordPageClaim SEEDS a missing row with put — patch cannot create', async (t) => {
 	t.after(restoreConfig);
 	const calls = await claimHarness();
-	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock']);
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000);
 	assert.equal(calls.patch.length, 0);
 	assert.equal(calls.put.length, 1);
 	assert.equal(calls.put[0].id, CLAIM_URL);
-	assert.deepEqual(calls.put[0].row, { url: CLAIM_URL, pageSignature: JSON.stringify([['35.99'], true]) });
+	assert.deepEqual(calls.put[0].row, {
+		url: CLAIM_URL,
+		pageSignature: JSON.stringify([['35.99'], true]),
+		// The RENDER's lastCached, passed in — not `Date.now()` at claim time. The serve path tests a
+		// device key with `lastCached >= basisAt`, so a stamp taken even milliseconds later would make
+		// the page this claim certifies fail its own test.
+		pageClaimAt: new Date(1_700_000_000_000),
+	});
 });
 
 test('recordPageClaim UPDATES an existing row with patch — put would clobber the probe baseline', async (t) => {
 	t.after(restoreConfig);
 	const calls = await claimHarness({ existing: { url: CLAIM_URL } });
-	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'OutOfStock']);
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'OutOfStock'], 1_700_000_000_000);
 	assert.equal(calls.put.length, 0);
 	assert.equal(calls.patch.length, 1);
 	assert.equal(calls.patch[0].id, CLAIM_URL);
-	assert.deepEqual(calls.patch[0].patch, { pageSignature: JSON.stringify([['35.99'], false]) });
+	assert.deepEqual(calls.patch[0].patch, {
+		pageSignature: JSON.stringify([['35.99'], false]),
+		pageClaimAt: new Date(1_700_000_000_000),
+	});
 });
 
 test('recordPageClaim: an ABSENT field means an old renderer — warn once an hour, write nothing', async (t) => {
@@ -1350,7 +1360,7 @@ const runVerifyPass = async ({ rows, answers, stored = {}, armed = true, ...over
 		read: async (url) => stored[url] ?? null,
 		write: async () => {},
 		trigger: async () => {},
-		verify: async (url) => verified.push(url),
+		verify: async (url, basisAt) => verified.push({ url, basisAt }),
 		isArmed: async (scope) => {
 			armedCalls.push(scope);
 			if (armed === 'throw') throw new Error('read fault');
@@ -1368,14 +1378,19 @@ const runVerifyPass = async ({ rows, answers, stored = {}, armed = true, ...over
 
 const AGREE_SIG = JSON.stringify([39.99, 35.99, 35.99, true]);
 const AGREE_CLAIM = JSON.stringify([['35.99'], true]);
+const CLAIM_AT = new Date(1_700_000_000_000);
 
 test('an unchanged page whose claim AGREES is verified while an invalidation is armed', async () => {
 	const { verified, stats } = await runVerifyPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: AGREE_SIG },
-		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
 	});
-	assert.deepEqual(verified, [URL_A]);
+	assert.deepEqual(
+		verified.map((v) => v.url),
+		[URL_A]
+	);
+	assert.equal(verified[0].basisAt, CLAIM_AT, 'the render basis must be carried onto the verification');
 	assert.equal(stats.unchanged, 1, 'verification must not disturb the signature buckets');
 });
 
@@ -1406,7 +1421,7 @@ test('a CHANGED signature is never verified', async () => {
 	const { verified, stats } = await runVerifyPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: JSON.stringify([39.99, 30.0, 30.0, true]) },
-		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
 	});
 	assert.equal(stats.changed, 1);
 	assert.deepEqual(verified, []);
@@ -1416,7 +1431,7 @@ test('a FIRST OBSERVATION seeds a baseline and is not verified', async () => {
 	const { verified, stats } = await runVerifyPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: AGREE_SIG },
-		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
 	});
 	assert.equal(stats.seeded, 1);
 	assert.deepEqual(verified, [], 'a page the probe has never compared is not proof of anything');
@@ -1427,8 +1442,8 @@ test('NOT ARMED -> no verification writes at all: a converged corpus pays nothin
 		rows: [row(URL_A), row(URL_B)],
 		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
 		stored: {
-			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
-			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT },
+			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT },
 		},
 		armed: false,
 	});
@@ -1440,8 +1455,8 @@ test('the armed check is resolved ONCE PER SCOPE, not once per row', async () =>
 		rows: [row(URL_A), row(URL_B)],
 		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
 		stored: {
-			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
-			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT },
+			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT },
 		},
 	});
 	assert.equal(armedCalls.length, 1, 'a pass covering 300k rows must not pay a point read per row');
@@ -1451,7 +1466,7 @@ test('an armed check that THROWS fails closed', async () => {
 	const { verified } = await runVerifyPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: AGREE_SIG },
-		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
 		armed: 'throw',
 	});
 	assert.deepEqual(verified, [], 'unknown means unverified means keep proxying');
@@ -1465,7 +1480,7 @@ test('with no verify/isArmed wired, the pass behaves exactly as before', async (
 		ownerOf: () => 'node-a',
 		hostname: 'node-a',
 		probe: async () => AGREE_SIG,
-		read: async () => ({ signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM }),
+		read: async () => ({ signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT }),
 		write: async () => {},
 		trigger: async () => {},
 		dryRun: false,
