@@ -40,11 +40,18 @@ export function resolveServeStatus(args) {
 	if (!args || !('epoch' in args) || args.epoch === undefined) {
 		throw new TypeError('resolveServeStatus: `epoch` is required (pass null when none applies)');
 	}
-	const { expiresAtMs, lastCachedMs, swrTtl, now, epoch } = args;
+	const { expiresAtMs, lastCachedMs, swrTtl, now, epoch, verifiedAtMs = NaN } = args;
 
 	const base = expiresAtMs > now ? 'hit' : expiresAtMs + swrTtl > now ? 'swr' : null;
 
-	if (epoch && !(lastCachedMs > epoch.at)) {
+	// `verifiedAtMs` DEFAULTS, where `epoch` throws, and the asymmetry is deliberate. Forgetting the
+	// epoch makes a caller silently epoch-blind — it reports a page as fresh while bots are proxied.
+	// Forgetting a verification only keeps a page invalidated, which is what would have happened
+	// anyway: the pre-feature answer, reached honestly. A default is safe exactly when omitting the
+	// argument cannot produce a serve that would otherwise have been refused.
+	const verified = verifiedAtMs > epoch?.at;
+
+	if (epoch && !(lastCachedMs > epoch.at) && !verified) {
 		// `!(a > b)`, never `<=`. `lastCached` is nullable and an unreadable value yields NaN, and
 		// every comparison against NaN is false — so `<=` would read a page with no usable
 		// `lastCached` as NOT invalidated, i.e. servable. Negating `>` makes NaN count as INVALIDATED
@@ -60,10 +67,30 @@ export function resolveServeStatus(args) {
 			base,
 			epochConsulted: true,
 			invalidatedBy: { scope: epoch.scope, at: epoch.at },
+			exemptedBy: null,
 		};
 	}
 
 	// `epochConsulted` lets a caller that RENDERS a freshness verdict assert it actually asked, rather
 	// than trusting that it did. The admin views' tests assert on it for that reason.
-	return { status: base, servable: base !== null, base, epochConsulted: epoch !== null, invalidatedBy: null };
+	//
+	// `exemptedBy` is set ONLY when a verification is what saved this serve — i.e. an epoch applied,
+	// the page predates it, and proof of currency overrode that. It is not merely "a verification
+	// exists": an exemption that never changed an outcome must not be counted as one, or the metric
+	// stops answering "how much is this feature buying" and starts answering "how many rows exist".
+	//
+	// `base !== null` is load-bearing, and is the same guard the invalidated branch above applies for
+	// the same reason: a page already past its SWR window was never going to be served, so a
+	// verification did not rescue anything. Without it, every stale-but-verified page in the scope
+	// reports as an exemption and the metric measures row count instead of benefit.
+	const exemptedBy =
+		base !== null && epoch && !(lastCachedMs > epoch.at) && verified ? { scope: epoch.scope, at: verifiedAtMs } : null;
+	return {
+		status: base,
+		servable: base !== null,
+		base,
+		epochConsulted: epoch !== null,
+		invalidatedBy: null,
+		exemptedBy,
+	};
 }

@@ -106,6 +106,12 @@ const CACHE_STATUSES = Object.freeze([
 	// (blob-timeout / blob-unreadable), which fires whether or not the rescue lands; blob-timeout /
 	// blob-missing here now mean the rescue ALSO missed and the request went to origin.
 	'peer-rescue',
+	// A page that an invalidation WOULD have refused, served because the change probe proved its
+	// claims still match the origin (`util/pageVerification.js`). Its own status, never folded into
+	// 'hit': this is the number that answers "what is per-page verification buying", and it must be
+	// separable from an ordinary hit both ways round — an operator has to be able to see, at a
+	// glance, how much content is being served on evidence rather than on age.
+	'verified',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
@@ -762,6 +768,10 @@ export const metrics = Object.freeze({
 	invalidationError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'invalidation_error', kind, null),
 
 	/** The outcome of one demand-driven heal attempt — a prerender_ops series. */
+	// outcome: 'written' | 'read-error' | 'write-error'. A skip is not counted here — the serve path's
+	// `verified` cacheStatus is what measures exemptions actually granted, and counting "row absent"
+	// would swamp both with the normal case.
+	pageVerification: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'page_verification', outcome, null),
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 

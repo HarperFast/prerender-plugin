@@ -1328,3 +1328,151 @@ test('a running row with no usable timestamp is not treated as freshly beating',
 		true
 	);
 });
+
+// ---- per-page verification writes (invalidation.verification) ---------------------------------
+
+/**
+ * The write gate for `PageVerification`. Two conditions, and BOTH are load-bearing in a way that is
+ * invisible if you only test the happy path — a bug in either serves invalidated content while every
+ * metric reports success.
+ */
+const runVerifyPass = async ({ rows, answers, stored = {}, armed = true, ...overrides }) => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const verified = [];
+	const armedCalls = [];
+	const rules = compileProbeRules([{ ...PAGECHECK_RULES[0], invalidateScope: 'route:prefix:/p/' }]);
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules,
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => answers[url] ?? null,
+		read: async (url) => stored[url] ?? null,
+		write: async () => {},
+		trigger: async () => {},
+		verify: async (url) => verified.push(url),
+		isArmed: async (scope) => {
+			armedCalls.push(scope);
+			if (armed === 'throw') throw new Error('read fault');
+			return armed;
+		},
+		dryRun: false,
+		maxTriggers: 100,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		...overrides,
+	});
+	return { stats, verified, armedCalls };
+};
+
+const AGREE_SIG = JSON.stringify([39.99, 35.99, 35.99, true]);
+const AGREE_CLAIM = JSON.stringify([['35.99'], true]);
+
+test('an unchanged page whose claim AGREES is verified while an invalidation is armed', async () => {
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+	});
+	assert.deepEqual(verified, [URL_A]);
+	assert.equal(stats.unchanged, 1, 'verification must not disturb the signature buckets');
+});
+
+test('NO pageSignature -> NOT verified, even though pageDisagrees is false', async () => {
+	// THE BUG THIS FEATURE CANNOT SURVIVE. `pageDisagrees` is only computed when a stored claim
+	// exists, so a URL nobody ever compared arrives at the unchanged branch looking exactly like a
+	// real agreement. Writing a verification here would exempt a page from an invalidation on the
+	// strength of a comparison that never happened.
+	const { verified } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: null } },
+	});
+	assert.deepEqual(verified, [], 'no claim was compared, so there is nothing to certify');
+});
+
+test('a DISAGREEING page is triggered, never verified', async () => {
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: JSON.stringify([['35.99'], false]) } },
+	});
+	assert.equal(stats.pageMismatch, 1);
+	assert.deepEqual(verified, []);
+});
+
+test('a CHANGED signature is never verified', async () => {
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: JSON.stringify([39.99, 30.0, 30.0, true]) },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+	});
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(verified, []);
+});
+
+test('a FIRST OBSERVATION seeds a baseline and is not verified', async () => {
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: null, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+	});
+	assert.equal(stats.seeded, 1);
+	assert.deepEqual(verified, [], 'a page the probe has never compared is not proof of anything');
+});
+
+test('NOT ARMED -> no verification writes at all: a converged corpus pays nothing', async () => {
+	const { verified } = await runVerifyPass({
+		rows: [row(URL_A), row(URL_B)],
+		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
+		stored: {
+			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+		},
+		armed: false,
+	});
+	assert.deepEqual(verified, []);
+});
+
+test('the armed check is resolved ONCE PER SCOPE, not once per row', async () => {
+	const { armedCalls } = await runVerifyPass({
+		rows: [row(URL_A), row(URL_B)],
+		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
+		stored: {
+			[URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+			[URL_B]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM },
+		},
+	});
+	assert.equal(armedCalls.length, 1, 'a pass covering 300k rows must not pay a point read per row');
+});
+
+test('an armed check that THROWS fails closed', async () => {
+	const { verified } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM } },
+		armed: 'throw',
+	});
+	assert.deepEqual(verified, [], 'unknown means unverified means keep proxying');
+});
+
+test('with no verify/isArmed wired, the pass behaves exactly as before', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(PAGECHECK_RULES),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => AGREE_SIG,
+		read: async () => ({ signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM }),
+		write: async () => {},
+		trigger: async () => {},
+		dryRun: false,
+		maxTriggers: 100,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+	});
+	assert.equal(stats.unchanged, 1);
+});

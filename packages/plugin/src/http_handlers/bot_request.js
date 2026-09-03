@@ -19,6 +19,7 @@ import { fetchOriginResource } from '../util/upstream.js';
 import { PrerenderedPage } from '../resources/PrerenderedPage.js';
 import { resolveServingPolicy, pollForFreshRender } from '../util/renderNow.js';
 import { resolveServeStatus } from '../util/pageFreshness.js';
+import { resolveVerification } from '../util/pageVerification.js';
 import { resolveInvalidation } from '../util/invalidation.js';
 import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { currentMinuteMs } from '../util/time.js';
@@ -208,14 +209,23 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	const epoch =
 		page && expiresAtMs + config.page.swrTtl > now ? await resolveInvalidation(routeScopeForEntry(info.route)) : null;
 
-	const { status, servable, invalidatedBy } = resolveServeStatus({
+	// SECOND GATE, INSIDE THE FIRST. The epoch read above already costs nothing unless this request
+	// would have been a cache serve; this one costs nothing unless the epoch is actually about to
+	// REFUSE it. So a page that is merely covered by an invalidation and post-epoch — the steady state
+	// once a scope has healed — pays no verification read at all, and the only requests that do pay
+	// one are those already committed to an origin round trip.
+	const verifiedAtMs = epoch && !(lastCachedMs > epoch.at) ? await resolveVerification(cacheUrl) : NaN;
+
+	const { status, servable, invalidatedBy, exemptedBy } = resolveServeStatus({
 		expiresAtMs,
 		lastCachedMs,
 		swrTtl: config.page.swrTtl,
 		now,
 		epoch,
+		verifiedAtMs,
 	});
 	info.invalidatedBy = invalidatedBy;
+	info.exemptedBy = exemptedBy;
 
 	if (servable) {
 		// READ THE BODY BEFORE COMMITTING TO THE CACHE SERVE. A record whose blob file is gone
@@ -232,7 +242,10 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		const cached = await materializeCachedBody(page, request.method);
 		if (cached.ok) {
 			info.cachedBody = cached.body;
-			info.cacheStatus = status;
+			// An exempted serve reports 'verified', not the underlying hit/swr. Folding it into 'hit'
+			// would make the feature invisible in exactly the metric an operator would use to judge it,
+			// and would inflate the freshness signal with pages that are old but proven.
+			info.cacheStatus = exemptedBy ? 'verified' : status;
 			info.source = 'cache';
 			return page;
 		}

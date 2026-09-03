@@ -57,6 +57,8 @@ import { writeSchedules } from './renderSchedule.js';
 import { recordInvalidation, isScopeResolvable } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
+import { resolveInvalidation } from './invalidation.js';
+import { writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
@@ -421,6 +423,23 @@ const warnPageClaimUnsupported = () => {
  * already-collected chunks and the canary from point reads, so probe latency and schedule writes
  * happen with every cursor closed (see util/scan.js for why that discipline is structural).
  */
+/**
+ * Is a per-page exemption worth recording for this scope right now?
+ *
+ * Only while an invalidation is actually active for it. A verification is ONLY ever consulted against
+ * an epoch (`resolveServeStatus`), so rows written when nothing is invalidated buy nothing and would
+ * add ~200k writes per node per cycle to a converged corpus — the exact per-probe write the
+ * `ProbeState` design goes out of its way to avoid.
+ *
+ * Wired into the SWEEP only, never the canary: the canary samples a few hundred URLs to detect a
+ * cliff, so it can neither cover the corpus nor be relied on for coverage, and letting it write
+ * verifications would spread a sparse, misleading set of exemptions across the scope.
+ */
+export const verificationArmedFor = async (scope) => {
+	if (!config.invalidation.verification.enabled) return false;
+	return (await resolveInvalidation(scope)) !== null;
+};
+
 export const runProbePass = async ({
 	rows,
 	rules,
@@ -430,6 +449,11 @@ export const runProbePass = async ({
 	read,
 	write,
 	trigger,
+	// Injected like `write`/`trigger` so a pass can be exercised without Harper, and DEFAULTED INERT:
+	// a caller that does not wire verification gets exactly the pre-feature behaviour. `isArmed` is
+	// resolved once per rule per pass (see below), never per row.
+	verify = null,
+	isArmed = null,
 	dryRun,
 	maxTriggers,
 	concurrency,
@@ -471,6 +495,32 @@ export const runProbePass = async ({
 	// share a symptom and nothing else — and a single merged multiplier cannot answer it.
 	let loadThrottle = 1;
 	const passStarted = now();
+
+	// RESOLVED ONCE PER PASS, NOT PER URL. A pass runs for hours over hundreds of thousands of rows;
+	// a point read per row to ask "is an invalidation still active" would cost more than the feature
+	// saves. Resolving at the top instead means a scope invalidated MID-PASS is not verified until the
+	// next pass — the safe direction, and the only one available without paying that per-row read.
+	// (The opposite error would be worse: a scope CLEARED mid-pass leaves rows written for an epoch
+	// nobody is enforcing, which is harmless — a verification is only ever consulted against an epoch.)
+	const armedScopes = new Map();
+	const isVerificationArmed = async (rule) => {
+		if (!verify || !isArmed) return false;
+		// A rule may only verify pages against the invalidation ITS OWN scope recorded. The rule that
+		// trips an invalidation is the rule entitled to lift it, per URL, and only over the fields it
+		// actually watches — otherwise one rule's price check could exempt pages from an invalidation
+		// recorded for something it never looked at. No scope, no pageCheck, no verification.
+		if (!rule?.pageCheck || !rule?.invalidateScope) return false;
+		if (armedScopes.has(rule.invalidateScope)) return armedScopes.get(rule.invalidateScope);
+		let armed = false;
+		try {
+			armed = await isArmed(rule.invalidateScope);
+		} catch {
+			// Fail closed: unknown means unverified means keep proxying.
+			armed = false;
+		}
+		armedScopes.set(rule.invalidateScope, armed);
+		return armed;
+	};
 
 	const processOne = async ({ row, rule }) => {
 		// Read BEFORE the probe now (it used to read after, to skip the read on a failed probe).
@@ -514,6 +564,8 @@ export const runProbePass = async ({
 		// Runs BEFORE the unchanged early-return, because "unchanged" is exactly the case it
 		// exists to catch. Only for extracted responses — a status-signal literal carries no
 		// price/availability to project (documented limitation).
+		const verificationArmed = await isVerificationArmed(rule);
+
 		let pageDisagrees = false;
 		if (rule.pageCheck && stored?.pageSignature) {
 			let values = null;
@@ -541,6 +593,27 @@ export const runProbePass = async ({
 				// First observation: baseline it, trigger nothing — the page's content is not known
 				// to have changed, the probe just hadn't seen it before.
 				await write(row.url, observed, { rowExists: stored !== null });
+			} else if (verificationArmed && stored.pageSignature) {
+				// PROOF, not absence of news. Both conditions are load-bearing and neither is
+				// redundant:
+				//
+				//   stored.pageSignature  `pageDisagrees` is computed only `if (rule.pageCheck &&
+				//                         stored?.pageSignature)`, so a URL whose page claim is unknown
+				//                         arrives here with `pageDisagrees === false` — identical, at
+				//                         this line, to a real agreement. Without this guard we would
+				//                         stamp "verified" on a page nobody ever compared, and serve it
+				//                         through an invalidation. That is the one failure this feature
+				//                         must never produce.
+				//
+				//   verificationArmed     the exemption only means anything while an invalidation is
+				//                         active for THIS RULE'S scope, and a converged corpus is
+				//                         supposed to pay no write per probe (see the ProbeState
+				//                         comment). Writing unconditionally would add ~200k writes per
+				//                         node per cycle in the steady state to buy nothing.
+				//
+				// Awaited, not detached: it shares the pass's pacing budget, and a write storm that
+				// outruns the probe is exactly what the paced sweep exists to prevent.
+				await verify(row.url);
 			}
 			return;
 		}
@@ -909,6 +982,8 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			read: readSignature,
 			write: writeSignature,
 			trigger: triggerRevalidate,
+			verify: writeVerification,
+			isArmed: verificationArmedFor,
 			...limits,
 			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
 			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
