@@ -781,6 +781,45 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'device key of the URL holds a live claim lease.)',
 						{ unit: 'ms', min: 0 }
 					),
+					crossNode: group(
+						'FORWARD A HEAL TO THE KEY\u2019S OWNER instead of discarding it. Without this, a heal is refused ' +
+							'outright whenever the crawler landed on a node that does not own the key by residency \u2014 measured ' +
+							'at 84-85% of all attempts on a four-node deployment, because bot traffic lands where the CDN\u2019s ' +
+							'geo-routing sends it while residency is hashed over the key, and the two are independent. The ' +
+							'module\u2019s "crawlers revisit" fallback assumes those two distributions match; where traffic is ' +
+							'concentrated on one node they do not, and a quarter of the corpus never heals on demand at all.\n\n' +
+							'THE OWNER DECIDES, this only carries the request. Three of the accelerator\u2019s guards \u2014 the live-lease ' +
+							'check, the authoritative schedule read, and therefore "never raise a due time" \u2014 can only be ' +
+							'evaluated on the owner, so writing from the receiving node instead would trade coverage for ' +
+							'delayed renders. (The floor objection people reach for first is void: `claim` seeks from a floor ' +
+							'clamped to `now - claimFloor.guard`, so any due time at or after the current minute is claimable ' +
+							'on any node.)\n\n' +
+							'COST IS BOUNDED BY `maxPerMinute`, NOT BY TRAFFIC: the slot is reserved before the call, so this ' +
+							'is at most that many requests per node per minute however much bot traffic arrives.\n\n' +
+							'REQUIRES `peerRescue.token` and `peerRescue.header`, reusing that shared cluster secret rather ' +
+							'than minting a second one \u2014 same trust boundary (node-to-node, on the serve path, with no user ' +
+							'credential available to forward), and one secret to rotate instead of two. With either unset this ' +
+							'is inert and the endpoint answers 404.',
+						{
+							enabled: option(
+								false,
+								'Off by default, like the accelerator itself. While off, a heal for a key this node does not own ' +
+									'is refused as `not-owner` exactly as before, and the `/prerender_peer/heal` endpoint does not ' +
+									'exist.'
+							),
+							timeoutMs: option(
+								2000,
+								'Deadline for one forwarded heal. Generous is pointless here: the request that triggered it has ' +
+									'already been answered, this is a repair running detached, and a peer that cannot answer in ' +
+									'seconds will not heal anything useful. A timeout is counted as `forward-failed`.\n\n' +
+									'Capped at the 32-bit signed maximum because this value reaches `setTimeout`: past that Node ' +
+									'emits TimeoutOverflowWarning and fires the timer IMMEDIATELY, so a fat-fingered value would ' +
+									'abort every forwarded heal on the spot rather than allowing a long one. The cap turns that ' +
+									'into a rejected value that keeps the default.',
+								{ unit: 'ms', min: 1, max: 2147483647 }
+							),
+						}
+					),
 					maxPerMinute: option(
 						10,
 						'Per-node ceiling on accelerated REQUESTS per minute, shared across every worker on the node ' +
