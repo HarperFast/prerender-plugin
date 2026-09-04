@@ -110,6 +110,19 @@ async function syncQueueState(force = false, pending = null) {
 	return { status, ...desired };
 }
 
+// The classes a browser ≥ 1.22.0 worker tallies per render (src/subrequests.ts over there). Read as
+// finite non-negative numbers or not at all: a tally with a missing class is a worker this plugin
+// does not know, and half a tally recorded as zeros would understate k rather than say nothing.
+const SUBREQUEST_CLASSES = ['sameOrigin', 'cacheable', 'uncacheable', 'unspecified', 'blocked'];
+const readSubrequests = (tally) => {
+	if (!tally || typeof tally !== 'object') return null;
+	for (const klass of SUBREQUEST_CLASSES) {
+		const n = tally[klass];
+		if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return null;
+	}
+	return tally;
+};
+
 export class RenderQueue extends Resource {
 	static loadAsInstance = false;
 
@@ -320,6 +333,15 @@ export class RenderQueue extends Resource {
 
 		const hasContent = result.statusCode === 200 && result.content;
 
+		// The page's same-origin subrequest tally, by shared-cache class (browser ≥ 1.22.0). One VALUE
+		// per class per result, so the fleet total is mean × count and the mean is k per render. Every
+		// class the worker reported, not only `uncacheable`: `unspecified` and `blocked` bound what k
+		// leaves out, and are worth nothing unless they are recorded beside it.
+		const subrequests = readSubrequests(result.subrequests);
+		if (subrequests) {
+			for (const klass of SUBREQUEST_CLASSES) metrics.renderSubrequests(subrequests[klass], klass);
+		}
+
 		if (typeof result.renderTime === 'number') {
 			metrics.renderTime(
 				result.renderTime,
@@ -386,6 +408,11 @@ export class RenderQueue extends Resource {
 					headers: JSON.stringify(result.headers),
 					expiresAt: nextRenderTime,
 					isIndexable: typeof result.isIndexable === 'boolean' ? result.isIndexable : null,
+					// k, and which side of the offload ledger it lands on when this row is served (see the
+					// schema). Null — never 0 — when the worker predates the tally: the serve path reports
+					// null as `unknown`, where a 0 would read as "this page makes no origin calls".
+					uncacheableSubrequests: subrequests ? subrequests.uncacheable : null,
+					scriptsStripped: typeof result.scriptsStripped === 'boolean' ? result.scriptsStripped : null,
 				});
 			}
 

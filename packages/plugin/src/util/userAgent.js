@@ -242,3 +242,34 @@ export const botCountsAsDemand = (botName) => {
 	if (demandSet === null) return true;
 	return typeof botName === 'string' && demandSet.has(botName.toLowerCase());
 };
+
+let rendersJsSet = null; // lowercase Set of registry names flagged rendersJs
+let rendersJsFrom; // the registry array the current set was built from
+
+/**
+ * Does the crawler labeled `botName` EXECUTE the pages it fetches?
+ *
+ * Read off the registry: an `analytics.bots` entry with `rendersJs: true`. This is the gate on
+ * `hydration_calls` (metrics.js) — the origin calls a page's own scripts make are only made by a
+ * crawler that runs those scripts, so only such a crawler's page-views carry the per-page factor
+ * k on either side of the offload ledger. It is a CLAIM about the crawler, not an observation:
+ * nothing here can see what a crawler does after it leaves with the document. The defaults flag
+ * only the vendors who document rendering (see configSchema.js); an unflagged crawler is assumed
+ * to fetch HTML and run nothing, which is what every AI crawler in the registry does today.
+ *
+ * Names are compared case-insensitively, like the other two registry-derived allowlists, and a
+ * derived name (a self-identifying UA the registry does not list) is never flagged — it has no
+ * entry to carry the flag.
+ */
+export const botRendersJs = (botName) => {
+	if (config.analytics.bots !== rendersJsFrom) {
+		const entries = Array.isArray(config.analytics.bots) ? config.analytics.bots : [];
+		rendersJsSet = new Set(
+			entries
+				.filter((entry) => entry && typeof entry.name === 'string' && entry.rendersJs === true)
+				.map((entry) => entry.name.toLowerCase())
+		);
+		rendersJsFrom = config.analytics.bots;
+	}
+	return typeof botName === 'string' && rendersJsSet.has(botName.toLowerCase());
+};

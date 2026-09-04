@@ -1874,7 +1874,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					// Search engines
 					{ name: 'Googlebot-Image', match: 'googlebot-image' },
 					{ name: 'Googlebot-Video', match: 'googlebot-video' },
-					{ name: 'Google InspectionTool', match: 'google-inspectiontool' },
+					{ name: 'Google InspectionTool', match: 'google-inspectiontool', rendersJs: true },
 					// the -Image/-Video variants need their own entries: the matcher requires a
 					// boundary after the match, so bare `googleother` can't cross the hyphen
 					{ name: 'GoogleOther-Image', match: 'googleother-image' },
@@ -1882,12 +1882,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					{ name: 'GoogleOther', match: 'googleother' },
 					{ name: 'Storebot-Google', match: 'storebot-google' },
 					{ name: 'AdsBot-Google', match: 'adsbot-google' },
-					{ name: 'Googlebot', match: 'googlebot' },
-					{ name: 'Bingbot', match: 'bingbot' },
+					{ name: 'Googlebot', match: 'googlebot', rendersJs: true },
+					{ name: 'Bingbot', match: 'bingbot', rendersJs: true },
 					{ name: 'DuckDuckBot', match: 'duckduckbot-https' },
 					{ name: 'DuckDuckBot', match: 'duckduckbot' },
-					{ name: 'Applebot', match: 'applebot' },
-					{ name: 'YandexBot', match: 'yandexbot' },
+					{ name: 'Applebot', match: 'applebot', rendersJs: true },
+					{ name: 'YandexBot', match: 'yandexbot', rendersJs: true },
 					{ name: 'Baidu Spider', match: 'baiduspider' },
 					{ name: 'SeznamBot', match: 'seznambot' },
 					{ name: 'Naver Yeti', match: 'yeti' },
@@ -1923,9 +1923,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					{ name: 'OnCrawl', match: 'oncrawl' },
 					{ name: 'Sitebulb', match: 'sitebulb' },
 				],
-				'Crawler registry: { name, match } entries, where `match` is a case-insensitive substring of ' +
-					'the User-Agent; longer matches win over shorter ones (e.g. `googlebot-image` before ' +
-					'`googlebot`).',
+				'Crawler registry: { name, match, rendersJs? } entries, where `match` is a case-insensitive substring ' +
+					'of the User-Agent; longer matches win over shorter ones (e.g. `googlebot-image` before ' +
+					'`googlebot`). `rendersJs: true` marks a crawler that EXECUTES the pages it fetches — Google’s ' +
+					'Web Rendering Service (Googlebot, the URL Inspection tool), Bingbot’s evergreen Chromium, ' +
+					'Applebot, YandexBot — and is the gate on the `hydration_calls` metric: only such a crawler’s ' +
+					'page-views carry the page’s own XHR/API calls to the origin, on either side of the offload ' +
+					'ledger. It is a claim about the crawler, not something this plugin can observe: nothing here ' +
+					'sees what a crawler does after it leaves with the document. Every AI crawler in the default ' +
+					'registry fetches HTML and runs nothing, and is deliberately unflagged; flag a bot only on its ' +
+					'vendor’s documentation.',
 				{ itemType: 'object' }
 			),
 		}

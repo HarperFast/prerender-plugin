@@ -338,6 +338,17 @@ type PrerenderedPage @table(database: "page_cache") @export {
 	# Indexability verdict from the render, stored so the serving path can surface it
 	# as a debug response header (x-harper-indexable). Optional — older rows lack it.
 	isIndexable: Boolean
+	# The page's own origin factor k, as the render fleet measured it: same-origin requests the
+	# page made beyond the document that no shared cache would have answered (browser ≥ 1.22.0,
+	# `subrequests.uncacheable`). Read on the serve path for a crawler that executes scripts and
+	# emitted as `hydration_calls` — the origin load its page-view carries, which is either SPARED
+	# (snapshot stored without scripts) or INCURRED (scripts kept, or an origin serve). Optional:
+	# a row rendered by an older fleet has none, and the serve path reports it as `unknown`.
+	uncacheableSubrequests: Int
+	# Whether the stored body had its scripts stripped by the render fleet (its
+	# postProcess.stripScripts at render time). Decides which side of the ledger k lands on when
+	# this row is cache-served. Optional, same vintage as the field above.
+	scriptsStripped: Boolean
 }
 
 type SharedBuffer @table(database: "coordination", replicate: false) {
