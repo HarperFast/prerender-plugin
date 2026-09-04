@@ -162,6 +162,37 @@ not have — the discovery gate, and a client-side bot filter), **Sitemaps**, **
 **Queue** (render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first
 record/clear), **Change probe**, **URL explainer**, **Metrics** (the live catalog), **Config**.
 
+**Offload is stated twice, gross and net** (console v0.12.0). The gross figure — crawler requests
+not proxied to the origin live — is what every serve-side panel is built from, and it is
+flattering: it counts what the origin was spared and none of what this system asks of the origin
+in exchange. Every render is the headless fleet loading a page from the origin; every change probe
+is an origin call; every sitemap refresh fetches the sitemap. A deployment rendering its whole
+corpus on a short cadence for a trickle of bot traffic can post a 95% gross offload while sending
+the origin _more_ requests than the crawlers would have. Net offload is
+`1 − (proxied + renders + probes + sitemap fetches) ÷ crawler requests arrived`, every term from a
+series already in the one analytics scan, and the panel beside the origin-fetch chart shows each
+term over time. Two caveats are written on the panel rather than assumed: a render counts as one
+origin request (the document — the page's own subresources reach the origin only if the CDN does
+not cache them for the renderer), and the probe and sitemap counters land in the bucket where a
+_pass finished_, so a short range reads either none of a running sweep or all of one that just
+ended — quote the 24h figure. One term the plugin cannot see at all is stated rather than
+omitted: whatever a crawler fetches from the origin _after_ we hand it a page — a rendering
+crawler's scripts and then the page's own XHR/API calls above all — never passes through this
+plugin, so the net tile says "before crawler follow-up requests" and the panel reports the
+exposure (every page handed to a crawler) as a count, never multiplied by a guessed factor. The
+render fleet can measure the per-page factor; when a plugin reports it, that tile becomes a number.
+
+**Invalidations gained a third panel** for the same release: what the active rows are doing.
+Refused serves (`invalidated` — each an origin round trip) beside rescued ones (`verified`, plugin
+v0.63.0 — a page the change probe has _proved_ current since the epoch, served from cache through
+the invalidation), the verifications the sweep recorded, and every outcome of the demand-driven
+heal including v0.64.0's cross-node `forwarded` / `forward-failed`. `forwarded` is deliberately
+never added to `lowered`: the owner counts a forwarded heal under its own verdict in the same
+series, so adding the two double-counts under cluster scope. The `verified` status is also a
+cache serve everywhere else in the console — the freshness chart, the per-route table, the
+staleness sums — and sits in one "Invalidation" family with `invalidated` on the non-hit strip,
+because the two are one population split into rescued and refused.
+
 **Change probe is new** (plugin v0.53.0+), and it is the one freshness surface that does not measure
 pages against a cadence. It reads what the probe is actually detecting — the change rate against the
 probes that HAD a baseline, not against every probe, because a pass that is mostly seeding has
@@ -181,6 +212,13 @@ sweeps — counted against the rows a pass _considered_, since a skipped URL was
 flagged when a settled deployment skips most of them, which means `reprobeAfter` sits too close to
 `sweepInterval`), and registry rows that could not be decoded, which is a storage-layer escalation
 rather than anything a setting here reaches.
+
+Plugin v0.62.0 moved the probe's state into a node-local row every worker can read (before it, 15
+of 16 workers answered "not running, never ran" — indistinguishable from the probe being off), and
+the endpoint now says when that row could _not_ be read. The console prints that as the loudest
+note on the page — the node is unknown, not idle — and shows a running sweep's heartbeat count
+("~24,000 rows examined") on the header pill, the sweep card and the per-node table, summed across
+the nodes running because each walks its own slice.
 
 Plugin v0.58.0's `pageCheck` adds the one counter on that card that is not about the origin
 changing: **page mismatches** — cached pages that disagree with the origin on a field they claim.

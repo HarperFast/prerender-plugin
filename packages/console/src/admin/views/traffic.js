@@ -18,6 +18,18 @@
  * it costs no request), falling back to `render.defaultInterval`. Absolute milliseconds stay one
  * click away, and the KPI carries both.
  *
+ * OFFLOAD IS STATED TWICE, GROSS AND NET, because the number the rollout is judged on is not the
+ * one the serve path can see. Gross offload is the share of crawler requests that were not proxied
+ * to the origin live — `bot_serve` source ≠ origin — and it is what every serve-side panel here is
+ * built from. It is also flattering: it counts what the origin was spared and none of what this
+ * system asks of the origin in exchange — every render, every change probe, every sitemap fetch is
+ * an origin request. Net offload subtracts those (`originLoad` in charts.js carries the arithmetic
+ * and its caveats), and the panel beside the origin-fetch chart shows each term. One term it
+ * cannot count is stated rather than omitted: whatever a crawler fetches from the origin after we
+ * hand it a page (a rendering crawler's scripts and API calls above all), which never passes
+ * through this plugin. The net tile says "before crawler follow-up requests" and the panel reports
+ * the exposure — every page handed to a crawler — as a count, never multiplied by a guessed factor.
+ *
  * AND NOT EVERY MISS IS OURS. A miss whose origin fetch came back 404 or 410 is a URL that does
  * not exist anywhere — there is nothing for the cache to be missing, and it can never improve,
  * because only a 200 is ever scheduled for prerendering. Left in the coverage number those URLs
@@ -39,9 +51,11 @@
  * THE BOT FILTER IS CLIENT-SIDE, ALWAYS. Selecting bots re-renders from the payload already in
  * hand; it never refetches, because the load discipline below is the whole reason this view can
  * afford to be this detailed. Four metrics carry a bot (`bot_request`, `bot_serve`, `page_age`,
- * and `prerender_ops`'s `discovery_gated`) and the rest do not — `route_serve`, `origin_fetch`, `duration` and `response_*` have no bot
- * dimension at all — so a panel that CANNOT honour the filter says "all bots" on its face rather
- * than quietly showing every crawler's numbers under one crawler's name.
+ * and `prerender_ops`'s `discovery_gated`) and the rest do not — `route_serve`, `origin_fetch`,
+ * `render`, the probe and sitemap counters, `duration` and `response_*` have no bot dimension at
+ * all — so a panel that CANNOT honour the filter says "all bots" on its face rather than quietly
+ * showing every crawler's numbers under one crawler's name. Net offload is one of those: a render
+ * is not for any one crawler.
  *
  * LOAD DISCIPLINE. Every number on this view comes from a single `analytics` request; each
  * node answers it from a per-worker cache inside `management.analytics.cacheTtl`, so switching
@@ -69,9 +83,13 @@ import {
 	emptyNote,
 	fmtCount,
 	fmtMs,
+	fmtNet,
 	fmtRatio,
+	isCacheServed,
 	legend,
 	lineChart,
+	originLoad,
+	originLoadBuckets,
 	pick,
 	rangePicker,
 	ratioOf,
@@ -148,7 +166,9 @@ export function render(ctx) {
 	const requests = pick(data, 'bot_request', (s) => keepBot(filter, s.method));
 	const ages = pick(data, 'page_age', (s) => keepBot(filter, s.path));
 	const cadences = cadenceIndex(configState(ctx).payload, data.intervals?.defaultRenderInterval);
-	const scope = { serves, requests, ages, cadences, filter };
+	// Over ALL bots whatever the filter says: three of its four terms carry no bot (see the header).
+	const load = originLoad(data);
+	const scope = { serves, requests, ages, cadences, filter, load };
 
 	return [
 		head,
@@ -158,8 +178,10 @@ export function render(ctx) {
 		kpis(data, scope),
 		el('div', { cls: 'cols' }, [freshness(data, scope), staleness(ctx, data, scope)]),
 		notFreshHit(data, scope),
-		el('div', { cls: 'cols' }, [originFetch(data, filter), latency(data, filter)]),
-		el('div', { cls: 'cols' }, [crawlers(data, scope), statusCodes(data, filter)]),
+		// The two origin-side panels together: what the origin was asked, then what each ask cost.
+		el('div', { cls: 'cols' }, [originSeen(data, scope), originFetch(data, filter)]),
+		el('div', { cls: 'cols' }, [latency(data, filter), statusCodes(data, filter)]),
+		crawlers(data, scope),
 		routes(ctx, data, cadences, filter),
 		discoveryGate(ctx, data, filter),
 		breadth(ctx, filter),
@@ -377,6 +399,7 @@ function kpis(data, scope) {
 	const freshHits = sumCount(serves.filter((s) => s.method === 'hit'));
 	const coverage = coverageSplit({ serves, costs: originCostByReason(data), filter });
 	const arrived = sumCount(requests);
+	const { load } = scope;
 
 	// SERVE TIME IS TWO POPULATIONS, and one number over both is a number about the hit rate. A
 	// cache hit is single-digit milliseconds and an origin proxy is hundreds; pooling them produces
@@ -420,11 +443,26 @@ function kpis(data, scope) {
 			{ warn: unresolvedShare > 0.02 }
 		),
 		stat(
-			'Origin offload',
+			'Origin offload · gross',
 			pct(total - originServes, total),
-			'requests the origin never saw',
+			'crawler requests not proxied live',
 			// The offload number is the rollout's headline; a majority-origin window deserves the flag.
 			{ warn: total > 0 && originServes > total / 2 }
+		),
+		stat(
+			'Origin offload · net',
+			fmtNet(load.net),
+			// The subtitle carries the sum, because the tile's whole point is what the gross figure
+			// leaves out — and under a bot filter it says so, since this one cannot narrow. "Before
+			// crawler follow-up requests" is the term that is NOT in the sum (see originLoad).
+			load.arrived > 0
+				? `origin saw ${fmtCount(load.total)} of ${fmtCount(load.arrived)} asked · before crawler follow-up requests${
+						filter ? ' · all bots' : ''
+					}`
+				: 'no crawler requests in the window',
+			// Below half is a flag on either figure; below ZERO means this system is sending the origin
+			// more requests than the crawlers would have on their own — the finding, not a display bug.
+			{ warn: Number.isFinite(load.net) && load.net < 0.5 }
 		),
 		stat('Cache-served', pct(cacheServes, total), 'stored snapshot answered'),
 		stat('Fresh hits', pct(freshHits, total), 'inside the configured cadence'),
@@ -473,9 +511,9 @@ function freshness(data, { serves, filter }) {
 				? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k))
 				: emptyNote('bot_serve', data),
 			el('p', { cls: 'muted chart-note' }, [
-				'hit + swr + peer-rescue is cache-served. A rising miss share is a coverage problem; a rising ',
-				'swr share is the fleet not keeping the configured cadence; blob-* should sit at zero. What each ',
-				'verdict costs, and which of them are the same problem, is the panel below.',
+				'hit + swr + verified + peer-rescue is cache-served. A rising miss share is a coverage problem; a ',
+				'rising swr share is the fleet not keeping the configured cadence; blob-* should sit at zero. What ',
+				'each verdict costs, and which of them are the same problem, is the panel below.',
 			]),
 			filter && muted(`Filtered to ${[...filter].join(', ')}.`),
 		],
@@ -534,9 +572,7 @@ function staleness(ctx, data, scope) {
 	// differ whenever a target's cadence comes from its stored value (a sitemap `changefreq`)
 	// instead — a case no metric exposes. When the two disagree, the verdicts win and the divisor
 	// is what is wrong, so say that rather than let a config gap read as a fleet failure.
-	const cacheServed = sumCount(
-		serves.filter((x) => x.method === 'hit' || x.method === 'swr' || x.method === 'peer-rescue')
-	);
+	const cacheServed = sumCount(serves.filter((x) => isCacheServed(x.method)));
 	const pastDue = sumCount(serves.filter((x) => x.method === 'swr' || x.method === 'stale'));
 	const contradicted =
 		normalizable && Number.isFinite(ratioP95) && ratioP95 > 1 && cacheServed > 0 && pastDue / cacheServed < 0.01;
@@ -643,8 +679,12 @@ const FAMILIES = [
 	},
 	{
 		key: 'invalidated',
-		label: 'Invalidated',
-		hint: 'a bulk invalidation cost the serve',
+		label: 'Invalidation',
+		// One family for both halves, because they are one population — the pages a bulk
+		// invalidation touched — split by what happened next: refused (`invalidated`, proxied to the
+		// origin) or rescued (`verified`, served from cache on the probe's evidence). Read against
+		// each other they size what per-page verification is buying; apart, neither means much.
+		hint: 'a bulk invalidation touched the serve — refused, or rescued on evidence',
 	},
 	{
 		key: 'not-cacheable',
@@ -669,6 +709,13 @@ const NOT_HIT = {
 		'the local body failed and the residency owner’s copy answered it — still a cache serve',
 	],
 	'invalidated': ['invalidated', 'a bulk invalidation demoted a page that would otherwise have served'],
+	// Deliberately its own verdict upstream and never folded into `hit`: the page is as old as it
+	// ever was and is being served on EVIDENCE (the probe re-confirmed its price/availability
+	// claims after the epoch), not on age. Still a cache serve — it counts toward offload.
+	'verified': [
+		'invalidated',
+		'an invalidation would have refused it; the change probe proved its claims current — still a cache serve',
+	],
 	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
 	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD)'],
 };
@@ -902,9 +949,10 @@ function notFreshHit(data, { serves, filter }) {
 					'counted in the status panel below.',
 				]),
 			el('p', { cls: 'muted chart-note' }, [
-				'One row per freshness verdict, because they are four different problems: coverage is fixed in the ',
+				'One row per freshness verdict, because they are different problems: coverage is fixed in the ',
 				'corpus (discovery, sitemaps), cadence by render capacity or a longer interval, integrity is blob ',
-				'health and never a caching question, and the last two are working as configured. ',
+				'health and never a caching question, invalidation is a bulk invalidation doing its job — with ',
+				'`verified` the part per-page verification bought back — and not-cacheable is working as configured. ',
 				'“origin median” is what that verdict typically costs at the origin, with its p95 in the tooltip — and ',
 				'“origin answered” is what came back: `absent` (404/410) is a page nobody has, `server-error` and ',
 				'`connect-fail` are the origin in trouble, and only `served` is a page we could have had cached.',
@@ -1059,6 +1107,140 @@ function statusCodes(data, filter) {
 	});
 }
 
+// ---- what the origin actually saw ----------------------------------------------
+//
+// The gross offload tile is a serve-side number, and the serve path is not the only thing here
+// that talks to the origin. The arithmetic is `originLoad` in charts.js (the overview reads the
+// same figure); this is the panel that shows its terms.
+
+/** What the origin saw, by cause, over time — the panel behind the net offload tile. */
+const LOAD_ROWS = [
+	{
+		key: 'proxied',
+		label: 'proxied serves',
+		color: 'var(--warn)',
+		means: 'crawler requests forwarded live — the only term the gross figure counts',
+	},
+	{
+		key: 'renders',
+		label: 'renders',
+		color: SERIES[0],
+		means: 'page loads by the render fleet, one per posted result — the document only',
+	},
+	{
+		key: 'probes',
+		label: 'change probes',
+		color: SERIES[2],
+		means: 'origin calls by the change probe, failures included',
+	},
+	{ key: 'sitemaps', label: 'sitemap fetches', color: SERIES[3], means: 'sitemaps read by refresh runs' },
+];
+
+function originSeen(data, { load, filter }) {
+	const stacks = originLoadBuckets(data);
+	const present = LOAD_ROWS.filter((row) => load[row.key] > 0);
+	const keys = present.map((row) => row.key);
+	const colorOf = (key) => LOAD_ROWS.find((row) => row.key === key)?.color ?? 'var(--fg-4)';
+
+	return card('What the origin actually saw', {
+		head: [
+			spacer(),
+			allBotsTag(filter, 'renders, probes and sitemap fetches are not for any one crawler'),
+			legend(present.map((row) => ({ label: row.label, color: row.color }))),
+		],
+		body: !load.total
+			? [
+					el('div', { cls: 'note ok' }, [
+						'Nothing in this window reached the origin — no proxied serve, no render, no probe, no sitemap ',
+						'fetch. Offload is 100% gross and net alike.',
+					]),
+					followUpNote(load),
+				]
+			: [
+					el('div', { cls: 'stat-grid tight' }, [
+						stat('Crawlers asked for', fmtCount(load.arrived), 'requests at ingress, all bots'),
+						stat(
+							'The origin answered',
+							fmtCount(load.total),
+							`${pct(load.total, load.arrived)} of that — ${fmtNet(load.net)} net offload`,
+							{ warn: Number.isFinite(load.net) && load.net < 0.5 }
+						),
+						stat(
+							'Gross offload counts',
+							fmtCount(load.proxied),
+							`${fmtCount(load.total - load.proxied)} more came from this system`
+						),
+						// The unmeasured term gets a tile so it sits in the same row as the measured ones, at
+						// the same size — not a footnote under a number that looks complete without it.
+						stat(
+							'Crawler follow-up requests',
+							'not measured',
+							`${fmtCount(load.handed)} pages handed to crawlers · what each fetched next bypasses this plugin`
+						),
+					]),
+					stackedBars(data, keys, stacks, colorOf, { format: fmtCount }),
+					barList(
+						present.map((row) => ({
+							label: row.label,
+							value: load[row.key],
+							color: row.color,
+							sub: pct(load[row.key], load.total),
+							title: `${row.label}: ${num(load[row.key])} — ${row.means}`,
+						})),
+						{ format: fmtCount }
+					),
+					el('p', { cls: 'muted chart-note' }, [
+						'Every request the origin answered because this deployment exists, against what crawlers asked ',
+						'for. Gross offload counts only the first bar; net offload subtracts all of them. A render is ',
+						'counted as ONE request — the document; the page’s own scripts and stylesheets reach the origin ',
+						'too if the CDN does not cache them for the renderer, which nothing here can see. A probe is one ',
+						'small endpoint call, not a page render — cheaper per request than the others, but a request.',
+						load.lumpy
+							? ' Probe and sitemap counts land where a PASS FINISHED, not where the requests happened: over ' +
+								'a range shorter than a sweep this is either none of a running pass or all of one that just ' +
+								'ended. Quote the 24h figure.'
+							: '',
+						' Not counted: requests the CDN answered from its own cache, and renders that never posted a result.',
+					]),
+					followUpNote(load),
+					Number.isFinite(load.net) &&
+						load.net < 0 &&
+						el('div', { cls: 'note warn' }, [
+							el('strong', { text: 'The origin saw more requests than the crawlers made. ' }),
+							'Net offload is negative: the render and probe cadence is generating more origin load than ',
+							'the bot traffic it is standing in for. That is the expected shape of a fresh deployment ',
+							'backfilling its corpus, and of a corpus much larger than what crawlers actually walk — the ',
+							'levers are the render interval, the demand ladder’s floors, the discovery gate, and the ',
+							'probe rate. Read it over 24h before acting on it.',
+						]),
+				],
+	});
+}
+
+/**
+ * The fifth term, spelled out. Shown whenever a page was handed to a crawler at all — including on
+ * the "nothing reached the origin" exit, where a net offload of 100% is precisely the claim this
+ * term qualifies.
+ */
+function followUpNote(load) {
+	if (!load.handed) return null;
+	return el('div', { cls: 'note' }, [
+		el('strong', {
+			text: `${num(load.handed)} pages were handed to crawlers, and what each crawler fetched next is not counted. `,
+		}),
+		'A rendering crawler (Googlebot, Bingbot, Applebot) loads the page’s scripts and then makes the XHR/fetch ',
+		'calls the page makes — inventory, pricing, personalisation — and those are the calls least likely to be ',
+		'cacheable; an image crawler fetches the images; any crawler may follow a linked resource. None of it ',
+		'passes through this plugin (the CDN sends a crawler’s subrequests straight to the origin), so nothing ',
+		'here can count it, and the net figure above is stated BEFORE it rather than with a guessed ',
+		'requests-per-page multiplied in — for every crawler, not a guessed subset of them. The render fleet can ',
+		'measure the per-page factor (it loads the same pages and already classifies every same-origin response ',
+		'as cacheable or not); stored on the cached page and applied at serve time by what the registry says a ',
+		'crawler fetches, this becomes a counted term. A snapshot served with its scripts stripped hydrates ',
+		'nothing, which makes even the rendering crawlers’ share an upper bound.',
+	]);
+}
+
 /** What a non-cache serve costs: why the origin was consulted, how slowly it answered, and with what. */
 function originFetch(data, filter) {
 	const fetches = pick(data, 'origin_fetch');
@@ -1114,7 +1296,7 @@ function routes(ctx, data, cadences, filter) {
 		const route = s.path ?? 'unrouted';
 		const entry = byRoute.get(route) ?? { total: 0, cache: 0, miss: 0, aging: 0, integrity: 0 };
 		entry.total += s.count;
-		if (s.method === 'hit' || s.method === 'swr' || s.method === 'peer-rescue') entry.cache += s.count;
+		if (isCacheServed(s.method)) entry.cache += s.count;
 		if (s.method === 'miss') entry.miss += s.count;
 		if (s.method === 'swr' || s.method === 'stale') entry.aging += s.count;
 		if (s.method === 'blob-missing' || s.method === 'blob-timeout' || s.method === 'peer-rescue')

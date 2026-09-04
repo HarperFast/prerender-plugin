@@ -28,7 +28,7 @@ installDom();
 const { el } = await import('../src/admin/ui.js');
 const { load, render, cadenceIndex, cadenceFor, notHitRows, originVerdict, originCostByReason, coverageSplit } =
 	await import('../src/admin/views/traffic.js');
-const { ratioOf } = await import('../src/admin/charts.js');
+const { ratioOf, originLoad, fmtNet, isCacheServed } = await import('../src/admin/charts.js');
 
 const HOUR = 3_600_000;
 const BUCKETS = 4;
@@ -121,6 +121,13 @@ const ANALYTICS = {
 		combo('response_500', 'p', 'GET', null, 60),
 		// A served page whose age computed negative — dropped from the distribution above
 		combo('prerender_ops', 'page_age_negative', 'googlebot', 'desktop', 3),
+		// What this system asked of the origin: 120 posted render results (one row each), one probe
+		// pass that made 60 requests (a VALUE — one emit carrying the count), one sitemap refresh
+		// that read 12 sitemaps. With 260 proxied serves the origin saw 452 of the 1,010 requests
+		// crawlers made: 74% gross offload, 55% net.
+		combo('render', 'outcome', 'rendered', null, 120),
+		combo('prerender_ops', 'probe_probed', null, null, 1, 60),
+		combo('prerender_ops', 'sitemap_sitemaps', null, null, 1, 12),
 	],
 };
 
@@ -407,6 +414,141 @@ test('the KPI strip separates a coverage miss from every other non-hit', async (
 	assert.match(text, /15%/);
 	// And the families are all named, each with its own fix.
 	for (const family of ['Coverage', 'Cadence', 'Integrity']) assert.match(text, new RegExp(family));
+});
+
+// ---- net offload ----------------------------------------------------------------
+
+test('net offload subtracts every origin request this system made; gross subtracts only the proxied ones', () => {
+	const load = originLoad(ANALYTICS);
+	// 100 + 150 misses and 10 blob-timeouts, all answered from the origin.
+	assert.equal(load.proxied, 260);
+	// One row per posted result, so the emit COUNT is the render count …
+	assert.equal(load.renders, 120);
+	// … while the pass counters carry their count as a VALUE: one emit, 60 probes. sumCount here
+	// would report 1 and the origin load would be short by a whole pass.
+	assert.equal(load.probes, 60);
+	assert.equal(load.sitemaps, 12);
+	assert.equal(load.total, 452);
+	// The baseline is what ARRIVED (bot_request), not what was served.
+	assert.equal(load.arrived, 1010);
+	assert.ok(Math.abs(load.net - (1010 - 452) / 1010) < 1e-9);
+	// A pass counter contributed, so the figure is stamped as landing where a pass finished.
+	assert.equal(load.lumpy, true);
+	// The unmeasured term's exposure is every page handed to a crawler, not a subset of bots.
+	assert.equal(load.handed, 1010);
+});
+
+test('the KPI strip carries gross AND net, and says what the net figure leaves out', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	assert.match(text, /Origin offload · gross/);
+	assert.match(text, /74%/);
+	assert.match(text, /Origin offload · net/);
+	assert.match(text, /55%/);
+	// The fifth term is stated on the tile, on the panel's own tile, and in the note — never
+	// multiplied in as a guess.
+	assert.match(text, /before crawler follow-up requests/);
+	assert.match(text, /What the origin actually saw/);
+	assert.match(text, /Crawler follow-up requests/);
+	assert.match(text, /not measured/);
+	assert.match(text, /1,010 pages were handed to crawlers/);
+	// Every measured term is named with its count.
+	for (const term of ['proxied serves', 'renders', 'change probes', 'sitemap fetches'])
+		assert.match(text, new RegExp(term));
+	// And the lumpiness caveat appears because a pass counter contributed.
+	assert.match(text, /land where a PASS FINISHED/);
+});
+
+test('a window with no crawler requests has no net offload — not a 100% one', () => {
+	const noBots = ANALYTICS.series.filter((s) => s.metric !== 'bot_request' && s.metric !== 'bot_serve');
+	const load = originLoad({ ...ANALYTICS, series: noBots });
+	assert.equal(load.arrived, 0);
+	assert.equal(load.net, null);
+	assert.equal(fmtNet(load.net), '—');
+});
+
+test('serves stand in for arrivals only when the window has no bot_request rows at all', () => {
+	const noRequests = ANALYTICS.series.filter((s) => s.metric !== 'bot_request');
+	assert.equal(originLoad({ ...ANALYTICS, series: noRequests }).arrived, 1010);
+});
+
+test('a fleet that out-requests its crawlers reads as a NEGATIVE offload, with the finding spelled out', async () => {
+	const analytics = { ...ANALYTICS, series: [...ANALYTICS.series, combo('render', 'outcome', 'rendered', null, 5000)] };
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const figure = originLoad(analytics);
+	assert.ok(figure.net < 0);
+	// A signed percentage — pct() is for shares of a whole and would have nothing to divide by.
+	assert.match(fmtNet(figure.net), /^-\d+%$/);
+	const text = textOf(ctx);
+	assert.match(text, /The origin saw more requests than the crawlers made/);
+	// The gross figure is untouched by renders, which is the whole reason the net one exists.
+	assert.match(text, /74%/);
+});
+
+test('the net tile cannot narrow to one bot, and says so rather than showing a crawler’s number', async () => {
+	const ctx = await ready();
+	ctx.data.bots = ['bingbot'];
+	const text = textOf(ctx);
+	assert.match(text, /before crawler follow-up requests · all bots/);
+	// Unchanged by the filter: renders, probes and sitemap fetches are not for any one crawler.
+	assert.match(text, /55%/);
+});
+
+test('nothing reaching the origin is 100% offload, and the follow-up caveat still stands', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			combo('bot_serve', 'cache', 'hit', 'googlebot', 500),
+			combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 500),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /100% gross and net alike/);
+	assert.match(text, /500 pages were handed to crawlers/);
+});
+
+// ---- verified: a cache serve through an invalidation ---------------------------
+
+test('verified is a cache serve in the invalidation family — never "other", never outside cache-served', () => {
+	const rows = notHitRows([
+		combo('bot_serve', 'cache', 'verified', 'googlebot', 40),
+		combo('bot_serve', 'origin', 'invalidated', 'googlebot', 60),
+	]);
+	const byStatus = new Map(rows.map((row) => [row.status, row]));
+	// Same family: the population an invalidation touched, split into rescued and refused.
+	assert.equal(byStatus.get('verified').family, 'invalidated');
+	assert.equal(byStatus.get('invalidated').family, 'invalidated');
+	assert.deepEqual([...byStatus.get('verified').sources], [['cache', 40]]);
+	assert.ok(isCacheServed('verified'));
+	assert.ok(isCacheServed('peer-rescue'));
+	assert.ok(!isCacheServed('invalidated'));
+	assert.ok(!isCacheServed('blob-timeout'));
+});
+
+test('the per-route table counts a verified serve as cache-served', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			combo('bot_serve', 'cache', 'verified', 'googlebot', 50),
+			combo('bot_serve', 'cache', 'hit', 'googlebot', 50),
+			combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 100),
+			combo('route_serve', '/product/', 'verified', 'desktop', 50),
+			combo('route_serve', '/product/', 'hit', 'desktop', 50),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const row = rowFor(draw(ctx), '/product/');
+	assert.ok(row, 'expected a /product/ row');
+	// Columns: route, mode, serves, cache-served, …
+	assert.equal(row.children[3].textContent, '100%');
+	// And the invalidation family is on the KPI strip with the verified share inside it.
+	const text = textOf(ctx);
+	assert.match(text, /Invalidation/);
+	assert.match(text, /rescued on evidence/);
 });
 
 // ---- misses the origin cannot serve -----------------------------------------

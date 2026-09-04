@@ -42,8 +42,10 @@ import {
 	colorFor,
 	emptyNote,
 	fmtMs,
+	fmtNet,
 	isMerged,
 	legend,
+	originLoad,
 	pick,
 	scopeLabel,
 	stackBy,
@@ -210,6 +212,9 @@ function traffic(ctx) {
 	const total = sumCount(serves);
 	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
 	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
+	// The figure the gross tile flatters: renders, probes and sitemap fetches are origin requests
+	// too. Same arithmetic as Traffic (charts.js), so the two views cannot disagree about "net".
+	const load = originLoad(data);
 	// The median, matching Traffic: an evenly refreshed corpus puts its p95 within a whisker of the
 	// interval by construction, so a p95 tile here would read as "behind" on a healthy fleet.
 	const ageMedian = weighted(pick(data, 'page_age'), 'median');
@@ -226,9 +231,17 @@ function traffic(ctx) {
 		body: [
 			el('div', { cls: 'stat-grid tight' }, [
 				stat('Serves', num(total)),
-				stat('Origin offload', pct(total - originServes, total), null, {
-					warn: total > 0 && originServes > total / 2,
-				}),
+				stat(
+					'Origin offload',
+					pct(total - originServes, total),
+					// Gross on the face, net underneath — the subtitle is what stops a 90% headline being
+					// quoted for a deployment whose renders and probes hand most of it back.
+					Number.isFinite(load.net)
+						? `${fmtNet(load.net)} net of renders + probes · before crawler follow-up requests`
+						: 'gross — crawler requests not proxied live',
+					// Either figure under half is the flag; the net one is the one that can go negative.
+					{ warn: (total > 0 && originServes > total / 2) || (Number.isFinite(load.net) && load.net < 0.5) }
+				),
 				stat('Cache-served', pct(cacheServes, total)),
 				stat('Page age', fmtMs(ageMedian), 'median, cache serves only ≈', {
 					warn: Number.isFinite(ageMedian) && Number.isFinite(interval) && ageMedian > interval,
