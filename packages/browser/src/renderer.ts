@@ -2,7 +2,7 @@ import { Renderer } from './Worker.js';
 import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
-import { emptyTally, tallySubresponse } from './subrequests.js';
+import { countsAsBlocked, emptyTally, tallySubresponse } from './subrequests.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
@@ -126,12 +126,12 @@ const renderer: Renderer = async (page, job) => {
 			if (isBlockedUrl(req.url())) {
 				// A same-origin request this fleet refuses to make is one a crawler WOULD make, of a
 				// class nobody can judge without a response — counted so the undercount is visible.
-				if (isSameOrigin(req.url())) subrequests.blocked++;
+				if (isSameOrigin(req.url()) && countsAsBlocked(req.resourceType())) subrequests.blocked++;
 				req.abort().catch(noop);
 				return;
 			}
 			if (blockedResourceTypes.has(req.resourceType())) {
-				if (isSameOrigin(req.url())) subrequests.blocked++;
+				if (isSameOrigin(req.url()) && countsAsBlocked(req.resourceType())) subrequests.blocked++;
 				// Stub blocked images (vs abort) so lazy-loaders keep their real src URLs.
 				if (config.block.stubImages && req.resourceType() === 'image') {
 					req.respond(STUB_IMAGE_RESPONSE).catch(noop);

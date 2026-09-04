@@ -34,7 +34,11 @@
  *
  * Blocked requests are counted separately. `block.resourceTypes` / `block.urlPatterns` abort a
  * request before any response exists, so a same-origin request this fleet refused to make is a
- * request a crawler WOULD make whose class is unknown — the visible bound on the undercount.
+ * request a crawler WOULD make whose class is unknown — the visible bound on the undercount. Static
+ * media (images, fonts, audio/video) is left out of that count: a fleet blocks those by the
+ * hundred, a CDN caches them as a matter of course, and counting them would make the bound read as
+ * an alarm about requests that say nothing about k. What remains — blocked scripts, XHR/fetch,
+ * documents, "other" — is exactly the class that might.
  */
 
 export type SubrequestClass = 'uncacheable' | 'cacheable' | 'unspecified';
@@ -45,9 +49,15 @@ export type SubrequestTally = {
 	cacheable: number;
 	uncacheable: number;
 	unspecified: number;
-	/** Same-origin requests this fleet's block list aborted before a response existed. */
+	/** Same-origin requests this fleet's block list aborted before a response existed — static media excluded. */
 	blocked: number;
 };
+
+// Resource types whose blocked requests are NOT counted as an unknown: static media a CDN caches.
+const STATIC_MEDIA = new Set(['image', 'font', 'media']);
+
+/** Does a blocked same-origin request of this resource type count toward the `blocked` bound? */
+export const countsAsBlocked = (resourceType: string): boolean => !STATIC_MEDIA.has(resourceType);
 
 export const emptyTally = (): SubrequestTally => ({
 	sameOrigin: 0,

@@ -403,7 +403,8 @@ zero max-age, `Vary: *`, or an expired `Expires`. `cacheable` is explicit positi
 `unspecified` had no freshness information at all and depends on the CDN's defaults, so it is
 reported and counted on neither side. `blocked` is the same-origin requests this fleet's block list
 aborted before any response — requests a crawler would make, of unknown class — the visible bound on
-the undercount. `scriptsStripped` says whether the stored snapshot can make any of these calls when
+the undercount; blocked images, fonts and media are left out of it, since a CDN caches those as a
+matter of course and they say nothing about k. `scriptsStripped` says whether the stored snapshot can make any of these calls when
 a crawler runs it: with scripts stripped the factor is a **saving** at serve time, not a cost.
 
 Cost: header checks on a response hook that already fires per response; no body reads, nothing

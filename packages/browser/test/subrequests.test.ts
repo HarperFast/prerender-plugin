@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifySubresponse, emptyTally, tallySubresponse } from '../dist/subrequests.js';
+import { classifySubresponse, countsAsBlocked, emptyTally, tallySubresponse } from '../dist/subrequests.js';
 
 // The shared-cache verdict behind the per-page factor `k` (HarperFast/prerender-plugin#153).
 //
@@ -79,4 +79,11 @@ test('the tally counts every same-origin response once, and a replay from our ow
 	// Replayed headers have been through filterReplayHeaders; the verdict must not depend on them.
 	tallySubresponse(tally, 'GET', 200, {}, { replayedFromOwnCache: true });
 	assert.deepEqual(tally, { sameOrigin: 4, cacheable: 2, uncacheable: 1, unspecified: 1, blocked: 0 });
+});
+
+test('a blocked image, font or media request is not an unknown — a CDN caches those as a matter of course', () => {
+	for (const type of ['image', 'font', 'media']) assert.equal(countsAsBlocked(type), false, type);
+	// The classes that MIGHT have reached the origin stay in the bound.
+	for (const type of ['xhr', 'fetch', 'script', 'document', 'other', 'stylesheet'])
+		assert.equal(countsAsBlocked(type), true, type);
 });
