@@ -25,10 +25,11 @@
  * system asks of the origin in exchange — every render, every change probe, every sitemap fetch is
  * an origin request. Net offload subtracts those (`originLoad` in charts.js carries the arithmetic
  * and its caveats), and the panel beside the origin-fetch chart shows each term. One term it
- * cannot count is stated rather than omitted: whatever a crawler fetches from the origin after we
- * hand it a page (a rendering crawler's scripts and API calls above all), which never passes
- * through this plugin. The net tile says "before crawler follow-up requests" and the panel reports
- * the exposure — every page handed to a crawler — as a count, never multiplied by a guessed factor.
+ * cannot count is stated rather than omitted: the requests a page's own scripts make when a
+ * rendering crawler runs it, which never pass through this plugin and are missing from BOTH sides
+ * — the origin would have served them for every raw page-view, and does not for a snapshot served
+ * without scripts. The net tile says "before crawler follow-up requests" and the panel reports the
+ * exposure — every page handed to a crawler — as a count, never multiplied by a guessed factor.
  *
  * AND NOT EVERY MISS IS OURS. A miss whose origin fetch came back 404 or 410 is a URL that does
  * not exist anywhere — there is nothing for the cache to be missing, and it can never improve,
@@ -1175,7 +1176,7 @@ function originSeen(data, { load, filter }) {
 						stat(
 							'Crawler follow-up requests',
 							'not measured',
-							`${fmtCount(load.handed)} pages handed to crawlers · what each fetched next bypasses this plugin`
+							`${fmtCount(load.handed)} pages handed to crawlers · counted on neither side of the ledger`
 						),
 					]),
 					stackedBars(data, keys, stacks, colorOf, { format: fmtCount }),
@@ -1220,24 +1221,27 @@ function originSeen(data, { load, filter }) {
 /**
  * The fifth term, spelled out. Shown whenever a page was handed to a crawler at all — including on
  * the "nothing reached the origin" exit, where a net offload of 100% is precisely the claim this
- * term qualifies.
+ * term qualifies (in that case, upward).
  */
 function followUpNote(load) {
 	if (!load.handed) return null;
 	return el('div', { cls: 'note' }, [
 		el('strong', {
-			text: `${num(load.handed)} pages were handed to crawlers, and what each crawler fetched next is not counted. `,
+			text: `${num(load.handed)} pages were handed to crawlers, and the requests their scripts make are counted on neither side. `,
 		}),
-		'A rendering crawler (Googlebot, Bingbot, Applebot) loads the page’s scripts and then makes the XHR/fetch ',
-		'calls the page makes — inventory, pricing, personalisation — and those are the calls least likely to be ',
-		'cacheable; an image crawler fetches the images; any crawler may follow a linked resource. None of it ',
-		'passes through this plugin (the CDN sends a crawler’s subrequests straight to the origin), so nothing ',
-		'here can count it, and the net figure above is stated BEFORE it rather than with a guessed ',
-		'requests-per-page multiplied in — for every crawler, not a guessed subset of them. The render fleet can ',
-		'measure the per-page factor (it loads the same pages and already classifies every same-origin response ',
-		'as cacheable or not); stored on the cached page and applied at serve time by what the registry says a ',
-		'crawler fetches, this becomes a counted term. A snapshot served with its scripts stripped hydrates ',
-		'nothing, which makes even the rendering crawlers’ share an upper bound.',
+		'A rendering crawler (Googlebot, Bingbot, Applebot) fetches a page and then runs it, and the page makes ',
+		'its own XHR/fetch calls to the origin — inventory, pricing, personalisation — which are exactly the ',
+		'calls no CDN caches. Without this system every such crawl costs the origin the document PLUS those ',
+		'calls, so the “crawlers asked for” baseline above understates what the origin was spared. With it, a ',
+		'snapshot served without its scripts triggers none of them (a saving not credited above), a snapshot ',
+		'that keeps its scripts or a proxied origin page triggers them as before (a cost not charged), and our ',
+		'own renders run the page too (each render is really the document plus those calls). None of it passes ',
+		'through this plugin — the CDN sends a crawler’s subrequests straight to the origin — so the figure is ',
+		'documents-only on both sides and says so, for every crawler rather than a guessed subset. Where ',
+		'snapshots are served with scripts stripped, the true net offload for rendering crawlers is HIGHER than ',
+		'shown. The render fleet can measure the per-page factor (it loads the same pages and already classifies ',
+		'every same-origin response as cacheable or not); applied to both sides by what the registry says each ',
+		'crawler runs, this becomes a counted term.',
 	]);
 }
 

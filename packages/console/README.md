@@ -176,11 +176,17 @@ origin request (the document — the page's own subresources reach the origin on
 not cache them for the renderer), and the probe and sitemap counters land in the bucket where a
 _pass finished_, so a short range reads either none of a running sweep or all of one that just
 ended — quote the 24h figure. One term the plugin cannot see at all is stated rather than
-omitted: whatever a crawler fetches from the origin _after_ we hand it a page — a rendering
-crawler's scripts and then the page's own XHR/API calls above all — never passes through this
-plugin, so the net tile says "before crawler follow-up requests" and the panel reports the
-exposure (every page handed to a crawler) as a count, never multiplied by a guessed factor. The
-render fleet can measure the per-page factor; when a plugin reports it, that tile becomes a number.
+omitted, and it is missing from _both_ sides: the requests a page's own scripts make when a
+rendering crawler runs it. Without this system every Googlebot/Bingbot/Applebot page-view costs the
+origin the document _plus_ the page's XHR/API calls (the ones no CDN caches), so the "crawlers asked
+for" baseline understates what the origin was spared; with it, a snapshot served without scripts
+triggers none of those calls (a saving the figure does not credit), while a snapshot that keeps its
+scripts, a proxied origin page, and every one of our own renders still trigger them (a cost it does
+not charge). None of it passes through the plugin, so the figure is documents-only on both sides,
+the net tile says "before crawler follow-up requests", and the panel reports the exposure (every
+page handed to a crawler) as a count, never multiplied by a guessed factor — where snapshots are
+served with scripts stripped, the true net offload for rendering crawlers is _higher_ than shown.
+The render fleet can measure the per-page factor; applied to both sides, that tile becomes a number.
 
 **Invalidations gained a third panel** for the same release: what the active rows are doing.
 Refused serves (`invalidated` — each an origin round trip) beside rescued ones (`verified`, plugin

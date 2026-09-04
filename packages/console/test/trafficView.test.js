@@ -452,6 +452,10 @@ test('the KPI strip carries gross AND net, and says what the net figure leaves o
 	assert.match(text, /Crawler follow-up requests/);
 	assert.match(text, /not measured/);
 	assert.match(text, /1,010 pages were handed to crawlers/);
+	// The omitted term is stated as two-sided: a saving where snapshots carry no scripts, a cost
+	// where they do — never as "the number would only be lower".
+	assert.match(text, /counted on neither side/);
+	assert.match(text, /true net offload for rendering crawlers is HIGHER than shown/);
 	// Every measured term is named with its count.
 	for (const term of ['proxied serves', 'renders', 'change probes', 'sitemap fetches'])
 		assert.match(text, new RegExp(term));

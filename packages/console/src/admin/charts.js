@@ -597,24 +597,31 @@ const SITEMAP_FETCHES = 'sitemap_sitemaps';
  * baseline is what ARRIVED. When the window has serves but no requests (it should not — both are
  * gated identically — but an older plugin could), the serve total stands in.
  *
- * A FIFTH TERM IS EXPOSED BUT NOT COUNTED — what a crawler fetches from the origin AFTER we hand
- * it a page. A rendering crawler (Google's WRS, Bingbot, Applebot) loads the page's scripts and
- * then makes whatever XHR/fetch calls the page makes — inventory, pricing, personalisation — and
- * those are the calls least likely to be cacheable anywhere; an image crawler fetches the images;
- * any crawler may follow a linked resource. None of it passes through this plugin: the CDN
- * forwards the DOCUMENT request to us and sends the crawler's subrequests straight to the origin,
- * so no series here can count them, and a net figure that quietly omitted them would be
- * flattering in exactly the way the gross one is. What CAN be counted is the exposure: every page
- * handed to a crawler — ALL of them, not a guessed subset of bots that "probably" fetch more,
- * because which crawler does what is a fact about the crawler that this console should not
- * assert. It is reported as that — a count of pages, never multiplied by a guessed
- * requests-per-page — and every reader of this figure says "before crawler follow-up requests".
- * The measured version needs the render fleet and the registry: our own headless Chrome loads the
- * same pages and already runs a cache policy on every same-origin response, so "uncacheable
- * same-origin subrequests per page load" is measurable there; stored on the cached page and
- * multiplied at serve time by what the registry says that crawler fetches, it becomes a counted
- * term. A snapshot with its scripts stripped hydrates nothing, which makes even the rendering
- * crawlers' share of this an upper bound.
+ * A FIFTH TERM IS MISSING FROM BOTH SIDES OF THE LEDGER, and it is stated rather than guessed:
+ * the requests a page's OWN SCRIPTS make. A rendering crawler (Google's WRS, Bingbot, Applebot)
+ * fetches a page and then runs it, and the page makes its XHR/fetch calls — inventory, pricing,
+ * personalisation — which are exactly the calls no CDN caches. Call that k per page load. Then:
+ *
+ *   without us   every rendering crawler's request costs the origin 1 + k, not 1 — the baseline
+ *                above (`bot_request`) counts documents only, so it UNDERSTATES what the origin
+ *                was spared.
+ *   with us      a snapshot served with its scripts stripped triggers NONE of the k (a saving not
+ *                credited above); a snapshot that keeps its scripts, and every proxied origin page,
+ *                trigger them as before (a cost not charged above); and our own renders run the
+ *                page too, so each render costs 1 + k, not the 1 counted above.
+ *
+ * None of these calls pass through this plugin — the CDN forwards the DOCUMENT to us and sends a
+ * crawler's subrequests straight to the origin — so no series here can count any of them, and the
+ * sign of the omission depends on facts this plugin cannot see (whether served snapshots carry
+ * scripts, which crawlers render). So the figure is documents-only on BOTH sides, says so, and
+ * reports the exposure: every page handed to a crawler — ALL of them, not a guessed subset of bots,
+ * because which crawler runs what is a fact about the crawler that this console should not assert.
+ * Where snapshots are served without scripts, the true net offload for rendering crawlers is
+ * HIGHER than shown. The measured version needs the render fleet and the registry: our headless
+ * Chrome already runs a cache policy on every same-origin response, so k ("uncacheable same-origin
+ * subrequests per page load") is measurable per render; stored on the cached page and applied to
+ * all four places above by what the registry says each crawler runs, it becomes a counted term on
+ * both sides.
  *
  * WHAT IS NOT COUNTED, so nobody assumes it is: crawler requests the CDN answered from its own
  * cache (they never reach this plugin), renders that crashed before posting a result (no row), and
@@ -646,7 +653,7 @@ export function originLoad(data) {
 		net: arrived > 0 ? (arrived - total) / arrived : null,
 		lumpy: probes > 0 || sitemaps > 0,
 		// The fifth term's exposure: every page handed to a crawler, cache-served or proxied alike —
-		// the crawler fetches what it fetches next either way.
+		// each one is a page whose scripts the crawler either ran against the origin or did not.
 		handed: served,
 	};
 }
