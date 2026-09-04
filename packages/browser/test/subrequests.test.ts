@@ -50,6 +50,13 @@ test('s-maxage wins over max-age for a shared cache, and zero is stale on arriva
 	assert.equal(ok({ 'cache-control': 'public, max-age=31536000, immutable' }), 'cacheable');
 });
 
+test('whitespace around = and a quoted delta-seconds are read the way the caches they stand in for read them', () => {
+	assert.equal(ok({ 'cache-control': 'public, max-age = 600' }), 'cacheable');
+	assert.equal(ok({ 'cache-control': 'max-age= 0' }), 'uncacheable');
+	assert.equal(ok({ 'cache-control': 's-maxage ="300", max-age=0' }), 'cacheable');
+	assert.equal(ok({ 'cache-control': 'max-age="0"' }), 'uncacheable');
+});
+
 test('Expires is read against the origin clock, and an unparseable one is already expired', () => {
 	assert.equal(ok({ expires: 'Thu, 01 Jan 2099 00:00:00 GMT' }), 'cacheable');
 	assert.equal(ok({ expires: 'Thu, 01 Jan 1970 00:00:00 GMT' }), 'uncacheable');

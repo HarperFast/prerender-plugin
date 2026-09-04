@@ -72,8 +72,11 @@ export const emptyTally = (): SubrequestTally => ({
 // again.
 const CACHEABLE_STATUSES = new Set([200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501]);
 
+// Lenient on purpose: the ABNF has no whitespace around `=` and no quotes on a delta-seconds value,
+// but origins emit both (`max-age = 60`, `max-age="60"`) and the caches this classifier stands in
+// for accept them. Strictness here would push a response a CDN happily caches into `unspecified`.
 const directiveSeconds = (cc: string, name: string): number | null => {
-	const m = cc.match(new RegExp(`(?:^|[,\\s])${name}=(\\d+)`));
+	const m = cc.match(new RegExp(`(?:^|[,\\s])${name}\\s*=\\s*"?(\\d+)"?`));
 	return m ? parseInt(m[1], 10) : null;
 };
 
