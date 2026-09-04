@@ -560,8 +560,10 @@ export const emptyNote = (what, data) =>
 // Series names as constants: the route-contract scanner in adminAssets.test.js reads a quoted
 // name inside a Map lookup or a comparison as a fetch of a route by that name.
 const RENDER_OUTCOME = 'outcome';
+const RENDER_SUBREQUESTS = 'subrequests';
 const PROBE_REQUESTS = 'probe_probed';
 const SITEMAP_FETCHES = 'sitemap_sitemaps';
+const HYDRATION = 'hydration_calls';
 
 /**
  * Every request the origin answered because this deployment exists, over the window, beside the
@@ -597,31 +599,44 @@ const SITEMAP_FETCHES = 'sitemap_sitemaps';
  * baseline is what ARRIVED. When the window has serves but no requests (it should not — both are
  * gated identically — but an older plugin could), the serve total stands in.
  *
- * A FIFTH TERM IS MISSING FROM BOTH SIDES OF THE LEDGER, and it is stated rather than guessed:
- * the requests a page's OWN SCRIPTS make. A rendering crawler (Google's WRS, Bingbot, Applebot)
- * fetches a page and then runs it, and the page makes its XHR/fetch calls — inventory, pricing,
- * personalisation — which are exactly the calls no CDN caches. Call that k per page load. Then:
+ * THE FIFTH TERM SITS ON BOTH SIDES OF THE LEDGER — the requests a page's OWN SCRIPTS make. A
+ * rendering crawler (Google's WRS, Bingbot, Applebot) fetches a page and then runs it, and the page
+ * makes its XHR/fetch calls — inventory, pricing, personalisation — which are exactly the calls no
+ * CDN caches. Call that k per page load. Then:
  *
- *   without us   every rendering crawler's request costs the origin 1 + k, not 1 — the baseline
- *                above (`bot_request`) counts documents only, so it UNDERSTATES what the origin
- *                was spared.
- *   with us      a snapshot served with its scripts stripped triggers NONE of the k (a saving not
- *                credited above); a snapshot that keeps its scripts, and every proxied origin page,
- *                trigger them as before (a cost not charged above); and our own renders run the
- *                page too, so each render costs 1 + k, not the 1 counted above.
+ *   without us   every rendering crawler's request costs the origin 1 + k, not 1 — a baseline that
+ *                counts documents only UNDERSTATES what the origin was spared.
+ *   with us      a snapshot served with its scripts stripped triggers NONE of the k (a saving); a
+ *                snapshot that keeps its scripts, and every proxied origin page, trigger them as
+ *                before (a cost); and our own renders run the page too, so each render costs 1 + k.
  *
- * None of these calls pass through this plugin — the CDN forwards the DOCUMENT to us and sends a
- * crawler's subrequests straight to the origin — so no series here can count any of them, and the
- * sign of the omission depends on facts this plugin cannot see (whether served snapshots carry
- * scripts, which crawlers render). So the figure is documents-only on BOTH sides, says so, and
- * reports the exposure: every page handed to a crawler — ALL of them, not a guessed subset of bots,
- * because which crawler runs what is a fact about the crawler that this console should not assert.
- * Where snapshots are served without scripts, the true net offload for rendering crawlers is
- * HIGHER than shown. The measured version needs the render fleet and the registry: our headless
- * Chrome already runs a cache policy on every same-origin response, so k ("uncacheable same-origin
- * subrequests per page load") is measurable per render; stored on the cached page and applied to
- * all four places above by what the registry says each crawler runs, it becomes a counted term on
- * both sides.
+ * None of these calls pass through the plugin — the CDN forwards the DOCUMENT to it and sends a
+ * crawler's subrequests straight to the origin — so the plugin cannot count them on the serve path.
+ * What it CAN do (plugin ≥ 0.65.0 with a browser ≥ 1.22.0 fleet) is use the render fleet's
+ * measurement: the renderer runs the same page and classifies every same-origin response by
+ * whether a shared cache would have answered it, the plugin stores that per page, and at serve time
+ * it puts the page's k on the side this serve earned it — `hydration_calls` with side `saved`
+ * (script-stripped snapshot to a crawler that would have run the page), `incurred` (a snapshot
+ * that kept its scripts, or any origin serve), or `unknown` (k not known: a miss, or a page not
+ * yet re-rendered since the fleet upgrade). The fleet's own renders report their k as `render`
+ * series `subrequests` (class `uncacheable`). Every one of these is a VALUE — Σ is mean × count.
+ *
+ * So, when those rows exist (`measured`), the figure becomes
+ *   baseline  = arrived + Σsaved + Σincurred        (documents + the calls those page-views cost)
+ *   actual    = proxied + renders + Σk_renders + probes + sitemaps + Σincurred
+ * and `unknown` is printed as the size of the remaining blind spot — it decays over one render
+ * cycle after the fleet upgrade, and until it is small the figure is still mostly documents-only.
+ * `netDocuments` keeps the documents-only reading beside it so the two can be compared.
+ *
+ * When they do not exist (an older plugin, or no rendering-crawler traffic), the figure is
+ * documents-only on BOTH sides, says so, and reports the exposure: every page handed to a crawler
+ * — ALL of them, not a guessed subset of bots, because which crawler runs what is a fact about the
+ * crawler that this console should not assert. Where snapshots are served without scripts, the
+ * true net offload for rendering crawlers is then HIGHER than shown.
+ *
+ * Two bounds on k are carried rather than hidden: `unspecified` responses had no freshness headers
+ * at all (a CDN's default TTL decides them — counted on neither side), and `blocked` is same-origin
+ * requests the fleet's block list aborted (a crawler would make them; class unknown).
  *
  * WHAT IS NOT COUNTED, so nobody assumes it is: crawler requests the CDN answered from its own
  * cache (they never reach this plugin), renders that crashed before posting a result (no row), and
@@ -640,22 +655,47 @@ export function originLoad(data) {
 	const sitemaps = sumValues(pick(data, 'prerender_ops', (s) => s.path === SITEMAP_FETCHES));
 	const requests = sumCount(pick(data, 'bot_request'));
 	const arrived = requests > 0 ? requests : served;
-	const total = proxied + renders + probes + sitemaps;
+	const documents = proxied + renders + probes + sitemaps;
+
+	// The fifth term, where a plugin ≥ 0.65.0 reports it. Values, so Σ = mean × count; the `unknown`
+	// side's value is always 0 and its COUNT is the blind spot.
+	const hydration = pick(data, HYDRATION);
+	const subrequests = pick(data, 'render', (s) => s.path === RENDER_SUBREQUESTS);
+	const bySide = (side) => hydration.filter((s) => s.path === side);
+	const saved = sumValues(bySide('saved'));
+	const incurred = sumValues(bySide('incurred'));
+	const rendersK = sumValues(subrequests.filter((s) => s.method === 'uncacheable'));
+	const unspecified = sumValues(subrequests.filter((s) => s.method === 'unspecified'));
+	const blocked = sumValues(subrequests.filter((s) => s.method === 'blocked'));
+	const knownServes = sumCount(bySide('saved')) + sumCount(bySide('incurred'));
+	const unknownServes = sumCount(bySide('unknown'));
+	// Measured once ANY hydration row exists: a window with only `unknown` rows is measured and
+	// blind, which is a different (and honestly reported) state from "this plugin cannot measure".
+	const measured = hydration.length > 0 || subrequests.length > 0;
+
+	const baseline = arrived + saved + incurred;
+	const total = documents + rendersK + incurred;
 
 	return {
 		proxied,
 		renders,
+		rendersK,
 		probes,
 		sitemaps,
+		// The documents-only pair, kept beside the full figure so the two can be compared.
+		documents,
+		netDocuments: ratioOf(arrived - documents, arrived),
 		total,
 		arrived,
+		baseline,
 		// Null, never 0 or 100%: an empty window has no offload to report. Through ratioOf like every
 		// other division in this module, so the zero-denominator guard cannot be forgotten here either.
-		net: ratioOf(arrived - total, arrived),
+		net: ratioOf(baseline - total, baseline),
 		lumpy: probes > 0 || sitemaps > 0,
 		// The fifth term's exposure: every page handed to a crawler, cache-served or proxied alike —
 		// each one is a page whose scripts the crawler either ran against the origin or did not.
 		handed: served,
+		scriptCalls: { measured, saved, incurred, knownServes, unknownServes, unspecified, blocked },
 	};
 }
 
@@ -690,6 +730,21 @@ export function originLoadBuckets(data) {
 			bucketsOf(
 				pick(data, 'render', (s) => s.path === RENDER_OUTCOME),
 				false
+			),
+		],
+		// The fleet's own script calls, and the crawlers' — both values, both per-bucket mean × count.
+		[
+			'rendersK',
+			bucketsOf(
+				pick(data, 'render', (s) => s.path === RENDER_SUBREQUESTS && s.method === 'uncacheable'),
+				true
+			),
+		],
+		[
+			'incurred',
+			bucketsOf(
+				pick(data, HYDRATION, (s) => s.path === 'incurred'),
+				true
 			),
 		],
 		[

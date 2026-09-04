@@ -237,7 +237,9 @@ function traffic(ctx) {
 					// Gross on the face, net underneath — the subtitle is what stops a 90% headline being
 					// quoted for a deployment whose renders and probes hand most of it back.
 					Number.isFinite(load.net)
-						? `${fmtNet(load.net)} net of renders + probes · before crawler follow-up requests`
+						? `${fmtNet(load.net)} net of renders + probes · ${
+								load.scriptCalls.measured ? 'script calls counted' : 'before crawler follow-up requests'
+							}`
 						: 'gross — crawler requests not proxied live',
 					// Either figure under half is the flag; the net one is the one that can go negative.
 					{ warn: (total > 0 && originServes > total / 2) || (Number.isFinite(load.net) && load.net < 0.5) }

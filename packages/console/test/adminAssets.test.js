@@ -230,6 +230,10 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		// the scan above, which is how three probe series once shipped with no panel and a green
 		// suite on both sides.
 		'changeProbe',
+		// `hydration_calls` (plugin v0.65.0): its path slot is the SIDE (saved/incurred/unknown), a
+		// dimension, read by charts.js `originLoad`. This test is what said the console was blind
+		// to it — the plugin half of #153 landed first in the same PR and this line went red.
+		'hydrationCalls',
 	]);
 
 	const emitted = [];

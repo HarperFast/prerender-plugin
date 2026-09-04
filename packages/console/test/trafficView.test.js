@@ -514,6 +514,97 @@ test('nothing reaching the origin is 100% offload, and the follow-up caveat stil
 	assert.match(text, /500 pages were handed to crawlers/);
 });
 
+// ---- the fifth term, measured (plugin ≥ 0.65.0, browser ≥ 1.22.0) ---------------
+
+/** The fixture plus the script-call rows a 0.65.0 plugin emits, so the term is counted on both sides. */
+const MEASURED = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		// hydration_calls: path=side, method=bot, type=source, VALUE = k per serve. Googlebot got 400
+		// script-stripped snapshots at k=5 (2,000 calls spared) and 100 origin pages at k=5 (500 calls
+		// taken); 50 serves had no k yet.
+		combo('hydration_calls', 'saved', 'googlebot', 'cache', 400, 5),
+		combo('hydration_calls', 'incurred', 'googlebot', 'origin', 100, 5),
+		combo('hydration_calls', 'unknown', 'googlebot', 'origin', 50, 0),
+		// render subrequests: the fleet's own 120 renders each made 5 uncacheable calls, saw 2 responses
+		// with no freshness headers, and aborted 1 same-origin request per render.
+		combo('render', 'subrequests', 'uncacheable', null, 120, 5),
+		combo('render', 'subrequests', 'cacheable', null, 120, 30),
+		combo('render', 'subrequests', 'unspecified', null, 120, 2),
+		combo('render', 'subrequests', 'blocked', null, 120, 1),
+	],
+};
+
+test('with script calls measured, k lands on both sides — spared on the baseline, taken and rendered on the cost', () => {
+	const load = originLoad(MEASURED);
+	assert.equal(load.scriptCalls.measured, true);
+	assert.equal(load.scriptCalls.saved, 2000);
+	assert.equal(load.scriptCalls.incurred, 500);
+	assert.equal(load.scriptCalls.knownServes, 500);
+	assert.equal(load.scriptCalls.unknownServes, 50);
+	// The fleet's own renders: 120 × 5 uncacheable calls; the bounds ride along.
+	assert.equal(load.rendersK, 600);
+	assert.equal(load.scriptCalls.unspecified, 240);
+	assert.equal(load.scriptCalls.blocked, 120);
+	// baseline = 1,010 documents + 2,500 calls those page-views carry; actual = 452 documents-only
+	// origin load + 600 render calls + 500 crawler calls.
+	assert.equal(load.baseline, 3510);
+	assert.equal(load.total, 452 + 600 + 500);
+	assert.ok(Math.abs(load.net - (3510 - 1552) / 3510) < 1e-9);
+	// The documents-only reading is kept beside it, unchanged.
+	assert.ok(Math.abs(load.netDocuments - (1010 - 452) / 1010) < 1e-9);
+});
+
+test('the measured panel shows saved beside taken, the documents-only figure for comparison, and the bounds', async () => {
+	const ctx = makeCtx({ analytics: MEASURED });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /Script calls/);
+	assert.match(text, /2\.0k saved/);
+	assert.match(text, /500 incurred/);
+	assert.match(text, /50 serves with k unknown/);
+	assert.match(text, /56% net offload · 55% documents-only/);
+	assert.match(text, /script calls counted/);
+	assert.match(text, /2,500 origin calls the pages’ own scripts would make were counted on both sides/);
+	assert.match(text, /240 same-origin responses during rendering carried no freshness/);
+	assert.match(text, /120 same-origin requests were aborted/);
+	// The two new causes appear as bars, and the exposure wording is gone.
+	assert.match(text, /render script calls/);
+	assert.match(text, /crawler script calls/);
+	assert.doesNotMatch(text, /not measured/);
+});
+
+test('a window that is mostly UNKNOWN says the figure is still documents-only, loudly', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('hydration_calls', 'saved', 'googlebot', 'cache', 10, 5),
+			combo('hydration_calls', 'unknown', 'googlebot', 'cache', 900, 0),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /900 serves to script-executing crawlers had no k/);
+	assert.match(text, /MOST of them, so this figure is still mostly documents-only/);
+	// And the Script calls tile warns.
+	const tile = find(draw(ctx), (n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Script calls');
+	assert.ok(
+		find(tile, (n) => n.attributes?.class === 'value warn'),
+		'a mostly-blind window should warn'
+	);
+});
+
+test('an older plugin that emits no script-call rows is NOT measured, and keeps the exposure wording', () => {
+	const load = originLoad(ANALYTICS);
+	assert.equal(load.scriptCalls.measured, false);
+	assert.equal(load.baseline, load.arrived);
+	assert.equal(load.total, load.documents);
+	assert.equal(load.net, load.netDocuments);
+});
+
 // ---- verified: a cache serve through an invalidation ---------------------------
 
 test('verified is a cache serve in the invalidation family — never "other", never outside cache-served', () => {
