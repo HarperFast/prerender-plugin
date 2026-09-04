@@ -1098,9 +1098,23 @@ export function mergeChangeProbe(results) {
 			ownerScopeNote: bodies[0].b.ownerScopeNote ?? null,
 			rules,
 			rulesDiverge: new Set(ruleJson).size > 1,
+			// Plugin v0.62.0 publishes the probe's state to a node-local row every worker can read,
+			// and says when that row could NOT be read: `stateAvailable: false` is "this answer is not
+			// trustworthy", which the old per-worker shape could not express (it reported `running:
+			// false, lastRun: null` — indistinguishable from the probe being off). Named per node,
+			// because a node whose row is unreadable contributes zeros to every sum above exactly the
+			// way an unswept node does, and the UI has to say which it is. An older plugin that has no
+			// such field is not flagged: absent is "not reported", not "unavailable".
+			stateUnavailableOn: bodies.filter((r) => r.b.stateAvailable === false).map((r) => r.hostname),
 			sweep: {
 				running: bodies.some((r) => r.b.sweep?.running),
 				runningOn: bodies.filter((r) => r.b.sweep?.running).map((r) => r.hostname),
+				// Live progress of the passes in flight, per node — a sweep runs for hours, and "running"
+				// alone cannot tell a pass that is moving from one whose worker died (the plugin's own
+				// heartbeat staleness handles the latter; this is the number an operator watches move).
+				progress: bodies
+					.filter((r) => r.b.sweep?.running && r.b.sweep?.progress)
+					.map((r) => ({ hostname: r.hostname, ...r.b.sweep.progress })),
 				armedInterval: bodies.find((r) => Number.isFinite(r.b.sweep?.armedInterval))?.b.sweep.armedInterval ?? null,
 				sweptNodes: sweeps.length,
 				unsweptNodes: bodies.filter((r) => !r.b.sweep?.lastRun?.startedAt).map((r) => r.hostname),
@@ -1157,7 +1171,10 @@ export function mergeChangeProbe(results) {
 				hostname: r.hostname,
 				enabled: r.b.enabled ?? null,
 				dryRun: r.b.dryRun ?? null,
+				// null on a plugin that predates the shared state row; false is the finding.
+				stateAvailable: typeof r.b.stateAvailable === 'boolean' ? r.b.stateAvailable : null,
 				sweepRunning: !!r.b.sweep?.running,
+				sweepProgress: r.b.sweep?.running ? (r.b.sweep?.progress ?? null) : null,
 				canaryRunning: !!r.b.canary?.running,
 				sweepFinishedAt: msOf(r.b.sweep?.lastRun?.finishedAt) || null,
 				canaryFinishedAt: msOf(r.b.canary?.lastRun?.finishedAt) || null,

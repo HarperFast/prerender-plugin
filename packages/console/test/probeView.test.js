@@ -723,3 +723,102 @@ test('the local governor is reported apart from the origin one — the fixes poi
 	assert.match(text, /local load/);
 	assert.match(text, /event loop 180ms behind/);
 });
+
+// ---- the shared state row (plugin v0.62.0) -------------------------------------
+
+test('an unreadable state row is the loudest thing on the page — the node is unknown, not idle', async () => {
+	const ctx = await ready({ status: { ...STATUS, stateAvailable: false } });
+	const text = draw(ctx).textContent;
+	assert.match(text, /state row could not be read on node-a/);
+	assert.match(text, /unknown, not idle/);
+});
+
+test('a cluster merge names the nodes whose state was unreadable, and flags them in the node table', async () => {
+	const status = {
+		...STATUS,
+		node: null,
+		scope: 'cluster',
+		sources: { mode: 'merged', complete: true, configured: 2, answered: 2 },
+		stateUnavailableOn: ['node-b'],
+		byNode: [
+			{
+				hostname: 'node-a',
+				enabled: true,
+				dryRun: true,
+				stateAvailable: true,
+				sweepRunning: false,
+				canaryRunning: false,
+			},
+			{
+				hostname: 'node-b',
+				enabled: true,
+				dryRun: true,
+				stateAvailable: false,
+				sweepRunning: false,
+				canaryRunning: false,
+			},
+		],
+	};
+	const ctx = await ready({ status });
+	const text = draw(ctx).textContent;
+	assert.match(text, /could not be read on node-b/);
+	assert.match(text, /state unreadable/);
+});
+
+test('a plugin without the state row is not accused of one it cannot read', async () => {
+	const ctx = await ready();
+	assert.doesNotMatch(draw(ctx).textContent, /could not be read/);
+});
+
+test('a running sweep says how far it has got, at node scope and summed under the cluster merge', async () => {
+	const node = await ready({
+		status: { ...STATUS, sweep: { ...STATUS.sweep, running: true, progress: { examinedApprox: 24_000 } } },
+	});
+	assert.match(draw(node).textContent, /sweep running · ~24,000 rows examined/);
+
+	const cluster = await ready({
+		status: {
+			...STATUS,
+			node: null,
+			scope: 'cluster',
+			sources: { mode: 'merged', complete: true, configured: 2, answered: 2 },
+			sweep: {
+				...STATUS.sweep,
+				running: true,
+				runningOn: ['node-a', 'node-b'],
+				progress: [
+					{ hostname: 'node-a', examinedApprox: 10_000 },
+					{ hostname: 'node-b', examinedApprox: 4000 },
+				],
+			},
+			byNode: [
+				{
+					hostname: 'node-a',
+					enabled: true,
+					dryRun: true,
+					sweepRunning: true,
+					sweepProgress: { examinedApprox: 10_000 },
+				},
+				{
+					hostname: 'node-b',
+					enabled: true,
+					dryRun: true,
+					sweepRunning: true,
+					sweepProgress: { examinedApprox: 4000 },
+				},
+			],
+		},
+	});
+	const text = draw(cluster).textContent;
+	// Disjoint slices, so the header sums; the node table keeps each node's own count.
+	assert.match(text, /~14,000 rows examined/);
+	assert.match(text, /sweeping · ~10,000 examined/);
+	assert.match(text, /sweeping · ~4,000 examined/);
+});
+
+test('a running sweep with no heartbeat count yet still reads as running, without a made-up number', async () => {
+	const ctx = await ready({ status: { ...STATUS, sweep: { ...STATUS.sweep, running: true, progress: null } } });
+	const text = draw(ctx).textContent;
+	assert.match(text, /sweep running/);
+	assert.doesNotMatch(text, /rows examined/);
+});

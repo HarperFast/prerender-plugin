@@ -1107,3 +1107,47 @@ test('discovery purge: a self-stopped pass is reported with the samples that exp
 	assert.equal(body.errorSamples[0].hostname, 'b.example.com:9926');
 	assert.equal(body.byNode.find((row) => row.hostname === 'b.example.com:9926').abortedOnErrors, true);
 });
+
+// Plugin v0.62.0 moved the probe's state into a node-local row every worker can read, and made
+// the endpoint say when that row could NOT be read. The merge has to carry that through: a node
+// whose state is unreadable contributes zeros to every sum exactly the way an unswept node does,
+// and only a name separates "idle" from "unknown".
+test('change probe: a node whose state row could not be read is NAMED, not read as idle', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { stateAvailable: true })),
+		ok('b', probeBody('b', { stateAvailable: false, sweep: { running: false, armedInterval: null, lastRun: null } })),
+	]);
+	assert.deepEqual(body.stateUnavailableOn, ['b.example.com:9926']);
+	assert.equal(body.byNode.find((row) => row.hostname === 'b.example.com:9926').stateAvailable, false);
+	assert.equal(body.byNode.find((row) => row.hostname === 'a.example.com:9926').stateAvailable, true);
+});
+
+test('change probe: a plugin that predates the state row is not flagged as unavailable', () => {
+	const { body } = mergerFor('change-probe')([ok('a', probeBody('a')), ok('b', probeBody('b'))]);
+	assert.deepEqual(body.stateUnavailableOn, []);
+	assert.equal(body.byNode[0].stateAvailable, null);
+});
+
+test('change probe: live progress rides along per node, and only while the pass is running', () => {
+	const { body } = mergerFor('change-probe')([
+		ok(
+			'a',
+			probeBody('a', {
+				sweep: { running: true, armedInterval: 86_400_000, lastRun: null, progress: { examinedApprox: 12_000 } },
+			})
+		),
+		// A finished pass that still carries a stale progress object must not be reported as moving.
+		ok(
+			'b',
+			probeBody('b', {
+				sweep: { running: false, armedInterval: 86_400_000, lastRun: null, progress: { examinedApprox: 5 } },
+			})
+		),
+	]);
+	assert.deepEqual(body.sweep.progress, [{ hostname: 'a.example.com:9926', examinedApprox: 12_000 }]);
+	assert.deepEqual(body.sweep.runningOn, ['a.example.com:9926']);
+	assert.deepEqual(body.byNode.find((row) => row.hostname === 'a.example.com:9926').sweepProgress, {
+		examinedApprox: 12_000,
+	});
+	assert.equal(body.byNode.find((row) => row.hostname === 'b.example.com:9926').sweepProgress, null);
+});

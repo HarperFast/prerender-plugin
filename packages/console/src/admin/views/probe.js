@@ -96,6 +96,29 @@ const sweepCadence = (sweep) => {
 };
 
 /**
+ * Nodes whose probe state row could not be read (plugin v0.62.0's `stateAvailable: false`),
+ * normalized over the node and cluster payload shapes. Empty for an older plugin, which has no
+ * such row and no such field.
+ */
+const stateUnavailableOn = (status) =>
+	status.stateUnavailableOn ?? (status.stateAvailable === false ? [status.node ?? 'this node'] : []);
+
+/**
+ * "sweep running", with how far it has got when the plugin says. `examinedApprox` is the pass's
+ * heartbeat counter — rows walked so far, rounded to the yield interval — and it is the one number
+ * that separates a sweep that is moving from one that merely claims to be. Summed across the
+ * nodes running, because each walks its own disjoint slice.
+ */
+const sweepProgress = (status) => {
+	// One object at node scope, a per-node list under the cluster merge.
+	const progress = status.sweep?.progress;
+	const list = Array.isArray(progress) ? progress : progress ? [progress] : [];
+	const examined = list.reduce((acc, p) => acc + (Number.isFinite(p?.examinedApprox) ? p.examinedApprox : 0), 0);
+	return examined > 0 ? ` · ~${num(examined)} rows examined` : '';
+};
+const sweepRunningLabel = (status) => `sweep running${sweepProgress(status)}`;
+
+/**
  * The pass counters, in the order a pass produces them.
  *
  * THESE ARE SERIES SIDE BY SIDE, NOT A PARTITION, and three of them are deliberately not
@@ -236,6 +259,24 @@ function state(ctx, status) {
 		);
 	}
 
+	// Plugin v0.62.0 publishes the probe's state to a node-local row so any worker can answer for
+	// the node; before it, 15 of 16 workers answered "not running, never ran" — indistinguishable
+	// from the probe being off. `stateAvailable: false` is the row failing to READ, and everything
+	// this page says about that node's sweep and canary is then untrustworthy rather than
+	// reassuring. Above the counters, because it changes what they mean.
+	const stateUnavailable = stateUnavailableOn(status);
+	if (stateUnavailable.length) {
+		body.push(
+			note('bad', [
+				`The change-probe state row could not be read on ${stateUnavailable.join(', ')}. `,
+				'Everything this page reports for ',
+				stateUnavailable.length > 1 ? 'those nodes' : 'that node',
+				' — running or not, last pass, armed cadence — is unknown, not idle: the sweep may well be running. ',
+				'The node’s log says why the read failed (a coordination database problem, usually).',
+			])
+		);
+	}
+
 	body.push(
 		kv([
 			['Sweep', sweepCadence(status.sweep) ?? 'not armed'],
@@ -289,7 +330,7 @@ function state(ctx, status) {
 							: 'live',
 						'ok'
 					),
-			status.sweep?.running && pill('sweep running', 'info'),
+			status.sweep?.running && pill(sweepRunningLabel(status), 'info'),
 			status.canary?.running && pill('canary running', 'info'),
 			spacer(),
 			segmented(
@@ -697,7 +738,10 @@ function sweepCard(ctx, status) {
 		head: [
 			sweepCadence(sweep) ? pill(sweepCadence(sweep), 'ok') : pill('not armed', 'bad'),
 			sweep.running &&
-				pill(sweep.runningOn?.length ? `running on ${sweep.runningOn.join(', ')}` : 'running now', 'info'),
+				pill(
+					`${sweep.runningOn?.length ? `running on ${sweep.runningOn.join(', ')}` : 'running now'}${sweepProgress(status)}`,
+					'info'
+				),
 			spacer(),
 			muted(last?.nodes > 1 ? `summed over ${last.nodes} nodes’ own slices` : ''),
 		],
@@ -855,8 +899,17 @@ function nodeTable(status) {
 					el('tr', null, [
 						el('td', { cls: 'mono', text: row.hostname }),
 						el('td', null, [
+							// An unreadable state row outranks everything else in the cell: "enabled" is read
+							// from config and is true, but running/last-pass/probed are all unknown for this node.
+							row.stateAvailable === false && pill('state unreadable', 'bad'),
 							row.enabled === false ? pill('disabled', 'bad') : pill('enabled', 'ok'),
-							row.sweepRunning && pill('sweeping', 'info'),
+							row.sweepRunning &&
+								pill(
+									Number.isFinite(row.sweepProgress?.examinedApprox)
+										? `sweeping · ~${num(row.sweepProgress.examinedApprox)} examined`
+										: 'sweeping',
+									'info'
+								),
 							row.canaryRunning && pill('canary', 'info'),
 						]),
 						el('td', null, [row.dryRun === false ? pill('live', 'ok') : pill('dry run', 'warn')]),

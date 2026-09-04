@@ -58,7 +58,7 @@ const CENSUS = {
 	canceled: false,
 };
 
-function makeCtx({ overview = OVERVIEW, purge = { running: false } } = {}) {
+function makeCtx({ overview = OVERVIEW, purge = { running: false }, analytics = ANALYTICS } = {}) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
 	const calls = { posts: [] };
@@ -71,7 +71,7 @@ function makeCtx({ overview = OVERVIEW, purge = { running: false } } = {}) {
 		},
 		async get(route) {
 			if (route === 'overview') return { ok: true, body: overview };
-			if (route === 'analytics') return { ok: true, body: ANALYTICS };
+			if (route === 'analytics') return { ok: true, body: analytics };
 			if (route === 'discovery-purge') return { ok: true, body: purge };
 			return { ok: true, body: null };
 		},
@@ -322,4 +322,52 @@ test('a cluster where only some nodes spared bot-visited targets is called out',
 	const text = cardTitled(await ready({ purge: mixed }), 'Discovered targets').textContent;
 	assert.match(text, /Only a\.example\.com:9926 spared bot-visited targets/);
 	assert.match(text, /sum two different predicates/);
+});
+
+// ---- the serve strip's offload tile -----------------------------------------------
+
+/** One analytics combo, in the shape `util/analyticsRead.js` emits (four buckets, flat). */
+const combo = (metric, path, method, type, count, value) => ({
+	metric,
+	path,
+	method,
+	type,
+	count,
+	total: 0,
+	counts: [count / 4, count / 4, count / 4, count / 4],
+	...(value === undefined ? {} : { mean: value, median: value, p95: value, means: [value, value, value, value] }),
+});
+
+test('the offload tile shows the gross figure with the net one underneath, from the same arithmetic as Traffic', async () => {
+	// 900 of 1,000 serves from cache (90% gross); 500 renders and a 100-probe pass mean the origin
+	// answered 700 of 1,000 crawler requests — 30% net. The headline alone would be the flattering
+	// number; the subtitle is what stops it being quoted on its own.
+	const analytics = {
+		...ANALYTICS,
+		startMs: 0,
+		endMs: 3_600_000,
+		bucketMs: 900_000,
+		bucketCount: 4,
+		series: [
+			combo('bot_serve', 'cache', 'hit', 'googlebot', 900),
+			combo('bot_serve', 'origin', 'miss', 'googlebot', 100),
+			combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 1000),
+			combo('render', 'outcome', 'rendered', null, 500),
+			combo('prerender_ops', 'probe_probed', null, null, 1, 100),
+		],
+	};
+	const ctx = await ready({ analytics });
+	const tile = find(
+		draw(ctx),
+		(n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Origin offload'
+	);
+	assert.ok(tile, 'expected an Origin offload tile');
+	assert.match(tile.textContent, /90%/);
+	assert.match(tile.textContent, /30% net of renders \+ probes/);
+	assert.match(tile.textContent, /before crawler follow-up requests/);
+	// Below half on the net figure warns even though the gross one is fine.
+	assert.ok(
+		find(tile, (n) => n.attributes?.class === 'value warn'),
+		'a 30% net offload should warn'
+	);
 });

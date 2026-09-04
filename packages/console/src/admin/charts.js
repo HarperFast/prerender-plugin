@@ -40,6 +40,10 @@ export const CACHE_STATUS_COLORS = {
 	'hit': OK,
 	'swr': INFO,
 	'peer-rescue': '#8ff1cd',
+	// A cache serve an invalidation would have refused, let through on the probe's evidence
+	// (plugin v0.63.0). Coloured beside `invalidated` rather than beside `hit`: the two are the
+	// same population — pages a bulk invalidation touched — split into rescued and refused.
+	'verified': '#c9a7ff',
 	'miss': WARN,
 	'stale': PINK,
 	'invalidated': PURPLE,
@@ -48,6 +52,19 @@ export const CACHE_STATUS_COLORS = {
 	'blob-missing': BAD,
 	'blob-timeout': BAD,
 };
+
+/**
+ * The freshness verdicts that are CACHE SERVES — the bytes came from a stored snapshot. This is
+ * the one enumeration every "cache-served" sum in the console must share, because a verdict
+ * missing from it does not read as missing: it reads as a smaller hit rate. `verified` sat outside
+ * every such sum for one plugin release and the cache-served share simply looked lower.
+ *
+ * `hit`, `swr` and `verified` are the page itself; `peer-rescue` is the owner's copy of it. What
+ * is NOT here: `miss`/`stale` (origin), `blob-*` (the local body failed AND no rescue landed, so
+ * the request went to origin), `invalidated` (refused), `skip`/`bypass` (never consulted).
+ */
+export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue']);
+export const isCacheServed = (status) => CACHE_SERVED.has(status);
 
 /** Where the bytes came from (bot_serve.path). `origin` is the one offload counts against. */
 export const SOURCE_COLORS = { cache: OK, rendered: INFO, origin: WARN };
@@ -534,3 +551,166 @@ export const emptyNote = (what, data) =>
 		el('code', { text: 'analytics.enabled' }),
 		' gates recording). Analytics rows are node-local; a cluster view sums every node’s own slice.',
 	]);
+
+// ---- origin load: the net offload arithmetic ---------------------------------
+//
+// Shared by Traffic (which shows every term) and the Overview (which shows the figure), so the two
+// can never disagree about what "net" means.
+
+// Series names as constants: the route-contract scanner in adminAssets.test.js reads a quoted
+// name inside a Map lookup or a comparison as a fetch of a route by that name.
+const RENDER_OUTCOME = 'outcome';
+const PROBE_REQUESTS = 'probe_probed';
+const SITEMAP_FETCHES = 'sitemap_sitemaps';
+
+/**
+ * Every request the origin answered because this deployment exists, over the window, beside the
+ * requests crawlers made — the two sides of the net offload figure.
+ *
+ * GROSS OFFLOAD IS FLATTERING. It is the share of crawler requests that were not proxied live
+ * (`bot_serve` source ≠ origin), and it counts what the origin was spared and none of what this
+ * system asks of the origin in exchange. A deployment rendering its whole corpus on a short
+ * cadence for a trickle of bot traffic can post a 95% gross offload while sending the origin MORE
+ * requests than the crawlers would have. Net offload is
+ * `1 − (proxied + renders + probes + sitemap fetches) ÷ crawler requests arrived`.
+ *
+ * FOUR TERMS, each from a series already in the scan:
+ *
+ *   proxied   `bot_serve` source = origin. A crawler request forwarded live: a miss, a page past
+ *             its SWR window, a blob fault nobody rescued, an invalidated page, a skip, a bypass.
+ *   renders   `render` series `outcome` — EXACTLY one row per posted result (metrics.js), so its
+ *             count is the number of page loads the headless fleet performed against the origin,
+ *             whatever became of each (rendered, suppressed, failed, transient…). Each is counted as
+ *             ONE origin request: the document. A page load also pulls the page's own scripts and
+ *             stylesheets, which reach the origin only if the CDN does not cache them for the
+ *             renderer — a deployment fact no metric here can see, so it is stated, not estimated.
+ *   probes    `probe_probed` — one origin call per attempt, failures included (a refused probe was
+ *             still a request). Sweep and canary both emit it. A probe hits a small endpoint, not a
+ *             page render, so it is cheaper than the other three; it is still a request.
+ *   sitemaps  `sitemap_sitemaps` — one fetch per sitemap a refresh run processed.
+ *
+ * `renders` is read with sumCount (one emit = one result); the two pass counters with sumValues
+ * (one emit per pass carrying the pass's count — sumCount there would count passes).
+ *
+ * THE DENOMINATOR IS `bot_request`, not `bot_serve`: without this system the CDN forwards every
+ * crawler request to the origin, including the few that never reach a serve outcome here, so the
+ * baseline is what ARRIVED. When the window has serves but no requests (it should not — both are
+ * gated identically — but an older plugin could), the serve total stands in.
+ *
+ * A FIFTH TERM IS MISSING FROM BOTH SIDES OF THE LEDGER, and it is stated rather than guessed:
+ * the requests a page's OWN SCRIPTS make. A rendering crawler (Google's WRS, Bingbot, Applebot)
+ * fetches a page and then runs it, and the page makes its XHR/fetch calls — inventory, pricing,
+ * personalisation — which are exactly the calls no CDN caches. Call that k per page load. Then:
+ *
+ *   without us   every rendering crawler's request costs the origin 1 + k, not 1 — the baseline
+ *                above (`bot_request`) counts documents only, so it UNDERSTATES what the origin
+ *                was spared.
+ *   with us      a snapshot served with its scripts stripped triggers NONE of the k (a saving not
+ *                credited above); a snapshot that keeps its scripts, and every proxied origin page,
+ *                trigger them as before (a cost not charged above); and our own renders run the
+ *                page too, so each render costs 1 + k, not the 1 counted above.
+ *
+ * None of these calls pass through this plugin — the CDN forwards the DOCUMENT to us and sends a
+ * crawler's subrequests straight to the origin — so no series here can count any of them, and the
+ * sign of the omission depends on facts this plugin cannot see (whether served snapshots carry
+ * scripts, which crawlers render). So the figure is documents-only on BOTH sides, says so, and
+ * reports the exposure: every page handed to a crawler — ALL of them, not a guessed subset of bots,
+ * because which crawler runs what is a fact about the crawler that this console should not assert.
+ * Where snapshots are served without scripts, the true net offload for rendering crawlers is
+ * HIGHER than shown. The measured version needs the render fleet and the registry: our headless
+ * Chrome already runs a cache policy on every same-origin response, so k ("uncacheable same-origin
+ * subrequests per page load") is measurable per render; stored on the cached page and applied to
+ * all four places above by what the registry says each crawler runs, it becomes a counted term on
+ * both sides.
+ *
+ * WHAT IS NOT COUNTED, so nobody assumes it is: crawler requests the CDN answered from its own
+ * cache (they never reach this plugin), renders that crashed before posting a result (no row), and
+ * cluster-internal traffic — peer rescue and forwarded heals are node-to-node, never origin.
+ *
+ * `lumpy` is true when either pass counter contributed: those land in the bucket where the pass
+ * FINISHED, so over a range shorter than a pass the term is either absent or all of it. Over a
+ * 24h range it is right to within one pass.
+ */
+export function originLoad(data) {
+	const serves = pick(data, 'bot_serve');
+	const served = sumCount(serves);
+	const proxied = sumCount(serves.filter((s) => s.path === 'origin'));
+	const renders = sumCount(pick(data, 'render', (s) => s.path === RENDER_OUTCOME));
+	const probes = sumValues(pick(data, 'prerender_ops', (s) => s.path === PROBE_REQUESTS));
+	const sitemaps = sumValues(pick(data, 'prerender_ops', (s) => s.path === SITEMAP_FETCHES));
+	const requests = sumCount(pick(data, 'bot_request'));
+	const arrived = requests > 0 ? requests : served;
+	const total = proxied + renders + probes + sitemaps;
+
+	return {
+		proxied,
+		renders,
+		probes,
+		sitemaps,
+		total,
+		arrived,
+		// Null, never 0 or 100%: an empty window has no offload to report. Through ratioOf like every
+		// other division in this module, so the zero-denominator guard cannot be forgotten here either.
+		net: ratioOf(arrived - total, arrived),
+		lumpy: probes > 0 || sitemaps > 0,
+		// The fifth term's exposure: every page handed to a crawler, cache-served or proxied alike —
+		// each one is a page whose scripts the crawler either ran against the origin or did not.
+		handed: served,
+	};
+}
+
+/**
+ * Per-bucket origin load by cause, for a stacked chart: stackBy's inner loop applied per TERM
+ * rather than over one metric's dimension, because the four terms come from three metrics and two
+ * value semantics. The proxied and render terms are per-request counts; the two pass counters are
+ * VALUES (one emit carrying a count), so their per-bucket form is mean × count, as in stackBy's
+ * values mode.
+ */
+export function originLoadBuckets(data) {
+	const bucketsOf = (combos, values) => {
+		const out = new Array(data.bucketCount).fill(0);
+		for (const combo of combos) {
+			for (let i = 0; i < combo.counts.length && i < out.length; i++) {
+				if (!values) out[i] += combo.counts[i];
+				else if (Number.isFinite(combo.means?.[i]) && combo.counts[i] > 0) out[i] += combo.means[i] * combo.counts[i];
+			}
+		}
+		return out;
+	};
+	return new Map([
+		[
+			'proxied',
+			bucketsOf(
+				pick(data, 'bot_serve', (s) => s.path === 'origin'),
+				false
+			),
+		],
+		[
+			'renders',
+			bucketsOf(
+				pick(data, 'render', (s) => s.path === RENDER_OUTCOME),
+				false
+			),
+		],
+		[
+			'probes',
+			bucketsOf(
+				pick(data, 'prerender_ops', (s) => s.path === PROBE_REQUESTS),
+				true
+			),
+		],
+		[
+			'sitemaps',
+			bucketsOf(
+				pick(data, 'prerender_ops', (s) => s.path === SITEMAP_FETCHES),
+				true
+			),
+		],
+	]);
+}
+
+/**
+ * A net offload as a percentage that may be NEGATIVE. `pct()` is built for shares of a whole;
+ * this is a signed ratio of 1, and a minus sign here is the finding.
+ */
+export const fmtNet = (net) => (Number.isFinite(net) ? `${Math.round(net * 100)}%` : '—');
