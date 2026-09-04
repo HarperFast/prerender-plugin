@@ -759,7 +759,11 @@ claim floor, schedule repair — are plugin behavior.)
   pass; a dashboard refresh never touches the index.
 
 - **Traffic** — the delivery half of [METRICS.md](METRICS.md)'s catalog, charted: origin
-  offload, cache-served and fresh-hit rates, serves by freshness state over time, the per-bot,
+  offload **gross and net** (net subtracts every origin request this system made — renders, probes,
+  sitemap fetches — and, from plugin 0.65.0 with a browser ≥ 1.22.0 fleet, counts the page's own
+  script-driven origin calls on both sides via `hydration_calls`: spared when a script-stripped
+  snapshot is served to a crawler that would have run the page, incurred when the page it got still
+  had scripts or came from the origin), cache-served and fresh-hit rates, serves by freshness state over time, the per-bot,
   per-device and status-code mix, origin-fetch cost and reasons, a per-route cadence table, and
   on-demand crawl breadth. Freshness is reported **relative to the cadence each route is
   configured for** (`page_age` ÷ that route's `renderInterval`, since a page expires one interval

@@ -124,3 +124,32 @@ test('a failed render posts outcome=error with the attempt error and derived rea
 		{ name: 'Error', message: 'Navigation timeout of 30000 ms exceeded' }
 	);
 });
+
+// The per-page origin factor (HarperFast/prerender-plugin#153). The plugin reads an ABSENT
+// `subrequests` as "this renderer predates the measurement", so a tally must ride every result
+// that had an attempt — including one that never reached content — and `scriptsStripped` must
+// say what this fleet does to the snapshot, since that is what turns the factor from a cost into
+// a saving at serve time.
+test('a render posts its same-origin subrequest tally and whether the snapshot keeps its scripts', async () => {
+	const job = makeJob();
+	const attempt = job.attemptStarted();
+	attempt.subrequests = { sameOrigin: 12, cacheable: 7, uncacheable: 4, unspecified: 1, blocked: 3 };
+	job.httpResponse = { statusCode: 200, headers: {} };
+	job.attemptEnded(undefined, '<html>ok</html>');
+
+	const meta = await send(job);
+	assert.deepEqual(meta.subrequests, { sameOrigin: 12, cacheable: 7, uncacheable: 4, unspecified: 1, blocked: 3 });
+	// The default config strips scripts; the field is the fleet's setting, posted as a boolean.
+	assert.equal(meta.scriptsStripped, true);
+});
+
+test('a result that never reached content still carries the partial tally', async () => {
+	const job = makeJob();
+	const attempt = job.attemptStarted();
+	attempt.subrequests = { sameOrigin: 2, cacheable: 1, uncacheable: 1, unspecified: 0, blocked: 0 };
+	job.attemptEnded(new Error('Navigation timeout of 30000 ms exceeded'), undefined);
+
+	const meta = await send(job);
+	assert.equal(meta.outcome, 'error');
+	assert.deepEqual(meta.subrequests, { sameOrigin: 2, cacheable: 1, uncacheable: 1, unspecified: 0, blocked: 0 });
+});

@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { getBotName, botMayDiscover, botCountsAsDemand } from '../src/util/userAgent.js';
+import { getBotName, botMayDiscover, botCountsAsDemand, botRendersJs } from '../src/util/userAgent.js';
 
 // Minimal stand-in for a WHATWG Headers object.
 const headers = (map) => ({ get: (k) => map[k.toLowerCase()] ?? null });
@@ -183,4 +183,63 @@ test('the discovery and demand allowlists are independent', () => {
 	assert.equal(botMayDiscover('Bingbot'), false);
 	assert.equal(botCountsAsDemand('Googlebot'), false);
 	assert.equal(botCountsAsDemand('Bingbot'), true);
+});
+
+// ---- botRendersJs: the gate on hydration_calls ----
+//
+// Same shape as the two allowlists above — a Set recompiled when the registry array's identity
+// changes — and the same reason it is not a `??=` memo: applyOptions replaces `config.analytics.bots`
+// with a fresh array on every change, and a set built once would keep honouring the registry the
+// process booted with after an operator flagged or unflagged a crawler from the console.
+
+test('botRendersJs: the default registry flags only the documented renderers', () => {
+	for (const bot of ['Googlebot', 'Google InspectionTool', 'Bingbot', 'Applebot', 'YandexBot']) {
+		assert.equal(botRendersJs(bot), true, bot);
+	}
+	for (const bot of ['GPTBot', 'ClaudeBot', 'OAI-SearchBot', 'PerplexityBot', 'CCBot', 'AhrefsBot', 'other']) {
+		assert.equal(botRendersJs(bot), false, bot);
+	}
+	assert.equal(botRendersJs(undefined), false);
+});
+
+test('botRendersJs: matches case-insensitively, like the other registry-derived allowlists', () => {
+	assert.equal(botRendersJs('googlebot'), true);
+	assert.equal(botRendersJs('BINGBOT'), true);
+});
+
+test('botRendersJs: follows a live registry change in both directions', () => {
+	applyOptions({
+		analytics: {
+			bots: [
+				{ name: 'MyBot', match: 'mybot', rendersJs: true },
+				{ name: 'Googlebot', match: 'googlebot', rendersJs: false },
+			],
+		},
+	});
+	assert.equal(botRendersJs('MyBot'), true, 'a deployment can flag a crawler the default does not');
+	assert.equal(botRendersJs('Googlebot'), false, 'and unflag one the default does');
+	// Back to the defaults: a fresh array, a fresh set.
+	applyOptions({});
+	assert.equal(botRendersJs('MyBot'), false);
+	assert.equal(botRendersJs('Googlebot'), true);
+});
+
+test('botRendersJs: only a literal true flags; an entry without the field, or with junk in it, does not', () => {
+	applyOptions({
+		analytics: {
+			bots: [
+				{ name: 'A', match: 'a' },
+				{ name: 'B', match: 'b', rendersJs: 'yes' },
+				{ name: 'C', match: 'c', rendersJs: 1 },
+			],
+		},
+	});
+	for (const bot of ['A', 'B', 'C']) assert.equal(botRendersJs(bot), false, bot);
+});
+
+test('botRendersJs: a derived name has no registry entry to carry the flag', () => {
+	applyOptions({ analytics: { bots: [], deriveUnknownBots: true } });
+	const derived = getBotName(headers({ 'user-agent': 'RenderyBot/1.0 (+https://example.com/bot)' }));
+	assert.equal(derived, 'RenderyBot');
+	assert.equal(botRendersJs(derived), false);
 });

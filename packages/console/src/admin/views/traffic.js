@@ -457,9 +457,9 @@ function kpis(data, scope) {
 			// leaves out — and under a bot filter it says so, since this one cannot narrow. "Before
 			// crawler follow-up requests" is the term that is NOT in the sum (see originLoad).
 			load.arrived > 0
-				? `origin saw ${fmtCount(load.total)} of ${fmtCount(load.arrived)} asked · before crawler follow-up requests${
-						filter ? ' · all bots' : ''
-					}`
+				? `origin saw ${fmtCount(load.total)} of ${fmtCount(load.baseline)} it would have · ${
+						load.scriptCalls.measured ? 'script calls counted' : 'before crawler follow-up requests'
+					}${filter ? ' · all bots' : ''}`
 				: 'no crawler requests in the window',
 			// Below half is a flag on either figure; below ZERO means this system is sending the origin
 			// more requests than the crawlers would have on their own — the finding, not a display bug.
@@ -1115,6 +1115,8 @@ function statusCodes(data, filter) {
 // same figure); this is the panel that shows its terms.
 
 /** What the origin saw, by cause, over time — the panel behind the net offload tile. */
+const PINK_SOFT = '#e08bb0';
+
 const LOAD_ROWS = [
 	{
 		key: 'proxied',
@@ -1127,6 +1129,20 @@ const LOAD_ROWS = [
 		label: 'renders',
 		color: SERIES[0],
 		means: 'page loads by the render fleet, one per posted result — the document only',
+	},
+	{
+		key: 'rendersK',
+		label: 'render script calls',
+		color: '#7fb3ff',
+		means:
+			'the origin calls the pages’ own scripts made while the fleet rendered them (uncacheable same-origin subrequests)',
+	},
+	{
+		key: 'incurred',
+		label: 'crawler script calls',
+		color: PINK_SOFT,
+		means:
+			'the origin calls a script-executing crawler’s page-view made — a snapshot that kept its scripts, or a proxied origin page',
 	},
 	{
 		key: 'probes',
@@ -1159,11 +1175,21 @@ function originSeen(data, { load, filter }) {
 				]
 			: [
 					el('div', { cls: 'stat-grid tight' }, [
-						stat('Crawlers asked for', fmtCount(load.arrived), 'requests at ingress, all bots'),
+						stat(
+							'The origin would have seen',
+							fmtCount(load.baseline),
+							load.scriptCalls.measured
+								? `${fmtCount(load.arrived)} crawler requests + ${fmtCount(load.scriptCalls.saved + load.scriptCalls.incurred)} script calls their page-views carry`
+								: 'crawler requests at ingress, all bots'
+						),
 						stat(
 							'The origin answered',
 							fmtCount(load.total),
-							`${pct(load.total, load.arrived)} of that — ${fmtNet(load.net)} net offload`,
+							`${pct(load.total, load.baseline)} of that — ${fmtNet(load.net)} net offload${
+								load.scriptCalls.measured && Number.isFinite(load.netDocuments)
+									? ` · ${fmtNet(load.netDocuments)} documents-only`
+									: ''
+							}`,
 							{ warn: Number.isFinite(load.net) && load.net < 0.5 }
 						),
 						stat(
@@ -1171,13 +1197,26 @@ function originSeen(data, { load, filter }) {
 							fmtCount(load.proxied),
 							`${fmtCount(load.total - load.proxied)} more came from this system`
 						),
-						// The unmeasured term gets a tile so it sits in the same row as the measured ones, at
-						// the same size — not a footnote under a number that looks complete without it.
-						stat(
-							'Crawler follow-up requests',
-							'not measured',
-							`${fmtCount(load.handed)} pages handed to crawlers · counted on neither side of the ledger`
-						),
+						// The fifth term gets a tile so it sits in the same row as the others, at the same size
+						// — measured, it is the saving and the cost side by side; unmeasured, it is the exposure
+						// rather than a footnote under a number that looks complete without it.
+						load.scriptCalls.measured
+							? stat(
+									'Script calls',
+									`${fmtCount(load.scriptCalls.saved)} saved`,
+									`${fmtCount(load.scriptCalls.incurred)} incurred${
+										load.scriptCalls.unknownServes > 0
+											? ` · ${fmtCount(load.scriptCalls.unknownServes)} serves with k unknown`
+											: ''
+									}`,
+									// Blind on more serves than it can see: the figure is still mostly documents-only.
+									{ warn: load.scriptCalls.unknownServes > load.scriptCalls.knownServes }
+								)
+							: stat(
+									'Crawler follow-up requests',
+									'not measured',
+									`${fmtCount(load.handed)} pages handed to crawlers · counted on neither side of the ledger`
+								),
 					]),
 					stackedBars(data, keys, stacks, colorOf, { format: fmtCount }),
 					barList(
@@ -1191,11 +1230,16 @@ function originSeen(data, { load, filter }) {
 						{ format: fmtCount }
 					),
 					el('p', { cls: 'muted chart-note' }, [
-						'Every request the origin answered because this deployment exists, against what crawlers asked ',
-						'for. Gross offload counts only the first bar; net offload subtracts all of them. A render is ',
-						'counted as ONE request — the document; the page’s own scripts and stylesheets reach the origin ',
-						'too if the CDN does not cache them for the renderer, which nothing here can see. A probe is one ',
-						'small endpoint call, not a page render — cheaper per request than the others, but a request.',
+						'Every request the origin answered because this deployment exists, against what it would have ',
+						'seen without it. Gross offload counts only the first bar; net offload subtracts all of them. ',
+						load.scriptCalls.measured
+							? 'A render is the document plus the calls the page’s own scripts made while rendering (“render ' +
+								'script calls”, as the fleet measured them); “crawler script calls” are the same calls made by a ' +
+								'script-executing crawler that was handed a page it could run. '
+							: 'A render is counted as ONE request — the document; the page’s own scripts and stylesheets reach ' +
+								'the origin too if the CDN does not cache them for the renderer, which nothing here can see. ',
+						'A probe is one small endpoint call, not a page render — cheaper per request than the others, but a ',
+						'request.',
 						load.lumpy
 							? ' Probe and sitemap counts land where a PASS FINISHED, not where the requests happened: over ' +
 								'a range shorter than a sweep this is either none of a running pass or all of one that just ' +
@@ -1225,6 +1269,38 @@ function originSeen(data, { load, filter }) {
  */
 function followUpNote(load) {
 	if (!load.handed) return null;
+	const { measured, saved, incurred, knownServes, unknownServes, unspecified, blocked } = load.scriptCalls;
+	if (measured) {
+		const calls = saved + incurred;
+		return el('div', { cls: unknownServes > knownServes ? 'note warn' : 'note' }, [
+			el('strong', {
+				text:
+					`${num(calls)} origin calls the pages’ own scripts would make were counted on both sides: ` +
+					`${num(saved)} spared, ${num(incurred)} taken. `,
+			}),
+			'A crawler that executes scripts (Googlebot, Bingbot, Applebot…) runs the page it is handed, and the ',
+			'page makes its own XHR/fetch calls to the origin — inventory, pricing, personalisation — which no CDN ',
+			'caches. The render fleet measured how many each page makes (k), and each such page-view puts its k on ',
+			'one side: SPARED when the crawler got a snapshot with its scripts stripped (nothing to run), TAKEN when ',
+			'the snapshot kept them or the page came from the origin. Without this system every one of those ',
+			'page-views would have cost the origin the document plus k, which is why the baseline above is larger ',
+			'than the request count.',
+			unknownServes > 0
+				? ` ${num(unknownServes)} serves to script-executing crawlers had no k — a miss, or a page not yet ` +
+					're-rendered since the fleet started measuring — and carry nothing on either side; ' +
+					(unknownServes > knownServes
+						? 'that is MOST of them, so this figure is still mostly documents-only. It decays over one render cycle.'
+						: 'it decays over one render cycle.')
+				: '',
+			unspecified > 0 || blocked > 0
+				? ` k is a lower bound: ${num(unspecified)} same-origin responses during rendering carried no freshness ` +
+					'headers at all (a CDN’s default TTL decides whether those reach the origin — counted on neither ' +
+					`side), and ${num(blocked)} same-origin requests were aborted by the fleet’s block list before any ` +
+					'response (a crawler would make them; class unknown).'
+				: '',
+			' Which crawlers run scripts is the registry’s claim (analytics.bots rendersJs), not an observation.',
+		]);
+	}
 	return el('div', { cls: 'note' }, [
 		el('strong', {
 			text: `${num(load.handed)} pages were handed to crawlers, and the requests their scripts make are counted on neither side. `,
@@ -1232,16 +1308,16 @@ function followUpNote(load) {
 		'A rendering crawler (Googlebot, Bingbot, Applebot) fetches a page and then runs it, and the page makes ',
 		'its own XHR/fetch calls to the origin — inventory, pricing, personalisation — which are exactly the ',
 		'calls no CDN caches. Without this system every such crawl costs the origin the document PLUS those ',
-		'calls, so the “crawlers asked for” baseline above understates what the origin was spared. With it, a ',
+		'calls, so the “would have seen” baseline above understates what the origin was spared. With it, a ',
 		'snapshot served without its scripts triggers none of them (a saving not credited above), a snapshot ',
 		'that keeps its scripts or a proxied origin page triggers them as before (a cost not charged), and our ',
 		'own renders run the page too (each render is really the document plus those calls). None of it passes ',
 		'through this plugin — the CDN sends a crawler’s subrequests straight to the origin — so the figure is ',
 		'documents-only on both sides and says so, for every crawler rather than a guessed subset. Where ',
 		'snapshots are served with scripts stripped, the true net offload for rendering crawlers is HIGHER than ',
-		'shown. The render fleet can measure the per-page factor (it loads the same pages and already classifies ',
-		'every same-origin response as cacheable or not); applied to both sides by what the registry says each ',
-		'crawler runs, this becomes a counted term.',
+		'shown. Plugin 0.65.0 with a browser 1.22.0 fleet measures the per-page factor and this note becomes a ',
+		'count: the fleet classifies every same-origin response as cacheable or not, the plugin stores it per ',
+		'page, and each serve to a crawler the registry flags as running scripts puts it on the right side.',
 	]);
 }
 

@@ -358,6 +358,72 @@ test('outcome=rendered stores the page and reschedules', async () => {
 	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'rescheduled one interval out');
 });
 
+// ---- the page's origin factor k (browser ≥ 1.22.0) ----
+
+const TALLY = { sameOrigin: 12, cacheable: 7, uncacheable: 4, unspecified: 1, blocked: 3 };
+
+test('a result carrying the subrequest tally stores k and the scripts flag on the page, and emits every class', async () => {
+	seedSource({ renderInterval: 60_000 });
+	await postResult(
+		{
+			id: key(A),
+			url: A,
+			statusCode: 200,
+			outcome: 'rendered',
+			isIndexable: true,
+			headers: {},
+			subrequests: TALLY,
+			scriptsStripped: true,
+		},
+		'<html>fresh</html>'
+	);
+
+	const page = stores.prerenderedPage.get(key(A));
+	assert.equal(page.uncacheableSubrequests, 4);
+	assert.equal(page.scriptsStripped, true);
+	// One VALUE per class — the console reads mean × count, so the value is the count for that class.
+	const rows = analytics.filter((a) => a[1] === 'render' && a[2] === 'subrequests').map((a) => [a[3], a[0]]);
+	assert.deepEqual(rows, [
+		['sameOrigin', 12],
+		['cacheable', 7],
+		['uncacheable', 4],
+		['unspecified', 1],
+		['blocked', 3],
+	]);
+});
+
+test('a worker that posts no tally stores NULL, never zero — the serve path reports null as unknown', async () => {
+	seedSource({ renderInterval: 60_000 });
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>fresh</html>'
+	);
+	const page = stores.prerenderedPage.get(key(A));
+	assert.equal(page.uncacheableSubrequests, null);
+	assert.equal(page.scriptsStripped, null);
+	assert.equal(
+		analytics.some((a) => a[1] === 'render' && a[2] === 'subrequests'),
+		false
+	);
+});
+
+test('a half-shaped tally is not read at all — zeros for missing classes would understate k', async () => {
+	seedSource({ renderInterval: 60_000 });
+	for (const bad of [{ uncacheable: 4 }, { ...TALLY, uncacheable: -1 }, { ...TALLY, blocked: 'many' }, 'nope', 7]) {
+		analytics = [];
+		await postResult(
+			{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {}, subrequests: bad },
+			'<html>fresh</html>'
+		);
+		assert.equal(stores.prerenderedPage.get(key(A)).uncacheableSubrequests, null, JSON.stringify(bad));
+		assert.equal(
+			analytics.some((a) => a[1] === 'render' && a[2] === 'subrequests'),
+			false,
+			JSON.stringify(bad)
+		);
+	}
+});
+
 // ---- route-typed render cadence ----
 
 const HOUR_MS = 3_600_000;

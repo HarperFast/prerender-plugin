@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { CacheKey } from '../util/cacheKey.js';
-import { getBotName, botMayDiscover, botCountsAsDemand } from '../util/userAgent.js';
+import { getBotName, botMayDiscover, botCountsAsDemand, botRendersJs } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
 import { canonicalizeUrl } from '../util/url.js';
 import { config } from '../config.js';
@@ -107,6 +107,7 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 	const route = info.route?.path ?? info.routeClass ?? 'unrouted';
 	metrics.botServe(info.source, info.cacheStatus, request.botName);
 	metrics.routeServe(route, info.cacheStatus, deviceType);
+	recordHydrationCalls(resource, request.botName, info);
 	if (info.source === 'cache' && resource.lastCached) {
 		// lastCached is a schema Date — guard truthiness FIRST, then coerce, exactly like the
 		// expiresAt read above: `new Date(null)` is epoch 0 (not NaN), so an unguarded null
@@ -128,6 +129,42 @@ export function recordServeOutcome(resource, request, info, deviceType) {
 			metrics.pageAgeNegative(request.botName, deviceType);
 		}
 	}
+}
+
+// THE OFFLOAD TERM NO SERVE-SIDE COUNTER CAN SEE (metrics.js `hydration_calls`, prerender-plugin#153).
+//
+// A crawler that executes scripts runs the page it is handed, and the page makes its own XHR/API
+// calls to the origin — calls that go crawler → CDN → origin and never pass through here. The
+// render fleet measured how many such calls THIS page makes (`uncacheableSubrequests`, k) when it
+// rendered it; this decides which side of the ledger those k calls land on for this serve:
+//
+//   saved     a cache serve of a snapshot stored WITHOUT its scripts — the crawler runs nothing, and
+//             the origin is spared the k calls a raw page-view would have cost it.
+//   incurred  a cache serve of a snapshot that KEPT its scripts, or any origin serve (the crawler
+//             gets a page with scripts either way) — the origin takes the k calls.
+//   unknown   k is not known for this serve: no page record (a miss), or one rendered by a fleet
+//             that did not report the tally. Value 0, counted so the blind spot has a size.
+//
+// Emitted only for crawlers the registry flags `rendersJs`: an unflagged crawler fetches HTML and
+// runs nothing, so its page-view carries no k on either side. Same gate as bot_serve otherwise, and
+// the same cost — one in-memory counter bump, no await.
+//
+// Exported for tests, which assert the side per source × stripped × k-known.
+export function recordHydrationCalls(resource, botName, info) {
+	if (!botRendersJs(botName)) return;
+	// The record whose k applies: the served page when the bytes came from cache (a render-now hit is
+	// the fresh record), else the record the request was judged against before it was proxied.
+	const page = info.source === 'origin' ? info.page : (resource ?? info.page);
+	const k = page?.uncacheableSubrequests;
+	if (typeof k !== 'number' || !Number.isFinite(k) || k < 0) {
+		metrics.hydrationCalls(0, 'unknown', botName, info.source);
+		return;
+	}
+	// `scriptsStripped` decides the side ONLY for a cache serve: a proxied origin page carries its
+	// scripts whatever the snapshot did. Null (older row) reads as "kept" — the conservative side,
+	// since crediting a saving on a snapshot that might hydrate is the one error this must not make.
+	const saved = info.source !== 'origin' && page.scriptsStripped === true;
+	metrics.hydrationCalls(k, saved ? 'saved' : 'incurred', botName, info.source);
 }
 
 // Resolve the request into { url, cacheUrl, deviceType, routeClass, route }, dispatching on
@@ -193,6 +230,10 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	const { skipCache, missMode, missModeExplicit } = resolveServingPolicy(routeClass, request.method, request.headers);
 
 	const page = skipCache ? null : await PrerenderedPage.get(cacheKey);
+	// The record this request was judged against, kept for `recordHydrationCalls`: when the request
+	// ends up proxied, `resource` is the origin response and the page's own k is only here. Never
+	// surfaced — response.js reads named fields off `info`, not the object.
+	info.page = page ?? null;
 	// expiresAt is a schema `Date` (stored from Date.now()); read it robustly so a Date,
 	// number, or serialized string all compare correctly — cf. the Number() coercion in
 	// util/renderNow.js. A bad/missing value yields NaN => not servable from cache.

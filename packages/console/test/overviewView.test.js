@@ -371,3 +371,29 @@ test('the offload tile shows the gross figure with the net one underneath, from 
 		'a 30% net offload should warn'
 	);
 });
+
+test('with script calls measured the offload subtitle says so, instead of the documents-only caveat', async () => {
+	const analytics = {
+		...ANALYTICS,
+		startMs: 0,
+		endMs: 3_600_000,
+		bucketMs: 900_000,
+		bucketCount: 4,
+		series: [
+			combo('bot_serve', 'cache', 'hit', 'googlebot', 900),
+			combo('bot_serve', 'origin', 'miss', 'googlebot', 100),
+			combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 1000),
+			combo('render', 'outcome', 'rendered', null, 100),
+			// 900 script-stripped snapshots to Googlebot at k=4: 3,600 calls spared on the baseline.
+			combo('hydration_calls', 'saved', 'googlebot', 'cache', 900, 4),
+		],
+	};
+	const ctx = await ready({ analytics });
+	const tile = find(
+		draw(ctx),
+		(n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Origin offload'
+	);
+	// (4,600 − 200) ÷ 4,600 = 96% — the saving the documents-only figure (80%) could not credit.
+	assert.match(tile.textContent, /96% net of renders \+ probes · script calls counted/);
+	assert.doesNotMatch(tile.textContent, /before crawler follow-up requests/);
+});

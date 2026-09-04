@@ -223,19 +223,64 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
+	hydration_calls: metric('hydration_calls', {
+		kind: 'value',
+		emittedBy: 'http_handlers/bot_request.js',
+		cadence: 'once per bot request from a crawler the registry flags `rendersJs`, beside bot_serve',
+		summary:
+			'The origin calls a script-executing crawler’s page-view makes AFTER the document — the offload term ' +
+			'no serve-side counter can see — as measured by the render fleet for that page (k).',
+		usefulFor:
+			'The missing side of net offload (prerender-plugin#153). A crawler that runs the page (Googlebot, ' +
+			'Bingbot, Applebot…) makes the page’s own XHR/API calls to the origin, and those never pass ' +
+			'through this plugin. Without prerender every such page-view costs the origin 1 + k requests; ' +
+			'with it, a snapshot served WITHOUT its scripts triggers none of the k (`saved`), while a snapshot ' +
+			'that kept them or a proxied origin page triggers all of them (`incurred`). So: ' +
+			'baseline origin load = bot_request + Σ(saved) + Σ(incurred); actual = proxied + renders(1 + k) + ' +
+			'probes + sitemaps + Σ(incurred). Read Σ as mean × count — the VALUE is k per serve.',
+		caveats:
+			'`unknown` rows are serves where k could not be known: no page record (a miss), or a page rendered ' +
+			'before the fleet reported subrequests (browser < 1.22.0) — their value is 0 and their COUNT is ' +
+			'the population the figure is blind to; it decays over one render cycle after the fleet upgrade. ' +
+			'k is the render fleet’s measurement of the ORIGIN page under its block list, so it undercounts by ' +
+			'whatever that list aborts (the fleet reports `blocked` beside it) and says nothing about what a ' +
+			'CDN’s default TTL does to responses with no freshness headers (`unspecified`). Which crawlers run ' +
+			'scripts is the registry’s claim (`analytics.bots[].rendersJs`), not an observation.',
+		gatedBy: 'analytics.enabled, and the bot’s registry entry carrying rendersJs: true',
+		dimensions: {
+			path: {
+				name: 'side',
+				values: ['saved', 'incurred', 'unknown'],
+				description:
+					'saved = a cache serve of a snapshot stored with its scripts stripped (the crawler runs nothing; ' +
+					'the origin is spared k). incurred = a cache serve of a snapshot that kept its scripts, or an ' +
+					'origin serve of any kind (the crawler runs the page; the origin takes k). unknown = k not ' +
+					'known for this serve (value 0; count the rows).',
+			},
+			method: { name: 'botName', description: 'As bot_request.method — only crawlers flagged rendersJs appear.' },
+			type: { name: 'source', values: SERVE_SOURCES, description: 'As bot_serve.path.' },
+		},
+	}),
+
 	render: metric('render', {
 		kind: 'value',
 		emittedBy: 'resources/RenderQueue.js',
 		cadence:
 			'per render result posted back by a browser worker: one `outcome` row always, one `time_ms` sample ' +
-			'when the worker reported a duration',
-		summary: 'The render fleet, in one scan: how long each render took, and what became of it.',
+			'when the worker reported a duration, one `subrequests` sample per class when the worker reported ' +
+			'its tally (browser ≥ 1.22.0)',
+		summary:
+			'The render fleet, in one scan: how long each render took, what became of it, and what the page asked of its origin.',
 		usefulFor:
 			'`time_ms` is fleet capacity (renders/hour/pod = concurrency ÷ time_ms) and what a settle-tuning ' +
 			'change has to move. `outcome` is the render-failure alert — "renders are failing", "the corpus is ' +
 			'being mass-suppressed", and "the renderer credential broke" were log-grep-only before it. One ' +
 			'`outcome` emit per posted result, so outcomes sum to results processed and any share reads as a ' +
-			'fraction of render throughput.',
+			'fraction of render throughput. `subrequests` is the per-page origin factor k (prerender-plugin#153): ' +
+			'the same-origin requests the page made beyond the document, by whether a SHARED cache would have ' +
+			'answered them — `uncacheable` is what reaches the origin whoever runs the page, i.e. what a ' +
+			'script-executing crawler’s page-view costs the origin and what each of OUR renders costs it too. ' +
+			'A VALUE per result (mean × count = total; mean = k per render), never a count of emits.',
 		caveats:
 			'auth-failure is special-cased on purpose: 401/403 never suppresses (it is almost never a statement ' +
 			'about the page), so a spike there with a steady `suppressed` is the signature of a broken bypass ' +
@@ -245,17 +290,24 @@ export const METRICS = Object.freeze({
 		dimensions: {
 			path: {
 				name: 'series',
-				values: ['time_ms', 'outcome'],
-				description: 'time_ms = duration distribution (ms). outcome = counter of what became of the result.',
+				values: ['time_ms', 'outcome', 'subrequests'],
+				description:
+					'time_ms = duration distribution (ms). outcome = counter of what became of the result. ' +
+					'subrequests = same-origin subrequest counts per result, by shared-cache class (method).',
 			},
 			method: {
-				name: 'statusCode (time_ms) / outcome (outcome)',
+				name: 'statusCode (time_ms) / outcome (outcome) / class (subrequests)',
 				description:
 					'time_ms: HTTP status the render observed — a NUMBER at the emit site (for a redirect bail, ' +
 					'the FIRST hop’s 3xx). outcome: rendered | suppressed | auth-failure | transient | failed | ' +
 					'redirect — rendered = usable result, suppressed = genuine non-indexable verdict (target moves ' +
 					'to its recheck cadence), auth-failure = 401/403 kept and retried, transient = 408/429/5xx kept ' +
-					'and retried, failed = the render itself broke, redirect = the page moved or bounced.',
+					'and retried, failed = the render itself broke, redirect = the page moved or bounced. ' +
+					'subrequests: uncacheable (explicitly reaches the origin: non-GET, uncacheable status, ' +
+					'Set-Cookie, no-store/private/no-cache, zero max-age, Vary *, expired Expires) | cacheable ' +
+					'(explicit positive freshness) | unspecified (no freshness information — CDN-default ' +
+					'dependent, counted on neither side of the offload figure) | blocked (same-origin requests the ' +
+					'fleet’s block list aborted before a response — a crawler would make them; class unknown).',
 			},
 			type: {
 				name: 'candidacy (time_ms) / detail (outcome)',
@@ -699,6 +751,18 @@ export const metrics = Object.freeze({
 
 	/** What became of one posted render result — exactly one call per result; the `render` outcome series. */
 	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render', 'outcome', outcome, detail ?? null),
+
+	/**
+	 * One class of one result's same-origin subrequest tally — the `render` subrequests series. A VALUE
+	 * (the count for that class on that render), so mean × count is the fleet total and mean is k.
+	 */
+	renderSubrequests: (count, klass) => server.recordAnalytics(count, 'render', 'subrequests', klass, null),
+
+	/**
+	 * The page's origin factor k, on the side of the offload ledger this serve put it. Value = k (0 for
+	 * 'unknown'); one call per bot request from a crawler the registry flags as running scripts.
+	 */
+	hydrationCalls: (k, side, botName, source) => server.recordAnalytics(k, 'hydration_calls', side, botName, source),
 
 	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
 	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
