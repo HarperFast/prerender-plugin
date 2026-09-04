@@ -649,8 +649,9 @@ export function originLoad(data) {
 		sitemaps,
 		total,
 		arrived,
-		// Null, never 0 or 100%: an empty window has no offload to report.
-		net: arrived > 0 ? (arrived - total) / arrived : null,
+		// Null, never 0 or 100%: an empty window has no offload to report. Through ratioOf like every
+		// other division in this module, so the zero-denominator guard cannot be forgotten here either.
+		net: ratioOf(arrived - total, arrived),
 		lumpy: probes > 0 || sitemaps > 0,
 		// The fifth term's exposure: every page handed to a crawler, cache-served or proxied alike —
 		// each one is a page whose scripts the crawler either ran against the origin or did not.
