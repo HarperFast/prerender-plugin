@@ -2,6 +2,7 @@ import { setTimeout as sleep } from 'timers/promises';
 import { request } from './external/http.js';
 import logger from './util/Logger.js';
 import { settings } from './settings.js';
+import type { SubrequestTally } from './subrequests.js';
 import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
@@ -66,6 +67,13 @@ type RenderAttempt = {
 	 * request produces no response.
 	 */
 	subresourceErrors?: number;
+	/**
+	 * Every same-origin response the page provoked beyond the document, by shared-cache verdict
+	 * (src/subrequests.ts). `uncacheable` is the per-page factor the plugin applies at serve time
+	 * to count the origin calls a script-running crawler's page-view makes — on both sides of the
+	 * offload ledger (HarperFast/prerender-plugin#153).
+	 */
+	subrequests?: SubrequestTally;
 };
 
 type OriginHttpResponse = {
@@ -223,6 +231,14 @@ export default class RenderJob {
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
+			// The page's own origin traffic, and whether the snapshot being posted can still make it.
+			// Posted on EVERY result that had an attempt (a redirect or an error saw a partial tally
+			// and that is still what the page asked for), and `scriptsStripped` is this fleet's
+			// setting rather than a per-page fact — a snapshot stored with its scripts removed cannot
+			// hydrate anything when a crawler runs it, which is what turns the factor from a cost
+			// into a saving. An older plugin ignores both fields.
+			subrequests: this.latestAttempt?.subrequests,
+			scriptsStripped: settings.config.postProcess.stripScripts,
 			outcome: this.outcome,
 			// One slug for WHY there is no content (see the field doc). The redirect/error
 			// fallbacks are derived here so every no-content result carries a reason without

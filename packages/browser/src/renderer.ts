@@ -2,6 +2,7 @@ import { Renderer } from './Worker.js';
 import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
+import { emptyTally, tallySubresponse } from './subrequests.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
@@ -52,6 +53,12 @@ const renderer: Renderer = async (page, job) => {
 	const timings: RenderTimings = {};
 	if (job.latestAttempt) job.latestAttempt.timings = timings;
 	let navStart = 0;
+	// What the page asked of its own origin beyond the document, by shared-cache verdict — the
+	// per-page factor the offload figure downstream needs (src/subrequests.ts). Same in-place
+	// discipline as `timings`: the attempt holds the reference, so a partial tally survives an
+	// early return.
+	const subrequests = emptyTally();
+	if (job.latestAttempt) job.latestAttempt.subrequests = subrequests;
 
 	const blockedResourceTypes = new Set(config.block.resourceTypes);
 	const blockedUrlPatterns = config.block.urlPatterns;
@@ -117,10 +124,14 @@ const renderer: Renderer = async (page, job) => {
 				return;
 			}
 			if (isBlockedUrl(req.url())) {
+				// A same-origin request this fleet refuses to make is one a crawler WOULD make, of a
+				// class nobody can judge without a response — counted so the undercount is visible.
+				if (isSameOrigin(req.url())) subrequests.blocked++;
 				req.abort().catch(noop);
 				return;
 			}
 			if (blockedResourceTypes.has(req.resourceType())) {
+				if (isSameOrigin(req.url())) subrequests.blocked++;
 				// Stub blocked images (vs abort) so lazy-loaders keep their real src URLs.
 				if (config.block.stubImages && req.resourceType() === 'image') {
 					req.respond(STUB_IMAGE_RESPONSE).catch(noop);
@@ -178,16 +189,27 @@ const renderer: Renderer = async (page, job) => {
 				return;
 			}
 
+			const sameOrigin = isSameOrigin(res.url());
 			// A same-origin asset the origin refused while the document succeeded. Recorded on the
 			// attempt (mutated in place, like `timings`, so it survives an early return) and
 			// aggregated by the worker — a render whose scripts all 403 otherwise reports as a
 			// clean success.
-			if (res.status() >= 400 && isSameOrigin(res.url()) && job.latestAttempt) {
+			if (res.status() >= 400 && sameOrigin && job.latestAttempt) {
 				job.latestAttempt.subresourceErrors = (job.latestAttempt.subresourceErrors ?? 0) + 1;
 			}
 
-			if (!cache || !cache.isCacheableRequest(req)) return;
 			const resHeaders = res.headers();
+			// Every same-origin response the page provoked, judged by whether a shared cache in front
+			// of the origin would have answered it. Sub-frame documents count too: they are not the
+			// navigation, and a crawler's renderer loads them the same way. Header reads only — no
+			// body, no await — on a hook that already fires per response.
+			if (sameOrigin) {
+				tallySubresponse(subrequests, req.method(), res.status(), resHeaders, {
+					replayedFromOwnCache: Boolean(resHeaders[CACHE_REPLAY_HEADER]),
+				});
+			}
+
+			if (!cache || !cache.isCacheableRequest(req)) return;
 			// Skip responses we just synthesized from our own cache.
 			if (resHeaders[CACHE_REPLAY_HEADER]) return;
 			const policy = cache.getCachePolicy(res);

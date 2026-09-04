@@ -385,6 +385,31 @@ Two things worth checking before adding a rule: an attribute may be **load-beari
 `<astro-island>` on hydration, so stripping `ssr` would destroy the only marker distinguishing a
 healthy snapshot from an un-hydrated one. Strip what is inert, not what is merely non-visual.
 
+### What the page asks of its origin — the `subrequests` tally (v1.22.0)
+
+Every result posts a count of the same-origin requests the page made beyond the document, judged by
+whether a **shared cache** in front of the origin would have answered them (RFC 9111 rules):
+
+```
+subrequests: { sameOrigin, cacheable, uncacheable, unspecified, blocked }
+scriptsStripped: <postProcess.stripScripts>
+```
+
+`uncacheable` is the per-page factor the plugin's offload figure needs — the XHR/API calls a
+crawler that executes JavaScript would send to the origin when it runs the same page, which never
+pass through the plugin and so cannot be counted anywhere else (prerender-plugin#153). It is
+explicit-only: non-GET, an uncacheable status, `Set-Cookie`, `no-store` / `private` / `no-cache`, a
+zero max-age, `Vary: *`, or an expired `Expires`. `cacheable` is explicit positive freshness;
+`unspecified` had no freshness information at all and depends on the CDN's defaults, so it is
+reported and counted on neither side. `blocked` is the same-origin requests this fleet's block list
+aborted before any response — requests a crawler would make, of unknown class — the visible bound on
+the undercount. `scriptsStripped` says whether the stored snapshot can make any of these calls when
+a crawler runs it: with scripts stripped the factor is a **saving** at serve time, not a cost.
+
+Cost: header checks on a response hook that already fires per response; no body reads, nothing
+awaited. The per-window stats line carries the totals as `subrequestsUncacheable` and
+`subrequestsUnspecified`.
+
 ## Custom renderer
 
 A renderer receives the Puppeteer `page` and the `RenderJob` and returns the serialized HTML (or
