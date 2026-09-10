@@ -16,6 +16,13 @@ export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefine
 // Comfortably longer than a render + its result POST, so it only ever fires on stuck bookkeeping.
 const RETIRED_BROWSER_MAX_MS = 120000;
 
+// A render is not started with less lease than this left: by the time it posted, the plugin may
+// have re-granted the job, and the second render would be wasted. Applied to a job as claimed and,
+// on a multi-device job, before EACH further variant — so a job that ran long posts what it has
+// rather than a result nobody will accept. The plugin floors `queue.jobLeaseTime` at 2 minutes for
+// exactly this number; lowering it here without raising that floor live-locks the queue.
+const LEASE_MIN_REMAINING_MS = 30 * 1000;
+
 type RenderWorkerConfig = {
 	/**
 	 * The max number of concurrent page renders
@@ -98,6 +105,12 @@ export default class RenderWorker {
 				other: 0,
 			},
 			expiredSkipped: 0,
+			// Results posted — one per claimed JOB, whereas `completed` counts renders. With plugin >=
+			// 0.66.0 a job renders every device of one URL, so `completed / jobs` is the variants per job.
+			jobs: 0,
+			// Variants a multi-device job asked for and this worker did NOT attempt: the lease ran short
+			// or the worker began draining between variants. The plugin retries the URL for them.
+			variantsSkipped: 0,
 			concurrencyBlocked: 0,
 			rpsDelayed: 0,
 			resultPostFailures: 0,
@@ -159,7 +172,7 @@ export default class RenderWorker {
 			if (this.shuttingDown) break;
 			const ts = Date.now();
 			// Do not run expired jobs to prevent double rendering
-			if (job.expiresAt - ts < 30 * 1000) {
+			if (job.expiresAt - ts < LEASE_MIN_REMAINING_MS) {
 				this.stats.expiredSkipped++;
 				console.log(`Skipping expired job ${job.id}`);
 				continue;
@@ -262,6 +275,8 @@ export default class RenderWorker {
 			throughput: {
 				completed: s.completed,
 				perSec: Number((s.completed / elapsedSec).toFixed(2)),
+				jobs: s.jobs,
+				variantsSkipped: s.variantsSkipped,
 				succeeded: s.succeeded,
 				emptyContent: s.emptyContent,
 				redirected: s.redirected,
@@ -432,7 +447,67 @@ export default class RenderWorker {
 		this.browser = null;
 	}
 
+	/**
+	 * One claimed job, start to posted result.
+	 *
+	 * A job is one URL. With plugin >= 0.66.0 it names every device to render (`deviceTypes`), and
+	 * they are rendered HERE, in turn, on this job's one concurrency slot — so `CONCURRENCY` still
+	 * bounds pages in flight, and a job simply occupies its slot for as many renders as it has
+	 * devices. Every device's snapshot then travels back in ONE result, which is what lets the plugin
+	 * keep a URL's variants aligned: same render pass, seconds apart, one scheduling decision. A
+	 * legacy per-device job (older plugin) is the single-variant case of the same loop and posts the
+	 * shape that plugin understands.
+	 *
+	 * The variants run sequentially rather than in parallel on purpose. Parallel variants would need
+	 * page-level accounting against `CONCURRENCY` and would double this job's burst on the origin;
+	 * sequential keeps every existing capacity number true (renders/hour/slot is unchanged) at the cost
+	 * of a longer per-job wall time, which the lease absorbs (`queue.jobLeaseTime` is minutes, a
+	 * variant is seconds).
+	 *
+	 * A variant is skipped — and the result posted PARTIAL — when the lease has under
+	 * `LEASE_MIN_REMAINING_MS` left or the worker started draining. A partial result is still worth
+	 * posting: the plugin stores the variants that rendered and retries the URL for the rest, and a
+	 * result that never arrives costs the whole lease before anything retries.
+	 */
 	async render(job: RenderJob) {
+		const variants = job.variants();
+		const attempted: RenderJob[] = [];
+
+		for (const variant of variants) {
+			if (attempted.length > 0) {
+				const leaseLeft = job.expiresAt - Date.now();
+				if (leaseLeft < LEASE_MIN_REMAINING_MS || this.shuttingDown) {
+					const skipped = variants.length - attempted.length;
+					this.stats.variantsSkipped += skipped;
+					logger.warn(
+						{ id: job.id, skipped, leaseLeftMs: leaseLeft, shuttingDown: this.shuttingDown },
+						'posting a partial result — remaining device variants not attempted'
+					);
+					break;
+				}
+			}
+			await this.renderVariant(variant);
+			attempted.push(variant);
+		}
+
+		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure
+		// (e.g. encode() throwing before the retry loop). Catch it so it's counted as a post
+		// failure rather than rejecting the whole render() through run()'s generic catch.
+		//
+		// The legacy shape for a legacy job, always: an older plugin reads `id` as a cache key and has
+		// no notion of `variants`, so it must get exactly what it always got.
+		const posted = await (
+			job.deviceTypes ? RenderJob.sendVariantsResult(job, attempted) : attempted[0].sendResult()
+		).catch((err) => {
+			logger.error({ id: job.id, err }, 'failed to send job result');
+			return false;
+		});
+		this.stats.jobs++;
+		if (!posted) this.stats.resultPostFailures++;
+	}
+
+	/** Render ONE device variant on a page of its own; the result is posted by the caller. */
+	private async renderVariant(job: RenderJob) {
 		const browser = await this.getBrowser();
 
 		browser.jobRefs++;
@@ -514,17 +589,8 @@ export default class RenderWorker {
 			}
 		}
 
-		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure
-		// (e.g. encode() throwing before the retry loop). Catch it so it's counted as a post
-		// failure rather than rejecting the whole render() through run()'s generic catch.
-		const sendPromise = job.sendResult().catch((err) => {
-			logger.error({ id: job.id, err }, 'failed to send job result');
-			return false;
-		});
-		const closePromise = page ? browser.closePage(page) : Promise.resolve();
 		try {
-			const [posted] = await Promise.all([sendPromise, closePromise]);
-			if (!posted) this.stats.resultPostFailures++;
+			if (page) await browser.closePage(page);
 		} finally {
 			// Released only now — not when the render finished. A retired browser is reaped once its
 			// refs hit zero, so dropping the ref before the page is closed let the reaper close the
