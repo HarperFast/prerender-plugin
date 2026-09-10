@@ -27,7 +27,17 @@ export type JobConfig = {
 	url: string;
 	expiresAt: number;
 	headers?: Record<string, string>;
+	/**
+	 * The ONE device this job renders — a legacy per-device job (plugin < 0.66.0), or one variant
+	 * of a multi-device job (see `variants()`). A multi-device job as claimed also carries this as
+	 * the first entry of `deviceTypes`, for renderers that predate the list.
+	 */
 	deviceType: string;
+	/**
+	 * Every device this job must render (plugin >= 0.66.0 claims ONE job per URL and expects every
+	 * variant back in a single result). Absent on a legacy per-device job.
+	 */
+	deviceTypes?: string[];
 	acceptLanguage?: string;
 	renderBudget?: number;
 	callbackOrigin: string;
@@ -104,6 +114,8 @@ export default class RenderJob {
 	expiresAt: number;
 	headers?: Record<string, string>;
 	deviceType: string;
+	/** See {@link JobConfig.deviceTypes}. Set on the job as CLAIMED; never on a variant. */
+	deviceTypes: string[] | undefined;
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
@@ -146,11 +158,40 @@ export default class RenderJob {
 		this.url = config.url;
 		this.headers = config.headers;
 		this.expiresAt = config.expiresAt;
-		this.deviceType = config.deviceType;
+		this.deviceTypes = Array.isArray(config.deviceTypes) && config.deviceTypes.length ? config.deviceTypes : undefined;
+		// A multi-device job names its devices in `deviceTypes`; `deviceType` then only exists for
+		// renderers that predate the list, and the first entry is what such a renderer would render.
+		this.deviceType = config.deviceType ?? this.deviceTypes?.[0] ?? '';
 		this.acceptLanguage = config.acceptLanguage;
 		this.renderBudget = config.renderBudget;
 		this.callbackOrigin = config.callbackOrigin;
 		this.isFromSitemap = config.isFromSitemap;
+	}
+
+	/**
+	 * The renders this claimed job stands for, one RenderJob per device.
+	 *
+	 * A legacy per-device job IS its own single variant. A multi-device job (plugin >= 0.66.0 claims
+	 * one job per URL) fans out to one job per entry of `deviceTypes`, each sharing the claim's id,
+	 * lease and callback — the renderer sees a plain per-device job either way, and only the worker
+	 * knows that several of them travel back in one result (`sendVariantsResult`).
+	 */
+	variants(): RenderJob[] {
+		if (!this.deviceTypes) return [this];
+		return this.deviceTypes.map(
+			(deviceType) =>
+				new RenderJob({
+					id: this.id,
+					url: this.url,
+					expiresAt: this.expiresAt,
+					headers: this.headers,
+					deviceType,
+					acceptLanguage: this.acceptLanguage,
+					renderBudget: this.renderBudget,
+					callbackOrigin: this.callbackOrigin,
+					isFromSitemap: this.isFromSitemap,
+				})
+		);
 	}
 
 	sanitizeHeaders(headers: Record<string, string>) {
@@ -202,24 +243,21 @@ export default class RenderJob {
 		return this.latestAttempt?.error || null;
 	}
 
-	/** Returns true if the result was delivered (204), false if it was dropped after retries. */
-	async sendResult(): Promise<boolean> {
-		const health = getHostHealth();
-		let host = '';
-		try {
-			host = new URL(this.callbackOrigin).hostname;
-		} catch {
-			// Malformed callbackOrigin — can't track host health, but still attempt the POST.
-		}
-
-		// Build the payload (incl. the expensive gzip) ONCE; retries re-send the same bytes.
+	/**
+	 * This render's result as the plugin reads it — every field of the wire metadata EXCEPT the job
+	 * identity (`id`/`url`), which belongs to the result envelope. One variant of a multi-device
+	 * result, or (with the identity added) the whole of a legacy per-device result.
+	 *
+	 * Builds the encoded body too (the expensive gzip) so a caller assembling several variants pays
+	 * it once per variant and retries re-send the same bytes.
+	 */
+	async resultMetadata(): Promise<{ metadata: VariantMetadata; contentBuffer: Buffer | null }> {
 		const attemptError = this.error;
-		const metadata = {
-			id: this.id,
-			url: this.url,
+		const metadata: VariantMetadata = {
+			deviceType: this.deviceType,
 			statusCode: this.httpResponse?.statusCode,
-			headers: {} as Record<string, string>,
-			renderTime: undefined as number | undefined,
+			headers: {},
+			renderTime: undefined,
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
@@ -257,62 +295,131 @@ export default class RenderJob {
 			metadata.headers['content-encoding'] = settings.contentEncoding;
 			contentBuffer = await encode(this.content, settings.contentEncoding);
 		}
-		const metadataBuffer = Buffer.from(JSON.stringify(metadata), 'utf-8');
-		const body = contentBuffer
-			? Buffer.concat([metadataBuffer, contentBuffer], metadataBuffer.byteLength + contentBuffer.byteLength)
-			: metadataBuffer;
+		return { metadata, contentBuffer };
+	}
 
-		// Retry transient failures (503/overload/network) so an expensive render isn't thrown
-		// away on a blip — bounded by the retry cap AND the job's lease (`expiresAt`), after
-		// which Harper may have re-leased it, so posting is pointless.
-		const maxAttempts = Math.max(1, settings.backoff.resultRetries + 1);
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
-				const res = await request(this.callbackOrigin, {
-					method: 'POST',
-					path: '/render_queue/job_result',
-					body,
-					headers: {
-						'x-metadata-size': metadataBuffer.byteLength.toString(),
-						'content-type': 'application/octet-stream',
-					},
-				});
+	/**
+	 * Post THIS render as a legacy per-device result: `{ id, url, ...variant }` followed by the one
+	 * encoded body. The shape every plugin release understands; a multi-device job posts through
+	 * `sendVariantsResult` instead. Returns true if the result was delivered (204), false if it was
+	 * dropped after retries.
+	 */
+	async sendResult(): Promise<boolean> {
+		const { metadata, contentBuffer } = await this.resultMetadata();
+		// `deviceType` is not part of the legacy metadata — the plugin reads it off the cache key —
+		// but posting it is harmless and lets a newer plugin log the device without parsing.
+		const envelope = { id: this.id, url: this.url, ...metadata };
+		return postResult(this, envelope, contentBuffer ? [contentBuffer] : []);
+	}
 
-				if (res.statusCode === 204) {
-					await res.body.bytes();
-					if (host) health.recordSuccess(host);
-					return true;
-				}
+	/**
+	 * Post ONE result for a multi-device job: `{ id, url, deviceTypes, variants: [...] }` followed by
+	 * every variant's encoded body, concatenated in `variants` order — each variant's `contentLength`
+	 * says how many of those bytes are its own (0 = no content). Plugin >= 0.66.0.
+	 *
+	 * `variants` is what was ATTEMPTED, which can be fewer than `deviceTypes` when the lease ran short
+	 * or the worker began draining mid-job; the plugin treats a device it asked for and did not get
+	 * back as a failed render and retries the URL.
+	 */
+	static async sendVariantsResult(job: RenderJob, variants: RenderJob[]): Promise<boolean> {
+		const encoded = await Promise.all(variants.map((variant) => variant.resultMetadata()));
+		const bodies: Buffer[] = [];
+		const envelope = {
+			id: job.id,
+			url: job.url,
+			deviceTypes: job.deviceTypes ?? variants.map((variant) => variant.deviceType),
+			variants: encoded.map(({ metadata, contentBuffer }) => {
+				if (contentBuffer) bodies.push(contentBuffer);
+				return { ...metadata, contentLength: contentBuffer?.byteLength ?? 0 };
+			}),
+		};
+		return postResult(job, envelope, bodies);
+	}
+}
 
-				const text = await res.body.text().catch(() => '');
-				if (RESULT_RETRIABLE_STATUS.has(res.statusCode)) {
-					const retryAfterMs = parseRetryAfter(res.headers['retry-after'] as string | string[] | undefined);
-					if (host) health.recordUnavailable(host, retryAfterMs);
-					if (attempt < maxAttempts && Date.now() < this.expiresAt) {
-						await sleep(resultBackoffMs(attempt));
-						continue;
-					}
-				} else if (host) {
-					// Non-retriable (4xx bug, auth failure, wrong endpoint) — usually persistent and
-					// host-wide. Feed the shared circuit (same as the claim path's non-2xx handling)
-					// so the consumer stops claiming work it can't deliver to this host, instead of
-					// rendering more results that will only be dropped.
-					health.recordError(host);
-				}
-				logger.error({ id: this.id, statusCode: res.statusCode, body: text, attempt }, 'failed to send job result');
-				return false;
-			} catch (e) {
-				// Network error — host unreachable.
-				if (host) health.recordUnavailable(host);
-				if (attempt < maxAttempts && Date.now() < this.expiresAt) {
+/** One variant's share of a posted result — see `RenderJob.resultMetadata`. */
+export type VariantMetadata = {
+	deviceType: string;
+	statusCode: number | undefined;
+	headers: Record<string, string>;
+	renderTime: number | undefined;
+	redirectedTo: string | undefined;
+	isIndexable: boolean | undefined;
+	structuredOffers: Array<string | null> | null | undefined;
+	outcome: JobOutcome;
+	reason: string | undefined;
+	error: { name: string; message: string; phase: string | undefined } | undefined;
+};
+
+/**
+ * POST one result body to the job's callback: the JSON envelope, then `bodies` concatenated, with
+ * `x-metadata-size` marking where the JSON ends. Shared by the legacy and the multi-device shapes so
+ * the retry policy cannot drift between them.
+ *
+ * Retries transient failures (503/overload/network) so an expensive render isn't thrown away on a
+ * blip — bounded by the retry cap AND the job's lease (`expiresAt`), after which Harper may have
+ * re-leased it, so posting is pointless. Returns true on a 204, false when dropped.
+ */
+async function postResult(job: RenderJob, envelope: object, bodies: Buffer[]): Promise<boolean> {
+	const health = getHostHealth();
+	let host = '';
+	try {
+		host = new URL(job.callbackOrigin).hostname;
+	} catch {
+		// Malformed callbackOrigin — can't track host health, but still attempt the POST.
+	}
+
+	// Build the payload ONCE; retries re-send the same bytes.
+	const metadataBuffer = Buffer.from(JSON.stringify(envelope), 'utf-8');
+	const body = bodies.length ? Buffer.concat([metadataBuffer, ...bodies]) : metadataBuffer;
+
+	const maxAttempts = Math.max(1, settings.backoff.resultRetries + 1);
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			const res = await request(job.callbackOrigin, {
+				method: 'POST',
+				path: '/render_queue/job_result',
+				body,
+				headers: {
+					'x-metadata-size': metadataBuffer.byteLength.toString(),
+					'content-type': 'application/octet-stream',
+				},
+			});
+
+			if (res.statusCode === 204) {
+				await res.body.bytes();
+				if (host) health.recordSuccess(host);
+				return true;
+			}
+
+			const text = await res.body.text().catch(() => '');
+			if (RESULT_RETRIABLE_STATUS.has(res.statusCode)) {
+				const retryAfterMs = parseRetryAfter(res.headers['retry-after'] as string | string[] | undefined);
+				if (host) health.recordUnavailable(host, retryAfterMs);
+				if (attempt < maxAttempts && Date.now() < job.expiresAt) {
 					await sleep(resultBackoffMs(attempt));
 					continue;
 				}
-				logger.error({ id: this.id, err: e, attempt }, 'failed to send job result');
-				return false;
+			} else if (host) {
+				// Non-retriable (4xx bug, auth failure, wrong endpoint) — usually persistent and
+				// host-wide. Feed the shared circuit (same as the claim path's non-2xx handling)
+				// so the consumer stops claiming work it can't deliver to this host, instead of
+				// rendering more results that will only be dropped.
+				health.recordError(host);
 			}
+			logger.error({ id: job.id, statusCode: res.statusCode, body: text, attempt }, 'failed to send job result');
+			return false;
+		} catch (e) {
+			// Network error — host unreachable.
+			if (host) health.recordUnavailable(host);
+			if (attempt < maxAttempts && Date.now() < job.expiresAt) {
+				await sleep(resultBackoffMs(attempt));
+				continue;
+			}
+			logger.error({ id: job.id, err: e, attempt }, 'failed to send job result');
+			return false;
 		}
-		// Exhausted retries without a definitive response (e.g. lease expired mid-backoff).
-		return false;
 	}
+	// Exhausted retries without a definitive response (e.g. lease expired mid-backoff).
+	return false;
 }
