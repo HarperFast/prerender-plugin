@@ -824,9 +824,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 						10,
 						'Per-node ceiling on accelerated REQUESTS per minute, shared across every worker on the node ' +
 							'(one minute-bucketed counter in a shared buffer). One accelerated request writes at most one ' +
-							'schedule row PER DEVICE ROW THE URL HAS — `deviceTypes.default` (two on this deployment), ' +
-							'plus the served device when that one is merely `supported` — so the write ceiling is this ' +
-							'number times those rows.\n\n' +
+							'schedule row per schedule row the URL has — normally just its URL row; plus any pre-0.66.0 ' +
+							'per-device row that has not yet converted, and a per-device row for the served device when ' +
+							'that one is merely `supported` — so the write ceiling is this number times those rows.\n\n' +
 							'Sized so its CEILING is defensible, not just its typical. 10/min/node is 14,400 ' +
 							'requests/node/day ≈ 28,800 schedule writes ≈ 2.3MB of audit/node/day, about 7% of measured ' +
 							'spare fleet render capacity (~792,700 renders/day spare against a 1,710,936/day ceiling and ' +

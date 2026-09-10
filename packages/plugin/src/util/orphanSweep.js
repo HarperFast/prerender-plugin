@@ -138,10 +138,14 @@ export const sweepOrphanedTargets = async ({
 		// target-guarded — the `PrerenderedPage.put`, which would otherwise leave a page record
 		// under a key whose target and schedule we just removed.
 		//
-		// Checked per DEVICE, and any one lease defers the whole target: the delete is per-url
-		// and takes every device key with it, so it is unsafe while ANY of them is out. A
-		// deferred target is simply swept on the next pass.
-		if (deviceTypes.some((deviceType) => isLeased(CacheKey.toCacheKey({ url: target.url, deviceType })))) {
+		// Checked under every schedule key the URL can have a lease under — the URL row, and any
+		// pre-0.66.0 device row that has not yet converted — and any one lease defers the whole
+		// target: the delete is per-url and takes every key with it, so it is unsafe while ANY of
+		// them is out. A deferred target is simply swept on the next pass.
+		if (
+			isLeased(target.url) ||
+			deviceTypes.some((deviceType) => isLeased(CacheKey.toCacheKey({ url: target.url, deviceType })))
+		) {
 			stats.leaseSkipped++;
 			continue;
 		}
@@ -187,8 +191,7 @@ export const sweepKeyRuleOrphans = async ({
 		deleteTarget: (url) => Target.delete(url),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
-		// Config at sweep time, matching Target.put's fan-out, so the lease check covers exactly
-		// the device keys that exist.
+		// The device rows a not-yet-converted URL may still be leased under, beside its URL row.
 		deviceTypes: config.deviceTypes.default,
 		maxDeletes,
 		dryRun,

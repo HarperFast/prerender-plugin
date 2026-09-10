@@ -134,20 +134,17 @@ test('every URL is filed at the minute IT was written, not at the minute the swe
 		PrerenderedPage.get = realGet;
 	}
 
-	const filed = urls.map((url) => Number(stores.renderSchedule.get(`${url}|desktop`).nextRenderTime));
+	// One row per URL, keyed by the URL: the revalidated render covers every device in one job.
+	const filed = urls.map((url) => Number(stores.renderSchedule.get(url).nextRenderTime));
 	assert.equal(filed.length, 4);
 	assert.ok(
 		filed[filed.length - 1] > filed[0],
 		`each URL is stamped with its own minute (got ${filed.join(', ')}) — one capture for the whole ` +
 			`sweep would file the last rows below the owning node's floor`
 	);
-	for (const [i, url] of urls.entries()) {
+	for (const url of urls) {
 		for (const device of DEVICES) {
-			assert.equal(
-				Number(stores.renderSchedule.get(`${url}|${device}`).nextRenderTime),
-				filed[i],
-				'a URL’s device variants still share one minute'
-			);
+			assert.equal(stores.renderSchedule.has(`${url}|${device}`), false, 'no per-device schedule rows');
 		}
 	}
 });
@@ -160,15 +157,13 @@ test('the sitemap flag survives the sweep — put REPLACES the schedule record',
 
 	await Target.revalidate({});
 
-	for (const device of DEVICES) {
-		assert.equal(
-			stores.renderSchedule.get(`${listed}|${device}`).fromSitemap,
-			true,
-			'a cleared flag makes claim report isFromSitemap:false, and the renderer then skips serializing a ' +
-				'non-indexable sitemap-listed page — i.e. a revalidate quietly stops those pages being cached'
-		);
-		assert.equal(stores.renderSchedule.get(`${unlisted}|${device}`).fromSitemap, false);
-	}
+	assert.equal(
+		stores.renderSchedule.get(listed).fromSitemap,
+		true,
+		'a cleared flag makes claim report isFromSitemap:false, and the renderer then skips serializing a ' +
+			'non-indexable sitemap-listed page — i.e. a revalidate quietly stops those pages being cached'
+	);
+	assert.equal(stores.renderSchedule.get(unlisted).fromSitemap, false);
 });
 
 test('a caller projection that cannot support the sweep is refused by name, not silently trusted', async () => {
@@ -192,10 +187,8 @@ test('a caller projection that cannot support the sweep is refused by name, not 
 	// so the flag survives a projected sweep. Under a fake that ignored `select` the row carried
 	// `sitemapUrl` whatever the caller asked for, and this assertion proved nothing about projections.
 	await Target.revalidate({ select: ['url', 'sitemapUrl'] });
-	assert.equal(stores.renderSchedule.size, DEVICES.length);
-	for (const device of DEVICES) {
-		assert.equal(stores.renderSchedule.get(`${url}|${device}`).fromSitemap, true, 'from the projected row');
-	}
+	assert.equal(stores.renderSchedule.size, 1, 'one row per URL');
+	assert.equal(stores.renderSchedule.get(url).fromSitemap, true, 'from the projected row');
 });
 
 test('a target row with no url is skipped instead of scheduling the string "undefined"', async () => {
@@ -209,7 +202,7 @@ test('a target row with no url is skipped instead of scheduling the string "unde
 	assert.equal(result.examined, 2, 'while still reporting everything the walk saw');
 	assert.deepEqual(
 		[...stores.renderSchedule.keys()].sort(),
-		['https://www.example.com/real|desktop', 'https://www.example.com/real|mobile'],
+		['https://www.example.com/real'],
 		'no schedule rows (and no floor lowering) for a URL that does not exist'
 	);
 });

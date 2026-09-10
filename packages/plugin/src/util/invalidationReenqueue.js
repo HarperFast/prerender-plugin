@@ -58,16 +58,18 @@
  *   error        the write threw. Logged, counted, swallowed — a failed acceleration must never
  *                turn into a 500 on a request that has already been answered.
  *
- * THE LAST TWO ARE TESTED PER ROW, NOT PER URL, because the WRITE is per row. A split pair is a
- * normal production state, not an edge case — `PrerenderAdmin.revalidateUrl` and `renderNow` each
- * write ONE device key on purpose, `util/reconcile.js` repairs a missing row with a fresh jitter, and
- * every per-device retry lane diverges the pair by its own delay. Taking either verdict from the
- * device the request happened to arrive on and applying it to the whole URL let the crawler's
- * User-Agent choose which invariant held: a mobile crawl would re-arm a desktop row that a desktop
- * crawl had just been refused (I11 lost), and one overdue sibling refused acceleration of the very key
- * whose page the invalidation had made unservable (I12's fan-out inverted into a whole-URL veto).
- * Skipping a row instead is safe in both directions: an unhealable key has no post-epoch content for
- * the pair to align with anyway, and an already-sooner key is already ahead in the claim order.
+ * THE LAST TWO ARE TESTED PER ROW, NOT PER URL, because the WRITE is per row. Since v0.66.0 a URL
+ * normally has exactly ONE schedule row (keyed by the URL; every device renders in one job), so the
+ * two tests simply decide the URL. The per-row form is kept for the rows that can still sit beside
+ * it: a pre-0.66.0 per-device row that has not yet converted, and a deliberate one-device row for a
+ * served device outside `deviceTypes.default`. When the table WAS per-device, a split pair was a
+ * normal production state, and taking either verdict from the device the request happened to arrive
+ * on and applying it to the whole URL let the crawler's User-Agent choose which invariant held: a
+ * mobile crawl would re-arm a desktop row that a desktop crawl had just been refused (I11 lost), and
+ * one overdue sibling refused acceleration of the very key whose page the invalidation had made
+ * unservable (I12's fan-out inverted into a whole-URL veto). Skipping a row instead is safe in both
+ * directions: an unhealable key has no post-epoch content to align with anyway, and an already-sooner
+ * key is already ahead in the claim order.
  *
  * I13 ("never creates a Target or a schedule row") is enforced by `no-schedule`/`no-target` against a
  * row that is ABSENT WHEN WE READ IT. It is not proof against a `Target.delete` landing between those
@@ -94,24 +96,25 @@
  *
  * Per NODE, shared across workers, in one minute-bucketed counter in a named shared buffer — the
  * same primitive the claim floor and the queue-status flag use (`util/coordination.js#getSab`).
- * It bounds requests, and one request writes at most one row per device row THE URL HAS —
- * `deviceTypes.default`, plus the served device when that one is merely `supported` — so the write
- * ceiling is `maxPerMinute ×` those rows (20/min/node at the two-device default, ≈2.3MB of
- * audit/node/day, ~7% of measured spare fleet capacity against ~1,000 owner-node candidate
- * requests/day cluster-wide).
+ * It bounds requests, and one request writes at most one row per schedule row THE URL HAS — its URL
+ * row, plus any not-yet-converted per-device row and a one-device row for a served device that is
+ * merely `supported` — so the write ceiling is `maxPerMinute ×` those rows (10/min/node once the
+ * corpus has converted, ≈1.2MB of audit/node/day, a few percent of measured spare fleet capacity
+ * against ~1,000 owner-node candidate requests/day cluster-wide).
  *
  * The slot is reserved LATE — after every refusal test, immediately before the write. Reserving
  * first would bound the reads too, but one repeatedly-crawled unhealable URL would then burn the
  * whole node's budget and starve every key that can actually heal. Reads stay bounded by bot
- * traffic instead: one Target read plus one schedule read per device key, on ≤2,900 cache-servable
- * requests/day cluster-wide, of which only the ~25% this node owns get past guard 1. An invalidated
+ * traffic instead: one Target read plus one schedule read per key the URL can have a row under, on
+ * ≤2,900 cache-servable requests/day cluster-wide, of which only the ~25% this node owns get past
+ * guard 1. An invalidated
  * request also pays `handlePageScheduling`'s own `Target.get` in the sibling `setImmediate` — the same
  * primary key, a different projection, deliberately NOT shared: that read is the rediscovery repair
  * for a page whose Target was deleted and it has to be fresh at the moment it runs.
  */
 
 import { config } from '../config.js';
-import { Target, cacheKeysOf, countedStrikes } from '../resources/Target.js';
+import { Target, scheduleKeysOf, countedStrikes } from '../resources/Target.js';
 import { QueueState } from '../resources/QueueState.js';
 import { getSab } from './coordination.js';
 import { getScheduleRow, leaseInfo, writeSchedules } from './renderSchedule.js';
@@ -278,10 +281,13 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy, forwarded =
 	// pulled-forward due times it is not draining — they would all come due at once on resume.
 	if (QueueState.status === 'paused') return refuse('paused');
 
-	// The device keys this URL implies, plus the key the request was actually served under: a device
-	// type may be `supported` (so it has pages and rows) without being in `deviceTypes.default`, and
-	// excluding it would leave the one key the request was about un-accelerated.
-	const keys = cacheKeysOf(url);
+	// Every schedule key this URL can have a row under: the URL row (the whole rotation, every device
+	// in one job), the URL's pre-0.66.0 per-device rows while they have not yet converted, and the key
+	// the request was actually served under — a device type may be `supported` (so it has a page, and
+	// can have a one-device row) without being in `deviceTypes.default`, and excluding it would leave
+	// the one key the request was about un-accelerated. The rows that do not exist cost one node-local
+	// point read each and are filtered out below.
+	const keys = scheduleKeysOf(url);
 	if (!keys.includes(cacheKey)) keys.push(cacheKey);
 
 	// Exact, and free: we own the key, so its lease is in THIS node's buffer.
@@ -314,14 +320,15 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy, forwarded =
 	// bounded either way: refusing wrongly leaves the key to heal on cadence, accelerating wrongly
 	// costs at most one render, and the rate limit caps both.
 	const interval = resolveRenderInterval(url, target.renderInterval);
-	// Seeded off the URL half, so every device key we write gets the SAME minute for free (I12) — a
-	// lowering that moved one device would de-align the pair permanently, cycle over cycle, because
-	// `processJobResult` reschedules from each render's own completion. No metric would show it:
-	// route_serve and page_age are per-device and nobody reads them as a pair.
-	const dueAt = getInitialRenderTime(cacheKey, spreadWindowMs());
+	// Seeded off the URL, so every row we write for it gets the SAME minute for free (I12): the URL
+	// row and any not-yet-converted device row come due together.
+	const dueAt = getInitialRenderTime(url, spreadWindowMs());
 
 	// PER ROW, BECAUSE THE WRITE IS PER ROW — see the module comment on why a whole-URL verdict here
-	// let the crawler's User-Agent decide which invariant held.
+	// let the crawler's User-Agent decide which invariant held. With the schedule keyed by URL there
+	// is normally exactly one row, so these two tests decide the URL; the per-row form is what keeps a
+	// half-converted URL (URL row beside a device row) and a one-device row correct through the same
+	// code.
 	//
 	//   completedAfterEpoch  the row's implied completion is after the epoch, so a render has already
 	//                        run and left this key pre-epoch: nothing can heal it (I11).
@@ -367,8 +374,8 @@ export const accelerateHeal = async ({ url, cacheKey, invalidatedBy, forwarded =
 		outcome: 'lowered',
 		dueAt,
 		written: eligible.map((row) => row.cacheKey),
-		// The device rows this write deliberately left where they were. There is no metric dimension for
-		// a partial fan-out — `lowered` is `lowered` — so a caller that wants to know whether the key the
+		// The rows this write deliberately left where they were. There is no metric dimension for a
+		// partial fan-out — `lowered` is `lowered` — so a caller that wants to know whether the key the
 		// request was about actually moved has to read this.
 		skipped: present.filter((row) => !eligible.includes(row)).map((row) => row.cacheKey),
 		// The floor obligation, discharged by the funnel as part of the write. True by construction

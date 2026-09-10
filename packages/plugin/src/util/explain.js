@@ -75,6 +75,9 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 			hostname: url.hostname,
 			canonicalUrl,
 			cacheKey,
+			// The RenderSchedule row's key: the URL itself (one row per URL, every device in one
+			// job). Named so a reader does not go looking for the row under `cacheKey`.
+			scheduleKey: canonicalUrl,
 		},
 		ingress: {
 			mode: config.ingress.mode,

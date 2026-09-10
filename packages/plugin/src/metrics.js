@@ -227,8 +227,9 @@ export const METRICS = Object.freeze({
 		kind: 'value',
 		emittedBy: 'resources/RenderQueue.js',
 		cadence:
-			'per render result posted back by a browser worker: one `outcome` row always, one `time_ms` sample ' +
-			'when the worker reported a duration',
+			'per render result posted back by a browser worker: one `outcome` row always (a result is one URL — ' +
+			'every device variant in it — since v0.66.0), and one `time_ms` sample per device variant the worker ' +
+			'timed',
 		summary: 'The render fleet, in one scan: how long each render took, and what became of it.',
 		usefulFor:
 			'`time_ms` is fleet capacity (renders/hour/pod = concurrency ÷ time_ms) and what a settle-tuning ' +
@@ -280,6 +281,7 @@ export const METRICS = Object.freeze({
 					'temporary',
 					'permanent',
 					'navigation',
+					'not-attempted',
 				],
 				description:
 					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
@@ -289,7 +291,9 @@ export const METRICS = Object.freeze({
 					'worker posted an indexable verdict with nothing to store); suppressed: the browser’s ' +
 					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
 					'transient: the status code; failed: the error phase (navigation = the document never arrived; ' +
-					'unknown = pre-v1.16.0 worker posted no detail); redirect: landed-auth/landed-transient ' +
+					'not-attempted = the worker was asked for this device and never started it — its lease ran short ' +
+					'or it began draining — so the URL retries; unknown = pre-v1.16.0 worker posted no detail); ' +
+					'redirect: landed-auth/landed-transient ' +
 					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
 					'it — a render is wasted every interval until fixed), non-indexable-destination (source ' +
 					'retired, destination suppressed), temporary (kept, strike counted), permanent (source retired ' +

@@ -187,6 +187,25 @@ const localClaimFloor = (now) => {
 };
 
 /**
+ * This node's schedule row for a URL — or for a cacheKey, which names its URL. The URL row first;
+ * failing that, the per-device row under the cacheKey (the requested one, or the first configured
+ * device's when only a URL was given), which exists for one cycle after the v0.66.0 upgrade and for a
+ * deliberate one-device render. Node-local (`replicateFrom: false` — this table is residency-pinned,
+ * and an unowned point read takes Harper's untimed replication fetch); the caller says whether the
+ * answer is authoritative.
+ */
+const readScheduleRowLocal = async (urlOrCacheKey) => {
+	const select = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'];
+	const url = CacheKey.urlOf(urlOrCacheKey);
+	const row = await RenderSchedule.get({ id: url, select }, { replicateFrom: false });
+	if (row) return row;
+	const deviceKey = CacheKey.isCacheKey(urlOrCacheKey)
+		? urlOrCacheKey
+		: CacheKey.toCacheKey({ url, deviceType: config.deviceTypes.default[0] });
+	return RenderSchedule.get({ id: deviceKey, select }, { replicateFrom: false });
+};
+
+/**
  * One schedule row as the console shows it, including the two node-local questions only the
  * owner can answer: is this key currently leased to a renderer, and is its due time BELOW the
  * claim floor (i.e. filed where no claim will ever look again).
@@ -202,6 +221,11 @@ const describeScheduleRow = (row, now) => {
 	const lease = leaseInfo(row.cacheKey);
 	return {
 		...row,
+		// The row's key is the URL (one row per URL, every device in one job). `perDevice` marks the
+		// exception: a pre-0.66.0 row that has not yet converted, or a deliberate one-device render —
+		// keyed by cacheKey and rendering only the device it names.
+		scheduleKey: row.cacheKey,
+		perDevice: CacheKey.isCacheKey(row.cacheKey),
 		nextRenderTime: due ? at : null,
 		dueInMs: due ? at - now : null,
 		// True for EVERY in-flight render now, since a leased row keeps its past due time until the
@@ -1042,7 +1066,9 @@ export class PrerenderAdmin extends Resource {
 	}
 
 	/**
-	 * Make ONE url due for render now (one device — this writes exactly one schedule row).
+	 * Make ONE url due for render now — its URL row, so every device renders together in one job.
+	 * (`deviceType` still shapes the reported cacheKey; it no longer selects a row, since v0.66.0
+	 * schedules a URL as a whole.)
 	 *
 	 * Deliberately not `Target.revalidate`, which takes a search target: pointed at the
 	 * whole collection that revalidates the entire registry, and at 1M+ targets an accidental
@@ -1083,7 +1109,7 @@ export class PrerenderAdmin extends Resource {
 		const nextRenderTime = currentMinuteMs();
 		// The write is residency-routed, so this reaches the owning node from any node — and it
 		// goes through the funnel, which lowers this node's claim floor to cover it.
-		await writeSchedule(cacheKey, {
+		await writeSchedule(canonicalUrl, {
 			nextRenderTime,
 			fromSitemap: !!target.sitemapUrl,
 			// The target's real cadence, off the point read above — an admin rejoin should not cost the
@@ -1103,6 +1129,7 @@ export class PrerenderAdmin extends Resource {
 		return json({
 			cacheKey,
 			canonicalUrl,
+			scheduleKey: canonicalUrl,
 			nextRenderTime,
 			scheduleOwnedBy: owner,
 			wokeLocalConsumers: owner === server.hostname,
@@ -1258,18 +1285,16 @@ export class PrerenderAdmin extends Resource {
 	 * proxying grants no authority the original caller lacked.
 	 */
 	static async scheduleRow(data) {
-		const cacheKey = data?.cacheKey;
-		if (typeof cacheKey !== 'string' || !cacheKey) {
-			return json({ error: 'cacheKey is required' }, 400);
+		// `url` or a `cacheKey` (the console and older callers send the latter): either names the URL
+		// whose row is wanted. The row is keyed by URL; a per-device row is read as the fallback, for the
+		// one cycle in which pre-0.66.0 rows still exist and for a deliberate one-device render.
+		const requested = typeof data?.url === 'string' && data.url ? data.url : data?.cacheKey;
+		if (typeof requested !== 'string' || !requested) {
+			return json({ error: 'url (or cacheKey) is required' }, 400);
 		}
 
 		const timedOutReads = [];
-		const row = await readWithTimeout('renderSchedule', timedOutReads, () =>
-			RenderSchedule.get(
-				{ id: cacheKey, select: ['cacheKey', 'nextRenderTime', 'fromSitemap'] },
-				{ replicateFrom: false }
-			)
-		);
+		const row = await readWithTimeout('renderSchedule', timedOutReads, () => readScheduleRowLocal(requested));
 
 		if (timedOutReads.length) return json({ error: 'local schedule read timed out' }, 504);
 
@@ -1463,12 +1488,7 @@ export class PrerenderAdmin extends Resource {
 					],
 				})
 			),
-			readWithTimeout('renderSchedule', timedOutReads, () =>
-				RenderSchedule.get(
-					{ id: cacheKey, select: ['cacheKey', 'nextRenderTime', 'fromSitemap'] },
-					{ replicateFrom: false }
-				)
-			),
+			readWithTimeout('renderSchedule', timedOutReads, () => readScheduleRowLocal(cacheKey)),
 			readWithTimeout('prerenderedPage', timedOutReads, () =>
 				PrerenderedPage.get({
 					id: cacheKey,

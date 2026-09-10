@@ -34,7 +34,7 @@
  */
 
 import { setImmediate as yieldNow, setTimeout as sleep } from 'node:timers/promises';
-import { Target, cacheKeysOf } from '../resources/Target.js';
+import { Target, scheduleKeysOf } from '../resources/Target.js';
 import { classifyUrl, PRERENDER } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
@@ -301,7 +301,7 @@ export const startDiscoveredPurge = ({
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
 		// Any leased device key defers the whole target — the delete takes every device with it.
-		isLeased: (url) => cacheKeysOf(url).some((cacheKey) => Boolean(leaseInfo(cacheKey))),
+		isLeased: (url) => scheduleKeysOf(url).some((key) => Boolean(leaseInfo(key))),
 		// The RESOURCE class delete, never the raw table's: only it cascades to the schedule
 		// rows, the cached pages and the probe baseline. A raw delete leaves schedule rows that
 		// re-render once each and page blobs that nothing ever reclaims.
