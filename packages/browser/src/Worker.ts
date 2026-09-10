@@ -492,16 +492,19 @@ export default class RenderWorker {
 
 		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure
 		// (e.g. encode() throwing before the retry loop). Catch it so it's counted as a post
-		// failure rather than rejecting the whole render() through run()'s generic catch.
+		// failure rather than rejecting the whole render() through run()'s generic catch. Started
+		// inside the chain so a synchronous throw lands in the same catch rather than escaping it.
+		// (`attempted` is never empty: the skip check above only runs once one variant is done, and
+		// `variants()` always yields at least one.)
 		//
 		// The legacy shape for a legacy job, always: an older plugin reads `id` as a cache key and has
 		// no notion of `variants`, so it must get exactly what it always got.
-		const posted = await (
-			job.deviceTypes ? RenderJob.sendVariantsResult(job, attempted) : attempted[0].sendResult()
-		).catch((err) => {
-			logger.error({ id: job.id, err }, 'failed to send job result');
-			return false;
-		});
+		const posted = await Promise.resolve()
+			.then(() => (job.deviceTypes ? RenderJob.sendVariantsResult(job, attempted) : attempted[0].sendResult()))
+			.catch((err) => {
+				logger.error({ id: job.id, err }, 'failed to send job result');
+				return false;
+			});
 		this.stats.jobs++;
 		if (!posted) this.stats.resultPostFailures++;
 	}
