@@ -29,3 +29,35 @@ test('honors a configured delimiter and attribute list', () => {
 	assert.deepEqual(CacheKey.parse(key), { url: 'https://x.com/', deviceType: 'mobile', region: 'west' });
 	assert.equal(CacheKey.extractUrl(key), 'https://x.com/');
 });
+
+// ---- schedule keys: a URL, or a pre-0.66.0 / one-device `<url>|<device>` row ----
+
+test('isCacheKey / urlOf / deviceOf tell a URL-keyed schedule row from a per-device one', () => {
+	const url = 'https://x.com/p?page=2';
+	assert.equal(CacheKey.isCacheKey(url), false);
+	assert.equal(CacheKey.urlOf(url), url, 'a URL is its own schedule key');
+	assert.equal(CacheKey.deviceOf(url), null);
+
+	assert.equal(CacheKey.isCacheKey(`${url}|mobile`), true);
+	assert.equal(CacheKey.urlOf(`${url}|mobile`), url);
+	assert.equal(CacheKey.deviceOf(`${url}|mobile`), 'mobile');
+});
+
+test('the shape test keys on a SUPPORTED device tail, so a delimiter inside the URL cannot misfire', () => {
+	// `cacheKey.delimiter` is configurable; with one that can legitimately occur inside a URL, "contains
+	// the delimiter" would read a plain URL as a per-device row and strip its tail.
+	applyOptions({ cacheKey: { delimiter: '/' } });
+	const url = 'https://x.com/catalog/shoes';
+	assert.equal(CacheKey.isCacheKey(url), false, 'ends in "shoes", not a device');
+	assert.equal(CacheKey.urlOf(url), url);
+	assert.equal(CacheKey.deviceOf(url), null);
+	assert.equal(CacheKey.isCacheKey(`${url}/mobile`), true);
+	assert.equal(CacheKey.urlOf(`${url}/mobile`), url);
+	assert.equal(CacheKey.deviceOf(`${url}/mobile`), 'mobile');
+	applyOptions({});
+});
+
+test('an unsupported device tail is not a per-device key', () => {
+	assert.equal(CacheKey.isCacheKey('https://x.com/p|watch'), false);
+	assert.equal(CacheKey.urlOf('https://x.com/p|watch'), 'https://x.com/p|watch');
+});

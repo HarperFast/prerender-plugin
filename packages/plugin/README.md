@@ -1289,11 +1289,17 @@ the URL in the retry lanes — is spelled out on `processDecodedJobResult` in
 are **not migrated by a sweep**: each converts the first time it renders — its job renders exactly the
 device its key names, its result writes the URL row and deletes the device row — so two siblings fold
 into one URL row within a render cycle at no extra renders, and the table holds both shapes meanwhile
-(every reader tolerates both). The `cacheKey` column name stays: Harper refuses to rename the primary
+(every reader tolerates both). The one carve-out: a writer that files the URL row **before** a URL's
+device rows have converted — a registry-wide `revalidate`, a sitemap ingest with `revalidate: true`,
+`POST /prerender_admin/revalidate`, or a render-now — renders that URL once more per leftover device
+row (each row still renders its device and rewrites the URL row), so a bulk revalidate in the first
+cycle after the upgrade costs up to one extra render per URL. Wait a cycle, or accept it. The `cacheKey` column name stays: Harper refuses to rename the primary
 key of a populated table, so read it as "the schedule key". **Deploy the render fleet (browser >=
 1.23.0) before this plugin version**: an older renderer handed a URL job renders only its first device.
 `renderNow` for a device outside `deviceTypes.default` still writes a per-device row — a one-off
-render of that device beside the rotation, stored and retired without touching the URL row.
+render of that device beside the rotation, stored and retired without touching the URL row. For a
+default device it pulls the URL row forward, so the render it waits on renders **every** default
+device before the result posts: size `renderNow.timeoutMs` for that, not for one render.
 
 ## Development
 

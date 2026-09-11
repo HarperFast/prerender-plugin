@@ -67,11 +67,12 @@ const transientShaped = (statusCode) => statusCode === 408 || statusCode === 429
 const hasContent = (variant) => variant.statusCode === 200 && !!variant.content;
 
 /**
- * The devices a URL job renders: `config.deviceTypes.default`, floored at one device so an
- * operator who empties the list still gets a render rather than a job the browser cannot act on.
+ * The devices a URL job renders. A copy, so a job never aliases live config. Never empty: the
+ * schema marks `deviceTypes.default` `nonEmpty`, so an emptied list is refused at apply time and
+ * the default kept — validated where config is applied, not guessed at here, which is also what
+ * keeps this and `describeJob`'s fold rule reading the same list.
  */
-const defaultDeviceTypes = () =>
-	config.deviceTypes.default.length ? [...config.deviceTypes.default] : [config.deviceTypes.supported[0]];
+const defaultDeviceTypes = () => [...config.deviceTypes.default];
 
 /**
  * One posted result, whatever shape the browser used, as `{ rowKey, url, asked, variants }`.
@@ -129,14 +130,26 @@ const describeJob = (rowKey, url) => {
 };
 
 /**
- * A per-device row that has been folded into the URL row is deleted once its result is processed —
- * unless the lease is being HELD (fast retry lane): the row is what the lease expiry re-grants, so it
- * must stay for the retry, and converts on the result that finally reschedules it.
+ * A per-device row is deleted once its result is processed — folded into the URL row, or spent as a
+ * one-off — unless the lease is being HELD (fast retry lane): the row is what the lease expiry
+ * re-grants, so it must stay for the retry, and goes on the result that finally settles it.
  */
 const retireRowIfConverted = async (job, held) => {
 	if (held || job.rowGone || !job.perDevice) return;
 	await deleteSchedule(job.rowKey);
 	job.rowGone = true;
+};
+
+/**
+ * Retire the job's URL: `Target.delete` drops the target, its pages, its URL row and its DEFAULT
+ * device rows (`scheduleKeysOf`) — which is every row a folding job can have come from, but NOT a
+ * one-device row for a non-default device. So the row is only known gone when the job folds; a
+ * `|tablet` one-off whose URL turned out to redirect is left to `retireRowIfConverted`, and would
+ * otherwise sit at its current-minute due time and be re-granted on every claim pass, forever.
+ */
+const retireSource = async (job) => {
+	await Target.delete(job.url);
+	job.rowGone = job.fold;
 };
 
 /** The variant a device the browser was asked for and never posted back reduces to. */
@@ -334,6 +347,12 @@ export class RenderQueue extends Resource {
 					`variants account for ${offset - metadataSize} of the ${buffer.byteLength - metadataSize} body byte(s)`
 				);
 			}
+			// Nothing attempted and nothing asked: there is no device to attribute anything to, and
+			// letting it through would reach the all-rendered branch with an empty list and reschedule
+			// the URL as a success that stored nothing.
+			if (result.variants.length === 0 && !(Array.isArray(result.deviceTypes) && result.deviceTypes.length)) {
+				throw new Error('a variants result must name at least one device (variants or deviceTypes)');
+			}
 		} else if (metadataBuffer.byteLength < buffer.byteLength) {
 			result.content = buffer.subarray(metadataSize);
 		}
@@ -511,8 +530,7 @@ export class RenderQueue extends Resource {
 			if (variant.redirect.landedOn === PRERENDER) {
 				if (!refiledTo) {
 					logger.info(`Skipped prerendered url due to redirect: ${rowKey} redirected to ${variant.redirectedTo}`);
-					await Target.delete(url);
-					job.rowGone = true;
+					await retireSource(job);
 					refiledTo = variant.redirect.destinationUrl;
 				}
 				variant.storeKey = variant.redirect.redirectKey;
@@ -564,7 +582,11 @@ export class RenderQueue extends Resource {
 			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
 			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
 			// http-error verdicts by status (404/410 recheck less, die sooner).
-			await Target.suppress(url, { reason: verdict.reason, statusCode: verdict.statusCode });
+			const { deleted } = await Target.suppress(url, { reason: verdict.reason, statusCode: verdict.statusCode });
+			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
+			// device rows with it — so a folding row is already gone (a second delete would only write a
+			// tombstone), while a non-default one-device row still needs retiring below.
+			if (deleted) job.rowGone = job.fold;
 			await retireRowIfConverted(job, held);
 			return;
 		}
@@ -633,12 +655,34 @@ export class RenderQueue extends Resource {
 		// servable meanwhile. One outcome emit per result, for the class the worst variant fell in —
 		// auth-shaped first (it is the one that signals a broken credential), then transient, then a
 		// plain failure — and one log line per failed variant, at the level that class warrants.
+		//
+		// "Failed" is THE COMPLEMENT of rendered, not a list of failure shapes: an `outcome` this code
+		// does not know, or a `redirected` whose destination re-keyed to the SAME cache key (the browser's
+		// own redirect check uses a default allowlist, the plugin's is per route, so they can disagree —
+		// step 1 deliberately did not claim it), must land here and retry, exactly where the per-key
+		// code's final `else` sent them. Listing failure shapes instead let anything unlisted fall
+		// through to step 5 and reschedule a URL as a success that stored nothing.
 		const failed = variants.filter(
 			(variant) =>
-				variant.outcome === 'error' ||
-				(variant.outcome === 'non-indexable' && (authShaped(variant.statusCode) || transientShaped(variant.statusCode)))
+				variant.outcome !== 'rendered' &&
+				!(
+					variant.outcome === 'non-indexable' &&
+					!authShaped(variant.statusCode) &&
+					!transientShaped(variant.statusCode)
+				)
 		);
-		if (failed.length) {
+		if (failed.length && refiledTo) {
+			// The source was just retired by the refile above: there is no row of its own to retry under,
+			// and holding ITS lease would pin the claim floor at a row that no longer exists. The
+			// destination renders on its own row and cadence, so a failed sibling here is logged and let
+			// go — its device simply has no page until the destination renders.
+			for (const variant of failed) {
+				logger.warn(
+					`Prerender ${url} (${variant.deviceType}) did not render (${variant.reason || variant.outcome}) — not ` +
+						`retried: the URL was retired in favour of ${refiledTo} by a sibling's client-side redirect`
+				);
+			}
+		} else if (failed.length) {
 			const auth = failed.find((variant) => authShaped(variant.statusCode));
 			const transient = failed.find((variant) => transientShaped(variant.statusCode));
 			if (auth) metrics.renderOutcome('auth-failure', auth.statusCode);
@@ -824,8 +868,7 @@ export class RenderQueue extends Resource {
 				`Prerendered url ${rowKey} redirected to non-indexable ${variant.redirectedTo}` +
 					`${variant.reason ? ` (${variant.reason})` : ''} — retiring the target`
 			);
-			await Target.delete(sourceUrl);
-			job.rowGone = true;
+			await retireSource(job);
 			const domain = URL.parse(destinationUrl)?.hostname;
 			// Auth-shaped and transient statuses never reach here (guarded above), so this
 			// suppression is a genuine content/gone verdict about the destination.
@@ -862,8 +905,7 @@ export class RenderQueue extends Resource {
 				`retiring the target in favor of ${redirectKey}`
 		);
 		const source = await Target.get({ id: sourceUrl, select: ['renderInterval'] });
-		await Target.delete(sourceUrl);
-		job.rowGone = true;
+		await retireSource(job);
 
 		// An existing destination row — active OR suppressed — wins: active means it's already
 		// in rotation under its own cadence; suppressed means a render already proved it
@@ -916,8 +958,7 @@ export class RenderQueue extends Resource {
 				`Prerendered url ${sourceUrl} kept redirecting ${strikes} consecutive times (${why}) — retiring it; ` +
 					`bots get the origin's own redirect and discovery re-creates what it actually serves`
 			);
-			await Target.delete(sourceUrl); // drops schedule rows + pages too
-			job.rowGone = true;
+			await retireSource(job); // drops the target, its pages, and every folding row
 			return;
 		}
 		await Target.patch(sourceUrl, { strikes });

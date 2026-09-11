@@ -210,11 +210,17 @@ test('a pre-0.66.0 per-device row claims as a job for exactly the device its key
 	assert.equal(job.isFromSitemap, true);
 });
 
-test('an emptied deviceTypes.default still claims one device rather than a job the browser cannot act on', async () => {
-	config.deviceTypes.default = [];
+test('an emptied deviceTypes.default is refused where config is applied — the job list is never empty', async () => {
+	// Validated at the entry point (the schema marks the option `nonEmpty`), not guarded here: `claim`
+	// and the fold rule in `describeJob` both read the same list, and a downstream fallback in one of
+	// them would let the two disagree.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ deviceTypes: { default: [] } });
+	assert.deepEqual(config.deviceTypes.default, ['desktop', 'mobile'], 'the default is kept');
 	seedUrlRow();
 	const [job] = await claim();
-	assert.deepEqual(job.deviceTypes, ['desktop'], 'the first supported device');
+	assert.deepEqual(job.deviceTypes, ['desktop', 'mobile']);
+	applyOptions({});
 });
 
 // ───────────────────────────── framing ─────────────────────────────
@@ -413,6 +419,104 @@ test('a rendered client-side redirect refiles under the destination keys and ret
 	assert.equal(stores.prerenderedPage.get(key(B, 'mobile')).content.toString(), '<html>landed m</html>');
 	assert.deepEqual(outcomes(), [['rendered', 'refiled']]);
 	assert.equal(leased(A), false, 'the SOURCE lease — the one that was granted — is released');
+});
+
+test('a redirected variant whose destination re-keys to the SAME key is a failure, not a success', async () => {
+	// The browser's own redirect check uses a default allowlist; the plugin's is per route, so a
+	// query-only hop the route folds away arrives as `redirected` with no key change. Nothing was
+	// rendered and nothing decided, so it must take the retry lane — never step 5's reschedule.
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>fresh</html>'),
+		{ deviceType: 'mobile', outcome: 'redirected', statusCode: 200, redirectedTo: `${A}?utm=x` },
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>fresh</html>');
+	assert.equal(stores.target.get(A).strikes, 1, 'counted as a failure');
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, 1, 'NOT rescheduled as a success');
+	assert.equal(leased(A), true, 'the fast lane holds the lease');
+	assert.deepEqual(outcomes(), [['failed', 'unknown']]);
+});
+
+test('an outcome this plugin does not know is a failure, not a success', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [{ deviceType: 'desktop', outcome: 'teleported' }, rendered('mobile')]);
+	assert.equal(stores.target.get(A).strikes, 1);
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, 1);
+	assert.equal(leased(A), true);
+});
+
+test('a result that names no device at all is refused with a 400, and the lease simply expires', async () => {
+	seedUrlRow();
+	await claim();
+	const response = await post({ id: A, url: A, variants: [] }, []);
+	assert.equal(response?.status, 400);
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, 1, 'nothing was rescheduled');
+	assert.deepEqual(outcomes(), [], 'and nothing was counted');
+});
+
+test('a one-device row for a NON-default device whose URL turns out to 301 is retired too — no re-grant loop', async () => {
+	seedUrlRow({ nextRenderTime: 9_999_999_999_999 });
+	stores.renderSchedule.set(key(A, 'tablet'), { nextRenderTime: 1, fromSitemap: false });
+	await claim();
+	await postVariants(A, [{ deviceType: 'tablet', outcome: 'redirected', statusCode: 301, redirectedTo: B }], {
+		id: key(A, 'tablet'),
+		deviceTypes: ['tablet'],
+	});
+	assert.equal(stores.target.has(A), false, 'the URL is retired — a page does not redirect for one device only');
+	assert.equal(stores.renderSchedule.has(A), false);
+	assert.equal(stores.renderSchedule.has(key(A, 'tablet')), false, 'the tablet row goes too — it is not a default key');
+	assert.equal(leased(key(A, 'tablet')), false);
+	assert.deepEqual(await claim(), [], 'nothing left to re-grant');
+	assert.ok(stores.target.get(B), 'destination adopted');
+});
+
+test('a refiled result with a failed sibling releases the SOURCE lease and touches no other target', async () => {
+	seedUrlRow();
+	stores.target.set(B, { url: B, renderInterval: 3_600_000, strikes: 0 });
+	stores.renderSchedule.set(B, { nextRenderTime: 5_555_555_555_555, fromSitemap: false });
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>landed</html>', { redirectedTo: B }),
+		{
+			deviceType: 'mobile',
+			outcome: 'error',
+			reason: 'error',
+			error: { name: 'Error', message: 'x', phase: 'settle' },
+		},
+	]);
+	assert.equal(stores.target.has(A), false, 'source retired by the refile');
+	assert.equal(stores.prerenderedPage.get(key(B, 'desktop')).content.toString(), '<html>landed</html>');
+	assert.equal(leased(A), false, 'no lease is held for a row that no longer exists');
+	assert.equal(stores.target.get(B).strikes, 0, "the sibling's failure is not charged to the destination");
+	assert.ok(warns.some((w) => w.includes('(mobile)') && w.includes('not retried')));
+	assert.deepEqual(outcomes(), [['rendered', 'refiled']]);
+});
+
+test('a suppression that deletes at maxStrikes does not delete the folding device row twice', async () => {
+	const max = config.render.suppression.maxStrikes;
+	stores.target.set(A, { url: A, renderInterval: 3_600_000, state: 'suppressed', strikes: max - 1 });
+	stores.renderSchedule.set(key(A, 'desktop'), { nextRenderTime: 1, fromSitemap: false });
+	const RenderSchedule = globalThis.databases.render_schedule.RenderSchedule;
+	const deletes = [];
+	const realDelete = RenderSchedule.delete;
+	RenderSchedule.delete = async (id) => {
+		deletes.push(id);
+		return realDelete.call(RenderSchedule, id);
+	};
+	try {
+		await claim();
+		await postVariants(
+			A,
+			[{ deviceType: 'desktop', outcome: 'non-indexable', isIndexable: false, statusCode: 200, reason: 'noindex' }],
+			{ id: key(A, 'desktop'), deviceTypes: ['desktop'] }
+		);
+	} finally {
+		RenderSchedule.delete = realDelete;
+	}
+	assert.equal(stores.target.has(A), false, 'deleted at maxStrikes');
+	assert.equal(deletes.filter((id) => id === key(A, 'desktop')).length, 1, 'the device row is deleted exactly once');
 });
 
 // ───────────────────────────── partial results ─────────────────────────────
