@@ -55,7 +55,8 @@ afterEach(() => {
 
 /**
  * A fake registry. `owners` maps a URL to its owning node so a test can place rows on either
- * side of the residency boundary; `schedules` is the set of cacheKeys that HAVE a row.
+ * side of the residency boundary; `schedules` is the set of schedule keys that HAVE a row — a URL
+ * (the row every target should have) or a pre-0.66.0 `url|device` cacheKey.
  */
 const harness = ({
 	targets,
@@ -117,38 +118,52 @@ test('a target missing its schedule row gets one restored', async () => {
 
 	assert.equal(stats.restored, 1);
 	assert.equal(h.puts.length, 1);
-	assert.equal(h.puts[0].cacheKey, 'https://x/a|desktop');
+	assert.equal(h.puts[0].cacheKey, 'https://x/a', 'the row is keyed by the URL — one row, every device');
 });
 
 test('a target that already has a schedule row is left alone', async () => {
 	const h = harness({
 		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
-		schedules: ['https://x/a|desktop'],
+		schedules: ['https://x/a'],
 	});
 
 	const stats = await h.run();
 
 	assert.equal(stats.restored, 0);
 	assert.equal(h.puts.length, 0);
+	assert.deepEqual(h.scheduleReads, ['https://x/a'], 'a present URL row settles it in one read');
 });
 
-test('every configured device is checked, and only the missing one is restored', async () => {
-	// One URL row implies one schedule row PER device. A half-scheduled URL — desktop present,
-	// mobile missing — is exactly as silent as a fully missing one and must be repaired
-	// without disturbing the sibling that is fine.
+test('a URL still scheduled under a pre-0.66.0 device row is NOT restored beside it', async () => {
+	// A per-device row converts into the URL row the first time it renders. Until then the URL IS
+	// scheduled, and restoring a URL row next to it would render the URL twice for a cycle. The
+	// device reads run only when the URL row is missing, so a converged corpus never pays them.
 	const h = harness({
 		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
 		deviceTypes: ['desktop', 'mobile'],
-		schedules: ['https://x/a|desktop'],
+		schedules: ['https://x/a|mobile'],
 	});
 
 	const stats = await h.run();
 
-	assert.deepEqual(h.scheduleReads.sort(), ['https://x/a|desktop', 'https://x/a|mobile']);
+	assert.deepEqual(h.scheduleReads, ['https://x/a', 'https://x/a|desktop', 'https://x/a|mobile']);
+	assert.equal(stats.missing, 0);
+	assert.deepEqual(h.puts, []);
+});
+
+test('a URL with neither a URL row nor any device row is restored under the URL', async () => {
+	const h = harness({
+		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
+		deviceTypes: ['desktop', 'mobile'],
+	});
+
+	const stats = await h.run();
+
+	assert.deepEqual(h.scheduleReads, ['https://x/a', 'https://x/a|desktop', 'https://x/a|mobile']);
 	assert.equal(stats.missing, 1);
 	assert.deepEqual(
 		h.puts.map((p) => p.cacheKey),
-		['https://x/a|mobile']
+		['https://x/a']
 	);
 });
 
@@ -168,16 +183,17 @@ test('keys owned by another node are never even asked about', async () => {
 
 	assert.equal(stats.examined, 2);
 	assert.equal(stats.owned, 1);
-	assert.deepEqual(h.scheduleReads, ['https://x/mine|desktop']);
+	assert.deepEqual(h.scheduleReads, ['https://x/mine', 'https://x/mine|desktop']);
 	assert.deepEqual(
 		h.puts.map((p) => p.cacheKey),
-		['https://x/mine|desktop']
+		['https://x/mine']
 	);
 });
 
-test('residency is asked once per URL, and both device rows live with that owner', async () => {
-	// RenderSchedule.setResidencyById hashes the URL half of the cacheKey, so the same URL on
-	// two device types lands on the SAME node — one ownership answer covers the whole fan-out.
+test('residency is asked once per URL, and every row of the URL lives with that owner', async () => {
+	// RenderSchedule.setResidencyById hashes the URL (the URL half, for a pre-0.66.0 cacheKey), so
+	// the URL row and any leftover device row land on the SAME node — one ownership answer covers
+	// every key that is checked.
 	const seen = [];
 	const h = harness({
 		targets: [{ url: 'https://x/a', renderInterval: 60000 }],
@@ -192,7 +208,7 @@ test('residency is asked once per URL, and both device rows live with that owner
 	});
 
 	assert.deepEqual(seen, ['https://x/a']);
-	assert.deepEqual(h.scheduleReads.sort(), ['https://x/a|desktop', 'https://x/a|mobile']);
+	assert.deepEqual(h.scheduleReads.sort(), ['https://x/a', 'https://x/a|desktop', 'https://x/a|mobile']);
 });
 
 test('restores at the jittered initial time, not now', async () => {
@@ -244,8 +260,8 @@ test('fromSitemap is carried over from the target', async () => {
 
 	await h.run();
 
-	assert.equal(h.puts.find((p) => p.cacheKey === 'https://x/a|desktop').fromSitemap, true);
-	assert.equal(h.puts.find((p) => p.cacheKey === 'https://x/b|desktop').fromSitemap, false);
+	assert.equal(h.puts.find((p) => p.cacheKey === 'https://x/a').fromSitemap, true);
+	assert.equal(h.puts.find((p) => p.cacheKey === 'https://x/b').fromSitemap, false);
 });
 
 test('the walk pages through every target rather than stopping at the first batch', async () => {
@@ -370,8 +386,8 @@ test('the live query asks for no sort — Harper rejects sorting by the primary 
 	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
 
 	assert.equal(stats.examined, 2);
-	// config.deviceTypes.default is ['desktop', 'mobile'], so two URLs fan out to four rows.
-	assert.equal(stats.restored, 4);
+	// One row per URL, whatever `config.deviceTypes.default` says: two URLs, two rows.
+	assert.equal(stats.restored, 2);
 
 	// Exactly one scan: no paging, so no cursor and no resumption.
 	assert.equal(searches.length, 1);

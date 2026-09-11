@@ -442,17 +442,25 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// `false` is the true answer.
 	const renderTarget = await Target.get({ id: cacheUrl, select: ['sitemapUrl', 'renderInterval', 'demandInterval'] });
 
-	// Force an immediately-claimable, one-off schedule. No Target is created, so
-	// processJobResult won't reschedule it — and drops the schedule row once the result
-	// lands — keeping this a single render rather than a recurring target. Concurrent
-	// render-now requests for the same URL collapse onto this one row; the feature is
-	// authenticated, so we accept the small window where a spammed key can re-render.
+	// Force an immediately-claimable schedule row. No Target is created, so processJobResult
+	// won't reschedule it — and drops the schedule row once the result lands — keeping this a
+	// single render rather than a recurring target. Concurrent render-now requests for the same
+	// URL collapse onto this one row; the feature is authenticated, so we accept the small window
+	// where a spammed key can re-render.
+	//
+	// WHICH ROW. For a device in `deviceTypes.default` it is the URL row — the one the recurring
+	// rotation uses — so a render-now on a target-backed URL PULLS ITS NEXT RENDER FORWARD (every
+	// device, together, exactly as the rotation would have rendered it) rather than adding a
+	// one-device render beside it and de-aligning the pair. For a device that is merely
+	// `supported`, the URL row cannot carry it (a URL job renders the default set), so it is a
+	// per-device row: one render of that one device, stored and retired, the URL row untouched.
 	//
 	// Through the funnel, because "due at the current minute" is exactly the write a claim floor
 	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
 	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
 	// keeps the row above the owner's floor and therefore claimable.
-	await writeSchedule(cacheKey, {
+	const scheduleKey = config.deviceTypes.default.includes(deviceType) ? cacheUrl : cacheKey;
+	await writeSchedule(scheduleKey, {
 		nextRenderTime: currentMinuteMs(),
 		fromSitemap: !!renderTarget?.sitemapUrl,
 		// PRESERVED WHEN THERE IS A TARGET, `null` WHEN THERE IS NOT — and the difference matters because

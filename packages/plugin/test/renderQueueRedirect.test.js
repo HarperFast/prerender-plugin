@@ -5,8 +5,12 @@ import assert from 'node:assert/strict';
  * processJobResult over the url-keyed Target registry.
  *
  * The properties pinned here:
- *   - Targets are ONE row per URL; put/delete/suppress fan out over the configured devices'
- *     RenderSchedule and PrerenderedPage rows.
+ *   - Targets are ONE row per URL, and so is the RenderSchedule row (keyed by the URL — one job
+ *     renders every device); only PrerenderedPage fans out per device. `seedSource` seeds the
+ *     PRE-0.66.0 shape — one schedule row per device — and posts legacy per-device results, so
+ *     these tests also pin the conversion: a per-device row's result writes the URL row and
+ *     retires the device row. The multi-device result shape is pinned in
+ *     test/renderQueueVariants.test.js.
  *   - A non-indexable verdict SUPPRESSES the target (state + strikes + recheck schedule,
  *     cached pages dropped) instead of deleting it — and `maxStrikes` consecutive verdicts
  *     delete it outright. A later indexable render lifts the suppression.
@@ -190,6 +194,7 @@ test('301 onto a served route retires the source URL — all devices — and ado
 	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: B, renderTime: 42 });
 
 	assert.equal(stores.target.has(A), false, 'source target must be retired');
+	assert.equal(stores.renderSchedule.has(A), false, 'the URL row must not be created for a retired source');
 	for (const device of DEVICES) {
 		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule must be dropped`);
 		assert.equal(stores.prerenderedPage.has(key(A, device)), false, `${device} cached page must be dropped`);
@@ -200,10 +205,11 @@ test('301 onto a served route retires the source URL — all devices — and ado
 	assert.equal(adopted.renderInterval, 1234567, 'cadence is inherited — the page moved, its schedule did not');
 	assert.notEqual(adopted.state, 'suppressed');
 
+	const schedule = stores.renderSchedule.get(B);
+	assert.ok(schedule, 'destination must be scheduled — ONE row, keyed by the URL, every device in one job');
+	assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
 	for (const device of DEVICES) {
-		const schedule = stores.renderSchedule.get(key(B, device));
-		assert.ok(schedule, `destination must be scheduled for ${device}`);
-		assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
+		assert.equal(stores.renderSchedule.has(key(B, device)), false, 'no per-device rows are created any more');
 	}
 
 	// One time_ms sample plus exactly one outcome — the emit-once-per-result contract, both
@@ -234,14 +240,14 @@ test('a rendered verdict with nothing to store is counted as no-content, not sto
 test('301 onto an already-targeted destination adopts nothing and leaves its schedule alone', async () => {
 	seedSource();
 	stores.target.set(B, { url: B, renderInterval: 999 });
-	stores.renderSchedule.set(key(B), { nextRenderTime: 8_888_888_888_888 });
+	stores.renderSchedule.set(B, { nextRenderTime: 8_888_888_888_888 });
 
 	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: B });
 
 	assert.equal(stores.target.has(A), false, 'source is still retired');
 	assert.equal(stores.target.get(B).renderInterval, 999, 'existing destination target untouched');
 	assert.equal(
-		stores.renderSchedule.get(key(B)).nextRenderTime,
+		stores.renderSchedule.get(B).nextRenderTime,
 		8_888_888_888_888,
 		'existing destination cadence must not be perturbed'
 	);
@@ -267,7 +273,9 @@ test('temporary redirect (302) keeps the source — target, cached pages — and
 	assert.ok(stores.prerenderedPage.has(key(A)), 'the cached page keeps serving while the redirect heals');
 	assert.equal(stores.target.has(B), false, 'a temporary destination is not adopted');
 
-	const schedule = stores.renderSchedule.get(key(A));
+	// The reschedule lands on the URL row — the per-device row this result came from has converted.
+	const schedule = stores.renderSchedule.get(A);
+	assert.equal(stores.renderSchedule.has(key(A)), false, 'the pre-0.66.0 device row is retired on conversion');
 	// nextRenderTime is minute-floored "now" + interval.
 	const flooredBefore = Math.floor(before / 60_000) * 60_000;
 	assert.ok(
@@ -300,7 +308,7 @@ test('redirect onto an unrouted path keeps the source and adopts nothing', async
 	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: off });
 
 	assert.ok(stores.target.has(A), 'incomplete route list must not end this URL for good');
-	assert.ok(stores.renderSchedule.has(key(A)), 'source stays in rotation');
+	assert.ok(stores.renderSchedule.has(A), 'source stays in rotation (on its URL row)');
 	assert.equal(stores.target.has(off), false);
 });
 
@@ -339,7 +347,7 @@ test('outcome=redirected without permanence (client-side, 200) keeps the source'
 	await postResult({ id: key(A), url: A, statusCode: 200, outcome: 'redirected', redirectedTo: B });
 
 	assert.ok(stores.target.has(A), 'no proof of permanence — the source stays');
-	assert.ok(stores.renderSchedule.has(key(A)), 'and stays scheduled');
+	assert.ok(stores.renderSchedule.has(A), 'and stays scheduled');
 	assert.equal(stores.target.has(B), false);
 });
 
@@ -355,7 +363,9 @@ test('outcome=rendered stores the page and reschedules', async () => {
 	const page = stores.prerenderedPage.get(key(A));
 	assert.ok(page, 'content must be stored');
 	assert.equal(page.isIndexable, true);
-	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'rescheduled one interval out');
+	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'rescheduled one interval out');
+	assert.equal(stores.renderSchedule.has(key(A)), false, 'the device row folded into the URL row');
+	assert.ok(stores.renderSchedule.has(key(A, 'mobile')), 'the sibling converts on its own render');
 });
 
 // ---- route-typed render cadence ----
@@ -371,7 +381,7 @@ test('outcome=rendered reschedules at the matched route renderInterval, beating 
 		'<html>fresh</html>'
 	);
 
-	const schedule = stores.renderSchedule.get(key(A));
+	const schedule = stores.renderSchedule.get(A);
 	// ≈ now + 6h (minute-floored), NOT now + the stored 24h — route cadence is retroactive.
 	assert.ok(schedule.nextRenderTime >= before + 6 * HOUR_MS - 60_000, 'due no earlier than ~6h out');
 	assert.ok(schedule.nextRenderTime < before + 7 * HOUR_MS, 'stored 24h interval must not win');
@@ -391,7 +401,7 @@ test('outcome=rendered keeps the stored interval when the matched route sets no 
 		'<html>fresh</html>'
 	);
 
-	const schedule = stores.renderSchedule.get(key(A));
+	const schedule = stores.renderSchedule.get(A);
 	assert.ok(schedule.nextRenderTime >= before + 2 * HOUR_MS - 60_000, 'stored cadence still drives');
 	assert.ok(schedule.nextRenderTime < before + 3 * HOUR_MS, 'default must not win over a valid stored interval');
 });
@@ -404,6 +414,7 @@ test('outcome=rendered with a landed URL that keys elsewhere keeps the refile se
 	);
 
 	assert.equal(stores.target.has(A), false, 'source target retired by the refile');
+	assert.equal(stores.renderSchedule.has(A), false, 'no URL row is written for a retired source');
 	for (const device of DEVICES) {
 		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule retired with it`);
 	}
@@ -433,16 +444,17 @@ test('a non-indexable verdict suppresses the target: state, strikes, recheck sch
 
 	for (const device of DEVICES) {
 		assert.equal(stores.prerenderedPage.has(key(A, device)), false, `${device} cached page must be dropped`);
-		const schedule = stores.renderSchedule.get(key(A, device));
-		assert.ok(
-			schedule.nextRenderTime >= before + config.render.suppression.recheckInterval - 60_000,
-			`${device} rescheduled at the recheck interval, not the render interval`
-		);
 	}
+	const schedule = stores.renderSchedule.get(A);
+	assert.ok(
+		schedule.nextRenderTime >= before + config.render.suppression.recheckInterval - 60_000,
+		'the URL row is rescheduled at the recheck interval, not the render interval'
+	);
+	assert.equal(stores.renderSchedule.has(key(A)), false, 'the device row this verdict came from is retired');
 	// info, not warn, since the log relevel: a suppression is a normal verdict, and the
 	// alertable aggregate is the render_outcome counter (asserted below).
 	assert.ok(
-		infos.some((w) => w.includes('Suppressing') && w.includes('(noindex)')),
+		infos.some((w) => w.includes('Suppressing') && w.includes('noindex')),
 		`expected a suppression info line naming the reason, got: ${infos.join(' | ')}`
 	);
 	assert.ok(
@@ -465,8 +477,9 @@ test('maxStrikes consecutive non-indexable verdicts delete the target outright',
 	}
 
 	assert.equal(stores.target.has(A), false, 'strike limit reached — the target is gone');
+	assert.equal(stores.renderSchedule.has(A), false, 'and its schedule row with it');
 	for (const device of DEVICES) {
-		assert.equal(stores.renderSchedule.has(key(A, device)), false, 'and its schedules with it');
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, 'and any leftover device rows');
 	}
 });
 
@@ -604,7 +617,7 @@ test('a temp redirect strikes the source but keeps it (and its cached page) belo
 	assert.ok(target, 'source survives a first temp redirect');
 	assert.equal(target.strikes, 1, 'but the strike is recorded');
 	assert.equal(stores.prerenderedPage.get(key(A)).content, 'old html', 'cached page keeps serving');
-	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'retry scheduled at cadence');
+	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'retry scheduled at cadence');
 });
 
 test('maxStrikes consecutive temp redirects retire the source outright', async () => {
@@ -615,6 +628,7 @@ test('maxStrikes consecutive temp redirects retire the source outright', async (
 	await postResult({ id: key(A), url: A, statusCode: 302, outcome: 'redirected', redirectedTo: B });
 
 	assert.equal(stores.target.has(A), false, 'source retired — the temporary status was a lie');
+	assert.equal(stores.renderSchedule.has(A), false, 'schedule row dropped');
 	for (const device of DEVICES) {
 		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule dropped`);
 		assert.equal(

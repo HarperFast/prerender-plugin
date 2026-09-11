@@ -208,13 +208,16 @@ test('404 suppresses as http-gone at the gone recheck cadence', async () => {
 	const goneRecheck = config.render.suppression.gone.recheckInterval;
 	const defaultRecheck = config.render.suppression.recheckInterval;
 	assert.ok(goneRecheck > defaultRecheck, 'precondition: gone rechecks are further apart than the default');
+	// The recheck lands on the URL row — one row, every device — and the per-device row the verdict
+	// came from is retired with it.
+	const schedule = stores.renderSchedule.get(A);
+	assert.ok(schedule, 'the URL recheck schedule must exist');
+	assert.ok(
+		schedule.nextRenderTime > Date.now() + defaultRecheck,
+		'recheck must use the gone cadence, not the default'
+	);
+	assert.equal(stores.renderSchedule.has(key(A)), false, 'the device row folded into the URL row');
 	for (const device of DEVICES) {
-		const schedule = stores.renderSchedule.get(key(A, device));
-		assert.ok(schedule, `${device} recheck schedule must exist`);
-		assert.ok(
-			schedule.nextRenderTime > Date.now() + defaultRecheck,
-			'recheck must use the gone cadence, not the default'
-		);
 		assert.equal(stores.prerenderedPage.has(key(A, device)), false, 'cached error page must not keep serving');
 	}
 });
@@ -233,6 +236,7 @@ test('gone deletes after gone.maxStrikes, sooner than the default maxStrikes', a
 	await postResult(nonIndexable(404));
 
 	assert.equal(stores.target.has(A), false, 'target must be deleted at gone.maxStrikes');
+	assert.equal(stores.renderSchedule.has(A), false, 'the URL schedule row must be gone');
 	for (const device of DEVICES) {
 		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule must be gone`);
 	}
@@ -367,9 +371,11 @@ test('past fastRetries, a failure drops to the target cadence — page kept but 
 	assert.equal(target.strikes, fast + 1);
 	assert.notEqual(target.state, 'suppressed');
 
-	const schedule = stores.renderSchedule.get(key(A));
+	// The slow lane writes the URL row (and retires the device row this result came from).
+	const schedule = stores.renderSchedule.get(A);
 	assert.ok(schedule.nextRenderTime > Date.now(), 'slow lane: rescheduled at the target cadence');
 	assert.ok(schedule.nextRenderTime < Date.now() + 2 * 3_600_000, 'cadence, not a suppression recheck');
+	assert.equal(stores.renderSchedule.has(key(A)), false, 'the device row folded into the URL row');
 
 	// The slow lane RELEASES the lease. Holding it would pin the claim floor for a full jobLeaseTime
 	// for a row that is now hours in the future — a latency cost for nothing.
@@ -399,7 +405,7 @@ test('noindex (status 200) still suppresses under the default knobs with its own
 	assert.equal(target.suppressedReason, 'noindex');
 
 	const goneRecheck = config.render.suppression.gone.recheckInterval;
-	const schedule = stores.renderSchedule.get(key(A));
+	const schedule = stores.renderSchedule.get(A);
 	assert.ok(schedule.nextRenderTime < Date.now() + goneRecheck, 'default recheck cadence, not the gone one');
 });
 
@@ -472,7 +478,7 @@ test('a BigInt strikes value (Harper numeric surfacing) still counts toward the 
 	await postResult(nonIndexable(503));
 
 	assert.equal(stores.target.get(A).strikes, fast + 1, 'BigInt count read correctly, not reset to 1');
-	assert.ok(stores.renderSchedule.get(key(A)).nextRenderTime > Date.now(), 'transitioned to the slow lane');
+	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'transitioned to the slow lane');
 });
 
 // ---- a THROW out of result handling ----
@@ -486,8 +492,8 @@ test('a throw while handling a result HOLDS the lease — it must not become a r
 	// UNPACED re-render loop against whatever is throwing, at claim frequency rather than once per
 	// lease.
 	//
-	// The throw here is a real one, not an injected stub: a rendered result with content but no
-	// `headers` object, which the store path stamps `x-harper-rendered` onto.
+	// The throw is the page store rejecting mid-result — a blob write failing is the reachable shape.
+	// (A result with no `headers` object used to be the trigger; the result path now tolerates that.)
 	seedSource();
 	const claimed = await claim();
 	assert.ok(
@@ -495,11 +501,20 @@ test('a throw while handling a result HOLDS the lease — it must not become a r
 		'precondition: claimed, so there is a lease to hold'
 	);
 
-	await assert.rejects(
-		() => postResult({ id: key(A), url: A, statusCode: 200, outcome: 'rendered' }, 'fresh html'),
-		/x-harper-rendered/,
-		'the failure must surface (a 500), not be swallowed'
-	);
+	const PrerenderedPage = globalThis.databases.page_cache.PrerenderedPage;
+	const realPut = PrerenderedPage.put;
+	PrerenderedPage.put = async () => {
+		throw new Error('blob store unavailable');
+	};
+	try {
+		await assert.rejects(
+			() => postResult({ id: key(A), url: A, statusCode: 200, outcome: 'rendered' }, 'fresh html'),
+			/blob store unavailable/,
+			'the failure must surface (a 500), not be swallowed'
+		);
+	} finally {
+		PrerenderedPage.put = realPut;
+	}
 
 	assert.equal(leased(key(A)), true, 'the lease is HELD, so the retry is paced by queue.jobLeaseTime');
 	assert.deepEqual(await claim(), [], 'and an immediate re-claim grants nothing');

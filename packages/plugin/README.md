@@ -651,7 +651,7 @@ Checked against the reference deployment (4 nodes, 16 workers, Harper Pro 5.2.3)
 | `GET /p/<absolute-url>`                      | Serve prerendered/cached HTML for a bot (cache hit or origin fetch) |
 | `POST /render_queue/pause`                   | Pause **this node's** queue                                         |
 | `POST /render_queue/resume`                  | Clear this node's pause override                                    |
-| `POST /render_queue/claim`                   | Claim due render jobs (`{ "limit": N }`)                            |
+| `POST /render_queue/claim`                   | Claim due render jobs (`{ "limit": N }`) — one job per URL          |
 | `POST /render_queue/job_result`              | Submit a render result (binary; `x-metadata-size` header)           |
 | `GET/PUT/DELETE /RenderTarget/...`           | Manage render targets                                               |
 | `POST /RenderTarget` `{action:"revalidate"}` | Force re-render of matching targets                                 |
@@ -685,34 +685,34 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                           | Purpose                                         | Gate         |
-| --------------------------------------- | ----------------------------------------------- | ------------ |
-| `GET /prerender_admin[/]`               | API index: what this is, where the UI lives     | public       |
-| `GET /prerender_admin/session`          | who am I                                        | public       |
-| `POST /prerender_admin/login`           | `{ username, password }`                        | public       |
-| `POST /prerender_admin/logout`          | end the session                                 | session      |
-| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                 | `super_user` |
-| `GET /prerender_admin/config`           | effective config, layers, overrides, warnings   | `super_user` |
-| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`) | `super_user` |
-| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse      | `super_user` |
-| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`  | `super_user` |
-| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)        | `super_user` |
-| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached  | `super_user` |
-| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                   | `super_user` |
-| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day | `super_user` |
-| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)             | `super_user` |
-| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace         | `super_user` |
-| `POST /prerender_admin/schedule`        | `{ cacheKey }` → this node's local schedule row | `super_user` |
-| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or         | `super_user` |
-|                                         | `{ action: "reset-claim-floor" }` (this node)   |              |
-| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one key due now    | `super_user` |
-| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node      | `super_user` |
-| `POST /prerender_admin/sweep-orphans`   | `{ dryRun?, maxDeletes? }` → key-rule orphans   | `super_user` |
-| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now    | `super_user` |
-| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail | `super_user` |
-| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots   | `super_user` |
-| `GET /prerender_admin/change-probe`     | probe rules + last pass records (this node)     | `super_user` |
-| `POST /prerender_admin/change-probe`    | `{ action?: "sweep"\|"canary", dryRun? }` → run | `super_user` |
+| Method & path                           | Purpose                                          | Gate         |
+| --------------------------------------- | ------------------------------------------------ | ------------ |
+| `GET /prerender_admin[/]`               | API index: what this is, where the UI lives      | public       |
+| `GET /prerender_admin/session`          | who am I                                         | public       |
+| `POST /prerender_admin/login`           | `{ username, password }`                         | public       |
+| `POST /prerender_admin/logout`          | end the session                                  | session      |
+| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                  | `super_user` |
+| `GET /prerender_admin/config`           | effective config, layers, overrides, warnings    | `super_user` |
+| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`)  | `super_user` |
+| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
+| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
+| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
+| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached   | `super_user` |
+| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                    | `super_user` |
+| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day  | `super_user` |
+| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)              | `super_user` |
+| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
+| `POST /prerender_admin/schedule`        | `{ url \| cacheKey }` → this node's schedule row | `super_user` |
+| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or          | `super_user` |
+|                                         | `{ action: "reset-claim-floor" }` (this node)    |              |
+| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one URL due now     | `super_user` |
+| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node       | `super_user` |
+| `POST /prerender_admin/sweep-orphans`   | `{ dryRun?, maxDeletes? }` → key-rule orphans    | `super_user` |
+| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now     | `super_user` |
+| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
+| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots    | `super_user` |
+| `GET /prerender_admin/change-probe`     | probe rules + last pass records (this node)      | `super_user` |
+| `POST /prerender_admin/change-probe`    | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
 
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the
 same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
@@ -843,8 +843,8 @@ claim floor, schedule repair — are plugin behavior.)
   startup log lines (empty security token, staging passthrough enabled, `renderNow` without a
   token).
 
-The explainer also offers **Render this URL now**, which makes that one key due immediately.
-It writes a single `RenderSchedule` row on purpose: the collection-level
+The explainer also offers **Render this URL now**, which makes that one URL due immediately —
+every device, in one job. It writes a single `RenderSchedule` row on purpose: the collection-level
 `RenderTarget.revalidate` takes a search target, and aimed at the whole registry it queues
 every target at once — at a million targets that is a self-inflicted render herd.
 
@@ -913,16 +913,17 @@ count is never mistaken for "all clear".
 ### Cache-key orphans
 
 The mirror-image problem, and the one **changing a `cacheKey.*` option creates**. A target's
-stored `url` _is_ the url-half of its cache key — `Target.put` derives the schedule rows from it
-verbatim, and a render is stored under the schedule row's own key. Nothing re-canonicalizes.
-So after a key-rule change, every target whose stored url is no longer what that url canonicalizes
-to keeps its schedule rows and **renders forever into a key no request can produce**.
+stored `url` _is_ its schedule key and the url-half of every page key — `Target.put` writes the
+schedule row under it verbatim, and a render is stored under `<url>|<device>`. Nothing
+re-canonicalizes. So after a key-rule change, every target whose stored url is no longer what that
+url canonicalizes to keeps its schedule row and **renders forever into keys no request can produce**.
 
 Nothing else cleans them up. A sitemap refresh creates the target under the new key and merely
 _unlinks_ the old one (`sitemapUrl → null`), which does not touch its schedule. And the canonical
 verdict cannot retire them either: with the rule applied on both sides, the renderer folds the job
 url and the declared canonical alike and calls it `self`. Measured after enabling
-`cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed, ~40,400 schedule rows.
+`cacheKey.plusIsSpace` on a ~38k-url catalog corpus: ~20,200 urls re-keyed (~40,400 schedule rows at
+the time, when the table held one per device; one per URL since v0.66.0).
 
 Sizing that cost needs care, because the nominal interval is **not** the rate. `nextRenderTime` is
 stamped at _completion_, so a row rendered `L` behind its due time has its next render set `interval`
@@ -1271,6 +1272,34 @@ render client ──claim──▶ render_queue ──jobs──▶ [headless re
 
 The render service is a separate process; see [`@harperfast/prerender-browser`](../browser). Its
 `RENDERER_BYPASS_*` settings must match this plugin's `origin.securityToken`.
+
+**A job is one URL** (v0.66.0). `RenderSchedule` holds one row per URL, a claim hands the renderer one
+job naming every device in `deviceTypes.default`, and the renderer (browser >= 1.23.0) renders them in
+turn and posts one result — `{ id, url, deviceTypes, variants: [...] }` with the variants' bodies
+concatenated behind the JSON. Pages are still stored per device (`PrerenderedPage` stays keyed by
+`<url>|<device>`); the schedule is written once, which is what keeps a URL's devices aligned instead
+of drifting apart through every per-device path (the retry lanes, render-now, reconcile). One result
+also means one `strikes` increment per failed cycle, and one page claim for the change probe. The
+precedence across a result's variants — a redirect on any device decides the URL, a genuine
+non-indexable verdict on any device suppresses it, rendered pages are stored and a failed device puts
+the URL in the retry lanes — is spelled out on `processDecodedJobResult` in
+[`src/resources/RenderQueue.js`](src/resources/RenderQueue.js).
+
+**Upgrading from a per-device schedule.** Rows written before v0.66.0 are keyed `<url>|<device>` and
+are **not migrated by a sweep**: each converts the first time it renders — its job renders exactly the
+device its key names, its result writes the URL row and deletes the device row — so two siblings fold
+into one URL row within a render cycle at no extra renders, and the table holds both shapes meanwhile
+(every reader tolerates both). The one carve-out: a writer that files the URL row **before** a URL's
+device rows have converted — a registry-wide `revalidate`, a sitemap ingest with `revalidate: true`,
+`POST /prerender_admin/revalidate`, or a render-now — renders that URL once more per leftover device
+row (each row still renders its device and rewrites the URL row), so a bulk revalidate in the first
+cycle after the upgrade costs up to one extra render per URL. Wait a cycle, or accept it. The `cacheKey` column name stays: Harper refuses to rename the primary
+key of a populated table, so read it as "the schedule key". **Deploy the render fleet (browser >=
+1.23.0) before this plugin version**: an older renderer handed a URL job renders only its first device.
+`renderNow` for a device outside `deviceTypes.default` still writes a per-device row — a one-off
+render of that device beside the rotation, stored and retired without touching the URL row. For a
+default device it pulls the URL row forward, so the render it waits on renders **every** default
+device before the result posts: size `renderNow.timeoutMs` for that, not for one render.
 
 ## Development
 

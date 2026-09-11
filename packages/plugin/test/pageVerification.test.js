@@ -215,11 +215,12 @@ test('with no epoch at all, a verification changes nothing', () => {
 // ---- the per-device basis: what makes a per-URL verification safe for per-cacheKey pages --------
 
 /**
- * `pageSignature` is keyed by url and written by whichever device rendered LAST, so the proof
- * belongs to one render while the pages are per-cacheKey. A SPLIT PAIR is a normal state here —
- * `PrerenderAdmin.revalidateUrl` and `renderNow` each write one device key on purpose, reconcile
- * repairs a missing row with fresh jitter, and every per-device retry lane diverges the pair. So a
- * bare per-URL exemption would serve a stale sibling on the strength of the other device's proof.
+ * `pageSignature` is keyed by url and written once per result, so the proof belongs to one render
+ * while the pages are per-cacheKey. Since v0.66.0 a URL's devices render in one job and share one
+ * `lastCached`, so the pair is aligned by construction — but a SPLIT PAIR is still reachable: a
+ * pre-0.66.0 per-device row that has not yet converted, a partial result whose missing device kept
+ * its older page, a one-device render-now. So a bare per-URL exemption would serve a stale sibling
+ * on the strength of the other device's proof, and the basis stays.
  */
 
 test('the VERIFIED render is exempt', () => {

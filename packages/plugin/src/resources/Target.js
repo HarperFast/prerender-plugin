@@ -4,7 +4,7 @@ import { resolveRenderInterval } from '../util/routeClass.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
-import { deleteSchedule, writeSchedules } from '../util/renderSchedule.js';
+import { deleteSchedule, writeSchedule } from '../util/renderSchedule.js';
 
 const {
 	page_cache: { PrerenderedPage },
@@ -33,9 +33,9 @@ export const countedStrikes = (value) => {
 
 /**
  * The URL registry — ONE row per URL (see schema.graphql). Device variants are not stored:
- * the devices a URL renders for are `config.deviceTypes.default` at write time, and `put`
- * fans out one RenderSchedule row per device. RenderSchedule and PrerenderedPage stay
- * cacheKey-keyed — the queue and the content are genuinely per-device.
+ * the devices a URL renders for are `config.deviceTypes.default` at claim time. `put` writes
+ * ONE RenderSchedule row, keyed by the URL, and a claim of that row is one job rendering every
+ * device; only PrerenderedPage stays cacheKey-keyed, because the CONTENT is genuinely per-device.
  *
  * WRITES TO A RESIDENCY-PINNED KEY DO NOT BLOCK ON THE OWNING NODE. Reads do. The asymmetry
  * is not obvious and v0.15.0 got it wrong, so it is written down here.
@@ -58,11 +58,19 @@ export const countedStrikes = (value) => {
  */
 
 /** The device variants a URL renders for — config at call time, never stored per-URL, so a
- *  config change applies to every URL on its next write/sweep instead of never. */
+ *  config change applies to every URL on its next claim instead of never. */
 const deviceTypes = () => config.deviceTypes.default;
 
-/** Every cacheKey a URL's row implies (one per configured device). */
+/**
+ * Every PAGE key a URL's row implies (one per configured device). Also the keys of the URL's
+ * pre-0.66.0 per-device schedule rows, which is why the schedule deletes below still name them:
+ * such a row converts itself the first time it renders, but a target retired before that must not
+ * leave one behind to render once more and drop itself.
+ */
 export const cacheKeysOf = (url) => deviceTypes().map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
+
+/** Every SCHEDULE key a URL may have a row under: the URL row, plus any not-yet-converted device row. */
+export const scheduleKeysOf = (url) => [url, ...cacheKeysOf(url)];
 
 export class Target extends TargetTable {
 	async put(data, target) {
@@ -79,42 +87,37 @@ export class Target extends TargetTable {
 		// present in `data` are cleared by construction. That is what makes a sitemap attach
 		// or a fresh discovery naturally lift a suppression — the site re-claimed the URL.
 		//
-		// Write the target first, then the schedules. Target and RenderSchedule live in
+		// Write the target first, then the schedule. Target and RenderSchedule live in
 		// separate databases (the schedule is isolated as the hot queue), so these are
 		// independent commits rather than one atomic write. Ordering target-first keeps the
 		// invariant "a schedule always references an existing target" (which `claim` relies
 		// on). The reverse gap — a target with a missing schedule row — is NOT self-healing:
-		// `util/reconcile.js` is what repairs it, per device.
+		// `util/reconcile.js` is what repairs it.
 		const result = await super.put({ url, ...data }, target);
 
 		// Absent a valid explicit time, jitter the first render across the interval — keyed
-		// off the URL, so bulk-created targets don't all come due at once and a URL's device
-		// variants share one slot. The jitter window is the same cadence the reschedule loop
-		// will resolve (route > stored > default), so the initial spread matches the recurring
-		// one. Target is API-exposed and resolveRenderInterval validates the stored number
-		// (rejects negatives / NaN / non-numbers) rather than trusting the payload.
+		// off the URL, so bulk-created targets don't all come due at once. The jitter window is
+		// the same cadence the reschedule loop will resolve (route > stored > default), so the
+		// initial spread matches the recurring one. Target is API-exposed and
+		// resolveRenderInterval validates the stored number (rejects negatives / NaN /
+		// non-numbers) rather than trusting the payload.
 		const interval = resolveRenderInterval(url, data.renderInterval);
 		const fromSitemap = !!data.sitemapUrl;
-		// One floor lowering for the whole device fan-out. The explicit `nextRenderTime` branch is
-		// validated no further than `> 0`, and it is the funnel for redirect adoption, sitemap
-		// `revalidate: true`, and any external `PUT /render_targets` — i.e. exactly the "due now"
-		// and "due in the past" writes a claim floor would otherwise strand. That is why it must
-		// not be a bare table put.
-		await writeSchedules(
-			cacheKeysOf(url).map((cacheKey) => ({
-				cacheKey,
-				nextRenderTime:
-					Number.isFinite(nextRenderTime) && nextRenderTime > 0
-						? nextRenderTime
-						: getInitialRenderTime(cacheKey, interval),
-				fromSitemap,
-				// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
-				// target row, so a put clears `demandInterval` along with the suppression fields; the
-				// target genuinely restarts at its route/stored cadence and this records that. Reading
-				// the old rung to carry it forward would file a cadence the target no longer has.
-				effectiveInterval: interval,
-			}))
-		);
+		// ONE row, keyed by the URL: the claim renders every configured device off it. The explicit
+		// `nextRenderTime` branch is validated no further than `> 0`, and it is the funnel for
+		// redirect adoption, sitemap `revalidate: true`, and any external `PUT /render_targets` —
+		// i.e. exactly the "due now" and "due in the past" writes a claim floor would otherwise
+		// strand. That is why it must not be a bare table put.
+		await writeSchedule(url, {
+			nextRenderTime:
+				Number.isFinite(nextRenderTime) && nextRenderTime > 0 ? nextRenderTime : getInitialRenderTime(url, interval),
+			fromSitemap,
+			// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
+			// target row, so a put clears `demandInterval` along with the suppression fields; the
+			// target genuinely restarts at its route/stored cadence and this records that. Reading
+			// the old rung to carry it forward would file a cadence the target no longer has.
+			effectiveInterval: interval,
+		});
 
 		return result;
 	}
@@ -133,8 +136,15 @@ export class Target extends TargetTable {
 		// lands on the node it runs on — an owner-node row deleted elsewhere is left behind, and
 		// that is fine: an orphaned baseline is never walked again (the sweep walks Targets), and
 		// a re-created target on a new owner seeds fresh regardless.
+		//
+		// The schedule deletes name the URL row AND the URL's pre-0.66.0 device rows (see
+		// `scheduleKeysOf`): a device row that has not yet converted would otherwise outlive its
+		// target, render once more, and only then drop itself. Harper records a delete of an absent
+		// key in the audit log, so this costs two tombstones per retired target once the corpus has
+		// converted — on a path that runs a few hundred times a day, not on the render path.
 		await Promise.all([
-			...cacheKeysOf(url).flatMap((cacheKey) => [deleteSchedule(cacheKey), PrerenderedPage.delete(cacheKey)]),
+			...scheduleKeysOf(url).map((key) => deleteSchedule(key)),
+			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 			databases.probe_state.ProbeState.delete(url),
 		]);
 
@@ -206,28 +216,24 @@ export class Target extends TargetTable {
 		// floor), routed through the funnel anyway so the first "recheck this immediately" path
 		// anyone adds here inherits the lowering instead of silently stranding the URL.
 		await Promise.all([
-			writeSchedules(
-				cacheKeysOf(url).map((cacheKey) => ({
-					cacheKey,
-					nextRenderTime: recheckAt,
-					fromSitemap: !!existing?.sitemapUrl,
-					// THE CADENCE, NOT `recheckInterval` — this is the case `util/renderPriority.js` calls
-					// out by name. A 7-day recheck filed as a cadence would make a suppressed 48h page read
-					// as 3.5 cadences stale the moment it comes due and outrank a genuinely late homepage,
-					// promoting exactly the rows worth deprioritizing. No rung applied for the same reason
-					// as `put`: the `TargetTable.put` above omits `demandInterval`, so the rung is cleared
-					// with it and the target resumes at its route/stored cadence.
-					effectiveInterval: resolveRenderInterval(url, existing?.renderInterval ?? null),
-				}))
-			),
+			writeSchedule(url, {
+				nextRenderTime: recheckAt,
+				fromSitemap: !!existing?.sitemapUrl,
+				// THE CADENCE, NOT `recheckInterval` — this is the case `util/renderPriority.js` calls
+				// out by name. A 7-day recheck filed as a cadence would make a suppressed 48h page read
+				// as 3.5 cadences stale the moment it comes due and outrank a genuinely late homepage,
+				// promoting exactly the rows worth deprioritizing. No rung applied for the same reason
+				// as `put`: the `TargetTable.put` above omits `demandInterval`, so the rung is cleared
+				// with it and the target resumes at its route/stored cadence.
+				effectiveInterval: resolveRenderInterval(url, existing?.renderInterval ?? null),
+			}),
 			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 		]);
 		return { deleted: false, strikes };
 	}
 
 	/** A render found a suppressed URL indexable again — put it back in normal rotation.
-	 *  The caller reschedules the device that just rendered; the sibling devices' schedules
-	 *  already exist (suppress set them) and will re-render at their recheck time. */
+	 *  The caller reschedules the URL row at its cadence. */
 	static async reactivate(url) {
 		await Target.patch(url, { state: null, suppressedReason: null, suppressedAt: null, strikes: 0 });
 	}
@@ -289,8 +295,8 @@ export class Target extends TargetTable {
 		});
 
 		// Phase 2 — writes, cursor now closed. Each batch is awaited before the next starts,
-		// so pending writes never span a monitor tick; within one URL the device variants are
-		// independent rows, so they proceed in parallel.
+		// so pending writes never span a monitor tick; within one URL the device PAGES are
+		// independent rows, so their expiry patches proceed in parallel.
 		await applyInBatches({
 			items: urls,
 			apply: async ({ url, sitemapUrl }) => {
@@ -319,22 +325,18 @@ export class Target extends TargetTable {
 				//
 				// One lowering per URL rather than one for the whole batch: every row here gets the
 				// same `currentMinuteMs()`, so after the first the CAS-min is a single atomic load
-				// that changes nothing. Hoisting the lowering out of the loop would mean carrying the
-				// batch's rows in memory to no measurable end.
-				await writeSchedules(
-					cacheKeysOf(url).map((cacheKey) => ({
-						cacheKey,
-						nextRenderTime,
-						fromSitemap: !!sitemapUrl,
-						// `null` — the sweep resolves from config instead, which is what it did before this
-						// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and
-						// an API-facing guard enforces exactly those two), so carrying a cadence here would
-						// mean widening that contract. It cannot affect this row's ranking anyway: every row
-						// is filed at the current minute, so its lateness is ~0 whatever the denominator,
-						// and the render it is being queued for refills the cadence on completion.
-						effectiveInterval: null,
-					}))
-				);
+				// that changes nothing.
+				await writeSchedule(url, {
+					nextRenderTime,
+					fromSitemap: !!sitemapUrl,
+					// `null` — the sweep resolves from config instead, which is what it did before this
+					// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and
+					// an API-facing guard enforces exactly those two), so carrying a cadence here would
+					// mean widening that contract. It cannot affect this row's ranking anyway: every row
+					// is filed at the current minute, so its lateness is ~0 whatever the denominator,
+					// and the render it is being queued for refills the cadence on completion.
+					effectiveInterval: null,
+				});
 			},
 		});
 

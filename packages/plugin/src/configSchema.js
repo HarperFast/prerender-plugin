@@ -190,9 +190,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'Device types the service understands; unrecognized values fall back to the first entry.',
 			{ itemType: 'string', nonEmpty: true }
 		),
-		default: option(['desktop', 'mobile'], 'Device types scheduled for rendering when a page is auto-discovered.', {
-			itemType: 'string',
-		}),
+		default: option(
+			['desktop', 'mobile'],
+			'Device types every render job renders (one job per URL renders all of them). Empty is refused at ' +
+				'apply time and the default kept: a job naming no device is one the browser cannot act on, and the ' +
+				'schedule code would otherwise have to guess.',
+			{ itemType: 'string', nonEmpty: true }
+		),
 	}),
 
 	cacheKey: group(
@@ -824,15 +828,17 @@ export const configSchema = group('Prerender plugin configuration.', {
 						10,
 						'Per-node ceiling on accelerated REQUESTS per minute, shared across every worker on the node ' +
 							'(one minute-bucketed counter in a shared buffer). One accelerated request writes at most one ' +
-							'schedule row PER DEVICE ROW THE URL HAS — `deviceTypes.default` (two on this deployment), ' +
-							'plus the served device when that one is merely `supported` — so the write ceiling is this ' +
-							'number times those rows.\n\n' +
+							'schedule row per schedule row the URL has — normally just its URL row; plus any pre-0.66.0 ' +
+							'per-device row that has not yet converted, and a per-device row for the served device when ' +
+							'that one is merely `supported` — so the write ceiling is this number times those rows.\n\n' +
 							'Sized so its CEILING is defensible, not just its typical. 10/min/node is 14,400 ' +
-							'requests/node/day ≈ 28,800 schedule writes ≈ 2.3MB of audit/node/day, about 7% of measured ' +
-							'spare fleet render capacity (~792,700 renders/day spare against a 1,710,936/day ceiling and ' +
-							'~918,000/day of baseline cadence demand) — against a measured demand of roughly 1,000 ' +
-							'owner-node candidate requests/day CLUSTER-WIDE, i.e. ~14x headroom. Raising it toward 120 ' +
-							'would authorise ~87% of all spare fleet capacity, which is why it is not the default.',
+							'requests/node/day ≈ 14,400 schedule writes ≈ 1.2MB of audit/node/day once the corpus holds one ' +
+							'row per URL (it was ~28,800 writes / 2.3MB at one row per device), and each write is a job that ' +
+							'renders every device — about 7% of measured spare fleet render capacity (~792,700 renders/day ' +
+							'spare against a 1,710,936/day ceiling and ~918,000/day of baseline cadence demand) — against a ' +
+							'measured demand of roughly 1,000 owner-node candidate requests/day CLUSTER-WIDE, i.e. ~14x ' +
+							'headroom. Raising it toward 120 would authorise ~87% of all spare fleet capacity, which is why ' +
+							'it is not the default.',
 						{ min: 1 }
 					),
 				}

@@ -88,18 +88,14 @@ export const getNextTimeOfDay = (timeStr, timezone) => {
 };
 
 /**
- * The jitter offset is seeded off the URL half of a cache key, NOT the whole key, so every
- * device-type variant of one URL lands on the SAME minute. Seeded off the full key, `desktop`
- * and `mobile` hash to unrelated offsets and drift up to a whole interval apart, which means
- * the two copies of a page can differ in age by up to 24h — a content change shows on one
- * device and not the other, and every render pays a cold origin/CDN fetch. Aligned, the pair
- * sorts adjacently in `RenderQueue.claim`'s nextRenderTime order and is rendered back-to-back
- * by one worker off a warm origin. Residency already groups them this way (`schedulerNode`
- * comes from the URL alone), so the seed now agrees with the routing.
- *
- * Alignment persists cycle over cycle because `processJobResult` reschedules from
- * `currentMinuteMs() + interval` — both variants completing within the same minute get an
- * identical next time, so the pair stays locked instead of drifting.
+ * The jitter offset is seeded off the URL, never off a whole cache key. Schedule rows are keyed by
+ * URL now (one row, every device in one job), so the seed IS the key; the URL-half rule below is
+ * what keeps a pre-0.66.0 per-device row, and a deliberate one-device row (`renderNow` for a
+ * device outside `deviceTypes.default`), on the same minute as the URL row they belong to. Seeded
+ * off the full cacheKey, `desktop` and `mobile` hashed to unrelated offsets and drifted up to a
+ * whole interval apart — the two copies of a page could differ in age by up to 24h. Residency
+ * already groups a URL's rows this way (`schedulerNode` comes from the URL alone), so the seed
+ * agrees with the routing.
  */
 const jitterSeed = (key) => {
 	const str = String(key ?? '');
