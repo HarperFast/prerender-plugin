@@ -468,8 +468,17 @@ test('a one-device row for a NON-default device whose URL turns out to 301 is re
 	assert.equal(stores.renderSchedule.has(A), false);
 	assert.equal(stores.renderSchedule.has(key(A, 'tablet')), false, 'the tablet row goes too — it is not a default key');
 	assert.equal(leased(key(A, 'tablet')), false);
-	assert.deepEqual(await claim(), [], 'nothing left to re-grant');
 	assert.ok(stores.target.get(B), 'destination adopted');
+	const next = await claim();
+	assert.ok(
+		next.every((job) => job.url !== A),
+		`nothing of ${A} is left to re-grant (got ${next.map((job) => job.id).join(', ')})`
+	);
+	assert.deepEqual(
+		next.map((job) => job.id),
+		[B],
+		'only the adopted destination is due'
+	);
 });
 
 test('a refiled result with a failed sibling releases the SOURCE lease and touches no other target', async () => {
