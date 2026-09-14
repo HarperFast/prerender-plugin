@@ -9,6 +9,7 @@ import { getResourceCache } from './ResourceCache.js';
 import { settings } from './settings.js';
 import { CpuSampler } from './util/cpu.js';
 import { renderPhaseOf } from './util/renderPhase.js';
+import { JobDocumentCache } from './documentReuse.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -111,6 +112,12 @@ export default class RenderWorker {
 			// Variants a multi-device job asked for and this worker did NOT attempt: the lease ran short
 			// or the worker began draining between variants. The plugin retries the URL for them.
 			variantsSkipped: 0,
+			// Document reuse (config.documentReuse): variants whose navigation was answered from a
+			// sibling's captured document, sample jobs that fetched and compared instead, and those
+			// samples' structural divergence ratios (0 = same markup; see documentReuse.ts).
+			documentsReused: 0,
+			documentSamples: 0,
+			documentDivergence: [] as number[],
 			concurrencyBlocked: 0,
 			rpsDelayed: 0,
 			resultPostFailures: 0,
@@ -131,6 +138,11 @@ export default class RenderWorker {
 			postProcess: [] as number[],
 		};
 	}
+
+	// Multi-device jobs seen while document reuse is on — the counter `documentReuse.sampleEvery`
+	// selects sample jobs from. Per worker, which is what makes "every Nth job" mean what it says on
+	// a worker that renders a few thousand jobs a day.
+	private documentJobs = 0;
 
 	// Set on graceful shutdown: stops the consumer loop and blocks new renders while
 	// in-flight ones drain.
@@ -277,6 +289,11 @@ export default class RenderWorker {
 				perSec: Number((s.completed / elapsedSec).toFixed(2)),
 				jobs: s.jobs,
 				variantsSkipped: s.variantsSkipped,
+				documentsReused: s.documentsReused,
+				documentSamples: s.documentSamples,
+				// max/mean of the sampled divergence ratios this window (0 = same markup); null when
+				// nothing was sampled.
+				documentDivergence: summarize(s.documentDivergence),
 				succeeded: s.succeeded,
 				emptyContent: s.emptyContent,
 				redirected: s.redirected,
@@ -473,6 +490,19 @@ export default class RenderWorker {
 		const variants = job.variants();
 		const attempted: RenderJob[] = [];
 
+		// One shared document per multi-device job, when the operator has said the site is responsive.
+		// The first variant fills it, the rest replay it — except on a sample job, which fetches and
+		// compares so the claim keeps being tested. See documentReuse.ts.
+		const reuse = settings.config.documentReuse;
+		let documentCache: JobDocumentCache | null = null;
+		if (reuse.enabled && variants.length > 1) {
+			this.documentJobs++;
+			documentCache = new JobDocumentCache({
+				sample: reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0,
+			});
+			for (const variant of variants) variant.documentCache = documentCache;
+		}
+
 		for (const variant of variants) {
 			if (attempted.length > 0) {
 				const leaseLeft = job.expiresAt - Date.now();
@@ -507,6 +537,23 @@ export default class RenderWorker {
 			});
 		this.stats.jobs++;
 		if (!posted) this.stats.resultPostFailures++;
+
+		if (documentCache) {
+			this.stats.documentsReused += documentCache.reusedBy.length;
+			if (documentCache.divergence) {
+				const { ratio, differing, chunks, samples } = documentCache.divergence;
+				this.stats.documentSamples++;
+				this.stats.documentDivergence.push(ratio);
+				// Structural divergence between the first variant's document and a real second fetch. A
+				// non-zero ratio on a quiet day is the site turning adaptive (or personalising the
+				// document); on a deploy day it is build churn the normaliser did not cover — read the
+				// samples before drawing either conclusion.
+				logger[ratio > 0 ? 'warn' : 'info'](
+					{ id: job.id, ratio: Number(ratio.toFixed(4)), differing, chunks, samples },
+					'document reuse sample: structural divergence between device documents'
+				);
+			}
+		}
 	}
 
 	/** Render ONE device variant on a page of its own; the result is posted by the caller. */

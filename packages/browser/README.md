@@ -123,6 +123,21 @@ keep a URL's variants aligned: same render pass, seconds apart, one scheduling d
 }
 ```
 
+**Document reuse** (`config.documentReuse`, off by default). On a responsive site the origin answers
+every device with the same document, so the second and later variants of a job can be navigated from
+the first variant's captured document instead of fetching it again — one document fetch per URL
+render instead of one per device, and the second variant skips its download. The first variant's
+first-party cookies are copied into each replaying variant's context before it navigates, so its
+scripts start where a visitor who received that document would; a document is never reused when it is
+not a final `200 text/html`, has a redirect chain, or sends a `Vary` naming the user agent or a
+client hint. A replayed variant posts `documentReused: true`. Turn it on only for a **responsive**
+site: an adaptive site (server-side device detection, m-dot) serves different markup per device, and
+replaying desktop markup into a mobile render caches a page no mobile visitor is served. `sampleEvery:
+N` keeps that claim tested — every Nth job fetches its second variant normally and logs the structural
+divergence between the two documents (hashed asset names, hydration ids and script bodies are
+normalised away, so a deploy in progress does not read as divergence); it reports and counts, and
+deliberately never switches reuse off by itself.
+
 A variant is **skipped and the result posted partial** when the lease has under 30s left or the
 worker began draining between variants: `variants` then lists fewer devices than `deviceTypes`, the
 plugin stores what rendered and retries the URL for the rest. (A result that never arrives would cost
@@ -152,6 +167,9 @@ include what you change:
 		"resourceTypes": ["image", "media", "font"], // aborted before loading
 		"urlPatterns": ["google-analytics.com"], // abort requests whose URL contains any
 	},
+	// Reuse the first device's document for the other devices of a job (see "Document reuse" above).
+	// Only for a RESPONSIVE site; `sampleEvery` keeps a running structural check of that assumption.
+	"documentReuse": { "enabled": false, "sampleEvery": 0 },
 	"navigation": {
 		"waitUntil": "domcontentloaded", // 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'
 		"renderBudgetMs": 20000,
