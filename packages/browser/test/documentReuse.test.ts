@@ -4,7 +4,6 @@ import {
 	DOCUMENT_REUSE_HEADER,
 	JobDocumentCache,
 	documentDivergence,
-	portableCookies,
 	toRespondPayload,
 	varyForbidsReuse,
 } from '../dist/documentReuse.js';
@@ -12,8 +11,8 @@ import { defaultConfig, mergeConfig } from '../dist/config.js';
 
 // Document reuse across a job's device variants: the guards that decide whether a document may
 // stand in for another device's, the fulfilment payload, and the structural comparison the sampled
-// check relies on. The end-to-end behaviour (one origin fetch, cookies carried, marker posted) is
-// in documentReuseRender.test.ts against a real browser.
+// check relies on. The end-to-end behaviour (one origin fetch, no cookie crossing variants, marker
+// posted) is in documentReuseRender.test.ts against a real browser.
 
 test('Vary forbids reuse only when it names the user agent, a client hint, or *', () => {
 	for (const ok of [undefined, null, '', 'Accept-Encoding', 'accept-encoding, Accept-Language', 'Origin']) {
@@ -49,7 +48,6 @@ test('the fulfilment payload drops hop-by-hop, encoding, length and set-cookie, 
 			'etag': '"abc"',
 		},
 		body: Buffer.from('<html></html>'),
-		cookies: [],
 		deviceType: 'desktop',
 	});
 	assert.equal(payload.status, 200);
@@ -60,42 +58,13 @@ test('the fulfilment payload drops hop-by-hop, encoding, length and set-cookie, 
 		[DOCUMENT_REUSE_HEADER]: '1',
 	});
 	assert.equal(payload.body.toString(), '<html></html>');
-});
-
-test('cookies are projected onto the fields setCookie accepts — bookkeeping fields do not travel', () => {
-	const [cookie] = portableCookies([
-		{
-			name: 'bucket',
-			value: 'a',
-			domain: 'site.example.com',
-			path: '/',
-			expires: 1_900_000_000,
-			size: 8,
-			httpOnly: true,
-			secure: true,
-			session: false,
-			sameSite: 'Lax',
-			priority: 'Medium',
-			sameParty: false,
-			sourceScheme: 'Secure',
-			sourcePort: 443,
-			partitionKey: { sourceOrigin: 'https://site.example.com', hasCrossSiteAncestor: false },
-		} as never,
-	]);
-	assert.deepEqual(cookie, {
-		name: 'bucket',
-		value: 'a',
-		domain: 'site.example.com',
-		path: '/',
-		expires: 1_900_000_000,
-		httpOnly: true,
-		secure: true,
-		sameSite: 'Lax',
-	});
+	// Chrome DOES store a fulfilled response's Set-Cookie (verified against Fetch.fulfillRequest), so
+	// stripping it is what keeps a cookie from crossing variants — not a formality.
+	assert.equal('set-cookie' in payload.headers, false);
 });
 
 test('a sample job never replays, even with an entry', () => {
-	const entry = { url: 'u', status: 200, headers: {}, body: Buffer.alloc(0), cookies: [], deviceType: 'desktop' };
+	const entry = { url: 'u', status: 200, headers: {}, body: Buffer.alloc(0), deviceType: 'desktop' };
 	const normal = new JobDocumentCache();
 	assert.equal(normal.canReplay, false, 'nothing captured yet');
 	normal.entry = entry;

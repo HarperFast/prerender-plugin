@@ -1,4 +1,4 @@
-import type { Cookie, CookieData, HTTPRequest, HTTPResponse } from 'puppeteer';
+import type { HTTPRequest, HTTPResponse } from 'puppeteer';
 
 /**
  * Reuse of the main document across the device variants of ONE job.
@@ -30,11 +30,16 @@ import type { Cookie, CookieData, HTTPRequest, HTTPResponse } from 'puppeteer';
  *     plugin (and rendered by nobody); an error page is its own verdict; a non-HTML body is not a
  *     document. Anything else falls through to a normal fetch — reuse is an optimisation, never a
  *     substitute for the origin's answer.
- *   - COOKIES TRAVEL WITH THE DOCUMENT. The document response sets cookies (bot-manager, experiment
- *     buckets, store selection) that the page's scripts and API calls read, and a fulfilled response's
- *     Set-Cookie headers are NOT relied on to be stored. So the first variant's first-party cookies
- *     are copied into the next variant's context before it navigates: it starts where a visitor who
- *     received that document would start, and the replayed response carries no Set-Cookie of its own.
+ *   - NO COOKIES CROSS VARIANTS. The replayed response carries no `Set-Cookie`, and nothing is copied
+ *     from the first variant's context: every variant still starts with an empty jar, exactly as it
+ *     did when each fetched its own document, and exactly as the bots this cache serves arrive. The
+ *     document response does set cookies (bot-manager, experiment buckets, store selection) that page
+ *     scripts may read, so a replayed variant's scripts run without them — a deliberate choice: a
+ *     cookie is what ties a render to a session, and two devices sharing one session is the one thing
+ *     a two-device job must not manufacture. Both alternatives were checked and declined: copying the
+ *     first context's cookies works, and Chrome DOES store `Set-Cookie` from a fulfilled response
+ *     (verified against Chrome via Fetch.fulfillRequest), so either would be a one-line change if the
+ *     decision is ever revisited.
  *   - REPLAY IS MARKED. The fulfilled response carries `x-render-document-reuse: 1` so the renderer's
  *     own response handler does not re-capture it, and the variant reports `documentReused: true` to
  *     the plugin, so reuse is visible per result rather than inferred from timing.
@@ -61,8 +66,6 @@ export type CapturedDocument = {
 	headers: Record<string, string>;
 	/** The DECODED body — `HTTPResponse.buffer()` has already undone the content encoding. */
 	body: Buffer;
-	/** First-party cookies of the context that received the document, copied into the next variant's. */
-	cookies: CookieData[];
 	/** The device that fetched it, for the log line and the result. */
 	deviceType: string;
 };
@@ -126,8 +129,9 @@ export const isReusableDocument = (res: HTTPResponse, req: HTTPRequest): boolean
 /**
  * Headers that must not be replayed. Hop-by-hop headers (RFC 7230 §6.1); `content-encoding` and
  * `content-length`, because the stored body is decoded and Chrome recomputes the length; and
- * `set-cookie`, because the cookies are copied into the variant's context explicitly rather than
- * trusted to a fulfilled response — the same list the resource cache applies to a replayed asset.
+ * `set-cookie`, because no cookie crosses variants (see the module comment — Chrome would store it,
+ * which is exactly why it has to be stripped). The same list the resource cache applies to a
+ * replayed asset.
  */
 const NON_REPLAYABLE = new Set([
 	'connection',
@@ -152,24 +156,6 @@ export const toRespondPayload = (doc: CapturedDocument) => {
 	headers[DOCUMENT_REUSE_HEADER] = '1';
 	return { status: doc.status, headers, body: doc.body };
 };
-
-/**
- * The cookies of a context, projected onto the fields `BrowserContext.setCookie` accepts. A
- * `Cookie` as read back carries bookkeeping (`size`, `session`, source scheme/port, partition key)
- * that is not a parameter; a projection keeps the copy honest across Puppeteer versions rather than
- * hoping unknown fields are ignored.
- */
-export const portableCookies = (cookies: Cookie[]): CookieData[] =>
-	cookies.map((cookie) => ({
-		name: cookie.name,
-		value: cookie.value,
-		domain: cookie.domain,
-		path: cookie.path,
-		expires: cookie.expires,
-		httpOnly: cookie.httpOnly,
-		secure: cookie.secure,
-		sameSite: cookie.sameSite,
-	}));
 
 // ── the sampled structural comparison ────────────────────────────────────────────────────────────
 

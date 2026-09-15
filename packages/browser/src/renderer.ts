@@ -5,13 +5,7 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
-import {
-	DOCUMENT_REUSE_HEADER,
-	documentDivergence,
-	isReusableDocument,
-	portableCookies,
-	toRespondPayload,
-} from './documentReuse.js';
+import { DOCUMENT_REUSE_HEADER, documentDivergence, isReusableDocument, toRespondPayload } from './documentReuse.js';
 
 const noop = () => {};
 
@@ -88,17 +82,13 @@ const renderer: Renderer = async (page, job) => {
 
 	// Document reuse (see documentReuse.ts). `documentCache` is shared by every variant of a
 	// multi-device job: the first variant to receive a reusable document fills it, and later variants
-	// answer their navigation from it. The cookies the document set travel with it: they are copied
-	// into THIS variant's (fresh) context before navigation, so its scripts start where a visitor who
-	// received that document would. A sample job copies nothing and replays nothing — it fetches cold,
-	// so the comparison is against a document the origin actually produced for this device.
+	// answer their navigation from it — with an EMPTY cookie jar, as every variant always has: no cookie
+	// crosses variants. A sample job replays nothing; it fetches cold, so the comparison is against a
+	// document the origin actually produced for this device.
 	const documentCache = job.documentCache;
 	const replayDocument = documentCache?.canReplay ? documentCache.entry : null;
-	if (replayDocument?.cookies.length) {
-		setupPromises.push(page.browserContext().setCookie(...replayDocument.cookies));
-	}
 	// The first variant's capture of its own document, settled before navigation returns so the entry
-	// is complete — cookies included — before the next variant starts.
+	// is complete before the next variant starts.
 	let documentCapture: Promise<void> | null = null;
 
 	if (profile.userAgent) {
@@ -208,13 +198,12 @@ const renderer: Renderer = async (page, job) => {
 				}
 				if (documentCache && !headers[DOCUMENT_REUSE_HEADER] && isReusableDocument(res, req)) {
 					if (!documentCache.entry) {
-						// The first variant: keep this document, and the cookies it set, for the next one.
+						// The first variant: keep this document for the next one.
 						documentCapture = res
 							.buffer()
-							.then(async (body) => {
+							.then((body) => {
 								if (documentCache.entry) return;
-								const cookies = portableCookies(await page.browserContext().cookies());
-								documentCache.entry = { url: res.url(), status, headers, body, cookies, deviceType };
+								documentCache.entry = { url: res.url(), status, headers, body, deviceType };
 							})
 							.catch(noop);
 					} else if (documentCache.sample) {

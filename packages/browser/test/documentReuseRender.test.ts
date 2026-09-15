@@ -8,11 +8,11 @@ import defaultRenderer from '../dist/renderer.js';
 import { resolveSettings, defaultLaunchOptions } from '../dist/settings.js';
 
 // Document reuse end to end, against a real headless Chrome: a two-device job fetches the document
-// from the origin ONCE, the second variant navigates from the captured copy, the cookies the document
-// set reach the second variant's scripts, and the result says which variant was replayed. Then the
-// two ways reuse is deliberately withheld: a sample job, and a document whose `Vary` names the user
-// agent. The origin records every request it sees, with the Cookie header, so the assertions are about
-// what the origin actually received rather than about the renderer's own bookkeeping.
+// from the origin ONCE, the second variant navigates from the captured copy with an EMPTY cookie jar
+// (no cookie crosses variants), and the result says which variant was replayed. Then the two ways
+// reuse is deliberately withheld: a sample job, and a document whose `Vary` names the user agent. The
+// origin records every request it sees, with the Cookie header, so the assertions are about what the
+// origin actually received rather than about the renderer's own bookkeeping.
 
 type Seen = { path: string; cookie: string | undefined; ua: string | undefined };
 const seen: Seen[] = [];
@@ -122,8 +122,12 @@ test('with reuse on, a two-device job fetches the document once and the second v
 	);
 
 	assert.equal(scripts.length, 2, 'each variant still loads its own scripts');
-	assert.equal(scripts[0].cookie, 'bucket=b7', "the first variant's script call carries the document's cookie");
-	assert.equal(scripts[1].cookie, 'bucket=b7', "so does the second's — the cookie travelled with the document");
+	assert.equal(scripts[0].cookie, 'bucket=b7', "the first variant's script call carries the cookie its document set");
+	assert.equal(
+		scripts[1].cookie,
+		undefined,
+		"the second variant's does NOT: the replayed response carries no Set-Cookie and nothing is copied — no cookie crosses variants"
+	);
 
 	assert.deepEqual(
 		result.variants.map((v) => [v.deviceType, v.outcome, v.documentReused]),
