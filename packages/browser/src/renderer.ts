@@ -5,6 +5,7 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
+import { DOCUMENT_REUSE_HEADER, documentDivergence, isReusableDocument, toRespondPayload } from './documentReuse.js';
 
 const noop = () => {};
 
@@ -79,6 +80,17 @@ const renderer: Renderer = async (page, job) => {
 
 	const setupPromises: Promise<unknown>[] = [page.setRequestInterception(true), page.setViewport(profile.viewport)];
 
+	// Document reuse (see documentReuse.ts). `documentCache` is shared by every variant of a
+	// multi-device job: the first variant to receive a reusable document fills it, and later variants
+	// answer their navigation from it — with an EMPTY cookie jar, as every variant always has: no cookie
+	// crosses variants. A sample job replays nothing; it fetches cold, so the comparison is against a
+	// document the origin actually produced for this device.
+	const documentCache = job.documentCache;
+	const replayDocument = documentCache?.canReplay ? documentCache.entry : null;
+	// The first variant's capture of its own document, settled before navigation returns so the entry
+	// is complete before the next variant starts.
+	let documentCapture: Promise<void> | null = null;
+
 	if (profile.userAgent) {
 		setupPromises.push(page.setUserAgent(profile.userAgent));
 	}
@@ -97,6 +109,15 @@ const renderer: Renderer = async (page, job) => {
 				return;
 			}
 			if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+				if (replayDocument && !job.documentReused) {
+					// Answered from the sibling's document: no origin fetch, no bypass token needed — the
+					// bytes already came through it. Marked so the response handler below does not treat
+					// this as a fresh document to capture.
+					job.documentReused = true;
+					documentCache!.reusedBy.push(deviceType);
+					req.respond(toRespondPayload(replayDocument)).catch(noop);
+					return;
+				}
 				const headers = req.headers();
 
 				for (const [key, value] of Object.entries(config.extraHeaders)) {
@@ -175,6 +196,28 @@ const renderer: Renderer = async (page, job) => {
 					ac.abort();
 					aborted = true;
 				}
+				if (documentCache && !headers[DOCUMENT_REUSE_HEADER] && isReusableDocument(res, req)) {
+					if (!documentCache.entry) {
+						// The first variant: keep this document for the next one.
+						documentCapture = res
+							.buffer()
+							.then((body) => {
+								if (documentCache.entry) return;
+								documentCache.entry = { url: res.url(), status, headers, body, deviceType };
+							})
+							.catch(noop);
+					} else if (documentCache.sample) {
+						// A sample job's later variant: this document came from the origin, so compare it
+						// against the sibling's. Reported by the worker once the job completes.
+						const first = documentCache.entry;
+						res
+							.buffer()
+							.then((body) => {
+								documentCache.divergence = documentDivergence(first.body, body);
+							})
+							.catch(noop);
+					}
+				}
 				return;
 			}
 
@@ -230,6 +273,9 @@ const renderer: Renderer = async (page, job) => {
 		throw markRenderPhase(e, 'navigation');
 	}
 	timings.navTotal = Date.now() - navStart;
+	// Complete the capture before anything else: the next variant may start the moment this render
+	// returns, and it must find the entry whole or absent, never half-filled.
+	if (documentCapture) await documentCapture;
 
 	// A navigation that HTTP-redirected to a different document is not worth settling. The plugin
 	// never serves this render from the job's own key: it either discards the content (destination

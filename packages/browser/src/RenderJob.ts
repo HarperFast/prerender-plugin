@@ -5,6 +5,7 @@ import { settings } from './settings.js';
 import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
+import type { JobDocumentCache } from './documentReuse.js';
 
 // Result-POST failures worth retrying: transient overload/gateway errors. Anything else
 // (e.g. a 4xx) is a bug, not a blip — logged and dropped (the lease expires → re-render).
@@ -116,6 +117,13 @@ export default class RenderJob {
 	deviceType: string;
 	/** See {@link JobConfig.deviceTypes}. Set on the job as CLAIMED; never on a variant. */
 	deviceTypes: string[] | undefined;
+	/**
+	 * The job's shared document, when `documentReuse` is on and this is one variant of a
+	 * multi-device job (set by the worker, read by the renderer). See `src/documentReuse.ts`.
+	 */
+	documentCache: JobDocumentCache | undefined;
+	/** True when this variant's navigation was answered from a sibling's captured document. */
+	documentReused = false;
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
@@ -262,6 +270,9 @@ export default class RenderJob {
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
 			outcome: this.outcome,
+			// Present only when true, so the flat legacy envelope is byte-identical for every render
+			// that did not reuse a document (and an older plugin never sees the key at all).
+			documentReused: this.documentReused || undefined,
 			// One slug for WHY there is no content (see the field doc). The redirect/error
 			// fallbacks are derived here so every no-content result carries a reason without
 			// each producer having to remember to set one.
@@ -347,6 +358,7 @@ export type VariantMetadata = {
 	isIndexable: boolean | undefined;
 	structuredOffers: Array<string | null> | null | undefined;
 	outcome: JobOutcome;
+	documentReused: true | undefined;
 	reason: string | undefined;
 	error: { name: string; message: string; phase: string | undefined } | undefined;
 };

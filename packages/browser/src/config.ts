@@ -343,6 +343,24 @@ export type CacheKeyConfig = {
 	trailingSlash: 'strip' | 'preserve';
 };
 
+/**
+ * Reuse of the main document across the device variants of one job — see `src/documentReuse.ts`
+ * for the whole argument. OFF by default: only the operator can say a site is responsive rather
+ * than adaptive, and replaying desktop markup into a mobile render of an adaptive site caches a page
+ * no mobile visitor is served.
+ */
+export type DocumentReuseConfig = {
+	/** Answer the second and later variants' navigation from the first variant's document. */
+	enabled: boolean;
+	/**
+	 * Every Nth multi-device job fetches its second variant normally and reports how much that
+	 * document differs, structurally, from the one the first variant captured — the running proof
+	 * that the site is still responsive. 0 disables sampling. Observability only: a divergent sample
+	 * is logged and counted, never used to switch reuse off (a deploy in progress would trip it).
+	 */
+	sampleEvery: number;
+};
+
 export type PrerenderConfig = {
 	/** Device profiles keyed by the job's `deviceType`; unknown types fall back to `defaultDevice`. */
 	devices: Record<string, DeviceProfile>;
@@ -363,6 +381,7 @@ export type PrerenderConfig = {
 	injectWebComponentsPolyfill: boolean;
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
 	extraHeaders: Record<string, string>;
+	documentReuse: DocumentReuseConfig;
 };
 
 // Built-in defaults — these reproduce the renderer's original hardcoded behavior, so
@@ -410,6 +429,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
+	documentReuse: { enabled: false, sampleEvery: 0 },
 });
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -436,7 +456,15 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	// so `{ postProcess: null }` survives to here intact. Assert the blocks are objects once, up
 	// front, so that surfaces as a named config error rather than as a TypeError from whichever
 	// check happened to touch the block first.
-	for (const name of ['devices', 'navigation', 'scroll', 'block', 'postProcess', 'canonical'] as const) {
+	for (const name of [
+		'devices',
+		'navigation',
+		'scroll',
+		'block',
+		'postProcess',
+		'canonical',
+		'documentReuse',
+	] as const) {
 		const block: unknown = config[name];
 		if (!block || typeof block !== 'object' || Array.isArray(block)) {
 			throw new Error(`prerender config: \`${name}\` must be an object`);
@@ -472,6 +500,12 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 		if (typeof config.navigation[field] !== 'number' || config.navigation[field] < 0) {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
 		}
+	}
+	if (typeof config.documentReuse.enabled !== 'boolean') {
+		throw new Error('prerender config: documentReuse.enabled must be a boolean');
+	}
+	if (!Number.isInteger(config.documentReuse.sampleEvery) || config.documentReuse.sampleEvery < 0) {
+		throw new Error('prerender config: documentReuse.sampleEvery must be a non-negative integer (0 = no sampling)');
 	}
 	// Scroll step is a positive fraction of the viewport; reject non-numbers / non-positive
 	// (config is API- and JSON-supplied). scrollPass additionally floors pathologically small
