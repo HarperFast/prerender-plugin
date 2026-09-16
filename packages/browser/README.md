@@ -559,17 +559,19 @@ pages churn between two renders seconds apart); a differing offer set is.
 
 It also answers the question those per-device comparisons structurally cannot: **did mobile stay
 mobile?** A replayed render is measured against three distances taken on the same page in the same
-minute — its own control, the nearest other device's control, and the **churn floor**: the same
-measurement for a variant that replayed nothing and therefore fetched its own document both times. It
+minute — its own control, the nearest other device's control, and **that device's own churn floor**,
+which is why the run renders each URL three times: two reuse-off passes (whose distance from each
+other is churn and nothing else) and one with reuse on. It
 must sit closer to the churn floor than to its sibling (`device=own 0.080 vs sibling 0.238, churn
 0.071`, `identity` on the result). A replayed variant that had become its sibling fails this even
 though its offers, status and outcome all agree, because the sibling's page is a perfectly valid page.
 
 The floor is what makes this usable on a live site. An absolute "kept its own markup" measure was
 tried first and failed the control — recommendation rails pick different products on every render, so
-even a variant that replays nothing loses most of its distinctive markup between two renders. Catalog
-pages here churn 0.23 while their two devices differ by 0.28, so a fixed threshold would be either
-blind or crying wolf. Where the devices do not differ by more than the churn, the result is reported
+even a variant that replays nothing loses most of its distinctive markup between two renders. Nor is
+one shared floor enough: on one catalog page two desktop renders differed by 0.172 while two mobile
+renders differed by 0.024, so judging mobile against desktop's noise invents a failure in one
+direction and hides one in the other. Where the devices do not differ by more than the churn, the result is reported
 `INCONCLUSIVE` rather than passed or failed, and the variant that fetched its own document is never
 judged — it is the control. This is the only comparison here that crosses devices, and it crosses them
 to prove they stayed apart.

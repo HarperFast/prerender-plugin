@@ -91,11 +91,12 @@ export type DeviceIdentity = {
 	/** Divergence from the nearest other device's control; null when there is no other device. */
 	crossRatio: number | null;
 	/**
-	 * The same measurement for a variant that was NOT replayed — it fetched its own document in both
-	 * runs, so its number is pure page churn, taken on the same page in the same minute. The floor any
-	 * honest verdict has to be read against.
+	 * THIS DEVICE'S own churn: the distance between two reuse-off renders of it, taken on the same page
+	 * in the same minute. Page churn and nothing else, and the floor any honest verdict is read
+	 * against. Per device, because churn is not shared — one catalog page churned 0.172 on desktop and
+	 * 0.024 on mobile in the same run.
 	 */
-	churnRatio: number | null;
+	churnRatio: number;
 	/** How far apart the two CONTROLS are — how distinguishable these devices are on this page at all. */
 	deviceGap: number | null;
 	/** `(churnRatio + crossRatio) / 2` — the line between "still itself" and "became its sibling". */
@@ -196,7 +197,7 @@ const sameOffers = (a: VariantSnapshot['structuredOffers'], b: VariantSnapshot['
  * fixed threshold is either blind or crying wolf, and the same number means different things page to
  * page. So the verdict is: a replayed render must sit closer to the churn floor than to its sibling.
  */
-const deviceIdentity = (own: string, others: string[], reused: string, churnRatio: number | null): DeviceIdentity => {
+const deviceIdentity = (own: string, others: string[], reused: string, churnRatio: number): DeviceIdentity => {
 	const ownRatio = documentDivergence(own, reused).ratio;
 	const crossRatios = others.map((other) => documentDivergence(other, reused).ratio);
 	const crossRatio = crossRatios.length ? Math.min(...crossRatios) : null;
@@ -205,13 +206,13 @@ const deviceIdentity = (own: string, others: string[], reused: string, churnRati
 	// devices were ever telling apart.
 	const gaps = others.map((other) => documentDivergence(own, other).ratio);
 	const deviceGap = gaps.length ? Math.min(...gaps) : null;
-	const conclusive = deviceGap !== null && churnRatio !== null && deviceGap > churnRatio;
+	const conclusive = deviceGap !== null && deviceGap > churnRatio;
 	return {
 		ownRatio,
 		crossRatio,
 		churnRatio,
 		deviceGap,
-		threshold: crossRatio !== null && churnRatio !== null ? (churnRatio + crossRatio) / 2 : null,
+		threshold: crossRatio !== null ? (churnRatio + crossRatio) / 2 : null,
 		conclusive,
 	};
 };
@@ -273,18 +274,17 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 	const results: ReuseParityResult[] = [];
 	try {
 		for (const url of urls) {
-			// Control first and reuse second, back to back, so a site change between them is as
-			// unlikely as it can be made without freezing the origin.
+			// TWO control passes, then the reuse pass — all back to back, so a site change between them is
+			// as unlikely as it can be made without freezing the origin.
+			//
+			// The second control is what makes the identity verdict trustworthy: two reuse-OFF renders of
+			// THE SAME DEVICE differ only by page churn, so each device brings its own floor. A shared
+			// floor is not good enough — measured on one catalog page, two desktop renders differed by
+			// 0.172 while two mobile renders differed by 0.024, and judging mobile against desktop's noise
+			// (or the reverse) invents a failure in one direction and hides one in the other.
+			const priorControl = await renderJobVariants(browser, url, devices, renderFn, { reuse: false, pin });
 			const control = await renderJobVariants(browser, url, devices, renderFn, { reuse: false, pin });
 			const reused = await renderJobVariants(browser, url, devices, renderFn, { reuse: true, pin });
-
-			// THE CHURN FLOOR, measured in this same run: a variant that replayed nothing fetched its own
-			// document in both runs, so the distance between its two renders is page churn and nothing
-			// else. Every identity verdict below is read against it.
-			const churn = reused
-				.map((v, i) => (v.documentReused ? null : documentDivergence(control[i].content ?? '', v.content ?? '').ratio))
-				.filter((r): r is number => r !== null);
-			const churnRatio = churn.length ? Math.max(...churn) : null;
 
 			const perDevice = devices.map((deviceType, i) => {
 				const a = snapshotOf(control[i], false);
@@ -296,7 +296,7 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 					control[i].content ?? '',
 					control.filter((_, j) => j !== i).map((v) => v.content ?? ''),
 					reused[i].content ?? '',
-					churnRatio
+					documentDivergence(priorControl[i].content ?? '', control[i].content ?? '').ratio
 				);
 				// Only a REPLAYED variant can lose its identity to reuse: the one that fetched its own document
 				// is the control by construction, and judging it produces exactly the false failure that made the
@@ -338,8 +338,8 @@ export function formatReuseParity(results: ReuseParityResult[]): string {
 				: d.identity.crossRatio === null
 					? 'n/a (single device)'
 					: !d.identity.conclusive
-						? `INCONCLUSIVE (own ${d.identity.ownRatio.toFixed(3)}, sibling ${d.identity.crossRatio.toFixed(3)}, churn ${(d.identity.churnRatio ?? 0).toFixed(3)} — the devices do not differ above the churn)`
-						: `own ${d.identity.ownRatio.toFixed(3)} vs sibling ${d.identity.crossRatio.toFixed(3)}, churn ${(d.identity.churnRatio ?? 0).toFixed(3)}${d.identityHeld ? '' : ' — NOT ITSELF'}`;
+						? `INCONCLUSIVE (own ${d.identity.ownRatio.toFixed(3)}, sibling ${d.identity.crossRatio.toFixed(3)}, churn ${d.identity.churnRatio.toFixed(3)} — the devices do not differ above the churn)`
+						: `own ${d.identity.ownRatio.toFixed(3)} vs sibling ${d.identity.crossRatio.toFixed(3)}, churn ${d.identity.churnRatio.toFixed(3)}${d.identityHeld ? '' : ' — NOT ITSELF'}`;
 			lines.push(
 				`   ${d.pass ? 'ok  ' : 'DIFF'} ${d.deviceType.padEnd(8)} ` +
 					`offers=${d.offersMatch ? 'same' : 'DIFFERENT'} ` +
