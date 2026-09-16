@@ -109,17 +109,22 @@ const runPass = async ({
 	rows,
 	answers,
 	stored = {},
+	// Per-URL stored rule fingerprint: absent = the current rule's (the steady state), null = a row
+	// from before fingerprints existed, any other string = a baseline taken under another rule.
+	fingerprints = {},
 	dryRun = false,
 	maxTriggers = 100,
 	owners = {},
 	...overrides
 }) => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const rules = compileProbeRules(RULES_RAW);
 	const written = [];
+	const writeOptions = [];
 	const triggered = [];
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
-		rules: compileProbeRules(RULES_RAW),
+		rules,
 		ownerOf: (url) => owners[url] ?? 'node-a',
 		hostname: 'node-a',
 		probe: async (rule, url) => {
@@ -128,8 +133,18 @@ const runPass = async ({
 			return answer ?? null;
 		},
 		// The port returns the whole baseline now — `probedAt` is what the freshness skip reads.
-		read: async (url) => (stored[url] === undefined ? null : { signature: stored[url], probedAt: NaN }),
-		write: async (url, signature) => written.push({ url, signature }),
+		read: async (url) =>
+			stored[url] === undefined
+				? null
+				: {
+						signature: stored[url],
+						probedAt: NaN,
+						fingerprint: url in fingerprints ? fingerprints[url] : rules[0].fingerprint,
+					},
+		write: async (url, signature, options) => {
+			written.push({ url, signature });
+			writeOptions.push({ url, ...options });
+		},
 		trigger: async (target) => triggered.push(target.url),
 		dryRun,
 		maxTriggers,
@@ -138,7 +153,7 @@ const runPass = async ({
 		pause: async () => {},
 		...overrides,
 	});
-	return { stats, written, triggered };
+	return { stats, written, writeOptions, triggered, rules };
 };
 
 const URL_A = 'https://example.com/product/prd-a/';
@@ -180,6 +195,51 @@ test('the state machine: seed, unchanged, changed', async () => {
 	assert.deepEqual(triggered, [URL_C]);
 	// The changed URL's signature is written only after its trigger landed.
 	assert.deepEqual(written.map((w) => w.url).sort(), [URL_A, URL_C].sort());
+});
+
+test('a baseline taken under ANOTHER rule re-baselines: stored, not compared, not triggered', async () => {
+	const { stats, written, writeOptions, triggered, rules } = await runPass({
+		rows: [row(URL_A), row(URL_B)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]' },
+		fingerprints: { [URL_A]: 'deadbeef' }, // B carries the current rule's fingerprint
+		answers: { [URL_A]: '[2]', [URL_B]: '[2]' },
+	});
+	// A: a rule edit produced a differently-shaped signature — that is not a content change.
+	// B: the same new value under the same rule IS a change.
+	assert.equal(stats.rebaselined, 1);
+	assert.equal(stats.changed, 1);
+	assert.equal(stats.triggered, 1);
+	assert.deepEqual(triggered, [URL_B]);
+	assert.deepEqual(written.map((w) => w.url).sort(), [URL_A, URL_B].sort());
+	// Every baseline write carries the rule that made it, so the NEXT edit is recognised too.
+	assert.ok(writeOptions.every((w) => w.fingerprint === rules[0].fingerprint));
+	assert.equal(stats.probed, stats.seeded + stats.rebaselined + stats.unchanged + stats.changed + stats.failed);
+});
+
+test('a pre-fingerprint row is compared as usual and stamped once when quiet', async () => {
+	const { stats, written, writeOptions, triggered, rules } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		fingerprints: { [URL_A]: null, [URL_B]: null }, // legacy rows; C is already stamped
+		answers: { [URL_A]: '[1]', [URL_B]: '[2]', [URL_C]: '[1]' },
+	});
+	// A: unchanged, legacy -> one stamp write. B: changed, legacy -> compared like any row (a
+	// legacy baseline was taken by the rule in force). C: unchanged and stamped -> no write at all,
+	// the converged-corpus guarantee.
+	assert.equal(stats.unchanged, 2);
+	assert.equal(stats.changed, 1);
+	assert.equal(stats.rebaselined, 0);
+	assert.deepEqual(triggered, [URL_B]);
+	assert.deepEqual(written.map((w) => w.url).sort(), [URL_A, URL_B].sort());
+	assert.ok(writeOptions.every((w) => w.fingerprint === rules[0].fingerprint));
+});
+
+test('the canary verdict ignores re-baselined rows, like seeds', async () => {
+	const verdict = changeProbe.canaryVerdict(
+		{ changed: 0, unchanged: 0, rebaselined: 500, seeded: 0 },
+		{ threshold: 0.1, minSample: 10 }
+	);
+	assert.deepEqual(verdict, { tripped: false, compared: 0, fraction: null });
 });
 
 test('dry run counts and re-baselines but never triggers', async () => {
@@ -1125,6 +1185,47 @@ test('scheduler: mode is live — switching re-arms rather than leaving the old 
 
 	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 0, startJitter: 1 });
 	assert.equal(changeProbe.probeTimerState().armedSweep, 60_000, 'and back');
+
+	t.mock.timers.reset();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('scheduler: anchored mode arms a daily timer keyed on the anchor, runs no boot sweep, and re-arms on edit', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'anchored',
+		anchorTime: '03:00',
+		anchorTimezone: 'UTC',
+		startDelay: 0,
+		startJitter: 1,
+	});
+	changeProbe.startChangeProbeScheduler();
+	assert.equal(changeProbe.probeTimerState().armedSweep, 'anchored:03:00|UTC');
+	const status = await changeProbe.changeProbeStatus();
+	assert.ok(status.sweep.nextAnchoredRunAt, 'the next run is published for the admin surface');
+	const next = new Date(status.sweep.nextAnchoredRunAt);
+	assert.equal(next.getUTCHours(), 3);
+	assert.equal(next.getUTCMinutes(), 0);
+	assert.ok(next.getTime() > Date.now() && next.getTime() - Date.now() <= 24 * 60 * 60 * 1000);
+	// No boot sweep: with startDelay 0 an interval/continuous boot would have started a pass by now.
+	assert.equal(status.sweep.running, false);
+
+	// Editing the anchor is a mode change to the scheduler: the marker moves, the timer re-arms.
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'anchored',
+		anchorTime: '04:30',
+		anchorTimezone: 'UTC',
+		startDelay: 0,
+		startJitter: 1,
+	});
+	assert.equal(changeProbe.probeTimerState().armedSweep, 'anchored:04:30|UTC');
+
+	// Back to interval mode (not continuous, which would start a pass that outlives the test).
+	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 0, startJitter: 1 });
+	assert.equal(changeProbe.probeTimerState().armedSweep, 60_000);
 
 	t.mock.timers.reset();
 	await applyProbeConfig({ enabled: false });

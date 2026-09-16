@@ -9,7 +9,8 @@
  *
  * DELIBERATELY DEPENDENCY-FREE. config.js reports rule problems from `collectConfigWarnings`,
  * which is a pure function of config — it can import this module only because this module imports
- * nothing of the runtime (no config, no tables, no globals). Keep it that way.
+ * nothing of the runtime (no config, no tables, no globals). Keep it that way. (`./hash.js` is a
+ * pure function too; that is the one import.)
  *
  * WHY A SIGNATURE AND NOT A DIFF. The probe never needs to know WHAT changed, only WHETHER the
  * watched fields changed — so the observation is reduced to a canonical string
@@ -23,6 +24,8 @@
  * this rule a shape change would flip every signature in the corpus at once and mass-trigger
  * re-renders of pages that did not change.
  */
+
+import { fnv1a32 } from './hash.js';
 
 const VALID_SOURCES = new Set(['request', 'document']);
 // No HEAD: extraction parses the response body, and a HEAD probe has none — it would validate
@@ -182,7 +185,33 @@ const compileRule = (raw, index, warn) => {
 							`extract (0-${extract.length - 1}) — pageCheck ignored`
 					);
 				} else {
-					pageCheck = { priceFrom: pc.priceFrom, availableFrom: pc.availableFrom };
+					pageCheck = { priceFrom: pc.priceFrom, availableFrom: pc.availableFrom, vocabulary: null };
+					// The rule's own availability words, on top of the built-in schema.org/retail sets.
+					// Tokenized the same way the endpoint's values will be, so "In Stock" and "IN_STOCK" in
+					// config meet "in stock" in a response. Invalid lists drop the vocabulary, not pageCheck:
+					// the built-in words still apply.
+					const words = (key) => {
+						const list = pc[key];
+						if (list === undefined || list === null) return [];
+						if (!Array.isArray(list) || list.some((w) => typeof w !== 'string' || !availabilityToken(w))) {
+							warn(`change-probe ${label}: pageCheck.${key} must be an array of availability words — ignored`);
+							return null;
+						}
+						return list.map(availabilityToken);
+					};
+					const available = words('availableValues');
+					const unavailable = words('unavailableValues');
+					if (available && unavailable && (available.length || unavailable.length)) {
+						const overlap = available.filter((w) => unavailable.includes(w));
+						if (overlap.length) {
+							warn(
+								`change-probe ${label}: pageCheck.availableValues and .unavailableValues both list ` +
+									`${overlap.join(', ')} — vocabulary ignored`
+							);
+						} else {
+							pageCheck.vocabulary = { available: new Set(available), unavailable: new Set(unavailable) };
+						}
+					}
 				}
 			}
 		} else if (pc.enabled) {
@@ -194,7 +223,7 @@ const compileRule = (raw, index, warn) => {
 		}
 	}
 
-	return {
+	const rule = {
 		label,
 		pathPattern,
 		patternSource: raw.pathPattern,
@@ -205,6 +234,49 @@ const compileRule = (raw, index, warn) => {
 		statusSignals,
 		pageCheck,
 	};
+	rule.fingerprint = ruleFingerprint(rule);
+	return rule;
+};
+
+/**
+ * What a rule OBSERVES, hashed: the endpoint, how it is asked, which values are taken from the
+ * answer, and which statuses stand in for values. Stored beside every baseline (ProbeState.
+ * ruleFingerprint) so the sweep can tell "the origin changed" from "the rule changed".
+ *
+ * WHY THIS EXISTS. A stored signature is only comparable to an observation made THE SAME WAY.
+ * Edit a rule's extract list, move it to another endpoint, add a header that changes which
+ * backend answers — and the next probe of every matched URL produces a differently-shaped
+ * signature. Without this, that read as 100% of the corpus changing in one pass: every URL a
+ * spurious re-render (bounded by maxTriggersPerSweep, so most of them deferred and retried
+ * forever), and the canary a certain trip, invalidating the rule's whole scope over a config
+ * edit. The only safe way to change a rule was a full dry-run cycle first. With the fingerprint,
+ * a mismatch re-baselines that URL — observation stored, nothing compared, nothing triggered,
+ * and it does not count toward the canary's verdict — so a rule edit costs one pass of blindness
+ * for the edited rule and nothing else.
+ *
+ * WHAT IS IN IT, AND WHAT IS NOT. Everything that shapes the observed value: source, URL
+ * template, method, headers (a cookie or header can route to a different backend), body,
+ * extract paths, status signals (a signal is a value). NOT the label, the pathPattern (which
+ * URLs match, not what is seen of them), invalidateScope or pageCheck (how an observation is
+ * acted on, not what it is). Header keys are sorted so a reordered YAML map is not a new rule.
+ */
+export const ruleFingerprint = (rule) => {
+	const headers = Object.fromEntries(
+		Object.entries(rule.request?.headers ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+	);
+	const observed =
+		rule.source === 'request'
+			? {
+					source: 'request',
+					url: rule.request.urlTemplate,
+					method: rule.request.method,
+					headers,
+					body: rule.request.body ?? null,
+					extract: rule.extract,
+					signals: rule.statusSignals,
+				}
+			: { source: 'document', headers, signals: rule.statusSignals };
+	return fnv1a32(JSON.stringify(observed)).toString(16).padStart(8, '0');
 };
 
 /**
@@ -231,11 +303,35 @@ const canonicalPrice = (value) => {
  * endpoint on EVERY pass and hard-expires every matched page, forever — the one failure mode this
  * feature must not have — so an unrecognized vocabulary degrades to "detects nothing" instead.
  */
-const AVAILABLE = new Set(['instock', 'instoreonly', 'onlineonly', 'limitedavailability']);
-const UNAVAILABLE = new Set(['outofstock', 'soldout', 'discontinued']);
-const availabilityVerdict = (raw) => {
+const AVAILABLE = new Set(['instock', 'instoreonly', 'onlineonly', 'limitedavailability', 'available']);
+const UNAVAILABLE = new Set(['outofstock', 'soldout', 'discontinued', 'unavailable']);
+
+/**
+ * A vocabulary token: the last path segment of a schema.org URL form, lower-cased, with every
+ * separator dropped — so `https://schema.org/InStock`, `InStock`, `IN_STOCK`, `in-stock` and the
+ * plain retail phrase `In Stock` all reduce to `instock`. Endpoints spell availability every one
+ * of these ways; the plugin is not the place to know which retailer uses which.
+ */
+export const availabilityToken = (raw) =>
+	String(raw)
+		.split('/')
+		.filter(Boolean)
+		.pop()
+		?.toLowerCase()
+		.replace(/[^a-z0-9]/g, '') ?? '';
+
+/**
+ * The verdict for one availability word: true, false, or null for no verdict. `vocabulary` is a
+ * rule's own `{ available, unavailable }` token sets (pageCheck.availableValues /
+ * unavailableValues), consulted BEFORE the built-in schema.org/retail sets so an operator can
+ * both extend the vocabulary and override a built-in reading for their endpoint.
+ */
+const availabilityVerdict = (raw, vocabulary = null) => {
 	if (typeof raw !== 'string') return null;
-	const token = raw.split('/').filter(Boolean).pop()?.toLowerCase() ?? '';
+	const token = availabilityToken(raw);
+	if (!token) return null;
+	if (vocabulary?.available.has(token)) return true;
+	if (vocabulary?.unavailable.has(token)) return false;
 	if (AVAILABLE.has(token)) return true;
 	if (UNAVAILABLE.has(token)) return false;
 	return null;
@@ -277,21 +373,46 @@ export const pageClaimFromOffers = (flat) => {
 };
 
 /**
+ * The endpoint's availability field as a verdict. Three shapes are readable, everything else is
+ * NO claim (null) — a field this plugin cannot read must degrade to "detects nothing", never to
+ * a guess that disagrees with every page on every pass:
+ *
+ *   boolean (or 'true'/'false')   the verdict itself
+ *   string                        an availability word, read by `availabilityVerdict` — the
+ *                                 schema.org forms, the plain retail phrases ("In Stock",
+ *                                 "Out of Stock", "Sold Out") and the rule's own vocabulary
+ *   array (a `[*]` projection)    per-variant words: in stock when ANY variant is, out of stock
+ *                                 only when every readable variant is and none is unreadable —
+ *                                 the same reduction `pageClaimFromOffers` applies to the page's
+ *                                 offers, so the two sides answer the same question
+ */
+const availabilityClaim = (raw, vocabulary) => {
+	if (raw === true || raw === 'true') return true;
+	if (raw === false || raw === 'false') return false;
+	if (typeof raw === 'string') return availabilityVerdict(raw, vocabulary);
+	if (Array.isArray(raw)) {
+		let sawAvailable = false;
+		let sawUnavailable = false;
+		let sawUnrecognized = false;
+		for (const item of raw) {
+			const verdict = availabilityClaim(item, vocabulary);
+			if (verdict === true) sawAvailable = true;
+			else if (verdict === false) sawUnavailable = true;
+			else if (item !== null && item !== undefined) sawUnrecognized = true;
+		}
+		return sawAvailable ? true : sawUnavailable && !sawUnrecognized ? false : null;
+	}
+	return null;
+};
+
+/**
  * The same claim shape, projected from the values the probe just extracted from the endpoint.
- * Availability is a claim only for an unambiguous boolean (true/'true'/false/'false') — any other
- * type is a mapping the operator got wrong or a field this plugin cannot read, and guessing turns
- * every probe of every page into a disagreement. Null when neither field yields a claim.
+ * Null when neither field yields a claim.
  */
 export const apiClaimOf = (values, pageCheck) => {
 	if (!pageCheck || !Array.isArray(values)) return null;
 	const price = canonicalPrice(values[pageCheck.priceFrom]);
-	const availableRaw = values[pageCheck.availableFrom];
-	const available =
-		availableRaw === true || availableRaw === 'true'
-			? true
-			: availableRaw === false || availableRaw === 'false'
-				? false
-				: null;
+	const available = availabilityClaim(values[pageCheck.availableFrom], pageCheck.vocabulary ?? null);
 	if (price === null && available === null) return null;
 	return JSON.stringify([price === null ? [] : [price], available]);
 };
@@ -413,13 +534,36 @@ export const substituteTemplate = (template, match) =>
 
 /**
  * The value at a dot/bracket path (`payload.products[0].prices[0].salePrice`) or undefined.
- * Tokens are plain property names and `[N]` numeric indexes; anything unreachable is undefined
- * rather than a throw, because a probe response missing a branch is data, not a bug.
+ * Tokens are plain property names, `[N]` numeric indexes and `[*]` projections; anything
+ * unreachable is undefined rather than a throw, because a probe response missing a branch is
+ * data, not a bug.
+ *
+ * `[*]` projects the REST of the path over every element of an array (`SKUS[*].availability` ->
+ * `["In Stock", "Out of Stock", ...]`), positionally: element k of the result is element k of the
+ * array, with an unreachable branch as null so a variant that lost a field does not shift the
+ * others. Order is the endpoint's — a reorder reads as a change, exactly like a reordered array
+ * value in any other extracted field. This is how a rule watches per-variant state without
+ * signing the whole variant object, whose other fields (inventory counters, store data) move
+ * without the page moving.
  */
-export const valueAtPath = (value, path) => {
+export const valueAtPath = (value, path) => walkPath(value, String(path).match(PATH_TOKEN) ?? [], 0);
+
+// `[*]` and `[N]` are tried BEFORE the bare-name alternative: `*` and digits are legal name
+// characters to that alternative, so ordering it first would tokenize `[*]` as the name `*`.
+const PATH_TOKEN = /\[\*\]|\[\d+\]|[^.[\]]+/g;
+
+const walkPath = (value, tokens, from) => {
 	let current = value;
-	for (const token of String(path).match(/[^.[\]]+|\[\d+\]/g) ?? []) {
+	for (let i = from; i < tokens.length; i++) {
 		if (current === null || current === undefined) return undefined;
+		const token = tokens[i];
+		if (token === '[*]') {
+			if (!Array.isArray(current)) return undefined;
+			return current.map((element) => {
+				const projected = walkPath(element, tokens, i + 1);
+				return projected === undefined ? null : projected;
+			});
+		}
 		const key = token.startsWith('[') ? Number(token.slice(1, -1)) : token;
 		current = current[key];
 	}

@@ -27,6 +27,8 @@ import {
 	pageClaimFromOffers,
 	apiClaimOf,
 	claimsDisagree,
+	ruleFingerprint,
+	availabilityToken,
 } from '../src/util/changeProbeSpec.js';
 
 const REQUEST_RULE = {
@@ -296,7 +298,7 @@ test('pageCheck compiles only with in-bounds indices, and only for source "reque
 		extract: ['a', 'b', 'c', 'd'],
 	};
 	const ok = compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 } }]);
-	assert.deepEqual(ok[0].pageCheck, { priceFrom: 2, availableFrom: 3 });
+	assert.deepEqual(ok[0].pageCheck, { priceFrom: 2, availableFrom: 3, vocabulary: null });
 
 	// out of bounds -> dropped whole, rule survives (a half-applied mapping compares the wrong column)
 	const oob = compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 2, availableFrom: 9 } }]);
@@ -420,12 +422,155 @@ test('apiClaimOf projects through the mapping; absent mapped fields yield no cla
 	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'false'], pc)), [['35.99'], false]);
 	assert.equal(apiClaimOf([null, null, null, null], pc), null);
 	assert.equal(apiClaimOf([1, 2, 3, true], null), null);
-	// A non-boolean availability field (a count, a status string) is a mapping the operator got
-	// wrong or a shape the plugin cannot read — availability becomes NO claim rather than a guess
-	// that would disagree with every page on every pass. Price alone still projects.
-	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'IN_STOCK'], pc)), [['35.99'], null]);
+	// An availability WORD is a claim: endpoints spell it every way (schema.org form, constant
+	// case, the plain retail phrase) and all of them reduce to one token.
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'IN_STOCK'], pc)), [['35.99'], true]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'In Stock'], pc)), [['35.99'], true]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'Out of Stock'], pc)), [['35.99'], false]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'Sold Out'], pc)), [['35.99'], false]);
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'https://schema.org/InStock'], pc)), [['35.99'], true]);
+	// A word outside the vocabulary, or a non-word (a count), is a shape the plugin cannot read —
+	// availability becomes NO claim rather than a guess that would disagree with every page on
+	// every pass. Price alone still projects.
+	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 'PreOrder'], pc)), [['35.99'], null]);
 	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, 7], pc)), [['35.99'], null]);
-	assert.equal(apiClaimOf([null, null, null, 'IN_STOCK'], pc), null);
+	assert.equal(apiClaimOf([null, null, null, 'Coming Soon'], pc), null);
+	// A `[*]` projection: in stock when ANY variant is, out only when every readable one is and
+	// none is unreadable — the reduction the page's offers get, so both sides answer one question.
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'In Stock']], pc)), [['3.00'], true]);
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'Out of Stock']], pc)), [['3.00'], false]);
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'PreOrder']], pc)), [['3.00'], null]);
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', null]], pc)), [['3.00'], false]);
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, []], pc)), [['3.00'], null]);
+});
+
+test('apiClaimOf consults the rule vocabulary before the built-in words', () => {
+	const pc = {
+		priceFrom: 0,
+		availableFrom: 1,
+		vocabulary: { available: new Set(['ships']), unavailable: new Set(['nope', 'instock']) },
+	};
+	assert.deepEqual(JSON.parse(apiClaimOf([9, 'Ships!'], pc)), [['9.00'], true]);
+	assert.deepEqual(JSON.parse(apiClaimOf([9, 'nope'], pc)), [['9.00'], false]);
+	// The rule's word beats the built-in reading — an endpoint may use a schema.org-looking word
+	// with its own meaning, and only the operator knows.
+	assert.deepEqual(JSON.parse(apiClaimOf([9, 'InStock'], pc)), [['9.00'], false]);
+	// Built-in words still apply for anything the rule did not name.
+	assert.deepEqual(JSON.parse(apiClaimOf([9, 'Sold Out'], pc)), [['9.00'], false]);
+	assert.equal(availabilityToken('https://schema.org/In-Stock'), 'instock');
+	assert.equal(availabilityToken(' OUT_OF_STOCK '), 'outofstock');
+	assert.equal(availabilityToken('///'), '');
+});
+
+test('pageCheck.availableValues / unavailableValues compile into the vocabulary, or drop it alone', () => {
+	const base = {
+		pathPattern: '^/p/',
+		source: 'request',
+		request: { urlTemplate: 'https://x/$1' },
+		extract: ['a', 'b'],
+	};
+	const ok = compileProbeRules([
+		{
+			...base,
+			pageCheck: {
+				enabled: true,
+				priceFrom: 0,
+				availableFrom: 1,
+				availableValues: ['Ships Today', 'IN_STOCK'],
+				unavailableValues: ['Gone'],
+			},
+		},
+	]);
+	assert.deepEqual([...ok[0].pageCheck.vocabulary.available].sort(), ['instock', 'shipstoday']);
+	assert.deepEqual([...ok[0].pageCheck.vocabulary.unavailable], ['gone']);
+	// Neither list -> no vocabulary object, built-in words only.
+	assert.equal(
+		compileProbeRules([{ ...base, pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 } }])[0].pageCheck
+			.vocabulary,
+		null
+	);
+	// A word on both sides is a contradiction: the vocabulary drops, pageCheck stays.
+	const warnings = [];
+	const clash = compileProbeRules(
+		[
+			{
+				...base,
+				pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1, availableValues: ['x'], unavailableValues: ['X'] },
+			},
+		],
+		warnings
+	);
+	assert.deepEqual(clash[0].pageCheck, { priceFrom: 0, availableFrom: 1, vocabulary: null });
+	assert.match(warnings[0], /both list x/);
+	// A malformed list drops the vocabulary, not the page check.
+	const bad = compileProbeRules(
+		[{ ...base, pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1, availableValues: 'yes' } }],
+		warnings
+	);
+	assert.equal(bad[0].pageCheck.vocabulary, null);
+	assert.match(warnings[1], /availableValues must be an array/);
+});
+
+test('valueAtPath [*] projects the rest of the path over an array, positionally', () => {
+	const doc = {
+		variants: [{ a: { s: 'x' } }, { a: {} }, { a: { s: 'z' } }],
+		flat: [1, 2],
+		nested: [{ k: [{ v: 1 }, { v: 2 }] }, { k: [{ v: 3 }] }],
+	};
+	assert.deepEqual(valueAtPath(doc, 'variants[*].a.s'), ['x', null, 'z']);
+	assert.deepEqual(valueAtPath(doc, 'variants[*].a'), [{ s: 'x' }, {}, { s: 'z' }]);
+	assert.deepEqual(valueAtPath(doc, 'flat[*]'), [1, 2]);
+	assert.deepEqual(valueAtPath(doc, 'nested[*].k[*].v'), [[1, 2], [3]]);
+	// Past the end of a branch every element reads null, positionally, never a throw.
+	assert.deepEqual(valueAtPath(doc, 'variants[*].a.s.t'), [null, null, null]);
+	// Not an array -> unreachable, like any missing branch; a signature of all-null then fails the probe.
+	assert.equal(valueAtPath(doc, 'nope[*].a'), undefined);
+	assert.equal(valueAtPath({ variants: 'str' }, 'variants[*].a'), undefined);
+	assert.deepEqual(extractValues(doc, ['variants[*].a.s', 'missing[*]']), [['x', null, 'z'], null]);
+	// `[*]` and `[N]` tokenize as brackets, never as the names `*` / digits.
+	assert.deepEqual(valueAtPath({ '*': 1, 'variants': [{ '*': 2 }] }, 'variants[*].*'), [2]);
+});
+
+test('ruleFingerprint changes with what is observed and with nothing else', () => {
+	const base = {
+		label: 'a',
+		pathPattern: '^/p/(\\d+)',
+		source: 'request',
+		request: {
+			urlTemplate: 'https://x/$1',
+			method: 'GET',
+			headers: { Accept: 'application/json', Referer: 'https://x/' },
+		},
+		extract: ['a', 'b'],
+		statusSignals: [{ status: 400, contains: 'GONE', signature: 'gone' }],
+		invalidateScope: 'all',
+		pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 },
+	};
+	const fp = (raw) => compileProbeRules([raw])[0].fingerprint;
+	assert.match(fp(base), /^[0-9a-f]{8}$/);
+	// Same observation, different bookkeeping: label, pattern, scope, pageCheck, header ORDER.
+	assert.equal(fp({ ...base, label: 'b' }), fp(base));
+	assert.equal(fp({ ...base, pathPattern: '^/q/(\\d+)' }), fp(base));
+	assert.equal(fp({ ...base, invalidateScope: null }), fp(base));
+	assert.equal(fp({ ...base, pageCheck: undefined }), fp(base));
+	assert.equal(
+		fp({ ...base, request: { ...base.request, headers: { Referer: 'https://x/', Accept: 'application/json' } } }),
+		fp(base)
+	);
+	// Different observation: endpoint, method, a header, the body, a path, a signal.
+	assert.notEqual(fp({ ...base, request: { ...base.request, urlTemplate: 'https://y/$1' } }), fp(base));
+	assert.notEqual(fp({ ...base, request: { ...base.request, method: 'POST', body: '{}' } }), fp(base));
+	assert.notEqual(
+		fp({ ...base, request: { ...base.request, headers: { ...base.request.headers, Cookie: 'c=1' } } }),
+		fp(base)
+	);
+	assert.notEqual(fp({ ...base, extract: ['a', 'b', 'c'] }), fp(base));
+	assert.notEqual(fp({ ...base, statusSignals: [] }), fp(base));
+	// Document mode has its own fingerprint, distinct from any request rule.
+	assert.notEqual(fp({ pathPattern: '^/p/' }), fp(base));
+	assert.equal(fp({ pathPattern: '^/p/' }), fp({ pathPattern: '^/other/', label: 'z' }));
+	// Direct call agrees with the compiled value.
+	assert.equal(ruleFingerprint(compileProbeRules([base])[0]), fp(base));
 });
 
 test('claimsDisagree survives a corrupted stored claim instead of ending the sweep', async () => {
