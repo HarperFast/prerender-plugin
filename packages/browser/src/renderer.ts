@@ -5,7 +5,14 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
-import { DOCUMENT_REUSE_HEADER, documentDivergence, isReusableDocument, toRespondPayload } from './documentReuse.js';
+import {
+	DOCUMENT_REUSE_HEADER,
+	cookieHeaderOf,
+	crossableCookies,
+	documentDivergence,
+	isReusableDocument,
+	toRespondPayload,
+} from './documentReuse.js';
 
 const noop = () => {};
 
@@ -87,6 +94,7 @@ const renderer: Renderer = async (page, job) => {
 	// no cookie crosses variants. A sample job's later variants replay nothing; they fetch cold, so the
 	// comparison is against a document the origin actually produced for this device.
 	const documentCache = job.documentCache;
+	const pinnedNames = config.documentReuse.cookies.pin;
 	// The first variant's capture of its own document, settled before navigation returns so the entry
 	// is complete before the next variant starts.
 	let documentCapture: Promise<void> | null = null;
@@ -122,9 +130,12 @@ const renderer: Renderer = async (page, job) => {
 					}
 					if (doc) {
 						job.documentReplayed = true;
-						// The document IS this device's own response (a prefetch) — it gets its cookies. A
-						// sibling's document does not: no cookie crosses variants.
+						// The document IS this device's own response (a prefetch), so it replays that response's
+						// cookies in full. A SIBLING gets only the pinned ones — the cookies that decide which
+						// backend serves the page's API calls, without which the two devices of this URL would
+						// render against two different systems.
 						const ownFetch = doc.deviceType === deviceType;
+						const cookies = ownFetch ? (doc.setCookies ?? []) : crossableCookies(doc, pinnedNames);
 						if (doc.source === 'prefetch') {
 							job.documentPrefetched = true;
 							documentCache.prefetchedBy.push(deviceType);
@@ -133,7 +144,7 @@ const renderer: Renderer = async (page, job) => {
 							job.documentReused = true;
 							documentCache.reusedBy.push(deviceType);
 						}
-						req.respond(toRespondPayload(doc, { withCookies: ownFetch })).catch(noop);
+						req.respond(toRespondPayload(doc, { cookies })).catch(noop);
 						return;
 					}
 				}
@@ -152,6 +163,14 @@ const renderer: Renderer = async (page, job) => {
 						headers[header.toLowerCase()] = job.headers![header];
 					});
 				}
+
+				// A VARIANT THAT FETCHES ITS OWN DOCUMENT CARRIES THE PINNED COOKIES TOO, once a sibling's
+				// document has set them. Otherwise parity would hold only on the replay path, and a sample
+				// job — or any fall-through — would let this device be routed to a different backend than the
+				// one its sibling rendered against: the divergence the pin exists to close, arriving by the
+				// other door.
+				const carried = documentCache?.entry ? crossableCookies(documentCache.entry, pinnedNames) : [];
+				if (carried.length) headers['cookie'] = cookieHeaderOf(carried);
 
 				req.continue({ headers }).catch(noop);
 				return;
@@ -216,17 +235,24 @@ const renderer: Renderer = async (page, job) => {
 					aborted = true;
 				}
 				if (documentCache && !headers[DOCUMENT_REUSE_HEADER] && isReusableDocument(res, req)) {
+					// WHAT THIS DEVICE'S OWN RESPONSE SET, for the pinned names — recorded for EVERY document
+					// this render fetches itself, not only the first. Pinning assumes those cookies are
+					// device-INDEPENDENT; if one of them encodes the device, crossing it would force a sibling
+					// into the wrong experience, which is worse than not pinning at all. On a sample job every
+					// variant fetches cold, so both devices' answers are in hand and the worker compares them.
+					if (pinnedNames.length) documentCache.notePinnedCookies(deviceType, headers['set-cookie']);
 					if (!documentCache.entry) {
 						// The first variant: keep this document for the next one.
 						documentCapture = res
 							.buffer()
 							.then((body) => {
 								if (documentCache.entry) return;
-								// `set-cookie` is dropped HERE, not at replay time: `CapturedDocument.headers`
-								// says it carries none, and a type whose invariant is only maintained by a
-								// filter three call sites away is one refactor from leaking a first variant's
-								// session cookies into its sibling. puppeteer joins multiple values with \n.
-								const { 'set-cookie': _cookies, ...replayable } = headers;
+								// `set-cookie` is separated HERE, not at replay time: `CapturedDocument.headers`
+								// says it carries none, and a type whose invariant is only maintained by a filter
+								// three call sites away is one refactor from leaking a first variant's session
+								// cookies into its sibling. Kept rather than discarded because the PINNED ones have
+								// to cross; which those are is decided per replay. puppeteer joins values with \n.
+								const { 'set-cookie': setCookieHeader, ...replayable } = headers;
 								documentCache.entry = {
 									url: res.url(),
 									status,
@@ -234,6 +260,7 @@ const renderer: Renderer = async (page, job) => {
 									body,
 									deviceType,
 									source: 'navigation',
+									setCookies: setCookieHeader ? setCookieHeader.split('\n') : [],
 								};
 							})
 							.catch(noop);

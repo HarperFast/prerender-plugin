@@ -57,7 +57,7 @@ before(async () => {
 		if (path.startsWith('/page')) {
 			res.writeHead(200, {
 				'content-type': 'text/html; charset=utf-8',
-				'set-cookie': 'bucket=b7; Path=/',
+				'set-cookie': ['bucket=b7; Path=/', 'SESSIONID=s-' + Math.random().toString(36).slice(2) + '; Path=/'],
 				...(vary ? { vary } : {}),
 			});
 			return res.end(
@@ -94,6 +94,7 @@ const configure = (documentReuse: {
 	enabled: boolean;
 	sampleEvery?: number;
 	prefetch?: { enabled: boolean; depth?: number; timeoutMs?: number };
+	cookies?: { pin: string[] };
 }) =>
 	resolveSettings(
 		{
@@ -182,7 +183,11 @@ test('with reuse on, a two-device job fetches the document once and the second v
 	);
 
 	assert.equal(scripts.length, 2, 'each variant still loads its own scripts');
-	assert.equal(scripts[0].cookie, 'bucket=b7', "the first variant's script call carries the cookie its document set");
+	assert.match(
+		scripts[0].cookie ?? '',
+		/bucket=b7/,
+		"the first variant's script call carries the cookies its document set"
+	);
 	assert.equal(
 		scripts[1].cookie,
 		undefined,
@@ -247,10 +252,10 @@ test('prefetch alone: the worker fetches the document, Chrome navigates from it 
 	assert.equal(documents[0].bypass, 'tok-1', 'the prefetch carries the bypass token, as the navigation would');
 	assert.match(documents[0].ua ?? '', /Chrome/, "the desktop profile has no UA of its own, so the browser's was sent");
 	assert.equal(scripts.length, 1);
-	assert.equal(
-		scripts[0].cookie,
-		'bucket=b7',
-		"the variant's script call carries the cookie its (prefetched) document set — its own response, arrived early"
+	assert.match(
+		scripts[0].cookie ?? '',
+		/bucket=b7/,
+		"the variant's script call carries the cookies its (prefetched) document set — its own response, arrived early"
 	);
 	assert.equal(scripts[0].bypass, 'tok-1', 'subresources still tokened');
 	assert.equal(result.outcome, 'rendered');
@@ -266,7 +271,7 @@ test('prefetch with reuse: one fetch by the worker answers both devices — cook
 
 	assert.equal(documents.length, 1, 'ONE document request for two devices');
 	assert.equal(scripts.length, 2, 'each variant still loads its own scripts');
-	assert.equal(scripts[0].cookie, 'bucket=b7', 'the fetching device gets its cookies');
+	assert.match(scripts[0].cookie ?? '', /bucket=b7/, 'the fetching device gets its cookies');
 	assert.equal(scripts[1].cookie, undefined, 'the sibling gets none: no cookie crosses variants');
 	assert.deepEqual(
 		result.variants.map((v) => [v.deviceType, v.outcome, v.documentPrefetched, v.documentReused]),
@@ -301,4 +306,32 @@ test('a sample job under prefetch compares the worker-fetched document against o
 			[undefined, undefined],
 		]
 	);
+});
+
+test('a pinned cookie crosses to the sibling so both devices hit the same backend — nothing else does', async () => {
+	// The reason this exists: where a storefront picks WHICH BACKEND serves the page's API calls from
+	// a cookie its document sets, a cookieless sibling renders against a different backend than the
+	// device that fetched the document, and one URL's two snapshots stop being comparable. The
+	// session cookie still never crosses.
+	configure({ enabled: true, cookies: { pin: ['bucket'] } });
+	const { documents, scripts, result } = await renderJob(`${base}/page?pinned`);
+
+	assert.equal(documents.length, 1, 'still one document fetch for the two devices');
+	assert.equal(scripts.length, 2);
+	assert.match(scripts[0].cookie ?? '', /bucket=b7/, 'the fetching device has the routing cookie');
+	assert.match(scripts[0].cookie ?? '', /SESSIONID=/, 'and its own session, as it always did');
+	assert.equal(scripts[1].cookie, 'bucket=b7', 'the sibling gets the routing cookie AND ONLY that');
+	assert.deepEqual(
+		result.variants.map((v) => [v.deviceType, v.documentReused]),
+		[
+			['desktop', undefined],
+			['mobile', true],
+		]
+	);
+});
+
+test('with no pin configured the sibling still gets nothing, which is the default', async () => {
+	configure({ enabled: true });
+	const { scripts } = await renderJob(`${base}/page?unpinned`);
+	assert.equal(scripts[1].cookie, undefined, 'default behaviour is unchanged: no cookie crosses');
 });

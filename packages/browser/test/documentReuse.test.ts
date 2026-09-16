@@ -7,6 +7,7 @@ import {
 	toRespondPayload,
 	varyForbidsReuse,
 } from '../dist/documentReuse.js';
+import { cookieHeaderOf, crossableCookies } from '../dist/documentReuse.js';
 import { defaultConfig, mergeConfig } from '../dist/config.js';
 
 // Document reuse across a job's device variants: the guards that decide whether a document may
@@ -74,8 +75,12 @@ test("a prefetched document's own cookies are replayed only when asked — for t
 		source: 'prefetch' as const,
 		setCookies: ['bucket=a; Path=/', 'vis=1; Path=/; HttpOnly'],
 	};
-	assert.equal('set-cookie' in toRespondPayload(doc).headers, false, 'a sibling replaying it gets no cookie');
-	const own = toRespondPayload(doc, { withCookies: true });
+	assert.equal(
+		'set-cookie' in toRespondPayload(doc).headers,
+		false,
+		'a sibling replaying it gets no cookie by default'
+	);
+	const own = toRespondPayload(doc, { cookies: doc.setCookies });
 	assert.deepEqual(
 		own.headers['set-cookie'],
 		['bucket=a; Path=/', 'vis=1; Path=/; HttpOnly'],
@@ -171,6 +176,7 @@ test('replayFor waits for a pending prefetch and records how long the navigation
 	);
 	assert.equal(await cache.replayFor('desktop'), doc);
 	assert.ok((cache.prefetchWaitMs ?? 0) >= 40, `waited for the prefetch: ${cache.prefetchWaitMs}ms`);
+	assert.equal(cache.prefetchLate, false, 'it landed inside the grace');
 	// A second variant asking finds it settled: no further wait is recorded above the first.
 	const before = cache.prefetchWaitMs;
 	await cache.replayFor('desktop');
@@ -222,17 +228,27 @@ test('identical documents diverge by exactly nothing, and Buffers are accepted',
 // ── config ──
 
 test('documentReuse defaults off, merges, and rejects bad values by name', () => {
-	const prefetch = { enabled: false, depth: 2, timeoutMs: 8000 };
-	assert.deepEqual(defaultConfig().documentReuse, { enabled: false, sampleEvery: 0, prefetch });
+	const prefetch = { enabled: false, depth: 2, maxDepth: 8, timeoutMs: 8000 };
+	const cookies = { pin: [] as string[] };
+	assert.deepEqual(defaultConfig().documentReuse, { enabled: false, sampleEvery: 0, prefetch, cookies });
 	assert.deepEqual(mergeConfig({ documentReuse: { enabled: true, sampleEvery: 50 } }).documentReuse, {
 		enabled: true,
 		sampleEvery: 50,
 		prefetch,
+		cookies,
 	});
 	assert.deepEqual(
 		mergeConfig({ documentReuse: { prefetch: { enabled: true } } }).documentReuse.prefetch,
-		{ enabled: true, depth: 2, timeoutMs: 8000 },
+		{ enabled: true, depth: 2, maxDepth: 8, timeoutMs: 8000 },
 		'a partial prefetch block keeps the other defaults'
+	);
+	assert.throws(
+		() => mergeConfig({ documentReuse: { prefetch: { depth: 9 } } } as never),
+		/maxDepth must be an integer >= depth/
+	);
+	assert.throws(
+		() => mergeConfig({ documentReuse: { cookies: { pin: [''] } } } as never),
+		/cookies\.pin must be an array of non-empty cookie names/
 	);
 	assert.throws(
 		() => mergeConfig({ documentReuse: { prefetch: { enabled: 'yes' } } } as never),
@@ -263,4 +279,49 @@ test('documentReuse defaults off, merges, and rejects bad values by name', () =>
 		/sampleEvery must be a non-negative integer/
 	);
 	assert.throws(() => mergeConfig({ documentReuse: null } as never), /`documentReuse` must be an object/);
+});
+
+// ── pinned cookies: backend parity across the devices of one job ──
+
+test('only the pinned cookies cross to a sibling, and they cross as a request header too', () => {
+	const doc = {
+		...captured('desktop'),
+		source: 'prefetch' as const,
+		setCookies: [
+			'shopnext=b7; Path=/; HttpOnly',
+			'SESSIONID=abc123; Path=/; Secure',
+			'AKA_A2=A; Path=/',
+			'enableProductService=1; Path=/',
+		],
+	};
+	// The routing cookies cross; the session and the bot-manager cookie never do.
+	const pinned = crossableCookies(doc, ['shopnext', 'enableProductService']);
+	assert.deepEqual(pinned, ['shopnext=b7; Path=/; HttpOnly', 'enableProductService=1; Path=/']);
+	assert.equal(crossableCookies(doc, []).length, 0, 'the default list is empty, so nothing crosses');
+	assert.deepEqual(
+		crossableCookies(doc, ['SHOPNEXT']),
+		['shopnext=b7; Path=/; HttpOnly'],
+		'names match case-insensitively'
+	);
+	// And the same values as a request Cookie header, for a variant that fetches its own document.
+	assert.equal(cookieHeaderOf(pinned), 'shopnext=b7; enableProductService=1');
+});
+
+test('pinned cookies that differ between devices are reported — the pin assumes they do not', () => {
+	// If a pinned cookie encodes the DEVICE, crossing it puts a sibling into the wrong experience,
+	// which is worse than not pinning. On a sample job both devices fetch cold, so both answers exist.
+	const cache = new JobDocumentCache({ pin: ['shopnext'] });
+	cache.notePinnedCookies('desktop', 'shopnext=desktop-a; Path=/\nSESSIONID=1; Path=/');
+	assert.deepEqual(cache.pinnedCookieConflict(), [], 'one device alone cannot disagree');
+	cache.notePinnedCookies('mobile', 'shopnext=mobile-b; Path=/\nSESSIONID=2; Path=/');
+	assert.deepEqual(cache.pinnedCookieConflict(), ['desktop', 'mobile'], 'the cookie is device-specific');
+
+	const agreeing = new JobDocumentCache({ pin: ['shopnext'] });
+	agreeing.notePinnedCookies('desktop', 'shopnext=b7; Path=/\nSESSIONID=1; Path=/');
+	agreeing.notePinnedCookies('mobile', 'shopnext=b7; Path=/\nSESSIONID=2; Path=/');
+	assert.deepEqual(
+		agreeing.pinnedCookieConflict(),
+		[],
+		'the session cookie differing is not a conflict — it is not pinned'
+	);
 });

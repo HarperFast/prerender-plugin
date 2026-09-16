@@ -30,18 +30,26 @@ import type { HTTPRequest, HTTPResponse } from 'puppeteer';
  *     plugin (and rendered by nobody); an error page is its own verdict; a non-HTML body is not a
  *     document. Anything else falls through to a normal fetch — reuse is an optimisation, never a
  *     substitute for the origin's answer.
- *   - NO COOKIES CROSS VARIANTS. The replayed response carries no `Set-Cookie`, and nothing is copied
- *     from the first variant's context: every variant still starts with an empty jar, exactly as it
- *     did when each fetched its own document, and exactly as the bots this cache serves arrive. The
- *     document response does set cookies (bot-manager, experiment buckets, store selection) that page
- *     scripts may read, so a replayed variant's scripts run without them — a deliberate choice: a
- *     cookie is what ties a render to a session, and two devices sharing one session is the one thing
- *     a two-device job must not manufacture. Both alternatives were checked and declined: copying the
- *     first context's cookies works, and Chrome DOES store `Set-Cookie` from a fulfilled response
- *     (verified against Chrome via Fetch.fulfillRequest), so either would be a one-line change if the
- *     decision is ever revisited. The one place `Set-Cookie` IS replayed is the prefetch answering the
- *     navigation of the device that fetched it (below): those are that variant's OWN cookies, arriving
- *     a moment early, not another device's.
+ *   - NO COOKIE CROSSES VARIANTS EXCEPT THE ONES NAMED, and the default list is empty. Every variant
+ *     otherwise starts with an empty jar, exactly as it did when each fetched its own document and
+ *     exactly as the bots this cache serves arrive. A document response sets plenty (bot-manager,
+ *     experiment buckets, store selection) and a replayed variant's scripts run without them, because
+ *     a cookie is what ties a render to an identity and two devices sharing one is what a two-device
+ *     job must not manufacture.
+ *
+ *     THE EXCEPTION IS ROUTING. Where a storefront picks WHICH BACKEND serves the page's API calls
+ *     from a cookie its document sets, a sibling replaying that document without the cookie renders
+ *     against a different backend than the device that fetched it — so one URL's two snapshots come
+ *     from two different systems, which is the very divergence rendering both devices in one job
+ *     exists to close. Such a cookie is part of the document's meaning, not of a session, so
+ *     `documentReuse.cookies.pin` names those and only those, and a pinned cookie is also sent by a
+ *     variant that goes to the origin itself — parity whichever path a variant takes. See
+ *     `crossableCookies`, and note the corollary: with reuse OFF each device gets its own document
+ *     and its own cookie, so if that value is assigned per response rather than derived from the
+ *     request, the two devices can already disagree today. Worth measuring before assuming otherwise.
+ *
+ *     A prefetch answering the navigation of the device that FETCHED it replays that response's
+ *     cookies in full: they are that variant's own, arriving a moment early, not another device's.
  *   - REPLAY IS MARKED. The fulfilled response carries `x-render-document-reuse: 1` so the renderer's
  *     own response handler does not re-capture it, and the variant reports `documentReused: true` to
  *     the plugin, so reuse is visible per result rather than inferred from timing.
@@ -159,12 +167,26 @@ export class JobDocumentCache {
 	prefetchWaitMs: number | null = null;
 	/** True when a prefetch was still in flight past the grace above, so the render fetched instead. */
 	prefetchLate = false;
+	/**
+	 * For each device that fetched its OWN document, the pinned cookies that response set — the
+	 * evidence for whether those cookies are device-independent, which is what pinning assumes.
+	 * Populated only when a pin list is configured, and only from cold fetches (a replay sets nothing
+	 * new). Two devices here with different values is the assumption failing.
+	 */
+	pinnedCookiesByDevice = new Map<string, string>();
 	/** The sampled comparison's result, once a sample job has run its second variant. */
 	divergence: DocumentDivergence | null = null;
 
-	constructor({ sample = false, acrossDevices = true }: { sample?: boolean; acrossDevices?: boolean } = {}) {
+	private readonly pinnedNames: Set<string>;
+
+	constructor({
+		sample = false,
+		acrossDevices = true,
+		pin = [],
+	}: { sample?: boolean; acrossDevices?: boolean; pin?: string[] } = {}) {
 		this.sample = sample;
 		this.acrossDevices = acrossDevices;
+		this.pinnedNames = new Set(pin.map((name) => name.toLowerCase()));
 	}
 
 	/**
@@ -212,6 +234,22 @@ export class JobDocumentCache {
 		if (!this.acrossDevices) return null;
 		if (varyForbidsReuse(doc.headers['vary'])) return null;
 		return doc;
+	}
+
+	/** Record what one device's own document response set, for the pinned names. */
+	notePinnedCookies(deviceType: string, setCookieHeader: string | undefined): void {
+		const values = setCookieHeader ? setCookieHeader.split('\n') : [];
+		const pinned = values.filter((value) => this.pinnedNames.has(cookieName(value).toLowerCase()));
+		if (pinned.length) this.pinnedCookiesByDevice.set(deviceType, pinned.slice().sort().join('; '));
+	}
+
+	/**
+	 * The devices whose pinned cookies disagree, if any — empty when fewer than two devices fetched
+	 * their own document, or when they all got the same values.
+	 */
+	pinnedCookieConflict(): string[] {
+		const seen = new Set(this.pinnedCookiesByDevice.values());
+		return seen.size > 1 ? [...this.pinnedCookiesByDevice.keys()] : [];
 	}
 
 	abortPrefetch(): void {
@@ -273,18 +311,45 @@ const NON_REPLAYABLE = new Set([
 	'set-cookie',
 ]);
 
+/** The name of a `Set-Cookie` value — everything before the first `=`. */
+export const cookieName = (setCookie: string): string => setCookie.slice(0, setCookie.indexOf('=')).trim();
+
 /**
- * The fulfilment payload for `HTTPRequest.respond()` built from a held document. `withCookies` adds
- * the document's own `Set-Cookie` values back (puppeteer accepts a list) — for the device whose
- * navigation this document is, so it starts exactly as it would have had Chrome fetched it; never for
- * a sibling replaying it.
+ * The `Set-Cookie` values a variant may be given, from a document that is not its own.
+ *
+ * ONLY THE PINNED ONES CROSS, and the operator names them. The reason they must cross at all is
+ * backend parity: where a storefront picks the backend that serves its API calls from a cookie its
+ * document sets, a sibling replaying that document WITHOUT the cookie renders against a different
+ * backend than the device that fetched it — so a URL's two snapshots come from two different systems,
+ * which is the one thing rendering both devices in one job exists to prevent. A cookie that decides
+ * routing is not a session; it is part of the document's meaning.
+ *
+ * Everything else still never crosses. Session, cart, visitor and bot-manager cookies tie a render
+ * to an identity, and two devices sharing one is exactly what a two-device job must not manufacture
+ * — so the list is an allowlist of names, empty by default, and never a pattern.
  */
-export const toRespondPayload = (doc: CapturedDocument, { withCookies = false }: { withCookies?: boolean } = {}) => {
+export const crossableCookies = (doc: CapturedDocument, pin: string[]): string[] => {
+	if (!pin.length || !doc.setCookies?.length) return [];
+	const wanted = new Set(pin.map((name) => name.toLowerCase()));
+	return doc.setCookies.filter((value) => wanted.has(cookieName(value).toLowerCase()));
+};
+
+/** Those same cookies as a request `Cookie` header, for a variant that fetches its own document. */
+export const cookieHeaderOf = (setCookies: string[]): string =>
+	setCookies.map((value) => value.split(';', 1)[0].trim()).join('; ');
+
+/**
+ * The fulfilment payload for `HTTPRequest.respond()` built from a held document. `cookies` are the
+ * `Set-Cookie` values to replay (puppeteer accepts a list): all of the document's own for the device
+ * that fetched it, so it starts exactly as it would have had Chrome fetched it, and for a sibling
+ * only the pinned subset — see `crossableCookies`.
+ */
+export const toRespondPayload = (doc: CapturedDocument, { cookies = [] }: { cookies?: string[] } = {}) => {
 	const headers: Record<string, string | string[]> = {};
 	for (const [name, value] of Object.entries(doc.headers)) {
 		if (!NON_REPLAYABLE.has(name.toLowerCase())) headers[name] = value;
 	}
-	if (withCookies && doc.setCookies?.length) headers['set-cookie'] = doc.setCookies;
+	if (cookies.length) headers['set-cookie'] = cookies;
 	headers[DOCUMENT_REUSE_HEADER] = '1';
 	return { status: doc.status, headers, body: doc.body };
 };

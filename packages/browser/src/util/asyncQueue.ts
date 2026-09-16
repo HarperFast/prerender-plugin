@@ -11,10 +11,27 @@ export class BoundedAsyncQueue<T> {
 	private putters: Array<() => void> = [];
 	private closed = false;
 
-	constructor(readonly capacity: number) {
+	private _capacity: number;
+
+	constructor(capacity: number) {
 		if (!Number.isInteger(capacity) || capacity < 1) {
 			throw new Error(`BoundedAsyncQueue: capacity must be a positive integer, got ${capacity}`);
 		}
+		this._capacity = capacity;
+	}
+
+	get capacity(): number {
+		return this._capacity;
+	}
+
+	/**
+	 * Raise the capacity by one and let a waiting producer through. The pool deepens itself when a
+	 * consumer found its work not ready — see the prefetch pipeline: depth is only ever "enough" or
+	 * "not yet", and the worker cannot know which from configuration alone.
+	 */
+	grow(): void {
+		this._capacity++;
+		this.putters.shift()?.();
 	}
 
 	get size(): number {
@@ -27,7 +44,7 @@ export class BoundedAsyncQueue<T> {
 
 	/** Resolves once there is room for one more item, or the queue has been closed. */
 	async waitForRoom(): Promise<void> {
-		while (!this.closed && this.items.length >= this.capacity) {
+		while (!this.closed && this.items.length >= this._capacity) {
 			await new Promise<void>((resolve) => this.putters.push(resolve));
 		}
 	}

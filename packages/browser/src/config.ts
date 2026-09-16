@@ -360,6 +360,24 @@ export type DocumentReuseConfig = {
 	 */
 	sampleEvery: number;
 	prefetch: DocumentPrefetchConfig;
+	cookies: DocumentCookieConfig;
+};
+
+/**
+ * Which cookies a document may carry across the variants of one job — see `src/documentReuse.ts`.
+ */
+export type DocumentCookieConfig = {
+	/**
+	 * Cookie NAMES that may cross, and that a variant fetching its own document will send. Empty by
+	 * default, so nothing crosses.
+	 *
+	 * This exists for one thing: a cookie that selects WHICH BACKEND serves the page's API calls.
+	 * Without it in the list, the device that fetched the document and the device that replayed it
+	 * render against different backends, and one URL's two snapshots stop being comparable. Name
+	 * those cookies and nothing else — never a session, cart, visitor or bot-manager cookie, which
+	 * tie a render to an identity that must not be shared between two devices.
+	 */
+	pin: string[];
 };
 
 /**
@@ -377,6 +395,16 @@ export type DocumentPrefetchConfig = {
 	 * `depth · r / c` seconds before its render starts.
 	 */
 	depth: number;
+	/**
+	 * Ceiling the pool may grow to on its own. The point of prefetching is that the next render finds
+	 * its document already in hand, so when one does NOT — the navigation waited out its grace and
+	 * went to the origin — the pool deepens by one, up to here, and stays there. `depth` is the floor
+	 * it starts from; this is how far it may go looking for "enough".
+	 *
+	 * It is a ceiling because depth is not free: every pooled job is CLAIMED but not yet rendered, so
+	 * it holds a lease and a document in memory for roughly `depth · renderTime / concurrency`.
+	 */
+	maxDepth: number;
 	/** Give up on a prefetch after this long; the variant then fetches the document itself. */
 	timeoutMs: number;
 };
@@ -449,7 +477,12 @@ export const defaultConfig = (): PrerenderConfig => ({
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
-	documentReuse: { enabled: false, sampleEvery: 0, prefetch: { enabled: false, depth: 2, timeoutMs: 8000 } },
+	documentReuse: {
+		enabled: false,
+		sampleEvery: 0,
+		prefetch: { enabled: false, depth: 2, maxDepth: 8, timeoutMs: 8000 },
+		cookies: { pin: [] },
+	},
 });
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -536,6 +569,16 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	if (!Number.isInteger(prefetch.depth) || (prefetch.depth as number) < 1) {
 		throw new Error('prerender config: documentReuse.prefetch.depth must be a positive integer');
+	}
+	if (!Number.isInteger(prefetch.maxDepth) || (prefetch.maxDepth as number) < (prefetch.depth as number)) {
+		throw new Error('prerender config: documentReuse.prefetch.maxDepth must be an integer >= depth');
+	}
+	const cookies: unknown = config.documentReuse.cookies;
+	if (!isPlainObject(cookies)) {
+		throw new Error('prerender config: documentReuse.cookies must be an object');
+	}
+	if (!Array.isArray(cookies.pin) || cookies.pin.some((name) => typeof name !== 'string' || !name.trim())) {
+		throw new Error('prerender config: documentReuse.cookies.pin must be an array of non-empty cookie names');
 	}
 	if (typeof prefetch.timeoutMs !== 'number' || !(prefetch.timeoutMs > 0)) {
 		throw new Error('prerender config: documentReuse.prefetch.timeoutMs must be a positive number');

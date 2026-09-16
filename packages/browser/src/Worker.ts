@@ -134,6 +134,10 @@ export default class RenderWorker {
 			// grace, so the render fetched for itself — a rising count means `depth` is too shallow.
 			documentsPrefetched: 0,
 			prefetchLate: 0,
+			// Sample jobs where two devices' own documents set DIFFERENT values for a pinned cookie — the
+			// pin's own assumption failing. Any non-zero count means a name in `cookies.pin` is
+			// device-specific and must come out of the list.
+			pinnedCookieConflicts: 0,
 			prefetchFallthrough: {
 				'status': 0,
 				'not-html': 0,
@@ -181,6 +185,31 @@ export default class RenderWorker {
 	// Chrome's own user agent, learned from the first launched browser: what a device profile without
 	// a `userAgent` sends, and therefore what its prefetch must send too.
 	private browserUserAgent: string | undefined;
+
+	// The prefetch pool, while the pipelined loop is running — held so a render that found its
+	// document not ready can deepen it.
+	private pool: BoundedAsyncQueue<RenderJob> | null = null;
+
+	/**
+	 * Deepen the prefetch pool by one, up to `maxDepth`.
+	 *
+	 * The point of prefetching is that the next render finds its document already fetched, so a render
+	 * that had to wait and then go to the origin is the pool saying it is too shallow for this
+	 * concurrency and this origin — which is not something configuration can know in advance, since it
+	 * depends on the ratio between a fetch and a render and both move. Growing on the evidence
+	 * converges on "enough" and then stops; it never shrinks, because the cost of being one deeper is a
+	 * lease and a document, and the cost of being one too shallow is a render that pays for its own
+	 * fetch.
+	 */
+	private deepenPool(): void {
+		const { maxDepth } = settings.config.documentReuse.prefetch;
+		if (!this.pool || this.pool.capacity >= maxDepth) return;
+		this.pool.grow();
+		logger.info(
+			{ depth: this.pool.capacity, maxDepth },
+			'a render waited on its prefetch and went to the origin — deepening the prefetch pool'
+		);
+	}
 
 	// Set on graceful shutdown: stops the consumer loop and blocks new renders while
 	// in-flight ones drain.
@@ -262,6 +291,7 @@ export default class RenderWorker {
 		);
 
 		const pool = new BoundedAsyncQueue<RenderJob>(prefetch.depth);
+		this.pool = pool;
 		const filling = (async () => {
 			// Iterated by hand rather than `for await`, so the next claim is pulled only once the pool
 			// has room for it: exactly `depth` jobs prefetch ahead, and a job's prefetch is under way
@@ -394,7 +424,7 @@ export default class RenderWorker {
 		// Every job that holds a document cache is now a sampling candidate.
 		this.documentJobs++;
 		const sample = reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0;
-		job.documentCache = new JobDocumentCache({ sample, acrossDevices });
+		job.documentCache = new JobDocumentCache({ sample, acrossDevices, pin: reuse.cookies.pin });
 		return job.documentCache;
 	}
 
@@ -533,6 +563,7 @@ export default class RenderWorker {
 				documentDivergence: summarize(s.documentDivergence),
 				documentsPrefetched: s.documentsPrefetched,
 				prefetchLate: s.prefetchLate,
+				pinnedCookieConflicts: s.pinnedCookieConflicts,
 				prefetchFallthrough: s.prefetchFallthrough,
 				jobsAbandoned: s.jobsAbandoned,
 				succeeded: s.succeeded,
@@ -805,7 +836,23 @@ export default class RenderWorker {
 			this.stats.documentsReused += documentCache.reusedBy.length;
 			this.stats.documentsPrefetched += documentCache.prefetchedBy.length;
 			if (documentCache.prefetchWaitMs !== null) this.stats.prefetchWaitMs.push(documentCache.prefetchWaitMs);
-			if (documentCache.prefetchLate) this.stats.prefetchLate++;
+			if (documentCache.prefetchLate) {
+				this.stats.prefetchLate++;
+				this.deepenPool();
+			}
+			// PINNING ASSUMES THE COOKIE IS NOT DEVICE-SPECIFIC, and this is where that assumption is
+			// tested rather than trusted. On a sample job each device fetched its own document, so two
+			// different values for the same pinned name means the cookie encodes the device — and
+			// crossing it puts a sibling into the wrong experience, which is worse than not pinning.
+			const conflict = documentCache.pinnedCookieConflict();
+			if (conflict.length) {
+				this.stats.pinnedCookieConflicts++;
+				logger.warn(
+					{ id: job.id, devices: conflict, pinned: [...documentCache.pinnedCookiesByDevice] },
+					'pinned cookies differ between devices — they are device-specific, so pinning them is unsafe; ' +
+						'remove them from documentReuse.cookies.pin'
+				);
+			}
 			if (documentCache.divergence) {
 				const { ratio, differing, chunks, samples } = documentCache.divergence;
 				this.stats.documentSamples++;

@@ -295,3 +295,27 @@ test('BoundedAsyncQueue: a waiting consumer is woken by a put, and by close', as
 	assert.equal(await waiting, undefined);
 	await q.waitForRoom(); // resolves at once on a closed queue
 });
+
+test('the pool deepens itself when a render finds its prefetch not ready', () => {
+	// Depth is only ever "enough" or "not yet", and configuration cannot know which — it depends on
+	// the ratio between a fetch and a render, and both move. The pool grows on the evidence.
+	const q = new BoundedAsyncQueue<number>(2);
+	assert.equal(q.capacity, 2);
+	q.grow();
+	assert.equal(q.capacity, 3);
+});
+
+test('growing the pool releases a producer that was blocked at the old capacity', async () => {
+	const q = new BoundedAsyncQueue<number>(1);
+	await q.put(1);
+	let through = false;
+	const blocked = q.put(2).then(() => {
+		through = true;
+	});
+	await sleep(10);
+	assert.equal(through, false, 'held at capacity 1');
+	q.grow();
+	await blocked;
+	assert.equal(through, true, 'the deeper pool took it without waiting for a take');
+	assert.equal(q.size, 2);
+});

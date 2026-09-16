@@ -126,11 +126,20 @@ keep a URL's variants aligned: same render pass, seconds apart, one scheduling d
 **Document reuse** (`config.documentReuse`, off by default). On a responsive site the origin answers
 every device with the same document, so the second and later variants of a job can be navigated from
 the first variant's captured document instead of fetching it again — one document fetch per URL
-render instead of one per device, and the second variant skips its download. **No cookie crosses
-variants**: the replayed response carries no `Set-Cookie` and nothing is copied from the first
-variant's context, so every variant still starts with an empty jar (a replayed variant's scripts run
-without the cookies the document would have set — deliberate, since a shared cookie is a shared
-session). A document is never reused when it is not a final `200 text/html`, has a redirect chain, or
+render instead of one per device, and the second variant skips its download. **No cookie crosses variants except the ones you name**: the replayed response carries no
+`Set-Cookie` and nothing is copied from the first variant's context, so every variant starts with an
+empty jar. The exception is routing. Where a site picks _which backend_ serves the page's API calls
+from a cookie its document sets, a cookieless sibling renders against a different backend than the
+device that fetched the document, and one URL's two snapshots stop being comparable —
+`documentReuse.cookies.pin` names those cookies (empty by default), and a pinned cookie is also sent
+by a variant that goes to the origin itself, so parity holds whichever path a variant takes. Pin only
+routing cookies: never a session, cart, visitor or bot-manager cookie, which tie a render to an
+identity two devices must not share. Pinning assumes the cookie is **device-independent**, and that
+assumption is tested rather than trusted — on a sample job both devices fetch cold, and if a pinned
+name comes back with different values the worker warns and counts `pinnedCookieConflicts`. (Corollary
+worth knowing: with reuse off each device already gets its own document and its own cookie, so if the
+value is assigned per response rather than derived from the request, the two devices can disagree
+today.) A document is never reused when it is not a final `200 text/html`, has a redirect chain, or
 sends a `Vary` naming the user agent or a client hint. A replayed variant posts `documentReused:
 true`. Turn it on only for a **responsive**
 site: an adaptive site (server-side device detection, m-dot) serves different markup per device, and
@@ -161,7 +170,11 @@ waits at most 500ms for a prefetch still in flight** and then fetches for itself
 own budget waiting for a document it may not get. Sizing: to hide
 a fetch of `f` seconds behind renders of `r` seconds on `c` slots, `depth ≥ f · c / r + 1` — the
 default `2` covers c=10, f=1 s, r=12 s; a pooled job sits claimed about `depth · r / c` seconds before
-its render starts, always inside the batch the plugin already claimed it in. `rps` still paces render
+its render starts, always inside the batch the plugin already claimed it in. **The pool also deepens
+itself**: every time a render has to wait out the grace and go to the origin, depth grows by one up to
+`maxDepth` (default 8) and stays there — the ratio between a fetch and a render is not something
+configuration can know in advance, and the whole point is that the next render finds its document
+already fetched. `rps` still paces render
 starts, and at steady state a prefetch starts each time a render does, so the origin sees the same
 request rate one render earlier. At shutdown, jobs still pooled — like any claimed job still waiting
 for a slot when the drain began — are dropped (nothing rendered, nothing to post; the lease expires
@@ -210,7 +223,9 @@ include what you change:
 	"documentReuse": {
 		"enabled": false,
 		"sampleEvery": 0,
-		"prefetch": { "enabled": false, "depth": 2, "timeoutMs": 8000 },
+		"prefetch": { "enabled": false, "depth": 2, "maxDepth": 8, "timeoutMs": 8000 },
+		// Cookie NAMES that may cross variants — routing cookies only, never session/cart/visitor.
+		"cookies": { "pin": [] },
 	},
 	"navigation": {
 		"waitUntil": "domcontentloaded", // 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'
