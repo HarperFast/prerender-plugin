@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { reuseParityCheck, formatReuseParity } from '../dist/audit/reuseParity.js';
+import type { Renderer } from '../dist/Worker.js';
 
 // The PRE-DEPLOY check for document reuse, against a real headless Chrome and an origin that behaves
 // the way the risky ones do: it routes its API by a cookie the document sets. Rendering with reuse on
@@ -31,6 +32,9 @@ before(async () => {
 			// The offers are written from the price call, exactly as a client-rendered PDP does it.
 			return res.end(
 				`<!doctype html><html><head><title>p</title></head><body><div id="o"></div>
+				<div id="vp">?</div>
+				<script>document.getElementById('vp').textContent =
+					innerWidth + (matchMedia('(max-width: 600px)').matches ? ' narrow' : ' wide');</script>
 				<script>fetch('/price').then(r=>r.json()).then(d=>{
 					const s=document.createElement('script');s.type='application/ld+json';
 					s.textContent=JSON.stringify({"@context":"https://schema.org","@type":"Product","name":"X",
@@ -98,4 +102,52 @@ test('pinning the routing cookie makes the same site pass', async () => {
 	assert.equal(result.devices[1].offersMatch, true, 'the sibling now reaches the same backend');
 	assert.equal(result.devices[1].reused.documentReused, true, 'still replaying — the saving is intact');
 	assert.match(formatReuseParity([result]), /All 1 URLs match per device/);
+});
+
+test('a replayed variant still renders as ITS OWN device — the regression everyone actually fears', async () => {
+	// The page writes its own viewport into the DOM, so desktop and mobile produce genuinely different
+	// markup. Reuse hands the mobile variant the DESKTOP document; the viewport and user agent are
+	// still mobile's own, so the mobile render must still come out mobile.
+	const [result] = await reuseParityCheck({
+		urls: [`${base}/page`],
+		devices: ['desktop', 'mobile'],
+		pin: ['bucket'],
+		config,
+	});
+
+	assert.equal(result.pass, true, `expected a pass, got:\n${formatReuseParity([result])}`);
+	for (const d of result.devices) {
+		assert.ok(d.signature.distinctive > 0, `${d.deviceType} must produce markup the other device does not`);
+		assert.equal(d.signature.ratio, 1, `${d.deviceType} kept ALL of its own markup (lost: ${d.signature.lost})`);
+		assert.equal(d.identityHeld, true);
+	}
+	assert.equal(result.devices[1].reused.documentReused, true, 'and mobile really was replayed');
+});
+
+test('the check CATCHES a replayed variant that came back as its sibling', async () => {
+	// The failure the check exists for, simulated at the only place it can be: a renderer that hands a
+	// replayed variant the first device's page. Nothing about the offers or the outcome differs — this
+	// is exactly the regression the per-device comparisons cannot see.
+	const asDesktop = `<html><body><div id="vp">1280 wide</div><div id="only-desktop">rail</div></body></html>`;
+	const asMobile = `<html><body><div id="vp">390 narrow</div><div id="only-mobile">drawer</div></body></html>`;
+	const leaky: Renderer = async (_page, job) =>
+		job.documentCache && job.deviceType !== 'desktop' ? asDesktop : job.deviceType === 'desktop' ? asDesktop : asMobile;
+
+	const [result] = await reuseParityCheck({
+		urls: [`${base}/page`],
+		devices: ['desktop', 'mobile'],
+		config,
+		renderer: leaky,
+	});
+
+	const [desktop, mobile] = result.devices;
+	assert.equal(desktop.identityHeld, true, 'the device that fetched the document is unaffected');
+	assert.equal(mobile.identityHeld, false, 'mobile came back as desktop and the check says so');
+	assert.equal(mobile.offersMatch, true, 'while offers and outcome agree — which is why this check exists');
+	assert.equal(mobile.outcomeMatch, true);
+	assert.equal(mobile.pass, false);
+	assert.equal(result.pass, false);
+	const text = formatReuseParity([result]);
+	assert.match(text, /own-markup-kept=0\.0% of \d+ — LOST/);
+	assert.match(text, /markup this device LOST/);
 });

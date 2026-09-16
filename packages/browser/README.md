@@ -557,6 +557,14 @@ without it, its pricing call is answered by a different backend, and the offers 
 everything else still looks healthy. A non-zero divergence ratio is not automatically a failure (live
 pages churn between two renders seconds apart); a differing offer set is.
 
+It also answers the question those per-device comparisons structurally cannot: **did mobile stay
+mobile?** Each device's control is compared against the other devices' controls to find the markup
+that is DISTINCTIVE to it — the chunks only that viewport and user agent produce — and the replayed
+render is then measured for how much of its own signature it kept (`own-markup-kept` in the report,
+`signature` on the result). A replayed variant that had become its sibling keeps almost none of it, so
+the check fails on identity even when the offers and the outcome agree. This is the only comparison
+here that crosses devices, and it crosses them to prove they stayed apart.
+
 This is the gate for turning `documentReuse.enabled` on, and for deciding what belongs in
 `cookies.pin`. The in-worker sampled check is the ongoing version of the same question, but it can
 only report after the affected snapshots have been served.

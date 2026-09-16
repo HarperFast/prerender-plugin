@@ -1,7 +1,7 @@
 import ManagedBrowser from '../ManagedBrowser.js';
 import RenderJob from '../RenderJob.js';
 import defaultRenderer from '../renderer.js';
-import { JobDocumentCache, documentDivergence, type DocumentDivergence } from '../documentReuse.js';
+import { JobDocumentCache, documentDivergence, normalisedChunks, type DocumentDivergence } from '../documentReuse.js';
 import { defaultLaunchOptions, resolveSettings, settings } from '../settings.js';
 import { initResourceCache } from '../ResourceCache.js';
 import { noop } from '../util/noop.js';
@@ -32,6 +32,15 @@ import type { LaunchOptions } from 'puppeteer';
  *   - Structural divergence of the serialized snapshot, normalised the same way the in-worker sample
  *     normalises it (hashed asset names, hydration ids and inline script bodies), so a deploy
  *     landing between the two renders does not read as a reuse defect.
+ *
+ *   - DEVICE IDENTITY — does the mobile render still look like a mobile render? Everything above
+ *     compares a device against itself, which cannot see the failure people actually fear: reuse
+ *     quietly turning the mobile variant into a second desktop render. So each device's control is
+ *     also compared against the OTHER devices' controls to learn what markup is DISTINCTIVE to it —
+ *     the chunks only that device's page produces — and the replayed render is then checked for how
+ *     much of its own signature it kept. A replayed variant that had become its sibling would retain
+ *     almost none. This is the only comparison here that crosses devices, and it crosses them to
+ *     prove they stayed apart.
  *
  * A NON-ZERO DIVERGENCE IS NOT AUTOMATICALLY A FAILURE and the verdict says so separately: two
  * renders of a live page seconds apart differ for many innocent reasons (a rotating carousel, a
@@ -65,6 +74,21 @@ export type VariantSnapshot = {
 	documentPrefetched?: boolean;
 };
 
+/**
+ * Did this device stay itself? `distinctive` is how many normalised chunks appear in this device's
+ * control and in NO other device's control — its signature, the markup only this viewport and user
+ * agent produce. `retained` is how many of those the REPLAYED render still has. A mobile variant that
+ * had become a second desktop render would keep almost none of them.
+ */
+export type DeviceSignature = {
+	distinctive: number;
+	retained: number;
+	/** `retained / distinctive`, or null when the devices produce no distinctive markup at all. */
+	ratio: number | null;
+	/** Distinctive chunks the replayed render LOST — the first few, to read by eye. */
+	lost: string[];
+};
+
 export type DeviceParity = {
 	deviceType: string;
 	control: VariantSnapshot;
@@ -74,9 +98,21 @@ export type DeviceParity = {
 	/** Outcome, status and indexability all agree. */
 	outcomeMatch: boolean;
 	divergence: DocumentDivergence;
+	/** Whether the replayed render kept the markup distinctive to this device. */
+	signature: DeviceSignature;
+	/** False when the device lost its own signature — a mobile render that came back desktop. */
+	identityHeld: boolean;
 	/** False when the offers or the outcome differ — the cases that mean the page is wrong. */
 	pass: boolean;
 };
+
+/**
+ * How much of a device's signature a replayed render must keep. Not 1: a live page churns between
+ * two renders, and a rotating rail or a personalised slot can be distinctive to a device in one
+ * render and absent in the next through nothing to do with reuse. A variant that had actually become
+ * its sibling scores near 0, so the threshold only has to be far from both ends.
+ */
+export const DEVICE_SIGNATURE_FLOOR = 0.6;
 
 export type ReuseParityResult = {
 	url: string;
@@ -136,6 +172,26 @@ const snapshotOf = (variant: RenderJob, withReuseFlags: boolean): VariantSnapsho
 
 const sameOffers = (a: VariantSnapshot['structuredOffers'], b: VariantSnapshot['structuredOffers']) =>
 	JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * What this device's control produced that no OTHER device's control did, and how much of it the
+ * replayed render kept. This is the only comparison here that crosses devices, and it crosses them to
+ * prove they stayed apart: a mobile variant answered from the desktop document is still expected to
+ * lay out, script and serialize as mobile, because the viewport and user agent are its own.
+ */
+const deviceSignature = (own: string, others: string[], reused: string): DeviceSignature => {
+	const mine = normalisedChunks(own);
+	for (const other of others) for (const chunk of normalisedChunks(other).keys()) mine.delete(chunk);
+	const replayed = normalisedChunks(reused);
+	let retained = 0;
+	const lost: string[] = [];
+	for (const chunk of mine.keys()) {
+		if (replayed.has(chunk)) retained++;
+		else if (lost.length < 3) lost.push(chunk.slice(0, 120));
+	}
+	const distinctive = mine.size;
+	return { distinctive, retained, ratio: distinctive ? retained / distinctive : null, lost };
+};
 
 /**
  * Run the check over `urls`. One browser for the whole run, each URL rendered control-first so the
@@ -205,6 +261,13 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 				const offersMatch = sameOffers(a.structuredOffers, b.structuredOffers);
 				const outcomeMatch =
 					a.outcome === b.outcome && a.statusCode === b.statusCode && a.isIndexable === b.isIndexable;
+				const signature = deviceSignature(
+					control[i].content ?? '',
+					control.filter((_, j) => j !== i).map((v) => v.content ?? ''),
+					reused[i].content ?? ''
+				);
+				// A null ratio means the devices render identical markup, so there is no identity to lose.
+				const identityHeld = signature.ratio === null || signature.ratio >= DEVICE_SIGNATURE_FLOOR;
 				return {
 					deviceType,
 					control: a,
@@ -212,7 +275,9 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 					offersMatch,
 					outcomeMatch,
 					divergence: documentDivergence(control[i].content ?? '', reused[i].content ?? ''),
-					pass: offersMatch && outcomeMatch,
+					signature,
+					identityHeld,
+					pass: offersMatch && outcomeMatch && identityHeld,
 				};
 			});
 			results.push({ url, devices: perDevice, pass: perDevice.every((d) => d.pass) });
@@ -232,13 +297,21 @@ export function formatReuseParity(results: ReuseParityResult[]): string {
 			const flags = [d.reused.documentReused && 'reused', d.reused.documentPrefetched && 'prefetched']
 				.filter(Boolean)
 				.join('+');
+			const sig =
+				d.signature.ratio === null
+					? 'n/a (devices render alike)'
+					: `${(d.signature.ratio * 100).toFixed(1)}% of ${d.signature.distinctive}${d.identityHeld ? '' : ' — LOST'}`;
 			lines.push(
 				`   ${d.pass ? 'ok  ' : 'DIFF'} ${d.deviceType.padEnd(8)} ` +
 					`offers=${d.offersMatch ? 'same' : 'DIFFERENT'} ` +
 					`outcome=${d.outcomeMatch ? 'same' : `${d.control.outcome}/${d.control.statusCode} -> ${d.reused.outcome}/${d.reused.statusCode}`} ` +
+					`own-markup-kept=${sig} ` +
 					`divergence=${d.divergence.ratio.toFixed(4)} ` +
 					`bytes=${d.control.bytes}->${d.reused.bytes}${flags ? ` [${flags}]` : ''}`
 			);
+			if (!d.identityHeld && d.signature.lost.length) {
+				lines.push(`        markup this device LOST: ${d.signature.lost.join(' | ')}`);
+			}
 			if (!d.offersMatch) {
 				lines.push(`        control offers : ${JSON.stringify(d.control.structuredOffers)}`);
 				lines.push(`        reused  offers : ${JSON.stringify(d.reused.structuredOffers)}`);
@@ -252,7 +325,7 @@ export function formatReuseParity(results: ReuseParityResult[]): string {
 	lines.push(
 		failed
 			? `\n${failed} of ${results.length} URLs differ where it matters — do NOT enable documentReuse.`
-			: `\nAll ${results.length} URLs match per device. Divergence ratios above are page churn, not reuse; read the samples before trusting a high one.`
+			: `\nAll ${results.length} URLs match per device, and each device kept its own markup — no replayed render became its sibling. Divergence ratios above are page churn, not reuse; read the samples before trusting a high one.`
 	);
 	return lines.join('\n');
 }

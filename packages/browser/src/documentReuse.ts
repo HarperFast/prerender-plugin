@@ -400,18 +400,19 @@ const normaliseChunk = (chunk: string): string =>
  * and what the question actually needs: "does the mobile document contain markup the desktop one
  * does not", not "where".
  */
+export const normalisedChunks = (doc: Buffer | string): Map<string, number> => {
+	const counts = new Map<string, number>();
+	for (const raw of doc.toString().split('><')) {
+		const chunk = normaliseChunk(raw);
+		if (!chunk) continue;
+		counts.set(chunk, (counts.get(chunk) ?? 0) + 1);
+	}
+	return counts;
+};
+
 export const documentDivergence = (a: Buffer | string, b: Buffer | string): DocumentDivergence => {
-	const bag = (doc: Buffer | string) => {
-		const counts = new Map<string, number>();
-		for (const raw of doc.toString().split('><')) {
-			const chunk = normaliseChunk(raw);
-			if (!chunk) continue;
-			counts.set(chunk, (counts.get(chunk) ?? 0) + 1);
-		}
-		return counts;
-	};
-	const left = bag(a);
-	const right = bag(b);
+	const left = normalisedChunks(a);
+	const right = normalisedChunks(b);
 	let differing = 0;
 	let chunks = 0;
 	const samples: string[] = [];

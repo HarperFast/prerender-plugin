@@ -123,7 +123,7 @@ export { runSelfCheck, runSelfCheckResults } from './audit/selfCheck.js';
 export type { Renderer } from './Worker.js';
 export type { RenderOnceOptions, RenderResult, RenderOutcome, Probe, ProbeContext } from './renderOnce.js';
 export type { RenderAuditOptions } from './audit/renderAudit.js';
-export type { ReuseParityOptions, ReuseParityResult, DeviceParity } from './audit/reuseParity.js';
+export type { ReuseParityOptions, ReuseParityResult, DeviceParity, DeviceSignature } from './audit/reuseParity.js';
 export type {
 	PaintParityOptions,
 	PaintParityReport,
