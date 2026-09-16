@@ -117,18 +117,16 @@ test('a replayed variant still renders as ITS OWN device — the regression ever
 	});
 
 	assert.equal(result.pass, true, `expected a pass, got:\n${formatReuseParity([result])}`);
-	for (const d of result.devices) {
-		assert.ok(
-			(d.identity.controlsRatio ?? 0) > 0.02,
-			`${d.deviceType}: the two devices must render distinguishably for this to mean anything`
-		);
-		assert.ok(
-			(d.identity.relative ?? 1) <= 0.5,
-			`${d.deviceType} stayed itself: own ${d.identity.ownRatio} vs sibling ${d.identity.crossRatio}`
-		);
-		assert.equal(d.identityHeld, true);
-	}
-	assert.equal(result.devices[1].reused.documentReused, true, 'and mobile really was replayed');
+	const [desktop, mobile] = result.devices;
+	assert.ok(!desktop.reused.documentReused, 'desktop fetched its own document — that pair IS the churn floor');
+	assert.equal(mobile.reused.documentReused, true, 'mobile really was replayed');
+	assert.equal(mobile.identity.conclusive, true, 'the devices differ above the churn, so the test can decide');
+	assert.ok(
+		mobile.identity.ownRatio <= (mobile.identity.threshold ?? 0),
+		`mobile stayed itself: own ${mobile.identity.ownRatio} vs sibling ${mobile.identity.crossRatio}, ` +
+			`churn ${mobile.identity.churnRatio}`
+	);
+	assert.equal(mobile.identityHeld, true);
 });
 
 test('the check CATCHES a replayed variant that came back as its sibling', async () => {
@@ -137,8 +135,13 @@ test('the check CATCHES a replayed variant that came back as its sibling', async
 	// is exactly the regression the per-device comparisons cannot see.
 	const asDesktop = `<html><body><div id="vp">1280 wide</div><div id="only-desktop">rail</div></body></html>`;
 	const asMobile = `<html><body><div id="vp">390 narrow</div><div id="only-mobile">drawer</div></body></html>`;
-	const leaky: Renderer = async (_page, job) =>
-		job.documentCache && job.deviceType !== 'desktop' ? asDesktop : job.deviceType === 'desktop' ? asDesktop : asMobile;
+	const leaky: Renderer = async (_page, job) => {
+		const leaked = Boolean(job.documentCache) && job.deviceType !== 'desktop';
+		// The real renderer sets this when a navigation is answered from a sibling's document, and the
+		// check only judges variants that say they were replayed — so the stand-in has to say so too.
+		if (leaked) job.documentReused = true;
+		return leaked || job.deviceType === 'desktop' ? asDesktop : asMobile;
+	};
 
 	const [result] = await reuseParityCheck({
 		urls: [`${base}/page`],
@@ -151,6 +154,8 @@ test('the check CATCHES a replayed variant that came back as its sibling', async
 	assert.equal(desktop.identityHeld, true, 'the device that fetched the document is unaffected');
 	assert.equal(mobile.identityHeld, false, 'mobile came back as desktop and the check says so');
 	assert.equal(mobile.identity.crossRatio, 0, "it is byte-for-byte the other device's page");
+	assert.equal(mobile.identity.churnRatio, 0, 'and the churn floor is zero, so the distance has no excuse');
+	assert.equal(mobile.identity.conclusive, true, 'the two controls DO differ — the devices were distinguishable');
 	assert.equal(mobile.offersMatch, true, 'while offers and outcome agree — which is why this check exists');
 	assert.equal(mobile.outcomeMatch, true);
 	assert.equal(mobile.pass, false);

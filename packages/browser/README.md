@@ -558,15 +558,21 @@ everything else still looks healthy. A non-zero divergence ratio is not automati
 pages churn between two renders seconds apart); a differing offer set is.
 
 It also answers the question those per-device comparisons structurally cannot: **did mobile stay
-mobile?** The replayed render is compared both against its own control and against the nearest other
-device's control, and must be markedly closer to its own (`device=0.130 own vs 0.420 sibling` in the
-report, `identity` on the result). A replayed variant that had become its sibling fails this even
+mobile?** A replayed render is measured against three distances taken on the same page in the same
+minute — its own control, the nearest other device's control, and the **churn floor**: the same
+measurement for a variant that replayed nothing and therefore fetched its own document both times. It
+must sit closer to the churn floor than to its sibling (`device=own 0.080 vs sibling 0.238, churn
+0.071`, `identity` on the result). A replayed variant that had become its sibling fails this even
 though its offers, status and outcome all agree, because the sibling's page is a perfectly valid page.
-The test is deliberately RELATIVE: a live page churns between any two renders — recommendation rails
-alone replace most of a page's per-device markup — so both numbers move together and only their ratio
-is stable. Where the two devices render the same markup anyway (controls within 2% of each other),
-there is no identity to lose and the test does not apply. This is the only comparison here that
-crosses devices, and it crosses them to prove they stayed apart.
+
+The floor is what makes this usable on a live site. An absolute "kept its own markup" measure was
+tried first and failed the control — recommendation rails pick different products on every render, so
+even a variant that replays nothing loses most of its distinctive markup between two renders. Catalog
+pages here churn 0.23 while their two devices differ by 0.28, so a fixed threshold would be either
+blind or crying wolf. Where the devices do not differ by more than the churn, the result is reported
+`INCONCLUSIVE` rather than passed or failed, and the variant that fetched its own document is never
+judged — it is the control. This is the only comparison here that crosses devices, and it crosses them
+to prove they stayed apart.
 
 This is the gate for turning `documentReuse.enabled` on, and for deciding what belongs in
 `cookies.pin`. The in-worker sampled check is the ongoing version of the same question, but it can
