@@ -38,6 +38,7 @@ import { getResidencyByUrl } from './residency.js';
 import { getInitialRenderTime } from './time.js';
 import { resolveRenderInterval } from './routeClass.js';
 import { getScheduleRow, writeSchedule } from './renderSchedule.js';
+import { claimRun, finishRun, isRunning, readRunState } from './runState.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread.
@@ -191,14 +192,19 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 	});
 };
 
-let running = false;
-let lastRun = null;
+/**
+ * RUN STATE LIVES ON THE NODE — see `util/runState.js`. This sweep is the least harmed of the
+ * three by per-worker state (it is periodic and restorative, a duplicate pass is harmless, and no
+ * operator gates a decision on its result), and it is converted anyway because it is the same
+ * three lines and leaving one module on the old pattern is how the pattern comes back.
+ */
+const KEY = 'reconcile';
 
 /** Summary of the most recent sweep on this node, for the management API. */
-export const getLastReconcile = () => lastRun;
+export const getLastReconcile = async () => (await readRunState(KEY))?.lastRun ?? null;
 
-/** Whether a sweep is in flight, so the admin action can say so instead of implying a new one. */
-export const isReconcileRunning = () => running;
+/** Whether a sweep is in flight ANYWHERE on this node, so the admin action can say so. */
+export const isReconcileRunning = async () => isRunning(await readRunState(KEY));
 
 /**
  * Run one sweep, guarded against overlap. Returns the run summary, or `{ skipped: true }`
@@ -206,13 +212,16 @@ export const isReconcileRunning = () => running;
  * guard, so triggering it by hand can never double up on the scheduled pass.
  */
 export const runReconcileOnce = async (options) => {
-	if (running) return { skipped: true, reason: 'a reconcile sweep is already running', lastRun };
-	running = true;
-
 	const startedAt = Date.now();
+	const { claimed, row } = await claimRun(KEY, { startedAt });
+	if (!claimed) {
+		return { skipped: true, reason: 'a reconcile sweep is already running', lastRun: row?.lastRun ?? null };
+	}
+
 	try {
 		const stats = await reconcileScheduleGaps(options);
-		lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+		const lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+		await finishRun(KEY, lastRun);
 
 		// The same numbers as METRICS: `restored` > 0 is the alert (URLs were silently
 		// un-renderable until this sweep). Guarded — a gauge must never cost the sweep record.
@@ -242,10 +251,13 @@ export const runReconcileOnce = async (options) => {
 	} catch (e) {
 		// `e?.message ?? String(e)` rather than `e.message`: anything can be thrown, and a
 		// null/undefined/string throw would turn the failure record itself into a TypeError.
-		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		await finishRun(KEY, {
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			error: e?.message ?? String(e),
+		});
 		throw e;
-	} finally {
-		running = false;
 	}
 };
 

@@ -39,6 +39,16 @@ import { classifyUrl, PRERENDER } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
 import { walkUrlRange } from './urlWalk.js';
+import {
+	claimRun,
+	finishRun,
+	isRunning,
+	makeCancelPoller,
+	makeHeartbeat,
+	publishRunState,
+	readRunState,
+	requestCancel,
+} from './runState.js';
 
 /**
  * Has the demand ladder stamped a rung on this target? Coerced before the finite check for the
@@ -219,15 +229,52 @@ const newStats = () => ({
 	canceled: false,
 });
 
+/**
+ * RUN STATE AND THE CANCEL LIVE ON THE NODE, NOT IN THIS MODULE — see `util/runState.js`.
+ *
+ * This is the sweep the per-worker pattern hurt most, and the cancel is why. `stopDiscoveredPurge`
+ * set a module flag in the worker that received the POST, and the running pass polled its OWN
+ * worker's flag. Harper loads a component per worker thread and the admin route is served by
+ * whichever worker takes the connection, so on a 16-worker node a stop had roughly a 1-in-16
+ * chance of reaching the pass. Every other time it reported the purge as not running and DID NOT
+ * STOP IT — on a paced bulk delete, with the operator's evidence saying it had stopped.
+ *
+ * `state` here is now a local mirror kept only so the pass's hot loop mutates something cheap; it
+ * is published to the row as it goes, and the row is what every reader and the cancel use.
+ */
+const KEY = 'discovery_purge';
+
+/**
+ * A purge of a large prefix runs for hours, so liveness is the HEARTBEAT and this window only has
+ * to outlast the gap between beats — it is not a bound on the pass. Four times the beat interval,
+ * so a node under load does not lose its own claim.
+ */
+const PURGE_STALE_MS = 120_000;
+
 let state = null;
-let cancelRequested = false;
 
-/** Live progress + last-run summary for the management API. */
-export const getDiscoveredPurgeState = () => state ?? { running: false };
+/** Live progress + last-run summary for the management API, from ANY worker on this node. */
+export const getDiscoveredPurgeState = async () => {
+	const row = await readRunState(KEY);
+	if (!row) return { running: false };
+	// THE CLAIM IS THE AUTHORITY ON "RUNNING", not the progress mirror. `progress` is republished on
+	// the throttled beat, so a pass that has only just started (or one whose beat has not come round
+	// yet) has a live claim and no mirror — reading the mirror first would report that as idle,
+	// which is the exact class of lie this module was rewritten to stop telling.
+	if (isRunning(row, PURGE_STALE_MS)) {
+		return row.progress ?? { running: true, node: row.node, startedAt: row.startedAt };
+	}
+	return row.lastRun ?? { running: false };
+};
 
-/** Request a cooperative stop; the pass ends at its next row. */
-export const stopDiscoveredPurge = () => {
-	if (state?.running) cancelRequested = true;
+/**
+ * Request a cooperative stop; the pass ends at its next row.
+ *
+ * The flag goes on the ROW, so it reaches the pass whichever worker is running it — which is the
+ * whole reason this module was rewritten.
+ */
+export const stopDiscoveredPurge = async () => {
+	await requestCancel(KEY);
 	return getDiscoveredPurgeState();
 };
 
@@ -267,18 +314,23 @@ const badRequest = (message) => Object.assign(new Error(message), { statusCode: 
  * Start one detached, owner-scoped purge pass on THIS node. Returns the initial state;
  * progress and the outcome live on `getDiscoveredPurgeState`.
  */
-export const startDiscoveredPurge = ({
+export const startDiscoveredPurge = async ({
 	urlPrefix,
 	dryRun = true,
 	ratePerSecond = 200,
 	force = false,
 	skipVisited = false,
 } = {}) => {
-	if (state?.running) return { started: false, alreadyRunning: true, state };
+	// VALIDATE BEFORE CLAIMING. A refused prefix must not take the claim and then throw, which
+	// would leave the node unable to start a purge until the heartbeat went stale.
 	const refusal = validatePurgePrefix(urlPrefix, { force });
 	if (refusal) throw refusal;
 
-	cancelRequested = false;
+	const claim = await claimRun(KEY, { staleMs: PURGE_STALE_MS });
+	if (!claim.claimed) {
+		return { started: false, alreadyRunning: true, state: claim.row?.progress ?? { running: false } };
+	}
+
 	state = {
 		running: true,
 		node: server.hostname,
@@ -294,6 +346,11 @@ export const startDiscoveredPurge = ({
 	};
 
 	const stats = state;
+	const beat = makeHeartbeat(KEY);
+	// PUBLISH THE MIRROR ONCE, UP FRONT. The beat is throttled, so without this a short pass could
+	// finish having never published progress at all, and a reader mid-pass would see the claim with
+	// nothing to describe it.
+	await publishRunState(KEY, { progress: { ...stats } });
 	purgeDiscoveredTargets({
 		rows: walkPrefix(databases.render_service.Target, urlPrefix, undefined, () => {
 			stats.unreadable++;
@@ -309,16 +366,26 @@ export const startDiscoveredPurge = ({
 		dryRun,
 		ratePerSecond,
 		skipVisited,
-		isCanceled: () => cancelRequested,
+		// The beat rides the walk's existing yield hook — no timer of its own, which would keep
+		// beating after a crashed pass and defeat the staleness window it feeds.
+		onYield: async () => {
+			beat({ ...stats });
+			await yieldNow();
+		},
+		// READ FROM THE ROW, so a stop that landed on any worker is seen here. The poller answers
+		// synchronously from a cached value (it is called once per row) and refreshes in the
+		// background, so a stop takes effect within a couple of seconds rather than on the next row.
+		isCanceled: makeCancelPoller(KEY),
 		stats,
 	})
 		.catch((e) => {
 			stats.error = e?.message ?? String(e);
 			logger.error(e, '[prerender] discovery purge failed');
 		})
-		.finally(() => {
+		.finally(async () => {
 			stats.running = false;
 			stats.finishedAt = Date.now();
+			await finishRun(KEY, { ...stats });
 			const verb = stats.dryRun ? 'would delete' : 'deleted';
 			logger.warn(
 				`[prerender] discovery purge ${stats.canceled ? 'stopped' : 'finished'}: ${verb} ${stats.deleted} ` +
@@ -337,8 +404,14 @@ export const startDiscoveredPurge = ({
 	return { started: true, alreadyRunning: false, state };
 };
 
-/** Test seam. */
+/** Test seam: clear the local mirror and the node's published row. */
 export const resetDiscoveredPurgeState = () => {
 	state = null;
-	cancelRequested = false;
+	return publishRunState(KEY, {
+		running: false,
+		heartbeatAt: null,
+		cancelRequested: false,
+		progress: null,
+		lastRun: null,
+	});
 };

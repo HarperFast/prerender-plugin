@@ -497,7 +497,7 @@ export class PrerenderAdmin extends Resource {
 			case 'discovery-purge':
 				// Live progress of THIS node's purge pass (it mutates its stats in place), or the
 				// last finished pass. Owner-scoped like sweep-orphans: query every node.
-				return json({ node: server.hostname, ...getDiscoveredPurgeState() });
+				return json({ node: server.hostname, ...(await getDiscoveredPurgeState()) });
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -1147,8 +1147,8 @@ export class PrerenderAdmin extends Resource {
 	 * Node-scoped, because a node can only authoritatively check the keys it owns — see
 	 * util/reconcile.js. Every node runs the periodic sweep for its own slice.
 	 */
-	static reconcile() {
-		const lastRun = getLastReconcile();
+	static async reconcile() {
+		const lastRun = await getLastReconcile();
 		const payload = {
 			node: server.hostname,
 			ownerScopeNote: 'Repairs only the keys this node owns; every node sweeps its own slice.',
@@ -1158,7 +1158,7 @@ export class PrerenderAdmin extends Resource {
 		// Checked up front so a double-click reports honestly rather than implying a second
 		// pass began. `runReconcileOnce` holds the authoritative guard either way, so the
 		// microtask-wide race between these two only affects the wording, never the work.
-		if (isReconcileRunning()) {
+		if (await isReconcileRunning()) {
 			return json({ ...payload, started: false, alreadyRunning: true });
 		}
 
@@ -1179,8 +1179,8 @@ export class PrerenderAdmin extends Resource {
 	 * `dryRun` defaults to the configured value (itself `true`), so an operator who POSTs this
 	 * without arguments gets a census rather than a deletion. Pass `{ dryRun: false }` to act.
 	 */
-	static sweepOrphans(data) {
-		const lastRun = getLastOrphanSweep();
+	static async sweepOrphans(data) {
+		const lastRun = await getLastOrphanSweep();
 		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : config.render.orphanSweep.dryRun;
 		const maxDeletes = Number.isFinite(Number(data?.maxDeletes))
 			? Math.max(1, Math.floor(Number(data.maxDeletes)))
@@ -1194,7 +1194,7 @@ export class PrerenderAdmin extends Resource {
 			lastRun,
 		};
 
-		if (isOrphanSweepRunning()) {
+		if (await isOrphanSweepRunning()) {
 			return json({ ...payload, started: false, alreadyRunning: true });
 		}
 
@@ -1215,16 +1215,16 @@ export class PrerenderAdmin extends Resource {
 	 * paced (`ratePerSecond` targets per second, default 200); progress is on
 	 * GET /prerender_admin/discovery-purge, and `{ action: 'stop' }` ends it at the next row.
 	 */
-	static discoveryPurge(data) {
+	static async discoveryPurge(data) {
 		if (data?.action === 'stop') {
-			return json({ node: server.hostname, ...stopDiscoveredPurge() });
+			return json({ node: server.hostname, ...(await stopDiscoveredPurge()) });
 		}
 		const dryRun = typeof data?.dryRun === 'boolean' ? data.dryRun : true;
 		const ratePerSecond = Number.isFinite(Number(data?.ratePerSecond))
 			? Math.max(1, Math.floor(Number(data.ratePerSecond)))
 			: 200;
 		try {
-			const result = startDiscoveredPurge({
+			const result = await startDiscoveredPurge({
 				urlPrefix: data?.urlPrefix,
 				dryRun,
 				ratePerSecond,
@@ -1417,8 +1417,8 @@ export class PrerenderAdmin extends Resource {
 			reconcile: {
 				enabled: config.render.reconcile.enabled,
 				interval: config.render.reconcile.interval,
-				running: isReconcileRunning(),
-				lastRun: getLastReconcile(),
+				running: await isReconcileRunning(),
+				lastRun: await getLastReconcile(),
 			},
 			// Ditto for the key-rule orphan sweep — same node scope, but MANUAL: there is no timer,
 			// so `lastRun` is null until someone runs it and there is no cadence to report. It is
@@ -1428,8 +1428,8 @@ export class PrerenderAdmin extends Resource {
 			orphanSweep: {
 				dryRunDefault: config.render.orphanSweep.dryRun,
 				maxDeletes: config.render.orphanSweep.maxDeletes,
-				running: isOrphanSweepRunning(),
-				lastRun: getLastOrphanSweep(),
+				running: await isOrphanSweepRunning(),
+				lastRun: await getLastOrphanSweep(),
 			},
 		};
 	}
