@@ -77,6 +77,12 @@ type RenderAttempt = {
 	 * request produces no response.
 	 */
 	subresourceErrors?: number;
+	/**
+	 * Cached responses the BROWSER refused to fulfil (a header it will not accept). Each one was
+	 * fetched from the network instead, so the render is unaffected — what it costs is the cache
+	 * hit. A steady count means the resource cache is quietly doing less than it appears to.
+	 */
+	cacheReplaysRefused?: number;
 };
 
 type OriginHttpResponse = {

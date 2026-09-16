@@ -221,8 +221,29 @@ const renderer: Renderer = async (page, job) => {
 					return;
 				}
 				if (entry) {
-					req.respond(cache.toRespondPayload(entry)).catch(noop);
-					return;
+					// A REFUSED REPLAY MUST FALL THROUGH TO THE NETWORK. The browser can reject a payload
+					// (see `filterReplayHeaders`), and a swallowed rejection leaves the request unanswered
+					// for the rest of the render: the resource never loads, the page waits on it, and the
+					// snapshot is missing whatever it would have done — with nothing to say so. puppeteer
+					// clears its interception flag when `Fetch.fulfillRequest` errors, so the request can
+					// still be continued, which is what a cache miss would have done anyway.
+					const served = await req
+						.respond(cache.toRespondPayload(entry))
+						.then(() => true)
+						.catch(() => {
+							// Counted rather than logged: a page whose cached asset the browser will not take
+							// refuses it on EVERY render, so a log line here would be per-render noise. The
+							// worker reports the count for the window.
+							if (job.latestAttempt) {
+								job.latestAttempt.cacheReplaysRefused = (job.latestAttempt.cacheReplaysRefused ?? 0) + 1;
+							}
+							return false;
+						});
+					if (served) return;
+					if (ac.signal.aborted || aborted) {
+						req.abort().catch(noop);
+						return;
+					}
 				}
 			}
 			// Same-origin SUBRESOURCES need the bypass token as much as the document does. An edge

@@ -171,6 +171,9 @@ export default class RenderWorker {
 			// cache is affected); `subresourceErrors` is the total refused assets (how badly).
 			rendersDegraded: 0,
 			subresourceErrors: 0,
+			// Cached responses the browser refused to fulfil; each was fetched from the network instead,
+			// so this is lost cache value, not lost content.
+			cacheReplaysRefused: 0,
 			renderTimes: [] as number[],
 			// Per-phase wall-clock samples (ms), drained into percentiles by logStats. Attribute
 			// the render time to network-wait (navTtfb/navTotal) vs in-browser work (settle/postProcess).
@@ -578,6 +581,7 @@ export default class RenderWorker {
 				// render "succeeded" — treat it like a failure count, not a curiosity.
 				rendersDegraded: s.rendersDegraded,
 				subresourceErrors: s.subresourceErrors,
+				cacheReplaysRefused: s.cacheReplaysRefused,
 				fromSitemap: s.fromSitemap,
 				failures: failuresTotal,
 				failuresByType: s.failures,
@@ -948,6 +952,7 @@ export default class RenderWorker {
 		if (attempt?.renderEndTime) {
 			this.stats.renderTimes.push(attempt.renderEndTime - attempt.renderStartTime);
 		}
+		if (attempt?.cacheReplaysRefused) this.stats.cacheReplaysRefused += attempt.cacheReplaysRefused;
 		if (attempt?.subresourceErrors) {
 			this.stats.rendersDegraded++;
 			this.stats.subresourceErrors += attempt.subresourceErrors;
