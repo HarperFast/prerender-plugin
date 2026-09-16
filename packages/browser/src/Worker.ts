@@ -486,8 +486,26 @@ export default class RenderWorker {
 					break;
 				}
 			}
-			await this.renderVariant(variant);
-			attempted.push(variant);
+			// A THROW HERE MUST NOT COST THE VARIANTS ALREADY RENDERED. `renderVariant` swallows
+			// render failures itself, but it starts with `getBrowser()` — outside that handling — so a
+			// failed relaunch between variants (the browser the previous variant retired on a timeout
+			// or protocol error) rejected out of this loop, discarded every completed render, and
+			// posted nothing at all, leaving the row pinning the claim floor. Ending the loop and
+			// posting what is in hand is the same trade the lease and drain checks above already make.
+			try {
+				await this.renderVariant(variant);
+				attempted.push(variant);
+			} catch (e) {
+				this.stats.failures.getPageFailed++;
+				const skipped = variants.length - attempted.length;
+				this.stats.variantsSkipped += skipped;
+				logger.error(
+					{ id: job.id, deviceType: variant.deviceType, skipped, err: e },
+					'variant could not be started — posting what has rendered and leaving the rest to the plugin'
+				);
+				if (attempted.length === 0) throw e;
+				break;
+			}
 		}
 
 		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure

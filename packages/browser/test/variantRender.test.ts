@@ -185,3 +185,55 @@ test('a legacy per-device job renders once and posts the legacy shape', async ()
 	assert.equal(posted[0].id, 'https://site.example.com/product/x|desktop');
 	assert.equal(posted[0].variants, undefined, 'an older plugin reads the flat shape');
 });
+
+test('a browser that cannot be relaunched between variants still posts what already rendered', async () => {
+	// `renderVariant` handles render failures itself, but it opens with `getBrowser()` — outside
+	// that handling. A variant that retires the browser on a timeout, followed by a relaunch that
+	// fails, used to reject straight out of the render loop: the completed first render was thrown
+	// away, nothing was posted, and the row kept pinning the claim floor with no result to release it.
+	const seen: string[] = [];
+	const { worker } = makeWorker(async (_page, job) => {
+		seen.push(job.deviceType);
+		job.httpResponse = { statusCode: 200, headers: {} };
+		job.isIndexable = true;
+		return `<html>${job.deviceType}</html>`;
+	});
+	let calls = 0;
+	worker.getBrowser = (async () => {
+		if (++calls > 1) throw new Error('Failed to launch the browser process');
+		return worker.browser;
+	}) as never;
+
+	posted.length = 0;
+	try {
+		await worker.render(urlJob());
+	} finally {
+		await worker.destroy();
+	}
+
+	assert.deepEqual(seen, ['desktop'], 'only the first variant ran');
+	assert.equal(posted.length, 1, 'the completed render was posted rather than discarded');
+	assert.deepEqual(posted[0].deviceTypes, ['desktop', 'mobile'], 'the job still reports what it was asked for');
+	assert.deepEqual(
+		posted[0].variants?.map((v) => [v.deviceType, v.outcome]),
+		[['desktop', 'rendered']],
+		'mobile is simply absent, which the plugin reads as not-attempted and retries'
+	);
+});
+
+test('a first variant that cannot start still rejects, exactly as a single-device job always did', async () => {
+	// The complement of the case above, and deliberately unchanged: with nothing rendered there is
+	// nothing to post, so the failure propagates to the run loop's handler as it does today.
+	const { worker } = makeWorker(async () => '<html>never</html>');
+	worker.getBrowser = (async () => {
+		throw new Error('Failed to launch the browser process');
+	}) as never;
+
+	posted.length = 0;
+	try {
+		await assert.rejects(() => worker.render(urlJob()), /Failed to launch/);
+	} finally {
+		await worker.destroy();
+	}
+	assert.equal(posted.length, 0);
+});
