@@ -138,6 +138,26 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'fast cadence at corpus scale. A floor at or above the granted cadence leaves the route ' +
 					'resting at that cadence (single-rung). Stored rungs below a newly-raised floor read as the ' +
 					'floor immediately and re-stamp on their next ladder decision. Live, like renderInterval.\n\n' +
+					"`departureAction` (default 'none', prerender routes only) — what happens when a URL on " +
+					'this route LEAVES the sitemap that listed it. A refresh unlinks such a target ' +
+					'(`sitemapUrl -> null`) and leaves it rendering on its own cadence, which is the right ' +
+					'default for a URL that merely stopped being declared. On a retail catalog it is not: a ' +
+					'product that sells out or is withdrawn leaves the product sitemap the same day, while its ' +
+					'page keeps serving the snapshot taken when it was still available.\n' +
+					'  none    — the pre-0.68.0 behaviour. Unlink and nothing else.\n' +
+					'  expire  — hard-expire the cached pages (past `page.swrTtl`, so they stop serving rather ' +
+					'than serving stale) and let the URL re-render on its own cadence. Bots fall through to the ' +
+					'origin in the meantime, which is correct but is origin load.\n' +
+					'  render  — hard-expire AND file the URL to render at the current minute, so one render ' +
+					'restores a correct page. This is the usual choice.\n' +
+					'Departure is a statement about the DECLARATION, not the page: the origin typically still ' +
+					'serves the URL with out-of-stock markup, so this is a RE-CHECK and the render’s own verdict ' +
+					'decides what follows — a page that is merely unavailable re-renders and stays, and one the ' +
+					'origin has actually retired answers 404/410 and is retired by the suppression path. Set it ' +
+					'only on routes where departure carries that meaning: a product URL leaving a product ' +
+					'sitemap says something about that product, while a listing URL leaving a paginated sitemap ' +
+					'usually means the catalog was re-bucketed, and acting on it would expire current pages. ' +
+					'Bounded and observable by `sitemap.departure`.\n\n' +
 					'`discoverTargets` (default true, prerender routes only) — whether a bot visiting an UNKNOWN ' +
 					'URL on this route creates a target for it. Set false on routes whose URL space is ' +
 					'combinatorial (faceted navigation, filter/sort permutations): crawlers walking those links ' +
@@ -1666,6 +1686,51 @@ export const configSchema = group('Prerender plugin configuration.', {
 			{ min: 0 }
 		),
 		failedCap: option(100, 'Max failed-entry samples carried back in a refresh result.', { min: 0 }),
+		departure: group(
+			'What a refresh does about URLs that LEAVE a sitemap, beyond unlinking them. The action is ' +
+				'declared PER ROUTE (`ingress.routes[].departureAction`); this group bounds and observes it, ' +
+				'and nothing here does anything until at least one route opts in.\n\n' +
+				'THE CHECK RUNS AFTER THE WHOLE WALK, not at prune time, and that is not an optimisation. A ' +
+				'paginated corpus shears across child boundaries: children are walked in order, so a URL that ' +
+				'moves to an EARLIER child is re-attached before the child it left is pruned and never looks ' +
+				'departed — but one that moves to a LATER child is pruned first and looks departed until the ' +
+				'child that now claims it is reached. Acting at prune time would fire on every URL that shifted ' +
+				'forward, which on a fixed-size paginated sitemap is every URL after an insertion. Candidates ' +
+				'are re-read once the walk ends and anything that picked up an attribution is dropped.',
+			{
+				enabled: option(
+					true,
+					'Master switch for the post-walk departure check. Routes still have to opt in, so leaving ' +
+						'this on costs nothing until one does; it exists so an operator can stop the behaviour ' +
+						'during an incident without editing the route list.'
+				),
+				dryRun: option(
+					true,
+					'Decide and report, write nothing. The default, because the useful thing to know first is ' +
+						'HOW MANY URLs a real walk would act on — a number no deployment has until it has ' +
+						'looked, and one that decides whether `maxActions` is a ceiling or a no-op. The result ' +
+						'and the progress row carry the outcome tally either way.'
+				),
+				maxActions: option(
+					5000,
+					'Ceiling on departed URLs ACTED ON in one walk. Skipped candidates (re-attached, ' +
+						'suppressed, route opted out) do not count against it. The cap is the guard against a ' +
+						'pathological walk: a child sitemap that fetches truncated but still parses as valid XML ' +
+						'presents every URL it no longer lists as departed, and without a ceiling one bad fetch ' +
+						'would expire a large slice of the cache. Overflow is counted as `capped` and left for ' +
+						'the next walk rather than silently dropped.',
+					{ min: 0 }
+				),
+				maxCandidates: option(
+					50000,
+					'Ceiling on departed URLs HELD for the post-walk check. Separate from `maxActions` because ' +
+						'this one bounds memory: it is a list of URLs retained across a walk that can prune ' +
+						'millions. A capped list is reported as such, so a short list is never presented as ' +
+						'"few departed".',
+					{ min: 0 }
+				),
+			}
+		),
 		userAgent: option(
 			'HarperSitemapCrawler/1.0',
 			'User-Agent for Harper’s sitemap crawler fetch. Unlike the proxy fetch UAs, a sitemap fetch ' +

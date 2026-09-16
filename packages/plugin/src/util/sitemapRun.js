@@ -91,7 +91,7 @@ export const actionForExisting = (existingTarget, sitemapUrl, claimedThisWalk) =
  *    cannot act on a partial set while claiming success, and the only caller was discarding it.
  *  - `failed` exists at all. One unreachable child used to abort the entire walk.
  */
-export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}) => {
+export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, departureCap = 0 } = {}) => {
 	const totals = {
 		created: 0,
 		updated: 0,
@@ -111,6 +111,14 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 	const truncatedScans = [];
 	let failedOverflow = 0;
 
+	// Departed URLs held for the post-walk check (util/sitemapDeparture.js). Collected during the
+	// walk and acted on only after it finishes, because a URL that shifts to a LATER child of a
+	// paginated index is pruned before the child that now claims it is reached — so mid-walk it is
+	// indistinguishable from one that genuinely left. Bounded: this is a list of URLs held in
+	// memory across a walk that can prune millions, and `departureCap: 0` (the default) keeps it
+	// empty for every deployment that has not opted a route in.
+	const departure = { candidates: [], capped: false, outcomes: {} };
+
 	return {
 		count(key, by = 1) {
 			totals[key] += by;
@@ -121,13 +129,37 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 			filtered[UNCLASSIFIED] += counts[UNCLASSIFIED];
 		},
 
-		/** Record unlinked targets: the full count always, a bounded sample of the URLs. */
+		/**
+		 * Record unlinked targets: the full count always, a bounded sample of the URLs, and — when
+		 * a route has opted in — a bounded list of candidates for the post-walk departure check.
+		 *
+		 * The `break` the sample loop used to take is now a `continue`-shaped condition: the two
+		 * caps are independent, and stopping the whole loop at the SAMPLE cap would have silently
+		 * truncated the candidate list to `removedSampleCap` entries.
+		 */
 		addRemoved(targets) {
 			totals.removed += targets.length;
 			for (const target of targets) {
-				if (removedSample.length >= removedSampleCap) break;
-				removedSample.push(target.url);
+				if (removedSample.length < removedSampleCap) removedSample.push(target.url);
+				if (departureCap <= 0) continue;
+				if (departure.candidates.length < departureCap) departure.candidates.push(target.url);
+				else departure.capped = true;
 			}
+		},
+
+		/** The departed URLs to re-read once the walk has finished. */
+		departureCandidates() {
+			return departure.candidates;
+		},
+
+		/**
+		 * One departure outcome, by name — the action taken ('render', 'expire'), the reason it was
+		 * skipped ('reattached', 'suppressed', 'route-opted-out', 'target-gone'), or 'capped'. Keyed
+		 * rather than counted into fixed fields so a new decision branch reports itself without a
+		 * matching change here and in the progress row.
+		 */
+		countDeparture(outcome) {
+			departure.outcomes[outcome] = (departure.outcomes[outcome] ?? 0) + 1;
 		},
 
 		/** A child sitemap threw. The walk continues; the failure is reported, not swallowed. */
@@ -150,6 +182,13 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100 } = {}
 				failed: [...failed],
 				failedOverflow,
 				truncatedScans: [...truncatedScans],
+				departures: {
+					// What the walk collected vs what it could not hold: a capped list means some
+					// departed URLs were never checked, which is a smaller claim than "none departed".
+					considered: departure.candidates.length,
+					capped: departure.capped,
+					outcomes: { ...departure.outcomes },
+				},
 			};
 		},
 	};
