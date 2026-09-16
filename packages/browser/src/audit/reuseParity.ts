@@ -75,18 +75,25 @@ export type VariantSnapshot = {
 };
 
 /**
- * Did this device stay itself? `distinctive` is how many normalised chunks appear in this device's
- * control and in NO other device's control — its signature, the markup only this viewport and user
- * agent produce. `retained` is how many of those the REPLAYED render still has. A mobile variant that
- * had become a second desktop render would keep almost none of them.
+ * Did this device stay itself? Measured RELATIVELY, because absolute measures do not survive a live
+ * page: the replayed render is compared both against its own control and against the nearest OTHER
+ * device's control, and what matters is that it is much closer to its own.
+ *
+ * The first version of this counted the markup distinctive to each device and checked how much the
+ * replay kept — and it flagged the DESKTOP variant, which replays nothing at all. Recommendation
+ * rails pick different products on every render, so most "distinctive" markup is distinctive to the
+ * RENDER, not to the device. Churn inflates both sides of a relative comparison equally, so the ratio
+ * between them still answers the question.
  */
-export type DeviceSignature = {
-	distinctive: number;
-	retained: number;
-	/** `retained / distinctive`, or null when the devices produce no distinctive markup at all. */
-	ratio: number | null;
-	/** Distinctive chunks the replayed render LOST — the first few, to read by eye. */
-	lost: string[];
+export type DeviceIdentity = {
+	/** Structural divergence between the replayed render and this device's own control. */
+	ownRatio: number;
+	/** Divergence from the nearest other device's control; null when there is no other device. */
+	crossRatio: number | null;
+	/** How far apart the two CONTROLS are — how distinguishable these devices are on this page at all. */
+	controlsRatio: number | null;
+	/** `ownRatio / crossRatio` — near 0 when the device stayed itself, near or above 1 when it did not. */
+	relative: number | null;
 };
 
 export type DeviceParity = {
@@ -98,21 +105,26 @@ export type DeviceParity = {
 	/** Outcome, status and indexability all agree. */
 	outcomeMatch: boolean;
 	divergence: DocumentDivergence;
-	/** Whether the replayed render kept the markup distinctive to this device. */
-	signature: DeviceSignature;
-	/** False when the device lost its own signature — a mobile render that came back desktop. */
+	/** How much closer the replayed render is to its own control than to the other device's. */
+	identity: DeviceIdentity;
+	/** False when the replayed render looks more like its sibling than like itself. */
 	identityHeld: boolean;
 	/** False when the offers or the outcome differ — the cases that mean the page is wrong. */
 	pass: boolean;
 };
 
 /**
- * How much of a device's signature a replayed render must keep. Not 1: a live page churns between
- * two renders, and a rotating rail or a personalised slot can be distinctive to a device in one
- * render and absent in the next through nothing to do with reuse. A variant that had actually become
- * its sibling scores near 0, so the threshold only has to be far from both ends.
+ * A replayed render must be at least this much closer to its own control than to the nearest other
+ * device's. Generous on purpose: a device swap scores at or above 1, a healthy replay well under 0.5
+ * on any site whose devices differ at all, and the threshold only has to separate those.
  */
-export const DEVICE_SIGNATURE_FLOOR = 0.6;
+export const DEVICE_IDENTITY_MAX_RELATIVE = 0.5;
+
+/**
+ * Below this cross-device divergence the two devices simply render the same markup, so there is no
+ * identity to lose and the relative test is not applied (it would divide by noise).
+ */
+export const DEVICES_ALIKE_BELOW = 0.02;
 
 export type ReuseParityResult = {
 	url: string;
@@ -174,23 +186,26 @@ const sameOffers = (a: VariantSnapshot['structuredOffers'], b: VariantSnapshot['
 	JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /**
- * What this device's control produced that no OTHER device's control did, and how much of it the
- * replayed render kept. This is the only comparison here that crosses devices, and it crosses them to
- * prove they stayed apart: a mobile variant answered from the desktop document is still expected to
- * lay out, script and serialize as mobile, because the viewport and user agent are its own.
+ * How much more like ITSELF than like its sibling the replayed render is. The only comparison in this
+ * file that crosses devices, and it crosses them to prove they stayed apart: a mobile variant answered
+ * from the desktop document still has mobile's viewport and user agent, so it must still serialize as
+ * mobile. Both numbers move together when the page churns, which is exactly why the verdict is their
+ * ratio rather than either one on its own.
  */
-const deviceSignature = (own: string, others: string[], reused: string): DeviceSignature => {
-	const mine = normalisedChunks(own);
-	for (const other of others) for (const chunk of normalisedChunks(other).keys()) mine.delete(chunk);
-	const replayed = normalisedChunks(reused);
-	let retained = 0;
-	const lost: string[] = [];
-	for (const chunk of mine.keys()) {
-		if (replayed.has(chunk)) retained++;
-		else if (lost.length < 3) lost.push(chunk.slice(0, 120));
-	}
-	const distinctive = mine.size;
-	return { distinctive, retained, ratio: distinctive ? retained / distinctive : null, lost };
+const deviceIdentity = (own: string, others: string[], reused: string): DeviceIdentity => {
+	const ownRatio = documentDivergence(own, reused).ratio;
+	const crossRatios = others.map((other) => documentDivergence(other, reused).ratio);
+	const crossRatio = crossRatios.length ? Math.min(...crossRatios) : null;
+	const controlRatios = others.map((other) => documentDivergence(own, other).ratio);
+	const controlsRatio = controlRatios.length ? Math.min(...controlRatios) : null;
+	return {
+		ownRatio,
+		crossRatio,
+		controlsRatio,
+		// A cross ratio of zero means the replay IS the other device's page — the worst case, not a
+		// missing measurement, so it reads as infinitely far from holding its own identity.
+		relative: crossRatio === null ? null : crossRatio === 0 ? Infinity : ownRatio / crossRatio,
+	};
 };
 
 /**
@@ -261,13 +276,17 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 				const offersMatch = sameOffers(a.structuredOffers, b.structuredOffers);
 				const outcomeMatch =
 					a.outcome === b.outcome && a.statusCode === b.statusCode && a.isIndexable === b.isIndexable;
-				const signature = deviceSignature(
+				const identity = deviceIdentity(
 					control[i].content ?? '',
 					control.filter((_, j) => j !== i).map((v) => v.content ?? ''),
 					reused[i].content ?? ''
 				);
-				// A null ratio means the devices render identical markup, so there is no identity to lose.
-				const identityHeld = signature.ratio === null || signature.ratio >= DEVICE_SIGNATURE_FLOOR;
+				// Devices that render alike have no identity to lose, and dividing by that noise would invent a
+				// verdict; everywhere else the replay must be markedly closer to its own control than its sibling's.
+				const identityHeld =
+					identity.controlsRatio === null ||
+					identity.controlsRatio < DEVICES_ALIKE_BELOW ||
+					(identity.relative ?? 0) <= DEVICE_IDENTITY_MAX_RELATIVE;
 				return {
 					deviceType,
 					control: a,
@@ -275,7 +294,7 @@ export async function reuseParityCheck(options: ReuseParityOptions): Promise<Reu
 					offersMatch,
 					outcomeMatch,
 					divergence: documentDivergence(control[i].content ?? '', reused[i].content ?? ''),
-					signature,
+					identity,
 					identityHeld,
 					pass: offersMatch && outcomeMatch && identityHeld,
 				};
@@ -297,20 +316,22 @@ export function formatReuseParity(results: ReuseParityResult[]): string {
 			const flags = [d.reused.documentReused && 'reused', d.reused.documentPrefetched && 'prefetched']
 				.filter(Boolean)
 				.join('+');
-			const sig =
-				d.signature.ratio === null
-					? 'n/a (devices render alike)'
-					: `${(d.signature.ratio * 100).toFixed(1)}% of ${d.signature.distinctive}${d.identityHeld ? '' : ' — LOST'}`;
+			const id =
+				d.identity.crossRatio === null
+					? 'n/a (single device)'
+					: `${d.identity.ownRatio.toFixed(3)} own vs ${d.identity.crossRatio.toFixed(3)} sibling${d.identityHeld ? '' : ' — NOT ITSELF'}`;
 			lines.push(
 				`   ${d.pass ? 'ok  ' : 'DIFF'} ${d.deviceType.padEnd(8)} ` +
 					`offers=${d.offersMatch ? 'same' : 'DIFFERENT'} ` +
 					`outcome=${d.outcomeMatch ? 'same' : `${d.control.outcome}/${d.control.statusCode} -> ${d.reused.outcome}/${d.reused.statusCode}`} ` +
-					`own-markup-kept=${sig} ` +
+					`device=${id} ` +
 					`divergence=${d.divergence.ratio.toFixed(4)} ` +
 					`bytes=${d.control.bytes}->${d.reused.bytes}${flags ? ` [${flags}]` : ''}`
 			);
-			if (!d.identityHeld && d.signature.lost.length) {
-				lines.push(`        markup this device LOST: ${d.signature.lost.join(' | ')}`);
+			if (!d.identityHeld) {
+				lines.push(
+					`        this render is no closer to its own control than to the other device's — reuse did not preserve ${d.deviceType}`
+				);
 			}
 			if (!d.offersMatch) {
 				lines.push(`        control offers : ${JSON.stringify(d.control.structuredOffers)}`);

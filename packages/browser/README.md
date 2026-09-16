@@ -558,12 +558,15 @@ everything else still looks healthy. A non-zero divergence ratio is not automati
 pages churn between two renders seconds apart); a differing offer set is.
 
 It also answers the question those per-device comparisons structurally cannot: **did mobile stay
-mobile?** Each device's control is compared against the other devices' controls to find the markup
-that is DISTINCTIVE to it — the chunks only that viewport and user agent produce — and the replayed
-render is then measured for how much of its own signature it kept (`own-markup-kept` in the report,
-`signature` on the result). A replayed variant that had become its sibling keeps almost none of it, so
-the check fails on identity even when the offers and the outcome agree. This is the only comparison
-here that crosses devices, and it crosses them to prove they stayed apart.
+mobile?** The replayed render is compared both against its own control and against the nearest other
+device's control, and must be markedly closer to its own (`device=0.130 own vs 0.420 sibling` in the
+report, `identity` on the result). A replayed variant that had become its sibling fails this even
+though its offers, status and outcome all agree, because the sibling's page is a perfectly valid page.
+The test is deliberately RELATIVE: a live page churns between any two renders — recommendation rails
+alone replace most of a page's per-device markup — so both numbers move together and only their ratio
+is stable. Where the two devices render the same markup anyway (controls within 2% of each other),
+there is no identity to lose and the test does not apply. This is the only comparison here that
+crosses devices, and it crosses them to prove they stayed apart.
 
 This is the gate for turning `documentReuse.enabled` on, and for deciding what belongs in
 `cookies.pin`. The in-worker sampled check is the ongoing version of the same question, but it can

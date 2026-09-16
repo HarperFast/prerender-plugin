@@ -107,7 +107,8 @@ test('pinning the routing cookie makes the same site pass', async () => {
 test('a replayed variant still renders as ITS OWN device — the regression everyone actually fears', async () => {
 	// The page writes its own viewport into the DOM, so desktop and mobile produce genuinely different
 	// markup. Reuse hands the mobile variant the DESKTOP document; the viewport and user agent are
-	// still mobile's own, so the mobile render must still come out mobile.
+	// still mobile's own, so the mobile render must still come out mobile — measured as being much
+	// closer to its own control than to its sibling's.
 	const [result] = await reuseParityCheck({
 		urls: [`${base}/page`],
 		devices: ['desktop', 'mobile'],
@@ -117,8 +118,14 @@ test('a replayed variant still renders as ITS OWN device — the regression ever
 
 	assert.equal(result.pass, true, `expected a pass, got:\n${formatReuseParity([result])}`);
 	for (const d of result.devices) {
-		assert.ok(d.signature.distinctive > 0, `${d.deviceType} must produce markup the other device does not`);
-		assert.equal(d.signature.ratio, 1, `${d.deviceType} kept ALL of its own markup (lost: ${d.signature.lost})`);
+		assert.ok(
+			(d.identity.controlsRatio ?? 0) > 0.02,
+			`${d.deviceType}: the two devices must render distinguishably for this to mean anything`
+		);
+		assert.ok(
+			(d.identity.relative ?? 1) <= 0.5,
+			`${d.deviceType} stayed itself: own ${d.identity.ownRatio} vs sibling ${d.identity.crossRatio}`
+		);
 		assert.equal(d.identityHeld, true);
 	}
 	assert.equal(result.devices[1].reused.documentReused, true, 'and mobile really was replayed');
@@ -143,11 +150,12 @@ test('the check CATCHES a replayed variant that came back as its sibling', async
 	const [desktop, mobile] = result.devices;
 	assert.equal(desktop.identityHeld, true, 'the device that fetched the document is unaffected');
 	assert.equal(mobile.identityHeld, false, 'mobile came back as desktop and the check says so');
+	assert.equal(mobile.identity.crossRatio, 0, "it is byte-for-byte the other device's page");
 	assert.equal(mobile.offersMatch, true, 'while offers and outcome agree — which is why this check exists');
 	assert.equal(mobile.outcomeMatch, true);
 	assert.equal(mobile.pass, false);
 	assert.equal(result.pass, false);
 	const text = formatReuseParity([result]);
-	assert.match(text, /own-markup-kept=0\.0% of \d+ — LOST/);
-	assert.match(text, /markup this device LOST/);
+	assert.match(text, /NOT ITSELF/);
+	assert.match(text, /reuse did not preserve mobile/);
 });
