@@ -123,6 +123,71 @@ keep a URL's variants aligned: same render pass, seconds apart, one scheduling d
 }
 ```
 
+**Document reuse** (`config.documentReuse`, off by default). On a responsive site the origin answers
+every device with the same document, so the second and later variants of a job can be navigated from
+the first variant's captured document instead of fetching it again — one document fetch per URL
+render instead of one per device, and the second variant skips its download. **No cookie crosses variants except the ones you name**: the replayed response carries no
+`Set-Cookie` and nothing is copied from the first variant's context, so every variant starts with an
+empty jar. The exception is routing. Where a site picks _which backend_ serves the page's API calls
+from a cookie its document sets, a cookieless sibling renders against a different backend than the
+device that fetched the document, and one URL's two snapshots stop being comparable —
+`documentReuse.cookies.pin` names those cookies (empty by default), and a pinned cookie is also sent
+by a variant that goes to the origin itself, so parity holds whichever path a variant takes. Pin only
+routing cookies: never a session, cart, visitor or bot-manager cookie, which tie a render to an
+identity two devices must not share. Pinning assumes the cookie is **device-independent**; if a pinned name
+comes back with different values per device the worker warns and counts `pinnedCookieConflicts`, but
+that is a running check, not the gate. **Verify before you enable anything** with `reuseParityCheck`
+(below), which answers the same question locally and in advance. (Corollary
+worth knowing: with reuse off each device already gets its own document and its own cookie, so if the
+value is assigned per response rather than derived from the request, the two devices can disagree
+today.) A document is never reused when it is not a final `200 text/html`, has a redirect chain, or
+sends a `Vary` naming the user agent or a client hint. A replayed variant posts `documentReused:
+true`. Turn it on only for a **responsive**
+site: an adaptive site (server-side device detection, m-dot) serves different markup per device, and
+replaying desktop markup into a mobile render caches a page no mobile visitor is served. `sampleEvery:
+N` keeps that claim tested — every Nth job fetches its second variant normally and logs the structural
+divergence between the two documents (hashed asset names, hydration ids and script bodies are
+normalised away, so a deploy in progress does not read as divergence); it reports and counts, and
+deliberately never switches reuse off by itself.
+
+**Document prefetch** (`config.documentReuse.prefetch`, off by default) takes the document fetch off
+the render's critical path. Reuse makes it one fetch per URL instead of one per device; prefetch makes
+that fetch overlap an _earlier_ job's render: the worker keeps a small bounded pool (`depth`) of
+claimed jobs whose documents it fetches itself, in this process, while the render slots are busy, so
+that when a slot frees the next job's document is already in hand. Its first variant's navigation is
+answered from it **with the response's own cookies** (that variant is indistinguishable from one Chrome
+fetched — it is its own response, arrived early), and the later variants replay it as under reuse,
+without cookies. A prefetched document is that device's own response, so prefetch needs none of the
+cross-device guards and works on its own for a single-device job; with `enabled` it is also what the
+siblings replay. The request is built to be what the navigation would send (device user agent or the
+browser's own, `extraHeaders`, the bypass token, the job's headers, Chrome's navigation `Accept` and
+`Sec-Fetch-*`), and host resolution follows `hostResolverRules` exactly as Chrome does — a deployment
+pinned to a staging edge never has its prefetch reach production. Only a final `200 text/html` within
+32 MB is held; a redirect, an error status, a non-HTML body, a timeout (`timeoutMs`) or any failure
+yields nothing and the variant fetches the document itself, at the cost of one extra request for that
+URL. A variant answered from a prefetched document posts `documentPrefetched: true`. **The navigation
+waits at most 500ms for a prefetch still in flight** and then fetches for itself, counted as
+`prefetchLate`: that wait is spent inside the navigation, so an unbounded one would spend the render's
+own budget waiting for a document it may not get. Sizing: to hide
+a fetch of `f` seconds behind renders of `r` seconds on `c` slots, `depth ≥ f · c / r + 1` — the
+default `2` covers c=10, f=1 s, r=12 s; a pooled job sits claimed about `depth · r / c` seconds before
+its render starts, always inside the batch the plugin already claimed it in. **The pool also deepens
+itself**: every time a render has to wait out the grace and go to the origin, depth grows by one up to
+`maxDepth` (default 8) and stays there — the ratio between a fetch and a render is not something
+configuration can know in advance, and the whole point is that the next render finds its document
+already fetched. `rps` still paces render
+starts, and at steady state a prefetch starts each time a render does, so the origin sees the same
+request rate one render earlier. At shutdown, jobs still pooled — like any claimed job still waiting
+for a slot when the drain began — are dropped (nothing rendered, nothing to post; the lease expires
+and the queue re-grants them; `jobsAbandoned` counts them). The per-window log line reports
+`documentsPrefetched`, `prefetchLate`, `prefetchFallthrough` (by why), `jobsAbandoned`, and under `phaseMs`
+`prefetchFetch` (origin time taken off the render) and `prefetchWait` (how much of it a navigation
+still waited for — 0 means the depth is enough). With prefetch on, a sample job compares a document
+this process fetched against one Chrome fetched for the same URL, so it also keeps the prefetch's
+fidelity under test — on a sample job every variant fetches cold, including the one the document was
+prefetched for, so the comparison is same-device (this process against Chrome) rather than
+cross-device.
+
 A variant is **skipped and the result posted partial** when the lease has under 30s left or the
 worker began draining between variants: `variants` then lists fewer devices than `deviceTypes`, the
 plugin stores what rendered and retries the URL for the rest. (A result that never arrives would cost
@@ -151,6 +216,17 @@ include what you change:
 	"block": {
 		"resourceTypes": ["image", "media", "font"], // aborted before loading
 		"urlPatterns": ["google-analytics.com"], // abort requests whose URL contains any
+	},
+	// Reuse the first device's document for the other devices of a job (see "Document reuse" above).
+	// Only for a RESPONSIVE site; `sampleEvery` keeps a running structural check of that assumption.
+	// `prefetch` fetches each job's document in the worker while earlier jobs render (see "Document
+	// prefetch"): `depth` jobs ahead, giving up after `timeoutMs` (the variant then fetches itself).
+	"documentReuse": {
+		"enabled": false,
+		"sampleEvery": 0,
+		"prefetch": { "enabled": false, "depth": 2, "maxDepth": 8, "timeoutMs": 8000 },
+		// Cookie NAMES that may cross variants — routing cookies only, never session/cart/visitor.
+		"cookies": { "pin": [] },
 	},
 	"navigation": {
 		"waitUntil": "domcontentloaded", // 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'
@@ -451,6 +527,58 @@ Two things worth checking before adding a rule: an attribute may be **load-beari
 (`[data-state]` selectors are common), and it may be a **diagnostic** — Astro removes `ssr` from
 `<astro-island>` on hydration, so stripping `ssr` would destroy the only marker distinguishing a
 healthy snapshot from an un-hydrated one. Strip what is inert, not what is merely non-visual.
+
+### `reuseParityCheck` — proving reuse is safe BEFORE enabling it
+
+```ts
+import { reuseParityCheck, formatReuseParity } from '@harperfast/prerender-browser';
+
+const results = await reuseParityCheck({
+	urls: ['https://example.com/product/a', 'https://example.com/product/b'],
+	devices: ['desktop', 'mobile'],
+	pin: ['bucket'], // the routing cookies you intend to configure
+	bypass: { header: 'x-origin-bypass', token: process.env.BYPASS_TOKEN },
+	config: {
+		/* the fleet's own rendering config */
+	},
+});
+console.log(formatReuseParity(results));
+```
+
+Renders each URL twice — once with reuse off, which is what production does today and therefore the
+control, and once with it on — and compares **each device against its own control**. Nothing is
+compared across devices: the question is not whether desktop and mobile agree (they should not) but
+whether each is still the page it would have been.
+
+It reports, per device, whether the page's own `structuredOffers` are identical, whether the outcome,
+status and indexability agree, and the structural divergence of the snapshot. **Read the offers
+first** — where a site routes its API calls by a cookie the document sets, a replayed variant runs
+without it, its pricing call is answered by a different backend, and the offers come back wrong while
+everything else still looks healthy. A non-zero divergence ratio is not automatically a failure (live
+pages churn between two renders seconds apart); a differing offer set is.
+
+It also answers the question those per-device comparisons structurally cannot: **did mobile stay
+mobile?** A replayed render is measured against three distances taken on the same page in the same
+minute — its own control, the nearest other device's control, and **that device's own churn floor**,
+which is why the run renders each URL three times: two reuse-off passes (whose distance from each
+other is churn and nothing else) and one with reuse on. It
+must sit closer to the churn floor than to its sibling (`device=own 0.080 vs sibling 0.238, churn
+0.071`, `identity` on the result). A replayed variant that had become its sibling fails this even
+though its offers, status and outcome all agree, because the sibling's page is a perfectly valid page.
+
+The floor is what makes this usable on a live site. An absolute "kept its own markup" measure was
+tried first and failed the control — recommendation rails pick different products on every render, so
+even a variant that replays nothing loses most of its distinctive markup between two renders. Nor is
+one shared floor enough: on one catalog page two desktop renders differed by 0.172 while two mobile
+renders differed by 0.024, so judging mobile against desktop's noise invents a failure in one
+direction and hides one in the other. Where the devices do not differ by more than the churn, the result is reported
+`INCONCLUSIVE` rather than passed or failed, and the variant that fetched its own document is never
+judged — it is the control. This is the only comparison here that crosses devices, and it crosses them
+to prove they stayed apart.
+
+This is the gate for turning `documentReuse.enabled` on, and for deciding what belongs in
+`cookies.pin`. The in-worker sampled check is the ongoing version of the same question, but it can
+only report after the affected snapshots have been served.
 
 ## Custom renderer
 

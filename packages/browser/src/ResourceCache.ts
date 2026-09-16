@@ -63,10 +63,17 @@ type IndexEntry = {
 	size: number; // body byte length on disk
 };
 
-function filterReplayHeaders(headers: Record<string, string>): Record<string, string> {
-	const out: Record<string, string> = {};
+function filterReplayHeaders(headers: Record<string, string>): Record<string, string | string[]> {
+	const out: Record<string, string | string[]> = {};
 	for (const [k, v] of Object.entries(headers)) {
-		if (!NON_REPLAYABLE_HEADERS.has(k.toLowerCase())) out[k] = v;
+		if (NON_REPLAYABLE_HEADERS.has(k.toLowerCase())) continue;
+		// A REPEATED response header reaches us as puppeteer's `\n`-join of its values, and CDP refuses
+		// to fulfil a response carrying one: `Fetch.fulfillRequest` fails with `Invalid header: <name>`
+		// — the whole replay, not that header — and the request is then never answered at all.
+		// MEASURED on a live storefront: a second render of one product page lost two cached scripts
+		// this way (`access-control-expose-headers`, `content-security-policy`) and serialized ~49 KB
+		// smaller than the first. A list is what puppeteer expands back into repeated headers.
+		out[k] = v.includes('\n') ? v.split('\n') : v;
 	}
 	return out;
 }
@@ -503,7 +510,7 @@ export class ResourceCache {
 
 	toRespondPayload(entry: CacheEntry): {
 		status: number;
-		headers: Record<string, string>;
+		headers: Record<string, string | string[]>;
 		body: Buffer;
 	} {
 		const headers = filterReplayHeaders(entry.headers);
