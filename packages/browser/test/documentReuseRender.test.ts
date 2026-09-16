@@ -23,6 +23,10 @@ import { resolveSettings, defaultLaunchOptions } from '../dist/settings.js';
 type Seen = { path: string; cookie: string | undefined; ua: string | undefined; bypass: string | undefined };
 const seen: Seen[] = [];
 let vary: string | undefined;
+// A header the origin sends MORE THAN ONCE. puppeteer hands repeats to us as one \n-joined value, and
+// CDP refuses to fulfil a response carrying one — the production shape of this is a CDN that repeats
+// `server-timing` on every document.
+let repeated: string[] | undefined;
 
 let origin: http.Server;
 let base = '';
@@ -59,6 +63,7 @@ before(async () => {
 				'content-type': 'text/html; charset=utf-8',
 				'set-cookie': ['bucket=b7; Path=/', 'SESSIONID=s-' + Math.random().toString(36).slice(2) + '; Path=/'],
 				...(vary ? { vary } : {}),
+				...(repeated ? { 'server-timing': repeated } : {}),
 			});
 			return res.end(
 				`<!doctype html><html><head><title>t</title></head><body><p id="m">ssr</p><script src="/app.js?v=1"></script></body></html>`
@@ -171,6 +176,29 @@ const runJob = async (path: string, deviceTypes?: string[]) => {
 	const scripts = seen.filter((s) => s.path.startsWith('/app.js'));
 	return { documents, scripts, result: posted[0] };
 };
+
+test('a document carrying a REPEATED header is still replayable — the browser refuses the \\n-join', async () => {
+	// The bug this pins cost the whole variant, not the reuse: `Fetch.fulfillRequest` rejected the
+	// payload, the navigation was never answered, and the render died at `navigationTimeoutMs` with
+	// nothing posted. Found by running the parity check against a real CDN, which repeats
+	// `server-timing` on every document.
+	configure({ enabled: true });
+	repeated = ['cdn-cache; desc=HIT', 'edge; dur=12'];
+	try {
+		const { documents, result } = await renderJob(`${base}/page`);
+		assert.equal(documents.length, 1, 'the document is still fetched once');
+		assert.deepEqual(
+			result.variants.map((v) => [v.deviceType, v.outcome, v.documentReused]),
+			[
+				['desktop', 'rendered', undefined],
+				['mobile', 'rendered', true],
+			],
+			'and the replayed variant RENDERS rather than timing out on a fulfilment the browser refused'
+		);
+	} finally {
+		repeated = undefined;
+	}
+});
 
 test('with reuse on, a two-device job fetches the document once and the second variant is replayed', async () => {
 	configure({ enabled: true });

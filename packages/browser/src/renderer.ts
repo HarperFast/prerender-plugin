@@ -129,23 +129,45 @@ const renderer: Renderer = async (page, job) => {
 						return;
 					}
 					if (doc) {
-						job.documentReplayed = true;
 						// The document IS this device's own response (a prefetch), so it replays that response's
 						// cookies in full. A SIBLING gets only the pinned ones — the cookies that decide which
 						// backend serves the page's API calls, without which the two devices of this URL would
 						// render against two different systems.
 						const ownFetch = doc.deviceType === deviceType;
 						const cookies = ownFetch ? (doc.setCookies ?? []) : crossableCookies(doc, pinnedNames);
-						if (doc.source === 'prefetch') {
-							job.documentPrefetched = true;
-							documentCache.prefetchedBy.push(deviceType);
+						// A FULFILMENT THAT FAILS MUST FALL THROUGH, not disappear. The browser can refuse the
+						// payload (measured: a CDN that repeats `server-timing`, which reaches us as puppeteer's
+						// \n-join and which CDP rejects), and a swallowed refusal is the worst outcome available:
+						// the request is never answered, the navigation runs the full `navigationTimeoutMs`, and
+						// the variant is lost — a render that cost a slot, a lease and nothing to show. puppeteer
+						// clears its interception flag when `Fetch.fulfillRequest` errors, so the request is still
+						// ours to continue below, which is the same fetch this variant would have made unaided.
+						const replayed = await req.respond(toRespondPayload(doc, { cookies })).then(
+							() => true,
+							(err: unknown) => {
+								documentCache.replayFailures.push({
+									deviceType,
+									message: err instanceof Error ? err.message : String(err),
+								});
+								return false;
+							}
+						);
+						if (replayed) {
+							job.documentReplayed = true;
+							if (doc.source === 'prefetch') {
+								job.documentPrefetched = true;
+								documentCache.prefetchedBy.push(deviceType);
+							}
+							if (!ownFetch) {
+								job.documentReused = true;
+								documentCache.reusedBy.push(deviceType);
+							}
+							return;
 						}
-						if (!ownFetch) {
-							job.documentReused = true;
-							documentCache.reusedBy.push(deviceType);
+						if (ac.signal.aborted || aborted) {
+							req.abort().catch(noop);
+							return;
 						}
-						req.respond(toRespondPayload(doc, { cookies })).catch(noop);
-						return;
 					}
 				}
 				const headers = req.headers();

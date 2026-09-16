@@ -138,6 +138,10 @@ export default class RenderWorker {
 			// pin's own assumption failing. Any non-zero count means a name in `cookies.pin` is
 			// device-specific and must come out of the list.
 			pinnedCookieConflicts: 0,
+			// Replays the browser REFUSED (an unfulfillable payload). Those variants fetched their own
+			// document, so nothing was lost but the saving; a steady count means reuse is buying nothing
+			// on this site and the log line says why.
+			documentReplayFailures: 0,
 			prefetchFallthrough: {
 				'status': 0,
 				'not-html': 0,
@@ -564,6 +568,7 @@ export default class RenderWorker {
 				documentsPrefetched: s.documentsPrefetched,
 				prefetchLate: s.prefetchLate,
 				pinnedCookieConflicts: s.pinnedCookieConflicts,
+				documentReplayFailures: s.documentReplayFailures,
 				prefetchFallthrough: s.prefetchFallthrough,
 				jobsAbandoned: s.jobsAbandoned,
 				succeeded: s.succeeded,
@@ -844,6 +849,16 @@ export default class RenderWorker {
 			// tested rather than trusted. On a sample job each device fetched its own document, so two
 			// different values for the same pinned name means the cookie encodes the device — and
 			// crossing it puts a sibling into the wrong experience, which is worse than not pinning.
+			if (documentCache.replayFailures.length) {
+				this.stats.documentReplayFailures += documentCache.replayFailures.length;
+				// Survivable — each of those variants went to the origin itself — but never silent: it
+				// means reuse is saving nothing on this site, and the browser's own message is the only
+				// thing that says why (an unfulfillable header, a payload it would not take).
+				logger.warn(
+					{ id: job.id, failures: documentCache.replayFailures },
+					'the browser refused a document replay; those variants fetched their own document'
+				);
+			}
 			const conflict = documentCache.pinnedCookieConflict();
 			if (conflict.length) {
 				this.stats.pinnedCookieConflicts++;

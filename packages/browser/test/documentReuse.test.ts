@@ -65,6 +65,27 @@ test('the fulfilment payload drops hop-by-hop, encoding, length and set-cookie, 
 	assert.equal('set-cookie' in payload.headers, false);
 });
 
+test('a REPEATED header is replayed as a list, because the browser refuses the joined value', () => {
+	// puppeteer joins a repeated response header's values with \n. CDP rejects a header value
+	// containing one — and rejects the whole `Fetch.fulfillRequest`, so the navigation is never
+	// answered and the variant dies at its navigation timeout. A list is what puppeteer expands back
+	// into repeated headers, which is what `set-cookie` always relied on.
+	const payload = toRespondPayload({
+		url: 'https://site.example.com/p',
+		status: 200,
+		headers: {
+			'content-type': 'text/html',
+			'server-timing': 'cdn-cache; desc=HIT\nedge; dur=12',
+			'etag': '"abc"',
+		},
+		body: Buffer.from('<html></html>'),
+		deviceType: 'desktop',
+		source: 'navigation',
+	});
+	assert.deepEqual(payload.headers['server-timing'], ['cdn-cache; desc=HIT', 'edge; dur=12']);
+	assert.equal(payload.headers['etag'], '"abc"', 'a single-valued header is untouched');
+});
+
 test("a prefetched document's own cookies are replayed only when asked — for the device that fetched it", () => {
 	const doc = {
 		url: 'https://site.example.com/p',

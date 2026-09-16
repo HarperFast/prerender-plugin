@@ -144,6 +144,12 @@ export type CapturedDocument = {
  */
 export class JobDocumentCache {
 	entry: CapturedDocument | null = null;
+	/**
+	 * Replays the browser refused to fulfil, by device. A fulfilment failure is survivable — the
+	 * variant falls through and fetches its own document — but it must never be silent: it means every
+	 * sibling of every job is paying an extra origin fetch, and the reason is in the message.
+	 */
+	replayFailures: Array<{ deviceType: string; message: string }> = [];
 	/** True on the jobs `documentReuse.sampleEvery` selects: later variants fetch normally and compare. */
 	readonly sample: boolean;
 	/** Whether a document may answer a DIFFERENT device's navigation (`documentReuse.enabled`). */
@@ -347,7 +353,13 @@ export const cookieHeaderOf = (setCookies: string[]): string =>
 export const toRespondPayload = (doc: CapturedDocument, { cookies = [] }: { cookies?: string[] } = {}) => {
 	const headers: Record<string, string | string[]> = {};
 	for (const [name, value] of Object.entries(doc.headers)) {
-		if (!NON_REPLAYABLE.has(name.toLowerCase())) headers[name] = value;
+		if (NON_REPLAYABLE.has(name.toLowerCase())) continue;
+		// A REPEATED response header reaches us as puppeteer's `\n`-join of its values, and CDP refuses
+		// a header value containing one — `Fetch.fulfillRequest` fails with `Invalid header: <name>`,
+		// which fails the WHOLE replay, not that header. Measured against a production CDN, which
+		// repeats `server-timing` on every document. Repeats go back as a list, which puppeteer expands
+		// into repeated headers, exactly as `set-cookie` already did.
+		headers[name] = value.includes('\n') ? value.split('\n') : value;
 	}
 	if (cookies.length) headers['set-cookie'] = cookies;
 	headers[DOCUMENT_REUSE_HEADER] = '1';
