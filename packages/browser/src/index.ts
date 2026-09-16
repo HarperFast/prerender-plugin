@@ -107,6 +107,12 @@ export { renderOnce, renderMatrix, selectorCountProbe, htmlContainsProbe } from 
 // that expose what bots miss. renderAudit is the primitive; renderHtmlReport builds a self-contained HTML
 // report from the cells; runSelfCheck is the tool's own correctness suite.
 export { renderAudit } from './audit/renderAudit.js';
+/**
+ * Pre-deploy check for `documentReuse`: render each URL twice, with reuse off and on, and compare
+ * each device against ITS OWN control. Run this before enabling reuse anywhere — the in-worker
+ * sampled check reports divergence only after the affected snapshots have already been served.
+ */
+export { reuseParityCheck, formatReuseParity } from './audit/reuseParity.js';
 // Paint parity — the counterpart that compares rendered INK rather than DOM. A post-processing bug
 // can leave the markup perfect and the rendering empty; renderAudit cannot see that class at all,
 // because its ground-truth state inherits the deployed post-processing on both sides.
@@ -117,6 +123,7 @@ export { runSelfCheck, runSelfCheckResults } from './audit/selfCheck.js';
 export type { Renderer } from './Worker.js';
 export type { RenderOnceOptions, RenderResult, RenderOutcome, Probe, ProbeContext } from './renderOnce.js';
 export type { RenderAuditOptions } from './audit/renderAudit.js';
+export type { ReuseParityOptions, ReuseParityResult, DeviceParity } from './audit/reuseParity.js';
 export type {
 	PaintParityOptions,
 	PaintParityReport,

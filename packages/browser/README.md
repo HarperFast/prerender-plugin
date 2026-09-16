@@ -134,9 +134,10 @@ device that fetched the document, and one URL's two snapshots stop being compara
 `documentReuse.cookies.pin` names those cookies (empty by default), and a pinned cookie is also sent
 by a variant that goes to the origin itself, so parity holds whichever path a variant takes. Pin only
 routing cookies: never a session, cart, visitor or bot-manager cookie, which tie a render to an
-identity two devices must not share. Pinning assumes the cookie is **device-independent**, and that
-assumption is tested rather than trusted — on a sample job both devices fetch cold, and if a pinned
-name comes back with different values the worker warns and counts `pinnedCookieConflicts`. (Corollary
+identity two devices must not share. Pinning assumes the cookie is **device-independent**; if a pinned name
+comes back with different values per device the worker warns and counts `pinnedCookieConflicts`, but
+that is a running check, not the gate. **Verify before you enable anything** with `reuseParityCheck`
+(below), which answers the same question locally and in advance. (Corollary
 worth knowing: with reuse off each device already gets its own document and its own cookie, so if the
 value is assigned per response rather than derived from the request, the two devices can disagree
 today.) A document is never reused when it is not a final `200 text/html`, has a redirect chain, or
@@ -526,6 +527,39 @@ Two things worth checking before adding a rule: an attribute may be **load-beari
 (`[data-state]` selectors are common), and it may be a **diagnostic** — Astro removes `ssr` from
 `<astro-island>` on hydration, so stripping `ssr` would destroy the only marker distinguishing a
 healthy snapshot from an un-hydrated one. Strip what is inert, not what is merely non-visual.
+
+### `reuseParityCheck` — proving reuse is safe BEFORE enabling it
+
+```ts
+import { reuseParityCheck, formatReuseParity } from '@harperfast/prerender-browser';
+
+const results = await reuseParityCheck({
+	urls: ['https://example.com/product/a', 'https://example.com/product/b'],
+	devices: ['desktop', 'mobile'],
+	pin: ['bucket'], // the routing cookies you intend to configure
+	bypass: { header: 'x-origin-bypass', token: process.env.BYPASS_TOKEN },
+	config: {
+		/* the fleet's own rendering config */
+	},
+});
+console.log(formatReuseParity(results));
+```
+
+Renders each URL twice — once with reuse off, which is what production does today and therefore the
+control, and once with it on — and compares **each device against its own control**. Nothing is
+compared across devices: the question is not whether desktop and mobile agree (they should not) but
+whether each is still the page it would have been.
+
+It reports, per device, whether the page's own `structuredOffers` are identical, whether the outcome,
+status and indexability agree, and the structural divergence of the snapshot. **Read the offers
+first** — where a site routes its API calls by a cookie the document sets, a replayed variant runs
+without it, its pricing call is answered by a different backend, and the offers come back wrong while
+everything else still looks healthy. A non-zero divergence ratio is not automatically a failure (live
+pages churn between two renders seconds apart); a differing offer set is.
+
+This is the gate for turning `documentReuse.enabled` on, and for deciding what belongs in
+`cookies.pin`. The in-worker sampled check is the ongoing version of the same question, but it can
+only report after the affected snapshots have been served.
 
 ## Custom renderer
 
