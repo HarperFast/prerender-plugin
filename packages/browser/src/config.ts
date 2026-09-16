@@ -485,6 +485,9 @@ export const defaultConfig = (): PrerenderConfig => ({
 	},
 });
 
+/** setTimeout's delay ceiling: past this a timer fires at once instead of late. */
+const MAX_TIMER_MS = 2147483647;
+
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -580,8 +583,14 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	if (!Array.isArray(cookies.pin) || cookies.pin.some((name) => typeof name !== 'string' || !name.trim())) {
 		throw new Error('prerender config: documentReuse.cookies.pin must be an array of non-empty cookie names');
 	}
-	if (typeof prefetch.timeoutMs !== 'number' || !(prefetch.timeoutMs > 0)) {
-		throw new Error('prerender config: documentReuse.prefetch.timeoutMs must be a positive number');
+	// Bounded by setTimeout's signed-32-bit delay: a larger value does not mean "no timeout", it fires
+	// the timer IMMEDIATELY (after 1ms, with a TimeoutOverflowWarning), so every prefetch would abort
+	// the instant it started and fall through to a normal fetch — the feature silently off, under a
+	// config that reads as generous. Refused at load rather than degraded at runtime.
+	if (typeof prefetch.timeoutMs !== 'number' || !(prefetch.timeoutMs > 0) || prefetch.timeoutMs > MAX_TIMER_MS) {
+		throw new Error(
+			`prerender config: documentReuse.prefetch.timeoutMs must be a positive number of ms, at most ${MAX_TIMER_MS}`
+		);
 	}
 	// Scroll step is a positive fraction of the viewport; reject non-numbers / non-positive
 	// (config is API- and JSON-supplied). scrollPass additionally floors pathologically small

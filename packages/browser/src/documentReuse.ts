@@ -403,7 +403,12 @@ export const documentDivergence = (a: Buffer | string, b: Buffer | string): Docu
 	let differing = 0;
 	let chunks = 0;
 	const samples: string[] = [];
-	for (const key of new Set([...left.keys(), ...right.keys()])) {
+	// The key set is built in place rather than from `[...left.keys(), ...right.keys()]`: this runs on
+	// multi-megabyte documents inside a render, and the spread would allocate a throwaway array holding
+	// every distinct chunk of both documents before the Set ever sees one.
+	const keys = new Set(left.keys());
+	for (const key of right.keys()) keys.add(key);
+	for (const key of keys) {
 		const l = left.get(key) ?? 0;
 		const r = right.get(key) ?? 0;
 		chunks += Math.max(l, r);

@@ -262,6 +262,12 @@ test('documentReuse defaults off, merges, and rejects bad values by name', () =>
 		() => mergeConfig({ documentReuse: { prefetch: { timeoutMs: 0 } } } as never),
 		/prefetch\.timeoutMs must be a positive number/
 	);
+	// Past setTimeout's ceiling the timer fires immediately, so a "generous" timeout would abort every
+	// prefetch at once — refused at load instead.
+	assert.throws(
+		() => mergeConfig({ documentReuse: { prefetch: { timeoutMs: 2147483648 } } } as never),
+		/prefetch\.timeoutMs must be a positive number of ms, at most 2147483647/
+	);
 	assert.throws(
 		() => mergeConfig({ documentReuse: { prefetch: null } } as never),
 		/documentReuse\.prefetch must be an object/
