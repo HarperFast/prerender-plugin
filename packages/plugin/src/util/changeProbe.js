@@ -50,7 +50,7 @@ import { gunzipSync } from 'node:zlib';
 import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
-import { epochMsOf, currentMinuteMs, MINUTE, SECOND } from './time.js';
+import { epochMsOf, currentMinuteMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { writeSchedules } from './renderSchedule.js';
@@ -135,8 +135,9 @@ const newStats = () => ({
 	examined: 0, // rows scanned
 	owned: 0, // rows this node owns
 	matched: 0, // owned rows a rule matched (suppressed excluded)
-	probed: 0, // probes attempted = seeded + unchanged + changed + failed
+	probed: 0, // probes attempted = seeded + rebaselined + unchanged + changed + failed
 	seeded: 0, // first observation stored, nothing compared
+	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
 	unchanged: 0,
 	changed: 0,
 	triggered: 0, // changes that scheduled a re-render
@@ -324,7 +325,7 @@ export const triggerRevalidate = async (row) => {
 const readSignature = async (url) => {
 	const row = await probeStateTable().get({
 		id: url,
-		select: ['url', 'signature', 'probedAt', 'pageSignature', 'pageClaimAt'],
+		select: ['url', 'signature', 'probedAt', 'pageSignature', 'pageClaimAt', 'ruleFingerprint'],
 	});
 	if (!row) return null;
 	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
@@ -339,6 +340,8 @@ const readSignature = async (url) => {
 		probedAt,
 		pageSignature: row.pageSignature ?? null,
 		pageClaimAt: row.pageClaimAt ?? null,
+		// null for a row written before fingerprints existed — read as "the rule in force", see processOne.
+		fingerprint: row.ruleFingerprint ?? null,
 	};
 };
 // The probe's write must NEVER carry the page claim through a whole-row put: `pageSignature`
@@ -351,8 +354,12 @@ const readSignature = async (url) => {
 // the seeding write is by definition to a URL with no row yet; a patch there would make every
 // first observation a silent no-op. A row the render path creates between the read and that put
 // loses at most one baseline to the race and re-seeds on the next pass.
-export const writeSignature = (url, signature, { rowExists = false, clearClaim = false } = {}) => {
+export const writeSignature = (url, signature, { rowExists = false, clearClaim = false, fingerprint = null } = {}) => {
 	const fields = { signature, probedAt: new Date() };
+	// The rule that made this observation (changeProbeSpec.js ruleFingerprint), so the next pass
+	// can tell a rule edit from a content change. Written with EVERY baseline, including the
+	// one-time stamp of a pre-fingerprint row; a signature is never left beside a stale fingerprint.
+	if (fingerprint !== null) fields.ruleFingerprint = fingerprint;
 	// BOTH HALVES OF THE PAIR, always. `pageClaimAt` is the render `pageSignature` came from, and the
 	// two are only meaningful together — a claim with no basis cannot be scoped to a device page, and
 	// a basis with no claim describes nothing. Clearing one and leaving the other is inert today
@@ -576,6 +583,27 @@ export const runProbePass = async ({
 		}
 		distressStreak = 0;
 
+		// RULE CHANGED, NOT CONTENT. A baseline is only comparable to an observation made the same
+		// way (changeProbeSpec.js ruleFingerprint). A stored fingerprint that is not this rule's
+		// means the rule was edited since the baseline was taken: store the new observation, compare
+		// nothing, trigger nothing, and keep the row out of the canary's verdict — a config edit must
+		// never read as a mass change. Before this, every rule edit produced a differently-shaped
+		// signature for 100% of matched URLs at once, and the only safe way to make one was a full
+		// dry-run cycle. Rows from before fingerprints existed carry none and are compared as usual:
+		// the rule that wrote them is the rule in force (a deploy that changed the rule would have
+		// reseeded them the old way), and they are stamped on their next quiet probe below, so the
+		// NEXT rule edit costs nothing either.
+		const ruleChanged =
+			Boolean(stored?.signature) &&
+			stored.fingerprint !== null &&
+			stored.fingerprint !== undefined &&
+			stored.fingerprint !== rule.fingerprint;
+		if (ruleChanged) {
+			stats.rebaselined++;
+			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+			return;
+		}
+
 		// ROUND-TRIP BLINDNESS. Everything below compares the origin to the origin, so a value
 		// that changed and changed BACK between two passes is invisible — and a render that landed
 		// inside that window left a page carrying the transient value. `pageSignature` is what the
@@ -601,7 +629,7 @@ export const runProbePass = async ({
 
 		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
 		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
-		// `probed = seeded + unchanged + changed + failed` is the documented invariant, and the
+		// `probed = seeded + rebaselined + unchanged + changed + failed` is the documented invariant, and the
 		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
 		// would silently shrink the mass-change sample right when claims are most likely to be
 		// stale. `pageMismatch` OVERLAYS these buckets; it never replaces them.
@@ -612,8 +640,16 @@ export const runProbePass = async ({
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
 				// to have changed, the probe just hadn't seen it before.
-				await write(row.url, observed, { rowExists: stored !== null });
-			} else if (verificationArmed && stored.pageSignature) {
+				await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
+				return;
+			}
+			// One-time stamp of a pre-fingerprint row (see the rule-changed block above): one patch
+			// per legacy row, after which a converged corpus is back to paying no write per probe.
+			// Not an alternative to the verification below — both are due, neither stands in for the other.
+			if (stored.fingerprint === null || stored.fingerprint === undefined) {
+				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+			}
+			if (verificationArmed && stored.pageSignature) {
 				// PROOF, not absence of news. Both conditions are load-bearing and neither is
 				// redundant:
 				//
@@ -644,7 +680,7 @@ export const runProbePass = async ({
 			// the opposite case and is deliberately NOT cleared: nothing was expired, so the
 			// disagreement still stands — in dry-run `pageMismatch` reads as a standing gauge of
 			// disagreeing pages per pass, where armed it is a detection rate.
-			await write(row.url, observed, { rowExists: stored !== null });
+			await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
 			return;
 		}
 		if (stats.triggered >= maxTriggers) {
@@ -663,7 +699,7 @@ export const runProbePass = async ({
 			// trigger budget on a page already expired and already filed. The next render writes a
 			// fresh claim; until then there is nothing to compare, which is the correct "I don't
 			// know" state. Folded into this write so it costs no second round trip.
-			await write(row.url, observed, { rowExists: stored !== null, clearClaim: true });
+			await write(row.url, observed, { rowExists: stored !== null, clearClaim: true, fingerprint: rule.fingerprint });
 		} catch (e) {
 			stats.errors++;
 			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
@@ -806,6 +842,7 @@ const emitStats = (stats, kind) => {
 	try {
 		metrics.changeProbe(stats.probed, 'probed');
 		metrics.changeProbe(stats.seeded, 'seeded');
+		metrics.changeProbe(stats.rebaselined, 'rebaselined');
 		metrics.changeProbe(stats.changed, 'changed');
 		metrics.changeProbe(stats.triggered, 'triggered');
 		metrics.changeProbe(stats.deferred, 'deferred');
@@ -922,6 +959,10 @@ let lastCanary = null;
 let measuredSliceSize = null;
 
 const isContinuous = () => config.changeProbe.mode === 'continuous';
+const isAnchored = () => config.changeProbe.mode === 'anchored';
+// The armed-sweep marker for anchored mode carries the anchor itself, so editing the time or the
+// zone reads as a mode change to `syncProbeTimers` (which compares markers) and re-arms the timer.
+const anchorKey = () => `anchored:${config.changeProbe.anchorTime}|${config.changeProbe.anchorTimezone}`;
 
 /**
  * Shared pass limits.
@@ -945,8 +986,23 @@ const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 	// Continuous pacing, or zeroes — and zeroes are what make interval mode bit-identical: with
 	// no cycle target `cycleRatePerSecond` is never consulted and the window is the one
 	// `ratePerSecond` has always implied.
-	cycleTarget: paced && isContinuous() ? config.changeProbe.cycleTarget : 0,
-	sliceSize: paced && isContinuous() ? (measuredSliceSize ?? 0) : 0,
+	// Continuous paces to its cycle; an anchored pass paces to its window (0 = the ceiling, the
+	// default: a daily pass exists to finish, not to spread); an interval pass is never paced.
+	cycleTarget: !paced
+		? 0
+		: isContinuous()
+			? config.changeProbe.cycleTarget
+			: isAnchored()
+				? config.changeProbe.anchorWindow
+				: 0,
+	// The denominator the cycle target is honoured against. Anchored mode needs it as much as
+	// continuous does: without it `cycleRatePerSecond` has nothing to divide and returns Infinity,
+	// so `anchorWindow` would be read, reported, and then silently ignored — the pass would burst at
+	// the ceiling however the window was set, and `probe_cycle_behind` (which also requires a slice)
+	// would stay quiet about it. `measuredSliceSize` is maintained after every completed pass
+	// regardless of mode, so the first anchored pass paces at the ceiling and measures, and every
+	// pass after it honours the window.
+	sliceSize: paced && (isContinuous() || isAnchored()) ? (measuredSliceSize ?? 0) : 0,
 	// The local governor is opt-in and orthogonal to the mode, so it is read from config rather
 	// than gated on `isContinuous()` — an operator who wants it in interval mode has been warned
 	// by the option's own documentation and may have reasons. It applies to the canary too: a
@@ -1326,6 +1382,7 @@ export const changeProbeStatus = async () => {
 			// has measured it yet, which is precisely when the pass runs at the ceiling — worth
 			// being able to see, because "at the ceiling" otherwise looks identical to "behind".
 			cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : null,
+			nextAnchoredRunAt: isAnchored() && nextAnchorAt ? new Date(nextAnchorAt).toISOString() : null,
 			sliceSize: isContinuous() ? (scheduler?.sliceSize ?? null) : null,
 		},
 		load: {
@@ -1383,8 +1440,79 @@ const clearProbeTimers = () => {
 	if (bootTimer) clearTimeout(bootTimer);
 	if (sweepTimer) clearInterval(sweepTimer);
 	if (canaryTimer) clearInterval(canaryTimer);
-	bootTimer = sweepTimer = canaryTimer = null;
+	if (anchorTimer) clearTimeout(anchorTimer);
+	bootTimer = sweepTimer = canaryTimer = anchorTimer = null;
+	nextAnchorAt = null;
 	stopContinuousLoop();
+};
+
+/**
+ * ANCHORED MODE's driver: one pass a day, starting at `anchorTime` in `anchorTimezone`, then
+ * re-armed for the next occurrence once the pass has finished.
+ *
+ * This is the mode for an origin whose content moves on a schedule — a retailer whose prices
+ * change only at its own midnight, say. Continuous mode would spread the same probes evenly
+ * over 24h and so notice a midnight change anywhere from minutes to a day later; anchored mode
+ * starts the pass right after the change and (at the default window of 0, the rate ceiling)
+ * finishes it as fast as the agreed ceiling allows, so the corpus is current for the day by the
+ * time the pass ends. The canary keeps its own cadence in this mode, so a change that lands OFF
+ * the schedule is still caught as a mass change; only the full walk is anchored.
+ *
+ * The re-arm is computed AFTER the pass, against the clock: a pass that outran the day (longer
+ * than 24h at the ceiling) simply lands on the next anchor and skips none by accident, and a
+ * DST shift is absorbed by `getNextTimeOfDay` recomputing the offset at the target instant.
+ * `getNextTimeOfDay` is never more than a day out, so the delay fits setTimeout's signed 32-bit
+ * range without the clamp `sweepInterval` needs.
+ */
+let anchorTimer = null;
+let nextAnchorAt = null;
+const armAnchorTimer = () => {
+	if (anchorTimer) clearTimeout(anchorTimer);
+	let at;
+	try {
+		at = getNextTimeOfDay(config.changeProbe.anchorTime, config.changeProbe.anchorTimezone);
+	} catch (e) {
+		at = NaN;
+		logger.warn(
+			`[prerender] change-probe: anchorTimezone "${config.changeProbe.anchorTimezone}" is not usable (${e?.message ?? String(e)})`
+		);
+	}
+	// An unusable anchor arms NOTHING. `setTimeout(fn, NaN)` fires at once, which would turn a typo
+	// in the timezone into a full-rate pass on every config apply; a warning and a null
+	// `nextAnchoredRunAt` on the admin surface is the failure mode that gets noticed and fixed.
+	if (!Number.isFinite(at)) {
+		nextAnchorAt = null;
+		logger.warn(
+			`[prerender] change-probe: anchored mode has no next run — fix anchorTime/anchorTimezone (the canary keeps running)`
+		);
+		return;
+	}
+	// A NEXT RUN MUST BE IN THE FUTURE. On the spring-forward day the anchor's wall-clock time can
+	// be one that never occurs — 02:30 where 02:00 jumps to 03:00 — and `getNextTimeOfDay` resolves
+	// it to an instant that has already passed. Left alone that fires the pass an hour early and,
+	// worse, the re-arm at the end of the pass computes the same past instant again: the whole
+	// corpus is walked back to back at the ceiling rate until the hour is over. Pushing a stale
+	// anchor on by a day lands on the next real occurrence, because the offset is applied to the
+	// resolved instant rather than to the wall clock.
+	if (at <= Date.now()) at += DAY;
+	nextAnchorAt = at;
+	anchorTimer = setTimeout(
+		async () => {
+			anchorTimer = null;
+			nextAnchorAt = null;
+			try {
+				await runProbeSweepOnce();
+			} catch (e) {
+				logger.error(e);
+			}
+			// Config is re-read here rather than captured: this is the boundary a live change acts on.
+			// A mode or anchor edit mid-pass has already re-armed through syncProbeTimers (the marker
+			// changed), so re-arming here as well would run two drivers.
+			if (config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) armAnchorTimer();
+		},
+		Math.max(0, at - Date.now())
+	);
+	anchorTimer.unref?.();
 };
 
 /**
@@ -1452,6 +1580,7 @@ const armIntervals = () => {
 	// identically either way. An early return here would have silently disabled the mass-change
 	// detector for anyone who turned continuous mode on.
 	if (isContinuous()) void runContinuousLoop();
+	else if (isAnchored()) armAnchorTimer();
 	else {
 		sweepTimer = setInterval(() => runProbeSweepOnce().catch((e) => logger.error(e)), armedSweep);
 		sweepTimer.unref?.();
@@ -1469,7 +1598,13 @@ const syncProbeTimers = () => {
 	// the mode does, or `syncProbeTimers` sees no difference and leaves an interval timer running
 	// after a switch to continuous (and vice versa). Tagging the mode into the key is what makes
 	// the mode itself live.
-	const desiredSweep = !enabled ? null : isContinuous() ? 'continuous' : config.changeProbe.sweepInterval;
+	const desiredSweep = !enabled
+		? null
+		: isContinuous()
+			? 'continuous'
+			: isAnchored()
+				? anchorKey()
+				: config.changeProbe.sweepInterval;
 	const desiredCanary = enabled && config.changeProbe.canary.interval > 0 ? config.changeProbe.canary.interval : null;
 	if (desiredSweep === armedSweep && desiredCanary === armedCanary) return;
 
@@ -1497,7 +1632,10 @@ const syncProbeTimers = () => {
 	void publishScheduler();
 	if (desiredSweep === null) return;
 
-	if (wasEnabled) {
+	// Anchored mode never runs a boot sweep: the whole point is that the pass starts at the anchor,
+	// and a restart at 15:00 must not walk the corpus at 15:05. Baselines persist across restarts
+	// (ProbeState), so nothing is lost by waiting for the anchor; the canary is armed right away.
+	if (wasEnabled || isAnchored()) {
 		armIntervals();
 		return;
 	}

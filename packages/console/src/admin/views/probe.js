@@ -134,6 +134,7 @@ const OUTCOMES = [
 	['fresh', 'Skipped (fresh)', '#6b7488'],
 	['probed', 'Probes', '#3d8cff'],
 	['seeded', 'Seeded', '#8a93a6'],
+	['rebaselined', 'Re-baselined', '#7c8cc4'],
 	['changed', 'Changed', '#f0a02a'],
 	['page_mismatch', 'Page mismatch', '#22b8cf'],
 	['triggered', 'Triggered', '#10a87e'],
@@ -413,6 +414,7 @@ function drift(ctx) {
 	const changed = totalOf('changed');
 	const failed = totalOf('failed');
 	const seeded = totalOf('seeded');
+	const rebaselined = totalOf('rebaselined');
 	const deferred = totalOf('deferred');
 	const triggered = totalOf('triggered');
 	const trips = totalOf('canary_trip');
@@ -432,7 +434,12 @@ function drift(ctx) {
 
 	// Compared = probes that had a baseline to compare against. Seeds and failures had none, so
 	// including them in the denominator understates the drift rate by exactly the seeding backlog.
-	const compared = Math.max(0, probed - seeded - failed);
+	// RE-BASELINED rows had one and it was not comparable — it was taken under a different rule —
+	// so the plugin stores the new observation and compares nothing. They belong on the same side
+	// as seeds. Leaving them in is not a rounding error: the pass right after a rule edit can be
+	// almost entirely re-baselined, and the card would read "0% changed" over a population that was
+	// never compared at all, which is indistinguishable from a completely static origin.
+	const compared = Math.max(0, probed - seeded - rebaselined - failed);
 	// Through `ratioOf` like every other ÷ figure in this console, and NOT because these two can be
 	// null — `sumValues` reduces from 0 over finite products, so they are always numbers. It is that
 	// the guard belongs at the site by convention rather than by an argument a reader has to
@@ -583,8 +590,11 @@ function drift(ctx) {
 				'“Failed” the origin caused, “Page mismatch” overlays the outcome buckets (a mismatched row is ',
 				'also inside “Changed” or the unchanged remainder), and “Skipped” sits outside “Probes” entirely ',
 				'because those rows were never attempted. “Changed” is measured against the probes that HAD a ',
-				'baseline; seeds and failures are excluded from that denominator because neither compared ',
-				'anything. “Page mismatch” stays at zero unless a rule sets pageCheck AND the render fleet posts ',
+				'baseline; seeds, re-baselined rows and failures are excluded from that denominator because none ',
+				'of them compared anything. “Re-baselined” is a row whose stored baseline was taken under a ',
+				'DIFFERENT rule — a rule edit, not a content change — so the plugin stored the new observation ',
+				'and compared nothing; expect one pass of them after any rule edit, and read a steady count as a ',
+				'rule that keeps changing. “Page mismatch” stays at zero unless a rule sets pageCheck AND the render fleet posts ',
 				'its pages’ offers (browser 1.20.0+) — enabled against an older fleet it records nothing, and the ',
 				'plugin log says so hourly.',
 			]),
@@ -639,7 +649,10 @@ function sweepCard(ctx, status) {
 	}
 
 	if (hasCounters) {
-		const compared = Math.max(0, (last.probed ?? 0) - (last.seeded ?? 0) - (last.failed ?? 0));
+		const compared = Math.max(
+			0,
+			(last.probed ?? 0) - (last.seeded ?? 0) - (last.rebaselined ?? 0) - (last.failed ?? 0)
+		);
 		body.push(
 			kv([
 				[

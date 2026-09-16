@@ -395,6 +395,14 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# was written would make the very page it certifies fail its own `lastCached >= basisAt` test.
 	# Written in the SAME patch as `pageSignature`, so it costs no extra read and no extra write.
 	pageClaimAt: Date
+	# The fingerprint of the RULE that produced `signature` (changeProbeSpec.js ruleFingerprint):
+	# endpoint, method, headers, body, extract paths, status signals. A baseline is only comparable
+	# to an observation made the same way, so a probe whose rule fingerprint differs from the stored
+	# one re-baselines the row instead of reading the new signature shape as a content change —
+	# which is what a rule edit used to look like, for 100% of matched URLs at once. Null on rows
+	# written before this column existed; those are compared as usual and stamped on their next
+	# quiet probe. Written by the probe only, in the same put/patch as `signature`.
+	ruleFingerprint: String
 }
 
 # Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a

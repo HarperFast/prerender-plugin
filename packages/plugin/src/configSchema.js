@@ -898,8 +898,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'  request.body     request body string (e.g. "{}").\n' +
 					'  extract          (request mode, required) value paths into the JSON response, e.g. ' +
 					'"payload.products[0].prices[0].salePrice" — the extracted values ARE the watched content; ' +
-					'everything else in the response is ignored. An extraction where every path yields null is a ' +
+					'everything else in the response is ignored. A path may end at an object or array, which is ' +
+					'signed whole, and `[*]` projects the rest of the path over every element of an array ' +
+					'("payload.products[0].variants[*].availability" -> one value per variant, in the endpoint’s ' +
+					'order) — the way to watch per-variant state without signing fields that move on their own ' +
+					'(inventory counters, store data). An extraction where every path yields null is a ' +
 					'FAILED probe, never a new signature, so an endpoint shape change cannot mass-trigger.\n' +
+					'  EDITING A RULE. The rule’s observation (endpoint, method, headers, body, extract, ' +
+					'statusSignals) is fingerprinted and stored beside every baseline. Change any of it and each ' +
+					'matched URL is RE-BASELINED on its next probe — new observation stored, nothing compared, ' +
+					'nothing triggered, not counted by the canary — instead of the new signature shape reading as ' +
+					'100% of the corpus changing at once. A rule edit therefore costs one pass without detection ' +
+					'for that rule and needs no dry-run cycle. Label, pathPattern, invalidateScope and pageCheck ' +
+					'are not part of the fingerprint: they change what is matched or done, not what is observed.\n' +
 					'  statusSignals    optional [{ status, signature, contains? }] — statuses this endpoint uses ' +
 					'to SAY something rather than to fail, mapped to a fixed signature. An endpoint that answers ' +
 					'a legitimate state with an error status (most usefully "no longer available" as a 4xx with ' +
@@ -932,9 +943,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'page\u2019s offers. A page yielding no Product offers records nothing, exactly as a failed ' +
 					'probe changes nothing, so a markup change cannot make every page look like a disagreement \u2014 ' +
 					'and each dimension compares only when BOTH sides make a readable claim (availability must ' +
-					'reduce to a recognized schema.org verdict on the page and a boolean at the endpoint; price ' +
-					'must parse as a number on the page), so an unrecognized vocabulary or price format degrades ' +
-					'to detecting nothing rather than expiring everything. ' +
+					'reduce to a recognized schema.org verdict on the page, and at the endpoint to a boolean, an ' +
+					'availability word, or a `[*]` list of per-variant words; price must parse as a number on the ' +
+					'page), so an unrecognized vocabulary or price format degrades to detecting nothing rather ' +
+					'than expiring everything. Availability words are matched after dropping case and separators ' +
+					'(InStock, IN_STOCK, "In Stock" and https://schema.org/InStock are one word); the built-in ' +
+					'vocabulary is Google’s (InStock, InStoreOnly, OnlineOnly, LimitedAvailability, Available / ' +
+					'OutOfStock, SoldOut, Discontinued, Unavailable), and `pageCheck.availableValues` / ' +
+					'`pageCheck.unavailableValues` (arrays of words) extend or override it per rule for an endpoint ' +
+					'with its own vocabulary. A per-variant list reads in stock when ANY variant is, exactly as the ' +
+					'page’s offers are read. ' +
 					'Detection is one extra node-local write per render and no extra origin traffic.\n' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
 					'records on a mass change. Empty = the canary detects and logs only.\n' +
@@ -956,9 +974,36 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'time lost to backoff are absorbed as they happen. `ratePerSecond` stays a hard ceiling. ' +
 					'A target that cannot be met at the ceiling is reported (`probe_cycle_behind`) rather ' +
 					'than silently missed — which is the whole point of the mode.\n\n' +
-					'Switching is safe in both directions and takes effect on the next config apply; a pass ' +
+					'"anchored" runs ONE full pass a day, starting at `anchorTime` in `anchorTimezone` and ' +
+					'paced to `anchorWindow` (0 = as fast as `ratePerSecond` allows). For an origin whose content ' +
+					'moves on a schedule — a retailer whose prices change only at its own midnight — this puts ' +
+					'the walk right after the change instead of spreading it over the day, so detection latency ' +
+					'is the pass length rather than up to a cycle, and the corpus is current for the day by the ' +
+					'time the pass ends. No pass runs at boot in this mode (baselines persist; a restart waits ' +
+					'for the anchor). The canary keeps its own cadence, so an off-schedule mass change is still ' +
+					'caught; only the full walk is anchored.\n\n' +
+					'Switching is safe in every direction and takes effect on the next config apply; a pass ' +
 					'in flight finishes under the rules it started with.',
-				{ enum: ['interval', 'continuous'] }
+				{ enum: ['interval', 'continuous', 'anchored'] }
+			),
+			anchorTime: option(
+				'00:15',
+				'ANCHORED MODE ONLY: local time of day ("HH:MM") the daily pass starts, interpreted in ' +
+					'`anchorTimezone`. Put it just AFTER the origin’s scheduled change lands (a few minutes ' +
+					'after its midnight, not at it) so the first probes see the new state rather than the ' +
+					'tail of the old one.',
+				{ nonEmpty: true }
+			),
+			anchorTimezone: option('UTC', 'ANCHORED MODE ONLY: IANA timezone `anchorTime` is interpreted in.', {
+				nonEmpty: true,
+			}),
+			anchorWindow: option(
+				0,
+				'ANCHORED MODE ONLY: wall-clock budget the daily pass paces itself to, like `cycleTarget` ' +
+					'for one pass. 0 (default) runs at the `ratePerSecond` ceiling and finishes as early as the ' +
+					'agreed rate allows; set it to spread the pass deliberately (e.g. 6h) when the origin would ' +
+					'rather see a lower steady rate than a short burst.',
+				{ unit: 'ms', min: 0 }
 			),
 			sweepInterval: option(
 				DAY,
