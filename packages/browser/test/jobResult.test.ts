@@ -310,3 +310,36 @@ test('a legacy job still posts the legacy envelope: id, url and the variant fiel
 	assert.equal('variants' in meta, false, 'an older plugin has no notion of variants');
 	assert.equal('deviceTypes' in meta, false);
 });
+
+test('a variant whose result cannot be built is posted as an error — the rest of the job still lands', async () => {
+	// Compression is the thing that realistically rejects here: an allocation failure on a
+	// multi-megabyte document. Before this, one such rejection took down the whole `Promise.all`,
+	// so NOTHING was posted — including the device that had rendered perfectly — and the schedule
+	// row sat pinning the claim floor with no result to release it.
+	const job = makeUrlJob(['desktop', 'mobile']);
+	const variants = job.variants();
+	for (const v of variants) {
+		v.httpResponse = { statusCode: 200, headers: {} };
+		v.isIndexable = true;
+		v.attemptStarted();
+		v.attemptEnded(undefined, `<html>${v.deviceType}</html>`);
+	}
+	variants[0].resultMetadata = () => Promise.reject(new RangeError('Array buffer allocation failed'));
+
+	const { meta, body, metadataSize } = await sendVariants(job, variants);
+	assert.deepEqual(meta.deviceTypes, ['desktop', 'mobile'], 'the job still reports what it was asked for');
+	assert.equal(meta.variants.length, 2, 'both devices are accounted for');
+
+	const [desktop, mobile] = meta.variants;
+	assert.equal(desktop.outcome, 'error');
+	assert.equal(desktop.reason, 'result-build-failed');
+	assert.equal(desktop.contentLength, 0, 'it contributes no bytes');
+	assert.equal((desktop as unknown as { error: { name: string; phase: string } }).error.name, 'RangeError');
+	assert.equal((desktop as unknown as { error: { phase: string } }).error.phase, 'result');
+
+	assert.equal(mobile.outcome, 'rendered', 'the healthy device is unaffected');
+	assert.ok(mobile.contentLength > 0);
+	// And the framing still adds up, so the plugin can walk it.
+	assert.equal(metadataSize + mobile.contentLength, body.byteLength);
+	assert.equal(gunzipSync(body.subarray(metadataSize)).toString(), '<html>mobile</html>');
+});

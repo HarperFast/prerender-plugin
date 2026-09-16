@@ -319,6 +319,35 @@ export default class RenderJob {
 	}
 
 	/**
+	 * This variant reduced to a reportable failure, for the case where its own result could not be
+	 * built at all (see `sendVariantsResult`). Deliberately allocates nothing and reads only fields
+	 * already in memory: whatever broke while building the real result must not break this too.
+	 *
+	 * The outcome is `error` even when the render itself succeeded, because from the plugin's side
+	 * that is exactly what happened — this device produced nothing it can store — and `error` is the
+	 * outcome that puts the URL in the retry lanes rather than rescheduling it as a success.
+	 */
+	unreportableMetadata(error: unknown): VariantMetadata {
+		const attempt = this.latestAttempt;
+		return {
+			deviceType: this.deviceType,
+			statusCode: this.httpResponse?.statusCode,
+			headers: {},
+			renderTime: attempt?.renderEndTime ? attempt.renderEndTime - attempt.renderStartTime : undefined,
+			redirectedTo: this.redirectedTo,
+			isIndexable: this.isIndexable,
+			structuredOffers: this.structuredOffers,
+			outcome: 'error',
+			reason: 'result-build-failed',
+			error: {
+				name: (error as Error)?.name ?? 'Error',
+				message: (error as Error)?.message ?? String(error),
+				phase: 'result',
+			},
+		};
+	}
+
+	/**
 	 * Post THIS render as a legacy per-device result: `{ id, url, ...variant }` followed by the one
 	 * encoded body. The shape every plugin release understands; a multi-device job posts through
 	 * `sendVariantsResult` instead. Returns true if the result was delivered (204), false if it was
@@ -342,7 +371,24 @@ export default class RenderJob {
 	 * back as a failed render and retries the URL.
 	 */
 	static async sendVariantsResult(job: RenderJob, variants: RenderJob[]): Promise<boolean> {
-		const encoded = await Promise.all(variants.map((variant) => variant.resultMetadata()));
+		// ONE VARIANT'S FAILURE MUST NOT DISCARD THE JOB. `resultMetadata` compresses the body, and
+		// compression can reject — an allocation failure on a multi-megabyte document, an encoding
+		// the runtime does not have. Awaiting the variants as a single all-or-nothing batch made one
+		// such rejection throw away every OTHER variant's completed render too, post nothing at all,
+		// and leave the row pinning the claim floor (see queue.jobLeaseTime: a job that never posts
+		// leaves its row due at the same minute forever). A variant that cannot produce a body is
+		// reported as the failure it is, and everything beside it still travels.
+		const encoded = await Promise.all(
+			variants.map((variant) =>
+				variant.resultMetadata().catch((err) => {
+					logger.error(
+						{ id: job.id, deviceType: variant.deviceType, err: err?.message ?? String(err) },
+						'failed to build a variant result — posting it as an error so the rest of the job still lands'
+					);
+					return { metadata: variant.unreportableMetadata(err), contentBuffer: null };
+				})
+			)
+		);
 		const bodies: Buffer[] = [];
 		const envelope = {
 			id: job.id,
