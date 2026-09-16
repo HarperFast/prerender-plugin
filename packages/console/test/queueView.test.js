@@ -218,3 +218,47 @@ test('an older plugin that emits none of this renders no panel at all', async ()
 	await load(ctx);
 	assert.doesNotMatch(draw(ctx).textContent, /Render prioritisation/);
 });
+
+/**
+ * `prerender_ops.legacy_renderer` — a fleet pod older than browser 1.23.0 posting a single-device
+ * result for a URL job. It shipped with plugin v0.66.0 and no console view read it, which the
+ * metric-coverage guard in adminAssets.test.js caught; these pin the reading rather than its
+ * mere presence.
+ *
+ * The silence is the point. An old pod's result is well-formed, so the outcome chart stays clean,
+ * render time stays normal, and the devices it never rendered just go unwritten — the first
+ * visible symptom is a serve-side one, days later, on a different view.
+ */
+
+test('a healthy fleet draws no legacy-renderer panel at all — zero is the steady state', async () => {
+	const ctx = await ready();
+	assert.doesNotMatch(draw(ctx).textContent, /predate URL jobs/);
+});
+
+test('a legacy renderer is called out with its count and the device it did render', async () => {
+	const ctx = makeCtx({
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'legacy_renderer', 'mobile', null, 37),
+			combo('prerender_ops', 'legacy_renderer', 'desktop', null, 5),
+		],
+	});
+	await load(ctx);
+	const text = draw(ctx).textContent;
+
+	assert.match(text, /predate URL jobs/);
+	assert.match(text, /42 results/, 'counts sum across the device slot');
+	assert.match(text, /desktop, mobile/, 'names what DID render, so a pod is recognisable');
+	// The consequence is the part an operator cannot get from any other panel.
+	assert.match(text, /never being written/);
+});
+
+test('one legacy result is singular, and still shown — a single old pod is the whole finding', async () => {
+	const ctx = makeCtx({
+		...ANALYTICS,
+		series: [...ANALYTICS.series, combo('prerender_ops', 'legacy_renderer', 'mobile', null, 1)],
+	});
+	await load(ctx);
+	assert.match(draw(ctx).textContent, /1 result was posted/);
+});

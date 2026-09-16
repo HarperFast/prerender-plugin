@@ -311,10 +311,52 @@ function supply(ctx) {
 			spacer(),
 			scanFooter(data),
 		]),
+		legacyRenderers(data),
 		kpis,
 		el('div', { cls: 'cols' }, [outcomeChart, timesChart]),
 		reasons,
 	]);
+}
+
+/**
+ * A renderer too old for URL jobs — `prerender_ops.legacy_renderer`, one per result posted in the
+ * single-device shape for a job that asked for several (a fleet pod predating browser 1.23.0).
+ *
+ * SHOWN ONLY WHEN NON-ZERO, and deliberately not a tile or a chart. Zero is the entire steady
+ * state, so a permanent "Legacy renderers: 0" would be noise on every healthy fleet and the
+ * silence would stop meaning anything. Non-zero is a mid-upgrade fleet, which is rare, temporary,
+ * and worth interrupting for.
+ *
+ * WHY IT IS WORTH INTERRUPTING FOR. Nothing else on this page moves. The old pod claims a URL job,
+ * renders ONE of its devices, and posts a well-formed result: the render counts as a success, the
+ * outcome chart is clean, render time is normal, and the devices it did not render simply go
+ * unrendered. Their cached pages then expire on their own schedule and those bots fall through to
+ * the origin — so the first visible symptom is a serve-side one, on a different view, days later.
+ * The plugin also warns hourly per node rather than per result, so the log is deliberately quiet.
+ */
+function legacyRenderers(data) {
+	const rows = pick(data, 'prerender_ops', (s) => s.path === 'legacy_renderer');
+	const total = sumCount(rows);
+	if (!total) return null;
+
+	// The slot carries the device the old renderer DID render, which is the useful half: the
+	// unrendered devices are every other one in `deviceTypes`, and naming what did arrive is what
+	// lets an operator recognise the pod's configuration.
+	const devices = [...new Set(rows.map((s) => s.method).filter(Boolean))].sort();
+
+	return card('Renderers that predate URL jobs', {
+		head: [spacer(), pill(`${num(total)} result${total === 1 ? '' : 's'}`, 'bad')],
+		body: [
+			el('p', { cls: 'note bad' }, [
+				`${num(total)} result${total === 1 ? ' was' : 's were'} posted in the single-device shape for a job `,
+				'that asked for several, so some pod in the render fleet is older than browser 1.23.0. It rendered ',
+				devices.length ? el('code', { text: devices.join(', ') }) : 'one device',
+				' and left the rest of each job unrendered — those pages are not failing, they are simply never ',
+				'being written, and they will fall out of cache as they expire. Upgrade the fleet; this returns to ',
+				'zero within one window of the last old pod being replaced.',
+			]),
+		],
+	});
 }
 
 function cluster(ctx, data, setPause) {
