@@ -440,7 +440,11 @@ test('apiClaimOf projects through the mapping; absent mapped fields yield no cla
 	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'In Stock']], pc)), [['3.00'], true]);
 	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'Out of Stock']], pc)), [['3.00'], false]);
 	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', 'PreOrder']], pc)), [['3.00'], null]);
-	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', null]], pc)), [['3.00'], false]);
+	// A null element is an UNREADABLE variant, not an absent one: `[*]` writes null where the path
+	// could not be walked, so a sold-out variant beside one whose availability has not populated
+	// must not answer a confident "out of stock" the endpoint never gave.
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['Out of Stock', null]], pc)), [['3.00'], null]);
+	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, ['In Stock', null]], pc)), [['3.00'], true]);
 	assert.deepEqual(JSON.parse(apiClaimOf([1, 2, 3, []], pc)), [['3.00'], null]);
 });
 
@@ -517,8 +521,10 @@ test('valueAtPath [*] projects the rest of the path over an array, positionally'
 		flat: [1, 2],
 		nested: [{ k: [{ v: 1 }, { v: 2 }] }, { k: [{ v: 3 }] }],
 	};
-	assert.deepEqual(valueAtPath(doc, 'variants[*].a.s'), ['x', null, 'z']);
-	assert.deepEqual(valueAtPath(doc, 'variants[*].a'), [{ s: 'x' }, {}, { s: 'z' }]);
+	// Projections come back SORTED — order is not a change, and an endpoint that returns its
+	// variants in an unstable order must not read as changed on every pass.
+	assert.deepEqual(valueAtPath(doc, 'variants[*].a.s'), ['x', 'z', null]);
+	assert.deepEqual(valueAtPath(doc, 'variants[*].a'), [{ s: 'x' }, { s: 'z' }, {}]);
 	assert.deepEqual(valueAtPath(doc, 'flat[*]'), [1, 2]);
 	assert.deepEqual(valueAtPath(doc, 'nested[*].k[*].v'), [[1, 2], [3]]);
 	// Past the end of a branch every element reads null, positionally, never a throw.
@@ -526,9 +532,41 @@ test('valueAtPath [*] projects the rest of the path over an array, positionally'
 	// Not an array -> unreachable, like any missing branch; a signature of all-null then fails the probe.
 	assert.equal(valueAtPath(doc, 'nope[*].a'), undefined);
 	assert.equal(valueAtPath({ variants: 'str' }, 'variants[*].a'), undefined);
-	assert.deepEqual(extractValues(doc, ['variants[*].a.s', 'missing[*]']), [['x', null, 'z'], null]);
+	assert.deepEqual(extractValues(doc, ['variants[*].a.s', 'missing[*]']), [['x', 'z', null], null]);
 	// `[*]` and `[N]` tokenize as brackets, never as the names `*` / digits.
 	assert.deepEqual(valueAtPath({ '*': 1, 'variants': [{ '*': 2 }] }, 'variants[*].*'), [2]);
+});
+
+test('a reordered array projects to the same value, so a reorder is not a change', () => {
+	// The failure this prevents: an endpoint with no stable variant order reads as 100% changed on
+	// every pass, which on the canary cohort is a trip and a bulk invalidation of the rule's scope.
+	const one = {
+		v: [
+			{ sku: 'a', av: 'In Stock' },
+			{ sku: 'b', av: 'Out of Stock' },
+		],
+	};
+	const two = {
+		v: [
+			{ sku: 'b', av: 'Out of Stock' },
+			{ sku: 'a', av: 'In Stock' },
+		],
+	};
+	assert.deepEqual(valueAtPath(one, 'v[*].av'), valueAtPath(two, 'v[*].av'));
+	assert.deepEqual(valueAtPath(one, 'v[*]'), valueAtPath(two, 'v[*]'));
+	// And the signature built from them agrees, which is the property that actually matters.
+	assert.equal(
+		JSON.stringify(extractValues(one, ['v[*].sku', 'v[*].av'])),
+		JSON.stringify(extractValues(two, ['v[*].sku', 'v[*].av']))
+	);
+	// A genuine change still reads as one.
+	const changed = {
+		v: [
+			{ sku: 'a', av: 'Out of Stock' },
+			{ sku: 'b', av: 'Out of Stock' },
+		],
+	};
+	assert.notEqual(JSON.stringify(extractValues(one, ['v[*].av'])), JSON.stringify(extractValues(changed, ['v[*].av'])));
 });
 
 test('ruleFingerprint changes with what is observed and with nothing else', () => {

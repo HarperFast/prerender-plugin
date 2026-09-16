@@ -196,6 +196,28 @@ test('the change rate is measured against what was COMPARED, not against every p
 	assert.match(changed.textContent, /of 2\.0k compared/);
 });
 
+test('re-baselined rows leave the compared denominator, so a rule edit cannot read as a static origin', async () => {
+	// The pass right after a rule edit: the plugin re-baselines every row it could not compare —
+	// stored under a different rule fingerprint — so almost nothing was actually compared. Counting
+	// those as compared reports "0% changed" over a population nothing looked at, which is exactly
+	// how a completely static catalogue reads.
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			passes('probed', 4, 1000),
+			passes('seeded', 4, 50),
+			passes('rebaselined', 4, 900),
+			passes('failed', 4, 10),
+			passes('changed', 4, 4),
+		],
+	};
+	const ctx = await ready({ analytics });
+	const changed = tile(ctx, 'Changed');
+	// 4,000 probed − 200 seeded − 3,600 re-baselined − 40 failed = 160 compared, and 16 changed.
+	assert.match(changed.textContent, /of 160 compared/);
+	assert.match(changed.textContent, /10%/);
+});
+
 test('a pass counter is summed by VALUE — counting emits would report the number of passes', async () => {
 	const ctx = await ready();
 	// 4 passes × 1000 = 4,000 probes. Summing `count` would say 4.

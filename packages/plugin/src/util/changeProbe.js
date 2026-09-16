@@ -50,7 +50,7 @@ import { gunzipSync } from 'node:zlib';
 import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
-import { epochMsOf, currentMinuteMs, getNextTimeOfDay, MINUTE, SECOND } from './time.js';
+import { epochMsOf, currentMinuteMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { writeSchedules } from './renderSchedule.js';
@@ -995,7 +995,14 @@ const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 			: isAnchored()
 				? config.changeProbe.anchorWindow
 				: 0,
-	sliceSize: paced && isContinuous() ? (measuredSliceSize ?? 0) : 0,
+	// The denominator the cycle target is honoured against. Anchored mode needs it as much as
+	// continuous does: without it `cycleRatePerSecond` has nothing to divide and returns Infinity,
+	// so `anchorWindow` would be read, reported, and then silently ignored — the pass would burst at
+	// the ceiling however the window was set, and `probe_cycle_behind` (which also requires a slice)
+	// would stay quiet about it. `measuredSliceSize` is maintained after every completed pass
+	// regardless of mode, so the first anchored pass paces at the ceiling and measures, and every
+	// pass after it honours the window.
+	sliceSize: paced && (isContinuous() || isAnchored()) ? (measuredSliceSize ?? 0) : 0,
 	// The local governor is opt-in and orthogonal to the mode, so it is read from config rather
 	// than gated on `isContinuous()` — an operator who wants it in interval mode has been warned
 	// by the option's own documentation and may have reasons. It applies to the canary too: a
@@ -1480,6 +1487,14 @@ const armAnchorTimer = () => {
 		);
 		return;
 	}
+	// A NEXT RUN MUST BE IN THE FUTURE. On the spring-forward day the anchor's wall-clock time can
+	// be one that never occurs — 02:30 where 02:00 jumps to 03:00 — and `getNextTimeOfDay` resolves
+	// it to an instant that has already passed. Left alone that fires the pass an hour early and,
+	// worse, the re-arm at the end of the pass computes the same past instant again: the whole
+	// corpus is walked back to back at the ceiling rate until the hour is over. Pushing a stale
+	// anchor on by a day lands on the next real occurrence, because the offset is applied to the
+	// resolved instant rather than to the wall clock.
+	if (at <= Date.now()) at += DAY;
 	nextAnchorAt = at;
 	anchorTimer = setTimeout(
 		async () => {

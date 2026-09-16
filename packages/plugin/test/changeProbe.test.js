@@ -1228,6 +1228,48 @@ test('scheduler: anchored mode arms a daily timer keyed on the anchor, runs no b
 	assert.equal(changeProbe.probeTimerState().armedSweep, 60_000);
 
 	t.mock.timers.reset();
+});
+
+test('scheduler: an anchor inside the spring-forward hour still arms a FUTURE run', async (t) => {
+	// 2026-03-08, America/New_York: 02:00 EST jumps to 03:00 EDT, so an anchor of 02:30 names a
+	// wall-clock time that does not occur that day and resolves to an instant already past. Armed
+	// as-is, the pass fires early AND every re-arm at the end of a pass computes the same past
+	// instant — the whole corpus walked back to back at the ceiling rate until the hour is over.
+	// The host's own zone is pinned to UTC for the duration: the resolver reads it, so without this
+	// the instant it returns — and therefore whether the bug reproduces at all — depends on wherever
+	// the test happens to run.
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+	try {
+		// Three instants inside the skipped hour. Every one of them resolved into the past before
+		// the guard, and each would have re-armed to the same past instant on every completion.
+		for (const now of ['2026-03-08T06:35:00Z', '2026-03-08T06:45:00Z', '2026-03-08T06:55:00Z']) {
+			t.mock.timers.setTime(Date.parse(now));
+			await applyProbeConfig({
+				enabled: true,
+				mode: 'anchored',
+				anchorTime: '02:30',
+				anchorTimezone: 'America/New_York',
+				startDelay: 0,
+				startJitter: 1,
+			});
+			changeProbe.startChangeProbeScheduler();
+
+			const status = await changeProbe.changeProbeStatus();
+			const next = new Date(status.sweep.nextAnchoredRunAt).getTime();
+			assert.ok(
+				next > Date.now(),
+				`at ${now} the next anchored run must be in the future, got ${new Date(next).toISOString()}`
+			);
+			assert.equal(status.sweep.running, false, `at ${now} it must not fire on the spot`);
+			await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 0, startJitter: 1 });
+		}
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+	}
 	await applyProbeConfig({ enabled: false });
 });
 

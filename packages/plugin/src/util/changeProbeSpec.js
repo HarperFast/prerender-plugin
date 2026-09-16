@@ -398,7 +398,14 @@ const availabilityClaim = (raw, vocabulary) => {
 			const verdict = availabilityClaim(item, vocabulary);
 			if (verdict === true) sawAvailable = true;
 			else if (verdict === false) sawUnavailable = true;
-			else if (item !== null && item !== undefined) sawUnrecognized = true;
+			// EVERY element that yields no verdict counts as unreadable, including a null one. A
+			// `[*]` projection writes exactly null where the path could not be walked — a variant
+			// that simply has no availability field yet — so skipping nulls let a list of one
+			// sold-out variant and one unreadable variant answer a confident "out of stock" that
+			// the endpoint never said. That claim is compared against the page's own, and a
+			// disagreement expires a page: the cost of guessing here is paid in origin traffic on
+			// products that were never out of stock.
+			else sawUnrecognized = true;
 		}
 		return sawAvailable ? true : sawUnavailable && !sawUnrecognized ? false : null;
 	}
@@ -552,6 +559,15 @@ export const valueAtPath = (value, path) => walkPath(value, String(path).match(P
 // characters to that alternative, so ordering it first would tokenize `[*]` as the name `*`.
 const PATH_TOKEN = /\[\*\]|\[\d+\]|[^.[\]]+/g;
 
+// A total, stable order over projected elements of any shape — they may be strings, numbers, nulls
+// or whole objects. Comparing their JSON keeps the sort deterministic across passes, which is the
+// only property that matters here: the same multiset must always produce the same signature.
+const byProjectedValue = (a, b) => {
+	const left = JSON.stringify(a) ?? 'null';
+	const right = JSON.stringify(b) ?? 'null';
+	return left < right ? -1 : left > right ? 1 : 0;
+};
+
 const walkPath = (value, tokens, from) => {
 	let current = value;
 	for (let i = from; i < tokens.length; i++) {
@@ -559,10 +575,19 @@ const walkPath = (value, tokens, from) => {
 		const token = tokens[i];
 		if (token === '[*]') {
 			if (!Array.isArray(current)) return undefined;
-			return current.map((element) => {
-				const projected = walkPath(element, tokens, i + 1);
-				return projected === undefined ? null : projected;
+			const projected = current.map((element) => {
+				const value = walkPath(element, tokens, i + 1);
+				return value === undefined ? null : value;
 			});
+			// ORDER IS NOT A CHANGE, so it is sorted out of the projection before it can become one.
+			// A signature is compared byte for byte, and plenty of endpoints return their variant
+			// array in whatever order the query came back in. Left positional, one such endpoint
+			// reads as 100% changed on EVERY pass — which on the canary cohort is not a wave of
+			// per-URL re-renders but a trip, and a bulk invalidation of the rule's whole scope.
+			// Sorting trades away the one case where a multiset is stable but its order is not: two
+			// variants swapping prices with each other is invisible. The offers on the page are the
+			// same set either way, which is what the signature is asking about.
+			return projected.sort(byProjectedValue);
 		}
 		const key = token.startsWith('[') ? Number(token.slice(1, -1)) : token;
 		current = current[key];
