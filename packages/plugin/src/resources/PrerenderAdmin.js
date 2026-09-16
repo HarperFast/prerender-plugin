@@ -2012,26 +2012,38 @@ export class PrerenderAdmin extends Resource {
 		const pageSize = Math.max(1, config.management.pageSize | 0);
 		const limit = Math.min(Math.max(1, Number(target?.get?.('limit')) || pageSize), pageSize);
 
-		// `￿` sorts after every code unit that can appear in a key, so [prefix, prefix+
-		// '￿') is the prefix range. The cursor (last key of the previous page) narrows the
-		// lower bound; `greater_than` both excludes it and gives the no-prefix case a full-table
-		// ascending walk bounded by `limit`.
+		// ONE-SIDED, and the prefix is enforced while CONSUMING — never as a second condition.
+		// A two-sided PK range does not prune this scan: the walk runs past the upper bound until
+		// it finds `limit + 1` matches or reaches the end of the table, so a prefix with no match
+		// AT THE SEEK POINT cost a full-table walk and returned 504 every time, at the same cost
+		// for `limit=1` as for `limit=30`. Measured against ~800k keys: a facet-shaped prefix with
+		// no match took the whole 3s budget; the same prefix client-bounded takes one seek.
+		//
+		// The rows are `cacheKey`-ordered, so the FIRST key that does not start with `prefix` ends
+		// the page — that is the entire upper bound, and it needs no condition. Same shape as
+		// `walkPrefix` in util/discoveredPurge.js, for the same reason.
+		//
+		// The cursor (last key of the previous page) narrows the lower bound; `greater_than` both
+		// excludes it and gives the no-prefix case a full-table ascending walk bounded by `limit`.
 		const conditions = [{ attribute: 'cacheKey', comparator: 'greater_than', value: cursor || prefix || '' }];
-		if (prefix) {
-			conditions.push({ attribute: 'cacheKey', comparator: 'less_than', value: `${prefix}￿` });
-		}
 
 		const timedOut = [];
-		const rows = await readWithTimeout('pages', timedOut, () =>
-			Array.fromAsync(
-				PrerenderedPage.search({
-					conditions,
-					sort: { attribute: 'cacheKey' },
-					select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
-					limit: limit + 1, // one extra row = "there is a next page", never shown
-				})
-			)
-		);
+		const rows = await readWithTimeout('pages', timedOut, async () => {
+			const kept = [];
+			for await (const row of PrerenderedPage.search({
+				conditions,
+				sort: { attribute: 'cacheKey' },
+				select: ['cacheKey', 'statusCode', 'lastCached', 'expiresAt', 'isIndexable'],
+				limit: limit + 1, // one extra row = "there is a next page", never shown
+			})) {
+				// BREAK, never `continue`: ascending order means one non-matching key proves every
+				// later key is outside the prefix too. Skipping instead would re-create the defect.
+				if (prefix && !String(row.cacheKey ?? '').startsWith(prefix)) break;
+				kept.push(row);
+				if (kept.length >= limit + 1) break;
+			}
+			return kept;
+		});
 		if (timedOut.length) return json({ error: 'page-cache read timed out' }, 504);
 
 		// ONE read for the whole page, derived per row synchronously below.
