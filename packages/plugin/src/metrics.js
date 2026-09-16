@@ -753,6 +753,14 @@ export const metrics = Object.freeze({
 	discoveryGated: (reason, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'discovery_gated', reason, botName ?? null),
 
+	/**
+	 * One result posted in the single-device shape for a job that asked for several — a renderer
+	 * older than browser 1.23.0. Non-zero means some pod missed the fleet upgrade and the devices it
+	 * is not rendering are silently falling out of cache.
+	 */
+	legacyRenderer: (deviceType) =>
+		server.recordAnalytics(true, 'prerender_ops', 'legacy_renderer', deviceType ?? null, null),
+
 	/** One series of a finished sitemap refresh run — prerender_ops `sitemap_<series>`. */
 	sitemapRun: (value, series) => server.recordAnalytics(value, 'prerender_ops', `sitemap_${series}`, null, null),
 

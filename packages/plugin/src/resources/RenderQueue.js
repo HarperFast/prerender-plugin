@@ -104,9 +104,41 @@ const normalizeJobResult = (result) => {
 				: variants.map((variant) => variant.deviceType);
 		return { rowKey, url, asked, variants };
 	}
-	const deviceType = CacheKey.deviceOf(rowKey) ?? sanitizeDeviceType(result.deviceType ?? defaultDeviceTypes()[0]);
+	const rowDevice = CacheKey.deviceOf(rowKey);
+	const deviceType = rowDevice ?? sanitizeDeviceType(result.deviceType ?? defaultDeviceTypes()[0]);
 	const { id, url: _url, deviceTypes, ...variant } = result;
+	// A FLAT RESULT ON A URL ROW IS A RENDERER THAT MISSED THE UPGRADE, and it is the one failure in
+	// this change that is otherwise completely silent. The job named every default device; a
+	// pre-1.23.0 worker rendered only the first and posted it flat. `asked` stays the one device on
+	// purpose — turning the others into `not-attempted` would put every URL that pod touches into
+	// the retry lanes and burn the corpus's strikes against a fleet that is merely old — but then
+	// nothing else says it happened either: the URL reschedules as a success, the outcome counters
+	// read healthy, and the unrendered device's pages quietly expire across everything that pod
+	// claims. So say it, loudly and cheaply.
+	if (!rowDevice) reportLegacyRenderer(url, deviceType);
 	return { rowKey, url, asked: [deviceType], variants: [{ ...variant, deviceType }] };
+};
+
+let lastLegacyRendererWarnAt = 0;
+
+/**
+ * A renderer too old for URL jobs, reported once an hour per node and counted on every result.
+ *
+ * Hourly rather than per result because a stale pod produces one of these for every job it claims,
+ * and a log line per render would bury the thing it is warning about. The counter is what makes the
+ * scale readable — if it is non-zero at all, some pod never took the fleet upgrade.
+ */
+const reportLegacyRenderer = (url, deviceType) => {
+	metrics.legacyRenderer(deviceType);
+	const now = Date.now();
+	if (now - lastLegacyRendererWarnAt < 3600000) return;
+	lastLegacyRendererWarnAt = now;
+	logger.warn(
+		`Prerender received a single-device result for a URL job (${url}, ${deviceType}) — that renderer predates ` +
+			`browser 1.23.0, so it rendered ONE of the job's devices and the rest went unrendered. Their cached pages ` +
+			`will expire and those bots will be served from the origin until the fleet is upgraded. This is counted in ` +
+			`prerender_ops legacy_renderer.`
+	);
 };
 
 /**
@@ -519,39 +551,16 @@ export class RenderQueue extends Resource {
 			return;
 		}
 
-		// 2. A rendered result whose landed URL keys elsewhere (client-side redirect that produced a
-		// real page): the long-standing refile semantics, per variant. Onto a route we serve, the page
-		// is stored under the DESTINATION's key and the source is retired — once, by URL, taking its
-		// device siblings with it: a page does not redirect for one device and serve for another.
-		// Onto a class we never serve, the render is discarded and the target kept (see the warn).
-		let refiledTo = null;
-		for (const variant of variants) {
-			if (variant.outcome !== 'rendered' || !variant.redirect) continue;
-			if (variant.redirect.landedOn === PRERENDER) {
-				if (!refiledTo) {
-					logger.info(`Skipped prerendered url due to redirect: ${rowKey} redirected to ${variant.redirectedTo}`);
-					await retireSource(job);
-					refiledTo = variant.redirect.destinationUrl;
-				}
-				variant.storeKey = variant.redirect.redirectKey;
-				variant.refiled = true;
-			} else {
-				// The redirect target is a class we never serve from cache, so re-keying onto it
-				// would file the render where no read will ever look — and deleting this target
-				// would silently end the URL's rendering for good (see util/reconcile.js on how
-				// undiagnosable that state is). The route list may simply be incomplete, so
-				// report it and leave the target alone rather than destroy it on that evidence.
-				// The render is wasted each interval until the redirect or the routes are fixed.
-				logger.warn(
-					`Prerendered url ${rowKey} redirected to ${variant.redirectedTo}, which is ${variant.redirect.landedOn} — ` +
-						`discarding the render and keeping the target (no key to store it under)`
-				);
-				recordUnroutedPath(variant.redirect.landedOn, variant.redirect.redirectPath, 'redirect');
-				variant.discardContent = true;
-			}
-		}
-
-		// 3. A verdict about the page itself, on any device. `reason` (browser >= v1.16.0) says WHY:
+		// 2. A verdict about the page itself, on any device. BEFORE the refile below, which is what
+		// the documented precedence has always said (redirect, then verdict, then rendered) and what
+		// the per-key code did when one device's result decided everything. Running the refile first
+		// inverted it destructively on a split result — one device client-side-redirecting while the
+		// other returned a genuine noindex: the refile deleted the target and its pages, and then
+		// `Target.suppress` CREATED the row again (it mints one when absent), re-minting the target
+		// that had just been deleted, as suppressed and carrying a strike, while the redirect
+		// destination went nowhere. A verdict suppresses the URL; nothing destructive may precede it.
+		//
+		// `reason` (browser >= v1.16.0) says WHY:
 		// 'noindex', 'canonical-mismatch', 'http-error', 'redirect-loop', or (>= v1.17.0)
 		// 'canonical-variant' — the canonical names this very document RE-SPELLED as a different
 		// cache key. Suppressed identically; the split keeps a wave of duplicate spellings legible.
@@ -591,6 +600,38 @@ export class RenderQueue extends Resource {
 			return;
 		}
 
+		// 3. A rendered result whose landed URL keys elsewhere (client-side redirect that produced a
+		// real page): the long-standing refile semantics, per variant. Onto a route we serve, the page
+		// is stored under the DESTINATION's key and the source is retired — once, by URL, taking its
+		// device siblings with it: a page does not redirect for one device and serve for another.
+		// Onto a class we never serve, the render is discarded and the target kept (see the warn).
+		let refiledTo = null;
+		for (const variant of variants) {
+			if (variant.outcome !== 'rendered' || !variant.redirect) continue;
+			if (variant.redirect.landedOn === PRERENDER) {
+				if (!refiledTo) {
+					logger.info(`Skipped prerendered url due to redirect: ${rowKey} redirected to ${variant.redirectedTo}`);
+					await retireSource(job);
+					refiledTo = variant.redirect.destinationUrl;
+				}
+				variant.storeKey = variant.redirect.redirectKey;
+				variant.refiled = true;
+			} else {
+				// The redirect target is a class we never serve from cache, so re-keying onto it
+				// would file the render where no read will ever look — and deleting this target
+				// would silently end the URL's rendering for good (see util/reconcile.js on how
+				// undiagnosable that state is). The route list may simply be incomplete, so
+				// report it and leave the target alone rather than destroy it on that evidence.
+				// The render is wasted each interval until the redirect or the routes are fixed.
+				logger.warn(
+					`Prerendered url ${rowKey} redirected to ${variant.redirectedTo}, which is ${variant.redirect.landedOn} — ` +
+						`discarding the render and keeping the target (no key to store it under)`
+				);
+				recordUnroutedPath(variant.redirect.landedOn, variant.redirect.redirectPath, 'redirect');
+				variant.discardContent = true;
+			}
+		}
+
 		// The scheduling target: the URL's own, or — after a refile — the destination's, which is what
 		// the old per-key code consulted once it had re-pointed the working key at the destination.
 		const scheduleUrl = refiledTo ?? url;
@@ -621,7 +662,26 @@ export class RenderQueue extends Resource {
 		const rendered = variants.filter((variant) => variant.outcome === 'rendered');
 		// Content is what gets stored, whatever the status the browser reported beside it — the same
 		// test the per-key path applied. (`hasContent`, with its 200 check, is the metrics candidacy.)
-		const stored = rendered.filter((variant) => !!variant.content && !variant.discardContent);
+		// A SIBLING OF A REFILED VARIANT HAS NOWHERE TO GO. `retireSource` ran `Target.delete` on the
+		// source URL above, which took the target, its schedule row and all of its pages; a variant
+		// that did NOT redirect still carries the source's own store key, so writing it here would
+		// leave a page blob for a URL with no target and no schedule row — never re-rendered, never
+		// reclaimed (only the resource-class delete cascades), and still served to bots as a 200 for
+		// a URL the origin redirects away from. The per-key code could not reach this state: each
+		// device carried its own result, so once one device's refile deleted the target the other
+		// device's row was already gone. The destination is scheduled below and renders both devices
+		// on its own next pass.
+		const orphaned = refiledTo ? rendered.filter((variant) => !variant.refiled) : [];
+		if (orphaned.length) {
+			logger.info(
+				`Prerender ${url} refiled to ${refiledTo}; discarding the ${orphaned
+					.map((variant) => variant.deviceType)
+					.join(', ')} render whose target was retired with it`
+			);
+		}
+		const stored = rendered.filter(
+			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled)
+		);
 		if (stored.length) {
 			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
 			// than per use because `recordPageClaim` stores it as the basis a per-URL verification

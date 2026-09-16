@@ -680,3 +680,72 @@ test('an older renderer answering a URL job posts flat and is attributed to the 
 	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'the URL is rescheduled');
 	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
 });
+
+// ──────────────── review fixes: refile, verdict order, legacy renderer ────────────────
+
+test('a client-side refile does NOT store the sibling that did not redirect — its target is gone', async () => {
+	// One device follows a client-side redirect to a URL we serve; the other renders the source
+	// normally. `Target.delete` takes the source target, its schedule row and all of its pages, so
+	// writing the sibling's page back under the source key would leave a blob for a URL with no
+	// target and no schedule row: never re-rendered, never reclaimed, and still served to bots as a
+	// 200 for a URL the origin redirects away from.
+	seedUrlRow();
+	stores.target.set(B, { url: B, renderInterval: 3_600_000 });
+	await postVariants(A, [
+		rendered('desktop', '<html>landed on b</html>', { redirectedTo: B }),
+		rendered('mobile', '<html>still a</html>'),
+	]);
+
+	assert.equal(stores.target.has(A), false, 'the source target was retired with the refile');
+	assert.equal(stores.prerenderedPage.has(key(A, 'mobile')), false, 'the sibling was NOT written back under it');
+	assert.equal(stores.prerenderedPage.has(key(A, 'desktop')), false);
+	assert.ok(
+		infos.some((line) => String(line).includes('discarding the mobile render')),
+		`the discard is reported, got: ${JSON.stringify(infos)}`
+	);
+	assert.equal(stores.prerenderedPage.has(key(B, 'desktop')), true, 'the refiled page landed on the destination');
+});
+
+test('a verdict outranks a refile: the target is suppressed, never deleted and re-minted', async () => {
+	// Documented precedence is redirect, then verdict, then rendered. With the refile running first
+	// it deleted the target and `Target.suppress` then CREATED the row again — re-minting the very
+	// target that had just been deleted, as suppressed and carrying a strike.
+	seedUrlRow();
+	stores.target.set(B, { url: B, renderInterval: 3_600_000 });
+	await postVariants(A, [
+		rendered('desktop', '<html>landed on b</html>', { redirectedTo: B }),
+		{
+			deviceType: 'mobile',
+			statusCode: 200,
+			outcome: 'non-indexable',
+			reason: 'noindex',
+			isIndexable: false,
+			headers: {},
+			renderTime: 90,
+			structuredOffers: null,
+		},
+	]);
+
+	const target = stores.target.get(A);
+	assert.ok(target, 'the target survives a verdict — suppression is not deletion');
+	assert.equal(target.state, 'suppressed');
+	assert.deepEqual(outcomes(), [['suppressed', 'noindex']], 'one outcome, and it is the verdict');
+	assert.equal(stores.prerenderedPage.has(key(B, 'desktop')), false, 'nothing was refiled onto the destination');
+});
+
+test('a flat result on a URL row is counted and warned about — an un-upgraded renderer is otherwise silent', async () => {
+	// A pre-1.23.0 worker renders ONE device of a multi-device job and posts it flat. The URL still
+	// reschedules as a success (making the others `not-attempted` would burn the corpus's strikes
+	// against a merely-old fleet), so this counter and warning are the only evidence it happened.
+	seedUrlRow();
+	await post({ id: A, url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {}, renderTime: 50 });
+
+	const legacy = analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === 'legacy_renderer');
+	assert.equal(legacy.length, 1, 'counted once for the result');
+	assert.equal(legacy[0][3], 'desktop', 'tagged with the device it actually rendered');
+	// The counter is what is asserted because it fires on every result. Its companion log line is
+	// deliberately rate-limited to once an hour per node — a stale pod produces one of these for
+	// every job it claims, and a line per render would bury the thing it is warning about — so
+	// whether it appears here depends on what ran earlier in the file.
+	assert.equal(stores.prerenderedPage.has(key(A, 'desktop')), true, 'and the one device it did render is stored');
+});

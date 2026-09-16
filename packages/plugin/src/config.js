@@ -615,6 +615,23 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 	if (target.domains.length === 0) {
 		add('warn', 'domains', 'domains allowlist is empty — all hosts will be treated as indexable');
 	}
+	// `deviceTypes.supported` decides how a SCHEDULE KEY PARSES since v0.66.0: a key's trailing
+	// `|<device>` is only read as a device when that device is supported, and anything else is read
+	// as a URL. So a default device missing from `supported` makes its pre-0.66.0 rows parse as URL
+	// rows, whose URL then resolves to no target — and the result path deletes them. Cheap to
+	// mistype, invisible until the rows are gone, and the config is the only place it can be caught.
+	const unsupportedDefaults = target.deviceTypes.default.filter(
+		(device) => !target.deviceTypes.supported.includes(device)
+	);
+	if (unsupportedDefaults.length) {
+		add(
+			'warn',
+			'deviceTypes.default',
+			`deviceTypes.default names ${unsupportedDefaults.join(', ')}, which deviceTypes.supported does not — ` +
+				'schedule keys for those devices parse as URLs and their rows are dropped as targetless. ' +
+				'Add them to deviceTypes.supported.'
+		);
+	}
 	if (target.ingress.mode === 'forwarded' && routeCount === 0) {
 		// Nothing is prerendered in this state: every forwarded request classifies as
 		// unclassified and is proxied straight through. Silent before — the plugin looked
