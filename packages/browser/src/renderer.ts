@@ -80,13 +80,13 @@ const renderer: Renderer = async (page, job) => {
 
 	const setupPromises: Promise<unknown>[] = [page.setRequestInterception(true), page.setViewport(profile.viewport)];
 
-	// Document reuse (see documentReuse.ts). `documentCache` is shared by every variant of a
-	// multi-device job: the first variant to receive a reusable document fills it, and later variants
-	// answer their navigation from it — with an EMPTY cookie jar, as every variant always has: no cookie
-	// crosses variants. A sample job replays nothing; it fetches cold, so the comparison is against a
-	// document the origin actually produced for this device.
+	// Document reuse and prefetch (see documentReuse.ts). `documentCache` is shared by every variant
+	// of the job: a prefetched document answers the navigation of the device it was fetched for (with
+	// that response's own cookies, as if Chrome had fetched it); the first variant's document — captured
+	// or prefetched — answers the later variants with an EMPTY cookie jar, as every variant always has:
+	// no cookie crosses variants. A sample job's later variants replay nothing; they fetch cold, so the
+	// comparison is against a document the origin actually produced for this device.
 	const documentCache = job.documentCache;
-	const replayDocument = documentCache?.canReplay ? documentCache.entry : null;
 	// The first variant's capture of its own document, settled before navigation returns so the entry
 	// is complete before the next variant starts.
 	let documentCapture: Promise<void> | null = null;
@@ -109,14 +109,33 @@ const renderer: Renderer = async (page, job) => {
 				return;
 			}
 			if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-				if (replayDocument && !job.documentReused) {
-					// Answered from the sibling's document: no origin fetch, no bypass token needed — the
-					// bytes already came through it. Marked so the response handler below does not treat
-					// this as a fresh document to capture.
-					job.documentReused = true;
-					documentCache!.reusedBy.push(deviceType);
-					req.respond(toRespondPayload(replayDocument)).catch(noop);
-					return;
+				if (documentCache && !job.documentReplayed) {
+					// Only the render's FIRST navigation may be answered from a held document (the latch);
+					// `replayFor` waits for a prefetch still in flight, so re-check the render is alive
+					// after it. Answered from a held document: no origin fetch, no bypass token needed —
+					// the bytes already came through it. Marked so the response handler below does not
+					// treat this as a fresh document to capture.
+					const doc = await documentCache.replayFor(deviceType);
+					if (ac.signal.aborted || aborted) {
+						req.abort().catch(noop);
+						return;
+					}
+					if (doc) {
+						job.documentReplayed = true;
+						// The document IS this device's own response (a prefetch) — it gets its cookies. A
+						// sibling's document does not: no cookie crosses variants.
+						const ownFetch = doc.deviceType === deviceType;
+						if (doc.source === 'prefetch') {
+							job.documentPrefetched = true;
+							documentCache.prefetchedBy.push(deviceType);
+						}
+						if (!ownFetch) {
+							job.documentReused = true;
+							documentCache.reusedBy.push(deviceType);
+						}
+						req.respond(toRespondPayload(doc, { withCookies: ownFetch })).catch(noop);
+						return;
+					}
 				}
 				const headers = req.headers();
 
@@ -203,7 +222,7 @@ const renderer: Renderer = async (page, job) => {
 							.buffer()
 							.then((body) => {
 								if (documentCache.entry) return;
-								documentCache.entry = { url: res.url(), status, headers, body, deviceType };
+								documentCache.entry = { url: res.url(), status, headers, body, deviceType, source: 'navigation' };
 							})
 							.catch(noop);
 					} else if (documentCache.sample) {

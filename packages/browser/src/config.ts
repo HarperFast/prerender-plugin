@@ -359,6 +359,26 @@ export type DocumentReuseConfig = {
 	 * is logged and counted, never used to switch reuse off (a deploy in progress would trip it).
 	 */
 	sampleEvery: number;
+	prefetch: DocumentPrefetchConfig;
+};
+
+/**
+ * Fetching a job's document in the worker AHEAD of its render — see `src/documentPrefetch.ts`. Works
+ * on its own (a single-device job's document, fetched while an earlier job renders) and with
+ * `documentReuse.enabled` (the prefetched document is then also what the other devices replay).
+ */
+export type DocumentPrefetchConfig = {
+	enabled: boolean;
+	/**
+	 * Claimed jobs held prefetching ahead of the render slots — the pipeline depth, and the most
+	 * prefetched documents in memory at once. To hide a fetch of `f` seconds behind renders of `r`
+	 * seconds on `c` slots, a slot frees every `r / c` seconds, so `depth ≥ f · c / r + 1` keeps a
+	 * document ready; 2 covers c=10, f=1 s, r=12 s. A pooled job sits claimed for about
+	 * `depth · r / c` seconds before its render starts.
+	 */
+	depth: number;
+	/** Give up on a prefetch after this long; the variant then fetches the document itself. */
+	timeoutMs: number;
 };
 
 export type PrerenderConfig = {
@@ -429,7 +449,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 	cacheKey: { plusIsSpace: false, trailingSlash: 'strip' },
 	injectWebComponentsPolyfill: true,
 	extraHeaders: {},
-	documentReuse: { enabled: false, sampleEvery: 0 },
+	documentReuse: { enabled: false, sampleEvery: 0, prefetch: { enabled: false, depth: 2, timeoutMs: 8000 } },
 });
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -506,6 +526,19 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	if (!Number.isInteger(config.documentReuse.sampleEvery) || config.documentReuse.sampleEvery < 0) {
 		throw new Error('prerender config: documentReuse.sampleEvery must be a non-negative integer (0 = no sampling)');
+	}
+	const prefetch: unknown = config.documentReuse.prefetch;
+	if (!isPlainObject(prefetch)) {
+		throw new Error('prerender config: documentReuse.prefetch must be an object');
+	}
+	if (typeof prefetch.enabled !== 'boolean') {
+		throw new Error('prerender config: documentReuse.prefetch.enabled must be a boolean');
+	}
+	if (!Number.isInteger(prefetch.depth) || (prefetch.depth as number) < 1) {
+		throw new Error('prerender config: documentReuse.prefetch.depth must be a positive integer');
+	}
+	if (typeof prefetch.timeoutMs !== 'number' || !(prefetch.timeoutMs > 0)) {
+		throw new Error('prerender config: documentReuse.prefetch.timeoutMs must be a positive number');
 	}
 	// Scroll step is a positive fraction of the viewport; reject non-numbers / non-positive
 	// (config is API- and JSON-supplied). scrollPass additionally floors pathologically small

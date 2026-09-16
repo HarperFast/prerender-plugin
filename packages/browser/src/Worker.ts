@@ -10,6 +10,8 @@ import { settings } from './settings.js';
 import { CpuSampler } from './util/cpu.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import { JobDocumentCache } from './documentReuse.js';
+import { prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
+import { BoundedAsyncQueue } from './util/asyncQueue.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -118,6 +120,29 @@ export default class RenderWorker {
 			documentsReused: 0,
 			documentSamples: 0,
 			documentDivergence: [] as number[],
+			// Document prefetch (config.documentReuse.prefetch): variants whose navigation was answered
+			// from a document this process fetched ahead of the render, and prefetches that yielded no
+			// document, by why (the variant then fetched normally — `status` is the origin's non-200,
+			// normal for a share of jobs; `timeout`/`error` are worth a look).
+			documentsPrefetched: 0,
+			prefetchFallthrough: {
+				'status': 0,
+				'not-html': 0,
+				'too-large': 0,
+				'timeout': 0,
+				'aborted': 0,
+				'error': 0,
+			} as Record<Exclude<PrefetchOutcome, 'fetched'>, number>,
+			// Claimed jobs this worker dropped at shutdown without attempting a render — pooled for
+			// prefetch, or waiting for a slot when the drain began. Their leases expire and the queue
+			// re-grants them; a handful per rollout is the expected shape.
+			jobsAbandoned: 0,
+			// How long a navigation waited for its prefetch to finish, ms — 0 when the document was already
+			// in hand. A p95 well above 0 says `prefetch.depth` is too shallow for this concurrency.
+			prefetchWaitMs: [] as number[],
+			// Wall time of the prefetches that produced a document — the origin time the render no
+			// longer spends.
+			prefetchFetchMs: [] as number[],
 			concurrencyBlocked: 0,
 			rpsDelayed: 0,
 			resultPostFailures: 0,
@@ -143,6 +168,10 @@ export default class RenderWorker {
 	// selects sample jobs from. Per worker, which is what makes "every Nth job" mean what it says on
 	// a worker that renders a few thousand jobs a day.
 	private documentJobs = 0;
+
+	// Chrome's own user agent, learned from the first launched browser: what a device profile without
+	// a `userAgent` sends, and therefore what its prefetch must send too.
+	private browserUserAgent: string | undefined;
 
 	// Set on graceful shutdown: stops the consumer loop and blocks new renders while
 	// in-flight ones drain.
@@ -179,41 +208,218 @@ export default class RenderWorker {
 		this.jobStartDelay = Math.floor(1000 / this.rps);
 	}
 
-	async run() {
-		for await (const job of RenderQueueConsumer(this.consumerAbort.signal)) {
-			if (this.shuttingDown) break;
-			const ts = Date.now();
-			// Do not run expired jobs to prevent double rendering
-			if (job.expiresAt - ts < LEASE_MIN_REMAINING_MS) {
-				this.stats.expiredSkipped++;
-				console.log(`Skipping expired job ${job.id}`);
+	/**
+	 * The claim → render loop, over the queue consumer by default (tests pass their own iterable).
+	 *
+	 * Without prefetch, a claimed job goes straight to a render slot: admitted, held for a free slot and
+	 * the `rps` pacing, started. With `documentReuse.prefetch` on, the loop is PIPELINED: a small
+	 * bounded pool (`prefetch.depth`) of claimed jobs sits between the consumer and the slots, and a
+	 * job's document fetch starts the moment it enters the pool — while earlier jobs are still
+	 * rendering — so that by the time a slot frees, the next job's document is usually in hand and its
+	 * render starts without waiting on the origin (documentPrefetch.ts).
+	 *
+	 * Two loops share the pool: the filler pulls from the consumer and waits while the pool is full,
+	 * so the worker never runs ahead of its slots by more than `depth` claims; the render loop waits
+	 * for a free slot and THEN takes the oldest pooled job — slot first, so exactly `depth` jobs
+	 * prefetch ahead and the lease is re-checked right before the render, not before a wait — and a
+	 * pooled job never waits for a SUCCESSOR to arrive, so a trickle of jobs from a near-empty queue
+	 * renders as promptly as it did before. `rps` still paces render starts; at steady state a
+	 * prefetch starts each time a render does, so the origin sees the same request rate, one render
+	 * earlier.
+	 *
+	 * At shutdown the consumer ends, the filler closes the pool, and whatever is still pooled is
+	 * dropped: no variant of it was attempted, so there is nothing to post, and its lease expires and
+	 * the queue re-grants it — the same fate a job sitting unclaimed in the consumer's batch always had.
+	 */
+	async run(jobs: AsyncIterable<RenderJob> = RenderQueueConsumer(this.consumerAbort.signal)) {
+		const prefetch = settings.config.documentReuse.prefetch;
+		if (!prefetch.enabled) {
+			for await (const job of jobs) {
+				if (this.shuttingDown) break;
+				if (!this.admit(job)) continue;
+				await this.awaitSlot();
+				await this.start(job);
+			}
+			return;
+		}
+
+		// A device profile without a `userAgent` sends Chrome's own, so the prefetch needs it before the
+		// first fetch. Launching the browser here costs nothing: the first render needs it moments later.
+		await this.getBrowser().then(
+			(browser) => this.rememberUserAgent(browser),
+			(err) =>
+				logger.warn({ err }, 'browser launch ahead of the first prefetch failed — prefetching without its user agent')
+		);
+
+		const pool = new BoundedAsyncQueue<RenderJob>(prefetch.depth);
+		const filling = (async () => {
+			// Iterated by hand rather than `for await`, so the next claim is pulled only once the pool
+			// has room for it: exactly `depth` jobs prefetch ahead, and a job's prefetch is under way
+			// before the render loop can take it.
+			const iterator = jobs[Symbol.asyncIterator]();
+			try {
+				while (!this.shuttingDown) {
+					await pool.waitForRoom();
+					if (pool.isClosed) break;
+					const next = await iterator.next();
+					if (next.done) break;
+					const job = next.value;
+					if (this.shuttingDown) {
+						this.abandon(job);
+						break;
+					}
+					if (!this.admit(job)) continue;
+					this.startPrefetch(job);
+					if (!(await pool.put(job))) this.abandon(job);
+				}
+			} finally {
+				pool.close();
+				// Let a generator source run its own cleanup (the queue consumer closes its MQTT client).
+				await Promise.resolve(iterator.return?.()).catch(noop);
+			}
+		})();
+
+		for (;;) {
+			await this.awaitSlot();
+			const job = await pool.take();
+			if (!job) break;
+			if (this.shuttingDown) {
+				this.abandon(job);
 				continue;
 			}
-
-			// wait for slot to open up
-			if (this.inflight.size >= this.CONCURRENCY) {
-				this.stats.concurrencyBlocked++;
-				await Promise.race(this.inflight);
+			if (!this.admit(job)) {
+				job.documentCache?.abortPrefetch();
+				continue;
 			}
+			await this.start(job);
+		}
+		await filling;
+	}
 
-			// wait if need to delay
-			const elapsed = ts - (this.lastRenderStartTime || Date.now());
-			if (elapsed < this.jobStartDelay) {
-				this.stats.rpsDelayed++;
-				const delay = this.jobStartDelay - elapsed;
-				await setTimeout(delay);
-			}
-			this.lastRenderStartTime = Date.now();
-			if (job.isFromSitemap) this.stats.fromSitemap++;
-			const p = this.render(job)
-				// NB: pino logger methods rely on `this`; passing `logger.error` bare makes it throw
-				// (`Cannot read properties of undefined (reading Symbol(pino.msgPrefix))`) when a render
-				// rejects, turning a logged failure into an unhandledRejection that kills the worker.
-				.catch((err) => logger.error({ err }, 'failed to render job'))
-				.finally(() => {
-					this.inflight.delete(p);
-				});
-			this.inflight.add(p);
+	/** Hold until a render slot is free. */
+	private async awaitSlot() {
+		// wait for slot to open up
+		if (this.inflight.size >= this.CONCURRENCY) {
+			this.stats.concurrencyBlocked++;
+			await Promise.race(this.inflight);
+		}
+	}
+
+	/** Whether a claimed job still has enough lease to be worth rendering; counted and logged when not. */
+	private admit(job: RenderJob): boolean {
+		// Do not run expired jobs to prevent double rendering
+		if (job.expiresAt - Date.now() < LEASE_MIN_REMAINING_MS) {
+			this.stats.expiredSkipped++;
+			console.log(`Skipping expired job ${job.id}`);
+			return false;
+		}
+		return true;
+	}
+
+	/** With a slot free (`awaitSlot`), hold for the `rps` pacing and start the render (not awaited). */
+	private async start(job: RenderJob) {
+		// Shutdown began while this job waited for its slot: the drain has run and the browser is gone,
+		// so a render now would launch a fresh Chrome into a process that is exiting. Drop the job
+		// instead — its lease expires and the queue re-grants it.
+		if (this.shuttingDown) {
+			this.abandon(job);
+			return;
+		}
+
+		// wait if need to delay
+		const elapsed = Date.now() - (this.lastRenderStartTime || Date.now());
+		if (elapsed < this.jobStartDelay) {
+			this.stats.rpsDelayed++;
+			const delay = this.jobStartDelay - elapsed;
+			await setTimeout(delay);
+		}
+		this.lastRenderStartTime = Date.now();
+		if (job.isFromSitemap) this.stats.fromSitemap++;
+		const p = this.render(job)
+			// NB: pino logger methods rely on `this`; passing `logger.error` bare makes it throw
+			// (`Cannot read properties of undefined (reading Symbol(pino.msgPrefix))`) when a render
+			// rejects, turning a logged failure into an unhandledRejection that kills the worker.
+			.catch((err) => logger.error({ err }, 'failed to render job'))
+			.finally(() => {
+				this.inflight.delete(p);
+			});
+		this.inflight.add(p);
+	}
+
+	/**
+	 * The job's document state, created on first ask: for every job when prefetch is on, else for a
+	 * multi-device job when reuse is. Sample selection (`sampleEvery`) counts multi-device jobs under
+	 * reuse, as it always has; a job that arrives through the pool and one rendered directly get the
+	 * same object either way.
+	 */
+	private documentCacheFor(job: RenderJob): JobDocumentCache | null {
+		if (job.documentCache) return job.documentCache;
+		const reuse = settings.config.documentReuse;
+		const multiDevice = (job.deviceTypes?.length ?? 1) > 1;
+		const acrossDevices = reuse.enabled && multiDevice;
+		if (!acrossDevices && !reuse.prefetch.enabled) return null;
+		let sample = false;
+		if (acrossDevices) {
+			this.documentJobs++;
+			sample = reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0;
+		}
+		job.documentCache = new JobDocumentCache({ sample, acrossDevices });
+		return job.documentCache;
+	}
+
+	/**
+	 * Start fetching the job's document for its first device, ahead of its render. The result lands on
+	 * the job's document cache; a prefetch that yields nothing is counted by outcome and the variant
+	 * fetches for itself. Never throws, never fails the job.
+	 */
+	private startPrefetch(job: RenderJob) {
+		const cache = this.documentCacheFor(job);
+		if (!cache || cache.prefetch) return;
+		const { timeoutMs } = settings.config.documentReuse.prefetch;
+		const ac = new AbortController();
+		cache.prefetchAbort = ac;
+		cache.prefetch = prefetchDocument(job, job.deviceType, {
+			timeoutMs,
+			signal: ac.signal,
+			defaultUserAgent: this.browserUserAgent,
+		})
+			.then((result) => {
+				if (result.doc) {
+					this.stats.prefetchFetchMs.push(result.ms);
+					if (!cache.entry) cache.entry = result.doc;
+					return result.doc;
+				}
+				this.stats.prefetchFallthrough[result.outcome as Exclude<PrefetchOutcome, 'fetched'>]++;
+				if (result.outcome === 'timeout' || result.outcome === 'error') {
+					logger.warn(
+						{ id: job.id, outcome: result.outcome, ms: result.ms, err: result.error },
+						'document prefetch yielded nothing — the render fetches the document itself'
+					);
+				} else if (result.outcome !== 'aborted') {
+					logger.debug({ id: job.id, outcome: result.outcome, status: result.status }, 'document prefetch not held');
+				}
+				return null;
+			})
+			.catch((err) => {
+				this.stats.prefetchFallthrough.error++;
+				logger.warn({ id: job.id, err }, 'document prefetch failed — the render fetches the document itself');
+				return null;
+			});
+	}
+
+	/** A claimed job this worker will not render (shutdown): cancel any prefetch and let its lease expire. */
+	private abandon(job: RenderJob) {
+		job.documentCache?.abortPrefetch();
+		this.stats.jobsAbandoned++;
+		logger.info({ id: job.id }, 'claimed job dropped at shutdown — its lease expires and the queue re-grants it');
+	}
+
+	private async rememberUserAgent(browser: ManagedBrowser) {
+		if (this.browserUserAgent) return;
+		try {
+			this.browserUserAgent = await browser.browser?.userAgent();
+		} catch {
+			// A browser that cannot say (or a stub in tests): profiles without a userAgent prefetch without one.
 		}
 	}
 
@@ -294,6 +500,9 @@ export default class RenderWorker {
 				// max/mean of the sampled divergence ratios this window (0 = same markup); null when
 				// nothing was sampled.
 				documentDivergence: summarize(s.documentDivergence),
+				documentsPrefetched: s.documentsPrefetched,
+				prefetchFallthrough: s.prefetchFallthrough,
+				jobsAbandoned: s.jobsAbandoned,
 				succeeded: s.succeeded,
 				emptyContent: s.emptyContent,
 				redirected: s.redirected,
@@ -314,6 +523,10 @@ export default class RenderWorker {
 				navTotal: summarize(s.navTotal),
 				settle: summarize(s.settle),
 				postProcess: summarize(s.postProcess),
+				// Prefetch: `prefetchFetch` is the origin time taken off the render's path; `prefetchWait`
+				// is how much of it the navigation still waited for (0 = fully hidden — the depth signal).
+				prefetchFetch: summarize(s.prefetchFetchMs),
+				prefetchWait: summarize(s.prefetchWaitMs),
 			},
 			// `worker`: THIS worker's own cores (Node + its Chrome tree). `container`: the whole
 			// pod from the cgroup — identical across all workers in the container, NOT this worker's
@@ -490,18 +703,12 @@ export default class RenderWorker {
 		const variants = job.variants();
 		const attempted: RenderJob[] = [];
 
-		// One shared document per multi-device job, when the operator has said the site is responsive.
-		// The first variant fills it, the rest replay it — except on a sample job, which fetches and
-		// compares so the claim keeps being tested. See documentReuse.ts.
-		const reuse = settings.config.documentReuse;
-		let documentCache: JobDocumentCache | null = null;
-		if (reuse.enabled && variants.length > 1) {
-			this.documentJobs++;
-			documentCache = new JobDocumentCache({
-				sample: reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0,
-			});
-			for (const variant of variants) variant.documentCache = documentCache;
-		}
+		// One shared document per job: prefetched ahead of this render (already on the job when it came
+		// through the pool), or captured by the first variant when the operator has said the site is
+		// responsive. The rest replay it — except on a sample job, which fetches and compares so the
+		// claim keeps being tested. See documentReuse.ts.
+		const documentCache = this.documentCacheFor(job);
+		if (documentCache) for (const variant of variants) variant.documentCache = documentCache;
 
 		for (const variant of variants) {
 			if (attempted.length > 0) {
@@ -540,6 +747,8 @@ export default class RenderWorker {
 
 		if (documentCache) {
 			this.stats.documentsReused += documentCache.reusedBy.length;
+			this.stats.documentsPrefetched += documentCache.prefetchedBy.length;
+			if (documentCache.prefetchWaitMs !== null) this.stats.prefetchWaitMs.push(documentCache.prefetchWaitMs);
 			if (documentCache.divergence) {
 				const { ratio, differing, chunks, samples } = documentCache.divergence;
 				this.stats.documentSamples++;
@@ -662,6 +871,7 @@ export default class RenderWorker {
 			this.browser = await this.browserPromise;
 			this.stats.browserLaunches++;
 			logger.info({ event: 'launched browser', retired: this.retiredBrowsers.size });
+			this.rememberUserAgent(this.browser).catch(noop);
 		}
 
 		if (this.browser.totalOpenedPages > this.BROWSER_MAX_TOTAL_PAGES) {

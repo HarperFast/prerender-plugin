@@ -122,8 +122,16 @@ export default class RenderJob {
 	 * multi-device job (set by the worker, read by the renderer). See `src/documentReuse.ts`.
 	 */
 	documentCache: JobDocumentCache | undefined;
-	/** True when this variant's navigation was answered from a sibling's captured document. */
+	/** True when this variant's navigation was answered from ANOTHER device's document. */
 	documentReused = false;
+	/** True when this variant's navigation was answered from a document the worker prefetched. */
+	documentPrefetched = false;
+	/**
+	 * Latch: this render's FIRST navigation has been answered from a held document. Only that one may
+	 * be — a client-side redirect's second navigation is to a different URL and must reach the origin.
+	 * Not posted; `documentReused` / `documentPrefetched` say what was replayed and from where.
+	 */
+	documentReplayed = false;
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
@@ -273,6 +281,7 @@ export default class RenderJob {
 			// Present only when true, so the flat legacy envelope is byte-identical for every render
 			// that did not reuse a document (and an older plugin never sees the key at all).
 			documentReused: this.documentReused || undefined,
+			documentPrefetched: this.documentPrefetched || undefined,
 			// One slug for WHY there is no content (see the field doc). The redirect/error
 			// fallbacks are derived here so every no-content result carries a reason without
 			// each producer having to remember to set one.
@@ -359,6 +368,7 @@ export type VariantMetadata = {
 	structuredOffers: Array<string | null> | null | undefined;
 	outcome: JobOutcome;
 	documentReused: true | undefined;
+	documentPrefetched: true | undefined;
 	reason: string | undefined;
 	error: { name: string; message: string; phase: string | undefined } | undefined;
 };

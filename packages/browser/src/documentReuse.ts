@@ -39,10 +39,24 @@ import type { HTTPRequest, HTTPResponse } from 'puppeteer';
  *     a two-device job must not manufacture. Both alternatives were checked and declined: copying the
  *     first context's cookies works, and Chrome DOES store `Set-Cookie` from a fulfilled response
  *     (verified against Chrome via Fetch.fulfillRequest), so either would be a one-line change if the
- *     decision is ever revisited.
+ *     decision is ever revisited. The one place `Set-Cookie` IS replayed is the prefetch answering the
+ *     navigation of the device that fetched it (below): those are that variant's OWN cookies, arriving
+ *     a moment early, not another device's.
  *   - REPLAY IS MARKED. The fulfilled response carries `x-render-document-reuse: 1` so the renderer's
  *     own response handler does not re-capture it, and the variant reports `documentReused: true` to
  *     the plugin, so reuse is visible per result rather than inferred from timing.
+ *
+ * PREFETCH (`documentReuse.prefetch`, documentPrefetch.ts). Reuse takes the document fetch from once
+ * per device to once per URL; prefetch takes it OFF THE RENDER'S CRITICAL PATH. The worker fetches a
+ * claimed job's document in this process while earlier jobs are still rendering, and the job's first
+ * variant is answered from it — with the response's own cookies, so that variant is indistinguishable
+ * from one whose navigation Chrome served — and the later variants replay it as they always did. A
+ * prefetched document is that device's own response fetched early, so it needs none of the cross-device
+ * guards (the `Vary` rule, the responsive-site claim, sampling): prefetch works on its own for a
+ * single-device job, and with `enabled` it is also what the siblings replay. The variant reports
+ * `documentPrefetched: true`. With prefetch on, a sample job's comparison is between a document THIS
+ * process fetched and one Chrome fetched for the same URL, so it also keeps the prefetch's fidelity
+ * under test.
  *
  * THE SAMPLED CHECK (`documentReuse.sampleEvery`). Every Nth job renders its second variant the old
  * way — a real fetch — and compares that document against the one the first variant captured. The
@@ -58,40 +72,91 @@ import type { HTTPRequest, HTTPResponse } from 'puppeteer';
 
 export const DOCUMENT_REUSE_HEADER = 'x-render-document-reuse';
 
-/** The first variant's document, ready to stand in for the next variant's navigation. */
+/** A job's document, held to answer a navigation: captured off the first variant's wire, or prefetched. */
 export type CapturedDocument = {
 	url: string;
 	status: number;
-	/** Response headers as received, before `replayHeaders` filters them for fulfilment. */
+	/** Response headers as received (without `set-cookie`), before `toRespondPayload` filters them. */
 	headers: Record<string, string>;
-	/** The DECODED body — `HTTPResponse.buffer()` has already undone the content encoding. */
+	/** The DECODED body — the content encoding has already been undone by whoever fetched it. */
 	body: Buffer;
-	/** The device that fetched it, for the log line and the result. */
+	/** The device whose request fetched it — the device whose navigation this document IS, not a stand-in. */
 	deviceType: string;
+	/**
+	 * Where it came from: `navigation` — captured from a variant's own response, which Chrome has
+	 * already applied (cookies included) to that variant; `prefetch` — fetched by the worker ahead of
+	 * the render (documentPrefetch.ts), which no variant has seen yet.
+	 */
+	source: 'navigation' | 'prefetch';
+	/**
+	 * The response's `Set-Cookie` values, kept apart from `headers`. Only a prefetch carries them, and
+	 * they are replayed ONLY to `deviceType`'s own navigation — the cookies that variant's document
+	 * would have set had Chrome fetched it — never to another device (see the module comment).
+	 */
+	setCookies?: string[];
 };
 
 /**
- * One job's shared document state. Created by the worker for a multi-device job when reuse is
- * enabled, handed to every variant, and read by the renderer: the first variant to capture a
- * reusable document fills `entry`; later variants replay it — or, on a SAMPLE job, fetch normally
- * and compare against it.
+ * One job's document state. Created by the worker — for a multi-device job when reuse is enabled,
+ * and for every job when prefetch is — handed to every variant, and read by the renderer through
+ * `replayFor`: a prefetched document answers the navigation of the device it was fetched for; the
+ * first variant's document (prefetched or captured) answers the later variants — or, on a SAMPLE job,
+ * the later variant fetches normally and the two are compared.
  */
 export class JobDocumentCache {
 	entry: CapturedDocument | null = null;
-	/** True on the jobs `documentReuse.sampleEvery` selects: fetch normally, compare, do not replay. */
+	/** True on the jobs `documentReuse.sampleEvery` selects: later variants fetch normally and compare. */
 	readonly sample: boolean;
-	/** Devices whose navigation was fulfilled from `entry`. */
+	/** Whether a document may answer a DIFFERENT device's navigation (`documentReuse.enabled`). */
+	readonly acrossDevices: boolean;
+	/**
+	 * The worker's prefetch of this job's document, when one was started (documentPrefetch.ts): settles
+	 * to the document, or to null when the variant must fetch for itself. Fills `entry` on success.
+	 */
+	prefetch: Promise<CapturedDocument | null> | null = null;
+	/** Cancels a prefetch still in flight — a job dropped at shutdown, or one whose lease ran out. */
+	prefetchAbort: AbortController | null = null;
+	/** Devices whose navigation was answered from ANOTHER device's document. */
 	reusedBy: string[] = [];
+	/** Devices whose navigation was answered from the prefetched document. */
+	prefetchedBy: string[] = [];
+	/**
+	 * How long a navigation had to wait for a prefetch still in flight, ms (the longest, over the job's
+	 * variants); 0 when the document was already in hand — the signal that `prefetch.depth` is enough.
+	 * Null until a variant asked.
+	 */
+	prefetchWaitMs: number | null = null;
 	/** The sampled comparison's result, once a sample job has run its second variant. */
 	divergence: DocumentDivergence | null = null;
 
-	constructor({ sample = false }: { sample?: boolean } = {}) {
+	constructor({ sample = false, acrossDevices = true }: { sample?: boolean; acrossDevices?: boolean } = {}) {
 		this.sample = sample;
+		this.acrossDevices = acrossDevices;
 	}
 
-	/** Whether the next variant's navigation should be answered from `entry`. */
-	get canReplay(): boolean {
-		return this.entry !== null && !this.sample;
+	/**
+	 * The document that may answer `deviceType`'s navigation, or null when it must fetch for itself.
+	 * Waits for a pending prefetch first. A document fetched FOR this device (a prefetch) always
+	 * qualifies — it is that device's own response, only fetched earlier. Another device's document
+	 * qualifies only across devices, on a non-sample job, and when its `Vary` does not name the user
+	 * agent or a client hint.
+	 */
+	async replayFor(deviceType: string): Promise<CapturedDocument | null> {
+		if (this.prefetch) {
+			const waitStart = Date.now();
+			await this.prefetch;
+			this.prefetchWaitMs = Math.max(this.prefetchWaitMs ?? 0, Date.now() - waitStart);
+		}
+		const doc = this.entry;
+		if (!doc) return null;
+		if (doc.deviceType === deviceType) return doc;
+		if (!this.acrossDevices || this.sample) return null;
+		if (varyForbidsReuse(doc.headers['vary'])) return null;
+		return doc;
+	}
+
+	abortPrefetch(): void {
+		this.prefetchAbort?.abort();
 	}
 }
 
@@ -131,7 +196,9 @@ export const isReusableDocument = (res: HTTPResponse, req: HTTPRequest): boolean
  * `content-length`, because the stored body is decoded and Chrome recomputes the length; and
  * `set-cookie`, because no cookie crosses variants (see the module comment — Chrome would store it,
  * which is exactly why it has to be stripped). The same list the resource cache applies to a
- * replayed asset.
+ * replayed asset. A prefetched document's own cookies are carried apart from its headers
+ * (`CapturedDocument.setCookies`) and added back by `toRespondPayload` only for the device that
+ * fetched it.
  */
 const NON_REPLAYABLE = new Set([
 	'connection',
@@ -147,12 +214,18 @@ const NON_REPLAYABLE = new Set([
 	'set-cookie',
 ]);
 
-/** The fulfilment payload for `HTTPRequest.respond()` built from a captured document. */
-export const toRespondPayload = (doc: CapturedDocument) => {
-	const headers: Record<string, string> = {};
+/**
+ * The fulfilment payload for `HTTPRequest.respond()` built from a held document. `withCookies` adds
+ * the document's own `Set-Cookie` values back (puppeteer accepts a list) — for the device whose
+ * navigation this document is, so it starts exactly as it would have had Chrome fetched it; never for
+ * a sibling replaying it.
+ */
+export const toRespondPayload = (doc: CapturedDocument, { withCookies = false }: { withCookies?: boolean } = {}) => {
+	const headers: Record<string, string | string[]> = {};
 	for (const [name, value] of Object.entries(doc.headers)) {
 		if (!NON_REPLAYABLE.has(name.toLowerCase())) headers[name] = value;
 	}
+	if (withCookies && doc.setCookies?.length) headers['set-cookie'] = doc.setCookies;
 	headers[DOCUMENT_REUSE_HEADER] = '1';
 	return { status: doc.status, headers, body: doc.body };
 };
