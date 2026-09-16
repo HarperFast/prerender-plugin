@@ -1,12 +1,11 @@
 /**
- * Repair for targets whose `RenderSchedule` rows have gone missing.
+ * Repair for targets whose `RenderSchedule` row has gone missing.
  *
  * `Target` and `RenderSchedule` live in separate databases, so creating a target is a target
- * commit plus one schedule commit PER DEVICE — and the schedule half is residency-routed to
- * whichever node owns the URL. If a schedule write is lost (a crash between them, or a routed
- * write to a node whose replication link is unhealthy), or if cluster membership changes and
- * moves a key's owner, the target survives with a missing schedule row for one or more of its
- * devices.
+ * commit plus one schedule commit — and the schedule half is residency-routed to whichever node
+ * owns the URL. If the schedule write is lost (a crash between them, or a routed write to a node
+ * whose replication link is unhealthy), or if cluster membership changes and moves a key's
+ * owner, the target survives with no schedule row.
  *
  * Nothing then repairs it, and nothing renders that URL again:
  *
@@ -78,9 +77,13 @@ export const reconcileSchedules = async ({
 	const stats = { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false };
 	const toRestore = [];
 
-	// Phase 1 — read only. One target row implies one schedule row PER configured device, and
-	// each is checked independently — a URL can be half-scheduled (desktop present, mobile
-	// missing) and that partial gap is just as silent as a full one.
+	// Phase 1 — read only. One target row implies ONE schedule row, keyed by the URL.
+	//
+	// A URL whose row is absent is checked a second way before it counts as missing: its
+	// pre-0.66.0 PER-DEVICE rows. Those convert to the URL row the first time they render, and until
+	// then a URL scheduled under them is scheduled — restoring a URL row beside them would render the
+	// URL twice for a cycle. The device reads cost nothing once the corpus has converted, because they
+	// only run for a URL whose URL row is missing, which is the rare case this sweep exists for.
 	for await (const target of streamTargets()) {
 		stats.examined++;
 		if (stats.examined % YIELD_EVERY === 0) await onYield();
@@ -90,19 +93,26 @@ export const reconcileSchedules = async ({
 		if (ownerOf(target.url) !== hostname) continue;
 		stats.owned++;
 
+		if (await getSchedule(target.url)) continue;
+		let scheduledByDeviceRow = false;
 		for (const deviceType of deviceTypes) {
-			const cacheKey = CacheKey.toCacheKey({ url: target.url, deviceType });
-			if (await getSchedule(cacheKey)) continue;
-			stats.missing++;
-
-			// Past the cap we keep counting but stop collecting, so the gap is measured in full
-			// while the repair stays bounded. A membership change can strand a large slice of the
-			// keyspace at once, and rewriting millions of rows in one pass would be its own outage.
-			if (toRestore.length < maxRestores) toRestore.push({ cacheKey, target });
+			if (await getSchedule(CacheKey.toCacheKey({ url: target.url, deviceType }))) {
+				scheduledByDeviceRow = true;
+				break;
+			}
 		}
+		if (scheduledByDeviceRow) continue;
+		stats.missing++;
+
+		// Past the cap we keep counting but stop collecting, so the gap is measured in full
+		// while the repair stays bounded. A membership change can strand a large slice of the
+		// keyspace at once, and rewriting millions of rows in one pass would be its own outage.
+		if (toRestore.length < maxRestores) toRestore.push({ cacheKey: target.url, target });
 	}
 
-	// Phase 2 — writes, with the scan's cursor now closed.
+	// Phase 2 — writes, with the scan's cursor now closed. `cacheKey` here is the URL — the row's
+	// key — named after the schema's primary-key attribute (see util/renderSchedule.js on why that
+	// attribute keeps its old name).
 	for (const { cacheKey, target } of toRestore) {
 		// Hoisted because the jittered time and the recorded cadence must be the same number — see both
 		// comments below.
@@ -161,7 +171,7 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		streamTargets: () => Target.search({ select: ['url', 'renderInterval', 'sitemapUrl'] }),
 		// Node-local by construction — see the module comment. Existence is all that matters.
 		// (`getScheduleRow` is what carries the mandatory `replicateFrom: false`.)
-		getSchedule: (cacheKey) => getScheduleRow(cacheKey, ['cacheKey']),
+		getSchedule: (key) => getScheduleRow(key, ['cacheKey']),
 		// Writes route by residency, so this reaches the owning node even though the read above
 		// deliberately does not — and it goes through the schedule funnel, which lowers the claim
 		// floor with the write. A restored row filed BEHIND the floor would be exactly the silent,
@@ -171,11 +181,10 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		// FUTURE time, so the funnel's CAS-min never actually moves the floor and the per-row cost
 		// is one atomic load. Batching it would mean changing the injected port signature that keeps
 		// the traversal tests running with no Harper globals, for no measurable gain.
-		putSchedule: (cacheKey, row) => writeSchedule(cacheKey, row),
+		putSchedule: (key, row) => writeSchedule(key, row),
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
-		// Config at sweep time, matching Target.put's fan-out — so a device added to config
-		// gets its missing schedule rows created for every existing target by this sweep.
+		// The device rows a not-yet-converted URL may still be scheduled under (see phase 1).
 		deviceTypes: config.deviceTypes.default,
 		maxRestores,
 		onYield: () => setImmediate(),

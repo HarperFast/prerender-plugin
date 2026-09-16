@@ -1,6 +1,31 @@
 /**
  * THE ONLY MODULE IN `src/` THAT TOUCHES THE `RenderSchedule` TABLE.
  *
+ * ── WHAT A ROW IS ────────────────────────────────────────────────────────────────────────────
+ *
+ * ONE ROW PER URL (since v0.66.0). The row's key is the URL, a claim hands the renderer ONE job
+ * carrying every device in `config.deviceTypes.default`, and the renderer posts ONE result with
+ * every device's snapshot — so a URL's variants are rendered in the same pass, seconds apart, and
+ * scheduled by one decision. Before this the table held one row per cacheKey (per device), and the
+ * two rows drifted apart through every per-device path (render-now, revalidate, reconcile, the
+ * retry lanes) until "a split pair" was a normal production state.
+ *
+ * Existing per-device rows are NOT migrated by a sweep. Each one converts the first time it renders:
+ * its job renders exactly the device its key names, and its result writes the URL row and deletes
+ * the device row (`RenderQueue.processJobResult`). Two sibling rows therefore fold into one URL row
+ * within a cycle at no extra renders. Until then BOTH SHAPES COEXIST in this table, and every reader
+ * of a key in this module goes through `CacheKey.urlOf` / `CacheKey.deviceOf`, never `extractUrl`.
+ * The floor algebra below is indifferent to key shape — a key is an opaque string to it.
+ *
+ * A device-keyed row remains the shape of a deliberate ONE-DEVICE render: `renderNow` for a device
+ * outside `deviceTypes.default` files one, and its result stores that page and retires the row
+ * without touching the URL row.
+ *
+ * The primary-key attribute is still NAMED `cacheKey` in the schema, and that is not carelessness:
+ * Harper refuses to rename the primary key of a table that has records (databases.ts, "Cannot
+ * change the primary key"), so the column name is fixed for the life of the table. Read it as
+ * "the schedule key".
+ *
  * "One concept, one home" is not a style preference here, it is the safety mechanism. The claim
  * scan now starts from a FLOOR (`util/renderLease.js` explains why: seeking the absolute minimum
  * of the `nextRenderTime` index degraded 0.36 ms → 6.25 ms over 40,000 reschedules and did not
@@ -288,14 +313,13 @@ export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, eff
 };
 
 /**
- * The batch form, for the fan-out writers (a target's device variants, `Target.revalidate`,
- * sitemap ingest, a reconcile repair pass). Writes every row, then lowers the floor ONCE with
- * the batch minimum — a per-row atomic inside the very loop that exists to keep transactions
- * short would be the wrong shape even though it is cheap.
+ * The batch form, for writers with several rows in hand (the invalidation accelerator, which may
+ * lower a URL row and a not-yet-converted device row together). Writes every row, then lowers the
+ * floor ONCE with the batch minimum — a per-row atomic inside the very loop that exists to keep
+ * transactions short would be the wrong shape even though it is cheap.
  *
- * Sequential, matching the call sites it replaces: `Target.put`'s device loop awaited each row,
- * and `reconcile`'s phase 2 does too. Rows are independent, so a rejection propagates with the
- * earlier rows applied — the same semantics as before, and deletes/puts here are idempotent.
+ * Sequential. Rows are independent, so a rejection propagates with the earlier rows applied, and
+ * deletes/puts here are idempotent.
  */
 export const writeSchedules = async (rows = []) => {
 	let lowest = Number.POSITIVE_INFINITY;
@@ -575,7 +599,7 @@ const maybeUnpinFloor = async (pass) => {
 	// rows written before this field existed: a target whose STORED interval differs from the default
 	// with no route interval to override it is pushed by that difference. Cost of that residual is one
 	// extra render per crawl of one URL, rate-limited by the accelerator's own budget.
-	const interval = carriedCadence(effectiveInterval) ?? resolveRenderInterval(CacheKey.extractUrl(cacheKey), null);
+	const interval = carriedCadence(effectiveInterval) ?? resolveRenderInterval(CacheKey.urlOf(cacheKey), null);
 	const nextRenderTime = Date.now() + interval;
 	try {
 		// `interval`, NOT the raw `effectiveInterval` off the row — and the difference is a silent
@@ -724,8 +748,9 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 	// parse, no route walk — so once the corpus has re-rendered once this memo serves the remainder:
 	// pre-upgrade rows and the writers with no cadence in hand.
 	//
-	// Route resolution parses a URL and walks the route list, and a URL's device variants share both —
-	// so this memo halves the work at minimum, on the one loop that sees every due row on the node.
+	// Route resolution parses a URL and walks the route list. Rows are keyed by URL now, so the memo
+	// mostly earns its keep during the one cycle after the upgrade in which a URL's pre-0.66.0 device
+	// rows still coexist and share it; it costs nothing to keep afterwards.
 	// Per sweep rather than process-lifetime: the route list is live-reloadable, and a cache keyed by
 	// URL over an 814k-target corpus to serve one sweep is the unbounded-structure mistake this node
 	// has already been taken down by twice.
@@ -822,7 +847,7 @@ export const sweepReadySet = async ({ nowMs = Date.now() } = {}) => {
 		// more often. Config resolution stays as the fallback for rows that carry nothing.
 		const carried = carriedCadence(row.effectiveInterval);
 		if (carried !== null) cadenceCarried++;
-		const intervalMs = carried ?? intervalFor(CacheKey.extractUrl(row.cacheKey));
+		const intervalMs = carried ?? intervalFor(CacheKey.urlOf(row.cacheKey));
 		const score = scoreOf({ dueAt, fromSitemap: !!row.fromSitemap }, { nowMs, intervalMs, sitemapBoost });
 		heap.offer(score, { cacheKey: row.cacheKey, dueAt, fromSitemap: !!row.fromSitemap });
 		// Yielding is free (measured: 2.375 vs 2.387 us/row at 20,000 rows) and this runs beside bot

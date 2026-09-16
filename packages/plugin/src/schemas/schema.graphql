@@ -82,10 +82,10 @@ type SitemapRefresh @table(database: "sitemaps") @export(name: "sitemap_refresh"
 }
 
 # The registry of URLs in the render rotation — ONE row per URL. Device variants are not
-# stored: the set of devices a URL renders for is `config.deviceTypes.default` at write time,
-# and `Target.put` fans out one RenderSchedule row per device (RenderSchedule and
-# PrerenderedPage stay cacheKey-keyed — the queue and the content are genuinely per-device;
-# only the registry is per-URL).
+# stored: the set of devices a URL renders for is `config.deviceTypes.default` at claim time.
+# `Target.put` writes ONE RenderSchedule row, keyed by the URL, and a claim of that row is one
+# job rendering every device; only PrerenderedPage stays cacheKey-keyed, because the CONTENT is
+# genuinely per-device.
 #
 # `state: suppressed` is the render-verdict memory that used to live in the NonIndexable
 # table: a render proved the page non-indexable, so discovery must not keep re-creating the
@@ -110,6 +110,19 @@ type Target @table(database: "render_service") @export {
 	demandInterval: Long
 }
 
+# The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that
+# renders every device in `config.deviceTypes.default`, and its one result schedules the URL once —
+# which is what keeps a URL's device variants aligned (same render pass, one decision) instead of
+# drifting apart through every per-device path, as they did when this table held a row per cacheKey.
+#
+# THE PRIMARY KEY IS STILL NAMED `cacheKey` AND HOLDS THE URL. Harper refuses to rename the primary
+# key of a table that has records, so the attribute name is fixed for the life of the table; read it
+# as "the schedule key". Two shapes of key coexist for one render cycle after the v0.66.0 upgrade:
+# the URL, and the pre-0.66.0 `<url>|<device>` cacheKey — each device-keyed row converts into the
+# URL row the first time it renders (`RenderQueue.processJobResult`), with no sweep and no extra
+# renders. A device-keyed row also remains the shape of a deliberate one-device render (`renderNow`
+# for a device outside `deviceTypes.default`). Every reader goes through `CacheKey.urlOf` /
+# `CacheKey.deviceOf`; see util/renderSchedule.js.
 type RenderSchedule @table(database: "render_schedule") @export {
 	cacheKey: String @primaryKey
 	nextRenderTime: Long @indexed
@@ -315,16 +328,16 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 	# The `lastCached` of the render whose claims were verified (`ProbeState.pageClaimAt`), and what
 	# makes a per-URL verification safe for PER-DEVICE pages.
 	#
-	# `pageSignature` is keyed by url and written by whichever device rendered last, so the evidence
-	# is per-URL while the pages are per-cacheKey. On a SPLIT PAIR — a normal state here — desktop
-	# could be verified while mobile still holds a pre-change render, and a bare per-URL exemption
-	# would serve the stale mobile page. Carrying the basis closes that exactly: the serve path
-	# exempts a key only when its OWN `lastCached` is at least this, so the verified render and
-	# anything newer qualify and a lagging sibling does not.
-	#
-	# In the healthy case this costs nothing — `util/time.js` seeds jitter off the URL half precisely
-	# so a URL's device variants land on the same minute, so both keys clear the basis and both are
-	# exempt. Absent (a row written before this field existed) reads as NaN and exempts nothing.
+	# `pageSignature` is keyed by url and written once per result, so the evidence is per-URL while
+	# the pages are per-cacheKey. Since v0.66.0 a URL's devices render in one job and every page of a
+	# result carries the SAME `lastCached`, so in the healthy case both keys clear the basis exactly.
+	# A SPLIT PAIR is still reachable — a pre-0.66.0 per-device row that has not yet converted, a
+	# partial result whose missing device kept its older page, a one-device render-now — and there
+	# desktop could be verified while mobile still holds a pre-change render; a bare per-URL exemption
+	# would serve the stale mobile page. Carrying the basis closes that exactly: the serve path exempts
+	# a key only when its OWN `lastCached` is at least this, so the verified render and anything newer
+	# qualify and a lagging sibling does not. Absent (a row written before this field existed) reads
+	# as NaN and exempts nothing.
 	basisAt: Date
 }
 

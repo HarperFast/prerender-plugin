@@ -436,3 +436,14 @@ test('a throwing listener does not break the apply or other listeners', () => {
 	assert.equal(ran, true);
 	applyOptions({});
 });
+
+test('an empty deviceTypes.default is refused at apply time and the default kept', () => {
+	// Every render job renders this list, and `claim` and the fold rule both read it; a job naming no
+	// device is one the browser cannot act on. Validated here, where config is applied — no downstream
+	// guard has to guess a device.
+	applyOptions({ deviceTypes: { default: [] } });
+	assert.deepEqual(config.deviceTypes.default, ['desktop', 'mobile']);
+	applyOptions({ deviceTypes: { default: ['mobile'] } });
+	assert.deepEqual(config.deviceTypes.default, ['mobile'], 'a non-empty list is honoured');
+	applyOptions({});
+});

@@ -3,6 +3,7 @@ import { config, onConfigApplied } from '../config.js';
 import { currentMinuteMs } from '../util/time.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
+import { sanitizeDeviceType } from '../util/device_type.js';
 import { canonicalizeUrl } from '../util/url.js';
 import {
 	classifyPath,
@@ -59,6 +60,193 @@ const legacyOutcome = (result) => {
 	if (result.redirectedTo) return 'redirected';
 	if (result.isIndexable === false) return 'non-indexable';
 	return 'error';
+};
+
+const authShaped = (statusCode) => statusCode === 401 || statusCode === 403;
+const transientShaped = (statusCode) => statusCode === 408 || statusCode === 429 || statusCode >= 500;
+const hasContent = (variant) => variant.statusCode === 200 && !!variant.content;
+
+/**
+ * The devices a URL job renders. A copy, so a job never aliases live config. Never empty: the
+ * schema marks `deviceTypes.default` `nonEmpty`, so an emptied list is refused at apply time and
+ * the default kept — validated where config is applied, not guessed at here, which is also what
+ * keeps this and `describeJob`'s fold rule reading the same list.
+ */
+const defaultDeviceTypes = () => [...config.deviceTypes.default];
+
+/**
+ * One posted result, whatever shape the browser used, as `{ rowKey, url, asked, variants }`.
+ *
+ *   rowKey    the schedule row the job came from (`id`, echoed verbatim by every browser version) —
+ *             the URL, or a cacheKey for a per-device row (see `describeJob`).
+ *   url       the URL that row stands for.
+ *   asked     the devices the job asked for; a device here with no variant below did not render.
+ *   variants  what the browser posted, one per device attempted.
+ *
+ * A browser >= 1.23.0 answering a URL job posts `variants` (and `deviceTypes`, what it was asked).
+ * Every earlier shape is one device and the envelope IS the variant: its device is the row's when
+ * the row is per-device (every pre-0.66.0 result), else what the browser posted, else the first
+ * default device — which is exactly what `claim` puts in `deviceType` for a renderer that predates
+ * the list, so a pre-1.23.0 renderer given a URL job is attributed to the device it actually
+ * rendered.
+ */
+const normalizeJobResult = (result) => {
+	const rowKey = String(result.id);
+	const url = CacheKey.urlOf(rowKey);
+	if (Array.isArray(result.variants)) {
+		const variants = result.variants.map((variant) => ({
+			...variant,
+			deviceType: sanitizeDeviceType(variant?.deviceType),
+		}));
+		const asked =
+			Array.isArray(result.deviceTypes) && result.deviceTypes.length
+				? result.deviceTypes.map(sanitizeDeviceType)
+				: variants.map((variant) => variant.deviceType);
+		return { rowKey, url, asked, variants };
+	}
+	const rowDevice = CacheKey.deviceOf(rowKey);
+	const deviceType = rowDevice ?? sanitizeDeviceType(result.deviceType ?? defaultDeviceTypes()[0]);
+	const { id, url: _url, deviceTypes, ...variant } = result;
+	// A FLAT RESULT ON A URL ROW IS A RENDERER THAT MISSED THE UPGRADE, and it is the one failure in
+	// this change that is otherwise completely silent. The job named every default device; a
+	// pre-1.23.0 worker rendered only the first and posted it flat. `asked` stays the one device on
+	// purpose — turning the others into `not-attempted` would put every URL that pod touches into
+	// the retry lanes and burn the corpus's strikes against a fleet that is merely old — but then
+	// nothing else says it happened either: the URL reschedules as a success, the outcome counters
+	// read healthy, and the unrendered device's pages quietly expire across everything that pod
+	// claims. So say it, loudly and cheaply.
+	if (!rowDevice) reportLegacyRenderer(url, deviceType);
+	return { rowKey, url, asked: [deviceType], variants: [{ ...variant, deviceType }] };
+};
+
+let lastLegacyRendererWarnAt = 0;
+
+/**
+ * A renderer too old for URL jobs, reported once an hour per node and counted on every result.
+ *
+ * Hourly rather than per result because a stale pod produces one of these for every job it claims,
+ * and a log line per render would bury the thing it is warning about. The counter is what makes the
+ * scale readable — if it is non-zero at all, some pod never took the fleet upgrade.
+ */
+const reportLegacyRenderer = (url, deviceType) => {
+	metrics.legacyRenderer(deviceType);
+	const now = Date.now();
+	if (now - lastLegacyRendererWarnAt < 3600000) return;
+	lastLegacyRendererWarnAt = now;
+	logger.warn(
+		`Prerender received a single-device result for a URL job (${url}, ${deviceType}) — that renderer predates ` +
+			`browser 1.23.0, so it rendered ONE of the job's devices and the rest went unrendered. Their cached pages ` +
+			`will expire and those bots will be served from the origin until the fleet is upgraded. This is counted in ` +
+			`prerender_ops legacy_renderer.`
+	);
+};
+
+/**
+ * What the row a job came from means for scheduling.
+ *
+ *   perDevice  the row is keyed by cacheKey and renders one device: a pre-0.66.0 row that has not
+ *              converted yet, or a deliberate one-device render (`renderNow` for a device outside
+ *              `deviceTypes.default`).
+ *   fold       this result may write the URL row. True for the URL row itself and for a per-device
+ *              row of a DEFAULT device — that row is a fragment of the URL's rotation and converts
+ *              into the URL row here. False for a non-default device: a one-off beside the rotation,
+ *              which must not move the URL row.
+ *   rowGone    set by whichever branch deleted the row (or the whole target), so the end-of-result
+ *              cleanup does not delete it a second time — Harper records a delete of an absent key in
+ *              the audit log.
+ */
+const describeJob = (rowKey, url) => {
+	const device = CacheKey.deviceOf(rowKey);
+	const perDevice = device !== null;
+	return { rowKey, url, perDevice, fold: !perDevice || config.deviceTypes.default.includes(device), rowGone: false };
+};
+
+/**
+ * A per-device row is deleted once its result is processed — folded into the URL row, or spent as a
+ * one-off — unless the lease is being HELD (fast retry lane): the row is what the lease expiry
+ * re-grants, so it must stay for the retry, and goes on the result that finally settles it.
+ */
+const retireRowIfConverted = async (job, held) => {
+	if (held || job.rowGone || !job.perDevice) return;
+	await deleteSchedule(job.rowKey);
+	job.rowGone = true;
+};
+
+/**
+ * Retire the job's URL: `Target.delete` drops the target, its pages, its URL row and its DEFAULT
+ * device rows (`scheduleKeysOf`) — which is every row a folding job can have come from, but NOT a
+ * one-device row for a non-default device. So the row is only known gone when the job folds; a
+ * `|tablet` one-off whose URL turned out to redirect is left to `retireRowIfConverted`, and would
+ * otherwise sit at its current-minute due time and be re-granted on every claim pass, forever.
+ */
+const retireSource = async (job) => {
+	await Target.delete(job.url);
+	job.rowGone = job.fold;
+};
+
+/** The variant a device the browser was asked for and never posted back reduces to. */
+const notAttemptedVariant = (deviceType) => ({
+	deviceType,
+	outcome: 'error',
+	reason: 'not-attempted',
+	error: {
+		name: 'Error',
+		message: 'the renderer did not attempt this device (its lease ran short, or it began draining)',
+		phase: 'not-attempted',
+	},
+	headers: {},
+});
+
+/**
+ * Resolve one variant's outcome and keys, in place. Pure with respect to the database.
+ *
+ *   cacheKey      the page key this variant renders for.
+ *   storeKey      where its content goes — `cacheKey`, or the destination's key after a refile.
+ *   outcome       posted (browser >= v1.16.0) or inferred from the legacy signals.
+ *   redirect      set when `redirectedTo` canonicalizes to a DIFFERENT key: `{ redirectKey,
+ *                 destinationUrl, redirectPath, landedOn }`. A target whose page URL collapses back
+ *                 to the same key (trailing slash, param reorder, encoding) is not a redirect.
+ */
+const classifyVariant = (variant, job) => {
+	variant.headers ??= {};
+	variant.cacheKey = CacheKey.toCacheKey({ url: job.url, deviceType: variant.deviceType });
+	variant.storeKey = variant.cacheKey;
+	// The browser's OWN verdict about the landed document, captured before the domain coercion
+	// below — "the page said noindex" and "the host is outside our allowlist" must not be
+	// conflated: only the former means the destination was inspected.
+	variant.inspectedNonIndexable = variant.isIndexable === false;
+
+	// The domain allowlist runs BEFORE the outcome is resolved so a legacy result for a foreign
+	// host still infers 'non-indexable' the way the old chain coerced it.
+	try {
+		const domain = URL.parse(variant.redirectedTo || job.url)?.hostname;
+		// Empty allowlist = allow all hosts.
+		if (config.domains.length && !config.domains.includes(domain)) variant.isIndexable = false;
+	} catch (e) {
+		logger.error(e, job.rowKey);
+	}
+
+	variant.outcome = variant.outcome ?? legacyOutcome(variant);
+
+	if (variant.redirectedTo) {
+		// The browser posts the RAW final page URL as `redirectedTo`. Canonicalize it the same way
+		// serving does — with the allowlist a bot READ of that target would use (route-aware) — so
+		// the rendered content is stored under the key that read computes.
+		const redirectKey = CacheKey.toCacheKey({
+			deviceType: variant.deviceType,
+			url: canonicalizeUrl(variant.redirectedTo, queryAllowlistFor(variant.redirectedTo)),
+		});
+		if (redirectKey !== variant.cacheKey) {
+			const redirectPath = URL.parse(variant.redirectedTo)?.pathname;
+			variant.redirect = {
+				redirectKey,
+				destinationUrl: CacheKey.extractUrl(redirectKey),
+				redirectPath,
+				landedOn: redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass,
+			};
+		}
+	}
+	return variant;
 };
 
 /**
@@ -160,10 +348,44 @@ export class RenderQueue extends Resource {
 
 	static resume = ({ updatedBy } = {}) => RenderQueue.setPause({ scope: server.hostname, paused: null, updatedBy });
 
+	/**
+	 * The body of a posted result, decoded: the JSON envelope with its content bytes attached.
+	 *
+	 * Two shapes. A browser >= 1.23.0 answering a URL job posts `{ id, url, deviceTypes, variants:
+	 * [...] }` followed by the variants' encoded bodies concatenated in order, each variant's
+	 * `contentLength` saying how many of those bytes are its own — attached here as `variant.content`.
+	 * Every earlier shape is one device: the envelope IS the variant and whatever follows the JSON is
+	 * its body, attached as `result.content` exactly as before. `normalizeJobResult` folds the two
+	 * into one.
+	 *
+	 * Throws on a variants body whose lengths do not account for exactly the bytes present: a result
+	 * whose bytes cannot be attributed to devices must not be stored under any of them.
+	 */
 	static decodeJobResult(buffer, metadataSize) {
 		const metadataBuffer = buffer.subarray(0, metadataSize);
 		const result = JSON.parse(metadataBuffer.toString('utf8'));
-		if (metadataBuffer.byteLength < buffer.byteLength) {
+		if (Array.isArray(result.variants)) {
+			let offset = metadataSize;
+			for (const variant of result.variants) {
+				const length = Number(variant?.contentLength) || 0;
+				if (length < 0 || offset + length > buffer.byteLength) {
+					throw new Error(`variant contentLength ${variant?.contentLength} overruns a ${buffer.byteLength}-byte body`);
+				}
+				if (length > 0) variant.content = buffer.subarray(offset, offset + length);
+				offset += length;
+			}
+			if (offset !== buffer.byteLength) {
+				throw new Error(
+					`variants account for ${offset - metadataSize} of the ${buffer.byteLength - metadataSize} body byte(s)`
+				);
+			}
+			// Nothing attempted and nothing asked: there is no device to attribute anything to, and
+			// letting it through would reach the all-rendered branch with an empty list and reschedule
+			// the URL as a success that stored nothing.
+			if (result.variants.length === 0 && !(Array.isArray(result.deviceTypes) && result.deviceTypes.length)) {
+				throw new Error('a variants result must name at least one device (variants or deviceTypes)');
+			}
+		} else if (metadataBuffer.byteLength < buffer.byteLength) {
 			result.content = buffer.subarray(metadataSize);
 		}
 		return result;
@@ -188,12 +410,26 @@ export class RenderQueue extends Resource {
 			);
 		}
 
-		const result = this.decodeJobResult(data, metadataSize);
+		let result;
+		try {
+			result = this.decodeJobResult(data, metadataSize);
+		} catch (e) {
+			// Same reasoning as above: a body that cannot be decoded, or whose variants do not account for
+			// its bytes, leaves nothing to release and nothing safe to store. A 4xx tells the browser not
+			// to retry the same bytes; the lease expires and the job is re-granted.
+			logger.error(
+				`[prerender] job_result rejected: ${e?.message ?? String(e)}. The lease will expire and the job be re-granted.`
+			);
+			return new Response(JSON.stringify({ error: `undecodable job_result: ${e?.message ?? String(e)}` }), {
+				status: 400,
+				headers: { 'content-type': 'application/json; charset=utf-8' },
+			});
+		}
 
-		// THE key the lease was granted under, captured before anything can re-point `cacheKey`.
-		// The redirect refile below reassigns `cacheKey` to the destination, and releasing by that
-		// would leak the SOURCE's lease on every rendered client-side redirect — the source row
-		// would then pin the claim floor until the lease expired, every cycle, forever.
+		// THE key the lease was granted under. Everything below is keyed off the job description built
+		// from it rather than off this string, so nothing can re-point it (the redirect refile used to
+		// reassign the working key, and releasing by that would have leaked the SOURCE's lease on every
+		// rendered client-side redirect — the row would then pin the claim floor for a full lease).
 		const claimKey = result.id;
 		// Set true by the branches whose retry pacing IS the lease (see retryAfterFailure): they
 		// must keep it, or the row — which still carries its original overdue due time now that
@@ -215,10 +451,10 @@ export class RenderQueue extends Resource {
 			// lease means the next pass re-grants it seconds later: an unpaced re-render loop against
 			// whatever is throwing, at claim frequency rather than once per lease.
 			//
-			// Reachable, not theoretical: `result.headers[...] = '1'` on a post with no headers
-			// object, a `PrerenderedPage.put`/`createBlob` failure, a `Target.get`/`Target.patch`
-			// rejection. Holding the lease paces the retry at `queue.jobLeaseTime`, exactly like the
-			// fast-retry lanes below, and the 500 is what says the result was not processed.
+			// Reachable, not theoretical: a `PrerenderedPage.put`/`createBlob` failure, a
+			// `Target.get`/`Target.patch` rejection. Holding the lease paces the retry at
+			// `queue.jobLeaseTime`, exactly like the fast-retry lanes below, and the 500 is what says
+			// the result was not processed.
 			holdLease = true;
 			throw e;
 		} finally {
@@ -227,181 +463,371 @@ export class RenderQueue extends Resource {
 		}
 	}
 
-	static async processDecodedJobResult(result, { holdLease }) {
-		let cacheKey = result.id;
-		const url = result.redirectedTo || result.url;
-		// Set when the render landed somewhere we don't serve from cache: reschedule as normal
-		// but store nothing, since the content belongs to a different URL than the key.
-		let discardContent = false;
+	/**
+	 * ONE RESULT, ONE URL, ONE SCHEDULING DECISION.
+	 *
+	 * A result carries every device variant of one URL (a browser >= 1.23.0 answering a URL job), or
+	 * one device (any earlier shape, and a per-device row's job). `normalizeJobResult` makes the two
+	 * the same thing — a list of variants — and everything below reasons about the LIST: pages are
+	 * stored per variant, because content is per device; the schedule is written once, because the
+	 * rotation is per URL. That single write is what keeps a URL's devices aligned. When each device
+	 * had its own row and its own result, every per-device path (the retry lanes, render-now,
+	 * reconcile) moved one device and not the other, and "a split pair" became a normal production
+	 * state — with a per-URL `strikes` counter fed twice per cycle, and the probe's per-URL page claim
+	 * written by whichever device happened to render last.
+	 *
+	 * ── PRECEDENCE ACROSS VARIANTS ──────────────────────────────────────────────────────────────
+	 *
+	 * A URL is not "mostly rendered". The verdicts a single device used to deliver for the whole URL
+	 * still do, in the order the old per-device code effectively applied them:
+	 *
+	 *   1. a REDIRECT the browser bailed on at navigation, on ANY device, decides the URL (a mobile
+	 *      301 to an m-dot host retires the URL, as it always did — the desktop row went with it);
+	 *   2. a genuine NON-INDEXABLE verdict on ANY device (noindex, canonical elsewhere, 404/410,
+	 *      other non-auth, non-transient http-error) SUPPRESSES the URL, whatever the other devices
+	 *      rendered — the pages go with the suppression, so none are stored;
+	 *   3. otherwise every RENDERED variant's page is stored under its own cacheKey, and then
+	 *   4. a FAILED variant (renderer error, auth-shaped or transient status, or a device the
+	 *      browser was asked for and did not attempt) puts the URL in the retry lanes — the stored
+	 *      pages stay servable, the whole URL re-renders on the lane's pacing, and the good side is
+	 *      rendered again so the pair stays aligned;
+	 *   5. all rendered: reschedule the URL at its cadence, reset strikes, lift a suppression.
+	 *
+	 * ── WHICH ROW ────────────────────────────────────────────────────────────────────────────────
+	 *
+	 * The row this job came from is `posted.id` — the URL (the normal case), or a cacheKey: a
+	 * pre-0.66.0 per-device row that has not yet converted, or a deliberate one-device render
+	 * (`renderNow` for a device outside `deviceTypes.default`). The URL's rotation lives on the URL
+	 * row, so a per-device row for a DEFAULT device FOLDS into it here — its result writes the URL
+	 * row and deletes the device row; two siblings converge on one row within a cycle at no extra
+	 * renders — while a per-device row for a NON-default device is a one-off: its page is stored and
+	 * the row deleted, and the URL row is not touched. `describeJob` decides which, once.
+	 */
+	static async processDecodedJobResult(posted, { holdLease: hold }) {
+		const { rowKey, url, asked, variants } = normalizeJobResult(posted);
+		const job = describeJob(rowKey, url);
+		let held = false;
+		const holdLease = () => {
+			held = true;
+			hold();
+		};
 
-		// The browser's OWN verdict about the landed document, captured before the domain
-		// coercion below — "the page said noindex" and "the host is outside our allowlist"
-		// must not be conflated: only the former means the destination was inspected.
-		const inspectedNonIndexable = result.isIndexable === false;
+		for (const variant of variants) classifyVariant(variant, job);
 
-		// The domain allowlist runs BEFORE the outcome is resolved so a legacy result for a
-		// foreign host still infers 'non-indexable' the way the old chain coerced it.
-		try {
-			const domain = URL.parse(url)?.hostname;
-			// Empty allowlist = allow all hosts.
-			if (config.domains.length && !config.domains.includes(domain)) {
-				result.isIndexable = false;
+		// A device the browser was asked for and did not post back is a render that did not happen:
+		// the lease ran short between variants, or the worker began draining. It fails like any other
+		// so the URL takes a retry lane for it, rather than the missing device silently keeping its old
+		// page until the next cadence.
+		for (const deviceType of asked) {
+			if (!variants.some((variant) => variant.deviceType === deviceType)) {
+				variants.push(classifyVariant(notAttemptedVariant(deviceType), job));
 			}
-		} catch (e) {
-			logger.error(e, result.id);
 		}
 
-		const outcome = result.outcome ?? legacyOutcome(result);
+		// One `time_ms` sample per variant the browser timed. A redirect bail gets its own lane so
+		// navigation-only renders do not read as fast full renders.
+		for (const variant of variants) {
+			if (typeof variant.renderTime !== 'number') continue;
+			const candidacy =
+				variant.outcome === 'redirected' && variant.redirect
+					? 'redirect'
+					: typeof variant.isIndexable === 'boolean'
+						? variant.isIndexable || hasContent(variant)
+							? 'candidate'
+							: 'non-candidate'
+						: 'unknown';
+			metrics.renderTime(variant.renderTime, variant.statusCode, candidacy);
+		}
 
-		if (result.redirectedTo) {
-			const { deviceType } = CacheKey.parse(result.id);
+		// 1. A redirect the browser bailed on at navigation, or a rendered-through client-side redirect
+		// that produced nothing. Decided by `processRedirectResult` for the whole URL, exactly as one
+		// device's result decided it before. The lane comes back so the fast-retry branch inside it
+		// holds its lease like the two below — one release point, three deciders.
+		const bailed = variants.find((variant) => variant.outcome === 'redirected' && variant.redirect);
+		if (bailed) {
+			const lane = await this.processRedirectResult(bailed, job);
+			if (lane === 'fast') holdLease();
+			await retireRowIfConverted(job, held);
+			return;
+		}
 
-			// The browser posts the RAW final page URL as `redirectedTo`. Canonicalize it the
-			// same way serving does — with the allowlist a bot READ of that target would use
-			// (route-aware) — so the rendered content is stored under the key that read computes.
-			const redirectKey = CacheKey.toCacheKey({
-				deviceType,
-				url: canonicalizeUrl(result.redirectedTo, queryAllowlistFor(result.redirectedTo)),
-			});
+		// 2. A verdict about the page itself, on any device. BEFORE the refile below, which is what
+		// the documented precedence has always said (redirect, then verdict, then rendered) and what
+		// the per-key code did when one device's result decided everything. Running the refile first
+		// inverted it destructively on a split result — one device client-side-redirecting while the
+		// other returned a genuine noindex: the refile deleted the target and its pages, and then
+		// `Target.suppress` CREATED the row again (it mints one when absent), re-minting the target
+		// that had just been deleted, as suppressed and carrying a strike, while the redirect
+		// destination went nowhere. A verdict suppresses the URL; nothing destructive may precede it.
+		//
+		// `reason` (browser >= v1.16.0) says WHY:
+		// 'noindex', 'canonical-mismatch', 'http-error', 'redirect-loop', or (>= v1.17.0)
+		// 'canonical-variant' — the canonical names this very document RE-SPELLED as a different
+		// cache key. Suppressed identically; the split keeps a wave of duplicate spellings legible.
+		//
+		// Note which urls can reach here at all: a sitemap-listed one is serialized even when
+		// non-indexable, so its variant arrives with content and `rendered` wins — the declared
+		// corpus is structurally out of this branch's reach, and only urls we DISCOVERED can be
+		// suppressed by a canonical verdict.
+		//
+		// EXCEPT 401/403 and 408/429/5xx, which are failures (step 4), not verdicts: an auth-shaped
+		// error is almost never a statement about the page — a broken renderer credential, an
+		// origin bot-mitigation rule change, an origin auth outage — and a transient one means the
+		// origin failed to serve the page, not that it disavowed it. Striking toward deletion would
+		// suppress (and after maxStrikes DELETE) swathes of healthy targets exactly when such a
+		// failure hits everything at once. Keep the target, keep its cached pages, retry.
+		const verdict = variants.find(
+			(variant) =>
+				variant.outcome === 'non-indexable' && !authShaped(variant.statusCode) && !transientShaped(variant.statusCode)
+		);
+		if (verdict) {
+			metrics.renderOutcome('suppressed', verdict.reason ?? 'unspecified');
+			// info, not warn: a suppression is a normal verdict (the page declared itself
+			// non-indexable) and it self-heals on its own recheck cadence. The alertable event is
+			// MASS suppression, which is the render_outcome counter's job.
+			logger.info(
+				`Suppressing prerendered url: ${url} (${verdict.deviceType}${verdict.reason ? `, ${verdict.reason}` : ''})`
+			);
+			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
+			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
+			// http-error verdicts by status (404/410 recheck less, die sooner).
+			const { deleted } = await Target.suppress(url, { reason: verdict.reason, statusCode: verdict.statusCode });
+			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
+			// device rows with it — so a folding row is already gone (a second delete would only write a
+			// tombstone), while a non-default one-device row still needs retiring below.
+			if (deleted) job.rowGone = job.fold;
+			await retireRowIfConverted(job, held);
+			return;
+		}
 
-			// Only treat it as a redirect when the final URL canonicalizes to a DIFFERENT key.
-			// A target whose page URL collapses back to the same key (trailing slash, param
-			// reorder, encoding) is not a redirect — keep it under result.id and, crucially,
-			// do NOT delete its Target (which would drop it from the recurring rotation).
-			if (redirectKey !== result.id) {
-				const redirectPath = URL.parse(result.redirectedTo)?.pathname;
-				const landedOn = redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass;
+		// 3. A rendered result whose landed URL keys elsewhere (client-side redirect that produced a
+		// real page): the long-standing refile semantics, per variant. Onto a route we serve, the page
+		// is stored under the DESTINATION's key and the source is retired — once, by URL, taking its
+		// device siblings with it: a page does not redirect for one device and serve for another.
+		// Onto a class we never serve, the render is discarded and the target kept (see the warn).
+		let refiledTo = null;
+		for (const variant of variants) {
+			if (variant.outcome !== 'rendered' || !variant.redirect) continue;
+			if (variant.redirect.landedOn === PRERENDER) {
+				if (!refiledTo) {
+					logger.info(`Skipped prerendered url due to redirect: ${rowKey} redirected to ${variant.redirectedTo}`);
+					await retireSource(job);
+					refiledTo = variant.redirect.destinationUrl;
+				}
+				variant.storeKey = variant.redirect.redirectKey;
+				variant.refiled = true;
+			} else {
+				// The redirect target is a class we never serve from cache, so re-keying onto it
+				// would file the render where no read will ever look — and deleting this target
+				// would silently end the URL's rendering for good (see util/reconcile.js on how
+				// undiagnosable that state is). The route list may simply be incomplete, so
+				// report it and leave the target alone rather than destroy it on that evidence.
+				// The render is wasted each interval until the redirect or the routes are fixed.
+				logger.warn(
+					`Prerendered url ${rowKey} redirected to ${variant.redirectedTo}, which is ${variant.redirect.landedOn} — ` +
+						`discarding the render and keeping the target (no key to store it under)`
+				);
+				recordUnroutedPath(variant.redirect.landedOn, variant.redirect.redirectPath, 'redirect');
+				variant.discardContent = true;
+			}
+		}
 
-				// 'redirected' = the render ended without content: the browser (≥ v1.16.0) bailed
-				// at navigation on an HTTP redirect (statusCode = the first hop's 3xx), or a
-				// rendered-through client-side redirect landed on a page that produced nothing.
-				// Content rendered under this job's context (device profile, waitFor path scoping)
-				// could only be stored under a key it wasn't rendered for, so there is nothing to
-				// store — only scheduling to decide.
-				if (outcome === 'redirected') {
-					// The lane comes back up so the fast-retry branch inside it holds its lease just
-					// like the two in this function — one release point, three deciders.
-					const lane = await this.processRedirectResult(result, {
-						redirectKey,
-						landedOn,
-						redirectPath,
-						inspectedNonIndexable,
+		// The scheduling target: the URL's own, or — after a refile — the destination's, which is what
+		// the old per-key code consulted once it had re-pointed the working key at the destination.
+		const scheduleUrl = refiledTo ?? url;
+		const scheduleJob = refiledTo ? describeJob(refiledTo, refiledTo) : job;
+		const renderTarget = await Target.get({
+			id: scheduleUrl,
+			select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
+		});
+
+		// Schedule the next render relative to when THIS one completed (now), not a fixed wall-clock
+		// time — so renders stay spread across the interval instead of realigning into a daily herd,
+		// and the cadence self-paces to fleet throughput. Cadence precedence: matched route's
+		// renderInterval, else the target's stored interval (sitemap changefreq / explicit API write;
+		// invalid values — including NaN from an arbitrary API PUT — are rejected), else the default.
+		// Resolved here on every cycle, so a route-cadence config change applies on each URL's next
+		// render without touching stored rows.
+		const base = resolveRenderInterval(scheduleUrl, renderTarget?.renderInterval);
+		// The demand ladder reallocates cadence WITHIN `base` (which stays the ceiling) by whether bots
+		// actually visit this URL. Off / dry-run / cold filter all return `base` unchanged.
+		const demand = decideInterval(scheduleUrl, base, renderTarget?.demandInterval);
+		const interval = demand.interval;
+		// The cached pages expire when the next render is due; the swrTtl window then keeps them served
+		// while the re-render lands, so render latency up to swrTtl never causes a cache miss.
+		const nextRenderTime = currentMinuteMs() + interval;
+
+		// Store every rendered variant's page — before the retry decision, so a device that rendered
+		// is served fresh even while the URL retries for a sibling that did not.
+		const rendered = variants.filter((variant) => variant.outcome === 'rendered');
+		// Content is what gets stored, whatever the status the browser reported beside it — the same
+		// test the per-key path applied. (`hasContent`, with its 200 check, is the metrics candidacy.)
+		// A SIBLING OF A REFILED VARIANT HAS NOWHERE TO GO. `retireSource` ran `Target.delete` on the
+		// source URL above, which took the target, its schedule row and all of its pages; a variant
+		// that did NOT redirect still carries the source's own store key, so writing it here would
+		// leave a page blob for a URL with no target and no schedule row — never re-rendered, never
+		// reclaimed (only the resource-class delete cascades), and still served to bots as a 200 for
+		// a URL the origin redirects away from. The per-key code could not reach this state: each
+		// device carried its own result, so once one device's refile deleted the target the other
+		// device's row was already gone. The destination is scheduled below and renders both devices
+		// on its own next pass.
+		const orphaned = refiledTo ? rendered.filter((variant) => !variant.refiled) : [];
+		if (orphaned.length) {
+			logger.info(
+				`Prerender ${url} refiled to ${refiledTo}; discarding the ${orphaned
+					.map((variant) => variant.deviceType)
+					.join(', ')} render whose target was retired with it`
+			);
+		}
+		const stored = rendered.filter(
+			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled)
+		);
+		if (stored.length) {
+			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
+			// than per use because `recordPageClaim` stores it as the basis a per-URL verification
+			// certifies, and the serve path tests each device key with `lastCached >= basisAt` — a
+			// device stamped milliseconds later than the claim would fail its own test. Sharing it
+			// across the variants is also what makes the pair's `basisAt` exact rather than aligned.
+			const cachedAt = Date.now();
+			// What this render CLAIMS, for the probe to compare the origin against on its next pass —
+			// once per URL, from the first variant that ran the extraction (the offers are a property of
+			// the document, not of the viewport: measured, desktop and mobile agreed byte-for-byte in
+			// 39/40 samples, the exception being a pair rendered 41h apart). Best-effort and awaited only
+			// for its (node-local) write: a render must not fail because a probe optimisation could not
+			// be recorded.
+			const claiming = stored.find((variant) => variant.structuredOffers !== undefined) ?? stored[0];
+			// CONCURRENTLY, because these all sit inside ONE request-scoped transaction and its duration
+			// is the thing to keep short. A result now carries every device of the URL, so where the
+			// per-key path wrote one page blob per transaction this writes one per device, in series —
+			// and a page blob is the largest write this plugin makes. The writes are independent (a
+			// different key each, and the claim is a different database entirely), so awaiting them
+			// together brings the transaction's wall time back to roughly one write rather than N.
+			//
+			// This is a BOUNDED fan-out, which is the whole distinction from the bulk-delete incident
+			// that taught us to serialize: the width is `deviceTypes.default`, so two here and a
+			// config change away from a handful — never the hundreds of in-flight writes that pushed
+			// the commit queue past its outstanding limit and had a thread reject every unrelated
+			// application write, this endpoint's own included.
+			//
+			// `recordPageClaim` never rejects (it catches and warns internally), so it cannot fail the
+			// result from inside this set — a probe optimisation must not cost a render.
+			await Promise.all([
+				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
+				...stored.map((variant) => {
+					variant.headers['x-harper-rendered'] = '1';
+					return databases.page_cache.PrerenderedPage.put(variant.storeKey, {
+						statusCode: variant.statusCode,
+						lastCached: cachedAt,
+						content: createBlob(variant.content),
+						headers: JSON.stringify(variant.headers),
+						expiresAt: nextRenderTime,
+						isIndexable: typeof variant.isIndexable === 'boolean' ? variant.isIndexable : null,
 					});
-					if (lane === 'fast') holdLease();
-					return;
-				}
-
-				// A rendered result whose landed URL keys elsewhere (client-side redirect that
-				// produced a real page): keep the long-standing refile semantics.
-				if (outcome === 'rendered') {
-					if (landedOn === PRERENDER) {
-						// Retiring by URL takes the device siblings too — a page does not redirect
-						// for one device and serve for another.
-						logger.info(`Skipped prerendered url due to redirect: ${result.id} redirected to ${result.redirectedTo}`);
-						await Target.delete(CacheKey.extractUrl(result.id));
-						cacheKey = redirectKey;
-					} else {
-						// The redirect target is a class we never serve from cache, so re-keying onto it
-						// would file the render where no read will ever look — and deleting this target
-						// would silently end the URL's rendering for good (see util/reconcile.js on how
-						// undiagnosable that state is). The route list may simply be incomplete, so
-						// report it and leave the target alone rather than destroy it on that evidence.
-						// The render is wasted each interval until the redirect or the routes are fixed.
-						logger.warn(
-							`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which is ${landedOn} — ` +
-								`discarding the render and keeping the target (no key to store it under)`
-						);
-						recordUnroutedPath(landedOn, redirectPath, 'redirect');
-						discardContent = true;
-					}
-				}
-			}
+				}),
+			]);
 		}
 
-		const hasContent = result.statusCode === 200 && result.content;
-
-		if (typeof result.renderTime === 'number') {
-			metrics.renderTime(
-				result.renderTime,
-				result.statusCode,
-				typeof result.isIndexable === 'boolean'
-					? result.isIndexable || hasContent
-						? 'candidate'
-						: 'non-candidate'
-					: 'unknown'
-			);
+		// 4. A failed variant puts the URL in the retry lanes: fast retries on the held lease, then
+		// escalation to a backed-off due time (`retryAfterFailure`). The stored pages above stay
+		// servable meanwhile. One outcome emit per result, for the class the worst variant fell in —
+		// auth-shaped first (it is the one that signals a broken credential), then transient, then a
+		// plain failure — and one log line per failed variant, at the level that class warrants.
+		//
+		// "Failed" is THE COMPLEMENT of rendered, not a list of failure shapes: an `outcome` this code
+		// does not know, or a `redirected` whose destination re-keyed to the SAME cache key (the browser's
+		// own redirect check uses a default allowlist, the plugin's is per route, so they can disagree —
+		// step 1 deliberately did not claim it), must land here and retry, exactly where the per-key
+		// code's final `else` sent them. Listing failure shapes instead let anything unlisted fall
+		// through to step 5 and reschedule a URL as a success that stored nothing.
+		const failed = variants.filter(
+			(variant) =>
+				variant.outcome !== 'rendered' &&
+				!(
+					variant.outcome === 'non-indexable' &&
+					!authShaped(variant.statusCode) &&
+					!transientShaped(variant.statusCode)
+				)
+		);
+		if (failed.length && refiledTo) {
+			// The source was just retired by the refile above: there is no row of its own to retry under,
+			// and holding ITS lease would pin the claim floor at a row that no longer exists. The
+			// destination renders on its own row and cadence, so a failed sibling here is logged and let
+			// go — its device simply has no page until the destination renders.
+			for (const variant of failed) {
+				logger.warn(
+					`Prerender ${url} (${variant.deviceType}) did not render (${variant.reason || variant.outcome}) — not ` +
+						`retried: the URL was retired in favour of ${refiledTo} by a sibling's client-side redirect`
+				);
+			}
+		} else if (failed.length) {
+			const auth = failed.find((variant) => authShaped(variant.statusCode));
+			const transient = failed.find((variant) => transientShaped(variant.statusCode));
+			if (auth) metrics.renderOutcome('auth-failure', auth.statusCode);
+			else if (transient) metrics.renderOutcome('transient', transient.statusCode);
+			else metrics.renderOutcome('failed', failed[0].error?.phase ?? 'unknown');
+			for (const variant of failed) {
+				const where = `${url} (${variant.deviceType})`;
+				if (authShaped(variant.statusCode)) {
+					logger.error(
+						`Prerender got ${variant.statusCode} for ${where} — auth-shaped, NOT suppressing. ` +
+							`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
+					);
+				} else if (transientShaped(variant.statusCode)) {
+					// info, not warn: by-design tolerance of an origin blip. The aggregate (a transient
+					// BURST is origin trouble) is render_outcome's job, not a per-URL log flood's.
+					logger.info(`Prerender got transient ${variant.statusCode} for ${where} — keeping target and cached page`);
+				} else {
+					// The browser posts `reason` and the failed attempt's error (name/message/phase) since
+					// v1.16.0; without them this can only say "unknown". `phase: 'navigation'` means the
+					// document never arrived (slow/refusing origin) — a different problem from a render
+					// that failed mid-settle; 'not-attempted' means the browser never started this device.
+					const detail = variant.error
+						? ` — ${variant.error.name}${variant.error.phase ? ` [${variant.error.phase}]` : ''}: ${variant.error.message}`
+						: '';
+					logger.warn(`Prerender failed for ${where} (${variant.reason || 'no reason reported'})${detail}`);
+				}
+			}
+			// This branch used to hold the lease unconditionally and forever for a renderer failure —
+			// no strike, no escalation — so a permanently-crashing render re-rendered once per
+			// `queue.jobLeaseTime` for the life of the target. The waste was never the renders; it was
+			// the CLAIM FLOOR, which a held lease pins at its row's due minute. Escalating returns
+			// 'slow', which releases the lease and lets the floor advance.
+			if ((await this.retryAfterFailure(scheduleJob)) === 'fast') holdLease();
+			await retireRowIfConverted(job, held);
+			return;
 		}
 
-		if (outcome === 'rendered') {
-			// One render outcome per posted result (the redirect path emits its own inside
-			// processRedirectResult). `refiled` = the client-side-redirect re-key above moved the
-			// result onto the destination's cache key; `discarded` = it landed on a class we never
-			// serve and the content was dropped; `no-content` = a legacy worker's isIndexable-only
-			// result (legacyOutcome calls it rendered, but there is nothing to store).
-			metrics.renderOutcome(
-				'rendered',
-				discardContent ? 'discarded' : cacheKey !== result.id ? 'refiled' : result.content ? 'stored' : 'no-content'
-			);
-			const url = CacheKey.extractUrl(cacheKey);
-			const renderTarget = await Target.get({
-				id: url,
-				select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
-			});
-			const renderInterval = renderTarget?.renderInterval;
+		// 5. Every variant rendered. One render outcome per posted result: `refiled` = the client-side
+		// redirect re-key above moved the pages onto the destination's keys; `discarded` = it landed on
+		// a class we never serve and the content was dropped; `no-content` = a legacy worker's
+		// isIndexable-only result (legacyOutcome calls it rendered, but there is nothing to store).
+		metrics.renderOutcome(
+			'rendered',
+			stored.length
+				? stored.some((variant) => variant.refiled)
+					? 'refiled'
+					: 'stored'
+				: rendered.some((variant) => variant.discardContent)
+					? 'discarded'
+					: 'no-content'
+		);
 
-			// Schedule the next render relative to when THIS one completed (now), not a
-			// fixed wall-clock time — so renders stay spread across the interval instead of
-			// realigning into a daily herd, and the cadence self-paces to fleet throughput.
-			// Cadence precedence: matched route's renderInterval, else the target's stored
-			// interval (sitemap changefreq / explicit API write; invalid values — including
-			// NaN from an arbitrary API PUT — are rejected), else the default. Resolved here
-			// on every cycle, so a route-cadence config change applies on each URL's next
-			// render without touching stored rows.
-			const base = resolveRenderInterval(url, renderInterval);
-			// The demand ladder reallocates cadence WITHIN `base` (which stays the ceiling) by
-			// whether bots actually visit this URL. Off / dry-run / cold filter all return `base`
-			// unchanged, so this is a no-op until deliberately switched on.
-			const demand = decideInterval(url, base, renderTarget?.demandInterval);
-			const interval = demand.interval;
-			// The cached page expires when the next render is due; the swrTtl window then keeps
-			// it served while the re-render lands, so render latency up to swrTtl never causes
-			// a cache miss.
-			const nextRenderTime = currentMinuteMs() + interval;
-
-			if (result.content && !discardContent) {
-				result.headers['x-harper-rendered'] = '1';
-				// ONE timestamp for the page and for the claim recorded alongside it. Taken here rather
-				// than at each use because `recordPageClaim` stores it as the basis a per-URL verification
-				// certifies, and the serve path tests a device key with `lastCached >= basisAt` — two
-				// separate `Date.now()` calls milliseconds apart would make the page fail its own test.
-				const cachedAt = Date.now();
-				// What this render CLAIMS, for the probe to compare the origin against on its next
-				// pass. Best-effort and awaited only for its (node-local) write: see recordPageClaim
-				// — a render must not fail because a probe optimisation could not be recorded.
-				await recordPageClaim(url, result.structuredOffers, cachedAt);
-				await databases.page_cache.PrerenderedPage.put(cacheKey, {
-					statusCode: result.statusCode,
-					lastCached: cachedAt,
-					content: createBlob(result.content),
-					headers: JSON.stringify(result.headers),
-					expiresAt: nextRenderTime,
-					isIndexable: typeof result.isIndexable === 'boolean' ? result.isIndexable : null,
-				});
-			}
-
-			if (renderTarget) {
-				// A target owns this schedule → recurring. Reschedule relative to completion
-				// using the resolved interval (so a target lacking an explicit renderInterval
-				// falls back to the default instead of getting stuck re-claiming every lease
-				// period). Refresh fromSitemap from the live target so it self-corrects if the
-				// URL has since left its sitemap.
-				//
-				// This is the highest-volume schedule write in the system, and it writes
-				// `now + interval` — i.e. FORWARD. The funnel's floor lowering is a CAS-min, so this
-				// path costs one atomic load and moves the floor not at all. That is load-bearing: a
-				// lowering on every completed render would rewind the floor to the current minute
-				// continuously and the whole 14× seek win would evaporate.
-				await writeSchedule(cacheKey, {
+		if (renderTarget) {
+			// A target owns this URL → recurring. Reschedule relative to completion using the resolved
+			// interval (so a target lacking an explicit renderInterval falls back to the default instead
+			// of getting stuck re-claiming every lease period). Refresh fromSitemap from the live target
+			// so it self-corrects if the URL has since left its sitemap.
+			//
+			// This is the highest-volume schedule write in the system, and it writes `now + interval` —
+			// i.e. FORWARD. The funnel's floor lowering is a CAS-min, so this path costs one atomic load
+			// and moves the floor not at all. That is load-bearing: a lowering on every completed render
+			// would rewind the floor to the current minute continuously and the whole 14× seek win would
+			// evaporate.
+			//
+			// A one-device render (a per-device row for a non-default device) does NOT reschedule: the
+			// URL's rotation is on the URL row, and this result was an extra render beside it.
+			if (scheduleJob.fold) {
+				await writeSchedule(scheduleUrl, {
 					nextRenderTime,
 					fromSitemap: !!renderTarget.sitemapUrl,
 					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
@@ -411,154 +837,83 @@ export class RenderQueue extends Resource {
 					effectiveInterval: interval,
 				});
 
-				// Persist the rung ONLY on an actual move. 'held' must not write even when the
-				// stored field is absent — absence already resolves to the base ceiling, so writing
-				// it would be redundant, and on first evaluation it would be a corpus-wide storm of
-				// replicated Target patches (~one per render for a full cycle), in dry-run too.
-				// A converged corpus therefore pays nothing here, on the system's hottest path.
+				// Persist the rung ONLY on an actual move. 'held' must not write even when the stored field
+				// is absent — absence already resolves to the base ceiling, so writing it would be
+				// redundant, and on first evaluation it would be a corpus-wide storm of replicated Target
+				// patches (~one per render for a full cycle), in dry-run too. A converged corpus therefore
+				// pays nothing here, on the system's hottest path.
 				if (demand.action === 'promoted' || demand.action === 'demoted') {
-					await Target.patch(url, { demandInterval: demand.level });
+					await Target.patch(scheduleUrl, { demandInterval: demand.level });
 				}
+			}
 
-				// A suppressed URL that rendered indexable again has healed — put it back in
-				// normal rotation, so the recheck cadence stops and discovery may see it again.
-				if (renderTarget.state === 'suppressed' && result.isIndexable === true) {
-					logger.info(`Prerendered url ${url} is indexable again — lifting its suppression`);
-					await Target.reactivate(url);
-				} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
-					// Strikes are CONSECUTIVE failures by definition: a successful render resets the
-					// count, so redirect blips months apart never accumulate toward retirement.
-					// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
-					// extra write.
-					await Target.patch(url, { strikes: 0 });
-				}
-			} else {
-				// No target owns this schedule: it's a one-off (render-now) or an orphaned
-				// row. Nothing sets a recurring cadence, so drop the schedule instead of
-				// leaving it to be re-claimed when the lease expires.
-				//
-				// The delete does NOT release the key's lease (see util/renderSchedule.js): the slot
-				// keeps holding the claim floor at this row's old due minute until it expires. That
-				// is the conservative direction — releasing here would let the floor advance past a
-				// row whose result may still be arriving from a duplicate renderer.
-				await deleteSchedule(cacheKey);
+			// A suppressed URL that rendered indexable again has healed — put it back in normal
+			// rotation, so the recheck cadence stops and discovery may see it again. Every variant
+			// rendered, so any device's indexable verdict is the URL's.
+			if (renderTarget.state === 'suppressed' && rendered.some((variant) => variant.isIndexable === true)) {
+				logger.info(`Prerendered url ${scheduleUrl} is indexable again — lifting its suppression`);
+				await Target.reactivate(scheduleUrl);
+			} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
+				// Strikes are CONSECUTIVE failures by definition: a successful render resets the
+				// count, so redirect blips months apart never accumulate toward retirement.
+				// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
+				// extra write.
+				await Target.patch(scheduleUrl, { strikes: 0 });
 			}
-		} else if (outcome === 'non-indexable') {
-			// `reason` (browser ≥ v1.16.0) says WHY: 'noindex', 'canonical-mismatch', 'http-error',
-			// or 'redirect-loop' — the difference between "the site asked us not to" and "the
-			// render is broken", which read identically without it. Browser ≥ v1.17.0 adds
-			// 'canonical-variant': the canonical names this very document RE-SPELLED as a
-			// different cache key, so the target duplicates one we already render rather than
-			// being a page that disowns itself. Suppressed identically — the split exists so a
-			// wave of duplicate spellings is legible as such rather than reading as an origin
-			// that stopped believing in its own pages.
+		} else if (!job.rowGone) {
+			// No target owns this URL: a one-off (render-now) or an orphaned row. Nothing sets a
+			// recurring cadence, so drop the row this job came from instead of leaving it to be
+			// re-claimed when the lease expires.
 			//
-			// Note which urls can reach here at all: a sitemap-listed one is serialized even when
-			// non-indexable, so its result arrives with content and `rendered` wins the outcome
-			// above — the declared corpus is structurally out of this branch's reach, and only
-			// urls we DISCOVERED can be suppressed by a canonical verdict.
-			//
-			// The verdict SUPPRESSES the
-			// target (state + recheck schedule) rather than deleting it — see Target.suppress,
-			// which also grades http-error verdicts by status (404/410 recheck less, die sooner).
-			//
-			// EXCEPT 401/403: an auth-shaped error is almost never a statement about the page —
-			// it's a broken renderer credential, an origin bot-mitigation rule change, or an
-			// origin auth outage. Striking toward deletion would suppress (and after maxStrikes
-			// DELETE) swathes of healthy targets exactly when such a failure hits everything at
-			// once. Keep the target, keep its cached page, retry via retryAfterFailure.
-			if (result.statusCode === 401 || result.statusCode === 403) {
-				metrics.renderOutcome('auth-failure', result.statusCode);
-				logger.error(
-					`Prerender got ${result.statusCode} for ${cacheKey} — auth-shaped, NOT suppressing. ` +
-						`If these are widespread, check the renderer's origin-bypass credential and the CDN/origin access rules.`
-				);
-				if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
-			} else if (result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500) {
-				// Transient-shaped: the origin failed to serve the page, it didn't disavow it.
-				// Suppressing would delete the last good cached page and park the URL for the
-				// recheck interval over what may be one bad minute at the origin — keep both
-				// and retry via retryAfterFailure (fast first, then the target's cadence).
-				metrics.renderOutcome('transient', result.statusCode);
-				// info, not warn: by-design tolerance of an origin blip. The aggregate (a transient
-				// BURST is origin trouble) is render_outcome's job, not a per-URL log flood's.
-				logger.info(`Prerender got transient ${result.statusCode} for ${cacheKey} — keeping target and cached page`);
-				if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
-			} else {
-				metrics.renderOutcome('suppressed', result.reason ?? 'unspecified');
-				// info, not warn: a suppression is a normal verdict (the page declared itself
-				// non-indexable) and it self-heals on its own recheck cadence. The alertable event is
-				// MASS suppression, which is the render_outcome counter's job.
-				logger.info(`Suppressing prerendered url: ${cacheKey}${result.reason ? ` (${result.reason})` : ''}`);
-				await Target.suppress(CacheKey.extractUrl(cacheKey), {
-					reason: result.reason,
-					statusCode: result.statusCode,
-				});
-			}
-		} else {
-			// The browser posts `reason` and the failed attempt's error (name/message/phase) since
-			// v1.16.0; without them this branch can only say "unknown". `phase: 'navigation'`
-			// means the document never arrived (slow/refusing origin) — a different problem from
-			// a render that failed mid-settle.
-			const detail = result.error
-				? ` — ${result.error.name}${result.error.phase ? ` [${result.error.phase}]` : ''}: ${result.error.message}`
-				: '';
-			metrics.renderOutcome('failed', result.error?.phase ?? 'unknown');
-			logger.warn(`Prerender failed for ${cacheKey} (${result.reason || 'no reason reported'})${detail}`);
-			// Same lane as every other non-suppressing failure: fast retries on the held lease,
-			// then escalation to a backed-off due time. This branch used to hold the lease
-			// unconditionally and forever — no strike, no escalation — so a permanently-crashing
-			// render re-rendered once per `queue.jobLeaseTime` for the life of the target.
-			//
-			// The waste was never the renders (measured: 7 such keys per node, ~42 renders/hr
-			// against a fleet doing 87,660). It was the CLAIM FLOOR: a held lease pins the floor at
-			// its row's due minute, so a handful of permanently-failing rows held the floor 12+
-			// hours in the past indefinitely, and every claim scan seeked from there across dead
-			// index entries. Escalating returns 'slow', which releases the lease and lets the floor
-			// advance — that is the point of this change, not the saved render capacity.
-			//
-			// `retryAfterFailure` does its own target read (and drops a targetless render-now /
-			// orphaned row), so the redundant existence check that used to guard this branch is gone.
-			if ((await this.retryAfterFailure(cacheKey)) === 'fast') holdLease();
+			// The delete does NOT release the key's lease (see util/renderSchedule.js): the slot keeps
+			// holding the claim floor at this row's old due minute until it expires. That is the
+			// conservative direction — releasing here would let the floor advance past a row whose
+			// result may still be arriving from a duplicate renderer.
+			await deleteSchedule(job.rowKey);
+			job.rowGone = true;
 		}
+		await retireRowIfConverted(job, held);
 	}
 
 	/**
 	 * A render that ended as a redirect with no content. Usually the browser bailed at
-	 * navigation on an HTTP redirect (`result.statusCode` is the FIRST hop's 3xx — the origin's
+	 * navigation on an HTTP redirect (`variant.statusCode` is the FIRST hop's 3xx — the origin's
 	 * statement about the job URL itself); a client-side redirect that rendered through to a
 	 * page that produced nothing lands here too (statusCode 200, permanence unknowable). What's
 	 * decided is what happens to the source target, and whether the destination becomes a
 	 * target of its own so it gets rendered under its own job context instead of being cached
 	 * from a render that ran as another URL.
 	 *
+	 * `variant` is the device that observed the redirect; `job` names the URL and the row. The
+	 * decision is about the URL — a page does not redirect for one device and serve for another —
+	 * so it retires or reschedules the whole URL, as one device's result always did.
+	 *
 	 * Returns the retry lane when it took one (`'fast'`/`'slow'`/`'dropped'`), so the caller — the
 	 * single lease-release point — knows whether this result's pacing is the lease itself.
 	 */
-	static async processRedirectResult(result, { redirectKey, landedOn, redirectPath, inspectedNonIndexable }) {
-		if (typeof result.renderTime === 'number') {
-			metrics.renderTime(result.renderTime, result.statusCode, 'redirect');
-		}
+	static async processRedirectResult(variant, job) {
+		const { redirectKey, destinationUrl, landedOn, redirectPath } = variant.redirect;
+		const { url: sourceUrl, rowKey } = job;
 
-		// Same status rules as processJobResult, applied BEFORE anything retires or strikes
+		// Same status rules as the failure branch, applied BEFORE anything retires or strikes
 		// the source. Only a rendered-through client-side redirect can carry these statuses
 		// (a bail-at-nav result posts the first hop's 3xx), so `statusCode` here is the LANDED
 		// document's: an auth-shaped or transient-shaped landing is a credential/origin
 		// problem, not a verdict on either URL. Without this, a page whose client-side
 		// redirect lands on a 401/403 would delete its source target on the FIRST such result
-		// (via the inspectedNonIndexable branch below) — the exact mass-deletion the
-		// processJobResult guard exists to prevent.
-		const authShaped = result.statusCode === 401 || result.statusCode === 403;
-		const transientShaped = result.statusCode === 408 || result.statusCode === 429 || result.statusCode >= 500;
-		if (authShaped || transientShaped) {
-			metrics.renderOutcome('redirect', authShaped ? 'landed-auth' : 'landed-transient');
+		// (via the inspectedNonIndexable branch below) — the exact mass-deletion the failure
+		// branch's guard exists to prevent.
+		const auth = authShaped(variant.statusCode);
+		const transient = transientShaped(variant.statusCode);
+		if (auth || transient) {
+			metrics.renderOutcome('redirect', auth ? 'landed-auth' : 'landed-transient');
 			// error for auth (credential/mitigation trouble), info for transient (origin blip) —
-			// same split as processJobResult's non-redirect branches.
-			logger[authShaped ? 'error' : 'info'](
-				`Prerendered url ${result.id} redirected to ${result.redirectedTo}, which returned ${result.statusCode} — ` +
-					`${authShaped ? 'auth-shaped' : 'transient'}, keeping the target`
+			// same split as the failure branch.
+			logger[auth ? 'error' : 'info'](
+				`Prerendered url ${rowKey} redirected to ${variant.redirectedTo}, which returned ${variant.statusCode} — ` +
+					`${auth ? 'auth-shaped' : 'transient'}, keeping the target`
 			);
-			return await this.retryAfterFailure(result.id);
+			return await this.retryAfterFailure(job);
 		}
 
 		if (landedOn !== PRERENDER) {
@@ -570,15 +925,15 @@ export class RenderQueue extends Resource {
 			// permanently redirected, and recordRedirectStrike retires it after maxStrikes.
 			metrics.renderOutcome('redirect', 'unrouted-destination');
 			logger.warn(
-				`Prerendered url ${result.id} redirected (${result.statusCode}) to ${result.redirectedTo}, which is ` +
+				`Prerendered url ${rowKey} redirected (${variant.statusCode}) to ${variant.redirectedTo}, which is ` +
 					`${landedOn} — keeping the target (no key to schedule the destination under)`
 			);
 			recordUnroutedPath(landedOn, redirectPath, 'redirect');
-			await this.recordRedirectStrike(result.id, `to unserved ${landedOn} destination`);
+			await this.recordRedirectStrike(job, `to unserved ${landedOn} destination`);
 			return;
 		}
 
-		if (inspectedNonIndexable) {
+		if (variant.inspectedNonIndexable) {
 			// The landed document was actually loaded and inspected (a rendered-through
 			// client-side redirect) and it is non-indexable: the source now leads to a page we
 			// would never cache. Retire the source and suppress the destination, so neither
@@ -587,54 +942,51 @@ export class RenderQueue extends Resource {
 			// foreign row would be registry noise nothing ever reads.)
 			metrics.renderOutcome('redirect', 'non-indexable-destination');
 			logger.info(
-				`Prerendered url ${result.id} redirected to non-indexable ${result.redirectedTo}` +
-					`${result.reason ? ` (${result.reason})` : ''} — retiring the target`
+				`Prerendered url ${rowKey} redirected to non-indexable ${variant.redirectedTo}` +
+					`${variant.reason ? ` (${variant.reason})` : ''} — retiring the target`
 			);
-			await Target.delete(CacheKey.extractUrl(result.id));
-			const destinationUrl = CacheKey.extractUrl(redirectKey);
+			await retireSource(job);
 			const domain = URL.parse(destinationUrl)?.hostname;
 			// Auth-shaped and transient statuses never reach here (guarded above), so this
 			// suppression is a genuine content/gone verdict about the destination.
 			if (!config.domains.length || config.domains.includes(domain)) {
-				await Target.suppress(destinationUrl, { reason: result.reason, statusCode: result.statusCode });
+				await Target.suppress(destinationUrl, { reason: variant.reason, statusCode: variant.statusCode });
 			}
 			return;
 		}
 
-		if (result.statusCode !== 301 && result.statusCode !== 308) {
+		if (variant.statusCode !== 301 && variant.statusCode !== 308) {
 			// No proof of permanence (302/303/307 — failover, geo bounce, outage page — or a
 			// client-side redirect's 200). The source is expected to come back — keep its target
-			// AND its cached page, and look again next interval. But a source that answers with
+			// AND its cached pages, and look again next interval. But a source that answers with
 			// a temp redirect EVERY interval is a permanent redirect wearing a temporary status:
 			// each result costs a strike and recordRedirectStrike retires the source after
 			// maxStrikes rather than paying a navigation every interval forever.
 			metrics.renderOutcome('redirect', 'temporary');
 			logger.info(
-				`Prerendered url ${result.id} temporarily redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
+				`Prerendered url ${rowKey} temporarily redirected (${variant.statusCode}) to ${variant.redirectedTo} — ` +
 					`keeping the target and retrying at its normal cadence`
 			);
-			await this.recordRedirectStrike(result.id, `temporary ${result.statusCode} to ${result.redirectedTo}`);
+			await this.recordRedirectStrike(job, `temporary ${variant.statusCode} to ${variant.redirectedTo}`);
 			return;
 		}
 
 		// Permanent move onto a route we serve: retire the source — Target.delete drops the URL's
-		// row and every device's schedule and cached page — and adopt the destination in its
+		// row, its schedule rows and every device's cached page — and adopt the destination in its
 		// place. A mutual 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each
 		// hop is a navigation-only render surfaced by this warn, so a broken site costs noise,
 		// not settles.
 		metrics.renderOutcome('redirect', 'permanent');
 		logger.info(
-			`Prerendered url ${result.id} permanently redirected (${result.statusCode}) to ${result.redirectedTo} — ` +
+			`Prerendered url ${rowKey} permanently redirected (${variant.statusCode}) to ${variant.redirectedTo} — ` +
 				`retiring the target in favor of ${redirectKey}`
 		);
-		const sourceUrl = CacheKey.extractUrl(result.id);
 		const source = await Target.get({ id: sourceUrl, select: ['renderInterval'] });
-		await Target.delete(sourceUrl);
+		await retireSource(job);
 
 		// An existing destination row — active OR suppressed — wins: active means it's already
 		// in rotation under its own cadence; suppressed means a render already proved it
 		// non-indexable, and a redirect pointing at it is no reason to resurrect it.
-		const destinationUrl = CacheKey.extractUrl(redirectKey);
 		const existingTarget = await Target.get({ id: destinationUrl, select: 'url' });
 		if (existingTarget) return;
 
@@ -644,7 +996,7 @@ export class RenderQueue extends Resource {
 		if (config.domains.length && !config.domains.includes(domain)) return;
 
 		// Due now, not jittered: adoptions arrive one per source render, already spread by the
-		// sources' own schedule jitter, and the source's cached page was just deleted — the
+		// sources' own schedule jitter, and the source's cached pages were just deleted — the
 		// sooner the destination renders, the shorter the window a bot gets neither page.
 		const target = { nextRenderTime: currentMinuteMs() };
 		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
@@ -662,8 +1014,8 @@ export class RenderQueue extends Resource {
 	 * whatever the origin actually serves. The strike counter is the target's one shared
 	 * `strikes` field (suppression uses it too); any successful render clears it.
 	 */
-	static async recordRedirectStrike(cacheKey, why) {
-		const sourceUrl = CacheKey.extractUrl(cacheKey);
+	static async recordRedirectStrike(job, why) {
+		const sourceUrl = job.url;
 		// One read serves both the strike decision and the reschedule below.
 		const renderTarget = await Target.get({
 			id: sourceUrl,
@@ -672,7 +1024,8 @@ export class RenderQueue extends Resource {
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
 		});
 		if (!renderTarget) {
-			await deleteSchedule(cacheKey);
+			await deleteSchedule(job.rowKey);
+			job.rowGone = true;
 			return;
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
@@ -682,33 +1035,35 @@ export class RenderQueue extends Resource {
 				`Prerendered url ${sourceUrl} kept redirecting ${strikes} consecutive times (${why}) — retiring it; ` +
 					`bots get the origin's own redirect and discovery re-creates what it actually serves`
 			);
-			await Target.delete(sourceUrl); // drops schedules + pages too
+			await retireSource(job); // drops the target, its pages, and every folding row
 			return;
 		}
 		await Target.patch(sourceUrl, { strikes });
-		await this.rescheduleAtTargetCadence(cacheKey, renderTarget);
+		await this.rescheduleAtTargetCadence(job, renderTarget);
 	}
 
 	/**
-	 * Retry shape for auth-shaped (401/403) and transient (408/429/5xx) failures — the ones
-	 * that never suppress. Two lanes, split by the target's strike count
+	 * Retry shape for auth-shaped (401/403) and transient (408/429/5xx) failures and renderer
+	 * errors — the ones that never suppress. Two lanes, split by the target's strike count
 	 * (`render.failureRetry.fastRetries`):
 	 *
 	 *   FAST — the schedule row is left alone AND THE CALLER KEEPS THE CLAIM LEASE, so the retry
 	 *   comes on lease expiry (`queue.jobLeaseTime`, minutes). An origin blip recovers fast, and
-	 *   the cached page's swrTtl window keeps serving bots across a lease-sized wait.
+	 *   the cached pages' swrTtl window keeps serving bots across a lease-sized wait.
 	 *
 	 *   SLOW — after `fastRetries` consecutive failures this is not a blip: drop to the
 	 *   target's normal cadence so a persistently failing page can't hot-loop renders all
-	 *   day. The kept page's expiry is deliberately NOT extended: `swrTtl` is the product
+	 *   day. The kept pages' expiry is deliberately NOT extended: `swrTtl` is the product
 	 *   bound on how stale we serve as if fresh, and past it bots fall through to the
 	 *   origin — whose answer (a live page for auth-shaped failures, an honest 5xx for
 	 *   transient ones) is the truth. Serving arbitrarily old snapshots while users get
 	 *   errors would break bot/user parity.
 	 *
 	 * Strikes are the target's one shared counter (suppression and redirect strikes use it
-	 * too); any successful render clears it. A targetless key (render-now one-off) has its
-	 * schedule dropped, as everywhere else.
+	 * too); any successful render clears it. One result per URL means one strike per failed
+	 * cycle — when each device posted its own result, two devices failing counted two, and the
+	 * fast lane was exhausted in a single cycle. A targetless key (render-now one-off) has its
+	 * row dropped, as everywhere else.
 	 *
 	 * WHAT CHANGED IN v0.34.0, AND WHY IT HAD TO. The fast lane used to work purely by omission:
 	 * `claim` wrote `now + jobLeaseTime` into `nextRenderTime`, so "leave the schedule untouched"
@@ -730,8 +1085,8 @@ export class RenderQueue extends Resource {
 	 *   must keep the lease; the other two mean release it (the row is now in the future or gone,
 	 *   and holding a lease for it would pin the claim floor for a full lease for nothing).
 	 */
-	static async retryAfterFailure(cacheKey) {
-		const sourceUrl = CacheKey.extractUrl(cacheKey);
+	static async retryAfterFailure(job) {
+		const sourceUrl = job.url;
 		const renderTarget = await Target.get({
 			id: sourceUrl,
 			// `demandInterval` rides along on a point read this path already makes, so the cadence filed
@@ -739,16 +1094,26 @@ export class RenderQueue extends Resource {
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
 		});
 		if (!renderTarget) {
-			await deleteSchedule(cacheKey);
+			await deleteSchedule(job.rowKey);
+			job.rowGone = true;
 			return 'dropped';
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		await Target.patch(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
-			logger.debug(`Retrying ${cacheKey} on its claim lease (failure strike ${strikes})`);
+			logger.debug(`Retrying ${job.rowKey} on its claim lease (failure strike ${strikes})`);
 			// Schedule untouched, lease held by the caller — the lease expiry drives the retry.
 			return 'fast';
+		}
+
+		if (!job.fold) {
+			// A one-device render beside the URL's rotation has no backoff row of its own: the URL row
+			// renders this device's siblings on cadence regardless, and a per-device row that lingered
+			// here would be one more thing the rotation does not know about.
+			await deleteSchedule(job.rowKey);
+			job.rowGone = true;
+			return 'slow';
 		}
 
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
@@ -761,37 +1126,39 @@ export class RenderQueue extends Resource {
 		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		const nextRenderTime = currentMinuteMs() + wait;
 		logger.debug(
-			`Retrying ${cacheKey} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
+			`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval: cadence });
+		await writeSchedule(sourceUrl, { nextRenderTime, fromSitemap, effectiveInterval: cadence });
 		return 'slow';
 	}
 
 	/**
 	 * Keep a redirecting source in its rotation. Mirrors the post-render scheduling in
-	 * processJobResult: a target-backed key comes due one interval from completion (so cadence
-	 * self-paces instead of realigning into a herd); a targetless key (render-now one-off,
-	 * orphaned row) has its schedule dropped so the lease doesn't re-claim it forever.
+	 * processDecodedJobResult: a target-backed URL comes due one interval from completion (so
+	 * cadence self-paces instead of realigning into a herd); a targetless key (render-now one-off,
+	 * orphaned row) — and a one-device row beside a URL's rotation — has its row dropped so the
+	 * lease doesn't re-claim it forever.
 	 *
 	 * `preloaded` (a row already read with at least renderInterval + sitemapUrl, e.g. by
 	 * recordRedirectStrike) skips the point read.
 	 */
-	static async rescheduleAtTargetCadence(cacheKey, preloaded) {
-		const sourceUrl = CacheKey.extractUrl(cacheKey);
+	static async rescheduleAtTargetCadence(job, preloaded) {
+		const sourceUrl = job.url;
 		const renderTarget =
 			preloaded ??
 			(await Target.get({
 				id: sourceUrl,
 				select: ['renderInterval', 'sitemapUrl', 'demandInterval'],
 			}));
-		if (!renderTarget) {
-			await deleteSchedule(cacheKey);
+		if (!renderTarget || !job.fold) {
+			await deleteSchedule(job.rowKey);
+			job.rowGone = true;
 			return;
 		}
 		// Same cadence resolution as the post-render path above (route > stored > default).
 		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
-		await writeSchedule(cacheKey, {
+		await writeSchedule(sourceUrl, {
 			nextRenderTime: currentMinuteMs() + interval,
 			fromSitemap: !!renderTarget.sitemapUrl,
 			// The ladder rung when the row carried one, else the ceiling. A caller-supplied `preloaded`
@@ -856,7 +1223,16 @@ export class RenderQueue extends Resource {
 		let notOwnedHere = 0;
 
 		for (const granted of pass.jobs) {
-			const { url, deviceType } = CacheKey.parse(granted.cacheKey);
+			// ONE JOB PER ROW, AND A ROW IS A URL. The job carries every device to render — the configured
+			// default set for a URL row; exactly the one device a per-device row names (a pre-0.66.0 row
+			// that has not converted yet, or a deliberate one-device render) — and the browser renders
+			// them in turn and posts one result. `deviceType` (the first) is kept for a renderer that
+			// predates `deviceTypes`: it renders that one device and posts the flat legacy shape, which
+			// `processJobResult` attributes to that device. Degraded, not broken — the render fleet is
+			// deployed first.
+			const url = CacheKey.urlOf(granted.cacheKey);
+			const device = CacheKey.deviceOf(granted.cacheKey);
+			const deviceTypes = device ? [device] : defaultDeviceTypes();
 
 			// Detection only, deliberately. `claim`'s lease write used to purge a stale local
 			// record on a node that is no longer the residency owner, as a side effect; that purge
@@ -869,7 +1245,8 @@ export class RenderQueue extends Resource {
 			jobs.push({
 				id: granted.cacheKey,
 				url,
-				deviceType,
+				deviceTypes,
+				deviceType: deviceTypes[0],
 				expiresAt: granted.expiresAtMs,
 				callbackOrigin: `${protocol}://${server.hostname}:${port}`,
 				// `fromSitemap` is denormalized onto the schedule row, so the job is built with no
