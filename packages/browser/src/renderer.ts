@@ -5,6 +5,14 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import type { PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
+import {
+	DOCUMENT_REUSE_HEADER,
+	cookieHeaderOf,
+	crossableCookies,
+	documentDivergence,
+	isReusableDocument,
+	toRespondPayload,
+} from './documentReuse.js';
 
 const noop = () => {};
 
@@ -79,6 +87,18 @@ const renderer: Renderer = async (page, job) => {
 
 	const setupPromises: Promise<unknown>[] = [page.setRequestInterception(true), page.setViewport(profile.viewport)];
 
+	// Document reuse and prefetch (see documentReuse.ts). `documentCache` is shared by every variant
+	// of the job: a prefetched document answers the navigation of the device it was fetched for (with
+	// that response's own cookies, as if Chrome had fetched it); the first variant's document — captured
+	// or prefetched — answers the later variants with an EMPTY cookie jar, as every variant always has:
+	// no cookie crosses variants. A sample job's later variants replay nothing; they fetch cold, so the
+	// comparison is against a document the origin actually produced for this device.
+	const documentCache = job.documentCache;
+	const pinnedNames = config.documentReuse.cookies.pin;
+	// The first variant's capture of its own document, settled before navigation returns so the entry
+	// is complete before the next variant starts.
+	let documentCapture: Promise<void> | null = null;
+
 	if (profile.userAgent) {
 		setupPromises.push(page.setUserAgent(profile.userAgent));
 	}
@@ -97,6 +117,59 @@ const renderer: Renderer = async (page, job) => {
 				return;
 			}
 			if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+				if (documentCache && !job.documentReplayed) {
+					// Only the render's FIRST navigation may be answered from a held document (the latch);
+					// `replayFor` waits for a prefetch still in flight, so re-check the render is alive
+					// after it. Answered from a held document: no origin fetch, no bypass token needed —
+					// the bytes already came through it. Marked so the response handler below does not
+					// treat this as a fresh document to capture.
+					const doc = await documentCache.replayFor(deviceType);
+					if (ac.signal.aborted || aborted) {
+						req.abort().catch(noop);
+						return;
+					}
+					if (doc) {
+						// The document IS this device's own response (a prefetch), so it replays that response's
+						// cookies in full. A SIBLING gets only the pinned ones — the cookies that decide which
+						// backend serves the page's API calls, without which the two devices of this URL would
+						// render against two different systems.
+						const ownFetch = doc.deviceType === deviceType;
+						const cookies = ownFetch ? (doc.setCookies ?? []) : crossableCookies(doc, pinnedNames);
+						// A FULFILMENT THAT FAILS MUST FALL THROUGH, not disappear. The browser can refuse the
+						// payload (measured: a CDN that repeats `server-timing`, which reaches us as puppeteer's
+						// \n-join and which CDP rejects), and a swallowed refusal is the worst outcome available:
+						// the request is never answered, the navigation runs the full `navigationTimeoutMs`, and
+						// the variant is lost — a render that cost a slot, a lease and nothing to show. puppeteer
+						// clears its interception flag when `Fetch.fulfillRequest` errors, so the request is still
+						// ours to continue below, which is the same fetch this variant would have made unaided.
+						const replayed = await req.respond(toRespondPayload(doc, { cookies })).then(
+							() => true,
+							(err: unknown) => {
+								documentCache.replayFailures.push({
+									deviceType,
+									message: err instanceof Error ? err.message : String(err),
+								});
+								return false;
+							}
+						);
+						if (replayed) {
+							job.documentReplayed = true;
+							if (doc.source === 'prefetch') {
+								job.documentPrefetched = true;
+								documentCache.prefetchedBy.push(deviceType);
+							}
+							if (!ownFetch) {
+								job.documentReused = true;
+								documentCache.reusedBy.push(deviceType);
+							}
+							return;
+						}
+						if (ac.signal.aborted || aborted) {
+							req.abort().catch(noop);
+							return;
+						}
+					}
+				}
 				const headers = req.headers();
 
 				for (const [key, value] of Object.entries(config.extraHeaders)) {
@@ -112,6 +185,14 @@ const renderer: Renderer = async (page, job) => {
 						headers[header.toLowerCase()] = job.headers![header];
 					});
 				}
+
+				// A VARIANT THAT FETCHES ITS OWN DOCUMENT CARRIES THE PINNED COOKIES TOO, once a sibling's
+				// document has set them. Otherwise parity would hold only on the replay path, and a sample
+				// job — or any fall-through — would let this device be routed to a different backend than the
+				// one its sibling rendered against: the divergence the pin exists to close, arriving by the
+				// other door.
+				const carried = documentCache?.entry ? crossableCookies(documentCache.entry, pinnedNames) : [];
+				if (carried.length) headers['cookie'] = cookieHeaderOf(carried);
 
 				req.continue({ headers }).catch(noop);
 				return;
@@ -140,8 +221,29 @@ const renderer: Renderer = async (page, job) => {
 					return;
 				}
 				if (entry) {
-					req.respond(cache.toRespondPayload(entry)).catch(noop);
-					return;
+					// A REFUSED REPLAY MUST FALL THROUGH TO THE NETWORK. The browser can reject a payload
+					// (see `filterReplayHeaders`), and a swallowed rejection leaves the request unanswered
+					// for the rest of the render: the resource never loads, the page waits on it, and the
+					// snapshot is missing whatever it would have done — with nothing to say so. puppeteer
+					// clears its interception flag when `Fetch.fulfillRequest` errors, so the request can
+					// still be continued, which is what a cache miss would have done anyway.
+					const served = await req
+						.respond(cache.toRespondPayload(entry))
+						.then(() => true)
+						.catch(() => {
+							// Counted rather than logged: a page whose cached asset the browser will not take
+							// refuses it on EVERY render, so a log line here would be per-render noise. The
+							// worker reports the count for the window.
+							if (job.latestAttempt) {
+								job.latestAttempt.cacheReplaysRefused = (job.latestAttempt.cacheReplaysRefused ?? 0) + 1;
+							}
+							return false;
+						});
+					if (served) return;
+					if (ac.signal.aborted || aborted) {
+						req.abort().catch(noop);
+						return;
+					}
 				}
 			}
 			// Same-origin SUBRESOURCES need the bypass token as much as the document does. An edge
@@ -174,6 +276,54 @@ const renderer: Renderer = async (page, job) => {
 					};
 					ac.abort();
 					aborted = true;
+				}
+				if (documentCache && !headers[DOCUMENT_REUSE_HEADER] && isReusableDocument(res, req)) {
+					// WHAT THIS DEVICE'S OWN RESPONSE SET, for the pinned names — recorded for EVERY document
+					// this render fetches itself, not only the first. Pinning assumes those cookies are
+					// device-INDEPENDENT; if one of them encodes the device, crossing it would force a sibling
+					// into the wrong experience, which is worse than not pinning at all. On a sample job every
+					// variant fetches cold, so both devices' answers are in hand and the worker compares them.
+					if (pinnedNames.length) documentCache.notePinnedCookies(deviceType, headers['set-cookie']);
+					if (!documentCache.entry) {
+						// The first variant: keep this document for the next one.
+						documentCapture = res
+							.buffer()
+							.then((body) => {
+								if (documentCache.entry) return;
+								// `set-cookie` is separated HERE, not at replay time: `CapturedDocument.headers`
+								// says it carries none, and a type whose invariant is only maintained by a filter
+								// three call sites away is one refactor from leaking a first variant's session
+								// cookies into its sibling. Kept rather than discarded because the PINNED ones have
+								// to cross; which those are is decided per replay. puppeteer joins values with \n.
+								const { 'set-cookie': setCookieHeader, ...replayable } = headers;
+								documentCache.entry = {
+									url: res.url(),
+									status,
+									headers: replayable,
+									body,
+									deviceType,
+									source: 'navigation',
+									setCookies: setCookieHeader ? setCookieHeader.split('\n') : [],
+								};
+							})
+							.catch(noop);
+					} else if (documentCache.sample && !documentCache.divergence) {
+						// A sample job's later variant: this document came from the origin, so compare it
+						// against the held one. Reported by the worker once the job completes.
+						//
+						// THE FIRST COMPARISON WINS, which is what makes the sample mean one thing. Under
+						// prefetch the held document is this process's own fetch and every variant fetches
+						// cold, so without the guard the last variant would overwrite a same-device
+						// comparison (is the prefetch faithful?) with a cross-device one (is the site still
+						// responsive?) — two different questions reported under one number.
+						const first = documentCache.entry;
+						res
+							.buffer()
+							.then((body) => {
+								documentCache.divergence = documentDivergence(first.body, body);
+							})
+							.catch(noop);
+					}
 				}
 				return;
 			}
@@ -230,6 +380,9 @@ const renderer: Renderer = async (page, job) => {
 		throw markRenderPhase(e, 'navigation');
 	}
 	timings.navTotal = Date.now() - navStart;
+	// Complete the capture before anything else: the next variant may start the moment this render
+	// returns, and it must find the entry whole or absent, never half-filled.
+	if (documentCapture) await documentCapture;
 
 	// A navigation that HTTP-redirected to a different document is not worth settling. The plugin
 	// never serves this render from the job's own key: it either discards the content (destination
