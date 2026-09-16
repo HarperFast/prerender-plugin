@@ -67,9 +67,4 @@ export class BoundedAsyncQueue<T> {
 		for (const resolve of this.takers.splice(0)) resolve(undefined);
 		for (const resolve of this.putters.splice(0)) resolve();
 	}
-
-	/** Remove and return everything still queued. */
-	drain(): T[] {
-		return this.items.splice(0);
-	}
 }

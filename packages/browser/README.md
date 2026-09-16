@@ -155,7 +155,10 @@ browser's own, `extraHeaders`, the bypass token, the job's headers, Chrome's nav
 pinned to a staging edge never has its prefetch reach production. Only a final `200 text/html` within
 32 MB is held; a redirect, an error status, a non-HTML body, a timeout (`timeoutMs`) or any failure
 yields nothing and the variant fetches the document itself, at the cost of one extra request for that
-URL. A variant answered from a prefetched document posts `documentPrefetched: true`. Sizing: to hide
+URL. A variant answered from a prefetched document posts `documentPrefetched: true`. **The navigation
+waits at most 500ms for a prefetch still in flight** and then fetches for itself, counted as
+`prefetchLate`: that wait is spent inside the navigation, so an unbounded one would spend the render's
+own budget waiting for a document it may not get. Sizing: to hide
 a fetch of `f` seconds behind renders of `r` seconds on `c` slots, `depth ≥ f · c / r + 1` — the
 default `2` covers c=10, f=1 s, r=12 s; a pooled job sits claimed about `depth · r / c` seconds before
 its render starts, always inside the batch the plugin already claimed it in. `rps` still paces render
@@ -163,11 +166,13 @@ starts, and at steady state a prefetch starts each time a render does, so the or
 request rate one render earlier. At shutdown, jobs still pooled — like any claimed job still waiting
 for a slot when the drain began — are dropped (nothing rendered, nothing to post; the lease expires
 and the queue re-grants them; `jobsAbandoned` counts them). The per-window log line reports
-`documentsPrefetched`, `prefetchFallthrough` (by why), `jobsAbandoned`, and under `phaseMs`
+`documentsPrefetched`, `prefetchLate`, `prefetchFallthrough` (by why), `jobsAbandoned`, and under `phaseMs`
 `prefetchFetch` (origin time taken off the render) and `prefetchWait` (how much of it a navigation
 still waited for — 0 means the depth is enough). With prefetch on, a sample job compares a document
 this process fetched against one Chrome fetched for the same URL, so it also keeps the prefetch's
-fidelity under test.
+fidelity under test — on a sample job every variant fetches cold, including the one the document was
+prefetched for, so the comparison is same-device (this process against Chrome) rather than
+cross-device.
 
 A variant is **skipped and the result posted partial** when the lease has under 30s left or the
 worker began draining between variants: `variants` then lists fewer devices than `deviceTypes`, the

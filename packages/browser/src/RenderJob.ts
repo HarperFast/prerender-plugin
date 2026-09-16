@@ -338,6 +338,10 @@ export default class RenderJob {
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
 			outcome: 'error',
+			// Carried through so the plugin still sees where this variant's document came from, even
+			// though its body never made it onto the wire.
+			documentReused: this.documentReused || undefined,
+			documentPrefetched: this.documentPrefetched || undefined,
 			reason: 'result-build-failed',
 			error: {
 				name: (error as Error)?.name ?? 'Error',

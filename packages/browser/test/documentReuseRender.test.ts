@@ -289,12 +289,15 @@ test('a prefetch the origin answers with a 404 yields nothing: Chrome fetches, a
 test('a sample job under prefetch compares the worker-fetched document against one Chrome fetched', async () => {
 	configure({ enabled: true, sampleEvery: 1, prefetch: { enabled: true, depth: 1 } });
 	const { documents, result } = await runJob('/page?prefetch-sample', ['desktop', 'mobile']);
-	assert.equal(documents.length, 2, 'the prefetch (desktop) and the mobile variant’s own fetch');
-	assert.equal(documents[1].ua?.includes('iPhone'), true, 'the second fetch was the mobile one, by Chrome');
+	// Three fetches on a sample job: the prefetch, then BOTH variants cold. Under prefetch the
+	// comparison that matters is same-device — this process's fetch against Chrome's — so the
+	// fetching device goes to the origin too, and the first cold fetch is the one compared.
+	assert.equal(documents.length, 3, 'the prefetch, then each variant fetching for itself');
+	assert.equal(documents[2].ua?.includes('iPhone'), true, 'the last fetch was the mobile one, by Chrome');
 	assert.deepEqual(
 		result.variants.map((v) => [v.documentPrefetched, v.documentReused]),
 		[
-			[true, undefined],
+			[undefined, undefined],
 			[undefined, undefined],
 		]
 	);

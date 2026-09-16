@@ -72,11 +72,42 @@ import type { HTTPRequest, HTTPResponse } from 'puppeteer';
 
 export const DOCUMENT_REUSE_HEADER = 'x-render-document-reuse';
 
+/**
+ * How long a navigation will wait for a prefetch that has not landed — see `replayFor`. Small on
+ * purpose and deliberately not configurable: this is a grace for a document arriving right now, not
+ * a budget. A deployment that needs a bigger one needs a deeper pool instead.
+ */
+export const PREFETCH_MAX_WAIT_MS = 500;
+
+/**
+ * True if `promise` settles within `graceMs`. A sentinel rather than the resolved value, because
+ * the prefetch resolves to NULL when it legitimately yielded no document (a redirect, a non-HTML
+ * body) — reading that as "did not land in time" would abort a prefetch that had already finished
+ * and count a normal fall-through as a late one. The timer never holds the process open.
+ */
+const LATE = Symbol('prefetch-late');
+const settledInTime = async (promise: Promise<unknown>, graceMs: number): Promise<boolean> => {
+	let timer: NodeJS.Timeout | undefined;
+	const grace = new Promise<typeof LATE>((resolve) => {
+		timer = setTimeout(() => resolve(LATE), graceMs);
+		timer.unref?.();
+	});
+	try {
+		return (await Promise.race([promise, grace])) !== LATE;
+	} finally {
+		clearTimeout(timer);
+	}
+};
+
 /** A job's document, held to answer a navigation: captured off the first variant's wire, or prefetched. */
 export type CapturedDocument = {
 	url: string;
 	status: number;
-	/** Response headers as received (without `set-cookie`), before `toRespondPayload` filters them. */
+	/**
+	 * Response headers as received, WITHOUT `set-cookie` — stripped by whoever captured this, so the
+	 * type's own invariant holds rather than resting on `toRespondPayload`'s filter. Any cookies the
+	 * response set live in `setCookies` instead, and only a prefetch keeps them.
+	 */
 	headers: Record<string, string>;
 	/** The DECODED body — the content encoding has already been undone by whoever fetched it. */
 	body: Buffer;
@@ -126,6 +157,8 @@ export class JobDocumentCache {
 	 * Null until a variant asked.
 	 */
 	prefetchWaitMs: number | null = null;
+	/** True when a prefetch was still in flight past the grace above, so the render fetched instead. */
+	prefetchLate = false;
 	/** The sampled comparison's result, once a sample job has run its second variant. */
 	divergence: DocumentDivergence | null = null;
 
@@ -142,15 +175,41 @@ export class JobDocumentCache {
 	 * agent or a client hint.
 	 */
 	async replayFor(deviceType: string): Promise<CapturedDocument | null> {
+		// THE WAIT IS BOUNDED, and the bound is the whole point. This runs inside the PAUSED
+		// navigation request, so every millisecond spent here is spent inside `page.goto` — whose
+		// timeout defaults to the entire render budget. An unbounded wait therefore inverted the
+		// feature: against a slow origin the render blocked for the full prefetch timeout, got
+		// nothing, fetched the document itself anyway, and entered the settle phase with a fraction
+		// of its budget left — an under-hydrated snapshot from a render that reports success.
+		// Strictly worse than never prefetching at all.
+		//
+		// A prefetch that has not landed by now is a miss, and the honest response to a miss is to
+		// go to the origin. The grace below only exists to catch one that is a hair from arriving;
+		// anything longer is not a saving, it is latency moved from the fetch to the wait. If these
+		// are common, `prefetch.depth` is too shallow for the concurrency — which is exactly what
+		// `prefetchWaitMs` and `prefetchLate` are for.
 		if (this.prefetch) {
 			const waitStart = Date.now();
-			await this.prefetch;
+			const landed = await settledInTime(this.prefetch, PREFETCH_MAX_WAIT_MS);
 			this.prefetchWaitMs = Math.max(this.prefetchWaitMs ?? 0, Date.now() - waitStart);
+			if (!landed) {
+				// Stop it holding an origin connection for a render that is no longer waiting on it.
+				this.prefetchLate = true;
+				this.abortPrefetch();
+				return null;
+			}
 		}
 		const doc = this.entry;
 		if (!doc) return null;
+		// A SAMPLE JOB REPLAYS NOTHING, its own device included. With prefetch on, the comparison
+		// that matters is no longer only "is this site still responsive" but "is the document this
+		// process fetched the one Chrome would have got" — and that question is only answered by
+		// letting Chrome fetch the SAME device and diffing the two. Returning the prefetched
+		// document here would compare this process's fetch of one device against Chrome's fetch of
+		// another, which is two variables in one number.
+		if (this.sample) return null;
 		if (doc.deviceType === deviceType) return doc;
-		if (!this.acrossDevices || this.sample) return null;
+		if (!this.acrossDevices) return null;
 		if (varyForbidsReuse(doc.headers['vary'])) return null;
 		return doc;
 	}

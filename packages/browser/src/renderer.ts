@@ -222,12 +222,30 @@ const renderer: Renderer = async (page, job) => {
 							.buffer()
 							.then((body) => {
 								if (documentCache.entry) return;
-								documentCache.entry = { url: res.url(), status, headers, body, deviceType, source: 'navigation' };
+								// `set-cookie` is dropped HERE, not at replay time: `CapturedDocument.headers`
+								// says it carries none, and a type whose invariant is only maintained by a
+								// filter three call sites away is one refactor from leaking a first variant's
+								// session cookies into its sibling. puppeteer joins multiple values with \n.
+								const { 'set-cookie': _cookies, ...replayable } = headers;
+								documentCache.entry = {
+									url: res.url(),
+									status,
+									headers: replayable,
+									body,
+									deviceType,
+									source: 'navigation',
+								};
 							})
 							.catch(noop);
-					} else if (documentCache.sample) {
+					} else if (documentCache.sample && !documentCache.divergence) {
 						// A sample job's later variant: this document came from the origin, so compare it
-						// against the sibling's. Reported by the worker once the job completes.
+						// against the held one. Reported by the worker once the job completes.
+						//
+						// THE FIRST COMPARISON WINS, which is what makes the sample mean one thing. Under
+						// prefetch the held document is this process's own fetch and every variant fetches
+						// cold, so without the guard the last variant would overwrite a same-device
+						// comparison (is the prefetch faithful?) with a cross-device one (is the site still
+						// responsive?) — two different questions reported under one number.
 						const first = documentCache.entry;
 						res
 							.buffer()

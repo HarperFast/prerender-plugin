@@ -117,12 +117,47 @@ test("a sibling's document answers another device only across devices, off a sam
 	assert.equal(await varies.replayFor('mobile'), null, 'the origin said the document is device-specific');
 });
 
-test('a document fetched FOR a device always answers that device — its own response, arrived early', async () => {
+test('a document fetched FOR a device answers that device, whatever the cross-device guards say', async () => {
+	// A prefetch is that device's own response, only fetched earlier, so the guards written for
+	// standing in for ANOTHER device do not apply to it — not the `Vary`, not the responsive-site claim.
 	const doc = { ...captured('desktop', 'User-Agent'), source: 'prefetch' as const };
-	const strictest = new JobDocumentCache({ sample: true, acrossDevices: false });
-	strictest.entry = doc;
-	assert.equal(await strictest.replayFor('desktop'), doc, 'no cross-device guard applies to the fetching device');
-	assert.equal(await strictest.replayFor('mobile'), null);
+	const cache = new JobDocumentCache({ acrossDevices: false });
+	cache.entry = doc;
+	assert.equal(await cache.replayFor('desktop'), doc, 'no cross-device guard applies to the fetching device');
+	assert.equal(await cache.replayFor('mobile'), null);
+});
+
+test('a sample job replays NOTHING, its own device included', async () => {
+	// Under prefetch the question a sample answers changes: not only "is this site still responsive"
+	// but "is the document this process fetched the one Chrome would have got". That is only
+	// answerable by letting Chrome fetch the same device and diffing the two, so the fetching device
+	// must go to the origin as well.
+	const sample = new JobDocumentCache({ sample: true });
+	sample.entry = { ...captured('desktop'), source: 'prefetch' as const };
+	assert.equal(await sample.replayFor('desktop'), null, 'the fetching device fetches cold too');
+	assert.equal(await sample.replayFor('mobile'), null);
+});
+
+test('a prefetch that has not landed within the grace is a miss, not a wait', async () => {
+	// The wait happens inside the PAUSED navigation, so it is spent inside `page.goto` — whose
+	// timeout defaults to the whole render budget. Unbounded, a slow origin made prefetch strictly
+	// worse than no prefetch: block, get nothing, fetch anyway, settle on what is left.
+	const cache = new JobDocumentCache({ acrossDevices: false });
+	let resolveLate: (v: null) => void = () => {};
+	cache.prefetch = new Promise((resolve) => (resolveLate = resolve));
+	cache.prefetchAbort = new AbortController();
+
+	const started = Date.now();
+	assert.equal(await cache.replayFor('desktop'), null, 'the render goes to the origin instead');
+	const waited = Date.now() - started;
+	assert.ok(waited < 2000, `bounded by the grace, waited ${waited}ms`);
+	assert.equal(cache.prefetchLate, true, 'and it is counted as late');
+	assert.equal(
+		cache.prefetchAbort.signal.aborted,
+		true,
+		'the in-flight fetch is cancelled, not left holding a connection'
+	);
+	resolveLate(null);
 });
 
 test('replayFor waits for a pending prefetch and records how long the navigation waited', async () => {

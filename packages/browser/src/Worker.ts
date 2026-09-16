@@ -10,7 +10,7 @@ import { settings } from './settings.js';
 import { CpuSampler } from './util/cpu.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import { JobDocumentCache } from './documentReuse.js';
-import { prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
+import { closePrefetchAgent, prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
 import { BoundedAsyncQueue } from './util/asyncQueue.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
@@ -124,7 +124,16 @@ export default class RenderWorker {
 			// from a document this process fetched ahead of the render, and prefetches that yielded no
 			// document, by why (the variant then fetched normally — `status` is the origin's non-200,
 			// normal for a share of jobs; `timeout`/`error` are worth a look).
+			//
+			// NOT DISJOINT FROM `documentsReused`: a sibling replaying a prefetched document is both
+			// prefetched and reused, so on a two-device job with both features on the two counters sum
+			// to more than the variants. Read `documentsPrefetched` as "navigations the origin never
+			// saw because this process had already fetched it", `documentsReused` as "navigations
+			// answered from ANOTHER device's document"; the overlap is the interesting case, not an
+			// error. `prefetchLate` counts jobs whose prefetch had not landed within the navigation's
+			// grace, so the render fetched for itself — a rising count means `depth` is too shallow.
 			documentsPrefetched: 0,
+			prefetchLate: 0,
 			prefetchFallthrough: {
 				'status': 0,
 				'not-html': 0,
@@ -237,8 +246,9 @@ export default class RenderWorker {
 			for await (const job of jobs) {
 				if (this.shuttingDown) break;
 				if (!this.admit(job)) continue;
+				const takenAt = Date.now();
 				await this.awaitSlot();
-				await this.start(job);
+				await this.start(job, takenAt);
 			}
 			return;
 		}
@@ -278,8 +288,13 @@ export default class RenderWorker {
 				await Promise.resolve(iterator.return?.()).catch(noop);
 			}
 		})();
+		// Handled at creation as well as at the `await` below: the render loop can sit inside a
+		// 12-second render before it reaches that await, and an unhandled rejection for that long
+		// trips the process-level handler, which exits — killing every in-flight render with it.
+		filling.catch(noop);
 
 		for (;;) {
+			const takenAt = Date.now();
 			await this.awaitSlot();
 			const job = await pool.take();
 			if (!job) break;
@@ -291,7 +306,7 @@ export default class RenderWorker {
 				job.documentCache?.abortPrefetch();
 				continue;
 			}
-			await this.start(job);
+			await this.start(job, takenAt);
 		}
 		await filling;
 	}
@@ -317,7 +332,7 @@ export default class RenderWorker {
 	}
 
 	/** With a slot free (`awaitSlot`), hold for the `rps` pacing and start the render (not awaited). */
-	private async start(job: RenderJob) {
+	private async start(job: RenderJob, takenAt: number) {
 		// Shutdown began while this job waited for its slot: the drain has run and the browser is gone,
 		// so a render now would launch a fresh Chrome into a process that is exiting. Drop the job
 		// instead — its lease expires and the queue re-grants it.
@@ -327,11 +342,25 @@ export default class RenderWorker {
 		}
 
 		// wait if need to delay
-		const elapsed = Date.now() - (this.lastRenderStartTime || Date.now());
+		//
+		// Measured from `takenAt` — when this job was taken, BEFORE it waited for a slot — because
+		// that is what the loop this replaced measured, and `rps` is an origin-protection lever: a
+		// number that quietly stops inserting the delay it always inserted is not a refactor. (The
+		// reading is admittedly odd under saturation, where the slot wait alone exceeds the window
+		// and no delay is ever due. That is a separate question from this change, and one to settle
+		// against the origin rather than in passing.)
+		const elapsed = takenAt - (this.lastRenderStartTime || Date.now());
 		if (elapsed < this.jobStartDelay) {
 			this.stats.rpsDelayed++;
 			const delay = this.jobStartDelay - elapsed;
 			await setTimeout(delay);
+		}
+		// One more check: the pacing delay is another window for the drain to begin, and a render
+		// started after `destroy()` has run launches a fresh Chrome into an exiting process — and
+		// does it INVISIBLY, since `shutdown()` snapshotted `inflight` before this was added to it.
+		if (this.shuttingDown) {
+			this.abandon(job);
+			return;
 		}
 		this.lastRenderStartTime = Date.now();
 		if (job.isFromSitemap) this.stats.fromSitemap++;
@@ -358,11 +387,13 @@ export default class RenderWorker {
 		const multiDevice = (job.deviceTypes?.length ?? 1) > 1;
 		const acrossDevices = reuse.enabled && multiDevice;
 		if (!acrossDevices && !reuse.prefetch.enabled) return null;
-		let sample = false;
-		if (acrossDevices) {
-			this.documentJobs++;
-			sample = reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0;
-		}
+		// SAMPLE SELECTION SPANS BOTH FEATURES. It used to be computed only for multi-device jobs
+		// under reuse, which left the configuration this ships in first — prefetch on, reuse off —
+		// with no running check of any kind, precisely where the new and unproven claim lives: that
+		// a document this process fetched with undici is the one Chrome would have been served.
+		// Every job that holds a document cache is now a sampling candidate.
+		this.documentJobs++;
+		const sample = reuse.sampleEvery > 0 && this.documentJobs % reuse.sampleEvery === 0;
 		job.documentCache = new JobDocumentCache({ sample, acrossDevices });
 		return job.documentCache;
 	}
@@ -378,7 +409,7 @@ export default class RenderWorker {
 		const { timeoutMs } = settings.config.documentReuse.prefetch;
 		const ac = new AbortController();
 		cache.prefetchAbort = ac;
-		cache.prefetch = prefetchDocument(job, job.deviceType, {
+		cache.prefetch = prefetchDocument(job, job.deviceTypes?.[0] ?? job.deviceType, {
 			timeoutMs,
 			signal: ac.signal,
 			defaultUserAgent: this.browserUserAgent,
@@ -501,6 +532,7 @@ export default class RenderWorker {
 				// nothing was sampled.
 				documentDivergence: summarize(s.documentDivergence),
 				documentsPrefetched: s.documentsPrefetched,
+				prefetchLate: s.prefetchLate,
 				prefetchFallthrough: s.prefetchFallthrough,
 				jobsAbandoned: s.jobsAbandoned,
 				succeeded: s.succeeded,
@@ -636,6 +668,12 @@ export default class RenderWorker {
 		this.browser = null;
 		this.retiredBrowsers.clear();
 
+		// The prefetch agent holds keep-alive sockets to the origin, and it is the one resource this
+		// teardown did not know about — harmless while the process exits anyway, but a `destroy()`
+		// that leaves the event loop open is a surprise waiting for the first caller who uses this
+		// class without exiting straight afterwards.
+		closing.push(closePrefetchAgent());
+
 		await Promise.all(closing);
 	}
 
@@ -767,6 +805,7 @@ export default class RenderWorker {
 			this.stats.documentsReused += documentCache.reusedBy.length;
 			this.stats.documentsPrefetched += documentCache.prefetchedBy.length;
 			if (documentCache.prefetchWaitMs !== null) this.stats.prefetchWaitMs.push(documentCache.prefetchWaitMs);
+			if (documentCache.prefetchLate) this.stats.prefetchLate++;
 			if (documentCache.divergence) {
 				const { ratio, differing, chunks, samples } = documentCache.divergence;
 				this.stats.documentSamples++;
