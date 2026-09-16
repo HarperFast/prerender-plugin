@@ -1474,7 +1474,7 @@ const armAnchorTimer = () => {
 	} catch (e) {
 		at = NaN;
 		logger.warn(
-			`[prerender] change-probe: anchorTimezone "${config.changeProbe.anchorTimezone}" is not usable (${e?.message ?? e})`
+			`[prerender] change-probe: anchorTimezone "${config.changeProbe.anchorTimezone}" is not usable (${e?.message ?? String(e)})`
 		);
 	}
 	// An unusable anchor arms NOTHING. `setTimeout(fn, NaN)` fires at once, which would turn a typo
