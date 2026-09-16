@@ -696,18 +696,35 @@ export class RenderQueue extends Resource {
 			// for its (node-local) write: a render must not fail because a probe optimisation could not
 			// be recorded.
 			const claiming = stored.find((variant) => variant.structuredOffers !== undefined) ?? stored[0];
-			await recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt);
-			for (const variant of stored) {
-				variant.headers['x-harper-rendered'] = '1';
-				await databases.page_cache.PrerenderedPage.put(variant.storeKey, {
-					statusCode: variant.statusCode,
-					lastCached: cachedAt,
-					content: createBlob(variant.content),
-					headers: JSON.stringify(variant.headers),
-					expiresAt: nextRenderTime,
-					isIndexable: typeof variant.isIndexable === 'boolean' ? variant.isIndexable : null,
-				});
-			}
+			// CONCURRENTLY, because these all sit inside ONE request-scoped transaction and its duration
+			// is the thing to keep short. A result now carries every device of the URL, so where the
+			// per-key path wrote one page blob per transaction this writes one per device, in series —
+			// and a page blob is the largest write this plugin makes. The writes are independent (a
+			// different key each, and the claim is a different database entirely), so awaiting them
+			// together brings the transaction's wall time back to roughly one write rather than N.
+			//
+			// This is a BOUNDED fan-out, which is the whole distinction from the bulk-delete incident
+			// that taught us to serialize: the width is `deviceTypes.default`, so two here and a
+			// config change away from a handful — never the hundreds of in-flight writes that pushed
+			// the commit queue past its outstanding limit and had a thread reject every unrelated
+			// application write, this endpoint's own included.
+			//
+			// `recordPageClaim` never rejects (it catches and warns internally), so it cannot fail the
+			// result from inside this set — a probe optimisation must not cost a render.
+			await Promise.all([
+				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
+				...stored.map((variant) => {
+					variant.headers['x-harper-rendered'] = '1';
+					return databases.page_cache.PrerenderedPage.put(variant.storeKey, {
+						statusCode: variant.statusCode,
+						lastCached: cachedAt,
+						content: createBlob(variant.content),
+						headers: JSON.stringify(variant.headers),
+						expiresAt: nextRenderTime,
+						isIndexable: typeof variant.isIndexable === 'boolean' ? variant.isIndexable : null,
+					});
+				}),
+			]);
 		}
 
 		// 4. A failed variant puts the URL in the retry lanes: fast retries on the held lease, then
