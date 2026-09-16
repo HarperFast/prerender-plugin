@@ -58,7 +58,7 @@ Only `harper` is required; everything else has a default.
 | `bypass`                     | `{ header: x-harper-renderer-bypass, token: '' }` | Shared origin-bypass header/token (match the plugin)                                        |
 | `config`                     | built-in defaults                                 | Rendering config (deep-partial object _or_ JSON file path)                                  |
 | `concurrency`                | ~half the CPUs                                    | Max concurrent page renders                                                                 |
-| `rps`                        | `8`                                               | Max render starts per second                                                                |
+| `rps`                        | `8`                                               | Max job starts per second (a job renders every device of one URL — see the queue protocol)  |
 | `jobClaimLimit`              | `concurrency * 2`                                 | Jobs claimed per batch                                                                      |
 | `browserExpirationThreshold` | `200`                                             | Pages a browser renders before being retired                                                |
 | `incognitoPages`             | `true`                                            | Render each page in a fresh incognito context                                               |
@@ -68,6 +68,73 @@ Only `harper` is required; everything else has a default.
 | `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)                                  |
 | `renderer`                   | the default renderer                              | Custom renderer (see below)                                                                 |
 | `installSignalHandlers`      | `true`                                            | Own SIGTERM/SIGINT (drain in-flight renders, then close Chrome); `false` to own the process |
+
+## Queue protocol
+
+A **job is one URL.** The plugin (>= 0.66.0) claims one job per URL and names every device to
+render on it:
+
+```jsonc
+// POST /render_queue/claim → 200 [ ...jobs ]
+{
+	"id": "https://site.example.com/product/x", // the schedule row this job stands for — echoed back verbatim
+	"url": "https://site.example.com/product/x",
+	"deviceTypes": ["desktop", "mobile"], // every device to render, in this order
+	"deviceType": "desktop", // the first of them, for renderers that predate the list
+	"expiresAt": 1757520000000, // lease expiry (epoch ms)
+	"callbackOrigin": "https://harper-node:9926",
+	"isFromSitemap": true,
+}
+```
+
+The worker renders the devices **in turn on the job's one concurrency slot** — each on a fresh page,
+through the same `renderer` — so `concurrency` still bounds pages in flight and renders-per-slot is
+unchanged; a job just holds its slot for as many renders as it has devices. (`rps` therefore paces
+_job_ starts.) Every device's snapshot then goes back in **one** result, which is what lets the plugin
+keep a URL's variants aligned: same render pass, seconds apart, one scheduling decision.
+
+```jsonc
+// POST /render_queue/job_result   (x-metadata-size: <bytes of the JSON envelope>)
+{
+	"id": "https://site.example.com/product/x",
+	"url": "https://site.example.com/product/x",
+	"deviceTypes": ["desktop", "mobile"], // what was asked
+	"variants": [
+		// what was attempted, in order — each followed in the body by `contentLength` bytes of its
+		// encoded HTML (0 = no content: a redirect, a verdict, or an error)
+		{
+			"deviceType": "desktop",
+			"outcome": "rendered",
+			"statusCode": 200,
+			"headers": {},
+			"renderTime": 8123,
+			"isIndexable": true,
+			"structuredOffers": null,
+			"contentLength": 41210,
+		},
+		{
+			"deviceType": "mobile",
+			"outcome": "error",
+			"reason": "error",
+			"error": { "name": "TimeoutError", "message": "…", "phase": "settle" },
+			"contentLength": 0,
+		},
+	],
+}
+```
+
+A variant is **skipped and the result posted partial** when the lease has under 30s left or the
+worker began draining between variants: `variants` then lists fewer devices than `deviceTypes`, the
+plugin stores what rendered and retries the URL for the rest. (A result that never arrives would cost
+the whole lease before anything retried.) The per-window log line reports `jobs` beside `completed`
+(renders) and `variantsSkipped`.
+
+**Compatibility.** A job WITHOUT `deviceTypes` — an older plugin, which claims one job per device
+— is rendered as before and posted in the flat legacy shape (`{ id, url, outcome, … }` plus one
+body), so this version can be deployed ahead of the plugin. The reverse is degraded, not broken: a
+renderer older than this one, handed a multi-device job, renders only `deviceType` (the first) and
+posts it flat; the plugin stores that one device and the others go unrendered until the fleet is
+upgraded — so **roll the render fleet out first.**
 
 ## Rendering config
 
