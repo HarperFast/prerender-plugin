@@ -20,10 +20,22 @@ import { sleep, noop } from './util.js';
  * @param {string} opts.html                       B's serialized snapshot bytes to serve
  * @param {{header:string, token:string}} [opts.bypass]  bot-mitigation bypass header/token for subrequests
  * @param {string[]} [opts.blockUrlPatterns]       substring patterns whose requests to abort (mirror B's block)
- * @returns {Promise<{page: import('puppeteer').Page, failed: Map<string,string>}>}
+ * @returns {Promise<{page: import('puppeteer').Page, failed: Map<string,string>, resourceFailures: ResourceFailure[]}>}
  *          `page` = the settled C page; `failed` = url -> errorText / 'HTTP <code>' for graceful
- *          image degradation downstream (detectors split BROKEN_SRC vs LOAD_FAILED vs UNREACHABLE_IN_ENV).
+ *          image degradation downstream (detectors split BROKEN_SRC vs LOAD_FAILED vs UNREACHABLE_IN_ENV);
+ *          `resourceFailures` = the same events carrying the RESOURCE TYPE, which is what lets a
+ *          caller tell a dead tracking pixel from a dead stylesheet (see `stylesheetFailures` in
+ *          paintParity — a 403 on the site's own CSS silently makes every CSS-visibility defect
+ *          disappear, so it has to be a first-class signal rather than one more url in a bag).
  */
+export interface ResourceFailure {
+	url: string;
+	/** Puppeteer resource type: 'stylesheet' | 'script' | 'image' | 'document' | … */
+	type: string;
+	/** 'HTTP <code>' for a 4xx/5xx response, or the network errorText for a failed request. */
+	reason: string;
+}
+
 export async function loadServed(
 	browser: Browser,
 	{
@@ -32,10 +44,15 @@ export async function loadServed(
 		bypass,
 		blockUrlPatterns = [],
 	}: { url: string; html: string; bypass?: { header: string; token: string }; blockUrlPatterns?: string[] }
-): Promise<{ page: Page; failed: Map<string, string> }> {
+): Promise<{ page: Page; failed: Map<string, string>; resourceFailures: ResourceFailure[] }> {
 	const page = await browser.newPage();
 	try {
 		const failed = new Map<string, string>(); // url -> errorText, for graceful image degradation
+		// Keyed by url for the same reason `failed` is: one resource that fails is ONE failure, however
+		// many events the browser emits for it (a 404 stylesheet reports through both the response and
+		// the request-failed paths). Counting events would make the severity depend on browser
+		// internals rather than on the page.
+		const resourceFailed = new Map<string, ResourceFailure>();
 
 		await page.setRequestInterception(true);
 
@@ -69,9 +86,26 @@ export async function loadServed(
 		});
 
 		// Record sub-resource failures (bad token, unroutable CDN, 4xx/5xx) for the image-canary tiers.
-		page.on('requestfailed', (r: HTTPRequest) => failed.set(r.url(), r.failure()?.errorText || 'failed'));
+		// A BLOCKED request is not a failure — we aborted it on purpose to mirror B — so the abort
+		// reason is filtered out rather than reported as a broken resource.
+		// A 4xx resource reports BOTH ways: the response arrives, then the load aborts. The status is
+		// the useful half ('HTTP 404' names the cause; 'net::ERR_ABORTED' is just its consequence), so
+		// a request failure never overwrites a status already recorded for that url.
+		page.on('requestfailed', (r: HTTPRequest) => {
+			const reason = r.failure()?.errorText || 'failed';
+			failed.set(r.url(), reason);
+			if (!blockUrlPatterns.some((p) => r.url().includes(p)) && !resourceFailed.has(r.url()))
+				resourceFailed.set(r.url(), { url: r.url(), type: r.resourceType(), reason });
+		});
 		page.on('response', (r: HTTPResponse) => {
-			if (r.status() >= 400) failed.set(r.url(), 'HTTP ' + r.status());
+			if (r.status() >= 400) {
+				failed.set(r.url(), 'HTTP ' + r.status());
+				resourceFailed.set(r.url(), {
+					url: r.url(),
+					type: r.request().resourceType(),
+					reason: 'HTTP ' + r.status(),
+				});
+			}
 		});
 
 		// Bounded navigation + settle: goto ≤20s, network-idle ≤5s, then a fixed 1.5s dwell so CSS
@@ -81,7 +115,7 @@ export async function loadServed(
 		await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 }).catch(noop);
 		await sleep(1500);
 
-		return { page, failed };
+		return { page, failed, resourceFailures: [...resourceFailed.values()] };
 	} catch (err) {
 		// Setup (setRequestInterception) can reject after newPage — close the page so a throw here does
 		// not orphan it (the caller never received a reference to close it; it just `continue`s the loop).

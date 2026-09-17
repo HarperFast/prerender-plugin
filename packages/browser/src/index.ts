@@ -116,7 +116,7 @@ export { reuseParityCheck, formatReuseParity } from './audit/reuseParity.js';
 // Paint parity — the counterpart that compares rendered INK rather than DOM. A post-processing bug
 // can leave the markup perfect and the rendering empty; renderAudit cannot see that class at all,
 // because its ground-truth state inherits the deployed post-processing on both sides.
-export { paintParity, diffPaint, collectPaint, PAINT_INVENTORY } from './audit/paintParity.js';
+export { paintParity, paintParityVerdict, diffPaint, collectPaint, PAINT_INVENTORY } from './audit/paintParity.js';
 export { renderHtmlReport } from './audit/report.js';
 export { runSelfCheck, runSelfCheckResults } from './audit/selfCheck.js';
 
@@ -132,6 +132,8 @@ export type {
 	PaintLoss,
 } from './audit/paintParity.js';
 export type { SelfCheckResult } from './audit/selfCheck.js';
+export type { ResourceFailure } from './audit/serveState.js';
+export type { PaintParityVerdict } from './audit/paintParity.js';
 export type {
 	AuditResult,
 	AuditOutcome,

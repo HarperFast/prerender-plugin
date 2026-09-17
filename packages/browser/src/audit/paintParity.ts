@@ -71,21 +71,99 @@ export const PAINT_INVENTORY = (): PaintItem[] => {
 
 	const items: PaintItem[] = [];
 	const clip = (s: string | null, n = 56) => (s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+	// Set once per element, read by `add`. An element that does not effectively paint is recorded
+	// with ZERO area rather than skipped — that distinction is the whole fix. Dropping it would move
+	// the key into `originOnly`, which `diffPaint` deliberately reports and never fails (it cannot
+	// tell real content drift from a defect), so the bug would still pass. Keeping the key on both
+	// sides at area 0 is what lets the existing "painted at origin, zero here" rule fire.
+	let elPaints = true;
 	const add = (kind: string, name: string, el: Element) => {
 		if (!name) return;
 		const r = el.getBoundingClientRect();
+		const width = elPaints ? r.width : 0;
+		const height = elPaints ? r.height : 0;
 		items.push({
 			key: `${kind}:${name}`,
-			width: +r.width.toFixed(1),
-			height: +r.height.toFixed(1),
-			area: +(r.width * r.height).toFixed(1),
+			width: +width.toFixed(1),
+			height: +height.toFixed(1),
+			area: +(width * height).toFixed(1),
 		});
+	};
+
+	/** The next node up, crossing a shadow boundary at the host rather than stopping there. */
+	const parentOf = (el: Element): Element | null => {
+		if (el.parentElement) return el.parentElement;
+		const root = el.getRootNode();
+		return root instanceof ShadowRoot ? root.host : null;
+	};
+
+	// EFFECTIVE visibility, not own-style visibility. `opacity` is NOT an inherited property, so a
+	// child of an `opacity: 0` ancestor computes `opacity: 1` and its box keeps its full size — an
+	// own-style check scores a completely invisible subtree as painting, identically to a healthy
+	// one. That is not hypothetical: a reveal-on-hydrate wrapper left in its pre-reveal state
+	// (`max-height: 0; opacity: 0`) hid an entire reviews section, 2,336 elements and 467 text runs,
+	// while every number this module produced stayed byte-identical to the healthy render.
+	//
+	// `checkVisibility` is the platform's own answer and covers display / visibility /
+	// content-visibility / inherited opacity in one call; the fallback walks for the cases that
+	// genuinely need an ancestor (display and opacity — `visibility` is inheritable but overridable,
+	// so the element's OWN computed value is already the right answer for it).
+	const cssVisible = (el: Element, style: CSSStyleDeclaration): boolean => {
+		const check = (el as Element & { checkVisibility?: (o: object) => boolean }).checkVisibility;
+		if (typeof check === 'function') return check.call(el, { checkOpacity: true, checkVisibilityCSS: true });
+		if (style.display === 'none' || style.visibility === 'hidden') return false;
+		for (let n: Element | null = el; n; n = parentOf(n)) {
+			const s = n === el ? style : getComputedStyle(n);
+			if (s.display === 'none' || Number(s.opacity) === 0) return false;
+		}
+		return true;
+	};
+
+	// The other way a live-looking subtree paints nothing: an ancestor COLLAPSED to zero in an axis
+	// it clips (the `max-height: 0; overflow: hidden` accordion). `checkVisibility` does not model
+	// clipping, and the descendants keep non-zero boxes of their own.
+	//
+	// Deliberately narrow — only a clipper whose own box is ZERO in the clipped axis counts. An
+	// element merely scrolled outside a normal-sized `overflow: hidden` container (every carousel on
+	// every page) is NOT treated as invisible: that is ordinary off-screen content, it reads the same
+	// at origin, and failing it would bury real findings under carousel noise.
+	const clipMemo = new Map<Element, boolean>();
+	const isZeroClipper = (el: Element): boolean => {
+		const s = getComputedStyle(el);
+		const clipsX = s.overflowX !== 'visible';
+		const clipsY = s.overflowY !== 'visible';
+		if (!clipsX && !clipsY) return false;
+		const r = el.getBoundingClientRect();
+		return (clipsX && r.width === 0) || (clipsY && r.height === 0);
+	};
+	/** Does anything at or above `el` clip its content away entirely? Memoized; elements arrive in
+	 *  document order, so each ancestor is answered once and reused by its whole subtree. */
+	const clipsContent = (el: Element | null): boolean => {
+		if (!el) return false;
+		const hit = clipMemo.get(el);
+		if (hit !== undefined) return hit;
+		const chain: Element[] = [];
+		let n: Element | null = el;
+		while (n && !clipMemo.has(n)) {
+			chain.push(n);
+			n = parentOf(n);
+		}
+		let acc = n ? (clipMemo.get(n) as boolean) : false;
+		for (let i = chain.length - 1; i >= 0; i--) {
+			acc = acc || isZeroClipper(chain[i]);
+			clipMemo.set(chain[i], acc);
+		}
+		return acc;
 	};
 
 	for (const el of elements) {
 		const style = getComputedStyle(el);
-		// Something the author has explicitly hidden is not "lost ink" — it is not ink at all.
-		if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+		// Something the author has explicitly hidden is not "lost ink" — it is not ink at all. That
+		// still holds, and falls out of the area being 0 on BOTH sides: hidden at origin means
+		// `origin.area > minArea` is false, so it can never produce a finding. What no longer falls
+		// through is the asymmetric case — painting at origin, invisible here — which is the defect.
+		elPaints = cssVisible(el, style) && !clipsContent(parentOf(el));
 		const tag = el.tagName.toLowerCase();
 
 		if (tag === 'path') add('geo', clip(el.getAttribute('d')), el);
@@ -227,7 +305,7 @@ export function diffPaint(
 
 import { renderOnce } from '../renderOnce.js';
 import { buildFullConfig, sweep } from './fullRender.js';
-import { loadServed } from './serveState.js';
+import { loadServed, type ResourceFailure } from './serveState.js';
 import type { DeepPartial, PrerenderConfig } from '../config.js';
 
 export interface PaintParityOptions {
@@ -256,6 +334,40 @@ export interface PaintParityReport extends PaintParityResult {
 	device: string;
 	/** Bytes of the audited snapshot. */
 	servedBytes: number;
+	/**
+	 * Same-origin stylesheets that did NOT load while the snapshot was being measured.
+	 *
+	 * This is a verdict about the MEASUREMENT, not about the page: with the site's own CSS missing,
+	 * every class that hides something stops hiding it, so a genuinely invisible section measures as
+	 * fully painting and the audit reports a clean pass. Measured on a real snapshot — the same
+	 * bytes, the only difference being whether the origin-bypass token was sent on subrequests:
+	 *
+	 *   token sent     9 stylesheets ok  ->  wrapper opacity 0, max-height 0px  ->  invisible
+	 *   token withheld 6 ok / 3x HTTP 403 ->  wrapper opacity 1, max-height none -> "visible"
+	 *
+	 * A non-empty array means `lost` is not trustworthy and the run should be treated as invalid,
+	 * not as a pass. `paintParityVerdict()` reports that case as `invalid`.
+	 */
+	stylesheetFailures: ResourceFailure[];
+}
+
+/** `invalid` — the run measured nothing meaningful and must not be read as a pass or a failure.
+ *  `lost-ink` — trustworthy, and the snapshot dropped marks the origin page paints.
+ *  `clean` — trustworthy, and nothing was lost. */
+export type PaintParityVerdict = 'invalid' | 'lost-ink' | 'clean';
+
+/**
+ * Three-valued on purpose. A boolean would have to fold "the measurement broke" into one of the two
+ * real answers, and folding it into `pass` is precisely the failure this module just had.
+ *
+ * Note for anyone gating a corpus on this: `lost` carries a small drift baseline on a live site —
+ * measured on one real product page, a healthy snapshot lost 2 text marks (a store link and a
+ * number) against 127 for the same page with its reviews section invisible. So threshold the count
+ * or triage the findings; do not demand `lost.length === 0` across a corpus and expect signal.
+ */
+export function paintParityVerdict(report: PaintParityReport): PaintParityVerdict {
+	if (report.stylesheetFailures.length > 0) return 'invalid';
+	return report.lost.length > 0 ? 'lost-ink' : 'clean';
 }
 
 /**
@@ -328,7 +440,7 @@ export async function paintParity(o: PaintParityOptions): Promise<PaintParityRep
 
 		// 3. The snapshot, loaded AT THE REAL URL so relative refs and same-origin subrequests
 		// resolve the way they do for a crawler fetching the cached bytes.
-		const { page } = await loadServed(reference.browser, {
+		const { page, resourceFailures } = await loadServed(reference.browser, {
 			url,
 			html,
 			bypass,
@@ -342,10 +454,24 @@ export async function paintParity(o: PaintParityOptions): Promise<PaintParityRep
 			await page.close().catch(() => {});
 		}
 
+		// Only SAME-ORIGIN stylesheets invalidate the measurement. A third-party stylesheet that
+		// 403s is ordinary web weather and usually blocked on purpose; the site's own CSS is what
+		// carries the classes that do the hiding.
+		const pageOrigin = new URL(url).origin;
+		const stylesheetFailures = resourceFailures.filter((f) => {
+			if (f.type !== 'stylesheet') return false;
+			try {
+				return new URL(f.url).origin === pageOrigin;
+			} catch {
+				return false;
+			}
+		});
+
 		return {
 			url,
 			device: reference.device,
 			servedBytes: html.length,
+			stylesheetFailures,
 			...diffPaint(originPaint, servedPaint, { minArea }),
 		};
 	} finally {
