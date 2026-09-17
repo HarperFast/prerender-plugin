@@ -1,5 +1,5 @@
 import { Renderer } from './Worker.js';
-import type { RenderTimings } from './RenderJob.js';
+import type { RenderTimings, WaitForResult } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import { resolveConfigForJob, type PostProcessConfig } from './config.js';
@@ -552,6 +552,10 @@ const renderer: Renderer = async (page, job) => {
 	// out (same discipline as the renderer's other waits), so it can never fail a render. Reached
 	// identically by renderOnce and the fleet because both run this renderer over the same config.
 	const applyWaitFor = async () => {
+		// Per-rule outcome. A rule that never satisfies is invisible today: it times out best-effort,
+		// the render succeeds, and nothing anywhere says a gate spent its whole `timeoutMs` finding
+		// nothing. That is both a silent tax on every matching render and a silently missing guard.
+		const results: WaitForResult[] = [];
 		// The URL path, used for per-rule pathPattern scoping (falls back to '' if job.url is odd).
 		let path = '';
 		try {
@@ -567,6 +571,7 @@ const renderer: Renderer = async (page, job) => {
 			if (rule.devices && !rule.devices.includes(deviceType)) continue;
 			if (rule.pathPattern && !new RegExp(rule.pathPattern).test(path)) continue;
 
+			const ruleStart = Date.now();
 			const contentSelector = rule.waitForSelector ?? rule.selector;
 			const minCount = Math.max(1, rule.minCount ?? 1);
 			const doScroll = rule.scrollIntoView !== false;
@@ -574,6 +579,8 @@ const renderer: Renderer = async (page, job) => {
 			const deadline = Date.now() + Math.min(remainingTimer.remaining, rule.timeoutMs ?? remainingTimer.remaining);
 			let satisfiedSince = 0;
 			let hasScrolled = false;
+			let satisfied = false;
+			let lastCount = 0;
 			while (Date.now() < deadline) {
 				// Scroll the anchor into view ONCE (enough to trip its IntersectionObserver); the widget
 				// then loads into the DOM and is counted regardless of scroll position. Avoids per-tick
@@ -587,18 +594,36 @@ const renderer: Renderer = async (page, job) => {
 				try {
 					count = await page.evaluate(countMatchingElements, contentSelector);
 				} catch {
-					return; // page closed / navigated — stop instead of looping to the deadline.
+					// page closed / navigated — stop instead of looping to the deadline, but keep the
+					// partial telemetry rather than dropping the whole run's attribution.
+					job.waitForResults = results;
+					return;
 				}
+				lastCount = count;
 				if (count >= minCount) {
-					if (stableMs === 0) break;
+					if (stableMs === 0) {
+						satisfied = true;
+						break;
+					}
 					if (satisfiedSince === 0) satisfiedSince = Date.now();
-					else if (Date.now() - satisfiedSince >= stableMs) break;
+					else if (Date.now() - satisfiedSince >= stableMs) {
+						satisfied = true;
+						break;
+					}
 				} else {
 					satisfiedSince = 0;
 				}
 				await new Promise((resolve) => setTimeout(resolve, config.navigation.domStablePollMs));
 			}
+			results.push({
+				name: rule.name ?? rule.selector,
+				satisfied,
+				count: lastCount,
+				minCount,
+				waitedMs: Date.now() - ruleStart,
+			});
 		}
+		job.waitForResults = results;
 	};
 
 	if (config.scroll.enabled && config.scroll.settleUntilStable) {
@@ -621,8 +646,14 @@ const renderer: Renderer = async (page, job) => {
 	// `settle` on purpose — it reads as part of the settle budget.
 	if (config.waitFor?.length) {
 		await applyWaitFor();
-		await scrollToTop();
 	}
+	// The LAST word on whether the page has stopped changing, and the only plateau check that runs
+	// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
+	// still filling — measured: reviews complete and correct, 107 product links instead of 547,
+	// because the earlier `domStable()` plateaued before the recommendation rails arrived and the
+	// review gate then let the snapshot go. See `navigation.finalDomStable`.
+	if (config.navigation.finalDomStable) await domStable();
+	if (config.waitFor?.length) await scrollToTop();
 	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {

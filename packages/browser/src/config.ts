@@ -87,6 +87,27 @@ export type NavigationConfig = {
 	domStablePollMs: number;
 	domStableTolerance: number;
 	/**
+	 * Run the DOM-plateau check ONE MORE TIME at the very end of settle, after the `waitFor` gates.
+	 *
+	 * Without it a gate can release the snapshot onto a DOM that is still filling. Measured: a
+	 * product page gated on its reviews widget serialized with 107 product links instead of 547,
+	 * because `domStable()` runs BEFORE the gates, plateaued on a DOM that had not yet received the
+	 * recommendation rails, and the review gate then let the snapshot go. Reviews were complete and
+	 * correct; a whole other section was not there.
+	 *
+	 * The alternative is a `waitFor` rule per widget, forever, and a page is only as complete as the
+	 * widget someone remembered to name. A plateau after the gates is the general form of the same
+	 * check, so prefer this over growing the rule list.
+	 *
+	 * It is also the ONLY plateau check that runs under `scroll.settleUntilStable` — that branch
+	 * calls `scrollSettle()` and never calls `domStable()` at all.
+	 *
+	 * Bounded by `domStableTimeoutMs` and the remaining budget like every other wait, and a complete
+	 * no-op when `domStableMs` is 0. Default false, preserving existing behavior byte-for-byte —
+	 * but turn it on for any config that leans on `waitFor` gates.
+	 */
+	finalDomStable: boolean;
+	/**
 	 * Decide indexability against the pre-settle DOM and skip the settle phase when the answer is
 	 * already "not indexable" — the plugin can never store such a page, so settling it is waste,
 	 * and settle is the dominant cost of a render. See the bail in `renderer.ts` for what it does
@@ -271,6 +292,9 @@ export type PostProcessConfig = {
  * consumer already feeds `startWorker`). Best-effort: a rule that never satisfies just times out.
  */
 export type WaitForRule = {
+	/** Optional label for telemetry — how this rule is attributed in `waitForResults`. Falls back to
+	 *  the selector, which is fine until two rules share one. */
+	name?: string;
 	/** CSS selector to scroll into view. Required; caller-supplied at runtime — there is no default. */
 	selector: string;
 	/** Scroll `selector` into view before waiting (default true; set false to only wait). */
@@ -488,6 +512,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStableTimeoutMs: 8000,
 		domStablePollMs: 250,
 		domStableTolerance: 8,
+		finalDomStable: false,
 		skipSettleWhenNonIndexable: false,
 	},
 	scroll: {
@@ -591,6 +616,11 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	for (const field of ['domStableMs', 'domStableTolerance', 'navigationTimeoutMs'] as const) {
 		if (typeof config.navigation[field] !== 'number' || config.navigation[field] < 0) {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
+		}
+	}
+	for (const field of ['finalDomStable', 'skipSettleWhenNonIndexable'] as const) {
+		if (typeof config.navigation[field] !== 'boolean') {
+			throw new Error(`prerender config: navigation.${field} must be a boolean`);
 		}
 	}
 	if (typeof config.documentReuse.enabled !== 'boolean') {
@@ -711,6 +741,17 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 				(!Array.isArray(rule.devices) || rule.devices.some((d) => typeof d !== 'string' || d.trim() === ''))
 			) {
 				throw new Error(`prerender config: waitFor[${i}].devices must be an array of non-empty device names`);
+			}
+			// A `pageTypes` scope silently matches NOTHING: rule scopes AND together and no job carries
+			// a declared page type, so such a rule never runs and the widget it was written to wait for
+			// is quietly absent from every snapshot. Named page types were abandoned deliberately.
+			// Failing loudly at config load is the only way this is ever noticed.
+			if ('pageTypes' in (rule as Record<string, unknown>)) {
+				throw new Error(
+					`prerender config: waitFor[${i}] uses \`pageTypes\`, which no job ever carries, so the rule ` +
+						'would match nothing and the content it guards would be missing from every render. Scope it ' +
+						'with `pathPattern` instead.'
+				);
 			}
 			if (rule.pathPattern !== undefined) {
 				if (typeof rule.pathPattern !== 'string' || rule.pathPattern.trim() === '') {

@@ -22,7 +22,7 @@
 import type { Browser, LaunchOptions, Page } from 'puppeteer';
 import ManagedBrowser from './ManagedBrowser.js';
 import RenderJob from './RenderJob.js';
-import type { RenderTimings } from './RenderJob.js';
+import type { RenderTimings, WaitForResult } from './RenderJob.js';
 import defaultRenderer from './renderer.js';
 import type { Renderer } from './Worker.js';
 import { resolveSettings, defaultLaunchOptions, settings } from './settings.js';
@@ -108,6 +108,10 @@ export interface RenderResult {
 	/** Scoped overrides (`config.overrides`) that this render resolved, in the order applied. Empty
 	 *  when none matched — `config` below is then the base config unchanged. */
 	appliedOverrides: string[];
+	/** Every `waitFor` gate whose scope matched, and what it did. A rule with `satisfied: false`
+	 *  spent `waitedMs` finding nothing — either it is guarding content this page does not have
+	 *  (so it is pure tax) or the content genuinely did not arrive (so the snapshot is short). */
+	waitForResults: WaitForResult[];
 	renderTimeMs: number | undefined;
 	screenshot: Uint8Array | undefined;
 	/** Set when the renderer threw — the result is still returned (mirrors Worker.render). */
@@ -295,6 +299,7 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 			error,
 			config: resolved.config,
 			appliedOverrides: resolved.applied,
+			waitForResults: job.waitForResults,
 			job,
 			probes: probeResults,
 			page: keepOpen ? page : undefined,

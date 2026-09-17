@@ -7,6 +7,19 @@ import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import type { JobDocumentCache } from './documentReuse.js';
 
+/** One `waitFor` rule's outcome for one render. Only rules whose scope MATCHED appear. */
+export interface WaitForResult {
+	/** The rule's `name`, falling back to its `selector`. */
+	name: string;
+	/** Did the content selector reach `minCount` (and hold for `stableMs`) before the deadline? */
+	satisfied: boolean;
+	/** The last count seen — with `satisfied: false` this is how close the gate got. */
+	count: number;
+	minCount: number;
+	/** Wall-clock this rule spent. For an unsatisfied rule this is the tax it charges every render. */
+	waitedMs: number;
+}
+
 // Result-POST failures worth retrying: transient overload/gateway errors. Anything else
 // (e.g. a 4xx) is a bug, not a blip — logged and dropped (the lease expires → re-render).
 const RESULT_RETRIABLE_STATUS = new Set([429, 502, 503, 504]);
@@ -145,6 +158,12 @@ export default class RenderJob {
 	 * require re-deriving the match by hand.
 	 */
 	appliedOverrides: string[] = [];
+	/**
+	 * What each `waitFor` gate that RAN for this variant did — see {@link WaitForResult}. Renderer-set.
+	 * A gate that times out is otherwise invisible: the render succeeds, the content it guards is
+	 * simply absent, and nothing says a rule spent its whole `timeoutMs` finding nothing.
+	 */
+	waitForResults: WaitForResult[] = [];
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
