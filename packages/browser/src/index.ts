@@ -96,7 +96,7 @@ export { default as RenderWorker } from './Worker.js';
 export { default as defaultRenderer } from './renderer.js';
 export { default as RenderJob } from './RenderJob.js';
 export { settings } from './settings.js';
-export { defaultConfig, loadConfig, mergeConfig } from './config.js';
+export { defaultConfig, loadConfig, mergeConfig, resolveConfigForJob } from './config.js';
 
 // On-demand render + analysis harness (the off-queue counterpart to startWorker). resolveSettings
 // and defaultLaunchOptions stay internal — the public surface is renderOnce/renderMatrix + probes.
@@ -164,4 +164,6 @@ export type {
 	ScrollConfig,
 	PostProcessConfig,
 	WaitForRule,
+	ConfigOverride,
+	ResolvedConfig,
 } from './config.js';

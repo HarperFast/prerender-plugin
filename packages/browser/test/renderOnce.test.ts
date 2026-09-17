@@ -193,3 +193,56 @@ test('captureNonIndexable returns HTML for a noindex page (and marks it non-inde
 	assert.equal(gated.html, undefined);
 	assert.equal(gated.outcome, 'non-indexable');
 });
+
+// ── scoped config overrides, end to end through the real renderer ──────────────────────────────
+
+test('a scoped override reaches the render: the same URL settles differently per device', async () => {
+	// The widget only mounts when its container is in view. Scroll is off, so viewport height is the
+	// only lever — and the override supplies it for mobile alone. Same config object, same URL:
+	// the ONLY difference between the two renders is whether the override matched.
+	const config = {
+		...NO_SCROLL,
+		overrides: [
+			{
+				name: 'tall-mobile-viewport',
+				devices: ['mobile'],
+				config: { devices: { mobile: { viewport: { width: 390, height: 5000 } } } },
+			},
+		],
+	};
+	const results = await renderMatrix(base, ['desktop', 'mobile'], {
+		config,
+		probes: { rev: selectorCountProbe(['.rev-item']) },
+	});
+	const byDevice = Object.fromEntries(results.map((r) => [r.device, r]));
+
+	assert.deepEqual(byDevice.mobile.appliedOverrides, ['tall-mobile-viewport']);
+	assert.deepEqual(byDevice.desktop.appliedOverrides, [], 'the desktop render must not match it');
+	assert.equal(byDevice.mobile.viewport.height, 5000, 'the override reached the viewport actually used');
+	assert.equal(
+		(byDevice.mobile.probes.rev as Record<string, number>)['.rev-item'],
+		5,
+		'the scoped viewport brought the lazy widget into view on mobile'
+	);
+	assert.equal(byDevice.mobile.config.devices.mobile.viewport.height, 5000, 'result.config is the RESOLVED config');
+});
+
+test('a path-scoped override does not touch a render on another path', async () => {
+	const config = {
+		...NO_SCROLL,
+		overrides: [
+			{
+				name: 'noindex-only',
+				pathPattern: '^/noindex',
+				config: { devices: { desktop: { viewport: { width: 640, height: 480 } } } },
+			},
+		],
+	};
+	const onLazy = await renderOnce({ url: base, device: 'desktop', config });
+	assert.deepEqual(onLazy.appliedOverrides, []);
+	assert.notEqual(onLazy.viewport.height, 480);
+
+	const onNoindex = await renderOnce({ url: `${base}/noindex`, device: 'desktop', config });
+	assert.deepEqual(onNoindex.appliedOverrides, ['noindex-only']);
+	assert.equal(onNoindex.viewport.height, 480, 'the matching path got the scoped viewport');
+});

@@ -138,6 +138,13 @@ export default class RenderJob {
 	 * Not posted; `documentReused` / `documentPrefetched` say what was replayed and from where.
 	 */
 	documentReplayed = false;
+	/**
+	 * Names of the scoped config overrides (`config.overrides`) this variant resolved, in the order
+	 * applied. Renderer-set and NOT posted: it is the attribution surface for renderOnce and the
+	 * audit tooling, so "which config did this render actually use" has an answer that does not
+	 * require re-deriving the match by hand.
+	 */
+	appliedOverrides: string[] = [];
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
