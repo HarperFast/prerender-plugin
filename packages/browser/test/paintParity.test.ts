@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { paintParity, diffPaint } from '../dist/audit/paintParity.js';
+import { paintParity, diffPaint, paintParityVerdict } from '../dist/audit/paintParity.js';
 import type { PaintItem } from '../dist/audit/paintParity.js';
 
 // A shadow widget whose SVG carries its geometry in a `d` PRESENTATION ATTRIBUTE — the exact shape
@@ -27,12 +27,51 @@ const FIXTURE = `<!doctype html><html><head><title>paint</title>
 </script>
 </body></html>`;
 
+// A reveal-on-hydrate widget: the server ships it COLLAPSED and a script flips it to revealed. This
+// is the shape that shipped a whole reviews section invisible — the snapshot caught the wrapper
+// before the flip, scripts were stripped, and it stayed collapsed forever. `hideWith` picks which
+// mechanism collapses it, because the two halves behave completely differently under measurement:
+// `display:none` zeroes the descendants' boxes (the old own-style check caught it), while
+// `opacity:0` leaves every descendant computing `opacity: 1` at full size (it did not).
+const revealFixture = (hideWith: 'opacity' | 'display' | 'clip', hydrated: boolean) => `<!doctype html>
+<html><head><title>reveal</title><style>
+  #wrap.collapsed-opacity { max-height: 0; opacity: 0; }
+  #wrap.collapsed-display { display: none; }
+  #wrap.collapsed-clip    { max-height: 0; overflow: hidden; }
+  #wrap.revealed { opacity: 1; }
+  /* A normal-sized clipping container with content scrolled out of view — the carousel shape that
+     must NOT be mistaken for a collapsed wrapper. */
+  #carousel { width: 40px; height: 20px; overflow: hidden; }
+  #carousel .slide { width: 400px; }
+</style></head><body>
+<p id="always">always visible text</p>
+<div id="carousel"><div class="slide">offscreen carousel slide</div></div>
+<div id="wrap" class="collapsed-${hideWith}">
+  <p id="review">five stars would buy again</p>
+</div>
+${hydrated ? `<script>document.getElementById('wrap').className = 'revealed';</script>` : ''}
+</body></html>`;
+
 let server: http.Server;
 let base = '';
+/** Same-origin stylesheet the served bytes reference; the server 404s it when this is true. */
+let breakStylesheet = false;
 
 before(async () => {
-	server = http.createServer((_req, res) => {
+	server = http.createServer((req, res) => {
+		const path = (req.url ?? '/').split('?')[0];
+		if (path === '/site.css') {
+			if (breakStylesheet) {
+				res.statusCode = 404;
+				return res.end('not found');
+			}
+			res.setHeader('content-type', 'text/css');
+			return res.end('#review { color: rgb(0, 0, 0); }');
+		}
 		res.setHeader('content-type', 'text/html; charset=utf-8');
+		// `/reveal-<mechanism>` serves the ORIGIN page: collapsed markup plus the hydration script.
+		const m = /^\/reveal-(opacity|display|clip)$/.exec(path);
+		if (m) return res.end(revealFixture(m[1] as 'opacity' | 'display' | 'clip', true));
 		res.end(FIXTURE);
 	});
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -78,4 +117,76 @@ test('a mark that stops painting is caught even though the DOM is intact', async
 	assert.deepEqual(report.lost, [], 'flattening must not cost a single mark');
 	// The SVG geometry specifically survived: its key is present and painting on both sides.
 	assert.equal(report.lostByKind.geo, undefined, 'no SVG geometry lost');
+});
+
+// ── the reveal-race regression: content present in the DOM, invisible on screen ────────────────
+
+// The snapshot half: the same markup the origin ships, with the hydration script stripped, so the
+// wrapper stays in whatever pre-reveal state it was serialized in. Passing it as `html` skips the
+// candidate render, which is what makes this test hermetic and fast.
+const collapsedSnapshot = (hideWith: 'opacity' | 'display' | 'clip') => revealFixture(hideWith, false);
+
+for (const hideWith of ['opacity', 'display', 'clip'] as const) {
+	test(`a subtree hidden by ${hideWith} is LOST INK, not a clean pass`, async () => {
+		const report = await paintParity({
+			url: `${base}/reveal-${hideWith}`,
+			base: { scroll: { enabled: false } },
+			html: collapsedSnapshot(hideWith),
+			sweepDeadlineMs: 3000,
+		});
+		const lostText = report.lost.filter((l) => l.kind === 'txt').map((l) => l.key);
+		assert.ok(
+			lostText.includes('txt:five stars would buy again'),
+			`the hidden review text must be reported lost, got ${JSON.stringify(report.lost)}`
+		);
+		assert.equal(paintParityVerdict(report), 'lost-ink', 'the run must report lost ink');
+	});
+}
+
+test('content merely scrolled out of a normal-sized clipping container is not a finding', async () => {
+	// Identical on both sides, so the ONLY way this appears in `lost` is the clip test over-reaching
+	// from collapsed wrappers to every carousel on the page.
+	const report = await paintParity({
+		url: `${base}/reveal-opacity`,
+		base: { scroll: { enabled: false } },
+		html: collapsedSnapshot('opacity'),
+		sweepDeadlineMs: 3000,
+	});
+	assert.ok(
+		!report.lost.some((l) => l.key === 'txt:offscreen carousel slide'),
+		'an off-screen carousel slide is ordinary content, not lost ink'
+	);
+	assert.ok(
+		!report.lost.some((l) => l.key === 'txt:always visible text'),
+		'content visible on both sides must never be reported lost'
+	);
+});
+
+test('a same-origin stylesheet that fails to load invalidates the run instead of passing it', async () => {
+	// Served bytes that reference the site's own CSS. With the stylesheet 404ing, nothing hides
+	// anything, so the naive verdict is a clean pass — which is exactly the trap.
+	const withCss = collapsedSnapshot('opacity').replace('</head>', '<link rel="stylesheet" href="/site.css"></head>');
+	breakStylesheet = true;
+	try {
+		const report = await paintParity({
+			url: `${base}/reveal-opacity`,
+			base: { scroll: { enabled: false } },
+			html: withCss,
+			sweepDeadlineMs: 3000,
+		});
+		assert.equal(
+			report.stylesheetFailures.length,
+			1,
+			'the dead same-origin stylesheet must be reported: ' + JSON.stringify(report.stylesheetFailures)
+		);
+		assert.match(report.stylesheetFailures[0].reason, /404/);
+		assert.equal(report.stylesheetFailures[0].type, 'stylesheet');
+		assert.equal(
+			paintParityVerdict(report),
+			'invalid',
+			'a run that lost its own CSS is neither a pass nor a content finding'
+		);
+	} finally {
+		breakStylesheet = false;
+	}
 });
