@@ -1386,7 +1386,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Verdicts are not all equally permanent, so the knobs split by HTTP status:\n' +
 				'  - 404/410 (`gone`): the origin’s strongest statement that the page no longer exists. ' +
 				'Rechecking it on the default cadence is almost pure waste, so it gets fewer, further-apart ' +
-				'rechecks before deletion.\n' +
+				'rechecks before deletion — and, when no sitemap lists the URL, deletion on the FIRST verdict ' +
+				'(`gone.maxStrikesUnlisted`), because a 404 at the origin is itself what stops discovery ' +
+				're-creating the target.\n' +
 				'  - 401/403 never suppress at all: an auth-shaped error is far more likely a broken renderer ' +
 				'credential or an origin rule change than a page verdict, and striking on it would mass-delete ' +
 				'healthy targets during an outage.\n' +
@@ -1400,7 +1402,28 @@ export const configSchema = group('Prerender plugin configuration.', {
 						unit: 'ms',
 						min: 1,
 					}),
-					maxStrikes: option(2, 'Consecutive gone verdicts before the target is deleted.', { min: 1 }),
+					maxStrikes: option(2, 'Consecutive gone verdicts before a SITEMAP-LISTED target is deleted.', { min: 1 }),
+					maxStrikesUnlisted: option(
+						1,
+						'Consecutive gone verdicts before a target NO SITEMAP LISTS is deleted. Separate from ' +
+							'`maxStrikes` because the two are not symmetric, and the asymmetry runs the opposite way to ' +
+							'the intuition.\n\n' +
+							'A suppressed row is the verdict memory that stops a URL being re-created, so deleting one ' +
+							'hands that job back to whatever created the target. For an unlisted target that is ' +
+							'discovery, and discovery mints only on a 200 from the origin — a URL the origin answers ' +
+							'404/410 for cannot be re-minted by a crawler hit, so retiring it is terminal and the row, ' +
+							'its schedule row and every recheck render it would have cost are pure waste. Hence a ' +
+							'default of 1: retire on the first verdict.\n\n' +
+							'For a SITEMAP-LISTED target the refresh re-creates it on the very next pass (an absent ' +
+							'target is a CREATE; a suppressed one is skipped), so deleting trades one recheck per ' +
+							'`recheckInterval` for a full render per `sitemap.refreshInterval` — at a 6h refresh ' +
+							'against a 14d recheck that is ~28x MORE render work. Those keep counting `maxStrikes`.\n\n' +
+							'Scoped to gone verdicts on purpose: noindex and canonical-mismatch verdicts come from ' +
+							'pages the origin serves 200 for, so discovery re-mints them on the next bot request ' +
+							'(a `<meta>` noindex is not even visible to the header check) and retiring those on sight ' +
+							'would loop the same way. Set equal to `maxStrikes` to restore the pre-0.67.0 behaviour.',
+						{ min: 1 }
+					),
 				}),
 			}
 		),

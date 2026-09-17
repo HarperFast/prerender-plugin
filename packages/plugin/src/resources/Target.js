@@ -5,6 +5,7 @@ import { getResidencyByUrl } from '../util/residency.js';
 import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { deleteSchedule, writeSchedule } from '../util/renderSchedule.js';
+import { gradeSuppression } from '../util/suppression.js';
 
 const {
 	page_cache: { PrerenderedPage },
@@ -174,24 +175,37 @@ export class Target extends TargetTable {
 	 * (see RenderQueue.processJobResult); auth-shaped errors are a renderer/origin problem,
 	 * not a page verdict.
 	 *
+	 * A gone verdict on a URL NO SITEMAP LISTS takes `gone.maxStrikesUnlisted` (default 1), i.e.
+	 * it retires on the first verdict: discovery mints only on a 200, so the origin's own 404 is
+	 * what stops the URL coming back, and the suppressed row it would otherwise hold would never
+	 * block anything. A sitemap-listed one keeps counting `gone.maxStrikes`, because there the
+	 * row is the only thing holding the next refresh off. See util/suppression.js.
+	 *
 	 * Creates the row when absent (a render-now one-off or a redirect destination can be
 	 * proven non-indexable before anything targeted it). Deletes the cached pages either
 	 * way — stale content of a page that said "don't index me" must not keep serving.
 	 */
 	static async suppress(url, { reason, statusCode } = {}) {
-		// Only an http-error verdict classifies by status: a noindex/canonical verdict came
-		// from a document that rendered, so its status is not the statement being made.
-		const gone = reason === 'http-error' && (statusCode === 404 || statusCode === 410);
-		const knobs = gone ? config.render.suppression.gone : config.render.suppression;
-		const storedReason = gone ? 'http-gone' : (reason ?? null);
-
 		const existing = await Target.get({
 			id: url,
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode'],
 		});
 		const strikes = countedStrikes(existing?.strikes) + 1;
 
-		const maxStrikes = knobs.maxStrikes;
+		// The grading reads `sitemapUrl`, which this projection already carries: a gone verdict on a
+		// target no sitemap lists has its own (lower) ceiling, because nothing re-creates it. See
+		// util/suppression.js for why that asymmetry exists and why it is scoped to gone verdicts.
+		const { storedReason, recheckInterval, maxStrikes } = gradeSuppression({
+			reason,
+			statusCode,
+			fromSitemap: !!existing?.sitemapUrl,
+		});
+
+		// `existing` is still required: with no row there is nothing to retire, and minting one is
+		// this method's documented job (a render-now one-off or a redirect destination can be proven
+		// non-indexable before anything targeted it). At an unlisted ceiling of 1 that row is created
+		// only to be retired on its first recheck — rare enough (those two paths only) to leave as
+		// the simpler behaviour rather than special-case a second deletion path here.
 		if (existing && Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
 			logger.warn(
 				`Prerender target ${url} non-indexable ${strikes} consecutive times (${storedReason ?? 'no reason'}) — deleting it`
@@ -211,7 +225,7 @@ export class Target extends TargetTable {
 			strikes,
 		});
 
-		const recheckAt = currentMinuteMs() + knobs.recheckInterval;
+		const recheckAt = currentMinuteMs() + recheckInterval;
 		// Safe by arithmetic (a recheck is always in the future, so it never lowers the claim
 		// floor), routed through the funnel anyway so the first "recheck this immediately" path
 		// anyone adds here inherits the lowering instead of silently stranding the URL.

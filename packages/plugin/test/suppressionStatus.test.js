@@ -171,15 +171,21 @@ const postResult = async (metadata, content) => {
 	await RenderQueue.processJobResult(body, ctx);
 };
 
-const seedSource = ({ url = A, renderInterval = 3_600_000, strikes, state } = {}) => {
+const SITEMAP = 'https://site.example.com/sitemap_product_1.xml';
+
+// `sitemapUrl` is load-bearing for the gone class: an unlisted target retires on the first gone
+// verdict (nothing re-creates it — discovery mints only on a 200), a listed one keeps counting
+// strikes (the next refresh would re-create it). Default unlisted, matching a discovered URL.
+const seedSource = ({ url = A, renderInterval = 3_600_000, strikes, state, sitemapUrl = null } = {}) => {
 	stores.target.set(url, {
 		url,
 		renderInterval,
+		...(sitemapUrl ? { sitemapUrl } : {}),
 		...(state ? { state } : {}),
 		...(Number.isFinite(strikes) ? { strikes } : {}),
 	});
 	for (const device of DEVICES) {
-		stores.renderSchedule.set(key(url, device), { nextRenderTime: 1, fromSitemap: false });
+		stores.renderSchedule.set(key(url, device), { nextRenderTime: 1, fromSitemap: !!sitemapUrl });
 		stores.prerenderedPage.set(key(url, device), { statusCode: 200, content: 'old html' });
 	}
 };
@@ -196,8 +202,8 @@ const nonIndexable = (statusCode, extra = {}) => ({
 
 // ---- gone (404/410) ----
 
-test('404 suppresses as http-gone at the gone recheck cadence', async () => {
-	seedSource();
+test('a sitemap-listed 404 suppresses as http-gone at the gone recheck cadence', async () => {
+	seedSource({ sitemapUrl: SITEMAP });
 	await postResult(nonIndexable(404));
 
 	const target = stores.target.get(A);
@@ -223,7 +229,7 @@ test('404 suppresses as http-gone at the gone recheck cadence', async () => {
 });
 
 test('410 classifies as gone too', async () => {
-	seedSource();
+	seedSource({ sitemapUrl: SITEMAP });
 	await postResult(nonIndexable(410));
 	assert.equal(stores.target.get(A).suppressedReason, 'http-gone');
 });
@@ -232,7 +238,7 @@ test('gone deletes after gone.maxStrikes, sooner than the default maxStrikes', a
 	const goneMax = config.render.suppression.gone.maxStrikes;
 	assert.ok(goneMax < config.render.suppression.maxStrikes, 'precondition: gone dies sooner');
 
-	seedSource({ strikes: goneMax - 1, state: 'suppressed' });
+	seedSource({ strikes: goneMax - 1, state: 'suppressed', sitemapUrl: SITEMAP });
 	await postResult(nonIndexable(404));
 
 	assert.equal(stores.target.has(A), false, 'target must be deleted at gone.maxStrikes');
@@ -246,9 +252,44 @@ test('a 404 verdict does NOT delete at gone.maxStrikes when the strikes came und
 	// Classification is per-verdict: strikes carry over, so a target already at
 	// gone.maxStrikes strikes from OTHER verdicts is deleted by the next gone verdict.
 	// This pins the arithmetic rather than any per-class strike ledger.
-	seedSource({ strikes: 1, state: 'suppressed' });
+	seedSource({ strikes: 1, state: 'suppressed', sitemapUrl: SITEMAP });
 	await postResult(nonIndexable(404));
 	assert.equal(stores.target.has(A), false, 'strikes are one shared counter; 2nd strike as gone deletes');
+});
+
+// ---- gone on a URL no sitemap lists (the discovered corpus) ----
+
+test('an UNLISTED 404 retires the target on the first verdict', async () => {
+	seedSource();
+	await postResult(nonIndexable(404));
+
+	// No suppressed row, no recheck schedule, no cached pages: a 404 at the origin is itself what
+	// stops discovery re-minting the URL, so the retirement is terminal and costs nothing further.
+	assert.equal(stores.target.has(A), false, 'an unlisted gone verdict deletes rather than suppressing');
+	assert.equal(stores.renderSchedule.has(A), false, 'the URL schedule row must go with it');
+	for (const device of DEVICES) {
+		assert.equal(stores.renderSchedule.has(key(A, device)), false, `${device} schedule must be gone`);
+		assert.equal(stores.prerenderedPage.has(key(A, device)), false, 'cached error page must not keep serving');
+	}
+});
+
+test('an unlisted 410 retires on the first verdict too', async () => {
+	seedSource();
+	await postResult(nonIndexable(410));
+	assert.equal(stores.target.has(A), false);
+});
+
+// The scoping that keeps the unlisted ceiling from looping: these come from pages the origin
+// serves 200 for, so discovery re-mints them on the next bot request.
+test('an unlisted NON-gone verdict still suppresses rather than retiring', async () => {
+	seedSource();
+	await postResult({ ...nonIndexable(200), reason: 'noindex' });
+
+	const target = stores.target.get(A);
+	assert.ok(target, 'a noindex verdict must keep the row that blocks re-discovery');
+	assert.equal(target.state, 'suppressed');
+	assert.equal(target.suppressedReason, 'noindex');
+	assert.equal(target.strikes, 1);
 });
 
 // ---- auth-shaped (401/403) ----
