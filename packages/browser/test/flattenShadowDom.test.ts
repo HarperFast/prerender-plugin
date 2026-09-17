@@ -189,3 +189,65 @@ test('page CSS does not reach flattened shadow content, but still styles slotted
 		replay.close();
 	}
 });
+
+test('nested shadow roots are scoped once, not once per ancestor', async () => {
+	// Three levels of shadow root, each with its own stylesheet. The generated <style> for an inner
+	// host lands INSIDE that host, which sits in its ancestor's shadow tree — so a naive pass
+	// re-serializes it with the ancestor's token too, and because the drop-guard only covers DIRECT
+	// children of the shadow root, the original stays as well. The rules end up in the document
+	// twice, at different prefix depths. Measured on a real review widget: 392 of 1,084 selectors
+	// carried an ancestor chain up to six deep, and fixing it removed 100KB — 48% of the injected CSS.
+	const FIXTURE = `<!doctype html><html><head><title>nested</title></head><body>
+<div id="outer"></div>
+<script>
+  const mk = (host, cls, text) => {
+    const sr = host.attachShadow({ mode: 'open' });
+    const st = document.createElement('style');
+    st.textContent = '.' + cls + ' { color: rgb(1, 2, 3); }';
+    sr.appendChild(st);
+    const d = document.createElement('div');
+    d.className = cls;
+    d.textContent = text;
+    sr.appendChild(d);
+    return d;
+  };
+  const lvl1 = mk(document.getElementById('outer'), 'lvl1', 'one');
+  const h2 = document.createElement('div'); lvl1.appendChild(h2);
+  const lvl2 = mk(h2, 'lvl2', 'two');
+  const h3 = document.createElement('div'); lvl2.appendChild(h3);
+  mk(h3, 'lvl3', 'three');
+</script></body></html>`;
+	const server = http.createServer((_q, s) => {
+		s.setHeader('content-type', 'text/html');
+		s.end(FIXTURE);
+	});
+	await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+	const at = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+	try {
+		const r = await renderOnce({
+			url: at,
+			device: 'desktop',
+			config: { scroll: { enabled: false }, postProcess: { flattenShadowDom: true, stripScripts: true } },
+		});
+		const html = r.html ?? '';
+		const css = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join('');
+		const PREF = /\[data-sh=(?:"|')?(s\d+)(?:"|')?\]/g;
+
+		// Every level's content and styling survived.
+		for (const cls of ['lvl1', 'lvl2', 'lvl3']) {
+			assert.ok(html.includes(cls), `${cls} content must survive flattening`);
+			assert.equal(
+				(css.match(new RegExp('\\.' + cls + '\\s*\\{', 'g')) ?? []).length,
+				1,
+				`${cls} rule emitted exactly once`
+			);
+		}
+		// No selector carries more than one scope token.
+		const selectors = [...css.matchAll(/([^{}]+)\{[^{}]*\}/g)].map((m) => m[1]);
+		const chained = selectors.filter((s) => new Set([...s.matchAll(PREF)].map((m) => m[1])).size > 1);
+		assert.deepEqual(chained, [], 'no selector may carry an ancestor chain of scope tokens');
+		await r.close?.();
+	} finally {
+		server.close();
+	}
+});

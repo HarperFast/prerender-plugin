@@ -1006,6 +1006,15 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 			return css;
 		};
 
+		// `<style>` elements WE generate below. They land inside their host, which itself sits in an
+		// ancestor's shadow tree — so when that ancestor is flattened, its `sr.styleSheets` includes
+		// this already-scoped sheet and prefixes every selector a SECOND time, with the ancestor's
+		// token. Nesting compounds it: measured on a review widget, 392 of 1,084 selectors carried an
+		// ancestor chain up to six deep (`[data-sh="s16"] [data-sh="s15"] … .cls`), and the chain was
+		// duplicated inside each `:where(:not(…))` argument list as well. Correct, because the chain
+		// is a real ancestor path, but pure bulk. Skipping our own sheets leaves each selector with
+		// the one prefix that scopes it.
+		const generated = new WeakSet<Node>();
 		let hostSeq = 0;
 		for (const host of hosts.reverse()) {
 			try {
@@ -1034,6 +1043,9 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				// styling outright would be the worse of the two failures.
 				const captured = new Set<Node>();
 				for (const sheet of sheets) {
+					// Already scoped by an inner pass: leave it exactly as it is, and do NOT mark it
+					// captured — it has to travel into the light DOM with the rest of the subtree.
+					if (sheet.ownerNode && generated.has(sheet.ownerNode)) continue;
 					try {
 						css += serializeRules(sheet.cssRules, hostSel);
 						if (sheet.ownerNode) captured.add(sheet.ownerNode);
@@ -1099,6 +1111,7 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				const style = document.createElement('style');
 				style.textContent = reset + css;
 				host.appendChild(style);
+				generated.add(style);
 				for (const node of [...sr.childNodes]) {
 					if (captured.has(node)) continue; // its rules are already in the scoped block
 					host.appendChild(node);
