@@ -187,3 +187,79 @@ test('a row with no usable timestamp reads as not running, not as beating at the
 	assert.equal(runState.isRunning({ running: true, heartbeatAt: null, startedAt: null }), false);
 	assert.equal(runState.isRunning({ running: true, heartbeatAt: 'not a date' }), false);
 });
+
+// ---- review follow-ups: clock drift and floating rejections ----
+
+test('a backward clock step does not suppress the heartbeat', async () => {
+	// An NTP correction makes `now - last` negative. A bare `elapsed < everyMs` would then skip
+	// every beat until the wall clock caught back up to `last` — and on a claim whose liveness IS
+	// the heartbeat, a silent gap reads as an abandoned run and hands the sweep to another worker.
+	const beats = [];
+	let clock = 1_000_000;
+	const realNow = Date.now;
+	Date.now = () => clock;
+	try {
+		const beat = runState.makeHeartbeat('sweep-drift', 1000);
+		beat('first'); // last = 1_000_000
+		clock = 1_000_500;
+		beat('too soon'); // inside the interval: suppressed
+		clock = 900_000; // the clock steps BACKWARD
+		beat('after drift');
+		await new Promise((resolve) => setImmediate(resolve));
+		const row = await runState.readRunState('sweep-drift');
+		beats.push(row?.progress);
+	} finally {
+		Date.now = realNow;
+	}
+	assert.equal(beats[0], 'after drift', 'the beat after a backward step must go through');
+});
+
+test('a backward clock step does not suppress the cancel poll', async () => {
+	// This poller is how a running bulk DELETE learns it was told to stop. With a bare
+	// `elapsed >= everyMs`, a backward clock step makes elapsed negative and suppresses polling for
+	// as long as the drift lasts — leaving `{ action: 'stop' }` unobserved on a destructive path.
+	await runState.claimRun('purge-drift');
+	let clock = 1_000_000;
+	const realNow = Date.now;
+	Date.now = () => clock;
+	try {
+		const poll = runState.makeCancelPoller('purge-drift', 1000);
+		assert.equal(poll(), false, 'nothing cancelled yet');
+		await new Promise((r) => setImmediate(r));
+
+		Date.now = realNow;
+		await runState.requestCancel('purge-drift');
+		Date.now = () => clock;
+
+		clock = 900_000; // the clock steps BACKWARD, well inside the 1000ms interval
+		poll(); // must still kick a refresh
+		await new Promise((r) => setImmediate(r));
+		assert.equal(poll(), true, 'the cancel must still be observed after a backward clock step');
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test('a failing cancel poll is swallowed, not left as an unhandled rejection', async () => {
+	// The promise is deliberately floating so the caller's hot loop never awaits it, which means an
+	// unhandled rejection would reach Node's default handler and take the worker down.
+	const errors = [];
+	const priorLogger = globalThis.logger;
+	globalThis.logger = { ...priorLogger, error: (m) => errors.push(String(m)) };
+	const rejections = [];
+	const onRejection = (e) => rejections.push(e);
+	process.on('unhandledRejection', onRejection);
+	try {
+		const broken = runState.makeCancelPoller('missing-store-run', 0);
+		globalThis.databases.coordination.SharedBuffer.get = async () => {
+			throw new Error('store unavailable');
+		};
+		broken();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual(rejections, [], 'no unhandled rejection may escape the poller');
+		assert.equal(broken(), false, 'a poller that cannot read reports "not cancelled"');
+	} finally {
+		process.off('unhandledRejection', onRejection);
+		globalThis.logger = priorLogger;
+	}
+});

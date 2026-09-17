@@ -158,7 +158,13 @@ export const makeHeartbeat = (key, everyMs = DEFAULT_STALE_MS / 4) => {
 	let last = 0;
 	return (progress) => {
 		const now = Date.now();
-		if (now - last < everyMs) return;
+		// `elapsed >= 0` is not redundant with the interval check: a BACKWARD clock step (an NTP
+		// correction) makes `elapsed` negative, and a bare `elapsed < everyMs` then suppresses every
+		// beat until the wall clock catches back up to `last`. On a claim whose liveness IS the
+		// heartbeat, that reads as an abandoned run and another worker takes the sweep over. Treating
+		// a negative elapsed as "the turn is due" reclaims it on the very next tick instead.
+		const elapsed = now - last;
+		if (elapsed >= 0 && elapsed < everyMs) return;
 		last = now;
 		void heartbeatRun(key, progress);
 	};
@@ -200,12 +206,25 @@ export const makeCancelPoller = (key, everyMs = 2000) => {
 	let polling = false;
 	return () => {
 		const now = Date.now();
-		if (!canceled && !polling && now - lastPoll >= everyMs) {
+		// Same backward-clock guard as `makeHeartbeat`, and it matters more here: this poller is how
+		// a running DELETE pass learns it was told to stop, so a clock step that suppressed polling
+		// would leave `{ action: 'stop' }` unobserved on a destructive path for as long as the drift
+		// lasted. A negative elapsed means poll now.
+		const elapsed = now - lastPoll;
+		if (!canceled && !polling && (elapsed < 0 || elapsed >= everyMs)) {
 			lastPoll = now;
 			polling = true;
 			void isCancelRequested(key)
 				.then((v) => {
 					if (v) canceled = true;
+				})
+				.catch((e) => {
+					// A store read can fail, and this promise is deliberately floating so the caller's
+					// hot loop never awaits it — which means an unhandled rejection here would reach
+					// Node's default handler and take the worker down. Swallow it loudly: the next tick
+					// polls again, and a poller that cannot read simply reports "not cancelled", which
+					// is the same answer it gives before the first successful poll.
+					globalThis.logger?.error?.(`[prerender] run-state cancel poll failed for ${key}: ${e?.message ?? String(e)}`);
 				})
 				.finally(() => {
 					polling = false;
