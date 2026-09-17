@@ -2,13 +2,17 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
-import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
+import { anyRouteDeparts, classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
 import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
+import { decideDeparture, DepartureAction } from '../util/sitemapDeparture.js';
+import { cacheKeysOf } from './Target.js';
+import { writeSchedule } from '../util/renderSchedule.js';
+import { resolveEffectiveInterval } from '../util/routeClass.js';
 
 /**
  * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
@@ -35,6 +39,10 @@ function reportFiltered(sitemapUrl, filtered, totalEntries) {
 	}
 }
 
+const {
+	page_cache: { PrerenderedPage },
+} = databases;
+
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
@@ -49,6 +57,10 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		const run = createRefreshRun({
 			removedSampleCap: config.sitemap.removedSampleCap,
 			failedCap: config.sitemap.failedCap,
+			// Zero unless the departure check is on AND some route opts in, which keeps the candidate
+			// list empty — and `addRemoved` allocation-free — for every deployment that has not asked
+			// for this. `anyRouteDeparts` is resolved once per walk rather than per departed URL.
+			departureCap: config.sitemap.departure.enabled && anyRouteDeparts() ? config.sitemap.departure.maxCandidates : 0,
 		});
 		const visited = new Set();
 		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
@@ -92,6 +104,25 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			} catch (e) {
 				logger.warn(`[prerender] Sitemap progress callback failed: ${describeError(e)}`);
 			}
+		}
+
+		// AFTER every child, so a URL that merely shifted to a later child of a paginated index has
+		// had its chance to be re-attached. See util/sitemapDeparture.js.
+		//
+		// Guarded: the departure check is an addition to the walk, not the walk. A failure here must
+		// not turn a refresh that correctly ingested a million URLs into a failed run — the walk's
+		// own result is already committed by this point, and the outcome tally reports what happened.
+		try {
+			await processDepartures(run);
+		} catch (e) {
+			logger.error(`[prerender] Departure check for ${rootSitemapUrl} failed: ${describeError(e)}`);
+			run.countDeparture('failed');
+		}
+
+		try {
+			await onProgress?.(run.snapshot());
+		} catch (e) {
+			logger.warn(`[prerender] Sitemap progress callback failed: ${describeError(e)}`);
 		}
 
 		return run.snapshot();
@@ -336,6 +367,9 @@ const progressFields = (snapshot) => ({
 	deferred: snapshot.deferred,
 	removed: snapshot.removed,
 	failed: snapshot.failed,
+	// The departure tally rides the progress row too, so a dry run is readable from
+	// `GET /sitemap_refresh/<root>` without waiting for the walk to return.
+	departures: snapshot.departures,
 });
 
 /**
@@ -641,6 +675,109 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 			break;
 	}
 	return Math.max(ttl, minTtl);
+}
+
+/**
+ * The post-walk departure check: decide, and act on, the URLs this walk unlinked.
+ *
+ * Runs once per walk, after every child, because a URL that shifted to a LATER child of a
+ * paginated index is pruned before the child that now claims it is reached — mid-walk it is
+ * indistinguishable from one that genuinely left. `decideDeparture` re-reads each candidate and
+ * drops anything that picked up an attribution in the meantime; see util/sitemapDeparture.js for
+ * why that guard is the load-bearing part.
+ *
+ * Every candidate is decided and counted, including the ones nothing happens to, so a dry run
+ * answers the question a deployment actually has before enabling this: how many URLs a real walk
+ * would touch, and how many of the departures are shear rather than departure.
+ */
+async function processDepartures(run) {
+	const urls = run.departureCandidates();
+	if (!urls.length) return;
+
+	const { dryRun, maxActions } = config.sitemap.departure;
+	let acted = 0;
+
+	await applyInBatches({
+		items: urls,
+		apply: async (url) => {
+			const target = await Target.get({
+				id: url,
+				// `sitemapUrl` is the shear guard, `state` keeps suppressed targets out, and the two
+				// cadence fields are what `resolveEffectiveInterval` needs to file a rung-correct row.
+				select: ['url', 'sitemapUrl', 'state', 'renderInterval', 'demandInterval'],
+			});
+
+			const { action, reason } = decideDeparture({ url, target });
+			if (action === DepartureAction.NONE) {
+				run.countDeparture(reason);
+				return;
+			}
+
+			// Check and increment in ONE synchronous block. `applyInBatches` runs a batch's items in
+			// parallel, so a check that awaited anything before incrementing would let a whole batch
+			// through a cap of one.
+			if (acted >= maxActions) {
+				run.countDeparture('capped');
+				return;
+			}
+			acted++;
+
+			if (dryRun) {
+				run.countDeparture(`would-${action}`);
+				return;
+			}
+
+			// HARD-expired, past the stale-while-revalidate window rather than to `now`. A plain
+			// `Date.now()` expiry leaves the page 'swr' (`util/pageFreshness.js`), i.e. still SERVING
+			// for another `page.swrTtl` — and the swr window exists to smooth over a late re-render of
+			// content presumed still right, which is exactly what a departed product page is not.
+			// This matches `changeProbe.triggerRevalidate`, which backdates for the same reason;
+			// `Target.revalidate` keeps the plain expiry deliberately, because an operator asking for
+			// a re-render is not asserting the content is wrong.
+			const hardExpiredAt = Date.now() - config.page.swrTtl;
+			await Promise.all(
+				cacheKeysOf(url).map(async (cacheKey) => {
+					const page = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+					if (page) await PrerenderedPage.patch(cacheKey, { expiresAt: hardExpiredAt });
+				})
+			);
+
+			if (action === DepartureAction.RENDER) {
+				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass. Rows are
+				// residency-routed, and a minute more than `queue.claimFloor.guard` old lands below the
+				// owner's floor and is never claimed again. This is the Target.revalidate lesson.
+				await writeSchedule(url, {
+					nextRenderTime: currentMinuteMs(),
+					// Derived, never a literal `false`, even though `decideDeparture` has already proved
+					// this target has no attribution and so this can only evaluate false. The literal is
+					// what `test/queueFunnel.test.js` forbids outright, and for a good reason: the
+					// derivation stays correct if this guard ever moves, where a literal would silently
+					// un-flag a sitemap-listed URL the day someone loosened the check above it.
+					fromSitemap: !!target.sitemapUrl,
+					effectiveInterval: resolveEffectiveInterval(url, target),
+				});
+			}
+			run.countDeparture(action);
+		},
+	});
+
+	const { considered, capped, outcomes } = run.snapshot().departures;
+	const summary = Object.entries(outcomes)
+		.map(([name, count]) => `${name} ${count}`)
+		.join(', ');
+	logger.info(
+		`[prerender] Departure check: ${considered} candidates${capped ? ' (CAPPED — some departed URLs were never checked)' : ''}` +
+			`${dryRun ? ', DRY RUN' : ''} — ${summary || 'nothing to do'}`
+	);
+
+	// Guarded like the walk's own gauges: a counter must never cost the run its result.
+	try {
+		for (const [name, count] of Object.entries(outcomes)) {
+			metrics.sitemapRun(count, `departure_${name.replace(/-/g, '_')}`);
+		}
+	} catch (e) {
+		logger.warn(`[prerender] sitemap departure gauges not recorded: ${describeError(e)}`);
+	}
 }
 
 async function fetchLatestSitemap(url) {

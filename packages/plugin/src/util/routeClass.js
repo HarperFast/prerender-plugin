@@ -41,6 +41,22 @@ export const UNCLASSIFIED = 'unclassified';
 const VALID_MATCH = new Set(['exact', 'prefix', 'contains']);
 const VALID_MODE = new Set([PRERENDER, PASSTHROUGH]);
 
+/**
+ * What a route does about URLs that LEAVE the sitemap that listed them — see
+ * util/sitemapDeparture.js for the whole argument. The enum lives here because this is the module
+ * that validates route fields, and putting it here is what keeps the validator and the consumer
+ * from disagreeing about the spelling.
+ */
+export const DepartureAction = {
+	/** Unlink and nothing else: the behaviour every route had before this existed. */
+	NONE: 'none',
+	/** Hard-expire the cached pages so they stop serving, and file the URL to render now. */
+	RENDER: 'render',
+	/** Hard-expire the cached pages only; the URL re-renders on its own cadence. */
+	EXPIRE: 'expire',
+};
+const VALID_DEPARTURE = new Set(Object.values(DepartureAction));
+
 // The allowlist every non-prerender class resolves to: keep every query param, so a proxied
 // request reaches the origin with the query the visitor actually sent. (`['*']` still
 // canonicalizes — params are sorted, the fragment and a trailing slash are dropped — it just
@@ -141,7 +157,37 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
-	return { match: raw.match, path: raw.path, mode, queryParams, renderInterval, discoverTargets, demandFloor, source };
+	// Optional per-route sitemap-departure action. Same drop-the-FIELD rule as the three above: a
+	// typo here must not change how the path is SERVED. Normalizing to `none` rather than leaving
+	// the raw string is what lets every consumer read the field without re-validating it.
+	let departureAction = DepartureAction.NONE;
+	if (raw.departureAction !== undefined && raw.departureAction !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring departureAction on passthrough route "${raw.match} ${raw.path}" — a passthrough route ` +
+					`owns no cached page to expire and no schedule to advance`
+			);
+		} else if (VALID_DEPARTURE.has(raw.departureAction)) {
+			departureAction = raw.departureAction;
+		} else {
+			warn(
+				`ignoring departureAction on route "${raw.match} ${raw.path}" — expected one of ` +
+					`${[...VALID_DEPARTURE].join(', ')}, got ${String(raw.departureAction)}`
+			);
+		}
+	}
+
+	return {
+		match: raw.match,
+		path: raw.path,
+		mode,
+		queryParams,
+		renderInterval,
+		discoverTargets,
+		demandFloor,
+		departureAction,
+		source,
+	};
 };
 
 /**
@@ -256,6 +302,19 @@ export const matchRoute = (path) => {
 		if (hit) return entry;
 	}
 	return null;
+};
+
+/**
+ * Does any COMPILED route opt into the sitemap-departure check?
+ *
+ * Reads the compiled list rather than the raw config, so a route whose `departureAction` was
+ * dropped as invalid correctly reads as opted out — the same answer the per-URL lookup gives.
+ * Resolved once per walk to keep the candidate list (and its per-URL allocation) at zero for
+ * deployments that have not asked for this.
+ */
+export const anyRouteDeparts = () => {
+	for (const entry of getRoutes()) if (entry.departureAction !== DepartureAction.NONE) return true;
+	return false;
 };
 
 /** How many prerender routes are configured. Config validation uses this — see below. */
