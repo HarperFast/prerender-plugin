@@ -647,13 +647,17 @@ const renderer: Renderer = async (page, job) => {
 	if (config.waitFor?.length) {
 		await applyWaitFor();
 	}
+	if (config.waitFor?.length) await scrollToTop();
 	// The LAST word on whether the page has stopped changing, and the only plateau check that runs
 	// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
 	// still filling — measured: reviews complete and correct, 107 product links instead of 547,
 	// because the earlier `domStable()` plateaued before the recommendation rails arrived and the
 	// review gate then let the snapshot go. See `navigation.finalDomStable`.
+	//
+	// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
+	// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
+	// causes. This way the last thing checked is the state that gets serialized.
 	if (config.navigation.finalDomStable) await domStable();
-	if (config.waitFor?.length) await scrollToTop();
 	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {
