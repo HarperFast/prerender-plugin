@@ -640,8 +640,12 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	// rather than an error.
 	for (const field of ['stepMs', 'topSettleMs'] as const) {
 		const v = config.scroll[field];
-		if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
-			throw new Error(`prerender config: scroll.${field} must be a non-negative number`);
+		// Capped at the timer ceiling for the same reason `prefetch.timeoutMs` is: past it,
+		// `setTimeout` fires after 1ms instead of late, so an over-large dwell silently becomes NO
+		// dwell — a fast render with missing content, which is the failure mode this whole config
+		// surface is trying to make impossible to reach by accident.
+		if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > MAX_TIMER_MS) {
+			throw new Error(`prerender config: scroll.${field} must be a non-negative number of ms, at most ${MAX_TIMER_MS}`);
 		}
 	}
 	if (!Number.isInteger(config.scroll.settleStablePasses) || config.scroll.settleStablePasses < 1) {
@@ -761,6 +765,18 @@ const validateOverrides = (config: PrerenderConfig): void => {
 		if (override.devices !== undefined) {
 			if (!Array.isArray(override.devices) || override.devices.some((d) => typeof d !== 'string' || d.trim() === ''))
 				throw new Error(`prerender config: overrides[${i}].devices must be an array of non-empty device names`);
+			// A device name that is not a real profile can never equal a job's deviceType, so the
+			// override silently never applies — the same class of failure as a scope nothing can
+			// satisfy, and a plain typo is all it takes.
+			const known = Object.keys(config.devices);
+			for (const d of override.devices) {
+				if (!known.includes(d)) {
+					throw new Error(
+						`prerender config: overrides[${i}].devices names unknown device "${d}", so the override would ` +
+							`never apply (known devices: ${known.join(', ')})`
+					);
+				}
+			}
 		}
 		if (override.pathPattern !== undefined) {
 			if (typeof override.pathPattern !== 'string' || override.pathPattern.trim() === '') {

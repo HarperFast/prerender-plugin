@@ -140,6 +140,20 @@ test('the blocks that are decided above a render cannot be scoped', () => {
 	);
 });
 
+test('a device name that is not a real profile is rejected, not silently non-matching', () => {
+	assert.throws(
+		() => withOverrides([{ name: 'typo', devices: ['moblile'], config: {} }]),
+		/names unknown device "moblile".*never apply/s
+	);
+	assert.doesNotThrow(() => withOverrides([{ name: 'ok', devices: ['mobile'], config: {} }]));
+});
+
+test('a settle dwell past the timer ceiling is rejected — it would become NO dwell', () => {
+	// setTimeout fires after 1ms past 2^31-1, so the dwell silently disappears.
+	assert.throws(() => mergeConfig({ scroll: { topSettleMs: 2147483648 } }), /at most 2147483647/);
+	assert.throws(() => mergeConfig({ scroll: { stepMs: 2147483648 } }), /at most 2147483647/);
+});
+
 test('devices and pathPattern shapes are validated', () => {
 	assert.throws(() => withOverrides([{ name: 'n', devices: [''], config: {} }]), /devices must be an array/);
 	assert.throws(
