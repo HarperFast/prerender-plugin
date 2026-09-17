@@ -1,7 +1,6 @@
 import type { BrowserContext, Page } from 'puppeteer';
 import type ManagedBrowser from './ManagedBrowser.js';
 import logger from './util/Logger.js';
-import { noop } from './util/noop.js';
 
 /**
  * ONE BROWSER CONTEXT FOR A JOB'S DEVICE VARIANTS — and the wipe that makes it safe.
@@ -97,11 +96,13 @@ export const resetForNextVariant = async (
 		logger.warn({ err, url }, 'could not clear cookies between variants — rendering in a fresh context instead');
 		return false;
 	}
-	const cdp = await page.createCDPSession().catch((err: unknown) => {
+	let cdp;
+	try {
+		cdp = await page.createCDPSession();
+	} catch (err) {
 		logger.warn({ err, url }, 'could not open a CDP session to clear storage between variants');
-		return null;
-	});
-	if (!cdp) return false;
+		return false;
+	}
 	try {
 		await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: CLEARED_STORAGE_TYPES });
 		return true;
@@ -112,7 +113,13 @@ export const resetForNextVariant = async (
 		);
 		return false;
 	} finally {
-		await cdp.detach().catch(noop);
+		try {
+			await cdp.detach();
+		} catch {
+			// The session dies with its page, and the page is closed right after this either way — a
+			// detach that fails has nothing left to leak. Swallowed here so it cannot mask the verdict
+			// this function returns, which is what decides whether the variant renders in this context.
+		}
 	}
 };
 
