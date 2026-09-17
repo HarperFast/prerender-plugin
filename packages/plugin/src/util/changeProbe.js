@@ -54,6 +54,7 @@ import { epochMsOf, currentMinuteMs, getNextTimeOfDay, DAY, MINUTE, SECOND } fro
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { writeSchedule } from './renderSchedule.js';
+import { createInlineTrigger, createTriggerQueue, SUBMIT_FULL } from './triggerQueue.js';
 import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
@@ -140,8 +141,9 @@ const newStats = () => ({
 	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
 	unchanged: 0,
 	changed: 0,
-	triggered: 0, // changes that scheduled a re-render
-	deferred: 0, // changes past maxTriggersPerSweep — signature kept stale so the next pass retries
+	queued: 0, // changes handed to the trigger queue (accepted, not necessarily settled yet)
+	triggered: 0, // changes that scheduled a re-render — merged from the queue after it drains
+	deferred: 0, // changes past maxTriggersPerSweep, or refused by a full queue — signature kept stale so the next pass retries
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
@@ -489,7 +491,11 @@ export const runProbePass = async ({
 	probe,
 	read,
 	write,
-	trigger,
+	// Hands one detected change to whatever performs the re-render — the paced queue for a sweep,
+	// the immediate shape for the canary (util/triggerQueue.js). It RETURNS rather than awaiting
+	// the trigger: the sweep must not pay trigger latency inside the row handler, because that is
+	// what made pass duration a function of the change rate.
+	submitTrigger,
 	// Injected like `write`/`trigger` so a pass can be exercised without Harper, and DEFAULTED INERT:
 	// a caller that does not wire verification gets exactly the pre-feature behaviour. `isArmed` is
 	// resolved once per rule per pass (see below), never per row.
@@ -697,27 +703,26 @@ export const runProbePass = async ({
 			await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
 			return;
 		}
-		if (stats.triggered >= maxTriggers) {
+		if (stats.queued >= maxTriggers) {
 			// Budget spent: leave the signature STALE so the next pass re-detects and retries.
 			// Bounds how much queue injection one pass can do (a mass change is the canary's job).
+			// Counted on ACCEPTANCE, not completion: the budget has to be decided synchronously here
+			// or a burst would race past it while earlier triggers were still settling.
 			stats.deferred++;
 			return;
 		}
-		try {
-			await trigger(row);
-			stats.triggered++;
-			// The page's claim is CLEARED on EVERY acted trip, not just a page disagreement: the
-			// trip hard-expired the page, so whatever the claim described is no longer served — and
-			// a preserved claim would re-detect against the NEW baseline on the next pass (a price
-			// drift's old claim disagrees with the new price by construction) and re-spend the
-			// trigger budget on a page already expired and already filed. The next render writes a
-			// fresh claim; until then there is nothing to compare, which is the correct "I don't
-			// know" state. Folded into this write so it costs no second round trip.
-			await write(row.url, observed, { rowExists: stored !== null, clearClaim: true, fingerprint: rule.fingerprint });
-		} catch (e) {
-			stats.errors++;
-			globalThis.logger?.error?.(e, `[prerender] change-probe trigger failed for ${row.url}`);
+		// Submit, never await the trigger itself. A refusal means the queue is at its depth limit,
+		// which is the same statement as the budget above — leave the signature stale and let the
+		// next pass retry. The BASELINE WRITE MOVED WITH THE TRIGGER, into the queue, because it
+		// must happen only after the trigger succeeds; that ordering is the whole retry story.
+		if (
+			(await submitTrigger({ row, observed, rowExists: stored !== null, fingerprint: rule.fingerprint })) ===
+			SUBMIT_FULL
+		) {
+			stats.deferred++;
+			return;
 		}
+		stats.queued++;
 	};
 
 	// Pacing: batches of `concurrency`, each batch held to the window `ratePerSecond` implies for
@@ -865,6 +870,10 @@ const emitStats = (stats, kind) => {
 		metrics.changeProbe(stats.throttled, 'throttled');
 		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
 		metrics.changeProbe(stats.behindBatches, 'cycle_behind');
+		// The trigger queue's high-water depth. Steadily at `trigger.maxPending` means the drain
+		// rate is behind the detection rate and changes are being deferred for want of queue, not
+		// for want of budget — the two look identical in `deferred` alone.
+		if (Number.isFinite(stats.triggerQueueDepth)) metrics.changeProbe(stats.triggerQueueDepth, 'trigger_queue_depth');
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -1060,6 +1069,17 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		let unreadable = 0;
 		let yields = 0;
+		// Triggers drain BESIDE the walk, not inside it. `submit` returns immediately, so the pass
+		// runs at its probe-rate floor whatever the change rate — see util/triggerQueue.js for the
+		// feedback loop this breaks.
+		const triggers = createTriggerQueue({
+			trigger: triggerRevalidate,
+			write: writeSignature,
+			maxPending: config.changeProbe.trigger.maxPending,
+			ratePerSecond: config.changeProbe.trigger.ratePerSecond,
+			concurrency: config.changeProbe.trigger.concurrency,
+			onError: (e, item) => logger.error(e, `[prerender] change-probe trigger failed for ${item.row.url}`),
+		});
 		const stats = await runProbePass({
 			rows: walkTargets(config.changeProbe.chunkSize, () => {
 				unreadable++;
@@ -1071,7 +1091,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			probe: probeOnce,
 			read: readSignature,
 			write: writeSignature,
-			trigger: triggerRevalidate,
+			submitTrigger: triggers.submit,
 			verify: writeVerification,
 			isArmed: verificationArmedFor,
 			...limits,
@@ -1092,6 +1112,14 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 		});
+		// A cancelled pass abandons what is still queued: those rows never had their baseline
+		// written, so the next pass re-detects them. Otherwise wait the queue out — the pass is not
+		// finished while re-renders it decided on are still unfiled, and `triggered` would under-report.
+		if (stats.aborted) triggers.stop();
+		await triggers.drain();
+		stats.triggered = triggers.stats.triggered;
+		stats.errors = triggers.stats.errors;
+		stats.triggerQueueDepth = triggers.stats.maxDepth;
 		stats.unreadable = unreadable;
 		// An interrupted pass keeps the OLD cohorts — a partial walk's sample covers only the key
 		// range it reached, and the chained reseed rebuilds them properly.
@@ -1286,6 +1314,11 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				perRule.push({ rule: rule.label, cohort: 0, skipped: 'empty cohort' });
 				continue;
 			}
+			const canaryTriggers = createInlineTrigger({
+				trigger: triggerRevalidate,
+				write: writeSignature,
+				onError: (e, item) => logger.error(e, `[prerender] change-probe trigger failed for ${item.row.url}`),
+			});
 			const stats = await runProbePass({
 				rows: readCohortRows(urls),
 				rules: [rule],
@@ -1295,7 +1328,9 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				probe: probeOnce,
 				read: readSignature,
 				write: writeSignature,
-				trigger: triggerRevalidate,
+				// IMMEDIATE, not queued: the cohort is a few hundred URLs and the canary's whole value
+				// is being fast, so there is nothing for a paced queue to spread.
+				submitTrigger: canaryTriggers.submit,
 				...limits,
 				// NEVER skips on baseline age. The cohort is small and deliberately probed on a
 				// cadence far tighter than `reprobeAfter` — freshness-skipping here would silence
@@ -1303,6 +1338,9 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				reprobeAfter: 0,
 				isCanceled: () => !config.changeProbe.enabled,
 			});
+			await canaryTriggers.drain();
+			stats.triggered = canaryTriggers.stats.triggered;
+			stats.errors = canaryTriggers.stats.errors;
 			emitStats(stats, 'canary');
 			const verdict = canaryVerdict(stats, { threshold: canary.threshold, minSample: canary.minSample });
 			let action = null;

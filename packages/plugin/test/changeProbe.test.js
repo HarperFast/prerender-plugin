@@ -122,6 +122,16 @@ const runPass = async ({
 	const written = [];
 	const writeOptions = [];
 	const triggered = [];
+	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const triggers = createInlineTrigger({
+		trigger: async (row) => {
+			triggered.push(row.url);
+		},
+		write: async (url, signature, options) => {
+			written.push({ url, signature });
+			writeOptions.push({ url, ...options });
+		},
+	});
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
 		rules,
@@ -145,7 +155,10 @@ const runPass = async ({
 			written.push({ url, signature });
 			writeOptions.push({ url, ...options });
 		},
-		trigger: async (target) => triggered.push(target.url),
+		// The REAL inline shape, not a stub: the trigger-then-write ordering now lives in
+		// util/triggerQueue.js, and a stub re-implementing it here would keep passing while the
+		// shipped path regressed. This is also exactly how the canary wires itself.
+		submitTrigger: triggers.submit,
 		dryRun,
 		maxTriggers,
 		concurrency: 2,
@@ -153,6 +166,10 @@ const runPass = async ({
 		pause: async () => {},
 		...overrides,
 	});
+	// What the sweep and the canary both do once the pass returns.
+	await triggers.drain();
+	stats.triggered = triggers.stats.triggered;
+	stats.errors = triggers.stats.errors;
 	return { stats, written, writeOptions, triggered, rules };
 };
 
@@ -284,9 +301,20 @@ test('past the trigger budget a change DEFERS: signature left stale so the next 
 	assert.deepEqual(written, [{ url: URL_A, signature: '[2]' }]);
 });
 
-test('a failed trigger write keeps the signature stale too', async () => {
+test('a failed trigger keeps the signature stale too', async () => {
+	// The property is unchanged by the move to a submitted trigger; only the seam moved. Driven
+	// through the REAL inline shape rather than a stub, because the ordering under test — baseline
+	// written only after the trigger succeeds — now lives in util/triggerQueue.js, and a stub that
+	// re-implemented it would pass while the shipped path regressed.
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
 	const written = [];
+	const triggers = createInlineTrigger({
+		trigger: async () => {
+			throw new Error('write refused');
+		},
+		write: async (url, signature) => written.push({ url, signature }),
+	});
 	const stats = await changeProbe.runProbePass({
 		rows: stream([row(URL_A)]),
 		rules: compileProbeRules(RULES_RAW),
@@ -295,18 +323,18 @@ test('a failed trigger write keeps the signature stale too', async () => {
 		probe: async () => '[2]',
 		read: async () => ({ signature: '[1]', probedAt: NaN }),
 		write: async (url, signature) => written.push({ url, signature }),
-		trigger: async () => {
-			throw new Error('write refused');
-		},
+		submitTrigger: triggers.submit,
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
 	});
-	assert.equal(stats.errors, 1);
-	assert.equal(stats.triggered, 0);
-	assert.deepEqual(written, []);
+	await triggers.drain();
+	assert.equal(triggers.stats.errors, 1);
+	assert.equal(triggers.stats.triggered, 0);
+	assert.equal(stats.queued, 1, 'the change was accepted for triggering');
+	assert.deepEqual(written, [], 'no baseline may be written when the trigger threw');
 });
 
 test('pacing sleeps out the remainder of each batch window', async () => {
@@ -447,7 +475,7 @@ test('freshness skip: a baseline younger than reprobeAfter is not re-probed', as
 		},
 		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - 60_000 : T - 20 * HOUR }),
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -476,7 +504,7 @@ test('freshness skip: an unparseable or missing probedAt probes rather than skip
 		// A row with no timestamp, and one that never had a baseline at all.
 		read: async (url) => (url === URL_A ? { signature: '[1]', probedAt: NaN } : null),
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -505,7 +533,7 @@ test('origin backoff: a pushback response stretches the pacing window, a clean b
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -533,7 +561,7 @@ test('origin backoff: an explicit Retry-After outranks the computed window', asy
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -559,7 +587,7 @@ test('origin backoff: a fully refusing origin ends the pass instead of crawling'
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -589,7 +617,7 @@ test('origin backoff: a rule/product failure is NOT distress and must not thrott
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -622,7 +650,7 @@ test('freshness skip: a BigInt probedAt is coerced, not thrown on', async () => 
 		},
 		read: async () => ({ signature: '[1]', probedAt: Number(BigInt(T - 60_000)) }),
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -651,7 +679,7 @@ test('origin backoff: the pacing wait can never exceed setTimeout’s 32-bit cap
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 10,
 		concurrency: 1,
@@ -677,6 +705,13 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 		}
 		static async patch(id, fields) {
 			patched.push({ id, ...fields });
+		}
+	};
+	// Capture the schedule write too: the trigger must file ONE row, keyed by the URL.
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
 		}
 	};
 	const before = Date.now();
@@ -734,6 +769,17 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
 	const written = [];
 	const triggered = [];
+	const write = async (url, signature, opts = {}) =>
+		written.push({ url, signature, rowExists: opts.rowExists === true, clearClaim: opts.clearClaim === true });
+	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	// The real inline shape — `clearClaim` is set by the trigger path itself, and these tests are
+	// precisely the ones asserting on it.
+	const triggers = createInlineTrigger({
+		trigger: async (row) => {
+			triggered.push(row.url);
+		},
+		write,
+	});
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
 		rules: compileProbeRules(PAGECHECK_RULES),
@@ -741,9 +787,8 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		hostname: 'node-a',
 		probe: async (rule, url) => answers[url] ?? null,
 		read: async (url) => stored[url] ?? null,
-		write: async (url, signature, opts = {}) =>
-			written.push({ url, signature, rowExists: opts.rowExists === true, clearClaim: opts.clearClaim === true }),
-		trigger: async (target) => triggered.push(target.url),
+		write,
+		submitTrigger: triggers.submit,
 		dryRun: false,
 		maxTriggers: 100,
 		concurrency: 1,
@@ -751,6 +796,9 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		pause: async () => {},
 		...overrides,
 	});
+	await triggers.drain();
+	stats.triggered = triggers.stats.triggered;
+	stats.errors = triggers.stats.errors;
 	return { stats, written, triggered };
 };
 
@@ -1053,7 +1101,7 @@ const runPaced = async ({ rows, answers = {}, clockStep = 0, ...overrides }) => 
 		},
 		read: async () => null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: true,
 		maxTriggers: 1000,
 		concurrency: 2,
@@ -1538,7 +1586,7 @@ const runVerifyPass = async ({ rows, answers, stored = {}, armed = true, ...over
 		probe: async (rule, url) => answers[url] ?? null,
 		read: async (url) => stored[url] ?? null,
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		verify: async (url, basisAt) => verified.push({ url, basisAt }),
 		isArmed: async (scope) => {
 			armedCalls.push(scope);
@@ -1661,7 +1709,7 @@ test('with no verify/isArmed wired, the pass behaves exactly as before', async (
 		probe: async () => AGREE_SIG,
 		read: async () => ({ signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT }),
 		write: async () => {},
-		trigger: async () => {},
+		submitTrigger: async () => 'queued',
 		dryRun: false,
 		maxTriggers: 100,
 		concurrency: 1,
