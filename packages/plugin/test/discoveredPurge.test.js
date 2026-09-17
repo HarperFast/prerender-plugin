@@ -22,6 +22,22 @@ const sharedBufferStub = {
 	unlock() {},
 };
 
+// `coordination.SharedBuffer` is a REAL TABLE in production, not just a lock store: the sweeps'
+// run-state row lives in it (`util/runState.js`), and `primaryStore` is only what the claim's
+// cross-worker lock uses. A fake carrying just `primaryStore` makes every claim refuse — the
+// publish fails, and a claim that cannot be published is refused by design — so the row has to be
+// modelled here for the sweeps to start at all.
+const runStateRows = new Map();
+const coordinationTable = {
+	primaryStore: sharedBufferStub,
+	async get(key) {
+		return runStateRows.get(key) ?? null;
+	},
+	async put(key, value) {
+		runStateRows.set(key, value);
+	},
+};
+
 // resources/Target.js extends the raw table class at module scope, so it must be a class.
 // `search` returns an ITERABLE, not a promise of one — Harper's does, and `for await` over a
 // promise throws.
@@ -35,14 +51,14 @@ class FakeTable {
 	}
 }
 
-let purge, applyOptions;
+let purge, applyOptions, runState;
 
 before(async () => {
 	globalThis.server = { hostname: 'node-a', workerIndex: 0, nodes: [], config: { http: {} } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {}, notify() {} };
 	globalThis.Resource = class {};
 	globalThis.databases = {
-		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		coordination: { SharedBuffer: coordinationTable },
 		probe_state: { ProbeState: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },
@@ -50,6 +66,7 @@ before(async () => {
 	};
 	({ applyOptions } = await import('../src/config.js'));
 	purge = await import('../src/util/discoveredPurge.js');
+	runState = await import('../src/util/runState.js');
 });
 
 beforeEach(() => {
@@ -225,15 +242,24 @@ test('startDiscoveredPurge: a detached run completes, reports, and refuses to ov
 	applyOptions({
 		ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/catalog/', discoverTargets: false }] },
 	});
-	assert.throws(
+	// Starting is async now (it claims the node's run-state row), so a refusal REJECTS rather than
+	// throwing synchronously. It still has to come before the claim — a refused prefix that took
+	// the claim and then threw would leave the node unable to purge until the heartbeat went stale.
+	await assert.rejects(
 		() => purge.startDiscoveredPurge({ urlPrefix: 'https://x.example/' }),
 		/whole origin/,
-		'validation refusals throw before anything starts'
+		'validation refusals reject before anything starts'
 	);
-	const { started } = purge.startDiscoveredPurge({ urlPrefix: 'https://x.example/catalog/' });
+	assert.equal(
+		(await purge.getDiscoveredPurgeState()).running ?? false,
+		false,
+		'a refused start leaves no claim behind'
+	);
+
+	const { started } = await purge.startDiscoveredPurge({ urlPrefix: 'https://x.example/catalog/' });
 	assert.equal(started, true);
-	while (purge.getDiscoveredPurgeState().running) await new Promise((resolve) => setImmediate(resolve));
-	const done = purge.getDiscoveredPurgeState();
+	while ((await purge.getDiscoveredPurgeState()).running) await new Promise((resolve) => setImmediate(resolve));
+	const done = await purge.getDiscoveredPurgeState();
 	assert.equal(done.error, null);
 	assert.equal(done.examined, 0, 'the FakeTable slice is empty');
 	assert.equal(done.dryRun, true, 'a bare start is a census');
@@ -391,4 +417,72 @@ test('skipVisited: off by default, so the predicate is unchanged for existing ca
 	});
 	assert.deepEqual(deleted, ['https://x.example/product/a']);
 	assert.equal(stats.visitedSkipped, 0);
+});
+
+/**
+ * THE CROSS-WORKER CANCEL — the defect that made this sweep's run state worth moving off the
+ * module. `stopDiscoveredPurge` set a flag in the worker that received the POST and the pass polled
+ * its OWN worker's flag; a stop landing anywhere else reported the purge as not running and did not
+ * stop it, on a paced bulk delete. Here the stop is issued through the same shared row the pass
+ * polls, which is what a different worker would do.
+ */
+test('a stop issued from another worker reaches the running pass — through startDiscoveredPurge', async () => {
+	applyOptions({
+		ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/catalog/', discoverTargets: false }] },
+	});
+
+	// A Target table with a long ascending range, so the walk is still going when the stop lands.
+	// `walkUrlRange` pages it with `greater_than` + a sort, which is what this models.
+	const URLS = Array.from({ length: 4000 }, (_, i) => `https://x.example/catalog/${String(i).padStart(5, '0')}`);
+	globalThis.databases.render_service.Target = class {
+		static async get() {}
+		static async put() {}
+		static async delete() {}
+		static search({ conditions = [], limit = 50, sort } = {}) {
+			const gt = conditions.find((c) => c.comparator === 'greater_than')?.value ?? '';
+			const ge = conditions.find((c) => c.comparator === 'greater_than_or_equal')?.value;
+			const lt = conditions.find((c) => c.comparator === 'less_than')?.value;
+			let keys = URLS.filter((u) => (ge !== undefined ? u >= ge : u > gt) && (lt === undefined || u < lt));
+			if (sort?.descending) keys = [...keys].reverse();
+			const page = keys.slice(0, limit);
+			return (async function* () {
+				for (const url of page) yield { url, sitemapUrl: null, demandInterval: null };
+			})();
+		}
+	};
+
+	const { started } = await purge.startDiscoveredPurge({
+		urlPrefix: 'https://x.example/catalog/',
+		dryRun: true,
+		ratePerSecond: 1_000_000,
+	});
+	assert.equal(started, true);
+
+	// THE STOP, issued the way a second worker would: through the public API, touching no module
+	// state the running pass can see. Under the per-worker flag this returned "stopped" and the
+	// pass ran to completion.
+	await purge.stopDiscoveredPurge();
+
+	const deadline = Date.now() + 5000;
+	let state = await purge.getDiscoveredPurgeState();
+	while (state.running && Date.now() < deadline) {
+		await new Promise((r) => setImmediate(r));
+		state = await purge.getDiscoveredPurgeState();
+	}
+
+	assert.equal(state.running, false, 'the pass ended');
+	assert.equal(state.canceled, true, 'and it ended BECAUSE of the stop');
+	assert.ok(state.examined < URLS.length, `it stopped early (examined ${state.examined} of ${URLS.length})`);
+});
+
+test('the purge reports itself running from a worker that did not start it', async () => {
+	applyOptions({
+		ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/catalog/', discoverTargets: false }] },
+	});
+	await runState.claimRun('discovery_purge');
+
+	// No module state was written by this "worker" — the answer comes entirely from the row.
+	const state = await purge.getDiscoveredPurgeState();
+	assert.equal(state.running, true);
+	assert.equal(typeof state.startedAt, 'number');
 });

@@ -36,6 +36,22 @@ const sharedBufferStub = {
 	unlock() {},
 };
 
+// `coordination.SharedBuffer` is a REAL TABLE in production, not just a lock store: the sweeps'
+// run-state row lives in it (`util/runState.js`), and `primaryStore` is only what the claim's
+// cross-worker lock uses. A fake carrying just `primaryStore` makes every claim refuse — the
+// publish fails, and a claim that cannot be published is refused by design — so the row has to be
+// modelled here for the sweeps to start at all.
+const runStateRows = new Map();
+const coordinationTable = {
+	primaryStore: sharedBufferStub,
+	async get(key) {
+		return runStateRows.get(key) ?? null;
+	},
+	async put(key, value) {
+		runStateRows.set(key, value);
+	},
+};
+
 let orphanSweep;
 
 // resources/Target.js (imported for the CASCADING delete) extends the raw table class and
@@ -56,7 +72,7 @@ beforeEach(async () => {
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
 	globalThis.Resource = class {};
 	globalThis.databases = {
-		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		coordination: { SharedBuffer: coordinationTable },
 		probe_state: { ProbeState: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },

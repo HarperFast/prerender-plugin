@@ -60,6 +60,7 @@ import { queryAllowlistFor } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
 import { Target } from '../resources/Target.js';
+import { claimRun, finishRun, isRunning, makeHeartbeat, publishRunState, readRunState } from './runState.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread. Same value, and the same reason, as reconcile.
@@ -171,6 +172,9 @@ export const sweepOrphanedTargets = async ({
 export const sweepKeyRuleOrphans = async ({
 	maxDeletes = config.render.orphanSweep.maxDeletes,
 	dryRun = config.render.orphanSweep.dryRun,
+	// The runner rides its heartbeat on this, so a long walk is never read as a dead worker. It
+	// defaults to a bare yield so a direct caller (and every test) behaves exactly as before.
+	onYield = () => setImmediate(),
 } = {}) => {
 	return sweepOrphanedTargets({
 		// One unconstrained streamed scan, for the reasons spelled out on `reconcileScheduleGaps`:
@@ -195,7 +199,7 @@ export const sweepKeyRuleOrphans = async ({
 		deviceTypes: config.deviceTypes.default,
 		maxDeletes,
 		dryRun,
-		onYield: () => setImmediate(),
+		onYield,
 	});
 };
 
@@ -234,44 +238,63 @@ export const summarizeSweep = (stats, maxDeletes) => {
 	};
 };
 
-let running = false;
-let lastRun = null;
+/**
+ * RUN STATE LIVES ON THE NODE, NOT IN THIS MODULE. Harper loads a component per worker thread, so
+ * `let running` here described one worker while the sweep is a per-node activity and the endpoint
+ * is served by whichever worker takes the connection — the guard did not guard and the summary was
+ * unreadable. See `util/runState.js` for the measurement and the mechanism.
+ */
+const KEY = 'orphan_sweep';
 
 /** Summary of the most recent sweep on this node, for the management API. */
-export const getLastOrphanSweep = () => lastRun;
+export const getLastOrphanSweep = async () => (await readRunState(KEY))?.lastRun ?? null;
 
-/** Whether a sweep is in flight, so the admin action can say so instead of implying a new one. */
-export const isOrphanSweepRunning = () => running;
+/** Whether a sweep is in flight ANYWHERE on this node, so the admin action can say so. */
+export const isOrphanSweepRunning = async () => isRunning(await readRunState(KEY));
 
 /**
- * Run one sweep, guarded against overlap. Returns the run summary, or `{ skipped: true }` when
- * one is already in flight.
+ * Run one sweep, guarded against overlap across every worker on this node. Returns the run
+ * summary, or `{ skipped: true }` when one is already in flight.
  */
 export const runOrphanSweepOnce = async (options) => {
-	if (running) return { skipped: true, reason: 'an orphan sweep is already running', lastRun };
-	running = true;
-
 	const startedAt = Date.now();
+	const { claimed, row } = await claimRun(KEY, { startedAt });
+	if (!claimed) {
+		return { skipped: true, reason: 'an orphan sweep is already running', lastRun: row?.lastRun ?? null };
+	}
+
 	try {
-		const stats = await sweepKeyRuleOrphans(options);
-		lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+		// The sweep's own pacing already yields; the heartbeat rides the same progress callback so a
+		// long walk is never mistaken for a dead worker.
+		const beat = makeHeartbeat(KEY);
+		const stats = await sweepKeyRuleOrphans({
+			...options,
+			onYield: async () => {
+				beat();
+				await setImmediate();
+			},
+		});
+		const lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
+		await finishRun(KEY, lastRun);
 
 		const { level, message } = summarizeSweep(stats, maxDeletesOf(options));
 		logger[level](message);
 
 		return lastRun;
 	} catch (e) {
-		lastRun = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		// The claim is released on the failure path too, or one thrown sweep locks the node out
+		// until the heartbeat goes stale.
+		await finishRun(KEY, {
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			error: e?.message ?? String(e),
+		});
 		throw e;
-	} finally {
-		running = false;
 	}
 };
 
 const maxDeletesOf = (options) => options?.maxDeletes ?? config.render.orphanSweep.maxDeletes;
 
 /** Test seam: forget the previous run so cases don't leak state into each other. */
-export const resetOrphanSweepState = () => {
-	running = false;
-	lastRun = null;
-};
+export const resetOrphanSweepState = () => publishRunState(KEY, { running: false, lastRun: null, heartbeatAt: null });

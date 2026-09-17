@@ -40,10 +40,26 @@ const sharedBufferStub = {
 	unlock() {},
 };
 
+// `coordination.SharedBuffer` is a REAL TABLE in production, not just a lock store: the sweeps'
+// run-state row lives in it (`util/runState.js`), and `primaryStore` is only what the claim's
+// cross-worker lock uses. A fake carrying just `primaryStore` makes every claim refuse — the
+// publish fails, and a claim that cannot be published is refused by design — so the row has to be
+// modelled here for the sweeps to start at all.
+const runStateRows = new Map();
+const coordinationTable = {
+	primaryStore: sharedBufferStub,
+	async get(key) {
+		return runStateRows.get(key) ?? null;
+	},
+	async put(key, value) {
+		runStateRows.set(key, value);
+	},
+};
+
 beforeEach(async () => {
 	globalThis.server = { hostname: 'node-a', nodes: [], config: { http: {} } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
-	globalThis.databases = { coordination: { SharedBuffer: { primaryStore: sharedBufferStub } } };
+	globalThis.databases = { coordination: { SharedBuffer: coordinationTable } };
 	reconcile = await import('../src/util/reconcile.js');
 });
 
@@ -380,7 +396,7 @@ test('the live query asks for no sort — Harper rejects sorting by the primary 
 		render_schedule: {
 			RenderSchedule: { get: async () => null, put: async () => {} },
 		},
-		coordination: { SharedBuffer: { primaryStore: sharedBufferStub } },
+		coordination: { SharedBuffer: coordinationTable },
 	};
 
 	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
