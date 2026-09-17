@@ -28,7 +28,7 @@ import type { Renderer } from './Worker.js';
 import { resolveSettings, defaultLaunchOptions, settings } from './settings.js';
 import type { BrowserOptions } from './settings.js';
 import { initResourceCache } from './ResourceCache.js';
-import type { PrerenderConfig, Viewport } from './config.js';
+import { resolveConfigForJob, type PrerenderConfig, type Viewport } from './config.js';
 import { noop } from './util/noop.js';
 import logger from './util/Logger.js';
 
@@ -105,6 +105,9 @@ export interface RenderResult {
 	responseHeaders: Record<string, string> | undefined;
 	/** Per-phase wall-clock split { navTtfb, navTotal, settle, postProcess } — same as prod stats. */
 	timings: RenderTimings;
+	/** Scoped overrides (`config.overrides`) that this render resolved, in the order applied. Empty
+	 *  when none matched — `config` below is then the base config unchanged. */
+	appliedOverrides: string[];
 	renderTimeMs: number | undefined;
 	screenshot: Uint8Array | undefined;
 	/** Set when the renderer threw — the result is still returned (mirrors Worker.render). */
@@ -172,12 +175,17 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 	await initResourceCache(settings.resourceCache);
 
 	const deviceType = device ?? settings.config.defaultDevice;
-	const profile = settings.config.devices[deviceType];
-	if (!profile) {
+	if (!settings.config.devices[deviceType]) {
 		throw new Error(
 			`renderOnce: device "${deviceType}" is not in config.devices (have: ${Object.keys(settings.config.devices).join(', ')})`
 		);
 	}
+	// Resolve the SAME scoped overrides the renderer will, so what this result reports about the
+	// render (its config, its device profile) is what the render actually used. The renderer
+	// resolves independently from the job; both are pure functions of (config, url, deviceType), so
+	// they cannot disagree.
+	const resolved = resolveConfigForJob(settings.config, { url, deviceType });
+	const profile = resolved.config.devices[deviceType] ?? resolved.config.devices[resolved.config.defaultDevice];
 
 	const renderFn = customRenderer ?? defaultRenderer;
 	const ownsBrowser = !providedBrowser;
@@ -246,7 +254,9 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 					browser: managed.browser,
 					job,
 					html,
-					config: settings.config,
+					// The config this render actually used, overrides applied — a probe that inspects
+					// config must see what ran, not the unscoped base.
+					config: resolved.config,
 					device: deviceType,
 				};
 				for (const [name, probe] of Object.entries(probes)) {
@@ -283,7 +293,8 @@ export async function renderOnce(options: RenderOnceOptions): Promise<RenderResu
 			renderTimeMs: attempt?.renderEndTime !== undefined ? attempt.renderEndTime - attempt.renderStartTime : undefined,
 			screenshot: shot,
 			error,
-			config: settings.config,
+			config: resolved.config,
+			appliedOverrides: resolved.applied,
 			job,
 			probes: probeResults,
 			page: keepOpen ? page : undefined,

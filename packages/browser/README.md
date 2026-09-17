@@ -274,11 +274,71 @@ include what you change:
 	},
 	"injectWebComponentsPolyfill": true, // force ShadyDOM/ShadyCSS so shadow-DOM CSS serializes
 	"extraHeaders": {}, // extra request headers on the navigation request
+	// optional: config patches that apply only to the renders they match. See "Scoped overrides".
+	"overrides": [
+		{
+			"name": "product-settle",
+			"pathPattern": "^/product/",
+			"config": { "navigation": { "domStableTimeoutMs": 15000 }, "scroll": { "stepFraction": 1.0 } },
+		},
+	],
 }
 ```
 
 Invalid config (missing viewport, `defaultDevice` not in `devices`, non-positive budgets) throws at
 `startWorker()`.
+
+### Scoped overrides — per-route settle, and per-route everything else
+
+Every block above is global: one setting for a home page, a category listing and a product page
+alike. That is backwards for the settle phase in particular, because how long a page needs to settle
+— and what it is even waiting for — is the most page-type-dependent thing the renderer does. A
+settle sized for the page that needs the most is waste on every other page, and settle is roughly
+78% of render time.
+
+`overrides` is a list of config patches, each scoped by URL path and/or device:
+
+```jsonc
+"overrides": [
+	// A cheap settle for a page type that has no lazy content worth waiting for.
+	{ "name": "home", "pathPattern": "^/$", "config": { "scroll": { "settleStablePasses": 1 } } },
+	// A patient one, with an explicit readiness gate, where the money is.
+	{
+		"name": "product",
+		"pathPattern": "^/product/",
+		"config": {
+			"navigation": { "domStableTimeoutMs": 15000 },
+			"waitFor": [{ "selector": "#reviews", "waitForSelector": ".review", "minCount": 1 }],
+		},
+	},
+	// Narrower still: path AND device.
+	{ "name": "product-mobile", "pathPattern": "^/product/", "devices": ["mobile"], "config": { … } },
+]
+```
+
+- **Matching is `pathPattern` AND `devices`**; an omitted field matches everything. Scoping is on the
+  URL path — there is no page-type axis, and a rule scope nothing can satisfy is worse than no rule.
+- **Order decides.** Overrides apply in array order, each deep-merged over the result so far, so the
+  last matching one wins a contested key. There is no specificity ranking.
+- **Arrays replace, objects merge** — the same rule the top-level config merge already follows. An
+  override that sets `waitFor` replaces the list rather than appending to it.
+- **No-op when unset.** With no overrides configured the base config is returned by identity, so an
+  existing deployment renders byte-identically.
+- **Two blocks cannot be scoped**, and are rejected at config load: `cacheKey`, because it mirrors
+  the URL-identity policy the plugin applies and the two must agree for every URL; and
+  `documentReuse`, because it is decided once per job and a job spans device variants, so a scoped
+  value would never be read. Overrides also cannot nest.
+- Each override is **validated as applied** — merged over the base and run through the same checks —
+  so a patch that replaces a good default with a bad value fails at load, not mid-render.
+- `renderOnce()` reports which ones matched as `appliedOverrides`, and its `config` is the resolved
+  config, so "which settings did this render actually use" has an answer you do not have to derive
+  by hand.
+
+**Tune settle against content, never against timings.** A dwell that looks like slack is often the
+only thing holding a widget's load open: on one real site `networkIdleTimeoutMs` never resolves at
+all, so it acts as a fixed per-pass sleep, and cutting it 2000 → 500 made renders 3.5× faster and
+dropped every one of 1,635 review nodes with `outcome=ok` and no error. Add the explicit `waitFor`
+readiness gate first, confirm the content is still there, and only then take the blind dwell down.
 
 ### `postProcess.minifyInlineCss` — re-emitting inline CSS from the CSSOM
 

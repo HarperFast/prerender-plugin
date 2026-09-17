@@ -430,6 +430,42 @@ export type PrerenderConfig = {
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
 	extraHeaders: Record<string, string>;
 	documentReuse: DocumentReuseConfig;
+	/**
+	 * Scoped config overrides, applied per render (see {@link ConfigOverride}). Absent by default →
+	 * a complete no-op, so an unconfigured deployment resolves the base config by identity.
+	 */
+	overrides?: ConfigOverride[];
+};
+
+/**
+ * A config patch that applies only to the renders it matches.
+ *
+ * The settle knobs are the reason this exists. `navigation.*` and `scroll.*` were global — ONE
+ * setting for a home page, a category listing and a product page alike — while the only thing that
+ * could be scoped was a `waitFor` rule. That is backwards: how long a page needs to settle, and what
+ * it is even waiting for, is the most page-type-dependent thing the renderer does. A settle sized
+ * for the page that needs the most is waste on every other page, and settle is ~78% of render time.
+ *
+ * Nothing here is settle-specific though, and that is deliberate: the defaults are opinionated, and
+ * an opinion that cannot be overridden per route eventually becomes a reason to fork the renderer.
+ * Anything read per render can be scoped — see `UNSCOPABLE` for the two blocks that cannot, and why.
+ *
+ * Matching is `pathPattern` AND `devices`; an omitted field matches everything. Scoping is on the
+ * URL PATH, never on a declared page type — rule scopes AND together and no job carries a page type,
+ * so a page-type scope would match nothing at all.
+ *
+ * Overrides apply IN ARRAY ORDER, each deep-merged over the result so far, so the last one that
+ * matches wins a contested key. No specificity ranking: the order you wrote is the order you get.
+ */
+export type ConfigOverride = {
+	/** Required. Names the override in the render result, and makes a never-matching rule visible. */
+	name: string;
+	/** JavaScript regex tested against the URL's path (e.g. `'^/product/'`). Omit → every path. */
+	pathPattern?: string;
+	/** Device types this applies to, matched against the job's `deviceType`. Omit → every device. */
+	devices?: string[];
+	/** The patch, deep-merged over the config resolved so far. */
+	config: DeepPartial<PrerenderConfig>;
 };
 
 // Built-in defaults — these reproduce the renderer's original hardcoded behavior, so
@@ -598,6 +634,24 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	if (typeof config.scroll.stepFraction !== 'number' || config.scroll.stepFraction <= 0) {
 		throw new Error('prerender config: scroll.stepFraction must be a positive number');
 	}
+	// The rest of the settle dwells. These went unchecked while they were global and set once by
+	// hand; scoped overrides make them per-route surface that a config author edits far more often,
+	// and a negative dwell is the kind of value that produces a fast render with missing content
+	// rather than an error.
+	for (const field of ['stepMs', 'topSettleMs'] as const) {
+		const v = config.scroll[field];
+		if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+			throw new Error(`prerender config: scroll.${field} must be a non-negative number`);
+		}
+	}
+	if (!Number.isInteger(config.scroll.settleStablePasses) || config.scroll.settleStablePasses < 1) {
+		throw new Error('prerender config: scroll.settleStablePasses must be a positive integer');
+	}
+	for (const field of ['enabled', 'settleUntilStable'] as const) {
+		if (typeof config.scroll[field] !== 'boolean') {
+			throw new Error(`prerender config: scroll.${field} must be a boolean`);
+		}
+	}
 	// Pruning unmatched CSS is only sound against a DOM nothing can still change. `stripScripts`
 	// is what guarantees that, so refuse the combination rather than quietly emitting a snapshot
 	// whose CSS assumes an inert page while its scripts are still there to un-inert it.
@@ -668,7 +722,79 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 			}
 		});
 	}
+	validateOverrides(config);
 	return config;
+};
+
+/** Config blocks a scoped override may not touch, and why. Both are decided ABOVE the level an
+ *  override matches at, so accepting one would mean accepting a setting that silently does nothing
+ *  — the same shape of landmine as a rule scope nothing can satisfy. */
+const UNSCOPABLE: Record<string, string> = {
+	overrides: 'overrides cannot nest',
+	cacheKey:
+		'cacheKey mirrors the URL-identity policy the plugin applies; the two must agree for every ' +
+		'URL or healthy pages are retired as duplicates, so it cannot vary by route',
+	documentReuse:
+		'documentReuse is decided once per JOB, and a job spans device variants, so it is settled ' +
+		'before any one variant device is known and a scoped value here would not be read',
+};
+
+const validateOverrides = (config: PrerenderConfig): void => {
+	if (config.overrides === undefined) return;
+	if (!Array.isArray(config.overrides)) {
+		throw new Error('prerender config: overrides must be an array of scoped override rules');
+	}
+	const seen = new Set<string>();
+	config.overrides.forEach((override, i) => {
+		if (!isPlainObject(override)) {
+			throw new Error(`prerender config: overrides[${i}] must be an object`);
+		}
+		// A name is mandatory: it is how an applied override is attributed in a render result and how
+		// a rule that never matches anything is ever noticed.
+		if (typeof override.name !== 'string' || override.name.trim() === '') {
+			throw new Error(`prerender config: overrides[${i}].name must be a non-empty string`);
+		}
+		if (seen.has(override.name)) {
+			throw new Error(`prerender config: overrides[${i}].name "${override.name}" is not unique`);
+		}
+		seen.add(override.name);
+		if (override.devices !== undefined) {
+			if (!Array.isArray(override.devices) || override.devices.some((d) => typeof d !== 'string' || d.trim() === ''))
+				throw new Error(`prerender config: overrides[${i}].devices must be an array of non-empty device names`);
+		}
+		if (override.pathPattern !== undefined) {
+			if (typeof override.pathPattern !== 'string' || override.pathPattern.trim() === '') {
+				throw new Error(`prerender config: overrides[${i}].pathPattern must be a non-empty string`);
+			}
+			try {
+				new RegExp(override.pathPattern);
+			} catch (err) {
+				throw new Error(
+					`prerender config: overrides[${i}].pathPattern is not a valid regex: ${(err as Error).message}`
+				);
+			}
+		}
+		if (!isPlainObject(override.config)) {
+			throw new Error(`prerender config: overrides[${i}].config must be an object`);
+		}
+		for (const [key, why] of Object.entries(UNSCOPABLE)) {
+			if (key in override.config) {
+				throw new Error(`prerender config: overrides[${i}].config may not set "${key}" — ${why}`);
+			}
+		}
+		// Validate the PATCH APPLIED, not the patch alone: a bad value only shows up once it has
+		// replaced the default it overrides. Each override is checked on its own against the base —
+		// combinations are not enumerated, which is a deliberate limit, but every value that can
+		// reach a render has been through the same checks the base config was.
+		const base = { ...config, overrides: undefined } as PrerenderConfig;
+		try {
+			validate(deepMerge(base, override.config));
+		} catch (err) {
+			throw new Error(
+				`prerender config: overrides[${i}] ("${override.name}") is invalid once applied — ${(err as Error).message}`
+			);
+		}
+	});
 };
 
 // Recursively-optional version of a type, with arrays kept whole. Lets callers pass
@@ -681,6 +807,69 @@ export type DeepPartial<T> = T extends (infer _U)[] ? T : T extends object ? { [
  */
 export const mergeConfig = (overrides: DeepPartial<PrerenderConfig> = {}): PrerenderConfig =>
 	validate(deepMerge(defaultConfig(), overrides));
+
+/** What `resolveConfigForJob` resolved, and which overrides got it there. */
+export type ResolvedConfig = {
+	config: PrerenderConfig;
+	/** Names of the overrides applied, in the order they were applied. Empty → the base config. */
+	applied: string[];
+};
+
+// Resolved configs are cached by the SIGNATURE of what produced them (device + the ordered list of
+// matching override names), not by URL: every product page resolves the same config, so the cache
+// holds one entry per distinct combination rather than one per URL. Bounded by construction — the
+// number of combinations is a property of the config, not of the corpus.
+const resolvedCache = new Map<string, PrerenderConfig>();
+let resolvedCacheFor: ConfigOverride[] | undefined;
+
+/**
+ * The effective config for one render. Matches `config.overrides` against this job's URL path and
+ * device type and deep-merges the matches, in order, over the base.
+ *
+ * Identity when nothing matches (and when no overrides are configured at all), so a deployment that
+ * does not use them pays nothing and renders byte-identically.
+ */
+export const resolveConfigForJob = (
+	config: PrerenderConfig,
+	{ url, deviceType }: { url: string; deviceType: string }
+): ResolvedConfig => {
+	const overrides = config.overrides;
+	if (!overrides?.length) return { config, applied: [] };
+
+	// The cache is keyed by name-signature, so it must be dropped when the config itself is replaced
+	// (a live config reload). Identity of the overrides array is the cheapest correct witness.
+	if (resolvedCacheFor !== overrides) {
+		resolvedCache.clear();
+		resolvedCacheFor = overrides;
+	}
+
+	let path = '';
+	try {
+		path = new URL(url).pathname;
+	} catch {
+		/* an unparseable URL matches only the unscoped overrides, which is the conservative read */
+	}
+
+	const applied: string[] = [];
+	for (const override of overrides) {
+		if (override.devices && !override.devices.includes(deviceType)) continue;
+		if (override.pathPattern && !new RegExp(override.pathPattern).test(path)) continue;
+		applied.push(override.name);
+	}
+	if (!applied.length) return { config, applied };
+
+	const key = `${deviceType}\u0000${applied.join('\u0000')}`;
+	let resolved = resolvedCache.get(key);
+	if (!resolved) {
+		const names = new Set(applied);
+		resolved = overrides.reduce(
+			(acc, override) => (names.has(override.name) ? deepMerge(acc, override.config) : acc),
+			config
+		);
+		resolvedCache.set(key, resolved);
+	}
+	return { config: resolved, applied };
+};
 
 /**
  * Load and validate a rendering config from a JSON file, deep-merged over the

@@ -2,7 +2,7 @@ import { Renderer } from './Worker.js';
 import type { RenderTimings } from './RenderJob.js';
 import { settings } from './settings.js';
 import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
-import type { PostProcessConfig } from './config.js';
+import { resolveConfigForJob, type PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 import {
@@ -48,8 +48,11 @@ class RemainingTimer {
 const renderer: Renderer = async (page, job) => {
 	const { url, deviceType } = job;
 
-	// Resolved rendering config + active resource cache for this render.
-	const config = settings.config;
+	// Resolved rendering config + active resource cache for this render. `resolveConfigForJob` layers
+	// any scoped overrides matching this URL path and device on top of the base — identity when none
+	// are configured, so an unconfigured fleet renders exactly as before.
+	const { config, applied: appliedOverrides } = resolveConfigForJob(settings.config, { url, deviceType });
+	job.appliedOverrides = appliedOverrides;
 	const cache = getResourceCache();
 
 	const navigationUrl = new URL(url);
