@@ -454,11 +454,32 @@ export type PrerenderConfig = {
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
 	extraHeaders: Record<string, string>;
 	documentReuse: DocumentReuseConfig;
+	variantContext: VariantContextConfig;
 	/**
 	 * Scoped config overrides, applied per render (see {@link ConfigOverride}). Absent by default →
 	 * a complete no-op, so an unconfigured deployment resolves the base config by identity.
 	 */
 	overrides?: ConfigOverride[];
+};
+
+/**
+ * Whether the device variants of one job share a browser context — see `src/variantContext.ts`.
+ */
+export type VariantContextConfig = {
+	/**
+	 * Render a job's variants in ONE browser context instead of one each, so the second variant is
+	 * served the sub-resources the first fetched from Chrome's own HTTP cache. Measured on a
+	 * production storefront: the second variant's same-origin network responses fell from 103 to 22.
+	 *
+	 * Only the CACHE is shared. Between variants every cookie is deleted but
+	 * `documentReuse.cookies.pin`, and the navigation origin's storage is cleared, so what a variant
+	 * inherits is exactly what it inherits with this off — an unwiped shared context would put both
+	 * devices on one session and one visitor id, which is what pinning exists to prevent.
+	 *
+	 * Independent of `documentReuse.enabled`: a site that serves different markup per device cannot
+	 * reuse a document but still fetches the same scripts and stylesheets twice.
+	 */
+	shared: boolean;
 };
 
 /**
@@ -544,6 +565,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		prefetch: { enabled: false, depth: 2, maxDepth: 8, timeoutMs: 8000 },
 		cookies: { pin: [] },
 	},
+	variantContext: { shared: false },
 });
 
 /** setTimeout's delay ceiling: past this a timer fires at once instead of late. */
@@ -641,6 +663,9 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	if (!Number.isInteger(prefetch.maxDepth) || (prefetch.maxDepth as number) < (prefetch.depth as number)) {
 		throw new Error('prerender config: documentReuse.prefetch.maxDepth must be an integer >= depth');
+	}
+	if (!isPlainObject(config.variantContext) || typeof config.variantContext.shared !== 'boolean') {
+		throw new Error('prerender config: variantContext.shared must be a boolean');
 	}
 	const cookies: unknown = config.documentReuse.cookies;
 	if (!isPlainObject(cookies)) {
@@ -782,6 +807,10 @@ const UNSCOPABLE: Record<string, string> = {
 	documentReuse:
 		'documentReuse is decided once per JOB, and a job spans device variants, so it is settled ' +
 		'before any one variant device is known and a scoped value here would not be read',
+	variantContext:
+		'variantContext decides how a JOB opens browser contexts for its variants, which is settled ' +
+		'before the first variant renders — a value scoped to one device could not be honoured for ' +
+		'the context its sibling already rendered in',
 };
 
 const validateOverrides = (config: PrerenderConfig): void => {

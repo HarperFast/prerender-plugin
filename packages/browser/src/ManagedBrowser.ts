@@ -1,4 +1,4 @@
-import puppeteer, { Browser, LaunchOptions, Page } from 'puppeteer';
+import puppeteer, { Browser, BrowserContext, LaunchOptions, Page } from 'puppeteer';
 import logger from './util/Logger.js';
 import { setTimeout } from 'timers';
 import { settings } from './settings.js';
@@ -93,20 +93,54 @@ export default class ManagedBrowser {
 		return this.browser.process()?.pid;
 	}
 
-	async getPage() {
+	/**
+	 * A context the CALLER owns: it outlives the pages opened in it and is disposed with
+	 * `disposeContext`, not by a page closing. Used to render a job's device variants in one context
+	 * (see variantContext.ts). Null when `incognitoPages` is off, since every page then shares the
+	 * default context already and there is nothing to hold.
+	 */
+	async createContext(): Promise<BrowserContext | null> {
+		if (!settings.incognitoPages) return null;
+		return await this.browser.createBrowserContext({ downloadBehavior: { policy: 'deny' } });
+	}
+
+	/** Dispose a context from `createContext`. Tolerates a browser that has already gone. */
+	async disposeContext(context: BrowserContext): Promise<void> {
+		try {
+			await context.close();
+		} catch (err: any) {
+			// Same reasoning as the page-close path below: a context dies with its browser, so a
+			// browser that is closing or already gone makes this expected rather than a leak.
+			if (this.closing || !this.browser.connected || contextAlreadyGone(err)) {
+				logger.debug({ err }, 'browser context already gone at dispose');
+			} else {
+				logger.error({ err }, 'Failed to close context.');
+			}
+		}
+	}
+
+	/**
+	 * A page to render on. Given a `context` from `createContext`, the page opens there and closing
+	 * it leaves the context alone — the caller disposes it once the whole job is done. Otherwise the
+	 * page gets a context of its own, disposed when it closes.
+	 */
+	async getPage(context?: BrowserContext | null) {
 		this.activePages++;
 		this.totalOpenedPages++;
 
 		let page;
 		try {
-			const context = await (!settings.incognitoPages
-				? this.browser.defaultBrowserContext()
-				: this.browser.createBrowserContext({ downloadBehavior: { policy: 'deny' } }));
-			page = await context.newPage();
+			const owned = context ?? null;
+			const pageContext =
+				owned ??
+				(await (!settings.incognitoPages
+					? this.browser.defaultBrowserContext()
+					: this.browser.createBrowserContext({ downloadBehavior: { policy: 'deny' } })));
+			page = await pageContext.newPage();
 			page.once('close', async () => {
-				if (settings.incognitoPages) {
+				if (settings.incognitoPages && !owned) {
 					try {
-						await context.close();
+						await pageContext.close();
 					} catch (err: any) {
 						// A context dies with its browser, so teardown makes this expected: the page
 						// 'close' event that got us here can BE the browser closing (worker shutdown, or

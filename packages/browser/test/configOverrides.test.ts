@@ -138,6 +138,10 @@ test('the blocks that are decided above a render cannot be scoped', () => {
 		() => withOverrides([{ name: 'n', config: { documentReuse: { enabled: false } } as never }]),
 		/may not set "documentReuse"/
 	);
+	assert.throws(
+		() => withOverrides([{ name: 'n', config: { variantContext: { shared: true } } as never }]),
+		/may not set "variantContext"/
+	);
 });
 
 test('a device name that is not a real profile is rejected, not silently non-matching', () => {

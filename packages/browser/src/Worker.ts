@@ -12,6 +12,7 @@ import { renderPhaseOf } from './util/renderPhase.js';
 import { JobDocumentCache } from './documentReuse.js';
 import { closePrefetchAgent, prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
 import { BoundedAsyncQueue } from './util/asyncQueue.js';
+import { closeVariantSession, newVariantSession, resetForNextVariant, type VariantSession } from './variantContext.js';
 
 export type Renderer = (page: Page, job: RenderJob) => Promise<string | undefined>;
 
@@ -138,6 +139,12 @@ export default class RenderWorker {
 			// pin's own assumption failing. Any non-zero count means a name in `cookies.pin` is
 			// device-specific and must come out of the list.
 			pinnedCookieConflicts: 0,
+			// Variants rendered in a SIBLING's browser context (config.variantContext.shared), so Chrome
+			// served them the sub-resources the first variant fetched, and the wipes between variants
+			// that could not be applied — each of those variants rendered in a context of its own
+			// instead, so nothing crossed; a steady count means the feature is buying nothing here.
+			variantContextsShared: 0,
+			variantContextResetFailures: 0,
 			// Replays the browser REFUSED (an unfulfillable payload). Those variants fetched their own
 			// document, so nothing was lost but the saving; a steady count means reuse is buying nothing
 			// on this site and the log line says why.
@@ -571,6 +578,8 @@ export default class RenderWorker {
 				documentsPrefetched: s.documentsPrefetched,
 				prefetchLate: s.prefetchLate,
 				pinnedCookieConflicts: s.pinnedCookieConflicts,
+				variantContextsShared: s.variantContextsShared,
+				variantContextResetFailures: s.variantContextResetFailures,
 				documentReplayFailures: s.documentReplayFailures,
 				prefetchFallthrough: s.prefetchFallthrough,
 				jobsAbandoned: s.jobsAbandoned,
@@ -788,39 +797,25 @@ export default class RenderWorker {
 		const documentCache = this.documentCacheFor(job);
 		if (documentCache) for (const variant of variants) variant.documentCache = documentCache;
 
-		for (const variant of variants) {
-			if (attempted.length > 0) {
-				const leaseLeft = job.expiresAt - Date.now();
-				if (leaseLeft < LEASE_MIN_REMAINING_MS || this.shuttingDown) {
-					const skipped = variants.length - attempted.length;
-					this.stats.variantsSkipped += skipped;
-					logger.warn(
-						{ id: job.id, skipped, leaseLeftMs: leaseLeft, shuttingDown: this.shuttingDown },
-						'posting a partial result — remaining device variants not attempted'
-					);
-					break;
-				}
-			}
-			// A THROW HERE MUST NOT COST THE VARIANTS ALREADY RENDERED. `renderVariant` swallows
-			// render failures itself, but it starts with `getBrowser()` — outside that handling — so a
-			// failed relaunch between variants (the browser the previous variant retired on a timeout
-			// or protocol error) rejected out of this loop, discarded every completed render, and
-			// posted nothing at all, leaving the row pinning the claim floor. Ending the loop and
-			// posting what is in hand is the same trade the lease and drain checks above already make.
-			try {
-				await this.renderVariant(variant);
-				attempted.push(variant);
-			} catch (e) {
-				this.stats.failures.getPageFailed++;
-				const skipped = variants.length - attempted.length;
-				this.stats.variantsSkipped += skipped;
-				logger.error(
-					{ id: job.id, deviceType: variant.deviceType, skipped, err: e },
-					'variant could not be started — posting what has rendered and leaving the rest to the plugin'
-				);
-				if (attempted.length === 0) throw e;
-				break;
-			}
+		// One browser context for the whole job, so the second variant is served the sub-resources the
+		// first fetched out of Chrome's cache instead of re-fetching them. State does NOT carry: the
+		// context is wiped between variants down to the pinned cookies. See variantContext.ts.
+		//
+		// Never on a SAMPLE job. Its later variants exist to fetch cold and be compared against the
+		// first — a warm cache and a wiped-but-shared context make that fetch something other than the
+		// cold one the comparison is supposed to be measuring, and the sample is the only running
+		// check that the site has not turned adaptive.
+		const session =
+			settings.config.variantContext.shared && variants.length > 1 && !documentCache?.sample
+				? newVariantSession()
+				: null;
+
+		try {
+			await this.renderVariants(job, variants, attempted, session);
+		} finally {
+			// Every exit path — a posted result, a partial, a throw. A context that outlives its job
+			// survives until the browser exits, and browsers here live for 200 pages.
+			if (session) await closeVariantSession(session);
 		}
 
 		// sendResult resolves true/false, but can still *reject* on an unexpected pre-POST failure
@@ -841,6 +836,54 @@ export default class RenderWorker {
 		this.stats.jobs++;
 		if (!posted) this.stats.resultPostFailures++;
 
+		this.reportDocumentCache(job, documentCache);
+	}
+
+	/** The variant loop itself: every device in turn, stopping early rather than losing what rendered. */
+	private async renderVariants(
+		job: RenderJob,
+		variants: RenderJob[],
+		attempted: RenderJob[],
+		session: VariantSession | null
+	) {
+		for (const variant of variants) {
+			if (attempted.length > 0) {
+				const leaseLeft = job.expiresAt - Date.now();
+				if (leaseLeft < LEASE_MIN_REMAINING_MS || this.shuttingDown) {
+					const skipped = variants.length - attempted.length;
+					this.stats.variantsSkipped += skipped;
+					logger.warn(
+						{ id: job.id, skipped, leaseLeftMs: leaseLeft, shuttingDown: this.shuttingDown },
+						'posting a partial result — remaining device variants not attempted'
+					);
+					break;
+				}
+			}
+			// A THROW HERE MUST NOT COST THE VARIANTS ALREADY RENDERED. `renderVariant` swallows
+			// render failures itself, but it starts with `getBrowser()` — outside that handling — so a
+			// failed relaunch between variants (the browser the previous variant retired on a timeout
+			// or protocol error) rejected out of this loop, discarded every completed render, and
+			// posted nothing at all, leaving the row pinning the claim floor. Ending the loop and
+			// posting what is in hand is the same trade the lease and drain checks above already make.
+			try {
+				await this.renderVariant(variant, session);
+				attempted.push(variant);
+			} catch (e) {
+				this.stats.failures.getPageFailed++;
+				const skipped = variants.length - attempted.length;
+				this.stats.variantsSkipped += skipped;
+				logger.error(
+					{ id: job.id, deviceType: variant.deviceType, skipped, err: e },
+					'variant could not be started — posting what has rendered and leaving the rest to the plugin'
+				);
+				if (attempted.length === 0) throw e;
+				break;
+			}
+		}
+	}
+
+	/** What the job's shared document did — reuse, prefetch, and the checks that keep them honest. */
+	private reportDocumentCache(job: RenderJob, documentCache: JobDocumentCache | null) {
 		if (documentCache) {
 			this.stats.documentsReused += documentCache.reusedBy.length;
 			this.stats.documentsPrefetched += documentCache.prefetchedBy.length;
@@ -888,9 +931,25 @@ export default class RenderWorker {
 		}
 	}
 
-	/** Render ONE device variant on a page of its own; the result is posted by the caller. */
-	private async renderVariant(job: RenderJob) {
+	/**
+	 * Render ONE device variant on a page of its own; the result is posted by the caller.
+	 *
+	 * With a `session`, that page opens in the context the job's earlier variants used, wiped first
+	 * (see variantContext.ts). The sharing is BEST-EFFORT by design — a variant can land on a
+	 * different browser than its sibling did, because `getBrowser()` relaunches after a retirement
+	 * and retires again at the page ceiling — so every path that cannot share simply renders in a
+	 * context of its own, which is what every variant did before this existed.
+	 */
+	private async renderVariant(job: RenderJob, session: VariantSession | null) {
 		const browser = await this.getBrowser();
+
+		// The context belongs to the browser that made it. A variant that landed on a different one
+		// (its sibling's browser was retired, or hit the page ceiling) starts a context there instead.
+		if (session && session.browser && session.browser !== browser) await closeVariantSession(session);
+		if (session && !session.context) {
+			session.context = await browser.createContext();
+			session.browser = session.context ? browser : null;
+		}
 
 		browser.jobRefs++;
 		job.attemptStarted();
@@ -901,7 +960,22 @@ export default class RenderWorker {
 		let content: string | undefined;
 
 		try {
-			page = await browser.getPage();
+			page = await browser.getPage(session?.context);
+			// A context that has already rendered a variant carries that variant's cookies and storage.
+			// It is handed on only once it is clean; if it cannot be, this variant gets its own — the
+			// saving is worth having only while it costs nothing.
+			if (session?.context && session.served > 0) {
+				const pin = settings.config.documentReuse.cookies.pin;
+				if (await resetForNextVariant(session.context, page, job.url, pin)) {
+					this.stats.variantContextsShared++;
+				} else {
+					this.stats.variantContextResetFailures++;
+					await browser.closePage(page);
+					await closeVariantSession(session);
+					page = await browser.getPage();
+				}
+			}
+			if (session?.context) session.served++;
 		} catch (e) {
 			this.retireBrowser(browser);
 			this.stats.failures.getPageFailed++;
