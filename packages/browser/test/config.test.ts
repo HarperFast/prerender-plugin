@@ -173,6 +173,16 @@ test('waitFor: a `pageTypes` scope is rejected rather than silently matching not
 	assert.doesNotThrow(() => mergeConfig({ waitFor: [{ selector: '#reviews', pathPattern: '^/product/' }] }));
 });
 
+test('variantContext.shared defaults off and must be a boolean', () => {
+	// Off by default: a job's variants each get a context of their own, as they always have.
+	assert.equal(defaultConfig().variantContext.shared, false);
+	assert.throws(
+		() => mergeConfig({ variantContext: { shared: 'yes' } as never }),
+		/variantContext.shared must be a boolean/
+	);
+	assert.doesNotThrow(() => mergeConfig({ variantContext: { shared: true } }));
+});
+
 test('navigation.finalDomStable defaults off and must be a boolean', () => {
 	assert.equal(defaultConfig().navigation.finalDomStable, false, 'existing deployments render byte-identically');
 	assert.throws(

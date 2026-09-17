@@ -188,6 +188,33 @@ fidelity under test — on a sample job every variant fetches cold, including th
 prefetched for, so the comparison is same-device (this process against Chrome) rather than
 cross-device.
 
+**One context per job** (`config.variantContext.shared`, off by default). Each variant has always had
+a browser context of its own — its own cookie jar, its own origin storage, and its own copy of
+Chrome's HTTP cache. The last of those is waste: both variants load the same page seconds apart, so
+the second re-fetches every script, stylesheet and API response the first already pulled. Turning this
+on renders a job's variants in one context, so Chrome serves the second from the cache the first
+filled. Measured on a production storefront, second variant, with the on-disk resource cache already
+on and warm: same-origin network responses fell from **103 to 22** on a product page and 99 to 16 on a
+catalog page, total network fetches from ~337 to ~139, and the on-disk cache was not cannibalised (70
+hits before, 66 after) — the two caches hold different things, since a cache shared between unrelated
+renders can only keep cookieless GET script/stylesheet responses while a per-job one is thrown away
+with its job.
+
+**Only the cache is shared.** Between variants every cookie is deleted but `documentReuse.cookies.pin`
+and the navigation origin's `local_storage`, `indexeddb`, `service_workers` and `cache_storage` are
+cleared, so what a variant inherits is exactly what it inherits with this off. That wipe is the
+feature: measured on the same page, an _unwiped_ shared context handed the second variant 125 cookies
+instead of the 6 pinned ones and put both devices on one session id, one visitor id and one
+bot-manager token — two devices sharing an identity is what `cookies.pin` exists to prevent, and
+nothing downstream would notice. A wipe that cannot be applied takes the sharing with it: that variant
+renders in a context of its own (counted as `variantContextResetFailures`), because the saving is only
+worth having while it costs nothing. Sharing is also skipped entirely on a **sample job**, whose later
+variants exist to fetch cold. It is independent of `documentReuse.enabled` — a site that serves
+different markup per device cannot reuse a document but still fetches the same assets twice — and
+best-effort: a variant that lands on a different browser than its sibling (a retirement, or the page
+ceiling) simply starts a context there. The per-window log line reports `variantContextsShared` and
+`variantContextResetFailures`.
+
 A variant is **skipped and the result posted partial** when the lease has under 30s left or the
 worker began draining between variants: `variants` then lists fewer devices than `deviceTypes`, the
 plugin stores what rendered and retries the URL for the rest. (A result that never arrives would cost
@@ -228,6 +255,10 @@ include what you change:
 		// Cookie NAMES that may cross variants — routing cookies only, never session/cart/visitor.
 		"cookies": { "pin": [] },
 	},
+	// Render a job's device variants in ONE browser context so Chrome's HTTP cache serves the second
+	// variant what the first fetched (see "One context per job"). Cookies and origin storage are wiped
+	// between variants down to `documentReuse.cookies.pin`, so nothing else carries over.
+	"variantContext": { "shared": false },
 	"navigation": {
 		"waitUntil": "domcontentloaded", // 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'
 		"renderBudgetMs": 20000,
@@ -324,10 +355,11 @@ settle sized for the page that needs the most is waste on every other page, and 
   override that sets `waitFor` replaces the list rather than appending to it.
 - **No-op when unset.** With no overrides configured the base config is returned by identity, so an
   existing deployment renders byte-identically.
-- **Two blocks cannot be scoped**, and are rejected at config load: `cacheKey`, because it mirrors
-  the URL-identity policy the plugin applies and the two must agree for every URL; and
-  `documentReuse`, because it is decided once per job and a job spans device variants, so a scoped
-  value would never be read. Overrides also cannot nest.
+- **Three blocks cannot be scoped**, and are rejected at config load: `cacheKey`, because it mirrors
+  the URL-identity policy the plugin applies and the two must agree for every URL; `documentReuse`,
+  because it is decided once per job and a job spans device variants, so a scoped value would never
+  be read; and `variantContext`, for the same reason — the contexts a job opens are settled before
+  its first variant renders. Overrides also cannot nest.
 - Each override is **validated as applied** — merged over the base and run through the same checks —
   so a patch that replaces a good default with a bad value fails at load, not mid-render.
 - `renderOnce()` reports which ones matched as `appliedOverrides`, and its `config` is the resolved
