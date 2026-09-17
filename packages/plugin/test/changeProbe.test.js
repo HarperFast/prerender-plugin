@@ -679,6 +679,13 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 			patched.push({ id, ...fields });
 		}
 	};
+	// Capture the schedule write too: the trigger must file ONE row, keyed by the URL.
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
 	const before = Date.now();
 	await changeProbe.triggerRevalidate(row('https://example.com/product/prd-a/'));
 	// Bound against a clock read taken AFTER the call: the trigger reads Date.now() itself, so
