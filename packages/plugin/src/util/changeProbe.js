@@ -53,7 +53,7 @@ import { fnv1a32 } from './hash.js';
 import { epochMsOf, currentMinuteMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
-import { writeSchedules } from './renderSchedule.js';
+import { writeSchedule } from './renderSchedule.js';
 import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
@@ -84,7 +84,7 @@ const probeStateTable = () => databases.probe_state.ProbeState;
 const YIELD_EVERY = 200;
 
 // What every probe read of the registry projects — what matching and the trigger need
-// (writeSchedules wants fromSitemap + the cadence). The stored signature is NOT here: it lives
+// (writeSchedule wants fromSitemap + the cadence). The stored signature is NOT here: it lives
 // in the node-local ProbeState table (see schema.graphql), read per probed URL.
 const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state'];
 
@@ -282,9 +282,26 @@ const probeOnce = async (rule, url) => {
 };
 
 /**
- * Re-render one changed URL now: hard-expire the cached pages and file every device row at the
- * current minute. Owner-scoped by the sweep, so the funnel's floor lowering covers these keys on
- * the node whose claim scan reads them.
+ * Re-render one changed URL now: hard-expire the cached pages and file the URL's schedule row at
+ * the current minute. Owner-scoped by the sweep, so the funnel's floor lowering covers these keys
+ * on the node whose claim scan reads them.
+ *
+ * ONE SCHEDULE ROW, KEYED BY THE URL — not one per device. The PAGES are still expired per device,
+ * because page content genuinely is per device; the SCHEDULE is not. This file was missed by the
+ * v0.66.0 move to URL-keyed jobs (that change touched RenderQueue, Target and renderSchedule), and
+ * the per-device rows it kept writing cost more than a stale spelling:
+ *
+ *   - `claim` gives a device-keyed row `deviceTypes: [thatDevice]` and a URL row the full default
+ *     set, so two device rows became TWO ONE-DEVICE JOBS instead of one two-device job — and each
+ *     job fetches the origin document for itself, which defeats the document reuse the browser
+ *     gained in the same release. Probe-triggered renders were doubling origin document load.
+ *   - The two jobs are claimed and rendered at different times, so desktop and mobile land
+ *     different `lastCached` values: exactly the split-pair state URL-keyed jobs removed.
+ *   - Two schedule writes per trigger instead of one, on a path that runs in-line with the sweep.
+ *
+ * Every other writer already files the URL row (`Target.put`, `Target.revalidate`, and `renderNow`
+ * for a default device); a per-device row remains legitimate only for a deliberate one-device
+ * render. Rows written before this fix convert themselves the first time they render.
  *
  * The expiry is backdated PAST the stale-while-revalidate window, not set to now. A trip means
  * the page's probed fields (price/availability) provably changed, so one more serve is a served
@@ -307,14 +324,11 @@ export const triggerRevalidate = async (row) => {
 	// hours, and a stale minute files rows below other nodes' claim-floor guard bands (the
 	// Target.revalidate lesson).
 	const nextRenderTime = currentMinuteMs();
-	await writeSchedules(
-		keys.map((cacheKey) => ({
-			cacheKey,
-			nextRenderTime,
-			fromSitemap: !!row.sitemapUrl,
-			effectiveInterval: resolveEffectiveInterval(row.url, row),
-		}))
-	);
+	await writeSchedule(row.url, {
+		nextRenderTime,
+		fromSitemap: !!row.sitemapUrl,
+		effectiveInterval: resolveEffectiveInterval(row.url, row),
+	});
 };
 
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —

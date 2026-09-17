@@ -693,6 +693,34 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 	}
 });
 
+test('a trip files ONE schedule row, keyed by the URL — not one per device', async () => {
+	// The v0.66.0 regression this pins. A device-keyed row gets `deviceTypes: [thatDevice]` from
+	// `claim`, so two of them are two ONE-DEVICE jobs: each fetches the origin document for
+	// itself (defeating document reuse) and they render at different times (splitting the pair's
+	// lastCached). One URL row is one job that renders every default device together.
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get() {
+			return null; // no cached page: isolate the schedule write
+		}
+	};
+
+	const url = 'https://example.com/product/prd-a/';
+	await changeProbe.triggerRevalidate(row(url));
+
+	assert.equal(scheduled.length, 1, `expected exactly one schedule row, got ${JSON.stringify(scheduled)}`);
+	assert.equal(scheduled[0].id, url, 'the row must be keyed by the URL, with no device suffix');
+	assert.ok(!String(scheduled[0].id).includes('|'), 'a "|" in the key means a per-device row');
+	// `put` REPLACES the record, so both of these must be explicit or the funnel throws.
+	assert.equal(typeof scheduled[0].fromSitemap, 'boolean');
+	assert.ok(Number.isFinite(scheduled[0].effectiveInterval));
+});
+
 /** A rule whose extract maps index 2 -> price and index 3 -> availability, with pageCheck on. */
 const PAGECHECK_RULES = [
 	{
