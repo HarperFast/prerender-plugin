@@ -160,3 +160,23 @@ test('throws when the JSON root is not an object', () => {
 test('throws a descriptive error for a missing file', () => {
 	assert.throws(() => loadConfig('/no/such/prerender.config.json'), /Failed to read prerender config/);
 });
+
+test('waitFor: a `pageTypes` scope is rejected rather than silently matching nothing', () => {
+	// Scopes AND together and no job carries a declared page type, so such a rule never runs and the
+	// content it guards is quietly missing from every render. Failing at config load is the only
+	// point at which anyone finds out.
+	assert.throws(
+		() => mergeConfig({ waitFor: [{ selector: '#reviews', pageTypes: ['product'] } as never] }),
+		/uses `pageTypes`.*match nothing.*pathPattern/s
+	);
+	// The supported scope still works.
+	assert.doesNotThrow(() => mergeConfig({ waitFor: [{ selector: '#reviews', pathPattern: '^/product/' }] }));
+});
+
+test('navigation.finalDomStable defaults off and must be a boolean', () => {
+	assert.equal(defaultConfig().navigation.finalDomStable, false, 'existing deployments render byte-identically');
+	assert.throws(
+		() => mergeConfig({ navigation: { finalDomStable: 'yes' } as never }),
+		/navigation.finalDomStable must be a boolean/
+	);
+});

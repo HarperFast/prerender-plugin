@@ -246,3 +246,85 @@ test('a path-scoped override does not touch a render on another path', async () 
 	assert.deepEqual(onNoindex.appliedOverrides, ['noindex-only']);
 	assert.equal(onNoindex.viewport.height, 480, 'the matching path got the scoped viewport');
 });
+
+// ── waitFor gate telemetry, and the plateau that has to follow the gates ───────────────────────
+
+test('waitFor telemetry attributes each gate that ran, satisfied or not', async () => {
+	const config = {
+		...NO_SCROLL,
+		devices: { mobile: { viewport: { width: 390, height: 5000 } } },
+		waitFor: [
+			{ name: 'reviews', selector: '#reviews', waitForSelector: '.rev-item', minCount: 1, timeoutMs: 8000 },
+			{ name: 'never-there', selector: '#reviews', waitForSelector: '.does-not-exist', minCount: 1, timeoutMs: 1200 },
+			{ name: 'other-device-only', selector: '#reviews', devices: ['tablet'], timeoutMs: 8000 },
+		],
+	};
+	const r = await renderOnce({ url: base, device: 'mobile', config });
+	const by = Object.fromEntries(r.waitForResults.map((w) => [w.name, w]));
+
+	assert.equal(r.waitForResults.length, 2, 'only rules whose scope matched are reported');
+	assert.equal(by['other-device-only'], undefined, 'a rule scoped to another device never ran');
+	assert.equal(by.reviews.satisfied, true);
+	assert.ok(by.reviews.count >= 1);
+	// The whole point: an unsatisfied gate is otherwise invisible, and it taxes every render.
+	assert.equal(by['never-there'].satisfied, false, 'a gate that found nothing must say so');
+	assert.equal(by['never-there'].count, 0);
+	assert.ok(by['never-there'].waitedMs >= 1000, 'and must report the time it cost');
+});
+
+test('finalDomStable catches content that arrives while a gate is holding the snapshot', async () => {
+	// The §5 shape: one widget is gated on, a SECOND arrives later. `domStable()` runs before the
+	// gates, so it plateaus on a DOM that has not yet received the second one; the gate then
+	// releases the snapshot and the second widget is simply missing.
+	const LATE = `<!doctype html><html><head><title>late</title></head><body>
+<div id="reviews"></div><div id="rails"></div>
+<script>
+  setTimeout(() => {
+    const t = document.getElementById('reviews');
+    for (let i = 0; i < 3; i++) { const d = document.createElement('div'); d.className = 'rev-item'; t.appendChild(d); }
+  }, 300);
+  // Arrives well after the gate above is satisfied.
+  setTimeout(() => {
+    const t = document.getElementById('rails');
+    for (let i = 0; i < 40; i++) { const d = document.createElement('div'); d.className = 'rail-item'; t.appendChild(d); }
+  }, 1600);
+</script></body></html>`;
+	const lateServer = http.createServer((_q, s) => {
+		s.setHeader('content-type', 'text/html');
+		s.end(LATE);
+	});
+	await new Promise<void>((r) => lateServer.listen(0, '127.0.0.1', r));
+	const lateBase = `http://127.0.0.1:${(lateServer.address() as AddressInfo).port}`;
+	try {
+		const gate = [
+			{ name: 'reviews', selector: '#reviews', waitForSelector: '.rev-item', minCount: 1, timeoutMs: 5000 },
+		];
+		const shared = { scroll: { enabled: false }, navigation: { domStableMs: 400, domStableTimeoutMs: 6000 } };
+
+		const without = await renderOnce({
+			url: lateBase,
+			device: 'desktop',
+			config: { ...shared, waitFor: gate },
+			probes: { n: selectorCountProbe(['.rail-item']) },
+		});
+		const with_ = await renderOnce({
+			url: lateBase,
+			device: 'desktop',
+			config: { ...shared, navigation: { ...shared.navigation, finalDomStable: true }, waitFor: gate },
+			probes: { n: selectorCountProbe(['.rail-item']) },
+		});
+
+		assert.equal(
+			(without.probes.n as Record<string, number>)['.rail-item'],
+			0,
+			'without the final plateau the gate releases the snapshot before the late section arrives'
+		);
+		assert.equal(
+			(with_.probes.n as Record<string, number>)['.rail-item'],
+			40,
+			'finalDomStable holds until the page actually stops changing'
+		);
+	} finally {
+		lateServer.close();
+	}
+});
