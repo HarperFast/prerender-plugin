@@ -1162,6 +1162,41 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'transaction may live anywhere near that long (see the scan group).',
 				{ min: 10 }
 			),
+			trigger: group(
+				'How detected changes are turned into re-renders. Submitted to a bounded queue that drains ' +
+					'BESIDE the walk rather than inside it, so a pass runs at its probe-rate floor whatever the ' +
+					'change rate.\n\n' +
+					'WHY THAT MATTERS. Triggering is six database operations, and when it ran in-line in the row ' +
+					'handler it shared the pass\u2019s concurrency with probing \u2014 so trigger volume set PASS ' +
+					'DURATION, and pass duration is detection latency, because the gap between two probes of one ' +
+					'URL is one pass. That closes a loop: more change \u2192 more triggers \u2192 longer pass ' +
+					'\u2192 a longer window in which each URL can change \u2192 more change. Measured on one ' +
+					'deployment, arming the probe took a pass from 9.2h to a projected ~21h with bot traffic flat ' +
+					'across both windows, and every knob traded deferrals against latency instead of escaping the ' +
+					'loop. Submitting makes pass duration max(probe time, drain time) rather than the sum, and ' +
+					'makes the meaningful limit triggers per SECOND \u2014 what the render fleet experiences.\n\n' +
+					'A full queue is reported as `deferred`, exactly like exhausting `maxTriggersPerSweep`: the ' +
+					'signature is left stale and the next pass re-detects. Nothing is lost by dropping the queue, ' +
+					'which is why it is in memory and why an aborted pass simply abandons it.',
+				{
+					ratePerSecond: option(
+						20,
+						'Triggers started per second. This is the rate the RENDER QUEUE sees, not the origin: a ' +
+							'trigger writes, it does not fetch. Size it against render capacity and the claim ' +
+							'floor, not against the origin ceiling that `changeProbe.ratePerSecond` respects. ' +
+							'0 or less drains unpaced.',
+						{ min: 0 }
+					),
+					concurrency: option(4, 'Triggers in flight at once.', { min: 1 }),
+					maxPending: option(
+						5000,
+						'Queue depth before submissions are refused and counted as `deferred`. Bounds memory ' +
+							'across a pass that can detect hundreds of thousands of changes; it is NOT the ' +
+							'per-pass budget, which stays `maxTriggersPerSweep`.',
+						{ min: 1 }
+					),
+				}
+			),
 			maxTriggersPerSweep: option(
 				5000,
 				'Ceiling on re-renders one sweep pass may file (per node). Changes past it stay detected but ' +
