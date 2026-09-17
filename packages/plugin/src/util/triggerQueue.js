@@ -41,6 +41,8 @@
  * add a table on the probe's write path, which is the one thing `ProbeState`'s design avoids.
  */
 
+import { MAX_TIMER_MS } from './probePacer.js';
+
 /** The outcome of a submit, as the caller's stats understand it. */
 export const SUBMIT_QUEUED = 'queued';
 export const SUBMIT_FULL = 'full';
@@ -115,7 +117,13 @@ export const createTriggerQueue = ({
 					const at = now();
 					const startAt = Math.max(at, nextSlotAt);
 					nextSlotAt = startAt + slotMs;
-					const wait = startAt - at;
+					// CLAMPED, because `sleep` wraps `setTimeout`: past a signed 32-bit delay it fires
+					// after 1ms instead of waiting, which would turn a deliberately slow drain into an
+					// unpaced one — the exact inversion `probePacer`'s own clamp exists to prevent. An
+					// absurdly small `ratePerSecond` is the way there (0.0001/s is a ~2.8h slot), and the
+					// resulting early wake just dispatches sooner, which at that configured rate is
+					// indistinguishable from the intent.
+					const wait = Math.min(startAt - at, MAX_TIMER_MS);
 					if (wait > 0) await sleep(wait);
 					// `stopped` can flip while we were asleep.
 					if (stopped) break;

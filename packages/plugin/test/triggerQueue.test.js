@@ -252,3 +252,28 @@ test('the inline trigger also withholds the baseline when the trigger throws', a
 	assert.equal(inline.stats.errors, 1);
 	assert.equal(inline.stats.triggered, 0);
 });
+
+test('an absurdly slow rate clamps the sleep instead of overflowing setTimeout', async () => {
+	// Past a signed 32-bit delay `setTimeout` fires after 1ms rather than waiting, so an unclamped
+	// wait would turn the slowest possible drain into an unpaced one.
+	const waits = [];
+	const q = createTriggerQueue({
+		trigger: async () => {},
+		write: async () => {},
+		ratePerSecond: 1e-7, // a 10,000,000,000 ms slot — past 2^31-1 on the very first wait
+		concurrency: 1,
+		now: () => 0, // a clock that never advances, so the backlog of slots keeps growing
+		sleep: async (ms) => {
+			waits.push(ms);
+		},
+	});
+	for (const url of ['a', 'b', 'c']) q.submit(item(`https://example.com/${url}`));
+	await q.drain();
+
+	assert.equal(q.stats.triggered, 3);
+	for (const w of waits) assert.ok(w <= 2147483647, `wait ${w} exceeds the max timer`);
+	assert.ok(
+		waits.some((w) => w === 2147483647),
+		'the pathological slot should have been clamped, not passed through'
+	);
+});
