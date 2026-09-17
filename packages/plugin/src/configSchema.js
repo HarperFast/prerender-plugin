@@ -1180,10 +1180,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'which is why it is in memory and why an aborted pass simply abandons it.',
 				{
 					ratePerSecond: option(
-						20,
+						5,
 						'Triggers started per second. This is the rate the RENDER QUEUE sees, not the origin: a ' +
-							'trigger writes, it does not fetch. Size it against render capacity and the claim ' +
-							'floor, not against the origin ceiling that `changeProbe.ratePerSecond` respects. ' +
+							'trigger writes, it does not fetch. Size it against SPARE RENDER CAPACITY and the claim ' +
+							'floor \u2014 not against the origin ceiling that `changeProbe.ratePerSecond` respects, ' +
+							'and not against how fast the queue could go.\n\n' +
+							'HOW TO SIZE IT. Aim for a drain that finishes INSIDE the pass: past that, the queue ' +
+							'backs up and changes defer for want of queue rather than of budget. Take ' +
+							'`maxTriggersPerSweep` over the pass length you expect \u2014 90,000 triggers across a ' +
+							'9h pass is ~2.8/s, so the default leaves headroom without being able to outrun a ' +
+							'fleet.\n\n' +
+							'GOING MUCH HIGHER IS THE ONE WAY THIS CHANGE CAN HURT, because it is something the ' +
+							'old in-line path could never do: at 20/s a 90,000-trigger budget drains in ~1.25h, ' +
+							'which on a four-node cluster injects renders several times faster than the fleet can ' +
+							'claim them \u2014 deepening the ready set and starving its lowest-priority class. ' +
+							'Raise it only against a measured render rate that sits below the fleet ceiling. ' +
 							'0 or less drains unpaced.',
 						{ min: 0 }
 					),
