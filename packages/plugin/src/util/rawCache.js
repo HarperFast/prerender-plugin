@@ -269,8 +269,9 @@ export const captureForRawCache = (resource, { cacheKey, policy }) => {
 		})
 		// The store is detached, so nothing else would observe a throw from the metric emit or the
 		// logger inside `storeRawPage`'s own catch. An unhandled rejection here would be a process-level
-		// event caused by an optimisation nobody is waiting on.
-		.catch(() => {})
+		// event caused by an optimisation nobody is waiting on. `e?.message ?? String(e)` because a
+		// non-Error throw is exactly what this is here to survive, and the log must not throw in turn.
+		.catch((e) => logger.warn?.(`[prerender] raw cache capture failed: ${e?.message ?? String(e)}`))
 		// ALWAYS, on every path. A slot that is not returned is a permanent reduction in how many
 		// documents this worker will ever capture again, and it would decay silently to zero.
 		.finally(() => {
