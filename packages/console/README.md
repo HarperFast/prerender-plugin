@@ -158,7 +158,8 @@ API contract; the short version: **Overview** (scale, serve health, backlog shap
 floor, schedule repair, and the discovered-target purge), **Traffic** (offload/hit-rate charts from
 one bounded analytics scan per node, freshness reported relative to each route's own render cadence,
 the non-hit verdicts broken out by what would fix them — coverage stated net of URLs the origin does
-not have — the discovery gate, and a client-side bot filter), **Sitemaps**, **Page cache**,
+not have — the discovery gate, the raw-document cache's refusals, and a client-side bot filter),
+**Sitemaps** (per-root ingest and check state, plus 24h walk counters), **Page cache**,
 **Queue** (render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first
 record/clear), **Change probe**, **URL explainer**, **Metrics** (the live catalog), **Config**.
 
@@ -254,6 +255,43 @@ way a row survived a pass — deferred, spared, unreadable, failed — is subtra
 reports what the pass never reached; a missing term there turns "we spared 40% on purpose" into
 "~40% was never reached".
 
+**The raw-document cache reports what it REFUSED**, not what it stored (plugin v0.76.0, console
+v0.14.0). `render.raw` keeps the origin document a miss already fetched, for URLs outside the
+render rotation — the facet and parameter combinations a crawler invents, which own no target and
+therefore miss on every single request. The failure mode is silence: a route that is enabled and
+filling nothing produces the same miss rate, the same origin proxies and the same absence of errors
+as a route nobody enabled, so the panel leads with the reason each candidate was turned away.
+Two of those reasons are findings rather than traffic and are called out above the breakdown —
+`has-cookie` means the origin is personalizing a route that was enabled on the assumption it is
+shared (the refusal is right, the assumption is not), and `oversize` means `render.raw.maxBytes`
+sits below the route's real document size, so the feature is on and structurally cannot fill.
+A raw serve is a **cache serve** and counts toward offload, but it is never a hit and never a
+freshness number: nothing rendered it, it has no cadence to be measured against, and the plugin
+emits no `page_age` for it. The Cache-served tile names the raw share instead of folding it in.
+
+**Ingested is not checked** (plugin v0.69.0, console v0.14.0). A sitemap walk now sends
+`If-Modified-Since`, and a `304` deliberately writes nothing — the stored row and its validator are
+still current. That makes `Sitemap.lastRefreshed` the time that document's _entries_ were last
+ingested, which on a nightly-rebuilt corpus is hours old by design; when it was last _looked at_
+lives on the run row. Both are shown under their own names, because printing the first under the
+second's label turns conditional fetching working into an operator chasing a sitemap that is not
+stale. Beside them, a walk-activity panel sums the per-run counters across roots and nodes over 24h
+(the same range key the Change probe view uses, so the two share one cached scan): `not modified` is
+the only evidence anywhere that conditional fetching is working at all — a walk that re-parses every
+document succeeds exactly like one that skipped — and a flat zero across a day of walks is flagged.
+`rendered soon` is the share of new targets whose first render was pulled inside
+`sitemap.newTargets.window` rather than waiting out a full interval of jitter; it is a _subset_ of
+created, stated with its denominator, and the gap is the per-run cap sending a bulk ingest back to
+the old behaviour.
+
+**A cadence is not its ceiling** (plugin v0.77.0, console v0.14.0). The URL explainer's Target card
+shows `renderInterval`, which is the interval the demand ladder schedules _inside_ — with the ladder
+armed it is not the cadence for most of a corpus, and nothing said so. The explainer now renders the
+plugin's own resolution: the effective interval, all four inputs (route, stored, default, rung), the
+demand floor, and `clampedBy` — the clamp that actually bound. `floor` on one URL is information;
+`floor` across a route means the ladder has no dynamic range there and the promotion machinery is
+running for nothing. `ceiling` means the rung is inert.
+
 Two more changed shape when configuration became editable:
 
 - **Nodes is new**, and it exists because "is this node healthy" had four homes: liveness and the
@@ -271,7 +309,8 @@ Two more changed shape when configuration became editable:
 
 Each domain view owns the options that govern the data it shows — `sitemap.*` under Sitemaps,
 `queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Page cache, `analytics`/`crawlStats`
-under Traffic, `invalidation` under Invalidations, `changeProbe` under Change probe — while Config
+under Traffic, `invalidation` under Invalidations, `changeProbe` under Change probe (`render.raw.*`
+rides the `render` group under Queue) — while Config
 remains exhaustive, so a setting can be found either by where it acts or by name.
 
 ## Development

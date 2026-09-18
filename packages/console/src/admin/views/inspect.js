@@ -26,6 +26,11 @@
  *   - The same rule covers "below the claim floor" and "leased", which are answers about the
  *     OWNER's node-local shared buffer. The owner computes both and this view consumes them
  *     verbatim; it never compares a row against the querying node's own floor.
+ *   - A CADENCE IS NOT ITS CEILING. The Target's `renderInterval` is the interval the demand
+ *     ladder schedules INSIDE, not the one this URL runs on, and the two differ for most of a
+ *     corpus once the ladder is armed. `cadenceCard` renders the plugin's own resolution of it
+ *     (`explain`'s `cadence` block, plugin v0.77.0) — every input, and the clamp that decided —
+ *     rather than leaving a reader to infer a cadence from a ceiling.
  *
  * THE BROWSE HALF'S QUERY SHAPE, AND THE HONESTY RULE THAT FOLLOWS FROM IT. `PrerenderedPage`
  * has only its primary key. A prefix search is a primary-key range and cheap; anything else —
@@ -234,6 +239,7 @@ function explanation(ctx, data) {
 				verdictPills(data, page),
 			],
 		}),
+		cadenceCard(data),
 		card('Stored rows', {
 			body: [
 				el('h3', { cls: 'subhead', text: 'PrerenderedPage' }),
@@ -301,7 +307,12 @@ function explanation(ctx, data) {
 									: '—',
 							],
 							['Scheduler node', mono(target.schedulerNode ?? '—')],
-							['Render interval', target.renderInterval ? duration(Number(target.renderInterval)) : 'default'],
+							// The stored CEILING, not the cadence: the demand ladder schedules inside it. The
+							// Render cadence card above resolves the two, which is why this row names what it is.
+							[
+								'Render interval (ceiling)',
+								target.renderInterval ? duration(Number(target.renderInterval)) : 'default',
+							],
 							['State', target.state === 'suppressed' ? pill('suppressed', 'warn') : pill('active', 'ok')],
 							data.rows.suppression && ['Suppressed', suppressionSummary(data.rows.suppression)],
 						])
@@ -311,6 +322,120 @@ function explanation(ctx, data) {
 			],
 		}),
 	];
+}
+
+/**
+ * How often this URL actually re-renders, and which input decided it.
+ *
+ * WHY THIS IS NOT ONE NUMBER. The cadence a page runs on is the demand ladder's stored rung, raised
+ * to the route's `demandFloor` and then capped by the base interval — route > stored > default. So
+ * there are four inputs and two clamps, and every one of them is a value an operator can set
+ * somewhere else and then fail to see the effect of. The `Render interval` row on the Target card
+ * below is the CEILING, not the cadence; reading it as the cadence is the specific mistake the
+ * plugin grew `explainCadence` (v0.77.0) to make impossible.
+ *
+ * READ `clampedBy` FIRST. It names the clamp that actually bound:
+ *
+ *   floor     the ladder wanted faster and `demandFloor` refused. One URL is information; `floor`
+ *             across a route means the ladder has NO dynamic range there — it is pinned at the
+ *             floor whatever the traffic does, and the promotion machinery is running for nothing.
+ *   ceiling   the ladder wanted slower than the route grants, so the route's own interval won. The
+ *             page renders at its configured cadence; the rung is inert.
+ *   null      the rung applied as computed, or there is no rung yet.
+ *
+ * The ceiling is tested FIRST upstream, deliberately: a floor above the route's interval reports
+ * `ceiling`, because that is the clamp that produced the answer — and a `demandFloor` larger than
+ * the `renderInterval` it modifies is precisely the misconfiguration this view is opened to find.
+ */
+const CLAMP = {
+	floor: [
+		'warn',
+		'clamped by demandFloor',
+		'The ladder’s rung was raised to the route’s demand floor. Across a route this means the ladder has ' +
+			'no range to work in: it cannot go faster than the floor, so promotion is running for nothing.',
+	],
+	ceiling: [
+		'',
+		'clamped by the route ceiling',
+		'The rung was slower than the route’s own interval, so the route won. The ladder never schedules ' +
+			'slower than the cadence a route already grants — the rung is inert here.',
+	],
+};
+
+/**
+ * An interval as text, or null when there isn't one.
+ *
+ * `duration()` takes `Math.abs(ms)`, so it formats `null` as "0s" and `undefined` as "NaNs" — both
+ * of which read as a real cadence. Every figure on this card comes from a payload that may be
+ * older than this console, so each one goes through here rather than trusting the field to exist.
+ * `Number()` because `storedInterval` rides a schema Long and arrives as a string on some payloads.
+ */
+const intervalText = (value) => {
+	const ms = Number(value);
+	return Number.isFinite(ms) && ms > 0 ? duration(ms) : null;
+};
+
+function cadenceCard(data) {
+	const cadence = data.cadence;
+	// Null for a URL with no target, and that is a real answer rather than a missing one: cadence is
+	// a property of being in the rotation. An older plugin sends no `cadence` at all, which is the
+	// same absence — say which, rather than drawing a card of dashes.
+	if (!cadence) return null;
+
+	const clamp = CLAMP[cadence.clampedBy];
+	const effective = intervalText(cadence.effectiveInterval);
+	const rung = intervalText(cadence.demandInterval);
+	const floor = intervalText(cadence.demandFloor);
+	const row = (text, note) => el('span', null, [mono(text), muted(`  ${note}`)]);
+
+	return card('Render cadence', {
+		head: [
+			clamp ? pill(clamp[1], clamp[0]) : rung ? pill('ladder rung applied', 'ok') : pill('base interval', ''),
+			spacer(),
+			effective && el('span', { cls: 'mono', style: { fontSize: '13px', color: 'var(--fg-0)' }, text: effective }),
+		],
+		body: [
+			clamp && el('div', { cls: `note ${clamp[0]}`.trim(), style: { marginBottom: '10px' } }, [clamp[2]]),
+			kv([
+				[
+					'Effective interval',
+					effective ? row(effective, 'what the scheduler actually files') : muted('— not reported'),
+				],
+				[
+					'Base (ceiling)',
+					intervalText(cadence.baseInterval)
+						? row(intervalText(cadence.baseInterval), `from ${cadence.baseFrom ?? 'unknown'}`)
+						: muted('— not reported'),
+				],
+				[
+					'Route interval',
+					intervalText(cadence.routeInterval)
+						? mono(intervalText(cadence.routeInterval))
+						: muted('— the route sets none'),
+				],
+				[
+					'Stored on the target',
+					intervalText(cadence.storedInterval)
+						? mono(intervalText(cadence.storedInterval))
+						: muted('— sitemap changefreq or an explicit write'),
+				],
+				[
+					'Default interval',
+					intervalText(cadence.defaultInterval) ? mono(intervalText(cadence.defaultInterval)) : muted('—'),
+				],
+				[
+					'Demand rung',
+					rung ? row(rung, 'the ladder’s stored decision') : muted('— the ladder has not evaluated this target'),
+				],
+				['Demand floor', floor ? row(floor, 'the fastest rung this route may reach') : muted('— the route sets none')],
+			]),
+			el('p', { cls: 'muted', style: { margin: '12px 0 0', fontSize: '12px' } }, [
+				'Resolved exactly as the scheduler resolves it: the rung raised to the floor, then capped by the ',
+				'base — so the Target card’s render interval below is the ceiling this is clamped into, never the ',
+				'cadence on its own.',
+			]),
+		],
+	});
 }
 
 function verdictPills(data, page) {

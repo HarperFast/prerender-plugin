@@ -295,11 +295,11 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
  * above says so and it has happened — which is why this checks the family the OTHER test is blind
  * to instead of replacing it. Between them, a new probe series has to be charted or waived.
  *
- * WHAT THIS STILL DOES NOT COVER: the other dynamic families (`sitemap_*`, `demand_*`,
- * `queue_health`'s gauges, `invalidation_*`). Those are legitimately unread from analytics — the
- * queue gauges are read from the overview endpoint instead, and the demand series have no panel —
- * so guarding them means a waiver list stating a decision per series, which belongs with whoever
- * makes those decisions rather than in a catch-up change.
+ * WHAT THIS STILL DOES NOT COVER: the remaining dynamic families (`demand_*`, `queue_health`'s
+ * gauges, `invalidation_*`). Those are legitimately unread from analytics — the queue gauges are
+ * read from the overview endpoint instead, and the demand series have no panel — so guarding them
+ * means a waiver list stating a decision per series, which belongs with whoever makes those
+ * decisions rather than in a catch-up change. `sitemap_*` has its own test below.
  */
 test('every probe series the catalog declares is read by the console, or waived with a reason', async () => {
 	const { METRICS } = await import('../../plugin/src/metrics.js');
@@ -321,6 +321,75 @@ test('every probe series the catalog declares is read by the console, or waived 
 			isRead(name),
 			`the plugin emits prerender_ops.${name} and no console view reads it — chart it on the Change ` +
 				"probe view, or add it to this test's NOT_CHARTED with the reason"
+		);
+	}
+});
+
+/**
+ * The same contract again, for the `sitemap_*` family — and this one reads the EMIT SITES, not the
+ * catalog.
+ *
+ * `metrics.sitemapRun` is on `DYNAMIC_SERIES_SLOT`, so the literal scan above cannot see any of
+ * these, and that exemption cost exactly what the probe one did: plugin v0.69.0 added
+ * `sitemap_not_modified` and v0.74.0 `sitemap_created_soon`, the console read neither, and every
+ * test on both sides stayed green. `sitemap_not_modified` is the ONLY evidence anywhere that
+ * conditional sitemap fetching is working — a walk that re-parses everything succeeds exactly like
+ * one that skipped.
+ *
+ * GROUND TRUTH IS `resources/Sitemap.js`, deliberately NOT the catalog's `values` list as the probe
+ * test uses. The two have drifted here and the drift is the point: at the time of writing the
+ * catalog enumerates six `sitemap_*` names and the plugin emits fifteen, so a catalog-based guard
+ * would pass while blind to the two series this test exists for. The emit site is what makes a
+ * series real.
+ */
+test('every sitemap series the plugin emits is read by the console, or waived with a reason', () => {
+	const source = readFileSync(fileURLToPath(new URL('../../plugin/src/resources/Sitemap.js', import.meta.url)), 'utf8');
+	// To the END of the statement, not to the first `)`: the departure emitter's own argument
+	// contains parentheses, and a lazier match would hand this test a truncated string it could
+	// neither recognize nor report usefully. Every call site is one line.
+	const calls = [...source.matchAll(/metrics\.sitemapRun\([^,]+,\s*(.+)\);$/gm)];
+	assert.ok(calls.length > 5, 'expected to find the sitemap emit sites at all — has Sitemap.js been restructured?');
+
+	// A series name built at the call site cannot be read from here, exactly as with the emitters
+	// the test above exempts — so each one is named, with what it is, rather than passing silently.
+	const BUILT_AT_THE_CALL_SITE = new Map([
+		[
+			"`departure_${name.replace(/-/g, '_')}`",
+			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …) — ten ' +
+				'series with dry-run-vs-armed semantics of their own. No console panel reads them: the ' +
+				'Sitemaps view charts walk OUTCOMES, and departures are a separate decision surface that ' +
+				'needs its own panel rather than seven more tiles on this one. Tracked, not forgotten.',
+		],
+	]);
+
+	const emitted = [];
+	for (const [, arg] of calls) {
+		const literal = arg.trim().match(/^(['"])([a-z_0-9]+)\1$/);
+		if (literal) {
+			emitted.push(`sitemap_${literal[2]}`);
+			continue;
+		}
+		assert.ok(
+			BUILT_AT_THE_CALL_SITE.has(arg.trim()),
+			`metrics.sitemapRun is called with a series name this test cannot read (\`${arg.trim()}\`). Name it in ` +
+				'BUILT_AT_THE_CALL_SITE with what it is and whether the console reads it, or pass a literal'
+		);
+	}
+	assert.ok(emitted.length > 5, 'expected literal sitemap series names');
+
+	// The walk panel holds the SUFFIX — `totalOf('not_modified')` builds `sitemap_not_modified` —
+	// so the full name never appears in the client. Both spellings count, as in the probe test.
+	const client = [...clientSources.values()].join('\n');
+	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('sitemap_'.length)}'`);
+
+	const NOT_CHARTED = new Map();
+
+	for (const name of new Set(emitted)) {
+		if (NOT_CHARTED.has(name)) continue;
+		assert.ok(
+			isRead(name),
+			`the plugin emits prerender_ops.${name} and no console view reads it — chart it on the Sitemaps ` +
+				"view, or add it to this test's NOT_CHARTED with the reason"
 		);
 	}
 });

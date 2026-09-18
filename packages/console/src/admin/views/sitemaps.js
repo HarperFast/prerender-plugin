@@ -7,17 +7,43 @@
  * The detail fetches ONE page of entries at a time, sliced server-side; per-entry state comes
  * from bounded point reads on just that page. Text filtering below is within the fetched page
  * and is labelled as such.
+ *
+ * INGESTED IS NOT CHECKED, and conflating the two misreports a healthy corpus as a stale one.
+ * Since plugin v0.69.0 a walk sends `If-Modified-Since`, and a `304` writes NOTHING — the stored
+ * row, its validator and its `lastRefreshed` are all still current, so they are deliberately left
+ * untouched. That makes `Sitemap.lastRefreshed` the time this document's ENTRIES were last
+ * INGESTED, which on a corpus that rebuilds nightly is hours old by design and says nothing about
+ * when it was last looked at. When it was last looked at lives on the run row (`SitemapRefresh`),
+ * per root. Both are shown, named for what they are: "ingested" on the document, "checked" from
+ * the run. A console that prints one under the other's label turns the feature working into an
+ * operator chasing a sitemap that is not stale.
+ *
+ * THE ANALYTICS WINDOW IS 24h AND SHARED. A refresh pass is daily, so an hour-wide window would
+ * almost never contain one; 24h is also the key the Change probe view uses, so whichever loaded
+ * first inside `management.analytics.cacheTtl` serves the other from the worker's cache. The walk
+ * counters are the only cluster-wide view of pass outcomes — the run row above is one root on one
+ * node — and `sitemap_not_modified` in particular is the ONLY evidence that conditional fetching
+ * is working at all.
  */
 
-import { ago, card, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, table } from '../ui.js';
+import { ago, card, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, stat, table } from '../ui.js';
+import { emptyNote, fmtCount, pick, scanFooter, scopeLabel, sumValues, windowEmpty } from '../charts.js';
 import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'sitemaps', label: 'Sitemaps', crumb: 'sitemaps', icon: ICONS.sitemaps };
 
 const PAGE_SIZE = 50;
 
+/** The window the walk counters are read over — a day, because a pass is daily. See the header. */
+const WALK_RANGE_MS = 24 * 3_600_000;
+
 export async function load(ctx) {
-	const [res] = await Promise.all([ctx.get('sitemaps'), loadConfig(ctx)]);
+	const [res, analyticsRes] = await Promise.all([
+		ctx.get('sitemaps'),
+		ctx.get('analytics', { range: WALK_RANGE_MS }),
+		loadConfig(ctx),
+	]);
+	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
 	if (!res.ok) {
 		ctx.data.list = null;
 		ctx.data.error = res.body?.error ?? `Could not load sitemaps (${res.status})`;
@@ -92,10 +118,23 @@ export function render(ctx) {
 						detail(ctx),
 					]),
 				]),
+		walkActivity(ctx),
 		settings(ctx),
 		editTray(ctx),
 	];
 }
+
+/**
+ * When this root was last WALKED, from its run row — as distinct from when its document was last
+ * ingested. Null for a child sitemap, which has no run row of its own: `SitemapRefresh` holds one
+ * row per root plus the `all` marker, so a child's only timestamp is its ingest.
+ */
+const checkedAt = (refresh) => {
+	const at = refresh?.finishedAt ?? refresh?.lastRefreshed ?? null;
+	if (!at) return null;
+	const ms = new Date(at).getTime();
+	return Number.isFinite(ms) ? ms : null;
+};
 
 function rootList(ctx, roots) {
 	return el(
@@ -133,8 +172,16 @@ function rootList(ctx, roots) {
 						failed ? pill('✗', 'bad') : running ? pill('…', 'info') : pill('✓', 'ok'),
 					]),
 					el('div', { cls: 'mono muted', style: { fontSize: '11px', marginTop: '4px' } }, [
-						`${num(sitemap.entryCount)} entries · ${sitemap.lastRefreshed ? ago(new Date(sitemap.lastRefreshed).getTime()) : 'never refreshed'}`,
+						`${num(sitemap.entryCount)} entries · ingested ${
+							sitemap.lastRefreshed ? ago(new Date(sitemap.lastRefreshed).getTime()) : 'never'
+						}`,
 					]),
+					// The run row, not the document row — see the header. A 304 leaves the document's own
+					// timestamp alone, so this is the only line that says the sitemap was looked at.
+					checkedAt(sitemap.refresh) &&
+						el('div', { cls: 'mono muted', style: { fontSize: '11px' } }, [
+							`checked ${ago(checkedAt(sitemap.refresh))}`,
+						]),
 				]
 			);
 		})
@@ -190,10 +237,31 @@ function detail(ctx) {
 			refresh &&
 				el('div', { style: { marginTop: '14px' } }, [
 					kv([
-						['Last walk', refresh.finishedAt ? ago(new Date(refresh.finishedAt).getTime()) : '—'],
+						['Last walk', checkedAt(refresh) ? ago(checkedAt(refresh)) : '—'],
 						refresh.created !== undefined && [
 							'Created / updated / removed',
-							`${num(refresh.created)} / ${num(refresh.updated)} / ${num(refresh.removed)}`,
+							el('span', null, [
+								`${num(refresh.created)} / ${num(refresh.updated)} / ${num(refresh.removed)}`,
+								// A SUBSET of `created`, never a fourth number: these are the new targets whose FIRST
+								// render was pulled into `sitemap.newTargets.window` instead of waiting out a full
+								// interval of jitter. `created - createdSoon` is the bulk-population overflow that
+								// fell back to the old behaviour, which is why the denominator is stated.
+								refresh.createdSoon !== undefined && refresh.created
+									? muted(`  ${num(refresh.createdSoon)} of the creates rendered soon`)
+									: null,
+							]),
+						],
+						// THE ONLY PROOF CONDITIONAL FETCHING IS WORKING, per root. A steady zero where the
+						// walk sends If-Modified-Since means the origin is not honouring it and every pass is
+						// re-parsing and re-scanning documents that did not change.
+						refresh.notModified !== undefined && [
+							'Not modified (304)',
+							el('span', null, [
+								`${num(refresh.notModified)} of ${num(refresh.sitemapsProcessed)} documents`,
+								refresh.sitemapsProcessed
+									? muted(`  ${pct(refresh.notModified, refresh.sitemapsProcessed)} skipped the re-parse`)
+									: null,
+							]),
 						],
 						refresh.duplicates ? ['Duplicates (overlapping sitemaps)', num(refresh.duplicates)] : null,
 					]),
@@ -205,8 +273,10 @@ function detail(ctx) {
 }
 
 function statsRow(detail) {
-	const { sitemap, targetCount } = detail;
+	const { sitemap, targetCount, refresh } = detail;
 	const entryCount = sitemap.entryCount ?? 0;
+	const ingested = sitemap.lastRefreshed ? ago(new Date(sitemap.lastRefreshed).getTime()) : 'never';
+	const checked = checkedAt(refresh);
 
 	// AN INDEX HAS NO TARGETS OF ITS OWN, structurally: a walk attributes each Target to the
 	// sitemap that actually listed the URL, which is always a child. So "Targets 0 / Coverage 0%"
@@ -216,9 +286,12 @@ function statsRow(detail) {
 		return el('div', { style: STATS_GRID }, [
 			statCell('Child sitemaps', num(entryCount), muted('listed by this index')),
 			statCell(
-				'Last walked',
-				sitemap.lastRefreshed ? ago(new Date(sitemap.lastRefreshed).getTime()) : 'never',
-				muted('this document, not its children')
+				'Child list ingested',
+				ingested,
+				// NOT "last walked". A 304 on an index says its CHILD LIST is unchanged, and the walk
+				// still descends into every child — so this document can be hours old while the corpus
+				// behind it was rebuilt minutes ago.
+				muted(checked ? `this document, not its children · checked ${ago(checked)}` : 'this document, not its children')
 			),
 			statCell('Entries', '—', muted('an index lists sitemaps, not URLs — open one below')),
 		]);
@@ -237,6 +310,15 @@ function statsRow(detail) {
 			'Coverage',
 			targetCount === null || !entryCount ? '—' : pct(Math.min(targetCount.count, entryCount), entryCount),
 			muted('entries with a render target')
+		),
+		// A CHILD HAS NO RUN ROW, so this is usually the only timestamp it carries — and it is an
+		// INGEST, not a check. Under conditional fetching a child that has not changed is fetched on
+		// every pass and written on none of them, so an hours-old figure here is the normal steady
+		// state rather than a walk that stopped reaching it.
+		statCell(
+			'Entries ingested',
+			ingested,
+			muted(checked ? `checked ${ago(checked)}` : 'when this document last changed — not when it was checked')
 		),
 	]);
 }
@@ -380,6 +462,108 @@ function shortPath(url) {
 	} catch {
 		return String(url ?? '');
 	}
+}
+
+/**
+ * Every walk that finished in the last day, across every root and every node.
+ *
+ * WHY IT IS NOT THE RUN ROW ABOVE. `SitemapRefresh` holds the LAST run per root, on whichever node
+ * claimed it. These counters are one emit per finished run, so they sum passes — which is the only
+ * way to see a root that ran three times, or a node whose walks are failing while another node's
+ * succeed. They are also the only home for the two numbers a rollout is judged on:
+ *
+ *   not modified   documents the origin answered `304` to, so their entries were never re-parsed
+ *                  and their prune scan never ran. On a healthy corpus this is most of every pass
+ *                  between rebuilds. A steady ZERO where conditional fetching is enabled means the
+ *                  origin is not honouring `If-Modified-Since` and every pass is doing full work —
+ *                  and nothing else anywhere reports that, because the walk still succeeds.
+ *   rendered soon  new targets whose first render was pulled into `sitemap.newTargets.window`
+ *                  instead of waiting out a full interval of jitter. A SUBSET of created, so the
+ *                  gap between the two is the per-run cap sending the overflow back to the old
+ *                  behaviour — which is what a bulk first ingest is supposed to look like.
+ *
+ * VALUE SEMANTICS: each row is one emit per RUN carrying that run's count, so the sum is
+ * Σ(mean × count) — `sumValues`, never `sumCount`, which would count runs.
+ */
+function walkActivity(ctx) {
+	const data = ctx.data.analytics;
+	if (!data || data.available === false) return null;
+
+	const combos = pick(data, 'prerender_ops', (s) => typeof s.path === 'string' && s.path.startsWith('sitemap_'));
+	const totalOf = (series) => sumValues(combos.filter((s) => s.path === `sitemap_${series}`));
+	const documents = totalOf('sitemaps');
+	const notModified = totalOf('not_modified');
+	const created = totalOf('created');
+	const createdSoon = totalOf('created_soon');
+	const updated = totalOf('updated');
+	const skipped = totalOf('skipped');
+	const removed = totalOf('removed');
+	const failed = totalOf('failed');
+
+	const title = `Walk activity — ${scopeLabel(data)}, last 24h`;
+	if (windowEmpty(data) || !combos.length) {
+		return card(title, {
+			body: [
+				emptyNote('sitemap walk', data),
+				el('p', { cls: 'muted chart-note' }, [
+					'These counters are emitted once per FINISHED walk. A refresh pass is daily, so an empty panel ',
+					'most often means no walk completed inside the window — press Refresh all above, or check that ',
+					el('code', { text: 'sitemap.node' }),
+					' names a node that is still in the cluster.',
+				]),
+			],
+			foot: [scanFooter(data)],
+		});
+	}
+
+	// Zero 304s across a day of walks is the conditional-fetch rollout not working. It is not an
+	// error anywhere — the walks succeed, the corpus is correct — it just costs a full re-parse and
+	// a prune scan per document, forever, which is the entire saving the feature was for.
+	const conditionalDead = documents > 0 && notModified === 0;
+
+	return card(title, {
+		head: [failed > 0 ? pill(`${fmtCount(failed)} failed`, 'bad') : null, spacer()],
+		body: [
+			conditionalDead &&
+				el('div', { cls: 'note warn' }, [
+					el('strong', { text: 'No document was answered 304 in this window. ' }),
+					'Every walk re-parsed every sitemap and re-ran its prune scan. Conditional fetching sends ',
+					el('code', { text: 'If-Modified-Since' }),
+					' from the stored validator, so a flat zero means either the origin ignores it or nothing has ',
+					'a stored validator yet — the first pass after an upgrade is legitimately all-zero here, a ',
+					'week of them is not.',
+				]),
+			el('div', { cls: 'stats' }, [
+				stat('Documents fetched', fmtCount(documents), 'attempts across every finished walk, failures included'),
+				stat(
+					'Not modified',
+					documents ? pct(notModified, documents) : '—',
+					`${fmtCount(notModified)} skipped the re-parse and the prune scan`,
+					{ warn: conditionalDead }
+				),
+				stat(
+					'Targets created',
+					fmtCount(created),
+					created
+						? `${pct(createdSoon, created)} rendered soon rather than waiting out the jitter`
+						: 'nothing new was declared'
+				),
+				stat('Re-attributed', fmtCount(updated), 'moved between sitemaps — the page did not change'),
+				stat('Unchanged', fmtCount(skipped), 'already correct, no write'),
+				stat('Unlinked', fmtCount(removed), 'left the sitemap that declared them'),
+				stat('Failed', fmtCount(failed), 'child sitemaps a walk could not read', { warn: failed > 0 }),
+			]),
+			el('p', { cls: 'muted chart-note' }, [
+				'One emit per finished walk, summed across roots and nodes — so these are passes, not the state ',
+				'of any one sitemap; the panel above is that. “Rendered soon” is a SUBSET of created, capped per ',
+				'run by ',
+				el('code', { text: 'sitemap.newTargets.maxPerRun' }),
+				', and the overflow falls back to full-interval jitter, which is what a bulk first ingest is ',
+				'meant to look like. A 304 is still an origin request; what it saves is this side’s work.',
+			]),
+		],
+		foot: [scanFooter(data)],
+	});
 }
 
 /**

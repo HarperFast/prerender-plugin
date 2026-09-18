@@ -40,14 +40,23 @@
  * and one origin_fetch row — except under a bot filter, where origin_fetch carries no bot name;
  * there the tile says it is not netted instead of scaling one population by the other's share.
  *
- * NOT EVERY NON-HIT IS A MISS. "miss" is one of nine freshness verdicts and the only one that
+ * NOT EVERY NON-HIT IS A MISS. "miss" is one of ten freshness verdicts and the only one that
  * means what the word implies — nothing cached under the key. The others are a page served past
  * its cadence (`swr`), one past the SWR window entirely (`stale`), a body that could not be read
  * although the key is cached and scheduled (`blob-missing` / `blob-timeout`, rescued or not), a
- * serve a bulk invalidation cost us (`invalidated`), and requests where the cache was never
- * consulted at all (`skip`, `bypass`). They have four different fixes — corpus coverage, render
- * cadence, blob integrity, and nothing-to-fix — so they get their own panel rather than one bar
- * labelled "miss", with what each one cost at the origin beside it.
+ * serve a bulk invalidation cost us (`invalidated`), a miss answered from a stored ORIGIN document
+ * rather than a snapshot (`raw`), and requests where the cache was never consulted at all (`skip`,
+ * `bypass`). They have five different fixes — corpus coverage, render cadence, blob integrity,
+ * nothing-to-fix, and a setting — so they get their own panel rather than one bar labelled "miss",
+ * with what each one cost at the origin beside it.
+ *
+ * `raw` IS A CACHE SERVE AND NEVER A HIT. `render.raw` keeps the document a miss already fetched,
+ * for URLs that own no target and never will, so the next crawler is answered from storage: it
+ * spares the origin exactly as a snapshot does, and it counts in Cache-served and in offload. But
+ * no browser ran on it, it has no cadence to be measured against, and it emits no `page_age` — so
+ * it is deliberately absent from every freshness number on this view. Its own panel reports what
+ * the store REFUSED, because an enabled route filling nothing is otherwise indistinguishable from
+ * one nobody enabled.
  *
  * THE BOT FILTER IS CLIENT-SIDE, ALWAYS. Selecting bots re-renders from the payload already in
  * hand; it never refetches, because the load discipline below is the whole reason this view can
@@ -184,7 +193,10 @@ export function render(ctx) {
 		el('div', { cls: 'cols' }, [latency(data, filter), statusCodes(data, filter)]),
 		crawlers(data, scope),
 		routes(ctx, data, cadences, filter),
+		// The two panels about URLs the rotation does not cover, together: the gate is what keeps them
+		// out of it, and the raw cache is what answers them anyway.
 		discoveryGate(ctx, data, filter),
+		rawCache(ctx, data, filter),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -396,7 +408,14 @@ function kpis(data, scope) {
 	const { serves, requests, filter } = scope;
 	const total = sumCount(serves);
 	const originServes = sumCount(serves.filter((s) => s.path === 'origin'));
-	const cacheServes = sumCount(serves.filter((s) => s.path === 'cache'));
+	// BY VERDICT, NOT BY SOURCE. Until plugin v0.76.0 the two agreed — every cache-served verdict
+	// carried source `cache`, `peer-rescue` included — so this counted `path === 'cache'` and got the
+	// right answer. `raw` broke that: it is a cache serve with its OWN source, so the source test
+	// would have dropped it and this tile would have fallen as the feature started working, while
+	// gross offload rose. `isCacheServed` is the enumeration charts.js says every such sum must
+	// share, and this is now one of them.
+	const rawServes = sumCount(serves.filter((s) => s.path === 'raw'));
+	const cacheServes = sumCount(serves.filter((s) => isCacheServed(s.method)));
 	const freshHits = sumCount(serves.filter((s) => s.method === 'hit'));
 	const coverage = coverageSplit({ serves, costs: originCostByReason(data), filter });
 	const arrived = sumCount(requests);
@@ -465,7 +484,16 @@ function kpis(data, scope) {
 			// more requests than the crawlers would have on their own — the finding, not a display bug.
 			{ warn: Number.isFinite(load.net) && load.net < 0.5 }
 		),
-		stat('Cache-served', pct(cacheServes, total), 'stored snapshot answered'),
+		stat(
+			'Cache-served',
+			pct(cacheServes, total),
+			// Named apart the moment there are any, because the two are different claims about the
+			// deployment: a snapshot means a render covers that URL, a raw document means one never
+			// will and the origin was spared anyway.
+			rawServes > 0
+				? `answered from storage · ${pct(rawServes, total)} raw documents, not snapshots`
+				: 'stored snapshot answered'
+		),
 		stat('Fresh hits', pct(freshHits, total), 'inside the configured cadence'),
 		stat(
 			'Coverage miss',
@@ -512,9 +540,11 @@ function freshness(data, { serves, filter }) {
 				? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k))
 				: emptyNote('bot_serve', data),
 			el('p', { cls: 'muted chart-note' }, [
-				'hit + swr + verified + peer-rescue is cache-served. A rising miss share is a coverage problem; a ',
-				'rising swr share is the fleet not keeping the configured cadence; blob-* should sit at zero. What ',
-				'each verdict costs, and which of them are the same problem, is the panel below.',
+				'hit + swr + verified + peer-rescue + raw is cache-served. A rising miss share is a coverage ',
+				'problem; a rising swr share is the fleet not keeping the configured cadence; blob-* should sit at ',
+				'zero. `raw` is a miss answered from a stored ORIGIN document rather than a snapshot — it spares ',
+				'the origin, but nothing rendered it, so it never counts as a hit. What each verdict costs, and ',
+				'which of them are the same problem, is the panel below.',
 			]),
 			filter && muted(`Filtered to ${[...filter].join(', ')}.`),
 		],
@@ -573,10 +603,16 @@ function staleness(ctx, data, scope) {
 	// differ whenever a target's cadence comes from its stored value (a sitemap `changefreq`)
 	// instead — a case no metric exposes. When the two disagree, the verdicts win and the divisor
 	// is what is wrong, so say that rather than let a config gap read as a fleet failure.
-	const cacheServed = sumCount(serves.filter((x) => isCacheServed(x.method)));
+	//
+	// THE DENOMINATOR IS THE SERVES THAT PRODUCED THE DISTRIBUTION, which is the serves whose SOURCE
+	// was `cache` — `page_age`/`route_page_age` are emitted only on that branch. It is deliberately
+	// not `isCacheServed`, which since plugin v0.76.0 also contains `raw`: a raw document contributes
+	// no age sample, so counting it here would shrink the past-due share on exactly the deployments
+	// that serve a lot of raw and fire this note against a fleet that is genuinely behind.
+	const agedServes = sumCount(serves.filter((x) => x.path === 'cache'));
 	const pastDue = sumCount(serves.filter((x) => x.method === 'swr' || x.method === 'stale'));
 	const contradicted =
-		normalizable && Number.isFinite(ratioP95) && ratioP95 > 1 && cacheServed > 0 && pastDue / cacheServed < 0.01;
+		normalizable && Number.isFinite(ratioP95) && ratioP95 > 1 && agedServes > 0 && pastDue / agedServes < 0.01;
 
 	return card(mode === 'ratio' ? 'Staleness at serve (÷ cadence, ≈)' : 'Page age at serve (≈)', {
 		head: [
@@ -630,7 +666,7 @@ function staleness(ctx, data, scope) {
 			contradicted &&
 				el('div', { cls: 'note' }, [
 					el('strong', { text: 'The freshness verdicts disagree with this ratio, and they are the authority. ' }),
-					`Only ${pct(pastDue, cacheServed)} of cache serves were past due (swr + stale), which is decided per `,
+					`Only ${pct(pastDue, agedServes)} of snapshot serves were past due (swr + stale), which is decided per `,
 					'request against that page’s own expiry — so these pages are fresh and the divisor is short. That ',
 					'happens when a target’s cadence comes from its stored interval (a sitemap ',
 					el('code', { text: 'changefreq' }),
@@ -688,6 +724,15 @@ const FAMILIES = [
 		hint: 'a bulk invalidation touched the serve — refused, or rescued on evidence',
 	},
 	{
+		key: 'raw',
+		label: 'Raw document',
+		// Not a fresh hit and not a problem: the request was a miss, and a stored ORIGIN document
+		// answered it instead of a live proxy. Its own family because every other one names something
+		// to fix — this one names a miss that cost the origin nothing, on a URL nothing will ever
+		// render. Folding it into cadence or coverage would report the feature working as a fault.
+		hint: 'a miss answered from a stored origin document — never rendered, so it has no cadence',
+	},
+	{
 		key: 'not-cacheable',
 		label: 'Not cacheable',
 		hint: 'the cache was never consulted',
@@ -717,6 +762,10 @@ const NOT_HIT = {
 		'invalidated',
 		'an invalidation would have refused it; the change probe proved its claims current — still a cache serve',
 	],
+	// A cache serve too, and counted as one — but never as a hit: a hit means a page this system
+	// rendered was inside its cadence, and nothing rendered this. `render.raw` stores the document a
+	// miss already fetched so the next crawler asking for the same URL is answered from storage.
+	'raw': ['raw', 'a stored origin document answered it — no browser ran on it, and it owns no render target'],
 	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
 	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD)'],
 };
@@ -1530,6 +1579,177 @@ function discoveryGate(ctx, data, filter) {
 				'pressure the gate is absorbing, not a count of URLs prevented. Gating stops NEW targets only: ',
 				'everything minted before the flag went on keeps rendering until it is purged, and the ',
 				'sitemap pipeline is untouched, so declared URLs on a gated route still schedule normally.',
+			]),
+		],
+	});
+}
+
+/**
+ * The raw-document cache: what it stored, and — the point of the panel — what it REFUSED.
+ *
+ * READ THE REFUSALS. An enabled route that stores nothing looks exactly like a route nobody
+ * enabled: same miss rate, same origin proxies, no error anywhere. The only thing that
+ * distinguishes them is the reason each candidate was turned away, which is why the plugin emits
+ * one `raw_cache` row per store ATTEMPT rather than counting successes. A panel that charted
+ * `stored` alone would be blind to the whole failure mode it exists for.
+ *
+ * TWO OUTCOMES ARE FINDINGS RATHER THAN FACTS OF LIFE, and they are flagged:
+ *
+ *   has-cookie   the origin tried to set a cookie, i.e. it is personalizing a route that was
+ *                assumed to be shared. Storing that document would replay one visitor's page to
+ *                every crawler, so the refusal is correct — but the ASSUMPTION is wrong, and
+ *                nothing else in this console would ever say so.
+ *   oversize     `render.raw.maxBytes` is below the route's real document size, so the feature is
+ *                enabled and structurally cannot fill. It is a settings fix, not a fault.
+ *
+ * The rest are the shape of the traffic: `not-200` and `content-type` are documents that were never
+ * eligible, `no-store` is the origin declining a shared cache (correctly honoured), `capture-busy`
+ * is the per-worker concurrency cap shedding a capture rather than the heap, and `empty` is a 200
+ * with no body — the one that used to be stored and replayed as a zero-byte document.
+ *
+ * WHAT THE STORE RATE IS NOT: a hit rate. Fills and serves are different populations over the same
+ * window — a document stored now is read by the NEXT crawler, possibly after this window — so the
+ * serves are shown beside the fills and never divided by them.
+ */
+// Outcome names as constants at the lookup sites, for the same reason the discovery gate's are:
+// the route-contract scanner in adminAssets.test.js reads a quoted name inside a Map lookup as a
+// fetch of an admin route by that name.
+const RAW_STORED = 'stored';
+const RAW_HAS_COOKIE = 'has-cookie';
+const RAW_OVERSIZE = 'oversize';
+
+/** Every refusal the plugin can report, and what an operator should do about it. */
+const RAW_REFUSALS = {
+	'not-200': ['the origin did not answer 200 — only a 200 is ever eligible', ''],
+	'staging': ['fetched through the staging origin, so the bytes are not production', ''],
+	'has-cookie': ['the origin set a cookie: this route is personalized, not shared', 'bad'],
+	'content-type': ['not in render.raw.contentTypes', ''],
+	'no-store': ['the origin sent private / no-store — it is declining a shared cache', ''],
+	'no-body': ['the response body was not a stream, so there was nothing to capture', ''],
+	'oversize': ['larger than render.raw.maxBytes — served, and the capture abandoned', 'warn'],
+	'capture-failed': ['the origin body errored or truncated mid-capture', 'warn'],
+	'write-failed': ['the store itself threw — the document was served, nothing was kept', 'bad'],
+	'empty': ['a 200 with a zero-byte body — refused rather than replayed as an empty document', 'warn'],
+	'capture-busy': ['render.raw.maxConcurrentCaptures was full; the next request stores it', ''],
+};
+
+function rawCache(ctx, data, filter) {
+	const attempts = pick(data, 'prerender_ops', (s) => s.path === 'raw_cache');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('render.raw.enabled')?.effective === true;
+	const rawRoutes = (options.get('ingress.routes')?.effective ?? []).filter(
+		(entry) => entry && typeof entry === 'object' && entry.rawCache === true
+	);
+	// All bots: `raw_cache` carries no bot dimension (its slots are outcome and nothing else), and
+	// the serve counts are narrowed by the filter like every other bot_serve read on this view.
+	const rawServes = sumCount(pick(data, 'bot_serve', (s) => s.path === 'raw' && keepBot(filter, s.type)));
+
+	const byOutcome = new Map();
+	for (const s of attempts) byOutcome.set(s.method ?? 'unknown', (byOutcome.get(s.method ?? 'unknown') ?? 0) + s.count);
+	const stored = byOutcome.get(RAW_STORED) ?? 0;
+	const total = [...byOutcome.values()].reduce((acc, n) => acc + n, 0);
+	const refused = total - stored;
+
+	// Off and never switched on: describe the capability instead of drawing an empty chart, which
+	// would read as a subsystem that is on and failing. Same exit as the discovery gate's.
+	if (!enabled && !total && !rawServes) {
+		return card('Raw-document cache', {
+			head: [spacer(), pill('off', '')],
+			body: [
+				el('p', { cls: 'muted chart-note' }, [
+					'A URL outside the render rotation — a facet or parameter combination a crawler invented — ',
+					'misses on every single request, and every miss is an origin fetch for a document the origin ',
+					'served minutes ago to a different crawler. With ',
+					el('code', { text: 'render.raw.enabled' }),
+					' and ',
+					el('code', { text: 'rawCache' }),
+					' on a route, that document is kept and the next crawler is answered from storage: no render ',
+					'capacity, no second origin request. It is NOT a prerendered snapshot — verify the route’s ',
+					'server-rendered HTML already carries its whole SEO surface before enabling it there. Both ',
+					'switches are under Rendering on ',
+					link('Config →', () => ctx.go('config')),
+					'.',
+				]),
+			],
+		});
+	}
+
+	const cookieRefusals = byOutcome.get(RAW_HAS_COOKIE) ?? 0;
+	const oversize = byOutcome.get(RAW_OVERSIZE) ?? 0;
+	const ranked = [...byOutcome.entries()].filter(([outcome]) => outcome !== RAW_STORED).sort((a, b) => b[1] - a[1]);
+	const maxBytes = options.get('render.raw.maxBytes')?.effective;
+
+	return card(`Raw-document cache — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? null : pill('master switch off', 'warn'),
+			rawRoutes.length
+				? pill(`${rawRoutes.length} route${rawRoutes.length === 1 ? '' : 's'} opted in`, 'info')
+				: pill('no route opted in', 'warn'),
+			spacer(),
+		],
+		body: [
+			// The two refusals that are findings rather than traffic, each above the breakdown so it
+			// is not something an operator has to spot in a bar list.
+			cookieRefusals > 0 &&
+				el('div', { cls: 'note bad' }, [
+					el('strong', { text: `${num(cookieRefusals)} document(s) refused for setting a cookie. ` }),
+					'The origin is personalizing a route that was enabled on the assumption it is shared. The ',
+					'refusal is correct — a stored personalized document would be replayed to every crawler that ',
+					'asks — but the assumption is not, and nothing else here reports it. Check what that route ',
+					'sets, or take it off ',
+					el('code', { text: 'rawCache' }),
+					'.',
+				]),
+			oversize > 0 &&
+				el('div', { cls: 'note warn' }, [
+					el('strong', { text: `${num(oversize)} document(s) were larger than render.raw.maxBytes` }),
+					maxBytes ? ` (${fmtCount(maxBytes)} bytes)` : '',
+					'. Those were served and not stored, so the route is enabled and cannot fill. The cap bounds ',
+					'COMPRESSED bytes as the origin sent them, and budget roughly 2× it per in-flight capture.',
+				]),
+			el('div', { cls: 'stats' }, [
+				stat(
+					'Stored',
+					fmtCount(stored),
+					total ? `${pct(stored, total)} of ${fmtCount(total)} attempts` : 'no attempts'
+				),
+				stat('Refused', fmtCount(refused), 'the reasons are below — this is the number to read', {
+					warn: total > 0 && stored === 0,
+				}),
+				// Deliberately NOT stored ÷ serves: a document stored in this window is read by the next
+				// crawler, which may be in the next one. Different populations, shown side by side.
+				stat('Raw serves', fmtCount(rawServes), `misses answered from storage${filter ? ' · filtered' : ''}`),
+			]),
+			total === 0
+				? el('p', { cls: 'muted chart-note' }, [
+						'No store attempt in this window. A capture is only ever attempted on a MISS on an opted-in ',
+						'route, so this is either a route mix that is not missing or a window too narrow to contain ',
+						'one — not a fault.',
+					])
+				: stored === total
+					? el('div', { cls: 'note ok' }, ['Every eligible document in this window was stored.'])
+					: // A TABLE, not a bar list, and for the same reason the non-hit verdicts are one: the
+						// reason has to be readable beside the count rather than behind a hover, and a bar
+						// list's sub-label is a nowrap cell sized for a number.
+						table(
+							['refusal', { text: 'documents', right: true }, { text: 'share', right: true }],
+							ranked.map(([outcome, count]) => {
+								const [means, severity] = RAW_REFUSALS[outcome] ?? ['an outcome this console does not know about', ''];
+								return el('tr', null, [
+									el('td', null, [pill(outcome, severity), el('div', { cls: 'muted', text: means })]),
+									el('td', { cls: 'right mono', text: num(count) }),
+									el('td', { cls: 'right mono', text: pct(count, total) }),
+								]);
+							})
+						),
+			el('p', { cls: 'muted chart-note' }, [
+				'One row per store ATTEMPT, which is what makes a route that is enabled and filling nothing ',
+				'distinguishable from one that is switched off — the two are identical in every other number on ',
+				'this page. A raw document only ever replaces an origin PROXY: it is read on a true miss and ',
+				'never in place of a stale or invalidated snapshot, because those mean a render is coming and ',
+				'the live origin is the better answer. Stored documents expire on ',
+				el('code', { text: 'render.raw.expiry' }),
+				' and refill on demand, one request at a time.',
 			]),
 		],
 	});

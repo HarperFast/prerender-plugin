@@ -66,14 +66,27 @@ export const CACHE_STATUS_COLORS = {
  * `hit`, `swr` and `verified` are the page itself; `peer-rescue` is the owner's copy of it. What
  * is NOT here: `miss`/`stale` (origin), `blob-*` (the local body failed AND no rescue landed, so
  * the request went to origin), `invalidated` (refused), `skip`/`bypass` (never consulted).
+ *
+ * `raw` IS IN THIS SET (plugin v0.76.0): a stored origin document answered the request, so the
+ * origin was spared exactly as it was by a snapshot. Leaving it out would not read as missing —
+ * it would read as a smaller cache-served share, which is the same failure `verified` caused for
+ * one release.
+ *
+ * BUT IT IS NOT AN AGE POPULATION. `page_age` / `route_page_age` are emitted only when the serve
+ * SOURCE is `cache` (`recordServeOutcome`), and a raw serve's source is `raw` — nothing rendered
+ * it, so it has no cadence to be measured against. Anything dividing by "cache serves" to talk
+ * about freshness must therefore count the source, not this set; see the staleness panel.
  */
-// `raw` IS IN THIS SET, and leaving it out would not read as missing — it would read as a smaller
-// hit rate, exactly as `verified` did for one plugin release. A raw serve answered from storage and
-// cost the origin nothing, which is what this set means.
 export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw']);
 export const isCacheServed = (status) => CACHE_SERVED.has(status);
 
-/** Where the bytes came from (bot_serve.path). `origin` is the one offload counts against. */
+/**
+ * Where the bytes came from (bot_serve.path). `origin` is the one offload counts against.
+ *
+ * `raw` is its own source upstream rather than a flavour of `cache`, and it stays that way here:
+ * "answered from storage" and "a render covers this URL" are different questions, and a raw
+ * document answers only the first.
+ */
 export const SOURCE_COLORS = { cache: OK, rendered: INFO, raw: '#7fd4e8', origin: WARN };
 
 /** What became of a posted render result (render outcome.method). */
@@ -594,7 +607,10 @@ const SITEMAP_FETCHES = 'sitemap_sitemaps';
  *   probes    `probe_probed` — one origin call per attempt, failures included (a refused probe was
  *             still a request). Sweep and canary both emit it. A probe hits a small endpoint, not a
  *             page render, so it is cheaper than the other three; it is still a request.
- *   sitemaps  `sitemap_sitemaps` — one fetch per sitemap a refresh run processed.
+ *   sitemaps  `sitemap_sitemaps` — one fetch per sitemap a refresh run processed. Conditional
+ *             fetching (plugin v0.69.0) does NOT remove these: the counter is attempts, and a
+ *             document the origin answered `304` to still cost a request. What it removes is the
+ *             re-parse and the prune scan on THIS side, which no origin-load term ever counted.
  *
  * `renders` is read with sumCount (one emit = one result); the two pass counters with sumValues
  * (one emit per pass carrying the pass's count — sumCount there would count passes).
