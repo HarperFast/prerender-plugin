@@ -26,12 +26,13 @@ import { resolveVerification } from '../util/pageVerification.js';
 const NO_VERIFICATION = Object.freeze({ verifiedAtMs: NaN, basisAtMs: NaN });
 import { resolveInvalidation } from '../util/invalidation.js';
 import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
-import { currentMinuteMs } from '../util/time.js';
+import { currentMinuteMs, epochMsOf } from '../util/time.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
+import { captureForRawCache, rawCachePolicy, readRawPage } from '../util/rawCache.js';
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { deliverResource } from './response.js';
 
@@ -345,12 +346,77 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		return rendered.resource;
 	}
 
+	// THE RAW-DOCUMENT CACHE (util/rawCache.js), and note the status it is gated on: `miss` ONLY.
+	//
+	// A miss is the one verdict that proves nothing is cached and — on a discovery-gated route, which
+	// is the population this exists for — that nothing is scheduled either. Every other status that
+	// reaches here FOUND a page row: 'stale', 'invalidated', 'blob-missing', 'blob-timeout'. A page row
+	// means a Target, which means a render is coming, and for those the LIVE origin is a better answer
+	// than a stored copy of it. Widening this to 'stale' would trade a live document for one up to a
+	// day old on exactly the URLs that have a render scheduled.
+	//
+	// 'skip' and 'bypass' are excluded for the same reason they record no demand: they never looked, so
+	// they can neither prove nor disprove that anything is cached.
+	//
+	// An EXPLICIT `missHeader: origin` is excluded too, and that one is not obvious. It leaves
+	// `cacheStatus` at 'miss' (only `Cache-Control: no-cache` sets `skip`), but it is an authorized
+	// operator asking for what the origin has RIGHT NOW — usually to verify a fix. Answering it from
+	// storage would make the one gesture available for checking the origin return a cached document.
+	const rawPolicy =
+		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
+			? rawCachePolicy(info.route)
+			: null;
+	if (rawPolicy) {
+		const stored = await readRawPage(cacheKey);
+		// A BULK INVALIDATION MUST REACH THESE TOO. Without this the feature would silently defeat
+		// invalidation on exactly the routes it is enabled for: the epoch above is read only when a
+		// `PrerenderedPage` row exists, and on this branch there is none, so nothing would consult it.
+		// Same `!(a > b)` shape as the page path, so an unreadable timestamp fails closed. No
+		// verification lookup: a verification certifies a RENDER's claims against the origin
+		// (`ProbeState.pageSignature`), and nothing rendered this — an absent proof is the true answer,
+		// not a missing optimisation.
+		const rawEpoch = stored ? await resolveInvalidation(routeScopeForEntry(info.route)) : null;
+		const refused = stored && rawEpoch && !(epochMsOf(stored.lastCached) > rawEpoch.at);
+		// A REFUSED RAW PAGE MUST SAY SO, or the invalidation is defeated by a conditional request.
+		// Leaving the status at 'miss' left BOTH 304 defences off — `stripValidators` below and
+		// `suppressConditional` in response.js key on this exact value — so a crawler returning with
+		// the `etag` it got from the stored document forwarded it to the origin, an origin whose ETag
+		// is publish-date-shaped answered 304, and the crawler kept the pre-invalidation bytes while
+		// every signal reported the invalidation working. That is the same hole `stripValidators` was
+		// added for on the page path, reopened on this one.
+		//
+		// `info.invalidatedBy` is deliberately NOT set: it drives `maybeAccelerateHeal`, which pulls a
+		// RENDER forward, and a raw URL owns no target to reschedule.
+		if (refused) info.cacheStatus = 'invalidated';
+		if (stored && !refused) {
+			const body = await materializeCachedBody(stored, request.method);
+			// An unreadable stored blob degrades to the origin proxy this branch replaced — the same
+			// shape as the rendered-page path, and the reason both read the body before committing a
+			// status. No peer rescue: a raw document is one origin fetch away, so the cheap answer is to
+			// fetch it rather than to go asking other nodes for it.
+			if (body.ok) {
+				info.cachedBody = body.body;
+				info.cacheStatus = 'raw';
+				info.source = 'raw';
+				return { ...stored, cacheKey, deviceType, url: cacheUrl };
+			}
+			// COUNTED AND LOGGED, never silent. The page path emits `serveError` here for a reason: a
+			// dangling blob (harper#2134) or one still arriving (harper-pro#683) costs every request for
+			// this key the full `blobReadBudgetMs` until the row expires, and without a counter it is
+			// indistinguishable from an ordinary miss — the same request shape, the same status.
+			metrics.serveError(body.reason === 'timeout' ? 'raw-blob-timeout' : 'raw-blob-unreadable');
+			logger.warn(
+				`raw document blob ${body.reason === 'timeout' ? 'read exceeded the budget' : 'unreadable'} for ${cacheKey}; serving origin instead`
+			);
+		}
+	}
+
 	info.source = 'origin';
 	// `stripValidators` on an invalidated verdict, so the origin cannot answer 304 to the validators
 	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
 	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
 	// invalidation worked. See util/upstream.js.
-	return fetchOriginResource({
+	const resource = await fetchOriginResource({
 		url,
 		deviceType,
 		headers: request.headers,
@@ -358,6 +424,11 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
 		reason: info.cacheStatus,
 	});
+
+	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
+	// body the crawler is already reading, so this costs no second origin request and — because the
+	// store is detached inside `captureForRawCache` — no latency on this response.
+	return rawPolicy ? captureForRawCache(resource, { cacheKey, policy: rawPolicy }) : resource;
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
@@ -418,7 +489,13 @@ const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
 //   that walks the corpus.
 export function recordDemand({ resource, routeClass, route, cacheUrl, botName, cacheStatus }) {
 	if (routeClass !== PRERENDER) return;
-	const owned = cacheStatus !== 'miss' && !NO_PAGE_LOOKUP.has(cacheStatus);
+	// 'raw' IS NOT OWNERSHIP, and this is the one place that would get it wrong for free. The rule
+	// above reads "found a page row, therefore a Target exists" — but a raw serve found a `RawPage`,
+	// which is precisely the population that owns NO Target and never will. Counting it would feed the
+	// ladder's Bloom filter the combinatorial facet space it is explicitly sized to exclude, and a
+	// saturated ring does not fail loudly: it answers "visited" for everything, and the visit signal
+	// stops being a signal for the corpus that does own targets.
+	const owned = cacheStatus !== 'miss' && cacheStatus !== 'raw' && !NO_PAGE_LOOKUP.has(cacheStatus);
 	const minting = cacheStatus === 'miss' && resource.statusCode === 200 && route?.discoverTargets !== false;
 	if (!owned && !minting) return;
 	if (!botCountsAsDemand(botName)) return;

@@ -189,6 +189,24 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route raw-document cache. Same drop-the-FIELD rule as the four above: a typo here
+	// must not change how the path is SERVED. Note this is the ROUTE's opt-in only — `render.raw.enabled`
+	// is the master switch and is checked at the call site, so a route can carry the flag through a
+	// deployment where the feature is off and mean exactly nothing.
+	let rawCache = false;
+	if (raw.rawCache !== undefined && raw.rawCache !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring rawCache on passthrough route "${raw.match} ${raw.path}" — a passthrough route is never ` +
+					`served from cache, so there is nothing for a stored document to answer`
+			);
+		} else if (typeof raw.rawCache === 'boolean') {
+			rawCache = raw.rawCache;
+		} else {
+			warn(`ignoring rawCache on route "${raw.match} ${raw.path}" — expected a boolean, got ${String(raw.rawCache)}`);
+		}
+	}
+
 	return {
 		match: raw.match,
 		path: raw.path,
@@ -198,6 +216,7 @@ const compileEntry = (raw, source, warn) => {
 		discoverTargets,
 		demandFloor,
 		departureAction,
+		rawCache,
 		source,
 	};
 };

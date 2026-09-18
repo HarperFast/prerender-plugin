@@ -503,3 +503,33 @@ test('a demandFloor slower than the route interval is warned about at compile ti
 		`expected a demandFloor>interval warning, got ${JSON.stringify(warnings)}`
 	);
 });
+
+test('route rawCache: true kept, an invalid value drops the FIELD but never the route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/', rawCache: true },
+				{ match: 'prefix', path: '/product/prd-', rawCache: 'yes' }, // invalid → field dropped
+			],
+		},
+	});
+	assert.equal(matchRoute('/catalog/girls.jsp').rawCache, true);
+	// The route itself survives: dropping it would change how the path is SERVED (prerender →
+	// unclassified), which is a far worse outcome than losing one flag.
+	assert.equal(matchRoute('/product/prd-1').mode, 'prerender');
+	assert.equal(matchRoute('/product/prd-1').rawCache, false);
+});
+
+test('route rawCache defaults to false and is ignored on a passthrough route', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/catalog/' },
+				{ match: 'prefix', path: '/help/', mode: 'passthrough', rawCache: true },
+			],
+		},
+	});
+	assert.equal(matchRoute('/catalog/x').rawCache, false);
+	// A passthrough route is never served from cache, so a stored document would answer nothing.
+	assert.equal(matchRoute('/help/contact-us').rawCache, false);
+});

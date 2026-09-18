@@ -104,7 +104,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				[],
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
-					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number }.\n\n' +
+					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
+					'rawCache?: boolean }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -166,7 +167,14 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'rotation; the sitemap pipeline is unaffected, so declared URLs on the route still schedule. ' +
 					'NOTE: flipping this false stops NEW targets only. Existing discovered targets keep rendering ' +
 					'until deleted — see the discovery-purge admin action, and gate BEFORE purging or crawlers ' +
-					're-mint what the purge removes.',
+					're-mint what the purge removes.\n\n' +
+					'`rawCache` (default false, prerender routes only, requires `render.raw.enabled`) — whether a ' +
+					'MISS on this route stores the origin document it just fetched, so the next crawler asking ' +
+					'for that URL is a cache hit instead of another origin round trip. It replaces an origin ' +
+					'proxy, never a render: a stale or invalidated snapshot still proxies live. Pair it with ' +
+					'`discoverTargets: false` — gated URLs are exactly the population this is for, and gating ' +
+					'without it leaves them missing on every request forever. Enable it only on a route whose ' +
+					'server-rendered document already carries its SEO surface; see `render.raw`.',
 				{ itemType: 'object' }
 			),
 			discoveryBots: option(
@@ -1283,7 +1291,85 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
-	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
+	render: group('Render scheduling: cadence, failure handling, schedule repair, and raw-document caching.', {
+		raw: group(
+			'RAW-DOCUMENT CACHING. Cache the origin document a miss already fetched, for URLs that are not ' +
+				'in the render rotation — no browser, no render capacity, no second origin request.\n\n' +
+				'THE PROBLEM IT SOLVES. On a large catalog the crawlable URL space is far bigger than the ' +
+				'corpus worth rendering: facet and parameter combinations a bot invents by following links own ' +
+				'no target, are never scheduled, and therefore MISS ON EVERY REQUEST. Measured on one ' +
+				'deployment, 89.8% of requests to the listing route were exactly that — each one an origin ' +
+				'fetch for a document the origin had already served, minutes earlier, to a different crawler. ' +
+				'Caching it turns those misses into hits at the cost of one write.\n\n' +
+				'WHEN IT IS THE RIGHT ANSWER: a route whose SERVER-RENDERED document already carries its whole ' +
+				'SEO surface — title, meta description, canonical, JSON-LD offers, the product grid — so the ' +
+				'render adds only interactive chrome. Verify that for a route before enabling it on that route; ' +
+				'a raw document is NOT a rendered snapshot and this setting will not tell you the difference.\n\n' +
+				'IT ONLY EVER REPLACES AN ORIGIN PROXY, never a render and never a cached snapshot. A raw page ' +
+				'is read only when `PrerenderedPage` held nothing at all — a true miss. A stale or invalidated ' +
+				'snapshot means a render is coming and the LIVE origin is the better answer, so those keep ' +
+				'proxying exactly as before. Raw serves are reported under their own cache status, so ' +
+				'`bot_serve` and `page_age` keep meaning what they meant.\n\n' +
+				'Off by default, and off for every route until a route opts in with `rawCache: true`.',
+			{
+				enabled: option(false, 'Master switch. Off = nothing is stored, nothing is read, no extra reads.'),
+				maxBytes: option(
+					1048576,
+					'Largest document to store, in bytes AS THE ORIGIN SENT IT — which is compressed (the ' +
+						'origin is asked for gzip), so this bounds memory and storage rather than the decompressed ' +
+						'size a search engine sees. Over the cap the document is served and NOT stored, and the ' +
+						'capture is abandoned so nothing further is buffered for it.\n\n' +
+						'BUDGET ~2x THIS PER IN-FLIGHT CAPTURE, not 1x. A capture holds one copy of the bytes, and ' +
+						'the `tee()` retains a second for the branch the crawler has not read yet — measured with a ' +
+						'stalled reader, a 768 KB document held 1.5 MB. The total is bounded by ' +
+						'`maxConcurrentCaptures`, so the worst case is roughly `2 x maxBytes x maxConcurrentCaptures` ' +
+						'per worker.',
+					{ unit: 'bytes', min: 1 }
+				),
+				maxConcurrentCaptures: option(
+					16,
+					'How many responses may be captured at once, per worker. Past it a response is served ' +
+						'without being stored.\n\n' +
+						'THIS EXISTS BECAUSE CAPTURING REMOVES BACKPRESSURE. Without a capture a slow client costs ' +
+						'socket buffers — the reader stops, the TCP window closes, and the ORIGIN holds the data. ' +
+						'The capture reads in a tight loop, so it drains the origin at full speed however slowly ' +
+						'the client reads, and this worker’s heap becomes the buffer instead. On a route that is ' +
+						'mostly misses, a client opening many connections and reading slowly would otherwise have a ' +
+						'heap lever it controls. Degrading to "this one is not stored" costs nothing — the next ' +
+						'request stores it — while degrading to heap pressure takes the serve path down with it.',
+					{ min: 1 }
+				),
+				expiry: option(
+					'midnight',
+					'When a stored document goes stale: `midnight` (the next local midnight in ' +
+						'`expiryTimezone`) or `interval` (use `expiryMs`).\n\n' +
+						'`midnight` EXISTS FOR STEP-CHANGE ORIGINS. Where a catalog reprices at a fixed hour rather ' +
+						'than drifting continuously, an interval is the wrong shape: a document fetched at 23:00 ' +
+						'with a 6h TTL serves post-change prices for five hours, while one fetched at 01:00 expires ' +
+						'long before anything about it has changed. Aligning expiry to the change boundary makes ' +
+						'every stored document correct for exactly as long as it is correct, and no longer.\n\n' +
+						'There is no herd to spread: raw pages refill on demand, one request at a time, so expiring ' +
+						'a whole route at once produces misses at the rate crawlers actually arrive.',
+					{ enum: ['midnight', 'interval'] }
+				),
+				expiryMs: option(
+					21600000,
+					'Lifetime of a stored document when `expiry` is `interval`. Ignored under `midnight`.\n\n' +
+						'SEPARATE FROM `expiry` ON PURPOSE. The two used to be one option accepting either the ' +
+						'string `midnight` or a number of milliseconds — which the config merge cannot express: it ' +
+						'type-checks every value against its default, so a numeric override of a string-defaulted ' +
+						'option was REJECTED with one log line and the default silently kept. The documented ' +
+						'setting did nothing.',
+					{ unit: 'ms', min: 1 }
+				),
+				expiryTimezone: option('UTC', 'IANA timezone `expiry: midnight` is resolved in.', { nonEmpty: true }),
+				contentTypes: option(
+					['text/html'],
+					'Content types eligible for storage, matched against the leading type of the response ' +
+						'`content-type` (parameters ignored). Anything else is served and not stored.'
+				),
+			}
+		),
 		defaultInterval: option(
 			DAY,
 			'How often a target is re-rendered when nothing more specific applies. Cadence is relative to ' +
@@ -1732,6 +1818,78 @@ export const configSchema = group('Prerender plugin configuration.', {
 			{ min: 0 }
 		),
 		failedCap: option(100, 'Max failed-entry samples carried back in a refresh result.', { min: 0 }),
+		newTargets: group(
+			'How soon a URL the sitemap has just DECLARED gets its first render.\n\n' +
+				'Without this, a newly created target takes `getInitialRenderTime`, which jitters the first ' +
+				'render across the target’s WHOLE render interval — `hash(url) % interval`. That jitter ' +
+				'exists for a real reason (the first ingest of a large sitemap must not stampede the queue), ' +
+				'but it is sized for bulk population and applies just as hard to the handful of genuinely new ' +
+				'URLs a mature corpus gains each day: on a 48h cadence a product published this morning can ' +
+				'wait two days to be rendered once, while the sitemap has been telling us about it the whole ' +
+				'time. A declaration is the strongest signal a site gives that a URL matters.\n\n' +
+				'So the first render is jittered across `window` instead of the interval, and only for the ' +
+				'first `maxPerRun` creates in a walk. The cap is what keeps the bulk case safe: a first ' +
+				'ingest creating hundreds of thousands of targets exceeds it immediately and everything past ' +
+				'it falls back to full-interval jitter, which is exactly the old behaviour. Steady-state ' +
+				'churn (tens to hundreds a day on a real corpus) never comes close to the cap.\n\n' +
+				'Only the FIRST render moves. The target’s cadence is untouched — `effectiveInterval` is ' +
+				'still the route/stored interval, so every render after this one is on the normal schedule.',
+			{
+				window: option(
+					15 * MINUTE,
+					'Jitter window for a newly declared target’s first render. Small values approximate ' +
+						'"immediately" while still spreading a batch across minutes rather than firing it into ' +
+						'one. `0` disables the fast path entirely and restores full-interval jitter.\n\n' +
+						'BELOW ~2 MINUTES IT STOPS SPREADING. `getInitialRenderTime` floors to the minute, so a ' +
+						'window under 60,000ms collapses every create in a walk onto ONE minute — the stampede ' +
+						'this is jittered to avoid, arrived at by asking for less jitter. Capped at 2147483647 ' +
+						'for the same reason `sweepInterval` is: a larger delay is not "effectively never", it ' +
+						'overflows the signed 32-bit timer and fires immediately.\n\n' +
+						'A window WIDER than the route’s own `renderInterval` is ignored — the fast path would be ' +
+						'slower than the jitter it replaces — and does not count as `createdSoon`.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
+				),
+				maxPerRun: option(
+					5000,
+					'Creates per walk that may take the fast path. Past this, new targets fall back to ' +
+						'full-interval jitter — the bulk-population guard.',
+					{ min: 0 }
+				),
+			}
+		),
+		conditional: group(
+			'Conditional sitemap fetching: send `If-Modified-Since` and skip the whole reconcile for a ' +
+				'document the origin answers 304 to.\n\n' +
+				'WHAT IT BUYS. A pass re-fetches every child and scans the `sitemapUrl` index once per ' +
+				'child, and it is that prune scan — a held read cursor, whose seconds scale linearly with ' +
+				'refresh frequency — that sets the real cost of refreshing often. A 304 skips the body, the ' +
+				'parse, the scan and every write, so an unchanged pass costs one request per document and ' +
+				'no database work at all. That is what makes polling for a change affordable instead of ' +
+				'merely possible: a deployment whose sitemaps rebuild once a night can check every few ' +
+				'minutes and pay for the walk only on the pass that finds the rebuild.\n\n' +
+				'USE `Last-Modified`, NOT `ETag`, AND DO NOT ASSUME EITHER. Measured on one production ' +
+				'edge: `If-Modified-Since` returned a clean 304, while `If-None-Match` sent back the exact ' +
+				'ETag the same edge had just served and got 200 with the full multi-megabyte body. An ' +
+				'origin that advertises a validator is not promising to honour it, which is why the ' +
+				'`not_modified` counter is worth watching — a steady zero here means every pass is doing ' +
+				'full work and the frequency should come back down.\n\n' +
+				'AN INDEX IS STILL DESCENDED on a 304: that only says the CHILD LIST is unchanged, not the ' +
+				'children, and on a real corpus the children rebuild on a different schedule from the index ' +
+				'that lists them. Each child then makes its own conditional decision.',
+			{
+				enabled: option(true, 'Send `If-Modified-Since` when a stored validator is available.'),
+				fullPassInterval: option(
+					24 * HOUR,
+					'Force an UNCONDITIONAL fetch of a document whose entries have not been ingested in this ' +
+						'long. This is the repair net and it is why the feature is safe to leave on: a 304 skips ' +
+						'the reconcile, and the reconcile is also what re-CREATES targets lost to anything else — ' +
+						'a bad purge, a half-applied delete, a botched migration. Without a periodic full pass a ' +
+						'corpus could drift for as long as the origin left its sitemaps untouched and nothing ' +
+						'would notice. Set it to 0 to make every fetch unconditional (the pre-0.69.0 behaviour).',
+					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
 		departure: group(
 			'What a refresh does about URLs that LEAVE a sitemap, beyond unlinking them. The action is ' +
 				'declared PER ROUTE (`ingress.routes[].departureAction`); this group bounds and observes it, ' +

@@ -101,7 +101,17 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 		// worth seeing, because nothing else in the system would ever mention it.
 		duplicates: 0,
 		deferred: 0,
+		// Creates that took the new-target fast path (first render inside
+		// `sitemap.newTargets.window` rather than a full interval of jitter). `created` counts every
+		// new target; this counts the subset that was not capped, so `created - createdSoon` is the
+		// bulk-population overflow that fell back to the old behaviour.
+		createdSoon: 0,
 		removed: 0,
+		// Documents the origin answered 304 to, so their entries were never re-parsed and their
+		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;
+		// a steady ZERO where conditional fetching is enabled means the origin is not honouring
+		// If-Modified-Since and every pass is doing full work.
+		notModified: 0,
 		sitemapsProcessed: 0,
 		sitemapsDiscovered: 0,
 	};
@@ -145,6 +155,14 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 				if (departure.candidates.length < departureCap) departure.candidates.push(target.url);
 				else departure.capped = true;
 			}
+		},
+
+		/**
+		 * How many creates have taken the fast path in this WALK — the cap is per walk, not per
+		 * child, so an index index fanning out to 17 children cannot multiply it by 17.
+		 */
+		fastPathTaken() {
+			return totals.createdSoon;
 		},
 
 		/** The departed URLs to re-read once the walk has finished. */

@@ -3,12 +3,13 @@ import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
 import { anyRouteDeparts, classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
-import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
+import { currentMinuteMs, epochMsOf, getInitialRenderTime, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
+import { conditionalValidatorFor } from '../util/sitemapConditional.js';
 import { decideDeparture, DepartureAction } from '../util/sitemapDeparture.js';
 import { cacheKeysOf } from './Target.js';
 import { writeSchedule } from '../util/renderSchedule.js';
@@ -363,6 +364,8 @@ const progressFields = (snapshot) => ({
 	created: snapshot.created,
 	updated: snapshot.updated,
 	skipped: snapshot.skipped,
+	createdSoon: snapshot.createdSoon,
+	notModified: snapshot.notModified,
 	duplicates: snapshot.duplicates,
 	deferred: snapshot.deferred,
 	removed: snapshot.removed,
@@ -407,8 +410,9 @@ async function runTrackedRefresh(rootUrl, options) {
 		});
 
 		logger.info(
-			`[prerender] Sitemap refresh for ${rootUrl} finished: ${result.sitemapsProcessed} sitemaps, ` +
-				`${result.created} created, ${result.updated} re-attributed, ${result.skipped} unchanged, ` +
+			`[prerender] Sitemap refresh for ${rootUrl} finished: ${result.sitemapsProcessed} sitemaps ` +
+				`(${result.notModified} not modified), ${result.created} created ` +
+				`(${result.createdSoon} fast-path), ${result.updated} re-attributed, ${result.skipped} unchanged, ` +
 				`${result.removed} unlinked, ${result.failed.length} failed`
 		);
 
@@ -417,8 +421,10 @@ async function runTrackedRefresh(rootUrl, options) {
 		try {
 			metrics.sitemapRun(result.sitemapsProcessed, 'sitemaps');
 			metrics.sitemapRun(result.created, 'created');
+			metrics.sitemapRun(result.createdSoon, 'created_soon');
 			metrics.sitemapRun(result.updated, 'updated');
 			metrics.sitemapRun(result.skipped, 'skipped');
+			metrics.sitemapRun(result.notModified, 'not_modified');
 			metrics.sitemapRun(result.removed, 'removed');
 			metrics.sitemapRun(result.failed.length, 'failed');
 		} catch (e) {
@@ -439,12 +445,40 @@ async function runTrackedRefresh(rootUrl, options) {
  *
  * The stored row is written last, so a document that throws partway leaves the previous row —
  * and its `lastRefreshed` — untouched rather than recording a refresh that did not happen.
+ *
+ * A 304 writes NOTHING — the stored row is still current, validator included — and for a urlset
+ * skips the reconcile entirely, which is where a pass's real cost lives: the per-child prune scan
+ * holds a read cursor, and cursor-seconds are what scale with refresh frequency. That is what
+ * makes polling often affordable rather than merely possible.
  */
 async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited }) {
 	logger.info(`Processing sitemap`, sitemapUrl);
 
-	const latestSitemap = await fetchLatestSitemap(sitemapUrl);
+	// A narrow projection on purpose: `entries` on a product child is megabytes, and this read
+	// happens for every document on every pass. The entries are read back only on the one path
+	// that needs them — a 304 on an INDEX, whose row is small by construction.
+	const stored = await Sitemap.get({ id: sitemapUrl, select: ['url', 'isIndex', 'lastModified', 'lastRefreshed'] });
+	const ifModifiedSince = conditionalValidatorFor(stored, revalidate);
+
+	const latestSitemap = await fetchLatestSitemap(sitemapUrl, { ifModifiedSince });
+
+	if (latestSitemap.notModified) {
+		run.count('notModified');
+
+		// An INDEX still has to be descended. A 304 says the CHILD LIST is unchanged, not that the
+		// children are — they are separate documents with their own validators, and on a real corpus
+		// they move on a different schedule from the index that lists them (measured: children
+		// rebuilt nightly, the index that lists them at a different hour entirely). So re-read the
+		// stored entries and keep walking; each child then makes its own conditional decision.
+		if (stored?.isIndex === true) {
+			const storedRow = await Sitemap.get({ id: sitemapUrl, select: ['url', 'entries'] });
+			return (storedRow?.entries ?? []).map(({ loc }) => loc).filter(Boolean);
+		}
+		return [];
+	}
+
 	const row = { ...latestSitemap, parentUrl };
+	delete row.notModified;
 
 	if (latestSitemap.isIndex === true) {
 		await Sitemap.put(sitemapUrl, row);
@@ -565,6 +599,9 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	});
 	run.addRemoved(departed);
 
+	// Read once per child rather than per entry: config is a live object and this is the hot loop.
+	const { window: newTargetWindow, maxPerRun: newTargetCap } = config.sitemap.newTargets;
+
 	let inflight = [];
 	let considered = 0;
 
@@ -614,12 +651,36 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval }));
 				break;
 
-			case TargetAction.CREATE:
-				// No explicit time, so Target.put jitters the first render across the
-				// interval — bulk sitemap population must not stampede the queue.
+			case TargetAction.CREATE: {
+				// A DECLARATION IS A STRONG SIGNAL, so a newly listed URL does not wait out a full
+				// interval of jitter to be rendered once. `getInitialRenderTime` spreads the first
+				// render across `hash(url) % interval`, which is sized for the first ingest of a large
+				// sitemap and applies just as hard to the handful of genuinely new URLs a mature corpus
+				// gains each day — on a 48h cadence, up to two days.
+				//
+				// The window is jittered rather than set to "now" for the same reason the interval jitter
+				// exists: a batch of creates must land across minutes, not in one. And the cap is what
+				// keeps bulk population safe — past `maxPerRun` this falls back to the old full-interval
+				// jitter by passing no explicit time at all, so a first ingest behaves exactly as before.
+				//
+				// Only the FIRST render moves: `Target.put` still files `effectiveInterval` from the
+				// route/stored cadence, so every render after this one is on the normal schedule.
 				run.count('created');
-				inflight.push(Target.put(cacheUrl, { renderInterval, sitemapUrl }));
+				// `< renderInterval`, because a window WIDER than the route's own cadence makes the "fast"
+				// path slower than the jitter it replaces — and would still count as `createdSoon`, so the
+				// metric would report an acceleration that did not happen. Not reachable on a corpus whose
+				// shortest interval is a day, but the guard is free and the metric has to stay honest.
+				const fast = newTargetWindow > 0 && newTargetWindow < renderInterval && run.fastPathTaken() < newTargetCap;
+				if (fast) run.count('createdSoon');
+				inflight.push(
+					Target.put(cacheUrl, {
+						renderInterval,
+						sitemapUrl,
+						...(fast ? { nextRenderTime: getInitialRenderTime(cacheUrl, newTargetWindow) } : {}),
+					})
+				);
 				break;
+			}
 
 			case TargetAction.RENDER:
 				run.count('created');
@@ -780,7 +841,7 @@ async function processDepartures(run) {
 	}
 }
 
-async function fetchLatestSitemap(url) {
+async function fetchLatestSitemap(url, { ifModifiedSince = null } = {}) {
 	// Route every Harper→origin sitemap fetch through the same edge as the render/origin-fetch
 	// path: whenever a staging IP is configured, pin the TCP connection to it (Host/SNI stay the
 	// real origin, exactly like upstream.js). The security token typically only authenticates
@@ -795,9 +856,19 @@ async function fetchLatestSitemap(url) {
 		headers: {
 			'User-Agent': config.sitemap.userAgent,
 			[config.origin.securityToken.header]: config.origin.securityToken.value,
+			// Echoed back VERBATIM from the stored row — see the schema comment. Absent on the first
+			// fetch of a document, when the origin sends no validator, and whenever the caller wants a
+			// full re-ingest.
+			...(ifModifiedSince ? { 'If-Modified-Since': ifModifiedSince } : {}),
 		},
 		dispatcher: dispatcherFor(stagingIp),
 	});
+
+	// BEFORE the `res.ok` guard, because 304 is not ok: `Response.ok` is 200-299, so a
+	// not-modified would otherwise be thrown as a failed fetch. Nothing else to read — a 304 has no
+	// body — and nothing to write: the stored row is still current, validator included.
+	if (res.status === 304) return { url, notModified: true };
+
 	const xml = await res.text();
 
 	// A blocked/errored fetch returns an HTML error page with a 4xx/5xx status. Guard the
@@ -819,10 +890,14 @@ async function fetchLatestSitemap(url) {
 
 	return {
 		url,
+		notModified: false,
 		lastRefreshed: new Date(),
 		isIndex: parsed.isIndex,
 		entries: parsed.entries,
 		entryCount: parsed.entries.length,
+		// Null where the origin sends none, which makes every later fetch of this document
+		// unconditional — the correct degradation, not an error.
+		lastModified: res.headers.get('last-modified') ?? null,
 	};
 }
 
