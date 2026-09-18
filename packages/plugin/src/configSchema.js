@@ -1753,8 +1753,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 					15 * MINUTE,
 					'Jitter window for a newly declared target’s first render. Small values approximate ' +
 						'"immediately" while still spreading a batch across minutes rather than firing it into ' +
-						'one. `0` disables the fast path entirely and restores full-interval jitter.',
-					{ unit: 'ms', min: 0 }
+						'one. `0` disables the fast path entirely and restores full-interval jitter.\n\n' +
+						'BELOW ~2 MINUTES IT STOPS SPREADING. `getInitialRenderTime` floors to the minute, so a ' +
+						'window under 60,000ms collapses every create in a walk onto ONE minute — the stampede ' +
+						'this is jittered to avoid, arrived at by asking for less jitter. Capped at 2147483647 ' +
+						'for the same reason `sweepInterval` is: a larger delay is not "effectively never", it ' +
+						'overflows the signed 32-bit timer and fires immediately.\n\n' +
+						'A window WIDER than the route’s own `renderInterval` is ignored — the fast path would be ' +
+						'slower than the jitter it replaces — and does not count as `createdSoon`.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
 				),
 				maxPerRun: option(
 					5000,

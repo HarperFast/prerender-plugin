@@ -635,7 +635,11 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				// Only the FIRST render moves: `Target.put` still files `effectiveInterval` from the
 				// route/stored cadence, so every render after this one is on the normal schedule.
 				run.count('created');
-				const fast = newTargetWindow > 0 && run.fastPathTaken() < newTargetCap;
+				// `< renderInterval`, because a window WIDER than the route's own cadence makes the "fast"
+				// path slower than the jitter it replaces — and would still count as `createdSoon`, so the
+				// metric would report an acceleration that did not happen. Not reachable on a corpus whose
+				// shortest interval is a day, but the guard is free and the metric has to stay honest.
+				const fast = newTargetWindow > 0 && newTargetWindow < renderInterval && run.fastPathTaken() < newTargetCap;
 				if (fast) run.count('createdSoon');
 				inflight.push(
 					Target.put(cacheUrl, {
