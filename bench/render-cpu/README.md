@@ -122,7 +122,14 @@ node bench/render-cpu/load.js --concurrency 1,2,4,8,12,16,24 --only baseline --r
 node bench/render-cpu/load.js --only context-pool --trace --batches 6    # the warm-up curve
 node bench/render-cpu/fleet.js --shapes 1x12,2x6,3x4,1x24,4x6 --reps 3   # process shape
 node bench/render-cpu/uvsweep.js --sizes 4,16,32 --reps 3                # one child per setting
+node bench/render-cpu/aging.js --batches 60 --concurrency 4              # does an aged browser slow down?
 ```
+
+[aging.js](aging.js) answers a different question from the other two and is documented in its own
+header: it keeps one browser alive for hundreds of pages and records every render in order, to test
+whether `browserExpirationThreshold` (retire at 200 pages) is buying anything. **It was started and
+stopped at 60 of 240 renders per arm — its result is INDETERMINATE, not negative.** See
+[§Does an aged browser get slower](#does-an-aged-browser-get-slower-unfinished).
 
 A UNIT is `(concurrency, variant, rep)`: its own browser, `--warmups` discarded batches, then one
 measured batch. Units are **interleaved rep-major**, for the same thermal reason as `bench.js`. A
@@ -266,6 +273,45 @@ origin's 20–100 ms RTT × 70 resources the sign flips. What IS settled is the 
 latency: our cache costs ~50 ms of extra Node main-thread CPU per render to give back ~70 ms of
 Chrome CPU, and Chrome's own cache does the offload at zero Node cost — but only within one slot's
 browser lifetime, where ours is shared across slots, processes and restarts.
+
+### Does an aged browser get slower? (UNFINISHED — 25% of the intended run)
+
+The fleet retires a browser after 200 opened pages (`browserExpirationThreshold`, checked as
+`browser.totalOpenedPages > BROWSER_MAX_TOTAL_PAGES` in `Worker.ts`). The reason on record is a
+general "prevent memory leaks" recommendation plus an operator impression; it has never been
+measured. [aging.js](aging.js) was built to measure it and the run was stopped early, at **60 of the
+intended 240 renders per arm**. What follows is three sample points per arm and **cannot support a
+verdict either way** — it is recorded so a later attempt starts from data rather than from nothing.
+
+Four arms, interleaved batch-by-batch against simultaneously live browsers (so thermal drift, which
+looks exactly like aging, hits every arm equally), c=4, external fixture. Each cell is one batch's
+median, not a band median:
+
+| arm                                  | page 20                         | page 40               | page 60               |
+| ------------------------------------ | ------------------------------- | --------------------- | --------------------- |
+| fresh-incognito (today's shape)      | 7,460ms / 2,187ms CPU / 1,430MB | 7,456 / 2,160 / 1,434 | 7,450 / 2,383 / 1,447 |
+| pooled-incognito                     | 7,467 / 2,260 / 1,430           | 7,451 / 2,173 / 1,436 | 7,462 / 2,270 / 1,439 |
+| pooled-recycle                       | 7,463 / 2,202 / 1,426           | 7,461 / 2,220 / 1,434 | 7,462 / 2,495 / 1,436 |
+| persist-default (persistent profile) | 7,478 / 2,262 / 1,418           | 7,472 / 2,395 / 1,425 | 7,466 / 2,327 / 1,426 |
+
+- **Wall is flat to 0.2% in every arm** over the first 60 pages — including the two that accumulate
+  state. Whatever aging is, it is not visible in wall-clock this early.
+- **CPU is non-monotonic in three of four arms** and every value sits inside the batch-to-batch
+  spread measured independently at this concurrency (~±5%). No signal.
+- **RSS rises ~1% per 40 pages in ALL FOUR arms, including the control** that creates and destroys a
+  browser context every render. A drift the control shares is not context accumulation, and at this
+  slope it is nowhere near a reason to retire at 200. Three points is not a curve, and this is the
+  one number worth re-measuring properly.
+
+**One real finding did come out of it, and it is about the wipe, not about aging.**
+`resetForNextVariant` with an EMPTY cookie jar costs **1–2 ms on an incognito context and ~20 ms on
+the default context of a persistent profile** — a 10–20× gap before a single cookie exists, so it is
+`Storage.clearDataForOrigin` touching a disk-backed profile rather than an in-memory one. At 20 ms
+that is 0.27% of a render here and would not decide anything on its own, but it is a cost that
+belongs to the persistent-profile candidate specifically, and it is the floor: puppeteer issues one
+`Network.deleteCookies` per cookie, and a real storefront handed over 125. (Measured over a 2-batch
+smoke run — small n, large effect.) The fixture's `?cookies=N` knob and the `wipe-0` / `wipe-25` /
+`wipe-125` arms exist to price that scaling and **were never run**.
 
 ### The concurrency ladder, and what process shape buys
 

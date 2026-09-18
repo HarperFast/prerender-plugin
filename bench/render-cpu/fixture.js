@@ -324,9 +324,17 @@ export async function startFixture({ port = 0 } = {}) {
 
 		if (url.pathname === '/product/prd-bench' || url.pathname === '/') {
 			const body = buildHtml(url.searchParams).replaceAll('PORT', String(server.address().port));
+			// `?cookies=N` hands the render N cookies. It exists to price `resetForNextVariant`, which
+			// deletes the jar one `Network.deleteCookies` call at a time — so the wipe's cost is a
+			// function of jar SIZE, and a fixture that sets no cookies prices it at zero. A real
+			// storefront handed over 125 (see variantContext.ts), which is the number to test at.
+			const jar = Math.max(0, Math.min(500, Number(url.searchParams.get('cookies') ?? 0)));
+			const setCookie = [];
+			for (let i = 0; i < jar; i++) setCookie.push(`bench_c${i}=v${i}; Path=/; SameSite=Lax`);
 			res.writeHead(200, {
 				'content-type': 'text/html; charset=utf-8',
 				'cache-control': 'public, max-age=60',
+				...(setCookie.length ? { 'set-cookie': setCookie } : {}),
 			});
 			res.end(body);
 			return;
