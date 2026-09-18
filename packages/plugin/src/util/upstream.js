@@ -235,5 +235,12 @@ export const fetchOriginResource = async (request) => {
 		headers: sanitizeOriginResponseHeaders(response.headers),
 		content: Readable.toWeb(response.body),
 		viaStaging: Boolean(stagingIp),
+		// SURFACED SEPARATELY BECAUSE THE SANITIZER DROPS IT. `set-cookie` is not on the forwarded
+		// allowlist, so by the time a caller sees `headers` there is nothing left to tell it the origin
+		// tried to set one — and "the origin set a cookie on this document" is the single best hint
+		// available that the response was personalized and must not be stored and replayed to every
+		// crawler. Reported rather than acted on here: relaying is unaffected, and only a caller that
+		// intends to CACHE the body has a decision to make (util/rawCache.js).
+		hadSetCookie: response.headers?.['set-cookie'] !== undefined,
 	};
 };

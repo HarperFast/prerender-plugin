@@ -18,6 +18,8 @@
 #                                                      isolated for reseed write bursts)
 #   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
 #                                                      serve path; isolated, see the type)
+#   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
+#                                                      the render rotation (expiring, isolated)
 
 type SitemapEntry {
 	loc: String
@@ -459,4 +461,65 @@ type VisitFilter @table(database: "crawl_stats") {
 	node: String
 	bits: Bytes
 	updatedAt: Date
+}
+
+# A cached ORIGIN DOCUMENT for a URL that is not in the render rotation — no browser, no render
+# capacity, just the bytes the origin already handed us on a miss, kept so the next crawler asking
+# for the same URL is a cache hit instead of another origin round trip.
+#
+# WHY THIS EXISTS. On a large catalog the crawlable URL space is far bigger than the corpus worth
+# rendering: facet and parameter combinations a bot invents by walking links, which own no Target,
+# are never scheduled, and therefore MISS ON EVERY REQUEST. Measured on one deployment, 89.8% of
+# requests to the listing route were exactly that — every one of them an origin fetch for a document
+# the origin had already served, minutes earlier, to a different crawler. For a route whose
+# server-rendered document already carries its whole SEO surface (title, canonical, JSON-LD offers,
+# the product grid), caching that document is nearly as good as rendering it and costs no render
+# capacity at all.
+#
+# ITS OWN TABLE, NOT A `PrerenderedPage` ROW, for three measured reasons:
+#
+#   - `PrerenderedPage` has NO expiration, and this population is unbounded and long-tailed by
+#     construction — a facet nobody ever visits again would keep its bytes forever. `expiration`
+#     makes the tail collect itself.
+#   - `PrerenderedPage` is not residency-pinned, so every row replicates to every node. This is a
+#     much larger key space than the render corpus, and `page_cache` is the database whose
+#     transaction log has been measured pegging worker threads at 85-95% of CPU on the receive side
+#     of a copy. A new blob stream of this shape does not belong in it.
+#   - Harper serializes writes per database, so a raw store must not queue behind a render's blob
+#     write, and a render must not queue behind a burst of raw stores.
+#
+# Same reasoning the `Invalidation` and `PageVerification` types already give for their own
+# databases. The cost is one extra point read, and only on a request that already missed the
+# rendered cache and was headed to the origin anyway.
+#
+# A RAW PAGE IS NOT A PRERENDERED PAGE and the serve path must never let the two blur: it is read
+# only when `PrerenderedPage` held NOTHING (a true miss, never a stale or invalidated row — those
+# mean a render is coming and the live origin is the better answer), it is reported under its own
+# cache status so `bot_serve` and `page_age` keep meaning what they meant, and it carries no
+# indexability verdict because nothing rendered it.
+#
+# DELIBERATELY NOT `@export`: a REST write verb here would let anything put arbitrary bytes under a
+# cache key that the serve path then hands to crawlers. The only writer is the miss path.
+type RawPage @table(database: "raw_cache", expiration: 604800) @sealed {
+	cacheKey: String @primaryKey
+	statusCode: Int!
+	# The origin's own response headers, filtered to `sanitizeOriginResponseHeaders`'s allowlist —
+	# INCLUDING `content-encoding`, because `content` holds the bytes exactly as the origin sent them
+	# and http_handlers/response.js re-encodes from this header at serve time. `content-length` is
+	# dropped on the way in: a re-encoded body has a different length, and a stored one would
+	# contradict the bytes actually written.
+	headers: String
+	# The origin bytes VERBATIM, in the origin's own encoding (gzip — see `resolveUpstreamHeaders`).
+	# Storing them decoded would cost a decompress on the serve path's miss branch and buy nothing.
+	content: Blob
+	lastCached: Date
+	expiresAt: Date
+}
+
+# Same anchor, same reason as CoordinationAnchor and ProbeStateAnchor: a database needs one
+# replicable table or the replication subscription spins (harper-pro#685). RawPage replicates, so
+# this is belt-and-braces rather than load-bearing — but the database is new, and the next person to
+# set `replicate: false` on RawPage should not have to rediscover the issue.
+type RawPageAnchor @table(database: "raw_cache") @sealed {
+	id: Int @primaryKey
 }
