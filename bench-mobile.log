@@ -1,0 +1,118 @@
+fixture: http://127.0.0.1:52289/product/prd-bench
+device: mobile   reps: 5   variants: baseline, combine-scroll-count, combine-waitfor, combine-tail, install-helpers, combines-all, exists-shortcircuit, native-count, monitor, tall-viewport, images-off, reduced-motion
+
+rep 1/5 baseline               wall   7438ms  cpu   2500ms  task  1627ms  eval  15  cdp  435  reviews 461
+rep 1/5 combine-scroll-count   wall   9752ms  cpu   3030ms  task  2007ms  eval  13  cdp  433  reviews 461
+rep 1/5 combine-waitfor        wall   7450ms  cpu   2510ms  task  1616ms  eval  14  cdp  434  reviews 461
+rep 1/5 combine-tail           wall   7461ms  cpu   2610ms  task  1700ms  eval  14  cdp  435  reviews 461
+rep 1/5 install-helpers        wall   7464ms  cpu   2620ms  task  1723ms  eval  15  cdp  436  reviews 461
+rep 1/5 combines-all           wall   9764ms  cpu   3210ms  task  2135ms  eval  11  cdp  432  reviews 461
+rep 1/5 exists-shortcircuit    wall   7458ms  cpu   2550ms  task  1665ms  eval  15  cdp  435  reviews 461
+rep 1/5 native-count           wall   7442ms  cpu   2420ms  task  1569ms  eval  15  cdp  436  reviews 461
+rep 1/5 monitor                wall   7423ms  cpu   2350ms  task  1501ms  eval  15  cdp  436  reviews 461
+rep 1/5 tall-viewport          wall   3405ms  cpu   1630ms  task   934ms  eval  15  cdp  435  reviews 461
+rep 1/5 images-off             wall   7386ms  cpu   2420ms  task  1672ms  eval  15  cdp   50  reviews 461
+rep 1/5 reduced-motion         wall   7453ms  cpu   2650ms  task  1740ms  eval  15  cdp  436  reviews 461
+rep 2/5 baseline               wall   7452ms  cpu   2580ms  task  1677ms  eval  15  cdp  435  reviews 461
+rep 2/5 combine-scroll-count   wall   9752ms  cpu   3260ms  task  2178ms  eval  13  cdp  433  reviews 461
+rep 2/5 combine-waitfor        wall   7443ms  cpu   2700ms  task  1752ms  eval  14  cdp  434  reviews 461
+rep 2/5 combine-tail           wall   7460ms  cpu   2650ms  task  1729ms  eval  14  cdp  435  reviews 461
+rep 2/5 install-helpers        wall   7462ms  cpu   2680ms  task  1759ms  eval  15  cdp  436  reviews 461
+rep 2/5 combines-all           wall   9763ms  cpu   3190ms  task  2112ms  eval  11  cdp  432  reviews 461
+rep 2/5 exists-shortcircuit    wall   7448ms  cpu   2530ms  task  1629ms  eval  15  cdp  435  reviews 461
+rep 2/5 native-count           wall   7462ms  cpu   2630ms  task  1713ms  eval  15  cdp  436  reviews 461
+rep 2/5 monitor                wall   7455ms  cpu   2430ms  task  1565ms  eval  15  cdp  436  reviews 461
+rep 2/5 tall-viewport          wall   3379ms  cpu   1630ms  task   924ms  eval  15  cdp  435  reviews 461
+rep 2/5 images-off             wall   7386ms  cpu   2310ms  task  1583ms  eval  15  cdp   50  reviews 461
+rep 2/5 reduced-motion         wall   7441ms  cpu   2500ms  task  1618ms  eval  15  cdp  436  reviews 461
+rep 3/5 baseline               wall   7417ms  cpu   2340ms  task  1478ms  eval  15  cdp  435  reviews 461
+rep 3/5 combine-scroll-count   wall   9737ms  cpu   3070ms  task  2030ms  eval  13  cdp  433  reviews 461
+rep 3/5 combine-waitfor        wall   7438ms  cpu   2620ms  task  1710ms  eval  14  cdp  434  reviews 461
+rep 3/5 combine-tail           wall   7464ms  cpu   2680ms  task  1752ms  eval  14  cdp  435  reviews 461
+rep 3/5 install-helpers        wall   7464ms  cpu   2690ms  task  1773ms  eval  15  cdp  436  reviews 461
+rep 3/5 combines-all           wall   9773ms  cpu   3340ms  task  2219ms  eval  11  cdp  432  reviews 461
+rep 3/5 exists-shortcircuit    wall   7453ms  cpu   2610ms  task  1720ms  eval  15  cdp  435  reviews 461
+rep 3/5 native-count           wall   7430ms  cpu   2670ms  task  1747ms  eval  15  cdp  436  reviews 461
+rep 3/5 monitor                wall   7452ms  cpu   2630ms  task  1723ms  eval  15  cdp  436  reviews 461
+rep 3/5 tall-viewport          wall   3379ms  cpu   1600ms  task   927ms  eval  15  cdp  435  reviews 461
+rep 3/5 images-off             wall   7381ms  cpu   2450ms  task  1696ms  eval  15  cdp   50  reviews 461
+rep 3/5 reduced-motion         wall   7448ms  cpu   2650ms  task  1733ms  eval  15  cdp  436  reviews 461
+rep 4/5 baseline               wall   7450ms  cpu   2650ms  task  1744ms  eval  15  cdp  435  reviews 461
+rep 4/5 combine-scroll-count   wall   9758ms  cpu   3250ms  task  2162ms  eval  13  cdp  433  reviews 461
+rep 4/5 combine-waitfor        wall   7450ms  cpu   2660ms  task  1753ms  eval  14  cdp  434  reviews 461
+rep 4/5 combine-tail           wall   7456ms  cpu   2680ms  task  1744ms  eval  14  cdp  435  reviews 461
+rep 4/5 install-helpers        wall   7462ms  cpu   2690ms  task  1758ms  eval  15  cdp  436  reviews 461
+rep 4/5 combines-all           wall   9759ms  cpu   3350ms  task  2241ms  eval  11  cdp  432  reviews 461
+rep 4/5 exists-shortcircuit    wall   7442ms  cpu   2630ms  task  1712ms  eval  15  cdp  435  reviews 461
+rep 4/5 native-count           wall   7460ms  cpu   2720ms  task  1787ms  eval  15  cdp  436  reviews 461
+rep 4/5 monitor                wall   7446ms  cpu   2690ms  task  1764ms  eval  15  cdp  436  reviews 461
+rep 4/5 tall-viewport          wall   3382ms  cpu   1620ms  task   926ms  eval  15  cdp  435  reviews 461
+rep 4/5 images-off             wall   7378ms  cpu   2440ms  task  1711ms  eval  15  cdp   50  reviews 461
+rep 4/5 reduced-motion         wall   7451ms  cpu   2700ms  task  1761ms  eval  15  cdp  436  reviews 461
+rep 5/5 baseline               wall   7426ms  cpu   2590ms  task  1703ms  eval  15  cdp  435  reviews 461
+rep 5/5 combine-scroll-count   wall   9760ms  cpu   3330ms  task  2228ms  eval  13  cdp  433  reviews 461
+rep 5/5 combine-waitfor        wall   7452ms  cpu   2630ms  task  1723ms  eval  14  cdp  434  reviews 461
+rep 5/5 combine-tail           wall   7460ms  cpu   2720ms  task  1783ms  eval  14  cdp  435  reviews 461
+rep 5/5 install-helpers        wall   7460ms  cpu   2710ms  task  1776ms  eval  15  cdp  436  reviews 461
+rep 5/5 combines-all           wall   9760ms  cpu   3320ms  task  2207ms  eval  11  cdp  432  reviews 461
+rep 5/5 exists-shortcircuit    wall   7445ms  cpu   2650ms  task  1736ms  eval  15  cdp  435  reviews 461
+rep 5/5 native-count           wall   7452ms  cpu   2710ms  task  1784ms  eval  15  cdp  436  reviews 461
+rep 5/5 monitor                wall   7460ms  cpu   2640ms  task  1729ms  eval  15  cdp  436  reviews 461
+rep 5/5 tall-viewport          wall   3393ms  cpu   1630ms  task   945ms  eval  15  cdp  435  reviews 461
+rep 5/5 images-off             wall   7369ms  cpu   2400ms  task  1687ms  eval  15  cdp   50  reviews 461
+rep 5/5 reduced-motion         wall   7443ms  cpu   2660ms  task  1713ms  eval  15  cdp  436  reviews 461
+
+## cost — median of 5 reps (delta vs baseline)
+
+variant               wall         cpu(tree)    task         task-other   proc-cpu     script     v8compile  devtools   layout     style     settle       postProc    evals      cdp-sent   passes    height      elements  
+--------------------  -----------  -----------  -----------  -----------  -----------  ---------  ---------  ---------  ---------  --------  -----------  ----------  ---------  ---------  --------  ----------  ----------
+baseline              7438         2580         1677         1363         2286         21         0          210        46         33        7104         218         15         435        3         18358       21864     
+combine-scroll-count  9752 (+31%)  3250 (+26%)  2162 (+29%)  1831 (+34%)  2912 (+27%)  25 (+19%)  0          215 (+2%)  54 (+17%)  33 (0%)   9418 (+33%)  223 (+2%)   13 (-13%)  433 (0%)   4 (+33%)  18358 (0%)  21864 (0%)
+combine-waitfor       7450 (0%)    2630 (+2%)   1723 (+3%)   1412 (+4%)   2330 (+2%)   21 (0%)    0          212 (+1%)  47 (+2%)   32 (-3%)  7114 (0%)    216 (-1%)   14 (-7%)   434 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+combine-tail          7460 (0%)    2680 (+4%)   1744 (+4%)   1419 (+4%)   2372 (+4%)   33 (+57%)  0          214 (+2%)  47 (+2%)   34 (+3%)  7112 (0%)    223 (+2%)   14 (-7%)   435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+install-helpers       7462 (0%)    2690 (+4%)   1759 (+5%)   1431 (+5%)   2394 (+5%)   34 (+62%)  0          214 (+2%)  47 (+2%)   33 (0%)   7116 (0%)    221 (+1%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+combines-all          9763 (+31%)  3320 (+29%)  2207 (+32%)  1863 (+37%)  2974 (+30%)  38 (+81%)  0          220 (+5%)  51 (+11%)  35 (+6%)  9418 (+33%)  224 (+3%)   11 (-27%)  432 (-1%)  4 (+33%)  18358 (0%)  21864 (0%)
+exists-shortcircuit   7448 (0%)    2610 (+1%)   1712 (+2%)   1398 (+3%)   2325 (+2%)   21 (0%)    0          215 (+2%)  46 (0%)    33 (0%)   7120 (0%)    216 (-1%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+native-count          7452 (0%)    2670 (+3%)   1747 (+4%)   1437 (+5%)   2372 (+4%)   33 (+57%)  0          202 (-4%)  47 (+2%)   33 (0%)   7097 (0%)    221 (+1%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+monitor               7452 (0%)    2630 (+2%)   1723 (+3%)   1409 (+3%)   2343 (+2%)   33 (+57%)  0          198 (-6%)  47 (+2%)   33 (0%)   7098 (0%)    223 (+2%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+tall-viewport         3382 (-55%)  1630 (-37%)  927 (-45%)   645 (-53%)   1295 (-43%)  11 (-48%)  0          209 (0%)   35 (-24%)  31 (-6%)  3053 (-57%)  219 (0%)    15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+images-off            7381 (-1%)   2420 (-6%)   1687 (+1%)   1380 (+1%)   2252 (-1%)   21 (0%)    0          204 (-3%)  48 (+4%)   33 (0%)   7124 (0%)    187 (-14%)  15 (0%)    50 (-89%)  3 (0%)    18341 (0%)  21863 (0%)
+reduced-motion        7448 (0%)    2650 (+3%)   1733 (+3%)   1412 (+4%)   2351 (+3%)   21 (0%)    0          215 (+2%)  47 (+2%)   32 (-3%)  7114 (0%)    217 (0%)    15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+
+## fidelity — must match baseline, or the cost win is not a win
+
+variant               reviews  revealed  lazyTiles  imgGated  offers  shadow  bytes 
+--------------------  -------  --------  ---------  --------  ------  ------  ------
+baseline              461      1         288        1         6       1788    945084
+combine-scroll-count  461      1         288        1         6       1788    945084
+combine-waitfor       461      1         288        1         6       1788    945084
+combine-tail          461      1         288        1         6       1788    945084
+install-helpers       461      1         288        1         6       1788    945084
+combines-all          461      1         288        1         6       1788    945084
+exists-shortcircuit   461      1         288        1         6       1788    945084
+native-count          461      1         288        1         6       1788    945084
+monitor               461      1         288        1         6       1788    945084
+tall-viewport         461      1         288        1         6       1788    945084
+images-off            461      1         288        0         6       1788    945038
+reduced-motion        461      1         288        1         6       1788    945084
+
+FIDELITY DIVERGENCE  images-off: imgGated 1 -> 0
+
+## baseline CDP methods sent (one representative run, 435 total)
+
+  385  Fetch.fulfillRequest
+   15  Runtime.callFunctionOn
+    4  Fetch.continueRequest
+    2  Target.setAutoAttach
+    2  Runtime.runIfWaitingForDebugger
+    2  Page.addScriptToEvaluateOnNewDocument
+    2  Emulation.setDeviceMetricsOverride
+    2  Emulation.setTouchEmulationEnabled
+    1  Target.createBrowserContext
+    1  Browser.setDownloadBehavior
+    1  Target.createTarget
+    1  Network.enable
+    1  Page.enable
+    1  Page.getFrameTree
+
+wrote /private/tmp/prerender-plugin/perf-cdp/bench/render-cpu/results/mobile.json

@@ -1,0 +1,522 @@
+{
+  "label": "ladder-extfixture",
+  "device": "mobile",
+  "reps": 3,
+  "warmups": 1,
+  "levels": [
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    24
+  ],
+  "uv": null,
+  "results": [
+    {
+      "concurrency": 1,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7420,
+      "perRenderWall": 7420,
+      "maxWall": 7420,
+      "cpuMsPerRender": 2500,
+      "rendersPerSec": 0.13,
+      "v8CompileMs": 0.22,
+      "scriptMs": 41.9,
+      "taskMs": 1636,
+      "devtoolsMs": 219,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 60,
+      "nodeBusyPct": 1,
+      "loopMeanMs": 10.9,
+      "loopP99Ms": 11.1,
+      "rssMb": 535,
+      "processes": 5,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2330,
+          "rssMb": 320,
+          "n": 2
+        },
+        "gpu-process": {
+          "cpuMs": 130,
+          "rssMb": 59,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 100,
+          "rssMb": 99,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 40,
+          "rssMb": 60,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763745696,
+          1789763753125
+        ],
+        [
+          1789763862651,
+          1789763870067
+        ],
+        [
+          1789763979354,
+          1789763986774
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2480,
+        2500,
+        2600
+      ],
+      "allBatch": [
+        7429,
+        7416,
+        7420
+      ]
+    },
+    {
+      "concurrency": 2,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7449,
+      "perRenderWall": 7448,
+      "maxWall": 7449,
+      "cpuMsPerRender": 2430,
+      "rendersPerSec": 0.27,
+      "v8CompileMs": 0,
+      "scriptMs": 41,
+      "taskMs": 1623,
+      "devtoolsMs": 217,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 37,
+      "nodeBusyPct": 1,
+      "loopMeanMs": 10.9,
+      "loopP99Ms": 11.2,
+      "rssMb": 841,
+      "processes": 6,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2275,
+          "rssMb": 579,
+          "n": 3
+        },
+        "gpu-process": {
+          "cpuMs": 95,
+          "rssMb": 76,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 70,
+          "rssMb": 113,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 30,
+          "rssMb": 77,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763760981,
+          1789763768429
+        ],
+        [
+          1789763877907,
+          1789763885356
+        ],
+        [
+          1789763994613,
+          1789764002063
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2300,
+        2430,
+        2470
+      ],
+      "allBatch": [
+        7448,
+        7449,
+        7450
+      ]
+    },
+    {
+      "concurrency": 4,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7475,
+      "perRenderWall": 7468,
+      "maxWall": 7475,
+      "cpuMsPerRender": 2175,
+      "rendersPerSec": 0.54,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1478,
+      "devtoolsMs": 216,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 24,
+      "nodeBusyPct": 1,
+      "loopMeanMs": 10.9,
+      "loopP99Ms": 11.2,
+      "rssMb": 1430,
+      "processes": 8,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2010,
+          "rssMb": 1072,
+          "n": 5
+        },
+        "gpu-process": {
+          "cpuMs": 73,
+          "rssMb": 108,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 65,
+          "rssMb": 140,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 25,
+          "rssMb": 110,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763776439,
+          1789763783914
+        ],
+        [
+          1789763893340,
+          1789763900818
+        ],
+        [
+          1789764010078,
+          1789764017553
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2175,
+        2300,
+        2173
+      ],
+      "allBatch": [
+        7475,
+        7478,
+        7475
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7573,
+      "perRenderWall": 7553,
+      "maxWall": 7573,
+      "cpuMsPerRender": 2225,
+      "rendersPerSec": 1.06,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1583,
+      "devtoolsMs": 221,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 21,
+      "nodeBusyPct": 2,
+      "loopMeanMs": 10.9,
+      "loopP99Ms": 11.4,
+      "rssMb": 2611,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2091,
+          "rssMb": 2081,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 70,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 53,
+          "rssMb": 183,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 23,
+          "rssMb": 168,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763792266,
+          1789763799839
+        ],
+        [
+          1789763909204,
+          1789763916772
+        ],
+        [
+          1789764025789,
+          1789764033367
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2136,
+        2225,
+        2236
+      ],
+      "allBatch": [
+        7573,
+        7568,
+        7578
+      ]
+    },
+    {
+      "concurrency": 12,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7701,
+      "perRenderWall": 7663,
+      "maxWall": 7700,
+      "cpuMsPerRender": 2221,
+      "rendersPerSec": 1.56,
+      "v8CompileMs": 0,
+      "scriptMs": 42,
+      "taskMs": 1626,
+      "devtoolsMs": 243,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 18,
+      "nodeBusyPct": 3,
+      "loopMeanMs": 11,
+      "loopP99Ms": 15.2,
+      "rssMb": 3786,
+      "processes": 16,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2083,
+          "rssMb": 3104,
+          "n": 13
+        },
+        "gpu-process": {
+          "cpuMs": 69,
+          "rssMb": 236,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 50,
+          "rssMb": 224,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 19,
+          "rssMb": 223,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763808608,
+          1789763816352
+        ],
+        [
+          1789763925608,
+          1789763933305
+        ],
+        [
+          1789764042156,
+          1789764049857
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2292,
+        2181,
+        2221
+      ],
+      "allBatch": [
+        7744,
+        7697,
+        7701
+      ]
+    },
+    {
+      "concurrency": 16,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 8606,
+      "perRenderWall": 7802,
+      "maxWall": 8605,
+      "cpuMsPerRender": 2475,
+      "rendersPerSec": 1.86,
+      "v8CompileMs": 0,
+      "scriptMs": 46,
+      "taskMs": 1719,
+      "devtoolsMs": 266,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 51,
+      "nodeBusyPct": 10,
+      "loopMeanMs": 11.3,
+      "loopP99Ms": 15,
+      "rssMb": 5023,
+      "processes": 20,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2224,
+          "rssMb": 4179,
+          "n": 17
+        },
+        "browser": {
+          "cpuMs": 129,
+          "rssMb": 279,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 75,
+          "rssMb": 300,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 55,
+          "rssMb": 264,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763825915,
+          1789763834556
+        ],
+        [
+          1789763942771,
+          1789763951265
+        ],
+        [
+          1789764059144,
+          1789764067750
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2475,
+        2473,
+        2483
+      ],
+      "allBatch": [
+        8641,
+        8494,
+        8606
+      ]
+    },
+    {
+      "concurrency": 24,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 8908,
+      "perRenderWall": 8125,
+      "maxWall": 8908,
+      "cpuMsPerRender": 2530,
+      "rendersPerSec": 2.69,
+      "v8CompileMs": 0,
+      "scriptMs": 65,
+      "taskMs": 2057,
+      "devtoolsMs": 261,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "nodeCpuMsPerRender": 38,
+      "nodeBusyPct": 10,
+      "loopMeanMs": 11.8,
+      "loopP99Ms": 31.3,
+      "rssMb": 7422,
+      "processes": 28,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2307,
+          "rssMb": 6276,
+          "n": 25
+        },
+        "browser": {
+          "cpuMs": 101,
+          "rssMb": 352,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 82,
+          "rssMb": 429,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 39,
+          "rssMb": 369,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789763844362,
+          1789763854549
+        ],
+        [
+          1789763961083,
+          1789763969909
+        ],
+        [
+          1789764077397,
+          1789764086305
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2726,
+        2530,
+        2529
+      ],
+      "allBatch": [
+        10187,
+        8826,
+        8908
+      ]
+    }
+  ]
+}

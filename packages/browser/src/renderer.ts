@@ -5,6 +5,8 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import { resolveConfigForJob, type PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
+import { experiments, splits, timed } from './experiments.js';
+import { HELPERS, buildBootstrap } from './inPage.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -110,11 +112,57 @@ const renderer: Renderer = async (page, job) => {
 		setupPromises.push(page.evaluateOnNewDocument(WEB_COMPONENTS_POLYFILL));
 	}
 
+	// EXPERIMENT (see experiments.ts): install the in-page helpers + mutation monitor once at
+	// document start, so a poll is a call by name instead of a fresh compile of a tree walk.
+	const bootstrapped =
+		experiments.installHelpers ||
+		experiments.nativeCount ||
+		experiments.monitor ||
+		experiments.combineTail ||
+		experiments.plateauEarlyReturn;
+	if (bootstrapped) {
+		setupPromises.push(
+			page.evaluateOnNewDocument(
+				buildBootstrap({
+					countDomElements,
+					countMatchingElements,
+					scrollSelectorIntoView,
+					scrollPass,
+					countThenScrollPass,
+					waitForStep,
+					extractIndexSignals,
+					extractStructuredOffers,
+					postProcess: postProcess as unknown as (...args: never[]) => unknown,
+				})
+			)
+		);
+	}
+	// EXPERIMENT: hand the block list to Chrome so those requests fail in the network stack and never
+	// pause into our handler. `setBlockedURLs` takes wildcard patterns; the config's entries are
+	// substrings, so each becomes `*<pattern>*`.
+	if (experiments.blockedUrlsViaCdp && blockedUrlPatterns.length > 0) {
+		setupPromises.push(
+			page
+				.createCDPSession()
+				.then((session) =>
+					session
+						.send('Network.setBlockedURLs', { urls: blockedUrlPatterns.map((pattern) => `*${pattern}*`) })
+						.finally(() => session.detach().catch(noop))
+				)
+				.catch(noop)
+		);
+	}
+	// EXPERIMENT: stop animation frames competing with the settle loop.
+	if (experiments.reducedMotion) {
+		setupPromises.push(page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]));
+	}
+
 	const ac = new AbortController();
 	let aborted = false;
 
 	page
 		.on('request', async (req) => {
+			splits.reqTotal++;
 			if (ac.signal.aborted || aborted) {
 				req.abort().catch(noop);
 				return;
@@ -200,15 +248,28 @@ const renderer: Renderer = async (page, job) => {
 				req.continue({ headers }).catch(noop);
 				return;
 			}
+			// EXPERIMENT: a cross-origin sub-frame document is loaded, parsed, scripted and laid out in
+			// its own renderer process, and none of it reaches the snapshot (the serializer emits the
+			// `<iframe>` tag, not the frame's document).
+			if (experiments.abortCrossOriginFrames && req.resourceType() === 'document' && !isSameOrigin(req.url())) {
+				splits.reqCrossOriginDoc++;
+				req.abort().catch(noop);
+				return;
+			}
+			// EXPERIMENT: when `blockedUrlsViaCdp` is on these never reach us — Chrome fails them in the
+			// network stack — so this branch is the control, not the mechanism.
 			if (isBlockedUrl(req.url())) {
+				splits.reqBlocked++;
 				req.abort().catch(noop);
 				return;
 			}
 			if (blockedResourceTypes.has(req.resourceType())) {
 				// Stub blocked images (vs abort) so lazy-loaders keep their real src URLs.
 				if (config.block.stubImages && req.resourceType() === 'image') {
+					splits.reqStubbed++;
 					req.respond(STUB_IMAGE_RESPONSE).catch(noop);
 				} else {
+					splits.reqBlocked++;
 					req.abort().catch(noop);
 				}
 				return;
@@ -242,7 +303,10 @@ const renderer: Renderer = async (page, job) => {
 							}
 							return false;
 						});
-					if (served) return;
+					if (served) {
+						splits.reqCacheHit++;
+						return;
+					}
 					if (ac.signal.aborted || aborted) {
 						req.abort().catch(noop);
 						return;
@@ -258,9 +322,13 @@ const renderer: Renderer = async (page, job) => {
 			// missing from the cache. Measured against a live edge: `_astro/*.js` and the layout
 			// CSS return 403 un-tokened and 200 tokened, from the same host, seconds apart.
 			if (settings.bypass.token && isSameOrigin(req.url())) {
+				splits.reqTokened++;
 				req.continue({ headers: { ...req.headers(), [settings.bypass.header]: settings.bypass.token } }).catch(noop);
 				return;
 			}
+			// Paused, inspected, and continued UNCHANGED: the requests that would never have needed to
+			// reach Node at all. This count is the ceiling on narrowing the interception patterns.
+			splits.reqPassThrough++;
 			req.continue().catch(noop); // For all other requests, continue without modification
 		})
 		.on('response', (res) => {
@@ -461,13 +529,54 @@ const renderer: Renderer = async (page, job) => {
 
 	const settleStart = Date.now();
 
+	// EXPERIMENT (experiments.ts): how a settle poll asks the page for a count. Every arm returns
+	// the SAME number for the same DOM — `monitor` maintains it from mutation records, `nativeCount`
+	// gets it from C++ traversal, `installHelpers` calls the already-compiled walk, and the default
+	// ships the walk's source per call, as today.
+	const countElements = async (): Promise<number> => timed('countMs', () => countElementsNow());
+	const countElementsNow = async (): Promise<number> => {
+		if (experiments.monitor) return await page.evaluate(() => window.__prerender.read().elements);
+		if (experiments.nativeCount) return await page.evaluate(() => window.__prerender.nativeElements());
+		if (experiments.installHelpers) return await page.evaluate(() => window.__prerender.countDomElements());
+		return await page.evaluate(countDomElements);
+	};
+
+	const countMatching = async (selector: string): Promise<number> => {
+		if (experiments.nativeCount || experiments.monitor)
+			return await page.evaluate((sel) => window.__prerender.nativeMatching(sel), selector);
+		if (experiments.installHelpers)
+			return await page.evaluate((sel) => window.__prerender.countMatchingElements(sel), selector);
+		return await page.evaluate(countMatchingElements, selector);
+	};
+
+	// Every plateau wait, timed: `countMs` covers only the evaluate inside the loop, so without this
+	// the dwell between polls — which is most of it — lands in no bucket at all.
+	const plateau = () =>
+		timed('plateauMs', async () => {
+			splits.plateaus++;
+			// EXPERIMENT: credit quiescence that accrued before this plateau was entered. The monitor
+			// timestamps the last change that exceeded the tolerance, so a page that has already been
+			// still for `domStableMs` needs no dwell at all. Falls through to the full wait whenever the
+			// monitor is absent or has not seen enough quiet — it can only ever SHORTEN a wait that the
+			// full check would also have ended.
+			if (experiments.plateauEarlyReturn) {
+				const quiet = await page
+					.evaluate((tolerance: number) => window.__prerender?.quietMs?.(tolerance) ?? -1, config.navigation.domStableTolerance)
+					.catch(() => -1);
+				if (quiet >= config.navigation.domStableMs) return;
+			}
+			return await domStable();
+		});
+
 	const networkIdle = () =>
-		page
-			.waitForNetworkIdle({
-				idleTime: config.navigation.networkIdleMs,
-				timeout: Math.min(remainingTimer.remaining, config.navigation.networkIdleTimeoutMs),
-			})
-			.catch(noop);
+		timed('idleMs', () =>
+			page
+				.waitForNetworkIdle({
+					idleTime: config.navigation.networkIdleMs,
+					timeout: Math.min(remainingTimer.remaining, config.navigation.networkIdleTimeoutMs),
+				})
+				.catch(noop)
+		);
 
 	// Wait until the DOM's element count stops changing for `domStableMs`, capped by
 	// `domStableTimeoutMs` and the remaining render budget. Catches late content
@@ -487,7 +596,7 @@ const renderer: Renderer = async (page, job) => {
 			// settle before they appear.
 			let count: number;
 			try {
-				count = await page.evaluate(countDomElements);
+				count = await countElements();
 			} catch {
 				// Page closed / crashed / navigated — stop polling instead of spinning to the deadline.
 				return;
@@ -512,12 +621,64 @@ const renderer: Renderer = async (page, job) => {
 		const requiredStablePasses = Math.max(1, config.scroll.settleStablePasses);
 		let last = -1;
 		let stablePasses = 0;
+		// EXPERIMENT: read the count at the ENTRY of the next pass instead of after this one, so a
+		// pass costs one call rather than two. The sample is the same state (previous pass +
+		// its network-idle), but the loop now decides one pass LATE — it has already started the
+		// next pass by the time it sees stability. Whether that trade is a win depends on which
+		// costs more, a round trip or a scroll pass, which is what the bench answers.
+		if (experiments.combineScrollCount) {
+			const passAndCount = async (): Promise<number> =>
+				experiments.installHelpers || experiments.nativeCount || experiments.monitor
+					? await page.evaluate(
+							async (stepMs: number, frac: number, useMonitor: boolean, useNative: boolean) => {
+								const helpers = window.__prerender;
+								const count = useMonitor
+									? helpers.read().elements
+									: useNative
+										? helpers.nativeElements()
+										: helpers.countDomElements();
+								await helpers.scrollPass(stepMs, frac);
+								return count;
+							},
+							config.scroll.stepMs,
+							config.scroll.stepFraction,
+							experiments.monitor,
+							experiments.nativeCount
+						)
+					: await page.evaluate(countThenScrollPass, config.scroll.stepMs, config.scroll.stepFraction);
+			let first = true;
+			while (Date.now() < deadline && stablePasses < requiredStablePasses) {
+				let count: number;
+				try {
+					count = await passAndCount();
+					await networkIdle();
+				} catch {
+					return;
+				}
+				// The entry count of the FIRST pass is the pre-scroll DOM, which the baseline loop
+				// never samples; including it would let a page with no lazy content settle a pass
+				// early. Skipped, so both arms compare the same sequence of post-pass samples.
+				if (!first) {
+					if (last >= 0 && Math.abs(count - last) <= config.navigation.domStableTolerance) stablePasses++;
+					else stablePasses = 0;
+					last = count;
+				}
+				first = false;
+			}
+			await scrollToTop();
+			return;
+		}
 		while (Date.now() < deadline && stablePasses < requiredStablePasses) {
 			let count: number;
 			try {
-				await page.evaluate(scrollPass, config.scroll.stepMs, config.scroll.stepFraction);
+				await timed('scrollMs', async () => {
+					splits.passes++;
+					return experiments.rafScroll
+						? await page.evaluate(scrollPassRaf, config.scroll.stepFraction)
+						: await page.evaluate(scrollPass, config.scroll.stepMs, config.scroll.stepFraction);
+				});
 				await networkIdle();
-				count = await page.evaluate(countDomElements);
+				count = await countElements();
 			} catch {
 				// Page closed / crashed during a pass — stop instead of looping to the deadline.
 				return;
@@ -539,8 +700,10 @@ const renderer: Renderer = async (page, job) => {
 	// class flip needs to land, which the wall-clock wait covers regardless of how it's scheduled.
 	const scrollToTop = async () => {
 		await page.evaluate(() => window.scrollTo(0, 0)).catch(noop);
+		// EXPERIMENT: the dwell is redundant when a plateau follows (see experiments.ts).
+		if (experiments.skipTopSettleBeforePlateau && config.navigation.finalDomStable) return;
 		if (config.scroll.topSettleMs > 0) {
-			await new Promise((resolve) => setTimeout(resolve, config.scroll.topSettleMs));
+			await timed('topSettleMs', () => new Promise<void>((resolve) => setTimeout(resolve, config.scroll.topSettleMs)));
 		}
 	};
 
@@ -582,17 +745,64 @@ const renderer: Renderer = async (page, job) => {
 			let satisfied = false;
 			let lastCount = 0;
 			while (Date.now() < deadline) {
+				splits.gateTicks++;
 				// Scroll the anchor into view ONCE (enough to trip its IntersectionObserver); the widget
 				// then loads into the DOM and is counted regardless of scroll position. Avoids per-tick
 				// layout thrash and fighting the page's own scroll handling. Keeps retrying until the
 				// anchor is actually found (it may itself be injected late).
+				// EXPERIMENT: one call per tick instead of two (scroll-into-view + count), and — when
+				// the gate is `minCount: 1` — an existence test that stops at the first match instead
+				// of counting every one of them. The reported count is still a real count: it is taken
+				// once, on the tick that satisfies the gate.
+				if (experiments.combineWaitFor || experiments.existsShortCircuit) {
+					const existsOnly = experiments.existsShortCircuit && minCount === 1;
+					const mode: 'walk' | 'native' = experiments.nativeCount || experiments.monitor ? 'native' : 'walk';
+					let step: { scrolled: boolean; count: number; exists: boolean };
+					try {
+						step = experiments.installHelpers
+							? await page.evaluate(
+									(opts: Parameters<typeof waitForStep>[0]) => window.__prerender.waitForStep(opts),
+									{ anchor: rule.selector, content: contentSelector, scroll: doScroll && !hasScrolled, existsOnly, mode }
+								)
+							: await page.evaluate(waitForStep, {
+									anchor: rule.selector,
+									content: contentSelector,
+									scroll: doScroll && !hasScrolled,
+									existsOnly,
+									mode,
+								});
+					} catch {
+						job.waitForResults = results;
+						return;
+					}
+					if (step.scrolled) hasScrolled = true;
+					const satisfiedNow = existsOnly ? step.exists : step.count >= minCount;
+					if (satisfiedNow) {
+						// One real count, for the telemetry the gate reports.
+						lastCount = existsOnly ? await countMatching(contentSelector).catch(() => minCount) : step.count;
+						if (stableMs === 0) {
+							satisfied = true;
+							break;
+						}
+						if (satisfiedSince === 0) satisfiedSince = Date.now();
+						else if (Date.now() - satisfiedSince >= stableMs) {
+							satisfied = true;
+							break;
+						}
+					} else {
+						lastCount = step.count;
+						satisfiedSince = 0;
+					}
+					await new Promise((resolve) => setTimeout(resolve, config.navigation.domStablePollMs));
+					continue;
+				}
 				if (doScroll && !hasScrolled) {
 					const scrolled = await page.evaluate(scrollSelectorIntoView, rule.selector).catch(() => false);
 					if (scrolled) hasScrolled = true;
 				}
 				let count: number;
 				try {
-					count = await page.evaluate(countMatchingElements, contentSelector);
+					count = await countMatching(contentSelector);
 				} catch {
 					// page closed / navigated — stop instead of looping to the deadline, but keep the
 					// partial telemetry rather than dropping the whole run's attribution.
@@ -632,12 +842,19 @@ const renderer: Renderer = async (page, job) => {
 		if (config.scroll.enabled) {
 			// Scroll to the bottom to trigger lazy-loaded content, then back to the top
 			// (e.g. so a scroll-aware navbar renders in its default state).
-			await page.evaluate(scrollToBottom, config.scroll.stepMs);
-			await networkIdle();
+			await timed('scrollMs', () =>
+				experiments.rafScroll
+					? page.evaluate(scrollPassRaf, config.scroll.stepFraction)
+					: page.evaluate(scrollToBottom, config.scroll.stepMs)
+			);
+			if (!experiments.skipIdleAfterScroll) await networkIdle();
 			await scrollToTop();
 		}
-		await networkIdle();
-		await domStable();
+		// EXPERIMENT: this idle window sits directly in front of the plateau below, which subsumes it.
+		if (!(experiments.skipIdleBeforePlateau && config.navigation.finalDomStable)) await networkIdle();
+		// EXPERIMENT: with `finalDomStable` on, this plateau is measured again after the gates, later
+		// and therefore more strictly. Skipping it tests whether the earlier one earns its dwell.
+		if (!(experiments.skipPreGatePlateau && config.navigation.finalDomStable)) await plateau();
 	}
 
 	// Content-readiness waits run AFTER the scroll/settle phase (so lazy widgets have been scrolled
@@ -645,7 +862,7 @@ const renderer: Renderer = async (page, job) => {
 	// (sticky headers) re-lands. No-op unless config.waitFor is set. Its dwell is attributed to
 	// `settle` on purpose — it reads as part of the settle budget.
 	if (config.waitFor?.length) {
-		await applyWaitFor();
+		await timed('gateMs', () => applyWaitFor());
 	}
 	if (config.waitFor?.length) await scrollToTop();
 	// The LAST word on whether the page has stopped changing, and the only plateau check that runs
@@ -657,7 +874,7 @@ const renderer: Renderer = async (page, job) => {
 	// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
 	// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
 	// causes. This way the last thing checked is the state that gets serialized.
-	if (config.navigation.finalDomStable) await domStable();
+	if (config.navigation.finalDomStable) await plateau();
 	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {
@@ -699,6 +916,30 @@ const renderer: Renderer = async (page, job) => {
 				// offers (or it failed benignly)" while an ABSENT field means "renderer predates
 				// this feature" — the consumer alarms on the latter, so collapsing null into
 				// undefined would make every offerless page impersonate an outdated renderer.
+				// EXPERIMENT: offers and the serialized document from ONE call. Both already run under
+				// the same condition and the offers read must precede any stripping, which the
+				// combined body preserves by reading first. A failed offers read still degrades to
+				// null without costing the render its content.
+				if (experiments.combineTail) {
+					const ppStart = Date.now();
+					const tail = await page.evaluate(
+						(cap: number, opts: unknown, patterns: string[]) => {
+							let offers: Array<string | null> | null = null;
+							try {
+								offers = window.__prerender.extractStructuredOffers(cap);
+							} catch {
+								offers = null;
+							}
+							return { offers, content: window.__prerender.postProcess(opts, patterns) };
+						},
+						STRUCTURED_OFFER_CAP,
+						config.postProcess,
+						config.block.urlPatterns
+					);
+					timings.postProcess = Date.now() - ppStart;
+					job.structuredOffers = tail.offers;
+					return tail.content;
+				}
 				job.structuredOffers = await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null);
 				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
@@ -733,9 +974,50 @@ async function scrollToBottom(stepMs: number) {
 	});
 }
 
+/**
+ * EXPERIMENT (experiments.ts): a scroll pass paced by animation frames instead of a fixed timer.
+ *
+ * `scrollPass` waits `stepMs` between steps whether or not the page needed the time, so a pass over
+ * a 18,000px document at a 844px viewport spends ~1.4s of pure wall-clock waiting. A frame-paced
+ * pass advances as fast as the compositor actually produces frames.
+ *
+ * The wall-clock cap is not optional: requestAnimationFrame can be starved indefinitely in a
+ * backgrounded/occluded headless tab, and every other wait in this renderer is bounded. A starved
+ * pass ends early rather than hanging the render.
+ */
+async function scrollPassRaf(stepFraction: number) {
+	window.__passes = (window.__passes ?? 0) + 1;
+	await new Promise<void>((resolve) => {
+		const frac = stepFraction >= 0.01 ? stepFraction : 0.5;
+		const step = Math.max(1, Math.round(window.innerHeight * frac));
+		let y = 0;
+		let done = false;
+		const finish = () => {
+			if (done) return;
+			done = true;
+			clearTimeout(cap);
+			resolve();
+		};
+		const cap = setTimeout(finish, 5000);
+		const tick = () => {
+			if (done) return;
+			window.scrollTo(0, y);
+			y += step;
+			if (y >= document.body.scrollHeight) {
+				finish();
+				return;
+			}
+			requestAnimationFrame(tick);
+		};
+		requestAnimationFrame(tick);
+	});
+}
+
 // One absolute-position scroll pass from top to bottom in `stepFraction`-of-viewport steps.
 // Used by the settle loop so each lazy section is held in the viewport long enough to trigger.
 async function scrollPass(stepMs: number, stepFraction: number) {
+	// Bench scaffolding (see experiments.ts): passes performed, read by bench/render-cpu.
+	window.__passes = (window.__passes ?? 0) + 1;
 	await new Promise<void>((resolve) => {
 		let y = 0;
 		// Guard the in-page math: a non-positive/NaN/pathologically-small fraction would floor to
@@ -752,6 +1034,133 @@ async function scrollPass(stepMs: number, stepFraction: number) {
 			}
 		}, stepMs);
 	});
+}
+
+/**
+ * EXPERIMENT (experiments.ts): read the element count, THEN run a scroll pass, in one call.
+ *
+ * The count is of the DOM as it stands on entry — i.e. the state left by the previous pass and its
+ * network-idle wait, which is precisely the sample the separate count call used to take. Self-
+ * contained (passed to page.evaluate), like every other in-page function here.
+ */
+async function countThenScrollPass(stepMs: number, stepFraction: number): Promise<number> {
+	let n = 0;
+	const walk = (node: Node) => {
+		if (node.nodeType === 1) {
+			n++;
+			const shadow = (node as Element).shadowRoot;
+			if (shadow) walk(shadow);
+		}
+		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
+	};
+	walk(document);
+
+	window.__passes = (window.__passes ?? 0) + 1;
+	await new Promise<void>((resolve) => {
+		let y = 0;
+		const frac = stepFraction >= 0.01 ? stepFraction : 0.5;
+		const step = Math.max(1, Math.round(window.innerHeight * frac));
+		const timer = setInterval(() => {
+			window.scrollTo(0, y);
+			y += step;
+			if (y >= document.body.scrollHeight) {
+				clearInterval(timer);
+				resolve();
+			}
+		}, stepMs);
+	});
+	return n;
+}
+
+/**
+ * EXPERIMENT (experiments.ts): one `waitFor` poll tick in one call — the optional scroll-into-view
+ * and the content check together.
+ *
+ * `existsOnly` answers a `minCount: 1` gate, which is an existence question: it returns at the
+ * FIRST match instead of walking the rest of the document to count 1,380 of them. `mode: 'native'`
+ * uses C++ traversal (querySelector/All over the light DOM plus the registered open shadow roots)
+ * instead of a JS walk; it requires the document-start bootstrap and falls back to the walk if the
+ * registry is absent, so a missing bootstrap degrades in cost, never in answer.
+ *
+ * Self-contained, and deliberately duplicates the two walks rather than calling them: it has to
+ * survive being shipped on its own to a page with no helpers installed.
+ */
+function waitForStep(opts: {
+	anchor: string;
+	content: string;
+	scroll: boolean;
+	existsOnly: boolean;
+	mode: 'walk' | 'native';
+}): { scrolled: boolean; count: number; exists: boolean } {
+	const helpers = (window as Window).__prerender;
+	const native = opts.mode === 'native' && helpers && typeof helpers.nativeMatching === 'function';
+
+	let scrolled = false;
+	if (opts.scroll) {
+		const find = (root: Document | ShadowRoot): Element | null => {
+			const direct = root.querySelector(opts.anchor);
+			if (direct) return direct;
+			for (const el of root.querySelectorAll('*')) {
+				const sr = (el as Element).shadowRoot;
+				if (sr) {
+					const nested = find(sr);
+					if (nested) return nested;
+				}
+			}
+			return null;
+		};
+		try {
+			const el = find(document);
+			if (el) {
+				el.scrollIntoView({ block: 'center' });
+				scrolled = true;
+			}
+		} catch {
+			/* malformed anchor selector — the gate simply never scrolls, as before */
+		}
+	}
+
+	if (opts.existsOnly) {
+		if (native) return { scrolled, count: 0, exists: helpers.nativeExists(opts.content) };
+		let found = false;
+		const walk = (node: Node): boolean => {
+			if (node.nodeType === 1) {
+				const el = node as Element;
+				if (el.matches(opts.content)) return true;
+				const sr = el.shadowRoot;
+				if (sr && walk(sr)) return true;
+			}
+			for (let child = node.firstChild; child; child = child.nextSibling) if (walk(child)) return true;
+			return false;
+		};
+		try {
+			found = walk(document);
+		} catch {
+			found = false;
+		}
+		return { scrolled, count: 0, exists: found };
+	}
+
+	if (native) {
+		const count = helpers.nativeMatching(opts.content);
+		return { scrolled, count, exists: count > 0 };
+	}
+	let n = 0;
+	const walk = (node: Node) => {
+		if (node.nodeType === 1) {
+			const el = node as Element;
+			if (el.matches(opts.content)) n++;
+			const sr = el.shadowRoot;
+			if (sr) walk(sr);
+		}
+		for (let child = node.firstChild; child; child = child.nextSibling) walk(child);
+	};
+	try {
+		walk(document);
+	} catch {
+		n = 0;
+	}
+	return { scrolled, count: n, exists: n > 0 };
 }
 
 // Count elements across the light DOM and all open shadow roots (widgets like the

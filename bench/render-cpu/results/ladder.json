@@ -1,0 +1,389 @@
+{
+  "label": "ladder",
+  "device": "mobile",
+  "reps": 3,
+  "warmups": 1,
+  "levels": [
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    24
+  ],
+  "uv": null,
+  "results": [
+    {
+      "concurrency": 1,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7406,
+      "perRenderWall": 7406,
+      "maxWall": 7406,
+      "cpuMsPerRender": 2200,
+      "rendersPerSec": 0.14,
+      "v8CompileMs": 0.23,
+      "scriptMs": 39.6,
+      "taskMs": 1381,
+      "devtoolsMs": 209,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 535,
+      "processes": 5,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 1950,
+          "rssMb": 320,
+          "n": 2
+        },
+        "browser": {
+          "cpuMs": 100,
+          "rssMb": 99,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 100,
+          "rssMb": 60,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 50,
+          "rssMb": 60,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2240,
+        2190,
+        2200
+      ],
+      "allBatch": [
+        7430,
+        7401,
+        7406
+      ]
+    },
+    {
+      "concurrency": 2,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7429,
+      "perRenderWall": 7428,
+      "maxWall": 7429,
+      "cpuMsPerRender": 2185,
+      "rendersPerSec": 0.27,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1449,
+      "devtoolsMs": 208,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 832,
+      "processes": 6,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2000,
+          "rssMb": 566,
+          "n": 3
+        },
+        "gpu-process": {
+          "cpuMs": 85,
+          "rssMb": 76,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 70,
+          "rssMb": 113,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 30,
+          "rssMb": 77,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2160,
+        2220,
+        2185
+      ],
+      "allBatch": [
+        7429,
+        7441,
+        7424
+      ]
+    },
+    {
+      "concurrency": 4,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7475,
+      "perRenderWall": 7454,
+      "maxWall": 7475,
+      "cpuMsPerRender": 2118,
+      "rendersPerSec": 0.54,
+      "v8CompileMs": 0,
+      "scriptMs": 39,
+      "taskMs": 1433,
+      "devtoolsMs": 213,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 1432,
+      "processes": 8,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 1955,
+          "rssMb": 1067,
+          "n": 5
+        },
+        "gpu-process": {
+          "cpuMs": 75,
+          "rssMb": 108,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 63,
+          "rssMb": 141,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 25,
+          "rssMb": 108,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2113,
+        2173,
+        2118
+      ],
+      "allBatch": [
+        7479,
+        7475,
+        7463
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7602,
+      "perRenderWall": 7572,
+      "maxWall": 7602,
+      "cpuMsPerRender": 2196,
+      "rendersPerSec": 1.05,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1582,
+      "devtoolsMs": 220,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 2618,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2039,
+          "rssMb": 2067,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 76,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 65,
+          "rssMb": 198,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 26,
+          "rssMb": 175,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2165,
+        2196,
+        2206
+      ],
+      "allBatch": [
+        7583,
+        7611,
+        7602
+      ]
+    },
+    {
+      "concurrency": 12,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7736,
+      "perRenderWall": 7680,
+      "maxWall": 7736,
+      "cpuMsPerRender": 2187,
+      "rendersPerSec": 1.55,
+      "v8CompileMs": 0,
+      "scriptMs": 41,
+      "taskMs": 1591,
+      "devtoolsMs": 236,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 3756,
+      "processes": 16,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2020,
+          "rssMb": 3071,
+          "n": 13
+        },
+        "gpu-process": {
+          "cpuMs": 73,
+          "rssMb": 236,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 56,
+          "rssMb": 224,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 23,
+          "rssMb": 223,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2211,
+        2187,
+        2172
+      ],
+      "allBatch": [
+        7764,
+        7736,
+        7725
+      ]
+    },
+    {
+      "concurrency": 16,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 8486,
+      "perRenderWall": 7975,
+      "maxWall": 8485,
+      "cpuMsPerRender": 2496,
+      "rendersPerSec": 1.89,
+      "v8CompileMs": 0,
+      "scriptMs": 42,
+      "taskMs": 1784,
+      "devtoolsMs": 257,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 4954,
+      "processes": 20,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2108,
+          "rssMb": 4071,
+          "n": 17
+        },
+        "gpu-process": {
+          "cpuMs": 76,
+          "rssMb": 301,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 75,
+          "rssMb": 281,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 30,
+          "rssMb": 293,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2496,
+        2583,
+        2289
+      ],
+      "allBatch": [
+        8486,
+        8832,
+        8165
+      ]
+    },
+    {
+      "concurrency": 24,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 11357,
+      "perRenderWall": 8448,
+      "maxWall": 11356,
+      "cpuMsPerRender": 2863,
+      "rendersPerSec": 2.11,
+      "v8CompileMs": 0,
+      "scriptMs": 51,
+      "taskMs": 2209,
+      "devtoolsMs": 242,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 6329,
+      "processes": 28,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2525,
+          "rssMb": 6127,
+          "n": 25
+        },
+        "browser": {
+          "cpuMs": 144,
+          "rssMb": 310,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 98,
+          "rssMb": 332,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 66,
+          "rssMb": 296,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2863,
+        2886,
+        2833
+      ],
+      "allBatch": [
+        10965,
+        12190,
+        11357
+      ]
+    }
+  ]
+}

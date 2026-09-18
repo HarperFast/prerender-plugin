@@ -1,0 +1,300 @@
+{
+  "label": "cache-matrix-70",
+  "device": "mobile",
+  "reps": 3,
+  "warmups": 2,
+  "levels": [
+    8
+  ],
+  "uv": null,
+  "results": [
+    {
+      "concurrency": 8,
+      "variant": "cache-off-70",
+      "reps": 3,
+      "batchMs": 7845,
+      "perRenderWall": 7807,
+      "maxWall": 7844,
+      "cpuMsPerRender": 2429,
+      "rendersPerSec": 1.02,
+      "v8CompileMs": 1,
+      "scriptMs": 153,
+      "taskMs": 1603,
+      "devtoolsMs": 220,
+      "requestsPerRender": 73,
+      "jsRequestsPerRender": 70,
+      "nodeCpuMsPerRender": 44,
+      "nodeBusyPct": 4,
+      "loopMeanMs": 10.8,
+      "loopP99Ms": 11.5,
+      "rssMb": 2909,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2263,
+          "rssMb": 2312,
+          "n": 9
+        },
+        "browser": {
+          "cpuMs": 109,
+          "rssMb": 193,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 76,
+          "rssMb": 172,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 63,
+          "rssMb": 230,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789764606226,
+          1789764614059
+        ],
+        [
+          1789764705994,
+          1789764713839
+        ],
+        [
+          1789764806376,
+          1789764814403
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2393,
+        2429,
+        2510
+      ],
+      "allBatch": [
+        7833,
+        7845,
+        8027
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "cache-on-70",
+      "reps": 3,
+      "batchMs": 8021,
+      "perRenderWall": 7982,
+      "maxWall": 8020,
+      "cpuMsPerRender": 2359,
+      "rendersPerSec": 1,
+      "v8CompileMs": 0,
+      "scriptMs": 152,
+      "taskMs": 1593,
+      "devtoolsMs": 220,
+      "requestsPerRender": 1,
+      "jsRequestsPerRender": 0,
+      "nodeCpuMsPerRender": 93,
+      "nodeBusyPct": 9,
+      "loopMeanMs": 10.8,
+      "loopP99Ms": 11.3,
+      "rssMb": 2850,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2141,
+          "rssMb": 2308,
+          "n": 9
+        },
+        "browser": {
+          "cpuMs": 121,
+          "rssMb": 202,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 74,
+          "rssMb": 172,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 35,
+          "rssMb": 169,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789764631264,
+          1789764639265
+        ],
+        [
+          1789764731165,
+          1789764739186
+        ],
+        [
+          1789764832829,
+          1789764840905
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2359,
+        2354,
+        2371
+      ],
+      "allBatch": [
+        8001,
+        8021,
+        8076
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "context-pool-70",
+      "reps": 3,
+      "batchMs": 7923,
+      "perRenderWall": 7733,
+      "maxWall": 7922,
+      "cpuMsPerRender": 2521,
+      "rendersPerSec": 1.01,
+      "v8CompileMs": 0,
+      "scriptMs": 148,
+      "taskMs": 1663,
+      "devtoolsMs": 219,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "nodeCpuMsPerRender": 43,
+      "nodeBusyPct": 4,
+      "loopMeanMs": 10.9,
+      "loopP99Ms": 13.6,
+      "rssMb": 2953,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2286,
+          "rssMb": 2347,
+          "n": 9
+        },
+        "browser": {
+          "cpuMs": 113,
+          "rssMb": 195,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 74,
+          "rssMb": 172,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 58,
+          "rssMb": 226,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789764656182,
+          1789764663949
+        ],
+        [
+          1789764756003,
+          1789764763926
+        ],
+        [
+          1789764857951,
+          1789764865897
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2431,
+        2521,
+        2530
+      ],
+      "allBatch": [
+        7767,
+        7923,
+        7946
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "context-pool-cache-70",
+      "reps": 3,
+      "batchMs": 8005,
+      "perRenderWall": 7951,
+      "maxWall": 8004,
+      "cpuMsPerRender": 2364,
+      "rendersPerSec": 1,
+      "v8CompileMs": 0,
+      "scriptMs": 152,
+      "taskMs": 1636,
+      "devtoolsMs": 219,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "nodeCpuMsPerRender": 92,
+      "nodeBusyPct": 9,
+      "loopMeanMs": 10.8,
+      "loopP99Ms": 11.5,
+      "rssMb": 2845,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2156,
+          "rssMb": 2302,
+          "n": 9
+        },
+        "browser": {
+          "cpuMs": 120,
+          "rssMb": 197,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 75,
+          "rssMb": 172,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 35,
+          "rssMb": 167,
+          "n": 1
+        }
+      },
+      "windows": [
+        [
+          1789764681087,
+          1789764689092
+        ],
+        [
+          1789764781294,
+          1789764789280
+        ],
+        [
+          1789764883542,
+          1789764891613
+        ]
+      ],
+      "batchCount": 3,
+      "allCpu": [
+        2354,
+        2364,
+        2386
+      ],
+      "allBatch": [
+        8005,
+        7986,
+        8071
+      ]
+    }
+  ]
+}

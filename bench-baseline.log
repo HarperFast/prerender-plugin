@@ -1,0 +1,35 @@
+fixture: http://127.0.0.1:52273/product/prd-bench
+device: mobile   reps: 2   variants: baseline
+
+rep 1/2 baseline               wall   7485ms  cpu   2660ms  task  1758ms  eval  15  cdp  435  reviews 461
+rep 2/2 baseline               wall   7456ms  cpu   2680ms  task  1741ms  eval  15  cdp  435  reviews 461
+
+## cost — median of 2 reps (delta vs baseline)
+
+variant   wall  cpu(tree)  task  task-other  proc-cpu  script  v8compile  layout  style  settle  postProc  evals  cdp-sent  passes  height  elements
+--------  ----  ---------  ----  ----------  --------  ------  ---------  ------  -----  ------  --------  -----  --------  ------  ------  --------
+baseline  7471  2670       1750  0           0         23      0          49      35     7126    225       15     435       3       18358   21864   
+
+## fidelity — must match baseline, or the cost win is not a win
+
+variant   reviews  revealed  lazyTiles  imgGated  offers  shadow  bytes 
+--------  -------  --------  ---------  --------  ------  ------  ------
+baseline  461      1         288        1         6       1788    945084
+
+
+## baseline CDP methods sent (one representative run, 435 total)
+
+  385  Fetch.fulfillRequest
+   15  Runtime.callFunctionOn
+    4  Fetch.continueRequest
+    2  Target.setAutoAttach
+    2  Runtime.runIfWaitingForDebugger
+    2  Page.addScriptToEvaluateOnNewDocument
+    2  Emulation.setDeviceMetricsOverride
+    2  Emulation.setTouchEmulationEnabled
+    1  Target.createBrowserContext
+    1  Browser.setDownloadBehavior
+    1  Target.createTarget
+    1  Network.enable
+    1  Page.enable
+    1  Page.getFrameTree
