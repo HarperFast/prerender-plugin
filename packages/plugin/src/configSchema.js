@@ -1771,6 +1771,39 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
+		conditional: group(
+			'Conditional sitemap fetching: send `If-Modified-Since` and skip the whole reconcile for a ' +
+				'document the origin answers 304 to.\n\n' +
+				'WHAT IT BUYS. A pass re-fetches every child and scans the `sitemapUrl` index once per ' +
+				'child, and it is that prune scan — a held read cursor, whose seconds scale linearly with ' +
+				'refresh frequency — that sets the real cost of refreshing often. A 304 skips the body, the ' +
+				'parse, the scan and every write, so an unchanged pass costs one request per document and ' +
+				'no database work at all. That is what makes polling for a change affordable instead of ' +
+				'merely possible: a deployment whose sitemaps rebuild once a night can check every few ' +
+				'minutes and pay for the walk only on the pass that finds the rebuild.\n\n' +
+				'USE `Last-Modified`, NOT `ETag`, AND DO NOT ASSUME EITHER. Measured on one production ' +
+				'edge: `If-Modified-Since` returned a clean 304, while `If-None-Match` sent back the exact ' +
+				'ETag the same edge had just served and got 200 with the full multi-megabyte body. An ' +
+				'origin that advertises a validator is not promising to honour it, which is why the ' +
+				'`not_modified` counter is worth watching — a steady zero here means every pass is doing ' +
+				'full work and the frequency should come back down.\n\n' +
+				'AN INDEX IS STILL DESCENDED on a 304: that only says the CHILD LIST is unchanged, not the ' +
+				'children, and on a real corpus the children rebuild on a different schedule from the index ' +
+				'that lists them. Each child then makes its own conditional decision.',
+			{
+				enabled: option(true, 'Send `If-Modified-Since` when a stored validator is available.'),
+				fullPassInterval: option(
+					24 * HOUR,
+					'Force an UNCONDITIONAL fetch of a document whose entries have not been ingested in this ' +
+						'long. This is the repair net and it is why the feature is safe to leave on: a 304 skips ' +
+						'the reconcile, and the reconcile is also what re-CREATES targets lost to anything else — ' +
+						'a bad purge, a half-applied delete, a botched migration. Without a periodic full pass a ' +
+						'corpus could drift for as long as the origin left its sitemaps untouched and nothing ' +
+						'would notice. Set it to 0 to make every fetch unconditional (the pre-0.69.0 behaviour).',
+					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
 		departure: group(
 			'What a refresh does about URLs that LEAVE a sitemap, beyond unlinking them. The action is ' +
 				'declared PER ROUTE (`ingress.routes[].departureAction`); this group bounds and observes it, ' +

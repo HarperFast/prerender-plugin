@@ -107,6 +107,11 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 		// bulk-population overflow that fell back to the old behaviour.
 		createdSoon: 0,
 		removed: 0,
+		// Documents the origin answered 304 to, so their entries were never re-parsed and their
+		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;
+		// a steady ZERO where conditional fetching is enabled means the origin is not honouring
+		// If-Modified-Since and every pass is doing full work.
+		notModified: 0,
 		sitemapsProcessed: 0,
 		sitemapsDiscovered: 0,
 	};
