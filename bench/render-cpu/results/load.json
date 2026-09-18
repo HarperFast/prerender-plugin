@@ -1,0 +1,186 @@
+{
+  "device": "mobile",
+  "reps": 2,
+  "levels": [
+    1,
+    8
+  ],
+  "results": [
+    {
+      "concurrency": 1,
+      "variant": "baseline",
+      "batchMs": 7386,
+      "perRenderWall": 7386,
+      "maxWall": 7386,
+      "cpuMsPerRender": 2585,
+      "rendersPerSec": 0.14,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 1,
+      "variant": "monitor",
+      "batchMs": 7380,
+      "perRenderWall": 7379,
+      "maxWall": 7379,
+      "cpuMsPerRender": 2605,
+      "rendersPerSec": 0.14,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 1,
+      "variant": "tall-viewport",
+      "batchMs": 3331,
+      "perRenderWall": 3330,
+      "maxWall": 3330,
+      "cpuMsPerRender": 1595,
+      "rendersPerSec": 0.3,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 1,
+      "variant": "step-raf",
+      "batchMs": 3079,
+      "perRenderWall": 3078,
+      "maxWall": 3078,
+      "cpuMsPerRender": 1575,
+      "rendersPerSec": 0.32,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 1,
+      "variant": "images-off",
+      "batchMs": 7362,
+      "perRenderWall": 7362,
+      "maxWall": 7362,
+      "cpuMsPerRender": 2325,
+      "rendersPerSec": 0.14,
+      "reviews": 461,
+      "bytes": 937289
+    },
+    {
+      "concurrency": 1,
+      "variant": "no-prune-css",
+      "batchMs": 7241,
+      "perRenderWall": 7240,
+      "maxWall": 7240,
+      "cpuMsPerRender": 2390,
+      "rendersPerSec": 0.14,
+      "reviews": 461,
+      "bytes": 1038768
+    },
+    {
+      "concurrency": 1,
+      "variant": "best-of",
+      "batchMs": 1697,
+      "perRenderWall": 1697,
+      "maxWall": 1697,
+      "cpuMsPerRender": 1090,
+      "rendersPerSec": 0.59,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 1,
+      "variant": "cpu-stack-safe",
+      "batchMs": 1665,
+      "perRenderWall": 1664,
+      "maxWall": 1664,
+      "cpuMsPerRender": 1090,
+      "rendersPerSec": 0.6,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "baseline",
+      "batchMs": 7588,
+      "perRenderWall": 7563,
+      "maxWall": 7588,
+      "cpuMsPerRender": 2206,
+      "rendersPerSec": 1.05,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "monitor",
+      "batchMs": 7561,
+      "perRenderWall": 7534,
+      "maxWall": 7560,
+      "cpuMsPerRender": 2171,
+      "rendersPerSec": 1.06,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "tall-viewport",
+      "batchMs": 4533,
+      "perRenderWall": 3482,
+      "maxWall": 4532,
+      "cpuMsPerRender": 1883,
+      "rendersPerSec": 1.76,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "step-raf",
+      "batchMs": 3343,
+      "perRenderWall": 3316,
+      "maxWall": 3342,
+      "cpuMsPerRender": 1725,
+      "rendersPerSec": 2.39,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "images-off",
+      "batchMs": 7454,
+      "perRenderWall": 7445,
+      "maxWall": 7453,
+      "cpuMsPerRender": 1973,
+      "rendersPerSec": 1.07,
+      "reviews": 461,
+      "bytes": 937289
+    },
+    {
+      "concurrency": 8,
+      "variant": "no-prune-css",
+      "batchMs": 7395,
+      "perRenderWall": 7373,
+      "maxWall": 7394,
+      "cpuMsPerRender": 2076,
+      "rendersPerSec": 1.08,
+      "reviews": 461,
+      "bytes": 1038768
+    },
+    {
+      "concurrency": 8,
+      "variant": "best-of",
+      "batchMs": 2015,
+      "perRenderWall": 1976,
+      "maxWall": 2015,
+      "cpuMsPerRender": 1348,
+      "rendersPerSec": 3.97,
+      "reviews": 461,
+      "bytes": 937335
+    },
+    {
+      "concurrency": 8,
+      "variant": "cpu-stack-safe",
+      "batchMs": 1967,
+      "perRenderWall": 1924,
+      "maxWall": 1967,
+      "cpuMsPerRender": 1358,
+      "rendersPerSec": 4.07,
+      "reviews": 461,
+      "bytes": 937335
+    }
+  ]
+}

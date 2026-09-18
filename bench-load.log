@@ -1,0 +1,45 @@
+fixture: http://127.0.0.1:53872/product/prd-bench
+device: mobile  reps: 2  concurrency: 1,8
+cores: 14
+
+c= 1 baseline                 batch   7386ms  per-render   7386ms  cpu/render  2585ms   0.14/s  reviews 461
+c= 1 monitor                  batch   7380ms  per-render   7379ms  cpu/render  2605ms   0.14/s  reviews 461
+c= 1 tall-viewport            batch   3331ms  per-render   3330ms  cpu/render  1595ms    0.3/s  reviews 461
+c= 1 step-raf                 batch   3079ms  per-render   3078ms  cpu/render  1575ms   0.32/s  reviews 461
+c= 1 images-off               batch   7362ms  per-render   7362ms  cpu/render  2325ms   0.14/s  reviews 461
+c= 1 no-prune-css             batch   7241ms  per-render   7240ms  cpu/render  2390ms   0.14/s  reviews 461
+c= 1 best-of                  batch   1697ms  per-render   1697ms  cpu/render  1090ms   0.59/s  reviews 461
+c= 1 cpu-stack-safe           batch   1665ms  per-render   1664ms  cpu/render  1090ms    0.6/s  reviews 461
+
+c= 8 baseline                 batch   7588ms  per-render   7563ms  cpu/render  2206ms   1.05/s  reviews 461
+c= 8 monitor                  batch   7561ms  per-render   7534ms  cpu/render  2171ms   1.06/s  reviews 461
+c= 8 tall-viewport            batch   4533ms  per-render   3482ms  cpu/render  1883ms   1.76/s  reviews 461
+c= 8 step-raf                 batch   3343ms  per-render   3316ms  cpu/render  1725ms   2.39/s  reviews 461
+c= 8 images-off               batch   7454ms  per-render   7445ms  cpu/render  1973ms   1.07/s  reviews 461
+c= 8 no-prune-css             batch   7395ms  per-render   7373ms  cpu/render  2076ms   1.08/s  reviews 461
+c= 8 best-of                  batch   2015ms  per-render   1976ms  cpu/render  1348ms   3.97/s  reviews 461
+c= 8 cpu-stack-safe           batch   1967ms  per-render   1924ms  cpu/render  1358ms   4.07/s  reviews 461
+
+
+## throughput under load (median of reps)
+
+conc  variant         batch   per-render  max-wall  cpu/render  renders/s  vs base /s  reviews
+----  --------------  ------  ----------  --------  ----------  ---------  ----------  -------
+1     baseline        7386ms  7386ms      7386ms    2585ms      0.14       1.00x       461    
+1     monitor         7380ms  7379ms      7379ms    2605ms      0.14       1.00x       461    
+1     tall-viewport   3331ms  3330ms      3330ms    1595ms      0.3        2.14x       461    
+1     step-raf        3079ms  3078ms      3078ms    1575ms      0.32       2.29x       461    
+1     images-off      7362ms  7362ms      7362ms    2325ms      0.14       1.00x       461    
+1     no-prune-css    7241ms  7240ms      7240ms    2390ms      0.14       1.00x       461    
+1     best-of         1697ms  1697ms      1697ms    1090ms      0.59       4.21x       461    
+1     cpu-stack-safe  1665ms  1664ms      1664ms    1090ms      0.6        4.29x       461    
+8     baseline        7588ms  7563ms      7588ms    2206ms      1.05       1.00x       461    
+8     monitor         7561ms  7534ms      7560ms    2171ms      1.06       1.01x       461    
+8     tall-viewport   4533ms  3482ms      4532ms    1883ms      1.76       1.68x       461    
+8     step-raf        3343ms  3316ms      3342ms    1725ms      2.39       2.28x       461    
+8     images-off      7454ms  7445ms      7453ms    1973ms      1.07       1.02x       461    
+8     no-prune-css    7395ms  7373ms      7394ms    2076ms      1.08       1.03x       461    
+8     best-of         2015ms  1976ms      2015ms    1348ms      3.97       3.78x       461    
+8     cpu-stack-safe  1967ms  1924ms      1967ms    1358ms      4.07       3.88x       461    
+
+wrote /private/tmp/prerender-plugin/perf-cdp/bench/render-cpu/results/load.json

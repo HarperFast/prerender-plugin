@@ -1,0 +1,189 @@
+fixture: http://127.0.0.1:52549/product/prd-bench
+device: mobile   reps: 5   variants: baseline, combine-scroll-count, combine-waitfor, combine-tail, install-helpers, combines-all, exists-shortcircuit, native-count, monitor, tall-viewport, viewport-2000, viewport-10000, viewport-taller-than-page, step-20ms, step-raf, idle-tight, poll-60ms, shared-context, images-off, stub-off, best-of, reduced-motion
+
+rep 1/5 baseline               wall   7465ms  cpu   2680ms  task  1777ms  eval  15  cdp  435  reviews 461
+rep 1/5 combine-scroll-count   wall   9756ms  cpu   3340ms  task  2238ms  eval  13  cdp  433  reviews 461
+rep 1/5 combine-waitfor        wall   7454ms  cpu   2700ms  task  1773ms  eval  14  cdp  434  reviews 461
+rep 1/5 combine-tail           wall   7479ms  cpu   2750ms  task  1800ms  eval  14  cdp  435  reviews 461
+rep 1/5 install-helpers        wall   7471ms  cpu   2690ms  task  1771ms  eval  15  cdp  436  reviews 461
+rep 1/5 combines-all           wall   7460ms  cpu   2650ms  task  1742ms  eval  13  cdp  434  reviews 461
+rep 1/5 exists-shortcircuit    wall   7444ms  cpu   2620ms  task  1722ms  eval  15  cdp  435  reviews 461
+rep 1/5 native-count           wall   7448ms  cpu   2700ms  task  1782ms  eval  15  cdp  436  reviews 461
+rep 1/5 monitor                wall   7460ms  cpu   2650ms  task  1740ms  eval  15  cdp  436  reviews 461
+rep 1/5 tall-viewport          wall   3390ms  cpu   1640ms  task   925ms  eval  15  cdp  435  reviews 461
+rep 1/5 viewport-2000          wall   4643ms  cpu   2010ms  task  1113ms  eval  15  cdp  435  reviews 461
+rep 1/5 viewport-10000         wall   2954ms  cpu   1760ms  task   890ms  eval  15  cdp  435  reviews 461
+rep 1/5 viewport-taller-than-page wall   2778ms  cpu   1770ms  task   816ms  eval  15  cdp  435  reviews 461
+rep 1/5 step-20ms              wall   4160ms  cpu   1880ms  task  1086ms  eval  15  cdp  435  reviews 461
+rep 1/5 step-raf               wall   3130ms  cpu   1640ms  task   974ms  eval  15  cdp  435  reviews 461
+rep 1/5 idle-tight             wall   6544ms  cpu   2550ms  task  1647ms  eval  15  cdp  435  reviews 461
+rep 1/5 poll-60ms              wall   7447ms  cpu   2620ms  task  1695ms  eval  15  cdp  435  reviews 461
+rep 1/5 shared-context         wall   7485ms  cpu   2650ms  task  1737ms  eval  15  cdp  432  reviews 461
+rep 1/5 images-off             wall   7383ms  cpu   2390ms  task  1657ms  eval  15  cdp   50  reviews 461
+rep 1/5 stub-off               wall   7432ms  cpu   2560ms  task  1690ms  eval  15  cdp  435  reviews 461
+rep 1/5 best-of                wall   1751ms  cpu   1170ms  task   671ms  eval  14  cdp  434  reviews 461
+rep 1/5 reduced-motion         wall   7444ms  cpu   2600ms  task  1701ms  eval  15  cdp  436  reviews 461
+rep 2/5 baseline               wall   7444ms  cpu   2660ms  task  1732ms  eval  15  cdp  435  reviews 461
+rep 2/5 combine-scroll-count   wall   9749ms  cpu   3200ms  task  2120ms  eval  13  cdp  433  reviews 461
+rep 2/5 combine-waitfor        wall   7444ms  cpu   2620ms  task  1691ms  eval  14  cdp  434  reviews 461
+rep 2/5 combine-tail           wall   7460ms  cpu   2670ms  task  1759ms  eval  14  cdp  435  reviews 461
+rep 2/5 install-helpers        wall   7454ms  cpu   2670ms  task  1739ms  eval  15  cdp  436  reviews 461
+rep 2/5 combines-all           wall   7460ms  cpu   2630ms  task  1730ms  eval  13  cdp  434  reviews 461
+rep 2/5 exists-shortcircuit    wall   7458ms  cpu   2670ms  task  1777ms  eval  15  cdp  435  reviews 461
+rep 2/5 native-count           wall   7456ms  cpu   2630ms  task  1724ms  eval  15  cdp  436  reviews 461
+rep 2/5 monitor                wall   7442ms  cpu   2630ms  task  1725ms  eval  15  cdp  436  reviews 461
+rep 2/5 tall-viewport          wall   3392ms  cpu   1630ms  task   933ms  eval  15  cdp  435  reviews 461
+rep 2/5 viewport-2000          wall   4628ms  cpu   1930ms  task  1062ms  eval  15  cdp  435  reviews 461
+rep 2/5 viewport-10000         wall   2951ms  cpu   1760ms  task   894ms  eval  15  cdp  435  reviews 461
+rep 2/5 viewport-taller-than-page wall   2766ms  cpu   1710ms  task   780ms  eval  15  cdp  435  reviews 461
+rep 2/5 step-20ms              wall   4162ms  cpu   1890ms  task  1140ms  eval  15  cdp  435  reviews 461
+rep 2/5 step-raf               wall   3129ms  cpu   1600ms  task   955ms  eval  15  cdp  435  reviews 461
+rep 2/5 idle-tight             wall   6543ms  cpu   2400ms  task  1528ms  eval  15  cdp  435  reviews 461
+rep 2/5 poll-60ms              wall   7439ms  cpu   2540ms  task  1659ms  eval  15  cdp  435  reviews 461
+rep 2/5 shared-context         wall   7474ms  cpu   2580ms  task  1667ms  eval  15  cdp  432  reviews 461
+rep 2/5 images-off             wall   7391ms  cpu   2320ms  task  1608ms  eval  15  cdp   50  reviews 461
+rep 2/5 stub-off               wall   7400ms  cpu   2470ms  task  1602ms  eval  15  cdp  435  reviews 461
+rep 2/5 best-of                wall   1721ms  cpu   1120ms  task   629ms  eval  14  cdp  434  reviews 461
+rep 2/5 reduced-motion         wall   7434ms  cpu   2310ms  task  1468ms  eval  15  cdp  436  reviews 461
+rep 3/5 baseline               wall   7453ms  cpu   2580ms  task  1690ms  eval  15  cdp  435  reviews 461
+rep 3/5 combine-scroll-count   wall   9750ms  cpu   3210ms  task  2137ms  eval  13  cdp  433  reviews 461
+rep 3/5 combine-waitfor        wall   7441ms  cpu   2610ms  task  1697ms  eval  14  cdp  434  reviews 461
+rep 3/5 combine-tail           wall   7461ms  cpu   2610ms  task  1711ms  eval  14  cdp  435  reviews 461
+rep 3/5 install-helpers        wall   7465ms  cpu   2630ms  task  1709ms  eval  15  cdp  436  reviews 461
+rep 3/5 combines-all           wall   7462ms  cpu   2600ms  task  1696ms  eval  13  cdp  434  reviews 461
+rep 3/5 exists-shortcircuit    wall   7439ms  cpu   2480ms  task  1608ms  eval  15  cdp  435  reviews 461
+rep 3/5 native-count           wall   7438ms  cpu   2570ms  task  1679ms  eval  15  cdp  436  reviews 461
+rep 3/5 monitor                wall   7451ms  cpu   2570ms  task  1666ms  eval  15  cdp  436  reviews 461
+rep 3/5 tall-viewport          wall   3402ms  cpu   1650ms  task   943ms  eval  15  cdp  435  reviews 461
+rep 3/5 viewport-2000          wall   4622ms  cpu   1880ms  task  1055ms  eval  15  cdp  435  reviews 461
+rep 3/5 viewport-10000         wall   2955ms  cpu   1720ms  task   861ms  eval  15  cdp  435  reviews 461
+rep 3/5 viewport-taller-than-page wall   2762ms  cpu   1710ms  task   784ms  eval  15  cdp  435  reviews 461
+rep 3/5 step-20ms              wall   4166ms  cpu   1860ms  task  1111ms  eval  15  cdp  435  reviews 461
+rep 3/5 step-raf               wall   3134ms  cpu   1590ms  task   959ms  eval  15  cdp  435  reviews 461
+rep 3/5 idle-tight             wall   6545ms  cpu   2400ms  task  1518ms  eval  15  cdp  435  reviews 461
+rep 3/5 poll-60ms              wall   7437ms  cpu   2450ms  task  1574ms  eval  15  cdp  435  reviews 461
+rep 3/5 shared-context         wall   7423ms  cpu   2290ms  task  1454ms  eval  15  cdp  432  reviews 461
+rep 3/5 images-off             wall   7400ms  cpu   2270ms  task  1577ms  eval  15  cdp   50  reviews 461
+rep 3/5 stub-off               wall   7417ms  cpu   2610ms  task  1724ms  eval  15  cdp  435  reviews 461
+rep 3/5 best-of                wall   1752ms  cpu   1140ms  task   654ms  eval  14  cdp  434  reviews 461
+rep 3/5 reduced-motion         wall   7439ms  cpu   2670ms  task  1751ms  eval  15  cdp  436  reviews 461
+rep 4/5 baseline               wall   7450ms  cpu   2650ms  task  1748ms  eval  15  cdp  435  reviews 461
+rep 4/5 combine-scroll-count   wall   9752ms  cpu   3270ms  task  2168ms  eval  13  cdp  433  reviews 461
+rep 4/5 combine-waitfor        wall   7444ms  cpu   2580ms  task  1708ms  eval  14  cdp  434  reviews 461
+rep 4/5 combine-tail           wall   7452ms  cpu   2610ms  task  1706ms  eval  14  cdp  435  reviews 461
+rep 4/5 install-helpers        wall   7467ms  cpu   2670ms  task  1745ms  eval  15  cdp  436  reviews 461
+rep 4/5 combines-all           wall   7458ms  cpu   2690ms  task  1775ms  eval  13  cdp  434  reviews 461
+rep 4/5 exists-shortcircuit    wall   7434ms  cpu   2570ms  task  1672ms  eval  15  cdp  435  reviews 461
+rep 4/5 native-count           wall   7451ms  cpu   2640ms  task  1725ms  eval  15  cdp  436  reviews 461
+rep 4/5 monitor                wall   7432ms  cpu   2600ms  task  1700ms  eval  15  cdp  436  reviews 461
+rep 4/5 tall-viewport          wall   3373ms  cpu   1610ms  task   906ms  eval  15  cdp  435  reviews 461
+rep 4/5 viewport-2000          wall   4633ms  cpu   1950ms  task  1075ms  eval  15  cdp  435  reviews 461
+rep 4/5 viewport-10000         wall   2952ms  cpu   1740ms  task   881ms  eval  15  cdp  435  reviews 461
+rep 4/5 viewport-taller-than-page wall   2765ms  cpu   1720ms  task   780ms  eval  15  cdp  435  reviews 461
+rep 4/5 step-20ms              wall   4174ms  cpu   1880ms  task  1092ms  eval  15  cdp  435  reviews 461
+rep 4/5 step-raf               wall   3137ms  cpu   1580ms  task   935ms  eval  15  cdp  435  reviews 461
+rep 4/5 idle-tight             wall   6545ms  cpu   2450ms  task  1576ms  eval  15  cdp  435  reviews 461
+rep 4/5 poll-60ms              wall   7452ms  cpu   2610ms  task  1696ms  eval  15  cdp  435  reviews 461
+rep 4/5 shared-context         wall   7439ms  cpu   2580ms  task  1665ms  eval  15  cdp  432  reviews 461
+rep 4/5 images-off             wall   7379ms  cpu   2160ms  task  1472ms  eval  15  cdp   50  reviews 461
+rep 4/5 stub-off               wall   7418ms  cpu   2470ms  task  1610ms  eval  15  cdp  435  reviews 461
+rep 4/5 best-of                wall   1754ms  cpu   1110ms  task   622ms  eval  14  cdp  434  reviews 461
+rep 4/5 reduced-motion         wall   7441ms  cpu   2440ms  task  1559ms  eval  15  cdp  436  reviews 461
+rep 5/5 baseline               wall   7451ms  cpu   2550ms  task  1668ms  eval  15  cdp  435  reviews 461
+rep 5/5 combine-scroll-count   wall   9740ms  cpu   2970ms  task  1959ms  eval  13  cdp  433  reviews 461
+rep 5/5 combine-waitfor        wall   7450ms  cpu   2530ms  task  1626ms  eval  14  cdp  434  reviews 461
+rep 5/5 combine-tail           wall   7449ms  cpu   2520ms  task  1615ms  eval  14  cdp  435  reviews 461
+rep 5/5 install-helpers        wall   7446ms  cpu   2500ms  task  1608ms  eval  15  cdp  436  reviews 461
+rep 5/5 combines-all           wall   7460ms  cpu   2480ms  task  1613ms  eval  13  cdp  434  reviews 461
+rep 5/5 exists-shortcircuit    wall   7456ms  cpu   2470ms  task  1578ms  eval  15  cdp  435  reviews 461
+rep 5/5 native-count           wall   7445ms  cpu   2560ms  task  1654ms  eval  15  cdp  436  reviews 461
+rep 5/5 monitor                wall   7464ms  cpu   2570ms  task  1689ms  eval  15  cdp  436  reviews 461
+rep 5/5 tall-viewport          wall   2761ms  cpu   1370ms  task   811ms  eval  14  cdp  434  reviews 461
+rep 5/5 viewport-2000          wall   4624ms  cpu   1840ms  task  1017ms  eval  15  cdp  435  reviews 461
+rep 5/5 viewport-10000         wall   2938ms  cpu   1750ms  task   891ms  eval  15  cdp  435  reviews 461
+rep 5/5 viewport-taller-than-page wall   2769ms  cpu   1670ms  task   762ms  eval  15  cdp  435  reviews 461
+rep 5/5 step-20ms              wall   4119ms  cpu   1720ms  task  1002ms  eval  15  cdp  435  reviews 461
+rep 5/5 step-raf               wall   3124ms  cpu   1530ms  task   919ms  eval  15  cdp  435  reviews 461
+rep 5/5 idle-tight             wall   6543ms  cpu   2320ms  task  1479ms  eval  15  cdp  435  reviews 461
+rep 5/5 poll-60ms              wall   7438ms  cpu   2460ms  task  1572ms  eval  15  cdp  435  reviews 461
+rep 5/5 shared-context         wall   7475ms  cpu   2520ms  task  1636ms  eval  15  cdp  432  reviews 461
+rep 5/5 images-off             wall   7374ms  cpu   2270ms  task  1548ms  eval  15  cdp   50  reviews 461
+rep 5/5 stub-off               wall   7421ms  cpu   2480ms  task  1611ms  eval  15  cdp  435  reviews 461
+rep 5/5 best-of                wall   1717ms  cpu   1140ms  task   635ms  eval  14  cdp  434  reviews 461
+rep 5/5 reduced-motion         wall   7443ms  cpu   2390ms  task  1515ms  eval  15  cdp  436  reviews 461
+
+## cost — median of 5 reps (delta vs baseline)
+
+variant                    wall         cpu(tree)    task         task-other   proc-cpu     script     v8compile  devtools   layout     style      settle       scroll       idle         count      gate          postProc    evals      cdp-sent   passes    height      elements  
+-------------------------  -----------  -----------  -----------  -----------  -----------  ---------  ---------  ---------  ---------  ---------  -----------  -----------  -----------  ---------  ------------  ----------  ---------  ---------  --------  ----------  ----------
+baseline                   7451         2650         1732         1421         2356         21         0          214        47         33         7122         4968         1503         20         24            215         15         435        3         18358       21864     
+combine-scroll-count       9750 (+31%)  3210 (+21%)  2137 (+23%)  1807 (+27%)  2880 (+22%)  24 (+14%)  0          219 (+2%)  53 (+13%)  33 (0%)    9419 (+32%)  0 (-100%)    2005 (+33%)  0 (-100%)  23 (-4%)      221 (+3%)   13 (-13%)  433 (0%)   4 (+33%)  18358 (0%)  21864 (0%)
+combine-waitfor            7444 (0%)    2610 (-2%)   1697 (-2%)   1383 (-3%)   2310 (-2%)   21 (0%)    0          214 (0%)   46 (-2%)   33 (0%)    7113 (0%)    4966 (0%)    1504 (0%)    18 (-10%)  12 (-50%)     216 (0%)    14 (-7%)   434 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+combine-tail               7460 (0%)    2610 (-2%)   1711 (-1%)   1386 (-2%)   2323 (-1%)   33 (+57%)  0          217 (+1%)  47 (0%)    34 (+3%)   7117 (0%)    4968 (0%)    1503 (0%)    16 (-20%)  20 (-17%)     221 (+3%)   14 (-7%)   435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+install-helpers            7465 (0%)    2670 (+1%)   1739 (0%)    1412 (-1%)   2371 (+1%)   33 (+57%)  0          217 (+1%)  47 (0%)    33 (0%)    7112 (0%)    4967 (0%)    1503 (0%)    18 (-10%)  23 (-4%)      223 (+4%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+combines-all               7460 (0%)    2630 (-1%)   1730 (0%)    1395 (-2%)   2353 (0%)    33 (+57%)  0          217 (+1%)  46 (-2%)   34 (+3%)   7109 (0%)    4967 (0%)    1503 (0%)    17 (-15%)  12 (-50%)     224 (+4%)   13 (-13%)  434 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+exists-shortcircuit        7444 (0%)    2570 (-3%)   1672 (-3%)   1363 (-4%)   2275 (-3%)   21 (0%)    0          214 (0%)   45 (-4%)   33 (0%)    7113 (0%)    4968 (0%)    1503 (0%)    17 (-15%)  24 (0%)       216 (0%)    15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+native-count               7448 (0%)    2630 (-1%)   1724 (0%)    1404 (-1%)   2339 (-1%)   33 (+57%)  0          204 (-5%)  47 (0%)    33 (0%)    7092 (0%)    4968 (0%)    1504 (0%)    6 (-70%)   12 (-50%)     227 (+6%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+monitor                    7451 (0%)    2600 (-2%)   1700 (-2%)   1391 (-2%)   2311 (-2%)   33 (+57%)  0          203 (-5%)  47 (0%)    34 (+3%)   7095 (0%)    4968 (0%)    1503 (0%)    3 (-85%)   14 (-42%)     227 (+6%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+tall-viewport              3390 (-55%)  1630 (-38%)  925 (-47%)   637 (-55%)   1294 (-45%)  11 (-48%)  0          211 (-1%)  35 (-26%)  31 (-6%)   3058 (-57%)  904 (-82%)   1504 (0%)    15 (-25%)  24 (0%)       220 (+2%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+viewport-2000              4628 (-38%)  1930 (-27%)  1062 (-39%)  762 (-46%)   1542 (-35%)  14 (-33%)  0          215 (0%)   37 (-21%)  31 (-6%)   4289 (-40%)  2147 (-57%)  1504 (0%)    17 (-15%)  19 (-21%)     224 (+4%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+viewport-10000             2952 (-60%)  1750 (-34%)  890 (-49%)   607 (-57%)   1290 (-45%)  9 (-57%)   0          204 (-5%)  35 (-26%)  29 (-12%)  2619 (-63%)  472 (-90%)   1503 (0%)    12 (-40%)  18 (-25%)     212 (-1%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+viewport-taller-than-page  2766 (-63%)  1710 (-35%)  780 (-55%)   511 (-64%)   1092 (-54%)  9 (-57%)   0          197 (-8%)  35 (-26%)  30 (-9%)   2435 (-66%)  294 (-94%)   1503 (0%)    26 (+30%)  6 (-75%)      213 (-1%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+step-20ms                  4162 (-44%)  1880 (-29%)  1092 (-37%)  796 (-44%)   1561 (-34%)  14 (-33%)  0          210 (-2%)  36 (-23%)  30 (-9%)   3834 (-46%)  1684 (-66%)  1504 (0%)    16 (-20%)  15 (-37%)     219 (+2%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+step-raf                   3130 (-58%)  1590 (-40%)  955 (-45%)   660 (-54%)   1355 (-42%)  12 (-43%)  0          213 (0%)   37 (-21%)  30 (-9%)   2795 (-61%)  645 (-87%)   1504 (0%)    21 (+5%)   24 (0%)       223 (+4%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+idle-tight                 6544 (-12%)  2400 (-9%)   1528 (-12%)  1218 (-14%)  2111 (-10%)  20 (-5%)   0          211 (-1%)  44 (-6%)   32 (-3%)   6208 (-13%)  4967 (0%)    603 (-60%)   18 (-10%)  17 (-29%)     217 (+1%)   15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+poll-60ms                  7439 (0%)    2540 (-4%)   1659 (-4%)   1352 (-5%)   2257 (-4%)   21 (0%)    0          209 (-2%)  45 (-4%)   33 (0%)    7109 (0%)    4967 (0%)    1503 (0%)    16 (-20%)  20 (-17%)     216 (0%)    15 (0%)    435 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+shared-context             7474 (0%)    2580 (-3%)   1665 (-4%)   1352 (-5%)   2274 (-3%)   21 (0%)    0          213 (0%)   45 (-4%)   33 (0%)    7083 (-1%)   4936 (-1%)   1503 (0%)    17 (-15%)  17 (-29%)     224 (+4%)   15 (0%)    432 (-1%)  3 (0%)    18358 (0%)  21864 (0%)
+images-off                 7383 (-1%)   2270 (-14%)  1577 (-9%)   1264 (-11%)  2119 (-10%)  21 (0%)    0          204 (-5%)  46 (-2%)   33 (0%)    7125 (0%)    4972 (0%)    1503 (0%)    16 (-20%)  22 (-8%)      190 (-12%)  15 (0%)    50 (-89%)  3 (0%)    18341 (0%)  21863 (0%)
+stub-off                   7418 (0%)    2480 (-6%)   1611 (-7%)   1301 (-8%)   2207 (-6%)   21 (0%)    0          209 (-2%)  47 (0%)    34 (+3%)   7104 (0%)    4966 (0%)    1504 (0%)    15 (-25%)  17 (-29%)     217 (+1%)   15 (0%)    435 (0%)   3 (0%)    18341 (0%)  21863 (0%)
+best-of                    1751 (-76%)  1140 (-57%)  635 (-63%)   364 (-74%)   916 (-61%)   9 (-57%)   0          201 (-6%)  32 (-32%)  29 (-12%)  1420 (-80%)  118 (-98%)   402 (-73%)   6 (-70%)   287 (+1096%)  216 (0%)    14 (-7%)   434 (0%)   2 (-33%)  18358 (0%)  21864 (0%)
+reduced-motion             7441 (0%)    2440 (-8%)   1559 (-10%)  1254 (-12%)  2162 (-8%)   21 (0%)    0          209 (-2%)  43 (-9%)   33 (0%)    7105 (0%)    4967 (0%)    1504 (0%)    15 (-25%)  14 (-42%)     218 (+1%)   15 (0%)    436 (0%)   3 (0%)    18358 (0%)  21864 (0%)
+
+## fidelity — must match baseline, or the cost win is not a win
+
+variant                    reviews  revealed  lazyTiles  imgGated  offers  shadow  bytes 
+-------------------------  -------  --------  ---------  --------  ------  ------  ------
+baseline                   461      1         288        1         6       1788    945084
+combine-scroll-count       461      1         288        1         6       1788    945084
+combine-waitfor            461      1         288        1         6       1788    945084
+combine-tail               461      1         288        1         6       1788    945084
+install-helpers            461      1         288        1         6       1788    945084
+combines-all               461      1         288        1         6       1788    945084
+exists-shortcircuit        461      1         288        1         6       1788    945084
+native-count               461      1         288        1         6       1788    945084
+monitor                    461      1         288        1         6       1788    945084
+tall-viewport              461      1         288        1         6       1788    945084
+viewport-2000              461      1         288        1         6       1788    945084
+viewport-10000             461      1         288        1         6       1788    945084
+viewport-taller-than-page  461      1         288        1         6       1788    945084
+step-20ms                  461      1         288        1         6       1788    945084
+step-raf                   461      1         288        1         6       1788    945084
+idle-tight                 461      1         288        1         6       1788    945084
+poll-60ms                  461      1         288        1         6       1788    945084
+shared-context             461      1         288        1         6       1788    945084
+images-off                 461      1         288        0         6       1788    945038
+stub-off                   461      1         288        0         6       1788    945057
+best-of                    461      1         288        1         6       1788    945084
+reduced-motion             461      1         288        1         6       1788    945084
+
+FIDELITY DIVERGENCE  images-off: imgGated 1 -> 0
+FIDELITY DIVERGENCE  stub-off: imgGated 1 -> 0
+
+## baseline CDP methods sent (one representative run, 435 total)
+
+  385  Fetch.fulfillRequest
+   15  Runtime.callFunctionOn
+    4  Fetch.continueRequest
+    2  Target.setAutoAttach
+    2  Runtime.runIfWaitingForDebugger
+    2  Page.addScriptToEvaluateOnNewDocument
+    2  Emulation.setDeviceMetricsOverride
+    2  Emulation.setTouchEmulationEnabled
+    1  Target.createBrowserContext
+    1  Browser.setDownloadBehavior
+    1  Target.createTarget
+    1  Network.enable
+    1  Page.enable
+    1  Page.getFrameTree
+
+wrote /private/tmp/prerender-plugin/perf-cdp/bench/render-cpu/results/mobile.json
