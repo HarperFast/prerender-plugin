@@ -1732,6 +1732,45 @@ export const configSchema = group('Prerender plugin configuration.', {
 			{ min: 0 }
 		),
 		failedCap: option(100, 'Max failed-entry samples carried back in a refresh result.', { min: 0 }),
+		newTargets: group(
+			'How soon a URL the sitemap has just DECLARED gets its first render.\n\n' +
+				'Without this, a newly created target takes `getInitialRenderTime`, which jitters the first ' +
+				'render across the target’s WHOLE render interval — `hash(url) % interval`. That jitter ' +
+				'exists for a real reason (the first ingest of a large sitemap must not stampede the queue), ' +
+				'but it is sized for bulk population and applies just as hard to the handful of genuinely new ' +
+				'URLs a mature corpus gains each day: on a 48h cadence a product published this morning can ' +
+				'wait two days to be rendered once, while the sitemap has been telling us about it the whole ' +
+				'time. A declaration is the strongest signal a site gives that a URL matters.\n\n' +
+				'So the first render is jittered across `window` instead of the interval, and only for the ' +
+				'first `maxPerRun` creates in a walk. The cap is what keeps the bulk case safe: a first ' +
+				'ingest creating hundreds of thousands of targets exceeds it immediately and everything past ' +
+				'it falls back to full-interval jitter, which is exactly the old behaviour. Steady-state ' +
+				'churn (tens to hundreds a day on a real corpus) never comes close to the cap.\n\n' +
+				'Only the FIRST render moves. The target’s cadence is untouched — `effectiveInterval` is ' +
+				'still the route/stored interval, so every render after this one is on the normal schedule.',
+			{
+				window: option(
+					15 * MINUTE,
+					'Jitter window for a newly declared target’s first render. Small values approximate ' +
+						'"immediately" while still spreading a batch across minutes rather than firing it into ' +
+						'one. `0` disables the fast path entirely and restores full-interval jitter.\n\n' +
+						'BELOW ~2 MINUTES IT STOPS SPREADING. `getInitialRenderTime` floors to the minute, so a ' +
+						'window under 60,000ms collapses every create in a walk onto ONE minute — the stampede ' +
+						'this is jittered to avoid, arrived at by asking for less jitter. Capped at 2147483647 ' +
+						'for the same reason `sweepInterval` is: a larger delay is not "effectively never", it ' +
+						'overflows the signed 32-bit timer and fires immediately.\n\n' +
+						'A window WIDER than the route’s own `renderInterval` is ignored — the fast path would be ' +
+						'slower than the jitter it replaces — and does not count as `createdSoon`.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
+				),
+				maxPerRun: option(
+					5000,
+					'Creates per walk that may take the fast path. Past this, new targets fall back to ' +
+						'full-interval jitter — the bulk-population guard.',
+					{ min: 0 }
+				),
+			}
+		),
 		conditional: group(
 			'Conditional sitemap fetching: send `If-Modified-Since` and skip the whole reconcile for a ' +
 				'document the origin answers 304 to.\n\n' +

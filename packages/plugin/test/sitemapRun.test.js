@@ -210,3 +210,28 @@ test('a snapshot is a copy, so persisting it mid-walk cannot be mutated afterwar
 	assert.equal(first.created, 0);
 	assert.equal(run.snapshot().failed.length, 2);
 });
+
+// ---- new-target fast path ----
+
+test('the fast-path cap is per WALK, not per child sitemap', () => {
+	// An index fanning out to 17 children must not multiply the cap by 17: `fastPathTaken` reads the
+	// walk's own running total, which is what the CREATE branch compares against maxPerRun.
+	const run = createRefreshRun();
+	assert.equal(run.fastPathTaken(), 0);
+	run.count('createdSoon');
+	run.count('createdSoon');
+	assert.equal(run.fastPathTaken(), 2, 'the count carries across children within one walk');
+	assert.equal(run.snapshot().createdSoon, 2);
+});
+
+test('createdSoon is a SUBSET of created, so the overflow is readable', () => {
+	// `created - createdSoon` is the bulk-population overflow that fell back to full-interval
+	// jitter — the number that says whether the cap bound.
+	const run = createRefreshRun();
+	for (let i = 0; i < 5; i++) run.count('created');
+	for (let i = 0; i < 2; i++) run.count('createdSoon');
+	const s = run.snapshot();
+	assert.equal(s.created, 5);
+	assert.equal(s.createdSoon, 2);
+	assert.equal(s.created - s.createdSoon, 3, 'three creates fell back to the old behaviour');
+});

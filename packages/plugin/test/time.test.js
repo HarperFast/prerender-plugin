@@ -171,3 +171,34 @@ test('epochMsOf returns NaN for an unparseable value', () => {
 test('epochMsOf keeps epoch 0 distinguishable from absent', () => {
 	assert.equal(epochMsOf(0), 0);
 });
+
+test('a short window bounds a new target’s first render, where the interval does not', () => {
+	// The new-target fast path (sitemap.newTargets.window) relies entirely on this: the same helper,
+	// handed a 15-minute window instead of the target’s cadence, confines the first render to
+	// minutes. Without it a newly declared URL waits `hash(url) % interval` — up to the whole
+	// interval, which on a 48h PDP cadence is two days.
+	const MIN = 60 * 1000;
+	const WINDOW = 15 * MIN;
+	const INTERVAL = 48 * 60 * MIN;
+	const urls = Array.from({ length: 200 }, (_, i) => `https://example.com/product/prd-${i}/thing.jsp`);
+
+	const before = Date.now();
+	const windowed = urls.map((u) => getInitialRenderTime(u, WINDOW));
+	const intervalled = urls.map((u) => getInitialRenderTime(u, INTERVAL));
+	const after = Date.now();
+
+	for (const t of windowed) {
+		assert.ok(t >= before - 60_000, `${t} is before now`);
+		assert.ok(t <= after + WINDOW, `${t} escaped the ${WINDOW}ms window`);
+	}
+
+	// And it is still JITTERED, not a single instant — a batch of creates must land across the
+	// window rather than all in one minute, which is the whole reason this is not simply "now".
+	assert.ok(new Set(windowed).size > 5, `expected spread across the window, got ${new Set(windowed).size} distinct`);
+
+	// The contrast the feature exists for: the interval version reaches far beyond the window.
+	assert.ok(
+		Math.max(...intervalled) > after + WINDOW * 10,
+		'precondition: full-interval jitter spreads far past a short window'
+	);
+});

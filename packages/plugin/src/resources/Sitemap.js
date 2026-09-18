@@ -3,7 +3,7 @@ import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
 import { anyRouteDeparts, classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
-import { currentMinuteMs, epochMsOf, getNextSitemapRefreshTime } from '../util/time.js';
+import { currentMinuteMs, epochMsOf, getInitialRenderTime, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
@@ -364,6 +364,7 @@ const progressFields = (snapshot) => ({
 	created: snapshot.created,
 	updated: snapshot.updated,
 	skipped: snapshot.skipped,
+	createdSoon: snapshot.createdSoon,
 	notModified: snapshot.notModified,
 	duplicates: snapshot.duplicates,
 	deferred: snapshot.deferred,
@@ -410,8 +411,9 @@ async function runTrackedRefresh(rootUrl, options) {
 
 		logger.info(
 			`[prerender] Sitemap refresh for ${rootUrl} finished: ${result.sitemapsProcessed} sitemaps ` +
-				`(${result.notModified} not modified), ${result.created} created, ${result.updated} re-attributed, ` +
-				`${result.skipped} unchanged, ${result.removed} unlinked, ${result.failed.length} failed`
+				`(${result.notModified} not modified), ${result.created} created ` +
+				`(${result.createdSoon} fast-path), ${result.updated} re-attributed, ${result.skipped} unchanged, ` +
+				`${result.removed} unlinked, ${result.failed.length} failed`
 		);
 
 		// The same numbers as METRICS — corpus churn and walk health, previously log-only.
@@ -419,6 +421,7 @@ async function runTrackedRefresh(rootUrl, options) {
 		try {
 			metrics.sitemapRun(result.sitemapsProcessed, 'sitemaps');
 			metrics.sitemapRun(result.created, 'created');
+			metrics.sitemapRun(result.createdSoon, 'created_soon');
 			metrics.sitemapRun(result.updated, 'updated');
 			metrics.sitemapRun(result.skipped, 'skipped');
 			metrics.sitemapRun(result.notModified, 'not_modified');
@@ -596,6 +599,9 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	});
 	run.addRemoved(departed);
 
+	// Read once per child rather than per entry: config is a live object and this is the hot loop.
+	const { window: newTargetWindow, maxPerRun: newTargetCap } = config.sitemap.newTargets;
+
 	let inflight = [];
 	let considered = 0;
 
@@ -645,12 +651,36 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval }));
 				break;
 
-			case TargetAction.CREATE:
-				// No explicit time, so Target.put jitters the first render across the
-				// interval — bulk sitemap population must not stampede the queue.
+			case TargetAction.CREATE: {
+				// A DECLARATION IS A STRONG SIGNAL, so a newly listed URL does not wait out a full
+				// interval of jitter to be rendered once. `getInitialRenderTime` spreads the first
+				// render across `hash(url) % interval`, which is sized for the first ingest of a large
+				// sitemap and applies just as hard to the handful of genuinely new URLs a mature corpus
+				// gains each day — on a 48h cadence, up to two days.
+				//
+				// The window is jittered rather than set to "now" for the same reason the interval jitter
+				// exists: a batch of creates must land across minutes, not in one. And the cap is what
+				// keeps bulk population safe — past `maxPerRun` this falls back to the old full-interval
+				// jitter by passing no explicit time at all, so a first ingest behaves exactly as before.
+				//
+				// Only the FIRST render moves: `Target.put` still files `effectiveInterval` from the
+				// route/stored cadence, so every render after this one is on the normal schedule.
 				run.count('created');
-				inflight.push(Target.put(cacheUrl, { renderInterval, sitemapUrl }));
+				// `< renderInterval`, because a window WIDER than the route's own cadence makes the "fast"
+				// path slower than the jitter it replaces — and would still count as `createdSoon`, so the
+				// metric would report an acceleration that did not happen. Not reachable on a corpus whose
+				// shortest interval is a day, but the guard is free and the metric has to stay honest.
+				const fast = newTargetWindow > 0 && newTargetWindow < renderInterval && run.fastPathTaken() < newTargetCap;
+				if (fast) run.count('createdSoon');
+				inflight.push(
+					Target.put(cacheUrl, {
+						renderInterval,
+						sitemapUrl,
+						...(fast ? { nextRenderTime: getInitialRenderTime(cacheUrl, newTargetWindow) } : {}),
+					})
+				);
 				break;
+			}
 
 			case TargetAction.RENDER:
 				run.count('created');
