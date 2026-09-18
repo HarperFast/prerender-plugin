@@ -208,6 +208,14 @@ export type ReadinessConfig = {
 	/**
 	 * What the settle phase does once a contract is satisfied.
 	 *
+	 *  - `report` — DO NOT GATE. The contract is evaluated alongside the ordinary settle and its
+	 *    verdict is reported, while the render behaves exactly as it does without a contract. This is
+	 *    how a contract should be rolled out: `timeoutMs` has to be set against the fleet, and the
+	 *    fleet's own `satisfied_ms` distribution is the only honest source for it. Measured on a
+	 *    laptop a product contract holds at 856ms; at 2x CPU throttle 1,749ms; at 4x it does not hold
+	 *    at all within 30s. Picking the number from the first of those would arm a gate that clips its
+	 *    own tail in production, and the failure would look like "renders are incomplete" rather than
+	 *    "the timeout is wrong".
 	 *  - `quiet` — stop once the contract holds AND the DOM has been unchanged for `quietMs`.
 	 *  - `plateau` — stop once the contract holds, then still run the full final plateau. The
 	 *    conservative setting for a page type whose contract is new or known to be partial.
@@ -224,7 +232,7 @@ export type ReadinessConfig = {
 	 * defensible — a page that goes quiet early because it is broken now fails a check instead of
 	 * being cached.
 	 */
-	onSatisfied: 'quiet' | 'plateau';
+	onSatisfied: 'report' | 'quiet' | 'plateau';
 	/**
 	 * How long to keep waiting for a clause that has NEVER been true in this render, once every other
 	 * clause holds and the DOM has gone quiet. Default 1000ms.
@@ -509,8 +517,8 @@ export function validateReadiness(readiness: unknown): void {
 	if (readiness === undefined) return;
 	const cfg = readiness as ReadinessConfig;
 	if (typeof cfg !== 'object' || cfg === null) throw new Error('prerender config: readiness must be an object');
-	if (cfg.onSatisfied !== undefined && cfg.onSatisfied !== 'quiet' && cfg.onSatisfied !== 'plateau') {
-		throw new Error("prerender config: readiness.onSatisfied must be 'quiet' or 'plateau'");
+	if (cfg.onSatisfied !== undefined && !['report', 'quiet', 'plateau'].includes(cfg.onSatisfied)) {
+		throw new Error("prerender config: readiness.onSatisfied must be 'report', 'quiet' or 'plateau'");
 	}
 	if (!Array.isArray(cfg.contracts)) throw new Error('prerender config: readiness.contracts must be an array');
 	for (const contract of cfg.contracts) {

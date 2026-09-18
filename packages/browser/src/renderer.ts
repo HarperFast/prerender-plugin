@@ -735,12 +735,94 @@ const renderer: Renderer = async (page, job) => {
 		return satisfied;
 	};
 
+	/**
+	 * Evaluate the contract ALONGSIDE the ordinary settle, reporting what it saw and gating nothing.
+	 *
+	 * This is the rollout mode, and it exists because the gate's own `timeoutMs` cannot honestly be
+	 * chosen from a developer machine: measured on live pages, a product contract holds at 856ms
+	 * unthrottled, 1,749ms at 2x CPU throttle, and not at all within 30s at 4x. A fleet sits somewhere
+	 * in that band. Running as an observer first produces the distribution the gate should be tuned
+	 * from, at no risk — the render behaves exactly as it does with no contract configured.
+	 *
+	 * Stops as soon as the settle it is watching finishes, so it can never extend a render.
+	 */
+	const observeContract = async (
+		governing: NonNullable<ReturnType<typeof contractFor>>,
+		until: { done: boolean }
+	): Promise<void> => {
+		const started = Date.now();
+		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
+		const payload = {
+			require: governing.require,
+			observe: governing.observe ?? [],
+			tolerance: config.navigation.domStableTolerance,
+		};
+		const firstTrue = new Map<string, number>();
+		let firstSatisfiedMs: number | null = null;
+		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
+
+		while (!until.done) {
+			try {
+				last = await page.evaluate(evaluateContract, payload);
+			} catch {
+				break;
+			}
+			for (const clause of last.require) {
+				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+			}
+			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
+				firstSatisfiedMs = Date.now() - started;
+			}
+			if (until.done) break;
+			await new Promise((resolve) => setTimeout(resolve, pollMs));
+		}
+
+		// One last look, so the verdict describes the DOM that is about to be serialized rather than
+		// the last poll before the settle ended.
+		try {
+			last = (await page.evaluate(evaluateContract, payload)) ?? last;
+			for (const clause of last.require) {
+				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+			}
+			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
+				firstSatisfiedMs = Date.now() - started;
+			}
+		} catch {
+			/* page gone — report what the loop saw */
+		}
+
+		const expectation = assessExpectations(last?.observe ?? [], job.expectations, {
+			...DEFAULT_EXPECTATION_POLICY,
+			...(config.readiness?.expectations ?? {}),
+		});
+		job.readiness = {
+			contract: governing.name,
+			satisfied: !!last && last.started && last.require.every((r) => r.ok),
+			shortfalls: expectation.shortfalls,
+			rebaselined: expectation.rebaselined,
+			learned: expectation.learned,
+			waitedMs: Date.now() - started,
+			firstSatisfiedMs,
+			require: (last?.require ?? governing.require.map((a) => ({ name: a.name, ok: false, count: 0 }))).map((r) => ({
+				...r,
+				firstTrueMs: firstTrue.get(r.name),
+			})),
+			observe: last?.observe ?? [],
+		} satisfies ReadinessResult;
+	};
+
 	// A contract REPLACES the timer-based settle rather than joining it: scroll once to trip whatever
 	// is lazy, then hold until the page says it is complete. Everything below is what runs when no
 	// contract governs this render, or when one is not satisfied.
+	const observing = { done: false };
+	let observer: Promise<void> | null = null;
 	let contractSatisfied = false;
 	let contractScrolled = false;
-	if (contract) {
+	// Report mode watches; it never decides. Everything below then runs exactly as it would with no
+	// contract configured.
+	if (contract && config.readiness?.onSatisfied === 'report') {
+		observer = observeContract(contract, observing);
+	} else if (contract) {
 		if (config.scroll.enabled) {
 			await page.evaluate(scrollToBottom, config.scroll.stepMs);
 			await scrollToTop();
@@ -790,6 +872,12 @@ const renderer: Renderer = async (page, job) => {
 	// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
 	// causes. This way the last thing checked is the state that gets serialized.
 	if (config.navigation.finalDomStable && !contractStopped) await domStable();
+	// The observer must not outlive the settle it is watching: stopping it here is what guarantees
+	// report mode cannot change a render's duration.
+	if (observer) {
+		observing.done = true;
+		await observer;
+	}
 	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {

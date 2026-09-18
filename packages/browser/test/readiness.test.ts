@@ -82,12 +82,23 @@ before(async () => {
 
 after(() => origin.close());
 
-const render = async (path: string, contract: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
+const render = async (
+	path: string,
+	contract: Record<string, unknown>,
+	extra: Record<string, unknown> = {},
+	navigation: Record<string, unknown> = {}
+) => {
 	const result = await renderOnce({
 		url: `${base}${path}`,
 		captureNonIndexable: true,
 		config: {
-			navigation: { networkIdleMs: 50, networkIdleTimeoutMs: 200, domStableMs: 0, domStableTimeoutMs: 500 },
+			navigation: {
+				networkIdleMs: 50,
+				networkIdleTimeoutMs: 200,
+				domStableMs: 0,
+				domStableTimeoutMs: 500,
+				...navigation,
+			},
 			scroll: { enabled: false },
 			readiness: { onSatisfied: 'quiet', quietMs: 100, contracts: [contract], ...extra },
 		} as never,
@@ -259,4 +270,52 @@ test('the render still serializes when a contract is never satisfied', async () 
 	});
 	assert.equal(result.job.readiness?.satisfied, false);
 	assert.match(result.html ?? '', /nothing to hydrate/);
+});
+
+test('report mode reports the verdict and changes nothing about the render', async () => {
+	// The rollout mode. A contract naming content that never arrives must NOT hold the render — the
+	// whole point is that the timeout can be chosen from the fleet's own distribution later, at no
+	// risk now.
+	const gated = await render('/no-islands', {
+		name: 'impossible',
+		require: [{ name: 'nope', selector: '#absent', minCount: 1 }],
+		timeoutMs: 3000,
+	});
+
+	const started = Date.now();
+	const reported = await render(
+		'/no-islands',
+		{ name: 'impossible', require: [{ name: 'nope', selector: '#absent', minCount: 1 }], timeoutMs: 3000 },
+		{ onSatisfied: 'report' }
+	);
+	const reportedMs = Date.now() - started;
+
+	// Both know the contract did not hold, and name the clause.
+	assert.equal(gated.job.readiness?.satisfied, false);
+	assert.equal(reported.job.readiness?.satisfied, false);
+	assert.equal(reported.job.readiness?.require[0].name, 'nope');
+	// But report mode did not spend the contract's wait on it.
+	assert.ok(
+		reportedMs < (gated.renderTimeMs ?? 3000) + 1500,
+		`report mode must not gate: took ${reportedMs}ms against a gated ${gated.renderTimeMs}ms`
+	);
+	assert.match(reported.html ?? '', /nothing to hydrate/);
+});
+
+test('report mode still times how long a satisfiable contract took to hold', async () => {
+	// This is the number the gate's timeoutMs is meant to be tuned from, so it has to survive the
+	// mode that exists to collect it. The settle is given enough room to reach the late content ON
+	// ITS OWN — report mode must not extend it, so a settle that ends first would (correctly) report
+	// the render as incomplete, which is a different test.
+	const result = await render(
+		'/late',
+		{ name: 'late', require: [{ name: 'items', selector: '.item', minCount: 2 }], timeoutMs: 5000 },
+		{ onSatisfied: 'report' },
+		{ domStableMs: 300, domStableTimeoutMs: 3000 }
+	);
+	assert.equal(result.job.readiness?.satisfied, true);
+	assert.ok(
+		(result.job.readiness?.firstSatisfiedMs ?? 0) >= 200,
+		'it must report WHEN the content arrived, not merely that it did'
+	);
 });
