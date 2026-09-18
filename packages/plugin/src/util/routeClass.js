@@ -157,6 +157,18 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// A floor SLOWER than the route's own interval can never take effect — `resolveEffectiveInterval`
+	// clamps to the interval last — so it is always a mistake, and a silent one: `explain` then reports
+	// a `demandFloor` that is not the cadence and never will be. Warned, not corrected, because which
+	// of the two numbers the author meant is not knowable from here.
+	if (demandFloor !== null && renderInterval !== null && demandFloor > renderInterval) {
+		warn(
+			`demandFloor (${demandFloor}ms) on route "${raw.match} ${raw.path}" is SLOWER than its renderInterval ` +
+				`(${renderInterval}ms), so it can never apply — the route interval is the ceiling and is clamped last. ` +
+				`One of the two is wrong.`
+		);
+	}
+
 	// Optional per-route sitemap-departure action. Same drop-the-FIELD rule as the three above: a
 	// typo here must not change how the path is SERVED. Normalizing to `none` rather than leaving
 	// the raw string is what lets every consumer read the field without re-validating it.
@@ -578,7 +590,15 @@ export const explainCadence = (url, target = {}) => {
 		defaultInterval: config.render.defaultInterval,
 		demandInterval: hasRung ? rung : null,
 		demandFloor: floor,
-		clampedBy: !hasRung ? null : floored > rung ? 'floor' : base < floored ? 'ceiling' : null,
+		// THE CEILING IS TESTED FIRST, and the order is the whole correctness of this field. `floored`
+		// is the value BEFORE `Math.min(..., base)`, so asking "did the floor raise the rung?" first
+		// reports `floor` even when the ceiling then overrode it — which is precisely the
+		// `demandFloor > renderInterval` misconfiguration an operator opens `explain` to diagnose.
+		// Measured against the resolver at route 24h / floor 48h: a 6h rung resolves to 24h, and the
+		// old order called that `floor` while reporting a 48h floor and a 24h cadence — three numbers
+		// that cannot be reconciled, with the field the docs say to read first pointing at a clamp that
+		// did not produce the answer.
+		clampedBy: !hasRung ? null : base < floored ? 'ceiling' : floored > rung ? 'floor' : null,
 	};
 };
 

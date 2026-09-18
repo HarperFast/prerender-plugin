@@ -14,6 +14,7 @@ import {
 	PRERENDER,
 	UNCLASSIFIED,
 	explainCadence,
+	inspectRoutes,
 } from '../src/util/routeClass.js';
 
 const ROUTES = [
@@ -471,4 +472,34 @@ test('explainCadence never disagrees with the resolver the scheduler actually us
 			);
 		}
 	}
+});
+
+test('explainCadence: a floor SLOWER than the route reports the ceiling — the clamp that actually bound', () => {
+	// The misconfiguration `explain` exists to diagnose, and the one the old precedence got wrong:
+	// `floored` is computed BEFORE the ceiling clamp, so testing "did the floor raise the rung?" first
+	// reported `floor` while the answer came from the ceiling — a 48h floor, a 24h cadence and a
+	// `clampedBy` naming a clamp that did not produce it. Three numbers that cannot be reconciled.
+	forwarded({
+		ingress: {
+			routes: [{ match: 'prefix', path: '/product/prd-', renderInterval: 24 * HOUR_MS, demandFloor: 48 * HOUR_MS }],
+		},
+	});
+	for (const rung of [6, 24, 48]) {
+		const c = explainCadence(PDP, { demandInterval: rung * HOUR_MS });
+		assert.equal(c.effectiveInterval, 24 * HOUR_MS, `rung ${rung}h`);
+		assert.equal(c.clampedBy, 'ceiling', `rung ${rung}h must report the clamp that bound`);
+		assert.equal(c.demandFloor, 48 * HOUR_MS, 'the unreachable floor is still reported, not hidden');
+	}
+});
+
+test('a demandFloor slower than the route interval is warned about at compile time', () => {
+	const warnings = [];
+	inspectRoutes(
+		[{ match: 'prefix', path: '/product/prd-', renderInterval: 24 * HOUR_MS, demandFloor: 48 * HOUR_MS }],
+		[]
+	).warnings.forEach((w) => warnings.push(w));
+	assert.ok(
+		warnings.some((w) => w.includes('demandFloor') && w.includes('can never apply')),
+		`expected a demandFloor>interval warning, got ${JSON.stringify(warnings)}`
+	);
 });
