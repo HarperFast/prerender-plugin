@@ -334,8 +334,31 @@ test('a contract with an unusable number or pattern is rejected at config load',
 
 	assert.throws(() => mergeConfig(contract({ timeoutMs: Number.NaN }) as never), /timeoutMs must be a non-negative/);
 	assert.throws(() => mergeConfig(contract({ quietMs: -1 }) as never), /quietMs must be a non-negative/);
-	assert.throws(() => mergeConfig(contract({ pollMs: 'soon' }) as never), /pollMs must be a non-negative/);
-	assert.doesNotThrow(() => mergeConfig(contract({ timeoutMs: 5000, quietMs: 250 }) as never));
+	assert.throws(() => mergeConfig(contract({ pollMs: 'soon' }) as never), /pollMs must be a positive/);
+	// A zero poll interval is a tight loop calling into the page as fast as the event loop allows.
+	assert.throws(() => mergeConfig(contract({ pollMs: 0 }) as never), /pollMs must be a positive/);
+	// Past the timer ceiling setTimeout fires after 1ms, so an over-large dwell becomes NO dwell —
+	// the same trap `scroll.topSettleMs` already guards against.
+	assert.throws(() => mergeConfig(contract({ timeoutMs: 2147483648 }) as never), /up to 2147483647/);
+	assert.doesNotThrow(() => mergeConfig(contract({ timeoutMs: 5000, quietMs: 250, pollMs: 250 }) as never));
+
+	// The top-level knobs and the expectation policy are validated too — every one of them ends up in
+	// a setTimeout or a comparison that silently does nothing when it is wrong.
+	const top = (over: Record<string, unknown>) => ({
+		readiness: { onSatisfied: 'quiet', contracts: [{ name: 'c', require: [{ name: 'x', selector: 'p' }] }], ...over },
+	});
+	assert.throws(() => mergeConfig(top({ quietMs: -5 }) as never), /readiness.quietMs/);
+	assert.throws(() => mergeConfig(top({ unmetGraceMs: 2147483648 }) as never), /readiness.unmetGraceMs/);
+	assert.throws(() => mergeConfig(top({ expectations: { tolerance: 1.5 } }) as never), /tolerance must be a number/);
+	assert.throws(
+		() => mergeConfig(top({ expectations: { rebaselineAfter: 0 } }) as never),
+		/rebaselineAfter must be a positive integer/
+	);
+	assert.doesNotThrow(() =>
+		mergeConfig(
+			top({ quietMs: 250, unmetGraceMs: 1000, expectations: { tolerance: 0.5, rebaselineAfter: 3 } }) as never
+		)
+	);
 
 	// A malformed regex used to fail only at evaluation time, where it threw out of the whole
 	// evaluator and discarded every other clause's result for that tick.

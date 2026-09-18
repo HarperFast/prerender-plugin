@@ -519,6 +519,25 @@ export function evaluateContract(payload: {
 	return { require: payload.require.map(run), observe: payload.observe.map(run), quietMs: quiet, started };
 }
 
+/**
+ * The ceiling `setTimeout` accepts. Past it Node fires the callback after 1ms instead of waiting, so
+ * an over-large dwell silently becomes NO dwell — the same trap `scroll.topSettleMs` already guards.
+ * A poll interval that large is nonsense anyway; what matters is that it fails loudly.
+ */
+const MAX_TIMER_MS = 2147483647;
+
+/** Every ms-valued readiness field, checked the same way, so none of them can silently misbehave. */
+const checkMs = (label: string, value: unknown, { positive = false } = {}): void => {
+	if (value === undefined) return;
+	const bad =
+		typeof value !== 'number' || !Number.isFinite(value) || value > MAX_TIMER_MS || (positive ? value <= 0 : value < 0);
+	if (bad) {
+		throw new Error(
+			`prerender config: ${label} must be a ${positive ? 'positive' : 'non-negative'} number up to ${MAX_TIMER_MS}`
+		);
+	}
+};
+
 /** Validate contracts at config load, so a broken one cannot first surface inside a render. */
 export function validateReadiness(readiness: unknown): void {
 	if (readiness === undefined) return;
@@ -527,24 +546,32 @@ export function validateReadiness(readiness: unknown): void {
 	if (cfg.onSatisfied !== undefined && !['report', 'quiet', 'plateau'].includes(cfg.onSatisfied)) {
 		throw new Error("prerender config: readiness.onSatisfied must be 'report', 'quiet' or 'plateau'");
 	}
+	checkMs('readiness.quietMs', cfg.quietMs);
+	checkMs('readiness.unmetGraceMs', cfg.unmetGraceMs);
+	if (cfg.expectations !== undefined) {
+		if (typeof cfg.expectations !== 'object' || cfg.expectations === null) {
+			throw new Error('prerender config: readiness.expectations must be an object');
+		}
+		checkMs('readiness.expectations.graceMs', cfg.expectations.graceMs);
+		const { tolerance, rebaselineAfter } = cfg.expectations;
+		if (tolerance !== undefined && (typeof tolerance !== 'number' || !(tolerance >= 0 && tolerance <= 1))) {
+			throw new Error('prerender config: readiness.expectations.tolerance must be a number between 0 and 1');
+		}
+		if (rebaselineAfter !== undefined && (!Number.isInteger(rebaselineAfter) || rebaselineAfter < 1)) {
+			throw new Error('prerender config: readiness.expectations.rebaselineAfter must be a positive integer');
+		}
+	}
 	if (!Array.isArray(cfg.contracts)) throw new Error('prerender config: readiness.contracts must be an array');
 	for (const contract of cfg.contracts) {
 		if (!contract.name) throw new Error('prerender config: every readiness contract needs a name');
 		if (!Array.isArray(contract.require) || contract.require.length === 0) {
 			throw new Error(`prerender config: readiness contract "${contract.name}" needs at least one require assertion`);
 		}
-		for (const [field, value] of Object.entries({
-			timeoutMs: contract.timeoutMs,
-			pollMs: contract.pollMs,
-			quietMs: contract.quietMs,
-		})) {
-			if (value === undefined) continue;
-			if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-				throw new Error(
-					`prerender config: readiness contract "${contract.name}" ${field} must be a non-negative number`
-				);
-			}
-		}
+		checkMs(`readiness contract "${contract.name}" timeoutMs`, contract.timeoutMs);
+		checkMs(`readiness contract "${contract.name}" quietMs`, contract.quietMs);
+		// POSITIVE, not merely non-negative: a zero poll interval is a tight loop calling into the page
+		// as fast as the event loop allows, which would burn a core per render.
+		checkMs(`readiness contract "${contract.name}" pollMs`, contract.pollMs, { positive: true });
 		if (contract.pathPattern) {
 			try {
 				new RegExp(contract.pathPattern);
