@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { KnownDevices } from 'puppeteer';
 import type { PuppeteerLifeCycleEvent } from 'puppeteer';
+import { validateReadiness, type ReadinessConfig } from './readiness.js';
 
 export type Viewport = {
 	width: number;
@@ -449,6 +450,13 @@ export type PrerenderConfig = {
 	 * deployments render byte-identically; present → both `renderOnce` and the fleet honor it.
 	 */
 	waitFor?: WaitForRule[];
+	/**
+	 * Per-page-type statements of what a COMPLETE render contains (see readiness.ts). When a contract
+	 * governs a render it replaces the timer-based settle: the renderer stops once the page says it is
+	 * complete AND has gone quiet, and reports which assertions held — so an incomplete render becomes
+	 * a fact on the wire rather than a silence.
+	 */
+	readiness?: ReadinessConfig;
 	/** Inject Web Components (ShadyDOM/ShadyCSS) polyfill-forcing flags before load. */
 	injectWebComponentsPolyfill: boolean;
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
@@ -741,6 +749,7 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	});
 	// waitFor is optional; when present every rule needs a non-empty selector and non-negative
 	// numeric fields (it is API-/JSON-supplied, so validate before it reaches the in-page waits).
+	validateReadiness(config.readiness);
 	if (config.waitFor !== undefined) {
 		if (!Array.isArray(config.waitFor)) {
 			throw new Error('prerender config: waitFor must be an array of rules');

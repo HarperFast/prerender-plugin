@@ -6,6 +6,7 @@ import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import type { JobDocumentCache } from './documentReuse.js';
+import type { ReadinessExpectations, ReadinessResult } from './readiness.js';
 
 /** One `waitFor` rule's outcome for one render. Only rules whose scope MATCHED appear. */
 export interface WaitForResult {
@@ -56,6 +57,12 @@ export type JobConfig = {
 	renderBudget?: number;
 	callbackOrigin: string;
 	isFromSitemap: boolean;
+	/**
+	 * What the last accepted render of this URL produced, so this render can be judged against the
+	 * page's own history rather than against a constant measured once (see readiness.ts). Absent on a
+	 * first render, which is never a regression.
+	 */
+	expectations?: ReadinessExpectations;
 };
 
 /**
@@ -164,6 +171,14 @@ export default class RenderJob {
 	 * simply absent, and nothing says a rule spent its whole `timeoutMs` finding nothing.
 	 */
 	waitForResults: WaitForResult[] = [];
+	/**
+	 * What this page type's readiness contract said, when one governed the render. Posted back so an
+	 * incomplete render is reported rather than silent: today a render that missed its SEO-critical
+	 * content still reports 200, non-empty and indexable.
+	 */
+	readiness?: ReadinessResult;
+	/** Carried from the job so the renderer can judge this render against this URL's history. */
+	expectations?: ReadinessExpectations;
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
@@ -214,6 +229,7 @@ export default class RenderJob {
 		this.renderBudget = config.renderBudget;
 		this.callbackOrigin = config.callbackOrigin;
 		this.isFromSitemap = config.isFromSitemap;
+		this.expectations = config.expectations;
 	}
 
 	/**
