@@ -837,3 +837,94 @@ test('a configured gate that refused nothing says so, rather than reading as unc
 	assert.match(text, /1 route gated/);
 	assert.match(text, /refused nothing in this window/);
 });
+
+// ---- the raw-document cache -------------------------------------------------
+
+/**
+ * A window where `render.raw` is on, mostly refusing. The refusals are the panel's whole reason to
+ * exist: an enabled route that stores nothing produces the same miss rate, the same origin proxies
+ * and the same absence of errors as a route nobody enabled.
+ */
+const RAW_ANALYTICS = {
+	...ANALYTICS,
+	series: [
+		combo('bot_serve', 'cache', 'hit', 'googlebot', 400),
+		combo('bot_serve', 'raw', 'raw', 'googlebot', 300),
+		combo('bot_serve', 'origin', 'miss', 'googlebot', 300),
+		combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 1000),
+		combo('page_age', 'googlebot', 'desktop', null, 400, 3 * HOUR, 9 * HOUR),
+		// raw_cache: method = outcome, one emit per store ATTEMPT.
+		combo('prerender_ops', 'raw_cache', 'stored', null, 120),
+		combo('prerender_ops', 'raw_cache', 'has-cookie', null, 80),
+		combo('prerender_ops', 'raw_cache', 'oversize', null, 40),
+		combo('prerender_ops', 'raw_cache', 'not-200', null, 10),
+	],
+};
+
+const RAW_CONFIG = {
+	...CONFIG,
+	layers: [
+		...CONFIG.layers,
+		{ path: 'render.raw.enabled', effective: true },
+		{ path: 'render.raw.maxBytes', effective: 1_048_576 },
+	].map((layer) =>
+		layer.path === 'ingress.routes'
+			? {
+					path: 'ingress.routes',
+					effective: layer.effective.map((r) => (r.path === '/catalog/' ? { ...r, rawCache: true } : r)),
+				}
+			: layer
+	),
+};
+
+const rawReady = async () => {
+	const ctx = makeCtx({ analytics: RAW_ANALYTICS, config: RAW_CONFIG });
+	await load(ctx);
+	return ctx;
+};
+
+test('a raw serve is cache-served and counts toward offload, but is never a fresh hit', async () => {
+	assert.ok(isCacheServed('raw'), 'a stored origin document answered it — the origin was spared');
+	const ctx = await rawReady();
+	const text = textOf(ctx);
+	// 700 of 1000 serves came from storage (400 hit + 300 raw); only 400 were fresh hits. Reading
+	// the SOURCE instead of the verdict would have made cache-served 40% and falling as the
+	// feature started working.
+	assert.match(text, /Cache-served/);
+	assert.match(text, /70%/, 'hit + raw');
+	assert.match(text, /raw documents, not snapshots/, 'the split is named, never silently folded in');
+	// And a raw serve has no cadence to be late against, so it must not read as a coverage or
+	// cadence problem in the non-hit taxonomy.
+	const rows = notHitRows([combo('bot_serve', 'raw', 'raw', 'googlebot', 300)]);
+	assert.equal(rows[0].family, 'raw');
+});
+
+test('the raw-cache panel leads with the refusals, because a silent route looks like a disabled one', async () => {
+	const ctx = await rawReady();
+	const text = textOf(ctx);
+	assert.match(text, /Raw-document cache/);
+	// 120 of 250 attempts stored; the other 130 are the number an operator has to see.
+	assert.match(text, /Refused/);
+	assert.match(text, /has-cookie/);
+	assert.match(text, /oversize/);
+	assert.match(text, /not-200/);
+});
+
+test('a personalized origin and an undersized cap are called out, not left in a bar list', async () => {
+	const ctx = await rawReady();
+	const text = textOf(ctx);
+	// has-cookie is the one outcome worth an alert: the route was enabled on the assumption it is
+	// shared, and the origin says otherwise.
+	assert.match(text, /refused for setting a cookie/);
+	// oversize means the feature is on and structurally cannot fill — a settings fix.
+	assert.match(text, /larger than render\.raw\.maxBytes/);
+});
+
+test('a deployment with the raw cache off is told what it is for, not shown an empty chart', async () => {
+	const ctx = makeCtx();
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /Raw-document cache/);
+	assert.match(text, /render\.raw\.enabled/, 'the capability is described, with the switch that turns it on');
+	assert.doesNotMatch(text, /Refused/, 'no chart of zeroes for a subsystem nobody enabled');
+});

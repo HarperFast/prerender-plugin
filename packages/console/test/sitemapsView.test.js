@@ -26,14 +26,75 @@ const CHILD = 'https://example.com/sitemap-products-1.xml';
 const LIST = {
 	node: 'node-a',
 	lastFullPass: Date.now() - 3_600_000,
-	sitemaps: [{ url: ROOT, entryCount: 2, lastRefreshed: Date.now() - 7_200_000, refresh: { state: 'idle' } }],
+	sitemaps: [
+		{
+			url: ROOT,
+			// INGESTED two hours ago, CHECKED five minutes ago. That gap is the normal steady state
+			// under conditional fetching, and a console that prints the first under the second's label
+			// sends an operator chasing a sitemap that is not stale.
+			entryCount: 2,
+			lastRefreshed: Date.now() - 7_200_000,
+			refresh: { state: 'idle', finishedAt: Date.now() - 300_000 },
+		},
+	],
+};
+
+const HOUR = 3_600_000;
+const BUCKETS = 4;
+
+/** One analytics combo, as `util/analyticsRead.js` emits it — value series, so mean x count. */
+const combo = (path, count, value) => ({
+	metric: 'prerender_ops',
+	path,
+	method: null,
+	type: null,
+	count,
+	total: 0,
+	mean: value,
+	median: value,
+	p95: value,
+	counts: new Array(BUCKETS).fill(count / BUCKETS),
+	means: new Array(BUCKETS).fill(value),
+});
+
+/** A day of walks: 30 documents fetched, 24 of them unchanged, 10 creates of which 6 went fast. */
+const ANALYTICS = {
+	available: true,
+	scope: 'node',
+	node: 'node-a',
+	rangeMs: 24 * HOUR,
+	startMs: 0,
+	endMs: 24 * HOUR,
+	bucketMs: 6 * HOUR,
+	bucketCount: BUCKETS,
+	cacheAgeMs: 0,
+	scan: { ms: 9, scanned: 400, kept: 20, cap: 20_000 },
+	series: [
+		combo('sitemap_sitemaps', 2, 15),
+		combo('sitemap_not_modified', 2, 12),
+		combo('sitemap_created', 2, 5),
+		combo('sitemap_created_soon', 2, 3),
+		combo('sitemap_updated', 2, 1),
+		combo('sitemap_skipped', 2, 400),
+		combo('sitemap_removed', 2, 2),
+		combo('sitemap_failed', 2, 0),
+	],
 };
 
 /** The index detail: entries are child sitemaps, and the server still sends page-shaped fields. */
 const INDEX_DETAIL = {
 	node: 'node-a',
 	sitemap: { url: ROOT, isIndex: true, entryCount: 2, lastRefreshed: Date.now() - 7_200_000, parentUrl: null },
-	refresh: { state: 'idle', finishedAt: Date.now() - 7_200_000 },
+	refresh: {
+		state: 'idle',
+		finishedAt: Date.now() - 300_000,
+		created: 10,
+		createdSoon: 6,
+		updated: 1,
+		removed: 2,
+		notModified: 24,
+		sitemapsProcessed: 30,
+	},
 	// Structurally zero for an index: a walk attributes every Target to the child that listed it.
 	targetCount: { count: 0, cap: 1000, truncated: false },
 	entries: [
@@ -54,7 +115,7 @@ const CHILD_DETAIL = {
 	limit: 50,
 };
 
-function makeCtx() {
+function makeCtx({ analytics = ANALYTICS } = {}) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
 	const calls = { posts: [], reloads: 0 };
@@ -67,6 +128,7 @@ function makeCtx() {
 		},
 		async get(route) {
 			if (route === 'sitemaps') return { ok: true, body: LIST };
+			if (route === 'analytics') return { ok: true, body: analytics };
 			return { ok: true, body: null };
 		},
 		async post(route, body) {
@@ -153,4 +215,63 @@ test('a selection that no longer resolves falls back to a root instead of a dead
 	await load(ctx);
 	assert.equal(ctx.data.selected, ROOT);
 	assert.equal(ctx.data.detail.sitemap.url, ROOT);
+});
+
+// ---- ingested vs checked, and the walk counters -----------------------------
+
+test('a sitemap reports when it was INGESTED and, separately, when it was checked', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// Under conditional fetching a 304 writes nothing, so the document's own timestamp is the last
+	// time its ENTRIES changed. Labelling that "refreshed" reads as a walk that has not reached
+	// this sitemap in hours, which is exactly the feature working.
+	assert.match(text, /ingested/);
+	assert.match(text, /checked/);
+	assert.doesNotMatch(text, /never refreshed/, 'the old label conflated the two timestamps');
+});
+
+test('the last walk reports its 304s and its fast-path creates, not just created/updated/removed', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	// sitemap_not_modified non-zero is the ONLY evidence conditional fetching works: a walk that
+	// re-parses every document succeeds exactly like one that skipped 24 of 30.
+	assert.match(text, /Not modified \(304\)/);
+	assert.match(text, /24 of 30 documents/);
+	// A SUBSET of created, stated with its denominator so it can never be read as a fourth count.
+	assert.match(text, /6 of the creates rendered soon/);
+});
+
+test('the walk panel sums passes across roots and nodes, and names the fast-path share', async () => {
+	const ctx = await ready();
+	const text = textOf(ctx);
+	assert.match(text, /Walk activity/);
+	// 2 emits x 15 documents = 30 fetched, 24 not modified: 80%.
+	assert.match(text, /Documents fetched/);
+	assert.match(text, /80%/);
+	// 10 created, 6 of them soon.
+	assert.match(text, /60% rendered soon/);
+});
+
+test('zero 304s across a day of walks is reported as the rollout not working', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: ANALYTICS.series.map((s) =>
+			s.path === 'sitemap_not_modified' ? { ...s, mean: 0, means: s.means.map(() => 0) } : s
+		),
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = textOf(ctx);
+	// Nothing errors and no walk fails — the only symptom is a full re-parse and prune scan per
+	// document, forever, which is the entire saving the feature was for.
+	assert.match(text, /No document was answered 304 in this window/);
+	assert.match(text, /If-Modified-Since/);
+});
+
+test('a window with no finished walk says so rather than reading as a dead scheduler', async () => {
+	const ctx = makeCtx({ analytics: { ...ANALYTICS, series: [] } });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /Walk activity/);
+	assert.match(text, /no walk completed inside the window|emitted once per FINISHED walk/i);
 });
