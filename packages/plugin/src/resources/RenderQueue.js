@@ -13,6 +13,7 @@ import {
 	PRERENDER,
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
+import { recordReadinessExpectation } from '../util/readinessExpectation.js';
 import { recordPageClaim } from '../util/changeProbe.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
@@ -539,6 +540,29 @@ export class RenderQueue extends Resource {
 			metrics.renderTime(variant.renderTime, variant.statusCode, candidacy);
 		}
 
+		// What each governed render's completeness contract said. This is the whole point of contracts
+		// being on the wire: a render that finished INCOMPLETE is otherwise indistinguishable from a
+		// good one — 200, non-empty, indexable, and nothing anywhere saying it is missing a widget.
+		// Measured under CPU contention, 8 of 15 renders finished with their contract unsatisfied and
+		// every one of them reported outcome=ok.
+		for (const variant of variants) {
+			const readiness = variant.readiness;
+			if (!readiness) continue; // no contract governed this render
+			// Exactly one verdict per variant, so the series sums to renders. A rebaseline is a separate
+			// series (emitted by the expectation store, which is the only thing that can know).
+			metrics.renderReadiness(readiness.contract, readiness.satisfied ? 'satisfied' : 'unsatisfied');
+			// Per CLAUSE, so a contract that has rotted against a template change reads as one clause
+			// failing across every render of its page type rather than as an unexplained slowdown.
+			for (const clause of readiness.unmet ?? []) metrics.renderReadinessUnmet(readiness.contract, clause);
+			for (const shortfall of readiness.shortfalls ?? [])
+				metrics.renderReadinessShortfall(readiness.contract, shortfall.name);
+			// How long it took to first hold — the distribution `timeoutMs` should be tuned from. Only
+			// when it held: an unsatisfied contract has no such time, and emitting its timeout here would
+			// drag the percentile toward the very ceiling the reader is checking against.
+			if (typeof readiness.firstSatisfiedMs === 'number')
+				metrics.renderReadinessMs(readiness.firstSatisfiedMs, readiness.contract);
+		}
+
 		// 1. A redirect the browser bailed on at navigation, or a rendered-through client-side redirect
 		// that produced nothing. Decided by `processRedirectResult` for the whole URL, exactly as one
 		// device's result decided it before. The lane comes back so the fast-retry branch inside it
@@ -711,8 +735,14 @@ export class RenderQueue extends Resource {
 			//
 			// `recordPageClaim` never rejects (it catches and warns internally), so it cannot fail the
 			// result from inside this set — a probe optimisation must not cost a render.
+			// The readiness observations, compared against what this URL last produced. Rides in the same
+			// concurrent set as the page writes and the probe claim: it is one node-local point read and
+			// one small write, and like `recordPageClaim` it never rejects — a regression signal must not
+			// cost a render.
+			const governed = stored.find((variant) => variant.readiness?.learned);
 			await Promise.all([
 				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
+				...(governed ? [recordReadinessExpectation(scheduleUrl, governed.readiness)] : []),
 				...stored.map((variant) => {
 					variant.headers['x-harper-rendered'] = '1';
 					return databases.page_cache.PrerenderedPage.put(variant.storeKey, {

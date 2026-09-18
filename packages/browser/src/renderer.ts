@@ -5,6 +5,14 @@ import { CACHE_REPLAY_HEADER, getResourceCache } from './ResourceCache.js';
 import { resolveConfigForJob, type PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
+import { monitorSource } from './domMonitor.js';
+import {
+	assessExpectations,
+	contractFor,
+	evaluateContract,
+	DEFAULT_EXPECTATION_POLICY,
+	type ReadinessResult,
+} from './readiness.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -109,6 +117,12 @@ const renderer: Renderer = async (page, job) => {
 	if (config.injectWebComponentsPolyfill) {
 		setupPromises.push(page.evaluateOnNewDocument(WEB_COMPONENTS_POLYFILL));
 	}
+
+	// A contract's stop condition is "the page contains what it should AND has stopped changing", and
+	// the second half is answered by the document-start monitor. Installed only when a contract
+	// governs this render, so a deployment that configures none pays nothing.
+	const contract = contractFor(config.readiness, url, deviceType);
+	if (contract) setupPromises.push(page.evaluateOnNewDocument(monitorSource()));
 
 	const ac = new AbortController();
 	let aborted = false;
@@ -626,10 +640,218 @@ const renderer: Renderer = async (page, job) => {
 		job.waitForResults = results;
 	};
 
-	if (config.scroll.enabled && config.scroll.settleUntilStable) {
+	/**
+	 * Hold until this page type's readiness contract holds AND the DOM has gone quiet.
+	 *
+	 * BOTH halves, always. The contract says the things we named are present; the quiet window says
+	 * nothing we did NOT name is still arriving. Recommendation rails have no server-rendered
+	 * placeholder — wrapper and content appear in the same frame — so no clause can assert one is
+	 * still coming, and only quiescence can. Measured, stopping on the contract alone loses 99% of the
+	 * product links on a product page.
+	 *
+	 * Returns whether the contract was satisfied. An unsatisfied contract falls through to the
+	 * ordinary settle below, so a contract can cost a render time but never content.
+	 */
+	const awaitContract = async (governing: NonNullable<ReturnType<typeof contractFor>>): Promise<boolean> => {
+		const started = Date.now();
+		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
+		const quietFor = governing.quietMs ?? config.readiness?.quietMs ?? 250;
+		const graceMs = config.readiness?.unmetGraceMs ?? 1000;
+		const policy = { ...DEFAULT_EXPECTATION_POLICY, ...(config.readiness?.expectations ?? {}) };
+		const deadline = started + Math.min(remainingTimer.remaining, governing.timeoutMs ?? remainingTimer.remaining);
+		const payload = {
+			require: governing.require,
+			observe: governing.observe ?? [],
+			tolerance: config.navigation.domStableTolerance,
+		};
+		// Clauses this URL has already proven cannot be satisfied are evaluated and reported, but not
+		// waited on — the difference between a gate and a tax.
+		const known = new Set(job.expectations?.unsatisfiable ?? []);
+		const firstTrue = new Map<string, number>();
+		let quietSince = 0;
+		let grantedGrace = false;
+		let firstSatisfiedMs: number | null = null;
+		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
+
+		while (Date.now() < deadline) {
+			try {
+				last = await page.evaluate(evaluateContract, payload);
+			} catch {
+				break; // page closed or navigated — report what we have
+			}
+			for (const clause of last.require) {
+				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+			}
+			// No verdict is meaningful before the parser finishes: an empty document satisfies
+			// absence-shaped clauses by having nothing in it, and is quiet for the same reason.
+			const held = last.started && last.require.every((r) => r.ok || known.has(r.name));
+			if (held && firstSatisfiedMs === null) firstSatisfiedMs = Date.now() - started;
+			const quiet = last.quietMs >= 0 && last.quietMs >= quietFor;
+
+			if (held && quiet) {
+				// The contract is silent about anything it does not name. Before accepting, check what
+				// this URL last produced: a page that carried three rails and 350 product links
+				// yesterday and none today has lost something no clause can see.
+				const verdict = assessExpectations(last.observe, job.expectations, policy);
+				if (verdict.shortfalls.length > 0 && !grantedGrace && Date.now() + policy.graceMs < deadline) {
+					grantedGrace = true;
+					await new Promise((resolve) => setTimeout(resolve, policy.graceMs));
+					continue;
+				}
+				break;
+			}
+
+			// THE ROT VALVE. Every clause either holds or has never been true at all, and the page has
+			// stopped changing — so waiting out the rest of the timeout will not produce what is
+			// missing. Stand aside, report it, and let the ordinary settle finish the render.
+			if (last.started && !held) {
+				const stalled = last.require.every((r) => r.ok || known.has(r.name) || !firstTrue.has(r.name));
+				if (stalled && quiet) {
+					if (quietSince === 0) quietSince = Date.now();
+					else if (Date.now() - quietSince >= graceMs) break;
+				} else {
+					quietSince = 0;
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, pollMs));
+		}
+
+		const satisfied = !!last && last.started && last.require.every((r) => r.ok || known.has(r.name));
+		const expectation = assessExpectations(last?.observe ?? [], job.expectations, policy);
+		job.readiness = {
+			contract: governing.name,
+			satisfied,
+			shortfalls: expectation.shortfalls,
+			rebaselined: expectation.rebaselined,
+			learned: expectation.learned,
+			waitedMs: Date.now() - started,
+			firstSatisfiedMs,
+			require: (last?.require ?? governing.require.map((a) => ({ name: a.name, ok: false, count: 0 }))).map((r) => ({
+				...r,
+				firstTrueMs: firstTrue.get(r.name),
+			})),
+			observe: last?.observe ?? [],
+		} satisfies ReadinessResult;
+		return satisfied;
+	};
+
+	/**
+	 * Evaluate the contract ALONGSIDE the ordinary settle, reporting what it saw and gating nothing.
+	 *
+	 * This is the rollout mode, and it exists because the gate's own `timeoutMs` cannot honestly be
+	 * chosen from a developer machine: measured on live pages, a product contract holds at 856ms
+	 * unthrottled, 1,749ms at 2x CPU throttle, and not at all within 30s at 4x. A fleet sits somewhere
+	 * in that band. Running as an observer first produces the distribution the gate should be tuned
+	 * from, at no risk — the render behaves exactly as it does with no contract configured.
+	 *
+	 * Stops as soon as the settle it is watching finishes, so it can never extend a render.
+	 */
+	const observeContract = async (
+		governing: NonNullable<ReturnType<typeof contractFor>>,
+		until: { done: boolean; wake?: (() => void) | undefined }
+	): Promise<void> => {
+		const started = Date.now();
+		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
+		const payload = {
+			require: governing.require,
+			observe: governing.observe ?? [],
+			tolerance: config.navigation.domStableTolerance,
+		};
+		const firstTrue = new Map<string, number>();
+		let firstSatisfiedMs: number | null = null;
+		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
+
+		while (!until.done) {
+			try {
+				last = await page.evaluate(evaluateContract, payload);
+			} catch {
+				break;
+			}
+			for (const clause of last.require) {
+				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+			}
+			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
+				firstSatisfiedMs = Date.now() - started;
+			}
+			if (until.done) break;
+			// Interruptible, so stopping the observer is PROMPT. A plain sleep meant the settle could be
+			// finished and still waiting up to a full poll interval for this loop to notice — which
+			// would make report mode extend the render it exists to leave alone.
+			await new Promise((resolve) => {
+				const timer = setTimeout(resolve, pollMs);
+				until.wake = () => {
+					clearTimeout(timer);
+					resolve(undefined);
+				};
+			});
+			until.wake = undefined;
+		}
+
+		// One last look, so the verdict describes the DOM that is about to be serialized rather than
+		// the last poll before the settle ended.
+		try {
+			last = (await page.evaluate(evaluateContract, payload)) ?? last;
+			for (const clause of last.require) {
+				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+			}
+			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
+				firstSatisfiedMs = Date.now() - started;
+			}
+		} catch {
+			/* page gone — report what the loop saw */
+		}
+
+		const expectation = assessExpectations(last?.observe ?? [], job.expectations, {
+			...DEFAULT_EXPECTATION_POLICY,
+			...(config.readiness?.expectations ?? {}),
+		});
+		job.readiness = {
+			contract: governing.name,
+			satisfied: !!last && last.started && last.require.every((r) => r.ok),
+			shortfalls: expectation.shortfalls,
+			rebaselined: expectation.rebaselined,
+			learned: expectation.learned,
+			waitedMs: Date.now() - started,
+			firstSatisfiedMs,
+			require: (last?.require ?? governing.require.map((a) => ({ name: a.name, ok: false, count: 0 }))).map((r) => ({
+				...r,
+				firstTrueMs: firstTrue.get(r.name),
+			})),
+			observe: last?.observe ?? [],
+		} satisfies ReadinessResult;
+	};
+
+	// A contract REPLACES the timer-based settle rather than joining it: scroll once to trip whatever
+	// is lazy, then hold until the page says it is complete. Everything below is what runs when no
+	// contract governs this render, or when one is not satisfied.
+	const observing: { done: boolean; wake?: (() => void) | undefined } = { done: false };
+	let observer: Promise<void> | null = null;
+	let contractSatisfied = false;
+	let contractScrolled = false;
+	// Report mode watches; it never decides. Everything below then runs exactly as it would with no
+	// contract configured.
+	if (contract && config.readiness?.onSatisfied === 'report') {
+		observer = observeContract(contract, observing);
+	} else if (contract) {
+		if (config.scroll.enabled) {
+			await page.evaluate(scrollToBottom, config.scroll.stepMs);
+			await scrollToTop();
+			contractScrolled = true;
+		}
+		contractSatisfied = await awaitContract(contract);
+	}
+	const contractStopped = contract !== null && contractSatisfied;
+
+	if (contractStopped) {
+		// The contract asserted the page is complete and quiet, which is a stronger statement than any
+		// wait below would establish.
+	} else if (config.scroll.enabled && !contractScrolled && config.scroll.settleUntilStable) {
 		await scrollSettle();
 	} else {
-		if (config.scroll.enabled) {
+		// A contract that timed out already scrolled this page, and then waited out its whole timeout
+		// on top — so the fallback repeating the pass is redundant work on the one path that is by
+		// definition already paying twice.
+		if (config.scroll.enabled && !contractScrolled) {
 			// Scroll to the bottom to trigger lazy-loaded content, then back to the top
 			// (e.g. so a scroll-aware navbar renders in its default state).
 			await page.evaluate(scrollToBottom, config.scroll.stepMs);
@@ -644,10 +866,12 @@ const renderer: Renderer = async (page, job) => {
 	// through) and BEFORE the snapshot; scroll back to the top afterward so scroll-reactive UI
 	// (sticky headers) re-lands. No-op unless config.waitFor is set. Its dwell is attributed to
 	// `settle` on purpose — it reads as part of the settle budget.
-	if (config.waitFor?.length) {
+	// A satisfied contract stands in for the hand-written gates and the final plateau too: they assert
+	// strictly less than it does, about the same DOM, later.
+	if (config.waitFor?.length && !contractStopped) {
 		await applyWaitFor();
 	}
-	if (config.waitFor?.length) await scrollToTop();
+	if (config.waitFor?.length && !contractStopped) await scrollToTop();
 	// The LAST word on whether the page has stopped changing, and the only plateau check that runs
 	// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
 	// still filling — measured: reviews complete and correct, 107 product links instead of 547,
@@ -657,7 +881,14 @@ const renderer: Renderer = async (page, job) => {
 	// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
 	// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
 	// causes. This way the last thing checked is the state that gets serialized.
-	if (config.navigation.finalDomStable) await domStable();
+	if (config.navigation.finalDomStable && !contractStopped) await domStable();
+	// The observer must not outlive the settle it is watching: stopping it here is what guarantees
+	// report mode cannot change a render's duration.
+	if (observer) {
+		observing.done = true;
+		observing.wake?.();
+		await observer;
+	}
 	timings.settle = Date.now() - settleStart;
 
 	if (finalRes) {

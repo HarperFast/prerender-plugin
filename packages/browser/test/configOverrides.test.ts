@@ -169,3 +169,27 @@ test('devices and pathPattern shapes are validated', () => {
 		/config must be an object/
 	);
 });
+
+test('two configs sharing an overrides array resolve independently', () => {
+	// THE REGRESSION. The resolved-config cache used to be keyed by the identity of
+	// `config.overrides` and cleared only when that array changed — so a config derived from another
+	// by spreading it and changing a field resolved to the FIRST config's cached result, for every
+	// URL that matched an override, for the rest of the process. A URL matching NO override was
+	// unaffected, because that path returns before the cache, which is what made it present as "this
+	// setting works on the home page and nowhere else".
+	const overrides: ConfigOverride[] = [
+		{ name: 'product', pathPattern: '^/product/', config: { navigation: { networkIdleMs: 111 } } },
+	];
+	const first = mergeConfig({ overrides, scroll: { topSettleMs: 300 } });
+	const second = mergeConfig({ overrides, scroll: { topSettleMs: 900 } });
+
+	const a = resolveConfigForJob(first, { url: 'https://example.com/product/x', deviceType: 'mobile' });
+	const b = resolveConfigForJob(second, { url: 'https://example.com/product/x', deviceType: 'mobile' });
+
+	assert.deepEqual(a.applied, ['product']);
+	assert.deepEqual(b.applied, ['product']);
+	assert.equal(a.config.navigation.networkIdleMs, 111, 'the override still applies');
+	assert.equal(b.config.navigation.networkIdleMs, 111);
+	assert.equal(a.config.scroll.topSettleMs, 300);
+	assert.equal(b.config.scroll.topSettleMs, 900, 'the second config must not resolve to the first');
+});

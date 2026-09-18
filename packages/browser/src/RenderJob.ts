@@ -6,6 +6,7 @@ import { encode } from './util/encoder.js';
 import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import type { JobDocumentCache } from './documentReuse.js';
+import type { ReadinessExpectations, ReadinessResult } from './readiness.js';
 
 /** One `waitFor` rule's outcome for one render. Only rules whose scope MATCHED appear. */
 export interface WaitForResult {
@@ -56,6 +57,12 @@ export type JobConfig = {
 	renderBudget?: number;
 	callbackOrigin: string;
 	isFromSitemap: boolean;
+	/**
+	 * What the last accepted render of this URL produced, so this render can be judged against the
+	 * page's own history rather than against a constant measured once (see readiness.ts). Absent on a
+	 * first render, which is never a regression.
+	 */
+	expectations?: ReadinessExpectations;
 };
 
 /**
@@ -164,6 +171,14 @@ export default class RenderJob {
 	 * simply absent, and nothing says a rule spent its whole `timeoutMs` finding nothing.
 	 */
 	waitForResults: WaitForResult[] = [];
+	/**
+	 * What this page type's readiness contract said, when one governed the render. Posted back so an
+	 * incomplete render is reported rather than silent: today a render that missed its SEO-critical
+	 * content still reports 200, non-empty and indexable.
+	 */
+	readiness?: ReadinessResult;
+	/** Carried from the job so the renderer can judge this render against this URL's history. */
+	expectations?: ReadinessExpectations;
 	acceptLanguage: string | undefined;
 	renderBudget: number | undefined;
 	callbackOrigin: string;
@@ -214,6 +229,7 @@ export default class RenderJob {
 		this.renderBudget = config.renderBudget;
 		this.callbackOrigin = config.callbackOrigin;
 		this.isFromSitemap = config.isFromSitemap;
+		this.expectations = config.expectations;
 	}
 
 	/**
@@ -299,6 +315,23 @@ export default class RenderJob {
 	 * Builds the encoded body too (the expensive gzip) so a caller assembling several variants pays
 	 * it once per variant and retries re-send the same bytes.
 	 */
+	/** The contract's verdict in its wire form, or undefined when no contract governed this render. */
+	private readinessReport(): ReadinessReport | undefined {
+		const r = this.readiness;
+		if (!r) return undefined;
+		return {
+			contract: r.contract,
+			satisfied: r.satisfied,
+			unmet: r.require.filter((c) => !c.ok).map((c) => c.name),
+			skipped: r.require.filter((c) => c.skipped).map((c) => c.name),
+			waitedMs: r.waitedMs,
+			firstSatisfiedMs: r.firstSatisfiedMs,
+			learned: r.learned ?? {},
+			shortfalls: r.shortfalls ?? [],
+			rebaselined: r.rebaselined ?? false,
+		};
+	}
+
 	async resultMetadata(): Promise<{ metadata: VariantMetadata; contentBuffer: Buffer | null }> {
 		const attemptError = this.error;
 		const metadata: VariantMetadata = {
@@ -309,6 +342,7 @@ export default class RenderJob {
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
+			readiness: this.readinessReport(),
 			outcome: this.outcome,
 			// Present only when true, so the flat legacy envelope is byte-identical for every render
 			// that did not reuse a document (and an older plugin never sees the key at all).
@@ -369,6 +403,9 @@ export default class RenderJob {
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
+			// Carried even on a failed result build: a render that could not be reported is exactly
+			// when knowing whether its contract held is most useful.
+			readiness: this.readinessReport(),
 			outcome: 'error',
 			// Carried through so the plugin still sees where this variant's document came from, even
 			// though its body never made it onto the wire.
@@ -440,6 +477,32 @@ export default class RenderJob {
 }
 
 /** One variant's share of a posted result — see `RenderJob.resultMetadata`. */
+/**
+ * What a readiness contract said, as it travels back to the consumer.
+ *
+ * Deliberately narrower than the in-process `ReadinessResult`: `unmet` carries only the names of
+ * clauses that did not hold, because that is what a metric needs to make an unsatisfiable clause
+ * visible — a gate that quietly fails on every render is the trap this feature exists to avoid, and
+ * it is only avoided if the failure reaches something that counts it. `learned` is the observation
+ * counts the consumer stores as this URL's expectation for next time.
+ */
+export type ReadinessReport = {
+	contract: string;
+	satisfied: boolean;
+	/** Names of the clauses that did not hold. Empty when satisfied. */
+	unmet: string[];
+	/** Names of clauses a guard decided did not apply — never conflate with "checked and passed". */
+	skipped: string[];
+	waitedMs: number;
+	firstSatisfiedMs: number | null;
+	/** Observation counts, for the consumer to store as this URL's expectation. */
+	learned: Record<string, number>;
+	/** Observations that fell far below what this URL last produced. */
+	shortfalls: Array<{ name: string; expected: number; got: number; ratio: number }>;
+	/** The shortfalls repeated enough times to be the page's new shape; re-learn from this render. */
+	rebaselined: boolean;
+};
+
 export type VariantMetadata = {
 	deviceType: string;
 	statusCode: number | undefined;
@@ -448,6 +511,8 @@ export type VariantMetadata = {
 	redirectedTo: string | undefined;
 	isIndexable: boolean | undefined;
 	structuredOffers: Array<string | null> | null | undefined;
+	/** Present only when a contract governed this render, so an older consumer never sees the key. */
+	readiness?: ReadinessReport;
 	outcome: JobOutcome;
 	documentReused: true | undefined;
 	documentPrefetched: true | undefined;

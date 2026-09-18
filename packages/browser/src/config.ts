@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { KnownDevices } from 'puppeteer';
 import type { PuppeteerLifeCycleEvent } from 'puppeteer';
+import { validateReadiness, type ReadinessConfig } from './readiness.js';
 
 export type Viewport = {
 	width: number;
@@ -449,6 +450,13 @@ export type PrerenderConfig = {
 	 * deployments render byte-identically; present → both `renderOnce` and the fleet honor it.
 	 */
 	waitFor?: WaitForRule[];
+	/**
+	 * Per-page-type statements of what a COMPLETE render contains (see readiness.ts). When a contract
+	 * governs a render it replaces the timer-based settle: the renderer stops once the page says it is
+	 * complete AND has gone quiet, and reports which assertions held — so an incomplete render becomes
+	 * a fact on the wire rather than a silence.
+	 */
+	readiness?: ReadinessConfig;
 	/** Inject Web Components (ShadyDOM/ShadyCSS) polyfill-forcing flags before load. */
 	injectWebComponentsPolyfill: boolean;
 	/** Extra request headers added to the navigation request (besides the bypass token and job headers). */
@@ -741,6 +749,7 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	});
 	// waitFor is optional; when present every rule needs a non-empty selector and non-negative
 	// numeric fields (it is API-/JSON-supplied, so validate before it reaches the in-page waits).
+	validateReadiness(config.readiness);
 	if (config.waitFor !== undefined) {
 		if (!Array.isArray(config.waitFor)) {
 			throw new Error('prerender config: waitFor must be an array of rules');
@@ -905,8 +914,19 @@ export type ResolvedConfig = {
 // matching override names), not by URL: every product page resolves the same config, so the cache
 // holds one entry per distinct combination rather than one per URL. Bounded by construction — the
 // number of combinations is a property of the config, not of the corpus.
-const resolvedCache = new Map<string, PrerenderConfig>();
-let resolvedCacheFor: ConfigOverride[] | undefined;
+// Keyed by the BASE CONFIG OBJECT, not by its overrides array.
+//
+// The previous key was the identity of `config.overrides`, which is wrong whenever two configs share
+// an overrides array — exactly what happens when one config is derived from another by spreading it
+// and changing a field. Every URL matching an override then resolved to the FIRST config's cached
+// result, silently and for the rest of the process; a URL matching none was unaffected, because that
+// path returns before the cache. It cost two wasted measurement runs before it was found, and it
+// presents as "this feature works on the home page and nowhere else", which is not a shape anyone
+// debugs quickly.
+//
+// A WeakMap on the config itself cannot have that failure: a different base config is a different
+// key by construction, and an old config's entries are collected with it.
+const resolvedCache = new WeakMap<PrerenderConfig, Map<string, PrerenderConfig>>();
 
 /**
  * The effective config for one render. Matches `config.overrides` against this job's URL path and
@@ -924,9 +944,10 @@ export const resolveConfigForJob = (
 
 	// The cache is keyed by name-signature, so it must be dropped when the config itself is replaced
 	// (a live config reload). Identity of the overrides array is the cheapest correct witness.
-	if (resolvedCacheFor !== overrides) {
-		resolvedCache.clear();
-		resolvedCacheFor = overrides;
+	let cache = resolvedCache.get(config);
+	if (!cache) {
+		cache = new Map<string, PrerenderConfig>();
+		resolvedCache.set(config, cache);
 	}
 
 	let path = '';
@@ -945,14 +966,14 @@ export const resolveConfigForJob = (
 	if (!applied.length) return { config, applied };
 
 	const key = `${deviceType}\u0000${applied.join('\u0000')}`;
-	let resolved = resolvedCache.get(key);
+	let resolved = cache.get(key);
 	if (!resolved) {
 		const names = new Set(applied);
 		resolved = overrides.reduce(
 			(acc, override) => (names.has(override.name) ? deepMerge(acc, override.config) : acc),
 			config
 		);
-		resolvedCache.set(key, resolved);
+		cache.set(key, resolved);
 	}
 	return { config: resolved, applied };
 };

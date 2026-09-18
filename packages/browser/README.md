@@ -291,6 +291,29 @@ include what you change:
 			"pathPattern": "^/product/", // only product pages have this widget
 		},
 	],
+	// optional: per-page-type statements of what a COMPLETE render contains. When one governs a
+	// render it REPLACES the timer-based settle — see "Readiness contracts" below. Absent → no-op.
+	"readiness": {
+		"onSatisfied": "quiet", // stop once the contract holds AND the DOM has been still for quietMs
+		"quietMs": 250,
+		"unmetGraceMs": 1000, // stop waiting on a clause that has never been true once everything else holds
+		"contracts": [
+			{
+				"name": "product",
+				"pathPattern": "^/product/",
+				"require": [
+					{ "name": "price", "selector": "[data-price]", "nonEmptyText": true, "textMatches": "\\$\\s?\\d" },
+					{ "name": "hydrated", "selector": "astro-island", "shed": "ssr" },
+					{ "name": "no-skeletons", "absent": ".skeleton" },
+					{ "name": "grid-or-empty", "anyOf": [{ "selector": ".tile", "minCount": 1 }, { "selector": ".no-results" }] },
+					{ "name": "rails-filled", "every": ".rail", "contains": ".slide" },
+					// only required when the page's own JSON-LD says the content should exist
+					{ "name": "reviews", "selector": ".review", "onlyIf": { "jsonLdNumber": "aggregateRating.ratingCount" } },
+				],
+				"observe": [{ "name": "product-links", "selector": "a[href^=/product/]" }], // reported, never waited on
+			},
+		],
+	},
 	"postProcess": {
 		"stripScripts": true, // remove executable <script> (keeps application/ld+json etc.)
 		"inlineEmptyStyleSheets": true,
@@ -371,6 +394,69 @@ only thing holding a widget's load open: on one real site `networkIdleTimeoutMs`
 all, so it acts as a fixed per-pass sleep, and cutting it 2000 → 500 made renders 3.5× faster and
 dropped every one of 1,635 review nodes with `outcome=ok` and no error. Add the explicit `waitFor`
 readiness gate first, confirm the content is still there, and only then take the blind dwell down.
+
+### Readiness contracts — deciding a render is complete by asking the page
+
+Every other settle signal is a timer, and a timer cannot be wrong out loud. A render that missed a
+widget, or that serialized pre-hydration markup, reports 200, non-empty and indexable, and nothing
+downstream can tell. A contract states per page type what a complete render CONTAINS; the renderer
+holds until that is true **and** the DOM has gone quiet, and posts the per-clause result back.
+
+Six assertion forms, each of which exists because something else could not express it:
+
+| form                                          | satisfied when                                                       | exists because                                                                                                |
+| --------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `selector` + `minCount`                       | at least N match (shadow-piercing)                                   | the base case                                                                                                 |
+| `anyOf`                                       | any branch matches                                                   | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived              |
+| `absent`                                      | nothing matches                                                      | skeletons and spinners that a real render replaces                                                            |
+| `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`) | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup        |
+| `every` + `contains`                          | every container has content, and at least one exists                 | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing |
+| `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                  | presence is not the same as populated                                                                         |
+
+Any clause can carry `onlyIf` — a guard making it conditional on what the page's **own** data says
+(`jsonLdNumber`) or on what the DOM holds (`present`). This is the difference between a guess and a
+check: a product with reviews and one without are structurally identical apart from the reviews, so
+a presence gate cannot tell "none" from "not yet", and accepting _either_ review items or a rating
+summary fires early on pages that do have reviews (measured: the summary lands 236–263 ms before the
+first review). Keyed on the page's declared `aggregateRating.ratingCount`, the document says what
+should exist and the rendered DOM is held to it.
+
+**Three properties worth knowing before writing one:**
+
+- **The quiet window is not optional, and it is where the speed comes from.** Running the same stop
+  policy with an _empty_ contract saves the same time to within 30 ms on 7 of 8 pages — the win is
+  replacing blind dwells with one real quiescence test. Stopping the instant a contract holds saves
+  more and loses the recommendation rails (measured: 99% of product links on one product page, 100%
+  on an empty facet), because rails have no server-rendered placeholder and no clause can assert one
+  is still coming. The contract's contribution is falsifiability, and that is what makes a short
+  quiet window safe.
+- **A clause must be false on a truncated render.** Anything server-rendered is true before the page
+  finishes and proves nothing; keep those as validity clauses and make sure at least one clause names
+  content that genuinely arrives late, or the contract will stop early.
+- **Templates change, so contracts rot.** A clause that has never been true, once every other clause
+  holds and the DOM is quiet, is stood aside after `unmetGraceMs` and reported unsatisfied — the
+  render falls back to the ordinary settle. Cost degrades to roughly today's behaviour instead of
+  waiting out the timeout on every render forever; without that valve one unsatisfiable clause
+  measured +385% wall.
+
+- **Cap `timeoutMs` low.** A contract that does not satisfy pays its whole timeout **and then the
+  full fallback settle on top**, and it costs CPU rather than only wall, because the page keeps
+  executing while the poll runs. Measured on a concurrency ladder: with a 15s timeout, one render in
+  twelve under contention took 10.8s and CPU/render rose 36%; at 3s the straggler was 4.8s and CPU
+  rose 12%, with the median render unchanged either way. Erring low is the safe direction — giving up
+  early falls back to exactly what the renderer does without a contract, so a too-low timeout costs
+  the optimisation and never the content. Set it from the `firstSatisfiedMs` distribution the results
+  carry rather than from a guess; if p95 approaches the timeout, the contract is being abandoned
+  under load and the win is quietly gone.
+
+Note this is a different failure from the rot valve above, and needs its own control: `unmetGraceMs`
+fires when a clause has never been true **and the page has gone quiet**, which is what a template
+change looks like. A page that is merely slow is still mutating, so the valve does not fire and the
+timeout is what bounds the wait.
+
+An unsatisfied contract always falls through to the normal settle, so a badly written contract can
+cost a render time but never content. `job.readiness` carries `satisfied`, per-clause `ok`/`count`/
+`firstTrueMs`, and any `observe` counts.
 
 ### `postProcess.minifyInlineCss` — re-emitting inline CSS from the CSSOM
 
