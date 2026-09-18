@@ -185,8 +185,6 @@ export type ReadinessContract = {
 	 * (rail counts, image counts): visibility without letting churn hold a render open.
 	 */
 	observe?: ReadinessAssertion[];
-	/** Hold the contract true for this long before accepting it. 0 = accept on first sight. */
-	stableMs?: number;
 	/** Give up after this long and report what was still false. Clamped by the render budget. */
 	timeoutMs?: number;
 	/** Sample interval. Defaults to `navigation.domStablePollMs`. */
@@ -468,7 +466,16 @@ export function evaluateContract(payload: {
 		if (a.nonEmptyText === true && typeof a.selector === 'string') {
 			let ok = false;
 			let seen = 0;
-			const pattern = typeof a.textMatches === 'string' ? new RegExp(a.textMatches as string) : null;
+			let pattern: RegExp | null = null;
+			try {
+				pattern = typeof a.textMatches === 'string' ? new RegExp(a.textMatches as string) : null;
+			} catch {
+				// Defence in depth: `validateReadiness` rejects a malformed pattern at config load, so this
+				// is unreachable through the public API. It stays because the alternative shape — building
+				// the RegExp outside the loop's try — threw out of the WHOLE evaluator, discarding every
+				// other clause's result for that tick rather than failing this one.
+				return { name: assertion.name, ok: false, count: 0 };
+			}
 			for (const root of roots) {
 				try {
 					for (const el of root.querySelectorAll(a.selector as string)) {
@@ -526,6 +533,18 @@ export function validateReadiness(readiness: unknown): void {
 		if (!Array.isArray(contract.require) || contract.require.length === 0) {
 			throw new Error(`prerender config: readiness contract "${contract.name}" needs at least one require assertion`);
 		}
+		for (const [field, value] of Object.entries({
+			timeoutMs: contract.timeoutMs,
+			pollMs: contract.pollMs,
+			quietMs: contract.quietMs,
+		})) {
+			if (value === undefined) continue;
+			if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+				throw new Error(
+					`prerender config: readiness contract "${contract.name}" ${field} must be a non-negative number`
+				);
+			}
+		}
 		if (contract.pathPattern) {
 			try {
 				new RegExp(contract.pathPattern);
@@ -535,6 +554,24 @@ export function validateReadiness(readiness: unknown): void {
 		}
 		for (const assertion of [...contract.require, ...(contract.observe ?? [])]) {
 			const a = assertion as Record<string, unknown>;
+			for (const field of ['minCount', 'maxRemaining', 'minContained'] as const) {
+				const value = a[field];
+				if (value === undefined) continue;
+				if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+					throw new Error(
+						`prerender config: readiness assertion "${assertion.name}" ${field} must be a non-negative number`
+					);
+				}
+			}
+			// Compiled here so a malformed pattern is a config error rather than a clause that can never
+			// hold — the same rule `waitFor.pathPattern` follows.
+			if (typeof a.textMatches === 'string') {
+				try {
+					new RegExp(a.textMatches);
+				} catch {
+					throw new Error(`prerender config: readiness assertion "${assertion.name}" has an invalid textMatches`);
+				}
+			}
 			const forms = [
 				a.selector && !a.shed && !a.nonEmptyText,
 				a.anyOf,

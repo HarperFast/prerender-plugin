@@ -103,7 +103,7 @@ export const recordReadinessExpectation = async (url, readiness, policy = DEFAUL
 		const verdict = assess(learned, parsed, policy);
 
 		for (const shortfall of verdict.shortfalls) metrics.renderReadinessShortfall(readiness.contract, shortfall.name);
-		if (verdict.rebaselined) metrics.renderReadiness(readiness.contract, 'rebaselined');
+		if (verdict.rebaselined) metrics.renderReadinessRebaseline(readiness.contract);
 		if (verdict.shortfalls.length) {
 			logger.warn(
 				`Prerender ${url}: rendered fewer than this URL last produced — ` +

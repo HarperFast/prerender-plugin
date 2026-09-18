@@ -319,3 +319,45 @@ test('report mode still times how long a satisfiable contract took to hold', asy
 		'it must report WHEN the content arrived, not merely that it did'
 	);
 });
+
+test('a contract with an unusable number or pattern is rejected at config load', async () => {
+	// A NaN or negative timeout makes the gate's deadline NaN, the loop never runs, and the contract
+	// is silently disabled — a config that looks enabled and protects nothing, which is the worst of
+	// the available outcomes. Same rule `waitFor` already applies to its numerics.
+	const { mergeConfig } = await import('../dist/config.js');
+	const contract = (over: Record<string, unknown>) => ({
+		readiness: {
+			onSatisfied: 'quiet',
+			contracts: [{ name: 'c', require: [{ name: 'x', selector: 'p' }], ...over }],
+		},
+	});
+
+	assert.throws(() => mergeConfig(contract({ timeoutMs: Number.NaN }) as never), /timeoutMs must be a non-negative/);
+	assert.throws(() => mergeConfig(contract({ quietMs: -1 }) as never), /quietMs must be a non-negative/);
+	assert.throws(() => mergeConfig(contract({ pollMs: 'soon' }) as never), /pollMs must be a non-negative/);
+	assert.doesNotThrow(() => mergeConfig(contract({ timeoutMs: 5000, quietMs: 250 }) as never));
+
+	// A malformed regex used to fail only at evaluation time, where it threw out of the whole
+	// evaluator and discarded every other clause's result for that tick.
+	assert.throws(
+		() =>
+			mergeConfig({
+				readiness: {
+					onSatisfied: 'quiet',
+					contracts: [{ name: 'c', require: [{ name: 'x', selector: 'p', nonEmptyText: true, textMatches: '([' }] }],
+				},
+			} as never),
+		/invalid textMatches/
+	);
+
+	assert.throws(
+		() =>
+			mergeConfig({
+				readiness: {
+					onSatisfied: 'quiet',
+					contracts: [{ name: 'c', require: [{ name: 'x', selector: 'p', minCount: -3 }] }],
+				},
+			} as never),
+		/minCount must be a non-negative/
+	);
+});

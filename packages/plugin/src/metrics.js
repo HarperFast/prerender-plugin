@@ -372,10 +372,13 @@ export const METRICS = Object.freeze({
 		dimensions: {
 			path: {
 				name: 'series',
-				values: ['verdict', 'unmet', 'shortfall', 'satisfied_ms'],
+				values: ['verdict', 'unmet', 'shortfall', 'rebaseline', 'satisfied_ms'],
 				description:
-					'verdict = counter of how the contract ended. unmet = counter, one per clause that did not ' +
-					'hold. shortfall = counter, one per observation that fell far below this URL\u2019s history. ' +
+					'verdict = counter of how the contract ended, EXACTLY ONE PER RENDER so shares read as ' +
+					'fractions of render throughput. unmet = counter, one per clause that did not hold. ' +
+					'shortfall = counter, one per observation that fell far below this URL\u2019s history. ' +
+					'rebaseline = counter, one per URL whose expectation was re-learned after repeated ' +
+					'shortfalls — kept OUT of verdict so that series keeps summing to one per render. ' +
 					'satisfied_ms = distribution of how long the contract took to first hold.',
 			},
 			method: {
@@ -384,12 +387,11 @@ export const METRICS = Object.freeze({
 			},
 			type: {
 				name: 'verdict (verdict) / clause (unmet) / observation (shortfall)',
-				values: ['satisfied', 'unsatisfied', 'rebaselined'],
+				values: ['satisfied', 'unsatisfied'],
 				description:
-					'verdict: satisfied | unsatisfied | rebaselined (the observation shortfalls repeated often ' +
-					'enough to be the page\u2019s new shape). unmet/shortfall: the configured clause or ' +
-					'observation name, so the enumeration above applies to the verdict series only. Null on ' +
-					'satisfied_ms.',
+					'verdict: satisfied | unsatisfied. unmet/shortfall: the configured clause or observation ' +
+					'name, so the enumeration above applies to the verdict series only. Null on rebaseline ' +
+					'and satisfied_ms.',
 			},
 		},
 	}),
@@ -770,6 +772,10 @@ export const metrics = Object.freeze({
 	/** One clause that did not hold. Emitted per clause, so it does not sum to renders. */
 	renderReadinessUnmet: (contract, clause) =>
 		server.recordAnalytics(true, 'render_readiness', 'unmet', contract, clause),
+
+	/** One URL whose expectation was re-learned. Its own series, so `verdict` stays one per render. */
+	renderReadinessRebaseline: (contract) =>
+		server.recordAnalytics(true, 'render_readiness', 'rebaseline', contract, null),
 
 	/** One observation that fell far below what this URL last produced. */
 	renderReadinessShortfall: (contract, observation) =>

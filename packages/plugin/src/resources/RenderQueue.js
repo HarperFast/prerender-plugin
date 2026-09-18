@@ -548,10 +548,9 @@ export class RenderQueue extends Resource {
 		for (const variant of variants) {
 			const readiness = variant.readiness;
 			if (!readiness) continue; // no contract governed this render
-			metrics.renderReadiness(
-				readiness.contract,
-				readiness.rebaselined ? 'rebaselined' : readiness.satisfied ? 'satisfied' : 'unsatisfied'
-			);
+			// Exactly one verdict per variant, so the series sums to renders. A rebaseline is a separate
+			// series (emitted by the expectation store, which is the only thing that can know).
+			metrics.renderReadiness(readiness.contract, readiness.satisfied ? 'satisfied' : 'unsatisfied');
 			// Per CLAUSE, so a contract that has rotted against a template change reads as one clause
 			// failing across every render of its page type rather than as an unexplained slowdown.
 			for (const clause of readiness.unmet ?? []) metrics.renderReadinessUnmet(readiness.contract, clause);

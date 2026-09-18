@@ -336,12 +336,14 @@ test('every render_readiness series and verdict the emitters can produce is decl
 		() => metrics.renderReadinessUnmet('c', 'x'),
 		() => metrics.renderReadinessShortfall('c', 'x'),
 		() => metrics.renderReadinessMs(1, 'c'),
+		() => metrics.renderReadinessRebaseline('c'),
 	]) {
 		assert.ok(declared.path.values.includes(emitted(emit).path), 'undeclared series');
 	}
 	// The verdict enumeration is closed; the clause/observation names in the same slot are not, which
-	// is why the catalog says the enumeration applies to the verdict series only.
-	for (const verdict of ['satisfied', 'unsatisfied', 'rebaselined']) {
+	// is why the catalog says the enumeration applies to the verdict series only. `rebaselined` is
+	// deliberately NOT a verdict — it rides its own series so verdict keeps summing to one per render.
+	for (const verdict of ['satisfied', 'unsatisfied']) {
 		assert.ok(declared.type.values.includes(emitted(() => metrics.renderReadiness('c', verdict)).type));
 	}
 });

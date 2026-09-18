@@ -748,7 +748,7 @@ const renderer: Renderer = async (page, job) => {
 	 */
 	const observeContract = async (
 		governing: NonNullable<ReturnType<typeof contractFor>>,
-		until: { done: boolean }
+		until: { done: boolean; wake?: (() => void) | undefined }
 	): Promise<void> => {
 		const started = Date.now();
 		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
@@ -774,7 +774,17 @@ const renderer: Renderer = async (page, job) => {
 				firstSatisfiedMs = Date.now() - started;
 			}
 			if (until.done) break;
-			await new Promise((resolve) => setTimeout(resolve, pollMs));
+			// Interruptible, so stopping the observer is PROMPT. A plain sleep meant the settle could be
+			// finished and still waiting up to a full poll interval for this loop to notice — which
+			// would make report mode extend the render it exists to leave alone.
+			await new Promise((resolve) => {
+				const timer = setTimeout(resolve, pollMs);
+				until.wake = () => {
+					clearTimeout(timer);
+					resolve(undefined);
+				};
+			});
+			until.wake = undefined;
 		}
 
 		// One last look, so the verdict describes the DOM that is about to be serialized rather than
@@ -814,7 +824,7 @@ const renderer: Renderer = async (page, job) => {
 	// A contract REPLACES the timer-based settle rather than joining it: scroll once to trip whatever
 	// is lazy, then hold until the page says it is complete. Everything below is what runs when no
 	// contract governs this render, or when one is not satisfied.
-	const observing = { done: false };
+	const observing: { done: boolean; wake?: (() => void) | undefined } = { done: false };
 	let observer: Promise<void> | null = null;
 	let contractSatisfied = false;
 	let contractScrolled = false;
@@ -876,6 +886,7 @@ const renderer: Renderer = async (page, job) => {
 	// report mode cannot change a render's duration.
 	if (observer) {
 		observing.done = true;
+		observing.wake?.();
 		await observer;
 	}
 	timings.settle = Date.now() - settleStart;
