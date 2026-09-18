@@ -33,7 +33,17 @@ type Sitemap @table(database: "sitemaps") {
 	isIndex: Boolean
 	entryCount: Int
 	entries: [SitemapEntry]
+	# When this document's ENTRIES were last ingested — NOT merely when it was last checked. A
+	# conditional fetch that comes back 304 leaves this alone, so it keeps meaning "the reconcile
+	# behind this row ran then", which is what `sitemap.conditional.fullPassInterval` measures
+	# against and what an operator reading the console wants it to mean.
 	lastRefreshed: Date
+	# The origin's `Last-Modified` for this document, replayed as `If-Modified-Since` on the next
+	# fetch. Stored as the RAW HEADER STRING, deliberately: it is an opaque validator to be echoed
+	# back verbatim, and parsing it to a Date and reformatting risks handing the origin a value
+	# that differs by a second and re-fetching the whole corpus. Null where the origin sends none,
+	# which simply means every fetch of that document is unconditional.
+	lastModified: String
 	# The index that listed this sitemap, or null for one added directly.
 	#
 	# Every document reached during a walk gets its own row, children included, so without this

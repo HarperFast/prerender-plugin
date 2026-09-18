@@ -1818,6 +1818,78 @@ export const configSchema = group('Prerender plugin configuration.', {
 			{ min: 0 }
 		),
 		failedCap: option(100, 'Max failed-entry samples carried back in a refresh result.', { min: 0 }),
+		newTargets: group(
+			'How soon a URL the sitemap has just DECLARED gets its first render.\n\n' +
+				'Without this, a newly created target takes `getInitialRenderTime`, which jitters the first ' +
+				'render across the target’s WHOLE render interval — `hash(url) % interval`. That jitter ' +
+				'exists for a real reason (the first ingest of a large sitemap must not stampede the queue), ' +
+				'but it is sized for bulk population and applies just as hard to the handful of genuinely new ' +
+				'URLs a mature corpus gains each day: on a 48h cadence a product published this morning can ' +
+				'wait two days to be rendered once, while the sitemap has been telling us about it the whole ' +
+				'time. A declaration is the strongest signal a site gives that a URL matters.\n\n' +
+				'So the first render is jittered across `window` instead of the interval, and only for the ' +
+				'first `maxPerRun` creates in a walk. The cap is what keeps the bulk case safe: a first ' +
+				'ingest creating hundreds of thousands of targets exceeds it immediately and everything past ' +
+				'it falls back to full-interval jitter, which is exactly the old behaviour. Steady-state ' +
+				'churn (tens to hundreds a day on a real corpus) never comes close to the cap.\n\n' +
+				'Only the FIRST render moves. The target’s cadence is untouched — `effectiveInterval` is ' +
+				'still the route/stored interval, so every render after this one is on the normal schedule.',
+			{
+				window: option(
+					15 * MINUTE,
+					'Jitter window for a newly declared target’s first render. Small values approximate ' +
+						'"immediately" while still spreading a batch across minutes rather than firing it into ' +
+						'one. `0` disables the fast path entirely and restores full-interval jitter.\n\n' +
+						'BELOW ~2 MINUTES IT STOPS SPREADING. `getInitialRenderTime` floors to the minute, so a ' +
+						'window under 60,000ms collapses every create in a walk onto ONE minute — the stampede ' +
+						'this is jittered to avoid, arrived at by asking for less jitter. Capped at 2147483647 ' +
+						'for the same reason `sweepInterval` is: a larger delay is not "effectively never", it ' +
+						'overflows the signed 32-bit timer and fires immediately.\n\n' +
+						'A window WIDER than the route’s own `renderInterval` is ignored — the fast path would be ' +
+						'slower than the jitter it replaces — and does not count as `createdSoon`.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
+				),
+				maxPerRun: option(
+					5000,
+					'Creates per walk that may take the fast path. Past this, new targets fall back to ' +
+						'full-interval jitter — the bulk-population guard.',
+					{ min: 0 }
+				),
+			}
+		),
+		conditional: group(
+			'Conditional sitemap fetching: send `If-Modified-Since` and skip the whole reconcile for a ' +
+				'document the origin answers 304 to.\n\n' +
+				'WHAT IT BUYS. A pass re-fetches every child and scans the `sitemapUrl` index once per ' +
+				'child, and it is that prune scan — a held read cursor, whose seconds scale linearly with ' +
+				'refresh frequency — that sets the real cost of refreshing often. A 304 skips the body, the ' +
+				'parse, the scan and every write, so an unchanged pass costs one request per document and ' +
+				'no database work at all. That is what makes polling for a change affordable instead of ' +
+				'merely possible: a deployment whose sitemaps rebuild once a night can check every few ' +
+				'minutes and pay for the walk only on the pass that finds the rebuild.\n\n' +
+				'USE `Last-Modified`, NOT `ETag`, AND DO NOT ASSUME EITHER. Measured on one production ' +
+				'edge: `If-Modified-Since` returned a clean 304, while `If-None-Match` sent back the exact ' +
+				'ETag the same edge had just served and got 200 with the full multi-megabyte body. An ' +
+				'origin that advertises a validator is not promising to honour it, which is why the ' +
+				'`not_modified` counter is worth watching — a steady zero here means every pass is doing ' +
+				'full work and the frequency should come back down.\n\n' +
+				'AN INDEX IS STILL DESCENDED on a 304: that only says the CHILD LIST is unchanged, not the ' +
+				'children, and on a real corpus the children rebuild on a different schedule from the index ' +
+				'that lists them. Each child then makes its own conditional decision.',
+			{
+				enabled: option(true, 'Send `If-Modified-Since` when a stored validator is available.'),
+				fullPassInterval: option(
+					24 * HOUR,
+					'Force an UNCONDITIONAL fetch of a document whose entries have not been ingested in this ' +
+						'long. This is the repair net and it is why the feature is safe to leave on: a 304 skips ' +
+						'the reconcile, and the reconcile is also what re-CREATES targets lost to anything else — ' +
+						'a bad purge, a half-applied delete, a botched migration. Without a periodic full pass a ' +
+						'corpus could drift for as long as the origin left its sitemaps untouched and nothing ' +
+						'would notice. Set it to 0 to make every fetch unconditional (the pre-0.69.0 behaviour).',
+					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
 		departure: group(
 			'What a refresh does about URLs that LEAVE a sitemap, beyond unlinking them. The action is ' +
 				'declared PER ROUTE (`ingress.routes[].departureAction`); this group bounds and observes it, ' +
