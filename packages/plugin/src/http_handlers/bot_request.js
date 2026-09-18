@@ -357,7 +357,15 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	//
 	// 'skip' and 'bypass' are excluded for the same reason they record no demand: they never looked, so
 	// they can neither prove nor disprove that anything is cached.
-	const rawPolicy = info.cacheStatus === 'miss' ? rawCachePolicy(info.route) : null;
+	//
+	// An EXPLICIT `missHeader: origin` is excluded too, and that one is not obvious. It leaves
+	// `cacheStatus` at 'miss' (only `Cache-Control: no-cache` sets `skip`), but it is an authorized
+	// operator asking for what the origin has RIGHT NOW — usually to verify a fix. Answering it from
+	// storage would make the one gesture available for checking the origin return a cached document.
+	const rawPolicy =
+		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
+			? rawCachePolicy(info.route)
+			: null;
 	if (rawPolicy) {
 		const stored = await readRawPage(cacheKey);
 		// A BULK INVALIDATION MUST REACH THESE TOO. Without this the feature would silently defeat
@@ -368,8 +376,19 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// (`ProbeState.pageSignature`), and nothing rendered this — an absent proof is the true answer,
 		// not a missing optimisation.
 		const rawEpoch = stored ? await resolveInvalidation(routeScopeForEntry(info.route)) : null;
-		const servable = stored && !(rawEpoch && !(epochMsOf(stored.lastCached) > rawEpoch.at));
-		if (servable) {
+		const refused = stored && rawEpoch && !(epochMsOf(stored.lastCached) > rawEpoch.at);
+		// A REFUSED RAW PAGE MUST SAY SO, or the invalidation is defeated by a conditional request.
+		// Leaving the status at 'miss' left BOTH 304 defences off — `stripValidators` below and
+		// `suppressConditional` in response.js key on this exact value — so a crawler returning with
+		// the `etag` it got from the stored document forwarded it to the origin, an origin whose ETag
+		// is publish-date-shaped answered 304, and the crawler kept the pre-invalidation bytes while
+		// every signal reported the invalidation working. That is the same hole `stripValidators` was
+		// added for on the page path, reopened on this one.
+		//
+		// `info.invalidatedBy` is deliberately NOT set: it drives `maybeAccelerateHeal`, which pulls a
+		// RENDER forward, and a raw URL owns no target to reschedule.
+		if (refused) info.cacheStatus = 'invalidated';
+		if (stored && !refused) {
 			const body = await materializeCachedBody(stored, request.method);
 			// An unreadable stored blob degrades to the origin proxy this branch replaced — the same
 			// shape as the rendered-page path, and the reason both read the body before committing a
@@ -381,6 +400,14 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 				info.source = 'raw';
 				return { ...stored, cacheKey, deviceType, url: cacheUrl };
 			}
+			// COUNTED AND LOGGED, never silent. The page path emits `serveError` here for a reason: a
+			// dangling blob (harper#2134) or one still arriving (harper-pro#683) costs every request for
+			// this key the full `blobReadBudgetMs` until the row expires, and without a counter it is
+			// indistinguishable from an ordinary miss — the same request shape, the same status.
+			metrics.serveError(body.reason === 'timeout' ? 'raw-blob-timeout' : 'raw-blob-unreadable');
+			logger.warn(
+				`raw document blob ${body.reason === 'timeout' ? 'read exceeded the budget' : 'unreadable'} for ${cacheKey}; serving origin instead`
+			);
 		}
 	}
 

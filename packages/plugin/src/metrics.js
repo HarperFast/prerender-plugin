@@ -89,6 +89,10 @@ const CACHE_STATUSES = Object.freeze([
 	'miss', // nothing cached under this key
 	'skip', // the cache was deliberately not consulted (renderNow / Cache-Control)
 	'bypass', // not a cacheable request at all (non-GET/HEAD)
+	// A stored ORIGIN document answered it (`render.raw`). A cache serve, and it counts toward
+	// offload — but NOT a prerendered one: no browser ran on it. Its own value so that "cache
+	// served" and "rendered coverage" stay different questions, and so `page_age` can exclude it.
+	'raw',
 	// A servable record whose blob body could not be read, so we served origin instead. Its own
 	// status rather than folding into 'miss': the key IS cached and correctly scheduled, and the
 	// two have different fixes — 'miss' means coverage, this means blob integrity (harper#2134).
@@ -118,6 +122,7 @@ const SERVE_SOURCES = Object.freeze([
 	'cache', // a stored snapshot answered it
 	'rendered', // an on-demand render landed inside the renderNow timeout
 	'origin', // proxied live to the origin — the request the offload number counts against
+	'raw', // a stored origin document (render.raw) — saved the round trip, but nothing rendered it
 ]);
 
 const DEVICE_TYPES = Object.freeze(['desktop', 'mobile', 'tablet']);

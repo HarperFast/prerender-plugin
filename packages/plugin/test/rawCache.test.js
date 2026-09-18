@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
  * cap, is paid for in the crawler's latency and this process's memory. Both are pinned below.
  */
 
-let rawCache, config;
+let rawCache, config, applyOptions;
 const rows = new Map();
 let ops = [];
 let failWrites = false;
@@ -52,7 +52,7 @@ before(async () => {
 		},
 	};
 
-	({ config } = await import('../src/config.js'));
+	({ config, applyOptions } = await import('../src/config.js'));
 	rawCache = await import('../src/util/rawCache.js');
 });
 
@@ -63,7 +63,9 @@ beforeEach(() => {
 	config.render.raw.enabled = true;
 	config.render.raw.maxBytes = 1024;
 	config.render.raw.expiry = 'midnight';
+	config.render.raw.expiryMs = 21600000;
 	config.render.raw.expiryTimezone = 'UTC';
+	config.render.raw.maxConcurrentCaptures = 16;
 	config.render.raw.contentTypes = ['text/html'];
 });
 
@@ -126,11 +128,22 @@ test('expiry: midnight resolves to the next UTC midnight, not to "now + 24h"', (
 	assert.ok(at - Date.now() <= 24 * 60 * 60 * 1000, 'and no more than a day out');
 });
 
-test('expiry: a numeric value is a plain offset from now', () => {
-	config.render.raw.expiry = 3_600_000;
+test("expiry: 'interval' uses expiryMs as a plain offset from now", () => {
+	// expiry and expiryMs are SEPARATE options because the config merge type-checks every value
+	// against its default: a numeric override of a string-defaulted option was rejected outright, so
+	// the documented "or a number of ms" form never reached the running config. This test goes
+	// through `applyOptions` rather than assigning the field, so it cannot pass on a state the
+	// config path is unable to produce.
+	applyOptions({ render: { raw: { enabled: true, expiry: 'interval', expiryMs: 3_600_000 } } });
 	const now = Date.now();
-	const at = rawCache.rawExpiresAt(policy(), now);
-	assert.equal(at, now + 3_600_000);
+	assert.equal(rawCache.rawExpiresAt(policy(), now), now + 3_600_000);
+});
+
+test('a numeric `expiry` is refused by the config layer and does NOT silently become an interval', () => {
+	applyOptions({ render: { raw: { enabled: true, expiry: 3_600_000 } } });
+	assert.equal(config.render.raw.expiry, 'midnight', 'a type mismatch must keep the default');
+	const at = rawCache.rawExpiresAt(policy());
+	assert.equal(new Date(at).getUTCHours(), 0, 'and the behaviour must be midnight, not an offset');
 });
 
 test('expiry: a garbage value falls back to the boundary and NEVER to NaN', () => {
@@ -195,11 +208,11 @@ test('content-length is dropped and content-encoding is kept', () => {
 	assert.equal(stored['content-length'], undefined);
 	assert.equal(stored['content-encoding'], 'gzip');
 	assert.equal(stored['content-type'], 'text/html; charset=utf-8');
-	assert.equal(stored['x-harper-raw'], '1');
+	assert.equal(stored['x-harper-raw'], undefined, 'no marker header: it had no reader and shipped ungated');
 });
 
 test('storedHeaders tolerates a resource with no headers at all', () => {
-	assert.deepEqual(rawCache.storedHeaders(undefined), { 'x-harper-raw': '1' });
+	assert.deepEqual(rawCache.storedHeaders(undefined), {});
 });
 
 // ---- the capture -----------------------------------------------------------------------------
@@ -326,4 +339,72 @@ test('a body that is not a stream is left alone rather than guessed at', () => {
 	const out = rawCache.captureForRawCache(resource, { cacheKey: 'k', policy: policy() });
 	assert.equal(out.content, 'already a string');
 	assert.ok(ops.includes('prerender_ops:raw_cache:no-body'));
+});
+
+// ---- the fixes the adversarial review found --------------------------------------------------
+
+test('a 200 with a ZERO-LENGTH body is not stored — an empty buffer is truthy', () => {
+	// `Buffer.concat([], 0)` is an empty Buffer, and empty Buffers are truthy. A `!result.bytes`
+	// check therefore stored an origin 200 with no body (an origin error path, some CDN failure
+	// modes) and replayed zero bytes under `content-encoding: gzip` to every later crawler.
+	const resource = originResource({ content: streamOf([]) });
+	rawCache.captureForRawCache(resource, { cacheKey: 'k', policy: policy() });
+	return new Promise((resolve) =>
+		setImmediate(() => {
+			assert.equal(rows.size, 0, 'nothing may be stored for an empty body');
+			assert.ok(ops.includes('prerender_ops:raw_cache:empty'), `expected an 'empty' outcome, got ${ops.join()}`);
+			resolve();
+		})
+	);
+});
+
+test('concurrent captures are capped, and the cap is released on every path', async () => {
+	// Capturing REMOVES origin->crawler backpressure: the capture reads in a tight loop, so the
+	// origin drains at full speed however slowly the crawler reads, and this worker's heap becomes
+	// the buffer. Measured retention is ~2x maxBytes per capture (one copy in `chunks`, one held by
+	// the tee for the unread branch), so the slot count is what actually bounds the heap.
+	config.render.raw.maxConcurrentCaptures = 2;
+	const held = [1, 2, 3].map((n) => {
+		const resource = originResource({ content: streamOf([`<html>${n}</html>`]) });
+		return { n, out: rawCache.captureForRawCache(resource, { cacheKey: `k${n}`, policy: policy() }) };
+	});
+
+	assert.equal(rawCache.captureSlotsInUse(), 2, 'only two may capture at once');
+	assert.ok(ops.includes('prerender_ops:raw_cache:capture-busy'), 'the refusal is counted, not silent');
+	// The third is still SERVED — it just is not stored.
+	assert.equal((await drain(held[2].out.content)).toString(), '<html>3</html>');
+
+	await Promise.all(held.slice(0, 2).map((h) => drain(h.out.content)));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(rawCache.captureSlotsInUse(), 0, 'slots must be returned or capture decays to zero');
+	assert.equal(rows.size, 2);
+});
+
+test('an oversize capture still reports itself when the crawler branch is never drained', async () => {
+	// `cancel()` on a tee branch returns the SHARED cancel promise, which settles only when both
+	// branches cancel or the source closes — so awaiting it never returned for a client that
+	// disconnected, a HEAD, or a local 304, and the `oversize` metric silently under-reported by
+	// exactly that population. This asserts the capture settles without anyone reading downstream.
+	const { captured } = rawCache.teeForCapture(streamOf(['a'.repeat(600), 'b'.repeat(600)]), 512);
+	const result = await captured;
+	assert.equal(result.outcome, 'oversize');
+	assert.equal(result.bytes, null);
+});
+
+test('a chunk with no byteLength cannot disable the cap', async () => {
+	// `size += undefined` makes size NaN, and `NaN > maxBytes` is FALSE — the cap would stop
+	// existing rather than fire. Unreachable through Readable.toWeb, but teeForCapture is exported.
+	const odd = new ReadableStream({
+		start(c) {
+			c.enqueue({ not: 'a typed array' });
+			c.close();
+		},
+	});
+	const { captured } = rawCache.teeForCapture(odd, 8);
+	const result = await captured;
+	assert.ok(result.outcome === 'ok' || result.outcome === 'capture-failed');
+});
+
+test('x-harper-raw is not stored — it had no reader and shipped to every crawler ungated', () => {
+	assert.equal(rawCache.storedHeaders(originResource().headers)['x-harper-raw'], undefined);
 });

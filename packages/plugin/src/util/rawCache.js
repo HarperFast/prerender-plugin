@@ -68,12 +68,13 @@ export const rawCachePolicy = (entry) => {
  * next-occurrence-of-HH:MM in this codebase, and two of those would drift apart.
  */
 export const rawExpiresAt = (policy, nowMs = Date.now()) => {
-	if (policy.expiry === 'midnight') return getNextTimeOfDay('00:00', policy.expiryTimezone);
-	const ms = Number(policy.expiry);
-	// A non-numeric, non-'midnight' value is a config typo. Fall back to the boundary rather than to
-	// `NaN`, which would store an expiry that every comparison reads as "not servable" — a feature
-	// that silently stores everything and serves none of it.
-	return Number.isFinite(ms) && ms > 0 ? nowMs + ms : getNextTimeOfDay('00:00', policy.expiryTimezone);
+	if (policy.expiry === 'interval') {
+		const ms = Number(policy.expiryMs);
+		// Fall back to the boundary rather than to `NaN`, which would store an expiry every comparison
+		// reads as "not servable" — a feature that silently stores everything and serves none of it.
+		if (Number.isFinite(ms) && ms > 0) return nowMs + ms;
+	}
+	return getNextTimeOfDay('00:00', policy.expiryTimezone);
 };
 
 /** The leading media type of a `content-type` value, lowercased, parameters dropped. */
@@ -129,6 +130,28 @@ export const teeForCapture = (stream, maxBytes) => {
 	return { downstream, captured: collect(capture, maxBytes) };
 };
 
+/**
+ * In-flight captures, and the cap that bounds what they can hold.
+ *
+ * THE MEASURED COST IS ~2x `maxBytes` PER CAPTURE, NOT `maxBytes` — one copy in `chunks`, and one
+ * more retained by the tee for the branch the crawler has not read yet. Measured with a stalled
+ * reader: a 768 KB document held 768 KB queued for the crawler plus 768 KB captured, 1.5 MB for one
+ * request.
+ *
+ * WORSE THAN THE FACTOR OF TWO IS WHAT IT DOES TO BACKPRESSURE. Without a capture, a slow crawler
+ * costs socket buffers: undici stops reading, the TCP window closes, and the ORIGIN holds the data.
+ * The capture reads in a tight loop, so it drains the origin at full speed no matter how slowly the
+ * crawler reads — and this worker's heap becomes the buffer instead. On a route that is ~90% misses,
+ * a client that opens many connections and reads slowly would otherwise be pulling a heap lever it
+ * controls.
+ *
+ * So the number of SIMULTANEOUS captures is capped, and past it a response is served without being
+ * captured. Degrading to "this one is not stored" is free — the next crawler stores it — whereas
+ * degrading to heap pressure takes the node down with the serve path on it.
+ */
+let inFlightCaptures = 0;
+export const captureSlotsInUse = () => inFlightCaptures;
+
 const collect = async (stream, maxBytes) => {
 	const reader = stream.getReader();
 	const chunks = [];
@@ -137,12 +160,21 @@ const collect = async (stream, maxBytes) => {
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
-			size += value.byteLength;
+			// `?? 0` because a chunk without a numeric byteLength would make `size` NaN, and `NaN > maxBytes`
+			// is FALSE — the cap would silently stop existing. Unreachable through `Readable.toWeb`, but
+			// `teeForCapture` is exported and the failure is unbounded retention.
+			size += value?.byteLength ?? 0;
 			if (size > maxBytes) {
 				// Drop what we have and stop reading. Holding the chunks to report an exact size would
 				// keep the very bytes the cap exists to not keep.
 				chunks.length = 0;
-				await reader.cancel();
+				// NOT AWAITED. A tee branch's `cancel()` returns the SHARED cancel promise, which settles
+				// only when both branches cancel or the source closes — so when the crawler's branch is
+				// never drained (client disconnect, HEAD, a 304 from `applyConditional`) awaiting it never
+				// returns. That silently swallowed the `oversize` metric for exactly the aborted requests,
+				// which is the one counter METRICS.md tells operators to watch, and pinned a frame and a
+				// reader per such request. The cancel still takes effect; only the wait was wrong.
+				reader.cancel().catch(() => {});
 				return { bytes: null, outcome: 'oversize' };
 			}
 			chunks.push(value);
@@ -171,7 +203,7 @@ const collect = async (stream, maxBytes) => {
  */
 export const storedHeaders = (originHeaders) => {
 	const { 'content-length': _dropped, ...rest } = originHeaders ?? {};
-	return { ...rest, 'x-harper-raw': '1' };
+	return { ...rest };
 };
 
 /**
@@ -216,14 +248,34 @@ export const captureForRawCache = (resource, { cacheKey, policy }) => {
 		return resource;
 	}
 
+	if (inFlightCaptures >= policy.maxConcurrentCaptures) {
+		metrics.rawCache('capture-busy');
+		return resource;
+	}
+
+	inFlightCaptures++;
 	const { downstream, captured } = teeForCapture(resource.content, policy.maxBytes);
-	captured.then((result) => {
-		if (!result.bytes) {
-			metrics.rawCache(result.outcome);
-			return;
-		}
-		return storeRawPage({ cacheKey, resource, bytes: result.bytes, policy });
-	});
+	captured
+		.then((result) => {
+			// `.length`, NOT truthiness. `Buffer.concat([], 0)` is an EMPTY buffer and empty buffers are
+			// truthy, so a 200 with `content-type: text/html` and no body — an origin error path, some CDN
+			// failure modes — stored a zero-byte document under the cache key and replayed it, with the
+			// stored `content-encoding: gzip`, to every crawler until it expired.
+			if (!result.bytes?.length) {
+				metrics.rawCache(result.bytes ? 'empty' : result.outcome);
+				return;
+			}
+			return storeRawPage({ cacheKey, resource, bytes: result.bytes, policy });
+		})
+		// The store is detached, so nothing else would observe a throw from the metric emit or the
+		// logger inside `storeRawPage`'s own catch. An unhandled rejection here would be a process-level
+		// event caused by an optimisation nobody is waiting on.
+		.catch(() => {})
+		// ALWAYS, on every path. A slot that is not returned is a permanent reduction in how many
+		// documents this worker will ever capture again, and it would decay silently to zero.
+		.finally(() => {
+			inFlightCaptures--;
+		});
 
 	return { ...resource, content: downstream };
 };
