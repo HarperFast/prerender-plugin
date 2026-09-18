@@ -42,9 +42,7 @@ const flag = (name, fallback) => {
 };
 const DEVICE = flag('device', 'mobile');
 const REPS = Number(flag('reps', 5));
-const ONLY = flag('only', '')
-	.split(',')
-	.filter(Boolean);
+const ONLY = flag('only', '').split(',').filter(Boolean);
 const JSON_OUT = flag('json', '');
 const WARMUP = Number(flag('warmup', 1));
 
@@ -139,8 +137,7 @@ async function main() {
 			wallMs,
 			renderMs: result.renderTimeMs ?? null,
 			...result.timings,
-			cpuMs:
-				cpuBefore && cpuAfter ? Math.round((cpuAfter.cpuSeconds - cpuBefore.cpuSeconds) * 1000) : null,
+			cpuMs: cpuBefore && cpuAfter ? Math.round((cpuAfter.cpuSeconds - cpuBefore.cpuSeconds) * 1000) : null,
 			...(result.probes?.metrics ?? {}),
 			cdpSent: cdp.sent,
 			cdpEvents: cdp.events,

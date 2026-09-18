@@ -1,0 +1,330 @@
+{
+  "label": "cache-matrix-c8",
+  "device": "mobile",
+  "reps": 3,
+  "warmups": 2,
+  "levels": [
+    8
+  ],
+  "uv": null,
+  "results": [
+    {
+      "concurrency": 8,
+      "variant": "baseline",
+      "reps": 3,
+      "batchMs": 7580,
+      "perRenderWall": 7555,
+      "maxWall": 7579,
+      "cpuMsPerRender": 2261,
+      "rendersPerSec": 1.06,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1624,
+      "devtoolsMs": 224,
+      "requestsPerRender": 12,
+      "jsRequestsPerRender": 9,
+      "rssMb": 2631,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2049,
+          "rssMb": 2083,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 71,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 56,
+          "rssMb": 200,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 24,
+          "rssMb": 177,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2261,
+        2313,
+        2200
+      ],
+      "allBatch": [
+        7573,
+        7597,
+        7580
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "context-pool",
+      "reps": 3,
+      "batchMs": 7560,
+      "perRenderWall": 7528,
+      "maxWall": 7559,
+      "cpuMsPerRender": 2215,
+      "rendersPerSec": 1.06,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1621,
+      "devtoolsMs": 226,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "rssMb": 2623,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2035,
+          "rssMb": 2071,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 71,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 53,
+          "rssMb": 199,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 21,
+          "rssMb": 174,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2273,
+        2215,
+        2180
+      ],
+      "allBatch": [
+        7554,
+        7602,
+        7560
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "resource-cache-on",
+      "reps": 3,
+      "batchMs": 7615,
+      "perRenderWall": 7565,
+      "maxWall": 7614,
+      "cpuMsPerRender": 2149,
+      "rendersPerSec": 1.05,
+      "v8CompileMs": 0,
+      "scriptMs": 40,
+      "taskMs": 1504,
+      "devtoolsMs": 219,
+      "requestsPerRender": 1,
+      "jsRequestsPerRender": 0,
+      "rssMb": 2623,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 2034,
+          "rssMb": 2077,
+          "n": 9
+        },
+        "browser": {
+          "cpuMs": 93,
+          "rssMb": 203,
+          "n": 1
+        },
+        "gpu-process": {
+          "cpuMs": 71,
+          "rssMb": 172,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 35,
+          "rssMb": 171,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2149,
+        2148,
+        2233
+      ],
+      "allBatch": [
+        7589,
+        7615,
+        7703
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "context-pool-plus-cache",
+      "reps": 3,
+      "batchMs": 7576,
+      "perRenderWall": 7546,
+      "maxWall": 7576,
+      "cpuMsPerRender": 2136,
+      "rendersPerSec": 1.06,
+      "v8CompileMs": 0,
+      "scriptMs": 41,
+      "taskMs": 1549,
+      "devtoolsMs": 222,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "rssMb": 2601,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 1988,
+          "rssMb": 2059,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 71,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 59,
+          "rssMb": 201,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 21,
+          "rssMb": 169,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2136,
+        2134,
+        2139
+      ],
+      "allBatch": [
+        7574,
+        7619,
+        7576
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "udd-default-context",
+      "reps": 3,
+      "batchMs": 7569,
+      "perRenderWall": 7541,
+      "maxWall": 7568,
+      "cpuMsPerRender": 2130,
+      "rendersPerSec": 1.06,
+      "v8CompileMs": 0,
+      "scriptMs": 24,
+      "taskMs": 1535,
+      "devtoolsMs": 220,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "rssMb": 2588,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 1973,
+          "rssMb": 2073,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 71,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 61,
+          "rssMb": 187,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 25,
+          "rssMb": 156,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2093,
+        2153,
+        2130
+      ],
+      "allBatch": [
+        7569,
+        7595,
+        7545
+      ]
+    },
+    {
+      "concurrency": 8,
+      "variant": "default-context-pooled-pages",
+      "reps": 3,
+      "batchMs": 7588,
+      "perRenderWall": 7566,
+      "maxWall": 7587,
+      "cpuMsPerRender": 2156,
+      "rendersPerSec": 1.05,
+      "v8CompileMs": 0,
+      "scriptMs": 24,
+      "taskMs": 1565,
+      "devtoolsMs": 221,
+      "requestsPerRender": 0,
+      "jsRequestsPerRender": 0,
+      "rssMb": 2598,
+      "processes": 12,
+      "reviews": 461,
+      "bytes": 937335,
+      "poolResetFailures": 0,
+      "cpuByType": {
+        "renderer": {
+          "cpuMs": 1988,
+          "rssMb": 2069,
+          "n": 9
+        },
+        "gpu-process": {
+          "cpuMs": 70,
+          "rssMb": 172,
+          "n": 1
+        },
+        "browser": {
+          "cpuMs": 66,
+          "rssMb": 192,
+          "n": 1
+        },
+        "utility:network": {
+          "cpuMs": 26,
+          "rssMb": 160,
+          "n": 1
+        }
+      },
+      "allCpu": [
+        2209,
+        2156,
+        2150
+      ],
+      "allBatch": [
+        7632,
+        7588,
+        7583
+      ]
+    }
+  ]
+}

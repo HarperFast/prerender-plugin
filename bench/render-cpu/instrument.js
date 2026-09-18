@@ -110,20 +110,29 @@ export function processTreeCpu(rootPid) {
 	if (!rootPid) return null;
 	let out;
 	try {
-		out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,time=,rss='], { encoding: 'utf8', maxBuffer: 8 << 20 });
+		// `-ww` + `command=` so the FULL argv survives: Chrome's own `--type=` is the only thing that
+		// says whether a CPU second went to the renderer, the GPU process, the network service or a
+		// utility, and `--renderer-client-id` separates one render's renderer from another's. Without
+		// it the tree is one number that attributes nothing (the old behaviour).
+		out = execFileSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,time=,rss=,command='], {
+			encoding: 'utf8',
+			maxBuffer: 32 << 20,
+		});
 	} catch {
 		return null; // no ps (or not permitted) — the other two instruments still work
 	}
 	const children = new Map();
 	const cpu = new Map();
 	const rss = new Map();
+	const argv = new Map();
 	for (const line of out.split('\n')) {
-		const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s*$/.exec(line);
+		const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(.*)$/.exec(line);
 		if (!m) continue;
 		const pid = Number(m[1]);
 		const ppid = Number(m[2]);
 		cpu.set(pid, parsePsTime(m[3]));
 		rss.set(pid, Number(m[4]));
+		argv.set(pid, m[5]);
 		if (!children.has(ppid)) children.set(ppid, []);
 		children.get(ppid).push(pid);
 	}
@@ -131,18 +140,61 @@ export function processTreeCpu(rootPid) {
 	let total = 0;
 	let processes = 0;
 	let rssKb = 0;
+	const byType = new Map();
+	const clientIds = new Set();
 	const stack = [rootPid];
 	while (stack.length) {
 		const pid = stack.pop();
-		total += cpu.get(pid) ?? 0;
-		rssKb += rss.get(pid) ?? 0;
+		const seconds = cpu.get(pid) ?? 0;
+		const kb = rss.get(pid) ?? 0;
+		total += seconds;
+		rssKb += kb;
 		processes++;
+		const bucket = chromeProcessType(pid === rootPid ? null : argv.get(pid));
+		const acc = byType.get(bucket) ?? { cpuSeconds: 0, rssKb: 0, processes: 0 };
+		acc.cpuSeconds += seconds;
+		acc.rssKb += kb;
+		acc.processes++;
+		byType.set(bucket, acc);
+		const clientId = /--renderer-client-id=(\d+)/.exec(argv.get(pid) ?? '');
+		if (clientId) clientIds.add(clientId[1]);
 		for (const child of children.get(pid) ?? []) stack.push(child);
 	}
 	// Process count and RSS ride along because on this fleet a CPU win that costs memory is not a win,
 	// and because the process count answers "are cross-origin frames getting their own renderer?"
 	// without touching a Chrome flag.
-	return { cpuSeconds: total, processes, rssMb: Math.round(rssKb / 1024) };
+	return {
+		cpuSeconds: total,
+		processes,
+		rssMb: Math.round(rssKb / 1024),
+		byType: Object.fromEntries(
+			[...byType]
+				.sort((a, b) => b[1].cpuSeconds - a[1].cpuSeconds)
+				.map(([k, v]) => [
+					k,
+					{ cpuSeconds: Number(v.cpuSeconds.toFixed(2)), rssMb: Math.round(v.rssKb / 1024), processes: v.processes },
+				])
+		),
+		rendererClientIds: clientIds.size,
+	};
+}
+
+/**
+ * Which Chrome process is this. Chrome puts `--type=<kind>` on every child it spawns and nothing on
+ * the browser process itself; the network service and the storage service are both `--type=utility`
+ * and are told apart by `--utility-sub-type=`, which is where a surprising amount of a render's CPU
+ * can sit when every response is being fulfilled over CDP.
+ */
+function chromeProcessType(command) {
+	if (!command) return 'browser';
+	const type = /--type=([\w-]+)/.exec(command);
+	if (!type) return 'browser';
+	if (type[1] === 'utility') {
+		const sub = /--utility-sub-type=([\w.-]+)/.exec(command);
+		if (sub) return `utility:${sub[1].replace(/\.mojom\..*$/, '')}`;
+		return 'utility';
+	}
+	return type[1];
 }
 
 /**
@@ -171,9 +223,11 @@ export function pageMetrics(metrics) {
 		// construction, and the per-response work of every fulfilled request. On the first baseline
 		// it was 95% of main-thread time, which is why it is reported rather than inferred.
 		taskOtherMs: Math.round((metrics.TaskOtherDuration ?? 0) * 1000),
-		// Direct evidence for the install-once hypothesis: every page.evaluate ships source that V8
-		// has to compile again.
-		v8CompileMs: Math.round((metrics.V8CompileDuration ?? 0) * 1000),
+		// MAIN-THREAD compile only, and sub-millisecond even for a megabyte of bundles — V8 streams and
+		// compiles script on background threads inside the renderer, and lazily. Reported to two
+		// decimals so "0" is visibly a real zero rather than a rounded number, but the instrument that
+		// can see compile work is processTreeCpu, not this counter.
+		v8CompileMs: Number(((metrics.V8CompileDuration ?? 0) * 1000).toFixed(2)),
 		// Main-thread time spent servicing CDP commands — what "a CDP call costs", measured inside
 		// the renderer rather than inferred from a message count.
 		devtoolsMs: Math.round((metrics.DevToolsCommandDuration ?? 0) * 1000),
@@ -182,7 +236,7 @@ export function pageMetrics(metrics) {
 		processTimeMs: Math.round((metrics.ProcessTime ?? 0) * 1000),
 		layoutObjects: metrics.LayoutObjects ?? 0,
 		resources: metrics.Resources ?? 0,
-		scriptMs: Math.round((metrics.ScriptDuration ?? 0) * 1000),
+		scriptMs: Number(((metrics.ScriptDuration ?? 0) * 1000).toFixed(1)),
 		layoutMs: Math.round((metrics.LayoutDuration ?? 0) * 1000),
 		recalcStyleMs: Math.round((metrics.RecalcStyleDuration ?? 0) * 1000),
 		layoutCount: metrics.LayoutCount ?? 0,

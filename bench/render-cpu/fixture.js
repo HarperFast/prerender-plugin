@@ -53,7 +53,8 @@ const CLASSES = ['flex', 'grid', 'px-4', 'py-2', 'text-sm', 'font-bold', 'rounde
 
 /** A utility stylesheet in the Tailwind idiom: thousands of rules, a handful of which match. */
 function utilityCss(random) {
-	let css = ':root{--c:#111}body{margin:0;font:14px system-ui}.hdr{position:sticky;top:0;height:64px;background:#fff}\n';
+	let css =
+		':root{--c:#111}body{margin:0;font:14px system-ui}.hdr{position:sticky;top:0;height:64px;background:#fff}\n';
 	css += '.hdr.hide{transform:translateY(-100%)}\n';
 	// Height is a measured property of the fixture, not an accident of the markup: a 4-column grid
 	// of 64px cells puts the page at ~20,000px on a 390px viewport, which is PDP scale. A single
@@ -86,7 +87,8 @@ function tile(i, random) {
 	html += `<div class="${cls()}"><span class="${cls()}">$${20 + (i % 80)}.99</span><s class="${cls()}">$${60 + (i % 90)}.00</s></div>`;
 	// A star row inside plain light DOM plus one in a shadow widget elsewhere.
 	html += `<div class="${cls()}" role="img" aria-label="${1 + (i % 5)} stars">`;
-	for (let s = 0; s < 5; s++) html += `<svg viewBox="0 0 16 16" class="${cls()}"><path d="M8 0l2 5 5 .5-4 3 1 5-4-3-4 3 1-5-4-3 5-.5z"/></svg>`;
+	for (let s = 0; s < 5; s++)
+		html += `<svg viewBox="0 0 16 16" class="${cls()}"><path d="M8 0l2 5 5 .5-4 3 1 5-4-3-4 3 1-5-4-3 5-.5z"/></svg>`;
 	html += '</div>';
 	html += `<button class="${cls()}" data-u="${i}">Add</button></div></div>`;
 	return html;
@@ -226,10 +228,10 @@ function buildHtml(query) {
 	html += JSON.stringify({
 		'@context': 'https://schema.org',
 		'@type': 'Product',
-		name: 'Bench Product',
-		offers: [
-			{ '@type': 'Offer', price: '39.99', priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
-			{ '@type': 'Offer', price: '44.99', priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
+		'name': 'Bench Product',
+		'offers': [
+			{ '@type': 'Offer', 'price': '39.99', 'priceCurrency': 'USD', 'availability': 'https://schema.org/InStock' },
+			{ '@type': 'Offer', 'price': '44.99', 'priceCurrency': 'USD', 'availability': 'https://schema.org/InStock' },
 		],
 	});
 	html += '</script></head>';
@@ -258,10 +260,17 @@ function buildHtml(query) {
 
 	// The review block, at the bottom — below the fold on a short viewport, in view on a tall one.
 	html += '<section id="reviewsAnchor"><h2>Customer Reviews</h2>';
-	html += '<div id="reviewTabs"><div id="reviewWrap" class="transition-all hidden"><div id="reviewList"></div></div></div>';
+	html +=
+		'<div id="reviewTabs"><div id="reviewWrap" class="transition-all hidden"><div id="reviewList"></div></div></div>';
 	html += '</section></main>';
 
-	for (let i = 0; i < 8; i++) html += `<script src="/asset/js/chunk-${i}.js"></script>`;
+	// `?chunks=N` raises the SUB-RESOURCE count without touching the DOM, the CSS or the page height,
+	// so every other number in this bench stays comparable. It exists for the resource-cache and
+	// UV_THREADPOOL_SIZE questions: a production storefront page makes ~70 cacheable sub-resource
+	// requests per render and the default fixture makes 11, so a null result at 11 bounds the lever
+	// rather than settling it. Each extra chunk is a real ~110KB bundle, fetched, cached and compiled.
+	const chunks = Math.max(1, Number(query.get('chunks') ?? 8));
+	for (let i = 0; i < chunks; i++) html += `<script src="/asset/js/chunk-${i}.js"></script>`;
 	html += '<script src="/asset/js/vendor.js"></script>';
 	html += '<script src="/asset/js/analytics-beacon.js"></script>'; // matches the blocked pattern
 	html += `<script>${shadowWidgetScript()}</script>`;
@@ -304,6 +313,13 @@ export async function startFixture({ port = 0 } = {}) {
 
 	const server = createServer((req, res) => {
 		const url = new URL(req.url, 'http://127.0.0.1');
+		// The counters, readable over HTTP so a runner in ANOTHER process can still report requests per
+		// render. Not counted itself, and never served to the page.
+		if (url.pathname === '/__stats') {
+			res.writeHead(200, { 'content-type': 'application/json' });
+			res.end(JSON.stringify(Object.fromEntries(requests)));
+			return;
+		}
 		count(url.pathname.replace(/\/\d+\.png$/, '/N.png'));
 
 		if (url.pathname === '/product/prd-bench' || url.pathname === '/') {

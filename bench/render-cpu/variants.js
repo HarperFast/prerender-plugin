@@ -302,13 +302,67 @@ export const VARIANTS = [
 	{
 		name: 'resource-cache-on',
 		why: 'the on-disk resource cache as deployed — measured against a cold browser, which is what it is actually replacing',
-		resourceCache: { enabled: true, dir: '/tmp/prerender-bench-cache' },
+		resourceCache: { enabled: true, dir: process.env.BENCH_CACHE_DIR || '/tmp/prerender-bench-cache' },
 	},
 	{
 		name: 'context-pool-plus-cache',
 		why: 'both caches together — do they compose or does one make the other redundant?',
 		contextPool: true,
-		resourceCache: { enabled: true, dir: '/tmp/prerender-bench-cache2' },
+		resourceCache: { enabled: true, dir: process.env.BENCH_CACHE_DIR2 || '/tmp/prerender-bench-cache2' },
+	},
+	{
+		// The resource-cache question at PRODUCTION resource counts. ~70 cacheable sub-resources per
+		// render is what a real storefront page costs; the default fixture's 11 is not enough to load
+		// a 4-thread libuv pool, so a null result there would prove nothing about the fleet.
+		name: 'cache-on-70',
+		why: 'the on-disk resource cache with 70 cacheable sub-resources per render — production shape for the read path',
+		urlQuery: 'chunks=69',
+		resourceCache: { enabled: true, dir: process.env.BENCH_CACHE_DIR || '/tmp/prerender-bench-cache' },
+	},
+	{
+		name: 'cache-off-70',
+		why: 'the same 70-sub-resource page with NO resource cache — the control the cache is judged against',
+		urlQuery: 'chunks=69',
+	},
+	{
+		name: 'context-pool-70',
+		why: "Chrome's own cache against the same 70-sub-resource page: does it make ours redundant?",
+		urlQuery: 'chunks=69',
+		contextPool: true,
+	},
+	{
+		name: 'context-pool-cache-70',
+		why: 'both caches, 70 sub-resources',
+		urlQuery: 'chunks=69',
+		contextPool: true,
+		resourceCache: { enabled: true, dir: process.env.BENCH_CACHE_DIR2 || '/tmp/prerender-bench-cache2' },
+	},
+	{
+		// Chrome's own DISK cache (and the V8 code cache that lives inside it) only exists for a
+		// persistent profile's default context. An incognito context's cache is in-memory by
+		// construction, so `--disk-cache-size` has never applied to a single production render — this
+		// row is what it would buy if it did.
+		name: 'udd-default-context',
+		why: "persistent --user-data-dir + the default (non-incognito) context: Chrome's disk cache and code cache survive even a browser restart",
+		browserOptions: { incognitoPages: false },
+		launch: { userDataDir: process.env.BENCH_UDD || '/tmp/prerender-bench-udd' },
+	},
+	{
+		name: 'udd-context-pool',
+		why: 'does a persistent profile compose with slot-scoped INCOGNITO contexts, or is the pool already the whole effect?',
+		contextPool: true,
+		launch: { userDataDir: process.env.BENCH_UDD2 || '/tmp/prerender-bench-udd2' },
+	},
+	{
+		name: 'default-context-pooled-pages',
+		why: 'the default context with no persistent profile — a temp-profile disk cache shared by every render in one browser lifetime',
+		browserOptions: { incognitoPages: false },
+	},
+	{
+		name: 'context-pool-no-wipe',
+		why: 'the pool WITHOUT the per-render cookie/storage wipe — prices the wipe itself, and is not shippable (renders would share a session)',
+		contextPool: true,
+		skipWipe: true,
 	},
 	{
 		name: 'reduced-motion',
