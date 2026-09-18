@@ -686,6 +686,19 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 			);
 		}
 	}
+	// A raw-cache interval longer than the TABLE's own expiration reclaims rows while they are still
+	// nominally servable — the row and its blob vanish, and the next request is a miss that silently
+	// re-fetches. The schema constant is 48h (schemas/schema.graphql, RawPage), and it cannot be
+	// configured, so this is the one raw-cache setting that can be made incoherent from config alone.
+	if (target.render.raw.enabled && target.render.raw.expiry === 'interval' && target.render.raw.expiryMs > 129600000) {
+		add(
+			'warn',
+			'render.raw.expiryMs',
+			`render.raw.expiryMs is ${target.render.raw.expiryMs}ms, within (or past) the RawPage table's own 48h ` +
+				`expiration — rows are reclaimed on that schedule regardless, so a longer interval does not extend ` +
+				`what is served, it just makes the last stretch of it a silent miss. Keep it comfortably under 48h.`
+		);
+	}
 	if (target.peerRescue.enabled && !target.peerRescue.token) {
 		// Inert, not open: both the rescue client and the endpoint fail closed without a token.
 		// Same shape as the renderNow finding — the operator asked for a feature that is not on.
