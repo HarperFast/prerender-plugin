@@ -44,6 +44,10 @@ export const CACHE_STATUS_COLORS = {
 	// (plugin v0.63.0). Coloured beside `invalidated` rather than beside `hit`: the two are the
 	// same population — pages a bulk invalidation touched — split into rescued and refused.
 	'verified': '#c9a7ff',
+	// A stored ORIGIN document answered it (plugin `render.raw`). Coloured apart from `hit`: it
+	// saved the origin round trip, so it belongs in the cache-served sum below, but nothing
+	// rendered it and it must not read as prerender coverage.
+	'raw': '#7fd4e8',
 	'miss': WARN,
 	'stale': PINK,
 	'invalidated': PURPLE,
@@ -63,11 +67,14 @@ export const CACHE_STATUS_COLORS = {
  * is NOT here: `miss`/`stale` (origin), `blob-*` (the local body failed AND no rescue landed, so
  * the request went to origin), `invalidated` (refused), `skip`/`bypass` (never consulted).
  */
-export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue']);
+// `raw` IS IN THIS SET, and leaving it out would not read as missing — it would read as a smaller
+// hit rate, exactly as `verified` did for one plugin release. A raw serve answered from storage and
+// cost the origin nothing, which is what this set means.
+export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw']);
 export const isCacheServed = (status) => CACHE_SERVED.has(status);
 
 /** Where the bytes came from (bot_serve.path). `origin` is the one offload counts against. */
-export const SOURCE_COLORS = { cache: OK, rendered: INFO, origin: WARN };
+export const SOURCE_COLORS = { cache: OK, rendered: INFO, raw: '#7fd4e8', origin: WARN };
 
 /** What became of a posted render result (render outcome.method). */
 export const OUTCOME_COLORS = {

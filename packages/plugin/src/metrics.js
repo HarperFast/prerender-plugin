@@ -89,6 +89,10 @@ const CACHE_STATUSES = Object.freeze([
 	'miss', // nothing cached under this key
 	'skip', // the cache was deliberately not consulted (renderNow / Cache-Control)
 	'bypass', // not a cacheable request at all (non-GET/HEAD)
+	// A stored ORIGIN document answered it (`render.raw`). A cache serve, and it counts toward
+	// offload — but NOT a prerendered one: no browser ran on it. Its own value so that "cache
+	// served" and "rendered coverage" stay different questions, and so `page_age` can exclude it.
+	'raw',
 	// A servable record whose blob body could not be read, so we served origin instead. Its own
 	// status rather than folding into 'miss': the key IS cached and correctly scheduled, and the
 	// two have different fixes — 'miss' means coverage, this means blob integrity (harper#2134).
@@ -118,6 +122,7 @@ const SERVE_SOURCES = Object.freeze([
 	'cache', // a stored snapshot answered it
 	'rendered', // an on-demand render landed inside the renderNow timeout
 	'origin', // proxied live to the origin — the request the offload number counts against
+	'raw', // a stored origin document (render.raw) — saved the round trip, but nothing rendered it
 ]);
 
 const DEVICE_TYPES = Object.freeze(['desktop', 'mobile', 'tablet']);
@@ -427,7 +432,8 @@ export const METRICS = Object.freeze({
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
-			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated)',
+			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
+			'per raw-document store attempt (raw_cache)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -464,6 +470,13 @@ export const METRICS = Object.freeze({
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
 			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
 			'render rotation", the corpus growth the gate is preventing. ' +
+			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, or the reason it ' +
+			'was refused (not-200, staging, has-cookie, content-type, no-store, no-body, oversize, ' +
+			'capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is enabled and ' +
+			'filling nothing is indistinguishable from one that is switched off unless the reason is recorded. ' +
+			'oversize climbing means render.raw.maxBytes is below the route’s real document size; has-cookie ' +
+			'climbing means the origin is personalizing a route that was assumed to be shared, which is the one ' +
+			'outcome worth an alert. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
@@ -752,6 +765,18 @@ export const metrics = Object.freeze({
 	/** A cacheable miss the discovery gate held out of target creation — a prerender_ops series. */
 	discoveryGated: (reason, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'discovery_gated', reason, botName ?? null),
+
+	/**
+	 * One raw-document store attempt and what became of it — a prerender_ops series.
+	 *
+	 * `outcome` is `stored` or the reason it was not: `not-200`, `staging`, `has-cookie`,
+	 * `content-type`, `no-store`, `no-body`, `oversize`, `capture-failed`, `write-failed`. Counting
+	 * the refusals is the point, not the successes: a route that is enabled and filling nothing looks
+	 * identical to one that is disabled unless the reason is recorded. `oversize` climbing is the
+	 * signal to revisit `render.raw.maxBytes`; `has-cookie` climbing means the origin is personalizing
+	 * a route that was assumed shared.
+	 */
+	rawCache: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'raw_cache', outcome, null),
 
 	/**
 	 * One result posted in the single-device shape for a job that asked for several — a renderer

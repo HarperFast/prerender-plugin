@@ -104,7 +104,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				[],
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
-					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number }.\n\n' +
+					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
+					'rawCache?: boolean }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -166,7 +167,14 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'rotation; the sitemap pipeline is unaffected, so declared URLs on the route still schedule. ' +
 					'NOTE: flipping this false stops NEW targets only. Existing discovered targets keep rendering ' +
 					'until deleted — see the discovery-purge admin action, and gate BEFORE purging or crawlers ' +
-					're-mint what the purge removes.',
+					're-mint what the purge removes.\n\n' +
+					'`rawCache` (default false, prerender routes only, requires `render.raw.enabled`) — whether a ' +
+					'MISS on this route stores the origin document it just fetched, so the next crawler asking ' +
+					'for that URL is a cache hit instead of another origin round trip. It replaces an origin ' +
+					'proxy, never a render: a stale or invalidated snapshot still proxies live. Pair it with ' +
+					'`discoverTargets: false` — gated URLs are exactly the population this is for, and gating ' +
+					'without it leaves them missing on every request forever. Enable it only on a route whose ' +
+					'server-rendered document already carries its SEO surface; see `render.raw`.',
 				{ itemType: 'object' }
 			),
 			discoveryBots: option(
@@ -1283,7 +1291,85 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
-	render: group('Render scheduling: cadence, failure handling, and schedule repair.', {
+	render: group('Render scheduling: cadence, failure handling, schedule repair, and raw-document caching.', {
+		raw: group(
+			'RAW-DOCUMENT CACHING. Cache the origin document a miss already fetched, for URLs that are not ' +
+				'in the render rotation — no browser, no render capacity, no second origin request.\n\n' +
+				'THE PROBLEM IT SOLVES. On a large catalog the crawlable URL space is far bigger than the ' +
+				'corpus worth rendering: facet and parameter combinations a bot invents by following links own ' +
+				'no target, are never scheduled, and therefore MISS ON EVERY REQUEST. Measured on one ' +
+				'deployment, 89.8% of requests to the listing route were exactly that — each one an origin ' +
+				'fetch for a document the origin had already served, minutes earlier, to a different crawler. ' +
+				'Caching it turns those misses into hits at the cost of one write.\n\n' +
+				'WHEN IT IS THE RIGHT ANSWER: a route whose SERVER-RENDERED document already carries its whole ' +
+				'SEO surface — title, meta description, canonical, JSON-LD offers, the product grid — so the ' +
+				'render adds only interactive chrome. Verify that for a route before enabling it on that route; ' +
+				'a raw document is NOT a rendered snapshot and this setting will not tell you the difference.\n\n' +
+				'IT ONLY EVER REPLACES AN ORIGIN PROXY, never a render and never a cached snapshot. A raw page ' +
+				'is read only when `PrerenderedPage` held nothing at all — a true miss. A stale or invalidated ' +
+				'snapshot means a render is coming and the LIVE origin is the better answer, so those keep ' +
+				'proxying exactly as before. Raw serves are reported under their own cache status, so ' +
+				'`bot_serve` and `page_age` keep meaning what they meant.\n\n' +
+				'Off by default, and off for every route until a route opts in with `rawCache: true`.',
+			{
+				enabled: option(false, 'Master switch. Off = nothing is stored, nothing is read, no extra reads.'),
+				maxBytes: option(
+					1048576,
+					'Largest document to store, in bytes AS THE ORIGIN SENT IT — which is compressed (the ' +
+						'origin is asked for gzip), so this bounds memory and storage rather than the decompressed ' +
+						'size a search engine sees. Over the cap the document is served and NOT stored, and the ' +
+						'capture is abandoned so nothing further is buffered for it.\n\n' +
+						'BUDGET ~2x THIS PER IN-FLIGHT CAPTURE, not 1x. A capture holds one copy of the bytes, and ' +
+						'the `tee()` retains a second for the branch the crawler has not read yet — measured with a ' +
+						'stalled reader, a 768 KB document held 1.5 MB. The total is bounded by ' +
+						'`maxConcurrentCaptures`, so the worst case is roughly `2 x maxBytes x maxConcurrentCaptures` ' +
+						'per worker.',
+					{ unit: 'bytes', min: 1 }
+				),
+				maxConcurrentCaptures: option(
+					16,
+					'How many responses may be captured at once, per worker. Past it a response is served ' +
+						'without being stored.\n\n' +
+						'THIS EXISTS BECAUSE CAPTURING REMOVES BACKPRESSURE. Without a capture a slow client costs ' +
+						'socket buffers — the reader stops, the TCP window closes, and the ORIGIN holds the data. ' +
+						'The capture reads in a tight loop, so it drains the origin at full speed however slowly ' +
+						'the client reads, and this worker’s heap becomes the buffer instead. On a route that is ' +
+						'mostly misses, a client opening many connections and reading slowly would otherwise have a ' +
+						'heap lever it controls. Degrading to "this one is not stored" costs nothing — the next ' +
+						'request stores it — while degrading to heap pressure takes the serve path down with it.',
+					{ min: 1 }
+				),
+				expiry: option(
+					'midnight',
+					'When a stored document goes stale: `midnight` (the next local midnight in ' +
+						'`expiryTimezone`) or `interval` (use `expiryMs`).\n\n' +
+						'`midnight` EXISTS FOR STEP-CHANGE ORIGINS. Where a catalog reprices at a fixed hour rather ' +
+						'than drifting continuously, an interval is the wrong shape: a document fetched at 23:00 ' +
+						'with a 6h TTL serves post-change prices for five hours, while one fetched at 01:00 expires ' +
+						'long before anything about it has changed. Aligning expiry to the change boundary makes ' +
+						'every stored document correct for exactly as long as it is correct, and no longer.\n\n' +
+						'There is no herd to spread: raw pages refill on demand, one request at a time, so expiring ' +
+						'a whole route at once produces misses at the rate crawlers actually arrive.',
+					{ enum: ['midnight', 'interval'] }
+				),
+				expiryMs: option(
+					21600000,
+					'Lifetime of a stored document when `expiry` is `interval`. Ignored under `midnight`.\n\n' +
+						'SEPARATE FROM `expiry` ON PURPOSE. The two used to be one option accepting either the ' +
+						'string `midnight` or a number of milliseconds — which the config merge cannot express: it ' +
+						'type-checks every value against its default, so a numeric override of a string-defaulted ' +
+						'option was REJECTED with one log line and the default silently kept. The documented ' +
+						'setting did nothing.',
+					{ unit: 'ms', min: 1 }
+				),
+				expiryTimezone: option('UTC', 'IANA timezone `expiry: midnight` is resolved in.', { nonEmpty: true }),
+				contentTypes: option(
+					['text/html'],
+					'Content types eligible for storage, matched against the leading type of the response ' +
+						'`content-type` (parameters ignored). Anything else is served and not stored.'
+				),
+			}
+		),
 		defaultInterval: option(
 			DAY,
 			'How often a target is re-rendered when nothing more specific applies. Cadence is relative to ' +
