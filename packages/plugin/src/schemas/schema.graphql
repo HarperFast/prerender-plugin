@@ -510,7 +510,15 @@ type VisitFilter @table(database: "crawl_stats") {
 #
 # DELIBERATELY NOT `@export`: a REST write verb here would let anything put arbitrary bytes under a
 # cache key that the serve path then hands to crawlers. The only writer is the miss path.
-type RawPage @table(database: "raw_cache", expiration: 604800) @sealed {
+# EXPIRATION IS 48h, NOT the 7 days this shipped with, and the two expiries are different things:
+# `expiresAt` below is when a row stops being SERVED (config `render.raw.expiry`, typically the next
+# local midnight, so <=24h), while this is when the row and its blob are RECLAIMED. At 7 days a row
+# sat in storage for six days after it could no longer answer anything — ~3.5x the footprint for no
+# benefit, replicated to every node. 48h leaves a full day of slack past a midnight expiry.
+#
+# It is a schema constant, so it bounds `render.raw.expiryMs` too: configure an interval longer than
+# this and rows are reclaimed while still nominally servable. config.js warns about that.
+type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 	cacheKey: String @primaryKey
 	statusCode: Int!
 	# The origin's own response headers, filtered to `sanitizeOriginResponseHeaders`'s allowlist —
