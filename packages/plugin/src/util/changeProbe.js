@@ -141,7 +141,8 @@ const newStats = () => ({
 	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
 	unchanged: 0,
 	changed: 0,
-	queued: 0, // changes handed to the trigger queue (accepted, not necessarily settled yet)
+	queued: 0, // changes handed to the trigger queue by THIS pass (accepted, not necessarily settled)
+	triggerQueuePending: 0, // still queued when the pass ended — the drain outlives the pass
 	triggered: 0, // changes that scheduled a re-render — merged from the queue after it drains
 	deferred: 0, // changes past maxTriggersPerSweep, or refused by a full queue — signature kept stale so the next pass retries
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
@@ -313,6 +314,45 @@ const probeOnce = async (rule, url) => {
  * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
  * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
+/**
+ * The sweep's trigger queue, created once and kept for the life of the process.
+ *
+ * MODULE-SCOPED BECAUSE THE DRAIN OUTLIVES THE PASS. A pass can detect changes faster than the
+ * bounded drain places them (probing at the ceiling with a high change rate does exactly that), and
+ * the alternative to carrying the remainder forward is dropping it — which throws away an origin
+ * read already paid for and re-buys it on the next pass, a full day later in anchored mode.
+ *
+ * Rebuilt only when the knobs change, so a live config edit takes effect without losing what is
+ * already queued.
+ */
+let triggerQueue = null;
+let triggerQueueKey = null;
+const sweepTriggers = () => {
+	const { ratePerSecond, concurrency, maxPending } = config.changeProbe.trigger;
+	const key = `${ratePerSecond}|${concurrency}|${maxPending}`;
+	if (triggerQueue && triggerQueueKey === key) return triggerQueue;
+	// A rebuild inherits nothing: the old queue's pending items were never baselined, so the next
+	// pass re-detects them. Stopping it prevents two queues draining at once at double the rate.
+	triggerQueue?.stop();
+	triggerQueueKey = key;
+	triggerQueue = createTriggerQueue({
+		trigger: triggerRevalidate,
+		write: writeSignature,
+		maxPending,
+		ratePerSecond,
+		concurrency,
+		onError: (e, item) => logger.error(e, `[prerender] change-probe trigger failed for ${item.row.url}`),
+	});
+	return triggerQueue;
+};
+
+/** Drop the queue — probe disabled, or a test resetting module state. */
+export const resetTriggerQueue = () => {
+	triggerQueue?.stop();
+	triggerQueue = null;
+	triggerQueueKey = null;
+};
+
 export const triggerRevalidate = async (row) => {
 	const keys = cacheKeysOf(row.url);
 	const hardExpiredAt = Date.now() - config.page.swrTtl;
@@ -703,11 +743,14 @@ export const runProbePass = async ({
 			await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
 			return;
 		}
-		if (stats.queued >= maxTriggers) {
-			// Budget spent: leave the signature STALE so the next pass re-detects and retries.
-			// Bounds how much queue injection one pass can do (a mass change is the canary's job).
-			// Counted on ACCEPTANCE, not completion: the budget has to be decided synchronously here
-			// or a burst would race past it while earlier triggers were still settling.
+		// A per-pass ceiling, and by default there ISN'T ONE (0 = unlimited). Deferring used to be the
+		// routine outcome of a busy pass, and it is a bad trade: the origin read that proved this URL
+		// changed has already been paid for, and dropping the result throws that away and re-buys it
+		// next pass — which in anchored mode is a DAY later. The render queue is itself a backlog; a
+		// trigger files a row and the fleet drains it at whatever rate it can. So the default is to
+		// queue everything and let that queue do the absorbing, with the drain rate bounding how fast
+		// the writes land rather than whether they land at all.
+		if (maxTriggers > 0 && stats.queued >= maxTriggers) {
 			stats.deferred++;
 			return;
 		}
@@ -1069,17 +1112,8 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		let unreadable = 0;
 		let yields = 0;
-		// Triggers drain BESIDE the walk, not inside it. `submit` returns immediately, so the pass
-		// runs at its probe-rate floor whatever the change rate — see util/triggerQueue.js for the
-		// feedback loop this breaks.
-		const triggers = createTriggerQueue({
-			trigger: triggerRevalidate,
-			write: writeSignature,
-			maxPending: config.changeProbe.trigger.maxPending,
-			ratePerSecond: config.changeProbe.trigger.ratePerSecond,
-			concurrency: config.changeProbe.trigger.concurrency,
-			onError: (e, item) => logger.error(e, `[prerender] change-probe trigger failed for ${item.row.url}`),
-		});
+		// Triggers drain BESIDE the walk, and OUTLIVE it — see `sweepTriggers`.
+		const triggers = sweepTriggers();
 		const stats = await runProbePass({
 			rows: walkTargets(config.changeProbe.chunkSize, () => {
 				unreadable++;
@@ -1104,7 +1138,10 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 				// `stats` in the temporal dead zone while this callback runs, so touching it here
 				// throws a ReferenceError rather than reading undefined.
 				yields++;
-				await beat({ examinedApprox: yields * YIELD_EVERY });
+				// Queue depth rides the heartbeat so the queue is visible WHILE the pass runs. Without
+				// it the only reading came from a finished pass, which is useless for a drain whose
+				// whole purpose is to outlive the pass.
+				await beat({ examinedApprox: yields * YIELD_EVERY, triggerQueuePending: triggers.depth });
 			},
 			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
 			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
@@ -1112,14 +1149,23 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 		});
-		// A cancelled pass abandons what is still queued: those rows never had their baseline
-		// written, so the next pass re-detects them. Otherwise wait the queue out — the pass is not
-		// finished while re-renders it decided on are still unfiled, and `triggered` would under-report.
-		if (stats.aborted) triggers.stop();
-		await triggers.drain();
+		// THE PASS DOES NOT WAIT FOR THE QUEUE. Draining is bounded by `trigger.ratePerSecond`, so a
+		// pass that detected more change than the drain can place would otherwise be held open by it
+		// — and in anchored mode a pass still running at the next anchor causes that anchor to be
+		// SKIPPED, turning a busy night into a missed one. The queue keeps going after the pass ends
+		// and the next pass adds to it.
+		//
+		// An aborted pass does NOT stop the queue either: what is already in it was genuinely
+		// detected and its baseline is unwritten, so draining it is still the right thing. Only
+		// disabling the probe clears it.
+		//
+		// `triggered`/`errors` are therefore CUMULATIVE counters read at pass end, not per-pass
+		// totals — a trigger submitted by this pass may settle during the next. `queued` is the
+		// honest per-pass number, and `triggerQueuePending` says how much of it had not landed yet.
 		stats.triggered = triggers.stats.triggered;
 		stats.errors = triggers.stats.errors;
 		stats.triggerQueueDepth = triggers.stats.maxDepth;
+		stats.triggerQueuePending = triggers.depth;
 		stats.unreadable = unreadable;
 		// An interrupted pass keeps the OLD cohorts — a partial walk's sample covers only the key
 		// range it reached, and the chained reseed rebuilds them properly.
@@ -1724,6 +1770,7 @@ export const __passLimitsForTest = passLimits;
 
 /** Tests only — module state that outlives a beforeEach. */
 export const resetChangeProbeState = () => {
+	resetTriggerQueue();
 	clearProbeTimers();
 	schedulerStarted = false;
 	armedSweep = armedCanary = null;

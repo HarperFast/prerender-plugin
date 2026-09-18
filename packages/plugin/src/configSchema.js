@@ -1200,21 +1200,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 					concurrency: option(4, 'Triggers in flight at once.', { min: 1 }),
 					maxPending: option(
-						5000,
-						'Queue depth before submissions are refused and counted as `deferred`. Bounds memory ' +
-							'across a pass that can detect hundreds of thousands of changes; it is NOT the ' +
-							'per-pass budget, which stays `maxTriggersPerSweep`.',
+						50000,
+						'Queue depth before submissions are refused. THE ONLY REMAINING BOUND once ' +
+							'`maxTriggersPerSweep` is off, and it is a MEMORY bound rather than a policy one: an ' +
+							'entry carries the observed signature, so at ~1.4 KB each, 50,000 pending is ~70 MB ' +
+							'per node. Sized so it does not bind in normal operation — a refusal is an OVERLOAD ' +
+							'ALARM saying the drain has fallen far behind detection, not a routine outcome. ' +
+							'Watch `probe_trigger_queue_depth` against it, and raise `trigger.ratePerSecond` ' +
+							'rather than this if it sits steadily close.',
 						{ min: 1 }
 					),
 				}
 			),
 			maxTriggersPerSweep: option(
-				5000,
-				'Ceiling on re-renders one sweep pass may file (per node). Changes past it stay detected but ' +
-					'DEFERRED — the signature is left stale so the next pass retries — bounding how much queue ' +
-					'injection a widespread change can cause. A genuinely mass change is the canary’s job, where ' +
-					'one invalidation row replaces thousands of due-now writes.',
-				{ min: 1 }
+				0,
+				'Ceiling on changes one pass may SUBMIT for re-render (per node). `0`, the default, means no ' +
+					'ceiling.\n\n' +
+					'This used to default to a finite number and drop everything past it, counting the remainder ' +
+					'as `deferred` with its signature left stale so a later pass would re-detect it. That is a ' +
+					'bad trade and the default is now off: the origin read that proved the URL changed has ' +
+					'already been paid for, and discarding the result re-buys it on the next pass — which in ' +
+					'`anchored` mode is a DAY later. The render queue is itself a backlog, so a trigger files a ' +
+					'row and the fleet drains it at whatever rate it can; `trigger.ratePerSecond` bounds how ' +
+					'fast those writes land, not whether they land at all.\n\n' +
+					'Set a finite value only to cap what ONE pass may inject — while sizing a new rule, say, ' +
+					'where a mistake would otherwise queue the whole corpus. A genuinely mass change is the ' +
+					'canary’s job, where one invalidation row replaces thousands of due-now writes.',
+				{ min: 0 }
 			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',

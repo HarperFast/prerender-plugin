@@ -301,6 +301,24 @@ test('past the trigger budget a change DEFERS: signature left stale so the next 
 	assert.deepEqual(written, [{ url: URL_A, signature: '[2]' }]);
 });
 
+test('maxTriggers 0 means NO ceiling: nothing is deferred, everything is queued', async () => {
+	// The default. Deferring throws away an origin read already paid for and re-buys it next pass —
+	// a day later in anchored mode — so the render queue, which is itself a backlog, absorbs the
+	// volume instead. `trigger.ratePerSecond` bounds how fast the writes land, not whether they do.
+	const { stats, written, triggered } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		answers: { [URL_A]: '[2]', [URL_B]: '[2]', [URL_C]: '[2]' },
+		maxTriggers: 0,
+		concurrency: 1,
+	});
+	assert.equal(stats.deferred, 0, 'no change may be dropped when there is no ceiling');
+	assert.equal(stats.queued, 3, 'every detected change was accepted');
+	assert.equal(stats.triggered, 3);
+	assert.deepEqual(triggered.sort(), [URL_A, URL_B, URL_C].sort());
+	assert.equal(written.length, 3, 'and each got its baseline, after its trigger');
+});
+
 test('a failed trigger keeps the signature stale too', async () => {
 	// The property is unchanged by the move to a submitted trigger; only the seam moved. Driven
 	// through the REAL inline shape rather than a stub, because the ordering under test — baseline
