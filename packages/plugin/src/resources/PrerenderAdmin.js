@@ -99,7 +99,13 @@ import {
 	MAX_REASON_LENGTH,
 	CLUSTER_SCOPE as CLUSTER_INVALIDATION,
 } from '../util/invalidation.js';
-import { inspectRoutes, resolveEffectiveInterval, routeScopes, routeScopeForUrl } from '../util/routeClass.js';
+import {
+	explainCadence,
+	inspectRoutes,
+	resolveEffectiveInterval,
+	routeScopes,
+	routeScopeForUrl,
+} from '../util/routeClass.js';
 import { CLUSTER_SCOPE } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
@@ -1481,6 +1487,11 @@ export class PrerenderAdmin extends Resource {
 						'sitemapUrl',
 						'schedulerNode',
 						'renderInterval',
+						// The demand ladder's stored rung. Selected for the `cadence` block below, and
+						// WITHOUT IT THIS VIEW CANNOT EXPLAIN ITS OWN SUBJECT: the rung is what
+						// `resolveEffectiveInterval` actually schedules from, so a view that reports
+						// `renderInterval` and omits this reports the ceiling as if it were the cadence.
+						'demandInterval',
 						'state',
 						'suppressedReason',
 						'suppressedAt',
@@ -1557,6 +1568,11 @@ export class PrerenderAdmin extends Resource {
 
 		return json({
 			...explanation,
+			// How this URL's render cadence resolves, with every input and the clamp that decided it.
+			// Null when there is no target: cadence is a property of a URL in the rotation, and
+			// reporting the route's interval for a URL that owns no target would read as a schedule
+			// that does not exist. See `explainCadence` for why this is worth a block of its own.
+			cadence: target ? explainCadence(canonicalUrl, target) : null,
 			rows: {
 				renderTarget: target ?? null,
 				// Already described (locally or by the owner) — see above.

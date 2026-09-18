@@ -527,6 +527,61 @@ export const demandFloorFor = (url) => entryFloor(classifyUrl(url).entry);
  * ladder re-decides. The ladder will snap it into the floored list on its next decision; until
  * then this must not credit a cadence the ladder no longer grants.
  */
+/**
+ * The whole cadence resolution for one URL, as data — every input, which one won, and what
+ * clamped it.
+ *
+ * WHY THIS EXISTS, and why it lives HERE rather than in the admin view that renders it. The
+ * resolution has four inputs (route interval, stored interval, default, ladder rung) and two
+ * clamps (the route's `demandFloor`, the route's own interval as a ceiling), and the answer is
+ * routinely NONE of the numbers an operator can see. A deployment whose PDP route reads
+ * `renderInterval: 96h` was measured rendering every 48h, because 95.7% of its targets carried a
+ * rung and the route's `demandFloor: 48h` clamped every one of them to exactly the floor — so the
+ * configured ceiling never bound, the knob named "floor" was the real cadence, and the only way to
+ * discover that was to read `Target.demandInterval` out of the table by hand for a sample of URLs
+ * and work the algebra backwards. That is a diagnosis nobody should have to repeat.
+ *
+ * It is DERIVED FROM THE SAME FUNCTIONS THE SCHEDULER USES, never recomputed alongside them. A
+ * second implementation of this algebra would be a second thing to keep correct, and the failure
+ * it produces is the worst kind available to a diagnostic: a view that confidently explains a
+ * cadence the scheduler is not using.
+ *
+ * `clampedBy` is the field to read first:
+ *   'floor'   — the ladder wanted this page faster and the route's demandFloor refused. Seeing this
+ *               on most of a route means the ladder has no dynamic range there at all.
+ *   'ceiling' — the stored rung is slower than the route allows, so the route's interval won. A
+ *               rung outliving a lowered route interval looks like this.
+ *   null      — no rung; the base interval is the cadence.
+ */
+export const explainCadence = (url, target = {}) => {
+	const { entry } = classifyUrl(url);
+	const storedInterval = target?.renderInterval ?? null;
+	const base = baseInterval(entry, storedInterval);
+	const floor = entryFloor(entry);
+	const rung = Number(target?.demandInterval);
+	const hasRung = Number.isFinite(rung) && rung > 0;
+	const floored = hasRung && floor !== null ? Math.max(rung, floor) : hasRung ? rung : null;
+
+	return {
+		effectiveInterval: resolveEffectiveInterval(url, target ?? {}),
+		// Which input supplied the BASE — the ceiling the ladder is clamped into. `baseInterval`
+		// resolves route > stored > default, so this mirrors that order rather than re-deriving it.
+		baseFrom:
+			entry && entry.renderInterval !== null && entry.renderInterval !== undefined
+				? 'route'
+				: Number.isFinite(Number(storedInterval)) && Number(storedInterval) > 0
+					? 'stored'
+					: 'default',
+		baseInterval: base,
+		routeInterval: entry?.renderInterval ?? null,
+		storedInterval,
+		defaultInterval: config.render.defaultInterval,
+		demandInterval: hasRung ? rung : null,
+		demandFloor: floor,
+		clampedBy: !hasRung ? null : floored > rung ? 'floor' : base < floored ? 'ceiling' : null,
+	};
+};
+
 export const resolveEffectiveInterval = (url, { renderInterval, demandInterval } = {}) => {
 	const { entry } = classifyUrl(url);
 	const base = baseInterval(entry, renderInterval);

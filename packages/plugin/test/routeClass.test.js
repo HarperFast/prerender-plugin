@@ -13,6 +13,7 @@ import {
 	PASSTHROUGH,
 	PRERENDER,
 	UNCLASSIFIED,
+	explainCadence,
 } from '../src/util/routeClass.js';
 
 const ROUTES = [
@@ -396,4 +397,78 @@ test('resolveEffectiveInterval clamps a stored rung UP to the route demandFloor'
 	);
 	// Unset rung stays at the ceiling regardless of the floor.
 	assert.equal(resolveEffectiveInterval(catalog, {}), DAY_MS);
+});
+
+// ---- explainCadence -------------------------------------------------------------------------
+//
+// The resolution has four inputs and two clamps, and the answer is routinely none of the numbers
+// an operator can see. These pin the case that actually cost a day of diagnosis on a production
+// cluster, plus the two ways it can be misread.
+
+const PDP = 'https://example.com/product/prd-1/thing.jsp';
+
+test('explainCadence: demandFloor EQUAL to the slowest rung collapses every graded page onto the floor', () => {
+	// The production shape: route says 96h, ladder rungs top out at 48h, floor is 48h. Every rung
+	// clamps up to 48h, the 96h ceiling never binds, and the knob named "floor" IS the cadence.
+	forwarded({
+		ingress: {
+			routes: [{ match: 'prefix', path: '/product/prd-', renderInterval: 96 * HOUR_MS, demandFloor: 48 * HOUR_MS }],
+		},
+	});
+	for (const rung of [6, 12, 24, 48]) {
+		const c = explainCadence(PDP, { renderInterval: 24 * HOUR_MS, demandInterval: rung * HOUR_MS });
+		assert.equal(c.effectiveInterval, 48 * HOUR_MS, `rung ${rung}h should resolve to the 48h floor`);
+		assert.equal(c.baseInterval, 96 * HOUR_MS, 'the route still supplies the base');
+		assert.equal(c.baseFrom, 'route');
+	}
+	// Only the rungs the floor actually raised report `floor`; a rung already at the floor was not
+	// clamped by anything, and saying otherwise would overstate what the floor is doing.
+	assert.equal(explainCadence(PDP, { demandInterval: 6 * HOUR_MS }).clampedBy, 'floor');
+	assert.equal(explainCadence(PDP, { demandInterval: 48 * HOUR_MS }).clampedBy, null);
+});
+
+test('explainCadence: a rung slower than the route reports the ceiling, not the floor', () => {
+	// A rung outliving a lowered route interval looks like this.
+	forwarded({
+		ingress: { routes: [{ match: 'prefix', path: '/product/prd-', renderInterval: 24 * HOUR_MS }] },
+	});
+	const c = explainCadence(PDP, { demandInterval: 96 * HOUR_MS });
+	assert.equal(c.effectiveInterval, 24 * HOUR_MS);
+	assert.equal(c.clampedBy, 'ceiling');
+	assert.equal(c.demandInterval, 96 * HOUR_MS, 'the stale rung is still reported, not hidden');
+});
+
+test('explainCadence: with no rung the base is the cadence, and its source is named', () => {
+	forwarded({ ingress: { routes: [{ match: 'prefix', path: '/product/prd-' }] } });
+
+	const stored = explainCadence(PDP, { renderInterval: 6 * HOUR_MS });
+	assert.equal(stored.effectiveInterval, 6 * HOUR_MS);
+	assert.equal(stored.baseFrom, 'stored');
+	assert.equal(stored.clampedBy, null);
+	assert.equal(stored.demandInterval, null);
+
+	const fallback = explainCadence(PDP, {});
+	assert.equal(fallback.baseFrom, 'default');
+	assert.equal(fallback.effectiveInterval, config.render.defaultInterval);
+});
+
+test('explainCadence never disagrees with the resolver the scheduler actually uses', () => {
+	// The whole hazard of a diagnostic that recomputes: a view that confidently explains a cadence
+	// the scheduler is not using. Cross-check the reported value against resolveEffectiveInterval
+	// across the matrix rather than trusting that the two implementations stayed in step.
+	forwarded({
+		ingress: {
+			routes: [{ match: 'prefix', path: '/product/prd-', renderInterval: 96 * HOUR_MS, demandFloor: 48 * HOUR_MS }],
+		},
+	});
+	for (const renderInterval of [null, 6 * HOUR_MS, 24 * HOUR_MS]) {
+		for (const demandInterval of [null, 6 * HOUR_MS, 48 * HOUR_MS, 96 * HOUR_MS]) {
+			const target = { renderInterval, demandInterval };
+			assert.equal(
+				explainCadence(PDP, target).effectiveInterval,
+				resolveEffectiveInterval(PDP, target),
+				`disagreed for ${JSON.stringify(target)}`
+			);
+		}
+	}
 });
