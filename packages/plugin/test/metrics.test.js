@@ -304,3 +304,44 @@ test('describeMetrics is JSON-serializable and covers both the plugin and the bu
 	described.plugin[0].summary = 'mutated';
 	assert.notEqual(Object.values(METRICS)[0].summary, 'mutated');
 });
+
+test('render_readiness puts the series in the path slot and the contract in the method slot', () => {
+	const v = emitted(() => metrics.renderReadiness('product', 'unsatisfied'));
+	assert.deepEqual(v, {
+		value: true,
+		metric: 'render_readiness',
+		path: 'verdict',
+		method: 'product',
+		type: 'unsatisfied',
+	});
+
+	const u = emitted(() => metrics.renderReadinessUnmet('product', 'rails-filled'));
+	assert.deepEqual([u.metric, u.path, u.method, u.type], ['render_readiness', 'unmet', 'product', 'rails-filled']);
+
+	const s = emitted(() => metrics.renderReadinessShortfall('product', 'product-links'));
+	assert.deepEqual([s.metric, s.path, s.method, s.type], ['render_readiness', 'shortfall', 'product', 'product-links']);
+
+	// The only series carrying a measurement rather than a count, and the one `timeoutMs` is tuned from.
+	const ms = emitted(() => metrics.renderReadinessMs(1629, 'product'));
+	assert.deepEqual(
+		[ms.value, ms.metric, ms.path, ms.method, ms.type],
+		[1629, 'render_readiness', 'satisfied_ms', 'product', null]
+	);
+});
+
+test('every render_readiness series and verdict the emitters can produce is declared', () => {
+	const declared = METRICS.render_readiness.dimensions;
+	for (const emit of [
+		() => metrics.renderReadiness('c', 'satisfied'),
+		() => metrics.renderReadinessUnmet('c', 'x'),
+		() => metrics.renderReadinessShortfall('c', 'x'),
+		() => metrics.renderReadinessMs(1, 'c'),
+	]) {
+		assert.ok(declared.path.values.includes(emitted(emit).path), 'undeclared series');
+	}
+	// The verdict enumeration is closed; the clause/observation names in the same slot are not, which
+	// is why the catalog says the enumeration applies to the verdict series only.
+	for (const verdict of ['satisfied', 'unsatisfied', 'rebaselined']) {
+		assert.ok(declared.type.values.includes(emitted(() => metrics.renderReadiness('c', verdict)).type));
+	}
+});

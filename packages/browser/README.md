@@ -439,6 +439,21 @@ should exist and the rendered DOM is held to it.
   waiting out the timeout on every render forever; without that valve one unsatisfiable clause
   measured +385% wall.
 
+- **Cap `timeoutMs` low.** A contract that does not satisfy pays its whole timeout **and then the
+  full fallback settle on top**, and it costs CPU rather than only wall, because the page keeps
+  executing while the poll runs. Measured on a concurrency ladder: with a 15s timeout, one render in
+  twelve under contention took 10.8s and CPU/render rose 36%; at 3s the straggler was 4.8s and CPU
+  rose 12%, with the median render unchanged either way. Erring low is the safe direction — giving up
+  early falls back to exactly what the renderer does without a contract, so a too-low timeout costs
+  the optimisation and never the content. Set it from the `firstSatisfiedMs` distribution the results
+  carry rather than from a guess; if p95 approaches the timeout, the contract is being abandoned
+  under load and the win is quietly gone.
+
+Note this is a different failure from the rot valve above, and needs its own control: `unmetGraceMs`
+fires when a clause has never been true **and the page has gone quiet**, which is what a template
+change looks like. A page that is merely slow is still mutating, so the valve does not fire and the
+timeout is what bounds the wait.
+
 An unsatisfied contract always falls through to the normal settle, so a badly written contract can
 cost a render time but never content. `job.readiness` carries `satisfied`, per-clause `ok`/`count`/
 `firstTrueMs`, and any `observe` counts.

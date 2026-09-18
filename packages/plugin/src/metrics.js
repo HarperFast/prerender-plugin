@@ -348,6 +348,52 @@ export const METRICS = Object.freeze({
 		},
 	}),
 
+	render_readiness: metric('render_readiness', {
+		kind: 'value',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence: 'per device variant of a posted result that a readiness contract governed; nothing when none did',
+		summary: 'What each page type\u2019s completeness contract said about the renders it governed.',
+		usefulFor:
+			'THE POINT OF CONTRACTS IS THAT AN INCOMPLETE RENDER BECOMES VISIBLE, and this is where it becomes ' +
+			'visible. `verdict` is the share of renders that finished complete — a rising `unsatisfied` share is ' +
+			'the fleet telling you it is storing pages that are missing something, which no other signal here ' +
+			'can say (those renders are 200, non-empty and indexable). `unmet` names the CLAUSE, so a contract ' +
+			'that has rotted against a template change shows up as one clause failing across every render of ' +
+			'its page type instead of as a silent slowdown. `satisfied_ms` is how `timeoutMs` should be tuned: ' +
+			'if its p95 approaches the configured timeout the contract is being abandoned under load and the ' +
+			'optimisation is quietly gone.',
+		caveats:
+			'`unmet` emits once per failing clause, so it does NOT sum to renders — read it against the ' +
+			'`unsatisfied` count in `verdict`. A clause that a guard decided did not apply is not unmet and is ' +
+			'not counted; that distinction is the difference between "checked and failed" and "nothing to ' +
+			'check". `shortfall` is a comparison against what this URL last produced, so it is silent on a ' +
+			'first render and after a rebaseline.',
+		gatedBy: 'a readiness contract matching the rendered URL (config.readiness)',
+		dimensions: {
+			path: {
+				name: 'series',
+				values: ['verdict', 'unmet', 'shortfall', 'satisfied_ms'],
+				description:
+					'verdict = counter of how the contract ended. unmet = counter, one per clause that did not ' +
+					'hold. shortfall = counter, one per observation that fell far below this URL\u2019s history. ' +
+					'satisfied_ms = distribution of how long the contract took to first hold.',
+			},
+			method: {
+				name: 'contract',
+				description: 'The contract\u2019s configured name — i.e. the page type, as the config defines it.',
+			},
+			type: {
+				name: 'verdict (verdict) / clause (unmet) / observation (shortfall)',
+				values: ['satisfied', 'unsatisfied', 'rebaselined'],
+				description:
+					'verdict: satisfied | unsatisfied | rebaselined (the observation shortfalls repeated often ' +
+					'enough to be the page\u2019s new shape). unmet/shortfall: the configured clause or ' +
+					'observation name, so the enumeration above applies to the verdict series only. Null on ' +
+					'satisfied_ms.',
+			},
+		},
+	}),
+
 	queue_health: metric('queue_health', {
 		kind: 'value',
 		emittedBy:
@@ -716,6 +762,21 @@ export const metrics = Object.freeze({
 
 	/** What became of one posted render result — exactly one call per result; the `render` outcome series. */
 	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render', 'outcome', outcome, detail ?? null),
+
+	/** How one render's readiness contract ended — one call per governed variant. */
+	renderReadiness: (contract, verdict) =>
+		server.recordAnalytics(true, 'render_readiness', 'verdict', contract, verdict),
+
+	/** One clause that did not hold. Emitted per clause, so it does not sum to renders. */
+	renderReadinessUnmet: (contract, clause) =>
+		server.recordAnalytics(true, 'render_readiness', 'unmet', contract, clause),
+
+	/** One observation that fell far below what this URL last produced. */
+	renderReadinessShortfall: (contract, observation) =>
+		server.recordAnalytics(true, 'render_readiness', 'shortfall', contract, observation),
+
+	/** How long the contract took to first hold — what `timeoutMs` should be tuned from. */
+	renderReadinessMs: (ms, contract) => server.recordAnalytics(ms, 'render_readiness', 'satisfied_ms', contract, null),
 
 	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
 	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),

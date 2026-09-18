@@ -739,10 +739,12 @@ const renderer: Renderer = async (page, job) => {
 	// is lazy, then hold until the page says it is complete. Everything below is what runs when no
 	// contract governs this render, or when one is not satisfied.
 	let contractSatisfied = false;
+	let contractScrolled = false;
 	if (contract) {
 		if (config.scroll.enabled) {
 			await page.evaluate(scrollToBottom, config.scroll.stepMs);
 			await scrollToTop();
+			contractScrolled = true;
 		}
 		contractSatisfied = await awaitContract(contract);
 	}
@@ -751,10 +753,13 @@ const renderer: Renderer = async (page, job) => {
 	if (contractStopped) {
 		// The contract asserted the page is complete and quiet, which is a stronger statement than any
 		// wait below would establish.
-	} else if (config.scroll.enabled && config.scroll.settleUntilStable) {
+	} else if (config.scroll.enabled && !contractScrolled && config.scroll.settleUntilStable) {
 		await scrollSettle();
 	} else {
-		if (config.scroll.enabled) {
+		// A contract that timed out already scrolled this page, and then waited out its whole timeout
+		// on top — so the fallback repeating the pass is redundant work on the one path that is by
+		// definition already paying twice.
+		if (config.scroll.enabled && !contractScrolled) {
 			// Scroll to the bottom to trigger lazy-loaded content, then back to the top
 			// (e.g. so a scroll-aware navbar renders in its default state).
 			await page.evaluate(scrollToBottom, config.scroll.stepMs);

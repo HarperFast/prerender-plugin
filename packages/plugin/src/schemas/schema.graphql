@@ -430,6 +430,37 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	ruleFingerprint: String
 }
 
+# What the last accepted render of a URL produced — the defence against content disappearing with
+# nothing to notice.
+#
+# A readiness contract bounds what it NAMES. Recommendation rails cannot usefully be named: they have
+# no server-rendered placeholder, so a contract can only assert "every rail that exists is filled",
+# which is true of a page that ended up with one rail instead of three. The page's own history is the
+# only oracle that covers what no clause can — a URL that carried three rails and 350 product links
+# yesterday and none today has lost something, and nothing else here would say so.
+#
+# `replicate: false` and node-local for the same reason ProbeState is: the render result is handled
+# on the key's owner, so the row is written and read by the same node. A URL that moves owners loses
+# its history and re-learns on its next render, which is the same self-healing behaviour as a first
+# render — never a false alarm.
+#
+# NOT read at claim time, deliberately. Handing the expectation to the renderer would mean either a
+# cross-database point read per claimed job or denormalizing onto RenderSchedule, and that table is
+# residency-pinned and rewritten on every render — the two costs its own schema comments exist to
+# avoid. The comparison happens where the data already is: on the result.
+type RenderExpectation @table(database: "probe_state", replicate: false) @sealed {
+	url: String @primaryKey
+	# Observation name -> count, as JSON. A map rather than columns because what a contract observes
+	# is configuration: the names come from `readiness.contracts[].observe` and change with it.
+	counts: String
+	# How many renders in a row have reported the same shortfall. THE CONVERGENCE MECHANISM: a rail
+	# removed site-wide must not fail this URL forever, so once the same shortfall has been seen
+	# `rebaselineAfter` times the expectation is re-learned instead of alarmed. Once is a lost rail;
+	# three times in a row is the new shape of the page.
+	consecutiveShortfalls: Int
+	updatedAt: Date
+}
+
 # Same anchor, same reason as CoordinationAnchor: ProbeState is `replicate: false`, and a
 # database with zero replicable tables spins the replication subscription (harper-pro#685).
 type ProbeStateAnchor @table(database: "probe_state") @sealed {
