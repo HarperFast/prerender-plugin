@@ -291,6 +291,26 @@ export const VARIANTS = [
 		},
 	},
 	{
+		// The candidate the old harness could not see: a long-lived context per slot, wiped between
+		// renders, so Chrome's HTTP cache and the V8 code cache built from it survive. Needs the
+		// resource cache OFF to isolate the mechanism — otherwise our own cache answers the same
+		// requests over CDP and Chrome never gets to cache anything.
+		name: 'context-pool',
+		why: 'slot-scoped browser contexts: Chrome keeps its HTTP + compiled-script cache across renders instead of a cold browser every time',
+		contextPool: true,
+	},
+	{
+		name: 'resource-cache-on',
+		why: 'the on-disk resource cache as deployed — measured against a cold browser, which is what it is actually replacing',
+		resourceCache: { enabled: true, dir: '/tmp/prerender-bench-cache' },
+	},
+	{
+		name: 'context-pool-plus-cache',
+		why: 'both caches together — do they compose or does one make the other redundant?',
+		contextPool: true,
+		resourceCache: { enabled: true, dir: '/tmp/prerender-bench-cache2' },
+	},
+	{
 		name: 'reduced-motion',
 		why: 'emulate prefers-reduced-motion so animation frames stop competing with settle',
 		experiments: { reducedMotion: true },

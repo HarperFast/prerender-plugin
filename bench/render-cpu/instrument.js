@@ -110,32 +110,39 @@ export function processTreeCpu(rootPid) {
 	if (!rootPid) return null;
 	let out;
 	try {
-		out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,time='], { encoding: 'utf8', maxBuffer: 8 << 20 });
+		out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,time=,rss='], { encoding: 'utf8', maxBuffer: 8 << 20 });
 	} catch {
 		return null; // no ps (or not permitted) — the other two instruments still work
 	}
 	const children = new Map();
 	const cpu = new Map();
+	const rss = new Map();
 	for (const line of out.split('\n')) {
-		const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+		const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s*$/.exec(line);
 		if (!m) continue;
 		const pid = Number(m[1]);
 		const ppid = Number(m[2]);
 		cpu.set(pid, parsePsTime(m[3]));
+		rss.set(pid, Number(m[4]));
 		if (!children.has(ppid)) children.set(ppid, []);
 		children.get(ppid).push(pid);
 	}
 	if (!cpu.has(rootPid)) return null;
 	let total = 0;
 	let processes = 0;
+	let rssKb = 0;
 	const stack = [rootPid];
 	while (stack.length) {
 		const pid = stack.pop();
 		total += cpu.get(pid) ?? 0;
+		rssKb += rss.get(pid) ?? 0;
 		processes++;
 		for (const child of children.get(pid) ?? []) stack.push(child);
 	}
-	return { cpuSeconds: total, processes };
+	// Process count and RSS ride along because on this fleet a CPU win that costs memory is not a win,
+	// and because the process count answers "are cross-origin frames getting their own renderer?"
+	// without touching a Chrome flag.
+	return { cpuSeconds: total, processes, rssMb: Math.round(rssKb / 1024) };
 }
 
 /**

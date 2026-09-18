@@ -24,6 +24,8 @@ export type PrerenderHelpers = {
 	read: () => { elements: number; lastChangeAt: number; mutations: number };
 	/** Recount from scratch — the audit path for `read()`. */
 	recount: () => number;
+	/** Quiet time in ms judged against a tolerance, or -1 when the history cannot answer. */
+	quietMs: (tolerance: number) => number;
 	nativeElements: () => number;
 	nativeMatching: (selector: string) => number;
 	nativeExists: (selector: string) => boolean;
@@ -67,7 +69,19 @@ declare global {
 function monitorSource(): string {
 	return `(() => {
   const NS = ${JSON.stringify(HELPERS)};
-  const state = { roots: [], elements: 0, lastChangeAt: Date.now(), mutations: 0, ready: false };
+  const state = {
+    roots: [],
+    elements: 0,
+    lastChangeAt: Date.now(),
+    mutations: 0,
+    ready: false,
+    startedAt: Date.now(),
+    // Bounded change history: {t, n} per batch that moved the element count. Bounded because this
+    // lives for the whole render on a page that may mutate continuously.
+    history: [],
+    truncated: false,
+  };
+  const HISTORY_MAX = 600;
   const win = window;
   if (win[NS] && win[NS].state) return;
 
@@ -95,6 +109,11 @@ function monitorSource(): string {
     if (delta !== 0) {
       state.elements += delta;
       state.lastChangeAt = Date.now();
+      state.history.push({ t: state.lastChangeAt, n: state.elements });
+      if (state.history.length > HISTORY_MAX) {
+        state.history.shift();
+        state.truncated = true;
+      }
     }
   });
 
@@ -140,6 +159,24 @@ function monitorSource(): string {
   win[NS].recount = () => {
     state.elements = countTree(document);
     return state.elements;
+  };
+  // How long the DOM has been quiet, judged the way the Node-side plateau judges it: a change only
+  // counts if the element count has drifted from the CURRENT count by more than the tolerance. The
+  // monitor's raw lastChangeAt cannot answer this: it moves on any non-zero delta, so a page with
+  // perpetual small churn would never look quiet even though the plateau loop would call it stable.
+  //
+  // Returns -1 for "cannot say", which the caller must treat as "do the full wait": that happens when
+  // the change history has been truncated, because an older change that exceeded the tolerance may
+  // have been dropped and answering from what is left would OVERSTATE the quiet.
+  win[NS].quietMs = (tolerance) => {
+    const now = Date.now();
+    const cur = state.elements;
+    for (let i = state.history.length - 1; i >= 0; i--) {
+      const entry = state.history[i];
+      if (Math.abs(entry.n - cur) > tolerance) return now - entry.t;
+    }
+    if (state.truncated) return -1;
+    return now - state.startedAt;
   };
   win[NS].read = () => ({
     elements: state.elements,

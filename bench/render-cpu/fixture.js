@@ -261,12 +261,40 @@ function buildHtml(query) {
 	html += '<div id="reviewTabs"><div id="reviewWrap" class="transition-all hidden"><div id="reviewList"></div></div></div>';
 	html += '</section></main>';
 
+	for (let i = 0; i < 8; i++) html += `<script src="/asset/js/chunk-${i}.js"></script>`;
 	html += '<script src="/asset/js/vendor.js"></script>';
 	html += '<script src="/asset/js/analytics-beacon.js"></script>'; // matches the blocked pattern
 	html += `<script>${shadowWidgetScript()}</script>`;
 	html += `<script>${pageScript()}</script>`;
 	html += '</body></html>';
 	return html;
+}
+
+/**
+ * A script bundle that is actually parsed, compiled and executed — the thing a commerce page's
+ * cost is really made of, and the thing the first version of this fixture did not have at all.
+ *
+ * Deterministic and cached by path so two runs compile byte-identical source. Each bundle defines a
+ * few hundred functions and runs a little work at module scope, so V8 has something to compile and
+ * something to keep in a code cache.
+ */
+const bundleCache = new Map();
+function bundle(pathname) {
+	const cached = bundleCache.get(pathname);
+	if (cached) return cached;
+	const random = rng(pathname.length * 7919);
+	const fns = Math.round(400 + random() * 200);
+	let src = `(() => {\n  const registry = {};\n`;
+	for (let i = 0; i < fns; i++) {
+		src += `  registry.f${i} = function f${i}(a, b) {\n`;
+		src += `    const k = (a || ${i}) * ${1 + (i % 13)} + (b || 0);\n`;
+		src += `    const s = String(k).split('').reverse().join('');\n`;
+		src += `    return { k, s, tag: 'f${i}', n: s.length + ${i % 7} };\n  };\n`;
+	}
+	src += `  let acc = 0;\n  for (const key of Object.keys(registry)) acc += registry[key](acc, 1).n;\n`;
+	src += `  window.__bundle = (window.__bundle || 0) + acc;\n})();\n`;
+	bundleCache.set(pathname, src);
+	return src;
 }
 
 /** Start the fixture server. Returns { url, close, requests } — requests is a live per-path count. */
@@ -299,7 +327,7 @@ export async function startFixture({ port = 0 } = {}) {
 		}
 		if (url.pathname.endsWith('.js')) {
 			res.writeHead(200, { 'content-type': 'text/javascript', 'cache-control': 'public, max-age=3600' });
-			res.end('window.__vendor = 1;');
+			res.end(bundle(url.pathname));
 			return;
 		}
 		res.writeHead(404, { 'content-type': 'text/plain' });

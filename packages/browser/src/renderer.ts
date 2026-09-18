@@ -115,7 +115,11 @@ const renderer: Renderer = async (page, job) => {
 	// EXPERIMENT (see experiments.ts): install the in-page helpers + mutation monitor once at
 	// document start, so a poll is a call by name instead of a fresh compile of a tree walk.
 	const bootstrapped =
-		experiments.installHelpers || experiments.nativeCount || experiments.monitor || experiments.combineTail;
+		experiments.installHelpers ||
+		experiments.nativeCount ||
+		experiments.monitor ||
+		experiments.combineTail ||
+		experiments.plateauEarlyReturn;
 	if (bootstrapped) {
 		setupPromises.push(
 			page.evaluateOnNewDocument(
@@ -133,6 +137,21 @@ const renderer: Renderer = async (page, job) => {
 			)
 		);
 	}
+	// EXPERIMENT: hand the block list to Chrome so those requests fail in the network stack and never
+	// pause into our handler. `setBlockedURLs` takes wildcard patterns; the config's entries are
+	// substrings, so each becomes `*<pattern>*`.
+	if (experiments.blockedUrlsViaCdp && blockedUrlPatterns.length > 0) {
+		setupPromises.push(
+			page
+				.createCDPSession()
+				.then((session) =>
+					session
+						.send('Network.setBlockedURLs', { urls: blockedUrlPatterns.map((pattern) => `*${pattern}*`) })
+						.finally(() => session.detach().catch(noop))
+				)
+				.catch(noop)
+		);
+	}
 	// EXPERIMENT: stop animation frames competing with the settle loop.
 	if (experiments.reducedMotion) {
 		setupPromises.push(page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]));
@@ -143,6 +162,7 @@ const renderer: Renderer = async (page, job) => {
 
 	page
 		.on('request', async (req) => {
+			splits.reqTotal++;
 			if (ac.signal.aborted || aborted) {
 				req.abort().catch(noop);
 				return;
@@ -228,15 +248,28 @@ const renderer: Renderer = async (page, job) => {
 				req.continue({ headers }).catch(noop);
 				return;
 			}
+			// EXPERIMENT: a cross-origin sub-frame document is loaded, parsed, scripted and laid out in
+			// its own renderer process, and none of it reaches the snapshot (the serializer emits the
+			// `<iframe>` tag, not the frame's document).
+			if (experiments.abortCrossOriginFrames && req.resourceType() === 'document' && !isSameOrigin(req.url())) {
+				splits.reqCrossOriginDoc++;
+				req.abort().catch(noop);
+				return;
+			}
+			// EXPERIMENT: when `blockedUrlsViaCdp` is on these never reach us — Chrome fails them in the
+			// network stack — so this branch is the control, not the mechanism.
 			if (isBlockedUrl(req.url())) {
+				splits.reqBlocked++;
 				req.abort().catch(noop);
 				return;
 			}
 			if (blockedResourceTypes.has(req.resourceType())) {
 				// Stub blocked images (vs abort) so lazy-loaders keep their real src URLs.
 				if (config.block.stubImages && req.resourceType() === 'image') {
+					splits.reqStubbed++;
 					req.respond(STUB_IMAGE_RESPONSE).catch(noop);
 				} else {
+					splits.reqBlocked++;
 					req.abort().catch(noop);
 				}
 				return;
@@ -270,7 +303,10 @@ const renderer: Renderer = async (page, job) => {
 							}
 							return false;
 						});
-					if (served) return;
+					if (served) {
+						splits.reqCacheHit++;
+						return;
+					}
 					if (ac.signal.aborted || aborted) {
 						req.abort().catch(noop);
 						return;
@@ -286,9 +322,13 @@ const renderer: Renderer = async (page, job) => {
 			// missing from the cache. Measured against a live edge: `_astro/*.js` and the layout
 			// CSS return 403 un-tokened and 200 tokened, from the same host, seconds apart.
 			if (settings.bypass.token && isSameOrigin(req.url())) {
+				splits.reqTokened++;
 				req.continue({ headers: { ...req.headers(), [settings.bypass.header]: settings.bypass.token } }).catch(noop);
 				return;
 			}
+			// Paused, inspected, and continued UNCHANGED: the requests that would never have needed to
+			// reach Node at all. This count is the ceiling on narrowing the interception patterns.
+			splits.reqPassThrough++;
 			req.continue().catch(noop); // For all other requests, continue without modification
 		})
 		.on('response', (res) => {
@@ -514,6 +554,17 @@ const renderer: Renderer = async (page, job) => {
 	const plateau = () =>
 		timed('plateauMs', async () => {
 			splits.plateaus++;
+			// EXPERIMENT: credit quiescence that accrued before this plateau was entered. The monitor
+			// timestamps the last change that exceeded the tolerance, so a page that has already been
+			// still for `domStableMs` needs no dwell at all. Falls through to the full wait whenever the
+			// monitor is absent or has not seen enough quiet — it can only ever SHORTEN a wait that the
+			// full check would also have ended.
+			if (experiments.plateauEarlyReturn) {
+				const quiet = await page
+					.evaluate((tolerance: number) => window.__prerender?.quietMs?.(tolerance) ?? -1, config.navigation.domStableTolerance)
+					.catch(() => -1);
+				if (quiet >= config.navigation.domStableMs) return;
+			}
 			return await domStable();
 		});
 

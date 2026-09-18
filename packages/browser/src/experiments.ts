@@ -59,6 +59,26 @@ export type Experiments = {
 	skipIdleBeforePlateau: boolean;
 	/** Skip the `waitForNetworkIdle` between the scroll pass and the return to the top. */
 	skipIdleAfterScroll: boolean;
+	/**
+	 * Let a plateau credit quiescence that accrued BEFORE it was entered.
+	 *
+	 * `domStable` restarts its dwell from the moment it is called, so a page that has provably not
+	 * changed for seconds still pays `domStableMs` in full — twice. The document-start monitor already
+	 * tracks when the DOM last changed by more than the tolerance; this reads it and returns
+	 * immediately when the page has already been quiet for long enough.
+	 */
+	plateauEarlyReturn: boolean;
+	/** Push `block.urlPatterns` to Chrome via `Network.setBlockedURLs` instead of aborting per request. */
+	blockedUrlsViaCdp: boolean;
+	/**
+	 * Abort cross-origin sub-frame DOCUMENTS.
+	 *
+	 * An iframe's content is never in the snapshot — the serializer emits the `<iframe>` tag, not the
+	 * loaded document — so a third-party frame is parsed, scripted and laid out in its own renderer
+	 * process for output that is discarded. Cross-origin only: a same-origin frame can reach the
+	 * parent DOM, so it can change what we serialize.
+	 */
+	abortCrossOriginFrames: boolean;
 };
 
 export const DEFAULT_EXPERIMENTS: Experiments = {
@@ -76,6 +96,9 @@ export const DEFAULT_EXPERIMENTS: Experiments = {
 	skipTopSettleBeforePlateau: false,
 	skipIdleBeforePlateau: false,
 	skipIdleAfterScroll: false,
+	plateauEarlyReturn: false,
+	blockedUrlsViaCdp: false,
+	abortCrossOriginFrames: false,
 };
 
 /**
@@ -98,6 +121,18 @@ export type SettleSplit = {
 	plateaus: number;
 	/** `scroll.topSettleMs` dwells — the last unattributed piece of the settle budget. */
 	topSettleMs: number;
+	/**
+	 * Request-class census. Prices the interception candidates before anyone rewrites the handler:
+	 * `passThrough` is the count of requests we paused, looked at, and continued UNCHANGED — the
+	 * ceiling on what narrowing `Fetch.enable` patterns could remove.
+	 */
+	reqTotal: number;
+	reqPassThrough: number;
+	reqBlocked: number;
+	reqStubbed: number;
+	reqCacheHit: number;
+	reqTokened: number;
+	reqCrossOriginDoc: number;
 };
 
 export const splits: SettleSplit = {
@@ -110,10 +145,27 @@ export const splits: SettleSplit = {
 	plateauMs: 0,
 	plateaus: 0,
 	topSettleMs: 0,
+	reqTotal: 0,
+	reqPassThrough: 0,
+	reqBlocked: 0,
+	reqStubbed: 0,
+	reqCacheHit: 0,
+	reqTokened: 0,
+	reqCrossOriginDoc: 0,
 };
 
 export const resetSplits = (): void => {
-	Object.assign(splits, { scrollMs: 0, idleMs: 0, countMs: 0, gateMs: 0, gateTicks: 0, passes: 0, plateauMs: 0, plateaus: 0, topSettleMs: 0 });
+	Object.assign(splits, { scrollMs: 0, idleMs: 0, countMs: 0, gateMs: 0, gateTicks: 0, passes: 0, plateauMs: 0,
+		plateaus: 0,
+		topSettleMs: 0,
+		reqTotal: 0,
+		reqPassThrough: 0,
+		reqBlocked: 0,
+		reqStubbed: 0,
+		reqCacheHit: 0,
+		reqTokened: 0,
+		reqCrossOriginDoc: 0,
+	});
 };
 
 /** Time an awaited step into one of the split buckets. Identity when instrumentation is off. */

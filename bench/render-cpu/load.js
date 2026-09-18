@@ -31,6 +31,7 @@ import defaultRenderer from '../../packages/browser/dist/renderer.js';
 import { resolveSettings, settings, defaultLaunchOptions } from '../../packages/browser/dist/settings.js';
 import { initResourceCache } from '../../packages/browser/dist/ResourceCache.js';
 import { experiments, resetExperiments } from '../../packages/browser/dist/experiments.js';
+import { resetForNextVariant } from '../../packages/browser/dist/variantContext.js';
 import { startFixture } from './fixture.js';
 import { VARIANTS, BASE_CONFIG, merge } from './variants.js';
 import { median, processTreeCpu } from './instrument.js';
@@ -69,7 +70,10 @@ async function main() {
 			resolveSettings(
 				{
 					config: merge(BASE_CONFIG, variant.config),
-					resourceCache: { enabled: false },
+					// An AXIS, not a constant. Hard-disabling it here is what made every caching and
+					// compile-cost candidate unmeasurable — including the "shared context" result that
+					// went into the README as a dead end.
+					resourceCache: variant.resourceCache ?? { enabled: false },
 					harper: {},
 					...(variant.browserOptions ?? {}),
 				},
@@ -90,10 +94,32 @@ async function main() {
 
 			const url = variant.urlQuery ? `${fixture.url}?${variant.urlQuery}` : fixture.url;
 
+			// SLOT-SCOPED CONTEXTS. Today every render gets a fresh incognito context, whose HTTP cache
+			// is in-memory and dies with it — so Chrome never carries a compiled-script (V8 code) cache
+			// from one render to the next, and the disk-cache flag has never applied to a single render.
+			// This leases a long-lived context per slot and wipes it between renders with the SAME
+			// routine production already uses between a job's device variants, which fails closed: if
+			// the wipe cannot be guaranteed the render takes a fresh context instead.
+			const pool = [];
+			let poolResetFailures = 0;
+			const acquireContext = async () => {
+				if (!variant.contextPool) return null;
+				return pool.pop() ?? (await managed.createContext());
+			};
+
 			// Renders the page and hands it back STILL OPEN: the caller closes it after sampling CPU.
 			const renderOne = async (i, keep) => {
 				const started = Date.now();
-				const page = await managed.getPage();
+				const context = await acquireContext();
+				const page = await managed.getPage(context);
+				if (context) {
+					const wiped = await resetForNextVariant(context, page, url, []);
+					if (!wiped) {
+						// Fail closed, exactly as production does: a context that cannot be proven clean is
+						// not reused. Counted so a silent fallback cannot flatter the result.
+						poolResetFailures++;
+					}
+				}
 				const job = new RenderJob({
 					id: `load-${i}`,
 					url,
@@ -110,6 +136,7 @@ async function main() {
 					job.attemptEnded(undefined, html);
 					if (keep) keep.push(page);
 					else await managed.closePage(page);
+					if (context) pool.push(context);
 				}
 				return {
 					wallMs: Date.now() - started,
@@ -131,9 +158,12 @@ async function main() {
 				const after = processTreeCpu(managed.pid);
 				const cpu = { cpuSeconds: (after?.cpuSeconds ?? 0) - (before?.cpuSeconds ?? 0) };
 				for (const page of open) await managed.closePage(page);
+			for (const context of pool.splice(0)) await managed.disposeContext(context).catch(() => {});
 				batches.push({
 					batchMs,
 					cpuSeconds: cpu.cpuSeconds,
+					processes: after?.processes ?? null,
+					rssMb: after?.rssMb ?? null,
 					perRenderWall: median(runs.map((r) => r.wallMs)),
 					maxWall: Math.max(...runs.map((r) => r.wallMs)),
 					reviews: median(runs.map((r) => r.reviews)),
@@ -152,6 +182,9 @@ async function main() {
 				rendersPerSec: Number((concurrency / (median(batches.map((b) => b.batchMs)) / 1000)).toFixed(2)),
 				reviews: median(batches.map((b) => b.reviews)),
 				bytes: median(batches.map((b) => b.bytes)),
+				processes: median(batches.map((b) => b.processes)),
+				rssMb: median(batches.map((b) => b.rssMb)),
+				poolResetFailures,
 			};
 			results.push(row);
 			console.log(
@@ -175,7 +208,19 @@ async function main() {
 
 function report(results) {
 	console.log('\n## throughput under load (median of reps)\n');
-	const head = ['conc', 'variant', 'batch', 'per-render', 'max-wall', 'cpu/render', 'renders/s', 'vs base /s', 'reviews'];
+	const head = [
+		'conc',
+		'variant',
+		'batch',
+		'per-render',
+		'max-wall',
+		'cpu/render',
+		'renders/s',
+		'vs base /s',
+		'procs',
+		'rssMb',
+		'reviews',
+	];
 	const rows = results.map((r) => {
 		const base = results.find((x) => x.concurrency === r.concurrency && x.variant === results[0].variant);
 		const ratio = base && base.rendersPerSec ? `${(r.rendersPerSec / base.rendersPerSec).toFixed(2)}x` : '-';
@@ -188,6 +233,8 @@ function report(results) {
 			`${r.cpuMsPerRender}ms`,
 			String(r.rendersPerSec),
 			ratio,
+			String(r.processes),
+			String(r.rssMb),
 			String(r.reviews),
 		];
 	});
