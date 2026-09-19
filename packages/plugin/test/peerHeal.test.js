@@ -60,7 +60,7 @@ before(async () => {
 		render_schedule: { RenderSchedule: emptyTable() },
 		invalidation: { Invalidation: emptyTable() },
 		verification: { PageVerification: emptyTable() },
-		probe_state: { ProbeState: emptyTable() },
+		probe_state: { ProbeState: emptyTable(), RenderExpectation: emptyTable() },
 		coordination: {
 			SharedBuffer: { primaryStore: { getUserSharedBuffer: (_k, buf) => buf } },
 		},

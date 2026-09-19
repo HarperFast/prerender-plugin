@@ -13,7 +13,7 @@ import {
 	PRERENDER,
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
-import { recordReadinessExpectation } from '../util/readinessExpectation.js';
+import { hasObservations, recordReadinessExpectation } from '../util/readinessExpectation.js';
 import { recordPageClaim } from '../util/changeProbe.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
@@ -74,6 +74,9 @@ const hasContent = (variant) => variant.statusCode === 200 && !!variant.content;
  * keeps this and `describeJob`'s fold rule reading the same list.
  */
 const defaultDeviceTypes = () => [...config.deviceTypes.default];
+
+/** A wire field that should be an array, read defensively — anything else is treated as empty. */
+const asArray = (value) => (Array.isArray(value) ? value : []);
 
 /**
  * One posted result, whatever shape the browser used, as `{ rowKey, url, asked, variants }`.
@@ -547,15 +550,20 @@ export class RenderQueue extends Resource {
 		// every one of them reported outcome=ok.
 		for (const variant of variants) {
 			const readiness = variant.readiness;
-			if (!readiness) continue; // no contract governed this render
-			// Exactly one verdict per variant, so the series sums to renders. A rebaseline is a separate
-			// series (emitted by the expectation store, which is the only thing that can know).
+			if (!readiness || typeof readiness !== 'object') continue; // no contract governed this render
+			// Exactly one verdict per governed VARIANT — a two-device job emits two — so the series sums
+			// to rendered devices (`render.time_ms`), not to posted results (`render.outcome`). A
+			// rebaseline is a separate series (emitted by the expectation store, which is the only thing
+			// that can know).
 			metrics.renderReadiness(readiness.contract, readiness.satisfied ? 'satisfied' : 'unsatisfied');
 			// Per CLAUSE, so a contract that has rotted against a template change reads as one clause
 			// failing across every render of its page type rather than as an unexplained slowdown.
-			for (const clause of readiness.unmet ?? []) metrics.renderReadinessUnmet(readiness.contract, clause);
-			for (const shortfall of readiness.shortfalls ?? [])
-				metrics.renderReadinessShortfall(readiness.contract, shortfall.name);
+			// `Array.isArray`, not `?? []`: this runs before anything is committed and outside any
+			// try/catch, and the poster is not authenticated — a non-iterable here would throw the whole
+			// result away with a 500 and hold the lease.
+			for (const clause of asArray(readiness.unmet)) metrics.renderReadinessUnmet(readiness.contract, clause);
+			for (const shortfall of asArray(readiness.shortfalls))
+				metrics.renderReadinessShortfall(readiness.contract, shortfall?.name);
 			// How long it took to first hold — the distribution `timeoutMs` should be tuned from. Only
 			// when it held: an unsatisfied contract has no such time, and emitting its timeout here would
 			// drag the percentile toward the very ceiling the reader is checking against.
@@ -735,14 +743,18 @@ export class RenderQueue extends Resource {
 			//
 			// `recordPageClaim` never rejects (it catches and warns internally), so it cannot fail the
 			// result from inside this set — a probe optimisation must not cost a render.
-			// The readiness observations, compared against what this URL last produced. Rides in the same
-			// concurrent set as the page writes and the probe claim: it is one node-local point read and
-			// one small write, and like `recordPageClaim` it never rejects — a regression signal must not
-			// cost a render.
-			const governed = stored.find((variant) => variant.readiness?.learned);
+			// The readiness observations, compared against what this PAGE last produced — per stored
+			// variant, under its own device's key, because the desktop and mobile renders of one URL are
+			// different pages with different counts (measured: a 59% `img` gap on the home page, against
+			// a shortfall rule that fires at 50%). Rides in the same concurrent set as the page writes and
+			// the probe claim: one node-local point read and one small write each, and like
+			// `recordPageClaim` it never rejects — a regression signal must not cost a render.
+			const observed = stored.filter((variant) => hasObservations(variant.readiness?.learned));
 			await Promise.all([
 				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
-				...(governed ? [recordReadinessExpectation(scheduleUrl, governed.readiness)] : []),
+				...observed.map((variant) =>
+					recordReadinessExpectation({ url: scheduleUrl, deviceType: variant.deviceType }, variant.readiness)
+				),
 				...stored.map((variant) => {
 					variant.headers['x-harper-rendered'] = '1';
 					return databases.page_cache.PrerenderedPage.put(variant.storeKey, {

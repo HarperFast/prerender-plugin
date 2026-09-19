@@ -264,6 +264,14 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		['prerender_ops.serve_error', 'blob-fault counter; the serve-side view of it is bot_serve blob-* on Traffic'],
 		['prerender_ops.unrouted', 'has its own endpoint and panel (the unrouted report), not the analytics window'],
 		['prerender_ops.config_warnings', 'the Config view reads the warnings themselves, which say more than a count'],
+		// Readiness contracts (plugin v0.79.0) are rolling out in report-only mode and are read raw from
+		// the analytics endpoint during that window; the Readiness panel is issue #189. Waived, not
+		// forgotten — this guard is what said the console was blind to it.
+		['render_readiness.verdict', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
+		['render_readiness.unmet', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
+		['render_readiness.shortfall', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
+		['render_readiness.rebaseline', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
+		['render_readiness.satisfied_ms', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
 	]);
 
 	const client = [...clientSources.values()].join('\n');
