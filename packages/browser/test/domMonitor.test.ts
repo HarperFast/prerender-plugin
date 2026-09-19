@@ -59,6 +59,20 @@ test('a parent inserted with its children in one task is counted once', async ()
 	await sleep(30);
 	assert.equal((await elements(page)) - before, 11, 'incremental count matches the 11 elements that were added');
 	assert.equal(await elements(page), await recount(page), 'and agrees with a full recount');
+
+	// The same shape rooted at an <a>, whose native `host` is a STRING (its URL's host) — the ancestor
+	// walk must not follow it. A product tile is exactly this: an anchor wrapping an image and text.
+	const mid = await elements(page);
+	await page.evaluate(() => {
+		const root = document.getElementById('root')!;
+		const tile = document.createElement('a');
+		tile.href = 'https://example.com/product/1';
+		root.appendChild(tile);
+		for (let i = 0; i < 4; i++) tile.appendChild(document.createElement('span'));
+	});
+	await sleep(30);
+	assert.equal((await elements(page)) - mid, 5, 'an anchor-rooted subtree is counted once too');
+	assert.equal(await elements(page), await recount(page));
 	await page.close();
 });
 

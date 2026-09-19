@@ -96,8 +96,11 @@ export const monitorSource = (): string => `(() => {
   // an inflation that depends on where the parser yielded, so ordinary churn of ~100 elements read
   // as ~250 and tripped a tolerance of 120. Walks 'host' at a shadow boundary so a root's content
   // is attributed to its host's insertion.
+  // Follow 'host' only from a ShadowRoot (nodeType 11): <a> and <area> have a native 'host' too, a
+  // string, and a detached anchor at the root of an added subtree must not be walked through it.
+  const up = (n) => n.parentNode || (n.nodeType === 11 ? n.host : null);
   const insideAdded = (node, added) => {
-    for (let p = node.parentNode || node.host; p; p = p.parentNode || p.host) if (added.has(p)) return true;
+    for (let p = up(node); p; p = up(p)) if (added.has(p)) return true;
     return false;
   };
 
