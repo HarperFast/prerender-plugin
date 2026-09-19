@@ -8,11 +8,27 @@ import assert from 'node:assert/strict';
 // The same rule exists in the browser package (`readiness.assessExpectations`) for the in-render
 // path. They must agree; if you change one, change both.
 
-globalThis.server = { hostname: 'test-node', recordAnalytics: () => {} };
-globalThis.databases = { probe_state: { RenderExpectation: {} } };
-globalThis.logger = { warn: () => {}, info: () => {}, error: () => {} };
+const analytics = [];
+let warns = [];
+globalThis.server = { hostname: 'test-node', recordAnalytics: (...args) => analytics.push(args) };
+globalThis.logger = { warn: (...args) => warns.push(args.map(String).join(' ')), info: () => {}, error: () => {} };
 
-const { assess } = await import('../src/util/readinessExpectation.js');
+// A node-local table, as the code sees it: point read with a select, patch, put.
+const rows = new Map();
+const fakeTable = {
+	get: async ({ id }) => (rows.has(id) ? { ...rows.get(id) } : undefined),
+	patch: async (id, data) => rows.set(id, { ...rows.get(id), ...data }),
+	put: async (id, data) => rows.set(id, { ...data }),
+};
+globalThis.databases = { probe_state: { RenderExpectation: fakeTable } };
+
+const { assess, recordReadinessExpectation, hasObservations } = await import('../src/util/readinessExpectation.js');
+const { CacheKey } = await import('../src/util/cacheKey.js');
+
+const URL_A = 'https://example.com/';
+const keyOf = (deviceType) => CacheKey.toCacheKey({ url: URL_A, deviceType });
+const shortfallEmits = () => analytics.filter((a) => a[1] === 'render_readiness' && a[2] === 'shortfall');
+const report = (learned) => ({ contract: 'home', satisfied: true, learned });
 
 const history = (counts, consecutiveShortfalls = 0) => ({ counts, consecutiveShortfalls });
 
@@ -65,4 +81,67 @@ test('a recovery resets the counter rather than leaving it armed', () => {
 	assert.deepEqual(v.shortfalls, []);
 	assert.equal(v.rebaselined, false, 'nothing fell short, so nothing is being re-learned');
 	assert.equal(v.next.consecutive, 0);
+});
+
+// ─── the record path: the unit is the PAGE, not the URL ─────────────────────────────────────────
+
+test('desktop and mobile renders of ONE URL keep separate histories — the measured 59% img gap is not a shortfall', async () => {
+	rows.clear();
+	analytics.length = 0;
+	warns = [];
+	// Measured on the live home page, same URL, one job: desktop 625 img, mobile 256.
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'desktop' }, report({ images: 625, rails: 2 }));
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'mobile' }, report({ images: 256, rails: 2 }));
+	// And the next job, same shape.
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'desktop' }, report({ images: 625, rails: 2 }));
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'mobile' }, report({ images: 256, rails: 2 }));
+
+	assert.deepEqual(shortfallEmits(), [], 'a device gap is not content loss');
+	assert.deepEqual(warns, []);
+	assert.deepEqual(
+		[...rows.keys()].sort(),
+		[keyOf('desktop'), keyOf('mobile')].sort(),
+		'one row per page, keyed like the page'
+	);
+	assert.deepEqual(JSON.parse(rows.get(keyOf('desktop')).counts), { images: 625, rails: 2 });
+	assert.deepEqual(JSON.parse(rows.get(keyOf('mobile')).counts), { images: 256, rails: 2 });
+});
+
+test('a real drop on one device is still caught, and names the device', async () => {
+	rows.clear();
+	analytics.length = 0;
+	warns = [];
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'mobile' }, report({ images: 256 }));
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'mobile' }, report({ images: 40 }));
+	assert.equal(shortfallEmits().length, 1);
+	assert.deepEqual(shortfallEmits()[0].slice(1), ['render_readiness', 'shortfall', 'home', 'images']);
+	assert.ok(warns.some((w) => w.includes(URL_A) && w.includes('(mobile)') && w.includes('images 40 vs 256')));
+	assert.equal(rows.get(keyOf('mobile')).consecutiveShortfalls, 1);
+	assert.deepEqual(JSON.parse(rows.get(keyOf('mobile')).counts), { images: 256 }, 'kept, not re-learned');
+});
+
+test('a contract with no observe clauses posts learned={} and records nothing', async () => {
+	rows.clear();
+	assert.equal(hasObservations({}), false);
+	assert.equal(hasObservations(undefined), false);
+	assert.equal(hasObservations({ rails: 0 }), true, 'a zero count is still an observation');
+	await recordReadinessExpectation({ url: URL_A, deviceType: 'desktop' }, report({}));
+	assert.equal(rows.size, 0);
+});
+
+test('a failing table never throws, and warns once rather than once per render', async () => {
+	analytics.length = 0;
+	warns = [];
+	const broken = globalThis.databases.probe_state.RenderExpectation;
+	globalThis.databases.probe_state.RenderExpectation = undefined; // a node whose schema did not load
+	try {
+		for (let i = 0; i < 50; i++) {
+			await recordReadinessExpectation({ url: URL_A, deviceType: 'desktop' }, report({ images: 1 }));
+		}
+	} finally {
+		globalThis.databases.probe_state.RenderExpectation = broken;
+	}
+	assert.equal(warns.length, 1, 'fifty failures, one line');
+	assert.ok(warns[0].includes('could not record the readiness expectation'));
+	assert.ok(warns[0].includes(keyOf('desktop')));
 });

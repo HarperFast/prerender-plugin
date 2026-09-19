@@ -88,11 +88,32 @@ export const monitorSource = (): string => `(() => {
     return n;
   };
 
+  // True when some OTHER node added in this same batch now contains the node. Records are delivered
+  // after the task that produced them, and countTree walks the subtree as it is THEN — so when the
+  // parser or a framework inserts a parent and then its children in one task, the parent's record
+  // already counts the children and each child's own record would count it again. Measured before
+  // this check: +21 for a parent with 10 children, and a 13,128-element document read as 41,878 —
+  // an inflation that depends on where the parser yielded, so ordinary churn of ~100 elements read
+  // as ~250 and tripped a tolerance of 120. Walks 'host' at a shadow boundary so a root's content
+  // is attributed to its host's insertion.
+  // Follow 'host' only from a ShadowRoot (nodeType 11): <a> and <area> have a native 'host' too, a
+  // string, and a detached anchor at the root of an added subtree must not be walked through it.
+  const up = (n) => n.parentNode || (n.nodeType === 11 ? n.host : null);
+  const insideAdded = (node, added) => {
+    for (let p = up(node); p; p = up(p)) if (added.has(p)) return true;
+    return false;
+  };
+
   const observer = new MutationObserver((records) => {
+    const added = new Set();
+    for (const r of records) for (const n of r.addedNodes) if (n.nodeType === 1) added.add(n);
     let delta = 0;
     for (const r of records) {
-      for (const n of r.addedNodes) if (n.nodeType === 1 || n.nodeType === 11) delta += countTree(n);
-      for (const n of r.removedNodes) if (n.nodeType === 1 || n.nodeType === 11) delta -= countTree(n);
+      for (const n of r.addedNodes) if (n.nodeType === 1 && !insideAdded(n, added)) delta += countTree(n);
+      // A removed node is detached by now, so its subtree is exactly what left. (A child removed
+      // from an already-removed parent in the same batch is subtracted twice; that reads as a
+      // change and shortens the reported quiet — the safe direction — and is rare.)
+      for (const n of r.removedNodes) if (n.nodeType === 1) delta -= countTree(n);
     }
     if (delta === 0) return;
     state.elements += delta;
@@ -113,7 +134,7 @@ export const monitorSource = (): string => `(() => {
   // exist (this runs at document start); a CLOSED root is invisible here exactly as it is invisible
   // to the tree walk this replaces.
   const nativeAttach = Element.prototype.attachShadow;
-  Element.prototype.attachShadow = function (init) {
+  const patchedAttach = function (init) {
     const root = nativeAttach.call(this, init);
     if (init && init.mode === 'open') {
       state.roots.push(root);
@@ -121,6 +142,12 @@ export const monitorSource = (): string => `(() => {
     }
     return root;
   };
+  // The wrapper is page-visible (its source is not native), and that is accepted: it is installed
+  // only when a contract will be waited on. Keep at least the name honest for anything that reads it.
+  try {
+    Object.defineProperty(patchedAttach, 'name', { value: 'attachShadow' });
+  } catch { /* frozen function objects — cosmetic only */ }
+  Element.prototype.attachShadow = patchedAttach;
 
   observe(document);
   state.elements = countTree(document);
@@ -136,9 +163,21 @@ export const monitorSource = (): string => `(() => {
     quietMs: (tolerance) => {
       const now = Date.now();
       const cur = state.elements;
-      for (let i = state.history.length - 1; i >= 0; i--) {
-        const entry = state.history[i];
-        if (Math.abs(entry.n - cur) > tolerance) return now - entry.t;
+      const history = state.history;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (Math.abs(history[i].n - cur) > tolerance) {
+          // history[i] is the LAST moment the count was far from where it is now. The quiet did not
+          // begin then — it began with the next change, the one that brought the count within
+          // tolerance of its current value. Returning history[i].t here (as this once did) reported
+          // the still period BEFORE the last burst as if it had accrued after it: a page quiet for
+          // 2s, then hit with 500 insertions, read as 2,153ms quiet 150ms later — and a render
+          // gated on "held && quiet" stopped the instant its last clause held, with no dwell at all.
+          // The next entry exists whenever the latest entry carries the current count, which every
+          // observed change guarantees; a recount() that moved the count without recording a change
+          // leaves no such entry, and "the count just moved" is the honest answer then.
+          const since = history[i + 1];
+          return since ? now - since.t : 0;
+        }
       }
       // An older change that exceeded the tolerance may have been dropped, and answering from what
       // is left would OVERSTATE the quiet — the one direction this must never fail in.

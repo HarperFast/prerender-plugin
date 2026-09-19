@@ -69,7 +69,7 @@ beforeEach(async () => {
 		// TABLE — the change probe publishes its cross-worker state as a row here, so the fake has
 		// to answer get/put as well as hand out buffers.
 		coordination: { SharedBuffer: probeStateTable() },
-		probe_state: { ProbeState: FakeTable },
+		probe_state: { ProbeState: FakeTable, RenderExpectation: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },
 		render_schedule: { RenderSchedule: FakeTable },

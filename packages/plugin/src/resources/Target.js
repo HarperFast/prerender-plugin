@@ -136,7 +136,10 @@ export class Target extends TargetTable {
 		// The probe baseline goes with the target. ProbeState is node-local, so this delete only
 		// lands on the node it runs on — an owner-node row deleted elsewhere is left behind, and
 		// that is fine: an orphaned baseline is never walked again (the sweep walks Targets), and
-		// a re-created target on a new owner seeds fresh regardless.
+		// a re-created target on a new owner seeds fresh regardless. The same holds for the render
+		// expectations (one per device, keyed like the pages): node-local, so a row on another node
+		// is left behind, and the table's expiration reclaims it — this delete is the prompt path,
+		// not the only one.
 		//
 		// The schedule deletes name the URL row AND the URL's pre-0.66.0 device rows (see
 		// `scheduleKeysOf`): a device row that has not yet converted would otherwise outlive its
@@ -147,6 +150,7 @@ export class Target extends TargetTable {
 			...scheduleKeysOf(url).map((key) => deleteSchedule(key)),
 			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 			databases.probe_state.ProbeState.delete(url),
+			...cacheKeysOf(url).map((cacheKey) => databases.probe_state.RenderExpectation.delete(cacheKey)),
 		]);
 
 		return super.delete(...arguments);

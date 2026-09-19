@@ -73,7 +73,7 @@ beforeEach(async () => {
 	globalThis.Resource = class {};
 	globalThis.databases = {
 		coordination: { SharedBuffer: coordinationTable },
-		probe_state: { ProbeState: FakeTable },
+		probe_state: { ProbeState: FakeTable, RenderExpectation: FakeTable },
 		render_service: { Target: FakeTable },
 		page_cache: { PrerenderedPage: FakeTable },
 		render_schedule: { RenderSchedule: FakeTable },

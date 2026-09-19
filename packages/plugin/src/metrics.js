@@ -366,19 +366,21 @@ export const METRICS = Object.freeze({
 			'`unmet` emits once per failing clause, so it does NOT sum to renders — read it against the ' +
 			'`unsatisfied` count in `verdict`. A clause that a guard decided did not apply is not unmet and is ' +
 			'not counted; that distinction is the difference between "checked and failed" and "nothing to ' +
-			'check". `shortfall` is a comparison against what this URL last produced, so it is silent on a ' +
-			'first render and after a rebaseline.',
+			'check". `shortfall` is a comparison against what this PAGE (URL + device) last produced, so it ' +
+			'is silent on a first render and after a rebaseline, and a desktop and a mobile render of one URL ' +
+			'never compare against each other.',
 		gatedBy: 'a readiness contract matching the rendered URL (config.readiness)',
 		dimensions: {
 			path: {
 				name: 'series',
 				values: ['verdict', 'unmet', 'shortfall', 'rebaseline', 'satisfied_ms'],
 				description:
-					'verdict = counter of how the contract ended, EXACTLY ONE PER RENDER so shares read as ' +
-					'fractions of render throughput. unmet = counter, one per clause that did not hold. ' +
+					'verdict = counter of how the contract ended, EXACTLY ONE PER GOVERNED DEVICE VARIANT — a ' +
+					'two-device job emits two — so shares read as fractions of rendered devices (`render.time_ms`), ' +
+					'NOT of posted results (`render.outcome`). unmet = counter, one per clause that did not hold. ' +
 					'shortfall = counter, one per observation that fell far below this URL\u2019s history. ' +
-					'rebaseline = counter, one per URL whose expectation was re-learned after repeated ' +
-					'shortfalls — kept OUT of verdict so that series keeps summing to one per render. ' +
+					'rebaseline = counter, one per page (URL + device) whose expectation was re-learned after ' +
+					'repeated shortfalls — kept OUT of verdict so that series keeps summing to one per variant. ' +
 					'satisfied_ms = distribution of how long the contract took to first hold.',
 			},
 			method: {
@@ -773,11 +775,11 @@ export const metrics = Object.freeze({
 	renderReadinessUnmet: (contract, clause) =>
 		server.recordAnalytics(true, 'render_readiness', 'unmet', contract, clause),
 
-	/** One URL whose expectation was re-learned. Its own series, so `verdict` stays one per render. */
+	/** One page whose expectation was re-learned. Its own series, so `verdict` stays one per variant. */
 	renderReadinessRebaseline: (contract) =>
 		server.recordAnalytics(true, 'render_readiness', 'rebaseline', contract, null),
 
-	/** One observation that fell far below what this URL last produced. */
+	/** One observation that fell far below what this page last produced. */
 	renderReadinessShortfall: (contract, observation) =>
 		server.recordAnalytics(true, 'render_readiness', 'shortfall', contract, observation),
 

@@ -26,7 +26,12 @@ const B = 'https://site.example.com/product/b';
 const key = (url, device) => `${url}|${device}`;
 const DEVICES = ['desktop', 'mobile'];
 
-const stores = { target: new Map(), renderSchedule: new Map(), prerenderedPage: new Map() };
+const stores = {
+	target: new Map(),
+	renderSchedule: new Map(),
+	prerenderedPage: new Map(),
+	renderExpectation: new Map(),
+};
 let warns = [];
 let infos = [];
 let errors = [];
@@ -95,7 +100,10 @@ before(async () => {
 	};
 	globalThis.createBlob = (buf) => buf;
 	globalThis.databases = {
-		probe_state: { ProbeState: { delete: async () => {} } },
+		probe_state: {
+			ProbeState: { delete: async () => {} },
+			RenderExpectation: makeResourceBase(stores.renderExpectation),
+		},
 		coordination: {
 			SharedBuffer: {
 				primaryStore: {
@@ -748,4 +756,116 @@ test('a flat result on a URL row is counted and warned about — an un-upgraded 
 	// every job it claims, and a line per render would bury the thing it is warning about — so
 	// whether it appears here depends on what ran earlier in the file.
 	assert.equal(stores.prerenderedPage.has(key(A, 'desktop')), true, 'and the one device it did render is stored');
+});
+
+// ───────────────────────────── readiness ─────────────────────────────
+
+const readinessRows = () => analytics.filter((a) => a[1] === 'render_readiness');
+const readiness = (contract, learned, extra = {}) => ({
+	contract,
+	satisfied: true,
+	unmet: [],
+	skipped: [],
+	waitedMs: 900,
+	firstSatisfiedMs: 850,
+	learned,
+	shortfalls: [],
+	rebaselined: false,
+	...extra,
+});
+
+test('a readiness report is recorded PER DEVICE, under the page key — the two variants never compare against each other', async () => {
+	seedUrlRow();
+	await claim();
+	// Measured on the live home page in one job: desktop 625 img, mobile 256 — a 59% gap.
+	await postVariants(A, [
+		rendered('desktop', '<html>d</html>', { readiness: readiness('home', { images: 625, rails: 2 }) }),
+		rendered('mobile', '<html>m</html>', { readiness: readiness('home', { images: 256, rails: 2 }) }),
+	]);
+	await claim(); // re-claim is refused while the lease is released? no — the row was rescheduled an hour out
+	stores.renderSchedule.get(A).nextRenderTime = 1;
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>d</html>', { readiness: readiness('home', { images: 625, rails: 2 }) }),
+		rendered('mobile', '<html>m</html>', { readiness: readiness('home', { images: 256, rails: 2 }) }),
+	]);
+
+	assert.deepEqual([...stores.renderExpectation.keys()].sort(), [key(A, 'desktop'), key(A, 'mobile')]);
+	assert.deepEqual(JSON.parse(stores.renderExpectation.get(key(A, 'desktop')).counts), { images: 625, rails: 2 });
+	assert.deepEqual(JSON.parse(stores.renderExpectation.get(key(A, 'mobile')).counts), { images: 256, rails: 2 });
+	assert.deepEqual(
+		readinessRows().filter((a) => a[2] === 'shortfall'),
+		[],
+		'a device gap is not content loss'
+	);
+	assert.equal(
+		readinessRows().filter((a) => a[2] === 'verdict').length,
+		4,
+		'one verdict per governed VARIANT — two per result'
+	);
+	assert.equal(readinessRows().filter((a) => a[2] === 'satisfied_ms').length, 4);
+	assert.deepEqual(
+		outcomes(),
+		[
+			['rendered', 'stored'],
+			['rendered', 'stored'],
+		],
+		'and still one outcome per result'
+	);
+});
+
+test("a device that failed does not lend its sibling's counts to its own history", async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>d</html>', { readiness: readiness('home', { images: 625 }) }),
+		{
+			deviceType: 'mobile',
+			outcome: 'error',
+			reason: 'error',
+			error: { name: 'TimeoutError', message: 'settle', phase: 'settle' },
+		},
+	]);
+	assert.deepEqual(
+		[...stores.renderExpectation.keys()],
+		[key(A, 'desktop')],
+		'only the page that stored is learned from'
+	);
+	assert.equal(stores.renderExpectation.has(key(A, 'mobile')), false);
+});
+
+test('a result with no readiness report emits and stores nothing readiness-shaped', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.deepEqual(readinessRows(), []);
+	assert.equal(stores.renderExpectation.size, 0);
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+});
+
+test('a malformed readiness report cannot cost the render — arrays are read defensively', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>d</html>', {
+			readiness: {
+				contract: 'home',
+				satisfied: false,
+				unmet: 1,
+				shortfalls: 'nope',
+				learned: 'nope',
+				firstSatisfiedMs: 'soon',
+			},
+		}),
+		rendered('mobile', '<html>m</html>'),
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>d</html>', 'stored');
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+	assert.deepEqual(
+		readinessRows().map((a) => a.slice(2)),
+		[['verdict', 'home', 'unsatisfied']],
+		'the verdict still counts; nothing else is trusted'
+	);
+	assert.equal(stores.renderExpectation.size, 0, 'a non-object learned is not an observation');
+	assert.equal(leased(A), false, 'and the lease is released — no 500, no held lease');
 });

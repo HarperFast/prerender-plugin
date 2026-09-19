@@ -14,8 +14,9 @@
 #   sitemaps         Sitemap, SitemapRefresh         — sitemap data
 #   coordination     SharedBuffer,                   — node-local SAB, never replicated
 #                    CoordinationAnchor                (+ an empty replicated anchor, see the type)
-#   probe_state      ProbeState, ProbeStateAnchor    — change-probe baselines (node-local,
-#                                                      isolated for reseed write bursts)
+#   probe_state      ProbeState, RenderExpectation,  — change-probe baselines + per-page render
+#                    ProbeStateAnchor                  expectations (node-local, isolated for
+#                                                      reseed write bursts)
 #   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
 #                                                      serve path; isolated, see the type)
 #   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
@@ -430,31 +431,44 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	ruleFingerprint: String
 }
 
-# What the last accepted render of a URL produced — the defence against content disappearing with
+# What the last accepted render of a PAGE produced — the defence against content disappearing with
 # nothing to notice.
 #
 # A readiness contract bounds what it NAMES. Recommendation rails cannot usefully be named: they have
 # no server-rendered placeholder, so a contract can only assert "every rail that exists is filled",
 # which is true of a page that ended up with one rail instead of three. The page's own history is the
-# only oracle that covers what no clause can — a URL that carried three rails and 350 product links
+# only oracle that covers what no clause can — a page that carried three rails and 350 product links
 # yesterday and none today has lost something, and nothing else here would say so.
 #
+# KEYED BY CACHE KEY (url + device), NOT BY URL, because the two device variants of one URL are
+# different pages with different counts and both are rendered in one job. Measured on the live home
+# page: 625 `img` on desktop against 256 on mobile, a 59% gap, against a shortfall rule that fires at
+# 50%. One URL-keyed row fed by whichever variant happened to store would report that gap as content
+# loss — indistinguishable from the real thing on the `shortfall` series and in the log.
+#
 # `replicate: false` and node-local for the same reason ProbeState is: the render result is handled
-# on the key's owner, so the row is written and read by the same node. A URL that moves owners loses
-# its history and re-learns on its next render, which is the same self-healing behaviour as a first
+# on the claiming node (the fleet posts to `callbackOrigin`, which the claim sets to the claiming
+# node), so the row is written and read by the same node. A page that moves claimers loses its
+# history there and re-learns on its next render, which is the same self-healing behaviour as a first
 # render — never a false alarm.
+#
+# EXPIRES, so the tail collects itself. 30 days is well past the longest render interval, so any page
+# still in rotation refreshes its row (every governed render writes it) long before it would expire,
+# while a row orphaned by a moved claimer, a one-off device render or a retired target is reclaimed
+# without a sweep. `Target.delete` also drops the URL's rows directly, beside `ProbeState`.
 #
 # NOT read at claim time, deliberately. Handing the expectation to the renderer would mean either a
 # cross-database point read per claimed job or denormalizing onto RenderSchedule, and that table is
 # residency-pinned and rewritten on every render — the two costs its own schema comments exist to
 # avoid. The comparison happens where the data already is: on the result.
-type RenderExpectation @table(database: "probe_state", replicate: false) @sealed {
-	url: String @primaryKey
+type RenderExpectation @table(database: "probe_state", replicate: false, expiration: 2592000) @sealed {
+	# `util/cacheKey.js` `CacheKey.toCacheKey({ url, deviceType })` — the same key the page is stored under.
+	cacheKey: String @primaryKey
 	# Observation name -> count, as JSON. A map rather than columns because what a contract observes
 	# is configuration: the names come from `readiness.contracts[].observe` and change with it.
 	counts: String
 	# How many renders in a row have reported the same shortfall. THE CONVERGENCE MECHANISM: a rail
-	# removed site-wide must not fail this URL forever, so once the same shortfall has been seen
+	# removed site-wide must not fail this page forever, so once the same shortfall has been seen
 	# `rebaselineAfter` times the expectation is re-learned instead of alarmed. Once is a lost rail;
 	# three times in a row is the new shape of the page.
 	consecutiveShortfalls: Int

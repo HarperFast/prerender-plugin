@@ -1,7 +1,9 @@
 import { metrics } from '../metrics.js';
+import { CacheKey } from './cacheKey.js';
 
 /**
- * What the last accepted render of a URL produced, and whether this render fell short of it.
+ * What the last accepted render of a PAGE (one URL on one device) produced, and whether this render
+ * fell short of it.
  *
  * ## The gap this closes
  *
@@ -13,7 +15,15 @@ import { metrics } from '../metrics.js';
  * held.
  *
  * The page's own history is the oracle that covers it. Nothing has to be written down and nothing
- * rots: the expectation is whatever this URL last actually produced.
+ * rots: the expectation is whatever this page last actually produced.
+ *
+ * ## Why the unit is the PAGE and not the URL
+ *
+ * One job renders every device variant of a URL, and the variants are different pages. Measured on
+ * the live home page: 625 `img` on desktop, 256 on mobile — a 59% gap against a rule that fires at
+ * 50%. A history keyed by URL alone and fed by whichever variant happened to store would report that
+ * gap as content loss, and on the `shortfall` series a device artefact and a real regression look
+ * identical. So the row is keyed by cache key, exactly as the page itself is.
  *
  * ## Why it converges instead of alarming forever
  *
@@ -84,19 +94,21 @@ export const assess = (learned, stored, policy = DEFAULTS) => {
 };
 
 /**
- * Record one render's readiness observations against this URL's history. Never throws.
+ * Record one render's readiness observations against this page's history. Never throws.
  *
- * `readiness` is the report the browser posted (`VariantMetadata.readiness`); `learned` on it is the
- * observation counts. Called once per URL per result, from the render-result path.
+ * `readiness` is the report the browser posted for this device's variant (`VariantMetadata.readiness`);
+ * `learned` on it is the observation counts. Called once per stored variant, from the render-result
+ * path, with the URL the job was scheduled under and the variant's device.
  */
-export const recordReadinessExpectation = async (url, readiness, policy = DEFAULTS) => {
+export const recordReadinessExpectation = async ({ url, deviceType }, readiness, policy = DEFAULTS) => {
+	const cacheKey = CacheKey.toCacheKey({ url, deviceType });
 	try {
 		const learned = readiness?.learned;
 		// Nothing observed means nothing to compare and nothing to store — a contract with no
 		// `observe` clauses, or a renderer that predates the field.
-		if (!learned || Object.keys(learned).length === 0) return;
+		if (!hasObservations(learned)) return;
 
-		const stored = await table().get({ id: url, select: ['counts', 'consecutiveShortfalls'] });
+		const stored = await table().get({ id: cacheKey, select: ['counts', 'consecutiveShortfalls'] });
 		const parsed = stored
 			? { counts: safeParse(stored.counts), consecutiveShortfalls: stored.consecutiveShortfalls }
 			: null;
@@ -106,11 +118,13 @@ export const recordReadinessExpectation = async (url, readiness, policy = DEFAUL
 		if (verdict.rebaselined) metrics.renderReadinessRebaseline(readiness.contract);
 		if (verdict.shortfalls.length) {
 			logger.warn(
-				`Prerender ${url}: rendered fewer than this URL last produced — ` +
+				`Prerender ${url} (${deviceType}): rendered fewer than this page last produced — ` +
 					verdict.shortfalls.map((s) => `${s.name} ${s.got} vs ${s.expected}`).join(', ')
 			);
 		}
 
+		// Written on EVERY governed render, even when `assess` kept the old counts: the write is what
+		// refreshes the table's expiration, so a page still in rotation never has its history reclaimed.
 		const fields = {
 			counts: JSON.stringify(verdict.next.counts),
 			consecutiveShortfalls: verdict.next.consecutive,
@@ -118,12 +132,26 @@ export const recordReadinessExpectation = async (url, readiness, policy = DEFAUL
 		};
 		// patch cannot create and put would clobber nothing else here, but the read already happened
 		// for the comparison, so choosing costs nothing extra.
-		if (stored) await table().patch(url, fields);
-		else await table().put(url, { url, ...fields });
+		if (stored) await table().patch(cacheKey, fields);
+		else await table().put(cacheKey, { cacheKey, ...fields });
 	} catch (error) {
-		logger.warn(error, `Prerender: could not record the readiness expectation for ${url}`);
+		// Once, then every thousandth. If the table is missing on a node (a schema that did not load)
+		// this path fails on EVERY governed render — thousands an hour per node — and a warn per render
+		// is the flood, not the signal. The count says how long it has been going on.
+		if (recordFailures++ % FAILURE_WARN_EVERY === 0) {
+			logger.warn(
+				error,
+				`Prerender: could not record the readiness expectation for ${cacheKey} (${recordFailures} failure(s) on this node so far)`
+			);
+		}
 	}
 };
+
+/** `learned` carries at least one observation — `{}` is what a contract with no `observe` clauses posts. */
+export const hasObservations = (learned) => !!learned && typeof learned === 'object' && Object.keys(learned).length > 0;
+
+const FAILURE_WARN_EVERY = 1000;
+let recordFailures = 0;
 
 const safeParse = (value) => {
 	try {
