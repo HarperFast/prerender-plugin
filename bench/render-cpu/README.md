@@ -404,6 +404,35 @@ run. That catches the failure modes we thought of. It cannot catch:
 The gate for all of that already exists in this package and should be the next step for any change
 here: `renderAudit` / `paintParity` / `reuseParity` against staging, per device.
 
+## Tested again under CPU starvation — the answer does not change
+
+Every CDP-reduction result below was first measured on an IDLE machine, where an evaluate costs
+1-3ms and nothing else wants the core, so it reads as free. That is a fair objection: under
+starvation the same work competes with the page's own hydration on the same main thread, and
+`DevToolsCommandDuration` is main-thread time by definition (210ms idle, 300-480ms at 4x throttle).
+So the question was re-run at 4x CPU throttle against a live page.
+
+**Our polling is not the culprit.** No contract (no polling at all) vs polling every 250ms vs every
+1000ms, 3 reps interleaved: polling adds ~50-80ms of main-thread CDP time, about **1% of task
+time**, and quartering the calls did not recover it. Content was identical in all three arms (364
+product links, 1,430 review nodes, zero un-hydrated islands). Note 302ms of `devtools` time exists
+with NO contract at all — the residue is request interception and postProcess, not the poll loop.
+
+**Nor is the interception plane, once measured with enough reps.** At 3 reps, blocking images in
+Blink (`--blink-settings=imagesEnabled=false`, removing ~1,000 Fetch round-trips) looked like -15%
+CPU and -18% wall. At **5 reps it is within noise**: wall -3%, CPU 0%, `devtools` slightly WORSE.
+The 3-rep result was drift, and it was one reporting decision away from being filed as a finding.
+
+**And one arm shows why "faster under starvation" must never be read alone.** Aborting blocked
+images instead of stubbing them halved CDP servicing (486ms -> 215ms) and cut wall 39% — while
+storing **0 of 364 product links**. It was fastest because the page never finished. `images-off`
+does the same thing intermittently: content held on 4 of 5 runs and collapsed to 0 links on the
+fifth.
+
+So the conclusion below stands in both regimes, and the reason it stands is worth keeping: the CDP
+work that competes for the starved main thread is not ours to remove. It is the requests the page
+itself makes, and removing them removes the page.
+
 ## Dead ends — measured, do not re-propose
 
 Each of these was implemented and measured against the same fixture in the same process. All of them
