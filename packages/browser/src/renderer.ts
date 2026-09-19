@@ -120,9 +120,14 @@ const renderer: Renderer = async (page, job) => {
 
 	// A contract's stop condition is "the page contains what it should AND has stopped changing", and
 	// the second half is answered by the document-start monitor. Installed only when a contract
-	// governs this render, so a deployment that configures none pays nothing.
+	// governs this render AND will be waited on: report mode never reads it, and the monitor is the
+	// one page-visible thing a render leaves behind (a patched `attachShadow` whose source is not
+	// native), so an observation-only rollout should not ship it. A deployment that configures no
+	// contract pays nothing either way.
 	const contract = contractFor(config.readiness, url, deviceType);
-	if (contract) setupPromises.push(page.evaluateOnNewDocument(monitorSource()));
+	if (contract && config.readiness?.onSatisfied !== 'report') {
+		setupPromises.push(page.evaluateOnNewDocument(monitorSource()));
+	}
 
 	const ac = new AbortController();
 	let aborted = false;
@@ -744,7 +749,9 @@ const renderer: Renderer = async (page, job) => {
 	 * in that band. Running as an observer first produces the distribution the gate should be tuned
 	 * from, at no risk — the render behaves exactly as it does with no contract configured.
 	 *
-	 * Stops as soon as the settle it is watching finishes, so it can never extend a render.
+	 * Stops as soon as the settle it is watching finishes. It extends the render by at most one poll
+	 * already in flight plus the final look below — one read-only evaluate each, ~1-2ms in-page on a
+	 * 13k-element product page — never by a wait of its own.
 	 */
 	const observeContract = async (
 		governing: NonNullable<ReturnType<typeof contractFor>>,
@@ -762,25 +769,32 @@ const renderer: Renderer = async (page, job) => {
 		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
 
 		while (!until.done) {
-			try {
-				last = await page.evaluate(evaluateContract, payload);
-			} catch {
-				break;
+			// Once every clause has held there is nothing left to learn until the final look: every
+			// further tick would only overwrite `last`, which the final look overwrites again. So poll
+			// until first satisfaction, then just wait for the settle to end. On the fleet that is
+			// roughly half the ~37 evaluates a variant would otherwise pay.
+			if (firstSatisfiedMs === null) {
+				try {
+					last = await page.evaluate(evaluateContract, payload);
+				} catch {
+					break;
+				}
+				for (const clause of last.require) {
+					if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+				}
+				if (last.started && last.require.every((r) => r.ok)) {
+					firstSatisfiedMs = Date.now() - started;
+				}
+				if (until.done) break;
 			}
-			for (const clause of last.require) {
-				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
-			}
-			if (last.started && last.require.every((r) => r.ok) && firstSatisfiedMs === null) {
-				firstSatisfiedMs = Date.now() - started;
-			}
-			if (until.done) break;
 			// Interruptible, so stopping the observer is PROMPT. A plain sleep meant the settle could be
 			// finished and still waiting up to a full poll interval for this loop to notice — which
-			// would make report mode extend the render it exists to leave alone.
+			// would make report mode extend the render it exists to leave alone. After satisfaction
+			// there is no timer at all: only the settle ending wakes this.
 			await new Promise((resolve) => {
-				const timer = setTimeout(resolve, pollMs);
+				const timer = firstSatisfiedMs === null ? setTimeout(resolve, pollMs) : null;
 				until.wake = () => {
-					clearTimeout(timer);
+					if (timer) clearTimeout(timer);
 					resolve(undefined);
 				};
 			});
@@ -828,66 +842,75 @@ const renderer: Renderer = async (page, job) => {
 	let observer: Promise<void> | null = null;
 	let contractSatisfied = false;
 	let contractScrolled = false;
-	// Report mode watches; it never decides. Everything below then runs exactly as it would with no
-	// contract configured.
-	if (contract && config.readiness?.onSatisfied === 'report') {
-		observer = observeContract(contract, observing);
-	} else if (contract) {
-		if (config.scroll.enabled) {
-			await page.evaluate(scrollToBottom, config.scroll.stepMs);
-			await scrollToTop();
-			contractScrolled = true;
+	// The settle is wrapped so the observer is released on EVERY exit, including a throw from a
+	// scroll or wait below. Without this, a render that failed mid-settle left the observer polling
+	// until the page closed and reported late or never — so the slow, failing tail dropped out of the
+	// very distribution the report window exists to measure.
+	try {
+		// Report mode watches; it never decides. Everything below then runs exactly as it would with
+		// no contract configured.
+		if (contract && config.readiness?.onSatisfied === 'report') {
+			observer = observeContract(contract, observing);
+		} else if (contract) {
+			if (config.scroll.enabled) {
+				await page.evaluate(scrollToBottom, config.scroll.stepMs);
+				await scrollToTop();
+				contractScrolled = true;
+			}
+			contractSatisfied = await awaitContract(contract);
 		}
-		contractSatisfied = await awaitContract(contract);
-	}
-	const contractStopped = contract !== null && contractSatisfied;
+		const contractStopped = contract !== null && contractSatisfied;
 
-	if (contractStopped) {
-		// The contract asserted the page is complete and quiet, which is a stronger statement than any
-		// wait below would establish.
-	} else if (config.scroll.enabled && !contractScrolled && config.scroll.settleUntilStable) {
-		await scrollSettle();
-	} else {
-		// A contract that timed out already scrolled this page, and then waited out its whole timeout
-		// on top — so the fallback repeating the pass is redundant work on the one path that is by
-		// definition already paying twice.
-		if (config.scroll.enabled && !contractScrolled) {
-			// Scroll to the bottom to trigger lazy-loaded content, then back to the top
-			// (e.g. so a scroll-aware navbar renders in its default state).
-			await page.evaluate(scrollToBottom, config.scroll.stepMs);
+		if (contractStopped) {
+			// The contract asserted the page is complete and quiet, which is a stronger statement than any
+			// wait below would establish.
+		} else if (config.scroll.enabled && !contractScrolled && config.scroll.settleUntilStable) {
+			await scrollSettle();
+		} else {
+			// A contract that timed out already scrolled this page, and then waited out its whole timeout
+			// on top — so the fallback repeating the pass is redundant work on the one path that is by
+			// definition already paying twice.
+			if (config.scroll.enabled && !contractScrolled) {
+				// Scroll to the bottom to trigger lazy-loaded content, then back to the top
+				// (e.g. so a scroll-aware navbar renders in its default state).
+				await page.evaluate(scrollToBottom, config.scroll.stepMs);
+				await networkIdle();
+				await scrollToTop();
+			}
 			await networkIdle();
-			await scrollToTop();
+			await domStable();
 		}
-		await networkIdle();
-		await domStable();
-	}
 
-	// Content-readiness waits run AFTER the scroll/settle phase (so lazy widgets have been scrolled
-	// through) and BEFORE the snapshot; scroll back to the top afterward so scroll-reactive UI
-	// (sticky headers) re-lands. No-op unless config.waitFor is set. Its dwell is attributed to
-	// `settle` on purpose — it reads as part of the settle budget.
-	// A satisfied contract stands in for the hand-written gates and the final plateau too: they assert
-	// strictly less than it does, about the same DOM, later.
-	if (config.waitFor?.length && !contractStopped) {
-		await applyWaitFor();
-	}
-	if (config.waitFor?.length && !contractStopped) await scrollToTop();
-	// The LAST word on whether the page has stopped changing, and the only plateau check that runs
-	// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
-	// still filling — measured: reviews complete and correct, 107 product links instead of 547,
-	// because the earlier `domStable()` plateaued before the recommendation rails arrived and the
-	// review gate then let the snapshot go. See `navigation.finalDomStable`.
-	//
-	// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
-	// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
-	// causes. This way the last thing checked is the state that gets serialized.
-	if (config.navigation.finalDomStable && !contractStopped) await domStable();
-	// The observer must not outlive the settle it is watching: stopping it here is what guarantees
-	// report mode cannot change a render's duration.
-	if (observer) {
+		// Content-readiness waits run AFTER the scroll/settle phase (so lazy widgets have been scrolled
+		// through) and BEFORE the snapshot; scroll back to the top afterward so scroll-reactive UI
+		// (sticky headers) re-lands. No-op unless config.waitFor is set. Its dwell is attributed to
+		// `settle` on purpose — it reads as part of the settle budget.
+		// A satisfied contract stands in for the hand-written gates and the final plateau too: they assert
+		// strictly less than it does, about the same DOM, later.
+		if (config.waitFor?.length && !contractStopped) {
+			await applyWaitFor();
+		}
+		if (config.waitFor?.length && !contractStopped) await scrollToTop();
+		// The LAST word on whether the page has stopped changing, and the only plateau check that runs
+		// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
+		// still filling — measured: reviews complete and correct, 107 product links instead of 547,
+		// because the earlier `domStable()` plateaued before the recommendation rails arrived and the
+		// review gate then let the snapshot go. See `navigation.finalDomStable`.
+		//
+		// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
+		// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
+		// causes. This way the last thing checked is the state that gets serialized.
+		if (config.navigation.finalDomStable && !contractStopped) await domStable();
+		// The observer must not outlive the settle it is watching: stopping it here is what guarantees
+		// report mode cannot change a render's duration.
+		if (observer) {
+			observing.done = true;
+			observing.wake?.();
+			await observer;
+		}
+	} finally {
 		observing.done = true;
 		observing.wake?.();
-		await observer;
 	}
 	timings.settle = Date.now() - settleStart;
 
