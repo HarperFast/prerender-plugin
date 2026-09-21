@@ -576,7 +576,24 @@ type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 	# Storing them decoded would cost a decompress on the serve path's miss branch and buy nothing.
 	content: Blob
 	lastCached: Date
-	expiresAt: Date
+	# @expiresAt MAKES THIS FIELD THE RECORD'S REAL EXPIRATION, not merely a column the serve path
+	# reads. Without it Harper stamps every row with the table default above (48h) and reclaims on that
+	# schedule, while `readRawPage` independently refuses the row at this timestamp — so between the
+	# two, a document that stopped being servable at its expiry sat on disk, with its blob, for up to
+	# another 47h. Measured on a live deployment the day this was found: 90,000 rows, every one
+	# carrying the same next-midnight expiry, none of them reclaimable for two days.
+	#
+	# With the directive Harper stamps THIS value into the record's expiry metadata, which governs both
+	# read-hiding and the cleanup sweep, so storage lifetime matches servable lifetime. It needs no
+	# index — the expiry rides the record encoding (a HAS_EXPIRATION flag plus an 8-byte timestamp),
+	# which is also why it survives replication to a peer.
+	#
+	# THE TABLE DEFAULT ABOVE IS NOW A FALLBACK, NOT A CEILING. Harper treats the field as
+	# authoritative in BOTH directions, so the 48h applies to a row whose field is missing or is not a
+	# timestamp — and a `render.raw.expiryMs` longer than 48h now genuinely extends retention rather
+	# than being cut short by it. The 48h still sets the cleanup cadence, which Harper derives as a
+	# quarter of it, so a row is physically reclaimed within ~12h of expiring.
+	expiresAt: Date @expiresAt
 }
 
 # Same anchor, same reason as CoordinationAnchor and ProbeStateAnchor: a database needs one

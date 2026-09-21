@@ -393,6 +393,12 @@ export const readRawPage = async (cacheKey) => {
 		return null;
 	}
 	if (!row) return null;
+	// KEPT EVEN THOUGH HARPER NOW HIDES EXPIRED ROWS ITSELF — `RawPage.expiresAt` carries the
+	// `@expiresAt` directive, so the stored timestamp governs read-hiding and the cleanup sweep.
+	// This is the serve-time guarantee and it is nearly free: it does not wait on a sweep having
+	// run, it fails closed on a row whose timestamp is unreadable, and it keeps the refusal a
+	// property of this module rather than of a schema directive someone could drop without noticing.
+	//
 	// Same robust read as the page path: a `Date` column can arrive as a Date, a number or a string,
 	// and anything unreadable must land on "expired" rather than on "serve it forever".
 	const expiresAtMs = row.expiresAt ? new Date(row.expiresAt).getTime() : NaN;

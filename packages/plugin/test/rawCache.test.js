@@ -1,5 +1,7 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /**
  * `util/rawCache.js` — caching the origin document a miss already fetched.
@@ -404,6 +406,40 @@ test('a stored page keeps the origin bytes verbatim and is read back while fresh
 
 	const read = await rawCache.readRawPage('https://example.com/c|desktop');
 	assert.equal(read.content.bytes.toString(), 'GZIPPED');
+});
+
+test('the RawPage schema still declares @expiresAt — the directive IS the storage saving', () => {
+	// This guards a fact that lives OUTSIDE this codebase. The directive is what makes Harper treat the
+	// stored timestamp as the record's expiration; without it Harper falls back to the table's 48h and
+	// a row that stopped being servable at midnight sits on disk, with its blob, for up to another 47h.
+	// No behavioural test here can see that — the behaviour is Harper's — so dropping the directive
+	// would leave this whole suite green while silently restoring two-day retention.
+	const schema = fs.readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
+	const block = schema.slice(schema.indexOf('type RawPage @table('));
+	const body = block.slice(0, block.indexOf('\n}'));
+	assert.match(body, /expiresAt: Date @expiresAt/, 'RawPage.expiresAt must carry the @expiresAt directive');
+});
+
+test("the stored expiresAt is a Date — the shape Harper's @expiresAt directive consumes", async () => {
+	// `RawPage.expiresAt` carries `@expiresAt`, so this field is not merely a column `readRawPage`
+	// checks: Harper stamps it into the record's expiry metadata, which governs read-hiding and the
+	// cleanup sweep. Its coercion accepts a Date, a number, or a numeric/ISO string, and falls back to
+	// the table's 48h default on anything else — SILENTLY. So a change here that made this field a
+	// boolean, an empty string, or absent would not fail any other test; it would just quietly restore
+	// the two-day retention this directive exists to remove.
+	await rawCache.storeRawPage({
+		cacheKey: 'k',
+		resource: originResource(),
+		bytes: Buffer.from('x'),
+		policy: policy(),
+	});
+	const stored = rows.get('k').expiresAt;
+	assert.ok(stored instanceof Date, `expiresAt must be a Date, got ${Object.prototype.toString.call(stored)}`);
+	assert.ok(
+		Number.isFinite(stored.getTime()),
+		'and a valid one — an Invalid Date coerces to NaN and takes the 48h default'
+	);
+	assert.ok(stored.getTime() > Date.now(), 'and in the future, or the row is born expired');
 });
 
 test('a write failure is counted and swallowed — a served response must not fail over a copy', async () => {
