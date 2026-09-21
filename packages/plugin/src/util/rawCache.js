@@ -85,7 +85,8 @@ const mediaTypeOf = (contentType) =>
 		.toLowerCase();
 
 /**
- * The directive NAMES in a `Cache-Control` header, lowercased.
+ * The directive NAMES in a `Cache-Control` header, lowercased — or **null** when the header cannot
+ * be parsed confidently.
  *
  * PARSED RATHER THAN SUBSTRING-MATCHED, because both directives that matter here may carry a quoted
  * field-name argument — `no-cache="X-Private-Header"` is legal (RFC 9111 §5.2.2) — and a substring
@@ -93,34 +94,58 @@ const mediaTypeOf = (contentType) =>
  * word boundary, so `/\bprivate\b/` matches inside `X-Private-Header` and inside `x-private-hint`
  * just as `includes` does. Only reading the directive names distinguishes them.
  *
- * Over-matching is the conservative direction for a cache — it refuses to store — so this is not a
- * safety fix. It is an accuracy one, and `no-store` is now the ONE cache-control refusal that
- * survives `assumeShared`, so a phantom one silently costs a deployment stores it cannot account
- * for and cannot tell from a real instruction.
+ * `;` IS ACCEPTED AS A SEPARATOR even though only `,` is legal, and a quote is stripped from a
+ * directive name even though a quoted name is not legal either. Real origins emit both, and the
+ * charitable reading is the one that keeps refusing: `private;max-age=60` is an origin plainly
+ * declaring the response unshared, and reading it as one unrecognized directive would STORE it.
  *
- * A repeated header arriving as an array is handled by construction: joining with commas is exactly
- * the list form this parses.
+ * Returning null on an unbalanced quote — rather than guessing — is what makes this safe to
+ * substitute for the substring test it replaced. See `hasCacheControlDirective`.
  */
 const cacheControlDirectives = (value) => {
-	const names = new Set();
-	if (value === undefined || value === null || value === '') return names;
+	if (value === undefined || value === null || value === '') return new Set();
 	const raw = String(value);
+	const names = new Set();
 	let start = 0;
 	let inQuotes = false;
 	const take = (end) => {
-		const name = raw.slice(start, end).split('=')[0].trim().toLowerCase();
+		// A quote cannot appear in a legal directive NAME, so stripping one can only recover a
+		// malformed `"private"`; the argument after `=` is already discarded.
+		const name = raw.slice(start, end).split('=')[0].replace(/"/g, '').trim().toLowerCase();
 		if (name) names.add(name);
 	};
 	for (let i = 0; i < raw.length; i++) {
 		const ch = raw[i];
 		if (ch === '"' && raw[i - 1] !== '\\') inQuotes = !inQuotes;
-		else if (ch === ',' && !inQuotes) {
+		else if ((ch === ',' || ch === ';') && !inQuotes) {
 			take(i);
 			start = i + 1;
 		}
 	}
 	take(raw.length);
-	return names;
+	// An unbalanced quote means every separator after it was swallowed, so the directive list is
+	// short by an unknown amount. Say so instead of answering from what survived.
+	return inQuotes ? null : names;
+};
+
+/**
+ * Does this `Cache-Control` carry `directive`?
+ *
+ * THE PARSER MAY ONLY EVER REMOVE A FALSE POSITIVE. Substring matching over-refuses, which is the
+ * conservative direction for a cache; a parser that answered from a header it did not understand
+ * would under-refuse, which is not. So where the parse is not trustworthy this defers to the
+ * substring test, and the result is never less refusing than before the parser existed.
+ *
+ * That distinction is load-bearing rather than theoretical: measured against the pre-parser
+ * implementation, six malformed-header shapes (`private;max-age=60`, `no-store;private`, an
+ * unbalanced quote, a stray trailing quote, `"private"`, `"no-store"`) went from refused to STORED
+ * — on the default path, where no `assumeShared` is set and nothing about behaviour was supposed to
+ * change. A document whose origin said `private` was about to be replayed to every crawler.
+ */
+const hasCacheControlDirective = (value, directive) => {
+	const names = cacheControlDirectives(value);
+	if (names === null) return String(value).toLowerCase().includes(directive);
+	return names.has(directive);
 };
 
 /**
@@ -137,7 +162,7 @@ const cacheControlDirectives = (value) => {
  */
 export const unsharedHint = (resource) => {
 	if (resource?.hadSetCookie) return 'set-cookie';
-	if (cacheControlDirectives(resource?.headers?.['cache-control']).has('private')) return 'private';
+	if (hasCacheControlDirective(resource?.headers?.['cache-control'], 'private')) return 'private';
 	return null;
 };
 
@@ -169,7 +194,7 @@ export const storeRefusal = (resource, policy) => {
 	//
 	// `no-cache` is deliberately NOT refused: it means revalidate-before-use, not do-not-store, and
 	// refusing it would exclude most correctly-configured HTML.
-	if (cacheControlDirectives(headers['cache-control']).has('no-store')) return 'no-store';
+	if (hasCacheControlDirective(headers['cache-control'], 'no-store')) return 'no-store';
 	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
 	return null;
 };

@@ -274,6 +274,29 @@ test('a cache-control DIRECTIVE is read, not a substring — a quoted field name
 	}
 });
 
+test('a MALFORMED cache-control still refuses — the parser may only ever remove a false positive', () => {
+	// Substring matching over-refused, which is conservative for a cache. A parser that answers from
+	// a header it cannot parse UNDER-refuses, which is not — and each row below went from refused to
+	// STORED in the first version of this parser, on the default path with no `assumeShared` set.
+	// `private;max-age=60` is an origin plainly declaring the response unshared.
+	const cc = (value) => originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+	for (const value of [
+		'private;max-age=60',
+		'no-store;private',
+		'no-cache="x, no-store', // unbalanced quote swallows the separator
+		'max-age=600, no-store"', // stray trailing quote
+		'"private"', // quoted directive name
+		'"no-store"',
+	]) {
+		assert.equal(rawCache.storeRefusal(cc(value), policy()), 'no-store', value);
+	}
+	// And the refusal is not an artefact of the fallback being reached for everything: the
+	// well-formed false positives are still stored.
+	for (const value of ['no-cache="X-Private-Header", max-age=600', 'x-private-hint=1, max-age=600', 'privately-held']) {
+		assert.equal(rawCache.storeRefusal(cc(value), policy()), null, value);
+	}
+});
+
 test('unsharedHint names the ground, and reports nothing for a plainly shared response', () => {
 	assert.equal(rawCache.unsharedHint(originResource()), null);
 	assert.equal(rawCache.unsharedHint(originResource({ hadSetCookie: true })), 'set-cookie');

@@ -1382,15 +1382,32 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'about the body — and refusing on them stores nothing at all. Measured on one deployment: ' +
 						'`Set-Cookie` on 8 of 8 listing responses and `private` on 4 of 8, so an enabled route ' +
 						'filled ZERO documents against 33,572 misses an hour, every one of them refused.\n\n' +
-						'VERIFY BEFORE SETTING IT, and the check is cheap: fetch the same URL twice as two COLD ' +
-						'visitors (no cookies) and diff the bodies. If the only differences are per-request ' +
-						'telemetry — a bot-manager sensor payload, a request id, a nonce — the document is shared ' +
-						'and this is safe. If any CONTENT differs, it is not, and no CDN behaviour makes it so.\n\n' +
+						'VERIFY BEFORE SETTING IT: fetch the same URL as two DIFFERENT visitors and diff the ' +
+						'bodies. If the only differences are per-request telemetry — a bot-manager sensor payload, ' +
+						'a request id, a nonce — the document is shared and this is safe. If any CONTENT differs, ' +
+						'it is not, and no CDN behaviour makes it so.\n\n' +
+						'“DIFFERENT VISITORS” MEANS DIFFERENT IP AND LOCALE, NOT JUST A FRESH COOKIE JAR. Two cold ' +
+						'fetches from one machine share their source address, `accept-language` and `referer`, and ' +
+						'the origin fetch forwards all of those (only `cookie`, `authorization`, `host`, ' +
+						'`user-agent`, `accept-encoding` and `origin.ignoredHeaders` are stripped) while the cache ' +
+						'key is url + device alone. So that pair of fetches is blind BY CONSTRUCTION to ' +
+						'geo-, IP- and locale-driven variance — store selection, currency, translated copy — which ' +
+						'is the personalization a retail origin is most likely to have. Vary the vantage point.\n\n' +
+						'Nothing reads `Vary`. An origin naming a request header there is declaring the response ' +
+						'varies on something this cache key does not contain, and with `Set-Cookie` and `private` ' +
+						'both suppressed it is the last standard statement left; check it by hand before enabling.\n\n' +
 						'A literal `no-store` is still refused. That is the origin instructing caches not to keep ' +
 						'the response at all, which is a different statement from “not for shared caches”.\n\n' +
-						'THE ALARM SURVIVES. A document stored under this setting is counted as `stored-unshared` ' +
-						'rather than `stored`, so the share of a route the origin calls personal stays visible and ' +
-						'a rise still means personalization appeared where it was assumed absent.'
+						'WHAT THE METRIC CAN AND CANNOT TELL YOU. A document stored under this setting is counted ' +
+						'as `stored-unshared` rather than `stored`, so the share of a route the origin calls ' +
+						'personal stays visible. Read it as a CENSUS, not an alarm: on an origin that sets a ' +
+						'cookie on every response it is 100% from the first minute and cannot rise, so no ' +
+						'threshold on it detects anything. Re-running the body diff above is the detector.\n\n' +
+						'A STORED `private` IS RELAYED ON EVERY RAW HIT, because the stored headers are the ' +
+						'origin’s own and `cache-control` is relayed from storage exactly as the origin proxy ' +
+						'already relays it on a miss. So this is not a change for those URLs — but a downstream ' +
+						'shared cache that honours `private` will not cache the hit, so do not expect edge offload ' +
+						'on it.'
 				),
 			}
 		),

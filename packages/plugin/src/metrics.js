@@ -526,9 +526,11 @@ export const METRICS = Object.freeze({
 			'enabled and filling nothing is indistinguishable from one that is switched off unless the reason is ' +
 			'recorded. oversize climbing means render.raw.maxBytes is below the route’s real document size; ' +
 			'has-cookie climbing means the origin is personalizing a route that was assumed to be shared, which ' +
-			'is the one outcome worth an alert. Under render.raw.assumeShared that alarm moves rather than ' +
-			'disappearing — those documents store as stored-unshared, so watch its share of the two stored ' +
-			'series instead. ' +
+			'is the one outcome worth an alert. Under render.raw.assumeShared those documents are STORED and ' +
+			'counted as stored-unshared instead, and that series is a CENSUS, not an alarm: on an origin that ' +
+			'sets a cookie on every response it is pinned at 100% from the first minute and cannot rise, so no ' +
+			'threshold on it detects anything. What still detects personalization is re-running the body diff ' +
+			'the option documents. Read stored + stored-unshared as the store rate. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
@@ -618,7 +620,9 @@ export const METRICS = Object.freeze({
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
-					"route's discoverTargets, 'bot' = ingress.discoveryBots). Other series: null.",
+					"route's discoverTargets, 'bot' = ingress.discoveryBots). raw_cache: THE OUTCOME — stored, " +
+					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
+					'Other series: null.',
 			},
 			type: {
 				name: 'context',
