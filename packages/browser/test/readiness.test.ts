@@ -19,6 +19,9 @@ import { renderOnce } from '../dist/renderOnce.js';
 
 let origin: http.Server;
 let base = '';
+// A second origin (same host, other port): "third-party" to pages served from `base`.
+let third: http.Server;
+let thirdBase = '';
 // Responses deliberately left unanswered by `/hang`; destroyed in `after` so the server can close.
 const hanging: http.ServerResponse[] = [];
 
@@ -101,17 +104,82 @@ before(async () => {
 				return res.end(page('<div class="grid"><div class="tile"><img src="/x.png"></div></div>'));
 			case '/grid-empty':
 				return res.end(page('<div class="grid"></div><p class="no-results">nothing</p>'));
+			// Content in two waves: one rail in the document, three more once a same-origin API answers.
+			case '/two-waves':
+				return res.end(
+					page(
+						'<div class="rail"><span class="slide">1</span></div><div id="more"></div>',
+						`<script>setTimeout(() => { fetch('/slow-json').then((r) => r.json()).then(() => {
+							document.getElementById('more').innerHTML =
+								'<div class="rail"><span class="slide">2</span></div><div class="rail"><span class="slide">3</span></div>'; }); }, 100);</script>`
+					)
+				);
+			case '/slow-json':
+				setTimeout(() => {
+					res.setHeader('content-type', 'application/json');
+					res.end('{"ok":true}');
+				}, 700);
+				return;
+			// The content is added by a THIRD-PARTY script that is slow to arrive: nothing same-origin is
+			// in flight, the DOM is quiet, and the document has not loaded.
+			case '/third-party-late':
+				return res.end(page('<p>ok</p>', `<script async src="${thirdBase}/slow.js"></script>`));
+			// Hydration that starts, pauses, then finishes — the shape of a starved idle callback.
+			case '/islands-paused':
+				return res.end(
+					page(
+						'<my-island ssr></my-island><my-island ssr></my-island><my-island ssr id="late"></my-island>',
+						`<script>setTimeout(() => { for (const el of document.querySelectorAll('my-island:not(#late)'))
+							el.removeAttribute('ssr'); }, 150);
+						setTimeout(() => document.getElementById('late').removeAttribute('ssr'), 1200);</script>`
+					)
+				);
+			// A main thread that is never idle: a MessageChannel loop keeps a task queued for 3s, and the
+			// content hydrates in a requestIdleCallback with no timeout.
+			case '/idle-starved':
+				return res.end(
+					page(
+						'<div id="host"></div>',
+						`<script>
+							requestIdleCallback(() => { document.getElementById('host').innerHTML = '<div class="hydrated">h</div>'; });
+							const until = Date.now() + 3000;
+							const ch = new MessageChannel();
+							ch.port1.onmessage = () => { const end = Date.now() + 30; while (Date.now() < end) {} if (Date.now() < until) ch.port2.postMessage(0); };
+							ch.port2.postMessage(0);
+						</script>`
+					)
+				);
+			// A script at a randomised-looking path that would add `.junk`, and one at a stable path that
+			// adds `.keep`; only a regex can name the first.
+			case '/regex-block':
+				// Scripts at the end of BODY, so `document.body` exists when they run.
+				return res.end(page('<p>ok</p><script src="/a1b2c3/xlqcP1U7"></script><script src="/keep.js"></script>'));
+			case '/a1b2c3/xlqcP1U7':
+			case '/keep.js': {
+				res.setHeader('content-type', 'application/javascript');
+				const cls = path === '/keep.js' ? 'keep' : 'junk';
+				return res.end(`document.body.insertAdjacentHTML('beforeend', '<div class="${cls}">x</div>');`);
+			}
 			default:
 				return res.end(page('<p>ok</p>'));
 		}
 	});
 	await new Promise<void>((resolve) => origin.listen(0, '127.0.0.1', resolve));
 	base = `http://127.0.0.1:${(origin.address() as AddressInfo).port}`;
+
+	third = http.createServer((req, res) => {
+		res.setHeader('content-type', 'application/javascript');
+		// Slow to arrive, and the only thing that produces the content the contract names.
+		setTimeout(() => res.end(`document.body.insertAdjacentHTML('beforeend', '<div class="late">x</div>');`), 700);
+	});
+	await new Promise<void>((resolve) => third.listen(0, '127.0.0.1', resolve));
+	thirdBase = `http://127.0.0.1:${(third.address() as AddressInfo).port}`;
 });
 
 after(() => {
 	for (const res of hanging) res.destroy();
 	origin.close();
+	third.close();
 });
 
 const render = async (
@@ -349,6 +417,99 @@ test('report mode still times how long a satisfiable contract took to hold', asy
 	assert.ok(
 		(result.job.readiness?.firstSatisfiedMs ?? 0) >= 200,
 		'it must report WHEN the content arrived, not merely that it did'
+	);
+});
+
+test('the stop waits for a request the page has open to its own origin', async () => {
+	// Content arrives in waves. After the first rail the contract holds and the DOM is quiet, but the
+	// page has a same-origin fetch in flight whose answer adds two more rails. Measured on a live
+	// product page: one rail stored out of four. The stop must hold while that request is young.
+	const result = await render('/two-waves', {
+		name: 'rails',
+		require: [{ name: 'rails-filled', every: '.rail', contains: '.slide' }],
+		timeoutMs: 5000,
+	});
+	const rails = (result.html ?? '').match(/class="rail"/g)?.length ?? 0;
+	assert.equal(rails, 3, `all three rails were serialized (got ${rails})`);
+	assert.equal(result.job.readiness?.stopped, true, 'and the contract, not a timer, ended the render');
+	assert.ok(
+		(result.job.readiness?.waitedMs ?? 0) >= 600,
+		`held through the fetch (${result.job.readiness?.waitedMs}ms)`
+	);
+});
+
+test('the rot valve does not stand a clause aside before the document has loaded', async () => {
+	// Nothing same-origin is in flight, the DOM is quiet, and the clause has never been true — every
+	// signal the valve used to read as rot. But a third-party script the document itself named has not
+	// arrived yet, so the page is not done; `load` has not fired.
+	const result = await render(
+		'/third-party-late',
+		{ name: 'late', require: [{ name: 'late', selector: '.late', minCount: 1 }], timeoutMs: 5000 },
+		{ unmetGraceMs: 200 }
+	);
+	assert.equal(result.job.readiness?.satisfied, true, 'the clause held once the script ran');
+	assert.equal(result.job.readiness?.stopped, true);
+	assert.ok((result.job.readiness?.waitedMs ?? 0) >= 500, `waited for load (${result.job.readiness?.waitedMs}ms)`);
+});
+
+test('the rot valve does not stand a hydration clause aside while hydration is in progress', async () => {
+	// Two of three islands shed the marker, then nothing for a second: an attribute change the DOM
+	// monitor cannot see, so the page reads as quiet. A count that has fallen and not reached its
+	// target is hydration mid-way, not rot — measured as 11 of 27 islands left for 8 s on a starved page.
+	const result = await render(
+		'/islands-paused',
+		{ name: 'hydrated', require: [{ name: 'hydrated', selector: 'my-island', shed: 'ssr' }], timeoutMs: 5000 },
+		{ unmetGraceMs: 200 }
+	);
+	assert.equal(result.job.readiness?.satisfied, true, 'the last island hydrated and the clause held');
+	assert.equal(result.job.readiness?.stopped, true);
+	assert.ok(
+		(result.job.readiness?.waitedMs ?? 0) >= 1000,
+		`waited through the pause (${result.job.readiness?.waitedMs}ms)`
+	);
+});
+
+test('a capped requestIdleCallback fires on a main thread that is never idle', async () => {
+	// The page hydrates in an idle callback with no timeout while a task is always queued. With the cap
+	// the browser runs the callback as an ordinary task once the cap elapses; the render then holds and
+	// stops. This is the mechanism behind deferred islands that never hydrate on a saturated pod.
+	const contract = {
+		name: 'hydrated',
+		require: [{ name: 'hydrated', selector: '.hydrated', minCount: 1 }],
+		timeoutMs: 6000,
+	};
+	const capped = await render('/idle-starved', contract, {}, { idleCallbackTimeoutMs: 100 });
+	assert.equal(capped.job.readiness?.satisfied, true, 'hydrated under the cap');
+	assert.ok(
+		(capped.job.readiness?.firstSatisfiedMs ?? Infinity) < 2000,
+		`held well before the busy loop ended (${capped.job.readiness?.firstSatisfiedMs}ms)`
+	);
+	assert.match(capped.html ?? '', /class="hydrated"/);
+});
+
+test('a block pattern may be a regular expression, honoured by interception and the strip alike', async () => {
+	const junkPath = '/a1b2c3/xlqcP1U7';
+	const result = await renderOnce({
+		url: `${base}/regex-block`,
+		captureNonIndexable: true,
+		config: {
+			navigation: { networkIdleMs: 50, networkIdleTimeoutMs: 200, domStableMs: 0, domStableTimeoutMs: 300 },
+			scroll: { enabled: false },
+			block: { urlPatterns: ['re:/[a-z0-9]{6}/[A-Za-z0-9]{8}$'] },
+			postProcess: { stripScripts: false, stripBlockedResources: true },
+		} as never,
+	});
+	const html = result.html ?? '';
+	assert.match(html, /class="keep"/, 'the stable script ran');
+	assert.doesNotMatch(html, /class="junk"/, 'the regex-matched script was aborted');
+	assert.ok(!html.includes(junkPath), 'and its element was stripped from the output');
+	assert.match(html, /keep\.js/, 'while the other script element stayed');
+});
+
+test('an invalid regular expression in block.urlPatterns is rejected at config load', async () => {
+	await assert.rejects(
+		renderOnce({ url: `${base}/no-islands`, config: { block: { urlPatterns: ['re:('] } } as never }),
+		/urlPatterns/
 	);
 });
 
