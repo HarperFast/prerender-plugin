@@ -280,6 +280,11 @@ export type ReadinessResult = {
 	rebaselined?: boolean;
 	/** What the consumer should store as this URL's expectation after this render. */
 	learned?: Record<string, number>;
+	/**
+	 * Whether every clause held. On the armed path this is restated against the DOM that was actually
+	 * serialized (see `finalize` in renderer.ts), so it answers "did this render finish complete?" —
+	 * not "did the contract hold in time", which is `firstSatisfiedMs`.
+	 */
 	satisfied: boolean;
 	/**
 	 * True when this contract ENDED the render: every clause held and the page had gone quiet. Not
@@ -287,9 +292,13 @@ export type ReadinessResult = {
 	 * within its timeout is satisfied and did not stop; the render fell back to the ordinary settle.
 	 */
 	stopped: boolean;
-	/** Wall time the contract held the render open. */
+	/** Wall time the contract held the render open. Never includes the fallback settle. */
 	waitedMs: number;
-	/** How long until it first became true, or null if it never did. */
+	/**
+	 * How long until it first became true WITHIN the contract's own window, or null if it never did.
+	 * This is the number `timeoutMs` is tuned from, so it is deliberately NOT restated afterwards:
+	 * `satisfied: true` with `firstSatisfiedMs: null` means the page completed during the fallback.
+	 */
 	firstSatisfiedMs: number | null;
 	require: AssertionResult[];
 	observe: AssertionResult[];
