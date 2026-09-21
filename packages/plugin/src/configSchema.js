@@ -1368,6 +1368,30 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'Content types eligible for storage, matched against the leading type of the response ' +
 						'`content-type` (parameters ignored). Anything else is served and not stored.'
 				),
+				assumeShared: option(
+					false,
+					'Store a document even when the origin marks it as NOT a shared artifact — a `Set-Cookie` ' +
+						'on the response, or `Cache-Control: private`.\n\n' +
+						'WHY THIS IS A SWITCH AND NOT A DEFAULT. Both signals are heuristics for one question: is ' +
+						'this response the same for every crawler? A `Set-Cookie` usually means the body was ' +
+						'personalized, and storing one then replays somebody’s session to everybody — so the ' +
+						'default refuses, and must keep refusing for an origin nobody has checked.\n\n' +
+						'BUT AN ORIGIN CAN BE WRONG ABOUT ITSELF. Where a CDN in front already serves ONE cached ' +
+						'copy of these documents to every visitor, with none of the session cookies in its cache ' +
+						'key, the origin’s `private` and `Set-Cookie` are about session BOOTSTRAP and say nothing ' +
+						'about the body — and refusing on them stores nothing at all. Measured on one deployment: ' +
+						'`Set-Cookie` on 8 of 8 listing responses and `private` on 4 of 8, so an enabled route ' +
+						'filled ZERO documents against 33,572 misses an hour, every one of them refused.\n\n' +
+						'VERIFY BEFORE SETTING IT, and the check is cheap: fetch the same URL twice as two COLD ' +
+						'visitors (no cookies) and diff the bodies. If the only differences are per-request ' +
+						'telemetry — a bot-manager sensor payload, a request id, a nonce — the document is shared ' +
+						'and this is safe. If any CONTENT differs, it is not, and no CDN behaviour makes it so.\n\n' +
+						'A literal `no-store` is still refused. That is the origin instructing caches not to keep ' +
+						'the response at all, which is a different statement from “not for shared caches”.\n\n' +
+						'THE ALARM SURVIVES. A document stored under this setting is counted as `stored-unshared` ' +
+						'rather than `stored`, so the share of a route the origin calls personal stays visible and ' +
+						'a rise still means personalization appeared where it was assumed absent.'
+				),
 			}
 		),
 		defaultInterval: option(

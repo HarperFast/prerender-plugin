@@ -520,13 +520,15 @@ export const METRICS = Object.freeze({
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
 			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
 			'render rotation", the corpus growth the gate is preventing. ' +
-			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, or the reason it ' +
-			'was refused (not-200, staging, has-cookie, content-type, no-store, no-body, oversize, ' +
-			'capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is enabled and ' +
-			'filling nothing is indistinguishable from one that is switched off unless the reason is recorded. ' +
-			'oversize climbing means render.raw.maxBytes is below the route’s real document size; has-cookie ' +
-			'climbing means the origin is personalizing a route that was assumed to be shared, which is the one ' +
-			'outcome worth an alert. ' +
+			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
+			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
+			'oversize, capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is ' +
+			'enabled and filling nothing is indistinguishable from one that is switched off unless the reason is ' +
+			'recorded. oversize climbing means render.raw.maxBytes is below the route’s real document size; ' +
+			'has-cookie climbing means the origin is personalizing a route that was assumed to be shared, which ' +
+			'is the one outcome worth an alert. Under render.raw.assumeShared that alarm moves rather than ' +
+			'disappearing — those documents store as stored-unshared, so watch its share of the two stored ' +
+			'series instead. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +

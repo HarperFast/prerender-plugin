@@ -85,6 +85,25 @@ const mediaTypeOf = (contentType) =>
 		.toLowerCase();
 
 /**
+ * Did the origin claim this document is NOT a shared artifact, and on what grounds?
+ *
+ * Two signals, one question: is this response the same for every crawler? `Set-Cookie` is the
+ * indirect form (it usually accompanies a personalized body) and `Cache-Control: private` is the
+ * explicit one. Reported rather than acted on here, because whether the claim is TRUE is a property
+ * of the origin — an origin fronted by a CDN that already serves one cached copy of these documents
+ * to every visitor is wrong about itself, and only the deployment can know that.
+ *
+ * `no-store` is deliberately absent: it is an instruction not to keep the response at all, which
+ * `render.raw.assumeShared` does not override.
+ */
+export const unsharedHint = (resource) => {
+	if (resource?.hadSetCookie) return 'set-cookie';
+	const cacheControl = String(resource?.headers?.['cache-control'] ?? '').toLowerCase();
+	if (cacheControl.includes('private')) return 'private';
+	return null;
+};
+
+/**
  * May this origin response be stored? Returns the reason it may not, or null when it may.
  *
  * Ordered cheapest-first, and every branch names itself so `rawCache{outcome}` reports WHY a route
@@ -93,18 +112,28 @@ const mediaTypeOf = (contentType) =>
 export const storeRefusal = (resource, policy) => {
 	if (resource.statusCode !== 200) return 'not-200';
 	if (resource.viaStaging) return 'staging';
+	const unshared = unsharedHint(resource);
 	// The origin tried to set a cookie, which is the best hint available that this document was
 	// personalized. The sanitizer already dropped the header, so this is the only place that can
 	// still see it — see `fetchOriginResource`. A personalized document stored here would be
 	// replayed to every crawler that asks.
-	if (resource.hadSetCookie) return 'has-cookie';
+	//
+	// `assumeShared` is the deployment asserting, against measured evidence, that this origin's
+	// cookies are session BOOTSTRAP and its bodies are shared. It is off by default and must stay
+	// off for any origin nobody has checked — see the option's own documentation for the check.
+	if (unshared === 'set-cookie' && !policy.assumeShared) return 'has-cookie';
 	const headers = resource.headers ?? {};
 	if (!policy.contentTypes.includes(mediaTypeOf(headers['content-type']))) return 'content-type';
-	// `private` and `no-store` are the origin saying this response is not a shared-cache artifact.
+	const cacheControl = String(headers['cache-control'] ?? '').toLowerCase();
+	// `no-store` is the origin instructing caches not to keep this response AT ALL, and
+	// `assumeShared` does NOT override it: that setting answers "is this response the same for every
+	// crawler", which is a different question from "may it be kept". `private` is the explicit form
+	// of the sharedness claim, so that one yields.
+	//
 	// `no-cache` is deliberately NOT refused: it means revalidate-before-use, not do-not-store, and
 	// refusing it would exclude most correctly-configured HTML.
-	const cacheControl = String(headers['cache-control'] ?? '').toLowerCase();
-	if (cacheControl.includes('private') || cacheControl.includes('no-store')) return 'no-store';
+	if (cacheControl.includes('no-store')) return 'no-store';
+	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
 	return null;
 };
 
@@ -220,7 +249,12 @@ export const storeRawPage = async ({ cacheKey, resource, bytes, policy }) => {
 			headers: JSON.stringify(storedHeaders(resource.headers)),
 			expiresAt: new Date(rawExpiresAt(policy)),
 		});
-		metrics.rawCache('stored');
+		// COUNTED APART WHEN THE ORIGIN CALLED IT PERSONAL. Enabling `assumeShared` must not silence
+		// the signal it overrides: `has-cookie` climbing is the alarm that an origin started
+		// personalizing a route assumed to be shared, and if those documents simply became ordinary
+		// `stored` rows that alarm would disappear exactly where it is most needed. Still one emit per
+		// attempt, so the series keeps summing to one per store.
+		metrics.rawCache(unsharedHint(resource) ? 'stored-unshared' : 'stored');
 	} catch (e) {
 		metrics.rawCache('write-failed');
 		logger.warn?.(`[prerender] raw document not stored for ${cacheKey}: ${e?.message ?? String(e)}`);
