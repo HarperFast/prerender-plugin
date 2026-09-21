@@ -242,7 +242,7 @@ include what you change:
 	"defaultDevice": "desktop", // fallback for an unknown deviceType
 	"block": {
 		"resourceTypes": ["image", "media", "font"], // aborted before loading
-		"urlPatterns": ["google-analytics.com"], // abort requests whose URL contains any
+		"urlPatterns": ["google-analytics.com", "re:/public/[0-9a-f]{40,}"], // abort URLs containing a substring, or matching a `re:` regex
 	},
 	// Reuse the first device's document for the other devices of a job (see "Document reuse" above).
 	// Only for a RESPONSIVE site; `sampleEvery` keeps a running structural check of that assumption.

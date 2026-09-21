@@ -6,6 +6,8 @@ import { resolveConfigForJob, type PostProcessConfig } from './config.js';
 import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 import { monitorSource } from './domMonitor.js';
+import { idleCallbackCapSource } from './idleCallbackCap.js';
+import { compileUrlPatterns } from './util/urlPatterns.js';
 import {
 	assessExpectations,
 	contractFor,
@@ -26,6 +28,13 @@ const noop = () => {};
 
 // 1×1 transparent GIF used to satisfy blocked image requests (see block.stubImages).
 const STUB_IMAGE = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+/**
+ * How long a request to the page's own origin counts as "content on its way". Older than this it is
+ * treated as a long-poll or a hung connection and no longer holds the contract stop or the rot valve
+ * open. Content APIs on a busy origin answer in ~0.2-2 s; a telemetry stream never does.
+ */
+const IN_FLIGHT_MAX_AGE_MS = 5000;
+
 const STUB_IMAGE_RESPONSE = { status: 200, contentType: 'image/gif', body: STUB_IMAGE };
 
 // Forces the Web Components polyfills so shadow DOM / custom-element CSS is
@@ -74,8 +83,9 @@ const renderer: Renderer = async (page, job) => {
 
 	const blockedResourceTypes = new Set(config.block.resourceTypes);
 	const blockedUrlPatterns = config.block.urlPatterns;
-	const isBlockedUrl = (requestUrl: string) =>
-		blockedUrlPatterns.length > 0 && blockedUrlPatterns.some((pattern) => requestUrl.includes(pattern));
+	// Substring or `re:` regex, compiled once per render — the same matcher the strip in postProcess
+	// applies, so what was aborted and what is removed from the output can never disagree.
+	const isBlockedUrl = compileUrlPatterns(blockedUrlPatterns);
 
 	// The bypass token goes to the navigation's OWN origin and nowhere else, so it can never be
 	// handed to a third-party host the page happens to pull from.
@@ -129,6 +139,13 @@ const renderer: Renderer = async (page, job) => {
 		setupPromises.push(page.evaluateOnNewDocument(monitorSource()));
 	}
 
+	// Deferred hydration waits for an idle period, and a saturated render pod may never offer one —
+	// see idleCallbackCap.ts. Installed whenever configured, contract or not: a plain timer settle
+	// loses the same islands for the same reason.
+	if (config.navigation.idleCallbackTimeoutMs > 0) {
+		setupPromises.push(page.evaluateOnNewDocument(idleCallbackCapSource(config.navigation.idleCallbackTimeoutMs)));
+	}
+
 	const ac = new AbortController();
 	let aborted = false;
 
@@ -144,13 +161,23 @@ const renderer: Renderer = async (page, job) => {
 	 * render and answers ~1 s later.
 	 *
 	 * A blocked or aborted request fires `requestfailed`, so the entries are removed either way.
+	 *
+	 * Bounded by age, because a request that has been outstanding for many seconds is a long-poll or
+	 * a hung connection, not content on its way — and a stop condition pinned by one of those would
+	 * wait out every timeout. `IN_FLIGHT_MAX_AGE_MS` is sized well above the ~0.2-2 s a content API
+	 * takes to answer on a busy origin.
 	 */
-	const inFlightSameOrigin = new Set<unknown>();
+	const inFlightSameOrigin = new Map<unknown, number>();
 	page.on('request', (req) => {
-		if (isSameOrigin(req.url())) inFlightSameOrigin.add(req);
+		if (isSameOrigin(req.url())) inFlightSameOrigin.set(req, Date.now());
 	});
 	page.on('requestfinished', (req) => inFlightSameOrigin.delete(req));
 	page.on('requestfailed', (req) => inFlightSameOrigin.delete(req));
+	const fetchingOwnOrigin = (): boolean => {
+		const cutoff = Date.now() - IN_FLIGHT_MAX_AGE_MS;
+		for (const startedAt of inFlightSameOrigin.values()) if (startedAt > cutoff) return true;
+		return false;
+	};
 
 	page
 		.on('request', async (req) => {
@@ -683,6 +710,14 @@ const renderer: Renderer = async (page, job) => {
 	 * still changing with nothing having said it may. Reproduced on a live product page with an
 	 * unreachable `quietMs`: settle ended at exactly the timeout and no gate ran. Either way a
 	 * contract can cost a render time, never content.
+	 *
+	 * THE STOP ALSO WAITS ON THE PAGE'S OWN IN-FLIGHT REQUESTS. Content arrives in waves: measured on
+	 * a product page, one recommendation rail rendered from an early source and three more from a
+	 * same-origin API that answered 1.5 s later. "Every rail that exists is filled" held after the
+	 * first wave, the DOM was quiet for the 250 ms window, and the snapshot shipped one rail out of
+	 * four — a truncation no clause can name and that a quiet window shorter than the gap cannot see.
+	 * A request the page has open to its own origin says a wave is still coming, so the stop holds
+	 * while one is young (see `IN_FLIGHT_MAX_AGE_MS`).
 	 */
 	const awaitContract = async (
 		governing: NonNullable<ReturnType<typeof contractFor>>
@@ -702,6 +737,14 @@ const renderer: Renderer = async (page, job) => {
 		// waited on — the difference between a gate and a tax.
 		const known = new Set(job.expectations?.unsatisfiable ?? []);
 		const firstTrue = new Map<string, number>();
+		// For `shed` clauses: the most elements ever seen still carrying the attribute. A clause whose
+		// count has fallen below its peak and is not yet satisfied is hydration IN PROGRESS — the valve
+		// must not read a pause in it as rot. Measured: 27 islands, 11 left for 8 s on a starved page.
+		const shedNames = new Set(
+			governing.require.filter((a) => typeof (a as { shed?: unknown }).shed === 'string').map((a) => a.name)
+		);
+		const shedPeak = new Map<string, number>();
+		const progressing = new Set<string>();
 		let quietSince = 0;
 		let grantedGrace = false;
 		let stopped = false;
@@ -716,12 +759,25 @@ const renderer: Renderer = async (page, job) => {
 			}
 			for (const clause of last.require) {
 				if (clause.ok && !firstTrue.has(clause.name)) firstTrue.set(clause.name, Date.now() - started);
+				if (shedNames.has(clause.name)) {
+					const peak = Math.max(shedPeak.get(clause.name) ?? 0, clause.count);
+					shedPeak.set(clause.name, peak);
+					if (!clause.ok && clause.count < peak) progressing.add(clause.name);
+					else progressing.delete(clause.name);
+				}
 			}
 			// No verdict is meaningful before the parser finishes: an empty document satisfies
 			// absence-shaped clauses by having nothing in it, and is quiet for the same reason.
 			const held = last.started && last.require.every((r) => r.ok || known.has(r.name));
 			if (held && firstSatisfiedMs === null) firstSatisfiedMs = Date.now() - started;
 			const quiet = last.quietMs >= 0 && last.quietMs >= quietFor;
+
+			// Held and quiet, but the page is still waiting on its own origin: the next wave of content
+			// is on the wire. Hold the stop until it lands, or the request ages out as a long-poll.
+			if (held && quiet && fetchingOwnOrigin()) {
+				await new Promise((resolve) => setTimeout(resolve, pollMs));
+				continue;
+			}
 
 			if (held && quiet) {
 				// The contract is silent about anything it does not name. Before accepting, check what
@@ -739,27 +795,28 @@ const renderer: Renderer = async (page, job) => {
 				break;
 			}
 
-			// THE ROT VALVE. Every clause either holds or has never been true at all, the page has
-			// stopped changing, AND it has stopped fetching from its own origin — so waiting out the
-			// rest of the timeout will not produce what is missing. Stand aside, report it, and let
-			// the ordinary settle finish the render.
+			// THE ROT VALVE. Every clause either holds or has never been true at all, and the page has
+			// genuinely finished — loaded, still, nothing in flight to its own origin, no hydration
+			// mid-way — so waiting out the rest of the timeout will not produce what is missing. Stand
+			// aside, report it, and let the ordinary settle finish the render.
 			//
-			// THE SAME-ORIGIN CONDITION IS NOT OPTIONAL, and leaving it out is what made this valve
-			// misfire on exactly the renders it most needed to get right. Its premise is "the page is
-			// done, so this clause will never be true", inferred from DOM quiet alone — and a
-			// CPU-STARVED PAGE IS QUIET BECAUSE IT HAS NOT STARTED YET, not because it has finished.
-			// Measured on a contended pod: the valve stood the recommendation-rail clause aside after
-			// 1,075 ms and 1,174 ms, while the API that fills those rails had not even been REQUESTED
-			// yet — it went out at 7.9 s and 10.0 s. The render then fell through to the blind timers
-			// and, on 2 of 3 interleaved runs of the same URL, serialized before the response landed:
-			// 0 product links and 431 KB against 476 links and 974 KB.
+			// EVERY PRECONDITION IS A RENDER THIS RELEASED TOO EARLY. Its premise is "the page is done,
+			// so this clause will never be true", and DOM quiet alone cannot establish that: a
+			// CPU-STARVED PAGE IS QUIET BECAUSE IT HAS NOT GOT THERE YET, not because it has finished.
+			// Measured on a contended pod: it stood the recommendation-rail clause aside after ~1.1 s
+			// while the API that fills those rails had not even been REQUESTED (it went out at 7.9 s
+			// and 10.0 s) — hence the in-flight condition; and at 5.1 s on a page whose 11 remaining
+			// islands were waiting for an idle period a 90%-busy main thread never gave them — hence
+			// the load and hydration-progress conditions. Both renders were then serialized by the
+			// blind fallback timers before the rails landed: 0 product links against 476.
 			//
-			// Waiting on in-flight same-origin work makes the valve mean what it says. A clause that
-			// has genuinely rotted still releases the render, because a page that has stopped
-			// fetching is a page that really is done.
-			if (last.started && !held) {
-				const stalled = last.require.every((r) => r.ok || known.has(r.name) || !firstTrue.has(r.name));
-				if (stalled && quiet && inFlightSameOrigin.size === 0) {
+			// A clause that has genuinely rotted still releases the render, because a page that has
+			// loaded, hydrated what it started and stopped fetching really is done.
+			if (last.started && last.loaded && !held) {
+				const stalled = last.require.every(
+					(r) => r.ok || known.has(r.name) || (!firstTrue.has(r.name) && !progressing.has(r.name))
+				);
+				if (stalled && quiet && !fetchingOwnOrigin()) {
 					if (quietSince === 0) quietSince = Date.now();
 					else if (Date.now() - quietSince >= graceMs) break;
 				} else {
@@ -1513,6 +1570,12 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 		// Remove resource elements pointing at blocked hosts (ad/analytics/RUM pixels,
 		// frames, scripts) so the served HTML doesn't fire them on load. Runs after the
 		// shadow flatten so pixels that came from shadow content are caught too.
+		// The same two forms interception honours (util/urlPatterns.ts), inlined because this runs in
+		// the page: a substring, or a `re:`-prefixed regular expression. Validated at config load, so a
+		// pattern that reaches here compiles.
+		const substrings = blockedUrlPatterns.filter((p) => !p.startsWith('re:'));
+		const regexes = blockedUrlPatterns.filter((p) => p.startsWith('re:')).map((p) => new RegExp(p.slice(3)));
+		const blocked = (url: string) => substrings.some((p) => url.includes(p)) || regexes.some((r) => r.test(url));
 		document.querySelectorAll('img, iframe, script, source, embed, object, link, video, audio').forEach((el) => {
 			const url =
 				el.getAttribute('src') ||
@@ -1520,7 +1583,7 @@ function postProcess(opts: PostProcessConfig, blockedUrlPatterns: string[] = [])
 				el.getAttribute('srcset') ||
 				el.getAttribute('data-src') ||
 				'';
-			if (url && blockedUrlPatterns.some((pattern) => url.includes(pattern))) el.remove();
+			if (url && blocked(url)) el.remove();
 		});
 	}
 

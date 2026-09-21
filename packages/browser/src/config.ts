@@ -14,6 +14,7 @@ import { resolve as resolvePath } from 'node:path';
 import { KnownDevices } from 'puppeteer';
 import type { PuppeteerLifeCycleEvent } from 'puppeteer';
 import { validateReadiness, type ReadinessConfig } from './readiness.js';
+import { compileUrlPatterns } from './util/urlPatterns.js';
 
 export type Viewport = {
 	width: number;
@@ -33,7 +34,12 @@ export type DeviceProfile = {
 export type BlockConfig = {
 	/** Puppeteer resource types aborted before they load (e.g. image, media, font, stylesheet). */
 	resourceTypes: string[];
-	/** Requests whose URL contains any of these substrings are aborted (e.g. analytics/ad hosts). */
+	/**
+	 * Requests whose URL matches any entry are aborted (e.g. analytics/ad hosts). A plain entry is a
+	 * substring test. An entry prefixed `re:` is a JavaScript regular expression tested against the
+	 * full URL — for resources served from randomised paths no substring can name (see
+	 * util/urlPatterns.ts). An expression that does not compile is rejected at config load.
+	 */
 	urlPatterns: string[];
 	/**
 	 * When `image` is in `resourceTypes`, answer blocked image requests with a 1×1
@@ -118,6 +124,24 @@ export type NavigationConfig = {
 	 * in the document would see pages skipped that a full render would have kept.
 	 */
 	skipSettleWhenNonIndexable: boolean;
+	/**
+	 * Cap (ms) on how long the page's `requestIdleCallback` calls may wait for an idle period; 0 leaves
+	 * the browser's behaviour alone. See idleCallbackCap.ts.
+	 *
+	 * Island frameworks hydrate deferred components in an idle callback, and an idle callback fires
+	 * only when the main thread has nothing queued. A render pod at its CPU quota rarely has that:
+	 * measured, the page's main thread was busy for 89-95% of every render profiled, the
+	 * `client:idle` islands waited 3.6-8 s on product pages and never hydrated at all on desktop
+	 * listing pages — and those islands are what fetch and render the recommendation rails. A fast
+	 * device would have hydrated them a few hundred ms after load; this makes the renderer behave
+	 * like one. Nothing runs that would not have run; it runs sooner.
+	 *
+	 * Cheap to be wrong about in the loose direction (a page hydrates its deferred islands a little
+	 * earlier than it would on a slow phone) and expensive in the strict direction (content waits on
+	 * an idle period that never comes). 200 is a reasonable cap; a value under a frame (16 ms) buys
+	 * nothing more.
+	 */
+	idleCallbackTimeoutMs: number;
 };
 
 export type ScrollConfig = {
@@ -543,6 +567,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		domStableTolerance: 8,
 		finalDomStable: false,
 		skipSettleWhenNonIndexable: false,
+		idleCallbackTimeoutMs: 0,
 	},
 	scroll: {
 		enabled: true,
@@ -643,10 +668,25 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	// domStableMs may be 0 (disabled), domStableTolerance 0 (exact match), and
 	// navigationTimeoutMs 0 (no navigation sub-cap), so these only have to be non-negative.
-	for (const field of ['domStableMs', 'domStableTolerance', 'navigationTimeoutMs'] as const) {
+	for (const field of ['domStableMs', 'domStableTolerance', 'navigationTimeoutMs', 'idleCallbackTimeoutMs'] as const) {
 		if (typeof config.navigation[field] !== 'number' || config.navigation[field] < 0) {
 			throw new Error(`prerender config: navigation.${field} must be a non-negative number`);
 		}
+	}
+	if (config.navigation.idleCallbackTimeoutMs > MAX_TIMER_MS) {
+		throw new Error(`prerender config: navigation.idleCallbackTimeoutMs must be at most ${MAX_TIMER_MS}`);
+	}
+	if (!Array.isArray(config.block.urlPatterns) || config.block.urlPatterns.some((p) => typeof p !== 'string' || !p)) {
+		throw new Error('prerender config: block.urlPatterns must be an array of non-empty strings');
+	}
+	// Compiled here so a malformed expression is a config error rather than a pattern that silently
+	// never matches — the same rule `waitFor.pathPattern` and `readiness` follow.
+	try {
+		compileUrlPatterns(config.block.urlPatterns);
+	} catch (error) {
+		throw new Error(
+			`prerender config: block.urlPatterns has an invalid regular expression: ${(error as Error).message}`
+		);
 	}
 	for (const field of ['finalDomStable', 'skipSettleWhenNonIndexable'] as const) {
 		if (typeof config.navigation[field] !== 'boolean') {

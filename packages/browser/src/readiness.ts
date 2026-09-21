@@ -245,8 +245,18 @@ export type ReadinessConfig = {
 	 * something far worse, and `readiness.satisfied` comes back false naming the clause. Degrading is
 	 * the point — a contract that can only ever make renders slower would not be safe to adopt.
 	 *
-	 * The condition is deliberately narrow: EVERY other clause must hold and the DOM must be quiet. A
-	 * clause that was true and has gone false again means the page is still moving, which is not rot.
+	 * The condition is deliberately narrow, because releasing early costs CONTENT while waiting costs
+	 * only time bounded by `timeoutMs`. Every other clause must hold; the DOM must be quiet; the
+	 * document must have LOADED; nothing the page requested from its own origin may still be in
+	 * flight; and no `shed` clause may be mid-way — one whose remaining count has fallen during this
+	 * render and has not reached its target is hydration in progress, not rot. A clause that was true
+	 * and has gone false again means the page is still moving, which is not rot either.
+	 *
+	 * Each of those was added after the valve released a render it should not have. Measured inside a
+	 * saturated pod: it stood the rails clause aside at 5.1 s on a product page whose 11 remaining
+	 * islands were waiting for an idle period that a 90%-busy main thread never gave them; the
+	 * fallback settle then ended before the rails island ever ran, and the page was stored with zero
+	 * product links. A starved page is quiet. Quiet is not done.
 	 */
 	unmetGraceMs?: number;
 	/**
@@ -339,7 +349,7 @@ export function evaluateContract(payload: {
 	observe: ReadinessAssertion[];
 	/** Element-count drift that does not count as a change, matching the plateau's own tolerance. */
 	tolerance: number;
-}): { require: AssertionResult[]; observe: AssertionResult[]; quietMs: number; started: boolean } {
+}): { require: AssertionResult[]; observe: AssertionResult[]; quietMs: number; started: boolean; loaded: boolean } {
 	// ONE shadow-root walk per tick, shared by every clause. A per-clause walk measured 2-22ms on a
 	// review-heavy page — 9% of a thread at a 250ms poll — for an answer that cannot change between
 	// clauses of the same tick.
@@ -530,8 +540,11 @@ export function evaluateContract(payload: {
 	// A document that is still parsing can satisfy clauses by having nothing in it yet, and it is
 	// quiet for the same reason. No contract verdict is meaningful before the parser has finished.
 	const started = document.readyState !== 'loading';
+	// The load event has fired: every script and stylesheet the document itself named has arrived.
+	// Before that, "nothing is happening" is the wrong reading of a quiet page — see the rot valve.
+	const loaded = document.readyState === 'complete';
 
-	return { require: payload.require.map(run), observe: payload.observe.map(run), quietMs: quiet, started };
+	return { require: payload.require.map(run), observe: payload.observe.map(run), quietMs: quiet, started, loaded };
 }
 
 /**
