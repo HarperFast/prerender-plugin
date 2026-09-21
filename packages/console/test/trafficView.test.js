@@ -899,6 +899,33 @@ test('a raw serve is cache-served and counts toward offload, but is never a fres
 	assert.equal(rows[0].family, 'raw');
 });
 
+test('`stored-unshared` is counted as a STORE, not as a refusal', async () => {
+	// The trap this pins: `refused = total - stored` with `stored` meaning only the literal 'stored'
+	// outcome. Turning `render.raw.assumeShared` on moves every fill onto `stored-unshared`, so the
+	// panel would have read Stored 0 / Refused 100% — with the stored===0 warning lit — at the exact
+	// moment the option made the cache work, and listed the outcome as "something this console does
+	// not know about".
+	const ctx = makeCtx({
+		analytics: {
+			...RAW_ANALYTICS,
+			series: [
+				...RAW_ANALYTICS.series.filter((s) => !(s.metric === 'prerender_ops' && s.path === 'raw_cache')),
+				// What the motivating deployment looks like: every fill is unshared, plus real refusals.
+				combo('prerender_ops', 'raw_cache', 'stored-unshared', null, 150),
+				combo('prerender_ops', 'raw_cache', 'not-200', null, 10),
+			],
+		},
+		config: RAW_CONFIG,
+	});
+	await load(ctx);
+	const text = textOf(ctx);
+	// 150 of 160 stored, so the store rate is 94% and the refusals are the 10 that really were.
+	assert.match(text, /94%/, 'counted as stored');
+	assert.doesNotMatch(text, /an outcome this console does not know about/);
+	assert.match(text, /kept despite the origin marking them personal/, 'the assumption is surfaced');
+	assert.match(text, /CENSUS/i, 'and framed as a census, not an alarm — it is pinned at 100% by construction');
+});
+
 test('the raw-cache panel leads with the refusals, because a silent route looks like a disabled one', async () => {
 	const ctx = await rawReady();
 	const text = textOf(ctx);

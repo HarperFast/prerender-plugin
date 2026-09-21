@@ -1607,6 +1607,14 @@ function discoveryGate(ctx, data, filter) {
  * is the per-worker concurrency cap shedding a capture rather than the heap, and `empty` is a 200
  * with no body — the one that used to be stored and replayed as a zero-byte document.
  *
+ * `stored-unshared` IS A STORE, NOT A REFUSAL. Under `render.raw.assumeShared` a document the origin
+ * marked `Set-Cookie`/`private` is kept anyway, and the plugin reports it apart so the assumption
+ * stays visible. Folding it into the refusals — which is what this panel did before the outcome
+ * existed — reports the route as refusing 100% of attempts on the very deployment where the option
+ * just made it work, and lights the `stored === 0` warning while the cache fills. It is counted as
+ * stored, and its share is called out as a census rather than an alarm: on an origin that sets a
+ * cookie on every response the share is pinned at 100% by construction.
+ *
  * WHAT THE STORE RATE IS NOT: a hit rate. Fills and serves are different populations over the same
  * window — a document stored now is read by the NEXT crawler, possibly after this window — so the
  * serves are shown beside the fills and never divided by them.
@@ -1615,6 +1623,10 @@ function discoveryGate(ctx, data, filter) {
 // the route-contract scanner in adminAssets.test.js reads a quoted name inside a Map lookup as a
 // fetch of an admin route by that name.
 const RAW_STORED = 'stored';
+// A store the origin called personal, kept anyway under `render.raw.assumeShared`. It is a STORE,
+// and counting it as a refusal would report the feature as refusing everything at the exact moment
+// it starts working — the inverse of the truth, and the same reading the operator came here to clear.
+const RAW_STORED_UNSHARED = 'stored-unshared';
 const RAW_HAS_COOKIE = 'has-cookie';
 const RAW_OVERSIZE = 'oversize';
 
@@ -1646,7 +1658,8 @@ function rawCache(ctx, data, filter) {
 
 	const byOutcome = new Map();
 	for (const s of attempts) byOutcome.set(s.method ?? 'unknown', (byOutcome.get(s.method ?? 'unknown') ?? 0) + s.count);
-	const stored = byOutcome.get(RAW_STORED) ?? 0;
+	const unshared = byOutcome.get(RAW_STORED_UNSHARED) ?? 0;
+	const stored = (byOutcome.get(RAW_STORED) ?? 0) + unshared;
 	const total = [...byOutcome.values()].reduce((acc, n) => acc + n, 0);
 	const refused = total - stored;
 
@@ -1676,7 +1689,9 @@ function rawCache(ctx, data, filter) {
 
 	const cookieRefusals = byOutcome.get(RAW_HAS_COOKIE) ?? 0;
 	const oversize = byOutcome.get(RAW_OVERSIZE) ?? 0;
-	const ranked = [...byOutcome.entries()].filter(([outcome]) => outcome !== RAW_STORED).sort((a, b) => b[1] - a[1]);
+	const ranked = [...byOutcome.entries()]
+		.filter(([outcome]) => outcome !== RAW_STORED && outcome !== RAW_STORED_UNSHARED)
+		.sort((a, b) => b[1] - a[1]);
 	const maxBytes = options.get('render.raw.maxBytes')?.effective;
 
 	return card(`Raw-document cache — ${scopeLabel(data)}`, {
@@ -1700,6 +1715,23 @@ function rawCache(ctx, data, filter) {
 					el('code', { text: 'rawCache' }),
 					'.',
 				]),
+			unshared > 0 &&
+				el('div', { cls: 'note' }, [
+					el('strong', {
+						text: `${num(unshared)} of ${num(stored)} stored document(s) were kept despite the origin marking them personal. `,
+					}),
+					'That is ',
+					el('code', { text: 'render.raw.assumeShared' }),
+					' doing what it was set for: the origin sends ',
+					el('code', { text: 'Set-Cookie' }),
+					' or ',
+					el('code', { text: 'Cache-Control: private' }),
+					' on a route a CDN in front already serves one shared copy of. Treat this as a CENSUS of how ',
+					'much of the route the origin calls personal, NOT as an alarm — on an origin that cookies every ',
+					'response it sits at 100% from the first minute and cannot rise. The detector that still works ',
+					'is the body diff: fetch a URL as two visitors from different IPs and locales and compare the ',
+					'content. If anything but per-request telemetry differs, turn the option off.',
+				]),
 			oversize > 0 &&
 				el('div', { cls: 'note warn' }, [
 					el('strong', { text: `${num(oversize)} document(s) were larger than render.raw.maxBytes` }),
@@ -1711,7 +1743,9 @@ function rawCache(ctx, data, filter) {
 				stat(
 					'Stored',
 					fmtCount(stored),
-					total ? `${pct(stored, total)} of ${fmtCount(total)} attempts` : 'no attempts'
+					total
+						? `${pct(stored, total)} of ${fmtCount(total)} attempts${unshared > 0 ? ` · ${num(unshared)} kept as unshared` : ''}`
+						: 'no attempts'
 				),
 				stat('Refused', fmtCount(refused), 'the reasons are below — this is the number to read', {
 					warn: total > 0 && stored === 0,

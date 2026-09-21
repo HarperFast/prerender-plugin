@@ -67,6 +67,7 @@ beforeEach(() => {
 	config.render.raw.expiryTimezone = 'UTC';
 	config.render.raw.maxConcurrentCaptures = 16;
 	config.render.raw.contentTypes = ['text/html'];
+	config.render.raw.assumeShared = false;
 });
 
 const policy = () => config.render.raw;
@@ -185,6 +186,130 @@ test('a personalized document is refused even though the sanitizer already dropp
 	const resource = originResource({ hadSetCookie: true });
 	assert.equal(resource.headers['set-cookie'], undefined, 'precondition: the header is already gone');
 	assert.equal(rawCache.storeRefusal(resource, policy()), 'has-cookie');
+});
+
+// ---- assumeShared: the origin's claim about itself, overridden on evidence ---------------------
+//
+// `Set-Cookie` and `Cache-Control: private` are two forms of ONE claim — this response is not the
+// same for every crawler. The claim can be false: an origin fronted by a CDN that already serves one
+// cached copy to every visitor sets session cookies that say nothing about the body. Measured on one
+// deployment, refusing on them stored ZERO documents against 33,572 misses an hour. What must NOT
+// happen is the override quietly widening to things it was never about, or silencing its own alarm.
+
+test('assumeShared stores a cookie-bearing document, and counts it apart so the alarm survives', async () => {
+	const resource = originResource({ hadSetCookie: true });
+	assert.equal(rawCache.storeRefusal(resource, policy()), 'has-cookie', 'refused by default');
+
+	config.render.raw.assumeShared = true;
+	assert.equal(rawCache.storeRefusal(resource, policy()), null);
+
+	await rawCache.storeRawPage({ cacheKey: 'k', resource, bytes: Buffer.from('GZIPPED'), policy: policy() });
+	assert.ok(ops.includes('prerender_ops:raw_cache:stored-unshared'), 'counted apart from an ordinary store');
+	assert.ok(!ops.includes('prerender_ops:raw_cache:stored'), 'and NOT also as a plain store — one emit per attempt');
+	assert.equal(rows.get('k').content.bytes.toString(), 'GZIPPED');
+});
+
+test('assumeShared stores a `private` document — the explicit form of the same claim', () => {
+	const resource = originResource({
+		headers: { 'content-type': 'text/html', 'cache-control': 'private, max-age=600' },
+	});
+	assert.equal(rawCache.storeRefusal(resource, policy()), 'no-store', 'refused by default');
+	config.render.raw.assumeShared = true;
+	assert.equal(rawCache.storeRefusal(resource, policy()), null);
+});
+
+test('assumeShared does NOT override a literal no-store — a different statement from "not shared"', () => {
+	config.render.raw.assumeShared = true;
+	for (const value of ['no-store', 'private, no-store', 'max-age=600, no-store']) {
+		const resource = originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+		assert.equal(rawCache.storeRefusal(resource, policy()), 'no-store', value);
+	}
+});
+
+test('assumeShared widens NOTHING else — every other refusal still fires', () => {
+	config.render.raw.assumeShared = true;
+	const cases = [
+		[{ statusCode: 404, hadSetCookie: true }, 'not-200'],
+		[{ statusCode: 500 }, 'not-200'],
+		[{ viaStaging: true, hadSetCookie: true }, 'staging'],
+		[{ hadSetCookie: true, headers: { 'content-type': 'application/json' } }, 'content-type'],
+	];
+	for (const [over, expected] of cases) {
+		assert.equal(rawCache.storeRefusal(originResource(over), policy()), expected, JSON.stringify(over));
+	}
+});
+
+test('an ordinary shared document still counts as `stored` under assumeShared', async () => {
+	config.render.raw.assumeShared = true;
+	await rawCache.storeRawPage({ cacheKey: 'k', resource: originResource(), bytes: Buffer.from('x'), policy: policy() });
+	assert.ok(ops.includes('prerender_ops:raw_cache:stored'));
+	assert.ok(!ops.includes('prerender_ops:raw_cache:stored-unshared'));
+});
+
+test('a cache-control DIRECTIVE is read, not a substring — a quoted field name is not a directive', () => {
+	// Both directives that matter here may carry a quoted field-name argument (RFC 9111 §5.2.2), and
+	// a substring test reads the ARGUMENT as the directive. A word-boundary regex does not fix it:
+	// `-` is a word boundary, so /\bprivate\b/ matches inside `X-Private-Header` too.
+	const cc = (value) => originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+
+	// ...the argument must not be mistaken for the directive
+	assert.equal(rawCache.unsharedHint(cc('no-cache="X-Private-Header", max-age=600')), null);
+	assert.equal(rawCache.unsharedHint(cc('x-private-hint=1, max-age=600')), null);
+	assert.equal(rawCache.storeRefusal(cc('no-cache="no-store", max-age=600'), policy()), null);
+
+	// ...while the real directives are still found, in any case and any position
+	assert.equal(rawCache.unsharedHint(cc('max-age=600, PRIVATE')), 'private');
+	assert.equal(rawCache.unsharedHint(cc('  private  ')), 'private');
+	assert.equal(rawCache.storeRefusal(cc('max-age=0, No-Store'), policy()), 'no-store');
+
+	// a repeated header arriving as an array is the same list, comma-joined
+	assert.equal(rawCache.unsharedHint(cc(['max-age=600', 'private'])), 'private');
+	assert.equal(rawCache.storeRefusal(cc(['max-age=600', 'no-store']), policy()), 'no-store');
+
+	// and an absent or empty header is not a claim about anything
+	for (const value of [undefined, null, '', '   ']) {
+		const resource = originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+		assert.equal(rawCache.unsharedHint(resource), null, JSON.stringify(value));
+		assert.equal(rawCache.storeRefusal(resource, policy()), null, JSON.stringify(value));
+	}
+});
+
+test('a MALFORMED cache-control still refuses — the parser may only ever remove a false positive', () => {
+	// Substring matching over-refused, which is conservative for a cache. A parser that answers from
+	// a header it cannot parse UNDER-refuses, which is not — and each row below went from refused to
+	// STORED in the first version of this parser, on the default path with no `assumeShared` set.
+	// `private;max-age=60` is an origin plainly declaring the response unshared.
+	const cc = (value) => originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+	for (const value of [
+		'private;max-age=60',
+		'no-store;private',
+		'no-cache="x, no-store', // unbalanced quote swallows the separator
+		'max-age=600, no-store"', // stray trailing quote
+		'"private"', // quoted directive name
+		'"no-store"',
+	]) {
+		assert.equal(rawCache.storeRefusal(cc(value), policy()), 'no-store', value);
+	}
+	// And the refusal is not an artefact of the fallback being reached for everything: the
+	// well-formed false positives are still stored.
+	for (const value of ['no-cache="X-Private-Header", max-age=600', 'x-private-hint=1, max-age=600', 'privately-held']) {
+		assert.equal(rawCache.storeRefusal(cc(value), policy()), null, value);
+	}
+});
+
+test('unsharedHint names the ground, and reports nothing for a plainly shared response', () => {
+	assert.equal(rawCache.unsharedHint(originResource()), null);
+	assert.equal(rawCache.unsharedHint(originResource({ hadSetCookie: true })), 'set-cookie');
+	assert.equal(
+		rawCache.unsharedHint(originResource({ headers: { 'content-type': 'text/html', 'cache-control': 'PRIVATE' } })),
+		'private'
+	);
+	// `no-store` is not a sharedness claim, so it is not a hint — it is refused on its own terms.
+	assert.equal(
+		rawCache.unsharedHint(originResource({ headers: { 'content-type': 'text/html', 'cache-control': 'no-store' } })),
+		null
+	);
+	assert.equal(rawCache.unsharedHint(undefined), null);
 });
 
 test('no-cache is STORABLE — it means revalidate before use, not do not store', () => {

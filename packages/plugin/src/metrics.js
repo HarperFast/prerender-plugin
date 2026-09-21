@@ -520,13 +520,17 @@ export const METRICS = Object.freeze({
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
 			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
 			'render rotation", the corpus growth the gate is preventing. ' +
-			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, or the reason it ' +
-			'was refused (not-200, staging, has-cookie, content-type, no-store, no-body, oversize, ' +
-			'capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is enabled and ' +
-			'filling nothing is indistinguishable from one that is switched off unless the reason is recorded. ' +
-			'oversize climbing means render.raw.maxBytes is below the route’s real document size; has-cookie ' +
-			'climbing means the origin is personalizing a route that was assumed to be shared, which is the one ' +
-			'outcome worth an alert. ' +
+			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
+			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
+			'oversize, capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is ' +
+			'enabled and filling nothing is indistinguishable from one that is switched off unless the reason is ' +
+			'recorded. oversize climbing means render.raw.maxBytes is below the route’s real document size; ' +
+			'has-cookie climbing means the origin is personalizing a route that was assumed to be shared, which ' +
+			'is the one outcome worth an alert. Under render.raw.assumeShared those documents are STORED and ' +
+			'counted as stored-unshared instead, and that series is a CENSUS, not an alarm: on an origin that ' +
+			'sets a cookie on every response it is pinned at 100% from the first minute and cannot rise, so no ' +
+			'threshold on it detects anything. What still detects personalization is re-running the body diff ' +
+			'the option documents. Read stored + stored-unshared as the store rate. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
@@ -616,7 +620,9 @@ export const METRICS = Object.freeze({
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
-					"route's discoverTargets, 'bot' = ingress.discoveryBots). Other series: null.",
+					"route's discoverTargets, 'bot' = ingress.discoveryBots). raw_cache: THE OUTCOME — stored, " +
+					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
+					'Other series: null.',
 			},
 			type: {
 				name: 'context',

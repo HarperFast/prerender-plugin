@@ -85,6 +85,88 @@ const mediaTypeOf = (contentType) =>
 		.toLowerCase();
 
 /**
+ * The directive NAMES in a `Cache-Control` header, lowercased — or **null** when the header cannot
+ * be parsed confidently.
+ *
+ * PARSED RATHER THAN SUBSTRING-MATCHED, because both directives that matter here may carry a quoted
+ * field-name argument — `no-cache="X-Private-Header"` is legal (RFC 9111 §5.2.2) — and a substring
+ * test reads that ARGUMENT as a directive. A word-boundary regex does not fix it either: `-` is a
+ * word boundary, so `/\bprivate\b/` matches inside `X-Private-Header` and inside `x-private-hint`
+ * just as `includes` does. Only reading the directive names distinguishes them.
+ *
+ * `;` IS ACCEPTED AS A SEPARATOR even though only `,` is legal, and a quote is stripped from a
+ * directive name even though a quoted name is not legal either. Real origins emit both, and the
+ * charitable reading is the one that keeps refusing: `private;max-age=60` is an origin plainly
+ * declaring the response unshared, and reading it as one unrecognized directive would STORE it.
+ *
+ * Returning null on an unbalanced quote — rather than guessing — is what makes this safe to
+ * substitute for the substring test it replaced. See `hasCacheControlDirective`.
+ */
+const cacheControlDirectives = (value) => {
+	if (value === undefined || value === null || value === '') return new Set();
+	const raw = String(value);
+	const names = new Set();
+	let start = 0;
+	let inQuotes = false;
+	const take = (end) => {
+		// A quote cannot appear in a legal directive NAME, so stripping one can only recover a
+		// malformed `"private"`; the argument after `=` is already discarded.
+		const name = raw.slice(start, end).split('=')[0].replace(/"/g, '').trim().toLowerCase();
+		if (name) names.add(name);
+	};
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i];
+		if (ch === '"' && raw[i - 1] !== '\\') inQuotes = !inQuotes;
+		else if ((ch === ',' || ch === ';') && !inQuotes) {
+			take(i);
+			start = i + 1;
+		}
+	}
+	take(raw.length);
+	// An unbalanced quote means every separator after it was swallowed, so the directive list is
+	// short by an unknown amount. Say so instead of answering from what survived.
+	return inQuotes ? null : names;
+};
+
+/**
+ * Does this `Cache-Control` carry `directive`?
+ *
+ * THE PARSER MAY ONLY EVER REMOVE A FALSE POSITIVE. Substring matching over-refuses, which is the
+ * conservative direction for a cache; a parser that answered from a header it did not understand
+ * would under-refuse, which is not. So where the parse is not trustworthy this defers to the
+ * substring test, and the result is never less refusing than before the parser existed.
+ *
+ * That distinction is load-bearing rather than theoretical: measured against the pre-parser
+ * implementation, six malformed-header shapes (`private;max-age=60`, `no-store;private`, an
+ * unbalanced quote, a stray trailing quote, `"private"`, `"no-store"`) went from refused to STORED
+ * — on the default path, where no `assumeShared` is set and nothing about behaviour was supposed to
+ * change. A document whose origin said `private` was about to be replayed to every crawler.
+ */
+const hasCacheControlDirective = (value, directive) => {
+	const names = cacheControlDirectives(value);
+	if (names === null) return String(value).toLowerCase().includes(directive);
+	return names.has(directive);
+};
+
+/**
+ * Did the origin claim this document is NOT a shared artifact, and on what grounds?
+ *
+ * Two signals, one question: is this response the same for every crawler? `Set-Cookie` is the
+ * indirect form (it usually accompanies a personalized body) and `Cache-Control: private` is the
+ * explicit one. Reported rather than acted on here, because whether the claim is TRUE is a property
+ * of the origin — an origin fronted by a CDN that already serves one cached copy of these documents
+ * to every visitor is wrong about itself, and only the deployment can know that.
+ *
+ * `no-store` is deliberately absent: it is an instruction not to keep the response at all, which
+ * `render.raw.assumeShared` does not override.
+ */
+export const unsharedHint = (resource) => {
+	if (resource?.hadSetCookie) return 'set-cookie';
+	if (hasCacheControlDirective(resource?.headers?.['cache-control'], 'private')) return 'private';
+	return null;
+};
+
+/**
  * May this origin response be stored? Returns the reason it may not, or null when it may.
  *
  * Ordered cheapest-first, and every branch names itself so `rawCache{outcome}` reports WHY a route
@@ -93,18 +175,27 @@ const mediaTypeOf = (contentType) =>
 export const storeRefusal = (resource, policy) => {
 	if (resource.statusCode !== 200) return 'not-200';
 	if (resource.viaStaging) return 'staging';
+	const unshared = unsharedHint(resource);
 	// The origin tried to set a cookie, which is the best hint available that this document was
 	// personalized. The sanitizer already dropped the header, so this is the only place that can
 	// still see it — see `fetchOriginResource`. A personalized document stored here would be
 	// replayed to every crawler that asks.
-	if (resource.hadSetCookie) return 'has-cookie';
+	//
+	// `assumeShared` is the deployment asserting, against measured evidence, that this origin's
+	// cookies are session BOOTSTRAP and its bodies are shared. It is off by default and must stay
+	// off for any origin nobody has checked — see the option's own documentation for the check.
+	if (unshared === 'set-cookie' && !policy.assumeShared) return 'has-cookie';
 	const headers = resource.headers ?? {};
 	if (!policy.contentTypes.includes(mediaTypeOf(headers['content-type']))) return 'content-type';
-	// `private` and `no-store` are the origin saying this response is not a shared-cache artifact.
+	// `no-store` is the origin instructing caches not to keep this response AT ALL, and
+	// `assumeShared` does NOT override it: that setting answers "is this response the same for every
+	// crawler", which is a different question from "may it be kept". `private` is the explicit form
+	// of the sharedness claim, so that one yields.
+	//
 	// `no-cache` is deliberately NOT refused: it means revalidate-before-use, not do-not-store, and
 	// refusing it would exclude most correctly-configured HTML.
-	const cacheControl = String(headers['cache-control'] ?? '').toLowerCase();
-	if (cacheControl.includes('private') || cacheControl.includes('no-store')) return 'no-store';
+	if (hasCacheControlDirective(headers['cache-control'], 'no-store')) return 'no-store';
+	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
 	return null;
 };
 
@@ -220,7 +311,12 @@ export const storeRawPage = async ({ cacheKey, resource, bytes, policy }) => {
 			headers: JSON.stringify(storedHeaders(resource.headers)),
 			expiresAt: new Date(rawExpiresAt(policy)),
 		});
-		metrics.rawCache('stored');
+		// COUNTED APART WHEN THE ORIGIN CALLED IT PERSONAL. Enabling `assumeShared` must not silence
+		// the signal it overrides: `has-cookie` climbing is the alarm that an origin started
+		// personalizing a route assumed to be shared, and if those documents simply became ordinary
+		// `stored` rows that alarm would disappear exactly where it is most needed. Still one emit per
+		// attempt, so the series keeps summing to one per store.
+		metrics.rawCache(unsharedHint(resource) ? 'stored-unshared' : 'stored');
 	} catch (e) {
 		metrics.rawCache('write-failed');
 		logger.warn?.(`[prerender] raw document not stored for ${cacheKey}: ${e?.message ?? String(e)}`);
