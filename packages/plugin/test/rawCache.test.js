@@ -1,5 +1,7 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /**
  * `util/rawCache.js` — caching the origin document a miss already fetched.
@@ -404,6 +406,61 @@ test('a stored page keeps the origin bytes verbatim and is read back while fresh
 
 	const read = await rawCache.readRawPage('https://example.com/c|desktop');
 	assert.equal(read.content.bytes.toString(), 'GZIPPED');
+});
+
+test('the RawPage schema still declares @expiresAt — the directive IS the storage saving', () => {
+	// This guards a fact that lives OUTSIDE this codebase. The directive is what makes Harper treat the
+	// stored timestamp as the record's expiration; without it Harper falls back to the table's 48h and
+	// a row that stopped being servable at midnight sits on disk, with its blob, for up to another 47h.
+	// No behavioural test here can see that — the behaviour is Harper's — so dropping the directive
+	// would leave this whole suite green while silently restoring two-day retention.
+	// A SCANNER MUST FAIL AS ITSELF. Every anchor is asserted before it is used: without that, a
+	// renamed table makes `indexOf` return -1, `slice(-1)` quietly yields the last character of the
+	// file, and the directive assertion below fails — reporting a MISSING DIRECTIVE when the truth is
+	// that this test stopped being able to look. On a guard whose whole job is noticing silent drift,
+	// misdiagnosing its own blindness as the thing it watches for is the expensive failure.
+	//
+	// The header is matched with a whitespace-tolerant regex so a formatter cannot break the scanner,
+	// but the block is terminated on a LINE-START `}` rather than by a non-greedy `[\s\S]*?\}`. That
+	// distinction is load-bearing: the body is mostly prose comments, and a single `}` in any of them
+	// truncates a non-greedy match short of the field — which reads as the directive being gone.
+	// Verified: adding a brace to one comment makes that form fail while this one still passes.
+	const schema = fs.readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
+	const header = /type\s+RawPage\s+@table\(/.exec(schema);
+	assert.ok(header, 'scanner anchor lost: no `type RawPage @table(` declaration in schema.graphql');
+	const block = schema.slice(header.index);
+	const close = block.indexOf('\n}');
+	assert.notEqual(close, -1, 'scanner anchor lost: the RawPage block is not closed by a line-start `}`');
+	const body = block.slice(0, close);
+	// ...and that the block found really is the table, not a comment that happens to name it.
+	assert.match(body, /cacheKey:\s*String\s+@primaryKey/, 'scanner matched something that is not the RawPage table');
+	assert.match(
+		body,
+		/expiresAt:\s*Date\s+@expiresAt/,
+		'RawPage.expiresAt must carry the @expiresAt directive — without it Harper reclaims on the table default'
+	);
+});
+
+test("the stored expiresAt is a Date — the shape Harper's @expiresAt directive consumes", async () => {
+	// `RawPage.expiresAt` carries `@expiresAt`, so this field is not merely a column `readRawPage`
+	// checks: Harper stamps it into the record's expiry metadata, which governs read-hiding and the
+	// cleanup sweep. Its coercion accepts a Date, a number, or a numeric/ISO string, and falls back to
+	// the table's 48h default on anything else — SILENTLY. So a change here that made this field a
+	// boolean, an empty string, or absent would not fail any other test; it would just quietly restore
+	// the two-day retention this directive exists to remove.
+	await rawCache.storeRawPage({
+		cacheKey: 'k',
+		resource: originResource(),
+		bytes: Buffer.from('x'),
+		policy: policy(),
+	});
+	const stored = rows.get('k').expiresAt;
+	assert.ok(stored instanceof Date, `expiresAt must be a Date, got ${Object.prototype.toString.call(stored)}`);
+	assert.ok(
+		Number.isFinite(stored.getTime()),
+		'and a valid one — an Invalid Date coerces to NaN and takes the 48h default'
+	);
+	assert.ok(stored.getTime() > Date.now(), 'and in the future, or the row is born expired');
 });
 
 test('a write failure is counted and swallowed — a served response must not fail over a copy', async () => {

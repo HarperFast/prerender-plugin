@@ -686,17 +686,24 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 			);
 		}
 	}
-	// A raw-cache interval longer than the TABLE's own expiration reclaims rows while they are still
-	// nominally servable — the row and its blob vanish, and the next request is a miss that silently
-	// re-fetches. The schema constant is 48h (schemas/schema.graphql, RawPage), and it cannot be
-	// configured, so this is the one raw-cache setting that can be made incoherent from config alone.
+	// A LONG RAW INTERVAL IS A FRESHNESS PROBLEM, NOT A STORAGE ONE — the opposite of what this
+	// warning used to say. `RawPage.expiresAt` now carries Harper's `@expiresAt` directive, so the
+	// stored timestamp IS the record's expiration: a value past the table's own 48h default extends
+	// retention rather than being truncated by it, and the "silent miss" this warned about cannot
+	// happen any more.
+	//
+	// What remains true is the reason raw caching is bounded at all. NOTHING verifies a raw document
+	// once it is stored: no render replaces it, and the change probe walks the target registry, so a
+	// URL that owns no target is never probed. The expiry is therefore the only bound on how stale a
+	// served document can be, and a long interval spends that budget with no detector behind it.
 	if (target.render.raw.enabled && target.render.raw.expiry === 'interval' && target.render.raw.expiryMs > 129600000) {
 		add(
 			'warn',
 			'render.raw.expiryMs',
-			`render.raw.expiryMs is ${target.render.raw.expiryMs}ms, within (or past) the RawPage table's own 48h ` +
-				`expiration — rows are reclaimed on that schedule regardless, so a longer interval does not extend ` +
-				`what is served, it just makes the last stretch of it a silent miss. Keep it comfortably under 48h.`
+			`render.raw.expiryMs is ${target.render.raw.expiryMs}ms (over 36h). Nothing verifies a raw document ` +
+				`once it is stored — no render replaces it, and the change probe never sees a URL that owns no ` +
+				`target — so this interval is the ONLY bound on how stale a served document can be. Where the ` +
+				`origin changes on a schedule rather than continuously, prefer expiry: 'midnight'.`
 		);
 	}
 	if (target.peerRescue.enabled && !target.peerRescue.token) {
