@@ -414,9 +414,20 @@ test('the RawPage schema still declares @expiresAt — the directive IS the stor
 	// a row that stopped being servable at midnight sits on disk, with its blob, for up to another 47h.
 	// No behavioural test here can see that — the behaviour is Harper's — so dropping the directive
 	// would leave this whole suite green while silently restoring two-day retention.
+	// A SCANNER MUST FAIL AS ITSELF. Every anchor is asserted before it is used: if the table is
+	// renamed or the declaration reformatted, `indexOf` returns -1, `slice(-1)` quietly yields the
+	// last character of the file and the directive assertion below fails — reporting a missing
+	// directive when the truth is that this test stopped being able to look. That misdiagnosis is
+	// the expensive kind on a guard whose whole job is to notice silent drift.
 	const schema = fs.readFileSync(fileURLToPath(new URL('../src/schemas/schema.graphql', import.meta.url)), 'utf8');
-	const block = schema.slice(schema.indexOf('type RawPage @table('));
-	const body = block.slice(0, block.indexOf('\n}'));
+	const start = schema.indexOf('type RawPage @table(');
+	assert.notEqual(start, -1, 'scanner anchor lost: no `type RawPage @table(` in schema.graphql');
+	const block = schema.slice(start);
+	const close = block.indexOf('\n}');
+	assert.notEqual(close, -1, 'scanner anchor lost: RawPage block is not closed by a line-start `}`');
+	const body = block.slice(0, close);
+	// And that the block it found is really the table, not a comment that happens to name it.
+	assert.match(body, /cacheKey: String @primaryKey/, 'scanner matched something that is not the RawPage table');
 	assert.match(body, /expiresAt: Date @expiresAt/, 'RawPage.expiresAt must carry the @expiresAt directive');
 });
 
