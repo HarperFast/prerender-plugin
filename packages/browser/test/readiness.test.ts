@@ -19,6 +19,8 @@ import { renderOnce } from '../dist/renderOnce.js';
 
 let origin: http.Server;
 let base = '';
+// Responses deliberately left unanswered by `/hang`; destroyed in `after` so the server can close.
+const hanging: http.ServerResponse[] = [];
 
 const page = (body: string, head = '') =>
 	`<!doctype html><html><head><title>t</title>${head}</head><body>${body}</body></html>`;
@@ -47,6 +49,23 @@ before(async () => {
 							for (let i = 0; i < 20; i++) t.appendChild(document.createElement('span')); }, 40);</script>`
 					)
 				);
+			// Content that lands LATE — after any sane contract timeout — so the contract must give up and
+			// the fallback settle is what actually captures it.
+			case '/late-rails':
+				return res.end(
+					page(
+						'<div id="host"></div>',
+						`<script>setTimeout(() => { document.getElementById('host').innerHTML =
+							'<i class="rail">a</i><i class="rail">b</i><i class="rail">c</i>'; }, 1200);</script>`
+					)
+				);
+			// A page that is QUIET but not FINISHED: it holds a same-origin request open while a required
+			// clause is still false. This is the shape of a CPU-starved commerce page.
+			case '/hang':
+				hanging.push(res);
+				return; // deliberately never answered within the test
+			case '/quiet-but-fetching':
+				return res.end(page('<p>started</p>', `<script>fetch('/hang');</script>`));
 			// Islands that shed their marker on "hydration", plus one that never does.
 			case '/islands':
 				return res.end(
@@ -90,7 +109,10 @@ before(async () => {
 	base = `http://127.0.0.1:${(origin.address() as AddressInfo).port}`;
 });
 
-after(() => origin.close());
+after(() => {
+	for (const res of hanging) res.destroy();
+	origin.close();
+});
 
 const render = async (
 	path: string,
@@ -432,4 +454,81 @@ test('a contract that holds but never sees the page go quiet falls back to the o
 	assert.equal(readiness?.satisfied, true, 'every clause held the whole time, and the report says so');
 	assert.equal(readiness?.stopped, false, 'but it did not stop the render');
 	assert.ok((readiness?.waitedMs ?? 0) >= 600, `it waited out its timeout (waited ${readiness?.waitedMs}ms)`);
+});
+
+// The armed path used to report from the moment it GAVE UP, not from the DOM it serialized: the
+// fallback settle, the gates and the final plateau all run after the contract's loop exits. Measured
+// on the fleet, 14 of 14 product pages reported `product-links: 0` while the HTML actually stored for
+// those pages carried 204-470 of them — and because `assessExpectations` skips an expectation of 0,
+// seeding those zeros SILENTLY DISABLES the shortfall detector for the page.
+test('an unsatisfied contract restates its verdict against the DOM that was serialized', async () => {
+	const result = await renderOnce({
+		url: `${base}/late-rails`,
+		captureNonIndexable: true,
+		config: {
+			navigation: { networkIdleMs: 50, networkIdleTimeoutMs: 200, domStableMs: 0, domStableTimeoutMs: 500 },
+			scroll: { enabled: false },
+			// The fallback holds the render until the late content lands, exactly as a production gate does.
+			waitFor: [{ name: 'rails-gate', selector: '.rail', minCount: 3, timeoutMs: 5000, scrollIntoView: false }],
+			readiness: {
+				onSatisfied: 'quiet',
+				quietMs: 100,
+				contracts: [
+					{
+						name: 'late',
+						// 400ms: the contract cannot win, so it abandons and the fallback finishes the job.
+						timeoutMs: 400,
+						require: [{ name: 'rails', selector: '.rail', minCount: 3 }],
+						observe: [{ name: 'rail-count', selector: '.rail' }],
+					},
+				],
+			},
+		} as never,
+	});
+	const readiness = result.job.readiness;
+	assert.equal(readiness?.stopped, false, 'the contract did not stop this render');
+	assert.equal(readiness?.satisfied, true, 'but the page WAS complete when it was serialized');
+	assert.equal(
+		readiness?.firstSatisfiedMs,
+		null,
+		'it never held inside the contract window — the tuning signal stays honest'
+	);
+	assert.equal(
+		readiness?.learned?.['rail-count'],
+		3,
+		'the learned count must describe the stored page, not the abandoned one'
+	);
+	assert.match(result.html ?? '', /class="rail"/);
+});
+
+// The rot valve infers "this clause will never be true" from DOM quiet. A CPU-starved page is quiet
+// because it has not STARTED, not because it has finished — measured on a contended pod, the valve
+// stood the rails clause aside after ~1.1s while the API filling those rails had not yet been
+// requested (it went out at 7.9-10.0s), and 2 of 3 renders then serialized without them.
+test('the rot valve does not stand a clause aside while the page is still fetching from its own origin', async () => {
+	const started = Date.now();
+	const result = await renderOnce({
+		url: `${base}/quiet-but-fetching`,
+		captureNonIndexable: true,
+		config: {
+			navigation: { networkIdleMs: 50, networkIdleTimeoutMs: 200, domStableMs: 0, domStableTimeoutMs: 500 },
+			scroll: { enabled: false },
+			readiness: {
+				onSatisfied: 'quiet',
+				quietMs: 100,
+				// Tiny grace: without the in-flight check the valve fires almost immediately.
+				unmetGraceMs: 150,
+				contracts: [
+					{ name: 'starved', timeoutMs: 1500, require: [{ name: 'never', selector: '#never', minCount: 1 }] },
+				],
+			},
+		} as never,
+	});
+	const readiness = result.job.readiness;
+	assert.equal(readiness?.satisfied, false, 'the clause genuinely never holds');
+	assert.ok(
+		(readiness?.waitedMs ?? 0) >= 1400,
+		`the contract must wait out its timeout while same-origin work is outstanding (waited ${readiness?.waitedMs}ms)`
+	);
+	assert.ok(Date.now() - started >= 1400);
 });

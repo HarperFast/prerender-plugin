@@ -132,6 +132,26 @@ const renderer: Renderer = async (page, job) => {
 	const ac = new AbortController();
 	let aborted = false;
 
+	/**
+	 * Requests to the page's OWN origin that have not finished.
+	 *
+	 * This is the signal that tells "the page has nothing left to do" apart from "the page is not
+	 * doing anything RIGHT NOW", and the rot valve cannot be trusted without it — see its use below.
+	 * Same-origin only, deliberately: network idle is unreachable on a commerce page (trailing
+	 * third-party beacons hold it open indefinitely, which is why `waitUntil: networkidle2` was
+	 * abandoned here), but the requests that actually produce content come from the page's own
+	 * origin. Measured on a contended pod, the recommendation-rail API is issued 7.9-10.0 s into the
+	 * render and answers ~1 s later.
+	 *
+	 * A blocked or aborted request fires `requestfailed`, so the entries are removed either way.
+	 */
+	const inFlightSameOrigin = new Set<unknown>();
+	page.on('request', (req) => {
+		if (isSameOrigin(req.url())) inFlightSameOrigin.add(req);
+	});
+	page.on('requestfinished', (req) => inFlightSameOrigin.delete(req));
+	page.on('requestfailed', (req) => inFlightSameOrigin.delete(req));
+
 	page
 		.on('request', async (req) => {
 			if (ac.signal.aborted || aborted) {
@@ -654,9 +674,10 @@ const renderer: Renderer = async (page, job) => {
 	 * still coming, and only quiescence can. Measured, stopping on the contract alone loses 99% of the
 	 * product links on a product page.
 	 *
-	 * Returns two verdicts, and they are not the same thing. `satisfied` is what the report carries:
-	 * every clause held. `stopped` is what the settle acts on: the loop left on "held AND quiet", the
-	 * one exit that establishes the page is complete. A contract that held throughout but never saw the
+	 * Returns two verdicts and a `finalize`. `satisfied` is what the report carries: every clause held.
+	 * `stopped` is what the settle acts on: the loop left on "held AND quiet", the one exit that
+	 * establishes the page is complete. `finalize` re-reads the page AFTER the fallback settle, and
+	 * the caller must await it on the not-stopped path — see the note on it below. A contract that held throughout but never saw the
 	 * page go quiet within its timeout is satisfied and did NOT stop — it falls through to the
 	 * ordinary settle like an unsatisfied one, because stopping there would snapshot a page that was
 	 * still changing with nothing having said it may. Reproduced on a live product page with an
@@ -665,7 +686,7 @@ const renderer: Renderer = async (page, job) => {
 	 */
 	const awaitContract = async (
 		governing: NonNullable<ReturnType<typeof contractFor>>
-	): Promise<{ satisfied: boolean; stopped: boolean }> => {
+	): Promise<{ satisfied: boolean; stopped: boolean; finalize: () => Promise<void> }> => {
 		const started = Date.now();
 		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
 		const quietFor = governing.quietMs ?? config.readiness?.quietMs ?? 250;
@@ -718,12 +739,27 @@ const renderer: Renderer = async (page, job) => {
 				break;
 			}
 
-			// THE ROT VALVE. Every clause either holds or has never been true at all, and the page has
-			// stopped changing — so waiting out the rest of the timeout will not produce what is
-			// missing. Stand aside, report it, and let the ordinary settle finish the render.
+			// THE ROT VALVE. Every clause either holds or has never been true at all, the page has
+			// stopped changing, AND it has stopped fetching from its own origin — so waiting out the
+			// rest of the timeout will not produce what is missing. Stand aside, report it, and let
+			// the ordinary settle finish the render.
+			//
+			// THE SAME-ORIGIN CONDITION IS NOT OPTIONAL, and leaving it out is what made this valve
+			// misfire on exactly the renders it most needed to get right. Its premise is "the page is
+			// done, so this clause will never be true", inferred from DOM quiet alone — and a
+			// CPU-STARVED PAGE IS QUIET BECAUSE IT HAS NOT STARTED YET, not because it has finished.
+			// Measured on a contended pod: the valve stood the recommendation-rail clause aside after
+			// 1,075 ms and 1,174 ms, while the API that fills those rails had not even been REQUESTED
+			// yet — it went out at 7.9 s and 10.0 s. The render then fell through to the blind timers
+			// and, on 2 of 3 interleaved runs of the same URL, serialized before the response landed:
+			// 0 product links and 431 KB against 476 links and 974 KB.
+			//
+			// Waiting on in-flight same-origin work makes the valve mean what it says. A clause that
+			// has genuinely rotted still releases the render, because a page that has stopped
+			// fetching is a page that really is done.
 			if (last.started && !held) {
 				const stalled = last.require.every((r) => r.ok || known.has(r.name) || !firstTrue.has(r.name));
-				if (stalled && quiet) {
+				if (stalled && quiet && inFlightSameOrigin.size === 0) {
 					if (quietSince === 0) quietSince = Date.now();
 					else if (Date.now() - quietSince >= graceMs) break;
 				} else {
@@ -750,7 +786,49 @@ const renderer: Renderer = async (page, job) => {
 			})),
 			observe: last?.observe ?? [],
 		} satisfies ReadinessResult;
-		return { satisfied, stopped };
+
+		/**
+		 * Re-read the page once the render is otherwise finished, and restate the verdict against the
+		 * DOM that is about to be serialized.
+		 *
+		 * WITHOUT THIS THE ARMED PATH REPORTS FROM THE WRONG MOMENT. `last` above is the final
+		 * IN-LOOP evaluation — the instant the contract was abandoned, by the deadline or the rot
+		 * valve — and the fallback settle, the `waitFor` gates and `finalDomStable` all run AFTER it.
+		 * Report mode has always taken this look; the gate did not, so on every unsatisfied render the
+		 * verdict, `unmet` and the observation counts described a DOM seconds younger than the snapshot.
+		 *
+		 * Measured on the fleet: 14 of 14 product pages reported `product-links: 0, rails: 0` while the
+		 * HTML actually stored for those same pages carried 204-470 product links. The counts are the
+		 * consumer's per-page expectation, and `assessExpectations` skips any observation whose expected
+		 * value is <= 0 — so seeding zeros does not merely misreport, it SILENTLY DISABLES the shortfall
+		 * detector for that page, which is the one mechanism meant to catch content going missing.
+		 *
+		 * `waitedMs` and `firstSatisfiedMs` are deliberately NOT restated: they measure the contract's
+		 * own window and are what `timeoutMs` is tuned from. So a render that was incomplete when the
+		 * contract gave up and complete by the snapshot reports `satisfied: true` with
+		 * `firstSatisfiedMs: null`, and those two together are the honest description of it.
+		 */
+		const finalize = async (): Promise<void> => {
+			const current = job.readiness;
+			if (!current) return;
+			let fin: Awaited<ReturnType<typeof evaluateContract>>;
+			try {
+				fin = await page.evaluate(evaluateContract, payload);
+			} catch {
+				return; // page closed or navigated — keep what the wait saw
+			}
+			const finalExpectation = assessExpectations(fin.observe, job.expectations, policy);
+			job.readiness = {
+				...current,
+				satisfied: fin.started && fin.require.every((r) => r.ok || known.has(r.name)),
+				shortfalls: finalExpectation.shortfalls,
+				rebaselined: finalExpectation.rebaselined,
+				learned: finalExpectation.learned,
+				require: fin.require.map((r) => ({ ...r, firstTrueMs: firstTrue.get(r.name) })),
+				observe: fin.observe,
+			} satisfies ReadinessResult;
+		};
+		return { satisfied, stopped, finalize };
 	};
 
 	/**
@@ -858,6 +936,8 @@ const renderer: Renderer = async (page, job) => {
 	let observer: Promise<void> | null = null;
 	let contractStopped = false;
 	let contractScrolled = false;
+	// Set on the armed path so the verdict can be restated against the serialized DOM — see `finalize`.
+	let contractFinalize: (() => Promise<void>) | null = null;
 	// The settle is wrapped so the observer is released on EVERY exit, including a throw from a
 	// scroll or wait below. Without this, a render that failed mid-settle left the observer polling
 	// until the page closed and reported late or never — so the slow, failing tail dropped out of the
@@ -873,7 +953,9 @@ const renderer: Renderer = async (page, job) => {
 				await scrollToTop();
 				contractScrolled = true;
 			}
-			({ stopped: contractStopped } = await awaitContract(contract));
+			const outcome = await awaitContract(contract);
+			contractStopped = outcome.stopped;
+			contractFinalize = outcome.finalize;
 		}
 
 		if (contractStopped) {
@@ -916,6 +998,10 @@ const renderer: Renderer = async (page, job) => {
 		// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
 		// causes. This way the last thing checked is the state that gets serialized.
 		if (config.navigation.finalDomStable && !contractStopped) await domStable();
+		// The contract gave up, but the render did not: restate its verdict and its observation counts
+		// against the DOM that is about to be serialized, rather than the one it walked away from.
+		// A contract that STOPPED the render needs no restatement — it already looked at this DOM.
+		if (!contractStopped && contractFinalize) await contractFinalize();
 		// The observer must not outlive the settle it is watching: stopping it here is what guarantees
 		// report mode cannot change a render's duration.
 		if (observer) {
