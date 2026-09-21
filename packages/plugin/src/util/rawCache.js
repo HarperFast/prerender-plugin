@@ -85,6 +85,45 @@ const mediaTypeOf = (contentType) =>
 		.toLowerCase();
 
 /**
+ * The directive NAMES in a `Cache-Control` header, lowercased.
+ *
+ * PARSED RATHER THAN SUBSTRING-MATCHED, because both directives that matter here may carry a quoted
+ * field-name argument — `no-cache="X-Private-Header"` is legal (RFC 9111 §5.2.2) — and a substring
+ * test reads that ARGUMENT as a directive. A word-boundary regex does not fix it either: `-` is a
+ * word boundary, so `/\bprivate\b/` matches inside `X-Private-Header` and inside `x-private-hint`
+ * just as `includes` does. Only reading the directive names distinguishes them.
+ *
+ * Over-matching is the conservative direction for a cache — it refuses to store — so this is not a
+ * safety fix. It is an accuracy one, and `no-store` is now the ONE cache-control refusal that
+ * survives `assumeShared`, so a phantom one silently costs a deployment stores it cannot account
+ * for and cannot tell from a real instruction.
+ *
+ * A repeated header arriving as an array is handled by construction: joining with commas is exactly
+ * the list form this parses.
+ */
+const cacheControlDirectives = (value) => {
+	const names = new Set();
+	if (value === undefined || value === null || value === '') return names;
+	const raw = String(value);
+	let start = 0;
+	let inQuotes = false;
+	const take = (end) => {
+		const name = raw.slice(start, end).split('=')[0].trim().toLowerCase();
+		if (name) names.add(name);
+	};
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i];
+		if (ch === '"' && raw[i - 1] !== '\\') inQuotes = !inQuotes;
+		else if (ch === ',' && !inQuotes) {
+			take(i);
+			start = i + 1;
+		}
+	}
+	take(raw.length);
+	return names;
+};
+
+/**
  * Did the origin claim this document is NOT a shared artifact, and on what grounds?
  *
  * Two signals, one question: is this response the same for every crawler? `Set-Cookie` is the
@@ -98,8 +137,7 @@ const mediaTypeOf = (contentType) =>
  */
 export const unsharedHint = (resource) => {
 	if (resource?.hadSetCookie) return 'set-cookie';
-	const cacheControl = String(resource?.headers?.['cache-control'] ?? '').toLowerCase();
-	if (cacheControl.includes('private')) return 'private';
+	if (cacheControlDirectives(resource?.headers?.['cache-control']).has('private')) return 'private';
 	return null;
 };
 
@@ -124,7 +162,6 @@ export const storeRefusal = (resource, policy) => {
 	if (unshared === 'set-cookie' && !policy.assumeShared) return 'has-cookie';
 	const headers = resource.headers ?? {};
 	if (!policy.contentTypes.includes(mediaTypeOf(headers['content-type']))) return 'content-type';
-	const cacheControl = String(headers['cache-control'] ?? '').toLowerCase();
 	// `no-store` is the origin instructing caches not to keep this response AT ALL, and
 	// `assumeShared` does NOT override it: that setting answers "is this response the same for every
 	// crawler", which is a different question from "may it be kept". `private` is the explicit form
@@ -132,7 +169,7 @@ export const storeRefusal = (resource, policy) => {
 	//
 	// `no-cache` is deliberately NOT refused: it means revalidate-before-use, not do-not-store, and
 	// refusing it would exclude most correctly-configured HTML.
-	if (cacheControl.includes('no-store')) return 'no-store';
+	if (cacheControlDirectives(headers['cache-control']).has('no-store')) return 'no-store';
 	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
 	return null;
 };

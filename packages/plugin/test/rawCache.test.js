@@ -246,6 +246,34 @@ test('an ordinary shared document still counts as `stored` under assumeShared', 
 	assert.ok(!ops.includes('prerender_ops:raw_cache:stored-unshared'));
 });
 
+test('a cache-control DIRECTIVE is read, not a substring — a quoted field name is not a directive', () => {
+	// Both directives that matter here may carry a quoted field-name argument (RFC 9111 §5.2.2), and
+	// a substring test reads the ARGUMENT as the directive. A word-boundary regex does not fix it:
+	// `-` is a word boundary, so /\bprivate\b/ matches inside `X-Private-Header` too.
+	const cc = (value) => originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+
+	// ...the argument must not be mistaken for the directive
+	assert.equal(rawCache.unsharedHint(cc('no-cache="X-Private-Header", max-age=600')), null);
+	assert.equal(rawCache.unsharedHint(cc('x-private-hint=1, max-age=600')), null);
+	assert.equal(rawCache.storeRefusal(cc('no-cache="no-store", max-age=600'), policy()), null);
+
+	// ...while the real directives are still found, in any case and any position
+	assert.equal(rawCache.unsharedHint(cc('max-age=600, PRIVATE')), 'private');
+	assert.equal(rawCache.unsharedHint(cc('  private  ')), 'private');
+	assert.equal(rawCache.storeRefusal(cc('max-age=0, No-Store'), policy()), 'no-store');
+
+	// a repeated header arriving as an array is the same list, comma-joined
+	assert.equal(rawCache.unsharedHint(cc(['max-age=600', 'private'])), 'private');
+	assert.equal(rawCache.storeRefusal(cc(['max-age=600', 'no-store']), policy()), 'no-store');
+
+	// and an absent or empty header is not a claim about anything
+	for (const value of [undefined, null, '', '   ']) {
+		const resource = originResource({ headers: { 'content-type': 'text/html', 'cache-control': value } });
+		assert.equal(rawCache.unsharedHint(resource), null, JSON.stringify(value));
+		assert.equal(rawCache.storeRefusal(resource, policy()), null, JSON.stringify(value));
+	}
+});
+
 test('unsharedHint names the ground, and reports nothing for a plainly shared response', () => {
 	assert.equal(rawCache.unsharedHint(originResource()), null);
 	assert.equal(rawCache.unsharedHint(originResource({ hadSetCookie: true })), 'set-cookie');
