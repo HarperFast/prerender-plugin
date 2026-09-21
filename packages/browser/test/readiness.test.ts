@@ -37,6 +37,16 @@ before(async () => {
 							'<div class="item">a</div><div class="item">b</div>'; }, 300);</script>`
 					)
 				);
+			// A page that satisfies its contract at once and then never stops changing: a ticker appends
+			// elements past any sane tolerance for as long as the page lives.
+			case '/churn':
+				return res.end(
+					page(
+						'<div class="item">a</div><div class="item">b</div><div id="ticker"></div>',
+						`<script>setInterval(() => { const t = document.getElementById('ticker'); if (!t) return;
+							for (let i = 0; i < 20; i++) t.appendChild(document.createElement('span')); }, 40);</script>`
+					)
+				);
 			// Islands that shed their marker on "hydration", plus one that never does.
 			case '/islands':
 				return res.end(
@@ -383,4 +393,43 @@ test('a contract with an unusable number or pattern is rejected at config load',
 			} as never),
 		/minCount must be a non-negative/
 	);
+});
+
+// The stop condition is "held AND quiet", and the deadline is the one exit that could quietly drop the
+// second half: a page whose clauses all hold but that never stops changing runs the loop out, and
+// `satisfied` (every clause held) is true. Treating that as a stop skipped the quiet window, the
+// fallback settle, every `waitFor` gate and the final plateau — the stop-on-contract-alone behaviour
+// measured to lose 99% of a product page's links. Reproduced on a live page with an unreachable
+// `quietMs`: settle ended at exactly the timeout and no gate ran.
+test('a contract that holds but never sees the page go quiet falls back to the ordinary settle', async () => {
+	const result = await renderOnce({
+		url: `${base}/churn`,
+		captureNonIndexable: true,
+		config: {
+			navigation: {
+				networkIdleMs: 50,
+				networkIdleTimeoutMs: 200,
+				domStableMs: 0,
+				domStableTimeoutMs: 500,
+				domStableTolerance: 5,
+			},
+			scroll: { enabled: false },
+			// The witness: a gate the fallback settle runs and a contract stop skips.
+			waitFor: [{ name: 'witness', selector: '.item', minCount: 1, timeoutMs: 500, scrollIntoView: false }],
+			readiness: {
+				onSatisfied: 'quiet',
+				quietMs: 100,
+				contracts: [{ name: 'churn', require: [{ name: 'items', selector: '.item', minCount: 2 }], timeoutMs: 600 }],
+			},
+		} as never,
+	});
+	assert.equal(
+		result.waitForResults.map((g) => g.name).join(),
+		'witness',
+		'the ordinary settle, gates included, must have run — the contract never saw the page quiet'
+	);
+	const readiness = result.job.readiness;
+	assert.equal(readiness?.satisfied, true, 'every clause held the whole time, and the report says so');
+	assert.equal(readiness?.stopped, false, 'but it did not stop the render');
+	assert.ok((readiness?.waitedMs ?? 0) >= 600, `it waited out its timeout (waited ${readiness?.waitedMs}ms)`);
 });

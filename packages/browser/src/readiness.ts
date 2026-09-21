@@ -281,6 +281,12 @@ export type ReadinessResult = {
 	/** What the consumer should store as this URL's expectation after this render. */
 	learned?: Record<string, number>;
 	satisfied: boolean;
+	/**
+	 * True when this contract ENDED the render: every clause held and the page had gone quiet. Not
+	 * the same as `satisfied` — a contract whose clauses all held but that never saw the page quiet
+	 * within its timeout is satisfied and did not stop; the render fell back to the ordinary settle.
+	 */
+	stopped: boolean;
 	/** Wall time the contract held the render open. */
 	waitedMs: number;
 	/** How long until it first became true, or null if it never did. */

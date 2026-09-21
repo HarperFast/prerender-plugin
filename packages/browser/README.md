@@ -455,7 +455,8 @@ change looks like. A page that is merely slow is still mutating, so the valve do
 timeout is what bounds the wait.
 
 An unsatisfied contract always falls through to the normal settle, so a badly written contract can
-cost a render time but never content. `job.readiness` carries `satisfied`, per-clause `ok`/`count`/
+cost a render time but never content. So does a contract that _held_ but never saw the page go quiet
+within its `timeoutMs`: the stop condition is "held **and** quiet", and the deadline is not a stop. `job.readiness` carries `satisfied`, per-clause `ok`/`count`/
 `firstTrueMs`, and any `observe` counts.
 
 ### `postProcess.minifyInlineCss` — re-emitting inline CSS from the CSSOM

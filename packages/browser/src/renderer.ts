@@ -654,10 +654,18 @@ const renderer: Renderer = async (page, job) => {
 	 * still coming, and only quiescence can. Measured, stopping on the contract alone loses 99% of the
 	 * product links on a product page.
 	 *
-	 * Returns whether the contract was satisfied. An unsatisfied contract falls through to the
-	 * ordinary settle below, so a contract can cost a render time but never content.
+	 * Returns two verdicts, and they are not the same thing. `satisfied` is what the report carries:
+	 * every clause held. `stopped` is what the settle acts on: the loop left on "held AND quiet", the
+	 * one exit that establishes the page is complete. A contract that held throughout but never saw the
+	 * page go quiet within its timeout is satisfied and did NOT stop — it falls through to the
+	 * ordinary settle like an unsatisfied one, because stopping there would snapshot a page that was
+	 * still changing with nothing having said it may. Reproduced on a live product page with an
+	 * unreachable `quietMs`: settle ended at exactly the timeout and no gate ran. Either way a
+	 * contract can cost a render time, never content.
 	 */
-	const awaitContract = async (governing: NonNullable<ReturnType<typeof contractFor>>): Promise<boolean> => {
+	const awaitContract = async (
+		governing: NonNullable<ReturnType<typeof contractFor>>
+	): Promise<{ satisfied: boolean; stopped: boolean }> => {
 		const started = Date.now();
 		const pollMs = governing.pollMs ?? config.navigation.domStablePollMs;
 		const quietFor = governing.quietMs ?? config.readiness?.quietMs ?? 250;
@@ -675,6 +683,7 @@ const renderer: Renderer = async (page, job) => {
 		const firstTrue = new Map<string, number>();
 		let quietSince = 0;
 		let grantedGrace = false;
+		let stopped = false;
 		let firstSatisfiedMs: number | null = null;
 		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
 
@@ -703,6 +712,9 @@ const renderer: Renderer = async (page, job) => {
 					await new Promise((resolve) => setTimeout(resolve, policy.graceMs));
 					continue;
 				}
+				// The ONLY exit that ends the render here. Every other way out of this loop — the deadline,
+				// the rot valve, a page that went away — falls through to the ordinary settle.
+				stopped = true;
 				break;
 			}
 
@@ -726,6 +738,7 @@ const renderer: Renderer = async (page, job) => {
 		job.readiness = {
 			contract: governing.name,
 			satisfied,
+			stopped,
 			shortfalls: expectation.shortfalls,
 			rebaselined: expectation.rebaselined,
 			learned: expectation.learned,
@@ -737,7 +750,7 @@ const renderer: Renderer = async (page, job) => {
 			})),
 			observe: last?.observe ?? [],
 		} satisfies ReadinessResult;
-		return satisfied;
+		return { satisfied, stopped };
 	};
 
 	/**
@@ -822,6 +835,8 @@ const renderer: Renderer = async (page, job) => {
 		job.readiness = {
 			contract: governing.name,
 			satisfied: !!last && last.started && last.require.every((r) => r.ok),
+			// Report mode watches; it never decides.
+			stopped: false,
 			shortfalls: expectation.shortfalls,
 			rebaselined: expectation.rebaselined,
 			learned: expectation.learned,
@@ -837,10 +852,11 @@ const renderer: Renderer = async (page, job) => {
 
 	// A contract REPLACES the timer-based settle rather than joining it: scroll once to trip whatever
 	// is lazy, then hold until the page says it is complete. Everything below is what runs when no
-	// contract governs this render, or when one is not satisfied.
+	// contract governs this render, or when one did not stop it — unsatisfied, OR satisfied but never
+	// quiet within its timeout (see `awaitContract`).
 	const observing: { done: boolean; wake?: (() => void) | undefined } = { done: false };
 	let observer: Promise<void> | null = null;
-	let contractSatisfied = false;
+	let contractStopped = false;
 	let contractScrolled = false;
 	// The settle is wrapped so the observer is released on EVERY exit, including a throw from a
 	// scroll or wait below. Without this, a render that failed mid-settle left the observer polling
@@ -857,9 +873,8 @@ const renderer: Renderer = async (page, job) => {
 				await scrollToTop();
 				contractScrolled = true;
 			}
-			contractSatisfied = await awaitContract(contract);
+			({ stopped: contractStopped } = await awaitContract(contract));
 		}
-		const contractStopped = contract !== null && contractSatisfied;
 
 		if (contractStopped) {
 			// The contract asserted the page is complete and quiet, which is a stronger statement than any
