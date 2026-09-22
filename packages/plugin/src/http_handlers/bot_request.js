@@ -32,7 +32,7 @@ import { recordCrawl } from '../util/crawlStats.js';
 import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
-import { captureForRawCache, rawCachePolicy, readRawPage } from '../util/rawCache.js';
+import { captureForRawCache, rawCachePolicy, rawKeyOf, readRawPage } from '../util/rawCache.js';
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { deliverResource } from './response.js';
 
@@ -366,8 +366,11 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
 			? rawCachePolicy(info.route)
 			: null;
+	// Per-device by default, one row per URL under `render.raw.deviceIndependent` (see `rawKeyOf`).
+	// Only the STORAGE key changes: the response still reports this request's own `cacheKey`.
+	const rawKey = rawPolicy ? rawKeyOf({ cacheKey, cacheUrl }, rawPolicy) : null;
 	if (rawPolicy) {
-		const stored = await readRawPage(cacheKey);
+		const stored = await readRawPage(rawKey);
 		// A BULK INVALIDATION MUST REACH THESE TOO. Without this the feature would silently defeat
 		// invalidation on exactly the routes it is enabled for: the epoch above is read only when a
 		// `PrerenderedPage` row exists, and on this branch there is none, so nothing would consult it.
@@ -406,7 +409,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 			// indistinguishable from an ordinary miss — the same request shape, the same status.
 			metrics.serveError(body.reason === 'timeout' ? 'raw-blob-timeout' : 'raw-blob-unreadable');
 			logger.warn(
-				`raw document blob ${body.reason === 'timeout' ? 'read exceeded the budget' : 'unreadable'} for ${cacheKey}; serving origin instead`
+				`raw document blob ${body.reason === 'timeout' ? 'read exceeded the budget' : 'unreadable'} for ${rawKey}; serving origin instead`
 			);
 		}
 	}
@@ -428,7 +431,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
 	// store is detached inside `captureForRawCache` — no latency on this response.
-	return rawPolicy ? captureForRawCache(resource, { cacheKey, policy: rawPolicy }) : resource;
+	return rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
 }
 
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
