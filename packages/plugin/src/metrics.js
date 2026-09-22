@@ -522,7 +522,7 @@ export const METRICS = Object.freeze({
 			'render rotation", the corpus growth the gate is preventing. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
-			'oversize, capture-failed, write-failed). READ THE REFUSALS, not the successes — a route that is ' +
+			'oversize, capture-failed, write-failed, vary-device). READ THE REFUSALS, not the successes — a route that is ' +
 			'enabled and filling nothing is indistinguishable from one that is switched off unless the reason is ' +
 			'recorded. oversize climbing means render.raw.maxBytes is below the route’s real document size; ' +
 			'has-cookie climbing means the origin is personalizing a route that was assumed to be shared, which ' +
@@ -530,7 +530,9 @@ export const METRICS = Object.freeze({
 			'counted as stored-unshared instead, and that series is a CENSUS, not an alarm: on an origin that ' +
 			'sets a cookie on every response it is pinned at 100% from the first minute and cannot rise, so no ' +
 			'threshold on it detects anything. What still detects personalization is re-running the body diff ' +
-			'the option documents. Read stored + stored-unshared as the store rate. ' +
+			'the option documents. Read stored + stored-unshared as the store rate. vary-device is refused only ' +
+			'under render.raw.deviceIndependent: the origin named User-Agent or a client hint in Vary, i.e. ' +
+			'declared the document adaptive — any count means that option is wrong for this origin. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +

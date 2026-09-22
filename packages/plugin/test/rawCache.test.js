@@ -70,6 +70,7 @@ beforeEach(() => {
 	config.render.raw.maxConcurrentCaptures = 16;
 	config.render.raw.contentTypes = ['text/html'];
 	config.render.raw.assumeShared = false;
+	config.render.raw.deviceIndependent = false;
 });
 
 const policy = () => config.render.raw;
@@ -589,4 +590,77 @@ test('a chunk with no byteLength cannot disable the cap', async () => {
 
 test('x-harper-raw is not stored — it had no reader and shipped to every crawler ungated', () => {
 	assert.equal(rawCache.storedHeaders(originResource().headers)['x-harper-raw'], undefined);
+});
+
+// ---- deviceIndependent: one row per URL --------------------------------------------------------
+//
+// The failure this guards against is silent in the worst direction: keyed by URL, whichever device
+// missed first decides what every device is served. So the default must stay per-device, and the
+// origin's own `Vary` must still be able to refuse the share.
+
+test('rawKeyOf: the per-device cacheKey by default, the device-free URL under deviceIndependent', () => {
+	const req = { cacheKey: 'https://example.com/catalog/x|mobile', cacheUrl: 'https://example.com/catalog/x' };
+	assert.equal(rawCache.rawKeyOf(req, policy()), req.cacheKey, 'default is per-device');
+	config.render.raw.deviceIndependent = true;
+	assert.equal(rawCache.rawKeyOf(req, policy()), req.cacheUrl);
+	assert.equal(
+		rawCache.rawKeyOf({ ...req, cacheKey: 'https://example.com/catalog/x|desktop' }, policy()),
+		rawCache.rawKeyOf(req, policy()),
+		'both devices land on ONE row — the point of the option'
+	);
+});
+
+test('variesByDevice: User-Agent, screen and Sec-CH-* hints, the ingress device header, and * — case-insensitive', () => {
+	for (const vary of [
+		'User-Agent',
+		'accept-encoding, user-agent',
+		' Sec-CH-UA-Mobile ',
+		'sec-ch-ua',
+		'Sec-CH-Viewport-Width',
+		'DPR',
+		'Viewport-Width',
+		'X-Device-Type',
+		'*',
+		['Accept-Encoding', 'User-Agent'],
+	]) {
+		assert.equal(rawCache.variesByDevice({ vary }), true, JSON.stringify(vary));
+	}
+	for (const vary of [undefined, null, '', 'Accept-Encoding', 'Accept-Language, Origin', 'x-user-agent-hint']) {
+		assert.equal(rawCache.variesByDevice({ vary }), false, JSON.stringify(vary));
+	}
+	assert.equal(rawCache.variesByDevice(undefined), false);
+	// The ingress device header comes from config, not a hardcoded name.
+	config.ingress.deviceTypeHeader = 'x-form-factor';
+	try {
+		assert.equal(rawCache.variesByDevice({ vary: 'X-Form-Factor' }), true);
+		assert.equal(rawCache.variesByDevice({ vary: 'X-Device-Type' }), false);
+	} finally {
+		config.ingress.deviceTypeHeader = 'x-device-type';
+	}
+});
+
+test('storeRefusal: a device-varying document is refused ONLY when it would be shared across devices', () => {
+	const adaptive = originResource({ headers: { ...originResource().headers, vary: 'Accept-Encoding, User-Agent' } });
+	assert.equal(rawCache.storeRefusal(adaptive, policy()), null, 'per-device keys store it under its own device');
+	config.render.raw.deviceIndependent = true;
+	assert.equal(rawCache.storeRefusal(adaptive, policy()), 'vary-device');
+	const responsive = originResource({ headers: { ...originResource().headers, vary: 'Accept-Encoding' } });
+	assert.equal(rawCache.storeRefusal(responsive, policy()), null, 'Vary: Accept-Encoding is the responsive case');
+});
+
+test('capture under deviceIndependent: the refusal is counted by name and nothing is stored', async () => {
+	config.render.raw.deviceIndependent = true;
+	const resource = originResource({
+		headers: { ...originResource().headers, vary: 'User-Agent' },
+		content: streamOf(['<html>']),
+	});
+	const out = rawCache.captureForRawCache(resource, { cacheKey: 'https://example.com/x', policy: policy() });
+	assert.equal(out, resource, 'served untouched — no tee for a refused capture');
+	assert.ok(ops.includes('prerender_ops:raw_cache:vary-device'));
+	assert.equal(rows.size, 0);
+});
+
+test('deviceIndependent defaults to false — sharing across devices is opt-in', async () => {
+	const { defaultConfig } = await import('../src/configSchema.js');
+	assert.equal(defaultConfig().render.raw.deviceIndependent, false);
 });

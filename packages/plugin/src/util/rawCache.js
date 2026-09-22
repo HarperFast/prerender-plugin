@@ -56,6 +56,64 @@ export const rawCachePolicy = (entry) => {
 };
 
 /**
+ * The `RawPage` key for this request: the per-device `cacheKey`, or — under
+ * `render.raw.deviceIndependent` — the device-free canonical URL, so one stored document answers
+ * every device.
+ *
+ * PER-DEVICE IS THE DEFAULT because the origin fetch is made with a per-device User-Agent
+ * (`origin.userAgents`), and an ADAPTIVE origin answers those differently. Replaying its desktop
+ * document to a smartphone crawler would be serving the wrong page, silently, under a 200. But a
+ * RESPONSIVE origin — one document, laid out by CSS — answers both identically, and there the
+ * per-device key stores every document twice and makes each device miss on its own: a desktop
+ * crawler's fetch never fills the cache for the smartphone crawler asking for the same URL minutes
+ * later.
+ *
+ * Flipping the switch in either direction stops reading the other shape's rows, which expire on
+ * their own. The two shapes cannot collide under the default delimiter (`|`, which
+ * `canonicalizeUrl` percent-encodes out of every URL). A delimiter that can occur in a URL — `/` —
+ * reopens the false positive `CacheKey.isCacheKey` documents: a URL ending `/<device>` is spelled
+ * like the per-device key of its parent, and for one expiry window after a flip that leftover row
+ * could answer for it.
+ */
+export const rawKeyOf = ({ cacheKey, cacheUrl }, policy) => (policy?.deviceIndependent ? cacheUrl : cacheKey);
+
+/**
+ * Request headers whose presence in `Vary` says the body depends on the device: the User-Agent,
+ * the pre-`Sec-` client hints that describe the screen (`DPR`, `Viewport-Width`, `Width`,
+ * `Device-Memory`), and this deployment's own ingress device header — which the origin fetch
+ * FORWARDS unless it is listed in `origin.ignoredHeaders`, so an origin can adapt on it. Every
+ * `Sec-CH-*` hint is matched by prefix in `variesByDevice`.
+ */
+const DEVICE_VARY_HEADERS = new Set(['user-agent', 'dpr', 'viewport-width', 'width', 'device-memory']);
+
+/**
+ * Does this response's `Vary` say the body depends on the device? True for any header in
+ * `DEVICE_VARY_HEADERS` or the ingress device header, any `Sec-CH-*` client hint, and `*` (varies on
+ * everything, the device included).
+ *
+ * This is the origin's own, standard declaration of exactly the property `deviceIndependent`
+ * assumes away, so it is the one check that can catch the assumption going wrong: an origin that
+ * turns adaptive and says so is refused rather than having its desktop document replayed to phones.
+ * An origin that turns adaptive and does NOT say so is invisible here; re-diffing a URL fetched
+ * under each `origin.userAgents` entry is the only detector for that.
+ */
+export const variesByDevice = (headers) => {
+	const vary = headers?.vary;
+	if (vary === undefined || vary === null || vary === '') return false;
+	const deviceHeader = String(config.ingress?.deviceTypeHeader ?? '').toLowerCase();
+	return String(Array.isArray(vary) ? vary.join(',') : vary)
+		.split(',')
+		.map((name) => name.trim().toLowerCase())
+		.some(
+			(name) =>
+				name === '*' ||
+				DEVICE_VARY_HEADERS.has(name) ||
+				name.startsWith('sec-ch-') ||
+				(deviceHeader !== '' && name === deviceHeader)
+		);
+};
+
+/**
  * When a document fetched now should stop being served.
  *
  * `midnight` is not a convenience spelling of "24h". It exists for origins whose content STEPS at
@@ -196,6 +254,9 @@ export const storeRefusal = (resource, policy) => {
 	// refusing it would exclude most correctly-configured HTML.
 	if (hasCacheControlDirective(headers['cache-control'], 'no-store')) return 'no-store';
 	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
+	// Only under `deviceIndependent`: with per-device keys a device-varying document is stored under
+	// the device that fetched it, which is correct. See `variesByDevice`.
+	if (policy.deviceIndependent && variesByDevice(headers)) return 'vary-device';
 	return null;
 };
 

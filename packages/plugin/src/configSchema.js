@@ -1409,6 +1409,31 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'shared cache that honours `private` will not cache the hit, so do not expect edge offload ' +
 						'on it.'
 				),
+				deviceIndependent: option(
+					false,
+					'Store ONE document per URL and serve it to every device, instead of one per URL per device.\n\n' +
+						'WHY THE DEFAULT IS PER-DEVICE. The origin fetch is made with a per-device User-Agent ' +
+						'(`origin.userAgents`), and an ADAPTIVE origin answers those with different HTML. Keyed by ' +
+						'URL alone, whichever device missed first would decide what every other device is served — ' +
+						'a desktop page to a smartphone crawler, under a 200, with nothing reporting it.\n\n' +
+						'WHEN TO TURN IT ON: a RESPONSIVE origin, one document laid out by CSS. There the per-device ' +
+						'key stores every document twice and halves the hit rate, because each device has to miss on ' +
+						'its own — a desktop crawler’s fetch never answers the smartphone crawler asking for the same ' +
+						'URL minutes later.\n\n' +
+						'VERIFY BEFORE SETTING IT: fetch the same URL with each `origin.userAgents` entry and diff the ' +
+						'bodies. Differences confined to per-request telemetry and generated ids mean the document is ' +
+						'device-independent; any difference in CONTENT or markup structure means it is not.\n\n' +
+						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-*` ' +
+						'client hint, `DPR`/`Viewport-Width`/`Width`/`Device-Memory`, `ingress.deviceTypeHeader`, or ' +
+						'`*` is the origin declaring the body depends on the device, and it is refused ' +
+						'and counted as `vary-device` rather than shared. That catches an origin that turns adaptive ' +
+						'AND says so; one that turns adaptive silently is caught only by re-running the diff.\n\n' +
+						'Flipping it in either direction needs no migration: the other key shape’s rows are simply ' +
+						'never read again and expire on their own. That relies on the two shapes not colliding, which ' +
+						'holds for the default `cacheKey.delimiter` (`|` never survives into a canonical URL) but not ' +
+						'for one that can occur in a URL: with `/`, a URL ending `/<device>` reads as its parent’s ' +
+						'per-device key for one expiry window after the flip.'
+				),
 			}
 		),
 		defaultInterval: option(

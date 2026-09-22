@@ -1643,6 +1643,10 @@ const RAW_REFUSALS = {
 	'write-failed': ['the store itself threw — the document was served, nothing was kept', 'bad'],
 	'empty': ['a 200 with a zero-byte body — refused rather than replayed as an empty document', 'warn'],
 	'capture-busy': ['render.raw.maxConcurrentCaptures was full; the next request stores it', ''],
+	'vary-device': [
+		'the origin sent Vary: User-Agent / a client hint — it is adaptive, so render.raw.deviceIndependent is wrong here',
+		'bad',
+	],
 };
 
 function rawCache(ctx, data, filter) {
