@@ -68,15 +68,28 @@ export const rawCachePolicy = (entry) => {
  * crawler's fetch never fills the cache for the smartphone crawler asking for the same URL minutes
  * later.
  *
- * No collision between the two shapes: a cacheKey always ends `<delimiter><device>` and a canonical
- * URL never does (see `CacheKey.isCacheKey`), so flipping the switch in either direction simply
- * stops reading the other shape's rows, which expire on their own.
+ * Flipping the switch in either direction stops reading the other shape's rows, which expire on
+ * their own. The two shapes cannot collide under the default delimiter (`|`, which
+ * `canonicalizeUrl` percent-encodes out of every URL). A delimiter that can occur in a URL — `/` —
+ * reopens the false positive `CacheKey.isCacheKey` documents: a URL ending `/<device>` is spelled
+ * like the per-device key of its parent, and for one expiry window after a flip that leftover row
+ * could answer for it.
  */
 export const rawKeyOf = ({ cacheKey, cacheUrl }, policy) => (policy?.deviceIndependent ? cacheUrl : cacheKey);
 
 /**
- * Does this response's `Vary` say the body depends on the device? Returns true for a `User-Agent`
- * or any `Sec-CH-UA*` client hint, and for `*` (varies on everything, the device included).
+ * Request headers whose presence in `Vary` says the body depends on the device: the User-Agent,
+ * the pre-`Sec-` client hints that describe the screen (`DPR`, `Viewport-Width`, `Width`,
+ * `Device-Memory`), and this deployment's own ingress device header — which the origin fetch
+ * FORWARDS unless it is listed in `origin.ignoredHeaders`, so an origin can adapt on it. Every
+ * `Sec-CH-*` hint is matched by prefix in `variesByDevice`.
+ */
+const DEVICE_VARY_HEADERS = new Set(['user-agent', 'dpr', 'viewport-width', 'width', 'device-memory']);
+
+/**
+ * Does this response's `Vary` say the body depends on the device? True for any header in
+ * `DEVICE_VARY_HEADERS` or the ingress device header, any `Sec-CH-*` client hint, and `*` (varies on
+ * everything, the device included).
  *
  * This is the origin's own, standard declaration of exactly the property `deviceIndependent`
  * assumes away, so it is the one check that can catch the assumption going wrong: an origin that
@@ -87,10 +100,17 @@ export const rawKeyOf = ({ cacheKey, cacheUrl }, policy) => (policy?.deviceIndep
 export const variesByDevice = (headers) => {
 	const vary = headers?.vary;
 	if (vary === undefined || vary === null || vary === '') return false;
+	const deviceHeader = String(config.ingress?.deviceTypeHeader ?? '').toLowerCase();
 	return String(Array.isArray(vary) ? vary.join(',') : vary)
 		.split(',')
 		.map((name) => name.trim().toLowerCase())
-		.some((name) => name === '*' || name === 'user-agent' || name.startsWith('sec-ch-ua'));
+		.some(
+			(name) =>
+				name === '*' ||
+				DEVICE_VARY_HEADERS.has(name) ||
+				name.startsWith('sec-ch-') ||
+				(deviceHeader !== '' && name === deviceHeader)
+		);
 };
 
 /**

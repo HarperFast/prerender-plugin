@@ -1423,12 +1423,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'VERIFY BEFORE SETTING IT: fetch the same URL with each `origin.userAgents` entry and diff the ' +
 						'bodies. Differences confined to per-request telemetry and generated ids mean the document is ' +
 						'device-independent; any difference in CONTENT or markup structure means it is not.\n\n' +
-						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-UA*` ' +
-						'client hint, or `*` is the origin declaring the body depends on the device, and it is refused ' +
+						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-*` ' +
+						'client hint, `DPR`/`Viewport-Width`/`Width`/`Device-Memory`, `ingress.deviceTypeHeader`, or ' +
+						'`*` is the origin declaring the body depends on the device, and it is refused ' +
 						'and counted as `vary-device` rather than shared. That catches an origin that turns adaptive ' +
 						'AND says so; one that turns adaptive silently is caught only by re-running the diff.\n\n' +
-						'Flipping it in either direction needs no migration: the two key shapes cannot collide, so ' +
-						'the other shape’s rows are simply never read again and expire on their own.'
+						'Flipping it in either direction needs no migration: the other key shape’s rows are simply ' +
+						'never read again and expire on their own. That relies on the two shapes not colliding, which ' +
+						'holds for the default `cacheKey.delimiter` (`|` never survives into a canonical URL) but not ' +
+						'for one that can occur in a URL: with `/`, a URL ending `/<device>` reads as its parent’s ' +
+						'per-device key for one expiry window after the flip.'
 				),
 			}
 		),

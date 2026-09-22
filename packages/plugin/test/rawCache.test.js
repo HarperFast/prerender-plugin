@@ -610,12 +610,16 @@ test('rawKeyOf: the per-device cacheKey by default, the device-free URL under de
 	);
 });
 
-test('variesByDevice: User-Agent, any Sec-CH-UA* hint, and * — case- and whitespace-insensitive', () => {
+test('variesByDevice: User-Agent, screen and Sec-CH-* hints, the ingress device header, and * — case-insensitive', () => {
 	for (const vary of [
 		'User-Agent',
 		'accept-encoding, user-agent',
 		' Sec-CH-UA-Mobile ',
 		'sec-ch-ua',
+		'Sec-CH-Viewport-Width',
+		'DPR',
+		'Viewport-Width',
+		'X-Device-Type',
 		'*',
 		['Accept-Encoding', 'User-Agent'],
 	]) {
@@ -625,6 +629,14 @@ test('variesByDevice: User-Agent, any Sec-CH-UA* hint, and * — case- and white
 		assert.equal(rawCache.variesByDevice({ vary }), false, JSON.stringify(vary));
 	}
 	assert.equal(rawCache.variesByDevice(undefined), false);
+	// The ingress device header comes from config, not a hardcoded name.
+	config.ingress.deviceTypeHeader = 'x-form-factor';
+	try {
+		assert.equal(rawCache.variesByDevice({ vary: 'X-Form-Factor' }), true);
+		assert.equal(rawCache.variesByDevice({ vary: 'X-Device-Type' }), false);
+	} finally {
+		config.ingress.deviceTypeHeader = 'x-device-type';
+	}
 });
 
 test('storeRefusal: a device-varying document is refused ONLY when it would be shared across devices', () => {
