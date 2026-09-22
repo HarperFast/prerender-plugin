@@ -1416,18 +1416,29 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'(`origin.userAgents`), and an ADAPTIVE origin answers those with different HTML. Keyed by ' +
 						'URL alone, whichever device missed first would decide what every other device is served — ' +
 						'a desktop page to a smartphone crawler, under a 200, with nothing reporting it.\n\n' +
-						'WHEN TO TURN IT ON: a RESPONSIVE origin, one document laid out by CSS. There the per-device ' +
-						'key stores every document twice and halves the hit rate, because each device has to miss on ' +
-						'its own — a desktop crawler’s fetch never answers the smartphone crawler asking for the same ' +
-						'URL minutes later.\n\n' +
-						'VERIFY BEFORE SETTING IT: fetch the same URL with each `origin.userAgents` entry and diff the ' +
-						'bodies. Differences confined to per-request telemetry and generated ids mean the document is ' +
-						'device-independent; any difference in CONTENT or markup structure means it is not.\n\n' +
+						'WHEN TO TURN IT ON: an origin whose documents carry the same CONTENT for every device — ' +
+						'responsive, or adaptive only in presentation. There the per-device key stores every ' +
+						'document twice and halves the hit rate, because each device has to miss on its own — a ' +
+						'desktop crawler’s fetch never answers the smartphone crawler asking for the same URL ' +
+						'minutes later.\n\n' +
+						'VERIFY BEFORE SETTING IT: fetch the same URL with each `origin.userAgents` entry, with a ' +
+						'CACHE-BUSTING query parameter, and compare what a crawler indexes — title, meta, canonical, ' +
+						'robots, headings, structured data, the product/link set. Presentation-only differences ' +
+						'(lazy-loading attributes, a UI component’s channel flag, facet-panel extras) do not ' +
+						'disqualify it; any difference in CONTENT does. Compare against two fetches from the SAME ' +
+						'device, because a catalog that re-ranks per response differs from itself.\n\n' +
+						'THE CACHE-BUSTER IS NOT OPTIONAL. A CDN whose cache key has no device in it hands every UA ' +
+						'whichever copy was filled first, so an un-busted comparison reads an adaptive origin as ' +
+						'byte-identical. Measured on one deployment: 5 of 6 un-busted mobile fetches returned the ' +
+						'desktop document. That same fact is the strongest argument FOR this option there: the edge ' +
+						'already serves one copy per URL to every device, so per-device raw rows were mostly the ' +
+						'other device’s document anyway.\n\n' +
 						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-*` ' +
 						'client hint, `DPR`/`Viewport-Width`/`Width`/`Device-Memory`, `ingress.deviceTypeHeader`, or ' +
 						'`*` is the origin declaring the body depends on the device, and it is refused ' +
 						'and counted as `vary-device` rather than shared. That catches an origin that turns adaptive ' +
-						'AND says so; one that turns adaptive silently is caught only by re-running the diff.\n\n' +
+						'AND says so. Many adaptive origins sniff the UA without declaring it, and those pass this ' +
+						'check silently; only re-running the cache-busted diff catches a change there.\n\n' +
 						'Flipping it in either direction needs no migration: the other key shape’s rows are simply ' +
 						'never read again and expire on their own. That relies on the two shapes not colliding, which ' +
 						'holds for the default `cacheKey.delimiter` (`|` never survives into a canonical URL) but not ' +

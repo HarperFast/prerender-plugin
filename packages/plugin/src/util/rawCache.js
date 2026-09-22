@@ -62,11 +62,11 @@ export const rawCachePolicy = (entry) => {
  *
  * PER-DEVICE IS THE DEFAULT because the origin fetch is made with a per-device User-Agent
  * (`origin.userAgents`), and an ADAPTIVE origin answers those differently. Replaying its desktop
- * document to a smartphone crawler would be serving the wrong page, silently, under a 200. But a
- * RESPONSIVE origin — one document, laid out by CSS — answers both identically, and there the
- * per-device key stores every document twice and makes each device miss on its own: a desktop
- * crawler's fetch never fills the cache for the smartphone crawler asking for the same URL minutes
- * later.
+ * document to a smartphone crawler would be serving the wrong page, silently, under a 200. But an
+ * origin whose documents carry the same CONTENT for every device — responsive, or adaptive only in
+ * presentation — gains nothing from it, and there the per-device key stores every document twice
+ * and makes each device miss on its own: a desktop crawler's fetch never fills the cache for the
+ * smartphone crawler asking for the same URL minutes later.
  *
  * Flipping the switch in either direction stops reading the other shape's rows, which expire on
  * their own. The two shapes cannot collide under the default delimiter (`|`, which
