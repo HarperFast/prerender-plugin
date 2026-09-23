@@ -39,21 +39,30 @@ import { getInitialRenderTime } from './time.js';
 import { resolveRenderInterval } from './routeClass.js';
 import { getScheduleRow, writeSchedule } from './renderSchedule.js';
 import { claimRun, finishRun, isRunning, readRunState } from './runState.js';
+import { walkUrlRange } from './urlWalk.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread.
 const YIELD_EVERY = 200;
+// Rows per chunk of the target walk. Each chunk is its own short read, so the walk never holds one
+// read transaction across the whole registry — the same size the discovered-target purge walks with.
+const CHUNK_SIZE = 10_000;
 
 /**
  * ONE pass over the targets: find the keys this node owns whose schedule row is missing, then
  * restore them after the scan has finished. All I/O is injected, so the traversal, the
  * ownership filter and the cap are testable without a live database.
  *
- * Deliberately CURSOR-FREE, and therefore indifferent to the order rows arrive in. An earlier
- * version paged by primary key and resumed from the last key seen, which quietly made
- * correctness depend on the storage engine returning rows in key order: if that ever stopped
- * holding, the cursor would skip rows silently — the worst possible failure mode for a repair
- * tool, in the one place nobody would look. A single pass needs no such guarantee.
+ * The traversal is indifferent to the order rows arrive in; the live binding's walk is not, and
+ * that is deliberate. This sweep used to stream one unconstrained `Target.search`, cursor-free, on
+ * the argument that a cursor makes correctness depend on key order. That argument was right about
+ * cursors and wrong about the risk that mattered: the projected iterator silently ENDS in front of
+ * a row whose key does not decode (see util/urlWalk.js), so on a replica holding such rows the
+ * pass covered an arbitrary prefix of the registry and reported "no gaps" for the rest. Measured on
+ * a four-node deployment: the first unreadable row sat about 500k rows into a 1.68M-row registry on
+ * three of the nodes, and 734 live targets past it had no schedule row for five weeks. The walk is
+ * now `walkUrlRange`, which skips and COUNTS unreadable rows and throws when it cannot prove the
+ * range was covered — a failed pass is recorded as a failure, never as a clean one.
  *
  * The two phases also make the transaction rule structural rather than a convention to
  * remember: no write is issued while the scan's cursor is open, because every write happens
@@ -75,8 +84,13 @@ export const reconcileSchedules = async ({
 	maxRestores,
 	onYield = () => {},
 } = {}) => {
-	const stats = { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false };
+	const stats = { examined: 0, owned: 0, missing: 0, restored: 0, unreadable: 0, truncated: false };
 	const toRestore = [];
+	// Counted, not fatal: an unreadable row cannot be checked (it has no addressable url), but it must
+	// not end the walk either. A non-zero count is a database-layer problem to escalate.
+	const onUnreadable = () => {
+		stats.unreadable++;
+	};
 
 	// Phase 1 — read only. One target row implies ONE schedule row, keyed by the URL.
 	//
@@ -85,7 +99,7 @@ export const reconcileSchedules = async ({
 	// then a URL scheduled under them is scheduled — restoring a URL row beside them would render the
 	// URL twice for a cycle. The device reads cost nothing once the corpus has converted, because they
 	// only run for a URL whose URL row is missing, which is the rare case this sweep exists for.
-	for await (const target of streamTargets()) {
+	for await (const target of streamTargets({ onUnreadable })) {
 		stats.examined++;
 		if (stats.examined % YIELD_EVERY === 0) await onYield();
 
@@ -159,17 +173,11 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 	} = databases;
 
 	return reconcileSchedules({
-		// One unconstrained scan, streamed. No conditions, no `sort`, no `limit`:
-		//   - no `sort`, because asking Harper to sort by the primary key is what broke v0.10.0
-		//     (the primary key is not flagged `indexed`, so a sort on it is rejected unless a
-		//     condition accompanies it — and Harper injects its own scan condition only AFTER
-		//     that check, so the first page threw before scanning anything);
-		//   - no conditions, because with none Harper injects that full-scan condition itself,
-		//     which is exactly what this wants;
-		//   - no `limit`, because the caller streams and never resumes, so it needs no paging.
-		//
-		// Nothing here depends on the order rows arrive in — see `reconcileSchedules`.
-		streamTargets: () => Target.search({ select: ['url', 'renderInterval', 'sitemapUrl'] }),
+		// The chunked, unreadable-row-safe walk — see `reconcileSchedules` for why not one streamed
+		// search. Every chunk carries a condition on the key, which is also what keeps the sort legal
+		// (a bare sort on the un-indexed primary key is what broke v0.10.0).
+		streamTargets: ({ onUnreadable } = {}) =>
+			walkUrlRange(Target, { select: ['url', 'renderInterval', 'sitemapUrl'], chunkSize: CHUNK_SIZE, onUnreadable }),
 		// Node-local by construction — see the module comment. Existence is all that matters.
 		// (`getScheduleRow` is what carries the mandatory `replicateFrom: false`.)
 		getSchedule: (key) => getScheduleRow(key, ['cacheKey']),
@@ -234,6 +242,13 @@ export const runReconcileOnce = async (options) => {
 
 		// Restoring a row means a URL was silently un-renderable until now, which is worth a
 		// warning rather than an info line. A clean pass says so quietly.
+		if (stats.unreadable) {
+			// Rows the walk could not read have no addressable url, so this sweep cannot tell whether
+			// they are scheduled. They are a replica-level fault, not a gap this sweep can repair.
+			logger.warn(
+				`[prerender] schedule reconcile: skipped ${stats.unreadable} unreadable target row(s) — their keys do not decode; escalate to the database layer`
+			);
+		}
 		if (stats.restored || stats.truncated) {
 			logger.warn(
 				`[prerender] schedule reconcile: restored ${stats.restored} of ${stats.missing} missing schedule row(s) across ${stats.owned} owned target(s) (${stats.examined} examined)` +

@@ -685,34 +685,37 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                           | Purpose                                          | Gate         |
-| --------------------------------------- | ------------------------------------------------ | ------------ |
-| `GET /prerender_admin[/]`               | API index: what this is, where the UI lives      | public       |
-| `GET /prerender_admin/session`          | who am I                                         | public       |
-| `POST /prerender_admin/login`           | `{ username, password }`                         | public       |
-| `POST /prerender_admin/logout`          | end the session                                  | session      |
-| `GET /prerender_admin/overview`         | nodes, counts, backlog snapshot                  | `super_user` |
-| `GET /prerender_admin/config`           | effective config, layers, overrides, warnings    | `super_user` |
-| `GET /prerender_admin/sitemaps`         | root sitemaps + refresh state (never `entries`)  | `super_user` |
-| `GET /prerender_admin/pages`            | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
-| `GET /prerender_admin/page-content`     | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
-| `GET /prerender_admin/unrouted`         | this worker's unrouted-path tally (peek)         | `super_user` |
-| `GET /prerender_admin/analytics`        | `?range` (ms) — bucketed metric series, cached   | `super_user` |
-| `GET /prerender_admin/invalidations`    | active bulk-invalidation rows                    | `super_user` |
-| `GET /prerender_admin/crawl-breadth`    | `?days` — distinct URLs crawled per bot per day  | `super_user` |
-| `GET /prerender_admin/metrics`          | the metric catalog (see METRICS.md)              | `super_user` |
-| `POST /prerender_admin/explain`         | `{ url, deviceType }` → cache-key trace          | `super_user` |
-| `POST /prerender_admin/schedule`        | `{ url \| cacheKey }` → this node's schedule row | `super_user` |
-| `POST /prerender_admin/queue`           | `{ scope, paused }` → pause control, or          | `super_user` |
-|                                         | `{ action: "reset-claim-floor" }` (this node)    |              |
-| `POST /prerender_admin/revalidate`      | `{ url, deviceType }` → make one URL due now     | `super_user` |
-| `POST /prerender_admin/reconcile`       | start a schedule-repair sweep on this node       | `super_user` |
-| `POST /prerender_admin/sweep-orphans`   | `{ dryRun?, maxDeletes? }` → key-rule orphans    | `super_user` |
-| `POST /prerender_admin/backlog`         | recompute the backlog/histogram snapshot now     | `super_user` |
-| `POST /prerender_admin/sitemap`         | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
-| `POST /prerender_admin/sitemap-refresh` | `{ url? }` → background walk of one/all roots    | `super_user` |
-| `GET /prerender_admin/change-probe`     | probe rules + last pass records (this node)      | `super_user` |
-| `POST /prerender_admin/change-probe`    | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
+| Method & path                              | Purpose                                          | Gate         |
+| ------------------------------------------ | ------------------------------------------------ | ------------ |
+| `GET /prerender_admin[/]`                  | API index: what this is, where the UI lives      | public       |
+| `GET /prerender_admin/session`             | who am I                                         | public       |
+| `POST /prerender_admin/login`              | `{ username, password }`                         | public       |
+| `POST /prerender_admin/logout`             | end the session                                  | session      |
+| `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot                  | `super_user` |
+| `GET /prerender_admin/config`              | effective config, layers, overrides, warnings    | `super_user` |
+| `GET /prerender_admin/sitemaps`            | root sitemaps + refresh state (never `entries`)  | `super_user` |
+| `GET /prerender_admin/pages`               | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
+| `GET /prerender_admin/page-content`        | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
+| `GET /prerender_admin/unrouted`            | this worker's unrouted-path tally (peek)         | `super_user` |
+| `GET /prerender_admin/analytics`           | `?range` (ms) — bucketed metric series, cached   | `super_user` |
+| `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                    | `super_user` |
+| `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day  | `super_user` |
+| `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)              | `super_user` |
+| `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace          | `super_user` |
+| `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row | `super_user` |
+| `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control, or          | `super_user` |
+|                                            | `{ action: "reset-claim-floor" }` (this node)    |              |
+| `POST /prerender_admin/revalidate`         | `{ url, deviceType }` → make one URL due now     | `super_user` |
+| `POST /prerender_admin/reconcile`          | start a schedule-repair sweep on this node       | `super_user` |
+| `POST /prerender_admin/sweep-orphans`      | `{ dryRun?, maxDeletes? }` → key-rule orphans    | `super_user` |
+| `GET /prerender_admin/sweep-orphan-pages`  | this node's page orphan sweep (live or last)     | `super_user` |
+| `POST /prerender_admin/sweep-orphan-pages` | `{ dryRun?, minAgeDays?, maxDeletes?,            | `super_user` |
+|                                            | ratePerSecond? }` → targetless pages, or stop    |              |
+| `POST /prerender_admin/backlog`            | recompute the backlog/histogram snapshot now     | `super_user` |
+| `POST /prerender_admin/sitemap`            | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
+| `POST /prerender_admin/sitemap-refresh`    | `{ url? }` → background walk of one/all roots    | `super_user` |
+| `GET /prerender_admin/change-probe`        | probe rules + last pass records (this node)      | `super_user` |
+| `POST /prerender_admin/change-probe`       | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
 
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the
 same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
@@ -887,6 +890,13 @@ Nothing then renders that URL, and **nothing re-creates the row**:
 - `processJobResult` reschedules, but only after a render, which needs a claim, which needs the
   very row that is missing.
 
+The commonest way in is replication order. `Target` and `RenderSchedule` are separate databases,
+so a newly created target can reach the node that owns its row AFTER the row does, and that node
+renders a URL it has no target for. Result handling used to drop the row there, treating it like a
+render-now one-off, and the target then arrived to nothing. Since v0.84.0 a row that carries a
+cadence is **deferred** instead (`render.targetMissing`): re-filed `deferMs` out without storing a
+page, and dropped with a warning only once its target has been missing for `graceMs`.
+
 The state is therefore terminal _and_ silent: the cached page expires, every later bot request
 falls through to the origin, and there is no error and no metric to notice it by. The only
 symptom is a page whose `lastCached` keeps receding.
@@ -895,12 +905,16 @@ symptom is a page whose `lastCached` keeps receding.
 the keys it owns**, checks node-locally whether the schedule row exists, collecting the gaps and
 restoring them once the scan has finished.
 
-The pass is deliberately cursor-free, so nothing depends on the order rows arrive in. Paging by
-primary key and resuming from the last key seen would make correctness rest on the storage engine
-returning rows in key order — and if that ever stopped holding, the cursor would skip rows
-silently, which is the worst failure mode available to a repair tool. Restoring only after the
-scan closes also makes the transaction rule structural rather than a convention: no write is ever
-issued while the scan's cursor is open. Owner-scoped is a safety requirement, not an optimization: a point read of a
+The pass walks the registry in chunks with the unreadable-row-safe walk (`util/urlWalk.js`). It
+used to stream one unconstrained search, and that was the bug: the projected iterator silently
+ENDS in front of a row whose key does not decode, so on a replica holding such rows the pass
+covered an arbitrary prefix of the registry and reported "no gaps" for the rest. Measured on a
+four-node deployment, the first such row sat about 500k rows into a 1.68M-row registry on three
+nodes, and 734 live targets past it went unscheduled for five weeks. The walk now skips and
+counts unreadable rows (`unreadable` in the pass summary — a non-zero count is a database-layer
+problem to escalate), and a pass it cannot prove covered the range is recorded as a FAILURE, never
+as a clean one. Restoring only after the scan closes keeps the transaction rule structural: no
+write is ever issued while the scan's cursor is open. Owner-scoped is a safety requirement, not an optimization: a point read of a
 residency-pinned row this node does not own takes Harper's untimed replication fetch, so a
 single such read could hang the sweep forever. Every node sweeping its own slice covers the
 whole keyspace with no coordination and no cross-node reads.
@@ -946,10 +960,45 @@ is created by an operator changing a config option, so it should run when someon
 it. Same structure as the repair sweep: node-scoped, cursor-free, deletes only after the scan
 closes, and `maxDeletes` bounds deletion while the scan still reports the true population. It also
 **defers any target with a device key currently leased**, so a delete does not land mid-render —
-though correctness does not rest on that, since a result whose target has gone deletes its own
-schedule row rather than resurrecting it.
+though correctness does not rest on that: a result whose target has gone stores no page, and its
+row is deferred and then dropped once the target has been missing for `render.targetMissing.graceMs`.
 
 The Overview panel shows the last sweep's result on that node and can start one on demand.
+
+### Page orphans
+
+A cached page is only ever removed by `Target.delete`'s cascade, so any target that disappears
+without it strands its pages: nothing re-renders them, nothing reclaims them (`PrerenderedPage` has
+no expiration), and — since `page_cache` is not residency-pinned — every one, blob included, sits
+on every node. Every other sweep walks the Target table, so none of them can see these. Measured on
+a four-node deployment: **394,783 of 2.73M pages (14.4%, ~19 GB per node) owned no target on any
+node**, all cached 4+ weeks earlier — 98% left by a key-rule sweep that deleted targets through the
+raw table before v0.54.0, the rest by render results that landed after their target was retired.
+They cost more than disk: every `page_cache` full copy walks them, and a stale orphan row turns a
+crawler's request into a `stale` serve instead of a `miss`, which keeps the raw-document cache
+from ever answering it.
+
+`POST /prerender_admin/sweep-orphan-pages` is the cleanup (`render.pageOrphanSweep`). A page is
+deleted only when this node owns its URL, it was cached at least `minAge` ago (21 days by default —
+far past any render cadence), it is **no longer servable** (past `expiresAt + page.swrTtl`), no
+Target owns its URL, and no render of it is in flight. So a deletion can change nothing a crawler
+is served beyond `stale → miss`. Each batch is **one transaction** that re-checks every key
+immediately before deleting it — Harper queues a deleted record's blob for unlinking when the
+delete is staged, so deleting a key something is concurrently writing could strand a live
+record's blob — and, with `confirmReplication`, is held until every peer confirms it, which is
+the backpressure: a peer that cannot keep up stalls the sweep rather than letting it run ahead of
+replication.
+
+There is no node-local shortcut: an eviction leaves no tombstone, so the next full copy from any
+peer that still holds the row would restore it. A replicated delete ships a few hundred bytes per
+key per peer and no blob, so what binds is the number of commits on `page_cache` — hence batching.
+Like the other destructive sweeps it is **manual only, dry-run by default, and node-scoped**: run it
+on every node; `GET /prerender_admin/sweep-orphan-pages` reports the live pass, and
+`{ action: "stop" }` ends it at the next row.
+
+Two leaks that fed this population are closed in the same release: `Target.delete` now removes
+pages for every **supported** device (a one-off rendered for a non-default device used to outlive
+its target), and a render result whose URL has no target no longer stores its page.
 
 ### Residency: why the schedule row is fetched from another node
 

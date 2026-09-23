@@ -274,6 +274,7 @@ export const METRICS = Object.freeze({
 					'discarded',
 					'refiled',
 					'no-content',
+					'target-missing',
 					'noindex',
 					'canonical-mismatch',
 					'http-error',
@@ -293,7 +294,9 @@ export const METRICS = Object.freeze({
 					'no isIndexable) | redirect (its own lane, so redirect bails do not read as fast renders). ' +
 					'outcome: per-outcome refinement — rendered: stored / discarded (landed on a class we never ' +
 					'serve) / refiled (client-side redirect onto another prerender key) / no-content (a legacy ' +
-					'worker posted an indexable verdict with nothing to store); suppressed: the browser’s ' +
+					'worker posted an indexable verdict with nothing to store) / target-missing (a recurring row whose ' +
+					'URL has no Target on this node — page not stored, row deferred, see render.targetMissing); ' +
+					'suppressed: the browser’s ' +
 					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
 					'transient: the status code; failed: the error phase (navigation = the document never arrived; ' +
 					'not-attempted = the worker was asked for this device and never started it — its lease ran short ' +

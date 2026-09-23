@@ -296,7 +296,10 @@ const lowerFloorFor = (nextRenderTime) => {
  * in 10.7 ms, mean 0.021 ms, against residency pinned to a node that does not exist). v0.15.0
  * assumed the read/write symmetry and wrapped these in a deadline that could never fire.
  */
-export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, effectiveInterval } = {}) => {
+export const writeSchedule = async (
+	cacheKey,
+	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince } = {}
+) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
 	}
@@ -308,7 +311,14 @@ export const writeSchedule = async (cacheKey, { nextRenderTime, fromSitemap, eff
 	if (effectiveInterval === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit effectiveInterval — put replaces the record`);
 	}
-	await scheduleTable().put(cacheKey, { nextRenderTime, fromSitemap, effectiveInterval });
+	// `targetMissingSince` is written only by the deferral that sets it (see `settleTargetless`);
+	// every other write omits it, and since `put` replaces the record, omitting it CLEARS it.
+	await scheduleTable().put(cacheKey, {
+		nextRenderTime,
+		fromSitemap,
+		effectiveInterval,
+		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
+	});
 	lowerFloorFor(nextRenderTime);
 };
 

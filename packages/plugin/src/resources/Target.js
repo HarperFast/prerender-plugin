@@ -70,6 +70,18 @@ const deviceTypes = () => config.deviceTypes.default;
  */
 export const cacheKeysOf = (url) => deviceTypes().map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
 
+/**
+ * Every page key a URL can have been STORED under — one per SUPPORTED device, not just the default
+ * set. A render-now for a device outside `deviceTypes.default` stores a page beside the rotation
+ * (a one-off), and a device later dropped from the default set leaves its pages behind; deleting
+ * only `cacheKeysOf` left both as pages with no target, which nothing re-renders or reclaims. The
+ * cost is one delete — a tombstone — per key that was never written, on a retirement path that
+ * runs a few hundred times a day. Use this for DELETES; the read-then-patch paths only ever touch
+ * rows that exist, so they stay on `cacheKeysOf`.
+ */
+export const pageKeysOf = (url) =>
+	config.deviceTypes.supported.map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
+
 /** Every SCHEDULE key a URL may have a row under: the URL row, plus any not-yet-converted device row. */
 export const scheduleKeysOf = (url) => [url, ...cacheKeysOf(url)];
 
@@ -148,9 +160,9 @@ export class Target extends TargetTable {
 		// converted — on a path that runs a few hundred times a day, not on the render path.
 		await Promise.all([
 			...scheduleKeysOf(url).map((key) => deleteSchedule(key)),
-			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
+			...pageKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 			databases.probe_state.ProbeState.delete(url),
-			...cacheKeysOf(url).map((cacheKey) => databases.probe_state.RenderExpectation.delete(cacheKey)),
+			...pageKeysOf(url).map((cacheKey) => databases.probe_state.RenderExpectation.delete(cacheKey)),
 		]);
 
 		return super.delete(...arguments);
@@ -245,7 +257,7 @@ export class Target extends TargetTable {
 				// with it and the target resumes at its route/stored cadence.
 				effectiveInterval: resolveRenderInterval(url, existing?.renderInterval ?? null),
 			}),
-			...cacheKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
+			...pageKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 		]);
 		return { deleted: false, strikes };
 	}

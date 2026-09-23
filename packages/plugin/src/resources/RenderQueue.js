@@ -26,6 +26,7 @@ import {
 	sweepReadySet,
 	deleteSchedule,
 	deriveQueueStatus,
+	getScheduleRow,
 	maybeResetFloor,
 	reconcileLeaseGauge,
 	releaseLease,
@@ -186,6 +187,87 @@ const retireRowIfConverted = async (job, held) => {
 const retireSource = async (job) => {
 	await Target.delete(job.url);
 	job.rowGone = job.fold;
+};
+
+/** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
+const hasCadence = (effectiveInterval) => {
+	const ms = Number(effectiveInterval);
+	return Number.isFinite(ms) && ms > 0;
+};
+
+/**
+ * A job whose URL has NO Target on this node. Two very different things look identical here, and
+ * every branch that met them used to treat both as the first:
+ *
+ *   - a ONE-OFF — a render-now for a URL nothing tracks. Its row is targetless by construction: it
+ *     renders once, stores its page (the render-now poller is waiting on it) and the row is dropped.
+ *   - a RECURRING row whose Target has not reached this node. `Target` and `RenderSchedule` are
+ *     separate databases, so a newly created target can arrive after its schedule row, and a replica
+ *     can be missing a target outright. Dropping that row is terminal and silent — nothing re-creates
+ *     a schedule for a target that exists (see util/reconcile.js). Measured on a four-node
+ *     deployment: 734 live, mostly sitemap-declared targets lost their rows exactly this way during
+ *     three days of write overload on `render_service`, and went unrendered for five weeks.
+ *
+ * The row says which it is: every recurring writer files a cadence (`effectiveInterval`) and a
+ * targetless render-now files none. A per-device row for a non-default device is a one-off beside
+ * the rotation whatever it carries. The read is node-local and authoritative: a result is processed
+ * on the node that granted its claim, which is the row's owner.
+ */
+const readTargetlessRow = async (job) => {
+	if (!job.fold) return { kind: 'one-off' };
+	const row = await getScheduleRow(job.rowKey, ['cacheKey', 'fromSitemap', 'effectiveInterval', 'targetMissingSince']);
+	if (!row) return { kind: 'gone' };
+	return hasCadence(row.effectiveInterval) ? { kind: 'recurring', row } : { kind: 'one-off' };
+};
+
+/**
+ * Settle a job whose URL has no Target on this node (see `readTargetlessRow`). A one-off's row is
+ * dropped, as it always was. A recurring row is DEFERRED — re-filed `render.targetMissing.deferMs`
+ * out, stamped with when its target was first found missing — and dropped only once that target has
+ * been missing for `render.targetMissing.graceMs`, when "not replicated yet" has stopped being the
+ * likely story. The drop warns, because it ends a rotation.
+ *
+ * The deferral is written to the URL row, so a pre-0.66.0 device row folds into it here exactly as a
+ * normal result would convert it (`retireRowIfConverted` then drops the device row).
+ *
+ * @returns {Promise<'dropped'|'deferred'>}
+ */
+const settleTargetless = async (job, targetless) => {
+	if (targetless.kind === 'gone') {
+		job.rowGone = true;
+		return 'dropped';
+	}
+	if (targetless.kind === 'one-off') {
+		await deleteSchedule(job.rowKey);
+		job.rowGone = true;
+		return 'dropped';
+	}
+	const { row } = targetless;
+	const now = Date.now();
+	const stamped = Number(row.targetMissingSince);
+	const since = Number.isFinite(stamped) && stamped > 0 ? stamped : now;
+	const { deferMs, graceMs } = config.render.targetMissing;
+	if (now - since >= graceMs) {
+		logger.warn(
+			`[prerender] ${job.url} has had no Target on this node for ${Math.round((now - since) / 60_000)}m — ` +
+				`dropping its schedule row. If the target exists on other nodes, this replica has diverged; ` +
+				`restore it with POST /prerender_admin/revalidate once the target is back.`
+		);
+		await deleteSchedule(job.rowKey);
+		job.rowGone = true;
+		return 'dropped';
+	}
+	logger.info(
+		`[prerender] ${job.url} has no Target on this node (missing since ${new Date(since).toISOString()}) — ` +
+			`deferring its row ${Math.round(deferMs / 60_000)}m instead of dropping it; no page stored`
+	);
+	await writeSchedule(job.url, {
+		nextRenderTime: currentMinuteMs() + deferMs,
+		fromSitemap: !!row.fromSitemap,
+		effectiveInterval: row.effectiveInterval,
+		targetMissingSince: since,
+	});
+	return 'deferred';
 };
 
 /** The variant a device the browser was asked for and never posted back reduces to. */
@@ -672,6 +754,12 @@ export class RenderQueue extends Resource {
 			id: scheduleUrl,
 			select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
 		});
+		// No target here: a one-off, or a recurring row whose target has not reached this node. The
+		// latter must not store its pages — a page with no target is never re-rendered and never
+		// reclaimed — and must not lose its row. A refile already retired the source and schedules the
+		// destination below; its no-destination case keeps the long-standing one-off handling.
+		const targetless = renderTarget || refiledTo ? null : await readTargetlessRow(job);
+		const withheld = targetless?.kind === 'recurring';
 
 		// Schedule the next render relative to when THIS one completed (now), not a fixed wall-clock
 		// time — so renders stay spread across the interval instead of realigning into a daily herd,
@@ -712,7 +800,7 @@ export class RenderQueue extends Resource {
 			);
 		}
 		const stored = rendered.filter(
-			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled)
+			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled) && !withheld
 		);
 		if (stored.length) {
 			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
@@ -849,9 +937,11 @@ export class RenderQueue extends Resource {
 				? stored.some((variant) => variant.refiled)
 					? 'refiled'
 					: 'stored'
-				: rendered.some((variant) => variant.discardContent)
-					? 'discarded'
-					: 'no-content'
+				: withheld
+					? 'target-missing'
+					: rendered.some((variant) => variant.discardContent)
+						? 'discarded'
+						: 'no-content'
 		);
 
 		if (renderTarget) {
@@ -903,16 +993,14 @@ export class RenderQueue extends Resource {
 				await Target.patch(scheduleUrl, { strikes: 0 });
 			}
 		} else if (!job.rowGone) {
-			// No target owns this URL: a one-off (render-now) or an orphaned row. Nothing sets a
-			// recurring cadence, so drop the row this job came from instead of leaving it to be
-			// re-claimed when the lease expires.
+			// No target owns this URL on this node: a one-off's row is dropped, a recurring row is
+			// deferred (see `settleTargetless`).
 			//
-			// The delete does NOT release the key's lease (see util/renderSchedule.js): the slot keeps
+			// A drop does NOT release the key's lease (see util/renderSchedule.js): the slot keeps
 			// holding the claim floor at this row's old due minute until it expires. That is the
 			// conservative direction — releasing here would let the floor advance past a row whose
 			// result may still be arriving from a duplicate renderer.
-			await deleteSchedule(job.rowKey);
-			job.rowGone = true;
+			await settleTargetless(job, targetless ?? { kind: 'one-off' });
 		}
 		await retireRowIfConverted(job, held);
 	}
@@ -1066,8 +1154,7 @@ export class RenderQueue extends Resource {
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
 		});
 		if (!renderTarget) {
-			await deleteSchedule(job.rowKey);
-			job.rowGone = true;
+			await settleTargetless(job, await readTargetlessRow(job));
 			return;
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
@@ -1136,9 +1223,8 @@ export class RenderQueue extends Resource {
 			select: ['strikes', 'renderInterval', 'sitemapUrl', 'demandInterval'],
 		});
 		if (!renderTarget) {
-			await deleteSchedule(job.rowKey);
-			job.rowGone = true;
-			return 'dropped';
+			// A deferred row is in the future, like a slow-lane backoff: the caller releases the lease.
+			return (await settleTargetless(job, await readTargetlessRow(job))) === 'deferred' ? 'slow' : 'dropped';
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
 		await Target.patch(sourceUrl, { strikes });
@@ -1193,9 +1279,13 @@ export class RenderQueue extends Resource {
 				id: sourceUrl,
 				select: ['renderInterval', 'sitemapUrl', 'demandInterval'],
 			}));
-		if (!renderTarget || !job.fold) {
+		if (!job.fold) {
 			await deleteSchedule(job.rowKey);
 			job.rowGone = true;
+			return;
+		}
+		if (!renderTarget) {
+			await settleTargetless(job, await readTargetlessRow(job));
 			return;
 		}
 		// Same cadence resolution as the post-render path above (route > stored > default).

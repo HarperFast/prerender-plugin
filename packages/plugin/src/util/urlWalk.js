@@ -23,6 +23,9 @@
  *      outside the range), the walk also throws: a false alarm is recoverable, a silent lie is
  *      not.
  *
+ * `key` names the primary-key attribute the walk is ordered and cursored on: `url` for the URL-keyed
+ * tables (the default), `cacheKey` for `PrerenderedPage`. The unreadable-row rules are the same for
+ * any string key — a row whose key attribute did not decode is skipped and counted, never a cursor.
  * `endBound` (exclusive) keeps the verification probes inside the caller's range so a row from
  * the next keyspace region can neither resume nor fail a prefix-scoped walk. The bounded probe
  * shape (two conditions on the key) falls back to an unbounded probe filtered in code when the
@@ -30,7 +33,7 @@
  * itself unreadable can still end a walk early when every probe path aborts on it; escalate such
  * rows to the database layer.
  */
-export async function* walkUrlRange(table, { startAt = '', select, chunkSize, onUnreadable, endBound }) {
+export async function* walkUrlRange(table, { key = 'url', startAt = '', select, chunkSize, onUnreadable, endBound }) {
 	let cursor = null;
 	let inclusiveStart = startAt;
 	let lastResume = null;
@@ -45,7 +48,7 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 		const out = [];
 		for await (const row of table.search({
 			conditions,
-			sort: descending ? { attribute: 'url', descending: true } : { attribute: 'url' },
+			sort: descending ? { attribute: key, descending: true } : { attribute: key },
 			limit,
 		})) {
 			out.push(row);
@@ -60,8 +63,8 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 	 * treat that as unknown, never as empty.
 	 */
 	const probeSearch = async (descending) => {
-		const range = [{ attribute: 'url', comparator: 'greater_than', value: cursor ?? '' }];
-		const bounded = endBound ? [...range, { attribute: 'url', comparator: 'less_than', value: endBound }] : range;
+		const range = [{ attribute: key, comparator: 'greater_than', value: cursor ?? '' }];
+		const bounded = endBound ? [...range, { attribute: key, comparator: 'less_than', value: endBound }] : range;
 		try {
 			return await search(bounded, descending, 1);
 		} catch {
@@ -72,7 +75,7 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 			if (descending) return null;
 			try {
 				const rows = await search(range, false, 1);
-				if (rows.length && typeof rows[0]?.url === 'string' && endBound && rows[0].url >= endBound) return [];
+				if (rows.length && typeof rows[0]?.[key] === 'string' && endBound && rows[0][key] >= endBound) return [];
 				return rows;
 			} catch {
 				return null;
@@ -85,12 +88,12 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 		for await (const row of table.search({
 			conditions: [
 				{
-					attribute: 'url',
+					attribute: key,
 					comparator: inclusiveStart !== null ? 'greater_than_equal' : 'greater_than',
 					value: inclusiveStart !== null ? inclusiveStart : cursor,
 				},
 			],
-			sort: { attribute: 'url' },
+			sort: { attribute: key },
 			...(select ? { select } : {}),
 			limit: chunkSize,
 		})) {
@@ -100,7 +103,7 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 
 		let lastReadableIndex = -1;
 		for (let i = 0; i < chunk.length; i++) {
-			if (typeof chunk[i]?.url === 'string') lastReadableIndex = i;
+			if (typeof chunk[i]?.[key] === 'string') lastReadableIndex = i;
 		}
 		const full = chunk.length >= chunkSize;
 		// A full chunk with no readable row can never advance the cursor: re-querying returns the
@@ -108,14 +111,14 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 		if (full && lastReadableIndex === -1) throw cannotAdvance();
 		for (let i = 0; i < chunk.length; i++) {
 			const row = chunk[i];
-			if (typeof row?.url !== 'string') {
+			if (typeof row?.[key] !== 'string') {
 				// Unreadable rows AFTER the last readable key of a full chunk are re-read by the
 				// next query (the cursor sits before them) — counting them now would double-count.
 				if (!full || i < lastReadableIndex) onUnreadable?.();
 				continue;
 			}
 			lastResume = null;
-			cursor = row.url;
+			cursor = row[key];
 			yield row;
 		}
 
@@ -124,19 +127,19 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 		// Short chunk: either the range is exhausted, or the projected iterator gave up at a row
 		// it could not read. Ask once, projection-free, from the last key we can address.
 		const probe = await probeSearch(false);
-		if (probe && probe.length && typeof probe[0]?.url === 'string') {
+		if (probe && probe.length && typeof probe[0]?.[key] === 'string') {
 			// The projected walk stopped early but the range continues at a readable key — resume
 			// from it inclusively (if only the row's PROJECTED read breaks, resuming at it yields
 			// it and nothing is lost). A repeat of the same resume key means the projected read
 			// can never hand the row over: skip it exclusively, counting it, and keep walking.
-			if (probe[0].url === lastResume) {
-				cursor = probe[0].url;
+			if (probe[0][key] === lastResume) {
+				cursor = probe[0][key];
 				lastResume = null;
 				onUnreadable?.();
 				continue;
 			}
-			lastResume = probe[0].url;
-			inclusiveStart = probe[0].url;
+			lastResume = probe[0][key];
+			inclusiveStart = probe[0][key];
 			continue;
 		}
 		if (probe && probe.length) {
@@ -148,14 +151,14 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 			if (!endBound) throw cannotAdvance();
 			const top = await probeSearch(true);
 			if (top === null) throw cannotAdvance();
-			if (top.length && typeof top[0]?.url === 'string') throw cannotAdvance();
+			if (top.length && typeof top[0]?.[key] === 'string') throw cannotAdvance();
 			return;
 		}
 		if (probe === null) {
 			// The forward probe could not run at all — verify via the top of the range before
 			// trusting the short chunk.
 			const top = await probeSearch(true);
-			if (top && top.length && typeof top[0]?.url === 'string') throw cannotAdvance();
+			if (top && top.length && typeof top[0]?.[key] === 'string') throw cannotAdvance();
 			if (top === null) return; // no probe shape works here — the chunk walk's answer stands
 			return;
 		}
@@ -163,7 +166,7 @@ export async function* walkUrlRange(table, { startAt = '', select, chunkSize, on
 		// Forward probe ran and the range past the cursor is empty. One descending look catches
 		// the store that aborts ascending reads at the poison row but can still read from the top.
 		const top = await probeSearch(true);
-		if (top && top.length && typeof top[0]?.url === 'string' && top[0].url !== cursor) throw cannotAdvance();
+		if (top && top.length && typeof top[0]?.[key] === 'string' && top[0][key] !== cursor) throw cannotAdvance();
 		return;
 	}
 }

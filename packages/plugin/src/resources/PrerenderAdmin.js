@@ -40,6 +40,9 @@
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
+ *   GET  /prerender_admin/sweep-orphan-pages  this node's pass     super_user
+ *   POST /prerender_admin/sweep-orphan-pages { dryRun?, minAgeDays?, super_user
+ *                                    maxDeletes?, ratePerSecond? } | { action: 'stop' }
  *   GET  /prerender_admin/discovery-purge  this node's purge state super_user
  *   POST /prerender_admin/discovery-purge { urlPrefix, dryRun?,    super_user
  *                                    ratePerSecond?, force?, skipVisited? } |
@@ -111,6 +114,7 @@ import { getResidencyByUrl } from '../util/residency.js';
 import { fetchScheduleFromPeer } from '../util/peer.js';
 import { getLastReconcile, isReconcileRunning, runReconcileOnce } from '../util/reconcile.js';
 import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '../util/orphanSweep.js';
+import { getPageOrphanSweepState, startPageOrphanSweep, stopPageOrphanSweep } from '../util/pageOrphanSweep.js';
 import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
 import { changeProbeStatus, isPassRunningOnNode, runProbeCanaryOnce, runProbeSweepOnce } from '../util/changeProbe.js';
 import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
@@ -504,6 +508,9 @@ export class PrerenderAdmin extends Resource {
 				// Live progress of THIS node's purge pass (it mutates its stats in place), or the
 				// last finished pass. Owner-scoped like sweep-orphans: query every node.
 				return json({ node: server.hostname, ...(await getDiscoveredPurgeState()) });
+			case 'sweep-orphan-pages':
+				// Same shape as discovery-purge: this node's live pass, or its last finished one.
+				return json({ node: server.hostname, ...(await getPageOrphanSweepState()) });
 			default:
 				return json({ error: `Unknown route: ${route}` }, 404);
 		}
@@ -539,6 +546,8 @@ export class PrerenderAdmin extends Resource {
 				return PrerenderAdmin.sweepOrphans(data);
 			case 'discovery-purge':
 				return PrerenderAdmin.discoveryPurge(data);
+			case 'sweep-orphan-pages':
+				return PrerenderAdmin.sweepOrphanPages(data);
 			case 'change-probe':
 				return PrerenderAdmin.changeProbe(data);
 			case 'backlog':
@@ -1209,6 +1218,30 @@ export class PrerenderAdmin extends Resource {
 		runOrphanSweepOnce({ dryRun, maxDeletes }).catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
+	}
+
+	/**
+	 * Start (or stop) a page orphan sweep on THIS node — deletion of cached pages no Target owns; see
+	 * util/pageOrphanSweep.js for the predicate and why it is safe. `dryRun` defaults to the configured
+	 * value (itself true), so a bare start is a census whose `deleted` counts what a real run would
+	 * remove. Detached and node-scoped: progress is on GET /prerender_admin/sweep-orphan-pages, and
+	 * `{ action: 'stop' }` ends it at the next row.
+	 */
+	static async sweepOrphanPages(data) {
+		if (data?.action === 'stop') {
+			return json({ node: server.hostname, ...(await stopPageOrphanSweep()) });
+		}
+		const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : undefined);
+		const days = positive(data?.minAgeDays);
+		const minAgeMs = days === undefined ? undefined : Math.max(1, days) * 86_400_000;
+		const result = await startPageOrphanSweep({
+			dryRun: typeof data?.dryRun === 'boolean' ? data.dryRun : undefined,
+			// The schema floor is one day; a request cannot go under it either.
+			minAgeMs,
+			maxDeletes: positive(data?.maxDeletes) === undefined ? undefined : Math.floor(positive(data.maxDeletes)),
+			ratePerSecond: positive(data?.ratePerSecond) === undefined ? undefined : Math.floor(positive(data.ratePerSecond)),
+		});
+		return json({ node: server.hostname, ...result });
 	}
 
 	/**

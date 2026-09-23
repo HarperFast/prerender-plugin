@@ -161,6 +161,15 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# which is what it did before this field existed. Every row re-renders on its own cadence, so
 	# the active corpus fills in within one cycle.
 	effectiveInterval: Long
+	# When a result for this row first found NO Target on the owning node (ms), set only while the
+	# row is deferred for it — see `settleTargetless` in resources/RenderQueue.js. A recurring row's
+	# target can be missing locally because it has not replicated yet (`Target` and this table are
+	# separate databases, and the row can arrive first); dropping the row then is terminal. The
+	# stamp is what bounds the wait: past `render.targetMissing.graceMs` the row is dropped. Every
+	# other writer `put`s the row whole and so clears it, which is the reset: a target that arrived
+	# re-files the row normally on its next render. NOT @indexed — read only by a point read of a
+	# row already in hand.
+	targetMissingSince: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
