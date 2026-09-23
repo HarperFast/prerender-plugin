@@ -402,16 +402,17 @@ widget, or that serialized pre-hydration markup, reports 200, non-empty and inde
 downstream can tell. A contract states per page type what a complete render CONTAINS; the renderer
 holds until that is true **and** the DOM has gone quiet, and posts the per-clause result back.
 
-Six assertion forms, each of which exists because something else could not express it:
+Seven assertion forms, each of which exists because something else could not express it:
 
-| form                                          | satisfied when                                                        | exists because                                                                                                |
-| --------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `selector` + `minCount`                       | at least N match (shadow-piercing)                                    | the base case                                                                                                 |
-| `anyOf` (branch `textMatches` optional)       | any branch matches (a `textMatches` branch counts only matching text) | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived              |
-| `absent`                                      | nothing matches                                                       | skeletons and spinners that a real render replaces                                                            |
-| `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`)  | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup        |
-| `every` + `contains`                          | every container has content, and at least one exists                  | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing |
-| `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                   | presence is not the same as populated                                                                         |
+| form                                          | satisfied when                                                        | exists because                                                                                                              |
+| --------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `selector` + `minCount`                       | at least N match (shadow-piercing)                                    | the base case                                                                                                               |
+| `anyOf` (branch `textMatches` optional)       | any branch matches (a `textMatches` branch counts only matching text) | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived                            |
+| `absent`                                      | nothing matches                                                       | skeletons and spinners that a real render replaces                                                                          |
+| `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`)  | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup                      |
+| `every` + `contains`                          | every container has content, and at least one exists                  | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing               |
+| `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                   | presence is not the same as populated                                                                                       |
+| `responded` (+ `minCount`)                    | a named call (URL RegExp) has finished loading                        | content filled into a server-rendered slot by one API call — the call decides, and timers guessing at it clip the slow tail |
 
 Any clause can carry `onlyIf` — a guard making it conditional on what the page's **own** data says
 (`jsonLdNumber`) or on what the DOM holds (`present`). This is the difference between a guess and a
@@ -427,6 +428,15 @@ no review text, so there is nothing to list — give the `anyOf` branch for that
 widget renders on every page do not. Pick text the widget only shows in its final state: measured,
 a review list's status line reads "1 to 0 of N" for 116–232 ms on pages that DO have reviews, before
 the list fills.
+
+A `responded` clause names the call a page's late content comes from. Measured on a commerce
+template: recommendation rails are empty server-rendered slots filled by one first-party call, and a
+render whose call took longer than the renderer's 5 s in-flight bound was treated as hung, released
+by the rot valve and stored with the slot empty. A request matching a `responded` clause never ages
+out, so the render holds while it is open (bounded by `timeoutMs`) and stops once it has answered
+and the page is quiet. Guard it with `onlyIf: { present: <the slot> }` so a page without the slot
+does not wait for a call it will not make. It is read from a document-start `PerformanceObserver`,
+not the resource-timing buffer, which such a page overflows.
 
 **Three properties worth knowing before writing one:**
 

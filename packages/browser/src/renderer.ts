@@ -12,9 +12,11 @@ import {
 	assessExpectations,
 	contractFor,
 	evaluateContract,
+	respondedPatterns,
 	DEFAULT_EXPECTATION_POLICY,
 	type ReadinessResult,
 } from './readiness.js';
+import { responseLogSource } from './responseLog.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -138,6 +140,13 @@ const renderer: Renderer = async (page, job) => {
 	if (contract && config.readiness?.onSatisfied !== 'report') {
 		setupPromises.push(page.evaluateOnNewDocument(monitorSource()));
 	}
+	// The calls a `responded` clause names — counted by a document-start observer, in report mode too
+	// (it patches nothing page-visible, and a clause must read the same whether or not it gates).
+	const awaitedCalls = contract ? respondedPatterns(contract) : [];
+	if (awaitedCalls.length > 0) {
+		setupPromises.push(page.evaluateOnNewDocument(responseLogSource(awaitedCalls)));
+	}
+	const awaitedCallRes = awaitedCalls.map((source) => new RegExp(source));
 
 	// Deferred hydration waits for an idle period, and a saturated render pod may never offer one —
 	// see idleCallbackCap.ts. Installed whenever configured, contract or not: a plain timer settle
@@ -167,15 +176,24 @@ const renderer: Renderer = async (page, job) => {
 	 * wait out every timeout. `IN_FLIGHT_MAX_AGE_MS` is sized well above the ~0.2-2 s a content API
 	 * takes to answer on a busy origin.
 	 */
-	const inFlightSameOrigin = new Map<unknown, number>();
+	//
+	// EXCEPT a call the governing contract names in a `responded` clause. That one is content the
+	// contract has said it is waiting for, so it never ages out: measured with a recommendation-rail
+	// call answering 6-14 s after it went out, the age bound read it as hung at 5 s, the rot valve
+	// stood the rail clause aside, and the fallback settle serialized the page before the answer
+	// landed — 26 of 35 renders stored with the slot empty. The contract `timeoutMs` bounds it instead.
+	const inFlightSameOrigin = new Map<unknown, { startedAt: number; awaited: boolean }>();
 	page.on('request', (req) => {
-		if (isSameOrigin(req.url())) inFlightSameOrigin.set(req, Date.now());
+		const reqUrl = req.url();
+		if (isSameOrigin(reqUrl)) {
+			inFlightSameOrigin.set(req, { startedAt: Date.now(), awaited: awaitedCallRes.some((re) => re.test(reqUrl)) });
+		}
 	});
 	page.on('requestfinished', (req) => inFlightSameOrigin.delete(req));
 	page.on('requestfailed', (req) => inFlightSameOrigin.delete(req));
 	const fetchingOwnOrigin = (): boolean => {
 		const cutoff = Date.now() - IN_FLIGHT_MAX_AGE_MS;
-		for (const startedAt of inFlightSameOrigin.values()) if (startedAt > cutoff) return true;
+		for (const { startedAt, awaited } of inFlightSameOrigin.values()) if (awaited || startedAt > cutoff) return true;
 		return false;
 	};
 
