@@ -404,14 +404,14 @@ holds until that is true **and** the DOM has gone quiet, and posts the per-claus
 
 Six assertion forms, each of which exists because something else could not express it:
 
-| form                                          | satisfied when                                                       | exists because                                                                                                |
-| --------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `selector` + `minCount`                       | at least N match (shadow-piercing)                                   | the base case                                                                                                 |
-| `anyOf`                                       | any branch matches                                                   | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived              |
-| `absent`                                      | nothing matches                                                      | skeletons and spinners that a real render replaces                                                            |
-| `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`) | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup        |
-| `every` + `contains`                          | every container has content, and at least one exists                 | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing |
-| `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                  | presence is not the same as populated                                                                         |
+| form                                          | satisfied when                                                        | exists because                                                                                                |
+| --------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `selector` + `minCount`                       | at least N match (shadow-piercing)                                    | the base case                                                                                                 |
+| `anyOf` (branch `textMatches` optional)       | any branch matches (a `textMatches` branch counts only matching text) | an empty-but-legitimate listing page is structurally identical to one whose grid has not arrived              |
+| `absent`                                      | nothing matches                                                       | skeletons and spinners that a real render replaces                                                            |
+| `selector` + `shed`                           | no element still carries the attribute (`maxRemaining`, `allowNone`)  | frameworks drop a marker on hydrate; this is the check that catches a snapshot of pre-hydration markup        |
+| `every` + `contains`                          | every container has content, and at least one exists                  | "at least 3 rails" is a constant someone measured once; "every rail is filled" survives the template changing |
+| `selector` + `nonEmptyText` (+ `textMatches`) | some match has text / matching text                                   | presence is not the same as populated                                                                         |
 
 Any clause can carry `onlyIf` — a guard making it conditional on what the page's **own** data says
 (`jsonLdNumber`) or on what the DOM holds (`present`). This is the difference between a guess and a
@@ -420,6 +420,13 @@ a presence gate cannot tell "none" from "not yet", and accepting _either_ review
 summary fires early on pages that do have reviews (measured: the summary lands 236–263 ms before the
 first review). Keyed on the page's declared `aggregateRating.ratingCount`, the document says what
 should exist and the rendered DOM is held to it.
+
+When the page's data cannot say it but the widget does — a rating count that includes ratings with
+no review text, so there is nothing to list — give the `anyOf` branch for that state a
+`textMatches`. The explicit statement ("N ratings without review text") satisfies; the headings the
+widget renders on every page do not. Pick text the widget only shows in its final state: measured,
+a review list's status line reads "1 to 0 of N" for 116–232 ms on pages that DO have reviews, before
+the list fills.
 
 **Three properties worth knowing before writing one:**
 

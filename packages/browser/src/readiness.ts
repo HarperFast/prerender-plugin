@@ -70,8 +70,20 @@ export type ReadinessAssertion = { onlyIf?: ReadinessGuard } & (
 			 * tell an empty facet from a grid that has not arrived, and every empty facet pays the full
 			 * timeout. Written as `anyOf: [grid-has-tiles, explicit-empty-state]`, both pages satisfy the
 			 * contract immediately and neither waits.
+			 *
+			 * A branch may carry `textMatches`, and then counts only the matches whose text satisfies the
+			 * pattern. That is for an empty state the page states only in WORDS. Measured on a live review
+			 * widget: a product whose ratings all lack review text renders the same headings as one with
+			 * reviews, plus one more heading saying so — the element exists in both shapes and only its
+			 * text tells them apart. Asked as a selector, that branch is either vacuous (it matches the
+			 * headings every page has) or impossible to write, and the page pays the whole timeout; asked
+			 * as text, the explicit statement satisfies and nothing else does.
+			 *
+			 * Choose the text with care: it must be something the widget says only in its final state.
+			 * The same widget's list status line reads "1 to 0 of N" for 116-232ms on pages that DO have
+			 * reviews, before the list fills — a branch matching that would release them early.
 			 */
-			anyOf: Array<{ selector: string; minCount?: number }>;
+			anyOf: Array<{ selector: string; minCount?: number; textMatches?: string }>;
 	  }
 	| {
 			name: string;
@@ -379,6 +391,29 @@ export function evaluateContract(payload: {
 		return n;
 	};
 
+	// Matches whose text satisfies `pattern` — an `anyOf` branch's reading of `textMatches`, with the
+	// same text rule as the `nonEmptyText` form (trimmed, and empty never matches).
+	const countText = (selector: string, pattern: string): number => {
+		let re: RegExp;
+		try {
+			re = new RegExp(pattern);
+		} catch {
+			return -1; // unreachable through the public API: `validateReadiness` compiles it at load
+		}
+		let n = 0;
+		for (const root of roots) {
+			try {
+				for (const el of root.querySelectorAll(selector)) {
+					const text = (el.textContent ?? '').trim();
+					if (text.length > 0 && re.test(text)) n++;
+				}
+			} catch {
+				return -1;
+			}
+		}
+		return n;
+	};
+
 	// Numbers the page itself declares, read from its JSON-LD (including @graph and array entries).
 	// This is what lets a clause ask "does this page claim to have reviews?" instead of guessing.
 	// How many JSON-LD blocks have parsed at all. The guard needs this to tell "the page declares
@@ -465,8 +500,11 @@ export function evaluateContract(payload: {
 		}
 		if (Array.isArray(a.anyOf)) {
 			let best = 0;
-			for (const branch of a.anyOf as Array<{ selector: string; minCount?: number }>) {
-				const n = countAll(branch.selector);
+			for (const branch of a.anyOf as Array<{ selector: string; minCount?: number; textMatches?: string }>) {
+				const n =
+					typeof branch.textMatches === 'string'
+						? countText(branch.selector, branch.textMatches)
+						: countAll(branch.selector);
 				if (n >= (branch.minCount ?? 1)) return { name: assertion.name, ok: true, count: n };
 				best = Math.max(best, n);
 			}
@@ -625,6 +663,41 @@ export function validateReadiness(readiness: unknown): void {
 					new RegExp(a.textMatches);
 				} catch {
 					throw new Error(`prerender config: readiness assertion "${assertion.name}" has an invalid textMatches`);
+				}
+			}
+			// Branches get the same checks as a clause's own fields: a branch with no selector matches
+			// nothing forever, and a malformed pattern would read as "never true" instead of as a mistake.
+			if (Array.isArray(a.anyOf)) {
+				if (a.anyOf.length === 0) {
+					throw new Error(`prerender config: readiness assertion "${assertion.name}" has an empty anyOf`);
+				}
+				for (const branch of a.anyOf as Array<Record<string, unknown>>) {
+					if (typeof branch?.selector !== 'string' || branch.selector === '') {
+						throw new Error(
+							`prerender config: readiness assertion "${assertion.name}" has an anyOf branch without a selector`
+						);
+					}
+					const min = branch.minCount;
+					if (min !== undefined && (typeof min !== 'number' || !Number.isFinite(min) || min < 0)) {
+						throw new Error(
+							`prerender config: readiness assertion "${assertion.name}" anyOf minCount must be a non-negative number`
+						);
+					}
+					if (branch.textMatches !== undefined) {
+						let valid = typeof branch.textMatches === 'string';
+						if (valid) {
+							try {
+								new RegExp(branch.textMatches as string);
+							} catch {
+								valid = false;
+							}
+						}
+						if (!valid) {
+							throw new Error(
+								`prerender config: readiness assertion "${assertion.name}" has an invalid anyOf textMatches`
+							);
+						}
+					}
 				}
 			}
 			const forms = [
