@@ -500,7 +500,11 @@ export function evaluateContract(payload: {
 		}
 		if (Array.isArray(a.anyOf)) {
 			let best = 0;
-			for (const branch of a.anyOf as Array<{ selector: string; minCount?: number; textMatches?: string }>) {
+			for (const branch of a.anyOf as Array<{ selector: string; minCount?: number; textMatches?: string } | null>) {
+				// `validateReadiness` rejects a malformed branch at load, but this runs inside page.evaluate:
+				// a TypeError here would throw out of the whole evaluator and abandon the contract for the
+				// render. A branch that cannot be read matches nothing.
+				if (!branch || typeof branch.selector !== 'string') continue;
 				const n =
 					typeof branch.textMatches === 'string'
 						? countText(branch.selector, branch.textMatches)
