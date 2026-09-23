@@ -1429,17 +1429,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'device, because a catalog that re-ranks per response differs from itself.\n\n' +
 						'THE CACHE-BUSTER IS NOT OPTIONAL. A CDN whose document cache key has no device in it hands ' +
 						'every UA whichever copy was filled first, so an un-busted comparison can read an adaptive ' +
-						'origin as byte-identical — measured on one deployment, back-to-back un-busted fetches ' +
-						'returned the other device’s document 5 times in 6.\n\n' +
+						'origin as byte-identical — measured on one deployment, un-busted fetches with the mobile UA ' +
+						'returned the desktop document 5 times in 6.\n\n' +
 						'THEN CHECK WHAT THE BOT PATH ACTUALLY SERVES, because that — not a laptop fetch — is what ' +
 						'this option changes. Request a few raw-cached URLs as each device through the CDN (with a ' +
 						'non-authorizing debug header value, so `x-harper-cache: raw` shows) and see whose markup ' +
-						'each device’s row holds. On the deployment above, rows written by real crawler traffic ' +
-						'held the MATCHING device’s markup 7 times in 8: the cross-device leak needs both devices ' +
-						'to fetch within the edge’s window, which crawlers rarely do. There this option would have ' +
-						'handed about half of raw serves the other device’s presentation, so it was left off — ' +
-						'presentation-only differences are a product tradeoff against the hit rate, not a safety ' +
-						'question.\n\n' +
+						'each device’s row holds. On the deployment above, rows written by real crawler traffic held ' +
+						'the MATCHING device’s markup 8 times in 9. The proxy’s own origin fetch goes through that ' +
+						'same device-blind document cache, so a row takes the other device’s markup only when the ' +
+						'other device filled the edge object within its TTL. There this option would have handed the ' +
+						'other device’s presentation to every serve whose device differs from the one that stored the ' +
+						'row, so it was left off — presentation-only differences are a product tradeoff against the ' +
+						'hit rate, not a safety question.\n\n' +
+						'SIZE THE GAIN BEFORE PAYING FOR IT. The extra hits are exactly the first request of the ' +
+						'second device for a URL both devices ask for while the row lives, so the gain is bounded by ' +
+						'the smaller device’s share of distinct URLs. And where the CDN caches the bot-path response ' +
+						'itself, most repeats never reach this cache at all.\n\n' +
 						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-*` ' +
 						'client hint, `DPR`/`Viewport-Width`/`Width`/`Device-Memory`, `ingress.deviceTypeHeader`, or ' +
 						'`*` is the origin declaring the body depends on the device, and it is refused ' +

@@ -64,7 +64,7 @@ export const rawCachePolicy = (entry) => {
  * (`origin.userAgents`), and an ADAPTIVE origin answers those differently. Replaying its desktop
  * document to a smartphone crawler would be serving the wrong page, silently, under a 200. But an
  * origin whose documents carry the same CONTENT for every device — responsive, or adaptive only in
- * presentation — gains nothing from it, and there the per-device key stores every document twice
+ * presentation — gains little from it, and there the per-device key stores every document twice
  * and makes each device miss on its own: a desktop crawler's fetch never fills the cache for the
  * smartphone crawler asking for the same URL minutes later.
  *
