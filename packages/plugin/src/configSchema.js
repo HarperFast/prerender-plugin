@@ -1427,12 +1427,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'(lazy-loading attributes, a UI component’s channel flag, facet-panel extras) do not ' +
 						'disqualify it; any difference in CONTENT does. Compare against two fetches from the SAME ' +
 						'device, because a catalog that re-ranks per response differs from itself.\n\n' +
-						'THE CACHE-BUSTER IS NOT OPTIONAL. A CDN whose cache key has no device in it hands every UA ' +
-						'whichever copy was filled first, so an un-busted comparison reads an adaptive origin as ' +
-						'byte-identical. Measured on one deployment: 5 of 6 un-busted mobile fetches returned the ' +
-						'desktop document. That same fact is the strongest argument FOR this option there: the edge ' +
-						'already serves one copy per URL to every device, so per-device raw rows were mostly the ' +
-						'other device’s document anyway.\n\n' +
+						'THE CACHE-BUSTER IS NOT OPTIONAL. A CDN whose document cache key has no device in it hands ' +
+						'every UA whichever copy was filled first, so an un-busted comparison can read an adaptive ' +
+						'origin as byte-identical — measured on one deployment, back-to-back un-busted fetches ' +
+						'returned the other device’s document 5 times in 6.\n\n' +
+						'THEN CHECK WHAT THE BOT PATH ACTUALLY SERVES, because that — not a laptop fetch — is what ' +
+						'this option changes. Request a few raw-cached URLs as each device through the CDN (with a ' +
+						'non-authorizing debug header value, so `x-harper-cache: raw` shows) and see whose markup ' +
+						'each device’s row holds. On the deployment above, rows written by real crawler traffic ' +
+						'held the MATCHING device’s markup 7 times in 8: the cross-device leak needs both devices ' +
+						'to fetch within the edge’s window, which crawlers rarely do. There this option would have ' +
+						'handed about half of raw serves the other device’s presentation, so it was left off — ' +
+						'presentation-only differences are a product tradeoff against the hit rate, not a safety ' +
+						'question.\n\n' +
 						'THE ORIGIN CAN STILL VETO IT. A response whose `Vary` names `User-Agent`, any `Sec-CH-*` ' +
 						'client hint, `DPR`/`Viewport-Width`/`Width`/`Device-Memory`, `ingress.deviceTypeHeader`, or ' +
 						'`*` is the origin declaring the body depends on the device, and it is refused ' +
