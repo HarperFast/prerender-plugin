@@ -140,7 +140,13 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 	// REACHABLE, not "has a button" — `schedule` is a leaf for peer `explain` calls that the UI
 	// never invokes, but it is proxied, so a deliberate node-named call works and it belongs in
 	// the allowlist rather than here.
-	const DELIBERATELY_NOT_EXPOSED = new Set([]);
+	const DELIBERATELY_NOT_EXPOSED = new Set([
+		// Plugin v0.84.0's page orphan sweep ships API-first: its first runs are a deliberate,
+		// per-node, dry-run-then-delete operation driven against each node directly. The console
+		// panel (proxy + an Overview control beside discovery-purge) is a follow-up console release;
+		// remove this entry when it lands.
+		'sweep-orphan-pages',
+	]);
 	for (const route of pluginServes) {
 		if (DELIBERATELY_NOT_EXPOSED.has(route)) continue;
 		assert.ok(

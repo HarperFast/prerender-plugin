@@ -1737,6 +1737,34 @@ export const configSchema = group('Prerender plugin configuration.', {
 				}),
 			}
 		),
+		targetMissing: group(
+			'What a render result does when its URL has NO Target on the node processing it, for a row that ' +
+				'is part of a recurring rotation (it carries a cadence). A render-now one-off is targetless by ' +
+				'construction and is unaffected: it stores its page and its row is dropped.\n\n' +
+				'A recurring row can meet a missing target because the target has not replicated to this node yet: ' +
+				'`Target` and `RenderSchedule` are separate databases, so a newly created target can arrive after ' +
+				'its schedule row, and a replica can lose a target outright. Dropping the row then is TERMINAL and ' +
+				'silent — nothing re-creates a schedule for a target that exists. Measured on a four-node ' +
+				'deployment: 734 live targets, most of them sitemap-declared, lost their rows this way during ' +
+				'three days of write overload and went unrendered for five weeks.\n\n' +
+				'So the row is DEFERRED instead: re-filed `deferMs` out without storing the page, and dropped only ' +
+				'once its target has been missing for `graceMs`. A target that arrives in the meantime is rendered ' +
+				'and rescheduled normally on the next pass. A truly orphaned row costs at most graceMs / deferMs ' +
+				'extra renders before it is dropped, with a warning.',
+			{
+				deferMs: option(6 * HOUR, 'How far out a deferred row is re-filed while its target is missing.', {
+					unit: 'ms',
+					min: MINUTE,
+				}),
+				graceMs: option(
+					24 * HOUR,
+					'How long a recurring row may find its target missing before it is dropped. Size it above the ' +
+						'longest replication lag you expect `render_service` to recover from.',
+					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
+
 		reconcile: group(
 			'Periodic repair of targets whose RenderSchedule row is missing. A target and its schedule are ' +
 				'two commits in two databases (the schedule routed to the node owning the URL), so the pair can ' +
@@ -1772,6 +1800,48 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'rows in one pass would be its own outage.',
 					{ min: 1 }
 				),
+			}
+		),
+
+		pageOrphanSweep: group(
+			'Deletion of cached PAGES that no Target owns (POST /prerender_admin/sweep-orphan-pages) — the ' +
+				'population every other sweep is blind to, since they all walk the Target table. A page is only ' +
+				'ever removed by the target delete cascade, so a target that disappears without it (a raw-table ' +
+				'delete, a render result that lands after its target was retired) strands its pages: never ' +
+				're-rendered, never reclaimed, and replicated in full to every node. Measured on one deployment: ' +
+				'14% of all pages, ~19 GB per node.\n\n' +
+				'A page is deleted only when this node owns its URL, it was cached at least `minAge` ago, it is no ' +
+				'longer servable (past expiresAt + page.swrTtl), no Target owns its URL and no render of it is in ' +
+				'flight — re-checked inside the delete transaction. So a deletion never changes what a crawler is ' +
+				'served beyond `stale` -> `miss`.\n\n' +
+				'MANUAL ONLY and dry-run by default, like the other destructive sweeps. Node-scoped: each node ' +
+				'sweeps the pages whose URL it owns, so run it on every node. Deletes replicate.',
+			{
+				minAge: option(
+					21 * DAY,
+					'How long ago a page must have been cached to be a candidate. Keep it well above the longest ' +
+						'render cadence plus swrTtl, so a page a live rotation maintains can never qualify.',
+					{ unit: 'ms', min: DAY }
+				),
+				maxDeletes: option(
+					100000,
+					'Ceiling on pages DELETED per pass. The walk still runs to the end, so `orphaned` is the true ' +
+						'population; re-run until `truncated` is false.',
+					{ min: 1 }
+				),
+				batchSize: option(
+					100,
+					'Pages deleted per transaction. The binding cost of a bulk delete is the number of commits on ' +
+						'page_cache, so a batch is one commit — and, with confirmReplication, one confirmation round.',
+					{ min: 1, max: 1000 }
+				),
+				ratePerSecond: option(100, 'Ceiling on pages deleted per second.', { min: 1 }),
+				confirmReplication: option(
+					true,
+					'Hold each batch until every peer has confirmed it. This is the backpressure: a peer that ' +
+						'cannot keep up stalls the sweep instead of letting it run ahead of replication.'
+				),
+				dryRun: option(true, 'Count and report without deleting anything. Defaults ON, so a bare start is a census.'),
 			}
 		),
 

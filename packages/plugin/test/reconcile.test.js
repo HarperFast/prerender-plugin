@@ -344,7 +344,7 @@ test('an empty registry is a clean no-op', async () => {
 
 	const stats = await h.run();
 
-	assert.deepEqual(stats, { examined: 0, owned: 0, missing: 0, restored: 0, truncated: false });
+	assert.deepEqual(stats, { examined: 0, owned: 0, missing: 0, restored: 0, unreadable: 0, truncated: false });
 });
 
 test('the result does not depend on the order rows arrive in', async () => {
@@ -365,32 +365,40 @@ test('the result does not depend on the order rows arrive in', async () => {
 });
 
 /**
- * The LIVE query, exercised through `reconcileScheduleGaps` rather than the injected
+ * The LIVE walk, exercised through `reconcileScheduleGaps` rather than the injected
  * `streamTargets` fake above.
  *
  * v0.10.0 shipped broken because every test stubbed this layer out: the traversal logic was
- * right and the query was rejected by Harper on its very first page, so the sweep restored
- * nothing and reported an error. Asserting the query shape is the cheapest way to hold that
- * contract without a live database.
+ * right and the query was rejected by Harper on its very first page. So the live query shape is
+ * asserted here against a fake table that answers the way Harper's does — conditions, sort and
+ * limit honored — including the two unreadable-row personalities from util/urlWalk.js.
  */
-test('the live query asks for no sort — Harper rejects sorting by the primary key', async () => {
+const liveTargets = (rows, { abortsBefore = new Set() } = {}) => {
 	const searches = [];
-	const rows = [
-		{ url: 'https://x/a', renderInterval: 60000, sitemapUrl: null },
-		{ url: 'https://x/b', renderInterval: 60000, sitemapUrl: null },
-	];
-
-	globalThis.databases = {
-		render_service: {
-			Target: {
-				search(target) {
-					searches.push(target);
-					return (async function* () {
-						yield* rows;
-					})();
-				},
-			},
+	const Target = {
+		search({ conditions, sort, select, limit }) {
+			searches.push({ conditions, sort, select, limit });
+			const [range, upper] = conditions ?? [];
+			let view = rows.filter((r) => {
+				if (!range) return true;
+				if (range.comparator === 'greater_than' ? r.key <= range.value : r.key < range.value) return false;
+				return !(upper && r.key >= upper.value);
+			});
+			if (sort?.descending) view = [...view].reverse();
+			const out = [];
+			for (const r of view) {
+				// The aborting personality: a PROJECTED read ends in front of the poison row.
+				if (select && abortsBefore.has(r.key)) break;
+				out.push({ ...r.record });
+				if (out.length >= limit) break;
+			}
+			return (async function* () {
+				yield* out;
+			})();
 		},
+	};
+	globalThis.databases = {
+		render_service: { Target },
 		// `get` and `put` ONLY: the schedule funnel must never reach for `search` on the reconcile
 		// path — that would be a second walk of the hot queue index inside a registry sweep.
 		render_schedule: {
@@ -398,23 +406,59 @@ test('the live query asks for no sort — Harper rejects sorting by the primary 
 		},
 		coordination: { SharedBuffer: coordinationTable },
 	};
+	return searches;
+};
+const targetRow = (url) => ({ key: url, record: { url, renderInterval: 60000, sitemapUrl: null } });
+
+test('the live walk conditions every chunk on the url key — never a bare primary-key sort', async () => {
+	const searches = liveTargets([targetRow('https://x/a'), targetRow('https://x/b')]);
 
 	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
 
 	assert.equal(stats.examined, 2);
 	// One row per URL, whatever `config.deviceTypes.default` says: two URLs, two rows.
 	assert.equal(stats.restored, 2);
+	assert.equal(stats.unreadable, 0);
+	// A sort on the un-indexed primary key is rejected outright unless a condition accompanies it
+	// ("url is not indexed and not combined with any other conditions") — so no search may sort
+	// without a `url` condition beside it.
+	for (const search of searches) {
+		assert.equal(search.conditions?.[0]?.attribute, 'url', 'every chunk carries a condition on the key');
+		assert.ok(Number.isFinite(search.limit), 'every chunk is bounded');
+	}
+	// The chunk reads project; only the verification probes are projection-free.
+	assert.deepEqual(searches[0].select, ['url', 'renderInterval', 'sitemapUrl']);
+});
 
-	// Exactly one scan: no paging, so no cursor and no resumption.
-	assert.equal(searches.length, 1);
-	const [search] = searches;
+test('a target past a projection-poison row is still examined — the walk does not end at it', async () => {
+	// The production failure: the PROJECTED iterator silently ends in front of a row it cannot
+	// project, and the old single streamed search reported "no gaps" for everything past it. The
+	// projection-free probe proves the range continues, so the walk skips the row (counting it —
+	// its projected read never hands it over) and carries on to the targets beyond.
+	const poison = 'https://x/m';
+	const puts = [];
+	liveTargets([targetRow('https://x/a'), targetRow(poison), targetRow('https://x/z')], {
+		abortsBefore: new Set([poison]),
+	});
+	globalThis.databases.render_schedule.RenderSchedule.put = async (key) => {
+		puts.push(key);
+	};
 
-	// `sort` on the primary key is rejected outright ("url is not indexed and not combined
-	// with any other conditions") because it is not flagged `indexed` in attribute metadata.
-	assert.equal(search.sort, undefined, 'must not ask Harper to sort by the primary key');
-	// And no conditions: with none, Harper injects its own full-scan condition, which is what
-	// this wants. Supplying a range condition is only needed to resume a cursor — there is none.
-	assert.equal(search.conditions, undefined, 'an unconstrained scan needs no conditions');
-	assert.equal(search.limit, undefined, 'a streamed scan needs no limit');
-	assert.deepEqual(search.select, ['url', 'renderInterval', 'sitemapUrl']);
+	const stats = await reconcile.reconcileScheduleGaps({ maxRestores: 10 });
+
+	assert.ok(puts.includes('https://x/z'), 'the target PAST the poison row was reached and restored');
+	assert.equal(stats.examined, 2);
+	assert.equal(stats.unreadable, 1, 'the row the walk could not hand over is counted, not silently dropped');
+});
+
+test('a row unreadable on every path fails the pass instead of reporting it clean', async () => {
+	// When no read can hand over the row's key, the walk cannot prove it covered the range. A
+	// partial pass must be recorded as a failure — never as "no gaps across N owned targets", which
+	// is the lie that left live targets unscheduled for weeks.
+	const poison = 'https://x/m';
+	liveTargets([targetRow('https://x/a'), { key: poison, record: { url: undefined } }, targetRow('https://x/z')], {
+		abortsBefore: new Set([poison]),
+	});
+
+	await assert.rejects(reconcile.reconcileScheduleGaps({ maxRestores: 10 }), /NOT fully covered/);
 });
