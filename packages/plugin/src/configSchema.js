@@ -1416,31 +1416,32 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'(`origin.userAgents`), and an ADAPTIVE origin answers those with different HTML. Keyed by ' +
 						'URL alone, whichever device missed first would decide what every other device is served — ' +
 						'a desktop page to a smartphone crawler, under a 200, with nothing reporting it.\n\n' +
-						'WHEN TO TURN IT ON: an origin whose documents carry the same CONTENT for every device — ' +
-						'responsive, or adaptive only in presentation. There the per-device key stores every ' +
-						'document twice and halves the hit rate, because each device has to miss on its own — a ' +
-						'desktop crawler’s fetch never answers the smartphone crawler asking for the same URL ' +
+						'RAW DOCUMENTS ONLY, AND THAT IS WHY THIS CAN BE SAFE. A rendered snapshot has its device’s ' +
+						'layout baked in, so rendered pages stay per device regardless. A raw document is served ' +
+						'UNRENDERED: the crawler lays it out at its own viewport, so what matters is not whether the ' +
+						'two devices’ HTML differs but whether each device’s HTML RENDERS correctly at the other ' +
+						'device’s viewport.\n\n' +
+						'WHEN TO TURN IT ON: an origin whose documents render the same page at a given viewport ' +
+						'whichever device’s document it is — responsive, or adaptive only in hints the page ' +
+						'recomputes at render time. There the per-device key makes each device miss on its own — ' +
+						'a desktop crawler’s fetch never answers the smartphone crawler asking for the same URL ' +
 						'minutes later.\n\n' +
-						'VERIFY BEFORE SETTING IT: fetch the same URL with each `origin.userAgents` entry, with a ' +
-						'CACHE-BUSTING query parameter, and compare what a crawler indexes — title, meta, canonical, ' +
-						'robots, headings, structured data, the product/link set. Presentation-only differences ' +
-						'(lazy-loading attributes, a UI component’s channel flag, facet-panel extras) do not ' +
-						'disqualify it; any difference in CONTENT does. Compare against two fetches from the SAME ' +
-						'device, because a catalog that re-ranks per response differs from itself.\n\n' +
+						'VERIFY BY RENDERING, NOT BY DIFFING MARKUP. For a few URLs, capture each device’s document ' +
+						'(cache-busted — see below), load EACH document at EACH device profile (viewport, UA, touch) ' +
+						'with the navigation answered from the captured document, and compare what renders — layout ' +
+						'(column count, element widths, horizontal overflow), visible text, loaded images — against ' +
+						'a same-document repeat as the noise floor. Measured on one deployment whose SSR differed by ' +
+						'UA in three places (a component flag, eager-vs-lazy image hints, an extra facet entry in ' +
+						'hydration data): every rendered measure followed the viewport and none followed the ' +
+						'document, so it was enabled. A markup diff would have called that origin unsafe.\n\n' +
 						'THE CACHE-BUSTER IS NOT OPTIONAL. A CDN whose document cache key has no device in it hands ' +
 						'every UA whichever copy was filled first, so an un-busted comparison can read an adaptive ' +
 						'origin as byte-identical — measured on one deployment, un-busted fetches with the mobile UA ' +
 						'returned the desktop document 5 times in 6.\n\n' +
-						'THEN CHECK WHAT THE BOT PATH ACTUALLY SERVES, because that — not a laptop fetch — is what ' +
-						'this option changes. Request a few raw-cached URLs as each device through the CDN (with a ' +
-						'non-authorizing debug header value, so `x-harper-cache: raw` shows) and see whose markup ' +
-						'each device’s row holds. On the deployment above, rows written by real crawler traffic held ' +
-						'the MATCHING device’s markup 8 times in 9. The proxy’s own origin fetch goes through that ' +
-						'same device-blind document cache, so a row takes the other device’s markup only when the ' +
-						'other device filled the edge object within its TTL. There this option would have handed the ' +
-						'other device’s presentation to every serve whose device differs from the one that stored the ' +
-						'row, so it was left off — presentation-only differences are a product tradeoff against the ' +
-						'hit rate, not a safety question.\n\n' +
+						'PER-DEVICE ROWS ARE NOT RELIABLY PER-DEVICE ANYWAY where the proxy’s origin fetch goes ' +
+						'through a device-blind document cache: a row takes the other device’s document whenever that ' +
+						'device filled the edge object within its TTL. Measured on the deployment above, 1 row in 9 ' +
+						'written by real crawler traffic held the other device’s markup.\n\n' +
 						'SIZE THE GAIN BEFORE PAYING FOR IT. The extra hits are exactly the first request of the ' +
 						'second device for a URL both devices ask for while the row lives, so the gain is bounded by ' +
 						'the smaller device’s share of distinct URLs. And where the CDN caches the bot-path response ' +
@@ -1450,7 +1451,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'`*` is the origin declaring the body depends on the device, and it is refused ' +
 						'and counted as `vary-device` rather than shared. That catches an origin that turns adaptive ' +
 						'AND says so. Many adaptive origins sniff the UA without declaring it, and those pass this ' +
-						'check silently; only re-running the cache-busted diff catches a change there.\n\n' +
+						'check silently; only re-running the cross-device render comparison catches a change there.\n\n' +
 						'Flipping it in either direction needs no migration: the other key shape’s rows are simply ' +
 						'never read again and expire on their own. That relies on the two shapes not colliding, which ' +
 						'holds for the default `cacheKey.delimiter` (`|` never survives into a canonical URL) but not ' +
