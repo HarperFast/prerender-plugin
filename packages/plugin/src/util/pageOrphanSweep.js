@@ -75,6 +75,8 @@ const CHUNK_SIZE = 10_000;
 // Consecutive failed batches that end the pass. One fault is a batch for the next pass; a fault on
 // every batch is the storage engine or a peer saying stop.
 const MAX_CONSECUTIVE_ERRORS = 5;
+// Longest single sleep while pacing, so a stop request is seen within this long.
+const PAUSE_SLICE_MS = 500;
 
 /** A stored `Date` (or number, or ISO string) as epoch ms; NaN when it cannot be read. */
 const epochMs = (value) => (value === null || value === undefined ? NaN : new Date(value).getTime());
@@ -135,7 +137,11 @@ export const sweepOrphanedPages = async ({
 		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000;
 		const elapsed = now() - started;
 		batch.length = 0;
-		if (elapsed < window) await pause(window - elapsed);
+		// In slices, so a stop lands within one of them: at the configured extremes (a 1000-page batch
+		// at 1/s) one pacing window is over sixteen minutes.
+		for (let remaining = window - elapsed; remaining > 0 && !isCanceled(); remaining -= PAUSE_SLICE_MS) {
+			await pause(Math.min(PAUSE_SLICE_MS, remaining));
+		}
 	};
 
 	for await (const row of rows) {

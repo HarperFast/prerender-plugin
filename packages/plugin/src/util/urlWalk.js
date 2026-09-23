@@ -34,6 +34,9 @@
  * rows to the database layer.
  */
 export async function* walkUrlRange(table, { key = 'url', startAt = '', select, chunkSize, onUnreadable, endBound }) {
+	// The walk reads `row[key]` to cursor and to tell readable from unreadable, so a projection that
+	// omits the key would make EVERY row look unreadable. Always project it.
+	if (select && !select.includes(key)) select = [...select, key];
 	let cursor = null;
 	let inclusiveStart = startAt;
 	let lastResume = null;

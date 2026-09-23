@@ -291,3 +291,28 @@ test('deletePageBatch re-checks every key inside ONE transaction, holding it for
 	assert.equal(transactions.length, 1, 'one commit per batch');
 	assert.equal(transactions[0].replicatedConfirmation, 3);
 });
+
+test('a stop lands during a long pacing window, not after it', async () => {
+	// One 10-page batch at 1 page/s is a 10s window. Sliced, the stop is seen within one slice.
+	const slept = [];
+	let stop = false;
+	const { stats } = await run(
+		Array.from({ length: 20 }, (_, i) => page(i)),
+		{
+			batchSize: 10,
+			ratePerSecond: 1,
+			pause: async (ms) => {
+				slept.push(ms);
+				if (slept.length === 2) stop = true;
+			},
+			isCanceled: () => stop,
+		}
+	);
+	assert.equal(slept.length, 2, 'the pause ended at the first slice after the stop');
+	assert.ok(
+		slept.every((ms) => ms <= 500),
+		'no single sleep is longer than a slice'
+	);
+	assert.equal(stats.canceled, true);
+	assert.equal(stats.deleted, 10, 'the second batch was never started');
+});

@@ -227,3 +227,15 @@ test('bounded probe shape unsupported: ascending falls back to an unbounded prob
 	);
 	assert.deepEqual(urls, [inside.key]);
 });
+
+test('a projection that omits the key still walks: the key is always projected', async () => {
+	// Without the key in `select`, every row would read as unreadable and a full chunk would throw.
+	const rows = [row(U(1)), row(U(2)), row(U(3))];
+	const table = fakeTable(rows);
+	const urls = await collect(walkUrlRange(table, { select: ['sitemapUrl'], chunkSize: 2 }));
+	assert.deepEqual(urls, [U(1), U(2), U(3)]);
+	assert.ok(
+		table.calls.every((call) => !call.select || call.select.includes('url')),
+		'every projected read carries the key'
+	);
+});
