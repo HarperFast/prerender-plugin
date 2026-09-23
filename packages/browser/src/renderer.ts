@@ -766,6 +766,8 @@ const renderer: Renderer = async (page, job) => {
 		let quietSince = 0;
 		let grantedGrace = false;
 		let stopped = false;
+		// Falls out of the loop at the deadline unless something below says otherwise.
+		let exit: NonNullable<ReadinessResult['exit']> = 'deadline';
 		let firstSatisfiedMs: number | null = null;
 		let last: Awaited<ReturnType<typeof evaluateContract>> | null = null;
 
@@ -773,6 +775,7 @@ const renderer: Renderer = async (page, job) => {
 			try {
 				last = await page.evaluate(evaluateContract, payload);
 			} catch {
+				exit = 'gone';
 				break; // page closed or navigated — report what we have
 			}
 			for (const clause of last.require) {
@@ -810,6 +813,7 @@ const renderer: Renderer = async (page, job) => {
 				// The ONLY exit that ends the render here. Every other way out of this loop — the deadline,
 				// the rot valve, a page that went away — falls through to the ordinary settle.
 				stopped = true;
+				exit = 'stopped';
 				break;
 			}
 
@@ -836,7 +840,10 @@ const renderer: Renderer = async (page, job) => {
 				);
 				if (stalled && quiet && !fetchingOwnOrigin()) {
 					if (quietSince === 0) quietSince = Date.now();
-					else if (Date.now() - quietSince >= graceMs) break;
+					else if (Date.now() - quietSince >= graceMs) {
+						exit = 'valve';
+						break;
+					}
 				} else {
 					quietSince = 0;
 				}
@@ -850,6 +857,7 @@ const renderer: Renderer = async (page, job) => {
 			contract: governing.name,
 			satisfied,
 			stopped,
+			exit,
 			shortfalls: expectation.shortfalls,
 			rebaselined: expectation.rebaselined,
 			learned: expectation.learned,
@@ -990,6 +998,7 @@ const renderer: Renderer = async (page, job) => {
 			satisfied: !!last && last.started && last.require.every((r) => r.ok),
 			// Report mode watches; it never decides.
 			stopped: false,
+			exit: 'observed',
 			shortfalls: expectation.shortfalls,
 			rebaselined: expectation.rebaselined,
 			learned: expectation.learned,
@@ -1010,6 +1019,8 @@ const renderer: Renderer = async (page, job) => {
 	const observing: { done: boolean; wake?: (() => void) | undefined } = { done: false };
 	let observer: Promise<void> | null = null;
 	let contractStopped = false;
+	// True once an ARMED contract (not report mode) has run its window — the only case `onGiveUp` governs.
+	let contractArmed = false;
 	let contractScrolled = false;
 	// Set on the armed path so the verdict can be restated against the serialized DOM — see `finalize`.
 	let contractFinalize: (() => Promise<void>) | null = null;
@@ -1028,14 +1039,18 @@ const renderer: Renderer = async (page, job) => {
 				await scrollToTop();
 				contractScrolled = true;
 			}
+			contractArmed = true;
 			const outcome = await awaitContract(contract);
 			contractStopped = outcome.stopped;
 			contractFinalize = outcome.finalize;
 		}
 
-		if (contractStopped) {
+		// `onGiveUp: 'stop'` — an armed contract that ended its window without stopping serializes now,
+		// instead of handing the render to the timers below (see ReadinessConfig.onGiveUp).
+		const skipFallback = contractStopped || (contractArmed && config.readiness?.onGiveUp === 'stop');
+		if (skipFallback) {
 			// The contract asserted the page is complete and quiet, which is a stronger statement than any
-			// wait below would establish.
+			// wait below would establish — or it gave up and was configured to stop anyway.
 		} else if (config.scroll.enabled && !contractScrolled && config.scroll.settleUntilStable) {
 			await scrollSettle();
 		} else {
@@ -1059,10 +1074,10 @@ const renderer: Renderer = async (page, job) => {
 		// `settle` on purpose — it reads as part of the settle budget.
 		// A satisfied contract stands in for the hand-written gates and the final plateau too: they assert
 		// strictly less than it does, about the same DOM, later.
-		if (config.waitFor?.length && !contractStopped) {
+		if (config.waitFor?.length && !skipFallback) {
 			await applyWaitFor();
 		}
-		if (config.waitFor?.length && !contractStopped) await scrollToTop();
+		if (config.waitFor?.length && !skipFallback) await scrollToTop();
 		// The LAST word on whether the page has stopped changing, and the only plateau check that runs
 		// under `scroll.settleUntilStable`. A gate above can release the snapshot onto a DOM that is
 		// still filling — measured: reviews complete and correct, 107 product links instead of 547,
@@ -1072,7 +1087,7 @@ const renderer: Renderer = async (page, job) => {
 		// AFTER `scrollToTop`, deliberately: returning to the top is itself a DOM event — it is why
 		// `topSettleMs` exists — so a plateau measured before it would not cover the churn the scroll
 		// causes. This way the last thing checked is the state that gets serialized.
-		if (config.navigation.finalDomStable && !contractStopped) await domStable();
+		if (config.navigation.finalDomStable && !skipFallback) await domStable();
 		// The contract gave up, but the render did not: restate its verdict and its observation counts
 		// against the DOM that is about to be serialized, rather than the one it walked away from.
 		// A contract that STOPPED the render needs no restatement — it already looked at this DOM.

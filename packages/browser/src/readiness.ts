@@ -305,6 +305,19 @@ export type ReadinessConfig = {
 	quietMs?: number;
 	/** How history is compared against (see ReadinessExpectations). Omitted = the defaults. */
 	expectations?: Partial<ExpectationPolicy>;
+	/**
+	 * What an ARMED contract does when its window ends without stopping the render — the rot valve,
+	 * the deadline, or the page going away. Default `'settle'`: fall back to the ordinary timer-based
+	 * settle, then the `waitFor` gates and the final plateau, as before contracts existed.
+	 *
+	 * `'stop'`: serialize now. The fallback is timers — a network-idle wait that cannot resolve on a
+	 * page with third-party chatter, one or two DOM plateaus, the gates — and it runs on exactly the
+	 * renders that are already late. What it can still rescue is content the contract does not name,
+	 * so this is for a page type whose late content IS named (`responded`, `anyOf`, guards). The
+	 * verdict is restated against what was serialized either way, so an incomplete render still says
+	 * so. Report mode is unaffected: it never gates, and the settle always runs.
+	 */
+	onGiveUp?: 'settle' | 'stop';
 };
 
 /** Per-assertion outcome, posted with the render so an incomplete page is a fact, not a silence. */
@@ -339,6 +352,14 @@ export type ReadinessResult = {
 	 * within its timeout is satisfied and did not stop; the render fell back to the ordinary settle.
 	 */
 	stopped: boolean;
+	/**
+	 * How the contract's window ENDED — the one thing that says which guess released a render that did
+	 * not stop: `stopped` (held and quiet), `valve` (the rot valve stood a never-true clause aside),
+	 * `deadline` (`timeoutMs`, or what was left of the render budget), `gone` (the page closed or
+	 * navigated), `observed` (report mode, which never ends anything). `valve` and `deadline` are the
+	 * exits that run the fallback settle, unless `onGiveUp: 'stop'`.
+	 */
+	exit?: 'stopped' | 'valve' | 'deadline' | 'gone' | 'observed';
 	/** Wall time the contract held the render open. Never includes the fallback settle. */
 	waitedMs: number;
 	/**
@@ -660,6 +681,9 @@ export function validateReadiness(readiness: unknown): void {
 	if (typeof cfg !== 'object' || cfg === null) throw new Error('prerender config: readiness must be an object');
 	if (cfg.onSatisfied !== undefined && !['report', 'quiet', 'plateau'].includes(cfg.onSatisfied)) {
 		throw new Error("prerender config: readiness.onSatisfied must be 'report', 'quiet' or 'plateau'");
+	}
+	if (cfg.onGiveUp !== undefined && !['settle', 'stop'].includes(cfg.onGiveUp)) {
+		throw new Error("prerender config: readiness.onGiveUp must be 'settle' or 'stop'");
 	}
 	checkMs('readiness.quietMs', cfg.quietMs);
 	checkMs('readiness.unmetGraceMs', cfg.unmetGraceMs);
