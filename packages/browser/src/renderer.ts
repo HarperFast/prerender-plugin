@@ -7,6 +7,7 @@ import { canonicalizeUrl, canonicalVerdict } from './util/url.js';
 import { markRenderPhase } from './util/renderPhase.js';
 import { monitorSource } from './domMonitor.js';
 import { idleCallbackCapSource } from './idleCallbackCap.js';
+import { forceVisibleSource } from './forceVisible.js';
 import { compileUrlPatterns } from './util/urlPatterns.js';
 import {
 	assessExpectations,
@@ -151,6 +152,10 @@ const renderer: Renderer = async (page, job) => {
 	// Deferred hydration waits for an idle period, and a saturated render pod may never offer one —
 	// see idleCallbackCap.ts. Installed whenever configured, contract or not: a plain timer settle
 	// loses the same islands for the same reason.
+	// Lazy content reported visible without a tall viewport or a scroll pass — see forceVisible.ts.
+	if (config.navigation.forceVisibleBudget > 0) {
+		setupPromises.push(page.evaluateOnNewDocument(forceVisibleSource(config.navigation.forceVisibleBudget)));
+	}
 	if (config.navigation.idleCallbackTimeoutMs > 0) {
 		setupPromises.push(page.evaluateOnNewDocument(idleCallbackCapSource(config.navigation.idleCallbackTimeoutMs)));
 	}

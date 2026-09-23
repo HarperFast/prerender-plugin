@@ -142,6 +142,21 @@ export type NavigationConfig = {
 	 * nothing more.
 	 */
 	idleCallbackTimeoutMs: number;
+	/**
+	 * How many elements one document may have reported visible to its `IntersectionObserver`s without
+	 * being on screen; 0 (the default) leaves the browser's behaviour alone. See forceVisible.ts.
+	 *
+	 * Lazy content waits to be scrolled into view. A tall viewport or a scroll pass satisfies that by
+	 * brute force, and both are paid on every render: measured on a live listing template, a 1,080px
+	 * viewport with no scroll pass cost 43% fewer CPU-seconds per render than the 5,000px one, content
+	 * identical — and on a product template the same short viewport lost the lazily-initialised review
+	 * widget on every mobile render until this was on, after which every render had it.
+	 *
+	 * A budget rather than a switch, because a "load more" sentinel reported visible loads the next
+	 * page and its new sentinel would be reported too. Size it to the lazy elements a page type
+	 * really has; past it, the native observer alone decides.
+	 */
+	forceVisibleBudget: number;
 };
 
 export type ScrollConfig = {
@@ -568,6 +583,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 		finalDomStable: false,
 		skipSettleWhenNonIndexable: false,
 		idleCallbackTimeoutMs: 0,
+		forceVisibleBudget: 0,
 	},
 	scroll: {
 		enabled: true,
@@ -675,6 +691,10 @@ const validate = (config: PrerenderConfig): PrerenderConfig => {
 	}
 	if (config.navigation.idleCallbackTimeoutMs > MAX_TIMER_MS) {
 		throw new Error(`prerender config: navigation.idleCallbackTimeoutMs must be at most ${MAX_TIMER_MS}`);
+	}
+	const budget = config.navigation.forceVisibleBudget;
+	if (!Number.isInteger(budget) || budget < 0) {
+		throw new Error('prerender config: navigation.forceVisibleBudget must be a non-negative integer (0 = off)');
 	}
 	if (!Array.isArray(config.block.urlPatterns) || config.block.urlPatterns.some((p) => typeof p !== 'string' || !p)) {
 		throw new Error('prerender config: block.urlPatterns must be an array of non-empty strings');
