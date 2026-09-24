@@ -57,6 +57,21 @@ export const DepartureAction = {
 };
 const VALID_DEPARTURE = new Set(Object.values(DepartureAction));
 
+/**
+ * What a route does about a URL that REJOINS a sitemap after an earlier walk unlinked it — see
+ * util/sitemapArrival.js. Spelled with the departure enum's own strings, not merely equal ones: one
+ * post-walk executor (`resources/Sitemap.js`) serves both checks, and it compares against those.
+ * No `expire`: a rejoining page is not known to be wrong in a way that is worth sending bots to the
+ * origin for until its cadence render — the only useful arrival action is to render it now.
+ */
+export const ArrivalAction = {
+	/** Re-attribute and nothing else: the behaviour every route had before this existed. */
+	NONE: DepartureAction.NONE,
+	/** Hard-expire the cached pages and file the URL to render now — the departure `render` action. */
+	RENDER: DepartureAction.RENDER,
+};
+const VALID_ARRIVAL = new Set(Object.values(ArrivalAction));
+
 // The allowlist every non-prerender class resolves to: keep every query param, so a proxied
 // request reaches the origin with the query the visitor actually sent. (`['*']` still
 // canonicalizes — params are sorted, the fragment and a trailing slash are dropped — it just
@@ -189,7 +204,26 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
-	// Optional per-route raw-document cache. Same drop-the-FIELD rule as the four above: a typo here
+	// Optional per-route sitemap-arrival action — `departureAction`'s mirror, validated the same way for
+	// the same reason: a typo costs the route its arrival check, never how the path is served.
+	let arrivalAction = ArrivalAction.NONE;
+	if (raw.arrivalAction !== undefined && raw.arrivalAction !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring arrivalAction on passthrough route "${raw.match} ${raw.path}" — a passthrough route ` +
+					`owns no cached page to expire and no schedule to advance`
+			);
+		} else if (VALID_ARRIVAL.has(raw.arrivalAction)) {
+			arrivalAction = raw.arrivalAction;
+		} else {
+			warn(
+				`ignoring arrivalAction on route "${raw.match} ${raw.path}" — expected one of ` +
+					`${[...VALID_ARRIVAL].join(', ')}, got ${String(raw.arrivalAction)}`
+			);
+		}
+	}
+
+	// Optional per-route raw-document cache. Same drop-the-FIELD rule as the fields above: a typo here
 	// must not change how the path is SERVED. Note this is the ROUTE's opt-in only — `render.raw.enabled`
 	// is the master switch and is checked at the call site, so a route can carry the flag through a
 	// deployment where the feature is off and mean exactly nothing.
@@ -216,6 +250,7 @@ const compileEntry = (raw, source, warn) => {
 		discoverTargets,
 		demandFloor,
 		departureAction,
+		arrivalAction,
 		rawCache,
 		source,
 	};
@@ -345,6 +380,12 @@ export const matchRoute = (path) => {
  */
 export const anyRouteDeparts = () => {
 	for (const entry of getRoutes()) if (entry.departureAction !== DepartureAction.NONE) return true;
+	return false;
+};
+
+/** `anyRouteDeparts` for the arrival check — what keeps its candidate list empty until a route opts in. */
+export const anyRouteArrives = () => {
+	for (const entry of getRoutes()) if (entry.arrivalAction !== ArrivalAction.NONE) return true;
 	return false;
 };
 

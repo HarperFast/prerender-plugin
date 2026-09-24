@@ -204,7 +204,7 @@ export class Target extends TargetTable {
 	static async suppress(url, { reason, statusCode } = {}) {
 		const existing = await Target.get({
 			id: url,
-			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode'],
+			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode', 'unlistedAt'],
 		});
 		const strikes = countedStrikes(existing?.strikes) + 1;
 
@@ -230,9 +230,15 @@ export class Target extends TargetTable {
 			return { deleted: true, strikes };
 		}
 
+		// A put REPLACES the row, so every field that describes the URL rather than the verdict is carried
+		// across by name. `unlistedAt` with `sitemapUrl`: the two describe one fact (when a walk unlinked
+		// it), and dropping the stamp here would turn a recently-unlisted target into a never-listed one —
+		// out of `changeProbe.scope: listed` the moment the verdict heals, and invisible to the arrival
+		// check if it rejoins its sitemap.
 		await TargetTable.put(url, {
 			url,
 			sitemapUrl: existing?.sitemapUrl ?? null,
+			unlistedAt: existing?.unlistedAt ?? null,
 			schedulerNode: existing?.schedulerNode ?? getResidencyByUrl(url),
 			renderInterval: existing?.renderInterval ?? null,
 			state: 'suppressed',

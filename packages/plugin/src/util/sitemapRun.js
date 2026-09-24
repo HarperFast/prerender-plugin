@@ -91,7 +91,13 @@ export const actionForExisting = (existingTarget, sitemapUrl, claimedThisWalk) =
  *    cannot act on a partial set while claiming success, and the only caller was discarding it.
  *  - `failed` exists at all. One unreachable child used to abort the entire walk.
  */
-export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, departureCap = 0 } = {}) => {
+export const createRefreshRun = ({
+	removedSampleCap = 20,
+	failedCap = 100,
+	departureCap = 0,
+	arrivalCap = 0,
+	startedAt = Date.now(),
+} = {}) => {
 	const totals = {
 		created: 0,
 		updated: 0,
@@ -132,7 +138,20 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 	// unlinked, so no later walk will offer it again — which is why `capped` is reported at all.
 	const departure = { candidates: [], capped: false, outcomes: {} };
 
+	// Rejoined URLs held for the post-walk arrival action (util/sitemapArrival.js). Unlike departures
+	// these are decided AT re-attach time — `startedAt` is what makes that exact — and only acted on
+	// after the walk, so both checks share one executor, one set of caps and one tally shape. Same
+	// bound, same `arrivalCap: 0` default, same Infinity for uncapped.
+	const arrival = { candidates: [], capped: false, outcomes: {} };
+
 	return {
+		/**
+		 * When this walk started (epoch ms). The prune stamps it as `Target.unlistedAt` and the re-attach
+		 * compares against it, so "unlinked by THIS walk" (shear) and "unlinked by an earlier one" (a
+		 * rejoin) are told apart by an exact comparison, never by two readings of a clock.
+		 */
+		startedAt,
+
 		count(key, by = 1) {
 			totals[key] += by;
 		},
@@ -183,6 +202,23 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 			departure.outcomes[outcome] = (departure.outcomes[outcome] ?? 0) + 1;
 		},
 
+		/** A re-attached target an EARLIER walk unlinked — held for the post-walk arrival action. */
+		addArrival(url) {
+			if (arrivalCap <= 0) return;
+			if (arrival.candidates.length < arrivalCap) arrival.candidates.push(url);
+			else arrival.capped = true;
+		},
+
+		/** The rejoined URLs to re-read once the walk has finished. */
+		arrivalCandidates() {
+			return arrival.candidates;
+		},
+
+		/** One arrival outcome, by name — `countDeparture`'s mirror. */
+		countArrival(outcome) {
+			arrival.outcomes[outcome] = (arrival.outcomes[outcome] ?? 0) + 1;
+		},
+
 		/** A child sitemap threw. The walk continues; the failure is reported, not swallowed. */
 		addFailure(url, error) {
 			if (failed.length < failedCap) failed.push({ url, error: describeError(error) });
@@ -209,6 +245,11 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 					considered: departure.candidates.length,
 					capped: departure.capped,
 					outcomes: { ...departure.outcomes },
+				},
+				arrivals: {
+					considered: arrival.candidates.length,
+					capped: arrival.capped,
+					outcomes: { ...arrival.outcomes },
 				},
 			};
 		},

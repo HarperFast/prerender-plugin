@@ -321,6 +321,16 @@ Grep-able, `[prerender]`-prefixed, and each is the richer record of something th
   "target with no schedule row" state. Any non-zero `restored` is worth an alert; nothing else
   reports it.
 - **`Sitemap refresh for <url> finished: …`** — sitemaps processed, targets created/removed, duration.
+- **`Arrival check: N rejoined …`** — the outcome tally of the post-walk sitemap-arrival action
+  (`ingress.routes[].arrivalAction`, `sitemap.arrival`): URLs a walk re-attributed after an EARLIER
+  walk unlinked them, with `render`/`would-render` and the named skips. Deliberately NOT a metric
+  series (a new `sitemap_*` family needs a console panel first); the same tally is `arrivals` on the
+  refresh result and on `GET /sitemap_refresh/<root>`.
+- **`change-probe sweep: changeProbe.scope left N rule-matched targets unprobed and probed only M`** —
+  under `changeProbe.scope: listed`, a pass that skipped more than it kept. Either the corpus really is
+  mostly unlisted (the setting is wrong for this site) or sitemap walks stopped listing what they used to;
+  check `sitemap_removed` and the departure tally. The per-pass count itself is `outOfScope` on the
+  `GET /prerender_admin/change-probe` pass record — the origin requests the scope saved.
 - **Render verdicts per URL** — `Suppressing prerendered url …`, `Prerender failed for … (reason)`,
   `Retrying … (failure strike N)`, `redirected to … which is <class>`. The aggregate is
   the `render` metric's `outcome` series; these lines carry the URL. Most are `info`/`debug` now (they are normal
