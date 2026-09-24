@@ -33,6 +33,7 @@
  */
 
 import { config, getLogger } from '../config.js';
+import { compileEntityPrefix, endsOnDelimiter } from './entityGate.js';
 
 export const PRERENDER = 'prerender';
 export const PASSTHROUGH = 'passthrough';
@@ -241,6 +242,50 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route ENTITY PREFIX — what the discovery gate treats as "the same product" (see
+	// util/entityGate.js). Same drop-the-FIELD rule as the fields above, and dropping it is exactly the
+	// pre-gate behaviour: every unknown URL on the route is minted. Compiled here, once per config
+	// apply, so the discovery path never parses a pattern.
+	let entityPrefix = null;
+	if (raw.entityPrefix !== undefined && raw.entityPrefix !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring entityPrefix on passthrough route "${raw.match} ${raw.path}" — a passthrough route is never ` +
+					`scheduled, so it never discovers targets and there is nothing to gate`
+			);
+		} else if (typeof raw.entityPrefix !== 'string' || raw.entityPrefix === '') {
+			warn(
+				`ignoring entityPrefix on route "${raw.match} ${raw.path}" — expected a non-empty regular expression ` +
+					`string, got ${String(raw.entityPrefix)}`
+			);
+		} else {
+			try {
+				entityPrefix = compileEntityPrefix(raw.entityPrefix);
+			} catch (e) {
+				warn(
+					`ignoring entityPrefix on route "${raw.match} ${raw.path}" — not a valid regular expression ` +
+						`(${e?.message ?? String(e)})`
+				);
+			}
+			// Warned, not dropped: the RUNTIME rule is what makes this safe — a match that does not end in
+			// "/" is refused per URL — so a pattern like `…\d+/?` still works wherever the URL continues past
+			// the id. The warning is so the author learns that some (or all) of their matches will be refused.
+			if (entityPrefix && !endsOnDelimiter(raw.entityPrefix)) {
+				warn(
+					`entityPrefix "${raw.entityPrefix}" on route "${raw.match} ${raw.path}" does not end in "/". A match ` +
+						`must end on "/" or it would be a string prefix of OTHER entities' URLs (prd-123 of prd-1234), so ` +
+						`any match that does not is ignored and that URL is discovered as if no entityPrefix were set`
+				);
+			}
+			if (entityPrefix && discoverTargets === false) {
+				warn(
+					`entityPrefix on route "${raw.match} ${raw.path}" does nothing: the route sets discoverTargets: false, ` +
+						`so no URL on it is ever discovered for the entity gate to refuse`
+				);
+			}
+		}
+	}
+
 	return {
 		match: raw.match,
 		path: raw.path,
@@ -252,6 +297,7 @@ const compileEntry = (raw, source, warn) => {
 		departureAction,
 		arrivalAction,
 		rawCache,
+		entityPrefix,
 		source,
 	};
 };

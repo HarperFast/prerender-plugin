@@ -106,7 +106,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
 					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
-					'rawCache?: boolean }.\n\n' +
+					'rawCache?: boolean, entityPrefix?: string }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -188,7 +188,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'proxy, never a render: a stale or invalidated snapshot still proxies live. Pair it with ' +
 					'`discoverTargets: false` — gated URLs are exactly the population this is for, and gating ' +
 					'without it leaves them missing on every request forever. Enable it only on a route whose ' +
-					'server-rendered document already carries its SEO surface; see `render.raw`.',
+					'server-rendered document already carries its SEO surface; see `render.raw`.\n\n' +
+					'`entityPrefix` (prerender routes only; off when absent) — a regular expression, anchored at the ' +
+					'start of the URL PATH, whose match is the part of the URL that identifies ONE entity, e.g. ' +
+					"`'^/product/prd-[^/]+/'` on a `/product/prd-` route. Traffic discovery then refuses to mint a " +
+					'target for an unknown URL when another URL of the same entity (a target whose URL starts with ' +
+					'this URL\u2019s origin plus the match) is already in rotation: crawlers requesting an old or ' +
+					'invented slug of a product whose correct URL is tracked no longer cost a render that ends ' +
+					'suppressed as `canonical-mismatch`. The URL is still served (a miss proxies the origin). ' +
+					'Sitemap-listed URLs are always created. Siblings that are all SUPPRESSED do not block, so a ' +
+					'product whose slug really changed is discovered at its new URL once the old URL\u2019s next ' +
+					'render has suppressed it — a delay of one render cycle of the old target, never a permanent ' +
+					'block. THE MATCH MUST END ON `/`: a prefix that stops mid-segment is a string prefix of other ' +
+					"entities' URLs (`prd-123` of `prd-1234`), so a match that does not end in `/` is ignored for " +
+					'that URL (it is discovered as if no entityPrefix were set) and a pattern whose source does not ' +
+					'end in `/` is warned about. Every URL under one prefix counts as the same entity, query variants ' +
+					'the route keeps included, so do not set this on a route where several URLs per entity are ' +
+					'distinct pages. The pattern runs against crawler-supplied paths, so keep it linear — a literal ' +
+					'prefix plus `[^/]+` segments, no nested quantifiers. Governed by `ingress.entityGate` (dry run ' +
+					'by default).',
 				{ itemType: 'object' }
 			),
 			discoveryBots: option(
@@ -202,6 +220,39 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'source. Creation-only: serving, the demand ladder, invalidation reenqueue, and sitemap ' +
 					'ingestion are all unaffected.',
 				{ itemType: 'string' }
+			),
+			entityGate: group(
+				'The entity discovery gate. Nothing here does anything until a route declares ' +
+					'`ingress.routes[].entityPrefix` — see that field for what an entity is.\n\n' +
+					'WHAT IT DOES. When a bot requests an unknown URL on such a route and discovery would mint a ' +
+					'target for it, the gate first reads the targets that share its entity prefix (one bounded ' +
+					'primary-key range read of at most 3 rows — fixed, not tunable: measured, the first sibling in ' +
+					'rotation was within the first 3 keys for every sampled entity — detached from the response and ' +
+					'node-local). If one of them is in rotation, the URL is not minted. If there are none, or every ' +
+					'one is suppressed, it is minted exactly as before. Any failure mints.\n\n' +
+					'WHAT IT SAVES. Each refused mint is a render (and an origin document fetch) that would have ' +
+					'ended `suppressed/canonical-mismatch`, then re-rendered on the suppression recheck until ' +
+					'`maxStrikes` deleted it and the next crawler hit minted it again. Existing suppressed rows are ' +
+					'left alone — they age out through `maxStrikes` as before, and once the gate is armed they are ' +
+					'not re-minted.\n\n' +
+					'Observed on `prerender_ops` / `entity_gate`, one emit per evaluation by outcome; armed ' +
+					'refusals are also counted on `discovery_gated` with the gate name `entity`.',
+				{
+					enabled: option(
+						true,
+						'Master switch. Routes still have to opt in with `entityPrefix`, so leaving this on costs ' +
+							'nothing until one does; it exists so an operator can stop the gate during an incident ' +
+							'without editing the route list. Off = no sibling read, nothing counted, every unknown URL ' +
+							'minted.'
+					),
+					dryRun: option(
+						true,
+						'Evaluate and count, but mint anyway. The default, because the number to know first is how ' +
+							'many mints the gate WOULD refuse — `entity_gate` outcome `would-gate` — which is read ' +
+							'against `render` outcome `suppressed`/`canonical-mismatch` before arming it. Turn it off ' +
+							'to arm the gate.'
+					),
+				}
 			),
 			excludePathPatterns: option(
 				['/search/'],

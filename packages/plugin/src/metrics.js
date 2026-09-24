@@ -480,13 +480,13 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js',
+			'util/changeProbe.js, util/entityGate.js',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
-			'per raw-document store attempt (raw_cache)',
+			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -522,7 +522,19 @@ export const METRICS = Object.freeze({
 			'discovery_gated = cacheable misses whose target creation the discovery gate refused, split by ' +
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
 			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
-			'render rotation", the corpus growth the gate is preventing. ' +
+			'render rotation", the corpus growth the gate is preventing. The `entity` gate is the exception ' +
+			'in scope, not in meaning: it is evaluated only for a URL with NO target row, so its count is ' +
+			'refused mints, and it is emitted only when the gate is ARMED (a dry run records would-gate on ' +
+			'entity_gate instead, never here). ' +
+			'entity_gate = one emit per evaluation of the entity discovery gate (ingress.entityGate, per-route ' +
+			'entityPrefix), split by outcome: gated (a sibling URL of the same entity is in rotation; not minted — ' +
+			'also counted as discovery_gated/entity), would-gate (the same verdict under dryRun; minted anyway), ' +
+			'suppressed-only (every sibling is suppressed; minted — a re-slug\u2019s new URL), no-siblings (a new ' +
+			'entity; minted), no-prefix (the route has an entityPrefix and this URL produced no usable match; ' +
+			'minted), error (the sibling read threw; minted). The outcomes sum to the mints the gate looked at. ' +
+			'THE DRY-RUN NUMBER is would-gate: the renders (and origin document fetches) arming the gate would ' +
+			'save, to read against render/outcome suppressed/canonical-mismatch. A route whose evaluations are ' +
+			'nearly all no-prefix has a pattern that does not match its URLs. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
 			'oversize, capture-failed, write-failed, vary-device). READ THE REFUSALS, not the successes — a route that is ' +
@@ -546,7 +558,7 @@ export const METRICS = Object.freeze({
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
-			'invalidation_reenqueue, probe_canary_trip, probe_invalidated and discovery_gated are counters; config_warnings is a slow gauge (latest value); ' +
+			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated and entity_gate are counters; config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-worker gauge — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
 			'and climbs until the next one, so it is a sawtooth: averaging over a window reports the middle ' +
@@ -597,6 +609,7 @@ export const METRICS = Object.freeze({
 					'probe_page_mismatch',
 					'probe_cycle_behind',
 					'discovery_gated',
+					'entity_gate',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -608,7 +621,8 @@ export const METRICS = Object.freeze({
 					'guardrail ratio\u2019s two halves, promoted_fast = promotions onto a fast rung, plus the ' +
 					'fill sizing gauge. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
-					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses.',
+					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
+					'entity_gate = entity discovery gate evaluations, by outcome.',
 			},
 			method: {
 				name: 'detail',
@@ -625,7 +639,9 @@ export const METRICS = Object.freeze({
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
-					"route's discoverTargets, 'bot' = ingress.discoveryBots). raw_cache: THE OUTCOME — stored, " +
+					"route's discoverTargets, 'bot' = ingress.discoveryBots, 'entity' = the route's entityPrefix " +
+					'found a sibling URL of the same entity in rotation, armed gate only). entity_gate: the outcome ' +
+					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
 					'Other series: null.',
 			},
@@ -634,7 +650,7 @@ export const METRICS = Object.freeze({
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated: the bot name. Other series: null.',
+					'that triggered the heal. discovery_gated and entity_gate: the bot name. Other series: null.',
 			},
 		},
 	}),
@@ -845,6 +861,13 @@ export const metrics = Object.freeze({
 	/** A cacheable miss the discovery gate held out of target creation — a prerender_ops series. */
 	discoveryGated: (reason, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'discovery_gated', reason, botName ?? null),
+
+	/**
+	 * One evaluation of the entity discovery gate (util/entityGate.js) and its outcome — a
+	 * prerender_ops series. Exactly one per evaluation, so the outcomes sum to the mints it looked at.
+	 */
+	entityGate: (outcome, botName) =>
+		server.recordAnalytics(true, 'prerender_ops', 'entity_gate', outcome, botName ?? null),
 
 	/**
 	 * One raw-document store attempt and what became of it — a prerender_ops series.

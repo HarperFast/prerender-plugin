@@ -278,6 +278,15 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		['render_readiness.shortfall', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
 		['render_readiness.rebaseline', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
 		['render_readiness.satisfied_ms', 'report-only window; read raw from /prerender_admin/analytics — panel is #189'],
+		// The entity discovery gate (plugin v0.90.0) ships in dry run. Its evaluation census is read raw
+		// from the analytics endpoint during that window; the refusals that matter once it is ARMED are
+		// also emitted as `discovery_gated` with the gate name `entity`, which the Discovery gate panel
+		// already totals — so no console release is needed to see the armed gate's effect. A tile for
+		// the census (would-gate / suppressed-only / no-siblings / no-prefix) is the follow-up.
+		[
+			'prerender_ops.entity_gate',
+			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
+		],
 	]);
 
 	const client = [...clientSources.values()].join('\n');
