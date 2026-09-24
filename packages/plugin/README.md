@@ -294,10 +294,12 @@ ingress:
   discoverable.
 - **Discovery only.** Sitemap ingestion, redirect adoption and the REST API create targets without
   consulting the gate; the declared corpus is always created.
-- **The read.** One one-sided primary-key range over `Target` (at most
-  `ingress.entityGate.siblingLimit` rows, projecting `url` and `state`), only for a URL with no target
-  row, inside the detached discovery step — never on the response path. `Target` is not
-  residency-pinned, so the read is node-local. Any failure mints.
+- **The read.** One one-sided primary-key range over `Target` (at most 3 rows, projecting `url` and
+  `state`, stopping at the first sibling in rotation), only for a URL with no target row, inside the
+  detached discovery step — never on the response path. `Target` is not residency-pinned, so the read
+  is node-local. Any failure mints. The 3 is fixed: measured on a production catalog, the first
+  sibling in rotation was within the first 3 keys for 150/150 sampled entities; past it the gate
+  mints, never refuses.
 
 Every URL under one prefix is the same entity, query variants the route keeps included — don't set
 `entityPrefix` on a route where several URLs per entity are distinct pages. The pattern runs against

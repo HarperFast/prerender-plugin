@@ -142,39 +142,51 @@ export const entityPrefixOf = (url, route) => {
 export const inRotation = (row) => row?.state !== 'suppressed';
 
 /**
- * Read up to `limit` siblings of `url` under `prefix`. Stops at the first sibling in rotation —
- * one is enough to decide — at the first key outside the prefix, or at the limit. `url` itself is
- * never its own sibling (it has no row when discovery gets here, but a concurrent mint may have
- * just written one).
- *
- * THE LOOP BODY DOES NOT AWAIT. Rows are collected and the cursor is released (by the `break`, or by
- * exhaustion) before the caller does anything else — the scan-then-write rule from util/scan.js.
+ * How many rows one evaluation reads. FIXED, not configuration, because the answer was measured and a
+ * knob for it would only be a way to get it wrong: across 150 suppressed old-slug targets on a
+ * production catalog, the first in-rotation sibling under the entity prefix sat at key-order position
+ * 1 for 135, position 2 for 14 and position 3 for 1 — so 3 rows found it for 150/150 (1 row: 90%,
+ * 2 rows: 99%), and no entity had more than 4 siblings at all. Past the limit the gate MINTS (the
+ * pre-gate behaviour), never refuses on a guess, so a miss costs one render, not a lost URL.
  */
-export const readSiblings = async ({ table, prefix, url, limit }) => {
-	const siblings = [];
+export const SIBLING_READ_LIMIT = 3;
+
+/**
+ * Look at `url`'s siblings under `prefix`: `{ blocker, seen }`, where `blocker` is the key of the first
+ * sibling in rotation (null when none was found) and `seen` how many siblings were read. Stops at the
+ * first sibling in rotation — one is enough to decide — at the first key outside the prefix, or after
+ * SIBLING_READ_LIMIT rows. `url` itself is never its own sibling (it has no row when discovery gets
+ * here, but a concurrent mint may have just written one; it then costs a row, which only shortens the
+ * look — the fail-open direction).
+ *
+ * THE LOOP BODY DOES NOT AWAIT. The cursor is released (by the `break`, or by exhaustion) before the
+ * caller does anything else — the scan-then-write rule from util/scan.js. No rows are kept: the decision
+ * needs only the first blocker's key and whether any sibling existed.
+ */
+export const readSiblings = async ({ table, prefix, url }) => {
+	let seen = 0;
 	for await (const row of table.search(
 		{
 			conditions: [{ attribute: 'url', comparator: 'greater_than_equal', value: prefix }],
 			sort: { attribute: 'url' },
 			select: [...SIBLING_SELECT],
-			// +1 so that `url` itself, if a concurrent mint just wrote it, cannot cost a sibling slot.
-			limit: limit + 1,
+			limit: SIBLING_READ_LIMIT,
 		},
 		{ replicateFrom: false }
 	)) {
 		const key = row?.url;
-		// An unreadable key can be neither compared nor trusted; skip it (the read stays bounded by
-		// `limit`). If the store instead ENDS the iterator at such a row, fewer siblings are seen and
-		// the gate mints — the fail-open direction.
+		// An unreadable key can be neither compared nor trusted; skip it (the read stays bounded by the
+		// limit). If the store instead ENDS the iterator at such a row, fewer siblings are seen and the
+		// gate mints — the fail-open direction.
 		if (typeof key !== 'string') continue;
-		// BREAK, never `continue`: ascending order means one key outside the prefix proves every
-		// later key is outside it too.
+		// BREAK, never `continue`: ascending order means one key outside the prefix proves every later
+		// key is outside it too.
 		if (!key.startsWith(prefix)) break;
 		if (key === url) continue;
-		siblings.push(row);
-		if (inRotation(row) || siblings.length >= limit) break;
+		seen++;
+		if (inRotation(row)) return { blocker: key, seen };
 	}
-	return siblings;
+	return { blocker: null, seen };
 };
 
 /**
@@ -203,11 +215,10 @@ export async function evaluateEntityGate({
 	const prefix = entityPrefixOf(url, route);
 	if (!prefix) return decided(EntityGateOutcome.NO_PREFIX, true);
 
-	let siblings;
+	let blocker;
+	let seen;
 	try {
-		// The schema floors it at 1; this only keeps a hand-built `gate` from reading zero rows.
-		const limit = Math.max(1, Math.floor(Number(gate.siblingLimit) || 5));
-		siblings = await readSiblings({ table, prefix, url, limit });
+		({ blocker, seen } = await readSiblings({ table, prefix, url }));
 	} catch (e) {
 		getLogger().warn?.(
 			`[prerender] entity gate: sibling read under ${prefix} failed (${e?.message ?? String(e)}); minting ${url} as before`
@@ -215,13 +226,12 @@ export async function evaluateEntityGate({
 		return decided(EntityGateOutcome.ERROR, true, prefix);
 	}
 
-	if (!siblings.length) return decided(EntityGateOutcome.NO_SIBLINGS, true, prefix);
-	const blocker = siblings.find(inRotation);
+	if (!seen) return decided(EntityGateOutcome.NO_SIBLINGS, true, prefix);
 	if (!blocker) return decided(EntityGateOutcome.SUPPRESSED_ONLY, true, prefix);
-	if (gate.dryRun) return decided(EntityGateOutcome.WOULD_GATE, true, prefix, blocker.url);
+	if (gate.dryRun) return decided(EntityGateOutcome.WOULD_GATE, true, prefix, blocker);
 
 	// Armed and refused. Counted on `discovery_gated` too, beside the route and bot gates, so every
 	// view of "what the gates held out of the rotation" includes it without learning a new series.
 	metrics.discoveryGated('entity', botName);
-	return decided(EntityGateOutcome.GATED, false, prefix, blocker.url);
+	return decided(EntityGateOutcome.GATED, false, prefix, blocker);
 }

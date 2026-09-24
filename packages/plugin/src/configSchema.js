@@ -212,7 +212,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'`ingress.routes[].entityPrefix` — see that field for what an entity is.\n\n' +
 					'WHAT IT DOES. When a bot requests an unknown URL on such a route and discovery would mint a ' +
 					'target for it, the gate first reads the targets that share its entity prefix (one bounded ' +
-					'primary-key range read, at most `siblingLimit` rows, detached from the response and ' +
+					'primary-key range read of at most 3 rows — fixed, not tunable: measured, the first sibling in ' +
+					'rotation was within the first 3 keys for every sampled entity — detached from the response and ' +
 					'node-local). If one of them is in rotation, the URL is not minted. If there are none, or every ' +
 					'one is suppressed, it is minted exactly as before. Any failure mints.\n\n' +
 					'WHAT IT SAVES. Each refused mint is a render (and an origin document fetch) that would have ' +
@@ -236,15 +237,6 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'many mints the gate WOULD refuse — `entity_gate` outcome `would-gate` — which is read ' +
 							'against `render` outcome `suppressed`/`canonical-mismatch` before arming it. Turn it off ' +
 							'to arm the gate.'
-					),
-					siblingLimit: option(
-						5,
-						'Most sibling rows one evaluation reads. The read stops at the FIRST sibling in rotation, so ' +
-							'this binds only when an entity has accumulated several suppressed URLs ahead of its live ' +
-							'one in key order; past the limit the URL is minted (the pre-gate behaviour), never ' +
-							'refused. Raise it if `suppressed-only` stays high while `canonical-mismatch` does not ' +
-							'fall.',
-						{ min: 1, max: 100 }
 					),
 				}
 			),

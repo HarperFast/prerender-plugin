@@ -121,12 +121,13 @@ let evaluateEntityGate;
 let entityPrefixOf;
 let EntityGateOutcome;
 let SIBLING_SELECT;
+let SIBLING_READ_LIMIT;
 let handlePageScheduling;
 
 before(async () => {
 	({ applyOptions, config } = await import('../src/config.js'));
 	({ matchRoute, inspectRoutes } = await import('../src/util/routeClass.js'));
-	({ evaluateEntityGate, entityPrefixOf, EntityGateOutcome, SIBLING_SELECT } = await import(
+	({ evaluateEntityGate, entityPrefixOf, EntityGateOutcome, SIBLING_SELECT, SIBLING_READ_LIMIT } = await import(
 		'../src/util/entityGate.js'
 	));
 	({ handlePageScheduling } = await import('../src/http_handlers/bot_request.js'));
@@ -273,7 +274,7 @@ test('a match that does not extend past a prefix route’s own path names the wh
 
 // ── the decision ───────────────────────────────────────────────────────────────────────────────
 
-const gate = (overrides = {}) => ({ enabled: true, dryRun: false, siblingLimit: 5, ...overrides });
+const gate = (overrides = {}) => ({ enabled: true, dryRun: false, ...overrides });
 
 test('a sitemap-listed sibling in rotation GATES: not minted, counted on both series', async () => {
 	const table = tableOf([
@@ -389,7 +390,7 @@ test('an unreadable row is skipped, never taken for a sibling or a cursor', asyn
 
 test('the read is one bounded, one-sided, node-local PK range with the minimal projection', async () => {
 	const table = tableOf([{ url: `${ORIGIN}/product/prd-123/a.jsp`, state: 'suppressed' }]);
-	await evaluateEntityGate({ url: U, route: route(), table, gate: gate({ siblingLimit: 5 }) });
+	await evaluateEntityGate({ url: U, route: route(), table, gate: gate() });
 	assert.equal(table.searches.length, 1);
 	const [{ query, context }] = table.searches;
 	assert.deepEqual(query.conditions, [
@@ -398,7 +399,8 @@ test('the read is one bounded, one-sided, node-local PK range with the minimal p
 	assert.deepEqual(query.sort, { attribute: 'url' });
 	assert.deepEqual(query.select, [...SIBLING_SELECT]);
 	assert.deepEqual(query.select, ['url', 'state']);
-	assert.equal(query.limit, 6, 'siblingLimit + 1, so the URL itself can never cost a sibling slot');
+	assert.equal(SIBLING_READ_LIMIT, 3, 'measured: the first sibling in rotation was within 3 keys for 150/150 entities');
+	assert.equal(query.limit, SIBLING_READ_LIMIT, 'a fixed 3-row read — no knob');
 	// SECOND argument: Harper ignores unknown query fields, so inside the query it would do nothing.
 	assert.deepEqual(context, { replicateFrom: false });
 	assert.equal('replicateFrom' in query, false);
@@ -421,30 +423,23 @@ test('the cursor is released before anything is recorded — on an early break a
 	assert.equal(cursorOpenAtEmit, false);
 });
 
-test('the read stops at the first sibling in rotation, and the limit bounds the suppressed case', async () => {
-	const suppressed = Array.from({ length: 7 }, (_, i) => ({
-		url: `${ORIGIN}/product/prd-123/dead-${i}.jsp`,
-		state: 'suppressed',
-	}));
-	// Seven dead slugs sort ahead of the live one. With siblingLimit 5 the live one is out of reach:
-	// the gate MINTS (the pre-gate behaviour), it never refuses on a guess.
+test('the read stops at the first sibling in rotation, and the 3-row limit bounds the suppressed case', async () => {
+	const dead = (n) =>
+		Array.from({ length: n }, (_, i) => ({ url: `${ORIGIN}/product/prd-123/dead-${i}.jsp`, state: 'suppressed' }));
 	const live = { url: `${ORIGIN}/product/prd-123/zz-live.jsp`, state: null };
-	let result = await evaluateEntityGate({
-		url: U,
-		route: route(),
-		table: tableOf([...suppressed, live]),
-		gate: gate({ siblingLimit: 5 }),
-	});
-	assert.equal(result.outcome, 'suppressed-only');
-	// Raised past the dead slugs, it finds the live one.
-	result = await evaluateEntityGate({
-		url: U,
-		route: route(),
-		table: tableOf([...suppressed, live]),
-		gate: gate({ siblingLimit: 10 }),
-	});
+	// Two dead slugs ahead of the live one: the live one is the third row read, so the gate finds it.
+	let result = await evaluateEntityGate({ url: U, route: route(), table: tableOf([...dead(2), live]), gate: gate() });
 	assert.equal(result.outcome, 'gated');
 	assert.equal(result.blocker, live.url);
+	// Three dead slugs ahead of it: the live one is past the read, and the gate MINTS (the pre-gate
+	// behaviour) — it never refuses on a guess.
+	result = await evaluateEntityGate({ url: U, route: route(), table: tableOf([...dead(3), live]), gate: gate() });
+	assert.equal(result.outcome, 'suppressed-only');
+	assert.equal(result.mint, true);
+	// The first sibling in rotation ends the read: nothing after it is consumed.
+	const table = tableOf([live, ...dead(2)]);
+	result = await evaluateEntityGate({ url: U, route: route(), table, gate: gate() });
+	assert.equal(result.outcome, 'gated');
 });
 
 // ── the discovery path ─────────────────────────────────────────────────────────────────────────
@@ -518,9 +513,7 @@ test('discovery is the ONLY caller — sitemap-driven (and every other) creation
 
 // ── config ─────────────────────────────────────────────────────────────────────────────────────
 
-test('ingress.entityGate defaults: on, DRY RUN, five siblings', () => {
+test('ingress.entityGate defaults: on, DRY RUN — and the read size is not configuration', () => {
 	applyOptions({});
-	assert.deepEqual(config.ingress.entityGate, { enabled: true, dryRun: true, siblingLimit: 5 });
-	applyOptions({ ingress: { entityGate: { siblingLimit: 0 } } });
-	assert.equal(config.ingress.entityGate.siblingLimit, 5, 'below the floor keeps the default');
+	assert.deepEqual(config.ingress.entityGate, { enabled: true, dryRun: true });
 });
