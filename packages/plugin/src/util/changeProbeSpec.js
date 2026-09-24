@@ -235,6 +235,10 @@ const compileRule = (raw, index, warn) => {
 		pageCheck,
 	};
 	rule.fingerprint = ruleFingerprint(rule);
+	rule.prefixFingerprints = prefixFingerprints(rule);
+	// The status-signal literals as a Set, once per compile: `signatureUnderPrefix` consults it for every
+	// extended row of a pass, and a rule is compiled once per config.
+	rule.statusSignalSignatures = new Set(statusSignals.map((signal) => signal.signature));
 	return rule;
 };
 
@@ -252,7 +256,8 @@ const compileRule = (raw, index, warn) => {
  * edit. The only safe way to change a rule was a full dry-run cycle first. With the fingerprint,
  * a mismatch re-baselines that URL — observation stored, nothing compared, nothing triggered,
  * and it does not count toward the canary's verdict — so a rule edit costs one pass of blindness
- * for the edited rule and nothing else.
+ * for the edited rule and nothing else. APPENDING extract paths costs not even that: see
+ * `prefixFingerprints`.
  *
  * WHAT IS IN IT, AND WHAT IS NOT. Everything that shapes the observed value: source, URL
  * template, method, headers (a cookie or header can route to a different backend), body,
@@ -277,6 +282,78 @@ export const ruleFingerprint = (rule) => {
 				}
 			: { source: 'document', headers, signals: rule.statusSignals };
 	return fnv1a32(JSON.stringify(observed)).toString(16).padStart(8, '0');
+};
+
+/**
+ * The fingerprint this rule WOULD have had with its extract list cut to its first k paths, for
+ * every 1 <= k < extract.length, mapped to k. A baseline stored under one of them was taken before
+ * the rest of the paths were APPENDED, and is still comparable on the slots it has.
+ *
+ * WHY THIS EXISTS. A full re-baseline is the right answer to a real rule change, and the wrong one
+ * to the commonest edit there is: adding a field. Appending one path (a per-variant availability
+ * projection, say) left every existing slot observed exactly as before, yet the fingerprint moved,
+ * so every matched URL spent a pass re-baselining with nothing compared. In anchored mode that pass
+ * is the nightly one scheduled right after the origin's daily change, so a whole night of changes
+ * on the fields the rule ALREADY watched went undetected until each page's cadence render. With
+ * this map the sweep compares those slots (`signatureUnderPrefix`) and upgrades the baseline in the
+ * same write.
+ *
+ * Built with `ruleFingerprint` itself over the sliced list, so a fingerprint stored by the shorter
+ * rule — today, in production — matches with no migration. Everything else in the fingerprint must
+ * be identical for a prefix to match: an edit that ALSO changes the endpoint, a header, the body or
+ * a status signal is a different observation and still re-baselines. Removing, reordering or
+ * rewording an existing path matches no prefix either. Document mode has no extract list, so its
+ * map is empty.
+ */
+export const prefixFingerprints = (rule) => {
+	const prefixes = new Map();
+	if (rule.source !== 'request' || !Array.isArray(rule.extract)) return prefixes;
+	for (let k = 1; k < rule.extract.length; k++) {
+		prefixes.set(ruleFingerprint({ ...rule, extract: rule.extract.slice(0, k) }), k);
+	}
+	return prefixes;
+};
+
+// A signature's slots, or null for anything that is not a JSON array (a status-signal literal).
+const slotsOf = (signature) => {
+	try {
+		const values = JSON.parse(signature);
+		return Array.isArray(values) ? values : null;
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * The observation as the rule's first `k` extract paths would have signed it — the string to
+ * compare with a baseline taken before the rest were appended — or null when either side does not
+ * have the shape those rules write, and the caller must re-baseline as for any rule change.
+ *
+ * BYTE FOR BYTE what `signatureOf` built for the shorter rule. Each path is extracted on its own, so
+ * this observation's first k values ARE the shorter rule's values for the same response, and
+ * `observed` is `signatureOf`'s JSON of them: parse, slice and stringify reproduces the shorter
+ * rule's string exactly (JSON.stringify is stable through a JSON.parse of its own output), so equal
+ * values compare equal. What it deliberately does NOT do is apply the all-null rule to the prefix.
+ * The observation as a whole was valid; old slots gone null beside a new one that is not is a value
+ * change, and the longer rule reports it as one against its own baseline too.
+ *
+ * A status-signal LITERAL has no slots and passes through whole, so it compares as it always has:
+ * the same literal is unchanged, and a literal against values (either way round) is a change.
+ *
+ * THE SHAPE CHECK is what stands between this and the failure fingerprints exist to prevent —
+ * every row of an upgrade reading as a change. The shorter rule only ever stored one of its
+ * literals (status signals are in the fingerprint, so they are this rule's too) or exactly `k`
+ * values; a baseline that is neither matched its prefix by hash collision or was never written by
+ * that rule, and is not comparable. The observation is held to its own shape the same way.
+ */
+export const signatureUnderPrefix = (rule, k, storedSignature, observed) => {
+	// Precomputed by compileRule; built here only for a hand-assembled rule (tests).
+	const literals = rule.statusSignalSignatures ?? new Set((rule.statusSignals ?? []).map((signal) => signal.signature));
+	if (!literals.has(storedSignature) && slotsOf(storedSignature)?.length !== k) return null;
+	if (literals.has(observed)) return observed;
+	const values = slotsOf(observed);
+	if (!values || values.length !== rule.extract?.length) return null;
+	return JSON.stringify(values.slice(0, k));
 };
 
 /**
