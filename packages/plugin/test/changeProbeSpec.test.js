@@ -28,6 +28,8 @@ import {
 	apiClaimOf,
 	claimsDisagree,
 	ruleFingerprint,
+	prefixFingerprints,
+	signatureUnderPrefix,
 	availabilityToken,
 } from '../src/util/changeProbeSpec.js';
 
@@ -609,6 +611,155 @@ test('ruleFingerprint changes with what is observed and with nothing else', () =
 	assert.equal(fp({ pathPattern: '^/p/' }), fp({ pathPattern: '^/other/', label: 'z' }));
 	// Direct call agrees with the compiled value.
 	assert.equal(ruleFingerprint(compileProbeRules([base])[0]), fp(base));
+});
+
+test('ruleFingerprint output is PINNED — fingerprints stored in production must keep matching', () => {
+	// Every baseline in ProbeState carries the fingerprint of the rule that took it, and the
+	// append-only upgrade matches those stored strings against prefixes rebuilt with this same
+	// function. Any change to what ruleFingerprint hashes or how it serializes silently turns the
+	// next deploy into a full re-baseline of every matched URL (and every prefix match into a miss).
+	// These values were computed before the prefix feature existed; they must never move.
+	const rule = {
+		pathPattern: '^/p/(\\d+)',
+		source: 'request',
+		request: {
+			urlTemplate: 'https://x/$1',
+			method: 'GET',
+			headers: { Accept: 'application/json', Referer: 'https://x/' },
+		},
+		statusSignals: [{ status: 400, contains: 'GONE', signature: 'gone' }],
+	};
+	const fp = (extract) => compileProbeRules([{ ...rule, extract }])[0].fingerprint;
+	assert.equal(fp(['a']), '6bee9b27');
+	assert.equal(fp(['a', 'b']), 'b35871c5');
+	assert.equal(fp(['a', 'b', 'c']), '735f199e');
+	assert.equal(compileProbeRules([{ pathPattern: '^/p/' }])[0].fingerprint, '2f3989b4');
+});
+
+/** A three-path rule, and the same rule after appending a fourth path. */
+const SHORT_RULE = {
+	pathPattern: '^/product/prd-([^/]+)',
+	source: 'request',
+	request: {
+		urlTemplate: 'https://api.example.com/price/$1',
+		method: 'POST',
+		headers: { Accept: 'application/json' },
+		body: '{}',
+	},
+	extract: ['p.regular', 'p.sale', 'p.price'],
+	statusSignals: [{ status: 404, contains: 'GONE', signature: 'unavailable' }],
+};
+const LONG_RULE = { ...SHORT_RULE, extract: [...SHORT_RULE.extract, 'p.variants[*].availability'] };
+const compiled = (raw) => compileProbeRules([raw])[0];
+
+test('prefixFingerprints: an APPENDED rule recognises the fingerprint of every shorter prefix', () => {
+	const long = compiled(LONG_RULE);
+	// Exactly the fingerprints the shorter rules stored — made by ruleFingerprint, not a lookalike.
+	assert.equal(long.prefixFingerprints.get(compiled(SHORT_RULE).fingerprint), 3);
+	assert.equal(
+		long.prefixFingerprints.get(compiled({ ...SHORT_RULE, extract: ['p.regular', 'p.sale'] }).fingerprint),
+		2
+	);
+	assert.equal(long.prefixFingerprints.get(compiled({ ...SHORT_RULE, extract: ['p.regular'] }).fingerprint), 1);
+	assert.equal(long.prefixFingerprints.size, 3, 'k = 1..n-1 — never the full list');
+	assert.equal(long.prefixFingerprints.has(long.fingerprint), false);
+	// Bookkeeping that is not in the fingerprint is not in the prefixes either.
+	const relabeled = compiled({
+		...LONG_RULE,
+		label: 'other',
+		pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
+	});
+	assert.deepEqual([...relabeled.prefixFingerprints], [...long.prefixFingerprints]);
+	// The direct call agrees with what compileRule stored.
+	assert.deepEqual([...prefixFingerprints(long)], [...long.prefixFingerprints]);
+	// A one-path rule has no prefix; document mode has no extract list at all.
+	assert.equal(compiled({ ...SHORT_RULE, extract: ['p.price'] }).prefixFingerprints.size, 0);
+	assert.equal(compiled({ pathPattern: '^/p/' }).prefixFingerprints.size, 0);
+});
+
+test('prefixFingerprints: anything but a clean append matches NO prefix — a real edit still re-baselines', () => {
+	const shortFp = compiled(SHORT_RULE).fingerprint;
+	const matches = (raw) => compiled(raw).prefixFingerprints.has(shortFp);
+	assert.equal(matches(LONG_RULE), true, 'control: the clean append matches');
+	// Removal, reordering, and editing an existing path.
+	assert.equal(matches({ ...SHORT_RULE, extract: ['p.regular', 'p.sale'] }), false, 'removal');
+	assert.equal(matches({ ...SHORT_RULE, extract: ['p.sale', 'p.regular', 'p.price', 'p.x'] }), false, 'reorder');
+	assert.equal(matches({ ...SHORT_RULE, extract: ['p.regular', 'p.sale', 'p.list', 'p.x'] }), false, 'edit');
+	// Prepending or inserting shifts the old slots — not an append.
+	assert.equal(matches({ ...SHORT_RULE, extract: ['p.x', ...SHORT_RULE.extract] }), false, 'prepend');
+	assert.equal(matches({ ...SHORT_RULE, extract: ['p.regular', 'p.x', 'p.sale', 'p.price'] }), false, 'insert');
+	// An append made together with ANY other change to the observation.
+	const withLong = (request) => ({ ...LONG_RULE, request: { ...LONG_RULE.request, ...request } });
+	assert.equal(matches(withLong({ urlTemplate: 'https://api.example.com/v2/$1' })), false, 'endpoint');
+	assert.equal(matches(withLong({ method: 'GET', body: null })), false, 'method/body');
+	assert.equal(matches(withLong({ body: '{"a":1}' })), false, 'body');
+	assert.equal(matches(withLong({ headers: { Accept: 'application/json', Cookie: 'c=1' } })), false, 'header');
+	assert.equal(matches({ ...LONG_RULE, statusSignals: [] }), false, 'status signals');
+	assert.equal(matches({ ...LONG_RULE, source: 'document', extract: undefined }), false, 'source');
+});
+
+// What probeOnce produces for a rule and a response — the stored and observed strings in production.
+const signed = (json, raw) => signatureOf(extractValues(json, raw.extract));
+
+test('signatureUnderPrefix reproduces the SHORTER rule’s signature byte for byte', () => {
+	const long = compiled(LONG_RULE);
+	// Values that stress the round trip: floats, a string with escapes and non-ASCII, a nested
+	// object, a missing field (null), and a projected array.
+	const response = {
+		p: {
+			regular: 39.99,
+			sale: { amount: 35.5, label: 'Save "10%" — now\n', tags: ['a', null] },
+			price: undefined,
+			variants: [{ availability: 'In Stock' }, { availability: 'Out of Stock' }],
+		},
+	};
+	const stored = signed(response, SHORT_RULE);
+	const observed = signed(response, LONG_RULE);
+	assert.notEqual(observed, stored, 'control: the longer observation is a different string');
+	assert.equal(signatureUnderPrefix(long, 3, stored, observed), stored);
+	// A different value in an old slot reads as different; a different value only in the new slot does not.
+	const repriced = signed({ p: { ...response.p, regular: 29.99 } }, LONG_RULE);
+	assert.notEqual(signatureUnderPrefix(long, 3, stored, repriced), stored);
+	const newSlotOnly = signed({ p: { ...response.p, variants: [{ availability: 'Sold Out' }] } }, LONG_RULE);
+	assert.equal(signatureUnderPrefix(long, 3, stored, newSlotOnly), stored);
+});
+
+test('signatureUnderPrefix: an all-null PREFIX is a value list, not a failed probe', () => {
+	// The shorter rule would have read this response as a failure (all-null); the longer rule reads
+	// a valid observation whose old slots went null — a change against the stored values.
+	const long = compiled(LONG_RULE);
+	const stored = signed({ p: { regular: 1, sale: 2, price: 3 } }, SHORT_RULE);
+	const observed = signed({ p: { variants: [{ availability: 'In Stock' }] } }, LONG_RULE);
+	assert.notEqual(observed, null, 'control: the longer rule accepts the observation');
+	assert.equal(signatureOf(extractValues({ p: {} }, SHORT_RULE.extract)), null, 'control: the shorter rule would not');
+	assert.equal(signatureUnderPrefix(long, 3, stored, observed), '[null,null,null]');
+});
+
+test('signatureUnderPrefix: status-signal literals compare whole, exactly as today', () => {
+	const long = compiled(LONG_RULE);
+	const stored = signed({ p: { regular: 1, sale: 2, price: 3 } }, SHORT_RULE);
+	const observed = signed({ p: { regular: 1, sale: 2, price: 3, variants: [] } }, LONG_RULE);
+	// Literal observed: passes through whole — equal to a stored literal, unequal to stored values.
+	assert.equal(signatureUnderPrefix(long, 3, 'unavailable', 'unavailable'), 'unavailable');
+	assert.equal(signatureUnderPrefix(long, 3, stored, 'unavailable'), 'unavailable');
+	// Stored literal, values observed: the prefix of the values, which can never equal the literal.
+	assert.equal(signatureUnderPrefix(long, 3, 'unavailable', observed), '[1,2,3]');
+});
+
+test('signatureUnderPrefix refuses a baseline the shorter rule could not have written', () => {
+	// The guard against a prefix match by hash collision (or a foreign row) reading as a change for
+	// every row: the shorter rule stores one of its literals or exactly k values, nothing else.
+	const long = compiled(LONG_RULE);
+	const observed = signed({ p: { regular: 1, sale: 2, price: 3, variants: [] } }, LONG_RULE);
+	assert.equal(signatureUnderPrefix(long, 3, '[1,2]', observed), null, 'wrong slot count');
+	assert.equal(signatureUnderPrefix(long, 3, '[1,2,3,4]', observed), null, 'wrong slot count');
+	assert.equal(signatureUnderPrefix(long, 3, 'gone', observed), null, 'a literal this rule does not declare');
+	assert.equal(signatureUnderPrefix(long, 3, '{"a":1}', observed), null, 'not an array');
+	// And an observation that is neither a literal nor this rule's n values.
+	assert.equal(signatureUnderPrefix(long, 3, '[1,2,3]', '[1,2,3]'), null, 'observation with the wrong slot count');
+	assert.equal(signatureUnderPrefix(long, 3, '[1,2,3]', 'garbage'), null, 'an undeclared literal observation');
+	// Control: the same stored value with the right shape is comparable.
+	assert.equal(signatureUnderPrefix(long, 3, '[1,2,3]', observed), '[1,2,3]');
 });
 
 test('claimsDisagree survives a corrupted stored claim instead of ending the sweep', async () => {
