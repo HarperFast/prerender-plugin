@@ -113,6 +113,36 @@ before(async () => {
 					)
 				);
 			}
+			// A server-rendered slot filled by ONE API call that answers late — past the renderer's 5 s
+			// in-flight age bound — and the same shape on a page that shrinks its resource-timing buffer
+			// to 1 first, so the call can only be seen by an observer, never in getEntriesByType().
+			case '/slow-slot':
+			case '/slow-slot-full-buffer': {
+				const shrink = path === '/slow-slot-full-buffer';
+				const wait = shrink ? 300 : 8000;
+				return res.end(
+					page(
+						'<div id="slot"></div>',
+						`<script>
+							${shrink ? "performance.setResourceTimingBufferSize(1); for (let i = 0; i < 5; i++) fetch('/quick?i=' + i);" : ''}
+							fetch('/slow-api?ms=${wait}').then((r) => r.json()).then(() => {
+								document.getElementById('slot').innerHTML = '<div class="rail"><span class="slide">1</span></div>';
+							});
+						</script>`
+					)
+				);
+			}
+			case '/slow-api': {
+				const ms = Number(new URL(req.url ?? '', 'http://x').searchParams.get('ms') ?? 0);
+				setTimeout(() => {
+					res.setHeader('content-type', 'application/json');
+					res.end('{"ok":true}');
+				}, ms);
+				return;
+			}
+			case '/quick':
+				res.setHeader('content-type', 'application/json');
+				return res.end('{}');
 			// Containers that are all filled, and a page with none at all.
 			case '/rails':
 				return res.end(page('<div class="rail"><span class="slide">1</span></div>'));
@@ -375,6 +405,57 @@ test('an anyOf branch can be satisfied by what an element SAYS, and not by the e
 	assert.ok((vacuous.job.readiness?.firstSatisfiedMs ?? Infinity) < 400, 'the selector-only branch released early');
 });
 
+test('a contract that names the call its content waits on holds past the in-flight age bound', async () => {
+	// The call answers at 8 s. Without naming it, the age bound reads it as hung at 5 s, the rot valve
+	// stands the rail clause aside, and the fallback settle serializes an empty slot.
+	const rails = { name: 'rails', every: '.rail', contains: '.slide' };
+	const unnamed = await render('/slow-slot', { name: 'unnamed', require: [rails], timeoutMs: 15000 });
+	assert.doesNotMatch(unnamed.html ?? '', /class="slide"/, 'without the named call, the slot is stored empty');
+	assert.equal(unnamed.job.readiness?.stopped, false);
+
+	// Named, the render holds while the call is open, then stops on the content it filled.
+	const named = await render('/slow-slot', {
+		name: 'named',
+		require: [rails, { name: 'rail-data', responded: '/slow-api' }],
+		timeoutMs: 15000,
+	});
+	assert.match(named.html ?? '', /class="slide"/, 'the late content is in the snapshot');
+	assert.equal(named.job.readiness?.satisfied, true);
+	assert.equal(named.job.readiness?.stopped, true, 'and the contract, not a timer, ended the render');
+	assert.ok((named.job.readiness?.firstSatisfiedMs ?? 0) >= 7000, 'not before the call answered');
+});
+
+test('a named call is counted even when the page has filled its resource-timing buffer', async () => {
+	const result = await render('/slow-slot-full-buffer', {
+		name: 'full-buffer',
+		require: [
+			{ name: 'rails', every: '.rail', contains: '.slide' },
+			{ name: 'rail-data', responded: '/slow-api' },
+		],
+		timeoutMs: 5000,
+	});
+	assert.equal(result.job.readiness?.satisfied, true);
+	assert.equal(result.job.readiness?.stopped, true);
+	assert.equal(result.job.readiness?.require.find((r) => r.name === 'rail-data')?.count, 1);
+});
+
+test('a named call the page never makes does not hold the render past the rot valve', async () => {
+	const result = await render('/late', {
+		name: 'never-called',
+		require: [
+			{ name: 'items', selector: '.item', minCount: 2 },
+			{ name: 'never', responded: '/no-such-call' },
+		],
+		timeoutMs: 10000,
+	});
+	assert.equal(result.job.readiness?.satisfied, false);
+	assert.deepEqual(
+		result.job.readiness?.require.filter((r) => !r.ok).map((r) => r.name),
+		['never']
+	);
+	assert.ok((result.job.readiness?.waitedMs ?? Infinity) < 5000, 'released by the valve, not the 10 s timeout');
+});
+
 test('"every container is filled" is not satisfied by having no containers', async () => {
 	const none = await render('/no-rails', {
 		name: 'rails',
@@ -631,6 +712,16 @@ test('a contract with an unusable number or pattern is rejected at config load',
 	assert.throws(() => mergeConfig(branches([{ minCount: 1 }]) as never), /anyOf branch without a selector/);
 	assert.throws(() => mergeConfig(branches([{ selector: 'p', minCount: -1 }]) as never), /anyOf minCount/);
 	assert.throws(() => mergeConfig(branches([]) as never), /empty anyOf/);
+
+	// A `responded` pattern is compiled at load, and is a form of its own.
+	const responded = (clause: Record<string, unknown>) => ({
+		readiness: { onSatisfied: 'quiet', contracts: [{ name: 'c', require: [{ name: 'x', ...clause }] }] },
+	});
+	assert.throws(() => mergeConfig(responded({ responded: '([' }) as never), /invalid responded pattern/);
+	assert.throws(() => mergeConfig(responded({ responded: 5 }) as never), /invalid responded pattern/);
+	assert.throws(() => mergeConfig(responded({ responded: '' }) as never), /invalid responded pattern/);
+	assert.throws(() => mergeConfig(responded({ responded: '/api', selector: 'p' }) as never), /exactly one of/);
+	assert.doesNotThrow(() => mergeConfig(responded({ responded: '/api/rails', minCount: 1 }) as never));
 	assert.doesNotThrow(() =>
 		mergeConfig(branches([{ selector: 'p' }, { selector: 'h3', textMatches: 'none' }]) as never)
 	);

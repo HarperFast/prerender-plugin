@@ -51,6 +51,8 @@
  * written in.
  */
 
+import type { ResponseLog } from './responseLog.js';
+
 /** One thing a complete render of this page type contains. */
 export type ReadinessAssertion = { onlyIf?: ReadinessGuard } & (
 	| {
@@ -142,6 +144,29 @@ export type ReadinessAssertion = { onlyIf?: ReadinessGuard } & (
 			selector: string;
 			textMatches?: string;
 			nonEmptyText: true;
+	  }
+	| {
+			name: string;
+			/**
+			 * Satisfied once at least `minCount` (default 1) resources whose URL matches this RegExp
+			 * source have FINISHED loading — the body has arrived, not merely been requested.
+			 *
+			 * For content filled by one API call into a server-rendered slot. Measured on a live commerce
+			 * template: recommendation rails are empty slots in the document, filled from a single
+			 * first-party call. Nothing in the DOM distinguishes "not filled yet" from "will stay empty",
+			 * and every heuristic that guesses has a failure: the rot valve read a slow call as hung once
+			 * it passed the in-flight age bound and released the render, and a fixed timeout either
+			 * clips the slow tail or charges every render for it. Naming the call ends the guess — the
+			 * contract holds until the response is in, the quiet window sees what it rendered, and the
+			 * render stops then.
+			 *
+			 * A request matching a `responded` clause of the governing contract never ages out of the
+			 * in-flight check, so neither the stop nor the rot valve can release the render while it is
+			 * open; the contract `timeoutMs` is what bounds it. Guard the clause (`onlyIf`) on the slot the
+			 * call fills, so a page without one does not wait for a call it will never make.
+			 */
+			responded: string;
+			minCount?: number;
 	  }
 );
 
@@ -494,6 +519,13 @@ export function evaluateContract(payload: {
 			}
 			if (declared < (guard.atLeast ?? 1)) return { name: assertion.name, ok: true, count: 0, skipped: true };
 		}
+		if (typeof a.responded === 'string') {
+			// Read from the document-start response log (see responseLog.ts). Absent log -> -1 -> "not
+			// yet": a render that cannot see the network must not believe the call has answered.
+			const log: ResponseLog | undefined = window.__prerenderResponses;
+			const n = log ? log.count(a.responded as string) : -1;
+			return { name: assertion.name, ok: n >= ((a.minCount as number) ?? 1), count: Math.max(n, 0) };
+		}
 		if (typeof a.absent === 'string') {
 			const n = countAll(a.absent);
 			return { name: assertion.name, ok: n === 0, count: Math.max(n, 0) };
@@ -608,6 +640,19 @@ const checkMs = (label: string, value: unknown, { positive = false } = {}): void
 	}
 };
 
+/**
+ * The `responded` patterns a contract names, across `require` and `observe` — what the response log
+ * must count, and which in-flight requests must never age out while this contract governs.
+ */
+export function respondedPatterns(contract: ReadinessContract): string[] {
+	const out = new Set<string>();
+	for (const a of [...contract.require, ...(contract.observe ?? [])]) {
+		const pattern = (a as { responded?: unknown }).responded;
+		if (typeof pattern === 'string') out.add(pattern);
+	}
+	return [...out];
+}
+
 /** Validate contracts at config load, so a broken one cannot first surface inside a render. */
 export function validateReadiness(readiness: unknown): void {
 	if (readiness === undefined) return;
@@ -704,6 +749,19 @@ export function validateReadiness(readiness: unknown): void {
 					}
 				}
 			}
+			if (a.responded !== undefined) {
+				let valid = typeof a.responded === 'string' && a.responded !== '';
+				if (valid) {
+					try {
+						new RegExp(a.responded as string);
+					} catch {
+						valid = false;
+					}
+				}
+				if (!valid) {
+					throw new Error(`prerender config: readiness assertion "${assertion.name}" has an invalid responded pattern`);
+				}
+			}
 			const forms = [
 				a.selector && !a.shed && !a.nonEmptyText,
 				a.anyOf,
@@ -711,11 +769,12 @@ export function validateReadiness(readiness: unknown): void {
 				a.shed,
 				a.every,
 				a.nonEmptyText,
+				a.responded,
 			].filter(Boolean).length;
 			if (!assertion.name || forms !== 1) {
 				throw new Error(
 					`prerender config: readiness assertion in "${contract.name}" must have a name and exactly one of ` +
-						'selector / anyOf / absent / (selector + shed) / (every + contains) / (selector + nonEmptyText)'
+						'selector / anyOf / absent / (selector + shed) / (every + contains) / (selector + nonEmptyText) / responded'
 				);
 			}
 		}
