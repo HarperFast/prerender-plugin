@@ -434,9 +434,11 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# endpoint, method, headers, body, extract paths, status signals. A baseline is only comparable
 	# to an observation made the same way, so a probe whose rule fingerprint differs from the stored
 	# one re-baselines the row instead of reading the new signature shape as a content change —
-	# which is what a rule edit used to look like, for 100% of matched URLs at once. Null on rows
-	# written before this column existed; those are compared as usual and stamped on their next
-	# quiet probe. Written by the probe only, in the same put/patch as `signature`.
+	# which is what a rule edit used to look like, for 100% of matched URLs at once. A fingerprint
+	# the rule would have had with only its first k extract paths (paths were APPENDED since) is
+	# still compared on those k slots and upgraded in place — no re-baseline. Null on rows written
+	# before this column existed; those are compared as usual and stamped on their next quiet
+	# probe. Written by the probe only, in the same put/patch as `signature`.
 	ruleFingerprint: String
 }
 

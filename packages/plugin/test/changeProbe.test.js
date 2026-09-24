@@ -1718,3 +1718,289 @@ test('with no verify/isArmed wired, the pass behaves exactly as before', async (
 	});
 	assert.equal(stats.unchanged, 1);
 });
+
+// ---- appending extract paths (append-only rule edits) -------------------------------------------
+
+/**
+ * A rule edit that only APPENDS extract paths keeps detecting on the slots the stored baseline has,
+ * instead of re-baselining every matched URL blind for a pass. Stored and observed strings are
+ * built with the real extraction (`signatureOf(extractValues(...))`), so these tests exercise the
+ * exact strings the old rule stored and the new rule observes, not hand-written lookalikes.
+ */
+const APPEND_OLD = {
+	label: 'pdp',
+	pathPattern: '^/product/prd-([^/]+)',
+	source: 'request',
+	request: { urlTemplate: 'https://api.example.com/price/$1', method: 'POST', body: '{}' },
+	extract: ['regular', 'sale', 'price'],
+	statusSignals: [{ status: 404, contains: 'GONE', signature: 'unavailable' }],
+};
+const APPEND_NEW = { ...APPEND_OLD, extract: [...APPEND_OLD.extract, 'variants[*].availability'] };
+
+const signedBy = async (raw, json) => {
+	const { signatureOf, extractValues } = await import('../src/util/changeProbeSpec.js');
+	return signatureOf(extractValues(json, raw.extract));
+};
+const OFFER = { regular: 39.99, sale: 35.99, price: 35.99, variants: [{ availability: 'In Stock' }] };
+
+const runAppendPass = async ({ rulesRaw = [APPEND_NEW], rows, answers, stored = {}, ...overrides }) => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const rules = compileProbeRules(rulesRaw);
+	const written = [];
+	const triggered = [];
+	const write = async (url, signature, options = {}) => written.push({ url, signature, ...options });
+	const triggers = createInlineTrigger({ trigger: async (target) => triggered.push(target.url), write });
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules,
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => answers[url] ?? null,
+		read: async (url) => (stored[url] ? { probedAt: NaN, pageSignature: null, ...stored[url] } : null),
+		write,
+		submitTrigger: triggers.submit,
+		dryRun: false,
+		maxTriggers: 100,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		...overrides,
+	});
+	await triggers.drain();
+	stats.triggered = triggers.stats.triggered;
+	stats.errors = triggers.stats.errors;
+	return { stats, written, triggered, rules };
+};
+const oldFingerprint = async (raw = APPEND_OLD) =>
+	(await import('../src/util/changeProbeSpec.js')).compileProbeRules([raw])[0].fingerprint;
+const assertInvariant = (stats) =>
+	assert.equal(stats.probed, stats.seeded + stats.rebaselined + stats.unchanged + stats.changed + stats.failed);
+
+test('APPENDED path: an unchanged 3-slot baseline is COMPARED under the 4-slot rule and upgraded, not re-baselined', async () => {
+	const fingerprint = await oldFingerprint();
+	const { stats, written, triggered, rules } = await runAppendPass({
+		rows: [row(URL_A), row(URL_B)],
+		stored: {
+			[URL_A]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint },
+			[URL_B]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint },
+		},
+		answers: {
+			[URL_A]: await signedBy(APPEND_NEW, OFFER),
+			// A change in ONLY the new slot has no baseline yet, so it cannot be seen this pass.
+			[URL_B]: await signedBy(APPEND_NEW, { ...OFFER, variants: [{ availability: 'Out of Stock' }] }),
+		},
+	});
+	assert.equal(stats.extended, 2);
+	assert.equal(stats.rebaselined, 0, 'appending a path is not a rule change');
+	assert.equal(stats.unchanged, 2, 'compared rows land in the signature buckets');
+	assert.deepEqual(triggered, []);
+	// ONE upgrade patch per row: the FULL new observation under the CURRENT fingerprint, so the next
+	// pass compares all four slots.
+	assert.deepEqual(
+		written.map(({ url, signature, rowExists, fingerprint: fp }) => ({ url, signature, rowExists, fp })),
+		[
+			{ url: URL_A, signature: await signedBy(APPEND_NEW, OFFER), rowExists: true, fp: rules[0].fingerprint },
+			{
+				url: URL_B,
+				signature: await signedBy(APPEND_NEW, { ...OFFER, variants: [{ availability: 'Out of Stock' }] }),
+				rowExists: true,
+				fp: rules[0].fingerprint,
+			},
+		]
+	);
+	assertInvariant(stats);
+});
+
+test('APPENDED path: a change in an OLD slot triggers, and the full observation is stored after the trigger', async () => {
+	const fingerprint = await oldFingerprint();
+	const repriced = { ...OFFER, price: 29.99 };
+	const { stats, written, triggered, rules } = await runAppendPass({
+		rows: [row(URL_A)],
+		stored: { [URL_A]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint } },
+		answers: { [URL_A]: await signedBy(APPEND_NEW, repriced) },
+	});
+	assert.equal(stats.extended, 1);
+	assert.equal(stats.changed, 1);
+	assert.equal(stats.rebaselined, 0);
+	assert.deepEqual(triggered, [URL_A]);
+	assert.equal(written.length, 1);
+	assert.equal(written[0].signature, await signedBy(APPEND_NEW, repriced));
+	assert.equal(written[0].fingerprint, rules[0].fingerprint);
+	assert.equal(written[0].clearClaim, true, 'the normal acted-trip write');
+	assertInvariant(stats);
+});
+
+test('APPENDED path: a deferred change writes nothing and is compared the same way on the next pass', async () => {
+	const fingerprint = await oldFingerprint();
+	const stored = { signature: await signedBy(APPEND_OLD, OFFER), fingerprint };
+	const answer = await signedBy(APPEND_NEW, { ...OFFER, sale: 30 });
+	const first = await runAppendPass({
+		rows: [row(URL_A)],
+		stored: { [URL_A]: stored },
+		answers: { [URL_A]: answer },
+		maxTriggers: 0,
+	});
+	assert.equal(first.stats.deferred, 1);
+	assert.deepEqual(first.written, [], 'budget spent: baseline AND fingerprint left stale');
+	const second = await runAppendPass({ rows: [row(URL_A)], stored: { [URL_A]: stored }, answers: { [URL_A]: answer } });
+	assert.equal(second.stats.extended, 1);
+	assert.deepEqual(second.triggered, [URL_A], 'the retry still sees the change');
+});
+
+test('APPENDED path: dry run compares and upgrades, triggers nothing', async () => {
+	const fingerprint = await oldFingerprint();
+	const { stats, written, triggered, rules } = await runAppendPass({
+		rows: [row(URL_A)],
+		stored: { [URL_A]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint } },
+		answers: { [URL_A]: await signedBy(APPEND_NEW, { ...OFFER, regular: 49.99 }) },
+		dryRun: true,
+	});
+	assert.equal(stats.changed, 1);
+	assert.equal(stats.extended, 1);
+	assert.deepEqual(triggered, []);
+	assert.deepEqual(
+		written.map((w) => [w.signature, w.fingerprint]),
+		[[await signedBy(APPEND_NEW, { ...OFFER, regular: 49.99 }), rules[0].fingerprint]]
+	);
+});
+
+test('APPENDED path: the pageCheck overlay still applies — a disagreeing page triggers on an unchanged row', async () => {
+	// pageCheck indices point into `extract`, and appending does not shift them. Here the check even
+	// reads the NEW slot (per-variant availability), and the page claims out of stock.
+	const withPageCheck = { ...APPEND_NEW, pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 } };
+	const fingerprint = await oldFingerprint(); // pageCheck is not in the fingerprint
+	const { stats, triggered } = await runAppendPass({
+		rulesRaw: [withPageCheck],
+		rows: [row(URL_A)],
+		stored: {
+			[URL_A]: {
+				signature: await signedBy(APPEND_OLD, OFFER),
+				fingerprint,
+				pageSignature: JSON.stringify([['35.99'], false]),
+			},
+		},
+		answers: { [URL_A]: await signedBy(APPEND_NEW, OFFER) },
+	});
+	assert.equal(stats.extended, 1);
+	assert.equal(stats.unchanged, 1, 'the old slots did not change');
+	assert.equal(stats.pageMismatch, 1);
+	assert.deepEqual(triggered, [URL_A]);
+});
+
+test('APPENDED path: an unchanged row whose page AGREES is verified while an invalidation is armed', async () => {
+	const withPageCheck = {
+		...APPEND_NEW,
+		pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
+		invalidateScope: 'route:prefix:/p/',
+	};
+	const verified = [];
+	const { stats, written } = await runAppendPass({
+		rulesRaw: [withPageCheck],
+		rows: [row(URL_A)],
+		stored: {
+			[URL_A]: {
+				signature: await signedBy(APPEND_OLD, OFFER),
+				fingerprint: await oldFingerprint(),
+				pageSignature: JSON.stringify([['35.99'], true]),
+				pageClaimAt: CLAIM_AT,
+			},
+		},
+		answers: { [URL_A]: await signedBy(APPEND_NEW, OFFER) },
+		verify: async (url, basisAt) => verified.push({ url, basisAt }),
+		isArmed: async () => true,
+	});
+	assert.equal(stats.extended, 1);
+	assert.deepEqual(verified, [{ url: URL_A, basisAt: CLAIM_AT }]);
+	assert.equal(written.length, 1, 'the upgrade patch is due as well — neither stands in for the other');
+});
+
+test('APPENDED path: the canary counts upgraded rows as COMPARED, so a mass change during an upgrade still trips', async () => {
+	const fingerprint = await oldFingerprint();
+	const urls = Array.from({ length: 10 }, (_, i) => `https://example.com/product/prd-${i}/`);
+	const stored = {};
+	const answers = {};
+	for (const [i, url] of urls.entries()) {
+		stored[url] = { signature: await signedBy(APPEND_OLD, OFFER), fingerprint };
+		// 4 of 10 repriced in the old slots — a promotional step, in the middle of a rule edit.
+		answers[url] = await signedBy(APPEND_NEW, i < 4 ? { ...OFFER, price: 19.99 } : OFFER);
+	}
+	const { stats } = await runAppendPass({ rows: urls.map((url) => row(url)), stored, answers, dryRun: true });
+	assert.equal(stats.extended, 10);
+	const verdict = changeProbe.canaryVerdict(stats, { threshold: 0.3, minSample: 10 });
+	assert.deepEqual(verdict, { tripped: true, compared: 10, fraction: 0.4 });
+});
+
+test('a NON-append edit still re-baselines: reorder, removal, a changed path, or an append plus a header', async () => {
+	const edits = {
+		reorder: { ...APPEND_OLD, extract: ['sale', 'regular', 'price', 'variants[*].availability'] },
+		removal: { ...APPEND_OLD, extract: ['regular', 'sale'] },
+		changedPath: { ...APPEND_OLD, extract: ['regular', 'sale', 'listPrice', 'variants[*].availability'] },
+		appendPlusHeader: { ...APPEND_NEW, request: { ...APPEND_NEW.request, headers: { accept: 'application/json' } } },
+		appendPlusSignal: { ...APPEND_NEW, statusSignals: [] },
+	};
+	const fingerprint = await oldFingerprint();
+	for (const [name, raw] of Object.entries(edits)) {
+		const { stats, triggered } = await runAppendPass({
+			rulesRaw: [raw],
+			rows: [row(URL_A)],
+			stored: { [URL_A]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint } },
+			// A value change that WOULD trigger if the rows were (wrongly) compared.
+			answers: { [URL_A]: await signedBy(raw, { ...OFFER, regular: 1, sale: 1, price: 1 }) },
+		});
+		assert.equal(stats.rebaselined, 1, `${name}: re-baselined`);
+		assert.equal(stats.extended, 0, `${name}: not treated as an append`);
+		assert.deepEqual(triggered, [], `${name}: nothing triggered`);
+	}
+});
+
+test('APPENDED path: status-signal literals compare exactly as they always have', async () => {
+	const fingerprint = await oldFingerprint();
+	const { stats, triggered } = await runAppendPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: {
+			[URL_A]: { signature: 'unavailable', fingerprint }, // still sold out
+			[URL_B]: { signature: 'unavailable', fingerprint }, // restocked
+			[URL_C]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint }, // sold out
+		},
+		answers: {
+			[URL_A]: 'unavailable',
+			[URL_B]: await signedBy(APPEND_NEW, OFFER),
+			[URL_C]: 'unavailable',
+		},
+	});
+	assert.equal(stats.extended, 3);
+	assert.equal(stats.unchanged, 1, 'the same literal is unchanged');
+	assert.equal(stats.changed, 2, 'literal against values is a change, either way round');
+	assert.deepEqual(triggered.sort(), [URL_B, URL_C].sort());
+});
+
+test('APPENDED path: old slots gone all-null beside a valid new slot is a CHANGE, not a failed probe', async () => {
+	const fingerprint = await oldFingerprint();
+	const observed = await signedBy(APPEND_NEW, { variants: [{ availability: 'In Stock' }] });
+	assert.equal(await signedBy(APPEND_OLD, { variants: [{ availability: 'In Stock' }] }), null, 'control');
+	const { stats, triggered } = await runAppendPass({
+		rows: [row(URL_A)],
+		stored: { [URL_A]: { signature: await signedBy(APPEND_OLD, OFFER), fingerprint } },
+		answers: { [URL_A]: observed },
+	});
+	assert.equal(stats.failed, 0);
+	assert.equal(stats.extended, 1);
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(triggered, [URL_A]);
+});
+
+test('APPENDED path: a baseline without the shape the shorter rule writes re-baselines instead', async () => {
+	// A stored fingerprint that matches a prefix but a signature the 3-path rule could never have
+	// written (hash collision, a foreign row) must not be compared — comparing it would read as a
+	// change on every such row.
+	const fingerprint = await oldFingerprint();
+	const { stats, triggered } = await runAppendPass({
+		rows: [row(URL_A)],
+		stored: { [URL_A]: { signature: '[1,2]', fingerprint } },
+		answers: { [URL_A]: await signedBy(APPEND_NEW, OFFER) },
+	});
+	assert.equal(stats.rebaselined, 1);
+	assert.equal(stats.extended, 0);
+	assert.deepEqual(triggered, []);
+});

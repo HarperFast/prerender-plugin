@@ -943,8 +943,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'matched URL is RE-BASELINED on its next probe — new observation stored, nothing compared, ' +
 					'nothing triggered, not counted by the canary — instead of the new signature shape reading as ' +
 					'100% of the corpus changing at once. A rule edit therefore costs one pass without detection ' +
-					'for that rule and needs no dry-run cycle. Label, pathPattern, invalidateScope and pageCheck ' +
-					'are not part of the fingerprint: they change what is matched or done, not what is observed.\n' +
+					'for that rule and needs no dry-run cycle. APPENDING paths to the end of `extract` is the ' +
+					'exception and costs no blind pass: a baseline taken before the append is still compared on ' +
+					'the slots it has — changes trigger, pageCheck applies, the canary counts it — and the same ' +
+					'write upgrades it to the full observation (counted as `extended` in the pass record). The ' +
+					'appended path has no baseline until that write, so a change in it alone is detected from ' +
+					'the following pass. Removing, reordering or editing an existing path, or appending while ' +
+					'changing anything else above, is a full re-baseline. Label, pathPattern, invalidateScope ' +
+					'and pageCheck are not part of the fingerprint: they change what is matched or done, not ' +
+					'what is observed.\n' +
 					'  statusSignals    optional [{ status, signature, contains? }] — statuses this endpoint uses ' +
 					'to SAY something rather than to fail, mapped to a fixed signature. An endpoint that answers ' +
 					'a legitimate state with an error status (most usefully "no longer available" as a 4xx with ' +

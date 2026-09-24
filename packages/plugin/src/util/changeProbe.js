@@ -70,6 +70,7 @@ import {
 	extractJsonLdOffers,
 	isSameProbeOrigin,
 	signatureOf,
+	signatureUnderPrefix,
 	statusSignalFor,
 	apiClaimOf,
 	claimsDisagree,
@@ -139,6 +140,7 @@ const newStats = () => ({
 	probed: 0, // probes attempted = seeded + rebaselined + unchanged + changed + failed
 	seeded: 0, // first observation stored, nothing compared
 	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
+	extended: 0, // baseline was taken before extract paths were APPENDED: compared on the slots it has, baseline upgraded — OVERLAYS unchanged/changed like pageMismatch, never a bucket of its own
 	unchanged: 0,
 	changed: 0,
 	queued: 0, // changes handed to the trigger queue (accepted, not necessarily settled yet)
@@ -606,10 +608,11 @@ export const runProbePass = async ({
 		// RULE CHANGED, NOT CONTENT. A baseline is only comparable to an observation made the same
 		// way (changeProbeSpec.js ruleFingerprint). A stored fingerprint that is not this rule's
 		// means the rule was edited since the baseline was taken: store the new observation, compare
-		// nothing, trigger nothing, and keep the row out of the canary's verdict — a config edit must
-		// never read as a mass change. Before this, every rule edit produced a differently-shaped
-		// signature for 100% of matched URLs at once, and the only safe way to make one was a full
-		// dry-run cycle. Rows from before fingerprints existed carry none and are compared as usual:
+		// nothing, trigger nothing (unless the edit only APPENDED extract paths — see below), and
+		// keep the row out of the canary's verdict — a config edit must never read as a mass change.
+		// Before this, every rule edit produced a differently-shaped signature for 100% of matched
+		// URLs at once, and the only safe way to make one was a full dry-run cycle. Rows from before
+		// fingerprints existed carry none and are compared as usual:
 		// the rule that wrote them is the rule in force (a deploy that changed the rule would have
 		// reseeded them the old way), and they are stamped on their next quiet probe below, so the
 		// NEXT rule edit costs nothing either.
@@ -618,10 +621,31 @@ export const runProbePass = async ({
 			stored.fingerprint !== null &&
 			stored.fingerprint !== undefined &&
 			stored.fingerprint !== rule.fingerprint;
+		// What the stored signature is compared against: the observation itself, except for a
+		// baseline taken before paths were appended (below).
+		let comparable = observed;
+		let extended = false;
 		if (ruleChanged) {
-			stats.rebaselined++;
-			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
-			return;
+			// APPENDED, NOT EDITED. A stored fingerprint that is the one this rule would have had with
+			// only its first k extract paths means the edit since was appending the rest: slots 0..k-1
+			// are observed exactly as they were, so the baseline is still comparable on them. Compare
+			// those slots with the normal semantics — changed triggers, pageCheck overlays, the canary
+			// counts the row as compared. Whichever write the outcome takes (the quiet stamp, the
+			// dry-run write, the trigger's) stores the FULL observation and this fingerprint, so the
+			// row is upgraded; a deferred change writes nothing and is compared the same way next pass.
+			// Without this, adding one field cost a full pass of blindness on every field the rule
+			// already watched. Anything that is not a clean append (or a baseline without the shape
+			// the shorter rule writes) re-baselines as before.
+			const k = rule.prefixFingerprints?.get(stored.fingerprint);
+			const prefix = k === undefined ? null : signatureUnderPrefix(rule, k, stored.signature, observed);
+			if (prefix === null) {
+				stats.rebaselined++;
+				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+				return;
+			}
+			comparable = prefix;
+			extended = true;
+			stats.extended++;
 		}
 
 		// ROUND-TRIP BLINDNESS. Everything below compares the origin to the origin, so a value
@@ -647,7 +671,7 @@ export const runProbePass = async ({
 			if (pageDisagrees) stats.pageMismatch++;
 		}
 
-		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
+		const signatureChanged = Boolean(stored?.signature) && stored.signature !== comparable;
 		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
 		// `probed = seeded + rebaselined + unchanged + changed + failed` is the documented invariant, and the
 		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
@@ -663,10 +687,12 @@ export const runProbePass = async ({
 				await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
 				return;
 			}
-			// One-time stamp of a pre-fingerprint row (see the rule-changed block above): one patch
-			// per legacy row, after which a converged corpus is back to paying no write per probe.
+			// One-time stamp of a pre-fingerprint row (see the rule-changed block above), or one-time
+			// upgrade of a baseline taken before paths were appended — the full observation replaces
+			// the shorter signature, so the next pass compares every slot. One patch per such row,
+			// after which a converged corpus is back to paying no write per probe.
 			// Not an alternative to the verification below — both are due, neither stands in for the other.
-			if (stored.fingerprint === null || stored.fingerprint === undefined) {
+			if (extended || stored.fingerprint === null || stored.fingerprint === undefined) {
 				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
 			}
 			if (verificationArmed && stored.pageSignature) {
