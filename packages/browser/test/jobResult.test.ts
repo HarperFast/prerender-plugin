@@ -343,3 +343,56 @@ test('a variant whose result cannot be built is posted as an error — the rest 
 	assert.equal(metadataSize + mobile.contentLength, body.byteLength);
 	assert.equal(gunzipSync(body.subarray(metadataSize)).toString(), '<html>mobile</html>');
 });
+
+// `pageFacts` rides every path `structuredOffers` rides, with the same absent-vs-null contract: ABSENT
+// means "this renderer predates the feature" (the consumer alarms on it), null means "the extraction
+// ran and failed benignly". Collapsing null into absent would make every such page impersonate an
+// outdated renderer.
+const FACTS = {
+	canonical: 'https://site.example.com/product/x',
+	title: 'Thing',
+	metaDescription: null,
+	h1: 'Thing',
+	product: { name: 'Thing', brand: null, image: null, rating: [4.5, 10], offers: [['S1', '9.99', 'USD', 'InStock']] },
+	breadcrumbs: ['Home', 'Things'],
+};
+
+test('pageFacts travels on the legacy envelope; null is posted as null and undefined stays absent', async () => {
+	const rendered = (facts: unknown) => {
+		const job = makeJob();
+		job.attemptStarted();
+		job.httpResponse = { statusCode: 200, headers: {} };
+		job.isIndexable = true;
+		job.pageFacts = facts as never;
+		job.attemptEnded(undefined, '<html>ok</html>');
+		return job;
+	};
+	const withFacts = (await send(rendered(FACTS))) as Record<string, unknown>;
+	assert.deepEqual(withFacts.pageFacts, FACTS);
+
+	const failed = (await send(rendered(null))) as Record<string, unknown>;
+	assert.equal('pageFacts' in failed, true, 'null must reach the wire, not be dropped');
+	assert.equal(failed.pageFacts, null);
+
+	const never = (await send(rendered(undefined))) as Record<string, unknown>;
+	assert.equal('pageFacts' in never, false, 'no extraction ran — nothing is claimed');
+});
+
+test('pageFacts travels on every variant of a multi-device result, and on a variant whose result could not be built', async () => {
+	const job = makeUrlJob(['desktop', 'mobile']);
+	const variants = job.variants();
+	for (const v of variants) {
+		v.httpResponse = { statusCode: 200, headers: {} };
+		v.isIndexable = true;
+		v.pageFacts = { ...FACTS, h1: `Thing (${v.deviceType})` } as never;
+		v.attemptStarted();
+		v.attemptEnded(undefined, `<html>${v.deviceType}</html>`);
+	}
+	variants[1].resultMetadata = () => Promise.reject(new RangeError('Array buffer allocation failed'));
+
+	const { meta } = await sendVariants(job, variants);
+	const [desktop, mobile] = meta.variants as unknown as Array<{ reason?: string; pageFacts: typeof FACTS }>;
+	assert.deepEqual(desktop.pageFacts, { ...FACTS, h1: 'Thing (desktop)' });
+	assert.equal(mobile.reason, 'result-build-failed');
+	assert.deepEqual(mobile.pageFacts, { ...FACTS, h1: 'Thing (mobile)' }, 'carried even when the body was not');
+});

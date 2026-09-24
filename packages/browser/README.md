@@ -109,7 +109,21 @@ keep a URL's variants aligned: same render pass, seconds apart, one scheduling d
 			"headers": {},
 			"renderTime": 8123,
 			"isIndexable": true,
-			"structuredOffers": null,
+			"structuredOffers": ["29.99", "USD", "InStock"], // [price, currency, availability] triples, sorted
+			"pageFacts": {
+				"canonical": "https://site.example.com/product/x",
+				"title": "Thing | Example Store",
+				"metaDescription": "A thing, in blue.",
+				"h1": "Thing",
+				"product": {
+					"name": "Thing",
+					"brand": "Example Brand",
+					"image": "https://site.example.com/img/x.jpg",
+					"rating": [4.6, 212], // [ratingValue, ratingCount ?? reviewCount]
+					"offers": [["SKU-1", "29.99", "USD", "InStock"]], // [sku, price, currency, availability], document order
+				},
+				"breadcrumbs": ["Home", "Things"],
+			},
 			"contentLength": 41210,
 		},
 		{
@@ -122,6 +136,38 @@ keep a URL's variants aligned: same render pass, seconds apart, one scheduling d
 	],
 }
 ```
+
+**What the page claims** (`structuredOffers`, `pageFacts`). A variant that produced content also
+carries facts the renderer read off the settled DOM (before `postProcess`), so the consumer can compare
+the cached page's own claims against its sources of truth without parsing HTML on its write path. Both
+fields share one wire contract: **absent** means the renderer predates the field (a consumer may alarm on
+it); **`null`** means the extraction ran and found nothing to claim or failed benignly — it is posted as
+`null`, never omitted, and an extraction failure never fails the render. The extraction runs only on
+the path that produces content, so a variant without content (a redirect, a verdict, an error) may carry
+neither — absence is meaningful only on a variant that carries content.
+
+- `structuredOffers` — what the consumer's change probe compares today: every schema.org `Product` offer
+  on the page as flat `[price, currency, availability]` triples, sorted; `null` when there are none or
+  more than 200.
+- `pageFacts` — `canonical` (`.href` of the first `<link rel="canonical">`, absolute), `title`
+  (`document.title`, trimmed), `metaDescription` (first `<meta name="description">`, verbatim), `h1`
+  (first `<h1>`'s text, whitespace collapsed), `product` and `breadcrumbs`. `product` is the first JSON-LD
+  node typed `Product` or `ProductGroup` (top-level arrays and `@graph` are searched; a block that does not
+  parse is skipped without costing the others): `name`, `brand` (`brand.name` or a string brand), `image`
+  (a string, the first of an array, or an ImageObject's `url`), `rating` (`[ratingValue, ratingCount ??
+reviewCount]` as numbers, `null` when neither is numeric) and `offers` — `[sku, price, currency,
+availability]` per offer, in **document order** (keyed by sku, never sorted), an `AggregateOffer`
+  contributing its `offers` list, availability reduced to its last path segment (`InStock`) exactly as in
+  `structuredOffers`. `breadcrumbs` is the names of the first `BreadcrumbList`, ordered by `position`
+  (`item.name`, else the element's own `name`; unnamed crumbs are skipped). Any fact the page does not
+  state, or states empty, is `null`.
+
+**Bounds are refusals, not truncations.** A truncated value would disagree with the consumer's source
+forever and re-render the page on every comparison, so a value past its bound becomes no claim at all:
+a `pageFacts` string over 2,048 characters is `null`; more than 200 offers makes `product.offers` `null`;
+more than 30 breadcrumbs, or one breadcrumb name over 2,048 characters, makes `breadcrumbs` `null`; an
+offer field over 64 characters is `null` (that field only). (`structuredOffers` predates this rule: it
+refuses past 200 offers but still slices an over-long field to 64 characters.)
 
 **Document reuse** (`config.documentReuse`, off by default). On a responsive site the origin answers
 every device with the same document, so the second and later variants of a job can be navigated from
@@ -785,7 +831,8 @@ compared across devices: the question is not whether desktop and mobile agree (t
 whether each is still the page it would have been.
 
 It reports, per device, whether the page's own `structuredOffers` are identical, whether the outcome,
-status and indexability agree, and the structural divergence of the snapshot. **Read the offers
+status and indexability agree, and the structural divergence of the snapshot (plus, informationally and
+outside the verdict, which `pageFacts` differ). **Read the offers
 first** — where a site routes its API calls by a cookie the document sets, a replayed variant runs
 without it, its pricing call is answered by a different backend, and the offers come back wrong while
 everything else still looks healthy. A non-zero divergence ratio is not automatically a failure (live
