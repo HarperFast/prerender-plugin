@@ -40,7 +40,7 @@ import { describeSecret } from './util/redact.js';
 // evaluation time. The count has to come from the compiler rather than from raw config,
 // because the finding's whole job is to catch entries the compiler REJECTED (a typo'd
 // `match`), which the raw array still contains.
-import { prerenderRouteCount } from './util/routeClass.js';
+import { DepartureAction, prerenderRouteCount } from './util/routeClass.js';
 // NOT cyclic, on purpose: changeProbeSpec.js is the probe's pure half and imports nothing of the
 // runtime, precisely so this module can compile prospective rules inside collectConfigWarnings.
 import { inspectProbeRules } from './util/changeProbeSpec.js';
@@ -782,6 +782,34 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				'change probe is in DRY RUN — probes run and change rates are measured (probe_* metrics), but ' +
 					'nothing is re-rendered and nothing is invalidated until dryRun is turned off'
 			);
+		}
+		// `scope: listed` stops probing a product once it has been out of its sitemap for `unlistedGrace`,
+		// on the premise that the departure check already re-rendered it on the way out. Without an armed
+		// departure nothing does, and the page keeps whatever it said when it left. Read off the RAW route
+		// list, not the compiled one: this may be checking a prospective config (see `prerenderRoutes`).
+		if (target.changeProbe.scope === 'listed') {
+			const { departure } = target.sitemap;
+			const routes = Array.isArray(target.ingress.routes) ? target.ingress.routes : [];
+			const routeDeparts = routes.some(
+				(route) =>
+					route &&
+					route.mode !== 'passthrough' &&
+					(route.departureAction === DepartureAction.RENDER || route.departureAction === DepartureAction.EXPIRE)
+			);
+			if (!departure.enabled || departure.dryRun || !routeDeparts) {
+				add(
+					'warn',
+					'changeProbe.scope',
+					"changeProbe.scope is 'listed' but sitemap departure is not armed (" +
+						(!routeDeparts
+							? 'no prerender route sets departureAction'
+							: !departure.enabled
+								? 'sitemap.departure.enabled is false'
+								: 'sitemap.departure.dryRun is true') +
+						') — a product that leaves its sitemap stops being probed after changeProbe.unlistedGrace and ' +
+						'nothing re-renders it on the way out, so its page keeps its last snapshot until its cadence render'
+				);
+			}
 		}
 		// The canary's bulk action needs the invalidation read path on; the mismatch would otherwise
 		// surface only at trip time, which is 4am during the exact event the operator configured for.

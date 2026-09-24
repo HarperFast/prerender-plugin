@@ -60,6 +60,7 @@ import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
+import { probeScopeFilter } from './probeScope.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
 import { isPassRunning, publishProbeState, readProbeState } from './probeState.js';
@@ -93,9 +94,10 @@ const probeStateTable = () => databases.probe_state.ProbeState;
 const YIELD_EVERY = 200;
 
 // What every probe read of the registry projects — what matching and the trigger need
-// (writeSchedule wants fromSitemap + the cadence). The stored signature is NOT here: it lives
-// in the node-local ProbeState table (see schema.graphql), read per probed URL.
-const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state'];
+// (writeSchedule wants fromSitemap + the cadence), plus `unlistedAt` for `changeProbe.scope`
+// (util/probeScope.js). The stored signature is NOT here: it lives in the node-local ProbeState
+// table (see schema.graphql), read per probed URL.
+const TARGET_SELECT = ['url', 'sitemapUrl', 'renderInterval', 'demandInterval', 'state', 'unlistedAt'];
 
 // Compile + memoize the rule list, keyed on config identity — applyOptions rebuilds config from
 // defaults on every change, so a fresh array means a reload (the routeClass memo pattern).
@@ -143,7 +145,8 @@ export const cohortCollector = (count) => {
 const newStats = () => ({
 	examined: 0, // rows scanned
 	owned: 0, // rows this node owns
-	matched: 0, // owned rows a rule matched (suppressed excluded)
+	matched: 0, // owned rows a rule matched (suppressed and out-of-scope excluded)
+	outOfScope: 0, // rule-matched rows `changeProbe.scope` left unprobed — the origin requests it saved; 0 under 'all'
 	probed: 0, // probes attempted = seeded + rebaselined + unchanged + changed + failed
 	seeded: 0, // first observation stored, nothing compared
 	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
@@ -730,6 +733,9 @@ export const runProbePass = async ({
 	now = Date.now,
 	isCanceled = () => false,
 	collectCohort = null,
+	// `changeProbe.scope` as a row predicate (util/probeScope.js), or null for 'all' — null never calls
+	// anything per row, which is what keeps the default pass's counters exactly the pre-option ones.
+	inScope = null,
 	ownershipChecked = false,
 	onYield = () => yieldNow(),
 	reprobeAfter = 0,
@@ -1154,6 +1160,13 @@ export const runProbePass = async ({
 			}
 		}
 		if (!rule) continue;
+		// AFTER the rule match, so `outOfScope` counts only rows that would otherwise have cost a probe,
+		// and BEFORE `matched`, so the canary cohort and the continuous-mode slice size (both built from
+		// matched rows) describe what is actually probed.
+		if (inScope && !inScope(row)) {
+			stats.outOfScope++;
+			continue;
+		}
 		stats.matched++;
 		collectCohort?.(rule, row.url);
 		batch.push({ row, rule });
@@ -1220,6 +1233,16 @@ const emitStats = (stats, kind) => {
 
 const logPass = (stats, kind, dryRun) => {
 	const line = { kind, dryRun, ...stats };
+	// A scope that keeps less than it skips is either a site whose corpus really is mostly unlisted (and
+	// then `scope: listed` is the wrong setting for it) or sitemaps that stopped listing what they used
+	// to. Neither should be discovered from the origin-request savings looking good.
+	if (stats.outOfScope > stats.matched) {
+		logger.warn(
+			`[prerender] change-probe ${kind}: changeProbe.scope left ${stats.outOfScope} rule-matched targets ` +
+				`unprobed and probed only ${stats.matched} — most of the watched corpus is not in any sitemap. ` +
+				`Check the sitemap walks (sitemap_removed, the departure tally) before trusting this scope.`
+		);
+	}
 	// >50% failures is the replatform signature: the endpoint or markup this rule was written
 	// against has probably changed shape, and every failed probe is a page silently back on
 	// interval-only freshness.
@@ -1451,6 +1474,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			// A pending reseed cancels too: the pass that must stand down for it is this one.
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
+			inScope: probeScopeFilter(config.changeProbe),
 		});
 		// A cancelled pass abandons what is still queued: those rows never had their baseline
 		// written, so the next pass re-detects them. Otherwise wait the queue out — the pass is not
@@ -1537,10 +1561,13 @@ const ensureCohorts = async () => {
 	const rules = probeRules();
 	const count = Math.max(1, config.changeProbe.canary.count | 0);
 	const next = new Map(rules.map((rule) => [rule.label, []]));
+	// The sweep's selection, so a bootstrap cohort samples what the sweep probes.
+	const inScope = probeScopeFilter(config.changeProbe);
 	for await (const row of walkTargets(config.changeProbe.chunkSize, () => countProbe('unreadable'))) {
 		if (!config.changeProbe.enabled) break;
 		if (getResidencyByUrl(row.url) !== server.hostname) continue;
 		if (row.state === 'suppressed' || !isCanaryCandidate(row.url)) continue;
+		if (inScope && !inScope(row)) continue;
 		const match = rules.find((rule) => buildProbeRequest(rule, row.url));
 		if (!match) continue;
 		const cohort = next.get(match.label);
@@ -1683,6 +1710,9 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				// the mass-change detector between sweeps, which is the one thing it exists for.
 				reprobeAfter: 0,
 				isCanceled: () => !config.changeProbe.enabled,
+				// Re-checked per pass, not only when the cohort was built: a member whose grace ran out
+				// since then is skipped (and counted) exactly as the sweep would skip it.
+				inScope: probeScopeFilter(config.changeProbe),
 			});
 			await canaryTriggers.drain();
 			stats.triggered = canaryTriggers.stats.triggered;

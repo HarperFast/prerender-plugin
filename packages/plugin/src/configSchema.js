@@ -105,6 +105,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Ordered route list (forwarded mode). Each entry is ' +
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
+					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
 					'rawCache?: boolean }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
@@ -159,6 +160,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'sitemap says something about that product, while a listing URL leaving a paginated sitemap ' +
 					'usually means the catalog was re-bucketed, and acting on it would expire current pages. ' +
 					'Bounded and observable by `sitemap.departure`.\n\n' +
+					"`arrivalAction` (default 'none', prerender routes only) — the other half: what happens when a " +
+					'URL on this route REJOINS a sitemap after an earlier walk unlinked it. On the same retail ' +
+					'catalog a product comes back to the sitemap the day it is restocked, and its cached page — ' +
+					'last rendered while it was unavailable — keeps serving out-of-stock markup until its next ' +
+					'cadence render.\n' +
+					'  none    — re-attribute and nothing else, as before.\n' +
+					'  render  — hard-expire the cached pages and file the URL to render at the current minute: ' +
+					'the departure `render` action, through the same code.\n' +
+					'A rejoin is told from a paginated sitemap\u2019s boundary shear (a URL moving to a later child ' +
+					'is unlinked and re-attached inside ONE walk) by `Target.unlistedAt`, which the unlinking walk ' +
+					'stamps with its own start — only a stamp from an earlier walk counts. Targets unlinked before ' +
+					'v0.89.0 carry no stamp, so their rejoin is not seen. Bounded and observable by ' +
+					'`sitemap.arrival`.\n\n' +
 					'`discoverTargets` (default true, prerender routes only) — whether a bot visiting an UNKNOWN ' +
 					'URL on this route creates a target for it. Set false on routes whose URL space is ' +
 					'combinatorial (faceted navigation, filter/sort permutations): crawlers walking those links ' +
@@ -1132,6 +1146,40 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Probe requests in flight at once per node. Bounds burstiness within the rate cap — the pacing ' +
 					'holds the sustained rate to ratePerSecond whatever origin latency does.',
 				{ min: 1 }
+			),
+			scope: option(
+				'all',
+				'Which targets the sweep and the canary probe.\n\n' +
+					'"all" (default) probes every owned, rule-matched target, however it entered the registry.\n\n' +
+					'"listed" probes a target only while a sitemap lists it (`sitemapUrl` set) or for ' +
+					'`unlistedGrace` after a walk unlinked it (`Target.unlistedAt`). Targets no sitemap has listed ' +
+					'(discovered from traffic), targets unlinked longer ago than the grace, and targets unlinked ' +
+					'before v0.89.0 (which carry no stamp) are skipped and counted as `outOfScope` in the pass ' +
+					'stats — the origin requests saved per pass. The canary cohort is built from, and re-checked ' +
+					'against, the same selection. Suppressed targets are skipped under either scope, as always.\n\n' +
+					'ONLY SAFE WHERE THE SITEMAP IS THE AVAILABILITY FEED AND DEPARTURE IS ARMED. On a catalog ' +
+					'whose product sitemap drops an item the day it sells out, the departure check ' +
+					"(`ingress.routes[].departureAction: 'render'` with `sitemap.departure.dryRun: false`) already " +
+					'expires and re-renders that page, so probing the unlisted long tail buys little. Anywhere else ' +
+					'this simply stops watching those pages: an unlisted page whose price or availability changes ' +
+					'keeps its snapshot until its cadence render. A config warning names the case where no route ' +
+					'has departure armed, and a pass that skips more rule-matched targets than it probes logs a ' +
+					'warning (most of the watched corpus not being in any sitemap is either a site this setting is ' +
+					'wrong for, or sitemaps that stopped listing what they used to).\n\n' +
+					'A FAILED sitemap walk cannot shrink the scope — it unlinks nothing. A child sitemap that parses ' +
+					'but is truncated can, once it has stayed truncated for longer than the grace. Switching to ' +
+					'"listed" in continuous or anchored mode paces its first cycle against the old, larger slice, ' +
+					'so that cycle finishes early; the next one paces to the real slice.',
+				{ enum: ['all', 'listed'] }
+			),
+			unlistedGrace: option(
+				2 * DAY,
+				'SCOPE "listed" ONLY: how long after a sitemap walk unlinks a target it is still probed. A URL ' +
+					'briefly missing from one walk (a truncated child sitemap, an origin rebuilding its sitemaps) ' +
+					'keeps being watched while later walks decide whether it really left, and a real departure is ' +
+					'still probed while its re-render lands. Measured from the start of the walk that unlinked it. ' +
+					'0 probes only currently-listed targets.',
+				{ unit: 'ms', min: 0 }
 			),
 			reprobeAfter: option(
 				12 * HOUR,
@@ -2206,6 +2254,67 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'already unlinked, so no later walk offers it again. It is never decided and never appears ' +
 						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
 						'removes the ceiling and never reports `capped`; 0 collects nothing.',
+					{ min: -1 }
+				),
+			}
+		),
+		arrival: group(
+			'What a refresh does about a URL that REJOINS a sitemap — re-attributed by a walk after an ' +
+				'EARLIER walk unlinked it. The action is declared PER ROUTE (`ingress.routes[].arrivalAction`); ' +
+				'this group bounds and observes it, and nothing here does anything until at least one route ' +
+				'opts in. The mirror of `sitemap.departure`, with its own switches so arming one never arms ' +
+				'the other.\n\n' +
+				'SHEAR IS KEPT OUT BY A STAMP, NOT BY WAITING. A walk that unlinks a target stamps ' +
+				'`Target.unlistedAt` with the walk\u2019s own START, and the re-attach compares against the ' +
+				'current walk\u2019s start: a URL that moved to a later child of a paginated index is unlinked ' +
+				'and re-attached inside one walk, so its stamp is this walk\u2019s start and it is not a rejoin. ' +
+				'Rejoins are therefore known the moment they are re-attached; they are still ACTED on after the ' +
+				'walk, by the same executor as departures.\n\n' +
+				'WHAT IT DOES NOT SEE: targets unlinked before v0.89.0 (no stamp — they re-render on their ' +
+				'cadence, as before); rejoins on a `revalidate: true` walk (which files every listed URL due ' +
+				'now anyway). A URL that moves between two ROOT sitemaps looks like a departure in the first ' +
+				'root\u2019s walk and a rejoin in the second\u2019s — the departure check has the same limitation, ' +
+				'and the cost is one render per such URL, inside the ceilings.\n\n' +
+				'Reported as `arrivals` on the refresh result and the progress row (`considered`, `capped`, and ' +
+				'an outcome tally: `render`, or `would-render` under `dryRun`, for actions; `route-opted-out`, ' +
+				'`suppressed`, `unlinked`, `target-gone` and `capped` for the candidates nothing happened to) and ' +
+				'in the walk\u2019s log — not as a metric series.',
+			{
+				enabled: option(
+					true,
+					'Master switch for the arrival action. Routes still have to opt in, so leaving this on costs ' +
+						'nothing until one does; it exists so an operator can stop the behaviour during an incident ' +
+						'without editing the route list.'
+				),
+				dryRun: option(
+					true,
+					'Decide and report, write nothing. SEPARATE from `sitemap.departure.dryRun` on purpose: a ' +
+						'deployment that has already armed departures and then opts a route into arrivals must still ' +
+						'get a measured walk first, because the number that matters — how many rejoins one walk ' +
+						'produces, and in particular the burst when a truncated child sitemap recovers and every URL ' +
+						'it had dropped rejoins at once — is not one anybody has until they have looked. Inheriting ' +
+						'the departure switch would act on the very first walk.'
+				),
+				// -1 = no ceiling on both, for the reasons `sitemap.departure` spells out; read through
+				// `departureLimit`.
+				maxActions: option(
+					5000,
+					'Ceiling on rejoined URLs ACTED ON in one walk, or -1 for no ceiling. Skipped candidates do not ' +
+						'count against it.\n\n' +
+						'WHAT IT GUARDS AGAINST: the rejoin burst. A child sitemap that fetched truncated in one walk ' +
+						'unlinked everything it dropped; when it recovers, every one of those URLs rejoins in the same ' +
+						'walk, and without a ceiling that would expire and re-render all of them at once.\n\n' +
+						'OVERFLOW IS DROPPED FOR GOOD, like a capped departure: the re-attach has already cleared the ' +
+						'stamp, so no later walk sees the URL as a rejoin. It keeps its target, attribution and ' +
+						'cadence; it just never gets its route\u2019s arrival action. -1 removes the ceiling; 0 acts on ' +
+						'nothing (every candidate is still decided and reported).',
+					{ min: -1 }
+				),
+				maxCandidates: option(
+					50000,
+					'Ceiling on rejoined URLs HELD for the post-walk action, or -1 for no ceiling. Bounds memory, as ' +
+						'`sitemap.departure.maxCandidates` does. Overflow is DROPPED FOR GOOD and reported as ' +
+						'`arrivals.capped`. -1 removes the ceiling; 0 collects nothing.',
 					{ min: -1 }
 				),
 			}

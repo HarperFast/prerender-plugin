@@ -11,6 +11,7 @@ import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { conditionalValidatorFor } from '../util/sitemapConditional.js';
 import { decideDeparture, DepartureAction, departureCandidateCap, departureLimit } from '../util/sitemapDeparture.js';
+import { arrivalCandidateCap, decideArrival, isRejoin } from '../util/sitemapArrival.js';
 import { cacheKeysOf } from './Target.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { resolveEffectiveInterval } from '../util/routeClass.js';
@@ -61,6 +62,8 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			// Zero unless the departure check is on AND some route opts in; Infinity when
 			// `maxCandidates` is -1. See util/sitemapDeparture.js.
 			departureCap: departureCandidateCap(),
+			// The same for rejoins, off `sitemap.arrival`. See util/sitemapArrival.js.
+			arrivalCap: arrivalCandidateCap(),
 		});
 		const visited = new Set();
 		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
@@ -117,6 +120,15 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		} catch (e) {
 			logger.error(`[prerender] Departure check for ${rootSitemapUrl} failed: ${describeError(e)}`);
 			run.countDeparture('failed');
+		}
+
+		// Rejoins were already told from shear during the walk (`isRejoin` against `run.startedAt`), so
+		// nothing forces this after the walk except sharing the departure executor. Guarded the same way.
+		try {
+			await processArrivals(run);
+		} catch (e) {
+			logger.error(`[prerender] Arrival check for ${rootSitemapUrl} failed: ${describeError(e)}`);
+			run.countArrival('failed');
 		}
 
 		try {
@@ -372,6 +384,7 @@ const progressFields = (snapshot) => ({
 	// The departure tally rides the progress row too, so a dry run is readable from
 	// `GET /sitemap_refresh/<root>` without waiting for the walk to return.
 	departures: snapshot.departures,
+	arrivals: snapshot.arrivals,
 });
 
 /**
@@ -592,9 +605,14 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 		run.addTruncatedScan(sitemapUrl, examined, departed.length);
 	}
 
+	// `unlistedAt` rides the unlink patch — no extra write — and is THE WALK'S START, not this prune's
+	// clock: a URL this same walk re-attaches further on then carries exactly `run.startedAt`, which is
+	// how the re-attach below tells shear from a rejoin (util/sitemapArrival.js). The probe's
+	// `changeProbe.scope: listed` grace is measured from it too (util/probeScope.js).
+	const unlistedAt = new Date(run.startedAt);
 	await applyInBatches({
 		items: departed,
-		apply: (target) => Target.patch(target.url, { sitemapUrl: null }),
+		apply: (target) => Target.patch(target.url, { sitemapUrl: null, unlistedAt }),
 	});
 	run.addRemoved(departed);
 
@@ -620,15 +638,20 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 		if (++considered % config.scan.yieldEvery === 0) await setImmediate();
 
 		let action;
+		let rejoined = false;
 		if (revalidate) {
+			// No point read, so no rejoin is detected — and none needs to be: this files every listed URL
+			// due now. The `put` below replaces the row, which clears any `unlistedAt` by construction.
 			action = TargetAction.RENDER;
 		} else if (canSkipLookup({ revalidate, knownKeys, key: cacheUrl })) {
 			action = TargetAction.SKIP;
 		} else {
 			// Only reached for a URL the prune scan did not return: genuinely new, moved here
-			// from another sitemap, or missed because `knownKeys` was capped. Only `sitemapUrl`
-			// is needed, so don't materialize the whole record in a bulk loop.
-			action = actionForExisting(await Target.get({ id: cacheUrl, select: ['sitemapUrl'] }), sitemapUrl, visited);
+			// from another sitemap, or missed because `knownKeys` was capped. Only the attribution
+			// and the unlink stamp are needed, so don't materialize the whole record in a bulk loop.
+			const existing = await Target.get({ id: cacheUrl, select: ['sitemapUrl', 'unlistedAt'] });
+			action = actionForExisting(existing, sitemapUrl, visited);
+			rejoined = action === TargetAction.REATTACH && isRejoin(existing, run.startedAt);
 		}
 
 		switch (action) {
@@ -646,8 +669,13 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				// Attribution changed, the page did not. `patch` leaves the RenderSchedule rows
 				// alone; `put` would recompute `getInitialRenderTime` and shove the next render
 				// forward by a fresh jitter every pass. See util/sitemapRun.js.
+				//
+				// `unlistedAt: null` in the same patch: re-attributed is listed, whether this is a rejoin, a
+				// same-walk shear, or a move from another sitemap. Unconditional, so the stamp cannot outlive
+				// the attribution it describes.
 				run.count('updated');
-				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval }));
+				if (rejoined) run.addArrival(cacheUrl);
+				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval, unlistedAt: null }));
 				break;
 
 			case TargetAction.CREATE: {
@@ -738,6 +766,95 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
 }
 
 /**
+ * The action path both post-walk checks share: re-read each candidate, decide it, and — inside the
+ * ceiling, and outside a dry run — hard-expire its cached pages and, for `render`, file it due now.
+ *
+ * ONE executor rather than one per check, because the action is the same action: a departing product
+ * page and a rejoining one are both pages whose cached snapshot is known to disagree with what the
+ * origin now says about availability. What differs is only how a candidate is decided (`decide`), which
+ * ceiling and dry-run switch apply, and where the outcome is counted.
+ *
+ * `decide` answers `{ action, reason }` with `action` spelled as a `DepartureAction` — `ArrivalAction`
+ * reuses those strings by construction (see util/routeClass.js), which is what lets one comparison
+ * serve both.
+ */
+async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) {
+	let acted = 0;
+
+	await applyInBatches({
+		items: urls,
+		apply: async (url) => {
+			const target = await Target.get({
+				id: url,
+				// `sitemapUrl` is the shear guard (departures) and the still-listed check (arrivals),
+				// `state` keeps suppressed targets out, and the two cadence fields are what
+				// `resolveEffectiveInterval` needs to file a rung-correct row.
+				select: ['url', 'sitemapUrl', 'state', 'renderInterval', 'demandInterval'],
+			});
+
+			const { action, reason } = decide({ url, target });
+			if (action === DepartureAction.NONE) {
+				count(reason);
+				return;
+			}
+
+			// Check and increment in ONE synchronous block. `applyInBatches` runs a batch's items in
+			// parallel, so a check that awaited anything before incrementing would let a whole batch
+			// through a cap of one.
+			if (acted >= maxActions) {
+				count('capped');
+				return;
+			}
+			acted++;
+
+			if (dryRun) {
+				count(`would-${action}`);
+				return;
+			}
+
+			// HARD-expired, past the stale-while-revalidate window rather than to `now`. A plain
+			// `Date.now()` expiry leaves the page 'swr' (`util/pageFreshness.js`), i.e. still SERVING
+			// for another `page.swrTtl` — and the swr window exists to smooth over a late re-render of
+			// content presumed still right, which is exactly what a departed (or rejoined) product page
+			// is not. This matches `changeProbe.triggerRevalidate`, which backdates for the same reason;
+			// `Target.revalidate` keeps the plain expiry deliberately, because an operator asking for
+			// a re-render is not asserting the content is wrong.
+			const hardExpiredAt = Date.now() - config.page.swrTtl;
+			await Promise.all(
+				cacheKeysOf(url).map(async (cacheKey) => {
+					const page = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+					if (page) await PrerenderedPage.patch(cacheKey, { expiresAt: hardExpiredAt });
+				})
+			);
+
+			if (action === DepartureAction.RENDER) {
+				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass. Rows are
+				// residency-routed, and a minute more than `queue.claimFloor.guard` old lands below the
+				// owner's floor and is never claimed again. This is the Target.revalidate lesson.
+				await writeSchedule(url, {
+					nextRenderTime: currentMinuteMs(),
+					// Derived, never a literal. For a departure `decideDeparture` has already proved this
+					// target has no attribution, so it can only evaluate false; for an arrival
+					// `decideArrival` has proved it has one, so it can only evaluate true. The literal
+					// `false` is what `test/queueFunnel.test.js` forbids outright, and for a good reason:
+					// the derivation stays correct if either guard ever moves, where a literal would
+					// silently mis-flag a URL the day someone loosened the check above it.
+					fromSitemap: !!target.sitemapUrl,
+					effectiveInterval: resolveEffectiveInterval(url, target),
+				});
+			}
+			count(action);
+		},
+	});
+}
+
+/** An outcome tally as one log fragment: "render 3, reattached 12". */
+const summarizeOutcomes = (outcomes) =>
+	Object.entries(outcomes)
+		.map(([name, count]) => `${name} ${count}`)
+		.join(', ');
+
+/**
  * The post-walk departure check: decide, and act on, the URLs this walk unlinked.
  *
  * Runs once per walk, after every child, because a URL that shifted to a LATER child of a
@@ -760,78 +877,17 @@ export async function processDepartures(run) {
 	if (!urls.length) return;
 
 	const { dryRun } = config.sitemap.departure;
-	// Through `departureLimit`, never raw: -1 is "no ceiling", and `acted >= -1` would refuse all.
-	const maxActions = departureLimit(config.sitemap.departure.maxActions);
-	let acted = 0;
-
-	await applyInBatches({
-		items: urls,
-		apply: async (url) => {
-			const target = await Target.get({
-				id: url,
-				// `sitemapUrl` is the shear guard, `state` keeps suppressed targets out, and the two
-				// cadence fields are what `resolveEffectiveInterval` needs to file a rung-correct row.
-				select: ['url', 'sitemapUrl', 'state', 'renderInterval', 'demandInterval'],
-			});
-
-			const { action, reason } = decideDeparture({ url, target });
-			if (action === DepartureAction.NONE) {
-				run.countDeparture(reason);
-				return;
-			}
-
-			// Check and increment in ONE synchronous block. `applyInBatches` runs a batch's items in
-			// parallel, so a check that awaited anything before incrementing would let a whole batch
-			// through a cap of one.
-			if (acted >= maxActions) {
-				run.countDeparture('capped');
-				return;
-			}
-			acted++;
-
-			if (dryRun) {
-				run.countDeparture(`would-${action}`);
-				return;
-			}
-
-			// HARD-expired, past the stale-while-revalidate window rather than to `now`. A plain
-			// `Date.now()` expiry leaves the page 'swr' (`util/pageFreshness.js`), i.e. still SERVING
-			// for another `page.swrTtl` — and the swr window exists to smooth over a late re-render of
-			// content presumed still right, which is exactly what a departed product page is not.
-			// This matches `changeProbe.triggerRevalidate`, which backdates for the same reason;
-			// `Target.revalidate` keeps the plain expiry deliberately, because an operator asking for
-			// a re-render is not asserting the content is wrong.
-			const hardExpiredAt = Date.now() - config.page.swrTtl;
-			await Promise.all(
-				cacheKeysOf(url).map(async (cacheKey) => {
-					const page = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
-					if (page) await PrerenderedPage.patch(cacheKey, { expiresAt: hardExpiredAt });
-				})
-			);
-
-			if (action === DepartureAction.RENDER) {
-				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass. Rows are
-				// residency-routed, and a minute more than `queue.claimFloor.guard` old lands below the
-				// owner's floor and is never claimed again. This is the Target.revalidate lesson.
-				await writeSchedule(url, {
-					nextRenderTime: currentMinuteMs(),
-					// Derived, never a literal `false`, even though `decideDeparture` has already proved
-					// this target has no attribution and so this can only evaluate false. The literal is
-					// what `test/queueFunnel.test.js` forbids outright, and for a good reason: the
-					// derivation stays correct if this guard ever moves, where a literal would silently
-					// un-flag a sitemap-listed URL the day someone loosened the check above it.
-					fromSitemap: !!target.sitemapUrl,
-					effectiveInterval: resolveEffectiveInterval(url, target),
-				});
-			}
-			run.countDeparture(action);
-		},
+	await actOnWalkCandidates({
+		urls,
+		decide: decideDeparture,
+		dryRun,
+		// Through `departureLimit`, never raw: -1 is "no ceiling", and `acted >= -1` would refuse all.
+		maxActions: departureLimit(config.sitemap.departure.maxActions),
+		count: (outcome) => run.countDeparture(outcome),
 	});
 
 	const { considered, capped, outcomes } = run.snapshot().departures;
-	const summary = Object.entries(outcomes)
-		.map(([name, count]) => `${name} ${count}`)
-		.join(', ');
+	const summary = summarizeOutcomes(outcomes);
 	logger.info(
 		`[prerender] Departure check: ${considered} candidates` +
 			`${capped ? ' (CAPPED at maxCandidates — the departed URLs past it were never checked, and no later walk will offer them)' : ''}` +
@@ -846,6 +902,41 @@ export async function processDepartures(run) {
 	} catch (e) {
 		logger.warn(`[prerender] sitemap departure gauges not recorded: ${describeError(e)}`);
 	}
+}
+
+/**
+ * The post-walk arrival action: act on the URLs this walk found REJOINING a sitemap.
+ *
+ * Which URLs those are was settled during the walk — `isRejoin` compared each re-attached target's
+ * `unlistedAt` against this walk's start, which is what keeps same-walk shear out — so this only
+ * re-reads each one, applies `decideArrival`, and hands it to the executor departures use, under
+ * `sitemap.arrival`'s own dry-run switch and ceilings. See util/sitemapArrival.js.
+ *
+ * Reported in the run tally and the progress row (`arrivals`) and in the log, NOT as metric series:
+ * the tally carries every outcome already, and a new `sitemap_*` family is a console change (its
+ * metric-coverage guard reads these emit sites) that belongs with a panel to show it on.
+ *
+ * Exported for tests.
+ */
+export async function processArrivals(run) {
+	const urls = run.arrivalCandidates();
+	if (!urls.length) return;
+
+	const { dryRun } = config.sitemap.arrival;
+	await actOnWalkCandidates({
+		urls,
+		decide: decideArrival,
+		dryRun,
+		maxActions: departureLimit(config.sitemap.arrival.maxActions),
+		count: (outcome) => run.countArrival(outcome),
+	});
+
+	const { considered, capped, outcomes } = run.snapshot().arrivals;
+	logger.info(
+		`[prerender] Arrival check: ${considered} rejoined` +
+			`${capped ? ' (CAPPED at maxCandidates — the rejoins past it were never checked, and no later walk will offer them)' : ''}` +
+			`${dryRun ? ', DRY RUN' : ''} — ${summarizeOutcomes(outcomes) || 'nothing to do'}`
+	);
 }
 
 async function fetchLatestSitemap(url, { ifModifiedSince = null } = {}) {

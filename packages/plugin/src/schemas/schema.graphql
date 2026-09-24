@@ -121,6 +121,15 @@ type Target @table(database: "render_service") @export {
 	# never been evaluated and starts from its route/stored interval. Written ONLY when the rung
 	# actually changes, so a converged corpus pays no write — same discipline as `strikes`.
 	demandInterval: Long
+	# When a sitemap walk last UNLINKED this target (`sitemapUrl -> null`): THE START OF THAT WALK, not
+	# the moment of the prune, so a URL the same walk re-attaches further on (a paginated sitemap's
+	# boundary shear) is told from one that rejoins in a later walk by an exact comparison — see
+	# util/sitemapArrival.js. Cleared in the patch that re-attributes the target. Absent on a target no
+	# walk has unlinked since v0.89.0: one discovered from traffic, or one unlinked before the upgrade.
+	# Read by `changeProbe.scope: listed` (an unlisted target is still probed for `unlistedGrace`) and by
+	# the sitemap arrival check. Both ride writes the walk already makes. NOT @indexed: only ever read
+	# off a row already in hand.
+	unlistedAt: Date
 }
 
 # The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that

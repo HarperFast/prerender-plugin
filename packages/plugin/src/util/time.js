@@ -24,6 +24,13 @@ export const currentMinuteMs = (ts = Date.now()) => Math.floor(ts / MINUTE) * MI
 export const epochMsOf = (value) => (value || value === 0 ? new Date(value).getTime() : Number.NaN);
 
 /**
+ * `epochMsOf`, safe against a BigInt — for a `Date` column read inside a walk, where a throw ends the
+ * walk. A Date column can surface as a BigInt, and `new Date(10n)` THROWS rather than coercing (the
+ * trap `readSignature` in util/changeProbe.js defends against inline). Absent or unparseable is NaN.
+ */
+export const dateColumnMs = (value) => epochMsOf(typeof value === 'bigint' ? Number(value) : value);
+
+/**
  * A NUMERIC column as a number, or `NaN` when the column is absent — the guard every reader of
  * `nextRenderTime` (and of any other numeric column) needs before comparing it to anything.
  *
