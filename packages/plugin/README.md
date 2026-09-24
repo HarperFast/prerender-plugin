@@ -257,6 +257,59 @@ forwarding `/blog/*`"); passthrough is the coverage backlog ("we proxy this much
 on purpose"). The tally is in-process, so **every worker** flushes its own line — each carries
 `node=` and `worker=`, and a reader sums across them.
 
+### Discovery: one target per entity (`entityPrefix`)
+
+Traffic discovery mints a target for any unknown URL a bot gets a cacheable 200 for. `Target` is
+keyed by URL, so two spellings of one product are two unrelated rows — and crawlers keep asking for
+old or invented slugs of products whose correct URL is already tracked. Each one is minted, renders,
+finds its canonical pointing elsewhere, is suppressed as `canonical-mismatch`, re-renders on the
+suppression recheck until `maxStrikes` deletes it, and is minted again by the next crawler hit.
+Measured on one deployment: `canonical-mismatch` was 8.2% of all render outcomes, and 150 of 150
+sampled suppressed targets had another target for the same product id under the correct slug.
+
+A route that declares `entityPrefix` stops that at discovery:
+
+```yaml
+ingress:
+  routes:
+    - { match: prefix, path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/' }
+  entityGate:
+    dryRun: true # the default: evaluate and count, mint anyway
+```
+
+- **The prefix.** The regex is anchored at the start of the URL path; its match plus the URL's origin
+  is the entity prefix (`https://www.example.com/product/prd-123/`). Every target whose URL starts
+  with it is a **sibling**.
+- **The match must end on `/`.** `…/prd-123` is a string prefix of `…/prd-1234/…`, so a prefix that
+  stops mid-segment would let product 1234 gate product 123 forever. A match that does not end in
+  `/` is ignored for that URL (it is discovered as before, counted `no-prefix`), and a pattern whose
+  source does not end in `/` is warned about at config time.
+- **The decision.** A sibling **in rotation** (not suppressed) means the entity already has a target
+  that will render, so the URL is not minted — it is still served (a miss proxies the origin). If
+  there are no siblings, or every sibling is **suppressed**, the URL is minted. Suppressed siblings
+  never block, which is what makes a genuine slug change a bounded delay rather than a permanent
+  block: the new slug is gated until the old slug's next render suppresses it (one render cycle of
+  the old target), then minted on its next crawl. `sitemapUrl` plays no part — a sitemap that lists
+  a non-canonical URL holds a listed-but-suppressed row, and the canonical URL must still be
+  discoverable.
+- **Discovery only.** Sitemap ingestion, redirect adoption and the REST API create targets without
+  consulting the gate; the declared corpus is always created.
+- **The read.** One one-sided primary-key range over `Target` (at most
+  `ingress.entityGate.siblingLimit` rows, projecting `url` and `state`), only for a URL with no target
+  row, inside the detached discovery step — never on the response path. `Target` is not
+  residency-pinned, so the read is node-local. Any failure mints.
+
+Every URL under one prefix is the same entity, query variants the route keeps included — don't set
+`entityPrefix` on a route where several URLs per entity are distinct pages. The pattern runs against
+crawler-supplied paths, so keep it linear: a literal prefix plus `[^/]+` segments, no nested
+quantifiers.
+
+**Rollout.** Deploy with `dryRun: true` (the default), read `prerender_ops` / `entity_gate` outcome
+`would-gate` against `render` outcome `suppressed`/`canonical-mismatch`, then set `dryRun: false`.
+Existing suppressed rows are untouched: they age out through `maxStrikes` as before, and once the gate
+is armed they are not re-minted. Armed refusals are also counted on `discovery_gated` with the gate
+name `entity`.
+
 ### Sitemaps are filtered to prerender routes
 
 A sitemap is written for search engines: it lists every indexable URL on the site, which is routinely

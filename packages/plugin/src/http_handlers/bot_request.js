@@ -34,6 +34,7 @@ import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
 import { captureForRawCache, rawCachePolicy, rawKeyOf, readRawPage } from '../util/rawCache.js';
 import { rescueFromOwner } from '../util/peerRescue.js';
+import { evaluateEntityGate } from '../util/entityGate.js';
 import { deliverResource } from './response.js';
 
 export async function handleBotRequest(request) {
@@ -443,6 +444,11 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 // Target.get entirely, which matters on a gated combinatorial route where misses are most of
 // the traffic. The gates stop target CREATION only — an existing target's miss was a no-op in
 // handlePageScheduling anyway — so `discovery_gated` counts gated misses, not denied mints.
+//
+// The ENTITY gate is the exception to "the gates sit here", and necessarily so: it asks whether
+// ANOTHER URL of the same entity has a target, which is a read, and it only means anything for a URL
+// with no target of its own. So it runs inside handlePageScheduling, after the existing-row check —
+// still detached, still off the response.
 function maybeSchedule(resource, routeClass, route, botName) {
 	if (routeClass !== PRERENDER || !resource.miss || resource.statusCode !== 200) return;
 	if (route && route.discoverTargets === false) {
@@ -453,7 +459,7 @@ function maybeSchedule(resource, routeClass, route, botName) {
 		metrics.discoveryGated('bot', botName);
 		return;
 	}
-	setImmediate(handlePageScheduling, resource);
+	setImmediate(handlePageScheduling, resource, route, botName);
 }
 
 // Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
@@ -614,7 +620,8 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	};
 }
 
-async function handlePageScheduling(resource) {
+// Exported for tests, which drive the discovery mint end to end against a stubbed Target table.
+export async function handlePageScheduling(resource, route, botName) {
 	try {
 		if (isPrerenderCandidate(resource)) {
 			// resource.url is the origin-fetch URL built from the canonical half, so it is
@@ -628,6 +635,12 @@ async function handlePageScheduling(resource) {
 			// no row at all is genuinely new.
 			const existingTarget = await Target.get({ id: canonicalUrl, select: 'url' });
 			if (!existingTarget) {
+				// THE ENTITY GATE (util/entityGate.js): a URL whose product already has a target in rotation
+				// under another URL is not minted. Evaluated only here — traffic discovery — and only for a
+				// URL with no row, so a sitemap or any other creation path never meets it. Inert unless the
+				// route declares `entityPrefix`; under `ingress.entityGate.dryRun` it counts and mints anyway.
+				const { mint } = await evaluateEntityGate({ url: canonicalUrl, route, botName });
+				if (!mint) return;
 				// No explicit time → Target.put jitters the first render across the interval,
 				// so a crawl that discovers many URLs at once doesn't stampede.
 				// Deliberately NO renderInterval: cadence is resolved at schedule time

@@ -185,6 +185,18 @@ Notes that bite:
   distinguishes a real crawler from a spoofed User-Agent: bot names come from the UA string alone,
   with no reverse-DNS or IP verification, so cross-check a search engine's own reporting before
   treating a per-bot breadth figure as that engine's crawl rate.
+- **The entity discovery gate is `prerender_ops` / `entity_gate`, and it is not in the table row
+  above** (v0.90.0). One emit per evaluation, detail = outcome, context = bot: `gated` (a sibling URL
+  of the same entity is in rotation; not minted), `would-gate` (the same verdict under
+  `ingress.entityGate.dryRun`; minted anyway), `suppressed-only` (every sibling suppressed; minted),
+  `no-siblings` (a new entity; minted), `no-prefix` (the route has an `entityPrefix` and this URL
+  produced no usable match; minted), `error` (the sibling read threw; minted). The outcomes sum to the
+  mints the gate evaluated. **`would-gate` is the dry-run number** — read it against `render` outcome
+  `suppressed`/`canonical-mismatch` before arming. A route that is nearly all `no-prefix` has a
+  pattern that does not match its URLs. Armed refusals are ALSO emitted as `discovery_gated` with the
+  gate name `entity` (never in a dry run), so every view of what the gates hold out includes them;
+  unlike the `route`/`bot` gates, `entity` is evaluated only for URLs with no target row, so it counts
+  refused mints rather than gated misses on known targets.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. The scan is capped by `management.scanCap`: a backlog past the cap reports the cap.
