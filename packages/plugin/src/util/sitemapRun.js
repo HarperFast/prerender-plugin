@@ -126,7 +126,10 @@ export const createRefreshRun = ({ removedSampleCap = 20, failedCap = 100, depar
 	// paginated index is pruned before the child that now claims it is reached — so mid-walk it is
 	// indistinguishable from one that genuinely left. Bounded: this is a list of URLs held in
 	// memory across a walk that can prune millions, and `departureCap: 0` (the default) keeps it
-	// empty for every deployment that has not opted a route in.
+	// empty for every deployment that has not opted a route in. `departureCap: Infinity` is the
+	// uncapped setting (`maxCandidates: -1`, via `departureLimit`), which holds every URL the walk
+	// unlinks and never sets `capped`. A URL past a finite cap is not deferred: it is already
+	// unlinked, so no later walk will offer it again — which is why `capped` is reported at all.
 	const departure = { candidates: [], capped: false, outcomes: {} };
 
 	return {
