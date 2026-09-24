@@ -345,6 +345,270 @@ test(`an offer field longer than ${PAGE_FACT_BOUNDS.maxOfferField} characters is
 	]);
 });
 
+// ── sourcing: product-level sku, ProductGroup variants, one level of nesting ─────────────────────
+
+test('a Product with exactly ONE sku-less offer names it with the product sku; never with several offers', async () => {
+	const single = await factsOf(
+		doc(
+			ld({
+				'@type': 'Product',
+				'sku': 9001,
+				'offers': { price: 5, priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
+			})
+		)
+	);
+	assert.deepEqual(single.product?.offers, [['9001', '5', 'USD', 'InStock']], 'numeric sku stated as a string');
+
+	// Through an AggregateOffer that lists one offer, it is still one offer.
+	const aggregated = await factsOf(
+		doc(
+			ld({
+				'@type': 'Product',
+				'sku': 'P-1',
+				'offers': { '@type': 'AggregateOffer', 'offers': [{ price: 5, priceCurrency: 'USD', sku: '' }] },
+			})
+		)
+	);
+	assert.deepEqual(aggregated.product?.offers, [['P-1', '5', 'USD', null]], 'an empty offer sku is no sku');
+
+	const ownSku = await factsOf(doc(ld({ '@type': 'Product', 'sku': 'P-1', 'offers': { sku: 'O-1', price: 5 } })));
+	assert.deepEqual(ownSku.product?.offers, [['O-1', '5', null, null]], "the offer's own sku wins");
+
+	const several = await factsOf(
+		doc(ld({ '@type': 'Product', 'sku': 'P-1', 'offers': [{ price: 5 }, { sku: 'O-2', price: 6 }] }))
+	);
+	assert.deepEqual(
+		several.product?.offers,
+		[
+			[null, '5', null, null],
+			['O-2', '6', null, null],
+		],
+		'with several offers the product sku names none of them'
+	);
+
+	// A refused offer sku is a stated sku — it is not replaced by the product's.
+	const refused = await factsOf(
+		doc(
+			ld({
+				'@type': 'Product',
+				'sku': 'P-1',
+				'offers': { sku: 'x'.repeat(PAGE_FACT_BOUNDS.maxOfferField + 1), price: 5 },
+			})
+		)
+	);
+	assert.deepEqual(refused.product?.offers, [[null, '5', null, null]]);
+
+	// The inherited sku is bounded like any offer field.
+	const longProductSku = await factsOf(
+		doc(ld({ '@type': 'Product', 'sku': 'y'.repeat(PAGE_FACT_BOUNDS.maxOfferField + 1), 'offers': { price: 5 } }))
+	);
+	assert.deepEqual(longProductSku.product?.offers, [[null, '5', null, null]]);
+});
+
+const variant = (sku: string, offers: unknown, extra: Record<string, unknown> = {}) => ({
+	'@type': 'Product',
+	sku,
+	offers,
+	...extra,
+});
+
+test('a ProductGroup with no offers of its own reads its hasVariant offers; sku = offer.sku ?? variant.sku', async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@type': 'ProductGroup',
+				'name': 'Widget Family',
+				'productGroupID': 'FAM-1',
+				'hasVariant': [
+					variant(
+						'V-S',
+						{ price: 10, priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
+						{
+							name: 'Widget, small',
+							brand: { '@type': 'Brand', 'name': 'Variant Brand' },
+							image: 'https://www.example.com/img/small.jpg',
+							aggregateRating: { ratingValue: 4, ratingCount: 3 },
+						}
+					),
+					variant('V-L', [
+						{ price: 20, priceCurrency: 'USD', availability: 'https://schema.org/OutOfStock' },
+						{ sku: 'V-L-REFURB', price: 15, priceCurrency: 'USD', availability: 'https://schema.org/InStock' },
+					]),
+					'not a variant',
+				],
+			})
+		)
+	);
+	assert.deepEqual(facts.product, {
+		name: 'Widget Family', // the group's own
+		brand: 'Variant Brand', // the group lacks one: the first variant's
+		image: 'https://www.example.com/img/small.jpg',
+		rating: [4, 3],
+		offers: [
+			['V-S', '10', 'USD', 'InStock'],
+			['V-L', '20', 'USD', 'OutOfStock'],
+			['V-L-REFURB', '15', 'USD', 'InStock'],
+		],
+	});
+});
+
+test("a ProductGroup's own offers win over its variants, and its own fields over the first variant's", async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@type': 'ProductGroup',
+				'name': 'Group name',
+				'brand': 'Group Brand',
+				'image': 'https://www.example.com/img/group.jpg',
+				'aggregateRating': { ratingValue: 5, reviewCount: 1 },
+				'offers': { '@type': 'AggregateOffer', 'offers': [{ sku: 'G-1', price: 1 }] },
+				'hasVariant': [variant('V-1', { price: 2 }, { name: 'Variant name', brand: 'Variant Brand' })],
+			})
+		)
+	);
+	assert.deepEqual(facts.product, {
+		name: 'Group name',
+		brand: 'Group Brand',
+		image: 'https://www.example.com/img/group.jpg',
+		rating: [5, 1],
+		offers: [['G-1', '1', null, null]],
+	});
+});
+
+test('a ProductGroup value past its bound is refused, never swapped for the first variant’s', async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@type': 'ProductGroup',
+				'name': 'n'.repeat(PAGE_FACT_BOUNDS.maxString + 1),
+				'hasVariant': [variant('V-1', { price: 2 }, { name: 'Variant name' })],
+			})
+		)
+	);
+	assert.equal(facts.product?.name, null);
+	assert.deepEqual(facts.product?.offers, [['V-1', '2', null, null]]);
+});
+
+test(`ProductGroup variant offers share the ${PAGE_FACT_BOUNDS.maxOffers}-offer refusal; a refused group never falls through`, async () => {
+	const n = PAGE_FACT_BOUNDS.maxOffers;
+	const offers = (count: number) => Array.from({ length: count }, (_, i) => ({ price: i }));
+	// Two variants that together state one offer too many.
+	const acrossVariants = await factsOf(
+		doc(
+			ld({
+				'@type': 'ProductGroup',
+				'hasVariant': [variant('A', offers(n)), variant('B', offers(1))],
+			})
+		)
+	);
+	assert.equal(acrossVariants.product?.offers, null);
+	// The group's own offers refused: the variants must NOT stand in for them.
+	const refusedGroup = await factsOf(
+		doc(ld({ '@type': 'ProductGroup', 'offers': offers(n + 1), 'hasVariant': [variant('A', { price: 1 })] }))
+	);
+	assert.equal(refusedGroup.product?.offers, null);
+});
+
+test('a Product is found one level down: a page node’s mainEntity (object or array) or mainEntityOfPage object', async () => {
+	const viaMainEntity = await factsOf(
+		doc(
+			ld({
+				'@type': 'WebPage',
+				'mainEntity': { '@type': 'Product', 'name': 'Nested', 'offers': { sku: 'N-1', price: 3 } },
+			})
+		)
+	);
+	assert.equal(viaMainEntity.product?.name, 'Nested');
+	assert.deepEqual(viaMainEntity.product?.offers, [['N-1', '3', null, null]]);
+
+	const viaArray = await factsOf(
+		doc(
+			ld({
+				'@context': 'https://schema.org',
+				'@graph': [
+					{
+						'@type': 'ItemPage',
+						'mainEntity': [
+							{ '@type': 'Organization', 'name': 'not it' },
+							{ '@type': 'ProductGroup', 'name': 'Nested group' },
+						],
+					},
+				],
+			})
+		)
+	);
+	assert.equal(viaArray.product?.name, 'Nested group');
+
+	const viaOfPage = await factsOf(
+		doc(ld({ '@type': 'WebPage', 'mainEntityOfPage': { '@type': 'Product', 'name': 'Of page' } }))
+	);
+	assert.equal(viaOfPage.product?.name, 'Of page');
+});
+
+test("a BreadcrumbList is found as a page node's breadcrumb", async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@type': 'CollectionPage',
+				'breadcrumb': {
+					'@type': 'BreadcrumbList',
+					'itemListElement': [
+						{ position: 2, name: 'Widgets' },
+						{ position: 1, name: 'Home' },
+					],
+				},
+			})
+		)
+	);
+	assert.deepEqual(facts.breadcrumbs, ['Home', 'Widgets']);
+});
+
+test('a top-level node wins over a nested one, wherever it sits on the page', async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@type': 'WebPage',
+				'mainEntity': { '@type': 'Product', 'name': 'Nested' },
+				'breadcrumb': { '@type': 'BreadcrumbList', 'itemListElement': [{ position: 1, name: 'Nested crumb' }] },
+			}) +
+				ld({ '@type': 'Product', 'name': 'Top level' }) +
+				ld({ '@type': 'BreadcrumbList', 'itemListElement': [{ position: 1, name: 'Top crumb' }] })
+		)
+	);
+	assert.equal(facts.product?.name, 'Top level');
+	assert.deepEqual(facts.breadcrumbs, ['Top crumb']);
+});
+
+test('nesting is searched ONE level deep, and only under page nodes', async () => {
+	const facts = await factsOf(
+		doc(
+			ld({
+				'@graph': [
+					// Two levels down: not searched.
+					{
+						'@type': 'WebPage',
+						'mainEntity': { '@type': 'WebPage', 'mainEntity': { '@type': 'Product', 'name': 'Deep' } },
+					},
+					// Not a page node: its mainEntity / breadcrumb are not searched.
+					{
+						'@type': 'Organization',
+						'mainEntity': { '@type': 'Product', 'name': 'Under an organization' },
+						'breadcrumb': { '@type': 'BreadcrumbList', 'itemListElement': [{ position: 1, name: 'no' }] },
+					},
+					// A mainEntityOfPage that is a URL string, and an untyped breadcrumb: not claims.
+					{
+						'@type': 'WebPage',
+						'mainEntityOfPage': 'https://www.example.com/p',
+						'breadcrumb': { itemListElement: [{ position: 1, name: 'untyped' }] },
+					},
+				],
+			})
+		)
+	);
+	assert.equal(facts.product, null);
+	assert.equal(facts.breadcrumbs, null);
+});
+
 // ── through the real renderer ──────────────────────────────────────────────────────────────────
 
 const RENDERED = (url: string) =>

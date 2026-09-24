@@ -149,18 +149,32 @@ neither — absence is meaningful only on a variant that carries content.
 - `structuredOffers` — what the consumer's change probe compares today: every schema.org `Product` offer
   on the page as flat `[price, currency, availability]` triples, sorted; `null` when there are none or
   more than 200.
-- `pageFacts` — `canonical` (`.href` of the first `<link rel="canonical">`, absolute), `title`
-  (`document.title`, trimmed), `metaDescription` (first `<meta name="description">`, verbatim), `h1`
-  (first `<h1>`'s text, whitespace collapsed), `product` and `breadcrumbs`. `product` is the first JSON-LD
-  node typed `Product` or `ProductGroup` (top-level arrays and `@graph` are searched; a block that does not
-  parse is skipped without costing the others): `name`, `brand` (`brand.name` or a string brand), `image`
-  (a string, the first of an array, or an ImageObject's `url`), `rating` (`[ratingValue, ratingCount ??
-reviewCount]` as numbers, `null` when neither is numeric) and `offers` — `[sku, price, currency,
-availability]` per offer, in **document order** (keyed by sku, never sorted), an `AggregateOffer`
-  contributing its `offers` list, availability reduced to its last path segment (`InStock`) exactly as in
-  `structuredOffers`. `breadcrumbs` is the names of the first `BreadcrumbList`, ordered by `position`
-  (`item.name`, else the element's own `name`; unnamed crumbs are skipped). Any fact the page does not
-  state, or states empty, is `null`.
+- `pageFacts` — what the page says about itself:
+  - `canonical`: `.href` of the first `<link rel="canonical">`, absolute.
+  - `title`: `document.title`, trimmed.
+  - `metaDescription`: the first `<meta name="description">`, verbatim.
+  - `h1`: the first `<h1>`'s text, whitespace collapsed.
+  - `product`: the first JSON-LD node typed `Product` or `ProductGroup`. Top-level arrays and `@graph`
+    are searched, and a block that does not parse is skipped without costing the others. It carries
+    `name`; `brand` (`brand.name`, or a string brand); `image` (a string, the first of an array, or an
+    ImageObject's `url`); `rating`, as the numbers `[ratingValue, ratingCount ?? reviewCount]`, or
+    `null` when neither is numeric; and `offers`, one `[sku, price, currency, availability]` per offer
+    in **document order** (keyed by sku, never sorted). An `AggregateOffer` contributes its `offers`
+    list, and availability is reduced to its last path segment (`InStock`) exactly as in
+    `structuredOffers`.
+  - `breadcrumbs`: the names in the first `BreadcrumbList`, ordered by `position` (`item.name`, else
+    the element's own `name`; unnamed crumbs are skipped).
+  - Any fact the page does not state, or states empty, is `null`.
+- Where the product facts come from when the page does not put them on one top-level node:
+  - **sku on the product.** A product with exactly **one** offer that has no `sku` names it with the
+    product's own `sku`. Never with several offers — the product's SKU names none of them then.
+  - **ProductGroup variants.** A `ProductGroup` stating no offers of its own reports the offers of its
+    `hasVariant` products, each sku-less offer taking its variant's `sku`, under the same 200-offer
+    refusal (a group whose own offers are refused does not fall through to its variants). `name`, `brand`,
+    `image` and `rating` stay the group's, taken from the first variant only where the group states none.
+  - **One level of nesting.** When no top-level node matches, a page node's (`WebPage` or a subtype such as
+    `ItemPage` or `CollectionPage`) `mainEntity` / `mainEntityOfPage` object is searched for the product,
+    and its `breadcrumb` object for the trail. A top-level node always wins, and nothing deeper is read.
 
 **Bounds are refusals, not truncations.** A truncated value would disagree with the consumer's source
 forever and re-render the page on every comparison, so a value past its bound becomes no claim at all:

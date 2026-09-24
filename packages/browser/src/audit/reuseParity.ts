@@ -192,7 +192,11 @@ const sameOffers = (a: VariantSnapshot['structuredOffers'], b: VariantSnapshot['
 /** Which page facts differ between two renders (`product.*` per field) — informational, not in `pass`. */
 const differingFacts = (a: VariantSnapshot['pageFacts'], b: VariantSnapshot['pageFacts']): string[] => {
 	if (!a || !b) return JSON.stringify(a ?? null) === JSON.stringify(b ?? null) ? [] : ['pageFacts'];
-	const keys = (x: object, y: object) => [...new Set([...Object.keys(x), ...Object.keys(y)])];
+	const keys = (x: object, y: object) => {
+		const set = new Set(Object.keys(x));
+		for (const key of Object.keys(y)) set.add(key);
+		return [...set];
+	};
 	const differs = (x: unknown, y: unknown) => JSON.stringify(x ?? null) !== JSON.stringify(y ?? null);
 	const out: string[] = [];
 	for (const key of keys(a, b) as Array<keyof PageFacts>) {

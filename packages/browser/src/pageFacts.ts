@@ -23,7 +23,10 @@ export type PageFactOffer = [
 	availability: string | null,
 ];
 
-/** The first Product / ProductGroup JSON-LD node on the page. */
+/**
+ * The first Product / ProductGroup JSON-LD node on the page. For a ProductGroup, a field the group
+ * does not state is taken from its first `hasVariant`.
+ */
 export type PageFactsProduct = {
 	name: string | null;
 	/** `brand.name` when the brand is an object, else a string brand. */
@@ -32,7 +35,11 @@ export type PageFactsProduct = {
 	image: string | null;
 	/** `aggregateRating` as `[ratingValue, ratingCount ?? reviewCount]`; null when neither is numeric. */
 	rating: [value: number | null, count: number | null] | null;
-	/** The product's offers in document order (an AggregateOffer contributes its `offers` list). */
+	/**
+	 * The product's offers in document order (an AggregateOffer contributes its `offers` list). A lone
+	 * sku-less offer takes the product's `sku`; a ProductGroup with no offers of its own reports its
+	 * variants' offers, each sku-less offer taking its variant's `sku`.
+	 */
 	offers: PageFactOffer[] | null;
 };
 
@@ -78,7 +85,9 @@ export const PAGE_FACT_BOUNDS: PageFactBounds = {
  *
  * JSON-LD is searched the way `extractStructuredOffers` searches it — each
  * `<script type="application/ld+json">` in document order, reading a top-level array or an `@graph`
- * as a list of nodes — and a block that does not parse is skipped without costing the others.
+ * as a list of nodes — and a block that does not parse is skipped without costing the others. When no
+ * top-level node matches, one level under a page node (WebPage or a subtype) is searched too: its
+ * `mainEntity` / `mainEntityOfPage` for the product, its `breadcrumb` for the trail.
  */
 export function extractPageFacts(bounds: PageFactBounds): PageFacts {
 	type Json = Record<string, unknown>;
@@ -109,8 +118,33 @@ export function extractPageFacts(bounds: PageFactBounds): PageFacts {
 	const descriptionEl = document.querySelector('meta[name="description" i]');
 	const h1El = document.querySelector('h1');
 
+	// schema.org WebPage and its subtypes: the nodes whose `mainEntity` / `breadcrumb` are searched.
+	const PAGE_TYPES = [
+		'WebPage',
+		'ItemPage',
+		'CollectionPage',
+		'SearchResultsPage',
+		'ProfilePage',
+		'AboutPage',
+		'ContactPage',
+		'FAQPage',
+		'QAPage',
+		'CheckoutPage',
+		'MedicalWebPage',
+		'RealEstateListing',
+		'MediaGallery',
+		'ImageGallery',
+		'VideoGallery',
+	];
+	const PRODUCT_TYPES = ['Product', 'ProductGroup'];
+
+	// A node at the top of a block (or of its @graph) always wins; one found a single level down — a
+	// page node's `mainEntity` / `mainEntityOfPage` / `breadcrumb` — is used only when no top-level node
+	// matched. One level only: this reads what a page states about itself, it does not crawl a graph.
 	let productNode: Json | null = null;
 	let breadcrumbNode: Json | null = null;
+	let nestedProduct: Json | null = null;
+	let nestedBreadcrumb: Json | null = null;
 	const blocks = document.querySelectorAll('script[type="application/ld+json"]');
 	for (let i = 0; i < blocks.length && !(productNode && breadcrumbNode); i++) {
 		let data: unknown;
@@ -123,47 +157,106 @@ export function extractPageFacts(bounds: PageFactBounds): PageFacts {
 		const nodes = Array.isArray(data) ? data : Array.isArray(graph) ? graph : [data];
 		for (const node of nodes) {
 			if (!isObject(node)) continue;
-			if (!productNode && hasType(node, ['Product', 'ProductGroup'])) productNode = node;
+			if (!productNode && hasType(node, PRODUCT_TYPES)) productNode = node;
 			if (!breadcrumbNode && hasType(node, ['BreadcrumbList'])) breadcrumbNode = node;
+			if (!hasType(node, PAGE_TYPES)) continue;
+			if (!nestedProduct) {
+				for (const entity of listOf(node.mainEntity)) {
+					if (isObject(entity) && hasType(entity, PRODUCT_TYPES)) {
+						nestedProduct = entity;
+						break;
+					}
+				}
+			}
+			const ofPage = node.mainEntityOfPage;
+			if (!nestedProduct && isObject(ofPage) && hasType(ofPage, PRODUCT_TYPES)) nestedProduct = ofPage;
+			const crumb = node.breadcrumb;
+			if (!nestedBreadcrumb && isObject(crumb) && hasType(crumb, ['BreadcrumbList'])) nestedBreadcrumb = crumb;
 		}
 	}
+	productNode = productNode ?? nestedProduct;
+	breadcrumbNode = breadcrumbNode ?? nestedBreadcrumb;
 
 	// A JSON number is stated as its string form ("35.99", "12345"), as structuredOffers states a price.
 	const asString = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? String(value) : value);
-	const readOffers = (raw: unknown): PageFactOffer[] | null => {
-		const offers: PageFactOffer[] = [];
+	const absent = (value: unknown) => value === undefined || value === null || value === '';
+	const nonEmpty = (value: unknown) => (typeof value === 'string' && value !== '' ? value : undefined);
+
+	// The offer objects a node states, in document order — an AggregateOffer summarises
+	// (lowPrice/highPrice), so only the offers it lists are offers. null when past the bound.
+	const offersOf = (raw: unknown): Json[] | null => {
+		const found: Json[] = [];
 		for (const entry of listOf(raw)) {
-			// An AggregateOffer summarises (lowPrice/highPrice); only the offers it lists are offers.
 			const list = isObject(entry) && hasType(entry, ['AggregateOffer']) ? listOf(entry.offers) : [entry];
 			for (const offer of list) {
 				if (!isObject(offer)) continue;
-				if (offers.length >= bounds.maxOffers) return null;
-				// Reduced exactly as extractStructuredOffers reduces it: the last non-empty path segment,
-				// so a trailing slash (https://schema.org/InStock/) still yields the verdict.
-				const availability =
-					typeof offer.availability === 'string' ? (offer.availability.split('/').filter(Boolean).pop() ?? '') : null;
-				offers.push([
-					offerField(asString(offer.sku)),
-					offerField(asString(offer.price)),
-					offerField(offer.priceCurrency),
-					offerField(availability),
-				]);
+				if (found.length >= bounds.maxOffers) return null;
+				found.push(offer);
 			}
 		}
-		return offers.length ? offers : null;
+		return found;
+	};
+	const tuple = (offer: Json, sku: unknown): PageFactOffer => {
+		// Reduced exactly as extractStructuredOffers reduces it: the last non-empty path segment, so a
+		// trailing slash (https://schema.org/InStock/) still yields the verdict.
+		const availability =
+			typeof offer.availability === 'string' ? (offer.availability.split('/').filter(Boolean).pop() ?? '') : null;
+		return [
+			offerField(asString(sku)),
+			offerField(asString(offer.price)),
+			offerField(offer.priceCurrency),
+			offerField(availability),
+		];
+	};
+
+	const readOffers = (node: Json, variants: Json[]): PageFactOffer[] | null => {
+		const own = offersOf(node.offers);
+		if (own === null) return null; // refused — never fall through to the variants
+		if (own.length) {
+			// A product selling ONE offer often names the SKU on itself rather than on the offer. Only
+			// then: with several offers, the product's SKU names none of them.
+			const inherit = own.length === 1 && absent(own[0].sku);
+			return own.map((offer) => tuple(offer, inherit ? node.sku : offer.sku));
+		}
+		// A ProductGroup usually sells through its variants (`hasVariant`, each a Product with its own
+		// offers and SKU) — read those when the group itself states no offers.
+		const out: PageFactOffer[] = [];
+		for (const variant of variants) {
+			const offers = offersOf(variant.offers);
+			if (offers === null) return null;
+			for (const offer of offers) {
+				if (out.length >= bounds.maxOffers) return null;
+				out.push(tuple(offer, absent(offer.sku) ? variant.sku : offer.sku));
+			}
+		}
+		return out.length ? out : null;
+	};
+
+	// Each field is PICKED raw — from the node, else (for a ProductGroup) its first variant — and only
+	// then bounded, so a value the group states too long is refused rather than swapped for a variant's.
+	const pickBrand = (n: Json) => nonEmpty(isObject(n.brand) ? n.brand.name : n.brand);
+	const pickImage = (n: Json) => {
+		const image = Array.isArray(n.image) ? n.image[0] : n.image;
+		return nonEmpty(isObject(image) ? image.url : image);
+	};
+	const pickRating = (n: Json): [number | null, number | null] | undefined => {
+		const r = n.aggregateRating;
+		if (!isObject(r)) return undefined;
+		const pair: [number | null, number | null] = [num(r.ratingValue), num(r.ratingCount ?? r.reviewCount)];
+		return pair[0] !== null || pair[1] !== null ? pair : undefined;
 	};
 
 	const readProduct = (node: Json): PageFactsProduct => {
-		const brand = isObject(node.brand) ? node.brand.name : node.brand;
-		let image = Array.isArray(node.image) ? node.image[0] : node.image;
-		if (isObject(image)) image = image.url;
-		let rating: PageFactsProduct['rating'] = null;
-		if (isObject(node.aggregateRating)) {
-			const r = node.aggregateRating;
-			const pair: [number | null, number | null] = [num(r.ratingValue), num(r.ratingCount ?? r.reviewCount)];
-			if (pair[0] !== null || pair[1] !== null) rating = pair;
-		}
-		return { name: str(node.name), brand: str(brand), image: str(image), rating, offers: readOffers(node.offers) };
+		const variants = hasType(node, ['ProductGroup']) ? listOf(node.hasVariant).filter(isObject) : [];
+		const pick = <T>(from: (n: Json) => T | undefined): T | undefined =>
+			from(node) ?? (variants.length ? from(variants[0]) : undefined);
+		return {
+			name: str(pick((n) => nonEmpty(n.name))),
+			brand: str(pick(pickBrand)),
+			image: str(pick(pickImage)),
+			rating: pick(pickRating) ?? null,
+			offers: readOffers(node, variants),
+		};
 	};
 
 	const readBreadcrumbs = (node: Json): string[] | null => {
