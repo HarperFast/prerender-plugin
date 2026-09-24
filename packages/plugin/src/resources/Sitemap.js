@@ -2,7 +2,7 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
-import { anyRouteDeparts, classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
+import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
 import { currentMinuteMs, epochMsOf, getInitialRenderTime, getNextSitemapRefreshTime } from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
@@ -10,7 +10,7 @@ import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { conditionalValidatorFor } from '../util/sitemapConditional.js';
-import { decideDeparture, DepartureAction } from '../util/sitemapDeparture.js';
+import { decideDeparture, DepartureAction, departureCandidateCap, departureLimit } from '../util/sitemapDeparture.js';
 import { cacheKeysOf } from './Target.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { resolveEffectiveInterval } from '../util/routeClass.js';
@@ -58,10 +58,9 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		const run = createRefreshRun({
 			removedSampleCap: config.sitemap.removedSampleCap,
 			failedCap: config.sitemap.failedCap,
-			// Zero unless the departure check is on AND some route opts in, which keeps the candidate
-			// list empty — and `addRemoved` allocation-free — for every deployment that has not asked
-			// for this. `anyRouteDeparts` is resolved once per walk rather than per departed URL.
-			departureCap: config.sitemap.departure.enabled && anyRouteDeparts() ? config.sitemap.departure.maxCandidates : 0,
+			// Zero unless the departure check is on AND some route opts in; Infinity when
+			// `maxCandidates` is -1. See util/sitemapDeparture.js.
+			departureCap: departureCandidateCap(),
 		});
 		const visited = new Set();
 		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
@@ -750,12 +749,19 @@ function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
  * Every candidate is decided and counted, including the ones nothing happens to, so a dry run
  * answers the question a deployment actually has before enabling this: how many URLs a real walk
  * would touch, and how many of the departures are shear rather than departure.
+ *
+ * A candidate refused by `maxActions` is counted `capped` and is gone for good — the walk already
+ * unlinked it, so no later walk offers it again. `maxActions: -1` removes the ceiling.
+ *
+ * Exported for tests.
  */
-async function processDepartures(run) {
+export async function processDepartures(run) {
 	const urls = run.departureCandidates();
 	if (!urls.length) return;
 
-	const { dryRun, maxActions } = config.sitemap.departure;
+	const { dryRun } = config.sitemap.departure;
+	// Through `departureLimit`, never raw: -1 is "no ceiling", and `acted >= -1` would refuse all.
+	const maxActions = departureLimit(config.sitemap.departure.maxActions);
 	let acted = 0;
 
 	await applyInBatches({
@@ -827,7 +833,8 @@ async function processDepartures(run) {
 		.map(([name, count]) => `${name} ${count}`)
 		.join(', ');
 	logger.info(
-		`[prerender] Departure check: ${considered} candidates${capped ? ' (CAPPED — some departed URLs were never checked)' : ''}` +
+		`[prerender] Departure check: ${considered} candidates` +
+			`${capped ? ' (CAPPED at maxCandidates — the departed URLs past it were never checked, and no later walk will offer them)' : ''}` +
 			`${dryRun ? ', DRY RUN' : ''} — ${summary || 'nothing to do'}`
 	);
 
