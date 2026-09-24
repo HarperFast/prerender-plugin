@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import puppeteer, { type Browser } from 'puppeteer';
-import { extractPageFacts, PAGE_FACT_BOUNDS } from '../dist/pageFacts.js';
+import { extractPageClaims, PAGE_FACT_BOUNDS, STRUCTURED_OFFER_CAP } from '../dist/pageFacts.js';
 import { renderOnce } from '../dist/renderOnce.js';
 
 /**
@@ -50,7 +50,7 @@ const factsOf = async (html: string) => {
 	const page = await browser.newPage();
 	try {
 		await page.goto(`${base}${path}`, { waitUntil: 'load' });
-		return await page.evaluate(extractPageFacts, PAGE_FACT_BOUNDS);
+		return (await page.evaluate(extractPageClaims, STRUCTURED_OFFER_CAP, PAGE_FACT_BOUNDS)).pageFacts;
 	} finally {
 		await page.close();
 	}
@@ -654,4 +654,44 @@ test('an extraction that throws posts pageFacts: null — present, never a faile
 	assert.equal(result.job.pageFacts, null);
 	assert.notEqual(result.job.pageFacts, undefined);
 	assert.deepEqual(result.job.structuredOffers, ['9.5', 'USD', 'InStock']);
+});
+
+test('an offers reader that throws posts structuredOffers: null — pageFacts still read, never a failed render', async () => {
+	// Both claims come from ONE evaluate now; each reader is caught inside the page, so a throw in the
+	// offers reader (here: the page breaks Array.prototype.flat, which only that reader calls) must cost
+	// the consumer the offers and nothing else — what two separate evaluates gave.
+	pages.set(
+		'/hostile-offers',
+		RENDERED(`${base}/hostile-offers`).replace(
+			'</body>',
+			`<script>Array.prototype.flat = function () { throw new Error('hostile page'); };</script></body>`
+		)
+	);
+	const result = await renderOnce({ url: `${base}/hostile-offers`, config: NO_SCROLL });
+	assert.equal(result.outcome, 'ok');
+	assert.ok(result.html && result.html.length > 0);
+	assert.equal(result.job.structuredOffers, null);
+	assert.notEqual(result.job.structuredOffers, undefined);
+	assert.equal(result.job.pageFacts?.product?.name, 'Blue Widget');
+	assert.deepEqual(result.job.pageFacts?.product?.offers, [['W1', '9.5', 'USD', 'InStock']]);
+});
+
+test('a failure of the extraction evaluate itself posts null for BOTH claims — present, never a failed render', async () => {
+	// No in-page catch can see a result that cannot be returned: the page makes the offers reader's
+	// output cyclic, so the evaluate itself rejects. Both claims are then null (ran, failed benignly),
+	// never absent ("renderer predates it"), and the render still succeeds.
+	pages.set(
+		'/unreturnable',
+		RENDERED(`${base}/unreturnable`).replace(
+			'</body>',
+			`<script>Array.prototype.flat = function () { const a = []; a.push(a); return a; };</script></body>`
+		)
+	);
+	const result = await renderOnce({ url: `${base}/unreturnable`, config: NO_SCROLL });
+	assert.equal(result.outcome, 'ok');
+	assert.ok(result.html && result.html.length > 0);
+	assert.equal(result.job.structuredOffers, null);
+	assert.notEqual(result.job.structuredOffers, undefined);
+	assert.equal(result.job.pageFacts, null);
+	assert.notEqual(result.job.pageFacts, undefined);
 });
