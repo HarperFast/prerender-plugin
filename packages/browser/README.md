@@ -142,7 +142,9 @@ carries facts the renderer read off the settled DOM (before `postProcess`), so t
 the cached page's own claims against its sources of truth without parsing HTML on its write path. Both
 fields share one wire contract: **absent** means the renderer predates the field (a consumer may alarm on
 it); **`null`** means the extraction ran and found nothing to claim or failed benignly — it is posted as
-`null`, never omitted, and an extraction failure never fails the render. The extraction runs only on
+`null`, never omitted, and an extraction failure never fails the render. Both are read in one in-page
+pass (one `page.evaluate`, each JSON-LD block parsed once): a failure in one reader costs only that
+field, and a failure of the pass itself posts `null` for both. The extraction runs only on
 the path that produces content, so a variant without content (a redirect, a verdict, an error) may carry
 neither — absence is meaningful only on a variant that carries content.
 
