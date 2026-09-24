@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { classifyUrl, DepartureAction, PRERENDER } from './routeClass.js';
+import { anyRouteDeparts, classifyUrl, DepartureAction, PRERENDER } from './routeClass.js';
 
 /**
  * What a URL LEAVING a sitemap means, and what to do about it.
@@ -39,12 +39,43 @@ import { classifyUrl, DepartureAction, PRERENDER } from './routeClass.js';
  * Candidates are collected during the walk and re-read once it has finished; anything that picked
  * up an attribution in the meantime is dropped. That is also why this cannot be folded into
  * `reconcileSitemapEntries`.
+ *
+ * ── WHY A CAPPED DEPARTURE IS GONE FOR GOOD ──────────────────────────────────────────────────
+ *
+ * The prune unlinks a departed target (`sitemapUrl -> null`) BEFORE it becomes a candidate, and a
+ * later walk finds departures by scanning for targets still linked to the sitemap being pruned. So
+ * a URL that overflows either ceiling — past `maxCandidates` it is never held, past `maxActions` it
+ * is decided but not acted on — is not left for the next walk: no walk will offer it again unless
+ * it re-enters a sitemap and departs a second time. The ceilings exist for the truncated-but-valid
+ * child sitemap, which presents every URL it dropped as departed; a deployment that would rather
+ * lose that guard than lose departures sets them to -1 (`departureLimit`).
  */
 
 // Re-exported so callers reason about departures through one module rather than reaching into the
 // route compiler for the enum. It is DEFINED in routeClass.js because that is what validates the
 // route field, and one definition is what keeps the validator and the consumers spelling it alike.
 export { DepartureAction };
+
+/**
+ * A departure ceiling as configured, turned into the number the comparisons use.
+ *
+ * `sitemap.departure.maxActions` and `maxCandidates` spell "no ceiling" as -1 (see the schema for why
+ * not `null` or `Infinity`), and that has to become Infinity before it meets `acted >= limit` or
+ * `length < cap`: compared raw, -1 would refuse EVERY candidate — the exact opposite of what it says.
+ * Any negative reads as uncapped, since the schema's floor of -1 lets a fraction through. 0 stays 0,
+ * because 0 is "none" and is also how a walk with no opted-in route keeps collection off.
+ */
+export const departureLimit = (value) => (value < 0 ? Infinity : value);
+
+/**
+ * How many departed URLs one walk may hold for the post-walk check.
+ *
+ * Zero unless the check is on AND some route opts in, which keeps the candidate list empty — and the
+ * walk's `addRemoved` allocation-free — for every deployment that has not asked for this, whatever
+ * `maxCandidates` says. Resolved once per walk rather than per departed URL.
+ */
+export const departureCandidateCap = () =>
+	config.sitemap.departure.enabled && anyRouteDeparts() ? departureLimit(config.sitemap.departure.maxCandidates) : 0;
 
 /**
  * The action a route declares for URLs that leave a sitemap.

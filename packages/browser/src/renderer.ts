@@ -18,6 +18,7 @@ import {
 	type ReadinessResult,
 } from './readiness.js';
 import { responseLogSource } from './responseLog.js';
+import { extractPageFacts, PAGE_FACT_BOUNDS } from './pageFacts.js';
 import {
 	DOCUMENT_REUSE_HEADER,
 	cookieHeaderOf,
@@ -1150,6 +1151,10 @@ const renderer: Renderer = async (page, job) => {
 				// this feature" — the consumer alarms on the latter, so collapsing null into
 				// undefined would make every offerless page impersonate an outdated renderer.
 				job.structuredOffers = await page.evaluate(extractStructuredOffers, STRUCTURED_OFFER_CAP).catch(() => null);
+				// The page's own SEO facts, with exactly the same absent-vs-null contract and the same
+				// never-fail-the-render handling. A separate evaluate on purpose: a throw in one must not
+				// cost the consumer the other.
+				job.pageFacts = await page.evaluate(extractPageFacts, PAGE_FACT_BOUNDS).catch(() => null);
 				const ppStart = Date.now();
 				const content = await page.evaluate(postProcess, config.postProcess, config.block.urlPatterns);
 				timings.postProcess = Date.now() - ppStart;

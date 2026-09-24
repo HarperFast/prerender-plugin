@@ -7,6 +7,7 @@ import { getHostHealth, parseRetryAfter } from './HostHealth.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import type { JobDocumentCache } from './documentReuse.js';
 import type { ReadinessExpectations, ReadinessResult } from './readiness.js';
+import type { PageFacts } from './pageFacts.js';
 
 /** One `waitFor` rule's outcome for one render. Only rules whose scope MATCHED appear. */
 export interface WaitForResult {
@@ -199,6 +200,15 @@ export default class RenderJob {
 	 */
 	structuredOffers: Array<string | null> | null | undefined;
 	/**
+	 * The page's own SEO facts — canonical, title, meta description, first `<h1>`, the first Product
+	 * JSON-LD node (name, brand, image, rating, per-SKU offers) and the first breadcrumb trail — read
+	 * off the live DOM beside `structuredOffers`, with the same wire semantics: `null` means the
+	 * extraction ran and failed benignly (the page was not evaluable), posted as null and NOT omitted,
+	 * because an ABSENT field means "this renderer predates the feature". See {@link PageFacts} and
+	 * `pageFacts.ts` for the shape and the bounds (a value past its bound is null, never truncated).
+	 */
+	pageFacts: PageFacts | null | undefined;
+	/**
 	 * Why this render produced no cacheable content — one slug across every no-content class,
 	 * so the plugin logs/tracks a single field: 'noindex' (robots meta/header),
 	 * 'canonical-mismatch' (page canonicalizes to a different URL), 'canonical-variant'
@@ -343,6 +353,7 @@ export default class RenderJob {
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
+			pageFacts: this.pageFacts,
 			readiness: this.readinessReport(),
 			outcome: this.outcome,
 			// Present only when true, so the flat legacy envelope is byte-identical for every render
@@ -404,6 +415,7 @@ export default class RenderJob {
 			redirectedTo: this.redirectedTo,
 			isIndexable: this.isIndexable,
 			structuredOffers: this.structuredOffers,
+			pageFacts: this.pageFacts,
 			// Carried even on a failed result build: a render that could not be reported is exactly
 			// when knowing whether its contract held is most useful.
 			readiness: this.readinessReport(),
@@ -514,6 +526,8 @@ export type VariantMetadata = {
 	redirectedTo: string | undefined;
 	isIndexable: boolean | undefined;
 	structuredOffers: Array<string | null> | null | undefined;
+	/** See `RenderJob.pageFacts`: absent = the renderer predates it or never ran the extraction; null = it failed benignly. */
+	pageFacts: PageFacts | null | undefined;
 	/** Present only when a contract governed this render, so an older consumer never sees the key. */
 	readiness?: ReadinessReport;
 	outcome: JobOutcome;

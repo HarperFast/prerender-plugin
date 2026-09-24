@@ -121,6 +121,15 @@ type Target @table(database: "render_service") @export {
 	# never been evaluated and starts from its route/stored interval. Written ONLY when the rung
 	# actually changes, so a converged corpus pays no write — same discipline as `strikes`.
 	demandInterval: Long
+	# When a sitemap walk last UNLINKED this target (`sitemapUrl -> null`): THE START OF THAT WALK, not
+	# the moment of the prune, so a URL the same walk re-attaches further on (a paginated sitemap's
+	# boundary shear) is told from one that rejoins in a later walk by an exact comparison — see
+	# util/sitemapArrival.js. Cleared in the patch that re-attributes the target. Absent on a target no
+	# walk has unlinked since v0.89.0: one discovered from traffic, or one unlinked before the upgrade.
+	# Read by `changeProbe.scope: listed` (an unlisted target is still probed for `unlistedGrace`) and by
+	# the sitemap arrival check. Both ride writes the walk already makes. NOT @indexed: only ever read
+	# off a row already in hand.
+	unlistedAt: Date
 }
 
 # The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that
@@ -428,15 +437,32 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# recorded. Those differ by milliseconds, and the difference is load-bearing: this value is
 	# copied onto a verification as the basis it certifies, and a stamp taken a few ms after the page
 	# was written would make the very page it certifies fail its own `lastCached >= basisAt` test.
-	# Written in the SAME patch as `pageSignature`, so it costs no extra read and no extra write.
+	# Written in the SAME patch as `pageSignature`, so it costs no extra read and no extra write. It
+	# stamps `pageFacts` too, and the mapping-defect guard reads it: a record stamped AFTER the
+	# baseline's `probedAt`, compared against an unchanged origin, is a WITNESSED comparison.
 	pageClaimAt: Date
+	# THE PAGE RECORD: what the cached page claims for every field it visibly states — canonical,
+	# title, meta description, h1, product name/brand/image/rating/offers, breadcrumbs — as canonical
+	# JSON (fixed key order), from the renderer's `pageFacts` (@harperfast/prerender-browser >= 1.37.0).
+	# Compared on every probe against the slots a rule maps (`pageCheck.fields`), so the probe
+	# re-renders a page that is WRONG on any mapped field and skips one that already caught up with an
+	# origin change. Written by the render path only, in the SAME patch as `pageSignature` and
+	# `pageClaimAt` (no extra read or write), and only for a rule that maps fields — always the whole
+	# record, so it never describes an older render than `pageClaimAt` says: null when the render's
+	# facts are unknown (older renderer, nothing extracted, not every default device stored) or the
+	# record exceeds 16 KB (refused, never truncated). Cleared with the claim when a trigger
+	# hard-expires the page. Nullable and inert unless a rule maps fields. ADDING THIS COLUMN to the
+	# @sealed table needs the component's workers restarted (a deploy does that), not a config reload.
+	pageFacts: String
 	# The fingerprint of the RULE that produced `signature` (changeProbeSpec.js ruleFingerprint):
 	# endpoint, method, headers, body, extract paths, status signals. A baseline is only comparable
 	# to an observation made the same way, so a probe whose rule fingerprint differs from the stored
 	# one re-baselines the row instead of reading the new signature shape as a content change —
-	# which is what a rule edit used to look like, for 100% of matched URLs at once. Null on rows
-	# written before this column existed; those are compared as usual and stamped on their next
-	# quiet probe. Written by the probe only, in the same put/patch as `signature`.
+	# which is what a rule edit used to look like, for 100% of matched URLs at once. A fingerprint
+	# the rule would have had with only its first k extract paths (paths were APPENDED since) is
+	# still compared on those k slots and upgraded in place — no re-baseline. Null on rows written
+	# before this column existed; those are compared as usual and stamped on their next quiet
+	# probe. Written by the probe only, in the same put/patch as `signature`.
 	ruleFingerprint: String
 }
 

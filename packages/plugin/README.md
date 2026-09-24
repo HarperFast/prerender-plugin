@@ -1346,6 +1346,16 @@ up as a `probe_failed` share and a loud log line, not as schedule churn. An extr
 path yields null is a failure too, so a shape change cannot flip every signature at once and
 mass-trigger. Suppressed targets are skipped — suppression owns its own recheck cadence.
 
+**Scope** (`scope`, default `all`). `listed` probes only targets a sitemap lists now, plus those a walk
+unlinked within `unlistedGrace` (48h by default, measured from `Target.unlistedAt`), and skips targets
+discovered from traffic and products long gone from the sitemap — counted per pass as `outOfScope`, the
+origin requests saved. It is only safe where the sitemap **is** the availability feed and the
+sitemap-departure check is armed (`ingress.routes[].departureAction: render`,
+`sitemap.departure.dryRun: false`), which already re-renders a product's page the day it leaves the
+sitemap; a config warning says so otherwise. Its pair is `arrivalAction: render` on the same route
+(`sitemap.arrival`, dry-run by default), which re-renders a product the day it **rejoins** its
+sitemap instead of leaving its out-of-stock snapshot serving until the next cadence render.
+
 Once a probe rule covers a route's volatile fields, that route's `renderInterval` can usually be
 raised substantially — the interval then only bounds what the probe cannot see (client-side
 content: reviews, image sets), and the render budget freed is what pays for the burst of
