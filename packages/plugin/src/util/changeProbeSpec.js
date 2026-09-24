@@ -236,6 +236,9 @@ const compileRule = (raw, index, warn) => {
 	};
 	rule.fingerprint = ruleFingerprint(rule);
 	rule.prefixFingerprints = prefixFingerprints(rule);
+	// The status-signal literals as a Set, once per compile: `signatureUnderPrefix` consults it for every
+	// extended row of a pass, and a rule is compiled once per config.
+	rule.statusSignalSignatures = new Set(statusSignals.map((signal) => signal.signature));
 	return rule;
 };
 
@@ -344,7 +347,8 @@ const slotsOf = (signature) => {
  * that rule, and is not comparable. The observation is held to its own shape the same way.
  */
 export const signatureUnderPrefix = (rule, k, storedSignature, observed) => {
-	const literals = new Set((rule.statusSignals ?? []).map((signal) => signal.signature));
+	// Precomputed by compileRule; built here only for a hand-assembled rule (tests).
+	const literals = rule.statusSignalSignatures ?? new Set((rule.statusSignals ?? []).map((signal) => signal.signature));
 	if (!literals.has(storedSignature) && slotsOf(storedSignature)?.length !== k) return null;
 	if (literals.has(observed)) return observed;
 	const values = slotsOf(observed);
