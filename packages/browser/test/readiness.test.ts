@@ -506,6 +506,72 @@ test('the render still serializes when a contract is never satisfied', async () 
 	assert.match(result.html ?? '', /nothing to hydrate/);
 });
 
+test('a contract reports HOW its window ended', async () => {
+	const stopped = await render('/late', {
+		name: 'stops',
+		require: [{ name: 'items', selector: '.item', minCount: 2 }],
+		timeoutMs: 5000,
+	});
+	assert.equal(stopped.job.readiness?.exit, 'stopped');
+
+	// Never true, and the page is done: the rot valve stands it aside.
+	const valve = await render('/no-rails', {
+		name: 'rots',
+		require: [{ name: 'rails', every: '.rail', contains: '.slide' }],
+		timeoutMs: 8000,
+	});
+	assert.equal(valve.job.readiness?.exit, 'valve');
+
+	// Never true, and the page holds a request open to its own origin, so the valve cannot fire.
+	const deadline = await render('/quiet-but-fetching', {
+		name: 'waits',
+		require: [{ name: 'never', selector: '#absent' }],
+		timeoutMs: 1500,
+	});
+	assert.equal(deadline.job.readiness?.exit, 'deadline');
+});
+
+test("onGiveUp 'stop' serializes when the contract gives up, instead of running the fallback settle", async () => {
+	// `/late-rails` fills its rails at 1.2 s; a 400 ms contract gives up well before that.
+	const contract = {
+		name: 'gives-up',
+		require: [{ name: 'rails', selector: '.rail', minCount: 3 }],
+		timeoutMs: 400,
+	};
+	// A plateau long enough to outlast the 1.2 s arrival, so the default fallback visibly rescues it.
+	const navigation = { domStableMs: 1500, domStableTimeoutMs: 5000 };
+	const settle = await render('/late-rails', contract, {}, navigation);
+	const stop = await render('/late-rails', contract, { onGiveUp: 'stop' }, navigation);
+
+	assert.notEqual(settle.job.readiness?.stopped, true);
+	assert.notEqual(stop.job.readiness?.stopped, true);
+	// The default keeps waiting on timers and so still captures the late rails ...
+	assert.match(settle.html ?? '', /class="rail"/);
+	assert.equal(settle.job.readiness?.satisfied, true, 'restated against the DOM the fallback reached');
+	// ... 'stop' does not wait, and says so: the verdict is restated against what was serialized.
+	assert.doesNotMatch(stop.html ?? '', /class="rail"/);
+	assert.equal(stop.job.readiness?.satisfied, false);
+	assert.ok(
+		(stop.timings.settle ?? Infinity) < (settle.timings.settle ?? 0),
+		`'stop' must skip the fallback timers (settle ${stop.timings.settle} ms vs ${settle.timings.settle} ms)`
+	);
+});
+
+test('an invalid onGiveUp is rejected at config load', async () => {
+	const { mergeConfig } = await import('../dist/config.js');
+	assert.throws(
+		() =>
+			mergeConfig({
+				readiness: {
+					onSatisfied: 'quiet',
+					onGiveUp: 'later',
+					contracts: [{ name: 'c', require: [{ name: 'x', selector: 'p' }] }],
+				},
+			} as never),
+		/onGiveUp must be 'settle' or 'stop'/
+	);
+});
+
 test('report mode reports the verdict and changes nothing about the render', async () => {
 	// The rollout mode. A contract naming content that never arrives must NOT hold the render — the
 	// whole point is that the timeout can be chosen from the fleet's own distribution later, at no

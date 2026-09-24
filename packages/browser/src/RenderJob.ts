@@ -322,6 +322,7 @@ export default class RenderJob {
 		return {
 			contract: r.contract,
 			satisfied: r.satisfied,
+			exit: r.exit,
 			unmet: r.require.filter((c) => !c.ok).map((c) => c.name),
 			skipped: r.require.filter((c) => c.skipped).map((c) => c.name),
 			waitedMs: r.waitedMs,
@@ -489,6 +490,8 @@ export default class RenderJob {
 export type ReadinessReport = {
 	contract: string;
 	satisfied: boolean;
+	/** How the contract's window ended — see `ReadinessResult.exit`. Absent from older renderers. */
+	exit?: 'stopped' | 'valve' | 'deadline' | 'gone' | 'observed';
 	/** Names of the clauses that did not hold. Empty when satisfied. */
 	unmet: string[];
 	/** Names of clauses a guard decided did not apply — never conflate with "checked and passed". */

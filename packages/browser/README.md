@@ -476,6 +476,44 @@ cost a render time but never content. So does a contract that _held_ but never s
 within its `timeoutMs`: the stop condition is "held **and** quiet", and the deadline is not a stop. `job.readiness` carries `satisfied`, per-clause `ok`/`count`/
 `firstTrueMs`, and any `observe` counts.
 
+`job.readiness.exit` (also on the wire) says **how** the contract's window ended: `stopped` (held
+and quiet), `valve` (the rot valve stood a never-true clause aside), `deadline` (`timeoutMs` or the
+render budget), `gone` (the page closed or navigated) or `observed` (report mode). `valve` and
+`deadline` are the two exits that hand a render to the fallback settle, so they are the ones to
+watch. `readiness.onGiveUp: 'stop'` (default `'settle'`) serializes an armed contract's render at
+either exit instead of running the fallback timers, `waitFor` gates and final plateau. That is for a
+page type whose late content is named (`responded`, `anyOf`, guards), so the fallback has nothing
+left to rescue. The verdict is still restated against what was serialized, so an incomplete render
+still says so.
+
+### `navigation.forceVisibleBudget` — lazy content without a tall viewport or a scroll pass
+
+Content that loads "when scrolled into view" waits on an `IntersectionObserver` callback. A renderer
+usually satisfies that by brute force, either with a very tall viewport (so everything is "in view"
+at load) or with a timed scroll pass, and both are paid on every render. With
+`forceVisibleBudget: N`, a document-start shim reports each element the page observes as
+intersecting, once, asynchronously, the way a real viewport reports an element already on screen.
+Lazy widgets then initialise at any viewport height with no scroll at all.
+
+Measured through the worker on two live commerce templates, interleaved against a 5,000px viewport
+with a scroll pass. Rails, filled rail slots and review nodes were identical on every page; rail item
+counts moved by at most 2 in either direction, which is the rails' own run-to-run churn.
+
+| page type | viewport                      | CPU-s per render                                    | render p50 (desktop) |
+| --------- | ----------------------------- | --------------------------------------------------- | -------------------- |
+| listing   | 1,080px                       | **−39%**                                            | −10% (p95 −30%)      |
+| product   | 1,080px                       | **−16%**                                            | −11% (p95 −16%)      |
+| product   | 1,080px, **without** the shim | the review widget never loaded on any mobile render | —                    |
+
+- **Budgeted per document.** A "load more" sentinel reported visible loads the next page, whose new
+  sentinel would be reported too. Past the budget the native observer alone decides. Real pages of
+  both types observed 96–211 elements per render.
+- **An element reported visible is never un-seen:** the native "not intersecting" update that
+  follows is dropped, so a component that unloads when scrolled away keeps what it loaded.
+- **Nothing is reported for an element the page stopped observing** before the report was due.
+- **What it cannot trigger:** code gated on `scroll` events or `getBoundingClientRect()` checks, and
+  native `loading="lazy"`. Measure a page type with no scroll pass before relying on it.
+
 ### `postProcess.minifyInlineCss` — re-emitting inline CSS from the CSSOM
 
 Replaces each inline `<style>`'s source text with the browser's own serialization of the parsed
