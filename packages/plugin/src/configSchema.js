@@ -2166,23 +2166,47 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'looked, and one that decides whether `maxActions` is a ceiling or a no-op. The result ' +
 						'and the progress row carry the outcome tally either way.'
 				),
+				// -1 is "no ceiling" for both caps below, and it is -1 rather than `null` or `Infinity` on
+				// purpose. `null` already means "no value" in every layer — the merge skips it and keeps the
+				// default, an override write refuses it, and the console's number field reports it for an
+				// emptied box — so making it mean "uncapped" would turn a blank `maxActions:` in config.yaml
+				// from the default into no guard at all, silently and in the dangerous direction. `Infinity`
+				// cannot cross JSON, so no override row or console edit could ever carry it. -1 is a plain
+				// number every layer already validates and transports, and nobody types it by accident.
+				// 0 keeps its meaning — act on / collect nothing — because 0 is also how a walk with no
+				// opted-in route switches collection off. Read them through `departureLimit`.
 				maxActions: option(
 					5000,
-					'Ceiling on departed URLs ACTED ON in one walk. Skipped candidates (re-attached, ' +
-						'suppressed, route opted out) do not count against it. The cap is the guard against a ' +
-						'pathological walk: a child sitemap that fetches truncated but still parses as valid XML ' +
-						'presents every URL it no longer lists as departed, and without a ceiling one bad fetch ' +
-						'would expire a large slice of the cache. Overflow is counted as `capped` and left for ' +
-						'the next walk rather than silently dropped.',
-					{ min: 0 }
+					'Ceiling on departed URLs ACTED ON in one walk, or -1 for no ceiling. Skipped candidates ' +
+						'(re-attached, suppressed, route opted out) do not count against it.\n\n' +
+						'WHAT IT GUARDS AGAINST: a child sitemap that fetches truncated but still parses as valid ' +
+						'XML presents every URL it no longer lists as departed, and without a ceiling that one bad ' +
+						'fetch would expire a large slice of the cache.\n\n' +
+						'OVERFLOW IS DROPPED FOR GOOD, not deferred. By the time the check runs the walk has already ' +
+						'unlinked the URL from its sitemap, and a later walk only looks for departures among URLs ' +
+						'still linked to one — so a URL counted as `capped` is never offered again (unless it ' +
+						're-enters a sitemap and departs a second time). It keeps its target, its render cadence ' +
+						'and its cached page; it just never gets its route’s departure action. Read `capped` as ' +
+						'departures lost, not postponed.\n\n' +
+						'-1 removes the ceiling: every departed URL gets its action and nothing is ever counted as ' +
+						'`capped`. That gives up the guard above, so read a `dryRun` tally first. 0 acts on ' +
+						'nothing — every candidate is still decided and reported.',
+					{ min: -1 }
 				),
 				maxCandidates: option(
 					50000,
-					'Ceiling on departed URLs HELD for the post-walk check. Separate from `maxActions` because ' +
-						'this one bounds memory: it is a list of URLs retained across a walk that can prune ' +
-						'millions. A capped list is reported as such, so a short list is never presented as ' +
-						'"few departed".',
-					{ min: 0 }
+					'Ceiling on departed URLs HELD for the post-walk check, or -1 for no ceiling. Separate from ' +
+						'`maxActions` because this one bounds memory: it is a list of URLs retained across a walk ' +
+						'that can prune millions. Uncapped, the list is bounded by the URLs that walk actually ' +
+						'unlinks — at most `scan.collectCap` per child sitemap — so it grows with how much of the ' +
+						'corpus departs at once, which is exactly what a truncated child sitemap inflates. A capped ' +
+						'list is reported as such (`departures.capped` on the result and the progress row), so a ' +
+						'short list is never presented as "few departed".\n\n' +
+						'Overflow is DROPPED FOR GOOD, for the same reason as `maxActions` overflow: the URL is ' +
+						'already unlinked, so no later walk offers it again. It is never decided and never appears ' +
+						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
+						'removes the ceiling and never reports `capped`; 0 collects nothing.',
+					{ min: -1 }
 				),
 			}
 		),
