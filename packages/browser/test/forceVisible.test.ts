@@ -45,11 +45,34 @@ const RETRACTED = page(
 	io.observe(el); io.unobserve(el);`
 );
 
+// Budget accounting. `/repeat`: one element observed five times, then a second element — with a
+// budget of 2 both must be reported (a repeat is a no-op natively and must cost nothing).
+// `/refund`: an element observed and immediately unobserved, then another — with a budget of 1 the
+// second must still be reported (an undelivered report gives its slot back).
+const REPEAT = page(
+	'<div style="height:6000px"></div><div id="a"></div><div id="b"></div>',
+	`const io = new IntersectionObserver((es) => { for (const e of es) if (e.isIntersecting) e.target.innerHTML = '<p class="hit">' + e.target.id + '</p>'; });
+	const a = document.getElementById('a'); for (let i = 0; i < 5; i++) io.observe(a); io.observe(document.getElementById('b'));`
+);
+const REFUND = page(
+	'<div style="height:6000px"></div><div id="c"></div><div id="d"></div>',
+	`const io = new IntersectionObserver((es) => { for (const e of es) if (e.isIntersecting) e.target.innerHTML = '<p class="hit">' + e.target.id + '</p>'; });
+	const c = document.getElementById('c'); io.observe(c); io.unobserve(c);
+	setTimeout(() => io.observe(document.getElementById('d')), 50);`
+);
+
 before(async () => {
 	origin = http.createServer((req, res) => {
 		res.setHeader('content-type', 'text/html');
 		const path = (req.url ?? '').split('?')[0];
-		const body = { '/lazy': LAZY, '/infinite': INFINITE, '/toggler': TOGGLER, '/retracted': RETRACTED }[path];
+		const body = {
+			'/lazy': LAZY,
+			'/infinite': INFINITE,
+			'/toggler': TOGGLER,
+			'/retracted': RETRACTED,
+			'/repeat': REPEAT,
+			'/refund': REFUND,
+		}[path];
 		res.end(body ?? '<p>ok</p>');
 	});
 	await new Promise<void>((resolve) => origin.listen(0, '127.0.0.1', resolve));
@@ -101,6 +124,18 @@ test('an element reported visible is never un-seen by the native observer', asyn
 test('nothing is reported for an element the page stopped observing', async () => {
 	const result = await render('/retracted', 50);
 	assert.doesNotMatch(result.html ?? '', /class="reported"/);
+});
+
+test('a repeated observe() of the same element spends no budget', async () => {
+	const result = await render('/repeat', 2);
+	const hits = ((result.html ?? '').match(/class="hit"/g) ?? []).length;
+	assert.equal(hits, 2, 'element a (observed five times) and element b both reported on a budget of 2');
+});
+
+test('a report that was never delivered gives its budget back', async () => {
+	const result = await render('/refund', 1);
+	assert.match(result.html ?? '', /<p class="hit">d<\/p>/, 'the unobserved element did not keep the only slot');
+	assert.doesNotMatch(result.html ?? '', /<p class="hit">c<\/p>/);
 });
 
 test('a negative or fractional budget is rejected at config load', async () => {

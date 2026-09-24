@@ -23,9 +23,11 @@
  *
  * ## What it deliberately does
  *
- *  - Budgeted per document. A "load more" sentinel reported visible loads the next page, whose new
- *    sentinel would be reported visible too; the budget is what stops an infinite list from
- *    becoming an infinite render. Past it, the native observer alone decides.
+ *  - Budgeted per document, counting reports DELIVERED. A "load more" sentinel reported visible loads
+ *    the next page, whose new sentinel would be reported visible too; the budget is what stops an
+ *    infinite list from becoming an infinite render. Past it, the native observer alone decides. A
+ *    repeated observe() of the same element spends nothing (it is a no-op natively), and a report
+ *    that turns out to be unnecessary (unobserved, detached, already visible) is refunded.
  *  - A native "not intersecting" update for an element already reported visible is dropped, so a
  *    component that unloads when scrolled away does not unload what it just loaded.
  *  - Nothing is delivered for an element the page stopped observing before the report was due.
@@ -90,9 +92,12 @@ export const forceVisibleSource = (budget: number): string => `(() => {
       this._forced = { callback, visible, watching };
     }
     observe(target) {
+      const { callback, visible, watching } = this._forced;
+      // Observing an element already observed is a no-op natively (per spec), so it must not spend
+      // budget or schedule a second report here either.
+      if (watching.has(target)) return;
       super.observe(target);
       stats.observed++;
-      const { callback, visible, watching } = this._forced;
       watching.add(target);
       if (left <= 0) {
         stats.refused++;
@@ -100,8 +105,12 @@ export const forceVisibleSource = (budget: number): string => `(() => {
       }
       left--;
       setTimeout(() => {
-        // The page stopped caring, or the real observer already said so.
-        if (!watching.has(target) || visible.has(target) || !target.isConnected) return;
+        // The page stopped caring, or the real observer already said so: nothing is delivered, so
+        // the slot goes back — the budget counts reports DELIVERED, not reports planned.
+        if (!watching.has(target) || visible.has(target) || !target.isConnected) {
+          left++;
+          return;
+        }
         visible.add(target);
         stats.reported++;
         const rect = target.getBoundingClientRect();
