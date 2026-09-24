@@ -790,8 +790,6 @@ const priceSetOf = (list) => {
 	return prices;
 };
 
-const sameSet = (a, b) => a.size === b.size && [...a].every((item) => b.has(item));
-
 /** A SKU key: a non-empty string, or a number in its string form (the renderer's convention). */
 const skuKey = (value) => {
 	if (typeof value === 'string') return value.trim() || null;
@@ -907,11 +905,21 @@ const COMPARATORS = {
 			return a === null || b === null ? null : Math.abs(a - b) <= field.options.tolerance + 1e-9;
 		},
 	},
-	// The endpoint's price (a number, or a list from a `[*]` projection) against the SET of prices
-	// the page's offers print — distinct canonical 2-decimal strings, set EQUALITY. Measured 100%
-	// where the endpoint's price list and the page's offers describe the same variants. Where the
-	// page lists fewer offers than the endpoint has variants, use `skus` instead: set equality over
-	// a truncated list disagrees on the missing prices, on every pass.
+	// The endpoint's price(s) against the SET of prices the page's offers print (distinct canonical
+	// 2-decimal strings), asked in the only direction a page can answer for itself:
+	//
+	//   a single endpoint price   the page must print it (the claim pair's rule: a page may list
+	//                             several variant prices while the endpoint reports one);
+	//   a list of them            EVERY price the page prints must still be in the endpoint's set.
+	//
+	// NOT set equality, and the difference is load-bearing. A page may list only SOME variants —
+	// measured, one origin's structured data stops at 50 offers while its endpoint lists every
+	// variant — so a price that exists only on an unlisted variant is absent from the page by
+	// construction. Equality would disagree on that product on every pass, re-render it, and
+	// disagree again with the re-render: a perpetual re-render loop the mapping guard cannot see,
+	// because the affected products are a small minority. What the subset test gives up is a new
+	// price on a listed variant while its old price survives on another; per-variant exactness is
+	// what `skus` is for.
 	priceSet: {
 		kinds: ['offers'],
 		keys: [],
@@ -919,7 +927,9 @@ const COMPARATORS = {
 		compare: (api, page) => {
 			const a = priceSetOf(Array.isArray(api) ? api : [api]);
 			const b = Array.isArray(page) ? priceSetOf(page.map((offer) => (Array.isArray(offer) ? offer[1] : null))) : null;
-			return a === null || b === null ? null : sameSet(a, b);
+			if (a === null || b === null) return null;
+			if (!Array.isArray(api)) return b.has([...a][0]);
+			return [...b].every((price) => a.has(price));
 		},
 	},
 	// An ordered list of names (strings, or objects carrying `nameKey`, default "name") against the

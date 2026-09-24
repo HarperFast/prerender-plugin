@@ -1015,9 +1015,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'stripping: an endpoint’s description may carry markup the page’s meta tag repeats verbatim), ' +
 					'"path" (URL path only — origin, query and fragment ignored, a relative value resolved against the ' +
 					'page URL; for canonical and product.image, whose URLs typically differ by size parameters alone), ' +
-					'"number" (numeric equality, "4.0" = 4; optional `tolerance`), "priceSet" (the endpoint’s price, or ' +
-					'a list of them, against the SET of prices the page’s offers print — set equality, so use "skus" ' +
-					'when the page lists fewer offers than the endpoint has variants), "names" (an ordered list of ' +
+					'"number" (numeric equality, "4.0" = 4; optional `tolerance`), "priceSet" (against the SET of prices ' +
+					'the page’s offers print: a single endpoint price must be among them, and for a list EVERY price ' +
+					'the page prints must still be in the endpoint’s set — not equality, so a page that lists only some ' +
+					'variants cannot disagree forever; use "skus" for per-variant exactness), "names" (an ordered list of ' +
 					'strings, or of objects carrying `nameKey`, default "name", matched against the TAIL of the page’s ' +
 					'breadcrumbs — a leading home crumb needs no configuration; extract the list itself, not a `[*]` ' +
 					'projection, since projections are sorted) and "skus" (per-variant tuples from a `[*].{…}` projection ' +

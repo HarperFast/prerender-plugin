@@ -1166,9 +1166,29 @@ test('number: numeric equality, "4.0" meets 4, with an optional tolerance; no nu
 
 const offers = (...list) => ({ product: { offers: list } });
 
-test('priceSet: the endpoint price(s) against the SET of page offer prices — set equality, canonical 2-decimal', () => {
+test('priceSet: a single endpoint price must be printed; for a list, every printed price must still be offered', () => {
 	const set = field('priceSet', 'product.offers');
 	assert.equal(verdict(set, 35.99, offers(['1', '35.99', 'USD', 'InStock'])), true, 'number vs string');
+	// A single endpoint price (a "lowest price") need only be AMONG the page's variant prices.
+	assert.equal(
+		verdict(set, 19.99, offers(['1', '19.99', 'USD', 'InStock'], ['2', '24.99', 'USD', 'InStock'])),
+		true,
+		'scalar is contained'
+	);
+	// MEASURED QUIRK: a page's structured data can stop at N offers while the endpoint lists every
+	// variant, so a price that exists only on an unlisted variant is absent from the page by
+	// construction. That must agree — equality here re-rendered the product on every pass, forever.
+	assert.equal(
+		verdict(set, [10, 12, 15], offers(['1', '10', 'USD', 'InStock'], ['2', '12', 'USD', 'InStock'])),
+		true,
+		'truncated page lists a subset of the endpoint set'
+	);
+	// A price the page prints that the endpoint no longer offers IS a disagreement.
+	assert.equal(
+		verdict(set, [10, 15], offers(['1', '10', 'USD', 'InStock'], ['2', '12', 'USD', 'InStock'])),
+		false,
+		'page prints a price the endpoint dropped'
+	);
 	assert.equal(verdict(set, '35.9', offers(['1', '35.90', 'USD', 'InStock'])), true);
 	assert.equal(
 		verdict(
