@@ -827,6 +827,15 @@ export class RenderQueue extends Resource {
 			// for its (node-local) write: a render must not fail because a probe optimisation could not
 			// be recorded.
 			const claiming = stored.find((variant) => variant.structuredOffers !== undefined) ?? stored[0];
+			// The page record, chosen the same way from the variant that ran ITS extraction (browser
+			// >= 1.37.0). It is one record for the URL, so it only vouches for the URL when this result
+			// replaced EVERY default device's page: after a partial render (one device failed) or a
+			// one-device render, the other device's cached page is older than the record would claim,
+			// and a record that "caught up" with a change would then skip re-rendering a page that did not.
+			const describing = stored.find((variant) => variant.pageFacts !== undefined) ?? stored[0];
+			const everyDevice = defaultDeviceTypes().every((device) =>
+				stored.some((variant) => variant.deviceType === device)
+			);
 			// CONCURRENTLY, because these all sit inside ONE request-scoped transaction and its duration
 			// is the thing to keep short. A result now carries every device of the URL, so where the
 			// per-key path wrote one page blob per transaction this writes one per device, in series —
@@ -850,7 +859,10 @@ export class RenderQueue extends Resource {
 			// `recordPageClaim` it never rejects — a regression signal must not cost a render.
 			const observed = stored.filter((variant) => hasObservations(variant.readiness?.learned));
 			await Promise.all([
-				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
+				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt, {
+					pageFacts: describing.pageFacts,
+					complete: everyDevice,
+				}),
 				...observed.map((variant) =>
 					recordReadinessExpectation({ url: scheduleUrl, deviceType: variant.deviceType }, variant.readiness)
 				),

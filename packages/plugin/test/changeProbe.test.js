@@ -1059,22 +1059,25 @@ test('writeSignature: patch for an existing row (claim untouched unless cleared)
 	assert.deepEqual(Object.keys(calls.patch[0].fields).sort(), ['probedAt', 'signature']);
 
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true, clearClaim: true });
-	// BOTH halves of the claim pair. `pageClaimAt` is the render `pageSignature` came from; clearing
-	// one and leaving the other is a half-state a verification could later read.
+	// THE WHOLE RECORD. `pageClaimAt` is the render `pageSignature` and `pageFacts` came from; clearing
+	// one and leaving another is a half-state a verification (or a mapped field) could later read.
 	assert.deepEqual(Object.keys(calls.patch[1].fields).sort(), [
 		'pageClaimAt',
+		'pageFacts',
 		'pageSignature',
 		'probedAt',
 		'signature',
 	]);
 	assert.equal(calls.patch[1].fields.pageSignature, null);
 	assert.equal(calls.patch[1].fields.pageClaimAt, null);
+	assert.equal(calls.patch[1].fields.pageFacts, null, 'the page record describes the expired page too');
 
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: false });
 	assert.equal(calls.patch.length, 2);
 	assert.equal(calls.put.length, 1);
 	assert.equal(calls.put[0].rowFields.url, URL_A);
 	assert.equal(calls.put[0].rowFields.pageSignature, null, 'a created row starts with no claim');
+	assert.equal(calls.put[0].rowFields.pageFacts, null, 'and with no page record');
 });
 
 // ---- continuous pacing + the local-load governor ------------------------------------------------
@@ -2003,4 +2006,785 @@ test('APPENDED path: a baseline without the shape the shorter rule writes re-bas
 	assert.equal(stats.rebaselined, 1);
 	assert.equal(stats.extended, 0);
 	assert.deepEqual(triggered, []);
+});
+
+// ---- the page record: mapped fields, caught-up changes, ignored slots, the mapping guard -----------
+
+/**
+ * A rule that maps four of its six slots to page facts and ignores one:
+ *   0 title -> title (text)        1 seoUrl -> canonical (path)     2 image -> product.image (path)
+ *   3 skus[*].{sku,availability,price} -> product.offers (skus)
+ *   4 inventory — ignoreChanges    5 regular — unmapped, a change here always triggers
+ * Stored and observed signatures are built with the real extraction, and records with the real
+ * canonicalizer, so these exercise the strings production writes.
+ */
+const MAPPED_RULE = {
+	label: 'pdp',
+	pathPattern: '^/product/prd-([^/]+)',
+	source: 'request',
+	request: { urlTemplate: 'https://api.example.com/p/$1', method: 'POST', body: '{}' },
+	extract: ['title', 'seoUrl', 'image', 'skus[*].{sku,availability,price}', 'inventory', 'regular'],
+	statusSignals: [{ status: 404, contains: 'GONE', signature: 'unavailable' }],
+	invalidateScope: 'route:prefix:/product/',
+	pageCheck: {
+		enabled: true,
+		fields: [
+			{ slot: 0, fact: 'title', compare: 'text' },
+			{ slot: 1, fact: 'canonical', compare: 'path' },
+			{ slot: 2, fact: 'product.image', compare: 'path' },
+			{ slot: 3, fact: 'product.offers', compare: 'skus' },
+		],
+		ignoreChanges: [4],
+	},
+};
+const API = (over = {}) => ({
+	title: 'Red Shoe',
+	seoUrl: '/product/prd-a/red-shoe.jsp',
+	image: 'https://media.example.com/i/shoe?w=350',
+	skus: [
+		{ sku: '111', availability: 'In Stock', price: 19.99 },
+		{ sku: '222', availability: 'Out of Stock', price: null },
+	],
+	inventory: 12,
+	regular: 39.99,
+	...over,
+});
+const apiSig = async (over, raw = MAPPED_RULE) => signedBy(raw, API(over));
+const RECORD = async (over = {}) => {
+	const { canonicalPageFacts } = await import('../src/util/changeProbeSpec.js');
+	return JSON.stringify(
+		canonicalPageFacts({
+			canonical: 'https://www.example.com/product/prd-a/red-shoe.jsp',
+			title: 'Red Shoe',
+			product: {
+				image: 'https://media.example.com/i/shoe?w=1000',
+				offers: [
+					['111', '19.99', 'USD', 'InStock'],
+					['222', null, 'USD', 'OutOfStock'],
+				],
+			},
+			...over,
+		})
+	);
+};
+// A WITNESSED record: rendered (2000) after the baseline was taken (1000).
+const BASELINE_AT = 1000;
+const RENDERED_AT = new Date(2000);
+
+const guardFor = (settings = { threshold: 0.2, minWitnessed: 10 }) => {
+	const disarmed = [];
+	const guard = changeProbe.createMappingGuard({
+		settings: () => settings,
+		onDisarm: (rule, field, entry) => disarmed.push({ rule: rule.label, field: field.label, ...entry }),
+	});
+	return { guard, disarmed };
+};
+
+const runMappedPass = async ({ rulesRaw = [MAPPED_RULE], rows, answers, stored = {}, ...overrides }) => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const rules = compileProbeRules(rulesRaw);
+	const written = [];
+	const triggered = [];
+	const verified = [];
+	const write = async (url, signature, options = {}) => written.push({ url, signature, ...options });
+	const triggers = createInlineTrigger({ trigger: async (target) => triggered.push(target.url), write });
+	const stats = await changeProbe.runProbePass({
+		rows: stream(rows),
+		rules,
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => answers[url] ?? null,
+		// Steady state by default: the stored fingerprint is the rule's own, so nothing is stamped.
+		read: async (url) =>
+			stored[url]
+				? {
+						probedAt: BASELINE_AT,
+						pageSignature: null,
+						pageClaimAt: RENDERED_AT,
+						pageFacts: null,
+						fingerprint: rules[0].fingerprint,
+						...stored[url],
+					}
+				: null,
+		write,
+		submitTrigger: triggers.submit,
+		verify: async (url, basisAt) => verified.push({ url, basisAt }),
+		isArmed: async () => false,
+		dryRun: false,
+		maxTriggers: 1000,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		...overrides,
+	});
+	await triggers.drain();
+	stats.triggered = triggers.stats.triggered;
+	assertInvariant(stats);
+	return { stats, written, triggered, verified, rules };
+};
+
+test('MAPPED FIELD: the page disagrees with an UNCHANGED origin -> trigger, counted per field, record cleared', async () => {
+	const signature = await apiSig();
+	const { stats, triggered, written } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.equal(stats.unchanged, 1, 'the origin did not change — the bucket says so');
+	assert.equal(stats.pageMismatch, 1);
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } }, 'decomposed by field');
+	assert.deepEqual(stats.slotChanges, {}, 'no origin change to decompose');
+	assert.equal(written[0].clearClaim, true, 'the trigger clears the record with the claim');
+});
+
+test('the same page AGREEING on every mapped field -> unchanged, nothing triggered, nothing written', async () => {
+	const signature = await apiSig();
+	const { stats, triggered, written } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, []);
+	assert.deepEqual(written, [], 'a converged corpus still pays no write per probe');
+	assert.equal(stats.pageMismatch, 0);
+	assert.deepEqual(stats.fieldMismatch, {});
+});
+
+test('CAUGHT UP: the origin changed and the page ALREADY shows the new value -> baseline moves, nothing triggered', async () => {
+	// A cadence render landed after the rename: re-rendering again would buy nothing.
+	const before = await apiSig();
+	const after = await apiSig({ title: 'Red Running Shoe' });
+	const { stats, triggered, written } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: after },
+		stored: { [URL_A]: { signature: before, pageFacts: await RECORD({ title: 'Red Running Shoe' }) } },
+	});
+	assert.deepEqual(triggered, []);
+	assert.equal(stats.changed, 1, 'still a change — for the canary, the rest of the corpus has not caught up');
+	assert.equal(stats.caughtUp, 1);
+	assert.deepEqual(stats.slotChanges, { pdp: { 0: 1 } });
+	assert.equal(written.length, 1);
+	assert.equal(written[0].signature, after, 'the new baseline, so the next pass compares against it');
+	assert.equal(written[0].rowExists, true);
+	assert.notEqual(written[0].clearClaim, true, 'nothing was expired, so the record stands');
+});
+
+test('a change the page has NOT caught up with triggers — and is a page mismatch too', async () => {
+	const { stats, triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'Red Running Shoe' }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.equal(stats.caughtUp, 0);
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } });
+});
+
+test('a change in an UNMAPPED slot triggers exactly as before, even when every mapped field agrees', async () => {
+	const { stats, triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ regular: 34.99 }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.equal(stats.caughtUp, 0);
+	assert.deepEqual(stats.slotChanges, { pdp: { 5: 1 } });
+	// ...and a change spanning a caught-up slot AND an unmapped one still triggers.
+	const both = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'Red Running Shoe', regular: 34.99 }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD({ title: 'Red Running Shoe' }) } },
+	});
+	assert.deepEqual(both.triggered, [URL_A]);
+	assert.equal(both.stats.caughtUp, 0);
+});
+
+test('a change in a mapped slot with NO page record (or a record that cannot compare) triggers — no evidence, no suppression', async () => {
+	for (const pageFacts of [null, await RECORD({ title: null }), '{corrupt']) {
+		const { stats, triggered } = await runMappedPass({
+			rows: [row(URL_A)],
+			answers: { [URL_A]: await apiSig({ title: 'Red Running Shoe' }) },
+			stored: { [URL_A]: { signature: await apiSig(), pageFacts } },
+		});
+		assert.deepEqual(triggered, [URL_A], `record ${pageFacts}`);
+		assert.equal(stats.caughtUp, 0);
+		assert.equal(stats.pageMismatch, 0, 'and no claim is not a mismatch');
+	}
+});
+
+test('skus: a changed SKU the page does not list is NOT caught up, even though every listed SKU agrees', async () => {
+	const skus = (price) => [
+		{ sku: '111', availability: 'In Stock', price: 19.99 },
+		{ sku: '999', availability: 'In Stock', price }, // beyond the page's truncated offer list
+	];
+	const { triggered, stats } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ skus: skus(4) }) },
+		stored: { [URL_A]: { signature: await apiSig({ skus: skus(5) }), pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A], 'swallowing this change is the failure caught-up must not have');
+	assert.equal(stats.caughtUp, 0);
+	assert.equal(stats.pageMismatch, 0, 'the SKUs both sides list agree — the page is not wrong where it can be checked');
+	// A repriced SKU the page DOES list, already showing the new price: caught up.
+	const listed = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig() },
+		stored: {
+			[URL_A]: {
+				signature: await apiSig({ skus: [{ sku: '111', availability: 'In Stock', price: 21.99 }, API().skus[1]] }),
+				pageFacts: await RECORD(),
+			},
+		},
+	});
+	assert.deepEqual(listed.triggered, []);
+	assert.equal(listed.stats.caughtUp, 1);
+});
+
+test('IGNORED: a change confined to ignoreChanges writes the baseline, triggers nothing, and is NOT a change for the canary', async () => {
+	const rows = [];
+	const answers = {};
+	const stored = {};
+	for (let i = 0; i < 10; i++) {
+		const url = `https://example.com/product/prd-${i}/`;
+		rows.push(row(url));
+		answers[url] = await apiSig({ inventory: 11 - i });
+		stored[url] = { signature: await apiSig(), pageFacts: null };
+	}
+	const { stats, triggered, written } = await runMappedPass({ rows, answers, stored });
+	assert.deepEqual(triggered, []);
+	assert.equal(stats.ignored, 10);
+	assert.equal(stats.unchanged, 10, 'bucketed unchanged: for mass-change detection it is not a change');
+	assert.equal(stats.changed, 0);
+	assert.deepEqual(stats.slotChanges, { pdp: { 4: 10 } }, 'but still counted per slot');
+	assert.equal(written.length, 10, 'each baseline moves, so the next pass compares against the new value');
+	// THE CANARY: a site-wide edit of an ignored field must not trip a route-wide invalidation.
+	assert.equal(changeProbe.canaryVerdict(stats, { threshold: 0.1, minSample: 5 }).tripped, false);
+	// Control: the same volume of change in a slot that is NOT ignored trips it.
+	for (const url of Object.keys(answers)) answers[url] = await apiSig({ regular: 1 });
+	const control = await runMappedPass({ rows, answers, stored });
+	assert.equal(control.stats.changed, 10);
+	assert.equal(changeProbe.canaryVerdict(control.stats, { threshold: 0.1, minSample: 5 }).tripped, true);
+});
+
+test('ignored + caught up together: nothing triggers; ignored + unmapped: triggers', async () => {
+	const quiet = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'Red Running Shoe', inventory: 3 }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD({ title: 'Red Running Shoe' }) } },
+	});
+	assert.deepEqual(quiet.triggered, []);
+	assert.equal(quiet.stats.caughtUp, 1);
+	assert.equal(quiet.stats.ignored, 0, 'not ignored-only: the title changed too');
+	const loud = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ regular: 1, inventory: 3 }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(loud.triggered, [URL_A]);
+});
+
+test('a status-signal literal transition is never ignored or caught up — it is a state, not slots', async () => {
+	const { stats, triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: 'unavailable' },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.deepEqual(stats.slotChanges, { pdp: { signal: 1 } });
+	assert.equal(stats.pageMismatch, 0, 'a literal carries no values to compare');
+});
+
+test('APPENDED path (#206) rows: a mapped disagreement triggers and a caught-up change is absorbed and upgraded', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const OLD = { ...MAPPED_RULE, extract: MAPPED_RULE.extract.slice(0, 5), pageCheck: undefined };
+	const oldFp = compileProbeRules([OLD])[0].fingerprint;
+	const { guard } = guardFor({ threshold: 0, minWitnessed: 1 }); // disarms on its first witness
+	// Unchanged prefix, page wrong on a mapped field -> trigger.
+	const wrong = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig() },
+		stored: {
+			[URL_A]: { signature: await apiSig({}, OLD), fingerprint: oldFp, pageFacts: await RECORD({ title: 'Old' }) },
+		},
+		guard,
+	});
+	assert.equal(wrong.stats.extended, 1);
+	assert.deepEqual(wrong.triggered, [URL_A]);
+	// An appended-path row is never WITNESSED: its new slots have no baseline to be unchanged against.
+	assert.equal(wrong.stats.fieldGuard.pdp['0:title'].witnessed, 0);
+	// Changed old slot the page already shows -> caught up, and the write upgrades the baseline.
+	const caught = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'Red Running Shoe' }) },
+		stored: {
+			[URL_A]: {
+				signature: await apiSig({}, OLD),
+				fingerprint: oldFp,
+				pageFacts: await RECORD({ title: 'Red Running Shoe' }),
+			},
+		},
+	});
+	assert.equal(caught.stats.extended, 1);
+	assert.equal(caught.stats.caughtUp, 1);
+	assert.deepEqual(caught.triggered, []);
+	assert.equal(caught.written[0].signature, await apiSig({ title: 'Red Running Shoe' }), 'the full observation');
+	assert.equal(caught.written[0].fingerprint, caught.rules[0].fingerprint, 'under the current fingerprint');
+});
+
+test('MAPPING GUARD: a broken mapping is DISARMED after minWitnessed and stops triggering; it still counts', async () => {
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const rows = [];
+	const answers = {};
+	const stored = {};
+	const signature = await apiSig();
+	for (let i = 0; i < 30; i++) {
+		const url = `https://example.com/product/prd-${i}/`;
+		rows.push(row(url));
+		answers[url] = signature;
+		// Every page "disagrees" on the title: the slot is mapped to the wrong fact.
+		stored[url] = { signature, pageFacts: await RECORD({ title: 'Acme' }) };
+	}
+	const { stats, triggered } = await runMappedPass({ rows, answers, stored, guard });
+	// Witness 10 crosses the threshold and is itself not acted on; 1-9 each re-rendered a page.
+	assert.equal(triggered.length, 9, 'a corpus-wide broken mapping costs ~minWitnessed renders, not the corpus');
+	assert.equal(stats.pageMismatch, 9, 'pageMismatch counts only the actionable (armed) disagreements');
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 30 } }, 'a disarmed field is still counted');
+	assert.deepEqual(
+		disarmed.map((d) => [d.rule, d.field, d.witnessed, d.disagreed]),
+		[['pdp', '0:title', 10, 10]]
+	);
+	assert.deepEqual(stats.fieldGuard.pdp['0:title'], { witnessed: 30, disagreed: 30, armed: false });
+	assert.deepEqual(
+		stats.fieldGuard.pdp['1:canonical'],
+		{ witnessed: 30, disagreed: 0, armed: true },
+		'siblings unaffected'
+	);
+});
+
+test('MAPPING GUARD: rare round trips never disarm — and each one re-renders', async () => {
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 20 });
+	const rows = [];
+	const answers = {};
+	const stored = {};
+	const signature = await apiSig();
+	for (let i = 0; i < 100; i++) {
+		const url = `https://example.com/product/prd-${i}/`;
+		rows.push(row(url));
+		answers[url] = signature;
+		// 2% of pages caught a transient value mid-flip: the genuine round-trip case.
+		stored[url] = { signature, pageFacts: await RECORD(i % 50 === 7 ? { title: 'Red Shoe — Sale' } : {}) };
+	}
+	const { stats, triggered } = await runMappedPass({ rows, answers, stored, guard });
+	assert.equal(triggered.length, 2, 'an individual witnessed disagreement is NEVER suppressed');
+	assert.deepEqual(disarmed, []);
+	assert.deepEqual(stats.fieldGuard.pdp['0:title'], { witnessed: 100, disagreed: 2, armed: true });
+});
+
+test('MAPPING GUARD: the rate is RECENT — a mapping right for a long time and then broken is still disarmed promptly', async () => {
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 10 }); // memory ~100 comparisons
+	const rule = { label: 'pdp', extract: ['title'] };
+	const title = { slot: 0, fact: 'title', compare: 'text', options: {}, label: '0:title' };
+	// A week of agreement...
+	for (let i = 0; i < 100_000; i++) guard.witness(rule, title, false);
+	assert.equal(guard.isArmed(rule, title), true);
+	// ...then the site changes its title template and every re-render disagrees.
+	let spent = 0;
+	while (guard.isArmed(rule, title) && spent < 1000) {
+		guard.witness(rule, title, true);
+		spent++;
+	}
+	assert.equal(disarmed.length, 1);
+	assert.ok(spent < 60, `disarmed after ${spent} disagreements, not after outweighing 100,000 agreements`);
+	// The halved sample never drops below minWitnessed, and a disarm is sticky.
+	for (let i = 0; i < 1000; i++) guard.witness(rule, title, false);
+	assert.equal(guard.isArmed(rule, title), false, 'only a mapping edit or a restart re-arms');
+	// A correct mapping at a steady 2% never trips however long it runs.
+	const { guard: steady } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	for (let i = 0; i < 100_000; i++) steady.witness(rule, title, i % 50 === 0);
+	assert.equal(steady.isArmed(rule, title), true);
+});
+
+test('MAPPING GUARD: only WITNESSED comparisons count — a record older than the baseline proves nothing', async () => {
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 10 });
+	const rows = [];
+	const answers = {};
+	const stored = {};
+	const signature = await apiSig();
+	for (let i = 0; i < 30; i++) {
+		const url = `https://example.com/product/prd-${i}/`;
+		rows.push(row(url));
+		answers[url] = signature;
+		// Rendered BEFORE the baseline was taken: the page may simply predate the current value.
+		stored[url] = { signature, pageFacts: await RECORD({ title: 'Acme' }), pageClaimAt: new Date(500) };
+	}
+	const { triggered, stats } = await runMappedPass({ rows, answers, stored, guard });
+	assert.equal(triggered.length, 30);
+	assert.deepEqual(disarmed, []);
+	assert.equal(stats.fieldGuard.pdp['0:title'].witnessed, 0);
+	// A CHANGED origin is not witnessed either (the page cannot be expected to show a value it predates).
+	const changed = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'New' }) },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Acme' }) } },
+		guard,
+	});
+	assert.equal(changed.stats.fieldGuard.pdp['0:title'].witnessed, 0);
+});
+
+test('MAPPING GUARD: a disarmed field no longer vouches for a caught-up change — the change triggers', async () => {
+	const { guard } = guardFor({ threshold: 0.2, minWitnessed: 1 });
+	const signature = await apiSig();
+	await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Acme' }) } },
+		guard,
+	});
+	const { triggered, stats } = await runMappedPass({
+		rows: [row(URL_B)],
+		answers: { [URL_B]: await apiSig({ title: 'Red Running Shoe' }) },
+		stored: { [URL_B]: { signature, pageFacts: await RECORD({ title: 'Red Running Shoe' }) } },
+		guard,
+	});
+	assert.deepEqual(triggered, [URL_B]);
+	assert.equal(stats.caughtUp, 0);
+});
+
+test('MAPPING GUARD: stays disarmed across a reload of the SAME mapping, re-arms when the mapping changes', async () => {
+	const { guard } = guardFor({ threshold: 0.2, minWitnessed: 1 });
+	const signature = await apiSig();
+	const broken = { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Acme' }) } };
+	await runMappedPass({ rows: [row(URL_A)], answers: { [URL_A]: signature }, stored: broken, guard });
+	// A config reload compiles NEW field objects for the same mapping: still disarmed.
+	const reloaded = await runMappedPass({ rows: [row(URL_A)], answers: { [URL_A]: signature }, stored: broken, guard });
+	assert.equal(reloaded.stats.fieldGuard.pdp['0:title'].armed, false);
+	assert.deepEqual(reloaded.triggered, []);
+	// The operator fixes the mapping (slot 0 now compares against h1): a new key, a clean record.
+	const fixed = {
+		...MAPPED_RULE,
+		pageCheck: {
+			...MAPPED_RULE.pageCheck,
+			fields: [{ slot: 0, fact: 'h1', compare: 'text' }, ...MAPPED_RULE.pageCheck.fields.slice(1)],
+		},
+	};
+	const after = await runMappedPass({
+		rulesRaw: [fixed],
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Acme', h1: 'Red Shoe' }) } },
+		guard,
+	});
+	assert.equal(after.stats.fieldGuard.pdp['0:h1'].armed, true);
+	assert.deepEqual(after.triggered, []);
+});
+
+test('MAPPING GUARD in DRY RUN: counts and disarms (the dry-run week finds a broken mapping), triggers nothing', async () => {
+	const { guard, disarmed } = guardFor({ threshold: 0.2, minWitnessed: 5 });
+	const rows = [];
+	const answers = {};
+	const stored = {};
+	const signature = await apiSig();
+	for (let i = 0; i < 8; i++) {
+		const url = `https://example.com/product/prd-${i}/`;
+		rows.push(row(url));
+		answers[url] = signature;
+		stored[url] = { signature, pageFacts: await RECORD({ title: 'Acme' }) };
+	}
+	const { triggered, written } = await runMappedPass({ rows, answers, stored, guard, dryRun: true });
+	assert.deepEqual(triggered, []);
+	assert.equal(disarmed.length, 1);
+	assert.ok(
+		written.every((w) => w.clearClaim !== true),
+		'dry run never clears the record'
+	);
+});
+
+test('the process guard WARNS loudly on disarm, naming the rule, the field and its extract path', async (t) => {
+	const { applyOptions } = await import('../src/config.js');
+	t.after(() => applyOptions({}));
+	applyOptions({ changeProbe: { mappingGuard: { threshold: 0.5, minWitnessed: 2 } } });
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const [rule] = compileProbeRules([MAPPED_RULE]);
+	// The same factory the sweep uses, with the live config and the real warning.
+	const signature = await apiSig();
+	const guard = changeProbe.__mappingGuardForTest();
+	for (const url of [URL_A, URL_B]) {
+		await changeProbe.runProbePass({
+			rows: stream([row(url)]),
+			rules: [rule],
+			ownerOf: () => 'node-a',
+			hostname: 'node-a',
+			probe: async () => signature,
+			read: async () => ({
+				signature,
+				probedAt: BASELINE_AT,
+				pageClaimAt: RENDERED_AT,
+				pageFacts: await RECORD({ title: 'Acme' }),
+				fingerprint: rule.fingerprint,
+			}),
+			write: async () => {},
+			submitTrigger: async () => 'queued',
+			guard,
+			dryRun: true,
+			maxTriggers: 10,
+			concurrency: 1,
+			ratePerSecond: 1000,
+			pause: async () => {},
+		});
+	}
+	assert.equal(warns.length, 1);
+	assert.match(
+		warns[0],
+		/change-probe pdp: pageCheck field 0:title \(extract\[0\] "title", compare text\) is DISARMED/
+	);
+	assert.match(warns[0], /2 of 2 recent witnessed comparisons \(100\.0%\)/);
+});
+
+test('verification: a pair+fields rule verifies only when NO armed mapped field disagrees', async () => {
+	const PAIRED = {
+		...MAPPED_RULE,
+		extract: [...MAPPED_RULE.extract, 'price', 'available'],
+		pageCheck: { ...MAPPED_RULE.pageCheck, priceFrom: 6, availableFrom: 7 },
+	};
+	const json = { ...API(), price: 19.99, available: true };
+	const signature = await signedBy(PAIRED, json);
+	const claim = JSON.stringify([['19.99'], true]);
+	const armedPass = (pageFacts) =>
+		runMappedPass({
+			rulesRaw: [PAIRED],
+			rows: [row(URL_A)],
+			answers: { [URL_A]: signature },
+			stored: { [URL_A]: { signature, pageSignature: claim, pageFacts } },
+			isArmed: async () => true,
+		});
+	const agreeing = await armedPass(await RECORD());
+	assert.deepEqual(
+		agreeing.verified.map((v) => v.url),
+		[URL_A]
+	);
+	const wrong = await armedPass(await RECORD({ title: 'Acme' }));
+	assert.deepEqual(wrong.verified, [], 'a page wrong on a mapped field is never certified');
+	assert.deepEqual(wrong.triggered, [URL_A]);
+	// No record (older renderer): the claim pair alone certifies, exactly as before fields existed.
+	const noRecord = await armedPass(null);
+	assert.deepEqual(
+		noRecord.verified.map((v) => v.url),
+		[URL_A]
+	);
+});
+
+test('verification: a fields-only rule needs an armed mapped field that AGREED — no record, no proof', async () => {
+	const signature = await apiSig();
+	const pass = (storedRow, answer = signature) =>
+		runMappedPass({
+			rows: [row(URL_A)],
+			answers: { [URL_A]: answer },
+			stored: { [URL_A]: storedRow },
+			isArmed: async () => true,
+		});
+	assert.deepEqual(
+		(await pass({ signature, pageFacts: await RECORD() })).verified.map((v) => v.url),
+		[URL_A]
+	);
+	assert.deepEqual((await pass({ signature, pageFacts: null })).verified, [], 'nothing was compared');
+	// An ignored change: the page's visible fields did not move, and they agree — verified.
+	const ignored = await pass({ signature, pageFacts: await RECORD() }, await apiSig({ inventory: 1 }));
+	assert.equal(ignored.stats.ignored, 1);
+	assert.deepEqual(
+		ignored.verified.map((v) => v.url),
+		[URL_A]
+	);
+	// A caught-up change: the baseline just moved — verified on the next pass, not this one.
+	const caught = await pass({ signature, pageFacts: await RECORD({ title: 'New' }) }, await apiSig({ title: 'New' }));
+	assert.equal(caught.stats.caughtUp, 1);
+	assert.deepEqual(caught.verified, []);
+});
+
+test('dry run: a caught-up change still moves the baseline; a mapped mismatch writes without clearing the record', async () => {
+	const caught = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: await apiSig({ title: 'New' }) },
+		stored: { [URL_A]: { signature: await apiSig(), pageFacts: await RECORD({ title: 'New' }) } },
+		dryRun: true,
+	});
+	assert.equal(caught.written.length, 1);
+	assert.equal(caught.stats.caughtUp, 1);
+	const signature = await apiSig();
+	const wrong = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD({ title: 'Acme' }) } },
+		dryRun: true,
+	});
+	assert.deepEqual(wrong.triggered, []);
+	assert.equal(wrong.stats.pageMismatch, 1);
+	assert.equal(wrong.written.length, 1);
+	assert.notEqual(wrong.written[0].clearClaim, true);
+});
+
+test('slotChanges decomposes changed by slot for EVERY rule — a rule with no pageCheck too', async () => {
+	const { stats } = await runPass({
+		rows: [row(URL_A), row(URL_B)],
+		answers: { [URL_A]: JSON.stringify([2]), [URL_B]: JSON.stringify([1]) },
+		stored: { [URL_A]: JSON.stringify([1]), [URL_B]: JSON.stringify([1]) },
+	});
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(stats.slotChanges, { pdp: { 0: 1 } });
+	assert.equal(stats.fieldGuard, undefined, 'no mapped fields, no guard snapshot');
+});
+
+// ---- recordPageClaim: the page record -------------------------------------------------------------
+
+const mappedClaimHarness = async ({ existing = null, pageCheck } = {}) => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			rules: [
+				{
+					label: 'pdp',
+					pathPattern: '^/product/prd-',
+					source: 'request',
+					request: { urlTemplate: 'https://api.example.com/x', method: 'POST', body: '{}' },
+					extract: ['title', 'b', 'price', 'available'],
+					pageCheck: pageCheck ?? {
+						enabled: true,
+						priceFrom: 2,
+						availableFrom: 3,
+						fields: [{ slot: 0, fact: 'title', compare: 'text' }],
+					},
+				},
+			],
+		},
+	});
+	const calls = { get: [], put: [], patch: [] };
+	globalThis.databases.probe_state.ProbeState = {
+		async get(query) {
+			calls.get.push(query);
+			return existing;
+		},
+		async put(id, row) {
+			calls.put.push({ id, row });
+		},
+		async patch(id, patch) {
+			calls.patch.push({ id, patch });
+		},
+	};
+	return calls;
+};
+const FACTS_IN = { title: 'Red Shoe', h1: 'Red Shoe', product: { offers: [['1', '35.99', 'USD', 'InStock']] } };
+
+test('recordPageClaim stores the canonical page record in the SAME write as the claim and its stamp', async (t) => {
+	t.after(restoreConfig);
+	const calls = await mappedClaimHarness({ existing: { url: CLAIM_URL } });
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000, { pageFacts: FACTS_IN });
+	const { canonicalPageFacts } = await import('../src/util/changeProbeSpec.js');
+	assert.equal(calls.put.length, 0);
+	assert.equal(calls.patch.length, 1, 'one write — no extra read or write for the record');
+	assert.deepEqual(calls.patch[0].patch, {
+		pageSignature: JSON.stringify([['35.99'], true]),
+		pageFacts: JSON.stringify(canonicalPageFacts(FACTS_IN)),
+		pageClaimAt: new Date(1_700_000_000_000),
+	});
+	// A missing row is seeded with put, record included.
+	const seeded = await mappedClaimHarness();
+	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000, { pageFacts: FACTS_IN });
+	assert.equal(seeded.put.length, 1);
+	assert.equal(seeded.put[0].row.pageFacts, JSON.stringify(canonicalPageFacts(FACTS_IN)));
+	assert.equal(
+		seeded.put[0].row.pageSignature,
+		null,
+		'the page declared no offers: no claim, and the record still stands'
+	);
+});
+
+test('recordPageClaim: ABSENT pageFacts is an old renderer — warn hourly, and the record is stored EMPTY', async (t) => {
+	t.after(restoreConfig);
+	const calls = await mappedClaimHarness({ existing: { url: CLAIM_URL } });
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000);
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000);
+	assert.equal(warns.length, 1, 'throttled');
+	assert.match(warns[0], /older than @harperfast\/prerender-browser 1\.37\.0/);
+	// Null, not left alone: the row's older record describes a page this render just replaced.
+	assert.equal(calls.patch[0].patch.pageFacts, null);
+	assert.equal(calls.patch[0].patch.pageSignature, JSON.stringify([['35.99'], true]), 'the claim is recorded as ever');
+	// On a missing row with nothing to record, no row is created at all.
+	const empty = await mappedClaimHarness();
+	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000);
+	assert.equal(empty.put.length + empty.patch.length, 0);
+});
+
+test('recordPageClaim: NULL pageFacts means the extraction ran and found nothing — silent, stored null', async (t) => {
+	t.after(restoreConfig);
+	const calls = await mappedClaimHarness({ existing: { url: CLAIM_URL } });
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000, { pageFacts: null });
+	assert.equal(warns.length, 0);
+	assert.equal(calls.patch[0].patch.pageFacts, null);
+});
+
+test('recordPageClaim REFUSES an oversized record (stored null, warned), never truncates it', async (t) => {
+	t.after(restoreConfig);
+	const calls = await mappedClaimHarness({ existing: { url: CLAIM_URL } });
+	const warns = [];
+	globalThis.logger.warn = (message) => warns.push(message);
+	const huge = { title: 'x', breadcrumbs: Array.from({ length: 30 }, () => 'y'.repeat(2000)) };
+	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000, { pageFacts: huge });
+	assert.equal(calls.patch[0].patch.pageFacts, null);
+	assert.match(warns[0], /over the 16384-byte bound — not stored/);
+});
+
+test('recordPageClaim: a render that did not store EVERY default device records no facts', async (t) => {
+	t.after(restoreConfig);
+	const calls = await mappedClaimHarness({ existing: { url: CLAIM_URL } });
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000, {
+		pageFacts: FACTS_IN,
+		complete: false,
+	});
+	assert.equal(calls.patch[0].patch.pageFacts, null, 'the other device page is older than this record would claim');
+});
+
+test('recordPageClaim: a fields-only rule records the page record and no claim; a pair-only rule no record', async (t) => {
+	t.after(restoreConfig);
+	const warns = [];
+	const fieldsOnly = await mappedClaimHarness({
+		existing: { url: CLAIM_URL },
+		pageCheck: { enabled: true, fields: [{ slot: 0, fact: 'title', compare: 'text' }] },
+	});
+	globalThis.logger.warn = (message) => warns.push(message);
+	await changeProbe.recordPageClaim(CLAIM_URL, undefined, 1_700_000_000_000, { pageFacts: FACTS_IN });
+	assert.equal(fieldsOnly.patch[0].patch.pageSignature, null);
+	assert.ok(fieldsOnly.patch[0].patch.pageFacts);
+	assert.deepEqual(warns, [], 'no claim pair, so an old structuredOffers-less renderer is not its concern');
+	// A rule with only the claim pair behaves exactly as before: no record, and no write at all
+	// when the render yields no claim.
+	const pairOnly = await mappedClaimHarness({
+		existing: { url: CLAIM_URL },
+		pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
+	});
+	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000, { pageFacts: FACTS_IN });
+	assert.deepEqual(Object.keys(pairOnly.patch[0].patch).sort(), ['pageClaimAt', 'pageSignature']);
+	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000, { pageFacts: FACTS_IN });
+	assert.equal(pairOnly.patch.length, 1, 'no claim, no write — exactly as before fields existed');
+});
+
+test('changeProbeStatus names a rule’s mapped fields and ignored slots only when it has them', async (t) => {
+	t.after(restoreConfig);
+	await mappedClaimHarness({
+		pageCheck: { enabled: true, fields: [{ slot: 0, fact: 'title', compare: 'text' }], ignoreChanges: [1] },
+	});
+	const status = await changeProbe.changeProbeStatus();
+	assert.deepEqual(status.rules[0].pageFields, ['0:title:text']);
+	assert.deepEqual(status.rules[0].ignoreChanges, [1]);
+	await mappedClaimHarness({ pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 } });
+	const plain = await changeProbe.changeProbeStatus();
+	assert.deepEqual(Object.keys(plain.rules[0]).sort(), ['invalidateScope', 'label', 'pathPattern', 'source']);
 });

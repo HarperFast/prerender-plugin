@@ -98,6 +98,16 @@ const compileRule = (raw, index, warn) => {
 			warn(`change-probe ${label}: source "request" requires extract — a non-empty array of value paths`);
 			return null;
 		}
+		// A malformed tuple projection would extract null on every probe, forever — a slot that looks
+		// configured and watches nothing. Refused here, where the operator sees it, like any other
+		// rule defect.
+		for (const [i, path] of raw.extract.entries()) {
+			const problem = extractPathProblem(path);
+			if (problem) {
+				warn(`change-probe ${label}: extract[${i}] "${path}": ${problem}`);
+				return null;
+			}
+		}
 		request = { urlTemplate: raw.request.urlTemplate, method, headers, body };
 		extract = raw.extract.slice();
 	} else {
@@ -165,54 +175,21 @@ const compileRule = (raw, index, warn) => {
 	// Which extracted values correspond to what the PAGE renders, so the probe can ask "does the
 	// cached page still agree with the origin" as well as "did the origin change". Site-specific
 	// by nature: only the operator knows which field of their endpoint is the price the page
-	// prints. Indices into `extract`, so nothing new is fetched. Dropped whole (not per-field) —
-	// a half-configured mapping would compare the wrong column.
+	// prints. Indices into `extract`, so nothing new is fetched. See `compilePageCheck`.
 	let pageCheck = null;
 	if (raw.pageCheck !== undefined && raw.pageCheck !== null) {
 		const pc = raw.pageCheck;
 		if (typeof pc !== 'object' || Array.isArray(pc)) {
-			warn(`change-probe ${label}: pageCheck must be an object { enabled, priceFrom, availableFrom }`);
+			warn(
+				`change-probe ${label}: pageCheck must be an object { enabled, priceFrom, availableFrom, fields, ignoreChanges }`
+			);
 		} else if (pc.enabled === true) {
 			if (source !== 'request') {
 				// In document mode the stored signature IS the page's own offers, so the page can
 				// never disagree with itself and the comparison is meaningless.
 				warn(`change-probe ${label}: pageCheck applies to source "request" only — ignored`);
 			} else {
-				const inBounds = (v) => Number.isInteger(v) && v >= 0 && v < extract.length;
-				if (!inBounds(pc.priceFrom) || !inBounds(pc.availableFrom)) {
-					warn(
-						`change-probe ${label}: pageCheck.priceFrom and .availableFrom must be integer indices into ` +
-							`extract (0-${extract.length - 1}) — pageCheck ignored`
-					);
-				} else {
-					pageCheck = { priceFrom: pc.priceFrom, availableFrom: pc.availableFrom, vocabulary: null };
-					// The rule's own availability words, on top of the built-in schema.org/retail sets.
-					// Tokenized the same way the endpoint's values will be, so "In Stock" and "IN_STOCK" in
-					// config meet "in stock" in a response. Invalid lists drop the vocabulary, not pageCheck:
-					// the built-in words still apply.
-					const words = (key) => {
-						const list = pc[key];
-						if (list === undefined || list === null) return [];
-						if (!Array.isArray(list) || list.some((w) => typeof w !== 'string' || !availabilityToken(w))) {
-							warn(`change-probe ${label}: pageCheck.${key} must be an array of availability words — ignored`);
-							return null;
-						}
-						return list.map(availabilityToken);
-					};
-					const available = words('availableValues');
-					const unavailable = words('unavailableValues');
-					if (available && unavailable && (available.length || unavailable.length)) {
-						const overlap = available.filter((w) => unavailable.includes(w));
-						if (overlap.length) {
-							warn(
-								`change-probe ${label}: pageCheck.availableValues and .unavailableValues both list ` +
-									`${overlap.join(', ')} — vocabulary ignored`
-							);
-						} else {
-							pageCheck.vocabulary = { available: new Set(available), unavailable: new Set(unavailable) };
-						}
-					}
-				}
+				pageCheck = compilePageCheck(pc, extract, label, warn);
 			}
 		} else if (pc.enabled) {
 			// `enabled: "true"` (a YAML/JSON string) must not silently disable: a config that LOOKS
@@ -240,6 +217,186 @@ const compileRule = (raw, index, warn) => {
 	// extended row of a pass, and a rule is compiled once per config.
 	rule.statusSignalSignatures = new Set(statusSignals.map((signal) => signal.signature));
 	return rule;
+};
+
+/**
+ * Compile an ENABLED request-mode `pageCheck` block, or null when nothing in it is usable.
+ *
+ * Three independent parts, each validated on its own so one bad part never costs the others:
+ *
+ *   priceFrom/availableFrom  the original price + availability claim, compiled EXACTLY as before —
+ *                            dropped as a pair if either index is out of bounds, because a
+ *                            half-applied pair compares the wrong column. Optional once `fields`
+ *                            or `ignoreChanges` is given (null here then means "no claim pair").
+ *   fields                   the page-record mapping (`compilePageFields`): a bad entry drops that
+ *                            entry alone, with a warning.
+ *   ignoreChanges            slots whose origin changes never trigger (`compileIgnoreChanges`).
+ *
+ * The vocabulary (availableValues/unavailableValues) serves both the pair and a `skus` field, so it
+ * compiles whenever the block survives.
+ */
+const compilePageCheck = (pc, extract, label, warn) => {
+	const inBounds = (v) => Number.isInteger(v) && v >= 0 && v < extract.length;
+	const fields = compilePageFields(pc.fields, inBounds, extract, label, warn);
+	const ignoreChanges = compileIgnoreChanges(pc.ignoreChanges, inBounds, extract, label, warn);
+	const more = fields.length > 0 || ignoreChanges.length > 0;
+	let priceFrom = null;
+	let availableFrom = null;
+	// Without fields or ignoreChanges the pair is the whole block, so it is required exactly as it
+	// always was. With them it is optional — but a pair that IS given must still be a valid one.
+	if (
+		!more ||
+		(pc.priceFrom !== undefined && pc.priceFrom !== null) ||
+		(pc.availableFrom !== undefined && pc.availableFrom !== null)
+	) {
+		if (!inBounds(pc.priceFrom) || !inBounds(pc.availableFrom)) {
+			warn(
+				`change-probe ${label}: pageCheck.priceFrom and .availableFrom must be integer indices into ` +
+					`extract (0-${extract.length - 1}) — ` +
+					(more
+						? 'the price/availability claim is ignored (fields and ignoreChanges still apply)'
+						: 'pageCheck ignored')
+			);
+			if (!more) return null;
+		} else {
+			priceFrom = pc.priceFrom;
+			availableFrom = pc.availableFrom;
+		}
+	}
+	return { priceFrom, availableFrom, vocabulary: compileVocabulary(pc, label, warn), fields, ignoreChanges };
+};
+
+/**
+ * The rule's own availability words, on top of the built-in schema.org/retail sets. Tokenized the
+ * same way the endpoint's values will be, so "In Stock" and "IN_STOCK" in config meet "in stock" in
+ * a response. Invalid lists drop the vocabulary, not pageCheck: the built-in words still apply.
+ */
+const compileVocabulary = (pc, label, warn) => {
+	const words = (key) => {
+		const list = pc[key];
+		if (list === undefined || list === null) return [];
+		if (!Array.isArray(list) || list.some((w) => typeof w !== 'string' || !availabilityToken(w))) {
+			warn(`change-probe ${label}: pageCheck.${key} must be an array of availability words — ignored`);
+			return null;
+		}
+		return list.map(availabilityToken);
+	};
+	const available = words('availableValues');
+	const unavailable = words('unavailableValues');
+	if (!available || !unavailable || (!available.length && !unavailable.length)) return null;
+	const overlap = available.filter((w) => unavailable.includes(w));
+	if (overlap.length) {
+		warn(
+			`change-probe ${label}: pageCheck.availableValues and .unavailableValues both list ` +
+				`${overlap.join(', ')} — vocabulary ignored`
+		);
+		return null;
+	}
+	return { available: new Set(available), unavailable: new Set(unavailable) };
+};
+
+/**
+ * `pageCheck.fields`: which extracted slot holds what the page shows as which PAGE FACT, and how
+ * the two are compared. Each entry `{ slot, fact, compare, ...options }` compiles to
+ * `{ slot, fact, compare, options, label }` where `label` ("<slot>:<fact>") names it in stats and
+ * warnings.
+ *
+ * DROPPED PER ENTRY, never the rule and never the list: a mapping entry is independent of its
+ * siblings (each compares its own slot to its own fact), so a typo in one is no reason to stop
+ * checking the others. What IS refused is an entry that could only ever compare wrongly — a
+ * comparator applied to a fact of the wrong kind (a price set against a title), an unknown fact or
+ * comparator, an out-of-bounds slot — because a confident wrong comparison disagrees on every pass
+ * and re-renders every page it matches, forever.
+ */
+const compilePageFields = (list, inBounds, extract, label, warn) => {
+	if (list === undefined || list === null) return [];
+	if (!Array.isArray(list)) {
+		warn(`change-probe ${label}: pageCheck.fields must be an array of { slot, fact, compare } — ignored`);
+		return [];
+	}
+	const fields = [];
+	const seen = new Set();
+	for (const [i, entry] of list.entries()) {
+		const where = `change-probe ${label}: pageCheck.fields[${i}]`;
+		if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+			warn(`${where} must be an object { slot, fact, compare } — entry dropped`);
+			continue;
+		}
+		if (!inBounds(entry.slot)) {
+			warn(`${where}.slot must be an integer index into extract (0-${extract.length - 1}) — entry dropped`);
+			continue;
+		}
+		if (typeof entry.fact !== 'string' || !Object.hasOwn(PAGE_FACTS, entry.fact)) {
+			warn(`${where}.fact must be one of ${Object.keys(PAGE_FACTS).join(', ')} — entry dropped`);
+			continue;
+		}
+		if (typeof entry.compare !== 'string' || !Object.hasOwn(COMPARATORS, entry.compare)) {
+			warn(`${where}.compare must be one of ${Object.keys(COMPARATORS).join(', ')} — entry dropped`);
+			continue;
+		}
+		const comparator = COMPARATORS[entry.compare];
+		const kind = PAGE_FACTS[entry.fact].kind;
+		if (!comparator.kinds.includes(kind)) {
+			const fitting = Object.keys(COMPARATORS).filter((name) => COMPARATORS[name].kinds.includes(kind));
+			warn(
+				`${where}: compare "${entry.compare}" does not apply to fact "${entry.fact}" (use ${fitting.join(' or ')}) — entry dropped`
+			);
+			continue;
+		}
+		let problem = null;
+		const options = comparator.options(entry, (message) => {
+			problem = message;
+		});
+		if (problem !== null) {
+			warn(`${where}: ${problem} — entry dropped`);
+			continue;
+		}
+		const unknown = Object.keys(entry).filter(
+			(key) => key !== 'slot' && key !== 'fact' && key !== 'compare' && !comparator.keys.includes(key)
+		);
+		if (unknown.length) warn(`${where}: unknown key(s) ${unknown.join(', ')} ignored`);
+		const fieldLabel = `${entry.slot}:${entry.fact}`;
+		if (seen.has(fieldLabel)) {
+			warn(`${where} maps slot ${entry.slot} to ${entry.fact} a second time — entry dropped`);
+			continue;
+		}
+		seen.add(fieldLabel);
+		fields.push({ slot: entry.slot, fact: entry.fact, compare: entry.compare, options, label: fieldLabel });
+	}
+	return fields;
+};
+
+/**
+ * `pageCheck.ignoreChanges`: extract slots whose origin changes do NOT trigger a re-render — the
+ * fields the page cannot show (an inventory counter, a store flag), watched only because the
+ * endpoint returns them next to fields it can. A change confined to these slots writes the new
+ * baseline and triggers nothing, and the canary does not count it as a change either. Returned
+ * sorted and de-duplicated; a bad entry drops alone.
+ */
+const compileIgnoreChanges = (list, inBounds, extract, label, warn) => {
+	if (list === undefined || list === null) return [];
+	if (!Array.isArray(list)) {
+		warn(`change-probe ${label}: pageCheck.ignoreChanges must be an array of extract indices — ignored`);
+		return [];
+	}
+	const slots = new Set();
+	for (const [i, slot] of list.entries()) {
+		if (!inBounds(slot)) {
+			warn(
+				`change-probe ${label}: pageCheck.ignoreChanges[${i}] must be an integer index into extract ` +
+					`(0-${extract.length - 1}) — entry dropped`
+			);
+			continue;
+		}
+		slots.add(slot);
+	}
+	if (slots.size === extract.length) {
+		warn(
+			`change-probe ${label}: pageCheck.ignoreChanges lists EVERY extract slot — no origin change on this rule ` +
+				`will ever trigger a re-render; only page mismatches (pageCheck fields) will`
+		);
+	}
+	return [...slots].sort((a, b) => a - b);
 };
 
 /**
@@ -494,7 +651,11 @@ const availabilityClaim = (raw, vocabulary) => {
  * Null when neither field yields a claim.
  */
 export const apiClaimOf = (values, pageCheck) => {
-	if (!pageCheck || !Array.isArray(values)) return null;
+	// A block with no claim pair (fields or ignoreChanges only) projects no claim at all — an index
+	// of null would read `values[null]` and happen to yield nothing, which is not a contract.
+	if (!pageCheck || !Array.isArray(values) || pageCheck.priceFrom === null || pageCheck.priceFrom === undefined) {
+		return null;
+	}
 	const price = canonicalPrice(values[pageCheck.priceFrom]);
 	const available = availabilityClaim(values[pageCheck.availableFrom], pageCheck.vocabulary ?? null);
 	if (price === null && available === null) return null;
@@ -533,6 +694,489 @@ export const claimsDisagree = (pageClaim, apiClaim) => {
 		return pagePrices.length > 0 && apiPrices.length > 0 && !apiPrices.every((price) => pagePrices.includes(price));
 	} catch {
 		return false;
+	}
+};
+
+// ---- the page record: what each cached page claims, field by field ------------------------------
+
+/**
+ * THE PAGE RECORD generalizes the price/availability claim above to every field a page visibly
+ * states. The renderer reads them off the settled DOM (`pageFacts`, @harperfast/prerender-browser
+ * >= 1.37.0) and posts them with the result; the render path stores them beside the claim
+ * (`ProbeState.pageFacts`, see changeProbe.js recordPageClaim); and each probe compares them with
+ * the slots a rule maps (`pageCheck.fields`). That lets the probe ask "is the CACHED PAGE wrong"
+ * instead of only "did the ORIGIN change" — so it re-renders a page that disagrees on any mapped
+ * field, and does NOT re-render one that already shows the new value (a cadence render that landed
+ * after the change).
+ *
+ * EVERY COMPARATOR FAILS TOWARD NO CLAIM, NEVER A GUESS. Null, absent, empty or unparseable on
+ * either side is "not compared" (null), never a disagreement: a confident wrong comparison
+ * disagrees on every pass and re-renders every page it matches, forever — the one failure this
+ * feature must not have. The comparators are a CLOSED set of typed functions rather than
+ * configurable transforms for the same reason: each one encodes a measured quirk of how an
+ * endpoint and a page state the same fact, and nothing else.
+ */
+
+/** Largest page record stored, in UTF-8 bytes — see `serializePageFacts`. */
+export const PAGE_FACTS_MAX_BYTES = 16 * 1024;
+
+/**
+ * The page facts a mapping may name, with the KIND of value each holds. The kind decides which
+ * comparators apply, so a nonsensical pairing (a price set against a title) is refused at compile
+ * time instead of disagreeing at run time.
+ */
+const PAGE_FACTS = {
+	'canonical': { kind: 'url', get: (facts) => facts.canonical },
+	'title': { kind: 'text', get: (facts) => facts.title },
+	'metaDescription': { kind: 'text', get: (facts) => facts.metaDescription },
+	'h1': { kind: 'text', get: (facts) => facts.h1 },
+	'product.name': { kind: 'text', get: (facts) => facts.product?.name },
+	'product.brand': { kind: 'text', get: (facts) => facts.product?.brand },
+	'product.image': { kind: 'url', get: (facts) => facts.product?.image },
+	'product.rating.value': { kind: 'number', get: (facts) => facts.product?.rating?.[0] },
+	'product.rating.count': { kind: 'number', get: (facts) => facts.product?.rating?.[1] },
+	'product.offers': { kind: 'offers', get: (facts) => facts.product?.offers },
+	'breadcrumbs': { kind: 'names', get: (facts) => facts.breadcrumbs },
+};
+
+/**
+ * Text as a page and an endpoint both state it: NFC, every whitespace run (NBSP and line breaks
+ * included) collapsed to one space, trimmed. Deliberately NOT case-folded and NOT HTML-stripped —
+ * measured, an endpoint's meta description can carry `<br>` and `<li><a …>` while the page's
+ * `<meta name=description>` holds that exact raw string, so stripping would turn a 100% match into
+ * a disagreement. Non-strings and empty text are no claim.
+ */
+const normalizeText = (value) => {
+	if (typeof value !== 'string') return null;
+	const text = value.normalize('NFC').replace(/\s+/g, ' ').trim();
+	return text === '' ? null : text;
+};
+
+/**
+ * A URL's PATH, the only part of it an endpoint and a page reliably agree on: measured, the
+ * endpoint's image URL differed from the page's on every page, only by size query parameters.
+ * Origin, query and fragment are ignored; a relative value resolves against the page's own URL.
+ * `decodeURI` (not `decodeURIComponent`) so `%7E` meets `~` without `%2F` turning into a separator.
+ */
+const pathOf = (value, base) => {
+	if (typeof value !== 'string' || value.trim() === '') return null;
+	const url = URL.parse(value.trim(), base ?? undefined);
+	if (!url) return null;
+	try {
+		return decodeURI(url.pathname);
+	} catch {
+		return url.pathname;
+	}
+};
+
+/** A finite number from a number or a numeric string ("4.0" from an endpoint, 4 from JSON-LD). */
+const numberOf = (value) => {
+	if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+	if (typeof value !== 'string' || value.trim() === '') return null;
+	const n = Number(value.trim());
+	return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * The distinct canonical prices of a value, or null when ANY element is unreadable: a set with a
+ * hole in it cannot be compared for equality, and guessing the hole away would disagree with the
+ * page on every pass for that product. Measured, an endpoint's single "lowest price" is null
+ * exactly when the product is out of stock, so a null here is "no claim" and nothing more.
+ */
+const priceSetOf = (list) => {
+	if (!Array.isArray(list) || !list.length) return null;
+	const prices = new Set();
+	for (const item of list) {
+		const price = canonicalPrice(item);
+		if (price === null) return null;
+		prices.add(price);
+	}
+	return prices;
+};
+
+/** A SKU key: a non-empty string, or a number in its string form (the renderer's convention). */
+const skuKey = (value) => {
+	if (typeof value === 'string') return value.trim() || null;
+	if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+	return null;
+};
+
+/**
+ * Per-SKU state keyed by SKU, with every SKU that appears more than once set aside in `dups`: two
+ * different states for one key is ambiguous, and ambiguity is no claim.
+ */
+const keyedBySku = (entries, read) => {
+	const map = new Map();
+	const dups = new Set();
+	for (const entry of Array.isArray(entries) ? entries : []) {
+		if (!Array.isArray(entry)) continue;
+		const state = read(entry);
+		if (state.sku === null) continue;
+		if (map.has(state.sku) || dups.has(state.sku)) {
+			map.delete(state.sku);
+			dups.add(state.sku);
+			continue;
+		}
+		map.set(state.sku, state);
+	}
+	return { map, dups };
+};
+
+// The endpoint's tuples under a field's `tuple` naming, and the page's [sku, price, currency,
+// availability] offers, both as { sku, price, availability }.
+const apiSkus = (value, tuple) =>
+	keyedBySku(value, (entry) => ({
+		sku: skuKey(entry[tuple.sku]),
+		price: tuple.price === null ? undefined : entry[tuple.price],
+		availability: tuple.availability === null ? undefined : entry[tuple.availability],
+	}));
+const pageSkus = (offers) =>
+	keyedBySku(offers, (offer) => ({ sku: skuKey(offer[0]), price: offer[1], availability: offer[3] }));
+
+/**
+ * One SKU on both sides: false when the availability VERDICTS differ (both must be readable — the
+ * same tri-state reduction the claim pair uses, the rule's vocabulary on the endpoint side) or,
+ * when both state one, the prices differ; true when at least one of those was compared and agreed;
+ * null when neither could be.
+ */
+const skuVerdict = (api, page, tuple, vocabulary) => {
+	let compared = false;
+	if (tuple.availability !== null) {
+		const apiInStock = availabilityClaim(api.availability, vocabulary);
+		const pageInStock = availabilityVerdict(page.availability);
+		if (typeof apiInStock === 'boolean' && typeof pageInStock === 'boolean') {
+			if (apiInStock !== pageInStock) return false;
+			compared = true;
+		}
+	}
+	if (tuple.price !== null) {
+		const apiPrice = canonicalPrice(api.price);
+		const pagePrice = canonicalPrice(page.price);
+		if (apiPrice !== null && pagePrice !== null) {
+			if (apiPrice !== pagePrice) return false;
+			compared = true;
+		}
+	}
+	return compared ? true : null;
+};
+
+const noOptions = () => ({});
+
+/**
+ * The closed set of comparators. `kinds` are the fact kinds each applies to, `keys` the extra
+ * entry keys it reads, `options` validates them (calling `fail` on a bad one), and `compare`
+ * returns true (agrees), false (disagrees) or null (not compared).
+ */
+const COMPARATORS = {
+	// Exact after normalizeText. Measured 100% on title, product name, h1, meta description, brand.
+	text: {
+		kinds: ['text', 'url'],
+		keys: [],
+		options: noOptions,
+		compare: (api, page) => {
+			const a = normalizeText(api);
+			const b = normalizeText(page);
+			return a === null || b === null ? null : a === b;
+		},
+	},
+	// URL pathname only. Measured 100% on an SEO URL against the canonical's path; required for
+	// images, whose URLs differ on every page by size parameters alone.
+	path: {
+		kinds: ['url'],
+		keys: [],
+		options: noOptions,
+		compare: (api, page, field, ctx) => {
+			const a = pathOf(api, ctx.pageUrl);
+			const b = pathOf(page, ctx.pageUrl);
+			return a === null || b === null ? null : a === b;
+		},
+	},
+	// Numeric equality with an optional absolute tolerance: an endpoint's rating is "4.0", the
+	// page's 4.
+	number: {
+		kinds: ['number'],
+		keys: ['tolerance'],
+		options: (entry, fail) => {
+			const tolerance = entry.tolerance === undefined || entry.tolerance === null ? 0 : entry.tolerance;
+			if (typeof tolerance !== 'number' || !Number.isFinite(tolerance) || tolerance < 0) {
+				fail('tolerance must be a finite number >= 0');
+			}
+			return { tolerance };
+		},
+		compare: (api, page, field) => {
+			const a = numberOf(api);
+			const b = numberOf(page);
+			return a === null || b === null ? null : Math.abs(a - b) <= field.options.tolerance + 1e-9;
+		},
+	},
+	// The endpoint's price(s) against the SET of prices the page's offers print (distinct canonical
+	// 2-decimal strings), asked in the only direction a page can answer for itself:
+	//
+	//   a single endpoint price   the page must print it (the claim pair's rule: a page may list
+	//                             several variant prices while the endpoint reports one);
+	//   a list of them            EVERY price the page prints must still be in the endpoint's set.
+	//
+	// NOT set equality, and the difference is load-bearing. A page may list only SOME variants —
+	// measured, one origin's structured data stops at 50 offers while its endpoint lists every
+	// variant — so a price that exists only on an unlisted variant is absent from the page by
+	// construction. Equality would disagree on that product on every pass, re-render it, and
+	// disagree again with the re-render: a perpetual re-render loop the mapping guard cannot see,
+	// because the affected products are a small minority. What the subset test gives up is a new
+	// price on a listed variant while its old price survives on another; per-variant exactness is
+	// what `skus` is for.
+	priceSet: {
+		kinds: ['offers'],
+		keys: [],
+		options: noOptions,
+		compare: (api, page) => {
+			const a = priceSetOf(Array.isArray(api) ? api : [api]);
+			const b = Array.isArray(page) ? priceSetOf(page.map((offer) => (Array.isArray(offer) ? offer[1] : null))) : null;
+			if (a === null || b === null) return null;
+			if (!Array.isArray(api)) return b.has([...a][0]);
+			return [...b].every((price) => a.has(price));
+		},
+	},
+	// An ordered list of names (strings, or objects carrying `nameKey`, default "name") against the
+	// page's list, as a SUFFIX: measured, a page's breadcrumbs open with a site-home crumb the
+	// endpoint omits, so the endpoint's list is compared with the page list's tail of the same
+	// length — no per-site configuration. An endpoint list LONGER than the page's is a disagreement
+	// (the page is missing levels). Extract the list itself, not a `[*]` projection: projections are
+	// sorted, and order is what this compares.
+	names: {
+		kinds: ['names'],
+		keys: ['nameKey'],
+		options: (entry, fail) => {
+			const nameKey = entry.nameKey === undefined || entry.nameKey === null ? 'name' : entry.nameKey;
+			if (typeof nameKey !== 'string' || nameKey === '') fail('nameKey must be a non-empty string');
+			return { nameKey };
+		},
+		compare: (api, page, field) => {
+			if (!Array.isArray(api) || !api.length || !Array.isArray(page) || !page.length) return null;
+			const names = [];
+			for (const item of api) {
+				const raw = item && typeof item === 'object' && !Array.isArray(item) ? item[field.options.nameKey] : item;
+				const name = normalizeText(raw);
+				if (name === null) return null;
+				names.push(name);
+			}
+			const crumbs = page.map(normalizeText);
+			if (crumbs.includes(null)) return null;
+			if (names.length > crumbs.length) return false;
+			const tail = crumbs.slice(crumbs.length - names.length);
+			return names.every((name, i) => name === tail[i]);
+		},
+	},
+	// Per-variant state: the endpoint's tuples (a `[*].{…}` projection) against the page's offers,
+	// keyed by SKU, over the INTERSECTION of SKUs only — measured, a page lists at most 50 SKU offers
+	// where the endpoint lists more, so a SKU missing from either side is not a disagreement.
+	// `tuple` names each tuple position: "sku" (required), "availability", "price", or null to skip
+	// a position; default ["sku", "availability", "price"].
+	skus: {
+		kinds: ['offers'],
+		keys: ['tuple'],
+		options: (entry, fail) => {
+			const names = entry.tuple === undefined || entry.tuple === null ? ['sku', 'availability', 'price'] : entry.tuple;
+			const tuple = { sku: null, availability: null, price: null };
+			if (!Array.isArray(names) || !names.length) {
+				fail('tuple must be an array naming each tuple position ("sku", "availability", "price" or null)');
+				return null;
+			}
+			for (const [i, name] of names.entries()) {
+				if (name === null) continue;
+				if (!Object.hasOwn(tuple, name) || tuple[name] !== null) {
+					fail(`tuple[${i}] must be "sku", "availability", "price" or null, each at most once`);
+					return null;
+				}
+				tuple[name] = i;
+			}
+			if (tuple.sku === null || (tuple.availability === null && tuple.price === null)) {
+				fail('tuple must name "sku" and at least one of "availability" or "price"');
+				return null;
+			}
+			return { tuple };
+		},
+		compare: (api, page, field, ctx) => {
+			if (!Array.isArray(api) || !Array.isArray(page)) return null;
+			const { tuple } = field.options;
+			const endpoint = apiSkus(api, tuple).map;
+			const offers = pageSkus(page).map;
+			let agreed = false;
+			for (const [sku, state] of endpoint) {
+				const offer = offers.get(sku);
+				if (!offer) continue;
+				const verdict = skuVerdict(state, offer, tuple, ctx.vocabulary);
+				if (verdict === false) return false;
+				if (verdict === true) agreed = true;
+			}
+			return agreed ? true : null;
+		},
+	},
+};
+
+/**
+ * One mapped field's verdict: true (the page agrees with the endpoint value), false (disagrees),
+ * null (not compared). `facts` is a parsed page record (`parsePageFacts`), `ctx` is
+ * `{ pageUrl, vocabulary }`. Never throws — a comparator fault on data from a previous release or
+ * a corrupted row must not end the sweep; it is no claim.
+ */
+export const compareField = (field, apiValue, facts, ctx = {}) => {
+	if (!facts || apiValue === null || apiValue === undefined) return null;
+	try {
+		const pageValue = PAGE_FACTS[field.fact].get(facts);
+		if (pageValue === null || pageValue === undefined) return null;
+		return COMPARATORS[field.compare].compare(apiValue, pageValue, field, ctx);
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * Has the page CAUGHT UP with a change in this field's slot — does it already show `after`, the
+ * value the probe just observed in place of `before`? True only on positive evidence, because a
+ * true here is what lets a real change go un-rendered.
+ *
+ * THE PAGE MUST AGREE WITH THE NEW VALUE AND NOT WITH THE OLD ONE. Agreement with `after` alone is
+ * not evidence when the change is invisible to the comparator: a crumb's URL changing inside a
+ * `names` object (only names are compared), a query parameter under `path`, a whitespace edit under
+ * `text`, a variant removed from a `priceSet` without changing the set. The page agrees with both
+ * values then, so nothing says it was re-rendered since — and the part that changed may well be on
+ * the page (a crumb's link) and stale. Those changes trigger, exactly as they did before fields.
+ *
+ * `skus` compares an intersection, so even that proves nothing about the SKU that actually changed —
+ * it may be one the page does not list (the page's offers are truncated), and reading "the SKUs I
+ * can see agree" as "the page caught up" would swallow that change. So every SKU whose tuple changed
+ * is proven on its own: a SKU still at the endpoint must be on the page, agreeing with its new state
+ * and not its old one (a change only in a skipped tuple position proves nothing); a SKU gone from the
+ * endpoint must be gone from the page. A changed tuple that cannot be keyed (no SKU, or a duplicated
+ * one) is not provable at all.
+ */
+export const fieldCaughtUp = (field, before, after, facts, ctx = {}) => {
+	if (compareField(field, after, facts, ctx) !== true) return false;
+	if (compareField(field, before, facts, ctx) === true) return false;
+	if (field.compare !== 'skus') return true;
+	try {
+		const { tuple } = field.options;
+		const was = apiSkus(before, tuple);
+		const now = apiSkus(after, tuple);
+		const page = pageSkus(PAGE_FACTS['product.offers'].get(facts));
+		const beforeTuples = new Set((Array.isArray(before) ? before : []).map((entry) => JSON.stringify(entry)));
+		const afterTuples = new Set((Array.isArray(after) ? after : []).map((entry) => JSON.stringify(entry)));
+		const changed = [
+			...(Array.isArray(after) ? after : []).filter((entry) => !beforeTuples.has(JSON.stringify(entry))),
+			...(Array.isArray(before) ? before : []).filter((entry) => !afterTuples.has(JSON.stringify(entry))),
+		];
+		for (const entry of changed) {
+			const sku = Array.isArray(entry) ? skuKey(entry[tuple.sku]) : null;
+			if (sku === null || was.dups.has(sku) || now.dups.has(sku) || page.dups.has(sku)) return false;
+			const state = now.map.get(sku);
+			const offer = page.map.get(sku);
+			if (state) {
+				if (!offer || skuVerdict(state, offer, tuple, ctx.vocabulary) !== true) return false;
+				const old = was.map.get(sku);
+				if (old && skuVerdict(old, offer, tuple, ctx.vocabulary) === true) return false;
+			} else if (offer) {
+				return false;
+			}
+		}
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * The slot indices at which two signatures differ, or null when that cannot be said: either side
+ * is a status-signal literal (a state, not slots), the shapes differ, or — defensively — the
+ * strings differ with no slot differing. Null means "treat as a change of everything", the safe
+ * reading for every caller (nothing is ignored, nothing is caught up).
+ */
+export const changedSlots = (storedSignature, observedSignature) => {
+	const before = slotsOf(storedSignature);
+	const after = slotsOf(observedSignature);
+	if (!before || !after || before.length !== after.length) return null;
+	const changed = [];
+	for (let i = 0; i < after.length; i++) {
+		if (JSON.stringify(before[i]) !== JSON.stringify(after[i])) changed.push(i);
+	}
+	return changed.length ? changed : null;
+};
+
+/** A signature's slot values, or null for a literal (exported for the sweep's caught-up test). */
+export const signatureSlots = (signature) => slotsOf(signature);
+
+const factString = (value) => (typeof value === 'string' && value !== '' ? value : null);
+const factNumber = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
+/**
+ * The renderer's `pageFacts` reduced to the contract's shape, in a FIXED key order — so the stored
+ * string is canonical (equal facts store equal bytes) and a renderer that sends extra keys or a
+ * wrong type cannot put anything into the record the comparators do not expect. A record where
+ * every fact is empty is null: it can support no comparison, and null says so for free.
+ */
+export const canonicalPageFacts = (raw) => {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+	const p = raw.product;
+	const product =
+		p && typeof p === 'object' && !Array.isArray(p)
+			? {
+					name: factString(p.name),
+					brand: factString(p.brand),
+					image: factString(p.image),
+					rating: Array.isArray(p.rating) ? [factNumber(p.rating[0]), factNumber(p.rating[1])] : null,
+					offers: Array.isArray(p.offers)
+						? p.offers.map((offer) =>
+								Array.isArray(offer)
+									? [factString(offer[0]), factString(offer[1]), factString(offer[2]), factString(offer[3])]
+									: [null, null, null, null]
+							)
+						: null,
+				}
+			: null;
+	const facts = {
+		canonical: factString(raw.canonical),
+		title: factString(raw.title),
+		metaDescription: factString(raw.metaDescription),
+		h1: factString(raw.h1),
+		product:
+			product && (product.name || product.brand || product.image || product.rating || product.offers) ? product : null,
+		breadcrumbs:
+			Array.isArray(raw.breadcrumbs) && raw.breadcrumbs.length && raw.breadcrumbs.every((crumb) => factString(crumb))
+				? raw.breadcrumbs.slice()
+				: null,
+	};
+	return Object.values(facts).some((value) => value !== null) ? facts : null;
+};
+
+/**
+ * The page record as stored: `{ json, bytes, refused }`. `json` is the canonical string, or null
+ * when there is nothing to store OR the record is REFUSED for exceeding PAGE_FACTS_MAX_BYTES.
+ *
+ * WHY 16 KB. The record is written on every render of a mapped URL into a node-local table that
+ * holds one row per probed URL (hundreds of thousands per node), and it is read on every probe of
+ * that URL — so its size is paid in both places, at corpus scale. A typical product page's record
+ * is 1-3 KB (the renderer measures well under 2 KB; 50 SKU offers add ~2 KB); even the renderer's
+ * own 200-offer cap fits at ~10 KB. The renderer's worst case is ~125 KB, and a page that large is
+ * pathological: storing it would make one URL's row cost what fifty normal ones do. Refused rather
+ * than truncated, like the renderer's own bounds — a truncated offer list or trail would disagree
+ * with the endpoint forever — and refusal stores NULL, so that page simply has no record (no
+ * claim) until a render fits.
+ */
+export const serializePageFacts = (raw) => {
+	const facts = canonicalPageFacts(raw);
+	if (!facts) return { json: null, bytes: 0, refused: false };
+	const json = JSON.stringify(facts);
+	const bytes = Buffer.byteLength(json, 'utf8');
+	return bytes > PAGE_FACTS_MAX_BYTES ? { json: null, bytes, refused: true } : { json, bytes, refused: false };
+};
+
+/** A stored page record parsed, or null for anything that is not one (absent, corrupted, legacy). */
+export const parsePageFacts = (json) => {
+	if (typeof json !== 'string' || json === '') return null;
+	try {
+		const facts = JSON.parse(json);
+		return facts && typeof facts === 'object' && !Array.isArray(facts) ? facts : null;
+	} catch {
+		return null;
 	}
 };
 
@@ -629,12 +1273,53 @@ export const substituteTemplate = (template, match) =>
  * value in any other extracted field. This is how a rule watches per-variant state without
  * signing the whole variant object, whose other fields (inventory counters, store data) move
  * without the page moving.
+ *
+ * A trailing TUPLE projection, `[*].{a,b.c}`, projects each element to the tuple `[a, b.c]`
+ * (dotted inner paths, no brackets, no nesting; an unreachable inner path is null). It exists so
+ * per-variant state can be compared BY KEY: `variants[*].{sku,availability,price.value}` keeps each
+ * SKU's availability and price attached to its SKU, where two separate `[*]` projections are each
+ * sorted on their own and lose the pairing. Tuples sort by their JSON like any projected element.
  */
-export const valueAtPath = (value, path) => walkPath(value, String(path).match(PATH_TOKEN) ?? [], 0);
+export const valueAtPath = (value, path) => walkPath(value, tokensOf(path), 0);
 
 // `[*]` and `[N]` are tried BEFORE the bare-name alternative: `*` and digits are legal name
 // characters to that alternative, so ordering it first would tokenize `[*]` as the name `*`.
 const PATH_TOKEN = /\[\*\]|\[\d+\]|[^.[\]]+/g;
+
+// `<prefix ending in [*]>.{inner,inner.path}` — the only place a tuple may appear.
+const TUPLE_TAIL = /^(.*\[\*\])\.\{([^{}]*)\}$/;
+// One inner path of a tuple: dotted names, no brackets, braces, commas or empty segments.
+const TUPLE_INNER = /^[^.[\]{},]+(?:\.[^.[\]{},]+)*$/;
+
+/**
+ * Why an extract path cannot be used, or null. Only tuple syntax is checked — any other string is a
+ * path, and a path to nowhere is data (it extracts null), not a config error. Braces anywhere but a
+ * well-formed trailing tuple, though, can only be a mistyped projection that would silently
+ * extract null on every probe.
+ */
+export const extractPathProblem = (path) => {
+	const text = String(path);
+	if (!text.includes('{') && !text.includes('}')) return null;
+	const match = TUPLE_TAIL.exec(text);
+	if (!match || match[1].includes('{') || match[1].includes('}')) {
+		return 'a tuple projection must END the path, directly after [*] — e.g. "items[*].{sku,price.value}"';
+	}
+	if (match[2].split(',').some((inner) => !TUPLE_INNER.test(inner.trim()))) {
+		return 'each name inside {…} must be a dotted path (no brackets, no empty names)';
+	}
+	return null;
+};
+
+// A path's tokens; a well-formed trailing tuple becomes one final `{ tuple: [tokens, ...] }` token.
+const tokensOf = (path) => {
+	const text = String(path);
+	const match = extractPathProblem(text) === null ? TUPLE_TAIL.exec(text) : null;
+	if (!match) return text.match(PATH_TOKEN) ?? [];
+	return [
+		...(match[1].match(PATH_TOKEN) ?? []),
+		{ tuple: match[2].split(',').map((inner) => inner.trim().match(PATH_TOKEN) ?? []) },
+	];
+};
 
 // A total, stable order over projected elements of any shape — they may be strings, numbers, nulls
 // or whole objects. Comparing their JSON keeps the sort deterministic across passes, which is the
@@ -648,8 +1333,17 @@ const byProjectedValue = (a, b) => {
 const walkPath = (value, tokens, from) => {
 	let current = value;
 	for (let i = from; i < tokens.length; i++) {
-		if (current === null || current === undefined) return undefined;
 		const token = tokens[i];
+		if (typeof token === 'object') {
+			// The tuple: always the last token, and always reached through a `[*]`, so `current` is one
+			// element. An element that is not there still yields a tuple (of nulls), so every element of
+			// the projection has the same shape.
+			return token.tuple.map((inner) => {
+				const field = current === null || current === undefined ? undefined : walkPath(current, inner, 0);
+				return field === undefined ? null : field;
+			});
+		}
+		if (current === null || current === undefined) return undefined;
 		if (token === '[*]') {
 			if (!Array.isArray(current)) return undefined;
 			const projected = current.map((element) => {
