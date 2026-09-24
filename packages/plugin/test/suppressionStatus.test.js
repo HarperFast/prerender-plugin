@@ -494,21 +494,37 @@ test('a client-side redirect landing on a 503 page keeps the source and seeds no
 	assert.equal(stores.target.has(B), false, 'transient destination must not become a suppressed row');
 });
 
-test('a client-side redirect landing on a 404 page retires the source and seeds an http-gone destination', async () => {
-	// The genuine-verdict path the guard must NOT swallow: gone destinations still classify.
+const redirectedToGone = () => ({
+	id: key(A),
+	url: A,
+	statusCode: 404,
+	outcome: 'redirected',
+	redirectedTo: B,
+	isIndexable: false,
+	reason: 'http-error',
+});
+
+test('a client-side redirect landing on a 404 page retires the source and mints no destination row', async () => {
+	// A suppressed row for a 404 destination would block nothing — discovery cannot mint a URL the
+	// origin 404s — and would cost a recheck render (see Target.suppress).
 	seedSource();
-	await postResult({
-		id: key(A),
-		url: A,
-		statusCode: 404,
-		outcome: 'redirected',
-		redirectedTo: B,
-		isIndexable: false,
-		reason: 'http-error',
-	});
+	await postResult(redirectedToGone());
 
 	assert.equal(stores.target.has(A), false, 'source retired — it leads to a page that is gone');
+	assert.equal(stores.target.has(B), false, 'a gone destination nothing targets is not minted');
+	assert.equal(stores.renderSchedule.has(B), false, 'and gets no recheck row');
+});
+
+test('a client-side redirect landing on a 404 page still classifies a TARGETED destination as gone', async () => {
+	// The genuine-verdict path the auth/transient guard must NOT swallow: gone destinations still
+	// classify. Sitemap-listed, so the gone verdict suppresses rather than retiring on first sight.
+	seedSource();
+	stores.target.set(B, { url: B, sitemapUrl: SITEMAP });
+	await postResult(redirectedToGone());
+
+	assert.equal(stores.target.has(A), false, 'source retired');
 	assert.equal(stores.target.get(B)?.suppressedReason, 'http-gone', 'destination suppressed under the gone class');
+	assert.equal(stores.target.get(B)?.sitemapUrl, SITEMAP, 'its sitemap attribution is kept');
 });
 
 test('a BigInt strikes value (Harper numeric surfacing) still counts toward the slow lane', async () => {

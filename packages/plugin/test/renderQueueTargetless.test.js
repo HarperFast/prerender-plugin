@@ -289,6 +289,100 @@ test('the redirect path defers a recurring targetless row too', async () => {
 	assert.ok(stores.renderSchedule.get(A)?.targetMissingSince, 'deferred, not dropped');
 });
 
+// ───────────────────────────── a gone verdict never mints a row ─────────────────────────────
+//
+// A suppressed row exists to stop something re-creating the URL, and for a 404/410 nothing can:
+// discovery mints only on a 200. So `Target.suppress` returns `absent` instead of minting, and the
+// job's row is settled like any other targetless result's. The race it closes: a URL row and a
+// pre-0.66.0 device row in flight together — the first 404 retires the target and takes both rows,
+// and the second used to mint it straight back as a suppressed row with a 14-day recheck.
+
+const gone = (deviceType, statusCode = 404) => ({
+	deviceType,
+	statusCode,
+	outcome: 'non-indexable',
+	isIndexable: false,
+	reason: 'http-error',
+	headers: {},
+	renderTime: 100,
+});
+
+/** An unlisted target with its URL row AND a device row not yet folded — both due. */
+const seedUnfoldedPair = () => {
+	stores.target.set(A, { url: A, renderInterval: 4 * HOUR });
+	stores.renderSchedule.set(A, { nextRenderTime: 1, fromSitemap: false, effectiveInterval: 4 * HOUR });
+	stores.renderSchedule.set(key(A, 'mobile'), { nextRenderTime: 1, fromSitemap: false });
+};
+
+const assertRetiredForGood = async () => {
+	assert.equal(stores.target.has(A), false, 'the late sibling must not mint the target back as suppressed');
+	assert.equal(stores.renderSchedule.size, 0, 'no recheck row, and no device row left behind');
+	assert.equal(stores.prerenderedPage.size, 0);
+	assert.deepEqual(await claim(), [], 'nothing left to render');
+};
+
+test('a device-row 404 landing after its URL row retired the target does NOT re-mint it', async () => {
+	seedUnfoldedPair();
+	const claimed = (await claim()).map((job) => job.id).sort();
+	assert.deepEqual(claimed, [A, key(A, 'mobile')].sort(), 'precondition: both rows are in flight at once');
+
+	await postVariants(A, [gone('desktop'), gone('mobile')]);
+	assert.equal(stores.target.has(A), false, 'precondition: an unlisted 404 retires on the first verdict');
+	assert.equal(stores.renderSchedule.has(key(A, 'mobile')), false, 'precondition: and its delete took the device row');
+
+	await post({ id: key(A, 'mobile'), url: A, ...gone('mobile') });
+
+	await assertRetiredForGood();
+	assert.ok(
+		infos.some((m) => m.includes('not minting')),
+		'the skipped mint is logged'
+	);
+});
+
+test('the same race in the other order: a URL-row 404 after the device row retired the target', async () => {
+	seedUnfoldedPair();
+	await claim();
+
+	await post({ id: key(A, 'mobile'), url: A, ...gone('mobile') });
+	assert.equal(stores.target.has(A), false, 'precondition: the device-row verdict retired the target');
+
+	await postVariants(A, [gone('desktop'), gone('mobile')]);
+
+	await assertRetiredForGood();
+});
+
+test('a gone one-off with no target drops its row and mints nothing', async () => {
+	stores.renderSchedule.set(A, { nextRenderTime: 1, fromSitemap: false, effectiveInterval: null });
+	await claim();
+	await postVariants(A, [gone('desktop', 410), gone('mobile', 410)]);
+
+	assert.equal(stores.target.has(A), false);
+	assert.equal(stores.renderSchedule.has(A), false, 'the one-off row is dropped');
+	assert.equal(leased(A), false);
+});
+
+test('a gone verdict on a recurring row whose target is missing here defers the row and mints nothing', async () => {
+	// The target may exist elsewhere and not have replicated yet — minting here would REPLACE it with
+	// a row carrying `sitemapUrl: null` once it arrives. Deferred like any targetless recurring row.
+	seedRecurringRow();
+	await claim();
+	await postVariants(A, [gone('desktop'), gone('mobile')]);
+
+	assert.equal(stores.target.has(A), false, 'a 404 must not mint a suppressed target');
+	assert.ok(stores.renderSchedule.get(A)?.targetMissingSince, 'deferred, not dropped');
+	assert.deepEqual(outcomes(), [['suppressed', 'http-error']], 'the verdict is still counted');
+});
+
+test('a NON-gone verdict with no target still mints its suppressed row — the page 200s, so discovery would', async () => {
+	stores.renderSchedule.set(A, { nextRenderTime: 1, fromSitemap: false, effectiveInterval: null });
+	await claim();
+	const noindex = (deviceType) => ({ ...gone(deviceType, 200), reason: 'noindex' });
+	await postVariants(A, [noindex('desktop'), noindex('mobile')]);
+
+	assert.equal(stores.target.get(A)?.state, 'suppressed');
+	assert.equal(stores.target.get(A)?.suppressedReason, 'noindex');
+});
+
 // ───────────────────────────── retirement leaves no page behind ─────────────────────────────
 
 test('retiring a target deletes its pages for EVERY supported device — a tablet one-off included', async () => {

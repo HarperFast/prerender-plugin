@@ -198,8 +198,10 @@ export class Target extends TargetTable {
 	 * row is the only thing holding the next refresh off. See util/suppression.js.
 	 *
 	 * Creates the row when absent (a render-now one-off or a redirect destination can be
-	 * proven non-indexable before anything targeted it). Deletes the cached pages either
-	 * way — stale content of a page that said "don't index me" must not keep serving.
+	 * proven non-indexable before anything targeted it) — EXCEPT on a gone verdict, which
+	 * returns `{ absent: true }` and writes nothing: see the guard below. Deletes the cached
+	 * pages either way — stale content of a page that said "don't index me" must not keep
+	 * serving.
 	 */
 	static async suppress(url, { reason, statusCode } = {}) {
 		const existing = await Target.get({
@@ -211,17 +213,33 @@ export class Target extends TargetTable {
 		// The grading reads `sitemapUrl`, which this projection already carries: a gone verdict on a
 		// target no sitemap lists has its own (lower) ceiling, because nothing re-creates it. See
 		// util/suppression.js for why that asymmetry exists and why it is scoped to gone verdicts.
-		const { storedReason, recheckInterval, maxStrikes } = gradeSuppression({
+		const { gone, storedReason, recheckInterval, maxStrikes } = gradeSuppression({
 			reason,
 			statusCode,
 			fromSitemap: !!existing?.sitemapUrl,
 		});
 
-		// `existing` is still required: with no row there is nothing to retire, and minting one is
-		// this method's documented job (a render-now one-off or a redirect destination can be proven
-		// non-indexable before anything targeted it). At an unlisted ceiling of 1 that row is created
-		// only to be retired on its first recheck — rare enough (those two paths only) to leave as
-		// the simpler behaviour rather than special-case a second deletion path here.
+		// A GONE VERDICT NEVER MINTS A ROW. A suppressed row exists to stop something re-creating the
+		// URL, and for a 404/410 nothing can: discovery mints only on a 200, and a URL a sitemap lists
+		// already has its row (attribution lives on it). So a minted gone row blocks nothing, costs a
+		// recheck render at `gone.recheckInterval`, and — because `handlePageScheduling` treats ANY row
+		// as "already known" — stops discovery re-creating the URL if the origin brings it back.
+		//
+		// This used to be assumed rare (a render-now one-off, a redirect destination). It is not: two
+		// jobs for one URL — its URL row and a pre-0.66.0 device row still waiting to fold — can be in
+		// flight together. The first 404 retires the target (unlisted, first verdict) and its
+		// `Target.delete` takes both rows; the second 404 arrives a moment later, finds no row, and
+		// minted it back as `http-gone` with a strike and a 14-day recheck. Measured on a four-node
+		// deployment: ~76,600 discovered URLs re-minted this way in the week after the unlisted
+		// ceiling shipped, i.e. the first-verdict retirement was undone for every URL that raced.
+		//
+		// The caller settles the job's own row (see RenderQueue.processDecodedJobResult).
+		if (!existing && gone) return { deleted: false, absent: true };
+
+		// With no row there is nothing to retire, and minting one is this method's documented job (a
+		// render-now one-off or a redirect destination can be proven non-indexable before anything
+		// targeted it) — for the verdicts whose page the origin still serves 200, which discovery
+		// WOULD otherwise re-mint.
 		if (existing && Number.isFinite(maxStrikes) && maxStrikes > 0 && strikes >= maxStrikes) {
 			logger.warn(
 				`Prerender target ${url} non-indexable ${strikes} consecutive times (${storedReason ?? 'no reason'}) — deleting it`
