@@ -705,11 +705,22 @@ export class RenderQueue extends Resource {
 			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
 			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
 			// http-error verdicts by status (404/410 recheck less, die sooner).
-			const { deleted } = await Target.suppress(url, { reason: verdict.reason, statusCode: verdict.statusCode });
+			const { deleted, absent } = await Target.suppress(url, {
+				reason: verdict.reason,
+				statusCode: verdict.statusCode,
+			});
 			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
 			// device rows with it — so a folding row is already gone (a second delete would only write a
 			// tombstone), while a non-default one-device row still needs retiring below.
 			if (deleted) job.rowGone = job.fold;
+			// A gone verdict on a URL with no Target: nothing was minted (see Target.suppress), so this
+			// job's row is settled as any targetless result's is — already gone when a sibling job's
+			// retirement took it (the common case), dropped for a one-off, deferred for a recurring row
+			// whose target may simply not have replicated here yet.
+			else if (absent) {
+				logger.info(`Prerendered url ${url} is gone and has no Target on this node — not minting one`);
+				await settleTargetless(job, await readTargetlessRow(job));
+			}
 			await retireRowIfConverted(job, held);
 			return;
 		}
