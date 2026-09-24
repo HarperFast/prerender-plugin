@@ -948,17 +948,27 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'"payload.products[0].prices[0].salePrice" — the extracted values ARE the watched content; ' +
 					'everything else in the response is ignored. A path may end at an object or array, which is ' +
 					'signed whole, and `[*]` projects the rest of the path over every element of an array ' +
-					'("payload.products[0].variants[*].availability" -> one value per variant, in the endpoint’s ' +
-					'order) — the way to watch per-variant state without signing fields that move on their own ' +
-					'(inventory counters, store data). An extraction where every path yields null is a ' +
+					'("payload.products[0].variants[*].availability" -> one value per variant) — the way to watch ' +
+					'per-variant state without signing fields that move on their own ' +
+					'(inventory counters, store data). A trailing tuple, `[*].{a,b.c}`, projects each element to ' +
+					'`[a, b.c]` (dotted inner paths, no brackets) so per-variant fields stay attached to their key — ' +
+					'e.g. "payload.products[0].variants[*].{sku,availability,price.value}" for a `skus` page check. ' +
+					'Projections (tuples included) are sorted, so a reordered array is not a change. An extraction where every path yields null is a ' +
 					'FAILED probe, never a new signature, so an endpoint shape change cannot mass-trigger.\n' +
 					'  EDITING A RULE. The rule’s observation (endpoint, method, headers, body, extract, ' +
 					'statusSignals) is fingerprinted and stored beside every baseline. Change any of it and each ' +
 					'matched URL is RE-BASELINED on its next probe — new observation stored, nothing compared, ' +
 					'nothing triggered, not counted by the canary — instead of the new signature shape reading as ' +
 					'100% of the corpus changing at once. A rule edit therefore costs one pass without detection ' +
-					'for that rule and needs no dry-run cycle. Label, pathPattern, invalidateScope and pageCheck ' +
-					'are not part of the fingerprint: they change what is matched or done, not what is observed.\n' +
+					'for that rule and needs no dry-run cycle. APPENDING paths to the end of `extract` is the ' +
+					'exception and costs no blind pass: a baseline taken before the append is still compared on ' +
+					'the slots it has — changes trigger, pageCheck applies, the canary counts it — and the same ' +
+					'write upgrades it to the full observation (counted as `extended` in the pass record). The ' +
+					'appended path has no baseline until that write, so a change in it alone is detected from ' +
+					'the following pass. Removing, reordering or editing an existing path, or appending while ' +
+					'changing anything else above, is a full re-baseline. Label, pathPattern, invalidateScope ' +
+					'and pageCheck are not part of the fingerprint: they change what is matched or done, not ' +
+					'what is observed.\n' +
 					'  statusSignals    optional [{ status, signature, contains? }] — statuses this endpoint uses ' +
 					'to SAY something rather than to fail, mapped to a fixed signature. An endpoint that answers ' +
 					'a legitimate state with an error status (most usefully "no longer available" as a 4xx with ' +
@@ -1002,6 +1012,47 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'with its own vocabulary. A per-variant list reads in stock when ANY variant is, exactly as the ' +
 					'page’s offers are read. ' +
 					'Detection is one extra node-local write per render and no extra origin traffic.\n' +
+					'\n\nTHE PAGE RECORD (`pageCheck.fields`). The claim pair above generalizes to every field a page ' +
+					'visibly states. With @harperfast/prerender-browser >= 1.37.0 each render also posts `pageFacts` ' +
+					'(canonical, title, metaDescription, h1, product.name, product.brand, product.image, ' +
+					'product.rating.value, product.rating.count, product.offers, breadcrumbs), and a rule that maps ' +
+					'fields stores them per URL and compares each mapped field on every probe. That does three things: ' +
+					'(1) a page that DISAGREES with the origin on any mapped field is re-rendered, like a claim-pair ' +
+					'disagreement; (2) an origin CHANGE that the cached page already shows (a cadence render landed after ' +
+					'it) is NOT re-rendered — every changed slot must be a mapped slot whose record agrees with the new ' +
+					'value, and the baseline simply moves (counted `caughtUp`); (3) with `ignoreChanges`, changes to ' +
+					'fields the page cannot show stop re-rendering at all. Shape: `pageCheck: { enabled: true, ' +
+					'fields: [{ slot: <i>, fact: "<fact>", compare: "<comparator>" }, ...], ignoreChanges: [<i>, ...] }` ' +
+					'(both, like the claim pair, apply only while `enabled` is true), where `slot` indexes ' +
+					'`extract`. The comparators are a closed set, each applying to certain facts: ' +
+					'"text" (exact after Unicode NFC, whitespace collapse and trim — no case folding and NO HTML ' +
+					'stripping: an endpoint’s description may carry markup the page’s meta tag repeats verbatim), ' +
+					'"path" (URL path only — origin, query and fragment ignored, a relative value resolved against the ' +
+					'page URL; for canonical and product.image, whose URLs typically differ by size parameters alone), ' +
+					'"number" (numeric equality, "4.0" = 4; optional `tolerance`), "priceSet" (against the SET of prices ' +
+					'the page’s offers print: a single endpoint price must be among them, and for a list EVERY price ' +
+					'the page prints must still be in the endpoint’s set — not equality, so a page that lists only some ' +
+					'variants cannot disagree forever; use "skus" for per-variant exactness), "names" (an ordered list of ' +
+					'strings, or of objects carrying `nameKey`, default "name", matched against the TAIL of the page’s ' +
+					'breadcrumbs — a leading home crumb needs no configuration; extract the list itself, not a `[*]` ' +
+					'projection, since projections are sorted) and "skus" (per-variant tuples from a `[*].{…}` projection ' +
+					'against the page’s offers keyed by SKU, over the SKUs both list; `tuple` names each tuple ' +
+					'position, default ["sku", "availability", "price"]). EVERY COMPARATOR FAILS TOWARD NO CLAIM: null, ' +
+					'absent or unparseable on either side is not compared, never a disagreement, and never evidence ' +
+					'that a page caught up. A bad entry is dropped alone with a warning. A mapping that is wrong anyway ' +
+					'is caught by `changeProbe.mappingGuard`. The record is stored only for a rule that maps fields, ' +
+					'from the first device variant, and only when the render stored every default device (otherwise ' +
+					'null — a partial render cannot vouch for the device page it did not replace); records over 16 KB ' +
+					'are refused, not truncated. `pageCheck` may carry `fields` and/or `ignoreChanges` without ' +
+					'priceFrom/availableFrom. Like the rest of pageCheck, none of this is in the rule fingerprint: ' +
+					'adding or editing a mapping re-baselines nothing.\n' +
+					'  pageCheck.ignoreChanges  extract indices whose origin changes never trigger a re-render — ' +
+					'fields the page cannot show (an inventory counter the endpoint returns beside the price). A change ' +
+					'confined to them writes the new baseline and triggers nothing (counted `ignored`), and the canary ' +
+					'does not count it as a change, so a site-wide edit of such a field cannot trip a bulk ' +
+					'invalidation. A status-signal literal is a state, not slots, and is never ignored.\n' +
+					'  PER-SLOT STATS. Pass records decompose `changed` by slot (`slotChanges`) and page mismatches by ' +
+					'mapped field (`fieldMismatch`), in `GET /prerender_admin/change-probe` and the pass log line.\n' +
 					'  invalidateScope  optional invalidation scope ("all" or "route:<match>:<path>") the canary ' +
 					'records on a mass change. Empty = the canary detects and logs only.\n' +
 					'  label            optional name for logs and the admin surface.',
@@ -1333,6 +1384,46 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'exactly the pages that just healed. A genuine second event inside the holdoff still heals ' +
 							'per-URL via the sweep; past it, a still-tripping canary re-records.',
 						{ unit: 'ms', min: 0 }
+					),
+				}
+			),
+			mappingGuard: group(
+				'The MAPPING-DEFECT GUARD for `pageCheck.fields`. A field mapped to the wrong slot, or compared the ' +
+					'wrong way, disagrees with nearly every page — and every disagreement is a re-render, so one bad ' +
+					'mapping would otherwise re-render its whole corpus on every pass. A correct mapping disagrees only ' +
+					'when the page really is wrong, and on a WITNESSED page (rendered after the stored baseline was ' +
+					'taken, the origin unchanged since) that takes a genuine round trip — the value changed and changed ' +
+					'back between two probes with a render in between, measured well under 1%.\n\n' +
+					'So each node counts, per mapped field, witnessed comparisons and witnessed disagreements, and ' +
+					'DISARMS the field when its disagreement rate reaches `threshold` over at least `minWitnessed` ' +
+					'comparisons: it stops triggering re-renders (and stops vouching for caught-up changes and ' +
+					'verifications), a warning names the rule and slot, and its mismatches are still counted ' +
+					'(`fieldMismatch` in the pass record; the guard’s own counts are `fieldGuard`). It stays disarmed ' +
+					'until that field’s mapping is edited or the process restarts. It never suppresses an individual ' +
+					'disagreement — a single one is exactly the round trip the page check exists to catch. Disarming ' +
+					'never hides an ORIGIN change: those trigger on the signature as always; a disarmed field only stops ' +
+					'correcting pages that are wrong while the origin is unchanged.\n\n' +
+					'The rate is RECENT, not lifetime: both counts halve each time the sample reaches ten times ' +
+					'`minWitnessed`, so a mapping that was right for a week and then broke (the site changed its page ' +
+					'template) is disarmed within a few thousand comparisons instead of after outweighing the week.\n\n' +
+					'In dry run the guard counts and disarms too, which is the point of a dry-run week: a broken ' +
+					'mapping announces itself before anything is armed.',
+				{
+					threshold: option(
+						0.2,
+						'Witnessed disagreement rate at or above which a mapped field is disarmed. The default sits ' +
+							'far from both ends: a wrong mapping disagrees on nearly every comparison, a correct one on ' +
+							'the rare round trip (a correct mapping would need twenty times the measured round-trip ' +
+							'rate to reach it).',
+						{ min: 0, max: 1 }
+					),
+					minWitnessed: option(
+						200,
+						'Fewest witnessed comparisons of a field before `threshold` is consulted. Large enough that a ' +
+							'correct mapping cannot reach the threshold by chance (at a 1% true rate, 20% of 200 is ~40 ' +
+							'disagreements where ~2 are expected); small enough that a broken mapping is disarmed after ' +
+							'about this many spurious re-renders per node rather than a corpus of them.',
+						{ min: 1 }
 					),
 				}
 			),

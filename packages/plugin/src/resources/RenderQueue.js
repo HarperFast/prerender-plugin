@@ -705,11 +705,22 @@ export class RenderQueue extends Resource {
 			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
 			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
 			// http-error verdicts by status (404/410 recheck less, die sooner).
-			const { deleted } = await Target.suppress(url, { reason: verdict.reason, statusCode: verdict.statusCode });
+			const { deleted, absent } = await Target.suppress(url, {
+				reason: verdict.reason,
+				statusCode: verdict.statusCode,
+			});
 			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
 			// device rows with it — so a folding row is already gone (a second delete would only write a
 			// tombstone), while a non-default one-device row still needs retiring below.
 			if (deleted) job.rowGone = job.fold;
+			// A gone verdict on a URL with no Target: nothing was minted (see Target.suppress), so this
+			// job's row is settled as any targetless result's is — already gone when a sibling job's
+			// retirement took it (the common case), dropped for a one-off, deferred for a recurring row
+			// whose target may simply not have replicated here yet.
+			else if (absent) {
+				logger.info(`Prerendered url ${url} is gone and has no Target on this node — not minting one`);
+				await settleTargetless(job, await readTargetlessRow(job));
+			}
 			await retireRowIfConverted(job, held);
 			return;
 		}
@@ -816,6 +827,15 @@ export class RenderQueue extends Resource {
 			// for its (node-local) write: a render must not fail because a probe optimisation could not
 			// be recorded.
 			const claiming = stored.find((variant) => variant.structuredOffers !== undefined) ?? stored[0];
+			// The page record, chosen the same way from the variant that ran ITS extraction (browser
+			// >= 1.37.0). It is one record for the URL, so it only vouches for the URL when this result
+			// replaced EVERY default device's page: after a partial render (one device failed) or a
+			// one-device render, the other device's cached page is older than the record would claim,
+			// and a record that "caught up" with a change would then skip re-rendering a page that did not.
+			const describing = stored.find((variant) => variant.pageFacts !== undefined) ?? stored[0];
+			const everyDevice = defaultDeviceTypes().every((device) =>
+				stored.some((variant) => variant.deviceType === device)
+			);
 			// CONCURRENTLY, because these all sit inside ONE request-scoped transaction and its duration
 			// is the thing to keep short. A result now carries every device of the URL, so where the
 			// per-key path wrote one page blob per transaction this writes one per device, in series —
@@ -839,7 +859,10 @@ export class RenderQueue extends Resource {
 			// `recordPageClaim` it never rejects — a regression signal must not cost a render.
 			const observed = stored.filter((variant) => hasObservations(variant.readiness?.learned));
 			await Promise.all([
-				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt),
+				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt, {
+					pageFacts: describing.pageFacts,
+					complete: everyDevice,
+				}),
 				...observed.map((variant) =>
 					recordReadinessExpectation({ url: scheduleUrl, deviceType: variant.deviceType }, variant.readiness)
 				),

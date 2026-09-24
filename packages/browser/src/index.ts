@@ -153,6 +153,7 @@ export type {
 	SuggestedConfig,
 } from './audit/util.js';
 export type { JobConfig } from './RenderJob.js';
+export type { PageFacts, PageFactsProduct, PageFactOffer, PageFactBounds } from './pageFacts.js';
 export type { BrowserOptions, ResourceCacheOptions, Settings } from './settings.js';
 export type {
 	PrerenderConfig,

@@ -6,6 +6,7 @@ import { defaultLaunchOptions, resolveSettings, settings } from '../settings.js'
 import { initResourceCache } from '../ResourceCache.js';
 import { noop } from '../util/noop.js';
 import type { BrowserOptions } from '../settings.js';
+import type { PageFacts } from '../pageFacts.js';
 import type { Renderer } from '../Worker.js';
 import type { LaunchOptions } from 'puppeteer';
 
@@ -68,6 +69,8 @@ export type VariantSnapshot = {
 	statusCode: number | undefined;
 	isIndexable: boolean | undefined;
 	structuredOffers: Array<string | null> | null | undefined;
+	/** The page's own SEO facts (canonical, title, h1, product JSON-LD, breadcrumbs), as a worker posts them. */
+	pageFacts: PageFacts | null | undefined;
 	bytes: number;
 	/** Only on the reuse run: whether this variant's navigation was answered from a held document. */
 	documentReused?: boolean;
@@ -178,12 +181,35 @@ const snapshotOf = (variant: RenderJob, withReuseFlags: boolean): VariantSnapsho
 	statusCode: variant.httpResponse?.statusCode,
 	isIndexable: variant.isIndexable,
 	structuredOffers: variant.structuredOffers,
+	pageFacts: variant.pageFacts,
 	bytes: variant.content?.length ?? 0,
 	...(withReuseFlags ? { documentReused: variant.documentReused, documentPrefetched: variant.documentPrefetched } : {}),
 });
 
 const sameOffers = (a: VariantSnapshot['structuredOffers'], b: VariantSnapshot['structuredOffers']) =>
 	JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/** Which page facts differ between two renders (`product.*` per field) — informational, not in `pass`. */
+const differingFacts = (a: VariantSnapshot['pageFacts'], b: VariantSnapshot['pageFacts']): string[] => {
+	if (!a || !b) return JSON.stringify(a ?? null) === JSON.stringify(b ?? null) ? [] : ['pageFacts'];
+	const keys = (x: object, y: object) => {
+		const set = new Set(Object.keys(x));
+		for (const key of Object.keys(y)) set.add(key);
+		return [...set];
+	};
+	const differs = (x: unknown, y: unknown) => JSON.stringify(x ?? null) !== JSON.stringify(y ?? null);
+	const out: string[] = [];
+	for (const key of keys(a, b) as Array<keyof PageFacts>) {
+		if (key === 'product' && a.product && b.product) {
+			for (const field of keys(a.product, b.product) as Array<keyof typeof a.product>) {
+				if (differs(a.product[field], b.product[field])) out.push(`product.${field}`);
+			}
+		} else if (differs(a[key], b[key])) {
+			out.push(key);
+		}
+	}
+	return out;
+};
 
 /**
  * Did this device stay itself? Asked as three distances measured on the same page in the same minute:
@@ -357,6 +383,8 @@ export function formatReuseParity(results: ReuseParityResult[]): string {
 				lines.push(`        control offers : ${JSON.stringify(d.control.structuredOffers)}`);
 				lines.push(`        reused  offers : ${JSON.stringify(d.reused.structuredOffers)}`);
 			}
+			const facts = differingFacts(d.control.pageFacts, d.reused.pageFacts);
+			if (facts.length) lines.push(`        page facts differ (informational): ${facts.join(', ')}`);
 			if (d.divergence.samples.length) {
 				lines.push(`        differing markup: ${d.divergence.samples.slice(0, 2).join(' | ')}`);
 			}

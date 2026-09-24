@@ -71,10 +71,18 @@ import {
 	extractJsonLdOffers,
 	isSameProbeOrigin,
 	signatureOf,
+	signatureUnderPrefix,
 	statusSignalFor,
 	apiClaimOf,
 	claimsDisagree,
 	pageClaimFromOffers,
+	changedSlots,
+	compareField,
+	fieldCaughtUp,
+	parsePageFacts,
+	serializePageFacts,
+	signatureSlots,
+	PAGE_FACTS_MAX_BYTES,
 } from './changeProbeSpec.js';
 
 const targetTable = () => databases.render_service.Target;
@@ -142,6 +150,7 @@ const newStats = () => ({
 	probed: 0, // probes attempted = seeded + rebaselined + unchanged + changed + failed
 	seeded: 0, // first observation stored, nothing compared
 	rebaselined: 0, // baseline was taken under a DIFFERENT rule fingerprint: observation stored, nothing compared or triggered (a rule edit, not a content change)
+	extended: 0, // baseline was taken before extract paths were APPENDED: compared on the slots it has, baseline upgraded — OVERLAYS unchanged/changed like pageMismatch, never a bucket of its own
 	unchanged: 0,
 	changed: 0,
 	queued: 0, // changes handed to the trigger queue (accepted, not necessarily settled yet)
@@ -150,7 +159,11 @@ const newStats = () => ({
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // trigger writes that threw
 	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
-	pageMismatch: 0, // cached page disagreed with the origin (pageCheck) — OVERLAYS the buckets above, which count by signature outcome alone
+	pageMismatch: 0, // cached page disagreed with the origin (pageCheck: the claim pair, or an ARMED mapped field) — OVERLAYS the buckets above, which count by signature outcome alone
+	caughtUp: 0, // origin changed, but every changed slot is a mapped slot the cached page ALREADY shows the new value for: baseline written, nothing triggered — OVERLAYS changed
+	ignored: 0, // origin changed only in pageCheck.ignoreChanges slots: baseline written, nothing triggered, NOT a change for the canary — OVERLAYS unchanged
+	slotChanges: {}, // { [rule]: { [slot]: n } } origin changes per extract slot ("signal" = a status-signal literal was involved, so no slot can be named) — decomposes changed, caughtUp and ignored
+	fieldMismatch: {}, // { [rule]: { ["<slot>:<fact>"]: n } } page mismatches per mapped field, armed or not — a disarmed field still counts here, and only here
 	throttled: 0, // probes the origin refused with a pushback status — what drives the backoff
 	throttleLevel: 1, // ORIGIN pacing-window multiplier when the pass ended; 1 means never backed off
 	loadThrottleLevel: 1, // LOCAL (event-loop) multiplier when the pass ended; 1 means never backed off
@@ -344,7 +357,7 @@ export const triggerRevalidate = async (row) => {
 const readSignature = async (url) => {
 	const row = await probeStateTable().get({
 		id: url,
-		select: ['url', 'signature', 'probedAt', 'pageSignature', 'pageClaimAt', 'ruleFingerprint'],
+		select: ['url', 'signature', 'probedAt', 'pageSignature', 'pageClaimAt', 'pageFacts', 'ruleFingerprint'],
 	});
 	if (!row) return null;
 	// A Date column can surface as a Date, an epoch number, a string, or — the trap this coercion
@@ -359,6 +372,8 @@ const readSignature = async (url) => {
 		probedAt,
 		pageSignature: row.pageSignature ?? null,
 		pageClaimAt: row.pageClaimAt ?? null,
+		// The page record (canonical JSON string), parsed lazily by processOne only for a rule that maps fields.
+		pageFacts: row.pageFacts ?? null,
 		// null for a row written before fingerprints existed — read as "the rule in force", see processOne.
 		fingerprint: row.ruleFingerprint ?? null,
 	};
@@ -379,18 +394,22 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
 	// can tell a rule edit from a content change. Written with EVERY baseline, including the
 	// one-time stamp of a pre-fingerprint row; a signature is never left beside a stale fingerprint.
 	if (fingerprint !== null) fields.ruleFingerprint = fingerprint;
-	// BOTH HALVES OF THE PAIR, always. `pageClaimAt` is the render `pageSignature` came from, and the
-	// two are only meaningful together — a claim with no basis cannot be scoped to a device page, and
-	// a basis with no claim describes nothing. Clearing one and leaving the other is inert today
+	// THE WHOLE RECORD, always. `pageClaimAt` is the render `pageSignature` and `pageFacts` came from,
+	// and they are only meaningful together — a claim with no basis cannot be scoped to a device page,
+	// and a basis with no claim describes nothing. Clearing one and leaving another is inert today
 	// (the verification write requires `stored.pageSignature`), but it leaves a half-state a later
-	// reader can pick up, which is the shape of bug this module's own comments keep closing.
+	// reader can pick up, which is the shape of bug this module's own comments keep closing. The page
+	// record goes too: the trip hard-expired the page it described, so a surviving record would be
+	// compared against the origin as though that page were still served — and, for a record that
+	// disagrees, re-trigger the already-expired page on every pass until its re-render lands.
 	if (clearClaim) {
 		fields.pageSignature = null;
 		fields.pageClaimAt = null;
+		fields.pageFacts = null;
 	}
 	return rowExists
 		? probeStateTable().patch(url, fields)
-		: probeStateTable().put(url, { url, pageSignature: null, pageClaimAt: null, ...fields });
+		: probeStateTable().put(url, { url, pageSignature: null, pageClaimAt: null, pageFacts: null, ...fields });
 };
 
 /**
@@ -399,8 +418,28 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
  * a render must never fail because a probe optimisation could not be recorded. Extraction that
  * yields nothing writes nothing — same rule as a failed probe, so a markup change cannot mass-
  * trigger by making every page look like a disagreement.
+ *
+ * TWO PARTS, ONE WRITE. The price/availability claim (`pageSignature`, from the renderer's
+ * `structuredOffers`) for a rule with the claim pair, and the PAGE RECORD (`pageFacts`, from the
+ * renderer's `pageFacts`) for a rule that maps fields. Both ride in the same patch as
+ * `pageClaimAt`, so the record costs no extra read and no extra write.
+ *
+ * A RULE THAT MAPS FIELDS ALWAYS WRITES THE WHOLE RECORD, nulls included. The record's contract is
+ * "what the page served right now claims", and `pageClaimAt` is the render it describes: leaving an
+ * older render's facts (or claim) in place beside a newer stamp would compare a page that is no
+ * longer served, and credit it to the wrong render. So a render whose facts are unknown — the
+ * renderer predates them (ABSENT), the extraction found nothing (null), the record is oversized, or
+ * the render did not store every default device (`complete: false`: a partial failure or a
+ * one-device render, whose other device pages are older than this record would claim) — stores
+ * null, which compares as no claim. A rule without fields keeps the original behaviour exactly: a
+ * render that yields no claim writes nothing.
  */
-export const recordPageClaim = async (url, structuredOffers, cachedAt = Date.now()) => {
+export const recordPageClaim = async (
+	url,
+	structuredOffers,
+	cachedAt = Date.now(),
+	{ pageFacts = undefined, complete = true } = {}
+) => {
 	try {
 		// The master switch gates STORAGE too — "Off = no probes, no timers, nothing stored" is
 		// the config contract, and this is the hottest write path to be skipping work on.
@@ -415,35 +454,62 @@ export const recordPageClaim = async (url, structuredOffers, cachedAt = Date.now
 		// pageCheck-less rule shadow this URL on the sweep side: claims written per render here,
 		// never compared there, and nothing to say so.
 		const rule = probeRules().find((r) => r.pathPattern.test(pathname));
-		if (!rule?.pageCheck) return;
-		if (structuredOffers === undefined) {
-			// The renderer does not know the field at all — it predates 1.20.0. There is
-			// deliberately NO fallback to parsing the stored HTML: recovering the offers here means
-			// a regex scan and a JSON parse of a ~1MB document on the hottest write path in this
-			// process, to reconstruct what the browser had structured in front of it. So pageCheck
-			// is INERT against an older renderer — say so rather than failing silently, since a
-			// config that looks enabled and protects nothing is the worst outcome. `null` is the
-			// other case and is NOT this warn: a >=1.20.0 renderer ran the extraction and the page
-			// declared no Product offers — nothing to record, same rule as a failed probe.
-			warnPageClaimUnsupported();
-			return;
+		const pageCheck = rule?.pageCheck;
+		if (!pageCheck) return;
+		const claimPair = pageCheck.priceFrom !== null && pageCheck.priceFrom !== undefined;
+		const mapped = (pageCheck.fields?.length ?? 0) > 0;
+		if (!claimPair && !mapped) return;
+		let claim = null;
+		if (claimPair) {
+			if (structuredOffers === undefined) {
+				// The renderer does not know the field at all — it predates 1.20.0. There is
+				// deliberately NO fallback to parsing the stored HTML: recovering the offers here means
+				// a regex scan and a JSON parse of a ~1MB document on the hottest write path in this
+				// process, to reconstruct what the browser had structured in front of it. So pageCheck
+				// is INERT against an older renderer — say so rather than failing silently, since a
+				// config that looks enabled and protects nothing is the worst outcome. `null` is the
+				// other case and is NOT this warn: a >=1.20.0 renderer ran the extraction and the page
+				// declared no Product offers — nothing to record, same rule as a failed probe.
+				warnPageClaimUnsupported();
+			} else {
+				claim = pageClaimFromOffers(structuredOffers);
+			}
 		}
-		const claim = pageClaimFromOffers(structuredOffers);
-		if (!claim) return;
-		// patch cannot create, and put would clobber the probe's own signature/probedAt — so read
-		// first and choose. The read is a node-local point read on a small table, once per render
-		// of a pageCheck-matched URL.
-		const existing = await probeStateTable().get({ id: url, select: ['url'] });
 		// `pageClaimAt` rides in the SAME write — no extra read, no extra write — and is the render's
 		// own `lastCached`, not the moment this ran. See the schema comment: it becomes the basis a
 		// verification certifies, and a stamp taken milliseconds later would exclude the very page it
 		// is certifying.
 		const claimAt = new Date(cachedAt);
-		if (existing) await probeStateTable().patch(url, { pageSignature: claim, pageClaimAt: claimAt });
-		else await probeStateTable().put(url, { url, pageSignature: claim, pageClaimAt: claimAt });
+		let fields;
+		if (mapped) {
+			fields = { pageSignature: claim, pageFacts: pageRecordOf(url, pageFacts, complete), pageClaimAt: claimAt };
+		} else {
+			if (!claim) return;
+			fields = { pageSignature: claim, pageClaimAt: claimAt };
+		}
+		// patch cannot create, and put would clobber the probe's own signature/probedAt — so read
+		// first and choose. The read is a node-local point read on a small table, once per render
+		// of a pageCheck-matched URL.
+		const existing = await probeStateTable().get({ id: url, select: ['url'] });
+		if (existing) await probeStateTable().patch(url, fields);
+		// A record of nothing is not worth creating a row for; on an EXISTING row the nulls above are
+		// the point (they retire an older render's record).
+		else if (fields.pageSignature !== null || fields.pageFacts) await probeStateTable().put(url, { url, ...fields });
 	} catch (e) {
 		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
 	}
+};
+
+/** The page record to store for one render, or null — see recordPageClaim for when and why. */
+const pageRecordOf = (url, pageFacts, complete) => {
+	if (pageFacts === undefined) {
+		warnPageFactsUnsupported();
+		return null;
+	}
+	if (!complete) return null;
+	const { json, bytes, refused } = serializePageFacts(pageFacts);
+	if (refused) warnPageFactsRefused(url, bytes);
+	return json;
 };
 
 // One line per hour per worker: this fires per RENDER, and a fleet mid-upgrade would otherwise
@@ -457,6 +523,32 @@ const warnPageClaimUnsupported = () => {
 		`[prerender] changeProbe.pageCheck is enabled but the render result carried no structuredOffers — ` +
 			`the renderer is older than @harperfast/prerender-browser 1.20.0, so page claims are not being ` +
 			`recorded and pageCheck cannot detect anything. Upgrade the render fleet or disable pageCheck.`
+	);
+};
+
+// Same shape and cadence as the claim warning above, for the page record's own field.
+let lastFactsUnsupportedWarnAt = 0;
+const warnPageFactsUnsupported = () => {
+	const now = Date.now();
+	if (now - lastFactsUnsupportedWarnAt < 3600000) return;
+	lastFactsUnsupportedWarnAt = now;
+	logger.warn?.(
+		`[prerender] changeProbe.pageCheck.fields are mapped but the render result carried no pageFacts — the ` +
+			`renderer is older than @harperfast/prerender-browser 1.37.0, so page records are stored empty and the ` +
+			`mapped fields detect nothing (and never suppress a trigger). Upgrade the render fleet or remove the mapping.`
+	);
+};
+
+// Hourly too: an oversized record is a property of a page TEMPLATE, so one bad template would
+// otherwise log on every render of every page built from it.
+let lastFactsRefusedWarnAt = 0;
+const warnPageFactsRefused = (url, bytes) => {
+	const now = Date.now();
+	if (now - lastFactsRefusedWarnAt < 3600000) return;
+	lastFactsRefusedWarnAt = now;
+	logger.warn?.(
+		`[prerender] change-probe page record for ${url} is ${bytes} bytes, over the ${PAGE_FACTS_MAX_BYTES}-byte ` +
+			`bound — not stored, so that page's mapped fields compare as no claim. (Logged at most hourly.)`
 	);
 };
 
@@ -486,6 +578,132 @@ export const verificationArmedFor = async (scope) => {
 	return (await resolveInvalidation(scope)) !== null;
 };
 
+/**
+ * THE MAPPING-DEFECT GUARD: disarm a mapped field that is evidently mapped wrong.
+ *
+ * A wrong mapping (a slot holding the regular price mapped to the sale price the page prints, a
+ * list compared in the wrong shape) disagrees on nearly EVERY comparison, and every disagreement is
+ * a re-render — so one bad mapping would re-render its whole corpus on every pass. A correct
+ * mapping disagrees only when the page really is wrong, and on a page the probe has WITNESSED —
+ * rendered after the stored baseline was taken, with the origin unchanged since — that takes a
+ * genuine round trip (the value changed and changed back between two probes, and a render landed in
+ * between): measured well under 1%.
+ *
+ * So the guard counts, per field, witnessed comparisons and witnessed disagreements, and DISARMS the
+ * field once its disagreement rate reaches `threshold` over at least `minWitnessed` comparisons. A
+ * disarmed field stops triggering (and stops counting toward caught-up and verification) but is
+ * still compared and still counted in `fieldMismatch`, and it stays disarmed until its mapping
+ * changes (a different entry, slot path or rule label is a different key) or the process restarts.
+ *
+ * AGGREGATE ONLY, BY DESIGN. It never suppresses an individual witnessed disagreement: a single one
+ * is exactly the round trip the page check exists to catch, and it must re-render. Only the RATE
+ * says "mapping defect", and only at a sample large enough that a correct mapping cannot reach it by
+ * chance (at a 1% true rate, 20% of 200 is ~40 disagreements where ~2 are expected).
+ *
+ * BOUNDED MEMORY. Both counts are halved whenever the sample reaches GUARD_WINDOW x `minWitnessed`,
+ * so the rate describes roughly the last few thousand comparisons rather than the process lifetime.
+ * Without it, a mapping that was right for a week and then broke — the site redesigns its title
+ * template, and every re-render still disagrees — would need hundreds of thousands of disagreements
+ * to outweigh the week of agreement, re-rendering every page it matches on every pass until then.
+ * The halved sample never drops below `minWitnessed`, so the threshold stays consultable.
+ *
+ * Per process, in memory: the sweep and canary run on worker 0, so that is where the evidence
+ * accumulates. A pass started by hand on another worker starts with its own, empty guard.
+ */
+// The guard's memory, in multiples of `minWitnessed` (see BOUNDED MEMORY above).
+const GUARD_WINDOW = 10;
+
+export const createMappingGuard = ({ settings, onDisarm = () => {} }) => {
+	const entries = new Map();
+	// A field's key, cached per compiled field object (a config reload compiles new ones). The rule
+	// label and the slot's extract PATH are in it, so re-pointing a slot or renaming the rule is a
+	// new mapping with a clean record.
+	const keys = new WeakMap();
+	const keyOf = (rule, field) => {
+		let key = keys.get(field);
+		if (key === undefined) {
+			key = JSON.stringify([
+				rule.label,
+				rule.extract?.[field.slot] ?? null,
+				field.slot,
+				field.fact,
+				field.compare,
+				field.options,
+			]);
+			keys.set(field, key);
+		}
+		return key;
+	};
+	return {
+		isArmed: (rule, field) => entries.get(keyOf(rule, field))?.disarmed !== true,
+		witness(rule, field, disagreed) {
+			const key = keyOf(rule, field);
+			let entry = entries.get(key);
+			if (!entry) entries.set(key, (entry = { witnessed: 0, disagreed: 0, disarmed: false }));
+			entry.witnessed++;
+			if (disagreed) entry.disagreed++;
+			if (entry.disarmed) return;
+			const { threshold, minWitnessed } = settings();
+			if (entry.witnessed >= minWitnessed && entry.disagreed / entry.witnessed >= threshold) {
+				entry.disarmed = true;
+				onDisarm(rule, field, entry);
+				return;
+			}
+			if (entry.witnessed >= GUARD_WINDOW * minWitnessed) {
+				entry.witnessed /= 2;
+				entry.disagreed /= 2;
+			}
+		},
+		/** `{ [rule]: { [field]: { witnessed, disagreed, armed } } }` for every mapped field of `rules`. */
+		snapshot(rules) {
+			const out = {};
+			for (const rule of rules) {
+				for (const field of rule.pageCheck?.fields ?? []) {
+					const entry = entries.get(keyOf(rule, field));
+					out[rule.label] ??= {};
+					out[rule.label][field.label] = {
+						witnessed: Math.round(entry?.witnessed ?? 0),
+						disagreed: Math.round(entry?.disagreed ?? 0),
+						armed: entry?.disarmed !== true,
+					};
+				}
+			}
+			return out;
+		},
+	};
+};
+
+const warnDisarmed = (rule, field, entry) => {
+	logger.warn?.(
+		`[prerender] change-probe ${rule.label}: pageCheck field ${field.label} (extract[${field.slot}] ` +
+			`"${rule.extract?.[field.slot]}", compare ${field.compare}) is DISARMED — the cached page disagreed with ` +
+			`the origin on ${Math.round(entry.disagreed)} of ${Math.round(entry.witnessed)} recent witnessed comparisons ` +
+			`(${((entry.disagreed / entry.witnessed) * 100).toFixed(1)}%), where a correct mapping disagrees only on ` +
+			`rare round trips. It no longer triggers re-renders (its mismatches are still counted in fieldMismatch) ` +
+			`until the mapping is edited or the process restarts. Check that extract[${field.slot}] really holds what ` +
+			`the page shows as ${field.fact}.`
+	);
+};
+
+// The node's guard — one per process, shared by the sweep and the canary (see createMappingGuard).
+let mappingGuard = null;
+const theMappingGuard = () =>
+	(mappingGuard ??= createMappingGuard({ settings: () => config.changeProbe.mappingGuard, onDisarm: warnDisarmed }));
+
+// A Date column as epoch ms, BigInt-safe (see readSignature); NaN when unreadable.
+const epochOf = (value) => {
+	if (value === undefined || value === null) return NaN;
+	const stamp = typeof value === 'bigint' ? Number(value) : value;
+	const ms = new Date(stamp).getTime();
+	return Number.isFinite(ms) ? ms : NaN;
+};
+
+// `stats[group][rule][key]++`, creating the levels on first use.
+const bump = (table, rule, key) => {
+	table[rule] ??= {};
+	table[rule][key] = (table[rule][key] ?? 0) + 1;
+};
+
 export const runProbePass = async ({
 	rows,
 	rules,
@@ -504,6 +722,9 @@ export const runProbePass = async ({
 	// resolved once per rule per pass (see below), never per row.
 	verify = null,
 	isArmed = null,
+	// The mapping-defect guard (createMappingGuard). Null = no guard: every mapped field is armed and
+	// nothing is witnessed, which is what a caller that does not wire it gets.
+	guard = null,
 	dryRun,
 	maxTriggers,
 	concurrency,
@@ -612,10 +833,11 @@ export const runProbePass = async ({
 		// RULE CHANGED, NOT CONTENT. A baseline is only comparable to an observation made the same
 		// way (changeProbeSpec.js ruleFingerprint). A stored fingerprint that is not this rule's
 		// means the rule was edited since the baseline was taken: store the new observation, compare
-		// nothing, trigger nothing, and keep the row out of the canary's verdict — a config edit must
-		// never read as a mass change. Before this, every rule edit produced a differently-shaped
-		// signature for 100% of matched URLs at once, and the only safe way to make one was a full
-		// dry-run cycle. Rows from before fingerprints existed carry none and are compared as usual:
+		// nothing, trigger nothing (unless the edit only APPENDED extract paths — see below), and
+		// keep the row out of the canary's verdict — a config edit must never read as a mass change.
+		// Before this, every rule edit produced a differently-shaped signature for 100% of matched
+		// URLs at once, and the only safe way to make one was a full dry-run cycle. Rows from before
+		// fingerprints existed carry none and are compared as usual:
 		// the rule that wrote them is the rule in force (a deploy that changed the rule would have
 		// reseeded them the old way), and they are stamped on their next quiet probe below, so the
 		// NEXT rule edit costs nothing either.
@@ -624,10 +846,31 @@ export const runProbePass = async ({
 			stored.fingerprint !== null &&
 			stored.fingerprint !== undefined &&
 			stored.fingerprint !== rule.fingerprint;
+		// What the stored signature is compared against: the observation itself, except for a
+		// baseline taken before paths were appended (below).
+		let comparable = observed;
+		let extended = false;
 		if (ruleChanged) {
-			stats.rebaselined++;
-			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
-			return;
+			// APPENDED, NOT EDITED. A stored fingerprint that is the one this rule would have had with
+			// only its first k extract paths means the edit since was appending the rest: slots 0..k-1
+			// are observed exactly as they were, so the baseline is still comparable on them. Compare
+			// those slots with the normal semantics — changed triggers, pageCheck overlays, the canary
+			// counts the row as compared. Whichever write the outcome takes (the quiet stamp, the
+			// dry-run write, the trigger's) stores the FULL observation and this fingerprint, so the
+			// row is upgraded; a deferred change writes nothing and is compared the same way next pass.
+			// Without this, adding one field cost a full pass of blindness on every field the rule
+			// already watched. Anything that is not a clean append (or a baseline without the shape
+			// the shorter rule writes) re-baselines as before.
+			const k = rule.prefixFingerprints?.get(stored.fingerprint);
+			const prefix = k === undefined ? null : signatureUnderPrefix(rule, k, stored.signature, observed);
+			if (prefix === null) {
+				stats.rebaselined++;
+				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+				return;
+			}
+			comparable = prefix;
+			extended = true;
+			stats.extended++;
 		}
 
 		// ROUND-TRIP BLINDNESS. Everything below compares the origin to the origin, so a value
@@ -639,59 +882,151 @@ export const runProbePass = async ({
 		// exists to catch. Only for extracted responses — a status-signal literal carries no
 		// price/availability to project (documented limitation).
 		const verificationArmed = await isVerificationArmed(rule);
+		const pageCheck = rule.pageCheck;
+		const claimPair = pageCheck ? pageCheck.priceFrom !== null && pageCheck.priceFrom !== undefined : false;
+		const mappedFields = pageCheck?.fields ?? [];
+
+		// The observation's slot values, parsed at most once and only when something needs them.
+		let values;
+		const valuesOf = () => {
+			if (values === undefined) values = signatureSlots(observed); // null for a status-signal literal
+			return values;
+		};
 
 		let pageDisagrees = false;
-		if (rule.pageCheck && stored?.pageSignature) {
-			let values = null;
-			try {
-				const parsed = JSON.parse(observed);
-				if (Array.isArray(parsed)) values = parsed;
-			} catch {
-				values = null; // a status-signal literal, not an extracted array
-			}
-			if (values) pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, rule.pageCheck));
-			if (pageDisagrees) stats.pageMismatch++;
+		if (claimPair && stored?.pageSignature && valuesOf()) {
+			pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, pageCheck));
 		}
 
-		const signatureChanged = Boolean(stored?.signature) && stored.signature !== observed;
+		const signatureChanged = Boolean(stored?.signature) && stored.signature !== comparable;
+
+		// THE PAGE RECORD: every mapped field compared against what the cached page claims — the same
+		// question as the claim pair above, asked of every field the page visibly states. A
+		// disagreement triggers exactly as `pageDisagrees` does; an agreement is what lets a CHANGE be
+		// recognised as one the page has already caught up with (below).
+		let verdicts = null;
+		let facts = null;
+		let mappedDisagrees = false;
+		let mappedAgreed = 0;
+		const armed = (field) => !guard || guard.isArmed(rule, field);
+		if (mappedFields.length && stored?.pageFacts && valuesOf()) {
+			facts = parsePageFacts(stored.pageFacts);
+			if (facts) {
+				const ctx = { pageUrl: row.url, vocabulary: pageCheck.vocabulary ?? null };
+				verdicts = mappedFields.map((field) => ({
+					field,
+					verdict: compareField(field, values[field.slot], facts, ctx),
+				}));
+				// WITNESSED: the page was rendered after the baseline was taken, and the origin still says
+				// exactly what it said then — so a correct mapping MUST agree unless the value made a
+				// round trip in between. Only these comparisons feed the mapping-defect guard. An
+				// appended-path row is excluded: its new slots have no baseline to be unchanged against.
+				const witnessed =
+					!extended && Boolean(stored.signature) && !signatureChanged && epochOf(stored.pageClaimAt) > stored.probedAt;
+				for (const { field, verdict } of verdicts) {
+					if (verdict === null) continue;
+					if (witnessed) guard?.witness(rule, field, verdict === false);
+					if (verdict === false) {
+						bump(stats.fieldMismatch, rule.label, field.label);
+						if (armed(field)) mappedDisagrees = true;
+					} else if (armed(field)) {
+						mappedAgreed++;
+					}
+				}
+			}
+		}
+		if (pageDisagrees || mappedDisagrees) stats.pageMismatch++;
+
+		// WHICH SLOTS CHANGED, and whether the change needs a render at all. Two ways it may not:
+		//
+		//   IGNORED   every changed slot is in `pageCheck.ignoreChanges` — fields the page cannot show.
+		//             Baseline written, nothing triggered, and NOT a change for the canary: a site-wide
+		//             edit of an ignored field (a badge, an inventory counter) must not read as a mass
+		//             change and invalidate a route.
+		//   CAUGHT UP every changed (non-ignored) slot is a mapped slot whose record ALREADY shows the
+		//             new value — a cadence render landed after the change. Baseline written, nothing
+		//             triggered; still a change for the canary (the rest of the corpus has not caught up).
+		//
+		// Anything else — an unmapped slot, a slot whose page record is unknown or disagrees, a
+		// status-signal literal (a state, not slots) — is a change, exactly as before.
+		//
+		// A slot is caught up only on positive evidence: at least one ARMED mapped field on it compared,
+		// and every armed field on it that compared shows the new value. A disarmed field is suspected of
+		// being mapped wrong, so its agreement is no evidence either way.
+		let storedValues = null;
+		const slotCaughtUp = (slot) => {
+			const onSlot = verdicts.filter(({ field, verdict }) => field.slot === slot && verdict !== null && armed(field));
+			if (!onSlot.length) return false;
+			storedValues ??= signatureSlots(stored.signature) ?? [];
+			const ctx = { pageUrl: row.url, vocabulary: pageCheck.vocabulary ?? null };
+			return onSlot.every(({ field }) => fieldCaughtUp(field, storedValues[slot], values[slot], facts, ctx));
+		};
+		let ignoredOnly = false;
+		let caughtUp = false;
+		if (signatureChanged) {
+			const slots = changedSlots(stored.signature, comparable);
+			if (slots === null) {
+				bump(stats.slotChanges, rule.label, 'signal');
+			} else {
+				for (const slot of slots) bump(stats.slotChanges, rule.label, String(slot));
+				const relevant = slots.filter((slot) => !(pageCheck?.ignoreChanges ?? []).includes(slot));
+				if (!relevant.length) ignoredOnly = true;
+				else if (verdicts) caughtUp = relevant.every((slot) => slotCaughtUp(slot));
+			}
+		}
+
+		const needsRender = signatureChanged && !ignoredOnly && !caughtUp;
 		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
 		// `probed = seeded + rebaselined + unchanged + changed + failed` is the documented invariant, and the
 		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
 		// would silently shrink the mass-change sample right when claims are most likely to be
-		// stale. `pageMismatch` OVERLAYS these buckets; it never replaces them.
-		if (signatureChanged) stats.changed++;
+		// stale. `pageMismatch`, `caughtUp` and `ignored` OVERLAY these buckets; they never replace
+		// them. An IGNORED change is bucketed unchanged — for the canary it is not a change.
+		if (signatureChanged && !ignoredOnly) stats.changed++;
 		else if (stored?.signature) stats.unchanged++;
 		else stats.seeded++;
-		if (!signatureChanged && !pageDisagrees) {
+		if (ignoredOnly) stats.ignored++;
+		if (caughtUp) stats.caughtUp++;
+		if (!needsRender && !pageDisagrees && !mappedDisagrees) {
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
 				// to have changed, the probe just hadn't seen it before.
 				await write(row.url, observed, { rowExists: stored !== null, fingerprint: rule.fingerprint });
 				return;
 			}
-			// One-time stamp of a pre-fingerprint row (see the rule-changed block above): one patch
-			// per legacy row, after which a converged corpus is back to paying no write per probe.
+			// The new baseline of an ignored or caught-up change; or the one-time stamp of a
+			// pre-fingerprint row (see the rule-changed block above), or one-time upgrade of a baseline
+			// taken before paths were appended — the full observation replaces the shorter signature, so
+			// the next pass compares every slot. One patch per such row, after which a converged corpus
+			// is back to paying no write per probe.
 			// Not an alternative to the verification below — both are due, neither stands in for the other.
-			if (stored.fingerprint === null || stored.fingerprint === undefined) {
+			if (signatureChanged || extended || stored.fingerprint === null || stored.fingerprint === undefined) {
 				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
 			}
-			if (verificationArmed && stored.pageSignature) {
+			// PROOF that something was compared: the stored claim for a rule with the claim pair (the
+			// original gate, unchanged), else at least one armed mapped field that agreed. A caught-up
+			// row is not verified on this pass — its baseline just moved — and is on the next.
+			const proof = claimPair ? Boolean(stored.pageSignature) : mappedAgreed > 0;
+			if (verificationArmed && proof && !caughtUp && !mappedDisagrees) {
 				// PROOF, not absence of news. Both conditions are load-bearing and neither is
 				// redundant:
 				//
-				//   stored.pageSignature  `pageDisagrees` is computed only `if (rule.pageCheck &&
-				//                         stored?.pageSignature)`, so a URL whose page claim is unknown
-				//                         arrives here with `pageDisagrees === false` — identical, at
-				//                         this line, to a real agreement. Without this guard we would
-				//                         stamp "verified" on a page nobody ever compared, and serve it
-				//                         through an invalidation. That is the one failure this feature
-				//                         must never produce.
+				//   proof                 `pageDisagrees` is computed only when a stored claim exists (and
+				//                         a mapped field only when a stored record does), so a URL whose
+				//                         page claim is unknown arrives here with nothing disagreeing —
+				//                         identical, at this line, to a real agreement. Without this guard
+				//                         we would stamp "verified" on a page nobody ever compared, and
+				//                         serve it through an invalidation. That is the one failure this
+				//                         feature must never produce.
 				//
 				//   verificationArmed     the exemption only means anything while an invalidation is
 				//                         active for THIS RULE'S scope, and a converged corpus is
 				//                         supposed to pay no write per probe (see the ProbeState
 				//                         comment). Writing unconditionally would add ~200k writes per
 				//                         node per cycle in the steady state to buy nothing.
+				//
+				// `!mappedDisagrees` is structurally true here (a disagreement leaves this branch), and is
+				// stated anyway: no armed mapped field may disagree with a page this certifies.
 				//
 				// Awaited, not detached: it shares the pass's pacing budget, and a write storm that
 				// outruns the probe is exactly what the paced sweep exists to prevent.
@@ -838,6 +1173,10 @@ export const runProbePass = async ({
 		if (batch.length >= Math.max(1, concurrency)) await flush();
 	}
 	await flush();
+
+	// Where each mapped field's guard stands after this pass (cumulative for the process, not the
+	// pass): how close a mapping is to being disarmed, and which ones are. Only for rules that map.
+	if (guard && rules.some((rule) => rule.pageCheck?.fields?.length)) stats.fieldGuard = guard.snapshot(rules);
 
 	return stats;
 };
@@ -1117,6 +1456,7 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			submitTrigger: triggers.submit,
 			verify: writeVerification,
 			isArmed: verificationArmedFor,
+			guard: theMappingGuard(),
 			...limits,
 			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
 			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
@@ -1358,6 +1698,12 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 				// IMMEDIATE, not queued: the cohort is a few hundred URLs and the canary's whole value
 				// is being fast, so there is nothing for a paced queue to spread.
 				submitTrigger: canaryTriggers.submit,
+				// The SAME guard as the sweep, reading AND witnessing: the canary re-probes its cohort
+				// every few minutes, so a broken mapping would otherwise re-render the whole cohort on
+				// every canary pass until the (possibly daily) sweep got round to disarming it. Repeat
+				// witnesses of one cohort do not skew the rate — they repeat its agreements and its
+				// disagreements alike.
+				guard: theMappingGuard(),
 				...limits,
 				// NEVER skips on baseline age. The cohort is small and deliberately probed on a
 				// cadence far tighter than `reprobeAfter` — freshness-skipping here would silence
@@ -1446,6 +1792,12 @@ export const changeProbeStatus = async () => {
 			pathPattern: rule.patternSource,
 			source: rule.source,
 			invalidateScope: rule.invalidateScope,
+			// Only when present, so a rule without them reads exactly as it did — the console compares
+			// these objects across nodes to spot a rule list that did not reach every node.
+			...(rule.pageCheck?.fields?.length
+				? { pageFields: rule.pageCheck.fields.map((field) => `${field.label}:${field.compare}`) }
+				: {}),
+			...(rule.pageCheck?.ignoreChanges?.length ? { ignoreChanges: rule.pageCheck.ignoreChanges } : {}),
 		})),
 		mode: config.changeProbe.mode,
 		// False only when the row could not be read at all. Distinguishes "the probe has not run
@@ -1752,6 +2104,9 @@ export const publishProbeStateForTest = publishProbeState;
 /** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
 export const __passLimitsForTest = passLimits;
 
+/** Tests only — the process's mapping guard, as the sweep and canary get it (live config, real warning). */
+export const __mappingGuardForTest = theMappingGuard;
+
 /** Tests only — module state that outlives a beforeEach. */
 export const resetChangeProbeState = () => {
 	clearProbeTimers();
@@ -1765,6 +2120,9 @@ export const resetChangeProbeState = () => {
 	compiledRules = null;
 	compiledFrom = undefined;
 	lastUnsupportedWarnAt = 0;
+	lastFactsUnsupportedWarnAt = 0;
+	lastFactsRefusedWarnAt = 0;
+	mappingGuard = null;
 	measuredSliceSize = null;
 	stopLoopLagMonitor();
 };
