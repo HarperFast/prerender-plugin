@@ -94,6 +94,25 @@ before(async () => {
 				return res.end(
 					page('<div id="widget"></div>', '<script type="application/ld+json">{"@type":"Product","name":"x"}</script>')
 				);
+			// A list widget whose headings exist from the start, whose status line reads "1 to 0" before
+			// the list fills, and whose final state is either items or a heading that says, in words only,
+			// that there are none. `/list-with-items` fills at 500ms; `/list-text-only` never does.
+			case '/list-with-items':
+			case '/list-text-only': {
+				const final =
+					path === '/list-with-items'
+						? `'<p class="status">1 to 2 of 2</p><div class="item">a</div><div class="item">b</div>'`
+						: `'<p class="status">1 to 0 of 2</p><h3>2 ratings without text</h3>'`;
+				return res.end(
+					page(
+						'<div id="list"><h3>Summary</h3><h3>Write one</h3><div id="body"></div></div>',
+						`<script>
+							setTimeout(() => { document.getElementById('body').innerHTML = '<p class="status">1 to 0 of 2</p>'; }, 150);
+							setTimeout(() => { document.getElementById('body').innerHTML = ${final}; }, 500);
+						</script>`
+					)
+				);
+			}
 			// Containers that are all filled, and a page with none at all.
 			case '/rails':
 				return res.end(page('<div class="rail"><span class="slide">1</span></div>'));
@@ -320,6 +339,40 @@ test('a DOM-guarded clause stands aside when the page has none of the thing', as
 	});
 	assert.equal(populated.job.readiness?.satisfied, true);
 	assert.equal(populated.job.readiness?.require[0].skipped, undefined, 'a populated grid IS checked');
+});
+
+test('an anyOf branch can be satisfied by what an element SAYS, and not by the element alone', async () => {
+	const contract = (name: string) => ({
+		name,
+		require: [
+			{
+				name: 'items-or-stated-none',
+				anyOf: [{ selector: '.item' }, { selector: '#list h3', textMatches: 'without text' }],
+			},
+		],
+		timeoutMs: 5000,
+	});
+
+	// The widget says in words that it has nothing to list: that alone satisfies, and only once said.
+	const textOnly = await render('/list-text-only', contract('text-only'));
+	assert.equal(textOnly.job.readiness?.satisfied, true);
+	assert.equal(textOnly.job.readiness?.stopped, true, 'the stated empty state lets the contract stop the render');
+	assert.ok((textOnly.job.readiness?.firstSatisfiedMs ?? 0) >= 400, 'not before the heading said so');
+	assert.match(textOnly.html ?? '', /2 ratings without text/);
+
+	// The same widget with items: its other headings exist from the start and do NOT satisfy the text
+	// branch, so the render holds until the items land.
+	const withItems = await render('/list-with-items', contract('with-items'));
+	assert.equal(withItems.job.readiness?.satisfied, true);
+	assert.ok((withItems.job.readiness?.firstSatisfiedMs ?? 0) >= 400, 'the always-present headings did not release it');
+	assert.match(withItems.html ?? '', /class="item"/);
+
+	// Asked as a bare selector, the same branch is vacuous: it matches the headings every page has.
+	const vacuous = await render('/list-with-items', {
+		...contract('vacuous'),
+		require: [{ name: 'items-or-any-heading', anyOf: [{ selector: '.item' }, { selector: '#list h3' }] }],
+	});
+	assert.ok((vacuous.job.readiness?.firstSatisfiedMs ?? Infinity) < 400, 'the selector-only branch released early');
 });
 
 test('"every container is filled" is not satisfied by having no containers', async () => {
@@ -564,6 +617,22 @@ test('a contract with an unusable number or pattern is rejected at config load',
 				},
 			} as never),
 		/invalid textMatches/
+	);
+
+	// anyOf branches are checked the same way — including the pattern a branch may now carry.
+	const branches = (anyOf: unknown) => ({
+		readiness: { onSatisfied: 'quiet', contracts: [{ name: 'c', require: [{ name: 'x', anyOf }] }] },
+	});
+	assert.throws(
+		() => mergeConfig(branches([{ selector: 'p', textMatches: '([' }]) as never),
+		/invalid anyOf textMatches/
+	);
+	assert.throws(() => mergeConfig(branches([{ selector: 'p', textMatches: 7 }]) as never), /invalid anyOf textMatches/);
+	assert.throws(() => mergeConfig(branches([{ minCount: 1 }]) as never), /anyOf branch without a selector/);
+	assert.throws(() => mergeConfig(branches([{ selector: 'p', minCount: -1 }]) as never), /anyOf minCount/);
+	assert.throws(() => mergeConfig(branches([]) as never), /empty anyOf/);
+	assert.doesNotThrow(() =>
+		mergeConfig(branches([{ selector: 'p' }, { selector: 'h3', textMatches: 'none' }]) as never)
 	);
 
 	assert.throws(
