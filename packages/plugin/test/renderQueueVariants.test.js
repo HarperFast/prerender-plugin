@@ -289,6 +289,67 @@ test('every device rendered: pages stored per device, ONE reschedule, ONE outcom
 	assert.equal(leased(A), false, 'the lease is released');
 });
 
+/**
+ * The page record rides with the claim: from the first variant that ran its extraction, and ONLY when
+ * the result replaced every default device's page — a partial render cannot vouch for the device page
+ * it did not replace.
+ */
+const withPageRecord = async (t) => {
+	const { applyOptions } = await import('../src/config.js');
+	const probeRows = new Map();
+	const original = globalThis.databases.probe_state.ProbeState;
+	globalThis.databases.probe_state.ProbeState = makeResourceBase(probeRows);
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			rules: [
+				{
+					label: 'pdp',
+					pathPattern: '^/product/',
+					source: 'request',
+					request: { urlTemplate: 'https://api.example.com/x', method: 'POST', body: '{}' },
+					extract: ['title'],
+					pageCheck: { enabled: true, fields: [{ slot: 0, fact: 'title', compare: 'text' }] },
+				},
+			],
+		},
+	});
+	t.after(() => {
+		globalThis.databases.probe_state.ProbeState = original;
+		applyOptions({});
+	});
+	return probeRows;
+};
+
+test('every device rendered: the page record is stored from the result, stamped with the pages’ own lastCached', async (t) => {
+	const probeRows = await withPageRecord(t);
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>d</html>', { pageFacts: { title: 'Red Shoe' } }),
+		rendered('mobile', '<html>m</html>', { pageFacts: { title: 'Red Shoe' } }),
+	]);
+	const record = probeRows.get(A);
+	assert.equal(JSON.parse(record.pageFacts).title, 'Red Shoe');
+	assert.equal(
+		record.pageClaimAt.getTime(),
+		stores.prerenderedPage.get(key(A, 'desktop')).lastCached,
+		'the record describes exactly the render stored beside it'
+	);
+});
+
+test('a PARTIAL render (one device failed) stores no page facts — the other device page is older', async (t) => {
+	const probeRows = await withPageRecord(t);
+	seedUrlRow();
+	probeRows.set(A, { url: A, pageFacts: '{"title":"from an older render"}' });
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', '<html>fresh</html>', { pageFacts: { title: 'Red Shoe' } }),
+		{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	]);
+	assert.equal(probeRows.get(A).pageFacts, null, 'retired, not kept and not replaced by one device’s view');
+});
+
 test('a device that failed puts the URL in the fast lane while the device that rendered is stored', async () => {
 	seedUrlRow();
 	await claim();
