@@ -60,6 +60,7 @@ import {
 	muted,
 	num,
 	pill,
+	section,
 	spacer,
 	table,
 	unwired,
@@ -67,7 +68,7 @@ import {
 import { pageContentUrl } from '../api.js';
 import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
-export const meta = { id: 'inspect', label: 'Inspect', crumb: 'inspect', icon: ICONS.explain };
+export const meta = { id: 'inspect', label: 'Inspect', icon: ICONS.explain };
 
 const PAGE_SIZE = 50;
 
@@ -95,24 +96,17 @@ export function render(ctx) {
 	const data = ctx.data.browse;
 
 	return [
-		el('div', { cls: 'view-head' }, [
-			el('span', { cls: 'eyebrow', text: 'Inspect' }),
-			data &&
-				el('span', {
-					cls: 'muted mono',
-					text: `${num(data.total?.recordCount)} pages${data.total?.estimatedRange ? ` (±${num(data.total.estimatedRange)})` : ''}`,
-				}),
-			spacer(),
-		]),
 		appliedNote(ctx),
 		...explainer(ctx),
 		// A dead page-cache read must not take the explainer down with it. As its own view a
 		// failed browse could early-return the whole screen; here that same return would also
 		// remove the one panel that still works — and the explainer reads different rows through
 		// a different route, so it is very often the half that survives.
-		data ? browser(ctx, data) : el('div', { cls: 'note bad', text: ctx.data.browseError ?? 'No page-cache data.' }),
+		data
+			? browser(ctx, data)
+			: el('div', { cls: 'note bad', text: ctx.data.browseError ?? 'Could not load the page cache.' }),
 		quality(),
-		...settings(ctx),
+		settings(ctx),
 		editTray(ctx),
 	];
 }
@@ -137,11 +131,10 @@ function explainer(ctx) {
 	const saved = ctx.data.input ?? { url: '', deviceType: '' };
 
 	const url = el('input', {
-		cls: 'mono',
+		cls: 'mono grow',
 		type: 'text',
 		value: saved.url,
 		placeholder: 'https://www.example.com/catalog/x.jsp?CN=a',
-		style: { flex: '1', minWidth: '260px' },
 	});
 	const device = el(
 		'select',
@@ -165,20 +158,12 @@ function explainer(ctx) {
 	const result = ctx.data.result;
 
 	return [
-		// Built by hand rather than with `card()`: that helper decides whether to draw a head with
-		// `(title || head.length)`, which for a title-less, head-less card is the NUMBER 0 — and 0 is
-		// not one of the falsy holes `append` skips, so it lands in the card as a literal "0" above
-		// the form. The explainer is the only card in the console with neither, and ui.js is not this
-		// file's to fix.
-		el('div', { cls: 'card' }, [
-			el('div', { cls: 'card-body' }, [
-				el('div', { cls: 'toolbar' }, [url, device, button]),
-				el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-					'Shows the cache key this URL resolves to and the live rows stored under it — the fastest ' +
-						'way to explain a page that never seems to hit cache. Browsing by prefix below fills this in.',
-				]),
-			]),
-		]),
+		card('Explain a URL', {
+			help:
+				'Shows the cache key this URL resolves to and the live rows stored under it — the fastest way to explain a ' +
+				'page that never seems to hit cache. “explain ↑” on a row of the page cache below fills this in.',
+			body: el('div', { cls: 'toolbar' }, [url, device, button]),
+		}),
 		result && !result.ok && el('div', { cls: 'note bad', text: result.body?.error ?? 'Explain failed' }),
 		result?.ok && explanation(ctx, result.body),
 	];
@@ -351,14 +336,13 @@ const CLAMP = {
 	floor: [
 		'warn',
 		'clamped by demandFloor',
-		'The ladder’s rung was raised to the route’s demand floor. Across a route this means the ladder has ' +
-			'no range to work in: it cannot go faster than the floor, so promotion is running for nothing.',
+		'The rung was raised to the route’s demand floor. Across a route, the ladder has no range to work in — ' +
+			'promotion is running for nothing.',
 	],
 	ceiling: [
 		'',
 		'clamped by the route ceiling',
-		'The rung was slower than the route’s own interval, so the route won. The ladder never schedules ' +
-			'slower than the cadence a route already grants — the rung is inert here.',
+		'The rung was slower than the route’s own interval, so the route won — the rung is inert here.',
 	],
 };
 
@@ -389,6 +373,9 @@ function cadenceCard(data) {
 	const row = (text, note) => el('span', null, [mono(text), muted(`  ${note}`)]);
 
 	return card('Render cadence', {
+		help:
+			'Resolved exactly as the scheduler resolves it: the demand rung raised to the floor, then capped by the base. ' +
+			'The Target’s render interval below is the ceiling this is clamped into, never the cadence on its own.',
 		head: [
 			clamp ? pill(clamp[1], clamp[0]) : rung ? pill('ladder rung applied', 'ok') : pill('base interval', ''),
 			spacer(),
@@ -429,11 +416,6 @@ function cadenceCard(data) {
 				],
 				['Demand floor', floor ? row(floor, 'the fastest rung this route may reach') : muted('— the route sets none')],
 			]),
-			el('p', { cls: 'muted', style: { margin: '12px 0 0', fontSize: '12px' } }, [
-				'Resolved exactly as the scheduler resolves it: the rung raised to the floor, then capped by the ',
-				'base — so the Target card’s render interval below is the ceiling this is clamped into, never the ',
-				'cadence on its own.',
-			]),
 		],
 	});
 }
@@ -463,48 +445,60 @@ function notes(data) {
 
 	if (data.underGlobalAllowlist.differs) {
 		note('warn', [
-			`This URL keys differently under the matched route allowlist (${data.allowlist.used.join(', ')}) ` +
-				`than under the global url.queryParams (${data.underGlobalAllowlist.allowlist.join(', ')}). ` +
-				'That difference is the usual cause of a permanent cache miss — check that the route is ' +
-				'present and ordered correctly.',
+			el('strong', {
+				text:
+					`Keys differently under the route allowlist (${data.allowlist.used.join(', ')}) than the global ` +
+					`url.queryParams (${data.underGlobalAllowlist.allowlist.join(', ')}) — the usual cause of a permanent miss.`,
+			}),
+			' Check that the route is present and ordered correctly.',
 		]);
 	}
 	if (data.ingress.routeClass === 'unclassified') {
 		note('warn', [
-			'No route matched this path, so all query params are kept and the page is proxied but never ' +
-				'cached. Either add a prerender route for it, declare it as a passthrough route if it is ' +
-				'deliberately not prerendered, or stop the CDN forwarding it here.',
+			el('strong', { text: 'No route matched — all query params are kept; proxied, never cached.' }),
+			' Add a prerender route, declare a passthrough route, or stop the CDN forwarding it.',
 		]);
 	}
 	if (data.verdict.suppressed) {
 		const s = data.rows.suppression;
-		note('bad', [
-			`This target is suppressed: a render judged it non-indexable` +
-				(s?.reason ? ` (${s.reason})` : '') +
-				(s?.strikes ? `, ${s.strikes}/${s.maxStrikes} strikes` : '') +
-				'. It blocks re-discovery and re-checks itself on its own schedule — the next render lifts ' +
-				'the suppression if the page is indexable again, or deletes the target at the strike limit.',
-		]);
+		out.push(
+			el(
+				'div',
+				{
+					cls: 'note bad',
+					style: { marginBottom: '10px' },
+					title: 'A suppressed target blocks re-discovery and re-checks itself on its own schedule.',
+				},
+				[
+					el('strong', {
+						text:
+							'Suppressed: a render judged this target non-indexable' +
+							(s?.reason ? ` (${s.reason})` : '') +
+							(s?.strikes ? `, ${s.strikes}/${s.maxStrikes} strikes` : '') +
+							'.',
+					}),
+					' The next render lifts it if the page is indexable again, or deletes the target at the strike limit.',
+				]
+			)
+		);
 	}
 	if (data.ingress.routeClass === 'passthrough') {
 		note('', [
 			data.eligibility.excludedByPattern
-				? `Matches excludePathPatterns (${data.eligibility.excludedByPattern}) — proxied live, never scheduled for rendering.`
-				: 'Declared as a passthrough route — proxied live and deliberately never prerendered.',
+				? `Matches excludePathPatterns (${data.eligibility.excludedByPattern}) — proxied live, never scheduled.`
+				: 'A passthrough route — proxied live and deliberately never prerendered.',
 		]);
 	}
 	if (!data.eligibility.domainAllowed) {
-		note('warn', ['Host is outside the domains allowlist — it will be rendered but force-marked non-indexable.']);
+		note('warn', ['Host is outside the domains allowlist — rendered, but force-marked non-indexable.']);
 	}
 	if (data.resolved.deviceTypeFellBack) {
-		note('', [
-			`The requested device type is not in deviceTypes.supported and fell back to "${data.resolved.deviceType}".`,
-		]);
+		note('', [`Device type not in deviceTypes.supported — fell back to "${data.resolved.deviceType}".`]);
 	}
 	if (data.degraded) {
 		note('bad', [
-			`These reads timed out and are shown as empty: ${data.degraded.timedOutReads.join(', ')}. ` +
-				'Treat those rows as unknown, not absent.',
+			el('strong', { text: `Reads timed out: ${data.degraded.timedOutReads.join(', ')}.` }),
+			' Treat those rows as unknown, not absent.',
 		]);
 	}
 	if (data.residency && !data.residency.scheduleReadIsAuthoritative) {
@@ -512,17 +506,17 @@ function notes(data) {
 			// The owner answered — say so, since the row came from a different node than the rest
 			// of the response.
 			note('ok', [
-				`The schedule row is owned by ${data.residency.scheduleOwnedBy} and was fetched from it, so it ` +
-					`is authoritative. Everything else was read on ${data.residency.queriedNode}.`,
+				`Schedule row fetched from its owner, ${data.residency.scheduleOwnedBy} (authoritative); the rest was read ` +
+					`on ${data.residency.queriedNode}.`,
 			]);
 		} else {
 			note('warn', [
-				'RenderSchedule rows are pinned to the node owning the URL, and this node ' +
-					`(${data.residency.queriedNode}) is not the owner — ${data.residency.scheduleOwnedBy} is. ` +
-					'Could not reach the owner' +
-					(data.residency.peerError ? ` (${data.residency.peerError})` : '') +
-					', so the row below is this node’s local copy: an absent one means "not scheduled on ' +
-					'this node", not "not scheduled".',
+				el('strong', {
+					text:
+						`${data.residency.queriedNode} is not this URL’s schedule owner (${data.residency.scheduleOwnedBy}) and ` +
+						`could not reach it${data.residency.peerError ? ` (${data.residency.peerError})` : ''}.`,
+				}),
+				' The schedule row below is the local copy — an absent one means “not scheduled on this node”, not “not scheduled”.',
 			]);
 		}
 	}
@@ -568,8 +562,8 @@ function revalidate(ctx, data, target, schedule) {
 				button,
 				muted(
 					!target && !timedOut(data, 'renderTarget')
-						? 'No target under this key, so there is no recurring rotation to rejoin.'
-						: 'Sets this one key due immediately. Never touches any other row.'
+						? 'No target under this key — no rotation to rejoin.'
+						: 'Marks only this key due now.'
 				),
 			]
 		),
@@ -579,9 +573,8 @@ function revalidate(ctx, data, target, schedule) {
 		children.push(
 			el('div', { cls: 'note ok', style: { marginTop: '10px' } }, [
 				result.body.wokeLocalConsumers
-					? 'Marked due now. This node owns the row and its consumers were woken, so the render should start shortly.'
-					: `Marked due now. ${result.body.scheduleOwnedBy} owns this row and will claim it on its next ` +
-						'status sync — the write is residency-routed, so it landed on that node.',
+					? 'Marked due now — this node owns the row and woke its consumers; the render should start shortly.'
+					: `Marked due now on ${result.body.scheduleOwnedBy}, which owns the row and claims it on its next status sync.`,
 			])
 		);
 	} else if (result) {
@@ -595,9 +588,8 @@ function revalidate(ctx, data, target, schedule) {
 		// wording elsewhere is careful to avoid.
 		children.push(
 			el('div', { cls: 'note warn', style: { marginTop: '10px' } }, [
-				'This key has a target but no schedule row, so nothing will render it. If the URL is not in ' +
-					'a sitemap, no other code path re-creates that row — use the button above, or let this ' +
-					'node’s periodic repair sweep pick it up.',
+				el('strong', { text: 'A target with no schedule row — nothing will render it.' }),
+				' Outside every sitemap nothing re-creates the row: use the button above, or wait for this node’s repair sweep.',
 			])
 		);
 	} else if (schedule?.belowClaimFloor && data.residency?.scheduleAuthoritative) {
@@ -610,15 +602,23 @@ function revalidate(ctx, data, target, schedule) {
 		// node-local state about the OWNER's slice of the table, so a non-owner's floor answers a
 		// different question entirely.
 		children.push(
-			el('div', { cls: 'note bad', style: { marginTop: '10px' } }, [
-				`This key is scheduled BELOW ${data.residency.scheduleOwnedBy}’s claim floor, so nothing will ` +
-					'claim it and nothing will report an error. A due time written straight to the table (the ' +
-					'operations API, or a PUT to the exported RenderSchedule endpoint) is the usual cause — no ' +
-					'plugin code runs in those paths, so the floor is not lowered to cover the write. It clears on ' +
-					'the owner’s next floor reset (queue.claimFloor.resetInterval), or immediately with the queue ' +
-					'action reset-claim-floor on that node. The button above also fixes it: it writes through the ' +
-					'schedule funnel, which lowers the floor with the row.',
-			])
+			el(
+				'div',
+				{
+					cls: 'note bad',
+					style: { marginTop: '10px' },
+					title:
+						'Usual cause: a due time written straight to the table (the operations API, or a PUT to the exported ' +
+						'RenderSchedule endpoint) — no plugin code runs there, so the floor is not lowered to cover the write.',
+				},
+				[
+					el('strong', {
+						text: `Scheduled BELOW ${data.residency.scheduleOwnedBy}’s claim floor — nothing will claim it or report an error.`,
+					}),
+					' The button above fixes it (it lowers the floor with the row), as does reset-claim-floor on that node or ' +
+						'its next queue.claimFloor.resetInterval.',
+				]
+			)
 		);
 	}
 
@@ -713,11 +713,21 @@ function browser(ctx, data) {
 
 	const filtered = (data.pages ?? []).length - rows.length;
 
-	return el('div', { cls: 'card' }, [
-		el('div', { cls: 'card-head' }, [
+	return card('Page cache', {
+		cls: 'flush-table',
+		head: [
 			el('div', { cls: 'searchbox', style: { maxWidth: '420px' } }, [search]),
-			el('button', { text: 'Search', disabled: ctx.busy, onclick: go }),
+			el('button', { cls: 'small', text: 'Search', disabled: ctx.busy, onclick: go }),
+			muted(
+				`${num(data.total?.recordCount)} pages${data.total?.estimatedRange ? ` (±${num(data.total.estimatedRange)})` : ''}`
+			),
 			spacer(),
+			filtered > 0 &&
+				el('span', {
+					cls: 'muted',
+					text: `filtering this page only — ${filtered} of ${data.pages.length} hidden`,
+					title: 'The filters do not query the table: there is no index on those fields.',
+				}),
 			filterSelect('fresh', [
 				['', 'Freshness: all'],
 				['fresh', 'fresh'],
@@ -728,20 +738,13 @@ function browser(ctx, data) {
 				['true', 'true'],
 				['false', 'false'],
 			]),
-		]),
-		filtered > 0 &&
-			el('div', { style: { padding: '8px 18px' } }, [
-				el('div', {
-					cls: 'note info',
-					text: `Filtering this fetched page only — ${filtered} of ${data.pages.length} rows hidden. The filters do not query the table (no index on those fields).`,
-				}),
-			]),
-		table(
+		],
+		body: table(
 			['cache key', 'status', 'freshness', 'cached', 'expires', 'indexable', { text: '', right: true }],
 			rows,
 			data.prefix ? 'No cached pages under this prefix.' : 'The page cache is empty.'
 		),
-		el('div', { cls: 'card-foot' }, [
+		foot: [
 			el('span', { text: `${rows.length} shown` }),
 			data.truncated && el('span', { text: '· more available' }),
 			spacer(),
@@ -757,8 +760,8 @@ function browser(ctx, data) {
 					ctx.data.cursor = data.nextCursor;
 					ctx.reload();
 				}),
-		]),
-	]);
+		],
+	});
 }
 
 /**
@@ -773,12 +776,10 @@ const quality = () =>
 	card('Content quality', {
 		body: [
 			unwired(
-				'Visible-text length, link/image counts and hydration-marker checks — for the one stored page ' +
-					'explained above, and per row in the table — trended against the route-class median so ' +
-					'outliers stand out.',
-				'content-quality fields persisted at render-result time (processJobResult) and the audit ' +
-					'detectors shared into this package — statusCode/bytes/isIndexable cannot distinguish a ' +
-					'healthy page from an unhydrated one'
+				'Visible-text length, link/image counts and hydration-marker checks per stored page, trended against ' +
+					'the route-class median.',
+				'content-quality fields persisted at render-result time (processJobResult) — statusCode/bytes/isIndexable ' +
+					'cannot tell a healthy page from an unhydrated one'
 			),
 		],
 	});
@@ -790,35 +791,31 @@ const quality = () =>
 // at once, and the orphaning is INVISIBLE in the table above — the rows are still there, they are
 // just under keys nothing computes any more.
 
-const settings = (ctx) => [
-	settingsCard(ctx, {
-		title: 'Cached-page lifetimes',
-		prefix: 'page',
-		description:
-			'The freshness column above is these values read against each row. ttl and minTtl are stamped onto ' +
-			'a target as its render interval when a sitemap is ingested, so changing them reaches the corpus at ' +
-			'the next refresh rather than now; swrTtl is applied at serve time, so it re-dates what counts as ' +
-			'stale on the very next read. None of the three evicts a page or schedules a render. blobReadBudgetMs is the ' +
-			'serve path only — how long a hit may spend reading the stored body before falling back to the ' +
-			'origin — and has no bearing on this table.',
-	}),
-	settingsCard(ctx, {
-		title: 'Cache-key identity',
-		prefix: 'cacheKey',
-		description:
-			'How a URL becomes the cache key — both the one the explainer resolves at the top of this page and ' +
-			'the first column of the table. A change reshapes every key at once: stored pages keep the keys they ' +
-			'were written under, so they are orphaned rather than migrated — not deleted, just never found ' +
-			'again — and the corpus effectively rebuilds from empty as pages re-render. The prefix search above ' +
-			'is a primary-key range, so after a change it can only find the new shape.',
-	}),
-	settingsCard(ctx, {
-		title: 'Console page size',
-		prefix: 'management.pageSize',
-		description:
-			'A ceiling on the rows one fetch returns — this view asks for 50, and a lower value here clamps it ' +
-			'(it also bounds the sitemap-entry table and the per-entry point reads a sitemap detail does). It ' +
-			'changes what one browse click costs, never what is stored, and the dropdowns above still filter ' +
-			'only the rows that came back.',
-	}),
-];
+function settings(ctx) {
+	const cards = [
+		settingsCard(ctx, {
+			title: 'Cached-page lifetimes',
+			prefix: 'page',
+			description:
+				'The freshness column is these values read against each row. ttl and minTtl are stamped onto a target at ' +
+				'sitemap ingest, so they reach the corpus at the next refresh; swrTtl applies at serve time, on the next ' +
+				'read. None evicts a page or schedules a render; blobReadBudgetMs is serve-path only.',
+		}),
+		settingsCard(ctx, {
+			title: 'Cache-key identity',
+			prefix: 'cacheKey',
+			description:
+				'How a URL becomes the cache key. A change reshapes every key at once: stored pages are orphaned — not ' +
+				'deleted, never found again — and the corpus rebuilds as pages re-render; the prefix search only finds ' +
+				'the new shape.',
+		}),
+		settingsCard(ctx, {
+			title: 'Console page size',
+			prefix: 'management.pageSize',
+			description:
+				'Caps the rows one fetch returns — this view asks for 50, and it also bounds the sitemap-entry table. It ' +
+				'changes what a browse costs, never what is stored.',
+		}),
+	].filter(Boolean);
+	return cards.length ? section(meta.id, 'Settings', cards) : null;
+}

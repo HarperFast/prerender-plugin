@@ -12,16 +12,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { installDom } from './domShim.js';
+import { installDom, find } from './domShim.js';
 
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render } = await import('../src/admin/views/inspect.js');
+const { load, render, meta } = await import('../src/admin/views/inspect.js');
 
 const HOUR = 3_600_000;
 
-const BROWSE = { rows: [], total: { recordCount: 0 }, nextCursor: null };
+const BROWSE = { pages: [], total: { recordCount: 1234 }, nextCursor: null };
 
 const CONFIG = {
 	schema: {
@@ -61,7 +61,9 @@ const explain = (cadence) => ({
 function makeCtx(result) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
+	const calls = { posts: [] };
 	const ctx = {
+		calls,
 		scratch,
 		busy: false,
 		get data() {
@@ -72,7 +74,8 @@ function makeCtx(result) {
 			if (route === 'config') return { ok: true, body: CONFIG };
 			return { ok: true, body: {} };
 		},
-		async post() {
+		async post(route, body) {
+			calls.posts.push({ route, body });
 			return { ok: true, body: {} };
 		},
 		render() {},
@@ -174,4 +177,107 @@ test('an older plugin that sends no intervals never formats a missing one as a r
 	assert.doesNotMatch(text, /\b0s\b/);
 	assert.match(text, /the ladder has not evaluated this target/);
 	assert.match(text, /base interval/);
+});
+
+// ---- the redesign: no header, explanations behind help, alerts short but intact ------------
+
+const draw = (ctx) => el('div', null, render(ctx));
+const helpText = (node) => {
+	const out = [];
+	find(node, (n) => {
+		if (n.attributes?.class === 'help') out.push(n.textContent);
+		return false;
+	});
+	return out.join('\n');
+};
+
+test('no header of its own: the page count moves onto the page-cache card, settings into a section', async () => {
+	const ctx = await ready(null);
+	const tree = draw(ctx);
+	assert.equal(meta.crumb, undefined);
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'view-head'),
+		null
+	);
+	const cacheCard = find(
+		tree,
+		(n) => String(n.attributes?.class).startsWith('card') && /^Page cache/.test(n.children[0]?.textContent ?? '')
+	);
+	assert.ok(cacheCard, 'the browse half is a titled card');
+	assert.match(cacheCard.children[0].textContent, /1,234 pages/);
+	assert.ok(
+		find(tree, (n) => n.attributes?.class === 'section'),
+		'settings collapse into a section'
+	);
+});
+
+test('the explainer still posts explain, and its "what is this" text is behind help', async () => {
+	const ctx = await ready({
+		effectiveInterval: 6 * HOUR,
+		baseFrom: 'route',
+		baseInterval: 24 * HOUR,
+		routeInterval: 24 * HOUR,
+		storedInterval: null,
+		defaultInterval: 24 * HOUR,
+		demandInterval: 6 * HOUR,
+		demandFloor: null,
+		clampedBy: null,
+	});
+	const tree = draw(ctx);
+	assert.match(helpText(tree), /the fastest way to explain a page that never seems to hit cache/);
+	assert.match(helpText(tree), /ceiling this is clamped into/, 'the cadence resolution note is kept');
+	const input = find(tree, (n) => n.tagName === 'INPUT' && n.attributes.placeholder?.startsWith('https://'));
+	input.value = 'https://www.example.com/catalog/x.jsp?CN=a';
+	find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'Explain').fire('click');
+	assert.deepEqual(ctx.calls.posts.at(-1), {
+		route: 'explain',
+		body: { url: 'https://www.example.com/catalog/x.jsp?CN=a', deviceType: undefined },
+	});
+});
+
+test('the hedges survive the shortening: unknown is not absent, not-owner is not "not scheduled"', async () => {
+	const body = explain(null);
+	body.degraded = { timedOutReads: ['prerenderedPage'] };
+	body.residency = {
+		scheduleReadIsAuthoritative: false,
+		scheduleAuthoritative: false,
+		queriedNode: 'node-a',
+		scheduleOwnedBy: 'node-b',
+		peerError: 'timeout',
+	};
+	const ctx = makeCtx({ ok: true, body });
+	await load(ctx);
+	const tree = draw(ctx);
+	const text = tree.textContent;
+	assert.match(text, /Reads timed out: prerenderedPage/);
+	assert.match(text, /unknown, not absent/);
+	assert.match(text, /node-a is not this URL’s schedule owner \(node-b\) and could not reach it \(timeout\)/);
+	assert.match(text, /“not scheduled on this node”, not “not scheduled”/);
+	assert.ok(find(tree, (n) => n.attributes?.class === 'note bad' && /Reads timed out/.test(n.textContent)));
+});
+
+test('a row below the owner’s claim floor is still the loud fault, with its cause on the tooltip', async () => {
+	const body = explain(null);
+	body.residency = {
+		scheduleReadIsAuthoritative: false,
+		scheduleAuthoritative: true,
+		queriedNode: 'node-a',
+		scheduleOwnedBy: 'node-b',
+	};
+	body.rows.renderSchedule = {
+		leased: false,
+		overdue: true,
+		dueInMs: 9 * 60_000,
+		belowClaimFloor: true,
+		fromSitemap: true,
+	};
+	const ctx = makeCtx({ ok: true, body });
+	await load(ctx);
+	const tree = draw(ctx);
+	const alarm = find(tree, (n) => n.attributes?.class === 'note bad' && /claim floor/.test(n.textContent));
+	assert.ok(alarm);
+	assert.match(alarm.textContent, /Scheduled BELOW node-b’s claim floor — nothing will claim it or report an error/);
+	assert.match(alarm.textContent, /reset-claim-floor/);
+	assert.match(alarm.attributes.title, /written straight to the table/);
+	assert.match(tree.textContent, /Schedule row fetched from its owner, node-b \(authoritative\)/);
 });

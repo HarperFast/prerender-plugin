@@ -746,13 +746,13 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/session`             | who am I                                         | public       |
 | `POST /prerender_admin/login`              | `{ username, password }`                         | public       |
 | `POST /prerender_admin/logout`             | end the session                                  | session      |
-| `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot                  | `super_user` |
+| `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot, host facts      | `super_user` |
 | `GET /prerender_admin/config`              | effective config, layers, overrides, warnings    | `super_user` |
 | `GET /prerender_admin/sitemaps`            | root sitemaps + refresh state (never `entries`)  | `super_user` |
 | `GET /prerender_admin/pages`               | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
 | `GET /prerender_admin/page-content`        | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
 | `GET /prerender_admin/unrouted`            | this worker's unrouted-path tally (peek)         | `super_user` |
-| `GET /prerender_admin/analytics`           | `?range` (ms) — bucketed metric series, cached   | `super_user` |
+| `GET /prerender_admin/analytics`           | `?range` (ms) — series + per-node system health  | `super_user` |
 | `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                    | `super_user` |
 | `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day  | `super_user` |
 | `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)              | `super_user` |
@@ -772,6 +772,28 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/change-probe`        | running pass, next run, last passes (this node)  | `super_user` |
 | `POST /prerender_admin/change-probe`       | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
 
+**Node health** comes in two node-scoped pieces, neither of which adds a scan:
+
+- `overview.host` — point-in-time facts from the answering worker's `os`/`process` and
+  `/proc/meminfo`: `hostname`, `cpus`, `totalMemory`, `availableMemory` with
+  `availableMemorySource` (`'meminfo'` is the kernel's `MemAvailable`, which counts reclaimable
+  page cache; `'freemem'` is the off-Linux fallback, which does not), `swapUsed`/`swapTotal`
+  (null without `/proc/meminfo`), `loadavg`, `uptimeSec` (the Harper process — it resets on a
+  restart), `pluginVersion`, `harperVersion` (null when it cannot be determined) and
+  `nodeVersion`. Memory and load are the host kernel's figures; where the process runs under a cgroup
+  memory limit below host RAM, `memoryLimit` and `memoryLimitAvailable` (Node 22+'s
+  `process.constrainedMemory()` / `availableMemory()`) carry the container's own ceiling and what is
+  free under it — null when there is no real limit.
+- analytics `system.nodes[]` — Harper's own per-node rows (`resource-usage`,
+  `main-thread-utilization`, `utilization`, `storage-volume`; a handful per node per aggregation
+  pass), kept from the same walk as the series and bucketed identically: `cpu` (fraction of ONE
+  core, so it can exceed 1), `majorFaults` (summed per bucket), `rss`, `heapUsed` (the main
+  thread's heap only), `elu` and `workerElu` (main-thread and worker event-loop utilization, as
+  Σactive ÷ Σ(active + idle)), `taskQueueLatency` (ms), and `latest` — each field's newest value
+  plus `diskAvailable`/`diskSize` for the fullest volume in the newest pass. A null is a bucket
+  with no sample, never a zero. One entry per node id in the table (several when `hdb_analytics`
+  replicates), named from `system.hdb_analytics_hostname`.
+
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the
 same resource (the Ubuntu and Fira Code subsets are vendored with their licenses in
 `src/admin/fonts/`), the CSP is `default-src 'none'` with `'self'` allowances and **no**
@@ -787,8 +809,14 @@ execute it against the operator's super-user session.
 panel is a reading of THIS package's data model, and the concepts below — snapshots, the
 claim floor, schedule repair — are plugin behavior.)
 
-- **Overview** — per-node queue status with staleness, table counts, the due-now backlog, the
-  in-flight count, the claim-floor lag, and a next-24h histogram of `nextRenderTime`. That
+- **Health** — the landing page: every number worth checking, each with a verdict (ok / watch /
+  bad) and the view that explains it. Its system section reads the per-node vitals this package
+  serves since v0.92.0 — `analytics` → `system.nodes[]` (Harper's own per-minute resource rows,
+  folded in the same scan) and `overview` → `host` (a point-in-time host block) — see "Node health".
+
+- **Queue** — per-node queue status, intent and throughput, the due-now backlog and its time to
+  clear at the observed render rate, the in-flight count, the claim-floor lag, and a next-24h
+  histogram of `nextRenderTime` (these backlog panels were on the retired Overview). That
   histogram is the quickest way to tell a healthy jittered spread from a render herd: a flat
   distribution means the initial-render jitter is working, a single tall bar means everything
   comes due at once. Note the histogram is capped at `management.scanCap` rows and reports

@@ -83,15 +83,43 @@ async function request(path, options) {
 	return { ok: res.ok, status: res.status, body };
 }
 
-export const get = (path, params) =>
-	request(path + (params && Object.keys(params).length ? `?${new URLSearchParams(params)}` : ''));
+/**
+ * Identical GETs in flight share one request.
+ *
+ * Views overlap in what they read — Health, Traffic and Queue all load the same analytics window —
+ * and the shell drops a superseded load's RESPONSE without being able to cancel its REQUEST. So
+ * switching views mid-load used to issue a second identical fetch, which the browser then held
+ * behind the first (its cache lock) and which the node answered twice. Sharing the promise makes the
+ * second caller ride the first. Only while in flight: a finished request is never reused, so a
+ * Refresh always goes back to the server.
+ */
+const inflight = new Map();
 
-export const post = (path, data) =>
-	request(path, {
+export const get = (path, params) => {
+	const url = path + (params && Object.keys(params).length ? `?${new URLSearchParams(params)}` : '');
+	// Keyed with the scope too: the same route for another node is a different answer.
+	const key = `${node}\u0000${url}`;
+	let pending = inflight.get(key);
+	if (!pending) {
+		// Identity-checked: after a POST cleared the map, a newer request may own this key.
+		const mine = request(url).finally(() => inflight.get(key) === mine && inflight.delete(key));
+		pending = mine;
+		inflight.set(key, pending);
+	}
+	return pending;
+};
+
+export const post = (path, data) => {
+	// A write changes what a read means: a GET issued AFTER this POST must not ride one issued before
+	// it — the reload after "Start" would redraw "not running", and the session check after sign-out
+	// would answer "signed in". So every POST (login and logout included) retires the shared reads.
+	inflight.clear();
+	return request(path, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify(data ?? {}),
 	});
+};
 
 /** The URL of a stored page's HTML. Opened in a tab; served as text/plain, never text/html. */
 export const pageContentUrl = (cacheKey) => withNode(`${BASE}/page-content?cacheKey=${encodeURIComponent(cacheKey)}`);

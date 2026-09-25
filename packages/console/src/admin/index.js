@@ -42,10 +42,10 @@ const ASSETS = new Map([
 	// The change probe's pure state logic (what each node is doing now, its health flags), imported
 	// by the probe view.
 	['views/_probeState.js', ['views/_probeState.js', JS]],
-	['views/overview.js', ['views/overview.js', JS]],
+	['views/health.js', ['views/health.js', JS]],
 	['views/traffic.js', ['views/traffic.js', JS]],
 	['views/queue.js', ['views/queue.js', JS]],
-	['views/nodes.js', ['views/nodes.js', JS]],
+	['views/corpus.js', ['views/corpus.js', JS]],
 	['views/sitemaps.js', ['views/sitemaps.js', JS]],
 	['views/invalidations.js', ['views/invalidations.js', JS]],
 	['views/probe.js', ['views/probe.js', JS]],

@@ -38,6 +38,7 @@ import {
 	duration,
 	el,
 	ICONS,
+	isOpen,
 	kv,
 	link,
 	meter,
@@ -47,8 +48,11 @@ import {
 	num,
 	pct,
 	pill,
+	section,
+	setOpen,
 	spacer,
 	stat,
+	stats,
 	table,
 } from '../ui.js';
 import {
@@ -57,7 +61,6 @@ import {
 	isMerged,
 	legend,
 	pick,
-	rangePicker,
 	ratioOf,
 	scanFooter,
 	scopeLabel,
@@ -82,16 +85,10 @@ import {
 	relative,
 } from './_probeState.js';
 
-export const meta = { id: 'probe', label: 'Change probe', crumb: 'change probe', icon: ICONS.probe };
-
-// A sweep interval's worth by default. The pass counters are emitted ONCE PER FINISHED PASS, so
-// the 1h window every other view shares would usually contain canary passes and no sweep at all —
-// and an empty panel on a healthy deployment is how a signal stops being read.
-const RANGES = [
-	{ label: '1h', ms: 3_600_000 },
-	{ label: '6h', ms: 6 * 3_600_000 },
-	{ label: '24h', ms: 24 * 3_600_000 },
-];
+// `ranged`: the finished-pass panel reads the shell's global time range. The pass counters are
+// emitted ONCE PER FINISHED PASS, so a narrow range often holds canary passes and no sweep at all —
+// the panel's empty state says to widen it rather than reading as "nothing is probing".
+export const meta = { id: 'probe', label: 'Change probe', icon: ICONS.probe, ranged: true };
 
 /**
  * How often the page re-reads the probe's STATUS on its own. Only the status: it is one node-local
@@ -175,26 +172,22 @@ const FAILURE_ALARM = 0.5;
 const FRESH_NOTICE = 0.5;
 
 export async function load(ctx) {
-	ctx.data.rangeMs ??= 24 * 3_600_000;
 	ctx.data.runMode ??= 'config';
 	ctx.data.autoRefresh ??= true;
-	// Marks this scratch as the probe view's, so a refresh timer that fires after the operator has
-	// moved on can tell (`ctx.data` is always the CURRENT view's scratch).
-	ctx.data.isProbeView = true;
 	const [statusRes, analyticsRes] = await Promise.all([
 		ctx.get('change-probe'),
-		ctx.get('analytics', { range: ctx.data.rangeMs }),
+		ctx.get('analytics', { range: ctx.rangeMs }),
 		loadConfig(ctx),
 	]);
-	applyStatus(ctx, statusRes);
+	applyStatus(ctx.data, statusRes);
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
 }
 
 /** Take a status read, stamped with when it arrived — every age on the page is measured from it. */
-const applyStatus = (ctx, res) => {
-	ctx.data.status = res.ok ? res.body : null;
-	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not read probe status (${res.status})`);
-	ctx.data.fetchedAt = Date.now();
+const applyStatus = (data, res) => {
+	data.status = res.ok ? res.body : null;
+	data.error = res.ok ? null : (res.body?.error ?? `Could not read probe status (${res.status})`);
+	data.fetchedAt = Date.now();
 };
 
 let refreshTimer = null;
@@ -202,18 +195,28 @@ let refreshTimer = null;
 /**
  * Re-arm the status refresh. Called on every render, so there is exactly one pending timer and it
  * always belongs to the page as last drawn; a render with auto-refresh off cancels it.
+ *
+ * THE TIMER RUNS OUTSIDE ANY LOAD, so it gets none of the shell's load pinning: the `ctx` it holds
+ * is the shell's, whose `data` is whichever view is on screen WHEN READ. So it captures this view's
+ * own scratch object up front and writes only there, and only while `ctx.data` is still that same
+ * object — which is false once the operator has navigated away, and false after a node-scope switch
+ * or a sign-out, because the shell replaces every scratch object then. A read from the old scope can
+ * therefore never land under the new scope's name.
  */
 function scheduleRefresh(ctx) {
 	if (refreshTimer) clearTimeout(refreshTimer);
 	refreshTimer = null;
-	if (!ctx.data.autoRefresh || typeof setTimeout !== 'function') return;
+	const own = ctx.data;
+	if (!own.autoRefresh || typeof setTimeout !== 'function') return;
 	refreshTimer = setTimeout(async () => {
 		refreshTimer = null;
-		if (!ctx.data?.isProbeView || !ctx.data.autoRefresh || ctx.busy) return;
+		if (ctx.data !== own || !own.autoRefresh || ctx.busy) return;
+		const startedAt = Date.now();
 		const res = await ctx.get('change-probe');
-		// The operator may have navigated away while the read was in flight.
-		if (!ctx.data?.isProbeView) return;
-		applyStatus(ctx, res);
+		// Navigated away or switched scope while the read was in flight — or a full load landed a
+		// NEWER status meanwhile, which this older read must not overwrite.
+		if (ctx.data !== own || (own.fetchedAt ?? 0) > startedAt) return;
+		applyStatus(own, res);
 		ctx.render();
 	}, REFRESH_MS);
 	refreshTimer.unref?.();
@@ -224,15 +227,14 @@ export function render(ctx) {
 	scheduleRefresh(ctx);
 
 	const fetchedAt = ctx.data.fetchedAt;
-	const head = el('div', { cls: 'view-head' }, [
-		el('span', { cls: 'eyebrow', text: 'Change probe' }),
-		spacer(),
+	const head = el('div', { cls: 'bar' }, [
 		fetchedAt
 			? muted(
 					`status read at ${new Date(fetchedAt).toLocaleTimeString()} (${ago(fetchedAt)})` +
 						(ctx.data.autoRefresh ? ` · re-read every ${duration(REFRESH_MS)}` : ' · auto-refresh paused')
 				)
 			: null,
+		spacer(),
 		segmented(
 			[
 				{ label: 'auto-refresh', value: true, title: `Re-read the probe status every ${duration(REFRESH_MS)}.` },
@@ -244,16 +246,15 @@ export function render(ctx) {
 				ctx.render();
 			}
 		),
-		el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
 	]);
 
-	// The settings ride along even when the status read failed: `changeProbe.enabled` is the
-	// likeliest reason this page has nothing on it, and the card that flips it belongs on the
-	// screen reporting the emptiness rather than a view away.
-	const knobs = [settings(ctx), editTray(ctx)];
+	// The settings ride along even when the status read failed — and open, because
+	// `changeProbe.enabled` is the likeliest reason this page has nothing on it, and the card that
+	// flips it belongs on the screen reporting the emptiness rather than a click away.
+	const knobs = [settings(ctx, { open: !status }), editTray(ctx)];
 
 	if (!status) {
-		return [head, el('div', { cls: 'note bad', text: ctx.data.error ?? 'No probe status.' }), ...knobs];
+		return [head, el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not read the probe status.' }), ...knobs];
 	}
 
 	const model = buildModel(ctx, status);
@@ -380,18 +381,22 @@ function nowCard(ctx, status, model) {
 	if (descs.length && descs.every((d) => d.enabled === false)) {
 		body.push(
 			note('bad', [
-				el('code', { text: 'changeProbe.enabled' }),
-				` is false${cluster ? ' on every node' : ''}. Nothing is probed and nothing here will move; the settings ` +
-					'card below turns it on.',
+				el('strong', null, [
+					el('code', { text: 'changeProbe.enabled' }),
+					` is false${cluster ? ' on every node' : ''}. Nothing is probed.`,
+				]),
+				' Turn it on under Settings below.',
 			])
 		);
 	} else if (!(status.rules ?? []).length) {
 		body.push(
 			note('warn', [
-				'The probe is enabled and no ',
-				el('code', { text: 'changeProbe.rules' }),
-				' match anything, so no timer is armed. A rule names the path pattern to claim and where to read ' +
-					'the fields that matter; without one there is nothing to compare.',
+				el('strong', null, [
+					'No ',
+					el('code', { text: 'changeProbe.rules' }),
+					' match anything, so no timer is armed.',
+				]),
+				' A rule names the paths to claim and the fields to compare.',
 			])
 		);
 	}
@@ -401,12 +406,12 @@ function nowCard(ctx, status, model) {
 	const older = olderThan(descs);
 	if (older.length) {
 		body.push(
-			note('', [
-				`${nodeList(older)} ${older.length === 1 ? 'runs' : 'run'} a plugin older than 0.91.0, which does not report ` +
-					'the running pass’s own counts or start time, or its next run. Where a column says ' +
-					'“n/a” the value is UNAVAILABLE on that node, not zero; the next anchored run shown for it is computed ' +
-					'here from the anchor setting.',
-			])
+			el('div', {
+				cls: 'hint',
+				text:
+					`${nodeList(older)} ${older.length === 1 ? 'runs' : 'run'} a plugin older than 0.91.0: “n/a” there means ` +
+					'unavailable, not zero, and the next anchored run is computed here from the anchor setting.',
+			})
 		);
 	}
 
@@ -432,6 +437,7 @@ function nowCard(ctx, status, model) {
 				}
 			),
 			el('button', {
+				cls: 'small',
 				text: cluster ? 'Sweep (pick a node)' : sweeping ? 'Sweep running…' : 'Run sweep',
 				disabled: ctx.busy || cluster || !enabled || sweeping,
 				title: cluster
@@ -440,20 +446,21 @@ function nowCard(ctx, status, model) {
 				onclick: () => run('sweep'),
 			}),
 			el('button', {
+				cls: 'small',
 				text: cluster ? 'Canary (pick a node)' : canaryRunning ? 'Canary running…' : 'Run canary',
 				disabled: ctx.busy || cluster || !enabled || canaryRunning,
 				title: cluster ? 'The cohort is built from the keys one node owns. Switch to a node.' : null,
 				onclick: () => run('canary'),
 			}),
 		],
-		body,
-		foot: [
-			muted(
-				status.ownerScopeNote ??
-					'Probes only the URLs this node owns; every node sweeps its own slice. A probe is origin backend ' +
-						'work — the rate cap is a promise to whoever runs it, per node.'
-			),
+		help: [
+			status.ownerScopeNote ??
+				'Probes only the URLs this node owns; every node sweeps its own slice. A probe is origin backend work — the ' +
+					'rate cap is a promise to whoever runs it, per node.',
+			' A manual run either inherits changeProbe.dryRun or is forced dry (the picker); the timers always use the ' +
+				'configured value.',
 		],
+		body,
 	});
 }
 
@@ -651,9 +658,7 @@ function rowCell(d) {
 /** The health flags, worst first, each naming the nodes it holds on and each node's own figure. */
 function flagsBlock(groups) {
 	if (!groups.length) {
-		return note('ok', [
-			'No health flags: nothing failing, backing off, stalled, overdue, or disagreeing between nodes.',
-		]);
+		return note('ok', ['No health flags — nothing failing, backing off, stalled, overdue or diverging.']);
 	}
 	const counts = ['bad', 'warn', 'info']
 		.map((severity) => [severity, groups.filter((g) => g.severity === severity).length])
@@ -816,18 +821,17 @@ function currentPassCard(model) {
 		),
 	];
 	return card('Current pass — in progress', {
-		head: [pill('partial counts, so far', 'info'), spacer(), muted('each node’s own running pass')],
+		head: [pill('partial counts, so far', 'info')],
+		help:
+			'The RUNNING pass’s own counts as of its last heartbeat — part-way through its slice, not a result. The last ' +
+			'pass that finished has its own card below and is never mixed into these.',
 		body: [
-			note('info', [
-				'These are the RUNNING pass’s own counts, as of its last heartbeat — a pass part-way through its slice, ' +
-					'not a result. The last pass that finished is in its own card below and is never mixed into these.',
-			]),
 			passTable(columns, rows, { withSum: columns.length > 1 }),
 			older.length
-				? muted(
-						`${nodeList(older)}: only rows walked are reported by plugin < 0.91.0 — the rest of that column is ` +
-							'unavailable, not zero.'
-					)
+				? el('div', {
+						cls: 'hint',
+						text: `${nodeList(older)}: plugin < 0.91.0 reports only rows walked — the rest of that column is n/a, not zero.`,
+					})
 				: null,
 		],
 	});
@@ -868,8 +872,8 @@ function lastPassCard(status, model) {
 	if (cluster && unswept.length) {
 		body.push(
 			note('warn', [
-				`No sweep has finished on ${unswept.join(', ')} since startup — the URLs those nodes own are not in the ` +
-					'figures below, so every sum here covers less of the corpus than it appears to.',
+				el('strong', { text: `No sweep has finished on ${unswept.join(', ')} since startup` }),
+				' — their slice is missing from every sum below.',
 			])
 		);
 	}
@@ -877,7 +881,7 @@ function lastPassCard(status, model) {
 	for (const d of withRuns.filter((x) => x.last.outcome === 'error')) {
 		body.push(
 			note('bad', [
-				`Last sweep failed${cluster ? ` on ${d.hostname}` : ''}: ${d.last.record.error}`,
+				el('strong', { text: `Last sweep failed${cluster ? ` on ${d.hostname}` : ''}: ${d.last.record.error}` }),
 				counted.length && !hasCounts(d.last.record) ? ' — the counts below cover only the passes that did finish.' : '',
 			])
 		);
@@ -886,18 +890,22 @@ function lastPassCard(status, model) {
 	for (const d of withRuns.filter((x) => x.last.outcome === 'gave-up')) {
 		body.push(
 			note('bad', [
-				`The last sweep${cluster ? ` on ${d.hostname}` : ''} STOPPED EARLY because the origin refused `,
-				el('code', { text: 'changeProbe.abortAfterDistress' }),
-				' probes in a row — an origin that is down rather than busy. It covered only part of the owned slice, so ' +
-					'its column is a partial count and the rest of the slice keeps whatever baselines it had. The next ' +
-					'scheduled pass is the retry and it starts clean; nothing needs restarting here.',
+				el('strong', null, [
+					`The last sweep${cluster ? ` on ${d.hostname}` : ''} STOPPED EARLY: the origin refused `,
+					el('code', { text: 'changeProbe.abortAfterDistress' }),
+					' probes in a row.',
+				]),
+				' Its column is a partial count; the next scheduled pass is the retry and starts clean.',
 			])
 		);
 	}
 
 	if (!withRuns.length) {
 		body.push(
-			muted('No sweep has finished since startup. The first one runs at the next scheduled start (see Probe now).')
+			el('div', {
+				cls: 'empty',
+				text: 'No sweep has finished since startup — the first runs at the next scheduled start (see Probe now).',
+			})
 		);
 	}
 
@@ -967,7 +975,6 @@ function lastPassCard(status, model) {
 			);
 		}
 		body.push(passTable(columns, rows, { withSum }));
-		body.push(semanticsNote(counted));
 		body.push(...detailsOf(status, counted, model));
 	}
 
@@ -977,14 +984,12 @@ function lastPassCard(status, model) {
 			spacer(),
 			muted(counted.length > 1 ? `each node’s own slice; Σ adds ${counted.length} nodes` : ''),
 		],
-		body,
-		foot: [
-			muted(
-				'The sweep catches per-URL drift — an item selling out, one price moving. It walks the whole owned ' +
-					'slice at the configured rate, so a large corpus takes hours per pass by design; that is what the ' +
-					'canary exists to cover.'
-			),
+		help: [
+			'The sweep catches per-URL drift — an item selling out, one price moving — walking the whole owned slice at ' +
+				'the configured rate, so a large corpus takes hours per pass by design (the canary covers the gap). ',
+			counted.length ? semantics(counted) : null,
 		],
+		body,
 	});
 }
 
@@ -993,19 +998,19 @@ function lastPassCard(status, model) {
  * one trigger queue across passes reports `triggered`/`errors` cumulatively (it carries
  * `triggerQueuePending`), and a reader summing those per pass would count every re-render twice.
  */
-function semanticsNote(counted) {
+function semantics(counted) {
 	const cumulative = counted.filter((d) => 'triggerQueuePending' in d.last.record);
-	return el('p', { cls: 'muted chart-note' }, [
-		'Every count here is for that one pass on that node. “Queued re-renders” is what the pass handed to the ' +
-			'trigger queue; “Re-renders filed” is how many of those it saw land before it ended',
+	return [
+		'Every count is for that one pass on that node. “Queued” is what the pass handed to the trigger queue; ',
+		'“Re-renders filed” is how many of those landed before it ended',
 		cumulative.length
-			? ` — except on ${nodeList(cumulative)}, whose plugin keeps one trigger queue across passes: there “Re-renders ` +
-				'filed” and “Trigger write errors” are CUMULATIVE since the process started, and “Queued” is the per-pass figure.'
-			: ' (the queue drains before the pass ends, so it is per pass too).',
-		' The overlay rows — pages disagreeing, caught up, ignored, appended paths — are not buckets: a row counted ' +
-			'there is also inside Changed or Unchanged. “n/a” is a counter the node’s plugin does not report; Σ marked * ' +
-			'sums only the nodes that do.',
-	]);
+			? ` — except on ${nodeList(cumulative)}, whose plugin keeps one queue across passes: there “Re-renders ` +
+				'filed” and “Trigger write errors” are CUMULATIVE since the process started.'
+			: '.',
+		' The overlay rows (pages disagreeing, caught up, ignored, appended paths) are not buckets — each is also ' +
+			'inside Changed or Unchanged. “n/a” is a counter that node’s plugin does not report; Σ marked * sums only ' +
+			'the nodes that do.',
+	].join('');
 }
 
 /** Slot index → extract path, from the node-reported rules (v0.91.0) or the configured rules. */
@@ -1035,8 +1040,21 @@ const sumMaps = (runs, key) => {
 	return seen ? out : null;
 };
 
-const details = (summary, children) =>
-	el('details', { cls: 'probe-details' }, [el('summary', { text: summary }), ...children.filter(Boolean)]);
+/**
+ * A native disclosure whose open state survives the rebuild. Every render replaces the tree — and
+ * the status auto-refresh renders every 30s — so a bare `<details>` snapped shut under the operator
+ * mid-read. Its state lives in ui.js's disclosure set instead, keyed by what it shows.
+ */
+const details = (key, summary, children) =>
+	el(
+		'details',
+		{
+			cls: 'probe-details',
+			open: isOpen(`probe:${key}`),
+			ontoggle: (event) => setOpen(`probe:${key}`, !!event.target.open),
+		},
+		[el('summary', { text: summary }), ...children.filter(Boolean)]
+	);
 
 /** Detail on demand: where the changes were, which page fields disagreed, the guard, the failures. */
 function detailsOf(status, counted, model) {
@@ -1061,7 +1079,7 @@ function detailsOf(status, counted, model) {
 			)
 	);
 	out.push(
-		details(`Where the origin changed — per extract slot${slots ? '' : ' (not reported)'}`, [
+		details('slots', `Where the origin changed — per extract slot${slots ? '' : ' (not reported)'}`, [
 			slots
 				? table(['rule', 'slot', 'extract path', { text: 'changes', right: true }], slotRows, 'No slot changed.')
 				: muted(`Not reported by plugin < ${SINCE.slotChanges} (${unreportedBy('slotChanges').join(', ')}).`),
@@ -1069,7 +1087,10 @@ function detailsOf(status, counted, model) {
 				? muted(`${unreportedBy('slotChanges').join(', ')} do not report it; the counts cover the other nodes.`)
 				: null,
 			slots
-				? muted('Decomposes Changed, Caught up and Ignored by the slot that moved; one change can move several slots.')
+				? el('div', {
+						cls: 'hint',
+						text: 'Changed, Caught up and Ignored, by the slot that moved; one change can move several slots.',
+					})
 				: null,
 		])
 	);
@@ -1089,7 +1110,7 @@ function detailsOf(status, counted, model) {
 			})
 	);
 	out.push(
-		details(`Page fields that disagreed with the origin${fields ? '' : ' (not reported)'}`, [
+		details('fields', `Page fields that disagreed with the origin${fields ? '' : ' (not reported)'}`, [
 			fields
 				? table(
 						['rule', 'field (slot:fact)', 'extract path', { text: 'mismatches', right: true }],
@@ -1098,7 +1119,10 @@ function detailsOf(status, counted, model) {
 					)
 				: muted(`Not reported by plugin < ${SINCE.fieldMismatch} (${unreportedBy('fieldMismatch').join(', ')}).`),
 			fields
-				? muted('Counted for every mapped field, armed or disarmed — a disarmed field counts here and only here.')
+				? el('div', {
+						cls: 'hint',
+						text: 'Every mapped field, armed or disarmed — a disarmed field counts here and only here.',
+					})
 				: null,
 		])
 	);
@@ -1122,7 +1146,7 @@ function detailsOf(status, counted, model) {
 	}
 	if (guardRows.length || counted.some((d) => 'fieldGuard' in d.last.record)) {
 		out.push(
-			details('Mapping guard — recent witnessed comparisons per mapped field', [
+			details('guard', 'Mapping guard — recent witnessed comparisons per mapped field', [
 				table(
 					[
 						'node',
@@ -1135,9 +1159,10 @@ function detailsOf(status, counted, model) {
 					guardRows,
 					'No mapped fields.'
 				),
-				muted(
-					'Per node (the guard is per process). A disarmed field stops triggering until its mapping changes or the process restarts.'
-				),
+				el('div', {
+					cls: 'hint',
+					text: 'Per node (the guard is per process). A disarmed field stops triggering until its mapping changes or the process restarts.',
+				}),
 			])
 		);
 	}
@@ -1147,11 +1172,11 @@ function detailsOf(status, counted, model) {
 	);
 	if (samples.length) {
 		out.push(
-			details(`Failure samples (${samples.length})`, [
-				muted(
-					'The first few failures of each pass. A failure leaves the stored signature untouched and triggers ' +
-						'nothing, so these are pages back on interval-only freshness until the rule fits again.'
-				),
+			details('failures', `Failure samples (${samples.length})`, [
+				el('div', {
+					cls: 'hint',
+					text: 'The first few failures of each pass — pages back on interval-only freshness until the rule fits again.',
+				}),
 				table(
 					['node', 'url', 'rule', 'error'],
 					samples.map((sample) =>
@@ -1254,10 +1279,10 @@ function configCard(status, model) {
 	}
 	if (fromConfig.length) {
 		body.push(
-			muted(
-				`Settings for ${nodeList(fromConfig)} are read from the config endpoint — their plugin (< 0.91.0) does not ` +
-					'report what it is running with.'
-			)
+			el('div', {
+				cls: 'hint',
+				text: `${nodeList(fromConfig)}: settings read from the config endpoint — plugin < 0.91.0 does not report its own.`,
+			})
 		);
 	}
 
@@ -1298,10 +1323,14 @@ function configCard(status, model) {
 			)
 		);
 	}
-	if (status.rulesDiverge) {
-		body.push(note('bad', ['The nodes do not agree on the rule list; the rules above are one node’s.']));
-	}
-	return card('Configuration — what the probe runs on', { body });
+	return card('Configuration', {
+		// The rules-diverge FLAG in Probe now carries the finding; this says what it means for the table.
+		head: [status.rulesDiverge ? pill('rules differ — table shows one node’s', 'bad') : null],
+		help:
+			'What each node reports it runs with — once when the nodes agree, per node (differences marked) when they ' +
+			'do not. The editable options are under Settings below.',
+		body,
+	});
 }
 
 // ---------------------------------------------------------------- the measured drift
@@ -1323,23 +1352,14 @@ function configCard(status, model) {
  */
 function drift(ctx) {
 	const data = ctx.data.analytics;
-	const range = rangePicker(RANGES, ctx.data.rangeMs, (ms) => {
-		ctx.data.rangeMs = ms;
-		ctx.reload();
-	});
-	if (!data)
-		return card('Finished passes', {
-			head: [spacer(), range],
-			body: [note('bad', ['The analytics window did not load.'])],
-		});
+	if (!data) return card('Finished passes', { body: [note('bad', ['The analytics window did not load.'])] });
 	if (data.available === false) {
 		return card('Finished passes', {
-			head: [spacer(), range],
 			body: [
-				note('', [
-					'Analytics is not available on this node, so the finished-pass trend cannot be read. "Probe now" and ',
-					'the pass cards above come from the probe’s own state and are unaffected.',
-				]),
+				el('div', {
+					cls: 'empty',
+					text: 'Analytics is off on this node, so there is no finished-pass trend. The cards above are unaffected.',
+				}),
 			],
 		});
 	}
@@ -1347,16 +1367,13 @@ function drift(ctx) {
 	const combos = pick(data, 'prerender_ops', (s) => typeof s.path === 'string' && s.path.startsWith('probe_'));
 	if (windowEmpty(data) || !combos.length) {
 		return card(`Finished passes — ${scopeLabel(data)}`, {
-			head: [pill('per finished pass — not live', ''), spacer(), range],
+			head: [pill('per finished pass — not live', '')],
 			body: [
 				emptyNote('change-probe', data),
-				note('', [
-					'These counters are emitted once per FINISHED pass. With a sweep every few hours and a window ',
-					'of ',
-					duration(ctx.data.rangeMs),
-					', an empty panel can simply mean no pass has completed inside it — widen the range before ',
-					'reading it as "nothing is probing".',
-				]),
+				el('div', {
+					cls: 'hint',
+					text: 'Emitted once per FINISHED pass — widen the range before reading this as “nothing is probing”.',
+				}),
 			],
 			foot: [scanFooter(data)],
 		});
@@ -1425,7 +1442,7 @@ function drift(ctx) {
 		{ values: true }
 	);
 
-	return card(`Finished passes — ${scopeLabel(data)}, last ${duration(data.rangeMs ?? ctx.data.rangeMs)}`, {
+	return card(`Finished passes — ${scopeLabel(data)}`, {
 		head: [
 			pill('per finished pass — not live', ''),
 			failing ? pill('probe failures dominate', 'bad') : null,
@@ -1436,15 +1453,23 @@ function drift(ctx) {
 			mismatchesStanding ? pill('pages disagree with the origin', 'warn') : null,
 			spacer(),
 			legend(keys.map((key) => ({ label: OUTCOME_LABEL[key], color: OUTCOME_COLOR[key] }))),
-			range,
+		],
+		help: [
+			'NOT LIVE: every series is emitted when a pass ENDS, so a running pass is in none of these — a nine-hour pass ',
+			'is one bar at its end, and bars are passes, not probes. These are series side by side, NOT a partition: ',
+			'Throttled is inside Failed, Page mismatch overlays the outcome buckets, and Skipped sits outside Probes. ',
+			'Changed is measured against probes that HAD a baseline (seeds, re-baselined rows and failures compared ',
+			'nothing); expect one pass of re-baselined rows after any rule edit. Page mismatch stays zero unless a rule ',
+			'sets pageCheck AND the render fleet posts offers (browser 1.20.0+).',
 		],
 		body: [
 			failing &&
 				note('bad', [
-					`${pct(failed, probed)} of probes failed. That is the shape a replatformed origin makes: the ` +
-						'endpoint or the markup a rule was written against has changed, every failed probe leaves the ' +
-						'stored signature untouched, and those pages are silently back on interval-only freshness. A ' +
-						'failure never triggers and never re-baselines, so nothing else in this console will move.',
+					el('strong', {
+						text: `${pct(failed, probed)} of probes failed — the endpoint or markup a rule reads has likely changed.`,
+					}),
+					' A failed probe leaves its signature untouched and triggers nothing, so those pages are silently back on ' +
+						'interval-only freshness.',
 				]),
 			// THE ONE ALARM ON THIS PAGE THAT IS NOT ABOUT THE PROBE. Everything else here reports a
 			// probe that has stopped telling the truth; this reports a probe that is hurting someone
@@ -1455,29 +1480,30 @@ function drift(ctx) {
 			// while every other number on this card keeps its shape. Nothing else surfaces it.
 			throttled > 0 &&
 				note('bad', [
-					`The origin pushed back on ${fmtCount(throttled)} probe${throttled === 1 ? '' : 's'} ` +
-						`(${pct(throttled, failed)} of all probe failures). Those are 429/502/503/504 responses and ` +
-						'connect or read timeouts — the origin asking for room, not a rule that no longer fits. The ' +
-						'sweep halves its pacing rate for each batch that contains one and recovers by halves, so a ' +
-						'sustained count means passes are taking longer than ',
+					el('strong', {
+						text:
+							`The origin pushed back on ${fmtCount(throttled)} probe${throttled === 1 ? '' : 's'} ` +
+							`(${pct(throttled, failed)} of failures) — 429/502/503/504 and timeouts.`,
+					}),
+					' The sweep halves its pace for each such batch, so passes run longer than ',
 					el('code', { text: 'sweepInterval' }),
-					' implies and the corpus is being re-probed more slowly than the settings say. Take it to ' +
-						'whoever runs the origin before raising ',
+					' implies. Take it to whoever runs the origin before raising ',
 					el('code', { text: 'changeProbe.ratePerSecond' }),
 					'.',
 				]),
 			// The application layer cannot address these rows, so no amount of console work reaches
 			// them: this is a database-layer escalation and the note says so rather than implying a
-			// setting would help.
+			// setting would help. Stepping over them is itself the fix for the walk — it used to END at
+			// the first one, silently, reporting a finished pass that had covered only the keyspace
+			// before it.
 			unreadable > 0 &&
 				note('bad', [
-					`${fmtCount(unreadable)} registry row${unreadable === 1 ? '' : 's'} could not be decoded, and the ` +
-						'walk stepped over them. Those targets are never probed, never re-rendered on change, and ' +
-						'appear in no other count on this page. Stepping over them is the fix — the walk used to ' +
-						'END at the first one, silently, reporting a finished pass that had covered only the ' +
-						'keyspace before it — so the pass itself is sound. But a row the application layer cannot ' +
-						'address is a storage-layer fault: it belongs with the database team, not with a setting ' +
-						'here.',
+					el('strong', {
+						text:
+							`${fmtCount(unreadable)} registry row${unreadable === 1 ? '' : 's'} could not be decoded and ` +
+							'were stepped over — never probed, and in no other count.',
+					}),
+					' A storage-layer fault for the database team, not a setting here.',
 				]),
 			// THE CLASS THE SIGNATURE COMPARISON CANNOT SEE. Everything else on this card asks "did
 			// the origin change since the last look", which is structurally blind to a value that
@@ -1487,88 +1513,81 @@ function drift(ctx) {
 			// origin against what the PAGE claims, so these are wrong pages found, not changes seen.
 			pageMismatch > 0 &&
 				note(mismatchesStanding ? 'warn' : '', [
-					`${fmtCount(pageMismatch)} probe${pageMismatch === 1 ? '' : 's'} found the cached page disagreeing ` +
-						'with the origin on a field it claims — a transient value the render captured and the ' +
-						'signature comparison could never see, because the origin itself never looked changed. ',
+					el('strong', {
+						text:
+							`${fmtCount(pageMismatch)} probe${pageMismatch === 1 ? '' : 's'} found the cached page disagreeing ` +
+							'with the origin on a field it claims.',
+					}),
 					mismatchesStanding
-						? 'In dry run nothing expires them, so the same disagreement is re-reported every pass: read ' +
-							'this as a standing count of wrong pages being served, not a rate.'
-						: 'Each one was hard-expired the moment it was seen — bots get origin content until the ' +
-							're-render lands — so read this as a detection rate.',
+						? ' In dry run nothing expires them — read this as a standing count of wrong pages being served.'
+						: ' Each was hard-expired the moment it was seen — read this as a detection rate.',
 				]),
 			skipping &&
 				note('warn', [
-					`${pct(fresh, fresh + probed)} of the rows these passes considered were skipped because a ` +
-						'stored baseline was still fresh. Right after a restart that is ',
+					el('strong', { text: `${pct(fresh, fresh + probed)} of the rows considered were skipped as fresh.` }),
+					' After a restart that is ',
 					el('code', { text: 'reprobeAfter' }),
-					' doing its job — the interrupted pass had already covered that ground. Sustained, it means ',
-					el('code', { text: 'reprobeAfter' }),
-					' sits too close to ',
+					' working; sustained, it sits too close to ',
 					el('code', { text: 'sweepInterval' }),
-					': a URL probed late in one pass is skipped by the next, so its real cadence is two sweep ' +
-						'intervals and nothing else here shows it.',
+					' and a URL’s real cadence is two sweep intervals.',
 				]),
-			el('div', { cls: 'stats' }, [
-				stat('Probes', fmtCount(probed), 'attempts across every finished pass'),
+			stats([
+				stat('Probes', fmtCount(probed), 'across finished passes', {
+					title: 'Probe attempts across every finished pass.',
+				}),
 				stat('Changed', pct(changed, compared), `${fmtCount(changed)} of ${fmtCount(compared)} compared`),
 				// Overlays the outcome buckets — a mismatched row is also inside Changed or the
 				// unchanged remainder — so the sub-label names the relationship instead of a share.
-				stat('Page mismatch', fmtCount(pageMismatch), 'cached page ≠ origin — overlays the buckets', {
+				stat('Page mismatch', fmtCount(pageMismatch), 'overlays the buckets', {
 					warn: mismatchesStanding,
+					title: 'Cached page ≠ origin. A mismatched row is also inside Changed or the unchanged remainder.',
 				}),
 				stat(
 					'Triggered',
 					fmtCount(triggered),
 					deferred ? `${fmtCount(deferred)} deferred past the cap` : 'per-URL re-renders filed'
 				),
-				stat('Seeded', fmtCount(seeded), 'first observation — nothing to compare yet'),
+				stat('Seeded', fmtCount(seeded), 'first observation', { title: 'First observation — nothing to compare yet.' }),
 				stat('Failed', pct(failed, probed), `${fmtCount(failed)} of ${fmtCount(probed)}`, { warn: failing }),
 				// Not inside `probed`: a skipped URL was never attempted. The sub-label gives the
 				// denominator explicitly so the tile cannot be read as a share of the probes.
 				stat('Skipped as fresh', fmtCount(fresh), `of ${fmtCount(fresh + probed)} rows considered`, {
 					warn: skipping,
+					title: 'Skipped because a stored baseline was still fresh — never attempted, so outside Probes.',
 				}),
 				// Inside `failed`, and the sub-label says so — the two tiles are not additive.
-				stat('Throttled', fmtCount(throttled), 'origin pushback — inside Failed', { warn: throttled > 0 }),
+				stat('Throttled', fmtCount(throttled), 'inside Failed', {
+					warn: throttled > 0,
+					title: 'Origin pushback (429/502/503/504, timeouts) — a subset of Failed.',
+				}),
 				// CONTINUOUS MODE ONLY, and hidden otherwise rather than shown as a permanent zero:
 				// in interval mode no cycle target exists, so a zero here would read as "meeting the
 				// target" when there is no target to meet. This is the mode's whole accountability
 				// signal — the explicit replacement for a pass that used to overrun and be skipped
 				// with nothing anywhere saying so.
 				continuous
-					? stat('Cycle behind', fmtCount(cycleBehind), 'batches that wanted more than the rate ceiling', {
+					? stat('Cycle behind', fmtCount(cycleBehind), 'batches over the rate ceiling', {
 							warn: cycleBehind > 0,
+							title: 'Batches that wanted more than ratePerSecond to meet the cycle target.',
 						})
 					: null,
 				stat('Canary trips', fmtCount(trips), `${fmtCount(invalidated)} recorded an invalidation`),
-				hasQueue ? stat('Trigger queue peak', fmtCount(queuePeak), 'deepest a finished pass recorded') : null,
+				hasQueue
+					? stat('Trigger queue peak', fmtCount(queuePeak), 'deepest a pass recorded', {
+							title: 'The deepest trigger-queue reading any finished pass recorded (a high-water mark, not a sum).',
+						})
+					: null,
 			]),
 			keys.length
 				? stackedBars(data, keys, stacks, (key) => OUTCOME_COLOR[key] ?? '#8a93a6', { format: fmtCount })
 				: null,
 			trips > invalidated &&
 				note('warn', [
-					`${fmtCount(trips - invalidated)} canary trip${trips - invalidated === 1 ? '' : 's'} recorded no ` +
-						'invalidation. That is a dry run, a scope still inside its holdoff, or a rule whose ' +
-						'invalidateScope names no configured route — the plugin log line says which of the three.',
+					el('strong', {
+						text: `${fmtCount(trips - invalidated)} canary trip${trips - invalidated === 1 ? '' : 's'} recorded no invalidation.`,
+					}),
+					' A dry run, a scope inside its holdoff, or an invalidateScope naming no route — the plugin log says which.',
 				]),
-			el('p', { cls: 'muted chart-note' }, [
-				'NOT LIVE: every series here is emitted when a pass ENDS, so a pass that is running now is in none of ',
-				'these numbers — a nine-hour pass appears as one bar at its end. ',
-				'One emit per finished pass, sweep and canary alike, so the bars are passes and not probes — a tall ',
-				'bar is a pass that landed in that bucket, not a busier minute. These are series side by side and ',
-				'NOT a partition: “Probes” is the total the outcomes divide up, “Throttled” is the slice of ',
-				'“Failed” the origin caused, “Page mismatch” overlays the outcome buckets (a mismatched row is ',
-				'also inside “Changed” or the unchanged remainder), and “Skipped” sits outside “Probes” entirely ',
-				'because those rows were never attempted. “Changed” is measured against the probes that HAD a ',
-				'baseline; seeds, re-baselined rows and failures are excluded from that denominator because none ',
-				'of them compared anything. “Re-baselined” is a row whose stored baseline was taken under a ',
-				'DIFFERENT rule — a rule edit, not a content change — so the plugin stored the new observation ',
-				'and compared nothing; expect one pass of them after any rule edit, and read a steady count as a ',
-				'rule that keeps changing. “Page mismatch” stays at zero unless a rule sets pageCheck AND the render fleet posts ',
-				'its pages’ offers (browser 1.20.0+) — enabled against an older fleet it records nothing, and the ',
-				'plugin log says so hourly.',
-			]),
 		],
 		foot: [scanFooter(data)],
 	});
@@ -1610,9 +1629,10 @@ function canaryCard(ctx, status, model) {
 	if (empties.length) {
 		body.push(
 			note('warn', [
-				`No cohort yet for ${empties.map((row) => row.rule).join(', ')}. A cohort is built by the first sweep ` +
-					'(or a cheaper key-order sample right after a restart), so an empty one means the mass-change ' +
-					'detector is dark for that rule — the sweep still catches the change, hours later.',
+				el('strong', {
+					text: `No cohort yet for ${empties.map((row) => row.rule).join(', ')} — the mass-change detector is dark there.`,
+				}),
+				' The first sweep builds it; until then the sweep still catches a change, hours later.',
 			])
 		);
 	}
@@ -1663,7 +1683,7 @@ function canaryCard(ctx, status, model) {
 			)
 		);
 	} else {
-		body.push(muted('No canary pass has finished since startup.'));
+		body.push(el('div', { cls: 'empty', text: 'No canary pass has finished since startup.' }));
 	}
 
 	const cohortTotal = Object.values(canary.cohortSizes ?? {}).reduce((acc, size) => acc + (Number(size) || 0), 0);
@@ -1678,19 +1698,14 @@ function canaryCard(ctx, status, model) {
 			spacer(),
 			muted(cohortTotal ? `${num(cohortTotal)} URLs under watch` : ''),
 		],
-		body,
-		foot: [
-			muted(
-				'A trip is a threshold crossed against ONE node’s cohort, so the verdict names the nodes that ' +
-					'crossed it rather than folding four independent judgements into one. The response is a bulk ' +
-					'invalidation, not thousands of re-renders: pre-change snapshots stop serving at once (bots get ' +
-					'origin content, correct by definition) while the fleet refills on its own cadence. '
-			),
-			status.dryRun
-				? muted('In dry run a trip is logged and nothing is invalidated — the log line says “WOULD TRIP”.')
-				: null,
-			el('span', null, [' ', link('Invalidations →', () => ctx.go('invalidations'))]),
+		help: [
+			'A trip is a threshold crossed against ONE node’s cohort, so the verdict names the nodes that crossed it. ',
+			'The response is a bulk invalidation, not thousands of re-renders: pre-change snapshots stop serving at once ',
+			'(bots get origin content) while the fleet refills on its own cadence.',
+			status.dryRun ? ' In dry run a trip is only logged — the log line says “WOULD TRIP”.' : '',
 		],
+		body,
+		foot: [link('Invalidations →', () => ctx.go('invalidations'))],
 	});
 }
 
@@ -1736,11 +1751,10 @@ function capacityCard(ctx, status, clusterScope) {
 	if (clusterScope) {
 		return card('Pacing and capacity', {
 			body: [
-				note('', [
-					'A probe rate is one node’s property — its own slice, its own pass duration, its own view of ' +
-						'origin latency. Summing four of them would produce a number that describes no node. ' +
-						'Switch to a node to see what is limiting its sweep.',
-				]),
+				el('div', {
+					cls: 'empty',
+					text: 'Per node only — summed rates describe no node. Switch to a node to see what limits its sweep.',
+				}),
 			],
 		});
 	}
@@ -1767,15 +1781,14 @@ function capacityCard(ctx, status, clusterScope) {
 	let verdict = null;
 	if (pushedBack) {
 		verdict = note('warn', [
-			'The origin pushed back during this pass, so its throughput is the backoff doing its job rather ' +
-				'than a capacity ceiling. Read this again after a pass that ends clean.',
+			el('strong', { text: 'The origin pushed back during this pass — its throughput is the backoff doing its job.' }),
+			' Not a capacity ceiling; read this again after a pass that ends clean.',
 		]);
 	} else if (ceilingBinding) {
 		verdict = note('', [
 			'The sweep is running at its configured ceiling, so ',
 			el('code', { text: 'ratePerSecond' }),
-			' is what limits it. Covering the slice faster means raising that number, which is a conversation ' +
-				'with whoever runs the origin — not a local change.',
+			' limits it. Going faster means raising it — a conversation with whoever runs the origin.',
 		]);
 	} else {
 		rows.push(['Implied per-probe latency', mono(`~${num(latencyMs)}ms`)]);
@@ -1784,15 +1797,14 @@ function capacityCard(ctx, status, clusterScope) {
 			pill(`${observed.toFixed(1)}/s — below the ${num(ceiling)}/s ceiling`, 'warn'),
 		]);
 		verdict = note('warn', [
-			`This node tops out at ${observed.toFixed(1)}/s, well under its ${num(ceiling)}/s ceiling, with no origin `,
-			'pushback to explain it — so ',
-			el('code', { text: 'ratePerSecond' }),
-			' is never actually reached and raising it would change nothing. Throughput here is ',
+			el('strong', null, [
+				`Tops out at ${observed.toFixed(1)}/s, under the ${num(ceiling)}/s ceiling with no pushback — `,
+				el('code', { text: 'ratePerSecond' }),
+				' is never actually reached.',
+			]),
+			` Throughput is concurrency ÷ latency (${num(concurrency)} in flight × ~${num(latencyMs)}ms per probe): raise `,
 			el('code', { text: 'concurrency' }),
-			` ÷ latency: ${num(concurrency)} in flight against ~${num(latencyMs)}ms per probe. Raising `,
-			el('code', { text: 'concurrency' }),
-			' is the lever, and it does not raise the sustained peak the origin agreed to — that stays capped ',
-			'at the ceiling.',
+			'; the agreed peak stays capped at the ceiling.',
 		]);
 	}
 
@@ -1813,35 +1825,26 @@ function capacityCard(ctx, status, clusterScope) {
 
 	return card('Pacing and capacity', {
 		head: [muted('this node’s last finished sweep')],
+		help:
+			'Throughput is min(concurrency ÷ latency, ratePerSecond), and the two terms fail with the same symptom. At the ' +
+			'ceiling the rate binds; well under it with no pushback, concurrency against origin latency does.',
 		body: [kv(rows.filter(Boolean)), verdict],
 	});
 }
 
-function settings(ctx) {
-	return el('div', null, [
-		el('div', { cls: 'view-head', style: { marginTop: '20px' } }, [
-			el('span', { cls: 'eyebrow', text: 'Settings' }),
-			spacer(),
-			muted('staged in this browser until you preview and apply'),
-		]),
+function settings(ctx, { open = false } = {}) {
+	const cards = [
 		settingsCard(ctx, {
 			title: 'Change probe',
 			prefix: 'changeProbe',
 			description:
-				'What is probed, how fast, and whether a detected change is allowed to act. ratePerSecond is the ' +
-				'origin-protection knob — probe endpoints are typically uncached, so every probe is backend work ' +
-				'for whoever runs the origin, and it also sizes the sweep (a 200k-URL slice at 10/s is about 5.6 ' +
-				'hours per pass). Leave dryRun on until the change rate above has been watched for a while: ' +
-				'signatures are written either way, so a dry-run week converges on the true rate rather than ' +
-				're-reporting the same delta. backoffMax and abortAfterDistress are what the sweep does when the ' +
-				'origin pushes back at that rate anyway, and reprobeAfter is what makes a restarted sweep resume ' +
-				'instead of re-probing ground it had already covered — keep it comfortably below sweepInterval, ' +
-				'or passes start skipping work that is genuinely due. mode picks how the sweep is scheduled: ' +
-				'"interval" fires a pass every sweepInterval and silently skips one that overruns, so the ' +
-				'sliceSize/rate arithmetic is yours to keep re-checking; "continuous" never stops walking and ' +
-				'paces itself to cycleTarget instead, reporting an unreachable target rather than missing it ' +
-				'quietly. load.* slows the sweep when THIS node is struggling rather than the origin — leave it ' +
-				'off in interval mode, where a slowdown can push a pass past its window and lose it.',
+				'What is probed, how fast, and whether a detected change may act. ratePerSecond protects the origin (probe ' +
+				'endpoints are usually uncached) and sizes the sweep — a 200k-URL slice at 10/s is ~5.6h per pass; leave ' +
+				'dryRun on until the change rate above has been watched a while. mode: interval fires every sweepInterval ' +
+				'and silently skips an overrunning pass, continuous paces itself to cycleTarget and reports a miss, anchored ' +
+				'runs daily at anchorTime. Keep reprobeAfter well below sweepInterval; backoffMax and abortAfterDistress ' +
+				'govern origin pushback, load.* this node’s own load (leave it off in interval mode).',
 		}),
-	]);
+	].filter(Boolean);
+	return cards.length ? section(meta.id, 'Settings', cards, { open }) : null;
 }

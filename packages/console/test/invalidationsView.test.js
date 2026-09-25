@@ -22,7 +22,7 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render } = await import('../src/admin/views/invalidations.js');
+const { load, render, meta } = await import('../src/admin/views/invalidations.js');
 
 const HOUR = 3_600_000;
 
@@ -107,16 +107,19 @@ const config = (over = {}) => ({
 function makeCtx({ list = LIST, analytics = ANALYTICS, cfg = config() } = {}) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
-	const calls = { gets: [], posts: [] };
+	const calls = { gets: [], queries: {}, posts: [], failures: [] };
 	return {
 		calls,
 		scratch,
 		busy: false,
+		// The shell's global range (top bar); 6h here so a hard-coded window would show.
+		rangeMs: 6 * HOUR,
 		get data() {
 			return scratch('invalidations');
 		},
-		async get(route) {
+		async get(route, query) {
 			calls.gets.push(route);
+			calls.queries[route] = query;
 			if (route === 'invalidations') return { ok: true, body: list };
 			if (route === 'analytics')
 				return analytics ? { ok: true, body: analytics } : { ok: false, status: 500, body: {} };
@@ -130,7 +133,9 @@ function makeCtx({ list = LIST, analytics = ANALYTICS, cfg = config() } = {}) {
 		async run(fn) {
 			return fn();
 		},
-		fail() {},
+		fail(message) {
+			calls.failures.push(message);
+		},
 		render() {},
 		reload() {},
 		go() {},
@@ -147,10 +152,88 @@ const ready = async (options) => {
 	return ctx;
 };
 
-test('the view reads the shared one-hour analytics window alongside the rows', async () => {
+test('the view reads the GLOBAL range alongside the rows, and says so to the shell', async () => {
 	const ctx = await ready();
 	assert.ok(ctx.calls.gets.includes('analytics'));
-	assert.match(draw(ctx).textContent, /What the invalidations are doing/);
+	assert.deepEqual(ctx.calls.queries.analytics, { range: 6 * HOUR });
+	assert.equal(meta.ranged, true, 'the top bar shows the range picker for this view');
+	assert.equal(meta.crumb, undefined);
+	assert.match(draw(ctx).textContent, /What the invalidations are doing — node node-a/);
+	assert.doesNotMatch(draw(ctx).textContent, /last hour/, 'the window is the top bar’s, not a fixed hour');
+});
+
+test('no header of its own: the enforcement state rides the Active card, and the shell owns Refresh', async () => {
+	const ctx = await ready();
+	const tree = draw(ctx);
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'view-head'),
+		null
+	);
+	assert.equal(
+		find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'Refresh'),
+		null
+	);
+	const activeCard = find(
+		tree,
+		(n) =>
+			String(n.attributes?.class).startsWith('card') && /^Active invalidations/.test(n.children[0]?.textContent ?? '')
+	);
+	assert.match(activeCard.children[0].textContent, /enforcement on/);
+	assert.match(activeCard.children[0].textContent, /1 of 8 scope slots/);
+
+	const off = await ready({ list: { ...LIST, enabled: false, killSwitchHidingRows: true } });
+	const text = draw(off).textContent;
+	assert.match(text, /invalidation\.enabled is FALSE/);
+	assert.ok(
+		find(draw(off), (n) => n.attributes?.class === 'note bad' && /recorded and NOT enforced/.test(n.textContent)),
+		'the kill switch hiding rows is still the loud banner'
+	);
+});
+
+test('the long explanations sit behind help toggles, not on the page', async () => {
+	const tree = draw(await ready());
+	const helps = [];
+	find(tree, (n) => {
+		if (n.attributes?.class === 'help') helps.push(n.textContent);
+		return false;
+	});
+	assert.ok(
+		helps.some((text) => /never added to “lowered”/.test(text)),
+		'the forwarded-heal rule is kept'
+	);
+	assert.ok(
+		helps.some((text) => /LATEST instant wins/.test(text)),
+		'the overlap precedence is kept'
+	);
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'muted chart-note'),
+		null,
+		'no explanatory paragraphs left in the body'
+	);
+});
+
+test('recording is still preview-first: the dry run, then an explicit second click', async () => {
+	const ctx = await ready();
+	const button = (text) => find(draw(ctx), (n) => n.tagName === 'BUTTON' && n.textContent === text);
+	// No reason, no preview.
+	await button('Preview (writes nothing)').listeners.click[0]();
+	assert.equal(ctx.calls.posts.length, 0);
+	assert.match(ctx.calls.failures[0], /reason is required/);
+
+	// The reason input is drawn from the form state, so filling that fills the field.
+	ctx.data.form.reason = 'promo flip';
+	ctx.post = async (route, data) => {
+		ctx.calls.posts.push({ route, data });
+		return { ok: true, body: { scope: data.scope, precedence: 'max', effect: 'refuses pre-epoch pages', limits: [] } };
+	};
+	await button('Preview (writes nothing)').listeners.click[0]();
+	assert.deepEqual(ctx.calls.posts.at(-1), {
+		route: 'invalidate',
+		data: { scope: 'all', reason: 'promo flip', dryRun: true },
+	});
+	assert.match(draw(ctx).textContent, /Preview — nothing has been written/);
+	await button('Invalidate all now').listeners.click[0]();
+	assert.deepEqual(ctx.calls.posts.at(-1), { route: 'invalidate', data: { scope: 'all', reason: 'promo flip' } });
 });
 
 test('refused and rescued are one population, and the shares are stated against it', async () => {
@@ -285,5 +368,5 @@ test('an analytics window that failed to load leaves the rest of the view standi
 	const text = draw(ctx).textContent;
 	assert.match(text, /Active invalidations/);
 	assert.match(text, /Record an invalidation/);
-	assert.match(text, /No bot_serve rows/);
+	assert.match(text, /No bot_serve data in this window/);
 });

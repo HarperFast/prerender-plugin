@@ -22,11 +22,11 @@
  * demand-driven heal (a crawled invalidated page is pulled forward in the queue, with v0.64.0
  * forwarding the heal to the key's owner instead of refusing it as `not-owner`). Those are
  * counters, they live in the analytics scan, and this is the view an operator is on when they
- * ask "is it working". The read is the same one-hour window the overview already holds, so on a
- * warm cache it costs no scan at all.
+ * ask "is it working". The read follows the global time range, so it shares the scan (and the
+ * worker's cache) with every other ranged view.
  */
 
-import { ago, card, el, ICONS, kv, mono, muted, num, pct, pill, spacer, stat, table } from '../ui.js';
+import { ago, card, el, ICONS, kv, mono, muted, num, pct, pill, section, spacer, stat, stats, table } from '../ui.js';
 import {
 	barList,
 	emptyNote,
@@ -40,14 +40,14 @@ import {
 } from '../charts.js';
 import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 
-export const meta = { id: 'invalidations', label: 'Invalidations', crumb: 'invalidations', icon: ICONS.invalidations };
+export const meta = { id: 'invalidations', label: 'Invalidations', icon: ICONS.invalidations, ranged: true };
 
 export async function load(ctx) {
 	const [res, analyticsRes] = await Promise.all([
 		ctx.get('invalidations'),
-		// The same range key Overview, Queue and Nodes use, so this is served from the worker's
-		// cache whenever any of them loaded inside management.analytics.cacheTtl.
-		ctx.get('analytics', { range: 3_600_000 }),
+		// The global range — the same key Traffic and Queue read, so this is served from the worker's
+		// cache whenever either loaded inside management.analytics.cacheTtl.
+		ctx.get('analytics', { range: ctx.rangeMs }),
 		loadConfig(ctx),
 	]);
 	ctx.data.list = res.ok ? res.body : null;
@@ -57,21 +57,18 @@ export async function load(ctx) {
 
 export function render(ctx) {
 	const data = ctx.data.list;
-	if (!data) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'No invalidation data.' });
+	if (!data) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load invalidations.' });
 
 	return [
-		el('div', { cls: 'view-head' }, [
-			el('span', { cls: 'eyebrow', text: 'Invalidations' }),
-			spacer(),
-			data.enabled ? pill('enforcement on', 'ok', true) : pill('invalidation.enabled is FALSE', 'bad', true),
-			el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
-		]),
 		appliedNote(ctx),
 		data.killSwitchHidingRows &&
 			el('div', { cls: 'note bad' }, [
-				'Rows exist but ',
-				el('code', { text: 'invalidation.enabled' }),
-				' is false — they are recorded and NOT enforced. Whatever those rows were protecting against is being served.',
+				el('strong', null, [
+					'Rows exist but ',
+					el('code', { text: 'invalidation.enabled' }),
+					' is false — they are recorded and NOT enforced. ',
+				]),
+				'Whatever they were protecting against is being served.',
 			]),
 		active(ctx, data),
 		effect(ctx, data),
@@ -158,9 +155,7 @@ function tally(combos, dim) {
 
 function effect(ctx, list) {
 	const data = ctx.data.analytics;
-	const title = data
-		? `What the invalidations are doing — ${scopeLabel(data)}, last hour`
-		: 'What the invalidations are doing';
+	const title = data ? `What the invalidations are doing — ${scopeLabel(data)}` : 'What the invalidations are doing';
 	const options = optionIndex(configState(ctx).payload);
 	const on = (path) => options.get(path)?.effective === true;
 	const verificationOn = on('invalidation.verification.enabled');
@@ -219,41 +214,49 @@ function effect(ctx, list) {
 			verificationOn ? pill('verification on', 'ok') : pill('verification off', ''),
 			reenqueueOn ? pill(crossNodeOn ? 'heal on · cross-node' : 'heal on', 'ok') : pill('heal off', ''),
 		],
+		help: [
+			'Refused and rescued split one population: pages rendered before the epoch that a crawler asked for. ',
+			'A refused serve is proxied to the origin (also inside Traffic’s miss/origin figures); a rescued one is served ',
+			'from cache because the probe proved its price and availability current — all “verified” asserts. ',
+			'Heal outcomes sum to attempts (hover a bar for its meaning); “forwarded” is counted again by the owner, so it is ',
+			'never added to “lowered”. Node-local counters, summed under cluster scope.',
+		],
 		body: [
-			el('div', { cls: 'stat-grid tight' }, [
+			stats([
 				stat(
 					'Refused',
 					num(refused),
-					touched
-						? `${pct(refused, touched)} of touched serves · each an origin round trip`
-						: 'serves an invalidation cost',
-					{ warn: refused > 0 && rescued === 0 && verificationOn }
+					touched ? `${pct(refused, touched)} of touched serves` : 'serves an invalidation cost',
+					{
+						warn: refused > 0 && rescued === 0 && verificationOn,
+						title: 'Serves an invalidation refused — each one an origin round trip.',
+					}
 				),
-				stat(
-					'Rescued',
-					num(rescued),
-					touched
-						? `${pct(rescued, touched)} · served on the probe’s evidence (verified)`
-						: 'served through an invalidation on evidence'
-				),
+				stat('Rescued', num(rescued), touched ? `${pct(rescued, touched)} · on probe evidence` : 'served on evidence', {
+					title: 'Served through an invalidation because the probe verified the page (cacheStatus verified).',
+				}),
 				stat(
 					'Verifications recorded',
 					num(written),
 					writeFaults.length
 						? `${writeFaults.map(([outcome, count]) => `${num(count)} ${outcome}`).join(' · ')}`
-						: 'by the probe sweep, while a scope is invalidated',
-					{ warn: writeFaults.length > 0 }
+						: 'by the probe sweep',
+					{ warn: writeFaults.length > 0, title: 'Written by the probe sweep while a scope is invalidated.' }
 				),
 				stat(
 					'Heals attempted',
 					num(healTotal),
 					healTotal
 						? `${num(heals.get(LOWERED) ?? 0)} lowered · ${pct(notOwner, healTotal)} not-owner`
-						: 'crawled invalidated pages pulled forward',
+						: 'crawled pages pulled forward',
 					// The accelerator's real ceiling: traffic lands where the CDN sends it while residency
 					// is hashed, so on a concentrated deployment most heals arrive off-owner. Past half,
 					// cross-node forwarding is the lever.
-					{ warn: healTotal > 0 && notOwner > healTotal / 2 && !crossNodeOn }
+					{
+						warn: healTotal > 0 && notOwner > healTotal / 2 && !crossNodeOn,
+						title:
+							'Crawled invalidated pages pulled forward in the queue. A not-owner majority with crossNode off: turn it on.',
+					}
 				),
 			]),
 			healRows.length
@@ -278,40 +281,47 @@ function effect(ctx, list) {
 					)
 				: null,
 			errorTotal > 0 &&
-				el('div', { cls: lkgExpired > 0 ? 'note bad' : 'note warn' }, [
-					el('strong', { text: `${num(errorTotal)} epoch resolution failure(s) this hour: ` }),
-					[...errors.entries()].map(([kind, count]) => `${kind} ${num(count)}`).join(' · '),
-					lkgExpired > 0
-						? '. lkg-expired means the row read threw AND the last-known-good memory was older than invalidation.lkgMaxAge, so those requests failed OPEN — content someone deliberately invalidated may have been served.'
-						: '. read-error means a live last-known-good answered; invalid-row and unknown-mode were treated as hard invalidations.',
-				]),
+				el(
+					'div',
+					{
+						cls: lkgExpired > 0 ? 'note bad' : 'note warn',
+						title:
+							'lkg-expired: the row read threw AND the last-known-good memory was older than invalidation.lkgMaxAge, ' +
+							'so the request failed open.',
+					},
+					[
+						el('strong', {
+							text: `${num(errorTotal)} epoch resolution failure(s): ${[...errors.entries()]
+								.map(([kind, count]) => `${kind} ${num(count)}`)
+								.join(' · ')}. `,
+						}),
+						lkgExpired > 0
+							? 'lkg-expired requests failed OPEN — content someone deliberately invalidated may have been served.'
+							: 'read-error: a live last-known-good answered; invalid-row / unknown-mode: treated as hard invalidations.',
+					]
+				),
 			nothingActive &&
 				!touched &&
-				el('div', { cls: 'note' }, [
-					'Nothing is invalidated right now, so none of this is expected to move: a verification is only ',
-					'written while a scope is invalidated, and a heal only fires on a serve an invalidation refused. ',
-					'Zeros here are the steady state, not a fault.',
-				]),
+				el('div', {
+					cls: 'hint',
+					text: 'Nothing is invalidated right now. Zeros here are the steady state, not a fault.',
+					title:
+						'A verification is only written while a scope is invalidated, and a heal only fires on a serve an invalidation refused.',
+				}),
 			!nothingActive &&
 				touched > 0 &&
 				!verificationOn &&
 				el('div', { cls: 'note' }, [
-					'Every touched serve was refused because ',
-					el('code', { text: 'invalidation.verification.enabled' }),
-					' is off. With it on, a page the change probe has re-confirmed against the origin since the epoch is ',
-					'served from cache instead of proxied — measured at 71-78% of a route-wide invalidation’s scope on ',
-					'one deployment. It requires ',
+					el('strong', null, [
+						'Every touched serve was refused because ',
+						el('code', { text: 'invalidation.verification.enabled' }),
+						' is off. ',
+					]),
+					'On, pages the probe re-confirmed since the epoch serve from cache instead (71-78% of a route-wide ',
+					'scope on one deployment); it needs ',
 					el('code', { text: 'changeProbe.pageCheck' }),
-					' on the rule whose scope was invalidated.',
+					' on the invalidated rule.',
 				]),
-			el('p', { cls: 'muted chart-note' }, [
-				'Refused and rescued are the population an invalidation touched — pages rendered before the epoch that ',
-				'a crawler asked for — split by what happened next. A refused serve is proxied to the origin (it is ',
-				'also inside the miss/origin figures on Traffic); a rescued one is served from cache because the probe ',
-				'proved its price and availability current, which is all “verified” asserts. The heal outcomes sum to ',
-				'attempts; “forwarded” is a hand-off whose result the owner counts under its own verdict, so it is ',
-				'never added to “lowered”. Counters, node-local, summed under cluster scope.',
-			]),
 		],
 		foot: [scanFooter(data)],
 	});
@@ -337,20 +347,21 @@ function active(ctx, data) {
 	);
 
 	return card('Active invalidations', {
-		head: [spacer(), muted(`${num(data.invalidations?.length ?? 0)} of ${num(data.maxScopes)} scope slots`)],
-		body: [
-			table(
-				['scope', 'state', 'since', 'reason', 'by', { text: '', right: true }],
-				rows,
-				'Nothing is invalidated. Pages serve on their own expiry/SWR windows.'
-			),
-			el('p', { cls: 'muted chart-note' }, [
-				'An invalidation is one row naming a scope and an instant: cached pages in that scope rendered ',
-				'before the instant stop being served (bots get the origin) until they re-render on their own ',
-				'cadence. Nothing is rewritten, so clearing is instant for pages still inside their windows. ',
-				'The LATEST instant among overlapping scopes wins — max, not most-specific.',
-			]),
+		cls: 'flush-table',
+		head: [
+			data.enabled ? pill('enforcement on', 'ok', true) : pill('invalidation.enabled is FALSE', 'bad', true),
+			spacer(),
+			muted(`${num(data.invalidations?.length ?? 0)} of ${num(data.maxScopes)} scope slots`),
 		],
+		help:
+			'Each row is a scope and an instant: cached pages in that scope rendered before the instant stop being served ' +
+			'(bots get the origin) until they re-render on their own cadence. Nothing is rewritten, so clearing is instant. ' +
+			'Among overlapping scopes the LATEST instant wins — max, not most-specific.',
+		body: table(
+			['scope', 'state', 'since', 'reason', 'by', { text: '', right: true }],
+			rows,
+			'Nothing is invalidated — pages serve on their own expiry/SWR windows.'
+		),
 	});
 }
 
@@ -386,7 +397,7 @@ function record(ctx, data) {
 
 	const reason = el('input', {
 		type: 'text',
-		style: { flex: '1', minWidth: '260px' },
+		cls: 'grow',
 		placeholder: 'why — this outlives the incident',
 		value: state.reason,
 		oninput: (event) => {
@@ -431,9 +442,8 @@ function record(ctx, data) {
 		body.push(el('div', { cls: 'note bad', text: preview.error }));
 	} else if (preview) {
 		body.push(
-			el('div', { cls: 'note info' }, [
-				el('strong', { text: 'Preview — nothing has been written. ' }),
-				'This is the same body the write returns.',
+			el('div', { cls: 'note info', title: 'The same body the write returns, minus the write.' }, [
+				el('strong', { text: 'Preview — nothing has been written.' }),
 			]),
 			kv([
 				['Scope', mono(preview.scope)],
@@ -456,7 +466,12 @@ function record(ctx, data) {
 		);
 	}
 
-	return card('Record an invalidation', { body });
+	return card('Record an invalidation', {
+		help:
+			'Preview is a dry run of the write and shows exactly what it would do; recording is a second click from ' +
+			'inside it. Clear (in the table above) runs at once — it is the safe direction.',
+		body,
+	});
 }
 
 const describeCoverage = (coverage) => (typeof coverage === 'string' ? coverage : (coverage?.covers ?? '—'));
@@ -464,23 +479,23 @@ const describeCoverage = (coverage) => (typeof coverage === 'string' ? coverage 
 /**
  * The knobs, deliberately BELOW the record form and outside it.
  *
- * `invalidation.enabled` is the pill in this view's header and the kill switch behind the banner
- * above, so it has to be reachable from here — but it is a config write with its own
+ * `invalidation.enabled` is the pill on the Active invalidations card and the kill switch behind the
+ * banner above, so it has to be reachable from here — but it is a config write with its own
  * preview-then-apply, not a step in recording an invalidation. Keeping it in its own card below
  * the form is what stops the two flows from reading as one.
  */
-const settings = (ctx) =>
-	settingsCard(ctx, {
-		title: 'Invalidation behaviour',
-		prefix: 'invalidation',
-		description:
-			'How the rows in Active invalidations above are applied. enabled is the header pill: false leaves ' +
-			'every row stored and stops honouring all of them at once, so the corpus serves pre-invalidation ' +
-			'bytes again — it does not clear anything. maxScopes is the slot count on that panel. pad only ' +
-			'widens the comparison toward invalidating (its cost is at most one extra render per page). ' +
-			'verification lets a page the change probe has PROVED current since the epoch be served through ' +
-			'the invalidation (the “rescued” count above; needs pageCheck on the rule). The reenqueue options ' +
-			'decide whether a bot request for an invalidated page pulls that URL forward in the queue instead of ' +
-			'waiting out its own cadence, and crossNode whether a heal for a key another node owns is forwarded ' +
-			'to it rather than dropped as not-owner. Nothing here rewrites a cached page.',
-	});
+function settings(ctx) {
+	const cards = [
+		settingsCard(ctx, {
+			title: 'Invalidation behaviour',
+			prefix: 'invalidation',
+			description:
+				'How the Active invalidations rows are applied; nothing here rewrites a cached page. enabled=false keeps ' +
+				'every row stored and stops honouring all of them — it clears nothing — and pad widens the comparison ' +
+				'toward invalidating (at most one extra render per page). verification serves pages the probe PROVED ' +
+				'current (“rescued”; needs pageCheck), reenqueue pulls a crawled invalidated URL forward in the queue, and ' +
+				'crossNode forwards that heal to the key’s owner instead of dropping it as not-owner.',
+		}),
+	].filter(Boolean);
+	return cards.length ? section(meta.id, 'Settings', cards) : null;
+}

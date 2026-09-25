@@ -1,5 +1,5 @@
 /**
- * The Overview's discovered-target purge card.
+ * The Corpus view: the discovered-target purge card, and the two other per-node passes.
  *
  * This is the console's second corpus-DELETING action, and it has one interlock the first does
  * not: gating the route has to happen BEFORE the purge, or crawlers re-mint exactly what was
@@ -21,7 +21,7 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render } = await import('../src/admin/views/overview.js');
+const { load, render } = await import('../src/admin/views/corpus.js');
 
 const OVERVIEW = {
 	generatedAt: Date.now(),
@@ -103,7 +103,7 @@ test('a node that has never purged says so, instead of showing a clean census of
 	const ctx = await ready();
 	const card = cardTitled(ctx, 'Discovered targets');
 	assert.ok(card, 'expected a Discovered targets card');
-	assert.match(card.textContent, /No purge has run on this node since startup/);
+	assert.match(card.textContent, /No purge has run since startup/);
 	assert.doesNotMatch(card.textContent, /Rows examined/);
 });
 
@@ -227,7 +227,7 @@ test('two nodes on different prefixes are not presented as one total', async () 
 			sources: { mode: 'merged', answered: 2, configured: 2, complete: true, nodes: [] },
 		},
 	});
-	assert.match(cardTitled(ctx, 'Discovered targets').textContent, /add up two populations/);
+	assert.match(cardTitled(ctx, 'Discovered targets').textContent, /add two populations/);
 });
 
 test('a pass stopped early reports what it never reached, rather than reading as complete', async () => {
@@ -303,7 +303,7 @@ test('delete failures are surfaced with their samples, not folded into the delet
 	};
 	const text = cardTitled(await ready({ purge: failed }), 'Discovered targets').textContent;
 	assert.match(text, /Failed — left for the next pass/);
-	assert.match(text, /STOPPED ITSELF/);
+	assert.match(text, /stopped itself/i);
 	assert.match(text, /transaction timeout/);
 });
 
@@ -321,53 +321,78 @@ test('a cluster where only some nodes spared bot-visited targets is called out',
 	};
 	const text = cardTitled(await ready({ purge: mixed }), 'Discovered targets').textContent;
 	assert.match(text, /Only a\.example\.com:9926 spared bot-visited targets/);
-	assert.match(text, /sum two different predicates/);
+	assert.match(text, /mix two predicates/);
 });
 
-// ---- the serve strip's offload tile -----------------------------------------------
+// ---- the other two passes ---------------------------------------------------------
 
-/** One analytics combo, in the shape `util/analyticsRead.js` emits (four buckets, flat). */
-const combo = (metric, path, method, type, count, value) => ({
-	metric,
-	path,
-	method,
-	type,
-	count,
-	total: 0,
-	counts: [count / 4, count / 4, count / 4, count / 4],
-	...(value === undefined ? {} : { mean: value, median: value, p95: value, means: [value, value, value, value] }),
+test('every pass on this page refuses cluster scope on its button, not with an error banner', async () => {
+	const ctx = await ready({
+		overview: {
+			...OVERVIEW,
+			sources: { mode: 'merged', answered: 4, configured: 4, complete: true, nodes: [] },
+			orphanSweep: {
+				...OVERVIEW.orphanSweep,
+				lastRun: { finishedAt: 1, examined: 10, owned: 5, orphaned: 3, deleted: 0, dryRun: true },
+			},
+		},
+	});
+	const repair = button(cardTitled(ctx, 'Schedule repair'), 'Run sweep (pick a node)');
+	const orphans = button(cardTitled(ctx, 'Key-rule orphans'), 'Dry run (pick a node)');
+	assert.equal(repair?.attributes.disabled, '');
+	assert.equal(orphans?.attributes.disabled, '');
+	// The delete is inert under cluster scope even though a census found orphans.
+	assert.equal(button(cardTitled(ctx, 'Key-rule orphans'), 'Delete orphans').attributes.disabled, '');
 });
 
-test('the offload tile shows the gross figure with the net one underneath, from the same arithmetic as Traffic', async () => {
-	// 900 of 1,000 serves from cache (90% gross); 500 renders and a 100-probe pass mean the origin
-	// answered 700 of 1,000 crawler requests — 30% net. The headline alone would be the flattering
-	// number; the subtitle is what stops it being quoted on its own.
-	const analytics = {
-		...ANALYTICS,
-		startMs: 0,
-		endMs: 3_600_000,
-		bucketMs: 900_000,
-		bucketCount: 4,
-		series: [
-			combo('bot_serve', 'cache', 'hit', 'googlebot', 900),
-			combo('bot_serve', 'origin', 'miss', 'googlebot', 100),
-			combo('bot_request', 'www.example.com', 'googlebot', 'desktop', 1000),
-			combo('render', 'outcome', 'rendered', null, 500),
-			combo('prerender_ops', 'probe_probed', null, null, 1, 100),
-		],
-	};
-	const ctx = await ready({ analytics });
+test('the orphan sweep always posts an explicit dry run first, and deletes only what a census found', async () => {
+	const clean = await ready();
+	assert.equal(button(cardTitled(clean, 'Key-rule orphans'), 'Delete orphans').attributes.disabled, '');
+	button(cardTitled(clean, 'Key-rule orphans'), 'Dry run').listeners.click[0]();
+	assert.deepEqual(clean.calls.posts.at(-1), { route: 'sweep-orphans', data: { dryRun: true } });
+
+	const found = await ready({
+		overview: {
+			...OVERVIEW,
+			orphanSweep: {
+				...OVERVIEW.orphanSweep,
+				lastRun: { finishedAt: 1, examined: 10, owned: 5, orphaned: 3, deleted: 0, dryRun: true },
+			},
+		},
+	});
+	const del = button(cardTitled(found, 'Key-rule orphans'), 'Delete orphans');
+	assert.equal(del.attributes.disabled, undefined);
+	del.listeners.click[0]();
+	assert.deepEqual(found.calls.posts.at(-1), { route: 'sweep-orphans', data: { dryRun: false } });
+});
+
+// One node with the sweep off leaves ~1/N of the corpus with no repair at all, while every other
+// panel keeps looking healthy.
+test('a node with schedule repair disabled is named, and the card reads as disabled', async () => {
+	const ctx = await ready({
+		overview: { ...OVERVIEW, reconcile: { ...OVERVIEW.reconcile, enabled: false, disabledOn: ['c.example.com:9926'] } },
+	});
+	const text = cardTitled(ctx, 'Schedule repair').textContent;
+	assert.match(text, /render\.reconcile\.enabled/);
+	assert.match(text, /c\.example\.com:9926/);
+	assert.match(text, /disabled/);
+});
+
+test('replicated table counts that disagree between nodes are flagged, not shown as one number', async () => {
+	const ctx = await ready({
+		overview: {
+			...OVERVIEW,
+			counts: {
+				targets: { recordCount: 1000, divergent: true, spread: { low: 990, high: 1000 } },
+				pages: { recordCount: 5 },
+			},
+			countsAsOf: Date.now(),
+		},
+	});
 	const tile = find(
 		draw(ctx),
-		(n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Origin offload'
+		(n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Render targets'
 	);
-	assert.ok(tile, 'expected an Origin offload tile');
-	assert.match(tile.textContent, /90%/);
-	assert.match(tile.textContent, /30% net of renders \+ probes/);
-	assert.match(tile.textContent, /before crawler follow-up requests/);
-	// Below half on the net figure warns even though the gross one is fine.
-	assert.ok(
-		find(tile, (n) => n.attributes?.class === 'value warn'),
-		'a 30% net offload should warn'
-	);
+	assert.match(tile.textContent, /nodes disagree: 990–1,000/);
+	assert.ok(find(tile, (n) => n.attributes?.class === 'value warn'));
 });

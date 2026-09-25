@@ -152,181 +152,81 @@ browser ── same-origin (cookies, CSP 'self') ──▶ prerender-console com
 
 ## What it shows
 
-The view-by-view tour lives in the plugin README's
-[Management API](../plugin/README.md#management-api-prerender_admin) section alongside the
-API contract; the short version: **Overview** (scale, serve health, backlog shape, claim
-floor, schedule repair, and the discovered-target purge), **Traffic** (offload/hit-rate charts from
-one bounded analytics scan per node, freshness reported relative to each route's own render cadence,
-the non-hit verdicts broken out by what would fix them — coverage stated net of URLs the origin does
-not have — the discovery gate, the raw-document cache's refusals, and a client-side bot filter),
-**Sitemaps** (per-root ingest and check state, plus 24h walk counters), **Page cache**,
-**Queue** (render/claim health and the backlog), **Nodes**, **Invalidations** (preview-first
-record/clear), **Change probe**, **URL explainer**, **Metrics** (the live catalog), **Config**.
+| View              | What it answers                                                                                                                                                                                 |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Health**        | Is anything wrong? Every tile is a check with a verdict (ok / watch / bad), and anything not ok is listed in the banner. The landing page.                                                      |
+| **Traffic**       | What crawlers got: offload (gross and net), freshness relative to each route's cadence, the non-hit verdicts by fix, **traffic by instance**, origin load, crawlers, routes, gate, raw cache.   |
+| **Queue**         | Is the render machinery keeping up: cluster pause, backlog and time to clear, claim floor, the **node table** (status, intent, per-node throughput, pause controls), outcomes, renders by node. |
+| **Sitemaps**      | Per-root ingest and check state, entries, and 24h walk counters.                                                                                                                                |
+| **Corpus**        | Corpus counts, and the three manual per-node passes: schedule repair, discovered-target purge, key-rule orphan sweep.                                                                           |
+| **Invalidations** | Active scopes, preview-first record/clear, and what the active rows are doing (refused vs rescued).                                                                                             |
+| **Change probe**  | What the probe is doing now, per node, with health flags; last pass; canary; finished-pass counters.                                                                                            |
+| **Inspect**       | One URL end to end: resolved key, stored rows, cadence resolution, revalidate, the page cache table.                                                                                            |
+| **Config**        | The searchable index of every option: layers, overrides, divergence between nodes, pending restarts.                                                                                            |
+| **Metrics**       | The live metric catalog.                                                                                                                                                                        |
 
-**Offload is stated twice, gross and net** (console v0.12.0). The gross figure — crawler requests
-not proxied to the origin live — is what every serve-side panel is built from, and it is
-flattering: it counts what the origin was spared and none of what this system asks of the origin
-in exchange. Every render is the headless fleet loading a page from the origin; every change probe
-is an origin call; every sitemap refresh fetches the sitemap. A deployment rendering its whole
-corpus on a short cadence for a trickle of bot traffic can post a 95% gross offload while sending
-the origin _more_ requests than the crawlers would have. Net offload is
-`1 − (proxied + renders + probes + sitemap fetches) ÷ crawler requests arrived`, every term from a
-series already in the one analytics scan, and the panel beside the origin-fetch chart shows each
-term over time. Two caveats are written on the panel rather than assumed: a render counts as one
-origin request (the document — the page's own subresources reach the origin only if the CDN does
-not cache them for the renderer), and the probe and sitemap counters land in the bucket where a
-_pass finished_, so a short range reads either none of a running sweep or all of one that just
-ended — quote the 24h figure. One term the plugin cannot see at all is stated rather than
-omitted, and it is missing from _both_ sides: the requests a page's own scripts make when a
-rendering crawler runs it. Without this system every Googlebot/Bingbot/Applebot page-view costs the
-origin the document _plus_ the page's XHR/API calls (the ones no CDN caches), so the "crawlers asked
-for" baseline understates what the origin was spared; with it, a snapshot served without scripts
-triggers none of those calls (a saving the figure does not credit), while a snapshot that keeps its
-scripts, a proxied origin page, and every one of our own renders still trigger them (a cost it does
-not charge). None of it passes through the plugin, so the figure is documents-only on both sides,
-the net tile says "before crawler follow-up requests", and the panel reports the exposure (every
-page handed to a crawler) as a count, never multiplied by a guessed factor — where snapshots are
-served with scripts stripped, the true net offload for rendering crawlers is _higher_ than shown.
-The render fleet can measure the per-page factor; applied to both sides, that tile becomes a number.
+The API contract behind each view is in the plugin README's
+[Management API](../plugin/README.md#management-api-prerender_admin) section.
 
-**Invalidations gained a third panel** for the same release: what the active rows are doing.
-Refused serves (`invalidated` — each an origin round trip) beside rescued ones (`verified`, plugin
-v0.63.0 — a page the change probe has _proved_ current since the epoch, served from cache through
-the invalidation), the verifications the sweep recorded, and every outcome of the demand-driven
-heal including v0.64.0's cross-node `forwarded` / `forward-failed`. `forwarded` is deliberately
-never added to `lowered`: the owner counts a forwarded heal under its own verdict in the same
-series, so adding the two double-counts under cluster scope. The `verified` status is also a
-cache serve everywhere else in the console — the freshness chart, the per-route table, the
-staleness sums — and sits in one "Invalidation" family with `invalidated` on the non-hit strip,
-because the two are one population split into rescued and refused.
+### The shell
 
-**Change probe leads with what the probe is doing now** (console v0.16.0; the full picture needs
-plugin v0.91.0). "Probe now" is one sentence for the scope and one row per node — sweeping since
-when and started by what, how far through its slice, its current rate and ETA; or idle, with the
-next run in local and UTC time — followed by health flags that need no reading between the lines:
-failures, origin pushback, backoff engaged, a late or stopped heartbeat, a pass overrunning its next
-anchor, a disarmed mapped field, a trigger queue near `maxPending`, deferred changes, and nodes
-disagreeing on mode, rules or settings. The running pass's own partial counts have a card of their
-own; the last completed pass has another, titled as the pass _before_ the running one while a pass
-runs, so yesterday's numbers can never be read as tonight's. Every time carries its age on the
-node's clock, and the status re-reads itself every 30s — the analytics charts do not, and say so
-("per finished pass — not live"). A node on an older plugin shows what it can: a counter it does not
-report reads n/a with the version that added it, never 0, and its next anchored run is computed from
-the anchor setting, because before v0.91.0 the plugin published it as null
-([#176](https://github.com/HarperFast/prerender-plugin/issues/176)).
+- **One time range** (15m–24h, capped by `management.analytics.maxRange`) in the top bar, shared by every
+  view that charts analytics, so every view reads the same cached window and shows the same range.
+- **Loads are sequenced.** A response for a load that has been superseded (a newer range, a view switch) is
+  dropped before it is written, and a load writes only into the view that started it. Identical in-flight
+  GETs share one request.
+- **Loading is a skeleton, never "no data"** — an empty state is a claim about the cluster, not the fetch.
+- **Charts hover by crosshair**: the whole plot is the target, the pointer snaps to the nearest bucket, and
+  the tooltip shows every series (with its share, on stacked bars).
+- **Explanations sit behind each card's `?`**, settings behind a collapsed **Settings** section, and long
+  option descriptions behind "more". Warnings stay on the page, one sentence each.
+- The view is in the URL hash, so a reload or a bookmark keeps it.
 
-**Change probe is new** (plugin v0.53.0+), and it is the one freshness surface that does not measure
-pages against a cadence. It reads what the probe is actually detecting — the change rate against the
-probes that HAD a baseline, not against every probe, because a pass that is mostly seeding has
-compared nothing — beside the failure share, because those two numbers are only meaningful
-together: a probe whose endpoint has changed shape reports zero changes, triggers nothing, and is
-indistinguishable from a catalogue that is not moving. The canary's verdict is reported per node,
-since a trip is a threshold crossed against one node's own cohort, and a trip that recorded no
-invalidation says which of the three reasons it was.
+### Health checks
 
-The same view carries the one alarm here that is not about the probe at all. Plugin v0.56.0 gave
-the sweep an origin backoff, and `probe_throttled` — 429/502/503/504 and connect/read timeouts — is
-the only signal that the probe is loading an origin that cannot take it. The sweep answers pushback
-by halving its own rate, so it covers less of the corpus per pass while the change rate, the failure
-share and the trigger count all keep exactly the shape they had; nothing else surfaces it. Two
-companions sit beside it: rows skipped because a baseline was still fresh (v0.56.0's resumable
-sweeps — counted against the rows a pass _considered_, since a skipped URL was never probed, and
-flagged when a settled deployment skips most of them, which means `reprobeAfter` sits too close to
-`sweepInterval`), and registry rows that could not be decoded, which is a storage-layer escalation
-rather than anything a setting here reaches.
+Thresholds are judgement calls set where a number stops being tail noise for a healthy deployment; they live
+in one place (`views/health.js`). A system tile shows the **worst node**, never an average.
 
-Plugin v0.62.0 moved the probe's state into a node-local row every worker can read (before it, 15
-of 16 workers answered "not running, never ran" — indistinguishable from the probe being off), and
-the endpoint now says when that row could _not_ be read. The console prints that as the loudest
-note on the page — the node is unknown, not idle — and, for a plugin older than v0.91.0, shows a
-running sweep's heartbeat count ("~24,000 rows examined") in that node's state row, summed across
-the nodes running because each walks its own slice.
+| Group       | Checks                                                                                                                                                       |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures |
+| Rendering   | renders/h, failure share, render time, claim scan p95, prioritised claims, backlog **time to clear** (> 2h watch, > 8h bad), claim floor lag                 |
+| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation               |
+| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**            |
+| Maintenance | rows below the claim floor, schedule repair, active invalidations                                                                                            |
 
-Plugin v0.58.0's `pageCheck` adds the one counter on that card that is not about the origin
-changing: **page mismatches** — cached pages that disagree with the origin on a field they claim.
-That is the class the signature comparison is structurally blind to (a value that changed and
-changed _back_ between two passes, with a render landing inside the window), and it overlays the
-outcome buckets rather than joining them: a mismatched row is also inside "Changed" or the
-unchanged remainder, so it is never part of any sum on the card. The reading depends on the run
-mode and the view says which applies — armed, each mismatch was hard-expired the moment it was
-seen (a detection rate); in dry run nothing expires them, so the same disagreement is re-reported
-every pass (a standing count of wrong pages being served). It stays at zero unless a rule sets
-`pageCheck` and the render fleet posts its pages' offers (browser 1.20.0+).
+System vitals come from Harper's own per-minute resource rows, which the plugin's analytics scan now keeps
+(same scan, no second walk), plus a point-in-time host block on `overview`. Against an older plugin the
+section says so once instead of showing zeroes.
 
-**The discovery gate** is split across the two views that own its halves: how much crawl traffic
-the gate is holding out of the render rotation is on Traffic (it carries a bot, so the bot filter
-applies), while the purge that removes what got in before the gate went on sits on Overview beside
-the key-rule orphan sweep — the console's other corpus-deleting action. The card states the
-gate-first interlock rather than leaving it to the plugin's 400: with the route still discovering,
-crawlers re-mint exactly what a purge removes.
+### Reading the numbers
 
-That card defaults to **sparing bot-visited targets** (plugin v0.57.0's `skipVisited`), even though
-the plugin's own default is off — a plugin default that changed behaviour for existing callers
-would be the wrong kind of change, while a console default is a suggestion to a human. A stored
-demand rung is durable evidence that a crawler came back to a page no sitemap declares, and
-deleting one buys a delete plus a re-render to arrive back where we started. The flag rides on the
-census as well as the purge, so the number an operator approves is the number that happens. Every
-way a row survived a pass — deferred, spared, unreadable, failed — is subtracted before the card
-reports what the pass never reached; a missing term there turns "we spared 40% on purpose" into
-"~40% was never reached".
-
-**The raw-document cache reports what it REFUSED**, not what it stored (plugin v0.76.0, console
-v0.14.0). `render.raw` keeps the origin document a miss already fetched, for URLs outside the
-render rotation — the facet and parameter combinations a crawler invents, which own no target and
-therefore miss on every single request. The failure mode is silence: a route that is enabled and
-filling nothing produces the same miss rate, the same origin proxies and the same absence of errors
-as a route nobody enabled, so the panel leads with the reason each candidate was turned away.
-Two of those reasons are findings rather than traffic and are called out above the breakdown —
-`has-cookie` means the origin is personalizing a route that was enabled on the assumption it is
-shared (the refusal is right, the assumption is not), and `oversize` means `render.raw.maxBytes`
-sits below the route's real document size, so the feature is on and structurally cannot fill.
-A raw serve is a **cache serve** and counts toward offload, but it is never a hit and never a
-freshness number: nothing rendered it, it has no cadence to be measured against, and the plugin
-emits no `page_age` for it. The Cache-served tile names the raw share instead of folding it in.
-
-**Ingested is not checked** (plugin v0.69.0, console v0.14.0). A sitemap walk now sends
-`If-Modified-Since`, and a `304` deliberately writes nothing — the stored row and its validator are
-still current. That makes `Sitemap.lastRefreshed` the time that document's _entries_ were last
-ingested, which on a nightly-rebuilt corpus is hours old by design; when it was last _looked at_
-lives on the run row. Both are shown under their own names, because printing the first under the
-second's label turns conditional fetching working into an operator chasing a sitemap that is not
-stale. Beside them, a walk-activity panel sums the per-run counters across roots and nodes over 24h
-(the same range key the Change probe view uses, so the two share one cached scan): `not modified` is
-the only evidence anywhere that conditional fetching is working at all — a walk that re-parses every
-document succeeds exactly like one that skipped — and a flat zero across a day of walks is flagged.
-`rendered soon` is the share of new targets whose first render was pulled inside
-`sitemap.newTargets.window` rather than waiting out a full interval of jitter; it is a _subset_ of
-created, stated with its denominator, and the gap is the per-run cap sending a bulk ingest back to
-the old behaviour.
-
-**A cadence is not its ceiling** (plugin v0.77.0, console v0.14.0). The URL explainer's Target card
-shows `renderInterval`, which is the interval the demand ladder schedules _inside_ — with the ladder
-armed it is not the cadence for most of a corpus, and nothing said so. The explainer now renders the
-plugin's own resolution: the effective interval, all four inputs (route, stored, default, rung), the
-demand floor, and `clampedBy` — the clamp that actually bound. `floor` on one URL is information;
-`floor` across a route means the ladder has no dynamic range there and the promotion machinery is
-running for nothing. `ceiling` means the rung is inert.
-
-Two more changed shape when configuration became editable:
-
-- **Nodes is new**, and it exists because "is this node healthy" had four homes: liveness and the
-  replication gap on Overview, observed status and pause intent on Queue, config divergence on
-  Config, and the topbar picker. The tell was that Queue imported the overview's own node-cell
-  helpers to draw a second node table. It now owns all of it, plus the two per-node questions the
-  override layer adds — did my edit reach this node, and is this node's override subscription
-  still live. A node whose subscription has died silently stops honouring every edit made from
-  this console, so that is the headline of the panel rather than a footnote.
-- **Config** stopped being a JSON dump and became the searchable index of all 156 options: every
-  option's default, deployed and override values, which layer won, and a filter for the questions
-  operators actually arrive with (what is overridden, what differs from the repo, what is pending
-  a restart). Divergence stays first, and stays the alarm it always was — a divergence at a path
-  nobody overrides is still a deploy that skipped a node.
+- **Offload is stated gross and net.** Gross is crawler requests not proxied live; net also subtracts every
+  origin request this system makes (renders, probes, sitemap fetches): `1 − (proxied + renders + probes +
+sitemap fetches) ÷ crawler requests arrived`. Both sides are documents only — the XHR/fetch calls a
+  rendering crawler's page makes never pass through the plugin — so where snapshots are served without
+  scripts the true net is higher than shown. Probe and sitemap counts land where a pass finished; quote 24h.
+- **Freshness is relative**: served age ÷ that route's render interval, so 1.0 means "due" on every route.
+  The median leads; an evenly refreshed corpus sits at 0.50× median and ~0.95× p95 by construction.
+- **Not every non-hit is a miss.** Verdicts are grouped by fix (coverage, cadence, integrity, invalidation,
+  raw, not-cacheable). Coverage is net of URLs the origin answered 404/410 — those can never be cached.
+  `verified` and `raw` are cache serves; `raw` is never a hit and never a freshness number.
+- **By instance** compares nodes from per-node buckets in the cluster merge. A share far from an even split
+  is load-balancer weighting or a node out of rotation; a low cache-served share is a cold cache.
+- **The raw-document cache reports what it refused** — an enabled route filling nothing looks exactly like
+  one nobody enabled. `has-cookie` (a route assumed shared is personalized) and `oversize` are called out.
+- **Ingested is not checked.** A `304` writes nothing, so a sitemap's ingest time is hours old by design;
+  when it was last looked at is on the run row. `not modified` is the only evidence conditional fetching
+  works.
+- **Discovered-target purge** (Corpus) defaults to sparing bot-visited targets, and the census runs the same
+  predicate as the purge. Gate the route first, or crawlers re-mint what a purge removes.
+- **Change probe** judges change rate against the probes that had a baseline, beside the failure share —
+  a probe whose endpoint changed shape reports zero changes and looks like a quiet catalogue.
 
 Each domain view owns the options that govern the data it shows — `sitemap.*` under Sitemaps,
-`queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Page cache, `analytics`/`crawlStats`
-under Traffic, `invalidation` under Invalidations, `changeProbe` under Change probe (`render.raw.*`
-rides the `render` group under Queue) — while Config
-remains exhaustive, so a setting can be found either by where it acts or by name.
+`queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Inspect, `analytics`/`crawlStats` under Traffic,
+`invalidation` under Invalidations, `changeProbe` under Change probe — while Config remains exhaustive, so a
+setting can be found either by where it acts or by name.
 
 ## Development
 

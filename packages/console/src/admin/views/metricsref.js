@@ -8,9 +8,9 @@
  * what the emitted data can support. Static data, one fetch, no table touched.
  */
 
-import { card, el, ICONS, mono, muted, pill, spacer, table } from '../ui.js';
+import { card, el, ICONS, mono, muted, pill, section, spacer, table } from '../ui.js';
 
-export const meta = { id: 'metrics', label: 'Metrics', crumb: 'metrics', icon: ICONS.metrics };
+export const meta = { id: 'metrics', label: 'Metrics', icon: ICONS.metrics };
 
 export async function load(ctx) {
 	// The catalog is version-static: one fetch per session is plenty.
@@ -22,27 +22,27 @@ export async function load(ctx) {
 
 export function render(ctx) {
 	const data = ctx.data.catalog;
-	if (!data) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'No catalog.' });
+	if (!data) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load the metric catalog.' });
 
 	const plugin = data.metrics?.plugin ?? [];
 	const builtIn = data.metrics?.builtIn ?? [];
 
 	return [
-		el('div', { cls: 'view-head' }, [el('span', { cls: 'eyebrow', text: 'Metric catalog' }), spacer()]),
-		el('div', { cls: 'note info' }, [
+		el('div', { cls: 'hint' }, [
 			'What this deployed version emits, served by the node itself (',
 			el('code', { text: 'GET /prerender_admin/metrics' }),
-			'). Values live in each node’s ',
+			'). Values live per node in ',
 			el('code', { text: 'system.hdb_analytics' }),
-			' — a metric name is a scan, a series is a row, and rows are per node: fan out and sum. ',
-			'The Traffic and Queue panels chart these via one bounded scan per refresh.',
+			' — fan out and sum.',
 		]),
-		...plugin.map((metric) => metricCard(metric)),
-		el('div', { cls: 'view-head', style: { marginTop: '20px' } }, [
-			el('span', { cls: 'eyebrow', text: 'Harper built-ins, as this plugin’s traffic uses them' }),
-			spacer(),
-		]),
-		...builtIn.map((metric) => metricCard(metric)),
+		// Open by default: the plugin's own series are what this page is opened for. The built-ins are
+		// reference for how this plugin's traffic shows up in Harper's own metrics, one click away.
+		section('metrics-plugin', `Plugin metrics (${plugin.length})`, plugin.map(metricCard), { open: true }),
+		section(
+			'metrics-builtin',
+			`Harper built-ins, as this plugin’s traffic uses them (${builtIn.length})`,
+			builtIn.map(metricCard)
+		),
 	];
 }
 
@@ -67,9 +67,11 @@ function metricCard(metric) {
 			spacer(),
 			metric.emittedBy && el('span', { cls: 'muted mono truncate', text: metric.emittedBy }),
 		],
+		// "Useful for" is guidance for a dashboard author, not the definition — behind the toggle.
+		help: metric.usefulFor || null,
+		helpKey: `metric:${metric.name}`,
 		body: [
 			el('p', { style: { margin: '0 0 6px' }, text: metric.summary }),
-			metric.usefulFor && el('p', { cls: 'muted', style: { margin: '0 0 10px' }, text: metric.usefulFor }),
 			metric.caveats && el('div', { cls: 'note warn', text: metric.caveats }),
 			table(['slot', 'meaning', 'values', ''], dims),
 		],

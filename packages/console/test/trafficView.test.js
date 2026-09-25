@@ -190,6 +190,15 @@ function makeCtx({ analytics = ANALYTICS, config = CONFIG } = {}) {
 
 const draw = (ctx) => el('div', null, render(ctx));
 const textOf = (ctx) => draw(ctx).textContent;
+// Long explanations moved out of the page and into tile tooltips (`title`) and the cards' help blocks
+// (in the DOM, hidden until toggled). A fact that moved is still asserted — against this.
+const titlesOf = (node) => [node.attributes?.title ?? '', ...(node.children ?? []).map(titlesOf)].join(' ');
+const everything = (ctx) => {
+	const root = draw(ctx);
+	return `${root.textContent} ${titlesOf(root)}`;
+};
+const tileNamed = (ctx, label) =>
+	find(draw(ctx), (n) => n.attributes?.class === 'stat' && n.children?.[0]?.textContent === label);
 const buttonSaying = (node, text) => find(node, (n) => n.tagName === 'BUTTON' && n.textContent.includes(text));
 /** The table row whose FIRST cell is exactly `label` — not merely a row mentioning it. */
 const rowFor = (node, label) =>
@@ -298,7 +307,7 @@ test('the whole view renders, and reports staleness against each route’s own c
 	// is the entire point: the fleet is three hours behind on the route that matters.
 	assert.match(text, /Staleness/);
 	assert.match(text, /2\.50×/);
-	assert.match(text, /each route’s cadence/);
+	assert.match(everything(ctx), /each route’s cadence/);
 	// Absolute is still carried, because a ratio is not what anyone quotes.
 	assert.match(text, /3\.0h/);
 });
@@ -311,7 +320,8 @@ test('staleness leads with the MEDIAN and carries the p95 beside it', async () =
 	// route_page_age: median 3h on a 1h route (3.00x) and on the 6h default (0.50x), count-weighted
 	// over 600/150 => 2.50x. The tail is 9h, which would read 7.50x — three times as alarming, on
 	// the same healthy window.
-	assert.match(text, /Staleness2\.50×median · p95 7\.50×/);
+	assert.match(text, /Staleness2\.50×median/);
+	assert.match(tileNamed(ctx, 'Staleness').attributes.title, /p95 7\.50×/);
 });
 
 test('a p95 that would warn does not warn when the median is fine', async () => {
@@ -333,8 +343,9 @@ test('serve time reports the two populations separately, never pooled', async ()
 	const text = textOf(ctx);
 	// 750 hits at 5ms and 260 origin serves at 900ms. Pooled that is 235ms — a number that moves
 	// with the hit rate rather than with how fast anything is.
-	assert.match(text, /Serve time · cache hit5msmedian · p95 40ms · origin-served 900ms/);
-	assert.doesNotMatch(text, /235ms/);
+	assert.match(text, /Serve time5mscache hit median · origin 900ms/);
+	assert.match(tileNamed(ctx, 'Serve time').attributes.title, /p95 40ms/);
+	assert.doesNotMatch(everything(ctx), /235ms/);
 });
 
 test('the per-route table and the staleness tile use the SAME statistic', async () => {
@@ -380,8 +391,7 @@ test('a route whose tail could not be merged shows no tail, rather than 0.00×',
 test('the staleness trend charts the median once the plugin buckets it', async () => {
 	const ctx = await ready();
 	const text = textOf(ctx);
-	assert.match(text, /p95mean÷ cadence|p95median÷ cadence/, 'the legend should name the two lines');
-	assert.match(text, /the p95 and the median/);
+	assert.match(text, /p95median÷ cadence/, 'the legend should name the two lines, median included');
 	assert.doesNotMatch(text, /predates per-bucket medians/);
 });
 
@@ -441,26 +451,27 @@ test('net offload subtracts every origin request this system made; gross subtrac
 test('the KPI strip carries gross AND net, and says what the net figure leaves out', async () => {
 	const ctx = await ready();
 	const text = textOf(ctx);
-	assert.match(text, /Origin offload · gross/);
+	const all = everything(ctx);
+	assert.match(text, /Offload · gross/);
 	assert.match(text, /74%/);
-	assert.match(text, /Origin offload · net/);
+	assert.match(text, /Offload · net/);
 	assert.match(text, /55%/);
-	// The fifth term is stated on the tile, on the panel's own tile, and in the note — never
+	// The fifth term is stated on the tile, on the panel's own tile, and in its help — never
 	// multiplied in as a guess.
-	assert.match(text, /before crawler follow-up requests/);
+	assert.match(tileNamed(ctx, 'Offload · net').attributes.title, /crawler follow-up requests are not counted/);
 	assert.match(text, /What the origin actually saw/);
-	assert.match(text, /Crawler follow-up requests/);
+	assert.match(text, /Follow-ups/);
 	assert.match(text, /not measured/);
-	assert.match(text, /1,010 pages were handed to crawlers/);
+	assert.match(text, /1\.0k pages handed to crawlers/);
 	// The omitted term is stated as two-sided: a saving where snapshots carry no scripts, a cost
 	// where they do — never as "the number would only be lower".
-	assert.match(text, /counted on neither side/);
-	assert.match(text, /true net offload for rendering crawlers is HIGHER than shown/);
+	assert.match(all, /counted on neither side/);
+	assert.match(all, /true net offload is higher than shown/);
 	// Every measured term is named with its count.
 	for (const term of ['proxied serves', 'renders', 'change probes', 'sitemap fetches'])
 		assert.match(text, new RegExp(term));
 	// And the lumpiness caveat appears because a pass counter contributed.
-	assert.match(text, /land where a PASS FINISHED/);
+	assert.match(all, /land where a pass FINISHED/);
 });
 
 test('a window with no crawler requests has no net offload — not a 100% one', () => {
@@ -485,7 +496,7 @@ test('a fleet that out-requests its crawlers reads as a NEGATIVE offload, with t
 	// A signed percentage — pct() is for shares of a whole and would have nothing to divide by.
 	assert.match(fmtNet(figure.net), /^-\d+%$/);
 	const text = textOf(ctx);
-	assert.match(text, /The origin saw more requests than the crawlers made/);
+	assert.match(text, /Net offload is negative/);
 	// The gross figure is untouched by renders, which is the whole reason the net one exists.
 	assert.match(text, /74%/);
 });
@@ -494,7 +505,7 @@ test('the net tile cannot narrow to one bot, and says so rather than showing a c
 	const ctx = await ready();
 	ctx.data.bots = ['bingbot'];
 	const text = textOf(ctx);
-	assert.match(text, /before crawler follow-up requests · all bots/);
+	assert.match(tileNamed(ctx, 'Offload · net').textContent, /· all bots/);
 	// Unchanged by the filter: renders, probes and sitemap fetches are not for any one crawler.
 	assert.match(text, /55%/);
 });
@@ -510,8 +521,9 @@ test('nothing reaching the origin is 100% offload, and the follow-up caveat stil
 	const ctx = makeCtx({ analytics });
 	await load(ctx);
 	const text = textOf(ctx);
-	assert.match(text, /100% gross and net alike/);
-	assert.match(text, /500 pages were handed to crawlers/);
+	assert.match(text, /Nothing in this window reached the origin — 100% offload/);
+	// The caveat still stands on that card: the crawler's own follow-up requests are uncounted.
+	assert.match(everything(ctx), /XHR\/fetch calls a rendering crawler/);
 });
 
 // ---- verified: a cache serve through an invalidation ---------------------------
@@ -601,10 +613,10 @@ test('the excluded population is shown, explained, and never silently dropped', 
 	const ctx = await ready();
 	const text = textOf(ctx);
 	assert.match(text, /Not found at origin/);
-	assert.match(text, /100 of the misses \(40%\) were 404 or 410 at the origin/);
+	assert.match(text, /100 of the misses \(40%\) were 404\/410 at the origin/);
 	// The two things that make it actionable: it is not a corpus gap, and it cannot improve.
-	assert.match(text, /not a\s+coverage gap/);
-	assert.match(text, /only a 200 is ever scheduled/);
+	assert.match(text, /not a coverage gap/);
+	assert.match(text, /Only a 200 is\s+ever scheduled/);
 });
 
 test('each verdict says what the origin actually answered', async () => {
@@ -620,8 +632,8 @@ test('a filtered window says the origin columns are all-bots rather than quietly
 	const ctx = await ready();
 	ctx.data.bots = ['bingbot'];
 	const text = textOf(ctx);
-	assert.match(text, /not netted: the origin 404 split is all-bots/);
-	assert.match(text, /origin_fetch carries no bot dimension/);
+	assert.match(text, /incl\. origin 404s \(filtered\)/);
+	assert.match(text, /origin_fetch has no bot dimension/);
 });
 
 test('the serve tile carries a rate, so two ranges can be compared at all', async () => {
@@ -631,7 +643,7 @@ test('the serve tile carries a rate, so two ranges can be compared at all', asyn
 
 test('a negative-age discard is surfaced, not silently missing from the distribution', async () => {
 	const ctx = await ready();
-	assert.match(textOf(ctx), /NEGATIVE age/);
+	assert.match(textOf(ctx), /negative age and were dropped — cross-node clock skew/);
 });
 
 test('a passthrough route is labelled and its miss rate is NOT flagged', async () => {
@@ -658,7 +670,7 @@ test('a prerendered route past its own cadence IS flagged, with the ratio', asyn
 
 test('serves that matched no route at all are called out', async () => {
 	const ctx = await ready();
-	assert.match(textOf(ctx), /matched no route at all/);
+	assert.match(textOf(ctx), /of serves matched no route/);
 });
 
 // ---- the bot filter ----------------------------------------------------------
@@ -685,7 +697,7 @@ test('a filtered view narrows what CAN be narrowed and says "all bots" where it 
 	// page_age for bingbot is 12h against the 6h default — the per-route cadence cannot apply,
 	// because page_age carries the bot and not the route. Both facts are stated.
 	assert.match(text, /2\.00×/);
-	assert.match(text, /a per-route cadence cannot be applied to a bot-filtered window/);
+	assert.match(text, /a bot-filtered window has no route/);
 	// Harper's own timing, the status codes and origin_fetch have no bot dimension.
 	assert.match(text, /all bots/);
 });
@@ -745,7 +757,7 @@ test('a payload with no interval in it falls back to absolute age and says why',
 	await load(ctx);
 	const text = textOf(ctx);
 	assert.match(text, /Page age at serve/);
-	assert.match(text, /carries no render interval/);
+	assert.match(text, /No render interval in the payload/);
 });
 
 // ---- the empty and broken windows -------------------------------------------
@@ -794,7 +806,7 @@ test('a gated miss is counted as traffic held out, never as a URL prevented', as
 		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, gated('route', 'Googlebot', 900)] },
 	});
 	await load(ctx);
-	assert.match(textOf(ctx), /not a count of URLs prevented/);
+	assert.match(textOf(ctx), /not URLs prevented/);
 });
 
 test('the bot filter narrows the gate panel, because discovery_gated carries the bot', async () => {
@@ -826,7 +838,7 @@ test('a deployment with no gate configured is told what the gate is for, not sho
 	await load(plain);
 	const text = textOf(plain);
 	assert.match(text, /not configured/);
-	assert.match(text, /crawlers walk novel combinations into permanent render load/);
+	assert.match(text, /unbounded render load/);
 	assert.ok(ctx);
 });
 
@@ -835,7 +847,7 @@ test('a configured gate that refused nothing says so, rather than reading as unc
 	const ctx = await ready();
 	const text = textOf(ctx);
 	assert.match(text, /1 route gated/);
-	assert.match(text, /refused nothing in this window/);
+	assert.match(text, /refused nothing in this range/);
 });
 
 // ---- the raw-document cache -------------------------------------------------
@@ -892,7 +904,7 @@ test('a raw serve is cache-served and counts toward offload, but is never a fres
 	// feature started working.
 	assert.match(text, /Cache-served/);
 	assert.match(text, /70%/, 'hit + raw');
-	assert.match(text, /raw documents, not snapshots/, 'the split is named, never silently folded in');
+	assert.match(text, /30% raw documents/, 'the split is named, never silently folded in');
 	// And a raw serve has no cadence to be late against, so it must not read as a coverage or
 	// cadence problem in the non-hit taxonomy.
 	const rows = notHitRows([combo('bot_serve', 'raw', 'raw', 'googlebot', 300)]);
@@ -922,8 +934,8 @@ test('`stored-unshared` is counted as a STORE, not as a refusal', async () => {
 	// 150 of 160 stored, so the store rate is 94% and the refusals are the 10 that really were.
 	assert.match(text, /94%/, 'counted as stored');
 	assert.doesNotMatch(text, /an outcome this console does not know about/);
-	assert.match(text, /kept despite the origin marking them personal/, 'the assumption is surfaced');
-	assert.match(text, /CENSUS/i, 'and framed as a census, not an alarm — it is pinned at 100% by construction');
+	assert.match(text, /150 kept as unshared/, 'the assumption is surfaced');
+	assert.match(text, /census, not an alarm/, 'and framed as a census — it is pinned at 100% by construction');
 });
 
 test('the raw-cache panel leads with the refusals, because a silent route looks like a disabled one', async () => {
@@ -954,4 +966,89 @@ test('a deployment with the raw cache off is told what it is for, not shown an e
 	assert.match(text, /Raw-document cache/);
 	assert.match(text, /render\.raw\.enabled/, 'the capability is described, with the switch that turns it on');
 	assert.doesNotMatch(text, /Refused/, 'no chart of zeroes for a subsystem nobody enabled');
+});
+
+// ---- by instance ---------------------------------------------------------------
+//
+// The cluster total hides the failure a load-balanced deployment actually has: traffic that is not
+// balanced. These pin that the per-node split is shown from the merge's per-node buckets, that a
+// node far from an even share is flagged, and that node scope says where to find the comparison.
+
+const nodeEntry = (node, serves, cached, renders) => ({
+	node,
+	hostname: `${node}:9926`,
+	rangeMs: HOUR,
+	totals: [],
+	buckets: [
+		{
+			metric: 'bot_serve',
+			path: 'cache',
+			method: 'hit',
+			count: cached,
+			counts: new Array(BUCKETS).fill(cached / BUCKETS),
+		},
+		{
+			metric: 'bot_serve',
+			path: 'origin',
+			method: 'miss',
+			count: serves - cached,
+			counts: new Array(BUCKETS).fill((serves - cached) / BUCKETS),
+		},
+		{
+			metric: 'render',
+			path: 'outcome',
+			method: 'rendered',
+			count: renders,
+			counts: new Array(BUCKETS).fill(renders / BUCKETS),
+		},
+	],
+});
+
+const clusterAnalytics = {
+	...ANALYTICS,
+	sources: { mode: 'merged', answered: 3, configured: 3, complete: true, nodes: [] },
+	byNode: [
+		nodeEntry('node-b', 6000, 5400, 900),
+		nodeEntry('node-a', 3000, 2700, 900),
+		nodeEntry('node-c', 3000, 900, 900),
+	],
+};
+
+test('by instance: every node gets a row and a line, and a node far from an even share is flagged', async () => {
+	const ctx = makeCtx({ analytics: clusterAnalytics });
+	await load(ctx);
+	const card = find(draw(ctx), (n) => n.attributes?.class === 'card' && n.textContent.startsWith('By instance'));
+	assert.ok(card, 'expected the By instance card under cluster scope');
+	const rows = find(card, (n) => n.tagName === 'TBODY').children;
+	// Sorted by hostname, not by traffic, so each node keeps its line colour between refreshes.
+	assert.deepEqual(
+		rows.map((tr) => tr.children[0].textContent),
+		['node-a', 'node-b', 'node-c']
+	);
+	const b = rows[1];
+	assert.match(b.textContent, /50%/, 'node-b carries 6,000 of 12,000');
+	assert.ok(
+		find(b, (n) => n.attributes?.class === 'pill warn'),
+		'1.5× an even split is the imbalance worth seeing'
+	);
+	assert.equal(
+		find(rows[0], (n) => n.attributes?.class === 'pill warn'),
+		null,
+		'0.75× is within normal weighting'
+	);
+	// A cold cache on one node shows as its own cache-served share.
+	assert.match(rows[2].textContent, /30%/);
+});
+
+test('by instance: node scope points at the picker instead of drawing a one-node comparison', async () => {
+	const ctx = await ready();
+	assert.match(textOf(ctx), /pick “all nodes” to compare instances/);
+});
+
+test('by instance: under a bot filter the panel says it is all bots — its series carry no bot', async () => {
+	const ctx = makeCtx({ analytics: clusterAnalytics });
+	await load(ctx);
+	ctx.data.bots = ['bingbot'];
+	const card = find(draw(ctx), (n) => n.attributes?.class === 'card' && n.textContent.startsWith('By instance'));
+	assert.match(card.textContent, /all bots/);
 });

@@ -17,10 +17,14 @@
  *     rather than stealing a meaning.
  *
  * Every multi-series chart gets a legend; single-series charts are named by their card title.
- * Hover detail rides native `title` tooltips — same affordance the rest of the console uses.
+ *
+ * HOVER IS A CROSSHAIR, NOT A HIT TARGET. Native `title` tooltips on per-bucket cells meant landing
+ * the pointer on a 6px sliver and waiting a second for the browser; one listener over the whole
+ * plot now maps the pointer's x to the nearest bucket and shows every series at that instant,
+ * immediately (see `hoverLayer`).
  */
 
-import { el } from './ui.js';
+import { el, num } from './ui.js';
 
 // ---- palette --------------------------------------------------------------
 
@@ -158,6 +162,90 @@ const clock = (ms) => {
 	const d = new Date(ms);
 	return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 };
+
+/** A bucket's span, for tooltip headers: "13:02–13:04". */
+const span = (data, i) => `${clock(data.startMs + i * data.bucketMs)}–${clock(data.startMs + (i + 1) * data.bucketMs)}`;
+
+// ---- hover ------------------------------------------------------------------
+
+/** The one floating tooltip, created on first hover and shared by every chart. */
+let tip = null;
+const tipNode = () => {
+	if (!tip) {
+		tip = el('div', { 'cls': 'ctip', 'role': 'tooltip', 'aria-hidden': 'true' });
+		document.body.appendChild(tip);
+	}
+	return tip;
+};
+
+function showTip(event, header, rows, footer) {
+	const node = tipNode();
+	node.textContent = '';
+	node.appendChild(el('div', { cls: 'ctip-head', text: header }));
+	for (const row of rows) {
+		node.appendChild(
+			el('div', { cls: `ctip-row${row.strong ? ' strong' : ''}` }, [
+				row.color ? el('span', { cls: 'swatch', style: { background: row.color } }) : el('span', { cls: 'swatch' }),
+				el('span', { cls: 'ctip-label', text: row.label }),
+				el('span', { cls: 'ctip-value', text: row.value }),
+			])
+		);
+	}
+	if (footer) node.appendChild(el('div', { cls: 'ctip-foot', text: footer }));
+	node.style.display = 'block';
+	// Beside the pointer, flipped to the left near the viewport's right edge so it never clips.
+	const pad = 14;
+	const { innerWidth, innerHeight } = window;
+	const box = node.getBoundingClientRect();
+	let left = event.clientX + pad;
+	if (left + box.width > innerWidth - 8) left = event.clientX - box.width - pad;
+	let top = event.clientY + pad;
+	if (top + box.height > innerHeight - 8) top = innerHeight - box.height - 8;
+	node.style.left = `${Math.max(8, left)}px`;
+	node.style.top = `${Math.max(8, top)}px`;
+}
+
+export const hideTip = () => {
+	if (tip) tip.style.display = 'none';
+};
+
+/**
+ * The hover surface for a time chart: covers the plot, turns the pointer's x into a bucket index,
+ * draws a crosshair (a band for bars, a hairline for lines) and fills the shared tooltip.
+ *
+ * `rowsAt(i)` returns `{ rows, footer }` — rows are `{ label, value, color, strong }`. `mode` picks
+ * the geometry: bars own a slot each; a line's points sit at the slot EDGES (first point at the
+ * left edge, last at the right), so it snaps to the nearest point instead.
+ */
+export function hoverLayer(data, rowsAt, { mode = 'bars' } = {}) {
+	const n = data.bucketCount;
+	const cross = el('div', { cls: `xhair ${mode}` });
+	const layer = el('div', { cls: 'hover' }, [cross]);
+	const indexAt = (event) => {
+		const box = layer.getBoundingClientRect();
+		const f = Math.min(0.9999, Math.max(0, (event.clientX - box.left) / Math.max(1, box.width)));
+		return { i: mode === 'line' ? Math.round(f * (n - 1)) : Math.floor(f * n), width: box.width };
+	};
+	layer.addEventListener('mousemove', (event) => {
+		if (!n) return;
+		const { i, width } = indexAt(event);
+		if (mode === 'line') {
+			cross.style.left = `${(i / Math.max(1, n - 1)) * width}px`;
+			cross.style.width = '1px';
+		} else {
+			cross.style.left = `${(i / n) * width}px`;
+			cross.style.width = `${width / n}px`;
+		}
+		cross.style.display = 'block';
+		const { rows, footer } = rowsAt(i);
+		showTip(event, span(data, i), rows, footer);
+	});
+	layer.addEventListener('mouseleave', () => {
+		cross.style.display = 'none';
+		hideTip();
+	});
+	return layer;
+}
 
 // ---- payload helpers -------------------------------------------------------
 //
@@ -305,7 +393,7 @@ export const legend = (items) =>
  * order with 2px gaps so segment boundaries survive adjacent same-lightness colors. Each
  * column's tooltip carries the full breakdown — the table view for people who need numbers.
  */
-export function stackedBars(data, keys, stacks, colorOf, { format = fmtCount } = {}) {
+export function stackedBars(data, keys, stacks, colorOf, { format = fmtCount, share = true } = {}) {
 	const bucketCount = data.bucketCount;
 	const totals = new Array(bucketCount).fill(0);
 	for (const key of keys) for (let i = 0; i < bucketCount; i++) totals[i] += stacks.get(key)[i];
@@ -313,14 +401,11 @@ export function stackedBars(data, keys, stacks, colorOf, { format = fmtCount } =
 
 	const columns = [];
 	for (let i = 0; i < bucketCount; i++) {
-		const t = data.startMs + i * data.bucketMs;
-		const lines = [`${clock(t)} — ${format(totals[i])}`];
 		const segments = [];
 		// Bottom-up: column-reverse in CSS, so append biggest (first key) first.
 		for (const key of keys) {
 			const v = stacks.get(key)[i];
 			if (v > 0) {
-				lines.push(`${key}: ${format(v)}`);
 				segments.push(
 					el('div', {
 						cls: 'seg',
@@ -329,10 +414,29 @@ export function stackedBars(data, keys, stacks, colorOf, { format = fmtCount } =
 				);
 			}
 		}
-		columns.push(el('div', { cls: 'col', title: lines.join('\n') }, segments));
+		columns.push(el('div', { cls: 'col' }, segments));
 	}
 
-	return el('div', null, [el('div', { cls: 'tchart' }, columns), timeAxis(data)]);
+	// Biggest first in the tooltip — the reading order of "what was this minute made of" — with
+	// each part's share of the column, which is the number a stacked bar makes you estimate by eye.
+	const rowsAt = (i) => {
+		const total = totals[i];
+		const rows = keys
+			.map((key) => ({ key, v: stacks.get(key)[i] }))
+			.filter(({ v }) => v > 0)
+			.sort((a, b) => b.v - a.v)
+			.map(({ key, v }) => ({
+				label: key,
+				value: share && total > 0 ? `${format(v)}  ${Math.round((v / total) * 100)}%` : format(v),
+				color: colorOf(key),
+			}));
+		return { rows: [...rows, { label: 'total', value: format(total), strong: true }] };
+	};
+
+	return el('div', null, [
+		el('div', { cls: 'plot' }, [el('div', { cls: 'tchart' }, columns), hoverLayer(data, rowsAt)]),
+		timeAxis(data),
+	]);
 }
 
 /**
@@ -409,22 +513,59 @@ export function lineChart(data, series, { format = fmtMs, band } = {}) {
 		flush();
 	}
 
-	// Hover layer: one cell per bucket carrying the tooltip (hit target wider than any mark).
-	const cells = [];
-	for (let i = 0; i < bucketCount; i++) {
-		const lines = [clock(data.startMs + i * data.bucketMs)];
-		for (const s of series) lines.push(`${s.label}: ${format(s.points[i])}`);
-		cells.push(el('div', { cls: 'cell', title: lines.join('\n') }));
-	}
+	const rowsAt = (i) => ({
+		rows: series.map((s) => ({ label: s.label, value: format(s.points[i]), color: s.color })),
+	});
 
 	return el('div', null, [
 		el('div', { cls: 'tchart-wrap' }, [
 			svg,
-			el('div', { cls: 'hover-cells' }, cells),
 			el('span', { cls: 'ymax mono', text: format(max) }),
+			hoverLayer(data, rowsAt, { mode: 'line' }),
 		]),
 		timeAxis(data),
 	]);
+}
+
+/**
+ * A sparkline: the trend of one series, no axes, for a tile or a table cell. Gaps stay gaps (null
+ * is absence, not zero). `min` pins the baseline — most of what the console sparks (rates, CPU,
+ * lag) reads wrong on an auto-scaled floor, where a 2% wiggle fills the whole box.
+ */
+export function spark(points, { color = SERIES[0], min = 0, max: maxIn, height = 26 } = {}) {
+	const ns = 'http://www.w3.org/2000/svg';
+	const W = 100;
+	const finite = points.filter((p) => Number.isFinite(p));
+	const svg = document.createElementNS(ns, 'svg');
+	svg.setAttribute('viewBox', `0 0 ${W} ${height}`);
+	svg.setAttribute('preserveAspectRatio', 'none');
+	svg.setAttribute('class', 'spark');
+	svg.setAttribute('aria-hidden', 'true');
+	if (finite.length < 2) return svg;
+	const lo = Math.min(min ?? Math.min(...finite), ...finite);
+	const hi = Math.max(maxIn ?? -Infinity, ...finite);
+	const range = hi - lo || 1;
+	const x = (i) => (i / Math.max(1, points.length - 1)) * W;
+	const y = (v) => height - 2 - ((v - lo) / range) * (height - 4);
+	let d = '';
+	let pen = false;
+	points.forEach((v, i) => {
+		if (!Number.isFinite(v)) {
+			pen = false;
+			return;
+		}
+		d += `${pen ? 'L' : 'M'}${x(i).toFixed(2)},${y(v).toFixed(2)}`;
+		pen = true;
+	});
+	const path = document.createElementNS(ns, 'path');
+	path.setAttribute('d', d);
+	path.setAttribute('fill', 'none');
+	path.setAttribute('stroke', color);
+	path.setAttribute('stroke-width', '1.5');
+	path.setAttribute('vector-effect', 'non-scaling-stroke');
+	path.setAttribute('stroke-linejoin', 'round');
+	svg.appendChild(path);
+	return svg;
 }
 
 /** Ranked horizontal bars — magnitude + identity for a nominal list (bots, reasons, routes). */
@@ -449,23 +590,30 @@ export function barList(rows, { format = fmtCount, color = SERIES[0], max: maxIn
 	);
 }
 
-/** Sparse time labels under a chart: first, middle, last. */
+/** Five time labels under a chart, evenly spaced across the window. */
 function timeAxis(data) {
-	const at = (i) => clock(data.startMs + i * data.bucketMs);
-	return el('div', { cls: 'taxis mono' }, [
-		el('span', { text: at(0) }),
-		el('span', { text: at(Math.floor(data.bucketCount / 2)) }),
-		el('span', { text: at(data.bucketCount) }),
-	]);
+	const ticks = [0, 0.25, 0.5, 0.75, 1];
+	return el(
+		'div',
+		{ cls: 'taxis mono' },
+		ticks.map((f) => el('span', { text: clock(data.startMs + f * data.bucketCount * data.bucketMs) }))
+	);
 }
 
-/** Segmented single-choice control. `items`: `[{ label, value, title }]`. */
+/** Segmented single-choice control. `items`: `[{ label, value, title, disabled }]`. */
 export function segmented(items, current, onPick) {
 	return el(
 		'div',
 		{ cls: 'segctl', role: 'group' },
-		items.map(({ label, value, title }) =>
-			el('button', { cls: value === current ? 'on' : '', text: label, title, onclick: () => onPick(value) })
+		items.map(({ label, value, title, disabled }) =>
+			el('button', {
+				'cls': value === current ? 'on' : '',
+				'text': label,
+				title,
+				disabled,
+				'aria-pressed': value === current ? 'true' : 'false',
+				'onclick': () => value !== current && onPick(value),
+			})
 		)
 	);
 }
@@ -522,15 +670,10 @@ export function scanFooter(data) {
 	if (data.sources?.mode === 'merged') parts.push(`${data.sources.answered} nodes merged`);
 	else if (data.sources?.mode === 'shared') parts.push(`${data.sources.servedBy} (${data.sources.note})`);
 	else parts.push(data.scope === 'cluster' ? 'cluster-wide (analytics replicate)' : `this node (${data.node})`);
-	if (data.scan) {
+	if (Number.isFinite(data.scan?.kept) && Number.isFinite(data.scan?.scanned)) {
 		parts.push(
 			`${scans === 1 ? 'one scan' : `${scans} scans`}: ${data.scan.kept.toLocaleString()} of ` +
 				`${data.scan.scanned.toLocaleString()} rows in ${scans === 1 ? '' : '≤'}${data.scan.ms}ms`
-		);
-	}
-	if (data.truncated) {
-		parts.push(
-			`hit the ${data.scan.cap.toLocaleString()}-row cap — covers ${clock(data.coveredFromMs)}–${clock(data.coveredToMs)} only`
 		);
 	}
 	parts.push(
@@ -538,8 +681,65 @@ export function scanFooter(data) {
 			? `cached ${Math.round(data.cacheAgeMs / 1000)}s ago`
 			: 'fresh'
 	);
-	return el('span', { cls: 'muted mono', text: parts.join(' · ') });
+	// The one part that changes what the numbers mean stays visible and loud; the rest is cost
+	// accounting, which is worth stating and not worth shouting.
+	return el('span', { cls: 'scan-foot-text' }, [
+		data.truncated &&
+			el('span', {
+				cls: 'pill warn',
+				text: `row cap hit — covers ${clock(data.coveredFromMs)}–${clock(data.coveredToMs)} only`,
+				title: `The scan stopped at ${num(data.scan?.cap)} rows and shed the oldest end of the window.`,
+			}),
+		el('span', { cls: 'muted mono', text: parts.join(' · ') }),
+	]);
 }
+
+/**
+ * The per-bucket totals of one metric, filtered — a single series for a line chart.
+ * `values` as in stackBy: sum mean × count rather than emits.
+ */
+export function bucketTotals(combos, bucketCount, { values = false } = {}) {
+	const out = new Array(bucketCount).fill(0);
+	for (const combo of combos) {
+		for (let i = 0; i < combo.counts.length && i < bucketCount; i++) {
+			if (!values) out[i] += combo.counts[i];
+			else if (Number.isFinite(combo.means?.[i]) && combo.counts[i] > 0) out[i] += combo.means[i] * combo.counts[i];
+		}
+	}
+	return out;
+}
+
+/**
+ * The nodes of a merged analytics payload, each with its own per-bucket series (see
+ * `perNodeBuckets` in util/aggregate.js). Empty under node scope, and for a console talking to a
+ * merge that predates per-node buckets — callers show a hint rather than an empty chart.
+ */
+export const nodeEntries = (data) =>
+	(data?.byNode ?? [])
+		.filter((entry) => Array.isArray(entry.buckets))
+		.map((entry) => ({ ...entry, label: String(entry.node ?? entry.hostname ?? '?').replace(/:\d+$/, '') }))
+		.sort((a, b) => a.label.localeCompare(b.label));
+
+/** One node's per-bucket total of a metric, optionally filtered. */
+export const nodeSeries = (entry, bucketCount, metric, filter) =>
+	bucketTotals(
+		entry.buckets.filter((s) => s.metric === metric && (!filter || filter(s))),
+		bucketCount
+	);
+
+/**
+ * Identity colour for a node, by its position in the sorted node list. Four validated slots, then
+ * gray: past four nodes a per-node line chart has stopped being readable anyway, and the table
+ * beside it carries every node.
+ */
+export const nodeColor = (index) => SERIES[index] ?? 'var(--fg-3)';
+
+/** Per-bucket counts as a per-minute RATE, so two ranges with different bucket widths compare. */
+export const perMinute = (counts, bucketMs) => counts.map((c) => (Number.isFinite(c) ? c / (bucketMs / 60_000) : null));
+
+/** A rate for tooltips and axes: one decimal under 10, so a quiet crawl does not round to 0. */
+export const fmtRate = (v) =>
+	v === null || v === undefined || !Number.isFinite(v) ? '—' : v < 10 ? `${v.toFixed(1)}/min` : `${fmtCount(v)}/min`;
 
 /**
  * What a payload's numbers actually cover, for card titles and eyebrows: "all N nodes", or the
@@ -565,12 +765,11 @@ export const windowEmpty = (data) => !data?.series?.length;
 
 /** Shared empty-state copy for a window with no rows. */
 export const emptyNote = (what, data) =>
-	el('div', { cls: 'note' }, [
-		`No ${what} rows in this window on ${isMerged(data) ? 'any node' : 'this node'}. Either no matching traffic `,
-		'arrived, the window is too narrow, or analytics is off (',
-		el('code', { text: 'analytics.enabled' }),
-		' gates recording). Analytics rows are node-local; a cluster view sums every node’s own slice.',
-	]);
+	el('div', {
+		cls: 'empty',
+		text: `No ${what} data in this window${isMerged(data) ? ' on any node' : ''}.`,
+		title: 'No matching traffic arrived, the range is too narrow, or analytics.enabled is off.',
+	});
 
 // ---- origin load: the net offload arithmetic ---------------------------------
 //

@@ -18,7 +18,7 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render } = await import('../src/admin/views/sitemaps.js');
+const { load, render, meta } = await import('../src/admin/views/sitemaps.js');
 
 const ROOT = 'https://example.com/sitemap-index.xml';
 const CHILD = 'https://example.com/sitemap-products-1.xml';
@@ -115,10 +115,10 @@ const CHILD_DETAIL = {
 	limit: 50,
 };
 
-function makeCtx({ analytics = ANALYTICS } = {}) {
+function makeCtx({ analytics = ANALYTICS, list = async () => ({ ok: true, body: LIST }) } = {}) {
 	const views = {};
 	const scratch = (id) => (views[id] ??= {});
-	const calls = { posts: [], reloads: 0 };
+	const calls = { gets: [], posts: [], reloads: 0, order: [] };
 	const ctx = {
 		calls,
 		scratch,
@@ -126,17 +126,23 @@ function makeCtx({ analytics = ANALYTICS } = {}) {
 		get data() {
 			return scratch('sitemaps');
 		},
-		async get(route) {
-			if (route === 'sitemaps') return { ok: true, body: LIST };
+		async get(route, query) {
+			calls.gets.push({ route, query });
+			calls.order.push(`get ${route}`);
+			if (route === 'sitemaps') return list();
 			if (route === 'analytics') return { ok: true, body: analytics };
 			return { ok: true, body: null };
 		},
 		async post(route, body) {
 			calls.posts.push({ route, body });
+			calls.order.push(`post ${route}`);
 			if (route !== 'sitemap') return { ok: true, body: {} };
 			if (body.url === ROOT) return { ok: true, body: INDEX_DETAIL };
 			if (body.url === CHILD) return { ok: true, body: CHILD_DETAIL };
 			return { ok: false, status: 404, body: { error: `No sitemap stored under ${body.url}` } };
+		},
+		async run(fn) {
+			return fn();
 		},
 		render() {},
 		async reload() {
@@ -271,7 +277,83 @@ test('zero 304s across a day of walks is reported as the rollout not working', a
 test('a window with no finished walk says so rather than reading as a dead scheduler', async () => {
 	const ctx = makeCtx({ analytics: { ...ANALYTICS, series: [] } });
 	await load(ctx);
+	const tree = draw(ctx);
+	assert.match(tree.textContent, /Walk activity — node node-a, last 24h/);
+	assert.match(tree.textContent, /No sitemap walk data in this window/);
+	// Why it is empty is one click away, not a paragraph on the page.
+	const help = find(tree, (n) => n.attributes?.class === 'help');
+	assert.ok(help, 'expected the explanation behind the help toggle');
+	assert.match(help.textContent, /once per FINISHED walk/);
+	assert.match(help.textContent, /no walk completed/);
+});
+
+// ---- the redesign: shell-owned header, fixed window, concurrent loads ----------------------
+
+test('the view has no header of its own, but keeps the walk-triggering buttons', async () => {
+	const ctx = await ready();
+	const tree = draw(ctx);
+	assert.equal(meta.crumb, undefined);
+	// The walk window is a daily pass — this view deliberately does not follow the global range.
+	assert.ok(!meta.ranged);
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'view-head'),
+		null
+	);
+	// "Refresh all" and "Refresh now" run walks (a POST), so they are actions and stay; the shell owns
+	// only the re-read.
+	assert.equal(
+		find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'Refresh'),
+		null
+	);
+	linkSaying(tree, 'Refresh all').fire('click');
+	assert.deepEqual(ctx.calls.posts.at(-1), { route: 'sitemap-refresh', body: {} });
+	linkSaying(tree, 'Refresh now').fire('click');
+	assert.deepEqual(ctx.calls.posts.at(-1), { route: 'sitemap-refresh', body: { url: ROOT } });
+	assert.match(tree.textContent, /last full pass 1h ago/);
+});
+
+test('the walk counters are read over a fixed 24h window, not the global range', async () => {
+	const ctx = await ready();
+	const analytics = ctx.calls.gets.find((call) => call.route === 'analytics');
+	assert.deepEqual(analytics.query, { range: 24 * HOUR });
+});
+
+test('the 24h scan does not wait for the list, and a known selection loads beside it', async () => {
+	let release;
+	const pending = new Promise((resolve) => (release = resolve));
+	const ctx = makeCtx({ list: () => pending.then(() => ({ ok: true, body: LIST })) });
+	ctx.data.selected = CHILD;
+	const loading = load(ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	// The list has not answered, and both the scan and the selected sitemap's detail are already out.
+	assert.ok(ctx.calls.order.includes('get analytics'), 'the analytics scan should start with the list');
+	assert.ok(
+		ctx.calls.posts.some((call) => call.route === 'sitemap' && call.body.url === CHILD),
+		'a known selection should not wait for the list'
+	);
+	release();
+	await loading;
+	assert.equal(ctx.data.detail.sitemap.url, CHILD);
+	assert.equal(
+		ctx.calls.posts.filter((call) => call.route === 'sitemap').length,
+		1,
+		'and the detail is not fetched twice'
+	);
+});
+
+test('with no selection yet, the detail waits for the list to name the first root', async () => {
+	const ctx = await ready();
+	assert.deepEqual(
+		ctx.calls.posts.filter((call) => call.route === 'sitemap').map((call) => call.body.url),
+		[ROOT]
+	);
+	assert.ok(ctx.calls.order.indexOf('get sitemaps') < ctx.calls.order.indexOf('post sitemap'));
+});
+
+test('a failed list is an error, never "no sitemaps"', async () => {
+	const ctx = makeCtx({ list: async () => ({ ok: false, status: 503, body: { error: 'upstream down' } }) });
+	await load(ctx);
 	const text = textOf(ctx);
-	assert.match(text, /Walk activity/);
-	assert.match(text, /no walk completed inside the window|emitted once per FINISHED walk/i);
+	assert.match(text, /upstream down/);
+	assert.doesNotMatch(text, /No sitemaps registered/);
 });
