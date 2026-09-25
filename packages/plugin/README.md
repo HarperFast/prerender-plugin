@@ -780,7 +780,10 @@ this plugin's resources all set `loadAsInstance = false`.
   page cache; `'freemem'` is the off-Linux fallback, which does not), `swapUsed`/`swapTotal`
   (null without `/proc/meminfo`), `loadavg`, `uptimeSec` (the Harper process — it resets on a
   restart), `pluginVersion`, `harperVersion` (null when it cannot be determined) and
-  `nodeVersion`. Memory and load are the host kernel's figures, not a container's cgroup limits.
+  `nodeVersion`. Memory and load are the host kernel's figures; where the process runs under a cgroup
+  memory limit below host RAM, `memoryLimit` and `memoryLimitAvailable` (Node 22+'s
+  `process.constrainedMemory()` / `availableMemory()`) carry the container's own ceiling and what is
+  free under it — null when there is no real limit.
 - analytics `system.nodes[]` — Harper's own per-node rows (`resource-usage`,
   `main-thread-utilization`, `utilization`, `storage-volume`; a handful per node per aggregation
   pass), kept from the same walk as the series and bucketed identically: `cpu` (fraction of ONE

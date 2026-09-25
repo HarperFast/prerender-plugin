@@ -55,11 +55,21 @@ function memory() {
 	const swapTotal = finite('SwapTotal');
 	const swapFree = finite('SwapFree');
 	const freemem = memAvailable === null ? safe(() => os.freemem()) : null;
+	// /proc/meminfo and os.totalmem() describe the HOST. In a container with a cgroup memory limit the
+	// process can be near its own ceiling while the host looks roomy, so report that ceiling too: Node's
+	// cgroup-aware readers (22+). An unconstrained process reports 0, or on some cgroup setups a
+	// near-2^63 sentinel — anything not below host RAM is not a real limit, and reads as null.
+	const total = safe(() => os.totalmem());
+	const limit = safe(() => process.constrainedMemory?.());
+	const memoryLimit = Number.isFinite(limit) && limit > 0 && (!Number.isFinite(total) || limit < total) ? limit : null;
+	const underLimit = memoryLimit !== null ? safe(() => process.availableMemory?.()) : null;
 	return {
 		availableMemory: memAvailable ?? freemem,
 		availableMemorySource: memAvailable !== null ? 'meminfo' : freemem !== null ? 'freemem' : null,
 		swapUsed: swapTotal !== null && swapFree !== null ? swapTotal - swapFree : null,
 		swapTotal,
+		memoryLimit,
+		memoryLimitAvailable: Number.isFinite(underLimit) ? underLimit : null,
 	};
 }
 

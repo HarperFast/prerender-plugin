@@ -68,6 +68,8 @@ test('hostInfo: every field present, typed or null, and it never throws without 
 		'harperVersion',
 		'hostname',
 		'loadavg',
+		'memoryLimit',
+		'memoryLimitAvailable',
 		'nodeVersion',
 		'pluginVersion',
 		'swapTotal',
@@ -94,5 +96,29 @@ test('hostInfo: every field present, typed or null, and it never throws without 
 		assert.equal(hostInfo().hostname, 'node-a.example.com');
 	} finally {
 		delete globalThis.server;
+	}
+});
+
+// /proc/meminfo describes the HOST; a container near its cgroup limit would read as roomy. The limit is
+// reported only when it is a real one — below host RAM — and never as a guessed number.
+test('hostInfo: a cgroup memory limit below host RAM is reported with what is free under it', (t) => {
+	const original = { constrained: process.constrainedMemory, available: process.availableMemory };
+	t.after(() => {
+		process.constrainedMemory = original.constrained;
+		process.availableMemory = original.available;
+	});
+
+	process.constrainedMemory = () => 2 * 2 ** 30;
+	process.availableMemory = () => 0.5 * 2 ** 30;
+	const limited = hostInfo();
+	assert.equal(limited.memoryLimit, 2 * 2 ** 30);
+	assert.equal(limited.memoryLimitAvailable, 0.5 * 2 ** 30);
+
+	// Unconstrained: 0, or the near-2^63 sentinel some cgroup setups report — neither is a limit.
+	for (const value of [0, 9_223_372_036_854_771_712, undefined]) {
+		process.constrainedMemory = () => value;
+		const free = hostInfo();
+		assert.equal(free.memoryLimit, null, `constrainedMemory() = ${value}`);
+		assert.equal(free.memoryLimitAvailable, null);
 	}
 });
