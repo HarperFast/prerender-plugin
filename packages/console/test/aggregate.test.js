@@ -1151,3 +1151,120 @@ test('change probe: live progress rides along per node, and only while the pass 
 	});
 	assert.equal(body.byNode.find((row) => row.hostname === 'b.example.com:9926').sweepProgress, null);
 });
+
+// ------------------------------------------------------------------ change probe: nothing dropped
+
+// The cluster view is the console's DEFAULT view, and before console v0.16.0 its merge carried only
+// the fields it knew when it was written: `mode`, `nextAnchoredRunAt`, `stateUpdatedAt` and every
+// counter added since were dropped, and `armedInterval` was read through `Number.isFinite` — so an
+// anchored (or continuous) cluster was reported as "not armed" while every node was sweeping.
+
+test('change probe: an ANCHORED cluster is armed, with its mode and next run, not "not armed"', () => {
+	const anchored = (node, nextRunAt) =>
+		probeBody(node, {
+			mode: 'anchored',
+			sweep: {
+				running: false,
+				armedInterval: 'anchored:00:05|America/Chicago',
+				nextAnchoredRunAt: new Date(nextRunAt).toISOString(),
+				nextRunAt,
+				lastRun: { ...probeStats(), dryRun: true, startedAt: 1000, finishedAt: 2000, error: null },
+			},
+		});
+	const { body } = mergerFor('change-probe')([ok('a', anchored('a', 9_000_000)), ok('b', anchored('b', 8_000_000))]);
+	assert.equal(body.sweep.armedInterval, 'anchored:00:05|America/Chicago');
+	assert.equal(body.sweep.armedIntervalDiverge, false);
+	assert.equal(body.mode, 'anchored');
+	assert.equal(body.modeDiverge, false);
+	assert.equal(body.sweep.nextRunAt, 8_000_000, 'the soonest any node runs');
+	assert.equal(body.sweep.nextAnchoredRunAt, new Date(8_000_000).toISOString());
+});
+
+test('change probe: every node’s own payload rides along whole — including fields the merge has never heard of', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { futureField: { answer: 42 }, stateUpdatedAt: 5 })),
+		ok('b', probeBody('b', { stateUpdatedAt: 7 })),
+	]);
+	assert.equal(body.perNode.length, 2);
+	assert.deepEqual(body.perNode[0].futureField, { answer: 42 });
+	assert.equal(body.perNode[0].hostname, 'a.example.com:9926');
+	assert.equal(body.stateUpdatedAt, 5, 'the stalest node’s state row');
+});
+
+test('change probe: the counters added after the merge was written now sum, and older nodes are named', () => {
+	const newer = (node, over) =>
+		probeBody(node, {
+			sweep: sweepWith({ rebaselined: 10, extended: 3, caughtUp: 4, ignored: 5, outOfScope: 6, queued: 70, ...over }),
+		});
+	const older = probeBody('c', { sweep: sweepWith({ rebaselined: 1, queued: 7 }) });
+	const { body } = mergerFor('change-probe')([ok('a', newer('a')), ok('b', newer('b')), ok('c', older)]);
+	const last = body.sweep.lastRun;
+	assert.equal(last.rebaselined, 21);
+	assert.equal(last.queued, 147);
+	assert.equal(last.extended, 6);
+	assert.equal(last.caughtUp, 8);
+	assert.equal(last.ignored, 10);
+	assert.equal(last.outOfScope, 12);
+	assert.deepEqual(last.unreported.extended, ['c.example.com:9926'], 'a sum over 2 of 3 nodes says so');
+	assert.equal(last.unreported.rebaselined, undefined);
+});
+
+test('change probe: per-slot and per-field counts add leaf by leaf; the guard names where a field is disarmed', () => {
+	const run = (node, over) => probeBody(node, { sweep: sweepWith(over) });
+	const { body } = mergerFor('change-probe')([
+		ok(
+			'a',
+			run('a', {
+				slotChanges: { pdp: { 0: 5, signal: 1 } },
+				fieldMismatch: { pdp: { '2:price': 3 } },
+				fieldGuard: { pdp: { '2:price': { witnessed: 100, disagreed: 90, armed: false } } },
+			})
+		),
+		ok(
+			'b',
+			run('b', {
+				slotChanges: { pdp: { 0: 2, 3: 4 } },
+				fieldMismatch: { pdp: { '2:price': 1 } },
+				fieldGuard: { pdp: { '2:price': { witnessed: 50, disagreed: 1, armed: true } } },
+			})
+		),
+	]);
+	const last = body.sweep.lastRun;
+	assert.deepEqual(last.slotChanges, { pdp: { 0: 7, 3: 4, signal: 1 } });
+	assert.deepEqual(last.fieldMismatch, { pdp: { '2:price': 4 } });
+	assert.deepEqual(last.fieldGuard.pdp['2:price'], {
+		witnessed: 150,
+		disagreed: 91,
+		armed: false,
+		disarmedOn: ['a.example.com:9926'],
+	});
+});
+
+test('change probe: a rolling deploy is not "rules disagree"; a different fingerprint is', () => {
+	const rule = {
+		label: 'price',
+		pathPattern: '^/product/',
+		source: 'request',
+		invalidateScope: 'route:prefix:/product/',
+	};
+	const withPrint = (fingerprint) => ({ rules: [{ ...rule, fingerprint, extract: ['price'], endpoint: null }] });
+	// One node on v0.91.0 (fingerprints), one older: the shared fields agree, so the rules agree.
+	const mixed = mergerFor('change-probe')([ok('a', probeBody('a', withPrint('aaaa'))), ok('b', probeBody('b'))]).body;
+	assert.equal(mixed.rulesDiverge, false);
+	// Both report fingerprints and they differ: an edited extract path the other fields cannot see.
+	const edited = mergerFor('change-probe')([
+		ok('a', probeBody('a', withPrint('aaaa'))),
+		ok('b', probeBody('b', withPrint('bbbb'))),
+	]).body;
+	assert.equal(edited.rulesDiverge, true);
+});
+
+test('change probe: nodes on different modes are a divergence, and the oldest plugin sets the version', () => {
+	const { body } = mergerFor('change-probe')([
+		ok('a', probeBody('a', { mode: 'anchored', statusVersion: 2 })),
+		ok('b', probeBody('b', { mode: 'continuous' })),
+	]);
+	assert.equal(body.mode, null);
+	assert.equal(body.modeDiverge, true);
+	assert.equal(body.statusVersion, 1);
+});

@@ -39,6 +39,9 @@ const ASSETS = new Map([
 	// Shared config-editing behaviour rather than a view. It is imported by every view that owns
 	// settings, so it has to be served even though the router never names it.
 	['views/_configEdit.js', ['views/_configEdit.js', JS]],
+	// The change probe's pure state logic (what each node is doing now, its health flags), imported
+	// by the probe view.
+	['views/_probeState.js', ['views/_probeState.js', JS]],
 	['views/overview.js', ['views/overview.js', JS]],
 	['views/traffic.js', ['views/traffic.js', JS]],
 	['views/queue.js', ['views/queue.js', JS]],

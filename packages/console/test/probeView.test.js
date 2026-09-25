@@ -27,6 +27,23 @@ installDom();
 
 const { el } = await import('../src/admin/ui.js');
 const { load, render } = await import('../src/admin/views/probe.js');
+const { mergerFor } = await import('../src/util/aggregate.js');
+
+/**
+ * A cluster status exactly as the console server builds it: every node's own payload through the
+ * real merge. Hand-built merged fixtures drift from what the merge produces — that drift is how the
+ * cluster view lost `mode` and the anchored schedule without a test noticing.
+ */
+const clusterOf = (...nodes) =>
+	mergerFor('change-probe')(
+		nodes.map(([hostname, body]) => ({
+			origin: `https://${hostname}`,
+			hostname,
+			ok: true,
+			status: 200,
+			body: { ...body, node: hostname },
+		}))
+	).body;
 
 const BUCKETS = 4;
 const HOUR = 3_600_000;
@@ -314,13 +331,7 @@ test('a pass inherits the configured dry run by default, and can be forced to a 
 });
 
 test('under cluster scope the run buttons refuse and say why — a pass is one node’s rate budget', async () => {
-	const ctx = await ready({
-		status: {
-			...STATUS,
-			node: null,
-			sources: { mode: 'merged', answered: 4, configured: 4, complete: true, nodes: [] },
-		},
-	});
+	const ctx = await ready({ status: clusterOf(['node-a', STATUS], ['node-b', STATUS]) });
 	const sweep = button(ctx, 'Sweep (pick a node)');
 	assert.ok(sweep, 'expected the button to name the scope problem rather than being silently inert');
 	assert.equal(sweep.attributes.disabled, '');
@@ -328,19 +339,21 @@ test('under cluster scope the run buttons refuse and say why — a pass is one n
 });
 
 test('a disabled probe names the nodes it is off on — their slice is simply absent from every total', async () => {
+	// Some nodes on, some off: the cluster case. The finding is the nodes that are off.
 	const ctx = await ready({
-		status: {
-			...STATUS,
-			enabled: true,
-			disabledOn: ['node-c'],
-			sources: { mode: 'merged', answered: 4, configured: 4, complete: true, nodes: [] },
-		},
+		status: clusterOf(
+			['node-a', STATUS],
+			['node-b', STATUS],
+			['node-c', { ...STATUS, enabled: false }],
+			['node-d', { ...STATUS, enabled: false }]
+		),
 	});
-	// `enabled` true with a disabledOn list is exactly the cluster case: some nodes have it on.
-	const ctxOff = await ready({ status: { ...STATUS, enabled: false, disabledOn: ['node-c', 'node-d'] } });
-	assert.match(draw(ctxOff).textContent, /is false on node-c, node-d/);
-	assert.match(draw(ctxOff).textContent, /never probed/);
-	assert.ok(draw(ctx));
+	const text = draw(ctx).textContent;
+	assert.match(text, /is false on node-c, node-d/);
+	assert.match(text, /never probed/);
+	// Off everywhere is a state, not a per-node finding.
+	const off = await ready({ status: { ...STATUS, enabled: false } });
+	assert.match(draw(off).textContent, /changeProbe\.enabled is false\. Nothing is probed/);
 });
 
 test('an enabled probe with no rules says no timer is armed rather than showing an idle sweep', async () => {
@@ -352,14 +365,16 @@ test('an enabled probe with no rules says no timer is armed rather than showing 
 
 test('an unswept node is named, because it contributes zero to every figure above', async () => {
 	const ctx = await ready({
-		status: {
-			...STATUS,
-			sweep: { ...STATUS.sweep, unsweptNodes: ['node-b'], lastRun: { ...STATUS.sweep.lastRun, nodes: 3 } },
-		},
+		status: clusterOf(
+			['node-a', STATUS],
+			['node-b', { ...STATUS, sweep: { ...STATUS.sweep, lastRun: null } }],
+			['node-c', STATUS]
+		),
 	});
 	const text = draw(ctx).textContent;
 	assert.match(text, /No sweep has finished on node-b/);
-	assert.match(text, /Oldest of 3 sweeps/);
+	// The sum says how many nodes it covers — two here, not three.
+	assert.match(text, /Σ 2 nodes/);
 });
 
 test('the failure samples are shown, because a failed probe changes nothing and logs nowhere else', async () => {
@@ -373,22 +388,23 @@ test('the status read failing still renders the card that turns the probe on', a
 });
 
 test('one node throwing does not delete the three that swept — both are reported', async () => {
-	// The merge takes the first error it finds across nodes, so an error and a full set of counters
-	// arrive together whenever the cluster is partly healthy. Showing only the error was dropping
-	// three good slices; showing only the counters hid that a quarter of the keyspace was missed.
+	// An error and a full set of counters arrive together whenever the cluster is partly healthy.
+	// Showing only the error was dropping three good slices; showing only the counters hid that a
+	// quarter of the keyspace was missed.
+	const broken = { node: 'node-d', startedAt: 1000, finishedAt: 2000, error: 'read transaction expired' };
 	const ctx = await ready({
-		status: {
-			...STATUS,
-			sweep: {
-				...STATUS.sweep,
-				lastRun: { ...STATUS.sweep.lastRun, nodes: 4, error: 'read transaction expired' },
-			},
-		},
+		status: clusterOf(
+			['node-a', STATUS],
+			['node-b', STATUS],
+			['node-c', STATUS],
+			['node-d', { ...STATUS, sweep: { ...STATUS.sweep, lastRun: broken } }]
+		),
 	});
 	const text = draw(ctx).textContent;
-	assert.match(text, /read transaction expired/);
+	assert.match(text, /Last sweep failed on node-d: read transaction expired/);
 	assert.match(text, /only the passes that did finish/);
 	assert.match(text, /Rows examined/);
+	assert.match(text, /Σ 3 nodes/, 'the three good slices are still there, and the sum says it is three');
 });
 
 test('an errored pass that counted nothing shows the error alone, not a row of dashes', async () => {
@@ -756,32 +772,12 @@ test('an unreadable state row is the loudest thing on the page — the node is u
 });
 
 test('a cluster merge names the nodes whose state was unreadable, and flags them in the node table', async () => {
-	const status = {
-		...STATUS,
-		node: null,
-		scope: 'cluster',
-		sources: { mode: 'merged', complete: true, configured: 2, answered: 2 },
-		stateUnavailableOn: ['node-b'],
-		byNode: [
-			{
-				hostname: 'node-a',
-				enabled: true,
-				dryRun: true,
-				stateAvailable: true,
-				sweepRunning: false,
-				canaryRunning: false,
-			},
-			{
-				hostname: 'node-b',
-				enabled: true,
-				dryRun: true,
-				stateAvailable: false,
-				sweepRunning: false,
-				canaryRunning: false,
-			},
-		],
-	};
-	const ctx = await ready({ status });
+	const ctx = await ready({
+		status: clusterOf(
+			['node-a', { ...STATUS, stateAvailable: true }],
+			['node-b', { ...STATUS, stateAvailable: false, sweep: { running: false, armedInterval: null, lastRun: null } }]
+		),
+	});
 	const text = draw(ctx).textContent;
 	assert.match(text, /could not be read on node-b/);
 	assert.match(text, /state unreadable/);
@@ -793,54 +789,359 @@ test('a plugin without the state row is not accused of one it cannot read', asyn
 });
 
 test('a running sweep says how far it has got, at node scope and summed under the cluster merge', async () => {
-	const node = await ready({
-		status: { ...STATUS, sweep: { ...STATUS.sweep, running: true, progress: { examinedApprox: 24_000 } } },
+	// An OLDER plugin (no statusVersion): rows walked is all a running pass publishes.
+	const running = (examinedApprox) => ({
+		...STATUS,
+		sweep: { ...STATUS.sweep, running: true, progress: { examinedApprox } },
 	});
-	assert.match(draw(node).textContent, /sweep running · ~24,000 rows examined/);
+	const node = await ready({ status: running(24_000) });
+	assert.match(draw(node).textContent, /Sweeping · ~24,000 rows examined/);
 
-	const cluster = await ready({
-		status: {
-			...STATUS,
-			node: null,
-			scope: 'cluster',
-			sources: { mode: 'merged', complete: true, configured: 2, answered: 2 },
-			sweep: {
-				...STATUS.sweep,
-				running: true,
-				runningOn: ['node-a', 'node-b'],
-				progress: [
-					{ hostname: 'node-a', examinedApprox: 10_000 },
-					{ hostname: 'node-b', examinedApprox: 4000 },
-				],
-			},
-			byNode: [
-				{
-					hostname: 'node-a',
-					enabled: true,
-					dryRun: true,
-					sweepRunning: true,
-					sweepProgress: { examinedApprox: 10_000 },
-				},
-				{
-					hostname: 'node-b',
-					enabled: true,
-					dryRun: true,
-					sweepRunning: true,
-					sweepProgress: { examinedApprox: 4000 },
-				},
-			],
-		},
-	});
+	const cluster = await ready({ status: clusterOf(['node-a', running(10_000)], ['node-b', running(4000)]) });
 	const text = draw(cluster).textContent;
-	// Disjoint slices, so the header sums; the node table keeps each node's own count.
-	assert.match(text, /~14,000 rows examined/);
-	assert.match(text, /sweeping · ~10,000 examined/);
-	assert.match(text, /sweeping · ~4,000 examined/);
+	// Disjoint slices, so the summary sums; the node table keeps each node's own count.
+	assert.match(text, /Sweeping on all 2 nodes · ~14,000 rows examined across them/);
+	assert.match(text, /~10,000 rows examined/);
+	assert.match(text, /~4,000 rows examined/);
 });
 
 test('a running sweep with no heartbeat count yet still reads as running, without a made-up number', async () => {
 	const ctx = await ready({ status: { ...STATUS, sweep: { ...STATUS.sweep, running: true, progress: null } } });
 	const text = draw(ctx).textContent;
-	assert.match(text, /sweep running/);
+	assert.match(text, /Sweeping/);
+	assert.match(text, /no heartbeat count yet/);
 	assert.doesNotMatch(text, /rows examined/);
+});
+
+// ---- what the probe is doing NOW (console v0.16.0) -----------------------------------------------
+
+/**
+ * The redesign's contract, executed against the view: the running pass and the last pass that ended
+ * are never shown as one; every time says how old it is; a node on an older plugin says which
+ * numbers it cannot report instead of showing them as zero; and the health flags need no reading
+ * between the lines. `now` here is the real clock, because the view ages everything against the
+ * node's clock carried forward from when the status was read.
+ */
+import { readFileSync } from 'node:fs';
+
+const LIVE = JSON.parse(readFileSync(new URL('./fixtures/change-probe-live-0.83.0.json', import.meta.url)));
+
+/** Shift every epoch-ms `…At` field so a captured payload reads as just captured. */
+const rebase = (value, shift) => {
+	if (Array.isArray(value)) return value.map((v) => rebase(v, shift));
+	if (value && typeof value === 'object') {
+		return Object.fromEntries(
+			Object.entries(value).map(([k, v]) => [
+				k,
+				typeof v === 'number' && /At$/.test(k) && v > 1e12 ? v + shift : rebase(v, shift),
+			])
+		);
+	}
+	return value;
+};
+
+/** The live 0.83.0 capture as a cluster status, plus the config the console would have loaded. */
+const liveCluster = () => {
+	const shift = Date.now() - LIVE.capturedAt;
+	return clusterOf(...LIVE.nodes.map(({ hostname, body }) => [hostname, rebase(body, shift)]));
+};
+const liveConfig = () => {
+	const flat = [];
+	const walk = (value, path) => {
+		if (value && typeof value === 'object' && !Array.isArray(value) && path !== 'changeProbe.rules') {
+			for (const [k, v] of Object.entries(value)) walk(v, `${path}.${k}`);
+		} else flat.push({ path, effective: value });
+	};
+	walk(LIVE.config.changeProbe, 'changeProbe');
+	const children = {};
+	for (const { path } of flat) {
+		const parts = path.split('.').slice(1);
+		let node = children;
+		for (const [i, part] of parts.entries()) {
+			if (i === parts.length - 1) node[part] = { kind: 'option' };
+			else node = (node[part] ??= { children: {} }).children;
+		}
+	}
+	return { schema: { children: { changeProbe: { children } } }, layers: flat };
+};
+
+const v2Settings = {
+	mode: 'anchored',
+	anchorTime: '00:05',
+	anchorTimezone: 'America/Chicago',
+	anchorWindow: 0,
+	ratePerSecond: 10,
+	concurrency: 4,
+	scope: 'all',
+	reprobeAfter: 6 * HOUR,
+	maxTriggersPerSweep: 150_000,
+	trigger: { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 },
+	canary: { interval: 30 * 60_000, count: 500, threshold: 0.7, minSample: 50 },
+};
+
+/** A plugin v0.91.0 payload; `running` puts it four hours into tonight's anchored pass. */
+const v2Body = ({ running = false, over = {} } = {}) => {
+	const now = Date.now();
+	return {
+		...STATUS,
+		statusVersion: 2,
+		serverTime: now,
+		dryRun: false,
+		mode: 'anchored',
+		settings: v2Settings,
+		heartbeat: { intervalMs: 30_000, staleAfterMs: 300_000 },
+		stateAvailable: true,
+		stateUpdatedAt: now - 20_000,
+		rules: [
+			{
+				...STATUS.rules[0],
+				fingerprint: '3fa1c29e',
+				extract: ['product.price.sale', 'product.status'],
+				endpoint: { method: 'GET', path: '/api/product/$1' },
+			},
+		],
+		...over,
+		sweep: {
+			running,
+			current: running
+				? {
+						startedAt: now - 4 * HOUR,
+						heartbeatAt: now - 20_000,
+						stale: false,
+						startedBy: 'anchor',
+						dryRun: false,
+						label: null,
+						phase: 'walking',
+						sliceEstimate: 4000,
+					}
+				: null,
+			progress: running
+				? {
+						examinedApprox: 20_000,
+						examined: 20_111,
+						owned: 5000,
+						matched: 2000,
+						probed: 1999,
+						changed: 77,
+						unchanged: 1800,
+						seeded: 20,
+						failed: 2,
+						throttled: 0,
+						queued: 70,
+						triggered: 66,
+						deferred: 0,
+						throttleLevel: 1,
+						triggerQueueDepth: 4,
+						recentRate: 9.8,
+						phase: 'walking',
+					}
+				: null,
+			lastRun: {
+				...STATUS.sweep.lastRun,
+				dryRun: false,
+				startedBy: 'anchor',
+				changed: 240,
+				// A healthy pass: STATUS's own record carries deferrals and a 10% failure share.
+				deferred: 0,
+				failed: 40,
+				startedAt: now - 20 * HOUR,
+				finishedAt: now - 11 * HOUR,
+				slotChanges: { price: { 0: 200, 1: 60 } },
+				fieldMismatch: { price: { '0:price': 9 } },
+				fieldGuard: { price: { '0:price': { witnessed: 300, disagreed: 4, armed: true } } },
+			},
+			armedInterval: 'anchored:00:05|America/Chicago',
+			nextAnchoredRunAt: new Date(now + 5 * HOUR).toISOString(),
+			nextRunAt: now + 5 * HOUR,
+			nextRunBasis: 'anchor',
+			...over.sweep,
+		},
+		canary: { ...STATUS.canary, lastRun: null, nextRunAt: now + 10 * 60_000, ...over.canary },
+	};
+};
+
+const cardTitled = (ctx, pattern) =>
+	find(draw(ctx), (n) => n.attributes?.class === 'card' && pattern.test(n.children[0]?.textContent ?? ''));
+
+test('mid-pass: the running pass has its own card, and the last completed pass is labelled as the one BEFORE it', async () => {
+	const ctx = await ready({
+		status: clusterOf(['node-a', v2Body({ running: true })], ['node-b', v2Body({ running: true })]),
+	});
+	const current = cardTitled(ctx, /^Current pass — in progress/);
+	assert.ok(current, 'the running pass is shown as itself');
+	assert.match(current.textContent, /partial counts, so far/);
+	assert.match(current.textContent, /the daily anchor/, 'who started it');
+	assert.match(current.textContent, /Changed.*77/s, 'its own changed count');
+	assert.doesNotMatch(current.textContent, /\b240\b/, 'and never the previous pass’s');
+
+	const last = cardTitled(ctx, /^Last completed sweep — the pass BEFORE the one running now/);
+	assert.ok(last, 'the previous pass cannot be read as the running one');
+	assert.match(last.textContent, /previous pass — not the running one/);
+	assert.match(last.textContent, /Changed.*240/s);
+
+	const now = cardTitled(ctx, /^Probe now/);
+	assert.match(now.textContent, /Sweeping on all 2 nodes · ~50% through · last node done ~/);
+	assert.match(now.textContent, /2,000 of ~4,000 matched \(50%\)/);
+	assert.match(now.textContent, /9\.8\/s now/);
+	assert.match(now.textContent, /since \d\d:\d\d UTC \(4h ago\)/);
+});
+
+test('idle anchored node: the state line is the next run, in local and UTC time, with how long until it', async () => {
+	const ctx = await ready({ status: v2Body() });
+	const text = cardTitled(ctx, /^Probe now/).textContent;
+	assert.match(text, /Idle · next sweep .* local · \d\d:\d\d UTC \(in 5h\)/);
+	assert.match(text, /by the daily anchor/);
+	assert.match(text, /last sweep ended 11h ago/);
+	assert.match(text, /No health flags/);
+	assert.equal(cardTitled(ctx, /^Current pass/), null, 'nothing is running, so there is no current-pass card');
+	assert.match(cardTitled(ctx, /^Last completed sweep$/).textContent, /complete/);
+});
+
+test('older plugin (live 0.83.0 capture): armed and anchored, next run computed, missing counters n/a — not zero', async () => {
+	const ctx = await ready({ status: liveCluster(), config: liveConfig() });
+	const tree = draw(ctx);
+	const text = tree.textContent;
+	// The cluster view used to say "not armed" here: the merge dropped the anchored marker.
+	assert.match(text, /daily at 00:05 America\/Chicago/);
+	assert.doesNotMatch(text, /not armed/);
+	assert.match(text, /Idle on all 4 nodes · next sweep .*05:05 UTC/);
+	assert.match(text, /computed here from the anchor setting \(plugin < 0\.91\.0\)/);
+	assert.match(text, /run a plugin older than 0\.91\.0/);
+	// A counter the plugin predates is n/a with the version that added it — and never a 0.
+	const extendedRow = find(tree, (n) => n.tagName === 'TR' && /Compared on appended paths/.test(n.textContent));
+	assert.ok(extendedRow);
+	assert.match(extendedRow.textContent, /n\/a/);
+	assert.doesNotMatch(extendedRow.textContent, /\b0\b/);
+	assert.ok(find(extendedRow, (n) => /added in 0\.86\.0/.test(n.attributes?.title ?? '')));
+	assert.match(text, /Where the origin changed — per extract slot \(not reported\)/);
+	// The flags are exactly what is there.
+	assert.match(text, /Unreadable registry rows\./);
+	assert.match(text, /Origin pushback \(trace\)\./);
+	assert.doesNotMatch(text, /Probe failures/);
+});
+
+test('stale heartbeat while running is flagged; a pass whose heartbeat stopped reads as stalled', async () => {
+	const late = v2Body({ running: true });
+	late.sweep.current.heartbeatAt = Date.now() - 3 * 60_000;
+	const lateText = draw(await ready({ status: late })).textContent;
+	assert.match(lateText, /heartbeat late/);
+	assert.match(lateText, /Heartbeat late\. The running sweep’s heartbeat is late/);
+
+	const dead = v2Body({ running: true });
+	dead.sweep.running = false;
+	dead.sweep.current = { ...dead.sweep.current, heartbeatAt: Date.now() - 12 * 60_000, stale: true };
+	const deadText = draw(await ready({ status: dead })).textContent;
+	assert.match(deadText, /stalled/);
+	assert.match(deadText, /heartbeat stopped/);
+	assert.match(deadText, /presumed dead/);
+	assert.doesNotMatch(deadText, /Idle/);
+});
+
+test('each health flag reaches the page with the nodes it holds on', async () => {
+	const now = Date.now();
+	const sick = v2Body({
+		running: true,
+		over: {
+			sweep: {
+				nextRunAt: now - 10 * 60_000, // the anchor passed while this pass was running
+			},
+		},
+	});
+	Object.assign(sick.sweep.progress, { throttleLevel: 8, triggerQueueDepth: 46_000 });
+	Object.assign(sick.sweep.lastRun, {
+		probed: 1000,
+		failed: 700,
+		rebaselined: 200,
+		deferred: 12,
+		unreadable: 3,
+		fieldGuard: { price: { '0:price': { witnessed: 300, disagreed: 280, armed: false } } },
+	});
+	const text = draw(await ready({ status: clusterOf(['node-a', sick], ['node-b', v2Body()]) })).textContent;
+	for (const title of [
+		'Probe failures dominate.',
+		'Backoff engaged.',
+		'Trigger queue near full.',
+		'Rule edit re-baselined rows.',
+		'Changes deferred.',
+		'Unreadable registry rows.',
+		'Mapped field disarmed.',
+		'Overran the anchor.',
+	]) {
+		assert.ok(text.includes(title), `expected the "${title}" flag`);
+	}
+	assert.match(text, /node-a: price 0:price/);
+	assert.match(text, /Health — \d+ faults?, \d+ warnings?/);
+});
+
+test('nodes disagreeing on mode or rules are flagged at the top, not left for the config view', async () => {
+	const other = v2Body({ over: { mode: 'continuous' } });
+	other.rules = [{ ...other.rules[0], fingerprint: 'deadbeef' }];
+	const text = draw(await ready({ status: clusterOf(['node-a', v2Body()], ['node-b', other]) })).textContent;
+	assert.match(
+		text,
+		/Modes differ between nodes\. The nodes run different sweep modes: node-a anchored, node-b continuous/
+	);
+	assert.match(text, /Rules differ between nodes\./);
+});
+
+test('the configuration card names the rule’s endpoint and fingerprint, and marks a setting that differs', async () => {
+	const other = v2Body({ over: { settings: { ...v2Settings, ratePerSecond: 5 } } });
+	const ctx = await ready({ status: clusterOf(['node-a', v2Body()], ['node-b', other]) });
+	const text = cardTitled(ctx, /^Configuration/).textContent;
+	assert.match(text, /GET \/api\/product\/\$1/);
+	assert.match(text, /3fa1c29e/);
+	assert.match(text, /Rate ceilingdiffers/);
+	assert.match(text, /10\/s.*5\/s/s);
+});
+
+test('detail on demand: per-slot changes carry the extract path, per-field mismatches and the guard', async () => {
+	const ctx = await ready({ status: v2Body() });
+	const last = cardTitled(ctx, /^Last completed sweep/);
+	const slotRow = find(
+		last,
+		(n) => n.tagName === 'TR' && /product\.price\.sale/.test(n.textContent) && /200/.test(n.textContent)
+	);
+	assert.ok(slotRow, 'slot 0 → its extract path, with its count');
+	assert.match(last.textContent, /Page fields that disagreed with the origin/);
+	assert.match(last.textContent, /0:price/);
+	assert.match(last.textContent, /Mapping guard/);
+});
+
+test('the finished-pass charts say they are per finished pass, not live — and read the queue high-water', async () => {
+	const ctx = await ready({
+		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('trigger_queue_depth', 4, 812)] },
+	});
+	const card = cardTitled(ctx, /^Finished passes/);
+	assert.ok(card);
+	assert.match(card.textContent, /per finished pass — not live/);
+	assert.match(card.textContent, /NOT LIVE/);
+	assert.match(tile(ctx, 'Trigger queue peak').textContent, /812/);
+});
+
+test('auto-refresh re-reads ONLY the status, on a timer, and pausing it stops the timer', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const ctx = await ready({ status: v2Body() });
+	const fetched = [];
+	const get = ctx.get.bind(ctx);
+	ctx.get = async (route, query) => {
+		fetched.push(route);
+		return get(route, query);
+	};
+	draw(ctx); // arms the timer
+	t.mock.timers.tick(30_000);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(fetched, ['change-probe'], 'the analytics scan is not re-run by the timer');
+	assert.equal(ctx.calls.renders, 1);
+
+	ctx.data.autoRefresh = false;
+	draw(ctx);
+	t.mock.timers.tick(60_000);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(fetched, ['change-probe'], 'paused means paused');
+	t.mock.timers.reset();
+});
+
+test('the status read time is on the page, so a stale screen can never pass for a live one', async () => {
+	const text = draw(await ready({ status: v2Body() })).textContent;
+	assert.match(text, /status read at .* \(\d+s ago\) · re-read every 30s/);
 });

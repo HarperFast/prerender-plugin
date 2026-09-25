@@ -769,7 +769,7 @@ this plugin's resources all set `loadAsInstance = false`.
 | `POST /prerender_admin/backlog`            | recompute the backlog/histogram snapshot now     | `super_user` |
 | `POST /prerender_admin/sitemap`            | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
 | `POST /prerender_admin/sitemap-refresh`    | `{ url? }` → background walk of one/all roots    | `super_user` |
-| `GET /prerender_admin/change-probe`        | probe rules + last pass records (this node)      | `super_user` |
+| `GET /prerender_admin/change-probe`        | running pass, next run, last passes (this node)  | `super_user` |
 | `POST /prerender_admin/change-probe`       | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
 
 The console is fully self-contained: its stylesheet, scripts and fonts are served from the

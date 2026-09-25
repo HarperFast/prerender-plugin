@@ -200,6 +200,21 @@ cache serve everywhere else in the console — the freshness chart, the per-rout
 staleness sums — and sits in one "Invalidation" family with `invalidated` on the non-hit strip,
 because the two are one population split into rescued and refused.
 
+**Change probe leads with what the probe is doing now** (console v0.16.0; the full picture needs
+plugin v0.91.0). "Probe now" is one sentence for the scope and one row per node — sweeping since
+when and started by what, how far through its slice, its current rate and ETA; or idle, with the
+next run in local and UTC time — followed by health flags that need no reading between the lines:
+failures, origin pushback, backoff engaged, a late or stopped heartbeat, a pass overrunning its next
+anchor, a disarmed mapped field, a trigger queue near `maxPending`, deferred changes, and nodes
+disagreeing on mode, rules or settings. The running pass's own partial counts have a card of their
+own; the last completed pass has another, titled as the pass _before_ the running one while a pass
+runs, so yesterday's numbers can never be read as tonight's. Every time carries its age on the
+node's clock, and the status re-reads itself every 30s — the analytics charts do not, and say so
+("per finished pass — not live"). A node on an older plugin shows what it can: a counter it does not
+report reads n/a with the version that added it, never 0, and its next anchored run is computed from
+the anchor setting, because before v0.91.0 the plugin published it as null
+([#176](https://github.com/HarperFast/prerender-plugin/issues/176)).
+
 **Change probe is new** (plugin v0.53.0+), and it is the one freshness surface that does not measure
 pages against a cadence. It reads what the probe is actually detecting — the change rate against the
 probes that HAD a baseline, not against every probe, because a pass that is mostly seeding has
@@ -223,8 +238,8 @@ rather than anything a setting here reaches.
 Plugin v0.62.0 moved the probe's state into a node-local row every worker can read (before it, 15
 of 16 workers answered "not running, never ran" — indistinguishable from the probe being off), and
 the endpoint now says when that row could _not_ be read. The console prints that as the loudest
-note on the page — the node is unknown, not idle — and shows a running sweep's heartbeat count
-("~24,000 rows examined") on the header pill, the sweep card and the per-node table, summed across
+note on the page — the node is unknown, not idle — and, for a plugin older than v0.91.0, shows a
+running sweep's heartbeat count ("~24,000 rows examined") in that node's state row, summed across
 the nodes running because each walks its own slice.
 
 Plugin v0.58.0's `pageCheck` adds the one counter on that card that is not about the origin

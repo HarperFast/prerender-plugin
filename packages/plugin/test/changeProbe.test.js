@@ -80,8 +80,14 @@ beforeEach(async () => {
 	changeProbe.resetChangeProbeState();
 });
 
-afterEach(() => {
+afterEach(async () => {
 	changeProbe.resetChangeProbeState();
+	// A scheduler test can leave a pass it started finishing against the fakes (a continuous cycle
+	// runs to completion after its loop is cancelled). Let it land, and let every state write this
+	// worker queued settle, before the globals it logs through are taken away — otherwise the pass
+	// throws into the NEXT test as an unhandled rejection.
+	for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+	await changeProbe.probeStatePublishedForTest();
 	delete globalThis.server;
 	delete globalThis.logger;
 	delete globalThis.databases;
@@ -1282,6 +1288,8 @@ test('scheduler: anchored mode arms a daily timer keyed on the anchor, runs no b
 	});
 	changeProbe.startChangeProbeScheduler();
 	assert.equal(changeProbe.probeTimerState().armedSweep, 'anchored:03:00|UTC');
+	// The status reads the PUBLISHED row (what every other worker sees), so wait for the write.
+	await changeProbe.probeStatePublishedForTest();
 	const status = await changeProbe.changeProbeStatus();
 	assert.ok(status.sweep.nextAnchoredRunAt, 'the next run is published for the admin surface');
 	const next = new Date(status.sweep.nextAnchoredRunAt);
@@ -1334,6 +1342,7 @@ test('scheduler: an anchor inside the spring-forward hour still arms a FUTURE ru
 				startJitter: 1,
 			});
 			changeProbe.startChangeProbeScheduler();
+			await changeProbe.probeStatePublishedForTest();
 
 			const status = await changeProbe.changeProbeStatus();
 			const next = new Date(status.sweep.nextAnchoredRunAt).getTime();
@@ -1534,6 +1543,28 @@ test('a heartbeat mid-pass must NOT wipe lastRun — the merge is one level deep
 	assert.deepEqual(row.sweep.lastRun, { label: 'previous' }, 'the previous result survived the heartbeat');
 	assert.equal(row.sweep.progress.examinedApprox, 400, 'and the new progress landed');
 	assert.equal(row.sweep.running, true);
+});
+
+test('a publish that rejects neither wedges later publishes nor rejects to its caller (review)', async () => {
+	// Force the one path out of publishNow's try/catch: the read throws AND the warning logger throws.
+	const working = globalThis.databases.coordination.SharedBuffer;
+	globalThis.databases.coordination.SharedBuffer = class {
+		static async get() {
+			throw new Error('store down');
+		}
+		static async put() {}
+	};
+	globalThis.logger.warn = () => {
+		throw new Error('logger down');
+	};
+	const failed = await changeProbe.publishProbeStateForTest({ sweep: { running: true } });
+	assert.equal(failed, false, 'the rejected publish resolves false instead of rejecting to its caller');
+
+	globalThis.databases.coordination.SharedBuffer = working;
+	globalThis.logger.warn = () => {};
+	await changeProbe.publishProbeStateForTest({ scheduler: { armedSweep: 'anchored:00:05|UTC' } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row?.scheduler?.armedSweep, 'anchored:00:05|UTC', 'the next publish still landed');
 });
 
 test('omission means "leave alone"; clearing a field requires naming it', async () => {
@@ -2786,5 +2817,314 @@ test('changeProbeStatus names a rule’s mapped fields and ignored slots only wh
 	assert.deepEqual(status.rules[0].ignoreChanges, [1]);
 	await mappedClaimHarness({ pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 } });
 	const plain = await changeProbe.changeProbeStatus();
-	assert.deepEqual(Object.keys(plain.rules[0]).sort(), ['invalidateScope', 'label', 'pathPattern', 'source']);
+	// The optional pageCheck keys are absent; the identity keys (v0.91.0) are always there.
+	assert.deepEqual(Object.keys(plain.rules[0]).sort(), [
+		'endpoint',
+		'extract',
+		'fingerprint',
+		'invalidateScope',
+		'label',
+		'pathPattern',
+		'source',
+	]);
+});
+
+// ---- what the probe is doing NOW (plugin v0.91.0) -------------------------------------------------
+
+/**
+ * The admin surface used to answer "what is the probe doing" with the LAST pass that ended, beside a
+ * bare `running: true` — for the ~9 hours an anchored pass runs, every number on it was yesterday's.
+ * These pin the running pass's own identity and counters, the next scheduled run from ANY worker,
+ * and #176: `nextAnchoredRunAt` read null right after arming, on every node, because it was module
+ * state on worker 0 and the one publish ran before the anchor was armed.
+ */
+
+const flushTurns = async (n = 30) => {
+	for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
+};
+
+/**
+ * A registry the real walk can page through: `search` honours the cursor condition and limit, and
+ * `hold(index)` can block before handing over a row — which is how a test catches a pass mid-flight.
+ */
+const walkableTargets = (urls, { hold = () => null } = {}) => {
+	const sorted = [...urls].sort();
+	return class WalkableTargets {
+		static async get() {}
+		static search({ conditions = [], limit = Infinity } = {}) {
+			return (async function* () {
+				const [cursor] = conditions;
+				let yielded = 0;
+				for (const [index, url] of sorted.entries()) {
+					if (cursor && !(cursor.comparator === 'greater_than_equal' ? url >= cursor.value : url > cursor.value)) {
+						continue;
+					}
+					if (yielded >= limit) return;
+					await hold(index);
+					yield { url, sitemapUrl: null, renderInterval: null, state: null, unlistedAt: null };
+					yielded++;
+				}
+			})();
+		}
+	};
+};
+
+// Rows no rule matches: the walk examines them (and heartbeats over them) without a single origin
+// request, which is what lets a whole pass run here with no network.
+const unmatchedUrls = (n) =>
+	Array.from({ length: n }, (_, i) => `https://www.example.com/help/${String(i).padStart(5, '0')}`);
+
+test('a running sweep publishes ITS OWN identity and partial counts, apart from the last pass that ended', async (t) => {
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW, chunkSize: 250, dryRun: true } });
+	t.after(() => applyOptions({ changeProbe: { enabled: false } }));
+	const T0 = Date.parse('2026-09-24T05:05:00Z');
+	t.mock.timers.enable({ apis: ['Date'], now: T0 });
+
+	// Yesterday's finished pass — the record the running pass must NOT be confused with.
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: false,
+			lastRun: { label: 'yesterday', matched: 12_345, probed: 12_000, startedAt: 1, finishedAt: 2 },
+		},
+	});
+
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	globalThis.databases.render_service.Target = walkableTargets(unmatchedUrls(300), {
+		hold: async (index) => {
+			// Past the first chunk's heartbeat: the walk has examined 250 rows and beaten once at 200.
+			if (index === 249) t.mock.timers.tick(31_000);
+			if (index >= 250) await gate;
+		},
+	});
+
+	const pass = changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	for (let i = 0; i < 200; i++) {
+		await flushTurns(1);
+		if ((await changeProbe.readProbeStateForTest())?.sweep?.progress?.examined === 200) break;
+	}
+
+	const mid = await changeProbe.changeProbeStatus();
+	assert.equal(mid.statusVersion, 2);
+	assert.equal(mid.sweep.running, true);
+	assert.equal(mid.sweep.current.startedAt, T0, 'the running pass says when IT started');
+	assert.equal(mid.sweep.current.startedBy, 'manual');
+	assert.equal(mid.sweep.current.dryRun, true);
+	assert.equal(mid.sweep.current.phase, 'walking');
+	assert.equal(mid.sweep.current.stale, false);
+	assert.equal(mid.sweep.current.sliceEstimate, 12_345, 'the previous complete pass sizes the ETA');
+	assert.equal(mid.sweep.progress.examined, 200, 'the pass’s own counters, not yesterday’s');
+	assert.equal(mid.sweep.progress.examinedApprox, 200, 'kept for consoles that predate the counters');
+	assert.equal(mid.sweep.progress.probed, 0);
+	assert.equal(mid.sweep.progress.triggerQueueDepth, 0);
+	assert.equal(typeof mid.sweep.progress.recentRate, 'number');
+	assert.equal(mid.sweep.lastRun.label, 'yesterday', 'and the last pass that ENDED is still the previous one');
+	assert.equal(mid.serverTime, T0 + 31_000, 'the node clock rides along, so a reader ages against it');
+
+	release();
+	await pass;
+	const done = await changeProbe.changeProbeStatus();
+	assert.equal(done.sweep.running, false);
+	assert.equal(done.sweep.current, null, 'no claim, no current pass');
+	assert.equal(done.sweep.progress, null);
+	assert.equal(done.sweep.lastRun.startedBy, 'manual', 'the finished record says who started it');
+	assert.equal(done.sweep.lastRun.examined, 300);
+});
+
+test('a pass whose heartbeat stopped is reported as STALLED, not as idle', async () => {
+	// `running` is the claim filtered by staleness — right for the run guard, and indistinguishable
+	// from an idle node for an operator. `current.stale` is the difference.
+	const longAgo = Date.now() - 10 * 60 * 1000;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: longAgo - 60_000, heartbeatAt: longAgo, startedBy: 'anchor', lastRun: null },
+	});
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.running, false, 'the claim is takeable');
+	assert.equal(status.sweep.current.stale, true);
+	assert.equal(status.sweep.current.heartbeatAt, longAgo);
+	assert.equal(status.sweep.current.startedBy, 'anchor');
+	assert.deepEqual(status.heartbeat, { intervalMs: 30_000, staleAfterMs: 300_000 });
+});
+
+test('#176: a live continuous -> anchored switch PUBLISHES a finite next anchored run', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	t.after(() => t.mock.timers.reset());
+	await applyProbeConfig({ enabled: true, mode: 'continuous', cycleTarget: 60_000, startDelay: 3_600_000 });
+	changeProbe.startChangeProbeScheduler();
+	await applyProbeConfig({ enabled: true, mode: 'anchored', anchorTime: '00:05', anchorTimezone: 'America/Chicago' });
+	await changeProbe.probeStatePublishedForTest();
+
+	// The ROW — what the fifteen workers that never armed anything read.
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.scheduler.armedSweep, 'anchored:00:05|America/Chicago');
+	assert.ok(Number.isFinite(row.scheduler.nextAnchorAt), 'the published anchor is finite right after arming');
+	assert.ok(row.scheduler.nextAnchorAt > Date.now());
+
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(new Date(status.sweep.nextAnchoredRunAt).getTime(), row.scheduler.nextAnchorAt);
+	assert.equal(status.sweep.nextRunAt, row.scheduler.nextAnchorAt);
+	assert.equal(status.sweep.nextRunBasis, 'anchor');
+	await applyProbeConfig({ enabled: false });
+});
+
+test('#176: a worker that never armed the scheduler still reports the next anchored run', async () => {
+	// Exactly the fifteen-of-sixteen case: this worker's module state knows nothing; only the row does.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW, mode: 'anchored', anchorTime: '00:05' } });
+	const at = Date.now() + 5 * 3_600_000;
+	await changeProbe.publishProbeStateForTest({ scheduler: { armedSweep: 'anchored:00:05|UTC', nextAnchorAt: at } });
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.nextAnchoredRunAt, new Date(at).toISOString());
+	assert.equal(status.sweep.nextRunAt, at);
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('every anchor re-arm publishes: mid-pass the next run is already the FOLLOWING anchor, and stays so', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse('2026-09-24T02:59:00Z') });
+	t.after(() => t.mock.timers.reset());
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	globalThis.databases.render_service.Target = walkableTargets(unmatchedUrls(3), { hold: () => gate });
+	await applyProbeConfig({ enabled: true, mode: 'anchored', anchorTime: '03:00', anchorTimezone: 'UTC' });
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	const today = Date.parse('2026-09-24T03:00:00Z');
+	const tomorrow = Date.parse('2026-09-25T03:00:00Z');
+	assert.equal((await changeProbe.readProbeStateForTest()).scheduler.nextAnchorAt, today);
+
+	t.mock.timers.tick(60_000); // the anchor fires; the pass blocks on the gate
+	for (let i = 0; i < 100 && !(await changeProbe.readProbeStateForTest())?.sweep?.running; i++) await flushTurns(1);
+	const mid = await changeProbe.changeProbeStatus();
+	assert.equal(mid.sweep.running, true);
+	assert.equal(mid.sweep.current.startedBy, 'anchor');
+	assert.equal(mid.sweep.nextRunAt, tomorrow, 'never null, never the instant that just fired');
+
+	release();
+	for (let i = 0; i < 100 && (await changeProbe.readProbeStateForTest())?.sweep?.running; i++) await flushTurns(1);
+	await changeProbe.probeStatePublishedForTest();
+	const after = await changeProbe.readProbeStateForTest();
+	assert.equal(after.sweep.lastRun.startedBy, 'anchor');
+	assert.equal(after.scheduler.nextAnchorAt, tomorrow, 'the re-arm after the pass published too');
+	await applyProbeConfig({ enabled: false });
+});
+
+test('an unusable anchor publishes a NULL next run — and null now means only that', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	t.after(() => t.mock.timers.reset());
+	await applyProbeConfig({ enabled: true, mode: 'anchored', anchorTime: '03:00', anchorTimezone: 'Not/AZone' });
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.armedInterval, 'anchored:03:00|Not/AZone', 'armed, so the null is not a disarm');
+	assert.equal(status.sweep.nextAnchoredRunAt, null);
+	assert.equal(status.sweep.nextRunAt, null);
+	assert.equal(status.sweep.nextRunBasis, 'anchor');
+	await applyProbeConfig({ enabled: false });
+});
+
+test('interval mode: the next run is the boot sweep until it fires, then the next timer tick', async (t) => {
+	const T0 = Date.parse('2026-09-24T12:00:00Z');
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: T0 });
+	t.after(() => t.mock.timers.reset());
+	await applyProbeConfig({
+		enabled: true,
+		sweepInterval: 3_600_000,
+		startDelay: 60_000,
+		startJitter: 1,
+		canary: { interval: 600_000 },
+	});
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	let status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.nextRunBasis, 'startup');
+	assert.equal(status.sweep.nextRunAt, T0 + 60_000);
+
+	t.mock.timers.tick(60_000); // boot fires: a sweep (empty registry) and the timers arm
+	await flushTurns();
+	await changeProbe.probeStatePublishedForTest();
+	status = await changeProbe.changeProbeStatus();
+	assert.equal(status.sweep.nextRunBasis, 'interval');
+	assert.equal(status.sweep.nextRunAt, T0 + 60_000 + 3_600_000);
+	assert.equal(status.canary.nextRunAt, T0 + 60_000 + 600_000);
+	await applyProbeConfig({ enabled: false });
+});
+
+test('a pass on a worker that is not the scheduler’s does not overwrite the published schedule', async () => {
+	// The admin POST runs a pass wherever the request landed. That worker has nothing armed, and its
+	// end-of-pass publish used to write `armedSweep: null` over worker 0's — "not armed" on the admin
+	// surface until worker 0 next republished, a day later in anchored mode.
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+	const schedule = { armedSweep: 'anchored:00:05|UTC', armedCanary: 1_800_000, nextAnchorAt: Date.now() + 3_600_000 };
+	await changeProbe.publishProbeStateForTest({ scheduler: schedule });
+	await changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	await changeProbe.probeStatePublishedForTest();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.scheduler.armedSweep, schedule.armedSweep);
+	assert.equal(row.scheduler.armedCanary, schedule.armedCanary);
+	assert.equal(row.scheduler.nextAnchorAt, schedule.nextAnchorAt);
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+test('the canary’s cohort build republishes the cohort sizes instead of leaving the boot-time {}', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	t.after(() => t.mock.timers.reset());
+	await applyProbeConfig({
+		enabled: true,
+		sweepInterval: 3_600_000,
+		startDelay: 3_600_000,
+		canary: { interval: 600_000 },
+	});
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	assert.deepEqual((await changeProbe.readProbeStateForTest()).scheduler.cohortSizes, {});
+	await changeProbe.runProbeCanaryOnce({ startedBy: 'interval' });
+	await changeProbe.probeStatePublishedForTest();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.deepEqual(row.scheduler.cohortSizes, { pdp: 0 }, 'the build ran and its (empty) result is published');
+	assert.equal(row.canary.lastRun.startedBy, 'interval');
+	await applyProbeConfig({ enabled: false });
+});
+
+test('the drain keeps beating while the queue settles, and stops the moment it is idle', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval'] });
+	let settle;
+	const triggers = { drain: () => new Promise((resolve) => (settle = resolve)) };
+	let beats = 0;
+	const draining = changeProbe.__drainWithHeartbeatForTest(triggers, () => beats++);
+	t.mock.timers.tick(30_000);
+	assert.equal(beats, 3, 'a beat every third of an interval while the queue drains');
+	settle();
+	await draining;
+	t.mock.timers.tick(60_000);
+	assert.equal(beats, 3, 'and none after');
+	t.mock.timers.reset();
+});
+
+test('the status names what the probe runs on: settings, rule fingerprints, extract paths and endpoint', async (t) => {
+	const { applyOptions } = await import('../src/config.js');
+	t.after(() => applyOptions({ changeProbe: { enabled: false } }));
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			rules: RULES_RAW,
+			mode: 'anchored',
+			anchorTime: '00:05',
+			anchorTimezone: 'America/Chicago',
+			ratePerSecond: 7,
+			trigger: { maxPending: 1234 },
+		},
+	});
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.settings.mode, 'anchored');
+	assert.equal(status.settings.anchorTime, '00:05');
+	assert.equal(status.settings.anchorTimezone, 'America/Chicago');
+	assert.equal(status.settings.ratePerSecond, 7);
+	assert.equal(status.settings.trigger.maxPending, 1234);
+	const [rule] = status.rules;
+	assert.match(rule.fingerprint, /\S/);
+	assert.deepEqual(rule.extract, ['price']);
+	assert.deepEqual(rule.endpoint, { method: 'POST', path: '/price/$1' }, 'the path, never the host');
+	assert.equal(status.workerIndex, 0);
 });
