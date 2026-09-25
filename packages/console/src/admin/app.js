@@ -2,79 +2,124 @@
  * Console entry point: session handling, the app shell, and the view router.
  *
  * Views are modules with a uniform contract (see VIEWS below):
- *   meta   { id, label, crumb, icon }   — sidebar entry and breadcrumb
+ *   meta   { id, label, icon, ranged? } — sidebar entry; `ranged` puts the time-range picker in
+ *                                          the top bar while that view is open
  *   load   (ctx) => Promise             — fetch what the view needs into ctx.data
  *   render (ctx) => Node                — build the DOM, synchronously, from ctx.data
  *
  * Rendering is a full rebuild of `#app` on every state change. That is not a performance
  * problem here (an operator console with tens of rows, not a bot read path) and it removes a
  * whole class of stale-DOM bugs that a partial-update scheme would introduce.
+ *
+ * LOADS ARE SEQUENCED. Every load takes a number, and a response that arrives after a newer load
+ * started is dropped before it can be written. Without that, clicking 24h and then 15m let the slow
+ * 24h scan land last and overwrite the 15m answer under a picker reading "15m" — and because
+ * `ctx.data` used to resolve to whichever view was current when the RESPONSE arrived, a load for
+ * one view could even write into another. A load's context is now pinned to the view that started it.
  */
 
-import { el, harperMark, icon, muted, pill, spacer } from './ui.js';
+import { el, harperMark, icon, pill, skeleton, spacer } from './ui.js';
 import { CLUSTER, get, post, setExpiredHandler, setNode } from './api.js';
-import * as overview from './views/overview.js';
+import { segmented } from './charts.js';
+import * as health from './views/health.js';
 import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
-import * as nodes from './views/nodes.js';
 import * as sitemaps from './views/sitemaps.js';
+import * as corpus from './views/corpus.js';
 import * as invalidations from './views/invalidations.js';
 import * as probe from './views/probe.js';
 import * as inspect from './views/inspect.js';
 import * as metricsref from './views/metricsref.js';
 import * as config from './views/config.js';
-import { discardEdit } from './views/_configEdit.js';
+import { configState, discardEdit, optionIndex } from './views/_configEdit.js';
 
-// Ordered as an operator triages: is it working (overview, traffic), what is it working on
-// (sitemaps), is the machinery healthy (queue, then the nodes running it), then actions and
-// reference. `inspect` sits below the divider because it is not a place you patrol — it is the
-// drill-down every other view hands a URL to. The change probe sits after Invalidations because
-// that is what its canary produces: a mass change is answered with one invalidation row, not with
-// thousands of re-renders.
+// Ordered as an operator triages: is anything wrong (health), what crawlers are getting (traffic),
+// whether the machinery is keeping up (queue), what it is working on (sitemaps, corpus), then the
+// two change mechanisms. Below the divider: the drill-down every other view hands a URL to, and
+// reference.
 const VIEWS = [
-	overview,
+	health,
 	traffic,
-	sitemaps,
 	queue,
-	nodes,
+	sitemaps,
+	corpus,
 	invalidations,
 	probe,
 	null /* divider */,
 	inspect,
-	metricsref,
 	config,
+	metricsref,
 ];
 const BY_ID = new Map(VIEWS.filter(Boolean).map((view) => [view.meta.id, view]));
+const DEFAULT_VIEW = health.meta.id;
 
 /**
- * Retired view ids, mapped to the view that absorbed them.
+ * Retired view ids, mapped to the view that absorbed them — so a bookmarked hash, a stored
+ * selection or an old call site lands somewhere meaningful rather than silently on the default.
  *
- * `explain` and `pages` merged into `inspect` (see views/inspect.js for why). Resolving the
- * alias here means every call site that hands a URL to the explainer keeps working untouched —
- * the sitemap entry table, the traffic per-route card, the unrouted report on the config view,
- * and that view's owner map, which is keyed by view id and so names `pages` without any link
- * text to make it look like a link. An id that is neither a view nor an alias still falls back
- * to the overview, which is the right answer for a genuine typo but the WRONG one for a retired
- * id: the console would look like it had simply lost the page, with nothing logged anywhere.
+ *   overview → health    replaced by a page of checks with verdicts; its serve strip was a subset
+ *                        of Traffic, its backlog moved to Queue, its maintenance actions to Corpus
+ *   nodes    → queue     the per-node table is about the queue; config agreement lives on Config
+ *   explain, pages → inspect
  */
 const ALIAS = new Map([
+	['overview', 'health'],
+	['nodes', 'queue'],
 	['explain', 'inspect'],
 	['pages', 'inspect'],
 ]);
 
+/** The time ranges every analytics-charting view shares. Capped by `management.analytics.maxRange`. */
+export const RANGES = [
+	{ label: '15m', ms: 15 * 60_000 },
+	{ label: '1h', ms: 3_600_000 },
+	{ label: '3h', ms: 3 * 3_600_000 },
+	{ label: '6h', ms: 6 * 3_600_000 },
+	{ label: '12h', ms: 12 * 3_600_000 },
+	{ label: '24h', ms: 24 * 3_600_000 },
+];
+const RANGE_KEY = 'prerender-console-range';
+const readRange = () => {
+	try {
+		const stored = Number(localStorage.getItem(RANGE_KEY));
+		if (RANGES.some((range) => range.ms === stored)) return stored;
+	} catch {
+		/* storage unavailable; the default is fine */
+	}
+	return 3_600_000;
+};
+
+const resolveId = (id) => {
+	const target = ALIAS.get(id) ?? id;
+	return BY_ID.has(target) ? target : DEFAULT_VIEW;
+};
+
+const hashView = () => {
+	try {
+		return location.hash ? resolveId(decodeURIComponent(location.hash.slice(1))) : DEFAULT_VIEW;
+	} catch {
+		return DEFAULT_VIEW;
+	}
+};
+
 const state = {
-	view: 'overview',
+	view: hashView(),
 	session: null,
 	busy: false,
 	error: null,
+	rangeMs: readRange(),
 	// Per-view scratch: fetched data and any local UI state (inputs, cursors, selection).
 	// Keyed by view id so switching views never leaks one view's state into another.
 	views: {},
+	// Views whose first load has finished in the current scope. Until then the view renders a
+	// skeleton — never its "no data" state, which is a claim about the cluster, not about the fetch.
+	loaded: new Set(),
+	loadedAt: null,
 };
 
 const scratch = (id) => (state.views[id] ??= {});
 
-const currentView = () => BY_ID.get(state.view) ?? overview;
+const currentView = () => BY_ID.get(state.view) ?? health;
 
 // ---- context handed to every view ----
 
@@ -88,6 +133,10 @@ const ctx = {
 	get session() {
 		return state.session;
 	},
+	/** The shared analytics window every ranged view reads. */
+	get rangeMs() {
+		return state.rangeMs;
+	},
 	scratch,
 	get,
 	post,
@@ -97,10 +146,10 @@ const ctx = {
 	go(id, patch) {
 		// The patch still lands in whatever view actually renders, so an aliased call site's
 		// scratch (a pre-filled URL, a selected sitemap) reaches the merged view unchanged.
-		const target = ALIAS.get(id) ?? id;
-		state.view = BY_ID.has(target) ? target : 'overview';
+		state.view = resolveId(id);
 		state.error = null;
 		if (patch) Object.assign(scratch(state.view), patch);
+		setHash(state.view);
 		load();
 	},
 
@@ -134,21 +183,20 @@ const ctx = {
 	},
 };
 
+const setHash = (id) => {
+	try {
+		if (location.hash.slice(1) !== id) globalThis.history?.replaceState?.(null, '', `#${id}`);
+	} catch {
+		/* no history API (tests); the view still switches */
+	}
+};
+
 // ---- shell ----
 
 /**
- * Where the operator was looking, carried across the rebuild.
- *
- * Rendering replaces the entire tree, `main` included, so without this every click — a filter
- * chip, a pause toggle, a page of a table, the one-second busy render an action does before its
- * result lands — silently teleported the page back to the top. On views that are several screens
- * long (Traffic, Config) that made the panels near the bottom effectively unusable: act on one,
- * and you have to find your place again. The scroll lives on `.main` rather than the window (the
- * shell is a `100vh` flex column with the content pane scrolling inside it), which is why
- * restoring `window.scrollY` would have done nothing.
- *
- * A view CHANGE still starts at the top — that is a new page, and arriving halfway down it is its
- * own kind of disorienting.
+ * Where the operator was looking, carried across the rebuild. The scroll lives on `.main` (the
+ * shell is a `100vh` flex column), so without this every click silently teleported the page back
+ * to the top. A view CHANGE still starts at the top.
  */
 let scrollTop = 0;
 let scrolledView = null;
@@ -162,19 +210,23 @@ function render() {
 	app.textContent = '';
 
 	if (!state.session)
-		return void app.appendChild(el('main', { cls: 'main' }, [el('p', { cls: 'muted', text: 'Loading…' })]));
+		return void app.appendChild(el('main', { cls: 'main' }, [el('div', { cls: 'view' }, [skeleton()])]));
 	if (!state.session.authenticated || !state.session.superUser) return void app.appendChild(renderSignIn());
 
 	const view = currentView();
+	const ready = state.loaded.has(state.view);
 	const main = el('main', { cls: 'main' }, [
 		el('div', { cls: 'view' }, [
 			state.error && el('div', { cls: 'note bad', text: state.error }),
 			...incompleteSources(),
-			view.render(ctx),
+			ready ? renderView(view) : skeleton(),
 		]),
 	]);
 	app.appendChild(
-		el('div', { cls: 'app' }, [renderSidebar(), el('div', { cls: 'content' }, [renderTopbar(view), main])])
+		el('div', { cls: `app${state.busy ? ' busy' : ''}` }, [
+			renderSidebar(),
+			el('div', { cls: 'content' }, [renderTopbar(view), main]),
+		])
 	);
 
 	if (state.view !== scrolledView) scrollTop = 0;
@@ -182,6 +234,21 @@ function render() {
 	// Assigning past the new content's height clamps, so a rebuild that produced a shorter page
 	// lands at its bottom rather than throwing.
 	main.scrollTop = scrollTop;
+}
+
+/**
+ * A view's render, contained. A throw in one panel used to abort the whole rebuild and leave the
+ * console blank — sidebar, top bar and all — which reads as "the console is down" during exactly
+ * the incident it was opened for. The error is shown where the view would be, and the shell around
+ * it keeps working, so the operator can still switch scope or view.
+ */
+function renderView(view) {
+	try {
+		return view.render(ctx);
+	} catch (e) {
+		globalThis.console?.error?.(e);
+		return el('div', { cls: 'note bad', text: `This view failed to render: ${e?.message ?? String(e)}` });
+	}
 }
 
 function renderSidebar() {
@@ -209,46 +276,73 @@ function renderSidebar() {
 		nav,
 		el('div', { cls: 'whoami' }, [
 			el('div', { cls: 'avatar', text: (username.slice(0, 2) || '?').toUpperCase() }),
-			el('div', { cls: 'who' }, [
-				el('div', { cls: 'name truncate', text: username }),
-				el('div', { cls: 'role', text: 'super_user' }),
-			]),
+			el('div', { cls: 'who' }, [el('div', { cls: 'name truncate', text: username })]),
 			el('button', { cls: 'link', text: 'Sign out', onclick: signOut }),
 		]),
 	]);
 }
 
+/** The largest window the cluster will serve, from the config payload when it is in hand. */
+const maxRange = () => {
+	const value = Number(optionIndex(configState(ctx).payload).get('management.analytics.maxRange')?.effective);
+	return Number.isFinite(value) && value > 0 ? value : null;
+};
+
+function rangePicker() {
+	const cap = maxRange();
+	return segmented(
+		RANGES.map(({ label, ms }) => ({
+			label,
+			value: ms,
+			disabled: cap !== null && ms > cap,
+			title: cap !== null && ms > cap ? `Above management.analytics.maxRange (${label} > cap)` : `Last ${label}`,
+		})),
+		state.rangeMs,
+		(ms) => {
+			state.rangeMs = ms;
+			try {
+				localStorage.setItem(RANGE_KEY, String(ms));
+			} catch {
+				/* the choice just won't survive a reload */
+			}
+			load();
+		}
+	);
+}
+
 function renderTopbar(view) {
-	// The cluster pill reads from whatever the overview last fetched. It is deliberately absent
-	// rather than assumed "running" when that data hasn't been loaded in this session — an
-	// unknown pause state must never render as a green light.
-	const cluster = scratch('overview').overview?.control?.cluster;
+	// The queue pill reads whatever the last overview payload said. Absent rather than assumed
+	// "running" when no view has loaded it — an unknown pause state must never render as green.
+	const cluster = (scratch('health').overview ?? scratch('queue').overview ?? scratch('corpus').overview)?.control
+		?.cluster;
+	const updated = state.loadedAt ? Math.round((Date.now() - state.loadedAt) / 1000) : null;
 
 	return el('div', { cls: 'topbar' }, [
-		el('div', { cls: 'crumbs' }, [
-			muted('prerender'),
-			el('span', { cls: 'sep', text: '/' }),
-			el('span', { cls: 'here', text: view.meta.crumb }),
-		]),
+		el('h1', { cls: 'view-title', text: view.meta.label }),
 		spacer(),
+		view.meta.ranged && rangePicker(),
 		nodePicker(),
-		cluster ? (cluster.paused ? pill('queue paused · cluster', 'bad', true) : pill('queue running', 'ok', true)) : null,
+		el(
+			'button',
+			{
+				cls: `refresh${state.busy ? ' spinning' : ''}`,
+				title: updated === null ? 'Refresh' : `Refresh — loaded ${updated}s ago`,
+				disabled: state.busy,
+				onclick: () => load(),
+			},
+			[icon(['M16.5 8A6.5 6.5 0 105 14.6', 'M16.5 3.5V8h-4.5'], 14), el('span', { text: 'Refresh' })]
+		),
+		cluster ? (cluster.paused ? pill('queue paused', 'bad', true) : pill('queue running', 'ok', true)) : null,
+		el('div', { cls: 'progress' }),
 	]);
 }
 
 /**
  * What this console is looking at: the whole cluster (the default) or one node.
  *
- * CLUSTER IS FIRST AND IS THE DEFAULT because it is the question an operator actually has.
- * Almost everything here is node-local — analytics rows, the backlog snapshot's owned-key
- * slice, the claim floor — so a per-node console answered "how is one quarter of the cluster",
- * and the cluster answer had to be assembled by hand across four browser tabs. The proxy fans
- * the read out and merges it (util/aggregate.js); a single node stays one click away for the
- * drill-down, and for the panels that are genuinely per-node.
- *
- * Switching scope DROPS all per-view state: stale data from the previous scope must never
- * render under the new scope's name. A node the sign-in didn't reach is still offered (picking
- * it lands on the sign-in form, which is the honest next step), but labelled.
+ * Switching scope DROPS all per-view state: stale data from the previous scope must never render
+ * under the new scope's name. A node the sign-in didn't reach is still offered (picking it lands on
+ * the sign-in form, which is the honest next step), but labelled.
  */
 function nodePicker() {
 	const nodes = state.session.nodes ?? [];
@@ -262,12 +356,11 @@ function nodePicker() {
 		'select',
 		{
 			cls: 'node-picker mono',
-			title:
-				'What this console reads. “All nodes” merges every node’s answer server-side; ' +
-				'a single node shows that node’s own slice.',
+			title: '“All nodes” merges every node’s answer; a single node shows its own slice.',
 			onchange: (event) => {
 				setNode(event.target.value);
 				state.views = {};
+				state.loaded = new Set();
 				load();
 			},
 		},
@@ -290,13 +383,9 @@ function nodePicker() {
 
 /**
  * The one banner that must appear no matter which view is open: a cluster answer that is
- * MISSING A NODE.
- *
- * A sum short by one node is not a smaller number, it is a wrong one — and it is
- * indistinguishable from a genuine drop in traffic, a shrinking backlog, or a cluster that
- * quietly stopped rendering. Rather than making every view remember to check, this walks
- * whatever the current view loaded and surfaces any incomplete `sources` envelope it finds; a
- * view that adds a new fetch is covered automatically.
+ * MISSING A NODE. A sum short by one node is not a smaller number, it is a wrong one — and it is
+ * indistinguishable from a genuine drop. This walks whatever the current view loaded and surfaces
+ * any incomplete `sources` envelope, so a view that adds a new fetch is covered automatically.
  */
 function incompleteSources() {
 	const seen = new Set();
@@ -310,10 +399,8 @@ function incompleteSources() {
 		seen.add(key);
 		banners.push(
 			el('div', { cls: 'note warn' }, [
-				el('strong', { text: `${sources.answered} of ${sources.configured} nodes answered. ` }),
-				'Every cluster total on this page is missing ' +
-					missing.map((node) => `${node.hostname} (${node.error ?? `HTTP ${node.status}`})`).join(', ') +
-					'. Treat the numbers as a floor, not a measurement — a missing node looks exactly like a drop.',
+				el('strong', { text: `${sources.answered} of ${sources.configured} nodes answered — totals are a floor. ` }),
+				'Missing: ' + missing.map((node) => `${node.hostname} (${node.error ?? `HTTP ${node.status}`})`).join(', '),
 			])
 		);
 	}
@@ -375,10 +462,7 @@ function renderSignIn() {
 				harperMark(28),
 				el('div', null, [
 					el('div', { cls: 'wordmark', text: 'Prerender Console' }),
-					el('div', {
-						cls: 'sub',
-						text: 'super_user on the prerender cluster — credentials are forwarded, never stored',
-					}),
+					el('div', { cls: 'sub', text: 'super_user · credentials are forwarded, never stored' }),
 				]),
 			]),
 			el('div', { cls: 'card' }, [
@@ -397,35 +481,75 @@ function renderSignIn() {
 async function signOut() {
 	await post('logout', {});
 	state.views = {};
-	// An unwritten config edit deliberately outlives a scope switch — an override is cluster-wide, so
-	// changing which node you are reading must not discard it. It must NOT outlive the operator: it
-	// would be applied under whoever signs in next, which on a shared operations machine is somebody
-	// else's change going out under your name.
+	state.loaded = new Set();
+	// An unwritten config edit deliberately outlives a scope switch — an override is cluster-wide.
+	// It must NOT outlive the operator: the next person to sign in would apply it under their name.
 	discardEdit();
 	load();
 }
 
 // ---- loading ----
 
+/** Thrown into a superseded load so it stops before writing anything. Never surfaced. */
+const SUPERSEDED = Symbol('superseded');
+let loadSeq = 0;
+
+/**
+ * A context pinned to the view and the load that created it. `data` is that view's scratch no
+ * matter what is on screen when a response lands, and a response for a load that has since been
+ * superseded throws instead of resolving — so nothing downstream of it gets to write.
+ */
+function loadContext(viewId, seq) {
+	const guard =
+		(fn) =>
+		async (...args) => {
+			const res = await fn(...args);
+			if (seq !== loadSeq) throw SUPERSEDED;
+			return res;
+		};
+	return Object.create(ctx, {
+		data: { get: () => scratch(viewId) },
+		get: { value: guard(get) },
+		post: { value: guard(post) },
+	});
+}
+
 async function load() {
+	const seq = ++loadSeq;
+	const viewId = state.view;
 	state.busy = true;
 	render();
 
-	const session = await get('session');
-	state.session = session.body;
-	if (!session.body?.authenticated || !session.body?.superUser) {
-		state.busy = false;
-		return render();
+	// The session check and the view's own fetches run CONCURRENTLY once signed in: a session that
+	// lapsed shows up as a 401 on the view's fetches too (the expired handler catches it), so there
+	// is no reason to pay a serial round trip before every view switch and range change.
+	const firstLoad = !state.session?.authenticated;
+	const sessionPromise = get('session').then((res) => {
+		if (seq === loadSeq || firstLoad) state.session = res.body;
+		return res.body;
+	});
+	if (firstLoad) {
+		const session = await sessionPromise;
+		if (seq !== loadSeq) return;
+		if (!session?.authenticated || !session?.superUser) {
+			state.busy = false;
+			return render();
+		}
 	}
 
+	const view = BY_ID.get(viewId) ?? health;
 	try {
-		await currentView().load(ctx);
+		await Promise.all([view.load(loadContext(viewId, seq)), sessionPromise]);
 	} catch (e) {
+		if (e === SUPERSEDED) return;
 		// A view's own fetch layer never throws (see api.js), so this is a bug in the view, not a
-		// transport failure. Surface it rather than leaving the console stuck on "Loading…".
-		state.error = `Failed to load ${state.view}: ${e?.message ?? String(e)}`;
+		// transport failure. Surface it rather than leaving the console stuck on a skeleton.
+		if (seq === loadSeq) state.error = `Failed to load ${viewId}: ${e?.message ?? String(e)}`;
 	}
+	if (seq !== loadSeq) return;
 
+	state.loaded.add(viewId);
+	state.loadedAt = Date.now();
 	state.busy = false;
 	render();
 }
@@ -433,9 +557,15 @@ async function load() {
 setExpiredHandler(() => {
 	state.session = { authenticated: false };
 	state.views = {};
-	// Same reasoning as signOut: an expired session is a session that ended, and the next sign-in may
-	// be a different person.
+	state.loaded = new Set();
+	// Same reasoning as signOut: an expired session is a session that ended.
 	discardEdit();
 });
 
+globalThis.addEventListener?.('hashchange', () => {
+	const id = hashView();
+	if (id !== state.view) ctx.go(id);
+});
+
+setHash(state.view);
 load();

@@ -163,24 +163,111 @@ export const spacer = () => el('span', { cls: 'spacer' });
 
 export const link = (text, onclick) => el('button', { cls: 'link', text, onclick });
 
-export function card(title, { head = [], body = null, foot = null, cls = '' } = {}) {
+// ---- disclosure state ----
+//
+// Rendering rebuilds the whole tree on every state change, so a native `<details>` would snap shut
+// on the next click anywhere. Every expandable thing in the console keeps its open/closed state
+// here instead, keyed by what it is rather than where it was drawn.
+
+const OPEN = new Set();
+export const isOpen = (key) => OPEN.has(key);
+export const setOpen = (key, open) => (open ? OPEN.add(key) : OPEN.delete(key));
+
+/**
+ * A "what does this mean" toggle for a card's head, and the block it reveals.
+ *
+ * The explanation is kept, never deleted — it is how a number on this console is read correctly —
+ * but it is hidden by default, because an operator who already knows it pays for it on every
+ * glance. Toggling flips the block in place rather than re-rendering, so the view does not jump.
+ */
+function helpParts(key, content) {
+	const block = el('div', { cls: 'help', hidden: !isOpen(key) }, [content].flat());
+	const button = el('button', {
+		'cls': `help-toggle${isOpen(key) ? ' on' : ''}`,
+		'text': '?',
+		'title': 'What this shows',
+		'aria-expanded': isOpen(key) ? 'true' : 'false',
+		'onclick': () => {
+			const open = !isOpen(key);
+			setOpen(key, open);
+			block.hidden = !open;
+			button.classList?.toggle('on', open);
+			button.setAttribute('aria-expanded', open ? 'true' : 'false');
+		},
+	});
+	return { block, button };
+}
+
+export function card(title, { head = [], body = null, foot = null, cls = '', help = null, helpKey } = {}) {
+	const explain = help ? helpParts(`help:${helpKey ?? title}`, help) : null;
 	return el('div', { cls: `card ${cls}`.trim() }, [
 		// `!!` because `head.length` of an empty head is the NUMBER 0, and `append` skips null/false/''
 		// but not 0 — a title-less, head-less card rendered a literal "0" above its body.
-		!!(title || head.length) &&
-			el('div', { cls: 'card-head' }, [title && el('div', { cls: 'title', text: title }), head]),
-		body && el('div', { cls: 'card-body' }, body),
+		!!(title || head.length || explain) &&
+			el('div', { cls: 'card-head' }, [title && el('div', { cls: 'title', text: title }), head, explain?.button]),
+		(body || explain) && el('div', { cls: 'card-body' }, [explain?.block, body]),
 		foot && el('div', { cls: 'card-foot' }, foot),
 	]);
 }
 
-export function stat(label, value, sub, { warn = false } = {}) {
-	return el('div', { cls: 'stat' }, [
+/**
+ * A collapsible group of cards — settings, above all, which used to open fully expanded at the
+ * bottom of every view and routinely outweighed the data above them.
+ */
+export function section(key, title, children, { open = false, meta = null } = {}) {
+	const expanded = isOpen(`section:${key}`) !== open;
+	return el('div', { cls: `section${expanded ? ' open' : ''}` }, [
+		el(
+			'button',
+			{
+				'cls': 'section-head',
+				'aria-expanded': expanded ? 'true' : 'false',
+				'onclick': (event) => {
+					setOpen(`section:${key}`, !isOpen(`section:${key}`));
+					const root = event.currentTarget.parentNode;
+					const now = isOpen(`section:${key}`) !== open;
+					root.classList?.toggle('open', now);
+					event.currentTarget.setAttribute('aria-expanded', now ? 'true' : 'false');
+				},
+			},
+			[el('span', { cls: 'chev', text: '›' }), el('span', { cls: 'section-title', text: title }), meta && muted(meta)]
+		),
+		el('div', { cls: 'section-body' }, children),
+	]);
+}
+
+/**
+ * One KPI. `sub` is a single line — the full text rides the tooltip — because a tile whose caption
+ * wraps to four lines stops being scannable in a row of eight.
+ */
+export function stat(label, value, sub, { warn = false, bad = false, title = null } = {}) {
+	const subText = typeof sub === 'string' ? sub : null;
+	return el('div', { cls: 'stat', title: title ?? subText }, [
 		el('div', { cls: 'label', text: label }),
-		el('div', { cls: `value${warn ? ' warn' : ''}`, text: value }),
+		el('div', { cls: `value${bad ? ' bad' : warn ? ' warn' : ''}`, text: value }),
 		sub && el('div', { cls: 'sub' }, [sub]),
 	]);
 }
+
+export const stats = (tiles) => el('div', { cls: 'stat-grid' }, tiles);
+
+/** Placeholder blocks while a view's first load is in flight — never "no data", which is a claim. */
+export const skeleton = () =>
+	el('div', { 'cls': 'skeleton', 'aria-busy': 'true' }, [
+		el(
+			'div',
+			{ cls: 'stat-grid' },
+			[1, 2, 3, 4, 5].map(() =>
+				el('div', { cls: 'stat sk' }, [el('div', { cls: 'sk-line short' }), el('div', { cls: 'sk-line big' })])
+			)
+		),
+		el(
+			'div',
+			{ cls: 'cols' },
+			[1, 2].map(() => el('div', { cls: 'card sk sk-chart' }))
+		),
+		el('div', { cls: 'card sk sk-table' }),
+	]);
 
 /** A definition list from `[term, value]` pairs; a null pair is skipped. */
 export function kv(pairs) {
@@ -259,6 +346,30 @@ export const unwired = (what, needs) =>
 	]);
 
 export const loading = () => el('p', { cls: 'muted', text: 'Loading…' });
+
+/**
+ * Long text shortened to its first sentence, expandable in place. Used for option descriptions,
+ * several of which run to five paragraphs and made a settings card taller than the screen.
+ */
+export function brief(key, text, { cls = 'muted' } = {}) {
+	const value = String(text ?? '').trim();
+	if (!value) return null;
+	const cut = value.search(/(?<=[.!?])\s|\n/);
+	if (cut === -1 || cut >= value.length - 1) return el('p', { cls: `brief ${cls}`, text: value });
+	const open = isOpen(`brief:${key}`);
+	const shown = el('span', { text: open ? value : value.slice(0, cut).trim() });
+	const toggle = el('button', {
+		cls: 'link more',
+		text: open ? 'less' : 'more',
+		onclick: () => {
+			const next = !isOpen(`brief:${key}`);
+			setOpen(`brief:${key}`, next);
+			shown.textContent = next ? value : value.slice(0, cut).trim();
+			toggle.textContent = next ? 'less' : 'more';
+		},
+	});
+	return el('p', { cls: `brief ${cls}` }, [shown, ' ', toggle]);
+}
 
 // ---- configuration editing -------------------------------------------------------------------
 //
@@ -589,7 +700,7 @@ export function settingRow(opt, { staged, invalid, pendingRestart, divergent, bu
 			divergent && pill('differs between nodes', 'bad'),
 			isStaged && pill('staged, not written', 'info'),
 		]),
-		opt.description && el('p', { cls: 'setting-desc', text: opt.description }),
+		brief(`opt:${opt.path}`, opt.description, { cls: 'setting-desc' }),
 		el('div', { cls: 'setting-ctl' }, [
 			control(opt, shown, (next) => onStage?.(opt.path, next), { invalid: !!invalid }),
 		]),

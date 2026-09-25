@@ -176,9 +176,17 @@ export function settingsCard(ctx, { title, prefix, paths, description, head = []
 	const editable = rows.filter((option) => option.uiEditable !== false).length;
 
 	return card(title, {
-		head: [...head, spacer(), muted(`${rows.length} option${rows.length === 1 ? '' : 's'}, ${editable} editable`)],
+		head: [
+			...head,
+			spacer(),
+			muted(
+				`${rows.length} option${rows.length === 1 ? '' : 's'}${editable < rows.length ? `, ${editable} editable` : ''}`
+			),
+		],
+		help: description || null,
+		helpKey: `settings:${prefix ?? title}`,
+		cls: 'settings',
 		body: [
-			description && el('p', { cls: 'muted chart-note', text: description }),
 			...rows.map((option) =>
 				settingRow(option, {
 					staged: Object.hasOwn(state.staged, option.path) ? state.staged[option.path] : undefined,

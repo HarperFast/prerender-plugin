@@ -18,19 +18,39 @@
  * the run. A console that prints one under the other's label turns the feature working into an
  * operator chasing a sitemap that is not stale.
  *
- * THE ANALYTICS WINDOW IS 24h AND SHARED. A refresh pass is daily, so an hour-wide window would
- * almost never contain one; 24h is also the key the Change probe view uses, so whichever loaded
- * first inside `management.analytics.cacheTtl` serves the other from the worker's cache. The walk
- * counters are the only cluster-wide view of pass outcomes — the run row above is one root on one
- * node — and `sitemap_not_modified` in particular is the ONLY evidence that conditional fetching
- * is working at all.
+ * THE ANALYTICS WINDOW IS A FIXED 24h, NOT THE GLOBAL RANGE. A refresh pass is daily, so an
+ * hour-wide window would almost never contain one — this view deliberately ignores the top bar's
+ * picker (it is not `ranged`) and says "last 24h" on the card instead. The walk counters are the
+ * only cluster-wide view of pass outcomes — the run row above is one root on one node — and
+ * `sitemap_not_modified` in particular is the ONLY evidence that conditional fetching is working.
+ *
+ * LOADS RUN CONCURRENTLY. The 24h scan is the slowest read here, so it runs alongside the list and
+ * the detail rather than ahead of them; when a selection is already known (every reload after the
+ * first), the detail is fetched alongside the list too.
  */
 
-import { ago, card, el, ICONS, kv, link, meter, muted, num, pct, pill, spacer, stat, table } from '../ui.js';
+import {
+	ago,
+	card,
+	el,
+	ICONS,
+	kv,
+	link,
+	meter,
+	muted,
+	num,
+	pct,
+	pill,
+	section,
+	spacer,
+	stat,
+	stats,
+	table,
+} from '../ui.js';
 import { emptyNote, fmtCount, pick, scanFooter, scopeLabel, sumValues, windowEmpty } from '../charts.js';
 import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
 
-export const meta = { id: 'sitemaps', label: 'Sitemaps', crumb: 'sitemaps', icon: ICONS.sitemaps };
+export const meta = { id: 'sitemaps', label: 'Sitemaps', icon: ICONS.sitemaps };
 
 const PAGE_SIZE = 50;
 
@@ -38,12 +58,19 @@ const PAGE_SIZE = 50;
 const WALK_RANGE_MS = 24 * 3_600_000;
 
 export async function load(ctx) {
-	const [res, analyticsRes] = await Promise.all([
-		ctx.get('sitemaps'),
+	const [, analyticsRes] = await Promise.all([
+		loadListAndDetail(ctx),
 		ctx.get('analytics', { range: WALK_RANGE_MS }),
 		loadConfig(ctx),
 	]);
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
+}
+
+async function loadListAndDetail(ctx) {
+	// A selection carried over from the last load (a click, a deep link, a page turn) does not need
+	// the list to resolve first, so its detail rides alongside the list fetch.
+	const known = ctx.data.selected;
+	const [res] = await Promise.all([ctx.get('sitemaps'), known ? loadDetail(ctx) : null]);
 	if (!res.ok) {
 		ctx.data.list = null;
 		ctx.data.error = res.body?.error ?? `Could not load sitemaps (${res.status})`;
@@ -57,8 +84,10 @@ export async function load(ctx) {
 	// stored sitemap by URL. Requiring the selection to appear in the root list snapped every
 	// drill-into-a-child straight back to the first root on the reload that followed the click.
 	const roots = res.body.sitemaps ?? [];
-	ctx.data.selected ??= roots[0]?.url ?? null;
-	await loadDetail(ctx);
+	if (!known) {
+		ctx.data.selected = roots[0]?.url ?? null;
+		await loadDetail(ctx);
+	}
 
 	// A selection that no longer resolves (a child that left its index between walks, a sitemap
 	// removed) falls back to the first root rather than leaving a dead pane with a stale URL in it.
@@ -89,28 +118,30 @@ async function loadDetail(ctx) {
 
 export function render(ctx) {
 	const list = ctx.data.list;
-	if (!list) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'No sitemap data.' });
+	if (!list) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load sitemaps.' });
 
 	const roots = list.sitemaps ?? [];
 
 	return [
-		el('div', { cls: 'view-head' }, [
-			el('span', { cls: 'eyebrow', text: 'Sitemaps' }),
-			list.lastFullPass && el('span', { cls: 'muted mono', text: `last full pass ${ago(list.lastFullPass)}` }),
+		appliedNote(ctx),
+		el('div', { cls: 'bar' }, [
+			el('span', { cls: 'bar-label', text: `${num(roots.length)} root sitemap${roots.length === 1 ? '' : 's'}` }),
+			list.lastFullPass && muted(`last full pass ${ago(list.lastFullPass)}`),
 			spacer(),
 			el('button', {
+				cls: 'small',
 				text: 'Refresh all',
+				title: 'Walk every root sitemap now. Each walk reaches its own children.',
 				disabled: ctx.busy,
 				// Roots only — the walk reaches its own children (see Sitemap.parentUrl).
 				onclick: () => ctx.run(() => ctx.post('sitemap-refresh', {})),
 			}),
 		]),
-		appliedNote(ctx),
 		roots.length === 0
-			? el('div', { cls: 'note' }, [
-					'No sitemaps are registered. Add one by POSTing its URL to the ',
+			? el('div', { cls: 'empty' }, [
+					'No sitemaps registered. POST a URL to the ',
 					el('code', { text: 'sitemaps' }),
-					' resource, and the daily scheduler will keep it refreshed.',
+					' resource; the daily scheduler keeps it refreshed.',
 				])
 			: el('div', { style: { display: 'flex', gap: '16px', alignItems: 'flex-start' } }, [
 					rootList(ctx, roots),
@@ -203,7 +234,7 @@ function detail(ctx) {
 			sitemap.parentUrl &&
 				el('div', { style: { marginBottom: '10px' } }, [
 					link(`↑ ${shortPath(sitemap.parentUrl)}`, () => open(ctx, sitemap.parentUrl)),
-					muted(' — the index that lists this sitemap'),
+					muted(' parent index'),
 				]),
 			el('div', { cls: 'toolbar' }, [
 				el('div', {
@@ -214,7 +245,9 @@ function detail(ctx) {
 				sitemap.isIndex && pill('index', 'info'),
 				spacer(),
 				el('button', {
+					cls: 'small',
 					text: 'Refresh now',
+					title: 'Walk this sitemap now.',
 					disabled: ctx.busy,
 					onclick: () => ctx.run(() => ctx.post('sitemap-refresh', { url: sitemap.url })),
 				}),
@@ -225,12 +258,12 @@ function detail(ctx) {
 				]),
 			refresh?.state === 'running' &&
 				el('div', { cls: 'note info', style: { marginTop: '12px' } }, [
-					`A walk is running on ${refresh.node ?? 'another node'} — ${num(refresh.sitemapsProcessed)} of ` +
-						`${num(refresh.sitemapsDiscovered)} sitemaps processed, last progress ${ago(new Date(refresh.updatedAt).getTime())}.`,
+					`Walking on ${refresh.node ?? 'another node'}: ${num(refresh.sitemapsProcessed)} of ` +
+						`${num(refresh.sitemapsDiscovered)} sitemaps, last progress ${ago(new Date(refresh.updatedAt).getTime())}.`,
 				]),
 			(refresh?.failed?.length ?? 0) > 0 &&
 				el('div', { cls: 'note warn', style: { marginTop: '12px' } }, [
-					`${refresh.failed.length} child sitemap(s) failed during the last walk: `,
+					`${refresh.failed.length} child sitemap(s) failed in the last walk: `,
 					el('span', { cls: 'mono', text: refresh.failed.map((failure) => failure.url).join(', ') }),
 				]),
 			statsRow(detail),
@@ -259,11 +292,11 @@ function detail(ctx) {
 							el('span', null, [
 								`${num(refresh.notModified)} of ${num(refresh.sitemapsProcessed)} documents`,
 								refresh.sitemapsProcessed
-									? muted(`  ${pct(refresh.notModified, refresh.sitemapsProcessed)} skipped the re-parse`)
+									? muted(`  ${pct(refresh.notModified, refresh.sitemapsProcessed)} skipped re-parse`)
 									: null,
 							]),
 						],
-						refresh.duplicates ? ['Duplicates (overlapping sitemaps)', num(refresh.duplicates)] : null,
+						refresh.duplicates ? ['Duplicates (overlapping)', num(refresh.duplicates)] : null,
 					]),
 				]),
 		],
@@ -283,62 +316,52 @@ function statsRow(detail) {
 	// on an index is not a finding, it is the shape of the data — and it reads as a total failure
 	// of the largest sitemap in the deployment. Count what an index does have instead.
 	if (sitemap.isIndex) {
-		return el('div', { style: STATS_GRID }, [
-			statCell('Child sitemaps', num(entryCount), muted('listed by this index')),
-			statCell(
-				'Child list ingested',
-				ingested,
+		return el('div', { style: { marginTop: '14px' } }, [
+			stats([
+				stat('Child sitemaps', num(entryCount), 'listed by this index'),
 				// NOT "last walked". A 304 on an index says its CHILD LIST is unchanged, and the walk
 				// still descends into every child — so this document can be hours old while the corpus
 				// behind it was rebuilt minutes ago.
-				muted(checked ? `this document, not its children · checked ${ago(checked)}` : 'this document, not its children')
-			),
-			statCell('Entries', '—', muted('an index lists sitemaps, not URLs — open one below')),
+				stat('Child list ingested', ingested, checked ? `checked ${ago(checked)}` : 'this document only', {
+					title:
+						'When this index document last changed — not its children, and not when it was last checked. ' +
+						'A 304 leaves it untouched while the walk still descends into every child.',
+				}),
+				stat('Entries', '—', 'an index lists sitemaps, not URLs', {
+					title: 'An index lists sitemaps, not URLs — open one below.',
+				}),
+			]),
 		]);
 	}
 
-	return el('div', { style: STATS_GRID }, [
-		statCell('Entries', num(entryCount), meter(1)),
-		// targetCount is a capped count of Target rows whose sitemapUrl matches (an
-		// indexed equality). Null when the count timed out — shown as unknown, not zero.
-		statCell(
-			'Targets',
-			targetCount === null ? '—' : num(targetCount.count) + (targetCount.truncated ? '+' : ''),
-			targetCount === null ? muted('count timed out') : meter(entryCount ? targetCount.count / entryCount : 0)
-		),
-		statCell(
-			'Coverage',
-			targetCount === null || !entryCount ? '—' : pct(Math.min(targetCount.count, entryCount), entryCount),
-			muted('entries with a render target')
-		),
-		// A CHILD HAS NO RUN ROW, so this is usually the only timestamp it carries — and it is an
-		// INGEST, not a check. Under conditional fetching a child that has not changed is fetched on
-		// every pass and written on none of them, so an hours-old figure here is the normal steady
-		// state rather than a walk that stopped reaching it.
-		statCell(
-			'Entries ingested',
-			ingested,
-			muted(checked ? `checked ${ago(checked)}` : 'when this document last changed — not when it was checked')
-		),
+	return el('div', { style: { marginTop: '14px' } }, [
+		stats([
+			stat('Entries', num(entryCount)),
+			// targetCount is a capped count of Target rows whose sitemapUrl matches (an
+			// indexed equality). Null when the count timed out — shown as unknown, not zero.
+			stat(
+				'Targets',
+				targetCount === null ? '—' : num(targetCount.count) + (targetCount.truncated ? '+' : ''),
+				targetCount === null ? 'count timed out' : meter(entryCount ? targetCount.count / entryCount : 0),
+				{ title: 'Target rows attributed to this sitemap (a capped count).' }
+			),
+			stat(
+				'Coverage',
+				targetCount === null || !entryCount ? '—' : pct(Math.min(targetCount.count, entryCount), entryCount),
+				'entries with a render target'
+			),
+			// A CHILD HAS NO RUN ROW, so this is usually the only timestamp it carries — and it is an
+			// INGEST, not a check. Under conditional fetching a child that has not changed is fetched on
+			// every pass and written on none of them, so an hours-old figure here is the normal steady
+			// state rather than a walk that stopped reaching it.
+			stat('Entries ingested', ingested, checked ? `checked ${ago(checked)}` : 'last change, not last check', {
+				title:
+					'When this document’s entries last changed. A 304 writes nothing, so hours old is normal — ' +
+					'it is not when the sitemap was last checked.',
+			}),
+		]),
 	]);
 }
-
-const STATS_GRID = {
-	display: 'grid',
-	gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
-	gap: '16px',
-	marginTop: '16px',
-};
-
-const statCell = (label, value, extra) =>
-	el('div', null, [
-		el('div', {
-			style: { fontSize: '12px', color: 'var(--fg-3)', textTransform: 'uppercase', letterSpacing: '0.12em' },
-			text: label,
-		}),
-		el('div', { style: { fontSize: '24px', fontWeight: '500', color: 'var(--fg-0)', marginTop: '4px' }, text: value }),
-		extra,
-	]);
 
 function entryTable(ctx, detail, entries) {
 	const filter = ctx.data.filter ?? '';
@@ -395,7 +418,7 @@ function entryTable(ctx, detail, entries) {
 					el('td', { cls: 'mono muted', text: entry.priority ?? '—' }),
 					el('td', null, [entryState(entry)]),
 					el('td', { cls: 'right' }, [
-						link('explain →', () => ctx.go('explain', { input: { url: entry.loc, deviceType: '' }, result: null })),
+						link('explain →', () => ctx.go('inspect', { input: { url: entry.loc, deviceType: '' }, result: null })),
 					]),
 				])
 	);
@@ -412,26 +435,27 @@ function entryTable(ctx, detail, entries) {
 		ctx.reload();
 	};
 
-	return el('div', { cls: 'card' }, [
-		el('div', { cls: 'card-head' }, [
+	return card(null, {
+		cls: 'flush-table',
+		head: [
 			el('div', { cls: 'searchbox', style: { maxWidth: '360px' } }, [search]),
 			filter && muted(`filtering this page only — ${visible.length} of ${entries.length} shown`),
 			spacer(),
-		]),
-		table(
+		],
+		body: table(
 			headers,
 			rows,
 			filter
-				? `No ${isIndex ? 'child sitemaps' : 'entries'} on this page match the filter.`
+				? `No ${isIndex ? 'child sitemaps' : 'entries'} on this page match.`
 				: `This ${isIndex ? 'index lists no sitemaps' : 'sitemap has no entries'}.`
 		),
-		el('div', { cls: 'card-foot' }, [
+		foot: [
 			el('span', { text: `${num(Math.min(offset + 1, total))}–${num(offset + entries.length)} of ${num(total)}` }),
 			spacer(),
 			offset > 0 && link('← prev', () => page(offset - PAGE_SIZE)),
 			offset + entries.length < total && link('next →', () => page(offset + PAGE_SIZE)),
-		]),
-	]);
+		],
+	});
 }
 
 /**
@@ -503,15 +527,13 @@ function walkActivity(ctx) {
 	const title = `Walk activity — ${scopeLabel(data)}, last 24h`;
 	if (windowEmpty(data) || !combos.length) {
 		return card(title, {
-			body: [
-				emptyNote('sitemap walk', data),
-				el('p', { cls: 'muted chart-note' }, [
-					'These counters are emitted once per FINISHED walk. A refresh pass is daily, so an empty panel ',
-					'most often means no walk completed inside the window — press Refresh all above, or check that ',
-					el('code', { text: 'sitemap.node' }),
-					' names a node that is still in the cluster.',
-				]),
+			help: [
+				'Emitted once per FINISHED walk. A pass is daily, so an empty panel usually means no walk completed ',
+				'in the last 24h — press Refresh all, or check that ',
+				el('code', { text: 'sitemap.node' }),
+				' names a node still in the cluster.',
 			],
+			body: [emptyNote('sitemap walk', data)],
 			foot: [scanFooter(data)],
 		});
 	}
@@ -523,43 +545,48 @@ function walkActivity(ctx) {
 
 	return card(title, {
 		head: [failed > 0 ? pill(`${fmtCount(failed)} failed`, 'bad') : null, spacer()],
+		help: [
+			'One emit per finished walk, summed across roots and nodes — passes, not the state of any one sitemap. ',
+			'“Rendered soon” is a SUBSET of created, capped per run by ',
+			el('code', { text: 'sitemap.newTargets.maxPerRun' }),
+			'; the overflow falls back to full-interval jitter. A 304 is still an origin request — what it saves is ',
+			'this side’s re-parse and prune scan.',
+		],
 		body: [
 			conditionalDead &&
 				el('div', { cls: 'note warn' }, [
 					el('strong', { text: 'No document was answered 304 in this window. ' }),
-					'Every walk re-parsed every sitemap and re-ran its prune scan. Conditional fetching sends ',
+					'Every walk re-parsed every sitemap: the origin ignores ',
 					el('code', { text: 'If-Modified-Since' }),
-					' from the stored validator, so a flat zero means either the origin ignores it or nothing has ',
-					'a stored validator yet — the first pass after an upgrade is legitimately all-zero here, a ',
-					'week of them is not.',
+					', or nothing has a stored validator yet (normal only for the first pass after an upgrade).',
 				]),
-			el('div', { cls: 'stats' }, [
-				stat('Documents fetched', fmtCount(documents), 'attempts across every finished walk, failures included'),
+			stats([
+				stat('Documents fetched', fmtCount(documents), 'across finished walks', {
+					title: 'Fetch attempts across every finished walk, failures included.',
+				}),
 				stat(
 					'Not modified',
 					documents ? pct(notModified, documents) : '—',
-					`${fmtCount(notModified)} skipped the re-parse and the prune scan`,
-					{ warn: conditionalDead }
+					`${fmtCount(notModified)} skipped re-parse`,
+					{ warn: conditionalDead, title: `${fmtCount(notModified)} skipped the re-parse and the prune scan.` }
 				),
 				stat(
 					'Targets created',
 					fmtCount(created),
-					created
-						? `${pct(createdSoon, created)} rendered soon rather than waiting out the jitter`
-						: 'nothing new was declared'
+					created ? `${pct(createdSoon, created)} rendered soon` : 'nothing new declared',
+					{ title: 'Rendered soon: the first render was pulled forward instead of waiting out the jitter.' }
 				),
-				stat('Re-attributed', fmtCount(updated), 'moved between sitemaps — the page did not change'),
+				stat('Re-attributed', fmtCount(updated), 'moved between sitemaps', {
+					title: 'Moved between sitemaps — the page itself did not change.',
+				}),
 				stat('Unchanged', fmtCount(skipped), 'already correct, no write'),
-				stat('Unlinked', fmtCount(removed), 'left the sitemap that declared them'),
-				stat('Failed', fmtCount(failed), 'child sitemaps a walk could not read', { warn: failed > 0 }),
-			]),
-			el('p', { cls: 'muted chart-note' }, [
-				'One emit per finished walk, summed across roots and nodes — so these are passes, not the state ',
-				'of any one sitemap; the panel above is that. “Rendered soon” is a SUBSET of created, capped per ',
-				'run by ',
-				el('code', { text: 'sitemap.newTargets.maxPerRun' }),
-				', and the overflow falls back to full-interval jitter, which is what a bulk first ingest is ',
-				'meant to look like. A 304 is still an origin request; what it saves is this side’s work.',
+				stat('Unlinked', fmtCount(removed), 'left their sitemap', {
+					title: 'Left the sitemap that declared them.',
+				}),
+				stat('Failed', fmtCount(failed), 'child sitemaps unreadable', {
+					warn: failed > 0,
+					title: 'Child sitemaps a walk could not read.',
+				}),
 			]),
 		],
 		foot: [scanFooter(data)],
@@ -573,15 +600,17 @@ function walkActivity(ctx) {
  * or how the next pass runs, and nothing here runs one — the buttons above are still the only way
  * to make a walk happen now.
  */
-const settings = (ctx) =>
-	settingsCard(ctx, {
-		title: 'Sitemap ingestion',
-		prefix: 'sitemap',
-		description:
-			'When the daily pass runs and how a walk behaves. refreshTime, timezone, node and workerIndex move ' +
-			'only the schedule — an empty node disables the periodic refresh entirely and leaves the Refresh ' +
-			'buttons above as the only trigger — and changing any of them never starts a walk now. ' +
-			'filteredWarnPercent changes the severity a refresh REPORTS when most of a sitemap is filtered out, ' +
-			'not what gets filtered: that is ingress.routes, and the Served without prerendering panel above is ' +
-			'the other half of the same question.',
-	});
+function settings(ctx) {
+	const cards = [
+		settingsCard(ctx, {
+			title: 'Sitemap ingestion',
+			prefix: 'sitemap',
+			description:
+				'When the daily pass runs and how a walk behaves. refreshTime, timezone, node and workerIndex move only ' +
+				'the schedule and never start a walk; an empty node disables the periodic refresh, leaving the Refresh ' +
+				'buttons as the only trigger. filteredWarnPercent changes what a refresh REPORTS, not what is filtered — ' +
+				'that is ingress.routes.',
+		}),
+	].filter(Boolean);
+	return cards.length ? section(meta.id, 'Settings', cards) : null;
+}

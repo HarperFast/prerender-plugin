@@ -84,7 +84,7 @@
  * its scope; the footer names the nodes.
  */
 
-import { card, el, ICONS, link, muted, num, pct, pill, spacer, stat, table } from '../ui.js';
+import { card, el, ICONS, link, muted, num, pct, pill, section, spacer, stat, stats, table } from '../ui.js';
 import {
 	barList,
 	CACHE_STATUS_COLORS,
@@ -94,14 +94,19 @@ import {
 	fmtCount,
 	fmtMs,
 	fmtNet,
+	fmtRate,
 	fmtRatio,
 	isCacheServed,
+	isMerged,
 	legend,
 	lineChart,
+	nodeColor,
+	nodeEntries,
+	nodeSeries,
 	originLoad,
 	originLoadBuckets,
+	perMinute,
 	pick,
-	rangePicker,
 	ratioOf,
 	scanFooter,
 	scopeLabel,
@@ -117,24 +122,16 @@ import {
 } from '../charts.js';
 import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 
-export const meta = { id: 'traffic', label: 'Traffic', crumb: 'traffic', icon: ICONS.traffic };
-
-const RANGES = [
-	{ label: '15m', ms: 15 * 60_000 },
-	{ label: '1h', ms: 3_600_000 },
-	{ label: '6h', ms: 6 * 3_600_000 },
-	{ label: '24h', ms: 24 * 3_600_000 },
-];
+export const meta = { id: 'traffic', label: 'Traffic', icon: ICONS.traffic, ranged: true };
 
 export async function load(ctx) {
-	ctx.data.rangeMs ??= 3_600_000;
 	// Relative by default: "1.4x the cadence" is a verdict, "4h" is a number the operator then has
 	// to look a config value up for. Absolute stays one click away in the panel head.
 	ctx.data.ageMode ??= 'ratio';
 	ctx.data.bots ??= [];
 	// Concurrent because the two are unrelated: the config read is usually already satisfied from
 	// the shared scratch, and when it is not it must still not add a round trip to the range switch.
-	const [res] = await Promise.all([ctx.get('analytics', { range: ctx.data.rangeMs }), loadConfig(ctx)]);
+	const [res] = await Promise.all([ctx.get('analytics', { range: ctx.rangeMs }), loadConfig(ctx)]);
 	ctx.data.analytics = res.ok ? res.body : null;
 	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load analytics (${res.status})`);
 }
@@ -142,33 +139,17 @@ export async function load(ctx) {
 export function render(ctx) {
 	const data = ctx.data.analytics;
 
-	const head = el('div', { cls: 'view-head' }, [
-		el('span', { cls: 'eyebrow', text: 'Traffic' }),
-		spacer(),
-		rangePicker(RANGES, ctx.data.rangeMs, (ms) => {
-			ctx.data.rangeMs = ms;
-			ctx.reload();
-		}),
-		el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
-	]);
-
 	// The settings ride along on the EMPTY exits too, not just the charted one. `analytics.enabled`
 	// is the likeliest reason this view has nothing to show, so the card that flips it belongs on
 	// the screen reporting the emptiness rather than a view away.
-	const knobs = [...settings(ctx), editTray(ctx)];
+	const knobs = [settings(ctx), editTray(ctx)];
 
 	if (!data)
-		return [
-			head,
-			appliedNote(ctx),
-			el('div', { cls: 'note bad', text: ctx.data.error ?? 'No analytics data.' }),
-			knobs,
-		];
-	if (data.available === false)
-		return [head, appliedNote(ctx), el('div', { cls: 'note bad', text: data.error }), knobs];
+		return [appliedNote(ctx), el('div', { cls: 'note bad', text: ctx.data.error ?? 'No analytics data.' }), knobs];
+	if (data.available === false) return [appliedNote(ctx), el('div', { cls: 'note bad', text: data.error }), knobs];
 
 	if (windowEmpty(data)) {
-		return [head, appliedNote(ctx), card('No traffic recorded', { body: [emptyNote('analytics', data)] }), knobs];
+		return [appliedNote(ctx), card('No traffic recorded', { body: [emptyNote('analytics', data)] }), knobs];
 	}
 
 	const filter = botFilter(ctx);
@@ -181,12 +162,12 @@ export function render(ctx) {
 	const scope = { serves, requests, ages, cadences, filter, load };
 
 	return [
-		head,
 		appliedNote(ctx),
 		botBar(ctx, data, filter),
 		filter && !serves.length ? el('div', { cls: 'note warn', text: noSelectedBotTraffic(filter) }) : null,
 		kpis(data, scope),
 		el('div', { cls: 'cols' }, [freshness(data, scope), staleness(ctx, data, scope)]),
+		instances(data, filter),
 		notFreshHit(data, scope),
 		// The two origin-side panels together: what the origin was asked, then what each ask cost.
 		el('div', { cls: 'cols' }, [originSeen(data, scope), originFetch(data, filter)]),
@@ -201,6 +182,101 @@ export function render(ctx) {
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
 	];
+}
+
+// ---- by instance ------------------------------------------------------------
+//
+// The cluster total hides the one failure a load-balanced deployment actually has: traffic that is
+// not balanced. GTM weighting, a node that dropped out of rotation, or one node whose cache is cold
+// after a restart all look like nothing in a sum. Per-node buckets come from the merge
+// (`perNodeBuckets` in util/aggregate.js), collapsed over the bot slot — so this panel cannot honour
+// the bot filter and says so.
+
+const CACHE_SOURCE_ORIGIN = 'origin';
+
+function instances(data, filter) {
+	const entries = nodeEntries(data);
+	if (!entries.length) {
+		// Node scope has nothing to compare; a merge from before per-node buckets has no time axis. The
+		// first is the common case and deserves one line pointing at the picker, not an empty card.
+		return isMerged(data)
+			? null
+			: el('div', { cls: 'hint', text: 'Viewing one node — pick “all nodes” to compare instances.' });
+	}
+
+	const window = coveredMs(data);
+	const serveTotals = entries.map((entry) => {
+		const serves = entry.buckets.filter((s) => s.metric === 'bot_serve');
+		const total = serves.reduce((acc, s) => acc + s.count, 0);
+		return {
+			entry,
+			total,
+			cache: serves.filter((s) => isCacheServed(s.method)).reduce((acc, s) => acc + s.count, 0),
+			origin: serves.filter((s) => s.path === CACHE_SOURCE_ORIGIN).reduce((acc, s) => acc + s.count, 0),
+			renders: entry.buckets.filter((s) => s.metric === 'render').reduce((acc, s) => acc + s.count, 0),
+		};
+	});
+	const clusterTotal = serveTotals.reduce((acc, row) => acc + row.total, 0);
+	const even = clusterTotal / entries.length;
+
+	const series = entries.map((entry, i) => ({
+		label: entry.label,
+		color: nodeColor(i),
+		points: perMinute(nodeSeries(entry, data.bucketCount, 'bot_serve'), data.bucketMs),
+	}));
+
+	const rows = serveTotals.map(({ entry, total, cache, origin, renders }, i) => {
+		const skew = even > 0 ? total / even : null;
+		return el('tr', null, [
+			el('td', { cls: 'mono nowrap' }, [
+				el('span', { cls: 'swatch', style: { background: nodeColor(i) } }),
+				entry.label,
+			]),
+			el('td', { cls: 'right mono', text: num(total) }),
+			el('td', { cls: 'right mono', text: window ? fmtRate(total / (window / 60_000)) : '—' }),
+			el('td', { cls: 'right' }, [
+				el('span', {
+					// ±35% of an even split is the flag: GTM weights are rarely exact, and a node carrying a
+					// third more or less than its peers is the imbalance worth seeing.
+					cls: skew !== null && Math.abs(skew - 1) > 0.35 ? 'pill warn' : 'mono',
+					text: pct(total, clusterTotal),
+					title: skew !== null ? `${fmtRatio(skew)} an even split` : null,
+				}),
+			]),
+			el('td', { cls: 'right mono', text: pct(cache, total) }),
+			el('td', { cls: 'right mono', text: pct(total - origin, total) }),
+			el('td', { cls: 'right mono muted', text: window ? `${fmtCount(renders / (window / 3_600_000))}/h` : '—' }),
+		]);
+	});
+
+	return card('By instance', {
+		head: [
+			spacer(),
+			allBotsTag(filter, 'per-node series are collapsed over the bot dimension'),
+			legend(series.map(({ label, color }) => ({ label, color }))),
+		],
+		help:
+			'Bot serves per minute on each node, and each node’s share of the cluster. A share far from an even split is ' +
+			'load-balancer weighting or a node out of rotation; a node with a much lower cache-served share has a cold or ' +
+			'missing cache. Renders/h is results that node posted — see Queue for per-node render detail.',
+		body: [
+			el('div', { cls: 'split' }, [
+				el('div', null, [lineChart(data, series, { format: fmtRate })]),
+				table(
+					[
+						'node',
+						{ text: 'serves', right: true },
+						{ text: 'rate', right: true },
+						{ text: 'share', right: true },
+						{ text: 'cache-served', right: true },
+						{ text: 'offload', right: true },
+						{ text: 'renders', right: true },
+					],
+					rows
+				),
+			]),
+		],
+	});
 }
 
 // ---- the bot filter ---------------------------------------------------------
@@ -285,10 +361,11 @@ function botBar(ctx, data, filter) {
 		),
 		hidden > 0 && muted(`+${hidden} smaller`),
 		filter &&
-			muted(
-				'filters serves, freshness, staleness, page age, the crawler mix and the discovery gate — panels ' +
-					'marked "all bots" cannot'
-			),
+			el('span', {
+				cls: 'muted',
+				text: 'panels tagged “all bots” can’t filter',
+				title: 'Filters serves, freshness, staleness, page age, the crawler mix and the discovery gate.',
+			}),
 	]);
 }
 
@@ -453,77 +530,76 @@ function kpis(data, scope) {
 	// it was an hour or a day. Sub-10 keeps a decimal: fmtCount would round a quiet crawl to "0/min".
 	const rate = perMinute === null ? '—' : `${perMinute < 10 ? perMinute.toFixed(1) : fmtCount(perMinute)}/min`;
 
-	return el('div', { cls: 'stat-grid' }, [
+	return stats([
+		stat('Bot serves', num(total), unresolvedShare > 0.02 ? `${num(unresolved)} never reached a serve` : rate, {
+			warn: unresolvedShare > 0.02,
+			title: `${num(arrived)} requests arrived at ingress; ${num(total)} resolved to a serve.`,
+		}),
 		stat(
-			'Bot serves',
-			num(total),
-			unresolvedShare > 0.02
-				? `${num(unresolved)} of ${num(arrived)} never reached a serve`
-				: `${num(arrived)} at ingress · ${rate}`,
-			{ warn: unresolvedShare > 0.02 }
-		),
-		stat(
-			'Origin offload · gross',
+			'Offload · gross',
 			pct(total - originServes, total),
-			'crawler requests not proxied live',
+			'not proxied live',
 			// The offload number is the rollout's headline; a majority-origin window deserves the flag.
-			{ warn: total > 0 && originServes > total / 2 }
+			{
+				warn: total > 0 && originServes > total / 2,
+				title: 'Share of crawler requests not proxied to the origin live.',
+			}
 		),
 		stat(
-			'Origin offload · net',
+			'Offload · net',
 			fmtNet(load.net),
-			// The subtitle carries the sum, because the tile's whole point is what the gross figure
-			// leaves out — and under a bot filter it says so, since this one cannot narrow. "Before
-			// crawler follow-up requests" is the term that is NOT in the sum (see originLoad).
 			load.arrived > 0
-				? `origin saw ${fmtCount(load.total)} of ${fmtCount(load.arrived)} asked · before crawler follow-up requests${
-						filter ? ' · all bots' : ''
-					}`
-				: 'no crawler requests in the window',
+				? `origin saw ${fmtCount(load.total)} of ${fmtCount(load.arrived)}${filter ? ' · all bots' : ''}`
+				: 'no crawler requests',
 			// Below half is a flag on either figure; below ZERO means this system is sending the origin
 			// more requests than the crawlers would have on their own — the finding, not a display bug.
-			{ warn: Number.isFinite(load.net) && load.net < 0.5 }
+			{
+				warn: Number.isFinite(load.net) && load.net < 0.5,
+				title:
+					'Gross offload minus the origin requests this system makes itself (renders, probes, sitemap fetches). ' +
+					'Documents only — crawler follow-up requests are not counted on either side.',
+			}
 		),
 		stat(
 			'Cache-served',
 			pct(cacheServes, total),
-			// Named apart the moment there are any, because the two are different claims about the
-			// deployment: a snapshot means a render covers that URL, a raw document means one never
-			// will and the origin was spared anyway.
-			rawServes > 0
-				? `answered from storage · ${pct(rawServes, total)} raw documents, not snapshots`
-				: 'stored snapshot answered'
+			// Named apart the moment there are any: a snapshot means a render covers that URL, a raw
+			// document means one never will and the origin was spared anyway.
+			rawServes > 0 ? `${pct(rawServes, total)} raw documents` : 'from a stored snapshot'
 		),
-		stat('Fresh hits', pct(freshHits, total), 'inside the configured cadence'),
+		stat('Fresh hits', pct(freshHits, total), 'inside the cadence'),
 		stat(
 			'Coverage miss',
 			pct(coverage.net, total),
 			coverage.netable
-				? `${num(coverage.absent)} excluded — the origin has no such page`
+				? `excl. ${num(coverage.absent)} origin 404s`
 				: coverage.absent > 0
-					? 'not netted: the origin 404 split is all-bots'
+					? 'incl. origin 404s (filtered)'
 					: 'nothing cached under the key',
 			// A miss the origin CAN serve is the corpus gap; the netted figure is the one worth a flag.
-			{ warn: total > 0 && coverage.net > total / 3 }
+			{
+				warn: total > 0 && coverage.net > total / 3,
+				title: 'Misses the origin could have served. A 404/410 at the origin is not a coverage gap and is excluded.',
+			}
 		),
-		stat(
-			'Serve time · cache hit',
-			fmtMs(hitMedian),
-			`median · p95 ${fmtMs(hitP95)} · origin-served ${fmtMs(otherMedian)}${filter ? ' · all bots' : ''}`
-		),
+		stat('Serve time', fmtMs(hitMedian), `cache hit median · origin ${fmtMs(otherMedian)}`, {
+			title: `Cache-hit median ${fmtMs(hitMedian)}, p95 ${fmtMs(hitP95)}. Origin-served median ${fmtMs(otherMedian)}.${
+				filter ? ' All bots.' : ''
+			}`,
+		}),
 		stat(
 			normalizable ? 'Staleness' : 'Page age',
 			normalizable ? fmtRatio(stalenessMedian) : fmtMs(ageMedian),
-			// Three numbers, because each answers a different question: the ratio is the verdict, the
-			// p95 is the tail, and the duration is what an operator quotes to someone else.
-			normalizable
-				? `median · p95 ${fmtRatio(stalenessP95)} · ${fmtMs(ageMedian)} against ${
-						basis === 'route' ? 'each route’s cadence' : fmtMs(fallback)
-					}`
-				: 'median · no render interval in the payload',
+			normalizable ? `median · ${fmtMs(ageMedian)}` : 'median',
 			// On the MEDIAN, not the p95: half the serves past their own cadence is unambiguous,
 			// where a p95 over 1.0 is where an evenly aged corpus lives anyway.
-			{ warn: Number.isFinite(stalenessMedian) && stalenessMedian > 1 }
+			{
+				warn: Number.isFinite(stalenessMedian) && stalenessMedian > 1,
+				title: normalizable
+					? `Served age ÷ ${basis === 'route' ? 'each route’s cadence' : fmtMs(fallback)}. 1.0 = exactly due. ` +
+						`p95 ${fmtRatio(stalenessP95)}.`
+					: 'No render interval in the payload, so only absolute age.',
+			}
 		),
 	]);
 }
@@ -534,19 +610,19 @@ function kpis(data, scope) {
 function freshness(data, { serves, filter }) {
 	const { keys, stacks } = stackBy(serves, 'method', data.bucketCount);
 	return card('Serves by freshness', {
-		head: [spacer(), legend(keys.map((k) => ({ label: k, color: colorFor(CACHE_STATUS_COLORS, k) })))],
+		head: [
+			filter && pill([...filter].join(', '), 'info'),
+			spacer(),
+			legend(keys.map((k) => ({ label: k, color: colorFor(CACHE_STATUS_COLORS, k) }))),
+		],
+		help:
+			'hit + swr + verified + peer-rescue + raw is cache-served. A rising miss share is a coverage problem; a rising ' +
+			'swr share is the fleet not keeping the cadence; blob-* should sit at zero. raw is a miss answered from a ' +
+			'stored ORIGIN document — it spares the origin, but nothing rendered it, so it never counts as a hit.',
 		body: [
 			serves.length
 				? stackedBars(data, keys, stacks, (k) => colorFor(CACHE_STATUS_COLORS, k))
 				: emptyNote('bot_serve', data),
-			el('p', { cls: 'muted chart-note' }, [
-				'hit + swr + verified + peer-rescue + raw is cache-served. A rising miss share is a coverage ',
-				'problem; a rising swr share is the fleet not keeping the configured cadence; blob-* should sit at ',
-				'zero. `raw` is a miss answered from a stored ORIGIN document rather than a snapshot — it spares ',
-				'the origin, but nothing rendered it, so it never counts as a hit. What each verdict costs, and ',
-				'which of them are the same problem, is the panel below.',
-			]),
-			filter && muted(`Filtered to ${[...filter].join(', ')}.`),
 		],
 	});
 }
@@ -566,7 +642,6 @@ function staleness(ctx, data, scope) {
 	const mode = normalizable && ctx.data.ageMode === 'ratio' ? 'ratio' : 'ms';
 
 	const ratioP95 = normalizable ? weighted(combos, 'p95', scaleOf) : null;
-	const ratioMedian = normalizable ? weighted(combos, 'median', scaleOf) : null;
 	const points = (stat) => weightedBuckets(combos, stat, data.bucketCount, mode === 'ratio' ? scaleOf : undefined);
 	// Plugin v0.51.0 buckets the median too. Before it, the payload carried per-bucket means and
 	// p95s only — so the typical line had to be a mean, and this chart said so. Detected rather
@@ -630,62 +705,38 @@ function staleness(ctx, data, scope) {
 				}
 			),
 		],
+		help: [
+			mode === 'ratio'
+				? 'Cache serves only. 1.0 is “exactly due”: a page expires one render interval after it was stored, so ' +
+					'above the line the fleet is not keeping the cadence. ' +
+					(swrBand
+						? `The upper line (${fmtRatio(swrBand)}) is interval + page.swrTtl, past which a page is not served at all. `
+						: '')
+				: 'Cache serves only. The dashed line is the default render interval. ',
+			basis === 'route'
+				? 'Each sample is measured against its own route’s renderInterval, so routes on different cadences compare. '
+				: `Measured against ${fmtMs(fallback)} (the default interval) — a bot-filtered window has no route. `,
+			'An evenly refreshed corpus sits at median 0.50× and p95 ~0.95× by construction, so the median is the number ',
+			'with headroom.',
+			hasMedians ? '' : ' This plugin predates per-bucket medians (v0.51.0), so the typical line is the mean.',
+		],
 		body: [
 			any
 				? lineChart(data, series, { band: bands, format: mode === 'ratio' ? fmtRatio : fmtMs })
 				: emptyNote('page_age', data),
-			el('p', { cls: 'muted chart-note' }, [
-				mode === 'ratio'
-					? 'Cache serves only, so origin proxies cannot drag it toward zero. 1.0 is “exactly due”: a page ' +
-						'expires one render interval after it was stored, so above the line the fleet is not keeping ' +
-						'the cadence. ' +
-						(swrBand
-							? `The upper line is ${fmtRatio(swrBand)} — interval + page.swrTtl, past which a page stops ` +
-								'being served at all and the next request falls through to the origin. '
-							: '')
-					: 'Cache serves only, so origin proxies cannot drag it toward zero. The dashed line is the default ' +
-						'render interval — a p95 above it means the fleet is not keeping the cadence. ',
-				basis === 'route'
-					? 'Each sample is measured against its own route’s renderInterval (route_page_age), so routes on ' +
-						'different cadences are comparable; the demand ladder can shorten an individual target’s ' +
-						'interval within that, which makes this read slightly generous.'
-					: `Measured against ${fmtMs(fallback)}, the default interval — page_age carries the bot, not the ` +
-						'route, so a per-route cadence cannot be applied to a bot-filtered window.',
-				mode === 'ratio' && Number.isFinite(ratioMedian)
-					? `This window: median ${fmtRatio(ratioMedian)}, p95 ${fmtRatio(ratioP95)}. An evenly refreshed corpus ` +
-						'sits at median 0.50× and p95 ~0.95× by construction — a page’s age walks from zero to its ' +
-						'interval and is re-rendered — so the MEDIAN is the number with headroom, and the p95 is ' +
-						'near the ceiling even when nothing is wrong. '
-					: '',
-				hasMedians
-					? 'The lines are the p95 and the median — the same two statistics as the tile, so the trend and ' +
-						'the headline cannot disagree.'
-					: 'The lines are the p95 and the MEAN: this node’s plugin predates per-bucket medians (v0.51.0), ' +
-						'so the typical case is a tile figure here rather than a trend.',
-			]),
 			contradicted &&
 				el('div', { cls: 'note' }, [
-					el('strong', { text: 'The freshness verdicts disagree with this ratio, and they are the authority. ' }),
-					`Only ${pct(pastDue, agedServes)} of snapshot serves were past due (swr + stale), which is decided per `,
-					'request against that page’s own expiry — so these pages are fresh and the divisor is short. That ',
-					'happens when a target’s cadence comes from its stored interval (a sitemap ',
+					el('strong', { text: 'The freshness verdicts disagree with this ratio, and they win. ' }),
+					`Only ${pct(pastDue, agedServes)} of snapshot serves were past due — the divisor is short. Targets `,
+					'whose cadence comes from a sitemap ',
 					el('code', { text: 'changefreq' }),
-					') rather than from ',
-					el('code', { text: 'ingress.routes' }),
-					', which is the only cadence this console can see. Set the route’s renderInterval to make this ',
-					'panel agree with reality.',
+					' are measured against the route’s interval; set the route’s renderInterval to match.',
 				]),
-			!normalizable &&
-				el('div', {
-					cls: 'note',
-					text: 'This node’s analytics payload carries no render interval, so only absolute age can be shown.',
-				}),
+			!normalizable && el('div', { cls: 'empty', text: 'No render interval in the payload — absolute age only.' }),
 			discarded > 0 &&
 				el('div', {
 					cls: 'note warn',
-					text:
-						`${num(discarded)} served page(s) reported a NEGATIVE age and were discarded from this ` +
-						'distribution — a snapshot stamped in this node’s future, i.e. cross-node clock skew.',
+					text: `${num(discarded)} serve(s) had a negative age and were dropped — cross-node clock skew.`,
 				}),
 		],
 	});
@@ -912,17 +963,12 @@ function notFreshHit(data, { serves, filter }) {
 	];
 
 	if (!total) {
-		return card('Not a fresh hit — what, and what it cost', { head, body: [emptyNote('bot_serve', data)] });
+		return card('Not a fresh hit', { head, body: [emptyNote('bot_serve', data)] });
 	}
 	if (!rows.length) {
 		return card('Every serve was a fresh hit', {
 			head,
-			body: [
-				el('div', { cls: 'note ok' }, [
-					'Every bot serve in this window was answered from cache inside its render interval — no misses, ',
-					'no stale pages, no blob faults, nothing proxied.',
-				]),
-			],
+			body: [el('div', { cls: 'note ok', text: 'Every bot serve in this window was a fresh cache hit.' })],
 		});
 	}
 
@@ -932,8 +978,8 @@ function notFreshHit(data, { serves, filter }) {
 			.sort((a, b) => b[1] - a[1])
 			.map(([source, count]) => `${source} ${pct(count, row.count)}`)
 			.join(' · ');
-		return el('tr', null, [
-			el('td', null, [pill(row.status), el('div', { cls: 'muted', text: row.means })]),
+		return el('tr', { title: row.means }, [
+			el('td', { cls: 'nowrap' }, [pill(row.status), el('span', { cls: 'muted cell-hint', text: row.means })]),
 			el('td', { cls: 'right mono', text: num(row.count) }),
 			el('td', { cls: 'right mono', text: pct(row.count, total) }),
 			el('td', { cls: 'mono', text: answered }),
@@ -948,8 +994,17 @@ function notFreshHit(data, { serves, filter }) {
 		]);
 	});
 
-	return card('Not a fresh hit — what, and what it cost', {
+	return card('Not a fresh hit', {
 		head,
+		help: [
+			'One row per freshness verdict, because each has a different fix: coverage is fixed in the corpus (discovery, ',
+			'sitemaps), cadence by render capacity or a longer interval, integrity is blob health, invalidation is a bulk ',
+			'invalidation doing its job (verified is what per-page verification bought back), and not-cacheable is ',
+			'working as configured. "origin median" is what that verdict typically costs at the origin (p95 in the ',
+			'tooltip); "origin answered" is what came back — absent (404/410) is a page nobody has, and only served is a ',
+			'page we could have had cached.',
+			filter ? ' * origin_fetch has no bot dimension: those columns are all bots.' : '',
+		],
 		body: [
 			el(
 				'div',
@@ -984,31 +1039,15 @@ function notFreshHit(data, { serves, filter }) {
 				body
 			),
 			coverage.absent > 0 &&
-				el('div', { cls: 'note' }, [
-					el('strong', {
-						text: `${num(coverage.absent)} of the misses (${pct(coverage.absent, coverage.missServes)}) were 404 or 410 at the origin. `,
-					}),
-					'Those URLs do not exist, so there is nothing for the cache to be missing — they are not a ',
-					'coverage gap, and ',
-					coverage.netable
-						? 'they are excluded from the Coverage figures above'
-						: 'they would be excluded but for the bot filter',
-					'. They also cannot improve: only a 200 is ever scheduled for prerendering, so the same URL ',
-					'misses on every crawl. A large or growing population here is usually crawler-invented URLs ',
-					'rather than anything this deployment did — the crawler sees the origin’s own 404, which is ',
-					'counted in the status panel below.',
-				]),
-			el('p', { cls: 'muted chart-note' }, [
-				'One row per freshness verdict, because they are different problems: coverage is fixed in the ',
-				'corpus (discovery, sitemaps), cadence by render capacity or a longer interval, integrity is blob ',
-				'health and never a caching question, invalidation is a bulk invalidation doing its job — with ',
-				'`verified` the part per-page verification bought back — and not-cacheable is working as configured. ',
-				'“origin median” is what that verdict typically costs at the origin, with its p95 in the tooltip — and ',
-				'“origin answered” is what came back: `absent` (404/410) is a page nobody has, `server-error` and ',
-				'`connect-fail` are the origin in trouble, and only `served` is a page we could have had cached.',
-				filter ? ' * origin_fetch carries no bot dimension: those two columns are all bots.' : '',
-			]),
+				el('div', {
+					cls: 'hint',
+					text:
+						`${num(coverage.absent)} of the misses (${pct(coverage.absent, coverage.missServes)}) were 404/410 at the ` +
+						`origin — no such page, so not a coverage gap${coverage.netable ? ' (excluded above)' : ''}. Only a 200 is ` +
+						'ever scheduled, so these miss on every crawl; usually crawler-invented URLs.',
+				}),
 		],
+		cls: 'flush-table',
 	});
 }
 
@@ -1027,13 +1066,10 @@ function latency(data, filter) {
 			allBotsTag(filter, 'Harper’s per-request timing'),
 			legend(series.map(({ label, color }) => ({ label, color }))),
 		],
-		body: [
-			any ? lineChart(data, series) : emptyNote('duration', data),
-			el('p', { cls: 'muted chart-note' }, [
-				'Harper’s own per-request timing for bot traffic, split by its independent cache verdict — ',
-				'a cross-check on the freshness panel. Percentiles are count-weighted merges: trend, not SLO.',
-			]),
-		],
+		help:
+			'Harper’s own per-request timing for bot traffic, split by its independent cache verdict — a cross-check on ' +
+			'the freshness panel. Percentiles are count-weighted merges: trend, not SLO.',
+		body: [any ? lineChart(data, series) : emptyNote('duration', data)],
 	});
 }
 
@@ -1076,7 +1112,10 @@ function crawlers(data, { serves, requests, filter }) {
 	const hosts = tally('path');
 
 	return card('Crawlers', {
-		head: [spacer(), filter && muted(`${[...filter].join(', ')} only`)],
+		head: [spacer(), filter && pill([...filter].join(', '), 'info')],
+		help:
+			'A crawler missing from this list is an unmatched User-Agent, not zero traffic — the registry and ' +
+			'analytics.deriveUnknownBots decide the labels. Device and host come from ingress requests.',
 		body: [
 			el('div', { cls: 'cols' }, [
 				el('div', null, [
@@ -1098,11 +1137,6 @@ function crawlers(data, { serves, requests, filter }) {
 							{ color: SERIES[3] }
 						),
 				]),
-			]),
-			el('p', { cls: 'muted chart-note' }, [
-				'Narrow every filterable panel to one crawler with the bot chips at the top of the page. A crawler ',
-				'missing from this list is an unmatched User-Agent, not zero traffic — the registry and ',
-				'analytics.deriveUnknownBots decide the labels.',
 			]),
 		],
 	});
@@ -1131,6 +1165,7 @@ function statusCodes(data, filter) {
 
 	return card('Status codes served to bots', {
 		head: [spacer(), allBotsTag(filter, 'Harper’s per-response counters')],
+		help: 'A metric exists only for codes that occurred — an absent code is zero, not unknown.',
 		body: [
 			ranked.length
 				? barList(
@@ -1150,9 +1185,6 @@ function statusCodes(data, filter) {
 					cls: 'note bad',
 					text: `${pct(serverErrors, total)} of responses to crawlers were 5xx (${num(serverErrors)}).`,
 				}),
-			el('p', { cls: 'muted chart-note' }, [
-				'A metric exists only for codes that occurred — an absent code is zero, not unknown.',
-			]),
 		],
 	});
 }
@@ -1192,41 +1224,47 @@ function originSeen(data, { load, filter }) {
 	const keys = present.map((row) => row.key);
 	const colorOf = (key) => LOAD_ROWS.find((row) => row.key === key)?.color ?? 'var(--fg-4)';
 
+	// The fifth term is stated rather than guessed: a rendering crawler runs the page, and its XHR/fetch
+	// calls go straight to the origin, never through this plugin — so the figure is documents-only on
+	// both sides. See `originLoad` in charts.js for the full ledger.
+	const help = [
+		'Every request the origin answered because this deployment exists, against what crawlers asked for. Gross ',
+		'offload counts only proxied serves; net offload subtracts all of them. A render counts as one request (the ',
+		'document); a probe is one small endpoint call. Not counted: requests the CDN answered from its own cache, ',
+		'renders that never posted a result, and — on both sides — the XHR/fetch calls a rendering crawler’s page ',
+		'makes (they bypass this plugin). Where snapshots are served without scripts, true net offload is higher than ',
+		'shown.',
+		load.lumpy
+			? ' Probe and sitemap counts land where a pass FINISHED, so over a range shorter than a pass quote the 24h figure.'
+			: '',
+	];
+
 	return card('What the origin actually saw', {
 		head: [
 			spacer(),
 			allBotsTag(filter, 'renders, probes and sitemap fetches are not for any one crawler'),
 			legend(present.map((row) => ({ label: row.label, color: row.color }))),
 		],
+		help,
 		body: !load.total
-			? [
-					el('div', { cls: 'note ok' }, [
-						'Nothing in this window reached the origin — no proxied serve, no render, no probe, no sitemap ',
-						'fetch. Offload is 100% gross and net alike.',
-					]),
-					followUpNote(load),
-				]
+			? [el('div', { cls: 'note ok', text: 'Nothing in this window reached the origin — 100% offload.' })]
 			: [
-					el('div', { cls: 'stat-grid tight' }, [
-						stat('Crawlers asked for', fmtCount(load.arrived), 'requests at ingress, all bots'),
-						stat(
-							'The origin answered',
-							fmtCount(load.total),
-							`${pct(load.total, load.arrived)} of that — ${fmtNet(load.net)} net offload`,
-							{ warn: Number.isFinite(load.net) && load.net < 0.5 }
-						),
-						stat(
-							'Gross offload counts',
-							fmtCount(load.proxied),
-							`${fmtCount(load.total - load.proxied)} more came from this system`
-						),
-						// The unmeasured term gets a tile so it sits in the same row as the measured ones, at
-						// the same size — not a footnote under a number that looks complete without it.
-						stat(
-							'Crawler follow-up requests',
-							'not measured',
-							`${fmtCount(load.handed)} pages handed to crawlers · counted on neither side of the ledger`
-						),
+					Number.isFinite(load.net) &&
+						load.net < 0 &&
+						el('div', { cls: 'note warn' }, [
+							el('strong', { text: 'Net offload is negative. ' }),
+							'Renders and probes send the origin more requests than the crawlers would have — expected while a ',
+							'corpus backfills. Levers: render interval, demand floors, the discovery gate, probe rate. Read it over 24h.',
+						]),
+					stats([
+						stat('Crawlers asked', fmtCount(load.arrived), 'requests at ingress'),
+						stat('Origin answered', fmtCount(load.total), `${fmtNet(load.net)} net offload`, {
+							warn: Number.isFinite(load.net) && load.net < 0.5,
+						}),
+						stat('Proxied', fmtCount(load.proxied), `+${fmtCount(load.total - load.proxied)} from this system`),
+						stat('Follow-ups', 'not measured', `${fmtCount(load.handed)} pages handed to crawlers`, {
+							title: 'The XHR/fetch calls a rendering crawler’s page makes are counted on neither side of the ledger.',
+						}),
 					]),
 					stackedBars(data, keys, stacks, colorOf, { format: fmtCount }),
 					barList(
@@ -1239,59 +1277,8 @@ function originSeen(data, { load, filter }) {
 						})),
 						{ format: fmtCount }
 					),
-					el('p', { cls: 'muted chart-note' }, [
-						'Every request the origin answered because this deployment exists, against what crawlers asked ',
-						'for. Gross offload counts only the first bar; net offload subtracts all of them. A render is ',
-						'counted as ONE request — the document; the page’s own scripts and stylesheets reach the origin ',
-						'too if the CDN does not cache them for the renderer, which nothing here can see. A probe is one ',
-						'small endpoint call, not a page render — cheaper per request than the others, but a request.',
-						load.lumpy
-							? ' Probe and sitemap counts land where a PASS FINISHED, not where the requests happened: over ' +
-								'a range shorter than a sweep this is either none of a running pass or all of one that just ' +
-								'ended. Quote the 24h figure.'
-							: '',
-						' Not counted: requests the CDN answered from its own cache, and renders that never posted a result.',
-					]),
-					followUpNote(load),
-					Number.isFinite(load.net) &&
-						load.net < 0 &&
-						el('div', { cls: 'note warn' }, [
-							el('strong', { text: 'The origin saw more requests than the crawlers made. ' }),
-							'Net offload is negative: the render and probe cadence is generating more origin load than ',
-							'the bot traffic it is standing in for. That is the expected shape of a fresh deployment ',
-							'backfilling its corpus, and of a corpus much larger than what crawlers actually walk — the ',
-							'levers are the render interval, the demand ladder’s floors, the discovery gate, and the ',
-							'probe rate. Read it over 24h before acting on it.',
-						]),
 				],
 	});
-}
-
-/**
- * The fifth term, spelled out. Shown whenever a page was handed to a crawler at all — including on
- * the "nothing reached the origin" exit, where a net offload of 100% is precisely the claim this
- * term qualifies (in that case, upward).
- */
-function followUpNote(load) {
-	if (!load.handed) return null;
-	return el('div', { cls: 'note' }, [
-		el('strong', {
-			text: `${num(load.handed)} pages were handed to crawlers, and the requests their scripts make are counted on neither side. `,
-		}),
-		'A rendering crawler (Googlebot, Bingbot, Applebot) fetches a page and then runs it, and the page makes ',
-		'its own XHR/fetch calls to the origin — inventory, pricing, personalisation — which are exactly the ',
-		'calls no CDN caches. Without this system every such crawl costs the origin the document PLUS those ',
-		'calls, so the “crawlers asked for” baseline above understates what the origin was spared. With it, a ',
-		'snapshot served without its scripts triggers none of them (a saving not credited above), a snapshot ',
-		'that keeps its scripts or a proxied origin page triggers them as before (a cost not charged), and our ',
-		'own renders run the page too (each render is really the document plus those calls). None of it passes ',
-		'through this plugin — the CDN sends a crawler’s subrequests straight to the origin — so the figure is ',
-		'documents-only on both sides and says so, for every crawler rather than a guessed subset. Where ',
-		'snapshots are served with scripts stripped, the true net offload for rendering crawlers is HIGHER than ',
-		'shown. The render fleet can measure the per-page factor (it loads the same pages and already classifies ',
-		'every same-origin response as cacheable or not); applied to both sides by what the registry says each ',
-		'crawler runs, this becomes a counted term.',
-	]);
 }
 
 /** What a non-cache serve costs: why the origin was consulted, how slowly it answered, and with what. */
@@ -1317,6 +1304,9 @@ function originFetch(data, filter) {
 
 	return card('Origin fetches', {
 		head: [spacer(), allBotsTag(filter, 'origin_fetch'), legend(series.map(({ label, color }) => ({ label, color })))],
+		help:
+			'Time to response headers, by why the origin was consulted — the freshness verdicts, plus render-timeout ' +
+			'(renderNow falling back because the fleet did not land an on-demand render in time).',
 		body: fetches.length
 			? [
 					lineChart(data, series),
@@ -1331,11 +1321,6 @@ function originFetch(data, filter) {
 						{}
 					),
 					el('p', { cls: 'muted chart-note mono' }, [`origin answered: ${codes.join(' · ')}`]),
-					el('p', { cls: 'muted chart-note' }, [
-						'Time to response headers, by why the origin was consulted — the same reasons as the ',
-						'freshness verdicts above, plus render-timeout, which is renderNow falling back because the ',
-						'fleet did not land an on-demand render in time.',
-					]),
 				]
 			: [emptyNote('origin_fetch', data)],
 	});
@@ -1445,8 +1430,16 @@ function routes(ctx, data, cadences, filter) {
 		head: [
 			spacer(),
 			allBotsTag(filter, 'route_serve carries the route in the slot bot_serve uses for the bot'),
-			link('explain a url →', () => ctx.go('explain')),
+			link('inspect a url →', () => ctx.go('inspect')),
 		],
+		help: [
+			'The cadence-tuning table. "÷ cadence" is the route’s median served age against its own renderInterval, so ',
+			'1.0 means the same everywhere: half that route’s serves were past due. An evenly refreshed route sits near ',
+			'0.50× (p95, in the tooltip, near 0.95× by construction). Miss is flagged only on routes we cache — a ',
+			'passthrough is proxied live by design. "default" cadence inherits render.defaultInterval; "floor" is the ',
+			'fastest rung the demand ladder may grant. "gated" routes no longer mint a target for an unknown URL.',
+		],
+		cls: 'flush-table',
 		body: [
 			table(
 				[
@@ -1464,24 +1457,11 @@ function routes(ctx, data, cadences, filter) {
 				].filter(Boolean),
 				rows
 			),
-			el('p', { cls: 'muted chart-note' }, [
-				'The cadence-tuning table. “÷ cadence” is that route’s MEDIAN served age against its own ',
-				'renderInterval, so every row is comparable and 1.0 means the same thing everywhere: half that ',
-				'route’s serves were past due. An evenly refreshed route sits near 0.50×, and its p95 — in the ',
-				'cell’s tooltip — sits near 0.95× by construction, which is why the tail is not what you tune ',
-				'against. A high miss share means its corpus ',
-				'isn’t covered — flagged only on routes we actually cache, since a passthrough is proxied live by ',
-				'design. Cadence is read from ingress.routes; “default” means the route sets none and inherits ',
-				'render.defaultInterval, and “floor” is the fastest rung the demand ladder may grant it. ',
-				'“Gated” means the route no longer mints a target for an unknown URL a bot asks for — those ',
-				'requests are still served from the origin, they just never enter the render rotation.',
-			]),
 			unclassified > 0 &&
 				el('div', { cls: 'note warn' }, [
-					`${pct(unclassified, total)} of route-attributed serves matched no route at all. Either the CDN is `,
-					'forwarding paths nobody declared or the route list is incomplete — the unrouted report on ',
-					link('Config', () => ctx.go('config')),
-					' buckets them by first path segment.',
+					`${pct(unclassified, total)} of serves matched no route — the CDN forwards undeclared paths or the route `,
+					'list is incomplete. ',
+					link('See the unrouted report →', () => ctx.go('config')),
 				]),
 		],
 	});
@@ -1525,19 +1505,16 @@ function discoveryGate(ctx, data, filter) {
 	if (!total && !botGateOn && !gatedRoutes.length) {
 		return card('Discovery gate', {
 			head: [spacer(), pill('not configured', '')],
-			body: [
-				el('p', { cls: 'muted chart-note' }, [
-					'Every route mints a target for any unknown URL a bot asks for, and every bot is trusted to do ',
-					'it. On a route whose URL space is combinatorial — facets, filter and sort permutations — that ',
-					'is unbounded: crawlers walk novel combinations into permanent render load. ',
-					el('code', { text: 'discoverTargets' }),
-					' on a route, and ',
-					el('code', { text: 'ingress.discoveryBots' }),
-					', are the two gates; both are under Request ingestion on ',
-					link('Config →', () => ctx.go('config')),
-					'.',
-				]),
+			help: [
+				'Every route mints a target for any unknown URL a bot asks for. On a combinatorial URL space (facets, ',
+				'filters, sorts) that is unbounded render load. The gates are ',
+				el('code', { text: 'discoverTargets' }),
+				' per route and ',
+				el('code', { text: 'ingress.discoveryBots' }),
+				' — under Request ingestion on ',
+				link('Config →', () => ctx.go('config')),
 			],
+			body: [el('div', { cls: 'empty', text: 'Every route mints targets for any bot.' })],
 		});
 	}
 
@@ -1556,11 +1533,15 @@ function discoveryGate(ctx, data, filter) {
 				: null,
 			botGateOn ? pill(bots.length ? `minting: ${bots.join(', ')}` : 'sitemap-only corpus', 'info') : null,
 			spacer(),
-			link('purge what is already in →', () => ctx.go('overview')),
+			link('purge what is already in →', () => ctx.go('corpus')),
 		],
+		help:
+			'Counted per gated MISS, so a URL refused a hundred times counts a hundred — the crawl pressure the gate ' +
+			'absorbs, not URLs prevented. A gated request is still served (from the origin); it just never enters the ' +
+			'render rotation. Gating stops NEW targets only: purge what was minted before, on Corpus.',
 		body: [
-			el('div', { cls: 'stats' }, [
-				stat('Gated misses', fmtCount(total), 'served from the origin, never scheduled'),
+			stats([
+				stat('Gated misses', fmtCount(total), 'served from origin, never scheduled'),
 				stat('By route flag', fmtCount(byGate.get(GATE_ROUTE_FLAG) ?? 0), 'discoverTargets: false'),
 				stat('By bot allowlist', fmtCount(byGate.get(GATE_BOT_ALLOWLIST) ?? 0), 'ingress.discoveryBots'),
 			]),
@@ -1569,17 +1550,7 @@ function discoveryGate(ctx, data, filter) {
 						ranked.map(([bot, count]) => ({ label: bot, value: count })),
 						{ format: fmtCount }
 					)
-				: el('p', { cls: 'muted chart-note' }, [
-						'The gate is configured and refused nothing in this window — no bot asked for an unknown URL ',
-						'on a gated route. That is the steady state once crawlers have stopped exploring; it is also ',
-						'what a range too narrow to contain a crawl looks like.',
-					]),
-			el('p', { cls: 'muted chart-note' }, [
-				'Counted per gated MISS, so a URL refused a hundred times counts a hundred — this is the crawl ',
-				'pressure the gate is absorbing, not a count of URLs prevented. Gating stops NEW targets only: ',
-				'everything minted before the flag went on keeps rendering until it is purged, and the ',
-				'sitemap pipeline is untouched, so declared URLs on a gated route still schedule normally.',
-			]),
+				: el('div', { cls: 'empty', text: 'Configured, and refused nothing in this range.' }),
 		],
 	});
 }
@@ -1672,22 +1643,18 @@ function rawCache(ctx, data, filter) {
 	if (!enabled && !total && !rawServes) {
 		return card('Raw-document cache', {
 			head: [spacer(), pill('off', '')],
-			body: [
-				el('p', { cls: 'muted chart-note' }, [
-					'A URL outside the render rotation — a facet or parameter combination a crawler invented — ',
-					'misses on every single request, and every miss is an origin fetch for a document the origin ',
-					'served minutes ago to a different crawler. With ',
-					el('code', { text: 'render.raw.enabled' }),
-					' and ',
-					el('code', { text: 'rawCache' }),
-					' on a route, that document is kept and the next crawler is answered from storage: no render ',
-					'capacity, no second origin request. It is NOT a prerendered snapshot — verify the route’s ',
-					'server-rendered HTML already carries its whole SEO surface before enabling it there. Both ',
-					'switches are under Rendering on ',
-					link('Config →', () => ctx.go('config')),
-					'.',
-				]),
+			help: [
+				'Keeps the origin document a miss already fetched, so the next crawler asking for a URL outside the render ',
+				'rotation is answered from storage. It is NOT a prerendered snapshot — check the route’s server-rendered ',
+				'HTML carries its SEO surface first. Switches: ',
+				el('code', { text: 'render.raw.enabled' }),
+				' and ',
+				el('code', { text: 'rawCache' }),
+				' on a route (',
+				link('Config →', () => ctx.go('config')),
+				').',
 			],
+			body: [el('div', { cls: 'empty', text: 'Off.' })],
 		});
 	}
 
@@ -1706,44 +1673,33 @@ function rawCache(ctx, data, filter) {
 				: pill('no route opted in', 'warn'),
 			spacer(),
 		],
+		help: [
+			'One row per store ATTEMPT, so a route that is enabled and filling nothing is distinguishable from one that is ',
+			'off. A raw document only replaces an origin PROXY on a true miss — never a stale or invalidated snapshot. ',
+			'Stored documents expire on ',
+			el('code', { text: 'render.raw.expiry' }),
+			' and refill on demand. "kept as unshared" is ',
+			el('code', { text: 'render.raw.assumeShared' }),
+			' storing a document the origin marked personal: a census, not an alarm — the body-diff test (two visitors, ',
+			'different IPs/locales) is the real detector.',
+		],
 		body: [
 			// The two refusals that are findings rather than traffic, each above the breakdown so it
 			// is not something an operator has to spot in a bar list.
 			cookieRefusals > 0 &&
 				el('div', { cls: 'note bad' }, [
 					el('strong', { text: `${num(cookieRefusals)} document(s) refused for setting a cookie. ` }),
-					'The origin is personalizing a route that was enabled on the assumption it is shared. The ',
-					'refusal is correct — a stored personalized document would be replayed to every crawler that ',
-					'asks — but the assumption is not, and nothing else here reports it. Check what that route ',
-					'sets, or take it off ',
+					'The origin personalizes a route enabled as shared — check what it sets, or take it off ',
 					el('code', { text: 'rawCache' }),
 					'.',
 				]),
-			unshared > 0 &&
-				el('div', { cls: 'note' }, [
-					el('strong', {
-						text: `${num(unshared)} of ${num(stored)} stored document(s) were kept despite the origin marking them personal. `,
-					}),
-					'That is ',
-					el('code', { text: 'render.raw.assumeShared' }),
-					' doing what it was set for: the origin sends ',
-					el('code', { text: 'Set-Cookie' }),
-					' or ',
-					el('code', { text: 'Cache-Control: private' }),
-					' on a route a CDN in front already serves one shared copy of. Treat this as a CENSUS of how ',
-					'much of the route the origin calls personal, NOT as an alarm — on an origin that cookies every ',
-					'response it sits at 100% from the first minute and cannot rise. The detector that still works ',
-					'is the body diff: fetch a URL as two visitors from different IPs and locales and compare the ',
-					'content. If anything but per-request telemetry differs, turn the option off.',
-				]),
 			oversize > 0 &&
 				el('div', { cls: 'note warn' }, [
-					el('strong', { text: `${num(oversize)} document(s) were larger than render.raw.maxBytes` }),
-					maxBytes ? ` (${fmtCount(maxBytes)} bytes)` : '',
-					'. Those were served and not stored, so the route is enabled and cannot fill. The cap bounds ',
-					'COMPRESSED bytes as the origin sent them, and budget roughly 2× it per in-flight capture.',
+					el('strong', { text: `${num(oversize)} document(s) exceeded render.raw.maxBytes` }),
+					maxBytes ? ` (${fmtCount(maxBytes)} compressed bytes)` : '',
+					' — served, not stored, so the route cannot fill.',
 				]),
-			el('div', { cls: 'stats' }, [
+			stats([
 				stat(
 					'Stored',
 					fmtCount(stored),
@@ -1751,7 +1707,7 @@ function rawCache(ctx, data, filter) {
 						? `${pct(stored, total)} of ${fmtCount(total)} attempts${unshared > 0 ? ` · ${num(unshared)} kept as unshared` : ''}`
 						: 'no attempts'
 				),
-				stat('Refused', fmtCount(refused), 'the reasons are below — this is the number to read', {
+				stat('Refused', fmtCount(refused), 'reasons below', {
 					warn: total > 0 && stored === 0,
 				}),
 				// Deliberately NOT stored ÷ serves: a document stored in this window is read by the next
@@ -1759,11 +1715,11 @@ function rawCache(ctx, data, filter) {
 				stat('Raw serves', fmtCount(rawServes), `misses answered from storage${filter ? ' · filtered' : ''}`),
 			]),
 			total === 0
-				? el('p', { cls: 'muted chart-note' }, [
-						'No store attempt in this window. A capture is only ever attempted on a MISS on an opted-in ',
-						'route, so this is either a route mix that is not missing or a window too narrow to contain ',
-						'one — not a fault.',
-					])
+				? el('div', {
+						cls: 'empty',
+						text: 'No store attempt in this range.',
+						title: 'A capture is only attempted on a miss on an opted-in route.',
+					})
 				: stored === total
 					? el('div', { cls: 'note ok' }, ['Every eligible document in this window was stored.'])
 					: // A TABLE, not a bar list, and for the same reason the non-hit verdicts are one: the
@@ -1773,22 +1729,16 @@ function rawCache(ctx, data, filter) {
 							['refusal', { text: 'documents', right: true }, { text: 'share', right: true }],
 							ranked.map(([outcome, count]) => {
 								const [means, severity] = RAW_REFUSALS[outcome] ?? ['an outcome this console does not know about', ''];
-								return el('tr', null, [
-									el('td', null, [pill(outcome, severity), el('div', { cls: 'muted', text: means })]),
+								return el('tr', { title: means }, [
+									el('td', { cls: 'nowrap' }, [
+										pill(outcome, severity),
+										el('span', { cls: 'muted cell-hint', text: means }),
+									]),
 									el('td', { cls: 'right mono', text: num(count) }),
 									el('td', { cls: 'right mono', text: pct(count, total) }),
 								]);
 							})
 						),
-			el('p', { cls: 'muted chart-note' }, [
-				'One row per store ATTEMPT, which is what makes a route that is enabled and filling nothing ',
-				'distinguishable from one that is switched off — the two are identical in every other number on ',
-				'this page. A raw document only ever replaces an origin PROXY: it is read on a true miss and ',
-				'never in place of a stale or invalidated snapshot, because those mean a render is coming and ',
-				'the live origin is the better answer. Stored documents expire on ',
-				el('code', { text: 'render.raw.expiry' }),
-				' and refill on demand, one request at a time.',
-			]),
 		],
 	});
 }
@@ -1808,14 +1758,15 @@ function breadth(ctx, filter) {
 	const body = [];
 	if (!state) {
 		body.push(
-			el('p', { cls: 'muted' }, [
-				'Distinct URLs each bot touched per day, from the crawl sketch (±2% at any scale). ',
-				'Loads on demand — it is its own capped scan.',
-			]),
-			el('button', { text: 'Load 7-day breadth', onclick: loadBreadth })
+			el('button', {
+				cls: 'small',
+				text: 'Load 7-day breadth',
+				title: 'Its own capped scan of the sketch table, so it loads on demand.',
+				onclick: loadBreadth,
+			})
 		);
 	} else if (state.loading) {
-		body.push(el('p', { cls: 'muted', text: 'Merging sketches…' }));
+		body.push(el('div', { cls: 'empty', text: 'Merging sketches…' }));
 	} else if (state.error) {
 		body.push(el('div', { cls: 'note bad', text: state.error }));
 	} else {
@@ -1866,17 +1817,21 @@ function breadth(ctx, filter) {
 						),
 					]),
 				]),
-				el('p', { cls: 'muted chart-note' }, [
-					'Sketch estimates (±2% at any scale); the day total is the union across bots, not a sum' +
-						(state.truncated ? ' — sketch scan truncated, so these undercount' : '') +
-						'. Compare against the corpus size on the overview.',
-				]),
-				el('button', { text: 'Reload', onclick: loadBreadth })
+				state.truncated && el('div', { cls: 'note warn', text: 'Sketch scan truncated — these undercount.' })
 			);
 		}
 	}
 
-	return card('Crawl breadth', { body });
+	return card('Crawl breadth', {
+		head: [
+			spacer(),
+			state && !state.loading && !state.error && el('button', { cls: 'small', text: 'Reload', onclick: loadBreadth }),
+		],
+		help:
+			'Distinct URLs each bot touched per day, from the crawl sketch (±2% at any scale). The day total is the union ' +
+			'across bots, not a sum. Compare against the corpus size on Corpus.',
+		body,
+	});
 }
 
 // ---- settings ---------------------------------------------------------------
@@ -1886,33 +1841,34 @@ function breadth(ctx, filter) {
 // RECORDED and one decides what this console may READ — a distinction the descriptions have to
 // carry, since a recording change leaves history intact and a read change leaves nothing at all.
 
-const settings = (ctx) => [
-	settingsCard(ctx, {
-		title: 'Analytics recording',
-		prefix: 'analytics',
-		description:
-			'What the plugin records for bot traffic, and under which names. Turning recording off empties ' +
-			'every panel above from the moment it takes effect — it does not delete rows already recorded, ' +
-			'and it changes nothing about what bots are served. The bot registry and deriveUnknownBots decide ' +
-			'the labels in the bot filter: a crawler missing there is an unmatched User-Agent, not zero traffic.',
-	}),
-	settingsCard(ctx, {
-		title: 'Crawl-breadth sketches',
-		prefix: 'crawlStats',
-		description:
-			'The sketch behind Crawl breadth above; nothing else reads it. Recording is gated by analytics ' +
-			'recording as well as by this group — with no bot name there is nothing to attribute a sketch to. ' +
-			'precision changes the register space, so days already written at the old value stop merging with ' +
-			'new ones until the next UTC rollover (that panel says so when it happens), and retentionDays only ' +
-			'prunes stored sketches.',
-	}),
-	settingsCard(ctx, {
-		title: 'Analytics reads (this console)',
-		prefix: 'management.analytics',
-		description:
-			'What this console is allowed to scan for the panels above — the cost of looking, never what was ' +
-			'recorded. cacheTtl is why switching ranges back and forth does not multiply scans, maxRange bounds ' +
-			'the range picker, and scanCap sheds the OLDEST end of a window rather than failing; the scan footer ' +
-			'reports the window a refresh actually covered.',
-	}),
-];
+const settings = (ctx) =>
+	section('traffic', 'Settings', [
+		settingsCard(ctx, {
+			title: 'Analytics recording',
+			prefix: 'analytics',
+			description:
+				'What the plugin records for bot traffic, and under which names. Turning recording off empties ' +
+				'every panel above from the moment it takes effect — it does not delete rows already recorded, ' +
+				'and it changes nothing about what bots are served. The bot registry and deriveUnknownBots decide ' +
+				'the labels in the bot filter: a crawler missing there is an unmatched User-Agent, not zero traffic.',
+		}),
+		settingsCard(ctx, {
+			title: 'Crawl-breadth sketches',
+			prefix: 'crawlStats',
+			description:
+				'The sketch behind Crawl breadth above; nothing else reads it. Recording is gated by analytics ' +
+				'recording as well as by this group — with no bot name there is nothing to attribute a sketch to. ' +
+				'precision changes the register space, so days already written at the old value stop merging with ' +
+				'new ones until the next UTC rollover (that panel says so when it happens), and retentionDays only ' +
+				'prunes stored sketches.',
+		}),
+		settingsCard(ctx, {
+			title: 'Analytics reads (this console)',
+			prefix: 'management.analytics',
+			description:
+				'What this console is allowed to scan for the panels above — the cost of looking, never what was ' +
+				'recorded. cacheTtl is why switching ranges back and forth does not multiply scans, maxRange bounds ' +
+				'the range picker, and scanCap sheds the OLDEST end of a window rather than failing; the scan footer ' +
+				'reports the window a refresh actually covered.',
+		}),
+	]);

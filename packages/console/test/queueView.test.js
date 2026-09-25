@@ -132,7 +132,8 @@ test('the capacity tile is the MEAN, not the tail', async () => {
 	assert.ok(render, 'expected a Render time tile');
 	// (300×11,000 + 200×1,700) / 500 = 7,280ms. The p95 over the same population is 10.6s.
 	assert.match(render.textContent, /7\.3s/);
-	assert.match(render.textContent, /capacity is concurrency ÷ this/);
+	// The capacity rule rides the tooltip now, beside the number it governs.
+	assert.match(render.attributes.title, /Capacity is concurrency ÷ this mean/);
 });
 
 test('the tail is still reported — it just is not the capacity number', async () => {
@@ -166,8 +167,8 @@ test('with no bails there is nothing to separate, and the tile does not invent a
 
 test('the prioritised share counts JOBS, not the claim passes that granted them', async () => {
 	const ctx = await ready();
-	const grants = tile(ctx, 'Prioritised grants');
-	assert.ok(grants, 'expected a Prioritised grants tile');
+	const grants = tile(ctx, 'Prioritised');
+	assert.ok(grants, 'expected a Prioritised tile');
 	// 420 of 500 jobs. Counting emits instead would report 100 of 120 — 83%, close enough to the
 	// right answer to look correct and wrong for a reason nobody would go looking for.
 	assert.match(grants.textContent, /84%/);
@@ -195,19 +196,19 @@ test('a capped sweep says which end of the backlog went unordered', async () => 
 		series: ANALYTICS.series.map((s) => (s.method === 'complete' ? { ...s, method: 'capped' } : s)),
 	});
 	await load(ctx);
-	assert.match(draw(ctx).textContent, /the rows it skipped are the youngest/);
+	assert.match(draw(ctx).textContent, /skips the recently-due rows it exists to protect/);
 });
 
 test('ready supply is per sweep, not summed across them', async () => {
 	const ctx = await ready();
 	// 12 sweeps publishing 4,800 entries each. Summing would report 57.6k entries that never existed.
-	assert.match(tile(ctx, 'Ready set supply').textContent, /4\.8k/);
+	assert.match(tile(ctx, 'Ready supply').textContent, /4\.8k/);
 });
 
 test('cadence carried is a migration gauge and reads as one', async () => {
 	const ctx = await ready();
 	assert.match(tile(ctx, 'Cadence carried').textContent, /94%/); // 4500 of 4800
-	assert.match(draw(ctx).textContent, /migration gauge, not an alarm/);
+	assert.match(draw(ctx).textContent, /Cadence carried" is a migration gauge/);
 });
 
 test('an older plugin that emits none of this renders no panel at all', async () => {
@@ -232,7 +233,7 @@ test('an older plugin that emits none of this renders no panel at all', async ()
 
 test('a healthy fleet draws no legacy-renderer panel at all — zero is the steady state', async () => {
 	const ctx = await ready();
-	assert.doesNotMatch(draw(ctx).textContent, /predate URL jobs/);
+	assert.doesNotMatch(draw(ctx).textContent, /older than browser 1\.23\.0/);
 });
 
 test('a legacy renderer is called out with its count and the device it did render', async () => {
@@ -247,7 +248,7 @@ test('a legacy renderer is called out with its count and the device it did rende
 	await load(ctx);
 	const text = draw(ctx).textContent;
 
-	assert.match(text, /predate URL jobs/);
+	assert.match(text, /older than browser 1\.23\.0/);
 	assert.match(text, /42 results/, 'counts sum across the device slot');
 	assert.match(text, /desktop, mobile/, 'names what DID render, so a pod is recognisable');
 	// The consequence is the part an operator cannot get from any other panel.
@@ -260,5 +261,52 @@ test('one legacy result is singular, and still shown — a single old pod is the
 		series: [...ANALYTICS.series, combo('prerender_ops', 'legacy_renderer', 'mobile', null, 1)],
 	});
 	await load(ctx);
-	assert.match(draw(ctx).textContent, /1 result was posted/);
+	assert.match(draw(ctx).textContent, /1 result came from/);
+});
+
+// ---- backlog and nodes (moved here from the overview and the Nodes view) -----------
+
+const withBacklog = (overview) => {
+	const ctx = makeCtx();
+	ctx.get = async (route) =>
+		route === 'overview'
+			? { ok: true, body: overview }
+			: route === 'analytics'
+				? { ok: true, body: ANALYTICS }
+				: { ok: true, body: null };
+	return ctx;
+};
+
+test('due now says how long the backlog takes to clear at the observed render rate', async () => {
+	// 500 results in the hour; 1,040 due with 40 in flight is 1,000 waiting — two hours of work.
+	const ctx = withBacklog({
+		...OVERVIEW,
+		backlog: { ...OVERVIEW.backlog, lastRun: { overdue: 1040, inFlight: 40, finishedAt: Date.now(), buckets: [] } },
+		claimFloor: { ...OVERVIEW.claimFloor, occupancy: 40 },
+	});
+	await load(ctx);
+	const due = tile(ctx, 'Due now');
+	assert.match(due.textContent, /~2h to clear/);
+	assert.ok(
+		find(due, (n) => n.attributes?.class === 'value'),
+		'two hours exactly is not yet past the watch line'
+	);
+});
+
+test('the node table carries each node’s status, throughput and pause controls', async () => {
+	const ctx = withBacklog({
+		...OVERVIEW,
+		nodes: [
+			{ hostname: 'node-a', status: 'queued', statusChangedTime: Date.now() - 3_600_000, override: null },
+			{ hostname: 'node-b', status: 'paused', statusChangedTime: Date.now(), override: { paused: true } },
+		],
+	});
+	await load(ctx);
+	const root = draw(ctx);
+	const table = find(root, (n) => n.tagName === 'TABLE' && n.textContent.includes('renders/h'));
+	assert.ok(table, 'expected the node table on Queue');
+	assert.match(table.textContent, /node-a/);
+	assert.match(table.textContent, /paused here/, 'a per-node override is shown as intent, apart from status');
+	// Under node scope only this node's row has a rate; the other is a blank, never a zero.
+	assert.match(table.textContent, /node-a.*500/s);
 });

@@ -263,6 +263,43 @@ const comboKey = (s) => `${s.metric} ${s.path ?? ''} ${s.method ?? ''} ${s.type 
  * writes "≈" on every merged percentile for exactly this reason. A merged p95 is a trend line,
  * never an SLO.
  */
+/**
+ * Which series get PER-NODE BUCKETS in the merged analytics payload: bot serves (by source and
+ * verdict) and render outcomes. That is what the traffic-by-instance and renders-by-node charts
+ * draw, and nothing else needs a per-node time axis.
+ *
+ * Collapsed over the remaining slot (the bot name on `bot_serve`) before shipping, which keeps it to
+ * a dozen or so arrays per node instead of one per (bot × verdict × source) — the per-instance view
+ * compares nodes, and a bot filter cannot narrow it (the tag on its card says so).
+ */
+const PER_NODE_BUCKETED = (s) => s.metric === 'bot_serve' || (s.metric === 'render' && s.path === 'outcome');
+
+function perNodeBuckets(series, bucketCount) {
+	const out = new Map();
+	for (const s of series ?? []) {
+		if (!PER_NODE_BUCKETED(s)) continue;
+		const key = `${s.metric}\u0000${s.path ?? ''}\u0000${s.method ?? ''}`;
+		let acc = out.get(key);
+		if (!acc) {
+			acc = {
+				metric: s.metric,
+				path: s.path ?? null,
+				method: s.method ?? null,
+				count: 0,
+				counts: new Array(bucketCount).fill(0),
+			};
+			out.set(key, acc);
+		}
+		acc.count += finite(s.count) || 0;
+		const counts = Array.isArray(s.counts) ? s.counts : [];
+		for (let i = 0; i < bucketCount && i < counts.length; i++) {
+			const c = finite(counts[i]);
+			if (Number.isFinite(c)) acc.counts[i] += c;
+		}
+	}
+	return [...out.values()];
+}
+
 export function mergeAnalytics(results) {
 	const usable = okBodies(results).filter((r) => r.body.available !== false);
 	if (!usable.length) {
@@ -428,6 +465,10 @@ export function mergeAnalytics(results) {
 			type: s.type ?? null,
 			count: finite(s.count) || 0,
 		})),
+		buckets: perNodeBuckets(r.body.series, bucketCount),
+		// Harper's own per-minute resource rows for that node (plugin v0.92.0+): CPU, memory, event loop,
+		// disk. Passed through per node, never summed — see `hosts` on the overview merge.
+		system: r.body.system ?? null,
 	}));
 
 	// Config that should be identical across nodes; a disagreement changes what the reference
@@ -702,6 +743,16 @@ export function mergeOverview(results) {
 			scope: 'cluster',
 			localQueueStatus: null,
 			queueStatusByNode: Object.fromEntries(bodies.map((r) => [r.hostname, r.b.localQueueStatus ?? null])),
+			// Point-in-time host vitals (plugin v0.92.0+), one entry per node that answered and NEVER merged:
+			// a CPU, memory or uptime figure means something only for the node that reported it, and an
+			// average of four would hide exactly the node that is in trouble. `host` is null for a plugin
+			// that predates it.
+			hosts: bodies.map((r) => ({
+				origin: r.origin,
+				hostname: r.hostname,
+				node: r.b.node ?? null,
+				host: r.b.host ?? null,
+			})),
 			control: {
 				cluster: freshest(controlRows, (row) => msOf(row.updatedTime)) ?? null,
 				knownScopes: [...new Set(bodies.flatMap((r) => r.b.control?.knownScopes ?? []))],

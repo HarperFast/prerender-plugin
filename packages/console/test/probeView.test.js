@@ -26,7 +26,7 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render } = await import('../src/admin/views/probe.js');
+const { load, render, meta } = await import('../src/admin/views/probe.js');
 const { mergerFor } = await import('../src/util/aggregate.js');
 
 /**
@@ -158,17 +158,29 @@ const PROBE_CONFIG = (ratePerSecond = 10, concurrency = 4) => ({
 });
 
 function makeCtx({ status = STATUS, analytics = ANALYTICS, config = PROBE_CONFIG() } = {}) {
-	const views = {};
+	// `let`, so a test can do what the shell does on a node-scope switch: replace every scratch.
+	let views = {};
+	let current = 'probe';
 	const scratch = (id) => (views[id] ??= {});
-	const calls = { posts: [], renders: 0, reloads: 0 };
+	const calls = { gets: [], posts: [], renders: 0, reloads: 0 };
 	return {
 		calls,
 		scratch,
 		busy: false,
+		// The shell's global range (top bar).
+		rangeMs: 24 * HOUR,
+		// Like the shell's: the CURRENT view's scratch, whatever view that is when this is read.
 		get data() {
-			return scratch('probe');
+			return scratch(current);
 		},
-		async get(route) {
+		resetScope() {
+			views = {};
+		},
+		navigate(id) {
+			current = id;
+		},
+		async get(route, query) {
+			calls.gets.push({ route, query });
 			if (route === 'change-probe')
 				return status
 					? { ok: true, body: status }
@@ -960,8 +972,21 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 	};
 };
 
+const isCard = (n) =>
+	String(n.attributes?.class ?? '')
+		.split(/\s+/)
+		.includes('card');
 const cardTitled = (ctx, pattern) =>
-	find(draw(ctx), (n) => n.attributes?.class === 'card' && pattern.test(n.children[0]?.textContent ?? ''));
+	find(draw(ctx), (n) => isCard(n) && pattern.test(n.children[0]?.textContent ?? ''));
+/** The text of every help block in a tree — the explanations now sit behind "?" toggles. */
+const helpText = (node) => {
+	const out = [];
+	find(node, (n) => {
+		if (n.attributes?.class === 'help') out.push(n.textContent);
+		return false;
+	});
+	return out.join('\n');
+};
 
 test('mid-pass: the running pass has its own card, and the last completed pass is labelled as the one BEFORE it', async () => {
 	const ctx = await ready({
@@ -994,7 +1019,8 @@ test('idle anchored node: the state line is the next run, in local and UTC time,
 	assert.match(text, /last sweep ended 11h ago/);
 	assert.match(text, /No health flags/);
 	assert.equal(cardTitled(ctx, /^Current pass/), null, 'nothing is running, so there is no current-pass card');
-	assert.match(cardTitled(ctx, /^Last completed sweep$/).textContent, /complete/);
+	// Not the "pass BEFORE the one running now" variant: nothing is running.
+	assert.match(cardTitled(ctx, /^Last completed sweep(?! —)/).textContent, /complete/);
 });
 
 test('older plugin (live 0.83.0 capture): armed and anchored, next run computed, missing counters n/a — not zero', async () => {
@@ -1114,7 +1140,9 @@ test('the finished-pass charts say they are per finished pass, not live — and 
 	const card = cardTitled(ctx, /^Finished passes/);
 	assert.ok(card);
 	assert.match(card.textContent, /per finished pass — not live/);
-	assert.match(card.textContent, /NOT LIVE/);
+	// The long "why" sits behind the card's help toggle — present, not on the page by default.
+	assert.match(helpText(card), /NOT LIVE/);
+	assert.match(helpText(card), /Throttled is inside Failed/);
 	assert.match(tile(ctx, 'Trigger queue peak').textContent, /812/);
 });
 
@@ -1144,4 +1172,142 @@ test('auto-refresh re-reads ONLY the status, on a timer, and pausing it stops th
 test('the status read time is on the page, so a stale screen can never pass for a live one', async () => {
 	const text = draw(await ready({ status: v2Body() })).textContent;
 	assert.match(text, /status read at .* \(\d+s ago\) · re-read every 30s/);
+});
+
+// ---- the redesign: shell-owned header and range, help toggles, scoped refresh (console v0.17) ----
+
+test('the finished-pass panel follows the GLOBAL range, and the view has no range picker of its own', async () => {
+	const ctx = makeCtx();
+	ctx.rangeMs = 6 * HOUR;
+	await load(ctx);
+	assert.equal(meta.ranged, true, 'the shell shows its range picker for this view');
+	assert.equal(meta.crumb, undefined);
+	assert.deepEqual(ctx.calls.gets.find((call) => call.route === 'analytics').query, { range: 6 * HOUR });
+	assert.equal(ctx.data.rangeMs, undefined, 'no view-local range survives');
+	const tree = draw(ctx);
+	for (const label of ['1h', '6h', '24h']) {
+		assert.equal(
+			find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === label),
+			null,
+			`no local ${label} button`
+		);
+	}
+});
+
+test('no view header or Refresh button — the shell owns both; the status line and auto-refresh stay', async () => {
+	const tree = draw(await ready({ status: v2Body() }));
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'view-head'),
+		null
+	);
+	assert.equal(
+		find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'Refresh'),
+		null
+	);
+	assert.ok(find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'auto-refresh'));
+	assert.ok(find(tree, (n) => n.tagName === 'BUTTON' && n.textContent === 'paused'));
+});
+
+test('settings sit in a collapsed section — opened when the status read failed, since the fix is there', async () => {
+	const section = (tree) => find(tree, (n) => String(n.attributes?.class ?? '').startsWith('section'));
+	const healthy = section(draw(await ready()));
+	assert.equal(healthy.attributes.class, 'section', 'collapsed by default');
+	const failed = section(draw(await ready({ status: null })));
+	assert.equal(failed.attributes.class, 'section open');
+});
+
+test('the auto-refresh drops a read once the operator has navigated away or switched scope', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+	// Scope switched before the timer fired: nothing is fetched at all.
+	const before = await ready({ status: v2Body() });
+	draw(before);
+	before.resetScope();
+	t.mock.timers.tick(30_000);
+	await settle();
+	assert.equal(before.calls.gets.filter((call) => call.route === 'change-probe').length, 1, 'only the load read');
+	assert.equal(before.calls.renders, 0);
+
+	// Navigated away WHILE the read was in flight: the answer must not land in whatever is on screen.
+	const during = await ready({ status: v2Body() });
+	const probeScratch = during.data;
+	const statusBefore = probeScratch.status;
+	draw(during);
+	const get = during.get.bind(during);
+	during.get = async (route, query) => {
+		during.navigate('queue');
+		return get(route, query);
+	};
+	t.mock.timers.tick(30_000);
+	await settle();
+	assert.equal(during.calls.renders, 0, 'no redraw for a view that is not on screen');
+	assert.equal(probeScratch.status, statusBefore, 'the probe scratch keeps its own status');
+	assert.equal(during.scratch('queue').status, undefined, 'and the queue view is not written into');
+
+	// Scope switched while in flight: the old scope's read is dropped, not written under the new scope.
+	const switched = await ready({ status: v2Body() });
+	draw(switched);
+	const get2 = switched.get.bind(switched);
+	switched.get = async (route, query) => {
+		switched.resetScope();
+		return get2(route, query);
+	};
+	t.mock.timers.tick(30_000);
+	await settle();
+	assert.equal(switched.calls.renders, 0);
+	assert.equal(switched.data.status, undefined, 'the new scope’s scratch stays empty until its own load');
+	t.mock.timers.reset();
+});
+
+test('the auto-refresh never overwrites a newer status a full load landed while it was in flight', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const ctx = await ready({ status: v2Body() });
+	draw(ctx);
+	const newer = { ...v2Body(), node: 'from-the-load' };
+	const get = ctx.get.bind(ctx);
+	ctx.get = async (route, query) => {
+		// A reload finished first and stamped a fresher read.
+		ctx.data.status = newer;
+		ctx.data.fetchedAt = Date.now() + 60_000;
+		return get(route, query);
+	};
+	t.mock.timers.tick(30_000);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(ctx.data.status, newer);
+	assert.equal(ctx.calls.renders, 0);
+	t.mock.timers.reset();
+});
+
+test('an opened detail block stays open across the rebuild the auto-refresh triggers', async () => {
+	const ctx = await ready({ status: v2Body() });
+	const summaryOf = (tree) =>
+		find(tree, (n) => n.tagName === 'DETAILS' && /Where the origin changed/.test(n.children[0]?.textContent ?? ''));
+	const first = summaryOf(draw(ctx));
+	assert.equal(first.attributes.open, undefined, 'closed by default');
+	first.open = true;
+	first.fire('toggle');
+	assert.equal(summaryOf(draw(ctx)).attributes.open, '', 'still open after a full re-render');
+	const again = summaryOf(draw(ctx));
+	again.open = false;
+	again.fire('toggle');
+	assert.equal(summaryOf(draw(ctx)).attributes.open, undefined);
+});
+
+test('explanations moved behind help keep their substance', async () => {
+	const ctx = await ready({ status: clusterOf(['node-a', v2Body({ running: true })], ['node-b', v2Body()]) });
+	const text = helpText(draw(ctx));
+	assert.match(text, /RUNNING pass’s own counts/, 'current pass');
+	assert.match(text, /not buckets/, 'the overlay rows are not a partition');
+	assert.match(text, /threshold crossed against ONE node’s cohort/, 'canary');
+	// Pacing is per node only, so it is read at node scope.
+	assert.match(
+		helpText(draw(await ready({ status: sweptAt(750, 100) }))),
+		/min\(concurrency ÷ latency, ratePerSecond\)/
+	);
+	assert.equal(
+		find(draw(ctx), (n) => n.attributes?.class === 'muted chart-note'),
+		null,
+		'no explanatory paragraph is left in a card body'
+	);
 });

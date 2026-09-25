@@ -61,7 +61,7 @@ import {
 	settingsCard,
 } from './_configEdit.js';
 
-export const meta = { id: 'config', label: 'Config', crumb: 'config', icon: ICONS.config };
+export const meta = { id: 'config', label: 'Config', icon: ICONS.config };
 
 /** The groups no domain view owns: what is prerendered, how it is fetched, and this console. */
 const OWN_GROUPS = [
@@ -148,17 +148,6 @@ export function render(ctx) {
 	if (!data) return el('div', { cls: 'note bad', text: state.error ?? 'No config data.' });
 
 	return [
-		el('div', { cls: 'view-head' }, [
-			el('span', { cls: 'eyebrow', text: 'Config' }),
-			el('span', {
-				cls: 'muted mono',
-				text: data.configFrom
-					? `${data.sources?.answered ?? '?'} nodes compared`
-					: `${data.node} · worker ${data.workerIndex}`,
-			}),
-			spacer(),
-			el('button', { text: 'Refresh', disabled: ctx.busy, onclick: () => ctx.reload() }),
-		]),
 		// Above the divergence panel on purpose: right after an apply, the thing the operator is
 		// about to read is a cluster that disagrees with itself, and this is the sentence that says
 		// why that is expected for the next second.
@@ -196,31 +185,21 @@ function divergence(data) {
 		deploy.length
 			? card('Nodes disagree', {
 					head: [spacer(), muted(`${deploy.length} option${deploy.length === 1 ? '' : 's'} differ`)],
-					body: [
-						el('div', { cls: 'note bad' }, [
-							'These options are not the same on every node. A prerender cluster runs one component ' +
-								'with one set of options, so this is a deploy that did not reach every node (or a node ' +
-								'that has not restarted into it) — not a configuration choice. Every other panel will ' +
-								'keep looking healthy while it is true.',
-						]),
-						valueTable(deploy),
-					],
+					help:
+						'Every node runs the same component with the same options, so a difference is a deploy that did not ' +
+						'reach every node (or a node that has not restarted into it). Every other panel keeps looking healthy ' +
+						'while it is true.',
+					body: [el('div', { cls: 'note bad', text: 'A deploy did not reach every node.' }), valueTable(deploy)],
 				})
 			: null,
 		converging.length
 			? card('An override is still landing', {
 					head: [spacer(), muted(`${converging.length} option${converging.length === 1 ? '' : 's'}`)],
-					body: [
-						el('div', { cls: 'note info' }, [
-							'These paths have a stored override in play and at least one node has not read the new row ' +
-								'yet. This is NOT the deploy failure above: the rows replicate, so every edit made from ' +
-								'this console makes the cluster disagree about that path for about a second. Nothing ' +
-								'needs doing — refresh and it is gone. If it is still here, it is not convergence: it is ' +
-								'a node REFUSING the override (its layer reads “override REJECTED — not in effect”) or a ' +
-								'node whose override watch has stopped. The panel below says which.',
-						]),
-						valueTable(converging),
-					],
+					help:
+						'A stored override is replicating and at least one node has not read the new row yet — normal for ' +
+						'about a second after every edit. If it persists, a node is refusing the override (its layer reads ' +
+						'"override REJECTED") or its override watch has stopped; Stored overrides below says which.',
+					body: [valueTable(converging)],
 				})
 			: null,
 		data.divergencesTruncated
@@ -323,41 +302,32 @@ function overrideLayer(data) {
 		body: [
 			disabledOn.length
 				? note('bad', [
-						el('strong', { text: `The override layer is switched OFF on ${disabledOn.join(', ')}. ` }),
-						'Every row below is stored, replicated and listed there — and ignored. That node is running its ' +
-							'deployed config.yaml, and an edit made from this console will never reach it. ',
+						el('strong', { text: `The override layer is OFF on ${disabledOn.join(', ')}. ` }),
+						'Those nodes ignore every row below. ',
 						el('code', { text: 'management.overrides.enabled' }),
-						' is a file option on purpose (a kill switch reachable only through the thing it switches off is ' +
-							'not a switch), so it cannot be turned back on from here: edit that node’s config.yaml and ' +
-							'restart it.',
+						' is file-only on purpose: fix it in that node’s config.yaml and restart.',
 					])
 				: null,
 			...deaf.map((node) =>
 				note('bad', [
 					el('strong', { text: `${node.hostname} has stopped hearing config edits. ` }),
-					node.watch.lastError
-						? `Its last read of the override table failed (${node.watch.lastError}). `
-						: 'Its override subscription is not live. ',
+					node.watch.lastError ? `Last read failed: ${node.watch.lastError}. ` : 'Subscription not live. ',
 					Number.isFinite(node.watch.syncInterval) && node.watch.syncInterval > 0
-						? `A backstop re-read every ${Math.round(node.watch.syncInterval / 1000)}s is the only thing still ` +
-							'delivering overrides to it, so an edit takes that long there instead of a second.'
-						: 'Nothing else re-reads the table there, so every edit made from this console will miss that node ' +
-							'until it restarts.',
-					node.watch.lastReadAt ? ` Last read ${ago(node.watch.lastReadAt)}.` : ' It has not read the table yet.',
+						? `Edits reach it only on the ${Math.round(node.watch.syncInterval / 1000)}s backstop re-read.`
+						: 'No backstop re-read — edits miss it until it restarts.',
+					node.watch.lastReadAt ? ` Last read ${ago(node.watch.lastReadAt)}.` : ' Never read.',
 				])
 			),
 			overrides.degraded
 				? note('warn', [
-						el('strong', { text: 'A node could not read the override table. ' }),
-						`The read fails open — the deployed config keeps running${overrides.error ? ` (${overrides.error})` : ''} — ` +
-							'so the list below may be short. An empty list here is not evidence that nothing is set.',
+						el('strong', { text: 'A node could not read the override table — this list may be short. ' }),
+						overrides.error ?? '',
 					])
 				: null,
 			overrides.truncated
 				? note('warn', [
 						el('strong', { text: 'More rows than the read cap. ' }),
-						'There are only ~130 option paths, so the excess is rows for options that no longer exist — they ' +
-							'are inert, but they are also hiding rows that are not.',
+						'The excess is rows for options that no longer exist — inert, but hiding rows that are not.',
 					])
 				: null,
 			table(
@@ -365,16 +335,12 @@ function overrideLayer(data) {
 				rows,
 				'No stored overrides — every value comes from the deployed config.yaml or the schema default.'
 			),
-			watched
-				? el('p', {
-						cls: 'muted chart-note',
-						text:
-							`Override watch live on ${watching} of ${watched} node${watched === 1 ? '' : 's'}. ` +
-							'A node that is not watching still applies overrides on its backstop re-read; a node that is ' +
-							'neither watching nor backstopped applies them only at restart.',
-					})
-				: null,
 		],
+		foot: watched ? [`override watch live on ${watching} of ${watched} node${watched === 1 ? '' : 's'}`] : null,
+		help:
+			'Rows written from this console, layered over each node’s config.yaml. A node that is not watching still ' +
+			'applies overrides on its backstop re-read; one that is neither watching nor backstopped applies them only ' +
+			'at restart. The layer column is the node’s own verdict: "override REJECTED" means stored but not in force.',
 	});
 }
 
@@ -404,15 +370,11 @@ function pendingRestart(data) {
 
 	return card('Changed, but still running the boot value', {
 		head: [spacer(), muted(`${byKey.size} option${byKey.size === 1 ? '' : 's'}`)],
-		body: [
-			note('warn', [
-				'These options are read once, at worker boot. The configuration now says the second value; the running ' +
-					'code is still doing the first, and will until the worker restarts. The index below shows the new ' +
-					'value because that is what is configured — this table is the only thing here that says it is not ' +
-					'what is happening.',
-			]),
-			table(['option', 'running (boot)', 'configured', 'on'], rows),
-		],
+		help:
+			'These options are read once, at worker boot. The index below shows the configured value; the running code ' +
+			'is still doing the boot value until the worker restarts.',
+		body: [table(['option', 'running (boot)', 'configured', 'on'], rows)],
+		cls: 'flush',
 	});
 }
 
@@ -424,7 +386,7 @@ function warnings(data) {
 			warning.message,
 		])
 	);
-	return rows.length ? rows : el('div', { cls: 'note ok', text: 'No configuration warnings.' });
+	return rows.length ? rows : null;
 }
 
 // ---------------------------------------------------------------- the index
@@ -495,16 +457,14 @@ function index(ctx, data) {
 				spacer(),
 				summary,
 			],
-			body: [
-				el('div', { cls: 'toolbar' }, buttons),
-				el('p', { cls: 'muted chart-note' }, [
-					data.configFrom
-						? `Values, layers and provenance are ${data.configFrom}’s — the node the comparison above is against. `
-						: 'Values, layers and provenance are this node’s. ',
-					'A search or a filter reaches every option, including the ones another view owns; each is labelled ' +
-						'with where it lives, and edits made from either place land in one tray and one write.',
-				]),
+			help: [
+				data.configFrom
+					? `Values, layers and provenance are ${data.configFrom}’s — the node the comparison above is against. `
+					: 'Values, layers and provenance are this node’s. ',
+				'Search and filters reach every option, including the ones another view owns; edits made anywhere land in ',
+				'one tray and one write.',
 			],
+			body: [el('div', { cls: 'toolbar' }, buttons)],
 		}),
 		results,
 	];
@@ -592,12 +552,12 @@ function assembleUnrouted(data, all) {
 							: 'This worker has served nothing unrouted since its last flush.',
 					})
 				: null,
-			el('p', { cls: 'muted', style: { margin: '12px 0 0' } }, [
-				'Counters are per-worker and reset on every flush, so this is a SAMPLE — one worker per node, ' +
-					'not a cluster total. It answers “is anything hitting a route we don’t classify”, never ' +
-					'“how much”. unclassified = the CDN forwarded a path no route declares; passthrough = ' +
-					'declared, deliberately proxied live.',
-			]),
+			el('p', {
+				cls: 'muted small-note',
+				text: 'A sample (one worker per node, reset each flush) — "is anything unrouted", not "how much".',
+				title:
+					'unclassified = the CDN forwarded a path no route declares; passthrough = declared, deliberately proxied live.',
+			}),
 		]),
 		all.length > 0 &&
 			table(['path bucket', 'class', { text: 'requests', right: true }, 'sample', { text: '', right: true }], all),
@@ -646,12 +606,6 @@ function elsewhere(ctx, options) {
 	return card('The rest of the configuration', {
 		head: [spacer(), muted('searchable from here, edited there')],
 		body: [
-			el('p', {
-				cls: 'muted chart-note',
-				text:
-					'These options are shown beside the data they govern, which is the only place their numbers mean ' +
-					'anything. Search or filter above and they appear here too — this list is just the shortcut.',
-			}),
 			kv(
 				[...byView.entries()].map(([id, entry]) => [
 					entry.label,
