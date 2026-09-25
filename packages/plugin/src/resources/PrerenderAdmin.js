@@ -24,14 +24,15 @@
  *   GET  /prerender_admin/session    who am I                       public
  *   POST /prerender_admin/login      { username, password }         public
  *   POST /prerender_admin/logout     end the session                session required
- *   GET  /prerender_admin/overview   nodes, counts, backlog shape   super_user
+ *   GET  /prerender_admin/overview   nodes, counts, backlog, host   super_user
  *   GET  /prerender_admin/config     effective config + warnings,   super_user
  *                                    layers + stored overrides
  *   GET  /prerender_admin/sitemaps   root sitemaps + refresh state  super_user
  *   GET  /prerender_admin/pages      ?prefix&cursor&limit           super_user
  *   GET  /prerender_admin/page-content ?cacheKey (text/plain)       super_user
  *   GET  /prerender_admin/unrouted   this worker's unrouted tally   super_user
- *   GET  /prerender_admin/analytics  ?range (ms) — bucketed series  super_user
+ *   GET  /prerender_admin/analytics  ?range (ms) — bucketed series, super_user
+ *                                    per-node system health
  *   GET  /prerender_admin/crawl-breadth ?days (default 7, max 31)   super_user
  *   POST /prerender_admin/explain    { url, deviceType }            super_user
  *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
@@ -129,6 +130,7 @@ import {
 import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
+import { hostInfo } from '../util/hostInfo.js';
 import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
@@ -1419,6 +1421,10 @@ export class PrerenderAdmin extends Resource {
 			generatedAt: now,
 			node: server.hostname,
 			workerIndex: server.workerIndex,
+			// This node's machine and process, point-in-time: CPU count, memory, load, Harper uptime
+			// (the restart detector) and the three versions. Syscalls and a procfs read — no scan, no
+			// table (util/hostInfo.js). The TRENDS live in the analytics window's `system` block.
+			host: hostInfo(),
 			// The flag `claim` actually reads on THIS node — the observed state, as opposed to
 			// the replicated intent below.
 			localQueueStatus: QueueState.status,
