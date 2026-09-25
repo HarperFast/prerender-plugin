@@ -74,8 +74,27 @@ export const readProbeState = async () => {
  *
  * Never throws. Publishing is observability, and observability must not be able to fail a probe
  * pass — the pass is the thing that keeps prices correct.
+ *
+ * SERIALIZED PER WORKER. Two publishes from the same worker used to be free to interleave their
+ * read and their write — the scheduler arming while its own boot sweep claimed, a sweep's final
+ * scheduler publish racing its own release — and whichever wrote second put back the branch it had
+ * read before the first landed. A lost `scheduler` branch is not healed by the next heartbeat (which
+ * only patches `sweep`); it stayed wrong until the next arm, which in anchored mode is a day away.
+ * Chaining this worker's writes removes that interleaving at the cost of a few node-local writes
+ * waiting on each other. Cross-worker races (a manual pass on another worker) remain tolerated, for
+ * the reason above.
  */
-export const publishProbeState = async (patch) => {
+let publishing = Promise.resolve(true);
+export const publishProbeState = (patch) => {
+	// `publishNow` never rejects, so the chain can never wedge on one failed write.
+	publishing = publishing.then(() => publishNow(patch));
+	return publishing;
+};
+
+/** Resolves once every publish this worker has issued so far has landed (tests). */
+export const probeStatePublished = () => publishing;
+
+const publishNow = async (patch) => {
 	try {
 		const existing = (await table().get(ROW_KEY)) ?? {};
 		const merged = { ...existing };

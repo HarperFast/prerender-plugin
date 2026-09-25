@@ -1308,7 +1308,12 @@ export class PrerenderAdmin extends Resource {
 
 		// Detached: the pass outlives this request, so a rejection has to be handled here or it
 		// surfaces as an unhandled rejection.
-		const run = action === 'sweep' ? runProbeSweepOnce({ dryRun }) : runProbeCanaryOnce({ dryRun });
+		// `startedBy: 'manual'` rides on the pass record, so an operator's run — often a forced dry run —
+		// is never read as the scheduled pass it otherwise looks exactly like.
+		const run =
+			action === 'sweep'
+				? runProbeSweepOnce({ dryRun, startedBy: 'manual' })
+				: runProbeCanaryOnce({ dryRun, startedBy: 'manual' });
 		run.catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });

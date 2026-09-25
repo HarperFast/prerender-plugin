@@ -63,7 +63,7 @@ import { walkUrlRange } from './urlWalk.js';
 import { probeScopeFilter } from './probeScope.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
-import { isPassRunning, publishProbeState, readProbeState } from './probeState.js';
+import { isPassRunning, probeStatePublished, publishProbeState, readProbeState } from './probeState.js';
 import {
 	compileProbeRules,
 	buildProbeRequest,
@@ -1147,8 +1147,10 @@ export const runProbePass = async ({
 		stats.examined++;
 		// Skipped rows (unowned, unmatched — most of a multi-node registry) never reach the paced
 		// flush, so without this a chunk of pure skips runs as one synchronous burst. Same
-		// discipline, same cadence as util/reconcile.js's walk.
-		if (stats.examined % YIELD_EVERY === 0) await onYield();
+		// discipline, same cadence as util/reconcile.js's walk. The LIVE stats ride along so the
+		// sweep's heartbeat can publish the running pass's own partial counts — the caller cannot
+		// read `stats` itself, which is still in its temporal dead zone while this pass runs.
+		if (stats.examined % YIELD_EVERY === 0) await onYield(stats);
 		if (!ownershipChecked && ownerOf(row.url) !== hostname) continue;
 		stats.owned++;
 		if (row.state === 'suppressed') continue;
@@ -1273,7 +1275,7 @@ const HEARTBEAT_MS = 30 * SECOND;
  * worker answered the request, so it was ~always false and the console's "Run sweep" could start
  * a second full-rate sweep alongside the scheduled one. See util/probeState.js.
  */
-const claimPass = async (kind) => {
+const claimPass = async (kind, { startedBy = null, dryRun = null, label = null } = {}) => {
 	const row = await readProbeState();
 	if (isPassRunning(row, kind, PASS_STALE_MS)) {
 		return {
@@ -1283,14 +1285,102 @@ const claimPass = async (kind) => {
 		};
 	}
 	const startedAt = Date.now();
+	const previous = row?.[kind]?.lastRun ?? null;
 	// Claim first, keeping the previous result readable while the new pass runs — the backlog
 	// snapshotter's shape, for the same reason: an operator looking mid-pass should see the last
 	// finished one, not a hole.
+	//
+	// WHAT THE PASS IS, published with the claim, so a reader can tell THIS pass from the one in
+	// `lastRun` without guessing from timestamps: who started it (an operator's manual dry run and the
+	// scheduled pass look identical otherwise), whether it acts, and the slice it is expected to cover
+	// — the denominator an ETA needs. `progress: null` so a claim never inherits the previous pass's
+	// last heartbeat reading (the merge is one level deep; omission would keep it).
 	await publishProbeState({
-		[kind]: { running: true, startedAt, heartbeatAt: startedAt, lastRun: row?.[kind]?.lastRun ?? null },
+		[kind]: {
+			running: true,
+			startedAt,
+			heartbeatAt: startedAt,
+			lastRun: previous,
+			progress: null,
+			startedBy,
+			dryRun,
+			label,
+			sliceEstimate: kind === 'sweep' ? sliceEstimateFrom(previous) : null,
+		},
 	});
 	return { ok: true, startedAt };
 };
+
+/**
+ * How many rows a new sweep is expected to probe: the slice this process measured on its last
+ * completed pass, else the previous pass's own `matched` if that pass ran to completion (a restart
+ * clears the module figure, and the row outlives the restart). Null when neither is trustworthy —
+ * an aborted or errored pass walked only part of the key range, and an ETA computed from its
+ * `matched` would promise an early finish that never comes.
+ */
+const sliceEstimateFrom = (previous) => {
+	if (Number.isFinite(measuredSliceSize)) return measuredSliceSize;
+	if (!previous || previous.aborted || previous.error) return null;
+	return Number.isFinite(previous.matched) ? previous.matched : null;
+};
+
+/**
+ * Wait out a trigger queue while keeping the pass's heartbeat alive. `onBeat` fires every third of
+ * a heartbeat interval (the heartbeat itself throttles to one write per interval) until the queue
+ * is idle, and never after — see the drain in `runProbeSweepOnce` for why the drain needs one.
+ */
+const drainWithHeartbeat = async (triggers, onBeat) => {
+	const timer = setInterval(onBeat, HEARTBEAT_MS / 3);
+	timer.unref?.();
+	try {
+		await triggers.drain();
+	} finally {
+		clearInterval(timer);
+	}
+};
+
+/**
+ * The running pass's partial counters, as the heartbeat publishes them.
+ *
+ * WHY THE HEARTBEAT CARRIES THEM. Before this, a sweep in flight published only `examinedApprox` —
+ * rows walked — so for the ~9 hours an anchored pass runs, every NUMBER on the admin surface was
+ * the PREVIOUS pass's, sitting next to `running: true`. That is the confusion this exists to end:
+ * the console could not show the current pass at all, so it showed the last one, and an operator
+ * once read a pre-deploy pass's failures as the new release's. A few dozen integers every 30s on a
+ * node-local row is the whole cost.
+ *
+ * Counters only: the per-slot and per-field maps stay on the finished pass record, where they are
+ * complete.
+ */
+const PROGRESS_COUNTERS = [
+	'examined',
+	'owned',
+	'matched',
+	'outOfScope',
+	'probed',
+	'seeded',
+	'rebaselined',
+	'extended',
+	'unchanged',
+	'changed',
+	'caughtUp',
+	'ignored',
+	'pageMismatch',
+	'queued',
+	'deferred',
+	'failed',
+	'throttled',
+	'fresh',
+	'behindBatches',
+];
+
+const passProgress = (live, extra) => ({
+	...Object.fromEntries(PROGRESS_COUNTERS.map((key) => [key, Number.isFinite(live?.[key]) ? live[key] : 0])),
+	throttleLevel: live?.throttleLevel ?? 1,
+	loadThrottleLevel: live?.loadThrottleLevel ?? 1,
+	pacedRate: live?.pacedRate ?? null,
+	...extra,
+});
 
 /**
  * Release the claim and publish the finished record.
@@ -1313,11 +1403,15 @@ const releasePass = async (kind, startedAt, lastRun) => {
  */
 const makeHeartbeat = (kind, startedAt) => {
 	let last = startedAt;
+	// `progress` may be a function of the heartbeat's instant, so a caller can hand over a snapshot
+	// builder that runs only when a beat is actually due — not on every one of the thousands of
+	// yields a pass makes between two beats.
 	return async (progress) => {
 		const now = Date.now();
 		if (now - last < HEARTBEAT_MS) return;
 		last = now;
-		await publishProbeState({ [kind]: { running: true, startedAt, heartbeatAt: now, progress: progress ?? null } });
+		const value = typeof progress === 'function' ? progress(now) : progress;
+		await publishProbeState({ [kind]: { running: true, startedAt, heartbeatAt: now, progress: value ?? null } });
 	};
 };
 
@@ -1403,8 +1497,13 @@ const passLimits = (dryRunOverride, { paced = false } = {}) => ({
  * `reseed` (set by the canary's chained pass) FORCES a probe of every matched URL: a mass change
  * has just been absorbed, so every baseline is known-stale and skipping the fresh-looking ones
  * would leave exactly the pages the trip was about carrying pre-change signatures.
+ *
+ * `startedBy` says what started the pass — 'anchor', 'interval', 'continuous', 'startup',
+ * 'manual' (the admin POST) or 'reseed' (a canary trip's chained pass) — and rides on both the
+ * claim and the finished record, so an operator's manual dry run can never be read as the
+ * scheduled pass it looks exactly like.
  */
-export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false } = {}) => {
+export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false, startedBy = null } = {}) => {
 	// Worker-local guard, and it is SET SYNCHRONOUSLY on purpose. The node-wide claim below is an
 	// await, so setting the flag after it would leave a window in which two concurrent calls on
 	// this worker both pass this check before either marks itself running — a re-entrancy race
@@ -1415,7 +1514,11 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 	// Then the NODE-WIDE claim. The local flag alone was the whole guard, which meant a manual run
 	// on any worker but 0 could not see the scheduled sweep and started a second one at full rate
 	// against the origin. See util/probeState.js.
-	const claim = await claimPass('sweep');
+	// The limits are read BEFORE the claim (they are pure config) so the claim can say whether this
+	// pass acts or only measures.
+	const limits = passLimits(dryRun, { paced: true });
+	const passStartedBy = startedBy ?? (reseed ? 'reseed' : null);
+	const claim = await claimPass('sweep', { startedBy: passStartedBy, dryRun: limits.dryRun, label });
 	if (!claim.ok) {
 		// Release the local flag we optimistically took — the `finally` below is not reached from
 		// here, so failing to reset it would wedge this worker's sweep for the life of the process.
@@ -1424,7 +1527,6 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 	}
 	const startedAt = claim.startedAt;
 	const beat = makeHeartbeat('sweep', startedAt);
-	const limits = passLimits(dryRun, { paced: true });
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
@@ -1442,6 +1544,28 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			concurrency: config.changeProbe.trigger.concurrency,
 			onError: (e, item) => logger.error(e, `[prerender] change-probe trigger failed for ${item.row.url}`),
 		});
+		// The heartbeat's payload, built only when a beat is due (see makeHeartbeat). `recentRate` is
+		// probes per second since the PREVIOUS beat — the rate the pass is running at now, which an
+		// average from the start of a nine-hour pass cannot show (a backoff an hour ago drags it down
+		// long after it cleared). `examinedApprox` stays for consoles that predate the counters.
+		let lastBeat = { at: startedAt, probed: 0 };
+		const progressOf = (live, phase) => (now) => {
+			const seconds = (now - lastBeat.at) / 1000;
+			const probed = Number.isFinite(live?.probed) ? live.probed : 0;
+			const recentRate = seconds > 0 ? Math.round(((probed - lastBeat.probed) / seconds) * 100) / 100 : null;
+			lastBeat = { at: now, probed };
+			return {
+				examinedApprox: yields * YIELD_EVERY,
+				...passProgress(live, {
+					phase,
+					recentRate,
+					triggered: triggers.stats.triggered,
+					errors: triggers.stats.errors,
+					triggerQueueDepth: triggers.depth,
+					unreadable,
+				}),
+			};
+		};
 		const stats = await runProbePass({
 			rows: walkTargets(config.changeProbe.chunkSize, () => {
 				unreadable++;
@@ -1461,13 +1585,14 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
 			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
 			// failure is swallowed by `publishProbeState`: a pass must never die of bookkeeping.
-			onYield: async () => {
+			onYield: async (live) => {
 				await yieldNow();
 				// A LOCAL counter, not `stats` — `const stats = await runProbePass({...})` leaves
 				// `stats` in the temporal dead zone while this callback runs, so touching it here
-				// throws a ReferenceError rather than reading undefined.
+				// throws a ReferenceError rather than reading undefined. The pass hands its live
+				// counters over as `live` instead.
 				yields++;
-				await beat({ examinedApprox: yields * YIELD_EVERY });
+				await beat(progressOf(live, 'walking'));
 			},
 			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
 			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
@@ -1480,7 +1605,12 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		// written, so the next pass re-detects them. Otherwise wait the queue out — the pass is not
 		// finished while re-renders it decided on are still unfiled, and `triggered` would under-report.
 		if (stats.aborted) triggers.stop();
-		await triggers.drain();
+		// THE DRAIN KEEPS THE HEARTBEAT. The walk's heartbeat rides its yields, and there are none
+		// while the pass waits for its queue; a deep queue at `trigger.ratePerSecond` can take longer
+		// than PASS_STALE_MS to settle, and a pass that goes quiet for that long reads as DEAD — the
+		// claim becomes takeable and the admin surface reports an idle node beside yesterday's
+		// `lastRun`, for a pass that is in fact still filing the re-renders it decided on.
+		await drainWithHeartbeat(triggers, () => void beat(progressOf(stats, 'draining')));
 		stats.triggered = triggers.stats.triggered;
 		stats.errors = triggers.stats.errors;
 		stats.triggerQueueDepth = triggers.stats.maxDepth;
@@ -1496,12 +1626,16 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		if (!stats.aborted) measuredSliceSize = stats.matched;
 		// The slice estimate and the cohorts both moved; republish so a reader sees what the NEXT
 		// cycle will pace against rather than the previous cycle's denominator.
-		if (!stats.aborted) void publishScheduler();
+		// AWAITED, unlike the config-path publishes: `releasePass` below is a read-modify-write of the
+		// same row, and letting the two interleave could write back the scheduler branch it read
+		// before this landed.
+		if (!stats.aborted) await publishScheduler();
 		emitStats(stats, 'sweep');
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
 			...stats,
 			dryRun: limits.dryRun,
+			startedBy: passStartedBy,
 			label,
 			node: server.hostname,
 			startedAt,
@@ -1511,7 +1645,14 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		await releasePass('sweep', startedAt, lastSweep);
 		return lastSweep;
 	} catch (e) {
-		lastSweep = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		lastSweep = {
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			startedBy: passStartedBy,
+			dryRun: limits.dryRun,
+			error: e?.message ?? String(e),
+		};
 		// A THROWN pass must release too, and must publish the error: leaving the claim held would
 		// wedge the probe until the heartbeat went stale, and dropping the error would make a
 		// crashed pass indistinguishable from one that never ran.
@@ -1523,7 +1664,11 @@ export const runProbeSweepOnce = async ({ dryRun, label = null, reseed = false }
 		// pass starts so the reseed does not cancel itself.
 		const chained = sweepInterrupt;
 		sweepInterrupt = null;
-		if (chained) runProbeSweepOnce({ dryRun: true, label: chained, reseed: true }).catch((e) => logger.error(e));
+		if (chained) {
+			runProbeSweepOnce({ dryRun: true, label: chained, reseed: true, startedBy: 'reseed' }).catch((e) =>
+				logger.error(e)
+			);
+		}
 	}
 };
 
@@ -1545,7 +1690,7 @@ export const requestSweepReseed = (label) => {
 		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
 		return { chained: true };
 	}
-	runProbeSweepOnce({ dryRun: true, label, reseed: true }).catch((e) => logger.error(e));
+	runProbeSweepOnce({ dryRun: true, label, reseed: true, startedBy: 'reseed' }).catch((e) => logger.error(e));
 	return { chained: false };
 };
 
@@ -1575,6 +1720,12 @@ const ensureCohorts = async () => {
 		if ([...next.values()].every((urls) => urls.length >= count)) break;
 	}
 	cohorts = next;
+	// The cohort sizes are published scheduler state, and until now only arming and a finished sweep
+	// republished them — so after every restart the admin surface read `cohortSizes: {}` (the sizes at
+	// boot, before this build ran) for the hours until the first sweep ended, while the canary was
+	// probing a full cohort. Measured on a live deployment: every node reported `{}` beside a canary
+	// pass over 500 URLs.
+	await publishScheduler();
 };
 
 /**
@@ -1657,19 +1808,19 @@ const actOnTrip = async (rule, fraction) => {
  * configured rate for under a minute; both passes write the same observed signature for a shared
  * URL, so the race is value-idempotent.
  */
-export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
+export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 	if (canaryRunning) {
 		return { skipped: true, reason: 'a canary pass is already running' };
 	}
 	// Synchronous, for the re-entrancy reason documented on the sweep above.
 	canaryRunning = true;
-	const claim = await claimPass('canary');
+	const limits = passLimits(dryRun);
+	const claim = await claimPass('canary', { startedBy, dryRun: limits.dryRun });
 	if (!claim.ok) {
 		canaryRunning = false;
 		return { skipped: true, reason: claim.reason, lastRun: claim.lastRun ?? lastCanary };
 	}
 	const startedAt = claim.startedAt;
-	const limits = passLimits(dryRun);
 	const canary = config.changeProbe.canary;
 	try {
 		await ensureCohorts();
@@ -1735,6 +1886,7 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 		lastCanary = {
 			perRule,
 			dryRun: limits.dryRun,
+			startedBy,
 			node: server.hostname,
 			startedAt,
 			finishedAt: Date.now(),
@@ -1743,7 +1895,14 @@ export const runProbeCanaryOnce = async ({ dryRun } = {}) => {
 		await releasePass('canary', startedAt, lastCanary);
 		return lastCanary;
 	} catch (e) {
-		lastCanary = { node: server.hostname, startedAt, finishedAt: Date.now(), error: e?.message ?? String(e) };
+		lastCanary = {
+			node: server.hostname,
+			startedAt,
+			finishedAt: Date.now(),
+			startedBy,
+			dryRun: limits.dryRun,
+			error: e?.message ?? String(e),
+		};
 		await releasePass('canary', startedAt, lastCanary);
 		throw e;
 	} finally {
@@ -1760,17 +1919,150 @@ export const isProbeSweepRunning = () => sweepRunning;
 export const isProbeCanaryRunning = () => canaryRunning;
 
 /**
+ * The shape version of `changeProbeStatus`. 1 is everything before plugin v0.91.0 (no field says so);
+ * 2 added the running pass (`current` + counters in `progress`), `nextRunAt`, `settings`, rule
+ * fingerprints and `serverTime`. The console reads it to tell a field this plugin does not report
+ * from a field that is zero — a blank rendered as 0 is how a missing signal reads as a healthy one.
+ */
+const STATUS_VERSION = 2;
+
+/** Epoch ms from a row timestamp (number, Date or ISO string), or null. */
+const msOrNull = (value) => {
+	const ms = epochMsOf(value);
+	return Number.isFinite(ms) ? ms : null;
+};
+
+/**
+ * The pass the row CLAIMS is running, or null — including one whose heartbeat has stopped.
+ *
+ * `running` (beside this) is the claim filtered by heartbeat staleness, which is right for the run
+ * guard and wrong for an operator: a pass whose worker died reads `running: false` exactly like an
+ * idle node, beside a `lastRun` that is hours old. `stale: true` here is what separates "stalled"
+ * from "idle".
+ */
+const currentPass = (row, kind) => {
+	const pass = row?.[kind];
+	if (!pass?.running) return null;
+	return {
+		startedAt: msOrNull(pass.startedAt),
+		heartbeatAt: msOrNull(pass.heartbeatAt ?? pass.startedAt),
+		stale: !isPassRunning(row, kind, PASS_STALE_MS),
+		startedBy: pass.startedBy ?? null,
+		dryRun: typeof pass.dryRun === 'boolean' ? pass.dryRun : null,
+		label: pass.label ?? null,
+		...(kind === 'sweep'
+			? {
+					phase: pass.progress?.phase ?? 'walking',
+					sliceEstimate: Number.isFinite(pass.sliceEstimate) ? pass.sliceEstimate : null,
+				}
+			: {}),
+	};
+};
+
+/** The first tick of a `setInterval` armed at `armedAt` that is still ahead of `now`. */
+const nextTick = (armedAt, every, now) => armedAt + Math.max(1, Math.ceil((now - armedAt) / every)) * every;
+
+/**
+ * When the next scheduled sweep starts, and why then — read from what the scheduler PUBLISHED, so
+ * every worker gives worker 0's answer.
+ *
+ * The basis follows what is ARMED (the published marker), not this worker's config: the two differ
+ * only for the instant between a config apply and worker 0 re-arming, and in that instant the armed
+ * driver is the one that will actually fire.
+ *
+ *   startup     a first arming's boot sweep is still pending (interval and continuous modes)
+ *   anchor      the next anchored run; null `at` means the anchor could not be computed — broken
+ *               `anchorTime`/`anchorTimezone`, which the plugin log names
+ *   continuous  no gap to schedule: the next cycle starts when the running one ends
+ *   interval    the next tick of the sweep timer (a tick that lands mid-pass is skipped)
+ */
+const nextSweepRun = (scheduler, now) => {
+	const armed = scheduler?.armedSweep ?? null;
+	if (!config.changeProbe.enabled || armed === null) return { at: null, basis: null };
+	const bootAt = msOrNull(scheduler.bootAt);
+	if (bootAt !== null && bootAt > now) return { at: bootAt, basis: 'startup' };
+	if (typeof armed === 'string' && armed.startsWith('anchored:')) {
+		return { at: msOrNull(scheduler.nextAnchorAt), basis: 'anchor' };
+	}
+	if (armed === 'continuous') return { at: null, basis: 'continuous' };
+	const armedAt = msOrNull(scheduler.intervalArmedAt);
+	const every = Number(armed);
+	if (armedAt === null || !(every > 0)) return { at: null, basis: 'interval' };
+	return { at: nextTick(armedAt, every, now), basis: 'interval' };
+};
+
+/** A rule as the admin surface reports it. */
+const ruleStatus = (rule) => ({
+	label: rule.label,
+	pathPattern: rule.patternSource,
+	source: rule.source,
+	invalidateScope: rule.invalidateScope,
+	// Only when present, so a rule without them reads exactly as it did.
+	...(rule.pageCheck?.fields?.length
+		? { pageFields: rule.pageCheck.fields.map((field) => `${field.label}:${field.compare}`) }
+		: {}),
+	...(rule.pageCheck?.ignoreChanges?.length ? { ignoreChanges: rule.pageCheck.ignoreChanges } : {}),
+	// WHAT MAKES TWO NODES' RULES THE SAME RULE. The console used to compare the objects above across
+	// nodes, which cannot see an edited extract path or header — exactly the edits that re-baseline a
+	// corpus. The fingerprint is what the probe itself compares a baseline against.
+	fingerprint: rule.fingerprint,
+	// The slot index -> path table `slotChanges` and `fieldMismatch` are keyed by, so a count can be
+	// read as a field rather than as a number.
+	extract: Array.isArray(rule.extract) ? rule.extract : [],
+	// The probed endpoint's method and PATH — the host and query are config, and the full template
+	// (headers included) is on the config endpoint. Null for `source: document`, which fetches the page.
+	endpoint: rule.request?.urlTemplate
+		? { method: rule.request.method, path: URL.parse(rule.request.urlTemplate)?.pathname ?? null }
+		: null,
+});
+
+/** The settings that decide when and how fast the probe runs — config, identical on every worker. */
+const probeSettings = () => {
+	const c = config.changeProbe;
+	return {
+		mode: c.mode,
+		anchorTime: c.anchorTime,
+		anchorTimezone: c.anchorTimezone,
+		anchorWindow: c.anchorWindow,
+		sweepInterval: c.sweepInterval,
+		cycleTarget: c.cycleTarget,
+		ratePerSecond: c.ratePerSecond,
+		concurrency: c.concurrency,
+		scope: c.scope,
+		reprobeAfter: c.reprobeAfter,
+		maxTriggersPerSweep: c.maxTriggersPerSweep,
+		abortAfterDistress: c.abortAfterDistress,
+		backoffMax: c.backoffMax,
+		trigger: {
+			maxPending: c.trigger.maxPending,
+			ratePerSecond: c.trigger.ratePerSecond,
+			concurrency: c.trigger.concurrency,
+		},
+		canary: {
+			interval: c.canary.interval,
+			count: c.canary.count,
+			threshold: c.canary.threshold,
+			minSample: c.canary.minSample,
+		},
+	};
+};
+
+/**
  * What this NODE's probe is doing — readable from any worker.
  *
  * Everything scheduler- or pass-shaped comes from the shared row rather than module state, for
  * the reason util/probeState.js documents: the scheduler arms on worker 0 and this endpoint is
  * served by all sixteen, so module state made the answer a coin flip that reported a healthy
- * probe as switched off ~95% of the time.
+ * probe as switched off ~95% of the time. `nextAnchoredRunAt` was the last field still read from
+ * module state — so it was null on every worker but 0, which is why it read null on all four nodes
+ * of a live deployment right after arming (#176) — and it is now published like the rest.
  *
- * `enabled`, `dryRun`, `rules`, `mode` and the `load` SETTINGS stay config-derived on purpose —
- * config is identical on every worker, so reading them locally is correct and costs no round
- * trip. `load.monitor` is the exception inside that block: it is the histogram's own liveness,
- * which only exists on the worker that armed it, so it is published like the rest.
+ * `enabled`, `dryRun`, `rules`, `mode`, `settings` and the `load` SETTINGS stay config-derived on
+ * purpose — config is identical on every worker, so reading them locally is correct and costs no
+ * round trip. `load.monitor` is the exception inside that block: it is the histogram's own
+ * liveness, which only exists on the worker that armed it, so it is published like the rest.
+ *
+ * CHEAP BY CONSTRUCTION: one node-local row read and config reads. The console polls this.
  *
  * A missing row reads as "nothing has run on this node yet", NOT as "disarmed": `armedInterval`
  * is null either way, but `stateAvailable: false` tells the console the difference between a
@@ -1781,32 +2073,39 @@ export const changeProbeStatus = async () => {
 	const sweep = row?.sweep ?? null;
 	const canary = row?.canary ?? null;
 	const scheduler = row?.scheduler ?? null;
+	// The NODE's clock, so a reader computes ages and ETAs against the clock that wrote the
+	// timestamps rather than against its own.
+	const now = Date.now();
+	const nextSweep = nextSweepRun(scheduler, now);
+	const canaryArmedAt = msOrNull(scheduler?.canaryArmedAt);
+	const canaryEvery = Number(scheduler?.armedCanary);
 
 	return {
+		statusVersion: STATUS_VERSION,
+		serverTime: now,
 		enabled: config.changeProbe.enabled,
 		dryRun: config.changeProbe.dryRun,
 		node: server.hostname,
+		workerIndex: server.workerIndex ?? null,
 		ownerScopeNote: 'Probes only the URLs this node owns; every node sweeps its own slice.',
-		rules: probeRules().map((rule) => ({
-			label: rule.label,
-			pathPattern: rule.patternSource,
-			source: rule.source,
-			invalidateScope: rule.invalidateScope,
-			// Only when present, so a rule without them reads exactly as it did — the console compares
-			// these objects across nodes to spot a rule list that did not reach every node.
-			...(rule.pageCheck?.fields?.length
-				? { pageFields: rule.pageCheck.fields.map((field) => `${field.label}:${field.compare}`) }
-				: {}),
-			...(rule.pageCheck?.ignoreChanges?.length ? { ignoreChanges: rule.pageCheck.ignoreChanges } : {}),
-		})),
+		rules: probeRules().map(ruleStatus),
 		mode: config.changeProbe.mode,
+		settings: probeSettings(),
+		// What "alive" means for a running pass, so a reader need not hard-code it: a healthy pass
+		// touches the row about every `intervalMs`, and one silent for `staleAfterMs` is presumed dead.
+		heartbeat: { intervalMs: HEARTBEAT_MS, staleAfterMs: PASS_STALE_MS },
 		// False only when the row could not be read at all. Distinguishes "the probe has not run
 		// here" from "this answer is not trustworthy", which the old shape could not express.
 		stateAvailable: row !== null,
 		stateUpdatedAt: row?.updatedAt ?? null,
 		sweep: {
 			running: isPassRunning(row, 'sweep', PASS_STALE_MS),
+			// The pass in flight, apart from `lastRun` — which is the last pass that ENDED and stays
+			// the previous one for the whole of a running pass.
+			current: currentPass(row, 'sweep'),
 			lastRun: sweep?.lastRun ?? null,
+			// The running pass's own partial counters (plugin v0.91.0; before it, only
+			// `examinedApprox`). Null when no pass holds the row.
 			progress: sweep?.running ? (sweep.progress ?? null) : null,
 			// In continuous mode this reads 'continuous' rather than a number: there is no gap
 			// between passes to arm, and reporting a stale `sweepInterval` here would describe a
@@ -1816,7 +2115,12 @@ export const changeProbeStatus = async () => {
 			// has measured it yet, which is precisely when the pass runs at the ceiling — worth
 			// being able to see, because "at the ceiling" otherwise looks identical to "behind".
 			cycleTarget: isContinuous() ? config.changeProbe.cycleTarget : null,
-			nextAnchoredRunAt: isAnchored() && nextAnchorAt ? new Date(nextAnchorAt).toISOString() : null,
+			nextAnchoredRunAt:
+				isAnchored() && msOrNull(scheduler?.nextAnchorAt) !== null
+					? new Date(msOrNull(scheduler.nextAnchorAt)).toISOString()
+					: null,
+			nextRunAt: nextSweep.at,
+			nextRunBasis: nextSweep.basis,
 			sliceSize: isContinuous() ? (scheduler?.sliceSize ?? null) : null,
 		},
 		load: {
@@ -1827,8 +2131,13 @@ export const changeProbeStatus = async () => {
 		},
 		canary: {
 			running: isPassRunning(row, 'canary', PASS_STALE_MS),
+			current: currentPass(row, 'canary'),
 			lastRun: canary?.lastRun ?? null,
 			armedInterval: scheduler?.armedCanary ?? null,
+			nextRunAt:
+				config.changeProbe.enabled && canaryArmedAt !== null && canaryEvery > 0
+					? nextTick(canaryArmedAt, canaryEvery, now)
+					: null,
 			cohortSizes: scheduler?.cohortSizes ?? {},
 		},
 	};
@@ -1843,23 +2152,43 @@ let sweepTimer = null;
 let canaryTimer = null;
 let armedSweep = null;
 let armedCanary = null;
+// When each driver was armed, so ANY worker can say when it fires next: the timers themselves live
+// on worker 0, and a timer cannot be asked for its next tick.
+let bootAt = null;
+let intervalArmedAt = null;
+let canaryArmedAt = null;
 
 /**
- * Publish the scheduler's own view: what is armed, the cohort sizes, the measured slice, and the
- * lag monitor's liveness. Only worker 0 ever calls this — it is the only worker that HAS these —
- * and every other worker reads the result.
+ * Publish the scheduler's own view: what is armed and when each driver fires next, the cohort
+ * sizes, the measured slice, and the lag monitor's liveness. Every other worker reads the result.
+ *
+ * ONLY THE SCHEDULER'S WORKER PUBLISHES. A pass can run on any worker — the admin POST starts one
+ * wherever the request landed — and that worker's module state has nothing armed, so its publish
+ * wrote `armedSweep: null` over worker 0's: after one manual sweep the admin surface reported the
+ * probe as not armed until worker 0 next republished, which in anchored mode is a day later.
+ *
+ * CALL IT AFTER THE STATE CHANGES, never before (#176): the snapshot is taken at the call, so a
+ * publish ahead of the arming it describes reports the previous arming.
+ *
+ * Returns the publish's promise. Config-path callers `void` it; a pass awaits it before its own
+ * write of the row.
  */
 const publishScheduler = () => {
+	if (!schedulerStarted) return Promise.resolve(false);
 	// The ARGUMENT is built synchronously, so a throw while building it escapes before there is a
-	// promise to reject — and both call sites use `void`, which would turn that into an unhandled
-	// exception on the config-apply path. Nothing in here should throw today; the guard is what
-	// keeps `publishProbeState`'s "observability can never fail a pass" promise true of the whole
-	// call rather than only of its async half.
+	// promise to reject — and the config-path call sites use `void`, which would turn that into an
+	// unhandled exception on the config-apply path. Nothing in here should throw today; the guard is
+	// what keeps `publishProbeState`'s "observability can never fail a pass" promise true of the
+	// whole call rather than only of its async half.
 	try {
-		void publishProbeState({
+		return publishProbeState({
 			scheduler: {
 				armedSweep,
 				armedCanary,
+				nextAnchorAt,
+				bootAt,
+				intervalArmedAt,
+				canaryArmedAt,
 				sliceSize: measuredSliceSize,
 				cohortSizes: Object.fromEntries([...cohorts].map(([label, urls]) => [label, urls.length])),
 				loadMonitor: loopLagMonitorState(),
@@ -1867,6 +2196,7 @@ const publishScheduler = () => {
 		});
 	} catch (e) {
 		logger.warn(`[prerender] could not publish change-probe scheduler state: ${e?.message ?? String(e)}`);
+		return Promise.resolve(false);
 	}
 };
 
@@ -1876,7 +2206,7 @@ const clearProbeTimers = () => {
 	if (canaryTimer) clearInterval(canaryTimer);
 	if (anchorTimer) clearTimeout(anchorTimer);
 	bootTimer = sweepTimer = canaryTimer = anchorTimer = null;
-	nextAnchorAt = null;
+	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = null;
 	stopContinuousLoop();
 };
 
@@ -1900,53 +2230,77 @@ const clearProbeTimers = () => {
  */
 let anchorTimer = null;
 let nextAnchorAt = null;
-const armAnchorTimer = () => {
-	if (anchorTimer) clearTimeout(anchorTimer);
+
+/**
+ * The next occurrence of the anchor, strictly in the future, or NaN when it cannot be computed.
+ *
+ * A NEXT RUN MUST BE IN THE FUTURE. On the spring-forward day the anchor's wall-clock time can be
+ * one that never occurs — 02:30 where 02:00 jumps to 03:00 — and `getNextTimeOfDay` resolves it to
+ * an instant that has already passed. Left alone that fires the pass an hour early and, worse, the
+ * re-arm at the end of the pass computes the same past instant again: the whole corpus is walked
+ * back to back at the ceiling rate until the hour is over. Pushing a stale anchor on by a day lands
+ * on the next real occurrence, because the offset is applied to the resolved instant rather than to
+ * the wall clock.
+ */
+const nextAnchorOccurrence = () => {
 	let at;
 	try {
 		at = getNextTimeOfDay(config.changeProbe.anchorTime, config.changeProbe.anchorTimezone);
 	} catch (e) {
-		at = NaN;
 		logger.warn(
 			`[prerender] change-probe: anchorTimezone "${config.changeProbe.anchorTimezone}" is not usable (${e?.message ?? String(e)})`
 		);
+		return NaN;
 	}
+	if (!Number.isFinite(at)) return NaN;
+	return at <= Date.now() ? at + DAY : at;
+};
+
+const armAnchorTimer = () => {
+	if (anchorTimer) clearTimeout(anchorTimer);
+	anchorTimer = null;
+	const at = nextAnchorOccurrence();
 	// An unusable anchor arms NOTHING. `setTimeout(fn, NaN)` fires at once, which would turn a typo
 	// in the timezone into a full-rate pass on every config apply; a warning and a null
-	// `nextAnchoredRunAt` on the admin surface is the failure mode that gets noticed and fixed.
+	// `nextAnchoredRunAt` on the admin surface is the failure mode that gets noticed and fixed — so
+	// the null is PUBLISHED, and since #176 null means only this.
 	if (!Number.isFinite(at)) {
 		nextAnchorAt = null;
 		logger.warn(
 			`[prerender] change-probe: anchored mode has no next run — fix anchorTime/anchorTimezone (the canary keeps running)`
 		);
+		void publishScheduler();
 		return;
 	}
-	// A NEXT RUN MUST BE IN THE FUTURE. On the spring-forward day the anchor's wall-clock time can
-	// be one that never occurs — 02:30 where 02:00 jumps to 03:00 — and `getNextTimeOfDay` resolves
-	// it to an instant that has already passed. Left alone that fires the pass an hour early and,
-	// worse, the re-arm at the end of the pass computes the same past instant again: the whole
-	// corpus is walked back to back at the ceiling rate until the hour is over. Pushing a stale
-	// anchor on by a day lands on the next real occurrence, because the offset is applied to the
-	// resolved instant rather than to the wall clock.
-	if (at <= Date.now()) at += DAY;
 	nextAnchorAt = at;
 	anchorTimer = setTimeout(
 		async () => {
 			anchorTimer = null;
-			nextAnchorAt = null;
+			// While this pass runs, the next run is the FOLLOWING occurrence — the one the re-arm below
+			// lands on if the pass ends before it. Publishing it now, rather than leaving the fired
+			// instant or a null up for the nine hours a pass takes, is what lets a reader see a pass
+			// that is on course to overrun its next anchor (and so skip it) before it does.
+			const upcoming = nextAnchorOccurrence();
+			nextAnchorAt = Number.isFinite(upcoming) ? upcoming : null;
+			// Awaited so the scheduler write lands before the pass claims the row.
+			await publishScheduler();
 			try {
-				await runProbeSweepOnce();
+				await runProbeSweepOnce({ startedBy: 'anchor' });
 			} catch (e) {
 				logger.error(e);
 			}
 			// Config is re-read here rather than captured: this is the boundary a live change acts on.
 			// A mode or anchor edit mid-pass has already re-armed through syncProbeTimers (the marker
-			// changed), so re-arming here as well would run two drivers.
+			// changed), and `armAnchorTimer` clears whatever timer that armed before arming its own, so
+			// the two can never both be live.
 			if (config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) armAnchorTimer();
 		},
 		Math.max(0, at - Date.now())
 	);
 	anchorTimer.unref?.();
+	// EVERY (re-)arm publishes — the first arm, an edit, and the re-arm after each pass. Publishing
+	// only from the paths that happened to call it is how the published anchor went stale (#176).
+	void publishScheduler();
 };
 
 /**
@@ -1988,7 +2342,7 @@ const runContinuousLoop = async () => {
 			// try/catch around `await` is correct and intentional: awaiting a rejected promise
 			// throws into this frame. The alternative (`.catch()`) would swallow the rejection and
 			// let the loop treat a crashed pass as a completed cycle.
-			const result = await runProbeSweepOnce();
+			const result = await runProbeSweepOnce({ startedBy: 'continuous' });
 			skipped = result?.skipped === true;
 		} catch (e) {
 			logger.error(e);
@@ -2016,17 +2370,31 @@ const armIntervals = () => {
 	if (isContinuous()) void runContinuousLoop();
 	else if (isAnchored()) armAnchorTimer();
 	else {
-		sweepTimer = setInterval(() => runProbeSweepOnce().catch((e) => logger.error(e)), armedSweep);
+		sweepTimer = setInterval(
+			() => runProbeSweepOnce({ startedBy: 'interval' }).catch((e) => logger.error(e)),
+			armedSweep
+		);
 		sweepTimer.unref?.();
+		intervalArmedAt = Date.now();
 	}
 	if (armedCanary) {
-		canaryTimer = setInterval(() => runProbeCanaryOnce().catch((e) => logger.error(e)), armedCanary);
+		canaryTimer = setInterval(
+			() => runProbeCanaryOnce({ startedBy: 'interval' }).catch((e) => logger.error(e)),
+			armedCanary
+		);
 		canaryTimer.unref?.();
+		canaryArmedAt = Date.now();
 	}
+	// After arming, so the published state describes the timers that now exist.
+	void publishScheduler();
 };
 
 // (Re)arm to match config; enable/disable and both intervals are live (reconcile's shape).
 const syncProbeTimers = () => {
+	// Only the scheduler's worker arms anything. The config listener that calls this is registered by
+	// `startChangeProbeScheduler`, so in a process this is always true — but a listener that outlives a
+	// stopped scheduler must not arm timers whose state it will never publish.
+	if (!schedulerStarted) return;
 	const enabled = config.changeProbe.enabled && probeRules().length > 0;
 	// In continuous mode there is no interval to arm, but the armed value still has to CHANGE when
 	// the mode does, or `syncProbeTimers` sees no difference and leaves an interval timer running
@@ -2059,12 +2427,18 @@ const syncProbeTimers = () => {
 	clearProbeTimers();
 	armedSweep = desiredSweep;
 	armedCanary = desiredCanary;
-	// Publish the arming so every worker can report it. Without this the endpoint answers
-	// `armedInterval: null` from 15 of 16 workers, which reads as "disarmed" rather than as
-	// "asked the wrong worker". Deliberately not awaited: `syncProbeTimers` runs on the config
-	// apply path and must not become async for a write whose failure is already logged.
-	void publishScheduler();
-	if (desiredSweep === null) return;
+
+	// EVERY BRANCH BELOW PUBLISHES, AND ONLY AFTER IT HAS ARMED (#176). This used to publish once,
+	// here, before anything was armed — so the snapshot carried the anchor as null, and null is the
+	// admin surface's "your anchor is broken" signal. Without a publish at all the endpoint answers
+	// `armedInterval: null` from 15 of 16 workers, which reads as "disarmed" rather than as "asked
+	// the wrong worker". Deliberately not awaited: `syncProbeTimers` runs on the config apply path and
+	// must not become async for a write whose failure is already logged.
+	if (desiredSweep === null) {
+		// A disarm is exactly what the published state has to say.
+		void publishScheduler();
+		return;
+	}
 
 	// Anchored mode never runs a boot sweep: the whole point is that the pass starts at the anchor,
 	// and a restart at 15:00 must not walk the corpus at 15:05. Baselines persist across restarts
@@ -2077,11 +2451,16 @@ const syncProbeTimers = () => {
 	// First arming is boot-shaped: delay + per-node stagger, so a rolling restart or a cluster-wide
 	// config apply doesn't start every node's registry walk (and origin probes) at the same moment.
 	const stagger = fnv1a32(server.hostname) % Math.max(1, config.changeProbe.startJitter | 0);
+	const delay = config.changeProbe.startDelay + stagger;
+	bootAt = Date.now() + delay;
 	bootTimer = setTimeout(() => {
-		runProbeSweepOnce().catch((e) => logger.error(e));
+		bootTimer = null;
+		bootAt = null;
+		runProbeSweepOnce({ startedBy: 'startup' }).catch((e) => logger.error(e));
 		armIntervals();
-	}, config.changeProbe.startDelay + stagger);
+	}, delay);
 	bootTimer.unref?.();
+	void publishScheduler();
 };
 
 export const probeTimerState = () => ({ started: schedulerStarted, armedSweep, armedCanary });
@@ -2100,6 +2479,11 @@ export function startChangeProbeScheduler() {
 /** Tests only — the shared row, which is what a DIFFERENT worker would see. */
 export const readProbeStateForTest = readProbeState;
 export const publishProbeStateForTest = publishProbeState;
+/** Tests only — resolves once every state write this worker issued has landed. */
+export const probeStatePublishedForTest = probeStatePublished;
+
+/** Tests only — the drain's heartbeat keeper, assertable without a queue that takes minutes. */
+export const __drainWithHeartbeatForTest = drainWithHeartbeat;
 
 /** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
 export const __passLimitsForTest = passLimits;
