@@ -86,8 +86,10 @@ export const readProbeState = async () => {
  */
 let publishing = Promise.resolve(true);
 export const publishProbeState = (patch) => {
-	// `publishNow` never rejects, so the chain can never wedge on one failed write.
-	publishing = publishing.then(() => publishNow(patch));
+	// The catch is on EVERY link, not assumed from `publishNow`'s own try/catch: a rejected link left
+	// in the chain would skip every later `.then` — permanently disabling state publishing on this
+	// worker — and would also hand the rejection to the caller, breaking "never throws" (review).
+	publishing = publishing.then(() => publishNow(patch)).catch(() => false);
 	return publishing;
 };
 

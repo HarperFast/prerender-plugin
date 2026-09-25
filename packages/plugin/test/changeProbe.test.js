@@ -1545,6 +1545,28 @@ test('a heartbeat mid-pass must NOT wipe lastRun — the merge is one level deep
 	assert.equal(row.sweep.running, true);
 });
 
+test('a publish that rejects neither wedges later publishes nor rejects to its caller (review)', async () => {
+	// Force the one path out of publishNow's try/catch: the read throws AND the warning logger throws.
+	const working = globalThis.databases.coordination.SharedBuffer;
+	globalThis.databases.coordination.SharedBuffer = class {
+		static async get() {
+			throw new Error('store down');
+		}
+		static async put() {}
+	};
+	globalThis.logger.warn = () => {
+		throw new Error('logger down');
+	};
+	const failed = await changeProbe.publishProbeStateForTest({ sweep: { running: true } });
+	assert.equal(failed, false, 'the rejected publish resolves false instead of rejecting to its caller');
+
+	globalThis.databases.coordination.SharedBuffer = working;
+	globalThis.logger.warn = () => {};
+	await changeProbe.publishProbeStateForTest({ scheduler: { armedSweep: 'anchored:00:05|UTC' } });
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row?.scheduler?.armedSweep, 'anchored:00:05|UTC', 'the next publish still landed');
+});
+
 test('omission means "leave alone"; clearing a field requires naming it', async () => {
 	// The rule the one-level merge implies, pinned so a future writer does not assume otherwise.
 	await changeProbe.publishProbeStateForTest({ sweep: { running: true, progress: { examinedApprox: 9 } } });
