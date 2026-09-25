@@ -1,0 +1,614 @@
+{
+	"capturedAt": 1790294208153,
+	"source": "READ-ONLY GET /prerender_admin/change-probe on a live 4-node deployment running plugin 0.83.0, 2026-09-24 ~23:57 UTC (idle between anchored passes). Hostnames, the origin host and product slugs are replaced; every number and timestamp is as read. The configured rule is replaced by a generic rule of the same shape (20 extract paths, the same pageCheck slots).",
+	"nodes": [
+		{
+			"hostname": "node-1.example.com",
+			"body": {
+				"enabled": true,
+				"dryRun": false,
+				"node": "node-1.example.com",
+				"ownerScopeNote": "Probes only the URLs this node owns; every node sweeps its own slice.",
+				"rules": [
+					{
+						"label": "pdp-price-availability",
+						"pathPattern": "^/product/prd-([^/]+)",
+						"source": "request",
+						"invalidateScope": "route:prefix:/product/prd-"
+					}
+				],
+				"mode": "anchored",
+				"stateAvailable": true,
+				"stateUpdatedAt": 1790294133541,
+				"sweep": {
+					"running": false,
+					"lastRun": {
+						"examined": 1688215,
+						"owned": 421022,
+						"matched": 289498,
+						"probed": 289493,
+						"seeded": 3123,
+						"rebaselined": 0,
+						"unchanged": 273600,
+						"changed": 12763,
+						"queued": 13325,
+						"triggered": 13325,
+						"deferred": 0,
+						"failed": 7,
+						"errors": 0,
+						"fresh": 5,
+						"pageMismatch": 3483,
+						"throttled": 7,
+						"throttleLevel": 1,
+						"loadThrottleLevel": 1,
+						"loopLagMs": null,
+						"pacedRate": 10,
+						"behindBatches": 0,
+						"abortedOnDistress": false,
+						"failureSamples": [
+							{
+								"url": "https://www.example.com/product/prd-1000001/sample-item-1.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000002/sample-item-2.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000003/sample-item-3.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							}
+						],
+						"triggerQueueDepth": 468,
+						"unreadable": 0,
+						"dryRun": false,
+						"label": null,
+						"node": "node-1.example.com",
+						"startedAt": 1790226300002,
+						"finishedAt": 1790257268499,
+						"error": null
+					},
+					"progress": null,
+					"armedInterval": "anchored:00:05|America/Chicago",
+					"cycleTarget": null,
+					"nextAnchoredRunAt": null,
+					"sliceSize": null
+				},
+				"load": {
+					"enabled": false,
+					"lagThreshold": 50,
+					"backoffMax": 8,
+					"monitor": {
+						"running": false,
+						"unavailable": false
+					}
+				},
+				"canary": {
+					"running": false,
+					"lastRun": {
+						"perRule": [
+							{
+								"rule": "pdp-price-availability",
+								"cohort": 500,
+								"examined": 500,
+								"owned": 500,
+								"matched": 500,
+								"probed": 500,
+								"seeded": 0,
+								"rebaselined": 0,
+								"unchanged": 500,
+								"changed": 0,
+								"queued": 1,
+								"triggered": 1,
+								"deferred": 0,
+								"failed": 0,
+								"errors": 0,
+								"fresh": 0,
+								"pageMismatch": 1,
+								"throttled": 0,
+								"throttleLevel": 1,
+								"loadThrottleLevel": 1,
+								"loopLagMs": null,
+								"pacedRate": 10,
+								"behindBatches": 0,
+								"abortedOnDistress": false,
+								"failureSamples": [],
+								"tripped": false,
+								"compared": 500,
+								"fraction": 0,
+								"action": null
+							}
+						],
+						"dryRun": false,
+						"node": "node-1.example.com",
+						"startedAt": 1790294083435,
+						"finishedAt": 1790294133540,
+						"error": null
+					},
+					"armedInterval": 1800000,
+					"cohortSizes": {}
+				}
+			}
+		},
+		{
+			"hostname": "node-2.example.com",
+			"body": {
+				"enabled": true,
+				"dryRun": false,
+				"node": "node-2.example.com",
+				"ownerScopeNote": "Probes only the URLs this node owns; every node sweeps its own slice.",
+				"rules": [
+					{
+						"label": "pdp-price-availability",
+						"pathPattern": "^/product/prd-([^/]+)",
+						"source": "request",
+						"invalidateScope": "route:prefix:/product/prd-"
+					}
+				],
+				"mode": "anchored",
+				"stateAvailable": true,
+				"stateUpdatedAt": 1790293599525,
+				"sweep": {
+					"running": false,
+					"lastRun": {
+						"examined": 1688552,
+						"owned": 420557,
+						"matched": 291601,
+						"probed": 291591,
+						"seeded": 3297,
+						"rebaselined": 0,
+						"unchanged": 274614,
+						"changed": 13673,
+						"queued": 14317,
+						"triggered": 14317,
+						"deferred": 0,
+						"failed": 7,
+						"errors": 0,
+						"fresh": 10,
+						"pageMismatch": 3467,
+						"throttled": 7,
+						"throttleLevel": 1,
+						"loadThrottleLevel": 1,
+						"loopLagMs": null,
+						"pacedRate": 10,
+						"behindBatches": 0,
+						"abortedOnDistress": false,
+						"failureSamples": [
+							{
+								"url": "https://www.example.com/product/prd-1000004/sample-item-4.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000005/sample-item-5.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000006/sample-item-6.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							}
+						],
+						"triggerQueueDepth": 457,
+						"unreadable": 16,
+						"dryRun": false,
+						"label": null,
+						"node": "node-2.example.com",
+						"startedAt": 1790226300004,
+						"finishedAt": 1790257062204,
+						"error": null
+					},
+					"progress": null,
+					"armedInterval": "anchored:00:05|America/Chicago",
+					"cycleTarget": null,
+					"nextAnchoredRunAt": null,
+					"sliceSize": null
+				},
+				"load": {
+					"enabled": false,
+					"lagThreshold": 50,
+					"backoffMax": 8,
+					"monitor": {
+						"running": false,
+						"unavailable": false
+					}
+				},
+				"canary": {
+					"running": false,
+					"lastRun": {
+						"perRule": [
+							{
+								"rule": "pdp-price-availability",
+								"cohort": 500,
+								"examined": 499,
+								"owned": 499,
+								"matched": 499,
+								"probed": 499,
+								"seeded": 0,
+								"rebaselined": 0,
+								"unchanged": 499,
+								"changed": 0,
+								"queued": 0,
+								"triggered": 0,
+								"deferred": 0,
+								"failed": 0,
+								"errors": 0,
+								"fresh": 0,
+								"pageMismatch": 0,
+								"throttled": 0,
+								"throttleLevel": 1,
+								"loadThrottleLevel": 1,
+								"loopLagMs": null,
+								"pacedRate": 10,
+								"behindBatches": 0,
+								"abortedOnDistress": false,
+								"failureSamples": [],
+								"tripped": false,
+								"compared": 499,
+								"fraction": 0,
+								"action": null
+							}
+						],
+						"dryRun": false,
+						"node": "node-2.example.com",
+						"startedAt": 1790293548838,
+						"finishedAt": 1790293599525,
+						"error": null
+					},
+					"armedInterval": 1800000,
+					"cohortSizes": {}
+				}
+			}
+		},
+		{
+			"hostname": "node-3.example.com",
+			"body": {
+				"enabled": true,
+				"dryRun": false,
+				"node": "node-3.example.com",
+				"ownerScopeNote": "Probes only the URLs this node owns; every node sweeps its own slice.",
+				"rules": [
+					{
+						"label": "pdp-price-availability",
+						"pathPattern": "^/product/prd-([^/]+)",
+						"source": "request",
+						"invalidateScope": "route:prefix:/product/prd-"
+					}
+				],
+				"mode": "anchored",
+				"stateAvailable": true,
+				"stateUpdatedAt": 1790294176522,
+				"sweep": {
+					"running": false,
+					"lastRun": {
+						"examined": 1687970,
+						"owned": 421452,
+						"matched": 290095,
+						"probed": 290090,
+						"seeded": 3316,
+						"rebaselined": 0,
+						"unchanged": 274156,
+						"changed": 12607,
+						"queued": 13163,
+						"triggered": 13163,
+						"deferred": 0,
+						"failed": 11,
+						"errors": 0,
+						"fresh": 5,
+						"pageMismatch": 3358,
+						"throttled": 11,
+						"throttleLevel": 1,
+						"loadThrottleLevel": 1,
+						"loopLagMs": null,
+						"pacedRate": 10,
+						"behindBatches": 0,
+						"abortedOnDistress": false,
+						"failureSamples": [
+							{
+								"url": "https://www.example.com/product/prd-1000007/sample-item-7.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000008/sample-item-8.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000009/sample-item-9.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							}
+						],
+						"triggerQueueDepth": 132,
+						"unreadable": 15,
+						"dryRun": false,
+						"label": null,
+						"node": "node-3.example.com",
+						"startedAt": 1790226300001,
+						"finishedAt": 1790257959437,
+						"error": null
+					},
+					"progress": null,
+					"armedInterval": "anchored:00:05|America/Chicago",
+					"cycleTarget": null,
+					"nextAnchoredRunAt": null,
+					"sliceSize": null
+				},
+				"load": {
+					"enabled": false,
+					"lagThreshold": 50,
+					"backoffMax": 8,
+					"monitor": {
+						"running": false,
+						"unavailable": false
+					}
+				},
+				"canary": {
+					"running": true,
+					"lastRun": {
+						"perRule": [
+							{
+								"rule": "pdp-price-availability",
+								"cohort": 500,
+								"examined": 500,
+								"owned": 500,
+								"matched": 499,
+								"probed": 499,
+								"seeded": 0,
+								"rebaselined": 0,
+								"unchanged": 496,
+								"changed": 3,
+								"queued": 4,
+								"triggered": 4,
+								"deferred": 0,
+								"failed": 0,
+								"errors": 0,
+								"fresh": 0,
+								"pageMismatch": 2,
+								"throttled": 0,
+								"throttleLevel": 1,
+								"loadThrottleLevel": 1,
+								"loopLagMs": null,
+								"pacedRate": 10,
+								"behindBatches": 0,
+								"abortedOnDistress": false,
+								"failureSamples": [],
+								"tripped": false,
+								"compared": 499,
+								"fraction": 0.006012024048096192,
+								"action": null
+							}
+						],
+						"dryRun": false,
+						"node": "node-3.example.com",
+						"startedAt": 1790292376521,
+						"finishedAt": 1790292434311,
+						"error": null
+					},
+					"armedInterval": 1800000,
+					"cohortSizes": {}
+				}
+			}
+		},
+		{
+			"hostname": "node-4.example.com",
+			"body": {
+				"enabled": true,
+				"dryRun": false,
+				"node": "node-4.example.com",
+				"ownerScopeNote": "Probes only the URLs this node owns; every node sweeps its own slice.",
+				"rules": [
+					{
+						"label": "pdp-price-availability",
+						"pathPattern": "^/product/prd-([^/]+)",
+						"source": "request",
+						"invalidateScope": "route:prefix:/product/prd-"
+					}
+				],
+				"mode": "anchored",
+				"stateAvailable": true,
+				"stateUpdatedAt": 1790292998843,
+				"sweep": {
+					"running": false,
+					"lastRun": {
+						"examined": 1683445,
+						"owned": 421527,
+						"matched": 289607,
+						"probed": 289601,
+						"seeded": 3184,
+						"rebaselined": 0,
+						"unchanged": 274547,
+						"changed": 11868,
+						"queued": 12387,
+						"triggered": 12387,
+						"deferred": 0,
+						"failed": 2,
+						"errors": 0,
+						"fresh": 6,
+						"pageMismatch": 3323,
+						"throttled": 2,
+						"throttleLevel": 1,
+						"loadThrottleLevel": 1,
+						"loopLagMs": null,
+						"pacedRate": 10,
+						"behindBatches": 0,
+						"abortedOnDistress": false,
+						"failureSamples": [
+							{
+								"url": "https://www.example.com/product/prd-1000010/sample-item-10.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							},
+							{
+								"url": "https://www.example.com/product/prd-1000011/sample-item-11.jsp",
+								"rule": "pdp-price-availability",
+								"error": "Headers Timeout Error"
+							}
+						],
+						"triggerQueueDepth": 456,
+						"unreadable": 150,
+						"dryRun": false,
+						"label": null,
+						"node": "node-4.example.com",
+						"startedAt": 1790226300002,
+						"finishedAt": 1790257968868,
+						"error": null
+					},
+					"progress": null,
+					"armedInterval": "anchored:00:05|America/Chicago",
+					"cycleTarget": null,
+					"nextAnchoredRunAt": null,
+					"sliceSize": null
+				},
+				"load": {
+					"enabled": false,
+					"lagThreshold": 50,
+					"backoffMax": 8,
+					"monitor": {
+						"running": false,
+						"unavailable": false
+					}
+				},
+				"canary": {
+					"running": false,
+					"lastRun": {
+						"perRule": [
+							{
+								"rule": "pdp-price-availability",
+								"cohort": 500,
+								"examined": 500,
+								"owned": 500,
+								"matched": 499,
+								"probed": 499,
+								"seeded": 0,
+								"rebaselined": 0,
+								"unchanged": 499,
+								"changed": 0,
+								"queued": 0,
+								"triggered": 0,
+								"deferred": 0,
+								"failed": 0,
+								"errors": 0,
+								"fresh": 0,
+								"pageMismatch": 0,
+								"throttled": 0,
+								"throttleLevel": 1,
+								"loadThrottleLevel": 1,
+								"loopLagMs": null,
+								"pacedRate": 10,
+								"behindBatches": 0,
+								"abortedOnDistress": false,
+								"failureSamples": [],
+								"tripped": false,
+								"compared": 499,
+								"fraction": 0,
+								"action": null
+							}
+						],
+						"dryRun": false,
+						"node": "node-4.example.com",
+						"startedAt": 1790292948735,
+						"finishedAt": 1790292998842,
+						"error": null
+					},
+					"armedInterval": 1800000,
+					"cohortSizes": {}
+				}
+			}
+		}
+	],
+	"config": {
+		"changeProbe": {
+			"enabled": true,
+			"dryRun": false,
+			"rules": [
+				{
+					"label": "pdp-price-availability",
+					"pathPattern": "^/product/prd-([^/]+)",
+					"source": "request",
+					"request": {
+						"urlTemplate": "https://www.example.com/api/product/$1",
+						"method": "GET",
+						"headers": {
+							"accept": "application/json"
+						}
+					},
+					"extract": [
+						"product.price.regular",
+						"product.price.sale",
+						"product.price.lowest",
+						"product.status",
+						"product.priceSet",
+						"product.availableOnline",
+						"product.url",
+						"product.price.saleStatus",
+						"product.price.percentOff",
+						"product.price.promotion",
+						"product.badges",
+						"product.isNew",
+						"product.bestSeller",
+						"product.topRated",
+						"product.title",
+						"product.brand",
+						"product.meta.title",
+						"product.meta.description",
+						"product.images[0].url",
+						"product.breadcrumbs"
+					],
+					"invalidateScope": "route:prefix:/product/prd-",
+					"statusSignals": [
+						{
+							"status": 400,
+							"contains": "ERR_UNAVAILABLE",
+							"signature": "unavailable"
+						},
+						{
+							"status": 400,
+							"contains": "ERR_UNKNOWN_ID",
+							"signature": "unknown-id"
+						}
+					],
+					"pageCheck": {
+						"enabled": true,
+						"priceFrom": 2,
+						"availableFrom": 3
+					}
+				}
+			],
+			"mode": "anchored",
+			"anchorTime": "00:05",
+			"anchorTimezone": "America/Chicago",
+			"anchorWindow": 0,
+			"sweepInterval": 43200000,
+			"cycleTarget": 86400000,
+			"ratePerSecond": 10,
+			"concurrency": 4,
+			"reprobeAfter": 21600000,
+			"backoffMax": 64,
+			"load.enabled": false,
+			"load.lagThreshold": 50,
+			"load.backoffMax": 8,
+			"load.resolution": 10,
+			"abortAfterDistress": 50,
+			"chunkSize": 2000,
+			"trigger.ratePerSecond": 3,
+			"trigger.concurrency": 4,
+			"trigger.maxPending": 50000,
+			"maxTriggersPerSweep": 150000,
+			"requestTimeout": 10000,
+			"maxResponseBytes": 5242880,
+			"startDelay": 300000,
+			"startJitter": 300000,
+			"canary.interval": 1800000,
+			"canary.count": 500,
+			"canary.threshold": 0.7,
+			"canary.minSample": 50,
+			"canary.holdoff": 21600000
+		}
+	}
+}

@@ -194,6 +194,8 @@ const msOf = (value) => {
 	return Number.isFinite(n) ? n : NaN;
 };
 
+const isoOrNull = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+
 // ---------------------------------------------------------------- the envelope
 
 /**
@@ -1005,12 +1007,127 @@ const PROBE_COUNTERS = [
 	// sums on its own and belongs in no subtraction — same footing as `throttled` inside `failed`.
 	'pageMismatch',
 	'errors',
+	// Added after the list was first written, and each one was DROPPED by this merge until console
+	// v0.16.0 — the cluster view simply did not have them, while every node reported them.
+	// `rebaselined` is the one that mattered most: the compared denominator subtracts it, so without
+	// it a cluster pass right after a rule edit read as "nothing changed" over rows never compared.
+	'rebaselined',
+	'queued',
+	'extended', // plugin v0.86.0 — overlays unchanged/changed, like pageMismatch
+	'caughtUp', // v0.88.0 — overlays changed
+	'ignored', // v0.88.0 — overlays unchanged
+	'outOfScope', // v0.89.0 — outside matched entirely
+	'behindBatches',
 ];
+
+/**
+ * Per-pass maps of counts, `{ [rule]: { [key]: n } }`: origin changes per extract slot and page
+ * mismatches per mapped field (plugin v0.88.0). Each node counts its own slice, so the leaves add.
+ */
+const PROBE_COUNT_MAPS = ['slotChanges', 'fieldMismatch'];
+
+const sumCountMaps = (runs, key) => {
+	const out = {};
+	let seen = false;
+	for (const run of runs) {
+		const map = run[key];
+		if (!map || typeof map !== 'object') continue;
+		seen = true;
+		for (const [rule, counts] of Object.entries(map)) {
+			for (const [leaf, n] of Object.entries(counts ?? {})) {
+				const value = finite(n);
+				if (!Number.isFinite(value)) continue;
+				out[rule] ??= {};
+				out[rule][leaf] = (out[rule][leaf] ?? 0) + value;
+			}
+		}
+	}
+	return seen ? out : null;
+};
+
+/**
+ * The mapping-defect guard, across nodes. The guard is per PROCESS — each node judges its own
+ * witnessed comparisons — so the counts add but the verdict does not: a field disarmed on one node
+ * is still triggering on the others, and the merge names the node rather than folding it.
+ */
+const mergeFieldGuards = (runs) => {
+	const out = {};
+	let seen = false;
+	for (const run of runs) {
+		const guard = run.fieldGuard;
+		if (!guard || typeof guard !== 'object') continue;
+		seen = true;
+		for (const [rule, fields] of Object.entries(guard)) {
+			for (const [field, entry] of Object.entries(fields ?? {})) {
+				out[rule] ??= {};
+				const merged = (out[rule][field] ??= { witnessed: 0, disagreed: 0, armed: true, disarmedOn: [] });
+				merged.witnessed += finite(entry?.witnessed) || 0;
+				merged.disagreed += finite(entry?.disagreed) || 0;
+				if (entry?.armed === false) {
+					merged.armed = false;
+					merged.disarmedOn.push(run.hostname);
+				}
+			}
+		}
+	}
+	return seen ? out : null;
+};
+
+/**
+ * What makes two nodes' rule lists the same, as a comparable string per node.
+ *
+ * NOT the raw objects: plugin v0.91.0 added `fingerprint`, `extract` and `endpoint` to each rule, so
+ * a JSON comparison would flag every mixed-version cluster — every rolling deploy — as "the nodes
+ * disagree on the rules". The fields every version reports are compared always; the fingerprint
+ * (which sees an edited extract path or header, where the rest cannot) only when every node has one.
+ */
+const ruleIdentity = (bodies) => {
+	const withFingerprints = bodies.every((r) => (r.b.rules ?? []).every((rule) => typeof rule.fingerprint === 'string'));
+	return bodies.map((r) =>
+		JSON.stringify(
+			(r.b.rules ?? []).map((rule) => [
+				rule.label ?? null,
+				rule.pathPattern ?? null,
+				rule.source ?? null,
+				rule.invalidateScope ?? null,
+				rule.pageFields ?? null,
+				rule.ignoreChanges ?? null,
+				withFingerprints ? rule.fingerprint : null,
+			])
+		)
+	);
+};
 
 /** Bound on the pooled failure samples — they exist to name a shape change, not to be a log. */
 const MAX_FAILURE_SAMPLES = 6;
 
 const sumCounters = (runs, keys) => Object.fromEntries(keys.map((key) => [key, sumOf(runs, (r) => r[key])]));
+
+/**
+ * Which nodes' pass records lack a counter — a node on a plugin older than the counter. Their slice
+ * is missing from that one sum, which reads as a smaller number rather than a partial one unless
+ * the payload says so. Only counters some node DOES report are listed.
+ */
+const unreportedCounters = (runs, keys) => {
+	const out = {};
+	for (const key of keys) {
+		const missing = runs.filter((run) => !Number.isFinite(finite(run[key]))).map((run) => run.hostname);
+		if (missing.length && missing.length < runs.length) out[key] = missing;
+	}
+	return out;
+};
+
+/** The one value every node that reports it agrees on, else null (the caller reports the split). */
+const agreed = (values) => {
+	const present = values.filter((value) => value !== null && value !== undefined);
+	if (!present.length) return null;
+	const first = JSON.stringify(present[0]);
+	return present.every((value) => JSON.stringify(value) === first) ? present[0] : null;
+};
+
+const diverges = (values) =>
+	new Set(values.filter((value) => value !== null && value !== undefined).map((value) => JSON.stringify(value))).size >
+	1;
 
 /**
  * Merge the change-probe status of every node into one cluster answer.
@@ -1047,8 +1164,10 @@ export function mergeChangeProbe(results) {
 	// Rules are configuration, so they are identical by intent and one node's copy is the answer.
 	// A disagreement is a deploy that skipped a node, which is the Config view's finding and not
 	// this one's — flagged here, diagnosed there.
-	const ruleJson = bodies.map((r) => JSON.stringify(r.b.rules ?? []));
+	const ruleJson = ruleIdentity(bodies);
 	const rules = bodies.find((r) => (r.b.rules ?? []).length)?.b.rules ?? [];
+	const modes = bodies.map((r) => r.b.mode ?? null);
+	const armedSweeps = bodies.map((r) => r.b.sweep?.armedInterval ?? null);
 
 	// Per RULE, across nodes: the counters add (disjoint cohorts), the verdict is named per node.
 	const perRule = new Map();
@@ -1098,6 +1217,15 @@ export function mergeChangeProbe(results) {
 			ownerScopeNote: bodies[0].b.ownerScopeNote ?? null,
 			rules,
 			rulesDiverge: new Set(ruleJson).size > 1,
+			// The sweep's scheduling mode. `null` with `modeDiverge` is the finding: the nodes are not
+			// running the same schedule, which is a deploy or override that did not land everywhere.
+			mode: agreed(modes),
+			modeDiverge: diverges(modes),
+			settingsDiverge: diverges(bodies.map((r) => r.b.settings ?? null)),
+			// 1 is every plugin before v0.91.0, which reports no running-pass counters, no next run and
+			// no settings. The OLDEST node decides what the cluster view can promise.
+			statusVersion: minOf(bodies, (r) => r.b.statusVersion ?? 1),
+			stateUpdatedAt: minOf(bodies, (r) => msOf(r.b.stateUpdatedAt)),
 			// Plugin v0.62.0 publishes the probe's state to a node-local row every worker can read,
 			// and says when that row could NOT be read: `stateAvailable: false` is "this answer is not
 			// trustworthy", which the old per-worker shape could not express (it reported `running:
@@ -1115,14 +1243,29 @@ export function mergeChangeProbe(results) {
 				progress: bodies
 					.filter((r) => r.b.sweep?.running && r.b.sweep?.progress)
 					.map((r) => ({ hostname: r.hostname, ...r.b.sweep.progress })),
-				armedInterval: bodies.find((r) => Number.isFinite(r.b.sweep?.armedInterval))?.b.sweep.armedInterval ?? null,
+				// ANY armed value, not only a numeric one. The plugin tags the mode into this field
+				// ('continuous', or 'anchored:<time>|<zone>'), and a `Number.isFinite` filter here turned
+				// every continuous or anchored cluster into "not armed" on the cluster view — the default
+				// view — while every node was armed and sweeping.
+				armedInterval: agreed(armedSweeps) ?? armedSweeps.find((value) => value !== null) ?? null,
+				armedIntervalDiverge: diverges(armedSweeps),
+				cycleTarget: agreed(bodies.map((r) => r.b.sweep?.cycleTarget ?? null)),
+				sliceSize: sumOf(bodies, (r) => r.b.sweep?.sliceSize),
+				// The EARLIEST next run across nodes: the soonest anything will start.
+				nextAnchoredRunAt: isoOrNull(minOf(bodies, (r) => msOf(r.b.sweep?.nextAnchoredRunAt))),
+				nextRunAt: minOf(bodies, (r) => msOf(r.b.sweep?.nextRunAt)),
 				sweptNodes: sweeps.length,
 				unsweptNodes: bodies.filter((r) => !r.b.sweep?.lastRun?.startedAt).map((r) => r.hostname),
 				lastRun: sweeps.length
 					? {
 							...sumCounters(sweeps, PROBE_COUNTERS),
+							...Object.fromEntries(PROBE_COUNT_MAPS.map((key) => [key, sumCountMaps(sweeps, key)])),
+							fieldGuard: mergeFieldGuards(sweeps),
+							unreported: unreportedCounters(sweeps, [...PROBE_COUNTERS, 'unreadable']),
 							// A walk fault, summed like a counter but reported apart from the pass outcomes.
 							unreadable: sumOf(sweeps, (run) => run.unreadable),
+							// The deepest the trigger queue got on any node — a high-water mark, not a sum.
+							triggerQueueDepth: maxOf(sweeps, (run) => run.triggerQueueDepth),
 							dryRun: sweeps.every((run) => run.dryRun !== false),
 							aborted: sweeps.some((run) => run.aborted),
 							// WHY `some` AND NOT A COUNT. One node that gave up on a refusing origin covered
@@ -1146,6 +1289,7 @@ export function mergeChangeProbe(results) {
 			canary: {
 				running: bodies.some((r) => r.b.canary?.running),
 				armedInterval: bodies.find((r) => Number.isFinite(r.b.canary?.armedInterval))?.b.canary.armedInterval ?? null,
+				nextRunAt: minOf(bodies, (r) => msOf(r.b.canary?.nextRunAt)),
 				cohortSizes: bodies.reduce((acc, r) => {
 					for (const [label, size] of Object.entries(r.b.canary?.cohortSizes ?? {})) {
 						acc[label] = (acc[label] ?? 0) + (finite(size) || 0);
@@ -1165,6 +1309,12 @@ export function mergeChangeProbe(results) {
 						}
 					: null,
 			},
+			// EVERY NODE'S OWN PAYLOAD, UNMERGED. The merge above is a summary, and it can only carry the
+			// fields it knows; every field a plugin added after it was written used to vanish here —
+			// `mode`, `nextAnchoredRunAt`, `stateUpdatedAt`, the page-record counters — while every node
+			// reported them. The view reads each node's state from its own payload, so a field this
+			// merge has never heard of still reaches the screen.
+			perNode: bodies.map((r) => ({ ...r.b, hostname: r.hostname })),
 			// Every node's own slice, unsummed — the purge/sweep actions are run per node, so this
 			// is the table an operator works down.
 			byNode: bodies.map((r) => ({
