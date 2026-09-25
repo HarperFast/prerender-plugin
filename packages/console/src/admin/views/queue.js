@@ -155,8 +155,10 @@ function kpis(data, analytics) {
 	const inFlightLive = Number.isFinite(floor.occupancy);
 	const inFlight = inFlightLive ? floor.occupancy : Number.isFinite(backlog?.inFlight) ? backlog.inFlight : null;
 
+	// Over the window the scan COVERED: a truncated scan holds fewer hours than were asked for.
 	const rendersPerHour = analytics
-		? sumCount(pick(analytics, 'render', (s) => s.path === OUTCOME)) / (analytics.rangeMs / 3_600_000)
+		? sumCount(pick(analytics, 'render', (s) => s.path === OUTCOME)) /
+			(coveredHours(analytics) ?? analytics.rangeMs / 3_600_000)
 		: null;
 	const clear = drain(backlog && !backlog.error ? backlog.overdue : null, inFlight, rendersPerHour);
 
@@ -210,7 +212,7 @@ function kpis(data, analytics) {
 		const claims = pick(analytics, 'queue_health', (s) => s.path === 'claim_scan_ms');
 		const total = sumCount(outcomes);
 		const failedLike = sumCount(outcomes.filter((s) => s.method === 'failed' || s.method === 'auth-failure'));
-		const hours = analytics.rangeMs / 3_600_000;
+		const hours = coveredHours(analytics) ?? analytics.rangeMs / 3_600_000;
 		tiles.push(
 			stat('Renders / hour', fmtCount(total / hours), `${num(total)} results · ${scopeLabel(analytics)}`),
 			stat('Failed', pct(failedLike, total), `${num(failedLike)} failed or auth-failed`, {
@@ -245,16 +247,28 @@ function kpis(data, analytics) {
  *
  * Returns `{ ms, verdict }`; `ms` is null when there is no rate to divide by. Past two hours the
  * backlog is outrunning a normal cadence's slack (watch), past eight a daily corpus is going stale
- * faster than it renders (bad). A backlog with NO renders in the window is bad on its face.
+ * faster than it renders (bad). A backlog with NO renders in the window is bad on its face; a backlog
+ * with no render RATE (analytics did not load) is unknown.
  */
 export function drain(overdue, inFlight, rendersPerHour) {
 	if (!Number.isFinite(overdue)) return { ms: null, verdict: 'na' };
 	const waiting = Math.max(0, overdue - (Number.isFinite(inFlight) ? inFlight : 0));
 	if (waiting === 0) return { ms: 0, verdict: 'ok' };
-	if (!(rendersPerHour > 0)) return { ms: null, verdict: 'bad' };
+	// An UNKNOWN rate (no analytics loaded) is not a zero one: "nothing rendered" would be a claim.
+	if (rendersPerHour === null || rendersPerHour === undefined || !Number.isFinite(rendersPerHour)) {
+		return { ms: null, verdict: 'na' };
+	}
+	if (rendersPerHour <= 0) return { ms: null, verdict: 'bad' };
 	const ms = (waiting / rendersPerHour) * 3_600_000;
 	return { ms, verdict: ms > 8 * 3_600_000 ? 'bad' : ms > 2 * 3_600_000 ? 'warn' : 'ok' };
 }
+
+/** Hours the analytics window actually covers — less than the range when the scan hit its cap. */
+const coveredHours = (data) => {
+	const from = data.coveredFromMs ?? data.startMs;
+	const to = data.coveredToMs ?? data.endMs;
+	return Number.isFinite(from) && Number.isFinite(to) && to > from ? (to - from) / 3_600_000 : null;
+};
 
 // ---- nodes ---------------------------------------------------------------------------
 

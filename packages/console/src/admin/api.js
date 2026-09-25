@@ -101,18 +101,25 @@ export const get = (path, params) => {
 	const key = `${node}\u0000${url}`;
 	let pending = inflight.get(key);
 	if (!pending) {
-		pending = request(url).finally(() => inflight.delete(key));
+		// Identity-checked: after a POST cleared the map, a newer request may own this key.
+		const mine = request(url).finally(() => inflight.get(key) === mine && inflight.delete(key));
+		pending = mine;
 		inflight.set(key, pending);
 	}
 	return pending;
 };
 
-export const post = (path, data) =>
-	request(path, {
+export const post = (path, data) => {
+	// A write changes what a read means: a GET issued AFTER this POST must not ride one issued before
+	// it — the reload after "Start" would redraw "not running", and the session check after sign-out
+	// would answer "signed in". So every POST (login and logout included) retires the shared reads.
+	inflight.clear();
+	return request(path, {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify(data ?? {}),
 	});
+};
 
 /** The URL of a stored page's HTML. Opened in a tab; served as text/plain, never text/html. */
 export const pageContentUrl = (cacheKey) => withNode(`${BASE}/page-content?cacheKey=${encodeURIComponent(cacheKey)}`);

@@ -20,7 +20,7 @@
 
 import { el, harperMark, icon, pill, skeleton, spacer } from './ui.js';
 import { CLUSTER, get, post, setExpiredHandler, setNode } from './api.js';
-import { segmented } from './charts.js';
+import { hideTip, segmented } from './charts.js';
 import * as health from './views/health.js';
 import * as traffic from './views/traffic.js';
 import * as queue from './views/queue.js';
@@ -208,6 +208,9 @@ function render() {
 	const live = app.querySelector?.('.main');
 	if (live) scrollTop = live.scrollTop;
 	app.textContent = '';
+	// The chart under the pointer is about to be replaced, and a removed node gets no mouseleave — the
+	// tooltip would otherwise stay up showing the previous data.
+	hideTip();
 
 	if (!state.session)
 		return void app.appendChild(el('main', { cls: 'main' }, [el('div', { cls: 'view' }, [skeleton()])]));
@@ -313,8 +316,12 @@ function rangePicker() {
 function renderTopbar(view) {
 	// The queue pill reads whatever the last overview payload said. Absent rather than assumed
 	// "running" when no view has loaded it — an unknown pause state must never render as green.
-	const cluster = (scratch('health').overview ?? scratch('queue').overview ?? scratch('corpus').overview)?.control
-		?.cluster;
+	// The FRESHEST overview any view holds: pausing on Queue must turn the pill red even though Health
+	// loaded an older payload first.
+	const cluster = ['health', 'queue', 'corpus']
+		.map((id) => scratch(id).overview)
+		.filter(Boolean)
+		.sort((a, b) => (b.generatedAt ?? 0) - (a.generatedAt ?? 0))[0]?.control?.cluster;
 	const updated = state.loadedAt ? Math.round((Date.now() - state.loadedAt) / 1000) : null;
 
 	return el('div', { cls: 'topbar' }, [
@@ -479,6 +486,7 @@ function renderSignIn() {
 }
 
 async function signOut() {
+	endSession();
 	await post('logout', {});
 	state.views = {};
 	state.loaded = new Set();
@@ -493,6 +501,20 @@ async function signOut() {
 /** Thrown into a superseded load so it stops before writing anything. Never surfaced. */
 const SUPERSEDED = Symbol('superseded');
 let loadSeq = 0;
+
+/**
+ * Bumped whenever the session ENDS — sign-out or expiry. A session answer fetched under an older epoch
+ * describes a session that no longer exists: written back late, it would put a signed-out operator on
+ * the signed-in shell. Ending a session also supersedes every load in flight, so their 401s stop
+ * writing into the fresh scratch.
+ */
+let authEpoch = 0;
+function endSession() {
+	authEpoch++;
+	loadSeq++;
+	state.session = { authenticated: false };
+	state.busy = false;
+}
 
 /**
  * A context pinned to the view and the load that created it. `data` is that view's scratch no
@@ -520,12 +542,17 @@ async function load() {
 	state.busy = true;
 	render();
 
-	// The session check and the view's own fetches run CONCURRENTLY once signed in: a session that
-	// lapsed shows up as a 401 on the view's fetches too (the expired handler catches it), so there
-	// is no reason to pay a serial round trip before every view switch and range change.
+	// Once signed in, the session check runs CONCURRENTLY with the view's fetches and the view does not
+	// wait for it: a lapsed session shows up as a 401 on those fetches anyway (the expired handler
+	// catches it), and the cluster session check walks nodes one at a time — with the first node down,
+	// awaiting it held every view switch and Refresh for a whole request timeout.
+	const epoch = authEpoch;
 	const firstLoad = !state.session?.authenticated;
 	const sessionPromise = get('session').then((res) => {
+		if (epoch !== authEpoch) return res.body;
 		if (seq === loadSeq || firstLoad) state.session = res.body;
+		// Signed out between loads, discovered after the view drew: go to the sign-in form now.
+		if (!firstLoad && seq === loadSeq && (!res.body?.authenticated || !res.body?.superUser)) render();
 		return res.body;
 	});
 	if (firstLoad) {
@@ -539,7 +566,7 @@ async function load() {
 
 	const view = BY_ID.get(viewId) ?? health;
 	try {
-		await Promise.all([view.load(loadContext(viewId, seq)), sessionPromise]);
+		await view.load(loadContext(viewId, seq));
 	} catch (e) {
 		if (e === SUPERSEDED) return;
 		// A view's own fetch layer never throws (see api.js), so this is a bug in the view, not a
@@ -555,11 +582,12 @@ async function load() {
 }
 
 setExpiredHandler(() => {
-	state.session = { authenticated: false };
+	endSession();
 	state.views = {};
 	state.loaded = new Set();
 	// Same reasoning as signOut: an expired session is a session that ended.
 	discardEdit();
+	render();
 });
 
 globalThis.addEventListener?.('hashchange', () => {

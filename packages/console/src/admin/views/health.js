@@ -61,7 +61,10 @@ export async function load(ctx) {
 	const [overviewRes, analyticsRes, , invalidationsRes] = await Promise.all([
 		ctx.get('overview'),
 		ctx.get('analytics', { range: ctx.rangeMs }),
-		loadConfig(ctx),
+		// FORCED: config agreement is one of this page's checks, and the shared scratch would otherwise
+		// answer every Refresh from whatever was fetched at first load — a deploy that skipped a node
+		// after the console opened would read "identical" forever. It is a small replicated read.
+		loadConfig(ctx, { force: true }),
 		ctx.get('invalidations'),
 	]);
 	ctx.data.overview = overviewRes.ok ? overviewRes.body : null;
@@ -70,6 +73,9 @@ export async function load(ctx) {
 	ctx.data.error = overviewRes.ok
 		? null
 		: (overviewRes.body?.error ?? `Could not load cluster state (${overviewRes.status})`);
+	ctx.data.analyticsError = analyticsRes.ok
+		? null
+		: (analyticsRes.body?.error ?? `Could not load analytics (${analyticsRes.status})`);
 }
 
 export function render(ctx) {
@@ -85,11 +91,36 @@ export function render(ctx) {
 		{ title: 'System', checks: systemChecks(nodes), empty: systemGap(nodes) },
 		{ title: 'Maintenance', checks: maintenanceChecks(overview, ctx.data.invalidations) },
 	];
-	const all = groups.flatMap((group) => group.checks);
+	// A source that did not load is itself a check, and a BAD one: every verdict it would have fed is
+	// missing, and a page of the checks that remain would otherwise read as a healthy cluster.
+	const inputs = [
+		!overview &&
+			check('input-overview', 'Cluster state', 'not loaded', 'bad', {
+				sub: 'queue, backlog, nodes, repair',
+				detail: ctx.data.error ?? 'Could not load cluster state.',
+			}),
+		!analytics &&
+			check(
+				'input-analytics',
+				'Analytics',
+				'not loaded',
+				ctx.data.analytics?.available === false || ctx.data.analyticsError ? 'bad' : 'warn',
+				{
+					sub: 'serving and rendering checks',
+					detail: analyticsProblem(ctx.data.analytics, ctx.data.analyticsError),
+					go: 'traffic',
+				}
+			),
+	].filter(Boolean);
+	const all = [...inputs, ...groups.flatMap((group) => group.checks)];
 
 	return [
 		!overview && el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load cluster state.' }),
-		ctx.data.analytics && !analytics && el('div', { cls: 'note warn', text: analyticsProblem(ctx.data.analytics) }),
+		!analytics &&
+			el('div', {
+				cls: `note ${ctx.data.analytics || ctx.data.analyticsError ? 'bad' : 'warn'}`,
+				text: analyticsProblem(ctx.data.analytics, ctx.data.analyticsError),
+			}),
 		banner(ctx, all),
 		...groups.map((group) => groupCard(ctx, group)),
 		nodeTable(ctx, nodes),
@@ -98,10 +129,12 @@ export function render(ctx) {
 
 const usable = (data) => data && data.available !== false && !windowEmpty(data);
 
-const analyticsProblem = (data) =>
-	data.available === false
-		? `Analytics unavailable: ${data.error ?? 'unknown reason'}`
-		: 'No analytics rows in this range.';
+const analyticsProblem = (data, error) =>
+	error
+		? `${error} — serving and rendering checks are missing.`
+		: data?.available === false
+			? `Analytics unavailable: ${data.error ?? 'unknown reason'}`
+			: 'No analytics rows in this range — serving and rendering checks are missing.';
 
 // ---- verdicts ---------------------------------------------------------------------
 
@@ -119,6 +152,9 @@ const below = (value, warn, bad) =>
  * sentence, shown in the tooltip and in the banner.
  */
 const check = (id, label, value, verdict, extra = {}) => ({ id, label, value, verdict, ...extra });
+
+/** The more severe of two verdicts. */
+const worse = (a, b) => ((VERDICT_RANK[a] ?? -1) >= (VERDICT_RANK[b] ?? -1) ? a : b);
 
 // ---- serving -------------------------------------------------------------------------
 
@@ -240,7 +276,9 @@ function renderingChecks(data, overview) {
 		const outcomes = pick(data, 'render', (s) => s.path === OUTCOME);
 		const total = sumCount(outcomes);
 		const failed = sumCount(outcomes.filter((s) => s.method === 'failed' || s.method === 'auth-failure'));
-		const hours = data.rangeMs / 3_600_000;
+		// The window the scan actually COVERED: a truncated scan holds fewer hours than were asked for,
+		// and dividing by the requested range would understate the rate (and overstate drain time).
+		const hours = (coveredMinutes(data) ?? data.rangeMs / 60_000) / 60;
 		const times = pick(data, 'render', (s) => s.path === 'time_ms');
 		const claims = pick(data, 'queue_health', (s) => s.path === CLAIM_SCAN);
 		const claimP95 = weighted(claims, 'p95');
@@ -290,7 +328,8 @@ function renderingChecks(data, overview) {
 	if (overview) {
 		const overdue = backlog && !backlog.error ? backlog.overdue : null;
 		const outcomes = data ? pick(data, 'render', (s) => s.path === OUTCOME) : [];
-		const rate = data ? sumCount(outcomes) / (data.rangeMs / 3_600_000) : null;
+		// No analytics means no rate — `drain` reads that as unknown, never as "nothing rendered".
+		const rate = data ? sumCount(outcomes) / ((coveredMinutes(data) ?? data.rangeMs / 60_000) / 60) : null;
 		// Judged by how long it takes to CLEAR, not by its size — see `drain` on the Queue view.
 		const clear = drain(overdue, inFlight, rate);
 		out.push(
@@ -298,7 +337,8 @@ function renderingChecks(data, overview) {
 				'due',
 				'Backlog',
 				Number.isFinite(overdue) ? num(overdue) + (backlog.truncated ? '+' : '') : '—',
-				backlog?.error ? 'bad' : backlog?.truncated ? 'warn' : clear.verdict,
+				// Truncation makes the count a floor, so it is at least a watch — but never softens a bad drain.
+				backlog?.error ? 'bad' : backlog?.truncated ? worse('warn', clear.verdict) : clear.verdict,
 				{
 					sub: Number.isFinite(clear.ms)
 						? `~${duration(clear.ms)} to clear · ${num(inFlight ?? 0)} in flight`
@@ -337,7 +377,14 @@ function clusterChecks(overview, config, nodes, analytics) {
 	const out = [];
 	if (overview) {
 		const list = overview.nodes ?? [];
-		const down = list.filter((node) => node.responding === false);
+		// Liveness from the fan-out's own record of who answered. The QueueStatus rows join to it by
+		// hostname, and that join misses a node whose configured origin is an IP or an alias — which
+		// would read as "4/4" while the merge knows it heard from three.
+		const sources = overview.sources;
+		const fanned = isMerged(overview) && Array.isArray(sources?.nodes);
+		const down = fanned
+			? sources.nodes.filter((node) => !node.ok).map((node) => ({ hostname: node.hostname }))
+			: list.filter((node) => node.responding === false);
 		const paused = list.filter((node) => node.status === 'paused');
 		const behind = list.filter((node) => node.behind?.length);
 		const cluster = overview.control?.cluster;
@@ -345,14 +392,11 @@ function clusterChecks(overview, config, nodes, analytics) {
 			check(
 				'responding',
 				'Nodes responding',
-				`${list.length - down.length}/${list.length}`,
-				down.length ? 'bad' : list.length ? 'ok' : 'na',
+				fanned ? `${sources.answered}/${sources.configured}` : '—',
+				// Under node scope there was no fan-out, so there is nothing to claim either way.
+				!fanned ? 'na' : down.length ? 'bad' : 'ok',
 				{
-					sub: down.length
-						? `down: ${down.map((n) => n.hostname).join(', ')}`
-						: isMerged(overview)
-							? 'all answered'
-							: 'node scope',
+					sub: down.length ? `down: ${down.map((n) => n.hostname).join(', ')}` : fanned ? 'all answered' : 'node scope',
 					go: 'queue',
 					detail: down.length ? `${down.map((n) => n.hostname).join(', ')} did not answer.` : null,
 				}
@@ -387,6 +431,21 @@ function clusterChecks(overview, config, nodes, analytics) {
 				}
 			)
 		);
+		// The replicated tables should count the same rows on every node; a persistent spread is a
+		// replication gap in Target/page data, which the queue-row check above cannot see.
+		const counts = overview.counts;
+		const split = ['targets', 'pages'].filter((key) => counts?.[key]?.divergent);
+		if (counts) {
+			out.push(
+				check('table-counts', 'Table counts', split.length ? 'nodes disagree' : 'agree', split.length ? 'bad' : 'ok', {
+					sub: split.length
+						? split.map((key) => `${key} ${num(counts[key].spread?.low)}–${num(counts[key].spread?.high)}`).join(' · ')
+						: 'targets and pages match',
+					go: 'corpus',
+					detail: split.length ? 'A replicated table counts differently across nodes — a replication gap.' : null,
+				})
+			);
+		}
 	}
 
 	if (config) {
@@ -397,7 +456,11 @@ function clusterChecks(overview, config, nodes, analytics) {
 			: config.overrides
 				? [config.overrides]
 				: [];
-		const deaf = watchNodes.filter((n) => n.enabled === false || n.watch?.lastError || n.watch?.subscribed === false);
+		// A failed or degraded override READ is as deaf as a dead subscription: the node runs its file
+		// config while this console lists rows it is not applying.
+		const deaf = watchNodes.filter(
+			(n) => n.enabled === false || n.error || n.degraded || n.watch?.lastError || n.watch?.subscribed === false
+		);
 		out.push(
 			check(
 				'config',
@@ -436,8 +499,11 @@ function clusterChecks(overview, config, nodes, analytics) {
 
 	// Version skew is the other deploy failure this page can see: a node still on the old plugin
 	// serves traffic and answers every read.
-	const versions = [...new Set(nodes.map((n) => n.host?.pluginVersion).filter(Boolean))];
-	if (versions.length) {
+	// A node that answered with no version runs a plugin before v0.92.0 — which is itself a version, and
+	// exactly the half-rolled deploy this check exists for. All-unknown is simply an older cluster.
+	const reported = nodes.filter((n) => n.reported);
+	const versions = [...new Set(reported.map((n) => n.host?.pluginVersion ?? '< 0.92.0'))];
+	if (reported.some((n) => n.host?.pluginVersion)) {
 		out.push(
 			check(
 				'versions',
@@ -496,10 +562,11 @@ function nodeVitals(overview, analytics) {
 		const e = entry(node.hostname);
 		if (e) Object.assign(e, { status: node.status, responding: node.responding, since: node.statusChangedTime });
 	}
-	const hosts = overview?.hosts ?? (overview?.host ? [{ node: overview.node, host: overview.host }] : []);
+	const hosts = overview?.hosts ?? (overview ? [{ node: overview.node, host: overview.host ?? null }] : []);
 	for (const h of hosts) {
 		const e = entry(h.host?.hostname ?? h.node ?? h.hostname);
-		if (e) e.host = h.host;
+		// `reported` = this node answered the overview at all; `host` is null on a plugin before v0.92.0.
+		if (e) Object.assign(e, { host: h.host ?? null, reported: true });
 	}
 
 	const systemOf = (system, name) => {
@@ -517,11 +584,15 @@ function nodeVitals(overview, analytics) {
 				.reduce((acc, s) => acc + s.count, 0);
 			e.rangeMs = node.rangeMs ?? analytics.rangeMs;
 			e.bucketMs = analytics.bucketMs;
+			e.endMs = analytics.endMs;
 		}
 	} else if (analytics?.system) {
-		for (const n of analytics.system.nodes ?? []) {
-			const e = entry(n.hostname ?? analytics.node);
-			if (e) Object.assign(e, { system: n, bucketMs: analytics.bucketMs });
+		const list = analytics.system.nodes ?? [];
+		for (const n of list) {
+			// An unnamed node is this one only when it is the ONLY one — with several (replicated analytics)
+			// pinning them all on the serving node would be the guess the plugin itself refused to make.
+			const e = entry(n.hostname ?? (list.length === 1 ? analytics.node : null));
+			if (e) Object.assign(e, { system: n, bucketMs: analytics.bucketMs, endMs: analytics.endMs });
 		}
 	}
 	return [...byKey.values()].sort((a, b) => a.hostname.localeCompare(b.hostname));
@@ -533,23 +604,43 @@ const hasSystem = (nodes) => nodes.some((n) => n.host || n.system);
 const systemGap = (nodes) =>
 	hasSystem(nodes) ? null : 'System vitals need plugin v0.92.0 or later on the prerender nodes.';
 
+/**
+ * A node's resource series, or null when its newest row is too old to call current. Harper writes these
+ * once per aggregation pass (~60 s); a node whose main thread is pegged stops writing them, and its last
+ * healthy sample — possibly hours old on a 24h range — must not read as its state now.
+ */
+const STALE_MS = 5 * 60_000;
+const vitals = (n) => {
+	const at = n.system?.latest?.at;
+	if (!n.system || !Number.isFinite(at)) return null;
+	return Number.isFinite(n.endMs) && n.endMs - at > STALE_MS ? null : n.system;
+};
+const staleVitals = (n) => !!n.system && !vitals(n);
+
 const cpuFraction = (n) => {
-	const cpu = n.system?.latest?.cpu;
+	const cpu = vitals(n)?.latest?.cpu;
 	const cores = n.host?.cpus;
 	return Number.isFinite(cpu) && Number.isFinite(cores) && cores > 0 ? cpu / cores : null;
 };
-const memAvailable = (n) =>
-	Number.isFinite(n.host?.availableMemory) && n.host?.totalMemory > 0
-		? n.host.availableMemory / n.host.totalMemory
-		: null;
+/**
+ * Memory available as a share: the CONTAINER's when the process runs under a cgroup limit below host
+ * RAM (plugin reports `memoryLimit`), else the host's MemAvailable. A container near its own ceiling
+ * is what gets OOM-killed, and the host figure would read it as roomy.
+ */
+const memAvailable = (n) => {
+	const h = n.host;
+	if (h?.memoryLimit > 0 && Number.isFinite(h.memoryLimitAvailable)) return h.memoryLimitAvailable / h.memoryLimit;
+	return Number.isFinite(h?.availableMemory) && h?.totalMemory > 0 ? h.availableMemory / h.totalMemory : null;
+};
+const memScope = (n) => (n.host?.memoryLimit > 0 ? 'container limit' : 'host');
 const diskFree = (n) =>
-	Number.isFinite(n.system?.latest?.diskAvailable) && n.system?.latest?.diskSize > 0
-		? n.system.latest.diskAvailable / n.system.latest.diskSize
+	Number.isFinite(vitals(n)?.latest?.diskAvailable) && vitals(n).latest.diskSize > 0
+		? vitals(n).latest.diskAvailable / vitals(n).latest.diskSize
 		: null;
-const loopOf = (n) => n.system?.latest?.workerElu ?? n.system?.latest?.elu ?? null;
+const loopOf = (n) => vitals(n)?.latest?.workerElu ?? vitals(n)?.latest?.elu ?? null;
 const lastOf = (series) => [...(series ?? [])].reverse().find((v) => Number.isFinite(v)) ?? null;
 const faultsPerMin = (n, bucketMs) => {
-	const last = lastOf(n.system?.majorFaults);
+	const last = lastOf(vitals(n)?.majorFaults);
 	return Number.isFinite(last) && bucketMs ? last / (bucketMs / 60_000) : null;
 };
 
@@ -572,12 +663,40 @@ function systemChecks(nodes) {
 	// The WORKERS' loop is the serve path's, so it is the one that says a node is saturated; the main
 	// thread's is the fallback for a payload without worker rows.
 	const elu = worst(nodes, loopOf);
-	const lag = worst(nodes, (n) => n.system?.latest?.taskQueueLatency);
+	const lag = worst(nodes, (n) => vitals(n)?.latest?.taskQueueLatency);
 	const swap = worst(nodes, (n) => faultsPerMin(n, n.bucketMs));
 	const uptime = worst(nodes, (n) => n.host?.uptimeSec, { higherIsWorse: false });
 	const of = (w) => (w && nodes.length > 1 ? `worst: ${w.n.hostname}` : w ? w.n.hostname : 'no data');
 
+	// A node that answered but contributed no current vitals is not "fine" — it is missing from every
+	// worst-node tile below, and it is often the most loaded node (the one whose fan-out timed out, or
+	// whose Harper stopped writing resource rows).
+	const answered = nodes.filter((n) => n.reported || n.system);
+	const stale = answered.filter(staleVitals);
+	const missing = answered.filter((n) => !n.system);
+	const coverage =
+		stale.length || (missing.length && answered.some((n) => vitals(n)))
+			? check(
+					'vitals',
+					'Vitals coverage',
+					`${answered.length - stale.length - missing.length}/${answered.length}`,
+					'warn',
+					{
+						sub: [
+							stale.length && `stale: ${stale.map((n) => n.hostname).join(', ')}`,
+							missing.length && `none: ${missing.map((n) => n.hostname).join(', ')}`,
+						]
+							.filter(Boolean)
+							.join(' · '),
+						detail:
+							'These nodes are left out of the tiles below: their resource rows are older than 5 minutes, or missing ' +
+							'(the analytics read failed there, or the node runs a plugin before v0.92.0).',
+					}
+				)
+			: null;
+
 	return [
+		coverage,
 		check('cpu', 'CPU', cpu ? pct(cpu.v, 1) : '—', cpu ? above(cpu.v, 0.85, 0.95) : 'na', {
 			sub: of(cpu),
 			spark:
@@ -589,7 +708,9 @@ function systemChecks(nodes) {
 		}),
 		check('memory', 'Memory available', mem ? pct(mem.v, 1) : '—', mem ? below(mem.v, 0.15, 0.07) : 'na', {
 			sub: mem ? `${of(mem)}${mem.n.host?.swapUsed > 0 ? ` · swap ${bytes(mem.n.host.swapUsed)}` : ''}` : 'no data',
-			detail: 'MemAvailable ÷ total on the node. Compare troughs, not a single sample.',
+			detail: mem
+				? `Free ÷ total (${memScope(mem.n)}). Compare troughs, not a single sample.`
+				: 'MemAvailable ÷ total. Compare troughs, not a single sample.',
 		}),
 		check('swap', 'Swap-in', swap ? `${fmtCount(swap.v)}/min` : '—', swap ? above(swap.v, 50, 500) : 'na', {
 			sub: `major faults · ${of(swap)}`,
@@ -597,10 +718,13 @@ function systemChecks(nodes) {
 			detail: 'Major page faults per minute — pages read back from swap. Sustained, it is memory pressure.',
 		}),
 		check('loop', 'Event loop', elu ? pct(elu.v, 1) : '—', elu ? above(elu.v, 0.8, 0.95) : 'na', {
-			sub: `${elu && Number.isFinite(elu.n.system?.latest?.workerElu) ? 'workers' : 'main thread'} busy · ${of(elu)}`,
+			// Harper merges every worker into ONE row, so this is a mean: one pegged thread in eight reads
+			// ~40%. It catches a node that is saturated overall, not a single hot worker — and says so.
+			sub: `${elu && Number.isFinite(elu.n.system?.latest?.workerElu) ? 'workers, mean' : 'main thread'} · ${of(elu)}`,
 			spark: elu && Number.isFinite(elu.n.system?.latest?.workerElu) ? elu.n.system.workerElu : elu?.n.system?.elu,
 			sparkMax: 1,
-			detail: 'Share of wall time the event loop was busy. Near 100% the node serves every request late.',
+			detail:
+				'Share of wall time the event loop was busy — the MEAN across workers, so a single pegged worker can hide in it.',
 		}),
 		check('task-latency', 'Task latency', lag ? fmtMs(lag.v) : '—', lag ? above(lag.v, 50, 250) : 'na', {
 			sub: of(lag),
@@ -682,6 +806,15 @@ function banner(ctx, checks) {
 		.filter((c) => c.verdict === 'bad' || c.verdict === 'warn')
 		.sort((a, b) => VERDICT_RANK[b.verdict] - VERDICT_RANK[a.verdict]);
 	const judged = checks.filter((c) => c.verdict === 'ok' || c.verdict === 'warn' || c.verdict === 'bad').length;
+	// "All clear" is a claim about checks that ran. With none judged it would be a claim about nothing.
+	if (!flagged.length && judged === 0) {
+		return el('div', { cls: 'health-banner warn' }, [
+			el('div', { cls: 'health-banner-head' }, [
+				el('span', { cls: 'dot' }),
+				el('strong', { text: 'No checks could be evaluated' }),
+			]),
+		]);
+	}
 	if (!flagged.length) {
 		return el('div', { cls: 'health-banner ok' }, [
 			el('span', { cls: 'dot' }),
@@ -801,11 +934,14 @@ function nodeTable(ctx, nodes) {
 				]),
 			system &&
 				cell(mem === null ? '—' : pct(mem, 1), below(mem, 0.15, 0.07), {
-					title: n.host?.totalMemory
-						? `${bytes(n.host.availableMemory)} of ${bytes(n.host.totalMemory)} available`
-						: null,
+					title:
+						n.host?.memoryLimit > 0
+							? `${bytes(n.host.memoryLimitAvailable)} of a ${bytes(n.host.memoryLimit)} container limit available`
+							: n.host?.totalMemory
+								? `${bytes(n.host.availableMemory)} of ${bytes(n.host.totalMemory)} available (host)`
+								: null,
 				}),
-			system && cell(Number.isFinite(n.system?.latest?.rss) ? bytes(n.system.latest.rss) : '—'),
+			system && cell(Number.isFinite(vitals(n)?.latest?.rss) ? bytes(vitals(n).latest.rss) : '—'),
 			system && cell(Number.isFinite(elu) ? pct(elu, 1) : '—', above(elu, 0.8, 0.95)),
 			system && cell(disk === null ? '—' : pct(disk, 1), below(disk, 0.15, 0.08)),
 			cell(n.serves === null ? '—' : pct(n.serves, totalServes)),

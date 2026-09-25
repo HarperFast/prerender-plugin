@@ -191,6 +191,8 @@ test('the backlog is judged by drain time, not by size', () => {
 	// Rows waiting and nothing rendering is bad whatever the size.
 	assert.equal(drain(100, 0, 0).verdict, 'bad');
 	assert.equal(drain(null, 0, 100).verdict, 'na');
+	// No analytics means no rate, which is unknown — not "nothing rendered".
+	assert.equal(drain(100, 0, null).verdict, 'na');
 });
 
 test('a backlog tile names the time to clear, and goes bad when nothing renders', async () => {
@@ -224,6 +226,7 @@ test('system tiles name the worst node, and the node table joins host and series
 				taskQueueLatency: series(5),
 				majorFaults: series(0),
 				latest: {
+					at: HOUR - 20_000,
 					cpu,
 					rss: 8 * 2 ** 30,
 					elu,
@@ -284,12 +287,132 @@ test('nodes on different plugin versions are a bad check — a deploy skipped a 
 });
 
 test('a node that did not answer turns the responding check bad and names it', async () => {
+	// Liveness comes from the fan-out's own record — not from joining QueueStatus rows by hostname,
+	// which misses a node whose configured origin is an IP or alias.
 	const overview = {
 		...OVERVIEW,
-		nodes: [...OVERVIEW.nodes, { hostname: 'node-c', status: 'queued', responding: false }],
+		sources: {
+			mode: 'merged',
+			answered: 2,
+			configured: 3,
+			complete: false,
+			nodes: [
+				{ hostname: 'node-a:9926', ok: true },
+				{ hostname: 'node-b:9926', ok: true },
+				{ hostname: '192.0.2.7:9926', ok: false },
+			],
+		},
 	};
 	const tile = vital(draw(await ready({ overview })), 'Nodes responding');
 	assert.equal(verdictOf(tile), 'bad');
 	assert.match(tile.textContent, /2\/3/);
-	assert.match(tile.textContent, /node-c/);
+	assert.match(tile.textContent, /192\.0\.2\.7/);
+});
+
+// ---- the review's findings: a false "All clear" is worse than a false alarm ----------------------
+
+test('a failed analytics read is a bad check, never a quiet gap under an "All clear"', async () => {
+	const ctx = makeCtx();
+	const base = ctx.get;
+	ctx.get = async (route, params) =>
+		route === 'analytics' ? { ok: false, status: 502, body: { error: 'Bad gateway' } } : base(route, params);
+	await load(ctx);
+	const root = draw(ctx);
+	const banner = find(root, (n) => (n.attributes?.class ?? '').startsWith('health-banner'));
+	assert.equal(banner.attributes.class, 'health-banner bad');
+	assert.match(banner.textContent, /Analytics/);
+	assert.match(root.textContent, /Bad gateway — serving and rendering checks are missing/);
+	// And with no render rate the backlog is UNKNOWN — not "nothing rendered".
+	const backlog = vital(root, 'Backlog');
+	assert.equal(verdictOf(backlog), 'na');
+	assert.doesNotMatch(backlog.attributes.title ?? '', /nothing rendered/);
+});
+
+test('with nothing judged the banner says so, rather than "All clear"', async () => {
+	const ctx = makeCtx();
+	ctx.get = async () => ({ ok: false, status: 0, body: { error: 'Request failed' } });
+	await load(ctx);
+	const banner = find(draw(ctx), (n) => (n.attributes?.class ?? '').startsWith('health-banner'));
+	assert.doesNotMatch(banner.textContent, /All clear/);
+});
+
+test('config agreement is re-read on every load, not answered from the first one', async () => {
+	let reads = 0;
+	const ctx = makeCtx({ config: { configFrom: 'node-a', divergences: [], sources: { answered: 2 } } });
+	const base = ctx.get;
+	ctx.get = async (route, params) => {
+		if (route === 'config') reads++;
+		return base(route, params);
+	};
+	await load(ctx);
+	await load(ctx);
+	assert.equal(reads, 2, 'a deploy that skips a node after the console opened must show up on Refresh');
+});
+
+test('a node on a plugin without a version counts as skew — the half-rolled deploy', async () => {
+	const overview = {
+		...OVERVIEW,
+		hosts: [
+			{ node: 'node-a', host: { hostname: 'node-a', pluginVersion: '0.92.0' } },
+			{ node: 'node-b', host: null },
+		],
+	};
+	const tile = vital(draw(await ready({ overview })), 'Plugin version');
+	assert.equal(verdictOf(tile), 'bad');
+	assert.match(tile.textContent, /< 0\.92\.0/);
+});
+
+test('stale vitals are left out of the tiles and named, never shown as current', async () => {
+	const series = (value) => new Array(BUCKETS).fill(value);
+	const node = (hostname, cpu, at) => ({
+		nodeId: 1,
+		hostname,
+		cpu: series(cpu),
+		elu: series(0.3),
+		majorFaults: series(0),
+		taskQueueLatency: series(5),
+		latest: { at, cpu, elu: 0.3, taskQueueLatency: 5, diskAvailable: 1, diskSize: 2 },
+	});
+	const analytics = {
+		...ANALYTICS,
+		byNode: [
+			// node-a wrote a resource row 20s before the window ended; node-b's newest is 40 minutes old.
+			{ node: 'node-a', totals: [], buckets: [], system: { nodes: [node('node-a', 4, HOUR - 20_000)] } },
+			{ node: 'node-b', totals: [], buckets: [], system: { nodes: [node('node-b', 15.9, HOUR - 40 * 60_000)] } },
+		],
+	};
+	const overview = {
+		...OVERVIEW,
+		hosts: ['node-a', 'node-b'].map((hostname) => ({
+			node: hostname,
+			host: { hostname, cpus: 16, totalMemory: 1, availableMemory: 0.5, pluginVersion: '0.92.0' },
+		})),
+	};
+	const root = draw(await ready({ overview, analytics }));
+	const cpu = vital(root, 'CPU');
+	assert.match(cpu.textContent, /25%/, 'the stale node’s 99% is not the current worst');
+	const coverage = vital(root, 'Vitals coverage');
+	assert.equal(verdictOf(coverage), 'warn');
+	assert.match(coverage.textContent, /stale: node-b/);
+});
+
+test('a truncated backlog never softens a bad drain', async () => {
+	const overview = {
+		...OVERVIEW,
+		backlog: { ...OVERVIEW.backlog, lastRun: { ...OVERVIEW.backlog.lastRun, overdue: 50_000, truncated: true } },
+	};
+	assert.equal(verdictOf(vital(draw(await ready({ overview })), 'Backlog')), 'bad');
+});
+
+test('table counts that disagree across nodes are a bad check — the replication gap', async () => {
+	const overview = {
+		...OVERVIEW,
+		counts: {
+			targets: { recordCount: 1000, divergent: true, spread: { low: 900, high: 1000 } },
+			pages: { recordCount: 5 },
+		},
+	};
+	const tile = vital(draw(await ready({ overview })), 'Table counts');
+	assert.equal(verdictOf(tile), 'bad');
+	assert.match(tile.textContent, /targets 900–1,000/);
 });

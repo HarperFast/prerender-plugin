@@ -205,7 +205,7 @@ function showTip(event, header, rows, footer) {
 	node.style.top = `${Math.max(8, top)}px`;
 }
 
-const hideTip = () => {
+export const hideTip = () => {
 	if (tip) tip.style.display = 'none';
 };
 
