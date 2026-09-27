@@ -1,0 +1,14 @@
+# The benchmark's copy of RenderSchedule: same fields, same single index, and — like production — alone
+# in its own database. node.js pins it by residency the way production pins RenderSchedule.
+type Sched @table(database: "bench_sched") @export {
+	cacheKey: String @primaryKey
+	nextRenderTime: Long @indexed
+	fromSitemap: Boolean
+	effectiveInterval: Long
+}
+
+# The driver's mailbox (rows `cmd` and `res`) and the named buffer the two worker threads share. Its own
+# non-replicated database, so neither the mailbox nor coordination touches the database being measured.
+type Ctl @table(database: "bench_ctl", replicate: false) @export {
+	id: ID @primaryKey
+}

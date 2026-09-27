@@ -24,7 +24,7 @@ ps -Ao pcpu,comm | sort -k1 -nr | sed -n '1,4s/^/run.sh:   /p' | tee -a "$LOG"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 STAGE="$(mktemp -d)"
 chmod 777 "$STAGE"
-cp "$HERE"/config.yaml "$HERE"/schema.graphql "$HERE"/bench.js "$STAGE/"
+cp "$HERE"/config.yaml "$HERE"/schema.graphql "$HERE"/bench.js "$HERE"/shared.js "$STAGE/"
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "run.sh: harperfast/harper:$HDB_VERSION rows=${ROWS:-250000} writes=${WRITES:-20000} rounds=${ROUNDS:-3}" | tee -a "$LOG"
