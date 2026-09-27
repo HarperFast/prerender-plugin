@@ -163,12 +163,16 @@ class Keeper {
 				if (set.size === 0) this.buckets[oc].delete(om);
 			}
 		}
-		if (value === null || value === undefined || value.nextRenderTime === null || value.nextRenderTime === undefined) {
+		// Not queued: a delete, or a row with no usable due time. `Number()` first: a Long can surface as a
+		// BigInt, and a non-finite time must not become a NaN bucket.
+		const due = value?.nextRenderTime;
+		const dueMs = due === null || due === undefined ? NaN : Number(due);
+		if (!Number.isFinite(dueMs)) {
 			this.due.delete(key);
 			return;
 		}
 		const c = classOf(Number(value.effectiveInterval), !!value.fromSitemap);
-		const m = Math.floor(Number(value.nextRenderTime) / MINUTE);
+		const m = Math.floor(dueMs / MINUTE);
 		this.due.set(key, m * 16 + c);
 		let set = this.buckets[c].get(m);
 		if (!set) this.buckets[c].set(m, (set = new Set()));
@@ -266,6 +270,7 @@ async function writer() {
 		seen = seq;
 		const cmd = Atomics.load(I, I_CMD);
 		if (cmd === CMD_STOP) return;
+		Atomics.store(I, I_ERR, 0);
 		const next = prng(0xc0ffee + ++arm * 7919);
 		const lat = new Float64Array(WRITES);
 		const elu0 = performance.eventLoopUtilization();
@@ -273,7 +278,9 @@ async function writer() {
 		const gap = RATE > 0 ? 1000 / RATE : 0;
 		let written = 0;
 		try {
-			if (cmd === CMD_BATCH && BATCH > 0 && typeof transaction === 'function') {
+			if (cmd === CMD_BATCH) {
+				// Never fall back to single writes under the batch label: that would report the wrong arm.
+				if (typeof transaction !== 'function') throw new Error('batch arm requested, but transaction() is unavailable');
 				for (let b = 0; written < WRITES; b++) {
 					const n = Math.min(BATCH, WRITES - written);
 					const t0 = performance.now();
@@ -511,6 +518,7 @@ async function runArm(ctx, arm, cmd) {
 	const cpu = process.cpuUsage(cpu0);
 	const wallMs = performance.now() - started;
 	const writes = Atomics.load(I, I_WRITES);
+	const writerFailed = Atomics.load(I, I_ERR) === 1;
 	if (sub) {
 		try {
 			(sub.end ?? sub.return)?.call(sub);
@@ -522,6 +530,7 @@ async function runArm(ctx, arm, cmd) {
 		arm,
 		mode: cmd === CMD_BATCH ? `batch${BATCH}` : RATE ? `paced${RATE}/s` : 'single',
 		writes,
+		writerFailed,
 		writer: {
 			writesPerSec: round((writes * 1000) / F[F_ELAPSED], 0),
 			putUs: {
