@@ -1,0 +1,9 @@
+# Two-node queue-keeper benchmark component (see node.js). NOT SHIPPED: a dev harness, loaded into two
+# throwaway harper-pro containers by run.sh. `jsResource`, not `pluginModule`: see bench/queue-index/config.yaml.
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'node.js'
