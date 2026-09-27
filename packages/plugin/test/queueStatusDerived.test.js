@@ -143,12 +143,16 @@ test('the derivation is tri-state: due rows held ⇒ queued, none ⇒ empty', as
 	assert.equal(searchCalls, 0);
 });
 
-test('a keeper that is not serving reports unready, never empty — its count is unknown', () => {
+test('a keeper that is not serving, or is still loading with nothing found yet, reports unready', () => {
 	funnel.clearKeeperSignal();
 	assert.equal(funnel.deriveQueueStatus(), 'unready');
+	funnel.setKeeperSignal({ due: 0, complete: false });
+	assert.equal(funnel.deriveQueueStatus(), 'unready', 'loading: not known to be empty');
+	funnel.setKeeperSignal({ due: 2, complete: false });
+	assert.equal(funnel.deriveQueueStatus(), 'queued', 'loading, and work already found');
 	keeperHolds(0);
-	assert.equal(funnel.deriveQueueStatus(Date.now() + 5 * MINUTE), 'unready', 'a keeper not heard from in minutes');
 	assert.equal(funnel.deriveQueueStatus(), 'empty');
+	assert.equal(funnel.deriveQueueStatus(Date.now() + 5 * MINUTE), 'empty', 'a quiet keeper is still served from');
 });
 
 test('becoming ready is a CHANGE, written once, so the fleet is told at once', async () => {

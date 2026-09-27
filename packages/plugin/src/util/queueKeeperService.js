@@ -1,19 +1,20 @@
 /**
- * THE QUEUE KEEPER'S LIFECYCLE on worker 0: subscribe, load, go live, publish, verify, report.
+ * THE QUEUE KEEPER'S LIFECYCLE on worker 0: subscribe, load, serve, verify, resync, report.
  *
  * `util/queueKeeper.js` is the data structure. This module makes it this node's render queue: the
  * in-memory front, with `RenderSchedule` as its durable side. It is the INDEX here — the thing claims
  * are served from — so it carries the guarantees an index has to carry, against the table it indexes:
  *
- *   - BUILT FROM THE TABLE. Subscribe first, then walk the table by primary key (chunked, local), and
- *     apply the events that arrived during the walk only after it ends. Applied during the walk, a
- *     chunk read before a write would overwrite the newer value. Only the LAST event per row is kept:
- *     each carries the row's value at delivery, so it is at least as new as anything read, and the
- *     buffer is bounded by the number of rows — a whole-table re-send during the load fits.
- *   - A ROW THE WALK CANNOT READ DOES NOT STOP THE QUEUE. `walkUrlRange` throws when it cannot get past
- *     an unreadable key; the keeper then goes live on what it loaded, marked not exact, and says so
- *     loudly. Rows past that point are held as soon as anything writes them. Failing closed instead
- *     would stop this node granting any claim, forever, since there is no other path to the queue.
+ *   - BUILT FROM THE TABLE, AND SERVING WHILE IT IS BUILT. Subscribe first, then walk the table by
+ *     primary key (chunked, local), publishing the ready set from what is held so far from the first
+ *     chunk on. Events apply as they arrive; a walked row is applied only if no event has touched its
+ *     key since the walk began, since each event carries the row's value at delivery and is at least
+ *     as new as anything the walk read. Serving a partial queue is safe because every grant is checked
+ *     against its durable row; only the ORDER is incomplete until the walk ends.
+ *   - A ROW THE WALK CANNOT READ DOES NOT STOP THE QUEUE. When `walkUrlRange` cannot get past a key that
+ *     did not decode, the rest of the table is walked from the top down to it. Only if that stops short
+ *     too is the load partial (`exact: false`, logged): a partial queue, never none, since there is no
+ *     other path to the queue.
  *   - KEPT CURRENT BY EVERY WRITE. The subscription delivers every commit to the table, from any
  *     thread and any node (#215: exact on one node and on two). Only `put`, `delete` and `invalidate`
  *     change a row; a replay after a subscription gap, or the whole-table re-send after a base copy,
@@ -21,25 +22,26 @@
  *   - CHECKED AGAINST THE TABLE WHEN USED. A claim point-reads each ready-set entry's durable row
  *     before granting it (`claimSchedules`), so an entry the keeper has not yet seen rescheduled or
  *     deleted is skipped, never rendered. Each publish also point-reads the head of what it published
- *     and repairs any it holds wrongly.
+ *     (each key at most once a minute) and repairs any it holds wrongly.
  *   - VERIFIED AGAINST THE TABLE, periodically (`queue.keeper.verifyInterval`): a full primary-key walk
  *     repairs anything missing, held at the wrong minute or class, or held after it was deleted. That
  *     bounds a missed write to one interval and counts it (`queue_health` `keeper_repaired`).
+ *   - NEVER RELOADED ONCE LIVE, so nothing here stops claims. A change of routes or default interval
+ *     reclassifies every held row in memory; a change of cluster membership reclassifies (dropping rows
+ *     this node no longer owns) and then runs the verification walk (adding the rows it now does); a
+ *     closed subscription is reopened and followed by the walk. The set is served throughout.
  *
- * A repair never trusts a read over a newer event: it snapshots what the keeper holds for the key,
- * reads the durable row, and applies the read only if the keeper's entry did not change meanwhile.
- * Harper delivers a row's value as of delivery, so an event arriving later can only be newer still.
+ * A repair never trusts a read over a newer event: the walks skip keys an event touched while they ran,
+ * and a point-read repair applies only if the keeper's entry did not change during the read.
  *
- * OWNERSHIP. The keeper holds only rows this node owns by residency: a node can store stale rows from
- * an earlier ownership ("residency ghosts"), which the old index never surfaced. Ownership depends on
- * the cluster's node list, empty at every worker start until the first `hdb_nodes` scan
- * (`util/residency.js`), so the load waits for a peer (up to a grace period, for a single-node
- * deployment), takes the node list BEFORE the walk, reloads if it changed during it, and rebuilds on
- * any later change.
+ * OWNERSHIP. The keeper holds only rows this node owns by residency: a node can store stale rows from an
+ * earlier ownership ("residency ghosts"). Ownership depends on the cluster's node list, empty at every
+ * worker start until the first `hdb_nodes` scan (`util/residency.js`), so a node with configured peers
+ * waits to see one (up to a grace period) before loading. A node with none — `system.hdb_nodes` names no
+ * other node, or does not exist — loads at once.
  *
- * WHILE IT IS NOT LIVE — waiting for peers, loading, or failed and retrying — this node grants no
- * claims and reports `unready`; going live is reported at once (`QueueState`). There is no other path to the queue: the
- * `nextRenderTime` index it replaced is gone (#215).
+ * UNTIL ITS FIRST PUBLISH, and after it withdraws, this node grants no claims and reports `unready`; the
+ * keeper reports each change of status itself (`QueueState`), so the fleet is told at once.
  */
 import { setImmediate as yieldNow, setTimeout as sleep } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
@@ -57,6 +59,7 @@ import {
 	setKeeperSignal,
 	subscribeScheduleChanges,
 	walkScheduleRows,
+	walkScheduleRowsDescending,
 } from './renderSchedule.js';
 import { getNodes, getResidencyByUrl } from './residency.js';
 import { WALK_CANNOT_ADVANCE } from './urlWalk.js';
@@ -70,14 +73,14 @@ const STATE_SAB_KEY = 'prerender/queue-state-v1';
 const STATE_SLOT_BYTES = 256 * 1024;
 /** Lists in the state document are capped so a corpus with very many routes or cadences still fits. */
 const MAX_LISTED = 200;
-/** Rows between event-loop yields during a walk. */
+/** Rows between event-loop yields during a walk or a reclassification. */
 const WALK_YIELD_EVERY = 200;
 /** Published entries point-read after each publish: the head, which claims take first. */
 const TOP_CHECK_ROWS = 64;
+/** A key the head check read is not read again for this long. */
+const TOP_CHECK_TTL_MS = 60_000;
 /** A publish is forced at least this often, so an expired lease is noticed even with nothing else moving. */
 const FORCE_PUBLISH_MS = 10_000;
-/** Membership-driven rebuilds are spaced at least this far apart. */
-const MIN_REBUILD_GAP_MS = 30_000;
 const SCHEDULE_FIELDS = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'];
 const MAX_TIMER_MS = 2_147_483_647;
 
@@ -91,14 +94,33 @@ export const readQueueStateDocument = () => stateSnapshot().read();
 const messageOf = (e) => e?.message ?? String(e);
 
 /**
- * Tell the fleet at once when this node starts or stops serving claims (`unready` ⇄ `queued`/`empty`),
- * rather than on the next status sync, up to `queue.statusSyncInterval` later. Unforced, so a pause
- * stands. Loaded lazily: `resources/QueueState.js` needs Harper's `Resource` at import.
+ * Report a queue status now rather than at the next status sync. Unforced, so a pause stands. Loaded
+ * lazily: `resources/QueueState.js` needs Harper's `Resource` at import.
  */
-const reportQueueStatus = (status) =>
-	import('../resources/QueueState.js')
-		.then(({ QueueState }) => QueueState.reportStatus(status))
-		.catch((e) => globalThis.logger?.warn?.(`[prerender] queue keeper could not report ${status}: ${messageOf(e)}`));
+let queueStateModule = null;
+const reportQueueStatus = async (status) => {
+	try {
+		queueStateModule ??= await import('../resources/QueueState.js');
+		await queueStateModule.QueueState.reportStatus(status);
+	} catch (e) {
+		globalThis.logger?.warn?.(`[prerender] queue keeper could not report ${status}: ${messageOf(e)}`);
+	}
+};
+
+/**
+ * How many OTHER nodes this node is configured to replicate with: `system.hdb_nodes` has one row per
+ * node, this one included. 0 when that table does not exist (a Harper without replication). Throws when
+ * it cannot be read, and the caller then waits for peers as if there were some.
+ */
+export const countConfiguredPeers = async () => {
+	const table = globalThis.databases?.system?.hdb_nodes;
+	if (!table?.search) return 0;
+	let peers = 0;
+	for await (const row of table.search({ conditions: [], select: ['name'] })) {
+		if (typeof row?.name === 'string' && row.name !== server.hostname) peers++;
+	}
+	return peers;
+};
 
 const carriedCadence = (effectiveInterval) => {
 	const ms = Number(effectiveInterval);
@@ -107,13 +129,17 @@ const carriedCadence = (effectiveInterval) => {
 
 /**
  * The host's classifier: null for a row this node does not own, else its route and cadence: the
- * row's carried `effectiveInterval`, else route over default.
+ * row's carried `effectiveInterval` (`carried`), else route over default.
  */
 export const classifyScheduleRow = (key, value) => {
 	const url = CacheKey.urlOf(key);
 	if (getResidencyByUrl(url) !== server.hostname) return null;
-	const cadenceMs = carriedCadence(value?.effectiveInterval) ?? resolveRenderInterval(url, null);
-	return { route: routeScopeForUrl(url) ?? 'unrouted', cadenceMs };
+	const carried = carriedCadence(value?.effectiveInterval);
+	return {
+		route: routeScopeForUrl(url) ?? 'unrouted',
+		cadenceMs: carried ?? resolveRenderInterval(url, null),
+		carried: carried !== null,
+	};
 };
 
 const capList = (list) => (list.length > MAX_LISTED ? list.slice(0, MAX_LISTED) : list);
@@ -125,6 +151,7 @@ const matches = (held, row, described) =>
 	held.minute === minuteOf(Number(row.nextRenderTime)) &&
 	held.fromSitemap === !!row.fromSitemap &&
 	held.cadenceMs === described.cadenceMs &&
+	held.carried === described.carried &&
 	held.route === described.route;
 
 /**
@@ -137,39 +164,48 @@ export const createKeeperService = ({
 	peerGraceMs = 120_000,
 	retryMs = 30_000,
 	maxRetryMs = 10 * 60_000,
+	countPeers = countConfiguredPeers,
 } = {}) => {
 	const createdAt = now();
 	let keeper = null;
 	let subscription = null;
+	/** stopped | waiting-for-peers | loading | live | failed. `loading` and `live` serve claims. */
 	let phase = 'stopped';
 	let epoch = 0;
-	/** During a load: the last event per row, applied when the walk ends. */
-	let buffered = null;
+	/** While a walk runs: keys an event touched since it began, whose walked value may be older. */
+	let touched = null;
+	/** The load has finished, so a due count of 0 means empty rather than "not found yet". */
+	let complete = false;
 	let publishing = false;
-	let lastDue = 0;
 	let verifying = false;
+	let resyncing = false;
+	let pendingResync = null;
+	let lastDue = 0;
+	let lastReported = null;
 	let lastPublishKey = null;
 	let failures = 0;
 	let nodesKey = null;
-	let lastRebuildAt = 0;
-	let withdrawnAtStart = false;
-	const timers = { publish: null, state: null, verify: null, retry: null, rebuild: null };
+	const checkedAt = new Map();
+	const timers = { publish: null, state: null, verify: null, retry: null };
 	const stats = {
 		loadStartedAt: null,
 		loadedAt: null,
 		loadMs: null,
 		loadRows: 0,
 		unreadableRows: 0,
-		/** Why the last load stopped short of the end of the table, or null when it read it all. */
+		/** Why the last load could not cover the whole table, or null when it did. */
 		partialLoad: null,
 		eventsApplied: 0,
 		lastEventAt: null,
 		lastPublish: null,
 		topCheck: null,
 		verify: null,
+		lastResync: null,
 		repairedTotal: 0,
 		lastError: null,
 	};
+
+	const serving = () => keeper !== null && (phase === 'loading' || phase === 'live');
 
 	const applyEvent = (event) => {
 		const type = event?.type;
@@ -180,6 +216,7 @@ export const createKeeperService = ({
 		if (type === 'put') value = event.value ?? null;
 		else if (type === 'delete' || type === 'invalidate') value = null;
 		else return;
+		touched?.add(event.id);
 		keeper.apply(event.id, value);
 		stats.eventsApplied++;
 		stats.lastEventAt = now();
@@ -187,18 +224,12 @@ export const createKeeperService = ({
 
 	const onEvent = (event) => {
 		if (!keeper || event?.id === undefined || event?.id === null) return;
-		if (buffered) {
-			buffered.delete(event.id); // re-insert, so the map holds each row's LAST event
-			buffered.set(event.id, event);
-			return;
-		}
 		try {
 			applyEvent(event);
 		} catch (e) {
-			// An event that could not be applied is a row the keeper may now be wrong about. Rebuild
-			// rather than carry on silently different from the table.
+			// A row the keeper may now be wrong about: the verification walk puts it right, from the table.
 			log?.error?.(`[prerender] queue keeper could not apply a ${event?.type} for ${event?.id}: ${messageOf(e)}`);
-			rebuild('an event could not be applied');
+			resync('an event could not be applied', { walk: true });
 		}
 	};
 
@@ -225,6 +256,39 @@ export const createKeeperService = ({
 		return true;
 	};
 
+	/**
+	 * Walk the whole table, ascending, then — if an unreadable key stops that — descending from the top
+	 * down to where it stopped. `onRow` is called for every readable row. Resolves null when superseded,
+	 * else `{ rows, unreadable, partial }`, `partial` naming why part of the table could not be read.
+	 */
+	const walkAll = async (mine, onRow) => {
+		let rows = 0;
+		let unreadable = 0;
+		let lastKey = '';
+		let partial = null;
+		const counted = () => unreadable++;
+		try {
+			for await (const row of walkScheduleRows({ onUnreadable: counted })) {
+				if (mine !== epoch) return null;
+				lastKey = row.cacheKey;
+				onRow(row);
+				if (++rows % WALK_YIELD_EVERY === 0) await yieldNow();
+			}
+		} catch (e) {
+			if (e?.code !== WALK_CANNOT_ADVANCE) throw e;
+			unreadable++;
+			const tail = walkScheduleRowsDescending({ above: lastKey, onUnreadable: counted });
+			let step;
+			while (!(step = await tail.next()).done) {
+				if (mine !== epoch) return null;
+				onRow(step.value);
+				if (++rows % WALK_YIELD_EVERY === 0) await yieldNow();
+			}
+			if (step.value !== true) partial = messageOf(e);
+		}
+		return { rows, unreadable, partial };
+	};
+
 	const endSubscription = (sub = subscription) => {
 		if (sub === subscription) subscription = null;
 		try {
@@ -247,9 +311,18 @@ export const createKeeperService = ({
 		return timer;
 	};
 
-	/** Stop serving the keeper's generation: claims grant nothing until it is live again. */
+	/** Report the status the keeper now implies, when it differs from the last one reported. */
+	const announce = () => {
+		const status = !serving() ? 'unready' : lastDue > 0 ? 'queued' : complete ? 'empty' : 'unready';
+		if (status === lastReported) return;
+		lastReported = status;
+		reportQueueStatus(status);
+	};
+
+	/** Stop serving the keeper's generation: claims grant nothing until it publishes again. */
 	const withdraw = () => {
 		clearKeeperSignal();
+		lastReported = 'unready';
 		reportQueueStatus('unready');
 		try {
 			publishKeeperSet([]);
@@ -269,33 +342,44 @@ export const createKeeperService = ({
 		return delay;
 	};
 
-	/** Load from the table and go live. Resolves when live, or when stopped/superseded meanwhile. */
+	/** Resolves false when superseded. */
+	const waitForPeers = async (mine) => {
+		if (getNodes().length >= 2) return true;
+		let peers = null;
+		try {
+			peers = await countPeers();
+		} catch (e) {
+			log?.warn?.(`[prerender] queue keeper could not read the configured peers (${messageOf(e)}); waiting for them`);
+		}
+		if (mine !== epoch) return false;
+		if (peers === 0) return true;
+		phase = 'waiting-for-peers';
+		writeState();
+		while (getNodes().length < 2 && now() - createdAt < peerGraceMs) {
+			await sleep(1_000, undefined, { ref: false });
+			if (mine !== epoch) return false;
+		}
+		return true;
+	};
+
+	/** Load from the table, serving from the first chunk. Resolves when live, or when stopped meanwhile. */
 	const start = async () => {
 		const mine = ++epoch;
 		clearTimers();
 		endSubscription();
-		// A generation left by an earlier worker 0 (a restart, a crash) or by this keeper before a
-		// rebuild must not keep being served: claims wait until this one is live.
-		if (phase === 'live' || !withdrawnAtStart) withdraw();
-		withdrawnAtStart = true;
+		// A generation left by an earlier worker 0 (a restart, a crash) must not keep being served.
+		withdraw();
 		keeper = null;
-		buffered = null;
+		touched = null;
+		complete = false;
 		stats.lastError = null;
 
-		// Ownership is only knowable once the node list is. Wait for a peer, up to the grace period.
-		if (getNodes().length < 2 && now() - createdAt < peerGraceMs) {
-			phase = 'waiting-for-peers';
-			writeState();
-			while (getNodes().length < 2 && now() - createdAt < peerGraceMs) {
-				await sleep(1_000, undefined, { ref: false });
-				if (mine !== epoch) return;
-			}
-		}
+		if (!(await waitForPeers(mine))) return;
 
 		phase = 'loading';
 		nodesKey = getNodes().join(',');
 		keeper = createQueueKeeper({ classify: classifyScheduleRow, now });
-		buffered = new Map();
+		touched = new Set();
 		stats.loadStartedAt = now();
 		stats.unreadableRows = 0;
 		stats.partialLoad = null;
@@ -308,63 +392,47 @@ export const createKeeperService = ({
 				return;
 			}
 			subscription = sub;
-			let rows = 0;
-			try {
-				for await (const row of walkScheduleRows({ onUnreadable: () => stats.unreadableRows++ })) {
-					if (mine !== epoch) return;
-					keeper.apply(row.cacheKey, row, { quiet: true });
-					if (++rows % WALK_YIELD_EVERY === 0) await yieldNow();
-				}
-			} catch (e) {
-				if (e?.code !== WALK_CANNOT_ADVANCE) throw e;
-				// Live on what was read (see the module comment); `exact` is false while this stands.
-				stats.partialLoad = messageOf(e);
-				stats.unreadableRows++;
-				log?.error?.(
-					`[prerender] queue keeper load stopped at an unreadable schedule row after ${rows} row(s): ` +
-						`${stats.partialLoad}. Going live without the rows past it; they are held as soon as anything ` +
-						'writes them. Repair or delete the unreadable row, then restart.'
-				);
-			}
-			if (mine !== epoch) return;
-			if (getNodes().join(',') !== nodesKey) {
-				log?.info?.('[prerender] queue keeper: the node list changed during the load; loading again.');
-				rebuild('the node list changed during the load');
-				return;
-			}
-			const pending = [...buffered.values()];
-			buffered = null;
-			for (const event of pending) applyEvent(event);
-			stats.loadRows = rows;
+			// Serve while loading (see the module comment).
+			timers.publish = every(publish, config.queue.keeper.publishInterval);
+			timers.state = every(writeState, config.queue.keeper.stateInterval);
+			const walked = await walkAll(mine, (row) => {
+				if (!touched.has(row.cacheKey)) keeper.apply(row.cacheKey, row, { quiet: true });
+			});
+			if (walked === null) return;
+			touched = null;
+			stats.loadRows = walked.rows;
+			stats.unreadableRows = walked.unreadable;
+			stats.partialLoad = walked.partial;
 			stats.loadMs = Math.round(performance.now() - started);
 			stats.loadedAt = now();
 			failures = 0;
+			complete = true;
 			phase = 'live';
 			lastPublishKey = null;
 			metrics.queueHealth(stats.loadMs, 'keeper_load_ms');
-			log?.info?.(
-				`[prerender] queue keeper live: ${keeper.size} of ${rows} stored schedule rows are this node's, loaded in ` +
-					`${stats.loadMs}ms (${pending.length} write(s) applied from during the load` +
-					`${stats.unreadableRows ? `, ${stats.unreadableRows} unreadable row(s) skipped` : ''}).`
-			);
-			if (getNodes().length < 2) {
-				log?.info?.(
-					'[prerender] queue keeper: no cluster peer is visible, so every stored row counts as this ' +
-						"node's. If this node is clustered, the keeper rebuilds when the node list changes."
+			if (walked.partial) {
+				log?.error?.(
+					`[prerender] queue keeper could not read part of the schedule table past an unreadable row ` +
+						`(${walked.partial}); serving without those rows, which are held as soon as anything writes them. ` +
+						'Repair or delete the unreadable row.'
 				);
 			}
+			log?.info?.(
+				`[prerender] queue keeper live: ${keeper.size} of ${walked.rows} stored schedule rows are this node's, ` +
+					`loaded in ${stats.loadMs}ms while serving` +
+					`${walked.unreadable ? `, ${walked.unreadable} unreadable row(s) skipped` : ''}.`
+			);
 			await publish();
 			if (mine !== epoch) return;
-			reportQueueStatus(lastDue > 0 ? 'queued' : 'empty');
 			writeState();
-			timers.publish = every(publish, config.queue.keeper.publishInterval);
-			timers.state = every(writeState, config.queue.keeper.stateInterval);
 			if (config.queue.keeper.verifyInterval > 0) timers.verify = every(verify, config.queue.keeper.verifyInterval);
+			if (getNodes().join(',') !== nodesKey) resync('the node list changed during the load', { walk: true });
 		} catch (e) {
 			if (mine !== epoch) return;
 			phase = 'failed';
 			stats.lastError = messageOf(e);
-			buffered = null;
+			touched = null;
+			clearTimers();
 			endSubscription();
 			withdraw();
 			writeState();
@@ -382,60 +450,111 @@ export const createKeeperService = ({
 		endSubscription();
 		withdraw();
 		keeper = null;
-		buffered = null;
+		touched = null;
+		complete = false;
 		failures = 0;
 		phase = 'stopped';
 		writeState();
 	};
 
-	/** Rebuild from the table; spaced so a flapping trigger cannot re-walk the table continuously. */
-	const rebuild = (why) => {
-		const wait = lastRebuildAt + MIN_REBUILD_GAP_MS - now();
-		if (wait > 0) {
-			if (!timers.rebuild) {
-				log?.info?.(`[prerender] queue keeper rebuild (${why}) deferred ${Math.ceil(wait / 1000)}s.`);
-				timers.rebuild = setTimeout(() => {
-					timers.rebuild = null;
-					lastRebuildAt = now();
-					start();
-				}, wait);
-				timers.rebuild.unref?.();
+	/**
+	 * Re-apply every held row under the current config and ownership, in memory: a row whose route or
+	 * config-resolved cadence changed moves class, and a row this node no longer owns is dropped.
+	 */
+	const reclassify = async (mine) => {
+		let moved = 0;
+		let dropped = 0;
+		const keys = keeper.keys();
+		for (let i = 0; i < keys.length; i++) {
+			if (mine !== epoch || !keeper) return null;
+			const key = keys[i];
+			const before = keeper.describe(key);
+			if (before) {
+				keeper.apply(key, keeper.heldValue(key), { quiet: true });
+				const after = keeper.describe(key);
+				if (!after) dropped++;
+				else if (after.route !== before.route || after.cadenceMs !== before.cadenceMs) moved++;
 			}
+			if ((i + 1) % WALK_YIELD_EVERY === 0) await yieldNow();
+		}
+		return { moved, dropped };
+	};
+
+	/**
+	 * Bring the keeper in line with a changed world while it goes on serving: reopen the subscription
+	 * (`resubscribe`), reclassify in memory, then run the verification walk (`walk`) for what only the
+	 * table can tell. Coalesced: a request while one runs is merged into the next.
+	 */
+	const resync = (why, { resubscribe = false, walk = false } = {}) => {
+		if (phase !== 'live') return Promise.resolve();
+		if (resyncing) {
+			pendingResync = {
+				why: pendingResync ? `${pendingResync.why}; ${why}` : why,
+				resubscribe: resubscribe || !!pendingResync?.resubscribe,
+				walk: walk || !!pendingResync?.walk,
+			};
 			return Promise.resolve();
 		}
-		lastRebuildAt = now();
-		log?.info?.(`[prerender] queue keeper rebuilding from the table: ${why}.`);
-		return start();
+		resyncing = true;
+		const mine = epoch;
+		return (async () => {
+			const started = performance.now();
+			try {
+				log?.info?.(`[prerender] queue keeper resyncing while serving: ${why}.`);
+				if (resubscribe) {
+					endSubscription();
+					const sub = await subscribeScheduleChanges(onEvent);
+					if (mine !== epoch) return endSubscription(sub);
+					subscription = sub;
+				}
+				nodesKey = getNodes().join(',');
+				const reclassified = await reclassify(mine);
+				if (reclassified === null) return;
+				const verified = walk ? await verify() : null;
+				stats.lastResync = {
+					at: now(),
+					why,
+					ms: Math.round(performance.now() - started),
+					...reclassified,
+					repaired: verified?.repaired ?? null,
+				};
+				lastPublishKey = null;
+			} catch (e) {
+				stats.lastError = messageOf(e);
+				log?.error?.(`[prerender] queue keeper resync failed (${why}): ${stats.lastError}`);
+			} finally {
+				resyncing = false;
+				const next = pendingResync;
+				pendingResync = null;
+				if (next && mine === epoch) resync(next.why, next);
+			}
+		})();
 	};
 
 	const publish = async () => {
-		if (phase !== 'live') return;
-		// The heartbeat comes first and does not wait on a publish still in flight (its head check awaits
-		// 64 point reads): a slow publish must not look like a dead keeper to the claim path.
+		if (!serving()) return;
+		// The heartbeat does not wait on a publish still in flight (its head check awaits point reads).
 		if (publishing) {
-			setKeeperSignal({ due: lastDue, nowMs: now() });
+			setKeeperSignal({ due: lastDue, complete, nowMs: now() });
 			return;
 		}
 		publishing = true;
 		const mine = epoch;
 		const started = performance.now();
 		try {
-			if (subscription?.closed) {
-				rebuild('its subscription closed');
-				return;
-			}
-			const nodes = getNodes().join(',');
-			if (nodes !== nodesKey) {
-				rebuild(`the cluster's node list changed (${nodesKey || 'none'} -> ${nodes})`);
-				return;
+			if (phase === 'live') {
+				if (subscription?.closed) resync('its subscription closed', { resubscribe: true, walk: true });
+				const nodes = getNodes().join(',');
+				if (nodes !== nodesKey && !resyncing) {
+					resync(`the cluster's node list changed (${nodesKey || 'none'} -> ${nodes})`, { walk: true });
+				}
 			}
 			const nowMs = now();
 			keeper.tick(nowMs);
 			const summary = keeper.dueSummary(nowMs);
-			// The heartbeat, every tick: a keeper that is alive but has nothing new to publish must not
-			// look stalled to the claim path.
 			lastDue = summary.due;
-			setKeeperSignal({ due: summary.due, nowMs });
+			setKeeperSignal({ due: summary.due, complete, nowMs });
+			announce();
 
 			const leases = leaseTable();
 			const ready = readyQueue().state();
@@ -461,21 +580,23 @@ export const createKeeperService = ({
 				due: summary.due,
 			};
 			metrics.queueHealth(ms, 'keeper_publish_ms');
+			if (phase !== 'live') return;
 			// Check the head of what was just published against the table, and repair what it holds
-			// wrongly, so an entry a claim would find stale is fixed at the source rather than skipped
-			// on every claim until its event arrives.
+			// wrongly, so an entry a claim would find stale is fixed at the source rather than skipped on
+			// every claim until its event arrives. Each key at most once per TOP_CHECK_TTL_MS: a head that
+			// has not moved has nothing new to find.
+			for (const [key, at] of checkedAt) if (nowMs - at > TOP_CHECK_TTL_MS) checkedAt.delete(key);
+			let checked = 0;
 			let repaired = 0;
-			const checked = top.rows.slice(0, TOP_CHECK_ROWS);
-			for (const { entry } of checked) {
+			for (const { entry } of top.rows.slice(0, TOP_CHECK_ROWS)) {
+				if (checkedAt.has(entry.cacheKey)) continue;
 				if (mine !== epoch || !keeper) return;
+				checkedAt.set(entry.cacheKey, nowMs);
+				checked++;
 				if (await repairFromTable(entry.cacheKey)) repaired++;
 			}
-			stats.topCheck = { at: nowMs, checked: checked.length, repaired };
-			if (repaired) {
-				// Usually an event still on its way: the next publish would have corrected it. Counted
-				// apart from the verification walk's repairs, which are misses.
-				lastPublishKey = null;
-			}
+			if (checked) stats.topCheck = { at: nowMs, checked, repaired };
+			if (repaired) lastPublishKey = null;
 		} catch (e) {
 			stats.lastError = messageOf(e);
 			log?.error?.(`[prerender] queue keeper publish failed: ${stats.lastError}`);
@@ -486,7 +607,8 @@ export const createKeeperService = ({
 
 	/**
 	 * The verification walk: every row of the table against the keeper, and every key the keeper holds
-	 * against the table. What it repairs is a write the keeper missed.
+	 * against the table. What it repairs is a write the keeper missed — or, after a membership change,
+	 * a row this node has just come to own.
 	 */
 	const verify = async () => {
 		if (phase !== 'live' || verifying) return null;
@@ -494,54 +616,68 @@ export const createKeeperService = ({
 		const mine = epoch;
 		const started = performance.now();
 		const result = { at: now(), scanned: 0, owned: 0, unowned: 0, missing: 0, mismatched: 0, phantoms: 0 };
+		touched = new Set();
 		try {
 			const seen = new Set();
-			const suspects = [];
-			let unreadable = 0;
-			for await (const row of walkScheduleRows({ onUnreadable: () => unreadable++ })) {
-				if (mine !== epoch || !keeper) return null;
+			const walked = await walkAll(mine, (row) => {
 				result.scanned++;
-				const described = classifyScheduleRow(row.cacheKey, row);
-				if (!described) {
-					result.unowned++;
-				} else {
+				const key = row.cacheKey;
+				const described = classifyScheduleRow(key, row);
+				if (described) {
 					result.owned++;
-					seen.add(row.cacheKey);
-					if (!matches(keeper.describe(row.cacheKey), row, described)) suspects.push(row.cacheKey);
+					seen.add(key);
+				} else {
+					result.unowned++;
 				}
-				if (result.scanned % WALK_YIELD_EVERY === 0) await yieldNow();
-			}
-			// Keys the keeper holds that the walk did not see: deleted, or written after the walk passed.
-			for (const key of keeper.keys()) if (!seen.has(key)) suspects.push(key);
-			for (const key of suspects) {
-				if (mine !== epoch || !keeper) return null;
-				const wasHeld = keeper.describe(key) !== null;
-				if (await repairFromTable(key)) {
-					if (!wasHeld) result.missing++;
-					else if (keeper.describe(key) === null) result.phantoms++;
-					else result.mismatched++;
+				// An event since the walk began is newer than this read; the walk's own value is not
+				// needed. Otherwise the walked row IS the table's value, newer than anything held.
+				if (touched.has(key)) return;
+				const held = keeper.describe(key);
+				if (!described) {
+					if (held !== null) {
+						keeper.apply(key, null);
+						result.mismatched++;
+					}
+					return;
+				}
+				if (matches(held, row, described)) return;
+				if (held === null) result.missing++;
+				else result.mismatched++;
+				keeper.apply(key, row);
+			});
+			if (walked === null) return null;
+			// Keys held that the walk did not see: deleted, unless an event touched them meanwhile. Only
+			// when the walk covered the whole table — a part it could not read proves nothing.
+			if (!walked.partial) {
+				for (const key of keeper.keys()) {
+					if (seen.has(key) || touched.has(key)) continue;
+					if (mine !== epoch || !keeper) return null;
+					if (await repairFromTable(key)) result.phantoms++;
 				}
 			}
-			result.unreadableRows = unreadable;
+			result.unreadableRows = walked.unreadable;
+			result.partial = walked.partial;
 			result.repaired = result.missing + result.mismatched + result.phantoms;
 			result.ms = Math.round(performance.now() - started);
 			stats.verify = result;
 			stats.repairedTotal += result.repaired;
+			if (!walked.partial && stats.partialLoad) stats.partialLoad = null; // the whole table is now held
 			metrics.queueHealth(result.ms, 'keeper_verify_ms');
 			if (result.repaired) {
 				metrics.queueHealth(result.repaired, 'keeper_repaired');
 				log?.warn?.(
 					`[prerender] queue keeper verification repaired ${result.repaired} row(s) it held differently from ` +
-						`the table (${result.missing} missing, ${result.mismatched} mismatched, ${result.phantoms} deleted). ` +
-						'Those were writes it missed; a steady count means its subscription is losing them.'
+						`the table (${result.missing} missing, ${result.mismatched} mismatched, ${result.phantoms} deleted).`
 				);
 			}
+			lastPublishKey = null;
 			return result;
 		} catch (e) {
 			stats.lastError = messageOf(e);
 			log?.error?.(`[prerender] queue keeper verification failed: ${stats.lastError}`);
 			return null;
 		} finally {
+			touched = null;
 			verifying = false;
 		}
 	};
@@ -564,8 +700,9 @@ export const createKeeperService = ({
 				phase,
 				rows: keeper?.size ?? 0,
 				classes: keeper?.classCount ?? 0,
-				// nothing skipped on the load, and the last verification found nothing to repair
-				exact: phase === 'live' && stats.unreadableRows === 0 && !stats.partialLoad && !(stats.verify?.repaired > 0),
+				resyncing,
+				// the whole table is held, and the last verification found nothing to repair
+				exact: phase === 'live' && !resyncing && !stats.partialLoad && !(stats.verify?.repaired > 0),
 				...stats,
 			},
 			queue,
@@ -584,7 +721,7 @@ export const createKeeperService = ({
 	return {
 		start,
 		stop,
-		rebuild,
+		resync,
 		publish,
 		verify,
 		writeState,
@@ -618,8 +755,8 @@ export const keeperService = () => service;
 
 /**
  * Start the keeper on worker 0 and follow live config: an interval change re-arms its timers, and a
- * change to the routes or the default interval rebuilds it (a row's route and resolved cadence are its
- * class). Idempotent.
+ * change to the routes or the default interval reclassifies every held row in memory (a row's route and
+ * resolved cadence are its class). Idempotent.
  */
 export function startQueueKeeper() {
 	if (server.workerIndex !== 0 || service) return;
@@ -641,8 +778,9 @@ export function startQueueKeeper() {
 		const next = config.queue.keeper;
 		const nextRoutesKey = classKey();
 		if (nextRoutesKey !== routesKey) {
-			service.rebuild('the routes or the default render interval changed, so rows may have changed class');
-		} else if (
+			service.resync('the routes or the default render interval changed, so rows may have changed class');
+		}
+		if (
 			next.publishInterval !== armed.publishInterval ||
 			next.stateInterval !== armed.stateInterval ||
 			next.verifyInterval !== armed.verifyInterval

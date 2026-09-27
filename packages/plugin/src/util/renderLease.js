@@ -61,12 +61,15 @@ export const LEASE_EPOCH_SEC = 1_700_000_000;
 const H_OCCUPANCY = 0;
 const HEADER_INT32 = 1;
 
-// Slot: [hashLo, hashHi, expiresSec, dueMinute]
+// Slot: [hashLo, hashHi, expiresSec, dueMinute, misses]
 const S_LO = 0;
 const S_HI = 1;
 const S_EXPIRES = 2;
 const S_DUE = 3;
-const SLOT_INT32 = 4;
+// How many of this key's leases in a row EXPIRED rather than being released: the result never came
+// (a renderer crash), or the fast-retry lane held it. Reset by a release. See `missesBeforeGrant`.
+const S_MISSES = 4;
+const SLOT_INT32 = 5;
 
 /**
  * `dueMinute` of a slot whose lease has been RELEASED and is only sitting out its
@@ -101,7 +104,7 @@ const MAX_PROBE = 8;
 export const LEASE_HEADER_BYTES = HEADER_INT32 * 4;
 export const LEASE_SLOT_BYTES = SLOT_INT32 * 4;
 
-/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 65,540 B. */
+/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 81,924 B. */
 export const leaseBufferBytes = (slots) => LEASE_HEADER_BYTES + LEASE_SLOT_BYTES * Math.max(0, slots | 0);
 
 /** Slots that actually fit in a buffer of this size — the authority when a size assert fails. */
@@ -231,8 +234,10 @@ export const createLeaseTable = ({
 			const at = base(found);
 			const observed = Atomics.load(i32, at + S_EXPIRES);
 			if (isLive(observed, nowSec)) return false;
+			const misses = missesOf(at);
 			Atomics.store(i32, at + S_DUE, due);
 			if (Atomics.compareExchange(i32, at + S_EXPIRES, observed, expiresSec) !== observed) return false;
+			Atomics.store(i32, at + S_MISSES, misses);
 			Atomics.add(i32, H_OCCUPANCY, 1);
 			return true;
 		}
@@ -243,6 +248,7 @@ export const createLeaseTable = ({
 		Atomics.store(i32, at + S_HI, hi);
 		Atomics.store(i32, at + S_EXPIRES, expiresSec);
 		Atomics.store(i32, at + S_DUE, due);
+		Atomics.store(i32, at + S_MISSES, 0);
 		onGrantWindow?.(cacheKey);
 		if (Atomics.compareExchange(i32, at + S_LO, observedLo, lo) !== observedLo) return false;
 		if (liveElsewhere(lo, hi, free, nowSec)) {
@@ -251,6 +257,26 @@ export const createLeaseTable = ({
 		}
 		Atomics.add(i32, H_OCCUPANCY, 1);
 		return true;
+	};
+
+	/** The expired lease in the slot at `at` counts as a miss unless it was released. */
+	const missesOf = (at) =>
+		Atomics.load(i32, at + S_DUE) === DUE_RELEASED ? 0 : Math.max(0, Atomics.load(i32, at + S_MISSES)) + 1;
+
+	/**
+	 * How many of `cacheKey`'s leases in a row will have expired without a result if it is granted now:
+	 * 0 when it holds no expired slot, or its last lease was released. The claim path bounds a render
+	 * that never reports (see `claimSchedules`). An undercount when the slot has been recycled by
+	 * another key, never an overcount.
+	 */
+	const missesBeforeGrant = (cacheKey) => {
+		const { lo, hi } = lease64(cacheKey);
+		const nowSec = nowSecond();
+		const { found } = locate(lo, hi, nowSec);
+		if (found === -1) return 0;
+		const at = base(found);
+		if (isLive(Atomics.load(i32, at + S_EXPIRES), nowSec)) return 0;
+		return missesOf(at);
 	};
 
 	/** Does another slot in `lo`'s probe window hold a live lease for this key? */
@@ -356,9 +382,10 @@ export const createLeaseTable = ({
 	/** Zero everything. Tests only — see `resetRenderQueueState` in util/renderSchedule.js. */
 	const resetAll = () => i32.fill(0);
 
-	return { slots: slotCount, isLeased, grant, release, occupancy, scanLive, leaseOf, resetAll };
+	return { slots: slotCount, isLeased, grant, release, occupancy, scanLive, leaseOf, missesBeforeGrant, resetAll };
 };
 
 /** The named cross-worker buffer this table lives in. Versioned, so a layout change gets a new name
- *  rather than a differently-shaped view of the old bytes (v2: the claim floor's header words are gone). */
+ *  rather than a differently-shaped view of the old bytes (v2: the claim floor's header words are gone,
+ *  and a slot carries its miss count). */
 export const LEASE_SAB_KEY = 'render_queue_v2';

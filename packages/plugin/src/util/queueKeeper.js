@@ -71,8 +71,10 @@ const lowerBound = (arr, value) => {
 
 /**
  * @param {object} opts
- * @param {(key: string, value: object) => ({ route: string, cadenceMs: number } | null)} opts.classify
- *   null means "not this node's to render": the row is not held.
+ * @param {(key: string, value: object) => ({ route: string, cadenceMs: number, carried?: boolean } | null)} opts.classify
+ *   null means "not this node's to render": the row is not held. `carried` says the cadence came off the
+ *   row (`effectiveInterval`) rather than from config, which is what lets the host reclassify every
+ *   held row in memory when config changes (`describe` hands it back).
  * @param {() => number} [opts.now]  injected clock, for flow accounting
  * @param {number} [opts.flowMinutes]  how many minutes of flow history to keep
  */
@@ -81,7 +83,7 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 
 	/** key -> dueMinute * CLASS_SPAN + classId */
 	const rows = new Map();
-	/** classId -> { route, cadenceMs, fromSitemap, buckets: Map<minute, Set<key>>, minutes: number[] } */
+	/** classId -> { route, cadenceMs, carried, fromSitemap, buckets: Map<minute, Set<key>>, minutes: number[] } */
 	const classes = [];
 	const classIds = new Map();
 
@@ -98,13 +100,13 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 	// Bumped by every apply that changes what is held, so the host can skip a publish nothing changed.
 	let version = 0;
 
-	const classOf = (route, cadenceMs, fromSitemap) => {
-		const name = `${route}\u0000${cadenceMs}\u0000${fromSitemap ? 1 : 0}`;
+	const classOf = (route, cadenceMs, carried, fromSitemap) => {
+		const name = `${route}\u0000${cadenceMs}\u0000${carried ? 1 : 0}\u0000${fromSitemap ? 1 : 0}`;
 		let id = classIds.get(name);
 		if (id === undefined) {
 			id = classes.length;
 			if (id >= CLASS_SPAN) throw new RangeError(`queue keeper: more than ${CLASS_SPAN} classes`);
-			classes.push({ route, cadenceMs, fromSitemap, buckets: new Map(), minutes: [] });
+			classes.push({ route, cadenceMs, carried, fromSitemap, buckets: new Map(), minutes: [] });
 			classIds.set(name, id);
 		}
 		return id;
@@ -180,7 +182,7 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			}
 			return false;
 		}
-		const classId = classOf(described.route, described.cadenceMs, !!value.fromSitemap);
+		const classId = classOf(described.route, described.cadenceMs, !!described.carried, !!value.fromSitemap);
 		insert(key, classId, minute);
 		if (!quiet) {
 			const isDue = minute <= nowMinute;
@@ -414,11 +416,23 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			const packed = rows.get(key);
 			if (packed === undefined) return null;
 			const { classId, minute } = unpack(packed);
-			const { route, cadenceMs, fromSitemap } = classes[classId];
-			return { minute, route, cadenceMs, fromSitemap };
+			const { route, cadenceMs, carried, fromSitemap } = classes[classId];
+			return { minute, route, cadenceMs, carried, fromSitemap };
 		},
-		/** Every held key (for the host's verification walk). */
-		keys: () => rows.keys(),
+		/**
+		 * The row value `apply` would need to hold `key` exactly as it is held now — for reclassifying in
+		 * memory: applying it again re-runs `classify` under the current config and ownership. Null when
+		 * not held.
+		 */
+		heldValue: (key) => {
+			const packed = rows.get(key);
+			if (packed === undefined) return null;
+			const { classId, minute } = unpack(packed);
+			const { cadenceMs, carried, fromSitemap } = classes[classId];
+			return { nextRenderTime: minute * MINUTE, fromSitemap, effectiveInterval: carried ? cadenceMs : null };
+		},
+		/** A snapshot of every held key: safe to iterate while applying (a live iterator is not). */
+		keys: () => [...rows.keys()],
 		/** The due minute held for `key`, or null when it is not held. */
 		dueMinuteOf: (key) => {
 			const packed = rows.get(key);

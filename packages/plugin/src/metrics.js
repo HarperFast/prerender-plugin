@@ -410,7 +410,7 @@ export const METRICS = Object.freeze({
 			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
 			'reconcile_* once per sweep per node; keeper_load_ms once per keeper load, keeper_publish_ms once per ' +
 			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms and keeper_repaired once ' +
-			'per verification walk; claim_granted per claim that granted any, claim_stale per claim that skipped any',
+			'per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
 		summary: 'Every queue signal under one name: backlog gauges, the queue keeper, schedule-gap repairs.',
 		usefulFor:
 			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
@@ -437,6 +437,7 @@ export const METRICS = Object.freeze({
 					'keeper_repaired',
 					'keeper_verify_ms',
 					'claim_stale',
+					'claim_wedged',
 				],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
@@ -460,7 +461,9 @@ export const METRICS = Object.freeze({
 					'keeper_verify_ms = one verification walk of the whole table (queue.keeper.verifyInterval). ' +
 					'claim_stale = ready-set entries a claim skipped because the durable row was no longer due ' +
 					'(rendered, rescheduled or deleted after the keeper published it): renders the check saved. A ' +
-					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late.',
+					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late. ' +
+					'claim_wedged = rows a claim filed one cadence forward instead of granting, because their last ' +
+					'leases all expired with no result (a renderer crashing or hanging on the URL); the log names them.',
 			},
 			method: {
 				name: 'source (claim_granted)',

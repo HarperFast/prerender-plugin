@@ -1321,6 +1321,17 @@ export class RenderQueue extends Resource {
 		// Ready-set entries the durable row showed were no longer due (rendered, rescheduled or deleted
 		// since the keeper published them): each one is a render the check saved.
 		if (pass.skippedStale > 0) metrics.queueHealth(pass.skippedStale, 'claim_stale');
+		// Rows whose renders never reported, filed one cadence forward instead of granted again. Each one is
+		// a URL to look at: the renderer is crashing or hanging on it.
+		if (pass.wedged.length > 0) {
+			metrics.queueHealth(pass.wedged.length, 'claim_wedged');
+			logger.warn(
+				`[prerender] ${pass.wedged.length} row(s) whose last ${config.render.failureRetry.fastRetries + 2} leases ` +
+					`expired with no result were filed one cadence forward instead of granted again: ` +
+					`${pass.wedged.slice(0, 3).join(', ')}${pass.wedged.length > 3 ? ', …' : ''}. The renderer is crashing ` +
+					`or hanging on these URLs; no strike was counted.`
+			);
+		}
 
 		const jobs = [];
 		let notOwnedHere = 0;

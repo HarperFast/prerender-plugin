@@ -43,8 +43,15 @@ before(async () => {
 	service = await import('../src/util/queueKeeperService.js');
 });
 
-test('with no peer visible it waits, and loads once one appears', async () => {
-	const s = service.createKeeperService({ log: null, peerGraceMs: 60_000 });
+test('with no configured peer (a single node) it loads at once', async () => {
+	const s = service.createKeeperService({ log: null, peerGraceMs: 60_000, countPeers: async () => 0 });
+	await s.start();
+	assert.equal(s.phase, 'live', 'no two-minute grace on a node with nothing to wait for');
+	s.stop();
+});
+
+test('with configured peers not yet visible it waits, and loads once one appears', async () => {
+	const s = service.createKeeperService({ log: null, peerGraceMs: 60_000, countPeers: async () => 1 });
 	const loading = s.start();
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	assert.equal(s.phase, 'waiting-for-peers');

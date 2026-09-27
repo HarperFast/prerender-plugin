@@ -45,9 +45,10 @@ const harness = ({ slots = SLOTS, now = 1_700_000_000_000 } = {}) => {
 test('the buffer layout is header + fixed-size slots', () => {
 	// One header word: the occupancy gauge.
 	assert.equal(LEASE_HEADER_BYTES, 4);
-	assert.equal(LEASE_SLOT_BYTES, 16);
-	assert.equal(leaseBufferBytes(4096), 4 + 16 * 4096);
-	assert.equal(leaseBufferBytes(4096), 65_540, 'the documented 64KB sizing');
+	// Five slot words: hash lo/hi, expiry, due minute, and the miss count.
+	assert.equal(LEASE_SLOT_BYTES, 20);
+	assert.equal(leaseBufferBytes(4096), 4 + 20 * 4096);
+	assert.equal(leaseBufferBytes(4096), 81_924, 'the documented 80KB sizing');
 });
 
 // ---- the all-zero buffer ----
@@ -224,6 +225,25 @@ test('two grants of one key racing onto DIFFERENT fresh slots: at most one is gr
 	assert.equal(outer, false, 'and the first gave its slot back');
 	assert.equal(a.isLeased(K), true);
 	assert.equal(a.scanLive().count, 1, 'one live lease for the key');
+});
+
+test('a lease that EXPIRES counts as a miss; a released one resets the count', () => {
+	let t = 1_700_000_000_000;
+	const { table } = {
+		table: createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t }),
+	};
+	const key = 'https://www.example.com/crash';
+	assert.equal(table.missesBeforeGrant(key), 0, 'never leased');
+	for (let i = 1; i <= 3; i++) {
+		table.grant(key, { dueMinute: 1, leaseExpiryMs: t + MINUTE });
+		assert.equal(table.missesBeforeGrant(key), 0, 'a live lease is not a miss yet');
+		t += MINUTE; // expired with no result
+		assert.equal(table.missesBeforeGrant(key), i, `${i} lease(s) in a row expired`);
+	}
+	table.grant(key, { dueMinute: 1, leaseExpiryMs: t + MINUTE });
+	table.release(key); // a result came
+	t += MINUTE;
+	assert.equal(table.missesBeforeGrant(key), 0, 'released: the count starts again');
 });
 
 test('re-granting an EXPIRED lease reuses its slot instead of consuming a second one', () => {

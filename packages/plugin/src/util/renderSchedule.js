@@ -43,7 +43,9 @@
  */
 
 import { config } from '../config.js';
+import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
+import { resolveRenderInterval } from './routeClass.js';
 import { MINUTE, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 import { READY_EPOCH_SEC, READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
@@ -213,8 +215,17 @@ export const getScheduleRow = (cacheKey, select) =>
  * entry would cost a render. It also hands the renderer the LIVE `fromSitemap`.
  *
  * A short claim is simply short: what the set could not grant is in flight or was stale, and the
- * keeper republishes within a second. While the keeper is not serving (loading at startup, or
- * stalled) nothing is granted and `keeperServed` is false, which the caller reports as `unready`.
+ * keeper republishes within a second. While the keeper is not serving (before its first publish, or
+ * after it withdrew) nothing is granted and `keeperServed` is false, which the caller reports as
+ * `unready`. A keeper that is serving but has gone quiet is still served from: every entry is checked
+ * against its row, so its last set stays safe to grant from until it drains.
+ *
+ * A RENDER THAT NEVER REPORTS IS BOUNDED HERE. A lease that expires with no result (a renderer crash)
+ * leaves the row due, so the key would be granted again at every expiry, forever. The lease table counts
+ * those misses; past the fast-retry lane's own holds (`render.failureRetry.fastRetries`) plus one, the
+ * row is filed one cadence forward instead of granted, and named (`pass.wedged`). No strike is counted —
+ * `strikes` is what suppression and redirect verdicts delete targets on, so a broad renderer outage must
+ * not walk the corpus toward deletion.
  *
  * No mutex: the ready-set cursor hands each entry to one taker, and the lease grant is exclusive
  * (`util/renderLease.js`), so claims on every worker run concurrently.
@@ -233,6 +244,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 		skippedStale: 0,
 		leaseRefused: false,
 		occupancy: 0,
+		wedged: [],
 	};
 	if (!keeper.serving || wanted === 0) {
 		pass.occupancy = leases.occupancy();
@@ -241,6 +253,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 
 	const queue = readyQueue();
 	const leaseTimeMs = config.queue.jobLeaseTime;
+	const missLimit = Math.max(0, config.render.failureRetry.fastRetries | 0) + 1;
 	// Over-take, because an entry may name a row that is already leased — the set is published every
 	// second, and a lease granted since is not reflected in it — so a run of them must not end the
 	// attempt while the set still holds grantable work. Bounded, so an entirely-leased set costs a fixed
@@ -256,10 +269,26 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 				pass.skippedLeased++;
 				continue;
 			}
-			const row = await getScheduleRow(entry.cacheKey, ['nextRenderTime', 'fromSitemap']);
+			const row = await getScheduleRow(entry.cacheKey, ['nextRenderTime', 'fromSitemap', 'effectiveInterval']);
 			const dueAt = numberOf(row?.nextRenderTime);
 			if (!row || !Number.isFinite(dueAt) || dueAt > nowMs) {
 				pass.skippedStale++;
+				continue;
+			}
+			if (leases.missesBeforeGrant(entry.cacheKey) > missLimit) {
+				const carried = Number(row.effectiveInterval);
+				const interval =
+					Number.isFinite(carried) && carried > 0
+						? carried
+						: resolveRenderInterval(CacheKey.urlOf(entry.cacheKey), null);
+				await writeSchedule(entry.cacheKey, {
+					nextRenderTime: nowMs + interval,
+					fromSitemap: !!row.fromSitemap,
+					effectiveInterval: interval,
+				});
+				// Marks the expired lease released, so the count starts again after the push.
+				leases.release(entry.cacheKey);
+				pass.wedged.push(entry.cacheKey);
 				continue;
 			}
 			const expiresAtMs = nowMs + leaseTimeMs;
@@ -314,6 +343,46 @@ export async function* walkScheduleRows({ chunkSize = 1000, onUnreadable } = {})
 }
 
 /**
+ * The rows ABOVE `above`, in DESCENDING primary-key order: how the keeper reaches the rows past an
+ * unreadable one that stopped the ascending walk (`walkUrlRange` throws there). A store that cannot
+ * read forward past a row whose key did not decode can still read down to it from the top. One
+ * condition per query, filtered in code, since two conditions on one key are not accepted everywhere
+ * (see `util/urlWalk.js`).
+ *
+ * The generator's return value is `true` when it reached `above` — a query found nothing more, or a
+ * row at or below it — and `false` when it stopped at a chunk with no readable key. Residual, as in
+ * `walkUrlRange`: a store that ENDS a read early at an unreadable row, without yielding it, reads here
+ * as the end of the range.
+ */
+export async function* walkScheduleRowsDescending({ above, chunkSize = 1000, onUnreadable } = {}) {
+	let below = null;
+	for (;;) {
+		const conditions =
+			below === null
+				? [{ attribute: 'cacheKey', comparator: 'greater_than', value: above }]
+				: [{ attribute: 'cacheKey', comparator: 'less_than', value: below }];
+		let n = 0;
+		let lowest = null;
+		for await (const row of scheduleTable().search(
+			{ conditions, sort: { attribute: 'cacheKey', descending: true }, select: SCHEDULE_SELECT, limit: chunkSize },
+			{ replicateFrom: false }
+		)) {
+			n++;
+			if (typeof row?.cacheKey !== 'string') {
+				onUnreadable?.();
+				continue;
+			}
+			if (row.cacheKey <= above) return true;
+			lowest = row.cacheKey;
+			yield row;
+		}
+		if (n === 0) return true;
+		if (lowest === null) return false;
+		below = lowest;
+	}
+}
+
+/**
  * Subscribe to every write to this table, in listener form (the form that does not build an async
  * iterator per event). `omitCurrent`: the keeper loads the current rows itself, by the walk above.
  *
@@ -331,22 +400,25 @@ export const publishKeeperSet = (rows, { due = 0 } = {}) => readyQueue().publish
 /**
  * THE KEEPER'S SIGNAL TO CLAIMS, in its own buffer.
  *
- *   live         the keeper is live and serving this node's claims
- *   heartbeatAt  refreshed on every publish tick, published or skipped; a stalled keeper goes stale
+ *   live         the keeper is publishing the set claims are served from (while loading too)
+ *   heartbeatAt  refreshed on every publish tick, published or skipped
  *   due          due rows the keeper holds (the tri-state status rule needs it)
+ *   complete     the keeper holds the whole table (its load has finished), so `due: 0` means empty
  */
 const KEEPER_SIGNAL_SAB_KEY = 'prerender/queue-keeper-signal';
 const KS_LIVE = 0;
 const KS_HEARTBEAT = 1; // seconds relative to READY_EPOCH_SEC
 const KS_DUE = 2;
+const KS_COMPLETE = 3;
 const KS_INT32 = 8;
 let liveKeeperSignal = null;
 const keeperSignalView = () => (liveKeeperSignal ??= new Int32Array(getSab(KEEPER_SIGNAL_SAB_KEY, KS_INT32 * 4)));
 const clampInt32 = (n) => Math.max(0, Math.min(2_147_483_647, n | 0));
 
-export const setKeeperSignal = ({ due = 0, nowMs = Date.now() } = {}) => {
+export const setKeeperSignal = ({ due = 0, complete = true, nowMs = Date.now() } = {}) => {
 	const view = keeperSignalView();
 	Atomics.store(view, KS_DUE, clampInt32(due));
+	Atomics.store(view, KS_COMPLETE, complete ? 1 : 0);
 	Atomics.store(view, KS_HEARTBEAT, Math.round(nowMs / 1000) - READY_EPOCH_SEC);
 	Atomics.store(view, KS_LIVE, 1);
 };
@@ -355,11 +427,11 @@ export const setKeeperSignal = ({ due = 0, nowMs = Date.now() } = {}) => {
 export const clearKeeperSignal = () => Atomics.store(keeperSignalView(), KS_LIVE, 0);
 
 /**
- * How long the claim path keeps serving a keeper it has not heard from: ten publish intervals, never
- * under 30 seconds. Generous on purpose — every entry is checked against its durable row before it is
- * granted, so a set a few seconds stale is still safe to serve, while a keeper cut off for a busy
- * worker 0 would stop every claim on the node. It is the backstop for a keeper that has stopped, not a
- * freshness bound; a keeper that stops cleanly or restarts withdraws its set at once.
+ * When a keeper's heartbeat counts as stale: ten publish intervals, never under 30 seconds. REPORTED,
+ * NOT ENFORCED. A stale keeper's last set is still served, because every entry is checked against its
+ * durable row before it is granted — so a stalled worker 0 degrades to "serve the last set until it
+ * drains" (5,000 entries is many minutes of claims) instead of stopping every claim on the node. A
+ * keeper that stops or restarts withdraws its set itself.
  */
 const keeperFreshMs = () => Math.max(30_000, 10 * Math.max(0, Number(config.queue.keeper.publishInterval) || 0));
 
@@ -371,8 +443,9 @@ export const readKeeperSignal = (nowMs = Date.now()) => {
 	const live = Atomics.load(view, KS_LIVE) === 1;
 	return {
 		live,
-		// serving claims: live and heard from recently
-		serving: live && ageMs !== null && ageMs <= keeperFreshMs(),
+		serving: live,
+		stale: live && (ageMs === null || ageMs > keeperFreshMs()),
+		complete: Atomics.load(view, KS_COMPLETE) === 1,
 		heartbeatAt,
 		ageMs,
 		due: Atomics.load(view, KS_DUE),
@@ -389,7 +462,8 @@ export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
 
 /**
  * `empty`, `queued` or `unready`, from the keeper's signal. `unready` while the keeper is not serving
- * (see `QueueState`): nothing can be granted, and the count is unknown.
+ * (see `QueueState`), and while it is still loading and has found nothing due yet: the count is not
+ * known to be zero.
  *
  * The due count includes rows in flight (a row stays due until its result reschedules it), which is
  * the tri-state rule: "granted zero but there ARE due rows" must report `queued`, never `empty`.
@@ -397,7 +471,8 @@ export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
 export const deriveQueueStatus = (nowMs = Date.now()) => {
 	const keeper = readKeeperSignal(nowMs);
 	if (!keeper.serving) return 'unready';
-	return keeper.due > 0 ? 'queued' : 'empty';
+	if (keeper.due > 0) return 'queued';
+	return keeper.complete ? 'empty' : 'unready';
 };
 
 /**

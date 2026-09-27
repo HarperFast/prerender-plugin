@@ -38,6 +38,8 @@ let subscribeDelay = null;
 let onPointRead = null;
 /** When set, the walk's one-row forward probe finds a row whose key did not decode. */
 let poisonProbe = false;
+/** ...and with this, so does every read from the top down: the rows past it cannot be reached. */
+let poisonTail = false;
 
 before(async () => {
 	globalThis.Resource = class {
@@ -86,19 +88,31 @@ before(async () => {
 					for (const row of rows) yield { ...row };
 				})();
 			}
-			// the keyset walk over cacheKey that walkUrlRange performs
+			// the keyset walks over cacheKey: walkUrlRange's ascending one, and the descending tail walk
 			if (poisonProbe && query.limit === 1 && !query.select) {
 				return (async function* () {
 					yield {}; // an unreadable row past the cursor
 				})();
 			}
+			if (poisonTail && query.sort?.descending) {
+				return (async function* () {
+					for (let i = 0; i < (query.limit ?? 1); i++) yield {}; // nothing readable from the top either
+				})();
+			}
+			const descending = !!query.sort?.descending;
 			const keys = [...table.keys()].sort();
-			const from = cond?.value ?? '';
-			const inclusive = cond?.comparator !== 'greater_than';
-			const picked = keys.filter((k) => (inclusive ? k >= from : k > from)).slice(0, query.limit ?? Infinity);
+			if (descending) keys.reverse();
+			const value = cond?.value ?? '';
+			const test = {
+				greater_than: (k) => k > value,
+				greater_than_equal: (k) => k >= value,
+				less_than: (k) => k < value,
+			}[cond?.comparator ?? 'greater_than_equal'];
+			const picked = keys.filter(test).slice(0, query.limit ?? Infinity);
 			const rows = picked.map((k) => ({ ...table.get(k) }));
-			onKeysetSearch?.();
+			const hold = onKeysetSearch?.();
 			return (async function* () {
+				if (hold) await hold;
 				for (const row of rows) yield row;
 			})();
 		},
@@ -205,12 +219,13 @@ beforeEach(() => {
 	subscribeDelay = null;
 	onPointRead = null;
 	poisonProbe = false;
+	poisonTail = false;
 	listeners = new Set();
 	table = new Map();
 });
 
 const started = async (opts = {}) => {
-	const s = service.createKeeperService({ log: null, ...opts });
+	const s = service.createKeeperService({ log: null, countPeers: async () => 1, ...opts });
 	await s.start();
 	return s;
 };
@@ -276,10 +291,22 @@ test('only the LAST event per row during the load is applied, and a whole-table 
 	s.stop();
 });
 
-test('a load that cannot get past an unreadable row goes live on what it read, not exact', async () => {
+test('an unreadable row stops the ascending walk; the rest is read from the top down', async () => {
 	const now = Date.now();
 	seed([row(item(1), now - HOUR), row(item(2), now - HOUR)]);
 	poisonProbe = true;
+	const s = await started();
+	assert.equal(s.phase, 'live');
+	assert.equal(s.keeper.size, 2);
+	assert.equal(s.stats.partialLoad, null, 'the tail walk reached the stopping point: nothing is missing');
+	s.stop();
+});
+
+test('if the tail cannot be read either, it goes live on what it read, not exact', async () => {
+	const now = Date.now();
+	seed([row(item(1), now - HOUR), row(item(2), now - HOUR)]);
+	poisonProbe = true;
+	poisonTail = true;
 	const s = await started();
 	assert.equal(s.phase, 'live', 'a partial queue, never none: there is no other path to the queue');
 	assert.equal(s.keeper.size, 2);
@@ -287,6 +314,27 @@ test('a load that cannot get past an unreadable row goes live on what it read, n
 	s.writeState();
 	assert.equal((await PrerenderAdmin.queueState().json()).trust.exact, false);
 	assert.equal((await funnel.claimSchedules({ grantLimit: 5 })).jobs.length, 2);
+	s.stop();
+});
+
+test('claims are served while the table is still loading', async () => {
+	const now = Date.now();
+	seed(Array.from({ length: 3 }, (_, i) => row(item(i), now - HOUR)));
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	let calls = 0;
+	onKeysetSearch = () => {
+		if (++calls === 2) return gate; // hold the walk after its first chunk
+	};
+	const s = service.createKeeperService({ log: null, countPeers: async () => 1 });
+	const loading = s.start();
+	await settle();
+	await s.publish();
+	assert.equal(s.phase, 'loading');
+	assert.ok(funnel.readKeeperSignal().serving, 'serving from the first chunk');
+	release();
+	await loading;
+	assert.equal(s.phase, 'live');
 	s.stop();
 });
 
@@ -340,18 +388,26 @@ test('a node list that changes during the load loads again, under the new list',
 	server.nodes = CLUSTER;
 });
 
-test('a change of cluster membership after going live rebuilds the keeper', async () => {
+test('a change of cluster membership resyncs in memory while serving, and a walk adds rows gained', async () => {
 	const now = Date.now();
 	seed(Array.from({ length: 40 }, (_, i) => row(item(i), now - HOUR)));
 	const s = await started();
+	const loadedAt = s.stats.loadedAt;
 	assert.equal(s.keeper.size, 40);
 	server.nodes = [...CLUSTER, { name: 'node-c' }];
 	await s.publish();
-	await settle();
+	for (let i = 0; i < 5 && s.stats.lastResync === null; i++) await settle();
 	assert.equal(s.phase, 'live');
+	assert.equal(s.stats.loadedAt, loadedAt, 'never reloaded');
 	assert.ok(s.keeper.size < 40, 'the rows node-c now owns were dropped');
-	s.stop();
+	assert.ok(s.stats.lastResync.dropped > 0);
+	assert.ok(funnel.readKeeperSignal().serving, 'serving throughout');
+	// ...and back: the rows it owns again are found by the walk
 	server.nodes = CLUSTER;
+	await s.publish();
+	for (let i = 0; i < 5 && s.keeper.size < 40; i++) await settle();
+	assert.equal(s.keeper.size, 40, 'the walk added the rows this node owns again');
+	s.stop();
 });
 
 // ---- lifecycle -------------------------------------------------------------------------------------
@@ -372,19 +428,17 @@ test('a stop that lands while the subscribe is in flight leaves no subscription 
 	assert.equal(s.phase, 'stopped');
 });
 
-test('a rebuild that lands while the subscribe is in flight leaves exactly one subscription', async () => {
+test('a resync reopens a closed subscription and goes on serving throughout', async () => {
 	seed([row(item(1), Date.now() - HOUR)]);
-	let release;
-	subscribeDelay = new Promise((resolve) => (release = resolve));
-	const s = service.createKeeperService({ log: null });
-	const first = s.start();
-	await settle();
-	const second = s.rebuild('test');
-	release();
-	await Promise.all([first, second]);
-	await settle();
-	assert.equal(listeners.size, 1);
+	const s = await started();
+	const [record] = listeners;
+	record.closed = true;
+	const gen = funnel.readyQueue().state().generation;
+	await s.resync('test', { resubscribe: true, walk: true });
+	assert.equal(listeners.size, 1, 'exactly one subscription');
 	assert.equal(s.phase, 'live');
+	assert.ok(funnel.readyQueue().state().count > 0, 'never withdrawn');
+	assert.ok(funnel.readyQueue().state().generation >= gen);
 	s.stop();
 	assert.equal(listeners.size, 0);
 });
@@ -489,9 +543,9 @@ test('a key published in two generations is granted once, however the claims int
 	s.stop();
 });
 
-test('a keeper that is not live, or has gone quiet, grants nothing and reports unready', async () => {
+test('before its first publish nothing is granted; a keeper gone quiet is still served from', async () => {
 	const now = Date.now();
-	seed([row(item(1), now - HOUR)]);
+	seed([row(item(1), now - HOUR), row(item(2), now - HOUR)]);
 	const before = await funnel.claimSchedules({ grantLimit: 5 });
 	assert.equal(before.jobs.length, 0, 'no keeper yet');
 	assert.equal(before.keeperServed, false);
@@ -500,16 +554,16 @@ test('a keeper that is not live, or has gone quiet, grants nothing and reports u
 	const s = await started();
 	const realNow = Date.now;
 	try {
-		Date.now = () => realNow() + 5 * 60_000; // no heartbeat for five minutes
-		const stale = await funnel.claimSchedules({ grantLimit: 5 });
-		assert.equal(stale.jobs.length, 0, 'stale: nothing granted');
-		assert.equal(stale.keeperServed, false);
-		assert.equal(funnel.deriveQueueStatus(), 'unready');
+		Date.now = () => realNow() + 5 * 60_000; // no heartbeat for five minutes: worker 0 stalled
+		assert.equal(funnel.readKeeperSignal().stale, true, 'reported');
+		const stale = await funnel.claimSchedules({ grantLimit: 1 });
+		assert.equal(stale.jobs.length, 1, 'its last set is still granted from, each entry checked against its row');
 	} finally {
 		Date.now = realNow;
 	}
-	assert.equal(indexSearches, 0);
 	s.stop();
+	assert.equal((await funnel.claimSchedules({ grantLimit: 5 })).jobs.length, 0, 'a stop withdraws the set');
+	assert.equal(indexSearches, 0);
 });
 
 test('the keeper announces its own transitions: queued when it goes live, unready when it stops', async () => {
@@ -522,6 +576,31 @@ test('the keeper announces its own transitions: queued when it goes live, unread
 	s.stop();
 	await settle();
 	assert.equal(QueueState.status, 'unready');
+});
+
+test('a row whose leases keep expiring with no result is filed forward, not granted forever', async () => {
+	const realNow = Date.now;
+	let clock = realNow();
+	Date.now = () => clock;
+	try {
+		seed([row(item(1), clock - HOUR)]);
+		const s = await started({ now: () => clock });
+		const limit = config.render.failureRetry.fastRetries + 2;
+		for (let i = 0; i < limit; i++) {
+			await s.publish();
+			const pass = await funnel.claimSchedules({ grantLimit: 1 });
+			assert.equal(pass.jobs.length, 1, `lease ${i + 1} granted`);
+			clock += config.queue.jobLeaseTime + 1_000; // expires with no result: a renderer crash
+		}
+		await s.publish();
+		const pass = await funnel.claimSchedules({ grantLimit: 1 });
+		assert.equal(pass.jobs.length, 0, 'not granted again');
+		assert.deepEqual(pass.wedged, [item(1)]);
+		assert.ok(Number(table.get(item(1)).nextRenderTime) > clock, 'filed forward');
+		s.stop();
+	} finally {
+		Date.now = realNow;
+	}
 });
 
 test('a publish still in flight does not stop the heartbeat', async () => {
@@ -560,8 +639,10 @@ test('a publish nothing changed still refreshes the heartbeat', async () => {
 
 test('the head of each publish is checked against the table and repaired', async () => {
 	const now = Date.now();
+	let clock = now;
 	seed([row(item(1), now - HOUR), row(item(2), now - 2 * HOUR)]);
-	const s = await started();
+	const s = await started({ now: () => clock });
+	clock += 61_000; // each key is re-checked at most once a minute
 	// The table moved item(2) to the future; the event never came.
 	table.set(item(2), row(item(2), now + 48 * HOUR));
 	emit('put', item(3), row(item(3), now - 3 * HOUR)); // something changes, so the next publish runs
@@ -594,20 +675,37 @@ test('the verification walk repairs a missing row, a mismatched one and a delete
 	s.stop();
 });
 
-test('a repair never reverts a newer event that lands during its read', async () => {
+test('the verification walk never applies a row older than an event that arrived during it', async () => {
 	const now = Date.now();
 	seed([row(item(1), now - HOUR)]);
 	const s = await started();
 	s.keeper.apply(item(1), null); // looks missing to the walk
-	onPointRead = (id) => {
-		if (id !== item(1)) return;
-		onPointRead = null;
-		// While the repair reads the (still due) row, a reschedule commits and its event arrives.
+	onKeysetSearch = () => {
+		onKeysetSearch = null;
+		// The chunk holding the (still due) row has been read; a reschedule commits and its event arrives
+		// before the walk applies that chunk.
 		table.set(item(1), row(item(1), now + 48 * HOUR));
 		emit('put', item(1), table.get(item(1)));
 	};
 	await s.verify();
 	assert.equal(s.keeper.dueMinuteOf(item(1)), Math.floor((now + 48 * HOUR) / MINUTE), 'the event won');
+	s.stop();
+});
+
+test('a point-read repair never reverts a newer event that lands during its read', async () => {
+	const now = Date.now();
+	seed([row(item(1), now - HOUR)]);
+	const s = await started();
+	s.keeper.apply(item(5), row(item(5), now - HOUR)); // held, but not in the table: a phantom to the walk
+	onPointRead = (id) => {
+		if (id !== item(5)) return;
+		onPointRead = null;
+		// While the repair reads the (absent) row, the row is written and its event arrives.
+		table.set(item(5), row(item(5), now + 48 * HOUR));
+		emit('put', item(5), table.get(item(5)));
+	};
+	await s.verify();
+	assert.equal(s.keeper.dueMinuteOf(item(5)), Math.floor((now + 48 * HOUR) / MINUTE), 'the event won');
 	s.stop();
 });
 
@@ -673,7 +771,7 @@ test('GET queue-state answers from the keeper, and 503 whenever it cannot vouch 
 
 // ---- live config -----------------------------------------------------------------------------------
 
-test('live config: a route change rebuilds the keeper, an interval change re-arms it', async () => {
+test('live config: a route change reclassifies in memory, without reloading or withdrawing', async () => {
 	const now = Date.now();
 	seed([row(item(1), now - HOUR), row(HOME, now - HOUR)]);
 	service.startQueueKeeper();
@@ -681,19 +779,20 @@ test('live config: a route change rebuilds the keeper, an interval change re-arm
 	const s = service.keeperService();
 	assert.equal(s.phase, 'live');
 	const loadedAt = s.stats.loadedAt;
+	assert.equal(s.keeper.describe(HOME).cadenceMs, HOUR);
 
 	applyOptions({ queue: { keeper: { publishInterval: 2_000 } } });
 	assert.equal(s.stats.loadedAt, loadedAt, 'an interval change does not reload');
 
-	await new Promise((resolve) => setTimeout(resolve, 5));
 	applyOptions({
 		ingress: {
 			mode: 'forwarded',
 			routes: [{ match: 'exact', path: '/', queryParams: [], renderInterval: 2 * HOUR }],
 		},
 	});
-	await settle();
-	assert.equal(s.phase, 'live');
-	assert.ok(s.stats.loadedAt > loadedAt, 'reloaded');
+	for (let i = 0; i < 5 && s.keeper.describe(HOME)?.cadenceMs !== 2 * HOUR; i++) await settle();
+	assert.equal(s.keeper.describe(HOME).cadenceMs, 2 * HOUR, 'reclassified under the new route');
+	assert.equal(s.stats.loadedAt, loadedAt, 'never reloaded');
+	assert.ok(funnel.readKeeperSignal().serving);
 	s.stop();
 });
