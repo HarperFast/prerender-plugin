@@ -27,8 +27,8 @@ export function backoffWait(interval, strikes, fromSitemap) {
 	const penalty = fromSitemap || escalations === 0 ? 1 : nonSitemapPenalty;
 	const capped = Math.min(interval * backoffFactor ** escalations * penalty, maxBackoff);
 
-	// `nextRenderTime` is a `Long @indexed` and the claim floor compares WHOLE MINUTES (`minuteOf`
-	// in util/renderSchedule.js), so a fractional wait — which a float-valued `backoffFactor` or
+	// `nextRenderTime` is a `Long` and the queue keeper buckets WHOLE MINUTES (`minuteOf` in
+	// util/renderSchedule.js), so a fractional wait — which a float-valued `backoffFactor` or
 	// `nonSitemapPenalty` produces, both being `min: 1` with no integer constraint — has no
 	// business reaching the row. Floor to a whole minute so the value is an integer AND aligned
 	// like every other schedule write; flooring (not rounding) also keeps it under `maxBackoff`.

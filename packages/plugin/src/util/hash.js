@@ -25,11 +25,10 @@ export function fnv1a32(str) {
  * one 32-bit word and 4,096 live entries the birthday probability of at least one collision is
  * ~4.7e-4 per fill — a few times a day across a fleet, forever. With 64 bits it is ~1.1e-13,
  * i.e. never. (A collision is safe in both directions — see the phantom-lease note in
- * renderLease.js — but "safe" costs a skipped render pass and a held-back claim floor, and
- * there is no reason to pay it.)
+ * renderLease.js — but "safe" costs a skipped render pass, and there is no reason to pay it.)
  *
- * WHY TWO SALTED fnv1a32 PASSES AND NOT BigInt. This runs on the claim path, once per scanned
- * row. `BigInt` arithmetic is slow, allocates, and — the reason that actually matters here —
+ * WHY TWO SALTED fnv1a32 PASSES AND NOT BigInt. This runs on the claim path, once per taken
+ * entry. `BigInt` arithmetic is slow, allocates, and — the reason that actually matters here —
  * this repo has already been bitten twice by BigInt escaping into numeric guards:
  * `Number.isFinite(BigInt)` is false (see `Target.countedStrikes` and `resolveRenderInterval`,
  * which both coerce BEFORE the finite check because a Harper `Long` column can surface as

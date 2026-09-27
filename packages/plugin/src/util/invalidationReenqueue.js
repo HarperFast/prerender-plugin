@@ -11,21 +11,18 @@
  * 21.5h at 100% utilisation, against the 48h those pages wait anyway, and measured utilisation is
  * already 98% with a 3.05h standing backlog. A bulk rewrite also costs 61.8MB of audit per node
  * (162 B/row, which pacing provably does not reduce), and claim is strictly due-time ascending, so
- * 1.53M corpses sit in front of the 1h and 12h routes. Against a claim floor it fails SILENTLY:
- * measured, a bulk lowering under a stale floor returned 0 rows in 23ms — the entire invalidation
- * invisible to claim. Crawl demand is the only selector that is both free and correctly ordered:
+ * 1.53M corpses sit in front of the 1h and 12h routes. Crawl demand is the only selector that is both free and correctly ordered:
  * ~4,000 bot requests/day against 1.6M keys, i.e. crawlers ask for ~0.25% of the corpus, and those
  * are exactly the pages whose staleness is visible to anyone.
  *
  * ── OWNER-NODE ONLY, AND WHY THAT IS NOT A LIMITATION WORTH ENGINEERING AWAY ────────────────────
  *
- * A due-time write is residency-routed and reaches the owner from any node, but the CLAIM FLOOR it
- * has to move is a node-local shared buffer (`SharedBuffer` is `replicate: false`) and `claim`
- * reads the schedule with `replicateFrom: false`. So an accelerating write from a non-owner lowers
- * ITS OWN floor — a no-op — and files a row beneath the owner's. That is the measured
- * "0 rows returned" shape. Hence guard 1: only the owner acts, which also makes the schedule read
- * node-authoritative. Coverage is ~25% of invalidated requests on a four-node cluster (HRW
- * arithmetic, not a measurement — `invalidation_reenqueue{outcome='not-owner'}` against the total
+ * A due-time write is residency-routed and reaches the owner from any node, but the guards that
+ * decide whether to write — the live lease, and the "never raise a due time" read — are only correct
+ * on the owner (see util/peerHeal.js). Hence guard 1: only the owner acts, which also makes the
+ * schedule read node-authoritative. (Before v0.93.0 there was a second reason: a non-owner's write
+ * landed beneath the owner's claim floor and was never claimed.) Coverage is ~25% of invalidated
+ * requests on a four-node cluster (HRW arithmetic, not a measurement — `invalidation_reenqueue{outcome='not-owner'}` against the total
  * is what finally measures it), and crawlers revisit, so the other 75% heal on a later crawl that
  * lands on the owner.
  *
@@ -95,7 +92,7 @@
  * ── THE RATE LIMIT ─────────────────────────────────────────────────────────────────────────────
  *
  * Per NODE, shared across workers, in one minute-bucketed counter in a named shared buffer — the
- * same primitive the claim floor and the queue-status flag use (`util/coordination.js#getSab`).
+ * same primitive the lease table and the queue-status flag use (`util/coordination.js#getSab`).
  * It bounds requests, and one request writes at most one row per schedule row THE URL HAS — its URL
  * row, plus any not-yet-converted per-device row and a one-device row for a served device that is
  * merely `supported` — so the write ceiling is `maxPerMinute ×` those rows (10/min/node once the
@@ -209,16 +206,17 @@ const reserveSlot = () => {
  * The jitter window actually used, clamped up to `queue.jobLeaseTime`.
  *
  * WHAT THE CLAMP IS FOR IS SPREAD, NOT LEASES. A narrow window piles this node's accelerated rows
- * onto a handful of minutes, and a pile lands exactly where the claim scan seeks: measured, that takes
- * the claim scan from 0.36ms to 11.59ms (32x), and the scar clears only on the store's next
- * compaction. `spreadWindow: 0` would collapse them onto ONE minute, which is why there is
- * deliberately no way to ask for "due now" here. `jobLeaseTime` is the floor only because the schema
+ * onto a handful of minutes. Before v0.93.0 that pile landed where the claim scan sought the index
+ * (measured 0.36ms to 11.59ms, 32x, until the next compaction); with no index that cost is gone, and
+ * the clamp stays so accelerated rows still enter the queue spread over a window rather than as one
+ * block. `spreadWindow: 0` would collapse them onto ONE minute, which is why there is deliberately no
+ * way to ask for "due now" here. `jobLeaseTime` is the floor only because the schema
  * already enforces `min: 2 * MINUTE` on it — i.e. it is the smallest spread this system already
  * trusts, not a coupling between the two quantities.
  *
  * IT IS NOT A LEASE GUARD, and it was documented as one in three places. That story — a row re-armed
- * sooner than `jobLeaseTime` comes due while the render it is chasing still holds its lease and pins
- * the claim floor for the rest of it — cannot be delivered by a window WIDTH: `dueAt` is uniform over
+ * sooner than `jobLeaseTime` comes due while the render it is chasing still holds its lease — cannot
+ * be delivered by a window WIDTH: `dueAt` is uniform over
  * `[now, now + window)`, so even at the defaults (15min window, 10min lease) two thirds of accelerated
  * keys are re-armed sooner than a lease. The hazard is closed exactly, and elsewhere, by the `leased`
  * guard: it refuses when ANY device key of the URL holds a live lease, read out of this node's own

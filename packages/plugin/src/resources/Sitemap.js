@@ -828,9 +828,8 @@ async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) 
 			);
 
 			if (action === DepartureAction.RENDER) {
-				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass. Rows are
-				// residency-routed, and a minute more than `queue.claimFloor.guard` old lands below the
-				// owner's floor and is never claimed again. This is the Target.revalidate lesson.
+				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass (the
+				// Target.revalidate lesson): a stale minute ranks the row as if it had waited that long.
 				await writeSchedule(url, {
 					nextRenderTime: currentMinuteMs(),
 					// Derived, never a literal. For a departure `decideDeparture` has already proved this

@@ -12,9 +12,8 @@ const {
 } = databases;
 
 // `RenderSchedule` is deliberately not destructured here: every write goes through
-// `util/renderSchedule.js`, which lowers the claim floor with the write. A raw put from this file
-// would file a row behind the floor and end that URL's rendering silently — see that module's
-// comment, and `test/queueFunnel.test.js`, which fails the build on one.
+// `util/renderSchedule.js`, which owns the write contract — see that module's comment, and
+// `test/queueFunnel.test.js`, which fails the build on a raw put.
 
 // The raw table class. Suppression writes go through this on purpose: `Target.put` (the
 // override below) is a REACTIVATION — it clears suppression fields and fans out fresh
@@ -118,9 +117,7 @@ export class Target extends TargetTable {
 		const fromSitemap = !!data.sitemapUrl;
 		// ONE row, keyed by the URL: the claim renders every configured device off it. The explicit
 		// `nextRenderTime` branch is validated no further than `> 0`, and it is the funnel for
-		// redirect adoption, sitemap `revalidate: true`, and any external `PUT /render_targets` —
-		// i.e. exactly the "due now" and "due in the past" writes a claim floor would otherwise
-		// strand. That is why it must not be a bare table put.
+		// redirect adoption, sitemap `revalidate: true`, and any external `PUT /render_targets`.
 		await writeSchedule(url, {
 			nextRenderTime:
 				Number.isFinite(nextRenderTime) && nextRenderTime > 0 ? nextRenderTime : getInitialRenderTime(url, interval),
@@ -356,12 +353,8 @@ export class Target extends TargetTable {
 			apply: async ({ url, sitemapUrl }) => {
 				// THE CURRENT MINUTE, PER URL — never captured once for the whole sweep. Phase 2 writes
 				// up to `scan.collectCap` × devices rows with a `PrerenderedPage.get` per key, which at
-				// scale takes tens of minutes. Rows are residency-routed, so ~75% land on nodes whose
-				// claim floor this process cannot lower and which hold it at
-				// `nowMinute − queue.claimFloor.guard`: every row filed with a minute more than the guard
-				// band old lands BELOW the owner's floor and is never claimed again — silently, from a
-				// fully funnel-routed in-plugin write, and permanently where `resetInterval: 0`.
-				// `Sitemap.js` already computes it per entry for the same reason.
+				// scale takes tens of minutes, and a minute captured at the start would file the last rows
+				// tens of minutes late — ranked as if they had been waiting that long.
 				const nextRenderTime = currentMinuteMs();
 				await Promise.all(
 					cacheKeysOf(url).map(async (cacheKey) => {

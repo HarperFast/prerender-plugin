@@ -36,8 +36,7 @@
  *   GET  /prerender_admin/crawl-breadth ?days (default 7, max 31)   super_user
  *   POST /prerender_admin/explain    { url, deviceType }            super_user
  *   POST /prerender_admin/schedule   { cacheKey } -> local row      super_user
- *   POST /prerender_admin/queue      { scope, paused } |            super_user
- *                                    { action: 'reset-claim-floor' }
+ *   POST /prerender_admin/queue      { scope, paused }              super_user
  *   POST /prerender_admin/revalidate { url, deviceType }            super_user
  *   POST /prerender_admin/reconcile  start a repair sweep           super_user
  *   POST /prerender_admin/sweep-orphans { dryRun?, maxDeletes? }    super_user
@@ -48,17 +47,16 @@
  *   POST /prerender_admin/discovery-purge { urlPrefix, dryRun?,    super_user
  *                                    ratePerSecond?, force?, skipVisited? } |
  *                                    { action: 'stop' }
- *   POST /prerender_admin/backlog    { cap? } recompute the snapshot    super_user
+ *   POST /prerender_admin/backlog    recompute the snapshot          super_user
  *   POST /prerender_admin/sitemap    { url, offset, limit } detail  super_user
  *   POST /prerender_admin/sitemap-refresh { url? }                  super_user
  *   POST /prerender_admin/config-override { set?, clear?, dryRun? } super_user
  *
  * QUERY-COST RULES for every route here (this console shares the server with bot traffic):
- *   - Nothing walks `RenderSchedule.nextRenderTime` on page load — `claim` reads that index
- *     from every worker every few seconds. The backlog histogram is a cached snapshot
- *     (util/backlogSnapshot.js); recomputing it is an explicit POST. The claim-floor and
- *     lease numbers are the exception, and only because they are atomic loads on a
- *     node-local shared buffer: no database work at all.
+ *   - Nothing walks `RenderSchedule` on page load. The queue counts come from the queue keeper's
+ *     shared-memory document; the backlog snapshot's table counts are cached
+ *     (util/backlogSnapshot.js), and recomputing them is an explicit POST. The lease numbers are
+ *     atomic loads on a node-local shared buffer: no database work at all.
  *   - `PrerenderedPage.content` is never selected in a list; a row can be megabytes. The one
  *     route that returns it (`page-content`) streams a single row as text/plain.
  *   - `Sitemap.entries` is never selected in a list query; one row can hold tens of
@@ -118,7 +116,8 @@ import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '..
 import { getPageOrphanSweepState, startPageOrphanSweep, stopPageOrphanSweep } from '../util/pageOrphanSweep.js';
 import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
 import { changeProbeStatus, isPassRunningOnNode, runProbeCanaryOnce, runProbeSweepOnce } from '../util/changeProbe.js';
-import { getBacklogSnapshotState, resolveScanCap, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
+import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
+import { QUEUE_STATE_SCHEMA, readQueueStateDocument } from '../util/queueKeeperService.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
 import {
 	MAX_WRITE_ENTRIES,
@@ -127,7 +126,7 @@ import {
 	validateOverride,
 	writeOverrides,
 } from '../util/configOverride.js';
-import { floorState, leaseInfo, minuteOf, writeSchedule } from '../util/renderSchedule.js';
+import { inFlightLeases, leaseInfo, leaseState, writeSchedule } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
 import { hostInfo } from '../util/hostInfo.js';
@@ -179,26 +178,6 @@ async function readWithTimeout(label, timedOut, read) {
 }
 
 /**
- * This node's claim-floor state, for the two routes that answer about a key THIS node owns.
- *
- * Never render a row's `belowClaimFloor` against the floor of a node that does not own the row:
- * the floor is node-local state about this node's slice of a residency-pinned table, so the
- * querying node's copy is meaningless for somebody else's key. `explain` hedges with the existing
- * `scheduleAuthoritative` machinery exactly as it already does for the row itself, and consumes
- * the owner's copy verbatim when it proxies.
- */
-const localClaimFloor = (now) => {
-	const state = floorState(now);
-	return {
-		enabled: state.enabled,
-		floorMinute: state.floorMinute,
-		rawFloorMinute: state.rawFloorMinute,
-		guardMinutes: state.guardMinutes,
-		floorMs: state.floorMinute > 0 ? state.floorMinute * 60_000 : null,
-	};
-};
-
-/**
  * This node's schedule row for a URL — or for a cacheKey, which names its URL. The URL row first;
  * failing that, the per-device row under the cacheKey (the requested one, or the first configured
  * device's when only a URL was given), which exists for one cycle after the v0.66.0 upgrade and for a
@@ -218,18 +197,16 @@ const readScheduleRowLocal = async (urlOrCacheKey) => {
 };
 
 /**
- * One schedule row as the console shows it, including the two node-local questions only the
- * owner can answer: is this key currently leased to a renderer, and is its due time BELOW the
- * claim floor (i.e. filed where no claim will ever look again).
+ * One schedule row as the console shows it, including the node-local question only the owner can
+ * answer: is this key currently leased to a renderer.
  */
 const describeScheduleRow = (row, now) => {
 	// `numberOf`, not `Number`: `Number(null)` is 0, so a row with no due time would be shown as due
-	// since 1970 — overdue AND below the claim floor — which is a false accusation against a specific
-	// URL in the one view an operator uses to decide whether to repair or delete it. A row with no due
-	// time reports `null` for every derived field instead of an answer it does not have.
+	// since 1970, which is a false accusation against a specific URL in the one view an operator uses to
+	// decide whether to repair or delete it. A row with no due time reports `null` for every derived
+	// field instead of an answer it does not have.
 	const at = numberOf(row.nextRenderTime);
 	const due = Number.isFinite(at);
-	const floor = localClaimFloor(now);
 	const lease = leaseInfo(row.cacheKey);
 	return {
 		...row,
@@ -246,8 +223,6 @@ const describeScheduleRow = (row, now) => {
 		overdue: due && at <= now,
 		leased: !!lease,
 		leaseExpiresAt: lease?.leaseExpiresAtMs ?? null,
-		// The floor comparator is inclusive, so a row AT the floor is claimable.
-		belowClaimFloor: due && floor.floorMinute > 0 && minuteOf(at) < floor.floorMinute,
 	};
 };
 
@@ -469,6 +444,8 @@ export class PrerenderAdmin extends Resource {
 		switch (route) {
 			case 'overview':
 				return json(await PrerenderAdmin.overview());
+			case 'queue-state':
+				return PrerenderAdmin.queueState();
 			case 'config':
 				return PrerenderAdmin.configView();
 			case 'invalidations':
@@ -1124,8 +1101,7 @@ export class PrerenderAdmin extends Resource {
 		}
 
 		const nextRenderTime = currentMinuteMs();
-		// The write is residency-routed, so this reaches the owning node from any node — and it
-		// goes through the funnel, which lowers this node's claim floor to cover it.
+		// The write is residency-routed, so this reaches the owning node from any node.
 		await writeSchedule(canonicalUrl, {
 			nextRenderTime,
 			fromSitemap: !!target.sitemapUrl,
@@ -1135,11 +1111,8 @@ export class PrerenderAdmin extends Resource {
 		});
 
 		// `claim` reads a node-local flag, so waking consumers only helps on the node that owns
-		// the row. When another node owns it, what makes the row claimable there is the CLAIM
-		// FLOOR'S GUARD BAND, not a status tick: every node holds its floor at least
-		// `queue.claimFloor.guard` behind the current minute, and this row is due at the current
-		// minute, so it lands above the owner's floor by construction. The owner then picks it up
-		// on its next claim — sooner than its status sync, not because of it.
+		// the row. When another node owns it, the owner's queue keeper sees the write by
+		// replication and publishes it within a second; its next claim picks it up.
 		const owner = getResidencyByUrl(canonicalUrl);
 		if (owner === server.hostname) await QueueState.reportStatus('queued');
 
@@ -1347,11 +1320,9 @@ export class PrerenderAdmin extends Resource {
 		const now = Date.now();
 		return json({
 			node: server.hostname,
+			// The lease table is node-local, so THIS leaf — which is only ever asked about keys it owns —
+			// is the only place `leased` can be answered.
 			renderSchedule: row ? describeScheduleRow(row, now) : null,
-			// The lease table and the claim floor are node-local, so THIS leaf — which is only ever
-			// asked about keys it owns — is the only place either question can be answered. A
-			// querying node must never compare a row against its OWN floor.
-			claimFloor: localClaimFloor(now),
 			checkedAt: now,
 		});
 	}
@@ -1402,6 +1373,76 @@ export class PrerenderAdmin extends Resource {
 		return json({ authenticated: false });
 	}
 
+	/**
+	 * GET /prerender_admin/queue-state — THIS node's render queue, from the queue keeper (#215).
+	 *
+	 * No database work: worker 0's last state document (`util/queueKeeperService.js`, recomputed every
+	 * `queue.keeper.stateInterval`) plus two live reads, the lease table and the pause flag. Answers
+	 * 503, with the reason and the live fields it does have, whenever the keeper cannot vouch for its
+	 * numbers (waiting, loading, failed, or its document stale), so a consumer never mistakes "no
+	 * data" for an empty queue. Node-local, like every per-node slice: sum across nodes to get the
+	 * cluster.
+	 *
+	 * `unclaimed` is `due - inFlight`, an ESTIMATE: a lease is on a due row (a row stays due until its
+	 * result reschedules it), but a lease can outlive its row's ownership, and the two are read up to one
+	 * state interval apart.
+	 */
+	static queueState() {
+		const nowMs = Date.now();
+		const doc = readQueueStateDocument();
+		const maxAgeMs = 3 * config.queue.keeper.stateInterval + 5_000;
+		const stateAgeMs = doc ? Math.max(0, nowMs - doc.generatedAt) : null;
+		const phase = doc?.keeper?.phase ?? 'starting';
+		const live = phase === 'live' && !!doc?.queue && stateAgeMs <= maxAgeMs;
+		const inFlight = inFlightLeases();
+		const status = QueueState.status;
+		const q = live ? doc.queue : null;
+		const trust = {
+			source: 'keeper',
+			live,
+			phase,
+			// every count comes from rows held, none from a capped scan; false when the load skipped
+			// unreadable rows or the last verification walk had to repair rows the keeper held wrongly
+			exact: live && doc.keeper.exact === true,
+			stateAt: doc?.generatedAt ?? null,
+			stateAgeMs,
+			maxAgeMs,
+			keeper: doc?.keeper ?? null,
+		};
+		const nowBlock = { inFlight, paused: status === 'paused', status };
+		if (!live) {
+			const reason =
+				phase !== 'live'
+					? `the queue keeper is ${phase}`
+					: `the queue keeper's state is ${Math.round(stateAgeMs / 1000)}s old`;
+			return json(
+				{ schema: QUEUE_STATE_SCHEMA, node: server.hostname, generatedAt: nowMs, error: reason, now: nowBlock, trust },
+				503
+			);
+		}
+		return json({
+			schema: QUEUE_STATE_SCHEMA,
+			node: server.hostname,
+			generatedAt: nowMs,
+			now: {
+				due: q.due,
+				dueSitemap: q.dueSitemap,
+				dueDiscovered: q.dueDiscovered,
+				...nowBlock,
+				unclaimed: Math.max(0, q.due - inFlight),
+			},
+			coming: q.coming,
+			lateness: {
+				...q.lateness,
+				oldestDueAt: q.oldestDueAt,
+				byRoute: q.byRoute,
+				classes: q.classes,
+			},
+			flow: q.flow,
+			trust,
+		});
+	}
+
 	static async overview() {
 		const now = Date.now();
 
@@ -1434,8 +1475,8 @@ export class PrerenderAdmin extends Resource {
 			counts: lastRun?.counts ?? null,
 			countsAsOf: lastRun?.counts ? (lastRun.finishedAt ?? null) : null,
 			// The overdue count and next-24h histogram, from the cached snapshot — NOT computed
-			// here. The scan walks the index `claim` reads from, so it runs on a background
-			// cadence (util/backlogSnapshot.js) and POST /backlog recomputes it on demand. The
+			// here. The snapshot also carries the table counts, which are scans, so it runs on a
+			// background cadence (util/backlogSnapshot.js) and POST /backlog recomputes it on demand. The
 			// snapshot row lives in the node-local coordination database, so any worker sees it.
 			backlog: {
 				enabled: config.management.backlogSnapshotInterval > 0,
@@ -1448,15 +1489,11 @@ export class PrerenderAdmin extends Resource {
 				jobLeaseTime: config.queue.jobLeaseTime,
 				defaultRenderInterval: config.render.defaultInterval,
 			},
-			// LIVE and O(1) — atomic loads on the node-local shared buffer, not part of the aged
-			// snapshot above. `lagMs` is how far behind the current minute the claim scan is
-			// starting, which is the one number that says whether a wedged render is pinning the
-			// queue: it cannot advance past the oldest in-flight lease.
-			claimFloor: (() => {
-				const state = floorState(now);
+			// LIVE — a walk of the node-local lease buffer, not part of the aged snapshot above.
+			leases: (() => {
+				const state = leaseState();
 				return {
 					...state,
-					lagMs: state.floorMinute > 0 ? now - state.floorMinute * 60_000 : null,
 					oldestLeaseAgeMs: state.oldestLeaseExpiresAt
 						? now - (state.oldestLeaseExpiresAt - config.queue.jobLeaseTime)
 						: null,
@@ -1581,10 +1618,6 @@ export class PrerenderAdmin extends Resource {
 		// cross-node `get` would have done. Only attempted when the local read didn't already
 		// find the row (a row present locally is authoritative regardless of residency).
 		let scheduleRow = schedule ? describeScheduleRow(schedule, now) : null;
-		// The claim floor this row is judged against. Local only while this node is the owner —
-		// the floor is node-local state about this node's slice of a residency-pinned table, so
-		// comparing somebody else's key against it would be a confident wrong answer.
-		let claimFloor = scheduleReadIsAuthoritative ? localClaimFloor(now) : null;
 		let scheduleSource = scheduleReadIsAuthoritative ? 'local (owner)' : 'local (not owner)';
 		let peerError = null;
 
@@ -1595,11 +1628,9 @@ export class PrerenderAdmin extends Resource {
 				headers: context?.headers,
 			});
 			if (peer.ok) {
-				// Consumed verbatim: the owner already computed `leased`, `leaseExpiresAt` and
-				// `belowClaimFloor` against ITS lease table and ITS floor, which is the only
-				// authoritative answer to either question.
+				// Consumed verbatim: the owner already computed `leased` and `leaseExpiresAt` against
+				// ITS lease table, which is the only authoritative answer.
 				scheduleRow = peer.row;
-				claimFloor = peer.claimFloor;
 				scheduleSource = `owner ${scheduleOwnedBy}`;
 			} else {
 				peerError = peer.reason;
@@ -1676,24 +1707,12 @@ export class PrerenderAdmin extends Resource {
 				// Why the owner could not be consulted, when it couldn't.
 				peerError,
 			},
-			// The floor the row above is judged against, or null when nobody authoritative answered.
-			// `rows.renderSchedule.belowClaimFloor` is only meaningful when this is present.
-			claimFloor,
 			degraded: timedOutReads.length ? { timedOutReads } : null,
 			checkedAt: now,
 		});
 	}
 
 	static async setQueuePause(data, context) {
-		// The operator escape hatch for a due time written below the claim floor by something
-		// outside the plugin (the operations API, or a PUT to the exported RenderSchedule
-		// endpoint — neither runs any plugin code). Waiting out
-		// `queue.claimFloor.resetInterval` is the automatic recovery; during an incident, this
-		// turns a five-minute wait into an immediate one. Node-scoped, like the floor itself.
-		if (data?.action === 'reset-claim-floor') {
-			return json(await RenderQueue.resetClaimFloor());
-		}
-
 		const scope = data?.scope ?? server.hostname;
 		const paused = data?.paused;
 
@@ -1734,19 +1753,13 @@ export class PrerenderAdmin extends Resource {
 	 * can take a while against a large backlog and nothing is gained holding the request open),
 	 * and a scan already in flight reports itself rather than implying a second one started.
 	 */
-	static async backlog(data) {
+	static async backlog() {
 		const { running, lastRun } = await getBacklogSnapshotState();
-		// An explicit deeper walk for this run only — the scheduled snapshot keeps using
-		// `management.scanCap`. See runBacklogSnapshotOnce: when the configured cap is smaller
-		// than the backlog, `overdue` reports the cap instead of a count and the histogram comes
-		// back empty, and this is how an operator learns the real number without a config
-		// round-trip. Clamped upstream.
-		const cap = data?.cap;
-		const payload = { node: server.hostname, lastRun, cap: resolveScanCap(cap, config.management.scanCap) };
+		const payload = { node: server.hostname, lastRun };
 
 		if (running) return json({ ...payload, started: false, alreadyRunning: true });
 
-		runBacklogSnapshotOnce({ cap }).catch((e) => logger.error(e));
+		runBacklogSnapshotOnce().catch((e) => logger.error(e));
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
 

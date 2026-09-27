@@ -1,16 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createReadyQueue, readyBufferBytes, readyCapacityIn, READY_KEY_BYTES } from '../src/util/readyQueue.js';
-import { createTopK, scoreOf } from '../src/util/renderPriority.js';
+import { scoreOf } from '../src/util/renderPriority.js';
 
 /**
  * The ready set and the scoring policy, against a plain ArrayBuffer with no Harper at all.
  *
  * What is pinned here, and why each one is a bug nothing else would catch:
  *
- *   - A KEY IS NEVER TRUNCATED. A truncated cache key names a DIFFERENT row, so a lease would be
- *     granted on the wrong page and its render stored under the wrong key. Dropping the entry costs
- *     one fallback scan; truncating it corrupts a page.
+ *   - A KEY IS NEVER TRUNCATED, AND ANY LENGTH FITS. Keys are packed end to end, so a long key needs
+ *     no slot of its own size; a generation whose keys outrun the region ends at the last that fit. A
+ *     truncated cache key would name a DIFFERENT row, so a lease would be granted on the wrong page.
  *   - THE CURSOR HANDS EACH INDEX OUT ONCE. It is the entire concurrency story — two workers claiming
  *     concurrently must never receive the same entry, and there is no lock to fall back on.
  *   - ...AND IT CANNOT RUN AWAY. It is an Int32 incremented on every claim including exhausted ones;
@@ -18,8 +18,6 @@ import { createTopK, scoreOf } from '../src/util/renderPriority.js';
  *   - A READER NEVER SEES A HALF-WRITTEN SET. `publish` writes the inactive slot and flips, and the
  *     cursor must reset BEFORE the flip or a claim landing between the two skips the head of a fresh
  *     generation.
- *   - TOP-K IS BOUNDED BY K, NOT BY THE CORPUS. The sweep walks a due set far larger than the set it
- *     fills; retaining more than K would be the unbounded-structure failure this node has hit twice.
  *   - LATENESS, NOT AGE. A 7-day suppression recheck must not outrank a genuinely late page.
  */
 
@@ -90,38 +88,6 @@ test('a row scored at or before its due moment is 0, never negative', () => {
 });
 
 // ---- top-K -------------------------------------------------------------------------------------
-
-test('TOP-K IS BOUNDED BY K while streaming a set far larger than K', () => {
-	const heap = createTopK(5);
-	for (let i = 0; i < 100_000; i++) heap.offer(i, { cacheKey: `k${i}` });
-	assert.equal(heap.size, 5, 'memory is a function of K, not of the corpus');
-	assert.deepEqual(
-		heap.drainDescending().map((r) => r.score),
-		[99999, 99998, 99997, 99996, 99995]
-	);
-});
-
-test('top-K keeps the best regardless of arrival order, and rejects on one comparison', () => {
-	const heap = createTopK(3);
-	for (const s of [5, 1, 9, 3, 7, 2, 8]) assert.equal(typeof heap.offer(s, { cacheKey: `k${s}` }), 'boolean');
-	assert.deepEqual(
-		heap.drainDescending().map((r) => r.score),
-		[9, 8, 7]
-	);
-	assert.equal(heap.offer(0, { cacheKey: 'no' }), false, 'a worse-than-worst candidate is refused');
-	assert.equal(heap.offer(100, { cacheKey: 'yes' }), true);
-});
-
-test('drainDescending is best-first, which is what lets the cursor compare nothing', () => {
-	const heap = createTopK(4);
-	heap.offer(1, { cacheKey: 'a' });
-	heap.offer(4, { cacheKey: 'b' });
-	heap.offer(2, { cacheKey: 'c' });
-	assert.deepEqual(
-		heap.drainDescending().map((r) => r.entry.cacheKey),
-		['b', 'c', 'a']
-	);
-});
 
 // ---- the shared set ---------------------------------------------------------------------------
 
@@ -195,22 +161,32 @@ test('publishing alternates slots, so the set being read is never the set being 
 	assert.equal(q.peek(1)[0].cacheKey, 'gen3|desktop');
 });
 
-test('A KEY IS NEVER TRUNCATED — an oversized one is dropped instead', () => {
+test('A KEY LONGER THAN ITS BUDGET FITS: keys are packed, so only the total is bounded', () => {
 	const q = queueOf(4);
-	const huge = `https://www.kohls.com/${'x'.repeat(READY_KEY_BYTES)}|desktop`;
-	const stored = q.publish([row('fits|desktop', 5), row(huge, 9)]);
-	assert.equal(stored, 1, 'the oversized entry is not stored at all');
-	// A truncated key would name a different row and grant a lease on the wrong page; a dropped one
-	// just falls to the scan.
+	const long = `https://www.example.com/${'x'.repeat(2 * READY_KEY_BYTES)}|desktop`;
+	assert.equal(q.publish([row(long, 9), row('short|desktop', 5)]), 2);
 	assert.deepEqual(
 		q.take(2).map((e) => e.cacheKey),
-		['fits|desktop']
+		[long, 'short|desktop']
+	);
+});
+
+test('A KEY IS NEVER TRUNCATED: a generation whose keys outrun the region ends at the last that fit', () => {
+	// Ending, not skipping: skipping would publish lower-priority rows ahead of the one that did not
+	// fit, and a truncated key names a different row.
+	const q = queueOf(2);
+	const huge = `https://www.example.com/${'x'.repeat(2 * READY_KEY_BYTES)}|desktop`;
+	const stored = q.publish([row('first|desktop', 9), row(huge, 8), row('last|desktop', 7)]);
+	assert.equal(stored, 1);
+	assert.deepEqual(
+		q.take(3).map((e) => e.cacheKey),
+		['first|desktop']
 	);
 });
 
 test('a multi-byte key round-trips by BYTES, not characters', () => {
 	const q = queueOf(4);
-	const key = 'https://www.kohls.com/café-über/日本|mobile';
+	const key = 'https://www.example.com/café-über/日本|mobile';
 	q.publish([row(key, 1)]);
 	assert.equal(q.take(1)[0].cacheKey, key);
 });
@@ -226,8 +202,6 @@ test('publishing more than capacity keeps the head, which is the best of the set
 });
 
 test('a zero-capacity buffer degrades to empty rather than corrupting memory', () => {
-	// The fallback path is what makes this safe: an unusable set means today's scan, not a stalled
-	// queue.
 	const q = createReadyQueue({ buffer: new ArrayBuffer(readyBufferBytes(1)), capacity: 0 });
 	assert.equal(q.capacity, 1, 'capacity is derived from the buffer when the argument is unusable');
 	const tiny = createReadyQueue({ buffer: new ArrayBuffer(32), capacity: 100 });
@@ -243,10 +217,10 @@ test('capacity is clamped to the buffer, never trusted from the argument', () =>
 	assert.ok(q.capacity <= 4);
 });
 
-test('state reports age and what the sweep examined, with no database work', () => {
+test('state reports age and the due count published with it, with no database work', () => {
 	let clock = T0;
 	const q = queueOf(8, () => clock);
-	assert.equal(q.state().sweptAt, null, 'never swept reads as null, not as the epoch');
+	assert.equal(q.state().sweptAt, null, 'never published reads as null, not as the epoch');
 	q.publish([row('a|desktop', 1)], { scannedRows: 200_000 });
 	clock = T0 + 90_000;
 	const state = q.state();

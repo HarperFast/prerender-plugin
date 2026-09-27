@@ -145,9 +145,14 @@ type Target @table(database: "render_service") @export {
 # renders. A device-keyed row also remains the shape of a deliberate one-device render (`renderNow`
 # for a device outside `deviceTypes.default`). Every reader goes through `CacheKey.urlOf` /
 # `CacheKey.deviceOf`; see util/renderSchedule.js.
+#
+# NO SECONDARY INDEX (since v0.93.0). The queue is the queue keeper, in memory on worker 0
+# (util/queueKeeperService.js); this table is its durable side and is read by primary key only — the
+# keeper's load and verification walks, and point reads. `nextRenderTime` was `@indexed` while claims
+# walked it, and every reschedule paid an index delete and insert for it (#215).
 type RenderSchedule @table(database: "render_schedule") @export {
 	cacheKey: String @primaryKey
-	nextRenderTime: Long @indexed
+	nextRenderTime: Long
 	# Denormalized from RenderTarget.sitemapUrl so `claim` doesn't need a per-job
 	# cross-database read just to flag sitemap-sourced jobs. Refreshed on every
 	# reschedule (job result), so it self-corrects when a URL leaves its sitemap.
@@ -159,15 +164,12 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# reason `util/renderPriority.js` scores lateness rather than age — the numerator is how far
 	# past due the row is, the denominator is how often it wants to render. Writers file the
 	# cadence here even when the gap they wrote differs. Denormalized for the same reason
-	# `fromSitemap` is: the ready-set sweep scores every due row on the node by lateness RELATIVE
-	# TO CADENCE, and recovering that per row from RenderTarget would be a cross-database point
-	# read per row over the whole due set — on a residency-pinned table, ~75% of them replication
-	# fetches. NOT @indexed: it is only ever read alongside a row already selected by
-	# `nextRenderTime`, and a second index costs ~13% on every write (bench/queue-index).
+	# `fromSitemap` is: the queue keeper ranks every due row on the node by lateness RELATIVE TO
+	# CADENCE, and recovering that per row from RenderTarget would be a cross-database point read per
+	# row — on a residency-pinned table, ~75% of them replication fetches.
 	#
 	# Absent is legal and self-healing — pre-upgrade rows, and the writers that genuinely have no
-	# cadence in hand (a render-now one-off) — and the sweep falls back to resolving from config,
-	# which is what it did before this field existed. Every row re-renders on its own cadence, so
+	# cadence in hand (a render-now one-off) — and the keeper falls back to resolving from config. Every row re-renders on its own cadence, so
 	# the active corpus fills in within one cycle.
 	effectiveInterval: Long
 	# When a result for this row first found NO Target on the owning node (ms), set only while the

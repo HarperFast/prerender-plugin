@@ -651,22 +651,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 			peerTimeoutMs: option(2500, 'Timeout for the peer-node explainer request.', { unit: 'ms', min: 1 }),
 			scanCap: option(
 				20000,
-				'Ceiling on rows touched by an overview scan (due-count, next-24h histogram, below-floor ' +
-					'detection). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
+				'Ceiling on rows touched by a management scan (the suppressed-target count, the analytics ' +
+					'reads). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
 					'page-load query — so results past this are reported as truncated rather than silently ' +
-					'undercounted. Note the due-count is no longer the headline capacity number: it now includes ' +
-					'every in-flight render, so its healthy floor is the in-flight count rather than zero.',
+					'undercounted. The queue counts are not scans: they come from the queue keeper.',
 				{ min: 1 }
 			),
 			backlogSnapshotInterval: option(
 				15 * MINUTE,
-				'How often the backlog/histogram snapshot recomputes (worker 0 of each node). Since v0.34.0 ' +
-					'this is the ONLY scan that still seeks the absolute minimum of the nextRenderTime index — ' +
-					'`claim` starts from queue.claimFloor instead — and it is kept that way deliberately, because ' +
-					'it is therefore the only reader that can see a row filed BELOW the floor and report it. It ' +
-					'runs on this cadence, never on dashboard page load. Its `overdue` count now includes ' +
-					'in-flight jobs (their rows keep their past due time until the render lands). 0 disables the ' +
-					'timer; the console’s Recompute button still triggers a one-off pass.',
+				'How often the backlog snapshot recomputes (worker 0 of each node): the queue keeper’s counts ' +
+					'and histogram, plus the table counts, which are scans and so never run on dashboard page load. ' +
+					'Its `overdue` count includes in-flight jobs (their rows keep their past due time until the ' +
+					'render lands). 0 disables the timer; the console’s Recompute button still triggers a one-off ' +
+					'pass.',
 				{ unit: 'ms', min: 0 }
 			),
 			snapshotTableCounts: option(
@@ -675,10 +672,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'snapshot. The counts go through Harper’s getRecordCount, which on RocksDB tables past ' +
 					'the sampling budget issues ONE synchronous native full-key iteration — measured 2.47s ' +
 					'on a ~2.2M-key table, during which every request routed to that worker waits ' +
-					'(harper-pro#664). False keeps the snapshot itself (the capped backlog/histogram walk and ' +
-					'the queue_health gauges, which never take that walk) while the console shows the counts ' +
-					'as unavailable — the setting for a deployment that disabled the whole snapshot to dodge ' +
-					'#664 and thereby lost its below-floor detector.',
+					'(harper-pro#664). False keeps the snapshot itself (the queue counts and the queue_health ' +
+					'gauges, which never take that walk) while the console shows the counts as unavailable.',
 				{}
 			),
 			pageSize: option(
@@ -844,8 +839,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'DEMAND-DRIVEN HEAL. When an invalidation is what made a request non-servable, lower that URL’s ' +
 					'due time so the pages bots actually crawl heal first instead of waiting out their cadence in ' +
 					'crawl order. The request itself is the trigger — no timer, no table scan, no cursor — and only ' +
-					'the node that OWNS the key by residency acts, because the claim floor a lowered due time has to ' +
-					'move is a node-local shared buffer that a write from another node cannot reach.\n\n' +
+					'the node that OWNS the key by residency acts, because its guards (the live lease, the ' +
+					'authoritative schedule read) are node-local.\n\n' +
 					'THERE IS DELIBERATELY NO CORPUS-WIDE SWEEP, and there will not be one. At a measured fleet ' +
 					'ceiling of 71,289 renders/hr the 1,530,046-key long-tail corpus floors a full re-render at 21.5h ' +
 					'at 100% utilisation — against the 48h those pages wait anyway, with measured utilisation already ' +
@@ -859,7 +854,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 						false,
 						'Off by default, like `render.reconcile.enabled`: enable it after one rehearsal, not on the ' +
 							'same deploy that introduces it. While off, an invalidation adds NOTHING to the queue — zero ' +
-							'schedule writes, zero audit, zero claim-scan work — and every page heals on its own cadence.'
+							'schedule writes, zero audit — and every page heals on its own cadence.'
 					),
 					spreadWindow: option(
 						15 * MINUTE,
@@ -867,9 +862,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'URL half of the cache key so a page’s device variants land on the SAME minute (see ' +
 							'util/time.js — de-aligned variants show a content change on one device and not the other, ' +
 							'permanently, cycle over cycle).\n\n' +
-							'NEVER "now". Collapsing due times onto one instant piles rows exactly where the claim scan ' +
-							'seeks: measured, that takes the claim scan from 0.36ms to 11.59ms (32x), and the scar clears ' +
-							'only on the next compaction of that store, which needs write pressure.\n\n' +
+							'NEVER "now". Collapsing due times onto one instant piles every accelerated row onto one ' +
+							'minute (before v0.93.0 that pile also slowed the index claim scan 32x).\n\n' +
 							'MUST BE >= `queue.jobLeaseTime`, and a smaller value is reported as a config warning and ' +
 							'then clamped up to it — because a narrow window is a smaller version of the same pile, not ' +
 							'because the two quantities are coupled. `queue.jobLeaseTime` is floored at 2 minutes, which ' +
@@ -888,9 +882,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'THE OWNER DECIDES, this only carries the request. Three of the accelerator\u2019s guards \u2014 the live-lease ' +
 							'check, the authoritative schedule read, and therefore "never raise a due time" \u2014 can only be ' +
 							'evaluated on the owner, so writing from the receiving node instead would trade coverage for ' +
-							'delayed renders. (The floor objection people reach for first is void: `claim` seeks from a floor ' +
-							'clamped to `now - claimFloor.guard`, so any due time at or after the current minute is claimable ' +
-							'on any node.)\n\n' +
+							'delayed renders.\n\n' +
 							'COST IS BOUNDED BY `maxPerMinute`, NOT BY TRAFFIC: the slot is reserved before the call, so this ' +
 							'is at most that many requests per node per minute however much bot traffic arrives.\n\n' +
 							'REQUIRES `peerRescue.token` and `peerRescue.header`, reusing that shared cluster secret rather ' +
@@ -1874,15 +1866,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'render clears it.\n\n' +
 				'Two consequences of the lease being node-local shared-buffer state rather than a stored due ' +
 				'time: a worker restart collapses the fast-lane wait to zero (the job is simply re-granted), ' +
-				'and a held lease HOLDS THE CLAIM FLOOR for its duration — see queue.jobLeaseTime. During a ' +
-				'broad origin failure every job takes this lane, so no lease is released at all for that ' +
-				'window and the claim scan degrades back toward its pre-floor cost.',
+				'and during a broad origin failure every job takes this lane, so no lease is released at all ' +
+				'for that window.',
 			{
 				fastRetries: option(
 					2,
 					'Consecutive failures retried on lease expiry before dropping to the target’s cadence. Each ' +
-						'such retry holds the claim floor for a full queue.jobLeaseTime — read that option’s latency ' +
-						'note before raising this.',
+						'such retry waits out a full queue.jobLeaseTime.',
 					{
 						min: 0,
 					}
@@ -1961,11 +1951,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'end up half-written — and for a URL that is not in a sitemap, NOTHING otherwise re-creates the ' +
 				'schedule: the URL stops rendering silently and permanently. Runs on worker 0 of every node, ' +
 				'each covering only the keys it owns.\n\n' +
-				'The repair write goes through the schedule funnel, so a restored row lowers the claim floor. ' +
-				'That matters: a restored row filed BEHIND the floor would be precisely the silent gap this ' +
-				'sweep exists to close. Note also that this sweep tests row EXISTENCE only, so it can never ' +
-				'detect a row that exists but sits below the floor — queue.claimFloor.resetInterval is what ' +
-				'recovers that.',
+				'The repair write goes through the schedule funnel, and the queue keeper sees it like any other ' +
+				'write.',
 			{
 				enabled: option(true, 'Run the periodic schedule-repair sweep.'),
 				interval: option(6 * HOUR, 'How often each node sweeps its own slice of the keyspace.', {
@@ -2388,19 +2375,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'lost when a worker generation is replaced. That is correct, not a bug: the schedule row was ' +
 				'never moved, so a lost lease simply means the job is granted again (which does mean a restart ' +
 				'produces a short duplicate-render burst for whatever was in flight).\n\n' +
-				'THIS IS A LATENCY KNOB, NOT ONLY A RETRY KNOB. The claim scan starts from a floor that cannot ' +
-				'advance past the oldest DUE ROW (see queue.claimFloor), and everything behind that row waits. ' +
-				'`render.failureRetry` multiplies this lease: the fast-retry lane deliberately holds it, so ' +
-				'`fastRetries: 2` pins the floor for 2 leases before the slow lane writes the row forward, and ' +
-				'during a broad origin 5xx event every job takes that lane at once.\n\n' +
-				'A LEASE EXPIRING DOES NOT LIFT THE PIN, so “one wedged render costs one lease” is not true. ' +
-				'Claiming writes nothing to the schedule row, so a render that never posts a result leaves the ' +
-				'row due at the same minute and every later pass derives the same floor from it — indefinitely. ' +
-				'The periodic reset cannot recover it either, because that row is the oldest due row it would ' +
-				'then re-derive from. Only writing the row forward or deleting it lifts the pin, and the ' +
-				'generic-failure path (a renderer crash, navigation timeout or settle failure on a URL that ' +
-				'still has a target) holds the lease and writes no row. Watch “Claim floor lag” on the overview ' +
-				'— it names the row holding the floor — and repair or delete that URL.\n\n' +
+				'It is also the retry pacing for the fast-retry lane (`render.failureRetry`), which deliberately ' +
+				'holds the lease: a render that fails is retried when its lease expires.\n\n' +
 				'The minimum is two minutes because the render fleet DISCARDS any granted job with under 30 ' +
 				'seconds of lease left. Below roughly 90s the fleet skips 100% of granted jobs and the queue ' +
 				'live-locks: claims keep succeeding, nothing ever renders, and the plugin sees only healthy ' +
@@ -2412,10 +2388,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 		),
 		statusSyncInterval: option(
 			MINUTE,
-			'How often each node re-resolves queue state on worker 0. The recompute no longer scans anything ' +
-				'— empty/queued is derived from the claim floor plus the last claim outcome, at zero database ' +
-				'cost. This interval governs how fast a replicated pause/resume intent (QueueControl) converges ' +
-				'onto a node, how often the QueueStatus row is broadcast, and how often the claim floor is reset.',
+			'How often each node re-resolves queue state on worker 0. The recompute scans nothing — ' +
+				'empty/queued comes from the queue keeper’s due count. This interval governs how fast a ' +
+				'replicated pause/resume intent (QueueControl) converges onto a node, how often the QueueStatus ' +
+				'row is broadcast, and how often the lease gauge is reconciled.',
 			{
 				unit: 'ms',
 				min: SECOND,
@@ -2423,87 +2399,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 		),
 		maxClaimLimit: option(
 			25,
-			'Hard ceiling on jobs granted per claim, regardless of what a consumer asks for. Recording a lease ' +
-				'is an atomic store rather than a database write now, so this is about fair share and mutex hold ' +
-				'time: the whole pass runs under the node’s claim mutex, and one greedy or misconfigured ' +
-				'worker must not be able to hold it while hoarding a burst other renderers should share.',
+			'Hard ceiling on jobs granted per claim, regardless of what a consumer asks for, so one greedy or ' +
+				'misconfigured renderer cannot take a burst other renderers should share.',
 			{ min: 1 }
-		),
-		claimFloor: group(
-			'The lower bound the claim scan seeks from — a single `nextRenderTime >= floor` condition instead ' +
-				'of a scan that starts at the absolute minimum of that index.\n\n' +
-				'WHY IT EXISTS: every completed render moves a key from the head of the nextRenderTime index ' +
-				'into the future and leaves a dead index entry AT THE SEEK POINT. Measured, the claim scan ' +
-				'degraded from 0.36ms to 6.25ms over 40,000 reschedules — linear, position-dependent (churn away ' +
-				'from the seek point was free), and it did not recover after the churn stopped. With the floor, ' +
-				'the identical 20 keys come back in 0.43ms.\n\n' +
-				'WHAT IT COSTS: the floor cannot advance past the oldest DUE ROW, and only that row’s own result ' +
-				'moves it — a lease expiring does not, because claiming writes nothing to the row. So a render ' +
-				'that never posts a result pins the floor at its minute until the row is written forward or ' +
-				'deleted (see queue.jobLeaseTime), and everything behind it waits. A due time written BELOW ' +
-				'the floor would never be read again, which is why every schedule write inside the plugin goes ' +
-				'through one funnel that lowers the floor with the write, why the floor is held a guard band ' +
-				'behind the current minute, and why it is periodically reset.',
-			{
-				enabled: option(
-					true,
-					'Kill switch. `false` forces the floor to 0, so the scan seeks from the absolute index ' +
-						'minimum exactly as it did before v0.34.0 — and changes nothing else (leases still live in ' +
-						'the shared buffer either way). It exists, and is live-reloadable, because a floor that is ' +
-						'wrong strands rows SILENTLY: such a URL stops rendering and reports nothing.'
-				),
-				guard: option(
-					5 * MINUTE,
-					'The floor is always held at least this far behind the current minute.\n\n' +
-						'This is what makes a "render this URL now" write safe from ANY node without cross-node ' +
-						'coordination: schedule rows are residency-pinned, so most such writes are issued by a node ' +
-						'that cannot lower the owner’s floor — but they are written at the current minute, and ' +
-						'every node holds its floor behind that by construction. Lowering this toward zero re-opens ' +
-						'that hazard for every write routed to another node. Raising it costs one extra re-walk of ' +
-						'the index entries inside the window (roughly guard × render rate × 0.15µs, so ' +
-						'~0.15ms at 5 minutes and 200 renders/min) and is self-limiting because the window slides.',
-					{ unit: 'ms', min: 0 }
-				),
-				resetInterval: option(
-					5 * MINUTE,
-					'How often worker 0 resets the floor to 0 so the next claim re-derives it from the index.\n\n' +
-						'This is the ONLY recovery for a due time written below the floor by something outside the ' +
-						'plugin: the Harper operations API and the exported RenderSchedule REST surface both write ' +
-						'the table with no plugin code in the path, so nothing in-process can observe them. The ' +
-						'reset bounds that from permanent to at most one interval, and costs one seek from the ' +
-						'absolute index minimum per interval per node (~6.25ms on an aged node — strictly cheaper ' +
-						'than the periodic status scan this release deletes).\n\n' +
-						'`0` disables it, which makes such a write strand its URL permanently and silently. Do not ' +
-						'set 0 without reading the module comment in src/util/reconcile.js on how undiagnosable ' +
-						'that state is.',
-					{ unit: 'ms', min: 0 }
-				),
-				unpinAfter: option(
-					HOUR,
-					'How long one row may hold the floor before the claim path writes it forward by ' +
-						'render.defaultInterval itself, so the queue can advance past it.\n\n' +
-						'This is the bound on the cost described above. The floor cannot pass the oldest DUE row, and ' +
-						'only that row’s own result moves it — but the highest-volume failure path (a renderer crash, ' +
-						'navigation timeout or settle failure on a URL that still has a target) deliberately holds its ' +
-						'lease and writes NO row, so it never moves. One such URL would pin the floor forever while ' +
-						'dead index entries pile up above it at the full render rate: measured ~43ms per claim after a ' +
-						'day, which is worse than the 6.25ms unfloored scan the floor exists to replace.\n\n' +
-						'It is self-limiting and does not need a rate limit: it fires on the row HOLDING the floor, and ' +
-						'unpinning one promotes the next, which must then hold for a full interval of its own. So the ' +
-						'ceiling is one write per interval per node — 24 a day at the default — even during an outage ' +
-						'in which every render fails. It is a fix for index degradation, not a way to keep throughput ' +
-						'up.\n\n' +
-						'No strike is counted and no retry semantics change: `strikes` is the target’s one shared ' +
-						'counter that suppression and redirect verdicts DELETE targets on, so routing the failure path ' +
-						'through it would walk the corpus toward deletion during a broad origin outage. The pushed URL ' +
-						'is named in a warning, and a warning also fires earlier, once the pin outlives what ' +
-						'render.failureRetry can account for.\n\n' +
-						'Set it above `render.failureRetry.fastRetries × queue.jobLeaseTime` (the pin that lane holds ' +
-						'legitimately) or healthy retries get pushed out. `0` disables the push entirely and restores ' +
-						'the unbounded pin — the queue then waits on that row until it is repaired or deleted by hand.',
-					{ unit: 'ms', min: 0 }
-				),
-			}
 		),
 		maxLeases: option(
 			4096,
@@ -2511,100 +2409,34 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'rendered.\n\n' +
 				'Sizing: a 10-minute lease at 12,000 renders/hour is about 2,000 leases in flight fleet-wide, ' +
 				'so ~500 per node on four nodes; 4,096 slots × 16 bytes is 64KB. A claim that cannot record ' +
-				'a lease does NOT grant the job (a granted-but-unrecorded job is a double render and an ' +
-				'untracked hold on the claim floor), so an undersized table shows up as claims granting fewer ' +
-				'jobs than asked, with a warning naming the occupancy.\n\n' +
+				'a lease does NOT grant the job (a granted-but-unrecorded job is a double render), so an ' +
+				'undersized table shows up as claims granting fewer jobs than asked, with a warning naming the ' +
+				'occupancy.\n\n' +
 				'Restart-scoped: the buffer is sized once by the first allocation in the process, so a live ' +
 				'change would give workers within one generation differently-sized views of the same named ' +
 				'buffer. It is read at FIRST USE (the first claim or lease operation) rather than at module ' +
-				'load, which is what makes a restart actually honour it: read at load it preceded the host’s ' +
-				'options being applied, so this option had no effect at all and the size mismatch it warns ' +
-				'about could not be detected.',
+				'load, which is what makes a restart actually honour it.',
 			{ min: 1, scope: 'restart' }
 		),
 		ready: group(
-			'THE READY SET — which of the due rows the next leases go to, decided by a background sweep ' +
-				'instead of by the order the index happens to be in.\n\n' +
-				'WHY: `claim` takes the first rows it finds from the claim floor, so the queue serves ' +
-				'whatever is oldest-due. Two production measurements say that is the wrong order under ' +
-				'scarcity (prerender-plugin#80): ~46% of a 521,929-row overdue queue was bot-discovered ' +
-				'rather than sitemap-submitted, and absolute due time treats a 1h-TTL homepage 3h overdue ' +
-				'exactly like a 48h-TTL product page 3h overdue — 300% stale against 6%. Simulated over ' +
-				'the real corpus the 1h route sits at 4.78x its own TTL even at FULL capacity.\n\n' +
-				'It could not be fixed by re-sorting the claim window, because the window is ANCHORED AT ' +
-				'THE OLDEST DUE TIME: under a backlog every row in it is ancient, so the homepage is never ' +
-				'read at all and a wider window is just more ancient rows. So a sweep scores the WHOLE due ' +
-				'set and keeps the best few thousand in shared memory; claims pop from that and touch no ' +
-				'index. Affordable because the read is projected, one-sided and write-free — though HOW affordable ' +
-				'depends on the corpus, not just the query: ~2.4us/row on a fresh 200k-row bench corpus, but ' +
-				'~55us/row over production 1.3M churned rows, where a ~300k due set is a ~27s sweep (measured ' +
-				'live 2026-08-21).\n\n' +
-				'ORDERING ONLY. Total render volume cannot change: every row it reorders is already due. ' +
-				'And it is a CACHE in front of the old path — cold, exhausted or disabled, claims fall back ' +
-				'to the index scan, so every failure mode here is the previous behaviour rather than a ' +
-				'stalled queue.',
+			'THE READY SET — the best of the due rows, in claim order, in shared memory. The queue keeper ' +
+				'publishes it every `queue.keeper.publishInterval`; claims on every worker pop from it.\n\n' +
+				'The order is relative lateness (lateness over cadence, times `sitemapBoost` for a sitemap-sourced ' +
+				'row), because absolute due time treats a 1h-TTL homepage 3h overdue exactly like a 48h-TTL ' +
+				'product page 3h overdue — 300% stale against 6% (prerender-plugin#80). Ordering only: total ' +
+				'render volume cannot change, since every row it reorders is already due.',
 			{
-				enabled: option(
-					true,
-					'Kill switch. `false` claims straight from the index scan, exactly as before v0.50.0. The ' +
-						'sweep also stops, so nothing is spent maintaining a set nothing reads.'
-				),
 				capacity: option(
 					5000,
-					'Entries the ready set holds. Sized to cover several sweep intervals of claims so the set ' +
-						'does not run dry between sweeps: at the recorded fleet throughput a node grants roughly ' +
-						'5 jobs a second (observed live: ~70-75 claims a minute), so 5,000 entries is about 16 ' +
-						'minutes of work — three sweep intervals at the default.\n\n' +
-						'DO NOT RAISE THIS CASUALLY. The reference cluster runs with 4.6GB of swap in use and 5.2GB ' +
-						'free of 33.6GB, so shared memory on these nodes is not free. A larger set does not improve ' +
-						'the ordering either — the sweep already scores every due row and keeps the best of them, so ' +
-						'this only buys time between sweeps. What makes the sweep safe on a swapping node is that ' +
-						'its own memory is a function of THIS number and not of the due set: it streams rows through ' +
-						'a bounded heap and retains only the best `capacity`.\n\n' +
+					'Entries the ready set holds. The keeper republishes every second, so this only needs to ' +
+						'cover the claims between publishes with room for leased rows it skips; at ~5 jobs a second ' +
+						'per node the default is far more than that.\n\n' +
 						'Costs `capacity x ~276 x 2` bytes of shared memory — two slots, so ~2.8MB at the default. ' +
-						'Raising it does ' +
-						'NOT make the ordering better — the sweep already scores every due row and keeps the best ' +
-						'of them — it only makes the set last longer between sweeps.\n\n' +
+						'Keys are packed end to end, so a long key does not need a slot of its own size.\n\n' +
 						'Restart-scoped: a named shared buffer is sized by its first allocation, so a live change ' +
 						'would give workers in one generation differently-sized views of the same buffer. A ' +
 						'mismatch is logged and the smaller size honoured.',
-					{ min: 0, scope: 'restart' }
-				),
-				sweepInterval: option(
-					5 * MINUTE,
-					'How often worker 0 re-scores the due set and republishes.\n\n' +
-						'This is the ORDERING STALENESS: a row that becomes due just after a sweep waits up to one ' +
-						'interval before it can be ranked. Five minutes against cadences of an hour and up is a ' +
-						'rounding error, and `capacity` covers roughly three of these intervals of claims, so the ' +
-						'set does not run dry between sweeps.\n\n' +
-						'FIVE MINUTES RATHER THAN ONE, on production evidence. A synthetic benchmark puts a ' +
-						'projected one-sided read at ~2.4us/row on a FRESH corpus, which would make a sweep sub-second — but ' +
-						'cluster reports `claim_scan_ms` at a 5-6ms median over a window of roughly 205 rows ' +
-						'(grantLimit + in-flight + grantLimit, at an observed lease occupancy of 75-155), and ' +
-						'`empty` passes at a 25ms mean with 47ms observed, which are seek-dominated. So the real ' +
-						'marginal per-row cost sits somewhere between 2.4us and ~25us — an order of magnitude of ' +
-						'uncertainty — and the sweep shares a worker with bot traffic. At the wide end a ' +
-						'one-minute interval would spend a noticeable fraction of a core continuously, for no ' +
-						'benefit: the ordering does not go stale that fast.\n\n' +
-						'WATCH `ready_sweep_ms` AND TIGHTEN FROM THERE. It reports the real number for your corpus, ' +
-						'which is the only way to know it — the backlog snapshot cannot tell you the due-set size ' +
-						'either, because `overdue` saturates at `management.scanCap` (observed pinned at 2,000).\n\n' +
-						'`0` disables the sweep, which leaves the set to go stale and then empty; claims fall back ' +
-						'to the index scan as they always do. The ceiling is node\u2019s own timer limit of 2^31-1 ms ' +
-						'(~24.8 days) \u2014 past it a timer fires every millisecond rather than never, which would ' +
-						'turn the sweep into a hot loop over the due set.',
-					{ unit: 'ms', min: 0, max: 2147483647 }
-				),
-				sweepCap: option(
-					500_000,
-					'Ceiling on rows one sweep reads. The due set cannot exceed the corpus, so this is a ' +
-						'guard against a runaway rather than a tuning knob — though at the ~55us/row a churned corpus costs, ' +
-						'reading.\n\n' +
-						'If a sweep hits the cap WITHOUT reaching a not-yet-due row it is ordering over a prefix ' +
-						'of the backlog, which is reported and warned about: the rows past the cap are the ' +
-						'youngest, so the effect is that recently-due pages go unranked — exactly the pages this ' +
-						'exists to protect.',
-					{ min: 1 }
+					{ min: 1, scope: 'restart' }
 				),
 				sitemapBoost: option(
 					2,
@@ -2619,14 +2451,45 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
-		claimScanCap: option(
-			1000,
-			'Ceiling on schedule rows read per claim pass. A leased row keeps its overdue position in the ' +
-				'nextRenderTime index now, so the pass reads past the in-flight pile ' +
-				'(grantLimit + in-flight + grantLimit) to find grantable rows; this caps that read. If ' +
-				'in-flight work exceeds the cap the pass can grant zero while work exists — it then reports ' +
-				'`queued` (never `empty`, which would tell the whole fleet to go idle) and logs the occupancy.',
-			{ min: 1 }
+		keeper: group(
+			'The queue keeper (v0.93.0): worker 0 holds every schedule row this node owns in memory, ' +
+				'kept current by a subscription on the schedule table, and is the queue — `RenderSchedule` is ' +
+				'its durable side. It publishes the ready set claims are served from, serves queue state ' +
+				'(`GET /prerender_admin/queue-state`) and feeds the backlog snapshot. See prerender-plugin#215.\n\n' +
+				'Each ready-set entry is checked against its durable row before it is granted, the head of each ' +
+				'publish is re-read and repaired, and a periodic verification walk (`verifyInterval`) repairs ' +
+				'anything it missed. Costs about 200 bytes of heap per row on worker 0 (about 50MB at 250k ' +
+				'rows), and a load by primary key at start: about 1s per 250k rows on a fresh store, expected ' +
+				'tens of seconds on a churned one. UNTIL IT IS LIVE THIS NODE GRANTS NO CLAIMS (it reports ' +
+				'`queued`, so the fleet keeps polling); on a single node it first waits up to two minutes for ' +
+				'a cluster peer, since residency ownership is not knowable before the node list is.',
+			{
+				publishInterval: option(
+					1000,
+					'How often worker 0 republishes the ready set from the keeper, and the longest a row that comes ' +
+						'due waits before it can be claimed. A publish is skipped when nothing it depends on changed ' +
+						'(forced every 10s regardless). The claim path stops trusting a keeper it has not heard from ' +
+						'in ten intervals (never under 30s) and grants nothing until it is heard from again.',
+					{ unit: 'ms', min: 100, max: 2147483647 }
+				),
+				verifyInterval: option(
+					60 * MINUTE,
+					'How often worker 0 walks the whole table and checks the keeper against it: every row it ' +
+						'owns must be held at the same due minute and class, and every row held must still exist. ' +
+						'Anything wrong is repaired from the table and counted (`queue_health` `keeper_repaired`); ' +
+						'expect 0, since the subscription delivers every write. This bounds a missed write to one ' +
+						'interval. A full primary-key walk, yielding every 200 rows: tens of seconds on a churned ' +
+						'production store. `0` disables it.',
+					{ unit: 'ms', min: 0, max: 2147483647 }
+				),
+				stateInterval: option(
+					5000,
+					'How often worker 0 recomputes queue state for `GET /prerender_admin/queue-state` and the ' +
+						'backlog snapshot. Walks every occupied minute of every class, so it runs apart from the ' +
+						'publish, which only takes the head of the queue.',
+					{ unit: 'ms', min: 1000, max: 2147483647 }
+				),
+			}
 		),
 	}),
 

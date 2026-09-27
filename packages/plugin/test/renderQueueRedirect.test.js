@@ -1,5 +1,6 @@
 import { test, before, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { publishDueRows } from './support/keeperStandIn.js';
 
 /**
  * processJobResult over the url-keyed Target registry.
@@ -162,7 +163,10 @@ beforeEach(() => {
 });
 
 /** Claim the way the fleet would, so leases are recorded exactly as production records them. */
-const claim = (limit = 10) => RenderQueue.claim({ limit });
+const claim = (limit = 10) => {
+	publishDueRows(funnel, stores.renderSchedule);
+	return RenderQueue.claim({ limit });
+};
 const leased = (cacheKey) => !!funnel.leaseInfo(cacheKey);
 
 afterEach(() => {

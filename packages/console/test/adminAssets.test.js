@@ -146,6 +146,10 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 		// panel (proxy + an Overview control beside discovery-purge) is a follow-up console release;
 		// remove this entry when it lands.
 		'sweep-orphan-pages',
+		// Plugin v0.93.0's queue state ships API-first too: node-local, for an autoscaler or an
+		// operator to read per node. The console view (proxy + a merger that sums nodes and refuses a
+		// partial sum) is a follow-up console release; remove this entry when it lands.
+		'queue-state',
 	]);
 	for (const route of pluginServes) {
 		if (DELIBERATELY_NOT_EXPOSED.has(route)) continue;

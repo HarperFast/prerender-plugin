@@ -540,11 +540,7 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// one-device render beside it and de-aligning the pair. For a device that is merely
 	// `supported`, the URL row cannot carry it (a URL job renders the default set), so it is a
 	// per-device row: one render of that one device, stored and retired, the URL row untouched.
-	//
-	// Through the funnel, because "due at the current minute" is exactly the write a claim floor
-	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
-	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
-	// keeps the row above the owner's floor and therefore claimable.
+
 	const scheduleKey = config.deviceTypes.default.includes(deviceType) ? cacheUrl : cacheKey;
 	await writeSchedule(scheduleKey, {
 		nextRenderTime: currentMinuteMs(),

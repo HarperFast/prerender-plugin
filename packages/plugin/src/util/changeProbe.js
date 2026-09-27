@@ -28,9 +28,9 @@
  *   fleet the better part of a day; invalidating it takes one 102-byte row.
  *
  * OWNER-SCOPED, LIKE EVERY SWEEP HERE. Each node probes only the URLs residency assigns to it:
- * the trigger writes due-now schedule rows, and a due-now row is only claimable where the writing
- * node's own claim floor covers it (see util/invalidationReenqueue.js for the measured failure of
- * non-owner lowering). Every node running the same sweep covers the keyspace with no coordination.
+ * the trigger's guards read the lease table and the schedule row, both of which are only authoritative
+ * on the owner (see util/invalidationReenqueue.js). Every node running the same sweep covers the
+ * keyspace with no coordination.
  *
  * WHAT A PROBE FAILURE MEANS: NOTHING. A fetch error, a non-2xx, an unparseable body, or an
  * extraction that yields no values leaves the stored signature untouched and triggers nothing —
@@ -301,8 +301,7 @@ const probeOnce = async (rule, url) => {
 
 /**
  * Re-render one changed URL now: hard-expire the cached pages and file the URL's schedule row at
- * the current minute. Owner-scoped by the sweep, so the funnel's floor lowering covers these keys
- * on the node whose claim scan reads them.
+ * the current minute. Owner-scoped by the sweep, whose guards read owner-local state.
  *
  * ONE SCHEDULE ROW, KEYED BY THE URL — not one per device. The PAGES are still expired per device,
  * because page content genuinely is per device; the SCHEDULE is not. This file was missed by the
@@ -339,8 +338,8 @@ export const triggerRevalidate = async (row) => {
 		})
 	);
 	// The current minute PER TRIGGER, never captured once for a whole pass — a paced sweep runs for
-	// hours, and a stale minute files rows below other nodes' claim-floor guard bands (the
-	// Target.revalidate lesson).
+	// hours, and a stale minute ranks the row as if it had waited that long (the Target.revalidate
+	// lesson).
 	const nextRenderTime = currentMinuteMs();
 	await writeSchedule(row.url, {
 		nextRenderTime,

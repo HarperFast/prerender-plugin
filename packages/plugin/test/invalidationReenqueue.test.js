@@ -8,16 +8,14 @@ import assert from 'node:assert/strict';
  * the happy path is one jittered write through the funnel, and every hazard is a guard that must
  * fire AND count itself. A silent skip and a working accelerator look identical in production.
  *
- *   - OWNER-NODE ONLY. The claim floor a lowered due time has to move is a node-local shared
- *     buffer, so a write from a non-owner lowers its own floor (a no-op) and files the row beneath
- *     the owner's. Measured shape of that mistake: 0 rows returned, 23ms.
+ *   - OWNER-NODE ONLY. The guards (the live lease, the authoritative schedule read) are node-local,
+ *     so only the owner can evaluate them.
  *   - THE PAIR MOVES TOGETHER. `util/time.js` seeds jitter off the URL half precisely so a URL's
  *     device variants share a minute; lowering one would leave the other on pre-invalidation
  *     content for up to a full interval, and `processJobResult` reschedules from each render's own
  *     completion, so the de-alignment is permanent, cycle over cycle. No metric would show it.
- *   - NEVER "NOW". Collapsing due times onto one instant is the herd the jitter exists to prevent:
- *     measured, it takes the claim scan from 0.36ms to 11.59ms (32x) and only clears on the store's
- *     next compaction.
+ *   - NEVER "NOW". Collapsing due times onto one instant is the pile the jitter exists to prevent
+ *     (see `spreadWindowMs`).
  *   - NEVER A KEY THAT CANNOT HEAL. `strikes > 0` is NOT that test: the `discardContent` branch
  *     reschedules at cadence and RESETS strikes to 0 while writing no page, so a key parked there
  *     looks perfectly healthy and can never heal. The test that catches it is arithmetic on the row
@@ -363,7 +361,7 @@ test('a split pair lowers the sibling that can be pulled forward instead of veto
 		Number(schedule.get(desktop).nextRenderTime),
 		nowMs - 2 * HOUR,
 		'the overdue row keeps its place in the claim order — a lowering that raised it would be a delay ' +
-			'dressed up as a repair, and aligning DOWN onto it would drag this node’s claim floor back two hours'
+			'dressed up as a repair'
 	);
 });
 
@@ -481,21 +479,6 @@ test('fromSitemap is re-supplied from the live target — put replaces the recor
 	for (const key of keysOf(url)) {
 		assert.equal(schedule.get(key).fromSitemap, true, 'a cleared flag makes the renderer skip a sitemap-listed page');
 	}
-});
-
-test('the write lowers this node’s claim floor, so the accelerated row is above the seek point', async () => {
-	const url = ownedUrl();
-	seed(url);
-	const leases = funnel.leaseTable();
-	// A caught-up node's floor sits AHEAD of the row we are about to file. Without the funnel's
-	// lowering, that row would be inserted behind the seek point and never claimed again.
-	const aheadMinute = Math.floor(nowMs / MINUTE) + 60;
-	assert.equal(leases.advanceFloor(0, aheadMinute), true);
-
-	const result = await accelerator.accelerateHeal({ url, cacheKey: keysOf(url)[0], invalidatedBy: epoch() });
-
-	assert.equal(result.outcome, 'lowered');
-	assert.equal(leases.rawFloorMinute(), Math.floor(result.dueAt / MINUTE), 'the floor came down to the batch minimum');
 });
 
 test('maybeAccelerateHeal is inert while it is disabled, and while nothing was invalidated', async () => {
