@@ -536,8 +536,10 @@ table is read by primary key only, and `nextRenderTime` carries no index
   loading (up to two minutes, for a single-node deployment), reloads if the node list changes during
   the load, and rebuilds on a later change of membership, routes or default interval. A row stored here
   but owned elsewhere is not held; the verification walk counts them (`trust.keeper.verify.unowned`).
-- **Until it is live, this node grants no claims.** It reports `queued`, so the fleet keeps polling
-  rather than backing off, and `queue-state` answers 503. A keeper that stops publishing loses the
+- **Until it is live, this node grants no claims.** It reports the queue status `unready` (a
+  render fleet that predates it reads an unknown status as `empty` and polls at its idle interval),
+  and `queue-state` answers 503. Going live is reported at once as `queued` or `empty`, so the fleet
+  is woken by the change rather than finding out on its next idle poll. A keeper that stops publishing loses the
   claim path after ten publish intervals (never under 30 s). A load that cannot get past an
   unreadable row goes live on what it read, marked `exact: false`, and logs an error: a partial
   queue, filled in as rows are written, rather than none.
@@ -1021,11 +1023,10 @@ reaches a remote node within one interval (default 1m), not instantly** — the 
 `QueueStatus` remains what each node last _observed_; the UI shows both, and marks a node
 stale when it stops reporting.
 
-The `empty`/`queued` half of that observed status is **derived, not scanned**: it is the queue
-keeper's due count, at zero database cost. It is deliberately tri-state at the source: due rows that
-are all in flight still report `queued`, never `empty` — reporting `empty` there would tell the whole
-fleet to go idle while a large backlog is being rendered — and so does a keeper that is not serving,
-whose count is unknown.
+The rest of that observed status is **derived, not scanned**, from the queue keeper at zero database
+cost: `queued` when it holds due rows, `empty` when it holds none, `unready` while it is not serving
+claims. Due rows that are all in flight still report `queued`, never `empty` — reporting `empty` there
+would tell the whole fleet to go idle while a large backlog is being rendered.
 
 `POST /render_queue/pause` stays deliberately node-scoped: that endpoint sets
 `loadAsInstance = false` and therefore enforces no authentication of its own, so it must not

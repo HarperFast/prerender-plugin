@@ -489,13 +489,13 @@ test('a key published in two generations is granted once, however the claims int
 	s.stop();
 });
 
-test('a keeper that is not live, or has gone quiet, grants nothing and reports queued', async () => {
+test('a keeper that is not live, or has gone quiet, grants nothing and reports unready', async () => {
 	const now = Date.now();
 	seed([row(item(1), now - HOUR)]);
 	const before = await funnel.claimSchedules({ grantLimit: 5 });
 	assert.equal(before.jobs.length, 0, 'no keeper yet');
-	assert.equal(before.sawDue, true, 'queued, so the fleet keeps polling');
-	assert.equal(funnel.deriveQueueStatus(), 'queued');
+	assert.equal(before.keeperServed, false);
+	assert.equal(funnel.deriveQueueStatus(), 'unready');
 
 	const s = await started();
 	const realNow = Date.now;
@@ -503,12 +503,25 @@ test('a keeper that is not live, or has gone quiet, grants nothing and reports q
 		Date.now = () => realNow() + 5 * 60_000; // no heartbeat for five minutes
 		const stale = await funnel.claimSchedules({ grantLimit: 5 });
 		assert.equal(stale.jobs.length, 0, 'stale: nothing granted');
-		assert.equal(stale.sawDue, true);
+		assert.equal(stale.keeperServed, false);
+		assert.equal(funnel.deriveQueueStatus(), 'unready');
 	} finally {
 		Date.now = realNow;
 	}
 	assert.equal(indexSearches, 0);
 	s.stop();
+});
+
+test('the keeper announces its own transitions: queued when it goes live, unready when it stops', async () => {
+	const { QueueState } = await import('../src/resources/QueueState.js');
+	QueueState.reportStatus('empty', true);
+	seed([row(item(1), Date.now() - HOUR)]);
+	const s = await started();
+	await settle();
+	assert.equal(QueueState.status, 'queued', 'live with a due row: the fleet is woken now, not at the next sync');
+	s.stop();
+	await settle();
+	assert.equal(QueueState.status, 'unready');
 });
 
 test('a publish still in flight does not stop the heartbeat', async () => {

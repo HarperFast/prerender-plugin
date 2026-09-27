@@ -185,7 +185,7 @@ type RenderSchedule @table(database: "render_schedule") @export {
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
 	hostname: String @primaryKey
-	# Queue status (empty, queued, or paused)
+	# Queue status (empty, queued, paused, or unready — see resources/QueueState.js)
 	status: String
 	updatedTime: Date @updatedTime
 }

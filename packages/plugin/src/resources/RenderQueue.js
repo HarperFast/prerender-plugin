@@ -327,7 +327,7 @@ const classifyVariant = (variant, job) => {
 
 /**
  * Resolve this node's desired pause intent from the replicated `QueueControl` table and
- * store it into the node-local queue flag; when not paused, derive empty/queued. Caller must
+ * store it into the node-local queue flag; when not paused, derive empty/queued/unready. Caller must
  * hold `mutex`.
  *
  * This is what makes pause/resume work cluster-wide: `claim` reads a non-replicated,
@@ -335,7 +335,7 @@ const classifyVariant = (variant, job) => {
  * this on its own status-sync interval, so a replicated intent write converges everywhere
  * within one `queue.statusSyncInterval`.
  *
- * THE STATUS RECOMPUTE DOES NOT SCAN: empty/queued comes from the queue keeper's due count, at zero
+ * THE STATUS RECOMPUTE DOES NOT SCAN: empty/queued/unready comes from the queue keeper's signal, at zero
  * database cost. `test/queueStatusDerived.test.js` pins that by installing a `search` that throws.
  */
 async function syncQueueState(force = false, pending = null) {
@@ -347,8 +347,7 @@ async function syncQueueState(force = false, pending = null) {
 	}
 
 	// The intent says "run". If the local flag still holds `paused`, the report must be
-	// forced: reportStatus's non-forced path is a compareExchange between empty<->queued,
-	// which by design cannot move a flag currently holding `paused`.
+	// forced: reportStatus's non-forced path by design cannot move a flag holding `paused`.
 	const liftingPause = QueueState.status === 'paused';
 
 	// The lease-gauge walk rides here, once per status sync: the gauge only ever drifts UP (a lease that
@@ -1378,8 +1377,9 @@ export class RenderQueue extends Resource {
 		if (jobs.length === 0) {
 			// TRI-STATE, and the distinction is not cosmetic. "Saw due rows but granted none" means a
 			// backlog is entirely in flight — reporting `empty` there tells every consumer in the fleet to
-			// back off to its idle interval while there is work.
-			QueueState.reportStatus(pass.sawDue ? 'queued' : 'empty');
+			// back off to its idle interval while there is work. And a keeper that is not serving is
+			// `unready`, so that it becoming ready is a change the fleet is told about.
+			QueueState.reportStatus(!pass.keeperServed ? 'unready' : pass.sawDue ? 'queued' : 'empty');
 		}
 
 		return jobs;

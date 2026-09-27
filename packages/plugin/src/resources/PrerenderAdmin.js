@@ -363,7 +363,7 @@ async function buildNodeList() {
 			// WHEN THE STATUS LAST CHANGED — not when this node last reported.
 			//
 			// The row is written only when the status actually moves (QueueState.reportStatus's
-			// compareExchange), which is deliberate: `reportStatus` is called per bot request and
+			// compare-and-swap on the node-local flag), which is deliberate: `reportStatus` is called per bot request and
 			// per claim pass, and the node-local shared buffer exists precisely so those paths do
 			// not each become a replicated write. A steady `queued` node therefore has an old
 			// timestamp and is perfectly healthy.
@@ -1114,7 +1114,7 @@ export class PrerenderAdmin extends Resource {
 		// the row. When another node owns it, the owner's queue keeper sees the write by
 		// replication and publishes it within a second; its next claim picks it up.
 		const owner = getResidencyByUrl(canonicalUrl);
-		if (owner === server.hostname) await QueueState.reportStatus('queued');
+		if (owner === server.hostname) await QueueState.noteWork();
 
 		return json({
 			cacheKey,

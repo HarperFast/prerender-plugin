@@ -2389,7 +2389,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 		statusSyncInterval: option(
 			MINUTE,
 			'How often each node re-resolves queue state on worker 0. The recompute scans nothing — ' +
-				'empty/queued comes from the queue keeper’s due count. This interval governs how fast a ' +
+				'empty/queued/unready comes from the queue keeper. This interval governs how fast a ' +
 				'replicated pause/resume intent (QueueControl) converges onto a node, how often the QueueStatus ' +
 				'row is broadcast, and how often the lease gauge is reconciled.',
 			{
@@ -2460,9 +2460,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'publish is re-read and repaired, and a periodic verification walk (`verifyInterval`) repairs ' +
 				'anything it missed. Costs about 200 bytes of heap per row on worker 0 (about 50MB at 250k ' +
 				'rows), and a load by primary key at start: about 1s per 250k rows on a fresh store, expected ' +
-				'tens of seconds on a churned one. UNTIL IT IS LIVE THIS NODE GRANTS NO CLAIMS (it reports ' +
-				'`queued`, so the fleet keeps polling); on a single node it first waits up to two minutes for ' +
-				'a cluster peer, since residency ownership is not knowable before the node list is.',
+				'tens of seconds on a churned one. UNTIL IT IS LIVE THIS NODE GRANTS NO CLAIMS and reports ' +
+				'`unready`, and going live is broadcast as `queued`/`empty` at once; on a single node it first ' +
+				'waits up to two minutes for a cluster peer, since residency ownership is not knowable before ' +
+				'the node list is.',
 			{
 				publishInterval: option(
 					1000,

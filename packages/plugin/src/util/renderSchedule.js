@@ -214,8 +214,7 @@ export const getScheduleRow = (cacheKey, select) =>
  *
  * A short claim is simply short: what the set could not grant is in flight or was stale, and the
  * keeper republishes within a second. While the keeper is not serving (loading at startup, or
- * stalled) nothing is granted, and the claim reports `sawDue` so consumers keep polling rather than
- * back off to their idle interval.
+ * stalled) nothing is granted and `keeperServed` is false, which the caller reports as `unready`.
  *
  * No mutex: the ready-set cursor hands each entry to one taker, and the lease grant is exclusive
  * (`util/renderLease.js`), so claims on every worker run concurrently.
@@ -228,7 +227,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 	const pass = {
 		jobs: [],
 		// the tri-state rule: granting nothing while due rows are in flight is still `queued`
-		sawDue: !keeper.serving || keeper.due > 0,
+		sawDue: keeper.serving && keeper.due > 0,
 		keeperServed: keeper.serving,
 		skippedLeased: 0,
 		skippedStale: 0,
@@ -389,15 +388,16 @@ export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
 // ---- status derivation (zero DB ops) --------------------------------------------------------
 
 /**
- * `empty` or `queued`, from the keeper's due count. `queued` while the keeper is not serving: the
- * count is unknown then, and `empty` would send every consumer in the fleet to its idle interval.
+ * `empty`, `queued` or `unready`, from the keeper's signal. `unready` while the keeper is not serving
+ * (see `QueueState`): nothing can be granted, and the count is unknown.
  *
  * The due count includes rows in flight (a row stays due until its result reschedules it), which is
  * the tri-state rule: "granted zero but there ARE due rows" must report `queued`, never `empty`.
  */
 export const deriveQueueStatus = (nowMs = Date.now()) => {
 	const keeper = readKeeperSignal(nowMs);
-	return !keeper.serving || keeper.due > 0 ? 'queued' : 'empty';
+	if (!keeper.serving) return 'unready';
+	return keeper.due > 0 ? 'queued' : 'empty';
 };
 
 /**

@@ -38,7 +38,7 @@
  * any later change.
  *
  * WHILE IT IS NOT LIVE — waiting for peers, loading, or failed and retrying — this node grants no
- * claims, and reports `queued` so the fleet keeps polling. There is no other path to the queue: the
+ * claims and reports `unready`; going live is reported at once (`QueueState`). There is no other path to the queue: the
  * `nextRenderTime` index it replaced is gone (#215).
  */
 import { setImmediate as yieldNow, setTimeout as sleep } from 'node:timers/promises';
@@ -89,6 +89,16 @@ const stateSnapshot = () =>
 export const readQueueStateDocument = () => stateSnapshot().read();
 
 const messageOf = (e) => e?.message ?? String(e);
+
+/**
+ * Tell the fleet at once when this node starts or stops serving claims (`unready` ⇄ `queued`/`empty`),
+ * rather than on the next status sync, up to `queue.statusSyncInterval` later. Unforced, so a pause
+ * stands. Loaded lazily: `resources/QueueState.js` needs Harper's `Resource` at import.
+ */
+const reportQueueStatus = (status) =>
+	import('../resources/QueueState.js')
+		.then(({ QueueState }) => QueueState.reportStatus(status))
+		.catch((e) => globalThis.logger?.warn?.(`[prerender] queue keeper could not report ${status}: ${messageOf(e)}`));
 
 const carriedCadence = (effectiveInterval) => {
 	const ms = Number(effectiveInterval);
@@ -240,6 +250,7 @@ export const createKeeperService = ({
 	/** Stop serving the keeper's generation: claims grant nothing until it is live again. */
 	const withdraw = () => {
 		clearKeeperSignal();
+		reportQueueStatus('unready');
 		try {
 			publishKeeperSet([]);
 		} catch (e) {
@@ -344,6 +355,7 @@ export const createKeeperService = ({
 			}
 			await publish();
 			if (mine !== epoch) return;
+			reportQueueStatus(lastDue > 0 ? 'queued' : 'empty');
 			writeState();
 			timers.publish = every(publish, config.queue.keeper.publishInterval);
 			timers.state = every(writeState, config.queue.keeper.stateInterval);

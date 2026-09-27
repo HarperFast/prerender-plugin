@@ -425,12 +425,12 @@ residency-pinned row you don't own can block indefinitely — pass `replicateFro
 Same-instance HTTP, documented in the README's endpoint table; these are what an external monitor
 that cannot hold a super-user session can still watch.
 
-| Endpoint                      | Signal                                                                                                                                                                                            |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /queue_status`           | Per-node **observed** queue state (`empty`/`queued`/`paused`) with its `updatedTime` — the staleness of that timestamp is itself a signal (a node not reporting is a node not claiming).          |
-| `GET /queue_control`          | The **desired** pause state (replicated intent). Intent ≠ observed for longer than one `statusSyncInterval` means a node is not converging — that comparison is the pause-machinery health check. |
-| `GET /sitemap_refresh/<root>` | Progress and outcome of a background sitemap walk: which node holds the claim, cursor position, counts so far. The way to tell "slow but moving" from "stalled".                                  |
-| `GET /RenderTarget/<url>`     | One target's stored state (`state`, `strikes`, intervals) — the minimal per-URL probe when the admin API's `explain` isn't available.                                                             |
+| Endpoint                      | Signal                                                                                                                                                                                             |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /queue_status`           | Per-node **observed** queue state (`empty`/`queued`/`paused`/`unready`) with its `updatedTime` — the staleness of that timestamp is itself a signal (a node not reporting is a node not claiming). |
+| `GET /queue_control`          | The **desired** pause state (replicated intent). Intent ≠ observed for longer than one `statusSyncInterval` means a node is not converging — that comparison is the pause-machinery health check.  |
+| `GET /sitemap_refresh/<root>` | Progress and outcome of a background sitemap walk: which node holds the claim, cursor position, counts so far. The way to tell "slow but moving" from "stalled".                                   |
+| `GET /RenderTarget/<url>`     | One target's stored state (`state`, `strikes`, intervals) — the minimal per-URL probe when the admin API's `explain` isn't available.                                                              |
 
 ### 4e. Config warnings are a monitorable surface
 

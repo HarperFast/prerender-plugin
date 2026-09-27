@@ -7,7 +7,8 @@ import assert from 'node:assert/strict';
  * `syncQueueState` once ran a head-seeking query (`nextRenderTime <= now`, limit 1) on worker 0 every
  * `queue.statusSyncInterval` — measured at ~700ms of synchronous native iteration per minute on an aged
  * node, on the worker that also serves bot traffic. The answer is the queue keeper's due count, at zero
- * database cost: `queued` when it holds due rows (in flight included) or is not serving, else `empty`.
+ * database cost: `queued` when it holds due rows (in flight included), `empty` when it holds none, and
+ * `unready` when it is not serving claims at all.
  *
  * The strongest way to pin the ABSENCE of a query is to make that query fatal: the RenderSchedule
  * fake here THROWS from `search`, so a status refresh that still scans cannot pass.
@@ -142,12 +143,45 @@ test('the derivation is tri-state: due rows held ⇒ queued, none ⇒ empty', as
 	assert.equal(searchCalls, 0);
 });
 
-test('a keeper that is not serving reports queued, never empty — its count is unknown', () => {
+test('a keeper that is not serving reports unready, never empty — its count is unknown', () => {
 	funnel.clearKeeperSignal();
-	assert.equal(funnel.deriveQueueStatus(), 'queued');
+	assert.equal(funnel.deriveQueueStatus(), 'unready');
 	keeperHolds(0);
-	assert.equal(funnel.deriveQueueStatus(Date.now() + MINUTE), 'queued', 'a keeper not heard from in a minute');
+	assert.equal(funnel.deriveQueueStatus(Date.now() + 5 * MINUTE), 'unready', 'a keeper not heard from in minutes');
 	assert.equal(funnel.deriveQueueStatus(), 'empty');
+});
+
+test('becoming ready is a CHANGE, written once, so the fleet is told at once', async () => {
+	funnel.clearKeeperSignal();
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'unready');
+	statuses.clear();
+	keeperHolds(3);
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'queued', 'unready -> queued moves without force');
+	statuses.clear();
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.size, 0, 'and a steady queued writes nothing');
+});
+
+test('a work-arrived hint moves only empty: never paused, never unready', async () => {
+	QueueState.reportStatus('unready');
+	statuses.clear();
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'unready', 'an unready node could not grant the job anyway');
+	assert.equal(statuses.size, 0);
+
+	QueueState.reportStatus('paused');
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'paused');
+	assert.equal(QueueState.reportStatus('queued'), undefined);
+	assert.equal(QueueState.status, 'paused', 'an unforced report never lifts a pause');
+
+	QueueState.reportStatus('empty', true);
+	statuses.clear();
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'queued');
+	assert.equal(statuses.get('node-a')?.status, 'queued');
 });
 
 // ---- what must NOT have been deleted with the scan ----

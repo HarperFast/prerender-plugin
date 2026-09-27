@@ -554,9 +554,10 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 		effectiveInterval: renderTarget ? resolveEffectiveInterval(cacheUrl, renderTarget) : null,
 	});
 
-	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
-	// so a paused queue stays paused (the render then simply times out to the fallback).
-	await QueueState.reportStatus('queued');
+	// Wake idle consumers now instead of waiting out the periodic status sync. Only from `empty`: a
+	// paused queue stays paused (the render then simply times out to the fallback), and an `unready` one
+	// stays unready — it could not grant the job anyway.
+	await QueueState.noteWork();
 
 	const page = await pollForFreshRender({
 		get: (key) => PrerenderedPage.get(key),
