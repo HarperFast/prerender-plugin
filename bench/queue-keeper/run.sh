@@ -19,7 +19,7 @@ LOG="${BENCH_LOG:-${TMPDIR:-/tmp}/queue-keeper-bench.log}"
 
 # The laptop is shared with other agents' benchmarks: record the host load so a contended run is visible.
 echo "run.sh: host load before: $(uptime | sed 's/.*load averages*: //')" | tee "$LOG"
-ps -Ao pcpu,comm | sort -k1 -nr | head -4 | sed 's/^/run.sh:   /' | tee -a "$LOG"
+ps -Ao pcpu,comm | sort -k1 -nr | sed -n '1,4s/^/run.sh:   /p' | tee -a "$LOG"
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 STAGE="$(mktemp -d)"
