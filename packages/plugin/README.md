@@ -1321,11 +1321,11 @@ override logs "Unknown configuration key" and is not applied.
 ### Why a request missed: `bot_miss`
 
 Every request `bot_serve` counts as `origin|miss` also gets one **cause** (`bot_miss`, by route and bot):
-`not-found` / `redirect` / `client-error` / `origin-error` (the origin status decided it), `passthrough`,
+`not-found` / `not-modified` / `redirect` / `client-error` / `origin-error` (the origin status decided it; `not-modified` is a crawler's conditional GET the origin answered 304), `passthrough`,
 `uncacheable`, `gated-route` / `gated-bot` / `gated-entity` / `device` (a rule or setting you chose —
 `device` is a device outside `deviceTypes.default`, which the rotation never renders), `new` /
-`unrendered` (a page the rotation owns and has not rendered yet — the only group render capacity or
-order can move), `suppressed`, `error`. Each missed URL also goes into a per-cause distinct-URL sketch, so
+`unrendered` / `render-timeout` (a page the rotation owns and has not rendered yet, or an on-demand
+render that did not land in time — the only group render capacity or order can move), `suppressed`, `error`. Each missed URL also goes into a per-cause distinct-URL sketch, so
 `GET /prerender_admin/crawl-breadth` can say how many distinct URLs each cause is made of (`misses` per
 day, `missUnion` across the range). Requests per distinct URL is how many times a missed URL is asked
 for, which is what a render of it would serve; the days' distinct counts against the range's union say

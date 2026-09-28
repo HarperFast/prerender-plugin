@@ -1094,7 +1094,8 @@ export const MISS_FAMILIES = [
 		label: 'Waiting on a render',
 		verdict: 'the only family capacity moves',
 		means:
-			'Pages the rotation owns and has not rendered yet: the only family render capacity or render order can move.',
+			'Pages the rotation owns and has not rendered yet, and on-demand renders that did not land in time: the only ' +
+			'family render capacity or render order can move.',
 	},
 	{
 		key: 'error',
@@ -1111,9 +1112,13 @@ export const MISS_FAMILIES = [
  */
 export const MISS_CAUSES = {
 	'not-found': ['origin', 'the origin answered 404 or 410 — there is no page to render'],
-	'redirect': ['origin', 'the origin answered 3xx'],
+	'not-modified': [
+		'origin',
+		'the origin answered 304 to the crawler’s conditional GET — its copy is current, we hold none',
+	],
+	'redirect': ['origin', 'the origin answered 3xx (other than 304)'],
 	'client-error': ['origin', 'any other 4xx from the origin'],
-	'origin-error': ['origin', 'a 5xx from the origin, or the fetch failed'],
+	'origin-error': ['origin', 'a 5xx from the origin, or no status at all'],
 	'passthrough': ['rule', 'the route is not prerendered here, by configuration'],
 	'uncacheable': ['rule', 'a 2xx that is not a prerender candidate (non-200, or its headers said not to cache)'],
 	'gated-route': ['rule', 'a route that adds no targets from traffic (discoverTargets: false)'],
@@ -1122,6 +1127,7 @@ export const MISS_CAUSES = {
 	'suppressed': ['rule', 'a target the render verdict suppressed (noindex, canonical elsewhere, error)'],
 	'new': ['waiting', 'no target yet: this request minted one, its first render jittered across the interval'],
 	'unrendered': ['waiting', 'a target in rotation with no page for this device yet'],
+	'render-timeout': ['waiting', 'an on-demand render (renderNow) did not land in time; its fallback answered'],
 	// Configuration, not capacity: the rotation never renders a device outside deviceTypes.default, however
 	// much fleet there is — only the setting (or a render-now for that device) serves it.
 	'device': ['rule', 'a device outside deviceTypes.default, which the rotation never renders — config, not capacity'],

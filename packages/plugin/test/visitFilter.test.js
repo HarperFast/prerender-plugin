@@ -427,6 +427,63 @@ test('a shared buffer the store would free between uses is held, so a merge reac
 	}
 });
 
+test('under steady traffic a losing worker whose merges the winner keeps storing never writes', async () => {
+	// The one-writer design (#87): losers merge, one worker stores. A loser that took each new merge's
+	// generation BEFORE checking whether the previous one was covered looked unpaid forever and wrote
+	// the full row every other interval — 5.9 row writes per interval across 16 simulated workers.
+	const interval = 60_000;
+	setDemand({ flushInterval: interval });
+	resetVisitFilter();
+	const genOf = () => {
+		const key = [...sabs.keys()].find((k) => k.startsWith('visitFilter/gen/'));
+		return key ? new Int32Array(sabs.get(key)) : null;
+	};
+	const t0 = slotOf(Date.now()) * H + 1000; // stay inside one slot
+	for (let tick = 0; tick < 12; tick++) {
+		recordVisit(`https://example.com/product/prd-steady-${tick}`);
+		await flushSlices({ write: false, nowMs: t0 + tick * interval });
+		// the winner stores the slot within the interval, covering everything merged so far
+		const gen = genOf();
+		Atomics.store(gen, 1, Atomics.load(gen, 0));
+	}
+	assert.equal(rows.size, 0, 'the loser never paid a debt the winner was paying');
+});
+
+test('a debt re-armed while its store is in flight survives that store', async () => {
+	// A second flush on the same thread can merge again while the first put is still awaiting; deleting
+	// the debt unconditionally after the put dropped the newer merge — a false negative.
+	const interval = 60_000;
+	setDemand({ flushInterval: interval });
+	resetVisitFilter();
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const put = VisitFilter.put;
+	let release;
+	const stalled = new Promise((resolve) => (release = resolve));
+	let first = true;
+	VisitFilter.put = async (id, data) => {
+		if (first) {
+			first = false;
+			await stalled;
+		}
+		return put.call(VisitFilter, id, data);
+	};
+	try {
+		const now = slotOf(Date.now()) * H + 1000;
+		recordVisit('https://example.com/product/prd-early');
+		const storing = flushSlices({ write: true, nowMs: now }); // stalls inside the put
+		await new Promise((resolve) => setImmediate(resolve));
+		recordVisit('https://example.com/product/prd-during');
+		await flushSlices({ write: false, nowMs: now + 1 }); // merges while the store is in flight
+		release();
+		await storing;
+		await flushSlices({ write: false, nowMs: now + 3 * interval }); // overdue: the loser pays
+		await refreshMerged(now + 3 * interval + 5000);
+		assert.equal(visitedWithin('https://example.com/product/prd-during', H, now), true);
+	} finally {
+		VisitFilter.put = put;
+	}
+});
+
 test('a debt another worker already paid is forgotten, with no write', async () => {
 	const now = Date.now();
 	recordVisit('https://example.com/product/prd-paid');

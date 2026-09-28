@@ -425,3 +425,40 @@ test('a sketch only a losing worker saw is stored by that worker once two interv
 	assert.ok(row, 'two intervals overdue: stored by the worker that saw it');
 	assert.equal(row.estimate, 1);
 });
+
+test('a rollover with nothing dirty still pays the closed day’s debts before releasing its buffers', async (t) => {
+	// A rare series merged just before midnight on a turn this worker lost, and nothing dirty since:
+	// releasing the day's buffers at rollover before paying made the later payment read a fresh zeroed
+	// buffer and store an empty row. Model the free: a store that forgets any buffer nobody holds.
+	const store = globalThis.databases.coordination.SharedBuffer.primaryStore;
+	const original = store.getUserSharedBuffer;
+	store.getUserSharedBuffer = (_key, fresh) => fresh;
+	resetHeldSabs();
+	try {
+		t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-08-04T23:58:00Z') });
+		for (let i = 0; i < 50; i++) recordMissBreadth('unrendered', `https://site.example.com/p/${i}`);
+		await flushSketches({ write: false }); // merged, owed: a lost turn
+		t.mock.timers.setTime(Date.parse('2026-08-05T00:00:01Z'));
+		recordCrawl('Googlebot', 'https://site.example.com/new-day'); // rollover, nothing of that series dirty
+		await tick();
+		await tick();
+		const row = rows.get(`2026-08-04|${MISS_SERIES_PREFIX}unrendered|node-a`);
+		assert.ok(row, 'the closed day was paid at rollover');
+		assert.ok(Math.abs(row.estimate - 50) <= 2, `estimate ${row.estimate}`);
+	} finally {
+		store.getUserSharedBuffer = original;
+	}
+});
+
+test('under steady traffic a losing worker whose merges the winner keeps storing never writes', async () => {
+	applyOptions({ crawlStats: { flushInterval: 60_000 } });
+	const t0 = Date.parse(`${today()}T00:10:00Z`);
+	for (let tick = 0; tick < 12; tick++) {
+		recordMissBreadth('gated-route', `https://site.example.com/c/${tick}`);
+		await flushSketches({ write: false, nowMs: t0 + tick * 60_000 });
+		const key = [...sabs.keys()].find((k) => k.startsWith('crawlSketch/gen/') && k.endsWith('~miss:gated-route'));
+		const gen = new Int32Array(sabs.get(key));
+		Atomics.store(gen, 1, Atomics.load(gen, 0)); // the winner stored it within the interval
+	}
+	assert.equal(rows.size, 0, 'the loser never paid a debt the winner was paying');
+});

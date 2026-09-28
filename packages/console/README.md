@@ -235,10 +235,10 @@ sitemap fetches) ÷ crawler requests arrived`. Both sides are documents only —
   like origin throttling from outside. The Queue view's **changed pages waiting** is how many of those
   pages are still served from the origin, and how long the oldest has waited.
 - **Why requests missed** (Traffic, plugin v0.95.0) gives every origin-served miss one cause (`bot_miss`), in
-  three families: **nothing to render** (the origin answered 404/410, 3xx, another 4xx or 5xx), **held out by a
+  three families: **nothing to render** (the origin answered 404/410, 304 to a conditional GET, 3xx, another 4xx or 5xx), **held out by a
   rule or setting** (passthrough, uncacheable, the route/bot/entity discovery gates, suppressed, and device — a
   device outside `deviceTypes.default`, which the rotation never renders) and **waiting on a render** (new,
-  unrendered). Only the last is render capacity or order; it is a watch past 10% of bot
+  unrendered, and an on-demand render that did not land in time). Only the last is render capacity or order; it is a watch past 10% of bot
   requests and bad past 25%. Per route and per bot for the top causes. **Load URL breadth** (the same
   crawl-breadth read as Crawl breadth) adds each cause's distinct URLs, requests per URL — how often a missed
   URL is asked for, i.e. what a render of it would serve — and recurrence (the days' distinct URLs over their

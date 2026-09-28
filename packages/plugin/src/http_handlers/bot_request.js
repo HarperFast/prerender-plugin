@@ -69,7 +69,9 @@ export async function handleBotRequest(request) {
 			recordBots && info.cacheStatus === 'miss' && info.source === 'origin'
 				? (cause) => recordMiss(cause, { route: info.route, routeClass, cacheUrl, botName: request.botName })
 				: null;
-		maybeSchedule(resource, routeClass, route, request.botName, onMiss);
+		maybeSchedule(resource, routeClass, route, request.botName, onMiss, {
+			renderTimedOut: info.renderNowStatus === 'timeout',
+		});
 		recordDemand({ resource, routeClass, route, cacheUrl, botName: request.botName, cacheStatus: info.cacheStatus });
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
 		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
@@ -458,6 +460,9 @@ export function recordMiss(cause, { route, routeClass, cacheUrl, botName }) {
 // below say what kind of 200 miss it was.
 const statusCause = (statusCode) => {
 	if (statusCode === 404 || statusCode === 410) return 'not-found';
+	// A crawler's conditional GET the origin answered 304: the page is real and the crawler's copy is
+	// current, but we hold none. Not a redirect — the validators ride a plain miss to the origin.
+	if (statusCode === 304) return 'not-modified';
 	if (statusCode >= 300 && statusCode < 400) return 'redirect';
 	if (statusCode >= 400 && statusCode < 500) return 'client-error';
 	if (statusCode >= 200 && statusCode < 300) return 'uncacheable';
@@ -481,7 +486,14 @@ const statusCause = (statusCode) => {
 //
 // `onMiss`, when given, is told WHY this request missed (`recordMiss`) — exactly once, here for every
 // cause the gates decide and from `handlePageScheduling` for the rest. Exported for tests.
-export function maybeSchedule(resource, routeClass, route, botName, onMiss = null) {
+export function maybeSchedule(resource, routeClass, route, botName, onMiss = null, { renderTimedOut = false } = {}) {
+	// An on-demand render that did not land in time missed for THAT reason, whatever its fallback
+	// answered with (the origin, or render-now's own 504): the cause is render latency, not the status
+	// the fallback happened to return. Scheduling below proceeds as it would have, untold.
+	if (renderTimedOut && onMiss) {
+		onMiss('render-timeout');
+		onMiss = null;
+	}
 	if (routeClass !== PRERENDER) return onMiss?.('passthrough');
 	if (!resource.miss || resource.statusCode !== 200) return onMiss?.(statusCause(resource.statusCode));
 	if (route && route.discoverTargets === false) {

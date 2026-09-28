@@ -251,7 +251,12 @@ onConfigApplied(() => {
 	if (shapeOf() !== armedShape) {
 		// The old shape's buffers are never read again (every key carries the shape).
 		const oldShape = armedShape;
-		releaseSabs((key) => key.startsWith('visitFilter/') && key.includes(`/${oldShape}`));
+		releaseSabs(
+			(key) =>
+				key.startsWith(`visitFilter/bits/${oldShape}/`) ||
+				key.startsWith(`visitFilter/gen/${oldShape}/`) ||
+				key === `visitFilter/turn/${oldShape}`
+		);
 		armedShape = shapeOf();
 		// Drop BOTH sides of the in-memory state: old-shape write slices must not flush under
 		// the new numbering, and the union must not keep answering from old-shape rows. Then
@@ -263,6 +268,9 @@ onConfigApplied(() => {
 		// the sweep also deletes.)
 		slices = new Map();
 		dirty.clear();
+		// Old-shape debts point at buffers just released and at slot numbers the new shape does not
+		// use: paying one would store a zeroed new-shape row.
+		pendingWrite.clear();
 		slot = null;
 		slotEndMs = 0;
 		merged = new Map();
@@ -367,9 +375,20 @@ export async function flushSlices({ write = true, nowMs = Date.now() } = {}) {
 		// turn clears `dirty` without writing: without this the bits would sit in the shared
 		// buffer, unwritten, until some worker happened to have BOTH new traffic for that slot
 		// and the turn — and on a quiet node they would simply age out with the slot. That is a
-		// false negative, so the debt is held explicitly until a store covers it. A debt keeps the
-		// time it was FIRST owed, so a stream of merges cannot keep postponing its payment.
-		if (gen) pendingWrite.set(s, { gen, since: pendingWrite.get(s)?.since ?? nowMs });
+		// false negative, so the debt is held explicitly until a store covers it.
+		//
+		// WHEN IT BECAME OWED decides when this worker pays it itself, and it is the time of the oldest
+		// merge no store has covered — not of the first merge ever. A prior debt that a store already
+		// covered is PAID, so this merge opens a new one now; only a prior debt still unpaid keeps its
+		// older time (so a stream of merges cannot postpone a debt the winner is really not paying).
+		// Checking that BEFORE replacing the generation is load-bearing: under steady traffic the
+		// winner covers every merge within an interval, and taking the new generation first made every
+		// loser look unpaid forever and write the full row every other interval — 5.9 row writes per
+		// interval across 16 simulated workers, against 1.0 for the one-writer design this preserves.
+		if (!gen) continue;
+		const prior = pendingWrite.get(s);
+		const stillOwed = prior !== undefined && Atomics.load(generationOf(s), 1) < prior.gen;
+		pendingWrite.set(s, { gen, since: stillOwed ? prior.since : nowMs });
 	}
 	dirty.clear();
 
@@ -386,8 +405,10 @@ export async function flushSlices({ write = true, nowMs = Date.now() } = {}) {
 	// land, and a later flush retries only that.
 	for (const [s, debt] of [...pendingWrite]) {
 		if (!write && debt.since > overdueBefore) continue;
-		await persist(s);
-		pendingWrite.delete(s);
+		const covered = await persist(s);
+		// Only what the store covered is paid: a flush on this thread may have merged again while the
+		// put was awaiting, and that newer debt must survive this one's payment.
+		if ((pendingWrite.get(s)?.gen ?? Infinity) <= covered) pendingWrite.delete(s);
 	}
 }
 
@@ -423,6 +444,7 @@ async function persist(s) {
 		mutex.unlock();
 	}
 	markStored(generation, covered);
+	return covered;
 }
 
 /** Raise `stored` to `covered`, never lower it (a slower concurrent store may finish last). */

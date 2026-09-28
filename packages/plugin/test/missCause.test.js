@@ -96,6 +96,7 @@ test('the origin status decides dead URLs, redirects and errors — no Target re
 		[404, 'not-found'],
 		[410, 'not-found'],
 		[301, 'redirect'],
+		[304, 'not-modified'],
 		[403, 'client-error'],
 		[429, 'client-error'],
 		[502, 'origin-error'],
@@ -161,4 +162,14 @@ test('recordMiss emits cause, route label, bot — in that slot order', () => {
 			[true, 'bot_miss', 'passthrough', 'passthrough', 'Bingbot'],
 		]
 	);
+});
+
+test('an on-demand render that timed out is render-timeout, whatever its fallback answered — told once', async () => {
+	// fallback 'error' answers with render-now's own 504, fallback 'origin' with the origin's status;
+	// neither is why the request missed.
+	maybeSchedule(miss({ statusCode: 504 }), PRERENDER, route(), 'Googlebot', onMiss, { renderTimedOut: true });
+	maybeSchedule(miss(), PRERENDER, route(), 'Googlebot', onMiss, { renderTimedOut: true });
+	await settle();
+	assert.deepEqual(told, ['render-timeout', 'render-timeout'], 'never also origin-error or new');
+	assert.deepEqual(TargetBase.puts, [U], 'and the 200 fallback still schedules as it would have');
 });

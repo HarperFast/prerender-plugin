@@ -625,7 +625,8 @@ test('every bot_miss cause the plugin declares is labelled on Traffic, and the c
 			.filter(([, [family]]) => family === 'waiting')
 			.map(([cause]) => cause)
 			.sort(),
-		['new', 'unrendered']
+		['new', 'render-timeout', 'unrendered']
 	);
 	assert.equal(MISS_CAUSES.device[0], 'rule');
+	assert.equal(MISS_CAUSES['not-modified'][0], 'origin', 'a 304 is the origin answering, not a redirect');
 });
