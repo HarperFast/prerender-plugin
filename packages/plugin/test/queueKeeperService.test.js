@@ -124,7 +124,7 @@ before(async () => {
 			let closed = false;
 			return {
 				get closed() {
-					return closed;
+					return closed || record.closed === true; // a test closes it by marking the record
 				},
 				end: () => {
 					closed = true;
@@ -428,6 +428,89 @@ test('a stop that lands while the subscribe is in flight leaves no subscription 
 	assert.equal(s.phase, 'stopped');
 });
 
+test('a walk a resync needs is not lost when a verification is already running', async () => {
+	const now = Date.now();
+	seed(Array.from({ length: 40 }, (_, i) => row(itemKey(i), now - HOUR)));
+	const s = await started();
+	const heldBefore = s.keeper.size;
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	onKeysetSearch = () => {
+		onKeysetSearch = null;
+		return gate; // the periodic verification is part-way through
+	};
+	const periodic = s.verify();
+	await settle();
+	// A peer leaves: rows move to this node, some in the part the running walk has already passed.
+	server.nodes = [{ name: 'node-a' }];
+	await s.resync('membership', { walk: true });
+	release();
+	await periodic;
+	for (let i = 0; i < 10 && s.keeper.size < 40; i++) await settle();
+	assert.ok(heldBefore < 40);
+	assert.equal(s.keeper.size, 40, 'the queued walk ran and found the rows this node now owns');
+	s.stop();
+	server.nodes = CLUSTER;
+});
+
+test('a resubscribe that fails is tried again, after a backoff', async () => {
+	seed([row(item(1), Date.now() - HOUR)]);
+	let clock = Date.now();
+	const s = await started({ now: () => clock, retryMs: 5_000 });
+	const [record] = listeners;
+	record.closed = true;
+	let failNext = true;
+	const RS = databases.render_schedule.RenderSchedule;
+	const real = RS.subscribe;
+	RS.subscribe = async (opts) => {
+		if (failNext) {
+			failNext = false;
+			throw new Error('subscribe refused');
+		}
+		return real(opts);
+	};
+	try {
+		await s.publish(); // sees the closed subscription: the resync fails
+		await settle();
+		assert.equal(s.subscriptionOpen, false);
+		await s.publish();
+		await settle();
+		assert.equal(s.subscriptionOpen, false, 'not hammered: waits out the backoff');
+		clock += 5_001;
+		await s.publish();
+		for (let i = 0; i < 5 && !s.subscriptionOpen; i++) await settle();
+		assert.equal(s.subscriptionOpen, true, 'tried again, and open');
+		assert.ok(funnel.readKeeperSignal().serving, 'serving throughout');
+	} finally {
+		RS.subscribe = real;
+		s.stop();
+	}
+});
+
+test('a config change during the load is applied when the load ends', async () => {
+	const now = Date.now();
+	seed([row(HOME, now - HOUR), row(item(1), now - HOUR)]);
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	let calls = 0;
+	onKeysetSearch = () => {
+		if (++calls === 2) return gate;
+	};
+	const s = service.createKeeperService({ log: null, countPeers: async () => 1 });
+	const loading = s.start();
+	await settle();
+	assert.equal(s.phase, 'loading');
+	applyOptions({
+		ingress: { mode: 'forwarded', routes: [{ match: 'exact', path: '/', queryParams: [], renderInterval: 3 * HOUR }] },
+	});
+	s.resync('the routes changed');
+	release();
+	await loading;
+	for (let i = 0; i < 5 && s.keeper.describe(HOME)?.cadenceMs !== 3 * HOUR; i++) await settle();
+	assert.equal(s.keeper.describe(HOME).cadenceMs, 3 * HOUR, 'reclassified under the new route once live');
+	s.stop();
+});
+
 test('a resync reopens a closed subscription and goes on serving throughout', async () => {
 	seed([row(item(1), Date.now() - HOUR)]);
 	const s = await started();
@@ -578,25 +661,42 @@ test('the keeper announces its own transitions: queued when it goes live, unread
 	assert.equal(QueueState.status, 'unready');
 });
 
-test('a row whose leases keep expiring with no result is filed forward, not granted forever', async () => {
+test('a key whose leases keep expiring with no result is held back, ever longer, until a result comes', async () => {
 	const realNow = Date.now;
 	let clock = realNow();
 	Date.now = () => clock;
 	try {
 		seed([row(item(1), clock - HOUR)]);
 		const s = await started({ now: () => clock });
+		const lease = config.queue.jobLeaseTime;
+		const claimOne = async () => {
+			await s.publish();
+			return funnel.claimSchedules({ grantLimit: 1 });
+		};
 		const limit = config.render.failureRetry.fastRetries + 2;
 		for (let i = 0; i < limit; i++) {
-			await s.publish();
-			const pass = await funnel.claimSchedules({ grantLimit: 1 });
-			assert.equal(pass.jobs.length, 1, `lease ${i + 1} granted`);
-			clock += config.queue.jobLeaseTime + 1_000; // expires with no result: a renderer crash
+			assert.equal((await claimOne()).jobs.length, 1, `lease ${i + 1} granted`);
+			clock += lease + 1_000; // expires with no result: a renderer crash, or a result that never arrives
 		}
-		await s.publish();
-		const pass = await funnel.claimSchedules({ grantLimit: 1 });
-		assert.equal(pass.jobs.length, 0, 'not granted again');
-		assert.deepEqual(pass.wedged, [item(1)]);
-		assert.ok(Number(table.get(item(1)).nextRenderTime) > clock, 'filed forward');
+		let pass = await claimOne();
+		assert.equal(pass.jobs.length, 0, 'held back, not granted again');
+		assert.equal(pass.wedged[0].cacheKey, item(1));
+		assert.equal(pass.wedged[0].backoff, 2 * lease, 'two leases first');
+		assert.equal(Number(table.get(item(1)).nextRenderTime) <= clock, true, 'nothing durable was written');
+
+		clock += 2 * lease + 1_000;
+		assert.equal((await claimOne()).jobs.length, 1, 'one more attempt once the hold ends');
+		clock += lease + 1_000; // ...which fails to report too
+		pass = await claimOne();
+		assert.equal(pass.wedged[0].backoff, 4 * lease, 'and the next hold is twice as long');
+
+		clock += 4 * lease + 1_000;
+		assert.equal((await claimOne()).jobs.length, 1);
+		funnel.releaseLease(item(1)); // a result arrives
+		clock += lease + 1_000;
+		pass = await claimOne();
+		assert.equal(pass.jobs.length, 1, 'a result resets the count: granted normally again');
+		assert.deepEqual(pass.wedged, []);
 		s.stop();
 	} finally {
 		Date.now = realNow;

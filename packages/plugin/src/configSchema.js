@@ -2460,17 +2460,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'publish is re-read and repaired, and a periodic verification walk (`verifyInterval`) repairs ' +
 				'anything it missed. Costs about 200 bytes of heap per row on worker 0 (about 50MB at 250k ' +
 				'rows), and a load by primary key at start: about 1s per 250k rows on a fresh store, expected ' +
-				'tens of seconds on a churned one. UNTIL IT IS LIVE THIS NODE GRANTS NO CLAIMS and reports ' +
-				'`unready`, and going live is broadcast as `queued`/`empty` at once; on a single node it first ' +
-				'waits up to two minutes for a cluster peer, since residency ownership is not knowable before ' +
-				'the node list is.',
+				'tens of seconds on a churned one — SERVED WHILE IT RUNS: the ready set is published from the ' +
+				'first chunk, so a restarted node grants claims within about a publish interval. Once live it is ' +
+				'never reloaded: a route or default-interval change reclassifies rows in memory, and a membership ' +
+				'change drops the rows this node no longer owns and walks the table for the ones it gained, all ' +
+				'while serving. Until its first publish the node reports `unready` and grants nothing. A node ' +
+				'whose `system.hdb_nodes` names another node first waits (up to two minutes) to see one, since ' +
+				'residency ownership is not knowable before the node list is; a single node does not wait.',
 			{
 				publishInterval: option(
 					1000,
 					'How often worker 0 republishes the ready set from the keeper, and the longest a row that comes ' +
 						'due waits before it can be claimed. A publish is skipped when nothing it depends on changed ' +
-						'(forced every 10s regardless). The claim path stops trusting a keeper it has not heard from ' +
-						'in ten intervals (never under 30s) and grants nothing until it is heard from again.',
+						'(forced every 10s regardless). A keeper not heard from in ten intervals (never under 30s) is ' +
+						'reported stale but still served from — every entry is checked against its row — until its ' +
+						'last set drains; then the node reports `unready`.',
 					{ unit: 'ms', min: 100, max: 2147483647 }
 				),
 				verifyInterval: option(

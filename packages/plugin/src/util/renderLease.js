@@ -67,7 +67,8 @@ const S_HI = 1;
 const S_EXPIRES = 2;
 const S_DUE = 3;
 // How many of this key's leases in a row EXPIRED rather than being released: the result never came
-// (a renderer crash), or the fast-retry lane held it. Reset by a release. See `missesBeforeGrant`.
+// (a renderer crash, a result that could not get back to this node), or the fast-retry lane held it.
+// Reset by a release. See `missesBeforeGrant` and `hold`.
 const S_MISSES = 4;
 const SLOT_INT32 = 5;
 
@@ -83,6 +84,13 @@ const SLOT_INT32 = 5;
  * the console report every just-finished render as in flight.
  */
 const DUE_RELEASED = -1;
+
+/**
+ * `dueMinute` of a slot that is HELD BACK rather than leased (see `hold`): the key is unclaimable until
+ * the expiry, but nothing is being rendered, so it counts in no gauge, and the miss count it carries is
+ * neither reset (no result came) nor advanced (no render was attempted).
+ */
+const DUE_HELD = -2;
 
 /**
  * How long a released lease keeps its key unclaimable, covering the visibility gap between the
@@ -173,7 +181,7 @@ export const createLeaseTable = ({
 	const isCounted = (at, nowSec) =>
 		Atomics.load(i32, at + S_LO) !== 0 &&
 		isLive(Atomics.load(i32, at + S_EXPIRES), nowSec) &&
-		Atomics.load(i32, at + S_DUE) !== DUE_RELEASED;
+		Atomics.load(i32, at + S_DUE) >= 0;
 
 	/** "Is this key claimable?" — the expiry alone, so a released lease still blocks through its
 	 *  grace. See DUE_RELEASED for why this is deliberately not the same question as `leaseOf`. */
@@ -222,13 +230,13 @@ export const createLeaseTable = ({
 	 * then sees the other's live slot gives its own back, so at most one is granted (both backing out is
 	 * possible, and costs one claim attempt).
 	 */
-	const grant = (cacheKey, { dueMinute, leaseExpiryMs } = {}) => {
+	const grant = (cacheKey, { dueMinute, leaseExpiryMs, held = false } = {}) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
 		const { found, free } = locate(lo, hi, nowSec);
 		const expiresSec = toExpiresSec(leaseExpiryMs);
-		// Clamped at 0 so a caller's junk value can never land on the DUE_RELEASED marker.
-		const due = Math.max(0, dueMinute | 0);
+		// Clamped at 0 so a caller's junk value can never land on a marker.
+		const due = held ? DUE_HELD : Math.max(0, dueMinute | 0);
 
 		if (found !== -1) {
 			const at = base(found);
@@ -238,7 +246,7 @@ export const createLeaseTable = ({
 			Atomics.store(i32, at + S_DUE, due);
 			if (Atomics.compareExchange(i32, at + S_EXPIRES, observed, expiresSec) !== observed) return false;
 			Atomics.store(i32, at + S_MISSES, misses);
-			Atomics.add(i32, H_OCCUPANCY, 1);
+			if (!held) Atomics.add(i32, H_OCCUPANCY, 1);
 			return true;
 		}
 
@@ -255,19 +263,35 @@ export const createLeaseTable = ({
 			Atomics.compareExchange(i32, at + S_LO, lo, 0);
 			return false;
 		}
-		Atomics.add(i32, H_OCCUPANCY, 1);
+		if (!held) Atomics.add(i32, H_OCCUPANCY, 1);
 		return true;
 	};
 
-	/** The expired lease in the slot at `at` counts as a miss unless it was released. */
-	const missesOf = (at) =>
-		Atomics.load(i32, at + S_DUE) === DUE_RELEASED ? 0 : Math.max(0, Atomics.load(i32, at + S_MISSES)) + 1;
+	/**
+	 * Hold `cacheKey` back until `untilMs` without leasing it: the backoff for a key whose renders keep
+	 * failing to report (see `claimSchedules`). Node-local and lost on restart, deliberately — it writes
+	 * nothing durable, so a restart simply gives the key another attempt. A result that arrives for the
+	 * key meanwhile (`release`) ends the hold after the usual grace and resets its miss count.
+	 */
+	const hold = (cacheKey, untilMs) => grant(cacheKey, { leaseExpiryMs: untilMs, held: true });
 
 	/**
-	 * How many of `cacheKey`'s leases in a row will have expired without a result if it is granted now:
-	 * 0 when it holds no expired slot, or its last lease was released. The claim path bounds a render
-	 * that never reports (see `claimSchedules`). An undercount when the slot has been recycled by
-	 * another key, never an overcount.
+	 * The miss count a grant into the expired slot at `at` carries: reset by a release, carried unchanged
+	 * through a hold (no render was attempted), and advanced by one for a lease that simply expired.
+	 */
+	const missesOf = (at) => {
+		const due = Atomics.load(i32, at + S_DUE);
+		const stored = Math.max(0, Atomics.load(i32, at + S_MISSES));
+		if (due === DUE_RELEASED) return 0;
+		return due === DUE_HELD ? stored : stored + 1;
+	};
+
+	/**
+	 * How many of `cacheKey`'s leases in a row have just expired without a result: 0 when it holds no
+	 * expired slot, when its last lease was released, and when what just ended was a HOLD — the attempt
+	 * after a hold is always granted, carrying the count, so a key that still fails to report is held
+	 * again for twice as long. The claim path uses it to bound a render that never reports (see
+	 * `claimSchedules`). An undercount when the slot has been recycled by another key, never an overcount.
 	 */
 	const missesBeforeGrant = (cacheKey) => {
 		const { lo, hi } = lease64(cacheKey);
@@ -276,6 +300,7 @@ export const createLeaseTable = ({
 		if (found === -1) return 0;
 		const at = base(found);
 		if (isLive(Atomics.load(i32, at + S_EXPIRES), nowSec)) return 0;
+		if (Atomics.load(i32, at + S_DUE) === DUE_HELD) return 0;
 		return missesOf(at);
 	};
 
@@ -334,7 +359,7 @@ export const createLeaseTable = ({
 		// would decrement the occupancy gauge for a grant that was only ever counted once.
 		const dueMinute = Atomics.load(i32, at + S_DUE);
 		if (dueMinute === DUE_RELEASED) return false;
-		const wasCounted = isCounted(at, nowSec);
+		const wasCounted = isCounted(at, nowSec); // false for a hold: it was never counted
 		if (Atomics.compareExchange(i32, at + S_DUE, dueMinute, DUE_RELEASED) !== dueMinute) return false;
 
 		// Shorten to the grace, never lengthen (a lease that already expired stays expired), and only
@@ -382,7 +407,18 @@ export const createLeaseTable = ({
 	/** Zero everything. Tests only — see `resetRenderQueueState` in util/renderSchedule.js. */
 	const resetAll = () => i32.fill(0);
 
-	return { slots: slotCount, isLeased, grant, release, occupancy, scanLive, leaseOf, missesBeforeGrant, resetAll };
+	return {
+		slots: slotCount,
+		isLeased,
+		grant,
+		hold,
+		release,
+		occupancy,
+		scanLive,
+		leaseOf,
+		missesBeforeGrant,
+		resetAll,
+	};
 };
 
 /** The named cross-worker buffer this table lives in. Versioned, so a layout change gets a new name

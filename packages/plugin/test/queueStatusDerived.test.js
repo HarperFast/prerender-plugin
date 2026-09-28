@@ -152,7 +152,11 @@ test('a keeper that is not serving, or is still loading with nothing found yet, 
 	assert.equal(funnel.deriveQueueStatus(), 'queued', 'loading, and work already found');
 	keeperHolds(0);
 	assert.equal(funnel.deriveQueueStatus(), 'empty');
-	assert.equal(funnel.deriveQueueStatus(Date.now() + 5 * MINUTE), 'empty', 'a quiet keeper is still served from');
+	assert.equal(
+		funnel.deriveQueueStatus(Date.now() + 5 * MINUTE),
+		'unready',
+		'a keeper gone quiet whose set has drained can grant nothing: its worker may be gone for good'
+	);
 });
 
 test('becoming ready is a CHANGE, written once, so the fleet is told at once', async () => {

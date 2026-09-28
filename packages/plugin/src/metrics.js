@@ -462,8 +462,9 @@ export const METRICS = Object.freeze({
 					'claim_stale = ready-set entries a claim skipped because the durable row was no longer due ' +
 					'(rendered, rescheduled or deleted after the keeper published it): renders the check saved. A ' +
 					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late. ' +
-					'claim_wedged = rows a claim filed one cadence forward instead of granting, because their last ' +
-					'leases all expired with no result (a renderer crashing or hanging on the URL); the log names them.',
+					'claim_wedged = keys a claim held back instead of granting (an exponential hold in the lease table, ' +
+					'capped at the cadence) because their last leases all expired with no result: a renderer crashing ' +
+					'on the URL, or, when many appear at once, results not reaching this node. The log names them.',
 			},
 			method: {
 				name: 'source (claim_granted)',

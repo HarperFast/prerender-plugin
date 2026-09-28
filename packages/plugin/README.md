@@ -532,17 +532,31 @@ table is read by primary key only, and `nextRenderTime` carries no index
   expected 0), which bounds a missed write to one interval. A repair never overwrites a newer write: it
   applies the read only if the keeper's entry did not change during it.
 - **Ownership.** It holds only rows this node owns by residency, so a stale row left by an earlier
-  ownership (a "residency ghost") is never rendered. It waits for a cluster peer to be visible before
-  loading (up to two minutes, for a single-node deployment), reloads if the node list changes during
-  the load, and rebuilds on a later change of membership, routes or default interval. A row stored here
-  but owned elsewhere is not held; the verification walk counts them (`trust.keeper.verify.unowned`).
-- **Until it is live, this node grants no claims.** It reports the queue status `unready` (a
-  render fleet that predates it reads an unknown status as `empty` and polls at its idle interval),
-  and `queue-state` answers 503. Going live is reported at once as `queued` or `empty`, so the fleet
-  is woken by the change rather than finding out on its next idle poll. A keeper that stops publishing loses the
-  claim path after ten publish intervals (never under 30 s). A load that cannot get past an
-  unreadable row goes live on what it read, marked `exact: false`, and logs an error: a partial
-  queue, filled in as rows are written, rather than none.
+  ownership (a "residency ghost") is never rendered. A node with configured peers (`system.hdb_nodes`
+  names another node) waits to see one before loading, up to two minutes; a single node loads at once.
+  A row stored here but owned elsewhere is not held; the verification walk counts them
+  (`trust.keeper.verify.unowned`).
+- **It serves while it loads, and never reloads once live.** The ready set is published from the first
+  chunk of the load (every grant is checked against its row, so a partial queue is safe; only its order
+  is incomplete for the first seconds). After that nothing reloads: a route or default-interval change
+  reclassifies every held row in memory; a membership change drops the rows this node no longer owns
+  in memory and runs the verification walk to add the ones it gained; a closed subscription is reopened
+  and walked. Claims are served throughout.
+- **Until its first publish, this node grants no claims** and reports the queue status `unready` (a
+  render fleet that predates it reads an unknown status as `empty` and polls at its idle interval).
+  `queue-state` answers 503 until the load finishes. Each change of status is reported by the keeper at
+  once, so the fleet is woken by it rather than finding out on its next idle poll.
+- **An unreadable row does not hide the rows past it.** When the load's walk cannot get past a key that
+  did not decode, the rest of the table is read from the top down to it. Only if that stops short too is
+  the queue partial (`exact: false`, logged).
+- **A render that never reports is bounded.** A key whose last `render.failureRetry.fastRetries + 2`
+  leases all expired with no result (a renderer crashing on the URL, or results not reaching this
+  node) is held back in the lease table instead of granted again: two leases, then four, eight, …
+  capped at its cadence. Nothing durable is written and no strike is counted; the first result that
+  arrives for the key clears it, so a node-wide delivery outage delays rows by a few leases, not by a
+  cadence. Named in a warning and counted (`queue_health` `claim_wedged`).
+- **A stalled worker 0 degrades, it does not stop claims.** Its last published set is still granted from,
+  each entry checked against its row, until it drains; only then does the node report `unready`.
 
 Measured before it was built ([#215](https://github.com/HarperFast/prerender-plugin/issues/215);
 harnesses in [#216](https://github.com/HarperFast/prerender-plugin/pull/216) and

@@ -220,12 +220,14 @@ export const getScheduleRow = (cacheKey, select) =>
  * `unready`. A keeper that is serving but has gone quiet is still served from: every entry is checked
  * against its row, so its last set stays safe to grant from until it drains.
  *
- * A RENDER THAT NEVER REPORTS IS BOUNDED HERE. A lease that expires with no result (a renderer crash)
- * leaves the row due, so the key would be granted again at every expiry, forever. The lease table counts
- * those misses; past the fast-retry lane's own holds (`render.failureRetry.fastRetries`) plus one, the
- * row is filed one cadence forward instead of granted, and named (`pass.wedged`). No strike is counted —
- * `strikes` is what suppression and redirect verdicts delete targets on, so a broad renderer outage must
- * not walk the corpus toward deletion.
+ * A RENDER THAT NEVER REPORTS IS BOUNDED HERE. A lease that expires with no result — a renderer crashing
+ * on the URL, or a result that cannot get back to this node — leaves the row due, so the key would be
+ * granted again at every expiry, forever. The lease table counts those misses; past the fast-retry
+ * lane's own holds (`render.failureRetry.fastRetries`) plus one, the key is HELD BACK in the lease table
+ * instead of granted — two leases, then four, eight, … capped at its cadence — and named (`pass.wedged`).
+ * Nothing durable is written, no strike is counted, and the first result that comes back for the key
+ * resets it: so a node-wide delivery outage delays rows by a few leases, not by a cadence, while a URL
+ * that genuinely crashes the renderer is retried ever more rarely.
  *
  * No mutex: the ready-set cursor hands each entry to one taker, and the lease grant is exclusive
  * (`util/renderLease.js`), so claims on every worker run concurrently.
@@ -245,6 +247,8 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 		leaseRefused: false,
 		occupancy: 0,
 		wedged: [],
+		// the keeper has read the whole table, so finding nothing due means empty
+		complete: keeper.complete,
 	};
 	if (!keeper.serving || wanted === 0) {
 		pass.occupancy = leases.occupancy();
@@ -275,20 +279,16 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 				pass.skippedStale++;
 				continue;
 			}
-			if (leases.missesBeforeGrant(entry.cacheKey) > missLimit) {
+			const misses = leases.missesBeforeGrant(entry.cacheKey);
+			if (misses > missLimit) {
 				const carried = Number(row.effectiveInterval);
-				const interval =
+				const cadence =
 					Number.isFinite(carried) && carried > 0
 						? carried
 						: resolveRenderInterval(CacheKey.urlOf(entry.cacheKey), null);
-				await writeSchedule(entry.cacheKey, {
-					nextRenderTime: nowMs + interval,
-					fromSitemap: !!row.fromSitemap,
-					effectiveInterval: interval,
-				});
-				// Marks the expired lease released, so the count starts again after the push.
-				leases.release(entry.cacheKey);
-				pass.wedged.push(entry.cacheKey);
+				const backoff = Math.min(cadence, leaseTimeMs * 2 ** Math.min(20, misses - missLimit));
+				if (leases.hold(entry.cacheKey, nowMs + backoff))
+					pass.wedged.push({ cacheKey: entry.cacheKey, misses, backoff });
 				continue;
 			}
 			const expiresAtMs = nowMs + leaseTimeMs;
@@ -441,10 +441,14 @@ export const readKeeperSignal = (nowMs = Date.now()) => {
 	const heartbeatAt = sec === 0 ? null : (sec + READY_EPOCH_SEC) * 1000;
 	const ageMs = heartbeatAt === null ? null : Math.max(0, nowMs - heartbeatAt);
 	const live = Atomics.load(view, KS_LIVE) === 1;
+	const stale = live && (ageMs === null || ageMs > keeperFreshMs());
 	return {
 		live,
-		serving: live,
-		stale: live && (ageMs === null || ageMs > keeperFreshMs()),
+		// A stale keeper is served from until its last set drains; after that it is not serving at all
+		// — its worker may be gone for good (a replacement that never started its keeper), and `queued`
+		// forever would keep the fleet polling a node that can grant nothing.
+		serving: live && (!stale || readyQueue().state().remaining > 0),
+		stale,
 		complete: Atomics.load(view, KS_COMPLETE) === 1,
 		heartbeatAt,
 		ageMs,

@@ -180,13 +180,17 @@ export const createKeeperService = ({
 	let verifying = false;
 	let resyncing = false;
 	let pendingResync = null;
+	/** No resync is started before this (ms): the backoff after one failed. */
+	let resyncRetryAt = 0;
+	/** A walk was asked for (by a resync) and has not run to completion yet. */
+	let walkWanted = false;
 	let lastDue = 0;
 	let lastReported = null;
 	let lastPublishKey = null;
 	let failures = 0;
 	let nodesKey = null;
 	const checkedAt = new Map();
-	const timers = { publish: null, state: null, verify: null, retry: null };
+	const timers = { publish: null, state: null, verify: null, retry: null, walkRetry: null };
 	const stats = {
 		loadStartedAt: null,
 		loadedAt: null,
@@ -379,7 +383,8 @@ export const createKeeperService = ({
 		phase = 'loading';
 		nodesKey = getNodes().join(',');
 		keeper = createQueueKeeper({ classify: classifyScheduleRow, now });
-		touched = new Set();
+		const loadTouched = new Set();
+		touched = loadTouched;
 		stats.loadStartedAt = now();
 		stats.unreadableRows = 0;
 		stats.partialLoad = null;
@@ -396,10 +401,10 @@ export const createKeeperService = ({
 			timers.publish = every(publish, config.queue.keeper.publishInterval);
 			timers.state = every(writeState, config.queue.keeper.stateInterval);
 			const walked = await walkAll(mine, (row) => {
-				if (!touched.has(row.cacheKey)) keeper.apply(row.cacheKey, row, { quiet: true });
+				if (!loadTouched.has(row.cacheKey)) keeper.apply(row.cacheKey, row, { quiet: true });
 			});
 			if (walked === null) return;
-			touched = null;
+			if (touched === loadTouched) touched = null;
 			stats.loadRows = walked.rows;
 			stats.unreadableRows = walked.unreadable;
 			stats.partialLoad = walked.partial;
@@ -426,12 +431,24 @@ export const createKeeperService = ({
 			if (mine !== epoch) return;
 			writeState();
 			if (config.queue.keeper.verifyInterval > 0) timers.verify = every(verify, config.queue.keeper.verifyInterval);
-			if (getNodes().join(',') !== nodesKey) resync('the node list changed during the load', { walk: true });
+			// What was asked for while loading (a config change, an event that could not be applied), and a
+			// node list that moved under the load.
+			const deferred = pendingResync;
+			pendingResync = null;
+			if (getNodes().join(',') !== nodesKey) {
+				resync(`the node list changed during the load${deferred ? `; ${deferred.why}` : ''}`, {
+					walk: true,
+					resubscribe: !!deferred?.resubscribe,
+				});
+			} else if (deferred) {
+				resync(deferred.why, deferred);
+			}
 		} catch (e) {
 			if (mine !== epoch) return;
 			phase = 'failed';
 			stats.lastError = messageOf(e);
 			touched = null;
+			pendingResync = null;
 			clearTimers();
 			endSubscription();
 			withdraw();
@@ -453,6 +470,8 @@ export const createKeeperService = ({
 		touched = null;
 		complete = false;
 		failures = 0;
+		pendingResync = null;
+		walkWanted = false;
 		phase = 'stopped';
 		writeState();
 	};
@@ -486,8 +505,9 @@ export const createKeeperService = ({
 	 * table can tell. Coalesced: a request while one runs is merged into the next.
 	 */
 	const resync = (why, { resubscribe = false, walk = false } = {}) => {
-		if (phase !== 'live') return Promise.resolve();
-		if (resyncing) {
+		if (phase !== 'live' && phase !== 'loading') return Promise.resolve();
+		// While loading (or while one runs), merged into the next: the load runs it when it goes live.
+		if (resyncing || phase === 'loading') {
 			pendingResync = {
 				why: pendingResync ? `${pendingResync.why}; ${why}` : why,
 				resubscribe: resubscribe || !!pendingResync?.resubscribe,
@@ -507,9 +527,12 @@ export const createKeeperService = ({
 					if (mine !== epoch) return endSubscription(sub);
 					subscription = sub;
 				}
-				nodesKey = getNodes().join(',');
+				// Recorded only once the keeper holds rows by it, so a failed resync is noticed again.
+				const nodes = getNodes().join(',');
 				const reclassified = await reclassify(mine);
 				if (reclassified === null) return;
+				nodesKey = nodes;
+				if (walk) walkWanted = true;
 				const verified = walk ? await verify() : null;
 				stats.lastResync = {
 					at: now(),
@@ -521,7 +544,11 @@ export const createKeeperService = ({
 				lastPublishKey = null;
 			} catch (e) {
 				stats.lastError = messageOf(e);
-				log?.error?.(`[prerender] queue keeper resync failed (${why}): ${stats.lastError}`);
+				resyncRetryAt = now() + retryMs;
+				log?.error?.(
+					`[prerender] queue keeper resync failed (${why}): ${stats.lastError}; serving meanwhile, retrying in ` +
+						`${Math.round(retryMs / 1000)}s.`
+				);
 			} finally {
 				resyncing = false;
 				const next = pendingResync;
@@ -542,11 +569,15 @@ export const createKeeperService = ({
 		const mine = epoch;
 		const started = performance.now();
 		try {
-			if (phase === 'live') {
-				if (subscription?.closed) resync('its subscription closed', { resubscribe: true, walk: true });
-				const nodes = getNodes().join(',');
-				if (nodes !== nodesKey && !resyncing) {
-					resync(`the cluster's node list changed (${nodesKey || 'none'} -> ${nodes})`, { walk: true });
+			if (phase === 'live' && !resyncing && now() >= resyncRetryAt) {
+				// No subscription at all is a resubscribe that failed: try again, as for a closed one.
+				if (!subscription || subscription.closed) {
+					resync('its subscription is not open', { resubscribe: true, walk: true });
+				} else {
+					const nodes = getNodes().join(',');
+					if (nodes !== nodesKey) {
+						resync(`the cluster's node list changed (${nodesKey || 'none'} -> ${nodes})`, { walk: true });
+					}
 				}
 			}
 			const nowMs = now();
@@ -611,12 +642,17 @@ export const createKeeperService = ({
 	 * a row this node has just come to own.
 	 */
 	const verify = async () => {
+		// One at a time; a walk asked for meanwhile (`walkWanted`) runs when this one ends.
 		if (phase !== 'live' || verifying) return null;
 		verifying = true;
+		const wanted = walkWanted;
+		walkWanted = false;
 		const mine = epoch;
 		const started = performance.now();
 		const result = { at: now(), scanned: 0, owned: 0, unowned: 0, missing: 0, mismatched: 0, phantoms: 0 };
-		touched = new Set();
+		const verifyTouched = new Set();
+		touched = verifyTouched;
+		let ok = false;
 		try {
 			const seen = new Set();
 			const walked = await walkAll(mine, (row) => {
@@ -631,7 +667,7 @@ export const createKeeperService = ({
 				}
 				// An event since the walk began is newer than this read; the walk's own value is not
 				// needed. Otherwise the walked row IS the table's value, newer than anything held.
-				if (touched.has(key)) return;
+				if (verifyTouched.has(key)) return;
 				const held = keeper.describe(key);
 				if (!described) {
 					if (held !== null) {
@@ -650,7 +686,7 @@ export const createKeeperService = ({
 			// when the walk covered the whole table — a part it could not read proves nothing.
 			if (!walked.partial) {
 				for (const key of keeper.keys()) {
-					if (seen.has(key) || touched.has(key)) continue;
+					if (seen.has(key) || verifyTouched.has(key)) continue;
 					if (mine !== epoch || !keeper) return null;
 					if (await repairFromTable(key)) result.phantoms++;
 				}
@@ -671,14 +707,28 @@ export const createKeeperService = ({
 				);
 			}
 			lastPublishKey = null;
+			ok = true;
 			return result;
 		} catch (e) {
 			stats.lastError = messageOf(e);
 			log?.error?.(`[prerender] queue keeper verification failed: ${stats.lastError}`);
 			return null;
 		} finally {
-			touched = null;
+			if (touched === verifyTouched) touched = null;
 			verifying = false;
+			if (mine === epoch) {
+				if (!ok && wanted && !timers.walkRetry) {
+					// A walk a resync depends on (rows gained, writes missed) must not wait out the interval.
+					timers.walkRetry = setTimeout(() => {
+						timers.walkRetry = null;
+						walkWanted = true;
+						verify();
+					}, retryMs);
+					timers.walkRetry.unref?.();
+				} else if (walkWanted) {
+					setImmediate(verify);
+				}
+			}
 		}
 	};
 
@@ -725,13 +775,16 @@ export const createKeeperService = ({
 		publish,
 		verify,
 		writeState,
-		/** Re-arm the timers after an interval change; no-op unless live. */
+		/** Re-arm the timers after an interval change; the verification timer only once live. */
 		rearm() {
-			if (phase !== 'live') return;
+			if (!serving()) return;
 			for (const name of ['publish', 'state', 'verify']) if (timers[name]) clearInterval(timers[name]);
 			timers.publish = every(publish, config.queue.keeper.publishInterval);
 			timers.state = every(writeState, config.queue.keeper.stateInterval);
-			timers.verify = config.queue.keeper.verifyInterval > 0 ? every(verify, config.queue.keeper.verifyInterval) : null;
+			timers.verify =
+				phase === 'live' && config.queue.keeper.verifyInterval > 0
+					? every(verify, config.queue.keeper.verifyInterval)
+					: null;
 		},
 		get phase() {
 			return phase;

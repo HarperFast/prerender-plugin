@@ -1321,15 +1321,20 @@ export class RenderQueue extends Resource {
 		// Ready-set entries the durable row showed were no longer due (rendered, rescheduled or deleted
 		// since the keeper published them): each one is a render the check saved.
 		if (pass.skippedStale > 0) metrics.queueHealth(pass.skippedStale, 'claim_stale');
-		// Rows whose renders never reported, filed one cadence forward instead of granted again. Each one is
-		// a URL to look at: the renderer is crashing or hanging on it.
+		// Keys whose renders keep failing to report, held back instead of granted again (see
+		// `claimSchedules`). Each is a URL to look at — or, when there are many at once, a sign that
+		// results are not getting back to this node.
 		if (pass.wedged.length > 0) {
 			metrics.queueHealth(pass.wedged.length, 'claim_wedged');
+			const sample = pass.wedged
+				.slice(0, 3)
+				.map((w) => `${w.cacheKey} (${w.misses} leases, held ${Math.round(w.backoff / 60_000)} min)`)
+				.join(', ');
 			logger.warn(
-				`[prerender] ${pass.wedged.length} row(s) whose last ${config.render.failureRetry.fastRetries + 2} leases ` +
-					`expired with no result were filed one cadence forward instead of granted again: ` +
-					`${pass.wedged.slice(0, 3).join(', ')}${pass.wedged.length > 3 ? ', …' : ''}. The renderer is crashing ` +
-					`or hanging on these URLs; no strike was counted.`
+				`[prerender] ${pass.wedged.length} key(s) whose last leases all expired with no result were held back ` +
+					`instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
+					`crashing or hanging on these URLs, or results are not reaching this node. No strike was counted, and ` +
+					`the first result that arrives for a key clears its hold.`
 			);
 		}
 
@@ -1390,7 +1395,9 @@ export class RenderQueue extends Resource {
 			// backlog is entirely in flight — reporting `empty` there tells every consumer in the fleet to
 			// back off to its idle interval while there is work. And a keeper that is not serving is
 			// `unready`, so that it becoming ready is a change the fleet is told about.
-			QueueState.reportStatus(!pass.keeperServed ? 'unready' : pass.sawDue ? 'queued' : 'empty');
+			QueueState.reportStatus(
+				!pass.keeperServed ? 'unready' : pass.sawDue ? 'queued' : pass.complete ? 'empty' : 'unready'
+			);
 		}
 
 		return jobs;
