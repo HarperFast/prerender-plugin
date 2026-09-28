@@ -27,7 +27,7 @@
  * cookies, not arbitrary headers, not upstream set-cookie beyond login's capture.
  *
  * THE DEFAULT SCOPE IS THE CLUSTER, not a node. A prerender deployment's numbers are node-local
- * by construction — analytics rows, the backlog snapshot's owned-key slice, the claim floor —
+ * by construction — analytics rows, the backlog snapshot's owned-key slice, the queue keeper —
  * so a per-node console showed one quarter of a four-node cluster and left the operator adding
  * up four browser tabs. `node=cluster` (the default) fans the read out to every signed-in node
  * and merges the answers here; `node=<hostname>` is the drill-down. Which routes merge, which
@@ -208,6 +208,10 @@ async function fanOut(route, { tokens, query = '', method = 'GET', body } = {}) 
 					status: res.statusCode,
 					error: payload?.error ?? `answered ${res.statusCode}`,
 					ms,
+					// Kept apart from `body`, which every merger treats as a usable answer: only a merger
+					// that knows a route's non-200 means something reads this (queue-state's 503 carries
+					// the keeper's reason and stats — see aggregate.js queueStateRow).
+					errorBody: payload,
 				};
 			}
 			return { ...base, ok: true, status: 200, error: null, ms, body: payload };

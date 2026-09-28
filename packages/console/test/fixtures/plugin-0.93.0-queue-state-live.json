@@ -1,0 +1,215 @@
+{
+	"schema": 1,
+	"node": "localhost",
+	"generatedAt": 1790611044236,
+	"now": {
+		"due": 152515,
+		"dueSitemap": 103750,
+		"dueDiscovered": 48765,
+		"inFlight": 410,
+		"paused": false,
+		"status": "queued",
+		"unclaimed": 152105
+	},
+	"coming": {
+		"next15m": 1022,
+		"next60m": 4284,
+		"next24h": 78134,
+		"byHour": [
+			4284, 4284, 4284, 4266, 4260, 4150, 2940, 2940, 2940, 2940, 2926, 2910, 2910, 2910, 2910, 2910, 2910, 2910, 2910,
+			2910, 2910, 2910, 2910, 3000
+		]
+	},
+	"lateness": {
+		"edges": [0.25, 1, 2, 4],
+		"sitemap": [47608, 49513, 3342, 3277, 10],
+		"discovered": [23443, 23987, 669, 666, 0],
+		"oldestDueAt": 1790502600000,
+		"byRoute": [
+			{
+				"route": "route:prefix:/product/prd-",
+				"due": 140392,
+				"sitemap": [46679, 46948, 0, 0, 0],
+				"discovered": [23291, 23474, 0, 0, 0]
+			},
+			{
+				"route": "route:prefix:/catalog/",
+				"due": 12122,
+				"sitemap": [929, 2565, 3342, 3276, 10],
+				"discovered": [152, 513, 669, 666, 0]
+			},
+			{
+				"route": "route:exact:/",
+				"due": 1,
+				"sitemap": [0, 0, 0, 1, 0],
+				"discovered": [0, 0, 0, 0, 0]
+			}
+		],
+		"classes": [
+			{
+				"route": "route:prefix:/catalog/",
+				"cadenceMs": 21600000,
+				"fromSitemap": true,
+				"rows": 14100,
+				"due": 10122,
+				"oldestDueAt": 1790502600000,
+				"oldestLatenessCadences": 5.019444444444445
+			},
+			{
+				"route": "route:prefix:/catalog/",
+				"cadenceMs": 21600000,
+				"fromSitemap": false,
+				"rows": 6000,
+				"due": 2000,
+				"oldestDueAt": 1790545980000,
+				"oldestLatenessCadences": 3.011111111111111
+			},
+			{
+				"route": "route:exact:/",
+				"cadenceMs": 3600000,
+				"fromSitemap": true,
+				"rows": 1,
+				"due": 1,
+				"oldestDueAt": 1790603400000,
+				"oldestLatenessCadences": 2.1166666666666667
+			},
+			{
+				"route": "route:prefix:/product/prd-",
+				"cadenceMs": 172800000,
+				"fromSitemap": true,
+				"rows": 186666,
+				"due": 93627,
+				"oldestDueAt": 1790524320000,
+				"oldestLatenessCadences": 0.5017361111111112
+			},
+			{
+				"route": "route:prefix:/product/prd-",
+				"cadenceMs": 172800000,
+				"fromSitemap": false,
+				"rows": 93334,
+				"due": 46765,
+				"oldestDueAt": 1790524560000,
+				"oldestLatenessCadences": 0.5003472222222223
+			}
+		]
+	},
+	"flow": [
+		{
+			"minute": 1790610600000,
+			"cameDue": 0,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 90,
+			"removed": 0
+		},
+		{
+			"minute": 1790610660000,
+			"cameDue": 98,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790610720000,
+			"cameDue": 0,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790610780000,
+			"cameDue": 154,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790610840000,
+			"cameDue": 56,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790610900000,
+			"cameDue": 98,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790610960000,
+			"cameDue": 0,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		},
+		{
+			"minute": 1790611020000,
+			"cameDue": 98,
+			"added": 0,
+			"triggered": 0,
+			"rescheduled": 0,
+			"removed": 0
+		}
+	],
+	"trust": {
+		"source": "keeper",
+		"live": true,
+		"phase": "live",
+		"exact": true,
+		"stateAt": 1790611039496,
+		"stateAgeMs": 4740,
+		"maxAgeMs": 20000,
+		"keeper": {
+			"phase": "live",
+			"rows": 300101,
+			"classes": 5,
+			"resyncing": false,
+			"exact": true,
+			"loadStartedAt": 1790610639169,
+			"loadedAt": 1790610640543,
+			"loadMs": 1374,
+			"loadRows": 300101,
+			"unreadableRows": 0,
+			"partialLoad": null,
+			"eventsApplied": 90,
+			"lastEventAt": 1790610648658,
+			"lastPublish": {
+				"at": 1790611036231,
+				"ms": 11.9,
+				"published": 5000,
+				"complete": false,
+				"skippedLeased": 625,
+				"due": 152515
+			},
+			"topCheck": {
+				"at": 1790611036231,
+				"checked": 10,
+				"repaired": 0
+			},
+			"verify": {
+				"at": 1790611030612,
+				"scanned": 300101,
+				"owned": 300101,
+				"unowned": 0,
+				"missing": 0,
+				"mismatched": 0,
+				"phantoms": 0,
+				"unreadableRows": 0,
+				"partial": null,
+				"repaired": 0,
+				"ms": 1265
+			},
+			"lastResync": null,
+			"repairedTotal": 0,
+			"lastError": null
+		}
+	}
+}

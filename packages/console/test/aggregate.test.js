@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
 	CLUSTER,
 	MERGED_GET,
@@ -7,6 +8,7 @@ import {
 	mergeConfig,
 	mergerFor,
 	mergeOverview,
+	mergeQueueState,
 	mergeUnrouted,
 	NODE_LOCAL_POST,
 	REPLICATED_POST_NOTE,
@@ -324,20 +326,25 @@ const overviewBody = (node, over = {}) => ({
 		lastRun: {
 			overdue: 10,
 			inFlight: 2,
-			belowFloor: 0,
 			buckets: [
 				{ hour: 0, count: 5 },
 				{ hour: 1, count: 7 },
 			],
 			scanned: 100,
-			cap: 2000,
 			truncated: false,
+			source: 'keeper',
 			finishedAt: 990_000,
 			error: null,
 		},
 	},
 	intervals: { statusSyncInterval: 30_000, jobLeaseTime: 300_000, defaultRenderInterval: 86_400_000 },
-	claimFloor: { enabled: true, lagMs: 60_000, occupancy: 2, floorHeldBy: 'https://x.example.com/a' },
+	leases: {
+		occupancy: 2,
+		oldestLeaseExpiresAt: 1_200_000,
+		oldestLeaseDueMinute: 16,
+		maxLeases: 4096,
+		oldestLeaseAgeMs: 60_000,
+	},
 	reconcile: {
 		enabled: true,
 		interval: 3_600_000,
@@ -380,16 +387,55 @@ test('overview: replicated table counts are NOT summed, and disagreement is surf
 	assert.equal(diverged.body.counts.pages.divergent, false, 'agreeing tables stay unflagged');
 });
 
-test('overview: the claim floor reports the WORST node and names it, but sums in-flight leases', () => {
+test('overview: in-flight leases SUM, but slot pressure is the fullest node’s', () => {
+	// Each node has its own lease table, and a full one refuses grants there however empty the others
+	// are — so the sum is cluster concurrency and the worst node is the capacity finding.
 	const merged = mergeOverview([
-		ok('a', overviewBody('a', { claimFloor: { enabled: true, lagMs: 60_000, occupancy: 2 } })),
-		ok('b', overviewBody('b', { claimFloor: { enabled: true, lagMs: 7_200_000, occupancy: 5 } })),
+		ok('a', overviewBody('a', { leases: { occupancy: 400, maxLeases: 4096, oldestLeaseAgeMs: 30_000 } })),
+		ok('b', overviewBody('b', { leases: { occupancy: 3900, maxLeases: 4096, oldestLeaseAgeMs: 90_000 } })),
 	]);
+	const leases = merged.body.leases;
+	assert.equal(leases.occupancy, 4300, 'leases in flight add up — that is cluster concurrency');
+	assert.equal(leases.maxLeases, 8192);
+	assert.equal(leases.fullestNode, 'b.example.com:9926');
+	assert.ok(Math.abs(leases.fullestShare - 3900 / 4096) < 1e-9);
+	assert.equal(leases.oldestLeaseAgeMs, 90_000);
+	assert.deepEqual(
+		leases.byNode.map((n) => n.hostname),
+		['a.example.com:9926', 'b.example.com:9926']
+	);
+	assert.equal('claimFloor' in merged.body, false, 'plugin v0.93.0 removed the claim floor');
+});
 
-	assert.equal(merged.body.claimFloor.lagMs, 7_200_000, 'the queue is as healthy as its most-pinned node');
-	assert.equal(merged.body.claimFloor.worstNode, 'b.example.com:9926');
-	assert.equal(merged.body.claimFloor.occupancy, 7, 'leases in flight add up — that is cluster concurrency');
-	assert.equal(merged.body.claimFloor.byNode.length, 2);
+test('overview: a node whose keeper was not live at snapshot time is NAMED, not summed as zero', () => {
+	// Since v0.93.0 a snapshot's queue half comes from the keeper; while it is not live the snapshot has
+	// `overdue: null` and `queueUnavailable`. `sumOf` skips a null, so without this the node would
+	// silently vanish from "due now" and read as the backlog shrinking.
+	const merged = mergeOverview([
+		ok('a', overviewBody('a')),
+		ok(
+			'b',
+			overviewBody('b', {
+				backlog: {
+					enabled: true,
+					interval: 3_600_000,
+					running: false,
+					lastRun: {
+						overdue: null,
+						inFlight: 0,
+						buckets: [],
+						source: 'keeper',
+						queueUnavailable: 'the queue keeper is not live',
+						finishedAt: 990_000,
+						error: null,
+					},
+				},
+			})
+		),
+	]);
+	assert.equal(merged.body.backlog.lastRun.overdue, 10);
+	assert.deepEqual(merged.body.backlog.lastRun.unavailable, ['b.example.com:9926']);
+	assert.equal(merged.body.backlog.lastRun.source, 'keeper');
 });
 
 test('overview: ONE node with the repair sweep off is the finding, not "the cluster has it on"', () => {
@@ -449,6 +495,165 @@ test('overview: the node table is deduplicated by hostname, keeping the freshest
 });
 
 // ------------------------------------------------------------------ unrouted
+
+// ------------------------------------------------------------------ queue state
+
+// Real plugin 0.93.0 answers, captured from harperfast/harper:5.2.13 with 300k seeded schedule rows:
+// a live keeper, and the two 503s a restart produces (`starting`, then `loading`).
+const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/plugin-0.93.0-${name}.json`, import.meta.url)));
+const LIVE_STATE = fixture('queue-state-live');
+const LOADING_STATE = fixture('queue-state-503-loading');
+const STARTING_STATE = fixture('queue-state-503-starting');
+
+/** A node that answered 503: fanOut keeps its body apart, as `errorBody`. */
+const refused = (host, body) => ({
+	origin: `https://${host}.example.com:9926`,
+	hostname: `${host}.example.com:9926`,
+	ok: false,
+	status: 503,
+	error: body.error,
+	ms: 4,
+	errorBody: body,
+});
+
+test('queue-state: live nodes SUM — counts, hours, lateness bins, routes and classes', () => {
+	const merged = mergeQueueState([ok('a', LIVE_STATE), ok('b', LIVE_STATE)]);
+	assert.equal(merged.status, 200);
+	const { cluster } = merged.body;
+	assert.equal(merged.body.live, 2);
+	assert.equal(cluster.now.due, 2 * LIVE_STATE.now.due);
+	assert.equal(cluster.now.dueSitemap, 2 * LIVE_STATE.now.dueSitemap);
+	assert.equal(cluster.now.unclaimed, 2 * LIVE_STATE.now.unclaimed);
+	assert.equal(cluster.coming.next60m, 2 * LIVE_STATE.coming.next60m);
+	assert.deepEqual(
+		cluster.coming.byHour,
+		LIVE_STATE.coming.byHour.map((n) => 2 * n)
+	);
+	assert.deepEqual(cluster.lateness.edges, [0.25, 1, 2, 4]);
+	assert.deepEqual(
+		cluster.lateness.sitemap,
+		LIVE_STATE.lateness.sitemap.map((n) => 2 * n)
+	);
+	assert.equal(cluster.lateness.oldestDueAt, LIVE_STATE.lateness.oldestDueAt);
+	// Classes add by (route × cadence × sitemap flag), keep the worst head, and name its node by the
+	// fan-out host like every other per-node field. The unread per-route list is not merged.
+	assert.equal(cluster.lateness.classes.length, LIVE_STATE.lateness.classes.length);
+	assert.equal(cluster.lateness.classes[0].worstNode, 'a.example.com:9926');
+	assert.equal('byRoute' in cluster.lateness, false);
+	// 0.93.0 does not send listsTruncated; its absence reads as not cut.
+	assert.equal(cluster.lateness.listsTruncated, false);
+	assert.equal(
+		cluster.lateness.classes[0].oldestLatenessCadences,
+		LIVE_STATE.lateness.classes[0].oldestLatenessCadences
+	);
+	assert.equal(cluster.lateness.classes[0].due, 2 * LIVE_STATE.lateness.classes[0].due);
+	// Flow minutes are wall-clock, so the same minute from two nodes is one slot.
+	assert.equal(cluster.flow.length, LIVE_STATE.flow.length);
+	assert.equal(cluster.flow.at(-1).cameDue, 2 * LIVE_STATE.flow.at(-1).cameDue);
+	assert.equal(cluster.exact, true);
+	assert.equal(merged.body.sources.complete, true);
+});
+
+test('queue-state: ONE node that cannot vouch withholds the cluster total — never a floor', () => {
+	// Each keeper holds only its node's rows, so three of four nodes summed is a quarter of the queue
+	// missing, and it reads exactly like the backlog draining.
+	const merged = mergeQueueState([ok('a', LIVE_STATE), refused('b', LOADING_STATE)]);
+	assert.equal(merged.status, 200);
+	assert.equal(merged.body.cluster, null);
+	assert.equal(merged.body.live, 1);
+	assert.deepEqual(merged.body.withheld, [{ hostname: 'b.example.com:9926', reason: 'the queue keeper is loading' }]);
+
+	// The 503 is an ANSWER: kept per node with its reason, the keeper's stats and the live `now` block.
+	const b = merged.body.nodes.find((row) => row.hostname === 'b.example.com:9926');
+	assert.equal(b.answered, true);
+	assert.equal(b.live, false);
+	assert.equal(b.httpStatus, 503);
+	assert.equal(b.trust.phase, 'loading');
+	assert.equal(b.now.status, 'queued');
+	assert.equal(b.now.due, undefined, 'a 503 carries no counts, and none are invented');
+	// The live node's own counts are still there for the per-node view.
+	assert.equal(merged.body.nodes[0].now.due, LIVE_STATE.now.due);
+
+	// Counted as answered in `sources`: the generic "N of M nodes answered" banner would call a loading
+	// node down; the Queue view names it with the keeper's reason instead.
+	assert.equal(merged.body.sources.complete, true);
+	assert.equal(merged.body.sources.nodes.find((n) => n.hostname === 'b.example.com:9926').ok, true);
+});
+
+test('queue-state: a node that did not answer at all is not an answer, and is named', () => {
+	const merged = mergeQueueState([ok('a', LIVE_STATE), down('b')]);
+	assert.equal(merged.body.cluster, null);
+	const b = merged.body.nodes.find((row) => row.hostname === 'b.example.com:9926');
+	assert.equal(b.answered, false);
+	assert.match(b.error, /unreachable/);
+	assert.equal(merged.body.sources.complete, false, 'a node that is DOWN still banners the view');
+});
+
+test('queue-state: nothing answering is a 502; "Management API is disabled" is no answer either', () => {
+	assert.equal(mergeQueueState([down('a'), down('b')]).status, 502);
+	const disabled = {
+		...down('a'),
+		status: 404,
+		error: 'Management API is disabled',
+		errorBody: { error: 'Management API is disabled' },
+	};
+	const merged = mergeQueueState([disabled]);
+	assert.equal(merged.status, 502);
+});
+
+test('queue-state: a node on a plugin before v0.93.0 is a node WITHOUT A KEEPER, not a missing answer', () => {
+	// Mid-canary the old nodes answer 404 "Unknown route" — up, and claiming from their own index.
+	const old = (host) => ({
+		...down(host),
+		status: 404,
+		error: 'Unknown route: queue-state',
+		errorBody: { error: 'Unknown route: queue-state' },
+	});
+	const mixed = mergeQueueState([ok('a', LIVE_STATE), old('b')]);
+	assert.equal(mixed.status, 200);
+	assert.equal(mixed.body.cluster, null, 'its queue is not counted, so there is no whole to sum');
+	const b = mixed.body.nodes.find((row) => row.hostname === 'b.example.com:9926');
+	assert.equal(b.noKeeper, true);
+	assert.equal(b.answered, false);
+	assert.equal(mixed.body.sources.complete, true, 'not a down node: the view names it itself');
+
+	// A whole cluster still on 0.92 is the same answer, not a 502.
+	const allOld = mergeQueueState([old('a'), old('b')]);
+	assert.equal(allOld.status, 200);
+	assert.equal(allOld.body.live, 0);
+	assert.ok(allOld.body.nodes.every((row) => row.noKeeper));
+});
+
+test('queue-state: 0.93.1’s listsTruncated is carried when any node cut its lists', () => {
+	const cut = { ...LIVE_STATE, lateness: { ...LIVE_STATE.lateness, listsTruncated: true } };
+	assert.equal(mergeQueueState([ok('a', LIVE_STATE), ok('b', cut)]).body.cluster.lateness.listsTruncated, true);
+});
+
+test('queue-state: the starting-phase 503 keeps its phase, and its `empty` status is not a verdict', () => {
+	// Captured: before the keeper reports anything the node-local status flag reads its zero value,
+	// `empty`, while the node grants nothing. The merge passes the phase through untouched.
+	const merged = mergeQueueState([refused('a', STARTING_STATE)]);
+	const row = merged.body.nodes[0];
+	assert.equal(row.trust.phase, 'starting');
+	assert.equal(row.now.status, 'empty');
+	assert.equal(row.trust.keeper, null);
+	assert.equal(row.error, 'the queue keeper is starting');
+});
+
+test('queue-state: an inexact node keeps the sum but says it is a lower bound, and where', () => {
+	const inexact = { ...LIVE_STATE, trust: { ...LIVE_STATE.trust, exact: false } };
+	const merged = mergeQueueState([ok('a', LIVE_STATE), ok('b', inexact)]);
+	assert.equal(merged.body.cluster.exact, false);
+	assert.equal(merged.body.nodes[1].trust.exact, false, 'the per-node flag the view refines is kept');
+});
+
+test('queue-state: nodes that bin lateness differently are not summed bin by bin', () => {
+	const skewed = { ...LIVE_STATE, lateness: { ...LIVE_STATE.lateness, edges: [0.5, 1, 3] } };
+	const merged = mergeQueueState([ok('a', LIVE_STATE), ok('b', skewed)]);
+	assert.equal(merged.body.cluster.lateness.edgesDiverge, true);
+	assert.equal(merged.body.cluster.lateness.sitemap, null);
+	assert.equal(merged.body.cluster.now.due, 2 * LIVE_STATE.now.due, 'the counts themselves still add');
+});
 
 test('unrouted: buckets sum across nodes and stay labelled as a per-worker SAMPLE', () => {
 	const body = (node, rows) => ({

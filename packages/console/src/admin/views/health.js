@@ -10,8 +10,13 @@
  *
  * THRESHOLDS are judgement calls, stated here so they can be argued with in one place. Each is set
  * where the number stops being tail noise for a healthy deployment, from the measured baselines the
- * other views' comments cite (cache-hit serves ~2ms p95; claim scan ~15ms, degrading ~17× before a
- * backlog shows; render failures well under 10%; a healthy corpus at median 0.5× its cadence).
+ * other views' comments cite (cache-hit serves ~2ms p95; render failures well under 10%; a healthy
+ * corpus at median 0.5× its cadence). The queue keeper's thresholds live beside the Queue view that
+ * charts them (`LIMITS` in queue.js), so the two pages cannot disagree.
+ *
+ * THE QUEUE KEEPER (plugin v0.93.0) is judged per node and never averaged: a node whose keeper cannot
+ * vouch for its numbers answers queue-state with a 503 and the reason, and a node that is not serving
+ * grants no claims at all — which every other tile would only show as a slow decline in its renders.
  *
  * SYSTEM VITALS are per node and never averaged: CPU, memory, event loop and disk come from Harper's
  * own per-minute resource rows (plugin v0.92.0+, through the analytics window) and a point-in-time
@@ -20,8 +25,8 @@
  * says so instead of showing zeros.
  *
  * NOTHING HERE SCANS BEYOND WHAT OTHER VIEWS ALREADY DO: `overview` is point reads plus a background
- * snapshot, `analytics` is the shared, per-worker-cached window, `config` and `invalidations` are
- * small replicated reads.
+ * snapshot, `analytics` is the shared, per-worker-cached window, `queue-state` is each keeper's
+ * shared-memory document, `config` and `invalidations` are small replicated reads.
  */
 
 import { ago, card, duration, el, ICONS, muted, num, pct, pill, spacer, table } from '../ui.js';
@@ -40,25 +45,36 @@ import {
 	SERIES,
 	spark,
 	sumCount,
-	sumValues,
 	weighted,
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
 import { configState, loadConfig } from './_configEdit.js';
 import { cadenceFor, cadenceIndex, coverageSplit, originCostByReason } from './traffic.js';
-import { drain } from './queue.js';
+import {
+	backlogReading,
+	drainOf,
+	hostOf,
+	keeperStats,
+	keeperVerdict,
+	LIMITS,
+	queueStateOf,
+	queueStateProblem,
+	repairsReading,
+	repairsSub,
+	slotPressure,
+	statusPill,
+} from './queue.js';
 
 export const meta = { id: 'health', label: 'Health', icon: ICONS.overview, ranged: true };
 
-// Series names as constants (see the route-contract scanner in adminAssets.test.js).
+// Series names as constants (see the route-contract scanner in adminAssets.test.js). The queue
+// keeper's series come from QUEUE_HEALTH in queue.js, through `keeperStats`.
 const OUTCOME = 'outcome';
-const CLAIM_SCAN = 'claim_scan_ms';
-const GRANTED = 'claim_granted';
 const ORIGIN = 'origin';
 
 export async function load(ctx) {
-	const [overviewRes, analyticsRes, , invalidationsRes] = await Promise.all([
+	const [overviewRes, analyticsRes, , invalidationsRes, stateRes] = await Promise.all([
 		ctx.get('overview'),
 		ctx.get('analytics', { range: ctx.rangeMs }),
 		// FORCED: config agreement is one of this page's checks, and the shared scratch would otherwise
@@ -66,10 +82,14 @@ export async function load(ctx) {
 		// after the console opened would read "identical" forever. It is a small replicated read.
 		loadConfig(ctx, { force: true }),
 		ctx.get('invalidations'),
+		ctx.get('queue-state'),
 	]);
 	ctx.data.overview = overviewRes.ok ? overviewRes.body : null;
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
 	ctx.data.invalidations = invalidationsRes.ok ? invalidationsRes.body : null;
+	// A 503 from a node is an ANSWER (its keeper's reason), kept per node; null only when nothing answered.
+	ctx.data.queueState = queueStateOf(stateRes);
+	ctx.data.queueStateError = ctx.data.queueState ? null : queueStateProblem(stateRes);
 	ctx.data.error = overviewRes.ok
 		? null
 		: (overviewRes.body?.error ?? `Could not load cluster state (${overviewRes.status})`);
@@ -83,10 +103,12 @@ export function render(ctx) {
 	const analytics = usable(ctx.data.analytics) ? ctx.data.analytics : null;
 	const config = configState(ctx).payload;
 	const nodes = nodeVitals(overview, ctx.data.analytics);
+	const qs = ctx.data.queueState;
 
 	const groups = [
 		{ title: 'Serving', checks: servingChecks(analytics, config) },
-		{ title: 'Rendering', checks: renderingChecks(analytics, overview) },
+		{ title: 'Rendering', checks: renderingChecks(analytics, overview, qs) },
+		{ title: 'Queue', checks: queueChecks(analytics, overview, qs) },
 		{ title: 'Cluster', checks: clusterChecks(overview, config, nodes, ctx.data.analytics) },
 		{ title: 'System', checks: systemChecks(nodes), empty: systemGap(nodes) },
 		{ title: 'Maintenance', checks: maintenanceChecks(overview, ctx.data.invalidations) },
@@ -111,6 +133,12 @@ export function render(ctx) {
 					go: 'traffic',
 				}
 			),
+		!qs &&
+			check('input-queue-state', 'Queue state', 'not loaded', 'bad', {
+				sub: 'queue keeper checks',
+				detail: ctx.data.queueStateError ?? 'Could not load queue state.',
+				go: 'queue',
+			}),
 	].filter(Boolean);
 	const all = [...inputs, ...groups.flatMap((group) => group.checks)];
 
@@ -265,110 +293,202 @@ function stalenessMedian(data, config) {
 
 // ---- rendering -----------------------------------------------------------------------
 
-function renderingChecks(data, overview) {
+/** Posted render results per hour over the window the scan COVERED, or null without analytics. */
+function renderRate(data) {
+	if (!data) return null;
+	// A truncated scan holds fewer hours than were asked for, and dividing by the requested range would
+	// understate the rate (and overstate drain time).
+	const hours = (coveredMinutes(data) ?? data.rangeMs / 60_000) / 60;
+	return sumCount(pick(data, 'render', (s) => s.path === OUTCOME)) / hours;
+}
+
+function renderingChecks(data, overview, qs) {
+	if (!data) return [];
+	const outcomes = pick(data, 'render', (s) => s.path === OUTCOME);
+	const total = sumCount(outcomes);
+	const failed = sumCount(outcomes.filter((s) => s.method === 'failed' || s.method === 'auth-failure'));
+	const times = pick(data, 'render', (s) => s.path === 'time_ms');
+	const reading = backlogReading(overview, qs);
+	const stalled = total === 0 && reading.overdue > (reading.inFlight ?? 0);
+
+	return [
+		check('renders', 'Renders / hour', fmtCount(renderRate(data)), stalled ? 'bad' : total === 0 ? 'warn' : 'info', {
+			sub: `${num(total)} results`,
+			spark: bucketTotals(outcomes, data.bucketCount).map((c) => c * (3_600_000 / data.bucketMs)),
+			go: 'queue',
+			detail: stalled ? 'Rows are due and nothing posted a render result in this range.' : null,
+		}),
+		check('render-fail', 'Render failures', pct(failed, total), total > 0 ? above(failed / total, 0.1, 0.25) : 'na', {
+			sub: `${num(failed)} failed or auth-failed`,
+			go: 'queue',
+		}),
+		check('render-time', 'Render time', fmtMs(weighted(times, 'mean')), 'info', {
+			sub: `mean · p95 ${fmtMs(weighted(times, 'p95'))}`,
+			spark: weightedBuckets(times, 'means', data.bucketCount),
+			go: 'queue',
+		}),
+	];
+}
+
+// ---- queue ------------------------------------------------------------------------------
+
+/**
+ * The render queue: the backlog judged by time to clear, and the queue keeper on every node.
+ *
+ * The backlog is the keepers' exact cluster total when every node is live, else the snapshot (see
+ * `backlogReading`). The keeper tile takes the WORST node: one node that is not serving is a quarter of
+ * the corpus not rendering, and a count of healthy nodes would bury it.
+ */
+function queueChecks(data, overview, qs) {
 	const out = [];
-	const backlog = overview?.backlog?.lastRun;
-	const floor = overview?.claimFloor ?? {};
-	const lease = overview?.intervals?.jobLeaseTime ?? 0;
-	const inFlight = Number.isFinite(floor.occupancy) ? floor.occupancy : (backlog?.inFlight ?? null);
+	const reading = backlogReading(overview, qs);
 
-	if (data) {
-		const outcomes = pick(data, 'render', (s) => s.path === OUTCOME);
-		const total = sumCount(outcomes);
-		const failed = sumCount(outcomes.filter((s) => s.method === 'failed' || s.method === 'auth-failure'));
-		// The window the scan actually COVERED: a truncated scan holds fewer hours than were asked for,
-		// and dividing by the requested range would understate the rate (and overstate drain time).
-		const hours = (coveredMinutes(data) ?? data.rangeMs / 60_000) / 60;
-		const times = pick(data, 'render', (s) => s.path === 'time_ms');
-		const claims = pick(data, 'queue_health', (s) => s.path === CLAIM_SCAN);
-		const claimP95 = weighted(claims, 'p95');
-		const granted = pick(data, 'queue_health', (s) => s.path === GRANTED);
-		const fromReady = sumValues(granted.filter((s) => s.method === 'ready'));
-		const grants = sumValues(granted);
-		const stalled = total === 0 && backlog?.overdue > (inFlight ?? 0);
-
-		out.push(
-			check('renders', 'Renders / hour', fmtCount(total / hours), stalled ? 'bad' : total === 0 ? 'warn' : 'info', {
-				sub: `${num(total)} results`,
-				spark: bucketTotals(outcomes, data.bucketCount).map((c) => c * (3_600_000 / data.bucketMs)),
-				go: 'queue',
-				detail: stalled ? 'Rows are due and nothing posted a render result in this range.' : null,
-			}),
-			check('render-fail', 'Render failures', pct(failed, total), total > 0 ? above(failed / total, 0.1, 0.25) : 'na', {
-				sub: `${num(failed)} failed or auth-failed`,
-				go: 'queue',
-			}),
-			check('render-time', 'Render time', fmtMs(weighted(times, 'mean')), 'info', {
-				sub: `mean · p95 ${fmtMs(weighted(times, 'p95'))}`,
-				spark: weightedBuckets(times, 'means', data.bucketCount),
-				go: 'queue',
-			}),
-			check('claim-scan', 'Claim scan p95', fmtMs(claimP95), above(claimP95, 250, 1000), {
-				sub: `median ${fmtMs(weighted(claims, 'median'))}`,
-				spark: weightedBuckets(claims, 'p95s', data.bucketCount),
-				go: 'queue',
-				detail: 'The leading indicator: the claim scan degrades before any backlog shows.',
-			}),
-			grants > 0 &&
-				check(
-					'prioritised',
-					'Prioritised claims',
-					pct(fromReady, grants),
-					fromReady === 0 ? 'bad' : below(fromReady / grants, 0.5, 0.1),
-					{
-						sub: 'from the ready set',
-						go: 'queue',
-						detail:
-							fromReady === 0 ? 'Every job came from the fallback index scan — nothing is being prioritised.' : null,
-					}
-				)
-		);
-	}
-
-	if (overview) {
-		const overdue = backlog && !backlog.error ? backlog.overdue : null;
-		const outcomes = data ? pick(data, 'render', (s) => s.path === OUTCOME) : [];
+	if (overview || qs?.cluster) {
 		// No analytics means no rate — `drain` reads that as unknown, never as "nothing rendered".
-		const rate = data ? sumCount(outcomes) / ((coveredMinutes(data) ?? data.rangeMs / 60_000) / 60) : null;
-		// Judged by how long it takes to CLEAR, not by its size — see `drain` on the Queue view.
-		const clear = drain(overdue, inFlight, rate);
+		const clear = drainOf(reading, renderRate(data));
+		const failedSnapshot = reading.source === 'snapshot' && !!reading.error;
+		const inFlight = Number.isFinite(reading.inFlight)
+			? num(reading.inFlight) + (reading.inFlightShortOf.length ? '+' : '')
+			: '—';
 		out.push(
 			check(
 				'due',
 				'Backlog',
-				Number.isFinite(overdue) ? num(overdue) + (backlog.truncated ? '+' : '') : '—',
-				// Truncation makes the count a floor, so it is at least a watch — but never softens a bad drain.
-				backlog?.error ? 'bad' : backlog?.truncated ? worse('warn', clear.verdict) : clear.verdict,
-				{
-					sub: Number.isFinite(clear.ms)
-						? `~${duration(clear.ms)} to clear · ${num(inFlight ?? 0)} in flight`
-						: `${Number.isFinite(inFlight) ? num(inFlight) : '—'} in flight`,
-					go: 'queue',
-					detail: backlog?.error
-						? `The backlog snapshot failed: ${backlog.error}`
-						: clear.verdict === 'bad' && !Number.isFinite(clear.ms)
-							? 'Rows are due and nothing rendered in this range.'
-							: Number.isFinite(clear.ms)
-								? `At the current render rate the backlog clears in about ${duration(clear.ms)}.`
-								: null,
-				}
-			),
-			check(
-				'floor',
-				'Claim floor lag',
-				floor.enabled === false ? 'off' : Number.isFinite(floor.lagMs) ? duration(floor.lagMs) : '—',
-				floor.enabled === false || !Number.isFinite(floor.lagMs) || !lease
+				Number.isFinite(reading.overdue) ? num(reading.overdue) + (reading.floor ? '+' : '') : '—',
+				// No count because a keeper is not live: unknown here, and judged once, on the keeper check.
+				reading.keeperDown
 					? 'na'
-					: above(floor.lagMs, 2 * lease, 6 * lease),
+					: failedSnapshot
+						? 'bad'
+						: // A floor makes the count a lower bound, so it is at least a watch — but never softens a bad drain.
+							reading.floor
+							? worse('warn', clear.verdict)
+							: clear.verdict,
 				{
-					sub: floor.worstNode ? `worst: ${floor.worstNode}` : 'how far back claims start',
+					sub: reading.keeperDown
+						? 'no count · see Queue keeper'
+						: (Number.isFinite(clear.ms)
+								? `~${duration(clear.ms)} to clear · ${inFlight} in flight`
+								: `${inFlight} in flight`) + (reading.source === 'snapshot' ? ' · snapshot' : ''),
 					go: 'queue',
-					detail: 'Past two leases, one render is holding every row behind it.',
+					detail: reading.keeperDown
+						? 'The backlog snapshot has no count while a queue keeper is not live — see the Queue keeper check.'
+						: failedSnapshot
+							? `The backlog snapshot failed: ${reading.error}`
+							: reading.shortOf.length
+								? `The snapshot has no queue from ${reading.shortOf.join(', ')} — the real backlog is larger.`
+								: clear.verdict === 'bad' && !Number.isFinite(clear.ms)
+									? 'Rows are due and nothing rendered in this range.'
+									: Number.isFinite(clear.ms)
+										? `At the current render rate the backlog clears in about ${duration(clear.ms)}.`
+										: null,
 				}
 			)
 		);
 	}
-	return out.filter(Boolean);
+
+	const k = keeperStats(data);
+	if (qs) {
+		const judged = qs.nodes.map((row) => ({ row, v: keeperVerdict(row) }));
+		const flagged = judged.filter(({ v }) => v.verdict !== 'ok');
+		let verdict = judged.reduce((acc, { v }) => worse(acc, v.verdict), 'ok');
+		// Every node live now, but snapshots in the range found a keeper not live — more than its restarts
+		// (one load each) explain. A routine deploy is one load and, at most, one such snapshot.
+		const flapped = verdict === 'ok' && k?.unexplainedNotLive > 0;
+		const restarted = verdict === 'ok' && !flapped && k?.notLiveSnapshots > 0;
+		if (flapped) verdict = 'warn';
+		out.push(
+			check('keeper', 'Queue keeper', `${qs.live}/${qs.configured} live`, verdict, {
+				sub: flagged.length
+					? flagged.map(({ row, v }) => `${hostOf(row)}: ${v.label}`).join(' · ')
+					: flapped
+						? `down in ${num(k.notLiveSnapshots)} snapshot${k.notLiveSnapshots === 1 ? '' : 's'} in range`
+						: restarted
+							? `restarted ${num(k.loads)}× in range`
+							: 'serving on every node',
+				go: 'queue',
+				detail: flagged.length
+					? flagged.map(({ row, v }) => `${hostOf(row)}: ${v.detail}`).join(' ')
+					: flapped
+						? `${num(k.notLiveSnapshots)} of ${num(k.snapshots)} backlog snapshots in this range found a queue keeper ` +
+							`not live, more than its ${num(k.loads)} load${k.loads === 1 ? '' : 's'} explain.`
+						: null,
+			})
+		);
+	} else {
+		// No queue state at all (the input check above says so). The replicated status still names a node
+		// whose keeper is not serving.
+		const unready = (overview?.nodes ?? []).filter((node) => node.status === 'unready');
+		if (unready.length) {
+			out.push(
+				check('keeper', 'Queue keeper', `${unready.length} unready`, 'bad', {
+					sub: unready.map((node) => node.hostname).join(', '),
+					go: 'queue',
+					detail: 'These nodes report unready: their queue keeper is not serving, so they grant no claims.',
+				})
+			);
+		}
+	}
+
+	if (k) {
+		const repairs = repairsReading(data, qs);
+		out.push(
+			check('keeper-repaired', 'Keeper repairs', num(repairs.total), repairs.verdict, {
+				sub: repairsSub(repairs),
+				go: 'queue',
+				detail:
+					repairs.missed > 0
+						? 'A verification walk found rows the queue keeper held differently from the table: its subscription is missing writes.'
+						: repairs.gained > 0
+							? `${num(repairs.gained)} rows gained after a membership change — the walk counts them as repairs; nothing was missed.`
+							: null,
+			}),
+			check('keeper-publish', 'Keeper publish p95', fmtMs(k.publishP95), k.publishVerdict, {
+				sub: `median ${fmtMs(k.publishMedian)} · limit ${fmtMs(LIMITS.publishMs[0])}`,
+				spark: k.publishSpark,
+				go: 'queue',
+				detail:
+					'One ready-set publish on worker 0 per publishInterval (skipped when nothing changed, forced every 10s). ' +
+					'A rising trend is a growing due set or class count.',
+			}),
+			check('holds', 'Render holds', num(k.holds), k.holdsVerdict, {
+				sub: k.granted > 0 ? `${pct(k.holds, k.granted)} of ${fmtCount(k.granted)} grants` : 'no grants in range',
+				go: 'queue',
+				detail:
+					k.holds > 0
+						? k.holdsVerdict === 'bad'
+							? 'Many holds on keys whose leases expired with no result — results are not reaching the node.'
+							: 'Holds on keys whose leases expired with no result — a renderer crashing on them; the plugin log names them.'
+						: null,
+			}),
+			check('stale', 'Stale claims', k.staleShare === null ? '—' : pct(k.stale, k.stale + k.granted), k.staleVerdict, {
+				sub: `${num(k.stale)} entries skipped`,
+				go: 'queue',
+				detail:
+					k.staleVerdict === 'warn' || k.staleVerdict === 'bad'
+						? 'Claims keep finding ready-set rows no longer due: the keeper is seeing writes late.'
+						: null,
+			})
+		);
+	}
+
+	const slots = slotPressure(overview);
+	if (slots) {
+		out.push(
+			check('lease-slots', 'Lease slots', pct(slots.share, 1), above(slots.share, ...LIMITS.slotShare), {
+				sub:
+					slots.node && slots.share > 0
+						? `fullest: ${slots.node}`
+						: `${num(overview.leases.occupancy)} of ${num(overview.leases.maxLeases)}`,
+				go: 'queue',
+				detail:
+					slots.share >= LIMITS.slotShare[0]
+						? 'A full lease table refuses grants on that node: claims get fewer jobs than asked. Raise queue.maxLeases.'
+						: null,
+			})
+		);
+	}
+	return out;
 }
 
 // ---- cluster ---------------------------------------------------------------------------
@@ -746,16 +866,7 @@ function systemChecks(nodes) {
 
 function maintenanceChecks(overview, invalidations) {
 	const out = [];
-	const lastRun = overview?.backlog?.lastRun;
 	if (overview) {
-		const below = lastRun?.belowFloor ?? 0;
-		out.push(
-			check('below-floor', 'Below claim floor', num(below), below > 0 ? 'bad' : lastRun ? 'ok' : 'na', {
-				sub: below > 0 ? 'rows that will never be claimed' : 'no stranded rows',
-				go: 'queue',
-				detail: below > 0 ? `${num(below)} schedule rows sit below the claim floor and will never be claimed.` : null,
-			})
-		);
 		const info = overview.reconcile ?? {};
 		const last = info.lastRun;
 		const overdue = last?.finishedAt && info.interval ? Date.now() - last.finishedAt > 3 * info.interval : false;
@@ -911,13 +1022,7 @@ function nodeTable(ctx, nodes) {
 		const hours = (n.rangeMs ?? 0) / 3_600_000;
 		return el('tr', null, [
 			el('td', { cls: 'mono' }, [n.hostname]),
-			el('td', null, [
-				n.responding === false
-					? pill('down', 'bad')
-					: n.status
-						? pill(n.status, n.status === 'paused' ? 'bad' : n.status === 'queued' ? 'ok' : '')
-						: muted('—'),
-			]),
+			el('td', null, [n.responding === false ? pill('down', 'bad') : n.status ? statusPill(n.status) : muted('—')]),
 			cell(n.host?.uptimeSec ? duration(n.host.uptimeSec * 1000) : '—', n.host?.uptimeSec < 900 ? 'warn' : null),
 			system &&
 				cell(cpu === null ? '—' : pct(cpu, 1), above(cpu, 0.85, 0.95), {

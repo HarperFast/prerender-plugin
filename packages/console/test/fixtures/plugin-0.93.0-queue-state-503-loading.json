@@ -1,0 +1,41 @@
+{
+	"schema": 1,
+	"node": "localhost",
+	"generatedAt": 1790610640536,
+	"error": "the queue keeper is loading",
+	"now": {
+		"inFlight": 0,
+		"paused": false,
+		"status": "queued"
+	},
+	"trust": {
+		"source": "keeper",
+		"live": false,
+		"phase": "loading",
+		"exact": false,
+		"stateAt": 1790610639169,
+		"stateAgeMs": 1367,
+		"maxAgeMs": 20000,
+		"keeper": {
+			"phase": "loading",
+			"rows": 0,
+			"classes": 0,
+			"resyncing": false,
+			"exact": false,
+			"loadStartedAt": 1790610639169,
+			"loadedAt": null,
+			"loadMs": null,
+			"loadRows": 0,
+			"unreadableRows": 0,
+			"partialLoad": null,
+			"eventsApplied": 0,
+			"lastEventAt": null,
+			"lastPublish": null,
+			"topCheck": null,
+			"verify": null,
+			"lastResync": null,
+			"repairedTotal": 0,
+			"lastError": null
+		}
+	}
+}

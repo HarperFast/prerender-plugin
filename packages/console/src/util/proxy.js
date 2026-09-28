@@ -30,6 +30,9 @@ export const PROXIED_GET = Object.freeze([
 	// side by side, never one node's answer wearing a cluster label.
 	'change-probe',
 	'discovery-purge',
+	// Node-local (each queue keeper holds the rows its node owns), fanned out and summed; a node that
+	// cannot vouch for its numbers answers 503 with the reason, which the merge keeps.
+	'queue-state',
 ]);
 
 export const PROXIED_POST = Object.freeze([

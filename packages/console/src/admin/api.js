@@ -14,7 +14,7 @@ const BASE = location.pathname.replace(/\/+$/, '');
 // ---- scope selection ----
 //
 // The console reads THE CLUSTER by default and one node on demand. Analytics, the backlog
-// snapshot and the claim floor are all node-local, so a cluster answer is a fan-out merged
+// snapshot and the queue keeper are all node-local, so a cluster answer is a fan-out merged
 // server-side (see util/aggregate.js) — which is why this is one value, not a multi-select:
 // the proxy does the work and hands back a single payload either way.
 //

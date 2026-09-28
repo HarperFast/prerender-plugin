@@ -1,0 +1,21 @@
+{
+	"schema": 1,
+	"node": "localhost",
+	"generatedAt": 1790610639104,
+	"error": "the queue keeper is starting",
+	"now": {
+		"inFlight": 0,
+		"paused": false,
+		"status": "empty"
+	},
+	"trust": {
+		"source": "keeper",
+		"live": false,
+		"phase": "starting",
+		"exact": false,
+		"stateAt": null,
+		"stateAgeMs": null,
+		"maxAgeMs": 20000,
+		"keeper": null
+	}
+}

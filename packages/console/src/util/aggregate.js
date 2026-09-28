@@ -3,8 +3,8 @@
  *
  * WHY THE CONSOLE DOES THIS AND NOT THE PLUGIN. Almost everything interesting in a prerender
  * deployment is node-local by construction — `hdb_analytics` rows are written per node, the
- * backlog snapshot covers only the residency-pinned keys THAT node owns, the claim floor is a
- * node-local shared buffer, and the unrouted tally is per worker. A plugin-side "cluster"
+ * backlog snapshot and the queue keeper cover only the residency-pinned keys THAT node owns, the
+ * lease table is a node-local shared buffer, and the unrouted tally is per worker. A plugin-side "cluster"
  * endpoint would have to fan out to its peers, which means every prerender node becomes a
  * client of every other prerender node on a path that also serves crawler traffic. The console
  * is already the one component that holds every node's session and talks to all of them, and it
@@ -52,6 +52,9 @@ export const MERGED_GET = Object.freeze([
 	// keyspace has not been touched.
 	'change-probe',
 	'discovery-purge',
+	// Each node's queue keeper holds only the rows that node owns, so the cluster's queue is the sum —
+	// and a node that cannot vouch for its numbers answers 503 with the reason. See mergeQueueState.
+	'queue-state',
 ]);
 
 /**
@@ -625,18 +628,22 @@ export function mergeOverview(results) {
 		bucketLength
 	).map((count, hour) => ({ hour, count }));
 
+	// Since plugin v0.93.0 a snapshot's queue half comes from the node's queue keeper, and a node
+	// whose keeper was not live at snapshot time reports `queueUnavailable` with a null `overdue`.
+	// `sumOf` skips a null, so that node would silently drop out of "due now" — named instead, the
+	// same way as a node with no snapshot at all.
+	const unavailable = bodies
+		.filter((r) => r.b.backlog?.lastRun && !r.b.backlog.lastRun.error && !Number.isFinite(r.b.backlog.lastRun.overdue))
+		.map((r) => r.hostname);
 	const backlogRun = runs.length
 		? {
 				overdue: sumOf(runs, (run) => run.overdue),
 				inFlight: sumOf(runs, (run) => run.inFlight),
-				belowFloor: sumOf(runs, (run) => run.belowFloor),
-				// The OLDEST row below any node's floor: the worst case is the one to act on.
-				oldestBelowFloorMs: minOf(runs, (run) => run.oldestBelowFloorMs),
 				buckets: summedBuckets,
 				scanned: sumOf(runs, (run) => run.scanned),
-				cap: sumOf(runs, (run) => run.cap),
 				truncated: runs.some((run) => run.truncated),
 				horizonMs: runs[0]?.horizonMs ?? null,
+				source: runs.find((run) => run.source)?.source ?? null,
 				// A sum is only as fresh as its STALEST input — and only as complete as its
 				// narrowest, so a node with no snapshot yet is named rather than counted as zero.
 				finishedAt: minOf(runs, (run) => msOf(run.finishedAt)),
@@ -645,34 +652,40 @@ export function mergeOverview(results) {
 				error: runs.find((run) => run.error)?.error ?? null,
 				nodes: runs.length,
 				missing: bodies.filter((r) => !r.b.backlog?.lastRun).map((r) => r.hostname),
+				unavailable,
 			}
 		: null;
 
-	// ---- claim floor: per node, and the cluster's health is the WORST node's.
-	const floors = bodies
-		.map((r) => ({ hostname: r.hostname, ...(r.b.claimFloor ?? {}) }))
-		.filter((f) => f && Object.keys(f).length > 1);
-	const worst = floors.reduce(
-		(acc, f) => (acc === null || (finite(f.lagMs) || -1) > (finite(acc.lagMs) || -1) ? f : acc),
-		null
-	);
-	const claimFloor = floors.length
+	// ---- leases: live, per node. In flight ADDS across nodes — it is the cluster's render
+	// concurrency — but slot pressure is per node (each node has its own lease table, and a full one
+	// refuses grants there however empty the others are), so the worst node is kept beside the sum.
+	const leaseRows = bodies
+		.filter((r) => r.b.leases && typeof r.b.leases === 'object')
+		.map((r) => ({
+			hostname: r.hostname,
+			occupancy: num(finite(r.b.leases.occupancy)),
+			maxLeases: num(finite(r.b.leases.maxLeases)),
+			oldestLeaseAgeMs: num(finite(r.b.leases.oldestLeaseAgeMs)),
+			oldestLeaseExpiresAt: num(finite(r.b.leases.oldestLeaseExpiresAt)),
+		}));
+	const slotShare = (row) =>
+		row.maxLeases > 0 && Number.isFinite(row.occupancy) ? row.occupancy / row.maxLeases : NaN;
+	let fullest = null;
+	for (const row of leaseRows) {
+		const share = slotShare(row);
+		if (Number.isFinite(share) && (fullest === null || share > slotShare(fullest))) fullest = row;
+	}
+	const leases = leaseRows.length
 		? {
-				...(worst ?? {}),
-				// In-flight leases ADD across nodes — this is the cluster's live render concurrency.
-				occupancy: sumOf(floors, (f) => f.occupancy),
-				lagMs: maxOf(floors, (f) => f.lagMs),
-				worstNode: worst?.hostname ?? null,
-				enabled: floors.some((f) => f.enabled !== false),
-				disabledOn: floors.filter((f) => f.enabled === false).map((f) => f.hostname),
-				byNode: floors.map((f) => ({
-					hostname: f.hostname,
-					enabled: f.enabled !== false,
-					lagMs: num(finite(f.lagMs)),
-					occupancy: num(finite(f.occupancy)),
-					floorHeldBy: f.floorHeldBy ?? null,
-					floorPinnedForMs: num(finite(f.floorPinnedForMs)),
-				})),
+				occupancy: sumOf(leaseRows, (row) => row.occupancy),
+				maxLeases: sumOf(leaseRows, (row) => row.maxLeases),
+				oldestLeaseAgeMs: maxOf(leaseRows, (row) => row.oldestLeaseAgeMs),
+				oldestLeaseExpiresAt: minOf(leaseRows, (row) => row.oldestLeaseExpiresAt),
+				fullestNode: fullest?.hostname ?? null,
+				fullestShare: fullest ? slotShare(fullest) : null,
+				// A node that answered without the block (an older plugin) is named, not counted as idle.
+				missing: bodies.filter((r) => !(r.b.leases && typeof r.b.leases === 'object')).map((r) => r.hostname),
+				byNode: leaseRows,
 			}
 		: null;
 
@@ -769,7 +782,7 @@ export function mergeOverview(results) {
 			},
 			intervals: bodies[0].b.intervals ?? null,
 			intervalsDiverge: new Set(intervalsJson).size > 1,
-			claimFloor,
+			leases,
 			reconcile,
 			orphanSweep,
 			sources: sourcesOf(results, { mode: 'merged' }),
@@ -1490,6 +1503,191 @@ export function mergeDiscoveryPurge(results) {
 	};
 }
 
+// ---------------------------------------------------------------- queue state
+
+/**
+ * One node's `GET /prerender_admin/queue-state` answer, as the merge and the Queue view read it.
+ *
+ * A 503 IS AN ANSWER. The plugin answers 503 whenever its queue keeper cannot vouch for its numbers
+ * (starting, waiting for peers, loading, failed, or a state document gone stale), and that body
+ * carries the reason, the keeper's own stats and the live `now` fields (in flight, pause, status).
+ * An operator needs every one of those, so it is kept — `answered` — and only its COUNTS are absent.
+ * A transport failure or a 401 carries no `trust` block and is not answered.
+ *
+ * A NODE WITHOUT A KEEPER is its own case: a plugin before v0.93.0 answers 404 "Unknown route" (a
+ * canary rollout runs mixed versions). It is up and claiming from its own index — `noKeeper`, judged as
+ * a watch by the view at either scope. A 404 "Management API is disabled" is not that; it is no answer.
+ *
+ * `fanOut` passes a non-200's parsed body as `errorBody`; `body` stays reserved for a usable 200.
+ */
+export function queueStateRow(result) {
+	const body = result.ok ? result.body : result.errorBody;
+	const answered = !!(body && typeof body === 'object' && body.trust && typeof body.trust === 'object');
+	const live = answered && !!result.ok && body.trust.live !== false;
+	const noKeeper =
+		!answered && result.status === 404 && /^Unknown route/.test(result.errorBody?.error ?? result.error ?? '');
+	return {
+		origin: result.origin ?? null,
+		hostname: result.hostname ?? body?.node ?? null,
+		node: answered ? (body.node ?? null) : null,
+		httpStatus: result.status ?? 0,
+		answered,
+		noKeeper,
+		live,
+		error: live ? null : answered ? (body.error ?? `answered ${result.status}`) : (result.error ?? null),
+		now: answered ? (body.now ?? null) : null,
+		coming: live ? (body.coming ?? null) : null,
+		// Per node: the bins and the oldest due row. The route and class lists are cluster-merged below.
+		lateness: live
+			? {
+					edges: body.lateness?.edges ?? null,
+					sitemap: body.lateness?.sitemap ?? null,
+					discovered: body.lateness?.discovered ?? null,
+					oldestDueAt: body.lateness?.oldestDueAt ?? null,
+				}
+			: null,
+		trust: answered ? body.trust : null,
+	};
+}
+
+/** How many classes the merged list keeps: the panel shows the worst few, and each node sends ≤200. */
+const MAX_CLASSES = 25;
+
+/** Element-wise sum of lateness bins, or null when the nodes disagree on the edges (a version skew). */
+function sumBins(rows, key, edgesJson) {
+	if (edgesJson === null) return null;
+	const arrays = rows.map((row) => row.lateness?.[key]).filter(Array.isArray);
+	const length = Math.max(0, ...arrays.map((a) => a.length));
+	return length ? sumArrays(arrays, length) : null;
+}
+
+/**
+ * Per-node queue state, merged.
+ *
+ * THE CLUSTER TOTAL IS WITHHELD, NOT FLOORED, until every configured node is live. Each keeper holds
+ * only the rows its node owns, so the sum over three of four nodes is not a smaller queue — it is a
+ * quarter of the queue missing, and it reads exactly like the backlog draining. `cluster` is null
+ * then, `withheld` names who could not vouch and why, and `nodes` still carries every node's own
+ * answer (the live nodes' counts included), which is what an operator acts on during a restart.
+ *
+ * Because a 503 is an answer, `sources` counts it as one: the view names those nodes itself, with the
+ * keeper's reason, where the generic "N of M nodes answered" banner would call a loading node down.
+ */
+export function mergeQueueState(results) {
+	const rows = results.map(queueStateRow);
+	// A cluster entirely on a plugin before v0.93.0 is still an answer: every node without a keeper.
+	if (!rows.some((row) => row.answered || row.noKeeper)) return allFailed(results, 'merged');
+
+	const live = rows.filter((row) => row.live);
+	const complete = live.length === rows.length;
+	const edgesSeen = new Set(live.map((row) => JSON.stringify(row.lateness?.edges ?? null)));
+	const edgesJson = edgesSeen.size === 1 ? [...edgesSeen][0] : null;
+
+	let cluster = null;
+	if (complete) {
+		const sum = (read) => sumOf(live, read);
+
+		// Classes (route × cadence × sitemap flag) add, keeping the worst head and naming its node the way
+		// every other per-node field here does: by the fan-out's host. (The per-route list is not merged —
+		// nothing reads it, and its bins would need the same edge check as the totals.)
+		const classes = new Map();
+		for (const result of results) {
+			for (const klass of result.body?.lateness?.classes ?? []) {
+				const id = `${klass.route}\u0000${klass.cadenceMs}\u0000${!!klass.fromSitemap}`;
+				const acc = classes.get(id) ?? {
+					route: klass.route,
+					cadenceMs: klass.cadenceMs,
+					fromSitemap: !!klass.fromSitemap,
+					rows: 0,
+					due: 0,
+					oldestDueAt: null,
+					oldestLatenessCadences: null,
+					worstNode: null,
+				};
+				acc.rows += finite(klass.rows) || 0;
+				acc.due += finite(klass.due) || 0;
+				const at = finite(klass.oldestDueAt);
+				if (Number.isFinite(at) && (acc.oldestDueAt === null || at < acc.oldestDueAt)) acc.oldestDueAt = at;
+				const late = finite(klass.oldestLatenessCadences);
+				if (Number.isFinite(late) && (acc.oldestLatenessCadences === null || late > acc.oldestLatenessCadences)) {
+					acc.oldestLatenessCadences = late;
+					acc.worstNode = result.hostname ?? null;
+				}
+				classes.set(id, acc);
+			}
+		}
+
+		// Flow is per minute on every node's clock; the minutes are wall-clock, so they align.
+		const flow = new Map();
+		for (const result of results) {
+			for (const slot of result.body?.flow ?? []) {
+				const minute = finite(slot.minute);
+				if (!Number.isFinite(minute)) continue;
+				const acc = flow.get(minute) ?? { minute, cameDue: 0, added: 0, triggered: 0, rescheduled: 0, removed: 0 };
+				for (const key of ['cameDue', 'added', 'triggered', 'rescheduled', 'removed'])
+					acc[key] += finite(slot[key]) || 0;
+				flow.set(minute, acc);
+			}
+		}
+
+		cluster = {
+			now: {
+				due: sum((row) => row.now?.due),
+				dueSitemap: sum((row) => row.now?.dueSitemap),
+				dueDiscovered: sum((row) => row.now?.dueDiscovered),
+				inFlight: sum((row) => row.now?.inFlight),
+				// Each node's own `due − inFlight` (clamped at zero there), summed: a node with more leases
+				// than due rows must not cancel another node's waiting rows.
+				unclaimed: sum((row) => row.now?.unclaimed),
+			},
+			coming: {
+				next15m: sum((row) => row.coming?.next15m),
+				next60m: sum((row) => row.coming?.next60m),
+				next24h: sum((row) => row.coming?.next24h),
+				byHour: sumArrays(
+					live.map((row) => row.coming?.byHour),
+					Math.max(0, ...live.map((row) => (Array.isArray(row.coming?.byHour) ? row.coming.byHour.length : 0)))
+				),
+			},
+			lateness: {
+				edges: edgesJson === null ? null : JSON.parse(edgesJson),
+				sitemap: sumBins(live, 'sitemap', edgesJson),
+				discovered: sumBins(live, 'discovered', edgesJson),
+				edgesDiverge: edgesJson === null,
+				oldestDueAt: minOf(live, (row) => row.lateness?.oldestDueAt),
+				// Plugin v0.93.1+: a node cut its lists at 200. Absent (0.93.0) reads as not cut.
+				listsTruncated: results.some((result) => result.body?.lateness?.listsTruncated === true),
+				classes: [...classes.values()]
+					.sort((a, b) => (b.oldestLatenessCadences ?? -1) - (a.oldestLatenessCadences ?? -1))
+					.slice(0, MAX_CLASSES),
+			},
+			flow: [...flow.values()].sort((a, b) => a.minute - b.minute),
+			// The plugin's own flag, every node's. The view refines it (a membership change's gained rows
+			// turn `exact` false without making a count short) from the per-node rows.
+			exact: live.every((row) => row.trust?.exact === true),
+		};
+	}
+
+	return {
+		status: 200,
+		body: {
+			scope: 'cluster',
+			generatedAt: minOf(live, (row) => row.trust?.stateAt),
+			live: live.length,
+			configured: rows.length,
+			cluster,
+			withheld: rows.filter((row) => !row.live).map((row) => ({ hostname: row.hostname, reason: row.error })),
+			nodes: rows,
+			// A 503 and a node without a keeper are answers the view names itself; only a node that did not
+			// answer at all banners the page as incomplete.
+			sources: sourcesOf(
+				results.map((r, i) => (rows[i].answered || rows[i].noKeeper ? { ...r, ok: true, error: null } : r)),
+				{ mode: 'merged' }
+			),
+		},
+	};
+}
+
 // ---------------------------------------------------------------- dispatch
 
 const MERGERS = {
@@ -1499,6 +1697,7 @@ const MERGERS = {
 	'config': mergeConfig,
 	'change-probe': mergeChangeProbe,
 	'discovery-purge': mergeDiscoveryPurge,
+	'queue-state': mergeQueueState,
 };
 
 export const mergerFor = (route) => MERGERS[route] ?? null;

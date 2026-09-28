@@ -23,9 +23,9 @@
  *   - "Not scheduled" is only asserted from an AUTHORITATIVE read. RenderSchedule rows are
  *     residency-pinned; when this node is not the owner and the owner could not be reached, an
  *     absent local row means "not scheduled HERE", and the view says so.
- *   - The same rule covers "below the claim floor" and "leased", which are answers about the
- *     OWNER's node-local shared buffer. The owner computes both and this view consumes them
- *     verbatim; it never compares a row against the querying node's own floor.
+ *   - The same rule covers "leased", which is an answer about the OWNER's node-local lease table.
+ *     The owner computes it and this view consumes it verbatim; it never checks a key against the
+ *     querying node's own leases.
  *   - A CADENCE IS NOT ITS CEILING. The Target's `renderInterval` is the interval the demand
  *     ladder schedules INSIDE, not the one this URL runs on, and the two differ for most of a
  *     corpus once the ladder is armed. `cadenceCard` renders the plugin's own resolution of it
@@ -574,7 +574,7 @@ function revalidate(ctx, data, target, schedule) {
 			el('div', { cls: 'note ok', style: { marginTop: '10px' } }, [
 				result.body.wokeLocalConsumers
 					? 'Marked due now — this node owns the row and woke its consumers; the render should start shortly.'
-					: `Marked due now on ${result.body.scheduleOwnedBy}, which owns the row and claims it on its next status sync.`,
+					: `Marked due now on ${result.body.scheduleOwnedBy}, which owns the row; its queue keeper publishes it within about a second.`,
 			])
 		);
 	} else if (result) {
@@ -591,34 +591,6 @@ function revalidate(ctx, data, target, schedule) {
 				el('strong', { text: 'A target with no schedule row — nothing will render it.' }),
 				' Outside every sitemap nothing re-creates the row: use the button above, or wait for this node’s repair sweep.',
 			])
-		);
-	} else if (schedule?.belowClaimFloor && data.residency?.scheduleAuthoritative) {
-		// STRUCTURALLY THE SAME BUG AS THE ONE ABOVE, and it needs its own case because the row
-		// EXISTS: without this the view above says "overdue by 9m" and reads as healthy-but-late,
-		// when in fact no claim will ever look at this key again. The repair sweep cannot see it
-		// either — it tests row existence, and the row is there.
-		//
-		// Gated on an authoritative read for the same reason, and doubly so here: the claim floor is
-		// node-local state about the OWNER's slice of the table, so a non-owner's floor answers a
-		// different question entirely.
-		children.push(
-			el(
-				'div',
-				{
-					cls: 'note bad',
-					style: { marginTop: '10px' },
-					title:
-						'Usual cause: a due time written straight to the table (the operations API, or a PUT to the exported ' +
-						'RenderSchedule endpoint) — no plugin code runs there, so the floor is not lowered to cover the write.',
-				},
-				[
-					el('strong', {
-						text: `Scheduled BELOW ${data.residency.scheduleOwnedBy}’s claim floor — nothing will claim it or report an error.`,
-					}),
-					' The button above fixes it (it lowers the floor with the row), as does reset-claim-floor on that node or ' +
-						'its next queue.claimFloor.resetInterval.',
-				]
-			)
 		);
 	}
 
