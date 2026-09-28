@@ -399,3 +399,24 @@ test('missUnion counts a URL that missed on several days once — the "do they c
 	assert.ok(Math.abs(union['gated-route'].distinctUrls - 900) / 900 <= 0.03, 'one-offs: the union is the sum');
 	assert.equal(union['not-found'].days, 3);
 });
+
+test('a sketch only a losing worker saw is stored by that worker once two intervals overdue', async () => {
+	// The winner of the write turn stores only the (day, series) pairs IT has pending. A miss cause or
+	// a rare crawler seen only by a losing worker used to wait for that worker's day rollover, so
+	// intra-day breadth read short — measured on two workers, a miss cause at 0.
+	applyOptions({ crawlStats: { flushInterval: 60_000 } });
+	const now = Date.now();
+	recordMissBreadth('unrendered', 'https://site.example.com/p/1');
+	await flushSketches({ write: false, nowMs: now });
+	assert.equal(rows.has(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`), false, 'owed, not yet overdue');
+	await flushSketches({ write: false, nowMs: now + 60_000 });
+	assert.equal(
+		rows.has(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`),
+		false,
+		'one interval: the winner may still'
+	);
+	await flushSketches({ write: false, nowMs: now + 121_000 });
+	const row = rows.get(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`);
+	assert.ok(row, 'two intervals overdue: stored by the worker that saw it');
+	assert.equal(row.estimate, 1);
+});

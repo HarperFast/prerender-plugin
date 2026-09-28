@@ -85,7 +85,8 @@ const hasBits = (bytes, idx, k) => {
 
 let slices = new Map(); // slot -> Uint8Array (this thread's observations for that slot)
 const dirty = new Set(); // slots with unmerged thread-local bits
-const pendingWrite = new Set(); // slots merged into the shared buffer but not yet stored
+// slots this thread merged into the shared buffer and has not seen stored: slot -> { gen, since }
+const pendingWrite = new Map();
 let slot = null; // the ring slot the clock is currently in
 let slotEndMs = 0; // rollover boundary, so the hot path compares one number
 let flushTimer = null;
@@ -151,7 +152,7 @@ function rollover(now) {
 	for (const s of slices.keys()) if (s <= oldest) slices.delete(s);
 	// Aged-out slots can no longer be answered by any probe, so an unwritten one is dead debt;
 	// dropping it keeps the set bounded by the ring rather than by uptime.
-	for (const s of pendingWrite) if (s <= oldest) pendingWrite.delete(s);
+	for (const s of pendingWrite.keys()) if (s <= oldest) pendingWrite.delete(s);
 	if (server.workerIndex === 0) {
 		setImmediate().then(() => sweepExpired(oldest).catch((e) => logger.error(e)));
 	}
@@ -303,12 +304,36 @@ const sharedSlice = (slot) => getSab(`visitFilter/bits/${shapeOf()}/${slot}`, bi
 const mergeIntoShared = (slot, mine) => {
 	const shared = new Int32Array(sharedSlice(slot));
 	const words = new Int32Array(mine.buffer, mine.byteOffset, mine.byteLength >>> 2);
+	let merged = false;
 	for (let i = 0; i < words.length; i++) {
 		const w = words[i];
-		if (w !== 0) Atomics.or(shared, i, w);
+		if (w !== 0) {
+			Atomics.or(shared, i, w);
+			merged = true;
+		}
 	}
 	mine.fill(0);
+	// This merge's generation (see "WHO PAYS FOR A MERGE" below), or 0 when nothing was merged.
+	return merged ? Atomics.add(generationOf(slot), 0, 1) + 1 : 0;
 };
+
+// ── WHO PAYS FOR A MERGE ─────────────────────────────────────────────────────────────────────
+//
+// One writer per node per interval stores the shared buffer, so a worker that loses the turn relies
+// on the winner to store its bits. Relying on it blindly lost them: the winner stores only the slots
+// IT has pending, so bits a loser merged after the winner's last store of a slot — the tail of every
+// slot, or everything in a slot only a losing worker saw traffic for — waited for the loser to win a
+// turn, which a phase-locked timer may never do. Measured on two workers with bursty traffic: one
+// worker's visits reached storage in 2 of 5 slots. That is a false negative, the one error this
+// filter must not make.
+//
+// So each shared slot carries two node-shared counters, `[merged, stored]`. A merge takes the next
+// `merged` generation; a store records the `merged` value it read before reading the buffer. A worker
+// forgets a debt once `stored` has passed its own merge (someone stored its bits), and pays a debt
+// itself — turn or no turn — once it is two intervals old: the winner had its chance. In steady
+// traffic the winner stores the live slot every interval and no loser ever writes; a loser writes
+// only for the tail the winner missed, which is exactly what used to be lost.
+const generationOf = (slot) => new Int32Array(getSab(`visitFilter/gen/${shapeOf()}/${slot}`, 8));
 
 /**
  * Merge this thread's dirty slices into the node-shared buffers, and — when `write` is set —
@@ -316,32 +341,40 @@ const mergeIntoShared = (slot, mine) => {
  *
  * The split is what makes one write serve every worker: merging is per worker and lock-free,
  * writing is once per node per interval (`claimWriteTurn`). A worker that loses the turn has
- * still contributed its bits to the shared buffer, so the winner's write carries them; the only
- * cost of losing is that those bits reach storage up to one interval later.
+ * still contributed its bits to the shared buffer, and the winner's next store of that slot
+ * carries them; if none comes within two intervals, this worker stores them itself (see "WHO PAYS
+ * FOR A MERGE"). `nowMs` is injectable for tests.
  */
-export async function flushSlices({ write = true } = {}) {
+export async function flushSlices({ write = true, nowMs = Date.now() } = {}) {
 	// Merge FIRST and unconditionally. This is the step that must not be skipped: it is the only
 	// thing that moves observations off this thread, and the shared buffer is what every later
 	// write reads from.
 	for (const s of dirty) {
 		const mine = slices.get(s);
-		if (mine) mergeIntoShared(s, mine);
+		const gen = mine ? mergeIntoShared(s, mine) : 0;
 		// Merged is NOT stored. Tracked separately from `dirty` because a worker that loses the
 		// turn clears `dirty` without writing: without this the bits would sit in the shared
 		// buffer, unwritten, until some worker happened to have BOTH new traffic for that slot
 		// and the turn — and on a quiet node they would simply age out with the slot. That is a
-		// false negative, so the debt is held explicitly until a write clears it.
-		pendingWrite.add(s);
+		// false negative, so the debt is held explicitly until a store covers it. A debt keeps the
+		// time it was FIRST owed, so a stream of merges cannot keep postponing its payment.
+		if (gen) pendingWrite.set(s, { gen, since: pendingWrite.get(s)?.since ?? nowMs });
 	}
 	dirty.clear();
 
-	if (!write || !pendingWrite.size) return;
+	// Debts another worker already paid: a store of the slot read the buffer after this merge.
+	for (const [s, debt] of pendingWrite) {
+		if (Atomics.load(generationOf(s), 1) >= debt.gen) pendingWrite.delete(s);
+	}
+	if (!pendingWrite.size) return;
+	const overdueBefore = nowMs - 2 * config.demand.flushInterval;
 	// Clear the debt slot by slot AS EACH ONE LANDS, rather than clearing up front and restoring
 	// on failure. A failure part-way through would otherwise re-queue the slots that had already
 	// been written, and each of those is another full-size replicated row — re-spending exactly
-	// what this function exists to save. Whatever remains in the set is precisely what did not
-	// land, and the next winning flush retries only that.
-	for (const s of [...pendingWrite]) {
+	// what this function exists to save. Whatever remains in the map is precisely what did not
+	// land, and a later flush retries only that.
+	for (const [s, debt] of [...pendingWrite]) {
+		if (!write && debt.since > overdueBefore) continue;
 		await persist(s);
 		pendingWrite.delete(s);
 	}
@@ -350,6 +383,10 @@ export async function flushSlices({ write = true } = {}) {
 async function persist(s) {
 	const VisitFilter = table();
 	const node = server.hostname;
+	// Every merge up to this generation is in the buffer read below (merges after it may be too —
+	// storing a bit twice is harmless, missing one is not).
+	const generation = generationOf(s);
+	const covered = Atomics.load(generation, 0);
 	const bits = new Uint8Array(sharedSlice(s));
 	const id = `${s}|${node}`;
 	// Read-merge-write of this node's own row (node is in the key, so the read is local and
@@ -367,14 +404,25 @@ async function persist(s) {
 			// bitsPerSlice changed under us; the old row is a different shape. Start clean rather
 			// than merging garbage — one slice of undercount, self-heals next slot.
 			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(bits), updatedAt: Date.now() });
-			return;
+		} else {
+			for (let i = 0; i < merged.length; i++) merged[i] |= bits[i];
+			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
 		}
-		for (let i = 0; i < merged.length; i++) merged[i] |= bits[i];
-		await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
 	} finally {
 		mutex.unlock();
 	}
+	markStored(generation, covered);
 }
+
+/** Raise `stored` to `covered`, never lower it (a slower concurrent store may finish last). */
+const markStored = (generation, covered) => {
+	let cur = Atomics.load(generation, 1);
+	while (covered > cur) {
+		const prev = Atomics.compareExchange(generation, 1, cur, covered);
+		if (prev === cur) break;
+		cur = prev;
+	}
+};
 
 // ---------------------------------------------------------------------------- read side
 

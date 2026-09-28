@@ -83,19 +83,3 @@ export const warmDemand = async () => {
 		// logged by the refresh itself
 	}
 };
-
-/** What the tracker can say right now, for the management API. */
-export const demandStatus = () => {
-	const { newestFill, worstFill, worstFalsePositive } = unionHealth();
-	const enabled = config.demand.enabled;
-	const warm = mergedWarm();
-	return {
-		enabled,
-		warm,
-		newestFill,
-		worstFill,
-		worstFalsePositive,
-		maxFalsePositive: config.demand.maxFalsePositive,
-		saturated: enabled && warm && worstFalsePositive > config.demand.maxFalsePositive,
-	};
-};

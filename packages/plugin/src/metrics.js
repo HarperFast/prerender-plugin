@@ -140,7 +140,7 @@ const MISS_CAUSES = Object.freeze([
 	'gated-entity', // a 200 with no target, whose entity already has one in rotation (ingress.entityGate)
 	'new', // a 200 with no target: this request minted one, first render jittered across the interval
 	'unrendered', // a target in rotation with no page for this device yet — waiting for its render
-	'device', // a target in rotation, but this device is not one it renders by default (deviceTypes.default)
+	'device', // a target in rotation, but this device is not one it renders by default (deviceTypes.default) — config, not capacity
 	'suppressed', // a target the render verdict suppressed (noindex, canonical elsewhere, error)
 	'error', // the Target read or the mint failed
 ]);
@@ -219,10 +219,11 @@ export const METRICS = Object.freeze({
 			'the detached Target read for new / unrendered / device / suppressed / gated-entity / error',
 		summary: 'Why a request that missed the cache missed: the reason, the route, the bot.',
 		usefulFor:
-			'Sizing COVERAGE — which misses are dead URLs (not-found), which are held out by a rule you chose ' +
-			'(gated-route, gated-bot, gated-entity, passthrough), and which are pages the rotation owns and has ' +
-			'not rendered yet (new, unrendered, device). Only the last group is render capacity or order; the ' +
-			'rest are decisions a render cannot change. Pair a cause with its distinct-URL count ' +
+			'Sizing COVERAGE — which misses are dead URLs (not-found), which are held out by a rule or setting you ' +
+			'chose (gated-route, gated-bot, gated-entity, passthrough, and device: a device outside ' +
+			'deviceTypes.default, which the rotation never renders), and which are pages the rotation owns and has ' +
+			'not rendered yet (new, unrendered). Only the last group is render capacity or order; the rest are ' +
+			'decisions a render cannot change. Pair a cause with its distinct-URL count ' +
 			'(GET /prerender_admin/crawl-breadth, `misses` per day and `missUnion` across the range): requests ' +
 			'per distinct URL is how often a missed URL is asked for again, which is what a render of it would ' +
 			'serve — a class of misses made of one-off URLs is not worth covering at any capacity.',
