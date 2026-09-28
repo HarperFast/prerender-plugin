@@ -78,6 +78,8 @@ import {
 } from '../charts.js';
 import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 import {
+	ACTION_WAIT_MIN_MS,
+	ACTION_WAIT_WARN,
 	SINCE,
 	STARTED_BY,
 	clusterFlags,
@@ -343,7 +345,7 @@ const FLAG_TITLE = {
 	'backoff': 'Backoff engaged.',
 	'rebaselined': 'Rule edit re-baselined rows.',
 	'action-errors': 'Actions failed.',
-	'resumed': 'Resumed after a restart.',
+	'action-bound': 'Paced by its actions.',
 	'cycle-behind': 'Behind the cycle target.',
 	'pass-error': 'Last sweep failed.',
 	'gave-up': 'Gave up on a refusing origin.',
@@ -523,6 +525,20 @@ const actionsText = (n, settings) => {
 	return typeof limit === 'number' && limit > 0 ? `${num(n)} of ${num(limit)}` : num(n);
 };
 
+/**
+ * Time the walk spent blocked on a full action pipeline (plugin v0.94.0), with its share of the pass —
+ * a warn pill past `ACTION_WAIT_WARN`, where the actions and not the origin are setting the pace.
+ */
+const actionWaitCell = (ms, share) => {
+	if (typeof ms !== 'number') return NA(`not reported by plugin < ${SINCE.actionWaitMs}`);
+	const text = `${ms > 0 ? duration(ms) : '0s'}${share !== null ? ` · ${pct(share, 1)} of the pass` : ''}`;
+	return share !== null && ms >= ACTION_WAIT_MIN_MS && share > ACTION_WAIT_WARN ? pill(text, 'warn') : mono(text);
+};
+
+/** A resume's walk cursor, shortened for a table cell with the full key on hover. */
+const cursorCell = (cursor) =>
+	cursor ? el('span', { cls: 'mono truncate', text: cursor, title: cursor }) : muted('the start of the key range');
+
 function stateTable(model) {
 	return table(
 		['node', 'state', 'progress', 'rate', 'finishes / next run', 'state row'],
@@ -558,6 +574,16 @@ function stateCell(d) {
 			])
 		);
 		if (r.startedBy) out.push(line([muted(`started by ${STARTED_BY[r.startedBy] ?? r.startedBy}`)]));
+		if (r.resumed && r.originStartedAt !== null) {
+			out.push(
+				line([
+					muted(
+						`continues the ${r.reseed ? 'reseed (a dry run)' : 'pass'} started ${fmtUtc(r.originStartedAt, d.now)} ` +
+							`(${relative(r.originStartedAt, d.now)})`
+					),
+				])
+			);
+		}
 	} else {
 		if (d.state !== 'unreadable') out.push(d.dryRun === false ? pill('live', 'ok') : pill('dry run', 'warn'));
 		if (d.last?.finishedAt) out.push(line([muted(`last sweep ended ${relative(d.last.finishedAt, d.now)}`)]));
@@ -576,7 +602,7 @@ function progressCell(d) {
 			line([muted('the pass’s own counts: n/a on plugin < 0.91.0')]),
 		];
 	}
-	if (r.slice !== null && r.matched !== null) {
+	if (r.fraction !== null) {
 		return [
 			meter(r.fraction),
 			line([mono(`${num(r.matched)} of ~${num(r.slice)} matched (${Math.round(r.fraction * 100)}%)`)]),
@@ -585,7 +611,13 @@ function progressCell(d) {
 	}
 	return [
 		mono(`${num(r.matched ?? 0)} matched so far`),
-		line([muted(`${num(r.examined)} rows examined — no slice estimate yet, so no percentage`)]),
+		line([
+			muted(
+				r.resumed
+					? `${num(r.examined)} rows examined — resumed mid-slice, so no percentage`
+					: `${num(r.examined)} rows examined — no slice estimate yet, so no percentage`
+			),
+		]),
 	];
 }
 
@@ -636,9 +668,11 @@ function whenCell(d) {
 				NA(
 					!r.hasCounters
 						? 'This node’s plugin (< 0.91.0) reports no counts to extrapolate from.'
-						: r.slice === null
-							? 'No slice estimate yet — the first complete pass measures it.'
-							: 'Not enough of the pass has run to extrapolate.'
+						: r.resumed
+							? 'A resumed pass walks only the rest of the slice, from the interrupted pass’s cursor — its share of it is unknown.'
+							: r.slice === null
+								? 'No slice estimate yet — the first complete pass measures it.'
+								: 'Not enough of the pass has run to extrapolate.'
 				)
 			);
 			out.push(line([muted('ETA unavailable')]));
@@ -836,6 +870,23 @@ function currentPassCard(model) {
 					? mono(actionsText(d.running.actionsInFlight, d.settings))
 					: NA(`not reported by plugin < ${SINCE.actionsInFlight}`)
 			),
+		live.some((d) => d.running.actionWaitMs !== null) &&
+			infoRow('Waited for an action slot', ({ d }) =>
+				actionWaitCell(d.running.actionWaitMs ?? undefined, d.running.actionWaitShare)
+			),
+		// A resume's origin, and where a resume of THIS pass would start (plugin v0.94.0).
+		live.some((d) => d.running.resumed) &&
+			infoRow('Continues', ({ d }) =>
+				d.running.resumed
+					? d.running.originStartedAt !== null
+						? mono(`the pass started ${fmtUtc(d.running.originStartedAt, d.now)}`)
+						: muted('an interrupted pass')
+					: muted('—')
+			),
+		live.some((d) => d.running.cursor !== null) &&
+			infoRow('Resume point', ({ d }) =>
+				d.running.cursor !== null ? cursorCell(d.running.cursor) : NA('not reported by this node')
+			),
 		infoRow('Pacing window now', ({ run }) =>
 			typeof run?.throttleLevel === 'number'
 				? run.throttleLevel > 1
@@ -964,6 +1015,7 @@ function lastPassCard(status, model) {
 											text: `continues the pass started ${fmtUtc(d.last.resumedFrom, d.now)}`,
 										})
 									: null,
+								el('div', { cls: 'sub muted' }, ['from ', cursorCell(d.last.resumeCursor)]),
 							])
 						: muted(STARTED_BY[run.startedBy] ?? run.startedBy)
 			),
@@ -1007,6 +1059,11 @@ function lastPassCard(status, model) {
 				)
 			);
 		}
+		if (columns.some((c) => typeof c.run.actionWaitMs === 'number')) {
+			rows.push(
+				infoRow('Waited for an action slot', ({ d, run }) => actionWaitCell(run.actionWaitMs, d.last.actionWaitShare))
+			);
+		}
 		if (columns.some((c) => c.run.unreadable > 0)) {
 			rows.push(
 				infoRow('Unreadable rows stepped over', ({ run }) =>
@@ -1038,10 +1095,11 @@ function semantics() {
 	return [
 		'Every count is for that one pass on that node. Each change is acted on as it is found: “Acted on” pages ',
 		'were hard-expired and their render filed ahead of routine rotation; an “Action error” left its page as it ',
-		'was and its baseline stale, so the next probe finds the change again. Nothing is deferred. A resumed pass ',
-		'probes only what the pass a restart interrupted had not reached; the rest counts as skipped. The overlay ',
-		'rows (pages disagreeing, caught up, ignored, appended paths) are not buckets — each is also inside Changed ',
-		'or Unchanged. “n/a” is a counter that node’s plugin does not report; Σ marked * sums only the nodes that do.',
+		'was and its baseline stale, so the next probe finds the change again. Nothing is deferred: when every ',
+		'action slot is busy the walk waits (“Waited for an action slot”). A resumed pass walks from the cursor the ',
+		'interrupted one reached, so its counts cover the rest of the slice, not all of it. The overlay rows (pages ',
+		'disagreeing, caught up, ignored, appended paths) are not buckets — each is also inside Changed or ',
+		'Unchanged. “n/a” is a counter that node’s plugin does not report; Σ marked * sums only the nodes that do.',
 	].join('');
 }
 
@@ -1780,6 +1838,12 @@ function capacityCard(ctx, status, clusterScope) {
 	// low throughput there is the backoff working, not a latency ceiling.
 	const pushedBack = (last.throttled ?? 0) > 0 || (last.throttleLevel ?? 1) > 1;
 	const ceilingBinding = observed >= ceiling * 0.9;
+	// BACKPRESSURE (plugin v0.94.0): time the walk spent blocked on a full action pipeline. Past the
+	// threshold the pass was paced by acting on changes, and the latency derived below — concurrency ÷
+	// observed — would blame the origin for a database-bound pass.
+	const waitMs = typeof last.actionWaitMs === 'number' ? last.actionWaitMs : null;
+	const waitShare = waitMs !== null ? Math.min(1, waitMs / (seconds * 1000)) : null;
+	const actionBound = waitShare !== null && waitMs >= ACTION_WAIT_MIN_MS && waitShare > ACTION_WAIT_WARN;
 	// Only meaningful when concurrency is the binding term; derived by inverting
 	// `throughput = concurrency / latency`.
 	const latencyMs = Math.round((concurrency / observed) * 1000);
@@ -1788,14 +1852,29 @@ function capacityCard(ctx, status, clusterScope) {
 		['Observed throughput', pill(`${observed.toFixed(1)}/s`, ceilingBinding ? 'ok' : '')],
 		['Configured ceiling', mono(`${num(ceiling)}/s`)],
 		['Concurrency', mono(num(concurrency))],
+		waitMs !== null ? ['Waited for an action slot', actionWaitCell(waitMs, waitShare)] : null,
 	];
 
+	const actionNote = actionBound
+		? note('warn', [
+				el('strong', {
+					text:
+						`The walk spent ${pct(waitShare, 1)} of this pass waiting for a free action slot — acting on changes ` +
+						'set its pace, not the origin or the probe concurrency.',
+				}),
+				' Raise ',
+				el('code', { text: 'changeProbe.trigger.concurrency' }),
+				' if the node’s database has headroom; raising probe concurrency or ratePerSecond would not help.',
+			])
+		: null;
 	let verdict = null;
 	if (pushedBack) {
 		verdict = note('warn', [
 			el('strong', { text: 'The origin pushed back during this pass — its throughput is the backoff doing its job.' }),
 			' Not a capacity ceiling; read this again after a pass that ends clean.',
 		]);
+	} else if (actionBound) {
+		verdict = actionNote;
 	} else if (ceilingBinding) {
 		verdict = note('', [
 			'The sweep is running at its configured ceiling, so ',
@@ -1828,7 +1907,7 @@ function capacityCard(ctx, status, clusterScope) {
 		const needed = slice / (target / 1000);
 		const reachable = needed <= Math.min(ceiling, ceilingBinding ? ceiling : observed);
 		rows.push(['Rate the cycle target needs', pill(`${needed.toFixed(1)}/s`, reachable ? 'ok' : 'bad')]);
-		if (!reachable && !pushedBack && !ceilingBinding) {
+		if (!reachable && !pushedBack && !ceilingBinding && !actionBound) {
 			// The concurrency that would clear it, at the latency just derived.
 			const wanted = Math.ceil((needed * latencyMs) / 1000);
 			rows.push(['Concurrency that would reach it', pill(`${num(wanted)} (from ${num(concurrency)})`, 'warn')]);
@@ -1839,8 +1918,11 @@ function capacityCard(ctx, status, clusterScope) {
 		head: [muted('this node’s last finished sweep')],
 		help:
 			'Throughput is min(concurrency ÷ latency, ratePerSecond), and the two terms fail with the same symptom. At the ' +
-			'ceiling the rate binds; well under it with no pushback, concurrency against origin latency does.',
-		body: [kv(rows.filter(Boolean)), verdict],
+			'ceiling the rate binds; well under it with no pushback, concurrency against origin latency does — unless ' +
+			`the walk spent over ${Math.round(ACTION_WAIT_WARN * 100)}% of the pass waiting for a free action slot, ` +
+			'when acting on changes (trigger.concurrency × database latency) is the governor instead.',
+		// Both notes when both held: pushback and backpressure are independent governors.
+		body: [kv(rows.filter(Boolean)), verdict, pushedBack ? actionNote : null],
 	});
 }
 

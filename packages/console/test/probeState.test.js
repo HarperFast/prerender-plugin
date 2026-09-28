@@ -60,11 +60,13 @@ const lastRun = (over = {}) => ({
 	loadThrottleLevel: 1,
 	behindBatches: 0,
 	maxActionsInFlight: 8,
+	actionWaitMs: 0,
 	unreadable: 0,
 	failureSamples: [],
 	dryRun: false,
 	startedBy: 'anchor',
 	resumedFrom: null,
+	resumeCursor: null,
 	startedAt: NOW - 19 * HOUR,
 	finishedAt: NOW - 10 * HOUR,
 	error: null,
@@ -122,6 +124,8 @@ const midPass = (over = {}) =>
 				heartbeatAt: NOW - 20_000,
 				stale: false,
 				startedBy: 'anchor',
+				reseed: false,
+				originStartedAt: NOW - 4 * HOUR,
 				dryRun: false,
 				label: null,
 				phase: 'walking',
@@ -140,6 +144,8 @@ const midPass = (over = {}) =>
 				triggered: 5800,
 				errors: 0,
 				actionsInFlight: 3,
+				actionWaitMs: 0,
+				cursor: 'https://www.example.com/product/k',
 				throttleLevel: 1,
 				recentRate: 9.9,
 				phase: 'walking',
@@ -375,21 +381,59 @@ test('the trigger-queue era is gone: deferrals and queue depth an older plugin r
 	assert.deepEqual(flagIds(describeNode(old, { hostname: 'node-a', now: NOW })), []);
 });
 
-test('flag: a resumed pass is a note — it explains why that pass probed only part of the slice', () => {
-	const resumed = withLast({ startedBy: 'resume', resumedFrom: NOW - 22 * HOUR, fresh: 150_000, probed: 140_000 });
-	const f = flagOf(resumed, 'resumed');
-	assert.equal(f.severity, 'info');
-	assert.equal(f.detail, 'node-a: resumed the pass started 22h ago');
-	assert.match(f.summary(['node-a']), /skipped \(counted as fresh\)/);
-	const d = describeNode(resumed, { now: NOW });
-	assert.equal(d.last.resumed, true);
-	assert.equal(d.last.resumedFrom, NOW - 22 * HOUR);
-	assert.equal(describeNode(v2(), { now: NOW }).last.resumed, false, 'an ordinary pass is not a resume');
-
+test('a resume is described, never flagged: what it continues, where it walks from, and no share of the whole slice', () => {
+	// Plugin v0.94.0 resumes from the interrupted walk's cursor, so a resumed pass's counts cover only the
+	// tail of the key range: there is no large skipped share to explain, and matched ÷ slice would under-read
+	// it and project an end hours late.
 	const resuming = midPass();
-	resuming.sweep.current.startedBy = 'resume';
-	assert.equal(flagOf(resuming, 'resumed').detail, 'node-a: resuming now');
-	assert.equal(flagOf(midPass(), 'resumed'), undefined);
+	Object.assign(resuming.sweep.current, {
+		startedBy: 'resume',
+		startedAt: NOW - HOUR,
+		originStartedAt: NOW - 22 * HOUR,
+		reseed: true,
+	});
+	resuming.sweep.nextRunAt = NOW + 30 * MIN;
+	const d = describeNode(resuming, { hostname: 'node-a', now: NOW });
+	assert.equal(d.running.resumed, true);
+	assert.equal(d.running.originStartedAt, NOW - 22 * HOUR);
+	assert.equal(d.running.reseed, true);
+	assert.equal(d.running.cursor, 'https://www.example.com/product/k');
+	assert.equal(d.running.fraction, null, 'no percentage of a slice it did not start at the beginning of');
+	assert.equal(d.running.etaAt, null);
+	assert.deepEqual(flagIds(d), [], 'no resumed note, and no will-overrun from a bogus ETA');
+
+	const resumed = withLast({
+		startedBy: 'resume',
+		resumedFrom: NOW - 22 * HOUR,
+		resumeCursor: 'https://www.example.com/product/k',
+	});
+	const last = describeNode(resumed, { now: NOW }).last;
+	assert.equal(last.resumed, true);
+	assert.equal(last.resumedFrom, NOW - 22 * HOUR);
+	assert.equal(last.resumeCursor, 'https://www.example.com/product/k');
+	assert.deepEqual(flagIds(describeNode(resumed, { now: NOW })), []);
+	assert.equal(describeNode(v2(), { now: NOW }).last.resumed, false, 'an ordinary pass is not a resume');
+	assert.equal(describeNode(midPass(), { now: NOW }).running.resumed, false);
+});
+
+test('flag: a pass paced by its actions — past 10% of its time waiting for a free slot, and at least a minute', () => {
+	// The last pass ran 9h; 1h 48m of waiting is 20% of it.
+	const bound = flagOf(withLast({ actionWaitMs: 108 * MIN }), 'action-bound');
+	assert.equal(bound.severity, 'warn');
+	assert.equal(bound.detail, 'node-a (last sweep): waited 1h 48m (20% of the pass)');
+	assert.match(bound.summary(['node-a']), /not the origin/);
+	assert.match(bound.summary(['node-a']), /trigger\.concurrency/);
+	assert.equal(flagOf(withLast({ actionWaitMs: 27 * MIN }), 'action-bound'), undefined, '5% is not the pace');
+	// A two-minute manual pass that waited 30s is a quarter of it, and still nothing to act on.
+	const short = withLast({ actionWaitMs: 30_000, startedAt: NOW - 2 * MIN, finishedAt: NOW });
+	assert.equal(flagOf(short, 'action-bound'), undefined);
+	// The running pass, against the time its counters cover (4h less the 20s since the heartbeat).
+	const running = midPass();
+	running.sweep.progress.actionWaitMs = HOUR;
+	assert.match(flagOf(running, 'action-bound').detail, /^node-a \(running sweep\): waited 1h \(25%/);
+	// A plugin that does not report it raises nothing.
+	const old = withLast({ actionWaitMs: undefined });
+	assert.equal(flagOf(old, 'action-bound'), undefined);
 });
 
 test('flag: a pass still running past its next anchor has skipped it; one projected to, would', () => {

@@ -794,4 +794,14 @@ test('changed pages waiting: a Queue check judged by time to re-render, and abse
 	);
 	assert.match(mixed.textContent, /not reported by node-b:9926/);
 	assert.equal(verdictOf(mixed), 'na');
+	// The same verdict as the Queue view: the oldest changed page's actual wait is judged too.
+	const aged = (n, agoMs) => ({ ...changed(n), now: { ...changed(n).now, oldestChangedAt: Date.now() - agoMs } });
+	const old = vital(
+		draw(
+			await ready({ queueState: stateOf(answer('node-a', aged(100, 3 * HOUR)), answer('node-b', aged(200, HOUR))) })
+		),
+		'Changed pages waiting'
+	);
+	assert.equal(verdictOf(old), 'warn', '300 rows is 9m of renders, but one has waited 3h');
+	assert.match(old.textContent, /oldest 3h · ~9m to re-render/);
 });

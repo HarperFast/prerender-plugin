@@ -656,6 +656,27 @@ test('queue-state: changed pages waiting sum when every node reports them, and a
 	assert.equal(mergeQueueState([ok('a', withChanged(0)), ok('b', withChanged(0))]).body.cluster.now.dueChanged, 0);
 });
 
+test('queue-state: the oldest changed page is the EARLIEST across nodes, and only when every node reports it', () => {
+	const at = (dueChanged, oldestChangedAt) => {
+		const body = withChanged(dueChanged);
+		return { ...body, now: { ...body.now, oldestChangedAt } };
+	};
+	const both = mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', at(20, 4_000_000))]).body.cluster.now;
+	assert.equal(both.oldestChangedAt, 4_000_000);
+	// A node with nothing changed due answers null — an answer, so it does not hide the other's.
+	assert.equal(
+		mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', at(0, null))]).body.cluster.now.oldestChangedAt,
+		5_000_000
+	);
+	const none = mergeQueueState([ok('a', at(0, null)), ok('b', at(0, null))]).body.cluster.now;
+	assert.equal('oldestChangedAt' in none, true);
+	assert.equal(none.oldestChangedAt, null);
+	// A node that does not send the field (the first 0.94.0 build, or 0.93): the cluster value is left
+	// out, exactly as that node sends it, rather than set to a null that would read "nothing waiting".
+	const mixed = mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', withChanged(20))]).body.cluster.now;
+	assert.equal('oldestChangedAt' in mixed, false);
+});
+
 test('queue-state: a changed class stays apart from the routine class it would otherwise fold into', () => {
 	const { classes } = mergeQueueState([ok('a', withChanged(50)), ok('b', withChanged(70))]).body.cluster.lateness;
 	const head = LIVE_STATE.lateness.classes[0];
@@ -1463,11 +1484,21 @@ test('change probe: the counters added after the merge was written now sum, and 
 // actions high-water is the worst node's, and a resumed pass is named — its counts cover a remainder.
 test('change probe: v0.94.0 — acted-on and action errors sum, the actions high-water is a max, resumes are named', () => {
 	const { body } = mergerFor('change-probe')([
-		ok('a', probeBody('a', { sweep: sweepWith({ triggered: 90, errors: 2, maxActionsInFlight: 8 }) })),
+		ok(
+			'a',
+			probeBody('a', { sweep: sweepWith({ triggered: 90, errors: 2, maxActionsInFlight: 8, actionWaitMs: 60_000 }) })
+		),
 		ok(
 			'b',
 			probeBody('b', {
-				sweep: sweepWith({ triggered: 40, errors: 1, maxActionsInFlight: 5, startedBy: 'resume', resumedFrom: 500 }),
+				sweep: sweepWith({
+					triggered: 40,
+					errors: 1,
+					maxActionsInFlight: 5,
+					actionWaitMs: 900_000,
+					startedBy: 'resume',
+					resumedFrom: 500,
+				}),
 			})
 		),
 		// A node still on 0.93: trigger-queue fields, no high-water.
@@ -1477,6 +1508,7 @@ test('change probe: v0.94.0 — acted-on and action errors sum, the actions high
 	assert.equal(last.triggered, 137);
 	assert.equal(last.errors, 3);
 	assert.equal(last.maxActionsInFlight, 8, 'the worst node, never a sum');
+	assert.equal(last.actionWaitMs, 900_000, 'the longest any node waited on its actions, never a sum');
 	assert.deepEqual(last.resumedOn, ['b.example.com:9926']);
 	for (const gone of ['queued', 'deferred', 'triggerQueueDepth']) {
 		assert.equal(gone in last, false, `${gone} is not merged any more`);
@@ -1486,6 +1518,7 @@ test('change probe: v0.94.0 — acted-on and action errors sum, the actions high
 	// An all-0.93 cluster has no high-water to report: null, not 0.
 	const old = mergerFor('change-probe')([ok('c', probeBody('c'))]).body.sweep.lastRun;
 	assert.equal(old.maxActionsInFlight, null);
+	assert.equal(old.actionWaitMs, null);
 	assert.deepEqual(old.resumedOn, []);
 });
 

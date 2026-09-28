@@ -88,6 +88,9 @@ export const queueSeries = (data, name) => pick(data, 'queue_health', (s) => s.p
  * - behindShare: due rows at least one cadence late (the page is two cadences old) over all due rows —
  *   judged only past `behindMinRows` late rows, so a quiet cluster whose handful of due rows includes a
  *   few held keys does not read as a third of the corpus falling behind.
+ * - changedWaitMs: how long the longest-waiting CHANGED page (plugin v0.94.0) has been due. The probe
+ *   hard-expired it, so bots get the origin for all of that time. The same bounds as the backlog's time to
+ *   clear: changed rows are ranked ahead of routine ones, so past 2h the fleet is not reaching them.
  */
 export const LIMITS = Object.freeze({
 	publishMs: [50, 250],
@@ -96,7 +99,11 @@ export const LIMITS = Object.freeze({
 	slotShare: [0.75, 0.95],
 	behindShare: [0.1, 0.33],
 	behindMinRows: 100,
+	changedWaitMs: [2 * 3_600_000, 8 * 3_600_000],
 });
+
+const VERDICT_RANK = { na: 0, ok: 1, warn: 2, bad: 3 };
+const worseVerdict = (a, b) => ((VERDICT_RANK[a] ?? 0) >= (VERDICT_RANK[b] ?? 0) ? a : b);
 
 const verdictAbove = (value, [warn, bad]) =>
 	!Number.isFinite(value) ? 'na' : value >= bad ? 'bad' : value >= warn ? 'warn' : 'ok';
@@ -473,28 +480,42 @@ export function backlogReading(overview, queueState) {
 /**
  * Changed pages waiting: due rows the change probe filed (plugin v0.94.0 `now.dueChanged`). The probe
  * hard-expired each one — its content is known changed — so until it re-renders, bots are served the
- * origin. They are ranked `queue.ready.changedHeadStart` cadences ahead of routine rows, so the render
- * rate reaches them first, and the time to re-render them is judged like the backlog's time to clear.
- * Shared with the Health view so the two pages cannot disagree.
+ * origin. Shared with the Health view so the two pages cannot disagree.
  *
- * `reported` is false when no live node reports the field (an older plugin everywhere): hide it, never
+ * TWO JUDGEMENTS, THE WORSE WINS. The ACTUAL wait of the longest-waiting changed page (`now.oldestChangedAt`,
+ * its due minute; `LIMITS.changedWaitMs`) says how long bots have already been getting the origin for it.
+ * The count ÷ the render rate (the backlog's 2h / 8h) says how long the rest will take — changed rows are
+ * ranked `queue.ready.changedHeadStart` cadences ahead, so the render rate reaches them first. Each alone
+ * misses a case: a small, old head reads fine by count, and a fresh wave reads fine by age.
+ *
+ * `reported` is false when no live node reports the count (an older plugin everywhere): hide it, never
  * show a 0. `count` is null when the cluster total is unknown — a keeper not live, or `missing` names the
- * live nodes that do not report it (a mixed rollout) — never a partial sum.
+ * live nodes that do not report it (a mixed rollout) — never a partial sum. The oldest wait is judged only
+ * when the cluster reports it (every node on a plugin that sends it); `null` there means nothing is due.
  */
-export function changedReading(queueState, rendersPerHour) {
+export function changedReading(queueState, rendersPerHour, now = Date.now()) {
 	const liveRows = (queueState?.nodes ?? []).filter((row) => row.live);
 	const reporting = liveRows.filter((row) => Number.isFinite(row.now?.dueChanged));
 	const reported = reporting.length > 0;
-	const count = Number.isFinite(queueState?.cluster?.now?.dueChanged) ? queueState.cluster.now.dueChanged : null;
+	const clusterNow = queueState?.cluster?.now;
+	const count = Number.isFinite(clusterNow?.dueChanged) ? clusterNow.dueChanged : null;
 	const missing = reported ? liveRows.filter((row) => !Number.isFinite(row.now?.dueChanged)).map(hostOf) : [];
 	const clear = count === null ? { ms: null, verdict: 'na' } : drainWaiting(count, rendersPerHour);
+	const oldestReported = count !== null && !!clusterNow && 'oldestChangedAt' in clusterNow;
+	const oldestAt = oldestReported && Number.isFinite(clusterNow.oldestChangedAt) ? clusterNow.oldestChangedAt : null;
+	const waitMs = oldestAt === null ? null : Math.max(0, now - oldestAt);
+	const waitVerdict = !oldestReported ? 'na' : waitMs === null ? 'ok' : verdictAbove(waitMs, LIMITS.changedWaitMs);
 	return {
 		reported,
 		count,
 		floor: count !== null && !liveRows.every(countsExact),
 		missing,
 		ms: clear.ms,
-		verdict: clear.verdict,
+		clearVerdict: clear.verdict,
+		oldestAt,
+		waitMs,
+		waitVerdict,
+		verdict: worseVerdict(waitVerdict, clear.verdict),
 	};
 }
 
@@ -502,7 +523,11 @@ export function changedReading(queueState, rendersPerHour) {
 export function changedSub(r) {
 	if (r.count === null) return r.missing.length ? `not reported by ${r.missing.join(', ')}` : 'needs every keeper live';
 	if (r.count === 0) return 'none waiting';
-	return Number.isFinite(r.ms) ? `~${duration(r.ms)} to re-render · served from origin` : 'served from origin';
+	const parts = [
+		r.waitMs !== null ? `oldest ${duration(r.waitMs)}` : null,
+		Number.isFinite(r.ms) ? `~${duration(r.ms)} to re-render` : null,
+	].filter(Boolean);
+	return parts.length ? parts.join(' · ') : 'served from origin';
 }
 
 /** The fullest node's lease slots in use, `{ share, node }`, or null. */
@@ -721,8 +746,8 @@ function kpis(data, qs, analytics) {
 					title:
 						'Inside Due now: pages the change probe found changed and hard-expired, ranked ' +
 						'queue.ready.changedHeadStart cadences ahead of routine rows. Bots are served the origin until each ' +
-						're-renders. "To re-render" is this count ÷ the render rate over the selected range; past 2h a watch, ' +
-						'past 8h bad.',
+						're-renders. "Oldest" is how long the longest-waiting one has been due; "to re-render" is this count ÷ ' +
+						'the render rate over the selected range. Either past 2h is a watch, past 8h bad.',
 				}
 			),
 		stat(
@@ -915,7 +940,10 @@ function keeperCard(ctx, qs, analytics, overview) {
 						title:
 							row.live && !Number.isFinite(row.now?.dueChanged)
 								? 'Not reported: this node’s plugin predates v0.94.0.'
-								: 'Due rows the change probe filed: served from the origin until they re-render.',
+								: 'Due rows the change probe filed: served from the origin until they re-render.' +
+									(Number.isFinite(row.now?.oldestChangedAt)
+										? ` The oldest has been due ${duration(Math.max(0, Date.now() - row.now.oldestChangedAt))}.`
+										: ''),
 					}
 				),
 			Number.isFinite(leased)

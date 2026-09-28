@@ -918,6 +918,8 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 						heartbeatAt: now - 20_000,
 						stale: false,
 						startedBy: 'anchor',
+						reseed: false,
+						originStartedAt: now - 4 * HOUR,
 						dryRun: false,
 						label: null,
 						phase: 'walking',
@@ -939,6 +941,8 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 						triggered: 66,
 						errors: 0,
 						actionsInFlight: 3,
+						actionWaitMs: 0,
+						cursor: 'https://www.example.com/product/m',
 						throttleLevel: 1,
 						recentRate: 9.8,
 						phase: 'walking',
@@ -949,10 +953,12 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 				dryRun: false,
 				startedBy: 'anchor',
 				resumedFrom: null,
+				resumeCursor: null,
 				changed: 240,
 				// A healthy pass: STATUS's own record carries a 10% failure share.
 				failed: 40,
 				maxActionsInFlight: 8,
+				actionWaitMs: 0,
 				startedAt: now - 20 * HOUR,
 				finishedAt: now - 11 * HOUR,
 				slotChanges: { price: { 0: 200, 1: 60 } },
@@ -1194,22 +1200,89 @@ test('the last pass reports what it acted on, what failed and the most actions i
 	assert.doesNotMatch(last.textContent, /Trigger queue|Queued re-renders|Deferred|NaN/);
 });
 
-test('a resumed pass is marked where it runs, in the last pass it became, and in the flags', async () => {
+test('a resumed pass says what it continues and where it walks from — marked, never flagged', async () => {
 	const now = Date.now();
 	const running = v2Body({ running: true });
-	running.sweep.current.startedBy = 'resume';
-	const live = cardTitled(await ready({ status: running }), /^Probe now/);
+	Object.assign(running.sweep.current, {
+		startedBy: 'resume',
+		startedAt: now - HOUR,
+		originStartedAt: now - 22 * HOUR,
+	});
+	const ctx = await ready({ status: running });
+	const live = cardTitled(ctx, /^Probe now/);
 	assert.ok(find(live, (n) => n.attributes?.class === 'pill info' && n.textContent === 'resumed'));
 	assert.match(live.textContent, /started by a restart \(resuming the interrupted pass\)/);
-	assert.match(live.textContent, /Resumed after a restart\./);
+	assert.match(live.textContent, /continues the pass started (\w{3} \d+ \w{3} )?\d\d:\d\d UTC \(22h ago\)/);
+	// It walks from a cursor, so a share of the whole slice would be wrong: none is claimed.
+	assert.match(live.textContent, /resumed mid-slice, so no percentage/);
+	assert.doesNotMatch(live.textContent, /% through|matched \(\d+%\)/);
+	assert.doesNotMatch(live.textContent, /Resumed after a restart|counted as fresh/, 'no flag explaining a skip share');
+	const current = cardTitled(ctx, /^Current pass/);
+	const row = (label) => find(current, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label));
+	assert.match(row('Continues').textContent, /the pass started/);
+	const cursor = find(row('Resume point'), (n) => n.attributes?.title === 'https://www.example.com/product/m');
+	assert.ok(cursor, 'the walk cursor, with the full key on hover');
+
+	// A resumed reseed says so — it is a dry run, whatever resumed it.
+	const reseed = v2Body({ running: true });
+	Object.assign(reseed.sweep.current, {
+		startedBy: 'resume',
+		originStartedAt: now - 2 * HOUR,
+		reseed: true,
+		dryRun: true,
+	});
+	assert.match(
+		cardTitled(await ready({ status: reseed }), /^Probe now/).textContent,
+		/continues the reseed \(a dry run\) started/
+	);
 
 	const done = v2Body();
-	Object.assign(done.sweep.lastRun, { startedBy: 'resume', resumedFrom: now - 22 * HOUR, fresh: 1500 });
-	const ctx = await ready({ status: done });
-	const last = cardTitled(ctx, /^Last completed sweep/);
+	Object.assign(done.sweep.lastRun, {
+		startedBy: 'resume',
+		resumedFrom: now - 22 * HOUR,
+		resumeCursor: 'https://www.example.com/product/k',
+	});
+	const after = await ready({ status: done });
+	const last = cardTitled(after, /^Last completed sweep/);
 	assert.match(last.textContent, /resumed after a restart/);
 	assert.match(last.textContent, /continues the pass started (\w{3} \d+ \w{3} )?\d\d:\d\d UTC/);
-	assert.match(cardTitled(ctx, /^Probe now/).textContent, /node-a: resumed the pass started 22h ago/);
+	assert.match(last.textContent, /from https:\/\/www\.example\.com\/product\/k/);
+	assert.match(helpText(last), /walks from the cursor the interrupted one reached/);
+	assert.match(cardTitled(after, /^Probe now/).textContent, /No health flags/);
+});
+
+test('backpressure: the time the walk waited for an action slot sits beside actions in flight, and warns past 10%', async () => {
+	const running = v2Body({ running: true });
+	const current = cardTitled(await ready({ status: running }), /^Current pass/);
+	const waitRow = (card) =>
+		find(card, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith('Waited for an action slot'));
+	assert.match(waitRow(current).textContent, /0s · 0% of the pass/);
+
+	// The last pass ran 9h and waited 2h of it: the actions, not the origin, set its pace.
+	const bound = v2Body();
+	bound.sweep.lastRun.actionWaitMs = 2 * HOUR;
+	const ctx = await ready({ status: bound });
+	const last = cardTitled(ctx, /^Last completed sweep/);
+	assert.ok(
+		find(waitRow(last), (n) => n.attributes?.class === 'pill warn' && /2h · 22% of the pass/.test(n.textContent))
+	);
+	const now = cardTitled(ctx, /^Probe now/).textContent;
+	assert.match(now, /Paced by its actions\./);
+	assert.match(now, /node-a \(last sweep\): waited 2h \(22% of the pass\)/);
+});
+
+test('pacing: an action-bound pass is not diagnosed as an origin-latency or concurrency limit', async () => {
+	// 1,500 probes in 200s, well under the 10/s ceiling — but 80s of it was spent waiting on the actions.
+	const text = draw(await ready({ status: sweptAt(1500, 200, { actionWaitMs: 80_000 }) })).textContent;
+	assert.match(text, /Waited for an action slot1m · 40% of the pass/);
+	assert.match(text, /acting on changes set its pace, not the origin or the probe concurrency/);
+	assert.match(text, /changeProbe\.trigger\.concurrency/);
+	assert.doesNotMatch(text, /never actually reached|Implied per-probe latency/);
+	// Without the wait the same numbers are the concurrency diagnosis they always were.
+	assert.match(
+		draw(await ready({ status: sweptAt(1500, 200, { actionWaitMs: 0 }) })).textContent,
+		/never actually reached/
+	);
 });
 
 test('an older plugin (0.93-shaped payload): the removed fields are not shown and the new ones are left out, not n/a rows', async () => {
@@ -1218,10 +1291,14 @@ test('an older plugin (0.93-shaped payload): the removed fields are not shown an
 	old.settings.trigger = { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 };
 	Object.assign(old.sweep.progress, { queued: 70, deferred: 4, triggerQueueDepth: 46_000 });
 	delete old.sweep.progress.actionsInFlight;
+	delete old.sweep.progress.actionWaitMs;
+	delete old.sweep.progress.cursor;
 	delete old.sweep.progress.errors;
 	Object.assign(old.sweep.lastRun, { queued: 230, deferred: 12, triggerQueueDepth: 49_000 });
 	delete old.sweep.lastRun.maxActionsInFlight;
+	delete old.sweep.lastRun.actionWaitMs;
 	delete old.sweep.lastRun.resumedFrom;
+	delete old.sweep.lastRun.resumeCursor;
 	const ctx = await ready({ status: old });
 	const text = draw(ctx).textContent;
 	assert.doesNotMatch(text, /Trigger queue|Triggers per sweep|drains \d|Queued re-renders|Deferred|deferred past|NaN/);
@@ -1234,6 +1311,13 @@ test('an older plugin (0.93-shaped payload): the removed fields are not shown an
 		find(cardTitled(ctx, /^Last completed sweep/), (n) => n.tagName === 'TR' && /Most actions/.test(n.textContent)),
 		null
 	);
+	for (const label of ['Waited for an action slot', 'Resume point', 'Continues']) {
+		assert.equal(
+			find(draw(ctx), (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label)),
+			null,
+			`nor the ${label} row`
+		);
+	}
 	// Its trigger.concurrency meant triggers in flight — the same bound, so it is shown as such.
 	assert.match(cardTitled(ctx, /^Configuration/).textContent, /Actions in flightat most 4/);
 	assert.doesNotMatch(text, /Changes deferred|Trigger queue near full/);

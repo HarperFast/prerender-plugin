@@ -1331,6 +1331,9 @@ export function mergeChangeProbe(results) {
 							unreadable: sumOf(sweeps, (run) => run.unreadable),
 							// The most actions any node had in flight at once (plugin v0.94.0) — a high-water mark, not a sum.
 							maxActionsInFlight: maxOf(sweeps, (run) => run.maxActionsInFlight),
+							// The longest any node's walk was blocked on a full action pipeline — the worst node, since
+							// each wait is a share of that node's own pass.
+							actionWaitMs: maxOf(sweeps, (run) => run.actionWaitMs),
 							// Nodes whose last pass finished one a restart cut short (plugin v0.94.0): their counts
 							// cover only the rows the interrupted pass had not reached.
 							resumedOn: sweeps.filter((run) => run.startedBy === 'resume').map((run) => run.hostname),
@@ -1648,6 +1651,12 @@ export function mergeQueueState(results) {
 				dueChanged: live.every((row) => Number.isFinite(row.now?.dueChanged))
 					? sum((row) => row.now?.dueChanged)
 					: null,
+				// The longest-waiting changed page's due minute: the EARLIEST across nodes, and only when every
+				// node reports the field. `null` is an answer (no changed page is due), so an unreported cluster
+				// value is left OUT rather than set to null — exactly as a node that does not report it sends it.
+				...(live.every((row) => row.now && 'oldestChangedAt' in row.now)
+					? { oldestChangedAt: minOf(live, (row) => row.now.oldestChangedAt) }
+					: {}),
 				inFlight: sum((row) => row.now?.inFlight),
 				// Each node's own `due − inFlight` (clamped at zero there), summed: a node with more leases
 				// than due rows must not cancel another node's waiting rows.
