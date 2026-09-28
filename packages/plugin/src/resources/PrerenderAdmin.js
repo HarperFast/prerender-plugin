@@ -1428,7 +1428,8 @@ export class PrerenderAdmin extends Resource {
 				dueSitemap: q.dueSitemap,
 				dueDiscovered: q.dueDiscovered,
 				// pages the change probe found changed and expired, waiting on their render; the oldest one's
-				// filing minute says how long changed pages are actually waiting
+				// due minute — its filing minute, or the earlier due time a row already overdue kept — is how long
+				// changed pages have been waiting (for such a row, longer than it has been served from the origin)
 				dueChanged: q.dueChanged ?? 0,
 				oldestChangedAt: q.oldestChangedDueAt ?? null,
 				...nowBlock,
