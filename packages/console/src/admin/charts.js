@@ -272,9 +272,9 @@ export const sumCount = (combos) => combos.reduce((acc, s) => acc + s.count, 0);
  *
  * `count` is the number of EMITS. For most value metrics that is what you want (750 durations),
  * but several of them record a count as their value — `claim_granted` emits once per claim pass
- * carrying the number of jobs, `ready_cadence` once per sweep carrying a number of rows — and
- * there `sumCount` answers "how many claim passes ran", which is a different question with a
- * plausible-looking answer.
+ * carrying the number of jobs, `keeper_repaired` once per verification walk carrying a number of
+ * rows — and there `sumCount` answers "how many claim passes ran", which is a different question
+ * with a plausible-looking answer.
  *
  * Reconstructed as Σ(mean × count) rather than read off `total`: the row schema has a `total`
  * column, but Harper populates it only for BOOLEAN counters. Every distribution row in a live

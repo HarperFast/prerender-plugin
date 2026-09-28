@@ -256,7 +256,10 @@ test('the hedges survive the shortening: unknown is not absent, not-owner is not
 	assert.ok(find(tree, (n) => n.attributes?.class === 'note bad' && /Reads timed out/.test(n.textContent)));
 });
 
-test('a row below the owner’s claim floor is still the loud fault, with its cause on the tooltip', async () => {
+test('an owner’s schedule row reads as due or leased, with no claim-floor verdict (removed in v0.93.0)', async () => {
+	// The real 0.93.0 explain row for a due homepage, fetched from its owner. The queue keeper has no
+	// floor, so a row that exists and is due is claimable — the one "row exists but will never render"
+	// case this view used to raise is gone with it, and the view must not invent one.
 	const body = explain(null);
 	body.residency = {
 		scheduleReadIsAuthoritative: false,
@@ -265,19 +268,26 @@ test('a row below the owner’s claim floor is still the loud fault, with its ca
 		scheduleOwnedBy: 'node-b',
 	};
 	body.rows.renderSchedule = {
-		leased: false,
-		overdue: true,
-		dueInMs: 9 * 60_000,
-		belowClaimFloor: true,
+		cacheKey: 'https://www.example.com/',
+		nextRenderTime: Date.now() - 9 * 60_000,
 		fromSitemap: true,
+		effectiveInterval: HOUR,
+		scheduleKey: 'https://www.example.com/',
+		perDevice: false,
+		dueInMs: -9 * 60_000,
+		overdue: true,
+		leased: false,
+		leaseExpiresAt: null,
 	};
 	const ctx = makeCtx({ ok: true, body });
 	await load(ctx);
 	const tree = draw(ctx);
-	const alarm = find(tree, (n) => n.attributes?.class === 'note bad' && /claim floor/.test(n.textContent));
-	assert.ok(alarm);
-	assert.match(alarm.textContent, /Scheduled BELOW node-b’s claim floor — nothing will claim it or report an error/);
-	assert.match(alarm.textContent, /reset-claim-floor/);
-	assert.match(alarm.attributes.title, /written straight to the table/);
+	assert.match(tree.textContent, /overdue by 9m/);
 	assert.match(tree.textContent, /Schedule row fetched from its owner, node-b \(authoritative\)/);
+	assert.doesNotMatch(tree.textContent, /claim floor|reset-claim-floor/);
+	assert.equal(
+		find(tree, (n) => n.attributes?.class === 'note bad'),
+		null,
+		'a due row on its owner is not a fault'
+	);
 });

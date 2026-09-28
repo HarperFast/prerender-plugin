@@ -1,0 +1,236 @@
+{
+	"generatedAt": 1790611044241,
+	"node": "localhost",
+	"workerIndex": 1,
+	"host": {
+		"hostname": "localhost",
+		"cpus": 14,
+		"totalMemory": 8318976000,
+		"availableMemory": 6575419392,
+		"availableMemorySource": "meminfo",
+		"swapUsed": 0,
+		"swapTotal": 1073737728,
+		"memoryLimit": null,
+		"memoryLimitAvailable": null,
+		"loadavg": [0.17, 0.15, 0.08],
+		"uptimeSec": 406,
+		"pluginVersion": "0.93.0",
+		"harperVersion": "5.2.13",
+		"nodeVersion": "v24.21.0"
+	},
+	"localQueueStatus": "queued",
+	"control": {
+		"cluster": null,
+		"knownScopes": ["all", "localhost"]
+	},
+	"nodes": [
+		{
+			"hostname": "localhost",
+			"status": "queued",
+			"statusChangedTime": 1790610640173,
+			"isThisNode": true,
+			"override": null
+		}
+	],
+	"counts": {
+		"targets": {
+			"recordCount": 0,
+			"estimatedRange": null
+		},
+		"pages": {
+			"recordCount": 0,
+			"estimatedRange": null
+		},
+		"sitemaps": {
+			"recordCount": 0,
+			"estimatedRange": null
+		},
+		"suppressed": {
+			"recordCount": 0,
+			"truncated": false
+		}
+	},
+	"countsAsOf": 1790611012135,
+	"backlog": {
+		"enabled": true,
+		"interval": 60000,
+		"running": false,
+		"lastRun": {
+			"overdue": 152417,
+			"inFlight": 340,
+			"buckets": [
+				{
+					"hour": 0,
+					"startMs": 1790611009479,
+					"count": 4284
+				},
+				{
+					"hour": 1,
+					"startMs": 1790614609479,
+					"count": 4284
+				},
+				{
+					"hour": 2,
+					"startMs": 1790618209479,
+					"count": 4284
+				},
+				{
+					"hour": 3,
+					"startMs": 1790621809479,
+					"count": 4266
+				},
+				{
+					"hour": 4,
+					"startMs": 1790625409479,
+					"count": 4260
+				},
+				{
+					"hour": 5,
+					"startMs": 1790629009479,
+					"count": 4150
+				},
+				{
+					"hour": 6,
+					"startMs": 1790632609479,
+					"count": 2940
+				},
+				{
+					"hour": 7,
+					"startMs": 1790636209479,
+					"count": 2940
+				},
+				{
+					"hour": 8,
+					"startMs": 1790639809479,
+					"count": 2940
+				},
+				{
+					"hour": 9,
+					"startMs": 1790643409479,
+					"count": 2940
+				},
+				{
+					"hour": 10,
+					"startMs": 1790647009479,
+					"count": 2927
+				},
+				{
+					"hour": 11,
+					"startMs": 1790650609479,
+					"count": 2910
+				},
+				{
+					"hour": 12,
+					"startMs": 1790654209479,
+					"count": 2910
+				},
+				{
+					"hour": 13,
+					"startMs": 1790657809479,
+					"count": 2910
+				},
+				{
+					"hour": 14,
+					"startMs": 1790661409479,
+					"count": 2910
+				},
+				{
+					"hour": 15,
+					"startMs": 1790665009479,
+					"count": 2910
+				},
+				{
+					"hour": 16,
+					"startMs": 1790668609479,
+					"count": 2910
+				},
+				{
+					"hour": 17,
+					"startMs": 1790672209479,
+					"count": 2910
+				},
+				{
+					"hour": 18,
+					"startMs": 1790675809479,
+					"count": 2910
+				},
+				{
+					"hour": 19,
+					"startMs": 1790679409479,
+					"count": 2910
+				},
+				{
+					"hour": 20,
+					"startMs": 1790683009479,
+					"count": 2910
+				},
+				{
+					"hour": 21,
+					"startMs": 1790686609479,
+					"count": 2910
+				},
+				{
+					"hour": 22,
+					"startMs": 1790690209479,
+					"count": 2910
+				},
+				{
+					"hour": 23,
+					"startMs": 1790693809479,
+					"count": 3000
+				}
+			],
+			"scanned": 300101,
+			"truncated": false,
+			"horizonMs": 1790697409479,
+			"source": "keeper",
+			"asOf": 1790611009479,
+			"counts": {
+				"targets": {
+					"recordCount": 0,
+					"estimatedRange": null
+				},
+				"pages": {
+					"recordCount": 0,
+					"estimatedRange": null
+				},
+				"sitemaps": {
+					"recordCount": 0,
+					"estimatedRange": null
+				},
+				"suppressed": {
+					"recordCount": 0,
+					"truncated": false
+				}
+			},
+			"node": "localhost",
+			"startedAt": 1790611012134,
+			"finishedAt": 1790611012135,
+			"error": null
+		}
+	},
+	"intervals": {
+		"statusSyncInterval": 60000,
+		"jobLeaseTime": 120000,
+		"defaultRenderInterval": 86400000
+	},
+	"leases": {
+		"occupancy": 290,
+		"oldestLeaseExpiresAt": 1790611048000,
+		"oldestLeaseDueMinute": 29842475,
+		"maxLeases": 4096,
+		"oldestLeaseAgeMs": 116241
+	},
+	"reconcile": {
+		"enabled": true,
+		"interval": 21600000,
+		"running": false,
+		"lastRun": null
+	},
+	"orphanSweep": {
+		"dryRunDefault": true,
+		"maxDeletes": 5000,
+		"running": false,
+		"lastRun": null
+	}
+}

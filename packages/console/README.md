@@ -44,25 +44,30 @@ first entry is _all nodes_; the rest are the configured nodes, for drilling in.
 
 This matters because almost nothing in a prerender deployment is cluster-wide at the source.
 `hdb_analytics` rows are written per node. The backlog snapshot covers only the residency-pinned
-`RenderSchedule` keys _that_ node owns. The claim floor is a node-local shared buffer. So a
-per-node console showed one Nth of an N-node cluster, and the cluster's real numbers — total
+`RenderSchedule` keys _that_ node owns, and so does its queue keeper. The lease table is a node-local
+shared buffer. So a per-node console showed one Nth of an N-node cluster, and the cluster's real numbers — total
 serve rate, total render backlog — had to be assembled by hand across N browser tabs.
 
 Under cluster scope the proxy fans each read out to every signed-in node and merges the answers
 server-side ([`src/util/aggregate.js`](src/util/aggregate.js)). Three classes, and the class is
 part of the contract:
 
-| Class      | Routes                                                                           | What happens                                                     |
-| ---------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| **merged** | `overview`, `analytics`, `unrouted`, `config`, `change-probe`, `discovery-purge` | fanned out and summed (or, for config, compared)                 |
-| **shared** | `pages`, `page-content`, `sitemaps`, `invalidations`, `crawl-breadth`, `metrics` | replicated data — **one** node answers, and the payload names it |
-| **single** | every POST                                                                       | writes are never fanned out                                      |
+| Class      | Routes                                                                                          | What happens                                                     |
+| ---------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **merged** | `overview`, `analytics`, `unrouted`, `config`, `change-probe`, `discovery-purge`, `queue-state` | fanned out and summed (or, for config, compared)                 |
+| **shared** | `pages`, `page-content`, `sitemaps`, `invalidations`, `crawl-breadth`, `metrics`                | replicated data — **one** node answers, and the payload names it |
+| **single** | every POST                                                                                      | writes are never fanned out                                      |
 
 The last two merged routes are owner-scoped passes rather than sums: a probe pass and a purge pass
 each cover the keys one node owns, so what the merge produces is every node's own slice side by
 side plus the running tally, and the nodes that have not run are named. One node's "deleted
 240,118" answered under a cluster label would read as done when three quarters of the keyspace has
 not been touched.
+
+`queue-state` (plugin v0.93.0) is summed, but **only when every node's queue keeper can vouch for its
+numbers**. A node that cannot answers 503 with the reason (starting, loading, failed, gone quiet); the
+merge keeps that answer per node and withholds the cluster total rather than presenting three nodes'
+queue as the cluster's. The Queue view then shows each node's own counts and state.
 
 A test pins every proxied GET to a class, so adding a route without deciding how it aggregates
 fails CI rather than silently answering from one node under an "all nodes" label.
@@ -152,18 +157,18 @@ browser ── same-origin (cookies, CSP 'self') ──▶ prerender-console com
 
 ## What it shows
 
-| View              | What it answers                                                                                                                                                                                 |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Health**        | Is anything wrong? Every tile is a check with a verdict (ok / watch / bad), and anything not ok is listed in the banner. The landing page.                                                      |
-| **Traffic**       | What crawlers got: offload (gross and net), freshness relative to each route's cadence, the non-hit verdicts by fix, **traffic by instance**, origin load, crawlers, routes, gate, raw cache.   |
-| **Queue**         | Is the render machinery keeping up: cluster pause, backlog and time to clear, claim floor, the **node table** (status, intent, per-node throughput, pause controls), outcomes, renders by node. |
-| **Sitemaps**      | Per-root ingest and check state, entries, and 24h walk counters.                                                                                                                                |
-| **Corpus**        | Corpus counts, and the three manual per-node passes: schedule repair, discovered-target purge, key-rule orphan sweep.                                                                           |
-| **Invalidations** | Active scopes, preview-first record/clear, and what the active rows are doing (refused vs rescued).                                                                                             |
-| **Change probe**  | What the probe is doing now, per node, with health flags; last pass; canary; finished-pass counters.                                                                                            |
-| **Inspect**       | One URL end to end: resolved key, stored rows, cadence resolution, revalidate, the page cache table.                                                                                            |
-| **Config**        | The searchable index of every option: layers, overrides, divergence between nodes, pending restarts.                                                                                            |
-| **Metrics**       | The live metric catalog.                                                                                                                                                                        |
+| View              | What it answers                                                                                                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Health**        | Is anything wrong? Every tile is a check with a verdict (ok / watch / bad), and anything not ok is listed in the banner. The landing page.                                                       |
+| **Traffic**       | What crawlers got: offload (gross and net), freshness relative to each route's cadence, the non-hit verdicts by fix, **traffic by instance**, origin load, crawlers, routes, gate, raw cache.    |
+| **Queue**         | Is the render machinery keeping up: cluster pause, backlog and time to clear, the **queue keeper** per node, lateness and flow, the **node table** (status, intent, throughput, pause), renders. |
+| **Sitemaps**      | Per-root ingest and check state, entries, and 24h walk counters.                                                                                                                                 |
+| **Corpus**        | Corpus counts, and the three manual per-node passes: schedule repair, discovered-target purge, key-rule orphan sweep.                                                                            |
+| **Invalidations** | Active scopes, preview-first record/clear, and what the active rows are doing (refused vs rescued).                                                                                              |
+| **Change probe**  | What the probe is doing now, per node, with health flags; last pass; canary; finished-pass counters.                                                                                             |
+| **Inspect**       | One URL end to end: resolved key, stored rows, cadence resolution, revalidate, the page cache table.                                                                                             |
+| **Config**        | The searchable index of every option: layers, overrides, divergence between nodes, pending restarts.                                                                                             |
+| **Metrics**       | The live metric catalog.                                                                                                                                                                         |
 
 The API contract behind each view is in the plugin README's
 [Management API](../plugin/README.md#management-api-prerender_admin) section.
@@ -185,15 +190,17 @@ The API contract behind each view is in the plugin README's
 ### Health checks
 
 Thresholds are judgement calls set where a number stops being tail noise for a healthy deployment; they live
-in one place (`views/health.js`). A system tile shows the **worst node**, never an average.
+in `views/health.js`, and the queue keeper's in `LIMITS` in `views/queue.js` (shared by both views). A system
+or keeper tile shows the **worst node**, never an average.
 
-| Group       | Checks                                                                                                                                                       |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures |
-| Rendering   | renders/h, failure share, render time, claim scan p95, prioritised claims, backlog **time to clear** (> 2h watch, > 8h bad), claim floor lag                 |
-| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation               |
-| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**            |
-| Maintenance | rows below the claim floor, schedule repair, active invalidations                                                                                            |
+| Group       | Checks                                                                                                                                                                     |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures               |
+| Rendering   | renders/h, failure share, render time                                                                                                                                      |
+| Queue       | backlog **time to clear** (> 2h watch, > 8h bad), queue keeper live on every node, keeper repairs (> 0 bad), keeper publish p95, wedged renders, stale claims, lease slots |
+| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation                             |
+| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**                          |
+| Maintenance | schedule repair, active invalidations                                                                                                                                      |
 
 System vitals come from Harper's own per-minute resource rows, which the plugin's analytics scan now keeps
 (same scan, no second walk), plus a point-in-time host block on `overview`. Against an older plugin the

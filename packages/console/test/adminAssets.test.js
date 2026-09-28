@@ -136,7 +136,7 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 	//
 	// A new plugin route therefore has to be wired here or named below, with the reason.
 	//
-	// Currently empty: every route the plugin dispatches is reachable. Note the bar is
+	// Every other route the plugin dispatches is reachable. Note the bar is
 	// REACHABLE, not "has a button" — `schedule` is a leaf for peer `explain` calls that the UI
 	// never invokes, but it is proxied, so a deliberate node-named call works and it belongs in
 	// the allowlist rather than here.
@@ -146,10 +146,6 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 		// panel (proxy + an Overview control beside discovery-purge) is a follow-up console release;
 		// remove this entry when it lands.
 		'sweep-orphan-pages',
-		// Plugin v0.93.0's queue state ships API-first too: node-local, for an autoscaler or an
-		// operator to read per node. The console view (proxy + a merger that sums nodes and refuses a
-		// partial sum) is a follow-up console release; remove this entry when it lands.
-		'queue-state',
 	]);
 	for (const route of pluginServes) {
 		if (DELIBERATELY_NOT_EXPOSED.has(route)) continue;
@@ -181,6 +177,7 @@ test('client → proxy → plugin: every layer speaks a route the next one dispa
 		'page-content',
 		'analytics',
 		'invalidate',
+		'queue-state',
 	]) {
 		assert.ok(called.includes(required), `no client module calls "${required}"`);
 	}
@@ -418,5 +415,70 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 			`the plugin emits prerender_ops.${name} and no console view reads it — chart it on the Sitemaps ` +
 				"view, or add it to this test's NOT_CHARTED with the reason"
 		);
+	}
+});
+
+/**
+ * The `queue_health` family, both ways — the one the literal scan above exempts (`queueHealth(value,
+ * gauge)` names its series at the call site) and the one plugin v0.93.0 rewrote: it REMOVED seven
+ * series (`claim_scan_ms`, `ready_sweep_ms`, `ready_published`, `ready_cadence`, `below_floor`,
+ * `below_floor_age_ms`, `floor_pin_age_ms`) that console 0.17.0 read, and added seven it did not. Both
+ * directions failed silently: the removed ones drew as `—`, the new ones were invisible.
+ *
+ * The console names every series it reads in ONE place, `QUEUE_HEALTH` in views/queue.js, so:
+ *   - every name there must be one the catalog declares — a read of a series that no longer exists
+ *     fails here instead of drawing an empty tile;
+ *   - every series the catalog declares must be read, or waived below with the reason.
+ * And no client module may carry a removed name at all, in case a read bypasses the constants.
+ */
+test('every queue_health series is read or waived, and the console reads none the plugin dropped', async () => {
+	const { METRICS } = await import('../../plugin/src/metrics.js');
+	const declared = METRICS.queue_health?.dimensions?.path?.values ?? [];
+	assert.ok(declared.length > 5, 'expected the queue_health series to be enumerated in the catalog');
+
+	const { installDom } = await import('./domShim.js');
+	installDom();
+	const { QUEUE_HEALTH } = await import('../src/admin/views/queue.js');
+	const read = new Set(Object.values(QUEUE_HEALTH));
+
+	for (const name of read) {
+		assert.ok(
+			declared.includes(name),
+			`the console reads queue_health.${name}, which the plugin no longer declares — remove the read`
+		);
+	}
+
+	const NOT_CHARTED = new Map([
+		['overdue', 'the due-now count is read live from queue-state, or from the overview snapshot'],
+		['lease_occupancy', 'in flight is read live from overview.leases (an exact slot walk)'],
+		['paused', 'pause state is read from the overview (QueueControl intent and QueueStatus observed)'],
+		['reconcile_restored', 'the Corpus view reads the repair sweep result from overview.reconcile'],
+		['reconcile_missing', 'the Corpus view reads the repair sweep result from overview.reconcile'],
+	]);
+	for (const name of declared) {
+		if (NOT_CHARTED.has(name)) continue;
+		assert.ok(
+			read.has(name),
+			`the plugin declares queue_health.${name} and no console view reads it — add it to QUEUE_HEALTH and ` +
+				"chart it, or add it to this test's NOT_CHARTED with the reason"
+		);
+	}
+	for (const name of NOT_CHARTED.keys()) {
+		assert.ok(declared.includes(name), `NOT_CHARTED waives queue_health.${name}, which the plugin no longer declares`);
+	}
+
+	const REMOVED_IN_0_93 = [
+		'claim_scan_ms',
+		'ready_sweep_ms',
+		'ready_published',
+		'ready_cadence',
+		'below_floor',
+		'below_floor_age_ms',
+		'floor_pin_age_ms',
+	];
+	const client = [...clientSources.values()].join('\n');
+	for (const name of REMOVED_IN_0_93) {
+		assert.equal(declared.includes(name), false, `${name} is back in the catalog — revisit this list`);
+		assert.equal(client.includes(`'${name}'`), false, `a client module still reads the removed series ${name}`);
 	}
 });

@@ -27,7 +27,13 @@ const OVERVIEW = {
 	countsAsOf: null,
 	backlog: { enabled: true, interval: 60_000, running: false, lastRun: null },
 	intervals: { statusSyncInterval: 1000, jobLeaseTime: 120_000, defaultRenderInterval: 21_600_000 },
-	claimFloor: { floorMinute: 0, lagMs: null, oldestLeaseAgeMs: null },
+	leases: {
+		occupancy: 0,
+		oldestLeaseExpiresAt: null,
+		oldestLeaseDueMinute: null,
+		maxLeases: 4096,
+		oldestLeaseAgeMs: null,
+	},
 	reconcile: { enabled: true, interval: 1, running: false, lastRun: null },
 	orphanSweep: { dryRunDefault: true, maxDeletes: 1, running: false, lastRun: null },
 };
