@@ -505,6 +505,19 @@ test('a loading node is a watch — it grants from a partial queue — never "Al
 	assert.doesNotMatch(banner.textContent, /All clear/);
 });
 
+test('mid-rollout, a node without a keeper (plugin 0.92) is a watch on the keeper check', async () => {
+	const old = {
+		...answer('node-b', { error: 'Unknown route: queue-state' }, 404),
+		error: 'Unknown route: queue-state',
+	};
+	const keeper = vital(
+		draw(await ready({ queueState: stateOf(answer('node-a', HEALTHY_STATE), old) })),
+		'Queue keeper'
+	);
+	assert.equal(verdictOf(keeper), 'warn');
+	assert.match(keeper.textContent, /node-b:9926: no keeper/);
+});
+
 test('a failed queue-state read is a bad input check, never a quiet gap under "All clear"', async () => {
 	const root = draw(await ready({ queueState: { ok: false, status: 502, body: { error: 'Bad gateway' } } }));
 	const banner = find(root, (n) => (n.attributes?.class ?? '').startsWith('health-banner'));

@@ -222,10 +222,22 @@ const inexactReason = (keeper) =>
  *   loading, still granting         watch: claims come from a partial queue until the load ends
  *   state stale, still granting     watch: worker 0 has gone quiet; its last set is granted until it drains
  *   anything else, or `unready`     bad: starting, waiting for peers, failed, stopped — no claims here
+ *   a 404 (plugin before v0.93.0)   watch: no keeper to judge, and its queue is not counted — it still
+ *                                   claims from its own index (a canary rollout runs mixed versions)
  *   no answer                       bad
  */
 export function keeperVerdict(row) {
-	if (!row?.answered) return { verdict: 'bad', label: 'no answer', detail: row?.error ?? 'Did not answer.' };
+	if (!row?.answered) {
+		return row?.httpStatus === 404
+			? {
+					verdict: 'warn',
+					label: 'no keeper',
+					detail:
+						'Runs a plugin before v0.93.0: it has no queue keeper, so its queue is not counted here. ' +
+						'It still claims from its own index.',
+				}
+			: { verdict: 'bad', label: 'no answer', detail: row?.error ?? 'Did not answer.' };
+	}
 	const keeper = row.trust?.keeper;
 	if (row.live) {
 		return row.trust.exact === true

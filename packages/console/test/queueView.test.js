@@ -253,6 +253,25 @@ test('the keeper verdict follows the phase: live, inexact, loading, stale, unrea
 	assert.equal(keeperVerdict({ answered: false, error: 'unreachable' }).verdict, 'bad');
 });
 
+test('mid-rollout, a node still on 0.92 is a watch, not an outage — it claims from its own index', async () => {
+	// The plugin PR supports a mixed cluster (one node first). That node answers queue-state 404.
+	const old = {
+		...answer('b', { error: 'Unknown route: queue-state' }, 404),
+		error: 'Unknown route: queue-state',
+	};
+	const ctx = makeCtx(ANALYTICS, { queueState: merged(answer('a', LIVE_STATE), old) });
+	await load(ctx);
+	const root = draw(ctx);
+	const b = rowOf(keeperTable(ctx), 'b.example.com');
+	assert.ok(find(b, (n) => n.attributes?.class === 'pill warn' && n.textContent === 'no keeper'));
+	assert.equal(
+		find(root, (n) => n.attributes?.class === 'note bad' && /grants no claims/.test(n.textContent)),
+		null,
+		'no outage alarm for a node that is still claiming'
+	);
+	assert.match(root.textContent, /Cluster totals withheld: b\.example\.com:9926/);
+});
+
 test('an older plugin without queue-state says what it needs, instead of an empty keeper', async () => {
 	const notFound = {
 		ok: false,
