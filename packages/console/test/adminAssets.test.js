@@ -618,12 +618,14 @@ test('every bot_miss cause the plugin declares is labelled on Traffic, and the c
 		assert.ok(typeof means === 'string' && means.length > 10, `"${cause}" says nothing about what it means`);
 	}
 	// The one family that is render capacity is exactly the rotation's own unrendered pages — the plugin
-	// README's grouping ("Why a request missed"), and the one the panel's verdict text rests on.
+	// README's grouping ("Why a request missed"), and the one the panel's verdict text rests on. `device` is
+	// NOT in it: a device outside deviceTypes.default is never rendered by the rotation — config, not capacity.
 	assert.deepEqual(
 		Object.entries(MISS_CAUSES)
 			.filter(([, [family]]) => family === 'waiting')
 			.map(([cause]) => cause)
 			.sort(),
-		['device', 'new', 'unrendered']
+		['new', 'unrendered']
 	);
+	assert.equal(MISS_CAUSES.device[0], 'rule');
 });
