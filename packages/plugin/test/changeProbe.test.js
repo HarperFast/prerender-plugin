@@ -1477,6 +1477,18 @@ test("RESTART RESILIENCE: the resume starts the WALK at the published cursor, in
 	t.mock.timers.reset();
 });
 
+test("RESTART RESILIENCE: an unusable recorded origin falls back to the claim's own start", async (t) => {
+	await armAnchoredScheduler(t);
+	const startedAt = Date.now() - 2 * HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, originStartedAt: 'not a time' },
+	});
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.deepEqual(decision, { resumed: true, from: startedAt, cursor: '' });
+	await settlePasses();
+	t.mock.timers.reset();
+});
+
 test('RESTART RESILIENCE: an early config apply re-arms a pending resume instead of dropping it', async (t) => {
 	const startedAt = Date.now() - HOUR;
 	await changeProbe.publishProbeStateForTest({

@@ -2313,8 +2313,12 @@ const checkResume = async () => {
 		armResumeCheck(PASS_STALE_MS);
 		return { resumed: false, reason: 'claim still live' };
 	}
-	const originStartedAt = epochMsOf(sweep.originStartedAt ?? sweep.startedAt);
-	if (Date.now() - originStartedAt > RESUME_WITHIN_MS) return decided({ resumed: false, reason: 'older than a day' });
+	// An unusable origin falls back to this claim's own start (validated above): `NaN` would pass the age
+	// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
+	const recordedOrigin = epochMsOf(sweep.originStartedAt);
+	const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
+	if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS))
+		return decided({ resumed: false, reason: 'older than a day' });
 	const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
 	logger.warn(
 		`[prerender] change-probe: resuming the sweep a restart interrupted (started ${new Date(originStartedAt).toISOString()}) ` +
