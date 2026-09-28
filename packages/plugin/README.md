@@ -580,13 +580,13 @@ explainer asks the owner.
 
 `GET /prerender_admin/queue-state` (node-local; sum nodes for the cluster):
 
-| Group      | Fields                                                                                                                                                                                                                           |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status`                                                                                                 |
-| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                                                                    |
-| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row; `listsTruncated` when either list was cut to 200 |
-| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                                                          |
-| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats                                           |
+| Group      | Fields                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `dueChanged` (due rows the change probe marked: pages expired as known-wrong, served from the origin until they re-render) and `oldestChangedAt` (the oldest such row's due minute — its filing minute, or the earlier due time it already had), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status` |
+| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                                                                                                                                                                                                                     |
+| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row; `listsTruncated` when either list was cut to 200                                                                                                                                                  |
+| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                                                                                                                                                                                                           |
+| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats                                                                                                                                                                                            |
 
 Counts are of rows this node owns. It answers **503** (with `trust` and the live `now` fields, and no
 counts) whenever the keeper cannot vouch for its numbers: waiting, loading, failed, or state older than
@@ -1216,14 +1216,21 @@ A **rule** (`changeProbe.rules`) says what to watch for the URLs its `pathPatter
 The extracted values are reduced to a **signature** stored in the node-local `ProbeState` table
 (`replicate: false` — the sweep is owner-scoped, so a URL's baseline is only ever read and written
 by its owner node, and replicating it would ship every baseline to nodes that never consult it; a
-lost baseline just re-seeds). A probe that observes a different signature expires the URL's cached
-pages and files every device row due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
-content actually changes:
+lost baseline just re-seeds). A probe that observes a different signature **acts on it when it finds
+it** (since v0.94.0): the URL's cached pages are hard-expired and its render is filed at the current
+minute, marked on the schedule row (`changedAt`) so the render queue ranks it
+`queue.ready.changedHeadStart` cadences ahead of routine rotation (a page known wrong is being served
+from the origin until it re-renders). Nothing detected is deferred and there is no per-pass budget —
+the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
+(the pass waits for a free slot rather than dropping a change), and the new baseline is written only
+after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
+cuts an anchored pass short resumes it on boot from the walk cursor its heartbeat published (held back
+to any action still in flight), with the interrupted pass's own dry-run and reseed settings. Two cadences
+cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
   `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price
-  moves. Re-renders per pass are capped (`maxTriggersPerSweep`); changes past the cap stay detected
-  and retry next pass. It runs in one of two modes (`mode`):
+  moves. It runs in one of two modes (`mode`):
   - **`interval`** (default) fires a discrete pass every `sweepInterval`. This asks you to solve
     `sliceSize / effectiveRate <= sweepInterval` by hand and re-solve it whenever the corpus grows
     or the origin has a bad week — and when the answer stops holding, the overrunning pass is

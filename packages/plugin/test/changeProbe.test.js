@@ -10,9 +10,8 @@ import assert from 'node:assert/strict';
  * it only acts on URLs this node OWNS; a probe FAILURE changes nothing (no write, no trigger —
  * the probe accelerates the baseline cadence, it never gates it); a first observation SEEDS
  * rather than triggers (the probe hadn't seen the page, the page didn't change); dry-run writes
- * signatures but triggers nothing; the trigger budget DEFERS by leaving the signature stale, so
- * the next pass re-detects; and a failed trigger write keeps the signature stale too, for the
- * same reason.
+ * signatures but triggers nothing; every change is acted on (no budget, nothing deferred); and a
+ * failed action keeps the signature stale, so the next probe of the URL acts again.
  */
 
 let changeProbe;
@@ -119,7 +118,6 @@ const runPass = async ({
 	// from before fingerprints existed, any other string = a baseline taken under another rule.
 	fingerprints = {},
 	dryRun = false,
-	maxTriggers = 100,
 	owners = {},
 	...overrides
 }) => {
@@ -128,11 +126,12 @@ const runPass = async ({
 	const written = [];
 	const writeOptions = [];
 	const triggered = [];
-	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
-	const triggers = createInlineTrigger({
-		trigger: async (row) => {
+	const { createChangeActions } = await import('../src/util/changeActions.js');
+	const triggers = createChangeActions({
+		act: async (row) => {
 			triggered.push(row.url);
 		},
+		concurrency: 4,
 		write: async (url, signature, options) => {
 			written.push({ url, signature });
 			writeOptions.push({ url, ...options });
@@ -161,12 +160,11 @@ const runPass = async ({
 			written.push({ url, signature });
 			writeOptions.push({ url, ...options });
 		},
-		// The REAL inline shape, not a stub: the trigger-then-write ordering now lives in
-		// util/triggerQueue.js, and a stub re-implementing it here would keep passing while the
-		// shipped path regressed. This is also exactly how the canary wires itself.
+		// The REAL pipeline, not a stub: the act-then-write ordering lives in util/changeActions.js, and
+		// a stub re-implementing it here would keep passing while the shipped path regressed. This is
+		// also exactly how the sweep and the canary wire themselves.
 		submitTrigger: triggers.submit,
 		dryRun,
-		maxTriggers,
 		concurrency: 2,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -293,30 +291,72 @@ test('a probe failure changes NOTHING: no write, no trigger, counted, sampled', 
 	assert.equal(stats.failureSamples[0].url, URL_A);
 });
 
-test('past the trigger budget a change DEFERS: signature left stale so the next pass retries', async () => {
+test('EVERY change is acted on: there is no budget and nothing is deferred', async () => {
+	// The v0.94.0 rule. A change past a per-pass budget, or past a full queue, used to be DEFERRED — its
+	// page kept serving content the probe knew was wrong until a later pass found it again. Now every
+	// change is acted on as it is found and the render queue orders the re-renders.
+	const urls = Array.from({ length: 40 }, (_, i) => `https://example.com/product/prd-${i}/`);
 	const { stats, written, triggered } = await runPass({
-		rows: [row(URL_A), row(URL_B)],
-		stored: { [URL_A]: '[1]', [URL_B]: '[1]' },
-		answers: { [URL_A]: '[2]', [URL_B]: '[2]' },
-		maxTriggers: 1,
-		concurrency: 1, // deterministic order: A triggers, B defers
+		rows: urls.map((u) => row(u)),
+		stored: Object.fromEntries(urls.map((u) => [u, '[1]'])),
+		answers: Object.fromEntries(urls.map((u) => [u, '[2]'])),
 	});
-	assert.equal(stats.triggered, 1);
-	assert.equal(stats.deferred, 1);
-	assert.deepEqual(triggered, [URL_A]);
-	assert.deepEqual(written, [{ url: URL_A, signature: '[2]' }]);
+	assert.equal(stats.changed, urls.length);
+	assert.equal(stats.triggered, urls.length);
+	assert.equal(stats.deferred, undefined, 'there is no deferral count any more');
+	assert.deepEqual([...triggered].sort(), [...urls].sort());
+	assert.equal(written.length, urls.length, 'and every one of them moved its baseline');
 });
 
-test('a failed trigger keeps the signature stale too', async () => {
-	// The property is unchanged by the move to a submitted trigger; only the seam moved. Driven
-	// through the REAL inline shape rather than a stub, because the ordering under test — baseline
-	// written only after the trigger succeeds — now lives in util/triggerQueue.js, and a stub that
+test('actions beside the walk are BOUNDED, and a full pipeline makes the pass wait instead of dropping', async () => {
+	// Backpressure, not refusal: with every slot busy the pass holds the next change until one frees,
+	// so a slow database slows the pass and loses nothing.
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { createChangeActions } = await import('../src/util/changeActions.js');
+	let inFlight = 0;
+	let peak = 0;
+	const acted = [];
+	const actions = createChangeActions({
+		act: async (target) => {
+			inFlight++;
+			peak = Math.max(peak, inFlight);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			inFlight--;
+			acted.push(target.url);
+		},
+		write: async () => {},
+		concurrency: 2,
+	});
+	const urls = Array.from({ length: 12 }, (_, i) => `https://example.com/product/prd-${i}/`);
+	await changeProbe.runProbePass({
+		rows: stream(urls.map((u) => row(u))),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => '[2]',
+		read: async () => ({ signature: '[1]', probedAt: NaN }),
+		write: async () => {},
+		submitTrigger: actions.submit,
+		dryRun: false,
+		concurrency: 4,
+		ratePerSecond: 1000,
+		pause: async () => {},
+	});
+	await actions.drain();
+	assert.equal(acted.length, urls.length, 'every change acted on, none dropped');
+	assert.ok(peak <= 2, `at most trigger.concurrency actions in flight (peak ${peak})`);
+	assert.equal(actions.stats.maxInFlight, 2);
+});
+
+test('a failed action keeps the signature stale, so the next probe acts again', async () => {
+	// Driven through the REAL pipeline rather than a stub, because the ordering under test — baseline
+	// written only after the action succeeds — lives in util/changeActions.js, and a stub that
 	// re-implemented it would pass while the shipped path regressed.
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
-	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const { createChangeActions } = await import('../src/util/changeActions.js');
 	const written = [];
-	const triggers = createInlineTrigger({
-		trigger: async () => {
+	const triggers = createChangeActions({
+		act: async () => {
 			throw new Error('write refused');
 		},
 		write: async (url, signature) => written.push({ url, signature }),
@@ -331,7 +371,6 @@ test('a failed trigger keeps the signature stale too', async () => {
 		write: async (url, signature) => written.push({ url, signature }),
 		submitTrigger: triggers.submit,
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -339,8 +378,8 @@ test('a failed trigger keeps the signature stale too', async () => {
 	await triggers.drain();
 	assert.equal(triggers.stats.errors, 1);
 	assert.equal(triggers.stats.triggered, 0);
-	assert.equal(stats.queued, 1, 'the change was accepted for triggering');
-	assert.deepEqual(written, [], 'no baseline may be written when the trigger threw');
+	assert.equal(stats.changed, 1, 'the change was detected');
+	assert.deepEqual(written, [], 'no baseline may be written when the action threw');
 });
 
 test('pacing sleeps out the remainder of each batch window', async () => {
@@ -413,6 +452,10 @@ test('cohortCollector picks the lowest hashes — a keyspace sample, not the alp
 });
 
 test('requestSweepReseed runs immediately when no sweep is running', async () => {
+	// ARMED, so the dry run below is the reseed's own and not the schema default's.
+	const { config } = await import('../src/config.js');
+	const savedDryRun = config.changeProbe.dryRun;
+	config.changeProbe.dryRun = false;
 	// `changeProbeStatus` is async now: it reads the node-local shared row rather than this
 	// worker's module state, which is what makes it answer the same way from all 16 workers.
 	const status = () => changeProbe.changeProbeStatus();
@@ -421,14 +464,17 @@ test('requestSweepReseed runs immediately when no sweep is running', async () =>
 	assert.equal(chained, false);
 	while (!(await status()).sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal((await status()).sweep.lastRun.label, 'reseed-now');
-	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never trigger.
+	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never act — even on an armed probe.
 	assert.equal((await status()).sweep.lastRun.dryRun, true);
+	config.changeProbe.dryRun = savedDryRun;
 });
 
 test('requestSweepReseed interrupts a running sweep and chains the reseed after it stands down', async () => {
 	const { config } = await import('../src/config.js');
 	const savedChunk = config.changeProbe.chunkSize;
+	const savedDryRun = config.changeProbe.dryRun;
 	config.changeProbe.chunkSize = 3;
+	config.changeProbe.dryRun = false; // armed, so the chained reseed's dry run is its own
 	let releaseGate;
 	const gate = new Promise((resolve) => (releaseGate = resolve));
 	let searchCalls = 0;
@@ -460,6 +506,7 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		assert.equal((await status()).sweep.lastRun.dryRun, true);
 	} finally {
 		config.changeProbe.chunkSize = savedChunk;
+		config.changeProbe.dryRun = savedDryRun;
 		globalThis.databases.render_service.Target = FakeTable;
 	}
 });
@@ -483,7 +530,6 @@ test('freshness skip: a baseline younger than reprobeAfter is not re-probed', as
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -512,7 +558,6 @@ test('freshness skip: an unparseable or missing probedAt probes rather than skip
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -541,7 +586,6 @@ test('origin backoff: a pushback response stretches the pacing window, a clean b
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1, // a 1000ms base window per single-item batch
 		now: () => 0,
@@ -569,7 +613,6 @@ test('origin backoff: an explicit Retry-After outranks the computed window', asy
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		now: () => 0,
@@ -595,7 +638,6 @@ test('origin backoff: a fully refusing origin ends the pass instead of crawling'
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -625,7 +667,6 @@ test('origin backoff: a rule/product failure is NOT distress and must not thrott
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1,
 		now: () => 0,
@@ -658,7 +699,6 @@ test('freshness skip: a BigInt probedAt is coerced, not thrown on', async () => 
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -687,7 +727,6 @@ test('origin backoff: the pacing wait can never exceed setTimeout’s 32-bit cap
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 10,
 		concurrency: 1,
 		ratePerSecond: 0.000001, // a window far past the cap once multiplied by the backoff
 		now: () => 0,
@@ -721,7 +760,7 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 		}
 	};
 	const before = Date.now();
-	await changeProbe.triggerRevalidate(row('https://example.com/product/prd-a/'));
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
 	// Bound against a clock read taken AFTER the call: the trigger reads Date.now() itself, so
 	// comparing against `before` alone flakes on any millisecond tick between the two reads.
 	const after = Date.now();
@@ -752,7 +791,7 @@ test('a trip files ONE schedule row, keyed by the URL — not one per device', a
 	};
 
 	const url = 'https://example.com/product/prd-a/';
-	await changeProbe.triggerRevalidate(row(url));
+	await changeProbe.actOnChange(row(url));
 
 	assert.equal(scheduled.length, 1, `expected exactly one schedule row, got ${JSON.stringify(scheduled)}`);
 	assert.equal(scheduled[0].id, url, 'the row must be keyed by the URL, with no device suffix');
@@ -760,6 +799,97 @@ test('a trip files ONE schedule row, keyed by the URL — not one per device', a
 	// `put` REPLACES the record, so both of these must be explicit or the funnel throws.
 	assert.equal(typeof scheduled[0].fromSitemap, 'boolean');
 	assert.ok(Number.isFinite(scheduled[0].effectiveInterval));
+});
+
+test('a change is MARKED on its schedule row, so the render queue ranks it ahead of rotation', async () => {
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {};
+	const before = Date.now();
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	assert.equal(scheduled.length, 1);
+	assert.ok(
+		scheduled[0].changedAt >= before && scheduled[0].changedAt <= Date.now(),
+		'changedAt is the detection instant'
+	);
+	assert.equal(scheduled[0].nextRenderTime % 60_000, 0, 'filed at the current minute');
+});
+
+test('a change found AGAIN before its render landed keeps its place: earlier due time and first changedAt', async () => {
+	// A later pass re-detects a change whose render has not landed yet (the page is expired, the row is
+	// waiting). Re-filing it at "now" would move it BACK in the queue on every pass that saw it.
+	const firstChange = Date.now() - 6 * HOUR;
+	const due = Math.floor(firstChange / 60_000) * 60_000;
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async get() {
+			return { nextRenderTime: due, changedAt: firstChange };
+		}
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {};
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	assert.equal(scheduled[0].nextRenderTime, due);
+	assert.equal(scheduled[0].changedAt, firstChange);
+});
+
+test('a routine row already DUE keeps its due time when a change is found; one due later is pulled to now', async () => {
+	const scheduled = [];
+	let stored = null;
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async get() {
+			return stored;
+		}
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {};
+	const lateDue = Math.floor((Date.now() - 3 * HOUR) / 60_000) * 60_000;
+	stored = { nextRenderTime: lateDue, changedAt: null };
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	assert.equal(scheduled[0].nextRenderTime, lateDue, 'never moved later');
+	stored = { nextRenderTime: Date.now() + 40 * HOUR, changedAt: null }; // a backoff, say
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	assert.ok(scheduled[1].nextRenderTime <= Date.now(), 'a change overrides a future due time');
+});
+
+test('a page already hard-expired is not patched again — one write per change, not per detection', async () => {
+	const { config } = await import('../src/config.js');
+	const patched = [];
+	let expiresAt = Date.now() + HOUR;
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get({ id }) {
+			return { cacheKey: id, expiresAt };
+		}
+		static async patch(id, fields) {
+			patched.push({ id, ...fields });
+			expiresAt = fields.expiresAt;
+		}
+	};
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {};
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	const first = patched.length;
+	assert.ok(first >= 1);
+	expiresAt = Date.now() - config.page.swrTtl - HOUR; // already past the swr window
+	await changeProbe.actOnChange(row('https://example.com/product/prd-a/'));
+	assert.equal(patched.length, first, 'no second patch for a page that is already expired past swr');
+});
+
+test('the pass records how far it has probed, batch by batch — the resume cursor', async () => {
+	const { stats } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		answers: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		concurrency: 2,
+	});
+	assert.equal(stats.walkedThrough, URL_C, 'the last row of the last flushed batch');
 });
 
 /** A rule whose extract maps index 2 -> price and index 3 -> availability, with pageCheck on. */
@@ -777,11 +907,11 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 	const triggered = [];
 	const write = async (url, signature, opts = {}) =>
 		written.push({ url, signature, rowExists: opts.rowExists === true, clearClaim: opts.clearClaim === true });
-	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const { createChangeActions } = await import('../src/util/changeActions.js');
 	// The real inline shape — `clearClaim` is set by the trigger path itself, and these tests are
 	// precisely the ones asserting on it.
-	const triggers = createInlineTrigger({
-		trigger: async (row) => {
+	const triggers = createChangeActions({
+		act: async (row) => {
 			triggered.push(row.url);
 		},
 		write,
@@ -796,7 +926,6 @@ const runPageCheckPass = async ({ rows, answers, stored = {}, ...overrides }) =>
 		write,
 		submitTrigger: triggers.submit,
 		dryRun: false,
-		maxTriggers: 100,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -1112,7 +1241,6 @@ const runPaced = async ({ rows, answers = {}, clockStep = 0, ...overrides }) => 
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: true,
-		maxTriggers: 1000,
 		concurrency: 2,
 		ratePerSecond: 10,
 		now: () => clock,
@@ -1273,6 +1401,147 @@ test('scheduler: mode is live — switching re-arms rather than leaving the old 
 
 	t.mock.timers.reset();
 	await applyProbeConfig({ enabled: false });
+});
+
+const armAnchoredScheduler = async (t, extra = {}) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'anchored',
+		anchorTime: '03:00',
+		anchorTimezone: 'UTC',
+		startDelay: 0,
+		startJitter: 1,
+		...extra,
+	});
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+};
+const settlePasses = async () => {
+	for (let i = 0; i < 40; i++) await new Promise((resolve) => setImmediate(resolve));
+	await changeProbe.probeStatePublishedForTest();
+};
+
+test('RESTART RESILIENCE: an anchored sweep a restart cut short is resumed on boot, from where it was', async (t) => {
+	// Anchored mode runs nothing until the next anchor, so before this a restart mid-pass left the rest
+	// of the corpus unprobed for up to a day. The claim a dead process leaves behind is the evidence: a
+	// sweep still `running` whose heartbeat has stopped.
+	await armAnchoredScheduler(t);
+	const startedAt = Date.now() - 3 * HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
+	});
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.deepEqual(decision, { resumed: true, from: startedAt, cursor: '' }, 'no cursor published: from the start');
+	await settlePasses();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.running, false);
+	assert.equal(row.sweep.lastRun.startedBy, 'resume');
+	assert.equal(row.sweep.lastRun.resumedFrom, startedAt, 'the finished record says what it resumed');
+	t.mock.timers.reset();
+});
+
+test("RESTART RESILIENCE: the resume starts the WALK at the published cursor, in the interrupted pass's own mode", async (t) => {
+	// The cursor, not baseline ages: an unchanged probe writes no baseline, so "skip rows probed since
+	// the pass began" would re-probe every row the interrupted pass found unchanged — most of them.
+	const searches = [];
+	globalThis.databases.render_service.Target = class extends FakeTable {
+		static search(query) {
+			searches.push(query);
+			return [];
+		}
+	};
+	await armAnchoredScheduler(t, { dryRun: false }); // armed: a dry-run resume must come from the claim
+	const startedAt = Date.now() - 3 * HOUR;
+	const cursor = 'https://example.com/product/prd-m/';
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: true,
+			startedAt,
+			heartbeatAt: Date.now() - 20 * 60_000,
+			startedBy: 'manual',
+			dryRun: true,
+			originStartedAt: startedAt - HOUR, // itself a resume of an earlier pass
+			progress: { cursor },
+		},
+	});
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.deepEqual(decision, { resumed: true, from: startedAt - HOUR, cursor });
+	await settlePasses();
+	const conditions = JSON.stringify(searches[0]?.conditions ?? []);
+	assert.ok(conditions.includes(cursor), `the walk starts at the cursor (conditions ${conditions})`);
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun.dryRun, true, 'a manual dry run resumes as a dry run');
+	assert.equal(row.sweep.lastRun.resumedFrom, startedAt - HOUR, 'a chain of resumes keeps the first start');
+	assert.equal(row.sweep.lastRun.resumeCursor, cursor);
+	t.mock.timers.reset();
+});
+
+test("RESTART RESILIENCE: an unusable recorded origin falls back to the claim's own start", async (t) => {
+	await armAnchoredScheduler(t);
+	const startedAt = Date.now() - 2 * HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, originStartedAt: 'not a time' },
+	});
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.deepEqual(decision, { resumed: true, from: startedAt, cursor: '' });
+	await settlePasses();
+	t.mock.timers.reset();
+});
+
+test('RESTART RESILIENCE: an early config apply re-arms a pending resume instead of dropping it', async (t) => {
+	const startedAt = Date.now() - HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
+	});
+	await armAnchoredScheduler(t);
+	// An anchor edit before the check fires: the timers are cleared and re-armed.
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'anchored',
+		anchorTime: '04:00',
+		anchorTimezone: 'UTC',
+		startDelay: 0,
+		startJitter: 1,
+	});
+	t.mock.timers.tick(1);
+	await settlePasses();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun?.startedBy, 'resume');
+	t.mock.timers.reset();
+});
+
+test('RESTART RESILIENCE: booting the scheduler in anchored mode ARMS the resume — no call needed', async (t) => {
+	// Seed the dead claim BEFORE the scheduler starts, exactly as a restarted process finds it.
+	const startedAt = Date.now() - 2 * HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
+	});
+	await armAnchoredScheduler(t); // startDelay 0, startJitter 1: the check is due on the next tick
+	t.mock.timers.tick(1);
+	await settlePasses();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun?.startedBy, 'resume', 'the boot timer resumed the interrupted pass by itself');
+	assert.equal(row.sweep.lastRun.resumedFrom, startedAt);
+	t.mock.timers.reset();
+});
+
+test('RESTART RESILIENCE: a claim that still beats, a finished pass, or one older than a day is not resumed', async (t) => {
+	await armAnchoredScheduler(t);
+	// Still heart-beating: a manual run on another worker, or simply not aged out since the restart.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: Date.now() - HOUR, heartbeatAt: Date.now() - 10_000, startedBy: 'anchor' },
+	});
+	assert.equal((await changeProbe.__checkResumeForTest()).reason, 'claim still live');
+	// Finished cleanly: nothing to resume.
+	await changeProbe.publishProbeStateForTest({ sweep: { running: false, startedAt: Date.now() - HOUR } });
+	assert.equal((await changeProbe.__checkResumeForTest()).reason, 'nothing interrupted');
+	// Older than a day: the anchor has already started a new one.
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt: Date.now() - 30 * HOUR, heartbeatAt: Date.now() - 29 * HOUR },
+	});
+	assert.equal((await changeProbe.__checkResumeForTest()).reason, 'older than a day');
+	t.mock.timers.reset();
 });
 
 test('scheduler: anchored mode arms a daily timer keyed on the anchor, runs no boot sweep, and re-arms on edit', async (t) => {
@@ -1628,7 +1897,6 @@ const runVerifyPass = async ({ rows, answers, stored = {}, armed = true, ...over
 			return armed;
 		},
 		dryRun: false,
-		maxTriggers: 100,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -1745,7 +2013,6 @@ test('with no verify/isArmed wired, the pass behaves exactly as before', async (
 		write: async () => {},
 		submitTrigger: async () => 'queued',
 		dryRun: false,
-		maxTriggers: 100,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -1777,14 +2044,27 @@ const signedBy = async (raw, json) => {
 };
 const OFFER = { regular: 39.99, sale: 35.99, price: 35.99, variants: [{ availability: 'In Stock' }] };
 
-const runAppendPass = async ({ rulesRaw = [APPEND_NEW], rows, answers, stored = {}, ...overrides }) => {
+const runAppendPass = async ({
+	rulesRaw = [APPEND_NEW],
+	rows,
+	answers,
+	stored = {},
+	failActions = false,
+	...overrides
+}) => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
-	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const { createChangeActions } = await import('../src/util/changeActions.js');
 	const rules = compileProbeRules(rulesRaw);
 	const written = [];
 	const triggered = [];
 	const write = async (url, signature, options = {}) => written.push({ url, signature, ...options });
-	const triggers = createInlineTrigger({ trigger: async (target) => triggered.push(target.url), write });
+	const triggers = createChangeActions({
+		act: async (target) => {
+			if (failActions) throw new Error('write refused');
+			triggered.push(target.url);
+		},
+		write,
+	});
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
 		rules,
@@ -1795,7 +2075,6 @@ const runAppendPass = async ({ rulesRaw = [APPEND_NEW], rows, answers, stored = 
 		write,
 		submitTrigger: triggers.submit,
 		dryRun: false,
-		maxTriggers: 100,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -1865,7 +2144,7 @@ test('APPENDED path: a change in an OLD slot triggers, and the full observation 
 	assertInvariant(stats);
 });
 
-test('APPENDED path: a deferred change writes nothing and is compared the same way on the next pass', async () => {
+test('APPENDED path: a change whose action FAILS writes nothing and is compared the same way on the next pass', async () => {
 	const fingerprint = await oldFingerprint();
 	const stored = { signature: await signedBy(APPEND_OLD, OFFER), fingerprint };
 	const answer = await signedBy(APPEND_NEW, { ...OFFER, sale: 30 });
@@ -1873,10 +2152,10 @@ test('APPENDED path: a deferred change writes nothing and is compared the same w
 		rows: [row(URL_A)],
 		stored: { [URL_A]: stored },
 		answers: { [URL_A]: answer },
-		maxTriggers: 0,
+		failActions: true,
 	});
-	assert.equal(first.stats.deferred, 1);
-	assert.deepEqual(first.written, [], 'budget spent: baseline AND fingerprint left stale');
+	assert.equal(first.stats.errors, 1);
+	assert.deepEqual(first.written, [], 'action failed: baseline AND fingerprint left stale');
 	const second = await runAppendPass({ rows: [row(URL_A)], stored: { [URL_A]: stored }, answers: { [URL_A]: answer } });
 	assert.equal(second.stats.extended, 1);
 	assert.deepEqual(second.triggered, [URL_A], 'the retry still sees the change');
@@ -2113,13 +2392,13 @@ const guardFor = (settings = { threshold: 0.2, minWitnessed: 10 }) => {
 
 const runMappedPass = async ({ rulesRaw = [MAPPED_RULE], rows, answers, stored = {}, ...overrides }) => {
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
-	const { createInlineTrigger } = await import('../src/util/triggerQueue.js');
+	const { createChangeActions } = await import('../src/util/changeActions.js');
 	const rules = compileProbeRules(rulesRaw);
 	const written = [];
 	const triggered = [];
 	const verified = [];
 	const write = async (url, signature, options = {}) => written.push({ url, signature, ...options });
-	const triggers = createInlineTrigger({ trigger: async (target) => triggered.push(target.url), write });
+	const triggers = createChangeActions({ act: async (target) => triggered.push(target.url), write });
 	const stats = await changeProbe.runProbePass({
 		rows: stream(rows),
 		rules,
@@ -2143,7 +2422,6 @@ const runMappedPass = async ({ rulesRaw = [MAPPED_RULE], rows, answers, stored =
 		verify: async (url, basisAt) => verified.push({ url, basisAt }),
 		isArmed: async () => false,
 		dryRun: false,
-		maxTriggers: 1000,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
@@ -2562,7 +2840,6 @@ test('the process guard WARNS loudly on disarm, naming the rule, the field and i
 			submitTrigger: async () => 'queued',
 			guard,
 			dryRun: true,
-			maxTriggers: 10,
 			concurrency: 1,
 			ratePerSecond: 1000,
 			pause: async () => {},
@@ -2917,7 +3194,7 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	assert.equal(mid.sweep.progress.examined, 200, 'the pass’s own counters, not yesterday’s');
 	assert.equal(mid.sweep.progress.examinedApprox, 200, 'kept for consoles that predate the counters');
 	assert.equal(mid.sweep.progress.probed, 0);
-	assert.equal(mid.sweep.progress.triggerQueueDepth, 0);
+	assert.equal(mid.sweep.progress.actionsInFlight, 0);
 	assert.equal(typeof mid.sweep.progress.recentRate, 'number');
 	assert.equal(mid.sweep.lastRun.label, 'yesterday', 'and the last pass that ENDED is still the previous one');
 	assert.equal(mid.serverTime, T0 + 31_000, 'the node clock rides along, so a reader ages against it');
@@ -3113,7 +3390,7 @@ test('the status names what the probe runs on: settings, rule fingerprints, extr
 			anchorTime: '00:05',
 			anchorTimezone: 'America/Chicago',
 			ratePerSecond: 7,
-			trigger: { maxPending: 1234 },
+			trigger: { concurrency: 5 },
 		},
 	});
 	const status = await changeProbe.changeProbeStatus();
@@ -3121,10 +3398,21 @@ test('the status names what the probe runs on: settings, rule fingerprints, extr
 	assert.equal(status.settings.anchorTime, '00:05');
 	assert.equal(status.settings.anchorTimezone, 'America/Chicago');
 	assert.equal(status.settings.ratePerSecond, 7);
-	assert.equal(status.settings.trigger.maxPending, 1234);
+	assert.equal(status.settings.trigger.concurrency, 5);
+	assert.equal(status.settings.maxTriggersPerSweep, undefined, 'there is no per-pass budget');
 	const [rule] = status.rules;
 	assert.match(rule.fingerprint, /\S/);
 	assert.deepEqual(rule.extract, ['price']);
 	assert.deepEqual(rule.endpoint, { method: 'POST', path: '/price/$1' }, 'the path, never the host');
 	assert.equal(status.workerIndex, 0);
+});
+
+test('the resume cursor is held back to the lowest URL whose action is still in flight', () => {
+	// A crash between probing a row and finishing its action leaves that row's baseline stale; a resume
+	// that started past it would skip it until the next day's pass.
+	const at = changeProbe.__resumeKeyOfForTest;
+	assert.equal(at('https://e.x/p/m', null), 'https://e.x/p/m', 'nothing in flight: the walk position');
+	assert.equal(at('https://e.x/p/m', 'https://e.x/p/c'), 'https://e.x/p/c', 'an earlier action still in flight');
+	assert.equal(at('https://e.x/p/c', 'https://e.x/p/m'), 'https://e.x/p/c', 'the walk position is the lower bound');
+	assert.equal(at(null, null), null);
 });

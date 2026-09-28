@@ -84,7 +84,6 @@ const ANALYTICS = {
 		passes('failed', 4, 100),
 		passes('changed', 4, 60),
 		passes('triggered', 4, 55),
-		passes('deferred', 4, 5),
 		passes('canary_trip', 2, 1),
 		passes('invalidated', 1, 1),
 	],
@@ -110,7 +109,6 @@ const STATUS = {
 			unchanged: 1760,
 			changed: 240,
 			triggered: 220,
-			deferred: 20,
 			failed: 400,
 			errors: 0,
 			failureSamples: [{ url: 'https://www.example.com/product/a', rule: 'price', error: 'HTTP 500' }],
@@ -886,12 +884,11 @@ const v2Settings = {
 	concurrency: 4,
 	scope: 'all',
 	reprobeAfter: 6 * HOUR,
-	maxTriggersPerSweep: 150_000,
-	trigger: { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 },
+	trigger: { concurrency: 8 },
 	canary: { interval: 30 * 60_000, count: 500, threshold: 0.7, minSample: 50 },
 };
 
-/** A plugin v0.91.0 payload; `running` puts it four hours into tonight's anchored pass. */
+/** A plugin v0.94.0 payload; `running` puts it four hours into tonight's anchored pass. */
 const v2Body = ({ running = false, over = {} } = {}) => {
 	const now = Date.now();
 	return {
@@ -921,6 +918,8 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 						heartbeatAt: now - 20_000,
 						stale: false,
 						startedBy: 'anchor',
+						reseed: false,
+						originStartedAt: now - 4 * HOUR,
 						dryRun: false,
 						label: null,
 						phase: 'walking',
@@ -939,11 +938,12 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 						seeded: 20,
 						failed: 2,
 						throttled: 0,
-						queued: 70,
 						triggered: 66,
-						deferred: 0,
+						errors: 0,
+						actionsInFlight: 3,
+						actionWaitMs: 0,
+						cursor: 'https://www.example.com/product/m',
 						throttleLevel: 1,
-						triggerQueueDepth: 4,
 						recentRate: 9.8,
 						phase: 'walking',
 					}
@@ -952,10 +952,13 @@ const v2Body = ({ running = false, over = {} } = {}) => {
 				...STATUS.sweep.lastRun,
 				dryRun: false,
 				startedBy: 'anchor',
+				resumedFrom: null,
+				resumeCursor: null,
 				changed: 240,
-				// A healthy pass: STATUS's own record carries deferrals and a 10% failure share.
-				deferred: 0,
+				// A healthy pass: STATUS's own record carries a 10% failure share.
 				failed: 40,
+				maxActionsInFlight: 8,
+				actionWaitMs: 0,
 				startedAt: now - 20 * HOUR,
 				finishedAt: now - 11 * HOUR,
 				slotChanges: { price: { 0: 200, 1: 60 } },
@@ -1073,12 +1076,12 @@ test('each health flag reaches the page with the nodes it holds on', async () =>
 			},
 		},
 	});
-	Object.assign(sick.sweep.progress, { throttleLevel: 8, triggerQueueDepth: 46_000 });
+	Object.assign(sick.sweep.progress, { throttleLevel: 8 });
 	Object.assign(sick.sweep.lastRun, {
 		probed: 1000,
 		failed: 700,
 		rebaselined: 200,
-		deferred: 12,
+		errors: 12,
 		unreadable: 3,
 		fieldGuard: { price: { '0:price': { witnessed: 300, disagreed: 280, armed: false } } },
 	});
@@ -1086,9 +1089,8 @@ test('each health flag reaches the page with the nodes it holds on', async () =>
 	for (const title of [
 		'Probe failures dominate.',
 		'Backoff engaged.',
-		'Trigger queue near full.',
 		'Rule edit re-baselined rows.',
-		'Changes deferred.',
+		'Actions failed.',
 		'Unreadable registry rows.',
 		'Mapped field disarmed.',
 		'Overran the anchor.',
@@ -1096,6 +1098,7 @@ test('each health flag reaches the page with the nodes it holds on', async () =>
 		assert.ok(text.includes(title), `expected the "${title}" flag`);
 	}
 	assert.match(text, /node-a: price 0:price/);
+	assert.match(text, /node-a \(last sweep\): 12 failed of 232/);
 	assert.match(text, /Health — \d+ faults?, \d+ warnings?/);
 });
 
@@ -1133,17 +1136,214 @@ test('detail on demand: per-slot changes carry the extract path, per-field misma
 	assert.match(last.textContent, /Mapping guard/);
 });
 
-test('the finished-pass charts say they are per finished pass, not live — and read the queue high-water', async () => {
-	const ctx = await ready({
-		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('trigger_queue_depth', 4, 812)] },
-	});
+test('the finished-pass charts say they are per finished pass, not live — and draw what a change produced', async () => {
+	const ctx = await ready();
 	const card = cardTitled(ctx, /^Finished passes/);
 	assert.ok(card);
 	assert.match(card.textContent, /per finished pass — not live/);
 	// The long "why" sits behind the card's help toggle — present, not on the page by default.
 	assert.match(helpText(card), /NOT LIVE/);
 	assert.match(helpText(card), /Throttled is inside Failed/);
-	assert.match(tile(ctx, 'Trigger queue peak').textContent, /812/);
+	const acted = tile(ctx, 'Acted on');
+	assert.match(acted.textContent, /220/, 'Σ over 4 passes of 55');
+	assert.match(acted.textContent, /pages expired, render filed ahead/);
+});
+
+test('a window from an older plugin: the series v0.94.0 removed draw no tile, legend entry or bar', async () => {
+	// probe_deferred and probe_trigger_queue_depth are still in any window that reaches back past the
+	// upgrade. There is nothing left to judge them against, so they are not drawn at all.
+	const ctx = await ready({
+		analytics: {
+			...ANALYTICS,
+			series: [...ANALYTICS.series, passes('deferred', 4, 5), passes('trigger_queue_depth', 4, 812)],
+		},
+	});
+	const card = cardTitled(ctx, /^Finished passes/);
+	assert.equal(tile(ctx, 'Trigger queue peak'), null);
+	assert.doesNotMatch(card.textContent, /Deferred|deferred|queue peak|812/);
+	assert.match(tile(ctx, 'Acted on').textContent, /220/);
+});
+
+// ---- plugin v0.94.0: a detected change is acted on when it is found ------------------------------
+
+test('the running pass shows the actions it has in flight against trigger.concurrency, and its own acted-on count', async () => {
+	const ctx = await ready({ status: v2Body({ running: true }) });
+	const current = cardTitled(ctx, /^Current pass — in progress/);
+	const row = (label) => find(current, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label));
+	assert.match(row('Actions in flight').textContent, /3 of 8/);
+	assert.match(row('Acted on').textContent, /66/);
+	assert.equal(row('Action errors').children.at(-1).textContent, '0');
+	assert.doesNotMatch(current.textContent, /Trigger queue|Queued|Deferred/);
+});
+
+test('draining: the walk is finished and the node table says what is left — no drain-rate ETA', async () => {
+	const body = v2Body({ running: true });
+	body.sweep.current.phase = 'draining';
+	body.sweep.progress.phase = 'draining';
+	const text = cardTitled(await ready({ status: body }), /^Probe now/).textContent;
+	assert.match(text, /finishing actions/);
+	assert.match(text, /walk finished/);
+	assert.match(text, /finishing 3 actions in flight/);
+	assert.doesNotMatch(text, /trigger queue|ETA unavailable/i);
+});
+
+test('the last pass reports what it acted on, what failed and the most actions it had in flight', async () => {
+	const body = v2Body();
+	Object.assign(body.sweep.lastRun, { triggered: 231, errors: 2 });
+	const last = cardTitled(await ready({ status: body }), /^Last completed sweep/);
+	const row = (label) => find(last, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label));
+	assert.match(row('Acted on').textContent, /231/);
+	assert.equal(row('Action errors').children.at(-1).textContent, '2');
+	assert.match(row('Action errors').textContent, /retried next probe/);
+	assert.match(row('Most actions in flight').textContent, /8 of 8/);
+	assert.match(helpText(last), /Nothing is deferred/);
+	assert.doesNotMatch(last.textContent, /Trigger queue|Queued re-renders|Deferred|NaN/);
+});
+
+test('a resumed pass says what it continues and where it walks from — marked, never flagged', async () => {
+	const now = Date.now();
+	const running = v2Body({ running: true });
+	Object.assign(running.sweep.current, {
+		startedBy: 'resume',
+		startedAt: now - HOUR,
+		originStartedAt: now - 22 * HOUR,
+	});
+	const ctx = await ready({ status: running });
+	const live = cardTitled(ctx, /^Probe now/);
+	assert.ok(find(live, (n) => n.attributes?.class === 'pill info' && n.textContent === 'resumed'));
+	assert.match(live.textContent, /started by a restart \(resuming the interrupted pass\)/);
+	assert.match(live.textContent, /continues the pass started (\w{3} \d+ \w{3} )?\d\d:\d\d UTC \(22h ago\)/);
+	// It walks from a cursor, so a share of the whole slice would be wrong: none is claimed.
+	assert.match(live.textContent, /resumed mid-slice, so no percentage/);
+	assert.doesNotMatch(live.textContent, /% through|matched \(\d+%\)/);
+	assert.doesNotMatch(live.textContent, /Resumed after a restart|counted as fresh/, 'no flag explaining a skip share');
+	const current = cardTitled(ctx, /^Current pass/);
+	const row = (label) => find(current, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label));
+	assert.match(row('Continues').textContent, /the pass started/);
+	const cursor = find(row('Resume point'), (n) => n.attributes?.title === 'https://www.example.com/product/m');
+	assert.ok(cursor, 'the walk cursor, with the full key on hover');
+
+	// A resumed reseed says so — it is a dry run, whatever resumed it.
+	const reseed = v2Body({ running: true });
+	Object.assign(reseed.sweep.current, {
+		startedBy: 'resume',
+		originStartedAt: now - 2 * HOUR,
+		reseed: true,
+		dryRun: true,
+	});
+	assert.match(
+		cardTitled(await ready({ status: reseed }), /^Probe now/).textContent,
+		/continues the reseed \(a dry run\) started/
+	);
+
+	const done = v2Body();
+	Object.assign(done.sweep.lastRun, {
+		startedBy: 'resume',
+		resumedFrom: now - 22 * HOUR,
+		resumeCursor: 'https://www.example.com/product/k',
+	});
+	const after = await ready({ status: done });
+	const last = cardTitled(after, /^Last completed sweep/);
+	assert.match(last.textContent, /resumed after a restart/);
+	assert.match(last.textContent, /continues the pass started (\w{3} \d+ \w{3} )?\d\d:\d\d UTC/);
+	assert.match(last.textContent, /from https:\/\/www\.example\.com\/product\/k/);
+	assert.match(helpText(last), /walks from the cursor the interrupted one reached/);
+	assert.match(cardTitled(after, /^Probe now/).textContent, /No health flags/);
+});
+
+test('backpressure: the time the walk waited for an action slot sits beside actions in flight, and warns past 10%', async () => {
+	const running = v2Body({ running: true });
+	const current = cardTitled(await ready({ status: running }), /^Current pass/);
+	const waitRow = (card) =>
+		find(card, (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith('Waited for an action slot'));
+	assert.match(waitRow(current).textContent, /0s · 0% of the pass/);
+
+	// The last pass ran 9h and waited 2h of it: the actions, not the origin, set its pace.
+	const bound = v2Body();
+	bound.sweep.lastRun.actionWaitMs = 2 * HOUR;
+	const ctx = await ready({ status: bound });
+	const last = cardTitled(ctx, /^Last completed sweep/);
+	assert.ok(
+		find(waitRow(last), (n) => n.attributes?.class === 'pill warn' && /2h · 22% of the pass/.test(n.textContent))
+	);
+	const now = cardTitled(ctx, /^Probe now/).textContent;
+	assert.match(now, /Paced by its actions\./);
+	assert.match(now, /node-a \(last sweep\): waited 2h \(22% of the pass\)/);
+});
+
+test('pacing: an action-bound pass is not diagnosed as an origin-latency or concurrency limit', async () => {
+	// 1,500 probes in 200s, well under the 10/s ceiling — but 80s of it was spent waiting on the actions.
+	const text = draw(await ready({ status: sweptAt(1500, 200, { actionWaitMs: 80_000 }) })).textContent;
+	assert.match(text, /Waited for an action slot1m · 40% of the pass/);
+	assert.match(text, /acting on changes set its pace, not the origin or the probe concurrency/);
+	assert.match(text, /changeProbe\.trigger\.concurrency/);
+	assert.doesNotMatch(text, /never actually reached|Implied per-probe latency/);
+	// Without the wait the same numbers are the concurrency diagnosis they always were.
+	assert.match(
+		draw(await ready({ status: sweptAt(1500, 200, { actionWaitMs: 0 }) })).textContent,
+		/never actually reached/
+	);
+});
+
+test('an older plugin (0.93-shaped payload): the removed fields are not shown and the new ones are left out, not n/a rows', async () => {
+	// What a node on 0.91–0.93 sends: trigger-queue counters and settings, no actions in flight.
+	const old = v2Body({ running: true, over: { settings: { ...v2Settings, maxTriggersPerSweep: 150_000 } } });
+	old.settings.trigger = { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 };
+	Object.assign(old.sweep.progress, { queued: 70, deferred: 4, triggerQueueDepth: 46_000 });
+	delete old.sweep.progress.actionsInFlight;
+	delete old.sweep.progress.actionWaitMs;
+	delete old.sweep.progress.cursor;
+	delete old.sweep.progress.errors;
+	Object.assign(old.sweep.lastRun, { queued: 230, deferred: 12, triggerQueueDepth: 49_000 });
+	delete old.sweep.lastRun.maxActionsInFlight;
+	delete old.sweep.lastRun.actionWaitMs;
+	delete old.sweep.lastRun.resumedFrom;
+	delete old.sweep.lastRun.resumeCursor;
+	const ctx = await ready({ status: old });
+	const text = draw(ctx).textContent;
+	assert.doesNotMatch(text, /Trigger queue|Triggers per sweep|drains \d|Queued re-renders|Deferred|deferred past|NaN/);
+	assert.equal(
+		find(cardTitled(ctx, /^Current pass/), (n) => n.tagName === 'TR' && /Actions in flight/.test(n.textContent)),
+		null,
+		'no node reports it: the row is left out rather than drawn as n/a'
+	);
+	assert.equal(
+		find(cardTitled(ctx, /^Last completed sweep/), (n) => n.tagName === 'TR' && /Most actions/.test(n.textContent)),
+		null
+	);
+	for (const label of ['Waited for an action slot', 'Resume point', 'Continues']) {
+		assert.equal(
+			find(draw(ctx), (n) => n.tagName === 'TR' && n.children[0]?.textContent.startsWith(label)),
+			null,
+			`nor the ${label} row`
+		);
+	}
+	// Its trigger.concurrency meant triggers in flight — the same bound, so it is shown as such.
+	assert.match(cardTitled(ctx, /^Configuration/).textContent, /Actions in flightat most 4/);
+	assert.doesNotMatch(text, /Changes deferred|Trigger queue near full/);
+});
+
+test('a cluster with one node on each side of v0.94.0 names the older node’s missing count instead of dropping it', async () => {
+	const old = v2Body({ running: true });
+	delete old.sweep.progress.actionsInFlight;
+	delete old.sweep.lastRun.maxActionsInFlight;
+	const ctx = await ready({ status: clusterOf(['node-a', v2Body({ running: true })], ['node-b', old]) });
+	const current = cardTitled(ctx, /^Current pass/);
+	const actions = find(current, (n) => n.tagName === 'TR' && /Actions in flight/.test(n.textContent));
+	assert.match(actions.textContent, /3 of 8/);
+	assert.ok(find(actions, (n) => n.textContent === 'n/a' && /plugin < 0\.94\.0/.test(n.attributes?.title ?? '')));
+	const most = find(
+		cardTitled(ctx, /^Last completed sweep/),
+		(n) => n.tagName === 'TR' && /Most actions/.test(n.textContent)
+	);
+	assert.match(most.textContent, /8 of 8/);
+	assert.match(most.textContent, /n\/a/);
+});
+
+test('the configuration card shows the actions-in-flight bound, not the removed trigger-queue settings', async () => {
+	const text = cardTitled(await ready({ status: v2Body() }), /^Configuration/).textContent;
+	assert.match(text, /Actions in flightat most 8/);
+	assert.doesNotMatch(text, /Trigger queue|Triggers per sweep/);
 });
 
 test('auto-refresh re-reads ONLY the status, on a timer, and pausing it stops the timer', async (t) => {

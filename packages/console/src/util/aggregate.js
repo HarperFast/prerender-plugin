@@ -1061,8 +1061,9 @@ const PROBE_COUNTERS = [
 	'seeded',
 	'unchanged',
 	'changed',
+	// Changes acted on — page hard-expired, render filed ahead of rotation (plugin v0.94.0; before it,
+	// re-renders filed). Plugin v0.94.0 removed `deferred` and `queued` with the trigger queue.
 	'triggered',
-	'deferred',
 	'failed',
 	'fresh',
 	'throttled',
@@ -1070,13 +1071,13 @@ const PROBE_COUNTERS = [
 	// with the origin (pageCheck, plugin v0.58.0) is ALSO inside `changed` or `unchanged`, so this
 	// sums on its own and belongs in no subtraction — same footing as `throttled` inside `failed`.
 	'pageMismatch',
+	// Actions that threw: page left as it was, baseline stale, so the next probe acts again.
 	'errors',
 	// Added after the list was first written, and each one was DROPPED by this merge until console
 	// v0.16.0 — the cluster view simply did not have them, while every node reported them.
 	// `rebaselined` is the one that mattered most: the compared denominator subtracts it, so without
 	// it a cluster pass right after a rule edit read as "nothing changed" over rows never compared.
 	'rebaselined',
-	'queued',
 	'extended', // plugin v0.86.0 — overlays unchanged/changed, like pageMismatch
 	'caughtUp', // v0.88.0 — overlays changed
 	'ignored', // v0.88.0 — overlays unchanged
@@ -1328,8 +1329,14 @@ export function mergeChangeProbe(results) {
 							unreported: unreportedCounters(sweeps, [...PROBE_COUNTERS, 'unreadable']),
 							// A walk fault, summed like a counter but reported apart from the pass outcomes.
 							unreadable: sumOf(sweeps, (run) => run.unreadable),
-							// The deepest the trigger queue got on any node — a high-water mark, not a sum.
-							triggerQueueDepth: maxOf(sweeps, (run) => run.triggerQueueDepth),
+							// The most actions any node had in flight at once (plugin v0.94.0) — a high-water mark, not a sum.
+							maxActionsInFlight: maxOf(sweeps, (run) => run.maxActionsInFlight),
+							// The longest any node's walk was blocked on a full action pipeline — the worst node, since
+							// each wait is a share of that node's own pass.
+							actionWaitMs: maxOf(sweeps, (run) => run.actionWaitMs),
+							// Nodes whose last pass finished one a restart cut short (plugin v0.94.0): their counts
+							// cover only the rows the interrupted pass had not reached.
+							resumedOn: sweeps.filter((run) => run.startedBy === 'resume').map((run) => run.hostname),
 							dryRun: sweeps.every((run) => run.dryRun !== false),
 							aborted: sweeps.some((run) => run.aborted),
 							// WHY `some` AND NOT A COUNT. One node that gave up on a refusing origin covered
@@ -1587,17 +1594,20 @@ export function mergeQueueState(results) {
 	if (complete) {
 		const sum = (read) => sumOf(live, read);
 
-		// Classes (route × cadence × sitemap flag) add, keeping the worst head and naming its node the way
-		// every other per-node field here does: by the fan-out's host. (The per-route list is not merged —
-		// nothing reads it, and its bins would need the same edge check as the totals.)
+		// Classes (route × cadence × sitemap flag × changed flag) add, keeping the worst head and naming its
+		// node the way every other per-node field here does: by the fan-out's host. The changed flag (plugin
+		// v0.94.0: rows the change probe filed, ranked ahead) keeps those rows' class apart from the routine
+		// one it would otherwise fold into — a 0.93 node sends no flag, and its classes read as routine.
+		// (The per-route list is not merged — nothing reads it, and its bins would need the same edge check.)
 		const classes = new Map();
 		for (const result of results) {
 			for (const klass of result.body?.lateness?.classes ?? []) {
-				const id = `${klass.route}\u0000${klass.cadenceMs}\u0000${!!klass.fromSitemap}`;
+				const id = `${klass.route}\u0000${klass.cadenceMs}\u0000${!!klass.fromSitemap}\u0000${!!klass.changed}`;
 				const acc = classes.get(id) ?? {
 					route: klass.route,
 					cadenceMs: klass.cadenceMs,
 					fromSitemap: !!klass.fromSitemap,
+					changed: !!klass.changed,
 					rows: 0,
 					due: 0,
 					oldestDueAt: null,
@@ -1635,6 +1645,18 @@ export function mergeQueueState(results) {
 				due: sum((row) => row.now?.due),
 				dueSitemap: sum((row) => row.now?.dueSitemap),
 				dueDiscovered: sum((row) => row.now?.dueDiscovered),
+				// Due rows the change probe filed (plugin v0.94.0): pages known changed, expired and served from
+				// the origin until they re-render. Summed only when EVERY node reports it: a node on an older
+				// plugin does not, and a sum without its slice would read as the whole cluster's.
+				dueChanged: live.every((row) => Number.isFinite(row.now?.dueChanged))
+					? sum((row) => row.now?.dueChanged)
+					: null,
+				// The longest-waiting changed page's due minute: the EARLIEST across nodes, and only when every
+				// node reports the field. `null` is an answer (no changed page is due), so an unreported cluster
+				// value is left OUT rather than set to null — exactly as a node that does not report it sends it.
+				...(live.every((row) => row.now && 'oldestChangedAt' in row.now)
+					? { oldestChangedAt: minOf(live, (row) => row.now.oldestChangedAt) }
+					: {}),
 				inFlight: sum((row) => row.now?.inFlight),
 				// Each node's own `due − inFlight` (clamped at zero there), summed: a node with more leases
 				// than due rows must not cancel another node's waiting rows.

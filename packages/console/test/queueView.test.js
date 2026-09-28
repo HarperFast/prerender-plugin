@@ -651,3 +651,104 @@ test('plugin 0.93.1’s listsTruncated is shown when present', async () => {
 	await load(ctx);
 	assert.match(draw(ctx).textContent, /class lists capped at 200 per node/);
 });
+
+// ---- plugin v0.94.0: changed pages waiting -------------------------------------------------------
+//
+// A page the change probe found changed is hard-expired and its render filed ahead of rotation, so
+// until it re-renders bots are served the origin. queue-state reports those due rows as
+// `now.dueChanged`; an older plugin does not report it at all, and that must read as absent, never 0.
+
+/**
+ * The 0.93.0 capture as plugin 0.94.0 answers it: the changed count, the class flag and — unless
+ * `oldestAgoMs` is `undefined`, the first 0.94.0 build's shape — the oldest changed row's due minute.
+ */
+const withChangedState = (dueChanged, oldestAgoMs = undefined) => ({
+	...LIVE_STATE,
+	now: {
+		...LIVE_STATE.now,
+		dueChanged,
+		...(oldestAgoMs === undefined ? {} : { oldestChangedAt: oldestAgoMs === null ? null : Date.now() - oldestAgoMs }),
+	},
+	lateness: {
+		...LIVE_STATE.lateness,
+		classes: [
+			{ ...LIVE_STATE.lateness.classes[0], changed: true, due: dueChanged, oldestLatenessCadences: 9 },
+			...LIVE_STATE.lateness.classes.map((klass) => ({ ...klass, changed: false })),
+		],
+	},
+});
+
+const changedTile = async (n, oldestAgoMs) => {
+	const ctx = makeCtx(ANALYTICS, { queueState: nodeState(withChangedState(n, oldestAgoMs)) });
+	await load(ctx);
+	return tile(ctx, 'Changed, waiting');
+};
+const verdictClass = (node) =>
+	find(node, (n) => String(n.attributes?.class ?? '').startsWith('value'))?.attributes.class;
+
+test('changed pages waiting: a tile beside due, judged by count ÷ render rate when no oldest wait is reported', async () => {
+	// The first 0.94.0 build sent no oldestChangedAt. 500 renders in the hour: 400 changed rows are ~48m of
+	// work (ok), 1,500 are 3h (watch), 5,000 are 10h (bad).
+	const ok = await changedTile(400);
+	assert.match(ok.textContent, /400/);
+	assert.match(ok.textContent, /~48m to re-render$/);
+	assert.equal(verdictClass(ok), 'value');
+	assert.match(ok.attributes.title, /queue\.ready\.changedHeadStart/);
+	assert.equal(verdictClass(await changedTile(1500)), 'value warn');
+	assert.equal(verdictClass(await changedTile(5000)), 'value bad');
+	assert.match((await changedTile(0)).textContent, /none waiting/);
+});
+
+test('changed pages waiting: the ACTUAL wait of the oldest changed page is judged too — the worse of the two wins', async () => {
+	const MIN = 60_000;
+	const HOUR = 60 * MIN;
+	// 400 rows re-render in ~48m, and the oldest has waited 10m: ok on both counts, and both are named.
+	const fresh = await changedTile(400, 10 * MIN);
+	assert.equal(verdictClass(fresh), 'value');
+	assert.match(fresh.textContent, /oldest 10m · ~48m to re-render/);
+	// Few rows, but one has been served from the origin for 3h — the count alone would have read ok.
+	assert.equal(verdictClass(await changedTile(400, 3 * HOUR)), 'value warn');
+	assert.equal(verdictClass(await changedTile(400, 9 * HOUR)), 'value bad');
+	// A fresh wave the fleet will take 3h to reach is a watch even though nothing has waited long yet.
+	assert.equal(verdictClass(await changedTile(1500, 5 * MIN)), 'value warn');
+	// Nothing due: null is an answer, and it is fine.
+	assert.equal(verdictClass(await changedTile(0, null)), 'value');
+});
+
+test('changed pages waiting: each node’s own count in the keeper table, and the changed class marked', async () => {
+	const ctx = makeCtx(ANALYTICS, { queueState: nodeState(withChangedState(1234)) });
+	await load(ctx);
+	const table = keeperTable(ctx);
+	assert.ok(table.children[0].textContent.includes('changed'), 'a changed column');
+	assert.match(rowOf(table, 'localhost').textContent, /152,5151,234/, 'due, then changed');
+	const lateness = find(draw(ctx), (n) => n.tagName === 'TABLE' && n.textContent.includes('cadence'));
+	assert.ok(find(lateness, (n) => n.attributes?.class === 'pill info' && n.textContent === 'changed'));
+	assert.match(lateness.textContent, /changed/);
+	assert.match(draw(ctx).textContent, /started queue\.ready\.changedHeadStart cadences ahead/, 'the help says why');
+	const aged = makeCtx(ANALYTICS, { queueState: nodeState(withChangedState(1234, 2 * 3_600_000)) });
+	await load(aged);
+	const cell = find(rowOf(keeperTable(aged), 'localhost'), (n) =>
+		/oldest has been due 2h/.test(n.attributes?.title ?? '')
+	);
+	assert.ok(cell, 'the node’s own oldest wait rides on its cell');
+});
+
+test('changed pages waiting: an older plugin reports none — no tile, no column, never a 0', async () => {
+	const ctx = await ready(); // the real 0.93.0 answer
+	assert.equal(tile(ctx, 'Changed, waiting'), null);
+	const table = keeperTable(ctx);
+	assert.equal(table.children[0].children[0].children.length, 10, 'the 0.93 columns only');
+	assert.doesNotMatch(table.children[0].textContent, /changed/);
+});
+
+test('changed pages waiting: a mixed-version cluster withholds the sum and names the node that cannot say', async () => {
+	const ctx = makeCtx(ANALYTICS, {
+		queueState: merged(answer('a', withChangedState(700)), answer('b', LIVE_STATE)),
+	});
+	await load(ctx);
+	const changed = tile(ctx, 'Changed, waiting');
+	assert.match(changed.textContent, /^Changed, waiting—not reported by b\.example\.com:9926$/);
+	const b = rowOf(keeperTable(ctx), 'b.example.com');
+	assert.ok(find(b, (n) => n.tagName === 'TD' && /predates v0\.94\.0/.test(n.attributes?.title ?? '')));
+	assert.match(rowOf(keeperTable(ctx), 'a.example.com').textContent, /700/);
+});

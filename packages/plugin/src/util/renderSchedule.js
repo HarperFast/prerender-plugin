@@ -46,7 +46,7 @@ import { config } from '../config.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
 import { resolveRenderInterval } from './routeClass.js';
-import { MINUTE, numberOf } from './time.js';
+import { MINUTE, currentMinuteMs, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 import { READY_EPOCH_SEC, READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
 import { walkUrlRange } from './urlWalk.js';
@@ -147,7 +147,7 @@ export const minuteOf = (ms) => Math.floor(ms / MINUTE);
  */
 export const writeSchedule = async (
 	cacheKey,
-	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince } = {}
+	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt } = {}
 ) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
@@ -162,11 +162,38 @@ export const writeSchedule = async (
 	}
 	// `targetMissingSince` is written only by the deferral that sets it (see `settleTargetless`);
 	// every other write omits it, and since `put` replaces the record, omitting it CLEARS it.
+	// `changedAt` the same way: the change probe sets it, a failed render's retry carries it, and every
+	// other write — the render's own reschedule above all — clears it by omission (schema.graphql).
 	await scheduleTable().put(cacheKey, {
 		nextRenderTime,
 		fromSitemap,
 		effectiveInterval,
 		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
+		...(Number.isFinite(changedAt) ? { changedAt } : {}),
+	});
+};
+
+/**
+ * File a row due NOW without ever DEMOTING it — the shape every "render this now" writer wants (the
+ * change probe, a revalidate, a render-now, an admin rejoin). A row that is already due keeps its
+ * due time, and a change mark (`changedAt`) keeps its first instant, so re-filing a page that is
+ * already waiting never moves it back in the queue or strips its priority. `changedAt` given here
+ * marks a row that has none.
+ *
+ * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
+ * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
+ * what every such writer did before, and the write still reaches the owner by residency.
+ */
+export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt } = {}) => {
+	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt']);
+	const minute = currentMinuteMs();
+	const due = numberOf(existing?.nextRenderTime);
+	const markedAt = numberOf(existing?.changedAt);
+	await writeSchedule(cacheKey, {
+		nextRenderTime: Number.isFinite(due) && due > 0 && due < minute ? due : minute,
+		fromSitemap,
+		effectiveInterval,
+		changedAt: Number.isFinite(markedAt) && markedAt > 0 ? markedAt : changedAt,
 	});
 };
 
@@ -324,7 +351,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 // ---- the queue keeper's table I/O (driven by util/queueKeeperService.js) ---------------------
 
 /** The four fields every reader of this table projects. */
-export const SCHEDULE_SELECT = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'];
+export const SCHEDULE_SELECT = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval', 'changedAt'];
 
 /**
  * Every row this node stores, in primary-key order, for the keeper's load. A chunked keyset walk

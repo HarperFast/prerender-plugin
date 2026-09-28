@@ -2,9 +2,9 @@ import { config } from '../config.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { resolveRenderInterval } from '../util/routeClass.js';
 import { getResidencyByUrl } from '../util/residency.js';
-import { currentMinuteMs, getInitialRenderTime } from '../util/time.js';
+import { currentMinuteMs, dateColumnMs, getInitialRenderTime } from '../util/time.js';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
-import { deleteSchedule, writeSchedule } from '../util/renderSchedule.js';
+import { deleteSchedule, fileDueNow, writeSchedule } from '../util/renderSchedule.js';
 import { gradeSuppression } from '../util/suppression.js';
 
 const {
@@ -355,11 +355,14 @@ export class Target extends TargetTable {
 				// up to `scan.collectCap` × devices rows with a `PrerenderedPage.get` per key, which at
 				// scale takes tens of minutes, and a minute captured at the start would file the last rows
 				// tens of minutes late — ranked as if they had been waiting that long.
-				const nextRenderTime = currentMinuteMs();
 				await Promise.all(
 					cacheKeysOf(url).map(async (cacheKey) => {
 						const existingPage = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
-						if (existingPage) {
+						// LOWER AN EXPIRY, NEVER RAISE ONE. A page the change probe hard-expired (backdated past
+						// the swr window because it is known wrong) must not be put back into swr serving by an
+						// operator's revalidate that happens to run before its render lands.
+						const expiresAt = dateColumnMs(existingPage?.expiresAt);
+						if (existingPage && !(Number.isFinite(expiresAt) && expiresAt <= Date.now())) {
 							await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
 						}
 					})
@@ -370,11 +373,9 @@ export class Target extends TargetTable {
 				// a non-indexable page unless it is sitemap-listed — so a revalidate quietly stopped
 				// those pages being cached at all.
 				//
-				// One lowering per URL rather than one for the whole batch: every row here gets the
-				// same `currentMinuteMs()`, so after the first the CAS-min is a single atomic load
-				// that changes nothing.
-				await writeSchedule(url, {
-					nextRenderTime,
+				// `fileDueNow`: filed at the current minute PER URL, and a row already due, or already
+				// marked by the change probe, keeps its place.
+				await fileDueNow(url, {
 					fromSitemap: !!sitemapUrl,
 					// `null` — the sweep resolves from config instead, which is what it did before this
 					// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and

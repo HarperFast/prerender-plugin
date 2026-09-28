@@ -88,6 +88,9 @@ export const queueSeries = (data, name) => pick(data, 'queue_health', (s) => s.p
  * - behindShare: due rows at least one cadence late (the page is two cadences old) over all due rows —
  *   judged only past `behindMinRows` late rows, so a quiet cluster whose handful of due rows includes a
  *   few held keys does not read as a third of the corpus falling behind.
+ * - changedWaitMs: how long the longest-waiting CHANGED page (plugin v0.94.0) has been due. The probe
+ *   hard-expired it, so bots get the origin for all of that time. The same bounds as the backlog's time to
+ *   clear: changed rows are ranked ahead of routine ones, so past 2h the fleet is not reaching them.
  */
 export const LIMITS = Object.freeze({
 	publishMs: [50, 250],
@@ -96,7 +99,11 @@ export const LIMITS = Object.freeze({
 	slotShare: [0.75, 0.95],
 	behindShare: [0.1, 0.33],
 	behindMinRows: 100,
+	changedWaitMs: [2 * 3_600_000, 8 * 3_600_000],
 });
+
+const VERDICT_RANK = { na: 0, ok: 1, warn: 2, bad: 3 };
+const worseVerdict = (a, b) => ((VERDICT_RANK[a] ?? 0) >= (VERDICT_RANK[b] ?? 0) ? a : b);
 
 const verdictAbove = (value, [warn, bad]) =>
 	!Number.isFinite(value) ? 'na' : value >= bad ? 'bad' : value >= warn ? 'warn' : 'ok';
@@ -470,6 +477,59 @@ export function backlogReading(overview, queueState) {
 	};
 }
 
+/**
+ * Changed pages waiting: due rows the change probe filed (plugin v0.94.0 `now.dueChanged`). The probe
+ * hard-expired each one — its content is known changed — so until it re-renders, bots are served the
+ * origin. Shared with the Health view so the two pages cannot disagree.
+ *
+ * TWO JUDGEMENTS, THE WORSE WINS. The ACTUAL wait of the longest-waiting changed page (`now.oldestChangedAt`,
+ * its due minute; `LIMITS.changedWaitMs`) says how long bots have already been getting the origin for it.
+ * The count ÷ the render rate (the backlog's 2h / 8h) says how long the rest will take — changed rows are
+ * ranked `queue.ready.changedHeadStart` cadences ahead, so the render rate reaches them first. Each alone
+ * misses a case: a small, old head reads fine by count, and a fresh wave reads fine by age.
+ *
+ * `reported` is false when no live node reports the count (an older plugin everywhere): hide it, never
+ * show a 0. `count` is null when the cluster total is unknown — a keeper not live, or `missing` names the
+ * live nodes that do not report it (a mixed rollout) — never a partial sum. The oldest wait is judged only
+ * when the cluster reports it (every node on a plugin that sends it); `null` there means nothing is due.
+ */
+export function changedReading(queueState, rendersPerHour, now = Date.now()) {
+	const liveRows = (queueState?.nodes ?? []).filter((row) => row.live);
+	const reporting = liveRows.filter((row) => Number.isFinite(row.now?.dueChanged));
+	const reported = reporting.length > 0;
+	const clusterNow = queueState?.cluster?.now;
+	const count = Number.isFinite(clusterNow?.dueChanged) ? clusterNow.dueChanged : null;
+	const missing = reported ? liveRows.filter((row) => !Number.isFinite(row.now?.dueChanged)).map(hostOf) : [];
+	const clear = count === null ? { ms: null, verdict: 'na' } : drainWaiting(count, rendersPerHour);
+	const oldestReported = count !== null && !!clusterNow && 'oldestChangedAt' in clusterNow;
+	const oldestAt = oldestReported && Number.isFinite(clusterNow.oldestChangedAt) ? clusterNow.oldestChangedAt : null;
+	const waitMs = oldestAt === null ? null : Math.max(0, now - oldestAt);
+	const waitVerdict = !oldestReported ? 'na' : waitMs === null ? 'ok' : verdictAbove(waitMs, LIMITS.changedWaitMs);
+	return {
+		reported,
+		count,
+		floor: count !== null && !liveRows.every(countsExact),
+		missing,
+		ms: clear.ms,
+		clearVerdict: clear.verdict,
+		oldestAt,
+		waitMs,
+		waitVerdict,
+		verdict: worseVerdict(waitVerdict, clear.verdict),
+	};
+}
+
+/** A changed-pages reading's one-line sub, for the Queue tile and the Health check. */
+export function changedSub(r) {
+	if (r.count === null) return r.missing.length ? `not reported by ${r.missing.join(', ')}` : 'needs every keeper live';
+	if (r.count === 0) return 'none waiting';
+	const parts = [
+		r.waitMs !== null ? `oldest ${duration(r.waitMs)}` : null,
+		Number.isFinite(r.ms) ? `~${duration(r.ms)} to re-render` : null,
+	].filter(Boolean);
+	return parts.length ? parts.join(' · ') : 'served from origin';
+}
+
 /** The fullest node's lease slots in use, `{ share, node }`, or null. */
 export function slotPressure(overview) {
 	const leases = overview?.leases;
@@ -637,6 +697,7 @@ function kpis(data, qs, analytics) {
 	const clear = drainOf(reading, rendersPerHour);
 	const slots = slotPressure(data);
 	const slotVerdict = verdictAbove(slots?.share, LIMITS.slotShare);
+	const changed = changedReading(qs, rendersPerHour);
 	const late = behind(qs?.cluster?.lateness);
 	const lateVerdict = behindVerdict(late);
 	const flightShort = reading.inFlightShortOf.length > 0;
@@ -673,6 +734,22 @@ function kpis(data, qs, analytics) {
 					(reading.error ? ` ${reading.error}` : ''),
 			}
 		),
+		// Plugin v0.94.0. Hidden, not zero, when no node reports it.
+		changed.reported &&
+			stat(
+				'Changed, waiting',
+				changed.count === null ? '—' : num(changed.count) + (changed.floor ? '+' : ''),
+				changedSub(changed),
+				{
+					warn: changed.verdict === 'warn',
+					bad: changed.verdict === 'bad',
+					title:
+						'Inside Due now: pages the change probe found changed and hard-expired, ranked ' +
+						'queue.ready.changedHeadStart cadences ahead of routine rows. Bots are served the origin until each ' +
+						're-renders. "Oldest" is how long the longest-waiting one has been due; "to re-render" is this count ÷ ' +
+						'the render rate over the selected range. Either past 2h is a watch, past 8h bad.',
+				}
+			),
 		stat(
 			'In flight',
 			Number.isFinite(reading.inFlight) ? num(reading.inFlight) + (flightShort ? '+' : '') : '—',
@@ -841,6 +918,8 @@ function keeperCard(ctx, qs, analytics, overview) {
 			])
 		: null;
 
+	// Plugin v0.94.0's changed-pages count, per node: a column only once some node reports it.
+	const withChanged = qs.nodes.some((row) => Number.isFinite(row.now?.dueChanged));
 	const rows = qs.nodes.map((row) => {
 		const v = keeperVerdict(row);
 		const keeper = row.trust?.keeper;
@@ -852,6 +931,21 @@ function keeperCard(ctx, qs, analytics, overview) {
 			el('td', { cls: 'mono' }, [hostOf(row)]),
 			el('td', { title: v.detail }, [pill(v.label, VERDICT_PILL[v.verdict] ?? '')]),
 			cell(row.live && Number.isFinite(row.now?.due) ? num(row.now.due) + (countsExact(row) ? '' : '+') : '—'),
+			withChanged &&
+				cell(
+					row.live && Number.isFinite(row.now?.dueChanged)
+						? num(row.now.dueChanged) + (countsExact(row) ? '' : '+')
+						: '—',
+					{
+						title:
+							row.live && !Number.isFinite(row.now?.dueChanged)
+								? 'Not reported: this node’s plugin predates v0.94.0.'
+								: 'Due rows the change probe filed: served from the origin until they re-render.' +
+									(Number.isFinite(row.now?.oldestChangedAt)
+										? ` The oldest has been due ${duration(Math.max(0, Date.now() - row.now.oldestChangedAt))}.`
+										: ''),
+					}
+				),
 			Number.isFinite(leased)
 				? cell(num(leased), { title: 'Live leases, from an exact walk of the lease table.' })
 				: cell(Number.isFinite(row.now?.inFlight) ? `≈${num(row.now.inFlight)}` : '—', {
@@ -930,6 +1024,7 @@ function keeperCard(ctx, qs, analytics, overview) {
 					'node',
 					'keeper',
 					{ text: 'due', right: true },
+					withChanged && { text: 'changed', right: true },
 					{ text: 'in flight', right: true },
 					{ text: 'next hour', right: true },
 					{ text: 'oldest due', right: true },
@@ -937,7 +1032,7 @@ function keeperCard(ctx, qs, analytics, overview) {
 					{ text: 'load', right: true },
 					{ text: 'publish', right: true },
 					{ text: 'verified', right: true },
-				],
+				].filter(Boolean),
 				rows,
 				'No node answered.'
 			),
@@ -965,8 +1060,9 @@ function latenessCard(qs) {
 		head: [spacer(), lateness.listsTruncated === true && muted('class lists capped at 200 per node')],
 		help:
 			'Due rows binned by lateness in their OWN cadence (0.5× on a 6h route is 3h late), sitemap and discovered ' +
-			'apart. Claims take the most late first, with sitemap rows boosted, so a class whose head keeps getting ' +
-			'later is one that is being starved. The table is the classes whose oldest row is furthest behind.',
+			'apart. Claims take the most late first, with sitemap rows boosted and rows the change probe filed ' +
+			'(changed) started queue.ready.changedHeadStart cadences ahead, so a class whose head keeps getting later ' +
+			'is one that is being starved. The table is the classes whose oldest row is furthest behind.',
 		body: [
 			lateness.edgesDiverge
 				? el('div', { cls: 'note warn', text: 'Nodes bin lateness differently (a version skew); bins not summed.' })
@@ -990,7 +1086,7 @@ function latenessCard(qs) {
 						el('tr', null, [
 							el('td', { cls: 'mono', text: c.route ?? '(default)' }),
 							el('td', { cls: 'right mono', text: Number.isFinite(c.cadenceMs) ? duration(c.cadenceMs) : '—' }),
-							el('td', { text: c.fromSitemap ? 'sitemap' : 'discovered' }),
+							el('td', null, [c.fromSitemap ? 'sitemap' : 'discovered', c.changed && pill('changed', 'info')]),
 							el('td', { cls: 'right mono', text: num(c.due) }),
 							el('td', {
 								cls: `right mono${c.oldestLatenessCadences >= 1 ? ' v-warn' : ''}`,
@@ -1405,7 +1501,8 @@ function settings(ctx) {
 			prefix: 'queue',
 			description:
 				'How work is handed to the render fleet: lease length, claim batch size, the ready set that decides the ' +
-				'ORDER, and the queue keeper that publishes it (publish, verification and state intervals). None of it ' +
+				'ORDER (sitemapBoost, and changedHeadStart for pages the change probe found changed), and the queue ' +
+				'keeper that publishes it (publish, verification and state intervals). None of it ' +
 				'changes what is in the corpus, only how fast and in what order it is worked through. ' +
 				'queue.ready.capacity and queue.maxLeases are restart-scoped.',
 		}),

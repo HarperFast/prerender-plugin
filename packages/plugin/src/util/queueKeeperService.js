@@ -48,7 +48,7 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
-import { createQueueKeeper } from './queueKeeper.js';
+import { changedOf, createQueueKeeper } from './queueKeeper.js';
 import {
 	clearKeeperSignal,
 	getScheduleRow,
@@ -81,7 +81,7 @@ const TOP_CHECK_ROWS = 64;
 const TOP_CHECK_TTL_MS = 60_000;
 /** A publish is forced at least this often, so an expired lease is noticed even with nothing else moving. */
 const FORCE_PUBLISH_MS = 10_000;
-const SCHEDULE_FIELDS = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'];
+const SCHEDULE_FIELDS = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval', 'changedAt'];
 const MAX_TIMER_MS = 2_147_483_647;
 
 let snapshot = null;
@@ -150,6 +150,7 @@ const matches = (held, row, described) =>
 	described !== null &&
 	held.minute === minuteOf(Number(row.nextRenderTime)) &&
 	held.fromSitemap === !!row.fromSitemap &&
+	held.changed === changedOf(row) &&
 	held.cadenceMs === described.cadenceMs &&
 	held.carried === described.carried &&
 	held.route === described.route;
@@ -597,6 +598,7 @@ export const createKeeperService = ({
 			const top = keeper.topK(ready.capacity, {
 				nowMs,
 				sitemapBoost: config.queue.ready.sitemapBoost,
+				changedHeadStart: config.queue.ready.changedHeadStart,
 				skip: (key) => leases.isLeased(key),
 			});
 			const published = publishKeeperSet(top.rows, { due: summary.due });

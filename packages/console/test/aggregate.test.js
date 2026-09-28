@@ -624,6 +624,73 @@ test('queue-state: a node on a plugin before v0.93.0 is a node WITHOUT A KEEPER,
 	assert.ok(allOld.body.nodes.every((row) => row.noKeeper));
 });
 
+/** Plugin v0.94.0's live answer: the 0.93.0 capture plus the changed-pages count and class flag. */
+const withChanged = (dueChanged, changedClassDue = dueChanged) => ({
+	...LIVE_STATE,
+	now: { ...LIVE_STATE.now, dueChanged },
+	lateness: {
+		...LIVE_STATE.lateness,
+		classes: [
+			...LIVE_STATE.lateness.classes.map((klass) => ({ ...klass, changed: false })),
+			{
+				...LIVE_STATE.lateness.classes[0],
+				changed: true,
+				rows: changedClassDue,
+				due: changedClassDue,
+				oldestLatenessCadences: 1.2,
+			},
+		],
+	},
+});
+
+test('queue-state: changed pages waiting sum when every node reports them, and are withheld when one does not', () => {
+	const both = mergeQueueState([ok('a', withChanged(1200)), ok('b', withChanged(300))]).body.cluster;
+	assert.equal(both.now.dueChanged, 1500);
+	// A node on 0.93 sends no count: a sum over the others is not the cluster's, so there is none.
+	const mixed = mergeQueueState([ok('a', withChanged(1200)), ok('b', LIVE_STATE)]).body;
+	assert.equal(mixed.cluster.now.dueChanged, null);
+	assert.equal(mixed.cluster.now.due, 2 * LIVE_STATE.now.due, 'the rest of the total is unaffected');
+	assert.equal(mixed.nodes[0].now.dueChanged, 1200, 'the node that reports it keeps its own count');
+	assert.equal(mergeQueueState([ok('a', LIVE_STATE)]).body.cluster.now.dueChanged, null);
+	// Zero is an answer, not an absence.
+	assert.equal(mergeQueueState([ok('a', withChanged(0)), ok('b', withChanged(0))]).body.cluster.now.dueChanged, 0);
+});
+
+test('queue-state: the oldest changed page is the EARLIEST across nodes, and only when every node reports it', () => {
+	const at = (dueChanged, oldestChangedAt) => {
+		const body = withChanged(dueChanged);
+		return { ...body, now: { ...body.now, oldestChangedAt } };
+	};
+	const both = mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', at(20, 4_000_000))]).body.cluster.now;
+	assert.equal(both.oldestChangedAt, 4_000_000);
+	// A node with nothing changed due answers null — an answer, so it does not hide the other's.
+	assert.equal(
+		mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', at(0, null))]).body.cluster.now.oldestChangedAt,
+		5_000_000
+	);
+	const none = mergeQueueState([ok('a', at(0, null)), ok('b', at(0, null))]).body.cluster.now;
+	assert.equal('oldestChangedAt' in none, true);
+	assert.equal(none.oldestChangedAt, null);
+	// A node that does not send the field (the first 0.94.0 build, or 0.93): the cluster value is left
+	// out, exactly as that node sends it, rather than set to a null that would read "nothing waiting".
+	const mixed = mergeQueueState([ok('a', at(10, 5_000_000)), ok('b', withChanged(20))]).body.cluster.now;
+	assert.equal('oldestChangedAt' in mixed, false);
+});
+
+test('queue-state: a changed class stays apart from the routine class it would otherwise fold into', () => {
+	const { classes } = mergeQueueState([ok('a', withChanged(50)), ok('b', withChanged(70))]).body.cluster.lateness;
+	const head = LIVE_STATE.lateness.classes[0];
+	const same = (c) => c.route === head.route && c.cadenceMs === head.cadenceMs && c.fromSitemap === head.fromSitemap;
+	const changed = classes.find((c) => same(c) && c.changed);
+	const routine = classes.find((c) => same(c) && !c.changed);
+	assert.equal(changed.due, 120);
+	assert.equal(routine.due, 2 * head.due);
+	// A 0.93 node's classes carry no flag and read as routine — they fold with the routine class.
+	const mixed = mergeQueueState([ok('a', withChanged(50)), ok('b', LIVE_STATE)]).body.cluster.lateness.classes;
+	assert.equal(mixed.find((c) => same(c) && !c.changed).due, 2 * head.due);
+	assert.equal(mixed.find((c) => same(c) && c.changed).due, 50);
+});
+
 test('queue-state: 0.93.1’s listsTruncated is carried when any node cut its lists', () => {
 	const cut = { ...LIVE_STATE, lateness: { ...LIVE_STATE.lateness, listsTruncated: true } };
 	assert.equal(mergeQueueState([ok('a', LIVE_STATE), ok('b', cut)]).body.cluster.lateness.listsTruncated, true);
@@ -1003,7 +1070,6 @@ const probeStats = (over = {}) => ({
 	unchanged: 700,
 	changed: 100,
 	triggered: 90,
-	deferred: 10,
 	failed: 100,
 	errors: 0,
 	failureSamples: [],
@@ -1399,19 +1465,61 @@ test('change probe: every node’s own payload rides along whole — including f
 test('change probe: the counters added after the merge was written now sum, and older nodes are named', () => {
 	const newer = (node, over) =>
 		probeBody(node, {
-			sweep: sweepWith({ rebaselined: 10, extended: 3, caughtUp: 4, ignored: 5, outOfScope: 6, queued: 70, ...over }),
+			sweep: sweepWith({ rebaselined: 10, extended: 3, caughtUp: 4, ignored: 5, outOfScope: 6, ...over }),
 		});
-	const older = probeBody('c', { sweep: sweepWith({ rebaselined: 1, queued: 7 }) });
+	const older = probeBody('c', { sweep: sweepWith({ rebaselined: 1 }) });
 	const { body } = mergerFor('change-probe')([ok('a', newer('a')), ok('b', newer('b')), ok('c', older)]);
 	const last = body.sweep.lastRun;
 	assert.equal(last.rebaselined, 21);
-	assert.equal(last.queued, 147);
 	assert.equal(last.extended, 6);
 	assert.equal(last.caughtUp, 8);
 	assert.equal(last.ignored, 10);
 	assert.equal(last.outOfScope, 12);
 	assert.deepEqual(last.unreported.extended, ['c.example.com:9926'], 'a sum over 2 of 3 nodes says so');
 	assert.equal(last.unreported.rebaselined, undefined);
+});
+
+// Plugin v0.94.0 acts on every change as it is found. The trigger queue's fields are gone from the merge
+// (an older node still sends them; nothing reads a sum of them), `triggered`/`errors` keep summing, the
+// actions high-water is the worst node's, and a resumed pass is named — its counts cover a remainder.
+test('change probe: v0.94.0 — acted-on and action errors sum, the actions high-water is a max, resumes are named', () => {
+	const { body } = mergerFor('change-probe')([
+		ok(
+			'a',
+			probeBody('a', { sweep: sweepWith({ triggered: 90, errors: 2, maxActionsInFlight: 8, actionWaitMs: 60_000 }) })
+		),
+		ok(
+			'b',
+			probeBody('b', {
+				sweep: sweepWith({
+					triggered: 40,
+					errors: 1,
+					maxActionsInFlight: 5,
+					actionWaitMs: 900_000,
+					startedBy: 'resume',
+					resumedFrom: 500,
+				}),
+			})
+		),
+		// A node still on 0.93: trigger-queue fields, no high-water.
+		ok('c', probeBody('c', { sweep: sweepWith({ triggered: 7, queued: 9, deferred: 2, triggerQueueDepth: 4000 }) })),
+	]);
+	const last = body.sweep.lastRun;
+	assert.equal(last.triggered, 137);
+	assert.equal(last.errors, 3);
+	assert.equal(last.maxActionsInFlight, 8, 'the worst node, never a sum');
+	assert.equal(last.actionWaitMs, 900_000, 'the longest any node waited on its actions, never a sum');
+	assert.deepEqual(last.resumedOn, ['b.example.com:9926']);
+	for (const gone of ['queued', 'deferred', 'triggerQueueDepth']) {
+		assert.equal(gone in last, false, `${gone} is not merged any more`);
+	}
+	// The per-node payloads still carry whatever each node sent — the view reads those.
+	assert.equal(body.perNode[1].sweep.lastRun.startedBy, 'resume');
+	// An all-0.93 cluster has no high-water to report: null, not 0.
+	const old = mergerFor('change-probe')([ok('c', probeBody('c'))]).body.sweep.lastRun;
+	assert.equal(old.maxActionsInFlight, null);
+	assert.equal(old.actionWaitMs, null);
+	assert.deepEqual(old.resumedOn, []);
 });
 
 test('change probe: per-slot and per-field counts add leaf by leaf; the guard names where a field is disarmed', () => {

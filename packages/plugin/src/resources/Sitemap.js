@@ -816,7 +816,7 @@ async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) 
 			// `Date.now()` expiry leaves the page 'swr' (`util/pageFreshness.js`), i.e. still SERVING
 			// for another `page.swrTtl` — and the swr window exists to smooth over a late re-render of
 			// content presumed still right, which is exactly what a departed (or rejoined) product page
-			// is not. This matches `changeProbe.triggerRevalidate`, which backdates for the same reason;
+			// is not. This matches `changeProbe.actOnChange`, which backdates for the same reason;
 			// `Target.revalidate` keeps the plain expiry deliberately, because an operator asking for
 			// a re-render is not asserting the content is wrong.
 			const hardExpiredAt = Date.now() - config.page.swrTtl;

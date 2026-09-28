@@ -50,3 +50,33 @@ test('writeSchedule refuses a write with no explicit effectiveInterval (same haz
 	]);
 	assert.deepEqual([...rows.keys()].sort(), ['a|desktop', 'b|desktop']);
 });
+
+test('fileDueNow files a row due now WITHOUT DEMOTING it: an earlier due time and a change mark survive', async () => {
+	// Every "render this now" writer goes through it (the change probe, revalidate, render-now, admin
+	// rejoin). Filing a page that is already waiting at "now" would move it back in the queue, and
+	// dropping its `changedAt` would strip the head start of a page known wrong.
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	rows.clear();
+	await funnel.fileDueNow('https://example.com/new', { fromSitemap: true, effectiveInterval: null });
+	assert.equal(rows.get('https://example.com/new').nextRenderTime, minute, 'no row: filed at the current minute');
+	assert.equal(rows.get('https://example.com/new').changedAt, undefined, 'and not marked unless asked');
+
+	const earlier = minute - 3 * 3_600_000;
+	rows.set('https://example.com/waiting', { nextRenderTime: earlier, fromSitemap: true, changedAt: earlier });
+	await funnel.fileDueNow('https://example.com/waiting', { fromSitemap: true, effectiveInterval: null });
+	assert.equal(
+		rows.get('https://example.com/waiting').nextRenderTime,
+		earlier,
+		'an already-due row keeps its due time'
+	);
+	assert.equal(rows.get('https://example.com/waiting').changedAt, earlier, 'and its mark');
+
+	rows.set('https://example.com/later', { nextRenderTime: minute + 48 * 3_600_000, fromSitemap: false });
+	await funnel.fileDueNow('https://example.com/later', {
+		fromSitemap: false,
+		effectiveInterval: null,
+		changedAt: minute,
+	});
+	assert.equal(rows.get('https://example.com/later').nextRenderTime, minute, 'a future row is pulled to now');
+	assert.equal(rows.get('https://example.com/later').changedAt, minute, 'and marked when asked');
+});

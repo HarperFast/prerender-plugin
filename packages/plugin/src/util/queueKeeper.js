@@ -15,9 +15,11 @@
  * boost. That score changes with the clock, so no stored order can express it (#80). But two rows
  * with the same cadence and the same sitemap flag share both divisor and multiplier, so between
  * THEM the earlier due time always scores higher, at every instant. So rows are grouped into
- * classes (route, cadence, sitemap flag), each class keeps its rows by due minute in ascending
- * order, and the best row overall is always at the head of one class. Taking the best K is a k-way
- * merge over a few dozen class heads, not a scan of the due set.
+ * classes (route, cadence, sitemap flag, changed flag), each class keeps its rows by due minute in
+ * ascending order, and the best row overall is always at the head of one class. Taking the best K is
+ * a k-way merge over a few dozen class heads, not a scan of the due set. The changed flag (a row the
+ * change probe filed, `changedAt`) adds a constant to its class's score, which leaves that ordering
+ * intact.
  *
  * The route is part of the class only so queue state can be reported per route; it does not change
  * the order.
@@ -47,9 +49,17 @@ export const LATENESS_EDGES = [0.25, 1, 2, 4];
 /**
  * A row is stored as one number, `dueMinute * CLASS_SPAN + classId`, so the per-row cost is one Map
  * entry and one Set membership. 2^16 classes is far past any real corpus: the class count is routes
- * times distinct cadences times two.
+ * times distinct cadences times four (sitemap flag, changed flag).
  */
 const CLASS_SPAN = 65_536;
+
+/** Whether a schedule row is one the change probe filed (`changedAt`; a Long can surface as a BigInt). */
+export const changedOf = (value) => {
+	const at = value?.changedAt;
+	if (at === null || at === undefined) return false;
+	const ms = Number(at);
+	return Number.isFinite(ms) && ms > 0;
+};
 
 const binOf = (cadences) => {
 	let bin = 0;
@@ -83,7 +93,7 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 
 	/** key -> dueMinute * CLASS_SPAN + classId */
 	const rows = new Map();
-	/** classId -> { route, cadenceMs, carried, fromSitemap, buckets: Map<minute, Set<key>>, minutes: number[] } */
+	/** classId -> { route, cadenceMs, carried, fromSitemap, changed, buckets: Map<minute, Set<key>>, minutes: number[] } */
 	const classes = [];
 	const classIds = new Map();
 
@@ -100,13 +110,13 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 	// Bumped by every apply that changes what is held, so the host can skip a publish nothing changed.
 	let version = 0;
 
-	const classOf = (route, cadenceMs, carried, fromSitemap) => {
-		const name = `${route}\u0000${cadenceMs}\u0000${carried ? 1 : 0}\u0000${fromSitemap ? 1 : 0}`;
+	const classOf = (route, cadenceMs, carried, fromSitemap, changed) => {
+		const name = `${route}\u0000${cadenceMs}\u0000${carried ? 1 : 0}\u0000${fromSitemap ? 1 : 0}\u0000${changed ? 1 : 0}`;
 		let id = classIds.get(name);
 		if (id === undefined) {
 			id = classes.length;
 			if (id >= CLASS_SPAN) throw new RangeError(`queue keeper: more than ${CLASS_SPAN} classes`);
-			classes.push({ route, cadenceMs, carried, fromSitemap, buckets: new Map(), minutes: [] });
+			classes.push({ route, cadenceMs, carried, fromSitemap, changed, buckets: new Map(), minutes: [] });
 			classIds.set(name, id);
 		}
 		return id;
@@ -182,7 +192,13 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			}
 			return false;
 		}
-		const classId = classOf(described.route, described.cadenceMs, !!described.carried, !!value.fromSitemap);
+		const classId = classOf(
+			described.route,
+			described.cadenceMs,
+			!!described.carried,
+			!!value.fromSitemap,
+			changedOf(value)
+		);
 		insert(key, classId, minute);
 		if (!quiet) {
 			const isDue = minute <= nowMinute;
@@ -222,7 +238,7 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 	 * `complete` is true when every due row was examined: the result then holds every due row that
 	 * `skip` let through, so a claim that exhausts the published set knows nothing more is due.
 	 */
-	const topK = (k, { nowMs, sitemapBoost = 1, skip } = {}) => {
+	const topK = (k, { nowMs, sitemapBoost = 1, changedHeadStart = 0, skip } = {}) => {
 		const limit = Math.max(0, k | 0);
 		const nowMinute = Math.floor(nowMs / MINUTE);
 		const out = [];
@@ -261,8 +277,8 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 		};
 		const scoreAt = (klass, minute) =>
 			scoreOf(
-				{ dueAt: minute * MINUTE, fromSitemap: klass.fromSitemap },
-				{ nowMs, intervalMs: klass.cadenceMs, sitemapBoost }
+				{ dueAt: minute * MINUTE, fromSitemap: klass.fromSitemap, changed: klass.changed },
+				{ nowMs, intervalMs: klass.cadenceMs, sitemapBoost, changedHeadStart }
 			);
 
 		for (let id = 0; id < classes.length; id++) {
@@ -329,15 +345,17 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 		const byHour = new Array(24).fill(0);
 		let due = 0;
 		let dueSitemap = 0;
+		let dueChanged = 0;
 		let next15m = 0;
 		let next60m = 0;
 		let next24h = 0;
 		let oldestDueMinute = null;
+		let oldestChangedMinute = null;
 		let nextDueMinute = null;
 		const classRows = [];
 
 		for (const klass of classes) {
-			const { minutes, buckets, cadenceMs, fromSitemap, route } = klass;
+			const { minutes, buckets, cadenceMs, fromSitemap, changed, route } = klass;
 			if (!minutes.length) continue;
 			let classDue = 0;
 			let classRowsHeld = 0;
@@ -366,13 +384,17 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			}
 			due += classDue;
 			if (fromSitemap) dueSitemap += classDue;
+			if (changed) dueChanged += classDue;
 			routeEntry.due += classDue;
 			const head = minutes[0];
 			if (classDue && (oldestDueMinute === null || head < oldestDueMinute)) oldestDueMinute = head;
+			if (changed && classDue && (oldestChangedMinute === null || head < oldestChangedMinute))
+				oldestChangedMinute = head;
 			classRows.push({
 				route,
 				cadenceMs,
 				fromSitemap,
+				changed,
 				rows: classRowsHeld,
 				due: classDue,
 				oldestDueAt: classDue ? head * MINUTE : null,
@@ -394,6 +416,10 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			due,
 			dueSitemap,
 			dueDiscovered: due - dueSitemap,
+			// due rows the change probe filed (`changedAt`): pages known changed, expired and served from the
+			// origin until their render lands — and how long the longest-waiting one has waited
+			dueChanged,
+			oldestChangedDueAt: oldestChangedMinute === null ? null : oldestChangedMinute * MINUTE,
 			oldestDueAt: oldestDueMinute === null ? null : oldestDueMinute * MINUTE,
 			nextDueAt: nextDueMinute === null ? null : nextDueMinute * MINUTE,
 			coming: { next15m, next60m, next24h, byHour },
@@ -416,8 +442,8 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			const packed = rows.get(key);
 			if (packed === undefined) return null;
 			const { classId, minute } = unpack(packed);
-			const { route, cadenceMs, carried, fromSitemap } = classes[classId];
-			return { minute, route, cadenceMs, carried, fromSitemap };
+			const { route, cadenceMs, carried, fromSitemap, changed } = classes[classId];
+			return { minute, route, cadenceMs, carried, fromSitemap, changed };
 		},
 		/**
 		 * The row value `apply` would need to hold `key` exactly as it is held now — for reclassifying in
@@ -428,8 +454,15 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			const packed = rows.get(key);
 			if (packed === undefined) return null;
 			const { classId, minute } = unpack(packed);
-			const { cadenceMs, carried, fromSitemap } = classes[classId];
-			return { nextRenderTime: minute * MINUTE, fromSitemap, effectiveInterval: carried ? cadenceMs : null };
+			const { cadenceMs, carried, fromSitemap, changed } = classes[classId];
+			return {
+				nextRenderTime: minute * MINUTE,
+				fromSitemap,
+				effectiveInterval: carried ? cadenceMs : null,
+				// the flag, not the instant: the class holds no per-row timestamp, and a reclassify needs only
+				// whether the row is one the probe filed (never 0, which would read as unmarked)
+				changedAt: changed ? Math.max(1, minute * MINUTE) : null,
+			};
 		},
 		/** A snapshot of every held key: safe to iterate while applying (a live iterator is not). */
 		keys: () => [...rows.keys()],

@@ -699,6 +699,34 @@ test('a per-device row past fastRetries converts as it takes the slow lane', asy
 	assert.equal(leased(key(A, 'desktop')), false, 'slow lane releases');
 });
 
+test('a CHANGED row keeps its mark through a failed render, and loses it when a render lands', async () => {
+	// The change probe hard-expired the page and marked the row so it ranks ahead of rotation. A
+	// failure's slow-lane backoff `put`s the row whole: omitting the mark would demote a page that is
+	// still being served from the origin. The render's own reschedule is what clears it.
+	const fast = config.render.failureRetry.fastRetries;
+	const changedAt = Date.now() - 60_000;
+	seedUrlRow({ strikes: fast });
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	await claim();
+	const failure = (deviceType) => ({
+		deviceType,
+		outcome: 'error',
+		reason: 'error',
+		error: { name: 'Error', message: 'x', phase: 'settle' },
+	});
+	await postVariants(A, DEVICES.map(failure));
+	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'the slow lane backed off');
+	assert.equal(stores.renderSchedule.get(A).changedAt, changedAt, 'the mark rides the backoff');
+
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), nextRenderTime: 1 });
+	await claim();
+	await postVariants(
+		A,
+		DEVICES.map((d) => rendered(d))
+	);
+	assert.equal(stores.renderSchedule.get(A).changedAt, undefined, 'a landed render clears it');
+});
+
 // ───────────────────────────── one-device rows beside the rotation ─────────────────────────────
 
 test('a per-device row for a NON-default device is a one-off: page stored, row retired, URL row untouched', async () => {

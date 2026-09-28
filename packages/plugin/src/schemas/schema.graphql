@@ -181,6 +181,13 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# re-files the row normally on its next render. NOT @indexed — read only by a point read of a
 	# row already in hand.
 	targetMissingSince: Long
+	# When the change probe found this page's origin content changed (ms), set by the probe's action
+	# (`util/changeProbe.js` `actOnChange`), which also hard-expired the page. The queue keeper ranks a
+	# row carrying it `queue.ready.changedHeadStart` cadences ahead (`util/renderPriority.js`): its page
+	# is known wrong and is being served from the origin until the render lands. Durable so the
+	# priority survives a restart. Every writer `put`s the row whole, so the render's reschedule clears
+	# it; a failed render's retry carries it forward (the page is still expired). NOT @indexed.
+	changedAt: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
@@ -344,7 +351,7 @@ type Invalidation @table(database: "invalidation") @sealed {
 # needs it lands wherever the CDN sent it; a node-local table would answer only ~15% of the requests
 # that matter (measured: `invalidation_reenqueue{outcome='not-owner'}` is 84-85%).
 #
-# KEYED BY URL, not cacheKey: the probe's unit is the URL, `triggerRevalidate` hard-expires every
+# KEYED BY URL, not cacheKey: the probe's unit is the URL, `actOnChange` hard-expires every
 # device key of a URL together, and one row instead of two halves the write volume. The serve path
 # derives the URL half with `CacheKey.extractUrl`.
 #

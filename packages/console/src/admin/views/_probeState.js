@@ -36,8 +36,9 @@ export const SINCE = Object.freeze({
 	fieldMismatch: '0.88.0',
 	fieldGuard: '0.88.0',
 	extended: '0.86.0',
-	queued: '0.71.0',
-	triggerQueueDepth: '0.71.0',
+	actionsInFlight: '0.94.0',
+	maxActionsInFlight: '0.94.0',
+	actionWaitMs: '0.94.0',
 	rebaselined: '0.65.0',
 	behindBatches: '0.60.0',
 	pageMismatch: '0.58.0',
@@ -54,8 +55,14 @@ export const FAILURE_WARN = 0.1;
 export const PUSHBACK_WARN = 0.01;
 /** A re-baselined share above this is a rule edit, not the odd legacy row. */
 export const REBASELINE_WARN = 0.05;
-/** Trigger-queue depth above this share of `maxPending` is close to deferring detected changes. */
-export const QUEUE_NEAR_FULL = 0.8;
+/**
+ * A pass that spent more than this share of its elapsed time waiting for a free action slot is paced by
+ * its actions (trigger.concurrency × the database's write latency), not by the origin — and from outside
+ * it looks exactly like an origin-throttled pass: slow, with a healthy failure share. Judged only past
+ * `ACTION_WAIT_MIN_MS` of waiting, so a short manual pass with a few seconds of it stays quiet.
+ */
+export const ACTION_WAIT_WARN = 0.1;
+export const ACTION_WAIT_MIN_MS = MINUTE;
 /** A partial pass must have probed this many before its failure share means anything. */
 const MIN_SAMPLE = 200;
 
@@ -69,6 +76,9 @@ export const msOf = (value) => {
 };
 
 const finite = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
+/** `part ÷ whole` capped at 1, or null when either is unknown or the whole is not positive. */
+const shareOf = (part, whole) => (part !== null && whole > 0 ? Math.min(1, Math.max(0, part) / whole) : null);
 
 /**
  * Every node's own payload. Under the cluster merge that is `perNode` (console v0.16.0+); at node
@@ -228,7 +238,11 @@ export function describeNode(
 		const matched = finite(progress?.matched);
 		const probed = finite(progress?.probed);
 		const slice = finite(current?.sliceEstimate) ?? (completed(last) ? last.matched : null);
-		const fraction = matched !== null && slice > 0 ? Math.min(0.999, matched / slice) : null;
+		// A RESUME (plugin v0.94.0) starts the walk at the interrupted pass's cursor, so its counts cover
+		// only the tail of the key range: matched ÷ the whole slice would under-read its progress and
+		// project an end hours too late (and a false "will overrun the anchor"). No percentage, no ETA.
+		const resumed = current?.startedBy === 'resume';
+		const fraction = !resumed && matched !== null && slice > 0 ? Math.min(0.999, matched / slice) : null;
 		// Counters are as of the last heartbeat, so the elapsed time they cover ends there.
 		const countersAt = msOf(current?.heartbeatAt);
 		const elapsedMs = startedAt !== null && countersAt !== null ? Math.max(0, countersAt - startedAt) : null;
@@ -236,14 +250,11 @@ export function describeNode(
 		const phase = current?.phase ?? progress?.phase ?? null;
 		let etaAt = null;
 		let etaBasis = null;
-		if (phase === 'draining') {
-			const depth = finite(progress?.triggerQueueDepth);
-			const rate = finite(settings?.trigger?.ratePerSecond);
-			if (depth !== null && rate > 0 && countersAt !== null) {
-				etaAt = countersAt + (depth / rate) * 1000;
-				etaBasis = 'draining';
-			}
-		} else if (fraction !== null && matched > 0 && elapsedMs >= MINUTE) {
+		// DRAINING HAS NO ETA TO GIVE, and needs none since plugin v0.94.0: the walk is over and the pass
+		// waits only for the actions still in flight — at most `trigger.concurrency` of them, seconds of
+		// database work. (Before it, this was a trigger queue drained at a configured rate, hours deep.)
+		if (phase === 'draining') etaBasis = 'draining';
+		else if (fraction !== null && matched > 0 && elapsedMs >= MINUTE) {
 			etaAt = Math.max(countersAt, startedAt + elapsedMs / (matched / slice));
 			etaBasis = 'slice';
 		}
@@ -255,6 +266,10 @@ export function describeNode(
 			lateAfterMs,
 			staleAfterMs: heartbeat.staleAfterMs ?? 5 * MINUTE,
 			startedBy: current?.startedBy ?? null,
+			resumed,
+			// The start of the pass this one continues (plugin v0.94.0) — equal to `startedAt` unless a resume.
+			originStartedAt: msOf(current?.originStartedAt),
+			reseed: current?.reseed === true,
 			dryRun: typeof current?.dryRun === 'boolean' ? current.dryRun : null,
 			label: current?.label ?? null,
 			phase,
@@ -270,6 +285,14 @@ export function describeNode(
 			elapsedMs,
 			avgRate,
 			recentRate: finite(progress?.recentRate),
+			// Actions (expire + file the render) started and not yet settled — plugin v0.94.0; null before.
+			actionsInFlight: finite(progress?.actionsInFlight),
+			// Time the walk spent blocked on a full action pipeline, and that as a share of the elapsed time
+			// the counters cover (plugin v0.94.0).
+			actionWaitMs: finite(progress?.actionWaitMs),
+			actionWaitShare: shareOf(finite(progress?.actionWaitMs), elapsedMs),
+			// Where a resume would start if this process died now: the walk's position (plugin v0.94.0).
+			cursor: typeof progress?.cursor === 'string' && progress.cursor ? progress.cursor : null,
 			etaAt,
 			etaBasis,
 			progress,
@@ -286,6 +309,16 @@ export function describeNode(
 				durationMs: finishedAt !== null && lastStartedAt !== null ? finishedAt - lastStartedAt : null,
 				agoMs: finishedAt === null ? null : Math.max(0, now - finishedAt),
 				outcome: last.error ? 'error' : last.abortedOnDistress ? 'gave-up' : last.aborted ? 'interrupted' : 'complete',
+				// A pass boot started to finish one a restart cut short (plugin v0.94.0). It walked from the
+				// interrupted pass's cursor (`resumeCursor`), so its counts cover the rest of the key range, not
+				// a whole slice; `resumedFrom` is when the pass it continues began.
+				resumed: last.startedBy === 'resume',
+				resumedFrom: msOf(last.resumedFrom),
+				resumeCursor: typeof last.resumeCursor === 'string' && last.resumeCursor ? last.resumeCursor : null,
+				actionWaitShare: shareOf(
+					finite(last.actionWaitMs),
+					finishedAt !== null && lastStartedAt !== null ? finishedAt - lastStartedAt : null
+				),
 			}
 		: null;
 
@@ -331,7 +364,7 @@ const flag = (id, severity, summary, detail = null) => ({ id, severity, summary,
  */
 export function nodeFlags(desc) {
 	const flags = [];
-	const { hostname: node, running, last, settings, now } = desc;
+	const { hostname: node, running, last, now } = desc;
 	const add = (f) => flags.push({ ...f, node });
 
 	if (desc.state === 'unreadable') {
@@ -354,7 +387,8 @@ export function nodeFlags(desc) {
 				'bad',
 				(nodes) =>
 					`A sweep stopped heartbeating on ${list(nodes)} and is presumed dead (its worker crashed or restarted). ` +
-					'Nothing needs restarting: the next scheduled pass takes the claim over.',
+					'Nothing needs restarting: an anchored node on plugin 0.94.0+ resumes it shortly after it restarts, ' +
+					'from where its walk had got to; otherwise the next scheduled pass takes the claim over.',
 				`${node}: last heartbeat ${ago(running?.heartbeatAt, now)}${running?.startedAt ? `, started ${ago(running.startedAt, now)}` : ''}`
 			)
 		);
@@ -445,33 +479,6 @@ export function nodeFlags(desc) {
 				)
 			);
 		}
-		const deferred = finite(run.deferred) ?? 0;
-		if (deferred > 0) {
-			add(
-				flag(
-					'deferred',
-					'warn',
-					(nodes) =>
-						`Detected changes were deferred on ${list(nodes)} — past maxTriggersPerSweep or a full trigger queue. ` +
-						'Their baselines stay stale, so the next pass re-detects and retries them; until then those pages wait.',
-					`${node} (${label}): ${count(deferred)} deferred`
-				)
-			);
-		}
-		const maxPending = finite(settings?.trigger?.maxPending);
-		const depth = finite(run.triggerQueueDepth);
-		if (maxPending > 0 && depth !== null && depth >= QUEUE_NEAR_FULL * maxPending) {
-			add(
-				flag(
-					'queue-near-full',
-					'warn',
-					(nodes) =>
-						`The trigger queue is close to changeProbe.trigger.maxPending on ${list(nodes)}. Past it, detected ` +
-						'changes are refused and deferred for want of queue rather than of budget.',
-					`${node} (${label}): ${count(depth)} of ${count(maxPending)}${live ? ' now' : ' at its deepest'}`
-				)
-			);
-		}
 		const behind = finite(run.behindBatches) ?? 0;
 		if (desc.mode === 'continuous' && behind > 0) {
 			add(
@@ -485,6 +492,53 @@ export function nodeFlags(desc) {
 				)
 			);
 		}
+	}
+
+	// ACTIONS THAT THREW — judged on any count, not after a sample: each is a page the probe found changed
+	// and could not expire or file, and every one of them is still being served as it was. A watch rather
+	// than a fault because the plugin writes the new baseline only after its action succeeds, so each
+	// one is detected again, and retried, on the URL's next probe.
+	const acted = [];
+	if (last?.record) acted.push({ label: 'last sweep', run: last.record });
+	if (running?.hasCounters) acted.push({ label: 'running sweep', run: running.progress });
+	for (const { label, run } of acted) {
+		const errors = finite(run.errors) ?? 0;
+		if (errors > 0) {
+			add(
+				flag(
+					'action-errors',
+					'warn',
+					(nodes) =>
+						`Acting on a detected change failed on ${list(nodes)}: those pages were not expired or re-filed and ` +
+						'still serve what they did. Their baselines stay stale, so the next probe of each URL finds the change ' +
+						'again and retries; the node’s log names them (“change-probe action failed”).',
+					`${node} (${label}): ${count(errors)} failed${finite(run.triggered) !== null ? ` of ${count(errors + run.triggered)}` : ''}`
+				)
+			);
+		}
+	}
+
+	// BACKPRESSURE (plugin v0.94.0): the walk waits for a free action slot rather than dropping a change,
+	// so a pass whose database cannot keep up with its change rate slows down — and looks exactly like one
+	// the origin is throttling. `actionWaitMs` is the only number that tells them apart.
+	const waited = [];
+	if (last?.record)
+		waited.push({ label: 'last sweep', ms: finite(last.record.actionWaitMs), share: last.actionWaitShare });
+	if (running?.hasCounters)
+		waited.push({ label: 'running sweep', ms: running.actionWaitMs, share: running.actionWaitShare });
+	for (const { label, ms, share } of waited) {
+		if (ms === null || share === null || ms < ACTION_WAIT_MIN_MS || share <= ACTION_WAIT_WARN) continue;
+		add(
+			flag(
+				'action-bound',
+				'warn',
+				(nodes) =>
+					`The sweep on ${list(nodes)} spent over ${Math.round(ACTION_WAIT_WARN * 100)}% of its time waiting for a ` +
+					'free action slot: acting on changes (trigger.concurrency × database write latency), not the origin, ' +
+					'is setting its pace. Raise changeProbe.trigger.concurrency if the node’s database has headroom.',
+				`${node} (${label}): waited ${duration(ms)} (${pctText(share, 1)} of the pass)`
+			)
+		);
 	}
 
 	if (last?.outcome === 'error') {
@@ -758,4 +812,5 @@ export const STARTED_BY = Object.freeze({
 	startup: 'the startup sweep',
 	manual: 'an operator (manual run)',
 	reseed: 'a canary trip (reseed)',
+	resume: 'a restart (resuming the interrupted pass)',
 });
