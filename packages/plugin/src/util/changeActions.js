@@ -1,0 +1,129 @@
+/**
+ * What the change probe does with a detected change, and how many it does at once.
+ *
+ * ── THE RULE ─────────────────────────────────────────────────────────────────────────────────
+ *
+ * A page the probe found changed is acted on WHEN IT IS FOUND: hard-expired (it is known wrong, so
+ * one more serve is a served mismatch) and its render filed, ahead of routine rotation
+ * (`changedAt` on the schedule row; `util/renderPriority.js`). The render queue is what orders the
+ * work, and it holds every row of the node already: a change wave is a reordering of rows it has,
+ * not an injection it has to be protected from.
+ *
+ * Before v0.94.0 a change went into an in-memory queue drained at `trigger.ratePerSecond` (3/s on
+ * one deployment), capped at `trigger.maxPending` and `maxTriggersPerSweep`, with everything past
+ * either cap DEFERRED to the next pass. On a day when 60% of a product corpus changed overnight,
+ * each node took over 12 hours to drain, deferred ~35k changes it had detected, and still held
+ * thousands when a restart dropped the queue — every one of those pages kept serving content the
+ * probe knew was wrong, until the next day's pass found it again. The cap existed for reasons that
+ * are gone (the claim floor, and the claim scan's cost when due rows pile onto one minute); the
+ * render fleet's capacity is real, but it bounds how fast pages RE-RENDER, not how fast a known-
+ * wrong page should stop being served.
+ *
+ * ── WHY IT IS NOT AWAITED IN-LINE, AND WHY IT IS NOT A QUEUE EITHER ──────────────────────────
+ *
+ * Acting is a handful of database operations (a read and a patch per device page, the schedule
+ * write, the new baseline), and awaiting them inside the probe's row handler made the change rate
+ * set the pass duration: measured once at 9.2h -> ~21h, and pass duration is detection latency.
+ * So `submit` starts the action and returns; the pass keeps probing. What bounds the work is
+ * CONCURRENCY — at most `concurrency` actions in flight — and when every slot is busy `submit`
+ * waits for one. That wait is backpressure on the pass, never a refusal: nothing detected is
+ * dropped or deferred, and the pass only slows if the database genuinely cannot keep up.
+ *
+ * ── ORDER, AND WHAT A RESTART COSTS ──────────────────────────────────────────────────────────
+ *
+ * The new baseline is written LAST, after the action succeeds. Anything that stops an action — a
+ * failure, a restart mid-flight — leaves the stored signature stale, so the next probe of that URL
+ * detects the same change and acts again. Actions are idempotent: an already hard-expired page is
+ * not patched again, and a row already filed for a change keeps its place (`actOnChange`). So a
+ * restart loses at most the `concurrency` actions in flight, and not even those: they are found
+ * again, and the interrupted pass itself resumes on boot (`changeProbe.js`, `checkResume`).
+ */
+
+/**
+ * @param {object} ports
+ * @param {(row: object) => Promise<void>} ports.act    expire the page and file its render
+ * @param {(url: string, observed: string, opts: object) => Promise<void>} ports.write  baseline write
+ * @param {number} ports.concurrency    actions in flight at once
+ * @param {(error: unknown, item: object) => void} [ports.onError]
+ */
+export const createChangeActions = ({ act, write, concurrency = 8, onError } = {}) => {
+	const limit = Math.max(1, concurrency | 0);
+	const stats = { triggered: 0, errors: 0, maxInFlight: 0 };
+	let inFlight = 0;
+	let stopped = false;
+	// Resolvers waiting for a slot (submit) and for idleness (drain).
+	let slotWaiters = [];
+	let idleWaiters = [];
+
+	const release = () => {
+		inFlight--;
+		const next = slotWaiters.shift();
+		if (next) next();
+		if (inFlight === 0 && !slotWaiters.length) {
+			const waiting = idleWaiters;
+			idleWaiters = [];
+			for (const resolve of waiting) resolve();
+		}
+	};
+
+	const run = async (item) => {
+		try {
+			await act(item.row);
+			// AFTER the action, never before — see the module comment. `clearClaim` goes with it because
+			// the page was just hard-expired, so whatever the stored page claim described is no longer
+			// being served.
+			await write(item.row.url, item.observed, {
+				rowExists: item.rowExists,
+				clearClaim: true,
+				fingerprint: item.fingerprint,
+			});
+			stats.triggered++;
+		} catch (e) {
+			stats.errors++;
+			// Swallowed on purpose: the signature stays stale, so the next probe of this URL acts again. An
+			// action failure must never take down the pass that found the change.
+			onError?.(e, item);
+		} finally {
+			release();
+		}
+	};
+
+	return {
+		stats,
+
+		/**
+		 * Act on one detected change. Resolves once the action has STARTED — at once while a slot is
+		 * free, otherwise when one frees up. Never rejects. After `stop()` it starts nothing, and the
+		 * change stays detectable (its baseline was never written).
+		 */
+		async submit(item) {
+			while (!stopped && inFlight >= limit) await new Promise((resolve) => slotWaiters.push(resolve));
+			if (stopped) return false;
+			inFlight++;
+			if (inFlight > stats.maxInFlight) stats.maxInFlight = inFlight;
+			void run(item);
+			return true;
+		},
+
+		/** Resolves once every action started so far has settled. */
+		async drain() {
+			if (inFlight === 0) return;
+			await new Promise((resolve) => idleWaiters.push(resolve));
+		},
+
+		/**
+		 * Start nothing more. Actions in flight finish (a database write cannot be recalled); a submit
+		 * waiting for a slot returns without acting.
+		 */
+		stop() {
+			stopped = true;
+			const waiting = slotWaiters;
+			slotWaiters = [];
+			for (const resolve of waiting) resolve();
+		},
+
+		get inFlight() {
+			return inFlight;
+		},
+	};
+};

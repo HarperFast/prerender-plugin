@@ -919,3 +919,19 @@ test('queue-state says when its per-class list was cut, instead of passing a par
 	assert.equal(body.lateness.listsTruncated, true);
 	s.stop();
 });
+
+test('a row the change probe marked is loaded as CHANGED and counted in queue-state', async () => {
+	// The walk and the head check read by an explicit field list; a list without `changedAt` would load
+	// every marked row as routine and the head start would silently never apply.
+	const { SCHEDULE_SELECT } = await import('../src/util/renderSchedule.js');
+	assert.ok(SCHEDULE_SELECT.includes('changedAt'), 'the keeper load reads the mark');
+	const now = Date.now();
+	seed([{ ...row(item(1), now - MINUTE), changedAt: now - MINUTE }, row(item(2), now - HOUR)]);
+	const s = await started();
+	assert.equal(s.keeper.describe(item(1)).changed, true);
+	assert.equal(s.keeper.describe(item(2)).changed, false);
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.now.dueChanged, 1);
+	s.stop();
+});

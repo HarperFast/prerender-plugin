@@ -1428,6 +1428,8 @@ export class PrerenderAdmin extends Resource {
 				due: q.due,
 				dueSitemap: q.dueSitemap,
 				dueDiscovered: q.dueDiscovered,
+				// pages the change probe found changed and expired, waiting on their render
+				dueChanged: q.dueChanged ?? 0,
 				...nowBlock,
 				unclaimed: Math.max(0, q.due - inFlight),
 			},

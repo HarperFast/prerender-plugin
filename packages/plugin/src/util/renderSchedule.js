@@ -147,7 +147,7 @@ export const minuteOf = (ms) => Math.floor(ms / MINUTE);
  */
 export const writeSchedule = async (
 	cacheKey,
-	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince } = {}
+	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt } = {}
 ) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
@@ -162,11 +162,14 @@ export const writeSchedule = async (
 	}
 	// `targetMissingSince` is written only by the deferral that sets it (see `settleTargetless`);
 	// every other write omits it, and since `put` replaces the record, omitting it CLEARS it.
+	// `changedAt` the same way: the change probe sets it, a failed render's retry carries it, and every
+	// other write — the render's own reschedule above all — clears it by omission (schema.graphql).
 	await scheduleTable().put(cacheKey, {
 		nextRenderTime,
 		fromSitemap,
 		effectiveInterval,
 		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
+		...(Number.isFinite(changedAt) ? { changedAt } : {}),
 	});
 };
 
@@ -324,7 +327,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 // ---- the queue keeper's table I/O (driven by util/queueKeeperService.js) ---------------------
 
 /** The four fields every reader of this table projects. */
-export const SCHEDULE_SELECT = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval'];
+export const SCHEDULE_SELECT = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval', 'changedAt'];
 
 /**
  * Every row this node stores, in primary-key order, for the keeper's load. A chunked keyset walk

@@ -270,3 +270,85 @@ test('flow counts additions, triggers, reschedules and removals per minute; a qu
 	const flow = keeper.state(T0 + 3 * MINUTE).flow;
 	assert.equal(flow.find((f) => f.minute === T0 + 2 * MINUTE).cameDue, 1);
 });
+
+// ---- a change the probe found ---------------------------------------------------------------------
+
+const putChanged = (keeper, key, dueAt, changedAt = dueAt) =>
+	keeper.apply(key, { nextRenderTime: dueAt, fromSitemap: true, changedAt });
+
+test('a CHANGED row starts ahead: filed now, it outranks routine rows that are already overdue', () => {
+	// The probe files a changed page at the current minute, so its lateness is zero. Without the head
+	// start it would enter BEHIND every overdue row while its page — hard-expired, known wrong — is
+	// served from the origin for as long as it waits.
+	const { keeper } = keeperAt();
+	put(keeper, url('/pdp/routine-late'), T0 - 12 * HOUR); // a quarter of its cadence late
+	putChanged(keeper, url('/pdp/changed'), T0);
+	const withHeadStart = keeper.topK(10, { nowMs: T0, changedHeadStart: 1 }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(withHeadStart, [url('/pdp/changed'), url('/pdp/routine-late')]);
+	const without = keeper.topK(10, { nowMs: T0, changedHeadStart: 0 }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(without, [url('/pdp/routine-late'), url('/pdp/changed')], 'head start 0: ranked like any other row');
+});
+
+test('the head start is BOUNDED: a routine row more than changedHeadStart cadences late wins', () => {
+	const { keeper } = keeperAt();
+	putChanged(keeper, url('/pdp/changed'), T0);
+	put(keeper, url('/pdp/very-late'), T0 - 3 * 48 * HOUR, false); // three cadences late, discovered
+	const order = keeper.topK(10, { nowMs: T0, changedHeadStart: 1 }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(
+		order,
+		[url('/pdp/very-late'), url('/pdp/changed')],
+		'a change wave cannot starve rotation indefinitely'
+	);
+});
+
+test('the order with changed rows is still exactly scoreOf at minute resolution', () => {
+	const { keeper } = keeperAt();
+	const rows = [];
+	for (let i = 0; i < 60; i++) {
+		const path = ['/home', '/pdp', '/cat'][i % 3];
+		const dueAt = T0 - (i % 17) * 37 * MINUTE;
+		const changed = i % 4 === 0;
+		const fromSitemap = i % 5 !== 0;
+		const key = url(`${path}/${i}`);
+		keeper.apply(key, { nextRenderTime: dueAt, fromSitemap, changedAt: changed ? dueAt : null });
+		rows.push({ key, dueAt, changed, fromSitemap, cadenceMs: classify(key).cadenceMs });
+	}
+	const opts = { nowMs: T0, sitemapBoost: 2, changedHeadStart: 1 };
+	const expected = rows
+		.map((r) => ({
+			key: r.key,
+			score: scoreOf(
+				{ dueAt: r.dueAt, fromSitemap: r.fromSitemap, changed: r.changed },
+				{ nowMs: T0, intervalMs: r.cadenceMs, sitemapBoost: 2, changedHeadStart: 1 }
+			),
+		}))
+		.sort((a, b) => b.score - a.score)
+		.map((r) => r.score);
+	const got = keeper.topK(100, opts).rows.map((r) => r.score);
+	assert.deepEqual(got, expected);
+});
+
+test('the changed flag is part of what is held: describe, heldValue and a clearing rewrite', () => {
+	const { keeper } = keeperAt();
+	putChanged(keeper, url('/pdp/a'), T0);
+	assert.equal(keeper.describe(url('/pdp/a')).changed, true);
+	const held = keeper.heldValue(url('/pdp/a'));
+	assert.ok(held.changedAt > 0, 'a reclassify re-applies the flag');
+	// The render's reschedule `put`s the row without `changedAt`: routine again.
+	put(keeper, url('/pdp/a'), T0 + 48 * HOUR);
+	assert.equal(keeper.describe(url('/pdp/a')).changed, false);
+	// A BigInt, as a Long can surface, is read as a mark.
+	keeper.apply(url('/pdp/b'), { nextRenderTime: T0, fromSitemap: true, changedAt: BigInt(T0) });
+	assert.equal(keeper.describe(url('/pdp/b')).changed, true);
+});
+
+test('state counts due changed rows and flags their classes', () => {
+	const { keeper } = keeperAt();
+	putChanged(keeper, url('/pdp/a'), T0 - MINUTE);
+	putChanged(keeper, url('/pdp/b'), T0 + HOUR); // not yet due
+	put(keeper, url('/pdp/c'), T0 - MINUTE);
+	const s = keeper.state(T0);
+	assert.equal(s.due, 2);
+	assert.equal(s.dueChanged, 1);
+	assert.ok(s.classes.some((c) => c.changed === true && c.due === 1));
+});

@@ -1024,8 +1024,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'normally. A declared signal outranks the origin-pushback classification, so do not declare ' +
 					'one for 429/503 unless that status really is a state on this endpoint rather than an ' +
 					'overloaded origin. CAUTION: if the endpoint starts answering the signaled status for ' +
-					'EVERYTHING, every matched URL flips to the same signature at once — bounded by ' +
-					'`maxTriggersPerSweep`, and the canary treats it as the mass change it looks like.\n' +
+					'EVERYTHING, every matched URL flips to the same signature at once and is acted on, and the ' +
+					'canary treats it as the mass change it looks like.\n' +
 					'\n\nPAGE CHECK (`pageCheck`). The comparison above asks "did the origin change since I last ' +
 					'looked", which is structurally blind to a value that changes and changes BACK between two ' +
 					'passes — and if a render landed inside that window, the cached page keeps the transient value ' +
@@ -1313,58 +1313,27 @@ export const configSchema = group('Prerender plugin configuration.', {
 				{ min: 10 }
 			),
 			trigger: group(
-				'How detected changes are turned into re-renders. Submitted to a bounded queue that drains ' +
-					'BESIDE the walk rather than inside it, so a pass runs at its probe-rate floor whatever the ' +
-					'change rate.\n\n' +
-					'WHY THAT MATTERS. Triggering is six database operations, and when it ran in-line in the row ' +
-					'handler it shared the pass\u2019s concurrency with probing \u2014 so trigger volume set PASS ' +
-					'DURATION, and pass duration is detection latency, because the gap between two probes of one ' +
-					'URL is one pass. That closes a loop: more change \u2192 more triggers \u2192 longer pass ' +
-					'\u2192 a longer window in which each URL can change \u2192 more change. Measured on one ' +
-					'deployment, arming the probe took a pass from 9.2h to a projected ~21h with bot traffic flat ' +
-					'across both windows, and every knob traded deferrals against latency instead of escaping the ' +
-					'loop. Submitting makes pass duration max(probe time, drain time) rather than the sum, and ' +
-					'makes the meaningful limit triggers per SECOND \u2014 what the render fleet experiences.\n\n' +
-					'A full queue is reported as `deferred`, exactly like exhausting `maxTriggersPerSweep`: the ' +
-					'signature is left stale and the next pass re-detects. Nothing is lost by dropping the queue, ' +
-					'which is why it is in memory and why an aborted pass simply abandons it.',
+				'What a detected change does, and how many at once. A change is ACTED ON WHEN IT IS FOUND: the ' +
+					'cached pages are hard-expired (the probe knows they are wrong, so one more serve is a served ' +
+					'mismatch) and the render is filed at the current minute, marked on the schedule row ' +
+					'(`changedAt`) so the render queue ranks it `queue.ready.changedHeadStart` cadences ahead of ' +
+					'routine rotation. Nothing detected is deferred and there is no per-pass budget: the render ' +
+					'queue orders the work, and the render fleet\u2019s capacity bounds how fast changed pages ' +
+					're-render, not how fast a known-wrong page stops being served (util/changeActions.js).\n\n' +
+					'Actions run BESIDE the walk rather than inside it, so the pass runs at its probe rate ' +
+					'whatever the change rate: awaiting them in the row handler once took a pass from 9.2h to a ' +
+					'projected ~21h, and pass duration is detection latency. The new baseline is written only ' +
+					'after its action succeeds, so a failure or a restart leaves the change detectable.',
 				{
-					ratePerSecond: option(
-						5,
-						'Triggers started per second. This is the rate the RENDER QUEUE sees, not the origin: a ' +
-							'trigger writes, it does not fetch. Size it against SPARE RENDER CAPACITY and the claim ' +
-							'floor \u2014 not against the origin ceiling that `changeProbe.ratePerSecond` respects, ' +
-							'and not against how fast the queue could go.\n\n' +
-							'HOW TO SIZE IT. Aim for a drain that finishes INSIDE the pass: past that, the queue ' +
-							'backs up and changes defer for want of queue rather than of budget. Take ' +
-							'`maxTriggersPerSweep` over the pass length you expect \u2014 90,000 triggers across a ' +
-							'9h pass is ~2.8/s, so the default leaves headroom without being able to outrun a ' +
-							'fleet.\n\n' +
-							'GOING MUCH HIGHER IS THE ONE WAY THIS CHANGE CAN HURT, because it is something the ' +
-							'old in-line path could never do: at 20/s a 90,000-trigger budget drains in ~1.25h, ' +
-							'which on a four-node cluster injects renders several times faster than the fleet can ' +
-							'claim them \u2014 deepening the ready set and starving its lowest-priority class. ' +
-							'Raise it only against a measured render rate that sits below the fleet ceiling. ' +
-							'0 or less drains unpaced.',
-						{ min: 0 }
-					),
-					concurrency: option(4, 'Triggers in flight at once.', { min: 1 }),
-					maxPending: option(
-						5000,
-						'Queue depth before submissions are refused and counted as `deferred`. Bounds memory ' +
-							'across a pass that can detect hundreds of thousands of changes; it is NOT the ' +
-							'per-pass budget, which stays `maxTriggersPerSweep`.',
+					concurrency: option(
+						8,
+						'Actions in flight at once. When every slot is busy the pass waits for one (backpressure) ' +
+							'rather than refusing the change, so this bounds the database load a change wave puts on ' +
+							'the node — each action is a read and a patch per device page plus the schedule and ' +
+							'baseline writes — never how much of the wave is acted on.',
 						{ min: 1 }
 					),
 				}
-			),
-			maxTriggersPerSweep: option(
-				5000,
-				'Ceiling on re-renders one sweep pass may file (per node). Changes past it stay detected but ' +
-					'DEFERRED — the signature is left stale so the next pass retries — bounding how much queue ' +
-					'injection a widespread change can cause. A genuinely mass change is the canary’s job, where ' +
-					'one invalidation row replaces thousands of due-now writes.',
-				{ min: 1 }
 			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
@@ -2448,6 +2417,17 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'sitemap pages held ~1.2 cadences late, a discovered page is served within ~2.4 cadences ' +
 						'of its own interval at the default.',
 					{ min: 1 }
+				),
+				changedHeadStart: option(
+					1,
+					'How far ahead a page the change probe found changed starts, in cadences: its row ranks as if ' +
+						'it were already this many of its own intervals late. The probe hard-expires such a page and ' +
+						'files its render at the current minute, so without a head start it would enter at lateness ' +
+						'zero, behind every overdue row, while bots are served the origin for as long as it waits.\n\n' +
+						'ADDITIVE, and bounded: a routine row still wins once it is more than `changedHeadStart` ' +
+						'cadences later than the changed rows being held, so a large change wave takes the fleet for ' +
+						'a while, never indefinitely. `0` ranks changed pages like any other due row.',
+					{ min: 0 }
 				),
 			}
 		),

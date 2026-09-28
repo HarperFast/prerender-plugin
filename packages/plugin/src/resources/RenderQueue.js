@@ -1241,11 +1241,21 @@ export class RenderQueue extends Resource {
 		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
 		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		const nextRenderTime = currentMinuteMs() + wait;
+		// A CHANGED PAGE STAYS CHANGED THROUGH A FAILED RENDER. The probe hard-expired it and marked the
+		// row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
+		// that is still being served from the origin. A local point read: results land on the owner,
+		// and elsewhere it reads nothing and the mark is simply not carried.
+		const { changedAt } = (await getScheduleRow(sourceUrl, ['changedAt'])) ?? {};
 		logger.debug(
 			`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
 		);
-		await writeSchedule(sourceUrl, { nextRenderTime, fromSitemap, effectiveInterval: cadence });
+		await writeSchedule(sourceUrl, {
+			nextRenderTime,
+			fromSitemap,
+			effectiveInterval: cadence,
+			changedAt: changedAt === null || changedAt === undefined ? undefined : Number(changedAt),
+		});
 		return 'slow';
 	}
 

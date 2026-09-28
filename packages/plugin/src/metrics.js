@@ -515,7 +515,8 @@ export const METRICS = Object.freeze({
 			'is off by default, so no rows means disabled. ' +
 			'probe_* = the change probe, per finished pass (sweep and canary alike): probed = attempts, of which ' +
 			'seeded (first observation stored) + changed + failed, the remainder unchanged; triggered = changes ' +
-			'that filed a re-render, deferred = changes past maxTriggersPerSweep (retried next pass); ' +
+			'acted on (page hard-expired, render filed ahead of rotation) — every change is, so triggered falls ' +
+			'short of changed only by caught-up and ignored changes, dry run, and actions that failed; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -602,7 +603,6 @@ export const METRICS = Object.freeze({
 					'probe_rebaselined',
 					'probe_changed',
 					'probe_triggered',
-					'probe_deferred',
 					'probe_failed',
 					'probe_canary_trip',
 					'probe_invalidated',
@@ -611,7 +611,6 @@ export const METRICS = Object.freeze({
 					'probe_unreadable',
 					'probe_page_mismatch',
 					'probe_cycle_behind',
-					'probe_trigger_queue_depth',
 					'discovery_gated',
 					'entity_gate',
 				],

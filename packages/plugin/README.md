@@ -1216,14 +1216,20 @@ A **rule** (`changeProbe.rules`) says what to watch for the URLs its `pathPatter
 The extracted values are reduced to a **signature** stored in the node-local `ProbeState` table
 (`replicate: false` — the sweep is owner-scoped, so a URL's baseline is only ever read and written
 by its owner node, and replicating it would ship every baseline to nodes that never consult it; a
-lost baseline just re-seeds). A probe that observes a different signature expires the URL's cached
-pages and files every device row due now, through the same funnel every other schedule write uses. Two cadences cover the two ways
-content actually changes:
+lost baseline just re-seeds). A probe that observes a different signature **acts on it when it finds
+it** (since v0.94.0): the URL's cached pages are hard-expired and its render is filed at the current
+minute, marked on the schedule row (`changedAt`) so the render queue ranks it
+`queue.ready.changedHeadStart` cadences ahead of routine rotation (a page known wrong is being served
+from the origin until it re-renders). Nothing detected is deferred and there is no per-pass budget —
+the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
+(the pass waits for a free slot rather than dropping a change), and the new baseline is written only
+after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
+cuts an anchored pass short resumes it on boot, skipping the rows it had already probed. Two cadences
+cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
   `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price
-  moves. Re-renders per pass are capped (`maxTriggersPerSweep`); changes past the cap stay detected
-  and retry next pass. It runs in one of two modes (`mode`):
+  moves. It runs in one of two modes (`mode`):
   - **`interval`** (default) fires a discrete pass every `sweepInterval`. This asks you to solve
     `sliceSize / effectiveRate <= sweepInterval` by hand and re-solve it whenever the corpus grows
     or the origin has a bad week — and when the answer stops holding, the overrunning pass is

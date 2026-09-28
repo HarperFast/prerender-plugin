@@ -71,6 +71,20 @@
  * lateness grows without bound while the boost stays constant. A discovered row wins as soon as its
  * ratio passes `sitemapBoost x` the highest sitemap ratio in the set — so if sitemap pages are being
  * held at `U` cadences late, a discovered page is served by `sitemapBoost x U` cadences late.
+ *
+ * ── A DETECTED CHANGE STARTS AHEAD ────────────────────────────────────────────────────────────
+ *
+ *     score += changedHeadStart            (a row the change probe filed: `changedAt` on the row)
+ *
+ * The one ADDITIVE term, and it has to be: the probe files a changed page at the current minute, so
+ * its lateness is zero and no multiplier can move it — it would enter behind every overdue row in the
+ * set, while its page, hard-expired because it is known wrong, is served from the origin for as long
+ * as it waits. The head start ranks it as if it were already `changedHeadStart` cadences late.
+ *
+ * Starvation stays bounded, with the same kind of statement as the boost's: a routine row wins as
+ * soon as its score passes the changed rows' — so if changed rows are being held at `U` cadences
+ * late, a routine row is served by `changedHeadStart + U` cadences late (divide by `sitemapBoost` for
+ * a sitemap row). A change wave can take the fleet for a while; it cannot take it indefinitely.
  */
 
 /**
@@ -86,7 +100,10 @@
  * false for every unusable value; a zero or negative one would produce Infinity or a sign flip, so it
  * degrades to raw lateness, which still orders sensibly among rows that share the problem.
  */
-export const scoreOf = ({ dueAt, fromSitemap }, { nowMs, intervalMs, sitemapBoost = 1 }) => {
+export const scoreOf = (
+	{ dueAt, fromSitemap, changed = false },
+	{ nowMs, intervalMs, sitemapBoost = 1, changedHeadStart = 0 }
+) => {
 	// THE DUE TIME IS GUARDED, AND IT IS THE DANGEROUS ONE. `nowMs - null` is `nowMs`, so an absent
 	// due time does not produce a small score or a NaN — it produces a lateness of ~1.8e12, which sorts
 	// straight to the head of the set and hands the next lease to a broken row. The keeper never holds a
@@ -100,5 +117,9 @@ export const scoreOf = ({ dueAt, fromSitemap }, { nowMs, intervalMs, sitemapBoos
 	// comparison rather than by a coercion. Adding a `typeof` check would only change behaviour for a
 	// numeric STRING interval, which works correctly today.
 	const ratio = intervalMs > 0 ? lateness / intervalMs : lateness;
-	return fromSitemap ? ratio * sitemapBoost : ratio;
+	const score = fromSitemap ? ratio * sitemapBoost : ratio;
+	// A change the probe found: the page is known wrong, was hard-expired, and is served from the origin
+	// until this render lands — see "A DETECTED CHANGE STARTS AHEAD" above. A non-positive or non-finite
+	// head start adds nothing, so the policy is off rather than broken.
+	return changed && changedHeadStart > 0 ? score + changedHeadStart : score;
 };

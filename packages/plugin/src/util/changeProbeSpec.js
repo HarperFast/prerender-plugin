@@ -408,8 +408,7 @@ const compileIgnoreChanges = (list, inBounds, extract, label, warn) => {
  * Edit a rule's extract list, move it to another endpoint, add a header that changes which
  * backend answers — and the next probe of every matched URL produces a differently-shaped
  * signature. Without this, that read as 100% of the corpus changing in one pass: every URL a
- * spurious re-render (bounded by maxTriggersPerSweep, so most of them deferred and retried
- * forever), and the canary a certain trip, invalidating the rule's whole scope over a config
+ * spurious expiry and re-render of every page it matched, and the canary a certain trip, invalidating the rule's whole scope over a config
  * edit. The only safe way to change a rule was a full dry-run cycle first. With the fingerprint,
  * a mismatch re-baselines that URL — observation stored, nothing compared, nothing triggered,
  * and it does not count toward the canary's verdict — so a rule edit costs one pass of blindness
