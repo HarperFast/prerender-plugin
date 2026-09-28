@@ -75,7 +75,12 @@
  * console shares its upstreams' workers with bot traffic, and a dashboard that can slow a node
  * down owes the operator the number. Crawl breadth is the one extra query (its own capped scan
  * of the sketch table); the sketches replicate, so it is read from one node and loads only on
- * an explicit click.
+ * an explicit click — one read fills both the Crawl breadth panel and the miss panel's distinct-URL
+ * columns.
+ *
+ * WHY A MISS HAPPENED is its own panel (plugin v0.95.0 `bot_miss`): one cause per origin-served miss,
+ * grouped into nothing to render, held out by a rule, and waiting on a render — and only the last is a
+ * question for render capacity.
  *
  * SCOPE HONESTY. Analytics rows are node-local, so a cluster total is a SUM the proxy computes
  * from every node's window (util/aggregate.js) — and a sum missing a node is a wrong number,
@@ -169,6 +174,7 @@ export function render(ctx) {
 		el('div', { cls: 'cols' }, [freshness(data, scope), staleness(ctx, data, scope)]),
 		instances(data, filter),
 		notFreshHit(data, scope),
+		whyMissed(ctx, data, scope),
 		// The two origin-side panels together: what the origin was asked, then what each ask cost.
 		el('div', { cls: 'cols' }, [originSeen(data, scope), originFetch(data, filter)]),
 		el('div', { cls: 'cols' }, [latency(data, filter), statusCodes(data, filter)]),
@@ -1051,6 +1057,375 @@ function notFreshHit(data, { serves, filter }) {
 	});
 }
 
+// ---- why a request missed -----------------------------------------------------------
+//
+// `bot_miss` (plugin v0.95.0) gives every request bot_serve counts as origin|miss exactly ONE cause. The
+// panel above says how many serves were misses; this one says why, grouped the only way that decides who
+// acts: nothing to render (the origin said so), held out by a rule this deployment chose, or a page the
+// rotation owns and has not rendered yet. Only that last family is render capacity or render order — the
+// others are an answer from the origin or a setting, and no amount of fleet changes them.
+//
+// A COUNT DOES NOT SIZE COVERAGE. A render serves the requests that come AFTER it, so what says whether a
+// class of misses is worth covering is how many times each missed URL is asked for, and whether the same
+// URLs come back day after day. Both come from the per-cause distinct-URL sketch behind crawl-breadth,
+// which loads on the same click as the Crawl breadth panel below.
+
+/**
+ * The three families an operator acts on, plus the fault the plugin counts apart. Each verdict says whose
+ * move it is; only `waiting` is render capacity.
+ */
+export const MISS_FAMILIES = [
+	{
+		key: 'origin',
+		label: 'Nothing to render',
+		verdict: 'the origin’s answer · not capacity',
+		means: 'The origin answered 404/410, a redirect, another 4xx or a 5xx: there is no page a render could store.',
+	},
+	{
+		key: 'rule',
+		label: 'Held out by a rule',
+		verdict: 'a rule you chose · not capacity',
+		means: 'A setting this deployment chose keeps these out of the cache: revisit the rule, not the fleet.',
+	},
+	{
+		key: 'waiting',
+		label: 'Waiting on a render',
+		verdict: 'the only family capacity moves',
+		means:
+			'Pages the rotation owns and has not rendered yet: the only family render capacity or render order can move.',
+	},
+	{
+		key: 'error',
+		label: 'Target read failed',
+		verdict: 'expect zero',
+		means: 'The Target read or the mint threw; the plugin log has the error.',
+	},
+];
+
+/**
+ * Every cause the plugin can report (metrics.js `MISS_CAUSES`), with its family and what it means. A test
+ * pins this against the plugin's catalog in both directions, so a new cause cannot ship unlabelled; one
+ * this console has never heard of still gets its own "other" tile rather than joining someone else's fix.
+ */
+export const MISS_CAUSES = {
+	'not-found': ['origin', 'the origin answered 404 or 410 — there is no page to render'],
+	'redirect': ['origin', 'the origin answered 3xx'],
+	'client-error': ['origin', 'any other 4xx from the origin'],
+	'origin-error': ['origin', 'a 5xx from the origin, or the fetch failed'],
+	'passthrough': ['rule', 'the route is not prerendered here, by configuration'],
+	'uncacheable': ['rule', 'a 2xx that is not a prerender candidate (non-200, or its headers said not to cache)'],
+	'gated-route': ['rule', 'a route that adds no targets from traffic (discoverTargets: false)'],
+	'gated-bot': ['rule', 'a bot not allowed to add targets (ingress.discoveryBots)'],
+	'gated-entity': ['rule', 'no target, and its entity already has one in rotation (ingress.entityGate)'],
+	'suppressed': ['rule', 'a target the render verdict suppressed (noindex, canonical elsewhere, error)'],
+	'new': ['waiting', 'no target yet: this request minted one, its first render jittered across the interval'],
+	'unrendered': ['waiting', 'a target in rotation with no page for this device yet'],
+	'device': ['waiting', 'a target in rotation, but this device is not one it renders by default (deviceTypes.default)'],
+	'error': ['error', 'the Target read or the mint failed'],
+};
+
+const FAMILY_PILL = { origin: '', rule: 'info', waiting: 'warn', error: 'bad' };
+
+/**
+ * `waiting` as a share of ALL bot requests, `[watch, bad]`: past a tenth of crawler traffic being served
+ * from the origin for pages the rotation already owns, capacity or order is worth a look; past a quarter
+ * the fleet is not keeping up with what it has taken on. The other two families carry no threshold — they
+ * are not a fleet verdict at any size.
+ */
+const WAITING_SHARE = [0.1, 0.25];
+
+/** Fold `bot_miss` combos (path = cause, method = route, type = bot) into one row per cause. */
+export function missRows(misses) {
+	const byCause = new Map();
+	for (const s of misses) {
+		const cause = s.path ?? 'unknown';
+		let row = byCause.get(cause);
+		if (!row) {
+			const [family, means] = MISS_CAUSES[cause] ?? ['other', 'a cause this console does not know about'];
+			byCause.set(cause, (row = { cause, family, means, count: 0, routes: new Map() }));
+		}
+		row.count += s.count;
+		const label = s.method ?? 'unrouted';
+		let route = row.routes.get(label);
+		if (!route) row.routes.set(label, (route = { route: label, count: 0, bots: new Map() }));
+		route.count += s.count;
+		const bot = s.type ?? 'other';
+		route.bots.set(bot, (route.bots.get(bot) ?? 0) + s.count);
+	}
+	return [...byCause.values()].sort((a, b) => b.count - a.count);
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Distinct URLs, requests per URL and recurrence per cause, from a crawl-breadth answer (plugin v0.95.0
+ * `breadth[].misses` and `missUnion`) joined to the analytics window. Null when the answer predates them.
+ *
+ * REQUESTS PER URL NEEDS THE SAME DAYS ON BOTH SIDES. The sketch is per UTC day; the analytics window is
+ * the view's range. So it is computed over the UTC days the window holds from their first minute — every
+ * earlier whole day, and the day the window ends in, whose sketch like the window runs to now — with each
+ * day's `bot_miss` count taken from the buckets that overlap it (a bucket straddling midnight is split in
+ * proportion). A range that starts after today's 00:00 UTC holds no such day, and the figure is left out
+ * rather than divided across mismatched spans.
+ *
+ * IT IS ALL BOTS, whatever the filter says: the sketch has no bot dimension.
+ *
+ * AND IT READS LOW on Harper 5.2.x: the numerator is an analytics count, and that release's analytics
+ * aggregation keeps only part of each period, while the sketch sees every URL. Hence ≈ on its face.
+ *
+ * Recurrence needs no analytics: the days' distinct URLs summed, over the distinct URLs across all of them
+ * (`missUnion`). 1.0 is every day's misses being new URLs; higher is the same URLs coming back, which is
+ * what a render would serve. Only for a cause seen on two or more days — on one it is 1 by construction.
+ */
+export function missBreadth(breadth, data) {
+	if (!breadth || !Array.isArray(breadth.missUnion) || !Array.isArray(breadth.breadth)) return null;
+	const days = breadth.breadth;
+	const from = data.coveredFromMs ?? data.startMs;
+	const to = data.coveredToMs ?? data.endMs;
+	const startOf = (day) => Date.parse(`${day}T00:00:00Z`);
+	const matched = days.filter((d) => {
+		const start = startOf(d.day);
+		return Number.isFinite(start) && start >= from && start < to;
+	});
+
+	const all = pick(data, 'bot_miss');
+	const countIn = (cause, fromMs, toMs) => {
+		let n = 0;
+		for (const s of all) {
+			if (s.path !== cause) continue;
+			for (let i = 0; i < s.counts.length; i++) {
+				const b0 = data.startMs + i * data.bucketMs;
+				const overlap = Math.min(b0 + data.bucketMs, toMs) - Math.max(b0, fromMs);
+				if (overlap > 0) n += (s.counts[i] * overlap) / data.bucketMs;
+			}
+		}
+		return n;
+	};
+	const entryOn = (d, cause) => d.misses?.find((m) => m.cause === cause) ?? null;
+	const distinctOn = (d, cause) => entryOn(d, cause)?.distinctUrls ?? 0;
+	const union = new Map(breadth.missUnion.map((u) => [u.cause, u]));
+
+	const byCause = new Map();
+	for (const cause of new Set([...union.keys(), ...all.map((s) => s.path)])) {
+		// No sketch row for the cause on any matched day is NOT zero URLs when requests missed for it: the
+		// sketch did not see them (a flush not yet landed, a truncated scan). Unknown, not 0.
+		const sketched = matched.some((d) => entryOn(d, cause));
+		const distinct = matched.reduce((acc, d) => acc + distinctOn(d, cause), 0);
+		const requests = matched.reduce((acc, d) => acc + countIn(cause, startOf(d.day), startOf(d.day) + DAY_MS), 0);
+		const u = union.get(cause);
+		const daySum = days.reduce((acc, d) => acc + distinctOn(d, cause), 0);
+		byCause.set(cause, {
+			distinct: sketched ? distinct : null,
+			reqPerUrl: sketched && distinct > 0 ? requests / distinct : null,
+			recurrence: u && u.days >= 2 && u.distinctUrls > 0 ? daySum / u.distinctUrls : null,
+			daysSeen: u?.days ?? 0,
+		});
+	}
+	return { byCause, matched: matched.map((d) => d.day), days: days.length, truncated: !!breadth.truncated };
+}
+
+/** The top bots in a split, as shares: "googlebot 62% · bingbot 30% · +2". */
+const botMix = (bots, total, top = 3) => {
+	const ranked = [...bots.entries()].sort((a, b) => b[1] - a[1]);
+	const shown = ranked.slice(0, top).map(([bot, n]) => `${bot} ${pct(n, total)}`);
+	return shown.join(' · ') + (ranked.length > top ? ` · +${ranked.length - top}` : '');
+};
+
+function whyMissed(ctx, data, { serves, filter }) {
+	const every = pick(data, 'bot_miss');
+	// A plugin before v0.95.0 emits no cause at all. Hidden, never a breakdown of zeros.
+	if (!every.length) return null;
+
+	const misses = every.filter((s) => keepBot(filter, s.type));
+	const total = sumCount(serves);
+	const missed = sumCount(misses);
+	const rows = missRows(misses);
+	// What bot_miss should add up to: every origin|miss serve, less the few whose detached Target read had not
+	// landed when the window closed. Far short of it is a node whose plugin reports no cause (a mixed rollout).
+	const originMisses = sumCount(serves.filter((s) => s.path === CACHE_SOURCE_ORIGIN && s.method === MISS));
+
+	const state = ctx.data.breadth;
+	const loaded = state && !state.loading && !state.error;
+	const reach = loaded ? missBreadth(state, data) : null;
+
+	const byFamily = new Map();
+	for (const row of rows) byFamily.set(row.family, (byFamily.get(row.family) ?? 0) + row.count);
+	const families = [
+		...MISS_FAMILIES,
+		...(byFamily.has('other')
+			? [{ key: 'other', label: 'Other', verdict: 'a cause this console has no entry for', means: '' }]
+			: []),
+	].filter((family) => byFamily.has(family.key));
+
+	const tiles = families.map((family) => {
+		const n = byFamily.get(family.key);
+		const share = total > 0 ? n / total : 0;
+		const verdict =
+			family.key === 'waiting'
+				? share >= WAITING_SHARE[1]
+					? 'bad'
+					: share >= WAITING_SHARE[0]
+						? 'warn'
+						: 'ok'
+				: family.key === 'error'
+					? share >= 0.01
+						? 'bad'
+						: 'warn'
+					: 'ok';
+		return stat(family.label, pct(n, total), family.verdict, {
+			warn: verdict === 'warn',
+			bad: verdict === 'bad',
+			title: `${num(n)} requests: ${pct(n, total)} of bot requests, ${pct(n, missed)} of misses. ${family.means}`,
+		});
+	});
+
+	const star = filter ? ' *' : '';
+	const breadthCols = !!reach;
+	const causeRows = rows.map((row) => {
+		const b = reach?.byCause.get(row.cause);
+		return el('tr', { title: row.means }, [
+			el('td', { cls: 'nowrap' }, [
+				pill(row.cause, FAMILY_PILL[row.family] ?? ''),
+				el('span', { cls: 'muted cell-hint', text: row.means }),
+			]),
+			el('td', null, [muted(row.family)]),
+			el('td', { cls: 'right mono', text: num(row.count) }),
+			el('td', { cls: 'right mono', text: pct(row.count, total) }),
+			el('td', { cls: 'right mono', text: pct(row.count, missed) }),
+			breadthCols && el('td', { cls: 'right mono', text: b?.distinct === null || !b ? '—' : fmtCount(b.distinct) }),
+			breadthCols &&
+				el('td', {
+					cls: 'right mono',
+					text: b?.reqPerUrl === null || !b ? '—' : `≈${fmtRatio(b.reqPerUrl)}`,
+					title:
+						'Requests per distinct URL that missed for this cause — what a render of those URLs would serve. Reads ' +
+						'low on Harper 5.2.x, whose analytics record only part of each period: below 1.0 is that, not a real value.',
+				}),
+			breadthCols &&
+				el('td', {
+					cls: 'right mono',
+					text: b?.recurrence === null || !b ? '—' : fmtRatio(b.recurrence),
+					title: !b
+						? null
+						: b.recurrence !== null
+							? 'The days’ distinct URLs over the distinct URLs across all of them: 1.0 = new URLs every day.'
+							: b.daysSeen === 1
+								? 'Seen on one day only — nothing to recur.'
+								: 'Not seen in the loaded days.',
+				}),
+		]);
+	});
+
+	// THE SPLIT, for the causes that carry most of the misses: which routes they land on, and which bots
+	// ask for them there. The cause repeats on every row (muted after the first), so a row reads on its own.
+	const TOP_CAUSES = 4;
+	const TOP_ROUTES = 3;
+	const splitRows = rows.slice(0, TOP_CAUSES).flatMap((row) =>
+		[...row.routes.values()]
+			.sort((a, b) => b.count - a.count)
+			.slice(0, TOP_ROUTES)
+			.map((route, i) =>
+				el('tr', null, [
+					el('td', { cls: 'nowrap' }, [i === 0 ? pill(row.cause, FAMILY_PILL[row.family] ?? '') : muted(row.cause)]),
+					el('td', { cls: 'mono', text: route.route }),
+					el('td', { cls: 'right mono', text: num(route.count) }),
+					el('td', { cls: 'right mono', text: pct(route.count, row.count) }),
+					el('td', { cls: 'mono', text: botMix(route.bots, route.count) }),
+				])
+			)
+	);
+
+	// Which days each breadth column covers, said once above the table rather than in every header.
+	const endMs = data.coveredToMs ?? data.endMs;
+	const lastDay = Number.isFinite(endMs) ? new Date(endMs).toISOString().slice(0, 10) : null;
+	const basis =
+		reach &&
+		(reach.matched.length
+			? `URLs and req/URL: ${reach.matched.join(', ')} (UTC${reach.matched.includes(lastDay) ? ', to now' : ''}) · ` +
+				`recurrence: ${reach.days} days · all bots`
+			: `recurrence: ${reach.days} days · all bots`);
+
+	return card(`Why requests missed — ${scopeLabel(data)}`, {
+		head: [
+			filter && muted(`${[...filter].join(', ')} only`),
+			spacer(),
+			pill(`${pct(missed, total)} of serves`, ''),
+			!state &&
+				el('button', {
+					cls: 'small',
+					text: 'Load URL breadth',
+					title: `Distinct URLs per cause, from the crawl sketch (${BREADTH_DAYS} days) — its own capped scan, so on demand.`,
+					onclick: () => loadBreadth(ctx),
+				}),
+			state?.loading && muted('merging sketches…'),
+		],
+		help: [
+			'One cause per request that missed the cache and was served from the origin (bot_miss). Nothing to render: ',
+			'the origin answered 404/410, a redirect, another 4xx or a 5xx — no render changes that. Held out by a rule: ',
+			'passthrough and uncacheable routes, the route, bot and entity discovery gates, and suppression — a setting ',
+			'this deployment chose; revisit the rule, not the fleet. Waiting on a render: new, unrendered and device — pages ',
+			'the rotation owns and has not rendered yet, the ONLY family render capacity or render order can move (watch ',
+			`past ${pct(WAITING_SHARE[0], 1)} of bot requests, bad past ${pct(WAITING_SHARE[1], 1)}). "error" is the Target `,
+			'read or mint failing. The per-cause breadth comes from crawl-breadth: req/URL is how many times each missed ',
+			'URL was asked for over the same UTC days — what a render of it would have served — and recurrence is the ',
+			'days’ distinct URLs over the distinct URLs across all of them: 1.0 means each day’s misses are new URLs, ',
+			'higher means the same URLs come back. A class of one-off URLs is not worth covering at any capacity. ',
+			'req/URL is ≈ and reads LOW on Harper 5.2.x: its requests are analytics counts, which that release records ',
+			'only part of, while the sketch sees every URL.',
+			filter ? ' * The sketch has no bot dimension: those columns are all bots.' : '',
+		],
+		cls: 'flush-table',
+		body: [
+			originMisses > 0 &&
+				missed < 0.9 * originMisses &&
+				el('div', {
+					cls: 'note warn',
+					text:
+						`Causes cover ${pct(missed, originMisses)} of ${num(originMisses)} origin misses — a node on a plugin ` +
+						'before v0.95.0 reports none, so these shares are short.',
+				}),
+			!misses.length
+				? el('div', { cls: 'empty', text: `No misses from ${[...(filter ?? [])].join(', ')} in this window.` })
+				: [
+						el('div', { cls: 'stat-grid tight' }, tiles),
+						basis && el('div', { cls: 'panel-sub', text: basis }),
+						table(
+							[
+								'cause',
+								'family',
+								{ text: 'requests', right: true },
+								{ text: 'of bot requests', right: true },
+								{ text: 'of misses', right: true },
+								breadthCols && { text: `URLs${star}`, right: true },
+								breadthCols && { text: `req/URL ≈${star}`, right: true },
+								breadthCols && { text: `recurrence${star}`, right: true },
+							].filter(Boolean),
+							causeRows
+						),
+						el('div', { cls: 'panel-sub', text: 'top causes by route, and the bots asking' }),
+						table(
+							['cause', 'route', { text: 'requests', right: true }, { text: 'of cause', right: true }, 'bots'],
+							splitRows
+						),
+					],
+			state?.error && el('div', { cls: 'hint', text: `URL breadth did not load: ${state.error}` }),
+			loaded &&
+				!reach &&
+				el('div', {
+					cls: 'hint',
+					text: 'Distinct URLs per cause need plugin v0.95.0 on the node that answered crawl-breadth.',
+				}),
+			reach &&
+				!reach.matched.length &&
+				el('div', {
+					cls: 'hint',
+					text: 'req/URL needs a range that reaches back to 00:00 UTC, where today’s sketch begins — pick 24h.',
+				}),
+			reach?.truncated && el('div', { cls: 'hint', text: 'Sketch scan truncated — distinct URLs undercount.' }),
+		],
+	});
+}
+
 /** Server-side latency by Harper's own cache verdict — an independent read on the hit rate. */
 function latency(data, filter) {
 	const hits = pick(data, 'duration', (s) => s.type === 'cache-hit');
@@ -1743,26 +2118,34 @@ function rawCache(ctx, data, filter) {
 	});
 }
 
+/** Days of crawl sketch one breadth read covers — the Crawl breadth panel's trend and the miss recurrence. */
+const BREADTH_DAYS = 7;
+
+/**
+ * ONE crawl-breadth read for both panels that use it (Crawl breadth, and the miss panel's distinct URLs):
+ * it is its own capped scan of the sketch table, so it loads on an explicit click, and either panel's
+ * button fills both.
+ */
+const loadBreadth = async (ctx) => {
+	ctx.data.breadth = { loading: true };
+	ctx.render();
+	const res = await ctx.get('crawl-breadth', { days: BREADTH_DAYS });
+	ctx.data.breadth = res.ok ? res.body : { error: res.body?.error ?? `Failed (${res.status})` };
+	ctx.render();
+};
+
 /** Distinct URLs per bot per day — how much of the corpus crawlers actually walk. */
 function breadth(ctx, filter) {
 	const state = ctx.data.breadth;
-
-	const loadBreadth = async () => {
-		ctx.data.breadth = { loading: true };
-		ctx.render();
-		const res = await ctx.get('crawl-breadth', { days: 7 });
-		ctx.data.breadth = res.ok ? res.body : { error: res.body?.error ?? `Failed (${res.status})` };
-		ctx.render();
-	};
 
 	const body = [];
 	if (!state) {
 		body.push(
 			el('button', {
 				cls: 'small',
-				text: 'Load 7-day breadth',
+				text: `Load ${BREADTH_DAYS}-day breadth`,
 				title: 'Its own capped scan of the sketch table, so it loads on demand.',
-				onclick: loadBreadth,
+				onclick: () => loadBreadth(ctx),
 			})
 		);
 	} else if (state.loading) {
@@ -1825,7 +2208,10 @@ function breadth(ctx, filter) {
 	return card('Crawl breadth', {
 		head: [
 			spacer(),
-			state && !state.loading && !state.error && el('button', { cls: 'small', text: 'Reload', onclick: loadBreadth }),
+			state &&
+				!state.loading &&
+				!state.error &&
+				el('button', { cls: 'small', text: 'Reload', onclick: () => loadBreadth(ctx) }),
 		],
 		help:
 			'Distinct URLs each bot touched per day, from the crawl sketch (±2% at any scale). The day total is the union ' +
