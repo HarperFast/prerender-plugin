@@ -1436,6 +1436,21 @@ test('RESTART RESILIENCE: an anchored sweep a restart cut short is resumed on bo
 	t.mock.timers.reset();
 });
 
+test('RESTART RESILIENCE: booting the scheduler in anchored mode ARMS the resume — no call needed', async (t) => {
+	// Seed the dead claim BEFORE the scheduler starts, exactly as a restarted process finds it.
+	const startedAt = Date.now() - 2 * HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
+	});
+	await armAnchoredScheduler(t); // startDelay 0, startJitter 1: the check is due on the next tick
+	t.mock.timers.tick(1);
+	await settlePasses();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun?.startedBy, 'resume', 'the boot timer resumed the interrupted pass by itself');
+	assert.equal(row.sweep.lastRun.resumedFrom, startedAt);
+	t.mock.timers.reset();
+});
+
 test('RESTART RESILIENCE: a claim that still beats, a finished pass, or one older than a day is not resumed', async (t) => {
 	await armAnchoredScheduler(t);
 	// Still heart-beating: a manual run on another worker, or simply not aged out since the restart.
