@@ -1512,7 +1512,11 @@ export function mergeDiscoveryPurge(results) {
  * (starting, waiting for peers, loading, failed, or a state document gone stale), and that body
  * carries the reason, the keeper's own stats and the live `now` fields (in flight, pause, status).
  * An operator needs every one of those, so it is kept — `answered` — and only its COUNTS are absent.
- * A transport failure, a 401 or an older plugin's 404 carries no `trust` block and is not answered.
+ * A transport failure or a 401 carries no `trust` block and is not answered.
+ *
+ * A NODE WITHOUT A KEEPER is its own case: a plugin before v0.93.0 answers 404 "Unknown route" (a
+ * canary rollout runs mixed versions). It is up and claiming from its own index — `noKeeper`, judged as
+ * a watch by the view at either scope. A 404 "Management API is disabled" is not that; it is no answer.
  *
  * `fanOut` passes a non-200's parsed body as `errorBody`; `body` stays reserved for a usable 200.
  */
@@ -1520,12 +1524,15 @@ export function queueStateRow(result) {
 	const body = result.ok ? result.body : result.errorBody;
 	const answered = !!(body && typeof body === 'object' && body.trust && typeof body.trust === 'object');
 	const live = answered && !!result.ok && body.trust.live !== false;
+	const noKeeper =
+		!answered && result.status === 404 && /^Unknown route/.test(result.errorBody?.error ?? result.error ?? '');
 	return {
 		origin: result.origin ?? null,
 		hostname: result.hostname ?? body?.node ?? null,
 		node: answered ? (body.node ?? null) : null,
 		httpStatus: result.status ?? 0,
 		answered,
+		noKeeper,
 		live,
 		error: live ? null : answered ? (body.error ?? `answered ${result.status}`) : (result.error ?? null),
 		now: answered ? (body.now ?? null) : null,
@@ -1568,7 +1575,8 @@ function sumBins(rows, key, edgesJson) {
  */
 export function mergeQueueState(results) {
 	const rows = results.map(queueStateRow);
-	if (!rows.some((row) => row.answered)) return allFailed(results, 'merged');
+	// A cluster entirely on a plugin before v0.93.0 is still an answer: every node without a keeper.
+	if (!rows.some((row) => row.answered || row.noKeeper)) return allFailed(results, 'merged');
 
 	const live = rows.filter((row) => row.live);
 	const complete = live.length === rows.length;
@@ -1577,23 +1585,14 @@ export function mergeQueueState(results) {
 
 	let cluster = null;
 	if (complete) {
-		const bodies = results.map((r) => r.body);
 		const sum = (read) => sumOf(live, read);
 
-		// Routes add; classes (route × cadence × sitemap flag) add too, keeping the worst head.
-		const routes = new Map();
+		// Classes (route × cadence × sitemap flag) add, keeping the worst head and naming its node the way
+		// every other per-node field here does: by the fan-out's host. (The per-route list is not merged —
+		// nothing reads it, and its bins would need the same edge check as the totals.)
 		const classes = new Map();
-		for (const body of bodies) {
-			for (const route of body?.lateness?.byRoute ?? []) {
-				const acc = routes.get(route.route) ?? { route: route.route, due: 0, sitemap: null, discovered: null };
-				acc.due += finite(route.due) || 0;
-				for (const key of ['sitemap', 'discovered']) {
-					if (!Array.isArray(route[key])) continue;
-					acc[key] = sumArrays([acc[key] ?? [], route[key]], Math.max(route[key].length, acc[key]?.length ?? 0));
-				}
-				routes.set(route.route, acc);
-			}
-			for (const klass of body?.lateness?.classes ?? []) {
+		for (const result of results) {
+			for (const klass of result.body?.lateness?.classes ?? []) {
 				const id = `${klass.route}\u0000${klass.cadenceMs}\u0000${!!klass.fromSitemap}`;
 				const acc = classes.get(id) ?? {
 					route: klass.route,
@@ -1612,7 +1611,7 @@ export function mergeQueueState(results) {
 				const late = finite(klass.oldestLatenessCadences);
 				if (Number.isFinite(late) && (acc.oldestLatenessCadences === null || late > acc.oldestLatenessCadences)) {
 					acc.oldestLatenessCadences = late;
-					acc.worstNode = body.node ?? null;
+					acc.worstNode = result.hostname ?? null;
 				}
 				classes.set(id, acc);
 			}
@@ -1620,8 +1619,8 @@ export function mergeQueueState(results) {
 
 		// Flow is per minute on every node's clock; the minutes are wall-clock, so they align.
 		const flow = new Map();
-		for (const body of bodies) {
-			for (const slot of body?.flow ?? []) {
+		for (const result of results) {
+			for (const slot of result.body?.flow ?? []) {
 				const minute = finite(slot.minute);
 				if (!Number.isFinite(minute)) continue;
 				const acc = flow.get(minute) ?? { minute, cameDue: 0, added: 0, triggered: 0, rescheduled: 0, removed: 0 };
@@ -1640,7 +1639,6 @@ export function mergeQueueState(results) {
 				// Each node's own `due − inFlight` (clamped at zero there), summed: a node with more leases
 				// than due rows must not cancel another node's waiting rows.
 				unclaimed: sum((row) => row.now?.unclaimed),
-				pausedOn: live.filter((row) => row.now?.paused).map((row) => row.hostname),
 			},
 			coming: {
 				next15m: sum((row) => row.coming?.next15m),
@@ -1657,15 +1655,16 @@ export function mergeQueueState(results) {
 				discovered: sumBins(live, 'discovered', edgesJson),
 				edgesDiverge: edgesJson === null,
 				oldestDueAt: minOf(live, (row) => row.lateness?.oldestDueAt),
-				byRoute: [...routes.values()].sort((a, b) => b.due - a.due),
+				// Plugin v0.93.1+: a node cut its lists at 200. Absent (0.93.0) reads as not cut.
+				listsTruncated: results.some((result) => result.body?.lateness?.listsTruncated === true),
 				classes: [...classes.values()]
 					.sort((a, b) => (b.oldestLatenessCadences ?? -1) - (a.oldestLatenessCadences ?? -1))
 					.slice(0, MAX_CLASSES),
 			},
 			flow: [...flow.values()].sort((a, b) => a.minute - b.minute),
-			// Every count is exact only if every node's is.
+			// The plugin's own flag, every node's. The view refines it (a membership change's gained rows
+			// turn `exact` false without making a count short) from the per-node rows.
 			exact: live.every((row) => row.trust?.exact === true),
-			inexactOn: live.filter((row) => row.trust?.exact !== true).map((row) => row.hostname),
 		};
 	}
 
@@ -1679,8 +1678,10 @@ export function mergeQueueState(results) {
 			cluster,
 			withheld: rows.filter((row) => !row.live).map((row) => ({ hostname: row.hostname, reason: row.error })),
 			nodes: rows,
+			// A 503 and a node without a keeper are answers the view names itself; only a node that did not
+			// answer at all banners the page as incomplete.
 			sources: sourcesOf(
-				results.map((r, i) => (rows[i].answered ? { ...r, ok: true, error: null } : r)),
+				results.map((r, i) => (rows[i].answered || rows[i].noKeeper ? { ...r, ok: true, error: null } : r)),
 				{ mode: 'merged' }
 			),
 		},

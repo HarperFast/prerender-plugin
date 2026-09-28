@@ -110,7 +110,7 @@ const TITLES = {
 	page: 'Cached-page lifetimes',
 	invalidation: 'Invalidation',
 	render: 'Render scheduling',
-	scan: 'Claim scan',
+	scan: 'Scan budgets',
 	sitemap: 'Sitemap ingestion',
 	queue: 'Render queue',
 	analytics: 'Analytics',

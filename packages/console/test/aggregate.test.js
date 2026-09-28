@@ -535,10 +535,13 @@ test('queue-state: live nodes SUM — counts, hours, lateness bins, routes and c
 		LIVE_STATE.lateness.sitemap.map((n) => 2 * n)
 	);
 	assert.equal(cluster.lateness.oldestDueAt, LIVE_STATE.lateness.oldestDueAt);
-	// Routes add by name; classes add by (route × cadence × sitemap flag) and keep the worst head.
-	const catalog = cluster.lateness.byRoute.find((r) => r.route === 'route:prefix:/catalog/');
-	assert.equal(catalog.due, 2 * LIVE_STATE.lateness.byRoute.find((r) => r.route === 'route:prefix:/catalog/').due);
+	// Classes add by (route × cadence × sitemap flag), keep the worst head, and name its node by the
+	// fan-out host like every other per-node field. The unread per-route list is not merged.
 	assert.equal(cluster.lateness.classes.length, LIVE_STATE.lateness.classes.length);
+	assert.equal(cluster.lateness.classes[0].worstNode, 'a.example.com:9926');
+	assert.equal('byRoute' in cluster.lateness, false);
+	// 0.93.0 does not send listsTruncated; its absence reads as not cut.
+	assert.equal(cluster.lateness.listsTruncated, false);
 	assert.equal(
 		cluster.lateness.classes[0].oldestLatenessCadences,
 		LIVE_STATE.lateness.classes[0].oldestLatenessCadences
@@ -586,10 +589,44 @@ test('queue-state: a node that did not answer at all is not an answer, and is na
 	assert.equal(merged.body.sources.complete, false, 'a node that is DOWN still banners the view');
 });
 
-test('queue-state: nothing answering is a 502, and an older plugin’s 404 is not an answer', () => {
+test('queue-state: nothing answering is a 502; "Management API is disabled" is no answer either', () => {
 	assert.equal(mergeQueueState([down('a'), down('b')]).status, 502);
-	const notFound = { ...down('a'), status: 404, error: 'Unknown route', errorBody: { error: 'Unknown route' } };
-	assert.equal(mergeQueueState([notFound]).status, 502);
+	const disabled = {
+		...down('a'),
+		status: 404,
+		error: 'Management API is disabled',
+		errorBody: { error: 'Management API is disabled' },
+	};
+	const merged = mergeQueueState([disabled]);
+	assert.equal(merged.status, 502);
+});
+
+test('queue-state: a node on a plugin before v0.93.0 is a node WITHOUT A KEEPER, not a missing answer', () => {
+	// Mid-canary the old nodes answer 404 "Unknown route" — up, and claiming from their own index.
+	const old = (host) => ({
+		...down(host),
+		status: 404,
+		error: 'Unknown route: queue-state',
+		errorBody: { error: 'Unknown route: queue-state' },
+	});
+	const mixed = mergeQueueState([ok('a', LIVE_STATE), old('b')]);
+	assert.equal(mixed.status, 200);
+	assert.equal(mixed.body.cluster, null, 'its queue is not counted, so there is no whole to sum');
+	const b = mixed.body.nodes.find((row) => row.hostname === 'b.example.com:9926');
+	assert.equal(b.noKeeper, true);
+	assert.equal(b.answered, false);
+	assert.equal(mixed.body.sources.complete, true, 'not a down node: the view names it itself');
+
+	// A whole cluster still on 0.92 is the same answer, not a 502.
+	const allOld = mergeQueueState([old('a'), old('b')]);
+	assert.equal(allOld.status, 200);
+	assert.equal(allOld.body.live, 0);
+	assert.ok(allOld.body.nodes.every((row) => row.noKeeper));
+});
+
+test('queue-state: 0.93.1’s listsTruncated is carried when any node cut its lists', () => {
+	const cut = { ...LIVE_STATE, lateness: { ...LIVE_STATE.lateness, listsTruncated: true } };
+	assert.equal(mergeQueueState([ok('a', LIVE_STATE), ok('b', cut)]).body.cluster.lateness.listsTruncated, true);
 });
 
 test('queue-state: the starting-phase 503 keeps its phase, and its `empty` status is not a verdict', () => {
@@ -607,7 +644,7 @@ test('queue-state: an inexact node keeps the sum but says it is a lower bound, a
 	const inexact = { ...LIVE_STATE, trust: { ...LIVE_STATE.trust, exact: false } };
 	const merged = mergeQueueState([ok('a', LIVE_STATE), ok('b', inexact)]);
 	assert.equal(merged.body.cluster.exact, false);
-	assert.deepEqual(merged.body.cluster.inexactOn, ['b.example.com:9926']);
+	assert.equal(merged.body.nodes[1].trust.exact, false, 'the per-node flag the view refines is kept');
 });
 
 test('queue-state: nodes that bin lateness differently are not summed bin by bin', () => {

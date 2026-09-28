@@ -561,14 +561,14 @@ test('zero repairs with no verification anywhere is unknown, not ok', async () =
 	assert.equal(verdictOf(vital(draw(await ready({ analytics, queueState })), 'Keeper repairs')), 'na');
 });
 
-test('wedged renders: a few is a watch, past 5% of grants is bad', async () => {
+test('render holds: a few is a watch, past 5% of grants is bad', async () => {
 	const few = { ...ANALYTICS, series: [...ANALYTICS.series, combo('queue_health', 'claim_wedged', null, null, 1, 3)] };
-	assert.equal(verdictOf(vital(draw(await ready({ analytics: few })), 'Wedged renders')), 'warn');
+	assert.equal(verdictOf(vital(draw(await ready({ analytics: few })), 'Render holds')), 'warn');
 	const many = {
 		...ANALYTICS,
 		series: [...ANALYTICS.series, combo('queue_health', 'claim_wedged', null, null, 20, 10)],
 	};
-	assert.equal(verdictOf(vital(draw(await ready({ analytics: many })), 'Wedged renders')), 'bad');
+	assert.equal(verdictOf(vital(draw(await ready({ analytics: many })), 'Render holds')), 'bad');
 });
 
 test('a nearly full lease table is bad on the fullest node, however empty the others are', async () => {
@@ -587,10 +587,184 @@ test('the real 0.93.0 payloads: keeper live, but renders that never report are b
 	const queueState = { ok: true, status: 200, body: LIVE_STATE };
 	const root = draw(await ready({ overview: fixture('overview'), analytics: fixture('analytics'), queueState }));
 	assert.equal(verdictOf(vital(root, 'Queue keeper')), 'ok');
-	assert.equal(verdictOf(vital(root, 'Wedged renders')), 'bad');
+	assert.equal(verdictOf(vital(root, 'Render holds')), 'bad');
 	assert.equal(verdictOf(vital(root, 'Backlog')), 'bad');
 	assert.equal(verdictOf(vital(root, 'Keeper repairs')), 'ok');
 	assert.equal(verdictOf(vital(root, 'Keeper publish p95')), 'ok');
 	assert.equal(verdictOf(vital(root, 'Lease slots')), 'ok');
 	assert.doesNotMatch(root.textContent, /claim floor|Claim scan|Prioriti[sz]ed/i);
+});
+
+// ---- review findings: one routine event is one watch, never three alarms with the wrong cause ----
+
+/** A live node whose keeper just resynced for `why`, its walk having counted `repaired` rows. */
+const resynced = (why, repaired, { walkRepaired = repaired } = {}) => {
+	const at = Date.now() - 60_000;
+	return {
+		...HEALTHY_STATE,
+		trust: {
+			...HEALTHY_STATE.trust,
+			exact: false,
+			keeper: {
+				...HEALTHY_STATE.trust.keeper,
+				exact: false,
+				verify: { ...HEALTHY_STATE.trust.keeper.verify, at: at - 1_300, repaired: walkRepaired, missing: walkRepaired },
+				lastResync: { at, why, ms: 1_400, kept: 1000, dropped: 0, repaired },
+			},
+		},
+	};
+};
+const MEMBERSHIP_WHY = "the cluster's node list changed (node-a -> node-a,node-b)";
+
+test('rows gained in a membership change are ONE watch, named as such — not missed writes', async () => {
+	// The verification walk counts a newly owned row as "missing", emits keeper_repaired and turns
+	// `exact` false. Before: Keeper repairs BAD ("missing writes"), Queue keeper "inexact", Backlog 600+.
+	const analytics = {
+		...ANALYTICS,
+		series: [...ANALYTICS.series, combo('queue_health', 'keeper_repaired', null, null, 1, 12)],
+	};
+	const queueState = stateOf(answer('node-a', resynced(MEMBERSHIP_WHY, 12)), answer('node-b', HEALTHY_STATE));
+	const root = draw(await ready({ analytics, queueState }));
+	const repairs = vital(root, 'Keeper repairs');
+	assert.equal(verdictOf(repairs), 'warn');
+	assert.match(repairs.textContent, /12 rows gained after a membership change/);
+	assert.doesNotMatch(repairs.attributes.title ?? '', /missing writes/);
+	assert.equal(verdictOf(vital(root, 'Queue keeper')), 'ok');
+	const backlog = vital(root, 'Backlog');
+	assert.equal(verdictOf(backlog), 'ok');
+	assert.doesNotMatch(backlog.textContent, /\+/, 'the counts are complete: the gained rows are held');
+});
+
+test('a repair NOT explained by a membership change is still bad, and still a lower bound', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [...ANALYTICS.series, combo('queue_health', 'keeper_repaired', null, null, 1, 12)],
+	};
+	for (const state of [
+		resynced('an event could not be applied', 12),
+		// A membership resync, but the node's last walk is a later one that repaired rows of its own.
+		resynced(MEMBERSHIP_WHY, 12, { walkRepaired: 3 }),
+	]) {
+		const queueState = stateOf(answer('node-a', state), answer('node-b', HEALTHY_STATE));
+		const root = draw(await ready({ analytics, queueState }));
+		assert.equal(verdictOf(vital(root, 'Keeper repairs')), 'bad');
+		assert.equal(verdictOf(vital(root, 'Queue keeper')), 'warn');
+		assert.match(vital(root, 'Backlog').textContent, /600\+/);
+	}
+});
+
+test('Health and Queue read repairs from ONE helper: a last walk outside the range still counts', async () => {
+	// A 15-minute range holds no hourly walk, but a node's last walk repaired 5 rows. Health once took
+	// max(range, last walk) while the Queue tile took the range alone and read 0.
+	const state = {
+		...HEALTHY_STATE,
+		trust: {
+			...HEALTHY_STATE.trust,
+			exact: false,
+			keeper: {
+				...HEALTHY_STATE.trust.keeper,
+				exact: false,
+				verify: { ...HEALTHY_STATE.trust.keeper.verify, repaired: 5 },
+			},
+		},
+	};
+	const analytics = { ...ANALYTICS, series: ANALYTICS.series.filter((s) => s.path !== 'keeper_verify_ms') };
+	const queueState = stateOf(answer('node-a', state), answer('node-b', HEALTHY_STATE));
+	const health = vital(draw(await ready({ analytics, queueState })), 'Keeper repairs');
+	assert.equal(verdictOf(health), 'bad');
+	assert.match(health.textContent, /5/);
+	assert.match(health.textContent, /last walk on 2\/2 nodes/);
+
+	const { load: loadQueue, render: renderQueue } = await import('../src/admin/views/queue.js');
+	const ctx = makeCtx({ analytics, queueState });
+	await loadQueue(ctx);
+	const repaired = find(
+		el('div', null, renderQueue(ctx)),
+		(n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === 'Repaired'
+	);
+	assert.match(repaired.textContent, /^Repaired5/);
+	assert.ok(find(repaired, (n) => n.attributes?.class === 'value bad'));
+});
+
+test('one node walked of two is said, not passed off as the whole cluster checked', async () => {
+	const unwalked = {
+		...HEALTHY_STATE,
+		trust: { ...HEALTHY_STATE.trust, keeper: { ...HEALTHY_STATE.trust.keeper, verify: null } },
+	};
+	const analytics = { ...ANALYTICS, series: ANALYTICS.series.filter((s) => s.path !== 'keeper_verify_ms') };
+	const queueState = stateOf(answer('node-a', HEALTHY_STATE), answer('node-b', unwalked));
+	const repairs = vital(draw(await ready({ analytics, queueState })), 'Keeper repairs');
+	assert.equal(verdictOf(repairs), 'ok');
+	assert.match(repairs.textContent, /last walk on 1\/2 nodes/);
+});
+
+test('a routine restart is not a watch for the whole range: one not-live snapshot per load is the restart', async () => {
+	// 4 snapshots, one of them during the restart's load (mean 0.75), and one keeper load in the range.
+	const withGauge = (loads) => ({
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series.filter((s) => s.path !== 'keeper_live'),
+			combo('queue_health', 'keeper_live', null, null, 4, 0.75),
+			...(loads ? [combo('queue_health', 'keeper_load_ms', null, null, loads, 900)] : []),
+		],
+	});
+	const restart = vital(draw(await ready({ analytics: withGauge(1) })), 'Queue keeper');
+	assert.equal(verdictOf(restart), 'ok');
+	assert.match(restart.textContent, /restarted 1× in range/);
+	// The same not-live snapshot with no load to explain it is a keeper that went down while running.
+	assert.equal(verdictOf(vital(draw(await ready({ analytics: withGauge(0) })), 'Queue keeper')), 'warn');
+});
+
+test('in flight is never silently short: a lease sum missing a node yields to the keepers’ complete sum', async () => {
+	const overview = {
+		...OVERVIEW,
+		leases: { occupancy: 40, maxLeases: 8192, fullestShare: 0.01, fullestNode: 'node-a', missing: ['node-b:9926'] },
+	};
+	// Keepers complete (80 in flight across both): theirs wins, unmarked.
+	const complete = vital(draw(await ready({ overview })), 'Backlog');
+	assert.match(complete.textContent, /80 in flight/);
+	assert.doesNotMatch(complete.textContent, /\+ in flight/);
+	// No keeper total: the short sum is shown, and marked as a floor.
+	const noState = { ok: false, status: 0, body: { error: 'Request failed' } };
+	assert.match(vital(draw(await ready({ overview, queueState: noState })), 'Backlog').textContent, /40\+ in flight/);
+});
+
+test('at node scope a keeper that is not live is ONE bad check: the snapshot’s missing count is n/a', async () => {
+	const overview = {
+		...OVERVIEW,
+		sources: undefined,
+		backlog: {
+			...OVERVIEW.backlog,
+			lastRun: {
+				overdue: null,
+				inFlight: 0,
+				buckets: [],
+				source: 'keeper',
+				queueUnavailable: 'the queue keeper is not live',
+				finishedAt: Date.now(),
+				error: null,
+			},
+		},
+	};
+	const root = draw(await ready({ overview, queueState: { ok: false, status: 503, body: STARTING_STATE } }));
+	// By exact label: the Backlog tile's own text now points at "Queue keeper".
+	const byLabel = (label) =>
+		find(
+			root,
+			(n) => /(^| )vital( |$)/.test(n.attributes?.class ?? '') && n.children[0]?.children[1]?.textContent === label
+		);
+	assert.equal(verdictOf(byLabel('Queue keeper')), 'bad');
+	const backlog = byLabel('Backlog');
+	assert.equal(verdictOf(backlog), 'na');
+	assert.match(backlog.textContent, /see Queue keeper/);
+});
+
+test('drilled to a node on plugin 0.92, Health reads "no keeper" — a watch, not a failed input', async () => {
+	const root = draw(
+		await ready({ queueState: { ok: false, status: 404, body: { error: 'Unknown route: queue-state' } } })
+	);
+	assert.equal(vital(root, 'Queue state'), null, 'not the bad input check');
+	const keeper = vital(root, 'Queue keeper');
+	assert.equal(verdictOf(keeper), 'warn');
+	assert.match(keeper.textContent, /this node: no keeper/);
 });

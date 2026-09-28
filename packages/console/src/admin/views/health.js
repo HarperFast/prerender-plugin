@@ -53,12 +53,15 @@ import { configState, loadConfig } from './_configEdit.js';
 import { cadenceFor, cadenceIndex, coverageSplit, originCostByReason } from './traffic.js';
 import {
 	backlogReading,
-	drain,
+	drainOf,
+	hostOf,
 	keeperStats,
 	keeperVerdict,
 	LIMITS,
 	queueStateOf,
 	queueStateProblem,
+	repairsReading,
+	repairsSub,
 	slotPressure,
 	statusPill,
 } from './queue.js';
@@ -342,31 +345,43 @@ function queueChecks(data, overview, qs) {
 
 	if (overview || qs?.cluster) {
 		// No analytics means no rate — `drain` reads that as unknown, never as "nothing rendered".
-		const clear = drain(reading.overdue, reading.inFlight, renderRate(data));
+		const clear = drainOf(reading, renderRate(data));
 		const failedSnapshot = reading.source === 'snapshot' && !!reading.error;
+		const inFlight = Number.isFinite(reading.inFlight)
+			? num(reading.inFlight) + (reading.inFlightShortOf.length ? '+' : '')
+			: '—';
 		out.push(
 			check(
 				'due',
 				'Backlog',
 				Number.isFinite(reading.overdue) ? num(reading.overdue) + (reading.floor ? '+' : '') : '—',
-				// A floor makes the count a lower bound, so it is at least a watch — but never softens a bad drain.
-				failedSnapshot ? 'bad' : reading.floor ? worse('warn', clear.verdict) : clear.verdict,
+				// No count because a keeper is not live: unknown here, and judged once, on the keeper check.
+				reading.keeperDown
+					? 'na'
+					: failedSnapshot
+						? 'bad'
+						: // A floor makes the count a lower bound, so it is at least a watch — but never softens a bad drain.
+							reading.floor
+							? worse('warn', clear.verdict)
+							: clear.verdict,
 				{
-					sub:
-						(Number.isFinite(clear.ms)
-							? `~${duration(clear.ms)} to clear · ${num(reading.inFlight ?? 0)} in flight`
-							: `${Number.isFinite(reading.inFlight) ? num(reading.inFlight) : '—'} in flight`) +
-						(reading.source === 'snapshot' ? ' · snapshot' : ''),
+					sub: reading.keeperDown
+						? 'no count · see Queue keeper'
+						: (Number.isFinite(clear.ms)
+								? `~${duration(clear.ms)} to clear · ${inFlight} in flight`
+								: `${inFlight} in flight`) + (reading.source === 'snapshot' ? ' · snapshot' : ''),
 					go: 'queue',
-					detail: failedSnapshot
-						? `The backlog snapshot has no count: ${reading.error}`
-						: reading.shortOf.length
-							? `The snapshot has no queue from ${reading.shortOf.join(', ')} — the real backlog is larger.`
-							: clear.verdict === 'bad' && !Number.isFinite(clear.ms)
-								? 'Rows are due and nothing rendered in this range.'
-								: Number.isFinite(clear.ms)
-									? `At the current render rate the backlog clears in about ${duration(clear.ms)}.`
-									: null,
+					detail: reading.keeperDown
+						? 'The backlog snapshot has no count while a queue keeper is not live — see the Queue keeper check.'
+						: failedSnapshot
+							? `The backlog snapshot failed: ${reading.error}`
+							: reading.shortOf.length
+								? `The snapshot has no queue from ${reading.shortOf.join(', ')} — the real backlog is larger.`
+								: clear.verdict === 'bad' && !Number.isFinite(clear.ms)
+									? 'Rows are due and nothing rendered in this range.'
+									: Number.isFinite(clear.ms)
+										? `At the current render rate the backlog clears in about ${duration(clear.ms)}.`
+										: null,
 				}
 			)
 		);
@@ -377,21 +392,26 @@ function queueChecks(data, overview, qs) {
 		const judged = qs.nodes.map((row) => ({ row, v: keeperVerdict(row) }));
 		const flagged = judged.filter(({ v }) => v.verdict !== 'ok');
 		let verdict = judged.reduce((acc, { v }) => worse(acc, v.verdict), 'ok');
-		// Every node live now, but a snapshot in the range found one that was not.
-		const flapped = verdict === 'ok' && k?.notLiveSnapshots > 0;
+		// Every node live now, but snapshots in the range found a keeper not live — more than its restarts
+		// (one load each) explain. A routine deploy is one load and, at most, one such snapshot.
+		const flapped = verdict === 'ok' && k?.unexplainedNotLive > 0;
+		const restarted = verdict === 'ok' && !flapped && k?.notLiveSnapshots > 0;
 		if (flapped) verdict = 'warn';
 		out.push(
 			check('keeper', 'Queue keeper', `${qs.live}/${qs.configured} live`, verdict, {
 				sub: flagged.length
-					? flagged.map(({ row, v }) => `${row.hostname}: ${v.label}`).join(' · ')
+					? flagged.map(({ row, v }) => `${hostOf(row)}: ${v.label}`).join(' · ')
 					: flapped
 						? `down in ${num(k.notLiveSnapshots)} snapshot${k.notLiveSnapshots === 1 ? '' : 's'} in range`
-						: 'serving on every node',
+						: restarted
+							? `restarted ${num(k.loads)}× in range`
+							: 'serving on every node',
 				go: 'queue',
 				detail: flagged.length
-					? flagged.map(({ row, v }) => `${row.hostname}: ${v.detail}`).join(' ')
+					? flagged.map(({ row, v }) => `${hostOf(row)}: ${v.detail}`).join(' ')
 					: flapped
-						? `${num(k.notLiveSnapshots)} of ${num(k.snapshots)} backlog snapshots in this range found a queue keeper not live.`
+						? `${num(k.notLiveSnapshots)} of ${num(k.snapshots)} backlog snapshots in this range found a queue keeper ` +
+							`not live, more than its ${num(k.loads)} load${k.loads === 1 ? '' : 's'} explain.`
 						: null,
 			})
 		);
@@ -411,39 +431,34 @@ function queueChecks(data, overview, qs) {
 	}
 
 	if (k) {
-		// Evidence that 0 means "checked, nothing to repair": a walk in the range, or a last walk on a node.
-		const lastWalks = (qs?.nodes ?? []).map((row) => row.trust?.keeper?.verify).filter(Boolean);
-		const lastRepaired = lastWalks.reduce((acc, walk) => acc + (walk.repaired > 0 ? walk.repaired : 0), 0);
-		const repaired = Math.max(k.repaired, lastRepaired);
+		const repairs = repairsReading(data, qs);
 		out.push(
-			check(
-				'keeper-repaired',
-				'Keeper repairs',
-				num(repaired),
-				repaired > 0 ? 'bad' : k.verifyWalks > 0 || lastWalks.length > 0 ? 'ok' : 'na',
-				{
-					sub: k.verifyWalks > 0 ? `${num(k.verifyWalks)} verify walks · expect 0` : 'no verify walk in range',
-					go: 'queue',
-					detail:
-						repaired > 0
-							? 'A verification walk found rows the queue keeper held differently from the table: its subscription is missing writes.'
+			check('keeper-repaired', 'Keeper repairs', num(repairs.total), repairs.verdict, {
+				sub: repairsSub(repairs),
+				go: 'queue',
+				detail:
+					repairs.missed > 0
+						? 'A verification walk found rows the queue keeper held differently from the table: its subscription is missing writes.'
+						: repairs.gained > 0
+							? `${num(repairs.gained)} rows gained after a membership change — the walk counts them as repairs; nothing was missed.`
 							: null,
-				}
-			),
+			}),
 			check('keeper-publish', 'Keeper publish p95', fmtMs(k.publishP95), k.publishVerdict, {
 				sub: `median ${fmtMs(k.publishMedian)} · limit ${fmtMs(LIMITS.publishMs[0])}`,
 				spark: k.publishSpark,
 				go: 'queue',
-				detail: 'One ready-set publish on worker 0, every second. A rising trend is a growing due set or class count.',
+				detail:
+					'One ready-set publish on worker 0 per publishInterval (skipped when nothing changed, forced every 10s). ' +
+					'A rising trend is a growing due set or class count.',
 			}),
-			check('wedged', 'Wedged renders', num(k.wedged), k.wedgedVerdict, {
-				sub: k.granted > 0 ? `${pct(k.wedged, k.granted)} of ${fmtCount(k.granted)} grants` : 'no grants in range',
+			check('holds', 'Render holds', num(k.holds), k.holdsVerdict, {
+				sub: k.granted > 0 ? `${pct(k.holds, k.granted)} of ${fmtCount(k.granted)} grants` : 'no grants in range',
 				go: 'queue',
 				detail:
-					k.wedged > 0
-						? k.wedgedVerdict === 'bad'
-							? 'Many keys held back because their leases expired with no result — results are not reaching the node.'
-							: 'Keys held back because their leases expired with no result — a renderer crashing on them; the plugin log names them.'
+					k.holds > 0
+						? k.holdsVerdict === 'bad'
+							? 'Many holds on keys whose leases expired with no result — results are not reaching the node.'
+							: 'Holds on keys whose leases expired with no result — a renderer crashing on them; the plugin log names them.'
 						: null,
 			}),
 			check('stale', 'Stale claims', k.staleShare === null ? '—' : pct(k.stale, k.stale + k.granted), k.staleVerdict, {

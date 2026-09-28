@@ -193,14 +193,14 @@ Thresholds are judgement calls set where a number stops being tail noise for a h
 in `views/health.js`, and the queue keeper's in `LIMITS` in `views/queue.js` (shared by both views). A system
 or keeper tile shows the **worst node**, never an average.
 
-| Group       | Checks                                                                                                                                                                     |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures               |
-| Rendering   | renders/h, failure share, render time                                                                                                                                      |
-| Queue       | backlog **time to clear** (> 2h watch, > 8h bad), queue keeper live on every node, keeper repairs (> 0 bad), keeper publish p95, wedged renders, stale claims, lease slots |
-| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation                             |
-| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**                          |
-| Maintenance | schedule repair, active invalidations                                                                                                                                      |
+| Group       | Checks                                                                                                                                                                                                                           |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures                                                                     |
+| Rendering   | renders/h, failure share, render time                                                                                                                                                                                            |
+| Queue       | backlog **time to clear** (> 2h watch, > 8h bad), queue keeper live on every node, keeper repairs (missed writes > 0 bad; rows gained in a membership change watch), keeper publish p95, render holds, stale claims, lease slots |
+| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation                                                                                   |
+| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**                                                                                |
+| Maintenance | schedule repair, active invalidations                                                                                                                                                                                            |
 
 System vitals come from Harper's own per-minute resource rows, which the plugin's analytics scan now keeps
 (same scan, no second walk), plus a point-in-time host block on `overview`. Against an older plugin the

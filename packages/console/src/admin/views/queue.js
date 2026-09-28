@@ -47,7 +47,7 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
-import { appliedNote, editTray, loadConfig, settingsCard } from './_configEdit.js';
+import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
 
 export const meta = { id: 'queue', label: 'Queue', icon: ICONS.queue, ranged: true };
 
@@ -82,10 +82,12 @@ export const queueSeries = (data, name) => pick(data, 'queue_health', (s) => s.p
  *   a merge over class heads); 250ms is a quarter of worker 0's time spent publishing.
  * - staleShare: ready-set entries a claim skipped because the row was no longer due, over everything it
  *   looked at. A trickle is normal; half means the keeper sees writes late.
- * - wedgedShare: keys held back (their leases kept expiring with no result) over jobs granted. Any is a
- *   URL to look at; past 5% it is results not reaching the node, not one bad page.
+ * - wedgedShare: holds (a key held back because its leases kept expiring with no result) over jobs
+ *   granted. Any is a URL to look at; past 5% it is results not reaching the node, not one bad page.
  * - slotShare: the fullest node's live leases over its lease slots. A full table refuses grants.
- * - behindShare: due rows at least one cadence late (the page is two cadences old) over all due rows.
+ * - behindShare: due rows at least one cadence late (the page is two cadences old) over all due rows —
+ *   judged only past `behindMinRows` late rows, so a quiet cluster whose handful of due rows includes a
+ *   few held keys does not read as a third of the corpus falling behind.
  */
 export const LIMITS = Object.freeze({
 	publishMs: [50, 250],
@@ -93,6 +95,7 @@ export const LIMITS = Object.freeze({
 	wedgedShare: 0.05,
 	slotShare: [0.75, 0.95],
 	behindShare: [0.1, 0.33],
+	behindMinRows: 100,
 });
 
 const verdictAbove = (value, [warn, bad]) =>
@@ -110,15 +113,25 @@ export async function load(ctx) {
 	ctx.data.analytics = analyticsRes.ok ? analyticsRes.body : null;
 	ctx.data.queueState = queueStateOf(stateRes);
 	ctx.data.queueStateError = ctx.data.queueState ? null : queueStateProblem(stateRes);
-	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load queue state (${res.status})`);
+	ctx.data.error = res.ok ? null : (res.body?.error ?? `Could not load the cluster overview (${res.status})`);
 }
 
 export function render(ctx) {
 	const data = ctx.data.overview;
-	if (!data) return el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load queue state.' });
 	const analytics = ctx.data.analytics;
 	const usable = analytics && analytics.available !== false && !windowEmpty(analytics);
 	const qs = ctx.data.queueState;
+	// Without the overview there are no controls, node table or snapshot — but the keepers answered on
+	// their own route, and whether they are serving is exactly what an operator opens this page for.
+	if (!data) {
+		return [
+			el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load the cluster overview.' }),
+			keeperAlarm(qs),
+			kpis(null, qs, usable ? analytics : null),
+			keeperCard(ctx, qs, usable ? analytics : null, null),
+			qs?.cluster && el('div', { cls: 'cols' }, [latenessCard(qs), flowCard(qs)]),
+		];
+	}
 
 	return [
 		appliedNote(ctx),
@@ -145,18 +158,48 @@ export function render(ctx) {
 
 // ---- queue state ---------------------------------------------------------------
 
+/** A plugin before v0.93.0 answers the route with this 404 ("Management API is disabled" is a 404 too). */
+const NO_ROUTE = /^Unknown route/;
+
+/** A row's node name for display; node scope's 404 carries none. */
+export const hostOf = (row) => row?.hostname ?? 'this node';
+
 /**
  * The queue-state answer in one shape under either scope.
  *
  * Cluster scope arrives merged (util/aggregate.js `mergeQueueState`). Node scope is the plugin's own
  * answer passed straight through — a 200, or a 503 whose body is still an answer: the keeper's reason,
- * its stats and the live `now` fields. Null only when there is no answer at all (the node did not
- * answer, or runs a plugin without the route).
+ * its stats and the live `now` fields. A plugin before v0.93.0 answers 404 "Unknown route", which is a
+ * node WITHOUT A KEEPER, judged the same at either scope. Null only when there is no answer at all.
  */
 export function queueStateOf(res) {
 	const body = res?.body;
 	if (!body || typeof body !== 'object') return null;
 	if (Array.isArray(body.nodes) && 'cluster' in body) return body;
+	if (res.status === 404 && NO_ROUTE.test(body.error ?? '')) {
+		const row = {
+			hostname: null,
+			node: null,
+			httpStatus: 404,
+			answered: false,
+			noKeeper: true,
+			live: false,
+			error: body.error,
+			now: null,
+			coming: null,
+			lateness: null,
+			trust: null,
+		};
+		return {
+			scope: 'node',
+			generatedAt: null,
+			live: 0,
+			configured: 1,
+			cluster: null,
+			withheld: [{ hostname: null, reason: body.error }],
+			nodes: [row],
+		};
+	}
 	if (!body.trust || typeof body.trust !== 'object') return null;
 	const live = !!res.ok && body.trust.live !== false;
 	const row = {
@@ -171,7 +214,6 @@ export function queueStateOf(res) {
 		lateness: live ? (body.lateness ?? null) : null,
 		trust: body.trust,
 	};
-	const exact = body.trust.exact === true;
 	return {
 		scope: 'node',
 		generatedAt: body.trust.stateAt ?? null,
@@ -183,8 +225,7 @@ export function queueStateOf(res) {
 					coming: body.coming ?? null,
 					lateness: body.lateness ?? null,
 					flow: body.flow ?? [],
-					exact,
-					inexactOn: exact ? [] : [row.hostname],
+					exact: body.trust.exact === true,
 				}
 			: null,
 		withheld: live ? [] : [{ hostname: row.hostname, reason: row.error }],
@@ -192,14 +233,50 @@ export function queueStateOf(res) {
 	};
 }
 
-/** Why there is no queue state at all. Every node answering 404 is a plugin before v0.93.0. */
+/** Why there is no queue state at all, naming what each node said. */
 export function queueStateProblem(res) {
-	const statuses = res?.body?.sources?.nodes?.map((node) => node.status) ?? [res?.status];
-	if (statuses.length && statuses.every((status) => status === 404)) {
-		return 'Queue state needs plugin v0.93.0 or later on the prerender nodes.';
-	}
-	return res?.body?.error ?? `Could not load queue state (${res?.status ?? 0}).`;
+	const said = (res?.body?.sources?.nodes ?? [])
+		.filter((node) => !node.ok)
+		.map((node) => `${node.hostname} (${node.error ?? `HTTP ${node.status}`})`);
+	const head = res?.body?.error ?? `Could not load queue state (${res?.status ?? 0}).`;
+	return said.length ? `${head} ${said.join(', ')}.` : head;
 }
+
+const MEMBERSHIP = /node list changed/;
+
+/**
+ * Rows this node's last verification walk counted as REPAIRED because a membership change handed it
+ * new rows to own — or 0.
+ *
+ * The plugin's walk cannot tell a row it gained from a row it missed: both are held nowhere and present
+ * in the table, so both count as `missing`, raise `keeper_repaired` and turn `exact` false until the
+ * next clean walk. After a node-list change that is the keeper doing its job. Its resync records the
+ * walk it ran (`lastResync`: `why`, `at`, `ms`, `repaired`), so a last walk whose repairs equal that
+ * resync's, and which ran inside it, is a gain, not a missed write.
+ */
+export function membershipGain(keeper) {
+	const resync = keeper?.lastResync;
+	const walk = keeper?.verify;
+	if (!resync || !MEMBERSHIP.test(resync.why ?? '') || !(resync.repaired > 0)) return 0;
+	if (!walk || walk.repaired !== resync.repaired) return 0;
+	// The resync's own walk began after the resync and ended before it was recorded.
+	const within = walk.at <= resync.at && resync.at - walk.at <= (resync.ms ?? 0) + 1000;
+	return within ? resync.repaired : 0;
+}
+
+/**
+ * Whether a live node's counts are complete. The plugin's `exact` also goes false for rows gained in a
+ * membership change (see `membershipGain`); those counts ARE complete, and are not marked a lower bound.
+ */
+export function countsExact(row) {
+	if (!row?.live) return false;
+	if (row.trust?.exact === true) return true;
+	const keeper = row.trust?.keeper;
+	return !!keeper && !keeper.partialLoad && !keeper.resyncing && membershipGain(keeper) > 0;
+}
+
+/** The live nodes whose counts are a lower bound. */
+export const inexactNodes = (qs) => (qs?.nodes ?? []).filter((row) => row.live && !countsExact(row)).map(hostOf);
 
 const inexactReason = (keeper) =>
 	keeper?.partialLoad
@@ -217,18 +294,18 @@ const inexactReason = (keeper) =>
  * reported anything it reads `empty` — its zero value — so a node in `starting` says "empty" while it
  * grants nothing. The phase is the keeper's own word for what it is doing.
  *
- *   live, exact                     ok
+ *   live, exact (or rows gained)    ok
  *   live, not exact                 watch: counts are a lower bound
  *   loading, still granting         watch: claims come from a partial queue until the load ends
  *   state stale, still granting     watch: worker 0 has gone quiet; its last set is granted until it drains
  *   anything else, or `unready`     bad: starting, waiting for peers, failed, stopped — no claims here
- *   a 404 (plugin before v0.93.0)   watch: no keeper to judge, and its queue is not counted — it still
+ *   no keeper (plugin < 0.93.0)     watch: nothing to judge, and its queue is not counted — it still
  *                                   claims from its own index (a canary rollout runs mixed versions)
  *   no answer                       bad
  */
 export function keeperVerdict(row) {
 	if (!row?.answered) {
-		return row?.httpStatus === 404
+		return row?.noKeeper
 			? {
 					verdict: 'warn',
 					label: 'no keeper',
@@ -240,9 +317,15 @@ export function keeperVerdict(row) {
 	}
 	const keeper = row.trust?.keeper;
 	if (row.live) {
-		return row.trust.exact === true
-			? { verdict: 'ok', label: 'live', detail: null }
-			: { verdict: 'warn', label: 'inexact', detail: inexactReason(keeper) };
+		if (row.trust.exact === true) return { verdict: 'ok', label: 'live', detail: null };
+		if (countsExact(row)) {
+			return {
+				verdict: 'ok',
+				label: 'live',
+				detail: `${num(membershipGain(keeper))} rows gained after a membership change.`,
+			};
+		}
+		return { verdict: 'warn', label: 'inexact', detail: inexactReason(keeper) };
 	}
 	const phase = row.trust?.phase ?? 'unknown';
 	const unready = row.now?.status === 'unready';
@@ -288,50 +371,101 @@ export function behind(lateness) {
 	return { late, all, share: all > 0 ? late / all : null };
 }
 
+/** The Behind verdict: a share, judged only past a minimum number of late rows. */
+export const behindVerdict = (late) =>
+	!late || late.share === null
+		? 'na'
+		: late.late < LIMITS.behindMinRows
+			? 'ok'
+			: verdictAbove(late.share, LIMITS.behindShare);
+
 /**
- * "Due now" and "in flight" from the best source there is: the keepers' cluster total when every node is
- * live (exact, seconds old), else the backlog snapshot (minutes old). In flight is the live lease read.
- * Shared with the Health view so the two pages cannot disagree.
+ * In flight, from the best source there is. The overview's lease walk is exact — but its sum is short
+ * when a node answered without the block (a plugin before v0.93.0, mid-rollout), and then the keepers'
+ * own sum, which covers every node, wins. Failing both, the short sum is marked (`shortOf`), never passed
+ * off as the whole.
+ */
+function inFlightOf(overview, cluster, snapshot) {
+	const leases = overview?.leases;
+	const missing = Array.isArray(leases?.missing) ? leases.missing : [];
+	if (Number.isFinite(leases?.occupancy) && !missing.length)
+		return { value: leases.occupancy, live: true, shortOf: [] };
+	if (Number.isFinite(cluster?.now?.inFlight)) return { value: cluster.now.inFlight, live: true, shortOf: [] };
+	if (Number.isFinite(leases?.occupancy)) return { value: leases.occupancy, live: true, shortOf: missing };
+	if (Number.isFinite(snapshot?.inFlight))
+		return { value: snapshot.inFlight, live: false, shortOf: snapshot.missing ?? [] };
+	return { value: null, live: false, shortOf: [] };
+}
+
+/**
+ * Rows waiting beyond in-flight, PER NODE and summed: `Σ max(0, due − leases)`. Σdue − Σleases would let a
+ * node with more leases than due rows cancel another node's waiting rows. Leases come from the exact walk
+ * where the overview has the node, else from that node's own queue-state.
+ */
+function waitingOf(overview, liveRows, cluster) {
+	let total = 0;
+	for (const row of liveRows) {
+		const due = row.now?.due;
+		if (!Number.isFinite(due)) return Number.isFinite(cluster?.now?.unclaimed) ? cluster.now.unclaimed : null;
+		const leased = exactLeases(overview, row.hostname) ?? row.now?.inFlight;
+		total += Math.max(0, due - (Number.isFinite(leased) ? leased : 0));
+	}
+	return total;
+}
+
+/**
+ * "Due now", "in flight" and the rows waiting, from the best source there is: the keepers' cluster total
+ * when every node is live (exact, seconds old), else the backlog snapshot (minutes old). Shared with the
+ * Health view so the two pages cannot disagree.
  *
  * `floor` marks a count that is a lower bound: an inexact keeper, a snapshot that hit unreadable rows, or
- * a snapshot with nodes it had no queue from.
+ * a snapshot with nodes it had no queue from. `keeperDown` marks a snapshot with no count BECAUSE a
+ * keeper was not live — that fault is the keeper check's, and the backlog is unknown, not failed.
  */
 export function backlogReading(overview, queueState) {
 	const snapshot = overview?.backlog?.lastRun ?? null;
-	const leases = overview?.leases;
 	const cluster = queueState?.cluster;
-	const inFlight = Number.isFinite(leases?.occupancy)
-		? leases.occupancy
-		: Number.isFinite(cluster?.now?.inFlight)
-			? cluster.now.inFlight
-			: Number.isFinite(snapshot?.inFlight)
-				? snapshot.inFlight
-				: null;
-	const inFlightLive = Number.isFinite(leases?.occupancy) || Number.isFinite(cluster?.now?.inFlight);
+	const flight = inFlightOf(overview, cluster, snapshot);
+	const base = { inFlight: flight.value, inFlightLive: flight.live, inFlightShortOf: flight.shortOf };
 	if (cluster && Number.isFinite(cluster.now?.due)) {
+		const liveRows = (queueState.nodes ?? []).filter((row) => row.live);
 		return {
+			...base,
 			overdue: cluster.now.due,
-			inFlight,
-			inFlightLive,
+			waiting: waitingOf(overview, liveRows, cluster),
 			source: 'keeper',
 			asOf: queueState.generatedAt ?? null,
-			floor: cluster.exact !== true,
+			floor: !liveRows.every(countsExact),
 			error: null,
+			keeperDown: false,
 			shortOf: [],
 		};
 	}
 	if (!snapshot) {
-		return { overdue: null, inFlight, inFlightLive, source: null, asOf: null, floor: false, error: null, shortOf: [] };
+		return {
+			...base,
+			overdue: null,
+			waiting: null,
+			source: null,
+			asOf: null,
+			floor: false,
+			error: null,
+			keeperDown: false,
+			shortOf: [],
+		};
 	}
 	const shortOf = [...(snapshot.missing ?? []), ...(snapshot.unavailable ?? [])];
+	const overdue = !snapshot.error && Number.isFinite(snapshot.overdue) ? snapshot.overdue : null;
 	return {
-		overdue: !snapshot.error && Number.isFinite(snapshot.overdue) ? snapshot.overdue : null,
-		inFlight,
-		inFlightLive,
+		...base,
+		overdue,
+		waiting: null,
 		source: 'snapshot',
 		asOf: snapshot.finishedAt ?? null,
 		floor: !!snapshot.truncated || shortOf.length > 0,
-		error: snapshot.error ?? (!Number.isFinite(snapshot.overdue) ? (snapshot.queueUnavailable ?? null) : null),
+		error: snapshot.error ?? null,
+		keeperDown:
+			!snapshot.error && overdue === null && (!!snapshot.queueUnavailable || (snapshot.unavailable?.length ?? 0) > 0),
 		shortOf,
 	};
 }
@@ -348,7 +482,7 @@ export function slotPressure(overview) {
 
 /**
  * The keeper's analytics over the range, judged. Every figure is a SUM OF VALUES where the series
- * records a count per emit (`claim_granted` is jobs per claim, `keeper_repaired` rows per walk), never a
+ * records a count per emit (`claim_granted` is jobs per claim, `claim_wedged` holds per claim), never a
  * count of emits.
  */
 export function keeperStats(data) {
@@ -356,23 +490,27 @@ export function keeperStats(data) {
 	const series = (name) => queueSeries(data, name);
 	const granted = sumValues(series(QUEUE_HEALTH.granted));
 	const stale = sumValues(series(QUEUE_HEALTH.stale));
-	const wedged = sumValues(series(QUEUE_HEALTH.wedged));
-	const repaired = sumValues(series(QUEUE_HEALTH.repaired));
+	// HOLDS, not keys: a key still failing when its hold ends is held again and counted again.
+	const holds = sumValues(series(QUEUE_HEALTH.wedged));
 	const publish = series(QUEUE_HEALTH.publishMs);
 	const verify = series(QUEUE_HEALTH.verifyMs);
 	const liveGauge = series(QUEUE_HEALTH.keeperLive);
 	const looked = granted + stale;
 	const staleShare = looked > 0 ? stale / looked : null;
 	const publishP95 = weighted(publish, 'p95');
+	const loads = sumCount(series(QUEUE_HEALTH.loadMs));
+	const snapshots = sumCount(liveGauge);
+	// The backlog snapshot's 1/0 gauge, once per snapshot per node: the zeros are snapshots that found a
+	// keeper not live. A mean merges exactly, so samples × (1 − mean) counts them across nodes.
+	const notLiveSnapshots = snapshots > 0 ? Math.round(snapshots * (1 - (weighted(liveGauge, 'mean') ?? 1))) : 0;
 	return {
 		granted,
 		stale,
 		staleShare,
 		staleVerdict: looked > 0 ? verdictAbove(staleShare, LIMITS.staleShare) : 'na',
-		wedged,
-		wedgedVerdict:
-			wedged > 0 ? (granted > 0 && wedged / granted >= LIMITS.wedgedShare ? 'bad' : 'warn') : granted > 0 ? 'ok' : 'na',
-		repaired,
+		holds,
+		holdsVerdict:
+			holds > 0 ? (granted > 0 && holds / granted >= LIMITS.wedgedShare ? 'bad' : 'warn') : granted > 0 ? 'ok' : 'na',
 		verifyWalks: sumCount(verify),
 		verifyMean: weighted(verify, 'mean'),
 		publishP95,
@@ -380,20 +518,72 @@ export function keeperStats(data) {
 		publishVerdict: verdictAbove(publishP95, LIMITS.publishMs),
 		publishSpark: weightedBuckets(publish, 'p95s', data.bucketCount),
 		// Once per keeper load: a load in the range is a restart (or a failed load retried).
-		loads: sumCount(series(QUEUE_HEALTH.loadMs)),
+		loads,
 		loadP95: weighted(series(QUEUE_HEALTH.loadMs), 'p95'),
-		// The backlog snapshot's 1/0 gauge, once per snapshot per node: the zeros are snapshots that found
-		// a keeper not live. A mean merges exactly, so samples × (1 − mean) counts them across nodes.
-		snapshots: sumCount(liveGauge),
-		notLiveSnapshots:
-			sumCount(liveGauge) > 0 ? Math.round(sumCount(liveGauge) * (1 - (weighted(liveGauge, 'mean') ?? 1))) : 0,
+		snapshots,
+		notLiveSnapshots,
+		// A restart is one load, and the snapshot that lands in its load window (or the peer wait) reads the
+		// keeper not live. Up to one such snapshot per load is the restart, not a fault.
+		unexplainedNotLive: Math.max(0, notLiveSnapshots - loads),
 	};
 }
 
 /**
+ * Keeper repairs over the range, for BOTH views — one reading so they cannot disagree.
+ *
+ * Two sources: the range's `keeper_repaired` sum, and each node's last verification walk (queue-state),
+ * which also covers a range too short to hold an hourly walk. Rows gained in a membership change are
+ * counted apart (`gained`, a watch): the walk reports them as repairs, but nothing was missed (see
+ * `membershipGain`). `missed` is what is left, and any is bad.
+ */
+export function repairsReading(data, qs) {
+	const inRange = data ? sumValues(queueSeries(data, QUEUE_HEALTH.repaired)) : 0;
+	const walksInRange = data ? sumCount(queueSeries(data, QUEUE_HEALTH.verifyMs)) : 0;
+	const since = Number.isFinite(data?.startMs) ? data.startMs : null;
+	const keepers = (qs?.nodes ?? []).filter((row) => row.answered).map((row) => row.trust?.keeper ?? null);
+	const walked = keepers.filter((keeper) => keeper?.verify);
+	const lastRepaired = walked.reduce((acc, keeper) => acc + Math.max(0, keeper.verify.repaired ?? 0), 0);
+	const lastGained = walked.reduce((acc, keeper) => acc + membershipGain(keeper), 0);
+	// A membership resync inside the range explains that much of the range's sum.
+	const rangeGained = keepers.reduce((acc, keeper) => {
+		const resync = keeper?.lastResync;
+		const inWindow = since === null || (Number.isFinite(resync?.at) && resync.at >= since);
+		return resync && MEMBERSHIP.test(resync.why ?? '') && resync.repaired > 0 && inWindow ? acc + resync.repaired : acc;
+	}, 0);
+	const gainedRange = Math.min(inRange, rangeGained);
+	const gainedLast = Math.min(lastRepaired, lastGained);
+	const missed = Math.max(inRange - gainedRange, lastRepaired - gainedLast);
+	const gained = Math.max(gainedRange, gainedLast);
+	const evidence = walksInRange > 0 || walked.length > 0;
+	return {
+		total: Math.max(inRange, lastRepaired),
+		missed,
+		gained,
+		walksInRange,
+		nodesWalked: walked.length,
+		nodes: keepers.length,
+		verdict: missed > 0 ? 'bad' : gained > 0 ? 'warn' : evidence ? 'ok' : 'na',
+	};
+}
+
+/** What the repairs reading says, in one line, for a tile's sub or a check's. */
+export function repairsSub(r) {
+	const coverage =
+		r.walksInRange > 0
+			? `${num(r.walksInRange)} verify walk${r.walksInRange === 1 ? '' : 's'}`
+			: r.nodesWalked > 0
+				? 'no walk in range'
+				: 'no verify walk yet';
+	const nodes = r.nodes > 0 ? ` · last walk on ${r.nodesWalked}/${r.nodes} nodes` : '';
+	return r.gained > 0 && r.missed === 0
+		? `${num(r.gained)} rows gained after a membership change`
+		: `${coverage}${nodes} · expect 0`;
+}
+
+/**
  * A node's live lease count from the overview's EXACT slot walk, or null. Preferred over queue-state's
- * `now.inFlight`, which is the lease table's O(1) gauge: it counts a lease that expired without a result
- * until the next reconcile (measured 410 against an exact 290 on a node whose renders never reported).
+ * `now.inFlight`, which before plugin v0.93.1 was the lease table's O(1) gauge: it counted a lease that
+ * expired without a result until the next reconcile (measured 410 against an exact 290).
  */
 function exactLeases(overview, hostname) {
 	const leases = overview?.leases;
@@ -431,7 +621,7 @@ function keeperAlarm(qs) {
 	return el(
 		'div',
 		{ cls: 'note bad' },
-		down.map(({ row, v }) => el('div', null, [el('strong', { text: `${row.hostname ?? 'a node'}: ` }), v.detail]))
+		down.map(({ row, v }) => el('div', null, [el('strong', { text: `${hostOf(row)}: ` }), v.detail]))
 	);
 }
 
@@ -444,11 +634,12 @@ function kpis(data, qs, analytics) {
 		? sumCount(pick(analytics, 'render', (s) => s.path === OUTCOME)) /
 			(coveredHours(analytics) ?? analytics.rangeMs / 3_600_000)
 		: null;
-	const clear = drain(reading.overdue, reading.inFlight, rendersPerHour);
+	const clear = drainOf(reading, rendersPerHour);
 	const slots = slotPressure(data);
 	const slotVerdict = verdictAbove(slots?.share, LIMITS.slotShare);
 	const late = behind(qs?.cluster?.lateness);
-	const lateVerdict = verdictAbove(late?.share, LIMITS.behindShare);
+	const lateVerdict = behindVerdict(late);
+	const flightShort = reading.inFlightShortOf.length > 0;
 	const sourceText =
 		reading.source === 'keeper'
 			? reading.floor
@@ -462,36 +653,40 @@ function kpis(data, qs, analytics) {
 		stat(
 			'Due now',
 			Number.isFinite(reading.overdue) ? num(reading.overdue) + (reading.floor ? '+' : '') : '—',
-			reading.error
-				? reading.source === 'snapshot'
-					? 'last snapshot has no count'
-					: reading.error
-				: !reading.source
-					? 'no queue state or snapshot'
-					: Number.isFinite(clear.ms)
-						? `~${duration(clear.ms)} to clear · ${sourceText}`
-						: sourceText,
+			reading.keeperDown
+				? 'no count: a queue keeper is not live'
+				: reading.error
+					? 'last snapshot failed'
+					: !reading.source
+						? 'no queue state or snapshot'
+						: Number.isFinite(clear.ms)
+							? `~${duration(clear.ms)} to clear · ${sourceText}`
+							: sourceText,
 			{
 				warn: clear.verdict === 'warn' || reading.floor,
 				bad: clear.verdict === 'bad' || !!reading.error,
 				title:
 					'Includes in-flight renders: a leased row keeps its due time until it lands. "To clear" is the rows ' +
-					'waiting beyond in-flight ÷ the render rate over the selected range. Live when every node’s queue ' +
-					'keeper can vouch for its count; otherwise the backlog snapshot' +
+					'waiting beyond in-flight, node by node, ÷ the render rate over the selected range. Live when every ' +
+					'node’s queue keeper can vouch for its count; otherwise the backlog snapshot' +
 					(reading.shortOf.length ? `, which has no queue from ${reading.shortOf.join(', ')}.` : '.') +
 					(reading.error ? ` ${reading.error}` : ''),
 			}
 		),
 		stat(
 			'In flight',
-			Number.isFinite(reading.inFlight) ? num(reading.inFlight) : '—',
-			[reading.inFlightLive ? 'live' : 'from snapshot', slots && `${pct(slots.share, 1)} of slots`]
+			Number.isFinite(reading.inFlight) ? num(reading.inFlight) + (flightShort ? '+' : '') : '—',
+			[
+				reading.inFlightLive ? 'live' : 'from snapshot',
+				slots && `${isMerged(data) ? 'fullest node ' : ''}${pct(slots.share, 1)} of slots`,
+			]
 				.filter(Boolean)
 				.join(' · '),
 			{
-				warn: slotVerdict === 'warn',
+				warn: slotVerdict === 'warn' || flightShort,
 				bad: slotVerdict === 'bad',
 				title:
+					(flightShort ? `No lease count from ${reading.inFlightShortOf.join(', ')}. ` : '') +
 					'Live leases. Slots are per node, and a full lease table refuses grants on that node' +
 					(slots?.node ? ` (fullest: ${slots.node}).` : '.'),
 			}
@@ -499,11 +694,19 @@ function kpis(data, qs, analytics) {
 		stat(
 			'Behind',
 			late?.share === null || !late ? '—' : pct(late.late, late.all),
-			late ? `${num(late.late)} due rows ≥ 1 cadence late` : qs ? 'needs every keeper live' : 'no queue state',
+			late
+				? `${num(late.late)} due rows ≥ 1 cadence late`
+				: qs?.cluster?.lateness?.edgesDiverge
+					? 'nodes bin lateness differently'
+					: qs
+						? 'needs every keeper live'
+						: 'no queue state',
 			{
 				warn: lateVerdict === 'warn',
 				bad: lateVerdict === 'bad',
-				title: 'Due rows at least one of their own cadences late: their page is already two cadences old.',
+				title:
+					'Due rows at least one of their own cadences late: their page is already two cadences old. Judged ' +
+					`only past ${num(LIMITS.behindMinRows)} such rows.`,
 			}
 		),
 	];
@@ -551,7 +754,16 @@ function kpis(data, qs, analytics) {
  */
 export function drain(overdue, inFlight, rendersPerHour) {
 	if (!Number.isFinite(overdue)) return { ms: null, verdict: 'na' };
-	const waiting = Math.max(0, overdue - (Number.isFinite(inFlight) ? inFlight : 0));
+	return drainWaiting(Math.max(0, overdue - (Number.isFinite(inFlight) ? inFlight : 0)), rendersPerHour);
+}
+
+/** `drain` from a `backlogReading`: its per-node waiting rows when it has them (the keepers), else due − in flight. */
+export const drainOf = (reading, rendersPerHour) =>
+	Number.isFinite(reading.waiting)
+		? drainWaiting(reading.waiting, rendersPerHour)
+		: drain(reading.overdue, reading.inFlight, rendersPerHour);
+
+function drainWaiting(waiting, rendersPerHour) {
 	if (waiting === 0) return { ms: 0, verdict: 'ok' };
 	// An UNKNOWN rate (no analytics loaded) is not a zero one: "nothing rendered" would be a claim.
 	if (rendersPerHour === null || rendersPerHour === undefined || !Number.isFinite(rendersPerHour)) {
@@ -584,29 +796,26 @@ function keeperCard(ctx, qs, analytics, overview) {
 		});
 	}
 	const k = keeperStats(analytics);
+	const repairs = repairsReading(analytics, qs);
+	const verifyMs = Number(optionIndex(configState(ctx).payload).get('queue.keeper.verifyInterval')?.effective);
+	const verifyEvery = Number.isFinite(verifyMs) && verifyMs > 0 ? `every ${duration(verifyMs)}` : 'periodic';
 	const tiles = k
 		? stats([
-				stat(
-					'Repaired',
-					num(k.repaired),
-					k.verifyWalks ? `rows · ${num(k.verifyWalks)} verify walks` : 'no walk in range',
-					{
-						bad: k.repaired > 0,
-						title: 'Rows a verification walk found the keeper holding differently from the table. Expect 0.',
-					}
-				),
-				stat(
-					'Wedged',
-					num(k.wedged),
-					k.granted > 0 ? `keys held · ${pct(k.wedged, k.granted)} of grants` : 'keys held',
-					{
-						warn: k.wedgedVerdict === 'warn',
-						bad: k.wedgedVerdict === 'bad',
-						title:
-							'Keys held back because their last leases all expired with no result: a renderer crashing on the URL ' +
-							'(the plugin log names them), or, when many at once, results not reaching the node.',
-					}
-				),
+				stat('Repaired', num(repairs.total), repairsSub(repairs), {
+					warn: repairs.verdict === 'warn',
+					bad: repairs.verdict === 'bad',
+					title:
+						'Rows a verification walk found the keeper holding differently from the table. Expect 0; rows gained ' +
+						'in a membership change are counted here too, and are named as such.',
+				}),
+				stat('Holds', num(k.holds), k.granted > 0 ? `${pct(k.holds, k.granted)} of grants` : 'no grants in range', {
+					warn: k.holdsVerdict === 'warn',
+					bad: k.holdsVerdict === 'bad',
+					title:
+						'Times a key was held back because its last leases all expired with no result: a renderer crashing on ' +
+						'the URL (the plugin log names them), or, when many at once, results not reaching the node. A key ' +
+						'still failing is held again, and counted again.',
+				}),
 				stat(
 					'Stale skips',
 					k.staleShare === null ? '—' : pct(k.stale, k.stale + k.granted),
@@ -621,7 +830,9 @@ function keeperCard(ctx, qs, analytics, overview) {
 				stat('Publish', fmtMs(k.publishP95), `p95 ≈ · median ${fmtMs(k.publishMedian)}`, {
 					warn: k.publishVerdict === 'warn',
 					bad: k.publishVerdict === 'bad',
-					title: 'One ready-set publish on worker 0, every publishInterval. Single-digit ms when healthy.',
+					title:
+						'One ready-set publish on worker 0, per queue.keeper.publishInterval (skipped when nothing changed, ' +
+						'forced every 10s). Single-digit ms when healthy.',
 				}),
 				stat('Verify walk', fmtMs(k.verifyMean), k.verifyWalks ? 'mean' : 'no walk in range'),
 				stat('Loads', num(k.loads), k.loads ? `p95 ≈ ${fmtMs(k.loadP95)}` : 'none in range', {
@@ -638,9 +849,9 @@ function keeperCard(ctx, qs, analytics, overview) {
 		const leased = exactLeases(overview, row.hostname);
 		const cell = (text, extra = {}) => el('td', { cls: 'right mono', text, ...extra });
 		return el('tr', null, [
-			el('td', { cls: 'mono' }, [row.hostname ?? '—']),
+			el('td', { cls: 'mono' }, [hostOf(row)]),
 			el('td', { title: v.detail }, [pill(v.label, VERDICT_PILL[v.verdict] ?? '')]),
-			cell(row.live && Number.isFinite(row.now?.due) ? num(row.now.due) + (row.trust?.exact === true ? '' : '+') : '—'),
+			cell(row.live && Number.isFinite(row.now?.due) ? num(row.now.due) + (countsExact(row) ? '' : '+') : '—'),
 			Number.isFinite(leased)
 				? cell(num(leased), { title: 'Live leases, from an exact walk of the lease table.' })
 				: cell(Number.isFinite(row.now?.inFlight) ? `≈${num(row.now.inFlight)}` : '—', {
@@ -673,7 +884,11 @@ function keeperCard(ctx, qs, analytics, overview) {
 			el('td', { cls: 'right' }, [
 				verify
 					? verify.repaired > 0
-						? pill(`${num(verify.repaired)} repaired`, 'bad')
+						? membershipGain(keeper) > 0
+							? el('span', { title: 'Rows this node gained in a membership change, not missed writes.' }, [
+									pill(`${num(verify.repaired)} gained`, 'warn'),
+								])
+							: pill(`${num(verify.repaired)} repaired`, 'bad')
 						: muted(ago(verify.at))
 					: muted('not yet'),
 			]),
@@ -687,31 +902,29 @@ function keeperCard(ctx, qs, analytics, overview) {
 			'Each node’s queue keeper holds the schedule rows that node owns and publishes the ready set claims are ',
 			'served from; these counts are its own, exact and seconds old. A node that cannot vouch for its numbers ',
 			'(starting, loading, failed, or gone quiet) says why, and the cluster total is withheld until every node ',
-			'can, rather than shown short. The tiles are the selected range: rows the hourly verification had to ',
-			'repair (expect 0), keys held back because their renders never report, claims that found a row no longer ',
-			'due, and what a publish and a verification walk cost worker 0.',
+			'can, rather than shown short. The tiles are the selected range: rows the verification walk ',
+			`(${verifyEvery}) had to repair (expect 0), holds on keys whose renders never report, claims that found `,
+			'a row no longer due, and what a publish and a verification walk cost worker 0.',
 		],
 		body: [
 			tiles,
-			k?.notLiveSnapshots > 0 &&
+			k?.unexplainedNotLive > 0 &&
 				el('div', {
 					cls: 'note warn',
-					text: `${num(k.notLiveSnapshots)} of ${num(k.snapshots)} backlog snapshots in this range found a queue keeper not live.`,
+					text:
+						`${num(k.notLiveSnapshots)} of ${num(k.snapshots)} backlog snapshots in this range found a queue keeper ` +
+						`not live, more than its ${num(k.loads)} load${k.loads === 1 ? '' : 's'} explain.`,
 				}),
 			withheld.length > 0 &&
 				qs.configured > 1 &&
 				el('div', {
 					cls: 'note warn',
 					text:
-						`Cluster totals withheld: ${withheld.map((w) => w.hostname).join(', ')} cannot vouch for ` +
+						`Cluster totals withheld: ${withheld.map((w) => w.hostname ?? 'this node').join(', ')} cannot vouch for ` +
 						`${withheld.length === 1 ? 'its' : 'their'} counts. The rows below are each node’s own.`,
 				}),
-			qs.cluster &&
-				qs.cluster.exact !== true &&
-				el('div', {
-					cls: 'note warn',
-					text: `Counts are a lower bound on ${(qs.cluster.inexactOn ?? []).join(', ') || 'a node'}.`,
-				}),
+			inexactNodes(qs).length > 0 &&
+				el('div', { cls: 'note warn', text: `Counts are a lower bound on ${inexactNodes(qs).join(', ')}.` }),
 			table(
 				[
 					'node',
@@ -749,6 +962,7 @@ function latenessCard(qs) {
 	}));
 	const classes = (lateness.classes ?? []).slice(0, 8);
 	return card('How late the due rows are', {
+		head: [spacer(), lateness.listsTruncated === true && muted('class lists capped at 200 per node')],
 		help:
 			'Due rows binned by lateness in their OWN cadence (0.5× on a 6h route is 3h late), sitemap and discovered ' +
 			'apart. Claims take the most late first, with sitemap rows boosted, so a class whose head keeps getting ' +
@@ -1129,8 +1343,8 @@ function upcoming(ctx, data, qs) {
 				})
 			);
 		}
-	} else if (qs.cluster.exact !== true) {
-		body.push(el('div', { cls: 'note warn', text: 'Counts are a lower bound: a keeper is not exact.' }));
+	} else if (inexactNodes(qs).length > 0) {
+		body.push(el('div', { cls: 'note warn', text: `Counts are a lower bound on ${inexactNodes(qs).join(', ')}.` }));
 	}
 	if ((fromKeeper || (lastRun && !lastRun.error)) && buckets.length && !buckets.some((bucket) => bucket.count)) {
 		body.push(el('div', { cls: 'note ok', text: 'Nothing is due in the next 24 hours.' }));
@@ -1205,8 +1419,8 @@ function settings(ctx) {
 			title: 'Scan budgets',
 			prefix: 'scan',
 			description:
-				'The bounds every registry walk runs under. A cap below the corpus makes the sweeps report a floor rather ' +
-				'than a count.',
+				'The bounds every registry walk runs under: how many rows one scan buffers, how writes are batched once ' +
+				'the cursor closes, and how often a walk yields to the event loop.',
 		}),
 	]);
 }

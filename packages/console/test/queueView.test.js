@@ -23,7 +23,9 @@ import { installDom, find } from './domShim.js';
 installDom();
 
 const { el } = await import('../src/admin/ui.js');
-const { load, render, keeperVerdict, queueStateOf, behind } = await import('../src/admin/views/queue.js');
+const { load, render, keeperVerdict, queueStateOf, behind, backlogReading, drainOf } = await import(
+	'../src/admin/views/queue.js'
+);
 const { mergeQueueState } = await import('../src/util/aggregate.js');
 
 const BUCKETS = 4;
@@ -272,15 +274,40 @@ test('mid-rollout, a node still on 0.92 is a watch, not an outage — it claims 
 	assert.match(root.textContent, /Cluster totals withheld: b\.example\.com:9926/);
 });
 
-test('an older plugin without queue-state says what it needs, instead of an empty keeper', async () => {
-	const notFound = {
+test('with no queue state at all, the card says what each node answered', async () => {
+	const failed = {
 		ok: false,
 		status: 502,
-		body: { error: 'No prerender node answered.', sources: { nodes: [{ status: 404 }, { status: 404 }] } },
+		body: {
+			error: 'No prerender node answered.',
+			sources: {
+				nodes: [
+					{ hostname: 'a.example.com:9926', ok: false, status: 404, error: 'Management API is disabled' },
+					{ hostname: 'b.example.com:9926', ok: false, status: 0, error: 'unreachable: timeout' },
+				],
+			},
+		},
 	};
-	const ctx = makeCtx(ANALYTICS, { queueState: notFound });
+	const ctx = makeCtx(ANALYTICS, { queueState: failed });
 	await load(ctx);
-	assert.match(draw(ctx).textContent, /Queue state needs plugin v0\.93\.0/);
+	const text = draw(ctx).textContent;
+	assert.match(text, /No prerender node answered\. a\.example\.com:9926 \(Management API is disabled\)/);
+	assert.match(text, /b\.example\.com:9926 \(unreachable: timeout\)/);
+});
+
+test('drilled to a node on plugin 0.92, it is "no keeper" — the same watch as under cluster scope', async () => {
+	const ctx = makeCtx(ANALYTICS, {
+		queueState: { ok: false, status: 404, body: { error: 'Unknown route: queue-state' } },
+	});
+	await load(ctx);
+	const row = rowOf(keeperTable(ctx), 'this node');
+	assert.ok(find(row, (n) => n.attributes?.class === 'pill warn' && n.textContent === 'no keeper'));
+	assert.equal(
+		keeperVerdict(queueStateOf({ ok: false, status: 404, body: { error: 'Unknown route' } }).nodes[0]).verdict,
+		'warn'
+	);
+	// "Management API is disabled" is a 404 too, and is not a node without a keeper.
+	assert.equal(queueStateOf({ ok: false, status: 404, body: { error: 'Management API is disabled' } }), null);
 });
 
 test('stale skips and grants are SUMS OF VALUES, not counts of emits', async () => {
@@ -304,10 +331,11 @@ test('a keeper repair is bad, and wedged keys past 5% of grants are too', async 
 	});
 	await load(ctx);
 	assert.ok(find(tile(ctx, 'Repaired'), (n) => n.attributes?.class === 'value bad'));
-	const wedged = tile(ctx, 'Wedged');
-	assert.match(wedged.textContent, /50/);
-	assert.match(wedged.textContent, /12% of grants/);
-	assert.ok(find(wedged, (n) => n.attributes?.class === 'value bad'));
+	// HOLDS, not keys: a key still failing when its hold ends is held and counted again.
+	const holds = tile(ctx, 'Holds');
+	assert.match(holds.textContent, /50/);
+	assert.match(holds.textContent, /12% of grants/);
+	assert.ok(find(holds, (n) => n.attributes?.class === 'value bad'));
 });
 
 test('in flight is the exact lease walk, and slot pressure is the fullest node’s', async () => {
@@ -342,10 +370,10 @@ test('the real 0.93.0 payloads render: keeper live, due exact, wedged keys calle
 	assert.match(tile(ctx, 'Due now').textContent, /152,515/);
 	assert.match(tile(ctx, 'In flight').textContent, /290/, 'the exact walk, not the 410 gauge');
 	// 19 claim passes held 10 keys each; 68 passes granted 10.66 each.
-	const wedged = tile(ctx, 'Wedged');
-	assert.match(wedged.textContent, /190/);
+	const holds = tile(ctx, 'Holds');
+	assert.match(holds.textContent, /190/);
 	assert.ok(
-		find(wedged, (n) => n.attributes?.class === 'value bad'),
+		find(holds, (n) => n.attributes?.class === 'value bad'),
 		'every render failing to report is bad'
 	);
 	assert.match(tile(ctx, 'Stale skips').textContent, /36 entries/);
@@ -470,4 +498,156 @@ test('the node table carries each node’s status, throughput and pause controls
 	assert.match(table.textContent, /paused here/, 'a per-node override is shown as intent, apart from status');
 	// Under node scope only this node's row has a rate; the other is a blank, never a zero.
 	assert.match(table.textContent, /node-a.*500/s);
+});
+
+// ---- review findings ------------------------------------------------------------
+
+/** The live answer with a lateness breakdown and due count of its own. */
+const liveWith = (over) => ({ ...LIVE_STATE, ...over });
+const nodeState = (body) => ({ ok: true, status: 200, body });
+
+test('rows gained in a membership change read as gained (watch), and the counts are not marked short', async () => {
+	const at = Date.now() - 60_000;
+	const keeper = {
+		...LIVE_STATE.trust.keeper,
+		exact: false,
+		verify: { ...LIVE_STATE.trust.keeper.verify, at: at - 1_300, repaired: 12, missing: 12 },
+		lastResync: { at, why: "the cluster's node list changed (a -> a,b)", ms: 1_400, repaired: 12 },
+	};
+	const state = liveWith({ trust: { ...LIVE_STATE.trust, exact: false, keeper } });
+	const analytics = {
+		...ANALYTICS,
+		series: [...ANALYTICS.series, combo('queue_health', 'keeper_repaired', null, null, 1, 12)],
+	};
+	const ctx = makeCtx(analytics, { queueState: nodeState(state) });
+	await load(ctx);
+	const row = rowOf(keeperTable(ctx), 'localhost');
+	assert.ok(find(row, (n) => n.attributes?.class === 'pill warn' && n.textContent === '12 gained'));
+	assert.ok(find(row, (n) => n.attributes?.class === 'pill ok' && n.textContent === 'live'));
+	assert.match(row.textContent, /152,515(?!\+)/, 'complete counts carry no "+"');
+	const repaired = tile(ctx, 'Repaired');
+	assert.match(repaired.textContent, /12 rows gained after a membership change/);
+	assert.ok(find(repaired, (n) => n.attributes?.class === 'value warn'));
+	assert.doesNotMatch(tile(ctx, 'Due now').textContent, /\+/);
+});
+
+test('Behind is not judged on a handful of rows: 4 late of 12 due on a quiet cluster is not bad', async () => {
+	const quiet = liveWith({
+		now: { ...LIVE_STATE.now, due: 12, dueSitemap: 12, dueDiscovered: 0, unclaimed: 12 },
+		lateness: { ...LIVE_STATE.lateness, sitemap: [6, 2, 4, 0, 0], discovered: [0, 0, 0, 0, 0] },
+	});
+	const ctx = makeCtx(ANALYTICS, { queueState: nodeState(quiet) });
+	await load(ctx);
+	const behindTile = tile(ctx, 'Behind');
+	assert.match(behindTile.textContent, /33%/);
+	assert.ok(
+		find(behindTile, (n) => n.attributes?.class === 'value'),
+		'under the minimum late-row count: no verdict'
+	);
+	// Past the minimum the same share is bad.
+	const busy = liveWith({
+		lateness: { ...LIVE_STATE.lateness, sitemap: [600, 200, 400, 0, 0], discovered: [0, 0, 0, 0, 0] },
+	});
+	const ctx2 = makeCtx(ANALYTICS, { queueState: nodeState(busy) });
+	await load(ctx2);
+	assert.ok(find(tile(ctx2, 'Behind'), (n) => n.attributes?.class === 'value bad'));
+});
+
+test('a lease sum missing a node is marked short and names it when there is no keeper total', async () => {
+	const overview = {
+		...OVERVIEW,
+		leases: {
+			occupancy: 290,
+			maxLeases: 4096,
+			fullestShare: 290 / 4096,
+			fullestNode: 'a.example.com:9926',
+			missing: ['b.example.com:9926'],
+			byNode: [{ hostname: 'a.example.com:9926', occupancy: 290, maxLeases: 4096 }],
+		},
+	};
+	const ctx = makeCtx(ANALYTICS, {
+		overview,
+		queueState: merged(answer('a', LIVE_STATE), answer('b', LOADING_STATE, 503)),
+	});
+	await load(ctx);
+	const inFlight = tile(ctx, 'In flight');
+	assert.match(inFlight.textContent, /290\+/);
+	assert.match(inFlight.attributes.title, /No lease count from b\.example\.com:9926/);
+	assert.ok(find(inFlight, (n) => n.attributes?.class === 'value warn'));
+});
+
+test('an overview that fails still shows the keepers — the page names the overview, not "queue state"', async () => {
+	const ctx = makeCtx();
+	const base = ctx.get;
+	ctx.get = async (route, params) =>
+		route === 'overview' ? { ok: false, status: 502, body: { error: 'Bad gateway' } } : base(route, params);
+	await load(ctx);
+	const root = draw(ctx);
+	assert.ok(find(root, (n) => n.attributes?.class === 'note bad' && n.textContent === 'Bad gateway'));
+	assert.ok(keeperTable(ctx), 'the keeper card is still drawn');
+	assert.match(tile(ctx, 'Due now').textContent, /152,515/);
+	const fallback = makeCtx();
+	fallback.get = async (route, params) =>
+		route === 'overview' ? { ok: false, status: 502, body: {} } : base(route, params);
+	await load(fallback);
+	assert.match(draw(fallback).textContent, /Could not load the cluster overview \(502\)/);
+});
+
+test('rows waiting are summed PER NODE: one node’s spare leases never cancel another’s backlog', () => {
+	// a: 10 due, 30 leased (leases can outlive a row's ownership); b: 100 due, none leased.
+	// Σdue − Σleases = 80; per node it is 0 + 100 = 100.
+	const qs = mergeQueueState([
+		answer('a', liveWith({ now: { ...LIVE_STATE.now, due: 10, inFlight: 30, unclaimed: 0 } })),
+		answer('b', liveWith({ now: { ...LIVE_STATE.now, due: 100, inFlight: 0, unclaimed: 100 } })),
+	]).body;
+	const overview = {
+		leases: {
+			occupancy: 30,
+			maxLeases: 8192,
+			missing: [],
+			byNode: [
+				{ hostname: 'a.example.com:9926', occupancy: 30, maxLeases: 4096 },
+				{ hostname: 'b.example.com:9926', occupancy: 0, maxLeases: 4096 },
+			],
+		},
+	};
+	const reading = backlogReading(overview, qs);
+	assert.equal(reading.overdue, 110);
+	assert.equal(reading.waiting, 100);
+	assert.equal(drainOf(reading, 100).ms, 3_600_000, '100 waiting at 100 renders/h is an hour');
+});
+
+test('queue flow: In, Out and Net are per-minute means of the due-set transitions, gaps kept as gaps', async () => {
+	const minute = 60_000;
+	const t0 = Math.floor(Date.now() / minute) * minute - 3 * minute;
+	const flow = [
+		{ minute: t0, cameDue: 10, triggered: 2, rescheduled: 5, added: 1, removed: 0 },
+		{ minute: t0 + minute, cameDue: 20, triggered: 0, rescheduled: 5, added: 0, removed: 7 },
+		{ minute: t0 + 3 * minute, cameDue: 30, triggered: 1, rescheduled: 5, added: 0, removed: 0 },
+	];
+	const ctx = makeCtx(ANALYTICS, { queueState: nodeState(liveWith({ flow })) });
+	await load(ctx);
+	// In = (12 + 20 + 31) / 3 = 21; Out = rescheduled only (removed rows may not have been due) = 5.
+	assert.match(tile(ctx, 'In').textContent, /21\/min/);
+	assert.match(tile(ctx, 'Out').textContent, /5\/min/);
+	const net = tile(ctx, 'Net');
+	assert.match(net.textContent, /\+16\/min/);
+	assert.match(net.textContent, /growing/);
+});
+
+test('lateness bins carry their values: sitemap and discovered per bin, from the real payload', async () => {
+	const ctx = await ready();
+	const text = draw(ctx).textContent;
+	// sitemap [47608, 49513, 3342, 3277, 10], discovered [23443, 23987, 669, 666, 0]
+	assert.match(text, /0–0\.25× · 48k sitemap \/ 23k discovered/);
+	assert.match(text, /1–2× · 3\.3k sitemap \/ 669 discovered/);
+	assert.match(text, /≥ 4× · 10 sitemap \/ 0 discovered/);
+	assert.doesNotMatch(text, /class lists capped/, '0.93.0 sends no listsTruncated; absence is not cut');
+});
+
+test('plugin 0.93.1’s listsTruncated is shown when present', async () => {
+	const cut = liveWith({ lateness: { ...LIVE_STATE.lateness, listsTruncated: true } });
+	const ctx = makeCtx(ANALYTICS, { queueState: nodeState(cut) });
+	await load(ctx);
+	assert.match(draw(ctx).textContent, /class lists capped at 200 per node/);
 });
