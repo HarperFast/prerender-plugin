@@ -21,6 +21,12 @@
  * stopped extracting anything reports zero changes, triggers nothing, and looks exactly like a
  * catalogue that is not moving. So the failure share is a health flag, not a number to go find.
  *
+ * A DETECTED CHANGE IS ACTED ON WHEN IT IS FOUND (plugin v0.94.0): the page is hard-expired and its
+ * render filed ahead of routine rotation, as the walk goes. There is no trigger queue, no per-pass
+ * budget and nothing deferred any more, so the numbers that watched those — deferrals, queue depth,
+ * the drain rate — are gone from this page. What is left to watch is whether an action FAILED
+ * (`errors`: that page still serves what it did, and is retried on its next probe).
+ *
  * TWO CADENCES, AND THE PANELS KEEP THEM APART. The SWEEP walks this node's whole owned slice on
  * a long interval and catches per-URL drift; the CANARY probes a small fixed cohort every few
  * minutes and exists for the event a sweep structurally cannot see in time — a promotion that
@@ -147,8 +153,7 @@ const OUTCOMES = [
 	['rebaselined', 'Re-baselined', '#7c8cc4'],
 	['changed', 'Changed', '#f0a02a'],
 	['page_mismatch', 'Page mismatch', '#22b8cf'],
-	['triggered', 'Triggered', '#10a87e'],
-	['deferred', 'Deferred', '#9d6bff'],
+	['triggered', 'Acted on', '#10a87e'],
 	['failed', 'Failed', '#e0566f'],
 	['throttled', 'Throttled', '#a32438'],
 ];
@@ -276,7 +281,7 @@ export function render(ctx) {
 
 /**
  * The config endpoint's view of the probe settings — used ONLY for nodes whose plugin predates
- * v0.91.0 and so does not report its own (the next anchored run, the trigger queue's ceiling).
+ * v0.91.0 and so does not report its own (the next anchored run, above all).
  */
 function settingsFromConfig(ctx) {
 	const options = optionIndex(configState(ctx).payload);
@@ -293,8 +298,7 @@ function settingsFromConfig(ctx) {
 		concurrency: setting('concurrency'),
 		scope: setting('scope'),
 		reprobeAfter: setting('reprobeAfter'),
-		maxTriggersPerSweep: setting('maxTriggersPerSweep'),
-		trigger: { maxPending: setting('trigger.maxPending'), ratePerSecond: setting('trigger.ratePerSecond') },
+		trigger: { concurrency: setting('trigger.concurrency') },
 		canary: {
 			interval: setting('canary.interval'),
 			count: setting('canary.count'),
@@ -338,8 +342,8 @@ const FLAG_TITLE = {
 	'pushback-trace': 'Origin pushback (trace).',
 	'backoff': 'Backoff engaged.',
 	'rebaselined': 'Rule edit re-baselined rows.',
-	'deferred': 'Changes deferred.',
-	'queue-near-full': 'Trigger queue near full.',
+	'action-errors': 'Actions failed.',
+	'resumed': 'Resumed after a restart.',
 	'cycle-behind': 'Behind the cycle target.',
 	'pass-error': 'Last sweep failed.',
 	'gave-up': 'Gave up on a refusing origin.',
@@ -513,6 +517,12 @@ function summaryLine(model) {
 
 const NA = (why) => el('span', { cls: 'muted', text: 'n/a', title: why });
 
+/** "3 of 8" against the node's `trigger.concurrency` when it reports one, else the bare count. */
+const actionsText = (n, settings) => {
+	const limit = settings?.trigger?.concurrency;
+	return typeof limit === 'number' && limit > 0 ? `${num(n)} of ${num(limit)}` : num(n);
+};
+
 function stateTable(model) {
 	return table(
 		['node', 'state', 'progress', 'rate', 'finishes / next run', 'state row'],
@@ -536,7 +546,8 @@ function stateCell(d) {
 	const out = [pill(text, kind)];
 	if (d.state === 'running' || d.state === 'stalled') {
 		const r = d.running;
-		if (r.phase === 'draining') out.push(pill('draining triggers', 'info'));
+		if (r.phase === 'draining') out.push(pill('finishing actions', 'info'));
+		if (r.startedBy === 'resume') out.push(pill('resumed', 'info'));
 		const runMode = r.dryRun ?? (d.dryRun === false ? false : d.dryRun === true ? true : null);
 		if (runMode !== null) out.push(runMode ? pill('dry run', 'warn') : pill('live', 'ok'));
 		out.push(
@@ -599,14 +610,24 @@ function whenCell(d) {
 	const out = [];
 	if (d.running) {
 		const r = d.running;
-		if (r.etaAt !== null) {
+		if (r.etaBasis === 'draining') {
+			// The walk is over; what is left is at most `trigger.concurrency` actions settling.
+			out.push(mono('walk finished'));
+			out.push(
+				line([
+					muted(
+						r.actionsInFlight !== null
+							? `finishing ${num(r.actionsInFlight)} action${r.actionsInFlight === 1 ? '' : 's'} in flight`
+							: 'finishing the actions it started'
+					),
+				])
+			);
+		} else if (r.etaAt !== null) {
 			out.push(mono(`done ~${fmtWhen(r.etaAt, d.now)}`));
 			out.push(
 				line([
 					muted(
-						r.etaBasis === 'draining'
-							? 'walk finished; draining the trigger queue'
-							: `estimate: ${num(r.slice)}-row slice (${r.sliceSource === 'node' ? 'measured by the node' : 'the last complete pass'})`
+						`estimate: ${num(r.slice)}-row slice (${r.sliceSource === 'node' ? 'measured by the node' : 'the last complete pass'})`
 					),
 				])
 			);
@@ -704,12 +725,10 @@ const COUNT_ROWS = [
 	['caughtUp', 'Caught up — page already right', 'overlays Changed; no render'],
 	['ignored', 'Ignored — ignoreChanges slots', 'overlays Unchanged'],
 	['pageMismatch', 'Pages disagreeing with the origin', 'overlays the buckets', { hideWhenZero: true }],
-	['queued', 'Queued re-renders', 'handed to the trigger queue'],
-	['triggered', 'Re-renders filed', null],
-	['deferred', 'Deferred', 'retried next pass'],
+	['triggered', 'Acted on', 'page expired, render filed ahead'],
+	['errors', 'Action errors', 'page unchanged; retried next probe'],
 	['failed', 'Failed probes', null],
 	['throttled', '— of those, origin pushback', 'inside Failed'],
-	['errors', 'Trigger write errors', null],
 ];
 
 const countCell = (run, key) => {
@@ -801,7 +820,7 @@ function currentPassCard(model) {
 		),
 		infoRow('Phase', ({ d }) =>
 			d.running.phase
-				? muted(d.running.phase === 'draining' ? 'draining triggers' : 'walking the registry')
+				? muted(d.running.phase === 'draining' ? 'walk done — finishing actions' : 'walking the registry')
 				: NA('plugin < 0.91.0')
 		),
 		infoRow('Counts as of', ({ d }) =>
@@ -809,9 +828,14 @@ function currentPassCard(model) {
 				? muted(`heartbeat ${relative(d.running.heartbeatAt, d.now)}`)
 				: NA('plugin < 0.91.0')
 		),
-		infoRow('Trigger queue now', ({ run }) =>
-			typeof run?.triggerQueueDepth === 'number' ? mono(num(run.triggerQueueDepth)) : NA('plugin < 0.91.0')
-		),
+		// Plugin v0.94.0: expire-and-file actions started and not yet settled, at most trigger.concurrency.
+		// Left out entirely when no node reports it, rather than drawn as a row of n/a.
+		live.some((d) => d.running.actionsInFlight !== null) &&
+			infoRow('Actions in flight', ({ d }) =>
+				d.running.actionsInFlight !== null
+					? mono(actionsText(d.running.actionsInFlight, d.settings))
+					: NA(`not reported by plugin < ${SINCE.actionsInFlight}`)
+			),
 		infoRow('Pacing window now', ({ run }) =>
 			typeof run?.throttleLevel === 'number'
 				? run.throttleLevel > 1
@@ -826,7 +850,7 @@ function currentPassCard(model) {
 			'The RUNNING pass’s own counts as of its last heartbeat — part-way through its slice, not a result. The last ' +
 			'pass that finished has its own card below and is never mixed into these.',
 		body: [
-			passTable(columns, rows, { withSum: columns.length > 1 }),
+			passTable(columns, rows.filter(Boolean), { withSum: columns.length > 1 }),
 			older.length
 				? el('div', {
 						cls: 'hint',
@@ -928,8 +952,20 @@ function lastPassCard(status, model) {
 			),
 			infoRow('Started', ({ d }) => mono(fmtUtc(d.last.startedAt, d.now))),
 			infoRow('Duration', ({ d }) => mono(d.last.durationMs !== null ? duration(d.last.durationMs) : '—')),
-			infoRow('Started by', ({ run }) =>
-				run.startedBy ? muted(STARTED_BY[run.startedBy] ?? run.startedBy) : NA('not reported by plugin < 0.91.0')
+			infoRow('Started by', ({ d, run }) =>
+				!run.startedBy
+					? NA('not reported by plugin < 0.91.0')
+					: d.last.resumed
+						? el('span', null, [
+								pill('resumed after a restart', 'info'),
+								d.last.resumedFrom !== null
+									? el('div', {
+											cls: 'sub muted',
+											text: `continues the pass started ${fmtUtc(d.last.resumedFrom, d.now)}`,
+										})
+									: null,
+							])
+						: muted(STARTED_BY[run.startedBy] ?? run.startedBy)
 			),
 			infoRow('Run mode', ({ run }) =>
 				run.dryRun === false ? pill('live', 'ok') : pill('dry run — nothing triggered', 'warn')
@@ -960,13 +996,17 @@ function lastPassCard(status, model) {
 				)
 			);
 		}
-		rows.push(
-			infoRow('Trigger queue high-water', ({ run }) =>
-				typeof run.triggerQueueDepth === 'number'
-					? mono(num(run.triggerQueueDepth))
-					: NA(`added in ${SINCE.triggerQueueDepth}`)
-			)
-		);
+		// Plugin v0.94.0: the most expire-and-file actions the pass had in flight at once. At the
+		// concurrency ceiling the walk waited for a free slot at least once (backpressure, never a drop).
+		if (columns.some((c) => typeof c.run.maxActionsInFlight === 'number')) {
+			rows.push(
+				infoRow('Most actions in flight', ({ d, run }) =>
+					typeof run.maxActionsInFlight === 'number'
+						? mono(actionsText(run.maxActionsInFlight, d.settings))
+						: NA(`not reported by plugin < ${SINCE.maxActionsInFlight}`)
+				)
+			);
+		}
 		if (columns.some((c) => c.run.unreadable > 0)) {
 			rows.push(
 				infoRow('Unreadable rows stepped over', ({ run }) =>
@@ -987,29 +1027,21 @@ function lastPassCard(status, model) {
 		help: [
 			'The sweep catches per-URL drift — an item selling out, one price moving — walking the whole owned slice at ' +
 				'the configured rate, so a large corpus takes hours per pass by design (the canary covers the gap). ',
-			counted.length ? semantics(counted) : null,
+			counted.length ? semantics() : null,
 		],
 		body,
 	});
 }
 
-/**
- * Which counts are per pass and which are not. Stated, because it has changed: a plugin that keeps
- * one trigger queue across passes reports `triggered`/`errors` cumulatively (it carries
- * `triggerQueuePending`), and a reader summing those per pass would count every re-render twice.
- */
-function semantics(counted) {
-	const cumulative = counted.filter((d) => 'triggerQueuePending' in d.last.record);
+/** What the counts mean, per pass — including the two a detected change produces. */
+function semantics() {
 	return [
-		'Every count is for that one pass on that node. “Queued” is what the pass handed to the trigger queue; ',
-		'“Re-renders filed” is how many of those landed before it ended',
-		cumulative.length
-			? ` — except on ${nodeList(cumulative)}, whose plugin keeps one queue across passes: there “Re-renders ` +
-				'filed” and “Trigger write errors” are CUMULATIVE since the process started.'
-			: '.',
-		' The overlay rows (pages disagreeing, caught up, ignored, appended paths) are not buckets — each is also ' +
-			'inside Changed or Unchanged. “n/a” is a counter that node’s plugin does not report; Σ marked * sums only ' +
-			'the nodes that do.',
+		'Every count is for that one pass on that node. Each change is acted on as it is found: “Acted on” pages ',
+		'were hard-expired and their render filed ahead of routine rotation; an “Action error” left its page as it ',
+		'was and its baseline stale, so the next probe finds the change again. Nothing is deferred. A resumed pass ',
+		'probes only what the pass a restart interrupted had not reached; the rest counts as skipped. The overlay ',
+		'rows (pages disagreeing, caught up, ignored, appended paths) are not buckets — each is also inside Changed ',
+		'or Unchanged. “n/a” is a counter that node’s plugin does not report; Σ marked * sums only the nodes that do.',
 	].join('');
 }
 
@@ -1223,11 +1255,7 @@ const settingRows = [
 	['Concurrency', (s) => s?.concurrency],
 	['Scope', (s) => s?.scope],
 	['Re-probe after', (s) => (s?.reprobeAfter ? duration(s.reprobeAfter) : null)],
-	[
-		'Trigger queue',
-		(s) => (s?.trigger?.maxPending ? `max ${num(s.trigger.maxPending)} · drains ${s.trigger.ratePerSecond}/s` : null),
-	],
-	['Triggers per sweep', (s) => (s?.maxTriggersPerSweep ? num(s.maxTriggersPerSweep) : null)],
+	['Actions in flight', (s) => (s?.trigger?.concurrency ? `at most ${num(s.trigger.concurrency)}` : null)],
 	[
 		'Canary',
 		(s) =>
@@ -1387,7 +1415,6 @@ function drift(ctx) {
 	const failed = totalOf('failed');
 	const seeded = totalOf('seeded');
 	const rebaselined = totalOf('rebaselined');
-	const deferred = totalOf('deferred');
 	const triggered = totalOf('triggered');
 	const trips = totalOf('canary_trip');
 	const invalidated = totalOf('invalidated');
@@ -1396,17 +1423,6 @@ function drift(ctx) {
 	const unreadable = totalOf('unreadable');
 	const pageMismatch = totalOf('page_mismatch');
 	const cycleBehind = totalOf('cycle_behind');
-	// A per-pass HIGH-WATER gauge, not a counter: summing it answers nothing. The deepest reading any
-	// pass in the window recorded is the question (was the queue close to trigger.maxPending?).
-	const queuePeak = Math.max(
-		0,
-		...combos
-			.filter((s) => s.path === 'probe_trigger_queue_depth')
-			.flatMap((s) => [...(s.p95s ?? []), ...(s.means ?? []), s.p95, s.mean])
-			.filter((v) => typeof v === 'number' && Number.isFinite(v))
-	);
-	const queueSeries = 'trigger_queue_depth';
-	const hasQueue = combos.some((s) => s.path === `probe_${queueSeries}`);
 	// What a mismatch MEANS depends on the run mode, which is the status's fact and not the
 	// window's: armed, each one was hard-expired the moment it was seen (a detection rate); dry,
 	// nothing expires them, so the same disagreement is re-reported every pass (a standing gauge).
@@ -1542,11 +1558,12 @@ function drift(ctx) {
 					warn: mismatchesStanding,
 					title: 'Cached page ≠ origin. A mismatched row is also inside Changed or the unchanged remainder.',
 				}),
-				stat(
-					'Triggered',
-					fmtCount(triggered),
-					deferred ? `${fmtCount(deferred)} deferred past the cap` : 'per-URL re-renders filed'
-				),
+				// Every change a live pass found is acted on as it is found (plugin v0.94.0) — nothing is
+				// deferred, so this falls short of Changed only by caught-up and ignored changes, dry runs,
+				// and actions that failed (those are re-detected next probe).
+				stat('Acted on', fmtCount(triggered), 'pages expired, render filed ahead', {
+					title: 'Changes acted on: the cached page hard-expired and its render filed ahead of routine rotation.',
+				}),
 				stat('Seeded', fmtCount(seeded), 'first observation', { title: 'First observation — nothing to compare yet.' }),
 				stat('Failed', pct(failed, probed), `${fmtCount(failed)} of ${fmtCount(probed)}`, { warn: failing }),
 				// Not inside `probed`: a skipped URL was never attempted. The sub-label gives the
@@ -1572,11 +1589,6 @@ function drift(ctx) {
 						})
 					: null,
 				stat('Canary trips', fmtCount(trips), `${fmtCount(invalidated)} recorded an invalidation`),
-				hasQueue
-					? stat('Trigger queue peak', fmtCount(queuePeak), 'deepest a pass recorded', {
-							title: 'The deepest trigger-queue reading any finished pass recorded (a high-water mark, not a sum).',
-						})
-					: null,
 			]),
 			keys.length
 				? stackedBars(data, keys, stacks, (key) => OUTCOME_COLOR[key] ?? '#8a93a6', { format: fmtCount })
@@ -1843,7 +1855,9 @@ function settings(ctx, { open = false } = {}) {
 				'dryRun on until the change rate above has been watched a while. mode: interval fires every sweepInterval ' +
 				'and silently skips an overrunning pass, continuous paces itself to cycleTarget and reports a miss, anchored ' +
 				'runs daily at anchorTime. Keep reprobeAfter well below sweepInterval; backoffMax and abortAfterDistress ' +
-				'govern origin pushback, load.* this node’s own load (leave it off in interval mode).',
+				'govern origin pushback, load.* this node’s own load (leave it off in interval mode). A detected change ' +
+				'is acted on when found: trigger.concurrency bounds the actions in flight, and queue.ready.changedHeadStart ' +
+				'(under Queue) sets how far ahead its render starts.',
 		}),
 	].filter(Boolean);
 	return cards.length ? section(meta.id, 'Settings', cards, { open }) : null;

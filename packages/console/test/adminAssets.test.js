@@ -350,6 +350,51 @@ test('every probe series the catalog declares is read by the console, or waived 
 });
 
 /**
+ * The other direction, which the test above cannot see: a probe series the console reads that the
+ * plugin no longer declares. Plugin v0.94.0 removed `probe_deferred` and `probe_trigger_queue_depth`
+ * with the trigger queue, and console 0.18.0 read both — a legend entry and a tile that would have drawn
+ * nothing forever, with every test green. The probe view names a series by its SUFFIX in two places,
+ * the `OUTCOMES` chart list and `totalOf('…')`, so both are read here and checked against the catalog.
+ * And no client module may name the removed fields or settings at all.
+ */
+test('every probe series the console reads is one the plugin declares, and nothing reads what v0.94.0 removed', async () => {
+	const { METRICS } = await import('../../plugin/src/metrics.js');
+	const declared = new Set(METRICS.prerender_ops?.dimensions?.path?.values ?? []);
+	const source = clientSources.get('views/probe.js');
+	assert.ok(source, 'expected views/probe.js among the client assets');
+	const outcomes = source.match(/const OUTCOMES = \[([\s\S]*?)\n\];/);
+	assert.ok(outcomes, 'expected the OUTCOMES chart list in views/probe.js');
+	const read = new Set([
+		...[...outcomes[1].matchAll(/\[\s*'([a-z_]+)'/g)].map((m) => m[1]),
+		...[...source.matchAll(/totalOf\('([a-z_]+)'\)/g)].map((m) => m[1]),
+	]);
+	assert.ok(read.size > 8, 'expected to find the probe series the view reads');
+	for (const suffix of read) {
+		assert.ok(
+			declared.has(`probe_${suffix}`),
+			`the Change probe view reads prerender_ops.probe_${suffix}, which the plugin no longer declares — remove the read`
+		);
+	}
+
+	const REMOVED_IN_0_94 = [
+		/\bprobe_deferred\b/,
+		/\btrigger_queue_depth\b/,
+		/\btriggerQueueDepth\b/,
+		/\bmaxTriggersPerSweep\b/,
+		/\bmaxPending\b/,
+		/trigger\.ratePerSecond/,
+	];
+	for (const [id, text] of clientSources) {
+		for (const pattern of REMOVED_IN_0_94) {
+			assert.doesNotMatch(text, pattern, `${id} still names ${pattern.source}, which plugin v0.94.0 removed`);
+		}
+	}
+	for (const name of ['probe_deferred', 'probe_trigger_queue_depth']) {
+		assert.equal(declared.has(name), false, `${name} is back in the catalog — revisit this test`);
+	}
+});
+
+/**
  * The same contract again, for the `sitemap_*` family — and this one reads the EMIT SITES, not the
  * catalog.
  *

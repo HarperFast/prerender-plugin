@@ -36,7 +36,7 @@ const LIVE_SETTINGS = {
 };
 const liveNode = (i) => LIVE.nodes[i];
 
-/** A healthy finished pass record — the shape plugin v0.88.0+ writes. */
+/** A healthy finished pass record — the shape plugin v0.94.0 writes. */
 const lastRun = (over = {}) => ({
 	examined: 1_688_000,
 	owned: 421_000,
@@ -50,9 +50,7 @@ const lastRun = (over = {}) => ({
 	changed: 12_980,
 	caughtUp: 0,
 	ignored: 0,
-	queued: 13_300,
 	triggered: 13_300,
-	deferred: 0,
 	failed: 10,
 	errors: 0,
 	fresh: 5,
@@ -61,11 +59,12 @@ const lastRun = (over = {}) => ({
 	throttleLevel: 1,
 	loadThrottleLevel: 1,
 	behindBatches: 0,
-	triggerQueueDepth: 400,
+	maxActionsInFlight: 8,
 	unreadable: 0,
 	failureSamples: [],
 	dryRun: false,
 	startedBy: 'anchor',
+	resumedFrom: null,
 	startedAt: NOW - 19 * HOUR,
 	finishedAt: NOW - 10 * HOUR,
 	error: null,
@@ -80,11 +79,11 @@ const SETTINGS = {
 	ratePerSecond: 10,
 	concurrency: 4,
 	scope: 'all',
-	trigger: { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 },
+	trigger: { concurrency: 8 },
 	canary: { interval: 1_800_000, count: 500, threshold: 0.7, minSample: 50 },
 };
 
-/** A v0.91.0 node payload, idle between anchored passes. */
+/** A v0.94.0 node payload (statusVersion 2, as since v0.91.0), idle between anchored passes. */
 const v2 = (over = {}) => ({
 	statusVersion: 2,
 	serverTime: NOW,
@@ -137,10 +136,11 @@ const midPass = (over = {}) =>
 				changed: 6000,
 				failed: 4,
 				throttled: 0,
-				deferred: 0,
 				rebaselined: 0,
+				triggered: 5800,
+				errors: 0,
+				actionsInFlight: 3,
 				throttleLevel: 1,
-				triggerQueueDepth: 50,
 				recentRate: 9.9,
 				phase: 'walking',
 			},
@@ -178,13 +178,17 @@ test('idle anchored node: the next run is the published anchor, in both clocks',
 	assert.deepEqual(flagIds(d), [], 'a healthy idle node raises nothing');
 });
 
-test('an ETA while draining is the queue over the drain rate, not the walk', () => {
+test('draining: the walk is over and there is no ETA to give — the actions still in flight say what is left', () => {
 	const node = midPass();
 	node.sweep.current.phase = 'draining';
-	node.sweep.progress.triggerQueueDepth = 900;
 	const d = describeNode(node, { hostname: 'node-a', now: NOW });
 	assert.equal(d.running.etaBasis, 'draining');
-	assert.equal(d.running.etaAt, NOW - 20_000 + (900 / 3) * 1000);
+	assert.equal(d.running.etaAt, null, 'at most trigger.concurrency actions settling — no queue to extrapolate');
+	assert.equal(d.running.actionsInFlight, 3);
+	// A plugin before v0.94.0 reports no such field: unknown, not zero.
+	delete node.sweep.progress.actionsInFlight;
+	assert.equal(describeNode(node, { now: NOW }).running.actionsInFlight, null);
+	assert.equal(flagOf(node, 'will-overrun'), undefined, 'no ETA, so nothing is projected past the anchor');
 });
 
 // ---------------------------------------------------------------- older plugins
@@ -347,16 +351,45 @@ test('flag: a DISARMED mapped field names the rule and field', () => {
 	assert.equal(f.detail, 'node-a: pdp 2:price');
 });
 
-test('flag: a trigger queue near maxPending, and changes deferred', () => {
-	assert.match(
-		flagOf(withLast({ triggerQueueDepth: 45_000 }), 'queue-near-full').detail,
-		/45,000 of 50,000 at its deepest/
+test('flag: actions that threw are a watch on ANY count, for the last pass and the running one', () => {
+	const last = flagOf(withLast({ errors: 7 }), 'action-errors');
+	assert.equal(last.severity, 'warn');
+	assert.equal(last.detail, 'node-a (last sweep): 7 failed of 13,307');
+	assert.match(last.summary(['node-a']), /next probe of each URL finds the change again/);
+	assert.equal(flagOf(withLast({ errors: 0 }), 'action-errors'), undefined);
+	// The running pass is judged before it has a failure sample: each error is a page still serving.
+	const early = midPass();
+	Object.assign(early.sweep.progress, { probed: 40, triggered: 2, errors: 1 });
+	assert.equal(flagOf(early, 'action-errors').detail, 'node-a (running sweep): 1 failed of 3');
+	// A record without `triggered` still names the count, without a made-up denominator.
+	assert.equal(
+		flagOf(withLast({ errors: 2, triggered: undefined }), 'action-errors').detail,
+		'node-a (last sweep): 2 failed'
 	);
-	assert.equal(flagOf(withLast({ triggerQueueDepth: 400 }), 'queue-near-full'), undefined);
-	const deep = midPass();
-	deep.sweep.progress.triggerQueueDepth = 49_000;
-	assert.match(flagOf(deep, 'queue-near-full').detail, /49,000 of 50,000 now/);
-	assert.equal(flagOf(withLast({ deferred: 120 }), 'deferred').detail, 'node-a (last sweep): 120 deferred');
+});
+
+test('the trigger-queue era is gone: deferrals and queue depth an older plugin reports raise nothing', () => {
+	// A plugin before v0.94.0 still sends these; the fields and the settings behind them no longer exist.
+	const old = withLast({ deferred: 120, queued: 13_420, triggerQueueDepth: 49_000 });
+	old.settings = { ...SETTINGS, trigger: { maxPending: 50_000, ratePerSecond: 3, concurrency: 4 } };
+	assert.deepEqual(flagIds(describeNode(old, { hostname: 'node-a', now: NOW })), []);
+});
+
+test('flag: a resumed pass is a note — it explains why that pass probed only part of the slice', () => {
+	const resumed = withLast({ startedBy: 'resume', resumedFrom: NOW - 22 * HOUR, fresh: 150_000, probed: 140_000 });
+	const f = flagOf(resumed, 'resumed');
+	assert.equal(f.severity, 'info');
+	assert.equal(f.detail, 'node-a: resumed the pass started 22h ago');
+	assert.match(f.summary(['node-a']), /skipped \(counted as fresh\)/);
+	const d = describeNode(resumed, { now: NOW });
+	assert.equal(d.last.resumed, true);
+	assert.equal(d.last.resumedFrom, NOW - 22 * HOUR);
+	assert.equal(describeNode(v2(), { now: NOW }).last.resumed, false, 'an ordinary pass is not a resume');
+
+	const resuming = midPass();
+	resuming.sweep.current.startedBy = 'resume';
+	assert.equal(flagOf(resuming, 'resumed').detail, 'node-a: resuming now');
+	assert.equal(flagOf(midPass(), 'resumed'), undefined);
 });
 
 test('flag: a pass still running past its next anchor has skipped it; one projected to, would', () => {

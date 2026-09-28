@@ -53,6 +53,8 @@ import { configState, loadConfig } from './_configEdit.js';
 import { cadenceFor, cadenceIndex, coverageSplit, originCostByReason } from './traffic.js';
 import {
 	backlogReading,
+	changedReading,
+	changedSub,
 	drainOf,
 	hostOf,
 	keeperStats,
@@ -382,6 +384,28 @@ function queueChecks(data, overview, qs) {
 									: Number.isFinite(clear.ms)
 										? `At the current render rate the backlog clears in about ${duration(clear.ms)}.`
 										: null,
+				}
+			)
+		);
+	}
+
+	// Pages the change probe expired, waiting on their render (plugin v0.94.0) — absent, not zero, before it.
+	const changed = changedReading(qs, renderRate(data));
+	if (changed.reported) {
+		out.push(
+			check(
+				'changed',
+				'Changed pages waiting',
+				changed.count === null ? '—' : num(changed.count) + (changed.floor ? '+' : ''),
+				changed.verdict,
+				{
+					sub: changedSub(changed),
+					go: 'queue',
+					detail:
+						changed.count > 0
+							? 'The change probe expired these pages; bots are served the origin until each re-renders. They are ' +
+								'ranked ahead of routine rows (queue.ready.changedHeadStart).'
+							: null,
 				}
 			)
 		);

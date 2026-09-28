@@ -36,8 +36,8 @@ export const SINCE = Object.freeze({
 	fieldMismatch: '0.88.0',
 	fieldGuard: '0.88.0',
 	extended: '0.86.0',
-	queued: '0.71.0',
-	triggerQueueDepth: '0.71.0',
+	actionsInFlight: '0.94.0',
+	maxActionsInFlight: '0.94.0',
 	rebaselined: '0.65.0',
 	behindBatches: '0.60.0',
 	pageMismatch: '0.58.0',
@@ -54,8 +54,6 @@ export const FAILURE_WARN = 0.1;
 export const PUSHBACK_WARN = 0.01;
 /** A re-baselined share above this is a rule edit, not the odd legacy row. */
 export const REBASELINE_WARN = 0.05;
-/** Trigger-queue depth above this share of `maxPending` is close to deferring detected changes. */
-export const QUEUE_NEAR_FULL = 0.8;
 /** A partial pass must have probed this many before its failure share means anything. */
 const MIN_SAMPLE = 200;
 
@@ -236,14 +234,11 @@ export function describeNode(
 		const phase = current?.phase ?? progress?.phase ?? null;
 		let etaAt = null;
 		let etaBasis = null;
-		if (phase === 'draining') {
-			const depth = finite(progress?.triggerQueueDepth);
-			const rate = finite(settings?.trigger?.ratePerSecond);
-			if (depth !== null && rate > 0 && countersAt !== null) {
-				etaAt = countersAt + (depth / rate) * 1000;
-				etaBasis = 'draining';
-			}
-		} else if (fraction !== null && matched > 0 && elapsedMs >= MINUTE) {
+		// DRAINING HAS NO ETA TO GIVE, and needs none since plugin v0.94.0: the walk is over and the pass
+		// waits only for the actions still in flight — at most `trigger.concurrency` of them, seconds of
+		// database work. (Before it, this was a trigger queue drained at a configured rate, hours deep.)
+		if (phase === 'draining') etaBasis = 'draining';
+		else if (fraction !== null && matched > 0 && elapsedMs >= MINUTE) {
 			etaAt = Math.max(countersAt, startedAt + elapsedMs / (matched / slice));
 			etaBasis = 'slice';
 		}
@@ -270,6 +265,8 @@ export function describeNode(
 			elapsedMs,
 			avgRate,
 			recentRate: finite(progress?.recentRate),
+			// Actions (expire + file the render) started and not yet settled — plugin v0.94.0; null before.
+			actionsInFlight: finite(progress?.actionsInFlight),
 			etaAt,
 			etaBasis,
 			progress,
@@ -286,6 +283,10 @@ export function describeNode(
 				durationMs: finishedAt !== null && lastStartedAt !== null ? finishedAt - lastStartedAt : null,
 				agoMs: finishedAt === null ? null : Math.max(0, now - finishedAt),
 				outcome: last.error ? 'error' : last.abortedOnDistress ? 'gave-up' : last.aborted ? 'interrupted' : 'complete',
+				// A pass boot started to finish one a restart cut short (plugin v0.94.0): it probed only the rows
+				// the interrupted pass had not reached, so its counts are that remainder, not a whole slice.
+				resumed: last.startedBy === 'resume',
+				resumedFrom: msOf(last.resumedFrom),
 			}
 		: null;
 
@@ -331,7 +332,7 @@ const flag = (id, severity, summary, detail = null) => ({ id, severity, summary,
  */
 export function nodeFlags(desc) {
 	const flags = [];
-	const { hostname: node, running, last, settings, now } = desc;
+	const { hostname: node, running, last, now } = desc;
 	const add = (f) => flags.push({ ...f, node });
 
 	if (desc.state === 'unreadable') {
@@ -354,7 +355,8 @@ export function nodeFlags(desc) {
 				'bad',
 				(nodes) =>
 					`A sweep stopped heartbeating on ${list(nodes)} and is presumed dead (its worker crashed or restarted). ` +
-					'Nothing needs restarting: the next scheduled pass takes the claim over.',
+					'Nothing needs restarting: an anchored node on plugin 0.94.0+ resumes it shortly after it restarts, ' +
+					'skipping the rows it already probed; otherwise the next scheduled pass takes the claim over.',
 				`${node}: last heartbeat ${ago(running?.heartbeatAt, now)}${running?.startedAt ? `, started ${ago(running.startedAt, now)}` : ''}`
 			)
 		);
@@ -445,33 +447,6 @@ export function nodeFlags(desc) {
 				)
 			);
 		}
-		const deferred = finite(run.deferred) ?? 0;
-		if (deferred > 0) {
-			add(
-				flag(
-					'deferred',
-					'warn',
-					(nodes) =>
-						`Detected changes were deferred on ${list(nodes)} — past maxTriggersPerSweep or a full trigger queue. ` +
-						'Their baselines stay stale, so the next pass re-detects and retries them; until then those pages wait.',
-					`${node} (${label}): ${count(deferred)} deferred`
-				)
-			);
-		}
-		const maxPending = finite(settings?.trigger?.maxPending);
-		const depth = finite(run.triggerQueueDepth);
-		if (maxPending > 0 && depth !== null && depth >= QUEUE_NEAR_FULL * maxPending) {
-			add(
-				flag(
-					'queue-near-full',
-					'warn',
-					(nodes) =>
-						`The trigger queue is close to changeProbe.trigger.maxPending on ${list(nodes)}. Past it, detected ` +
-						'changes are refused and deferred for want of queue rather than of budget.',
-					`${node} (${label}): ${count(depth)} of ${count(maxPending)}${live ? ' now' : ' at its deepest'}`
-				)
-			);
-		}
 		const behind = finite(run.behindBatches) ?? 0;
 		if (desc.mode === 'continuous' && behind > 0) {
 			add(
@@ -485,6 +460,48 @@ export function nodeFlags(desc) {
 				)
 			);
 		}
+	}
+
+	// ACTIONS THAT THREW — judged on any count, not after a sample: each is a page the probe found changed
+	// and could not expire or file, and every one of them is still being served as it was. A watch rather
+	// than a fault because the plugin writes the new baseline only after its action succeeds, so each
+	// one is detected again, and retried, on the URL's next probe.
+	const acted = [];
+	if (last?.record) acted.push({ label: 'last sweep', run: last.record });
+	if (running?.hasCounters) acted.push({ label: 'running sweep', run: running.progress });
+	for (const { label, run } of acted) {
+		const errors = finite(run.errors) ?? 0;
+		if (errors > 0) {
+			add(
+				flag(
+					'action-errors',
+					'warn',
+					(nodes) =>
+						`Acting on a detected change failed on ${list(nodes)}: those pages were not expired or re-filed and ` +
+						'still serve what they did. Their baselines stay stale, so the next probe of each URL finds the change ' +
+						'again and retries; the node’s log names them (“change-probe action failed”).',
+					`${node} (${label}): ${count(errors)} failed${finite(run.triggered) !== null ? ` of ${count(errors + run.triggered)}` : ''}`
+				)
+			);
+		}
+	}
+
+	// A pass boot started to finish one a restart cut short (plugin v0.94.0). The feature working, so a
+	// note — but it is why that pass probed a fraction of the slice and skipped the rest as fresh.
+	const resumedRun = running?.startedBy === 'resume' ? running : last?.resumed && !running ? last : null;
+	if (resumedRun) {
+		add(
+			flag(
+				'resumed',
+				'info',
+				(nodes) =>
+					`A restart cut a sweep short on ${list(nodes)}, and the node resumed it on boot: rows the interrupted ` +
+					'pass had already probed are skipped (counted as fresh), so the resumed pass covers only the remainder.',
+				resumedRun === running
+					? `${node}: resuming now`
+					: `${node}: resumed ${last.resumedFrom !== null ? `the pass started ${ago(last.resumedFrom, now)}` : 'a pass'}`
+			)
+		);
 	}
 
 	if (last?.outcome === 'error') {
@@ -758,4 +775,5 @@ export const STARTED_BY = Object.freeze({
 	startup: 'the startup sweep',
 	manual: 'an operator (manual run)',
 	reseed: 'a canary trip (reseed)',
+	resume: 'a restart (resuming the interrupted pass)',
 });

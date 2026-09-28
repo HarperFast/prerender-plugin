@@ -768,3 +768,30 @@ test('drilled to a node on plugin 0.92, Health reads "no keeper" — a watch, no
 	assert.equal(verdictOf(keeper), 'warn');
 	assert.match(keeper.textContent, /this node: no keeper/);
 });
+
+// Plugin v0.94.0: pages the change probe expired, waiting on their render — served from the origin until
+// then. Judged like the backlog, by the time the render rate takes to reach them; absent before v0.94.0.
+test('changed pages waiting: a Queue check judged by time to re-render, and absent on an older plugin', async () => {
+	const changed = (n) => ({ ...HEALTHY_STATE, now: { ...HEALTHY_STATE.now, dueChanged: n } });
+	const at = async (a, b) =>
+		vital(
+			draw(await ready({ queueState: stateOf(answer('node-a', changed(a)), answer('node-b', changed(b))) })),
+			'Changed pages waiting'
+		);
+	// 2,000 renders in the hour.
+	const quiet = await at(100, 200);
+	assert.equal(verdictOf(quiet), 'ok');
+	assert.match(quiet.textContent, /300/);
+	assert.match(quiet.textContent, /~9m to re-render/);
+	assert.equal(verdictOf(await at(3000, 2000)), 'warn', '5,000 is 2.5h of renders');
+	assert.equal(verdictOf(await at(12_000, 8000)), 'bad', '20,000 is 10h');
+	// The real 0.93.0 answer carries no count: no check at all, never a green 0.
+	assert.equal(vital(draw(await ready()), 'Changed pages waiting'), null);
+	// Mixed versions: shown, but with no total and no verdict.
+	const mixed = vital(
+		draw(await ready({ queueState: stateOf(answer('node-a', changed(40)), answer('node-b', HEALTHY_STATE)) })),
+		'Changed pages waiting'
+	);
+	assert.match(mixed.textContent, /not reported by node-b:9926/);
+	assert.equal(verdictOf(mixed), 'na');
+});
