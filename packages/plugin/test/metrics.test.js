@@ -170,11 +170,11 @@ test('render documents every outcome detail the emitters use', () => {
 	}
 });
 
-test('claim_scan rides queue_health so the queue reads in ONE get_analytics scan', () => {
+test('claim_granted rides queue_health so the queue reads in ONE get_analytics scan', () => {
 	// A metric name is a window scan on the read side (metric is unindexed in hdb_analytics);
 	// a series is just rows in an existing scan. These pins are the consolidation contract.
-	const c = emitted(() => metrics.claimScan(3.2, 'granted'));
-	assert.deepEqual(c, { value: 3.2, metric: 'queue_health', path: 'claim_scan_ms', method: 'granted', type: null });
+	const c = emitted(() => metrics.claimGranted(4));
+	assert.deepEqual(c, { value: 4, metric: 'queue_health', path: 'claim_granted', method: 'ready', type: null });
 });
 
 test('origin_fetch keeps its own name (it needs both dimension slots) and emits the duration FIRST', () => {
@@ -211,7 +211,7 @@ test('every series the consolidated emitters produce is declared in its catalog 
 	// The series values are built at the emit site (e.g. `sitemap_${series}`), so this is what
 	// keeps a new call from minting an undocumented series.
 	const qh = METRICS.queue_health.dimensions.path.values;
-	for (const series of ['claim_scan_ms', 'reconcile_restored', 'reconcile_missing']) {
+	for (const series of ['claim_granted', 'claim_stale', 'reconcile_restored', 'reconcile_missing']) {
 		assert.ok(qh.includes(series), `queue_health missing ${series}`);
 	}
 	const ops = METRICS.prerender_ops.dimensions.path.values;

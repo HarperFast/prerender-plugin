@@ -23,14 +23,11 @@ import { getDesiredPause, setDesiredPause } from '../util/queueControl.js';
 import { getResidencyByUrl } from '../util/residency.js';
 import {
 	claimSchedules,
-	sweepReadySet,
 	deleteSchedule,
 	deriveQueueStatus,
 	getScheduleRow,
-	maybeResetFloor,
 	reconcileLeaseGauge,
 	releaseLease,
-	resetFloorNow,
 	writeSchedule,
 } from '../util/renderSchedule.js';
 
@@ -38,18 +35,11 @@ const protocol = server.hostname === 'localhost' ? 'http' : 'https';
 const port = protocol === 'https' ? server.config.http.securePort || server.config.http.port : server.config.http.port;
 
 // The `RenderSchedule` table is deliberately NOT destructured here. Every read, write and delete
-// of it goes through `util/renderSchedule.js`, which owns the due-time write and the claim-floor
-// lowering together — a raw write from this file would file a row behind the floor and silently
-// end that URL's rendering. `test/queueFunnel.test.js` enforces that mechanically.
+// of it goes through `util/renderSchedule.js`, which owns the write contract (`put` replaces the
+// record, so `fromSitemap` and `effectiveInterval` are required) and the local-read rule.
+// `test/queueFunnel.test.js` enforces that mechanically.
 
 const mutex = getMutex('render_queue');
-
-// Rate limit for the wedged-row warning below. Per worker, which is the cheap and correct-enough
-// direction: the pin AGE it gates on is node-wide (it lives in the shared header), so every worker
-// agrees about when to start warning, and the worst case is one message per worker per window rather
-// than one per node. Sharing a timestamp across workers would mean another header word and a CAS to
-// suppress log lines.
-let lastFloorPinWarnAt = 0;
 
 // Browsers ≥ v1.16.0 post `outcome` — the single field result handling keys on: 'rendered'
 // (content present; a rendered-through client-side redirect is still a rendered page),
@@ -337,7 +327,7 @@ const classifyVariant = (variant, job) => {
 
 /**
  * Resolve this node's desired pause intent from the replicated `QueueControl` table and
- * store it into the node-local queue flag; when not paused, derive empty/queued. Caller must
+ * store it into the node-local queue flag; when not paused, derive empty/queued/unready. Caller must
  * hold `mutex`.
  *
  * This is what makes pause/resume work cluster-wide: `claim` reads a non-replicated,
@@ -345,12 +335,8 @@ const classifyVariant = (variant, job) => {
  * this on its own status-sync interval, so a replicated intent write converges everywhere
  * within one `queue.statusSyncInterval`.
  *
- * THE STATUS RECOMPUTE NO LONGER SCANS. It used to run a second head-seeking query
- * (`nextRenderTime <= now`, limit 1) against the same index `claim` walks — measured at ~700ms
- * of synchronous native iteration per minute on an aged node, on worker 0, which also serves bot
- * traffic. Once a claim floor exists the answer is derivable from it plus the last claim outcome
- * at zero database cost, so the scan is gone. `test/queueStatusDerived.test.js` pins its absence
- * by installing a `search` that throws.
+ * THE STATUS RECOMPUTE DOES NOT SCAN: empty/queued/unready comes from the queue keeper's signal, at zero
+ * database cost. `test/queueStatusDerived.test.js` pins that by installing a `search` that throws.
  */
 async function syncQueueState(force = false, pending = null) {
 	const desired = await getDesiredPause(server.hostname, pending);
@@ -361,22 +347,12 @@ async function syncQueueState(force = false, pending = null) {
 	}
 
 	// The intent says "run". If the local flag still holds `paused`, the report must be
-	// forced: reportStatus's non-forced path is a compareExchange between empty<->queued,
-	// which by design cannot move a flag currently holding `paused`.
+	// forced: reportStatus's non-forced path by design cannot move a flag holding `paused`.
 	const liftingPause = QueueState.status === 'paused';
 
-	// The floor reset rides here because this function already holds the claim mutex, which is
-	// exactly the serialization a reset needs against a concurrent `advanceFloor`. It is the only
-	// recovery for a due time written below the floor by the operations API or the exported REST
-	// surface — nothing in-process can observe those writes.
-	maybeResetFloor(Date.now());
-
-	// And the lease-gauge walk rides here for the same reason, on the same cadence. It is NOT
-	// bookkeeping: the gauge only ever drifts UP (a lease that expires without a result has nobody to
-	// decrement it) and it SIZES the claim scan, so unreconciled it climbs until every claim pass
-	// drains the full `queue.claimScanCap` — measured at 820 against 20 truly in flight after ~80
-	// minutes, and minutes rather than hours during a broad origin outage. One walk fixes the number
-	// for every worker, because the buffer is shared.
+	// The lease-gauge walk rides here, once per status sync: the gauge only ever drifts UP (a lease that
+	// expires without a result has nobody to decrement it), and one walk fixes the number for every
+	// worker, because the buffer is shared.
 	reconcileLeaseGauge();
 
 	const status = deriveQueueStatus(Date.now());
@@ -515,7 +491,7 @@ export class RenderQueue extends Resource {
 		// THE key the lease was granted under. Everything below is keyed off the job description built
 		// from it rather than off this string, so nothing can re-point it (the redirect refile used to
 		// reassign the working key, and releasing by that would have leaked the SOURCE's lease on every
-		// rendered client-side redirect — the row would then pin the claim floor for a full lease).
+		// rendered client-side redirect — the source would then stay unclaimable for a full lease).
 		const claimKey = result.id;
 		// Set true by the branches whose retry pacing IS the lease (see retryAfterFailure): they
 		// must keep it, or the row — which still carries its original overdue due time now that
@@ -533,8 +509,8 @@ export class RenderQueue extends Resource {
 			// case where nothing moved the row forward. Worse, the throw propagates out of the
 			// request handler, so Harper ABORTS the ambient transaction and rolls back whatever this
 			// result did commit (the `PrerenderedPage.put` included). The row keeps its original
-			// overdue due time and the floor is at or below its minute by construction, so a freed
-			// lease means the next pass re-grants it seconds later: an unpaced re-render loop against
+			// overdue due time, so a freed lease means the next claim re-grants it seconds later: an
+			// unpaced re-render loop against
 			// whatever is throwing, at claim frequency rather than once per lease.
 			//
 			// Reachable, not theoretical: a `PrerenderedPage.put`/`createBlob` failure, a
@@ -903,7 +879,7 @@ export class RenderQueue extends Resource {
 		);
 		if (failed.length && refiledTo) {
 			// The source was just retired by the refile above: there is no row of its own to retry under,
-			// and holding ITS lease would pin the claim floor at a row that no longer exists. The
+			// and holding ITS lease would block a slot for a row that no longer exists. The
 			// destination renders on its own row and cadence, so a failed sibling here is logged and let
 			// go — its device simply has no page until the destination renders.
 			for (const variant of failed) {
@@ -942,9 +918,8 @@ export class RenderQueue extends Resource {
 			}
 			// This branch used to hold the lease unconditionally and forever for a renderer failure —
 			// no strike, no escalation — so a permanently-crashing render re-rendered once per
-			// `queue.jobLeaseTime` for the life of the target. The waste was never the renders; it was
-			// the CLAIM FLOOR, which a held lease pins at its row's due minute. Escalating returns
-			// 'slow', which releases the lease and lets the floor advance.
+			// `queue.jobLeaseTime` for the life of the target. Escalating returns 'slow', which releases
+			// the lease and files the row forward by its backoff.
 			if ((await this.retryAfterFailure(scheduleJob)) === 'fast') holdLease();
 			await retireRowIfConverted(job, held);
 			return;
@@ -973,12 +948,6 @@ export class RenderQueue extends Resource {
 			// of getting stuck re-claiming every lease period). Refresh fromSitemap from the live target
 			// so it self-corrects if the URL has since left its sitemap.
 			//
-			// This is the highest-volume schedule write in the system, and it writes `now + interval` —
-			// i.e. FORWARD. The funnel's floor lowering is a CAS-min, so this path costs one atomic load
-			// and moves the floor not at all. That is load-bearing: a lowering on every completed render
-			// would rewind the floor to the current minute continuously and the whole 14× seek win would
-			// evaporate.
-			//
 			// A one-device render (a per-device row for a non-default device) does NOT reschedule: the
 			// URL's rotation is on the URL row, and this result was an extra render beside it.
 			if (scheduleJob.fold) {
@@ -988,7 +957,7 @@ export class RenderQueue extends Resource {
 					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
 					// the writer every target passes through on every cycle, so it is what backfills the
 					// cadence across the corpus, and it is the only site holding a rung fresher than the
-					// stored one. The ready-set sweep divides lateness by this to rank the row.
+					// stored one. The queue keeper divides lateness by this to rank the row.
 					effectiveInterval: interval,
 				});
 
@@ -1019,10 +988,8 @@ export class RenderQueue extends Resource {
 			// No target owns this URL on this node: a one-off's row is dropped, a recurring row is
 			// deferred (see `settleTargetless`).
 			//
-			// A drop does NOT release the key's lease (see util/renderSchedule.js): the slot keeps
-			// holding the claim floor at this row's old due minute until it expires. That is the
-			// conservative direction — releasing here would let the floor advance past a row whose
-			// result may still be arriving from a duplicate renderer.
+			// A drop does NOT release the key's lease (see util/renderSchedule.js): the slot simply
+			// expires, and with the row gone nothing can claim the key meanwhile.
 			await settleTargetless(job, targetless ?? { kind: 'one-off' });
 		}
 		await retireRowIfConverted(job, held);
@@ -1228,14 +1195,12 @@ export class RenderQueue extends Resource {
 	 * jobLeaseTime − 30s. The lease is NOT re-armed to `now + jobLeaseTime` on failure — that
 	 * would quietly lengthen a documented wait.
 	 *
-	 * The cost, which belongs in the operator's head: a held lease holds the claim floor, so
-	 * `fastRetries: 2` can pin it for 2 × jobLeaseTime (20 minutes on defaults), and during a
-	 * broad origin 5xx or a bot-mitigation rule change EVERY job takes this lane and no lease is
-	 * released at all for that window.
+	 * The cost, which belongs in the operator's head: during a broad origin 5xx or a bot-mitigation
+	 * rule change EVERY job takes this lane and no lease is released at all for that window.
 	 *
 	 * @returns {Promise<'fast'|'slow'|'dropped'>} which lane was taken. `'fast'` means the caller
 	 *   must keep the lease; the other two mean release it (the row is now in the future or gone,
-	 *   and holding a lease for it would pin the claim floor for a full lease for nothing).
+	 *   and holding a lease for it would block it for a full lease for nothing).
 	 */
 	static async retryAfterFailure(job) {
 		const sourceUrl = job.url;
@@ -1271,7 +1236,7 @@ export class RenderQueue extends Resource {
 		const fromSitemap = !!renderTarget.sitemapUrl;
 		const wait = backoffWait(interval, strikes, fromSitemap);
 		// THE CADENCE, NOT `wait`. The backoff is how long until the retry; the cadence is how often the
-		// page wants to render. Filing `wait` here would tell the sweep a repeatedly-failing 1h page is
+		// page wants to render. Filing `wait` here would tell the keeper a repeatedly-failing 1h page is
 		// on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority on
 		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
 		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
@@ -1333,46 +1298,45 @@ export class RenderQueue extends Resource {
 	 * `.map`s the body — a 204, an object wrapper, or a new status code circuit-breaks a
 	 * perfectly healthy node.
 	 *
-	 * WHAT NO LONGER HAPPENS HERE: the per-job lease write. `claim` used to write
-	 * `nextRenderTime = now + jobLeaseTime` back onto every granted row, which was a second
-	 * write per render landing on the hot head of the very index the scan seeks from. The lease
-	 * now lives in a node-local shared buffer (util/renderLease.js) and recording it is an atomic
-	 * store, so one render costs exactly ONE schedule write — the reschedule when its result
-	 * lands. That halves queue write volume and audit bytes (~87 → ~44 MB/day/node).
+	 * Jobs come from the ready set the queue keeper publishes, each checked against its durable row
+	 * and leased exclusively (`claimSchedules`). No mutex: nothing here needs serializing, so claims on
+	 * every worker run concurrently.
 	 *
-	 * `expiresAt` is therefore no longer minute-floored either. The flooring only ever existed
-	 * because the value doubled as a `nextRenderTime`, and it silently cost up to 59,999 ms of
-	 * lease — which matters because the fleet discards any granted job with under 30s of lease
-	 * left (hence `queue.jobLeaseTime`'s two-minute minimum).
+	 * The lease lives in a node-local shared buffer (util/renderLease.js), not on the row, so one
+	 * render costs exactly ONE schedule write — the reschedule when its result lands. `expiresAt` is
+	 * not minute-floored: the fleet discards any granted job with under 30s of lease left (hence
+	 * `queue.jobLeaseTime`'s two-minute minimum), and flooring would silently cost up to 59,999 ms.
 	 */
-	static claim = mutex.withLock(async ({ limit = 20 } = {}) => {
+	static claim = async ({ limit = 20 } = {}) => {
 		if (QueueState.status === 'paused') {
 			return [];
 		}
 
-		// Bound the batch server-side so no consumer can over-claim: the whole pass runs under
-		// this mutex, and one worker must not be able to hold it while hoarding a burst other
-		// renderers should share.
+		// Bound the batch server-side so no consumer can over-claim a burst other renderers should share.
 		limit = Math.min(Math.max(1, limit | 0), config.queue.maxClaimLimit);
 
-		// One pass: floored scan, drained before anything is leased, leases granted from memory,
-		// floor advanced to the first due row the pass saw. All of it in util/renderSchedule.js —
-		// this function owns the wire format and the status report, nothing else.
-		const scanStarted = performance.now();
 		const pass = await claimSchedules({ grantLimit: limit });
-		// The queue's leading indicator: this duration degrades (measured 17x once) when dead index
-		// entries pile at the seek point, before any backlog shows. Two clock reads and one buffered
-		// emit per pass — nothing on the per-row path.
-		metrics.claimScan(
-			performance.now() - scanStarted,
-			pass.scanTruncated ? 'capped' : pass.jobs.length ? 'granted' : 'empty'
-		);
 
-		// WHERE the batch came from. Two emits per claim at most, on a path that runs a few times a
-		// second — and the only evidence that the ready set is doing anything, since it moves no totals.
-		const fromReady = pass.fromReady ?? 0;
-		if (fromReady > 0) metrics.claimSource(fromReady, 'ready');
-		if (pass.jobs.length - fromReady > 0) metrics.claimSource(pass.jobs.length - fromReady, 'index');
+		if (pass.jobs.length > 0) metrics.claimGranted(pass.jobs.length);
+		// Ready-set entries the durable row showed were no longer due (rendered, rescheduled or deleted
+		// since the keeper published them): each one is a render the check saved.
+		if (pass.skippedStale > 0) metrics.queueHealth(pass.skippedStale, 'claim_stale');
+		// Keys whose renders keep failing to report, held back instead of granted again (see
+		// `claimSchedules`). Each is a URL to look at — or, when there are many at once, a sign that
+		// results are not getting back to this node.
+		if (pass.wedged.length > 0) {
+			metrics.queueHealth(pass.wedged.length, 'claim_wedged');
+			const sample = pass.wedged
+				.slice(0, 3)
+				.map((w) => `${w.cacheKey} (${w.misses} leases, held ${Math.round(w.backoff / 60_000)} min)`)
+				.join(', ');
+			logger.warn(
+				`[prerender] ${pass.wedged.length} key(s) whose last leases all expired with no result were held back ` +
+					`instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
+					`crashing or hanging on these URLs, or results are not reaching this node. No strike was counted, and ` +
+					`the first result that arrives for a key clears its hold.`
+			);
+		}
 
 		const jobs = [];
 		let notOwnedHere = 0;
@@ -1389,12 +1353,8 @@ export class RenderQueue extends Resource {
 			const device = CacheKey.deviceOf(granted.cacheKey);
 			const deviceTypes = device ? [device] : defaultDeviceTypes();
 
-			// Detection only, deliberately. `claim`'s lease write used to purge a stale local
-			// record on a node that is no longer the residency owner, as a side effect; that purge
-			// is gone with the write. The corrective write is a new write on the hot claim path with
-			// residency semantics that could not be verified, so Stage 1 ships the count and leaves
-			// the repair to `render.reconcile` (which restores the row on the new owner) until this
-			// number proves it happens.
+			// Detection only. The keeper holds only rows this node owns, so this counts ownership that
+			// changed between the keeper's last rebuild and this claim.
 			if (getResidencyByUrl(url) !== server.hostname) notOwnedHere++;
 
 			jobs.push({
@@ -1404,7 +1364,7 @@ export class RenderQueue extends Resource {
 				deviceType: deviceTypes[0],
 				expiresAt: granted.expiresAtMs,
 				callbackOrigin: `${protocol}://${server.hostname}:${port}`,
-				// `fromSitemap` is denormalized onto the schedule row, so the job is built with no
+				// `fromSitemap` is off the durable row the claim just read, so the job is built with no
 				// per-job Target read.
 				isFromSitemap: !!granted.fromSitemap,
 			});
@@ -1418,76 +1378,30 @@ export class RenderQueue extends Resource {
 				`[prerender] claim could not record a lease for a due row: ${pass.occupancy} of ` +
 					`${config.queue.maxLeases} slots occupied. Granted ${jobs.length} of ${limit}. If the occupancy is ` +
 					`near the table size, raise queue.maxLeases (restart-scoped); if it is nowhere near it, the key's ` +
-					`probe window is full and the next pass will place it elsewhere.`
+					`probe window is full and the next claim will place it elsewhere.`
 			);
-		} else if (pass.scanTruncated && jobs.length < limit) {
-			logger.warn(
-				`[prerender] claim hit its ${pass.scanLimit}-row scan cap with ${pass.occupancy} lease(s) in flight and ` +
-					`granted ${jobs.length} of ${limit}, without reaching a not-yet-due row. In-flight work is filling ` +
-					`the scan window — raise queue.claimScanCap, or look at ${pass.floorHeldBy ?? 'the oldest due row'}, ` +
-					`which is holding the claim floor at minute ${pass.floorTo}.`
-			);
-		}
-
-		// A SEPARATE CHECK, deliberately not chained onto the branches above. The wedged row this names
-		// is one due row that never reschedules on an otherwise HEALTHY node: every pass still reaches a
-		// not-yet-due row, so `scanTruncated` is false and `leaseRefused` is false, and the branch above
-		// stays silent for as long as the node runs. That was the whole failure — the single scenario the
-		// `floorHeldBy` report was added for was the one scenario that could never print it, while the
-		// scan quietly degraded past the cost the floor was introduced to remove.
-		//
-		// The threshold is what the retry design itself can explain and no more: the fast-retry lane
-		// holds its lease, and therefore the floor, for `fastRetries` full leases before the slow lane
-		// writes the row forward, so one further lease beyond that is not a lane — it is a row whose
-		// result never comes. Rate-limited to one line per window per worker, so a genuinely stuck row
-		// says so about twice before `queue.claimFloor.unpinAfter` pushes it forward on its own.
-		// Gated on the floor being ON: with it off the scan seeks from the absolute index minimum anyway,
-		// so a row that never moves costs nothing extra and there is nothing to warn about.
-		if (config.queue.claimFloor.enabled) {
-			const explainable = config.queue.jobLeaseTime * (Math.max(0, config.render.failureRetry.fastRetries | 0) + 1);
-			if (pass.floorPinnedForMs > explainable && Date.now() - lastFloorPinWarnAt >= explainable) {
-				lastFloorPinWarnAt = Date.now();
-				const unpin = config.queue.claimFloor.unpinAfter;
-				logger.warn(
-					`[prerender] ${pass.floorHeldBy} has held the claim floor at minute ${pass.floorTo} for ` +
-						`${Math.round(pass.floorPinnedForMs / 60_000)} minute(s) — longer than the retry lanes can account ` +
-						`for (${Math.round(explainable / 60_000)} min), so its render is failing in a way that posts no ` +
-						`result and reschedules nothing. Everything due behind it is waiting and the nextRenderTime index ` +
-						`is degrading above it. ` +
-						(unpin > 0
-							? `It will be pushed forward automatically after ${Math.round(unpin / 60_000)} min.`
-							: `queue.claimFloor.unpinAfter is 0, so this will NOT resolve on its own — repair or delete the URL.`)
-				);
-			}
 		}
 
 		if (notOwnedHere) {
 			logger.warn(
 				`[prerender] claim granted ${notOwnedHere} job(s) for URL(s) this node does not own by residency. ` +
-					`Stale local schedule rows on a former owner are no longer purged at claim time; the schedule ` +
-					`reconcile sweep restores them on the new owner.`
+					`The queue keeper rebuilds when the node list changes; the schedule reconcile sweep restores rows ` +
+					`on the new owner.`
 			);
 		}
 
 		if (jobs.length === 0) {
-			// TRI-STATE, and the distinction is not cosmetic. "Saw due rows but granted none" means
-			// a large backlog is entirely in flight (or the scan cap was consumed by it) — reporting
-			// `empty` there tells every consumer in the fleet to back off to its idle interval while
-			// there is work, and nothing corrects it until the next status sync.
-			QueueState.reportStatus(pass.sawDue ? 'queued' : 'empty');
+			// TRI-STATE, and the distinction is not cosmetic. "Saw due rows but granted none" means a
+			// backlog is entirely in flight — reporting `empty` there tells every consumer in the fleet to
+			// back off to its idle interval while there is work. And a keeper that is not serving is
+			// `unready`, so that it becoming ready is a change the fleet is told about.
+			QueueState.reportStatus(
+				!pass.keeperServed ? 'unready' : pass.sawDue ? 'queued' : pass.complete ? 'empty' : 'unready'
+			);
 		}
 
 		return jobs;
-	});
-
-	/**
-	 * Reset the claim floor now instead of waiting out `queue.claimFloor.resetInterval`.
-	 *
-	 * The operator escape hatch for the one write this plugin cannot see: a due time written
-	 * below the floor through the operations API or the exported `RenderSchedule` REST surface.
-	 * Under the claim mutex, so it cannot interleave with a pass's `advanceFloor`.
-	 */
-	static resetClaimFloor = mutex.withLock(async () => ({ ...resetFloorNow(), node: server.hostname }));
+	};
 
 	async post(target, data) {
 		const ctx = this.getContext();
@@ -1517,106 +1431,6 @@ let queueStatusSyncStarted = false;
  * handleApplication after config is applied (so the interval reflects overrides).
  * Idempotent. The interval follows `queue.statusSyncInterval` changes without a restart.
  */
-/**
- * The ready-set sweep, on worker 0, on its own interval.
- *
- * SEPARATE FROM `startQueueStatusSync` DESPITE THE SIMILAR SHAPE, and the reason is the claim mutex.
- * The status sync deliberately runs inside it — the floor reset and the lease-gauge walk both need
- * that serialization. The sweep must NOT: it holds a read cursor over the due set for hundreds of
- * milliseconds, and taking the claim mutex for that long would block every claim on the node for the
- * duration of a scan whose entire purpose is to keep claims off the index.
- *
- * It needs no mutex of its own either. It writes nothing to the database, and its only shared-memory
- * write is `publish`, which fills the inactive slot and flips one atomic — so a concurrent claim
- * either sees the previous generation or the next one, never a partial set. Two overlapping sweeps
- * would merely duplicate work, and `sweeping` prevents that within a worker.
- */
-let readySweepStarted = false;
-
-/**
- * `e?.message`, never `e.message`: anything can be thrown, and `null.message` is a TypeError raised
- * from inside the very handler that exists to keep this path alive. Same helper and same reasoning as
- * `util/configOverride.js`.
- */
-const messageOf = (e) => e?.message ?? String(e);
-
-/**
- * Node's `setInterval` ceiling. Past 2^31-1 ms the delay overflows: node warns and then fires the
- * callback after ONE MILLISECOND. So an over-large sweep interval does not merely slow the sweep
- * down, it converts it into a hot loop re-reading the due set on worker 0 — the opposite of what the
- * number asked for. The schema rejects anything larger with a warning, which is the loud path; this
- * clamp is here so that the loud path working is not the only thing between a typo and that loop.
- */
-const MAX_TIMER_MS = 2147483647;
-
-export function startReadySweep() {
-	if (server.workerIndex !== 0 || readySweepStarted) return;
-	readySweepStarted = true;
-
-	let sweeping = false;
-
-	const sweep = () => {
-		if (sweeping || !config.queue.ready.enabled) return;
-		sweeping = true;
-		const started = performance.now();
-		// THE SYNCHRONOUS INVOCATION IS INSIDE THE TRY, not just the promise chain. `sweeping` is a
-		// latch: if the call throws before returning a promise, `finally` never runs, the latch is never
-		// released, and the sweep is permanently dead for the life of the process — with claims quietly
-		// falling back to the index scan and nothing saying why. That silent-forever failure is worth
-		// more than the narrow chance of the throw.
-		try {
-			sweepReadySet()
-				.then((result) => {
-					if (result?.skipped) return;
-					metrics.readySweep(performance.now() - started, result.truncated ? 'capped' : 'complete');
-					metrics.readyPublished(result.published);
-					// Both halves, every sweep, so the ratio is readable without needing the total from a
-					// second series — and so `carried: 0` is an explicit observation rather than an absence.
-					metrics.readyCadenceSource(result.cadenceCarried, 'carried');
-					metrics.readyCadenceSource(result.due - result.cadenceCarried, 'resolved');
-					if (result.truncated) {
-						// The rows past the cap are the YOUNGEST, so a truncated sweep leaves recently-due pages
-						// unranked — precisely the pages this feature exists to protect. That makes it a warning
-						// rather than a statistic.
-						logger.warn(
-							`[prerender] ready-set sweep read its ${config.queue.ready.sweepCap}-row cap without reaching a ` +
-								`not-yet-due row: ${result.due} due row(s) seen, ${result.published} published. The ordering ` +
-								`covers only the oldest part of the backlog, so recently-due pages are going unranked. Raise ` +
-								`queue.ready.sweepCap, or reduce the backlog.`
-						);
-					}
-				})
-				.catch((e) => logger.error(messageOf(e)))
-				.finally(() => {
-					sweeping = false;
-				});
-		} catch (e) {
-			logger.error(messageOf(e));
-			sweeping = false;
-		}
-	};
-
-	// Once immediately, so a restarted worker generation does not serve a whole interval of claims
-	// from the index before the set exists.
-	sweep();
-
-	const arm = (ms) => {
-		const timer = ms > 0 ? setInterval(sweep, Math.min(MAX_TIMER_MS, ms)) : null;
-		timer?.unref?.();
-		return timer;
-	};
-
-	let armed = config.queue.ready.sweepInterval;
-	let timer = arm(armed);
-
-	onConfigApplied(() => {
-		if (config.queue.ready.sweepInterval === armed) return;
-		if (timer) clearInterval(timer);
-		armed = config.queue.ready.sweepInterval;
-		timer = arm(armed);
-	});
-}
-
 export function startQueueStatusSync() {
 	if (server.workerIndex !== 0 || queueStatusSyncStarted) return;
 	queueStatusSyncStarted = true;

@@ -404,72 +404,74 @@ export const METRICS = Object.freeze({
 	queue_health: metric('queue_health', {
 		kind: 'value',
 		emittedBy:
-			'util/backlogSnapshot.js (snapshot gauges), resources/RenderQueue.js (claim_scan_ms), util/reconcile.js (reconcile_*)',
+			'util/backlogSnapshot.js (snapshot gauges), util/reconcile.js (reconcile_*), ' +
+			'util/queueKeeperService.js (keeper_*), resources/RenderQueue.js (claim_granted, claim_stale)',
 		cadence:
 			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
-			'claim_scan_ms once per claim pass; reconcile_* once per sweep per node',
-		summary: 'Every queue signal under one name: backlog gauges, claim-scan health, schedule-gap repairs.',
+			'reconcile_* once per sweep per node; keeper_load_ms once per keeper load, keeper_publish_ms once per ' +
+			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms and keeper_repaired once ' +
+			'per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
+		summary: 'Every queue signal under one name: backlog gauges, the queue keeper, schedule-gap repairs.',
 		usefulFor:
 			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
-			'module header). Backlog gauges say whether the queue is keeping up; claim_scan_ms is the leading ' +
-			'indicator (the scan degrades — measured 17× once — before any backlog shows); reconcile_restored > 0 ' +
-			'means URLs were silently un-renderable until the sweep repaired them.',
+			'module header). Backlog gauges say whether the queue is keeping up; keeper_repaired > 0 means the ' +
+			'queue keeper missed writes; reconcile_restored > 0 means URLs were silently un-renderable until the ' +
+			'sweep repaired them.',
 		caveats:
 			'MIXED CADENCES under one name: the snapshot series are slow gauges (chart the latest value, never a ' +
-			'sum; one row per node — sum `overdue` across nodes), claim_scan_ms is a per-pass duration ' +
-			'distribution, reconcile_* are per-sweep totals. Snapshot values come from a capped scan — a backlog ' +
-			'past management.scanCap reports the cap, not the truth.',
+			'sum; one row per node — sum `overdue` across nodes), keeper_*_ms are per-event durations, ' +
+			'reconcile_* are per-sweep totals, claim_* are per-claim counts.',
 		dimensions: {
 			path: {
 				name: 'series',
 				values: [
 					'overdue',
 					'lease_occupancy',
-					'below_floor',
-					'below_floor_age_ms',
-					'floor_pin_age_ms',
 					'paused',
-					'claim_scan_ms',
-					'ready_sweep_ms',
-					'ready_published',
-					'ready_cadence',
+					'keeper_live',
 					'claim_granted',
 					'reconcile_restored',
 					'reconcile_missing',
+					'keeper_load_ms',
+					'keeper_publish_ms',
+					'keeper_repaired',
+					'keeper_verify_ms',
+					'claim_stale',
+					'claim_wedged',
 				],
 				description:
 					'overdue = schedule rows already due, INCLUDING in-flight renders (so its healthy floor is the ' +
-					'in-flight count, not zero — not comparable with pre-0.34.0 numbers). ' +
+					'in-flight count, not zero), from the queue keeper; absent while it is not live. ' +
 					'lease_occupancy = live claim leases on this node right now. ' +
-					'below_floor = rows filed BELOW the claim floor, which nothing will ever claim: expect 0, and ' +
-					'treat any sustained non-zero as lost renders. ' +
-					'below_floor_age_ms = age of the oldest such row (absent when there are none). ' +
-					'floor_pin_age_ms = how long the claim floor has been stuck at one value; a floor pinned for ' +
-					'hours means one failing key is holding the whole queue’s scan position. ' +
 					'paused = 1 when this node’s queue is paused at snapshot time, else 0 — makes "paused for hours" ' +
 					'alertable without polling the REST surface. ' +
-					'claim_scan_ms = claim-pass duration; watch the p95 trend, not the level. ' +
-					'ready_sweep_ms = duration of the ready-set sweep (method complete|capped); `capped` means it ' +
-					'never reached a not-yet-due row, so the ordering covers only the oldest part of the backlog ' +
-					'and recently-due pages are going unranked. ' +
-					'ready_published = entries the last sweep published — the ordering’s supply; a persistent 0 ' +
-					'with a non-empty backlog means the sweep is failing. ' +
-					'claim_granted = jobs granted per claim split by source (ready|index) — the only series that ' +
-					'shows whether prioritisation is engaging, since it reorders a fixed amount of work and moves ' +
-					'no total. All-`index` is the failure to look for and is indistinguishable from health ' +
-					'elsewhere. ' +
+					'keeper_live = 1 when this node\u2019s queue keeper is live at snapshot time, else 0 — a node ' +
+					'whose keeper is not live grants no claims. ' +
+					'claim_granted = jobs granted per claim. ' +
 					'reconcile_restored / reconcile_missing = schedule gaps repaired / found per sweep (they differ ' +
 					'when the per-sweep restore cap truncates the pass); expect zero — a steady rate means ' +
-					'something is CREATING gaps, and the reconcile log line names the URLs.',
+					'something is CREATING gaps, and the reconcile log line names the URLs. ' +
+					'keeper_load_ms = how long the queue keeper took to load this node\u2019s rows from the table ' +
+					'(once per start or rebuild); the node grants no claims for that long. ' +
+					'keeper_publish_ms = one ready-set publish from the keeper; expect single-digit ms, and a ' +
+					'rising trend means the due set or the class count is growing. ' +
+					'keeper_repaired = rows the keeper\u2019s verification walk found it held differently from the table ' +
+					'(missing, wrong minute or class, or deleted) and repaired; expect 0, and treat a steady count as ' +
+					'its subscription losing writes. ' +
+					'keeper_verify_ms = one verification walk of the whole table (queue.keeper.verifyInterval). ' +
+					'claim_stale = ready-set entries a claim skipped because the durable row was no longer due ' +
+					'(rendered, rescheduled or deleted after the keeper published it): renders the check saved. A ' +
+					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late. ' +
+					'claim_wedged = keys a claim held back instead of granting (an exponential hold in the lease table, ' +
+					'capped at the cadence) because their last leases all expired with no result: a renderer crashing ' +
+					'on the URL, or, when many appear at once, results not reaching this node. The log names them.',
 			},
 			method: {
-				name: 'result (claim_scan_ms) | outcome (ready_sweep_ms) | source (claim_granted)',
-				values: ['granted', 'empty', 'capped', 'complete', 'ready', 'index'],
+				name: 'source (claim_granted)',
+				values: ['ready'],
 				description:
-					'claim_scan_ms, ready_sweep_ms and claim_granted use this slot. On claim_scan_ms: ' +
-					'granted = jobs handed out, empty = nothing due, capped = the ' +
-					'scan hit queue.claimScanCap without reaching a not-yet-due row (in-flight work is filling the ' +
-					'window). Every other series emits null here.',
+					'claim_granted emits `ready` (every claim is served from the ready set). Every other series ' +
+					'emits null here.',
 			},
 			type: { name: null, description: 'Unused (emitted as null).' },
 		},
@@ -815,39 +817,8 @@ export const metrics = Object.freeze({
 	/** How long the contract took to first hold — what `timeoutMs` should be tuned from. */
 	renderReadinessMs: (ms, contract) => server.recordAnalytics(ms, 'render_readiness', 'satisfied_ms', contract, null),
 
-	/** One claim pass's duration and how it ended — a queue_health series, so the queue reads in one scan. */
-	claimScan: (durationMs, result) => server.recordAnalytics(durationMs, 'queue_health', 'claim_scan_ms', result, null),
-
-	/** One ready-set sweep: how long it took, and whether it saw the whole due set or hit its cap. */
-	readySweep: (durationMs, outcome) =>
-		server.recordAnalytics(durationMs, 'queue_health', 'ready_sweep_ms', outcome, null),
-
-	/** How many entries the last sweep published — the ordering's supply. */
-	readyPublished: (count) => server.recordAnalytics(count, 'queue_health', 'ready_published', null, null),
-
-	/**
-	 * How much of the due set the last sweep could score against its REAL cadence, `carried` vs
-	 * `resolved`.
-	 *
-	 * The backfill gauge, and the only way to see it land. `effectiveInterval` is written by the
-	 * schedule writers, so it is absent on every row until that row re-renders: this reads all
-	 * `resolved` on the first sweep after an upgrade and should cross over within one cadence. A ratio
-	 * that STAYS low is the interesting signal — it means rows are being filed without a cadence (a
-	 * writer passing `null`, a corpus that is not re-rendering) and the demand ladder's promotions are
-	 * being scored against their route ceilings, which is the exact bug this field exists to fix. It
-	 * cannot be inferred from anything else: the ordering still works in both states, just less well.
-	 */
-	readyCadenceSource: (count, source) => server.recordAnalytics(count, 'queue_health', 'ready_cadence', source, null),
-
-	/**
-	 * Jobs granted per claim, split by WHERE they came from: the ready set or the fallback index scan.
-	 *
-	 * This is the series that says whether prioritisation is actually happening. The ready set reorders
-	 * a fixed amount of work, so no total moves when it engages — and a node quietly serving every
-	 * claim from `index` (a sweep that is failing, a buffer that could not be sized, a set that is
-	 * always dry) looks identical to a healthy one in every other number.
-	 */
-	claimSource: (count, source) => server.recordAnalytics(count, 'queue_health', 'claim_granted', source, null),
+	/** Jobs granted by one claim. */
+	claimGranted: (count) => server.recordAnalytics(count, 'queue_health', 'claim_granted', 'ready', null),
 
 	/** One origin proxy on the serve path: time to response headers, status, and why. */
 	originFetch: (durationMs, statusCode, reason) =>

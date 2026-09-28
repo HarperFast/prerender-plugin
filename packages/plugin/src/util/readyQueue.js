@@ -4,55 +4,32 @@
  *
  * ── WHY THIS EXISTS AT ALL ─────────────────────────────────────────────────────────────────────
  *
- * `claim` reads `nextRenderTime >= floor` and takes the first rows it finds, so the queue serves
- * whatever is oldest-due. That is the wrong order under scarcity (see `util/renderPriority.js` for
- * the two production measurements), and the reason it could not simply be re-sorted is structural:
- * the claim window is ANCHORED AT THE OLDEST DUE TIME. Under a deep backlog every row in it is
- * ancient, so a homepage two of its own cadences late is nowhere near the window and no amount of
- * re-ranking finds a row that was never read. Widening the window does not help — a wider window
- * anchored in the same place is more ancient rows.
+ * Priority is relative lateness (`util/renderPriority.js`), which no stored key can order, so the
+ * queue cannot be read off an index in the order it should be served. The queue keeper
+ * (`util/queueKeeperService.js`) holds every due row on worker 0 and publishes the best few thousand
+ * here each second; `claim`, on whichever worker the consumer's poll landed, pops from this in
+ * priority order and touches no index at all.
  *
- * The fix is to stop deciding from a window. A background sweep scores the WHOLE due set and keeps
- * the best few thousand here; `claim` then pops from this in priority order and touches no index at
- * all. That is affordable because of one measured fact (#119): a projected one-sided read costs
- * ~2.4 us/row on a freshly-written 200k-row bench corpus — but ~55 us/row warm on the production
- * corpus of 1.3M churned rows, where a ~300k-row due set is a ~27s sweep (see
- * `util/renderPriority.js`). Writes, by contrast, are
- * 76-89 us/row, i.e. 32x a read. Reading liberally and writing not at all is the cheap direction, and
- * this structure adds ZERO writes.
- *
- * ── IT IS A CACHE IN FRONT OF THE OLD PATH, NOT A REPLACEMENT ─────────────────────────────────
- *
- * The single most important property for shipping this safely: when the set is cold, empty, or
- * exhausted, `claim` falls back to the floored scan it has always used. So the failure mode of
- * everything here is TODAY'S BEHAVIOUR — not a stalled queue. A sweep that never runs, a buffer sized
- * to zero, a worker that never publishes: all of them degrade to the current ordering rather than to
- * no ordering.
- *
- * That also means nothing here is a correctness invariant. An entry naming a row that has since been
- * rescheduled or deleted costs at most one redundant render (the lease CAS refuses a duplicate, and
- * `processJobResult` already drops a result whose target is gone). Compare that with the claim
- * floor, where a row filed below it is never claimed again — silently, terminally. This structure
- * cannot lose a page, because the next sweep re-reads the table.
+ * An entry is a pointer, never the truth: a claim point-reads each entry's durable row before granting
+ * it (`claimSchedules`), so an entry naming a row that has since been rescheduled or deleted is skipped,
+ * not rendered.
  *
  * ── WHY A SHARED BUFFER, AND WHY DOUBLE-BUFFERED ──────────────────────────────────────────────
  *
- * Claims arrive on whichever worker the consumer's poll landed on, so a per-worker set would mean N
- * workers each sweeping the corpus — N times the cost for the same answer. One worker sweeps and
+ * Claims arrive on whichever worker the consumer's poll landed on, and the keeper lives on one. It
  * publishes here; every worker reads.
  *
- * The set is REBUILT WHOLE on every sweep, never mutated in place, which is what makes the layout
+ * The set is REBUILT WHOLE on every publish, never mutated in place, which is what makes the layout
  * trivial: two slots, write the inactive one, flip an atomic. No fragmentation, no compaction, no
- * partially-visible set — a reader is always looking at one complete generation. Variable-length
- * cache keys would otherwise force an allocator in shared memory, which is exactly the kind of thing
- * that has taken this node down twice.
+ * partially-visible set — a reader is always looking at one complete generation. Keys are packed end to
+ * end in the slot's key region in publish order, so a variable-length key needs no allocator.
  *
  * ── AND WHY THE CURSOR IS A BARE ATOMIC ────────────────────────────────────────────────────────
  *
  * Entries are written BEST FIRST, so consumption order is already priority order and a consumer needs
  * to compare nothing. Claiming is `Atomics.add(cursor, 1)`: no lock, no scan, no coordination, and two
- * workers can never be handed the same index. Popping past the end simply reports exhaustion, which
- * is the signal to fall back.
+ * workers can never be handed the same index. Popping past the end simply reports exhaustion: the
+ * keeper republishes within a second.
  *
  * NO DEPENDENCIES beyond the encoder, deliberately — same discipline as `util/renderLease.js`. This
  * is a data structure, so `test/readyQueue.test.js` drives it against a plain `new ArrayBuffer()`
@@ -66,7 +43,7 @@
 //   3  count[slot 0]
 //   4  count[slot 1]
 //   5  sweptAtSec        when the active slot was published (relative epoch, see below)
-//   6  scannedRows       how many rows the publishing sweep examined, for reporting
+//   6  scannedRows       due rows the keeper held at publish, for reporting
 const H_ACTIVE = 0;
 const H_GENERATION = 1;
 const H_CURSOR = 2;
@@ -93,11 +70,8 @@ export const READY_EPOCH_SEC = 1_700_000_000;
  *   flags       Int32  bit 0 = fromSitemap
  *
  * `fromSitemap` is carried even though ordering does not need it — the boost is already folded into
- * the score. The renderer needs the LIVE value: it serializes a non-indexable page only when the url
- * is sitemap-listed, so a job that reports `false` for a listed page silently stops that page being
- * cached at all. That bug has been introduced twice in this package by a caller that let the flag go
- * absent, and the alternative here is a point read per granted job on the claim path against a
- * residency-pinned table, where an unowned read takes an untimed replication fetch.
+ * the score. A claim hands the renderer the value off the durable row it reads before granting, not
+ * this one; the copy here is for the explainer and the tests.
  */
 const E_SCORE = 0;
 const E_DUE_AT = 1;
@@ -109,10 +83,10 @@ const ENTRY_INT32 = 5;
 const F_FROM_SITEMAP = 1;
 
 /**
- * Bytes reserved per entry for its key. The production cache key is a URL plus a device suffix;
- * measured against the corpus the long tail of product URLs sits comfortably under this, and a key
- * that does not fit is DROPPED FROM THE SET rather than truncated — a truncated key is a key that
- * names a different row, which would grant a lease on the wrong page.
+ * Key bytes budgeted per entry: a slot's key region is `capacity × READY_KEY_BYTES` bytes, shared by
+ * its entries end to end, so any one key may be far longer — only the total is bounded. A generation
+ * whose keys outrun the region ends at the last key that fit (never truncated: a truncated key names a
+ * different row), and the rest follow in a later generation once the head has been claimed.
  */
 export const READY_KEY_BYTES = 256;
 
@@ -146,13 +120,14 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 	const bytes = new Uint8Array(buffer);
 	// Clamped to the buffer, never trusted from the argument: indexing past a short buffer is silent
 	// memory corruption, whereas deriving the capacity from the buffer we actually got is merely a
-	// smaller set — and a smaller set degrades to the fallback scan, which is safe.
+	// smaller set.
 	const cap = Math.min(
 		Math.max(0, capacity | 0) || readyCapacityIn(buffer.byteLength),
 		readyCapacityIn(buffer.byteLength)
 	);
 
 	const perSlotEntryBytes = cap * ENTRY_INT32 * 4;
+	const keyRegionBytes = cap * READY_KEY_BYTES;
 	const slotEntryBase = (slot) => HEADER_INT32 * 4 + slot * (perSlotEntryBytes + cap * READY_KEY_BYTES);
 	const slotBlobBase = (slot) => slotEntryBase(slot) + perSlotEntryBytes;
 	const entryIndex = (slot, i) => slotEntryBase(slot) / 4 + i * ENTRY_INT32;
@@ -163,7 +138,10 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 		const base = entryIndex(slot, i);
 		const keyOffset = Atomics.load(i32, base + E_KEY_OFFSET);
 		const keyLen = Atomics.load(i32, base + E_KEY_LEN);
-		if (keyLen <= 0 || keyLen > READY_KEY_BYTES) return null;
+		// Bounds-checked against the slot's key region: an entry read while its slot was being rewritten
+		// can pair a stale offset with a fresh length, and must fail rather than read past the region.
+		const regionBase = slotBlobBase(slot);
+		if (keyLen <= 0 || keyOffset < regionBase || keyOffset + keyLen > regionBase + keyRegionBytes) return null;
 		return {
 			cacheKey: decoder.decode(bytes.subarray(keyOffset, keyOffset + keyLen)),
 			dueAt: fromSec(Atomics.load(i32, base + E_DUE_AT)),
@@ -180,7 +158,8 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 		 * in order and compares nothing, so ordering is this function's contract, not the reader's.
 		 *
 		 * Writes the INACTIVE slot and flips at the end, so a reader is never looking at a half-written
-		 * set. Returns how many entries were actually stored.
+		 * set. Returns how many entries were actually stored: fewer than offered when the capacity or the
+		 * key region filled first.
 		 */
 		publish(rows, { scannedRows = 0 } = {}) {
 			if (cap === 0) return 0;
@@ -188,13 +167,15 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 			const blobBase = slotBlobBase(target);
 
 			let stored = 0;
+			let keyBytes = 0;
 			for (const { entry, score } of rows) {
 				if (stored >= cap) break;
 				const encoded = encoder.encode(entry.cacheKey);
-				// DROPPED, NOT TRUNCATED. A truncated key names a different row, and granting a lease on
-				// the wrong page is worse than not granting one — the fallback scan will find this row.
-				if (encoded.length > READY_KEY_BYTES) continue;
-				const keyOffset = blobBase + stored * READY_KEY_BYTES;
+				// ENDS THE GENERATION, never skips or truncates: skipping would publish lower-priority rows
+				// ahead of this one, and a truncated key names a different row.
+				if (keyBytes + encoded.length > keyRegionBytes) break;
+				const keyOffset = blobBase + keyBytes;
+				keyBytes += encoded.length;
 				bytes.set(encoded, keyOffset);
 				const base = entryIndex(target, stored);
 				Atomics.store(i32, base + E_SCORE, Math.round(Math.min(2_147_483, score) * 1000));
@@ -208,28 +189,32 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 			Atomics.store(i32, countSlot(target), stored);
 			Atomics.store(i32, H_SCANNED, Math.min(scannedRows, 2_147_483_647));
 			Atomics.store(i32, H_SWEPT_AT, toSec(now()));
-			// ORDER MATTERS: reset the cursor BEFORE flipping, or a claim landing between the two reads
-			// the new slot with the old slot's cursor and skips the head of a fresh generation.
-			Atomics.store(i32, H_CURSOR, 0);
+			// ORDER MATTERS, together with `take` reading the slot AFTER its cursor increment: flip first,
+			// then reset. Any index a take gets is then read from the slot that was active when it got it
+			// or a newer one, so a take straddling a publish can hand out a new-generation entry a second
+			// time (the lease grant refuses the duplicate) but never skips one. The other order let a take
+			// that read the old slot consume index 0.. of the new generation: its head, handed to nobody.
 			Atomics.store(i32, H_ACTIVE, target);
+			Atomics.store(i32, H_CURSOR, 0);
 			Atomics.add(i32, H_GENERATION, 1);
 			return stored;
 		},
 
 		/**
 		 * Take the next `n` entries in priority order. Returns fewer (or none) when the set is
-		 * exhausted, which is the caller's signal to fall back to the index scan.
+		 * exhausted.
 		 *
-		 * `Atomics.add` on the cursor is the whole concurrency story: two workers can never be handed
-		 * the same index, and there is no lock to hold while a claim is in flight.
+		 * `Atomics.add` on the cursor is the whole concurrency story: within one generation two workers
+		 * can never be handed the same index, and there is no lock to hold while a claim is in flight.
+		 * The slot is read after each increment, never before (see the ordering note in `publish`).
 		 */
 		take(n) {
 			const out = [];
 			if (cap === 0) return out;
-			const slot = Atomics.load(i32, H_ACTIVE);
-			const count = Atomics.load(i32, countSlot(slot));
 			for (let i = 0; i < n; i++) {
 				const index = Atomics.add(i32, H_CURSOR, 1);
+				const slot = Atomics.load(i32, H_ACTIVE);
+				const count = Atomics.load(i32, countSlot(slot));
 				if (index >= count) {
 					// Do not let the cursor run away past the count while a set is exhausted: it is an
 					// Int32 and a busy node claims several times a second, so an unbounded increment would
@@ -238,7 +223,7 @@ export const createReadyQueue = ({ buffer, capacity, now = Date.now } = {}) => {
 					// A COMPARE-EXCHANGE, NOT A STORE, and the difference is a whole generation. A plain
 					// store here races `publish`: publish resets the cursor to 0 and flips the slot, and a
 					// store landing just after that rewinds it to the PREVIOUS generation's count — so every
-					// entry of the fresh set is skipped, silently, until the next sweep replaces it. The CAS
+					// entry of the fresh set is skipped, silently, until the next publish replaces it. The CAS
 					// only clamps if the cursor is still where this call's own increment left it, so a
 					// concurrent reset always wins. (Two threads are needed to hit it, which is why no test
 					// here can: single-threaded, nothing can interleave between the add and the clamp.)

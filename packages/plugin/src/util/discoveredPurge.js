@@ -160,8 +160,8 @@ export const purgeDiscoveredTargets = async ({
 		const window = (batch.length / Math.max(1, ratePerSecond)) * 1000;
 		const elapsed = now() - started;
 		batch.length = 0;
-		// Paced in the dry run too: the walk itself reads the same index the claim scan works,
-		// and the census being a bit slower beats perturbing a saturated queue to count faster.
+		// Paced in the dry run too: the walk itself reads beside bot traffic, and the census being a
+		// bit slower beats perturbing a busy node to count faster.
 		if (elapsed < window) await pause(window - elapsed);
 	};
 

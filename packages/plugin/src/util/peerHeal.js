@@ -13,14 +13,9 @@
  *
  * ── WHY FORWARD, RATHER THAN JUST WRITE FROM HERE ──────────────────────────────────────────────
  *
- * The guard's own stated reason — that a cross-node write files a row beneath the owner's claim
- * floor — is VOID, and provably so. `claim` seeks from `readFloorMinute`, which clamps:
- *
- *     Math.max(0, Math.min(stored, nowMinute - guardMinutes))
- *
- * The effective floor can never exceed `now - guard`, however far `stored` has advanced, so a due
- * time at or after the current minute clears every node's floor by the whole guard band —
- * unconditionally, with no dependence on the peer's queue state.
+ * The guard's original stated reason — that a cross-node write files a row beneath the owner's claim
+ * floor — no longer applies: there is no claim floor since v0.93.0, and the owner's queue keeper sees
+ * a cross-node write by replication like any other.
  *
  * But three OTHER things behind that guard are only correct on the owner, and they are why writing
  * from here anyway would be a regression rather than a fix:

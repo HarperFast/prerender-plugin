@@ -21,10 +21,11 @@
  * `1/interval`, so two rows with different intervals cross exactly once — no stored key can express
  * an order that changes with the clock, and #80 rejected it as a comparator for exactly that reason.
  *
- * That objection is fatal to an index and irrelevant to a function that is re-evaluated. Re-scoring
- * the whole due set on a timer is affordable because the read is projected, one-sided and write-free.
- * HOW affordable was badly mis-estimated, and the correction is worth carrying because it is a trap
- * anyone re-running the harness will fall into.
+ * That objection is fatal to an index and irrelevant to a function that is re-evaluated. Since
+ * v0.93.0 it is evaluated in memory by the queue keeper (`util/queueKeeper.js`), over class heads
+ * rather than rows. Before that a sweep re-scored the whole due set from the index every few minutes,
+ * and how affordable THAT was is a measurement worth keeping, because it is a trap anyone re-running
+ * the harness will fall into.
  *
  * `bench/queue-index` (#119) measured ~2.4 us/row. MEASURED ON THE PRODUCTION CORPUS (2026-08-21) the
  * sweep runs ~55 us/row warm, ~80 us/row cold — a ~300k-row due set is a ~27s sweep, not the
@@ -34,8 +35,8 @@
  *
  * On an LSM store that difference is the whole cost. Every reschedule is a `put` that supersedes the
  * old value, and a range scan has to walk past superseded entries until compaction removes them — the
- * same shape as the dead-index-entry degradation the claim floor exists to bound. The harness ALREADY
- * measured this and it was read too narrowly: an unfloored seek after 40,000 head reschedules went
+ * same shape as the dead-index-entry degradation the claim floor (v0.34.0–v0.92.0) existed to bound.
+ * The harness ALREADY measured this and it was read too narrowly: an unfloored seek after 40,000 head reschedules went
  * 0.073 -> 5.60 ms, 77x, on the same engine and corpus. 2.4 us/row was a FLOOR for a fresh corpus,
  * never a steady state.
  *
@@ -54,11 +55,10 @@
  *
  * The tempting form is `(now - lastRender) / interval` — staleness relative to cadence, the same
  * number plus one, and it reads better. It is wrong here, because `dueAt - interval` is not when the
- * page last rendered for every row in the table. Three writers deliberately schedule a gap that is
- * not the cadence: `Target.suppress` writes `render.suppression.recheckInterval` (7 days),
- * `backoffWait` writes up to `render.failureRetry.maxBackoff`, and the unpin hatch pushes by
- * `render.defaultInterval`. Under the age form a 7-day suppression recheck on a 48h route arrives
- * reading as 3.5 cadences stale and outranks a genuinely late homepage — promoting exactly the rows
+ * page last rendered for every row in the table. Two writers deliberately schedule a gap that is
+ * not the cadence: `Target.suppress` writes `render.suppression.recheckInterval` (7 days), and
+ * `backoffWait` writes up to `render.failureRetry.maxBackoff`. Under the age form a 7-day suppression
+ * recheck on a 48h route arrives reading as 3.5 cadences stale and outranks a genuinely late homepage — promoting exactly the rows
  * worth deprioritizing.
  *
  * Lateness has no such coupling: it is zero at the moment any row comes due, whatever gap preceded
@@ -89,9 +89,9 @@
 export const scoreOf = ({ dueAt, fromSitemap }, { nowMs, intervalMs, sitemapBoost = 1 }) => {
 	// THE DUE TIME IS GUARDED, AND IT IS THE DANGEROUS ONE. `nowMs - null` is `nowMs`, so an absent
 	// due time does not produce a small score or a NaN — it produces a lateness of ~1.8e12, which sorts
-	// straight to the head of the set and hands the next lease to a broken row. `sweepReadySet` filters
-	// non-finite due times before it gets here, but this is exported and scored by callers that have
-	// not, so the guard belongs with the arithmetic. Zero is the right answer: a row with no due time
+	// straight to the head of the set and hands the next lease to a broken row. The keeper never holds a
+	// non-finite due time, but this is exported and scored by callers that may, so the guard belongs with
+	// the arithmetic. Zero is the right answer: a row with no due time
 	// makes no claim to urgency.
 	if (!Number.isFinite(dueAt) || !Number.isFinite(nowMs)) return 0;
 	const lateness = Math.max(0, nowMs - dueAt);
@@ -101,90 +101,4 @@ export const scoreOf = ({ dueAt, fromSitemap }, { nowMs, intervalMs, sitemapBoos
 	// numeric STRING interval, which works correctly today.
 	const ratio = intervalMs > 0 ? lateness / intervalMs : lateness;
 	return fromSitemap ? ratio * sitemapBoost : ratio;
-};
-
-/**
- * A BOUNDED MAX-K SELECTION over a stream, as a min-heap of size K.
- *
- * The point is that the sweep must be able to walk a due set far larger than anything it can hold:
- * 500,000 overdue rows at the recorded corpus, against a ready set of a few thousand. So rows stream
- * THROUGH this and only the best K are ever retained — memory is a function of K, not of the corpus,
- * which is what makes "sweep everything" affordable in the first place. A sort would need the whole
- * set resident, and this node has twice been taken down by an unbounded structure over this corpus.
- *
- * A min-heap (not a max-heap) because the operation on every row after the first K is "is this better
- * than the WORST one I am keeping" — one comparison against the root, and a rejected row costs
- * exactly that. At a 500k-row sweep into a 5k set, ~99% of rows are rejected on that single compare.
- */
-export const createTopK = (k) => {
-	const capacity = Math.max(1, k | 0);
-	// [score, entry] pairs kept as parallel arrays: one allocation each rather than an object per
-	// candidate, on a path that sees every due row on the node.
-	const scores = [];
-	const entries = [];
-
-	const swap = (i, j) => {
-		const s = scores[i];
-		scores[i] = scores[j];
-		scores[j] = s;
-		const e = entries[i];
-		entries[i] = entries[j];
-		entries[j] = e;
-	};
-
-	const up = (i) => {
-		while (i > 0) {
-			const parent = (i - 1) >> 1;
-			if (scores[parent] <= scores[i]) break;
-			swap(parent, i);
-			i = parent;
-		}
-	};
-
-	const down = (i) => {
-		for (;;) {
-			const left = 2 * i + 1;
-			const right = left + 1;
-			let smallest = i;
-			if (left < scores.length && scores[left] < scores[smallest]) smallest = left;
-			if (right < scores.length && scores[right] < scores[smallest]) smallest = right;
-			if (smallest === i) break;
-			swap(i, smallest);
-			i = smallest;
-		}
-	};
-
-	return {
-		get size() {
-			return scores.length;
-		},
-
-		/** True if the candidate was kept. */
-		offer(score, entry) {
-			if (scores.length < capacity) {
-				scores.push(score);
-				entries.push(entry);
-				up(scores.length - 1);
-				return true;
-			}
-			// The single comparison the whole design rests on: the root is the worst kept row.
-			if (score <= scores[0]) return false;
-			scores[0] = score;
-			entries[0] = entry;
-			down(0);
-			return true;
-		},
-
-		/**
-		 * The kept entries, BEST FIRST, with their scores.
-		 *
-		 * Best-first is what lets the shared cursor in `util/readyQueue.js` be a bare atomic
-		 * increment: consumption order IS priority order, so no consumer has to compare anything.
-		 */
-		drainDescending() {
-			const out = entries.map((entry, i) => ({ entry, score: scores[i] }));
-			out.sort((a, b) => b.score - a.score);
-			return out;
-		},
-	};
 };

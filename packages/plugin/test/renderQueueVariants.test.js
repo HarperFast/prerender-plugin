@@ -1,5 +1,6 @@
 import { test, before, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { publishDueRows } from './support/keeperStandIn.js';
 
 /**
  * ONE JOB PER URL, ONE RESULT, ONE SCHEDULING DECISION (plugin v0.66.0 / browser v1.23.0).
@@ -147,7 +148,10 @@ afterEach(() => {
 	config.deviceTypes.supported = ['desktop', 'mobile', 'tablet'];
 });
 
-const claim = (limit = 10) => RenderQueue.claim({ limit });
+const claim = (limit = 10) => {
+	publishDueRows(funnel, stores.renderSchedule);
+	return RenderQueue.claim({ limit });
+};
 const leased = (k) => !!funnel.leaseInfo(k);
 const outcomes = () => analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome').map((a) => [a[3], a[4]]);
 const renderTimes = () => analytics.filter((a) => a[1] === 'render' && a[2] === 'time_ms');

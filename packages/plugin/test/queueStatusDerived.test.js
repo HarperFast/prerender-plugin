@@ -4,10 +4,11 @@ import assert from 'node:assert/strict';
 /**
  * Queue status is DERIVED, not scanned.
  *
- * `syncQueueState` used to run a second head-seeking query (`nextRenderTime <= now`, limit 1) on
- * worker 0 every `queue.statusSyncInterval` — measured at ~700ms of synchronous native iteration
- * per minute on an aged node, on the worker that also serves bot traffic. With a claim floor the
- * answer is derivable from it plus the last claim outcome at zero database cost.
+ * `syncQueueState` once ran a head-seeking query (`nextRenderTime <= now`, limit 1) on worker 0 every
+ * `queue.statusSyncInterval` — measured at ~700ms of synchronous native iteration per minute on an aged
+ * node, on the worker that also serves bot traffic. The answer is the queue keeper's due count, at zero
+ * database cost: `queued` when it holds due rows (in flight included), `empty` when it holds none, and
+ * `unready` when it is not serving claims at all.
  *
  * The strongest way to pin the ABSENCE of a query is to make that query fatal: the RenderSchedule
  * fake here THROWS from `search`, so a status refresh that still scans cannot pass.
@@ -18,10 +19,12 @@ import assert from 'node:assert/strict';
  */
 
 const MINUTE = 60_000;
-const T0 = 1_700_000_400_000;
 const minuteOf = (ms) => Math.floor(ms / MINUTE);
 
-let RenderQueue, QueueState, funnel, config;
+let RenderQueue, QueueState, funnel;
+
+/** The keeper, live, holding `due` due rows. */
+const keeperHolds = (due) => funnel.setKeeperSignal({ due });
 
 const controls = new Map();
 const statuses = new Map();
@@ -108,7 +111,6 @@ before(async () => {
 		page_cache: { PrerenderedPage: makeTable(new Map()) },
 	};
 
-	({ config } = await import('../src/config.js'));
 	({ QueueState } = await import('../src/resources/QueueState.js'));
 	({ RenderQueue } = await import('../src/resources/RenderQueue.js'));
 	funnel = await import('../src/util/renderSchedule.js');
@@ -123,7 +125,7 @@ beforeEach(() => {
 });
 
 test('refreshQueueStatus resolves with a status even though RenderSchedule.search throws', async () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	keeperHolds(1);
 
 	const result = await RenderQueue.refreshQueueStatus();
 
@@ -132,20 +134,62 @@ test('refreshQueueStatus resolves with a status even though RenderSchedule.searc
 	assert.equal(QueueState.status, 'queued');
 });
 
-test('the derivation is tri-state: due rows seen ⇒ queued, none ⇒ empty', async () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+test('the derivation is tri-state: due rows held ⇒ queued, none ⇒ empty', async () => {
+	keeperHolds(0);
 	assert.equal((await RenderQueue.refreshQueueStatus()).status, 'empty');
 
-	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	keeperHolds(1);
 	assert.equal((await RenderQueue.refreshQueueStatus()).status, 'queued');
 	assert.equal(searchCalls, 0);
 });
 
-test('a not-yet-due row whose minute has arrived flips the derivation to queued', () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: minuteOf(T0 + 5 * MINUTE) });
-	assert.equal(funnel.deriveQueueStatus(T0), 'empty');
-	assert.equal(funnel.deriveQueueStatus(T0 + 5 * MINUTE), 'queued');
-	assert.equal(searchCalls, 0);
+test('a keeper that is not serving, or is still loading with nothing found yet, reports unready', () => {
+	funnel.clearKeeperSignal();
+	assert.equal(funnel.deriveQueueStatus(), 'unready');
+	funnel.setKeeperSignal({ due: 0, complete: false });
+	assert.equal(funnel.deriveQueueStatus(), 'unready', 'loading: not known to be empty');
+	funnel.setKeeperSignal({ due: 2, complete: false });
+	assert.equal(funnel.deriveQueueStatus(), 'queued', 'loading, and work already found');
+	keeperHolds(0);
+	assert.equal(funnel.deriveQueueStatus(), 'empty');
+	assert.equal(
+		funnel.deriveQueueStatus(Date.now() + 5 * MINUTE),
+		'unready',
+		'a keeper gone quiet whose set has drained can grant nothing: its worker may be gone for good'
+	);
+});
+
+test('becoming ready is a CHANGE, written once, so the fleet is told at once', async () => {
+	funnel.clearKeeperSignal();
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'unready');
+	statuses.clear();
+	keeperHolds(3);
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.get('node-a')?.status, 'queued', 'unready -> queued moves without force');
+	statuses.clear();
+	await RenderQueue.refreshQueueStatus();
+	assert.equal(statuses.size, 0, 'and a steady queued writes nothing');
+});
+
+test('a work-arrived hint moves only empty: never paused, never unready', async () => {
+	QueueState.reportStatus('unready');
+	statuses.clear();
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'unready', 'an unready node could not grant the job anyway');
+	assert.equal(statuses.size, 0);
+
+	QueueState.reportStatus('paused');
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'paused');
+	assert.equal(QueueState.reportStatus('queued'), undefined);
+	assert.equal(QueueState.status, 'paused', 'an unforced report never lifts a pause');
+
+	QueueState.reportStatus('empty', true);
+	statuses.clear();
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'queued');
+	assert.equal(statuses.get('node-a')?.status, 'queued');
 });
 
 // ---- what must NOT have been deleted with the scan ----
@@ -178,7 +222,7 @@ test('LIFTING a pause is force-written — a compareExchange cannot move a flag 
 	assert.equal(QueueState.status, 'paused');
 
 	controls.delete('all');
-	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	keeperHolds(0);
 	const result = await RenderQueue.refreshQueueStatus();
 
 	assert.equal(result.status, 'empty');
@@ -186,7 +230,7 @@ test('LIFTING a pause is force-written — a compareExchange cannot move a flag 
 });
 
 test('a forced refresh writes the QueueStatus row', async () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	keeperHolds(0);
 	await RenderQueue.refreshQueueStatus(true);
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
@@ -202,7 +246,7 @@ test('a forced refresh writes the QueueStatus row', async () => {
 // console needed instead was to stop inferring liveness from this timestamp at all.
 
 test('a steady status writes NOTHING, however many syncs run', async () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	keeperHolds(1);
 	await RenderQueue.refreshQueueStatus();
 	const first = statuses.get('node-a');
 	assert.equal(first?.status, 'queued', 'the flip to queued wrote once');
@@ -214,11 +258,11 @@ test('a steady status writes NOTHING, however many syncs run', async () => {
 });
 
 test('a real change still writes, in both directions', async () => {
-	funnel.leaseTable().recordPassOutcome({ sawDue: true, earliestNotYetDueMinute: 0 });
+	keeperHolds(1);
 	await RenderQueue.refreshQueueStatus();
 	assert.equal(statuses.get('node-a')?.status, 'queued');
 
-	funnel.leaseTable().recordPassOutcome({ sawDue: false, earliestNotYetDueMinute: 0 });
+	keeperHolds(0);
 	await RenderQueue.refreshQueueStatus();
 	assert.equal(statuses.get('node-a')?.status, 'empty');
 });
@@ -230,12 +274,8 @@ test('the status refresh reconciles the lease gauge, which otherwise climbs with
 	// nobody to decrement it — the grant counted +1, and a late release (or the release that never
 	// arrives) sees a dead slot and correctly declines — so every expiry leaks one, permanently.
 	//
-	// That is not cosmetic, because the gauge SIZES the claim scan (`grantLimit + occupancy +
-	// grantLimit`, capped at queue.claimScanCap). Measured on the real pass it reached 820 against 20
-	// genuinely in flight after ~80 minutes and crossed a 1,000-row cap by pass 49, after which every
-	// claim drains the full cap of projected rows under the claim mutex, on the worker that also serves
-	// bot traffic. Nothing else in the system walks the slots on a timer, so if this refresh stops doing
-	// it the drift is unbounded again.
+	// Nothing else in the system walks the slots on a timer, so if this refresh stops doing it the drift
+	// is unbounded, and the in-flight count every console view and the queue state report climbs with it.
 	const leases = funnel.leaseTable();
 	const now = Date.now();
 
@@ -251,39 +291,5 @@ test('the status refresh reconciles the lease gauge, which otherwise climbs with
 	await RenderQueue.refreshQueueStatus();
 
 	assert.equal(leases.occupancy(), 0, 'the refresh walked the slots and reconciled it to the truth');
-	assert.equal(searchCalls, 0, 'and did it without touching the queue index — the walk is pure Atomics');
-});
-
-// ---- the floor reset rides on the status sync ----
-
-test('the status refresh resets the claim floor at most once per resetInterval', async () => {
-	const original = config.queue.claimFloor.resetInterval;
-	try {
-		config.queue.claimFloor.resetInterval = 5 * MINUTE;
-		funnel.resetRenderQueueState();
-
-		// First refresh: the reset fires (this is what recovers a due time written below the floor by
-		// the operations API, which no plugin code can observe).
-		await RenderQueue.refreshQueueStatus();
-		funnel.leaseTable().advanceFloor(0, minuteOf(T0));
-		assert.equal(funnel.maybeResetFloor(Date.now() + MINUTE), false, 'not again inside the interval');
-		assert.equal(funnel.leaseTable().rawFloorMinute(), minuteOf(T0), 'so the floor survives');
-
-		assert.equal(funnel.maybeResetFloor(Date.now() + 6 * MINUTE), true);
-		assert.equal(funnel.leaseTable().rawFloorMinute(), 0, 'and the next pass re-derives it from the index');
-	} finally {
-		config.queue.claimFloor.resetInterval = original;
-	}
-});
-
-test('resetting the claim floor by hand reports what it changed', async () => {
-	funnel.resetRenderQueueState();
-	funnel.leaseTable().advanceFloor(0, minuteOf(T0));
-
-	const result = await RenderQueue.resetClaimFloor();
-
-	assert.equal(result.previousFloorMinute, minuteOf(T0));
-	assert.equal(result.floorMinute, 0);
-	assert.equal(result.node, 'node-a');
-	assert.equal(funnel.leaseTable().rawFloorMinute(), 0);
+	assert.equal(searchCalls, 0, 'and did it without touching the table — the walk is pure Atomics');
 });

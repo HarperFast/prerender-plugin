@@ -10,10 +10,8 @@
  * Measured on 400,000 rows (one node's slice of a 1.61M-key corpus): 15.7 s wall and **61.8 MB of
  * audit per node per invalidation**, at 162 B/row, and pacing does not reduce it — batching with
  * yields kept the same 162 B/write, took 8.9x longer, and made claim's max latency WORSE (47.4 ->
- * 62.4 ms). The naive form is uniquely bad on top of that: collapsing every due time to
- * `currentMinuteMs()` piles the rows exactly where the claim scan seeks, taking it from 0.36 ms to
- * 11.59 ms (32x), and that scar only clears on the next compaction of the store, which needs write
- * pressure. Recording an epoch instead costs **0.18 ms and 102 bytes** — ~606,000x less audit — and
+ * 62.4 ms). (While claims walked the `nextRenderTime` index, collapsing every due time to
+ * `currentMinuteMs()` also slowed the claim scan 32x.) Recording an epoch instead costs **0.18 ms and 102 bytes** — ~606,000x less audit — and
  * it is what makes undo instant, because `lastCached` was never altered.
  *
  * WHY NOT A QUEUE-SIDE SWEEP, ever. The PDP corpus is 1,530,046 keys against a measured fleet

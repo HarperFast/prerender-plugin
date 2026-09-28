@@ -744,8 +744,8 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 		// silently WIDEN the window an operator deliberately narrowed.
 		//
 		// THE HAZARD IS THE PILE, NOT THE LEASE. A narrow window squeezes every accelerated row on the
-		// node onto a handful of minutes, and rows piled at the minute the claim scan seeks take that
-		// scan from 0.36ms to 11.59ms (32x), clearing only on the store's next compaction. This warning
+		// node onto a handful of minutes (before v0.93.0 that pile also slowed the index claim scan 32x;
+		// with no index the spread is kept so accelerated rows still arrive spread out). This warning
 		// used to claim instead that a key re-armed sooner than `jobLeaseTime` chases a render that still
 		// holds its lease — which a window WIDTH cannot prevent (the jitter is uniform, so most keys are
 		// re-armed sooner than a lease even at the defaults), and which the accelerator's node-local
@@ -756,8 +756,7 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 			'invalidation.reenqueue.spreadWindow',
 			`invalidation.reenqueue.spreadWindow (${reenqueue.spreadWindow}ms) is below queue.jobLeaseTime ` +
 				`(${target.queue.jobLeaseTime}ms) — that squeezes every accelerated due time onto a handful of ` +
-				`minutes, and a pile of rows at the minute the claim scan seeks takes that scan from 0.36ms to ` +
-				`11.59ms. The accelerator is using ${target.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
+				`minutes. The accelerator is using ${target.queue.jobLeaseTime}ms instead; raise spreadWindow to at ` +
 				`least that to silence this.`
 		);
 	}

@@ -129,15 +129,16 @@ rest: true # required for the @export-ed table REST endpoints
     userAgent: HarperSitemapCrawler/1.0 # self-identifying UA for the sitemap crawler fetch
 
   queue:
-    jobLeaseTime: 600000 # 10m — how long a claimed job is leased (also a LATENCY knob, see below)
-    statusSyncInterval: 60000 # 1m  — pause convergence, status broadcast, claim-floor reset
+    jobLeaseTime: 600000 # 10m — how long a claimed job is leased (also the fast-retry pacing)
+    statusSyncInterval: 60000 # 1m  — pause convergence, status broadcast, lease-gauge reconcile
     maxLeases: 4096 # lease slots in the node-local shared buffer (restart-scoped)
-    claimScanCap: 1000 # ceiling on schedule rows read per claim pass
-    claimFloor: # the lower bound the claim scan seeks from (see "The claim floor")
-      enabled: true # false = seek the absolute index minimum, as before v0.34.0
-      guard: 300000 # 5m — the floor is always held at least this far behind now
-      resetInterval: 300000 # 5m — how often the floor is reset and re-derived from the index
-      unpinAfter: 3600000 # 1h — a row holding the floor this long is written forward (0 = never)
+    ready:
+      capacity: 5000 # entries in the ready set (restart-scoped)
+      sitemapBoost: 2 # a sitemap-sourced row outranks a discovered one at the same lateness
+    keeper: # the in-memory queue (see "The render queue")
+      publishInterval: 1000 # 1s — ready-set republish; the longest a newly-due row waits
+      verifyInterval: 3600000 # 1h — full check of the keeper against the table; 0 disables
+      stateInterval: 5000 # 5s — queue-state recompute
 
   management: # the management API at /prerender_admin
     enabled: true # false makes every management route 404
@@ -444,9 +445,7 @@ Three properties are worth knowing before a bulk upload:
   content change could appear on one device and not the other for hours.
 - **`revalidate: true` bypasses the stagger entirely**, setting every entry due in the same
   minute. That is its purpose (forcing a backfill), but it is not how to warm a large sitemap for
-  the first time — omit it and let the jitter place the URLs. It is safe with respect to the claim
-  floor because it writes through the schedule funnel (which lowers the floor with the rows) and
-  because the guard band keeps the current minute above every node's floor — see "The claim floor".
+  the first time — omit it and let the jitter place the URLs.
 
 There is no separate "warm-up" pacing knob, and none is needed: the initial spread is exactly the
 steady-state cadence, so a fleet that can sustain the ongoing load can absorb the warm.
@@ -502,202 +501,102 @@ schedule is benign and self-heals on the next sitemap refresh / `revalidate`.
 
 See [`src/schemas/schema.graphql`](src/schemas/schema.graphql).
 
-#### Where the claim floor and the job leases live
+#### The render queue: the queue keeper (v0.93.0)
 
-Neither is a table. Both are **node-local shared-buffer state**, in one named cross-worker buffer
-(`coordination.SharedBuffer`, never replicated): a fixed array of lease slots keyed by a 64-bit hash
-of the cache key, plus the claim floor as a single integer. A lease costs zero database operations.
+Worker 0 on each node holds every `RenderSchedule` row that node owns in memory, kept current by a
+subscription on the table. **The keeper is the queue, and `RenderSchedule` is its durable side**: the
+table is read by primary key only, and `nextRenderTime` carries no index
+([#215](https://github.com/HarperFast/prerender-plugin/issues/215)).
 
-**Losing them on a restart is correct, not a fault.** A lease is not a record of work — the schedule
-row is, and it was never moved — so a job whose lease vanished is simply granted again. The visible
-cost is a duplicate-render burst for whatever was in flight (~500 per node at 12k renders/hour), and
-both results are accepted, with the later `PrerenderedPage.put` winning. The floor zeroing on restart
-is a _feature_: `0` means "seek the absolute index minimum", i.e. exactly the pre-v0.34.0 behaviour,
-so a restart cannot help but re-derive the truth from the index. Persisting the floor would make a
-bad value durable, which is why it is deliberately not persisted.
+- **Claims.** Every `queue.keeper.publishInterval` (1 s) the keeper publishes the best of the due set,
+  in claim order, into a shared buffer (the ready set). A claim, on whichever worker the poll landed,
+  takes entries in order, point-reads each one's row locally, skips any that is no longer due
+  (`queue_health` `claim_stale`), and leases the rest. The lease grant is exclusive, so claims need no
+  mutex and a key published in two consecutive sets is still granted once
+  ([#218](https://github.com/HarperFast/prerender-plugin/issues/218)). A short claim is short: the
+  keeper republishes within a second.
+- **Order.** Relative lateness: `max(0, now − dueAt) / effectiveInterval`, times
+  `queue.ready.sitemapBoost` for a sitemap-sourced row. Absolute due time treats a 1 h-TTL homepage 3 h
+  overdue like a 48 h-TTL product page 3 h overdue — 300% stale against 6%
+  ([#80](https://github.com/HarperFast/prerender-plugin/issues/80)). Lateness rather than age, because
+  `dueAt − interval` is not when the page last rendered for every row (suppression rechecks file 7
+  days out, `backoffWait` up to `maxBackoff`). The cadence is the row's own `effectiveInterval` — rung
+  > route > stored > default, so a page `render.demand` promoted to 6 h is not ranked as if it were on
+  > its route's 24 h ceiling. `sitemapBoost` is a multiplier, never a tier, so a discovered page is
+  > served within roughly `sitemapBoost ×` the worst sitemap ratio. Rows are grouped by class (route ×
+  > cadence × sitemap flag), within which due time already orders them, so the best K is a merge over
+  > class heads, not a scan.
+- **It repairs itself from the table.** Each publish re-reads the head of what it published and fixes
+  what it holds wrongly. A verification walk (`queue.keeper.verifyInterval`, 1 h) checks every row it
+  owns and every row it holds against the table and repairs the difference (`keeper_repaired`,
+  expected 0), which bounds a missed write to one interval. A repair never overwrites a newer write: it
+  applies the read only if the keeper's entry did not change during it.
+- **Ownership.** It holds only rows this node owns by residency, so a stale row left by an earlier
+  ownership (a "residency ghost") is never rendered. A node with configured peers (`system.hdb_nodes`
+  names another node) waits to see one before loading, up to two minutes; a single node loads at once.
+  A row stored here but owned elsewhere is not held; the verification walk counts them
+  (`trust.keeper.verify.unowned`).
+- **It serves while it loads, and never reloads once live.** The ready set is published from the first
+  chunk of the load (every grant is checked against its row, so a partial queue is safe; only its order
+  is incomplete for the first seconds). After that nothing reloads: a route or default-interval change
+  reclassifies every held row in memory; a membership change drops the rows this node no longer owns
+  in memory and runs the verification walk to add the ones it gained; a closed subscription is reopened
+  and walked. Claims are served throughout.
+- **Until its first publish, this node grants no claims** and reports the queue status `unready` (a
+  render fleet that predates it reads an unknown status as `empty` and polls at its idle interval).
+  `queue-state` answers 503 until the load finishes. Each change of status is reported by the keeper at
+  once, so the fleet is woken by it rather than finding out on its next idle poll.
+- **An unreadable row does not hide the rows past it.** When the load's walk cannot get past a key that
+  did not decode, the rest of the table is read from the top down to it. Only if that stops short too is
+  the queue partial (`exact: false`, logged).
+- **A render that never reports is bounded.** A key whose last `render.failureRetry.fastRetries + 2`
+  leases all expired with no result (a renderer crashing on the URL, or results not reaching this
+  node) is held back in the lease table instead of granted again: two leases, then four, eight, …
+  capped at its cadence. Nothing durable is written and no strike is counted; the first result that
+  arrives for the key clears it, so a node-wide delivery outage delays rows by a few leases, not by a
+  cadence. Named in a warning and counted (`queue_health` `claim_wedged`).
+- **A stalled worker 0 degrades, it does not stop claims.** Its last published set is still granted from,
+  each entry checked against its row, until it drains; only then does the node report `unready`.
 
-Consequences worth knowing before you read a dashboard: lease state is **per node**, so only the node
-that owns a URL (residency) can answer "is this key being rendered right now" or "is this row below
-the floor" — the URL explainer asks that node and shows its answer, and never compares a row against
-the querying node's floor. And every one of these numbers is gone after a deploy.
+Measured before it was built ([#215](https://github.com/HarperFast/prerender-plugin/issues/215);
+harnesses in [#216](https://github.com/HarperFast/prerender-plugin/pull/216) and
+[#217](https://github.com/HarperFast/prerender-plugin/pull/217)):
 
-#### The claim floor
+- A node's subscription gets a `put` for every write to a row it owns, from any node, and a no-op
+  `delete` for each write it makes to a row it does not own. On two nodes every distinct row written
+  to an owner reached its keeper, and each keeper matched its own table row for row.
+- A replication base copy that carries any row of the table re-sends the whole table to live
+  subscribers; the keeper absorbs it (applying a row's current value twice changes nothing).
+- About 200 B of heap per row (about 50 MB at 250k rows). A primary-key load at start: about 1 s per
+  250k rows on a fresh store, expected tens of seconds on a churned one. `topK(5000)` over 250k rows:
+  0.14–0.27 ms.
 
-`claim` reads `nextRenderTime >= floor` (one condition, sorted, limited) instead of scanning from the
-absolute minimum of that index. It has to: every completed render moves a key off the head of the
-index and leaves a dead entry **at the seek point**, and the scan measurably degraded 0.36 ms →
-6.25 ms over 40,000 reschedules — linearly, and permanently (it did not recover when the churn
-stopped). With the floor the same 20 keys come back in 0.43 ms.
+**Leases** are node-local shared-buffer state (`coordination.SharedBuffer`, never replicated): a fixed
+array of slots keyed by a 64-bit hash of the schedule key, at zero database operations. Losing them on
+a restart is correct — a lease is not a record of work, the row is, and it was never moved — so a job
+whose lease vanished is granted again; the cost is a duplicate-render burst for whatever was in flight.
+Lease state is per node, so only the owner can answer "is this key being rendered right now"; the URL
+explainer asks the owner.
 
-The floor advances to **the first due row a pass observed**, which is the same thing as
-`min(last granted, oldest in-flight lease)`. So:
+`GET /prerender_admin/queue-state` (node-local; sum nodes for the cluster):
 
-- **`queue.jobLeaseTime` is now a latency knob.** The floor cannot advance past the oldest _due row_,
-  so everything behind that row waits for it. The fast-retry lane
-  (`render.failureRetry.fastRetries`) deliberately holds its lease, which multiplies that — and
-  during a broad origin 5xx event _every_ job takes that lane, so no lease is released at all for the
-  duration and the claim scan degrades back toward its old cost. Watch **Claim floor lag** on the
-  overview; it names the row holding the floor.
-- **A lease expiring does _not_ lift the pin.** Claiming writes nothing to the schedule row, so a
-  render that never posts a result leaves the row due at the same minute, and every later pass
-  derives the same floor from it — until something writes that row forward or deletes it. The
-  periodic floor reset cannot recover it either: that row _is_ the oldest due row the reset would
-  re-derive from. The generic-failure path (renderer crash, navigation timeout, settle failure on a
-  URL that still has a target) has exactly this shape — it holds the lease and writes no row — so one
-  permanently failing URL would pin the floor indefinitely while dead index entries accumulate above
-  it at the full render rate (~43 ms/pass after a day, i.e. worse than the unfloored scan the floor
-  replaces).
+| Group      | Fields                                                                                                                                                                                 |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status`                                                       |
+| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                          |
+| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row         |
+| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                |
+| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats |
 
-  So `queue.claimFloor.unpinAfter` bounds it: a row that has held the floor for longer than that is
-  written forward one `render.defaultInterval` by the claim path itself, and named in a warning. A
-  warning also fires earlier, as soon as the pin outlives what `render.failureRetry` can account for
-  (`fastRetries × jobLeaseTime`) — that one is the signal to act on, because the automatic push
-  unblocks the _queue_ without fixing the _URL_. Repair or delete it (deleting is safe — bots proxy
-  to the origin and discovery re-creates whatever it serves), and watch **Claim floor lag** on the
-  overview, which names the row and shows how long it has held on.
+Counts are of rows this node owns. It answers **503** (with `trust` and the live `now` fields, and no
+counts) whenever the keeper cannot vouch for its numbers: waiting, loading, failed, or state older than
+three state intervals.
 
-  The push is self-limiting at one write per interval per node, because unpinning one row promotes
-  the next, which must then hold for a full interval of its own. It counts **no strike** and changes
-  no retry semantics, deliberately: `strikes` is the target's one shared counter that suppression and
-  redirect verdicts _delete_ targets on, so routing the highest-volume failure path through it would
-  walk the corpus toward deletion during a broad origin outage. Set `unpinAfter: 0` to restore the
-  unbounded pin.
-
-- **A due time written below the floor is never claimed again.** Every schedule write inside the
-  plugin goes through one funnel ([`src/util/renderSchedule.js`](src/util/renderSchedule.js)) that
-  lowers the floor with the write, and the floor is held `queue.claimFloor.guard` behind the current
-  minute so a "due now" write from _any_ node lands above it without coordination. What is _not_
-  covered is a write with no plugin code in its path — the Harper operations API, or a `PUT` to the
-  exported `RenderSchedule` endpoint. Those are recovered by the periodic floor reset
-  (`queue.claimFloor.resetInterval`), or immediately by `POST /prerender_admin/queue`
-  `{"action":"reset-claim-floor"}`. The backlog snapshot counts such rows (`belowFloor`) and both the
-  overview and the URL explainer call them out — that is the only automatic evidence you get, because
-  the schedule-repair sweep tests row _existence_ and such a row exists.
-
-Set `queue.claimFloor.enabled: false` to roll the floor back to the old full seek. It changes nothing
-else; leases stay where they are either way.
-
-#### The ready set: which of the due rows goes first
-
-The floor decides _where the scan starts_. `queue.ready` decides _which rows get the leases_ — and it
-had to stop being a property of the scan at all.
-
-`claim` takes the first rows it finds from the floor, so the queue serves whatever is oldest-due. Two
-production measurements say that is the wrong order under scarcity
-([#80](https://github.com/HarperFast/prerender-plugin/issues/80)):
-
-- **Provenance.** During a multi-hour backlog, **239,090 of 521,929 overdue rows (~46%)** were
-  bot-discovered rather than sitemap-submitted.
-- **TTL-blindness.** Absolute due time treats a 1 h-TTL homepage 3 h overdue exactly like a 48 h-TTL
-  product page 3 h overdue — 300% stale against 6%. Simulated over the real corpus the 1 h route sits
-  at **4.78× its own TTL even at full capacity**, and 48.83× at half.
-
-**Why it cannot be fixed by re-sorting the claim window.** The window is anchored at the _oldest_ due
-time and is already an EDF prefix. Under a backlog every row in it is ancient, so a homepage two of
-its own cadences late is never read at all — and a wider window anchored in the same place is just
-more ancient rows. (Ranking by relative lateness also cannot be an _index_: `(t − dueAt) / interval`
-has slope `1/interval`, so two rows with different intervals cross exactly once and no stored key can
-express an order that changes with the clock.)
-
-So the ordering moved out of the index. A background sweep on worker 0 scores the **whole** due set
-and publishes the best few thousand into a shared buffer; `claim` pops from that in priority order and
-reads no index at all. That is affordable because of one measured fact
-([#119](https://github.com/HarperFast/prerender-plugin/pull/119)): a projected one-sided read costs
-**~2.4 µs/row, flat** from 200 to 20,000 rows, and yielding every 200 rows is free, with **zero
-writes**.
-
-> **That figure is a floor for a FRESH corpus and does not describe production.** Measured on the
-> live cluster (2026-08-21) the sweep runs **~55 µs/row warm, ~80 µs/row cold** — a ~300k-row due set
-> is a **~27 s sweep**, not the sub-second one the bench predicted. Same storage engine both times
-> (RocksDB, Harper's default); what differs is the corpus. The bench wrote 200k rows and read them
-> immediately; production holds 1.3M rows rewritten on every render for months, and on an LSM store a
-> range scan walks past every superseded version until compaction removes it.
->
-> The harness already measured this and it was read too narrowly: an unfloored seek after 40,000 head
-> reschedules went **0.073 → 5.60 ms, 77×**, same engine, same corpus. The design argument still holds
-> (reads remain far cheaper than writes, so recomputing beats a 1.3M-row restamp) — but size nothing
-> off a fresh-corpus number.
-
-Writes are 76–89 µs/row, 32× a
-read, so reading liberally and writing not at all is the cheap direction.
-
-The score is `max(0, now − dueAt) / effectiveInterval`, multiplied by `queue.ready.sitemapBoost` for a
-sitemap-sourced row. Lateness rather than age, deliberately: `dueAt − interval` is not when the page
-last rendered for every row — suppression rechecks schedule 7 days, `backoffWait` up to `maxBackoff`,
-the unpin hatch a `defaultInterval` — so an age-based ratio would put a 7-day recheck on a 48 h route
-at the _head_ of the queue reading as 3.5 cadences stale.
-
-**The cadence is the row's own, not the route's** — and this is load-bearing rather than a detail.
-A route grants a _ceiling_ (`/catalog/` at 24 h) and `render.demand` promotes bot-visited targets
-beneath it to 12 h or 6 h, writing `now + rung` as the due time. Resolving the denominator from config
-would therefore divide a promoted page's lateness by 24 h when it is really on 6 h — a **4× under-
-statement, on precisely the pages the ladder singled out as worth rendering more often**, silently
-undoing the ladder's work. So every schedule writer files the cadence it used onto the row as
-`effectiveInterval` (`resolveEffectiveInterval`: rung > route > stored > default, the rung clamped to
-the ceiling so a stale one cannot read as slower), and the sweep divides by that. It rides along in a
-projection the sweep already pays for, so it costs no extra read — recovering it from `RenderTarget`
-instead would be a cross-database point read per row over the whole due set, ~75% of them replication
-fetches on a residency-pinned table.
-
-The field is **absent and self-healing** on rows written before it existed, and on the writers with no
-cadence in hand: the sweep falls back to resolving from config, which is exactly what it did before,
-and each row fills in when it next renders. `queue_health` `ready_cadence` (`carried`/`resolved`) is
-the gauge — all `resolved` on the first sweep after an upgrade, crossing over within one cadence.
-
-Three properties are worth knowing:
-
-- **It is a cache in front of the old path, not a replacement.** Cold (a fresh worker generation),
-  exhausted (claims outrunning the sweep), disabled, or a buffer that could not be sized — all of them
-  fall through to the floored index scan. Every failure mode is _the previous behaviour_, which is why
-  it ships on by default.
-- **Nothing here is a correctness invariant.** An entry naming a row that has since been rescheduled
-  or deleted costs at most one redundant render: the lease CAS refuses a duplicate and
-  `processJobResult` already drops a result whose target is gone. It cannot lose a page, because the
-  next sweep re-reads the table. Compare the claim floor, where a row filed below it is never read
-  again — silently and terminally.
-- **The sweep owns the floor now.** Once claims are served from memory they observe nothing, and a
-  floor nothing observes freezes — measured, an unfloored seek degrades **0.073 → 5.60 ms over 40,000
-  reschedules** while a floored one stays flat at 0.07 ms. So the sweep applies the same floor rule,
-  and is better informed doing it: it sees every due row, so "the first due row observed" is the true
-  minimum rather than the minimum of a window.
-
-`sitemapBoost` is a multiplier and never a tier, so it cannot starve discovered URLs: an unserved
-row's lateness grows without bound while the boost stays constant, so a discovered page is served
-within roughly `sitemapBoost ×` the worst sitemap ratio.
-
-Watch `queue_health` `claim_granted` (jobs per claim, split `ready`/`index`). The ready set reorders a
-fixed amount of work and moves no total, so this is the only series that shows whether prioritisation
-is engaging — a node quietly serving every claim from `index` looks identical to a healthy one
-everywhere else. `ready_sweep_ms` with method `capped` means the sweep never reached a not-yet-due row,
-so it is ordering over the oldest part of the backlog only and recently-due pages are going unranked;
-raise `queue.ready.sweepCap`.
-
-`queue.ready.enabled: false` claims straight from the index scan and stops the sweep — a true revert.
-
-##### What the live cluster says about the defaults
-
-Checked against the reference deployment (4 nodes, 16 workers, Harper Pro 5.2.3) before rollout:
-
-- **`claim_scan_ms` reports `method: capped` on essentially every pass** — 280 samples over six hours.
-  `capped` means the pass read its whole window and never reached a not-yet-due row. With
-  `lease_occupancy` at 75–155 the window is ~205 rows, so the queue is choosing ~4 jobs out of ~205
-  rows that are all ancient and never seeing the rest of the due set. That is the anchoring problem
-  this section describes, measured in production rather than argued from a simulation.
-- **The marginal per-row read cost is uncertain by an order of magnitude.** A synthetic benchmark says
-  ~2.4 µs/row; live, a ~205-row window takes a 5–6 ms median (p95 9–12 ms) and `empty` passes average
-  25 ms with 47 ms observed, which are seek-dominated. That is why `sweepInterval` defaults to five
-  minutes rather than one, and why `ready_sweep_ms` exists — it is the only thing that will tell you
-  the real number for your corpus.
-- **The due-set size cannot be read from the backlog snapshot.** `overdue` saturates at
-  `management.scanCap` (observed pinned at 2,000), so "how many rows will the sweep walk" is answered
-  by `ready_sweep_ms` and the sweep's own `scanned` count, not by the overview.
-- **The nodes swap** (4.6 GB in use, 5.2 GB free of 33.6 GB). This is why the sweep streams rows
-  through a bounded heap and retains only `capacity` of them: its memory is a function of the set
-  size, never of the due set. A design that sorted the due set would be actively unsafe here, and it
-  is why `capacity` should not be raised casually.
-- **The sweep cannot make a cross-node request.** It reuses the same query the claim scan uses, which
-  carries `replicateFrom: false`, and it performs no point reads at all — so it cannot take the
-  untimed replication fetch that an unowned point read on this residency-pinned table would.
+**Removed in v0.93.0**, with the index they existed for: the claim floor and its unpin hatch, the
+ready-set sweep, the index claim scan, the `reset-claim-floor` queue action, and the config keys
+`queue.claimFloor.*`, `queue.claimScanCap`, `queue.ready.enabled`, `queue.ready.sweepInterval`,
+`queue.ready.sweepCap` and `queue.keeper.enabled`. A deployment that still sets any of them gets an
+"Unknown configuration key" warning and nothing else; delete them.
 
 ## HTTP & resource API
 
@@ -747,6 +646,7 @@ this plugin's resources all set `loadAsInstance = false`.
 | `POST /prerender_admin/login`              | `{ username, password }`                         | public       |
 | `POST /prerender_admin/logout`             | end the session                                  | session      |
 | `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot, host facts      | `super_user` |
+| `GET /prerender_admin/queue-state`         | this node's queue from the keeper; 503 if unsure | `super_user` |
 | `GET /prerender_admin/config`              | effective config, layers, overrides, warnings    | `super_user` |
 | `GET /prerender_admin/sitemaps`            | root sitemaps + refresh state (never `entries`)  | `super_user` |
 | `GET /prerender_admin/pages`               | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
@@ -758,8 +658,7 @@ this plugin's resources all set `loadAsInstance = false`.
 | `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)              | `super_user` |
 | `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace          | `super_user` |
 | `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row | `super_user` |
-| `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control, or          | `super_user` |
-|                                            | `{ action: "reset-claim-floor" }` (this node)    |              |
+| `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control              | `super_user` |
 | `POST /prerender_admin/revalidate`         | `{ url, deviceType }` → make one URL due now     | `super_user` |
 | `POST /prerender_admin/reconcile`          | start a schedule-repair sweep on this node       | `super_user` |
 | `POST /prerender_admin/sweep-orphans`      | `{ dryRun?, maxDeletes? }` → key-rule orphans    | `super_user` |
@@ -806,8 +705,8 @@ execute it against the operator's super-user session.
 ### What the console shows
 
 (The views live in `@harperfast/prerender-console`; they are documented here because every
-panel is a reading of THIS package's data model, and the concepts below — snapshots, the
-claim floor, schedule repair — are plugin behavior.)
+panel is a reading of THIS package's data model, and the concepts below — snapshots, leases,
+schedule repair — are plugin behavior.)
 
 - **Health** — the landing page: every number worth checking, each with a verdict (ok / watch /
   bad) and the view that explains it. Its system section reads the per-node vitals this package
@@ -815,34 +714,28 @@ claim floor, schedule repair — are plugin behavior.)
   folded in the same scan) and `overview` → `host` (a point-in-time host block) — see "Node health".
 
 - **Queue** — per-node queue status, intent and throughput, the due-now backlog and its time to
-  clear at the observed render rate, the in-flight count, the claim-floor lag, and a next-24h
-  histogram of `nextRenderTime` (these backlog panels were on the retired Overview). That
-  histogram is the quickest way to tell a healthy jittered spread from a render herd: a flat
-  distribution means the initial-render jitter is working, a single tall bar means everything
-  comes due at once. Note the histogram is capped at `management.scanCap` rows and reports
-  `truncated` — at a large registry read the shape, not the counts.
+  clear at the observed render rate, the in-flight count, and a next-24h histogram of
+  `nextRenderTime` (these backlog panels were on the retired Overview). That histogram is the
+  quickest way to tell a healthy jittered spread from a render herd: a flat distribution means the
+  initial-render jitter is working, a single tall bar means everything comes due at once. Since
+  v0.93.0 the counts come from the queue keeper and are exact.
 
   **The due-now backlog is still the capacity signal, but its healthy floor is no longer zero.**
   A claimed job's schedule row keeps its past due time until its result lands, so "due now"
   includes every in-flight render. Jitter flattens the arrival curve but cannot lower it, so a
   backlog that climbs and never returns to _roughly the in-flight count_ means sustained demand
   (`Σ targets ÷ renderInterval`) exceeds fleet throughput. The two numbers are shown side by side
-  and never subtracted: one is a scan that may be fifteen minutes old, the other a gauge read at
-  request time. Hour 0 of the histogram no longer holds the in-flight population for the same
+  and never subtracted: one is a snapshot that may be fifteen minutes old, the other a gauge read
+  at request time. Hour 0 of the histogram no longer holds the in-flight population for the same
   reason.
 
-  **Claim floor lag** and **In flight** are live O(1) reads of the node-local shared buffer, and
-  are labelled as such. A lag well past one `queue.jobLeaseTime` means a render is pinning the floor
-  and everything behind it is waiting; the lag's subtitle names the row (as last observed by the
-  worker serving the page — the claim pass is the only thing that sees it). A **Below claim floor** alarm means rows have been
-  filed where no claim will look — see "The claim floor".
+  **In flight** is a live read of the node-local lease buffer, and is labelled as such.
 
-  The backlog/histogram is a **cached snapshot**, not a page-load query. Since v0.34.0 it is also
-  the only scan left that seeks the absolute minimum of the `nextRenderTime` index, kept that way
-  deliberately: that makes it the only detector of a below-floor row. It recomputes on
+  The backlog/histogram is a **cached snapshot**, not a page-load query. It recomputes on
   `management.backlogSnapshotInterval` (worker 0 of each node, result in the node-local
   coordination database) and the page shows it with its age. _Recompute_ triggers a one-off
-  pass; a dashboard refresh never touches the index.
+  pass; a dashboard refresh never touches the table. For the live queue, read
+  `GET /prerender_admin/queue-state`.
 
 - **Traffic** — the delivery half of [METRICS.md](METRICS.md)'s catalog, charted: origin
   offload, cache-served and fresh-hit rates, serves by freshness state over time, the per-bot,
@@ -903,15 +796,11 @@ claim floor, schedule repair — are plugin behavior.)
   otherwise. _view HTML_ streams the stored bytes as `text/plain`; _explain_ hands the row to
   the URL explainer.
 - **Queue & nodes** — cluster/per-node pause controls (intent vs. observed, see "Queue
-  control"), a **render-prioritisation** panel (v0.50.0's ready set: the share of grants that came
-  from the scored set rather than the fallback index scan, sweep health and cap, entries published
-  per sweep, and the `effectiveInterval` backfill) — which exists because the ready set reorders a
-  fixed amount of work and moves no total, so every other number on the page reads identically
-  whether prioritisation is engaging or not running at all — plus this node's supply side from the
-  shared analytics window: render outcomes
-  over time (the "renders are failing" shape as it develops, with the auth-failure-vs-
-  suppressed signature called out), render time and claim-scan p95 trends, and a ranked
-  outcome-detail list.
+  control"), a **render-prioritisation** panel (v0.50.0's ready-set sweep; it reads series this
+  plugin no longer emits since v0.93.0, and the console's catch-up release replaces it with the
+  queue keeper's state) — plus this node's supply side from the shared analytics window: render
+  outcomes over time (the "renders are failing" shape as it develops, with the auth-failure-vs-
+  suppressed signature called out), render time trends, and a ranked outcome-detail list.
 - **Invalidations** — the active bulk-invalidation rows (an unresolvable scope — one that no
   longer names a configured route — is flagged as loudly as it deserves), and the record flow
   with **preview-first UX**: the primary button is a `dryRun` that shows coverage, overlapping
@@ -934,12 +823,11 @@ every device, in one job. It writes a single `RenderSchedule` row on purpose: th
 `RenderTarget.revalidate` takes a search target, and aimed at the whole registry it queues
 every target at once — at a million targets that is a self-inflicted render herd.
 
-**This is also the supported way to force one URL to the front of the queue.** Writing
-`nextRenderTime = 1` straight to the table through the operations socket used to work and no longer
-reliably does: no plugin code runs in that path, so nothing lowers the claim floor, and the row can
-land where no claim will look. Such a row is recovered only on the next floor reset
-(`queue.claimFloor.resetInterval`), and until then the URL silently does not render. Use
-`POST /prerender_admin/revalidate` — or the button — which writes through the funnel.
+**This is also the supported way to force one URL to the front of the queue.** A write straight to
+the table through the operations socket reaches the queue too (the keeper sees every commit), but a
+raw `put` replaces the record and drops `fromSitemap` and `effectiveInterval`, which the renderer and
+the ranking both read. Use `POST /prerender_admin/revalidate` — or the button — which writes through
+the funnel.
 
 ### Where residency comes from
 
@@ -1118,10 +1006,10 @@ node-local and accept the inconclusive answer.
 
 Table totals come from Harper's `getRecordCount()`, which is time-bounded and switches to
 sampling on a large table — it is reported with its `estimatedRange` rather than as an exact
-figure. The backlog/histogram scan walks at most `management.scanCap` rows (default 20 000)
-and marks the result `truncated` when it hits that ceiling. At 1M+ targets an exact range
-count is not a page-load query, so the UI labels an estimate as an estimate instead of
-presenting a short count as the total.
+figure. The backlog counts and histogram come from the queue keeper and are exact (`truncated`
+only when the keeper's load skipped unreadable rows or its last verification had to repair any).
+At 1M+ targets an exact table count is not a page-load query, so the UI labels an estimate as an
+estimate instead of presenting a short count as the total.
 
 Both live in the background snapshot: a dashboard load is two walks of node-sized tables plus
 one node-local point read, regardless of deployment size. The console never polls — data
@@ -1149,13 +1037,10 @@ reaches a remote node within one interval (default 1m), not instantly** — the 
 `QueueStatus` remains what each node last _observed_; the UI shows both, and marks a node
 stale when it stops reporting.
 
-The `empty`/`queued` half of that observed status is **derived, not scanned**. It used to be a
-second head-seeking query against the render index on every tick; it is now computed from the claim
-floor plus the last claim outcome, at zero database cost. It is deliberately tri-state at the
-source: a pass that saw due rows but granted none (because they are all in flight) reports
-`queued`, never `empty` — reporting `empty` there would tell the whole fleet to go idle while a
-large backlog is being rendered. The `statusSyncInterval` convergence promise above is unchanged;
-that interval now also carries the periodic claim-floor reset.
+The rest of that observed status is **derived, not scanned**, from the queue keeper at zero database
+cost: `queued` when it holds due rows, `empty` when it holds none, `unready` while it is not serving
+claims. Due rows that are all in flight still report `queued`, never `empty` — reporting `empty` there
+would tell the whole fleet to go idle while a large backlog is being rendered.
 
 `POST /render_queue/pause` stays deliberately node-scoped: that endpoint sets
 `loadAsInstance = false` and therefore enforces no authentication of its own, so it must not
@@ -1267,9 +1152,8 @@ POST /prerender_admin/invalidate  {"scope":"all","mode":null}      # clear
 **Nothing is rewritten.** That is the whole design, and it is a measured choice, not an aesthetic
 one. Rewriting the corpus — which `Target.revalidate`'s collection form does — costs **15.7 s and
 61.8 MB of audit per node per invalidation** at 400k rows, and pacing does not reduce it (same
-162 B/write, 8.9× longer, claim's max latency _worse_). Collapsing due times to "now" is worse still:
-the rows land exactly where the claim scan seeks, taking it **0.36 ms → 11.59 ms**. Recording an
-epoch costs **0.18 ms and 102 bytes** — ~606,000× less audit — and it is what makes undo instant.
+162 B/write, 8.9× longer, claim's max latency _worse_). (While claims walked the `nextRenderTime`
+index, collapsing due times to "now" also slowed the claim scan 32×.) Recording an epoch costs **0.18 ms and 102 bytes** — ~606,000× less audit — and it is what makes undo instant.
 
 There is deliberately **no corpus sweep, and never will be**: 1.53M PDP keys against a measured
 fleet ceiling of 71,289 renders/hr is a **21.5 h floor at 100% utilisation**, against the 48 h such a

@@ -540,11 +540,7 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// one-device render beside it and de-aligning the pair. For a device that is merely
 	// `supported`, the URL row cannot carry it (a URL job renders the default set), so it is a
 	// per-device row: one render of that one device, stored and retired, the URL row untouched.
-	//
-	// Through the funnel, because "due at the current minute" is exactly the write a claim floor
-	// would strand: on this node the funnel lowers the floor in-process, and on any other node —
-	// which is ~75% of keys, since schedule rows are residency-pinned — the guard band is what
-	// keeps the row above the owner's floor and therefore claimable.
+
 	const scheduleKey = config.deviceTypes.default.includes(deviceType) ? cacheUrl : cacheKey;
 	await writeSchedule(scheduleKey, {
 		nextRenderTime: currentMinuteMs(),
@@ -558,9 +554,10 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 		effectiveInterval: renderTarget ? resolveEffectiveInterval(cacheUrl, renderTarget) : null,
 	});
 
-	// Wake idle consumers now instead of waiting out the periodic status sync. Non-force
-	// so a paused queue stays paused (the render then simply times out to the fallback).
-	await QueueState.reportStatus('queued');
+	// Wake idle consumers now instead of waiting out the periodic status sync. Only from `empty`: a
+	// paused queue stays paused (the render then simply times out to the fallback), and an `unready` one
+	// stays unready — it could not grant the job anyway.
+	await QueueState.noteWork();
 
 	const page = await pollForFreshRender({
 		get: (key) => PrerenderedPage.get(key),

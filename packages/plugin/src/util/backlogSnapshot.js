@@ -3,28 +3,21 @@
  * table counts — everything the overview needs that is not a point read, computed on a
  * background cadence instead of on page load.
  *
- * WHY NOT ON PAGE LOAD. The histogram scan is a sorted, capped range read over
- * `RenderSchedule.nextRenderTime` — the index every completed render writes back to. The table
- * counts (`getRecordCount`) are time-bounded, but four of them is still up to ~2s of scanning per
- * refresh on 1M-row tables. This plugin shares its workers with bot traffic; a dashboard
- * refresh must never put either kind of work in front of a bot request, so the overview serves
- * the LAST snapshot with its timestamp, a timer on worker 0 recomputes it on a slow cadence,
- * and recomputing right now is an explicit admin action.
+ * THE QUEUE HALF COMES FROM THE QUEUE KEEPER (`util/queueKeeperService.js`), which holds every row
+ * this node owns: counts are exact and uncapped, and the 24-hour histogram is never empty. Before
+ * v0.93.0 it was a capped walk of the `nextRenderTime` index, which reported the cap instead of a count
+ * whenever the backlog outgrew it. While the keeper is not live the queue half is absent
+ * (`queueUnavailable`), never a guess.
  *
- * SINCE v0.34.0 THIS IS THE ONLY SCAN THAT STILL SEEKS THE ABSOLUTE MINIMUM of that index —
- * `claim` starts from the claim floor instead (`util/renderSchedule.js`) — and it is kept that
- * way DELIBERATELY. It is therefore the only reader in the system that can see a row filed BELOW
- * the floor, which is a row nothing will ever claim: the same terminal, silent state
- * `util/reconcile.js` exists for, reachable now through a due time written by the operations API
- * or the exported REST surface. Narrowing this query to the floor (a two-sided range would be the
- * obvious "optimisation") would make that failure mode invisible again. Do not.
+ * `overdue` includes every in-flight render: a leased job's row keeps its past due time until its
+ * result lands. The snapshot reports `inFlight` beside it rather than subtracting a live gauge from
+ * an older count and presenting the difference as one figure.
  *
- * `overdue` ALSO CHANGED MEANING. A leased job's row keeps its past due time until its result
- * lands, so `overdue` now includes every in-flight render and acquires a permanent floor equal to
- * the in-flight count. It is no longer comparable with numbers recorded before v0.34.0, and
- * "backlog returns to zero" is no longer the capacity test — "backlog returns to the in-flight
- * count" is. The snapshot reports `inFlight` beside it so the console can show both rather than
- * subtract a live gauge from a 15-minute-old scan and present the difference as one figure.
+ * WHY NOT ON PAGE LOAD. The table counts (`getRecordCount`) are time-bounded, but four of them is still
+ * up to ~2s of scanning per refresh on 1M-row tables. This plugin shares its workers with bot traffic;
+ * a dashboard refresh must never put that work in front of a bot request, so the overview serves the
+ * LAST snapshot with its timestamp, a timer on worker 0 recomputes it on a slow cadence, and
+ * recomputing right now is an explicit admin action.
  *
  * WHY THE RESULT LIVES IN THE `coordination` DATABASE, NOT MODULE STATE. The timer runs on
  * worker 0, but overview requests are served by every worker — module state would leave the
@@ -34,139 +27,51 @@
  *
  * The in-flight guard is the same advisory claim `claimRefreshRun` uses for sitemap walks: a
  * `running` marker with a staleness takeover, not a lock. Two racing workers at worst run one
- * redundant capped scan; a crashed worker can never wedge the snapshot forever.
+ * redundant pass; a crashed worker can never wedge the snapshot forever.
  */
 
 import { setImmediate as yieldNow } from 'node:timers/promises';
 import { config, collectConfigWarnings, onConfigApplied } from '../config.js';
 import { fnv1a32 } from './hash.js';
-import { HOUR, MINUTE, numberOf } from './time.js';
-import { currentFloorMs, inFlightLeases, floorState } from './renderSchedule.js';
+import { HOUR, MINUTE } from './time.js';
+import { inFlightLeases } from './renderSchedule.js';
+import { readQueueStateDocument } from './queueKeeperService.js';
 import { metrics } from '../metrics.js';
-
-// Rows scanned between event-loop yields, matching util/reconcile.js — a background scan on a
-// worker that also serves bot traffic must never monopolize the loop between rows.
-const YIELD_EVERY = 200;
 
 export const HISTOGRAM_HOURS = 24;
 
 const ROW_KEY = 'backlog_snapshot';
 
 // A `running` marker older than this is a dead run (crashed worker, killed process) and is
-// taken over. Generous next to a real scan, which is a single capped index walk.
+// taken over. Generous next to a real pass.
 const STALE_RUN_MS = 5 * MINUTE;
-
-// Ceiling on an on-demand `cap` override. High enough to see past a large backlog, low enough
-// that a mistyped request cannot turn into an unbounded walk of the queue index beside bot
-// traffic. Measured cost to calibrate against: ~3.5s per 2,000 rows, so this is ~3 minutes of
-// yielding walk in the worst case — deliberate, operator-initiated, and single-flighted.
-const MAX_ON_DEMAND_CAP = 100_000;
-
-/**
- * The row cap one scan will use: the on-demand override when a usable one was given, else the
- * configured cap.
- *
- * ABSENCE IS CHECKED BEFORE `Number`, deliberately. `Number(null)` and `Number('')` are both
- * `0`, and `0` is finite — so a request carrying `cap: null` (or an empty form field) would
- * pass a naive finite check, clamp up to the floor of 1, and run a ONE-ROW scan that reports
- * `overdue: 1, truncated: true`. That is a plausible-looking answer, which makes it the worst
- * kind of wrong. Exactly the trap that put the analytics range on its 1-minute floor in
- * v0.47.1; the same guard, in the same order, is why this is a named function with tests.
- */
-export function resolveScanCap(cap, configured) {
-	const fallback = Math.max(1, configured | 0);
-	if (cap === null || cap === undefined || cap === '') return fallback;
-	const n = Number(cap);
-	if (!Number.isFinite(n) || n < 1) return fallback;
-	return Math.min(Math.floor(n), MAX_ON_DEMAND_CAP);
-}
 
 const table = () => databases.coordination.SharedBuffer;
 
 /**
- * One capped, index-ordered walk of `RenderSchedule` over everything due within the next
- * `HISTOGRAM_HOURS`, bucketed by hour (plus an `overdue` count for anything already due).
- *
- * A single ascending scan gives both the backlog count and the upcoming shape. Because it is
- * ascending, a backlog larger than the cap consumes the whole budget and the histogram comes
- * back empty — which is the correct signal, not a defect: when you are that far behind, the
- * next-24h distribution is not the problem.
- *
- * Counting is capped because there is no cheap exact count for a range in the underlying
- * store; `truncated` says so explicitly rather than presenting a short count as the total.
+ * The queue half of the snapshot, from the queue keeper's last state document, or null when the
+ * keeper cannot answer (not live, or its document is stale). Any worker can call it: the document is
+ * in shared memory.
  */
-export async function scanUpcoming(now, cap) {
-	const { RenderSchedule } = databases.render_schedule;
-	const horizon = now + HISTOGRAM_HOURS * HOUR;
-
-	const buckets = Array.from({ length: HISTOGRAM_HOURS }, (_, hour) => ({
-		hour,
-		startMs: now + hour * HOUR,
-		count: 0,
-	}));
-
-	let overdue = 0;
-	let scanned = 0;
-	// The claim floor as `claim` would read it right now, captured ONCE so every row in this pass
-	// is judged against the same value. Null = no floor, in which case nothing can be below it.
-	const floorMs = currentFloorMs(now);
-	let belowFloor = 0;
-	let oldestBelowFloorMs = null;
-
-	// Streamed and bucketed incrementally — never buffered (`cap` rows of nothing but a
-	// timestamp is still cap rows of garbage), yielding between batches so the loop stays
-	// available to bot requests. The walk is `cap`-bounded, which is what actually bounds how
-	// long its read snapshot lives — a `snapshot: false` query option is NOT consumed by
-	// Harper's search path (it exists only on internal store-level getRange calls).
-	for await (const row of RenderSchedule.search(
-		{
-			conditions: [{ attribute: 'nextRenderTime', comparator: 'less_than_equal', value: horizon }],
-			sort: { attribute: 'nextRenderTime' },
-			select: ['nextRenderTime'],
-			limit: cap,
-		},
-		{ replicateFrom: false }
-	)) {
-		scanned++;
-		if (scanned % YIELD_EVERY === 0) await yieldNow();
-
-		// `numberOf`, not `Number`: `Number(null)` is 0, which is finite and below any floor, so an
-		// absent due time would count as `belowFloor` with an `oldest` of 1970 — a permanent false
-		// alarm on the ONE metric that reports rows filed where no claim will look again.
-		const at = numberOf(row.nextRenderTime);
-		if (!Number.isFinite(at)) continue;
-		// THE ALARM FOR THE NEW FAILURE MODE. A row below the floor is invisible to `claim` and to
-		// the reconcile sweep (which tests existence, and the row exists), so this count is the
-		// only automatic evidence that it happened. The floor comparator is inclusive, so a row AT
-		// the floor is claimable and must not be counted.
-		if (floorMs !== null && at < floorMs) {
-			belowFloor++;
-			if (oldestBelowFloorMs === null || at < oldestBelowFloorMs) oldestBelowFloorMs = at;
-		}
-		if (at <= now) {
-			overdue++;
-			continue;
-		}
-		const hour = Math.floor((at - now) / HOUR);
-		if (hour >= 0 && hour < HISTOGRAM_HOURS) buckets[hour].count++;
-	}
-
+export const upcomingFromKeeper = (now) => {
+	const doc = readQueueStateDocument();
+	if (doc?.keeper?.phase !== 'live' || !doc.queue) return null;
+	const maxAgeMs = 3 * config.queue.keeper.stateInterval + 5_000;
+	if (!(now - doc.generatedAt <= maxAgeMs)) return null;
+	const q = doc.queue;
 	return {
-		overdue,
-		// The live in-flight lease count, reported beside `overdue` rather than subtracted from it:
-		// one is a scan that may be minutes old and the other is a gauge read right now, and
-		// presenting their difference as a single number would be arithmetic across two clocks.
+		overdue: q.due,
 		inFlight: inFlightLeases(),
-		belowFloor,
-		oldestBelowFloorMs,
-		floorMs,
-		buckets,
-		scanned,
-		cap,
-		truncated: scanned >= cap,
-		horizonMs: horizon,
+		buckets: q.coming.byHour.map((count, hour) => ({ hour, startMs: doc.generatedAt + hour * HOUR, count })),
+		scanned: q.rows,
+		// a load that skipped unreadable rows, or a verification walk that had to repair rows, makes the
+		// counts a lower bound until the next clean verification
+		truncated: !doc.keeper.exact,
+		horizonMs: doc.generatedAt + HISTOGRAM_HOURS * HOUR,
+		source: 'keeper',
+		asOf: doc.generatedAt,
 	};
-}
+};
 
 /**
  * `getRecordCount` for one table: time-bounded and yielding inside Harper, and it reports
@@ -231,7 +136,7 @@ export const getBacklogSnapshotState = async () => {
  * console's Recompute button share this, so a click can never stack a second scan onto the
  * scheduled one.
  */
-export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
+export const runBacklogSnapshotOnce = async () => {
 	const existing = await readRow();
 	if (isRunning(existing)) {
 		return { skipped: true, reason: 'a backlog scan is already running', lastRun: existing?.lastRun ?? null };
@@ -243,18 +148,13 @@ export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
 
 	let lastRun;
 	try {
-		// The scheduled snapshot always uses the configured cap. `cap` is the ON-DEMAND override:
-		// `management.scanCap` has to be sized for a walk that runs every interval beside bot
-		// traffic, and that budget is often far below the backlog itself — at which point the
-		// walk is spent entirely on overdue rows, `overdue` reports the cap rather than a count,
-		// and the 24-hour histogram comes back empty because the scan never reached a
-		// not-yet-due row. Measured in the field at `scanCap: 2000`: every node reporting
-		// "2000+ overdue" and 24 empty hour buckets, with no way to learn the real number short
-		// of deploying a config change, reading it, and deploying it back.
-		//
-		// One deliberate deeper walk answers that. It is clamped, it is never the scheduled
-		// path, and it takes the same single-flight claim as everything else, so it cannot stack.
-		const stats = await scanUpcoming(startedAt, resolveScanCap(cap, config.management.scanCap));
+		const stats = upcomingFromKeeper(startedAt) ?? {
+			overdue: null,
+			inFlight: inFlightLeases(),
+			buckets: [],
+			source: 'keeper',
+			queueUnavailable: 'the queue keeper is not live',
+		};
 
 		// The table counts ride in the same snapshot for the same reason as the histogram:
 		// getRecordCount is bounded (and yields internally), but it is still scanning work, and
@@ -267,7 +167,7 @@ export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
 		} = databases;
 		// `snapshotTableCounts: false` is the #664 dodge: getRecordCount's native full-key walk is
 		// the ONLY part of this pass that can stall a traffic-serving worker, so a deployment can
-		// drop the counts while keeping the capped backlog walk and the queue_health gauges. The
+		// drop the counts while keeping the queue half and the queue_health gauges. The
 		// shape matches countTable's own failure value, which the console already renders.
 		const skipped = { recordCount: null, error: 'disabled' };
 		const counts = !config.management.snapshotTableCounts
@@ -284,14 +184,11 @@ export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
 
 		lastRun = { ...stats, counts, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 
-		// Alertable gauges off numbers this pass already computed — until here they existed only in
-		// the admin console, so "a row sits below the claim floor" (the silent render gap) and "the
-		// floor has been pinned for hours" were facts nobody could page on. Emitted from the same
+		// Alertable gauges off numbers this pass already computed, emitted from the same
 		// one-worker-per-node cadence as the snapshot itself; value metrics, same buffered
 		// recordAnalytics path as page_age. Guarded separately: losing a gauge must never cost the
 		// snapshot.
 		try {
-			const floor = floorState(startedAt);
 			// Dynamic import, not top-level: QueueState's module load touches Harper globals (a
 			// shared status buffer) that plain unit-test imports of this module don't have.
 			const { QueueState } = await import('../resources/QueueState.js');
@@ -299,13 +196,10 @@ export const runBacklogSnapshotOnce = async ({ cap } = {}) => {
 			// The warning COUNT rides the same per-node gauge pass; the findings themselves are on
 			// GET /prerender_admin/config. Alert on change, not on level.
 			metrics.configWarnings(collectConfigWarnings().length);
-			metrics.queueHealth(stats.overdue, 'overdue');
+			// 1 while the queue keeper is live: a node whose keeper is not grants no claims at all.
+			metrics.queueHealth(stats.queueUnavailable ? 0 : 1, 'keeper_live');
+			if (stats.overdue !== null) metrics.queueHealth(stats.overdue, 'overdue');
 			metrics.queueHealth(stats.inFlight, 'lease_occupancy');
-			metrics.queueHealth(stats.belowFloor, 'below_floor');
-			if (stats.oldestBelowFloorMs !== null) {
-				metrics.queueHealth(startedAt - stats.oldestBelowFloorMs, 'below_floor_age_ms');
-			}
-			metrics.queueHealth(floor.floorPinnedForMs, 'floor_pin_age_ms');
 		} catch (e) {
 			logger.warn?.(`[prerender] queue_health gauges not recorded: ${e?.message ?? String(e)}`);
 		}
@@ -352,10 +246,9 @@ const syncSnapshotterTimers = () => {
 		return;
 	}
 
-	// Stagger per node for the same reason the reconciler does: every node scans its own slice,
-	// and a rolling restart (or a config change, which reaches every node at once) would
-	// otherwise sync them all onto the shared render index at the same moment. Seeded
-	// differently than the reconciler so the two sweeps don't coincide.
+	// Stagger per node for the same reason the reconciler does: a rolling restart (or a config
+	// change, which reaches every node at once) would otherwise sync every node's table counts onto
+	// the same moment. Seeded differently than the reconciler so the two sweeps don't coincide.
 	const stagger = fnv1a32(`backlog:${server.hostname}`) % Math.max(1, Math.min(desired, 5 * MINUTE));
 
 	snapshotterDelayTimer = setTimeout(() => {

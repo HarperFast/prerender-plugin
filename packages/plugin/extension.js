@@ -15,12 +15,13 @@ import {
 	seedOverrideFingerprint,
 	startOverrideWatch,
 } from './src/util/configOverride.js';
-import { startQueueStatusSync, startReadySweep } from './src/resources/RenderQueue.js';
+import { startQueueStatusSync } from './src/resources/RenderQueue.js';
 import { startSitemapRefreshScheduler } from './src/resources/Sitemap.js';
 import { startScheduleReconciler } from './src/util/reconcile.js';
 import { startChangeProbeScheduler } from './src/util/changeProbe.js';
 import { startUnroutedReporter } from './src/util/unrouted.js';
 import { startBacklogSnapshotter } from './src/util/backlogSnapshot.js';
+import { startQueueKeeper } from './src/util/queueKeeperService.js';
 import { startInvalidationWatch } from './src/util/invalidation.js';
 
 export async function handleApplication(scope) {
@@ -100,14 +101,15 @@ export async function handleApplication(scope) {
 	// self-gate by worker/node. The reconciler is deliberately NOT pinned to one node:
 	// every node repairs the schedule rows it owns (see util/reconcile.js).
 	startQueueStatusSync();
-	startReadySweep();
+	// Worker 0: the in-memory render queue every claim on this node is served from.
+	startQueueKeeper();
 	startSitemapRefreshScheduler();
 	startScheduleReconciler();
 	// Owner-scoped on every node, like the reconciler: each node probes the URLs it owns.
 	// Inert unless changeProbe.enabled with at least one usable rule.
 	startChangeProbeScheduler();
-	// Keeps the console's backlog histogram off the page-load path: the scan walks the same
-	// nextRenderTime index `claim` reads from, so it recomputes on this slow cadence instead.
+	// Keeps the console's backlog snapshot off the page-load path: its table counts are scans, so it
+	// recomputes on this slow cadence instead.
 	startBacklogSnapshotter();
 	// Unlike the three above, this one runs on EVERY worker: its counters are in-process, so
 	// each worker has to flush its own tally (see util/unrouted.js).

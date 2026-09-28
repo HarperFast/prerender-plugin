@@ -1,5 +1,6 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { publishDueRows } from './support/keeperStandIn.js';
 
 /**
  * Status-aware result handling: not every HTTP error is the same statement about a page.
@@ -73,22 +74,6 @@ const makeResourceBase = (rows) =>
 			const resource = new this(id);
 			return resource.delete();
 		}
-		/**
-		 * Enough of Harper's search to drive a real claim pass: the one-sided
-		 * `nextRenderTime >= value` condition, the sort on the same attribute, and the limit. The
-		 * primary key is injected into each projected row, which is what the real table does for a
-		 * `select` naming it.
-		 */
-		static async *search(query = {}) {
-			const [condition] = query.conditions ?? [];
-			const floor = condition ? Number(condition.value) : Number.NEGATIVE_INFINITY;
-			const matching = [...rows.entries()]
-				.map(([cacheKey, row]) => ({ cacheKey, ...row }))
-				.filter((row) => Number(row.nextRenderTime) >= floor)
-				.sort((a, b) => Number(a.nextRenderTime) - Number(b.nextRenderTime))
-				.slice(0, query.limit ?? Infinity);
-			for (const row of matching) yield row;
-		}
 	};
 
 let RenderQueue, config, funnel;
@@ -154,14 +139,11 @@ beforeEach(() => {
 });
 
 /** Claim jobs the way the render fleet would, so the lease is recorded exactly as production does. */
-const claim = (limit = 10) => RenderQueue.claim({ limit });
+const claim = (limit = 10) => {
+	publishDueRows(funnel, stores.renderSchedule);
+	return RenderQueue.claim({ limit });
+};
 
-/**
- * `seedSource` writes STRAIGHT into the fake table, bypassing the funnel, so a seeded row never
- * lowers the claim floor. That is fine only because `beforeEach` resets the floor to 0 ("seek the
- * absolute minimum") — a test that seeds after a floor has been established must seed through the
- * funnel or reset first.
- */
 const leased = (cacheKey) => !!funnel.leaseInfo(cacheKey);
 
 const postResult = async (metadata, content) => {

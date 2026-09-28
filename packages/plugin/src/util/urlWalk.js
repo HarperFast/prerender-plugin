@@ -32,8 +32,17 @@
  * store rejects it. Residual (documented, not fixable from this layer): a range whose LAST key is
  * itself unreadable can still end a walk early when every probe path aborts on it; escalate such
  * rows to the database layer.
+ *
+ * `searchOptions` is passed as the second argument of every search the walk makes, so a caller on a
+ * residency-pinned table can keep every read local (`{ replicateFrom: false }`).
  */
-export async function* walkUrlRange(table, { key = 'url', startAt = '', select, chunkSize, onUnreadable, endBound }) {
+/** `error.code` of the throw that means "rows remain but no readable cursor can reach them". */
+export const WALK_CANNOT_ADVANCE = 'URL_WALK_CANNOT_ADVANCE';
+
+export async function* walkUrlRange(
+	table,
+	{ key = 'url', startAt = '', select, chunkSize, onUnreadable, endBound, searchOptions }
+) {
 	// The walk reads `row[key]` to cursor and to tell readable from unreadable, so a projection that
 	// omits the key would make EVERY row look unreadable. Always project it.
 	if (select && !select.includes(key)) select = [...select, key];
@@ -42,18 +51,24 @@ export async function* walkUrlRange(table, { key = 'url', startAt = '', select, 
 	let lastResume = null;
 
 	const cannotAdvance = () =>
-		new Error(
-			`url walk cannot advance past an unreadable row after ${JSON.stringify(cursor)} — ` +
-				`the range was NOT fully covered; treat this pass as partial and escalate the row to the database layer`
+		Object.assign(
+			new Error(
+				`url walk cannot advance past an unreadable row after ${JSON.stringify(cursor)} — ` +
+					`the range was NOT fully covered; treat this pass as partial and escalate the row to the database layer`
+			),
+			{ code: WALK_CANNOT_ADVANCE }
 		);
 
 	const search = async (conditions, descending, limit) => {
 		const out = [];
-		for await (const row of table.search({
-			conditions,
-			sort: descending ? { attribute: key, descending: true } : { attribute: key },
-			limit,
-		})) {
+		for await (const row of table.search(
+			{
+				conditions,
+				sort: descending ? { attribute: key, descending: true } : { attribute: key },
+				limit,
+			},
+			searchOptions
+		)) {
 			out.push(row);
 			if (out.length >= limit) break;
 		}
@@ -88,18 +103,21 @@ export async function* walkUrlRange(table, { key = 'url', startAt = '', select, 
 
 	while (true) {
 		const chunk = [];
-		for await (const row of table.search({
-			conditions: [
-				{
-					attribute: key,
-					comparator: inclusiveStart !== null ? 'greater_than_equal' : 'greater_than',
-					value: inclusiveStart !== null ? inclusiveStart : cursor,
-				},
-			],
-			sort: { attribute: key },
-			...(select ? { select } : {}),
-			limit: chunkSize,
-		})) {
+		for await (const row of table.search(
+			{
+				conditions: [
+					{
+						attribute: key,
+						comparator: inclusiveStart !== null ? 'greater_than_equal' : 'greater_than',
+						value: inclusiveStart !== null ? inclusiveStart : cursor,
+					},
+				],
+				sort: { attribute: key },
+				...(select ? { select } : {}),
+				limit: chunkSize,
+			},
+			searchOptions
+		)) {
 			chunk.push(row);
 		}
 		inclusiveStart = null;

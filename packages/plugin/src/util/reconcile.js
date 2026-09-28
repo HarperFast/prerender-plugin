@@ -142,12 +142,7 @@ export const reconcileSchedules = async ({
 			// repaired row rejoins the rotation exactly where a fresh one would land. The
 			// resolver owns the numeric guards — BigInt from a `Long` column is coerced,
 			// null/NaN/non-positive fall back to the default.
-			//
-			// `getInitialRenderTime` is always >= `currentMinuteMs(now)`, so a repair can at worst
-			// TIE the claim floor — and a tie is claimable only because the floor comparator is
-			// inclusive (`greater_than_equal`). If that comparator were ever made exclusive, every
-			// repaired row would be filed one step behind the floor and this sweep would restore
-			// rows into the very silent gap it exists to close.
+
 			nextRenderTime: getInitialRenderTime(cacheKey, interval),
 			fromSitemap: !!target.sitemapUrl,
 			// The same cadence the jitter above was drawn from, so a repaired row is ranked by the
