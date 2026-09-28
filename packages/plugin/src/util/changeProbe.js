@@ -54,6 +54,7 @@ import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from '
 import { getResidencyByUrl } from './residency.js';
 import { resolveEffectiveInterval } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
+import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
 import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
@@ -351,10 +352,18 @@ export const actOnChange = async (row) => {
 	// time and a change found again before its render landed keeps its first `changedAt`: re-filing
 	// either at "now" would move the page BACK in the queue on every pass that re-detected it. The probe
 	// runs on the owner, so the read that makes this possible is local.
+	//
+	// THE PAGE'S DEMAND GOES WITH THE MARK (`demandPeriod`): how often bots ask for it, from the demand
+	// tracker, so the queue can order changed pages by the origin visits their wait costs
+	// (`queue.ready.changedDemand`, util/renderPriority.js). Stamped here, once, rather than looked up
+	// by the keeper: the keeper holds rows by class and has no business reading a Bloom ring per row. An
+	// unknown demand (tracker off, cold, saturated) stamps nothing and the row orders by cadence.
+	const demand = demandOf(row.url, nowMs);
 	await fileDueNow(row.url, {
 		fromSitemap: !!row.sitemapUrl,
 		effectiveInterval: resolveEffectiveInterval(row.url, row),
 		changedAt: nowMs,
+		demandPeriod: demand.known ? demand.periodMs : undefined,
 	});
 };
 
@@ -1561,7 +1570,9 @@ export const runProbeSweepOnce = async ({
 		let yields = 0;
 		// Changes are acted on BESIDE the walk, not inside it: `submit` returns once the action has
 		// started, so the pass runs at its probe-rate floor whatever the change rate, and only waits
-		// when every action slot is busy — see util/changeActions.js.
+		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
+		// so the first changes of the pass are not stamped as unknown for want of it.
+		await warmDemand();
 		const triggers = createChangeActions({
 			act: actOnChange,
 			write: writeSignature,
@@ -1867,6 +1878,7 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				perRule.push({ rule: rule.label, cohort: 0, skipped: 'empty cohort' });
 				continue;
 			}
+			await warmDemand();
 			const canaryTriggers = createChangeActions({
 				act: actOnChange,
 				write: writeSignature,

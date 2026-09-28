@@ -85,6 +85,30 @@
  * soon as its score passes the changed rows' — so if changed rows are being held at `U` cadences
  * late, a routine row is served by `changedHeadStart + U` cadences late (divide by `sitemapBoost` for
  * a sitemap row). A change wave can take the fleet for a while; it cannot take it indefinitely.
+ *
+ * ── A CHANGED PAGE WAITS IN VISITS, NOT CADENCES ──────────────────────────────────────────────
+ *
+ *     changed row, queue.ready.changedDemand on, demand known:
+ *         score = max(0, now - dueAt) / demandPeriod  x  (fromSitemap ? sitemapBoost : 1)  +  changedHeadStart
+ *
+ * A changed page is hard-expired, so every bot visit while it waits is served from the origin. Divided
+ * by the page's estimated visit period (`demandPeriod`, stamped from the demand tracker when the change
+ * was acted on — util/demand.js), the wait IS that count: the visits this page has sent to the origin
+ * so far. Divided by cadence instead, every changed product page shares one divisor, and a change
+ * wave renders in the order the probe found the changes — URL order — whatever bots are asking for.
+ *
+ * Two pages found changed together: the one asked for every 6h gains a point every 6h, the one asked
+ * for twice a week gains one every 3.5 days, so the first renders first. The second is not starved:
+ * it still gains, and a page with no visit in the tracker's whole window gains one point per window.
+ *
+ * WHERE THE TWO SCALES MEET. A changed row scores in visits missed and a routine row in cadences late,
+ * and they are compared as numbers. That is the policy, stated: a routine row is still being served
+ * from the cache — at worst stale — while a changed row is being served from the origin, so a changed
+ * page nobody asks for yields to a routine row at the same score rather than taking the fleet from
+ * pages bots are reading. The starvation bound above holds with U in visits.
+ *
+ * With demand unknown (tracker off, cold or saturated — the row carries no `demandPeriod`), or the
+ * option off, a changed row orders by cadence exactly as above.
  */
 
 /**
@@ -101,8 +125,8 @@
  * degrades to raw lateness, which still orders sensibly among rows that share the problem.
  */
 export const scoreOf = (
-	{ dueAt, fromSitemap, changed = false },
-	{ nowMs, intervalMs, sitemapBoost = 1, changedHeadStart = 0 }
+	{ dueAt, fromSitemap, changed = false, demandPeriodMs = null },
+	{ nowMs, intervalMs, sitemapBoost = 1, changedHeadStart = 0, changedDemand = false }
 ) => {
 	// THE DUE TIME IS GUARDED, AND IT IS THE DANGEROUS ONE. `nowMs - null` is `nowMs`, so an absent
 	// due time does not produce a small score or a NaN — it produces a lateness of ~1.8e12, which sorts
@@ -116,7 +140,10 @@ export const scoreOf = (
 	// null, undefined, NaN, 0 and every negative, so the `Number(null) === 0` trap is closed by the
 	// comparison rather than by a coercion. Adding a `typeof` check would only change behaviour for a
 	// numeric STRING interval, which works correctly today.
-	const ratio = intervalMs > 0 ? lateness / intervalMs : lateness;
+	// A changed row waits in VISITS when its demand is known and the option is on — see "A CHANGED PAGE
+	// WAITS IN VISITS" above. `> 0` is false for null/NaN/0, so an unknown demand falls back to cadence.
+	const divisor = changed && changedDemand && demandPeriodMs > 0 ? demandPeriodMs : intervalMs;
+	const ratio = divisor > 0 ? lateness / divisor : lateness;
 	const score = fromSitemap ? ratio * sitemapBoost : ratio;
 	// A change the probe found: the page is known wrong, was hard-expired, and is served from the origin
 	// until this render lands — see "A DETECTED CHANGE STARTS AHEAD" above. A non-positive or non-finite

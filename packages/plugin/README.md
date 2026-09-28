@@ -481,7 +481,7 @@ queue table is isolated and bursty/heavy writes don't serialize against it:
 | `page_cache`      | `PrerenderedPage`                       | rendered-HTML cache (heavy blob writes)                           |
 | `sitemaps`        | `Sitemap`, `SitemapRefresh`             | sitemap data + per-root refresh progress                          |
 | `invalidation`    | `Invalidation`                          | bulk-invalidation epochs (one row per scope)                      |
-| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth sketches, demand-ladder visit bloom                 |
+| `crawl_stats`     | `CrawlSketch`, `VisitFilter`            | crawl-breadth and miss-cause sketches, demand-tracker visit bloom |
 | `coordination`    | `SharedBuffer`                          | node-local cross-worker SAB (never replicated)                    |
 | `config`          | `ConfigOverride`                        | operator-set config overrides — isolated because it is SUBSCRIBED |
 
@@ -524,8 +524,14 @@ table is read by primary key only, and `nextRenderTime` carries no index
   > route > stored > default, so a page `render.demand` promoted to 6 h is not ranked as if it were on
   > its route's 24 h ceiling. `sitemapBoost` is a multiplier, never a tier, so a discovered page is
   > served within roughly `sitemapBoost ×` the worst sitemap ratio. Rows are grouped by class (route ×
-  > cadence × sitemap flag), within which due time already orders them, so the best K is a merge over
-  > class heads, not a scan.
+  > cadence × sitemap flag × change mark × demand estimate), within which due time already orders them,
+  > so the best K is a merge over class heads, not a scan.
+- **Changed pages first, most-asked-for first.** A row the change probe filed (`changedAt`) starts
+  `queue.ready.changedHeadStart` cadences ahead. With `queue.ready.changedDemand` (default on) its wait
+  is counted in the page's visit periods instead of its cadence — the demand tracker's estimate, stamped
+  on the row as `demandPeriod` when the change was acted on — so the score is the bot visits the wait has
+  sent to the origin, and a change wave renders the pages bots ask for first. A row with no estimate
+  (tracker off, cold or saturated) orders by cadence.
 - **It repairs itself from the table.** Each publish re-reads the head of what it published and fixes
   what it holds wrongly. A verification walk (`queue.keeper.verifyInterval`, 1 h) checks every row it
   owns and every row it holds against the table and repairs the difference (`keeper_repaired`,
@@ -580,13 +586,13 @@ explainer asks the owner.
 
 `GET /prerender_admin/queue-state` (node-local; sum nodes for the cluster):
 
-| Group      | Fields                                                                                                                                                                                                                                                                                                                                                                            |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `dueChanged` (due rows the change probe marked: pages expired as known-wrong, served from the origin until they re-render) and `oldestChangedAt` (the oldest such row's due minute — its filing minute, or the earlier due time it already had), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status` |
-| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                                                                                                                                                                                                                     |
-| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row; `listsTruncated` when either list was cut to 200                                                                                                                                                  |
-| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                                                                                                                                                                                                           |
-| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats                                                                                                                                                                                            |
+| Group      | Fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `dueChanged` (due rows the change probe marked: pages expired as known-wrong, served from the origin until they re-render), `oldestChangedAt` (the oldest such row's due minute — its filing minute, or the earlier due time it already had) and `changedByDemand` (the same rows by demand estimate: `periodMs` between bot visits, `null` for unknown, with `due` and `oldestDueAt`), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status` |
+| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row; `listsTruncated` when either list was cut to 200                                                                                                                                                                                                                                                                                         |
+| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats                                                                                                                                                                                                                                                                                                                                   |
 
 Counts are of rows this node owns. It answers **503** (with `trust` and the live `now` fields, and no
 counts) whenever the keeper cannot vouch for its numbers: waiting, loading, failed, or state older than
@@ -639,37 +645,37 @@ The super-user check is written out on every route rather than relying on Harper
 `allowRead`/`allowCreate` hooks, because those only run when `loadAsInstance !== false` — and
 this plugin's resources all set `loadAsInstance = false`.
 
-| Method & path                              | Purpose                                          | Gate         |
-| ------------------------------------------ | ------------------------------------------------ | ------------ |
-| `GET /prerender_admin[/]`                  | API index: what this is, where the UI lives      | public       |
-| `GET /prerender_admin/session`             | who am I                                         | public       |
-| `POST /prerender_admin/login`              | `{ username, password }`                         | public       |
-| `POST /prerender_admin/logout`             | end the session                                  | session      |
-| `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot, host facts      | `super_user` |
-| `GET /prerender_admin/queue-state`         | this node's queue from the keeper; 503 if unsure | `super_user` |
-| `GET /prerender_admin/config`              | effective config, layers, overrides, warnings    | `super_user` |
-| `GET /prerender_admin/sitemaps`            | root sitemaps + refresh state (never `entries`)  | `super_user` |
-| `GET /prerender_admin/pages`               | `?prefix&cursor&limit` — page-cache browse       | `super_user` |
-| `GET /prerender_admin/page-content`        | `?cacheKey` — one stored page, as `text/plain`   | `super_user` |
-| `GET /prerender_admin/unrouted`            | this worker's unrouted-path tally (peek)         | `super_user` |
-| `GET /prerender_admin/analytics`           | `?range` (ms) — series + per-node system health  | `super_user` |
-| `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                    | `super_user` |
-| `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day  | `super_user` |
-| `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)              | `super_user` |
-| `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace          | `super_user` |
-| `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row | `super_user` |
-| `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control              | `super_user` |
-| `POST /prerender_admin/revalidate`         | `{ url, deviceType }` → make one URL due now     | `super_user` |
-| `POST /prerender_admin/reconcile`          | start a schedule-repair sweep on this node       | `super_user` |
-| `POST /prerender_admin/sweep-orphans`      | `{ dryRun?, maxDeletes? }` → key-rule orphans    | `super_user` |
-| `GET /prerender_admin/sweep-orphan-pages`  | this node's page orphan sweep (live or last)     | `super_user` |
-| `POST /prerender_admin/sweep-orphan-pages` | `{ dryRun?, minAgeDays?, maxDeletes?,            | `super_user` |
-|                                            | ratePerSecond? }` → targetless pages, or stop    |              |
-| `POST /prerender_admin/backlog`            | recompute the backlog/histogram snapshot now     | `super_user` |
-| `POST /prerender_admin/sitemap`            | `{ url, offset, limit }` → one sitemap's detail  | `super_user` |
-| `POST /prerender_admin/sitemap-refresh`    | `{ url? }` → background walk of one/all roots    | `super_user` |
-| `GET /prerender_admin/change-probe`        | running pass, next run, last passes (this node)  | `super_user` |
-| `POST /prerender_admin/change-probe`       | `{ action?: "sweep"\|"canary", dryRun? }` → run  | `super_user` |
+| Method & path                              | Purpose                                                                                                                                   | Gate         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `GET /prerender_admin[/]`                  | API index: what this is, where the UI lives                                                                                               | public       |
+| `GET /prerender_admin/session`             | who am I                                                                                                                                  | public       |
+| `POST /prerender_admin/login`              | `{ username, password }`                                                                                                                  | public       |
+| `POST /prerender_admin/logout`             | end the session                                                                                                                           | session      |
+| `GET /prerender_admin/overview`            | nodes, counts, backlog snapshot, host facts                                                                                               | `super_user` |
+| `GET /prerender_admin/queue-state`         | this node's queue from the keeper; 503 if unsure                                                                                          | `super_user` |
+| `GET /prerender_admin/config`              | effective config, layers, overrides, warnings                                                                                             | `super_user` |
+| `GET /prerender_admin/sitemaps`            | root sitemaps + refresh state (never `entries`)                                                                                           | `super_user` |
+| `GET /prerender_admin/pages`               | `?prefix&cursor&limit` — page-cache browse                                                                                                | `super_user` |
+| `GET /prerender_admin/page-content`        | `?cacheKey` — one stored page, as `text/plain`                                                                                            | `super_user` |
+| `GET /prerender_admin/unrouted`            | this worker's unrouted-path tally (peek)                                                                                                  | `super_user` |
+| `GET /prerender_admin/analytics`           | `?range` (ms) — series + per-node system health                                                                                           | `super_user` |
+| `GET /prerender_admin/invalidations`       | active bulk-invalidation rows                                                                                                             | `super_user` |
+| `GET /prerender_admin/crawl-breadth`       | `?days` — distinct URLs crawled per bot per day, and distinct MISSED URLs per miss cause (`misses` per day, `missUnion` across the range) | `super_user` |
+| `GET /prerender_admin/metrics`             | the metric catalog (see METRICS.md)                                                                                                       | `super_user` |
+| `POST /prerender_admin/explain`            | `{ url, deviceType }` → cache-key trace                                                                                                   | `super_user` |
+| `POST /prerender_admin/schedule`           | `{ url \| cacheKey }` → this node's schedule row                                                                                          | `super_user` |
+| `POST /prerender_admin/queue`              | `{ scope, paused }` → pause control                                                                                                       | `super_user` |
+| `POST /prerender_admin/revalidate`         | `{ url, deviceType }` → make one URL due now                                                                                              | `super_user` |
+| `POST /prerender_admin/reconcile`          | start a schedule-repair sweep on this node                                                                                                | `super_user` |
+| `POST /prerender_admin/sweep-orphans`      | `{ dryRun?, maxDeletes? }` → key-rule orphans                                                                                             | `super_user` |
+| `GET /prerender_admin/sweep-orphan-pages`  | this node's page orphan sweep (live or last)                                                                                              | `super_user` |
+| `POST /prerender_admin/sweep-orphan-pages` | `{ dryRun?, minAgeDays?, maxDeletes?,                                                                                                     | `super_user` |
+|                                            | ratePerSecond? }` → targetless pages, or stop                                                                                             |              |
+| `POST /prerender_admin/backlog`            | recompute the backlog/histogram snapshot now                                                                                              | `super_user` |
+| `POST /prerender_admin/sitemap`            | `{ url, offset, limit }` → one sitemap's detail                                                                                           | `super_user` |
+| `POST /prerender_admin/sitemap-refresh`    | `{ url? }` → background walk of one/all roots                                                                                             | `super_user` |
+| `GET /prerender_admin/change-probe`        | running pass, next run, last passes (this node)                                                                                           | `super_user` |
+| `POST /prerender_admin/change-probe`       | `{ action?: "sweep"\|"canary", dryRun? }` → run                                                                                           | `super_user` |
 
 **Node health** comes in two node-scoped pieces, neither of which adds a scan:
 
@@ -1218,9 +1224,10 @@ The extracted values are reduced to a **signature** stored in the node-local `Pr
 by its owner node, and replicating it would ship every baseline to nodes that never consult it; a
 lost baseline just re-seeds). A probe that observes a different signature **acts on it when it finds
 it** (since v0.94.0): the URL's cached pages are hard-expired and its render is filed at the current
-minute, marked on the schedule row (`changedAt`) so the render queue ranks it
-`queue.ready.changedHeadStart` cadences ahead of routine rotation (a page known wrong is being served
-from the origin until it re-renders). Nothing detected is deferred and there is no per-pass budget —
+minute, marked on the schedule row (`changedAt`, with the page's demand estimate as `demandPeriod`) so
+the render queue ranks it `queue.ready.changedHeadStart` cadences ahead of routine rotation, and among
+changed pages by how often bots ask for them (a page known wrong is being served from the origin until
+it re-renders). Nothing detected is deferred and there is no per-pass budget —
 the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
 (the pass waits for a free slot rather than dropping a change), and the new baseline is written only
 after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
@@ -1278,6 +1285,51 @@ Once a probe rule covers a route's volatile fields, that route's `renderInterval
 raised substantially — the interval then only bounds what the probe cannot see (client-side
 content: reviews, image sets), and the render budget freed is what pays for the burst of
 re-renders a mass change triggers. Status and manual runs: `GET`/`POST /prerender_admin/change-probe`.
+
+### Demand: the tracker, and what reads it
+
+`demand.*` (v0.95.0; default **off**) records which URLs the crawlers you name (`demand.bots`) actually
+ask for: a ring of Bloom slices (`slices` × `sliceMs`, 4 days of 6 h at the defaults), one merged row per
+node per slice, replicated so any node can answer. It measures and never acts. A URL's **demand** is
+how many slices saw a visit, 0 to 16, and its estimated visit period is the window over that count
+(`util/demand.js`).
+
+Consumers decide what demand is worth, each with its own settings:
+
+- the **cadence ladder** (`render.demand`) moves a target between render intervals. It predates the
+  tracker and its decisions did not change when the tracker was split out of it; it needs
+  `demand.enabled` too, and a config finding says so if it is on without it;
+- **changed-page order** (`queue.ready.changedDemand`, above) ranks the pages the change probe found
+  changed by the origin visits their wait costs.
+
+What it cannot see: presence is per slice, so a page asked for every minute and one asked for once in
+six hours read the same. False positives only ever ADD demand, and they rise off a cliff with fill
+(`fill^k`): a ring sized for 100k URLs per slice that is asked to hold 350k answers "visited" about half
+the time. `demand_false_positive` (the worst full slice's `fill^k`) is the number to watch; past
+`demand.maxFalsePositive` the tracker reports demand as **unknown** and the changed-page order falls back
+to cadence. The ladder does not consult it. Size `demand.bitsPerSlice` from the measured peak distinct
+URLs per slice (`n ≈ −(m/k) ln(1 − fill)`), and weigh it against `demand.flushInterval`: the row is
+`bitsPerSlice / 8` bytes and replicates on every flush. Changing `bitsPerSlice`, `hashes` or `sliceMs`
+reshapes the ring, and the ladder then rests targets at base for one slowest rung while new history
+accumulates.
+
+**Moved in v0.95.0, without an alias:** `render.demand.{bots, sliceMs, slices, bitsPerSlice, hashes,
+flushInterval, mergeInterval}` are `demand.*`. From v0.95.0 an unknown key is reported at any depth
+(it used to be reported only at the top level), so an old path left in `config.yaml` or a stored
+override logs "Unknown configuration key" and is not applied.
+
+### Why a request missed: `bot_miss`
+
+Every request `bot_serve` counts as `origin|miss` also gets one **cause** (`bot_miss`, by route and bot):
+`not-found` / `redirect` / `client-error` / `origin-error` (the origin status decided it), `passthrough`,
+`uncacheable`, `gated-route` / `gated-bot` / `gated-entity` (a rule you chose), `new` / `unrendered` /
+`device` (a page the rotation owns and has not rendered yet — the only group render capacity or order
+can move), `suppressed`, `error`. Each missed URL also goes into a per-cause distinct-URL sketch, so
+`GET /prerender_admin/crawl-breadth` can say how many distinct URLs each cause is made of (`misses` per
+day, `missUnion` across the range). Requests per distinct URL is how many times a missed URL is asked
+for, which is what a render of it would serve; the days' distinct counts against the range's union say
+whether the same URLs come back tomorrow. A class of misses made of one-off URLs is not worth covering
+at any capacity.
 
 ## Metrics & observability
 

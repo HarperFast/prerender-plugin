@@ -1,7 +1,8 @@
 /**
  * Visit filter — "was this URL visited by a bot in the last N hours?", as a ring of Bloom
- * slices. The demand ladder (util/demandLadder.js) reads it to decide whether a target's
- * render cadence should move up or down; nothing else depends on it.
+ * slices. The storage behind the DEMAND TRACKER (`demand.*`): `util/demand.js` turns it into a
+ * demand level per URL, and the cadence ladder (util/demandLadder.js) asks it membership
+ * questions directly, as it always has.
  *
  * WHY A BLOOM FILTER AND NOT A `lastVisitedAt` COLUMN. The obvious design is a timestamp on
  * Target, which the reschedule path already reads for free. It does not survive the traffic
@@ -54,6 +55,7 @@ import { setImmediate } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
 import { getMutex, getSab } from './coordination.js';
 import { fnv1a32 } from './hash.js';
+import { metrics } from '../metrics.js';
 
 const table = () => databases.crawl_stats.VisitFilter;
 
@@ -90,8 +92,8 @@ let flushTimer = null;
 let armedFlushInterval = null;
 const scratch = new Int32Array(32); // reused index buffer; k is bounded well below 32
 
-const sliceMs = () => config.render.demand.sliceMs;
-const sliceCount = () => config.render.demand.slices;
+const sliceMs = () => config.demand.sliceMs;
+const sliceCount = () => config.demand.slices;
 // bitsPerSlice, normalized UP to a power of two (memoized on the raw config value — one
 // compare on the hot path). Two things depend on the normalization, not just prefer it:
 //   - byte sizing: a non-multiple-of-8 count would truncate at `>>> 3`, and bits past the
@@ -102,7 +104,7 @@ const sliceCount = () => config.render.demand.slices;
 let bcRaw = 0;
 let bcNorm = 0;
 const bitCount = () => {
-	const raw = config.render.demand.bitsPerSlice;
+	const raw = config.demand.bitsPerSlice;
 	if (raw !== bcRaw) {
 		bcRaw = raw;
 		bcNorm = 1024;
@@ -110,7 +112,7 @@ const bitCount = () => {
 	}
 	return bcNorm;
 };
-const hashes = () => Math.min(config.render.demand.hashes, scratch.length);
+const hashes = () => Math.min(config.demand.hashes, scratch.length);
 
 /** Ring slot for a wall-clock time. Monotonic, so slot order is comparable modulo the ring. */
 export const slotOf = (ms) => Math.floor(ms / sliceMs());
@@ -123,7 +125,7 @@ const newSlice = () => new Uint8Array(bitCount() >>> 3);
  * resolves per URL, and dropping the device split halves the distinct count the filter holds.
  */
 export function recordVisit(url) {
-	if (!config.render.demand.enabled) return;
+	if (!config.demand.enabled) return;
 
 	const now = Date.now();
 	if (now >= slotEndMs) rollover(now);
@@ -178,7 +180,7 @@ export async function sweepExpired(cutoffSlot, nowSlot = slotOf(Date.now())) {
 }
 
 const armFlushTimer = () => {
-	armedFlushInterval = config.render.demand.flushInterval;
+	armedFlushInterval = config.demand.flushInterval;
 	// Every worker MERGES on every tick; only the interval's winner also WRITES. See
 	// `claimWriteTurn` — the dedup lives here rather than inside `flushSlices` so that explicit
 	// calls (the disable path below, shutdown, tests) always persist.
@@ -208,7 +210,7 @@ const TURN_EPOCH_SEC = 1_700_000_000;
 const nowTurnSec = () => Math.floor(Date.now() / 1000) - TURN_EPOCH_SEC;
 
 const claimWriteTurn = () => {
-	const intervalSec = Math.max(1, Math.round(config.render.demand.flushInterval / 1000));
+	const intervalSec = Math.max(1, Math.round(config.demand.flushInterval / 1000));
 	const now = nowTurnSec();
 	// Keyed by shape: a sizing change starts a fresh turn clock rather than inheriting one taken
 	// against rows of a different byte length.
@@ -231,36 +233,40 @@ const claimWriteTurn = () => {
 // probe bits set than checked), and a sliceMs change renumbers every slot.
 const shapeOf = () => `${sliceMs()}|${bitCount()}|${hashes()}`;
 let armedShape = shapeOf();
-let coldUntilMs = 0;
+// When the current shape's history began: 0 until a reshape, then the moment of it. Everything
+// before it was recorded under another shape and is unreadable, so a consumer must not read an
+// empty slot from before it as "nobody visited" — see `historyFromMs`.
+let historyStartMs = 0;
 
 onConfigApplied(() => {
 	if (shapeOf() !== armedShape) {
 		armedShape = shapeOf();
 		// Drop BOTH sides of the in-memory state: old-shape write slices must not flush under
 		// the new numbering, and the union must not keep answering from old-shape rows. Then
-		// hold the ladder cold until a full slowest-rung window of NEW-shape history exists —
-		// engaging against a near-empty union reads as "nobody visited anything" and demotes
-		// the corpus, the error direction this module must not produce. (Persisted old-shape
-		// rows age out via sweepExpired; a sliceMs increase leaves them at impossible-future
-		// slot numbers, which the sweep also deletes.)
+		// record when the NEW-shape history began: engaging against a near-empty union reads as
+		// "nobody visited anything", the error direction this module must not produce, so each
+		// consumer holds until the history it needs exists (the ladder: its slowest rung;
+		// `visitedSlots`: it counts only the slots since). (Persisted old-shape rows age out via
+		// sweepExpired; a sliceMs increase leaves them at impossible-future slot numbers, which
+		// the sweep also deletes.)
 		slices = new Map();
 		dirty.clear();
 		slot = null;
 		slotEndMs = 0;
 		merged = new Map();
 		mergedAt = 0;
-		const ladder = (config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0);
-		coldUntilMs = Date.now() + (ladder.length ? Math.max(...ladder) : 0);
+		unionStats = EMPTY_STATS;
+		historyStartMs = Date.now();
 	}
 	if (!flushTimer) return;
-	if (!config.render.demand.enabled) {
+	if (!config.demand.enabled) {
 		clearInterval(flushTimer);
 		flushTimer = null;
 		armedFlushInterval = null;
 		flushSlices().catch((e) => logger.error(e)); // persist rather than discard
 		return;
 	}
-	if (config.render.demand.flushInterval !== armedFlushInterval) {
+	if (config.demand.flushInterval !== armedFlushInterval) {
 		clearInterval(flushTimer);
 		armFlushTimer();
 	}
@@ -376,6 +382,43 @@ let merged = new Map(); // slot -> Uint8Array unioned across nodes
 let mergedAt = 0;
 let refreshing = null;
 
+// Measured once per re-union, never per question: the set-bit fraction of each slot and the
+// false-positive rate that implies (`fill^k`). The newest slot is PARTIAL and still filling, so it
+// is reported (`newestFill`, the sizing sawtooth) but kept out of the worst case, which is taken
+// over the FULL slots — the ones most of every level count is made of.
+const EMPTY_STATS = Object.freeze({ newestFill: 0, worstFill: 0, worstFalsePositive: 0 });
+let unionStats = EMPTY_STATS;
+
+const fillOf = (bytes) => {
+	let set = 0;
+	for (let i = 0; i < bytes.length; i++) {
+		let b = bytes[i];
+		b = b - ((b >> 1) & 0x55);
+		b = (b & 0x33) + ((b >> 2) & 0x33);
+		set += (b + (b >> 4)) & 0x0f;
+	}
+	return bytes.length ? set / (bytes.length * 8) : 0;
+};
+
+const measureUnion = (union, newestSlot) => {
+	const expected = bitCount() >>> 3;
+	let newestFill = 0;
+	let worstFill = 0;
+	let fullSlots = 0;
+	for (const [s, bytes] of union) {
+		if (bytes.length !== expected) continue;
+		const fill = fillOf(bytes);
+		if (s === newestSlot) newestFill = fill;
+		else {
+			fullSlots++;
+			if (fill > worstFill) worstFill = fill;
+		}
+	}
+	// A ring with only its newest slot has no full slot to judge; the partial one is all there is.
+	if (!fullSlots) worstFill = newestFill;
+	return { newestFill, worstFill, worstFalsePositive: worstFill ** hashes() };
+};
+
 /**
  * Refresh the in-memory union of every node's rows for the slots still in the ring.
  * Cheap (slices x nodes small rows) and on a timer, because the reschedule path cannot
@@ -404,15 +447,35 @@ export async function refreshMerged(nowMs = Date.now()) {
 	}
 	merged = next;
 	mergedAt = nowMs;
+	unionStats = measureUnion(next, newest);
+	// The sizing signals, emitted where they are measured. `fill` is the newest slot's (the sawtooth
+	// to read at its PEAK), `false_positive` the worst full slot's `fill^k` — the number
+	// `demand.maxFalsePositive` is compared against. Guarded: losing a metric must never fail a
+	// refresh.
+	try {
+		metrics.demand(unionStats.newestFill, 'fill');
+		metrics.demand(unionStats.worstFalsePositive, 'false_positive');
+	} catch {
+		// metrics unavailable (tests, early boot)
+	}
 	return merged;
 }
 
 /**
- * True once the read-side union is warm enough to answer. After a shape change this also
- * holds until a full slowest-rung window of new-shape history exists — the union may be
- * populated but still blind to everything recorded before the reshape.
+ * True once the read-side union holds a first refresh. Consumers decide for themselves how much
+ * history they need on top (`historyFromMs`): the union may be populated but still blind to
+ * everything recorded before a reshape.
  */
-export const mergedReady = () => mergedAt > 0 && Date.now() >= coldUntilMs;
+export const mergedWarm = () => mergedAt > 0;
+
+/**
+ * When the current shape's history began — 0 unless the filter was reshaped since boot. Nothing
+ * recorded before it is readable, so an empty slot from before it is NOT evidence of no visits.
+ */
+export const historyFromMs = () => historyStartMs;
+
+/** The last re-union's sizing measurements: `{ newestFill, worstFill, worstFalsePositive }`. */
+export const unionHealth = () => unionStats;
 
 /**
  * Kick the background refresh without asking a membership question.
@@ -423,15 +486,28 @@ export const mergedReady = () => mergedAt > 0 && Date.now() >= coldUntilMs;
  * which that same refusal skips — so without this the filter would never warm and the ladder
  * would stay disabled forever.
  */
-export const ensureMerged = (nowMs = Date.now()) => maybeRefresh(nowMs);
+export const ensureMerged = (nowMs = Date.now()) => {
+	maybeRefresh(nowMs);
+};
+
+/**
+ * Warm the union and WAIT for it: resolves once a refresh that was due has landed (at once when the
+ * union is already current). For a caller about to ask many questions in a row — a probe pass — so
+ * the first few are not answered by a cold union.
+ */
+export const awaitMerged = async (nowMs = Date.now()) => {
+	await maybeRefresh(nowMs);
+};
 
 const maybeRefresh = (nowMs) => {
-	if (nowMs - mergedAt < config.render.demand.mergeInterval || refreshing) return;
+	if (refreshing) return refreshing;
+	if (nowMs - mergedAt < config.demand.mergeInterval) return undefined;
 	refreshing = refreshMerged(nowMs)
 		.catch((e) => logger.error(e))
 		.finally(() => {
 			refreshing = null;
 		});
+	return refreshing;
 };
 
 /**
@@ -458,6 +534,35 @@ export function visitedWithin(url, windowMs, nowMs = Date.now()) {
 		if (bytes && bytes.length === bitCount() >>> 3 && hasBits(bytes, idx, k)) return true;
 	}
 	return false;
+}
+
+/**
+ * In how many ring slots was `url` visited? The demand LEVEL, 0..`covered`, over the slots the
+ * union can answer for: the ring, newest (partial) slot included, clipped to the current shape's
+ * history (`historyFromMs`) and to the oldest slot any node has written — a tracker switched on
+ * yesterday has one day of slots, and an empty slot before its first row is not evidence of
+ * nothing. `covered` is 0 while the union is cold. A read of the cached union; the refresh it may
+ * kick is async and answers later questions.
+ */
+export function visitedSlots(url, nowMs = Date.now()) {
+	maybeRefresh(nowMs);
+	if (!merged.size) return { level: 0, covered: 0 };
+	const k = hashes();
+	const expected = bitCount() >>> 3;
+	const newest = slotOf(nowMs);
+	let oldest = newest - sliceCount() + 1;
+	if (historyStartMs > 0) oldest = Math.max(oldest, slotOf(historyStartMs));
+	let firstWritten = Infinity;
+	for (const [s, bytes] of merged) if (bytes.length === expected && s < firstWritten) firstWritten = s;
+	oldest = Math.max(oldest, firstWritten);
+	if (oldest > newest) return { level: 0, covered: 0 };
+	const idx = bitsFor(url, bitCount(), k, scratch);
+	let level = 0;
+	for (let s = oldest; s <= newest; s++) {
+		const bytes = merged.get(s);
+		if (bytes && bytes.length === expected && hasBits(bytes, idx, k)) level++;
+	}
+	return { level, covered: newest - oldest + 1 };
 }
 
 /**
@@ -488,15 +593,7 @@ export function newestFill() {
 	let newest = -Infinity;
 	for (const s of merged.keys()) if (s > newest) newest = s;
 	const bytes = merged.get(newest);
-	if (!bytes?.length) return 0;
-	let set = 0;
-	for (let i = 0; i < bytes.length; i++) {
-		let b = bytes[i];
-		b = b - ((b >> 1) & 0x55);
-		b = (b & 0x33) + ((b >> 2) & 0x33);
-		set += (b + (b >> 4)) & 0x0f;
-	}
-	return set / (bytes.length * 8);
+	return bytes?.length ? fillOf(bytes) : 0;
 }
 
 /** Test seam: drop all in-memory state (both sides). */
@@ -508,7 +605,10 @@ export function resetVisitFilter() {
 	slotEndMs = 0;
 	merged = new Map();
 	mergedAt = 0;
-	coldUntilMs = 0;
+	unionStats = EMPTY_STATS;
+	historyStartMs = 0;
+	armedShape = shapeOf();
+	refreshing = null;
 	if (flushTimer) clearInterval(flushTimer);
 	flushTimer = null;
 	armedFlushInterval = null;

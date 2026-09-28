@@ -775,6 +775,19 @@ test('the verification walk repairs a missing row, a mismatched one and a delete
 	s.stop();
 });
 
+test('the verification walk repairs a changed row whose demand estimate differs from the table', async () => {
+	// `matches` compares the estimate: a keeper holding the wrong one would order that page by a demand
+	// it does not have until the next write happened to touch it.
+	const now = Date.now();
+	seed([{ ...row(item(1), now - MINUTE), changedAt: now - MINUTE, demandPeriod: 6 * HOUR }]);
+	const s = await started();
+	table.set(item(1), { ...row(item(1), now - MINUTE), changedAt: now - MINUTE, demandPeriod: 24 * HOUR }); // event lost
+	const result = await s.verify();
+	assert.equal(result.mismatched, 1);
+	assert.equal(s.keeper.describe(item(1)).demandPeriodMs, 24 * HOUR);
+	s.stop();
+});
+
 test('the verification walk never applies a row older than an event that arrived during it', async () => {
 	const now = Date.now();
 	seed([row(item(1), now - HOUR)]);
@@ -933,5 +946,30 @@ test('a row the change probe marked is loaded as CHANGED and counted in queue-st
 	s.writeState();
 	const body = await PrerenderAdmin.queueState().json();
 	assert.equal(body.now.dueChanged, 1);
+	s.stop();
+});
+
+test('the keeper loads a changed row’s demand estimate and reports the waiting changed rows by it', async () => {
+	// Without `demandPeriod` in the load list every changed row would load as demand-unknown and
+	// queue.ready.changedDemand would silently order by cadence.
+	const { SCHEDULE_SELECT } = await import('../src/util/renderSchedule.js');
+	assert.ok(SCHEDULE_SELECT.includes('demandPeriod'), 'the keeper load reads the estimate');
+	const now = Date.now();
+	seed([
+		{ ...row(item(1), now - MINUTE), changedAt: now - MINUTE, demandPeriod: 6 * HOUR },
+		{ ...row(item(2), now - MINUTE), changedAt: now - MINUTE },
+	]);
+	const s = await started();
+	assert.equal(s.keeper.describe(item(1)).demandPeriodMs, 6 * HOUR);
+	assert.equal(s.keeper.describe(item(2)).demandPeriodMs, null);
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.deepEqual(
+		body.now.changedByDemand.map((b) => [b.periodMs, b.due]),
+		[
+			[6 * HOUR, 1],
+			[null, 1],
+		]
+	);
 	s.stop();
 });

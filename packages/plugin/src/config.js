@@ -155,6 +155,18 @@ const remapLegacyPaths = (options) => {
 	return copy;
 };
 
+// Harper component keys that sit beside the plugin's options in the same config block.
+const HARPER_COMPONENT_KEYS = [
+	'package',
+	'files',
+	'runOnMainThread',
+	'timeout',
+	'rest',
+	'graphqlSchema',
+	'jsResource',
+	'pluginModule',
+];
+
 /**
  * Deep-merge `source` onto `target`, guided by the shape of `target` (the
  * defaults). Only keys that exist in the defaults are considered. Values must
@@ -192,31 +204,19 @@ const mergeInto = (target, source, path = 'prerender', origin = null) => {
 		}
 	}
 
-	// Surface override keys that don't map to a known option — usually a typo.
+	// Surface override keys that don't map to a known option — usually a typo, or an option a release
+	// moved or removed. AT EVERY LEVEL: every plain-object default in this tree is a schema group (no
+	// option has an object default), so an unknown key anywhere is a key nothing reads. Before v0.95.0
+	// only the top level was checked, and a key inside a group — `render.demand.bitsPerSlice` after the
+	// demand tracker moved to `demand.*`, or any nested typo — was dropped without a word.
 	for (const key of Object.keys(source)) {
-		// `package`/`files`/`runOnMainThread`/`timeout` are Harper component keys, not plugin options.
-		if (
-			key in target ||
-			[
-				'package',
-				'files',
-				'runOnMainThread',
-				'timeout',
-				'rest',
-				'graphqlSchema',
-				'jsResource',
-				'pluginModule',
-			].includes(key)
-		) {
-			continue;
-		}
-		if (path === 'prerender') {
-			// `origin` names the layer, because the fix differs: an unknown key in config.yaml is a
-			// typo to correct in git, while an unknown key in a stored override is a row left behind
-			// by an option that was renamed or removed in a later release — which nobody would find
-			// by grepping the repo.
-			warn(`[prerender] Unknown configuration key: ${path}.${key}${origin ? ` (from ${origin})` : ''}`);
-		}
+		if (key in target) continue;
+		// `package`/`files`/`runOnMainThread`/`timeout`/… are Harper component keys, not plugin options.
+		if (path === 'prerender' && HARPER_COMPONENT_KEYS.includes(key)) continue;
+		// `origin` names the layer, because the fix differs: an unknown key in config.yaml is a typo to
+		// correct in git, while an unknown key in a stored override is a row left behind by an option
+		// that was renamed or removed in a later release — which nobody would find by grepping the repo.
+		warn(`[prerender] Unknown configuration key: ${path}.${key}${origin ? ` (from ${origin})` : ''}`);
 	}
 };
 
@@ -704,6 +704,18 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				`once it is stored — no render replaces it, and the change probe never sees a URL that owns no ` +
 				`target — so this interval is the ONLY bound on how stale a served document can be. Where the ` +
 				`origin changes on a schedule rather than continuously, prefer expiry: 'midnight'.`
+		);
+	}
+	// A CONSUMER WITH NO TRACKER is inert, not broken, and says nothing about it: the ladder rests every
+	// target at its base cadence forever. The operator asked for demand-driven cadence and is not getting
+	// it — the config is the only place that can be seen.
+	if (target.render.demand.enabled && !target.demand.enabled) {
+		add(
+			'warn',
+			'demand.enabled',
+			'render.demand.enabled is true but demand.enabled is false — the cadence ladder has no visits to decide ' +
+				'on and rests every target at its route cadence. Enable the demand tracker (demand.enabled), or ' +
+				'turn the ladder off.'
 		);
 	}
 	if (target.peerRescue.enabled && !target.peerRescue.token) {

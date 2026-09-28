@@ -25,6 +25,7 @@ let locks = [];
 const sabs = new Map();
 
 let recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET;
+let recordMissBreadth, mergeBreadthRow, finalizeMissUnion, MISS_SERIES_PREFIX;
 let estimateSketch, createSketch, addToSketch;
 let applyOptions;
 
@@ -75,6 +76,9 @@ before(async () => {
 	};
 	({ applyOptions } = await import('../src/config.js'));
 	({ recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET } = await import(
+		'../src/util/crawlStats.js'
+	));
+	({ recordMissBreadth, mergeBreadthRow, finalizeMissUnion, MISS_SERIES_PREFIX } = await import(
 		'../src/util/crawlStats.js'
 	));
 	({ estimateSketch, createSketch, addToSketch } = await import('../src/util/hll.js'));
@@ -327,4 +331,71 @@ test('precision sets the row size, and a mismatched stored row is ignored rather
 	const after = rows.get(`${today()}|Googlebot|node-a`);
 	assert.equal(after.registers.length, 1 << 12, 'rewritten at the new precision');
 	assert.ok(after.estimate >= 1, 'still a usable estimate rather than garbage from a bad merge');
+});
+
+// ── miss breadth: distinct missed URLs per cause (bot_request.js recordMiss) ─────────────────
+
+test('miss series are exempt from the bot cap, and a bot flood cannot fold a cause into ~overflow', async () => {
+	applyOptions({ crawlStats: { maxBotsPerThread: 2 } });
+	recordMissBreadth('not-found', 'https://site.example.com/gone');
+	recordMissBreadth('gated-route', 'https://site.example.com/c?facet=1');
+	// Two miss series exist already; the cap still admits two BOTS.
+	recordCrawl('Googlebot', 'https://site.example.com/a');
+	recordCrawl('Bingbot', 'https://site.example.com/b');
+	recordCrawl('SomeDerivedBot', 'https://site.example.com/c');
+	recordMissBreadth('new', 'https://site.example.com/fresh'); // past the cap, still its own series
+	await flushSketches();
+	assert.ok(rows.has(`${today()}|Googlebot|node-a`));
+	assert.ok(rows.has(`${today()}|Bingbot|node-a`));
+	assert.ok(rows.has(`${today()}|${OVERFLOW_BUCKET}|node-a`), 'the third bot overflowed');
+	for (const cause of ['not-found', 'gated-route', 'new']) {
+		assert.ok(rows.has(`${today()}|${MISS_SERIES_PREFIX}${cause}|node-a`), `${cause} kept its own series`);
+	}
+});
+
+test('breadth lists miss series apart from bots, and keeps them out of the crawler count', () => {
+	const urls = (from, to) => {
+		const s = createSketch();
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const [day] = computeBreadth([
+		{ day: '2026-08-04', bot: 'Googlebot', registers: urls(0, 1000) },
+		{ day: '2026-08-04', bot: `${MISS_SERIES_PREFIX}not-found`, registers: urls(0, 200) },
+	]);
+	assert.deepEqual(
+		day.bots.map((b) => b.bot),
+		['Googlebot'],
+		'a miss cause is not a crawler'
+	);
+	assert.equal(day.misses.length, 1);
+	assert.equal(day.misses[0].cause, 'not-found');
+	assert.ok(Math.abs(day.misses[0].distinctUrls - 200) / 200 <= 0.03);
+	assert.ok(Math.abs(day.total - 1000) / 1000 <= 0.03, 'total is the crawlers’ union');
+});
+
+test('missUnion counts a URL that missed on several days once — the "do they come back" number', () => {
+	const urls = (from, to) => {
+		const s = createSketch();
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const byDay = new Map();
+	// The same 500 dead URLs asked for on three days, and 300 new facet URLs each day.
+	for (const [n, d] of [
+		[0, '2026-08-02'],
+		[1, '2026-08-03'],
+		[2, '2026-08-04'],
+	]) {
+		mergeBreadthRow(byDay, { day: d, bot: `${MISS_SERIES_PREFIX}not-found`, registers: urls(0, 500) });
+		mergeBreadthRow(byDay, {
+			day: d,
+			bot: `${MISS_SERIES_PREFIX}gated-route`,
+			registers: urls(10_000 + n * 300, 10_300 + n * 300),
+		});
+	}
+	const union = Object.fromEntries(finalizeMissUnion(byDay).map((u) => [u.cause, u]));
+	assert.ok(Math.abs(union['not-found'].distinctUrls - 500) / 500 <= 0.03, 'recurring: the union is one day');
+	assert.ok(Math.abs(union['gated-route'].distinctUrls - 900) / 900 <= 0.03, 'one-offs: the union is the sum');
+	assert.equal(union['not-found'].days, 3);
 });

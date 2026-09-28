@@ -1632,9 +1632,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'affordable interval bounds it and this does not try.\n\n' +
 				'COST IS NOT SELF-LIMITING. It scales with the fraction of the corpus bots touch, which ' +
 				'grows as search-engine traffic ramps. `maxFastFraction` is the backstop and the level ' +
-				'histogram logged every `statsInterval` is the early warning — watch it before trusting it.',
+				'histogram logged every `statsInterval` is the early warning — watch it before trusting it.\n\n' +
+				'A CONSUMER of the demand tracker (`demand.*`, where the visit ring and its sizing live since ' +
+				'v0.95.0): it acts only while `demand.enabled` is on too.',
 			{
-				enabled: option(false, 'Master switch. Off = `resolveRenderInterval` is used unchanged.'),
+				enabled: option(
+					false,
+					'Master switch. Off = `resolveRenderInterval` is used unchanged. Needs `demand.enabled`: with ' +
+						'the tracker off there is nothing to decide on, and the ladder rests every target at base.'
+				),
 				dryRun: option(
 					true,
 					'Compute and LOG every ladder decision but schedule with the unchanged base interval. ' +
@@ -1706,63 +1712,6 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'a single fast decision would exceed the limit on its own and the ratio therefore says ' +
 						'nothing.',
 					{ min: 0, max: 1 }
-				),
-				bots: option(
-					['*'],
-					'Bots whose visits count as demand, by the bot name the analytics registry resolves ' +
-						"(analytics.bots / derived names / the literal 'other'), compared case-insensitively. " +
-						"['*'] (default) counts every bot; [] counts none, so every target rests at its route " +
-						'cadence; a list counts exactly those. Same shape and matching rules as ' +
-						'`ingress.discoveryBots`, and worth setting for a related reason: cadence is render ' +
-						'budget, so whoever this counts decides where that budget goes, and a third-party ' +
-						'crawler walking the corpus breadth-first promotes pages no search engine asked for. ' +
-						'It is also the first lever on ring saturation — see `bitsPerSlice`.',
-					{ itemType: 'string' }
-				),
-				sliceMs: option(
-					6 * HOUR,
-					'Time resolution of the visit ring. Cannot be coarser than the fastest rung or that rung ' +
-						'can never be evaluated.',
-					{ unit: 'ms', min: 1 }
-				),
-				slices: option(
-					16,
-					'Ring length. Must cover promoteWindows x the slowest rung, so the promotion test for the ' +
-						'top rung can see far enough back.',
-					{ min: 2 }
-				),
-				bitsPerSlice: option(
-					1 << 20,
-					'Bloom filter bits per ring slice, rounded UP to a power of two at use (byte sizing and ' +
-						'probe spread both require it). ~1M bits holds ~100k distinct URLs per slice at ~1% ' +
-						'false positives. There are no false negatives, so a visited page is never demoted for ' +
-						'lack of evidence.\n\n' +
-						'SIZE THIS AGAINST THE DISTINCT-URL RATE, and treat overshoot as a correctness problem ' +
-						'rather than a cost one. A slice holding n distinct URLs fills to `1 - e^(-kn/m)`, and ' +
-						'the false-positive rate is `fill^k` — so it degrades not gradually but off a cliff: at ' +
-						'the default k=7 and m=1M, 100k URLs fills to 0.49 (~0.7% false), 320k to 0.88 (~41%), ' +
-						'640k to 0.986 (~91%). Past that the ring answers "visited" for essentially everything, ' +
-						'the ladder promotes the whole corpus to its floor, and nothing about the failure is ' +
-						'loud — the cadence just stops being demand-driven. Watch `demand_fill` at its PEAK, ' +
-						'not its mean (it is a sawtooth that resets each slice).\n\n' +
-						'Raising this is the last lever, not the first: the row is `bitsPerSlice / 8` bytes and ' +
-						'REPLICATES on every flush, which is how the per-worker version of this write produced ' +
-						'a transaction log two orders of magnitude larger than the state it carried. Cut what ' +
-						'goes in first — `bots` above, and the rotation gate in `recordDemand` — since a URL ' +
-						'the ladder can never act on is pure fill.',
-					{ min: 1024 }
-				),
-				hashes: option(7, 'Bloom hash count (k).', { min: 1, max: 32 }),
-				flushInterval: option(
-					5 * MINUTE,
-					'How often a worker merges its in-memory ring slices into this node\u2019s replicated row.',
-					{ unit: 'ms', min: SECOND }
-				),
-				mergeInterval: option(
-					5 * MINUTE,
-					'How often the read side re-unions every node\u2019s rows. The reschedule path runs ~20x/s ' +
-						'and cannot pay a multi-row read per job result, so it reads a cached union this stale.',
-					{ unit: 'ms', min: SECOND }
 				),
 				statsInterval: option(15 * MINUTE, 'How often the level histogram + promote/demote counters are logged.', {
 					unit: 'ms',
@@ -2429,6 +2378,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'a while, never indefinitely. `0` ranks changed pages like any other due row.',
 					{ min: 0 }
 				),
+				changedDemand: option(
+					true,
+					'Order changed pages by how often bots ask for them: a changed row\u2019s wait is counted in the ' +
+						'page\u2019s visit periods, as the demand tracker (`demand.*`) estimated them when the change was ' +
+						'acted on, instead of in its cadence. A changed page is expired, so each visit while it waits ' +
+						'is served from the origin, and counted this way the score is those visits: the pages asked ' +
+						'for most render first. Counted in cadence, every changed product page shares one divisor and ' +
+						'a change wave renders in the order the probe found it.\n\n' +
+						'`changedHeadStart` still applies, and so does its bound, now in visits. A changed page nobody ' +
+						'asks for gains slowly and yields to routine rows at the same score — they are still served ' +
+						'from the cache, it is not asked for. Demand that is unknown (tracker off, still loading, or ' +
+						'past `demand.maxFalsePositive`) leaves a row ordered by cadence, as with this off. The estimate ' +
+						'is stamped on the row (`RenderSchedule.demandPeriod`) whether or not this is on, so switching ' +
+						'it applies to pages already waiting.'
+				),
 			}
 		),
 		keeper: group(
@@ -2557,6 +2521,112 @@ export const configSchema = group('Prerender plugin configuration.', {
 		}
 	),
 
+	demand: group(
+		'The DEMAND TRACKER: which URLs bots actually ask for, and how often — measured, never acted on ' +
+			'here. Every visit from a `bots` crawler to a URL in the render rotation sets bits in a ring of ' +
+			'Bloom slices (`slices` x `sliceMs`, 4 days at the defaults) that replicate, so any node can ' +
+			'answer for the cluster. A URL\u2019s DEMAND is how many of those slices saw a visit, 0 to ' +
+			'`slices`, and its estimated visit period is the window divided by that count.\n\n' +
+			'CONSUMERS decide what demand is worth, each with its own settings: the cadence ladder ' +
+			'(`render.demand`) moves a target between render intervals, and `queue.ready.changedDemand` ' +
+			'orders changed pages by how often they are asked for. Neither can act while this is off.\n\n' +
+			'WHAT IT CANNOT SEE. Presence is per slice: one visit and a thousand in the same 6 hours read ' +
+			'the same, so demand resolves periods from one slice up to the window and nothing faster. And ' +
+			'false positives only ever ADD demand (there are no false negatives), which is why a saturated ' +
+			'ring is the failure to watch — see `bitsPerSlice` and `maxFalsePositive`.\n\n' +
+			'Moved from `render.demand` in v0.95.0, without an alias: a stored override on an old path ' +
+			'reports as an unknown key until it is re-saved here.',
+		{
+			enabled: option(
+				false,
+				'Record bot visits at all. Off = nothing is recorded, every consumer reads demand as unknown ' +
+					'and behaves as if it were off: the cadence ladder rests every target at its route cadence, ' +
+					'and changed pages order by cadence.'
+			),
+			bots: option(
+				['*'],
+				'Bots whose visits count as demand, by the bot name the analytics registry resolves ' +
+					"(analytics.bots / derived names / the literal 'other'), compared case-insensitively. " +
+					"['*'] (default) counts every bot; [] counts none, so every target rests at its route " +
+					'cadence; a list counts exactly those. Same shape and matching rules as ' +
+					'`ingress.discoveryBots`, and worth setting for a related reason: every consumer spends ' +
+					'render budget on what this counts (cadence, the order changed pages render in), and a third-party ' +
+					'crawler walking the corpus breadth-first promotes pages no search engine asked for. ' +
+					'It is also the first lever on ring saturation — see `bitsPerSlice`.',
+				{ itemType: 'string' }
+			),
+			sliceMs: option(
+				6 * HOUR,
+				'Time resolution of the visit ring. Cannot be coarser than the fastest rung or that rung ' +
+					'can never be evaluated.',
+				{ unit: 'ms', min: 1 }
+			),
+			slices: option(
+				16,
+				'Ring length. Must cover promoteWindows x the slowest rung, so the promotion test for the ' +
+					'top rung can see far enough back.',
+				{ min: 2 }
+			),
+			bitsPerSlice: option(
+				1 << 20,
+				'Bloom filter bits per ring slice, rounded UP to a power of two at use (byte sizing and ' +
+					'probe spread both require it). ~1M bits holds ~100k distinct URLs per slice at ~1% ' +
+					'false positives. There are no false negatives, so a visited page is never demoted for ' +
+					'lack of evidence.\n\n' +
+					'SIZE THIS AGAINST THE DISTINCT-URL RATE, and treat overshoot as a correctness problem ' +
+					'rather than a cost one. A slice holding n distinct URLs fills to `1 - e^(-kn/m)`, and ' +
+					'the false-positive rate is `fill^k` — so it degrades not gradually but off a cliff: at ' +
+					'the default k=7 and m=1M, 100k URLs fills to 0.49 (~0.7% false), 320k to 0.88 (~41%), ' +
+					'640k to 0.986 (~91%). Past that the ring answers "visited" for essentially everything, ' +
+					'the cadence ladder promotes the whole corpus to its floor, and nothing about the ' +
+					'failure is loud — the cadence just stops being demand-driven (`maxFalsePositive` ' +
+					'stops the newer consumers acting on such a ring; the ladder still does). Watch `demand_fill` at its PEAK, ' +
+					'not its mean (it is a sawtooth that resets each slice).\n\n' +
+					'Raising this is the last lever, not the first: the row is `bitsPerSlice / 8` bytes and ' +
+					'REPLICATES on every flush, which is how the per-worker version of this write produced ' +
+					'a transaction log two orders of magnitude larger than the state it carried. Cut what ' +
+					'goes in first — `bots` above, and the rotation gate in `recordDemand` — since a URL ' +
+					'no consumer can ever act on is pure fill.',
+				{ min: 1024 }
+			),
+			hashes: option(
+				7,
+				'Bloom hash count (k). The false-positive rate is `fill^k`, and fill itself rises with k ' +
+					'(`1 - e^(-kn/m)`), so the best k for a slice holding n distinct URLs in m bits is ' +
+					'`(m/n) ln 2` — 7 suits ~100k URLs in the default 1M bits. A ring running far past its sizing ' +
+					'is better served by more bits than by a smaller k: at 3.7 URLs per 10 bits, k = 7 reads ~53% ' +
+					'false and k = 2 still ~25%.',
+				{ min: 1, max: 32 }
+			),
+			flushInterval: option(
+				5 * MINUTE,
+				'How often a worker merges its in-memory ring slices into this node\u2019s replicated row. ' +
+					'Only the current slice is dirty, so the replicated volume is about one `bitsPerSlice / 8` ' +
+					'row per node per interval — the other half of the bytes question `bitsPerSlice` raises.',
+				{ unit: 'ms', min: SECOND }
+			),
+			mergeInterval: option(
+				5 * MINUTE,
+				'How often the read side re-unions every node\u2019s rows. The reschedule path runs ~20x/s ' +
+					'and cannot pay a multi-row read per job result, so it reads a cached union this stale. ' +
+					'`demand_fill` is emitted at each re-union.',
+				{ unit: 'ms', min: SECOND }
+			),
+			maxFalsePositive: option(
+				0.05,
+				'The false-positive rate above which demand is UNKNOWN rather than a number. Measured at every ' +
+					're-union as the worst full slice\u2019s `fill^k`; while it is exceeded, `queue.ready.changedDemand` ' +
+					'falls back to cadence ordering.\n\n' +
+					'Why a threshold rather than a correction: a URL nobody visits reads about `slices x rate` ' +
+					'slices of demand from noise alone — at 0.05 over 16 slices that is 0.8, under one slice, so ' +
+					'a real visit still outranks the noise. At 0.5 it is 8 of 16, and every URL reads as visited ' +
+					'every 12 hours whether anyone asked for it or not.\n\n' +
+					'The cadence ladder does NOT consult this: its decisions predate the tracker and are pinned ' +
+					'as they were. A saturated ring still promotes the ladder\u2019s whole corpus to its floor.',
+				{ min: 0, max: 1 }
+			),
+		}
+	),
 	crawlStats: group(
 		'Crawl breadth: distinct URLs crawled per bot per UTC day, via per-thread HyperLogLog ' +
 			'sketches flushed to crawl_stats.CrawlSketch. Read merged through ' +

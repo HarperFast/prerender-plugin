@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
  *   - a miss on a discovery-gated route does NOT count (it owns no Target and never will), and
  *     neither does a non-200 (an origin 404 is not a page);
  *   - non-prerender classes never count, since they own no Target at all;
- *   - `render.demand.bots` gates on the resolved bot name.
+ *   - `demand.bots` gates on the resolved bot name.
  *
  * The assertions go through the real visitFilter rather than a stub, so a wiring change that
  * records the wrong URL — the cache key instead of the device-free URL, say — fails here.
@@ -96,9 +96,7 @@ before(async () => {
 const setDemand = (overrides = {}) =>
 	applyOptions({
 		ingress: { routes: [] },
-		render: {
-			demand: { enabled: true, sliceMs: H, slices: 16, bitsPerSlice: 1 << 20, hashes: 7, bots: ['*'], ...overrides },
-		},
+		demand: { enabled: true, sliceMs: H, slices: 16, bitsPerSlice: 1 << 20, hashes: 7, bots: ['*'], ...overrides },
 	});
 
 beforeEach(() => {
@@ -181,7 +179,7 @@ test('a non-prerender class is never demand', async () => {
 	assert.equal(await wasRecorded({ routeClass: 'unclassified', cacheStatus: 'hit' }), false);
 });
 
-test('render.demand.bots gates the signal on the resolved bot name', async () => {
+test('demand.bots gates the signal on the resolved bot name', async () => {
 	setDemand({ bots: ['Googlebot'] });
 	assert.equal(
 		await wasRecorded({ cacheStatus: 'hit', botName: 'AhrefsBot' }, 'https://example.com/product/prd-2/a.jsp'),

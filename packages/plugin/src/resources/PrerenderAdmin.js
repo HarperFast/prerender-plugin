@@ -127,7 +127,7 @@ import {
 	writeOverrides,
 } from '../util/configOverride.js';
 import { fileDueNow, inFlightLeases, leaseInfo, leaseState } from '../util/renderSchedule.js';
-import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
+import { mergeBreadthRow, finalizeBreadth, finalizeMissUnion } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
 import { hostInfo } from '../util/hostInfo.js';
 import { decode } from '../util/contentEncoding.js';
@@ -1432,6 +1432,10 @@ export class PrerenderAdmin extends Resource {
 				// changed pages have been waiting (for such a row, longer than it has been served from the origin)
 				dueChanged: q.dueChanged ?? 0,
 				oldestChangedAt: q.oldestChangedDueAt ?? null,
+				// the same rows by the demand estimate they carry (`periodMs` between bot visits; null = the tracker
+				// could not say when the change was acted on), most-asked-for first — what
+				// `queue.ready.changedDemand` orders them by
+				changedByDemand: q.changedByDemand ?? [],
 				...nowBlock,
 				unclaimed: Math.max(0, q.due - inFlight),
 			},
@@ -2078,6 +2082,9 @@ export class PrerenderAdmin extends Resource {
 			shardsMerged,
 			truncated,
 			breadth: finalizeBreadth(byDay),
+			// Distinct missed URLs per cause across the WHOLE range (each day's are in `breadth[].misses`):
+			// set the days' sum against this to see whether the same URLs keep missing.
+			missUnion: finalizeMissUnion(byDay),
 		});
 	}
 

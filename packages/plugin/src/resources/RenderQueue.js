@@ -1245,7 +1245,8 @@ export class RenderQueue extends Resource {
 		// row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
 		// that is still being served from the origin. A local point read: results land on the owner,
 		// and elsewhere it reads nothing and the mark is simply not carried.
-		const { changedAt } = (await getScheduleRow(sourceUrl, ['changedAt'])) ?? {};
+		// Its demand estimate rides with the mark (`demandPeriod`), for the same reason.
+		const { changedAt, demandPeriod } = (await getScheduleRow(sourceUrl, ['changedAt', 'demandPeriod'])) ?? {};
 		logger.debug(
 			`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
 				`${fromSitemap ? '' : ', non-sitemap'})`
@@ -1255,6 +1256,7 @@ export class RenderQueue extends Resource {
 			fromSitemap,
 			effectiveInterval: cadence,
 			changedAt: changedAt === null || changedAt === undefined ? undefined : Number(changedAt),
+			demandPeriod: demandPeriod === null || demandPeriod === undefined ? undefined : Number(demandPeriod),
 		});
 		return 'slow';
 	}

@@ -34,7 +34,8 @@ let locks = [];
 const sabs = new Map();
 
 let recordVisit, flushSlices, refreshMerged, visitedWithin, visitedInEachWindow;
-let sweepExpired, resetVisitFilter, slotOf, mergedReady;
+let sweepExpired, resetVisitFilter, slotOf, mergedWarm, historyFromMs, visitedSlots, unionHealth, visitProbe;
+let demandOf, warmDemand;
 let applyOptions;
 
 const H = 60 * 60 * 1000;
@@ -111,30 +112,38 @@ before(async () => {
 		sweepExpired,
 		resetVisitFilter,
 		slotOf,
-		mergedReady,
+		mergedWarm,
+		historyFromMs,
+		visitedSlots,
+		unionHealth,
 	} = await import('../src/util/visitFilter.js'));
+	({ visitProbe } = await import('../src/util/demandLadder.js'));
+	({ demandOf, warmDemand } = await import('../src/util/demand.js'));
 });
 
+// The ring's sizing is the demand TRACKER's (`demand.*`, v0.95.0); the ladder's rungs stay under
+// `render.demand` and matter here only for how long a reshape holds the ladder cold.
 const setDemand = (overrides = {}) =>
 	applyOptions({
-		render: {
-			demand: {
-				enabled: true,
-				sliceMs: H,
-				slices: 16,
-				bitsPerSlice: 1 << 20,
-				hashes: 7,
-				...overrides,
-			},
+		demand: {
+			enabled: true,
+			sliceMs: H,
+			slices: 16,
+			bitsPerSlice: 1 << 20,
+			hashes: 7,
+			...overrides,
 		},
+		render: { demand: { enabled: true, ladder: [H, 2 * H, 4 * H] } },
 	});
 
 beforeEach(() => {
 	rows.clear();
 	locks = [];
 	sabs.clear();
-	resetVisitFilter();
+	// Config FIRST, then the reset: a test that reshaped the ring leaves the next one's setDemand to
+	// reshape it back, and a reshape stamps a history start that would clip every level count here.
 	setDemand();
+	resetVisitFilter();
 });
 
 test('record → flush → refresh → visitedWithin roundtrips; unvisited URL stays invisible', async () => {
@@ -250,14 +259,77 @@ test('a sizing change drops both sides of the in-memory state and holds the ladd
 	recordVisit('https://example.com/a');
 	await flushSlices();
 	await refreshMerged(now);
-	assert.equal(mergedReady(), true);
+	assert.equal(mergedWarm(), true);
+	assert.equal(visitProbe.ready(now), true, 'no reshape: the ladder may decide as soon as the union is warm');
 	assert.equal(visitedWithin('https://example.com/a', H, now), true);
 
 	// Reshape: the slot numbering changes, so every old-shape answer is garbage. The union
 	// must stop answering (cold hold) rather than demote the corpus off near-empty data.
 	setDemand({ sliceMs: 2 * H });
-	assert.equal(mergedReady(), false, 'union no longer claims to be warm');
+	assert.equal(mergedWarm(), false, 'union no longer claims to be warm');
 	assert.equal(visitedWithin('https://example.com/a', H, now), false, 'old-shape union dropped');
+	const since = historyFromMs();
+	assert.ok(since > 0, 'the new shape records when its history began');
+
+	// A refresh warms the union again, but the LADDER stays cold until a full slowest-rung window of
+	// new-shape history exists (4h here) — the pre-split behaviour, now derived from the history start.
+	await refreshMerged(Date.now());
+	assert.equal(mergedWarm(), true);
+	assert.equal(visitProbe.ready(since + 4 * H - 1), false, 'still inside the slowest rung');
+	assert.equal(visitProbe.ready(since + 4 * H), true, 'a full slowest-rung window of new history');
+});
+
+// ── the demand LEVEL (util/demand.js reads it) ──────────────────────────────────────────────
+
+test('visitedSlots counts the slots with a visit, over the slots the union can answer for', async () => {
+	const base = slotOf(Date.now()) * H;
+	const url = 'https://example.com/hot';
+	// Visits in three distinct slots: 5h ago, 3h ago, now. Recording is clocked by Date.now(), so move
+	// the clock for each and flush it as its own slot.
+	const realNow = Date.now;
+	try {
+		for (const hoursAgo of [5, 3, 0]) {
+			Date.now = () => base - hoursAgo * H + 60_000;
+			recordVisit(url);
+			await flushSlices();
+		}
+	} finally {
+		Date.now = realNow;
+	}
+	const at = base + 30 * 60_000;
+	await refreshMerged(at);
+	const hot = visitedSlots(url, at);
+	assert.equal(hot.level, 3);
+	// Only six slots have ever been written (5h ago through now): an empty slot before the first row
+	// anywhere is not evidence of no visit, so the window is those six, not the ring's sixteen.
+	assert.equal(hot.covered, 6);
+	assert.deepEqual(visitedSlots('https://example.com/never', at), { level: 0, covered: 6 });
+});
+
+test('visitedSlots is cold (covered 0) before the union loads', () => {
+	assert.deepEqual(visitedSlots('https://example.com/x', Date.now()), { level: 0, covered: 0 });
+});
+
+test('unionHealth measures fill and fill^k over FULL slots, not the partial newest one', async () => {
+	setDemand({ bitsPerSlice: 1024, hashes: 2 });
+	const base = slotOf(Date.now()) * H;
+	const realNow = Date.now;
+	try {
+		// A full slot one hour ago with plenty of URLs, and a light newest slot.
+		Date.now = () => base - H + 60_000;
+		for (let i = 0; i < 400; i++) recordVisit(`https://example.com/p${i}`);
+		await flushSlices();
+		Date.now = () => base + 60_000;
+		recordVisit('https://example.com/only-one');
+		await flushSlices();
+	} finally {
+		Date.now = realNow;
+	}
+	await refreshMerged(base + 2 * 60_000);
+	const { newestFill, worstFill, worstFalsePositive } = unionHealth();
+	assert.ok(newestFill > 0 && newestFill < 0.01, `newest slot barely filled (${newestFill})`);
+	assert.ok(worstFill > 0.25, `the full slot is well filled (${worstFill})`);
+	assert.ok(Math.abs(worstFalsePositive - worstFill ** 2) < 1e-12, 'false-positive rate is fill^k');
 });
 
 test('a cold union answers false rather than throwing or inventing traffic', () => {
@@ -328,4 +400,72 @@ test('merging is idempotent: the same slice merged twice is indistinguishable fr
 	await refreshMerged(now);
 	assert.equal(visitedWithin('https://example.com/product/prd-1', H, now), true);
 	assert.equal(rows.size, 1);
+});
+
+// ── demandOf: the tracker's answer (util/demand.js) ─────────────────────────────────────────
+
+const visitAt = async (url, ms) => {
+	const realNow = Date.now;
+	try {
+		Date.now = () => ms;
+		recordVisit(url);
+		await flushSlices();
+	} finally {
+		Date.now = realNow;
+	}
+};
+
+test('demandOf: unknown while the tracker is off, and while the union has not loaded', async () => {
+	setDemand({ enabled: false });
+	assert.deepEqual(
+		{ known: demandOf('https://example.com/a').known, reason: demandOf('https://example.com/a').reason },
+		{ known: false, reason: 'off' }
+	);
+	setDemand();
+	resetVisitFilter();
+	const cold = demandOf('https://example.com/a');
+	assert.equal(cold.known, false);
+	assert.equal(cold.reason, 'cold');
+	assert.equal(cold.periodMs, null, 'an unknown answer carries no number to misuse');
+});
+
+test('demandOf: the level is slots visited, the period the covered window over it', async () => {
+	const base = slotOf(Date.now()) * H;
+	for (const hoursAgo of [7, 5, 3, 1]) await visitAt('https://example.com/hot', base - hoursAgo * H + 60_000);
+	await visitAt('https://example.com/other', base + 60_000); // the newest slot exists too
+	const at = base + 30 * 60_000;
+	await refreshMerged(at);
+	const hot = demandOf('https://example.com/hot', at);
+	assert.equal(hot.known, true);
+	assert.equal(hot.level, 4);
+	assert.equal(hot.slots, 8, 'written history runs from 7h ago through the current slot');
+	assert.equal(hot.windowMs, 8 * H);
+	assert.equal(hot.periodMs, 2 * H, 'four visits in eight hours: one every two');
+
+	const never = demandOf('https://example.com/never', at);
+	assert.equal(never.level, 0);
+	assert.equal(never.periodMs, 8 * H, 'no visit in the window: the period is AT LEAST the window, reported as it');
+});
+
+test('demandOf: past demand.maxFalsePositive the answer is unknown, not a noise-dominated number', async () => {
+	const base = slotOf(Date.now()) * H;
+	await visitAt('https://example.com/a', base - H + 60_000);
+	await visitAt('https://example.com/b', base + 60_000);
+	setDemand({ maxFalsePositive: 0 }); // any measurable fill exceeds it
+	resetVisitFilter();
+	await refreshMerged(base + 2 * 60_000);
+	assert.ok(unionHealth().worstFalsePositive > 0);
+	const r = demandOf('https://example.com/a', base + 2 * 60_000);
+	assert.equal(r.known, false);
+	assert.equal(r.reason, 'saturated');
+});
+
+test('warmDemand loads the union, so the first question of a pass is answered', async () => {
+	const base = slotOf(Date.now()) * H;
+	await visitAt('https://example.com/a', base + 60_000);
+	resetVisitFilter(); // in-memory union gone, rows still stored
+	assert.equal(demandOf('https://example.com/a').reason, 'cold');
+	resetVisitFilter();
+	await warmDemand();
+	assert.equal(demandOf('https://example.com/a').known, true);
 });
