@@ -1052,3 +1052,235 @@ test('by instance: under a bot filter the panel says it is all bots — its seri
 	const card = find(draw(ctx), (n) => n.attributes?.class === 'card' && n.textContent.startsWith('By instance'));
 	assert.match(card.textContent, /all bots/);
 });
+
+// ---- plugin v0.95.0: why requests missed ------------------------------------------------------------
+//
+// `bot_miss` gives every origin-served miss one cause. The panel groups them by who can act — the origin,
+// a rule the deployment chose, or render capacity — and only the last family is a question for the fleet.
+// Beside each cause, the crawl sketch says how many distinct URLs it is made of and whether they come back.
+
+const { missRows, missBreadth, MISS_FAMILIES } = await import('../src/admin/views/traffic.js');
+
+// A 24h window ending 03:00 UTC in 6h buckets, so the LAST bucket (21:00–03:00) straddles midnight: today's
+// share of it is half.
+const END = Date.parse('2026-09-28T03:00:00Z');
+const withCounts = (row, counts) => ({ ...row, count: counts.reduce((a, b) => a + b, 0), counts });
+const MISS_WINDOW = {
+	...ANALYTICS,
+	rangeMs: 24 * HOUR,
+	startMs: END - 24 * HOUR,
+	endMs: END,
+	coveredFromMs: END - 24 * HOUR,
+	coveredToMs: END,
+	bucketMs: 6 * HOUR,
+	series: [
+		combo('bot_serve', 'cache', 'hit', 'googlebot', 6000),
+		combo('bot_serve', 'origin', 'miss', 'googlebot', 3000),
+		combo('bot_serve', 'origin', 'miss', 'bingbot', 1000),
+		// bot_miss: path = cause, method = route, type = bot. 4,000 in all — every origin miss explained.
+		combo('bot_miss', 'not-found', '/product/', 'googlebot', 800),
+		combo('bot_miss', 'gated-route', '/catalog/', 'googlebot', 1200),
+		withCounts(combo('bot_miss', 'new', '/product/', 'googlebot', 0), [150, 150, 150, 150]),
+		withCounts(combo('bot_miss', 'new', '/product/', 'bingbot', 0), [100, 100, 100, 100]),
+		combo('bot_miss', 'new', '/', 'bingbot', 200),
+		combo('bot_miss', 'unrendered', '/product/', 'bingbot', 400),
+		combo('bot_miss', 'passthrough', 'passthrough', 'googlebot', 400),
+	],
+};
+
+const SKETCH = {
+	days: 7,
+	truncated: false,
+	breadth: [
+		{
+			day: '2026-09-28',
+			total: 900,
+			bots: [],
+			misses: [
+				{ cause: 'new', distinctUrls: 40, shards: 2 },
+				{ cause: 'not-found', distinctUrls: 90, shards: 2 },
+			],
+		},
+		{
+			day: '2026-09-27',
+			total: 800,
+			bots: [],
+			misses: [
+				{ cause: 'new', distinctUrls: 500, shards: 2 },
+				{ cause: 'not-found', distinctUrls: 600, shards: 2 },
+				{ cause: 'unrendered', distinctUrls: 100, shards: 2 },
+			],
+		},
+	],
+	missUnion: [
+		{ cause: 'not-found', distinctUrls: 460, days: 2 },
+		{ cause: 'new', distinctUrls: 540, days: 2 },
+		{ cause: 'unrendered', distinctUrls: 100, days: 1 },
+	],
+};
+
+const missCtx = async (analytics = MISS_WINDOW) => {
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	return ctx;
+};
+const missCard = (ctx) =>
+	find(
+		draw(ctx),
+		(n) => (n.attributes?.class ?? '').startsWith('card') && n.textContent.startsWith('Why requests missed')
+	);
+const bodyRows = (table) => find(table, (n) => n.tagName === 'TBODY').children;
+const causeTable = (card) => find(card, (n) => n.tagName === 'TABLE' && n.textContent.includes('of misses'));
+const splitTable = (card) => find(card, (n) => n.tagName === 'TABLE' && n.textContent.includes('of cause'));
+const cellsOf = (tr) => tr.children.map((td) => td.textContent);
+
+test('why requests missed: hidden on a plugin that reports no cause', async () => {
+	assert.equal(missCard(await ready()), null, 'no bot_miss rows: no panel, never a breakdown of zeros');
+});
+
+test('why requests missed: three families with a verdict each — only waiting on a render is capacity', async () => {
+	const card = missCard(await missCtx());
+	assert.ok(card, 'expected the miss panel');
+	const tile = (label) => find(card, (n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === label);
+	const valueClass = (node) =>
+		find(node, (n) => String(n.attributes?.class ?? '').startsWith('value')).attributes.class;
+	// 10,000 bot requests: 800 nothing to render, 1,600 held by a rule, 1,600 waiting on a render.
+	assert.match(tile('Nothing to render').textContent, /8%.*not capacity/);
+	assert.match(tile('Held out by a rule').textContent, /16%.*not capacity/);
+	assert.equal(valueClass(tile('Held out by a rule')), 'value', 'a rule is never a fleet verdict, at any size');
+	const waiting = tile('Waiting on a render');
+	assert.match(waiting.textContent, /16%/);
+	assert.match(waiting.textContent, /the only family capacity moves/);
+	assert.equal(valueClass(waiting), 'value warn', '16% of bot requests is past the 10% watch');
+	assert.match(waiting.attributes.title, /1,600 requests: 16% of bot requests, 40% of misses/);
+	assert.equal(tile('Target read failed'), null, 'no error cause, no tile');
+	assert.deepEqual(
+		MISS_FAMILIES.map((f) => f.key),
+		['origin', 'rule', 'waiting', 'error']
+	);
+	// The explanation is behind the toggle, not on the page.
+	const help = find(card, (n) => n.attributes?.class === 'help');
+	assert.ok(help.attributes.hidden !== undefined, 'the help block starts hidden');
+	assert.match(help.textContent, /ONLY family render capacity or render order can move/);
+});
+
+test('why requests missed: every cause is a row, as a share of bot requests and of misses', async () => {
+	const rows = bodyRows(causeTable(missCard(await missCtx())));
+	const byCause = new Map(rows.map((tr) => [tr.children[0].children[0].textContent, cellsOf(tr)]));
+	assert.deepEqual([...byCause.keys()], ['gated-route', 'new', 'not-found', 'unrendered', 'passthrough']);
+	assert.deepEqual(byCause.get('new').slice(1, 5), ['waiting', '1,200', '12%', '30%']);
+	assert.deepEqual(byCause.get('gated-route').slice(1, 5), ['rule', '1,200', '12%', '30%']);
+	// Breadth is not loaded yet, so there are no breadth columns — and a button to load them.
+	assert.equal(rows[0].children.length, 5);
+	assert.ok(buttonSaying(missCard(await missCtx()), 'Load URL breadth'));
+});
+
+test('why requests missed: the top causes split by route, with the bots asking there', async () => {
+	const rows = bodyRows(splitTable(missCard(await missCtx()))).map(cellsOf);
+	// Four causes, each with its routes: `new` lands on two.
+	assert.deepEqual(rows.slice(0, 3), [
+		['gated-route', '/catalog/', '1,200', '100%', 'googlebot 100%'],
+		['new', '/product/', '1,000', '83%', 'googlebot 60% · bingbot 40%'],
+		['new', '/', '200', '17%', 'bingbot 100%'],
+	]);
+	assert.equal(rows.length, 5, 'the top four causes only: passthrough is left to the table above');
+});
+
+test('why requests missed: the bot filter narrows the causes, and the sketch columns say they are all bots', async () => {
+	const ctx = await missCtx();
+	ctx.data.bots = ['bingbot'];
+	ctx.data.breadth = SKETCH;
+	const card = missCard(ctx);
+	const rows = bodyRows(causeTable(card));
+	assert.deepEqual(
+		rows.map((tr) => tr.children[0].children[0].textContent),
+		['new', 'unrendered']
+	);
+	assert.match(causeTable(card).textContent, /URLs \*/);
+	assert.match(find(card, (n) => n.attributes?.class === 'help').textContent, /the sketch has no bot dimension/i);
+	assert.equal(ctx.calls.reloads, 0, 'a filter never refetches');
+});
+
+test('breadth: distinct URLs and requests per URL over the UTC day the window holds, recurrence over the loaded days', () => {
+	const reach = missBreadth(SKETCH, MISS_WINDOW);
+	// The window runs 03:00 yesterday → 03:00 today: yesterday started before it, so only today matches.
+	assert.deepEqual(reach.matched, ['2026-09-28']);
+	const nw = reach.byCause.get('new');
+	// Today's `new` requests: half of the googlebot and bingbot /product/ rows' last bucket (75 + 50), plus half
+	// of the / row's last bucket (25) = 150, over 40 distinct URLs.
+	assert.equal(nw.distinct, 40);
+	assert.equal(nw.reqPerUrl, 150 / 40);
+	// (40 + 500) / 540: the two days' URLs are all different ones.
+	assert.equal(nw.recurrence, 1);
+	// (90 + 600) / 460: a good share of yesterday's 404s came back today.
+	assert.equal(reach.byCause.get('not-found').recurrence, 690 / 460);
+	// Seen on one day only: nothing to recur. And no sketch row today is unknown, not zero URLs.
+	assert.equal(reach.byCause.get('unrendered').recurrence, null);
+	assert.equal(reach.byCause.get('unrendered').distinct, null);
+	assert.equal(reach.byCause.get('gated-route').distinct, null);
+	// The breadth answer of a plugin before v0.95.0 carries neither field.
+	assert.equal(missBreadth({ breadth: SKETCH.breadth.map(({ misses, ...day }) => day) }, MISS_WINDOW), null);
+});
+
+test('breadth: a range that starts after 00:00 UTC matches no day, and requests per URL is left out', () => {
+	const short = { ...MISS_WINDOW, rangeMs: 2 * HOUR, startMs: END - 2 * HOUR, coveredFromMs: END - 2 * HOUR };
+	const reach = missBreadth(SKETCH, short);
+	assert.deepEqual(reach.matched, []);
+	assert.equal(reach.byCause.get('new').reqPerUrl, null);
+	assert.equal(reach.byCause.get('new').recurrence, 1, 'recurrence needs no analytics');
+});
+
+test('why requests missed: loaded breadth fills the columns, and says which days each covers', async () => {
+	const ctx = await missCtx();
+	ctx.data.breadth = SKETCH;
+	const card = missCard(ctx);
+	const row = bodyRows(causeTable(card)).find((tr) => tr.children[0].children[0].textContent === 'new');
+	assert.deepEqual(cellsOf(row).slice(5), ['40', '≈3.75×', '1.00×']);
+	assert.match(card.textContent, /URLs and req\/URL: 2026-09-28 \(UTC, to now\) · recurrence: 2 days · all bots/);
+	assert.match(row.children[6].attributes.title, /Reads low on Harper 5\.2\.x/);
+	// An older plugin answered crawl-breadth: no columns, and the reason.
+	ctx.data.breadth = { breadth: [{ day: '2026-09-28', total: 1, bots: [] }] };
+	const older = missCard(ctx);
+	assert.equal(bodyRows(causeTable(older))[0].children.length, 5);
+	assert.match(older.textContent, /need plugin v0\.95\.0 on the node that answered crawl-breadth/);
+});
+
+test('why requests missed: one click loads the breadth both panels read', async () => {
+	const ctx = await missCtx();
+	const queries = [];
+	const get = ctx.get;
+	ctx.get = async (route, query) => {
+		if (route === 'crawl-breadth') {
+			queries.push(query);
+			return { ok: true, body: SKETCH };
+		}
+		return get(route, query);
+	};
+	buttonSaying(missCard(ctx), 'Load URL breadth').fire('click');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(queries, [{ days: 7 }]);
+	assert.equal(ctx.data.breadth, SKETCH);
+	assert.equal(buttonSaying(missCard(ctx), 'Load URL breadth'), null, 'loaded: the button is gone');
+	assert.equal(buttonSaying(draw(ctx), 'Load 7-day breadth'), null, 'and the Crawl breadth panel is filled too');
+});
+
+test('why requests missed: causes far short of the origin misses name the likely mixed rollout', async () => {
+	const partial = {
+		...MISS_WINDOW,
+		series: MISS_WINDOW.series.filter((s) => s.metric !== 'bot_miss' || s.path === 'gated-route'),
+	};
+	assert.match(missCard(await missCtx(partial)).textContent, /Causes cover 30% of 4,000 origin misses/);
+	assert.doesNotMatch(missCard(await missCtx()).textContent, /Causes cover/);
+});
+
+test('miss rows fold route and bot per cause, and an unknown cause gets its own family', () => {
+	const rows = missRows([
+		combo('bot_miss', 'new', '/a', 'googlebot', 3),
+		combo('bot_miss', 'new', '/a', 'bingbot', 1),
+		combo('bot_miss', 'quantum-miss', '/b', 'googlebot', 2),
+	]);
+	assert.equal(rows[0].cause, 'new');
+	assert.equal(rows[0].routes.get('/a').count, 4);
+	assert.equal(rows[0].routes.get('/a').bots.get('bingbot'), 1);
+	assert.equal(rows[1].family, 'other');
+});

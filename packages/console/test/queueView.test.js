@@ -752,3 +752,130 @@ test('changed pages waiting: a mixed-version cluster withholds the sum and names
 	assert.ok(find(b, (n) => n.tagName === 'TD' && /predates v0\.94\.0/.test(n.attributes?.title ?? '')));
 	assert.match(rowOf(keeperTable(ctx), 'a.example.com').textContent, /700/);
 });
+
+// ---- plugin v0.95.0: changed pages by demand ------------------------------------------------------
+//
+// The change probe stamps a changed row with the page's demand (the tracker's estimate of the time
+// between bot visits), and with `queue.ready.changedDemand` the keeper counts that row's wait in visits:
+// the pages bots ask for most render first. queue-state splits the due changed rows by that estimate
+// (`now.changedByDemand`); the view shows the split and whether the ordering is actually in use.
+
+const { changedOrdering, demandPeriodText } = await import('../src/admin/views/queue.js');
+
+const H = 3_600_000;
+
+/** The 0.94.0 changed state plus plugin 0.95.0's split. */
+const withDemandState = (split) => {
+	const body = withChangedState(
+		split.reduce((acc, entry) => acc + entry.due, 0),
+		30 * 60_000
+	);
+	return { ...body, now: { ...body.now, changedByDemand: split } };
+};
+
+/** A config payload carrying the options the split is read against. */
+const demandConfig = ({ changedDemand = true, tracker = true } = {}) => ({
+	schema: {
+		children: {
+			queue: { children: { ready: { children: { changedDemand: { kind: 'option' } } } } },
+			demand: {
+				children: { enabled: { kind: 'option' }, sliceMs: { kind: 'option' }, slices: { kind: 'option' } },
+			},
+		},
+	},
+	layers: [
+		{ path: 'queue.ready.changedDemand', effective: changedDemand },
+		{ path: 'demand.enabled', effective: tracker },
+		{ path: 'demand.sliceMs', effective: 6 * H },
+		{ path: 'demand.slices', effective: 16 },
+	],
+});
+
+const SPLIT = () => [
+	{ periodMs: 6 * H, due: 300, oldestDueAt: Date.now() - 10 * 60_000 },
+	{ periodMs: 24 * H, due: 100, oldestDueAt: Date.now() - 3 * H },
+	{ periodMs: 96 * H, due: 50, oldestDueAt: Date.now() - H },
+	{ periodMs: null, due: 50, oldestDueAt: Date.now() - 20 * 60_000 },
+];
+
+async function demandCtx(state, config) {
+	const ctx = makeCtx(ANALYTICS, { queueState: state });
+	const get = ctx.get;
+	ctx.get = async (route, query) =>
+		route === 'config'
+			? config
+				? { ok: true, body: config }
+				: { ok: false, status: 404, body: {} }
+			: get(route, query);
+	await load(ctx);
+	return ctx;
+}
+const demandCard = (ctx) =>
+	find(
+		draw(ctx),
+		(n) => (n.attributes?.class ?? '').startsWith('card') && n.textContent.startsWith('Changed, waiting — by demand')
+	);
+const splitRows = (card) =>
+	find(card, (n) => n.tagName === 'TBODY').children.map((tr) => tr.children.map((td) => td.textContent));
+
+test('changed pages by demand: the split, most-asked-for first, and the ordering it is ranked by', async () => {
+	const ctx = await demandCtx(nodeState(withDemandState(SPLIT())), demandConfig());
+	const card = demandCard(ctx);
+	assert.ok(card, 'expected the by-demand card while changed pages wait');
+	assert.deepEqual(splitRows(card), [
+		['every 6h', '300', '60%', '10m'],
+		['every 24h', '100', '20%', '3h'],
+		// The tracker's whole window (16 × 6h): a page visited once in it and one never visited read the same.
+		['≥ 4d / not visited', '50', '10%', '1h'],
+		['unknown', '50', '10%', '20m'],
+	]);
+	assert.ok(find(card, (n) => n.attributes?.class === 'pill info' && n.textContent === 'ordered by demand'));
+	// A group whose oldest row has waited past the changed-wait watch is marked on its own cell.
+	assert.ok(find(card, (n) => n.tagName === 'TD' && n.textContent === '3h' && /v-warn/.test(n.attributes.class)));
+	// The tile carries the same split in its tooltip, with the ordering.
+	const title = tile(ctx, 'Changed, waiting').attributes.title;
+	assert.match(title, /By demand: every 6h 300 · every 24h 100 · ≥ 4d \/ not visited 50 · unknown 50\./);
+	assert.match(title, /Ranked by the bot visits/);
+});
+
+test('changed pages by demand: with changedDemand off, or the tracker off, the rows order by cadence and it says so', async () => {
+	const off = demandCard(await demandCtx(nodeState(withDemandState(SPLIT())), demandConfig({ changedDemand: false })));
+	assert.ok(find(off, (n) => n.attributes?.class === 'pill' && n.textContent === 'ordered by cadence'));
+	assert.match(off.textContent, /queue\.ready\.changedDemand is off: changed pages order by cadence\./);
+
+	const blind = demandCard(await demandCtx(nodeState(withDemandState(SPLIT())), demandConfig({ tracker: false })));
+	assert.match(blind.textContent, /ordered by cadence/);
+	assert.match(blind.textContent, /demand\.enabled is off: no page carries a demand estimate/);
+});
+
+test('changed pages by demand: without the config the split still shows, with no ordering claimed', async () => {
+	const card = demandCard(await demandCtx(nodeState(withDemandState(SPLIT())), null));
+	assert.ok(card);
+	assert.doesNotMatch(card.textContent, /ordered by/);
+	// No window to compare against, so the longest period is just a period.
+	assert.equal(splitRows(card)[2][0], 'every 4d');
+});
+
+test('changed pages by demand: hidden on an older plugin, on a mixed cluster, and with nothing waiting', async () => {
+	assert.equal(demandCard(await demandCtx(nodeState(withChangedState(400, 60_000)), demandConfig())), null);
+	const mixed = merged(answer('a', withDemandState(SPLIT())), answer('b', withChangedState(20, 60_000)));
+	assert.equal(demandCard(await demandCtx(mixed, demandConfig())), null);
+	assert.equal(demandCard(await demandCtx(nodeState(withDemandState([])), demandConfig())), null);
+	// Merged from nodes that all send it, the split is the cluster's.
+	const both = merged(answer('a', withDemandState(SPLIT())), answer('b', withDemandState(SPLIT())));
+	assert.equal(splitRows(demandCard(await demandCtx(both, demandConfig())))[0][1], '600');
+});
+
+test('demand periods read as intervals, the window as its bound, and no estimate as unknown', () => {
+	assert.equal(demandPeriodText(6 * H), 'every 6h');
+	assert.equal(demandPeriodText(19.2 * H), 'every 19h');
+	assert.equal(demandPeriodText(1.5 * H), 'every 1.5h');
+	assert.equal(demandPeriodText(30 * 60_000), 'every 30m');
+	assert.equal(demandPeriodText(48 * H, 96 * H), 'every 2d');
+	assert.equal(demandPeriodText(96 * H, 96 * H), '≥ 4d / not visited');
+	for (const unknown of [null, undefined, 0, -1, Number.NaN])
+		assert.equal(demandPeriodText(unknown, 96 * H), 'unknown');
+	// On a plugin before v0.95.0 there is no ordering to state.
+	assert.equal(changedOrdering({ schema: { children: {} }, layers: [] }), null);
+	assert.equal(changedOrdering(demandConfig()).windowMs, 96 * H);
+});

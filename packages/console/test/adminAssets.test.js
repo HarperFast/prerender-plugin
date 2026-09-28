@@ -217,6 +217,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 	const DYNAMIC_SERIES_SLOT = new Set([
 		'botRequest',
 		'botServe',
+		// `bot_miss`'s path slot is the miss CAUSE, a closed set (metrics.js MISS_CAUSES) — a dimension, and
+		// guarded by name in the bot_miss test below, so a new cause cannot ship without a label on Traffic.
+		'botMiss',
 		'routeServe',
 		'pageAge',
 		'routePageAge',
@@ -229,7 +232,10 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'sitemapRun',
 		'reconcile',
 		'queueHealth',
-		'demandLadder',
+		// `demand_${series}` (named `demandLadder` before plugin v0.95.0): the ladder's decision counters and
+		// the tracker's two sizing gauges. Guarded by name in the demand test below — the gauges are read by
+		// the Health view, and each ladder series is waived there with the reason.
+		'demand',
 		'invalidationError',
 		'invalidationReenqueue',
 		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe
@@ -319,11 +325,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
  * above says so and it has happened — which is why this checks the family the OTHER test is blind
  * to instead of replacing it. Between them, a new probe series has to be charted or waived.
  *
- * WHAT THIS STILL DOES NOT COVER: the remaining dynamic families (`demand_*`, `queue_health`'s
- * gauges, `invalidation_*`). Those are legitimately unread from analytics — the queue gauges are
- * read from the overview endpoint instead, and the demand series have no panel — so guarding them
- * means a waiver list stating a decision per series, which belongs with whoever makes those
- * decisions rather than in a catch-up change. `sitemap_*` has its own test below.
+ * The other families on `DYNAMIC_SERIES_SLOT` that name a SERIES at the call site — `sitemap_*`,
+ * `queue_health` and `demand_*` — each have their own test below, and so does `bot_miss`'s cause, a
+ * dimension whose values the Traffic view labels.
  */
 test('every probe series the catalog declares is read by the console, or waived with a reason', async () => {
 	const { METRICS } = await import('../../plugin/src/metrics.js');
@@ -526,4 +530,100 @@ test('every queue_health series is read or waived, and the console reads none th
 		assert.equal(declared.includes(name), false, `${name} is back in the catalog — revisit this list`);
 		assert.equal(client.includes(`'${name}'`), false, `a client module still reads the removed series ${name}`);
 	}
+});
+
+/**
+ * The `demand_*` family, both ways. `metrics.demand` names its series at the call site
+ * (`demand_${series}`), so the literal scan above cannot see any of them. Plugin v0.95.0 split the
+ * demand TRACKER out of the cadence ladder and added `demand_false_positive` — the number
+ * `demand.maxFalsePositive` is held against, and the only signal that changed-page order has quietly
+ * stopped using demand. The Health view reads it and `demand_fill`; the ladder's decision counters have
+ * no panel, and each is waived below with the reason. And no client module may name a tracker option on
+ * its pre-0.95 path: those moved to `demand.*` without an alias, so a read there reads nothing.
+ */
+test('every demand series is read or waived, the console reads none the plugin does not declare, and no moved key', async () => {
+	const { METRICS } = await import('../../plugin/src/metrics.js');
+	const declared = (METRICS.prerender_ops?.dimensions?.path?.values ?? []).filter(
+		(value) => typeof value === 'string' && value.startsWith('demand_')
+	);
+	assert.ok(declared.length > 5, 'expected the demand series to be enumerated in the catalog');
+
+	const LADDER =
+		'the cadence ladder’s decision counters (render.demand) — no panel yet: the ladder logs its per-level ' +
+		'histogram, and Corpus spares promoted targets by their stored demandInterval';
+	const NOT_CHARTED = new Map(
+		[
+			'demand_promoted',
+			'demand_demoted',
+			'demand_held',
+			'demand_skipped_cold',
+			'demand_single_rung',
+			'demand_promoted_fast',
+			'demand_fast',
+			'demand_graded',
+		].map((name) => [name, LADDER])
+	);
+
+	const client = [...clientSources.values()].join('\n');
+	for (const name of declared) {
+		if (NOT_CHARTED.has(name)) continue;
+		assert.ok(
+			client.includes(`'${name}'`),
+			`the plugin declares prerender_ops.${name} and no console view reads it — chart it, or add it to this ` +
+				"test's NOT_CHARTED with the reason"
+		);
+	}
+	for (const name of NOT_CHARTED.keys()) {
+		assert.ok(declared.includes(name), `NOT_CHARTED waives prerender_ops.${name}, which the plugin no longer declares`);
+	}
+	for (const [id, text] of clientSources) {
+		for (const [, name] of text.matchAll(/'(demand_[a-z_]+)'/g)) {
+			assert.ok(declared.includes(name), `${id} reads prerender_ops.${name}, which the plugin does not declare`);
+		}
+		assert.doesNotMatch(
+			text,
+			/render\.demand\.(bots|sliceMs|slices|bitsPerSlice|hashes|flushInterval|mergeInterval)\b/,
+			`${id} names a tracker option on its pre-0.95 path — it is demand.* now`
+		);
+	}
+});
+
+/**
+ * `bot_miss`'s causes (plugin v0.95.0), both ways. The emitter is on `DYNAMIC_SERIES_SLOT` because its
+ * path slot is the cause — a dimension — so nothing above would notice a new one. The Traffic view's miss
+ * panel labels every cause with its FAMILY, and the family is the verdict: a cause that arrived unlabelled
+ * would fall into "other" and stop saying whether it is render capacity or a rule. So every cause the
+ * catalog declares must be in `MISS_CAUSES`, and nothing may be there that the plugin no longer sends.
+ */
+test('every bot_miss cause the plugin declares is labelled on Traffic, and the console labels none it does not', async () => {
+	const { METRICS } = await import('../../plugin/src/metrics.js');
+	const declared = METRICS.bot_miss?.dimensions?.path?.values ?? [];
+	assert.ok(declared.length > 5, 'expected the bot_miss causes to be enumerated in the catalog');
+
+	const { installDom } = await import('./domShim.js');
+	installDom();
+	const { MISS_CAUSES, MISS_FAMILIES } = await import('../src/admin/views/traffic.js');
+	const families = new Set(MISS_FAMILIES.map((family) => family.key));
+
+	for (const cause of declared) {
+		assert.ok(
+			Object.hasOwn(MISS_CAUSES, cause),
+			`the plugin declares bot_miss cause "${cause}" and the Traffic miss panel has no label for it — add it ` +
+				'to MISS_CAUSES in views/traffic.js with its family'
+		);
+	}
+	for (const [cause, [family, means]] of Object.entries(MISS_CAUSES)) {
+		assert.ok(declared.includes(cause), `MISS_CAUSES labels "${cause}", which the plugin no longer declares`);
+		assert.ok(families.has(family), `"${cause}" is filed under "${family}", which MISS_FAMILIES does not define`);
+		assert.ok(typeof means === 'string' && means.length > 10, `"${cause}" says nothing about what it means`);
+	}
+	// The one family that is render capacity is exactly the rotation's own unrendered pages — the plugin
+	// README's grouping ("Why a request missed"), and the one the panel's verdict text rests on.
+	assert.deepEqual(
+		Object.entries(MISS_CAUSES)
+			.filter(([, [family]]) => family === 'waiting')
+			.map(([cause]) => cause)
+			.sort(),
+		['device', 'new', 'unrendered']
+	);
 });

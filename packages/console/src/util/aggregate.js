@@ -1557,6 +1557,29 @@ export function queueStateRow(result) {
 	};
 }
 
+/**
+ * Every node's `now.changedByDemand` (plugin v0.95.0) as one list: due changed rows by the demand period
+ * they carry — `periodMs` between bot visits, `null` when the tracker could not say. Periods are whole-slot
+ * fractions of the tracker's window, so the same period on two nodes is the same value and merges exactly:
+ * `due` sums, `oldestDueAt` is the earliest. Ordered as the plugin orders it, most-asked-for first and
+ * unknown last.
+ */
+function mergeChangedByDemand(rows) {
+	const byPeriod = new Map();
+	for (const row of rows) {
+		for (const entry of row.now.changedByDemand) {
+			const period = finite(entry?.periodMs);
+			const periodMs = Number.isFinite(period) && period > 0 ? period : null;
+			const acc = byPeriod.get(periodMs) ?? { periodMs, due: 0, oldestDueAt: null };
+			acc.due += finite(entry?.due) || 0;
+			const at = finite(entry?.oldestDueAt);
+			if (Number.isFinite(at) && (acc.oldestDueAt === null || at < acc.oldestDueAt)) acc.oldestDueAt = at;
+			byPeriod.set(periodMs, acc);
+		}
+	}
+	return [...byPeriod.values()].sort((a, b) => (a.periodMs ?? Infinity) - (b.periodMs ?? Infinity));
+}
+
 /** How many classes the merged list keeps: the panel shows the worst few, and each node sends ≤200. */
 const MAX_CLASSES = 25;
 
@@ -1597,7 +1620,9 @@ export function mergeQueueState(results) {
 		// Classes (route × cadence × sitemap flag × changed flag) add, keeping the worst head and naming its
 		// node the way every other per-node field here does: by the fan-out's host. The changed flag (plugin
 		// v0.94.0: rows the change probe filed, ranked ahead) keeps those rows' class apart from the routine
-		// one it would otherwise fold into — a 0.93 node sends no flag, and its classes read as routine.
+		// one it would otherwise fold into — a 0.93 node sends no flag, and its classes read as routine. A 0.95
+		// node also splits a changed class by demand period; those fold together here, because this list ranks
+		// how late classes are and the demand split has its own list (`now.changedByDemand`).
 		// (The per-route list is not merged — nothing reads it, and its bins would need the same edge check.)
 		const classes = new Map();
 		for (const result of results) {
@@ -1656,6 +1681,11 @@ export function mergeQueueState(results) {
 				// value is left OUT rather than set to null — exactly as a node that does not report it sends it.
 				...(live.every((row) => row.now && 'oldestChangedAt' in row.now)
 					? { oldestChangedAt: minOf(live, (row) => row.now.oldestChangedAt) }
+					: {}),
+				// The same rows by the demand estimate they carry (plugin v0.95.0): merged by period, and left
+				// out unless every node sends the list — the same rule as the two fields above.
+				...(live.every((row) => Array.isArray(row.now?.changedByDemand))
+					? { changedByDemand: mergeChangedByDemand(live) }
 					: {}),
 				inFlight: sum((row) => row.now?.inFlight),
 				// Each node's own `due − inFlight` (clamped at zero there), summed: a node with more leases

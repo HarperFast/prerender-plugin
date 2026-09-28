@@ -88,6 +88,9 @@ const ELSEWHERE = {
 	page: { id: 'inspect', label: 'Inspect' },
 	invalidation: { id: 'invalidations', label: 'Invalidations' },
 	render: { id: 'queue', label: 'Queue' },
+	// The demand tracker (plugin v0.95.0, moved out of render.demand): read by the cadence ladder and by
+	// changed-page order, both of which live on Queue.
+	demand: { id: 'queue', label: 'Queue' },
 	scan: { id: 'queue', label: 'Queue' },
 	queue: { id: 'queue', label: 'Queue' },
 	sitemap: { id: 'sitemaps', label: 'Sitemaps' },
@@ -110,6 +113,7 @@ const TITLES = {
 	page: 'Cached-page lifetimes',
 	invalidation: 'Invalidation',
 	render: 'Render scheduling',
+	demand: 'Demand tracker',
 	scan: 'Scan budgets',
 	sitemap: 'Sitemap ingestion',
 	queue: 'Render queue',

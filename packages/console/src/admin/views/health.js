@@ -49,7 +49,7 @@ import {
 	weightedBuckets,
 	windowEmpty,
 } from '../charts.js';
-import { configState, loadConfig } from './_configEdit.js';
+import { configState, loadConfig, optionIndex } from './_configEdit.js';
 import { cadenceFor, cadenceIndex, coverageSplit, originCostByReason } from './traffic.js';
 import {
 	backlogReading,
@@ -74,6 +74,9 @@ export const meta = { id: 'health', label: 'Health', icon: ICONS.overview, range
 // keeper's series come from QUEUE_HEALTH in queue.js, through `keeperStats`.
 const OUTCOME = 'outcome';
 const ORIGIN = 'origin';
+// The demand tracker's sizing gauges (plugin v0.95.0, prerender_ops), emitted at every re-union of the ring.
+const DEMAND_FALSE_POSITIVE = 'demand_false_positive';
+const DEMAND_FILL = 'demand_fill';
 
 export async function load(ctx) {
 	const [overviewRes, analyticsRes, , invalidationsRes, stateRes] = await Promise.all([
@@ -110,7 +113,7 @@ export function render(ctx) {
 	const groups = [
 		{ title: 'Serving', checks: servingChecks(analytics, config) },
 		{ title: 'Rendering', checks: renderingChecks(analytics, overview, qs) },
-		{ title: 'Queue', checks: queueChecks(analytics, overview, qs) },
+		{ title: 'Queue', checks: queueChecks(analytics, overview, qs, config) },
 		{ title: 'Cluster', checks: clusterChecks(overview, config, nodes, ctx.data.analytics) },
 		{ title: 'System', checks: systemChecks(nodes), empty: systemGap(nodes) },
 		{ title: 'Maintenance', checks: maintenanceChecks(overview, ctx.data.invalidations) },
@@ -341,7 +344,7 @@ function renderingChecks(data, overview, qs) {
  * `backlogReading`). The keeper tile takes the WORST node: one node that is not serving is a quarter of
  * the corpus not rendering, and a count of healthy nodes would bury it.
  */
-function queueChecks(data, overview, qs) {
+function queueChecks(data, overview, qs, config) {
 	const out = [];
 	const reading = backlogReading(overview, qs);
 
@@ -410,6 +413,9 @@ function queueChecks(data, overview, qs) {
 			)
 		);
 	}
+
+	const demand = demandTrackerCheck(data, config);
+	if (demand) out.push(demand);
 
 	const k = keeperStats(data);
 	if (qs) {
@@ -513,6 +519,101 @@ function queueChecks(data, overview, qs) {
 		);
 	}
 	return out;
+}
+
+/**
+ * The worst per-bucket reading of a gauge, over every bucket in the range: its p95 there, which for a
+ * gauge emitted once per worker per re-union is close to that minute's worst worker. A PEAK, never a sum
+ * and never a mean over the range — a ring that saturated for an hour is saturated.
+ *
+ * Under cluster scope the merge averages each bucket across nodes (count-weighted); for these gauges that
+ * costs little, because every node's workers re-union EVERY node's rows (util/visitFilter.js
+ * `refreshMerged`), so the nodes measure the same ring and differ only by how recently each re-unioned.
+ */
+function gaugePeak(combos) {
+	let peak = null;
+	for (const combo of combos) {
+		const values = Array.isArray(combo.p95s) ? combo.p95s : [combo.p95];
+		for (const v of values) if (Number.isFinite(v) && (peak === null || v > peak)) peak = v;
+	}
+	return peak;
+}
+
+/** `bitsPerSlice` as the ring uses it: rounded UP to a power of two, at least 1024 (visitFilter.js `bitCount`). */
+const ringBits = (raw) => {
+	let bits = 1024;
+	while (bits < raw) bits *= 2;
+	return bits;
+};
+
+/**
+ * The demand tracker (plugin v0.95.0): is its ring answering, or saturated?
+ *
+ * A ring past `demand.maxFalsePositive` does not fail loudly. The tracker reports demand as UNKNOWN to
+ * changed-page order (`queue.ready.changedDemand`), which falls back to cadence, and the cadence ladder —
+ * which does not consult the limit — keeps acting on a ring that answers "visited" for almost everything.
+ * `demand_false_positive` is the worst FULL slot's `fill^k`, so it has no sawtooth and its peak is the
+ * reading; `demand_fill` (the newest slot, a sawtooth) rides along at its peak.
+ *
+ * Off → not applicable. Hidden on a plugin without the tracker (no `demand.enabled` option), and when the
+ * config did not load, rather than a tile of zeros.
+ */
+function demandTrackerCheck(data, config) {
+	const options = optionIndex(config);
+	const enabled = options.get('demand.enabled');
+	if (!enabled) return null;
+	if (enabled.effective !== true) {
+		return check('demand', 'Demand tracker', 'off', 'na', {
+			sub: 'demand.enabled is false',
+			go: 'queue',
+			detail: 'Not applicable: nothing reads demand, so changed pages order by cadence.',
+		});
+	}
+
+	const limit = Number(options.get('demand.maxFalsePositive')?.effective);
+	const series = data ? pick(data, 'prerender_ops', (s) => s.path === DEMAND_FALSE_POSITIVE) : [];
+	const peak = gaugePeak(series);
+	const fill = data ? gaugePeak(pick(data, 'prerender_ops', (s) => s.path === DEMAND_FILL)) : null;
+	if (peak === null) {
+		return check('demand', 'Demand tracker', '—', 'na', {
+			sub: data ? 'no re-union in range' : 'no analytics',
+			go: 'queue',
+			detail: data
+				? 'The ring is re-unioned when something reads demand (the cadence ladder, a probe pass); nothing did in this range.'
+				: null,
+		});
+	}
+
+	const saturated = Number.isFinite(limit) && peak > limit;
+	// The sizing the README gives, from the same number: the worst full slot's fill is `fp^(1/k)`, and a slot
+	// of m bits at fill f holds n ≈ −(m/k)·ln(1 − f) distinct URLs. The bits that hold n at the limit follow.
+	const k = Number(options.get('demand.hashes')?.effective);
+	const bits = Number(options.get('demand.bitsPerSlice')?.effective);
+	const m = Number.isFinite(bits) && bits > 0 ? ringBits(bits) : null;
+	const worstFill = k > 0 ? peak ** (1 / k) : null;
+	const urls = m !== null && worstFill !== null && worstFill < 1 ? -(m / k) * Math.log(1 - worstFill) : null;
+	const needed =
+		Number.isFinite(urls) && Number.isFinite(limit) && limit > 0 && limit < 1
+			? ringBits((-k * urls) / Math.log(1 - limit ** (1 / k)))
+			: null;
+	const ladder = options.get('render.demand.enabled')?.effective === true;
+
+	return check('demand', 'Demand tracker', pctFine(peak), saturated ? 'warn' : 'ok', {
+		// The value is the range's PEAK false-positive rate; the fill beside it is the newest slot's, also at its peak.
+		sub: `false positives · limit ${Number.isFinite(limit) ? pctFine(limit) : '—'}${
+			Number.isFinite(fill) ? ` · fill ${pct(fill, 1)}` : ''
+		}`,
+		spark: weightedBuckets(series, 'p95s', data.bucketCount),
+		go: 'queue',
+		detail: saturated
+			? 'Demand is unknown to changed-page order while false positives are past demand.maxFalsePositive — changed ' +
+				'pages order by cadence. Size demand.bitsPerSlice from the measured fill, n ≈ −(m/k)·ln(1 − fill)' +
+				(Number.isFinite(urls)
+					? `: about ${fmtCount(urls)} URLs per slice, which needs bitsPerSlice ≈ ${num(needed)} at this limit.`
+					: '.') +
+				(ladder ? ' The cadence ladder does not consult the limit and is promoting on this ring.' : '')
+			: 'The range’s peak false-positive rate (the worst full slot’s fill^k) against demand.maxFalsePositive.',
+	});
 }
 
 // ---- cluster ---------------------------------------------------------------------------

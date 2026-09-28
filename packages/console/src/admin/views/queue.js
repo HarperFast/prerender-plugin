@@ -128,13 +128,15 @@ export function render(ctx) {
 	const analytics = ctx.data.analytics;
 	const usable = analytics && analytics.available !== false && !windowEmpty(analytics);
 	const qs = ctx.data.queueState;
+	const order = changedOrdering(configState(ctx).payload);
 	// Without the overview there are no controls, node table or snapshot — but the keepers answered on
 	// their own route, and whether they are serving is exactly what an operator opens this page for.
 	if (!data) {
 		return [
 			el('div', { cls: 'note bad', text: ctx.data.error ?? 'Could not load the cluster overview.' }),
 			keeperAlarm(qs),
-			kpis(null, qs, usable ? analytics : null),
+			kpis(null, qs, usable ? analytics : null, order),
+			changedDemandCard(qs, order),
 			keeperCard(ctx, qs, usable ? analytics : null, null),
 			qs?.cluster && el('div', { cls: 'cols' }, [latenessCard(qs), flowCard(qs)]),
 		];
@@ -145,7 +147,8 @@ export function render(ctx) {
 		controlBar(ctx, data),
 		keeperAlarm(qs),
 		usable && legacyRenderers(analytics),
-		kpis(data, qs, usable ? analytics : null),
+		kpis(data, qs, usable ? analytics : null, order),
+		changedDemandCard(qs, order),
 		keeperCard(ctx, qs, usable ? analytics : null, data),
 		qs?.cluster && el('div', { cls: 'cols' }, [latenessCard(qs), flowCard(qs)]),
 		nodeTable(ctx, data, analytics),
@@ -530,6 +533,66 @@ export function changedSub(r) {
 	return parts.length ? parts.join(' · ') : 'served from origin';
 }
 
+/**
+ * The due changed rows by the demand estimate each carries (plugin v0.95.0 `now.changedByDemand`):
+ * `[{ periodMs, due, oldestDueAt }]`, most-asked-for first, `periodMs: null` (unknown) last. Null — hide
+ * it, never an empty split — when the cluster total is withheld or any live node's plugin does not send it
+ * (the merge leaves the field out then).
+ */
+export const changedByDemandOf = (queueState) => {
+	const list = queueState?.cluster?.now?.changedByDemand;
+	return Array.isArray(list) ? list : null;
+};
+
+/**
+ * How the keeper orders changed pages, from the config payload: `{ byDemand, why, windowMs }`, or null on a
+ * plugin before v0.95.0 (no `queue.ready.changedDemand`). By demand needs BOTH the option and the tracker
+ * (`demand.enabled`): with the tracker off no row carries an estimate, and every one orders by cadence.
+ * `windowMs` is the tracker's ring (`demand.slices × demand.sliceMs`), the longest period it can state.
+ */
+export function changedOrdering(configPayload) {
+	const options = optionIndex(configPayload);
+	const option = options.get('queue.ready.changedDemand');
+	if (!option) return null;
+	const tracker = options.get('demand.enabled')?.effective === true;
+	const sliceMs = Number(options.get('demand.sliceMs')?.effective);
+	const slices = Number(options.get('demand.slices')?.effective);
+	const on = option.effective === true;
+	return {
+		byDemand: on && tracker,
+		why: !on
+			? 'queue.ready.changedDemand is off: changed pages order by cadence.'
+			: !tracker
+				? 'demand.enabled is off: no page carries a demand estimate, so changed pages order by cadence.'
+				: 'Ranked by the bot visits each page’s wait has sent to the origin; unknown demand orders by cadence.',
+		windowMs: sliceMs > 0 && slices > 0 ? sliceMs * slices : null,
+	};
+}
+
+const HOUR_MS = 3_600_000;
+
+/** A span for a demand period: minutes under an hour, hours under two days, then days. */
+const spanText = (ms) => {
+	if (ms < HOUR_MS) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+	if (ms < 48 * HOUR_MS) {
+		const hours = ms / HOUR_MS;
+		return `${hours < 10 ? Math.round(hours * 10) / 10 : Math.round(hours)}h`;
+	}
+	return `${Math.round((ms / (24 * HOUR_MS)) * 10) / 10}d`;
+};
+
+/**
+ * A demand period as read: "every 6h", "every 24h", "unknown" (the tracker off, still loading, or
+ * saturated when the change was acted on). At the tracker's whole window it is "≥ 4d / not visited": a
+ * URL visited once in the window and one never visited both read as the window, the longest period the
+ * ring can state.
+ */
+export function demandPeriodText(periodMs, windowMs = null) {
+	if (!Number.isFinite(periodMs) || periodMs <= 0) return 'unknown';
+	if (Number.isFinite(windowMs) && windowMs > 0 && periodMs >= windowMs) return `≥ ${spanText(windowMs)} / not visited`;
+	return `every ${spanText(periodMs)}`;
+}
+
 /** The fullest node's lease slots in use, `{ share, node }`, or null. */
 export function slotPressure(overview) {
 	const leases = overview?.leases;
@@ -687,7 +750,7 @@ function keeperAlarm(qs) {
 
 // ---- KPIs ------------------------------------------------------------------------
 
-function kpis(data, qs, analytics) {
+function kpis(data, qs, analytics, order = null) {
 	const reading = backlogReading(data, qs);
 	// Over the window the scan COVERED: a truncated scan holds fewer hours than were asked for.
 	const rendersPerHour = analytics
@@ -747,7 +810,8 @@ function kpis(data, qs, analytics) {
 						'Inside Due now: pages the change probe found changed and hard-expired, ranked ' +
 						'queue.ready.changedHeadStart cadences ahead of routine rows. Bots are served the origin until each ' +
 						're-renders. "Oldest" is how long the longest-waiting one has been due; "to re-render" is this count ÷ ' +
-						'the render rate over the selected range. Either past 2h is a watch, past 8h bad.',
+						'the render rate over the selected range. Either past 2h is a watch, past 8h bad.' +
+						changedDemandTitle(changedByDemandOf(qs), order),
 				}
 			),
 		stat(
@@ -857,6 +921,68 @@ const coveredHours = (data) => {
 	const to = data.coveredToMs ?? data.endMs;
 	return Number.isFinite(from) && Number.isFinite(to) && to > from ? (to - from) / 3_600_000 : null;
 };
+
+// ---- changed pages, by demand -------------------------------------------------------
+//
+// Plugin v0.95.0 stamps a changed row with the page's demand (`demandPeriod`, the tracker's estimate of
+// the time between bot visits) when the change is acted on, and with `queue.ready.changedDemand` the keeper
+// counts that row's wait in visits instead of cadences: the pages bots ask for most render first. The split
+// says which pages are waiting, and the ordering says whether it is being used.
+
+/** The split and the ordering, as one sentence for the Changed, waiting tile's tooltip. */
+const changedDemandTitle = (split, order) => {
+	if (!split || !split.length) return '';
+	const parts = split.map((entry) => `${demandPeriodText(entry.periodMs, order?.windowMs)} ${num(entry.due)}`);
+	return ` By demand: ${parts.join(' · ')}.${order ? ` ${order.why}` : ''}`;
+};
+
+/**
+ * The due changed rows by demand, while any are waiting. Hidden when the split is not reported (a plugin
+ * before v0.95.0 on any live node, or the cluster total withheld) and when nothing changed is due — the
+ * tile above already says "none waiting".
+ */
+function changedDemandCard(qs, order) {
+	const split = changedByDemandOf(qs);
+	if (!split || !split.some((entry) => entry.due > 0)) return null;
+	const total = split.reduce((acc, entry) => acc + (entry.due ?? 0), 0);
+	const now = Date.now();
+	const rows = split.map((entry) => {
+		const waitMs = Number.isFinite(entry.oldestDueAt) ? Math.max(0, now - entry.oldestDueAt) : null;
+		return el('tr', null, [
+			el('td', { cls: 'mono', text: demandPeriodText(entry.periodMs, order?.windowMs) }),
+			el('td', { cls: 'right mono', text: num(entry.due) }),
+			el('td', { cls: 'right mono', text: pct(entry.due, total) }),
+			el('td', {
+				cls: `right mono${waitMs !== null && waitMs >= LIMITS.changedWaitMs[0] ? ' v-warn' : ''}`,
+				text: waitMs === null ? '—' : duration(waitMs),
+			}),
+		]);
+	});
+	return card('Changed, waiting — by demand', {
+		head: [
+			spacer(),
+			// Neutral, not a warning, when off: ordering by cadence is a choice the deployment may have made.
+			order && pill(order.byDemand ? 'ordered by demand' : 'ordered by cadence', order.byDemand ? 'info' : ''),
+		],
+		help: [
+			'The changed pages waiting (the tile above), split by how often bots ask for each: the demand tracker’s ',
+			'estimate of the time between visits, stamped on the row when the probe acted on the change. Every visit ',
+			'while a changed page waits is served from the origin, so with queue.ready.changedDemand on the keeper counts ',
+			'the wait in visits and the most-asked-for pages render first. "unknown" rows carry no estimate (the tracker ',
+			'was off, still loading, or saturated when the change was acted on) and order by cadence. The longest period ',
+			'the tracker can state is its window (demand.slices × demand.sliceMs): a page visited once in it and one never ',
+			'visited both read "≥ window". "oldest wait" is how long that group’s longest-waiting row has been due.',
+		],
+		cls: 'flush-table',
+		body: [
+			order && !order.byDemand && el('div', { cls: 'hint', text: order.why }),
+			table(
+				['demand', { text: 'due', right: true }, { text: 'share', right: true }, { text: 'oldest wait', right: true }],
+				rows
+			),
+		],
+	});
+}
 
 // ---- the queue keeper ---------------------------------------------------------------
 
@@ -1501,7 +1627,8 @@ function settings(ctx) {
 			prefix: 'queue',
 			description:
 				'How work is handed to the render fleet: lease length, claim batch size, the ready set that decides the ' +
-				'ORDER (sitemapBoost, and changedHeadStart for pages the change probe found changed), and the queue ' +
+				'ORDER (sitemapBoost, changedHeadStart for pages the change probe found changed, and changedDemand, which ' +
+				'ranks those by how often bots ask for them), and the queue ' +
 				'keeper that publishes it (publish, verification and state intervals). None of it ' +
 				'changes what is in the corpus, only how fast and in what order it is worked through. ' +
 				'queue.ready.capacity and queue.maxLeases are restart-scoped.',
@@ -1511,6 +1638,15 @@ function settings(ctx) {
 			prefix: 'render',
 			description:
 				'What arrives in the queue at all: the render cadence, failure retry and suppression, and the repair sweep.',
+		}),
+		settingsCard(ctx, {
+			title: 'Demand tracker',
+			prefix: 'demand',
+			description:
+				'Which URLs bots ask for, and how often: a replicated ring of visit slices that measures and never acts. ' +
+				'Two consumers read it — the cadence ladder (render.demand) and changed-page order ' +
+				'(queue.ready.changedDemand) — and neither can act while it is off. Size bitsPerSlice from the measured ' +
+				'fill (Health’s demand check); a ring past maxFalsePositive reads as unknown to changed-page order.',
 		}),
 		settingsCard(ctx, {
 			title: 'Scan budgets',
