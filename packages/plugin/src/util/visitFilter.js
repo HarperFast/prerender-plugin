@@ -53,7 +53,7 @@
 
 import { setImmediate } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
-import { getMutex, getSab } from './coordination.js';
+import { getMutex, getSab, releaseSabs } from './coordination.js';
 import { fnv1a32 } from './hash.js';
 import { metrics } from '../metrics.js';
 
@@ -153,6 +153,14 @@ function rollover(now) {
 	// Aged-out slots can no longer be answered by any probe, so an unwritten one is dead debt;
 	// dropping it keeps the set bounded by the ring rather than by uptime.
 	for (const s of pendingWrite.keys()) if (s <= oldest) pendingWrite.delete(s);
+	// And its shared buffers: nothing will merge into or store an aged-out slot again, so stop holding
+	// them (coordination.js holds every buffer it hands out, which is what keeps a live slot's bits
+	// from being garbage-collected between a merge and its store).
+	releaseSabs((key) => {
+		if (!key.startsWith('visitFilter/bits/') && !key.startsWith('visitFilter/gen/')) return false;
+		const slotOfKey = Number(key.slice(key.lastIndexOf('/') + 1));
+		return Number.isFinite(slotOfKey) && slotOfKey <= oldest;
+	});
 	if (server.workerIndex === 0) {
 		setImmediate().then(() => sweepExpired(oldest).catch((e) => logger.error(e)));
 	}
@@ -241,6 +249,9 @@ let historyStartMs = 0;
 
 onConfigApplied(() => {
 	if (shapeOf() !== armedShape) {
+		// The old shape's buffers are never read again (every key carries the shape).
+		const oldShape = armedShape;
+		releaseSabs((key) => key.startsWith('visitFilter/') && key.includes(`/${oldShape}`));
 		armedShape = shapeOf();
 		// Drop BOTH sides of the in-memory state: old-shape write slices must not flush under
 		// the new numbering, and the union must not keep answering from old-shape rows. Then

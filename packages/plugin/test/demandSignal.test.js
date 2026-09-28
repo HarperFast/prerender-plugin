@@ -28,6 +28,7 @@ import assert from 'node:assert/strict';
 const rows = new Map();
 const sabs = new Map();
 
+let resetHeldSabs;
 let applyOptions, recordDemand;
 let flushSlices, refreshMerged, visitedWithin, resetVisitFilter;
 
@@ -86,6 +87,7 @@ before(async () => {
 	};
 
 	({ applyOptions } = await import('../src/config.js'));
+	({ resetHeldSabs } = await import('../src/util/coordination.js'));
 	({ recordDemand } = await import('../src/http_handlers/bot_request.js'));
 	({ flushSlices, refreshMerged, visitedWithin, resetVisitFilter } = await import('../src/util/visitFilter.js'));
 });
@@ -102,6 +104,7 @@ const setDemand = (overrides = {}) =>
 beforeEach(() => {
 	rows.clear();
 	sabs.clear();
+	resetHeldSabs();
 	resetVisitFilter();
 	setDemand();
 });
@@ -133,6 +136,7 @@ test('every status that FOUND a page row is demand, even when the body came from
 			resetVisitFilter();
 			rows.clear();
 			sabs.clear();
+			resetHeldSabs();
 			assert.equal(await wasRecorded({ cacheStatus, resource: { statusCode: 200 } }), true);
 		});
 	}

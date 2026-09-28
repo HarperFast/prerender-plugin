@@ -36,6 +36,7 @@ const sabs = new Map();
 let recordVisit, flushSlices, refreshMerged, visitedWithin, visitedInEachWindow;
 let sweepExpired, resetVisitFilter, slotOf, mergedWarm, historyFromMs, visitedSlots, unionHealth, visitProbe;
 let demandOf, warmDemand;
+let resetHeldSabs;
 let applyOptions;
 
 const H = 60 * 60 * 1000;
@@ -103,6 +104,7 @@ before(async () => {
 	};
 
 	({ applyOptions } = await import('../src/config.js'));
+	({ resetHeldSabs } = await import('../src/util/coordination.js'));
 	({
 		recordVisit,
 		flushSlices,
@@ -140,6 +142,7 @@ beforeEach(() => {
 	rows.clear();
 	locks = [];
 	sabs.clear();
+	resetHeldSabs();
 	// Config FIRST, then the reset: a test that reshaped the ring leaves the next one's setDemand to
 	// reshape it back, and a reshape stamps a history start that would clip every level count here.
 	setDemand();
@@ -400,6 +403,30 @@ test('a merge the winner never stored is stored by the worker that made it, once
 	);
 });
 
+test('a shared buffer the store would free between uses is held, so a merge reaches its store', async () => {
+	// Harper 5.2's RocksDB store frees a `getUserSharedBuffer` buffer once no ArrayBuffer references
+	// it, and the next call for the key returns a NEW zeroed one. A caller that re-fetched by name on
+	// every use lost what it had merged whenever a GC ran in between — measured in Docker: six merged
+	// registers read back empty 11 ms later. Model the worst case, a GC between every call.
+	const store = globalThis.databases.coordination.SharedBuffer.primaryStore;
+	const original = store.getUserSharedBuffer;
+	store.getUserSharedBuffer = (_key, fresh) => fresh; // forgets everything it hands out
+	try {
+		resetHeldSabs();
+		const now = Date.now();
+		recordVisit('https://example.com/product/prd-held');
+		await flushSlices({ write: true, nowMs: now });
+		await refreshMerged(now);
+		assert.equal(
+			visitedWithin('https://example.com/product/prd-held', H, now),
+			true,
+			'the merge survived to the store'
+		);
+	} finally {
+		store.getUserSharedBuffer = original;
+	}
+});
+
 test('a debt another worker already paid is forgotten, with no write', async () => {
 	const now = Date.now();
 	recordVisit('https://example.com/product/prd-paid');
@@ -422,6 +449,7 @@ test('a restart with empty shared buffers cannot erase history already in the ro
 	// path must still read-merge, or the first post-restart flush overwrites the slot's history
 	// with only what this process has seen since boot.
 	sabs.clear();
+	resetHeldSabs();
 	resetVisitFilter();
 	setDemand();
 

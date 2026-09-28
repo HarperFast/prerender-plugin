@@ -27,6 +27,7 @@ const sabs = new Map();
 let recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET;
 let recordMissBreadth, mergeBreadthRow, finalizeMissUnion, MISS_SERIES_PREFIX;
 let estimateSketch, createSketch, addToSketch;
+let resetHeldSabs;
 let applyOptions;
 
 before(async () => {
@@ -75,6 +76,7 @@ before(async () => {
 		},
 	};
 	({ applyOptions } = await import('../src/config.js'));
+	({ resetHeldSabs } = await import('../src/util/coordination.js'));
 	({ recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET } = await import(
 		'../src/util/crawlStats.js'
 	));
@@ -90,6 +92,7 @@ beforeEach(() => {
 	rows.clear();
 	locks = [];
 	sabs.clear();
+	resetHeldSabs();
 	mock.timers.reset();
 });
 
@@ -299,6 +302,7 @@ test('a restart with empty shared sketches cannot erase the registers already in
 	// must still read-merge, or the first post-restart flush replaces a full day of registers
 	// with only what this process has seen since boot.
 	sabs.clear();
+	resetHeldSabs();
 	resetCrawlStats();
 
 	recordCrawl('Googlebot', 'https://site.example.com/p/new');
@@ -323,6 +327,7 @@ test('precision sets the row size, and a mismatched stored row is ignored rather
 	// element-wise would be meaningless, so it must be ignored — the new-shape sketch wins and
 	// the day self-heals at rollover.
 	sabs.clear();
+	resetHeldSabs();
 	resetCrawlStats();
 	applyOptions({ crawlStats: { precision: 12 } });
 	recordCrawl('Googlebot', 'https://site.example.com/p/2');
