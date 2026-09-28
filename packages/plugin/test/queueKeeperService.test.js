@@ -896,3 +896,26 @@ test('live config: a route change reclassifies in memory, without reloading or w
 	assert.ok(funnel.readKeeperSignal().serving);
 	s.stop();
 });
+
+test('queue-state says when its per-class list was cut, instead of passing a partial list off as whole', async () => {
+	const now = Date.now();
+	// Each carried cadence is its own class, so 201 distinct intervals is one class past the list cap.
+	const rows = Array.from({ length: 201 }, (_, n) => ({
+		...row(item(n), now - HOUR),
+		effectiveInterval: (60 + n) * MINUTE,
+	}));
+	seed(rows.slice(0, 3));
+	let s = await started();
+	s.writeState();
+	let body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.lateness.listsTruncated, false);
+	s.stop();
+
+	seed(rows);
+	s = await started();
+	s.writeState();
+	body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.lateness.classes.length, 200);
+	assert.equal(body.lateness.listsTruncated, true);
+	s.stop();
+});

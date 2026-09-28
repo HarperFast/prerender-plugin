@@ -293,3 +293,37 @@ test('the status refresh reconciles the lease gauge, which otherwise climbs with
 	assert.equal(leases.occupancy(), 0, 'the refresh walked the slots and reconciled it to the truth');
 	assert.equal(searchCalls, 0, 'and did it without touching the table — the walk is pure Atomics');
 });
+
+test('the in-flight count the admin API reports is the slot walk, not the drifting gauge', () => {
+	// `queue-state` derives `unclaimed = due - inFlight` from this. Read off the gauge, every expired
+	// lease still counted, and an autoscaler sizing the fleet from `unclaimed` saw it deflated.
+	const leases = funnel.leaseTable();
+	const now = Date.now();
+	for (let i = 0; i < 10; i++) {
+		leases.grant(`gone${i}|desktop`, { dueMinute: minuteOf(now) - 10, leaseExpiryMs: now - MINUTE });
+	}
+	leases.grant('live|desktop', { dueMinute: minuteOf(now) - 10, leaseExpiryMs: now + 10 * MINUTE });
+	assert.equal(leases.occupancy(), 11, 'the gauge still counts the ten expired leases');
+
+	assert.equal(funnel.inFlightLeases(), 1, 'only the live lease is in flight');
+	assert.equal(leases.occupancy(), 1, 'and the walk reconciled the gauge as it went');
+});
+
+// ---- a fresh process ----
+
+test('before anything reports, the status reads unready, and the first report of ANY status writes the row', async () => {
+	// The shared flag's zero value is what a restarted node holds until its first report. It must not
+	// read as a real status: `empty` would claim a queue the node has not loaded, and — being equal to
+	// it — would make a first `empty` report a no-op, leaving the pre-restart row in place.
+	Atomics.store(QueueState.i32a, 0, 0);
+	statuses.clear();
+	assert.equal(QueueState.status, 'unready');
+
+	await QueueState.noteWork();
+	assert.equal(QueueState.status, 'unready', 'a work hint cannot move a node that has not reported');
+	assert.equal(statuses.size, 0);
+
+	await QueueState.reportStatus('empty');
+	assert.equal(QueueState.status, 'empty');
+	assert.equal(statuses.get('node-a')?.status, 'empty', 'the first report is a change, so it is written');
+});
