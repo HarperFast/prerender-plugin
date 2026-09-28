@@ -350,6 +350,7 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 		let next60m = 0;
 		let next24h = 0;
 		let oldestDueMinute = null;
+		let oldestChangedMinute = null;
 		let nextDueMinute = null;
 		const classRows = [];
 
@@ -387,6 +388,8 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			routeEntry.due += classDue;
 			const head = minutes[0];
 			if (classDue && (oldestDueMinute === null || head < oldestDueMinute)) oldestDueMinute = head;
+			if (changed && classDue && (oldestChangedMinute === null || head < oldestChangedMinute))
+				oldestChangedMinute = head;
 			classRows.push({
 				route,
 				cadenceMs,
@@ -414,8 +417,9 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 			dueSitemap,
 			dueDiscovered: due - dueSitemap,
 			// due rows the change probe filed (`changedAt`): pages known changed, expired and served from the
-			// origin until their render lands
+			// origin until their render lands — and how long the longest-waiting one has waited
 			dueChanged,
+			oldestChangedDueAt: oldestChangedMinute === null ? null : oldestChangedMinute * MINUTE,
 			oldestDueAt: oldestDueMinute === null ? null : oldestDueMinute * MINUTE,
 			nextDueAt: nextDueMinute === null ? null : nextDueMinute * MINUTE,
 			coming: { next15m, next60m, next24h, byHour },
@@ -456,8 +460,8 @@ export const createQueueKeeper = ({ classify, now = Date.now, flowMinutes = 60 }
 				fromSitemap,
 				effectiveInterval: carried ? cadenceMs : null,
 				// the flag, not the instant: the class holds no per-row timestamp, and a reclassify needs only
-				// whether the row is one the probe filed
-				changedAt: changed ? minute * MINUTE : null,
+				// whether the row is one the probe filed (never 0, which would read as unmarked)
+				changedAt: changed ? Math.max(1, minute * MINUTE) : null,
 			};
 		},
 		/** A snapshot of every held key: safe to iterate while applying (a live iterator is not). */

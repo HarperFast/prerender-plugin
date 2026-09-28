@@ -126,7 +126,7 @@ import {
 	validateOverride,
 	writeOverrides,
 } from '../util/configOverride.js';
-import { inFlightLeases, leaseInfo, leaseState, writeSchedule } from '../util/renderSchedule.js';
+import { fileDueNow, inFlightLeases, leaseInfo, leaseState } from '../util/renderSchedule.js';
 import { mergeBreadthRow, finalizeBreadth } from '../util/crawlStats.js';
 import { clampRange, readAnalyticsWindow } from '../util/analyticsRead.js';
 import { hostInfo } from '../util/hostInfo.js';
@@ -134,7 +134,7 @@ import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { startSitemapRefreshInBackground } from './Sitemap.js';
-import { currentMinuteMs, numberOf } from '../util/time.js';
+import { numberOf } from '../util/time.js';
 
 const {
 	render_schedule: { RenderSchedule },
@@ -1100,10 +1100,9 @@ export class PrerenderAdmin extends Resource {
 			);
 		}
 
-		const nextRenderTime = currentMinuteMs();
-		// The write is residency-routed, so this reaches the owning node from any node.
-		await writeSchedule(canonicalUrl, {
-			nextRenderTime,
+		// The write is residency-routed, so this reaches the owning node from any node. `fileDueNow`: a
+		// row already due, or marked by the change probe, keeps its place and its mark.
+		await fileDueNow(canonicalUrl, {
 			fromSitemap: !!target.sitemapUrl,
 			// The target's real cadence, off the point read above — an admin rejoin should not cost the
 			// page its ranking on the way back into rotation.
@@ -1428,8 +1427,10 @@ export class PrerenderAdmin extends Resource {
 				due: q.due,
 				dueSitemap: q.dueSitemap,
 				dueDiscovered: q.dueDiscovered,
-				// pages the change probe found changed and expired, waiting on their render
+				// pages the change probe found changed and expired, waiting on their render; the oldest one's
+				// filing minute says how long changed pages are actually waiting
 				dueChanged: q.dueChanged ?? 0,
+				oldestChangedAt: q.oldestChangedDueAt ?? null,
 				...nowBlock,
 				unclaimed: Math.max(0, q.due - inFlight),
 			},

@@ -120,3 +120,29 @@ test('drain resolves at once when idle, and after the last action otherwise', as
 	await d;
 	assert.equal(drained, true);
 });
+
+test('lowestInFlight names the earliest URL still acting, and the time spent waiting is counted', async () => {
+	const gates = new Map();
+	let clock = 0;
+	const actions = createChangeActions({
+		act: (row) => new Promise((resolve) => gates.set(row.url, resolve)),
+		write: async () => {},
+		concurrency: 2,
+		now: () => clock,
+	});
+	await actions.submit(item('https://e.x/b'));
+	await actions.submit(item('https://e.x/a'));
+	assert.equal(actions.lowestInFlight, 'https://e.x/a');
+	const waiting = actions.submit(item('https://e.x/c'));
+	clock = 250;
+	gates.get('https://e.x/a')();
+	await waiting;
+	assert.equal(actions.stats.waits, 1);
+	assert.equal(actions.stats.waitMs, 250, 'the pass was blocked on a full pipeline for 250ms');
+	assert.equal(actions.lowestInFlight, 'https://e.x/b');
+	gates.get('https://e.x/b')();
+	await tick();
+	gates.get('https://e.x/c')();
+	await actions.drain();
+	assert.equal(actions.lowestInFlight, null);
+});

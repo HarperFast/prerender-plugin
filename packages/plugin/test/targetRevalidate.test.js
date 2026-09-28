@@ -137,15 +137,36 @@ test('every URL is filed at the minute IT was written, not at the minute the swe
 	// One row per URL, keyed by the URL: the revalidated render covers every device in one job.
 	const filed = urls.map((url) => Number(stores.renderSchedule.get(url).nextRenderTime));
 	assert.equal(filed.length, 4);
+	// Filed at the minute each row is WRITTEN (`fileDueNow` reads the clock at the write), so none can
+	// carry the sweep's starting minute — which would rank the last rows as if they had waited the
+	// whole sweep.
+	const startMinute = Math.floor(1_700_000_400_000 / MINUTE) * MINUTE;
 	assert.ok(
-		filed[filed.length - 1] > filed[0],
-		`each URL is stamped with its own minute (got ${filed.join(', ')}) — one capture for the whole ` +
-			`sweep would file the last rows below the owning node's floor`
+		filed.every((minute) => minute > startMinute),
+		`each URL is stamped at its own write (got ${filed.join(', ')}), never the sweep's first minute ${startMinute}`
 	);
 	for (const url of urls) {
 		for (const device of DEVICES) {
 			assert.equal(stores.renderSchedule.has(`${url}|${device}`), false, 'no per-device schedule rows');
 		}
+	}
+});
+
+test('a revalidate LOWERS a page expiry and never raises one — a probe hard-expiry stays hard', async () => {
+	// The change probe backdates a known-wrong page past the swr window. A revalidate that ran before its
+	// render landed used to set `expiresAt: now`, putting it back into stale-while-revalidate serving.
+	const url = 'https://www.example.com/hard';
+	stores.target.set(url, { url });
+	const hard = Date.now() - 3 * 60 * MINUTE;
+	for (const device of DEVICES)
+		stores.prerenderedPage.set(`${url}|${device}`, { cacheKey: `${url}|${device}`, expiresAt: hard });
+	await Target.revalidate({});
+	for (const device of DEVICES) {
+		assert.equal(
+			Number(stores.prerenderedPage.get(`${url}|${device}`).expiresAt),
+			hard,
+			`${device} stays hard-expired`
+		);
 	}
 });
 

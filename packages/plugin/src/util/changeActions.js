@@ -36,7 +36,9 @@
  * detects the same change and acts again. Actions are idempotent: an already hard-expired page is
  * not patched again, and a row already filed for a change keeps its place (`actOnChange`). So a
  * restart loses at most the `concurrency` actions in flight, and not even those: they are found
- * again, and the interrupted pass itself resumes on boot (`changeProbe.js`, `checkResume`).
+ * again, and the interrupted pass itself resumes on boot from its walk cursor (`changeProbe.js`,
+ * `checkResume`), which is held back to the lowest URL still in flight here (`lowestInFlight`) so an
+ * action a crash cut off is re-probed rather than skipped.
  */
 
 /**
@@ -46,17 +48,23 @@
  * @param {number} ports.concurrency    actions in flight at once
  * @param {(error: unknown, item: object) => void} [ports.onError]
  */
-export const createChangeActions = ({ act, write, concurrency = 8, onError } = {}) => {
+export const createChangeActions = ({ act, write, concurrency = 8, onError, now = () => Date.now() } = {}) => {
 	const limit = Math.max(1, concurrency | 0);
-	const stats = { triggered: 0, errors: 0, maxInFlight: 0 };
+	// `waitMs` is how long the pass spent blocked on a full pipeline — the one way actions can slow a
+	// pass, so the one number that says whether they did.
+	const stats = { triggered: 0, errors: 0, maxInFlight: 0, waits: 0, waitMs: 0 };
 	let inFlight = 0;
+	const inFlightUrls = new Map(); // url -> count (a URL is acted on once per pass, but be exact)
 	let stopped = false;
 	// Resolvers waiting for a slot (submit) and for idleness (drain).
 	let slotWaiters = [];
 	let idleWaiters = [];
 
-	const release = () => {
+	const release = (url) => {
 		inFlight--;
+		const n = (inFlightUrls.get(url) ?? 1) - 1;
+		if (n > 0) inFlightUrls.set(url, n);
+		else inFlightUrls.delete(url);
 		const next = slotWaiters.shift();
 		if (next) next();
 		if (inFlight === 0 && !slotWaiters.length) {
@@ -84,7 +92,7 @@ export const createChangeActions = ({ act, write, concurrency = 8, onError } = {
 			// action failure must never take down the pass that found the change.
 			onError?.(e, item);
 		} finally {
-			release();
+			release(item.row.url);
 		}
 	};
 
@@ -97,9 +105,15 @@ export const createChangeActions = ({ act, write, concurrency = 8, onError } = {
 		 * change stays detectable (its baseline was never written).
 		 */
 		async submit(item) {
-			while (!stopped && inFlight >= limit) await new Promise((resolve) => slotWaiters.push(resolve));
+			if (!stopped && inFlight >= limit) {
+				const started = now();
+				stats.waits++;
+				while (!stopped && inFlight >= limit) await new Promise((resolve) => slotWaiters.push(resolve));
+				stats.waitMs += now() - started;
+			}
 			if (stopped) return false;
 			inFlight++;
+			inFlightUrls.set(item.row.url, (inFlightUrls.get(item.row.url) ?? 0) + 1);
 			if (inFlight > stats.maxInFlight) stats.maxInFlight = inFlight;
 			void run(item);
 			return true;
@@ -124,6 +138,13 @@ export const createChangeActions = ({ act, write, concurrency = 8, onError } = {
 
 		get inFlight() {
 			return inFlight;
+		},
+
+		/** The lowest URL (walk order) with an action still in flight, or null — what a resume must not skip. */
+		get lowestInFlight() {
+			let lowest = null;
+			for (const url of inFlightUrls.keys()) if (lowest === null || url < lowest) lowest = url;
+			return lowest;
 		},
 	};
 };

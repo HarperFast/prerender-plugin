@@ -10,9 +10,8 @@ import assert from 'node:assert/strict';
  * it only acts on URLs this node OWNS; a probe FAILURE changes nothing (no write, no trigger —
  * the probe accelerates the baseline cadence, it never gates it); a first observation SEEDS
  * rather than triggers (the probe hadn't seen the page, the page didn't change); dry-run writes
- * signatures but triggers nothing; the trigger budget DEFERS by leaving the signature stale, so
- * the next pass re-detects; and a failed trigger write keeps the signature stale too, for the
- * same reason.
+ * signatures but triggers nothing; every change is acted on (no budget, nothing deferred); and a
+ * failed action keeps the signature stale, so the next probe of the URL acts again.
  */
 
 let changeProbe;
@@ -453,6 +452,10 @@ test('cohortCollector picks the lowest hashes — a keyspace sample, not the alp
 });
 
 test('requestSweepReseed runs immediately when no sweep is running', async () => {
+	// ARMED, so the dry run below is the reseed's own and not the schema default's.
+	const { config } = await import('../src/config.js');
+	const savedDryRun = config.changeProbe.dryRun;
+	config.changeProbe.dryRun = false;
 	// `changeProbeStatus` is async now: it reads the node-local shared row rather than this
 	// worker's module state, which is what makes it answer the same way from all 16 workers.
 	const status = () => changeProbe.changeProbeStatus();
@@ -461,14 +464,17 @@ test('requestSweepReseed runs immediately when no sweep is running', async () =>
 	assert.equal(chained, false);
 	while (!(await status()).sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal((await status()).sweep.lastRun.label, 'reseed-now');
-	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never trigger.
+	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never act — even on an armed probe.
 	assert.equal((await status()).sweep.lastRun.dryRun, true);
+	config.changeProbe.dryRun = savedDryRun;
 });
 
 test('requestSweepReseed interrupts a running sweep and chains the reseed after it stands down', async () => {
 	const { config } = await import('../src/config.js');
 	const savedChunk = config.changeProbe.chunkSize;
+	const savedDryRun = config.changeProbe.dryRun;
 	config.changeProbe.chunkSize = 3;
+	config.changeProbe.dryRun = false; // armed, so the chained reseed's dry run is its own
 	let releaseGate;
 	const gate = new Promise((resolve) => (releaseGate = resolve));
 	let searchCalls = 0;
@@ -500,6 +506,7 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		assert.equal((await status()).sweep.lastRun.dryRun, true);
 	} finally {
 		config.changeProbe.chunkSize = savedChunk;
+		config.changeProbe.dryRun = savedDryRun;
 		globalThis.databases.render_service.Target = FakeTable;
 	}
 });
@@ -875,17 +882,14 @@ test('a page already hard-expired is not patched again — one write per change,
 	assert.equal(patched.length, first, 'no second patch for a page that is already expired past swr');
 });
 
-test('a RESUMED pass skips every row the interrupted pass already probed', async () => {
-	const resumeFrom = Date.now() - 2 * HOUR;
-	const { stats, triggered } = await runPass({
-		rows: [row(URL_A), row(URL_B)],
-		stored: { [URL_A]: '[1]', [URL_B]: '[1]' },
-		answers: { [URL_A]: '[2]', [URL_B]: '[2]' },
-		skipProbedSince: resumeFrom,
-		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? resumeFrom + HOUR : resumeFrom - HOUR }),
+test('the pass records how far it has probed, batch by batch — the resume cursor', async () => {
+	const { stats } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		answers: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[1]' },
+		concurrency: 2,
 	});
-	assert.equal(stats.fresh, 1, 'URL_A was probed after the interrupted pass started');
-	assert.deepEqual(triggered, [URL_B]);
+	assert.equal(stats.walkedThrough, URL_C, 'the last row of the last flushed batch');
 });
 
 /** A rule whose extract maps index 2 -> price and index 3 -> availability, with pageCheck on. */
@@ -1399,7 +1403,7 @@ test('scheduler: mode is live — switching re-arms rather than leaving the old 
 	await applyProbeConfig({ enabled: false });
 });
 
-const armAnchoredScheduler = async (t) => {
+const armAnchoredScheduler = async (t, extra = {}) => {
 	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
 	await applyProbeConfig({
 		enabled: true,
@@ -1408,6 +1412,7 @@ const armAnchoredScheduler = async (t) => {
 		anchorTimezone: 'UTC',
 		startDelay: 0,
 		startJitter: 1,
+		...extra,
 	});
 	changeProbe.startChangeProbeScheduler();
 	await changeProbe.probeStatePublishedForTest();
@@ -1427,12 +1432,70 @@ test('RESTART RESILIENCE: an anchored sweep a restart cut short is resumed on bo
 		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
 	});
 	const decision = await changeProbe.__checkResumeForTest();
-	assert.deepEqual(decision, { resumed: true, from: startedAt });
+	assert.deepEqual(decision, { resumed: true, from: startedAt, cursor: '' }, 'no cursor published: from the start');
 	await settlePasses();
 	const row = await changeProbe.readProbeStateForTest();
 	assert.equal(row.sweep.running, false);
 	assert.equal(row.sweep.lastRun.startedBy, 'resume');
 	assert.equal(row.sweep.lastRun.resumedFrom, startedAt, 'the finished record says what it resumed');
+	t.mock.timers.reset();
+});
+
+test("RESTART RESILIENCE: the resume starts the WALK at the published cursor, in the interrupted pass's own mode", async (t) => {
+	// The cursor, not baseline ages: an unchanged probe writes no baseline, so "skip rows probed since
+	// the pass began" would re-probe every row the interrupted pass found unchanged — most of them.
+	const searches = [];
+	globalThis.databases.render_service.Target = class extends FakeTable {
+		static search(query) {
+			searches.push(query);
+			return [];
+		}
+	};
+	await armAnchoredScheduler(t, { dryRun: false }); // armed: a dry-run resume must come from the claim
+	const startedAt = Date.now() - 3 * HOUR;
+	const cursor = 'https://example.com/product/prd-m/';
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: true,
+			startedAt,
+			heartbeatAt: Date.now() - 20 * 60_000,
+			startedBy: 'manual',
+			dryRun: true,
+			originStartedAt: startedAt - HOUR, // itself a resume of an earlier pass
+			progress: { cursor },
+		},
+	});
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.deepEqual(decision, { resumed: true, from: startedAt - HOUR, cursor });
+	await settlePasses();
+	const conditions = JSON.stringify(searches[0]?.conditions ?? []);
+	assert.ok(conditions.includes(cursor), `the walk starts at the cursor (conditions ${conditions})`);
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun.dryRun, true, 'a manual dry run resumes as a dry run');
+	assert.equal(row.sweep.lastRun.resumedFrom, startedAt - HOUR, 'a chain of resumes keeps the first start');
+	assert.equal(row.sweep.lastRun.resumeCursor, cursor);
+	t.mock.timers.reset();
+});
+
+test('RESTART RESILIENCE: an early config apply re-arms a pending resume instead of dropping it', async (t) => {
+	const startedAt = Date.now() - HOUR;
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: true, startedAt, heartbeatAt: Date.now() - 20 * 60_000, startedBy: 'anchor' },
+	});
+	await armAnchoredScheduler(t);
+	// An anchor edit before the check fires: the timers are cleared and re-armed.
+	await applyProbeConfig({
+		enabled: true,
+		mode: 'anchored',
+		anchorTime: '04:00',
+		anchorTimezone: 'UTC',
+		startDelay: 0,
+		startJitter: 1,
+	});
+	t.mock.timers.tick(1);
+	await settlePasses();
+	const row = await changeProbe.readProbeStateForTest();
+	assert.equal(row.sweep.lastRun?.startedBy, 'resume');
 	t.mock.timers.reset();
 });
 
@@ -3330,4 +3393,14 @@ test('the status names what the probe runs on: settings, rule fingerprints, extr
 	assert.deepEqual(rule.extract, ['price']);
 	assert.deepEqual(rule.endpoint, { method: 'POST', path: '/price/$1' }, 'the path, never the host');
 	assert.equal(status.workerIndex, 0);
+});
+
+test('the resume cursor is held back to the lowest URL whose action is still in flight', () => {
+	// A crash between probing a row and finishing its action leaves that row's baseline stale; a resume
+	// that started past it would skip it until the next day's pass.
+	const at = changeProbe.__resumeKeyOfForTest;
+	assert.equal(at('https://e.x/p/m', null), 'https://e.x/p/m', 'nothing in flight: the walk position');
+	assert.equal(at('https://e.x/p/m', 'https://e.x/p/c'), 'https://e.x/p/c', 'an earlier action still in flight');
+	assert.equal(at('https://e.x/p/c', 'https://e.x/p/m'), 'https://e.x/p/c', 'the walk position is the lower bound');
+	assert.equal(at(null, null), null);
 });

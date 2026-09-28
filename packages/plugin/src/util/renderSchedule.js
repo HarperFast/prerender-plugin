@@ -46,7 +46,7 @@ import { config } from '../config.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
 import { resolveRenderInterval } from './routeClass.js';
-import { MINUTE, numberOf } from './time.js';
+import { MINUTE, currentMinuteMs, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 import { READY_EPOCH_SEC, READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
 import { walkUrlRange } from './urlWalk.js';
@@ -170,6 +170,30 @@ export const writeSchedule = async (
 		effectiveInterval,
 		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
 		...(Number.isFinite(changedAt) ? { changedAt } : {}),
+	});
+};
+
+/**
+ * File a row due NOW without ever DEMOTING it — the shape every "render this now" writer wants (the
+ * change probe, a revalidate, a render-now, an admin rejoin). A row that is already due keeps its
+ * due time, and a change mark (`changedAt`) keeps its first instant, so re-filing a page that is
+ * already waiting never moves it back in the queue or strips its priority. `changedAt` given here
+ * marks a row that has none.
+ *
+ * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
+ * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
+ * what every such writer did before, and the write still reaches the owner by residency.
+ */
+export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt } = {}) => {
+	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt']);
+	const minute = currentMinuteMs();
+	const due = numberOf(existing?.nextRenderTime);
+	const markedAt = numberOf(existing?.changedAt);
+	await writeSchedule(cacheKey, {
+		nextRenderTime: Number.isFinite(due) && due > 0 && due < minute ? due : minute,
+		fromSitemap,
+		effectiveInterval,
+		changedAt: Number.isFinite(markedAt) && markedAt > 0 ? markedAt : changedAt,
 	});
 };
 

@@ -1224,7 +1224,8 @@ from the origin until it re-renders). Nothing detected is deferred and there is 
 the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
 (the pass waits for a free slot rather than dropping a change), and the new baseline is written only
 after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
-cuts an anchored pass short resumes it on boot, skipping the rows it had already probed. Two cadences
+cuts an anchored pass short resumes it on boot from the walk cursor its heartbeat published (held back
+to any action still in flight), with the interrupted pass's own dry-run and reseed settings. Two cadences
 cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,

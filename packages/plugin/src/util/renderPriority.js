@@ -121,5 +121,5 @@ export const scoreOf = (
 	// A change the probe found: the page is known wrong, was hard-expired, and is served from the origin
 	// until this render lands — see "A DETECTED CHANGE STARTS AHEAD" above. A non-positive or non-finite
 	// head start adds nothing, so the policy is off rather than broken.
-	return changed && changedHeadStart > 0 ? score + changedHeadStart : score;
+	return changed && Number.isFinite(changedHeadStart) && changedHeadStart > 0 ? score + changedHeadStart : score;
 };

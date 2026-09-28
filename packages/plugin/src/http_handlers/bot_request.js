@@ -26,8 +26,8 @@ import { resolveVerification } from '../util/pageVerification.js';
 const NO_VERIFICATION = Object.freeze({ verifiedAtMs: NaN, basisAtMs: NaN });
 import { resolveInvalidation } from '../util/invalidation.js';
 import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
-import { currentMinuteMs, epochMsOf } from '../util/time.js';
-import { writeSchedule } from '../util/renderSchedule.js';
+import { epochMsOf } from '../util/time.js';
+import { fileDueNow } from '../util/renderSchedule.js';
 import { recordCrawl } from '../util/crawlStats.js';
 import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
@@ -542,8 +542,8 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// per-device row: one render of that one device, stored and retired, the URL row untouched.
 
 	const scheduleKey = config.deviceTypes.default.includes(deviceType) ? cacheUrl : cacheKey;
-	await writeSchedule(scheduleKey, {
-		nextRenderTime: currentMinuteMs(),
+	// `fileDueNow`: a row already due, or marked by the change probe, keeps its place and its mark.
+	await fileDueNow(scheduleKey, {
 		fromSitemap: !!renderTarget?.sitemapUrl,
 		// PRESERVED WHEN THERE IS A TARGET, `null` WHEN THERE IS NOT — and the difference matters because
 		// `put` replaces the record. This key may be a real target's recurring row (a warm-on-demand
