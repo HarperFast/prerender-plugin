@@ -1146,8 +1146,12 @@ test('why requests missed: three families with a verdict each — only waiting o
 		find(node, (n) => String(n.attributes?.class ?? '').startsWith('value')).attributes.class;
 	// 10,000 bot requests: 800 nothing to render, 1,600 held by a rule, 1,600 waiting on a render.
 	assert.match(tile('Nothing to render').textContent, /8%.*not capacity/);
-	assert.match(tile('Held out by a rule').textContent, /16%.*not capacity/);
-	assert.equal(valueClass(tile('Held out by a rule')), 'value', 'a rule is never a fleet verdict, at any size');
+	assert.match(tile('Held out by a rule or setting').textContent, /16%.*not capacity/);
+	assert.equal(
+		valueClass(tile('Held out by a rule or setting')),
+		'value',
+		'a rule is never a fleet verdict, at any size'
+	);
 	const waiting = tile('Waiting on a render');
 	assert.match(waiting.textContent, /16%/);
 	assert.match(waiting.textContent, /the only family capacity moves/);
@@ -1283,4 +1287,6 @@ test('miss rows fold route and bot per cause, and an unknown cause gets its own 
 	assert.equal(rows[0].routes.get('/a').count, 4);
 	assert.equal(rows[0].routes.get('/a').bots.get('bingbot'), 1);
 	assert.equal(rows[1].family, 'other');
+	// A device outside deviceTypes.default is configuration, not capacity: it never waits on a render.
+	assert.equal(missRows([combo('bot_miss', 'device', '/a', 'googlebot', 1)])[0].family, 'rule');
 });

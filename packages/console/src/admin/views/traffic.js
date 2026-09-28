@@ -79,7 +79,7 @@
  * columns.
  *
  * WHY A MISS HAPPENED is its own panel (plugin v0.95.0 `bot_miss`): one cause per origin-served miss,
- * grouped into nothing to render, held out by a rule, and waiting on a render — and only the last is a
+ * grouped into nothing to render, held out by a rule or setting, and waiting on a render — and only the last is a
  * question for render capacity.
  *
  * SCOPE HONESTY. Analytics rows are node-local, so a cluster total is a SUM the proxy computes
@@ -1083,9 +1083,11 @@ export const MISS_FAMILIES = [
 	},
 	{
 		key: 'rule',
-		label: 'Held out by a rule',
-		verdict: 'a rule you chose · not capacity',
-		means: 'A setting this deployment chose keeps these out of the cache: revisit the rule, not the fleet.',
+		label: 'Held out by a rule or setting',
+		verdict: 'a setting you chose · not capacity',
+		means:
+			'A rule or setting this deployment chose keeps these out of the cache — including a device outside ' +
+			'deviceTypes.default, which the rotation never renders: revisit the configuration, not the fleet.',
 	},
 	{
 		key: 'waiting',
@@ -1120,7 +1122,9 @@ export const MISS_CAUSES = {
 	'suppressed': ['rule', 'a target the render verdict suppressed (noindex, canonical elsewhere, error)'],
 	'new': ['waiting', 'no target yet: this request minted one, its first render jittered across the interval'],
 	'unrendered': ['waiting', 'a target in rotation with no page for this device yet'],
-	'device': ['waiting', 'a target in rotation, but this device is not one it renders by default (deviceTypes.default)'],
+	// Configuration, not capacity: the rotation never renders a device outside deviceTypes.default, however
+	// much fleet there is — only the setting (or a render-now for that device) serves it.
+	'device': ['rule', 'a device outside deviceTypes.default, which the rotation never renders — config, not capacity'],
 	'error': ['error', 'the Target read or the mint failed'],
 };
 
@@ -1361,9 +1365,10 @@ function whyMissed(ctx, data, { serves, filter }) {
 		],
 		help: [
 			'One cause per request that missed the cache and was served from the origin (bot_miss). Nothing to render: ',
-			'the origin answered 404/410, a redirect, another 4xx or a 5xx — no render changes that. Held out by a rule: ',
-			'passthrough and uncacheable routes, the route, bot and entity discovery gates, and suppression — a setting ',
-			'this deployment chose; revisit the rule, not the fleet. Waiting on a render: new, unrendered and device — pages ',
+			'the origin answered 404/410, a redirect, another 4xx or a 5xx — no render changes that. Held out by a rule or ',
+			'setting: passthrough and uncacheable routes, the route, bot and entity discovery gates, suppression, and a ',
+			'device outside deviceTypes.default (the rotation never renders it) — revisit the configuration, not the ',
+			'fleet. Waiting on a render: new and unrendered — pages ',
 			'the rotation owns and has not rendered yet, the ONLY family render capacity or render order can move (watch ',
 			`past ${pct(WAITING_SHARE[0], 1)} of bot requests, bad past ${pct(WAITING_SHARE[1], 1)}). "error" is the Target `,
 			'read or mint failing. The per-cause breadth comes from crawl-breadth: req/URL is how many times each missed ',
