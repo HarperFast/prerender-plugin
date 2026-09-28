@@ -12,21 +12,29 @@ import { getSab } from '../util/coordination.js';
  *            `queued` at once, where a node that had reported `queued` all along would be found only on
  *            its next idle poll. A consumer that predates it treats an unknown status as `empty` — back
  *            off to the idle interval — which is right for a node that can grant nothing.
+ *
+ * Code 0 is NOT a status: it is the buffer's zero value, "nothing reported since this process
+ * started", and reads as `unready` (the node grants nothing yet). Being distinct from every real
+ * status is what makes the first report after a restart a change, so it always writes the row —
+ * whatever it is, `empty` included, the row would otherwise keep its pre-restart value.
  */
 export const QueueStatusCode = {
-	empty: 0,
-	queued: 1,
-	paused: 2,
-	unready: 3,
+	empty: 1,
+	queued: 2,
+	paused: 3,
+	unready: 4,
 };
 export const QueueStatusByCode = {
-	0: 'empty',
-	1: 'queued',
-	2: 'paused',
-	3: 'unready',
+	0: 'unready',
+	1: 'empty',
+	2: 'queued',
+	3: 'paused',
+	4: 'unready',
 };
 
-const sab = await getSab('queue_status', 4);
+// `_v2`: the codes above were renumbered in v0.93.1, and a worker still on the old numbering must not
+// share the buffer with one on the new.
+const sab = await getSab('queue_status_v2', 4);
 
 export class QueueState extends Resource {
 	static loadAsInstance = false;

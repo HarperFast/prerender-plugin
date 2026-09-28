@@ -580,13 +580,13 @@ explainer asks the owner.
 
 `GET /prerender_admin/queue-state` (node-local; sum nodes for the cluster):
 
-| Group      | Fields                                                                                                                                                                                 |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status`                                                       |
-| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                          |
-| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row         |
-| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                |
-| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats |
+| Group      | Fields                                                                                                                                                                                                                           |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `now`      | `due` (`dueSitemap`, `dueDiscovered`), `inFlight` (live leases), `unclaimed` (`due − inFlight`, an estimate), `paused`, `status`                                                                                                 |
+| `coming`   | `next15m`, `next60m`, `next24h`, `byHour[24]`                                                                                                                                                                                    |
+| `lateness` | due rows binned by lateness in their own cadences (`edges` 0.25/1/2/4), `sitemap` / `discovered`, `byRoute`, and per class (route × cadence × sitemap flag) the oldest due row; `listsTruncated` when either list was cut to 200 |
+| `flow`     | per minute for the last hour: `cameDue`, `added`, `triggered`, `rescheduled`, `removed`                                                                                                                                          |
+| `trust`    | `live`, `phase`, `exact` (false if the load skipped unreadable rows or the last verification repaired any), `stateAt`, `stateAgeMs`, the keeper's load, publish and verification stats                                           |
 
 Counts are of rows this node owns. It answers **503** (with `trust` and the live `now` fields, and no
 counts) whenever the keeper cannot vouch for its numbers: waiting, loading, failed, or state older than
@@ -796,9 +796,8 @@ schedule repair — are plugin behavior.)
   otherwise. _view HTML_ streams the stored bytes as `text/plain`; _explain_ hands the row to
   the URL explainer.
 - **Queue & nodes** — cluster/per-node pause controls (intent vs. observed, see "Queue
-  control"), a **render-prioritisation** panel (v0.50.0's ready-set sweep; it reads series this
-  plugin no longer emits since v0.93.0, and the console's catch-up release replaces it with the
-  queue keeper's state) — plus this node's supply side from the shared analytics window: render
+  control"), the queue keeper per node (console v0.18.0+: phase, repairs, wedged and stale claims,
+  lease slots, lateness, flow, from `queue-state`) — plus this node's supply side from the shared analytics window: render
   outcomes over time (the "renders are failing" shape as it develops, with the auth-failure-vs-
   suppressed signature called out), render time trends, and a ranked outcome-detail list.
 - **Invalidations** — the active bulk-invalidation rows (an unresolvable scope — one that no

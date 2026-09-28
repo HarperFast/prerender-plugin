@@ -1437,6 +1437,8 @@ export class PrerenderAdmin extends Resource {
 				oldestDueAt: q.oldestDueAt,
 				byRoute: q.byRoute,
 				classes: q.classes,
+				// true when either list was cut to its first 200 entries
+				listsTruncated: q.listsTruncated === true,
 			},
 			flow: q.flow,
 			trust,

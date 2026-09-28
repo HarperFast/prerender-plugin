@@ -484,9 +484,9 @@ export const deriveQueueStatus = (nowMs = Date.now()) => {
  * `syncQueueState` once per `queue.statusSyncInterval`, on worker 0.
  *
  * The gauge has no other way back down: `grant`/`release` are exact about every lease that ends in a
- * RESULT, but a lease that merely EXPIRES leaves its +1 behind forever. It feeds `inFlightLeases()`
- * into the backlog snapshot, the queue state and the lease-refused warning, so unreconciled it would
- * report "8000 of 4096 slots occupied". The buffer is shared, so ONE walk fixes it for every worker.
+ * RESULT, but a lease that merely EXPIRES leaves its +1 behind forever. It feeds each claim's
+ * `occupancy` and the lease-refused warning, so unreconciled it would report "8000 of 4096 slots
+ * occupied". The buffer is shared, so ONE walk fixes it for every worker.
  */
 export const reconcileLeaseGauge = () => leaseTable().scanLive();
 
@@ -501,8 +501,14 @@ export const leaseState = () => {
 	};
 };
 
-/** In-flight lease count, for the backlog snapshot and the console. O(1). */
-export const inFlightLeases = () => leaseTable().occupancy();
+/**
+ * In-flight lease count, for the backlog snapshot and `queue-state`: the slot walk, not the O(1)
+ * gauge. The gauge still counts every lease that expired without a result until the next reconcile
+ * (measured 410 against a true 290 after a burst of renders that never reported), which would
+ * deflate `unclaimed` for exactly the consumer that sizes the fleet from it. The walk is a few
+ * thousand atomic loads, and it reconciles the gauge as it goes.
+ */
+export const inFlightLeases = () => leaseTable().scanLive().count;
 
 /**
  * Zero the lease buffer. TESTS ONLY (precedent: `resetCrawlStats`). The buffer outlives a
