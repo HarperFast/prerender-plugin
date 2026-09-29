@@ -598,6 +598,12 @@ export const METRICS = Object.freeze({
 			'was asked to stand down first), chained (it waited for a pass that acts), caught_up (the process was ' +
 			'down when it came; run at boot), skipped (served by a later anchor’s pass, or abandoned by a ' +
 			're-arm) — anything but on_time is logged, and a skipped is a night whose pass started late; ' +
+			'probe_detection_lag = a duration (ms) per origin change a SWEEP detects, two upper bounds on how long ' +
+			'the change went unseen (no per-URL "last seen unchanged" is stored, so the lag itself cannot be ' +
+			'measured): detail pass = since the start of the pass that found it (for an anchored pass, since the ' +
+			'anchor — the lag itself for a change that landed on schedule), detail previous_pass = since the ' +
+			'start of the pass before (a true bound when that pass covered the URL); context = the rule label. ' +
+			'Read percentiles, never the total; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -663,7 +669,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted and suppression_held are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'gone_reopen, suppression_lifted and suppression_held are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -720,6 +726,7 @@ export const METRICS = Object.freeze({
 					'probe_caught_up',
 					'probe_ignored',
 					'probe_anchor',
+					'probe_detection_lag',
 					'discovery_gated',
 					'entity_gate',
 					'raw_cache',
@@ -773,7 +780,7 @@ export const METRICS = Object.freeze({
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). probe_anchor: the outcome (on_time, interrupted, ' +
-					'chained, caught_up, skipped). Other series: null.',
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -783,7 +790,8 @@ export const METRICS = Object.freeze({
 					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
-					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. Other series: null.',
+					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
+					'Other series: null.',
 			},
 		},
 	}),

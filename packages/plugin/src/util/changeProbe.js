@@ -829,6 +829,9 @@ export const runProbePass = async ({
 	// pass's metrics are emitted on (see `createPassEmitter`).
 	onStart = () => {},
 	onBatch = () => {},
+	// Called with (rule, row) for every origin CHANGE the pass detects (the rows counted `changed`) —
+	// what the detection-lag metric is emitted from.
+	onChange = () => {},
 } = {}) => {
 	const stats = newStats();
 	onStart(stats);
@@ -1070,8 +1073,10 @@ export const runProbePass = async ({
 		// would silently shrink the mass-change sample right when claims are most likely to be
 		// stale. `pageMismatch`, `caughtUp` and `ignored` OVERLAY these buckets; they never replace
 		// them. An IGNORED change is bucketed unchanged — for the canary it is not a change.
-		if (signatureChanged && !ignoredOnly) stats.changed++;
-		else if (stored?.signature) stats.unchanged++;
+		if (signatureChanged && !ignoredOnly) {
+			stats.changed++;
+			onChange(rule, row);
+		} else if (stored?.signature) stats.unchanged++;
 		else stats.seeded++;
 		if (ignoredOnly) stats.ignored++;
 		if (caughtUp) stats.caughtUp++;
@@ -1317,6 +1322,31 @@ const countProbe = (series, detail = null, value = 1, context = null) => {
 		logger.warn(`[prerender] change-probe ${series} not recorded: ${e?.message ?? String(e)}`);
 	}
 };
+
+/**
+ * DETECTION LAG, as two upper bounds per detected change — there is no per-URL record of when the probe
+ * last saw a URL UNCHANGED (an unchanged probe writes nothing, by design), so the true lag cannot be
+ * measured, only bounded:
+ *
+ *   `pass`           now minus the start of the pass that found it — for an anchored pass, the ANCHOR
+ *                    instant it serves (it may start later: chained, or caught up), so for a change that
+ *                    landed at the origin's scheduled time this is the lag itself.
+ *   `previous_pass`  now minus the start of the pass before it. That pass observed the URL at some point
+ *                    after its start, so if it covered the URL, the change happened after this — a true
+ *                    upper bound, not an estimate.
+ *
+ * `probe_detection_lag`, detail = the bound, context = the rule label, value = ms: read its percentiles.
+ */
+const detectionLagEmitter =
+	({ passStart, previousStart }) =>
+	(rule) => {
+		const now = Date.now();
+		if (Number.isFinite(passStart) && now >= passStart)
+			countProbe('detection_lag', 'pass', now - passStart, rule.label);
+		if (Number.isFinite(previousStart) && now >= previousStart) {
+			countProbe('detection_lag', 'previous_pass', now - previousStart, rule.label);
+		}
+	};
 
 /**
  * A pass's counters as `probe_*` series, emitted AS THE PASS GOES: each call sends what each counter
@@ -1710,6 +1740,10 @@ export const runProbeSweepOnce = async ({
 		if (Number.isFinite(at) && at >= startedAt) interruptedBy = pass.interruptRequestedBy ?? 'request';
 	};
 	const emit = createPassEmitter('sweep');
+	const detectionLag = detectionLagEmitter({
+		passStart: anchorAt ?? resume?.originStartedAt ?? startedAt,
+		previousStart: epochMsOf(claim.previous?.resumedFrom ?? claim.previous?.startedAt),
+	});
 	const counts = () => ({
 		...live,
 		triggered: triggers?.stats.triggered ?? 0,
@@ -1796,6 +1830,7 @@ export const runProbeSweepOnce = async ({
 			inScope: probeScopeFilter(config.changeProbe),
 			onStart: (running) => (live = running),
 			onBatch: () => emit(counts()),
+			onChange: detectionLag,
 		});
 		// A cancelled pass starts nothing more; what is in flight finishes. Either way wait for the
 		// actions in flight — the pass is not finished while pages it decided to expire are unexpired,

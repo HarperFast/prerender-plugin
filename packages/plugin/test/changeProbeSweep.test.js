@@ -536,3 +536,30 @@ test('F7b: the reseed ACTS on a page re-rendered after the trip that then change
 	assert.equal(schedules.get(pdp('pre')), undefined);
 	assert.equal(probeRows.get(pdp('pre')).signature, '[8]', 'but its baseline moves, as the dry run did');
 });
+
+// ---- detection lag (G1) ---------------------------------------------------------------------------
+
+test('G1: every detected change emits two lag bounds, per rule — since the anchor, and since the previous pass', async () => {
+	configure({});
+	const previousStart = Date.now() - 24 * HOUR;
+	sharedRows.set('change_probe', {
+		sweep: { running: false, lastRun: { startedBy: 'anchor', startedAt: previousStart, dryRun: false } },
+	});
+	seedTarget('changed');
+	seedBaseline('changed', '[10]', previousStart - HOUR);
+	answers.set('changed', { status: 200, body: { price: 8 } });
+	seedTarget('quiet');
+	seedBaseline('quiet', '[10]', previousStart - HOUR);
+	answers.set('quiet', { status: 200, body: { price: 10 } });
+	const anchorAt = Date.now() - 2 * HOUR; // an anchored pass that started (chained) after its anchor
+	const before = Date.now();
+	await changeProbe.runProbeSweepOnce({ startedBy: 'anchor', anchorAt });
+	const after = Date.now();
+	const lags = series('detection_lag');
+	assert.equal(lags.length, 2, 'one change, two bounds; the unchanged URL emits nothing');
+	const pass = lags.find((r) => r.method === 'pass');
+	const previous = lags.find((r) => r.method === 'previous_pass');
+	assert.equal(pass.type, 'pdp', 'labelled by rule');
+	assert.ok(pass.value >= before - anchorAt && pass.value <= after - anchorAt, 'measured from the ANCHOR');
+	assert.ok(previous.value >= before - previousStart && previous.value <= after - previousStart);
+});

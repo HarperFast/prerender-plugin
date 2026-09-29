@@ -3571,3 +3571,15 @@ test('the resume cursor is held back to the lowest URL whose action is still in 
 	assert.equal(at('https://e.x/p/c', 'https://e.x/p/m'), 'https://e.x/p/c', 'the walk position is the lower bound');
 	assert.equal(at(null, null), null);
 });
+
+test('onChange fires for an origin change only — not for a seed, an unchanged row, or an ignored-only change', async () => {
+	const seen = [];
+	const { stats } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_B]: '[1]', [URL_C]: '[1]' },
+		answers: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[2]' },
+		onChange: (rule, changed) => seen.push([rule.label, changed.url]),
+	});
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(seen, [['pdp', URL_C]]);
+});

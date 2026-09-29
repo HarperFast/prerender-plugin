@@ -197,6 +197,12 @@ Notes that bite:
   pass that acts), `caught_up` (the node was down when it came; run at boot) or `skipped` (served by
   a later anchor's pass, or abandoned by a re-arm). **Anything but `on_time` means that night's pass
   started late; `skipped` means an anchor got no pass of its own.**
+  (5) `probe_detection_lag` — a **duration** (ms; read percentiles, never the total), one pair per
+  origin change a sweep detects, context = rule label. No per-URL "last seen unchanged" is stored (an
+  unchanged probe writes nothing), so the lag is bounded, not measured: detail `pass` = since the
+  start of the pass that found it — for an anchored pass, since the ANCHOR, which for a change that
+  landed on schedule is the lag itself; detail `previous_pass` = since the start of the pass before,
+  a true upper bound whenever that pass covered the URL. The G1 detection-latency number.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. Since v0.93.0 it comes from the queue keeper and is exact; it is absent while the
