@@ -464,8 +464,11 @@ test('requestSweepReseed runs immediately when no sweep is running', async () =>
 	assert.equal(chained, false);
 	while (!(await status()).sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal((await status()).sweep.lastRun.label, 'reseed-now');
-	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never act — even on an armed probe.
-	assert.equal((await status()).sweep.lastRun.dryRun, true);
+	// ARMED since v0.97.0 (F7b): it acts on a change wherever the trip's invalidation does not already
+	// cover every page — a dry-run reseed baselined pages re-rendered after the trip that then changed,
+	// and they served wrong for the rest of the night.
+	assert.equal((await status()).sweep.lastRun.dryRun, false);
+	assert.equal((await status()).sweep.lastRun.startedBy, 'reseed');
 	config.changeProbe.dryRun = savedDryRun;
 });
 
@@ -503,7 +506,7 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		while ((await status()).sweep.lastRun?.label !== 'reseed-after-trip') {
 			await new Promise((resolve) => setImmediate(resolve));
 		}
-		assert.equal((await status()).sweep.lastRun.dryRun, true);
+		assert.equal((await status()).sweep.lastRun.dryRun, false, 'the chained reseed acts (F7b)');
 	} finally {
 		config.changeProbe.chunkSize = savedChunk;
 		config.changeProbe.dryRun = savedDryRun;

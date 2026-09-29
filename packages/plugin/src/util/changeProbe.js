@@ -52,14 +52,14 @@ import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
 import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
-import { resolveEffectiveInterval } from './routeClass.js';
+import { resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
 import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
 import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
-import { writeVerification } from './pageVerification.js';
+import { resolveVerification, writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
 import { probeScopeFilter } from './probeScope.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
@@ -156,6 +156,7 @@ const newStats = () => ({
 	unchanged: 0,
 	changed: 0,
 	triggered: 0, // changes acted on: page hard-expired, render filed ahead of rotation, baseline written
+	covered: 0, // RESEED only: changes whose every page the trip's invalidation already refuses — baselined, not acted on
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
 	fresh: 0, // skipped: baseline written since this pass (or the pass it resumes) began — already probed
@@ -329,21 +330,30 @@ const probeOnce = async (rule, url) => {
  * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
  * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
-export const actOnChange = async (row) => {
+export const actOnChange = async (row, { coveredBy = null } = {}) => {
 	const nowMs = Date.now();
 	const keys = cacheKeysOf(row.url);
 	const hardExpiredAt = nowMs - config.page.swrTtl;
+	const pages = await Promise.all(
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt', 'lastCached'] }))
+	);
+	// COVERED BY THE INVALIDATION — the reseed after a canary trip only (`coveredBy`, see
+	// `requestSweepReseed`). Every page the URL has predates the trip's epoch and no verification lets it
+	// through, so the invalidation is already refusing all of it: acting would add nothing a bot sees
+	// now, and would make the trip irreversible for this URL — clearing a FALSE trip is meant to restore
+	// exactly these pages. Returns false: nothing done, the baseline is still written (as a dry run
+	// would), and the pipeline counts it `covered`, not `triggered`.
+	if (coveredBy && (await isCoveredByInvalidation(row.url, pages, coveredBy))) return false;
 	// EXPIRE FIRST: if anything below fails, the page has at least stopped serving known-wrong content,
 	// and the stale baseline makes the next probe act again. A page already expired this far (a change
 	// found again before its render landed) is not patched again — one replicated write per device
 	// page per change, not per detection.
 	await Promise.all(
-		keys.map(async (cacheKey) => {
-			const page = await pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+		pages.map(async (page, index) => {
 			if (!page) return;
 			const expiresAt = dateColumnMs(page.expiresAt);
 			if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
-			await pageTable().patch(cacheKey, { expiresAt: hardExpiredAt });
+			await pageTable().patch(keys[index], { expiresAt: hardExpiredAt });
 		})
 	);
 	// FILED AT THE CURRENT MINUTE, NEVER LATER THAN IT ALREADY WAS (`fileDueNow`). The current minute
@@ -365,6 +375,49 @@ export const actOnChange = async (row) => {
 		changedAt: nowMs,
 		demandPeriod: demand.known ? demand.periodMs : undefined,
 	});
+	return true;
+};
+
+/**
+ * Is every page of this URL already refused by an invalidation? `epochFor(url)` resolves the epoch the
+ * serve path would apply (`{ at }` with the pad added, or null), and a page is refused when it was
+ * rendered at or before it — `!(lastCached > at)`, the serve path's own NaN-safe test — and no page
+ * verification exempts it (`resolveServeStatus`). A URL with NO page is covered too: there is nothing
+ * the invalidation lets through for an action to stop.
+ */
+const isCoveredByInvalidation = async (url, pages, epochFor) => {
+	const epoch = await epochFor(url);
+	if (!epoch) return false;
+	const { verifiedAtMs, basisAtMs } = await resolveVerification(url);
+	return pages.every((page) => {
+		if (!page) return true;
+		const lastCached = dateColumnMs(page.lastCached);
+		if (lastCached > epoch.at) return false;
+		return !(verifiedAtMs > epoch.at && lastCached >= basisAtMs);
+	});
+};
+
+/**
+ * The invalidation epoch per route scope, resolved ONCE PER PASS (a pass covers hundreds of thousands
+ * of URLs; the scope set is a handful). A scope cleared mid-pass keeps its epoch for the rest of the
+ * pass, which only means a covered URL is baselined rather than expired — and clearing the
+ * invalidation is exactly the operator saying those pages may serve.
+ */
+const epochResolver = () => {
+	const epochs = new Map();
+	return async (url) => {
+		const scope = routeScopeForUrl(url);
+		if (!epochs.has(scope)) {
+			let epoch = null;
+			try {
+				epoch = await resolveInvalidation(scope);
+			} catch {
+				epoch = null;
+			}
+			epochs.set(scope, epoch);
+		}
+		return epochs.get(scope);
+	};
 };
 
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
@@ -1645,8 +1698,9 @@ export const runProbeSweepOnce = async ({
 	let triggers = null;
 	let phase = 'walking';
 	let stopHeartbeat = () => {};
-	// A pass that only MEASURES — a dry run, or a reseed — stands down when an anchored pass asks it to
-	// (see `requestSweepInterrupt`); a pass that acts is never interrupted, the anchor waits for it.
+	// A dry run or a reseed stands down when an anchored pass asks it to (see `requestSweepInterrupt`):
+	// the one acts on nothing, and the other's work — every matched URL probed, what changed acted on —
+	// is what the anchored pass does anyway. Any other pass is never interrupted; the anchor waits for it.
 	const interruptible = limits.dryRun === true || reseed === true;
 	let interruptedBy = null;
 	const checkInterrupt = async () => {
@@ -1671,8 +1725,11 @@ export const runProbeSweepOnce = async ({
 		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
 		// so the first changes of the pass are not stamped as unknown for want of it.
 		await warmDemand();
+		// A RESEED acts on a change only where the trip's invalidation does not already cover every page
+		// (see `requestSweepReseed`); every other pass acts on every change.
+		const coveredBy = reseed ? epochResolver() : null;
 		triggers = createChangeActions({
-			act: actOnChange,
+			act: coveredBy ? (target) => actOnChange(target, { coveredBy }) : actOnChange,
 			write: writeSignature,
 			concurrency: config.changeProbe.trigger.concurrency,
 			onError: logActionError,
@@ -1753,6 +1810,7 @@ export const runProbeSweepOnce = async ({
 			await triggers.retryFailed();
 		}
 		stats.triggered = triggers.stats.triggered;
+		stats.covered = triggers.stats.covered;
 		stats.errors = triggers.stats.errors;
 		stats.retried = triggers.stats.retried;
 		stats.recovered = triggers.stats.recovered;
@@ -1824,38 +1882,42 @@ export const runProbeSweepOnce = async ({
 		const chained = sweepInterrupt;
 		sweepInterrupt = null;
 		if (chained) {
-			runProbeSweepOnce({ dryRun: true, label: chained, reseed: true, startedBy: 'reseed' }).catch((e) =>
-				logger.error(e)
+			runProbeSweepOnce({ dryRun: chained.dryRun, label: chained.label, reseed: true, startedBy: 'reseed' }).catch(
+				(e) => logger.error(e)
 			);
 		}
 	}
 };
 
-// The label of a reseed waiting for the running sweep to stand down, or null. See
+// The reseed waiting for the running sweep to stand down (`{ label, dryRun }`), or null. See
 // `requestSweepReseed` — a plain "skip if running" here was the wrong shape, because a canary
 // trip lands DURING a sweep in exactly the scenario the canary exists for.
 let sweepInterrupt = null;
 
 /**
- * Run a signature RESEED sweep (dry-run semantics: probe + re-baseline, act on nothing) as soon as
- * possible: immediately when no sweep is running, otherwise by interrupting the running pass — which
- * notices via its cancellation check within a batch — and chaining the reseed when it exits.
+ * Run a signature RESEED sweep as soon as possible: immediately when no sweep is running, otherwise by
+ * interrupting the running pass — which notices via its cancellation check within a batch — and
+ * chaining the reseed when it exits. A reseed probes EVERY matched URL (a mass change has just been
+ * absorbed, so every baseline is known-stale) and re-baselines what changed.
  *
- * A DRY RUN ON PURPOSE, even though every other detected change is acted on. The trip has already
- * invalidated the whole scope, so the pages are already not served; what is left is re-rendering,
- * and the invalidation accelerator does that for exactly the pages bots ask for. A per-URL action
- * here would add nothing but harm: it would hard-expire pages individually (so clearing a FALSE
- * trip's invalidation would no longer restore serving), re-expire pages that had already re-rendered
- * correctly since the trip (the baseline predates the change, and a render never updates it), and
- * put the whole scope ahead of the accelerator's demand-driven heals.
+ * ARMED, EXCEPT WHERE THE INVALIDATION ALREADY COVERS THE PAGE (v0.97.0; it was a dry run before). The
+ * trip invalidated the scope, but the epoch only refuses pages rendered BEFORE it — so a page
+ * re-rendered after the trip that then changed, and a page-claim mismatch on one, were baselined by the
+ * dry-run reseed and never expired: known-wrong pages served for the rest of the night, and the
+ * baseline no longer disagreed, so the next pass did not act either. The reseed now acts on a change as
+ * any pass does — expire, file the render — unless every page of the URL predates the epoch and no
+ * verification exempts it (`isCoveredByInvalidation`). Those it baselines without acting, which keeps
+ * what the dry run was for: clearing a FALSE trip's invalidation still restores serving for exactly
+ * those pages, and a per-URL expiry does not pile the whole scope ahead of the accelerator's
+ * demand-driven heals. `dryRun` is the tripping canary's: a trip only acts on an armed canary pass.
  */
-export const requestSweepReseed = (label) => {
+export const requestSweepReseed = (label, { dryRun = false } = {}) => {
 	if (sweepRunning) {
-		sweepInterrupt = label;
+		sweepInterrupt = { label, dryRun };
 		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
 		return { chained: true };
 	}
-	runProbeSweepOnce({ dryRun: true, label, reseed: true, startedBy: 'reseed' }).catch((e) => logger.error(e));
+	runProbeSweepOnce({ dryRun, label, reseed: true, startedBy: 'reseed' }).catch((e) => logger.error(e));
 	return { chained: false };
 };
 
@@ -1911,7 +1973,7 @@ export const canaryVerdict = (stats, { threshold, minSample }) => {
  * sound — and say exactly why not otherwise, because a mass price change the operator configured
  * a response for is the one event this feature exists to catch.
  */
-const actOnTrip = async (rule, fraction) => {
+const actOnTrip = async (rule, fraction, { dryRun = false } = {}) => {
 	const scope = rule.invalidateScope;
 	if (!scope) {
 		logger.warn(
@@ -1954,8 +2016,9 @@ const actOnTrip = async (rule, fraction) => {
 			`origin for that scope until pages re-render; a reseed sweep is re-baselining signatures now`
 	);
 	// A mass change makes the whole stored diff stale, so re-baseline NOW rather than waiting out the
-	// next pass — as a RESEED, a dry run (see `requestSweepReseed` for why it acts on nothing).
-	const { chained } = requestSweepReseed(`reseed after invalidating ${scope}`);
+	// next pass — as a RESEED, which acts only where the invalidation does not cover (see
+	// `requestSweepReseed`).
+	const { chained } = requestSweepReseed(`reseed after invalidating ${scope}`, { dryRun });
 	return { acted: true, scope, reseedChained: chained };
 };
 
@@ -2047,7 +2110,9 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 			let action = null;
 			if (verdict.tripped) {
 				countProbe('canary_trip');
-				action = limits.dryRun ? { acted: false, reason: 'dry-run' } : await actOnTrip(rule, verdict.fraction);
+				action = limits.dryRun
+					? { acted: false, reason: 'dry-run' }
+					: await actOnTrip(rule, verdict.fraction, { dryRun: limits.dryRun });
 				if (limits.dryRun) {
 					logger.warn(
 						`[prerender] change-probe canary WOULD TRIP for ${rule.label} ` +
@@ -2466,9 +2531,8 @@ const actingPassSince = (sweep, since) => {
  * the most recent anchor, one is started, as that anchor's pass (`probe_anchor` outcome `caught_up`).
  *
  * WHICH WINS. A stale claim that belongs to the current anchor period (its origin is at or after the
- * most recent anchor) is today's pass: it is resumed from its cursor. One that only measured (a dry run
- * or a reseed) is not resumed when a catch-up is due — the anchored pass would interrupt it the moment
- * it started. One whose origin predates the most recent anchor is yesterday's pass: finishing its tail
+ * most recent anchor) is today's pass: it is resumed from its cursor. A dry run or a reseed is not
+ * resumed when a catch-up is due — the anchored pass would interrupt it the moment it started. One whose origin predates the most recent anchor is yesterday's pass: finishing its tail
  * would leave the head unprobed since before the anchor, so the catch-up runs a whole pass instead.
  */
 const checkResume = async () => {
@@ -2493,10 +2557,10 @@ const checkResume = async () => {
 		// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
 		const recordedOrigin = epochMsOf(sweep.originStartedAt);
 		const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
-		const measuring = sweep.dryRun === true || sweep.reseed === true || sweep.startedBy === 'reseed';
+		const interruptible = sweep.dryRun === true || sweep.reseed === true || sweep.startedBy === 'reseed';
 		if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS)) reason = 'older than a day';
 		else if (Number.isFinite(lastAnchor) && originStartedAt < lastAnchor) reason = 'predates the last anchor';
-		else if (catchUpDue && measuring) reason = 'a measuring pass, and the anchored pass is due';
+		else if (catchUpDue && interruptible) reason = 'a dry run or reseed, and the anchored pass is due';
 		else {
 			const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
 			logger.warn(
@@ -2608,8 +2672,8 @@ const previousAnchorOccurrence = () => {
 };
 
 /**
- * Ask whatever sweep holds this node's claim to stand down — honoured only by a pass that measures
- * (a dry run or a reseed), within one heartbeat tick, on whichever worker it runs. Addressed through
+ * Ask whatever sweep holds this node's claim to stand down — honoured only by a dry run or a reseed
+ * (the passes an anchored pass subsumes), within one heartbeat tick, on whichever worker it runs. Addressed through
  * the claim row because the pass may be on another worker (a console-started dry run), where no
  * module state reaches it; a new claim clears it (`claimPass`).
  */
@@ -2630,10 +2694,11 @@ let timerGeneration = 0;
  * console, a resume — and the timer re-armed for TOMORROW with no log line and no metric: the pass the
  * whole mode exists for simply did not happen that night. Now:
  *
- *   - a pass that only MEASURES (a dry run, a reseed) is asked to stand down (`requestSweepInterrupt`),
- *     and the anchored pass takes the sweep as soon as it has — outcome `interrupted`. What a reseed
- *     does is a subset of what the anchored pass does: every matched URL, probed.
- *   - a pass that ACTS is left to finish, and the anchored pass runs after it — outcome `chained`.
+ *   - a dry run or a reseed is asked to stand down (`requestSweepInterrupt`), and the anchored pass
+ *     takes the sweep as soon as it has — outcome `interrupted`. A dry run acts on nothing, and a
+ *     reseed's work (every matched URL probed, what changed acted on) is what the anchored pass does.
+ *   - any other pass (it ACTS, and is not the anchored pass's to cut short) is left to finish, and the
+ *     anchored pass runs after it — outcome `chained`.
  *   - an anchor that comes round while this wait is still going (the other pass outran a whole day) is
  *     served by the same pass, and the one it replaces is counted `skipped`.
  *   - a re-arm (a mode or anchor edit, a disable) abandons the wait — counted `skipped` too.
@@ -2674,16 +2739,16 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time', generation = tim
 			return pass;
 		}
 		const holder = (await readProbeState())?.sweep;
-		const measuring = holder?.dryRun === true || holder?.reseed === true;
+		const interruptible = holder?.dryRun === true || holder?.reseed === true;
 		waitedFor = holder?.startedBy ? `a ${holder.dryRun ? 'dry-run ' : ''}${holder.startedBy} pass` : waitedFor;
-		if (measuring && !asked) {
+		if (interruptible && !asked) {
 			asked = true;
 			if (result === 'on_time') result = 'interrupted';
 			logger.warn(
-				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a measuring sweep'} running — asking it to stand down`
+				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a dry run or reseed'} running — asking it to stand down`
 			);
 			await requestSweepInterrupt('anchor');
-		} else if (!measuring && result === 'on_time') {
+		} else if (!interruptible && result === 'on_time') {
 			result = 'chained';
 			logger.warn(
 				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a sweep'} running — its pass runs when that one ends`

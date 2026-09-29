@@ -59,7 +59,8 @@ export const RETRY_LIMIT = 1000;
 
 /**
  * @param {object} ports
- * @param {(row: object) => Promise<void>} ports.act    expire the page and file its render
+ * @param {(row: object) => Promise<boolean | void>} ports.act    expire the page and file its render;
+ *   resolving `false` means it deliberately did nothing (counted `covered`, baseline still written)
  * @param {(url: string, observed: string, opts: object) => Promise<void>} ports.write  baseline write
  * @param {number} ports.concurrency    actions in flight at once
  * @param {(error: unknown, item: object) => void} [ports.onError]
@@ -79,6 +80,7 @@ export const createChangeActions = ({
 	// `errors - recovered` is what is left for the next probe; `retrySkipped` failed past the bound.
 	const stats = {
 		triggered: 0,
+		covered: 0,
 		errors: 0,
 		retried: 0,
 		recovered: 0,
@@ -111,16 +113,20 @@ export const createChangeActions = ({
 
 	const run = async (item, retry) => {
 		try {
-			await act(item.row);
+			// `false` = the action decided there was nothing to do (the reseed's covered-by-invalidation
+			// case, changeProbe.js `actOnChange`): the baseline still moves, as a dry run's would, and the
+			// claim stays — no page was expired, so what it describes is still the cached page.
+			const acted = (await act(item.row)) !== false;
 			// AFTER the action, never before — see the module comment. `clearClaim` goes with it because
 			// the page was just hard-expired, so whatever the stored page claim described is no longer
 			// being served.
 			await write(item.row.url, item.observed, {
 				rowExists: item.rowExists,
-				clearClaim: true,
+				clearClaim: acted,
 				fingerprint: item.fingerprint,
 			});
-			stats.triggered++;
+			if (acted) stats.triggered++;
+			else stats.covered++;
 			if (retry) stats.recovered++;
 		} catch (e) {
 			if (!retry) {

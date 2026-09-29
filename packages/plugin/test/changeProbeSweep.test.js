@@ -121,6 +121,8 @@ class RegistryTable {
 let probeRows;
 let pages;
 let schedules;
+let invalidations;
+let verifications;
 let recorded;
 let probeFaults;
 let pageFaults;
@@ -149,6 +151,8 @@ beforeEach(async () => {
 	probeRows = new Map();
 	pages = new Map();
 	schedules = new Map();
+	invalidations = new Map();
+	verifications = new Map();
 	recorded = [];
 	probeFaults = {};
 	pageFaults = {};
@@ -161,8 +165,8 @@ beforeEach(async () => {
 		render_service: { Target: RegistryTable },
 		page_cache: { PrerenderedPage: memoryTable(pages, pageFaults) },
 		render_schedule: { RenderSchedule: memoryTable(schedules) },
-		invalidation: { Invalidation: memoryTable(new Map()) },
-		verification: { PageVerification: memoryTable(new Map()) },
+		invalidation: { Invalidation: memoryTable(invalidations) },
+		verification: { PageVerification: memoryTable(verifications) },
 	};
 	changeProbe = await import('../src/util/changeProbe.js');
 	({ applyOptions } = await import('../src/config.js'));
@@ -172,6 +176,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	applyOptions({ changeProbe: { enabled: false } });
+	(await import('../src/util/invalidation.js')).resetInvalidationState();
 	changeProbe.resetChangeProbeState();
 	for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
 	await changeProbe.probeStatePublishedForTest();
@@ -477,4 +482,57 @@ test('F7a: the most recent anchor is DST-correct — a pass just after a fall-ba
 		else process.env.TZ = hostTz;
 		t.mock.timers.reset();
 	}
+});
+
+// ---- the reseed after a canary trip acts where the invalidation does not cover (F7b) -------------
+
+test('F7b: the reseed ACTS on a page re-rendered after the trip that then changed — and leaves a pre-trip page to the invalidation', async (t) => {
+	t.after(() => applyOptions({ invalidation: { verification: { enabled: false } } }));
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			dryRun: false,
+			rules: rules(),
+			ratePerSecond: 10_000,
+			concurrency: 2,
+			canary: { count: 10, interval: 0 },
+		},
+		invalidation: { verification: { enabled: true } },
+	});
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	for (const id of ['pre', 'post', 'verified']) {
+		seedTarget(id);
+		seedBaseline(id, '[10]', trip - 24 * HOUR);
+		answers.set(id, { status: 200, body: { price: 8 } });
+	}
+	seedPage('pre', { lastCached: trip - HOUR }); // the invalidation refuses it
+	seedPage('post', { lastCached: trip + HOUR }); // re-rendered after the trip: the invalidation lets it through
+	seedPage('verified', { lastCached: trip - HOUR }); // pre-trip, but a verification exempts it
+	verifications.set(pdp('verified'), {
+		url: pdp('verified'),
+		verifiedAt: new Date(trip + 30 * 60_000),
+		basisAt: new Date(trip - HOUR),
+	});
+
+	const { chained } = changeProbe.requestSweepReseed('reseed after invalidating all');
+	assert.equal(chained, false);
+	let lastRun;
+	for (let i = 0; i < 200 && !lastRun; i++) {
+		await new Promise((resolve) => setImmediate(resolve));
+		lastRun = (await changeProbe.readProbeStateForTest())?.sweep?.lastRun;
+	}
+	assert.equal(lastRun.dryRun, false, 'the reseed is armed');
+	assert.equal(lastRun.changed, 3);
+	assert.equal(lastRun.triggered, 2, 'post and verified: pages a bot can still be served');
+	assert.equal(lastRun.covered, 1, 'pre: every page already refused by the invalidation');
+	assert.ok(pageOf('post').expiresAt < Date.now(), 'the post-trip page that changed no longer serves');
+	assert.ok(schedules.get(pdp('post'))?.changedAt > 0, 'and its render is filed ahead of rotation');
+	assert.ok(pageOf('verified').expiresAt < Date.now(), 'a verification-exempt page is not covered');
+	assert.ok(
+		pageOf('pre').expiresAt > Date.now(),
+		'the pre-trip page is NOT expired — clearing a false trip restores it'
+	);
+	assert.equal(schedules.get(pdp('pre')), undefined);
+	assert.equal(probeRows.get(pdp('pre')).signature, '[8]', 'but its baseline moves, as the dry run did');
 });
