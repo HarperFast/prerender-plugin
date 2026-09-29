@@ -38,7 +38,7 @@ import { getResidencyByUrl } from './residency.js';
 import { getInitialRenderTime } from './time.js';
 import { resolveRenderInterval } from './routeClass.js';
 import { getScheduleRow, writeSchedule } from './renderSchedule.js';
-import { claimRun, finishRun, isRunning, readRunState } from './runState.js';
+import { claimRun, finishRun, isRunning, makeHeartbeat, readRunState } from './runState.js';
 import { walkUrlRange } from './urlWalk.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
@@ -127,8 +127,10 @@ export const reconcileSchedules = async ({
 
 	// Phase 2 — writes, with the scan's cursor now closed. `cacheKey` here is the URL — the row's
 	// key — named after the schema's primary-key attribute (see util/renderSchedule.js on why that
-	// attribute keeps its old name).
+	// attribute keeps its old name). It yields on the same hook as the scan: up to `maxRestores`
+	// writes is minutes on a loaded node, and the hook is also what carries the run's heartbeat.
 	for (const { cacheKey, target } of toRestore) {
+		if (stats.restored > 0 && stats.restored % YIELD_EVERY === 0) await onYield();
 		// Hoisted because the jittered time and the recorded cadence must be the same number — see both
 		// comments below.
 		const interval = resolveRenderInterval(target.url, target.renderInterval);
@@ -162,7 +164,10 @@ export const reconcileSchedules = async ({
 };
 
 /** `reconcileSchedules` bound to the live tables. */
-export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconcile.maxRestores } = {}) => {
+export const reconcileScheduleGaps = async ({
+	maxRestores = config.render.reconcile.maxRestores,
+	onYield = () => setImmediate(),
+} = {}) => {
 	const {
 		render_service: { Target },
 	} = databases;
@@ -191,7 +196,7 @@ export const reconcileScheduleGaps = async ({ maxRestores = config.render.reconc
 		// The device rows a not-yet-converted URL may still be scheduled under (see phase 1).
 		deviceTypes: config.deviceTypes.default,
 		maxRestores,
-		onYield: () => setImmediate(),
+		onYield,
 	});
 };
 
@@ -222,7 +227,19 @@ export const runReconcileOnce = async (options) => {
 	}
 
 	try {
-		const stats = await reconcileScheduleGaps(options);
+		// THE CLAIM'S LIVENESS IS ITS HEARTBEAT (util/runState.js), and a pass is longer than the staleness
+		// window: a full registry walk is projected at ~158s on a production-sized node against 120s. With
+		// no beat, a pass that long reads as abandoned while it runs — `isReconcileRunning` says false, and
+		// the next admin POST claims the run and starts a SECOND full walk beside it. The beat rides the
+		// sweep's own yield hook, throttled, exactly as the orphan sweeps' do.
+		const beat = makeHeartbeat(KEY);
+		const stats = await reconcileScheduleGaps({
+			...options,
+			onYield: async () => {
+				beat();
+				await setImmediate();
+			},
+		});
 		const lastRun = { ...stats, node: server.hostname, startedAt, finishedAt: Date.now(), error: null };
 		await finishRun(KEY, lastRun);
 

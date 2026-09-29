@@ -462,3 +462,38 @@ test('a row unreadable on every path fails the pass instead of reporting it clea
 
 	await assert.rejects(reconcile.reconcileScheduleGaps({ maxRestores: 10 }), /NOT fully covered/);
 });
+
+test('a pass longer than the staleness window keeps beating, so it never reads as abandoned mid-pass', async (t) => {
+	// A pass is projected at ~158s on a production-sized node against the 120s staleness window. Without a
+	// heartbeat it reads as abandoned while it runs: `isReconcileRunning` says false, and a second admin
+	// POST claims the run and starts a concurrent full walk.
+	const realNow = Date.now;
+	let clock = realNow();
+	Date.now = () => clock;
+	t.after(() => {
+		Date.now = realNow;
+	});
+	runStateRows.clear();
+	liveTargets(Array.from({ length: 450 }, (_, i) => targetRow(`https://x/${String(i).padStart(4, '0')}`)));
+	const { Target } = globalThis.databases.render_service;
+	const search = Target.search.bind(Target);
+	let advanced = false;
+	Target.search = (query) => {
+		// the registry walk takes longer than the staleness window before its rows arrive
+		if (!advanced) {
+			advanced = true;
+			clock += 150_000;
+		}
+		return search(query);
+	};
+	const runningDuringWrites = [];
+	globalThis.databases.render_schedule.RenderSchedule.put = async () => {
+		if (!runningDuringWrites.length) runningDuringWrites.push(await reconcile.isReconcileRunning());
+	};
+
+	const lastRun = await reconcile.runReconcileOnce({ maxRestores: 10 });
+
+	assert.equal(lastRun.error, null);
+	assert.equal(lastRun.restored, 10);
+	assert.deepEqual(runningDuringWrites, [true], 'still claimed, 150s into the pass');
+});
