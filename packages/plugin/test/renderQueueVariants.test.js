@@ -1237,3 +1237,72 @@ test('Target.put marks the row urgent only for an explicit due time that is not 
 	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute });
 	assert.ok(stores.renderSchedule.get(A).urgentAt > 0, 'explicitly now');
 });
+
+// ───────────────────────────── what a landed render reports ─────────────────────────────
+
+const lagSamples = () => analytics.filter((a) => a[1] === 'render' && a[2] === 'change_lag_ms');
+const sizeSamples = () => analytics.filter((a) => a[1] === 'render_size');
+
+test('a render that lands for a changed row reports trigger-to-cache, once, by route', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	const changedAt = clock.now - 7 * 60_000;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	await claim();
+	clock.now += 20_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.deepEqual(
+		lagSamples().map((a) => [a[0], a[3]]),
+		[[7 * 60_000 + 20_000, 'unrouted']],
+		'ms from the mark to the landed render, labelled by route'
+	);
+});
+
+test('no lag sample for a routine row, a partial render, or a render refused for predating the mark', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(lagSamples().length, 0, 'routine: nothing changed');
+
+	seedUrlRow({ url: B });
+	stores.renderSchedule.set(B, { ...stores.renderSchedule.get(B), changedAt: clock.now - 60_000 });
+	await claim();
+	await postVariants(B, [
+		rendered('desktop'),
+		{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	]);
+	assert.equal(lagSamples().length, 0, 'partial: the mark rides the retry, and the landing is counted then');
+});
+
+test('each stored page reports its DECODED size by route and device, banded at the 1 MB threshold', async () => {
+	const { gzipSync } = await import('node:zlib');
+	seedUrlRow();
+	await claim();
+	const big = `<html>${'x'.repeat(1_200_000)}</html>`;
+	const gz = gzipSync(Buffer.from(big));
+	await postVariants(A, [
+		rendered('desktop', gz, { headers: { 'content-encoding': 'gzip' } }),
+		rendered('mobile', '<html>small</html>'),
+	]);
+	assert.deepEqual(
+		sizeSamples()
+			.map((a) => [a[0], a[2], a[3], a[4]])
+			.sort((x, y) => x[2].localeCompare(y[2])),
+		[
+			[Buffer.byteLength(big), 'unrouted', 'desktop', '1m-2m'],
+			[Buffer.byteLength('<html>small</html>'), 'unrouted', 'mobile', 'under-500k'],
+		],
+		'the gzip trailer’s length, not the bytes on the wire'
+	);
+});
+
+test('a page in an encoding that would cost a decompression to measure is not measured', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', 'br-bytes', { headers: { 'content-encoding': 'br' } }),
+		rendered('mobile', 'not really gzip', { headers: { 'content-encoding': 'gzip' } }),
+	]);
+	assert.deepEqual(sizeSamples(), []);
+});

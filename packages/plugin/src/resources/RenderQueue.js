@@ -11,6 +11,7 @@ import {
 	queryAllowlistFor,
 	resolveEffectiveInterval,
 	resolveRenderInterval,
+	routeScopeForUrl,
 	PRERENDER,
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
@@ -233,6 +234,26 @@ const renderStartedBy = (result, nowMs) => {
 	let total = 0;
 	for (const ms of times) if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) total += ms;
 	return total > 0 ? nowMs - total : null;
+};
+
+/** The route label the metrics carry for a URL — the keeper's and `route_serve`'s. */
+const routeLabelOf = (url) => routeScopeForUrl(url) ?? 'unrouted';
+
+/**
+ * A stored body's DECODED length, or null when it cannot be had for free.
+ *
+ * A gzip member ends with ISIZE, the uncompressed length modulo 2^32 (RFC 1952 §2.3.1), so for the
+ * render fleet's default encoding the answer is four bytes away, and an unencoded body is its own
+ * length. Anything else would mean decompressing every page on the result path — a request handler, per
+ * render — to measure it, so it is not measured. Read byte by byte so a plain Uint8Array works too.
+ */
+const decodedLengthOf = (content, encoding) => {
+	if (!content?.byteLength) return null;
+	const coding = typeof encoding === 'string' ? encoding.trim().toLowerCase() : '';
+	if (coding === '' || coding === 'identity') return content.byteLength;
+	const n = content.byteLength;
+	if (coding !== 'gzip' || n < 18 || content[0] !== 0x1f || content[1] !== 0x8b) return null;
+	return (content[n - 4] | (content[n - 3] << 8) | (content[n - 2] << 16) | (content[n - 1] << 24)) >>> 0;
 };
 
 /** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
@@ -914,6 +935,14 @@ export class RenderQueue extends Resource {
 		const stored = rendered.filter(
 			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled) && !withheld
 		);
+		// How big each page is as a crawler parses it (G4): one sample per device page stored, by the route
+		// of the key it is stored under.
+		for (const variant of stored) {
+			const bytes = decodedLengthOf(variant.content, variant.headers['content-encoding']);
+			if (bytes !== null) {
+				metrics.renderSize(bytes, routeLabelOf(CacheKey.urlOf(variant.storeKey)), variant.deviceType);
+			}
+		}
 		if (stored.length) {
 			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
 			// than per use because `recordPageClaim` stores it as the basis a per-URL verification
@@ -1066,6 +1095,13 @@ export class RenderQueue extends Resource {
 						? 'discarded'
 						: 'no-content'
 		);
+		// TRIGGER TO CACHE (G1): how long a page found changed was served from the origin before this render
+		// replaced it — from the mark's first instant, which `fileDueNow` keeps, to now. Emitted only here,
+		// where every device rendered and the reschedule below clears the mark: a partial render keeps the
+		// mark through the retry lane, and its URL is counted once, when its render finally lands.
+		if (marks.changedAt !== undefined && renderTarget && scheduleJob.fold && !refiledTo && stored.length) {
+			metrics.renderChangeLag(Math.max(0, Date.now() - marks.changedAt), routeLabelOf(url));
+		}
 
 		if (renderTarget) {
 			// A target owns this URL → recurring. Reschedule relative to completion using the resolved

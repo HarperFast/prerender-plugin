@@ -238,6 +238,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'demand',
 		'invalidationError',
 		'invalidationReenqueue',
+		// `render_size` (plugin v0.97.0): its path slot is the route label, a dimension like route_serve's.
+		// No view reads it yet — a page-size panel beside the Traffic view's route table is the follow-up.
+		'renderSize',
 		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe
 		// view, and guarded by name in the test BELOW: being on this list exempts an emitter from
 		// the scan above, which is how three probe series once shipped with no panel and a green
@@ -297,6 +300,12 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		// plugin v0.97.0: how often an off-owner "render this now" filing reached its owner. A health signal
 		// with an expected steady state (forwarded, or nothing when the peer token is unset); a tile on the
 		// Queue view is the console follow-up.
+		// plugin v0.97.0: trigger-to-cache for a detected change, per route. Read raw from the analytics
+		// endpoint until the Change probe view charts it beside the pass counters it is the outcome of.
+		[
+			'render.change_lag_ms',
+			'plugin v0.97.0; read raw from /prerender_admin/analytics — a Change probe panel is the follow-up',
+		],
 		[
 			'prerender_ops.due_now_forward',
 			'plugin v0.97.0; read raw from /prerender_admin/analytics until the Queue view charts it',

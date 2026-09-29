@@ -292,8 +292,8 @@ export const METRICS = Object.freeze({
 		emittedBy: 'resources/RenderQueue.js',
 		cadence:
 			'per render result posted back by a browser worker: one `outcome` row always (a result is one URL — ' +
-			'every device variant in it — since v0.66.0), and one `time_ms` sample per device variant the worker ' +
-			'timed',
+			'every device variant in it — since v0.66.0), one `time_ms` sample per device variant the worker ' +
+			'timed, and one `change_lag_ms` sample per URL whose render landed while its row carried a change mark',
 		summary: 'The render fleet, in one scan: how long each render took, and what became of it.',
 		usefulFor:
 			'`time_ms` is fleet capacity (renders/hour/pod = concurrency ÷ time_ms) and what a settle-tuning ' +
@@ -310,11 +310,19 @@ export const METRICS = Object.freeze({
 		dimensions: {
 			path: {
 				name: 'series',
-				values: ['time_ms', 'outcome'],
-				description: 'time_ms = duration distribution (ms). outcome = counter of what became of the result.',
+				values: ['time_ms', 'outcome', 'change_lag_ms'],
+				description:
+					'time_ms = duration distribution (ms). outcome = counter of what became of the result. ' +
+					'change_lag_ms (plugin v0.97.0) = TRIGGER TO CACHE: ms from the instant the origin was found ' +
+					'changed (`changedAt` — the change probe, a gone reopen, a sitemap departure or rejoin) to the ' +
+					'render that replaced the page landing, one sample per URL, emitted where that render clears the ' +
+					'mark. Every millisecond of it the page was hard-expired and bots were served the origin; its p95 ' +
+					'per route against the probe cadence is how fresh a detected change actually gets. A render that ' +
+					'did not land (a failure, a render granted before the mark) emits nothing, so the lag keeps ' +
+					'growing until one does.',
 			},
 			method: {
-				name: 'statusCode (time_ms) / outcome (outcome)',
+				name: 'statusCode (time_ms) / outcome (outcome) / route (change_lag_ms)',
 				description:
 					'time_ms: HTTP status the render observed — a NUMBER at the emit site (for a redirect bail, ' +
 					'the FIRST hop’s 3xx). outcome: rendered | suppressed | auth-failure | transient | failed | ' +
@@ -322,10 +330,11 @@ export const METRICS = Object.freeze({
 					'(target moves to its recheck cadence), auth-failure = 401/403 kept and retried, transient = ' +
 					'408/429/5xx kept and retried, failed = the render itself broke, redirect = the page moved or ' +
 					'bounced, superseded = the result was dropped whole because a newer fact outranks it (plugin ' +
-					'v0.97.0; see its detail).',
+					'v0.97.0; see its detail). change_lag_ms: the route label, as route_serve.path (the matched ' +
+					"route's path, else 'unrouted').",
 			},
 			type: {
-				name: 'candidacy (time_ms) / detail (outcome)',
+				name: 'candidacy (time_ms) / detail (outcome) / unused (change_lag_ms)',
 				values: [
 					'candidate',
 					'non-candidate',
@@ -373,6 +382,36 @@ export const METRICS = Object.freeze({
 					'lease is not released) / changed-during-render (its lease predates the row’s change mark, so ' +
 					'it may show the content from before the change; nothing stored, the row stays due and marked ' +
 					'and renders again at once).',
+			},
+		},
+	}),
+
+	render_size: metric('render_size', {
+		kind: 'value',
+		unit: 'bytes',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence: 'one sample per device page a render result stored',
+		summary: 'How big each stored page is DECODED — the HTML a crawler parses, not the bytes on the wire.',
+		usefulFor:
+			'Crawler size limits are on the decoded document (Bing’s soft limit is 1 MB), and a page’s size ' +
+			'swings with its content (a product page with thousands of reviews is several times one with none). ' +
+			'`count` per band over the route’s total is the exact share of its renders over each threshold — ' +
+			'"share of product-page renders over 1 MB" is the rows with band 1m-2m or 2m-plus — and the values ' +
+			'inside a band are its distribution.',
+		caveats:
+			'Measured for a gzip body (its trailer states the decoded length, so it costs nothing) and an ' +
+			'unencoded one — the render fleet’s default and only configured encoding. A page stored in any ' +
+			'other encoding emits NO sample rather than paying a decompression per render on the result path. ' +
+			'Pages stored, not pages served: a page is counted once per render, however often it is served.',
+		dimensions: {
+			path: { name: 'route', description: 'As route_serve.path.' },
+			method: { name: 'deviceType', values: DEVICE_TYPES, description: 'The stored page’s device.' },
+			type: {
+				name: 'band',
+				values: ['under-500k', '500k-1m', '1m-2m', '2m-plus'],
+				description:
+					'Decoded size band, decimal units (1m = 1,000,000 bytes, the stricter reading of a "1 MB" limit): ' +
+					'the three edges are the ones a size budget is judged against.',
 			},
 		},
 	}),
@@ -893,6 +932,10 @@ export const describeMetrics = () => ({
 
 // ---------------------------------------------------------------------- emitters
 //
+/** `render_size`'s band for a decoded byte count — decimal edges, see its catalog entry. */
+export const renderSizeBand = (bytes) =>
+	bytes < 500_000 ? 'under-500k' : bytes < 1_000_000 ? '500k-1m' : bytes < 2_000_000 ? '1m-2m' : '2m-plus';
+
 // The ONLY places `server.recordAnalytics` is called. Each one fixes its metric's slot order to
 // what the catalog above documents, so a dashboard contract cannot be changed by editing an
 // argument list in an unrelated module. Value metrics take the value first, exactly as
@@ -933,6 +976,11 @@ export const metrics = Object.freeze({
 
 	/** What became of one posted render result — exactly one call per result; the `render` outcome series. */
 	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render', 'outcome', outcome, detail ?? null),
+	// trigger-to-cache: ms from the change mark to the render that cleared it, per route
+	renderChangeLag: (lagMs, route) => server.recordAnalytics(lagMs, 'render', 'change_lag_ms', route, null),
+	// a stored page's decoded size, per route and device, banded so a share over a threshold is a count
+	renderSize: (bytes, route, deviceType) =>
+		server.recordAnalytics(bytes, 'render_size', route, deviceType, renderSizeBand(bytes)),
 
 	/** How one render's readiness contract ended — one call per governed variant. */
 	renderReadiness: (contract, verdict) =>
