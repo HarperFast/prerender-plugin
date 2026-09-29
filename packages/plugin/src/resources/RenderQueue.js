@@ -15,7 +15,7 @@ import {
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
 import { hasObservations, recordReadinessExpectation } from '../util/readinessExpectation.js';
-import { recordPageClaim } from '../util/changeProbe.js';
+import { actOnStaleRender, recordPageClaim } from '../util/changeProbe.js';
 import { backoffWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { metrics } from '../metrics.js';
@@ -808,6 +808,8 @@ export class RenderQueue extends Resource {
 		const stored = rendered.filter(
 			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled) && !withheld
 		);
+		// What the change probe's render check made of this render (`recordPageClaim`); acted on below.
+		let claimCheck;
 		if (stored.length) {
 			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
 			// than per use because `recordPageClaim` stores it as the basis a per-URL verification
@@ -853,7 +855,7 @@ export class RenderQueue extends Resource {
 			// the probe claim: one node-local point read and one small write each, and like
 			// `recordPageClaim` it never rejects — a regression signal must not cost a render.
 			const observed = stored.filter((variant) => hasObservations(variant.readiness?.learned));
-			await Promise.all([
+			[claimCheck] = await Promise.all([
 				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt, {
 					pageFacts: describing.pageFacts,
 					complete: everyDevice,
@@ -1017,6 +1019,10 @@ export class RenderQueue extends Resource {
 			// expires, and with the row gone nothing can claim the key meanwhile.
 			await settleTargetless(job, targetless ?? { kind: 'one-off' });
 		}
+		// A render the probe's render check found STALE (it disagrees with the probe's last observation of
+		// the origin — util/changeProbe.js): expired and re-filed HERE, after the page writes and the
+		// reschedule above, either of which would otherwise overwrite the expiry or the re-file.
+		if (renderTarget && claimCheck?.stale) await actOnStaleRender(scheduleUrl, renderTarget);
 		await retireRowIfConverted(job, held);
 	}
 

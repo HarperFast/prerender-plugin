@@ -1346,6 +1346,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 				}
 			),
+			renderCheck: option(
+				true,
+				'Check each render against the probe’s last observation of the origin as it lands (rules with the ' +
+					'`pageCheck` price/availability pair only): a page whose claim DISAGREES with the stored endpoint ' +
+					'signature is hard-expired and its render re-filed ahead of rotation, exactly as a detected change ' +
+					'is. It catches a render claimed before a probe found a change and landing after it, and a render ' +
+					'that captured a stale CDN or origin copy — pages the pass would otherwise not look at again until ' +
+					'its next run. The stored signature is trusted only when the probe is known to have observed the ' +
+					'URL since the origin last moved (the most recent anchor in anchored mode; the start of an active ' +
+					'invalidation), so a render newer than the probe’s view is never expired on its stale evidence, ' +
+					'and one re-file per stored observation bounds a page that disagrees every time. Dry run counts ' +
+					'only. Outcomes are `probe_render_mismatch`. Costs no read or write on a render that agrees.'
+			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
 				min: SECOND,

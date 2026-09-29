@@ -482,6 +482,12 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# before this column existed; those are compared as usual and stamped on their next quiet
 	# probe. Written by the probe only, in the same put/patch as `signature`.
 	ruleFingerprint: String
+	# When the render check (`changeProbe.renderCheck`, util/changeProbe.js renderClaimVerdict) last
+	# expired and re-filed this URL because a render disagreed with `signature`. Bounds it to ONE re-file
+	# per stored observation (it acts only while `probedAt` is newer), so a page that disagrees with the
+	# endpoint on every render cannot loop. Written in the render's own claim patch; null until then.
+	# Adding this column to the @sealed table needs the workers restarted (a deploy does that).
+	renderRefiledAt: Date
 }
 
 # What the last accepted render of a PAGE produced — the defence against content disappearing with

@@ -504,6 +504,13 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
  * one-device render, whose other device pages are older than this record would claim) — stores
  * null, which compares as no claim. A rule without fields keeps the original behaviour exactly: a
  * render that yields no claim writes nothing.
+ *
+ * AND IT CHECKS THE RENDER (`changeProbe.renderCheck`, v0.97.0). The row this reads to choose between
+ * patch and put holds the probe's last observation of the origin, so the new claim is compared with it
+ * right here — see `renderClaimVerdict`. Resolves `{ stale: true }` when the render disagrees and should
+ * be expired and re-filed; the CALLER does that (`actOnStaleRender`), after its own page writes and its
+ * reschedule, which would otherwise overwrite both the expiry and the re-file. Anything else resolves
+ * undefined, and nothing here ever rejects.
  */
 export const recordPageClaim = async (
 	url,
@@ -560,14 +567,141 @@ export const recordPageClaim = async (
 		}
 		// patch cannot create, and put would clobber the probe's own signature/probedAt — so read
 		// first and choose. The read is a node-local point read on a small table, once per render
-		// of a pageCheck-matched URL.
-		const existing = await probeStateTable().get({ id: url, select: ['url'] });
+		// of a pageCheck-matched URL. It carries the probe's baseline too, for the render check.
+		const existing = await probeStateTable().get({
+			id: url,
+			select: ['url', 'signature', 'probedAt', 'ruleFingerprint', 'renderRefiledAt'],
+		});
+		const verdict = existing && claim ? await renderClaimVerdict(url, rule, claim, existing) : null;
+		// The bound (see `renderClaimVerdict`) rides in the claim's own write: no extra write.
+		if (verdict?.stale) fields.renderRefiledAt = new Date();
 		if (existing) await probeStateTable().patch(url, fields);
 		// A record of nothing is not worth creating a row for; on an EXISTING row the nulls above are
 		// the point (they retire an older render's record).
 		else if (fields.pageSignature !== null || fields.pageFacts) await probeStateTable().put(url, { url, ...fields });
+		if (verdict?.outcome) countProbe('render_mismatch', verdict.outcome);
+		return verdict?.stale ? { stale: true } : undefined;
 	} catch (e) {
 		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
+		return undefined;
+	}
+};
+
+/**
+ * THE RENDER CHECK: does a render that just landed disagree with the probe's last observation of the
+ * origin? Null when nothing disagrees (or the check does not apply), else `{ outcome }`, with
+ * `stale: true` when the page should be expired and re-filed.
+ *
+ * WHAT IT CATCHES. A render claimed BEFORE a probe found a change and landing AFTER it — the probe
+ * expired the old page and filed a render, and the render already in flight then stored the old content
+ * over it with a fresh expiry; and a render that captured a stale copy of the page (a CDN or origin
+ * cache behind the one the probe's endpoint reads). Either way the probe will not look at the URL again
+ * until its next pass, a day away in anchored mode, and the page serves wrong until then.
+ *
+ * WHEN IT TRUSTS THE BASELINE. The stored signature is the probe's last observation, and the render is
+ * NEWER than it — so a disagreement means the render is stale OR the origin changed since the probe
+ * looked, and only the first is the render's fault. Acting on the second would expire correct pages en
+ * masse exactly when the origin changes most: every cadence render between a midnight reprice and the
+ * pass reaching its URL. So the baseline is trusted only when the probe is known to have observed the
+ * URL (`observedSince`: the running pass walked past it, or the last pass covered it — or the baseline
+ * itself was written) SINCE the last point the origin is known to have moved: the most recent anchor in
+ * anchored mode, and the start of any active invalidation for the URL's route (a canary trip is a mass
+ * change). Otherwise `untrusted`, and nothing is done — the pass will compare the page's claim itself.
+ *
+ * WHY IT CANNOT LOOP. A page whose origin genuinely disagrees with the endpoint on every render (the
+ * page prints a price the endpoint never reports) would re-render forever. `renderRefiledAt` bounds it
+ * to ONE re-file per stored observation: a later disagreeing render against the same baseline counts
+ * `bounded` and is left to the pass, which acts on the claim as it always has and writes a new baseline.
+ *
+ * Only the price/availability claim pair — the fields a served mismatch costs most on — and only in an
+ * armed probe (`dry_run` is counted otherwise). The mapped `pageCheck.fields` are not checked here: the
+ * mapping-defect guard that protects them lives in the sweep's process.
+ */
+const renderClaimVerdict = async (url, rule, claim, stored) => {
+	if (!config.changeProbe.renderCheck) return null;
+	const fingerprint = stored.ruleFingerprint ?? null;
+	if (!stored.signature || (fingerprint !== null && fingerprint !== rule.fingerprint)) return null;
+	const slots = signatureSlots(stored.signature);
+	if (!slots) return null; // a status-signal literal carries no price/availability to compare
+	if (compareClaims(claim, apiClaimOf(slots, rule.pageCheck)) !== false) return null;
+	const probedAt = epochOf(stored.probedAt);
+	const refiledAt = epochOf(stored.renderRefiledAt);
+	if (Number.isFinite(refiledAt) && !(probedAt > refiledAt)) return { outcome: 'bounded' };
+	if (!(await baselineTrusted(url, probedAt))) return { outcome: 'untrusted' };
+	if (config.changeProbe.dryRun) return { outcome: 'dry_run' };
+	return { stale: true };
+};
+
+/** Is the probe's baseline for `url` known to postdate the last time the origin is known to have moved? */
+const baselineTrusted = async (url, probedAt) => {
+	let movedAt = -Infinity;
+	if (isAnchored()) {
+		const anchor = previousAnchorOccurrence();
+		if (Number.isFinite(anchor)) movedAt = anchor;
+	}
+	try {
+		const epoch = await resolveInvalidation(routeScopeForUrl(url));
+		// The epoch carries the serve path's pad; the trip itself is the instant that matters here.
+		if (epoch) movedAt = Math.max(movedAt, epoch.at - config.invalidation.pad);
+	} catch {
+		// Unknown: judge on the anchor alone.
+	}
+	if (movedAt === -Infinity) return true;
+	const since = observedSince((await sweepStateForRenderCheck())?.sweep, url);
+	return (
+		Math.max(Number.isFinite(probedAt) ? probedAt : -Infinity, Number.isFinite(since) ? since : -Infinity) >= movedAt
+	);
+};
+
+/**
+ * When the probe last OBSERVED `url` at the latest, from this node's published pass state (the probe
+ * writes nothing on an unchanged observation, so this is the only record there is): the start of the
+ * running pass once its cursor is past the URL, else the start of the last pass if it covered the URL
+ * (it finished, or it stopped past it). NaN when unknown. A pass's start is its ORIGIN — a resume and
+ * the pass it continues walk one key range between them.
+ */
+const observedSince = (sweep, url) => {
+	if (!sweep) return NaN;
+	if (sweep.running === true && typeof sweep.progress?.cursor === 'string' && url < sweep.progress.cursor) {
+		return epochMsOf(sweep.originStartedAt ?? sweep.startedAt);
+	}
+	const last = sweep.lastRun;
+	if (!last || last.error) return NaN;
+	if (last.aborted && !(typeof last.walkedThrough === 'string' && url <= last.walkedThrough)) return NaN;
+	return epochMsOf(last.resumedFrom ?? last.startedAt);
+};
+
+// The pass state for the render check, re-read at most every few seconds per worker: it only runs on a
+// disagreement, but a change wave can make that thousands of renders an hour.
+const RENDER_CHECK_STATE_TTL_MS = 10 * SECOND;
+let renderCheckState = { at: 0, row: null };
+const sweepStateForRenderCheck = async () => {
+	if (Date.now() - renderCheckState.at < RENDER_CHECK_STATE_TTL_MS) return renderCheckState.row;
+	renderCheckState = { at: Date.now(), row: await readProbeState() };
+	return renderCheckState.row;
+};
+
+/**
+ * Expire and re-file a render the render check found stale (`recordPageClaim` resolved `{ stale }`):
+ * exactly the probe's own action, so the page stops serving now and its re-render is ranked as a change.
+ * Called by the render result path AFTER its page writes and its reschedule. Never rejects — a render
+ * must not fail for this.
+ */
+export const actOnStaleRender = async (url, target = null) => {
+	try {
+		await actOnChange({
+			url,
+			sitemapUrl: target?.sitemapUrl ?? null,
+			renderInterval: target?.renderInterval ?? null,
+			demandInterval: target?.demandInterval ?? null,
+		});
+		countProbe('render_mismatch', 'refiled');
+		logger.info?.(
+			`[prerender] change-probe: the render of ${url} disagrees with the probe's last observation of the origin — expired and re-filed`
+		);
+	} catch (e) {
+		countProbe('render_mismatch', 'error');
+		logger.warn?.(`[prerender] change-probe: stale render of ${url} not re-filed: ${e?.message ?? String(e)}`);
 	}
 };
 
@@ -3207,6 +3341,7 @@ export const resetChangeProbeState = () => {
 	lastUnsupportedWarnAt = 0;
 	lastFactsUnsupportedWarnAt = 0;
 	lastFactsRefusedWarnAt = 0;
+	renderCheckState = { at: 0, row: null };
 	mappingGuard = null;
 	measuredSliceSize = null;
 	resumePending = false;

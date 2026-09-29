@@ -603,7 +603,13 @@ export const METRICS = Object.freeze({
 			'measured): detail pass = since the start of the pass that found it (for an anchored pass, since the ' +
 			'anchor — the lag itself for a change that landed on schedule), detail previous_pass = since the ' +
 			'start of the pass before (a true bound when that pass covered the URL); context = the rule label. ' +
-			'Read percentiles, never the total; ' +
+			'Read percentiles, never the total; probe_render_mismatch = the render check (changeProbe.renderCheck): ' +
+			'a render that landed disagreeing with the probe’s last observation of the origin, detail = refiled ' +
+			'(hard-expired and re-filed as a change), bounded (already re-filed once against that observation — a ' +
+			'page that disagrees every time; left to the pass), untrusted (the observation predates the last ' +
+			'anchor or trip and no pass has seen the URL since, so the render may just be newer — nothing done), ' +
+			'dry_run, error. refiled is stale renders caught before they served a pass-length; a steady bounded ' +
+			'is pages the endpoint and the page genuinely disagree on; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -727,6 +733,7 @@ export const METRICS = Object.freeze({
 					'probe_ignored',
 					'probe_anchor',
 					'probe_detection_lag',
+					'probe_render_mismatch',
 					'discovery_gated',
 					'entity_gate',
 					'raw_cache',
@@ -780,7 +787,7 @@ export const METRICS = Object.freeze({
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). probe_anchor: the outcome (on_time, interrupted, ' +
-					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). Other series: null.',
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (refiled, bounded, untrusted, dry_run, error). Other series: null.',
 			},
 			type: {
 				name: 'context',

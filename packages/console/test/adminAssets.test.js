@@ -348,6 +348,7 @@ test('every probe series the catalog declares is read by the console, or waived 
 		['probe_ignored', 'plugin 0.97.0: read via /change-probe (ignored); panel later'],
 		['probe_anchor', 'plugin 0.97.0: anchored-pass outcomes (detail); logged on the node; panel later'],
 		['probe_detection_lag', 'plugin 0.97.0: a duration (percentiles, per rule); panel later'],
+		['probe_render_mismatch', 'plugin 0.97.0: render-check outcomes (detail); panel later'],
 	]);
 
 	for (const name of series) {
