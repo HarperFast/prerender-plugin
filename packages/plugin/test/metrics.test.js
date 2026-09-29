@@ -383,7 +383,15 @@ test('the negative cache and the reopen trigger emit prerender_ops series the ca
 		method: 'http-gone',
 		type: '<1d',
 	});
-	for (const e of [n, g, r, l]) assert.ok(ops.includes(e.path), `prerender_ops missing ${e.path}`);
+	const h = emitted(() => metrics.suppressionHeld('http-gone', '<6h'));
+	assert.deepEqual(h, {
+		value: true,
+		metric: 'prerender_ops',
+		path: 'suppression_held',
+		method: 'http-gone',
+		type: '<6h',
+	});
+	for (const e of [n, g, r, l, h]) assert.ok(ops.includes(e.path), `prerender_ops missing ${e.path}`);
 	assert.ok(ops.includes('raw_cache'), 'raw_cache was emitted and undeclared before v0.96.0');
 });
 

@@ -682,10 +682,20 @@ export class RenderQueue extends Resource {
 			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
 			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
 			// http-error verdicts by status (404/410 recheck less, die sooner).
-			const { deleted, absent } = await Target.suppress(url, {
+			const { deleted, absent, held } = await Target.suppress(url, {
 				reason: verdict.reason,
 				statusCode: verdict.statusCode,
 			});
+			// The other half of `suppression_lifted` below: a suppressed target rendered, and the verdict
+			// stood. Together they are the precision of every early recheck — a gone target rendered
+			// before its `recheckInterval` was filed by a reopen (util/goneReopen.js), and this is where
+			// one that found the page still gone shows up.
+			if (held) {
+				metrics.suppressionHeld(
+					held.reason ?? 'unknown',
+					suppressionAgeBucket(Date.now() - dateColumnMs(held.suppressedAt))
+				);
+			}
 			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
 			// device rows with it — so a folding row is already gone (a second delete would only write a
 			// tombstone), while a non-default one-device row still needs retiring below.

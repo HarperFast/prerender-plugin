@@ -553,7 +553,8 @@ export const METRICS = Object.freeze({
 			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
-			'stored 404 (negative_gap), per reopen decision (gone_reopen), per lifted suppression (suppression_lifted)',
+			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
+			'or suppression_held)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -635,7 +636,11 @@ export const METRICS = Object.freeze({
 			'recheck due now), would-file (dry run), deduped, capped; the render verdict then decides, and ' +
 			'suppression_lifted is where a reopen that worked shows up. suppression_lifted = one emit per suppression ' +
 			'a render lifted, with the reason and how long it had held — the only measure of how often a verdict ' +
-			'turns out to have been temporary. ' +
+			'turns out to have been temporary. suppression_held = the other half: a suppressed target rendered and ' +
+			'the verdict stood (re-suppressed with another strike, or deleted at the ceiling). Read the two ' +
+			'together by age: a gone target’s own recheck lands in 14d+ (render.suppression.gone.recheckInterval), ' +
+			'so http-gone in the younger buckets is an EARLY recheck — a reopen, an arrival or an operator ' +
+			'revalidate — and lifted / (lifted + held) there is how often the evidence that filed it was right. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
@@ -647,7 +652,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen and suppression_lifted are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'gone_reopen, suppression_lifted and suppression_held are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -707,6 +712,7 @@ export const METRICS = Object.freeze({
 					'negative_gap',
 					'gone_reopen',
 					'suppression_lifted',
+					'suppression_held',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -723,7 +729,7 @@ export const METRICS = Object.freeze({
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
-					'lifted, by reason and age.',
+					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age.',
 			},
 			method: {
 				name: 'detail',
@@ -750,8 +756,8 @@ export const METRICS = Object.freeze({
 					'bot-excluded, read-blob-failed); a background re-check (recheck-gone, recheck-live, recheck-moved, ' +
 					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
-					'suppression_lifted: the suppressedReason the render lifted (http-gone, noindex, ' +
-					'canonical-mismatch, ...). Other series: null.',
+					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
+					'(http-gone, noindex, canonical-mismatch, ...). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -760,8 +766,8 @@ export const METRICS = Object.freeze({
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
 					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
-					'suppression_lifted: how long the target had been suppressed — <1h, <6h, <1d, <3d, <14d, 14d+, or ' +
-					'unknown. Other series: null.',
+					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
+					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. Other series: null.',
 			},
 		},
 	}),
@@ -970,6 +976,9 @@ export const metrics = Object.freeze({
 	/** A suppression a render lifted: the reason it had been suppressed for, and how long it held (a bucket). */
 	suppressionLifted: (reason, ageBucket) =>
 		server.recordAnalytics(true, 'prerender_ops', 'suppression_lifted', reason, ageBucket),
+	/** A suppressed target rendered and still non-indexable: the reason it was suppressed for, and how long it had held. */
+	suppressionHeld: (reason, ageBucket) =>
+		server.recordAnalytics(true, 'prerender_ops', 'suppression_held', reason, ageBucket),
 
 	/**
 	 * One result posted in the single-device shape for a job that asked for several — a renderer
