@@ -81,6 +81,7 @@ const newStats = () => ({
 	leaseSkipped: 0,
 	deleted: 0,
 	visitedSkipped: 0,
+	suppressedSkipped: 0,
 	errors: 0,
 	errorSamples: [],
 	abortedOnErrors: false,
@@ -417,6 +418,55 @@ test('skipVisited: off by default, so the predicate is unchanged for existing ca
 	});
 	assert.deepEqual(deleted, ['https://x.example/product/a']);
 	assert.equal(stats.visitedSkipped, 0);
+});
+
+test('a SUPPRESSED row is kept unless its verdict is gone — deleting it lets discovery re-mint a 200 page', async () => {
+	// canonical-mismatch and noindex pages answer 200, so the next crawl re-mints them: a delete, a mint, a
+	// render and a re-suppression per URL. Suppression clears demandInterval, so skipVisited never spared them.
+	const deleted = [];
+	const stats = newStats();
+	await purge.purgeDiscoveredTargets({
+		rows: (async function* () {
+			yield {
+				url: 'https://x.example/product/a',
+				sitemapUrl: null,
+				state: 'suppressed',
+				suppressedReason: 'canonical-mismatch',
+			};
+			yield { url: 'https://x.example/product/b', sitemapUrl: null, state: 'suppressed', suppressedReason: 'noindex' };
+			yield {
+				url: 'https://x.example/product/c',
+				sitemapUrl: null,
+				state: 'suppressed',
+				suppressedReason: 'http-gone',
+			};
+			yield { url: 'https://x.example/product/d', sitemapUrl: null, state: null };
+		})(),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		isLeased: () => false,
+		deleteTarget: async (url) => deleted.push(url),
+		dryRun: false,
+		ratePerSecond: 1_000_000,
+		skipVisited: true,
+		pause: async () => {},
+		stats,
+	});
+	assert.deepEqual(deleted, ['https://x.example/product/c', 'https://x.example/product/d']);
+	assert.equal(stats.suppressedSkipped, 2);
+	assert.equal(stats.discovered, 4);
+});
+
+test('walkPrefix projects the verdict, so the purge can tell a suppressed row', async () => {
+	const selects = [];
+	const table = {
+		search({ select }) {
+			selects.push(select);
+			return [];
+		},
+	};
+	for await (const r of purge.walkPrefix(table, 'https://x.example/catalog/', 2)) assert.fail(r);
+	assert.ok(selects[0].includes('state') && selects[0].includes('suppressedReason'));
 });
 
 /**

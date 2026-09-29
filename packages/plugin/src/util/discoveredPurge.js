@@ -39,6 +39,7 @@ import { classifyUrl, PRERENDER } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
 import { walkUrlRange } from './urlWalk.js';
+import { isGoneSuppressed } from './suppression.js';
 import {
 	claimRun,
 	finishRun,
@@ -75,7 +76,7 @@ export async function* walkPrefix(table, urlPrefix, chunkSize = CHUNK_SIZE, onUn
 	const endBound = urlPrefix.slice(0, -1) + String.fromCharCode(urlPrefix.charCodeAt(urlPrefix.length - 1) + 1);
 	for await (const row of walkUrlRange(table, {
 		startAt: urlPrefix,
-		select: ['url', 'sitemapUrl', 'demandInterval'],
+		select: ['url', 'sitemapUrl', 'demandInterval', 'state', 'suppressedReason'],
 		chunkSize,
 		onUnreadable,
 		endBound,
@@ -181,6 +182,17 @@ export const purgeDiscoveredTargets = async ({
 		if (row.sitemapUrl !== null && row.sitemapUrl !== undefined && row.sitemapUrl !== '') continue;
 		stats.discovered++;
 
+		// A SUPPRESSED row is kept unless its verdict is gone. It is the verdict memory that stops the URL
+		// being re-created: canonical-mismatch and noindex pages answer 200, so discovery re-mints them on
+		// the next crawl the moment the row is gone — a delete, a mint, a render and a re-suppression to
+		// arrive back where the purge started, per URL (hundreds of thousands of such rows on one
+		// deployment). `skipVisited` cannot spare them either: suppression clears `demandInterval`. A
+		// gone verdict is the exception, because nothing re-mints a 404 (discovery mints only on a 200).
+		if (row.state === 'suppressed' && !isGoneSuppressed(row)) {
+			stats.suppressedSkipped++;
+			continue;
+		}
+
 		// `skipVisited` spares anything the demand ladder has PROMOTED. A stored `demandInterval`
 		// is not a guess: the ladder writes a rung only after a bot visited the URL in each of
 		// `promoteWindows` consecutive windows, so it is durable evidence of repeat crawler demand
@@ -223,6 +235,7 @@ const newStats = () => ({
 	leaseSkipped: 0,
 	deleted: 0,
 	visitedSkipped: 0,
+	suppressedSkipped: 0,
 	errors: 0,
 	errorSamples: [],
 	abortedOnErrors: false,
@@ -395,6 +408,7 @@ export const startDiscoveredPurge = async ({
 					// INCOMPLETE for its prefix even when it reports no error — say so here rather
 					// than leaving an operator to infer it from a count that does not add up.
 					`${stats.visitedSkipped ? `, ${stats.visitedSkipped} spared as bot-visited` : ''}` +
+					`${stats.suppressedSkipped ? `, ${stats.suppressedSkipped} kept as suppressed (the verdict holds re-discovery off)` : ''}` +
 					`${stats.unreadable ? `, ${stats.unreadable} unreadable row(s) skipped` : ''}` +
 					`${stats.errors ? `, ${stats.errors} failed and left for the next pass` : ''})` +
 					`${stats.error ? ` — error: ${stats.error}` : ''}`
