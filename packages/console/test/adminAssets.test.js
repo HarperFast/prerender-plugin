@@ -503,6 +503,11 @@ test('every queue_health series is read or waived, and the console reads none th
 		['paused', 'pause state is read from the overview (QueueControl intent and QueueStatus observed)'],
 		['reconcile_restored', 'the Corpus view reads the repair sweep result from overview.reconcile'],
 		['reconcile_missing', 'the Corpus view reads the repair sweep result from overview.reconcile'],
+		[
+			'keeper_unschedulable',
+			'plugin v0.97.0: emitted only when a verification walk finds owned rows with no due time (expect none); ' +
+				'the count is also in queue-state keeper.verify.unschedulable — a Queue tile is a console follow-up',
+		],
 	]);
 	for (const name of declared) {
 		if (NOT_CHARTED.has(name)) continue;

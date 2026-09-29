@@ -775,6 +775,43 @@ test('the verification walk repairs a missing row, a mismatched one and a delete
 	s.stop();
 });
 
+test('a row with no usable due time is counted apart by the walk, never "repaired" on every pass', async () => {
+	// The keeper never holds a row without a due time (its own rule), so held === null is the RIGHT state
+	// for one. Counted as missing, every walk "repaired" it again: keeper_repaired never reached 0 and the
+	// keeper never read as exact, forever, over one bad row.
+	const now = Date.now();
+	seed([
+		row(item(1), now - HOUR),
+		{ cacheKey: item(2), nextRenderTime: null, fromSitemap: true },
+		{ cacheKey: item(3), nextRenderTime: -5, fromSitemap: true },
+	]);
+	const s = await started();
+	const first = await s.verify();
+	const second = await s.verify();
+	for (const walk of [first, second]) {
+		assert.equal(walk.missing, 0);
+		assert.equal(walk.repaired, 0, 'nothing the keeper holds differs from the table');
+		assert.equal(walk.unschedulable, 2, 'the two rows no claim can grant, counted on their own');
+	}
+	assert.equal(s.keeper.has(item(2)), false);
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.trust.exact, true, 'a bad row is not a keeper that disagrees with its table');
+	s.stop();
+});
+
+test('a held row whose due time the table has since lost is dropped by the walk, as a mismatch', async () => {
+	const now = Date.now();
+	seed([row(item(1), now - HOUR)]);
+	const s = await started();
+	table.set(item(1), { cacheKey: item(1), nextRenderTime: null, fromSitemap: true }); // event lost
+	const result = await s.verify();
+	assert.equal(result.mismatched, 1);
+	assert.equal(result.unschedulable, 0);
+	assert.equal(s.keeper.has(item(1)), false);
+	s.stop();
+});
+
 test('the verification walk repairs a changed row whose demand estimate differs from the table', async () => {
 	// `matches` compares the estimate: a keeper holding the wrong one would order that page by a demand
 	// it does not have until the next write happened to touch it.

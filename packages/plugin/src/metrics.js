@@ -471,8 +471,8 @@ export const METRICS = Object.freeze({
 		cadence:
 			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
 			'reconcile_* once per sweep per node; keeper_load_ms once per keeper load, keeper_publish_ms once per ' +
-			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms and keeper_repaired once ' +
-			'per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
+			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms, keeper_repaired and ' +
+			'keeper_unschedulable once per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
 		summary: 'Every queue signal under one name: backlog gauges, the queue keeper, schedule-gap repairs.',
 		usefulFor:
 			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
@@ -498,6 +498,7 @@ export const METRICS = Object.freeze({
 					'keeper_publish_ms',
 					'keeper_repaired',
 					'keeper_verify_ms',
+					'keeper_unschedulable',
 					'claim_stale',
 					'claim_wedged',
 				],
@@ -521,6 +522,10 @@ export const METRICS = Object.freeze({
 					'(missing, wrong minute or class, or deleted) and repaired; expect 0, and treat a steady count as ' +
 					'its subscription losing writes. ' +
 					'keeper_verify_ms = one verification walk of the whole table (queue.keeper.verifyInterval). ' +
+					'keeper_unschedulable = rows this node owns whose nextRenderTime is null or negative, found by a ' +
+					'verification walk (emitted only when non-zero): the keeper cannot hold them and no claim can grant ' +
+					'them, so those URLs never render until something re-files them. Not a repair, and not counted in ' +
+					'keeper_repaired. ' +
 					'claim_stale = ready-set entries a claim skipped because the durable row was no longer due ' +
 					'(rendered, rescheduled or deleted after the keeper published it): renders the check saved. A ' +
 					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late. ' +
