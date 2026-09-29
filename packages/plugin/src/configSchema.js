@@ -65,7 +65,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 	domains: option(
 		[],
 		'Allowlist of hostnames considered indexable. Pages on other hosts are rendered but ' +
-			'never marked indexable/cached. Empty = allow all.',
+			'never marked indexable/cached. Empty = allow all.\n\n' +
+			'Also the hosts a SITEMAP fetch may send `origin.securityToken` to (and pin to ' +
+			'`origin.staging.ip`), beside the root sitemap\u2019s own host — re-decided on every redirect ' +
+			'hop. A child sitemap on another host of this deployment needs listing here; empty trusts only ' +
+			'the root\u2019s host.',
 		{ itemType: 'string' }
 	),
 

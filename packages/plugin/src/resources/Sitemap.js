@@ -1247,6 +1247,11 @@ async function relinkAfterFailedWalk(run) {
  *
  * Only held URLs are covered (`holdCap`). A deployment holding none has no departure or arrival action
  * to protect, and its URL simply re-attaches on the unchanged child's next full pass.
+ *
+ * THE COST is at most one full fetch and parse per 304'd urlset — an unconditional pass's downloads
+ * without its reconcile — and only on a walk that both unlinked something and had unchanged children:
+ * the in-between walks of a corpus whose children do not all rebuild at once. A walk where everything
+ * answered 304 unlinked nothing, and one where everything changed has nothing unchanged to re-read.
  */
 async function reattachToUnchangedListers(run, rootSitemapUrl) {
 	const unchanged = run.unchangedUrlsets();
