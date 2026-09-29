@@ -257,7 +257,9 @@ export const getScheduleRow = (cacheKey, select) =>
  *
  * A RENDER THAT NEVER REPORTS IS BOUNDED HERE. A lease that expires with no result — a renderer crashing
  * on the URL, or a result that cannot get back to this node — leaves the row due, so the key would be
- * granted again at every expiry, forever. The lease table counts those misses; past the fast-retry
+ * granted again at every expiry, forever; so does a result that was processed and released its lease
+ * but whose commit then failed (it is re-granted at the same due minute, which the lease table counts
+ * as a miss too — see `missesOf` in util/renderLease.js). The lease table counts those misses; past the fast-retry
  * lane's own holds (`render.failureRetry.fastRetries`) plus one, the key is HELD BACK in the lease table
  * instead of granted — two leases, then four, eight, … capped at its cadence — and named (`pass.wedged`).
  * Nothing durable is written, no strike is counted, and the first result that comes back for the key
@@ -314,7 +316,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 				pass.skippedStale++;
 				continue;
 			}
-			const misses = leases.missesBeforeGrant(entry.cacheKey);
+			const misses = leases.missesBeforeGrant(entry.cacheKey, minuteOf(dueAt));
 			if (misses > missLimit) {
 				const carried = Number(row.effectiveInterval);
 				const cadence =
@@ -322,7 +324,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 						? carried
 						: resolveRenderInterval(CacheKey.urlOf(entry.cacheKey), null);
 				const backoff = Math.min(cadence, leaseTimeMs * 2 ** Math.min(20, misses - missLimit));
-				if (leases.hold(entry.cacheKey, nowMs + backoff))
+				if (leases.hold(entry.cacheKey, nowMs + backoff, minuteOf(dueAt)))
 					pass.wedged.push({ cacheKey: entry.cacheKey, misses, backoff });
 				continue;
 			}
@@ -500,9 +502,13 @@ export const readKeeperSignal = (nowMs = Date.now()) => {
 
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
 
-export const releaseLease = (cacheKey) => leaseTable().release(cacheKey);
+/** Release `cacheKey`'s lease; with `grantedAtMs` (from `leaseGrant`), only the lease granted then. */
+export const releaseLease = (cacheKey, options) => leaseTable().release(cacheKey, options);
 
 export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
+
+/** The key's latest real grant, live, released or expired — the lease generation a result belongs to. */
+export const leaseGrant = (cacheKey) => leaseTable().grantOf(cacheKey);
 
 // ---- status derivation (zero DB ops) --------------------------------------------------------
 

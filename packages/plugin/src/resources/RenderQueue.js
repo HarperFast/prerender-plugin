@@ -27,6 +27,7 @@ import {
 	deleteSchedule,
 	deriveQueueStatus,
 	getScheduleRow,
+	leaseGrant,
 	reconcileLeaseGauge,
 	releaseLease,
 	writeSchedule,
@@ -205,6 +206,30 @@ const readMarks = async (url) => {
 	if (!(Number.isFinite(changedAt) && changedAt > 0)) return {};
 	const demandPeriod = numberOf(row?.demandPeriod);
 	return { changedAt, demandPeriod: Number.isFinite(demandPeriod) && demandPeriod > 0 ? demandPeriod : undefined };
+};
+
+/**
+ * How much earlier than a key's latest grant a result's render must provably have begun before it is
+ * treated as another lease's (see `processJobResult`). The grant instant is floored to the second and a
+ * renderer's timing comes off its own clock; the slack absorbs both, and costs detection only for a
+ * render that began within it of the re-grant — which a lease of at least two minutes all but rules out.
+ */
+const LEASE_GENERATION_SLACK_MS = 5_000;
+
+/**
+ * The latest instant a posted result's render can have begun: now, less the render time its variants
+ * report — they render in turn inside one job, so their times add, and each is a duration off the
+ * renderer's own clock, so no skew enters. Null when none reported one (a renderer older than the
+ * field, or nothing rendered), and then the lease-generation tests have nothing to go on and decide
+ * nothing.
+ */
+const renderStartedBy = (result, nowMs) => {
+	const times = Array.isArray(result.variants)
+		? result.variants.map((variant) => variant?.renderTime)
+		: [result.renderTime];
+	let total = 0;
+	for (const ms of times) if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) total += ms;
+	return total > 0 ? nowMs - total : null;
 };
 
 /** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
@@ -521,6 +546,27 @@ export class RenderQueue extends Resource {
 		// reassign the working key, and releasing by that would have leaked the SOURCE's lease on every
 		// rendered client-side redirect — the source would then stay unclaimable for a full lease).
 		const claimKey = result.id;
+		// THE LEASE GENERATION THIS RESULT CAN BELONG TO, read before anything is decided or released. A
+		// render that outlives its lease still posts its result, and by then the key can have been granted
+		// to another renderer. That result is LATE, not current: it must not overwrite the newer lease's
+		// page (or reschedule over its result, if it has landed), and above all must not release the newer
+		// lease — release was keyed by the key alone, so it handed the other renderer's key back to the
+		// queue mid-render. A result whose render provably began before the key's latest grant is
+		// therefore dropped whole, and the release below names the grant it belongs to.
+		//
+		// "Provably" is one-directional on purpose: the renderer echoes no lease token, so the only
+		// evidence is its render time against the grant instant. A result that cannot be proved late is
+		// processed exactly as before.
+		const grant = claimKey === undefined || claimKey === null ? null : leaseGrant(String(claimKey));
+		const startedBy = renderStartedBy(result, Date.now());
+		if (grant && startedBy !== null && startedBy < grant.grantedAtMs - LEASE_GENERATION_SLACK_MS) {
+			metrics.renderOutcome('superseded', 'newer-lease');
+			logger.info(
+				`[prerender] discarding a late result for ${claimKey}: its render began before the key was leased again ` +
+					`at ${new Date(grant.grantedAtMs).toISOString()}, so that lease's render stands and its lease is left alone`
+			);
+			return;
+		}
 		// Set true by the branches whose retry pacing IS the lease (see retryAfterFailure): they
 		// must keep it, or the row — which still carries its original overdue due time now that
 		// the lease has left `nextRenderTime` — becomes immediately re-claimable and hot-loops.
@@ -530,6 +576,8 @@ export class RenderQueue extends Resource {
 				holdLease: () => {
 					holdLease = true;
 				},
+				grant,
+				startedBy,
 			});
 		} catch (e) {
 			// A THROW MUST HOLD THE LEASE. `holdLease` is only set by branches that ran to
@@ -548,8 +596,11 @@ export class RenderQueue extends Resource {
 			holdLease = true;
 			throw e;
 		} finally {
-			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`.
-			if (!holdLease && claimKey) releaseLease(claimKey);
+			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`, and only of the
+			// grant read above: a key granted again while this result was processed is another renderer's.
+			// No grant at all means this node holds no lease the result could be for (a restart, or the
+			// slot recycled), so any lease that appears meanwhile is someone else's too.
+			if (!holdLease && grant) releaseLease(claimKey, { grantedAtMs: grant.grantedAtMs });
 		}
 	}
 
@@ -593,7 +644,7 @@ export class RenderQueue extends Resource {
 	 * renders — while a per-device row for a NON-default device is a one-off: its page is stored and
 	 * the row deleted, and the URL row is not touched. `describeJob` decides which, once.
 	 */
-	static async processDecodedJobResult(posted, { holdLease: hold }) {
+	static async processDecodedJobResult(posted, { holdLease: hold, grant = null, startedBy = null }) {
 		const { rowKey, url, asked, variants } = normalizeJobResult(posted);
 		const job = describeJob(rowKey, url);
 		let held = false;
@@ -655,6 +706,31 @@ export class RenderQueue extends Resource {
 			// drag the percentile toward the very ceiling the reader is checking against.
 			if (typeof readiness.firstSatisfiedMs === 'number')
 				metrics.renderReadinessMs(readiness.firstSatisfiedMs, readiness.contract);
+		}
+
+		// 0. A RESULT FROM A LEASE OLDER THAN A CHANGE MARK IS OLD CONTENT. The change probe (or a gone
+		// reopen, or a sitemap departure) marks the row `changedAt` when it finds the origin changed, and
+		// hard-expires the page. A render granted BEFORE that instant may have fetched the document before
+		// the change — measured shape: claimed at T-8s, marked at T, posted at T+3s — and storing it would
+		// serve the old price fresh for a whole cadence, while its reschedule cleared the mark that says
+		// the page is wrong. So it is dropped whole: nothing stored, the row left due with its mark, and the
+		// lease released so the page renders again at once. It cannot loop: the next grant is after the
+		// mark, whose first instant `fileDueNow` keeps.
+		//
+		// The grant is the lease's, floored to its second — a lower bound, so this errs toward one wasted
+		// render, never toward a stored stale page — or, with no lease slot to ask, the latest instant the
+		// render can have begun. Only for a job that writes the URL row: a one-device render beside the
+		// rotation neither reads nor clears its mark.
+		const marks = job.fold ? await readMarks(url) : {};
+		const grantedBy = Math.min(grant?.grantedAtMs ?? Infinity, startedBy ?? Infinity);
+		if (marks.changedAt !== undefined && marks.changedAt > grantedBy) {
+			metrics.renderOutcome('superseded', 'changed-during-render');
+			logger.info(
+				`[prerender] not storing the render of ${url}: its lease predates the change found at ` +
+					`${new Date(marks.changedAt).toISOString()}, so it may show the old content. The row stays due and ` +
+					`marked, and renders again now.`
+			);
+			return;
 		}
 
 		// 1. A redirect the browser bailed on at navigation, or a rendered-through client-side redirect

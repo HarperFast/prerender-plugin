@@ -692,11 +692,47 @@ test('a key whose leases keep expiring with no result is held back, ever longer,
 
 		clock += 4 * lease + 1_000;
 		assert.equal((await claimOne()).jobs.length, 1);
-		funnel.releaseLease(item(1)); // a result arrives
+		// A result arrives, and moves the row as every result that lands does (here to a minute that is
+		// still due, so the next claim can see it). A release that leaves the row at the minute it was
+		// granted for is a result that did not commit — counted as a miss, not a reset (see below).
+		funnel.releaseLease(item(1));
+		const moved = row(item(1), clock - MINUTE);
+		table.set(item(1), moved);
+		emit('put', item(1), moved);
 		clock += lease + 1_000;
 		pass = await claimOne();
 		assert.equal(pass.jobs.length, 1, 'a result resets the count: granted normally again');
 		assert.deepEqual(pass.wedged, []);
+		s.stop();
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test('a key whose results keep being released without moving its row is held back too', async () => {
+	// The result path releases before the request's transaction commits; a commit that then fails leaves
+	// the row due at its old minute, and the key is re-granted as soon as the grace passes — a loop at
+	// claim speed that renders the page and stores nothing. Each release reset the count, so the wedge
+	// guard never engaged.
+	const realNow = Date.now;
+	let clock = realNow();
+	Date.now = () => clock;
+	try {
+		seed([row(item(1), clock - HOUR)]);
+		const s = await started({ now: () => clock });
+		const claimOne = async () => {
+			await s.publish();
+			return funnel.claimSchedules({ grantLimit: 1 });
+		};
+		const limit = config.render.failureRetry.fastRetries + 2;
+		for (let i = 0; i < limit; i++) {
+			assert.equal((await claimOne()).jobs.length, 1, `lease ${i + 1} granted`);
+			funnel.releaseLease(item(1)); // a result was processed; its commit did not land
+			clock += 6_000; // past the release grace
+		}
+		const pass = await claimOne();
+		assert.equal(pass.jobs.length, 0, 'held back, not granted again');
+		assert.equal(pass.wedged[0]?.cacheKey, item(1));
 		s.stop();
 	} finally {
 		Date.now = realNow;

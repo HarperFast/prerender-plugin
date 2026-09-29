@@ -1125,3 +1125,102 @@ test('a temporary redirect re-files the source at its EFFECTIVE cadence, carryin
 	assert.ok(row.nextRenderTime >= before + 48 * HOUR_MS - 60_000, 'but no lease-scale wait: strikes retire here');
 	assert.equal(row.changedAt, changedAt);
 });
+
+// ───────────────────────────── which lease a result belongs to ─────────────────────────────
+
+/** Drive Date.now for one test: every clock in the claim, lease and result paths reads it late. */
+const fakeClock = (t) => {
+	const real = Date.now;
+	const clock = { now: real() };
+	Date.now = () => clock.now;
+	t.after(() => {
+		Date.now = real;
+	});
+	return clock;
+};
+
+test('a render whose lease predates a change mark is not stored: the row stays due, marked, and renders again', async (t) => {
+	// Claimed at T-8s, the probe finds the origin changed and marks the row at T, the result posts at T+3s:
+	// its document may be from before the change, and storing it would serve the old price for a cadence.
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += 8_000;
+	const changedAt = clock.now;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt, demandPeriod: 6 * 3_600_000 });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>old price</html>'), rendered('mobile', '<html>old</html>')]);
+
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content, 'old html', 'nothing stored');
+	const row = stores.renderSchedule.get(A);
+	assert.equal(row.nextRenderTime, 1, 'still due where it was');
+	assert.equal(row.changedAt, changedAt, 'and still marked');
+	assert.equal(leased(A), false, 'the lease is released, so the page renders again at once');
+	assert.deepEqual(outcomes(), [['superseded', 'changed-during-render']]);
+});
+
+test('a render granted AFTER the change mark is stored as normal, and its reschedule clears the mark', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: clock.now - 60_000 });
+	await claim();
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>new price</html>'), rendered('mobile')]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>new price</html>');
+	assert.equal(stores.renderSchedule.get(A).changedAt, undefined);
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+});
+
+test('a result that outlived its lease does not release the renderer the key went to next', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000; // the first renderer is still going; its lease expires
+	assert.equal((await claim()).length, 1, 'and the key is granted to a second renderer');
+	clock.now += 20_000;
+	// began before the second grant: 30s + 20s ago, and it rendered for longer than that
+	await postVariants(A, [
+		rendered('desktop', '<html>late</html>', { renderTime: 60_000 }),
+		rendered('mobile', '<html>late</html>', { renderTime: 20_000 }),
+	]);
+
+	assert.equal(leased(A), true, 'the second renderer still holds its lease');
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content, 'old html', 'and the late page is not stored');
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, 1, 'nor rescheduled over');
+	assert.deepEqual(outcomes(), [['superseded', 'newer-lease']]);
+});
+
+test('a result that outlived its lease never overwrites the page the next lease already stored', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000;
+	await claim();
+	clock.now += 10_000;
+	await postVariants(A, [rendered('desktop', '<html>newer</html>'), rendered('mobile', '<html>newer</html>')]);
+	const rescheduled = stores.renderSchedule.get(A).nextRenderTime;
+	clock.now += 10_000;
+	await postVariants(A, [
+		rendered('desktop', '<html>older</html>', { renderTime: 80_000 }),
+		rendered('mobile', '<html>older</html>', { renderTime: 10_000 }),
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>newer</html>');
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, rescheduled);
+	assert.deepEqual(outcomes(), [
+		['rendered', 'stored'],
+		['superseded', 'newer-lease'],
+	]);
+});
+
+test('a result that outlived its lease with NO grant since is still the latest render, and is stored', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000;
+	await postVariants(A, [
+		rendered('desktop', '<html>slow</html>', { renderTime: config.queue.jobLeaseTime }),
+		rendered('mobile', '<html>slow</html>', { renderTime: 20_000 }),
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>slow</html>');
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+});

@@ -318,9 +318,11 @@ export const METRICS = Object.freeze({
 				description:
 					'time_ms: HTTP status the render observed — a NUMBER at the emit site (for a redirect bail, ' +
 					'the FIRST hop’s 3xx). outcome: rendered | suppressed | auth-failure | transient | failed | ' +
-					'redirect — rendered = usable result, suppressed = genuine non-indexable verdict (target moves ' +
-					'to its recheck cadence), auth-failure = 401/403 kept and retried, transient = 408/429/5xx kept ' +
-					'and retried, failed = the render itself broke, redirect = the page moved or bounced.',
+					'redirect | superseded — rendered = usable result, suppressed = genuine non-indexable verdict ' +
+					'(target moves to its recheck cadence), auth-failure = 401/403 kept and retried, transient = ' +
+					'408/429/5xx kept and retried, failed = the render itself broke, redirect = the page moved or ' +
+					'bounced, superseded = the result was dropped whole because a newer fact outranks it (plugin ' +
+					'v0.97.0; see its detail).',
 			},
 			type: {
 				name: 'candidacy (time_ms) / detail (outcome)',
@@ -347,6 +349,8 @@ export const METRICS = Object.freeze({
 					'permanent',
 					'navigation',
 					'not-attempted',
+					'newer-lease',
+					'changed-during-render',
 				],
 				description:
 					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
@@ -364,7 +368,11 @@ export const METRICS = Object.freeze({
 					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
 					'it — a render is wasted every interval until fixed), non-indexable-destination (source ' +
 					'retired, destination suppressed), temporary (kept, strike counted), permanent (source retired ' +
-					'in favor of the destination).',
+					'in favor of the destination); superseded: newer-lease (the render began before the key was ' +
+					'leased to another renderer — a result that outlived its lease; nothing stored, and the newer ' +
+					'lease is not released) / changed-during-render (its lease predates the row’s change mark, so ' +
+					'it may show the content from before the change; nothing stored, the row stays due and marked ' +
+					'and renders again at once).',
 			},
 		},
 	}),
