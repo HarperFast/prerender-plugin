@@ -1958,7 +1958,7 @@ export const runProbeSweepOnce = async ({
 			// reseed: a row it re-baselined before a restart cut it short is re-baselined already.
 			skipProbedSince: resume?.originStartedAt ?? startedAt,
 			// A pending reseed cancels too: the pass that must stand down for it is this one. So does an
-			// anchored pass's request, for a pass that only measures.
+			// anchored pass's request, when this is a dry run or a reseed.
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null || interruptedBy !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 			inScope: probeScopeFilter(config.changeProbe),
@@ -2713,8 +2713,9 @@ const actingPassSince = (sweep, since) => {
  *
  * WHICH WINS. A stale claim that belongs to the current anchor period (its origin is at or after the
  * most recent anchor) is today's pass: it is resumed from its cursor. A dry run or a reseed is not
- * resumed when a catch-up is due — the anchored pass would interrupt it the moment it started. One whose origin predates the most recent anchor is yesterday's pass: finishing its tail
- * would leave the head unprobed since before the anchor, so the catch-up runs a whole pass instead.
+ * resumed when a catch-up is due — the anchored pass would interrupt it the moment it started. One
+ * whose origin predates the most recent anchor is yesterday's pass: finishing its tail would leave the
+ * head unprobed since before the anchor, so the catch-up runs a whole pass instead.
  */
 const checkResume = async () => {
 	const decided = (result) => {
@@ -2854,16 +2855,16 @@ const previousAnchorOccurrence = () => {
 
 /**
  * Ask whatever sweep holds this node's claim to stand down — honoured only by a dry run or a reseed
- * (the passes an anchored pass subsumes), within one heartbeat tick, on whichever worker it runs. Addressed through
- * the claim row because the pass may be on another worker (a console-started dry run), where no
- * module state reaches it; a new claim clears it (`claimPass`).
+ * (the passes an anchored pass subsumes), within one heartbeat tick, on whichever worker it runs.
+ * Addressed through the claim row because the pass may be on another worker (a console-started dry
+ * run), where no module state reaches it; a new claim clears it (`claimPass`).
  */
 export const requestSweepInterrupt = (by) =>
 	publishProbeState({ sweep: { interruptRequestedAt: Date.now(), interruptRequestedBy: by } });
 
 // How often an anchored pass that is waiting for another sweep tries again.
 const ANCHOR_RETRY_MS = 15 * SECOND;
-// Bumped by every re-arm, so the anchor that fired knows whether the re-arm after its pass is still its to make.
+// Bumped by every re-arm, so an anchor that fired knows whether re-arming after its pass is still its job.
 let timerGeneration = 0;
 
 /**

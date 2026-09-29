@@ -1230,10 +1230,17 @@ changed pages by how often bots ask for them (a page known wrong is being served
 it re-renders). Nothing detected is deferred and there is no per-pass budget —
 the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
 (the pass waits for a free slot rather than dropping a change), and the new baseline is written only
-after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
-cuts an anchored pass short resumes it on boot from the walk cursor its heartbeat published (held back
-to any action still in flight), with the interrupted pass's own dry-run and reseed settings. Two cadences
-cover the two ways content actually changes:
+after its action succeeds, so a failure or a restart leaves the change detectable; an action that
+throws is retried once when the walk ends. A restart that cuts an anchored pass short resumes it on boot
+from the walk cursor its heartbeat published (held back to any action still in flight), with the
+interrupted pass's own dry-run and reseed settings; a restart that spanned the anchor runs that
+anchor's pass at boot instead (v0.97.0), and an anchor that fires while another sweep holds the node
+stands a dry run or a reseed down, or waits for any other pass and runs after it — each outcome is a
+`probe_anchor` emit, never a silent skip. A pass skips only URLs it (or the pass it resumes) has already
+probed. With `renderCheck` (default on) each render of a claim-pair `pageCheck` URL is compared with
+the probe's last observation of the origin as it lands, and one that disagrees — claimed before a probe
+found a change, or rendered from a stale CDN copy — is expired and re-filed at once
+(`probe_render_mismatch`). Two cadences cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
   `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price
@@ -1263,7 +1270,11 @@ cover the two ways content actually changes:
   invalidation** (above): pre-change snapshots stop serving immediately — bots get origin content,
   which is correct by definition — while re-renders refill on their own machinery. Detection and
   response are different mechanisms on purpose: re-rendering a large corpus takes a render fleet
-  hours; invalidating it takes one row.
+  hours; invalidating it takes one row. The trip's **reseed** re-probes the whole slice and acts on
+  every change the invalidation does not already cover (a page re-rendered after the trip), leaving
+  pages that predate it to the invalidation so that clearing a false trip still restores them.
+  `canary.schedule` (optional) replaces the all-day `canary.interval` with time-of-day windows in
+  `anchorTimezone`, dense where a scheduled change is expected and sparse elsewhere.
 
 **A probe failure changes nothing** — no signature write, no trigger. The probe is an accelerator
 on top of the baseline cadence, never a gate on it: an endpoint that breaks (or replatforms) shows
