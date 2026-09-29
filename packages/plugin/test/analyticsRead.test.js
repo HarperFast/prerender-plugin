@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bucketize, bucketWidthFor, clampRange, readAnalyticsWindow, systemSeries } from '../src/util/analyticsRead.js';
+import { readFileSync } from 'node:fs';
+import {
+	bucketize,
+	bucketWidthFor,
+	clampRange,
+	isSystemRow,
+	readAnalyticsWindow,
+	systemSeries,
+} from '../src/util/analyticsRead.js';
+import { analyticsFixture, FIXTURE_RANGE_MS } from './support/analyticsFixture.js';
 
 // Rows as they come off system.hdb_analytics directly: the PK is the raw composite
 // [epochMs, nodeId] — get_analytics flattens it, the console reader must do its own.
@@ -355,4 +364,111 @@ test('scan: an unresolved hostname falls back to this server only when the windo
 		several.system.nodes.map((n) => n.hostname),
 		[null, null]
 	);
+});
+
+// ------------------------------------------------------------------ the fold is streamed, not buffered
+
+/**
+ * `analyticsFold.golden.json` is what the reader produced BEFORE the fold was split into accumulate
+ * and finish (v0.96.0's `bucketize` and `systemSeries` over the buffered rows), on the fixture in
+ * `support/analyticsFixture.js`. The streamed fold must reproduce it exactly, sums added in the same
+ * order included.
+ */
+const golden = JSON.parse(readFileSync(new URL('./support/analyticsFold.golden.json', import.meta.url), 'utf8'));
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+test('fold: bucketize and systemSeries over the fixture match the pre-streaming output exactly', () => {
+	const { rows, startMs, endMs } = analyticsFixture();
+	const geometry = { startMs, endMs, bucketMs: 60_000 };
+	// The scan's split: system rows to their own fold, every other kept row to the series.
+	assert.deepEqual(
+		plain(
+			bucketize(
+				rows.filter((row) => !isSystemRow(row)),
+				geometry
+			)
+		),
+		golden.series
+	);
+	assert.deepEqual(plain(systemSeries(rows, geometry)), golden.system);
+});
+
+test('scan: the walk folds each row as it is yielded, and the result matches the pre-streaming output', async (t) => {
+	const { rows, endMs } = analyticsFixture();
+	t.mock.timers.enable({ apis: ['Date'], now: endMs });
+
+	// The walk hands the reader one row at a time. Each row is POISONED once the reader has moved on
+	// to the next, so a reader that kept rows to bucket them later would chart the poison: only a fold
+	// that consumed each row when it was yielded reproduces the golden output.
+	globalThis.server = { hostname: 'node-a.example.com' };
+	globalThis.databases = {
+		system: {
+			hdb_analytics: {
+				replicate: false,
+				async *search() {
+					for (const row of rows) {
+						yield row;
+						Object.assign(row, { id: [endMs - 1, 999], count: 1e9, mean: 1e9, cpuUtilization: 1e9 });
+					}
+				},
+			},
+			hdb_analytics_hostname: { get: async () => undefined },
+		},
+	};
+
+	const window = await readAnalyticsWindow(FIXTURE_RANGE_MS);
+	assert.equal(window.startMs, endMs - FIXTURE_RANGE_MS);
+	assert.equal(window.bucketMs, 60_000);
+	assert.equal(window.bucketCount, golden.series.bucketCount);
+	assert.deepEqual(plain(window.series), golden.series.series);
+	assert.deepEqual(plain(window.system.nodes), golden.system);
+	assert.equal(window.scan.scanned, rows.length);
+});
+
+// ------------------------------------------------------------------ the cache is bounded
+
+function countingAnalytics() {
+	const calls = { search: 0 };
+	globalThis.server = { hostname: 'node-a.example.com' };
+	globalThis.databases = {
+		system: {
+			hdb_analytics: {
+				replicate: false,
+				search() {
+					calls.search++;
+					return [];
+				},
+			},
+			hdb_analytics_hostname: { get: async () => undefined },
+		},
+	};
+	return calls;
+}
+
+test('clampRange rounds to a whole minute, so near-identical ranges share one cache entry and one scan', async () => {
+	const MAX = 24 * 3_600_000;
+	assert.equal(clampRange('1800010', MAX), 1_800_000);
+	assert.equal(clampRange('1830000', MAX), 1_860_000);
+	assert.equal(clampRange('89999', MAX), 60_000);
+	// A maxRange that is not a whole minute is still the ceiling.
+	assert.equal(clampRange('999999', 90_500), 90_500);
+
+	const calls = countingAnalytics();
+	await readAnalyticsWindow(clampRange('2400001', MAX));
+	await readAnalyticsWindow(clampRange('2400017', MAX));
+	assert.equal(calls.search, 1);
+});
+
+test('the window cache holds at most eight ranges, evicting the oldest', async () => {
+	const calls = countingAnalytics();
+	const ranges = Array.from({ length: 9 }, (_, i) => (100 + i) * 60_000);
+	for (const range of ranges) await readAnalyticsWindow(range);
+	assert.equal(calls.search, 9);
+
+	// The newest eight are still cached...
+	for (const range of ranges.slice(1)) await readAnalyticsWindow(range);
+	assert.equal(calls.search, 9, 'a cached range was re-scanned');
+	// ...and the first was evicted, so asking for it again is a scan.
+	await readAnalyticsWindow(ranges[0]);
+	assert.equal(calls.search, 10);
 });

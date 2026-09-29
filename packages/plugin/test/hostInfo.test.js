@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { findHarperVersion, harperVersion, hostInfo, parseMeminfo, pluginVersion } from '../src/util/hostInfo.js';
 
 test('parseMeminfo: kB means KiB, unitless lines pass through, junk is skipped', () => {
@@ -56,6 +58,24 @@ test('versions: the plugin reads its own package.json; outside Harper the Harper
 	// Under the test runner the nearest package.json is this plugin's — which must not be reported
 	// as Harper's.
 	assert.equal(harperVersion(), null);
+});
+
+test('versions: the plugin version is the one on disk when the module LOADED, not when it is first asked', async (t) => {
+	// A deploy that does not restart Harper installs a new package.json under workers still running the
+	// old modules. The version must name the loaded code, so it is read with the module rather than on
+	// the first overview request. A copy of the module in a scratch package stands in for the install.
+	const root = mkdtempSync(join(tmpdir(), 'prerender-hostinfo-'));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	mkdirSync(join(root, 'src', 'util'), { recursive: true });
+	copyFileSync(fileURLToPath(new URL('../src/util/hostInfo.js', import.meta.url)), join(root, 'src/util/hostInfo.js'));
+	const writeVersion = (version) =>
+		writeFileSync(join(root, 'package.json'), JSON.stringify({ name: '@harperfast/prerender', version }));
+
+	writeVersion('1.0.0');
+	const loaded = await import(pathToFileURL(join(root, 'src/util/hostInfo.js')).href);
+	writeVersion('2.0.0'); // the staged deploy
+	assert.equal(loaded.pluginVersion(), '1.0.0');
+	assert.equal(loaded.hostInfo().pluginVersion, '1.0.0');
 });
 
 test('hostInfo: every field present, typed or null, and it never throws without Harper globals', () => {

@@ -188,6 +188,8 @@ export const writeSchedule = async (
  * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
  * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
  * what every such writer did before, and the write still reaches the owner by residency.
+ *
+ * Returns the due time it wrote.
  */
 export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt, demandPeriod } = {}) => {
 	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod']);
@@ -196,13 +198,15 @@ export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, cha
 	const markedAt = numberOf(existing?.changedAt);
 	const heldPeriod = numberOf(existing?.demandPeriod);
 	const wasMarked = Number.isFinite(markedAt) && markedAt > 0;
+	const nextRenderTime = Number.isFinite(due) && due > 0 && due < minute ? due : minute;
 	await writeSchedule(cacheKey, {
-		nextRenderTime: Number.isFinite(due) && due > 0 && due < minute ? due : minute,
+		nextRenderTime,
 		fromSitemap,
 		effectiveInterval,
 		changedAt: wasMarked ? markedAt : changedAt,
 		demandPeriod: wasMarked && Number.isFinite(heldPeriod) && heldPeriod > 0 ? heldPeriod : demandPeriod,
 	});
+	return nextRenderTime;
 };
 
 /**
