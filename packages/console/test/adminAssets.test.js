@@ -429,7 +429,8 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 		[
 			"`departure_${name.replace(/-/g, '_')}`",
 			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …) — ten ' +
-				'series with dry-run-vs-armed semantics of their own. No console panel reads them: the ' +
+				'series with dry-run-vs-armed semantics of their own, plus the walk corrections _relinked and ' +
+				'_listed_unchanged (plugin v0.97.0), which need that same panel. No console panel reads them: the ' +
 				'Sitemaps view charts walk OUTCOMES, and departures are a separate decision surface that ' +
 				'needs its own panel rather than seven more tiles on this one. Tracked, not forgotten.',
 		],

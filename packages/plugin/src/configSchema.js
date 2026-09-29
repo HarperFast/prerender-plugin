@@ -2295,7 +2295,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 				maxPerRun: option(
 					5000,
 					'Creates per walk that may take the fast path. Past this, new targets fall back to ' +
-						'full-interval jitter — the bulk-population guard.',
+						'full-interval jitter — the bulk-population guard.\n\n' +
+						'A discovered target\u2019s FIRST listing (a URL minted from traffic that no walk has listed ' +
+						'or unlinked) shares this cap: it is filed due now — or, when a canonical-mismatch or ' +
+						'noindex verdict parked it, its recheck is — and counted `listedSoon` on the refresh result. ' +
+						'A gone-suppressed one is left to `render.suppression.gone.reopen`.',
 					{ min: 0 }
 				),
 			}
@@ -2330,6 +2334,43 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'corpus could drift for as long as the origin left its sitemaps untouched and nothing ' +
 						'would notice. Set it to 0 to make every fetch unconditional (the pre-0.69.0 behaviour).',
 					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
+		shrinkGuard: group(
+			'A circuit breaker on the prune itself: a child sitemap whose fetch would unlink more than ' +
+				'`maxRatio` of the URLs attributed to it is refused and counted as a FAILED child — its row, ' +
+				'its targets and their attribution are left exactly as the last good fetch left them, and the ' +
+				'walk, having a failed child, acts on no departure and re-links what it did unlink. It applies ' +
+				'to every deployment, departure check or not: the prune runs regardless, and an unlink is what ' +
+				'the departure and arrival checks, the probe’s `listed` scope and the negative cache’s ' +
+				'`listed` guard all read.\n\n' +
+				'WHAT IT GUARDS AGAINST: a child that arrives short but well-formed — a generator that died ' +
+				'mid-build and still closed its root, an edge serving a stale partial object. A body cut off ' +
+				'mid-document is refused earlier, by the parse (its root is never closed). Either way the ' +
+				'document presents every URL it lost as departed, which on an armed departure check is a slice ' +
+				'of the cache hard-expired and re-rendered, then re-rendered again as rejoins once the origin ' +
+				'recovers.\n\n' +
+				'WHY 0.5: real churn is nowhere near it. A paginated product child sheds URLs through shear, not ' +
+				'the prune (a URL that moved to an earlier child is re-attached before this child is pruned), so ' +
+				'what one child genuinely loses per walk is a few percent at most, while a truncated or partial ' +
+				'document typically loses most of itself. The breaker trips on EVERY walk until the document ' +
+				'recovers, so a shrink that is real needs an operator: raise `maxRatio` for one walk (1 disables ' +
+				'the guard), then put it back. A child the index STOPS LISTING is pruned behind the same guard, ' +
+				'measured against the larger of its attributed targets and its last `entryCount`.',
+			{
+				maxRatio: option(
+					0.5,
+					'Largest share of a child’s attributed URLs one prune may unlink. 1 disables the guard.',
+					{ min: 0, max: 1 }
+				),
+				minUrls: option(
+					1000,
+					'The guard applies only when the prune would unlink at least this many URLs, so a small ' +
+						'child legitimately emptied by the site is not refused on every walk. Sized well above real ' +
+						'per-child churn (tens a day on a mature catalog) and well below what a truncated product ' +
+						'child loses (tens of thousands).',
+					{ min: 0 }
 				),
 			}
 		),
@@ -2397,7 +2438,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Overflow is DROPPED FOR GOOD, for the same reason as `maxActions` overflow: the URL is ' +
 						'already unlinked, so no later walk offers it again. It is never decided and never appears ' +
 						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
-						'removes the ceiling and never reports `capped`; 0 collects nothing.',
+						'removes the ceiling and never reports `capped`; 0 collects nothing.\n\n' +
+						'The same list is what a walk with a FAILED child re-links (`departure_relinked`) instead of ' +
+						'departing, so it also bounds that, and an arrival-only deployment holds up to this many ' +
+						'for the re-link alone.',
 					{ min: -1 }
 				),
 			}

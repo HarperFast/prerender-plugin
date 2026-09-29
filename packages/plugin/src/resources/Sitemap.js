@@ -3,19 +3,34 @@ import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
 import { classifyUrl, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
-import { currentMinuteMs, epochMsOf, getInitialRenderTime, getNextSitemapRefreshTime } from '../util/time.js';
+import {
+	currentMinuteMs,
+	dateColumnMs,
+	epochMsOf,
+	getInitialRenderTime,
+	getNextSitemapRefreshTime,
+	numberOf,
+} from '../util/time.js';
 import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { conditionalValidatorFor } from '../util/sitemapConditional.js';
-import { decideDeparture, DepartureAction, departureCandidateCap, departureLimit } from '../util/sitemapDeparture.js';
-import { arrivalCandidateCap, decideArrival, isRejoin } from '../util/sitemapArrival.js';
+import {
+	decideDeparture,
+	DepartureAction,
+	departureCandidateCap,
+	departureLimit,
+	shrinkRefusal,
+} from '../util/sitemapDeparture.js';
+import { arrivalCandidateCap, decideArrival, isFirstListing, isRejoin } from '../util/sitemapArrival.js';
 import { cacheKeysOf } from './Target.js';
-import { writeSchedule } from '../util/renderSchedule.js';
+import { fileDueNow } from '../util/renderSchedule.js';
 import { resolveEffectiveInterval } from '../util/routeClass.js';
 import { runDetached } from '../util/detach.js';
+import { demandOf } from '../util/demand.js';
+import { isGoneSuppressed } from '../util/suppression.js';
 
 /**
  * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
@@ -46,6 +61,24 @@ const {
 	page_cache: { PrerenderedPage },
 } = databases;
 
+// The raw table, for the one delete that must NOT cascade: a child sitemap the index stopped listing
+// loses its row once its targets have been unlinked. `Sitemap.delete` (the resource below) would take
+// every target attributed to it — the URLs that moved to other children included.
+const SitemapTable = databases.sitemaps.Sitemap;
+
+/**
+ * Entries a URLSET row keeps. The row used to store every `<url>` it listed — about 6 MB on a
+ * 50,000-entry product child — rewritten and replicated to every node on each pass that changed it
+ * (at least 100 MB a day on one deployment), for a list nothing reads back: the walk re-parses the
+ * document, and the console's detail view shows a page of 50 at a time. A leading sample keeps that
+ * view useful and `entryCount` keeps the true size. An INDEX keeps its whole list: it is small by
+ * construction, and a 304 on an index is descended from it.
+ */
+const STORED_ENTRY_SAMPLE = 500;
+
+/** Redirect hops one sitemap fetch follows, each one re-deciding the bypass token (`fetchLatestSitemap`). */
+const MAX_SITEMAP_REDIRECTS = 5;
+
 class Sitemap extends databases.sitemaps.Sitemap {
 	static directURLMapping = true;
 
@@ -57,16 +90,26 @@ class Sitemap extends databases.sitemaps.Sitemap {
 	 * allowed to fail the walk.
 	 */
 	static async refresh(rootSitemapUrl, { revalidate = false, onProgress } = {}) {
+		// Zero unless the departure check is on AND some route opts in; Infinity when
+		// `maxCandidates` is -1. See util/sitemapDeparture.js.
+		const departureCap = departureCandidateCap();
+		// The same for rejoins, off `sitemap.arrival`. See util/sitemapArrival.js.
+		const arrivalCap = arrivalCandidateCap();
 		const run = createRefreshRun({
 			removedSampleCap: config.sitemap.removedSampleCap,
 			failedCap: config.sitemap.failedCap,
-			// Zero unless the departure check is on AND some route opts in; Infinity when
-			// `maxCandidates` is -1. See util/sitemapDeparture.js.
-			departureCap: departureCandidateCap(),
-			// The same for rejoins, off `sitemap.arrival`. See util/sitemapArrival.js.
-			arrivalCap: arrivalCandidateCap(),
+			departureCap,
+			arrivalCap,
+			// An arrival-only deployment still holds what the walk unlinks, bounded like departures: a
+			// URL a failed walk leaves unlinked is otherwise re-attached by the NEXT walk carrying an
+			// earlier walk's stamp, and read there as a rejoin (see `relinkAfterFailedWalk`).
+			holdCap:
+				departureCap > 0 ? departureCap : arrivalCap > 0 ? departureLimit(config.sitemap.departure.maxCandidates) : 0,
 		});
 		const visited = new Set();
+		// Children an index stopped listing, found as each index is processed and pruned once the walk
+		// is over (`pruneDroppedChildren`) — by then every child still listed has re-attached what moved.
+		const dropped = new Map();
 		const queue = [{ url: rootSitemapUrl, parentUrl: null }];
 		run.count('sitemapsDiscovered');
 
@@ -77,7 +120,14 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			visited.add(sitemapUrl);
 
 			try {
-				const children = await refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited });
+				const children = await refreshOneSitemap(sitemapUrl, {
+					parentUrl,
+					revalidate,
+					run,
+					visited,
+					rootSitemapUrl,
+					dropped,
+				});
 				for (const child of children) {
 					queue.push({ url: child, parentUrl: sitemapUrl });
 					run.count('sitemapsDiscovered');
@@ -110,6 +160,21 @@ class Sitemap extends databases.sitemaps.Sitemap {
 			}
 		}
 
+		// A child the index stopped listing is pruned as an empty urlset, AFTER every child still listed,
+		// so the URLs that merely moved to one of them are re-attached first and only what is listed
+		// nowhere departs. Behind the shrink guard: a truncated INDEX drops children too, and a refused
+		// one is a failed child like any other. Its row goes only once the walk is known clean (below).
+		const prunedChildren = await pruneDroppedChildren(run, dropped, visited);
+
+		// A URL the owning child dropped may still be listed by a child the origin answered 304 to,
+		// whose entries this walk never read. Re-attached to it before anything reads it as departed.
+		try {
+			await reattachToUnchangedListers(run, rootSitemapUrl);
+		} catch (e) {
+			logger.error(`[prerender] Unchanged-lister check for ${rootSitemapUrl} failed: ${describeError(e)}`);
+			run.addFailure(rootSitemapUrl, e);
+		}
+
 		// AFTER every child, so a URL that merely shifted to a later child of a paginated index has
 		// had its chance to be re-attached. See util/sitemapDeparture.js.
 		//
@@ -121,6 +186,20 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		} catch (e) {
 			logger.error(`[prerender] Departure check for ${rootSitemapUrl} failed: ${describeError(e)}`);
 			run.countDeparture('failed');
+		}
+
+		// The dropped children's rows, LAST and only on a clean walk: a walk that failed anywhere has just
+		// re-linked what their prune unlinked, back onto these rows, and a row deleted under its own
+		// targets would strand them — attributed to a sitemap nothing walks, which is the state the prune
+		// exists to end. Kept, they are simply offered again by the next walk.
+		if (!run.walkFailed()) {
+			for (const url of prunedChildren) {
+				try {
+					await SitemapTable.delete(url);
+				} catch (e) {
+					logger.warn(`[prerender] Could not drop the row of unlisted sitemap ${url}: ${describeError(e)}`);
+				}
+			}
 		}
 
 		// Rejoins were already told from shear during the walk (`isRejoin` against `run.startedAt`), so
@@ -163,7 +242,11 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		const results = [];
 		for (const url of urls) {
 			logger.info(`Scheduling refresh for sitemap`, url);
-			results.push(await runTrackedRefresh(url, refreshOptions));
+			// Awaited — this is the blocking form — but OUTSIDE the request's transaction (util/detach.js):
+			// a walk is minutes of batched writes, each batch meant to commit as it goes, and on the
+			// request's transaction they would all be pending on one that the long-transaction monitor
+			// fires on every 30 seconds.
+			results.push(await runDetached(() => runTrackedRefresh(url, refreshOptions)));
 		}
 		return results;
 	}
@@ -187,18 +270,24 @@ class Sitemap extends databases.sitemaps.Sitemap {
 		// (A lists B, B lists A) terminate.
 		if (cascading.has(url)) return super.delete(...arguments);
 
-		const descendants = await sitemapDescendants(url);
+		// The cascade runs OUTSIDE the request's transaction (util/detach.js) and the request waits for
+		// it: a large sitemap's targets are deleted in batches that must commit as they go, and on the
+		// request's transaction every one of them would be pending on a transaction the 30-second
+		// long-transaction monitor fires on. Only the row's own delete stays on the request.
+		await runDetached(async () => {
+			const descendants = await sitemapDescendants(url);
 
-		for (const sitemapUrl of [url, ...descendants]) {
-			await deleteTargetsFor(sitemapUrl);
-		}
+			for (const sitemapUrl of [url, ...descendants]) {
+				await deleteTargetsFor(sitemapUrl);
+			}
 
-		for (const child of descendants) cascading.add(child);
-		try {
-			await applyInBatches({ items: descendants, apply: (child) => Sitemap.delete(child) });
-		} finally {
-			for (const child of descendants) cascading.delete(child);
-		}
+			for (const child of descendants) cascading.add(child);
+			try {
+				await applyInBatches({ items: descendants, apply: (child) => Sitemap.delete(child) });
+			} finally {
+				for (const child of descendants) cascading.delete(child);
+			}
+		});
 
 		return super.delete(...arguments);
 	}
@@ -379,6 +468,7 @@ const progressFields = (snapshot) => ({
 	updated: snapshot.updated,
 	skipped: snapshot.skipped,
 	createdSoon: snapshot.createdSoon,
+	listedSoon: snapshot.listedSoon,
 	notModified: snapshot.notModified,
 	duplicates: snapshot.duplicates,
 	deferred: snapshot.deferred,
@@ -427,7 +517,8 @@ async function runTrackedRefresh(rootUrl, options) {
 		logger.info(
 			`[prerender] Sitemap refresh for ${rootUrl} finished: ${result.sitemapsProcessed} sitemaps ` +
 				`(${result.notModified} not modified), ${result.created} created ` +
-				`(${result.createdSoon} fast-path), ${result.updated} re-attributed, ${result.skipped} unchanged, ` +
+				`(${result.createdSoon} fast-path), ${result.updated} re-attributed ` +
+				`(${result.listedSoon} first listings fast-pathed), ${result.skipped} unchanged, ` +
 				`${result.removed} unlinked, ${result.failed.length} failed`
 		);
 
@@ -466,16 +557,16 @@ async function runTrackedRefresh(rootUrl, options) {
  * holds a read cursor, and cursor-seconds are what scale with refresh frequency. That is what
  * makes polling often affordable rather than merely possible.
  */
-async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited }) {
+async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visited, rootSitemapUrl, dropped }) {
 	logger.info(`Processing sitemap`, sitemapUrl);
 
-	// A narrow projection on purpose: `entries` on a product child is megabytes, and this read
-	// happens for every document on every pass. The entries are read back only on the one path
-	// that needs them — a 304 on an INDEX, whose row is small by construction.
+	// A narrow projection on purpose: `entries` on an index can be long, and this read happens for
+	// every document on every pass. The entries are read back only on the one path that needs them —
+	// a 304 on an INDEX.
 	const stored = await Sitemap.get({ id: sitemapUrl, select: ['url', 'isIndex', 'lastModified', 'lastRefreshed'] });
 	const ifModifiedSince = conditionalValidatorFor(stored, revalidate);
 
-	const latestSitemap = await fetchLatestSitemap(sitemapUrl, { ifModifiedSince });
+	const latestSitemap = await fetchLatestSitemap(sitemapUrl, { ifModifiedSince, rootSitemapUrl });
 
 	if (latestSitemap.notModified) {
 		run.count('notModified');
@@ -485,10 +576,17 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 		// they move on a different schedule from the index that lists them (measured: children
 		// rebuilt nightly, the index that lists them at a different hour entirely). So re-read the
 		// stored entries and keep walking; each child then makes its own conditional decision.
+		//
+		// And re-diffed against the stored child rows, although the list is unchanged: a child a
+		// previous walk found dropped but could not prune (a tripped shrink guard, a failed scan) still
+		// has its row, and an index that 304s from then on would otherwise never offer it again.
 		if (stored?.isIndex === true) {
 			const storedRow = await Sitemap.get({ id: sitemapUrl, select: ['url', 'entries'] });
-			return (storedRow?.entries ?? []).map(({ loc }) => loc).filter(Boolean);
+			const children = (storedRow?.entries ?? []).map(({ loc }) => loc).filter(Boolean);
+			await noteDroppedChildren(sitemapUrl, children, dropped);
+			return children;
 		}
+		run.addUnchangedUrlset(sitemapUrl);
 		return [];
 	}
 
@@ -497,15 +595,100 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 
 	if (latestSitemap.isIndex === true) {
 		await Sitemap.put(sitemapUrl, row);
-		return latestSitemap.entries.map(({ loc }) => loc).filter(Boolean);
+		const children = latestSitemap.entries.map(({ loc }) => loc).filter(Boolean);
+		await noteDroppedChildren(sitemapUrl, children, dropped);
+		return children;
 	}
 
 	if (latestSitemap.entries?.length) {
 		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited });
 	}
 
-	await Sitemap.put(sitemapUrl, row);
+	await Sitemap.put(sitemapUrl, { ...row, entries: latestSitemap.entries.slice(0, STORED_ENTRY_SAMPLE) });
 	return [];
+}
+
+/**
+ * Record the children of `indexUrl` that have a stored row but are no longer listed.
+ *
+ * A child's row keeps its `parentUrl` after the index stops listing it, so it is not a root either:
+ * nothing walks it, nothing prunes it, and every target attributed to it stays LISTED for good — in
+ * the probe's `listed` scope, behind the negative cache's `listed` guard, never offered to the
+ * departure check. Collected here, acted on after the walk. Read-only: the cursor closes before any
+ * write (util/scan.js).
+ */
+async function noteDroppedChildren(indexUrl, listed, dropped) {
+	if (!dropped) return;
+	const listedNow = new Set(listed);
+	for await (const row of Sitemap.search({
+		select: ['url', 'isIndex', 'entryCount'],
+		conditions: [{ attribute: 'parentUrl', value: indexUrl }],
+	})) {
+		if (row?.url && !listedNow.has(row.url)) {
+			dropped.set(row.url, { isIndex: row.isIndex === true, entryCount: numberOf(row.entryCount) });
+		}
+	}
+}
+
+/**
+ * Prune every child an index stopped listing as if it now listed nothing. Returns the rows to drop once
+ * the walk is known clean — the caller deletes them, never this.
+ *
+ * Skipped when this walk visited it after all (another index lists it), and entirely on a walk that
+ * already failed, whose departure step would only re-link it. A dropped sub-INDEX takes its own
+ * descendants with it — its targets are attributed to its children, never to itself. A refusal by the
+ * shrink guard, or any other failure, is a failed child: its row and its targets stay as they were, the
+ * walk acts on no departure, and the next walk offers the child again. A truncated prune keeps the row
+ * for the same reason, so the rest is unlinked on a later pass rather than stranded.
+ */
+async function pruneDroppedChildren(run, dropped, visited) {
+	const pruned = [];
+	const pending = [...dropped].filter(([url]) => !visited.has(url));
+	if (pending.length && run.walkFailed()) {
+		logger.warn(
+			`[prerender] ${pending.length} unlisted sitemap(s) left for the next clean walk: this one had a failed child`
+		);
+		return pruned;
+	}
+	for (const [url, info] of pending) {
+		try {
+			if (info.isIndex) {
+				const descendants = (await sitemapDescendants(url)).filter((child) => !visited.has(child));
+				let complete = true;
+				for (const child of descendants) {
+					try {
+						const row = await Sitemap.get({ id: child, select: ['url', 'isIndex', 'entryCount'] });
+						if (row && row.isIndex !== true && !(await pruneDroppedChild(run, child, numberOf(row.entryCount)))) {
+							complete = false;
+						}
+					} catch (e) {
+						complete = false;
+						logger.error(
+							`[prerender] Sitemap ${child} is no longer listed and could not be pruned: ${describeError(e)}`
+						);
+						run.addFailure(child, e);
+					}
+				}
+				if (complete) pruned.push(...descendants, url);
+				continue;
+			}
+			if (await pruneDroppedChild(run, url, info.entryCount)) pruned.push(url);
+		} catch (e) {
+			logger.error(`[prerender] Sitemap ${url} is no longer listed and could not be pruned: ${describeError(e)}`);
+			run.addFailure(url, e);
+		}
+	}
+	return pruned;
+}
+
+/** One dropped urlset: every target still attributed to it departs. True when it was fully pruned. */
+async function pruneDroppedChild(run, sitemapUrl, entryCount) {
+	logger.info(`[prerender] Sitemap ${sitemapUrl} is no longer listed by its index — unlinking what it still holds`);
+	const { truncated } = await pruneSitemapTargets(sitemapUrl, new Map(), {
+		run,
+		baseline: Number.isFinite(entryCount) ? entryCount : 0,
+	});
+	return !truncated;
 }
 
 /**
@@ -525,6 +708,26 @@ async function rootSitemapUrls() {
 	return roots;
 }
 
+/** What the entry loop's point read projects: `actionForExisting`, `isRejoin` and `fileFirstListing`. */
+const FIRST_LISTING_SELECT = ['sitemapUrl', 'unlistedAt', 'state', 'suppressedReason', 'demandInterval'];
+
+/**
+ * A first listing's fast path: file the URL due now, never later than it already was (`fileDueNow`).
+ *
+ * Due NOW rather than jittered across `newTargets.window` like a create, because only `fileDueNow`
+ * keeps what the row already has — a due time that is earlier, a change mark the probe filed — and the
+ * row is not new: it may carry both. The burst is bounded by the same `maxPerRun` a create's is, and
+ * the window still gates it (0 disables both). A row SUPPRESSED on a verdict other than gone —
+ * canonical-mismatch, noindex — is filed the same way: its recheck, parked for days by the verdict,
+ * is exactly what the site declaring the URL calls into question, and the render re-proves or lifts
+ * it. A gone verdict is left to its own reopen path (util/goneReopen.js), which the caller excludes.
+ */
+const fileFirstListing = (url, existing, renderInterval) =>
+	fileDueNow(url, {
+		fromSitemap: true,
+		effectiveInterval: resolveEffectiveInterval(url, { renderInterval, demandInterval: existing?.demandInterval }),
+	});
+
 /** Diff one `<urlset>` against the targets currently attributed to it, and apply the result. */
 async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited }) {
 	// Keep only the URLs this deployment actually prerenders, keyed by the canonical URL-half the
@@ -542,82 +745,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
 	run.addFiltered(filtered);
 
-	// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
-	// `Target.patch` from inside the open search cursor. Harper's long-transaction monitor
-	// aborts (422, poisoned) any transaction that has writes pending when it fires, so on a large
-	// sitemap the refresh could die partway through with some targets already unlinked. Collect
-	// while reading, write once the cursor is closed — see util/scan.js.
-	//
-	// The collect step is also where the filtered-vs-departed distinction is made. Absent from the
-	// incoming map means one of two very different things, and conflating them is what would turn
-	// every filtered URL into an orphan:
-	//   - it left the sitemap        -> unlink it, as before
-	//   - it was FILTERED just above -> leave it alone
-	// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the RenderSchedule
-	// row intact: the target keeps rendering on its interval with nothing tracking it and no
-	// sitemap to bring it back. Fine for a URL that genuinely left the sitemap (that is the
-	// pre-existing discovery-target shape), but applied to a filtered URL it would silently
-	// convert this pass's entire filtered set into permanently-rendering, unattributable
-	// targets — the exact load the filter removes.
-	//
-	// Retiring them is deliberately NOT done here. Deleting targets needs the guardrails the
-	// reconcile sweep will carry (refuse when no prerender routes compile, a ceiling on how much
-	// one pass may retire), not an ingest pass that would act on whatever the route list happened
-	// to say this morning.
-	//
-	// The same pass builds `knownKeys`: every target this scan returns is BOTH present and (by the
-	// scan's own condition) already attributed to this sitemap, which is exactly what the entry
-	// loop below would otherwise spend a point read per entry × device discovering. It is a cache,
-	// not an authority — a miss falls through to the read — so capping it costs latency, never
-	// correctness.
-	const knownKeys = new Set();
-	const {
-		items: departed,
-		examined,
-		truncated,
-	} = await collectFromScan({
-		scan: () =>
-			Target.search({
-				// Array select, NOT a string one: a string select projects to the bare VALUE
-				// rather than a record, which is the trap that once made every target look
-				// un-attributed. Only the key is needed — nothing here reads the other columns.
-				select: ['url'],
-				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
-			}),
-		pick: (target) => {
-			if (incomingEntryMap.has(target.url)) {
-				if (knownKeys.size < config.scan.collectCap) knownKeys.add(target.url);
-				return null;
-			}
-			if (classifyUrl(target.url).routeClass !== PRERENDER) {
-				run.count('deferred');
-				return null;
-			}
-			return target;
-		},
-	});
-
-	// `collectFromScan` computes this precisely so a caller cannot act on a partial set while
-	// reporting success, and it used to be discarded here. A truncated prune means some departed
-	// targets kept their attribution and will be unlinked on a later pass.
-	if (truncated) {
-		logger.error(
-			`[prerender] ${sitemapUrl}: prune collected ${departed.length} of ${examined} scanned targets ` +
-				`(scan.collectCap=${config.scan.collectCap}). Only the collected ones were unlinked this pass.`
-		);
-		run.addTruncatedScan(sitemapUrl, examined, departed.length);
-	}
-
-	// `unlistedAt` rides the unlink patch — no extra write — and is THE WALK'S START, not this prune's
-	// clock: a URL this same walk re-attaches further on then carries exactly `run.startedAt`, which is
-	// how the re-attach below tells shear from a rejoin (util/sitemapArrival.js). The probe's
-	// `changeProbe.scope: listed` grace is measured from it too (util/probeScope.js).
-	const unlistedAt = new Date(run.startedAt);
-	await applyInBatches({
-		items: departed,
-		apply: (target) => Target.patch(target.url, { sitemapUrl: null, unlistedAt }),
-	});
-	run.addRemoved(departed);
+	const { knownKeys } = await pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run });
 
 	// Read once per child rather than per entry: config is a live object and this is the hot loop.
 	const { window: newTargetWindow, maxPerRun: newTargetCap } = config.sitemap.newTargets;
@@ -642,6 +770,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 
 		let action;
 		let rejoined = false;
+		let existing = null;
 		if (revalidate) {
 			// No point read, so no rejoin is detected — and none needs to be: this files every listed URL
 			// due now. The `put` below replaces the row, which clears any `unlistedAt` by construction.
@@ -650,9 +779,10 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 			action = TargetAction.SKIP;
 		} else {
 			// Only reached for a URL the prune scan did not return: genuinely new, moved here
-			// from another sitemap, or missed because `knownKeys` was capped. Only the attribution
-			// and the unlink stamp are needed, so don't materialize the whole record in a bulk loop.
-			const existing = await Target.get({ id: cacheUrl, select: ['sitemapUrl', 'unlistedAt'] });
+			// from another sitemap, or missed because `knownKeys` was capped. The attribution and the
+			// unlink stamp decide the action; the verdict and the rung are what a first listing's
+			// fast path needs (`fileFirstListing`). Never the whole record in a bulk loop.
+			existing = await Target.get({ id: cacheUrl, select: FIRST_LISTING_SELECT });
 			action = actionForExisting(existing, sitemapUrl, visited);
 			rejoined = action === TargetAction.REATTACH && isRejoin(existing, run.startedAt);
 		}
@@ -668,7 +798,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				run.count('duplicates');
 				continue;
 
-			case TargetAction.REATTACH:
+			case TargetAction.REATTACH: {
 				// Attribution changed, the page did not. `patch` leaves the RenderSchedule rows
 				// alone; `put` would recompute `getInitialRenderTime` and shove the next render
 				// forward by a fresh jitter every pass. See util/sitemapRun.js.
@@ -676,10 +806,24 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 				// `unlistedAt: null` in the same patch: re-attributed is listed, whether this is a rejoin, a
 				// same-walk shear, or a move from another sitemap. Unconditional, so the stamp cannot outlive
 				// the attribution it describes.
+				//
+				// A FIRST listing is the exception on the schedule (util/sitemapArrival.js `isFirstListing`):
+				// a URL discovered from traffic that the site now declares takes the new-target fast path,
+				// inside the same per-walk cap as a create — its first render, or the recheck of a verdict
+				// the declaration contradicts, filed due now (`fileFirstListing`).
 				run.count('updated');
 				if (rejoined) run.addArrival(cacheUrl);
-				inflight.push(Target.patch(cacheUrl, { sitemapUrl, renderInterval, unlistedAt: null }));
+				const soon =
+					newTargetWindow > 0 &&
+					newTargetWindow < renderInterval &&
+					run.fastPathTaken() < newTargetCap &&
+					isFirstListing(existing) &&
+					!isGoneSuppressed(existing);
+				if (soon) run.count('listedSoon');
+				const attach = Target.patch(cacheUrl, { url: cacheUrl, sitemapUrl, renderInterval, unlistedAt: null });
+				inflight.push(soon ? attach.then(() => fileFirstListing(cacheUrl, existing, renderInterval)) : attach);
 				break;
+			}
 
 			case TargetAction.CREATE: {
 				// A DECLARATION IS A STRONG SIGNAL, so a newly listed URL does not wait out a full
@@ -734,6 +878,107 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	if (inflight.length > 0) {
 		await Promise.all(inflight);
 	}
+}
+
+/**
+ * The prune half of a reconcile: unlink every target attributed to `sitemapUrl` that the document no
+ * longer lists, behind the shrink guard. Returns the keys it found still listed (the entry loop's
+ * point-read cache) and whether the scan was truncated. A child the index stopped listing is pruned
+ * through here too, with an empty `incomingEntryMap` and its last `entryCount` as the guard's
+ * `baseline` (util/sitemapDeparture.js `shrinkRefusal`).
+ */
+async function pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run, baseline = 0 }) {
+	// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
+	// `Target.patch` from inside the open search cursor. Harper's long-transaction monitor
+	// aborts (422, poisoned) any transaction that has writes pending when it fires, so on a large
+	// sitemap the refresh could die partway through with some targets already unlinked. Collect
+	// while reading, write once the cursor is closed — see util/scan.js.
+	//
+	// The collect step is also where the filtered-vs-departed distinction is made. Absent from the
+	// incoming map means one of two very different things, and conflating them is what would turn
+	// every filtered URL into an orphan:
+	//   - it left the sitemap              -> unlink it, as before
+	//   - it was FILTERED by the partition -> leave it alone
+	// Unlinking is `patch`, which bypasses the overridden `put` and so leaves the RenderSchedule
+	// row intact: the target keeps rendering on its interval with nothing tracking it and no
+	// sitemap to bring it back. Fine for a URL that genuinely left the sitemap (that is the
+	// pre-existing discovery-target shape), but applied to a filtered URL it would silently
+	// convert this pass's entire filtered set into permanently-rendering, unattributable
+	// targets — the exact load the filter removes.
+	//
+	// Retiring them is deliberately NOT done here. Deleting targets needs the guardrails the
+	// reconcile sweep will carry (refuse when no prerender routes compile, a ceiling on how much
+	// one pass may retire), not an ingest pass that would act on whatever the route list happened
+	// to say this morning.
+	//
+	// The same pass builds `knownKeys`: every target this scan returns is BOTH present and (by the
+	// scan's own condition) already attributed to this sitemap, which is exactly what the caller's
+	// entry loop would otherwise spend a point read per entry × device discovering. It is a cache,
+	// not an authority — a miss falls through to the read — so capping it costs latency, never
+	// correctness.
+	const knownKeys = new Set();
+	const {
+		items: departed,
+		examined,
+		truncated,
+	} = await collectFromScan({
+		scan: () =>
+			Target.search({
+				// Array select, NOT a string one: a string select projects to the bare VALUE
+				// rather than a record, which is the trap that once made every target look
+				// un-attributed. Only the key is needed — nothing here reads the other columns.
+				select: ['url'],
+				conditions: [{ attribute: 'sitemapUrl', value: sitemapUrl }],
+			}),
+		pick: (target) => {
+			if (incomingEntryMap.has(target.url)) {
+				if (knownKeys.size < config.scan.collectCap) knownKeys.add(target.url);
+				return null;
+			}
+			if (classifyUrl(target.url).routeClass !== PRERENDER) {
+				run.count('deferred');
+				return null;
+			}
+			return target;
+		},
+	});
+
+	// BEFORE anything is written: a child whose fetch would unlink most of what it holds is far more
+	// likely short than real (`sitemap.shrinkGuard`). Thrown, it is a failed child — its row is not
+	// rewritten (the put follows the reconcile), so the next walk sends the old validator, which a
+	// changed document answers in full — and a walk with a failed child re-links rather than departs.
+	const refusal = shrinkRefusal({ sitemapUrl, departed: departed.length, examined, baseline });
+	if (refusal) throw new Error(refusal);
+
+	// `collectFromScan` computes this precisely so a caller cannot act on a partial set while
+	// reporting success, and it used to be discarded here. A truncated prune means some departed
+	// targets kept their attribution and will be unlinked on a later pass.
+	if (truncated) {
+		logger.error(
+			`[prerender] ${sitemapUrl}: prune collected ${departed.length} of ${examined} scanned targets ` +
+				`(scan.collectCap=${config.scan.collectCap}). Only the collected ones were unlinked this pass.`
+		);
+		run.addTruncatedScan(sitemapUrl, examined, departed.length);
+	}
+
+	// `unlistedAt` rides the unlink patch — no extra write — and is THE WALK'S START, not this prune's
+	// clock: a URL this same walk re-attaches further on then carries exactly `run.startedAt`, which is
+	// how the entry loop's re-attach tells shear from a rejoin (util/sitemapArrival.js). The probe's
+	// `changeProbe.scope: listed` grace is measured from it too (util/probeScope.js).
+	const unlistedAt = new Date(run.startedAt);
+	// The primary key rides every patch here, and in every other patch of a row that may have just been
+	// deleted: a patch that lands on a missing record CREATES one holding only the patched fields, and
+	// Harper writes the key attribute only when the update names it (`resources/Table.ts`, the
+	// primary-key assignment in the write path). A walk racing a retirement on another node then left a
+	// row with no `url` — invisible to every keyed walk (util/urlWalk.js counts it as unreadable) and
+	// undeletable by anything that reads rows to find them.
+	await applyInBatches({
+		items: departed,
+		apply: (target) => Target.patch(target.url, { url: target.url, sitemapUrl: null, unlistedAt }),
+	});
+	run.addRemoved(departed, sitemapUrl);
+
+	return { knownKeys, truncated };
 }
 
 function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
@@ -823,19 +1068,30 @@ async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) 
 			// is not. This matches `changeProbe.actOnChange`, which backdates for the same reason;
 			// `Target.revalidate` keeps the plain expiry deliberately, because an operator asking for
 			// a re-render is not asserting the content is wrong.
-			const hardExpiredAt = Date.now() - config.page.swrTtl;
+			const nowMs = Date.now();
+			const hardExpiredAt = nowMs - config.page.swrTtl;
 			await Promise.all(
 				cacheKeysOf(url).map(async (cacheKey) => {
 					const page = await PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
-					if (page) await PrerenderedPage.patch(cacheKey, { expiresAt: hardExpiredAt });
+					if (!page) return;
+					// Already past it (the probe expired it earlier tonight): one replicated write per page per
+					// fact, not per signal. The key rides the patch — see `pruneSitemapTargets`.
+					const expiresAt = dateColumnMs(page.expiresAt);
+					if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
+					await PrerenderedPage.patch(cacheKey, { cacheKey, expiresAt: hardExpiredAt });
 				})
 			);
 
 			if (action === DepartureAction.RENDER) {
-				// THE CURRENT MINUTE, PER URL — never captured once for the whole pass (the
-				// Target.revalidate lesson): a stale minute ranks the row as if it had waited that long.
-				await writeSchedule(url, {
-					nextRenderTime: currentMinuteMs(),
+				// FILED THE WAY THE PROBE FILES A DETECTED CHANGE (changeProbe.actOnChange), because it is one:
+				// the page was just hard-expired as known to disagree with the origin. A plain schedule put here
+				// entered the row at lateness zero with no change mark — behind every late row, while its page
+				// was already answering from the origin — and REPLACED the row, erasing a `changedAt` and
+				// `demandPeriod` the probe had filed for the same page that night. `fileDueNow` files at the
+				// current minute PER URL (never a minute captured once for the pass — the Target.revalidate
+				// lesson), never later than the row already was, and keeps a mark's first instant.
+				const demand = demandOf(url, nowMs);
+				await fileDueNow(url, {
 					// Derived, never a literal. For a departure `decideDeparture` has already proved this
 					// target has no attribution, so it can only evaluate false; for an arrival
 					// `decideArrival` has proved it has one, so it can only evaluate true. The literal
@@ -844,6 +1100,8 @@ async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) 
 					// silently mis-flag a URL the day someone loosened the check above it.
 					fromSitemap: !!target.sitemapUrl,
 					effectiveInterval: resolveEffectiveInterval(url, target),
+					changedAt: nowMs,
+					demandPeriod: demand.known ? demand.periodMs : undefined,
 				});
 			}
 			count(action);
@@ -876,13 +1134,29 @@ const summarizeOutcomes = (outcomes) =>
  * Exported for tests.
  */
 export async function processDepartures(run) {
+	// A WALK WITH A FAILED CHILD ACTS ON NO DEPARTURE. A paginated index shears forward: a URL that moved
+	// from child k into child k+1 is unlinked by k's prune and re-attached only when k+1 is reached — and
+	// if k+1 failed (a 503, a truncated body, a tripped shrink guard) nothing re-attaches it. It then reads
+	// as departed here: its page hard-expired and filed to render, and on the NEXT walk, re-attached with
+	// this walk's stamp, read as a rejoin and rendered again. So the departure check is skipped outright
+	// and everything the walk unlinked is put back (`relinkAfterFailedWalk`); the next clean walk decides.
+	if (run.walkFailed()) {
+		await relinkAfterFailedWalk(run);
+		return;
+	}
+
 	const urls = run.departureCandidates();
 	if (!urls.length) return;
 
 	const { dryRun } = config.sitemap.departure;
 	await actOnWalkCandidates({
 		urls,
-		decide: decideDeparture,
+		// A URL `reattachToUnchangedListers` put back is re-attached like shear, but for a different reason
+		// worth telling apart: a second child still lists it.
+		decide: (candidate) =>
+			candidate.target?.sitemapUrl && run.isListedUnchanged(candidate.url)
+				? { action: DepartureAction.NONE, reason: 'listed-unchanged' }
+				: decideDeparture(candidate),
 		dryRun,
 		// Through `departureLimit`, never raw: -1 is "no ceiling", and `acted >= -1` would refuse all.
 		maxActions: departureLimit(config.sitemap.departure.maxActions),
@@ -897,13 +1171,112 @@ export async function processDepartures(run) {
 			`${dryRun ? ', DRY RUN' : ''} — ${summary || 'nothing to do'}`
 	);
 
-	// Guarded like the walk's own gauges: a counter must never cost the run its result.
+	recordDepartureGauges(outcomes);
+}
+
+/** One `sitemap_departure_<outcome>` series per outcome. Guarded: a counter must never cost the run its result. */
+function recordDepartureGauges(outcomes) {
 	try {
 		for (const [name, count] of Object.entries(outcomes)) {
 			metrics.sitemapRun(count, `departure_${name.replace(/-/g, '_')}`);
 		}
 	} catch (e) {
 		logger.warn(`[prerender] sitemap departure gauges not recorded: ${describeError(e)}`);
+	}
+}
+
+/**
+ * Undo this walk's unlinks after a child failed: every held URL still unlinked goes back to the child
+ * that unlinked it, with its stamp cleared — exactly the row it had before the walk, since the prune
+ * only ever unlinks a URL that was listed. Counted as the departure outcome `relinked`, beside
+ * `reattached` (a later child claimed it after all) and `target-gone`. NOT gated by
+ * `sitemap.departure.dryRun`: this is not a departure action but the correction of the walk's own
+ * write, and it is what keeps the next walk from reading every re-linked URL as a rejoin.
+ *
+ * The children that unlinked something lose their stored validator, so the next walk fetches them
+ * unconditionally: re-linked, a URL that really did move stays attributed to its old child — and is
+ * DUPLICATE to the child that now lists it — until the old child's prune runs again, which a 304 would
+ * put off until `sitemap.conditional.fullPassInterval`.
+ *
+ * URLs the walk unlinked past `holdCap` were never held and stay unlinked; the next walk re-attaches
+ * them as a move, and — carrying this walk's stamp — as a rejoin. `departures.capped` says it happened.
+ */
+async function relinkAfterFailedWalk(run) {
+	const held = run.heldUnlinked();
+	if (!held.length) return;
+
+	const unconditional = new Set();
+	await applyInBatches({
+		items: held,
+		apply: async ({ url, sitemapUrl }) => {
+			const target = await Target.get({ id: url, select: ['url', 'sitemapUrl'] });
+			if (!target) return run.countDeparture('target-gone');
+			if (target.sitemapUrl) return run.countDeparture('reattached');
+			if (!sitemapUrl) return run.countDeparture('unknown-child');
+			await Target.patch(url, { url, sitemapUrl, unlistedAt: null });
+			unconditional.add(sitemapUrl);
+			run.countDeparture('relinked');
+		},
+	});
+	for (const sitemapUrl of unconditional) {
+		// Read first: a patch of a missing row would create one with no `parentUrl`, i.e. a new ROOT.
+		if (await Sitemap.get({ id: sitemapUrl, select: ['url'] })) {
+			await Sitemap.patch(sitemapUrl, { url: sitemapUrl, lastModified: null });
+		}
+	}
+
+	const { departures, failed, failedOverflow } = run.snapshot();
+	logger.warn(
+		`[prerender] Departure check SKIPPED: ${failed.length + failedOverflow} child sitemap(s) failed, so ` +
+			`nothing this walk unlinked can be trusted to have left — ${summarizeOutcomes(departures.outcomes)}`
+	);
+	recordDepartureGauges(departures.outcomes);
+}
+
+/**
+ * Re-attach a URL the walk unlinked to a child that still lists it but answered 304.
+ *
+ * A URL listed by two children is owned by the first (`actionForExisting`, first writer wins). When the
+ * owner drops it, its prune unlinks it — and the other child, unchanged, answered 304, so its entries
+ * were never read and nothing re-attaches it: it reads as departed while still declared, and heals on
+ * that child's next full pass, counted as a rejoin. So once the walk is over, each 304'd urlset is
+ * fetched unconditionally ONLY when the walk holds unlinked URLs, parsed (no reconcile, no write to its
+ * row), and every held URL it lists is re-attached to it — attribution only, as any re-attach is.
+ * Reported as the departure outcome `listed-unchanged`. A fetch that fails is a failed child, so the
+ * departure check that follows re-links instead of departing.
+ *
+ * Only held URLs are covered (`holdCap`). A deployment holding none has no departure or arrival action
+ * to protect, and its URL simply re-attaches on the unchanged child's next full pass.
+ */
+async function reattachToUnchangedListers(run, rootSitemapUrl) {
+	const unchanged = run.unchangedUrlsets();
+	if (run.walkFailed() || !unchanged.length) return;
+	const pending = new Set(run.heldUnlinked().map(({ url }) => url));
+	if (!pending.size) return;
+
+	for (const childUrl of unchanged) {
+		if (!pending.size) return;
+		let latest;
+		try {
+			latest = await fetchLatestSitemap(childUrl, { rootSitemapUrl });
+		} catch (e) {
+			logger.error(`[prerender] Sitemap ${childUrl} could not be re-read for its listings: ${describeError(e)}`);
+			run.addFailure(childUrl, e);
+			return;
+		}
+		if (latest.isIndex) continue;
+		const { incoming } = partitionSitemapEntries(latest.entries);
+		const listed = [...pending].filter((url) => incoming.has(url));
+		for (const url of listed) pending.delete(url);
+		await applyInBatches({
+			items: listed,
+			apply: async (url) => {
+				const target = await Target.get({ id: url, select: ['url', 'sitemapUrl'] });
+				if (!target || target.sitemapUrl) return;
+				await Target.patch(url, { url, sitemapUrl: childUrl, unlistedAt: null });
+				run.noteListedUnchanged(url);
+			},
+		});
 	}
 }
 
@@ -942,28 +1315,72 @@ export async function processArrivals(run) {
 	);
 }
 
-async function fetchLatestSitemap(url, { ifModifiedSince = null } = {}) {
+/**
+ * May a sitemap fetch of `url` carry the origin-bypass token (and take the staging pin)?
+ *
+ * Only a host this deployment serves: the root sitemap's own host, or one named in `domains`. The token
+ * used to ride EVERY sitemap fetch with `redirect: 'follow'` — and undici keeps custom headers across a
+ * cross-origin redirect, so an index listing a third-party child, or a child 301ing to another host,
+ * handed the bypass secret to whoever answered (reproduced: a 301 to another host received the header
+ * verbatim). The same rule the render path follows: the token goes to the navigation origin, never to a
+ * third-party host.
+ */
+const mayCarryToken = (url, rootSitemapUrl) => {
+	const host = URL.parse(url)?.hostname;
+	if (!host) return false;
+	return host === URL.parse(rootSitemapUrl)?.hostname || config.domains.includes(host);
+};
+
+const isRedirect = (status) => status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+
+async function fetchLatestSitemap(url, { ifModifiedSince = null, rootSitemapUrl = url } = {}) {
 	// Route every Harper→origin sitemap fetch through the same edge as the render/origin-fetch
 	// path: whenever a staging IP is configured, pin the TCP connection to it (Host/SNI stay the
 	// real origin, exactly like upstream.js). The security token typically only authenticates
 	// against the staging edge, so a direct prod fetch is bounced with a 403 "Access Denied".
 	// Empty staging.ip → normal direct fetch (production, once the token is valid at the origin).
-	const stagingIp = configuredStagingIp();
-	const via = stagingIp ? ` (via staging ${stagingIp})` : '';
+	// Both apply only to a host that may carry the token (`mayCarryToken`): the staging edge fronts
+	// this deployment's hosts, not a third party's.
+	//
+	// Redirects are followed HERE, `redirect: 'manual'`, a bounded number of hops, so the token and the
+	// pin are decided again for every hop's host rather than inherited from the first.
+	let current = url;
+	let res;
+	let via = '';
+	for (let hop = 0; ; hop++) {
+		const trusted = mayCarryToken(current, rootSitemapUrl);
+		const stagingIp = trusted ? configuredStagingIp() : undefined;
+		via = stagingIp ? ` (via staging ${stagingIp})` : '';
 
-	const res = await fetch(url, {
-		method: 'GET',
-		redirect: 'follow',
-		headers: {
-			'User-Agent': config.sitemap.userAgent,
-			[config.origin.securityToken.header]: config.origin.securityToken.value,
-			// Echoed back VERBATIM from the stored row — see the schema comment. Absent on the first
-			// fetch of a document, when the origin sends no validator, and whenever the caller wants a
-			// full re-ingest.
-			...(ifModifiedSince ? { 'If-Modified-Since': ifModifiedSince } : {}),
-		},
-		dispatcher: dispatcherFor(stagingIp),
-	});
+		res = await fetch(current, {
+			method: 'GET',
+			redirect: 'manual',
+			headers: {
+				'User-Agent': config.sitemap.userAgent,
+				...(trusted ? { [config.origin.securityToken.header]: config.origin.securityToken.value } : {}),
+				// Echoed back VERBATIM from the stored row — see the schema comment. Absent on the first
+				// fetch of a document, when the origin sends no validator, and whenever the caller wants a
+				// full re-ingest.
+				...(ifModifiedSince ? { 'If-Modified-Since': ifModifiedSince } : {}),
+			},
+			dispatcher: dispatcherFor(stagingIp),
+		});
+
+		if (!isRedirect(res.status)) break;
+		const location = res.headers.get('location');
+		// Released, not read: a redirect body is never the document.
+		await res.body?.cancel().catch(() => {});
+		const next = location ? URL.parse(location, current) : null;
+		if (!next || (next.protocol !== 'https:' && next.protocol !== 'http:')) {
+			throw new Error(`Sitemap fetch for ${url}${via}: ${res.status} with no usable Location (${location ?? 'none'})`);
+		}
+		if (hop >= MAX_SITEMAP_REDIRECTS) {
+			throw new Error(
+				`Sitemap fetch for ${url}${via}: more than ${MAX_SITEMAP_REDIRECTS} redirects (last ${next.href})`
+			);
+		}
+		current = next.href;
+	}
 
 	// BEFORE the `res.ok` guard, because 304 is not ok: `Response.ok` is 200-299, so a
 	// not-modified would otherwise be thrown as a failed fetch. Nothing else to read — a 304 has no

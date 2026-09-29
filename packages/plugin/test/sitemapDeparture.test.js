@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
 import { createRefreshRun } from '../src/util/sitemapRun.js';
-import { decideDeparture, DepartureAction, departureActionFor } from '../src/util/sitemapDeparture.js';
+import { decideDeparture, DepartureAction, departureActionFor, shrinkRefusal } from '../src/util/sitemapDeparture.js';
 import { anyRouteDeparts } from '../src/util/routeClass.js';
 
 globalThis.logger ??= { debug() {}, info() {}, warn() {}, error() {} };
@@ -146,4 +146,64 @@ test('outcomes are tallied by name', () => {
 	run.countDeparture('render');
 	run.countDeparture('reattached');
 	assert.deepEqual(run.snapshot().departures.outcomes, { render: 2, reattached: 1 });
+});
+
+// ---- the held list: what a failed walk re-links ----
+
+test('a held URL carries the child that unlinked it; the departure candidates are its first departureCap', () => {
+	const run = createRefreshRun({ departureCap: 2, holdCap: 3 });
+	run.addRemoved(
+		[1, 2, 3, 4].map((n) => ({ url: `https://site.example.com/p/${n}` })),
+		SITEMAP
+	);
+	assert.deepEqual(
+		run.heldUnlinked().map(({ sitemapUrl }) => sitemapUrl),
+		[SITEMAP, SITEMAP, SITEMAP]
+	);
+	assert.equal(run.departureCandidates().length, 2);
+	assert.equal(run.snapshot().departures.considered, 2);
+	assert.equal(run.snapshot().departures.capped, true);
+});
+
+test('an arrival-only walk holds for the re-link without presenting any departure candidate', () => {
+	const run = createRefreshRun({ departureCap: 0, holdCap: 10 });
+	run.addRemoved([{ url: PRODUCT }], SITEMAP);
+	assert.equal(run.heldUnlinked().length, 1);
+	assert.deepEqual(run.departureCandidates(), []);
+	assert.deepEqual(run.snapshot().departures, { considered: 0, capped: false, outcomes: {} });
+});
+
+test('walkFailed counts a failure past failedCap too — a cap of 0 must not hide a failed child', () => {
+	const run = createRefreshRun({ failedCap: 0 });
+	assert.equal(run.walkFailed(), false);
+	run.addFailure(SITEMAP, new Error('503'));
+	assert.equal(run.snapshot().failed.length, 0);
+	assert.equal(run.walkFailed(), true);
+});
+
+// ---- the shrink guard ----
+
+test('shrinkRefusal: past maxRatio and at least minUrls it refuses, naming the option', () => {
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 100 } } });
+	assert.match(
+		shrinkRefusal({ sitemapUrl: SITEMAP, departed: 30_000, examined: 50_000 }),
+		/refusing to unlink 30000 of 50000 attributed URLs \(60%.*maxRatio=0\.5/
+	);
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 20_000, examined: 50_000 }), null, 'under the ratio');
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 99, examined: 100 }), null, 'under minUrls');
+});
+
+test('shrinkRefusal: a baseline larger than the scan is the denominator, and maxRatio 1 disables it', () => {
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 10 } } });
+	// A dropped child: 12 leftovers of a 50,000-entry document — the rest moved and were re-attached.
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12, baseline: 50_000 }), null);
+	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12 }), null);
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 1, minUrls: 10 } } });
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12 }), null);
+});
+
+test('the shrink guard defaults: 0.5 of what a child held, from 1000 URLs', () => {
+	applyOptions({});
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 999, examined: 999 }), null);
+	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 1000, examined: 1999 }), null);
 });

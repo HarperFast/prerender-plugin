@@ -74,6 +74,9 @@ before(async () => {
 		},
 		render_schedule: {
 			RenderSchedule: class {
+				static async get() {
+					return undefined;
+				}
 				static async put(key, row) {
 					schedulePuts.push({ key, ...row });
 				}
@@ -202,7 +205,8 @@ test('an unlink stamps unlistedAt with the WALK’s start, in the same patch tha
 	const after = Date.now();
 
 	const unlink = patches.find((p) => p.id === P(1));
-	assert.deepEqual(Object.keys(unlink).sort(), ['id', 'sitemapUrl', 'unlistedAt'], 'one patch, no extra write');
+	assert.deepEqual(Object.keys(unlink).sort(), ['id', 'sitemapUrl', 'unlistedAt', 'url'], 'one patch, no extra write');
+	assert.equal(unlink.url, P(1), 'the key rides the patch, so one racing a delete cannot leave a url-less stub');
 	assert.equal(unlink.sitemapUrl, null);
 	assert.ok(unlink.unlistedAt instanceof Date);
 	assert.ok(unlink.unlistedAt.getTime() >= before && unlink.unlistedAt.getTime() <= after);
@@ -300,6 +304,10 @@ test('an armed rejoin hard-expires the cached pages past swrTtl and files the UR
 	assert.equal(filed[0].fromSitemap, true, 'a rejoined URL is sitemap-listed');
 	assert.ok(filed[0].nextRenderTime >= minuteBefore && filed[0].nextRenderTime <= now);
 	assert.equal(filed[0].effectiveInterval, config.render.defaultInterval);
+	assert.ok(
+		filed[0].changedAt >= minuteBefore && filed[0].changedAt <= now,
+		'filed as a change, like the probe files one'
+	);
 });
 
 test('a rejoin on a route that has not opted in is decided and counted, never acted on', async () => {

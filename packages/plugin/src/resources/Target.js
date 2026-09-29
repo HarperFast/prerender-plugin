@@ -6,6 +6,7 @@ import { currentMinuteMs, dateColumnMs, getInitialRenderTime } from '../util/tim
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { deleteSchedule, fileDueNow, writeSchedule } from '../util/renderSchedule.js';
 import { gradeSuppression } from '../util/suppression.js';
+import { runDetached } from '../util/detach.js';
 
 const {
 	page_cache: { PrerenderedPage },
@@ -168,7 +169,11 @@ export class Target extends TargetTable {
 	async post(body, target) {
 		switch (body.action) {
 			case 'revalidate':
-				return Target.revalidate(target);
+				// Awaited, so the response still carries the counts, but run OUTSIDE the request's
+				// transaction (util/detach.js): phase 2 is `scan.collectCap` URLs of page patches and
+				// schedule writes in batches meant to commit as they go, and on the request's transaction
+				// they would all be pending on one the 30-second long-transaction monitor fires on.
+				return runDetached(() => Target.revalidate(target));
 			default:
 				throw new Error('invalid action');
 		}
@@ -301,7 +306,10 @@ export class Target extends TargetTable {
 	/** A render found a suppressed URL indexable again — put it back in normal rotation.
 	 *  The caller reschedules the URL row at its cadence. */
 	static async reactivate(url) {
-		await Target.patch(url, { state: null, suppressedReason: null, suppressedAt: null, strikes: 0 });
+		// The key rides the patch: a target deleted a moment ago on another node would otherwise come back
+		// as a row with no `url` (a patch of a missing record stores only what it names — see
+		// `pruneSitemapTargets` in resources/Sitemap.js).
+		await Target.patch(url, { url, state: null, suppressedReason: null, suppressedAt: null, strikes: 0 });
 	}
 
 	/**
@@ -378,7 +386,8 @@ export class Target extends TargetTable {
 						// operator's revalidate that happens to run before its render lands.
 						const expiresAt = dateColumnMs(existingPage?.expiresAt);
 						if (existingPage && !(Number.isFinite(expiresAt) && expiresAt <= Date.now())) {
-							await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
+							// With its key, so a page deleted since the read is not re-created as a keyless stub.
+							await PrerenderedPage.patch(cacheKey, { cacheKey, expiresAt: Date.now() });
 						}
 					})
 				);
