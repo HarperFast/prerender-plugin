@@ -404,7 +404,7 @@ export const METRICS = Object.freeze({
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
 					'bypass (non-GET/HEAD), render-timeout (a renderNow render did not land in time and the ' +
-					'origin was the fallback), or revalidate (a background HEAD re-checking a stored 404/410 past its ' +
+					'origin was the fallback), or revalidate (a background re-check of a stored 404/410 past its ' +
 					'fresh window, render.negative — one per bot_serve cacheStatus negative-revalidate). ' +
 					"'other' is the emitter's default for a caller that passed no " +
 					'reason — its presence is a bug in the caller, not a traffic category.',

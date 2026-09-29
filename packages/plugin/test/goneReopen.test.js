@@ -23,6 +23,7 @@ const scheduleRows = new Map();
 const ops = [];
 let targetReads = 0;
 let failRead = false;
+let failWrite = false;
 
 class TargetBase {
 	static async get({ id, select }) {
@@ -65,7 +66,10 @@ before(async () => {
 		render_schedule: {
 			RenderSchedule: {
 				get: async ({ id }) => scheduleRows.get(id) ?? null,
-				put: async (id, data) => scheduleRows.set(id, { ...data }),
+				put: async (id, data) => {
+					if (failWrite) throw new Error('write failed');
+					scheduleRows.set(id, { ...data });
+				},
 			},
 		},
 		page_cache: { PrerenderedPage: class {} },
@@ -81,6 +85,7 @@ beforeEach(() => {
 	ops.length = 0;
 	targetReads = 0;
 	failRead = false;
+	failWrite = false;
 	reopen.resetReopenState();
 	applyOptions({ render: { suppression: { gone: { reopen: { enabled: true, dryRun: false } } } } });
 });
@@ -174,4 +179,13 @@ test('a failed read is counted and swallowed', async () => {
 	failRead = true;
 	assert.equal(await reopen.maybeReopenGone({ url: URL_A, via: 'traffic', nowMs: NOW }), 'error');
 	assert.deepEqual(reopenOps(), ['error/traffic']);
+});
+
+test('a filing that failed is not deduped: the next 200 retries it', async () => {
+	targets.set(URL_A, gone());
+	failWrite = true;
+	assert.equal(await reopen.maybeReopenGone({ url: URL_A, via: 'traffic', nowMs: NOW }), 'error');
+	failWrite = false;
+	assert.equal(await reopen.maybeReopenGone({ url: URL_A, via: 'traffic', nowMs: NOW + 60_000 }), 'filed');
+	assert.ok(scheduleRows.has(URL_A));
 });

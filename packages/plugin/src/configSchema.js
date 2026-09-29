@@ -1630,7 +1630,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'  - inside `freshMs`: the stored response answers and the origin is not asked. This is the only ' +
 				'part that saves origin requests.\n' +
 				'  - past `freshMs`, inside `lifeMs`: the stored response answers AT ONCE and the origin is ' +
-				're-checked in the background (a HEAD). A 404/410 refreshes `checkedAt`; a 200 or a redirect drops ' +
+				're-checked in the background (a HEAD, or a GET once the stored body is older than `lifeMs`, which ' +
+				'replaces it). A 404/410 refreshes `checkedAt`; a 200 or a redirect drops ' +
 				'the entry, so the next request sees the live page; anything else (5xx, a timeout) keeps serving ' +
 				'until the life ends. This buys response time and fast recovery, not offload.\n' +
 				'  - past `lifeMs`: the request proxies as if nothing were stored, and a 404 stores again.\n\n' +
@@ -1682,7 +1683,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					6 * HOUR,
 					'How long a stored response may answer at all. Between `freshMs` and this, it answers and the ' +
 						'origin is re-checked in the background. It bounds storage (a row lives this long past its last ' +
-						'confirmation) and how old a stored BODY can be, since a re-check is a HEAD and refreshes the ' +
+						'confirmation) and how old a stored BODY can be: once the bytes are older than this, the next ' +
+						'check that goes to the origin anyway (a re-check, or an excluded bot’s proxied request) ' +
+						'replaces them instead of confirming them, so no body is served more than about twice this old. ' +
+						'Until then a re-check is a HEAD, which refreshes the ' +
 						'status, not the bytes. Must be at least `freshMs`.',
 					{ unit: 'ms', min: 1 }
 				),

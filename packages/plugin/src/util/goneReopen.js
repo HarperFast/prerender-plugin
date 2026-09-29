@@ -113,6 +113,8 @@ export const maybeReopenGone = async ({ url, target, via, nowMs = Date.now() }) 
 		metrics.goneReopen('filed', via);
 		return 'filed';
 	} catch (e) {
+		// Forgotten, so the next 200 retries: a filing that failed must not be deduped as if it had landed.
+		recent.delete(url);
 		metrics.goneReopen('error', via);
 		logger.warn?.(`[prerender] could not reopen ${url}: ${e?.message ?? String(e)}`);
 		return 'error';

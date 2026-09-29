@@ -279,7 +279,7 @@ export const storeRefusal = (resource, policy) => {
  */
 export const teeForCapture = (stream, maxBytes) => {
 	const [downstream, capture] = stream.tee();
-	return { downstream, captured: collect(capture, maxBytes) };
+	return { downstream, captured: collectBody(capture, maxBytes) };
 };
 
 /**
@@ -304,7 +304,12 @@ export const teeForCapture = (stream, maxBytes) => {
 let inFlightCaptures = 0;
 export const captureSlotsInUse = () => inFlightCaptures;
 
-const collect = async (stream, maxBytes) => {
+/**
+ * Read a web stream to completion, keeping at most `maxBytes`: `{ bytes, outcome }`, where `bytes` is null
+ * past the cap ('oversize') or on a read error ('capture-failed'). Exported for util/negativeCache.js,
+ * whose body-refreshing re-check reads a response nobody else is reading.
+ */
+export const collectBody = async (stream, maxBytes) => {
 	const reader = stream.getReader();
 	const chunks = [];
 	let size = 0;

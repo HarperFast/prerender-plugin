@@ -679,8 +679,9 @@ type RawPageAnchor @table(database: "raw_cache") @sealed {
 # per database) and a commit here never taxes a subscription on any other table.
 #
 # `checkedAt` is what the fresh window runs from: the last time the ORIGIN confirmed the status, by a
-# proxied answer or a background re-check. `storedAt` is when these bytes were fetched; a re-check is a
-# HEAD, so it moves `checkedAt` and leaves the body alone.
+# proxied answer or a background re-check. `storedAt` is when these bytes were fetched: a re-check is a
+# HEAD that moves `checkedAt` alone until the bytes are older than `lifeMs`, and then a GET that replaces
+# them, so no body is served more than about twice `lifeMs` old.
 #
 # DELIBERATELY NOT `@export`: a REST write verb here would let anything put a 404 under a cache key that
 # the serve path then hands to crawlers. The only writer is the miss path.

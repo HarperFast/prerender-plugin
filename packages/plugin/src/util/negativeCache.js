@@ -18,6 +18,12 @@
  *               it serving until its life ends. This buys response time and fast recovery, not offload.
  *   expired     past `lifeMs`: proxy as if nothing were stored, and a 404 stores again.
  *
+ * The BODY has a life too. A confirmation moves `checkedAt` and nothing else, so a URL crawlers keep
+ * asking for would otherwise answer with its first body forever. Once the bytes are older than `lifeMs`
+ * (`storedAt`), the next check that goes to the origin anyway replaces them: the re-check is a GET instead
+ * of a HEAD, and a proxied 404 is stored whole instead of confirmed. No extra origin request, and no body
+ * is ever served more than about twice `lifeMs` old.
+ *
  * ── WHAT IT MUST NEVER DO ────────────────────────────────────────────────────────────────────
  *
  * Answer for a URL that exists. So it only ever replaces an origin proxy on a TRUE miss (nothing in
@@ -39,7 +45,7 @@ import { Target } from '../resources/Target.js';
 import { materializeCachedBody } from './cachedBody.js';
 import { dateColumnMs } from './time.js';
 import { fetchOriginResource } from './upstream.js';
-import { hasCacheControlDirective, storedHeaders, teeForCapture, unsharedHint } from './rawCache.js';
+import { collectBody, hasCacheControlDirective, storedHeaders, teeForCapture, unsharedHint } from './rawCache.js';
 
 const table = () => databases.negative_cache.NegativePage;
 
@@ -91,6 +97,14 @@ export const negativeFreshness = (row, policy, nowMs = Date.now()) => {
 	if (age < policy.lifeMs) return 'revalidate';
 	return 'expired';
 };
+
+/**
+ * Have the stored BYTES outlived `lifeMs`? Then the next check that asks the origin replaces them rather
+ * than confirming them. An unreadable `storedAt` counts as outlived, for the reason `negativeFreshness`
+ * fails closed: the cost is one body rewrite.
+ */
+export const negativeBodyExpired = (row, policy, nowMs = Date.now()) =>
+	!(nowMs - dateColumnMs(row?.storedAt) < policy.lifeMs);
 
 /**
  * A stored row for this key, or null when there is none, it has expired, or it is not a whole answer.
@@ -219,8 +233,17 @@ export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard
 		return resource;
 	}
 
+	let downstream, captured;
+	try {
+		({ downstream, captured } = teeForCapture(resource.content, policy.maxBytes));
+	} catch (e) {
+		// Before the slot is taken: a tee that throws (a stream something already locked) must neither cost
+		// the crawler its response nor keep a slot nobody will ever return.
+		metrics.negativeCache('capture-failed');
+		logger.warn?.(`[prerender] negative-cache capture not attached for ${key}: ${e?.message ?? String(e)}`);
+		return resource;
+	}
 	inFlightCaptures++;
-	const { downstream, captured } = teeForCapture(resource.content, policy.maxBytes);
 	captured
 		.then(async (result) => {
 			// `.length`, not truthiness — an empty Buffer is truthy (see captureForRawCache).
@@ -293,12 +316,40 @@ export const settleNegativeRecheck = async ({ key, cacheUrl, statusCode, policy,
 };
 
 /**
+ * A GET re-check found the page still gone, and the stored bytes had outlived `lifeMs`: store the origin's
+ * answer whole. A response this cache may no longer keep (the origin now marks it private, say) or cannot
+ * read drops the entry instead — confirming it would keep serving the outlived bytes, which is the one
+ * thing this path exists to stop. Exported for tests; `startNegativeRecheck` is the caller.
+ */
+export const refreshNegativeBody = async ({ key, resource, policy, nowMs = Date.now() }) => {
+	metrics.negativeCache('recheck-gone');
+	const refusal = negativeStoreRefusal(resource, policy);
+	if (refusal || typeof resource.content?.getReader !== 'function') {
+		resource.content?.cancel?.()?.catch?.(() => {});
+		metrics.negativeCache(refusal ?? 'no-body');
+		await dropNegativePage(key);
+		return 'dropped';
+	}
+	const result = await collectBody(resource.content, policy.maxBytes);
+	if (!result.bytes?.length) {
+		metrics.negativeCache(result.bytes ? 'empty' : result.outcome);
+		await dropNegativePage(key);
+		return 'dropped';
+	}
+	await storeNegativePage({ key, resource, bytes: result.bytes, policy, nowMs });
+	return 'refreshed';
+};
+
+/**
  * Start a background re-check of a stored response, unless one is already running for this key or the
  * per-worker cap is reached. Returns whether THIS call started one — the caller reports the request as
  * `negative-revalidate` (source origin) only then, so bot_serve and origin_fetch agree one for one.
  *
- * Per worker, not per node: two workers can re-check the same key at once. That is at most one extra HEAD
- * per worker per key, and coordinating across threads would cost more than it saves.
+ * A HEAD, unless `refreshBody` (the stored bytes have outlived `lifeMs`): then a GET, whose 404 replaces
+ * them. Bounded like a capture — `maxBytes` per check, `maxConcurrentChecks` checks.
+ *
+ * Per worker, not per node: two workers can re-check the same key at once. That is at most one extra
+ * request per worker per key, and coordinating across threads would cost more than it saves.
  */
 export const startNegativeRecheck = ({
 	key,
@@ -307,6 +358,7 @@ export const startNegativeRecheck = ({
 	deviceType,
 	policy,
 	onLive,
+	refreshBody = false,
 	fetchOrigin = fetchOriginResource,
 }) => {
 	if (inFlightChecks.has(key)) {
@@ -320,14 +372,25 @@ export const startNegativeRecheck = ({
 	const run = (async () => {
 		let resource;
 		try {
-			resource = await fetchOrigin({ url, deviceType, method: 'HEAD', headers: RECHECK_HEADERS, reason: 'revalidate' });
+			resource = await fetchOrigin({
+				url,
+				deviceType,
+				method: refreshBody ? 'GET' : 'HEAD',
+				headers: RECHECK_HEADERS,
+				reason: 'revalidate',
+			});
 		} catch (e) {
 			metrics.negativeCache('recheck-error');
 			logger.warn?.(`[prerender] negative-cache re-check failed for ${key}: ${e?.message ?? String(e)}`);
 			return;
 		}
-		// A HEAD has no body, but its stream still has to be closed to release the socket. Not awaited: a
-		// cancel that never settles must not pin the re-check slot.
+		if (refreshBody && policy.statuses.includes(resource.statusCode)) {
+			await refreshNegativeBody({ key, resource, policy });
+			return;
+		}
+		// A HEAD has no body, and a GET that is not storing one has nothing to read, but either stream still
+		// has to be closed to release the socket. Not awaited: a cancel that never settles must not pin the
+		// re-check slot.
 		resource.content?.cancel?.()?.catch?.(() => {});
 		await settleNegativeRecheck({ key, cacheUrl, statusCode: resource.statusCode, policy, onLive });
 	})()
@@ -372,6 +435,16 @@ export const answerFromNegativeCache = async ({
 	const verdict = negativeFreshness(row, policy, nowMs);
 	if (verdict === 'expired') return { row, verdict };
 
+	// BEFORE the bot and Target checks, and not only as a guard on answering. A refused row must reach
+	// `afterNegativeProxy` as expired for EVERY request, so the proxied 404 stores afresh; a row that went
+	// on as 'fresh' for an excluded bot would be CONFIRMED by that bot's proxied 404, moving `checkedAt`
+	// past the epoch and making the pre-invalidation bytes answerable again.
+	const epoch = await epochOf();
+	if (epoch && !(checkedAtMs > epoch.at)) {
+		metrics.negativeCache('invalidated');
+		return { row, verdict: 'expired' };
+	}
+
 	if (!botMayReadNegative(botName, policy)) {
 		metrics.negativeCache('bot-excluded');
 		return { row, verdict, excluded: true };
@@ -389,12 +462,6 @@ export const answerFromNegativeCache = async ({
 		return { row: null, verdict: null };
 	}
 
-	const epoch = await epochOf();
-	if (epoch && !(checkedAtMs > epoch.at)) {
-		metrics.negativeCache('invalidated');
-		return { row, verdict: 'expired' };
-	}
-
 	if (policy.dryRun) {
 		metrics.negativeCache(verdict === 'fresh' ? 'would-serve' : 'would-revalidate');
 		return { row, verdict };
@@ -408,7 +475,18 @@ export const answerFromNegativeCache = async ({
 		return { row, verdict: 'expired' };
 	}
 
-	const started = verdict === 'revalidate' ? recheck({ key, url, cacheUrl, deviceType, policy, onLive }) : false;
+	const started =
+		verdict === 'revalidate'
+			? recheck({
+					key,
+					url,
+					cacheUrl,
+					deviceType,
+					policy,
+					onLive,
+					refreshBody: negativeBodyExpired(row, policy, nowMs),
+				})
+			: false;
 	return {
 		answered: true,
 		resource: {
@@ -432,15 +510,20 @@ export const answerFromNegativeCache = async ({
  * THE DRY RUN'S ONE SUBTLETY: a proxied 404 may refresh `checkedAt` only where an ARMED cache would have
  * asked the origin too. Refreshing on every request would restart the fresh window on requests an armed
  * cache answers from storage, and `would-serve` would stop being exactly what arming saves.
+ *
+ * Where it does refresh, bytes that have outlived `lifeMs` are replaced by the ones just proxied rather
+ * than confirmed — what an armed cache's GET re-check does, here for free.
  */
-export const afterNegativeProxy = (resource, { key, cacheUrl, policy, lookup = {} }) => {
+export const afterNegativeProxy = (resource, { key, cacheUrl, policy, lookup = {}, nowMs = Date.now() }) => {
 	const { row = null, verdict = null, excluded = false } = lookup;
 	const status = resource.statusCode;
 
 	if (policy.statuses.includes(status)) {
 		if (!row || verdict === 'expired') return captureForNegativeCache(resource, { key, cacheUrl, policy });
 		const armedWouldAsk = excluded || !policy.dryRun || verdict !== 'fresh';
-		if (armedWouldAsk) void confirmNegativePage(key, policy);
+		if (!armedWouldAsk) return resource;
+		if (negativeBodyExpired(row, policy, nowMs)) return captureForNegativeCache(resource, { key, cacheUrl, policy });
+		void confirmNegativePage(key, policy, nowMs);
 		return resource;
 	}
 

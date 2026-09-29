@@ -518,10 +518,12 @@ const statusCause = (statusCode) => {
 // covers what `excludePathPatterns` used to gate separately, since those patterns compile
 // into passthrough routes (see util/routeClass.js).
 //
-// The discovery gates sit HERE, not in handlePageScheduling: a gated miss skips the detached
+// The discovery gates sit HERE, not in handlePageScheduling: a route-gated miss skips the detached
 // Target.get entirely, which matters on a gated combinatorial route where misses are most of
-// the traffic. The gates stop target CREATION only — an existing target's miss was a no-op in
-// handlePageScheduling anyway — so `discovery_gated` counts gated misses, not denied mints.
+// the traffic. A BOT-gated true miss pays one detached read while `render.suppression.gone.reopen` is
+// on, to see a gone target answering 200 again (`reopenFromTraffic`). The gates stop target CREATION
+// only — an existing target's miss was a no-op in handlePageScheduling anyway — so
+// `discovery_gated` counts gated misses, not denied mints.
 //
 // The ENTITY gate is the exception to "the gates sit here", and necessarily so: it asks whether
 // ANOTHER URL of the same entity has a target, which is a read, and it only means anything for a URL

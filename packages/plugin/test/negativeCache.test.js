@@ -124,7 +124,7 @@ const storedRow = (over = {}) => ({
 	statusCode: 404,
 	headers: JSON.stringify({ 'content-type': 'text/html' }),
 	content: Buffer.from('STORED-404'),
-	storedAt: new Date(NOW - 10 * HOUR),
+	storedAt: new Date(NOW - 3 * HOUR),
 	checkedAt: new Date(NOW - 10 * 60_000),
 	expiresAt: new Date(Date.now() + 5 * HOUR),
 	...over,
@@ -262,6 +262,16 @@ test('an empty body is not stored, and a refused response is returned untouched 
 	assert.equal(nc.captureForNegativeCache(refused, { key: KEY_A, cacheUrl: URL_A, policy: policy() }), refused);
 });
 
+test('a tee that throws costs neither the response nor a capture slot', async () => {
+	const locked = streamOf('ITEM-GONE-1');
+	locked.getReader();
+	const resource = origin404({ content: locked });
+	const out = nc.captureForNegativeCache(resource, { key: KEY_A, cacheUrl: URL_A, policy: policy() });
+	assert.equal(out, resource, 'the response is handed back untouched');
+	assert.equal(nc.negativeCaptureSlotsInUse(), 0);
+	assert.deepEqual(opsOf('negative_cache'), ['capture-failed']);
+});
+
 test('the capture cap is honoured and released on every path', async () => {
 	const p = policy({ maxConcurrentCaptures: 1 });
 	let release;
@@ -361,6 +371,30 @@ test('an invalidation newer than the last confirmation refuses the entry, so it 
 	assert.equal(older.answered, true, 'an epoch older than the confirmation changes nothing');
 });
 
+test('an invalidation refuses the entry for an EXCLUDED bot too, so its proxied 404 re-stores rather than confirms', async () => {
+	const row = storedRow({ checkedAt: new Date(NOW - 10 * 60_000) });
+	rows.set(KEY_A, row);
+	const lookup = await answer({
+		botName: 'Googlebot',
+		policy: policy({ excludeBots: ['Googlebot'] }),
+		epochOf: async () => ({ at: NOW - 60_000 }),
+	});
+	assert.equal(lookup.verdict, 'expired');
+	assert.deepEqual(opsOf('negative_cache'), ['invalidated'], 'decided before the bot check');
+	// Confirming here would move checkedAt past the epoch and make the pre-invalidation bytes answerable.
+	const out = nc.afterNegativeProxy(origin404(), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy({ excludeBots: ['Googlebot'] }),
+		lookup,
+		nowMs: NOW,
+	});
+	await drain(out.content);
+	await settle();
+	assert.deepEqual(writes, [['put', KEY_A]]);
+	assert.equal(rows.get(KEY_A).content.toString(), 'ITEM-GONE-1');
+});
+
 test('a body that cannot be read proxies instead of committing a 404 with no bytes', async () => {
 	rows.set(KEY_A, storedRow({ content: { bytes: async () => Promise.reject(new Error('Blob file not found')) } }));
 	const got = await answer();
@@ -402,7 +436,13 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 	const dry = policy({ dryRun: true });
 	const row = storedRow();
 	rows.set(KEY_A, row);
-	nc.afterNegativeProxy(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: dry, lookup: { row, verdict: 'fresh' } });
+	nc.afterNegativeProxy(origin404(), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: dry,
+		lookup: { row, verdict: 'fresh' },
+		nowMs: NOW,
+	});
 	await settle();
 	assert.deepEqual(writes, [], 'armed would have answered from storage: no confirmation');
 
@@ -411,6 +451,7 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 		cacheUrl: URL_A,
 		policy: dry,
 		lookup: { row, verdict: 'revalidate' },
+		nowMs: NOW,
 	});
 	await settle();
 	assert.deepEqual(writes, [['patch', KEY_A]], 'armed would have re-checked: this proxy is that check');
@@ -421,6 +462,7 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 		cacheUrl: URL_A,
 		policy: dry,
 		lookup: { row, verdict: 'fresh', excluded: true },
+		nowMs: NOW,
 	});
 	await settle();
 	assert.deepEqual(writes, [['patch', KEY_A]], 'an excluded bot always asks the origin, armed or not');
@@ -565,6 +607,103 @@ test('a re-check is a HEAD with reason revalidate, one per key, capped, and alwa
 	assert.equal(nc.negativeRechecksInFlight(), 0, 'a failed fetch releases the slot too');
 	assert.ok(opsOf('negative_cache').includes('recheck-error'));
 	assert.equal(rows.has(KEY_A), true, 'and the entry keeps answering');
+});
+
+// ── the body's own life ──────────────────────────────────────────────────────────────────────
+
+test('a body older than lifeMs is outlived; an unreadable storedAt counts as outlived', () => {
+	const p = policy({ lifeMs: 6 * HOUR });
+	assert.equal(nc.negativeBodyExpired(storedRow({ storedAt: new Date(NOW - 5 * HOUR) }), p, NOW), false);
+	assert.equal(nc.negativeBodyExpired(storedRow({ storedAt: new Date(NOW - 6 * HOUR) }), p, NOW), true);
+	assert.equal(nc.negativeBodyExpired(storedRow({ storedAt: null }), p, NOW), true);
+});
+
+test('a re-check of an outlived body asks for it: the lookup passes refreshBody only then', async () => {
+	const seen = [];
+	const recheck = (args) => (seen.push(args.refreshBody), true);
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 2 * HOUR), storedAt: new Date(NOW - 3 * HOUR) }));
+	await answer({ recheck });
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 2 * HOUR), storedAt: new Date(NOW - 20 * HOUR) }));
+	await answer({ recheck });
+	assert.deepEqual(seen, [false, true]);
+});
+
+test('a refreshing re-check is a GET whose 404 replaces the stored body and restarts both clocks', async () => {
+	rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
+	const calls = [];
+	const fetchOrigin = async (args) => (calls.push(args), origin404({ content: streamOf('ITEM-GONE-2') }));
+	assert.equal(
+		nc.startNegativeRecheck({
+			key: KEY_A,
+			url: URL_A,
+			cacheUrl: URL_A,
+			deviceType: 'desktop',
+			policy: policy(),
+			refreshBody: true,
+			fetchOrigin,
+		}),
+		true
+	);
+	await settle();
+	assert.equal(calls[0].method, 'GET');
+	assert.equal(calls[0].reason, 'revalidate');
+	assert.deepEqual(writes, [['put', KEY_A]], 'stored whole, not patched');
+	const row = rows.get(KEY_A);
+	assert.equal(row.content.toString(), 'ITEM-GONE-2');
+	assert.ok(Date.now() - row.storedAt.getTime() < 60_000, 'the new bytes are dated now');
+	assert.equal(row.checkedAt.getTime(), row.storedAt.getTime());
+	assert.deepEqual(opsOf('negative_cache'), ['recheck-gone', 'stored']);
+	assert.equal(nc.negativeRechecksInFlight(), 0);
+});
+
+test('a refreshing re-check that finds the page live drops the entry and reopens, like a HEAD', async () => {
+	rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
+	let cancelled = false;
+	const content = new ReadableStream({ cancel: () => void (cancelled = true) });
+	const live = [];
+	nc.startNegativeRecheck({
+		key: KEY_A,
+		url: URL_A,
+		cacheUrl: URL_A,
+		deviceType: 'desktop',
+		policy: policy(),
+		refreshBody: true,
+		onLive: (u) => live.push(u),
+		fetchOrigin: async () => ({ statusCode: 200, headers: {}, content }),
+	});
+	await settle();
+	assert.equal(rows.has(KEY_A), false);
+	assert.deepEqual(live, [URL_A]);
+	assert.equal(cancelled, true, 'a live body nobody stores is closed, not read');
+});
+
+test('an outlived body the origin now refuses, or sends empty, is dropped — never confirmed', async () => {
+	for (const [resource, reason] of [
+		[origin404({ headers: { 'content-type': 'text/html', 'cache-control': 'private' } }), 'private'],
+		[origin404({ content: streamOf('') }), 'empty'],
+	]) {
+		rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
+		ops.length = 0;
+		assert.equal(await nc.refreshNegativeBody({ key: KEY_A, resource, policy: policy() }), 'dropped');
+		assert.equal(rows.has(KEY_A), false, reason);
+		assert.deepEqual(opsOf('negative_cache'), ['recheck-gone', reason]);
+	}
+});
+
+test("an excluded bot's proxied 404 replaces an outlived body instead of confirming it", async () => {
+	const row = storedRow({ storedAt: new Date(NOW - 20 * HOUR) });
+	rows.set(KEY_A, row);
+	const out = nc.afterNegativeProxy(origin404(), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		lookup: { row, verdict: 'fresh', excluded: true },
+		nowMs: NOW,
+	});
+	await drain(out.content);
+	await settle();
+	assert.deepEqual(writes, [['put', KEY_A]]);
+	assert.equal(rows.get(KEY_A).content.toString(), 'ITEM-GONE-1');
 });
 
 test('the guard reads the Target once, locally: listed, any Target, or nothing', async () => {

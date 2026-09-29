@@ -718,16 +718,17 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				`background. lifeMs is how long a stored response may answer at all; freshMs, the part without asking.`
 		);
 	}
-	// A LONG LIFE IS A LONG-LIVED BODY. A background re-check is a HEAD: it re-confirms the status and
-	// leaves the stored bytes alone, so the body a crawler is handed can be up to `lifeMs` old. For a 404
-	// that is rarely content anyone reads, but an origin whose error page carries live data (a retired
-	// product's offer, say) serves that data from whenever it was stored.
+	// A LONG LIFE IS A LONG-LIVED BODY. A re-check replaces the stored bytes only once they have outlived
+	// `lifeMs` (until then it is a HEAD and confirms the status alone), so the body a crawler is handed can be
+	// up to about twice `lifeMs` old. For a 404 that is rarely content anyone reads, but an origin whose error
+	// page carries live data (a retired product's offer, say) serves that data from whenever it was stored.
 	if (target.render.negative.enabled && target.render.negative.lifeMs > 86400000) {
 		add(
 			'warn',
 			'render.negative.lifeMs',
 			`render.negative.lifeMs is ${target.render.negative.lifeMs}ms (over 24h). A re-check refreshes the ` +
-				`status, not the stored body, so a crawler can be handed a body this old.`
+				`status and replaces the stored body only once it is older than this, so a crawler can be handed a ` +
+				`body up to about twice this old.`
 		);
 	}
 	// A CONSUMER WITH NO TRACKER is inert, not broken, and says nothing about it: the ladder rests every
