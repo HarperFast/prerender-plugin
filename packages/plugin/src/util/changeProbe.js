@@ -1177,9 +1177,8 @@ export const runProbePass = async ({
 		stats.examined++;
 		// Skipped rows (unowned, unmatched — most of a multi-node registry) never reach the paced
 		// flush, so without this a chunk of pure skips runs as one synchronous burst. Same
-		// discipline, same cadence as util/reconcile.js's walk. The LIVE stats ride along so the
-		// sweep's heartbeat can publish the running pass's own partial counts — the caller cannot
-		// read `stats` itself, which is still in its temporal dead zone while this pass runs.
+		// discipline, same cadence as util/reconcile.js's walk. (The heartbeat does NOT ride this —
+		// see `startHeartbeat` for why it is a timer.)
 		if (stats.examined % YIELD_EVERY === 0) await onYield(stats);
 		if (!ownershipChecked && ownerOf(row.url) !== hostname) continue;
 		stats.owned++;
@@ -1412,18 +1411,23 @@ const sliceEstimateFrom = (previous) => {
 };
 
 /**
- * Wait out the actions in flight while keeping the pass's heartbeat alive. `onBeat` fires every third
- * of a heartbeat interval (the heartbeat itself throttles to one write per interval) until the
- * pipeline is idle, and never after — see the drain in `runProbeSweepOnce` for why the drain needs one.
+ * Keep a pass's heartbeat alive ON A TIMER for as long as the pass runs: `onTick` fires every third of
+ * a heartbeat interval (the heartbeat itself throttles to one write per interval) until the returned
+ * stop function is called, and never after.
+ *
+ * WHY A TIMER, NOT THE WALK. The heartbeat used to ride the walk's yields — one every 200 rows
+ * examined — and a pass can sit inside ONE await for longer than the claim's staleness window: an
+ * origin's `Retry-After` (honoured up to 5 minutes, which IS `PASS_STALE_MS`), a long wait for an
+ * action slot while the database is slow, a slow chunk read. The claim then read as dead while the pass
+ * was alive, and the console's "Run sweep" (or a resume check) started a second full-rate pass beside
+ * it — the origin taking `ratePerSecond` twice over, the one number agreed with whoever runs it. A timer
+ * beats through all of those. Unref'd, so it never holds a process open, and the caller stops it before
+ * releasing the claim: a beat after the release would publish `running: true` over a finished pass.
  */
-const drainWithHeartbeat = async (triggers, onBeat) => {
-	const timer = setInterval(onBeat, HEARTBEAT_MS / 3);
+const startHeartbeat = (onTick) => {
+	const timer = setInterval(() => void onTick(), HEARTBEAT_MS / 3);
 	timer.unref?.();
-	try {
-		await triggers.drain();
-	} finally {
-		clearInterval(timer);
-	}
+	return () => clearInterval(timer);
 };
 
 /**
@@ -1630,6 +1634,8 @@ export const runProbeSweepOnce = async ({
 	// emit what the pass did before it threw (see `createPassEmitter`).
 	let live = null;
 	let triggers = null;
+	let phase = 'walking';
+	let stopHeartbeat = () => {};
 	const emit = createPassEmitter('sweep');
 	const counts = () => ({
 		...live,
@@ -1641,7 +1647,6 @@ export const runProbeSweepOnce = async ({
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		let unreadable = 0;
-		let yields = 0;
 		// Changes are acted on BESIDE the walk, not inside it: `submit` returns once the action has
 		// started, so the pass runs at its probe-rate floor whatever the change rate, and only waits
 		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
@@ -1664,7 +1669,7 @@ export const runProbeSweepOnce = async ({
 			const recentRate = seconds > 0 ? Math.round(((probed - lastBeat.probed) / seconds) * 100) / 100 : null;
 			lastBeat = { at: now, probed };
 			return {
-				examinedApprox: yields * YIELD_EVERY,
+				examinedApprox: Number.isFinite(live?.examined) ? live.examined : 0,
 				...passProgress(live, {
 					phase,
 					recentRate,
@@ -1678,6 +1683,10 @@ export const runProbeSweepOnce = async ({
 				}),
 			};
 		};
+		// The liveness signal for the node-wide claim, for the WHOLE pass — walk, drain and retries (see
+		// `startHeartbeat`). Its failure is swallowed by `publishProbeState`: a pass must never die of
+		// bookkeeping.
+		stopHeartbeat = startHeartbeat(() => beat(progressOf(live, phase)));
 		const stats = await runProbePass({
 			rows: walkTargets(
 				config.changeProbe.chunkSize,
@@ -1698,18 +1707,6 @@ export const runProbeSweepOnce = async ({
 			isArmed: verificationArmedFor,
 			guard: theMappingGuard(),
 			...limits,
-			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
-			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
-			// failure is swallowed by `publishProbeState`: a pass must never die of bookkeeping.
-			onYield: async (live) => {
-				await yieldNow();
-				// A LOCAL counter, not `stats` — `const stats = await runProbePass({...})` leaves
-				// `stats` in the temporal dead zone while this callback runs, so touching it here
-				// throws a ReferenceError rather than reading undefined. The pass hands its live
-				// counters over as `live` instead.
-				yields++;
-				await beat(progressOf(live, 'walking'));
-			},
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a
 			// reseed: a row it re-baselined before a restart cut it short is re-baselined already.
 			skipProbedSince: resume?.originStartedAt ?? startedAt,
@@ -1724,13 +1721,13 @@ export const runProbeSweepOnce = async ({
 		// actions in flight — the pass is not finished while pages it decided to expire are unexpired,
 		// and `triggered` would under-report. There are at most `trigger.concurrency` of them.
 		if (stats.aborted) triggers.stop();
-		// The drain keeps the heartbeat (the walk's rides its yields, and there are none while it
-		// waits), so a slow database never makes a live pass read as dead.
-		await drainWithHeartbeat(triggers, () => void beat(progressOf(stats, 'draining')));
+		phase = 'draining';
+		await triggers.drain();
 		// The actions that failed, once more (util/changeActions.js) — the cursor has moved past them, so
 		// otherwise each is a known-wrong page until the next pass. Not when the probe was switched off.
 		if (config.changeProbe.enabled) {
-			await drainWithHeartbeat({ drain: () => triggers.retryFailed() }, () => void beat(progressOf(stats, 'retrying')));
+			phase = 'retrying';
+			await triggers.retryFailed();
 		}
 		stats.triggered = triggers.stats.triggered;
 		stats.errors = triggers.stats.errors;
@@ -1774,6 +1771,7 @@ export const runProbeSweepOnce = async ({
 			finishedAt: Date.now(),
 			error: null,
 		};
+		stopHeartbeat();
 		await releasePass('sweep', startedAt, lastSweep);
 		return lastSweep;
 	} catch (e) {
@@ -1790,9 +1788,11 @@ export const runProbeSweepOnce = async ({
 		// A THROWN pass must release too, and must publish the error: leaving the claim held would
 		// wedge the probe until the heartbeat went stale, and dropping the error would make a
 		// crashed pass indistinguishable from one that never ran.
+		stopHeartbeat();
 		await releasePass('sweep', startedAt, lastSweep);
 		throw e;
 	} finally {
+		stopHeartbeat();
 		sweepRunning = false;
 		// The trip's reseed, chained after this pass stood down for it. Cleared BEFORE the chained
 		// pass starts so the reseed does not cancel itself.
@@ -2704,8 +2704,8 @@ export const publishProbeStateForTest = publishProbeState;
 /** Tests only — resolves once every state write this worker issued has landed. */
 export const probeStatePublishedForTest = probeStatePublished;
 
-/** Tests only — the drain's heartbeat keeper, assertable without a queue that takes minutes. */
-export const __drainWithHeartbeatForTest = drainWithHeartbeat;
+/** Tests only — the pass's timer heartbeat, assertable without a pass that takes minutes. */
+export const __startHeartbeatForTest = startHeartbeat;
 
 /** Tests only — where a resume starts, from the walk position and the actions in flight. */
 export const __resumeKeyOfForTest = resumeKeyOf;

@@ -3295,7 +3295,7 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW, chunkSize: 250, dryRun: true } });
 	t.after(() => applyOptions({ changeProbe: { enabled: false } }));
 	const T0 = Date.parse('2026-09-24T05:05:00Z');
-	t.mock.timers.enable({ apis: ['Date'], now: T0 });
+	t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: T0 });
 
 	// Yesterday's finished pass — the record the running pass must NOT be confused with.
 	await changeProbe.publishProbeStateForTest({
@@ -3306,19 +3306,25 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	});
 
 	let release;
+	let blocked = false;
 	const gate = new Promise((resolve) => (release = resolve));
 	globalThis.databases.render_service.Target = walkableTargets(unmatchedUrls(300), {
 		hold: async (index) => {
-			// Past the first chunk's heartbeat: the walk has examined 250 rows and beaten once at 200.
-			if (index === 249) t.mock.timers.tick(31_000);
-			if (index >= 250) await gate;
+			// The walk has examined the first chunk's 250 rows and is stuck fetching the next one.
+			if (index >= 250) {
+				blocked = true;
+				await gate;
+			}
 		},
 	});
 
 	const pass = changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	for (let i = 0; i < 200 && !blocked; i++) await flushTurns(1);
+	// Stuck in ONE await for longer than a heartbeat: the timer beats anyway (P3).
+	t.mock.timers.tick(31_000);
 	for (let i = 0; i < 200; i++) {
 		await flushTurns(1);
-		if ((await changeProbe.readProbeStateForTest())?.sweep?.progress?.examined === 200) break;
+		if ((await changeProbe.readProbeStateForTest())?.sweep?.progress?.examined === 250) break;
 	}
 
 	const mid = await changeProbe.changeProbeStatus();
@@ -3330,8 +3336,8 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	assert.equal(mid.sweep.current.phase, 'walking');
 	assert.equal(mid.sweep.current.stale, false);
 	assert.equal(mid.sweep.current.sliceEstimate, 12_345, 'the previous complete pass sizes the ETA');
-	assert.equal(mid.sweep.progress.examined, 200, 'the pass’s own counters, not yesterday’s');
-	assert.equal(mid.sweep.progress.examinedApprox, 200, 'kept for consoles that predate the counters');
+	assert.equal(mid.sweep.progress.examined, 250, 'the pass’s own counters, not yesterday’s');
+	assert.equal(mid.sweep.progress.examinedApprox, 250, 'kept for consoles that predate the counters');
 	assert.equal(mid.sweep.progress.probed, 0);
 	assert.equal(mid.sweep.progress.actionsInFlight, 0);
 	assert.equal(typeof mid.sweep.progress.recentRate, 'number');
@@ -3503,16 +3509,15 @@ test('the canary’s cohort build republishes the cohort sizes instead of leavin
 	await applyProbeConfig({ enabled: false });
 });
 
-test('the drain keeps beating while the queue settles, and stops the moment it is idle', async (t) => {
+test('the pass heartbeat is a TIMER: it beats while the pass sits in one await, and never after it stops', async (t) => {
+	// P3 (review 2026-09-29): the beat used to ride the walk's yields, so a Retry-After wait (up to 5
+	// minutes, the staleness window) or a long wait for an action slot made a live claim read as dead.
 	t.mock.timers.enable({ apis: ['setInterval'] });
-	let settle;
-	const triggers = { drain: () => new Promise((resolve) => (settle = resolve)) };
 	let beats = 0;
-	const draining = changeProbe.__drainWithHeartbeatForTest(triggers, () => beats++);
+	const stop = changeProbe.__startHeartbeatForTest(() => beats++);
 	t.mock.timers.tick(30_000);
-	assert.equal(beats, 3, 'a beat every third of an interval while the queue drains');
-	settle();
-	await draining;
+	assert.equal(beats, 3, 'a tick every third of an interval, with no walk progress at all');
+	stop();
 	t.mock.timers.tick(60_000);
 	assert.equal(beats, 3, 'and none after');
 	t.mock.timers.reset();
