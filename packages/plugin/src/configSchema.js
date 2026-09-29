@@ -805,6 +805,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'outage. Set 0 to fail open on the first read error.',
 				{ unit: 'ms', min: 0 }
 			),
+			syncInterval: option(
+				MINUTE,
+				'How often each worker re-reads the invalidation table as a BACKSTOP to its subscription.\n\n' +
+					'Every worker holds the table in memory and the serve path resolves epochs from that copy with no ' +
+					'read at all; a subscription re-reads it the moment any row changes, on any node, so an ' +
+					'invalidation and its undo both reach every worker within about a second. This interval bounds ' +
+					'the one failure the subscription cannot report — delivery stopping silently — to at most this ' +
+					'long of a stale view. It costs one read of a single-digit table per worker per interval, against ' +
+					'the two point reads per cache-servable request the view replaced. While the subscription is ' +
+					'down or the copy has not loaded, the serve path reads the table per request instead, and each ' +
+					'tick also retries the subscription.',
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
+			),
 			maxScopes: option(
 				16,
 				'Ceiling on simultaneously active scopes. Bounds the console walk and the operator surface — NOT ' +

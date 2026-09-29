@@ -47,31 +47,48 @@
  *   - `invalidation.enabled: false` is a kill switch, and while any row exists it is reported as a
  *     config warning, a log line and a console banner.
  *
- * ── HOW THE EPOCH REACHES EVERY WORKER: IT DOES NOT ─────────────────────────────────────────────
+ * ── HOW THE EPOCH REACHES EVERY WORKER: A SUBSCRIBED IN-MEMORY VIEW ─────────────────────────────
  *
- * There is no propagation mechanism, deliberately. Every worker resolves per request, so apply AND
- * undo are both effective on the next request, and "the epoch never reached worker 5" is not a
- * state this design can be in. A refresh timer was costed and rejected: 8 workers x 4 nodes x
- * 1/min is 46,080 reads/day against <=5,800 for per-request resolution at this traffic (~7.9x more
- * storage work), while introducing that very failure mode and delaying both apply and undo by an
- * interval. The affordability comes from the gate in `bot_request.js` — the epoch is read only when
- * the request would otherwise have been a cache serve — and from the scope set being closed, so
- * resolution is two point reads by known key rather than a walk.
+ * Each worker holds the whole table in memory (`view`, below) and the serve path resolves from it
+ * synchronously — no read, no await, no allocation while nothing is invalidated. A subscription is
+ * the DOORBELL: any committed change to the table, on any node (a replicated write commits locally
+ * and rings too), makes the worker re-read the table, so apply and undo reach every worker within one
+ * notify pass plus one read of a single-digit table. The event is never the payload — Harper does not
+ * dedupe and may reorder, so the view is always rebuilt from a read.
  *
- * WHAT PER-REQUEST RESOLUTION DOES NOT BUY: cross-NODE effectiveness. Each node's serve path reads
- * its own replica of the invalidation table, so a row recorded on node A reaches node B by Harper
- * async replication — normally sub-second, but this cluster has seen freshly-written rows silently
- * fail to replicate for days (the Target replication-gap incident). During such a fault an "all"
- * invalidation is silently inert on the nodes that never received the row, while the console —
- * answering from the writing node — shows it active. The operator responses say this; the rehearsal
- * step that matters is confirming the row is visible on a PEER node, not the one that took the
- * write.
+ * WHY, IN NUMBERS. This used to resolve per request with two point reads (`all` and the route's
+ * scope), and the module header priced that at "<=5,800 reads/day" to reject a refresh timer. At the
+ * traffic this actually serves — ~7M bot requests/day, most of them cache-servable — it was ~10M reads
+ * a day, about 2,000x the estimate. The view costs one read per worker per doorbell plus the
+ * `invalidation.syncInterval` backstop (8 workers x 4 nodes x 1/min = 46,080 reads/day of a table
+ * this small) — and it no longer grows with traffic.
+ *
+ * THE SUBSCRIPTION IS PRICED PER DATABASE, not per table: the audit log spans the database, so every
+ * commit anywhere in it pays a notify pass for each subscribed worker. That is free here only because
+ * `Invalidation` is ALONE in its database and written only when an invalidation is applied or cleared. Never move another
+ * table into `invalidation`; see schema.graphql.
+ *
+ * EVERY FAILURE FALLS BACK TO THE OLD PATH, never to a stale view. The view is trusted only after a
+ * full read completed while the subscription it was loaded under is still the live one. Until then —
+ * at boot, before the first read lands; after `subscribe()` throws; after the subscription closes; after
+ * a read throws — `resolveInvalidation` reads per request exactly as it did before, with the
+ * last-known-good below. Each backstop tick retries whatever is down. The one failure no event reports,
+ * delivery stopping silently, is bounded by that same tick.
+ *
+ * WHAT NEITHER DESIGN BUYS: cross-NODE effectiveness. Each node's serve path reads its own replica
+ * of the invalidation table, so a row recorded on node A reaches node B by Harper async replication —
+ * normally sub-second, but this cluster has seen freshly-written rows silently fail to replicate for
+ * days (the Target replication-gap incident). During such a fault an "all" invalidation is silently
+ * inert on the nodes that never received the row, while the console — answering from the writing
+ * node — shows it active. The operator responses say this; the rehearsal step that matters is
+ * confirming the row is visible on a PEER node, not the one that took the write.
  */
 
 import { config, onConfigApplied } from '../config.js';
 import { epochMsOf } from './time.js';
 import { routeScopes, routeForScope } from './routeClass.js';
 import { metrics } from '../metrics.js';
+import { runDetached } from './detach.js';
 
 /** The scope covering every prerender route. `route:<match>:<path>` covers exactly one. */
 export const CLUSTER_SCOPE = 'all';
@@ -177,10 +194,31 @@ export const interpretRow = (scope, row) => {
  * not be able to hide a fresh `all` — and no coverage check can catch that, because coverage
  * enumerates routes, not competing rows. Most-specific-wins reads as the natural choice and is the
  * one rule that can silently serve invalidated content.
+ *
+ * A VALUE, NOT A PROMISE, whenever the view answers — the per-request cost is two Map lookups — and a
+ * promise from the per-request-read fallback. Every caller awaits, which takes either.
  */
-export const resolveInvalidation = async (routeScope) => {
+export const resolveInvalidation = (routeScope) => {
 	if (!config.invalidation.enabled) return null;
+	if (view !== null) return epochFromView(view, routeScope);
+	return resolveByReads(routeScope);
+};
 
+// The applicable scopes: `all`, plus the route's own when it has one.
+const epochFromView = (rows, routeScope) => {
+	let scope = CLUSTER_SCOPE;
+	let at = rows.get(CLUSTER_SCOPE);
+	if (routeScope && routeScope !== CLUSTER_SCOPE) {
+		const routeAt = rows.get(routeScope);
+		if (routeAt !== undefined && (at === undefined || routeAt > at)) {
+			scope = routeScope;
+			at = routeAt;
+		}
+	}
+	return at === undefined ? null : { scope, at: at + config.invalidation.pad };
+};
+
+const resolveByReads = async (routeScope) => {
 	// At most two, both point reads by known key, issued together. (Concurrency is correct here —
 	// the "probe shapes sequentially" rule from the measurement work is about benchmarking, where a
 	// Promise.all makes every shape report the slowest one's latency.)
@@ -197,32 +235,203 @@ export const resolveInvalidation = async (routeScope) => {
 	return { scope: winner.scope, at: winner.at + config.invalidation.pad };
 };
 
+// ---- the per-worker view ---------------------------------------------------------------------
+
 /**
- * Prime the LKG so a worker's very first cache-servable request is not the one uncovered read.
- *
- * The window is real but tiny, and stating it beats engineering it away: the HTTP handler is
- * installed at module load, before `handleApplication` runs, and at ~0.046 req/s cluster-wide that
- * is ~0.05 requests. Failures are swallowed — priming is an optimisation, and a boot that fails
- * because an empty table could not be read would be a far worse trade.
+ * scope -> invalidatedAt ms, holding ONLY rows that apply (`interpretRow` non-null), so a scope that is
+ * absent reads as "no invalidation" with no second lookup. `null` whenever it cannot be trusted — the
+ * serve path then reads per request. Replaced whole on every load, never edited in place, so a
+ * request can never observe half a load.
  */
-export const primeInvalidationLkg = async () => {
-	if (!config.invalidation.enabled) return { primed: 0 };
-	const scopes = [CLUSTER_SCOPE, ...routeScopes()];
-	let primed = 0;
-	for (const scope of scopes) {
-		try {
-			const row = await table().get({ id: scope, select: ['scope', 'invalidatedAt', 'mode'] });
-			lkg.set(scope, { at: Date.now(), invalidatedAtMs: interpretRow(scope, row) });
-			primed++;
-		} catch {
-			// Deliberately silent per scope: `readScope` will log and count if it matters later.
+let view = null;
+
+/** The live subscription, or null. A load installs its result only if this has not changed under it. */
+let subscription = null;
+let subscribing = false;
+// Warn on the transition into "cannot subscribe", not on every retry: the backstop retries each tick on
+// every worker, and the counter already carries the rate.
+let subscribeWarned = false;
+// Loads are serialized, and a doorbell that rings mid-load marks the view dirty so a fresh load follows:
+// the in-flight one may have read before the write it is ringing about.
+let loading = null;
+let dirty = false;
+let backstopTimer = null;
+let armedBackstop = null;
+
+/**
+ * Past this many rows the view is not trusted: an incomplete copy would read every scope it lost as
+ * "nothing invalidated". The API caps active scopes at `invalidation.maxScopes`, so only rows written by
+ * hand through the operations socket can get here, and they get the per-request path.
+ */
+const VIEW_MAX_ROWS = 1024;
+
+// The boot path does not wait on this (the view starts detached), but a `subscribe()` that never settles
+// would leave the worker on per-request reads with nothing said. Bounded, then retried by the backstop.
+const SUBSCRIBE_TIMEOUT_MS = 10_000;
+
+const loadView = async () => {
+	const loadedUnder = subscription;
+	const rows = [];
+	try {
+		// One-sided range over the primary key, as in `listInvalidations`; `select` an ARRAY (see
+		// `readScope`). `replicateFrom: false` is the SECOND argument, not a query field — Harper ignores
+		// unknown query fields silently. The table is fully replicated, so this is a local read either way;
+		// it is stated so a future residency change cannot turn a doorbell into a cross-node wait.
+		for await (const row of table().search(
+			{
+				conditions: [{ attribute: 'scope', comparator: 'greater_than', value: '' }],
+				select: ['scope', 'invalidatedAt', 'mode'],
+				limit: VIEW_MAX_ROWS + 1,
+			},
+			{ replicateFrom: false }
+		)) {
+			rows.push(row);
 		}
+	} catch (e) {
+		view = null;
+		countError('view-read-error');
+		logger.error(e, '[prerender] invalidation view read failed; this worker reads per request until it recovers');
+		return;
 	}
-	return { primed };
+	if (rows.length > VIEW_MAX_ROWS) {
+		view = null;
+		logger.warn(
+			`[prerender] the invalidation table holds more than ${VIEW_MAX_ROWS} rows; this worker resolves epochs ` +
+				`per request instead of from memory. Rows past invalidation.maxScopes can only have been written by hand.`
+		);
+		return;
+	}
+
+	const next = new Map();
+	for (const row of rows) {
+		const at = interpretRow(row.scope, row);
+		if (at !== null) next.set(row.scope, at);
+	}
+	// The per-request fallback's memory, refreshed from the same read: if the view later goes untrusted and
+	// a read then fails, the last-known-good is this load's answer rather than whatever the boot left.
+	const now = Date.now();
+	for (const scope of [CLUSTER_SCOPE, ...routeScopes()])
+		lkg.set(scope, { at: now, invalidatedAtMs: next.get(scope) ?? null });
+
+	// Installed only under the subscription it was read under. A read that raced a lost-and-replaced
+	// subscription may predate a write only the new one would ring for; the new one has queued its own load.
+	if (loadedUnder !== null && subscription === loadedUnder) view = next;
 };
 
-/** Tests only — the LKG is per-worker process state that outlives a `beforeEach`. */
-export const resetInvalidationState = () => lkg.clear();
+/** Ring the doorbell: (re)load the view, after any load already in flight. Never rejects. */
+const requestLoad = () => {
+	dirty = true;
+	if (loading) return loading;
+	// DETACHED: the doorbell can fire inside the async context of the request whose write rang it, and a
+	// read on that request's transaction fails once Harper closes it (util/detach.js).
+	loading = runDetached(async () => {
+		try {
+			while (dirty) {
+				dirty = false;
+				await loadView();
+			}
+		} finally {
+			loading = null;
+		}
+	}).catch((e) => logger.error(e, '[prerender] invalidation view load failed'));
+	return loading;
+};
+
+const dropSubscription = (lost) => {
+	if (subscription !== lost) return;
+	subscription = null;
+	view = null;
+	countError('view-subscribe-error');
+	logger.warn('[prerender] invalidation subscription closed; this worker reads per request until it re-subscribes');
+};
+
+const subscribeView = async () => {
+	if (subscription !== null || subscribing) return;
+	subscribing = true;
+	let timer;
+	let gaveUp = false;
+	const attempt = Promise.resolve().then(() =>
+		// The LISTENER form, never `for await`: a throw escaping a loop body ends the iterator, which closes
+		// and unregisters the subscription permanently. `omitCurrent`: the retained replay is unawaitable and
+		// truncates at 100 for the caller, so the view is loaded by a bounded read instead, and with the
+		// replay skipped the subscription is armed the moment this resolves.
+		table().subscribe({
+			omitCurrent: true,
+			listener: () => {
+				requestLoad();
+			},
+		})
+	);
+	try {
+		const live = await Promise.race([
+			attempt,
+			new Promise((_, reject) => {
+				timer = setTimeout(() => {
+					gaveUp = true;
+					reject(new Error(`subscribe timed out after ${SUBSCRIBE_TIMEOUT_MS}ms`));
+				}, SUBSCRIBE_TIMEOUT_MS);
+				timer.unref?.();
+			}),
+		]);
+		if (!live) throw new Error('subscribe returned no subscription');
+		subscription = live;
+		subscribeWarned = false;
+		live.on?.('close', () => dropSubscription(live));
+		requestLoad();
+	} catch (e) {
+		countError('view-subscribe-error');
+		if (!subscribeWarned) {
+			subscribeWarned = true;
+			logger.warn(
+				`[prerender] could not subscribe to invalidations (${e?.message ?? e}); this worker reads per request ` +
+					`and retries every invalidation.syncInterval`
+			);
+		}
+		// A subscribe that settles after we stopped waiting must not live on unreferenced, ringing a view
+		// nobody trusts and never being ended.
+		if (gaveUp)
+			attempt.then(
+				(late) => late?.end?.(),
+				() => {}
+			);
+	} finally {
+		clearTimeout(timer);
+		subscribing = false;
+	}
+};
+
+// The backstop: re-subscribe if the subscription is down, otherwise re-read. Re-armed from
+// `onConfigApplied`, so `invalidation.syncInterval` is live.
+const syncBackstop = () => {
+	const wanted = Math.min(2147483647, Math.max(1000, Math.trunc(Number(config.invalidation.syncInterval)) || 60_000));
+	if (wanted === armedBackstop) return;
+	clearInterval(backstopTimer);
+	armedBackstop = wanted;
+	backstopTimer = setInterval(() => {
+		if (subscription === null) subscribeView().catch(() => {});
+		else requestLoad();
+	}, wanted);
+	backstopTimer.unref?.();
+};
+
+/** Tests only — the LKG and the view are per-worker process state that outlives a `beforeEach`. */
+export const resetInvalidationState = () => {
+	lkg.clear();
+	view = null;
+	subscription?.end?.();
+	subscription = null;
+	subscribing = false;
+	subscribeWarned = false;
+	dirty = false;
+	loading = null;
+	clearInterval(backstopTimer);
+	backstopTimer = null;
+	armedBackstop = null;
+	invalidationWatchStarted = false;
+};
+
+/** Tests and diagnostics: is this worker resolving from memory, and is its doorbell connected? */
+export const invalidationViewState = () => ({ trusted: view !== null, subscribed: subscription !== null });
 
 // ---- the active set, for the admin surface ---------------------------------------------------
 
@@ -311,22 +520,27 @@ export const checkScopeResolvability = async () => {
 export const isScopeResolvable = (scope) => scope === CLUSTER_SCOPE || routeScopes().has(scope);
 
 /**
- * Prime the LKG and watch for scopes that stop resolving. Called once per worker from
- * `handleApplication`, and re-run on every config apply.
+ * Start this worker's view of the table, and watch for scopes that stop resolving. Called once per
+ * worker from `handleApplication`, and re-run on every config apply.
  *
- * EVERY WORKER, not worker 0. Both halves are per-worker concerns: the LKG is per-worker process
- * state, and there is no cross-worker channel for it (deliberately — see the module comment on why
- * there is no propagation mechanism at all). The resolvability report is a log line, so worker 0
- * would be enough for it alone; running it everywhere costs one bounded read of a single-digit table
- * per worker per config change and keeps the two halves in one place.
+ * EVERY WORKER, not worker 0. The view is per-worker process state (the serve path runs on every
+ * worker), and so is the last-known-good it refreshes. The resolvability report is a log line, so
+ * worker 0 would be enough for it alone; running it everywhere costs one bounded read of a
+ * single-digit table per worker per config change and keeps the halves in one place.
+ *
+ * NOT AWAITED BY THE BOOT PATH: until the subscription is armed and the first read lands, the serve
+ * path reads per request, which is correct, only dearer.
  *
  * RE-RUNNING ON CONFIG APPLY IS THE POINT, and it is the half that cannot be got from config alone.
  * A route renamed or removed by a live edit silently un-invalidates whatever that scope covered —
  * the row is still there, still looks applied, and now matches nothing. `collectConfigWarnings()` is
- * synchronous and a pure function of config, so it cannot read the table to notice; this can.
+ * synchronous and a pure function of config, so it cannot read the table to notice; this can. The
+ * re-run also re-arms the backstop (its interval is live) and reloads the view, whose read is what
+ * fills the last-known-good for any route scope the edit added.
  *
- * Failures are swallowed per call. Priming is an optimisation and the report is diagnostics; a boot
- * that failed because an empty table could not be read would be a far worse trade than a late warning.
+ * Failures are swallowed per call. The view falls back by itself and the report is diagnostics; a
+ * boot that failed because an empty table could not be read would be a far worse trade than a late
+ * warning.
  */
 let invalidationWatchStarted = false;
 
@@ -335,11 +549,13 @@ export const startInvalidationWatch = () => {
 	invalidationWatchStarted = true;
 
 	const run = () => {
-		primeInvalidationLkg().catch(() => {});
+		syncBackstop();
+		if (subscription !== null) requestLoad();
 		checkScopeResolvability().catch(() => {});
 		warnIfKillSwitchHidesRows().catch(() => {});
 	};
 
+	subscribeView().catch(() => {});
 	run();
 	onConfigApplied(run);
 };

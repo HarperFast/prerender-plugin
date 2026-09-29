@@ -386,6 +386,11 @@ sustained rate (see §5):
   (`blob-stream`); a non-zero rate here means a path is bypassing the up-front read.
 - **`invalidation read failed for scope …`** — the storage fault behind the `invalidation_error` series; the
   metric says how often, the line says which scope and what threw.
+- **`invalidation view read failed` / `could not subscribe to invalidations` / `invalidation subscription closed`**
+  — a worker's in-memory view of the invalidation table is down (`invalidation_error` kinds `view-read-error`,
+  `view-subscribe-error`), so that worker resolves epochs with per-request reads until the
+  `invalidation.syncInterval` backstop recovers it. Correct, only dearer — the per-request path is the one every
+  release before 0.97.0 ran on; a steady count means the backstop is not recovering and is worth a look.
 - **`could not accelerate … after an invalidation`** — the demand-driven heal path failing
   unexpectedly (the metric's `error` outcome, with the exception attached).
 - **`job_result rejected: x-metadata-size …`** — a render worker posting malformed results; the
