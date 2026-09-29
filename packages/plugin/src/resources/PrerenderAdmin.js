@@ -134,6 +134,7 @@ import { decode } from '../util/contentEncoding.js';
 import { RenderQueue } from './RenderQueue.js';
 import { QueueState } from './QueueState.js';
 import { startSitemapRefreshInBackground } from './Sitemap.js';
+import { runDetached } from '../util/detach.js';
 import { numberOf } from '../util/time.js';
 
 const {
@@ -1153,7 +1154,9 @@ export class PrerenderAdmin extends Resource {
 
 		// Detached: the sweep outlives this request, so a rejection has to be handled here or
 		// it surfaces as an unhandled rejection.
-		runReconcileOnce().catch((e) => logger.error(e));
+		// Outside this request's context (util/detach.js): the walk outlives the response, and the
+		// request's transaction does not.
+		runDetached(() => runReconcileOnce()).catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
@@ -1189,7 +1192,7 @@ export class PrerenderAdmin extends Resource {
 
 		// Detached: the sweep outlives this request, so a rejection has to be handled here or it
 		// surfaces as an unhandled rejection.
-		runOrphanSweepOnce({ dryRun, maxDeletes }).catch((e) => logger.error(e));
+		runDetached(() => runOrphanSweepOnce({ dryRun, maxDeletes })).catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
@@ -1208,13 +1211,16 @@ export class PrerenderAdmin extends Resource {
 		const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : undefined);
 		const days = positive(data?.minAgeDays);
 		const minAgeMs = days === undefined ? undefined : Math.max(1, days) * 86_400_000;
-		const result = await startPageOrphanSweep({
-			dryRun: typeof data?.dryRun === 'boolean' ? data.dryRun : undefined,
-			// The schema floor is one day; a request cannot go under it either.
-			minAgeMs,
-			maxDeletes: positive(data?.maxDeletes) === undefined ? undefined : Math.floor(positive(data.maxDeletes)),
-			ratePerSecond: positive(data?.ratePerSecond) === undefined ? undefined : Math.floor(positive(data.ratePerSecond)),
-		});
+		const result = await runDetached(() =>
+			startPageOrphanSweep({
+				dryRun: typeof data?.dryRun === 'boolean' ? data.dryRun : undefined,
+				// The schema floor is one day; a request cannot go under it either.
+				minAgeMs,
+				maxDeletes: positive(data?.maxDeletes) === undefined ? undefined : Math.floor(positive(data.maxDeletes)),
+				ratePerSecond:
+					positive(data?.ratePerSecond) === undefined ? undefined : Math.floor(positive(data.ratePerSecond)),
+			})
+		);
 		return json({ node: server.hostname, ...result });
 	}
 
@@ -1237,13 +1243,15 @@ export class PrerenderAdmin extends Resource {
 			? Math.max(1, Math.floor(Number(data.ratePerSecond)))
 			: 200;
 		try {
-			const result = await startDiscoveredPurge({
-				urlPrefix: data?.urlPrefix,
-				dryRun,
-				ratePerSecond,
-				force: data?.force === true,
-				skipVisited: data?.skipVisited === true,
-			});
+			const result = await runDetached(() =>
+				startDiscoveredPurge({
+					urlPrefix: data?.urlPrefix,
+					dryRun,
+					ratePerSecond,
+					force: data?.force === true,
+					skipVisited: data?.skipVisited === true,
+				})
+			);
 			return json({ node: server.hostname, ...result });
 		} catch (e) {
 			// The validation refusals (bad prefix, ungated route) are operator input, not faults.
@@ -1284,10 +1292,16 @@ export class PrerenderAdmin extends Resource {
 		// surfaces as an unhandled rejection.
 		// `startedBy: 'manual'` rides on the pass record, so an operator's run — often a forced dry run —
 		// is never read as the scheduled pass it otherwise looks exactly like.
-		const run =
+		//
+		// OUTSIDE THIS REQUEST'S CONTEXT (util/detach.js). Started inline, the pass inherited the request's
+		// transaction, which Harper closes after the response: every page read an action made on it from
+		// then on aborted ("Database closed during transaction get operation"), and each was a detected
+		// change left for the next pass.
+		const run = runDetached(() =>
 			action === 'sweep'
 				? runProbeSweepOnce({ dryRun, startedBy: 'manual' })
-				: runProbeCanaryOnce({ dryRun, startedBy: 'manual' });
+				: runProbeCanaryOnce({ dryRun, startedBy: 'manual' })
+		);
 		run.catch((e) => logger.error(e));
 
 		return json({ ...payload, started: true, alreadyRunning: false });
@@ -1769,7 +1783,7 @@ export class PrerenderAdmin extends Resource {
 
 		if (running) return json({ ...payload, started: false, alreadyRunning: true });
 
-		runBacklogSnapshotOnce().catch((e) => logger.error(e));
+		runDetached(() => runBacklogSnapshotOnce()).catch((e) => logger.error(e));
 		return json({ ...payload, started: true, alreadyRunning: false });
 	}
 
@@ -1990,7 +2004,7 @@ export class PrerenderAdmin extends Resource {
 		if (url !== undefined && (typeof url !== 'string' || !url)) {
 			return json({ error: 'url must be a sitemap URL, or omitted to refresh every root' }, 400);
 		}
-		return json(await startSitemapRefreshInBackground(url));
+		return json(await runDetached(() => startSitemapRefreshInBackground(url)));
 	}
 
 	/**

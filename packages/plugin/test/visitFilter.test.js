@@ -93,7 +93,9 @@ before(async () => {
 								? row.slot < c.value
 								: c.comparator === 'greater_than'
 									? row.slot > c.value
-									: row.slot >= c.value
+									: c.comparator === 'equals'
+										? row.slot === c.value
+										: row.slot >= c.value
 						);
 						if (ok) out.push({ ...row });
 					}
@@ -368,41 +370,6 @@ test('bits from a worker that did not write are carried by the worker that does'
 	assert.equal(visitedWithin('https://example.com/product/prd-winner', H, now), true);
 });
 
-test('a merge the winner never stored is stored by the worker that made it, once two intervals overdue', async () => {
-	// The false negative the one-writer split used to make. The winner stores a slot when IT has
-	// pending bits for it; a loser that merges AFTER that store — the tail of a slot, or a slot only it
-	// saw traffic in — relied on a later winner that never came. Measured on two workers with bursty
-	// traffic: one worker's visits reached storage in 2 of 5 slots.
-	const now = Date.now();
-	const interval = 60_000; // demand.flushInterval default is 5 min; set a round one
-	setDemand({ flushInterval: interval });
-	resetVisitFilter();
-	recordVisit('https://example.com/product/prd-winner');
-	await flushSlices({ write: true, nowMs: now }); // the winner stores the slot
-	recordVisit('https://example.com/product/prd-tail'); // a loser's merge, after that store
-	await flushSlices({ write: false, nowMs: now + 1000 });
-	await refreshMerged(now + 1000);
-	assert.equal(
-		visitedWithin('https://example.com/product/prd-tail', H, now),
-		false,
-		'not stored yet: the winner may still'
-	);
-	await flushSlices({ write: false, nowMs: now + interval });
-	await refreshMerged(now + interval + 2000);
-	assert.equal(
-		visitedWithin('https://example.com/product/prd-tail', H, now),
-		false,
-		'one interval: still the winner’s turn'
-	);
-	await flushSlices({ write: false, nowMs: now + 2 * interval + 1000 });
-	await refreshMerged(now + 2 * interval + 5000);
-	assert.equal(
-		visitedWithin('https://example.com/product/prd-tail', H, now),
-		true,
-		'two intervals overdue: the loser stores its own bits, turn or no turn'
-	);
-});
-
 test('a shared buffer the store would free between uses is held, so a merge reaches its store', async () => {
 	// Harper 5.2's RocksDB store frees a `getUserSharedBuffer` buffer once no ArrayBuffer references
 	// it, and the next call for the key returns a NEW zeroed one. A caller that re-fetched by name on
@@ -427,34 +394,52 @@ test('a shared buffer the store would free between uses is held, so a merge reac
 	}
 });
 
-test('under steady traffic a losing worker whose merges the winner keeps storing never writes', async () => {
-	// The one-writer design (#87): losers merge, one worker stores. A loser that took each new merge's
-	// generation BEFORE checking whether the previous one was covered looked unpaid forever and wrote
-	// the full row every other interval — 5.9 row writes per interval across 16 simulated workers.
-	const interval = 60_000;
-	setDemand({ flushInterval: interval });
-	resetVisitFilter();
-	const genOf = () => {
-		const key = [...sabs.keys()].find((k) => k.startsWith('visitFilter/gen/'));
-		return key ? new Int32Array(sabs.get(key)) : null;
+// ── one copy per node (v0.95.1) ────────────────────────────────────────────────────────────
+// Every worker sets its bits straight into the node-shared live slice, and whichever worker holds the
+// flush turn stores every slot that changed since its last store. Nobody owes anything, so none of the
+// per-worker debts the merge design needed exist to be lost.
+
+const countCalls = (method) => {
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const original = VisitFilter[method];
+	const calls = [];
+	VisitFilter[method] = async (...args) => {
+		calls.push(args);
+		return original.apply(VisitFilter, args);
 	};
-	const t0 = slotOf(Date.now()) * H + 1000; // stay inside one slot
-	for (let tick = 0; tick < 12; tick++) {
-		recordVisit(`https://example.com/product/prd-steady-${tick}`);
-		await flushSlices({ write: false, nowMs: t0 + tick * interval });
-		// the winner stores the slot within the interval, covering everything merged so far
-		const gen = genOf();
-		Atomics.store(gen, 1, Atomics.load(gen, 0));
-	}
-	assert.equal(rows.size, 0, 'the loser never paid a debt the winner was paying');
+	return { calls, restore: () => (VisitFilter[method] = original) };
+};
+
+test('only the worker holding the turn stores; the others set bits and write nothing', async () => {
+	recordVisit('https://example.com/product/prd-a');
+	await flushSlices({ write: false });
+	assert.equal(rows.size, 0, 'no turn, no write — however many workers record');
+	recordVisit('https://example.com/product/prd-b'); // "another worker": the same shared slice
+	await flushSlices({ write: true });
+	assert.equal(rows.size, 1, 'one row per node per slot');
+	await refreshMerged(Date.now());
+	assert.equal(visitedWithin('https://example.com/product/prd-a', H, Date.now()), true);
+	assert.equal(visitedWithin('https://example.com/product/prd-b', H, Date.now()), true);
 });
 
-test('a debt re-armed while its store is in flight survives that store', async () => {
-	// A second flush on the same thread can merge again while the first put is still awaiting; deleting
-	// the debt unconditionally after the put dropped the newer merge — a false negative.
-	const interval = 60_000;
-	setDemand({ flushInterval: interval });
-	resetVisitFilter();
+test('a slot nothing changed in since its last store is not stored again', async () => {
+	const puts = countCalls('put');
+	try {
+		recordVisit('https://example.com/product/prd-once');
+		await flushSlices();
+		await flushSlices();
+		recordVisit('https://example.com/product/prd-once'); // a repeat visit sets no new bit
+		await flushSlices();
+		assert.equal(puts.calls.length, 1, 'one store: a repeat visit is not a change');
+		recordVisit('https://example.com/product/prd-new');
+		await flushSlices();
+		assert.equal(puts.calls.length, 2, 'a new URL is');
+	} finally {
+		puts.restore();
+	}
+});
+
+test('a visit set while a store is in flight is stored by the next store', async () => {
 	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
 	const put = VisitFilter.put;
 	let release;
@@ -468,33 +453,97 @@ test('a debt re-armed while its store is in flight survives that store', async (
 		return put.call(VisitFilter, id, data);
 	};
 	try {
-		const now = slotOf(Date.now()) * H + 1000;
+		const now = Date.now();
 		recordVisit('https://example.com/product/prd-early');
 		const storing = flushSlices({ write: true, nowMs: now }); // stalls inside the put
 		await new Promise((resolve) => setImmediate(resolve));
 		recordVisit('https://example.com/product/prd-during');
-		await flushSlices({ write: false, nowMs: now + 1 }); // merges while the store is in flight
 		release();
 		await storing;
-		await flushSlices({ write: false, nowMs: now + 3 * interval }); // overdue: the loser pays
-		await refreshMerged(now + 3 * interval + 5000);
+		await flushSlices({ write: true, nowMs: now + 1 });
+		await refreshMerged(now + 2);
 		assert.equal(visitedWithin('https://example.com/product/prd-during', H, now), true);
 	} finally {
 		VisitFilter.put = put;
 	}
 });
 
-test('a debt another worker already paid is forgotten, with no write', async () => {
-	const now = Date.now();
-	recordVisit('https://example.com/product/prd-paid');
-	await flushSlices({ write: false, nowMs: now }); // merged, owed
-	// Another worker stores the slot after this merge: its `stored` generation passes ours.
-	const genKey = [...sabs.keys()].find((k) => k.startsWith('visitFilter/gen/'));
-	const gen = new Int32Array(sabs.get(genKey));
-	Atomics.store(gen, 1, Atomics.load(gen, 0));
-	const before = rows.size;
-	await flushSlices({ write: false, nowMs: now + 24 * H }); // long overdue, but already paid
-	assert.equal(rows.size, before, 'nothing written: the bits are already stored');
+test('only the first store of a slot in a process reads the row back', async () => {
+	const gets = countCalls('get');
+	try {
+		recordVisit('https://example.com/product/prd-1');
+		await flushSlices();
+		recordVisit('https://example.com/product/prd-2');
+		await flushSlices();
+		recordVisit('https://example.com/product/prd-3');
+		await flushSlices();
+		assert.equal(gets.calls.length, 1, 'the fold of pre-restart history, once; later stores write blind');
+	} finally {
+		gets.restore();
+	}
+});
+
+test('a refresh fetches the bits only of slots with a row it has not seen at that version', async () => {
+	const base = slotOf(Date.now()) * H;
+	const realNow = Date.now;
+	try {
+		for (const hoursAgo of [3, 2, 0]) {
+			Date.now = () => base - hoursAgo * H + 60_000;
+			recordVisit(`https://example.com/product/prd-${hoursAgo}`);
+			await flushSlices();
+		}
+	} finally {
+		Date.now = realNow;
+	}
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const search = VisitFilter.search;
+	const bitReads = [];
+	VisitFilter.search = async (query) => {
+		if (query.select?.includes('bits')) bitReads.push(query.conditions[0].value);
+		return search.call(VisitFilter, query);
+	};
+	try {
+		const at = base + 30 * 60_000;
+		await refreshMerged(at);
+		assert.equal(bitReads.length, 3, 'first refresh: every slot with a row');
+		bitReads.length = 0;
+		await refreshMerged(at + 1);
+		assert.deepEqual(bitReads, [], 'nothing changed: no bits read');
+		recordVisit('https://example.com/product/prd-late');
+		await flushSlices({ nowMs: at });
+		await refreshMerged(at + 2);
+		assert.deepEqual(bitReads, [slotOf(at)], 'only the slot whose row moved');
+		assert.equal(visitedWithin('https://example.com/product/prd-late', H, at + 2), true);
+	} finally {
+		VisitFilter.search = search;
+	}
+});
+
+test('a live slice is let go only once stored — an unstored one survives two rollovers', async () => {
+	// Model Harper 5.2: a store that forgets any buffer nobody holds. Releasing an unstored live slice
+	// would free its bits.
+	const store = globalThis.databases.coordination.SharedBuffer.primaryStore;
+	const original = store.getUserSharedBuffer;
+	store.getUserSharedBuffer = (_key, fresh) => fresh;
+	resetHeldSabs();
+	const realNow = Date.now;
+	try {
+		const base = slotOf(realNow()) * H;
+		Date.now = () => base - 3 * H + 60_000;
+		recordVisit('https://example.com/product/prd-unstored'); // three slots back, never stored
+		Date.now = () => base + 60_000;
+		recordVisit('https://example.com/product/prd-now'); // rollover: slot -3 is two+ back, unstored
+		await flushSlices({ nowMs: base + 60_000 });
+		await refreshMerged(base + 120_000);
+		assert.equal(
+			visitedWithin('https://example.com/product/prd-unstored', 4 * H, base + 120_000),
+			true,
+			'kept until stored'
+		);
+	} finally {
+		Date.now = realNow;
+		store.getUserSharedBuffer = original;
+	}
 });
 
 test('a restart with empty shared buffers cannot erase history already in the row', async () => {

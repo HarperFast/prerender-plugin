@@ -146,7 +146,8 @@ Notes that bite:
   `overdue` sums across nodes; `fill` takes its **peak** (below); `false_positive` is measured over
   full slots only, so its level is the answer. The ladder's decision counters are NOT gauges — they
   are per-interval counts and must be summed.
-- **`demand_fill` is a sawtooth — read max/p95, never the mean.** It is the set-bit fraction of the
+- **`demand_fill` is a sawtooth — read max/p95, never the mean.** One worker per node emits it at each
+  refresh of the node's shared union (v0.95.1; every worker did before). It is the set-bit fraction of the
   newest visit-filter slice, which resets to ~0 at each `sliceMs` rollover and climbs until the next
   one, so an average reports the middle of the ramp while the ladder's decisions land all along it,
   including at the top. The false-positive rate is `fill^k` (k = `demand.hashes`, 7 by

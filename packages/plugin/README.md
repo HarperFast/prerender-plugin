@@ -1308,8 +1308,19 @@ six hours read the same. False positives only ever ADD demand, and they rise off
 the time. `demand_false_positive` (the worst full slice's `fill^k`) is the number to watch; past
 `demand.maxFalsePositive` the tracker reports demand as **unknown** and the changed-page order falls back
 to cadence. The ladder does not consult it. Size `demand.bitsPerSlice` from the measured peak distinct
-URLs per slice (`n ≈ −(m/k) ln(1 − fill)`), and weigh it against `demand.flushInterval`: the row is
-`bitsPerSlice / 8` bytes and replicates on every flush. Changing `bitsPerSlice`, `hashes` or `sliceMs`
+URLs per slice (`n ≈ −(m/k) ln(1 − fill)`), with room: bits `≈ k·n / −ln(1 − f)` for a fill f, and
+f = 0.652 holds the 5% limit at k = 7.
+
+What a larger ring costs, since v0.95.1 once per node rather than once per worker:
+
+| Cost              | Scales with                                                       | Notes                                                                             |
+| ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Replicated writes | one row (`bitsPerSlice / 8`) per node per `flushInterval`         | Only the current slice changes; the lever is `flushInterval`.                     |
+| Memory            | `slices` rows per node (the union), plus about two live slices    | Shared by every worker on the node.                                               |
+| Reads             | the rows that changed since the last refresh, per `mergeInterval` | One worker refreshes; in steady traffic that is the current slice from each node. |
+
+Every worker sets its bits in the node's shared slice, and whichever worker holds the interval's turn
+stores it, so no visit waits on a particular worker. Changing `bitsPerSlice`, `hashes` or `sliceMs`
 reshapes the ring, and the ladder then rests targets at base for one slowest rung while new history
 accumulates.
 
