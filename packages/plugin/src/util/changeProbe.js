@@ -2906,7 +2906,12 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 		}
 		let pass;
 		try {
-			pass = await runProbeSweepOnce({ startedBy: 'anchor', anchorAt: served });
+			// Attempt only when the claim looks free: every attempt briefly holds this worker's re-entrancy
+			// flag, and a reseed requested inside that instant would be parked for a pass that never starts.
+			pass =
+				sweepRunning || (await isPassRunningOnNode('sweep'))
+					? { skipped: true }
+					: await runProbeSweepOnce({ startedBy: 'anchor', anchorAt: served });
 		} catch (e) {
 			logger.error(e);
 			countProbe('anchor', result);
