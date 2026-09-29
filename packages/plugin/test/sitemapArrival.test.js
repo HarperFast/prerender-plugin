@@ -154,6 +154,61 @@ test('decideArrival: every skip is named', () => {
 
 // ---- the candidate list ----
 
+// ---- a GONE-suppressed target rejoining its sitemap (render.suppression.gone.reopen) ----
+
+const withReopen = (reopen, { productAction = 'render' } = {}) =>
+	applyOptions({
+		sitemap: { arrival: { enabled: true, dryRun: true } },
+		render: { suppression: { gone: { reopen } } },
+		ingress: {
+			mode: 'forwarded',
+			routes: [
+				{
+					match: 'prefix',
+					path: '/product/',
+					mode: 'prerender',
+					...(productAction ? { arrivalAction: productAction } : {}),
+				},
+			],
+		},
+	});
+
+const goneRow = { url: PRODUCT, sitemapUrl: SITEMAP, state: 'suppressed', suppressedReason: 'http-gone' };
+
+test('decideArrival: a GONE-suppressed target that rejoins takes its route’s action — the sitemap says it exists again', () => {
+	withReopen({ enabled: true, dryRun: false });
+	assert.deepEqual(decideArrival({ url: PRODUCT, target: goneRow }), {
+		action: ArrivalAction.RENDER,
+		reason: 'rejoined-gone',
+	});
+	withReopen({ enabled: true, dryRun: false }, { productAction: null });
+	assert.deepEqual(decideArrival({ url: PRODUCT, target: goneRow }), {
+		action: ArrivalAction.NONE,
+		reason: 'route-opted-out',
+	});
+});
+
+test('decideArrival: under the reopen dry run a gone rejoin is counted, not acted on; switched off it is skipped', () => {
+	withReopen({ enabled: true, dryRun: true });
+	assert.deepEqual(decideArrival({ url: PRODUCT, target: goneRow }), {
+		action: ArrivalAction.NONE,
+		reason: 'would-reopen',
+	});
+	withReopen({ enabled: false });
+	assert.deepEqual(decideArrival({ url: PRODUCT, target: goneRow }), {
+		action: ArrivalAction.NONE,
+		reason: 'suppressed',
+	});
+});
+
+test('decideArrival: noindex and canonical-mismatch suppressions stay skipped — a listing says nothing about them', () => {
+	withReopen({ enabled: true, dryRun: false });
+	for (const suppressedReason of ['noindex', 'canonical-mismatch', null]) {
+		const target = { ...goneRow, suppressedReason };
+		assert.equal(decideArrival({ url: PRODUCT, target }).reason, 'suppressed', String(suppressedReason));
+	}
+});
+
 test('arrivalCandidateCap follows sitemap.arrival.maxCandidates, -1 is Infinity, 0 is 0', () => {
 	setRoutes({ arrival: { maxCandidates: 123 } });
 	assert.equal(arrivalCandidateCap(), 123);

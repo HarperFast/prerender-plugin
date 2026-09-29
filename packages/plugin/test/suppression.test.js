@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyOptions } from '../src/config.js';
-import { gradeSuppression, isGoneVerdict } from '../src/util/suppression.js';
+import { gradeSuppression, isGoneSuppressed, isGoneVerdict, suppressionAgeBucket } from '../src/util/suppression.js';
 
 globalThis.logger ??= { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -73,4 +73,27 @@ test('setting maxStrikesUnlisted equal to maxStrikes restores the pre-0.67.0 beh
 	setSuppression({ maxStrikesUnlisted: 2 });
 	assert.equal(gradeSuppression({ reason: 'http-error', statusCode: 404, fromSitemap: false }).maxStrikes, 2);
 	assert.equal(gradeSuppression({ reason: 'http-error', statusCode: 404, fromSitemap: true }).maxStrikes, 2);
+});
+
+test('isGoneSuppressed: only a row suppressed with the gone reason — the one an origin 200 can overturn', () => {
+	assert.equal(isGoneSuppressed({ state: 'suppressed', suppressedReason: 'http-gone' }), true);
+	assert.equal(isGoneSuppressed({ state: 'suppressed', suppressedReason: 'noindex' }), false);
+	assert.equal(isGoneSuppressed({ state: null, suppressedReason: 'http-gone' }), false);
+	assert.equal(isGoneSuppressed(null), false);
+	// The reason a gone verdict stores and the one the predicate reads are the same constant.
+	assert.equal(
+		gradeSuppression({ reason: 'http-error', statusCode: 404, fromSitemap: false }).storedReason,
+		'http-gone'
+	);
+});
+
+test('suppressionAgeBucket: a closed set, split where flapping differs from coming back', () => {
+	const H = 3_600_000;
+	assert.equal(suppressionAgeBucket(5 * 60_000), '<1h');
+	assert.equal(suppressionAgeBucket(2 * H), '<6h');
+	assert.equal(suppressionAgeBucket(12 * H), '<1d');
+	assert.equal(suppressionAgeBucket(2 * DAY), '<3d');
+	assert.equal(suppressionAgeBucket(10 * DAY), '<14d');
+	assert.equal(suppressionAgeBucket(14 * DAY), '14d+');
+	for (const bad of [NaN, -1, undefined]) assert.equal(suppressionAgeBucket(bad), 'unknown');
 });

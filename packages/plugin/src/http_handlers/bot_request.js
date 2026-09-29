@@ -33,6 +33,13 @@ import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
 import { captureForRawCache, rawCachePolicy, rawKeyOf, readRawPage } from '../util/rawCache.js';
+import {
+	afterNegativeProxy,
+	answerFromNegativeCache,
+	negativeCachePolicy,
+	negativeKeyOf,
+} from '../util/negativeCache.js';
+import { isGoneSuppressed, maybeReopenGone, REOPEN_SELECT } from '../util/goneReopen.js';
 import { rescueFromOwner } from '../util/peerRescue.js';
 import { evaluateEntityGate } from '../util/entityGate.js';
 import { deliverResource } from './response.js';
@@ -71,6 +78,7 @@ export async function handleBotRequest(request) {
 				: null;
 		maybeSchedule(resource, routeClass, route, request.botName, onMiss, {
 			renderTimedOut: info.renderNowStatus === 'timeout',
+			cacheStatus: info.cacheStatus,
 		});
 		recordDemand({ resource, routeClass, route, cacheUrl, botName: request.botName, cacheStatus: info.cacheStatus });
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
@@ -424,6 +432,37 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		}
 	}
 
+	// THE NEGATIVE CACHE (util/negativeCache.js): the origin's own stored 404/410, gated exactly like the raw
+	// cache above and for the same reasons — a TRUE miss only, never over an explicit `missHeader: origin`
+	// — and consulted after it, since a stored document for this URL would be the better answer. What the
+	// lookup found is carried to `afterNegativeProxy`, which stores, refreshes or drops the entry once the
+	// origin has answered.
+	const negativePolicy =
+		info.cacheStatus === 'miss' && !(missModeExplicit && effectiveMissMode === 'origin')
+			? negativeCachePolicy(info.route)
+			: null;
+	const negativeKey = negativePolicy ? negativeKeyOf({ cacheKey, cacheUrl }, negativePolicy) : null;
+	let negativeLookup = null;
+	if (negativePolicy) {
+		negativeLookup = await answerFromNegativeCache({
+			key: negativeKey,
+			cacheUrl,
+			url,
+			deviceType,
+			method: request.method,
+			botName: request.botName,
+			policy: negativePolicy,
+			epochOf: () => resolveInvalidation(routeScopeForEntry(info.route)),
+			onLive: (liveUrl) => maybeReopenGone({ url: liveUrl, via: 'recheck' }),
+		});
+		if (negativeLookup.answered) {
+			info.cachedBody = negativeLookup.body;
+			info.cacheStatus = negativeLookup.cacheStatus;
+			info.source = negativeLookup.source;
+			return { ...negativeLookup.resource, cacheKey };
+		}
+	}
+
 	info.source = 'origin';
 	// `stripValidators` on an invalidated verdict, so the origin cannot answer 304 to the validators
 	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
@@ -441,7 +480,12 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
 	// store is detached inside `captureForRawCache` — no latency on this response.
-	return rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
+	const kept = rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
+	// Same rule for a 404/410: the store (and the Target guard in front of it) is detached. The two never
+	// both attach — the raw cache stores only 200s, the negative cache only its configured statuses.
+	return negativePolicy
+		? afterNegativeProxy(kept, { key: negativeKey, cacheUrl, policy: negativePolicy, lookup: negativeLookup })
+		: kept;
 }
 
 // WHY A MISS HAPPENED, one cause per origin-served miss: the `bot_miss` counter, and the same URL into
@@ -474,10 +518,12 @@ const statusCause = (statusCode) => {
 // covers what `excludePathPatterns` used to gate separately, since those patterns compile
 // into passthrough routes (see util/routeClass.js).
 //
-// The discovery gates sit HERE, not in handlePageScheduling: a gated miss skips the detached
+// The discovery gates sit HERE, not in handlePageScheduling: a route-gated miss skips the detached
 // Target.get entirely, which matters on a gated combinatorial route where misses are most of
-// the traffic. The gates stop target CREATION only — an existing target's miss was a no-op in
-// handlePageScheduling anyway — so `discovery_gated` counts gated misses, not denied mints.
+// the traffic. A BOT-gated true miss pays one detached read while `render.suppression.gone.reopen` is
+// on, to see a gone target answering 200 again (`reopenFromTraffic`). The gates stop target CREATION
+// only — an existing target's miss was a no-op in handlePageScheduling anyway — so
+// `discovery_gated` counts gated misses, not denied mints.
 //
 // The ENTITY gate is the exception to "the gates sit here", and necessarily so: it asks whether
 // ANOTHER URL of the same entity has a target, which is a read, and it only means anything for a URL
@@ -486,7 +532,14 @@ const statusCause = (statusCode) => {
 //
 // `onMiss`, when given, is told WHY this request missed (`recordMiss`) — exactly once, here for every
 // cause the gates decide and from `handlePageScheduling` for the rest. Exported for tests.
-export function maybeSchedule(resource, routeClass, route, botName, onMiss = null, { renderTimedOut = false } = {}) {
+export function maybeSchedule(
+	resource,
+	routeClass,
+	route,
+	botName,
+	onMiss = null,
+	{ renderTimedOut = false, cacheStatus = null } = {}
+) {
 	// An on-demand render that did not land in time missed for THAT reason, whatever its fallback
 	// answered with (the origin, or render-now's own 504): the cause is render latency, not the status
 	// the fallback happened to return. Scheduling below proceeds as it would have, untold.
@@ -502,9 +555,28 @@ export function maybeSchedule(resource, routeClass, route, botName, onMiss = nul
 	}
 	if (!botMayDiscover(botName)) {
 		metrics.discoveryGated('bot', botName);
+		// A BOT THAT MAY NOT ADD A TARGET MAY STILL REOPEN ONE (util/goneReopen.js). The discovery gate stops
+		// crawlers minting URLs nobody declared; a gone-suppressed row is a URL the rotation already held, so
+		// the origin answering 200 for it is evidence whichever crawler asked. A true miss only: a suppressed
+		// target has no page, so anything else found a row in rotation and has nothing to reopen. Detached,
+		// like the discovery read, and never on a route-gated path (that return is above).
+		if (cacheStatus === 'miss' && config.render.suppression.gone.reopen.enabled) {
+			setImmediate(reopenFromTraffic, resource);
+		}
 		return onMiss?.('gated-bot');
 	}
 	setImmediate(handlePageScheduling, resource, route, botName, onMiss);
+}
+
+// A gated bot's origin 200 on a minting route: reopen the URL's target if it is gone-suppressed. Exported
+// for tests.
+export async function reopenFromTraffic(resource) {
+	try {
+		if (!isPrerenderCandidate(resource)) return;
+		await maybeReopenGone({ url: canonicalizeUrl(resource.url, ['*']), via: 'traffic' });
+	} catch (e) {
+		logger.error(e);
+	}
 }
 
 // Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
@@ -550,7 +622,13 @@ export function recordDemand({ resource, routeClass, route, cacheUrl, botName, c
 	// ladder's Bloom filter the combinatorial facet space it is explicitly sized to exclude, and a
 	// saturated ring does not fail loudly: it answers "visited" for everything, and the visit signal
 	// stops being a signal for the corpus that does own targets.
-	const owned = cacheStatus !== 'miss' && cacheStatus !== 'raw' && !NO_PAGE_LOOKUP.has(cacheStatus);
+	// A stored 404 is the same case again: nothing rendered it and no Target owns it.
+	const owned =
+		cacheStatus !== 'miss' &&
+		cacheStatus !== 'raw' &&
+		cacheStatus !== 'negative' &&
+		cacheStatus !== 'negative-revalidate' &&
+		!NO_PAGE_LOOKUP.has(cacheStatus);
 	const minting = cacheStatus === 'miss' && resource.statusCode === 200 && route?.discoverTargets !== false;
 	if (!owned && !minting) return;
 	if (!botCountsAsDemand(botName)) return;
@@ -692,11 +770,16 @@ export async function handlePageScheduling(resource, route, botName, onMiss = nu
 			// target is already in rotation, and a SUPPRESSED one is a render verdict saying
 			// "stop re-creating me" (it re-checks itself on its own schedule). Only a URL with
 			// no row at all is genuinely new.
-			// `state` rides on the same point read (it tells a suppressed row from one in rotation).
-			const existingTarget = await Target.get({ id: canonicalUrl, select: ['url', 'state'] });
+			// `state` rides on the same point read (it tells a suppressed row from one in rotation), and so does
+			// what a reopen needs: this read is the one that sees a gone target answering 200 again.
+			const existingTarget = await Target.get({ id: canonicalUrl, select: [...REOPEN_SELECT] });
 			if (existingTarget) {
-				if (existingTarget.state === 'suppressed') tell('suppressed');
-				else if (resource.deviceType && !config.deviceTypes.default.includes(resource.deviceType)) tell('device');
+				if (existingTarget.state === 'suppressed') {
+					tell('suppressed');
+					if (isGoneSuppressed(existingTarget)) {
+						await maybeReopenGone({ url: canonicalUrl, target: existingTarget, via: 'traffic' });
+					}
+				} else if (resource.deviceType && !config.deviceTypes.default.includes(resource.deviceType)) tell('device');
 				else tell('unrendered');
 			} else {
 				// THE ENTITY GATE (util/entityGate.js): a URL whose product already has a target in rotation

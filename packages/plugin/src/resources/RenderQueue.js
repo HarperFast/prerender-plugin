@@ -1,6 +1,7 @@
 import { getMutex } from '../util/coordination.js';
 import { config, onConfigApplied } from '../config.js';
-import { currentMinuteMs } from '../util/time.js';
+import { currentMinuteMs, dateColumnMs } from '../util/time.js';
+import { suppressionAgeBucket } from '../util/suppression.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
@@ -681,10 +682,20 @@ export class RenderQueue extends Resource {
 			// Suppress writes the URL row (its recheck) and drops every device's page; the verdict
 			// SUPPRESSES the target rather than deleting it — see Target.suppress, which also grades
 			// http-error verdicts by status (404/410 recheck less, die sooner).
-			const { deleted, absent } = await Target.suppress(url, {
+			const { deleted, absent, held } = await Target.suppress(url, {
 				reason: verdict.reason,
 				statusCode: verdict.statusCode,
 			});
+			// The other half of `suppression_lifted` below: a suppressed target rendered, and the verdict
+			// stood. Together they are the precision of every early recheck — a gone target rendered
+			// before its `recheckInterval` was filed by a reopen (util/goneReopen.js), and this is where
+			// one that found the page still gone shows up.
+			if (held) {
+				metrics.suppressionHeld(
+					held.reason ?? 'unknown',
+					suppressionAgeBucket(Date.now() - dateColumnMs(held.suppressedAt))
+				);
+			}
 			// At maxStrikes the suppression DELETED the target, and `Target.delete` took the URL's default
 			// device rows with it — so a folding row is already gone (a second delete would only write a
 			// tombstone), while a non-default one-device row still needs retiring below.
@@ -739,7 +750,15 @@ export class RenderQueue extends Resource {
 		const scheduleJob = refiledTo ? describeJob(refiledTo, refiledTo) : job;
 		const renderTarget = await Target.get({
 			id: scheduleUrl,
-			select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
+			select: [
+				'renderInterval',
+				'sitemapUrl',
+				'state',
+				'strikes',
+				'demandInterval',
+				'suppressedReason',
+				'suppressedAt',
+			],
 		});
 		// No target here: a one-off, or a recurring row whose target has not reached this node. The
 		// latter must not store its pages — a page with no target is never re-rendered and never
@@ -977,6 +996,12 @@ export class RenderQueue extends Resource {
 			if (renderTarget.state === 'suppressed' && rendered.some((variant) => variant.isIndexable === true)) {
 				logger.info(`Prerendered url ${scheduleUrl} is indexable again — lifting its suppression`);
 				await Target.reactivate(scheduleUrl);
+				// How often a verdict turns out to have been temporary, and after how long — nothing else
+				// measures it, and it is what sizes a reopen trigger (util/goneReopen.js).
+				metrics.suppressionLifted(
+					renderTarget.suppressedReason ?? 'unknown',
+					suppressionAgeBucket(Date.now() - dateColumnMs(renderTarget.suppressedAt))
+				);
 			} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
 				// Strikes are CONSECUTIVE failures by definition: a successful render resets the
 				// count, so redirect blips months apart never accumulate toward retirement.

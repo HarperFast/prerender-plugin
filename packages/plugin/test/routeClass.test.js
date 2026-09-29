@@ -520,6 +520,24 @@ test('route rawCache: true kept, an invalid value drops the FIELD but never the 
 	assert.equal(matchRoute('/product/prd-1').rawCache, false);
 });
 
+test('route negativeCache: true kept, an invalid value drops the FIELD but never the route, passthrough ignores it', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/product/prd-', negativeCache: true },
+				{ match: 'prefix', path: '/catalog/', negativeCache: 'yes' }, // invalid → field dropped
+				{ match: 'prefix', path: '/help/', mode: 'passthrough', negativeCache: true },
+				{ match: 'prefix', path: '/brand/' },
+			],
+		},
+	});
+	assert.equal(matchRoute('/product/prd-1').negativeCache, true);
+	assert.equal(matchRoute('/catalog/x').mode, 'prerender');
+	assert.equal(matchRoute('/catalog/x').negativeCache, false);
+	assert.equal(matchRoute('/help/faq').negativeCache, false);
+	assert.equal(matchRoute('/brand/x').negativeCache, false, 'defaults to false');
+});
+
 test('route rawCache defaults to false and is ignored on a passthrough route', () => {
 	forwarded({
 		ingress: {

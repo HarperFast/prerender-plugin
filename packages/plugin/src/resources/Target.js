@@ -203,9 +203,24 @@ export class Target extends TargetTable {
 	static async suppress(url, { reason, statusCode } = {}) {
 		const existing = await Target.get({
 			id: url,
-			select: ['strikes', 'renderInterval', 'sitemapUrl', 'schedulerNode', 'unlistedAt'],
+			select: [
+				'strikes',
+				'renderInterval',
+				'sitemapUrl',
+				'schedulerNode',
+				'unlistedAt',
+				'state',
+				'suppressedReason',
+				'suppressedAt',
+			],
 		});
 		const strikes = countedStrikes(existing?.strikes) + 1;
+		// The verdict this one REPLACES, when the target was already suppressed: the render re-proved it
+		// rather than lifting it. Returned so the caller can count it beside `suppression_lifted`.
+		const held =
+			existing?.state === 'suppressed'
+				? { reason: existing.suppressedReason ?? null, suppressedAt: existing.suppressedAt ?? null }
+				: null;
 
 		// The grading reads `sitemapUrl`, which this projection already carries: a gone verdict on a
 		// target no sitemap lists has its own (lower) ceiling, because nothing re-creates it. See
@@ -242,7 +257,7 @@ export class Target extends TargetTable {
 				`Prerender target ${url} non-indexable ${strikes} consecutive times (${storedReason ?? 'no reason'}) — deleting it`
 			);
 			await Target.delete(url); // drops schedules + pages too
-			return { deleted: true, strikes };
+			return { deleted: true, strikes, held };
 		}
 
 		// A put REPLACES the row, so every field that describes the URL rather than the verdict is carried
@@ -280,7 +295,7 @@ export class Target extends TargetTable {
 			}),
 			...pageKeysOf(url).map((cacheKey) => PrerenderedPage.delete(cacheKey)),
 		]);
-		return { deleted: false, strikes };
+		return { deleted: false, strikes, held };
 	}
 
 	/** A render found a suppressed URL indexable again — put it back in normal rotation.

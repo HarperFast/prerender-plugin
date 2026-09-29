@@ -184,6 +184,7 @@ export function render(ctx) {
 		// out of it, and the raw cache is what answers them anyway.
 		discoveryGate(ctx, data, filter),
 		rawCache(ctx, data, filter),
+		negativeCache(ctx, data, filter),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -790,6 +791,14 @@ const FAMILIES = [
 		hint: 'a miss answered from a stored origin document — never rendered, so it has no cadence',
 	},
 	{
+		key: 'negative',
+		label: 'Stored 404',
+		// A dead URL, answered from the origin's own 404 instead of asking it again. Not a coverage gap
+		// (there is no page to cover) and not a fault — its own family, like raw, so the feature working
+		// never reads as something to fix.
+		hint: 'a dead URL answered from the origin’s stored 404 — there is no page to render',
+	},
+	{
 		key: 'not-cacheable',
 		label: 'Not cacheable',
 		hint: 'the cache was never consulted',
@@ -823,6 +832,11 @@ const NOT_HIT = {
 	// rendered was inside its cadence, and nothing rendered this. `render.raw` stores the document a
 	// miss already fetched so the next crawler asking for the same URL is answered from storage.
 	'raw': ['raw', 'a stored origin document answered it — no browser ran on it, and it owns no render target'],
+	'negative': ['negative', 'the origin’s stored 404 answered a dead URL, and the origin was not asked'],
+	'negative-revalidate': [
+		'negative',
+		'the stored 404 answered at once while the origin was re-checked in the background — counted against offload',
+	],
 	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
 	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD)'],
 };
@@ -2125,6 +2139,155 @@ function rawCache(ctx, data, filter) {
 								]);
 							})
 						),
+		],
+	});
+}
+
+// ---- the negative cache (plugin render.negative) --------------------------------
+//
+// The dry run is the reason this panel exists. Arming the cache is a decision made on two numbers the
+// plugin counts while nothing is served from storage: `would-serve` (the origin requests arming saves)
+// and `would-serve-live` (requests an armed cache would have answered with a 404 while the origin said
+// 200). Armed, the same row reads as what it did, and `recheck-live` is the recovery signal.
+
+const NEGATIVE_REFUSALS = new Set([
+	'has-cookie',
+	'private',
+	'no-store',
+	'staging',
+	'no-body',
+	'empty',
+	'oversize',
+	'capture-failed',
+	'capture-busy',
+	'write-failed',
+	'skipped-listed',
+	'skipped-target',
+]);
+
+// Finer than `pct` for a risk share: 3 stale 404s in 1,000 must not print as 0%.
+const riskShare = (part, whole) => {
+	const share = (part / whole) * 100;
+	return share > 0 && share < 0.1 ? '<0.1%' : `${share < 10 ? share.toFixed(1) : Math.round(share)}%`;
+};
+
+function negativeCache(ctx, data, filter) {
+	const events = pick(data, 'prerender_ops', (s) => s.path === 'negative_cache');
+	const gaps = pick(data, 'prerender_ops', (s) => s.path === 'negative_gap');
+	const reopens = pick(data, 'prerender_ops', (s) => s.path === 'gone_reopen');
+	const lifted = pick(data, 'prerender_ops', (s) => s.path === 'suppression_lifted');
+	const held = pick(data, 'prerender_ops', (s) => s.path === 'suppression_held');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('render.negative.enabled')?.effective === true;
+	const dryRun = options.get('render.negative.dryRun')?.effective !== false;
+	const routes = (options.get('ingress.routes')?.effective ?? []).filter(
+		(entry) => entry && typeof entry === 'object' && entry.negativeCache === true
+	);
+	// Narrowed by the bot filter like every other bot_serve read here; the prerender_ops rows carry no bot.
+	const answered = sumCount(pick(data, 'bot_serve', (s) => s.method === 'negative' && keepBot(filter, s.type)));
+	const rechecking = sumCount(
+		pick(data, 'bot_serve', (s) => s.method === 'negative-revalidate' && keepBot(filter, s.type))
+	);
+
+	const tally = (combos) => {
+		const by = new Map();
+		for (const s of combos) by.set(s.method ?? 'unknown', (by.get(s.method ?? 'unknown') ?? 0) + s.count);
+		return (key) => by.get(key) ?? 0;
+	};
+	const ev = tally(events);
+	const reopen = tally(reopens);
+	const liftedGone = sumCount(lifted.filter((s) => s.method === 'http-gone'));
+	// A gone target's own recheck lands in 14d+, so a gone target rendered younger than that was an EARLY
+	// recheck — a reopen, an arrival or an operator revalidate — and live vs still-gone there is how often
+	// the evidence that filed it was right.
+	const early = (s) => s.method === 'http-gone' && s.type !== '14d+' && s.type !== 'unknown';
+	const earlyLive = sumCount(lifted.filter(early));
+	const earlyGone = sumCount(held.filter(early));
+	const stored = ev('stored') + ev('stored-unshared');
+	const refused = [...NEGATIVE_REFUSALS].reduce((acc, key) => acc + ev(key), 0);
+	const wouldServe = ev('would-serve');
+	const wouldLive = ev('would-serve-live');
+	// Every would-serve-live request was first counted as would-serve OR would-revalidate (the lookup
+	// counts, the proxied 200 then counts again), so those two are its denominator.
+	const wouldAnswer = wouldServe + ev('would-revalidate');
+
+	if (!enabled && !events.length && !answered && !rechecking && !reopens.length) {
+		return card('Negative cache', {
+			head: [spacer(), pill('off', '')],
+			help: [
+				'Keeps the origin’s own 404/410 for a dead URL, so the next crawler asking for it is answered without ',
+				'another origin request. Switches: ',
+				el('code', { text: 'render.negative.enabled' }),
+				' and ',
+				el('code', { text: 'negativeCache' }),
+				' on a route (',
+				link('Config →', () => ctx.go('config')),
+				').',
+			],
+			body: [el('div', { cls: 'empty', text: 'Off.' })],
+		});
+	}
+
+	return card(`Negative cache — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? (dryRun ? pill('dry run', 'info') : pill('armed', 'ok')) : pill('master switch off', 'warn'),
+			routes.length
+				? pill(`${routes.length} route${routes.length === 1 ? '' : 's'} opted in`, 'info')
+				: pill('no route opted in', 'warn'),
+			spacer(),
+		],
+		help: [
+			'The origin’s stored 404 for a dead URL. Inside ',
+			el('code', { text: 'render.negative.freshMs' }),
+			' it answers and nobody is asked; after that it answers at once while the origin is re-checked, which ',
+			'saves no origin request and is counted against offload. A sitemap-listed Target always overrules it. ',
+			'In a dry run nothing is answered from storage: “would serve” is what arming saves, and “would serve ',
+			'live” is how often arming would have answered a live page with a 404.',
+		],
+		body: [
+			wouldLive > 0 &&
+				el('div', { cls: dryRun ? 'note bad' : 'note warn' }, [
+					el('strong', {
+						text: `${num(wouldLive)} request(s) would have been answered with a stale 404`,
+					}),
+					' while the origin answered 200' +
+						(wouldAnswer ? ` (${riskShare(wouldLive, wouldAnswer)} of the requests arming would have answered)` : '') +
+						'. ',
+					'Do not arm while this is material; a shorter freshMs narrows it.',
+				]),
+			stats([
+				dryRun && enabled
+					? stat('Would serve', fmtCount(wouldServe), 'origin requests arming would save')
+					: stat('Answered', fmtCount(answered), `origin not asked${filter ? ' · filtered' : ''}`),
+				dryRun && enabled
+					? stat('Would serve live', fmtCount(wouldLive), 'stored 404s the origin answered 200 for', {
+							warn: wouldLive > 0,
+						})
+					: stat('Answered, re-checking', fmtCount(rechecking), 'counted against offload'),
+				stat('Stored', fmtCount(stored), refused ? `${fmtCount(refused)} refused` : 'no refusals'),
+				stat(
+					'Re-checks',
+					fmtCount(ev('recheck-gone') + ev('recheck-live') + ev('recheck-moved') + ev('recheck-error')),
+					`${num(ev('recheck-live'))} live · ${num(ev('recheck-error'))} failed · ${num(ev('recheck-busy'))} shed`
+				),
+				stat(
+					'Re-ask gap',
+					fmtMs(weighted(gaps, 'median')),
+					`median since last confirmed · p95 ${fmtMs(weighted(gaps, 'p95'))}`
+				),
+				stat(
+					'Gone targets reopened',
+					fmtCount(reopen('filed') + reopen('would-file')),
+					`${reopen('would-file') ? 'dry run · ' : ''}${num(reopen('deduped'))} deduped · ${num(liftedGone)} lifted by a render`
+				),
+				stat(
+					'Early rechecks live',
+					earlyLive + earlyGone ? riskShare(earlyLive, earlyLive + earlyGone) : '—',
+					`${num(earlyLive)} live again · ${num(earlyGone)} still gone (gone targets rendered before their recheck)`,
+					{ warn: earlyGone > earlyLive }
+				),
+			]),
+			!events.length && el('div', { cls: 'empty', text: 'No negative-cache activity in this range.' }),
 		],
 	});
 }

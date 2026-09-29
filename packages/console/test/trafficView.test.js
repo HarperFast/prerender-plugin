@@ -544,6 +544,52 @@ test('verified is a cache serve in the invalidation family — never "other", ne
 	assert.ok(!isCacheServed('blob-timeout'));
 });
 
+// ---- a stored 404 (plugin render.negative) ----------------------------------------
+
+test('a stored 404 is its own family, and only the answer that asked nobody counts as cache-served', () => {
+	const rows = notHitRows([
+		combo('bot_serve', 'negative', 'negative', 'bingbot', 30),
+		combo('bot_serve', 'origin', 'negative-revalidate', 'bingbot', 10),
+	]);
+	const byStatus = new Map(rows.map((row) => [row.status, row]));
+	assert.equal(byStatus.get('negative').family, 'negative', 'never "other", never coverage');
+	assert.equal(byStatus.get('negative-revalidate').family, 'negative');
+	assert.deepEqual([...byStatus.get('negative-revalidate').sources], [['origin', 10]]);
+	// The origin did the work for the re-checking answer, so it must not read as spared anywhere.
+	assert.ok(isCacheServed('negative'));
+	assert.ok(!isCacheServed('negative-revalidate'));
+});
+
+test('the negative-cache panel reads the dry run: would-serve, and the stale-404 risk as a warning', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'negative_cache', 'would-serve', null, 900),
+			combo('prerender_ops', 'negative_cache', 'would-revalidate', null, 100),
+			combo('prerender_ops', 'negative_cache', 'would-serve-live', null, 3),
+			combo('prerender_ops', 'negative_cache', 'stored', null, 400),
+			combo('prerender_ops', 'gone_reopen', 'would-file', 'traffic', 7),
+			// Early rechecks (younger than a gone target's own 14d+): 9 live, 1 still gone. The 14d+ rows
+			// are the ordinary recheck and stay out of the share.
+			combo('prerender_ops', 'suppression_lifted', 'http-gone', '<6h', 9),
+			combo('prerender_ops', 'suppression_held', 'http-gone', '<1h', 1),
+			combo('prerender_ops', 'suppression_held', 'http-gone', '14d+', 40),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Negative cache/);
+	assert.match(text, /3 request\(s\) would have been answered with a stale 404/);
+	// A share of every lookup arming would have answered (would-serve + would-revalidate, which already
+	// include the 3), not of would-serve alone, and not rounded down to 0%.
+	assert.match(text, /\(0\.3% of the requests arming would have answered\)/);
+	assert.match(text, /Early rechecks live/);
+	assert.match(text, /90%/);
+	assert.match(text, /9 live again · 1 still gone/);
+});
+
 test('the per-route table counts a verified serve as cache-served', async () => {
 	const analytics = {
 		...ANALYTICS,

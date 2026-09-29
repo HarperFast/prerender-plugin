@@ -360,3 +360,45 @@ test('every render_readiness series and verdict the emitters can produce is decl
 		assert.ok(declared.type.values.includes(emitted(() => metrics.renderReadiness('c', verdict)).type));
 	}
 });
+
+test('the negative cache and the reopen trigger emit prerender_ops series the catalog declares', () => {
+	const ops = METRICS.prerender_ops.dimensions.path.values;
+	const n = emitted(() => metrics.negativeCache('would-serve-live'));
+	assert.deepEqual(n, {
+		value: true,
+		metric: 'prerender_ops',
+		path: 'negative_cache',
+		method: 'would-serve-live',
+		type: null,
+	});
+	const g = emitted(() => metrics.negativeGap(3_300_000));
+	assert.deepEqual(g, { value: 3_300_000, metric: 'prerender_ops', path: 'negative_gap', method: null, type: null });
+	const r = emitted(() => metrics.goneReopen('filed', 'traffic'));
+	assert.deepEqual(r, { value: true, metric: 'prerender_ops', path: 'gone_reopen', method: 'filed', type: 'traffic' });
+	const l = emitted(() => metrics.suppressionLifted('http-gone', '<1d'));
+	assert.deepEqual(l, {
+		value: true,
+		metric: 'prerender_ops',
+		path: 'suppression_lifted',
+		method: 'http-gone',
+		type: '<1d',
+	});
+	const h = emitted(() => metrics.suppressionHeld('http-gone', '<6h'));
+	assert.deepEqual(h, {
+		value: true,
+		metric: 'prerender_ops',
+		path: 'suppression_held',
+		method: 'http-gone',
+		type: '<6h',
+	});
+	for (const e of [n, g, r, l, h]) assert.ok(ops.includes(e.path), `prerender_ops missing ${e.path}`);
+	assert.ok(ops.includes('raw_cache'), 'raw_cache was emitted and undeclared before v0.96.0');
+});
+
+test('a stored 404 has its own cache statuses and source, and its re-check its own origin_fetch reason', () => {
+	const statuses = METRICS.bot_serve.dimensions.method.values;
+	assert.ok(statuses.includes('negative'));
+	assert.ok(statuses.includes('negative-revalidate'));
+	assert.ok(METRICS.bot_serve.dimensions.path.values.includes('negative'));
+	assert.ok(METRICS.origin_fetch.dimensions.method.values.includes('revalidate'));
+});

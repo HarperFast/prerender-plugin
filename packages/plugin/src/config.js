@@ -706,6 +706,31 @@ export const collectConfigWarnings = (target = config, { prerenderRoutes } = {})
 				`origin changes on a schedule rather than continuously, prefer expiry: 'midnight'.`
 		);
 	}
+	// A LIFE SHORTER THAN THE FRESH WINDOW has no revalidate window at all: every row expires while it is
+	// still answering without a re-check, so the background check this feature is built around never
+	// runs and a recovered page is only noticed once the row is gone. Almost certainly the two swapped.
+	if (target.render.negative.enabled && target.render.negative.lifeMs < target.render.negative.freshMs) {
+		add(
+			'warn',
+			'render.negative.lifeMs',
+			`render.negative.lifeMs (${target.render.negative.lifeMs}ms) is shorter than freshMs ` +
+				`(${target.render.negative.freshMs}ms), so a stored 404 expires before it is ever re-checked in the ` +
+				`background. lifeMs is how long a stored response may answer at all; freshMs, the part without asking.`
+		);
+	}
+	// A LONG LIFE IS A LONG-LIVED BODY. A re-check replaces the stored bytes only once they have outlived
+	// `lifeMs` (until then it is a HEAD and confirms the status alone), so the body a crawler is handed can be
+	// up to about twice `lifeMs` old. For a 404 that is rarely content anyone reads, but an origin whose error
+	// page carries live data (a retired product's offer, say) serves that data from whenever it was stored.
+	if (target.render.negative.enabled && target.render.negative.lifeMs > 86400000) {
+		add(
+			'warn',
+			'render.negative.lifeMs',
+			`render.negative.lifeMs is ${target.render.negative.lifeMs}ms (over 24h). A re-check refreshes the ` +
+				`status and replaces the stored body only once it is older than this, so a crawler can be handed a ` +
+				`body up to about twice this old.`
+		);
+	}
 	// A CONSUMER WITH NO TRACKER is inert, not broken, and says nothing about it: the ladder rests every
 	// target at its base cadence forever. The operator asked for demand-driven cadence and is not getting
 	// it — the config is the only place that can be seen.

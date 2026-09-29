@@ -475,3 +475,29 @@ test('the demand tracker lives at demand.* — the old render.demand sizing keys
 	assert.equal(current.config.demand.bitsPerSlice, 1 << 22);
 	assert.deepEqual(current.warnings, []);
 });
+
+test('render.negative: a life shorter than the fresh window, and a life over a day, are flagged', () => {
+	applyOptions({ render: { negative: { enabled: true, freshMs: 2 * 3_600_000, lifeMs: 3_600_000 } } });
+	assert.ok(findingKeys().includes('render.negative.lifeMs'), 'lifeMs < freshMs never re-checks');
+	applyOptions({ render: { negative: { enabled: true, freshMs: 3_600_000, lifeMs: 2 * 86_400_000 } } });
+	assert.ok(findingKeys().includes('render.negative.lifeMs'), 'a re-check refreshes status, not the stored body');
+	applyOptions({ render: { negative: { enabled: true, freshMs: 3_600_000, lifeMs: 6 * 3_600_000 } } });
+	assert.ok(!findingKeys().includes('render.negative.lifeMs'));
+	applyOptions({ render: { negative: { enabled: false, freshMs: 2 * 3_600_000, lifeMs: 3_600_000 } } });
+	assert.ok(!findingKeys().includes('render.negative.lifeMs'), 'a disabled feature is not a finding');
+	applyOptions({});
+});
+
+test('render.negative ships off and dry, keeps 404/410, and render.suppression.gone.reopen ships on and dry', () => {
+	applyOptions({});
+	const n = config.render.negative;
+	assert.equal(n.enabled, false);
+	assert.equal(n.dryRun, true);
+	assert.deepEqual(n.statuses, [404, 410]);
+	assert.equal(n.skipTargets, 'listed');
+	assert.equal(n.ignoreNoStore, false);
+	assert.ok(n.lifeMs >= n.freshMs);
+	const r = config.render.suppression.gone.reopen;
+	assert.equal(r.enabled, true);
+	assert.equal(r.dryRun, true);
+});

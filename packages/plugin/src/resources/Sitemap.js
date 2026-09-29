@@ -790,9 +790,10 @@ async function actOnWalkCandidates({ urls, decide, dryRun, maxActions, count }) 
 			const target = await Target.get({
 				id: url,
 				// `sitemapUrl` is the shear guard (departures) and the still-listed check (arrivals),
-				// `state` keeps suppressed targets out, and the two cadence fields are what
+				// `state` keeps suppressed targets out — except, for an arrival, a GONE-suppressed one, which
+				// `suppressedReason` identifies (util/goneReopen.js) — and the two cadence fields are what
 				// `resolveEffectiveInterval` needs to file a rung-correct row.
-				select: ['url', 'sitemapUrl', 'state', 'renderInterval', 'demandInterval'],
+				select: ['url', 'sitemapUrl', 'state', 'suppressedReason', 'renderInterval', 'demandInterval'],
 			});
 
 			const { action, reason } = decide({ url, target });

@@ -106,7 +106,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
 					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
-					'rawCache?: boolean, entityPrefix?: string }.\n\n' +
+					'rawCache?: boolean, negativeCache?: boolean, entityPrefix?: string }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -189,6 +189,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'`discoverTargets: false` — gated URLs are exactly the population this is for, and gating ' +
 					'without it leaves them missing on every request forever. Enable it only on a route whose ' +
 					'server-rendered document already carries its SEO surface; see `render.raw`.\n\n' +
+					'`negativeCache` (default false, prerender routes only, requires `render.negative.enabled`) — ' +
+					'whether a MISS on this route that the origin answers 404/410 stores that response, so the next ' +
+					'crawler asking for the same dead URL is answered without another origin round trip. Like ' +
+					'`rawCache` it replaces an origin proxy and nothing else, and it never answers a URL a sitemap ' +
+					'lists. Meant for a detail-page route whose dead URLs crawlers keep re-asking for; see ' +
+					'`render.negative`.\n\n' +
 					'`entityPrefix` (prerender routes only; off when absent) — a regular expression, anchored at the ' +
 					'start of the URL PATH, whose match is the part of the URL that identifies ONE entity, e.g. ' +
 					"`'^/product/prd-[^/]+/'` on a `/product/prd-` route. Traffic discovery then refuses to mint a " +
@@ -1611,6 +1617,145 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
+		negative: group(
+			'NEGATIVE CACHING. Keep the origin’s own 404/410 for a URL, and answer the next crawler asking for ' +
+				'the same dead URL from it instead of asking the origin again.\n\n' +
+				'THE PROBLEM IT SOLVES. Crawlers keep asking for URLs that stopped existing long ago, and they ' +
+				're-ask on a schedule. Measured on one deployment: origin 404s were a third of all origin ' +
+				'fetches, a dead product page cost the origin nearly a full page build (336 ms against 416 ms ' +
+				'for a live one), and one crawler re-asked each dead URL about every 55 minutes — half of all ' +
+				'repeat gaps fell between 50 and 60 minutes. Each of those repeats is an origin request that can ' +
+				'only ever answer the same thing.\n\n' +
+				'THREE WINDOWS, measured from the last time the ORIGIN confirmed the status (`checkedAt`):\n' +
+				'  - inside `freshMs`: the stored response answers and the origin is not asked. This is the only ' +
+				'part that saves origin requests.\n' +
+				'  - past `freshMs`, inside `lifeMs`: the stored response answers AT ONCE and the origin is ' +
+				're-checked in the background (a HEAD, or a GET once the stored body is older than `lifeMs`, which ' +
+				'replaces it). A 404/410 refreshes `checkedAt`; a 200 or a redirect drops ' +
+				'the entry, so the next request sees the live page; anything else (5xx, a timeout) keeps serving ' +
+				'until the life ends. This buys response time and fast recovery, not offload.\n' +
+				'  - past `lifeMs`: the request proxies as if nothing were stored, and a 404 stores again.\n\n' +
+				'IT ONLY EVER REPLACES AN ORIGIN PROXY on a true miss, after the raw cache: a URL with a cached ' +
+				'page, stale or not, is never answered from here. It never answers a URL whose Target a sitemap ' +
+				'lists (`skipTargets`), checked on every read, so a relisted product answers live on every node as ' +
+				'soon as the sitemap walk attaches it. An explicit `missHeader: origin` bypasses it, like the raw ' +
+				'cache. Nothing here is ever rendered, so a stored response owns no target and records no demand.\n\n' +
+				'COUNTED HONESTLY. A fresh answer is `bot_serve` source `negative`, cacheStatus `negative`. An answer ' +
+				'whose background re-check went to the origin is source `origin`, cacheStatus `negative-revalidate`: ' +
+				'the crawler did not wait, but the origin still did the work, so offload counts it against. The ' +
+				're-check itself is `origin_fetch` reason `revalidate`, one per such answer.\n\n' +
+				'Off by default, and off for every route until a route opts in with `negativeCache: true`.',
+			{
+				enabled: option(false, 'Master switch. Off = nothing is stored, nothing is read, no extra reads.'),
+				dryRun: option(
+					true,
+					'Store, re-check and time exactly as armed, but never ANSWER from a stored response: every ' +
+						'request still proxies. What an armed cache would have done is counted on ' +
+						'`prerender_ops negative_cache` — `would-serve` (the origin requests `freshMs` would save) and ' +
+						'`would-revalidate` — and the gap since the last confirmation on `negative_gap`, which is the ' +
+						'live curve to choose `freshMs` from.\n\n' +
+						'THE RISK NUMBER IS `would-serve-live`: requests an armed cache would have answered with a stored ' +
+						'404 while the origin, asked anyway, answered 200. It is the recovery exposure measured directly, ' +
+						'and it should sit near zero before this is turned off.\n\n' +
+						'The dry run refreshes `checkedAt` only where an armed cache would have asked the origin, so ' +
+						'`would-serve` is exactly what arming saves rather than an overcount.'
+				),
+				statuses: option(
+					[404, 410],
+					'Origin statuses to keep. Anything else is never stored. 5xx and 429 must never be here: they ' +
+						'are the origin failing to answer, not a statement that the page does not exist.'
+				),
+				freshMs: option(
+					HOUR,
+					'How long after the origin last confirmed the status a stored response answers WITHOUT asking ' +
+						'the origin. The one number that decides the saving.\n\n' +
+						'CHOOSE IT FROM THE CRAWLERS’ REPEAT GAPS, NOT FROM A ROUND NUMBER. Savings step at multiples ' +
+						'of a crawler’s re-ask period rather than rising smoothly: on the measured deployment 50 ' +
+						'minutes saved 9.9% of 404 origin fetches, 55 minutes 29.3%, 2h 42.9% and 2h15m 43.7%. A ' +
+						'window a little past a step catches the crawler’s jitter. The dry run records every gap on ' +
+						'`negative_gap`.\n\n' +
+						'The cost of a longer window is a URL that comes back answering 404 to a crawler for up to this ' +
+						'long. Recoveries were rare where measured (about 2 in 60 URLs that stopped 404ing), and the ' +
+						'sitemap check on every read covers the common case of a relisted product.',
+					{ unit: 'ms', min: 1 }
+				),
+				lifeMs: option(
+					6 * HOUR,
+					'How long a stored response may answer at all. Between `freshMs` and this, it answers and the ' +
+						'origin is re-checked in the background. It bounds storage (a row lives this long past its last ' +
+						'confirmation) and how old a stored BODY can be: once the bytes are older than this, the next ' +
+						'check that goes to the origin anyway (a re-check, or an excluded bot’s proxied request) ' +
+						'replaces them instead of confirming them, so no body is served more than about twice this old. ' +
+						'Until then a re-check is a HEAD, which refreshes the ' +
+						'status, not the bytes. Must be at least `freshMs`.',
+					{ unit: 'ms', min: 1 }
+				),
+				deviceIndependent: option(
+					false,
+					'Store ONE response per URL and answer every device from it, instead of one per URL per device. ' +
+						'A 404 is almost never device-specific, so this is usually safe and adds a little to the saving ' +
+						'(about one point on the measured deployment); per-device stays the default for the same reason ' +
+						'as `render.raw.deviceIndependent`, because the body is the origin’s and an adaptive origin ' +
+						'could send a different one.'
+				),
+				excludeBots: option(
+					[],
+					'Bot names (as `getBotName` labels them, case-insensitive) never answered from a stored response. ' +
+						'Their requests still proxy and still refresh or store entries for everyone else.\n\n' +
+						'WHY IT EXISTS: a merchant or ads crawler that fetches a relisted product’s landing page while a ' +
+						'stale 404 is stored can disapprove the listing, and a user-triggered agent (a read-aloud fetch) ' +
+						'is a real person. On a deployment with a shopping feed, list the search engine’s crawlers here; ' +
+						'their share of the repeats is usually small, so leaving them out costs little.',
+					{ itemType: 'string' }
+				),
+				skipTargets: option(
+					'listed',
+					'Which URLs are never answered from a stored response because they have a Target: `listed` (a ' +
+						'sitemap lists the Target) or `any` (the URL has any Target at all). Checked on every read and ' +
+						'again before every store — a local read, since Target replicates.\n\n' +
+						'`listed` is the default because a sitemap listing is the origin declaring the page exists, which ' +
+						'outranks a stored 404, and it is exactly the case that recovers: listed products that 404 ' +
+						'briefly are the transient tail. `any` also leaves out a retired product the rotation still ' +
+						'holds, which recovers on its next recheck render instead.',
+					{ enum: ['listed', 'any'] }
+				),
+				assumeShared: option(
+					false,
+					'Store a response even when the origin marks it as not shared — a `Set-Cookie`, or ' +
+						'`Cache-Control: private`. Same question, same check before setting it, as ' +
+						'`render.raw.assumeShared`; stored under it counts as `stored-unshared`.'
+				),
+				ignoreNoStore: option(
+					false,
+					'Store a response even when the origin sends `Cache-Control: no-store`.\n\n' +
+						'A literal `no-store` is the origin asking caches not to keep the response at all, and the raw ' +
+						'cache always honours it. It is a switch here because some origins send it on every document ' +
+						'while a CDN, and this plugin’s own page cache, keep them anyway; on such an origin the 404s ' +
+						'are no different from the pages already cached. Leave it off for an origin whose `no-store` ' +
+						'means something.'
+				),
+				maxBytes: option(
+					1048576,
+					'Largest response body to store, in bytes as the origin sent it (compressed). Over it, served ' +
+						'and not stored. Same capture, same ~2x-per-capture memory rule, as `render.raw.maxBytes`.',
+					{ unit: 'bytes', min: 1 }
+				),
+				maxConcurrentCaptures: option(
+					16,
+					'How many responses may be captured at once, per worker, for the same backpressure reason as ' +
+						'`render.raw.maxConcurrentCaptures`. Past it a response is served without being stored.',
+					{ min: 1 }
+				),
+				maxConcurrentChecks: option(
+					8,
+					'How many background re-checks may be in flight at once, per worker. Past it a stored response ' +
+						'still answers but nobody asks the origin (counted as `recheck-busy`), so under origin distress ' +
+						'the re-checks shed and the origin sees fewer requests, not more. A URL already being re-checked ' +
+						'joins that check instead of starting a second (`recheck-joined`).',
+					{ min: 1 }
+				),
+			}
+		),
 		defaultInterval: option(
 			DAY,
 			'How often a target is re-rendered when nothing more specific applies. Cadence is relative to ' +
@@ -1766,6 +1911,48 @@ export const configSchema = group('Prerender plugin configuration.', {
 							'(a `<meta>` noindex is not even visible to the header check) and retiring those on sight ' +
 							'would loop the same way. Set equal to `maxStrikes` to restore the pre-0.67.0 behaviour.',
 						{ min: 1 }
+					),
+					reopen: group(
+						'REOPEN A GONE TARGET ON EVIDENCE OF LIFE. A gone suppression deletes the pages and parks the ' +
+							'target for `recheckInterval`, and until then every other signal skips it: the sitemap walk, ' +
+							'the arrival check, the change probe and discovery all treat a suppressed row as settled. So a ' +
+							'product that comes back waits the full recheck (14 days by default) to be rendered again, ' +
+							'while bots are served the live origin page meanwhile. Measured on one deployment: both ' +
+							'sitemap-listed products sampled 404ing on one day answered 200 three days later.\n\n' +
+							'THE EVIDENCE IS AN ORIGIN 200 THE PLUGIN ALREADY SAW: a bot request proxied to the origin for ' +
+							'a gone-suppressed target (any bot — the row proves the URL is real, so the discovery gate ' +
+							'does not apply), a negative-cache re-check that found the page live, or the sitemap listing ' +
+							'the URL again (through the arrival check). Each files the target’s recheck due now, and the ' +
+							'render’s own verdict decides: indexable reactivates it, a 404 suppresses it again.\n\n' +
+							'Gone verdicts only. A noindex or canonical-mismatch page answers 200 by definition, so a 200 ' +
+							'proves nothing about it and reopening it would loop. A route that does not add targets from ' +
+							'traffic (`discoverTargets: false`) never pays the Target read this needs.',
+						{
+							enabled: option(
+								true,
+								'Master switch. On by default and inert under `dryRun`, which is also the default: the ' +
+									'counts on `prerender_ops gone_reopen` size the effect before anything is filed.'
+							),
+							dryRun: option(
+								true,
+								'Count what would be reopened (`would-file`) without filing anything. The arrival path ' +
+									'reports the same verdict as `would-reopen` in the sitemap arrival tally.'
+							),
+							dedupeMs: option(
+								6 * HOUR,
+								'A URL reopened within this window is not reopened again (`deduped`), per worker: a ' +
+									'crawler asking every hour must not file a render every hour while the first one is ' +
+									'still waiting to be claimed.',
+								{ unit: 'ms', min: 0 }
+							),
+							maxPerMinute: option(
+								60,
+								'Most reopens filed per minute per worker (`capped` past it). A mass relisting — a ' +
+									'retirement wave reversed — reaches the queue as a stream rather than all at once; a ' +
+									'capped URL is simply reopened by its next bot request.',
+								{ min: 1 }
+							),
+						}
 					),
 				}),
 			}

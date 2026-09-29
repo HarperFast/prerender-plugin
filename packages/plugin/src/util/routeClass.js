@@ -242,6 +242,25 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route negative cache (util/negativeCache.js) — `rawCache`'s sibling for the origin's own
+	// 404/410. Same drop-the-FIELD rule, and the same split: this is the ROUTE's opt-in only, and
+	// `render.negative.enabled` is the master switch checked at the call site.
+	let negativeCache = false;
+	if (raw.negativeCache !== undefined && raw.negativeCache !== null) {
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring negativeCache on passthrough route "${raw.match} ${raw.path}" — a passthrough route is never ` +
+					`served from cache, so there is nothing for a stored response to answer`
+			);
+		} else if (typeof raw.negativeCache === 'boolean') {
+			negativeCache = raw.negativeCache;
+		} else {
+			warn(
+				`ignoring negativeCache on route "${raw.match} ${raw.path}" — expected a boolean, got ${String(raw.negativeCache)}`
+			);
+		}
+	}
+
 	// Optional per-route ENTITY PREFIX — what the discovery gate treats as "the same product" (see
 	// util/entityGate.js). Same drop-the-FIELD rule as the fields above, and dropping it is exactly the
 	// pre-gate behaviour: every unknown URL on the route is minted. Compiled here, once per config
@@ -297,6 +316,7 @@ const compileEntry = (raw, source, warn) => {
 		departureAction,
 		arrivalAction,
 		rawCache,
+		negativeCache,
 		entityPrefix,
 		source,
 	};

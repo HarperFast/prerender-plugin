@@ -293,6 +293,61 @@ test('every device rendered: pages stored per device, ONE reschedule, ONE outcom
 	assert.equal(leased(A), false, 'the lease is released');
 });
 
+test('a render that lifts a suppression counts it, with the reason and how long it held', async () => {
+	seedUrlRow({ state: 'suppressed', strikes: 1 });
+	stores.target.set(A, {
+		...stores.target.get(A),
+		suppressedReason: 'http-gone',
+		suppressedAt: new Date(Date.now() - 5 * 3_600_000),
+	});
+	await claim();
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(stores.target.get(A).state, null, 'reactivated');
+	const lifted = analytics
+		.filter((a) => a[1] === 'prerender_ops' && a[2] === 'suppression_lifted')
+		.map((a) => [a[3], a[4]]);
+	assert.deepEqual(lifted, [['http-gone', '<6h']], 'the only measure of how often a verdict was temporary');
+});
+
+test('a render that finds a suppressed target still non-indexable counts it as held, beside lifted', async () => {
+	// A gone target reopened five hours after its verdict, rendered, and still 404: the reopen's evidence was
+	// wrong. It already carried a strike, so the verdict deletes it — and is still counted.
+	seedUrlRow({ state: 'suppressed', strikes: 1 });
+	stores.target.set(A, {
+		...stores.target.get(A),
+		suppressedReason: 'http-gone',
+		suppressedAt: new Date(Date.now() - 5 * 3_600_000),
+	});
+	await claim();
+	const gone404 = (deviceType) => ({
+		deviceType,
+		outcome: 'non-indexable',
+		isIndexable: false,
+		statusCode: 404,
+		reason: 'http-error',
+	});
+	await postVariants(A, [gone404('desktop'), gone404('mobile')]);
+	const series = (name) => analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === name).map((a) => [a[3], a[4]]);
+	assert.deepEqual(series('suppression_held'), [['http-gone', '<6h']]);
+	assert.deepEqual(series('suppression_lifted'), []);
+	assert.equal(stores.target.has(A), false, 'the second gone strike deleted it');
+});
+
+test('a first verdict on a target in rotation is not a held suppression', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		{ deviceType: 'desktop', outcome: 'non-indexable', isIndexable: false, statusCode: 200, reason: 'noindex' },
+		rendered('mobile'),
+	]);
+	assert.equal(stores.target.get(A).state, 'suppressed');
+	assert.deepEqual(
+		analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === 'suppression_held'),
+		[],
+		'held means a suppression re-proved, not a new one'
+	);
+});
+
 /**
  * The page record rides with the claim: from the first variant that ran its extraction, and ONLY when
  * the result replaced every default device's page — a partial render cannot vouch for the device page

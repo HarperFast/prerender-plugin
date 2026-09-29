@@ -52,6 +52,11 @@ export const CACHE_STATUS_COLORS = {
 	// saved the origin round trip, so it belongs in the cache-served sum below, but nothing
 	// rendered it and it must not read as prerender coverage.
 	'raw': '#7fd4e8',
+	// The origin's own stored 404/410 (plugin `render.negative`). `negative` spared the origin; the
+	// `-revalidate` twin answered from storage while the origin was re-checked, so it sits nearer the
+	// origin-side colours — offload counts it against.
+	'negative': '#b9a57e',
+	'negative-revalidate': '#d9a066',
 	'miss': WARN,
 	'stale': PINK,
 	'invalidated': PURPLE,
@@ -76,12 +81,17 @@ export const CACHE_STATUS_COLORS = {
  * it would read as a smaller cache-served share, which is the same failure `verified` caused for
  * one release.
  *
+ * `negative` IS TOO (plugin v0.96.0): the origin's stored 404 answered a dead URL and the origin was not
+ * asked. `negative-revalidate` is NOT: it was answered from storage while that request's background
+ * re-check went to the origin, so the plugin reports its source as `origin` and it must not count as
+ * spared here either.
+ *
  * BUT IT IS NOT AN AGE POPULATION. `page_age` / `route_page_age` are emitted only when the serve
  * SOURCE is `cache` (`recordServeOutcome`), and a raw serve's source is `raw` — nothing rendered
  * it, so it has no cadence to be measured against. Anything dividing by "cache serves" to talk
  * about freshness must therefore count the source, not this set; see the staleness panel.
  */
-export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw']);
+export const CACHE_SERVED = new Set(['hit', 'swr', 'verified', 'peer-rescue', 'raw', 'negative']);
 export const isCacheServed = (status) => CACHE_SERVED.has(status);
 
 /**
@@ -91,7 +101,7 @@ export const isCacheServed = (status) => CACHE_SERVED.has(status);
  * "answered from storage" and "a render covers this URL" are different questions, and a raw
  * document answers only the first.
  */
-export const SOURCE_COLORS = { cache: OK, rendered: INFO, raw: '#7fd4e8', origin: WARN };
+export const SOURCE_COLORS = { cache: OK, rendered: INFO, raw: '#7fd4e8', negative: '#b9a57e', origin: WARN };
 
 /** What became of a posted render result (render outcome.method). */
 export const OUTCOME_COLORS = {
