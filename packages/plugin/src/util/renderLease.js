@@ -28,8 +28,8 @@
  * are still working. A result whose render provably began before its key's latest grant is dropped
  * (`grantOf`, and `RenderQueue.processJobResult`); one that cannot be proved late is accepted, and the
  * later `PrerenderedPage.put` wins, with a correct `expiresAt`. The one sharp edge is that two results
- * for the same failing key each run
- * `Target.patch(url, { strikes })`, so a failing key can double-strike toward `maxStrikes`. That is
+ * for the same failing key each run `Target.patch(url, { strikes })`, so a failing key can
+ * double-strike toward `maxStrikes`. That is
  * accepted: every candidate fix (gate the strike on lease presence, stamp a claim generation onto the
  * row) silently disables the `render.failureRetry.fastRetries` lane across restarts, which is worse.
  *
@@ -428,8 +428,11 @@ export const createLeaseTable = ({
 		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
 		if (Atomics.load(i32, at + S_LO) !== lo || Atomics.load(i32, at + S_HI) !== hi) return false;
 		// The generation, checked after the expiry was read: a grant stores its stamp BEFORE its expiry CAS,
-		// so a re-grant that landed after that read has already changed the stamp, and one that lands after
-		// this check stored a different expiry, so the CAS below leaves its lease alone.
+		// so a re-grant already under way when that read ran has changed the stamp by now and is refused.
+		// One that starts after this check can still have its due word taken by the CAS below (a window of
+		// a few instructions): its expiry is never shortened — the expiry CAS names the value read above —
+		// so the key stays unclaimable for the whole new lease, and only the gauge and `leaseOf` read it as
+		// released until the next slot walk.
 		if (grantedAtMs !== undefined && fromExpiresSec(Atomics.load(i32, at + S_GRANTED)) !== grantedAtMs) return false;
 
 		// ONE release per lease, claimed with a CAS on the due-minute word. Two results for one key is

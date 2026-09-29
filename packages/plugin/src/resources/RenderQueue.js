@@ -1519,10 +1519,11 @@ export class RenderQueue extends Resource {
 				.map((w) => `${w.cacheKey} (${w.misses} leases, held ${Math.round(w.backoff / 60_000)} min)`)
 				.join(', ');
 			logger.warn(
-				`[prerender] ${pass.wedged.length} key(s) whose last leases all expired with no result were held back ` +
-					`instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
-					`crashing or hanging on these URLs, or results are not reaching this node. No strike was counted, and ` +
-					`the first result that arrives for a key clears its hold.`
+				`[prerender] ${pass.wedged.length} key(s) whose last leases all ended without moving their row were held ` +
+					`back instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
+					`crashing or hanging on these URLs, results are not reaching this node, or results arrive and their ` +
+					`commit fails (the log has the error). No strike was counted, and the first result that lands for a ` +
+					`key clears its hold.`
 			);
 		}
 
