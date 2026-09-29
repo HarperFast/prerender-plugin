@@ -1061,3 +1061,67 @@ test('a strike reset racing a cross-node delete leaves a row that carries its ur
 	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
 	assert.equal(stores.target.get(A)?.url, A);
 });
+
+// ───────────────────────────── the slow lane's wait ─────────────────────────────
+
+const HOUR_MS = 3_600_000;
+const failedVariants = () => [
+	{ deviceType: 'desktop', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+];
+/** A product page on a 96h ceiling rendering at its 48h ladder rung, one strike short of the slow lane. */
+const seedLadderedRow = (schedule = {}) => {
+	seedUrlRow({ renderInterval: 96 * HOUR_MS, strikes: config.render.failureRetry.fastRetries });
+	stores.target.set(A, { ...stores.target.get(A), demandInterval: 48 * HOUR_MS });
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), effectiveInterval: 48 * HOUR_MS, ...schedule });
+};
+
+test('the slow lane waits the page’s EFFECTIVE cadence, not the route ceiling it renders within', async () => {
+	// The pages expire at the 48h rung; a retry filed at the 96h ceiling left a failed page on the origin
+	// for ~42h past its swr window.
+	seedLadderedRow();
+	await claim();
+	const before = Date.now();
+	await postVariants(A, failedVariants());
+	const row = stores.renderSchedule.get(A);
+	assert.ok(row.nextRenderTime <= before + 48 * HOUR_MS, 'one 48h cadence out, not 96h');
+	assert.ok(row.nextRenderTime >= before + 48 * HOUR_MS - 60_000);
+	assert.equal(row.effectiveInterval, 48 * HOUR_MS);
+});
+
+test('a CHANGED page’s failed render retries at lease scale, and keeps its mark', async () => {
+	// Hard-expired by the probe, so every minute of the wait is served from the origin.
+	const changedAt = Date.now() - 60_000;
+	seedLadderedRow({ changedAt, demandPeriod: 6 * HOUR_MS });
+	await claim();
+	const before = Date.now();
+	await postVariants(A, failedVariants());
+	const row = stores.renderSchedule.get(A);
+	const twoLeases = 2 * config.queue.jobLeaseTime;
+	assert.ok(row.nextRenderTime <= before + twoLeases, 'two leases, not two days');
+	assert.ok(row.nextRenderTime >= before + twoLeases - 60_000);
+	assert.equal(row.changedAt, changedAt, 'still changed');
+	assert.equal(row.demandPeriod, 6 * HOUR_MS);
+	assert.equal(row.effectiveInterval, 48 * HOUR_MS, 'the cadence filed is still the cadence');
+});
+
+test('a temporary redirect re-files the source at its EFFECTIVE cadence, carrying its change mark', async () => {
+	const changedAt = Date.now() - 60_000;
+	seedLadderedRow({ changedAt });
+	stores.target.set(A, { ...stores.target.get(A), strikes: 0 });
+	await claim();
+	const before = Date.now();
+	const bounce = (deviceType) => ({
+		deviceType,
+		outcome: 'redirected',
+		statusCode: 302,
+		redirectedTo: 'https://site.example.com/elsewhere',
+		headers: {},
+	});
+	await postVariants(A, [bounce('desktop'), bounce('mobile')]);
+	assert.deepEqual(outcomes(), [['redirect', 'temporary']]);
+	const row = stores.renderSchedule.get(A);
+	assert.ok(row.nextRenderTime <= before + 48 * HOUR_MS, 'the rung, not the 96h ceiling');
+	assert.ok(row.nextRenderTime >= before + 48 * HOUR_MS - 60_000, 'but no lease-scale wait: strikes retire here');
+	assert.equal(row.changedAt, changedAt);
+});

@@ -1,6 +1,6 @@
 import { getMutex } from '../util/coordination.js';
 import { config, onConfigApplied } from '../config.js';
-import { currentMinuteMs, dateColumnMs } from '../util/time.js';
+import { currentMinuteMs, dateColumnMs, numberOf } from '../util/time.js';
 import { suppressionAgeBucket } from '../util/suppression.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
@@ -16,7 +16,7 @@ import {
 import { decideInterval } from '../util/demandLadder.js';
 import { hasObservations, recordReadinessExpectation } from '../util/readinessExpectation.js';
 import { recordPageClaim } from '../util/changeProbe.js';
-import { backoffWait } from '../util/failureBackoff.js';
+import { backoffWait, changedRetryWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { metrics } from '../metrics.js';
 import { Target, countedStrikes } from './Target.js';
@@ -190,6 +190,22 @@ const retireSource = async (job) => {
  * readable ghost the purge and reconcile sweeps can see.
  */
 const patchTarget = (url, fields) => Target.patch(url, { url, ...fields });
+
+/**
+ * The marks a row carries that a retry must carry forward, as `writeSchedule` takes them.
+ *
+ * A CHANGED PAGE STAYS CHANGED THROUGH A RENDER THAT DID NOT LAND. The probe hard-expired it and marked
+ * the row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
+ * that is still being served from the origin. Its demand estimate (`demandPeriod`) rides with it.
+ * A local point read: results land on the owner, and elsewhere it reads nothing and nothing is carried.
+ */
+const readMarks = async (url) => {
+	const row = await getScheduleRow(url, ['changedAt', 'demandPeriod']);
+	const changedAt = numberOf(row?.changedAt);
+	if (!(Number.isFinite(changedAt) && changedAt > 0)) return {};
+	const demandPeriod = numberOf(row?.demandPeriod);
+	return { changedAt, demandPeriod: Number.isFinite(demandPeriod) && demandPeriod > 0 ? demandPeriod : undefined };
+};
 
 /** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
 const hasCadence = (effectiveInterval) => {
@@ -1268,31 +1284,32 @@ export class RenderQueue extends Resource {
 			return 'slow';
 		}
 
-		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const fromSitemap = !!renderTarget.sitemapUrl;
-		const wait = backoffWait(interval, strikes, fromSitemap);
-		// THE CADENCE, NOT `wait`. The backoff is how long until the retry; the cadence is how often the
-		// page wants to render. Filing `wait` here would tell the keeper a repeatedly-failing 1h page is
-		// on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority on
-		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
+		// THE EFFECTIVE CADENCE — the ladder's rung — not the route ceiling, for the wait AND for what is
+		// filed. The ceiling is what the ladder allocates WITHIN: a product page on a 96h route rendering
+		// at its 48h rung has pages that expire at 48h, so a retry filed 96h out left a failed page on the
+		// origin for ~42h past its swr window.
+		//
+		// And the cadence is filed, not `wait`: the backoff is how long until the retry, the cadence how
+		// often the page wants to render. Filing `wait` would tell the keeper a repeatedly-failing 1h page
+		// is on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority.
 		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
-		const nextRenderTime = currentMinuteMs() + wait;
-		// A CHANGED PAGE STAYS CHANGED THROUGH A FAILED RENDER. The probe hard-expired it and marked the
-		// row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
-		// that is still being served from the origin. A local point read: results land on the owner,
-		// and elsewhere it reads nothing and the mark is simply not carried.
-		// Its demand estimate rides with the mark (`demandPeriod`), for the same reason.
-		const { changedAt, demandPeriod } = (await getScheduleRow(sourceUrl, ['changedAt', 'demandPeriod'])) ?? {};
+		const marks = await readMarks(sourceUrl);
+		// A MARKED page waits at lease scale (`changedRetryWait`): its page is hard-expired, so a cadence
+		// wait is that long on the origin.
+		const wait =
+			marks.changedAt === undefined
+				? backoffWait(cadence, strikes, fromSitemap)
+				: changedRetryWait(cadence, strikes, fromSitemap);
 		logger.debug(
 			`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
-				`${fromSitemap ? '' : ', non-sitemap'})`
+				`${fromSitemap ? '' : ', non-sitemap'}${marks.changedAt === undefined ? '' : ', changed'})`
 		);
 		await writeSchedule(sourceUrl, {
-			nextRenderTime,
+			nextRenderTime: currentMinuteMs() + wait,
 			fromSitemap,
 			effectiveInterval: cadence,
-			changedAt: changedAt === null || changedAt === undefined ? undefined : Number(changedAt),
-			demandPeriod: demandPeriod === null || demandPeriod === undefined ? undefined : Number(demandPeriod),
+			...marks,
 		});
 		return 'slow';
 	}
@@ -1324,17 +1341,23 @@ export class RenderQueue extends Resource {
 			await settleTargetless(job, await readTargetlessRow(job));
 			return;
 		}
-		// Same cadence resolution as the post-render path above (route > stored > default).
-		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
+		// The ladder rung when the row carried one, else the ceiling — for the wait as well as the filed
+		// cadence, as in `retryAfterFailure` (a wait at the route ceiling outlived the rung's pages by half
+		// a ceiling). A caller-supplied `preloaded` row is documented as "at least renderInterval +
+		// sitemapUrl", so an absent `demandInterval` means "not read" rather than "not promoted" —
+		// resolving to the ceiling is the safe reading, and the next render files the true rung either
+		// way. (`recordRedirectStrike`, the one in-tree preloader, selects it.)
+		//
+		// A marked row keeps its mark, but NOT the lease-scale wait the failure lane gives it: every
+		// result here costs a redirect strike, and `render.redirects.maxStrikes` of them retire the source.
+		// At lease scale four temporary redirects — a failover of an hour or two — would retire it; at the
+		// cadence they take four cycles, which is what that ceiling was sized against.
+		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		await writeSchedule(sourceUrl, {
-			nextRenderTime: currentMinuteMs() + interval,
+			nextRenderTime: currentMinuteMs() + cadence,
 			fromSitemap: !!renderTarget.sitemapUrl,
-			// The ladder rung when the row carried one, else the ceiling. A caller-supplied `preloaded`
-			// row is documented as "at least renderInterval + sitemapUrl", so an absent `demandInterval`
-			// means "not read" rather than "not promoted" — resolving to the ceiling is the safe reading,
-			// and the next render files the true rung either way. (`recordRedirectStrike`, the one
-			// in-tree preloader, now selects it.)
-			effectiveInterval: resolveEffectiveInterval(sourceUrl, renderTarget),
+			effectiveInterval: cadence,
+			...(await readMarks(sourceUrl)),
 		});
 	}
 
