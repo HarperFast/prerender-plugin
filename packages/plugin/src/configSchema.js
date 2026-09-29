@@ -1232,15 +1232,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			reprobeAfter: option(
 				12 * HOUR,
-				'Skip a URL whose stored baseline is younger than this. What makes a sweep RESUMABLE: the ' +
-					'walk position is in memory, so a restart mid-pass otherwise re-probes every URL the pass ' +
-					'had already covered — hours of origin requests that can only confirm what is already ' +
-					'stored. With this set, a restarted pass skips that ground in seconds and reaches new work ' +
-					'immediately. Keep it comfortably BELOW `sweepInterval` (half is the default) or the skip ' +
-					'starts eating real passes: a URL probed at the very end of one pass would be skipped by ' +
-					'the next one, and its cadence would silently stretch. 0 disables skipping. The canary ' +
-					'never skips (its whole job is the fast cadence), and a canary-triggered RESEED never ' +
-					'skips (every baseline is known-stale after a mass change).',
+				'RETIRED in v0.97.0 — accepted so existing configs and overrides stay valid, read by nothing. It ' +
+					'skipped a URL whose stored baseline was younger than this, meant to spare a restarted pass the ' +
+					'ground it had covered. But a baseline is only WRITTEN on a change, a seed or a re-baseline — an ' +
+					'unchanged probe writes nothing — so the age test skipped exactly the URLs that had recently ' +
+					'CHANGED and never the quiet ones: a change caught by an off-schedule pass was then skipped by the ' +
+					'next scheduled pass, and a reprice landing in between waited a further full pass. A pass now ' +
+					'skips only URLs written since IT (or the pass it resumes) began, which needs no setting, and an ' +
+					'interrupted anchored pass resumes from its walk cursor. The canary never skipped and still does ' +
+					'not. Remove it from config at leisure.',
 				{ unit: 'ms', min: 0 }
 			),
 			backoffMax: option(

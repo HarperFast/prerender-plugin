@@ -511,12 +511,18 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 	}
 });
 
-test('freshness skip: a baseline younger than reprobeAfter is not re-probed', async () => {
-	// The restart case: a pass that already covered these URLs died mid-walk, and the pass that
-	// replaces it must not spend origin requests re-confirming what is already stored.
+test('freshness skip: only a baseline written since THIS pass began is skipped — a recent CHANGE is re-probed', async () => {
+	// F3 (review 2026-09-29). `probedAt` moves only when a baseline is WRITTEN — a change, a seed, a
+	// re-baseline — so the old "younger than reprobeAfter" test skipped precisely the URLs that had just
+	// changed. The live case: a daytime pass caught a change and wrote its baseline at T-9h; the anchored
+	// pass that began after midnight reached the URL at T, skipped it as "fresh", and the midnight reprice
+	// kept serving for another day. Now only a baseline written at or after the pass's own start (a row an
+	// interrupted run of this same pass already covered) is skipped.
 	const probed = [];
 	const T = 1_700_000_000_000;
+	const passStart = T - 3 * HOUR;
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const triggered = [];
 	const stats = await changeProbe.runProbePass({
 		rows: stream([row(URL_A), row(URL_B)]),
 		rules: compileProbeRules(RULES_RAW),
@@ -526,19 +532,47 @@ test('freshness skip: a baseline younger than reprobeAfter is not re-probed', as
 			probed.push(url);
 			return '[9]';
 		},
-		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - 60_000 : T - 20 * HOUR }),
+		// URL_A: written by this pass an hour ago (before a restart). URL_B: changed by a daytime pass 9h ago.
+		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - HOUR : T - 9 * HOUR }),
 		write: async () => {},
-		submitTrigger: async () => 'queued',
+		submitTrigger: async ({ row }) => triggered.push(row.url),
 		dryRun: false,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
 		now: () => T,
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: passStart,
 	});
-	assert.deepEqual(probed, [URL_B], 'only the stale baseline was re-probed');
+	assert.deepEqual(probed, [URL_B], 'the 9h-old change is re-probed; only this pass’s own write is skipped');
+	assert.deepEqual(triggered, [URL_B], 'and the reprice it finds is acted on');
 	assert.equal(stats.fresh, 1);
 	assert.equal(stats.probed, 1);
+});
+
+test('freshness skip: with no pass start (the canary), nothing is ever skipped', async () => {
+	const probed = [];
+	const T = 1_700_000_000_000;
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			probed.push(url);
+			return '[1]';
+		},
+		read: async () => ({ signature: '[1]', probedAt: T - 1 }),
+		write: async () => {},
+		submitTrigger: async () => {},
+		dryRun: false,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		now: () => T,
+	});
+	assert.deepEqual(probed, [URL_A]);
+	assert.equal(stats.fresh, 0);
 });
 
 test('freshness skip: an unparseable or missing probedAt probes rather than skips', async () => {
@@ -561,10 +595,36 @@ test('freshness skip: an unparseable or missing probedAt probes rather than skip
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: 0,
 	});
 	assert.equal(probed.length, 2, 'unknown age must probe — never skip on a value we cannot read');
 	assert.equal(stats.fresh, 0);
+});
+
+test('pacing: a row skipped as fresh makes no origin call and is NOT charged a slot of the rate window', async () => {
+	// P4 (review 2026-09-29). Skipped rows used to count toward the paced batch, so a run of skips crawled
+	// at `ratePerSecond` though it asked the origin nothing.
+	const waits = [];
+	const T = 1_700_000_000_000;
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B), row(URL_C), row(URL_D)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => '[1]',
+		// A, B and C were written by this pass already; only D makes a request.
+		read: async (url) => ({ signature: '[1]', probedAt: url === URL_D ? T - 9 * HOUR : T }),
+		write: async () => {},
+		submitTrigger: async () => {},
+		dryRun: false,
+		concurrency: 2,
+		ratePerSecond: 1, // a 1000ms window per probed row
+		now: () => T,
+		pause: async (ms) => waits.push(ms),
+		skipProbedSince: T - HOUR,
+	});
+	assert.deepEqual(waits, [1000], 'the all-skip batch waits nothing; the batch with one probe waits one slot');
 });
 
 test('origin backoff: a pushback response stretches the pacing window, a clean batch relaxes it', async () => {
@@ -703,7 +763,7 @@ test('freshness skip: a BigInt probedAt is coerced, not thrown on', async () => 
 		ratePerSecond: 1000,
 		pause: async () => {},
 		now: () => T,
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: T - HOUR,
 	});
 	assert.deepEqual(probed, [], 'the BigInt-derived timestamp was understood as fresh');
 	assert.equal(stats.fresh, 1);

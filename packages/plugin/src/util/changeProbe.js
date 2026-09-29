@@ -158,7 +158,7 @@ const newStats = () => ({
 	triggered: 0, // changes acted on: page hard-expired, render filed ahead of rotation, baseline written
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
-	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
+	fresh: 0, // skipped: baseline written since this pass (or the pass it resumes) began — already probed
 	pageMismatch: 0, // cached page disagreed with the origin (pageCheck: the claim pair, or an ARMED mapped field) — OVERLAYS the buckets above, which count by signature outcome alone
 	caughtUp: 0, // origin changed, but every changed slot is a mapped slot the cached page ALREADY shows the new value for: baseline written, nothing triggered — OVERLAYS changed
 	ignored: 0, // origin changed only in pageCheck.ignoreChanges slots: baseline written, nothing triggered, NOT a change for the canary — OVERLAYS unchanged
@@ -370,8 +370,8 @@ export const actOnChange = async (row) => {
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
 // a missing row (never probed, ownership moved, node rebuilt, target deleted) reads as null and
 // the state machine SEEDS, which is the safe direction everywhere this can happen.
-// Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
-// another pass already covered (see `reprobeAfter` in runProbePass).
+// Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL it
+// (or the pass it resumes) already probed — see `skipProbedSince` in runProbePass.
 const readSignature = async (url) => {
 	const row = await probeStateTable().get({
 		id: url,
@@ -755,7 +755,9 @@ export const runProbePass = async ({
 	inScope = null,
 	ownershipChecked = false,
 	onYield = () => yieldNow(),
-	reprobeAfter = 0,
+	// Skip a URL whose baseline was written at or after this instant (epoch ms): THIS pass, or the pass
+	// it resumes, already probed it. Null never skips — the canary's setting. See `processOne`.
+	skipProbedSince = null,
 	backoffMax = 1,
 	abortAfterDistress = 0,
 	// Continuous mode. `cycleTarget` is the wall-clock budget for covering `sliceSize` matched
@@ -814,14 +816,21 @@ export const runProbePass = async ({
 	};
 
 	const processOne = async ({ row, rule }) => {
-		// Read BEFORE the probe now (it used to read after, to skip the read on a failed probe).
-		// The stored baseline carries WHEN it was taken, and a baseline younger than
-		// `reprobeAfter` means another pass already covered this URL — the common case after a
-		// restart, which otherwise re-probes hours of already-seeded ground. Trading a node-local
-		// point read for an origin request is the right way round: the origin request is the
-		// scarce, externally-visible resource.
+		// Read BEFORE the probe (it used to read after, to skip the read on a failed probe): the stored
+		// baseline carries WHEN it was written, and one written since this pass began — by this pass
+		// before a restart cut it short, by an in-flight action the resume cursor was held back for, or
+		// by the canary — has already been probed by the pass this row belongs to. Trading a node-local
+		// point read for an origin request is the right way round: the origin request is the scarce,
+		// externally-visible resource.
+		//
+		// SINCE THE PASS BEGAN, NOT "YOUNGER THAN `reprobeAfter`" (the rule before v0.97.0). `probedAt`
+		// moves only when a baseline is WRITTEN — a change, a seed, a re-baseline — never on an unchanged
+		// observation, so an age test selected exactly the rows that had recently CHANGED and never the
+		// quiet ones it was meant to spare. Measured on a live deployment: every change an off-schedule
+		// daytime pass caught was skipped by the next night's anchored pass, because its baseline was
+		// under 12h old — and that night's reprice of those pages waited a full day for the pass after.
 		const stored = (await read(row.url)) ?? null;
-		if (reprobeAfter > 0 && Number.isFinite(stored?.probedAt) && now() - stored.probedAt < reprobeAfter) {
+		if (skipProbedSince !== null && Number.isFinite(stored?.probedAt) && stored.probedAt >= skipProbedSince) {
 			stats.fresh++;
 			return;
 		}
@@ -1079,11 +1088,15 @@ export const runProbePass = async ({
 	// response to pressure immediate and the recovery slow — the asymmetry a backoff needs.
 	const flush = async () => {
 		if (!batch.length) return;
-		const batchSize = batch.length;
 		const started = now();
 		batchDistress = 0;
 		retryAfterMs = 0;
+		const probedBefore = stats.probed;
 		await Promise.all(batch.map(processOne));
+		// ONLY ROWS THAT MADE A REQUEST ARE PACED. A row skipped as fresh costs a node-local read and no
+		// origin call, so charging it a slot of the rate window made a run of skips crawl at
+		// `ratePerSecond` for nothing — the pacing exists for the origin, not for the table.
+		const requested = stats.probed - probedBefore;
 		// Every row up to here has been probed and its action (if any) started: the resume cursor may
 		// move past them once their actions settle (see `resumeKeyOf`).
 		stats.walkedThrough = batch[batch.length - 1].row.url;
@@ -1126,7 +1139,7 @@ export const runProbePass = async ({
 		const elapsed = now() - started;
 		batch.length = 0;
 		const wait = batchPause({
-			batchSize,
+			batchSize: requested,
 			rate,
 			originThrottle: throttle,
 			loadThrottle,
@@ -1636,8 +1649,9 @@ export const runProbeSweepOnce = async ({
 				yields++;
 				await beat(progressOf(live, 'walking'));
 			},
-			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
-			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
+			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a
+			// reseed: a row it re-baselined before a restart cut it short is re-baselined already.
+			skipProbedSince: resume?.originStartedAt ?? startedAt,
 			// A pending reseed cancels too: the pass that must stand down for it is this one.
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
@@ -1903,10 +1917,10 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				// disagreements alike.
 				guard: theMappingGuard(),
 				...limits,
-				// NEVER skips on baseline age. The cohort is small and deliberately probed on a
-				// cadence far tighter than `reprobeAfter` — freshness-skipping here would silence
-				// the mass-change detector between sweeps, which is the one thing it exists for.
-				reprobeAfter: 0,
+				// NEVER skips. The cohort is small and re-probed on a deliberately fast cadence, and a
+				// skip here would silence the mass-change detector between sweeps — the one thing it
+				// exists for.
+				skipProbedSince: null,
 				isCanceled: () => !config.changeProbe.enabled,
 				// Re-checked per pass, not only when the cohort was built: a member whose grace ran out
 				// since then is skipped (and counted) exactly as the sweep would skip it.
