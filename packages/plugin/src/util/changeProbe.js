@@ -75,7 +75,7 @@ import {
 	signatureUnderPrefix,
 	statusSignalFor,
 	apiClaimOf,
-	claimsDisagree,
+	compareClaims,
 	pageClaimFromOffers,
 	changedSlots,
 	compareField,
@@ -919,10 +919,12 @@ export const runProbePass = async ({
 			return values;
 		};
 
-		let pageDisagrees = false;
+		// The claim pair's verdict: true compared-and-agreed, false disagreed, null nothing comparable.
+		let claimVerdict = null;
 		if (claimPair && stored?.pageSignature && valuesOf()) {
-			pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, pageCheck));
+			claimVerdict = compareClaims(stored.pageSignature, apiClaimOf(values, pageCheck));
 		}
+		const pageDisagrees = claimVerdict === false;
 
 		const signatureChanged = Boolean(stored?.signature) && stored.signature !== comparable;
 
@@ -1029,18 +1031,20 @@ export const runProbePass = async ({
 			if (signatureChanged || extended || stored.fingerprint === null || stored.fingerprint === undefined) {
 				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
 			}
-			// PROOF that something was compared: the stored claim for a rule with the claim pair (the
-			// original gate, unchanged), else at least one armed mapped field that agreed. A caught-up
-			// row is not verified on this pass — its baseline just moved — and is on the next.
-			const proof = claimPair ? Boolean(stored.pageSignature) : mappedAgreed > 0;
+			// PROOF that something was compared AND agreed: for a rule with the claim pair, a claim
+			// comparison that actually compared a dimension (`claimVerdict === true` — a stored claim
+			// alone is not a comparison: an unrecognised availability word beside a null endpoint price
+			// compares nothing and used to pass here); else at least one armed mapped field that agreed.
+			// A caught-up row is not verified on this pass — its baseline just moved — and is on the next.
+			const proof = claimPair ? claimVerdict === true : mappedAgreed > 0;
 			if (verificationArmed && proof && !caughtUp && !mappedDisagrees) {
 				// PROOF, not absence of news. Both conditions are load-bearing and neither is
 				// redundant:
 				//
-				//   proof                 `pageDisagrees` is computed only when a stored claim exists (and
-				//                         a mapped field only when a stored record does), so a URL whose
-				//                         page claim is unknown arrives here with nothing disagreeing —
-				//                         identical, at this line, to a real agreement. Without this guard
+				//   proof                 nothing disagreeing is not an agreement: a URL whose page claim
+				//                         is unknown, or whose claim shares no comparable dimension with the
+				//                         endpoint's, arrives here with nothing disagreeing — identical, at
+				//                         this line, to a real agreement. Without this guard
 				//                         we would stamp "verified" on a page nobody ever compared, and
 				//                         serve it through an invalidation. That is the one failure this
 				//                         feature must never produce.

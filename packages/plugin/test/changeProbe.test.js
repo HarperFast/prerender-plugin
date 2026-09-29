@@ -2053,6 +2053,28 @@ test('NO pageSignature -> NOT verified, even though pageDisagrees is false', asy
 	assert.deepEqual(verified, [], 'no claim was compared, so there is nothing to certify');
 });
 
+test('a stored claim that COMPARES NOTHING is not proof — P1: verified needs a comparison that happened', async () => {
+	// P1 (review 2026-09-29). The page's availability word is one the vocabulary does not know (null
+	// verdict) and the endpoint's price is null: neither dimension is comparable. Before, the proof was
+	// "a stored claim exists", and the no-disagreement answer then certified a page nobody had compared.
+	const sig = JSON.stringify([39.99, null, null, true]);
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: sig },
+		stored: {
+			[URL_A]: {
+				signature: sig,
+				probedAt: NaN,
+				pageSignature: JSON.stringify([['35.99'], null]),
+				pageClaimAt: CLAIM_AT,
+			},
+		},
+	});
+	assert.equal(stats.unchanged, 1);
+	assert.equal(stats.pageMismatch, 0, 'nothing comparable is not a disagreement either');
+	assert.deepEqual(verified, [], 'and not an agreement: no dimension was compared');
+});
+
 test('a DISAGREEING page is triggered, never verified', async () => {
 	const { verified, stats } = await runVerifyPass({
 		rows: [row(URL_A)],

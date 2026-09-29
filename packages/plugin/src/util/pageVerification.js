@@ -8,7 +8,7 @@
  *
  * The change probe already answers the question the invalidation is guessing at. `pageCheck`
  * compares what the CACHED PAGE claims against what the origin's endpoint says right now
- * (`util/changeProbe.js`, `claimsDisagree`). When that comparison AGREES after the epoch, the page is
+ * (`util/changeProbe.js`, `compareClaims`). When that comparison AGREES after the epoch, the page is
  * demonstrably current on the fields the invalidation was recorded for, and refusing it buys nothing.
  *
  * ── WHAT THIS DOES AND DOES NOT ASSERT ─────────────────────────────────────────────────────────
@@ -18,11 +18,14 @@
  * probe looks at. So this is opt-in per deployment, and the honest framing is "price and availability
  * are verified", never "the page is fine".
  *
- * That is also why the write is gated on `stored.pageSignature` EXISTING. `pageDisagrees` is computed
- * only `if (rule.pageCheck && stored?.pageSignature)`, so a URL whose page claim is unknown yields
- * `false` — indistinguishable, at the call site, from a real agreement. Writing a verification off
- * that would stamp "verified" on a page nobody ever compared, which is the one bug this feature
- * cannot survive: it would serve invalidated content while reporting success.
+ * That is also why the write is gated on a comparison that HAPPENED and agreed (`compareClaims`
+ * answering `true`, or an armed mapped field agreeing), never on the absence of a disagreement. A URL
+ * whose page claim is unknown — or whose claim shares no readable dimension with the endpoint's (an
+ * unrecognised availability word beside a null price) — has nothing disagreeing, which is
+ * indistinguishable at the call site from a real agreement. Writing a verification off that would
+ * stamp "verified" on a page nobody ever compared, which is the one bug this feature cannot survive:
+ * it would serve invalidated content while reporting success. (Before v0.97.0 the gate was only that
+ * a stored claim existed, which let the second case through.)
  *
  * ── EVERY FAILURE FAILS CLOSED ─────────────────────────────────────────────────────────────────
  *
