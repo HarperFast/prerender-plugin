@@ -191,7 +191,12 @@ Notes that bite:
   confined to `pageCheck.ignoreChanges`; not counted as `changed`). (3) `probe_fresh` now counts only
   URLs whose baseline was written since the pass — or the pass it resumes — began, i.e. that pass had
   already probed them; near zero in a settled pass. It used to count baselines younger than
-  `changeProbe.reprobeAfter` (now retired), which selected every recently CHANGED URL.
+  `changeProbe.reprobeAfter` (now retired), which selected every recently CHANGED URL. (4)
+  `probe_anchor` (anchored mode): one emit per anchor, detail = what became of it — `on_time`,
+  `interrupted` (a dry-run or reseed pass was asked to stand down first), `chained` (it waited for a
+  pass that acts), `caught_up` (the node was down when it came; run at boot) or `skipped` (served by
+  a later anchor's pass, or abandoned by a re-arm). **Anything but `on_time` means that night's pass
+  started late; `skipped` means an anchor got no pass of its own.**
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. Since v0.93.0 it comes from the queue keeper and is exact; it is absent while the

@@ -1520,12 +1520,18 @@ test('scheduler: mode is live — switching re-arms rather than leaving the old 
 	await applyProbeConfig({ enabled: false });
 });
 
+// An anchor time of day (UTC) that last occurred `hours` ago. The resume and catch-up decisions compare
+// a claim's start with the most recent anchor, so a fixed '03:00' would make these tests depend on the
+// hour they run at.
+const anchorHoursAgo = (hours) => new Date(Date.now() - hours * HOUR).toISOString().slice(11, 16);
+
 const armAnchoredScheduler = async (t, extra = {}) => {
 	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
 	await applyProbeConfig({
 		enabled: true,
 		mode: 'anchored',
-		anchorTime: '03:00',
+		// Six hours back: every claim these tests seed (1-4h old) belongs to the current anchor period.
+		anchorTime: anchorHoursAgo(6),
 		anchorTimezone: 'UTC',
 		startDelay: 0,
 		startJitter: 1,
@@ -1580,6 +1586,8 @@ test("RESTART RESILIENCE: the resume starts the WALK at the published cursor, in
 			dryRun: true,
 			originStartedAt: startedAt - HOUR, // itself a resume of an earlier pass
 			progress: { cursor },
+			// The anchored pass already ran since the anchor, so no catch-up competes with the resume.
+			lastRun: { startedBy: 'anchor', startedAt: Date.now() - 5 * HOUR, dryRun: false },
 		},
 	});
 	const decision = await changeProbe.__checkResumeForTest();
@@ -1616,7 +1624,7 @@ test('RESTART RESILIENCE: an early config apply re-arms a pending resume instead
 	await applyProbeConfig({
 		enabled: true,
 		mode: 'anchored',
-		anchorTime: '04:00',
+		anchorTime: anchorHoursAgo(5),
 		anchorTimezone: 'UTC',
 		startDelay: 0,
 		startJitter: 1,

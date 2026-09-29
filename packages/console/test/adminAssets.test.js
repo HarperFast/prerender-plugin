@@ -346,6 +346,7 @@ test('every probe series the catalog declares is read by the console, or waived 
 		['probe_errors', 'plugin 0.97.0: actions that threw — read via /change-probe (errors/unacted); panel later'],
 		['probe_caught_up', 'plugin 0.97.0: read via /change-probe (caughtUp); panel later'],
 		['probe_ignored', 'plugin 0.97.0: read via /change-probe (ignored); panel later'],
+		['probe_anchor', 'plugin 0.97.0: anchored-pass outcomes (detail); logged on the node; panel later'],
 	]);
 
 	for (const name of series) {

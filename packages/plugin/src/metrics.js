@@ -593,7 +593,11 @@ export const METRICS = Object.freeze({
 			'the pass record has retried/recovered/unacted — and a change still unacted is found again on its next ' +
 			'probe; expect zero); caught_up = changes the cached page already showed (a mapped pageCheck field ' +
 			'agreed with the new value), baseline moved, nothing triggered — they overlay changed; ignored = changes ' +
-			'confined to pageCheck.ignoreChanges slots, not counted as changed; ' +
+			'confined to pageCheck.ignoreChanges slots, not counted as changed; probe_anchor = one emit per ' +
+			'anchor in anchored mode, detail = what became of it: on_time, interrupted (a dry-run or reseed pass ' +
+			'was asked to stand down first), chained (it waited for a pass that acts), caught_up (the process was ' +
+			'down when it came; run at boot), skipped (served by a later anchor’s pass, or abandoned by a ' +
+			're-arm) — anything but on_time is logged, and a skipped is a night whose pass started late; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -715,6 +719,7 @@ export const METRICS = Object.freeze({
 					'probe_errors',
 					'probe_caught_up',
 					'probe_ignored',
+					'probe_anchor',
 					'discovery_gated',
 					'entity_gate',
 					'raw_cache',
@@ -767,7 +772,8 @@ export const METRICS = Object.freeze({
 					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
-					'(http-gone, noindex, canonical-mismatch, ...). Other series: null.',
+					'(http-gone, noindex, canonical-mismatch, ...). probe_anchor: the outcome (on_time, interrupted, ' +
+					'chained, caught_up, skipped). Other series: null.',
 			},
 			type: {
 				name: 'context',

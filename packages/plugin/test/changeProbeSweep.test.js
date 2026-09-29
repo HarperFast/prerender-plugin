@@ -288,3 +288,193 @@ test('A4: an action that fails is retried once after the walk — the page is ex
 		'the failure log says a retry follows'
 	);
 });
+
+// ---- the anchored pass is never silently lost (F7a) ---------------------------------------------
+
+const flushTurns = async (n = 30) => {
+	for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
+	await changeProbe.probeStatePublishedForTest();
+};
+const unmatched = (n) => {
+	for (let i = 0; i < n; i++) {
+		const url = `https://site.example.com/help/${String(i).padStart(5, '0')}`;
+		registry.set(url, { url, sitemapUrl: null, renderInterval: null, demandInterval: null, state: null });
+	}
+};
+const anchorOutcomes = () => series('anchor').map((r) => r.method);
+const sweepRow = async () => (await changeProbe.readProbeStateForTest())?.sweep;
+const armAnchored = async (t, now, extra = {}) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse(now) });
+	configure({
+		mode: 'anchored',
+		anchorTime: '03:00',
+		anchorTimezone: 'UTC',
+		chunkSize: 250,
+		// The boot resume/catch-up check fires on the first tick unless a test says otherwise.
+		startDelay: 0,
+		startJitter: 1,
+		...extra,
+	});
+	changeProbe.startChangeProbeScheduler();
+	await flushTurns();
+};
+// A walk that blocks at row 250 until released: the way a test holds a pass mid-flight.
+const gateAt = (index) => {
+	let release;
+	let reached = false;
+	const gate = new Promise((resolve) => (release = resolve));
+	let seen = 0;
+	holdRow = async () => {
+		if (seen++ === index) {
+			reached = true;
+			await gate;
+		}
+	};
+	return { release, reached: () => reached };
+};
+
+test('F7a: an anchor that fires during a RESEED interrupts it and runs the anchored pass (reviewer case B)', async (t) => {
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR });
+	unmatched(300);
+	const gate = gateAt(250);
+	const reseed = changeProbe.runProbeSweepOnce({ reseed: true, startedBy: 'reseed', label: 'reseed after a trip' });
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+	assert.equal((await sweepRow()).reseed, true, 'the reseed holds the sweep');
+
+	t.mock.timers.tick(60_000); // 03:00 — the anchor fires, finds the reseed, asks it to stand down
+	await flushTurns();
+	t.mock.timers.tick(10_000); // the reseed's heartbeat tick reads the request
+	await flushTurns();
+	holdRow = async () => {};
+	gate.release();
+	const stoodDown = await reseed;
+	assert.equal(stoodDown.aborted, true, 'the reseed stood down');
+	assert.equal(stoodDown.interruptedBy, 'anchor');
+
+	t.mock.timers.tick(15_000); // the anchor's retry finds the sweep free
+	await flushTurns();
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'anchor', 'the anchored pass ran — the night is not lost');
+	assert.equal(row.lastRun.anchorAt, Date.parse('2026-09-24T03:00:00Z'), 'as the pass for that anchor');
+	assert.equal(row.lastRun.examined, 300, 'a whole pass');
+	assert.deepEqual(anchorOutcomes(), ['interrupted']);
+	t.mock.timers.reset();
+});
+
+test('F7a: an anchor that fires during a pass that ACTS waits for it, then runs — chained, never skipped', async (t) => {
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR });
+	unmatched(300);
+	const gate = gateAt(250);
+	const manual = changeProbe.runProbeSweepOnce({ startedBy: 'manual', dryRun: false });
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+
+	t.mock.timers.tick(60_000); // the anchor fires
+	await flushTurns();
+	t.mock.timers.tick(30_000); // heartbeats and retries while the manual pass is still running
+	await flushTurns();
+	assert.equal((await sweepRow()).startedBy, 'manual', 'the acting pass is not interrupted');
+	holdRow = async () => {};
+	gate.release();
+	const finished = await manual;
+	assert.equal(finished.aborted, undefined, 'it ran to completion');
+	assert.equal(finished.examined, 300);
+
+	t.mock.timers.tick(15_000);
+	await flushTurns();
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'anchor');
+	assert.deepEqual(anchorOutcomes(), ['chained']);
+	t.mock.timers.reset();
+});
+
+test('F7a: a restart that SPANNED the anchor catches the pass up at boot, as that anchor’s pass', async (t) => {
+	// Yesterday's anchored pass is the last thing the node ran; the process was down at today's 03:00.
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-23T03:00:00Z'),
+			dryRun: false,
+			startedBy: 'anchor',
+			lastRun: { startedBy: 'anchor', startedAt: Date.parse('2026-09-23T03:00:00Z'), dryRun: false },
+		},
+	});
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T03:30:00Z');
+	t.mock.timers.tick(1); // the boot check
+	await flushTurns();
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'anchor', 'the missed night ran at boot');
+	assert.equal(row.lastRun.anchorAt, Date.parse('2026-09-24T03:00:00Z'));
+	assert.deepEqual(anchorOutcomes(), ['caught_up']);
+	t.mock.timers.reset();
+});
+
+test('F7a: no catch-up when the anchored pass already started since the anchor — a restart costs nothing', async (t) => {
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-24T03:00:00Z'),
+			dryRun: false,
+			lastRun: { startedBy: 'anchor', startedAt: Date.parse('2026-09-24T03:00:00Z'), dryRun: false },
+		},
+	});
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T09:30:00Z');
+	t.mock.timers.tick(1);
+	await flushTurns();
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedAt, Date.parse('2026-09-24T03:00:00Z'), 'nothing ran');
+	assert.deepEqual(anchorOutcomes(), []);
+	t.mock.timers.reset();
+});
+
+test('F7a: a dead claim from BEFORE the last anchor is not resumed — a whole catch-up pass runs instead', async (t) => {
+	// Yesterday's pass (04:00, 23.5h ago — inside the old one-day resume window) died mid-walk. Finishing
+	// its tail would leave its head unprobed since before today's 03:00 anchor.
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: true,
+			startedAt: Date.parse('2026-09-23T04:00:00Z'),
+			heartbeatAt: Date.parse('2026-09-23T09:00:00Z'),
+			dryRun: false,
+			startedBy: 'anchor',
+			progress: { cursor: 'https://site.example.com/help/00005' },
+		},
+	});
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T03:30:00Z');
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.equal(decision.resumed, false);
+	assert.equal(decision.reason, 'predates the last anchor');
+	assert.equal(decision.caughtUp, true);
+	await flushTurns();
+	const row = await sweepRow();
+	assert.equal(row.lastRun.examined, 10, 'the whole slice, not the tail after the cursor');
+	assert.equal(row.lastRun.resumedFrom, null);
+	t.mock.timers.reset();
+});
+
+test('F7a: the most recent anchor is DST-correct — a pass just after a fall-back anchor counts as that night’s', async (t) => {
+	// America/Chicago falls back at 2026-11-01T07:00Z. The 00:05 anchor that day was 05:05Z (CDT); the
+	// next is 06:05Z on Nov 2 (CST). `next - 24h` would say 06:05Z on Nov 1 — an hour late — and read the
+	// 05:10Z pass as predating it.
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-11-01T05:10:00Z'),
+			dryRun: false,
+			lastRun: { startedBy: 'anchor', startedAt: Date.parse('2026-11-01T05:10:00Z'), dryRun: false },
+		},
+	});
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	try {
+		await armAnchored(t, '2026-11-01T12:00:00Z', { anchorTime: '00:05', anchorTimezone: 'America/Chicago' });
+		const decision = await changeProbe.__checkResumeForTest();
+		assert.equal(decision.caughtUp, undefined, 'no catch-up: that night’s pass ran');
+	} finally {
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+		t.mock.timers.reset();
+	}
+});

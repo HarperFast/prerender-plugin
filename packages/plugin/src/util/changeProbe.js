@@ -1257,9 +1257,9 @@ const logActionError = (e, item, { retry = false } = {}) =>
 	);
 
 // Metric emission must never cost the pass or the trip action its outcome.
-const countProbe = (series) => {
+const countProbe = (series, detail = null, value = 1, context = null) => {
 	try {
-		metrics.changeProbe(1, series);
+		metrics.changeProbe(value, series, detail, context);
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${series} not recorded: ${e?.message ?? String(e)}`);
 	}
@@ -1356,7 +1356,7 @@ const HEARTBEAT_MS = 30 * SECOND;
  */
 const claimPass = async (
 	kind,
-	{ startedBy = null, dryRun = null, label = null, reseed = false, originStartedAt = null } = {}
+	{ startedBy = null, dryRun = null, label = null, reseed = false, originStartedAt = null, anchorAt = null } = {}
 ) => {
 	const row = await readProbeState();
 	if (isPassRunning(row, kind, PASS_STALE_MS)) {
@@ -1391,10 +1391,17 @@ const claimPass = async (
 			// the pass it belongs to (itself, or the one a resume is continuing) — see `checkResume`.
 			reseed,
 			originStartedAt: originStartedAt ?? startedAt,
+			// The anchor instant an anchored pass serves (it can start later: chained behind another pass,
+			// or caught up at boot) — kept so a resume serves the same one. Null for every other pass.
+			anchorAt,
+			// A request to stand down is addressed to the pass that holds the claim NOW, so a new claim
+			// starts with none (see `requestSweepInterrupt`).
+			interruptRequestedAt: null,
+			interruptRequestedBy: null,
 			sliceEstimate: kind === 'sweep' ? sliceEstimateFrom(previous) : null,
 		},
 	});
-	return { ok: true, startedAt };
+	return { ok: true, startedAt, previous };
 };
 
 /**
@@ -1600,6 +1607,7 @@ export const runProbeSweepOnce = async ({
 	reseed = false,
 	startedBy = null,
 	resume = null,
+	anchorAt = null,
 } = {}) => {
 	// Worker-local guard, and it is SET SYNCHRONOUSLY on purpose. The node-wide claim below is an
 	// await, so setting the flag after it would leave a window in which two concurrent calls on
@@ -1621,6 +1629,7 @@ export const runProbeSweepOnce = async ({
 		label,
 		reseed,
 		originStartedAt: resume?.originStartedAt ?? null,
+		anchorAt,
 	});
 	if (!claim.ok) {
 		// Release the local flag we optimistically took — the `finally` below is not reached from
@@ -1636,6 +1645,16 @@ export const runProbeSweepOnce = async ({
 	let triggers = null;
 	let phase = 'walking';
 	let stopHeartbeat = () => {};
+	// A pass that only MEASURES — a dry run, or a reseed — stands down when an anchored pass asks it to
+	// (see `requestSweepInterrupt`); a pass that acts is never interrupted, the anchor waits for it.
+	const interruptible = limits.dryRun === true || reseed === true;
+	let interruptedBy = null;
+	const checkInterrupt = async () => {
+		if (!interruptible || interruptedBy !== null) return;
+		const pass = (await readProbeState())?.sweep;
+		const at = epochMsOf(pass?.interruptRequestedAt);
+		if (Number.isFinite(at) && at >= startedAt) interruptedBy = pass.interruptRequestedBy ?? 'request';
+	};
 	const emit = createPassEmitter('sweep');
 	const counts = () => ({
 		...live,
@@ -1686,7 +1705,10 @@ export const runProbeSweepOnce = async ({
 		// The liveness signal for the node-wide claim, for the WHOLE pass — walk, drain and retries (see
 		// `startHeartbeat`). Its failure is swallowed by `publishProbeState`: a pass must never die of
 		// bookkeeping.
-		stopHeartbeat = startHeartbeat(() => beat(progressOf(live, phase)));
+		stopHeartbeat = startHeartbeat(async () => {
+			await beat(progressOf(live, phase));
+			await checkInterrupt();
+		});
 		const stats = await runProbePass({
 			rows: walkTargets(
 				config.changeProbe.chunkSize,
@@ -1710,8 +1732,9 @@ export const runProbeSweepOnce = async ({
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a
 			// reseed: a row it re-baselined before a restart cut it short is re-baselined already.
 			skipProbedSince: resume?.originStartedAt ?? startedAt,
-			// A pending reseed cancels too: the pass that must stand down for it is this one.
-			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
+			// A pending reseed cancels too: the pass that must stand down for it is this one. So does an
+			// anchored pass's request, for a pass that only measures.
+			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null || interruptedBy !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 			inScope: probeScopeFilter(config.changeProbe),
 			onStart: (running) => (live = running),
@@ -1765,6 +1788,8 @@ export const runProbeSweepOnce = async ({
 			startedBy: passStartedBy,
 			resumedFrom: resume?.originStartedAt ?? null,
 			resumeCursor: resume?.cursor ?? null,
+			anchorAt,
+			interruptedBy,
 			label,
 			node: server.hostname,
 			startedAt,
@@ -2357,6 +2382,7 @@ const clearProbeTimers = () => {
 	if (resumeTimer) clearTimeout(resumeTimer);
 	bootTimer = sweepTimer = canaryTimer = anchorTimer = resumeTimer = null;
 	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = null;
+	timerGeneration++;
 	stopContinuousLoop();
 };
 
@@ -2390,8 +2416,9 @@ let nextAnchorAt = null;
  * where the walk had got to, held back to any action still in flight — `resumeKeyOf`), with the
  * interrupted pass's own dry-run and reseed semantics, recording the pass it continues. One that
  * still beats may be a manual run on another worker, or simply not aged out yet since the restart, so
- * it is looked at again once it would have. A pass (or a chain of resumes) that started more than a
- * day ago is not resumed: the anchor has already started a new one.
+ * it is looked at again once it would have. A pass (or a chain of resumes) that started before the most
+ * recent anchor, or more than a day ago, is not resumed: that anchor's pass is due instead, and the same
+ * check catches it up (see `checkResume`).
  */
 const RESUME_WITHIN_MS = DAY;
 let resumeTimer = null;
@@ -2412,6 +2439,38 @@ const armResumeCheck = (delay = null) => {
 	resumeTimer.unref?.();
 };
 
+/**
+ * Did a pass that ACTS start on this node at or after `since`? The evidence is the sweep branch of the
+ * row: the latest claim (running or released — its fields outlive the release) and the last pass that
+ * ended. A pass's start is its ORIGIN — the start of the pass a resume continues — because a resume
+ * walks only the tail of a pass whose head may predate `since`. A dry run observed but acted on
+ * nothing, so it is not the pass an anchor asked for; an unknown `dryRun` (a row from before v0.91.0)
+ * is read as acting, which errs toward NOT running an extra full pass against the origin.
+ */
+const actingPassSince = (sweep, since) => {
+	const claimOrigin = epochMsOf(sweep?.originStartedAt ?? sweep?.startedAt);
+	if (sweep && sweep.dryRun !== true && claimOrigin >= since) return true;
+	const last = sweep?.lastRun;
+	const lastOrigin = epochMsOf(last?.resumedFrom ?? last?.startedAt);
+	return Boolean(last) && last.dryRun !== true && lastOrigin >= since;
+};
+
+/**
+ * The boot-time decision for anchored mode: resume the pass a restart cut short, or CATCH UP the pass a
+ * restart made this node miss, or neither.
+ *
+ * CATCHING UP. The anchor timer only ever looks forward (`nextAnchorOccurrence`), so a process that was
+ * down when its anchor came — a deploy at 00:03 for a 00:05 anchor, a crash overnight — used to skip
+ * that night's pass entirely, and nothing said so: the next pass was the following night, and every
+ * page the reprice moved served its old price for a day. Now, if no pass that acts has started since
+ * the most recent anchor, one is started, as that anchor's pass (`probe_anchor` outcome `caught_up`).
+ *
+ * WHICH WINS. A stale claim that belongs to the current anchor period (its origin is at or after the
+ * most recent anchor) is today's pass: it is resumed from its cursor. One that only measured (a dry run
+ * or a reseed) is not resumed when a catch-up is due — the anchored pass would interrupt it the moment
+ * it started. One whose origin predates the most recent anchor is yesterday's pass: finishing its tail
+ * would leave the head unprobed since before the anchor, so the catch-up runs a whole pass instead.
+ */
 const checkResume = async () => {
 	const decided = (result) => {
 		resumePending = false;
@@ -2421,32 +2480,51 @@ const checkResume = async () => {
 		return decided({ resumed: false, reason: 'not armed' });
 	const row = await readProbeState();
 	const sweep = row?.sweep;
+	const lastAnchor = previousAnchorOccurrence();
+	const catchUpDue = Number.isFinite(lastAnchor) && !actingPassSince(sweep, lastAnchor);
 	const startedAt = epochMsOf(sweep?.startedAt);
-	if (!sweep?.running || !Number.isFinite(startedAt)) return decided({ resumed: false, reason: 'nothing interrupted' });
-	if (isPassRunning(row, 'sweep', PASS_STALE_MS)) {
-		armResumeCheck(PASS_STALE_MS);
-		return { resumed: false, reason: 'claim still live' };
+	let reason = 'nothing interrupted';
+	if (sweep?.running && Number.isFinite(startedAt)) {
+		if (isPassRunning(row, 'sweep', PASS_STALE_MS)) {
+			armResumeCheck(PASS_STALE_MS);
+			return { resumed: false, reason: 'claim still live' };
+		}
+		// An unusable origin falls back to this claim's own start (validated above): `NaN` would pass the age
+		// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
+		const recordedOrigin = epochMsOf(sweep.originStartedAt);
+		const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
+		const measuring = sweep.dryRun === true || sweep.reseed === true || sweep.startedBy === 'reseed';
+		if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS)) reason = 'older than a day';
+		else if (Number.isFinite(lastAnchor) && originStartedAt < lastAnchor) reason = 'predates the last anchor';
+		else if (catchUpDue && measuring) reason = 'a measuring pass, and the anchored pass is due';
+		else {
+			const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
+			logger.warn(
+				`[prerender] change-probe: resuming the sweep a restart interrupted (started ${new Date(originStartedAt).toISOString()}) ` +
+					`from ${cursor ? JSON.stringify(cursor) : 'the start (no cursor was published)'}`
+			);
+			const anchorAt = epochMsOf(sweep.anchorAt);
+			runProbeSweepOnce({
+				startedBy: 'resume',
+				resume: { cursor, originStartedAt },
+				reseed: sweep.reseed === true || sweep.startedBy === 'reseed',
+				// The interrupted pass's own mode — a manual dry run must not resume armed, nor the reverse.
+				dryRun: typeof sweep.dryRun === 'boolean' ? sweep.dryRun : undefined,
+				label: sweep.label ?? null,
+				anchorAt: Number.isFinite(anchorAt) ? anchorAt : null,
+			}).catch((e) => logger.error(e));
+			return decided({ resumed: true, from: originStartedAt, cursor });
+		}
 	}
-	// An unusable origin falls back to this claim's own start (validated above): `NaN` would pass the age
-	// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
-	const recordedOrigin = epochMsOf(sweep.originStartedAt);
-	const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
-	if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS))
-		return decided({ resumed: false, reason: 'older than a day' });
-	const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
-	logger.warn(
-		`[prerender] change-probe: resuming the sweep a restart interrupted (started ${new Date(originStartedAt).toISOString()}) ` +
-			`from ${cursor ? JSON.stringify(cursor) : 'the start (no cursor was published)'}`
-	);
-	runProbeSweepOnce({
-		startedBy: 'resume',
-		resume: { cursor, originStartedAt },
-		reseed: sweep.reseed === true || sweep.startedBy === 'reseed',
-		// The interrupted pass's own mode — a manual dry run must not resume armed, nor the reverse.
-		dryRun: typeof sweep.dryRun === 'boolean' ? sweep.dryRun : undefined,
-		label: sweep.label ?? null,
-	}).catch((e) => logger.error(e));
-	return decided({ resumed: true, from: originStartedAt, cursor });
+	if (catchUpDue) {
+		logger.warn(
+			`[prerender] change-probe: no pass has run since the ${new Date(lastAnchor).toISOString()} anchor (the ` +
+				`process was down when it came) — running that anchor's pass now`
+		);
+		void runAnchoredPass(lastAnchor, { outcome: 'caught_up', generation: timerGeneration });
+		return decided({ resumed: false, reason, caughtUp: true, anchorAt: lastAnchor });
+	}
+	return decided({ resumed: false, reason });
 };
 
 /**
@@ -2473,6 +2551,160 @@ const nextAnchorOccurrence = () => {
 	if (!Number.isFinite(at)) return NaN;
 	return at <= Date.now() ? at + DAY : at;
 };
+
+/** Minutes past local midnight of `ms` in `timezone` (DST-correct: Intl resolves the offset at `ms`). */
+const localFormatters = new Map();
+export const localMinutesOf = (ms, timezone) => {
+	let format = localFormatters.get(timezone);
+	if (!format) {
+		format = new Intl.DateTimeFormat('en-US', {
+			timeZone: timezone,
+			hour: '2-digit',
+			minute: '2-digit',
+			hourCycle: 'h23',
+		});
+		localFormatters.set(timezone, format);
+	}
+	let hours = 0;
+	let minutes = 0;
+	for (const part of format.formatToParts(new Date(ms))) {
+		if (part.type === 'hour') hours = Number(part.value);
+		else if (part.type === 'minute') minutes = Number(part.value);
+	}
+	return hours * 60 + minutes;
+};
+
+/** "HH:MM" as minutes past midnight, the way `getNextTimeOfDay` reads it (unparseable parts are 0). */
+export const minutesOfTimeOfDay = (timeStr) => {
+	const [h, m] = String(timeStr).split(':');
+	const hours = Number.parseInt(h, 10);
+	const minutes = Number.parseInt(m ?? '0', 10);
+	return (Number.isFinite(hours) ? hours : 0) * 60 + (Number.isFinite(minutes) ? minutes : 0);
+};
+
+/**
+ * The most recent occurrence of the anchor at or before now, or NaN when it cannot be computed.
+ *
+ * The day before the next one, CORRECTED FOR A DST SHIFT between them: `next - 24h` lands an hour off
+ * the anchor's wall-clock time when a transition falls in between, so the difference between the
+ * anchor's minutes and the candidate's local minutes (as Intl resolves them at that instant) is
+ * applied. An anchor that does not exist that day (inside the spring-forward hour) resolves within
+ * the hour, which is all a "did a pass start since" test needs.
+ */
+const previousAnchorOccurrence = () => {
+	const next = nextAnchorOccurrence();
+	if (!Number.isFinite(next)) return NaN;
+	let at = next - DAY;
+	try {
+		let delta =
+			minutesOfTimeOfDay(config.changeProbe.anchorTime) - localMinutesOf(at, config.changeProbe.anchorTimezone);
+		if (delta > 720) delta -= 1440;
+		if (delta < -720) delta += 1440;
+		at += delta * MINUTE;
+	} catch {
+		return NaN;
+	}
+	return at <= Date.now() ? at : at - DAY;
+};
+
+/**
+ * Ask whatever sweep holds this node's claim to stand down — honoured only by a pass that measures
+ * (a dry run or a reseed), within one heartbeat tick, on whichever worker it runs. Addressed through
+ * the claim row because the pass may be on another worker (a console-started dry run), where no
+ * module state reaches it; a new claim clears it (`claimPass`).
+ */
+export const requestSweepInterrupt = (by) =>
+	publishProbeState({ sweep: { interruptRequestedAt: Date.now(), interruptRequestedBy: by } });
+
+// How often an anchored pass that is waiting for another sweep tries again.
+const ANCHOR_RETRY_MS = 15 * SECOND;
+// Bumped by every re-arm, so a waiting anchored pass knows the schedule it was waiting for is gone.
+let timerGeneration = 0;
+
+/**
+ * Run the anchored pass for the anchor at `anchorAt` — now if the sweep is free, otherwise as soon as it
+ * is. Resolves when the pass has run, or when the wait was abandoned. Never rejects.
+ *
+ * AN ANCHOR IS NEVER SILENTLY LOST. It used to await `runProbeSweepOnce`, which returns `{ skipped }`
+ * whenever any sweep is running on the node — a reseed after a canary trip, a manual pass from the
+ * console, a resume — and the timer re-armed for TOMORROW with no log line and no metric: the pass the
+ * whole mode exists for simply did not happen that night. Now:
+ *
+ *   - a pass that only MEASURES (a dry run, a reseed) is asked to stand down (`requestSweepInterrupt`),
+ *     and the anchored pass takes the sweep as soon as it has — outcome `interrupted`. What a reseed
+ *     does is a subset of what the anchored pass does: every matched URL, probed.
+ *   - a pass that ACTS is left to finish, and the anchored pass runs after it — outcome `chained`.
+ *   - an anchor that comes round while this wait is still going (the other pass outran a whole day) is
+ *     served by the same pass, and the one it replaces is counted `skipped`.
+ *   - a re-arm (a mode or anchor edit, a disable) abandons the wait — counted `skipped` too.
+ *
+ * Every anchor is one `probe_anchor` emit, detail = outcome; `on_time` is the plain case and
+ * `caught_up` the boot catch-up (`checkResume`).
+ */
+const runAnchoredPass = async (anchorAt, { outcome = 'on_time', generation = timerGeneration } = {}) => {
+	let served = anchorAt;
+	let result = outcome;
+	let asked = false;
+	let waitedFor = null;
+	for (;;) {
+		if (generation !== timerGeneration || !schedulerStarted || !config.changeProbe.enabled || !isAnchored()) {
+			countProbe('anchor', 'skipped');
+			logger.warn(
+				`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} was abandoned — the ` +
+					`schedule changed while it waited`
+			);
+			return null;
+		}
+		let pass;
+		try {
+			pass = await runProbeSweepOnce({ startedBy: 'anchor', anchorAt: served });
+		} catch (e) {
+			logger.error(e);
+			countProbe('anchor', result);
+			return null;
+		}
+		if (!pass?.skipped) {
+			countProbe('anchor', result);
+			if (result !== 'on_time') {
+				logger.warn(
+					`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} ran ` +
+						(result === 'caught_up' ? 'as a catch-up' : `after ${waitedFor ?? 'another sweep'} (${result})`)
+				);
+			}
+			return pass;
+		}
+		const holder = (await readProbeState())?.sweep;
+		const measuring = holder?.dryRun === true || holder?.reseed === true;
+		waitedFor = holder?.startedBy ? `a ${holder.dryRun ? 'dry-run ' : ''}${holder.startedBy} pass` : waitedFor;
+		if (measuring && !asked) {
+			asked = true;
+			if (result === 'on_time') result = 'interrupted';
+			logger.warn(
+				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a measuring sweep'} running — asking it to stand down`
+			);
+			await requestSweepInterrupt('anchor');
+		} else if (!measuring && result === 'on_time') {
+			result = 'chained';
+			logger.warn(
+				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a sweep'} running — its pass runs when that one ends`
+			);
+		}
+		// A LATER anchor while this one waits: one pass serves both, and the older is the one skipped.
+		const latest = previousAnchorOccurrence();
+		if (Number.isFinite(latest) && latest > served) {
+			countProbe('anchor', 'skipped');
+			served = latest;
+		}
+		await waitUnref(ANCHOR_RETRY_MS);
+	}
+};
+
+// A wait that never holds the process open (the global timer, which is also what tests can drive).
+const waitUnref = (ms) =>
+	new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+	});
 
 const armAnchorTimer = () => {
 	if (anchorTimer) clearTimeout(anchorTimer);
@@ -2502,16 +2734,14 @@ const armAnchorTimer = () => {
 			nextAnchorAt = Number.isFinite(upcoming) ? upcoming : null;
 			// Awaited so the scheduler write lands before the pass claims the row.
 			await publishScheduler();
-			try {
-				await runProbeSweepOnce({ startedBy: 'anchor' });
-			} catch (e) {
-				logger.error(e);
+			const generation = timerGeneration;
+			await runAnchoredPass(at, { generation });
+			// Config is re-read here rather than captured: this is the boundary a live change acts on. A
+			// mode or anchor edit while the pass ran (or waited) has already re-armed through
+			// syncProbeTimers — the generation moved — and that arming stands.
+			if (generation === timerGeneration && config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) {
+				armAnchorTimer();
 			}
-			// Config is re-read here rather than captured: this is the boundary a live change acts on.
-			// A mode or anchor edit mid-pass has already re-armed through syncProbeTimers (the marker
-			// changed), and `armAnchorTimer` clears whatever timer that armed before arming its own, so
-			// the two can never both be live.
-			if (config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) armAnchorTimer();
 		},
 		Math.max(0, at - Date.now())
 	);

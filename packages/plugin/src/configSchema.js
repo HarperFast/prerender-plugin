@@ -1127,9 +1127,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'moves on a schedule — a retailer whose prices change only at its own midnight — this puts ' +
 					'the walk right after the change instead of spreading it over the day, so detection latency ' +
 					'is the pass length rather than up to a cycle, and the corpus is current for the day by the ' +
-					'time the pass ends. No pass runs at boot in this mode (baselines persist; a restart waits ' +
-					'for the anchor). The canary keeps its own cadence, so an off-schedule mass change is still ' +
-					'caught; only the full walk is anchored.\n\n' +
+					'time the pass ends. A restart does not start a pass of its own in this mode (baselines ' +
+					'persist): it RESUMES a pass it cut short from the walk cursor, and CATCHES UP the pass for an ' +
+					'anchor it was down for (no acting pass started since the most recent anchor). An anchor that ' +
+					'fires while another sweep holds the node interrupts a dry run or a reseed, and waits for any ' +
+					'other pass and runs after it — never skipped silently (`probe_anchor`). The canary keeps its ' +
+					'own cadence, so an off-schedule mass change is still caught; only the full walk is anchored.\n\n' +
 					'Switching is safe in every direction and takes effect on the next config apply; a pass ' +
 					'in flight finishes under the rules it started with.',
 				{ enum: ['interval', 'continuous', 'anchored'] }
