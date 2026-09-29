@@ -294,7 +294,31 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// markup, and an intra-cluster fetch is ~50x cheaper than the origin round trip. Inert unless
 		// `peerRescue` is configured; origin remains the backstop for every miss (owner is this node,
 		// owner unreachable, owner's own read fails).
-		const rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		let rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		// THE OWNER'S COPY IS JUDGED BY THE SAME RULE THE LOCAL ONE WAS. The local record proved itself
+		// servable, but it is the replica — and replication lag is exactly when blob faults cluster, so
+		// the owner's newer metadata may already say this page must not be served: hard-expired by the
+		// change probe, or re-rendered before an epoch the local copy postdates. Serving those bytes as a
+		// 200 because the LOCAL row said so would hand the crawler the very page the probe acted to stop.
+		// Decided here rather than on the owner so that one node, one epoch and one config decide the
+		// whole request, and so the endpoint stays a dumb read (http_handlers/peer_page.js). The
+		// verification pair still applies: the owner is never older than the local copy, so a proof
+		// that exempted the local render exempts the owner's too.
+		if (rescue.ok) {
+			const owner = resolveServeStatus({
+				expiresAtMs: epochMsOf(rescue.page.expiresAt),
+				lastCachedMs: epochMsOf(rescue.page.lastCached),
+				swrTtl: config.page.swrTtl,
+				now: Date.now(),
+				epoch,
+				verifiedAtMs,
+				basisAtMs,
+			});
+			if (!owner.servable) {
+				const why = owner.status === 'invalidated' ? 'invalidated' : 'past its serve window';
+				rescue = { ok: false, owner: rescue.owner, reason: `the owner's copy is ${why}` };
+			}
+		}
 		if (rescue.ok) {
 			const note = timedOut ? `read exceeded ${config.page.blobReadBudgetMs}ms` : 'unreadable';
 			logger.warn(
