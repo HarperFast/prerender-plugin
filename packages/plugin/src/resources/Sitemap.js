@@ -15,6 +15,7 @@ import { arrivalCandidateCap, decideArrival, isRejoin } from '../util/sitemapArr
 import { cacheKeysOf } from './Target.js';
 import { writeSchedule } from '../util/renderSchedule.js';
 import { resolveEffectiveInterval } from '../util/routeClass.js';
+import { runDetached } from '../util/detach.js';
 
 /**
  * Log what a sitemap contributed vs. what was dropped. A large filtered share almost always
@@ -237,11 +238,13 @@ export async function startSitemapRefreshInBackground(url, refreshOptions = {}) 
 		// Deliberately not awaited: the walk outlives this request. Failures are logged and
 		// recorded on the progress row by `runTrackedRefresh`; the catch here only keeps the
 		// rejection from surfacing as an unhandled one.
-		void runTrackedRefresh(only, refreshOptions).catch(() => {});
+		// Outside the request that asked (util/detach.js): the walk outlives the response, and the
+		// request's transaction does not.
+		void runDetached(() => runTrackedRefresh(only, refreshOptions)).catch(() => {});
 		return { background: true, sitemaps: [{ url: only, started: true, progress: progressPath(only) }] };
 	}
 
-	void (async () => {
+	void runDetached(async () => {
 		for (const root of urls) {
 			const claim = await claimRefreshRun(root);
 			if (!claim.ok) {
@@ -250,7 +253,7 @@ export async function startSitemapRefreshInBackground(url, refreshOptions = {}) 
 			}
 			await runTrackedRefresh(root, refreshOptions).catch(() => {});
 		}
-	})();
+	});
 
 	return {
 		background: true,

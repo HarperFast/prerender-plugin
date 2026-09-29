@@ -567,6 +567,10 @@ type VisitFilter @table(database: "crawl_stats") {
 	node: String
 	bits: Bytes
 	updatedAt: Date
+	# The ring shape the row was written under (`sliceMs|bitsPerSlice|hashes`, v0.95.1). Length alone
+	# cannot tell a row written with a different `hashes` from one of this shape; rows with another shape
+	# are neither merged nor counted as history. Absent on older rows, which are taken on length alone.
+	shape: String
 }
 
 # A cached ORIGIN DOCUMENT for a URL that is not in the render rotation — no browser, no render

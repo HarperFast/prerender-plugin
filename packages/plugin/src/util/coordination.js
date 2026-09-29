@@ -44,6 +44,9 @@ export const releaseSabs = (matches) => {
 	for (const key of held.keys()) if (matches(key)) held.delete(key);
 };
 
+/** Test seam: the keys held right now. */
+export const heldSabKeys = () => [...held.keys()];
+
 /** Test seam: forget every held buffer, as a restart would. */
 export const resetHeldSabs = () => held.clear();
 

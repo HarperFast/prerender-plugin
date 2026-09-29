@@ -617,7 +617,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated and entity_gate are counters; config_warnings is a slow gauge (latest value); ' +
-			'demand_fill is a per-worker gauge — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
+			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
 			'and climbs until the next one, so it is a sawtooth: averaging over a window reports the middle ' +
 			'of the ramp while the decisions that matter are made at the top of it. A k=7 probe ' +

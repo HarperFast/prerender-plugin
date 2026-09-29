@@ -1715,6 +1715,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				statsInterval: option(15 * MINUTE, 'How often the level histogram + promote/demote counters are logged.', {
 					unit: 'ms',
+					max: 2147483647,
 					min: SECOND,
 				}),
 			}
@@ -2582,11 +2583,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'failure is loud — the cadence just stops being demand-driven (`maxFalsePositive` ' +
 					'stops the newer consumers acting on such a ring; the ladder still does). Watch `demand_fill` at its PEAK, ' +
 					'not its mean (it is a sawtooth that resets each slice).\n\n' +
-					'Raising this is the last lever, not the first: the row is `bitsPerSlice / 8` bytes and ' +
-					'REPLICATES on every flush, which is how the per-worker version of this write produced ' +
-					'a transaction log two orders of magnitude larger than the state it carried. Cut what ' +
-					'goes in first — `bots` above, and the rotation gate in `recordDemand` — since a URL ' +
-					'no consumer can ever act on is pure fill.',
+					'WHAT A LARGER RING COSTS (v0.95.1: one copy per node, not per worker). Replicated bytes: ' +
+					'the row is `bitsPerSlice / 8` bytes and replicates on every store (`flushInterval`) that ' +
+					'changed it — the per-worker version of this write once produced a transaction log two ' +
+					'orders of magnitude larger than the state it carried. Memory: `slices` x the row per node ' +
+					'for the union, plus about two live slices. Reads: each `mergeInterval` one worker scans ' +
+					'the ring’s row versions and fetches only the rows that changed — the current slice from ' +
+					'each node — plus one local read of this node\u2019s own row per store. Size to the peak distinct URLs per slice with room: bits = `k n / -ln(1 - f)` ' +
+					'for fill f, and f = `maxFalsePositive^(1/k)` (0.652 for 5% at k = 7). Cut what goes in ' +
+					'too — `bots` above, and the rotation gate in `recordDemand` — since a URL no consumer can ' +
+					'ever act on is pure fill.',
 				{ min: 1024 }
 			),
 			hashes: option(
@@ -2600,17 +2606,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			flushInterval: option(
 				5 * MINUTE,
-				'How often a worker merges its in-memory ring slices into this node\u2019s replicated row. ' +
-					'Only the current slice is dirty, so the replicated volume is about one `bitsPerSlice / 8` ' +
-					'row per node per interval — the other half of the bytes question `bitsPerSlice` raises.',
-				{ unit: 'ms', min: SECOND }
+				'How often this node\u2019s live slice is stored to its replicated row, by whichever worker ' +
+					'holds the interval\u2019s turn (every worker sets its bits in the same shared slice). Only ' +
+					'the current slice changes, so the replicated volume is about one `bitsPerSlice / 8` row ' +
+					'per node per interval — the other half of the bytes question `bitsPerSlice` raises, and ' +
+					'the lever for it: a visit reaches the other nodes up to one interval late, against a ' +
+					'`sliceMs` slice.',
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
 			),
 			mergeInterval: option(
 				5 * MINUTE,
-				'How often the read side re-unions every node\u2019s rows. The reschedule path runs ~20x/s ' +
-					'and cannot pay a multi-row read per job result, so it reads a cached union this stale. ' +
-					'`demand_fill` is emitted at each re-union.',
-				{ unit: 'ms', min: SECOND }
+				'How often the node\u2019s shared union of every node\u2019s rows is brought up to date — by one ' +
+					'worker, incrementally: it reads the ring\u2019s row versions and fetches only the rows that ' +
+					'changed. The reschedule path runs ~20x/s and cannot pay a read per job result, so every ' +
+					'worker answers from the shared union, this stale at most. `demand_fill` and ' +
+					'`demand_false_positive` are emitted at each refresh, once per node.',
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
 			),
 			maxFalsePositive: option(
 				0.05,
