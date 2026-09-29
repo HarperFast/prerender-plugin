@@ -35,6 +35,10 @@
  *
  * `searchOptions` is passed as the second argument of every search the walk makes, so a caller on a
  * residency-pinned table can keep every read local (`{ replicateFrom: false }`).
+ *
+ * `onUnreadable` is told where the row was: `{ after }`, the last readable key before a row whose key
+ * attribute is missing (null before the first), or `{ key }` for a row whose key is known but whose
+ * projected read never hands it over. `recoverKeylessKeys` turns the first kind back into keys.
  */
 /** `error.code` of the throw that means "rows remain but no readable cursor can reach them". */
 export const WALK_CANNOT_ADVANCE = 'URL_WALK_CANNOT_ADVANCE';
@@ -135,7 +139,7 @@ export async function* walkUrlRange(
 			if (typeof row?.[key] !== 'string') {
 				// Unreadable rows AFTER the last readable key of a full chunk are re-read by the
 				// next query (the cursor sits before them) — counting them now would double-count.
-				if (!full || i < lastReadableIndex) onUnreadable?.();
+				if (!full || i < lastReadableIndex) onUnreadable?.({ after: cursor ?? (startAt || null) });
 				continue;
 			}
 			lastResume = null;
@@ -156,7 +160,7 @@ export async function* walkUrlRange(
 			if (probe[0][key] === lastResume) {
 				cursor = probe[0][key];
 				lastResume = null;
-				onUnreadable?.();
+				onUnreadable?.({ key: cursor });
 				continue;
 			}
 			lastResume = probe[0][key];
@@ -191,3 +195,38 @@ export async function* walkUrlRange(
 		return;
 	}
 }
+
+/**
+ * The primary keys of rows a walk saw WITHOUT their key attribute, recovered from the table's primary
+ * store — which, unlike every search, yields each record's key beside its value.
+ *
+ * Such a row is a stub, not a record anything wrote whole: a `patch` that lands on a key deleted a
+ * moment earlier creates a row holding only the patched fields, and Harper stores the key attribute
+ * only when the update names it (`resources/Table.ts`, the primary-key assignment in the write path).
+ * A search projects the key from the VALUE, so the row comes back keyless — counted as unreadable by
+ * `walkUrlRange`, and undeletable by anything that finds rows by reading them. The key is still the
+ * row's position in the store, so from the last readable key before it (`gaps`, the `after` values
+ * `walkUrlRange` reports) a range read of the store finds it: every entry up to the next one whose
+ * value carries the key attribute.
+ *
+ * Bounded (`perGap` entries per gap, at most `max` keys), read-only, and empty when the table exposes
+ * no primary store. A tombstone (no value) is not a row and is skipped; so is a non-string key, which
+ * is store metadata rather than a record.
+ */
+export const recoverKeylessKeys = (table, gaps, { key = 'url', perGap = 100, max = 10_000 } = {}) => {
+	const store = table?.primaryStore;
+	if (typeof store?.getRange !== 'function') return [];
+	const found = new Set();
+	for (const after of new Set(gaps)) {
+		let seen = 0;
+		for (const { key: id, value } of store.getRange(after === null ? {} : { start: after })) {
+			if (id === after) continue;
+			if (++seen > perGap || found.size >= max) break;
+			if (typeof id !== 'string' || value === null || typeof value !== 'object') continue;
+			if (typeof value[key] === 'string') break;
+			found.add(id);
+		}
+		if (found.size >= max) break;
+	}
+	return [...found];
+};
