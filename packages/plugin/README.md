@@ -1313,11 +1313,11 @@ f = 0.652 holds the 5% limit at k = 7.
 
 What a larger ring costs, since v0.95.1 once per node rather than once per worker:
 
-| Cost              | Scales with                                                       | Notes                                                                             |
-| ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Replicated writes | one row (`bitsPerSlice / 8`) per node per `flushInterval`         | Only the current slice changes; the lever is `flushInterval`.                     |
-| Memory            | `slices` rows per node (the union), plus about two live slices    | Shared by every worker on the node.                                               |
-| Reads             | the rows that changed since the last refresh, per `mergeInterval` | One worker refreshes; in steady traffic that is the current slice from each node. |
+| Cost              | Scales with                                                                                                                   | Notes                                                                                          |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Replicated writes | one row (`bitsPerSlice / 8`) per node per `flushInterval`                                                                     | Only the current slice changes; the lever is `flushInterval`.                                  |
+| Memory            | `slices` rows per node (the union), plus about two live slices                                                                | Shared by every worker on the node.                                                            |
+| Reads             | one version scan of the ring, and the rows that changed, per `mergeInterval`; one local read of this node's own row per store | One worker refreshes; in steady traffic the changed rows are the current slice from each node. |
 
 Every worker sets its bits in the node's shared slice, and whichever worker holds the interval's turn
 stores it, so no visit waits on a particular worker. Changing `bitsPerSlice`, `hashes` or `sliceMs`

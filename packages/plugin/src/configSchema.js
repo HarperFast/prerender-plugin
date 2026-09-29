@@ -2586,9 +2586,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'the row is `bitsPerSlice / 8` bytes and replicates on every store (`flushInterval`) that ' +
 					'changed it — the per-worker version of this write once produced a transaction log two ' +
 					'orders of magnitude larger than the state it carried. Memory: `slices` x the row per node ' +
-					'for the union, plus about two live slices. Reads: each `mergeInterval` one worker reads ' +
+					'for the union, plus about two live slices. Reads: each `mergeInterval` one worker scans ' +
 					'the ring’s row versions and fetches only the rows that changed — the current slice from ' +
-					'each node. Size to the peak distinct URLs per slice with room: bits = `k n / -ln(1 - f)` ' +
+					'each node — plus one local read of this node\u2019s own row per store. Size to the peak distinct URLs per slice with room: bits = `k n / -ln(1 - f)` ' +
 					'for fill f, and f = `maxFalsePositive^(1/k)` (0.652 for 5% at k = 7). Cut what goes in ' +
 					'too — `bots` above, and the rotation gate in `recordDemand` — since a URL no consumer can ' +
 					'ever act on is pure fill.',

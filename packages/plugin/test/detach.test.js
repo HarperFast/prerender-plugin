@@ -58,3 +58,11 @@ test('every admin action that starts work it does not wait for starts it detache
 		}
 	}
 });
+
+test('the sitemap background refresh starts its walks detached', () => {
+	const source = readFileSync(new URL('../src/resources/Sitemap.js', import.meta.url), 'utf8');
+	const start = source.indexOf('export async function startSitemapRefreshInBackground');
+	const body = source.slice(start, source.indexOf('\n}\n', start));
+	assert.ok(start >= 0 && body.includes('runDetached('), 'the background walks go through runDetached');
+	assert.doesNotMatch(body, /void runTrackedRefresh\(|void \(async/, 'no walk started inline');
+});

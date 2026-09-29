@@ -35,7 +35,7 @@ const sabs = new Map();
 
 let recordVisit, flushSlices, refreshMerged, visitedWithin, visitedInEachWindow;
 let sweepExpired, resetVisitFilter, slotOf, mergedWarm, historyFromMs, visitedSlots, unionHealth, visitProbe;
-let demandOf, warmDemand;
+let demandOf, warmDemand, heldSabKeys, releaseSabs;
 let resetHeldSabs;
 let applyOptions;
 
@@ -106,7 +106,7 @@ before(async () => {
 	};
 
 	({ applyOptions } = await import('../src/config.js'));
-	({ resetHeldSabs } = await import('../src/util/coordination.js'));
+	({ resetHeldSabs, heldSabKeys, releaseSabs } = await import('../src/util/coordination.js'));
 	({
 		recordVisit,
 		flushSlices,
@@ -468,19 +468,117 @@ test('a visit set while a store is in flight is stored by the next store', async
 	}
 });
 
-test('only the first store of a slot in a process reads the row back', async () => {
-	const gets = countCalls('get');
+test('every store merges the row it replaces, so a live slice that lost its bits cannot wipe the row', async () => {
+	// Harper can replace a worker inside a running process; if every worker holding a slot's live slice
+	// goes, the slice is freed and comes back empty while its change counters live on. A store that
+	// wrote the slice blind would then overwrite the node's row with nothing.
+	const now = Date.now();
+	recordVisit('https://example.com/product/prd-before');
+	await flushSlices({ nowMs: now });
+	// Every worker holding the live slice is replaced: the slice is freed, its counters are not (another
+	// worker holds them), and the new worker starts with no view of either.
+	const liveKey = [...sabs.keys()].find((key) => key.startsWith('visitRing/live/'));
+	releaseSabs((key) => key === liveKey);
+	sabs.delete(liveKey);
+	resetVisitFilter();
+	recordVisit('https://example.com/product/prd-after');
+	await flushSlices({ nowMs: now + 1 });
+	await refreshMerged(now + 2);
+	assert.equal(visitedWithin('https://example.com/product/prd-before', H, now + 2), true, 'the stored row survived');
+	assert.equal(visitedWithin('https://example.com/product/prd-after', H, now + 2), true);
+});
+
+test('a slot whose store fails is retried next interval and does not hold back the others', async () => {
+	const base = slotOf(Date.now()) * H;
+	const realNow = Date.now;
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const put = VisitFilter.put;
 	try {
-		recordVisit('https://example.com/product/prd-1');
-		await flushSlices();
-		recordVisit('https://example.com/product/prd-2');
-		await flushSlices();
-		recordVisit('https://example.com/product/prd-3');
-		await flushSlices();
-		assert.equal(gets.calls.length, 1, 'the fold of pre-restart history, once; later stores write blind');
+		Date.now = () => base - H + 60_000;
+		recordVisit('https://example.com/product/prd-old'); // an older slot, left unstored
+		Date.now = () => base + 60_000;
+		recordVisit('https://example.com/product/prd-new');
+		const failing = `${slotOf(base - H)}|node-a`;
+		VisitFilter.put = async (id, data) => {
+			if (id === failing) throw new Error('store refused');
+			return put.call(VisitFilter, id, data);
+		};
+		await flushSlices({ nowMs: base + 60_000 });
+		assert.ok(rows.has(`${slotOf(base)}|node-a`), 'the newer slot was stored');
+		assert.equal(rows.has(failing), false);
+		VisitFilter.put = put;
+		await flushSlices({ nowMs: base + 120_000 });
+		assert.ok(rows.has(failing), 'and the failed one on the next interval');
 	} finally {
-		gets.restore();
+		Date.now = realNow;
+		VisitFilter.put = put;
 	}
+});
+
+test('rows of another shape do not count as history', async () => {
+	// A restart with a new bitsPerSlice leaves old-shape rows in the ring. Counting them as the start of
+	// history made a tracker with one hour of rows answer as if it had eleven.
+	const base = slotOf(Date.now()) * H;
+	rows.set(`${slotOf(base - 10 * H)}|node-b`, {
+		id: `${slotOf(base - 10 * H)}|node-b`,
+		slot: slotOf(base - 10 * H),
+		node: 'node-b',
+		bits: Buffer.alloc(64), // another size
+		updatedAt: base - 10 * H,
+	});
+	const realNow = Date.now;
+	try {
+		Date.now = () => base + 60_000;
+		recordVisit('https://example.com/product/prd-now');
+		await flushSlices({ nowMs: base + 60_000 });
+	} finally {
+		Date.now = realNow;
+	}
+	await refreshMerged(base + 120_000);
+	assert.deepEqual(visitedSlots('https://example.com/product/prd-now', base + 120_000), { level: 1, covered: 1 });
+});
+
+test('a reshape that lands mid-refresh folds nothing into the new shape', async () => {
+	// The union only ever gains bits, so old-shape bits folded into the new shape's union would stay for
+	// the ring's life (and read as fill that is not there).
+	recordVisit('https://example.com/product/prd-old-shape');
+	await flushSlices();
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const search = VisitFilter.search;
+	VisitFilter.search = async (query) => {
+		const result = await search.call(VisitFilter, query);
+		// reshape once the refresh has decided which slots to fetch, before it folds any
+		if (!query.select?.includes('bits')) setDemand({ bitsPerSlice: 1 << 21 });
+		return result;
+	};
+	try {
+		await refreshMerged(Date.now());
+	} finally {
+		VisitFilter.search = search;
+	}
+	assert.equal(mergedWarm(), false, 'the new shape was not declared warm off the old shape’s rows');
+	const polluted = heldSabKeys().filter(
+		(key) => key.startsWith('visitRing/union/') && key.includes(`|${1 << 21}|`)
+	).length;
+	assert.equal(polluted, 0, 'no new-shape union slice was written');
+});
+
+test('a worker that never records still lets go of what ages out of the ring', async () => {
+	setDemand({ slices: 4 });
+	resetVisitFilter();
+	const base = slotOf(Date.now()) * H;
+	for (let k = 0; k < 12; k++) {
+		const at = base + k * H + 60_000;
+		// another node's row lands in every slot; this worker only refreshes and reads
+		const id = `${slotOf(at)}|node-b`;
+		const bits = Buffer.alloc((1 << 20) >>> 3);
+		bits[k] = 1;
+		rows.set(id, { id, slot: slotOf(at), node: 'node-b', bits, updatedAt: at });
+		await refreshMerged(at);
+		visitedWithin('https://example.com/product/prd-x', H, at);
+	}
+	const unions = heldSabKeys().filter((key) => key.startsWith('visitRing/union/'));
+	assert.ok(unions.length <= 5, `holds ${unions.length} union slices for a 4-slot ring`);
 });
 
 test('a refresh fetches the bits only of slots with a row it has not seen at that version', async () => {
