@@ -1102,8 +1102,10 @@ export class PrerenderAdmin extends Resource {
 		}
 
 		// The write is residency-routed, so this reaches the owning node from any node. `fileDueNow`: a
-		// row already due, or marked by the change probe, keeps its place and its mark.
-		await fileDueNow(canonicalUrl, {
+		// row already due, or marked by the change probe, keeps its place and its mark. On a node that does
+		// not own the row it cannot see that place, so it files the current minute, and the returned time is
+		// the one it wrote.
+		const nextRenderTime = await fileDueNow(canonicalUrl, {
 			fromSitemap: !!target.sitemapUrl,
 			// The target's real cadence, off the point read above — an admin rejoin should not cost the
 			// page its ranking on the way back into rotation.
