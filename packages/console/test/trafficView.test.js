@@ -570,6 +570,11 @@ test('the negative-cache panel reads the dry run: would-serve, and the stale-404
 			combo('prerender_ops', 'negative_cache', 'would-serve-live', null, 3),
 			combo('prerender_ops', 'negative_cache', 'stored', null, 400),
 			combo('prerender_ops', 'gone_reopen', 'would-file', 'traffic', 7),
+			// Early rechecks (younger than a gone target's own 14d+): 9 live, 1 still gone. The 14d+ rows
+			// are the ordinary recheck and stay out of the share.
+			combo('prerender_ops', 'suppression_lifted', 'http-gone', '<6h', 9),
+			combo('prerender_ops', 'suppression_held', 'http-gone', '<1h', 1),
+			combo('prerender_ops', 'suppression_held', 'http-gone', '14d+', 40),
 		],
 	};
 	const ctx = makeCtx({ analytics });
@@ -580,6 +585,9 @@ test('the negative-cache panel reads the dry run: would-serve, and the stale-404
 	// A share of every lookup arming would have answered (would-serve + would-revalidate, which already
 	// include the 3), not of would-serve alone, and not rounded down to 0%.
 	assert.match(text, /\(0\.3% of the requests arming would have answered\)/);
+	assert.match(text, /Early rechecks live/);
+	assert.match(text, /90%/);
+	assert.match(text, /9 live again · 1 still gone/);
 });
 
 test('the per-route table counts a verified serve as cache-served', async () => {

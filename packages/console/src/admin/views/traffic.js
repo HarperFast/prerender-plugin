@@ -2176,6 +2176,7 @@ function negativeCache(ctx, data, filter) {
 	const gaps = pick(data, 'prerender_ops', (s) => s.path === 'negative_gap');
 	const reopens = pick(data, 'prerender_ops', (s) => s.path === 'gone_reopen');
 	const lifted = pick(data, 'prerender_ops', (s) => s.path === 'suppression_lifted');
+	const held = pick(data, 'prerender_ops', (s) => s.path === 'suppression_held');
 	const options = optionIndex(configState(ctx).payload);
 	const enabled = options.get('render.negative.enabled')?.effective === true;
 	const dryRun = options.get('render.negative.dryRun')?.effective !== false;
@@ -2196,6 +2197,12 @@ function negativeCache(ctx, data, filter) {
 	const ev = tally(events);
 	const reopen = tally(reopens);
 	const liftedGone = sumCount(lifted.filter((s) => s.method === 'http-gone'));
+	// A gone target's own recheck lands in 14d+, so a gone target rendered younger than that was an EARLY
+	// recheck — a reopen, an arrival or an operator revalidate — and live vs still-gone there is how often
+	// the evidence that filed it was right.
+	const early = (s) => s.method === 'http-gone' && s.type !== '14d+' && s.type !== 'unknown';
+	const earlyLive = sumCount(lifted.filter(early));
+	const earlyGone = sumCount(held.filter(early));
 	const stored = ev('stored') + ev('stored-unshared');
 	const refused = [...NEGATIVE_REFUSALS].reduce((acc, key) => acc + ev(key), 0);
 	const wouldServe = ev('would-serve');
@@ -2272,6 +2279,12 @@ function negativeCache(ctx, data, filter) {
 					'Gone targets reopened',
 					fmtCount(reopen('filed') + reopen('would-file')),
 					`${reopen('would-file') ? 'dry run · ' : ''}${num(reopen('deduped'))} deduped · ${num(liftedGone)} lifted by a render`
+				),
+				stat(
+					'Early rechecks live',
+					earlyLive + earlyGone ? riskShare(earlyLive, earlyLive + earlyGone) : '—',
+					`${num(earlyLive)} live again · ${num(earlyGone)} still gone (gone targets rendered before their recheck)`,
+					{ warn: earlyGone > earlyLive }
 				),
 			]),
 			!events.length && el('div', { cls: 'empty', text: 'No negative-cache activity in this range.' }),
