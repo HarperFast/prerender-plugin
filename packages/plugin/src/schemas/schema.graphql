@@ -287,6 +287,13 @@ type ConfigOverride @table(database: "config") @sealed {
 	# Why this override exists. It outlives the operator who set it, and an unexplained override that
 	# contradicts the deployed file is precisely the row the next person cannot safely revert.
 	note: String
+
+	# A hash of the config.yaml layer's value at `path` when the row was written (config.js
+	# `hashConfigValue`). A row holds a WHOLE option, so an override of one route is a copy of every
+	# route, and a later config.yaml edit to any of them is silently merged away. Comparing this with
+	# the file's value now is how the layers view reports that (`masking`). Null on rows written
+	# before v0.97.0, which report `masking: null`, unknown.
+	fileHash: String
 }
 
 # Bulk cache invalidation. "Everything of this kind is wrong as of now; stop serving it."

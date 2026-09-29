@@ -77,6 +77,7 @@ import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promi
 import {
 	config,
 	collectConfigWarnings,
+	collectOverrideWarnings,
 	pendingRestartChanges,
 	describeConfigLayers,
 	resolveConfig,
@@ -116,6 +117,7 @@ import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '..
 import { getPageOrphanSweepState, startPageOrphanSweep, stopPageOrphanSweep } from '../util/pageOrphanSweep.js';
 import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
 import { changeProbeStatus, isPassRunningOnNode, runProbeCanaryOnce, runProbeSweepOnce } from '../util/changeProbe.js';
+import { inspectProbeRules } from '../util/changeProbeSpec.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { QUEUE_STATE_SCHEMA, readQueueStateDocument } from '../util/queueKeeperService.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
@@ -549,10 +551,15 @@ export class PrerenderAdmin extends Resource {
 	 *   config          the effective config, secrets reported as presence only
 	 *   schema          the option catalog: descriptions, types, defaults, live-vs-restart scope,
 	 *                   validation hints, and whether the console may write each option
-	 *   warnings        cross-option findings against the RUNNING config
+	 *   warnings        cross-option findings against the RUNNING config, plus one per stored override
+	 *                   that is masking a config.yaml change (warn) or now equals it (info)
 	 *   pendingRestart  restart-scoped options changed since boot — the new value is in `config`,
 	 *                   but the running behavior still reflects the boot value
-	 *   layers          per option, what each layer says and which one won
+	 *   layers          per option, what each layer says and which one won. An overridden option also
+	 *                   carries `redundant` (the override equals the file's value now: clearing it changes
+	 *                   nothing) and `masking` (the override is in effect and the file's value has changed
+	 *                   since it was written: true / false, or null for a row written before v0.97.0,
+	 *                   which recorded nothing to compare against)
 	 *   overrides       the stored rows, and whether this node is keeping up with them
 	 *
 	 * `layers` is the answer to "why is this value what it is", which the merged `config` cannot
@@ -569,7 +576,7 @@ export class PrerenderAdmin extends Resource {
 		return json({
 			config: redactConfig(config),
 			schema: describeConfigSchema(),
-			warnings: collectConfigWarnings(),
+			warnings: [...collectConfigWarnings(), ...collectOverrideWarnings()],
 			pendingRestart: pendingRestartChanges(),
 			layers: describeConfigLayers(),
 			overrides: {
@@ -621,6 +628,8 @@ export class PrerenderAdmin extends Resource {
 	 * The preview also COMPILES a prospective `ingress.routes` rather than echoing it. An invalid
 	 * route entry is dropped, not rejected — from the outside indistinguishable from a route nobody
 	 * wrote — so echoing the operator's input back would confirm a route that is about to vanish.
+	 * A set of `ingress.routes` or `changeProbe.rules` whose compiler would drop entries is therefore
+	 * listed in `rejected` and refused on apply, like any other value the cluster would not honour.
 	 */
 	static async configOverride(data, context) {
 		// 409, not a silent write, and the same refusal `invalidate` gives for `invalidation.enabled`:
@@ -777,6 +786,32 @@ export class PrerenderAdmin extends Resource {
 				requested: secret ? describeSecret(entry.value) : entry.value,
 				effective: secret ? describeSecret(effective) : effective,
 				reason: 'the resolved config does not hold this value — it would be stored and never honored',
+			});
+		}
+
+		// ENTRIES THE COMPILER WOULD DROP are the same outcome one level down: the list is stored and
+		// merged whole, so the resolve check above passes it, and then the route compiler or the probe
+		// compiler quietly leaves the bad entries out. A route or a rule that is in the table and not
+		// in the router is exactly what this route exists to keep out, so it is refused like any other
+		// value that would not be honoured. Inspected as the value being SET, not the resolved list,
+		// so a bad entry already in the file layer never blocks an unrelated edit.
+		const rejectedPaths = new Set(rejected.map((entry) => entry.path));
+		for (const entry of sets) {
+			if (rejectedPaths.has(entry.path)) continue;
+			const compiled =
+				entry.path === 'ingress.routes'
+					? inspectRoutes(entry.value, [])
+					: entry.path === 'changeProbe.rules'
+						? inspectProbeRules(entry.value)
+						: null;
+			if (!compiled || compiled.dropped === 0) continue;
+			rejected.push({
+				path: entry.path,
+				requested: entry.value,
+				dropped: compiled.dropped,
+				reason:
+					`the compiler would drop ${compiled.dropped} of these entries, so they would be stored and never ` +
+					`honored: ${compiled.warnings.join('; ')}`,
 			});
 		}
 

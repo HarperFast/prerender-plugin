@@ -1069,6 +1069,20 @@ never a snapshot of the whole config. That distinction is the entire design:
 - Clearing one row reverts **one option** to the deployed value. Clearing every row returns the
   cluster to exactly its deployed state — which is the rollback story, and it is one delete.
 
+**But a list is one option.** An edit to one route stores a copy of the whole `ingress.routes` list
+(and one probe rule, all of `changeProbe.rules`). From then on, a `config.yaml` edit to _any_ route
+deploys and is merged away by that copy. So since v0.97.0 each row records a hash of the file's value
+at its path when it is written (`fileHash`), and `GET /prerender_admin/config` reports on each
+overridden option in `layers`:
+
+- `masking: true` means the override is in effect and the file's value has changed since the row
+  was written. A deploy is being overridden. This is also a `warn` finding in `warnings`, and is
+  logged on every apply.
+- `redundant: true` means the override now equals the file's value, so clearing it is a no-op that
+  un-pins the option. This is also an `info` finding.
+- `masking: null` means the row was written before v0.97.0 and recorded no hash, so it is unknown
+  whether the file moved. Saving the row again records one.
+
 The rows live in `config.ConfigOverride` — alone in that database, because a subscription is a
 per-database cost — and **replicate**, so the console writes once, on
 whichever node it reached, and every node converges — including a node that was down when the write
@@ -1135,10 +1149,12 @@ could not:
   deployed setting down with it.
 - **`noop`** — a change whose prospective effective value equals the current one, e.g. an override
   that merely restates what the file already says.
-- **dropped routes** — an `ingress.routes` edit is compiled by `inspectRoutes()` during the preview.
-  An invalid route entry is _dropped_, not rejected, so from the outside it is indistinguishable
-  from a route nobody wrote: the config lists it, the plugin starts, and the paths it covered
-  quietly stop being prerendered. The preview compiles it and reports the drop.
+- **dropped entries** — an `ingress.routes` or `changeProbe.rules` value is compiled during the
+  preview (`inspectRoutes()` / `inspectProbeRules()`). The compiler _drops_ an invalid entry rather
+  than rejecting it, so from the outside the entry is indistinguishable from one nobody wrote: the
+  config lists it, the plugin starts, and the paths it covered quietly stop being prerendered (or
+  probed). Since v0.97.0 such a value is listed in `rejected` with its `dropped` count and the
+  compiler's reasons, and the apply refuses it (409) like any other value that would not be honoured.
 
 ### Bulk cache invalidation
 
