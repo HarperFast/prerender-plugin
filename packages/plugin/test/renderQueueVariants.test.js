@@ -293,6 +293,22 @@ test('every device rendered: pages stored per device, ONE reschedule, ONE outcom
 	assert.equal(leased(A), false, 'the lease is released');
 });
 
+test('a render that lifts a suppression counts it, with the reason and how long it held', async () => {
+	seedUrlRow({ state: 'suppressed', strikes: 1 });
+	stores.target.set(A, {
+		...stores.target.get(A),
+		suppressedReason: 'http-gone',
+		suppressedAt: new Date(Date.now() - 5 * 3_600_000),
+	});
+	await claim();
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(stores.target.get(A).state, null, 'reactivated');
+	const lifted = analytics
+		.filter((a) => a[1] === 'prerender_ops' && a[2] === 'suppression_lifted')
+		.map((a) => [a[3], a[4]]);
+	assert.deepEqual(lifted, [['http-gone', '<6h']], 'the only measure of how often a verdict was temporary');
+});
+
 /**
  * The page record rides with the claim: from the first variant that ran its extraction, and ONLY when
  * the result replaced every default device's page — a partial render cannot vouch for the device page

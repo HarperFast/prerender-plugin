@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { anyRouteArrives, ArrivalAction, classifyUrl, PRERENDER } from './routeClass.js';
 import { departureLimit } from './sitemapDeparture.js';
 import { dateColumnMs } from './time.js';
+import { isGoneSuppressed } from './suppression.js';
 
 /**
  * What a URL REJOINING a sitemap means, and what to do about it — the other half of
@@ -110,8 +111,19 @@ export const decideArrival = ({ url, target }) => {
 	// not listed, so it is not an arrival any more.
 	if (!target.sitemapUrl) return { action: ArrivalAction.NONE, reason: 'unlinked' };
 
-	// Suppression owns a suppressed target's schedule — the same reason `decideDeparture` skips it.
-	if (target.state === 'suppressed') return { action: ArrivalAction.NONE, reason: 'suppressed' };
+	// Suppression owns a suppressed target's schedule — the same reason `decideDeparture` skips it — with
+	// ONE exception: a GONE-suppressed target coming back to its sitemap. That is the origin declaring,
+	// in the one place it declares availability, that a page this system parked as dead exists again, and
+	// skipping it here left the product unrendered for the rest of its 14-day recheck. It takes the
+	// route's own arrival action, so the render's verdict decides (util/goneReopen.js explains why a
+	// verdict, not this signal, flips the target). Under the reopen switch's dry run it is only counted.
+	if (target.state === 'suppressed') {
+		const reopen = config.render.suppression.gone.reopen;
+		if (!isGoneSuppressed(target) || !reopen?.enabled) return { action: ArrivalAction.NONE, reason: 'suppressed' };
+		if (reopen.dryRun) return { action: ArrivalAction.NONE, reason: 'would-reopen' };
+		const action = arrivalActionFor(url);
+		return { action, reason: action === ArrivalAction.NONE ? 'route-opted-out' : 'rejoined-gone' };
+	}
 
 	const action = arrivalActionFor(url);
 	return { action, reason: action === ArrivalAction.NONE ? 'route-opted-out' : 'rejoined' };

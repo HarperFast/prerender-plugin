@@ -21,6 +21,8 @@
 #                                                      serve path; isolated, see the type)
 #   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
 #                                                      the render rotation (expiring, isolated)
+#   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local
+#                    NegativePageAnchor                (+ an empty replicated anchor, see the type)
 
 type SitemapEntry {
 	loc: String
@@ -656,5 +658,52 @@ type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 # this is belt-and-braces rather than load-bearing — but the database is new, and the next person to
 # set `replicate: false` on RawPage should not have to rediscover the issue.
 type RawPageAnchor @table(database: "raw_cache") @sealed {
+	id: Int @primaryKey
+}
+
+# THE ORIGIN'S OWN "THIS DOES NOT EXIST", kept so the next crawler asking for the same dead URL is
+# answered without asking the origin again (util/negativeCache.js). A dead product page is a full origin
+# page build, and crawlers re-ask for the same dead URLs on a fixed cadence — measured on one
+# deployment, about half of all repeat gaps fell between 50 and 60 minutes.
+#
+# NODE-LOCAL, hence `replicate: false`, for three reasons:
+#   - The traffic that repeats is pinned to one node by the traffic manager (one crawler's dead URLs
+#     landed 99% on one node in the measured deployment), so a replicated row would buy the other nodes
+#     nothing while costing every write a blob stream to each of them.
+#   - A row that is wrong is corrected where it is read: the background re-check and the proxied answer
+#     both run on the node that holds it. Nothing has to reach across the cluster to clear an entry.
+#   - Losing rows is harmless — the next request proxies and stores again — so there is no durability
+#     argument for the replication cost.
+#
+# Its own database, so these writes never queue behind a render's blob write (Harper serializes writes
+# per database) and a commit here never taxes a subscription on any other table.
+#
+# `checkedAt` is what the fresh window runs from: the last time the ORIGIN confirmed the status, by a
+# proxied answer or a background re-check. `storedAt` is when these bytes were fetched; a re-check is a
+# HEAD, so it moves `checkedAt` and leaves the body alone.
+#
+# DELIBERATELY NOT `@export`: a REST write verb here would let anything put a 404 under a cache key that
+# the serve path then hands to crawlers. The only writer is the miss path.
+#
+# `expiresAt` carries `@expiresAt`, so the stored timestamp (`checkedAt + render.negative.lifeMs`)
+# governs read-hiding and the cleanup sweep, exactly as on RawPage, and a patch that moves it re-stamps
+# the record's expiry. The 24h table expiration is only the FALLBACK for a row whose field is unreadable;
+# its quarter (6h) is the reclaim cadence.
+type NegativePage @table(database: "negative_cache", replicate: false, expiration: 86400) @sealed {
+	cacheKey: String @primaryKey
+	statusCode: Int!
+	# The origin's own response headers, filtered to `sanitizeOriginResponseHeaders`'s allowlist and
+	# without `content-length` — the same rule, and the same reason, as RawPage.headers.
+	headers: String
+	# The origin bytes VERBATIM, in the origin's own encoding (see RawPage.content).
+	content: Blob
+	storedAt: Date
+	checkedAt: Date
+	expiresAt: Date @expiresAt
+}
+
+# Same anchor, same reason as CoordinationAnchor and ProbeStateAnchor: NegativePage is `replicate: false`,
+# and a database with zero replicable tables spins the replication subscription (harper-pro#685).
+type NegativePageAnchor @table(database: "negative_cache") @sealed {
 	id: Int @primaryKey
 }

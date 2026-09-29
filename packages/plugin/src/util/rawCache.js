@@ -200,7 +200,7 @@ const cacheControlDirectives = (value) => {
  * — on the default path, where no `assumeShared` is set and nothing about behaviour was supposed to
  * change. A document whose origin said `private` was about to be replayed to every crawler.
  */
-const hasCacheControlDirective = (value, directive) => {
+export const hasCacheControlDirective = (value, directive) => {
 	const names = cacheControlDirectives(value);
 	if (names === null) return String(value).toLowerCase().includes(directive);
 	return names.has(directive);

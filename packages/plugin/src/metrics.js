@@ -116,6 +116,14 @@ const CACHE_STATUSES = Object.freeze([
 	// separable from an ordinary hit both ways round — an operator has to be able to see, at a
 	// glance, how much content is being served on evidence rather than on age.
 	'verified',
+	// The origin's own STORED 404/410 answered it (`render.negative`), inside its fresh window: the origin
+	// was not asked. Source `negative`, so offload counts it as spared — and not a hit: nothing was
+	// cached that anyone could render, and it must never read as coverage.
+	'negative',
+	// A stored 404/410 answered it AT ONCE while THIS request's background re-check went to the origin.
+	// Source `origin`, deliberately: the crawler did not wait, but the origin did the work, and offload
+	// is about the origin. One per `origin_fetch` reason `revalidate`.
+	'negative-revalidate',
 ]);
 
 const SERVE_SOURCES = Object.freeze([
@@ -123,6 +131,7 @@ const SERVE_SOURCES = Object.freeze([
 	'rendered', // an on-demand render landed inside the renderNow timeout
 	'origin', // proxied live to the origin — the request the offload number counts against
 	'raw', // a stored origin document (render.raw) — saved the round trip, but nothing rendered it
+	'negative', // the origin's stored 404/410 (render.negative), inside its fresh window — the origin was not asked
 ]);
 
 const DEVICE_TYPES = Object.freeze(['desktop', 'mobile', 'tablet']);
@@ -389,12 +398,15 @@ export const METRICS = Object.freeze({
 					'blob-missing',
 					'blob-timeout',
 					'render-timeout',
+					'revalidate',
 					'other',
 				],
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
-					'bypass (non-GET/HEAD), or render-timeout (a renderNow render did not land in time and the ' +
-					"origin was the fallback). 'other' is the emitter's default for a caller that passed no " +
+					'bypass (non-GET/HEAD), render-timeout (a renderNow render did not land in time and the ' +
+					'origin was the fallback), or revalidate (a background HEAD re-checking a stored 404/410 past its ' +
+					'fresh window, render.negative — one per bot_serve cacheStatus negative-revalidate). ' +
+					"'other' is the emitter's default for a caller that passed no " +
 					'reason — its presence is a bug in the caller, not a traffic category.',
 			},
 			type: { name: null, description: 'Unused (emitted as null).' },
@@ -532,14 +544,16 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js, util/entityGate.js',
+			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
 			'demand_*), per visit-ring re-union (demand_fill, demand_false_positive), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
-			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate)',
+			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
+			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
+			'stored 404 (negative_gap), per reopen decision (gone_reopen), per lifted suppression (suppression_lifted)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -579,7 +593,8 @@ export const METRICS = Object.freeze({
 			'line says which). ' +
 			'discovery_gated = cacheable misses whose target creation the discovery gate refused, split by ' +
 			'which gate (route flag vs bot allowlist) and by bot. This is gated MISSES, not denied mints — ' +
-			'a miss on an already-known target counts too — so read it as "traffic on URLs held out of the ' +
+			'a miss on an already-known target counts too, and so does a stale page\u2019s origin refetch (the gate ' +
+			'sees the origin 200, not the cache verdict; bot_miss counts true misses only) — so read it as "traffic on URLs held out of the ' +
 			'render rotation", the corpus growth the gate is preventing. The `entity` gate is the exception ' +
 			'in scope, not in meaning: it is evaluated only for a URL with NO target row, so its count is ' +
 			'refused mints, and it is emitted only when the gate is ARMED (a dry run records would-gate on ' +
@@ -606,6 +621,21 @@ export const METRICS = Object.freeze({
 			'the option documents. Read stored + stored-unshared as the store rate. vary-device is refused only ' +
 			'under render.raw.deviceIndependent: the origin named User-Agent or a client hint in Vary, i.e. ' +
 			'declared the document adaptive — any count means that option is wrong for this origin. ' +
+			'negative_cache = the negative cache (render.negative), one emit per event. Stores read like raw_cache ' +
+			'(stored + stored-unshared is the store rate; the refusals say why a route fills nothing). On read, ' +
+			'guarded-listed / guarded-target are stored 404s a Target overruled (the entry is dropped), bot-excluded ' +
+			'are requests from render.negative.excludeBots that found one. The re-checks are the recovery signal: ' +
+			'recheck-live counts stored 404s the origin now answers 200 for — each one dropped and its gone target ' +
+			'reopened — and recheck-busy is the per-worker cap shedding checks. IN A DRY RUN, would-serve is exactly ' +
+			'the origin requests arming would save, and would-serve-live is the risk: requests an armed cache would ' +
+			'have answered with a 404 while the origin, asked anyway, answered 200. Expect it near zero before arming. ' +
+			'negative_gap = milliseconds since the origin last confirmed a stored 404, sampled on every request that ' +
+			'found one: its distribution is the curve to choose render.negative.freshMs from (savings step at the ' +
+			"crawlers' re-ask period). gone_reopen = a proxied origin 200 for a gone-suppressed target: filed (its " +
+			'recheck due now), would-file (dry run), deduped, capped; the render verdict then decides, and ' +
+			'suppression_lifted is where a reopen that worked shows up. suppression_lifted = one emit per suppression ' +
+			'a render lifted, with the reason and how long it had held — the only measure of how often a verdict ' +
+			'turns out to have been temporary. ' +
 			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
 			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
@@ -616,7 +646,9 @@ export const METRICS = Object.freeze({
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
-			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated and entity_gate are counters; config_warnings is a slow gauge (latest value); ' +
+			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
+			'gone_reopen and suppression_lifted are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
 			'and climbs until the next one, so it is a sawtooth: averaging over a window reports the middle ' +
@@ -670,6 +702,11 @@ export const METRICS = Object.freeze({
 					'probe_cycle_behind',
 					'discovery_gated',
 					'entity_gate',
+					'raw_cache',
+					'negative_cache',
+					'negative_gap',
+					'gone_reopen',
+					'suppression_lifted',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -682,7 +719,11 @@ export const METRICS = Object.freeze({
 					'tracker\u2019s fill and false_positive sizing gauges. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
 					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
-					'entity_gate = entity discovery gate evaluations, by outcome.',
+					'entity_gate = entity discovery gate evaluations, by outcome. raw_cache = raw-document store ' +
+					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
+					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
+					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
+					'lifted, by reason and age.',
 			},
 			method: {
 				name: 'detail',
@@ -703,14 +744,24 @@ export const METRICS = Object.freeze({
 					'found a sibling URL of the same entity in rotation, armed gate only). entity_gate: the outcome ' +
 					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
-					'Other series: null.',
+					'negative_cache: the outcome — stored/stored-unshared; a refusal (has-cookie, private, no-store, ' +
+					'staging, no-body, empty, oversize, capture-failed, capture-busy, write-failed, skipped-listed, ' +
+					'skipped-target); a guard on read (guarded-listed, guarded-target, guard-error, invalidated, ' +
+					'bot-excluded, read-blob-failed); a background re-check (recheck-gone, recheck-live, recheck-moved, ' +
+					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
+					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
+					'suppression_lifted: the suppressedReason the render lifted (http-gone, noindex, ' +
+					'canonical-mismatch, ...). Other series: null.',
 			},
 			type: {
 				name: 'context',
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated and entity_gate: the bot name. Other series: null.',
+					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
+					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
+					'suppression_lifted: how long the target had been suppressed — <1h, <6h, <1d, <3d, <14d, 14d+, or ' +
+					'unknown. Other series: null.',
 			},
 		},
 	}),
@@ -910,6 +961,15 @@ export const metrics = Object.freeze({
 	 * a route that was assumed shared.
 	 */
 	rawCache: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'raw_cache', outcome, null),
+	/** One negative-cache event (render.negative): a store, a refusal, a read guard, a re-check, or a dry-run verdict. */
+	negativeCache: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'negative_cache', outcome, null),
+	/** Milliseconds since the origin last confirmed a stored 404, per request that found one — the freshMs curve. */
+	negativeGap: (ms) => server.recordAnalytics(ms, 'prerender_ops', 'negative_gap', null, null),
+	/** A gone-suppressed target seen answering 200 at the origin, and what was done about it. `via` = traffic | recheck. */
+	goneReopen: (outcome, via) => server.recordAnalytics(true, 'prerender_ops', 'gone_reopen', outcome, via),
+	/** A suppression a render lifted: the reason it had been suppressed for, and how long it held (a bucket). */
+	suppressionLifted: (reason, ageBucket) =>
+		server.recordAnalytics(true, 'prerender_ops', 'suppression_lifted', reason, ageBucket),
 
 	/**
 	 * One result posted in the single-device shape for a job that asked for several — a renderer

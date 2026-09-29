@@ -1,6 +1,7 @@
 import { getMutex } from '../util/coordination.js';
 import { config, onConfigApplied } from '../config.js';
-import { currentMinuteMs } from '../util/time.js';
+import { currentMinuteMs, dateColumnMs } from '../util/time.js';
+import { suppressionAgeBucket } from '../util/suppression.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
@@ -739,7 +740,15 @@ export class RenderQueue extends Resource {
 		const scheduleJob = refiledTo ? describeJob(refiledTo, refiledTo) : job;
 		const renderTarget = await Target.get({
 			id: scheduleUrl,
-			select: ['renderInterval', 'sitemapUrl', 'state', 'strikes', 'demandInterval'],
+			select: [
+				'renderInterval',
+				'sitemapUrl',
+				'state',
+				'strikes',
+				'demandInterval',
+				'suppressedReason',
+				'suppressedAt',
+			],
 		});
 		// No target here: a one-off, or a recurring row whose target has not reached this node. The
 		// latter must not store its pages — a page with no target is never re-rendered and never
@@ -977,6 +986,12 @@ export class RenderQueue extends Resource {
 			if (renderTarget.state === 'suppressed' && rendered.some((variant) => variant.isIndexable === true)) {
 				logger.info(`Prerendered url ${scheduleUrl} is indexable again — lifting its suppression`);
 				await Target.reactivate(scheduleUrl);
+				// How often a verdict turns out to have been temporary, and after how long — nothing else
+				// measures it, and it is what sizes a reopen trigger (util/goneReopen.js).
+				metrics.suppressionLifted(
+					renderTarget.suppressedReason ?? 'unknown',
+					suppressionAgeBucket(Date.now() - dateColumnMs(renderTarget.suppressedAt))
+				);
 			} else if (renderTarget.state !== 'suppressed' && renderTarget.strikes > 0) {
 				// Strikes are CONSECUTIVE failures by definition: a successful render resets the
 				// count, so redirect blips months apart never accumulate toward retirement.

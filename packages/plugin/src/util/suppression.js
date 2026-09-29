@@ -18,6 +18,27 @@ const GONE_STATUSES = new Set([404, 410]);
  */
 export const isGoneVerdict = (reason, statusCode) => reason === 'http-error' && GONE_STATUSES.has(statusCode);
 
+/** The `suppressedReason` a gone verdict stores (see `gradeSuppression`). */
+export const GONE_REASON = 'http-gone';
+
+/**
+ * How long a lifted suppression had held, as a closed set of buckets (a metric dimension, so it must stay
+ * bounded). The split that matters is minutes-to-hours against days: a verdict lifted within the hour is
+ * an origin flapping, one lifted after the full recheck is a page that really came back.
+ */
+export const suppressionAgeBucket = (ageMs) => {
+	if (!(ageMs >= 0)) return 'unknown';
+	if (ageMs < 3_600_000) return '<1h';
+	if (ageMs < 21_600_000) return '<6h';
+	if (ageMs < 86_400_000) return '<1d';
+	if (ageMs < 259_200_000) return '<3d';
+	if (ageMs < 1_209_600_000) return '<14d';
+	return '14d+';
+};
+
+/** Is this Target row suppressed by a 404/410 verdict? The only suppression an origin 200 can overturn. */
+export const isGoneSuppressed = (target) => target?.state === 'suppressed' && target?.suppressedReason === GONE_REASON;
+
 /**
  * WHY THE CEILING DEPENDS ON SITEMAP ATTRIBUTION, AND WHY ONLY FOR `gone`.
  *
@@ -59,7 +80,7 @@ export function gradeSuppression({ reason, statusCode, fromSitemap }) {
 	return {
 		gone,
 		// Stored as `http-gone` so the registry distinguishes "page vanished" from "page errored".
-		storedReason: gone ? 'http-gone' : (reason ?? null),
+		storedReason: gone ? GONE_REASON : (reason ?? null),
 		recheckInterval: knobs.recheckInterval,
 		maxStrikes: gone && !fromSitemap ? knobs.maxStrikesUnlisted : knobs.maxStrikes,
 	};

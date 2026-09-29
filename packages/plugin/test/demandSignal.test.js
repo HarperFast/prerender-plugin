@@ -153,6 +153,21 @@ test('a miss on a discovery-gated route is NOT demand — it owns no target and 
 	);
 });
 
+test('a stored 404 is NOT demand — nothing rendered it and no Target owns it (render.negative)', async (t) => {
+	// The raw-cache reasoning again: the rule "found a page row, therefore a Target exists" does not hold
+	// for an answer that came out of the negative cache, and counting dead URLs crawlers re-ask for hourly
+	// would fill the ring with exactly the population nothing will ever render.
+	for (const cacheStatus of ['negative', 'negative-revalidate']) {
+		await t.test(cacheStatus, async () => {
+			resetVisitFilter();
+			rows.clear();
+			sabs.clear();
+			resetHeldSabs();
+			assert.equal(await wasRecorded({ cacheStatus, resource: { statusCode: 404 } }), false);
+		});
+	}
+});
+
 test('a gated route still counts once the URL has a page row', async () => {
 	// The gate stops target CREATION, not cadence: a sitemap-declared URL on a gated route is a
 	// real target and must keep earning its rung.
