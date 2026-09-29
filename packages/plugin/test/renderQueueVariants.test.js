@@ -705,8 +705,9 @@ test('a CHANGED row keeps its mark through a failed render, and loses it when a 
 	// still being served from the origin. The render's own reschedule is what clears it.
 	const fast = config.render.failureRetry.fastRetries;
 	const changedAt = Date.now() - 60_000;
+	const demandPeriod = 6 * 3_600_000;
 	seedUrlRow({ strikes: fast });
-	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt, demandPeriod });
 	await claim();
 	const failure = (deviceType) => ({
 		deviceType,
@@ -717,6 +718,7 @@ test('a CHANGED row keeps its mark through a failed render, and loses it when a 
 	await postVariants(A, DEVICES.map(failure));
 	assert.ok(stores.renderSchedule.get(A).nextRenderTime > Date.now(), 'the slow lane backed off');
 	assert.equal(stores.renderSchedule.get(A).changedAt, changedAt, 'the mark rides the backoff');
+	assert.equal(stores.renderSchedule.get(A).demandPeriod, demandPeriod, 'and so does its demand estimate');
 
 	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), nextRenderTime: 1 });
 	await claim();
@@ -725,6 +727,7 @@ test('a CHANGED row keeps its mark through a failed render, and loses it when a 
 		DEVICES.map((d) => rendered(d))
 	);
 	assert.equal(stores.renderSchedule.get(A).changedAt, undefined, 'a landed render clears it');
+	assert.equal(stores.renderSchedule.get(A).demandPeriod, undefined, 'with its demand estimate');
 });
 
 // ───────────────────────────── one-device rows beside the rotation ─────────────────────────────

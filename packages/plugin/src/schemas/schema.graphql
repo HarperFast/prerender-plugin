@@ -188,6 +188,13 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# priority survives a restart. Every writer `put`s the row whole, so the render's reschedule clears
 	# it; a failed render's retry carries it forward (the page is still expired). NOT @indexed.
 	changedAt: Long
+	# How often bots ask for this page, as the demand tracker estimated it when the change was acted
+	# on (util/demand.js: ms between visits). Written only beside `changedAt` and cleared with it, and
+	# read only for a changed row: with `queue.ready.changedDemand` on, a changed page's wait is
+	# measured in these periods rather than in cadences, so the pages bots ask for most render first.
+	# Absent = the tracker could not say (off, cold, saturated); the row then orders by cadence.
+	# NOT @indexed.
+	demandPeriod: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
@@ -560,6 +567,10 @@ type VisitFilter @table(database: "crawl_stats") {
 	node: String
 	bits: Bytes
 	updatedAt: Date
+	# The ring shape the row was written under (`sliceMs|bitsPerSlice|hashes`, v0.95.1). Length alone
+	# cannot tell a row written with a different `hashes` from one of this shape; rows with another shape
+	# are neither merged nor counted as history. Absent on older rows, which are taken on length alone.
+	shape: String
 }
 
 # A cached ORIGIN DOCUMENT for a URL that is not in the render rotation — no browser, no render

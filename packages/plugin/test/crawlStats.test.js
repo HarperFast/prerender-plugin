@@ -25,7 +25,9 @@ let locks = [];
 const sabs = new Map();
 
 let recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET;
+let recordMissBreadth, mergeBreadthRow, finalizeMissUnion, MISS_SERIES_PREFIX;
 let estimateSketch, createSketch, addToSketch;
+let resetHeldSabs;
 let applyOptions;
 
 before(async () => {
@@ -74,7 +76,11 @@ before(async () => {
 		},
 	};
 	({ applyOptions } = await import('../src/config.js'));
+	({ resetHeldSabs } = await import('../src/util/coordination.js'));
 	({ recordCrawl, flushSketches, computeBreadth, resetCrawlStats, OVERFLOW_BUCKET } = await import(
+		'../src/util/crawlStats.js'
+	));
+	({ recordMissBreadth, mergeBreadthRow, finalizeMissUnion, MISS_SERIES_PREFIX } = await import(
 		'../src/util/crawlStats.js'
 	));
 	({ estimateSketch, createSketch, addToSketch } = await import('../src/util/hll.js'));
@@ -86,6 +92,7 @@ beforeEach(() => {
 	rows.clear();
 	locks = [];
 	sabs.clear();
+	resetHeldSabs();
 	mock.timers.reset();
 });
 
@@ -295,6 +302,7 @@ test('a restart with empty shared sketches cannot erase the registers already in
 	// must still read-merge, or the first post-restart flush replaces a full day of registers
 	// with only what this process has seen since boot.
 	sabs.clear();
+	resetHeldSabs();
 	resetCrawlStats();
 
 	recordCrawl('Googlebot', 'https://site.example.com/p/new');
@@ -319,6 +327,7 @@ test('precision sets the row size, and a mismatched stored row is ignored rather
 	// element-wise would be meaningless, so it must be ignored — the new-shape sketch wins and
 	// the day self-heals at rollover.
 	sabs.clear();
+	resetHeldSabs();
 	resetCrawlStats();
 	applyOptions({ crawlStats: { precision: 12 } });
 	recordCrawl('Googlebot', 'https://site.example.com/p/2');
@@ -327,4 +336,129 @@ test('precision sets the row size, and a mismatched stored row is ignored rather
 	const after = rows.get(`${today()}|Googlebot|node-a`);
 	assert.equal(after.registers.length, 1 << 12, 'rewritten at the new precision');
 	assert.ok(after.estimate >= 1, 'still a usable estimate rather than garbage from a bad merge');
+});
+
+// ── miss breadth: distinct missed URLs per cause (bot_request.js recordMiss) ─────────────────
+
+test('miss series are exempt from the bot cap, and a bot flood cannot fold a cause into ~overflow', async () => {
+	applyOptions({ crawlStats: { maxBotsPerThread: 2 } });
+	recordMissBreadth('not-found', 'https://site.example.com/gone');
+	recordMissBreadth('gated-route', 'https://site.example.com/c?facet=1');
+	// Two miss series exist already; the cap still admits two BOTS.
+	recordCrawl('Googlebot', 'https://site.example.com/a');
+	recordCrawl('Bingbot', 'https://site.example.com/b');
+	recordCrawl('SomeDerivedBot', 'https://site.example.com/c');
+	recordMissBreadth('new', 'https://site.example.com/fresh'); // past the cap, still its own series
+	await flushSketches();
+	assert.ok(rows.has(`${today()}|Googlebot|node-a`));
+	assert.ok(rows.has(`${today()}|Bingbot|node-a`));
+	assert.ok(rows.has(`${today()}|${OVERFLOW_BUCKET}|node-a`), 'the third bot overflowed');
+	for (const cause of ['not-found', 'gated-route', 'new']) {
+		assert.ok(rows.has(`${today()}|${MISS_SERIES_PREFIX}${cause}|node-a`), `${cause} kept its own series`);
+	}
+});
+
+test('breadth lists miss series apart from bots, and keeps them out of the crawler count', () => {
+	const urls = (from, to) => {
+		const s = createSketch();
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const [day] = computeBreadth([
+		{ day: '2026-08-04', bot: 'Googlebot', registers: urls(0, 1000) },
+		{ day: '2026-08-04', bot: `${MISS_SERIES_PREFIX}not-found`, registers: urls(0, 200) },
+	]);
+	assert.deepEqual(
+		day.bots.map((b) => b.bot),
+		['Googlebot'],
+		'a miss cause is not a crawler'
+	);
+	assert.equal(day.misses.length, 1);
+	assert.equal(day.misses[0].cause, 'not-found');
+	assert.ok(Math.abs(day.misses[0].distinctUrls - 200) / 200 <= 0.03);
+	assert.ok(Math.abs(day.total - 1000) / 1000 <= 0.03, 'total is the crawlers’ union');
+});
+
+test('missUnion counts a URL that missed on several days once — the "do they come back" number', () => {
+	const urls = (from, to) => {
+		const s = createSketch();
+		for (let i = from; i < to; i++) addToSketch(s, `https://site.example.com/p/${i}`);
+		return s;
+	};
+	const byDay = new Map();
+	// The same 500 dead URLs asked for on three days, and 300 new facet URLs each day.
+	for (const [n, d] of [
+		[0, '2026-08-02'],
+		[1, '2026-08-03'],
+		[2, '2026-08-04'],
+	]) {
+		mergeBreadthRow(byDay, { day: d, bot: `${MISS_SERIES_PREFIX}not-found`, registers: urls(0, 500) });
+		mergeBreadthRow(byDay, {
+			day: d,
+			bot: `${MISS_SERIES_PREFIX}gated-route`,
+			registers: urls(10_000 + n * 300, 10_300 + n * 300),
+		});
+	}
+	const union = Object.fromEntries(finalizeMissUnion(byDay).map((u) => [u.cause, u]));
+	assert.ok(Math.abs(union['not-found'].distinctUrls - 500) / 500 <= 0.03, 'recurring: the union is one day');
+	assert.ok(Math.abs(union['gated-route'].distinctUrls - 900) / 900 <= 0.03, 'one-offs: the union is the sum');
+	assert.equal(union['not-found'].days, 3);
+});
+
+test('a sketch only a losing worker saw is stored by that worker once two intervals overdue', async () => {
+	// The winner of the write turn stores only the (day, series) pairs IT has pending. A miss cause or
+	// a rare crawler seen only by a losing worker used to wait for that worker's day rollover, so
+	// intra-day breadth read short — measured on two workers, a miss cause at 0.
+	applyOptions({ crawlStats: { flushInterval: 60_000 } });
+	const now = Date.now();
+	recordMissBreadth('unrendered', 'https://site.example.com/p/1');
+	await flushSketches({ write: false, nowMs: now });
+	assert.equal(rows.has(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`), false, 'owed, not yet overdue');
+	await flushSketches({ write: false, nowMs: now + 60_000 });
+	assert.equal(
+		rows.has(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`),
+		false,
+		'one interval: the winner may still'
+	);
+	await flushSketches({ write: false, nowMs: now + 121_000 });
+	const row = rows.get(`${today()}|${MISS_SERIES_PREFIX}unrendered|node-a`);
+	assert.ok(row, 'two intervals overdue: stored by the worker that saw it');
+	assert.equal(row.estimate, 1);
+});
+
+test('a rollover with nothing dirty still pays the closed day’s debts before releasing its buffers', async (t) => {
+	// A rare series merged just before midnight on a turn this worker lost, and nothing dirty since:
+	// releasing the day's buffers at rollover before paying made the later payment read a fresh zeroed
+	// buffer and store an empty row. Model the free: a store that forgets any buffer nobody holds.
+	const store = globalThis.databases.coordination.SharedBuffer.primaryStore;
+	const original = store.getUserSharedBuffer;
+	store.getUserSharedBuffer = (_key, fresh) => fresh;
+	resetHeldSabs();
+	try {
+		t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-08-04T23:58:00Z') });
+		for (let i = 0; i < 50; i++) recordMissBreadth('unrendered', `https://site.example.com/p/${i}`);
+		await flushSketches({ write: false }); // merged, owed: a lost turn
+		t.mock.timers.setTime(Date.parse('2026-08-05T00:00:01Z'));
+		recordCrawl('Googlebot', 'https://site.example.com/new-day'); // rollover, nothing of that series dirty
+		await tick();
+		await tick();
+		const row = rows.get(`2026-08-04|${MISS_SERIES_PREFIX}unrendered|node-a`);
+		assert.ok(row, 'the closed day was paid at rollover');
+		assert.ok(Math.abs(row.estimate - 50) <= 2, `estimate ${row.estimate}`);
+	} finally {
+		store.getUserSharedBuffer = original;
+	}
+});
+
+test('under steady traffic a losing worker whose merges the winner keeps storing never writes', async () => {
+	applyOptions({ crawlStats: { flushInterval: 60_000 } });
+	const t0 = Date.parse(`${today()}T00:10:00Z`);
+	for (let tick = 0; tick < 12; tick++) {
+		recordMissBreadth('gated-route', `https://site.example.com/c/${tick}`);
+		await flushSketches({ write: false, nowMs: t0 + tick * 60_000 });
+		const key = [...sabs.keys()].find((k) => k.startsWith('crawlSketch/gen/') && k.endsWith('~miss:gated-route'));
+		const gen = new Int32Array(sabs.get(key));
+		Atomics.store(gen, 1, Atomics.load(gen, 0)); // the winner stored it within the interval
+	}
+	assert.equal(rows.size, 0, 'the loser never paid a debt the winner was paying');
 });

@@ -805,3 +805,98 @@ test('changed pages waiting: a Queue check judged by time to re-render, and abse
 	assert.equal(verdictOf(old), 'warn', '300 rows is 9m of renders, but one has waited 3h');
 	assert.match(old.textContent, /oldest 3h · ~9m to re-render/);
 });
+
+// ---- plugin v0.95.0: the demand tracker -----------------------------------------------------------
+//
+// A ring past demand.maxFalsePositive fails quietly: the tracker reports demand as unknown to changed-page
+// order, which falls back to cadence, and nothing else says so. `demand_false_positive` is the worst full
+// slot's fill^k, emitted per worker at every re-union — so the check reads its PEAK, never a mean.
+
+const demandConfigOf = ({ enabled = true, maxFalsePositive = 0.05, ladder = false } = {}) => ({
+	configFrom: 'node-a',
+	divergences: [],
+	sources: { answered: 2 },
+	schema: {
+		children: {
+			demand: {
+				children: {
+					enabled: { kind: 'option' },
+					maxFalsePositive: { kind: 'option' },
+					bitsPerSlice: { kind: 'option' },
+					hashes: { kind: 'option' },
+				},
+			},
+			render: { children: { demand: { children: { enabled: { kind: 'option' } } } } },
+		},
+	},
+	layers: [
+		{ path: 'demand.enabled', effective: enabled },
+		{ path: 'demand.maxFalsePositive', effective: maxFalsePositive },
+		{ path: 'demand.bitsPerSlice', effective: 1 << 20 },
+		{ path: 'demand.hashes', effective: 7 },
+		{ path: 'render.demand.enabled', effective: ladder },
+	],
+});
+
+/** A prerender_ops gauge whose per-bucket p95s are given; the range-wide mean sits well below the peak. */
+const gauge = (name, p95s) => ({
+	...combo('prerender_ops', name, null, null, 40, p95s.reduce((a, b) => a + b, 0) / p95s.length),
+	p95s,
+});
+const withGauges = (fp, fill = [0.3, 0.45, 0.2, 0.35]) => ({
+	...ANALYTICS,
+	series: [...ANALYTICS.series, gauge('demand_false_positive', fp), gauge('demand_fill', fill)],
+});
+
+test('demand tracker: off is not applicable, and a plugin without the tracker shows no tile at all', async () => {
+	const off = vital(draw(await ready({ config: demandConfigOf({ enabled: false }) })), 'Demand tracker');
+	assert.equal(verdictOf(off), 'na');
+	assert.match(off.textContent, /off/);
+	assert.match(off.textContent, /demand\.enabled is false/);
+	// No `demand.enabled` option: a plugin before v0.95.0. Hidden, not a tile of zeros.
+	const older = { configFrom: 'node-a', divergences: [], sources: { answered: 2 } };
+	assert.equal(vital(draw(await ready({ config: older, analytics: withGauges([0.3]) })), 'Demand tracker'), null);
+	assert.equal(vital(draw(await ready()), 'Demand tracker'), null, 'no config loaded: nothing to judge');
+});
+
+test('demand tracker: under the limit is ok, and the tile carries the limit and the fill peak', async () => {
+	const tile = vital(
+		draw(await ready({ config: demandConfigOf(), analytics: withGauges([0.004, 0.006, 0.005, 0.007]) })),
+		'Demand tracker'
+	);
+	assert.equal(verdictOf(tile), 'ok');
+	assert.match(tile.textContent, /0\.7%/, 'the peak, not the mean (0.55%)');
+	assert.match(tile.textContent, /limit 5\.0%/);
+	assert.match(tile.textContent, /fill 45%/, 'the fill sawtooth at its peak');
+});
+
+test('demand tracker: a peak past maxFalsePositive is a watch that says what it costs and how to size the ring', async () => {
+	// Mean 3.75%, under the limit — only the peak (12%) crosses it. A mean would have read healthy.
+	const root = draw(await ready({ config: demandConfigOf(), analytics: withGauges([0.01, 0.12, 0.01, 0.01]) }));
+	const tile = vital(root, 'Demand tracker');
+	assert.equal(verdictOf(tile), 'warn');
+	assert.match(tile.textContent, /12%/);
+	const detail = tile.attributes.title;
+	assert.match(detail, /Demand is unknown to changed-page order/);
+	assert.match(detail, /changed pages order by cadence/);
+	assert.match(detail, /demand\.bitsPerSlice/);
+	assert.match(detail, /n ≈ −\(m\/k\)·ln\(1 − fill\)/);
+	// fill = 0.12^(1/7) ≈ 0.739 in 2^20 bits at k = 7 holds ≈ 201k URLs; 5% at that load needs 2^21 bits.
+	assert.match(detail, /about 201k URLs per slice/);
+	assert.match(detail, /bitsPerSlice ≈ 2,097,152/);
+	assert.doesNotMatch(detail, /cadence ladder/, 'the ladder is off here');
+	const banner = find(root, (n) => (n.attributes?.class ?? '').startsWith('health-banner'));
+	assert.match(banner.textContent, /Demand tracker/);
+
+	const ladder = vital(
+		draw(await ready({ config: demandConfigOf({ ladder: true }), analytics: withGauges([0.3]) })),
+		'Demand tracker'
+	);
+	assert.match(ladder.attributes.title, /cadence ladder does not consult the limit/);
+});
+
+test('demand tracker: on, with no re-union in the range, is not applicable rather than a clean zero', async () => {
+	const tile = vital(draw(await ready({ config: demandConfigOf() })), 'Demand tracker');
+	assert.equal(verdictOf(tile), 'na');
+	assert.match(tile.textContent, /no re-union in range/);
+});

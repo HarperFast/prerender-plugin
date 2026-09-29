@@ -342,6 +342,118 @@ test('the changed flag is part of what is held: describe, heldValue and a cleari
 	assert.equal(keeper.describe(url('/pdp/b')).changed, true);
 });
 
+// ---- a changed row's demand (queue.ready.changedDemand) ------------------------------------------
+
+const putChangedDemand = (keeper, key, dueAt, demandPeriod) =>
+	keeper.apply(key, { nextRenderTime: dueAt, fromSitemap: true, changedAt: dueAt, demandPeriod });
+
+test('changedDemand: changed pages found together render most-asked-for first', () => {
+	// A change wave: three PDPs found changed in the same minute, an hour ago. In cadence they tie, and
+	// the order is whatever the minute bucket holds. In visits, the page asked for every 6h has sent
+	// the origin a sixth of a visit per hour of wait, the twice-a-week one a sixtieth.
+	const { keeper } = keeperAt();
+	putChangedDemand(keeper, url('/pdp/rare'), T0 - HOUR, 96 * HOUR);
+	putChangedDemand(keeper, url('/pdp/hot'), T0 - HOUR, 6 * HOUR);
+	putChangedDemand(keeper, url('/pdp/daily'), T0 - HOUR, 24 * HOUR);
+	const on = keeper.topK(10, { nowMs: T0, changedHeadStart: 1, changedDemand: true }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(on, [url('/pdp/hot'), url('/pdp/daily'), url('/pdp/rare')]);
+	const off = keeper.topK(10, { nowMs: T0, changedHeadStart: 1, changedDemand: false }).rows;
+	assert.equal(new Set(off.map((r) => r.score)).size, 1, 'off: one divisor, one score — demand is ignored');
+});
+
+test('changedDemand: a changed row with no demand estimate orders by cadence, as before', () => {
+	const { keeper } = keeperAt();
+	putChanged(keeper, url('/pdp/unknown'), T0 - 6 * HOUR); // no demandPeriod: the tracker could not say
+	const [row] = keeper.topK(10, { nowMs: T0, changedHeadStart: 1, changedDemand: true }).rows;
+	assert.equal(row.score, 6 / 48 + 1, 'lateness over the 48h cadence, plus the head start');
+});
+
+test('changedDemand: a changed page nobody asks for yields to a routine row at the same score', () => {
+	// A changed PDP with no visit in the tracker's 4-day window, 12h into its wait: 12/96 + 1 = 1.125 in
+	// visits, 12/48 + 1 = 1.25 in cadence. A routine PDP 1.2 cadences late (57h36m) sits between the two
+	// — still being served from the cache to the bots that ARE asking for it. Demand puts it first;
+	// cadence would not.
+	const { keeper } = keeperAt();
+	putChangedDemand(keeper, url('/pdp/unasked'), T0 - 12 * HOUR, 96 * HOUR);
+	put(keeper, url('/pdp/routine'), T0 - (57 * HOUR + 36 * MINUTE));
+	const order = (changedDemand) =>
+		keeper.topK(10, { nowMs: T0, changedHeadStart: 1, changedDemand }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(order(true), [url('/pdp/routine'), url('/pdp/unasked')]);
+	assert.deepEqual(order(false), [url('/pdp/unasked'), url('/pdp/routine')]);
+});
+
+test('changedDemand: the order is still exactly scoreOf, with demand periods in the mix', () => {
+	const { keeper } = keeperAt();
+	const rows = [];
+	const periods = [null, 6 * HOUR, 12 * HOUR, 24 * HOUR, 96 * HOUR];
+	for (let i = 0; i < 80; i++) {
+		const path = ['/home', '/pdp', '/cat'][i % 3];
+		const dueAt = T0 - (i % 19) * 41 * MINUTE;
+		const changed = i % 3 !== 1;
+		const demandPeriodMs = changed ? periods[i % periods.length] : null;
+		const fromSitemap = i % 4 !== 0;
+		const key = url(`${path}/${i}`);
+		keeper.apply(key, {
+			nextRenderTime: dueAt,
+			fromSitemap,
+			changedAt: changed ? dueAt : null,
+			// an unchanged row may carry a stale value; it must mean nothing
+			demandPeriod: demandPeriodMs ?? (changed ? null : 6 * HOUR),
+		});
+		rows.push({ key, dueAt, changed, fromSitemap, demandPeriodMs, cadenceMs: classify(key).cadenceMs });
+	}
+	const opts = { nowMs: T0, sitemapBoost: 2, changedHeadStart: 1, changedDemand: true };
+	const expected = rows
+		.map((r) =>
+			scoreOf(
+				{ dueAt: r.dueAt, fromSitemap: r.fromSitemap, changed: r.changed, demandPeriodMs: r.demandPeriodMs },
+				{ nowMs: T0, intervalMs: r.cadenceMs, sitemapBoost: 2, changedHeadStart: 1, changedDemand: true }
+			)
+		)
+		.sort((a, b) => b - a);
+	assert.deepEqual(
+		keeper.topK(200, opts).rows.map((r) => r.score),
+		expected
+	);
+});
+
+test('scoreOf: demand is the divisor only for a changed row, with the option on and a usable period', () => {
+	const at = { nowMs: T0, intervalMs: 48 * HOUR, changedHeadStart: 1, changedDemand: true };
+	const dueAt = T0 - 6 * HOUR;
+	assert.equal(scoreOf({ dueAt, changed: true, demandPeriodMs: 6 * HOUR }, at), 1 + 1, 'six hours of a 6h period');
+	assert.equal(
+		scoreOf({ dueAt, changed: true, demandPeriodMs: 6 * HOUR }, { ...at, changedDemand: false }),
+		6 / 48 + 1
+	);
+	assert.equal(scoreOf({ dueAt, changed: false, demandPeriodMs: 6 * HOUR }, at), 6 / 48, 'a routine row ignores it');
+	for (const unusable of [null, undefined, 0, -1, NaN]) {
+		assert.equal(scoreOf({ dueAt, changed: true, demandPeriodMs: unusable }, at), 6 / 48 + 1, `unusable ${unusable}`);
+	}
+	assert.equal(
+		scoreOf({ dueAt, changed: true, fromSitemap: true, demandPeriodMs: 6 * HOUR }, { ...at, sitemapBoost: 2 }),
+		2 + 1,
+		'the sitemap boost still multiplies the ratio'
+	);
+});
+
+test('a changed row carries its demand through describe, heldValue and the queue state', () => {
+	const { keeper } = keeperAt();
+	putChangedDemand(keeper, url('/pdp/a'), T0 - HOUR, 6 * HOUR);
+	putChangedDemand(keeper, url('/pdp/b'), T0 - 2 * HOUR, 6 * HOUR);
+	putChangedDemand(keeper, url('/pdp/c'), T0 - 3 * HOUR, 24 * HOUR);
+	putChanged(keeper, url('/pdp/d'), T0 - 4 * HOUR);
+	assert.equal(keeper.describe(url('/pdp/a')).demandPeriodMs, 6 * HOUR);
+	assert.equal(keeper.heldValue(url('/pdp/a')).demandPeriod, 6 * HOUR, 'a reclassify keeps the estimate');
+	assert.deepEqual(keeper.state(T0).changedByDemand, [
+		{ periodMs: 6 * HOUR, due: 2, oldestDueAt: T0 - 2 * HOUR },
+		{ periodMs: 24 * HOUR, due: 1, oldestDueAt: T0 - 3 * HOUR },
+		{ periodMs: null, due: 1, oldestDueAt: T0 - 4 * HOUR },
+	]);
+	// The render's reschedule `put`s the row without the mark: its demand goes with it.
+	put(keeper, url('/pdp/a'), T0 + 48 * HOUR);
+	assert.equal(keeper.describe(url('/pdp/a')).demandPeriodMs, null);
+});
+
 test('state counts due changed rows and flags their classes', () => {
 	const { keeper } = keeperAt();
 	putChanged(keeper, url('/pdp/a'), T0 - MINUTE);

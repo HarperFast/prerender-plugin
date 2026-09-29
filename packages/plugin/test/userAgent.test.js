@@ -159,18 +159,18 @@ test('botCountsAsDemand: the default counts every bot', () => {
 });
 
 test('botCountsAsDemand: a list gates case-insensitively and follows a live config change', () => {
-	applyOptions({ render: { demand: { bots: ['googlebot', 'Bingbot'] } } });
+	applyOptions({ demand: { bots: ['googlebot', 'Bingbot'] } });
 	assert.equal(botCountsAsDemand('Googlebot'), true);
 	assert.equal(botCountsAsDemand('BINGBOT'), true);
 	assert.equal(botCountsAsDemand('AhrefsBot'), false);
 	assert.equal(botCountsAsDemand('other'), false);
 	assert.equal(botCountsAsDemand(undefined), false);
-	applyOptions({ render: { demand: { bots: ['*'] } } });
+	applyOptions({ demand: { bots: ['*'] } });
 	assert.equal(botCountsAsDemand('AhrefsBot'), true);
 });
 
 test('botCountsAsDemand: an empty list stops the ladder seeing any demand at all', () => {
-	applyOptions({ render: { demand: { bots: [] } } });
+	applyOptions({ demand: { bots: [] } });
 	assert.equal(botCountsAsDemand('Googlebot'), false);
 	assert.equal(botCountsAsDemand('other'), false);
 });
@@ -178,7 +178,7 @@ test('botCountsAsDemand: an empty list stops the ladder seeing any demand at all
 // The two allowlists share a compile helper but must not share STATE: editing one cannot be
 // allowed to answer for the other, which is exactly what a single cached set would do.
 test('the discovery and demand allowlists are independent', () => {
-	applyOptions({ ingress: { discoveryBots: ['Googlebot'] }, render: { demand: { bots: ['Bingbot'] } } });
+	applyOptions({ ingress: { discoveryBots: ['Googlebot'] }, demand: { bots: ['Bingbot'] } });
 	assert.equal(botMayDiscover('Googlebot'), true);
 	assert.equal(botMayDiscover('Bingbot'), false);
 	assert.equal(botCountsAsDemand('Googlebot'), false);

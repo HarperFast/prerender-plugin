@@ -458,6 +458,13 @@ test('discovery, ARMED: a URL whose product has a target in rotation is not mint
 	assert.deepEqual(outcomes(), ['gated']);
 });
 
+test('discovery, ARMED: the refused mint is the miss cause gated-entity (bot_miss)', async () => {
+	put(`${ORIGIN}/product/prd-123/old-spelling.jsp`);
+	const told = [];
+	await handlePageScheduling(originMiss(U), route(), 'Googlebot', (cause) => told.push(cause));
+	assert.deepEqual(told, ['gated-entity']);
+});
+
 test('discovery, DRY RUN (the default): minted exactly as before, and counted', async () => {
 	configure({ gate: { dryRun: true } });
 	put(`${ORIGIN}/product/prd-123/old-spelling.jsp`);

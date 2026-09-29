@@ -447,3 +447,31 @@ test('an empty deviceTypes.default is refused at apply time and the default kept
 	assert.deepEqual(config.deviceTypes.default, ['mobile'], 'a non-empty list is honoured');
 	applyOptions({});
 });
+
+test('the cadence ladder on with the demand tracker off is a finding — the ladder would rest everything at base', () => {
+	applyOptions({ render: { demand: { enabled: true } } });
+	assert.ok(findingKeys().includes('demand.enabled'), 'ladder without tracker is reported');
+	applyOptions({ demand: { enabled: true }, render: { demand: { enabled: true } } });
+	assert.ok(!findingKeys().includes('demand.enabled'), 'both on: nothing to report');
+	applyOptions({ demand: { enabled: true } });
+	assert.ok(
+		!findingKeys().includes('demand.enabled'),
+		'a tracker with no ladder is fine (another consumer may read it)'
+	);
+	applyOptions({});
+});
+
+test('the demand tracker lives at demand.* — the old render.demand sizing keys are unknown keys now', async () => {
+	// A clean move (v0.95.0), no alias: an old-path key must be REPORTED, never silently applied or
+	// silently dropped.
+	const { resolveConfig } = await import('../src/config.js');
+	const moved = resolveConfig({ render: { demand: { bitsPerSlice: 1 << 22 } } });
+	assert.equal(moved.config.demand.bitsPerSlice, 1 << 20, 'not applied to the tracker');
+	assert.ok(
+		moved.warnings.some((w) => w.includes('Unknown configuration key') && w.includes('render.demand.bitsPerSlice')),
+		`reported: ${JSON.stringify(moved.warnings)}`
+	);
+	const current = resolveConfig({ demand: { bitsPerSlice: 1 << 22 } });
+	assert.equal(current.config.demand.bitsPerSlice, 1 << 22);
+	assert.deepEqual(current.warnings, []);
+});

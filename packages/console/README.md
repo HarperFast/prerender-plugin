@@ -157,18 +157,18 @@ browser ── same-origin (cookies, CSP 'self') ──▶ prerender-console com
 
 ## What it shows
 
-| View              | What it answers                                                                                                                                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Health**        | Is anything wrong? Every tile is a check with a verdict (ok / watch / bad), and anything not ok is listed in the banner. The landing page.                                                       |
-| **Traffic**       | What crawlers got: offload (gross and net), freshness relative to each route's cadence, the non-hit verdicts by fix, **traffic by instance**, origin load, crawlers, routes, gate, raw cache.    |
-| **Queue**         | Is the render machinery keeping up: cluster pause, backlog and time to clear, the **queue keeper** per node, lateness and flow, the **node table** (status, intent, throughput, pause), renders. |
-| **Sitemaps**      | Per-root ingest and check state, entries, and 24h walk counters.                                                                                                                                 |
-| **Corpus**        | Corpus counts, and the three manual per-node passes: schedule repair, discovered-target purge, key-rule orphan sweep.                                                                            |
-| **Invalidations** | Active scopes, preview-first record/clear, and what the active rows are doing (refused vs rescued).                                                                                              |
-| **Change probe**  | What the probe is doing now, per node, with health flags; last pass; canary; finished-pass counters.                                                                                             |
-| **Inspect**       | One URL end to end: resolved key, stored rows, cadence resolution, revalidate, the page cache table.                                                                                             |
-| **Config**        | The searchable index of every option: layers, overrides, divergence between nodes, pending restarts.                                                                                             |
-| **Metrics**       | The live metric catalog.                                                                                                                                                                         |
+| View              | What it answers                                                                                                                                                                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Health**        | Is anything wrong? Every tile is a check with a verdict (ok / watch / bad), and anything not ok is listed in the banner. The landing page.                                                                                                                    |
+| **Traffic**       | What crawlers got: offload (gross and net), freshness relative to each route's cadence, the non-hit verdicts by fix, **why requests missed** (plugin v0.95.0), **traffic by instance**, origin load, crawlers, routes, gate, raw cache.                       |
+| **Queue**         | Is the render machinery keeping up: cluster pause, backlog and time to clear, changed pages waiting and **their demand** (plugin v0.95.0), the **queue keeper** per node, lateness and flow, the **node table** (status, intent, throughput, pause), renders. |
+| **Sitemaps**      | Per-root ingest and check state, entries, and 24h walk counters.                                                                                                                                                                                              |
+| **Corpus**        | Corpus counts, and the three manual per-node passes: schedule repair, discovered-target purge, key-rule orphan sweep.                                                                                                                                         |
+| **Invalidations** | Active scopes, preview-first record/clear, and what the active rows are doing (refused vs rescued).                                                                                                                                                           |
+| **Change probe**  | What the probe is doing now, per node, with health flags; last pass; canary; finished-pass counters.                                                                                                                                                          |
+| **Inspect**       | One URL end to end: resolved key, stored rows, cadence resolution, revalidate, the page cache table.                                                                                                                                                          |
+| **Config**        | The searchable index of every option: layers, overrides, divergence between nodes, pending restarts.                                                                                                                                                          |
+| **Metrics**       | The live metric catalog.                                                                                                                                                                                                                                      |
 
 The API contract behind each view is in the plugin README's
 [Management API](../plugin/README.md#management-api-prerender_admin) section.
@@ -193,14 +193,14 @@ Thresholds are judgement calls set where a number stops being tail noise for a h
 in `views/health.js`, and the queue keeper's in `LIMITS` in `views/queue.js` (shared by both views). A system
 or keeper tile shows the **worst node**, never an average.
 
-| Group       | Checks                                                                                                                                                                                                                                                                                                                                                      |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures                                                                                                                                                                                                |
-| Rendering   | renders/h, failure share, render time                                                                                                                                                                                                                                                                                                                       |
-| Queue       | backlog **time to clear** (> 2h watch, > 8h bad), changed pages waiting (the oldest one's actual wait and the time to re-render the rest, same thresholds — plugin v0.94.0), queue keeper live on every node, keeper repairs (missed writes > 0 bad; rows gained in a membership change watch), keeper publish p95, render holds, stale claims, lease slots |
-| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation                                                                                                                                                                                                              |
-| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**                                                                                                                                                                                                           |
-| Maintenance | schedule repair, active invalidations                                                                                                                                                                                                                                                                                                                       |
+| Group       | Checks                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Serving     | bot serves/min, net offload (< 50% watch, < 0 bad), cache-served, coverage miss, staleness (median age ÷ cadence), 5xx share, cache-hit p95, origin failures                                                                                                                                                                                                                                                                                                                  |
+| Rendering   | renders/h, failure share, render time                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Queue       | backlog **time to clear** (> 2h watch, > 8h bad), changed pages waiting (the oldest one's actual wait and the time to re-render the rest, same thresholds — plugin v0.94.0), demand tracker (peak false-positive rate past `demand.maxFalsePositive` watch, tracker off n/a — plugin v0.95.0), queue keeper live on every node, keeper repairs (missed writes > 0 bad; rows gained in a membership change watch), keeper publish p95, render holds, stale claims, lease slots |
+| Cluster     | nodes responding, queue paused, replication, config agreement, pending restart, override watch, plugin version skew, analytics scan truncation                                                                                                                                                                                                                                                                                                                                |
+| System      | CPU (share of cores), memory available, swap-in (major faults/min), worker event loop, task latency, disk free, uptime — **needs plugin v0.92.0**                                                                                                                                                                                                                                                                                                                             |
+| Maintenance | schedule repair, active invalidations                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 System vitals come from Harper's own per-minute resource rows, which the plugin's analytics scan now keeps
 (same scan, no second walk), plus a point-in-time host block on `overview`. Against an older plugin the
@@ -234,9 +234,26 @@ sitemap fetches) ÷ crawler requests arrived`. Both sides are documents only —
   URL's next probe) and **time waited for an action slot** past 10% of a pass — backpressure, which looks
   like origin throttling from outside. The Queue view's **changed pages waiting** is how many of those
   pages are still served from the origin, and how long the oldest has waited.
+- **Why requests missed** (Traffic, plugin v0.95.0) gives every origin-served miss one cause (`bot_miss`), in
+  three families: **nothing to render** (the origin answered 404/410, 304 to a conditional GET, 3xx, another 4xx or 5xx), **held out by a
+  rule or setting** (passthrough, uncacheable, the route/bot/entity discovery gates, suppressed, and device — a
+  device outside `deviceTypes.default`, which the rotation never renders) and **waiting on a render** (new,
+  unrendered, and an on-demand render that did not land in time). Only the last is render capacity or order; it is a watch past 10% of bot
+  requests and bad past 25%. Per route and per bot for the top causes. **Load URL breadth** (the same
+  crawl-breadth read as Crawl breadth) adds each cause's distinct URLs, requests per URL — how often a missed
+  URL is asked for, i.e. what a render of it would serve — and recurrence (the days' distinct URLs over their
+  union: ~1 is new URLs daily, higher is the same URLs coming back). Requests per URL is computed over the
+  UTC days the range holds from their first minute (today, on a 24h range), all bots, and is `≈`: it divides an
+  analytics count, which Harper 5.2.x records only part of, by a sketch count, so it reads low there.
+- **Changed pages by demand** (Queue, plugin v0.95.0): the changed pages waiting, split by the demand estimate
+  each carries ("every 6h" … "≥ 4d / not visited", or unknown), and whether `queue.ready.changedDemand` is
+  ranking them by it — with it off, or `demand.enabled` off, they order by cadence and the card says so. The
+  Health view's **demand tracker** check is the ring's peak false-positive rate against
+  `demand.maxFalsePositive`: past it, demand is unknown to that ordering, and the check gives the fill-derived
+  sizing for `demand.bitsPerSlice` (n ≈ −(m/k)·ln(1 − fill)).
 
 Each domain view owns the options that govern the data it shows — `sitemap.*` under Sitemaps,
-`queue`/`render`/`scan` under Queue, `page`/`cacheKey` under Inspect, `analytics`/`crawlStats` under Traffic,
+`queue`/`render`/`demand`/`scan` under Queue, `page`/`cacheKey` under Inspect, `analytics`/`crawlStats` under Traffic,
 `invalidation` under Invalidations, `changeProbe` under Change probe — while Config remains exhaustive, so a
 setting can be found either by where it acts or by name.
 

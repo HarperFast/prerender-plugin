@@ -28,7 +28,7 @@ import { resolveInvalidation } from '../util/invalidation.js';
 import { maybeAccelerateHeal } from '../util/invalidationReenqueue.js';
 import { epochMsOf } from '../util/time.js';
 import { fileDueNow } from '../util/renderSchedule.js';
-import { recordCrawl } from '../util/crawlStats.js';
+import { recordCrawl, recordMissBreadth } from '../util/crawlStats.js';
 import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
@@ -62,7 +62,16 @@ export async function handleBotRequest(request) {
 		const info = { route, routeClass };
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
-		maybeSchedule(resource, routeClass, route, request.botName);
+		// WHY THIS MISS HAPPENED (`bot_miss`), for exactly the requests bot_serve counts as origin|miss.
+		// Decided by the scheduling path below, because that is where the reasons are: the gates, and —
+		// detached, after its Target read — whether the URL is new, waiting for a render, or suppressed.
+		const onMiss =
+			recordBots && info.cacheStatus === 'miss' && info.source === 'origin'
+				? (cause) => recordMiss(cause, { route: info.route, routeClass, cacheUrl, botName: request.botName })
+				: null;
+		maybeSchedule(resource, routeClass, route, request.botName, onMiss, {
+			renderTimedOut: info.renderNowStatus === 'timeout',
+		});
 		recordDemand({ resource, routeClass, route, cacheUrl, botName: request.botName, cacheStatus: info.cacheStatus });
 		// DEMAND-DRIVEN HEAL, default off and a no-op unless an invalidation is what cost this request
 		// its cache serve (`info.invalidatedBy` is set only when the epoch was consulted, which happens
@@ -435,6 +444,31 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	return rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
 }
 
+// WHY A MISS HAPPENED, one cause per origin-served miss: the `bot_miss` counter, and the same URL into
+// that cause's distinct-URL sketch (util/crawlStats.js), so requests per distinct URL — how often a
+// miss is a URL asked for AGAIN — can be read per cause. That second number is what decides whether a
+// class of misses is worth covering: a render serves the requests that come after it, and a URL asked
+// for once gets none. The causes are a closed set (metrics.js MISS_CAUSES).
+//
+// Exported for tests.
+export function recordMiss(cause, { route, routeClass, cacheUrl, botName }) {
+	metrics.botMiss(cause, route?.path ?? routeClass ?? 'unrouted', botName);
+	recordMissBreadth(cause, cacheUrl);
+}
+
+// The cause an origin status alone decides. A 200 is not decided here: the gates and the Target read
+// below say what kind of 200 miss it was.
+const statusCause = (statusCode) => {
+	if (statusCode === 404 || statusCode === 410) return 'not-found';
+	// A crawler's conditional GET the origin answered 304: the page is real and the crawler's copy is
+	// current, but we hold none. Not a redirect — the validators ride a plain miss to the origin.
+	if (statusCode === 304) return 'not-modified';
+	if (statusCode >= 300 && statusCode < 400) return 'redirect';
+	if (statusCode >= 400 && statusCode < 500) return 'client-error';
+	if (statusCode >= 200 && statusCode < 300) return 'uncacheable';
+	return 'origin-error';
+};
+
 // Schedule the URL for prerendering after a cacheable origin miss (a fresh 200 the caller
 // didn't already have cached). Only a `prerender` path is ever scheduled — which now also
 // covers what `excludePathPatterns` used to gate separately, since those patterns compile
@@ -449,17 +483,28 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 // ANOTHER URL of the same entity has a target, which is a read, and it only means anything for a URL
 // with no target of its own. So it runs inside handlePageScheduling, after the existing-row check —
 // still detached, still off the response.
-function maybeSchedule(resource, routeClass, route, botName) {
-	if (routeClass !== PRERENDER || !resource.miss || resource.statusCode !== 200) return;
+//
+// `onMiss`, when given, is told WHY this request missed (`recordMiss`) — exactly once, here for every
+// cause the gates decide and from `handlePageScheduling` for the rest. Exported for tests.
+export function maybeSchedule(resource, routeClass, route, botName, onMiss = null, { renderTimedOut = false } = {}) {
+	// An on-demand render that did not land in time missed for THAT reason, whatever its fallback
+	// answered with (the origin, or render-now's own 504): the cause is render latency, not the status
+	// the fallback happened to return. Scheduling below proceeds as it would have, untold.
+	if (renderTimedOut && onMiss) {
+		onMiss('render-timeout');
+		onMiss = null;
+	}
+	if (routeClass !== PRERENDER) return onMiss?.('passthrough');
+	if (!resource.miss || resource.statusCode !== 200) return onMiss?.(statusCause(resource.statusCode));
 	if (route && route.discoverTargets === false) {
 		metrics.discoveryGated('route', botName);
-		return;
+		return onMiss?.('gated-route');
 	}
 	if (!botMayDiscover(botName)) {
 		metrics.discoveryGated('bot', botName);
-		return;
+		return onMiss?.('gated-bot');
 	}
-	setImmediate(handlePageScheduling, resource, route, botName);
+	setImmediate(handlePageScheduling, resource, route, botName, onMiss);
 }
 
 // Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
@@ -470,9 +515,10 @@ function maybeSchedule(resource, routeClass, route, botName) {
 // is about to mint the Target that makes the URL real.
 const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
 
-// Demand signal for the render ladder (util/visitFilter.js -> util/demandLadder.js). Keyed on
-// the device-free URL, since cadence resolves per URL and dropping the device split halves the
-// distinct count the filter carries. No-op unless `render.demand.enabled`.
+// Demand signal: the demand tracker's visit ring (util/visitFilter.js), read by util/demand.js and
+// the cadence ladder (util/demandLadder.js). Keyed on the device-free URL, since cadence resolves per
+// URL and dropping the device split halves the distinct count the filter carries. No-op unless
+// `demand.enabled`.
 //
 // DELIBERATELY OUTSIDE the `recordBots` analytics gate: that gate is about analytics volume,
 // whereas this feeds scheduling — turning analytics down must not silently demote the corpus for
@@ -481,8 +527,8 @@ const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
 // BOTH GATES BELOW EXIST TO HOLD THE RING'S FILL FACTOR DOWN, and that is a correctness concern,
 // not a tidiness one. Fill sets the false-positive rate (~fill^k), and a saturated ring does not
 // fail loudly — it answers "visited" for everything, so the ladder promotes the whole corpus to
-// its floor and the visit signal stops being a signal. `bitsPerSlice` is sized for the URLs the
-// ladder can actually act on, so anything else recorded here is spent budget.
+// its floor and the visit signal stops being a signal. `bitsPerSlice` is sized for the URLs a
+// consumer can actually act on, so anything else recorded here is spent budget.
 //
 //   ROTATION. The ladder only ever probes URLs that own a Target. `cacheStatus` is the sharper
 //   test than `resource.miss`: 'stale', 'invalidated', 'blob-missing' and 'blob-timeout' all
@@ -493,7 +539,7 @@ const NO_PAGE_LOOKUP = new Set(['bypass', 'skip']);
 //   route is discovery-gated (combinatorial facet URLs, which own no Target and never will) or
 //   the origin returned no page (404s for URLs that predate the deployment).
 //
-//   BOT. `render.demand.bots`, mirroring `ingress.discoveryBots`. Cadence is render budget, so a
+//   BOT. `demand.bots`, mirroring `ingress.discoveryBots`. Cadence is render budget, so a
 //   deployment usually wants it allocated by the engines it serves rather than by every crawler
 //   that walks the corpus.
 export function recordDemand({ resource, routeClass, route, cacheUrl, botName, cacheStatus }) {
@@ -618,9 +664,25 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 }
 
 // Exported for tests, which drive the discovery mint end to end against a stubbed Target table.
-export async function handlePageScheduling(resource, route, botName) {
+//
+// `onMiss` (see maybeSchedule) is told the cause this path decides — once, whatever happens:
+//   uncacheable   a 200 that is not a prerender candidate (headers said not to cache it)
+//   new           no Target: minted now, first render jittered across the route's interval
+//   gated-entity  no Target, and the entity gate refused to mint one
+//   unrendered    an active Target with no page for this device yet — waiting for a render
+//   device        an active Target, but this device is not one it renders by default
+//   suppressed    a Target the render verdict suppressed (it re-checks itself on its own schedule)
+//   error         the read or the mint failed
+export async function handlePageScheduling(resource, route, botName, onMiss = null) {
+	let told = false;
+	const tell = (cause) => {
+		if (told) return;
+		told = true;
+		onMiss?.(cause);
+	};
 	try {
-		if (isPrerenderCandidate(resource)) {
+		if (!isPrerenderCandidate(resource)) tell('uncacheable');
+		else {
 			// resource.url is the origin-fetch URL built from the canonical half, so it is
 			// already route-filtered; canonicalize idempotently ('*' keeps it as-is) so this
 			// url-half equals the Target primary key.
@@ -630,14 +692,19 @@ export async function handlePageScheduling(resource, route, botName) {
 			// target is already in rotation, and a SUPPRESSED one is a render verdict saying
 			// "stop re-creating me" (it re-checks itself on its own schedule). Only a URL with
 			// no row at all is genuinely new.
-			const existingTarget = await Target.get({ id: canonicalUrl, select: 'url' });
-			if (!existingTarget) {
+			// `state` rides on the same point read (it tells a suppressed row from one in rotation).
+			const existingTarget = await Target.get({ id: canonicalUrl, select: ['url', 'state'] });
+			if (existingTarget) {
+				if (existingTarget.state === 'suppressed') tell('suppressed');
+				else if (resource.deviceType && !config.deviceTypes.default.includes(resource.deviceType)) tell('device');
+				else tell('unrendered');
+			} else {
 				// THE ENTITY GATE (util/entityGate.js): a URL whose product already has a target in rotation
 				// under another URL is not minted. Evaluated only here — traffic discovery — and only for a
 				// URL with no row, so a sitemap or any other creation path never meets it. Inert unless the
 				// route declares `entityPrefix`; under `ingress.entityGate.dryRun` it counts and mints anyway.
 				const { mint } = await evaluateEntityGate({ url: canonicalUrl, route, botName });
-				if (!mint) return;
+				if (!mint) return tell('gated-entity');
 				// No explicit time → Target.put jitters the first render across the interval,
 				// so a crawl that discovers many URLs at once doesn't stampede.
 				// Deliberately NO renderInterval: cadence is resolved at schedule time
@@ -645,9 +712,11 @@ export async function handlePageScheduling(resource, route, botName) {
 				// default here would freeze creation-time config into the row, which is
 				// exactly what made interval config changes non-retroactive.
 				await Target.put(canonicalUrl, {});
+				tell('new');
 			}
 		}
 	} catch (e) {
+		tell('error');
 		logger.error(e);
 	}
 }

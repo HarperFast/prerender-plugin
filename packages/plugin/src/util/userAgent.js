@@ -223,9 +223,9 @@ let demandSet = null; // lowercase Set, or null meaning "every bot" ('*' present
 let demandFrom; // the config array the current set was built from
 
 /**
- * Does a visit labeled `botName` count as demand for the render ladder?
+ * Does a visit labeled `botName` count as demand (the demand tracker, `demand.*`)?
  *
- * `render.demand.bots` has the same shape and matching rules as `ingress.discoveryBots`:
+ * `demand.bots` has the same shape and matching rules as `ingress.discoveryBots`:
  * `['*']` (default) counts every bot, `[]` counts none (every target rests at its route
  * cadence), a list counts exactly those, compared case-insensitively.
  *
@@ -235,9 +235,9 @@ let demandFrom; // the config array the current set was built from
  * in http_handlers/bot_request.js for why that is a correctness concern and not just a cost.
  */
 export const botCountsAsDemand = (botName) => {
-	if (config.render.demand.bots !== demandFrom) {
-		demandSet = compileAllowlist(config.render.demand.bots);
-		demandFrom = config.render.demand.bots;
+	if (config.demand.bots !== demandFrom) {
+		demandSet = compileAllowlist(config.demand.bots);
+		demandFrom = config.demand.bots;
 	}
 	if (demandSet === null) return true;
 	return typeof botName === 'string' && demandSet.has(botName.toLowerCase());

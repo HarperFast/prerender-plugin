@@ -47,10 +47,23 @@
  * DRY RUN. With `dryRun` on (the default), every decision is computed and counted but the
  * returned interval is the unchanged base — so a week of production traffic tells you the
  * steady-state level distribution, and therefore the render budget, BEFORE paying for it.
+ *
+ * A CONSUMER OF THE DEMAND TRACKER. Since v0.95.0 the visit ring and its sizing are `demand.*`
+ * (util/visitFilter.js, util/demand.js), and this module is one of the things that read it: it
+ * asks its membership questions directly, exactly as before the split, and its decisions did not
+ * move. It does not consult the tracker's saturation verdict (`demand.maxFalsePositive`) — that
+ * would have changed them. With the tracker off it rests every target at base (`off`).
  */
 
 import { config, onConfigApplied } from '../config.js';
-import { visitedWithin, visitedInEachWindow, mergedReady, ensureMerged, newestFill } from './visitFilter.js';
+import {
+	visitedWithin,
+	visitedInEachWindow,
+	mergedWarm,
+	historyFromMs,
+	ensureMerged,
+	newestFill,
+} from './visitFilter.js';
 import { demandFloorFor } from './routeClass.js';
 import { metrics } from '../metrics.js';
 
@@ -124,8 +137,20 @@ export const rungIndexOf = (current, list = rungs()) => {
  * The visit-filter seam. Injected so the ladder's decision logic — which is all of the
  * subtlety here — is unit-testable without a warm Bloom ring or Harper globals behind it.
  */
+/**
+ * Ready once the union holds a refresh AND, after a reshape of the ring, a full slowest-rung window
+ * of new-shape history exists: an empty slot from before the reshape would read as "nobody
+ * visited" and demote the corpus.
+ */
+const ringReady = (nowMs = Date.now()) => {
+	if (!mergedWarm()) return false;
+	const since = historyFromMs();
+	if (!since) return true;
+	return nowMs >= since + (cachedRungs.length ? cachedRungs[cachedRungs.length - 1] : 0);
+};
+
 export const visitProbe = {
-	ready: mergedReady,
+	ready: ringReady,
 	warm: ensureMerged,
 	within: visitedWithin,
 	eachWindow: visitedInEachWindow,
@@ -172,7 +197,10 @@ const bump = (interval) => stats.levels.set(interval, (stats.levels.get(interval
 export function decideInterval(url, base, current, nowMs = Date.now(), probe = visitProbe) {
 	const demand = config.render.demand;
 
-	if (!demand.enabled || !cachedRungs.length) return { interval: base, level: base, action: 'off' };
+	// No tracker, nothing to decide on: the ladder is inert rather than cold, since no amount of
+	// waiting will warm a ring that records nothing.
+	if (!demand.enabled || !config.demand.enabled || !cachedRungs.length)
+		return { interval: base, level: base, action: 'off' };
 	armDemandStats();
 
 	// The rungs this base can actually occupy: everything faster than it, plus base itself
@@ -306,15 +334,16 @@ export function logDemandStats() {
 	// the workers with the least evidence. Summing counters and dividing at query time is
 	// correct across workers AND across nodes, which a gauge can never be.
 	try {
-		metrics.demandLadder(s.promoted, 'promoted');
-		metrics.demandLadder(s.demoted, 'demoted');
-		metrics.demandLadder(s.held, 'held');
-		metrics.demandLadder(s.skippedCold, 'skipped_cold');
-		metrics.demandLadder(s.singleRung, 'single_rung');
-		metrics.demandLadder(s.promotedFast, 'promoted_fast');
-		metrics.demandLadder(s.fast, 'fast');
-		metrics.demandLadder(s.graded, 'graded');
-		metrics.demandLadder(fill, 'fill');
+		metrics.demand(s.promoted, 'promoted');
+		metrics.demand(s.demoted, 'demoted');
+		metrics.demand(s.held, 'held');
+		metrics.demand(s.skippedCold, 'skipped_cold');
+		metrics.demand(s.singleRung, 'single_rung');
+		metrics.demand(s.promotedFast, 'promoted_fast');
+		metrics.demand(s.fast, 'fast');
+		metrics.demand(s.graded, 'graded');
+		// `demand_fill` is the tracker's own series now, emitted at every re-union
+		// (util/visitFilter.js) whether or not this ladder is on.
 	} catch (e) {
 		logger.warn(`[prerender] demand_ladder metrics not recorded: ${e?.message ?? String(e)}`);
 	}

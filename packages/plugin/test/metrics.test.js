@@ -111,19 +111,32 @@ test('render carries both the duration and the outcome, so the render panel read
 	assert.deepEqual(t, { value: 9600, metric: 'render', path: 'time_ms', method: 200, type: 'candidate' });
 });
 
-test('queue_health puts the series in the path slot; the ladder is a prerender_ops demand_* series', () => {
+test('queue_health puts the series in the path slot; demand is a prerender_ops demand_* series', () => {
 	const q = emitted(() => metrics.queueHealth(42, 'overdue'));
 	assert.deepEqual([q.value, q.metric, q.path], [42, 'queue_health', 'overdue']);
-	const d = emitted(() => metrics.demandLadder(0.03, 'fill'));
+	const d = emitted(() => metrics.demand(0.03, 'fill'));
 	assert.deepEqual([d.value, d.metric, d.path], [0.03, 'prerender_ops', 'demand_fill']);
 });
 
-test('every ladder series the emitter can produce is declared on prerender_ops', () => {
+test('every demand series the emitters can produce is declared on prerender_ops', () => {
+	// the ladder's decision counters, and the tracker's two sizing gauges
 	const series = ['promoted', 'demoted', 'held', 'skipped_cold', 'single_rung', 'promoted_fast', 'fast', 'graded'];
-	for (const s of [...series, 'fill']) {
-		const e = emitted(() => metrics.demandLadder(1, s));
+	for (const s of [...series, 'fill', 'false_positive']) {
+		const e = emitted(() => metrics.demand(1, s));
 		assert.ok(METRICS.prerender_ops.dimensions.path.values.includes(e.path), `prerender_ops missing ${e.path}`);
 	}
+});
+
+test('bot_miss puts the cause in the path slot, the route in method, the bot in type', () => {
+	const e = emitted(() => metrics.botMiss('not-found', '/product/prd-', 'Googlebot'));
+	assert.deepEqual(e, {
+		value: true,
+		metric: 'bot_miss',
+		path: 'not-found',
+		method: '/product/prd-',
+		type: 'Googlebot',
+	});
+	assert.ok(METRICS.bot_miss.dimensions.path.values.includes('not-found'));
 });
 
 test('invalidation_reenqueue normalizes a missing scope to null rather than dropping the slot', () => {

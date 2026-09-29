@@ -1,7 +1,8 @@
 /**
  * Visit filter — "was this URL visited by a bot in the last N hours?", as a ring of Bloom
- * slices. The demand ladder (util/demandLadder.js) reads it to decide whether a target's
- * render cadence should move up or down; nothing else depends on it.
+ * slices. The storage behind the DEMAND TRACKER (`demand.*`): `util/demand.js` turns it into a
+ * demand level per URL, and the cadence ladder (util/demandLadder.js) asks it membership
+ * questions directly, as it always has.
  *
  * WHY A BLOOM FILTER AND NOT A `lastVisitedAt` COLUMN. The obvious design is a timestamp on
  * Target, which the reschedule path already reads for free. It does not survive the traffic
@@ -18,8 +19,8 @@
  * default — so sixteen workers rewriting it every interval is ~2 MB per slot per interval of
  * REPLICATED transaction log for one row's worth of state. Measured on production: 1.2 GB of
  * transaction logs behind 18 MB of live data, the largest log corpus on the cluster (#87).
- * Workers now merge into a node-shared buffer (`sharedSlice`) and exactly one of them writes
- * per interval (`claimWriteTurn`), which is the same stored state for 1/N of the log volume.
+ * Workers now set their bits in one node-shared slice and exactly one of them stores it per
+ * interval (`claimTurn`), which is the same stored state for 1/N of the log volume.
  * Any future change here should price the BYTES on the replicated path, not the operations.
  *
  * WHY FALSE POSITIVES ARE THE SAFE ERROR. A false positive says "visited" for a URL nobody
@@ -40,20 +41,37 @@
  * targets and test each, or use a different structure. This is why the ladder adjusts cadence
  * per-target at reschedule time rather than driving a sweep.
  *
- * SHAPE. Mirrors util/crawlStats.js exactly: per-thread slices accumulate in memory, a timer
- * merges them into this node's row (`slot|node`) under the cross-worker mutex, and rows
- * replicate so any node can answer. Reads merge every node's row for the slots they need,
- * cached in-memory and refreshed on a timer — the reschedule path runs ~20x/s and must not
- * pay a multi-row read per job result.
+ * SHAPE (v0.95.1). ONE COPY PER NODE of everything, in shared memory:
  *
- * Hot-path cost (recordVisit): one number compare for slot rollover, k = 7 int32 hash rounds
- * over the URL, k byte writes. No allocation, no await, no storage touch.
+ *   - WRITE: every worker sets its visits' bits straight into the node-shared LIVE slice for the
+ *     current slot (`live`), and one worker per `flushInterval` — whoever claims the turn — stores
+ *     every slot whose bits moved since its last store to this node's row (`slot|node`). Rows
+ *     replicate, so any node can answer.
+ *   - READ: one node-shared UNION per slot (`union`), the OR of every node's stored rows, kept by
+ *     one worker per `mergeInterval` and refreshed INCREMENTALLY: it projects the ring's rows to their
+ *     versions (`updatedAt`) and fetches and merges the bits only of rows that changed — in steady
+ *     traffic, the current slot's row from each node. (Whether the projection spares the storage
+ *     read of each row's value is up to the store; what it certainly spares is the decode and the
+ *     merge, and it happens once per node rather than once per worker.)
+ *
+ * Before v0.95.1 every worker kept its own copy of both: thread-local write slices merged into the
+ * shared one at each flush, and a full union rebuilt from every row of the ring each merge interval.
+ * At 16 workers that was 16 copies of the ring in memory and 16 full re-reads per interval — the
+ * cost that scaled with `bitsPerSlice` and made a larger, less saturated ring expensive. Writing
+ * straight into shared memory also removes the question of which worker still owes a store: the
+ * bits are the node's the moment they are set.
+ *
+ * Hot-path cost (recordVisit): one number compare for slot rollover, two fnv1a32 hashes, k byte
+ * reads, and an atomic OR only for a bit not already set (a repeat visit writes nothing). No
+ * allocation, no await, no storage touch.
  */
 
 import { setImmediate } from 'node:timers/promises';
 import { config, onConfigApplied } from '../config.js';
-import { getMutex, getSab } from './coordination.js';
+import { getMutex, getSab, releaseSabs } from './coordination.js';
+import { runDetached } from './detach.js';
 import { fnv1a32 } from './hash.js';
+import { metrics } from '../metrics.js';
 
 const table = () => databases.crawl_stats.VisitFilter;
 
@@ -70,8 +88,23 @@ const bitsFor = (url, bitCount, k, out) => {
 	return out;
 };
 
-const setBits = (bytes, idx, k) => {
-	for (let i = 0; i < k; i++) bytes[idx[i] >>> 3] |= 1 << (idx[i] & 7);
+/**
+ * Set `url`'s bits in a slice other workers are setting too. `Atomics.or`, never `|=`: a plain
+ * read-modify-write can drop a sibling's bit in the same byte, and a dropped bit is a false NEGATIVE,
+ * the one error direction this filter must not make. A bit already set is only read, so a repeat
+ * visit costs no atomic write. Returns whether any bit was newly set.
+ */
+const setSharedBits = (bytes, idx, k) => {
+	let set = false;
+	for (let i = 0; i < k; i++) {
+		const at = idx[i] >>> 3;
+		const mask = 1 << (idx[i] & 7);
+		if (!(bytes[at] & mask)) {
+			Atomics.or(bytes, at, mask);
+			set = true;
+		}
+	}
+	return set;
 };
 
 const hasBits = (bytes, idx, k) => {
@@ -81,17 +114,16 @@ const hasBits = (bytes, idx, k) => {
 
 // ---------------------------------------------------------------------------- write side
 
-let slices = new Map(); // slot -> Uint8Array (this thread's observations for that slot)
-const dirty = new Set(); // slots with unmerged thread-local bits
-const pendingWrite = new Set(); // slots merged into the shared buffer but not yet stored
 let slot = null; // the ring slot the clock is currently in
 let slotEndMs = 0; // rollover boundary, so the hot path compares one number
+let liveNow = null; // this worker's view of the current slot's live slice (and its generation)
+const liveHeld = new Set(); // slots whose live slice this worker holds (see `rollover`)
 let flushTimer = null;
 let armedFlushInterval = null;
 const scratch = new Int32Array(32); // reused index buffer; k is bounded well below 32
 
-const sliceMs = () => config.render.demand.sliceMs;
-const sliceCount = () => config.render.demand.slices;
+const sliceMs = () => config.demand.sliceMs;
+const sliceCount = () => config.demand.slices;
 // bitsPerSlice, normalized UP to a power of two (memoized on the raw config value — one
 // compare on the hot path). Two things depend on the normalization, not just prefer it:
 //   - byte sizing: a non-multiple-of-8 count would truncate at `>>> 3`, and bits past the
@@ -102,7 +134,7 @@ const sliceCount = () => config.render.demand.slices;
 let bcRaw = 0;
 let bcNorm = 0;
 const bitCount = () => {
-	const raw = config.render.demand.bitsPerSlice;
+	const raw = config.demand.bitsPerSlice;
 	if (raw !== bcRaw) {
 		bcRaw = raw;
 		bcNorm = 1024;
@@ -110,12 +142,55 @@ const bitCount = () => {
 	}
 	return bcNorm;
 };
-const hashes = () => Math.min(config.render.demand.hashes, scratch.length);
+const hashes = () => Math.min(config.demand.hashes, scratch.length);
 
 /** Ring slot for a wall-clock time. Monotonic, so slot order is comparable modulo the ring. */
 export const slotOf = (ms) => Math.floor(ms / sliceMs());
 
-const newSlice = () => new Uint8Array(bitCount() >>> 3);
+// ── THE NODE'S SHARED STATE ─────────────────────────────────────────────────────────────────
+//
+// Every key carries the SHAPE (see `shapeOf`) and, per slot, the ABSOLUTE slot number — never a ring
+// position. A ring-position key would have to be zeroed on wrap, and zeroing a buffer other workers may
+// be setting bits in is exactly the race that loses bits. Absolute keys are written for one slot's life
+// and released when it leaves the ring (`ageOut`). coordination.js holds every buffer it hands out: on
+// Harper 5.2 an unreferenced shared buffer is freed and re-fetched as zeros.
+//
+// ITS OWN NAMESPACE, `visitRing/`. v0.95.0 kept `visitFilter/{bits,gen,turn}/…` at other sizes, and a
+// shared buffer keeps the size of its FIRST allocation for as long as any worker holds it — so a worker
+// on this layout loaded beside one on the old (a worker restart inside a running process) would get the
+// old size back and throw on every store.
+//
+//   live/<slot>   this node's bits for the slot, set by every worker
+//   gen/<slot>    Int32 [set, stored]: `set` counts changes to the live slice, `stored` is the `set`
+//                 value the last store read before copying it
+//   union/<slot>  the OR of every node's stored row for the slot
+//   ctl           Int32 [writeTurn, refreshTurn]  — the two one-worker-per-interval turns
+//   stats         Float64 [mergedAt, newestFill, worstFill, worstFalsePositive, firstSlot + 1]
+const RING = 'visitRing';
+const bytesOf = (shape) => Number(shape.split('|')[1]) >>> 3;
+const liveSlice = (s, shape = shapeOf()) => new Uint8Array(getSab(`${RING}/live/${shape}/${s}`, bytesOf(shape)));
+const generationOf = (s, shape = shapeOf()) => new Int32Array(getSab(`${RING}/gen/${shape}/${s}`, 8));
+const unionSlice = (s, shape = shapeOf()) => new Uint8Array(getSab(`${RING}/union/${shape}/${s}`, bytesOf(shape)));
+const control = (shape = shapeOf()) => new Int32Array(getSab(`${RING}/ctl/${shape}`, 8));
+const STATS_MERGED_AT = 0;
+const STATS_NEWEST_FILL = 1;
+const STATS_WORST_FILL = 2;
+const STATS_WORST_FP = 3;
+// The first slot any node stored a row of THIS shape for, plus one (0 = none yet). Counted only from
+// rows of the right length: a restart with a new `bitsPerSlice` leaves old-shape rows in the ring, and
+// counting them made a tracker with an hour of history answer as if it had eleven.
+const STATS_FIRST_SLOT = 4;
+// Read by the ladder's log line and readiness check, which also run where no store exists (early boot,
+// unit tests of the ladder alone): there the answer is "never refreshed", all zeros.
+const NO_STATS = new Float64Array(5);
+const stats = (shape = shapeOf()) => {
+	try {
+		return new Float64Array(getSab(`${RING}/stats/${shape}`, 40));
+	} catch {
+		return NO_STATS;
+	}
+};
+const firstSlotOf = (shared) => (shared[STATS_FIRST_SLOT] > 0 ? shared[STATS_FIRST_SLOT] - 1 : Infinity);
 
 /**
  * Observe one bot visit. Called on the serving path; synchronous by design.
@@ -123,18 +198,20 @@ const newSlice = () => new Uint8Array(bitCount() >>> 3);
  * resolves per URL, and dropping the device split halves the distinct count the filter holds.
  */
 export function recordVisit(url) {
-	if (!config.render.demand.enabled) return;
+	if (!config.demand.enabled) return;
 
 	const now = Date.now();
 	if (now >= slotEndMs) rollover(now);
 
-	let bytes = slices.get(slot);
-	if (!bytes) {
-		bytes = newSlice();
-		slices.set(slot, bytes);
+	if (!liveNow) {
+		liveNow = { bytes: liveSlice(slot), generation: generationOf(slot) };
+		liveHeld.add(slot);
 	}
-	setBits(bytes, bitsFor(url, bitCount(), hashes(), scratch), hashes());
-	dirty.add(slot);
+	if (setSharedBits(liveNow.bytes, bitsFor(url, bitCount(), hashes(), scratch), hashes())) {
+		// AFTER the bits: a store that reads `set` and then copies the slice either sees this change's
+		// count and its bits, or not the count — and then stores again next interval.
+		Atomics.add(liveNow.generation, 0, 1);
+	}
 
 	if (!flushTimer) armFlushTimer();
 }
@@ -142,16 +219,59 @@ export function recordVisit(url) {
 function rollover(now) {
 	slot = slotOf(now);
 	slotEndMs = (slot + 1) * sliceMs();
-	// Drop in-memory slices that have aged out of the ring; one worker per node also sweeps
-	// their persisted rows (same division of labor as crawlStats' day rollover — the sweep is
-	// setImmediate'd off the hot path and bounded by `limit`).
-	const oldest = slot - sliceCount();
-	for (const s of slices.keys()) if (s <= oldest) slices.delete(s);
-	// Aged-out slots can no longer be answered by any probe, so an unwritten one is dead debt;
-	// dropping it keeps the set bounded by the ring rather than by uptime.
-	for (const s of pendingWrite) if (s <= oldest) pendingWrite.delete(s);
+	liveNow = null;
+	ageOut(now);
+}
+
+/**
+ * Let go of what has aged out of the ring — from EVERY entry point, not only a recorded visit: a worker
+ * that answers questions or refreshes the union but never records one (a node the counted bots do not
+ * reach) would otherwise hold a union slice per elapsed slot for the life of the process. Once per slot
+ * per worker; one worker per node also sweeps the aged rows (bounded, off the hot path).
+ */
+let agedAt = null;
+function ageOut(nowMs) {
+	const current = slotOf(nowMs);
+	// Forward only: a caller holding an older clock (an action that read the time before its awaits)
+	// must not rewind it and make the next fresh call redo all of this.
+	if (agedAt !== null && current <= agedAt) return;
+	agedAt = current;
+	const shape = shapeOf();
+	// ONE SLOT PAST THE RING is kept: the promotion test's second window starts in the partial slot just
+	// outside it at the defaults (16 x 6h = 96h = promoteWindows 2 x 48h), and a visit there must still be
+	// readable. Everything older goes.
+	const oldest = current - sliceCount() - 1;
+	const ours = `${RING}/`;
+	releaseSabs((key) => {
+		if (!key.startsWith(ours) || !key.includes(`/${shape}/`)) return false;
+		const kind = key.slice(ours.length, key.indexOf('/', ours.length));
+		const slotOfKey = Number(key.slice(key.lastIndexOf('/') + 1));
+		return (kind === 'live' || kind === 'gen' || kind === 'union') && Number.isFinite(slotOfKey) && slotOfKey <= oldest;
+	});
+	for (const [id, seen] of seenVersions) if (seen.slot <= oldest) seenVersions.delete(id);
+	// A LIVE slice is only needed until it is stored: nothing sets bits in a slot once it has ended
+	// (every worker rolls over before its next visit), and after its last store the row carries it.
+	// So this worker lets go of a live slice two slots back once `stored` has caught up with `set` —
+	// never before, or an unstored slice would be freed with its bits. Keeps the node at about two live
+	// slices instead of the whole ring.
+	for (const s of liveHeld) {
+		if (s >= current - 1) continue;
+		if (s > oldest) {
+			const generation = generationOf(s, shape);
+			if (Atomics.load(generation, 1) < Atomics.load(generation, 0)) continue;
+		}
+		const key = `${RING}/live/${shape}/${s}`;
+		releaseSabs((k) => k === key);
+		liveHeld.delete(s);
+	}
 	if (server.workerIndex === 0) {
-		setImmediate().then(() => sweepExpired(oldest).catch((e) => logger.error(e)));
+		// Detached (util/detach.js): this can run on any entry point, including a read inside a render
+		// result's request, and the deletes must not ride on — or abort with — that request's transaction.
+		const cutoff = oldest + 1; // rows below the one retained slot
+		runDetached(async () => {
+			await setImmediate();
+			await sweepExpired(cutoff);
+		}).catch((e) => logger.error(e));
 	}
 }
 
@@ -178,51 +298,47 @@ export async function sweepExpired(cutoffSlot, nowSlot = slotOf(Date.now())) {
 }
 
 const armFlushTimer = () => {
-	armedFlushInterval = config.render.demand.flushInterval;
-	// Every worker MERGES on every tick; only the interval's winner also WRITES. See
-	// `claimWriteTurn` — the dedup lives here rather than inside `flushSlices` so that explicit
-	// calls (the disable path below, shutdown, tests) always persist.
-	flushTimer = setInterval(
-		() => flushSlices({ write: claimWriteTurn() }).catch((e) => logger.error(e)),
-		armedFlushInterval
+	armedFlushInterval = config.demand.flushInterval;
+	// Every worker ticks; only the interval's winner stores (`claimTurn`). The dedup lives here
+	// rather than inside `flushSlices` so that explicit calls (the disable path below, tests) always
+	// persist.
+	// Armed OUTSIDE whatever request recorded the first visit (util/detach.js): an interval created
+	// inside a request runs every tick in that request's long-closed context.
+	flushTimer = runDetached(() =>
+		setInterval(
+			() => flushSlices({ write: claimTurn(0, config.demand.flushInterval) }).catch((e) => logger.error(e)),
+			armedFlushInterval
+		)
 	);
 	flushTimer.unref?.();
 };
 
-// ------------------------------------------------------- one writer per node per interval
+// ------------------------------------------------------- one worker per node per interval
 //
-// The node's accumulated bits live in a shared buffer (see `sharedSlice`), so the row can be
-// written by ANY one worker rather than by all of them. This is the atomic turn-taking that
-// picks that one: whoever first observes that a full `flushInterval` has elapsed since the last
-// write claims the turn with a CAS and does it; every other worker merges and returns.
-//
-// WHY THIS MATTERS: the row is `bitsPerSlice / 8` bytes — 128 KB at the default — and it
-// replicates. Sixteen workers each writing it every interval put ~2 MB per slot per interval
-// into the replicated transaction log for one row's worth of state, which measured 1.2 GB of
-// transaction logs against 18 MB of live data on a production node (#87). One writer makes that
-// 1/N without changing what is stored.
+// The row is `bitsPerSlice / 8` bytes and it replicates, so every worker storing it every interval put
+// N times one row's worth of state into the replicated transaction log — measured at 1.2 GB of logs
+// behind 18 MB of live data on a production node (#87). The same turn-taking picks the one worker that
+// re-unions the ring for the node. Whoever first observes that a full interval has elapsed since the
+// last turn claims it with a CAS.
 //
 // Seconds are stored relative to a fixed epoch, in Int32, for the same reason `renderLease` does
 // it: raw epoch seconds leave Int32 in 2038, and the offset buys a lifetime either side.
 const TURN_EPOCH_SEC = 1_700_000_000;
-const nowTurnSec = () => Math.floor(Date.now() / 1000) - TURN_EPOCH_SEC;
+const nowTurnSec = (nowMs = Date.now()) => Math.floor(nowMs / 1000) - TURN_EPOCH_SEC;
 
-const claimWriteTurn = () => {
-	const intervalSec = Math.max(1, Math.round(config.render.demand.flushInterval / 1000));
-	const now = nowTurnSec();
-	// Keyed by shape: a sizing change starts a fresh turn clock rather than inheriting one taken
-	// against rows of a different byte length.
-	const turn = new Int32Array(getSab(`visitFilter/turn/${shapeOf()}`, 4));
-	const last = Atomics.load(turn, 0);
+const claimTurn = (which, intervalMs, nowMs = Date.now()) => {
+	const intervalSec = Math.max(1, Math.round(intervalMs / 1000));
+	const now = nowTurnSec(nowMs);
+	const turn = control();
+	const last = Atomics.load(turn, which);
 	const elapsed = now - last;
 	// Only a turn taken in the PAST, within the interval, blocks this one. A bare
 	// `elapsed < intervalSec` would also match a NEGATIVE elapsed — a clock stepped backwards
 	// (NTP correction, VM migration) leaves `last` in the future, and the turn would then be
-	// wedged shut until the clock caught up, which for a large step means no visit-filter write
-	// for as long as it takes. Requiring `elapsed >= 0` to block makes a backward step reclaim
-	// the turn on the next tick and re-anchor `last` to the corrected clock.
+	// wedged shut until the clock caught up. Requiring `elapsed >= 0` to block makes a backward
+	// step reclaim the turn on the next tick and re-anchor `last` to the corrected clock.
 	if (last !== 0 && elapsed >= 0 && elapsed < intervalSec) return false;
-	return Atomics.compareExchange(turn, 0, last, now) === last;
+	return Atomics.compareExchange(turn, which, last, now) === last;
 };
 
 // The filter's persisted shape: slot numbering (sliceMs), byte length (bitsPerSlice,
@@ -231,188 +347,291 @@ const claimWriteTurn = () => {
 // probe bits set than checked), and a sliceMs change renumbers every slot.
 const shapeOf = () => `${sliceMs()}|${bitCount()}|${hashes()}`;
 let armedShape = shapeOf();
-let coldUntilMs = 0;
+// When the current shape's history began: 0 until a reshape, then the moment of it. Everything
+// before it was recorded under another shape and is unreadable, so a consumer must not read an
+// empty slot from before it as "nobody visited" — see `historyFromMs`.
+let historyStartMs = 0;
 
 onConfigApplied(() => {
 	if (shapeOf() !== armedShape) {
+		// The old shape's buffers are never read or written again (every key carries the shape).
+		const oldShape = armedShape;
+		releaseSabs((key) => key.startsWith(`${RING}/`) && key.split('/').includes(oldShape));
 		armedShape = shapeOf();
-		// Drop BOTH sides of the in-memory state: old-shape write slices must not flush under
-		// the new numbering, and the union must not keep answering from old-shape rows. Then
-		// hold the ladder cold until a full slowest-rung window of NEW-shape history exists —
-		// engaging against a near-empty union reads as "nobody visited anything" and demotes
-		// the corpus, the error direction this module must not produce. (Persisted old-shape
-		// rows age out via sweepExpired; a sliceMs increase leaves them at impossible-future
-		// slot numbers, which the sweep also deletes.)
-		slices = new Map();
-		dirty.clear();
+		// Drop this worker's views and the row versions it has seen, then record when the NEW-shape
+		// history began: engaging against a near-empty union reads as "nobody visited anything", the
+		// error direction this module must not produce, so each consumer holds until the history it
+		// needs exists (the ladder: its slowest rung; `visitedSlots`: it counts only the slots since).
+		// (Persisted old-shape rows age out via sweepExpired; a sliceMs increase leaves them at
+		// impossible-future slot numbers, which the sweep also deletes.)
 		slot = null;
 		slotEndMs = 0;
-		merged = new Map();
-		mergedAt = 0;
-		const ladder = (config.render.demand.ladder ?? []).filter((n) => Number.isFinite(n) && n > 0);
-		coldUntilMs = Date.now() + (ladder.length ? Math.max(...ladder) : 0);
+		liveNow = null;
+		liveHeld.clear();
+		seenVersions.clear();
+		refreshing = null;
+		agedAt = null;
+		historyStartMs = Date.now();
 	}
 	if (!flushTimer) return;
-	if (!config.render.demand.enabled) {
+	if (!config.demand.enabled) {
 		clearInterval(flushTimer);
 		flushTimer = null;
 		armedFlushInterval = null;
 		flushSlices().catch((e) => logger.error(e)); // persist rather than discard
 		return;
 	}
-	if (config.render.demand.flushInterval !== armedFlushInterval) {
+	if (config.demand.flushInterval !== armedFlushInterval) {
 		clearInterval(flushTimer);
 		armFlushTimer();
 	}
 });
 
 /**
- * This node's accumulated bits for `slot`, shared by every worker on it.
+ * Store every ring slot whose live slice changed since its last store — when `write` is set, which
+ * the timer sets only for the worker holding the interval's turn. Exported for tests.
  *
- * Keyed by shape as well as slot, so a `bitsPerSlice` change can never hand back a buffer of the
- * previous byte length (`getUserSharedBuffer` sizes a named buffer once, on first use, and later
- * callers get what the first one allocated — see the sizing note in `renderSchedule.js`).
- *
- * Keyed by ABSOLUTE slot, never by ring position. A ring-position key would have to be zeroed on
- * wrap, and zeroing a buffer other workers may already be OR-ing into is exactly the race that
- * loses bits — i.e. manufactures the false negative this module must never produce. Absolute keys
- * are write-once-per-slot and need no reset. The cost is one buffer per elapsed slot for the
- * process's life (128 KB per 6 h at the defaults, ~0.5 MB/day, released on restart), which is a
- * fair trade for deleting the race outright.
+ * No worker owes anything: the bits are in the node-shared slice the moment they are set, so whichever
+ * worker holds the turn stores them all. A store records the change count it read BEFORE copying the
+ * slice (`stored`), so a change made during a store is stored by the next. Each slot is stored on its
+ * own: one that fails is retried next interval and never holds back the others.
  */
-const sharedSlice = (slot) => getSab(`visitFilter/bits/${shapeOf()}/${slot}`, bitCount() >>> 3);
-
-/**
- * Merge `mine` into the node-shared buffer for `slot`, then clear it.
- *
- * `Atomics.or` per 32-bit word, not `|=`: sibling workers merge concurrently and a plain
- * read-modify-write can drop a neighbour's bit inside the same word. A dropped bit is a false
- * NEGATIVE, the one error direction this filter is built to exclude. Word-at-a-time (rather than
- * byte) makes it a quarter of the atomic operations, and the byte length is always a multiple of
- * 4 because `bitCount` is a power of two >= 1024.
- *
- * Zero words are skipped — a sparsely-populated slice is mostly zeros, and `Atomics.or` with 0 is
- * a no-op that still costs a locked instruction.
- */
-const mergeIntoShared = (slot, mine) => {
-	const shared = new Int32Array(sharedSlice(slot));
-	const words = new Int32Array(mine.buffer, mine.byteOffset, mine.byteLength >>> 2);
-	for (let i = 0; i < words.length; i++) {
-		const w = words[i];
-		if (w !== 0) Atomics.or(shared, i, w);
-	}
-	mine.fill(0);
-};
-
-/**
- * Merge this thread's dirty slices into the node-shared buffers, and — when `write` is set —
- * persist them to this node's rows. Exported for tests.
- *
- * The split is what makes one write serve every worker: merging is per worker and lock-free,
- * writing is once per node per interval (`claimWriteTurn`). A worker that loses the turn has
- * still contributed its bits to the shared buffer, so the winner's write carries them; the only
- * cost of losing is that those bits reach storage up to one interval later.
- */
-export async function flushSlices({ write = true } = {}) {
-	// Merge FIRST and unconditionally. This is the step that must not be skipped: it is the only
-	// thing that moves observations off this thread, and the shared buffer is what every later
-	// write reads from.
-	for (const s of dirty) {
-		const mine = slices.get(s);
-		if (mine) mergeIntoShared(s, mine);
-		// Merged is NOT stored. Tracked separately from `dirty` because a worker that loses the
-		// turn clears `dirty` without writing: without this the bits would sit in the shared
-		// buffer, unwritten, until some worker happened to have BOTH new traffic for that slot
-		// and the turn — and on a quiet node they would simply age out with the slot. That is a
-		// false negative, so the debt is held explicitly until a write clears it.
-		pendingWrite.add(s);
-	}
-	dirty.clear();
-
-	if (!write || !pendingWrite.size) return;
-	// Clear the debt slot by slot AS EACH ONE LANDS, rather than clearing up front and restoring
-	// on failure. A failure part-way through would otherwise re-queue the slots that had already
-	// been written, and each of those is another full-size replicated row — re-spending exactly
-	// what this function exists to save. Whatever remains in the set is precisely what did not
-	// land, and the next winning flush retries only that.
-	for (const s of [...pendingWrite]) {
-		await persist(s);
-		pendingWrite.delete(s);
+export async function flushSlices({ write = true, nowMs = Date.now() } = {}) {
+	if (!write) return;
+	ageOut(nowMs);
+	const shape = shapeOf();
+	const newest = slotOf(nowMs);
+	for (let s = newest - sliceCount() + 1; s <= newest; s++) {
+		if (shapeOf() !== shape) return; // reshaped meanwhile: the new shape stores its own slices
+		const generation = generationOf(s, shape);
+		if (!(Atomics.load(generation, 0) > Atomics.load(generation, 1))) continue;
+		try {
+			await persist(s, generation, shape);
+		} catch (e) {
+			logger.error(e, `[prerender] visit ring: storing slot ${s} failed; retried next interval`);
+		}
 	}
 }
 
-async function persist(s) {
+async function persist(s, generation, shape) {
 	const VisitFilter = table();
 	const node = server.hostname;
-	const bits = new Uint8Array(sharedSlice(s));
 	const id = `${s}|${node}`;
-	// Read-merge-write of this node's own row (node is in the key, so the read is local and
-	// cannot take a cross-node fetch), serialized against sibling workers by the cross-worker
-	// mutex. The read is still required even though the shared buffer holds this process's full
-	// accumulation: after a restart the buffer starts empty while the ROW still holds everything
-	// written before it, and a plain overwrite would drop that history — again a false negative.
-	// Same discipline as crawlStats.persist.
+	// Every change up to this count is in the slice copied below (changes after it may be too —
+	// storing a bit twice is harmless, missing one is not).
+	const covered = Atomics.load(generation, 0);
+	const live = liveSlice(s, shape);
+	liveHeld.add(s);
+	// READ-MERGE-WRITE of this node's own row (node is in the key, so the read is local), serialized by
+	// the cross-worker mutex. The row can hold bits this process's live slice does not: everything stored
+	// before a restart, and whatever a worker still on an older layout stored during a rolling upgrade
+	// (it writes the same row). A blind overwrite would drop them — a false negative. One local row read
+	// per store is the whole cost.
 	const mutex = getMutex(`visitFilter/${s}`);
 	await mutex.lock();
 	try {
+		const bits = new Uint8Array(live); // a copy: the slice keeps moving under other workers
 		const existing = await VisitFilter.get(id);
-		const merged = existing?.bits ? new Uint8Array(existing.bits) : newSlice();
-		if (merged.length !== bits.length) {
-			// bitsPerSlice changed under us; the old row is a different shape. Start clean rather
-			// than merging garbage — one slice of undercount, self-heals next slot.
-			await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(bits), updatedAt: Date.now() });
-			return;
+		// A reshape that landed while this waited: an old-shape slice must not overwrite a new-shape row.
+		if (shapeOf() !== shape) return;
+		if (existing?.bits && existing.bits.length === bits.length && sameShape(existing.shape, shape)) {
+			const stored = new Uint8Array(existing.bits);
+			for (let i = 0; i < bits.length; i++) bits[i] |= stored[i];
 		}
-		for (let i = 0; i < merged.length; i++) merged[i] |= bits[i];
-		await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(merged), updatedAt: Date.now() });
+		// The row carries the SHAPE it was written under — length alone cannot tell a row written with a
+		// different `hashes` from one of this shape, and folding one reads its visits at the wrong bits.
+		await VisitFilter.put(id, { slot: s, node, shape, bits: Buffer.from(bits.buffer), updatedAt: Date.now() });
 	} finally {
 		mutex.unlock();
 	}
+	markStored(generation, covered);
 }
+
+/**
+ * Whether a stored row's recorded shape is this one. A row with no shape was written before v0.95.1;
+ * it is taken on its length alone, as it always was (its `hashes` cannot be known).
+ */
+const sameShape = (rowShape, shape) => rowShape === null || rowShape === undefined || rowShape === shape;
+
+/** OR `from` into the shared `into`, word by word, skipping zero words (a sparse slice is mostly zeros). */
+const orInto = (into, from) => {
+	// Word by word needs both views 4-byte aligned; every caller passes a fresh copy or a whole shared
+	// buffer, but a pooled Buffer can sit at any offset, so fall back to bytes rather than throw.
+	if ((into.byteOffset | from.byteOffset) & 3) {
+		for (let i = 0; i < from.length; i++) if (from[i] !== 0) Atomics.or(into, i, from[i]);
+		return;
+	}
+	const target = new Int32Array(into.buffer, into.byteOffset, into.byteLength >>> 2);
+	const source = new Int32Array(from.buffer, from.byteOffset, from.byteLength >>> 2);
+	for (let i = 0; i < source.length; i++) {
+		const w = source[i];
+		if (w !== 0) Atomics.or(target, i, w);
+	}
+};
+
+/** Raise `stored` to `covered`, never lower it (a slower concurrent store may finish last). */
+const markStored = (generation, covered) => {
+	let cur = Atomics.load(generation, 1);
+	while (covered > cur) {
+		const prev = Atomics.compareExchange(generation, 1, cur, covered);
+		if (prev === cur) break;
+		cur = prev;
+	}
+};
 
 // ---------------------------------------------------------------------------- read side
 
-let merged = new Map(); // slot -> Uint8Array unioned across nodes
-let mergedAt = 0;
+// Row versions this worker has already folded into the shared union: id -> { slot, version }. Local
+// to the worker, and that is enough: the union is a monotone OR, so a worker that takes the refresh
+// turn with an older view only re-folds rows another worker already folded — wasted reads, never
+// a wrong answer.
+const seenVersions = new Map();
 let refreshing = null;
 
-/**
- * Refresh the in-memory union of every node's rows for the slots still in the ring.
- * Cheap (slices x nodes small rows) and on a timer, because the reschedule path cannot
- * afford a multi-row read per job result.
- */
-export async function refreshMerged(nowMs = Date.now()) {
-	const VisitFilter = table();
-	const newest = slotOf(nowMs);
-	const oldest = newest - sliceCount() + 1;
-	const next = new Map();
-	let scanned = 0;
-	const found = await VisitFilter.search({
-		conditions: [{ attribute: 'slot', comparator: 'greater_than_equal', value: oldest }],
-		select: ['slot', 'bits'],
-	});
-	for await (const row of found) {
-		// Bounded at ring-length x nodes rows, so this rarely fires — but it runs on workers
-		// serving traffic, and awaiting a cursor only drains microtasks (repo convention:
-		// yield by rows SCANNED, same as util/scan.js).
-		if (++scanned % config.scan.yieldEvery === 0) await setImmediate();
-		if (!row?.bits) continue;
-		const cur = next.get(row.slot);
-		const bits = new Uint8Array(row.bits);
-		if (!cur) next.set(row.slot, bits);
-		else if (cur.length === bits.length) for (let i = 0; i < cur.length; i++) cur[i] |= bits[i];
+const fillOf = (bytes) => {
+	let set = 0;
+	for (let i = 0; i < bytes.length; i++) {
+		let b = bytes[i];
+		b = b - ((b >> 1) & 0x55);
+		b = (b & 0x33) + ((b >> 2) & 0x33);
+		set += (b + (b >> 4)) & 0x0f;
 	}
-	merged = next;
-	mergedAt = nowMs;
-	return merged;
-}
+	return bytes.length ? set / (bytes.length * 8) : 0;
+};
+
+const epochOf = (value) => {
+	if (value === null || value === undefined) return NaN;
+	const ms = typeof value === 'bigint' ? Number(value) : new Date(value).getTime();
+	return Number.isFinite(ms) ? ms : NaN;
+};
 
 /**
- * True once the read-side union is warm enough to answer. After a shape change this also
- * holds until a full slowest-rung window of new-shape history exists — the union may be
- * populated but still blind to everything recorded before the reshape.
+ * Bring the node's shared union up to date with every node's stored rows for the slots in the ring.
+ * Called by the worker holding the refresh turn (`maybeRefresh`), and directly by tests.
+ *
+ * INCREMENTAL: it projects the ring's rows to their versions (id, slot, `updatedAt`) and fetches the
+ * bits only of slots with a row this worker has not folded at that version. In steady traffic that
+ * is the current slot, from each node; older slots stop changing once their slot ends. The union is a
+ * monotone OR, so folding a row again is harmless and nothing ever needs clearing.
+ *
+ * It then measures what the sizing depends on — the set-bit fraction of each slot and the false-positive
+ * rate that implies (`fill^k`) — and publishes it with the refresh time for every worker. The newest
+ * slot is PARTIAL and still filling, so it is reported (`newestFill`, the sizing sawtooth) but kept out
+ * of the worst case, which is taken over the FULL slots — the ones most of every level count is made of.
  */
-export const mergedReady = () => mergedAt > 0 && Date.now() >= coldUntilMs;
+export async function refreshMerged(nowMs = Date.now()) {
+	ageOut(nowMs);
+	const VisitFilter = table();
+	// ONE SHAPE for the whole refresh: a reshape that lands mid-refresh must not fold old-shape rows into
+	// the new shape's union, where they would stay for the ring's life (the union only ever gains bits).
+	const shape = shapeOf();
+	const expected = bytesOf(shape);
+	const shared = stats(shape);
+	const newest = slotOf(nowMs);
+	const oldest = newest - sliceCount() + 1;
+	const changedSlots = new Set();
+	let scanned = 0;
+	const versions = await VisitFilter.search({
+		conditions: [{ attribute: 'slot', comparator: 'greater_than_equal', value: oldest }],
+		select: ['id', 'slot', 'updatedAt', 'shape'],
+	});
+	const inRing = []; // { id, slot, shape } of every row in the ring, for where history starts
+	for await (const row of versions) {
+		// Bounded at ring-length x nodes rows — but it runs on workers serving traffic, and awaiting a
+		// cursor only drains microtasks (repo convention: yield by rows SCANNED, same as util/scan.js).
+		if (++scanned % config.scan.yieldEvery === 0) await setImmediate();
+		if (!row?.id || !(row.slot >= oldest && row.slot <= newest + 1)) continue;
+		if (!sameShape(row.shape, shape)) continue; // another shape's row: never folded, never history
+		inRing.push({ id: row.id, slot: row.slot, shape: row.shape });
+		const version = epochOf(row.updatedAt);
+		const seen = seenVersions.get(row.id);
+		if (seen && seen.version === version && Number.isFinite(version)) continue;
+		changedSlots.add(row.slot);
+	}
+	for (const s of changedSlots) {
+		if (shapeOf() !== shape) return; // reshaped meanwhile: the new shape starts its own history
+		const union = unionSlice(s, shape);
+		const rows = await VisitFilter.search({
+			conditions: [{ attribute: 'slot', comparator: 'equals', value: s }],
+			select: ['id', 'slot', 'shape', 'bits', 'updatedAt'],
+		});
+		for await (const row of rows) {
+			if (row?.slot !== s || !row.bits || shapeOf() !== shape) continue;
+			const bits = new Uint8Array(row.bits);
+			const usable = bits.length === expected && sameShape(row.shape, shape);
+			if (usable) orInto(union, bits);
+			seenVersions.set(row.id, { slot: s, version: epochOf(row.updatedAt), usable });
+		}
+		await setImmediate();
+	}
+	if (shapeOf() !== shape) return;
+
+	// WHERE HISTORY STARTS, recomputed every refresh from the rows the ring holds now — never carried
+	// over: a slot whose rows were swept, or a ring that grew (`slices` raised), must not read as history
+	// that was looked at and found empty. A row counts if it is of this shape (its length checked when it
+	// was folded).
+	let first = Infinity;
+	for (const row of inRing) {
+		if (row.slot > newest || !(row.slot < first)) continue;
+		if (seenVersions.get(row.id)?.usable) first = row.slot;
+	}
+	shared[STATS_FIRST_SLOT] = Number.isFinite(first) ? first + 1 : 0;
+
+	let newestFill = 0;
+	let worstFill = 0;
+	let fullSlots = 0;
+	for (let s = Math.max(oldest, first); s <= newest; s++) {
+		const fill = fillOf(unionSlice(s, shape));
+		if (s === newest) newestFill = fill;
+		else {
+			fullSlots++;
+			if (fill > worstFill) worstFill = fill;
+		}
+	}
+	// A ring with only its newest slot has no full slot to judge; the partial one is all there is.
+	if (!fullSlots) worstFill = newestFill;
+	const worstFalsePositive = worstFill ** Number(shape.split('|')[2]);
+	shared[STATS_NEWEST_FILL] = newestFill;
+	shared[STATS_WORST_FILL] = worstFill;
+	shared[STATS_WORST_FP] = worstFalsePositive;
+	shared[STATS_MERGED_AT] = nowMs; // last: a reader that sees the time sees the numbers it describes
+
+	// The sizing signals, emitted where they are measured — once per node per refresh. `fill` is the
+	// newest slot's (the sawtooth to read at its PEAK), `false_positive` the worst full slot's `fill^k`,
+	// the number `demand.maxFalsePositive` is compared against. Guarded: losing a metric must never fail
+	// a refresh.
+	try {
+		metrics.demand(newestFill, 'fill');
+		metrics.demand(worstFalsePositive, 'false_positive');
+	} catch {
+		// metrics unavailable (tests, early boot)
+	}
+}
+
+const mergedAtMs = () => stats()[STATS_MERGED_AT];
+
+/**
+ * True once the node's union holds a first refresh. Consumers decide for themselves how much
+ * history they need on top (`historyFromMs`): the union may be populated but still blind to
+ * everything recorded before a reshape.
+ */
+export const mergedWarm = () => mergedAtMs() > 0;
+
+/**
+ * When the current shape's history began — 0 unless the filter was reshaped since boot. Nothing
+ * recorded before it is readable, so an empty slot from before it is NOT evidence of no visits.
+ */
+export const historyFromMs = () => historyStartMs;
+
+/** The last refresh's sizing measurements: `{ newestFill, worstFill, worstFalsePositive }`. */
+export const unionHealth = () => {
+	const shared = stats();
+	return {
+		newestFill: shared[STATS_NEWEST_FILL],
+		worstFill: shared[STATS_WORST_FILL],
+		worstFalsePositive: shared[STATS_WORST_FP],
+	};
+};
 
 /**
  * Kick the background refresh without asking a membership question.
@@ -423,26 +642,44 @@ export const mergedReady = () => mergedAt > 0 && Date.now() >= coldUntilMs;
  * which that same refusal skips — so without this the filter would never warm and the ladder
  * would stay disabled forever.
  */
-export const ensureMerged = (nowMs = Date.now()) => maybeRefresh(nowMs);
+export const ensureMerged = (nowMs = Date.now()) => {
+	maybeRefresh(nowMs);
+};
+
+/**
+ * Warm the union and WAIT for it: resolves once the union holds a refresh (at once when it already
+ * does). For a caller about to ask many questions in a row — a probe pass — so the first few are not
+ * answered by a cold union. If another worker holds the refresh turn, this waits for its refresh, up
+ * to 10 s; a pass that starts anyway answers `cold` and stamps nothing, which is the safe side.
+ */
+export const awaitMerged = async (nowMs = Date.now()) => {
+	const mine = maybeRefresh(nowMs);
+	if (mine) return mine;
+	for (let waited = 0; !mergedWarm() && waited < 10_000; waited += 100) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+};
 
 const maybeRefresh = (nowMs) => {
-	if (nowMs - mergedAt < config.render.demand.mergeInterval || refreshing) return;
-	refreshing = refreshMerged(nowMs)
+	if (refreshing) return refreshing;
+	if (nowMs - mergedAtMs() < config.demand.mergeInterval) return undefined;
+	// One refresh per node per interval: the union is shared, so a second worker refreshing it would
+	// only repeat the reads. A cold union (never refreshed) is claimed at once by whoever asks first.
+	if (!claimTurn(1, config.demand.mergeInterval, nowMs) && mergedWarm()) return undefined;
+	// Outside whatever request asked (util/detach.js): a render result's reschedule asks from inside the
+	// result request's transaction, and the refresh's reads must not ride on it.
+	refreshing = runDetached(() => refreshMerged(nowMs))
 		.catch((e) => logger.error(e))
 		.finally(() => {
 			refreshing = null;
 		});
+	return refreshing;
 };
 
-/**
- * Was `url` visited at any point in the last `windowMs`? Tests the ring slices covering that
- * window; a slot with no row anywhere reads as "not visited", so a cold read-side union
- * answers false rather than inventing traffic.
- */
-export function visitedWithin(url, windowMs, nowMs = Date.now()) {
-	maybeRefresh(nowMs);
-	if (!merged.size) return false;
-	const k = hashes();
+/** The ring slots the union can answer for, oldest first — clipped to the first slot any node wrote. */
+const readableFrom = (oldestWanted) => Math.max(oldestWanted, firstSlotOf(stats()));
+
+const visitedIn = (idx, k, windowMs, nowMs, floorSlot) => {
 	const newest = slotOf(nowMs);
 	// Anchor on the slot containing the window's START, not on a slot count. The newest slot
 	// is PARTIAL: `ceil(windowMs/sliceMs)` slots back from it cover as little as the elapsed
@@ -450,14 +687,51 @@ export function visitedWithin(url, windowMs, nowMs = Date.now()) {
 	// minutes of its 6h window, and the miss direction is a false NEGATIVE, the one error
 	// this filter must not make (a genuinely visited page reading unvisited gets demoted).
 	// Anchoring instead over-covers by up to one slice — the safe, documented direction.
-	// Clamped to the ring so a window wider than the ring cannot walk absent slots.
-	const oldest = Math.max(slotOf(nowMs - windowMs), newest - sliceCount() + 1);
-	const idx = bitsFor(url, bitCount(), k, scratch);
-	for (let s = newest; s >= oldest; s--) {
-		const bytes = merged.get(s);
-		if (bytes && bytes.length === bitCount() >>> 3 && hasBits(bytes, idx, k)) return true;
-	}
+	// Clamped to the ring so a window wider than the ring cannot walk absent slots, and to the first
+	// slot any node wrote (an earlier one has nothing to answer with).
+	// `floorSlot` is the ring's real edge — the slot just past it, which `ageOut` keeps — measured from the
+	// caller's clock, not from this window's end: an earlier window of the promotion test must not read a
+	// slot nobody holds any more.
+	const oldest = readableFrom(Math.max(slotOf(nowMs - windowMs), newest - sliceCount() + 1, floorSlot));
+	for (let s = newest; s >= oldest; s--) if (hasBits(unionSlice(s), idx, k)) return true;
 	return false;
+};
+
+/**
+ * Was `url` visited at any point in the last `windowMs`? Tests the ring slices covering that
+ * window; a slot with no row anywhere reads as "not visited", so a cold union answers false
+ * rather than inventing traffic.
+ */
+export function visitedWithin(url, windowMs, nowMs = Date.now()) {
+	ageOut(nowMs);
+	maybeRefresh(nowMs);
+	if (!mergedWarm()) return false;
+	const k = hashes();
+	return visitedIn(bitsFor(url, bitCount(), k, scratch), k, windowMs, nowMs, slotOf(nowMs) - sliceCount());
+}
+
+/**
+ * In how many ring slots was `url` visited? The demand LEVEL, 0..`covered`, over the slots the
+ * union can answer for: the ring, newest (partial) slot included, clipped to the current shape's
+ * history (`historyFromMs`) and to the oldest slot any node has written — a tracker switched on
+ * yesterday has one day of slots, and an empty slot before its first row is not evidence of
+ * nothing. `covered` is 0 while the union is cold. A read of the shared union; the refresh it may
+ * kick is async and answers later questions.
+ */
+export function visitedSlots(url, nowMs = Date.now()) {
+	ageOut(nowMs);
+	maybeRefresh(nowMs);
+	if (!mergedWarm()) return { level: 0, covered: 0 };
+	const k = hashes();
+	const newest = slotOf(nowMs);
+	let oldest = newest - sliceCount() + 1;
+	if (historyStartMs > 0) oldest = Math.max(oldest, slotOf(historyStartMs));
+	oldest = readableFrom(oldest);
+	if (oldest > newest) return { level: 0, covered: 0 };
+	const idx = bitsFor(url, bitCount(), k, scratch);
+	let level = 0;
+	for (let s = oldest; s <= newest; s++) if (hasBits(unionSlice(s), idx, k)) level++;
+	return { level, covered: newest - oldest + 1 };
 }
 
 /**
@@ -468,12 +742,17 @@ export function visitedWithin(url, windowMs, nowMs = Date.now()) {
  * whose real visit period equals its interval, which settles at rendering TWICE per visit.
  * Requiring a visit in each of the last two candidate-sized windows asks the sharper question
  * — "would a render at the FASTER cadence actually have been seen?" — and settles at roughly
- * one render per visit instead.
+ * one render per visit instead. The URL is hashed once for all the windows.
  */
 export function visitedInEachWindow(url, windowMs, count, nowMs = Date.now()) {
+	ageOut(nowMs);
+	maybeRefresh(nowMs);
+	if (!mergedWarm()) return false;
+	const k = hashes();
+	const idx = bitsFor(url, bitCount(), k, scratch);
+	const floorSlot = slotOf(nowMs) - sliceCount();
 	for (let w = 0; w < count; w++) {
-		const end = nowMs - w * windowMs;
-		if (!visitedWithin(url, windowMs, end)) return false;
+		if (!visitedIn(idx, k, windowMs, nowMs - w * windowMs, floorSlot)) return false;
 	}
 	return true;
 }
@@ -481,34 +760,21 @@ export function visitedInEachWindow(url, windowMs, count, nowMs = Date.now()) {
 /**
  * Fill factor (set-bit fraction) of the newest slot in the union — the sizing early warning
  * surfaced in the demand-ladder histogram log. A k-hash probe false-positives at ~fill^k, and
- * false positives promote pages nobody visited. Read once per histogram interval, never on
- * the serve path.
+ * false positives promote pages nobody visited. Measured at each refresh, never on the serve path.
  */
-export function newestFill() {
-	let newest = -Infinity;
-	for (const s of merged.keys()) if (s > newest) newest = s;
-	const bytes = merged.get(newest);
-	if (!bytes?.length) return 0;
-	let set = 0;
-	for (let i = 0; i < bytes.length; i++) {
-		let b = bytes[i];
-		b = b - ((b >> 1) & 0x55);
-		b = (b & 0x33) + ((b >> 2) & 0x33);
-		set += (b + (b >> 4)) & 0x0f;
-	}
-	return set / (bytes.length * 8);
-}
+export const newestFill = () => stats()[STATS_NEWEST_FILL];
 
-/** Test seam: drop all in-memory state (both sides). */
+/** Test seam: drop this worker's in-memory state. The node-shared state lives in coordination.js. */
 export function resetVisitFilter() {
-	slices = new Map();
-	dirty.clear();
-	pendingWrite.clear();
 	slot = null;
 	slotEndMs = 0;
-	merged = new Map();
-	mergedAt = 0;
-	coldUntilMs = 0;
+	liveNow = null;
+	liveHeld.clear();
+	agedAt = null;
+	seenVersions.clear();
+	historyStartMs = 0;
+	armedShape = shapeOf();
+	refreshing = null;
 	if (flushTimer) clearInterval(flushTimer);
 	flushTimer = null;
 	armedFlushInterval = null;

@@ -773,6 +773,63 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 	}
 });
 
+test('the action stamps the page’s demand beside the mark — and nothing when demand is unknown', async () => {
+	// queue.ready.changedDemand orders changed pages by how often bots ask for them, and the keeper
+	// reads that off the row: the action is where it is stamped (util/demand.js).
+	const scheduled = [];
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async put(id, fields) {
+			scheduled.push({ id, ...fields });
+		}
+	};
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get() {
+			return null;
+		}
+	};
+	const visits = new Map();
+	globalThis.databases.crawl_stats = {
+		VisitFilter: class {
+			static async get(id) {
+				return visits.get(id) ?? null;
+			}
+			static async put(id, data) {
+				visits.set(id, { id, ...data });
+			}
+			static async delete(id) {
+				visits.delete(id);
+			}
+			static async search() {
+				return [...visits.values()];
+			}
+		},
+	};
+	const { applyOptions } = await import('../src/config.js');
+	const visitFilter = await import('../src/util/visitFilter.js');
+	const { warmDemand } = await import('../src/util/demand.js');
+	const url = 'https://example.com/product/prd-a/';
+	try {
+		// Tracker off (the default): unknown, so the row carries no estimate and orders by cadence.
+		applyOptions({});
+		await changeProbe.actOnChange(row(url));
+		assert.ok(Number.isFinite(scheduled[0].changedAt));
+		assert.equal('demandPeriod' in scheduled[0], false);
+
+		// Tracker on, the page visited in the current slot, union loaded as a pass loads it.
+		applyOptions({ demand: { enabled: true } });
+		visitFilter.resetVisitFilter();
+		visitFilter.recordVisit(url);
+		await visitFilter.flushSlices();
+		await warmDemand();
+		scheduled.length = 0;
+		await changeProbe.actOnChange(row(url));
+		assert.equal(scheduled[0].demandPeriod, 6 * 3_600_000, 'one slot of history, visited in it: one visit per slot');
+	} finally {
+		visitFilter.resetVisitFilter();
+		await restoreConfig();
+	}
+});
+
 test('a trip files ONE schedule row, keyed by the URL — not one per device', async () => {
 	// The v0.66.0 regression this pins. A device-keyed row gets `deviceTypes: [thatDevice]` from
 	// `claim`, so two of them are two ONE-DEVICE jobs: each fetches the origin document for

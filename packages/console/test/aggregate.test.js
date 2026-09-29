@@ -691,6 +691,53 @@ test('queue-state: a changed class stays apart from the routine class it would o
 	assert.equal(mixed.find((c) => same(c) && c.changed).due, 50);
 });
 
+/** Plugin v0.95.0's live answer: the changed count with its split by the demand period each row carries. */
+const withDemand = (changedByDemand) => {
+	const body = withChanged(changedByDemand.reduce((acc, entry) => acc + entry.due, 0));
+	return { ...body, now: { ...body.now, changedByDemand } };
+};
+
+test('queue-state: changed rows by demand merge by period — due summed, oldest the earliest, unknown last', () => {
+	const H = 3_600_000;
+	const a = withDemand([
+		{ periodMs: 6 * H, due: 10, oldestDueAt: 5_000_000 },
+		{ periodMs: 24 * H, due: 4, oldestDueAt: 7_000_000 },
+		{ periodMs: null, due: 3, oldestDueAt: 6_000_000 },
+	]);
+	const b = withDemand([
+		{ periodMs: null, due: 2, oldestDueAt: 1_000_000 },
+		{ periodMs: 6 * H, due: 5, oldestDueAt: 4_000_000 },
+		{ periodMs: 96 * H, due: 8, oldestDueAt: 9_000_000 },
+	]);
+	const { now } = mergeQueueState([ok('a', a), ok('b', b)]).body.cluster;
+	assert.deepEqual(now.changedByDemand, [
+		{ periodMs: 6 * H, due: 15, oldestDueAt: 4_000_000 },
+		{ periodMs: 24 * H, due: 4, oldestDueAt: 7_000_000 },
+		{ periodMs: 96 * H, due: 8, oldestDueAt: 9_000_000 },
+		{ periodMs: null, due: 5, oldestDueAt: 1_000_000 },
+	]);
+	assert.equal(
+		now.changedByDemand.reduce((acc, entry) => acc + entry.due, 0),
+		now.dueChanged,
+		'the split adds back up to the changed count'
+	);
+	// Nothing changed due on either node is an answer: an empty split, not an absent one.
+	assert.deepEqual(
+		mergeQueueState([ok('a', withDemand([])), ok('b', withDemand([]))]).body.cluster.now.changedByDemand,
+		[]
+	);
+});
+
+test('queue-state: the demand split is left out unless every node sends it — a 0.94 node has none', () => {
+	const mixed = mergeQueueState([
+		ok('a', withDemand([{ periodMs: 6 * 3_600_000, due: 10, oldestDueAt: 5_000_000 }])),
+		ok('b', withChanged(20)),
+	]).body;
+	assert.equal('changedByDemand' in mixed.cluster.now, false, 'not a split of one node’s rows under a cluster label');
+	assert.equal(mixed.cluster.now.dueChanged, 30, 'the count itself still sums');
+	assert.equal(mixed.nodes[0].now.changedByDemand.length, 1, 'each node keeps its own');
+});
+
 test('queue-state: 0.93.1’s listsTruncated is carried when any node cut its lists', () => {
 	const cut = { ...LIVE_STATE, lateness: { ...LIVE_STATE.lateness, listsTruncated: true } };
 	assert.equal(mergeQueueState([ok('a', LIVE_STATE), ok('b', cut)]).body.cluster.lateness.listsTruncated, true);

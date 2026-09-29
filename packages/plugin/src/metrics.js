@@ -127,6 +127,26 @@ const SERVE_SOURCES = Object.freeze([
 
 const DEVICE_TYPES = Object.freeze(['desktop', 'mobile', 'tablet']);
 
+// WHY a bot request missed (bot_miss.path). Exactly one per request bot_serve counts as origin|miss.
+const MISS_CAUSES = Object.freeze([
+	'passthrough', // the route is not prerendered here, by configuration — never cached
+	'not-found', // the origin answered 404 or 410: there is no page to render
+	'not-modified', // the origin answered 304 to the crawler's conditional GET: real page, we hold none
+	'redirect', // the origin answered 3xx (other than 304)
+	'client-error', // any other 4xx
+	'origin-error', // 5xx, or no status at all (a fetch that failed outright throws before this and is counted by neither)
+	'uncacheable', // a 2xx that is not a prerender candidate (non-200, or its headers said not to cache)
+	'gated-route', // a 200 on a route that does not add targets from traffic (ingress.routes[].discoverTargets)
+	'gated-bot', // a 200 from a bot not allowed to add targets (ingress.discoveryBots)
+	'gated-entity', // a 200 with no target, whose entity already has one in rotation (ingress.entityGate)
+	'new', // a 200 with no target: this request minted one, first render jittered across the interval
+	'render-timeout', // an on-demand render (renderNow) did not land in time; the fallback answered
+	'unrendered', // a target in rotation with no page for this device yet — waiting for its render
+	'device', // a target in rotation, but this device is not one it renders by default (deviceTypes.default) — config, not capacity
+	'suppressed', // a target the render verdict suppressed (noindex, canonical elsewhere, error)
+	'error', // the Target read or the mint failed
+]);
+
 /**
  * The catalog, keyed by metric name. Ordered as an operator reads them: what arrived, what we
  * served it from, how fresh it was, then the machinery behind that.
@@ -190,6 +210,36 @@ export const METRICS = Object.freeze({
 			},
 			method: { name: 'cacheStatus', values: CACHE_STATUSES, description: 'As bot_serve.method.' },
 			type: { name: 'deviceType', values: DEVICE_TYPES, description: 'Sanitized device type.' },
+		},
+	}),
+
+	bot_miss: metric('bot_miss', {
+		kind: 'counter',
+		emittedBy: 'http_handlers/bot_request.js',
+		cadence:
+			'once per bot request that bot_serve counts as origin|miss — at resolve time for most causes, after ' +
+			'the detached Target read for new / unrendered / device / suppressed / gated-entity / error',
+		summary: 'Why a request that missed the cache missed: the reason, the route, the bot.',
+		usefulFor:
+			'Sizing COVERAGE — which misses are dead URLs (not-found; not-modified is a real page the crawler already ' +
+			'holds), which are held out by a rule or setting you ' +
+			'chose (gated-route, gated-bot, gated-entity, passthrough, and device: a device outside ' +
+			'deviceTypes.default, which the rotation never renders), and which are pages the rotation owns and has ' +
+			'not rendered yet (new, unrendered, render-timeout). Only the last group is render capacity or order; ' +
+			'the rest are decisions a render cannot change. Pair a cause with its distinct-URL count ' +
+			'(GET /prerender_admin/crawl-breadth, `misses` per day and `missUnion` across the range): requests ' +
+			'per distinct URL is how often a missed URL is asked for again, which is what a render of it would ' +
+			'serve — a class of misses made of one-off URLs is not worth covering at any capacity.',
+		gatedBy: 'analytics.enabled (same gate as bot_serve)',
+		caveats:
+			'Sums to bot_serve origin|miss for the same window, less the few whose detached read had not landed ' +
+			'when the window closed. discovery_gated (prerender_ops) overlaps gated-route/gated-bot by design and ' +
+			'predates this. A render-now that landed in time is not a miss (bot_serve source rendered); one that ' +
+			'timed out and fell back to the origin is.',
+		dimensions: {
+			path: { name: 'cause', values: MISS_CAUSES, description: 'Why the cache had nothing to serve.' },
+			method: { name: 'route', description: 'As route_serve.path.' },
+			type: { name: 'botName', description: 'As bot_request.method.' },
 		},
 	}),
 
@@ -481,11 +531,12 @@ export const METRICS = Object.freeze({
 		kind: 'value',
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
-			'util/demandLadder.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
+			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
 			'util/changeProbe.js, util/entityGate.js',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
-			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (demand_*), ' +
+			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
+			'demand_*), per visit-ring re-union (demand_fill, demand_false_positive), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
 			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate)',
@@ -507,7 +558,10 @@ export const METRICS = Object.freeze({
 			'rung faster than their own cadence (demand_single_rung) and cold-filter holds ' +
 			'(demand_skipped_cold) are not ladder outcomes and would otherwise make it a readout of the ' +
 			'route mix. demand_promoted_fast is the movement counter — budget being reallocated onto fast ' +
-			'rungs right now, zero once the distribution settles. ' +
+			'rungs right now, zero once the distribution settles. demand_fill and demand_false_positive are the ' +
+			'demand TRACKER\u2019s sizing gauges (demand.*), emitted whenever the ring is re-unioned: ' +
+			'demand_false_positive is the worst full slot\u2019s fill^k, the number demand.maxFalsePositive ' +
+			'holds the newer consumers to. ' +
 			'invalidation_error = an active invalidation is NOT being enforced on the requests that failed ' +
 			'(the serve path falls back per-worker, so these are invisible in serve metrics); expect zero, ' +
 			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
@@ -563,7 +617,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated and entity_gate are counters; config_warnings is a slow gauge (latest value); ' +
-			'demand_fill is a per-worker gauge — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
+			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
 			'and climbs until the next one, so it is a sawtooth: averaging over a window reports the middle ' +
 			'of the ramp while the decisions that matter are made at the top of it. A k=7 probe ' +
@@ -571,7 +625,8 @@ export const METRICS = Object.freeze({
 			'and only the second one is the answer — take max/p95 across buckets. False positives promote ' +
 			'pages nobody visited, and a saturated ring promotes the whole corpus to its floor without ' +
 			'raising any other alarm: watch this before trusting the histogram, and see ' +
-			'`render.demand.bitsPerSlice` for what to do when it is high. ' +
+			'`demand.bitsPerSlice` for what to do when it is high. demand_false_positive is a gauge too, but ' +
+			'over FULL slots only, so it has no sawtooth: its level is the answer. ' +
 			'unrouted’s bucket slot is bounded by ingress.report.maxBuckets per class. The per-level ladder ' +
 			'histogram exists only in the demand-ladder log line.',
 		dimensions: {
@@ -597,6 +652,7 @@ export const METRICS = Object.freeze({
 					'demand_fast',
 					'demand_graded',
 					'demand_fill',
+					'demand_false_positive',
 					'invalidation_error',
 					'invalidation_reenqueue',
 					'probe_probed',
@@ -623,7 +679,7 @@ export const METRICS = Object.freeze({
 					'(promoted/demoted/held are the graded ones and sum to demand_graded; skipped_cold and ' +
 					'single_rung are the two paths where no decision was possible), fast/graded = the ' +
 					'guardrail ratio\u2019s two halves, promoted_fast = promotions onto a fast rung, plus the ' +
-					'fill sizing gauge. ' +
+					'tracker\u2019s fill and false_positive sizing gauges. ' +
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
 					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
 					'entity_gate = entity discovery gate evaluations, by outcome.',
@@ -775,6 +831,7 @@ export const metrics = Object.freeze({
 
 	/** What answered the request. */
 	botServe: (source, cacheStatus, botName) => server.recordAnalytics(true, 'bot_serve', source, cacheStatus, botName),
+	botMiss: (cause, route, botName) => server.recordAnalytics(true, 'bot_miss', cause, route, botName),
 
 	/** The same outcome, per route. */
 	routeServe: (route, cacheStatus, deviceType) =>
@@ -875,7 +932,7 @@ export const metrics = Object.freeze({
 	queueHealth: (value, gauge) => server.recordAnalytics(value, 'queue_health', gauge, null, null),
 
 	/** One series of the demand ladder's decision histogram — prerender_ops `demand_<series>`. */
-	demandLadder: (value, series) => server.recordAnalytics(value, 'prerender_ops', `demand_${series}`, null, null),
+	demand: (value, series) => server.recordAnalytics(value, 'prerender_ops', `demand_${series}`, null, null),
 
 	/** A failed invalidation-epoch resolution — a prerender_ops series. */
 	invalidationError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'invalidation_error', kind, null),

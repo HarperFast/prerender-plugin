@@ -80,3 +80,67 @@ test('fileDueNow files a row due now WITHOUT DEMOTING it: an earlier due time an
 	assert.equal(rows.get('https://example.com/later').nextRenderTime, minute, 'a future row is pulled to now');
 	assert.equal(rows.get('https://example.com/later').changedAt, minute, 'and marked when asked');
 });
+
+test('demandPeriod rides with the change mark and only with it', async () => {
+	// It says how urgent a CHANGE is (queue.ready.changedDemand), so a row with no mark never carries
+	// one — the render's reschedule clears both by omission.
+	rows.clear();
+	await funnel.writeSchedule('https://example.com/a', {
+		nextRenderTime: T0,
+		fromSitemap: true,
+		effectiveInterval: null,
+		changedAt: T0,
+		demandPeriod: 6 * 3_600_000,
+	});
+	assert.equal(rows.get('https://example.com/a').demandPeriod, 6 * 3_600_000);
+	await funnel.writeSchedule('https://example.com/b', {
+		nextRenderTime: T0,
+		fromSitemap: true,
+		effectiveInterval: null,
+		demandPeriod: 6 * 3_600_000,
+	});
+	assert.equal('demandPeriod' in rows.get('https://example.com/b'), false, 'no mark, no demand');
+	for (const unusable of [0, -1, NaN, null, undefined]) {
+		await funnel.writeSchedule('https://example.com/c', {
+			nextRenderTime: T0,
+			fromSitemap: true,
+			effectiveInterval: null,
+			changedAt: T0,
+			demandPeriod: unusable,
+		});
+		assert.equal('demandPeriod' in rows.get('https://example.com/c'), false, `unusable ${unusable} is not written`);
+	}
+});
+
+test('fileDueNow: a marked row keeps its demand, and takes the given one only if it had none', async () => {
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	const earlier = minute - 3_600_000;
+	rows.clear();
+	rows.set('https://example.com/kept', {
+		nextRenderTime: earlier,
+		fromSitemap: true,
+		changedAt: earlier,
+		demandPeriod: 6e6,
+	});
+	await funnel.fileDueNow('https://example.com/kept', {
+		fromSitemap: true,
+		effectiveInterval: null,
+		changedAt: minute,
+		demandPeriod: 9e6,
+	});
+	assert.equal(rows.get('https://example.com/kept').demandPeriod, 6e6, 'the first estimate stays with the first mark');
+
+	// A revalidate or render-now passes no demand at all: the mark and its demand both survive.
+	await funnel.fileDueNow('https://example.com/kept', { fromSitemap: true, effectiveInterval: null });
+	assert.equal(rows.get('https://example.com/kept').changedAt, earlier);
+	assert.equal(rows.get('https://example.com/kept').demandPeriod, 6e6);
+
+	rows.set('https://example.com/unknown', { nextRenderTime: earlier, fromSitemap: true, changedAt: earlier });
+	await funnel.fileDueNow('https://example.com/unknown', {
+		fromSitemap: true,
+		effectiveInterval: null,
+		changedAt: minute,
+		demandPeriod: 9e6,
+	});
+	assert.equal(rows.get('https://example.com/unknown').demandPeriod, 9e6, 'marked with no estimate: takes the new one');
+});

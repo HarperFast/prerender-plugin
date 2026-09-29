@@ -31,8 +31,12 @@ const always = probeOf({ visited: () => true, each: () => true });
 
 // applyOptions merges into DEFAULTS, not cumulatively — a second call inside a test would
 // silently reset `enabled` back to its default. So every override goes through here.
+// The ladder is a CONSUMER of the demand tracker (v0.95.0): it acts only while `demand.enabled` is
+// on. Every decision below is the pre-split ladder's, with only this line added — which is the
+// "decisions did not move" guarantee, stated as a test suite.
 const setDemand = (overrides = {}) =>
 	applyOptions({
+		demand: { enabled: true },
 		render: {
 			demand: {
 				enabled: true,
@@ -277,6 +281,14 @@ test('an empty ladder disables the ladder rather than throwing', () => {
 	assert.equal(r.interval, 48 * H);
 });
 
+test('with the demand tracker off the ladder is inert — off, not cold, since nothing will warm it', () => {
+	applyOptions({ demand: { enabled: false }, render: { demand: { enabled: true, dryRun: false } } });
+	const r = decideInterval('u', 48 * H, 6 * H, Date.now(), always);
+	assert.equal(r.interval, 48 * H, 'rests at base');
+	assert.equal(r.action, 'off');
+	assert.equal(drainStats().skippedCold, 0, 'not counted as a cold hold');
+});
+
 test('config defaults ship inert: enabled off and dryRun on', () => {
 	// Both matter. `enabled` off means no behaviour change at all; `dryRun` on means that even
 	// turning `enabled` on only starts MEASURING — you have to opt in twice to change scheduling.
@@ -289,6 +301,7 @@ test('config defaults ship inert: enabled off and dryRun on', () => {
 test('a route demandFloor bounds promotion, heals sub-floor stamps, and leaves other routes alone', () => {
 	const T = 1_700_000_000_000;
 	applyOptions({
+		demand: { enabled: true },
 		render: {
 			demand: {
 				enabled: true,
