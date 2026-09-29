@@ -50,6 +50,9 @@ import { MINUTE, currentMinuteMs, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 import { READY_EPOCH_SEC, READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
 import { walkUrlRange } from './urlWalk.js';
+import { getResidencyByUrl } from './residency.js';
+import { forwardDueNow, isDueNowForwardActive } from './peerHeal.js';
+import { metrics } from '../metrics.js';
 
 /**
  * The live lease table, over one named buffer shared by every worker on this node.
@@ -193,13 +196,29 @@ export const writeSchedule = async (
  * after a deploy, an admin rejoin, a new sitemap URL. The mark gives it `queue.ready.urgentHeadStart`
  * (util/renderPriority.js), and a change mark, when there is one, takes precedence over it.
  *
- * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
- * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
- * what every such writer did before, and the write still reaches the owner by residency.
+ * ON THE OWNER, OR NOT AT ALL. The read that makes all of that possible is node-local
+ * (`getScheduleRow`, `replicateFrom: false`), so it is only authoritative on the row's residency owner.
+ * Anywhere else — about three calls in four on a four-node cluster — it sees nothing, and the whole-row
+ * `put` that replicates to the owner REPLACES the owner's row: an overdue row pushed back to the
+ * current minute, its change mark and demand estimate wiped. So a node that does not own the row asks
+ * the owner to file it (`forwardDueNow`, `queue.dueNowForward`) and writes nothing itself. If the owner
+ * cannot be asked, or refuses, the row is filed here exactly as it always was: the forward can only
+ * make this better, never worse. `forwarded` is set by the owner's endpoint, and makes it a leaf.
  *
- * Returns the due time it wrote.
+ * Returns the due time it wrote (the owner's, when forwarded).
  */
-export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt, demandPeriod } = {}) => {
+export const fileDueNow = async (
+	cacheKey,
+	{ fromSitemap, effectiveInterval, changedAt, demandPeriod, forwarded = false } = {}
+) => {
+	if (!forwarded && isDueNowForwardActive()) {
+		const owner = getResidencyByUrl(CacheKey.urlOf(cacheKey));
+		if (owner !== server.hostname) {
+			const sent = await forwardDueNow({ owner, cacheKey, fromSitemap, effectiveInterval, changedAt, demandPeriod });
+			metrics.dueNowForward(sent.ok ? 'forwarded' : sent.reason === 'cooling' ? 'skipped' : 'fell-back');
+			if (sent.ok) return sent.nextRenderTime;
+		}
+	}
 	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod', 'urgentAt']);
 	const minute = currentMinuteMs();
 	const due = numberOf(existing?.nextRenderTime);

@@ -294,6 +294,13 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 			'prerender_ops.entity_gate',
 			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
 		],
+		// plugin v0.97.0: how often an off-owner "render this now" filing reached its owner. A health signal
+		// with an expected steady state (forwarded, or nothing when the peer token is unset); a tile on the
+		// Queue view is the console follow-up.
+		[
+			'prerender_ops.due_now_forward',
+			'plugin v0.97.0; read raw from /prerender_admin/analytics until the Queue view charts it',
+		],
 	]);
 
 	const client = [...clientSources.values()].join('\n');

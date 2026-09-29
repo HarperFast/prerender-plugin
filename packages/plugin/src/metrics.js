@@ -557,7 +557,8 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js',
+			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
+			'util/renderSchedule.js (due_now_forward)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
@@ -567,7 +568,7 @@ export const METRICS = Object.freeze({
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
-			'or suppression_held)',
+			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -659,13 +660,18 @@ export const METRICS = Object.freeze({
 			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
 			'sweepInterval and real cadence is being eaten. probe_throttled = probes the origin refused ' +
 			'with pushback (429/502/503/504/timeout), which is what drives the sweep to halve its rate: ' +
-			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it.',
+			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it. ' +
+			'due_now_forward = a render-now, revalidate, rejoin or probe filing made on a node that does not own the ' +
+			'row (queue.dueNowForward): forwarded (the owner filed it, keeping an earlier due time and a change ' +
+			'mark), fell-back (the owner could not be asked or refused, so it was filed here as before 0.97.0 — ' +
+			'which can demote the owner’s row), skipped (that owner failed within the last 30s; filed here). A ' +
+			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted and suppression_held are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'gone_reopen, suppression_lifted, suppression_held and due_now_forward are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -726,6 +732,7 @@ export const METRICS = Object.freeze({
 					'gone_reopen',
 					'suppression_lifted',
 					'suppression_held',
+					'due_now_forward',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -742,7 +749,8 @@ export const METRICS = Object.freeze({
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
-					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age.',
+					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age. ' +
+					'due_now_forward = off-owner "render this now" filings, by outcome.',
 			},
 			method: {
 				name: 'detail',
@@ -770,7 +778,8 @@ export const METRICS = Object.freeze({
 					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
-					'(http-gone, noindex, canonical-mismatch, ...). Other series: null.',
+					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
+					'fell-back, skipped). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -1018,6 +1027,8 @@ export const metrics = Object.freeze({
 
 	/** A failed invalidation-epoch resolution — a prerender_ops series. */
 	invalidationError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'invalidation_error', kind, null),
+	// a "render this now" filing on a node that does not own the row: forwarded to the owner, or filed here
+	dueNowForward: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'due_now_forward', outcome, null),
 
 	/** The outcome of one demand-driven heal attempt — a prerender_ops series. */
 	// outcome: 'written' | 'read-error' | 'write-error'. A skip is not counted here — the serve path's

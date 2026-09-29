@@ -2645,6 +2645,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 			}
 		),
+		dueNowForward: group(
+			'FORWARD A "RENDER THIS NOW" TO THE ROW’S OWNER (v0.97.0). Every render-now, revalidate, admin ' +
+				'rejoin and change-probe filing goes through one write that must never DEMOTE a row: a row ' +
+				'already due keeps its due time, and a change mark keeps its first instant. That needs the row, ' +
+				'and the row lives only on its residency owner — on any other node (about three in four on a ' +
+				'four-node cluster) the local read sees nothing, and the whole-row write that replicates to the ' +
+				'owner REPLACED its row: an overdue row pushed back to the current minute, its change mark and ' +
+				'demand estimate wiped.\n\n' +
+				'So a node that does not own the row asks the owner to file it (`POST /prerender_peer/due-now`), ' +
+				'where the read is authoritative, and writes nothing itself. The owner never forwards onward. ' +
+				'If the owner cannot be reached or refuses, the write is made locally exactly as before — never ' +
+				'worse than without this — and that owner is not asked again for 30 seconds, so a peer that is ' +
+				'down costs a bulk revalidate one timeout, not one per row. Counted as `prerender_ops` ' +
+				'`due_now_forward`.\n\n' +
+				'REQUIRES `peerRescue.token` and `peerRescue.header` (the shared cluster secret the peer ' +
+				'endpoints already use). With either unset this is inert and the endpoint answers 404.',
+			{
+				enabled: option(true, 'Forward when the peer token is configured. Off files every row locally, as before.'),
+				timeoutMs: option(
+					1000,
+					'Deadline for one forwarded filing, after which it is made locally. Short, because a render-now ' +
+						'waits on it: the bot is held for the render, and this sits in front of it. Capped at the ' +
+						'32-bit signed maximum because it reaches `setTimeout`.',
+					{ unit: 'ms', min: 1, max: 2147483647 }
+				),
+			}
+		),
 	}),
 
 	analytics: group(
