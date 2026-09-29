@@ -28,6 +28,8 @@ import {
 	walkOptions,
 	schemaNodeAt,
 	checkUiEditable,
+	describeItemRule,
+	invalidItems,
 	isOption,
 	SECOND,
 	MINUTE,
@@ -265,6 +267,14 @@ const enforceSchemaConstraints = (fresh, fallback = null) => {
 			const bad = value.filter((entry) => !node.itemEnum.includes(entry));
 			if (bad.length) {
 				reject(path, node, `${bad.map((v) => `'${v}'`).join(', ')} not allowed here`);
+				return;
+			}
+		}
+		if (node.items && Array.isArray(value)) {
+			const bad = invalidItems(node, value);
+			if (bad.length) {
+				const listed = bad.map((v) => JSON.stringify(v)).join(', ');
+				reject(path, node, `${listed} not allowed here — each entry must be ${describeItemRule(node.items)}`);
 				return;
 			}
 		}

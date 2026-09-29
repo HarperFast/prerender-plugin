@@ -19,6 +19,10 @@
  *   nonEmpty  true — an empty string/array is rejected at apply time (default kept).
  *             Reserved for values where empty is catastrophic rather than unwise.
  *   itemType  Display hint for array options ('string' | 'object').
+ *   items     { integer?, min?, max?, not? } — a rule every entry of a list of NUMBERS must meet.
+ *             A list with one entry breaking it is rejected whole at apply time (default
+ *             kept), like `itemEnum`, and for the same reason: it is for lists where a
+ *             rogue entry does harm rather than nothing.
  *   uiEditable
  *             false — the console must refuse to write this option, and says so instead of
  *             offering a control. Inherited by a group's children, like `scope`. Reserved for
@@ -275,7 +279,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'across them.',
 				{
 					enabled: option(true, 'Emit the periodic unrouted-path report.'),
-					interval: option(5 * MINUTE, 'How often each worker flushes its tally.', { unit: 'ms', min: SECOND }),
+					interval: option(
+						5 * MINUTE,
+						'How often each worker flushes its tally. At most 2147483647 (~24.8 days), Node’s timer ' +
+							'ceiling: past it a timer fires every millisecond rather than never.',
+						{ unit: 'ms', min: SECOND, max: 2147483647 }
+					),
 					maxBuckets: option(200, 'Distinct buckets tracked per class before overflow counting.', { min: 1 }),
 					topN: option(20, 'Buckets listed per log line, highest count first.', { min: 1 }),
 				}
@@ -657,11 +666,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			peerTimeoutMs: option(2500, 'Timeout for the peer-node explainer request.', { unit: 'ms', min: 1 }),
 			scanCap: option(
 				20000,
-				'Ceiling on rows touched by a management scan (the suppressed-target count, the analytics ' +
-					'reads). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
+				'Ceiling on rows touched by a management scan (the suppressed-target count, a sitemap’s ' +
+					'target count; the analytics scan has its own `analytics.scanCap`). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
 					'page-load query — so results past this are reported as truncated rather than silently ' +
-					'undercounted. The queue counts are not scans: they come from the queue keeper.',
-				{ min: 1 }
+					'undercounted. The queue counts are not scans: they come from the queue keeper.\n\n' +
+					'At most 1,000,000, 50x the default. It is editable from the console, and each walk it ' +
+					'bounds runs on a worker that also serves bot traffic. The largest such walk (every ' +
+					'suppressed target) is useful up to about this size; past it the answer is "a lot", and a ' +
+					'truncated count already reports that.',
+				{ min: 1, max: 1_000_000 }
 			),
 			backlogSnapshotInterval: option(
 				15 * MINUTE,
@@ -669,8 +682,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'and histogram, plus the table counts, which are scans and so never run on dashboard page load. ' +
 					'Its `overdue` count includes in-flight jobs (their rows keep their past due time until the ' +
 					'render lands). 0 disables the timer; the console’s Recompute button still triggers a one-off ' +
-					'pass.',
-				{ unit: 'ms', min: 0 }
+					'pass. At most 2147483647 (~24.8 days), Node’s timer ceiling: past it a timer fires every ' +
+					'millisecond rather than never, so a large value is not a way to switch this off — 0 is.',
+				{ unit: 'ms', min: 0, max: 2147483647 }
 			),
 			snapshotTableCounts: option(
 				true,
@@ -685,8 +699,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 			pageSize: option(
 				50,
 				'Rows per page for the console’s sitemap-entry and page-cache tables. Also bounds the ' +
-					'per-entry state lookups a sitemap detail performs (point reads, one per row).',
-				{ min: 1 }
+					'per-entry state lookups a sitemap detail performs (point reads, one per row). At most ' +
+					'500, 10x the default: a sitemap page costs two point reads per row, and a page longer than ' +
+					'this is a table nobody reads on one screen.',
+				{ min: 1, max: 500 }
 			),
 			analytics: group(
 				'The console’s Traffic/queue-health charts: ONE bounded primary-key scan of this node’s ' +
@@ -700,8 +716,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						DAY,
 						'Ceiling on the window one analytics request may ask for. The scan cost scales ' +
 							'directly with the window (rows = active metric combos × aggregate periods), so ' +
-							'this is the knob that bounds the worst read an operator can trigger.',
-						{ unit: 'ms', min: MINUTE }
+							'this is the knob that bounds the worst read an operator can trigger. At most 7 days, ' +
+							'7x the default and the console’s longest range (24h). A longer window would be ' +
+							'decided by `scanCap` rather than by the range, and would come back truncated.',
+						{ unit: 'ms', min: MINUTE, max: 7 * DAY }
 					),
 					cacheTtl: option(
 						MINUTE,
@@ -715,8 +733,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Ceiling on rows one analytics scan walks. The walk runs NEWEST-FIRST, so past the ' +
 							'cap it is the oldest end of the window that is shed, and the response reports ' +
 							'the window it actually covered rather than presenting a partial range as the ' +
-							'full one.',
-						{ min: 1000 }
+							'full one.\n\n' +
+							'Memory does not grow with this: each row is folded into its series as it is read, ' +
+							'so a scan holds one accumulator per metric combo, not the rows. What grows is the ' +
+							'time one scan keeps a serving worker busy, which is what the ceiling bounds. At ' +
+							'3,000,000 it is 10x the ~300,000 rows a busy node writes in 24h, which covers the ' +
+							'7-day `maxRange` ceiling at that rate.',
+						{ min: 1000, max: 3_000_000 }
 					),
 				}
 			),
@@ -1662,8 +1685,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				statuses: option(
 					[404, 410],
-					'Origin statuses to keep. Anything else is never stored. 5xx and 429 must never be here: they ' +
-						'are the origin failing to answer, not a statement that the page does not exist.'
+					'Origin statuses to keep. Anything else is never stored. Each entry must be an integer 4xx ' +
+						'other than 429, and a list with any other entry is refused whole (the default is kept). A 5xx ' +
+						'or a 429 is the origin failing to answer, not a statement that the page does not exist, so ' +
+						'storing one would replay an outage to crawlers. A string such as "404" never equals a ' +
+						'status, so it would store nothing.',
+					{ items: { integer: true, min: 400, max: 499, not: [429] } }
 				),
 				freshMs: option(
 					HOUR,
@@ -2061,10 +2088,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'write.',
 			{
 				enabled: option(true, 'Run the periodic schedule-repair sweep.'),
-				interval: option(6 * HOUR, 'How often each node sweeps its own slice of the keyspace.', {
-					unit: 'ms',
-					min: SECOND,
-				}),
+				interval: option(
+					6 * HOUR,
+					'How often each node sweeps its own slice of the keyspace. At most 2147483647 (~24.8 days), ' +
+						'Node’s timer ceiling: past it a timer fires every millisecond rather than never, so a large ' +
+						'value is not a way to switch the sweep off — `enabled: false` is.',
+					{ unit: 'ms', min: SECOND, max: 2147483647 }
+				),
 				startDelay: option(5 * MINUTE, 'Grace after boot before the first sweep.', {
 					unit: 'ms',
 					min: 0,
@@ -2497,10 +2527,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'How often each node re-resolves queue state on worker 0. The recompute scans nothing — ' +
 				'empty/queued/unready comes from the queue keeper. This interval governs how fast a ' +
 				'replicated pause/resume intent (QueueControl) converges onto a node, how often the QueueStatus ' +
-				'row is broadcast, and how often the lease gauge is reconciled.',
+				'row is broadcast, and how often the lease gauge is reconciled. At most 2147483647 (~24.8 days), ' +
+				'Node’s timer ceiling: past it a timer fires every millisecond rather than never.',
 			{
 				unit: 'ms',
 				min: SECOND,
+				max: 2147483647,
 			}
 		),
 		maxClaimLimit: option(
@@ -2961,7 +2993,18 @@ export const describeConfigSchema = () => {
 		if (isOption(node)) {
 			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
 			out.default = clone(node.default);
-			for (const key of ['enum', 'itemEnum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
+			for (const key of [
+				'enum',
+				'itemEnum',
+				'items',
+				'unit',
+				'min',
+				'max',
+				'nonEmpty',
+				'itemType',
+				'secret',
+				'movedFrom',
+			]) {
 				if (node[key] !== undefined) out[key] = node[key];
 			}
 			// Resolved rather than raw: the console renders a control from this, so it must not have to
@@ -2981,6 +3024,40 @@ export const describeConfigSchema = () => {
 	};
 	return describe(configSchema, 'live', true);
 };
+
+/**
+ * The entries of a list that break the option's `items` rule; empty when all pass or there is no
+ * rule. Shared by the apply-time constraint pass and the override door, so the two cannot disagree.
+ */
+export const invalidItems = (node, list) => {
+	const rule = node?.items;
+	if (!rule || !Array.isArray(list)) return [];
+	return list.filter(
+		(entry) =>
+			typeof entry !== 'number' ||
+			!Number.isFinite(entry) ||
+			(rule.integer && !Number.isInteger(entry)) ||
+			(rule.min !== undefined && entry < rule.min) ||
+			(rule.max !== undefined && entry > rule.max) ||
+			(Array.isArray(rule.not) && rule.not.includes(entry))
+	);
+};
+
+/** An `items` rule as the reason a refusal gives. */
+export const describeItemRule = (rule) =>
+	[
+		rule.integer ? 'an integer' : 'a number',
+		rule.min !== undefined && rule.max !== undefined
+			? `from ${rule.min} to ${rule.max}`
+			: rule.min !== undefined
+				? `>= ${rule.min}`
+				: rule.max !== undefined
+					? `<= ${rule.max}`
+					: null,
+		Array.isArray(rule.not) && rule.not.length ? `other than ${rule.not.join(', ')}` : null,
+	]
+		.filter(Boolean)
+		.join(' ');
 
 /**
  * May the console write this path, and if not, why not?

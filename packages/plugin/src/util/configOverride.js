@@ -34,7 +34,7 @@
  */
 
 import { config, getLogger, onConfigApplied, resolveConfig } from '../config.js';
-import { aliasPaths, checkUiEditable } from '../configSchema.js';
+import { aliasPaths, checkUiEditable, describeItemRule, invalidItems } from '../configSchema.js';
 
 const table = () => databases.config.ConfigOverride;
 
@@ -251,6 +251,17 @@ export const validateOverride = (path, value) => {
 			// itemEnum a rogue entry is corrupting rather than merely wrong, and a half-applied list is
 			// worse than the default one.
 			return { ok: false, reason: `${path}: ${bad.map((v) => `'${v}'`).join(', ')} not allowed here` };
+		}
+	}
+
+	if (node.items && Array.isArray(value)) {
+		const bad = invalidItems(node, value);
+		if (bad.length) {
+			const listed = bad.map((v) => JSON.stringify(v)).join(', ');
+			return {
+				ok: false,
+				reason: `${path}: ${listed} not allowed here — each entry must be ${describeItemRule(node.items)}`,
+			};
 		}
 	}
 
