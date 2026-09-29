@@ -130,14 +130,34 @@ const ignoredDownstreamRequestHeaders = () => {
 // encoding and re-encodes stored pages itself, the proxy path relays content-encoding +
 // content-length for the passed-through body. See the accept-encoding note in
 // resolveUpstreamHeaders for why the origin body is fetched gzip (not brotli).
+//
+// `location` IS WHAT MAKES A PROXIED REDIRECT A REDIRECT. The dispatcher's `request()` does not
+// follow redirects, so an origin 301/302/307/308 is relayed as that status — and without this
+// header the crawler got a 301 naming no target: a dead end it records against the URL instead of
+// the move the origin declared. Relayed VERBATIM, relative or absolute: the origin resolved it
+// against the public URL, which is the URL the crawler asked for (forwarded mode rebuilds the fetch
+// from the forwarded host; prefix mode's absolute URL is the public one), so the client resolves it
+// correctly with no rewriting here.
+//
+// `content-language` is the origin's own statement of the document's language, which a crawler
+// uses to place the page; dropping it on a miss served the same document with less information than
+// the origin gave.
+//
+// `link` is DELIBERATELY STILL ABSENT. It is not a CDN header, but these headers are also what
+// traffic discovery reads (`isPrerenderCandidate` refuses a URL whose Link canonical names another
+// URL, by exact string compare), and that check has never seen a Link header on this path. Adding it
+// here would switch on a never-exercised mint refusal for every origin that sends one. The rendered
+// snapshot's stored `link` is governed by `page.serveLinkHeader` (http_handlers/response.js).
 const FORWARDED_RESPONSE_HEADERS = new Set([
 	'content-type',
 	'content-encoding',
 	'content-length',
+	'content-language',
 	'cache-control',
 	'expires',
 	'etag',
 	'last-modified',
+	'location',
 	'vary',
 	'x-robots-tag',
 	'retry-after',
@@ -196,6 +216,27 @@ export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators
 	return upstream;
 };
 
+/**
+ * End an origin body that nobody will read, so its connection goes back to the pool (or is closed)
+ * now rather than when undici's `bodyTimeout` fires. Dropping the reference is not enough — the
+ * socket stays held until the body is consumed — and that is how a HEAD, or a 304 answered locally
+ * from an origin 200, used to pin one origin connection each.
+ *
+ * BY DESTROYING THE UNDERLYING NODE STREAM, never by `cancel()`ing the web stream wrapped around it.
+ * Node's `Readable.toWeb` adapter (measured on v24.15) keeps a scheduled `resume` after a cancel, whose
+ * next `data` event enqueues into the closed controller and throws `ERR_INVALID_STATE` from an event
+ * handler — an uncaughtException on the serve path. Destroying the source is the same release with no
+ * adapter in the way. A captured body carries its own `releaseBody`, which drains the crawler's branch
+ * instead so the capture beside it still completes (util/rawCache.js#discardStream).
+ *
+ * A resource that did not come from `fetchOriginResource` (a stored page, a test fixture) falls back to
+ * its stream's own `cancel`, not awaited: a tee branch's cancel settles only when both branches do.
+ */
+export const releaseOriginBody = (resource) => {
+	if (typeof resource?.releaseBody === 'function') resource.releaseBody();
+	else resource?.content?.cancel?.()?.catch?.(() => {});
+};
+
 export const fetchOriginResource = async (request) => {
 	const { url, deviceType, method = 'GET', body, stripValidators = false, reason = 'other' } = request;
 	const headers = request.headers.asObject;
@@ -234,6 +275,9 @@ export const fetchOriginResource = async (request) => {
 		statusCode: response.statusCode,
 		headers: sanitizeOriginResponseHeaders(response.headers),
 		content: Readable.toWeb(response.body),
+		// See `releaseOriginBody`. A property rather than a lookup so it survives the `{ ...resource }`
+		// copies the capture paths make.
+		releaseBody: () => response.body.destroy(),
 		viaStaging: Boolean(stagingIp),
 		// SURFACED SEPARATELY BECAUSE THE SANITIZER DROPS IT. `set-cookie` is not on the forwarded
 		// allowlist, so by the time a caller sees `headers` there is nothing left to tell it the origin

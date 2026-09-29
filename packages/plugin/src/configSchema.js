@@ -749,6 +749,21 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'The cap turns that into a rejected value that keeps the default.',
 			{ unit: 'ms', min: 0, max: 2147483647 }
 		),
+		serveLinkHeader: option(
+			true,
+			'Serve the origin document’s `Link` response header with a cached page.\n\n' +
+				'The renderer stores the header off the origin document precisely so a canonical or hreflang ' +
+				'alternate declared in HTTP (rather than in the markup) reaches the crawler with the snapshot — ' +
+				'which is what a browser loading the same URL receives. Every earlier release stripped it on ' +
+				'every serve, a rule inherited from a predecessor codebase that relayed the origin’s headers ' +
+				'wholesale on the proxy path, where it kept the live page’s resource hints off relayed responses. ' +
+				'This plugin’s proxy path is allowlisted and has never carried `Link`, so the strip ended up ' +
+				'acting only on the header the renderer stored on purpose.\n\n' +
+				'Turn it off if the origin’s `Link` is mostly resource hints (`preload`, `preconnect`) and the ' +
+				'edge in front of this plugin acts on them for bot traffic (103 Early Hints, for example). One ' +
+				'check settles it: look at a stored page’s `headers` for `link`, and see which `rel` values it ' +
+				'carries. A proxied (cache-miss) response is unaffected either way — it never carries `Link`.'
+		),
 	}),
 
 	invalidation: group(

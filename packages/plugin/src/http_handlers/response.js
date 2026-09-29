@@ -14,6 +14,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { headersToObject } from '../util/headers.js';
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
 import { metrics } from '../metrics.js';
+import { releaseOriginBody } from '../util/upstream.js';
 
 // Headers preserved on a 304 response; everything else is dropped.
 const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
@@ -33,32 +34,48 @@ function formatRoute(route) {
 	return `${route.match ?? ''} ${route.path ?? ''} [${params}] ${route.mode ?? ''} (${route.source ?? ''})`;
 }
 
+// The origin's validators, which a rendered snapshot must not carry. See `buildResponseHeaders`.
+const ORIGIN_VALIDATORS = new Set(['etag', 'last-modified']);
+
 /**
  * Build the base response headers from the upstream/cached resource: copy every upstream
- * header except `link`, and set `age` for a cached 200.
+ * header (`link` only under `page.serveLinkHeader`), and set `age` for a cached 200.
+ *
+ * `snapshot` — the body is a RENDERED page (a cache serve, a peer rescue, a render-now result),
+ * not the origin's own bytes. Its stored `etag`/`last-modified` are the ORIGIN DOCUMENT's, which
+ * the renderer kept from the response it rendered, and they describe that raw document, not the
+ * snapshot: a re-render that changed client-rendered content (prices, reviews, stock) under an
+ * unchanged origin ETag answered the crawler's next conditional request 304, and the crawler kept
+ * the old snapshot while every signal said a fresh page was being served. So a snapshot carries
+ * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, which moves on every
+ * render. No ETag: none is cheaply at hand (the page stores no content hash, and hashing ~220 KB
+ * per request is not cheap), and an ETag that is not about the bytes is the defect being removed.
+ * A raw-cache document is the origin's bytes verbatim, so it keeps the origin's validators.
  */
-export function buildResponseHeaders(resource) {
+export function buildResponseHeaders(resource, snapshot = false) {
 	const headers = new Headers();
 	const upstreamHeaders = headersToObject(resource.headers);
+	const serveLink = config.page.serveLinkHeader;
 
 	for (const [key, value] of Object.entries(upstreamHeaders)) {
+		if (key === 'link' && !serveLink) continue;
+		if (snapshot && ORIGIN_VALIDATORS.has(key)) continue;
 		try {
-			if (key !== 'link') {
-				headers.append(key, value);
-			}
+			headers.append(key, value);
 		} catch (e) {
 			getLogger().error(e);
 		}
 	}
 
-	if (resource.statusCode === 200 && resource.lastCached) {
-		// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad
-		// value yields no age header rather than "NaN".
-		const lastCachedMs = new Date(resource.lastCached).getTime();
-		if (!isNaN(lastCachedMs)) {
+	// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad value yields
+	// no header rather than "NaN" or an "Invalid Date" validator.
+	const lastCachedMs = resource.lastCached ? new Date(resource.lastCached).getTime() : NaN;
+	if (!isNaN(lastCachedMs)) {
+		if (resource.statusCode === 200) {
 			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
 			headers.set('age', String(ageSec));
 		}
+		if (snapshot) headers.set('last-modified', new Date(lastCachedMs).toUTCString());
 	}
 
 	return headers;
@@ -208,7 +225,11 @@ export function deliverResource(resource, request, info = {}) {
 	// was turned into an origin serve BEFORE this function committed a status (see
 	// `resolveResource`). The fallback to `resource.content` covers the origin path and the
 	// render-now timeout fallback, which can hand back a cached page nobody materialized.
-	let body = request.method === 'HEAD' ? undefined : (info.cachedBody ?? resource.content);
+	const isHead = request.method === 'HEAD';
+	let body = isHead ? undefined : (info.cachedBody ?? resource.content);
+	// A HEAD is forwarded upstream as a HEAD, so this body is normally already empty — but it is
+	// still a live stream on an open socket until someone ends it.
+	if (isHead) releaseOriginBody(resource);
 	const wasCacheMiss = computeWasCacheMiss(resource);
 
 	// RESIDUAL PATH ONLY: a cached Blob that arrived unmaterialized. It still streams, and a
@@ -232,7 +253,10 @@ export function deliverResource(resource, request, info = {}) {
 		body = body.stream();
 	}
 
-	let headers = buildResponseHeaders(resource);
+	// 'cache' and 'rendered' are the sources whose body is a rendered snapshot; 'raw' and 'negative'
+	// are the origin's own stored bytes, and 'origin' its live ones.
+	const snapshot = info.source === 'cache' || info.source === 'rendered';
+	let headers = buildResponseHeaders(resource, snapshot);
 
 	// A CONDITIONAL REQUEST MUST NOT BE ABLE TO UNDO AN INVALIDATION, and it could, by two
 	// independent routes. The crawler's validators are ones this plugin handed it off the
@@ -249,7 +273,11 @@ export function deliverResource(resource, request, info = {}) {
 	const suppressConditional = info.cacheStatus === 'invalidated';
 
 	if (!suppressConditional) {
+		const unconditional = body;
 		({ status, headers, body } = applyConditional(status, headers, request, body));
+		// A 304 made HERE out of an origin 200 abandons the origin's body — the same pinned socket as a
+		// HEAD, on every conditional request the origin itself did not answer 304.
+		if (body === undefined && unconditional !== undefined) releaseOriginBody(resource);
 	}
 
 	// AFTER `applyConditional`, not before — the same treatment `x-harper-render-now` already gets

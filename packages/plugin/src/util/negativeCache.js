@@ -44,8 +44,15 @@ import { metrics } from '../metrics.js';
 import { Target } from '../resources/Target.js';
 import { materializeCachedBody } from './cachedBody.js';
 import { dateColumnMs } from './time.js';
-import { fetchOriginResource } from './upstream.js';
-import { collectBody, hasCacheControlDirective, storedHeaders, teeForCapture, unsharedHint } from './rawCache.js';
+import { fetchOriginResource, releaseOriginBody } from './upstream.js';
+import {
+	collectBody,
+	discardStream,
+	hasCacheControlDirective,
+	storedHeaders,
+	teeForCapture,
+	unsharedHint,
+} from './rawCache.js';
 
 const table = () => databases.negative_cache.NegativePage;
 
@@ -215,10 +222,18 @@ export const negativeCaptureSlotsInUse = () => inFlightCaptures;
 
 /**
  * Attach a capture to a proxied 404/410, returning the resource with its body replaced by the branch the
- * crawler will read. The store — and the Target guard read in front of it — are DETACHED: a write in front
- * of a crawler's body is latency the crawler pays for a benefit only the next crawler gets.
+ * crawler will read — or a promise of it, when the Target guard has to be read first.
+ *
+ * THE GUARD IS READ BEFORE THE BODY IS TEED, NOT AFTER IT IS BUFFERED. The other order teed and read every
+ * byte of the 404 into memory and only then asked whether it could be kept — so for a URL a sitemap lists,
+ * which answers 404 on EVERY request and is refused on every one, each request paid a tee, a full buffer
+ * and a capture slot for a store that could never happen. The read was already made per capture, so this
+ * adds no read; it moves one local point read in front of the response of a 404 that has no stored entry.
+ * `guarded` is the verdict the lookup already read (`answerFromNegativeCache`), when it read one, so that
+ * request pays no second read. The store itself stays detached: a write in front of a crawler's body is
+ * latency the crawler pays for a benefit only the next crawler gets.
  */
-export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard = targetGuard }) => {
+export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard = targetGuard, guarded }) => {
 	const refusal = negativeStoreRefusal(resource, policy);
 	if (refusal) {
 		metrics.negativeCache(refusal);
@@ -226,6 +241,21 @@ export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard
 	}
 	if (typeof resource.content?.tee !== 'function') {
 		metrics.negativeCache('no-body');
+		return resource;
+	}
+	if (guarded !== undefined) return attachNegativeCapture(resource, { key, policy, guarded });
+	// Rejection is mapped to the guard's own failure verdict: this promise is now on the response path, so
+	// a throw here would turn the crawler's 404 into a 500.
+	return guard(cacheUrl, policy).then(
+		(verdict) => attachNegativeCapture(resource, { key, policy, guarded: verdict }),
+		() => attachNegativeCapture(resource, { key, policy, guarded: 'error' })
+	);
+};
+
+const attachNegativeCapture = (resource, { key, policy, guarded }) => {
+	if (guarded) {
+		// The body is untouched: the crawler reads the origin's stream directly, and nothing is buffered.
+		metrics.negativeCache(guarded === 'error' ? 'guard-error' : `skipped-${guarded}`);
 		return resource;
 	}
 	if (inFlightCaptures >= policy.maxConcurrentCaptures) {
@@ -245,17 +275,10 @@ export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard
 	}
 	inFlightCaptures++;
 	captured
-		.then(async (result) => {
+		.then((result) => {
 			// `.length`, not truthiness — an empty Buffer is truthy (see captureForRawCache).
 			if (!result.bytes?.length) {
 				metrics.negativeCache(result.bytes ? 'empty' : result.outcome);
-				return;
-			}
-			// Checked again here, not only on read: storing a 404 for a URL a sitemap lists would cost every
-			// later request a guard read and a drop, and the origin already said it exists.
-			const guarded = await guard(cacheUrl, policy);
-			if (guarded) {
-				metrics.negativeCache(guarded === 'error' ? 'guard-error' : `skipped-${guarded}`);
 				return;
 			}
 			return storeNegativePage({ key, resource, bytes: result.bytes, policy });
@@ -266,7 +289,8 @@ export const captureForNegativeCache = (resource, { key, cacheUrl, policy, guard
 			inFlightCaptures--;
 		});
 
-	return { ...resource, content: downstream };
+	// Released by draining, not destroying, for the reason `captureForRawCache` gives.
+	return { ...resource, content: downstream, releaseBody: () => discardStream(downstream) };
 };
 
 // What a background re-check sends. There is no request to borrow headers from — the one that triggered
@@ -325,7 +349,7 @@ export const refreshNegativeBody = async ({ key, resource, policy, nowMs = Date.
 	metrics.negativeCache('recheck-gone');
 	const refusal = negativeStoreRefusal(resource, policy);
 	if (refusal || typeof resource.content?.getReader !== 'function') {
-		resource.content?.cancel?.()?.catch?.(() => {});
+		releaseOriginBody(resource);
 		metrics.negativeCache(refusal ?? 'no-body');
 		await dropNegativePage(key);
 		return 'dropped';
@@ -389,9 +413,9 @@ export const startNegativeRecheck = ({
 			return;
 		}
 		// A HEAD has no body, and a GET that is not storing one has nothing to read, but either stream still
-		// has to be closed to release the socket. Not awaited: a cancel that never settles must not pin the
-		// re-check slot.
-		resource.content?.cancel?.()?.catch?.(() => {});
+		// has to be closed to release the socket — by destroying the source, not cancelling the web stream
+		// (see `releaseOriginBody`), and not awaited, so nothing can pin the re-check slot.
+		releaseOriginBody(resource);
 		await settleNegativeRecheck({ key, cacheUrl, statusCode: resource.statusCode, policy, onLive });
 	})()
 		.catch((e) => logger.warn?.(`[prerender] negative-cache re-check failed for ${key}: ${e?.message ?? String(e)}`))
@@ -456,15 +480,17 @@ export const answerFromNegativeCache = async ({
 		metrics.negativeCache('guard-error');
 		return { row, verdict, excluded: true };
 	}
+	// `guarded` rides along past this point so `afterNegativeProxy` does not read the same Target again
+	// before deciding whether to capture: this request's verdict is already in hand.
 	if (guarded) {
 		metrics.negativeCache(`guarded-${guarded}`);
 		void dropNegativePage(key);
-		return { row: null, verdict: null };
+		return { row: null, verdict: null, guarded };
 	}
 
 	if (policy.dryRun) {
 		metrics.negativeCache(verdict === 'fresh' ? 'would-serve' : 'would-revalidate');
-		return { row, verdict };
+		return { row, verdict, guarded };
 	}
 
 	// Read the body before committing to the answer, as the page and raw paths do: an unreadable blob
@@ -472,7 +498,7 @@ export const answerFromNegativeCache = async ({
 	const body = await materializeCachedBody(row, method);
 	if (!body.ok) {
 		metrics.negativeCache('read-blob-failed');
-		return { row, verdict: 'expired' };
+		return { row, verdict: 'expired', guarded };
 	}
 
 	const started =
@@ -505,7 +531,7 @@ export const answerFromNegativeCache = async ({
 /**
  * After a request the negative cache did not answer has been proxied: store a 404 that has no entry,
  * refresh one the origin just confirmed, drop one the origin just contradicted. Returns the resource the
- * crawler will read (teed when a capture is attached).
+ * crawler will read (teed when a capture is attached), or a promise of it while the Target guard is read.
  *
  * THE DRY RUN'S ONE SUBTLETY: a proxied 404 may refresh `checkedAt` only where an ARMED cache would have
  * asked the origin too. Refreshing on every request would restart the fresh window on requests an armed
@@ -514,15 +540,26 @@ export const answerFromNegativeCache = async ({
  * Where it does refresh, bytes that have outlived `lifeMs` are replaced by the ones just proxied rather
  * than confirmed — what an armed cache's GET re-check does, here for free.
  */
-export const afterNegativeProxy = (resource, { key, cacheUrl, policy, lookup = {}, nowMs = Date.now() }) => {
-	const { row = null, verdict = null, excluded = false } = lookup;
+export const afterNegativeProxy = (
+	resource,
+	{ key, cacheUrl, policy, lookup = {}, method = 'GET', nowMs = Date.now() }
+) => {
+	const { row = null, verdict = null, excluded = false, guarded } = lookup;
 	const status = resource.statusCode;
 
 	if (policy.statuses.includes(status)) {
-		if (!row || verdict === 'expired') return captureForNegativeCache(resource, { key, cacheUrl, policy });
+		// A HEAD carries no body: it can confirm a stored answer's status, as the background HEAD re-check
+		// does, but it can never supply one. Capturing it would store an empty 404 — or, for bytes that have
+		// outlived `lifeMs`, confirming would keep serving them; so where a body is needed it does neither.
+		const head = method === 'HEAD';
+		if (!row || verdict === 'expired') {
+			return head ? resource : captureForNegativeCache(resource, { key, cacheUrl, policy, guarded });
+		}
 		const armedWouldAsk = excluded || !policy.dryRun || verdict !== 'fresh';
 		if (!armedWouldAsk) return resource;
-		if (negativeBodyExpired(row, policy, nowMs)) return captureForNegativeCache(resource, { key, cacheUrl, policy });
+		if (negativeBodyExpired(row, policy, nowMs)) {
+			return head ? resource : captureForNegativeCache(resource, { key, cacheUrl, policy, guarded });
+		}
 		void confirmNegativePage(key, policy, nowMs);
 		return resource;
 	}

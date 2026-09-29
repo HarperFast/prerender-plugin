@@ -210,7 +210,7 @@ test('every refusal names itself, and the switches widen only their own refusal'
 
 test('a proxied 404 is captured, delivered in full, and stored with its windows set from now', async () => {
 	const before = Date.now();
-	const out = nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() });
+	const out = await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() });
 	assert.equal(await drain(out.content), 'ITEM-GONE-1', 'the crawler gets every byte');
 	await settle();
 	const row = rows.get(KEY_A);
@@ -229,7 +229,7 @@ test('a proxied 404 is captured, delivered in full, and stored with its windows 
 
 test('a URL a sitemap lists is never stored, and neither is one with any Target under skipTargets: any', async () => {
 	targets.set(URL_A, { sitemapUrl: 'https://www.example.com/sitemap_product_1.xml' });
-	const out = nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() });
+	const out = await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() });
 	await drain(out.content);
 	await settle();
 	assert.equal(rows.size, 0);
@@ -237,13 +237,15 @@ test('a URL a sitemap lists is never stored, and neither is one with any Target 
 
 	targets.set(URL_A, { state: 'suppressed' });
 	ops.length = 0;
-	await drain(nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() }).content);
+	await drain(
+		(await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: policy() })).content
+	);
 	await settle();
 	assert.equal(rows.size, 1, 'an unlisted Target is stored under the default');
 	rows.clear();
 	ops.length = 0;
 	const any = policy({ skipTargets: 'any' });
-	await drain(nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: any }).content);
+	await drain((await nc.captureForNegativeCache(origin404(), { key: KEY_A, cacheUrl: URL_A, policy: any })).content);
 	await settle();
 	assert.equal(rows.size, 0);
 	assert.deepEqual(opsOf('negative_cache'), ['skipped-target']);
@@ -251,22 +253,27 @@ test('a URL a sitemap lists is never stored, and neither is one with any Target 
 
 test('an empty body is not stored, and a refused response is returned untouched with its body never teed', async () => {
 	await drain(
-		nc.captureForNegativeCache(origin404({ content: streamOf('') }), { key: KEY_A, cacheUrl: URL_A, policy: policy() })
-			.content
+		(
+			await nc.captureForNegativeCache(origin404({ content: streamOf('') }), {
+				key: KEY_A,
+				cacheUrl: URL_A,
+				policy: policy(),
+			})
+		).content
 	);
 	await settle();
 	assert.equal(rows.size, 0);
 	assert.deepEqual(opsOf('negative_cache'), ['empty']);
 
 	const refused = origin404({ hadSetCookie: true });
-	assert.equal(nc.captureForNegativeCache(refused, { key: KEY_A, cacheUrl: URL_A, policy: policy() }), refused);
+	assert.equal(await nc.captureForNegativeCache(refused, { key: KEY_A, cacheUrl: URL_A, policy: policy() }), refused);
 });
 
 test('a tee that throws costs neither the response nor a capture slot', async () => {
 	const locked = streamOf('ITEM-GONE-1');
 	locked.getReader();
 	const resource = origin404({ content: locked });
-	const out = nc.captureForNegativeCache(resource, { key: KEY_A, cacheUrl: URL_A, policy: policy() });
+	const out = await nc.captureForNegativeCache(resource, { key: KEY_A, cacheUrl: URL_A, policy: policy() });
 	assert.equal(out, resource, 'the response is handed back untouched');
 	assert.equal(nc.negativeCaptureSlotsInUse(), 0);
 	assert.deepEqual(opsOf('negative_cache'), ['capture-failed']);
@@ -278,8 +285,12 @@ test('the capture cap is honoured and released on every path', async () => {
 	const slow = new ReadableStream({
 		start: (c) => (release = () => (c.enqueue(new TextEncoder().encode('X')), c.close())),
 	});
-	const first = nc.captureForNegativeCache(origin404({ content: slow }), { key: KEY_A, cacheUrl: URL_A, policy: p });
-	const second = nc.captureForNegativeCache(origin404(), { key: 'other', cacheUrl: URL_A, policy: p });
+	const first = await nc.captureForNegativeCache(origin404({ content: slow }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: p,
+	});
+	const second = await nc.captureForNegativeCache(origin404(), { key: 'other', cacheUrl: URL_A, policy: p });
 	assert.deepEqual(opsOf('negative_cache'), ['capture-busy']);
 	assert.equal(typeof second.content.tee, 'function', 'served untouched');
 	release();
@@ -382,7 +393,7 @@ test('an invalidation refuses the entry for an EXCLUDED bot too, so its proxied 
 	assert.equal(lookup.verdict, 'expired');
 	assert.deepEqual(opsOf('negative_cache'), ['invalidated'], 'decided before the bot check');
 	// Confirming here would move checkedAt past the epoch and make the pre-invalidation bytes answerable.
-	const out = nc.afterNegativeProxy(origin404(), {
+	const out = await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: policy({ excludeBots: ['Googlebot'] }),
@@ -421,7 +432,7 @@ test('a DRY RUN never answers; it counts would-serve and would-revalidate instea
 // ── after a proxy ────────────────────────────────────────────────────────────────────────────
 
 test('after a proxied 404 with no entry: captured and stored', async () => {
-	const out = nc.afterNegativeProxy(origin404(), {
+	const out = await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: policy(),
@@ -436,7 +447,7 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 	const dry = policy({ dryRun: true });
 	const row = storedRow();
 	rows.set(KEY_A, row);
-	nc.afterNegativeProxy(origin404(), {
+	await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: dry,
@@ -446,7 +457,7 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 	await settle();
 	assert.deepEqual(writes, [], 'armed would have answered from storage: no confirmation');
 
-	nc.afterNegativeProxy(origin404(), {
+	await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: dry,
@@ -457,7 +468,7 @@ test('a dry run refreshes the window ONLY where an armed cache would have asked 
 	assert.deepEqual(writes, [['patch', KEY_A]], 'armed would have re-checked: this proxy is that check');
 
 	writes.length = 0;
-	nc.afterNegativeProxy(origin404(), {
+	await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: dry,
@@ -472,7 +483,7 @@ test('THE RISK NUMBER: a dry run counts would-serve-live when the origin answers
 	const dry = policy({ dryRun: true });
 	const row = storedRow();
 	rows.set(KEY_A, row);
-	nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+	await nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: dry,
@@ -491,7 +502,7 @@ test('a proxied 200 or redirect drops the entry; a 5xx leaves it', async () => {
 	]) {
 		const row = storedRow();
 		rows.set(KEY_A, row);
-		nc.afterNegativeProxy(origin404({ statusCode }), {
+		await nc.afterNegativeProxy(origin404({ statusCode }), {
 			key: KEY_A,
 			cacheUrl: URL_A,
 			policy: policy(),
@@ -693,7 +704,7 @@ test('an outlived body the origin now refuses, or sends empty, is dropped — ne
 test("an excluded bot's proxied 404 replaces an outlived body instead of confirming it", async () => {
 	const row = storedRow({ storedAt: new Date(NOW - 20 * HOUR) });
 	rows.set(KEY_A, row);
-	const out = nc.afterNegativeProxy(origin404(), {
+	const out = await nc.afterNegativeProxy(origin404(), {
 		key: KEY_A,
 		cacheUrl: URL_A,
 		policy: policy(),
@@ -704,6 +715,106 @@ test("an excluded bot's proxied 404 replaces an outlived body instead of confirm
 	await settle();
 	assert.deepEqual(writes, [['put', KEY_A]]);
 	assert.equal(rows.get(KEY_A).content.toString(), 'ITEM-GONE-1');
+});
+
+test('a listed URL answering 404 is guarded BEFORE its body is teed — no tee, no buffer, no capture slot', async () => {
+	// The defect: every request for a sitemap-listed URL that answers 404 teed and buffered the whole body
+	// into memory, and only then read the guard that refused to store it — on every request, forever.
+	targets.set(URL_A, { sitemapUrl: 'https://www.example.com/sitemap_product_1.xml' });
+	const resource = origin404();
+	let lockedAtGuard = null;
+	const guard = async (url, p) => {
+		lockedAtGuard = resource.content.locked;
+		return nc.targetGuard(url, p);
+	};
+	const out = await nc.captureForNegativeCache(resource, { key: KEY_A, cacheUrl: URL_A, policy: policy(), guard });
+	assert.equal(lockedAtGuard, false, 'the guard ran before anything took a reader on the body');
+	assert.equal(out, resource, 'handed back untouched: the crawler reads the origin stream directly');
+	assert.equal(out.content.locked, false, 'never teed');
+	assert.equal(nc.negativeCaptureSlotsInUse(), 0);
+	assert.equal(await drain(out.content), 'ITEM-GONE-1');
+	await settle();
+	assert.equal(rows.size, 0);
+	assert.deepEqual(opsOf('negative_cache'), ['skipped-listed']);
+});
+
+test('a guard verdict the lookup already read is carried to the capture, which reads no Target again', async () => {
+	// The lookup found a stale row for a URL that is now listed: it reads the guard, drops the row, and the
+	// proxied 404 must neither tee nor ask the Target a second time.
+	rows.set(KEY_A, storedRow());
+	targets.set(URL_A, { sitemapUrl: 'https://www.example.com/sitemap_product_1.xml' });
+	let reads = 0;
+	const guard = async (url, p) => {
+		reads++;
+		return nc.targetGuard(url, p);
+	};
+	const lookup = await answer({ guard });
+	assert.equal(lookup.guarded, 'listed');
+	const resource = origin404();
+	const out = await nc.afterNegativeProxy(resource, { key: KEY_A, cacheUrl: URL_A, policy: policy(), lookup });
+	assert.equal(out, resource);
+	assert.equal(reads, 1, 'one Target read for the whole request');
+	assert.deepEqual(opsOf('negative_cache'), ['guarded-listed', 'skipped-listed']);
+});
+
+test('a guard that throws on the response path costs the capture, never the response', async () => {
+	const resource = origin404();
+	const out = await nc.captureForNegativeCache(resource, {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		guard: async () => {
+			throw new Error('storage fault');
+		},
+	});
+	assert.equal(out, resource);
+	assert.deepEqual(opsOf('negative_cache'), ['guard-error']);
+});
+
+test('a proxied HEAD 404 stores nothing, and never confirms bytes that have outlived their life', async () => {
+	// No entry: a HEAD has no body to store — capturing it would keep an empty 404.
+	const head = origin404({ content: streamOf('') });
+	assert.equal(
+		await nc.afterNegativeProxy(head, {
+			key: KEY_A,
+			cacheUrl: URL_A,
+			policy: policy(),
+			lookup: { row: null },
+			method: 'HEAD',
+		}),
+		head
+	);
+	await settle();
+	assert.deepEqual(writes, []);
+
+	// An entry whose bytes have outlived lifeMs: confirming would keep serving them, and a HEAD cannot
+	// replace them, so it does neither.
+	const outlived = storedRow({ storedAt: new Date(NOW - 20 * HOUR) });
+	rows.set(KEY_A, outlived);
+	await nc.afterNegativeProxy(origin404({ content: streamOf('') }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		lookup: { row: outlived, verdict: 'revalidate', excluded: true },
+		method: 'HEAD',
+		nowMs: NOW,
+	});
+	await settle();
+	assert.deepEqual(writes, []);
+
+	// A body still inside its life: the HEAD's status confirms it, exactly as the background HEAD does.
+	const fresh = storedRow();
+	rows.set(KEY_A, fresh);
+	await nc.afterNegativeProxy(origin404({ content: streamOf('') }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		lookup: { row: fresh, verdict: 'revalidate', excluded: true },
+		method: 'HEAD',
+		nowMs: NOW,
+	});
+	await settle();
+	assert.deepEqual(writes, [['patch', KEY_A]]);
 });
 
 test('the guard reads the Target once, locally: listed, any Target, or nothing', async () => {

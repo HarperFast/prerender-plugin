@@ -357,6 +357,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		return fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
 			reason: failStatus,
 		});
@@ -492,9 +493,14 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
 	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
 	// invalidation worked. See util/upstream.js.
+	//
+	// A HEAD GOES UPSTREAM AS A HEAD. Sent as a GET, the origin built and sent a full document that
+	// nothing would read: `deliverResource` drops the body of a HEAD, and the undici stream behind it
+	// held its socket until `bodyTimeout` — one pinned origin connection per HEAD miss.
 	const resource = await fetchOriginResource({
 		url,
 		deviceType,
+		method: request.method,
 		headers: request.headers,
 		stripValidators: info.cacheStatus === 'invalidated',
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
@@ -503,12 +509,22 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
-	// store is detached inside `captureForRawCache` — no latency on this response.
-	const kept = rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
-	// Same rule for a 404/410: the store (and the Target guard in front of it) is detached. The two never
-	// both attach — the raw cache stores only 200s, the negative cache only its configured statuses.
+	// store is detached inside `captureForRawCache` — no latency on this response. Never for a HEAD:
+	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
+	const kept =
+		rawPolicy && request.method !== 'HEAD'
+			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy })
+			: resource;
+	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
+	// only 200s, the negative cache only its configured statuses.
 	return negativePolicy
-		? afterNegativeProxy(kept, { key: negativeKey, cacheUrl, policy: negativePolicy, lookup: negativeLookup })
+		? afterNegativeProxy(kept, {
+				key: negativeKey,
+				cacheUrl,
+				policy: negativePolicy,
+				lookup: negativeLookup,
+				method: request.method,
+			})
 		: kept;
 }
 
@@ -757,6 +773,7 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 		resource: await fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
 			stripValidators: !!activeEpoch,
 			reason: 'render-timeout',

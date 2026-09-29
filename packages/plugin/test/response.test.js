@@ -23,18 +23,24 @@ const mockRequest = (headers = {}) => {
 
 beforeEach(() => applyOptions({}));
 
-test('buildResponseHeaders copies upstream headers, drops link, sets age for a cached 200', () => {
+test('buildResponseHeaders copies upstream headers, keeps link, sets age for a cached 200', () => {
 	const resource = {
 		statusCode: 200,
-		headers: { 'content-type': 'text/html', 'link': '<https://x>; rel=preload', 'etag': '"abc"' },
+		headers: { 'content-type': 'text/html', 'link': '<https://x>; rel=canonical', 'etag': '"abc"' },
 		lastCached: new Date(Date.now() - 5000),
 	};
 	const headers = buildResponseHeaders(resource);
 	assert.equal(headers.get('content-type'), 'text/html');
 	assert.equal(headers.get('etag'), '"abc"');
-	assert.equal(headers.has('link'), false);
+	assert.equal(headers.get('link'), '<https://x>; rel=canonical', 'the renderer stored it to be served');
 	const age = Number(headers.get('age'));
 	assert.ok(age >= 4 && age <= 7, `expected age ~5, got ${age}`);
+});
+
+test('page.serveLinkHeader: false restores the strip', () => {
+	applyOptions({ page: { serveLinkHeader: false } });
+	const headers = buildResponseHeaders({ statusCode: 200, headers: { link: '<https://x>; rel=preload' } }, true);
+	assert.equal(headers.has('link'), false);
 });
 
 test('buildResponseHeaders omits age unless it is a cached 200', () => {

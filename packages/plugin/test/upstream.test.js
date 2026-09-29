@@ -6,6 +6,7 @@ import { restartPaths } from '../src/configSchema.js';
 import {
 	configuredStagingIp,
 	dispatcherFor,
+	releaseOriginBody,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
 	stagingTargetIp,
@@ -141,6 +142,33 @@ test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
 	assert.equal(clean['etag'], '"abc"');
 	assert.equal(clean['vary'], 'Accept-Encoding');
 	assert.equal(clean['x-robots-tag'], 'noindex');
+});
+
+test('sanitizeOriginResponseHeaders keeps a redirect target and the document language, and still drops link', () => {
+	// The proxy does not follow redirects, so without `location` an origin 301 reached the crawler naming
+	// no target. `link` stays out: traffic discovery reads these headers, and its Link-canonical check has
+	// never seen one on this path (see the allowlist's comment).
+	const clean = sanitizeOriginResponseHeaders({
+		'location': '/product/prd-2/new.jsp',
+		'content-language': 'en-US',
+		'link': '<https://www.example.com/p>; rel="canonical"',
+	});
+	assert.equal(clean['location'], '/product/prd-2/new.jsp', 'relayed verbatim, relative or not');
+	assert.equal(clean['content-language'], 'en-US');
+	assert.equal(clean['link'], undefined);
+});
+
+test('releaseOriginBody destroys the origin stream, and falls back to cancel for anything else', async () => {
+	let released = 0;
+	releaseOriginBody({ releaseBody: () => released++, content: { cancel: () => assert.fail('never the web cancel') } });
+	assert.equal(released, 1);
+	let cancelled = 0;
+	releaseOriginBody({ content: new ReadableStream({ cancel: () => void cancelled++ }) });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(cancelled, 1);
+	// A stored page (Blob content, no stream) and nothing at all are both no-ops, never a throw.
+	releaseOriginBody({ content: new Blob(['x']) });
+	releaseOriginBody(undefined);
 });
 
 test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {
