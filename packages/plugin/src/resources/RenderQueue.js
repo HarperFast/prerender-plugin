@@ -199,6 +199,9 @@ const patchTarget = (url, fields) => Target.patch(url, { url, ...fields });
  * the row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
  * that is still being served from the origin. Its demand estimate (`demandPeriod`) rides with it.
  * A local point read: results land on the owner, and elsewhere it reads nothing and nothing is carried.
+ *
+ * An ask's mark (`urgentAt`) is deliberately NOT carried: the ask was answered by the attempts, and a
+ * page that failed its fast lane as well is a failing page, not an urgent one.
  */
 const readMarks = async (url) => {
 	const row = await getScheduleRow(url, ['changedAt', 'demandPeriod']);
@@ -1245,7 +1248,9 @@ export class RenderQueue extends Resource {
 
 		// Due now, not jittered: adoptions arrive one per source render, already spread by the
 		// sources' own schedule jitter, and the source's cached pages were just deleted — the
-		// sooner the destination renders, the shorter the window a bot gets neither page.
+		// sooner the destination renders, the shorter the window a bot gets neither page. An explicit
+		// current minute is also what marks the row an ask (`urgentAt`, in `Target.put`), so it ranks
+		// ahead of routine lateness rather than behind every overdue row.
 		const target = { nextRenderTime: currentMinuteMs() };
 		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
 			target.renderInterval = source.renderInterval;

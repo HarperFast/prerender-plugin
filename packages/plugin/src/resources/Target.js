@@ -118,9 +118,13 @@ export class Target extends TargetTable {
 		// ONE row, keyed by the URL: the claim renders every configured device off it. The explicit
 		// `nextRenderTime` branch is validated no further than `> 0`, and it is the funnel for
 		// redirect adoption, sitemap `revalidate: true`, and any external `PUT /render_targets`.
+		const explicit = Number.isFinite(nextRenderTime) && nextRenderTime > 0;
 		await writeSchedule(url, {
-			nextRenderTime:
-				Number.isFinite(nextRenderTime) && nextRenderTime > 0 ? nextRenderTime : getInitialRenderTime(url, interval),
+			nextRenderTime: explicit ? nextRenderTime : getInitialRenderTime(url, interval),
+			// An explicit time that is not in the future is an ask to render now (an adopted redirect
+			// destination, a sitemap `revalidate: true`), ranked ahead like any `fileDueNow` — see
+			// `urgentAt` in schema.graphql. A jittered initial time never is.
+			urgentAt: explicit && nextRenderTime <= currentMinuteMs() ? Date.now() : undefined,
 			fromSitemap,
 			// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
 			// target row, so a put clears `demandInterval` along with the suppression fields; the

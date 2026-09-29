@@ -524,7 +524,7 @@ table is read by primary key only, and `nextRenderTime` carries no index
   > route > stored > default, so a page `render.demand` promoted to 6 h is not ranked as if it were on
   > its route's 24 h ceiling. `sitemapBoost` is a multiplier, never a tier, so a discovered page is
   > served within roughly `sitemapBoost ×` the worst sitemap ratio. Rows are grouped by class (route ×
-  > cadence × sitemap flag × change mark × demand estimate), within which due time already orders them,
+  > cadence × sitemap flag × change or urgent mark × demand estimate), within which due time already orders them,
   > so the best K is a merge over class heads, not a scan.
 - **Changed pages first, most-asked-for first.** A row the change probe filed (`changedAt`) starts
   `queue.ready.changedHeadStart` cadences ahead. With `queue.ready.changedDemand` (default on) its wait
@@ -532,6 +532,11 @@ table is read by primary key only, and `nextRenderTime` carries no index
   on the row as `demandPeriod` when the change was acted on — so the score is the bot visits the wait has
   sent to the origin, and a change wave renders the pages bots ask for first. A row with no estimate
   (tracker off, cold or saturated) orders by cadence.
+- **An ask to render now starts ahead too.** A row filed due now by a render-now, a revalidate, an
+  admin rejoin or an adopted redirect destination (`urgentAt`) starts `queue.ready.urgentHeadStart`
+  cadences ahead; filed at the current minute it would otherwise rank behind every overdue row. Both
+  head starts are in boosted units — multiplied by `sitemapBoost`, as sitemap lateness is — so a fresh
+  marked row outranks every routine row less than that many cadences late, sitemap-listed or not.
 - **It repairs itself from the table.** Each publish re-reads the head of what it published and fixes
   what it holds wrongly. A verification walk (`queue.keeper.verifyInterval`, 1 h) checks every row it
   owns and every row it holds against the table and repairs the difference (`keeper_repaired`,

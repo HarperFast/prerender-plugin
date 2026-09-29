@@ -72,19 +72,37 @@
  * ratio passes `sitemapBoost x` the highest sitemap ratio in the set — so if sitemap pages are being
  * held at `U` cadences late, a discovered page is served by `sitemapBoost x U` cadences late.
  *
- * ── A DETECTED CHANGE STARTS AHEAD ────────────────────────────────────────────────────────────
+ * ── A DETECTED CHANGE, OR AN ASK TO RENDER NOW, STARTS AHEAD ─────────────────────────────────
  *
- *     score += changedHeadStart            (a row the change probe filed: `changedAt` on the row)
+ *     score += headStart x max(1, sitemapBoost)
+ *         headStart = changedHeadStart   a row the change probe filed: `changedAt` on the row
+ *                   = urgentHeadStart    a row filed due now by an ask: `urgentAt` (render-now,
+ *                                        revalidate, rejoin, a redirect destination adopted)
  *
- * The one ADDITIVE term, and it has to be: the probe files a changed page at the current minute, so
- * its lateness is zero and no multiplier can move it — it would enter behind every overdue row in the
- * set, while its page, hard-expired because it is known wrong, is served from the origin for as long
- * as it waits. The head start ranks it as if it were already `changedHeadStart` cadences late.
+ * The one ADDITIVE term, and it has to be: both kinds are filed at the current minute, so their
+ * lateness is zero and no multiplier can move it — they would enter behind every overdue row in the
+ * set. For a changed page that is the whole cost of the change: hard-expired because it is known
+ * wrong, it is served from the origin for as long as it waits. For an ask it is the ask itself going
+ * unanswered — a render-now whose caller is polling, a revalidate after a deploy, the destination of a
+ * permanent redirect whose source's pages were just deleted. Measured before the urgent mark existed: a
+ * row filed due now was absent from a full ready set of routine rows 1–5,000 minutes late, while a
+ * changed row filed the same minute placed 3,565th.
+ *
+ * THE HEAD START IS BOOSTED, and it has to be. A routine SITEMAP row's lateness is multiplied by
+ * `sitemapBoost`, so an unboosted head start of 1 cadence was worth HALF a cadence of sitemap lateness
+ * at the default boost of 2: any sitemap product page 24h late on its 48h cadence outranked a page
+ * found changed a minute ago. Multiplied by the boost, the head start is stated in the same units as
+ * the rows it has to beat: a fresh marked row outranks every routine row less than `headStart`
+ * cadences late, sitemap-listed or not (a discovered one, less than `headStart x sitemapBoost`). It is
+ * the boost itself, not the row's sitemap flag, because a discovered page that changed is just as
+ * wrong on the origin as a listed one.
  *
  * Starvation stays bounded, with the same kind of statement as the boost's: a routine row wins as
- * soon as its score passes the changed rows' — so if changed rows are being held at `U` cadences
- * late, a routine row is served by `changedHeadStart + U` cadences late (divide by `sitemapBoost` for
- * a sitemap row). A change wave can take the fleet for a while; it cannot take it indefinitely.
+ * soon as its score passes the marked rows' — so if marked rows are being held at `U` cadences late,
+ * a routine sitemap row is served by `headStart + U` cadences late (times `sitemapBoost` for a
+ * discovered one). A change wave, or a route-wide revalidate, can take the fleet for a while; it
+ * cannot take it indefinitely. A row carrying both marks takes the change's head start: the two are
+ * not added.
  *
  * ── A CHANGED PAGE WAITS IN VISITS, NOT CADENCES ──────────────────────────────────────────────
  *
@@ -125,8 +143,8 @@
  * degrades to raw lateness, which still orders sensibly among rows that share the problem.
  */
 export const scoreOf = (
-	{ dueAt, fromSitemap, changed = false, demandPeriodMs = null },
-	{ nowMs, intervalMs, sitemapBoost = 1, changedHeadStart = 0, changedDemand = false }
+	{ dueAt, fromSitemap, changed = false, urgent = false, demandPeriodMs = null },
+	{ nowMs, intervalMs, sitemapBoost = 1, changedHeadStart = 0, urgentHeadStart = 0, changedDemand = false }
 ) => {
 	// THE DUE TIME IS GUARDED, AND IT IS THE DANGEROUS ONE. `nowMs - null` is `nowMs`, so an absent
 	// due time does not produce a small score or a NaN — it produces a lateness of ~1.8e12, which sorts
@@ -145,8 +163,11 @@ export const scoreOf = (
 	const divisor = changed && changedDemand && demandPeriodMs > 0 ? demandPeriodMs : intervalMs;
 	const ratio = divisor > 0 ? lateness / divisor : lateness;
 	const score = fromSitemap ? ratio * sitemapBoost : ratio;
-	// A change the probe found: the page is known wrong, was hard-expired, and is served from the origin
-	// until this render lands — see "A DETECTED CHANGE STARTS AHEAD" above. A non-positive or non-finite
-	// head start adds nothing, so the policy is off rather than broken.
-	return changed && Number.isFinite(changedHeadStart) && changedHeadStart > 0 ? score + changedHeadStart : score;
+	// A change the probe found, or an ask to render now — see "A DETECTED CHANGE, OR AN ASK TO RENDER
+	// NOW, STARTS AHEAD" above: in boosted units, and the change's when a row carries both. A non-positive
+	// or non-finite head start adds nothing, so the policy is off rather than broken.
+	const headStart = changed ? changedHeadStart : urgent ? urgentHeadStart : 0;
+	if (!(Number.isFinite(headStart) && headStart > 0)) return score;
+	const boost = Number.isFinite(sitemapBoost) && sitemapBoost > 1 ? sitemapBoost : 1;
+	return score + headStart * boost;
 };

@@ -344,6 +344,41 @@ test('the changed flag is part of what is held: describe, heldValue and a cleari
 
 // ---- a changed row's demand (queue.ready.changedDemand) ------------------------------------------
 
+const putUrgent = (keeper, key, dueAt, fromSitemap = true) =>
+	keeper.apply(key, { nextRenderTime: dueAt, fromSitemap, urgentAt: dueAt });
+
+test('an URGENT row starts ahead of routine lateness, sitemap-listed or not, and is still bounded', () => {
+	// Filed due now by an ask (render-now, revalidate, rejoin, an adopted redirect destination), lateness 0.
+	const { keeper } = keeperAt();
+	put(keeper, url('/pdp/sitemap-late'), T0 - 30 * HOUR); // 30h late on a 48h cadence: boosted to 1.25
+	putUrgent(keeper, url('/pdp/asked'), T0, false);
+	put(keeper, url('/pdp/very-late'), T0 - 5 * 48 * HOUR); // five cadences late
+	const order = keeper.topK(10, { nowMs: T0, sitemapBoost: 2, urgentHeadStart: 1 }).rows.map((r) => r.entry.cacheKey);
+	assert.deepEqual(order, [url('/pdp/very-late'), url('/pdp/asked'), url('/pdp/sitemap-late')]);
+	const off = keeper.topK(10, { nowMs: T0, sitemapBoost: 2, urgentHeadStart: 0 }).rows.map((r) => r.entry.cacheKey);
+	assert.equal(off.at(-1), url('/pdp/asked'), 'head start 0: ranked like any other row, which is last');
+});
+
+test('the urgent flag is part of what is held — describe, heldValue, the state — and a change mark wins', () => {
+	const { keeper } = keeperAt();
+	putUrgent(keeper, url('/pdp/a'), T0 - MINUTE);
+	assert.equal(keeper.describe(url('/pdp/a')).urgent, true);
+	assert.ok(keeper.heldValue(url('/pdp/a')).urgentAt > 0, 'a reclassify re-applies the flag');
+	keeper.apply(url('/pdp/a'), keeper.heldValue(url('/pdp/a')));
+	assert.equal(keeper.describe(url('/pdp/a')).urgent, true, 'and survives the round trip');
+	const state = keeper.state(T0);
+	assert.equal(state.dueUrgent, 1);
+	assert.equal(state.oldestUrgentDueAt, T0 - MINUTE);
+	keeper.apply(url('/pdp/b'), { nextRenderTime: T0, fromSitemap: true, changedAt: T0, urgentAt: T0 });
+	assert.deepEqual(
+		[keeper.describe(url('/pdp/b')).changed, keeper.describe(url('/pdp/b')).urgent],
+		[true, false],
+		'one class, the change’s'
+	);
+	put(keeper, url('/pdp/a'), T0 + 48 * HOUR); // the render's reschedule
+	assert.equal(keeper.describe(url('/pdp/a')).urgent, false);
+});
+
 const putChangedDemand = (keeper, key, dueAt, demandPeriod) =>
 	keeper.apply(key, { nextRenderTime: dueAt, fromSitemap: true, changedAt: dueAt, demandPeriod });
 
@@ -431,9 +466,29 @@ test('scoreOf: demand is the divisor only for a changed row, with the option on 
 	}
 	assert.equal(
 		scoreOf({ dueAt, changed: true, fromSitemap: true, demandPeriodMs: 6 * HOUR }, { ...at, sitemapBoost: 2 }),
-		2 + 1,
-		'the sitemap boost still multiplies the ratio'
+		2 + 2,
+		'the sitemap boost still multiplies the ratio — and the head start, which is stated in boosted units'
 	);
+});
+
+test('scoreOf: the head start is in BOOSTED units, so a fresh marked row beats routine sitemap lateness', () => {
+	// Unboosted, a head start of 1 was worth half a cadence of sitemap lateness at the default boost of 2:
+	// any sitemap product page 24h late on its 48h cadence outranked a page found changed a minute ago.
+	const at = { nowMs: T0, intervalMs: 48 * HOUR, sitemapBoost: 2, changedHeadStart: 1, urgentHeadStart: 1 };
+	const lateSitemap = scoreOf({ dueAt: T0 - 30 * HOUR, fromSitemap: true }, at);
+	for (const fromSitemap of [true, false]) {
+		assert.ok(scoreOf({ dueAt: T0, fromSitemap, changed: true }, at) > lateSitemap, `changed, sitemap ${fromSitemap}`);
+		assert.ok(scoreOf({ dueAt: T0, fromSitemap, urgent: true }, at) > lateSitemap, `urgent, sitemap ${fromSitemap}`);
+	}
+	// and still bounded: a sitemap row past `headStart` cadences late wins
+	assert.ok(scoreOf({ dueAt: T0 - 50 * HOUR, fromSitemap: true }, at) > scoreOf({ dueAt: T0, changed: true }, at));
+});
+
+test('scoreOf: an urgent row takes urgentHeadStart; a row carrying both marks takes the change’s, not the sum', () => {
+	const at = { nowMs: T0, intervalMs: 48 * HOUR, changedHeadStart: 1, urgentHeadStart: 0.5 };
+	assert.equal(scoreOf({ dueAt: T0, urgent: true }, at), 0.5);
+	assert.equal(scoreOf({ dueAt: T0, changed: true, urgent: true }, at), 1);
+	assert.equal(scoreOf({ dueAt: T0, urgent: true }, { ...at, urgentHeadStart: 0 }), 0, 'off, not broken');
 });
 
 test('a changed row carries its demand through describe, heldValue and the queue state', () => {

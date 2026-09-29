@@ -147,7 +147,7 @@ export const minuteOf = (ms) => Math.floor(ms / MINUTE);
  */
 export const writeSchedule = async (
 	cacheKey,
-	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt, demandPeriod } = {}
+	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt, demandPeriod, urgentAt } = {}
 ) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
@@ -165,7 +165,8 @@ export const writeSchedule = async (
 	// `changedAt` the same way: the change probe sets it, a failed render's retry carries it, and every
 	// other write — the render's own reschedule above all — clears it by omission (schema.graphql).
 	// `demandPeriod` rides with it and ONLY with it: it describes how urgent the change is, so a row
-	// with no mark never carries one.
+	// with no mark never carries one. `urgentAt` (an ask to render now, `fileDueNow`) is cleared the same
+	// way, and is not written beside a change mark: the change's head start is the one such a row takes.
 	const marked = Number.isFinite(changedAt);
 	await scheduleTable().put(cacheKey, {
 		nextRenderTime,
@@ -174,6 +175,7 @@ export const writeSchedule = async (
 		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
 		...(marked ? { changedAt } : {}),
 		...(marked && Number.isFinite(demandPeriod) && demandPeriod > 0 ? { demandPeriod } : {}),
+		...(!marked && Number.isFinite(urgentAt) && urgentAt > 0 ? { urgentAt } : {}),
 	});
 };
 
@@ -185,24 +187,36 @@ export const writeSchedule = async (
  * marks a row that has none, and `demandPeriod` goes with the mark: a row already marked keeps the
  * one it has, and takes the given one only if it had none.
  *
+ * EVERY CALL IS AN ASK, AND THE ROW SAYS SO (`urgentAt`, first instant kept). Filed at the current
+ * minute its lateness is zero, which ranked it behind every overdue row in the queue — and past the
+ * ready set's capacity not published at all: a render-now whose caller was polling for it, a revalidate
+ * after a deploy, an admin rejoin, a new sitemap URL. The mark gives it `queue.ready.urgentHeadStart`
+ * (util/renderPriority.js), and a change mark, when there is one, takes precedence over it.
+ *
  * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
  * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
  * what every such writer did before, and the write still reaches the owner by residency.
+ *
+ * Returns the due time it wrote.
  */
 export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt, demandPeriod } = {}) => {
-	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod']);
+	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod', 'urgentAt']);
 	const minute = currentMinuteMs();
 	const due = numberOf(existing?.nextRenderTime);
 	const markedAt = numberOf(existing?.changedAt);
 	const heldPeriod = numberOf(existing?.demandPeriod);
+	const askedAt = numberOf(existing?.urgentAt);
 	const wasMarked = Number.isFinite(markedAt) && markedAt > 0;
+	const nextRenderTime = Number.isFinite(due) && due > 0 && due < minute ? due : minute;
 	await writeSchedule(cacheKey, {
-		nextRenderTime: Number.isFinite(due) && due > 0 && due < minute ? due : minute,
+		nextRenderTime,
 		fromSitemap,
 		effectiveInterval,
 		changedAt: wasMarked ? markedAt : changedAt,
 		demandPeriod: wasMarked && Number.isFinite(heldPeriod) && heldPeriod > 0 ? heldPeriod : demandPeriod,
+		urgentAt: Number.isFinite(askedAt) && askedAt > 0 ? askedAt : Date.now(),
 	});
+	return nextRenderTime;
 };
 
 /**
@@ -360,7 +374,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 
 // ---- the queue keeper's table I/O (driven by util/queueKeeperService.js) ---------------------
 
-/** The four fields every reader of this table projects. */
+/** The fields every reader of this table projects. */
 export const SCHEDULE_SELECT = [
 	'cacheKey',
 	'nextRenderTime',
@@ -368,6 +382,7 @@ export const SCHEDULE_SELECT = [
 	'effectiveInterval',
 	'changedAt',
 	'demandPeriod',
+	'urgentAt',
 ];
 
 /**

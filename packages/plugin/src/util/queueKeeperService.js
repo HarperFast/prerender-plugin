@@ -48,7 +48,7 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
-import { changedOf, demandPeriodOf, createQueueKeeper } from './queueKeeper.js';
+import { changedOf, demandPeriodOf, createQueueKeeper, urgentOf } from './queueKeeper.js';
 import {
 	clearKeeperSignal,
 	getScheduleRow,
@@ -81,7 +81,15 @@ const TOP_CHECK_ROWS = 64;
 const TOP_CHECK_TTL_MS = 60_000;
 /** A publish is forced at least this often, so an expired lease is noticed even with nothing else moving. */
 const FORCE_PUBLISH_MS = 10_000;
-const SCHEDULE_FIELDS = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval', 'changedAt', 'demandPeriod'];
+const SCHEDULE_FIELDS = [
+	'cacheKey',
+	'nextRenderTime',
+	'fromSitemap',
+	'effectiveInterval',
+	'changedAt',
+	'demandPeriod',
+	'urgentAt',
+];
 const MAX_TIMER_MS = 2_147_483_647;
 
 let snapshot = null;
@@ -164,6 +172,7 @@ const matches = (held, row, described) =>
 	held.minute === minuteOf(Number(row.nextRenderTime)) &&
 	held.fromSitemap === !!row.fromSitemap &&
 	held.changed === changedOf(row) &&
+	held.urgent === urgentOf(row) &&
 	held.demandPeriodMs === demandPeriodOf(row) &&
 	held.cadenceMs === described.cadenceMs &&
 	held.carried === described.carried &&
@@ -612,6 +621,7 @@ export const createKeeperService = ({
 				nowMs,
 				sitemapBoost: config.queue.ready.sitemapBoost,
 				changedHeadStart: config.queue.ready.changedHeadStart,
+				urgentHeadStart: config.queue.ready.urgentHeadStart,
 				changedDemand: config.queue.ready.changedDemand,
 				skip: (key) => leases.isLeased(key),
 			});

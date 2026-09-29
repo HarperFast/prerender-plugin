@@ -197,6 +197,16 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# Absent = the tracker could not say (off, cold, saturated); the row then orders by cadence.
 	# NOT @indexed.
 	demandPeriod: Long
+	# When an ASK filed this row due now (ms): a render-now, a revalidate, an admin rejoin, an adopted
+	# redirect destination — every `fileDueNow` caller (util/renderSchedule.js), and `Target.put` given an
+	# explicit due time that is not in the future. Filed at the current minute such a row is zero cadences
+	# late, which ranked it behind every overdue row; the queue keeper ranks a row carrying this
+	# `queue.ready.urgentHeadStart` ahead instead (util/renderPriority.js). Distinct from `changedAt`,
+	# which means the ORIGIN changed and is what the re-render-lag metric measures from; a row carrying
+	# both takes the change's head start, and this is not written beside a change mark. Cleared by every
+	# other writer's `put`, the render's reschedule above all; NOT carried through a failed render's slow
+	# lane (the ask was answered by the attempts). NOT @indexed.
+	urgentAt: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {

@@ -212,6 +212,9 @@ test('301 onto a served route retires the source URL — all devices — and ado
 	const schedule = stores.renderSchedule.get(B);
 	assert.ok(schedule, 'destination must be scheduled — ONE row, keyed by the URL, every device in one job');
 	assert.ok(schedule.nextRenderTime <= Date.now(), 'due now — the source pages are gone, fill the gap fast');
+	// ...and ranked like it: filed at the current minute it is zero cadences late, which put it behind every
+	// overdue row in the queue while bots got neither page.
+	assert.ok(schedule.urgentAt > 0, 'marked as an ask, so the keeper ranks it urgentHeadStart ahead');
 	for (const device of DEVICES) {
 		assert.equal(stores.renderSchedule.has(key(B, device)), false, 'no per-device rows are created any more');
 	}

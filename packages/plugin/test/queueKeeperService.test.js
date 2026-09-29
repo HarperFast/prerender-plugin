@@ -1022,6 +1022,56 @@ test('a row the change probe marked is loaded as CHANGED and counted in queue-st
 	s.stop();
 });
 
+test('a row filed due NOW ranks at the head of a full ready set — no longer behind every overdue row', async () => {
+	// Measured before the urgent mark: with 5,005 routine rows 1–5,005 minutes late, a row filed at the
+	// current minute (render-now, revalidate, rejoin, a new sitemap URL) was not published at all, while a
+	// changed row filed the same minute placed 3,565th. Both now start a boosted head start ahead.
+	const now = Date.now();
+	const cap = funnel.readyQueue().capacity;
+	const rows = [];
+	for (let n = 1; n <= cap + 5; n++) rows.push(row(item(n), Math.floor((now - n * MINUTE) / MINUTE) * MINUTE));
+	seed(rows);
+	const s = await started();
+	const asked = item(0);
+	await funnel.fileDueNow(asked, { fromSitemap: false, effectiveInterval: null });
+	emit('put', asked, table.get(asked));
+	const changed = item(cap + 6);
+	await funnel.fileDueNow(changed, { fromSitemap: true, effectiveInterval: null, changedAt: now });
+	emit('put', changed, table.get(changed));
+	await s.publish();
+	const published = funnel
+		.readyQueue()
+		.peek(cap)
+		.map((e) => e.cacheKey);
+	// Ahead of every routine row less than one cadence (48h) late — and behind the ones more than a
+	// cadence late, which is the bound that keeps a wave of asks from starving the rotation.
+	const pastACadence = cap + 5 - (48 * HOUR) / MINUTE;
+	for (const key of [asked, changed]) {
+		const at = published.indexOf(key);
+		assert.ok(at >= 0, `${key} is published`);
+		assert.ok(at <= pastACadence + 2, `${key} ranks ahead of routine lateness under a cadence (at ${at})`);
+		assert.ok(at >= pastACadence - 1, 'and behind rows more than a cadence late');
+	}
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.trust.exact, true);
+	assert.equal((await s.verify()).repaired, 0, 'the keeper holds the urgent class exactly as the table has it');
+	s.stop();
+});
+
+test('the keeper loads the urgent mark: it is in the load projection and in what a verification compares', async () => {
+	const { SCHEDULE_SELECT } = await import('../src/util/renderSchedule.js');
+	assert.ok(SCHEDULE_SELECT.includes('urgentAt'), 'a projection without it would load every ask as routine');
+	const now = Date.now();
+	seed([{ ...row(item(1), now - MINUTE), urgentAt: now - MINUTE }]);
+	const s = await started();
+	assert.equal(s.keeper.describe(item(1)).urgent, true);
+	table.set(item(1), row(item(1), now - MINUTE)); // the mark cleared, event lost
+	assert.equal((await s.verify()).mismatched, 1);
+	assert.equal(s.keeper.describe(item(1)).urgent, false);
+	s.stop();
+});
+
 test('the keeper loads a changed row’s demand estimate and reports the waiting changed rows by it', async () => {
 	// Without `demandPeriod` in the load list every changed row would load as demand-unknown and
 	// queue.ready.changedDemand would silently order by cadence.

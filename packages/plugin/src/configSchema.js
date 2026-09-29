@@ -2561,9 +2561,26 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'it were already this many of its own intervals late. The probe hard-expires such a page and ' +
 						'files its render at the current minute, so without a head start it would enter at lateness ' +
 						'zero, behind every overdue row, while bots are served the origin for as long as it waits.\n\n' +
+						'IN BOOSTED UNITS (since v0.97.0): the head start is multiplied by `sitemapBoost`, as a sitemap ' +
+						'row’s lateness is, so a page found changed a minute ago outranks every routine row less than ' +
+						'this many cadences late, sitemap-listed or not (a discovered one, less than this times the ' +
+						'boost). Unboosted, a sitemap row half a cadence late already outranked it at the default boost.\n\n' +
 						'ADDITIVE, and bounded: a routine row still wins once it is more than `changedHeadStart` ' +
 						'cadences later than the changed rows being held, so a large change wave takes the fleet for ' +
 						'a while, never indefinitely. `0` ranks changed pages like any other due row.',
+					{ min: 0 }
+				),
+				urgentHeadStart: option(
+					1,
+					'The same head start, for a row filed due now by an ASK rather than a detected change: a ' +
+						'render-now, a revalidate, an admin rejoin, the destination of a permanent redirect whose ' +
+						'source was just retired, a sitemap entry filed for an immediate render ' +
+						'(`RenderSchedule.urgentAt`). Filed at the current minute such a row is zero cadences late, so ' +
+						'without this it ranked behind every overdue row — and past `capacity` routine rows, was not ' +
+						'published at all. In boosted units and bounded exactly as `changedHeadStart` is, so a ' +
+						'route-wide revalidate takes the fleet for a while, never indefinitely. A row that is also ' +
+						'marked changed takes `changedHeadStart` instead; the two are not added. `0` ranks such rows ' +
+						'like any other due row, which is the pre-0.97.0 behaviour.',
 					{ min: 0 }
 				),
 				changedDemand: option(

@@ -1224,3 +1224,16 @@ test('a result that outlived its lease with NO grant since is still the latest r
 	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>slow</html>');
 	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
 });
+
+test('Target.put marks the row urgent only for an explicit due time that is not in the future', async () => {
+	// An adopted redirect destination and a sitemap `revalidate: true` pass the current minute: an ask to
+	// render now. A jittered first render, and an explicit future time, are not asks.
+	const { Target } = await import('../src/resources/Target.js');
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	await Target.put(A, { renderInterval: 3_600_000 });
+	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'jittered');
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute + 3_600_000 });
+	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'explicitly later');
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute });
+	assert.ok(stores.renderSchedule.get(A).urgentAt > 0, 'explicitly now');
+});

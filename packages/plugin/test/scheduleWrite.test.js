@@ -144,3 +144,45 @@ test('fileDueNow: a marked row keeps its demand, and takes the given one only if
 	});
 	assert.equal(rows.get('https://example.com/unknown').demandPeriod, 9e6, 'marked with no estimate: takes the new one');
 });
+
+test('fileDueNow marks the row URGENT, keeping the first ask’s instant; a change mark takes precedence', async () => {
+	// Filed at the current minute a row is zero cadences late, so without the mark an ask to render now
+	// ranked behind every overdue row — and past the ready set's capacity was not published at all.
+	rows.clear();
+	const before = Date.now();
+	await funnel.fileDueNow('https://example.com/asked', { fromSitemap: true, effectiveInterval: null });
+	const askedAt = rows.get('https://example.com/asked').urgentAt;
+	assert.ok(askedAt >= before && askedAt <= Date.now(), 'marked when filed');
+	await funnel.fileDueNow('https://example.com/asked', { fromSitemap: true, effectiveInterval: null });
+	assert.equal(rows.get('https://example.com/asked').urgentAt, askedAt, 'a second ask keeps the first instant');
+
+	await funnel.fileDueNow('https://example.com/changed', {
+		fromSitemap: true,
+		effectiveInterval: null,
+		changedAt: before,
+	});
+	assert.equal(rows.get('https://example.com/changed').changedAt, before);
+	assert.equal('urgentAt' in rows.get('https://example.com/changed'), false, 'not written beside a change mark');
+
+	// Every other writer `put`s the row whole, so the render's reschedule clears it by omission.
+	await funnel.writeSchedule('https://example.com/asked', {
+		nextRenderTime: T0,
+		fromSitemap: true,
+		effectiveInterval: null,
+	});
+	assert.equal('urgentAt' in rows.get('https://example.com/asked'), false);
+});
+
+test('fileDueNow returns the due time it wrote', async () => {
+	rows.clear();
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/r', { fromSitemap: true, effectiveInterval: null }),
+		minute
+	);
+	rows.set('https://example.com/r', { nextRenderTime: minute - 3_600_000, fromSitemap: true });
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/r', { fromSitemap: true, effectiveInterval: null }),
+		minute - 3_600_000
+	);
+});
