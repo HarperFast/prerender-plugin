@@ -232,10 +232,15 @@ function rollover(now) {
 let agedAt = null;
 function ageOut(nowMs) {
 	const current = slotOf(nowMs);
-	if (current === agedAt) return;
+	// Forward only: a caller holding an older clock (an action that read the time before its awaits)
+	// must not rewind it and make the next fresh call redo all of this.
+	if (agedAt !== null && current <= agedAt) return;
 	agedAt = current;
 	const shape = shapeOf();
-	const oldest = current - sliceCount();
+	// ONE SLOT PAST THE RING is kept: the promotion test's second window starts in the partial slot just
+	// outside it at the defaults (16 x 6h = 96h = promoteWindows 2 x 48h), and a visit there must still be
+	// readable. Everything older goes.
+	const oldest = current - sliceCount() - 1;
 	const ours = `${RING}/`;
 	releaseSabs((key) => {
 		if (!key.startsWith(ours) || !key.includes(`/${shape}/`)) return false;
@@ -260,7 +265,13 @@ function ageOut(nowMs) {
 		liveHeld.delete(s);
 	}
 	if (server.workerIndex === 0) {
-		setImmediate().then(() => sweepExpired(oldest).catch((e) => logger.error(e)));
+		// Detached (util/detach.js): this can run on any entry point, including a read inside a render
+		// result's request, and the deletes must not ride on — or abort with — that request's transaction.
+		const cutoff = oldest + 1; // rows below the one retained slot
+		runDetached(async () => {
+			await setImmediate();
+			await sweepExpired(cutoff);
+		}).catch((e) => logger.error(e));
 	}
 }
 
@@ -391,6 +402,7 @@ export async function flushSlices({ write = true, nowMs = Date.now() } = {}) {
 	const shape = shapeOf();
 	const newest = slotOf(nowMs);
 	for (let s = newest - sliceCount() + 1; s <= newest; s++) {
+		if (shapeOf() !== shape) return; // reshaped meanwhile: the new shape stores its own slices
 		const generation = generationOf(s, shape);
 		if (!(Atomics.load(generation, 0) > Atomics.load(generation, 1))) continue;
 		try {
@@ -420,19 +432,35 @@ async function persist(s, generation, shape) {
 	try {
 		const bits = new Uint8Array(live); // a copy: the slice keeps moving under other workers
 		const existing = await VisitFilter.get(id);
-		if (existing?.bits && existing.bits.length === bits.length) {
+		// A reshape that landed while this waited: an old-shape slice must not overwrite a new-shape row.
+		if (shapeOf() !== shape) return;
+		if (existing?.bits && existing.bits.length === bits.length && sameShape(existing.shape, shape)) {
 			const stored = new Uint8Array(existing.bits);
 			for (let i = 0; i < bits.length; i++) bits[i] |= stored[i];
 		}
-		await VisitFilter.put(id, { slot: s, node, bits: Buffer.from(bits.buffer), updatedAt: Date.now() });
+		// The row carries the SHAPE it was written under — length alone cannot tell a row written with a
+		// different `hashes` from one of this shape, and folding one reads its visits at the wrong bits.
+		await VisitFilter.put(id, { slot: s, node, shape, bits: Buffer.from(bits.buffer), updatedAt: Date.now() });
 	} finally {
 		mutex.unlock();
 	}
 	markStored(generation, covered);
 }
 
+/**
+ * Whether a stored row's recorded shape is this one. A row with no shape was written before v0.95.1;
+ * it is taken on its length alone, as it always was (its `hashes` cannot be known).
+ */
+const sameShape = (rowShape, shape) => rowShape === null || rowShape === undefined || rowShape === shape;
+
 /** OR `from` into the shared `into`, word by word, skipping zero words (a sparse slice is mostly zeros). */
 const orInto = (into, from) => {
+	// Word by word needs both views 4-byte aligned; every caller passes a fresh copy or a whole shared
+	// buffer, but a pooled Buffer can sit at any offset, so fall back to bytes rather than throw.
+	if ((into.byteOffset | from.byteOffset) & 3) {
+		for (let i = 0; i < from.length; i++) if (from[i] !== 0) Atomics.or(into, i, from[i]);
+		return;
+	}
 	const target = new Int32Array(into.buffer, into.byteOffset, into.byteLength >>> 2);
 	const source = new Int32Array(from.buffer, from.byteOffset, from.byteLength >>> 2);
 	for (let i = 0; i < source.length; i++) {
@@ -505,13 +533,16 @@ export async function refreshMerged(nowMs = Date.now()) {
 	let scanned = 0;
 	const versions = await VisitFilter.search({
 		conditions: [{ attribute: 'slot', comparator: 'greater_than_equal', value: oldest }],
-		select: ['id', 'slot', 'updatedAt'],
+		select: ['id', 'slot', 'updatedAt', 'shape'],
 	});
+	const inRing = []; // { id, slot, shape } of every row in the ring, for where history starts
 	for await (const row of versions) {
 		// Bounded at ring-length x nodes rows — but it runs on workers serving traffic, and awaiting a
 		// cursor only drains microtasks (repo convention: yield by rows SCANNED, same as util/scan.js).
 		if (++scanned % config.scan.yieldEvery === 0) await setImmediate();
 		if (!row?.id || !(row.slot >= oldest && row.slot <= newest + 1)) continue;
+		if (!sameShape(row.shape, shape)) continue; // another shape's row: never folded, never history
+		inRing.push({ id: row.id, slot: row.slot, shape: row.shape });
 		const version = epochOf(row.updatedAt);
 		const seen = seenVersions.get(row.id);
 		if (seen && seen.version === version && Number.isFinite(version)) continue;
@@ -522,24 +553,33 @@ export async function refreshMerged(nowMs = Date.now()) {
 		const union = unionSlice(s, shape);
 		const rows = await VisitFilter.search({
 			conditions: [{ attribute: 'slot', comparator: 'equals', value: s }],
-			select: ['id', 'slot', 'bits', 'updatedAt'],
+			select: ['id', 'slot', 'shape', 'bits', 'updatedAt'],
 		});
 		for await (const row of rows) {
-			if (row?.slot !== s || !row.bits) continue;
+			if (row?.slot !== s || !row.bits || shapeOf() !== shape) continue;
 			const bits = new Uint8Array(row.bits);
-			if (bits.length !== expected || shapeOf() !== shape) continue;
-			orInto(union, bits);
-			if (!(firstSlotOf(shared) <= s)) shared[STATS_FIRST_SLOT] = s + 1;
-			seenVersions.set(row.id, { slot: s, version: epochOf(row.updatedAt) });
+			const usable = bits.length === expected && sameShape(row.shape, shape);
+			if (usable) orInto(union, bits);
+			seenVersions.set(row.id, { slot: s, version: epochOf(row.updatedAt), usable });
 		}
 		await setImmediate();
 	}
 	if (shapeOf() !== shape) return;
 
+	// WHERE HISTORY STARTS, recomputed every refresh from the rows the ring holds now — never carried
+	// over: a slot whose rows were swept, or a ring that grew (`slices` raised), must not read as history
+	// that was looked at and found empty. A row counts if it is of this shape (its length checked when it
+	// was folded).
+	let first = Infinity;
+	for (const row of inRing) {
+		if (row.slot > newest || !(row.slot < first)) continue;
+		if (seenVersions.get(row.id)?.usable) first = row.slot;
+	}
+	shared[STATS_FIRST_SLOT] = Number.isFinite(first) ? first + 1 : 0;
+
 	let newestFill = 0;
 	let worstFill = 0;
 	let fullSlots = 0;
-	const first = firstSlotOf(shared);
 	for (let s = Math.max(oldest, first); s <= newest; s++) {
 		const fill = fillOf(unionSlice(s, shape));
 		if (s === newest) newestFill = fill;
@@ -639,7 +679,7 @@ const maybeRefresh = (nowMs) => {
 /** The ring slots the union can answer for, oldest first — clipped to the first slot any node wrote. */
 const readableFrom = (oldestWanted) => Math.max(oldestWanted, firstSlotOf(stats()));
 
-const visitedIn = (idx, k, windowMs, nowMs) => {
+const visitedIn = (idx, k, windowMs, nowMs, floorSlot) => {
 	const newest = slotOf(nowMs);
 	// Anchor on the slot containing the window's START, not on a slot count. The newest slot
 	// is PARTIAL: `ceil(windowMs/sliceMs)` slots back from it cover as little as the elapsed
@@ -649,7 +689,10 @@ const visitedIn = (idx, k, windowMs, nowMs) => {
 	// Anchoring instead over-covers by up to one slice — the safe, documented direction.
 	// Clamped to the ring so a window wider than the ring cannot walk absent slots, and to the first
 	// slot any node wrote (an earlier one has nothing to answer with).
-	const oldest = readableFrom(Math.max(slotOf(nowMs - windowMs), newest - sliceCount() + 1));
+	// `floorSlot` is the ring's real edge — the slot just past it, which `ageOut` keeps — measured from the
+	// caller's clock, not from this window's end: an earlier window of the promotion test must not read a
+	// slot nobody holds any more.
+	const oldest = readableFrom(Math.max(slotOf(nowMs - windowMs), newest - sliceCount() + 1, floorSlot));
 	for (let s = newest; s >= oldest; s--) if (hasBits(unionSlice(s), idx, k)) return true;
 	return false;
 };
@@ -664,7 +707,7 @@ export function visitedWithin(url, windowMs, nowMs = Date.now()) {
 	maybeRefresh(nowMs);
 	if (!mergedWarm()) return false;
 	const k = hashes();
-	return visitedIn(bitsFor(url, bitCount(), k, scratch), k, windowMs, nowMs);
+	return visitedIn(bitsFor(url, bitCount(), k, scratch), k, windowMs, nowMs, slotOf(nowMs) - sliceCount());
 }
 
 /**
@@ -707,8 +750,9 @@ export function visitedInEachWindow(url, windowMs, count, nowMs = Date.now()) {
 	if (!mergedWarm()) return false;
 	const k = hashes();
 	const idx = bitsFor(url, bitCount(), k, scratch);
+	const floorSlot = slotOf(nowMs) - sliceCount();
 	for (let w = 0; w < count; w++) {
-		if (!visitedIn(idx, k, windowMs, nowMs - w * windowMs)) return false;
+		if (!visitedIn(idx, k, windowMs, nowMs - w * windowMs, floorSlot)) return false;
 	}
 	return true;
 }

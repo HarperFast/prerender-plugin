@@ -20,4 +20,13 @@
  */
 import { AsyncResource } from 'node:async_hooks';
 
-export const runDetached = AsyncResource.bind((fn) => fn());
+//
+// A synchronous throw comes back as a rejected promise, so a caller's `.catch` sees it too: detached
+// work is fire-and-forget, and an error that escaped the catch would surface in the request instead.
+export const runDetached = AsyncResource.bind((fn) => {
+	try {
+		return fn();
+	} catch (e) {
+		return Promise.reject(e);
+	}
+});

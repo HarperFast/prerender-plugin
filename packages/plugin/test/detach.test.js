@@ -66,3 +66,10 @@ test('the sitemap background refresh starts its walks detached', () => {
 	assert.ok(start >= 0 && body.includes('runDetached('), 'the background walks go through runDetached');
 	assert.doesNotMatch(body, /void runTrackedRefresh\(|void \(async/, 'no walk started inline');
 });
+
+test('a synchronous throw comes back as a rejection, so the caller’s .catch sees it', async () => {
+	const result = runDetached(() => {
+		throw new Error('boom');
+	});
+	await assert.rejects(result, /boom/);
+});

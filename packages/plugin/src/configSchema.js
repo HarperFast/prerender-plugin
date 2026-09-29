@@ -1715,6 +1715,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				statsInterval: option(15 * MINUTE, 'How often the level histogram + promote/demote counters are logged.', {
 					unit: 'ms',
+					max: 2147483647,
 					min: SECOND,
 				}),
 			}
@@ -2611,7 +2612,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'per node per interval — the other half of the bytes question `bitsPerSlice` raises, and ' +
 					'the lever for it: a visit reaches the other nodes up to one interval late, against a ' +
 					'`sliceMs` slice.',
-				{ unit: 'ms', min: SECOND }
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
 			),
 			mergeInterval: option(
 				5 * MINUTE,
@@ -2620,7 +2621,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'changed. The reschedule path runs ~20x/s and cannot pay a read per job result, so every ' +
 					'worker answers from the shared union, this stale at most. `demand_fill` and ' +
 					'`demand_false_positive` are emitted at each refresh, once per node.',
-				{ unit: 'ms', min: SECOND }
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
 			),
 			maxFalsePositive: option(
 				0.05,

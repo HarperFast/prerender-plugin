@@ -563,6 +563,102 @@ test('a reshape that lands mid-refresh folds nothing into the new shape', async 
 	assert.equal(polluted, 0, 'no new-shape union slice was written');
 });
 
+test('where history starts is recomputed each refresh: rows that left the ring are not history', async () => {
+	// Kept as a running minimum, it never rose again: a tracker switched off for longer than the ring and
+	// back on — no rows left — answered "known, level 0" instead of "unknown" from slots nobody looked at.
+	const base = slotOf(Date.now()) * H;
+	const realNow = Date.now;
+	try {
+		Date.now = () => base - 20 * H + 60_000;
+		recordVisit('https://example.com/product/prd-long-ago');
+		await flushSlices({ nowMs: base - 20 * H + 60_000 });
+		await refreshMerged(base - 20 * H + 120_000);
+		assert.equal(visitedSlots('https://example.com/product/prd-long-ago', base - 20 * H + 120_000).covered, 1);
+		await refreshMerged(base + 60_000); // 20 slots later: that row is outside the 16-slot ring
+		assert.deepEqual(visitedSlots('https://example.com/product/prd-other', base + 60_000), { level: 0, covered: 0 });
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test('a row recorded under another shape is neither merged nor history, even at the same length', async () => {
+	// Length alone cannot tell a different `hashes`: its visits sit at other bits.
+	const base = slotOf(Date.now()) * H;
+	const id = `${slotOf(base - 5 * H)}|node-b`;
+	const bits = Buffer.alloc((1 << 20) >>> 3, 0xff); // every bit set: would read "visited" for anything
+	rows.set(id, { id, slot: slotOf(base - 5 * H), node: 'node-b', shape: `${H}|${1 << 20}|5`, bits, updatedAt: base });
+	const realNow = Date.now;
+	try {
+		Date.now = () => base + 60_000;
+		recordVisit('https://example.com/product/prd-now');
+		await flushSlices({ nowMs: base + 60_000 });
+	} finally {
+		Date.now = realNow;
+	}
+	await refreshMerged(base + 120_000);
+	assert.equal(visitedWithin('https://example.com/product/prd-never', 8 * H, base + 120_000), false, 'not merged');
+	assert.deepEqual(
+		visitedSlots('https://example.com/product/prd-now', base + 120_000),
+		{ level: 1, covered: 1 },
+		'not history'
+	);
+	assert.equal(
+		rows.get(`${slotOf(base)}|node-a`).shape,
+		`${H}|${1 << 20}|7`,
+		'and our own rows say which shape they are'
+	);
+});
+
+test('the promotion test can read the partial slot just past the ring, which is kept', async () => {
+	// At the defaults the ring is exactly promoteWindows x the slowest rung, so the second window starts
+	// in the partial slot just outside it. Released everywhere, a visit there read as none: a refused
+	// promotion. Scaled here to 1h slices, a 16-slot ring and two 8h windows.
+	const base = slotOf(Date.now()) * H;
+	const url = 'https://example.com/product/prd-edge';
+	const realNow = Date.now;
+	// Model Harper 5.2: a buffer nobody holds is gone.
+	const store = globalThis.databases.coordination.SharedBuffer.primaryStore;
+	const original = store.getUserSharedBuffer;
+	store.getUserSharedBuffer = (_key, fresh) => fresh;
+	resetHeldSabs();
+	try {
+		for (const at of [base - 15.3 * H, base - 0.2 * H]) {
+			Date.now = () => at;
+			recordVisit(url);
+			await flushSlices({ nowMs: at });
+			await refreshMerged(at + 1000);
+		}
+		const now = base + 0.5 * H; // partial current slot: window 2 starts in slot -16
+		assert.equal(visitedInEachWindow(url, 8 * H, 2, now), true);
+	} finally {
+		Date.now = realNow;
+		store.getUserSharedBuffer = original;
+	}
+});
+
+test('a reshape that lands during a store writes nothing under the old shape', async () => {
+	recordVisit('https://example.com/product/prd-a');
+	const VisitFilter = globalThis.databases.crawl_stats.VisitFilter;
+	const get = VisitFilter.get;
+	const puts = [];
+	const put = VisitFilter.put;
+	VisitFilter.get = async (id) => {
+		setDemand({ bitsPerSlice: 1 << 21 }); // reshape while the store waits on its read
+		return get.call(VisitFilter, id);
+	};
+	VisitFilter.put = async (id, data) => {
+		puts.push(id);
+		return put.call(VisitFilter, id, data);
+	};
+	try {
+		await flushSlices();
+		assert.deepEqual(puts, [], 'the old-shape slice was not stored over whatever the new shape writes');
+	} finally {
+		VisitFilter.get = get;
+		VisitFilter.put = put;
+	}
+});
+
 test('a worker that never records still lets go of what ages out of the ring', async () => {
 	setDemand({ slices: 4 });
 	resetVisitFilter();
