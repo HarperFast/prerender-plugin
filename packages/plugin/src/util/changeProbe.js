@@ -770,8 +770,15 @@ export const runProbePass = async ({
 	readLag = () => null,
 	lagThreshold = 0,
 	loadBackoffMax = 1,
+	// Observability hooks. `onStart` receives the pass's LIVE stats object as soon as it exists — the
+	// caller cannot otherwise reach it while the pass runs (or after it throws), and its heartbeat and
+	// metric emission both need to. `onBatch` fires after every probed batch, which is the cadence the
+	// pass's metrics are emitted on (see `createPassEmitter`).
+	onStart = () => {},
+	onBatch = () => {},
 } = {}) => {
 	const stats = newStats();
+	onStart(stats);
 	const batch = [];
 
 	// The origin-pressure state. `throttle` multiplies the pacing window, so it divides the
@@ -1104,6 +1111,7 @@ export const runProbePass = async ({
 		// Every row up to here has been probed and its action (if any) started: the resume cursor may
 		// move past them once their actions settle (see `resumeKeyOf`).
 		stats.walkedThrough = batch[batch.length - 1].row.url;
+		onBatch(stats);
 
 		throttle = stepBackoff(throttle, batchDistress > 0, backoffMax);
 		stats.throttleLevel = throttle;
@@ -1240,6 +1248,15 @@ async function* readCohortRows(urls) {
 	}
 }
 
+// One log line per failed action: the first attempt, and the after-walk retry (util/changeActions.js).
+const logActionError = (e, item, { retry = false } = {}) =>
+	logger.error(
+		e,
+		retry
+			? `[prerender] change-probe action retry failed for ${item.row.url} — left for the next probe of it`
+			: `[prerender] change-probe action failed for ${item.row.url} (retried once when the walk ends)`
+	);
+
 // Metric emission must never cost the pass or the trip action its outcome.
 const countProbe = (series) => {
 	try {
@@ -1249,21 +1266,51 @@ const countProbe = (series) => {
 	}
 };
 
-const emitStats = (stats, kind) => {
-	try {
-		metrics.changeProbe(stats.probed, 'probed');
-		metrics.changeProbe(stats.seeded, 'seeded');
-		metrics.changeProbe(stats.rebaselined, 'rebaselined');
-		metrics.changeProbe(stats.changed, 'changed');
-		metrics.changeProbe(stats.triggered, 'triggered');
-		metrics.changeProbe(stats.failed, 'failed');
-		metrics.changeProbe(stats.fresh, 'fresh');
-		metrics.changeProbe(stats.throttled, 'throttled');
-		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
-		metrics.changeProbe(stats.behindBatches, 'cycle_behind');
-	} catch (e) {
-		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
-	}
+/**
+ * A pass's counters as `probe_*` series, emitted AS THE PASS GOES: each call sends what each counter
+ * gained since the previous call, and a counter that gained nothing sends nothing.
+ *
+ * WHY NOT ONCE, AT THE END. That was the shape until v0.97.0, and it made a nine-hour pass ONE
+ * analytics row per series: recorded whole or lost whole (Harper 5.2 aggregates two thirds of every
+ * 90s and drops the rest, so a single row lands in a dropped window about a third of the time), lost
+ * entirely when the pass threw or a restart cut it short (the emit sat after the walk), and — read over
+ * a window that truncated the pass — attributed to whichever window the pass happened to END in. Per
+ * batch, a pass's counts spread over its whole duration like every per-request series, so ratios
+ * against those stay unbiased, and a crashed pass has already reported everything up to its last batch.
+ * `total` is the meaningful number; `count` is emits, not passes.
+ */
+const PASS_SERIES = [
+	['probed', 'probed'],
+	['seeded', 'seeded'],
+	['rebaselined', 'rebaselined'],
+	['changed', 'changed'],
+	['triggered', 'triggered'],
+	['errors', 'errors'],
+	['failed', 'failed'],
+	['fresh', 'fresh'],
+	['throttled', 'throttled'],
+	['pageMismatch', 'page_mismatch'],
+	['caughtUp', 'caught_up'],
+	['ignored', 'ignored'],
+	['behindBatches', 'cycle_behind'],
+];
+
+export const createPassEmitter = (kind, emit = (value, series) => metrics.changeProbe(value, series)) => {
+	const sent = {};
+	return (counts) => {
+		try {
+			for (const [key, series] of PASS_SERIES) {
+				const value = counts?.[key];
+				if (!Number.isFinite(value)) continue;
+				const delta = value - (sent[key] ?? 0);
+				if (delta <= 0) continue;
+				sent[key] = value;
+				emit(delta, series);
+			}
+		} catch (e) {
+			logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
+		}
+	};
 };
 
 const logPass = (stats, kind, dryRun) => {
@@ -1579,6 +1626,16 @@ export const runProbeSweepOnce = async ({
 	}
 	const startedAt = claim.startedAt;
 	const beat = makeHeartbeat('sweep', startedAt);
+	// The pass's live counters and its action pipeline, held OUTSIDE the try so the error path can still
+	// emit what the pass did before it threw (see `createPassEmitter`).
+	let live = null;
+	let triggers = null;
+	const emit = createPassEmitter('sweep');
+	const counts = () => ({
+		...live,
+		triggered: triggers?.stats.triggered ?? 0,
+		errors: triggers?.stats.errors ?? 0,
+	});
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
@@ -1590,11 +1647,11 @@ export const runProbeSweepOnce = async ({
 		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
 		// so the first changes of the pass are not stamped as unknown for want of it.
 		await warmDemand();
-		const triggers = createChangeActions({
+		triggers = createChangeActions({
 			act: actOnChange,
 			write: writeSignature,
 			concurrency: config.changeProbe.trigger.concurrency,
-			onError: (e, item) => logger.error(e, `[prerender] change-probe action failed for ${item.row.url}`),
+			onError: logActionError,
 		});
 		// The heartbeat's payload, built only when a beat is due (see makeHeartbeat). `recentRate` is
 		// probes per second since the PREVIOUS beat — the rate the pass is running at now, which an
@@ -1660,6 +1717,8 @@ export const runProbeSweepOnce = async ({
 			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 			inScope: probeScopeFilter(config.changeProbe),
+			onStart: (running) => (live = running),
+			onBatch: () => emit(counts()),
 		});
 		// A cancelled pass starts nothing more; what is in flight finishes. Either way wait for the
 		// actions in flight — the pass is not finished while pages it decided to expire are unexpired,
@@ -1668,8 +1727,18 @@ export const runProbeSweepOnce = async ({
 		// The drain keeps the heartbeat (the walk's rides its yields, and there are none while it
 		// waits), so a slow database never makes a live pass read as dead.
 		await drainWithHeartbeat(triggers, () => void beat(progressOf(stats, 'draining')));
+		// The actions that failed, once more (util/changeActions.js) — the cursor has moved past them, so
+		// otherwise each is a known-wrong page until the next pass. Not when the probe was switched off.
+		if (config.changeProbe.enabled) {
+			await drainWithHeartbeat({ drain: () => triggers.retryFailed() }, () => void beat(progressOf(stats, 'retrying')));
+		}
 		stats.triggered = triggers.stats.triggered;
 		stats.errors = triggers.stats.errors;
+		stats.retried = triggers.stats.retried;
+		stats.recovered = triggers.stats.recovered;
+		stats.retrySkipped = triggers.stats.retrySkipped;
+		// Changes this pass detected and did not act on: the next probe of each URL finds it again.
+		stats.unacted = triggers.stats.errors - triggers.stats.recovered;
 		stats.maxActionsInFlight = triggers.stats.maxInFlight;
 		stats.actionWaitMs = triggers.stats.waitMs;
 		stats.unreadable = unreadable;
@@ -1691,7 +1760,7 @@ export const runProbeSweepOnce = async ({
 		// same row, and letting the two interleave could write back the scheduler branch it read
 		// before this landed.
 		if (!partialWalk) await publishScheduler();
-		emitStats(stats, 'sweep');
+		emit(counts());
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
 			...stats,
@@ -1708,6 +1777,8 @@ export const runProbeSweepOnce = async ({
 		await releasePass('sweep', startedAt, lastSweep);
 		return lastSweep;
 	} catch (e) {
+		// What the pass did before it threw is real work the origin saw; report it.
+		if (live) emit(counts());
 		lastSweep = {
 			node: server.hostname,
 			startedAt,
@@ -1901,7 +1972,14 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				act: actOnChange,
 				write: writeSignature,
 				concurrency: config.changeProbe.trigger.concurrency,
-				onError: (e, item) => logger.error(e, `[prerender] change-probe action failed for ${item.row.url}`),
+				onError: logActionError,
+			});
+			const emit = createPassEmitter('canary');
+			let canaryLive = null;
+			const canaryCounts = () => ({
+				...canaryLive,
+				triggered: canaryTriggers.stats.triggered,
+				errors: canaryTriggers.stats.errors,
 			});
 			const stats = await runProbePass({
 				rows: readCohortRows(urls),
@@ -1929,11 +2007,17 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				// Re-checked per pass, not only when the cohort was built: a member whose grace ran out
 				// since then is skipped (and counted) exactly as the sweep would skip it.
 				inScope: probeScopeFilter(config.changeProbe),
+				onStart: (running) => (canaryLive = running),
+				onBatch: () => emit(canaryCounts()),
 			});
 			await canaryTriggers.drain();
+			if (config.changeProbe.enabled) await canaryTriggers.retryFailed();
 			stats.triggered = canaryTriggers.stats.triggered;
 			stats.errors = canaryTriggers.stats.errors;
-			emitStats(stats, 'canary');
+			stats.retried = canaryTriggers.stats.retried;
+			stats.recovered = canaryTriggers.stats.recovered;
+			stats.unacted = canaryTriggers.stats.errors - canaryTriggers.stats.recovered;
+			emit(canaryCounts());
 			const verdict = canaryVerdict(stats, { threshold: canary.threshold, minSample: canary.minSample });
 			let action = null;
 			if (verdict.tripped) {

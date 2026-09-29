@@ -341,7 +341,12 @@ test('every probe series the catalog declares is read by the console, or waived 
 	const client = [...clientSources.values()].join('\n');
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('probe_'.length)}'`);
 
-	const NOT_CHARTED = new Map();
+	const NOT_CHARTED = new Map([
+		// Added by plugin v0.97.0; the pass record on GET /change-probe carries them. Console panel later.
+		['probe_errors', 'plugin 0.97.0: actions that threw — read via /change-probe (errors/unacted); panel later'],
+		['probe_caught_up', 'plugin 0.97.0: read via /change-probe (caughtUp); panel later'],
+		['probe_ignored', 'plugin 0.97.0: read via /change-probe (ignored); panel later'],
+	]);
 
 	for (const name of series) {
 		if (NOT_CHARTED.has(name)) continue;
