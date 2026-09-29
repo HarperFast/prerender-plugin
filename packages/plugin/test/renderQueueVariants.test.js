@@ -1020,3 +1020,44 @@ test('a malformed readiness report cannot cost the render — arrays are read de
 	assert.equal(stores.renderExpectation.size, 0, 'a non-object learned is not an observation');
 	assert.equal(leased(A), false, 'and the lease is released — no 500, no held lease');
 });
+
+// ───────────────────────────── a patch that races a delete ─────────────────────────────
+
+/**
+ * A Target deleted on another node between the result path's read and its patch. Harper applies a
+ * patch to a missing record by storing only the patched fields — the fake `patch` above does the same
+ * — so a patch without the primary key leaves a row with no `url`, which no projected walk can read.
+ */
+const deleteTargetAfterRead = (t, nth) => {
+	const base = globalThis.databases.render_service.Target;
+	const original = base.get;
+	let reads = 0;
+	base.get = async function (query) {
+		const row = await original.call(this, query);
+		if (++reads === nth) stores.target.delete(typeof query === 'object' ? query.id : query);
+		return row;
+	};
+	t.after(() => {
+		base.get = original;
+	});
+};
+
+test('a failure strike racing a cross-node delete leaves a row that carries its url', async (t) => {
+	seedUrlRow();
+	await claim();
+	// the result's own read, then the retry lane's — the one its strike patch follows
+	deleteTargetAfterRead(t, 2);
+	await postVariants(A, [
+		{ deviceType: 'desktop', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+		{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	]);
+	assert.equal(stores.target.get(A)?.url, A, 'the patch named the key, so the row it left is addressable');
+});
+
+test('a strike reset racing a cross-node delete leaves a row that carries its url', async (t) => {
+	seedUrlRow({ strikes: 2 });
+	await claim();
+	deleteTargetAfterRead(t, 1);
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(stores.target.get(A)?.url, A);
+});

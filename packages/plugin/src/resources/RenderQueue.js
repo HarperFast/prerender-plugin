@@ -180,6 +180,17 @@ const retireSource = async (job) => {
 	job.rowGone = job.fold;
 };
 
+/**
+ * Patch a target's fields WITH ITS PRIMARY KEY. Every patch on the result path reads the target a
+ * moment earlier, and a `Target.delete` on another node (a sitemap departure, a retirement) can
+ * replicate in between. Harper applies a patch to a missing record by storing ONLY the patched fields
+ * (`resources/Table.ts`: the incremental update is applied to a null record, and the primary key is
+ * set only when the update names it) — a row whose `url` attribute is absent, which a projected walk
+ * cannot read and nothing can address. Naming the key costs nothing and makes the worst case a
+ * readable ghost the purge and reconcile sweeps can see.
+ */
+const patchTarget = (url, fields) => Target.patch(url, { url, ...fields });
+
 /** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
 const hasCadence = (effectiveInterval) => {
 	const ms = Number(effectiveInterval);
@@ -986,7 +997,7 @@ export class RenderQueue extends Resource {
 				// patches (~one per render for a full cycle), in dry-run too. A converged corpus therefore
 				// pays nothing here, on the system's hottest path.
 				if (demand.action === 'promoted' || demand.action === 'demoted') {
-					await Target.patch(scheduleUrl, { demandInterval: demand.level });
+					await patchTarget(scheduleUrl, { demandInterval: demand.level });
 				}
 			}
 
@@ -1007,7 +1018,7 @@ export class RenderQueue extends Resource {
 				// count, so redirect blips months apart never accumulate toward retirement.
 				// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
 				// extra write.
-				await Target.patch(scheduleUrl, { strikes: 0 });
+				await patchTarget(scheduleUrl, { strikes: 0 });
 			}
 		} else if (!job.rowGone) {
 			// No target owns this URL on this node: a one-off's row is dropped, a recurring row is
@@ -1182,7 +1193,7 @@ export class RenderQueue extends Resource {
 			await retireSource(job); // drops the target, its pages, and every folding row
 			return;
 		}
-		await Target.patch(sourceUrl, { strikes });
+		await patchTarget(sourceUrl, { strikes });
 		await this.rescheduleAtTargetCadence(job, renderTarget);
 	}
 
@@ -1240,7 +1251,7 @@ export class RenderQueue extends Resource {
 			return (await settleTargetless(job, await readTargetlessRow(job))) === 'deferred' ? 'slow' : 'dropped';
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
-		await Target.patch(sourceUrl, { strikes });
+		await patchTarget(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
 			logger.debug(`Retrying ${job.rowKey} on its claim lease (failure strike ${strikes})`);
