@@ -2165,6 +2165,12 @@ const NEGATIVE_REFUSALS = new Set([
 	'skipped-target',
 ]);
 
+// Finer than `pct` for a risk share: 3 stale 404s in 1,000 must not print as 0%.
+const riskShare = (part, whole) => {
+	const share = (part / whole) * 100;
+	return share > 0 && share < 0.1 ? '<0.1%' : `${share < 10 ? share.toFixed(1) : Math.round(share)}%`;
+};
+
 function negativeCache(ctx, data, filter) {
 	const events = pick(data, 'prerender_ops', (s) => s.path === 'negative_cache');
 	const gaps = pick(data, 'prerender_ops', (s) => s.path === 'negative_gap');
@@ -2194,6 +2200,9 @@ function negativeCache(ctx, data, filter) {
 	const refused = [...NEGATIVE_REFUSALS].reduce((acc, key) => acc + ev(key), 0);
 	const wouldServe = ev('would-serve');
 	const wouldLive = ev('would-serve-live');
+	// Every would-serve-live request was first counted as would-serve OR would-revalidate (the lookup
+	// counts, the proxied 200 then counts again), so those two are its denominator.
+	const wouldAnswer = wouldServe + ev('would-revalidate');
 
 	if (!enabled && !events.length && !answered && !rechecking && !reopens.length) {
 		return card('Negative cache', {
@@ -2235,7 +2244,7 @@ function negativeCache(ctx, data, filter) {
 						text: `${num(wouldLive)} request(s) would have been answered with a stale 404`,
 					}),
 					' while the origin answered 200' +
-						(wouldServe ? ` (${pct(wouldLive, wouldServe + wouldLive)} of would-serve)` : '') +
+						(wouldAnswer ? ` (${riskShare(wouldLive, wouldAnswer)} of the requests arming would have answered)` : '') +
 						'. ',
 					'Do not arm while this is material; a shorter freshMs narrows it.',
 				]),

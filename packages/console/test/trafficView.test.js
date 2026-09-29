@@ -566,6 +566,7 @@ test('the negative-cache panel reads the dry run: would-serve, and the stale-404
 		series: [
 			...ANALYTICS.series,
 			combo('prerender_ops', 'negative_cache', 'would-serve', null, 900),
+			combo('prerender_ops', 'negative_cache', 'would-revalidate', null, 100),
 			combo('prerender_ops', 'negative_cache', 'would-serve-live', null, 3),
 			combo('prerender_ops', 'negative_cache', 'stored', null, 400),
 			combo('prerender_ops', 'gone_reopen', 'would-file', 'traffic', 7),
@@ -576,6 +577,9 @@ test('the negative-cache panel reads the dry run: would-serve, and the stale-404
 	const text = everything(ctx);
 	assert.match(text, /Negative cache/);
 	assert.match(text, /3 request\(s\) would have been answered with a stale 404/);
+	// A share of every lookup arming would have answered (would-serve + would-revalidate, which already
+	// include the 3), not of would-serve alone, and not rounded down to 0%.
+	assert.match(text, /\(0\.3% of the requests arming would have answered\)/);
 });
 
 test('the per-route table counts a verified serve as cache-served', async () => {
