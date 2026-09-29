@@ -37,6 +37,7 @@ import {
 	DAY,
 } from './configSchema.js';
 import { describeSecret } from './util/redact.js';
+import { runInLoadContext } from './util/detach.js';
 // Cyclic by design, and safe: routeClass.js imports `config`/`getLogger` from here, and this
 // module calls back into it only from inside `collectConfigWarnings` — never at module
 // evaluation time. The count has to come from the compiler rather than from raw config,
@@ -511,7 +512,11 @@ export const applyOptions = (options, overrides) => {
 
 	for (const listener of configListeners) {
 		try {
-			listener(config, previous);
+			// In the load-time context, never the caller's (util/detach.js). An apply can run inside a
+			// request (a stored-override doorbell may fire in the committing request's async context),
+			// and these listeners re-arm the schedulers' timers: armed there, every later tick of the
+			// probe, reconcile, backlog and poll timers would run on that request's closed transaction.
+			runInLoadContext(() => listener(config, previous));
 		} catch (e) {
 			getLogger().error?.(e);
 		}

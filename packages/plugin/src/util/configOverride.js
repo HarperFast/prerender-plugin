@@ -35,6 +35,7 @@
 
 import { config, getLogger, onConfigApplied, resolveConfig } from '../config.js';
 import { aliasPaths, checkUiEditable, describeItemRule, invalidItems } from '../configSchema.js';
+import { runDetached } from './detach.js';
 
 const table = () => databases.config.ConfigOverride;
 
@@ -423,11 +424,19 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 		return inFlight;
 	};
 
+	// ARMED DETACHED (util/detach.js). This runs from the subscription's listener, and Harper's
+	// `committed` handler may run it in the async context of the request whose write rang it. A timer
+	// armed there inherits that context, so the re-read, the apply and every timer the apply re-arms
+	// would run on the request's transaction, which Harper closes after the response: the table read
+	// aborts with "Database closed during transaction get". Every console edit is served by some
+	// worker, and that worker is where this can happen.
 	const ring = (reason) => {
 		clearTimeout(debounceTimer);
-		debounceTimer = setTimeout(() => {
-			reread(reason).catch((e) => getLogger().error?.(e));
-		}, DEBOUNCE_MS);
+		debounceTimer = runDetached(() =>
+			setTimeout(() => {
+				reread(reason).catch((e) => getLogger().error?.(e));
+			}, DEBOUNCE_MS)
+		);
 		debounceTimer.unref?.();
 	};
 
