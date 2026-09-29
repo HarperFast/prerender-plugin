@@ -2314,6 +2314,7 @@ const probeSettings = () => {
 		},
 		canary: {
 			interval: c.canary.interval,
+			schedule: canarySchedule().map(scheduleWindowStatus),
 			count: c.canary.count,
 			threshold: c.canary.threshold,
 			minSample: c.canary.minSample,
@@ -2408,10 +2409,15 @@ export const changeProbeStatus = async () => {
 			current: currentPass(row, 'canary'),
 			lastRun: canary?.lastRun ?? null,
 			armedInterval: scheduler?.armedCanary ?? null,
-			nextRunAt:
-				config.changeProbe.enabled && canaryArmedAt !== null && canaryEvery > 0
-					? nextTick(canaryArmedAt, canaryEvery, now)
-					: null,
+			// The time-of-day schedule, when one is set (`canary.schedule`); null = the fixed interval.
+			schedule: scheduler?.armedCanarySchedule ? canarySchedule().map(scheduleWindowStatus) : null,
+			nextRunAt: !config.changeProbe.enabled
+				? null
+				: scheduler?.armedCanarySchedule
+					? msOrNull(scheduler.nextCanaryAt)
+					: canaryArmedAt !== null && canaryEvery > 0
+						? nextTick(canaryArmedAt, canaryEvery, now)
+						: null,
 			cohortSizes: scheduler?.cohortSizes ?? {},
 		},
 	};
@@ -2426,6 +2432,10 @@ let sweepTimer = null;
 let canaryTimer = null;
 let armedSweep = null;
 let armedCanary = null;
+// The armed canary SCHEDULE's identity (windows + timezone), or null when the fixed interval runs.
+let armedCanarySchedule = null;
+// When a scheduled canary fires next — published, because a chain of timeouts has no `armedAt + k*every`.
+let nextCanaryAt = null;
 // When each driver was armed, so ANY worker can say when it fires next: the timers themselves live
 // on worker 0, and a timer cannot be asked for its next tick.
 let bootAt = null;
@@ -2459,6 +2469,8 @@ const publishScheduler = () => {
 			scheduler: {
 				armedSweep,
 				armedCanary,
+				armedCanarySchedule,
+				nextCanaryAt,
 				nextAnchorAt,
 				bootAt,
 				intervalArmedAt,
@@ -2481,7 +2493,7 @@ const clearProbeTimers = () => {
 	if (anchorTimer) clearTimeout(anchorTimer);
 	if (resumeTimer) clearTimeout(resumeTimer);
 	bootTimer = sweepTimer = canaryTimer = anchorTimer = resumeTimer = null;
-	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = null;
+	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = nextCanaryAt = null;
 	timerGeneration++;
 	stopContinuousLoop();
 };
@@ -2620,7 +2632,7 @@ const checkResume = async () => {
 			`[prerender] change-probe: no pass has run since the ${new Date(lastAnchor).toISOString()} anchor (the ` +
 				`process was down when it came) — running that anchor's pass now`
 		);
-		void runAnchoredPass(lastAnchor, { outcome: 'caught_up', generation: timerGeneration });
+		void runAnchoredPass(lastAnchor, { outcome: 'caught_up' });
 		return decided({ resumed: false, reason, caughtUp: true, anchorAt: lastAnchor });
 	}
 	return decided({ resumed: false, reason });
@@ -2717,7 +2729,7 @@ export const requestSweepInterrupt = (by) =>
 
 // How often an anchored pass that is waiting for another sweep tries again.
 const ANCHOR_RETRY_MS = 15 * SECOND;
-// Bumped by every re-arm, so a waiting anchored pass knows the schedule it was waiting for is gone.
+// Bumped by every re-arm, so the anchor that fired knows whether the re-arm after its pass is still its to make.
 let timerGeneration = 0;
 
 /**
@@ -2741,13 +2753,16 @@ let timerGeneration = 0;
  * Every anchor is one `probe_anchor` emit, detail = outcome; `on_time` is the plain case and
  * `caught_up` the boot catch-up (`checkResume`).
  */
-const runAnchoredPass = async (anchorAt, { outcome = 'on_time', generation = timerGeneration } = {}) => {
+const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
+	// The schedule this pass belongs to. A re-arm that keeps it (a canary edit, say) leaves the wait
+	// alone; one that changes the anchor, the mode, or disables the probe abandons it.
+	const key = anchorKey();
 	let served = anchorAt;
 	let result = outcome;
 	let asked = false;
 	let waitedFor = null;
 	for (;;) {
-		if (generation !== timerGeneration || !schedulerStarted || !config.changeProbe.enabled || !isAnchored()) {
+		if (!schedulerStarted || !config.changeProbe.enabled || !isAnchored() || armedSweep !== key) {
 			countProbe('anchor', 'skipped');
 			logger.warn(
 				`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} was abandoned — the ` +
@@ -2835,7 +2850,7 @@ const armAnchorTimer = () => {
 			// Awaited so the scheduler write lands before the pass claims the row.
 			await publishScheduler();
 			const generation = timerGeneration;
-			await runAnchoredPass(at, { generation });
+			await runAnchoredPass(at);
 			// Config is re-read here rather than captured: this is the boundary a live change acts on. A
 			// mode or anchor edit while the pass ran (or waited) has already re-armed through
 			// syncProbeTimers — the generation moved — and that arming stands.
@@ -2910,6 +2925,121 @@ const stopContinuousLoop = () => {
 	continuousStop = null;
 };
 
+/**
+ * THE CANARY'S TIME-OF-DAY SCHEDULE (`changeProbe.canary.schedule`) — optional; empty (the default) is
+ * the fixed `canary.interval`, exactly as before.
+ *
+ * WHY. The canary exists to catch a mass change fast, and on a site that reprices on a schedule the
+ * change comes at one time of day: a 500-URL cohort every 30 minutes all day is ~24k origin calls per
+ * node per day, nearly all of them confirming that nothing happened. A schedule makes the canary dense
+ * where a change is expected and sparse elsewhere: windows `{ from, to, interval }` ("HH:MM", in
+ * `anchorTimezone`, the anchor's own zone and DST handling), each with its own interval; outside every
+ * window `canary.interval` applies (0 = no canary there). A window may wrap midnight (`to` < `from`);
+ * the first window containing an instant is the one that applies.
+ *
+ * WHEN IT RUNS. At each window's start, then every `interval` inside it; a run whose next interval would
+ * cross the window's end hands over to the outside cadence, counted from that run. A chain of timeouts,
+ * re-armed at each FIRE (not after the pass, so the cadence does not drift by the pass's duration), and
+ * every next instant is computed afresh from the wall clock — a DST shift moves the windows with the
+ * local time rather than accumulating an hour of error, and a start inside a spring-forward hole is
+ * pushed to its next real occurrence rather than resolving into the past.
+ */
+let compiledSchedule = null;
+let compiledScheduleFrom;
+const TIME_OF_DAY = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+export const canarySchedule = () => {
+	const raw = config.changeProbe.canary.schedule;
+	if (raw === compiledScheduleFrom) return compiledSchedule;
+	compiledScheduleFrom = raw;
+	compiledSchedule = [];
+	for (const [index, entry] of (Array.isArray(raw) ? raw : []).entries()) {
+		const interval = Number(entry?.interval);
+		const valid =
+			TIME_OF_DAY.test(String(entry?.from ?? '')) &&
+			TIME_OF_DAY.test(String(entry?.to ?? '')) &&
+			entry.from !== entry.to &&
+			Number.isFinite(interval) &&
+			interval >= MINUTE &&
+			interval <= MAX_TIMER_DELAY;
+		if (!valid) {
+			logger.warn?.(
+				`[prerender] changeProbe.canary.schedule[${index}] is not { from: "HH:MM", to: "HH:MM" (different), ` +
+					`interval: >= 60000 ms } — ignored: ${JSON.stringify(entry)}`
+			);
+			continue;
+		}
+		compiledSchedule.push({
+			fromTime: entry.from,
+			toTime: entry.to,
+			from: minutesOfTimeOfDay(entry.from),
+			to: minutesOfTimeOfDay(entry.to),
+			interval,
+		});
+	}
+	return compiledSchedule;
+};
+const MAX_TIMER_DELAY = 2147483647;
+const canaryScheduleKey = (schedule) =>
+	`${config.changeProbe.anchorTimezone}|${schedule.map((w) => `${w.fromTime}-${w.toTime}/${w.interval}`).join(',')}`;
+const scheduleWindowStatus = (window) => ({ from: window.fromTime, to: window.toTime, interval: window.interval });
+
+/** The next occurrence of "HH:MM" in `timezone`, strictly after now (the spring-forward guard). */
+const nextOccurrenceOf = (timeStr, timezone) => {
+	const at = getNextTimeOfDay(timeStr, timezone);
+	if (!Number.isFinite(at)) return NaN;
+	return at <= Date.now() ? at + DAY : at;
+};
+
+/** When the scheduled canary should next run, seen from `now` (just after a run, or at arming). */
+export const nextScheduledCanary = (now, { schedule, interval, timezone }) => {
+	const minutes = localMinutesOf(now, timezone);
+	const inside = (w) => (w.from < w.to ? minutes >= w.from && minutes < w.to : minutes >= w.from || minutes < w.to);
+	const current = schedule.find(inside);
+	const outside = interval > 0 ? now + interval : Infinity;
+	let next = outside;
+	if (current) {
+		const end = nextOccurrenceOf(current.toTime, timezone);
+		next = Number.isFinite(end) && now + current.interval > end ? outside : now + current.interval;
+	}
+	for (const window of schedule) {
+		const start = nextOccurrenceOf(window.fromTime, timezone);
+		if (Number.isFinite(start) && start < next) next = start;
+	}
+	return next;
+};
+
+const armCanarySchedule = () => {
+	if (canaryTimer) clearTimeout(canaryTimer);
+	canaryTimer = null;
+	let at;
+	try {
+		at = nextScheduledCanary(Date.now(), {
+			schedule: canarySchedule(),
+			interval: config.changeProbe.canary.interval,
+			timezone: config.changeProbe.anchorTimezone,
+		});
+	} catch (e) {
+		logger.warn(
+			`[prerender] change-probe: canary.schedule cannot be evaluated in anchorTimezone ` +
+				`"${config.changeProbe.anchorTimezone}" (${e?.message ?? String(e)}) — the scheduled canary is not armed`
+		);
+		at = NaN;
+	}
+	nextCanaryAt = Number.isFinite(at) ? at : null;
+	if (nextCanaryAt !== null) {
+		canaryTimer = setTimeout(
+			() => {
+				canaryTimer = null;
+				armCanarySchedule();
+				runProbeCanaryOnce({ startedBy: 'interval' }).catch((e) => logger.error(e));
+			},
+			Math.min(Math.max(0, nextCanaryAt - Date.now()), MAX_TIMER_DELAY)
+		);
+		canaryTimer.unref?.();
+	}
+	void publishScheduler();
+};
+
 const armIntervals = () => {
 	// The SWEEP is what the mode changes. The CANARY is orthogonal to it — a fixed cohort on a
 	// fast fixed cadence, whose whole job is to notice a mass change between sweeps — so it arms
@@ -2925,7 +3055,8 @@ const armIntervals = () => {
 		sweepTimer.unref?.();
 		intervalArmedAt = Date.now();
 	}
-	if (armedCanary) {
+	if (armedCanarySchedule !== null) armCanarySchedule();
+	else if (armedCanary) {
 		canaryTimer = setInterval(
 			() => runProbeCanaryOnce({ startedBy: 'interval' }).catch((e) => logger.error(e)),
 			armedCanary
@@ -2955,8 +3086,17 @@ const syncProbeTimers = () => {
 			: isAnchored()
 				? anchorKey()
 				: config.changeProbe.sweepInterval;
-	const desiredCanary = enabled && config.changeProbe.canary.interval > 0 ? config.changeProbe.canary.interval : null;
-	if (desiredSweep === armedSweep && desiredCanary === armedCanary) return;
+	const schedule = canarySchedule();
+	const desiredCanarySchedule = enabled && schedule.length ? canaryScheduleKey(schedule) : null;
+	const desiredCanary =
+		enabled && config.changeProbe.canary.interval > 0
+			? config.changeProbe.canary.interval
+			: desiredCanarySchedule !== null
+				? 0
+				: null;
+	if (desiredSweep === armedSweep && desiredCanary === armedCanary && desiredCanarySchedule === armedCanarySchedule) {
+		return;
+	}
 
 	// A mode switch must re-measure. The slice estimate is not wrong across a switch, but it can
 	// be arbitrarily stale (interval mode never maintains it), and pacing a fresh continuous cycle
@@ -2975,6 +3115,7 @@ const syncProbeTimers = () => {
 	clearProbeTimers();
 	armedSweep = desiredSweep;
 	armedCanary = desiredCanary;
+	armedCanarySchedule = desiredCanarySchedule;
 
 	// EVERY BRANCH BELOW PUBLISHES, AND ONLY AFTER IT HAS ARMED (#176). This used to publish once,
 	// here, before anything was armed — so the snapshot carried the anchor as null, and null is the
@@ -3053,8 +3194,10 @@ export const __mappingGuardForTest = theMappingGuard;
 export const resetChangeProbeState = () => {
 	clearProbeTimers();
 	schedulerStarted = false;
-	armedSweep = armedCanary = null;
+	armedSweep = armedCanary = armedCanarySchedule = null;
 	sweepRunning = canaryRunning = false;
+	compiledSchedule = null;
+	compiledScheduleFrom = undefined;
 	sweepInterrupt = null;
 	lastSweep = lastCanary = null;
 	cohorts = new Map();

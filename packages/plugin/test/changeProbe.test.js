@@ -3583,3 +3583,117 @@ test('onChange fires for an origin change only — not for a seed, an unchanged 
 	assert.equal(stats.changed, 1);
 	assert.deepEqual(seen, [['pdp', URL_C]]);
 });
+
+// ---- the canary's optional time-of-day schedule (E2) ----------------------------------------------
+
+test('E2: nextScheduledCanary — dense inside a window from its start, the outside interval elsewhere', (t) => {
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['Date'] });
+	try {
+		const schedule = [{ fromTime: '00:00', toTime: '02:00', from: 0, to: 120, interval: 10 * 60_000 }];
+		// The window boundaries are read off the wall clock, so each case sets it.
+		const from = (iso, interval = 2 * HOUR) => {
+			t.mock.timers.setTime(Date.parse(iso));
+			return new Date(
+				changeProbe.nextScheduledCanary(Date.now(), { schedule, interval, timezone: 'UTC' })
+			).toISOString();
+		};
+		assert.equal(
+			from('2026-09-23T23:30:00.000Z'),
+			'2026-09-24T00:00:00.000Z',
+			'the window start beats the outside cadence'
+		);
+		assert.equal(from('2026-09-24T00:00:00.000Z'), '2026-09-24T00:10:00.000Z', 'then every window interval');
+		assert.equal(from('2026-09-24T01:50:00.000Z'), '2026-09-24T02:00:00.000Z', 'up to the window end');
+		assert.equal(
+			from('2026-09-24T01:55:00.000Z'),
+			'2026-09-24T03:55:00.000Z',
+			'past it, the outside cadence from that run'
+		);
+		assert.equal(from('2026-09-24T12:00:00.000Z'), '2026-09-24T14:00:00.000Z');
+		assert.equal(from('2026-09-24T23:00:00.000Z'), '2026-09-25T00:00:00.000Z');
+		assert.equal(from('2026-09-24T12:00:00.000Z', 0), '2026-09-25T00:00:00.000Z', 'outside interval 0: windows only');
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+	}
+});
+
+test('E2: the scheduled canary runs at the window start and every window interval, and publishes its next run', async (t) => {
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse('2026-09-23T23:30:00Z') });
+	try {
+		await applyProbeConfig({
+			// Anchored, so the canary arms at once (interval mode arms it with the boot sweep), with the anchor
+			// and the boot check out of the way.
+			enabled: true,
+			mode: 'anchored',
+			anchorTime: '12:00',
+			startDelay: 24 * HOUR - 1,
+			startJitter: 1,
+			canary: { interval: 2 * HOUR, count: 10, schedule: [{ from: '00:00', to: '02:00', interval: 600_000 }] },
+		});
+		changeProbe.startChangeProbeScheduler();
+		await changeProbe.probeStatePublishedForTest();
+		let status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:00:00Z'), 'the window start, not 23:30 + 2h');
+		assert.deepEqual(status.canary.schedule, [{ from: '00:00', to: '02:00', interval: 600_000 }]);
+		t.mock.timers.tick(30 * 60_000); // 00:00 — the first run
+		await settlePasses();
+		status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.lastRun?.startedAt, Date.parse('2026-09-24T00:00:00Z'), 'ran at the window start');
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:10:00Z'));
+		t.mock.timers.tick(10 * 60_000);
+		await settlePasses();
+		status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.lastRun?.startedAt, Date.parse('2026-09-24T00:10:00Z'));
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:20:00Z'));
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+		await applyProbeConfig({ enabled: false });
+	}
+});
+
+test('E2: with no schedule the canary is the fixed interval, exactly as before', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 60_000, canary: { interval: 30_000 } });
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.canary.armedInterval, 30_000);
+	assert.equal(status.canary.schedule, null);
+	t.mock.timers.reset();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('E2: a window starting inside the spring-forward hole still arms a FUTURE run', async (t) => {
+	// America/New_York, 2026-03-08: 02:00 EST jumps to 03:00 EDT, so a 02:30 start does not occur that day.
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse('2026-03-08T06:45:00Z') });
+	try {
+		await applyProbeConfig({
+			enabled: true,
+			mode: 'anchored',
+			anchorTime: '12:00',
+			startDelay: 24 * HOUR - 1,
+			startJitter: 1,
+			anchorTimezone: 'America/New_York',
+			canary: { interval: 0, count: 10, schedule: [{ from: '02:30', to: '04:00', interval: 600_000 }] },
+		});
+		changeProbe.startChangeProbeScheduler();
+		await changeProbe.probeStatePublishedForTest();
+		const status = await changeProbe.changeProbeStatus();
+		assert.ok(status.canary.nextRunAt > Date.now(), `next run ${new Date(status.canary.nextRunAt).toISOString()}`);
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+		await applyProbeConfig({ enabled: false });
+	}
+});

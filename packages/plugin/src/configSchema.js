@@ -1145,9 +1145,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'tail of the old one.',
 				{ nonEmpty: true }
 			),
-			anchorTimezone: option('UTC', 'ANCHORED MODE ONLY: IANA timezone `anchorTime` is interpreted in.', {
-				nonEmpty: true,
-			}),
+			anchorTimezone: option(
+				'UTC',
+				'IANA timezone `anchorTime` (anchored mode) and the `canary.schedule` windows are interpreted in.',
+				{ nonEmpty: true }
+			),
 			anchorWindow: option(
 				0,
 				'ANCHORED MODE ONLY: wall-clock budget the daily pass paces itself to, like `cycleTarget` ' +
@@ -1374,11 +1376,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
 					'replaces it.)',
 				{
-					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
-						unit: 'ms',
-						min: 0,
-						max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
-					}),
+					interval: option(
+						30 * MINUTE,
+						'How often the cohort is probed — all day, or outside the `schedule` windows when one is set. ' +
+							'0 disables the canary (with a schedule: disables it outside the windows).',
+						{
+							unit: 'ms',
+							min: 0,
+							max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
+						}
+					),
+					schedule: option(
+						[],
+						'OPTIONAL time-of-day cadence; empty (the default) probes every `interval`, all day. Each entry is ' +
+							'`{ from: "HH:MM", to: "HH:MM", interval: <ms, >= 60000> }` in `anchorTimezone` (the anchor’s zone ' +
+							'and DST handling): inside the window the cohort is probed at its start and then every ' +
+							'`interval`; outside every window, every `canary.interval` (0 = not at all). A window may wrap ' +
+							'midnight; the first one containing an instant applies; an invalid entry is dropped with a ' +
+							'warning.\n\n' +
+							'WHY. On a site that reprices on a schedule a mass change comes at one time of day, and a ' +
+							'500-URL cohort every 30 minutes around the clock is ~24k origin calls per node per day spent ' +
+							'mostly confirming nothing happened. E.g. `interval: 14400000` (4h) with `schedule: [{ from: ' +
+							'"23:50", to: "03:00", interval: 600000 }]` (10 min) probes densely across a midnight reprice ' +
+							'and every 4h elsewhere — ' +
+							'but an OFF-schedule mass change is then seen up to `interval` late, so keep the outside ' +
+							'interval within what that exposure can bear.',
+						{ itemType: 'object' }
+					),
 					count: option(
 						500,
 						'Cohort size per rule per node. At the default threshold this resolves a mass change with ' +
