@@ -832,7 +832,10 @@ export const METRICS = Object.freeze({
 					'the bot name. invalidation_error: the kind — read-error (the row read threw; a live ' +
 					'last-known-good answered, or the request failed OPEN), lkg-expired (it threw and the memory ' +
 					'was older than invalidation.lkgMaxAge — the serious one), invalid-row (row exists, shape ' +
-					'unusable), unknown-mode (treated as hard). invalidation_reenqueue: the outcome — lowered ' +
+					'unusable), unknown-mode (treated as hard) — those two once per view load, not per request — ' +
+					'view-read-error / view-subscribe-error (the worker’s in-memory view could not be read, or its ' +
+					'subscription could not be armed or closed: that worker resolves per request until the ' +
+					'invalidation.syncInterval backstop recovers it; correct, only dearer). invalidation_reenqueue: the outcome — lowered ' +
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +

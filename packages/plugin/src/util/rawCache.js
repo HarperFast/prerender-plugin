@@ -351,6 +351,29 @@ export const collectBody = async (stream, maxBytes) => {
 };
 
 /**
+ * Read a stream to its end and throw the bytes away — the release for a CAPTURED body nobody will send
+ * (a local 304). Destroying the source would release the socket too, but would also fail the capture
+ * reading beside it; draining the crawler's branch lets the capture finish and the connection end
+ * normally, and discarding each chunk as it arrives means the tee retains nothing for this branch.
+ * Never rejects; a stream something else already reads is left alone.
+ */
+export const discardStream = (stream) => {
+	let reader;
+	try {
+		reader = stream.getReader();
+	} catch {
+		return;
+	}
+	(async () => {
+		try {
+			while (!(await reader.read()).done);
+		} catch {
+			// The origin body failed; the capture branch reports it on its own terms.
+		}
+	})();
+};
+
+/**
  * Headers to store beside the bytes: the origin's own filtered set, minus `content-length`.
  *
  * See the module header on encoding. `content-length` is dropped because the serve path may hand
@@ -440,7 +463,9 @@ export const captureForRawCache = (resource, { cacheKey, policy }) => {
 			inFlightCaptures--;
 		});
 
-	return { ...resource, content: downstream };
+	// `releaseBody` replaced (util/upstream.js#releaseOriginBody): once a capture rides the body, an
+	// unsent response drains its branch instead of destroying the source out from under the capture.
+	return { ...resource, content: downstream, releaseBody: () => discardStream(downstream) };
 };
 
 /**

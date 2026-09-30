@@ -17,8 +17,8 @@
 #   probe_state      ProbeState, RenderExpectation,  — change-probe baselines + per-page render
 #                    ProbeStateAnchor                  expectations (node-local, isolated for
 #                                                      reseed write bursts)
-#   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
-#                                                      serve path; isolated, see the type)
+#   invalidation     Invalidation                    — bulk-invalidation epochs (held in memory by
+#                                                      every worker and SUBSCRIBED; isolated, see the type)
 #   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
 #                                                      the render rotation (expiring, isolated)
 #   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local
@@ -321,7 +321,10 @@ type ConfigOverride @table(database: "config") @sealed {
 # ITS OWN DATABASE, for two measured reasons. Harper serializes writes per database, and (a) a bulk
 # write to another table in the same database pushed tiny-table read p99 from 0.24 ms to 9.7 ms
 # (max 13.9 ms) — and this table is read ON THE SERVE PATH; (b) `Target.revalidate` and the queue
-# both write `render_service`, so a scope row there would queue behind those commits.
+# both write `render_service`, so a scope row there would queue behind those commits. And a third,
+# since every worker SUBSCRIBES to it (util/invalidation.js holds the table in memory): a
+# subscription is priced per DATABASE — every commit anywhere in it runs a notify pass for each
+# subscribed worker — so NOTHING ELSE MAY EVER SHARE THIS DATABASE.
 #
 # DELIBERATELY NOT @export. A REST write verb here takes the whole corpus off the serve path in one
 # request, and a bare PUT cannot enforce any of the validation that makes a scope meaningful — the

@@ -119,11 +119,11 @@ export async function handleApplication(scope) {
 	// Unlike the three above, this one runs on EVERY worker: its counters are in-process, so
 	// each worker has to flush its own tally (see util/unrouted.js).
 	startUnroutedReporter();
-	// EVERY worker too, and for two different reasons in one call: it primes this worker's
-	// last-known-good invalidation set (the serve path resolves per request, and the HTTP handler is
-	// installed at module load — before this runs — so the very first cache-servable request would
-	// otherwise be the one uncovered read), and it reports any recorded scope that no longer names a
-	// configured route. That second half must re-run on config changes, because a route RENAMED by a
-	// live edit un-invalidates a corpus somebody deliberately invalidated, with nothing else to notice.
+	// EVERY worker too, and for two different reasons in one call: it starts this worker's subscribed
+	// in-memory view of the invalidation table (the serve path resolves epochs from it; until it loads,
+	// the handler — installed at module load, before this runs — reads per request), and it reports any
+	// recorded scope that no longer names a configured route. That second half must re-run on config
+	// changes, because a route RENAMED by a live edit un-invalidates a corpus somebody deliberately
+	// invalidated, with nothing else to notice.
 	startInvalidationWatch();
 }

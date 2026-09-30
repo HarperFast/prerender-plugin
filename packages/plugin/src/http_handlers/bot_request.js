@@ -294,7 +294,31 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// markup, and an intra-cluster fetch is ~50x cheaper than the origin round trip. Inert unless
 		// `peerRescue` is configured; origin remains the backstop for every miss (owner is this node,
 		// owner unreachable, owner's own read fails).
-		const rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		let rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		// THE OWNER'S COPY IS JUDGED BY THE SAME RULE THE LOCAL ONE WAS. The local record proved itself
+		// servable, but it is the replica — and replication lag is exactly when blob faults cluster, so
+		// the owner's newer metadata may already say this page must not be served: hard-expired by the
+		// change probe, or re-rendered before an epoch the local copy postdates. Serving those bytes as a
+		// 200 because the LOCAL row said so would hand the crawler the very page the probe acted to stop.
+		// Decided here rather than on the owner so that one node, one epoch and one config decide the
+		// whole request, and so the endpoint stays a dumb read (http_handlers/peer_page.js). The
+		// verification pair still applies: the owner is never older than the local copy, so a proof
+		// that exempted the local render exempts the owner's too.
+		if (rescue.ok) {
+			const owner = resolveServeStatus({
+				expiresAtMs: epochMsOf(rescue.page.expiresAt),
+				lastCachedMs: epochMsOf(rescue.page.lastCached),
+				swrTtl: config.page.swrTtl,
+				now: Date.now(),
+				epoch,
+				verifiedAtMs,
+				basisAtMs,
+			});
+			if (!owner.servable) {
+				const why = owner.status === 'invalidated' ? 'invalidated' : 'past its serve window';
+				rescue = { ok: false, owner: rescue.owner, reason: `the owner's copy is ${why}` };
+			}
+		}
 		if (rescue.ok) {
 			const note = timedOut ? `read exceeded ${config.page.blobReadBudgetMs}ms` : 'unreadable';
 			logger.warn(
@@ -333,6 +357,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		return fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
 			reason: failStatus,
 		});
@@ -468,9 +493,14 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
 	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
 	// invalidation worked. See util/upstream.js.
+	//
+	// A HEAD GOES UPSTREAM AS A HEAD. Sent as a GET, the origin built and sent a full document that
+	// nothing would read: `deliverResource` drops the body of a HEAD, and the undici stream behind it
+	// held its socket until `bodyTimeout` — one pinned origin connection per HEAD miss.
 	const resource = await fetchOriginResource({
 		url,
 		deviceType,
+		method: request.method,
 		headers: request.headers,
 		stripValidators: info.cacheStatus === 'invalidated',
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
@@ -479,12 +509,22 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
-	// store is detached inside `captureForRawCache` — no latency on this response.
-	const kept = rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
-	// Same rule for a 404/410: the store (and the Target guard in front of it) is detached. The two never
-	// both attach — the raw cache stores only 200s, the negative cache only its configured statuses.
+	// store is detached inside `captureForRawCache` — no latency on this response. Never for a HEAD:
+	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
+	const kept =
+		rawPolicy && request.method !== 'HEAD'
+			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy })
+			: resource;
+	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
+	// only 200s, the negative cache only its configured statuses.
 	return negativePolicy
-		? afterNegativeProxy(kept, { key: negativeKey, cacheUrl, policy: negativePolicy, lookup: negativeLookup })
+		? afterNegativeProxy(kept, {
+				key: negativeKey,
+				cacheUrl,
+				policy: negativePolicy,
+				lookup: negativeLookup,
+				method: request.method,
+			})
 		: kept;
 }
 
@@ -733,6 +773,7 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 		resource: await fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
 			stripValidators: !!activeEpoch,
 			reason: 'render-timeout',
