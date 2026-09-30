@@ -210,7 +210,9 @@ test('shrinkRefusal: maxRatio 1 disables it, and the defaults are 0.5 of the las
 	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 999, stored: 1999 }), null);
 	assert.equal(config.sitemap.shrinkGuard.acceptAfter, 2);
 	assert.equal(config.sitemap.shrinkGuard.acceptAge, 48 * 3_600_000);
-	assert.equal(config.sitemap.shrinkGuard.releasePerWalk, 5000);
+	assert.equal(config.sitemap.shrinkGuard.newVersionAfter, 20 * 3_600_000);
+	assert.equal(config.sitemap.shrinkGuard.releasePerWalk, undefined, 'replaced by departure.maxPerWalk');
+	assert.equal(config.sitemap.departure.maxPerWalk, 5000);
 });
 
 test('droppedChildRefusal: what a dropped child still holds after the walk, past maxRatio and at least minUrls', () => {

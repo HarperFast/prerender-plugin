@@ -133,9 +133,6 @@ export const indexShrinkRefusal = ({ indexUrl, leftovers, storedEntries }) => {
 	);
 };
 
-/** `sitemap.shrinkGuard.releasePerWalk` as a ceiling: -1 (any negative) is none. */
-export const shrinkReleaseLimit = () => departureLimit(config.sitemap.shrinkGuard.releasePerWalk);
-
 /**
  * How many departed URLs one walk may hold for the post-walk check.
  *

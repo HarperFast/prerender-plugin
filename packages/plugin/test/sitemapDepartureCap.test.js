@@ -88,7 +88,9 @@ const PRODUCT_ROUTE = { match: 'prefix', path: '/product/', mode: 'prerender' };
 const configure = ({ departure = {}, action = 'render' } = {}) => {
 	warns.length = 0;
 	return applyOptions({
-		sitemap: { departure: { enabled: true, dryRun: true, ...departure } },
+		// `maxPerWalk` off: these tests are about the LOSSY caps (`maxActions`, `maxCandidates`); the walk-wide
+		// budget, which defers rather than drops, has its own tests (sitemapWalkGuards.test.js).
+		sitemap: { departure: { enabled: true, dryRun: true, maxPerWalk: -1, ...departure } },
 		ingress: {
 			mode: 'forwarded',
 			routes: [{ ...PRODUCT_ROUTE, ...(action ? { departureAction: action } : {}) }],

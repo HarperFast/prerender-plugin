@@ -445,9 +445,14 @@ sustained rate (see §5):
   closes) or by `sitemap.shrinkGuard` (`refusing a document of N entries against the M last accepted`, or
   — for a child its index left out — `no longer listed by its index, and N … are listed nowhere else`)
   fails here too; refusals count `prerender_ops` `sitemap_shrink_refused`. A refused shrink is accepted
-  only once it survives a new origin version or `shrinkGuard.acceptAge` — logged as `ACCEPTING a shrink …`
-  and counted `sitemap_shrink_accepted`, the one to alert on: a real shrink landed. Its departures then
-  release at most `shrinkGuard.releasePerWalk` a walk; `sitemap_shrink_held_back` counts the rest.
+  only once it survives a new origin version (arriving at least `shrinkGuard.newVersionAfter` after the
+  first refusal) or `shrinkGuard.acceptAge` — logged as `ACCEPTING a shrink …` and counted
+  `sitemap_shrink_accepted`, the one to alert on: a real shrink landed. What it departs is metered like
+  every departure, by `sitemap.departure.maxPerWalk` (below).
+- **`Departure check DEFERRED N URL(s) past sitemap.departure.maxPerWalk …`** — the walk decided its
+  departure budget; the rest were re-linked to the child that unlinked them, whose validator was cleared,
+  so later walks offer them again. Counted as `departure_deferred` in the `sitemap_departure_*` family
+  (postponed, not lost), with a `budget` entry per child in the progress row's `holdBack`.
 - **`Departure check HELD BACK N URL(s) …`** — a child failed, so the held URLs that could have moved into
   it (on a route it held at its last parse; a child never stored holds its siblings' URLs) were put
   back on the child that unlinked them instead of departing. Counted in the `sitemap_departure_*` family

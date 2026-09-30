@@ -60,14 +60,11 @@ type Sitemap @table(database: "sitemaps") {
 	routes: [String]
 	# `sitemap.shrinkGuard`'s memory of a shrink it REFUSED (a document much shorter than this row, or —
 	# on a dropped child's row — its index leaving it out): how many times, and the version and time of
-	# the FIRST refusal, which "a new origin version" and `acceptAge` are measured from. A refused fetch
+	# the FIRST refusal, which "a new origin version" (`newVersionAfter`) and `acceptAge` are measured from. A refused fetch
 	# patches only these; an accepted document's put replaces the row and clears them.
 	shrinkRefusals: Int
 	shrinkRefusedVersion: String
 	shrinkRefusedAt: Date
-	# An accepted shrink still releasing past `releasePerWalk`: the next walk refetches it in full and
-	# unlinks the next batch under the same ceiling.
-	shrinkRelease: Boolean
 }
 
 type SitemapFailure {

@@ -493,11 +493,6 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 			'refused shrinks accepted once they outlived a rebuild or shrinkGuard.acceptAge (plugin v0.97.0) — rare ' +
 				'and logged at error; waits for the same panel',
 		],
-		[
-			'sitemap_shrink_held_back',
-			'URLs an accepted shrink kept attributed past shrinkGuard.releasePerWalk (plugin v0.97.0), released on ' +
-				'later walks; waits for the same panel',
-		],
 	]);
 
 	for (const name of new Set(emitted)) {

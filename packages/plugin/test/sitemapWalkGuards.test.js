@@ -201,19 +201,28 @@ const urlset = (...urls) =>
 	`<?xml version="1.0"?><urlset>${urls.map((u) => `<url><loc>${u}</loc></url>`).join('')}</urlset>`;
 const range = (from, to) => Array.from({ length: to - from }, (_, i) => P(from + i));
 
-const configure = ({ sitemap = {}, domains = [], departureDryRun = false, arrivalDryRun = false } = {}) =>
+const PRODUCT_ROUTE = { match: 'prefix', path: '/product/', departureAction: 'render', arrivalAction: 'render' };
+
+const configure = ({
+	sitemap = {},
+	departure = {},
+	domains = [],
+	departureDryRun = false,
+	arrivalDryRun = false,
+	routes = [PRODUCT_ROUTE],
+} = {}) =>
 	applyOptions({
 		domains,
 		origin: { securityToken: { header: 'x-bypass', value: 'SECRET' } },
 		sitemap: {
-			departure: { enabled: true, dryRun: departureDryRun, maxActions: -1, maxCandidates: -1 },
+			departure: { enabled: true, dryRun: departureDryRun, maxActions: -1, maxCandidates: -1, ...departure },
 			arrival: { enabled: true, dryRun: arrivalDryRun, maxActions: -1, maxCandidates: -1 },
 			conditional: { enabled: true },
 			...sitemap,
 		},
 		ingress: {
 			mode: 'forwarded',
-			routes: [{ match: 'prefix', path: '/product/', departureAction: 'render', arrivalAction: 'render' }],
+			routes,
 		},
 	});
 
@@ -376,7 +385,8 @@ test('a shorter document served unchanged all day stays refused: it is not accep
 });
 
 test('a refused shrink is accepted once it survives a NEW origin version, and not before acceptAfter refusals', async () => {
-	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2 } } });
+	// `newVersionAfter: 0`: the version rule alone (its minimum age has its own test below).
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2, newVersionAfter: 0 } } });
 	lastMod[C1] = MON;
 	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
 
@@ -405,9 +415,32 @@ test('a refused shrink with no new version is accepted after acceptAge', async (
 	assert.equal((await walk(short)).shrinkAccepted, 1);
 });
 
-test('an accepted shrink releases at most releasePerWalk departures a walk, and the rest on later walks', async () => {
+// Round-3 R1: a Last-Modified bump alone used to count as the rebuild that confirms a shrink, so a touch or a
+// re-publish of the same bad build was believed within hours.
+test('a new version that arrives before newVersionAfter is not the rebuild that confirms a shrink', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2, newVersionAfter: 40 } } });
+	lastMod[C1] = MON;
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	lastMod[C1] = TUE;
+	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	lastMod[C1] = 'Tue, 02 Sep 2026 06:00:00 GMT'; // the same bad build, touched hours later
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	assert.equal((await walk(short)).shrinkRefused, 1, 'past acceptAfter, but the new version came too soon');
+	await sleep(45);
+	lastMod[C1] = 'Wed, 03 Sep 2026 00:00:00 GMT'; // the next build, still short
+	const believed = await walk(short);
+	assert.equal(believed.shrinkAccepted, 1);
+	assert.equal(believed.failed.length, 0);
+});
+
+// Round-3 R2/R3: `releasePerWalk` limited only an ACCEPTED shrink, and per child. A partial build short of
+// `maxRatio` was never refused, so everything it dropped departed in one walk; three accepted children
+// released three ceilings. One budget per walk now meters every departure, and defers the rest.
+test('departure.maxPerWalk meters an accepted shrink across walks: deferred URLs are re-linked, then depart later', async () => {
 	configure({
-		sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, acceptAge: 0, releasePerWalk: 3 } },
+		sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, acceptAge: 0 } },
+		departure: { maxPerWalk: 3 },
 	});
 	lastMod[C1] = MON;
 	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
@@ -416,21 +449,88 @@ test('an accepted shrink releases at most releasePerWalk departures a walk, and 
 	await walk(short); // refused once
 	const first = await walk(short);
 	assert.equal(first.shrinkAccepted, 1);
-	assert.equal(first.removed, 3);
-	assert.equal(first.shrinkHeldBack, 5);
-	assert.equal(first.departures.outcomes.render, 3);
-	assert.equal(sitemapRows.get(C1).shrinkRelease, true);
+	assert.equal(first.departures.outcomes.render, 3, 'the budget');
+	assert.equal(first.departures.outcomes.deferred, 5, 'the rest, deferred');
+	assert.equal(range(2, 10).filter((url) => attributed(url) === C1).length, 5, 're-linked, not lost');
 	assert.equal(sitemapRows.get(C1).lastModified, null, 'refetched in full next walk');
+	const budget = first.holdBack.find((entry) => entry.reason === 'budget');
+	assert.equal(budget.sitemapUrl, C1);
+	assert.equal(budget.count, 5);
 
 	const second = await walk(short);
 	assert.equal(second.shrinkRefused, 0, 'already accepted: not judged again');
-	assert.equal(second.removed, 3);
-	assert.equal(second.shrinkHeldBack, 2);
+	assert.equal(second.departures.outcomes.render, 3);
+	assert.equal(second.departures.outcomes.deferred, 2);
 	const third = await walk(short);
-	assert.equal(third.removed, 2);
-	assert.equal(third.shrinkHeldBack, 0);
-	assert.equal(sitemapRows.get(C1).shrinkRelease, undefined, 'done releasing');
+	assert.equal(third.departures.outcomes.render, 2);
+	assert.equal(third.departures.outcomes.deferred ?? 0, 0);
+	assert.equal(range(2, 10).filter((url) => attributed(url)).length, 0, 'all departed, over three walks');
 	assert.equal(sitemapRows.get(C1).lastModified, TUE, 'conditional again');
+});
+
+test('departure.maxPerWalk is one budget across every child: shrinks short of maxRatio in two children share it', async () => {
+	// Each child loses 4 of 10 — under maxRatio, so neither is refused — and they share one budget of 5.
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } }, departure: { maxPerWalk: 5 } });
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 10)), [C2]: urlset(...range(10, 20)) });
+	const partial = { [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 6)), [C2]: urlset(...range(10, 16)) };
+	const result = await walk(partial);
+	assert.equal(result.shrinkRefused, 0);
+	assert.equal(result.departures.outcomes.render, 5, 'one budget, not one per child');
+	assert.equal(result.departures.outcomes.deferred, 3);
+	const lost = [...range(6, 10), ...range(16, 20)];
+	assert.equal(lost.filter((url) => attributed(url)).length, 3, 'the deferred three are still attributed');
+
+	// The origin recovers before the deferred URLs' turn: they were never departed, so they do not rejoin.
+	const recovered = await walk({
+		[ROOT]: index(C1, C2),
+		[C1]: urlset(...range(0, 10)),
+		[C2]: urlset(...range(10, 20)),
+	});
+	assert.equal(recovered.arrivals.outcomes.render ?? 0, 5, 'only the five that departed rejoin');
+});
+
+test('departure.maxPerWalk leaves a normal walk alone: departures under the budget are decided as before', async () => {
+	configure({ departure: { maxPerWalk: 5 } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 8)) });
+	assert.equal(result.departures.outcomes.render, 2);
+	assert.equal(result.departures.outcomes.deferred ?? 0, 0);
+	assert.equal(result.holdBack.length, 0);
+});
+
+// Round-3 item 4: a hold-back must never be silent. The result (and the progress row it feeds) names each
+// child departures are held back for, why, since when, and when a refusal can be accepted.
+test('the result names a refused shrink it holds back, with since when and when it can be accepted', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2, acceptAge: 48 * 3_600_000 } } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) });
+	const entry = result.holdBack.find((hold) => hold.sitemapUrl === C1);
+	assert.equal(entry.reason, 'refused-shrink');
+	assert.match(entry.detail, /refusing a document/);
+	assert.ok(Date.parse(entry.since) <= Date.now());
+	assert.equal(entry.refusals, 1);
+	assert.equal(entry.acceptAfterRefusals, 2);
+	assert.ok(Date.parse(entry.acceptRegardlessAt) - Date.parse(entry.since) === 48 * 3_600_000);
+	assert.ok(Date.parse(entry.acceptOnNewVersionFrom) > Date.parse(entry.since));
+});
+
+test('the result names a failed child that held URLs back', async () => {
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1), P(2), P(3)), [C2]: urlset(P(4)) });
+	const result = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }); // P2, P3 shifted into C2, which fails
+	const entry = result.holdBack.find((hold) => hold.sitemapUrl === C2);
+	assert.equal(entry.reason, 'failed-child');
+	assert.ok(entry.detail, 'with the failure');
+});
+
+// Round-3 item 6: a child's stored `routes` are keys of the config it was last parsed under. After a route
+// edit they name no current route, and a failure of that child must not be read as "held none of today's".
+test('a failed child whose stored route keys the current config no longer produces holds back its siblings too', async () => {
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1), P(2)), [C2]: urlset(P(4)) });
+	// The product route is edited: the same URLs now fall on a different entry, so C2's stored key is stale.
+	configure({ routes: [{ ...PRODUCT_ROUTE, path: '/product' }] });
+	const result = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }); // P2 shifted into C2, which fails
+	assert.deepEqual(result.departures.outcomes, { relinked: 1 }, 'held back, not departed');
+	assert.equal(attributed(P(2)), C1);
 });
 
 // ---- S1: a child the index stops listing ----
@@ -576,7 +676,10 @@ test('a small legitimate index change is not refused: the minUrls floor applies 
 });
 
 test('an omitted child is accepted once its INDEX publishes a new version still without it, releasing in batches', async () => {
-	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, releasePerWalk: 4 } } });
+	configure({
+		sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, newVersionAfter: 0 } },
+		departure: { maxPerWalk: 4 },
+	});
 	lastMod[ROOT] = MON;
 	const docs = { [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 5)), [C2]: urlset(...range(5, 11)) };
 	await walk(docs);
@@ -587,12 +690,12 @@ test('an omitted child is accepted once its INDEX publishes a new version still 
 	lastMod[ROOT] = 'Wed, 03 Sep 2026 00:00:00 GMT';
 	const accepted = await walk(omit);
 	assert.equal(accepted.shrinkAccepted, 1);
-	assert.equal(accepted.removed, 4);
-	assert.equal(accepted.shrinkHeldBack, 2);
-	assert.equal(sitemapRows.has(C2), true, 'kept while it is still releasing');
+	assert.equal(accepted.departures.outcomes.render, 4, 'the budget');
+	assert.equal(accepted.departures.outcomes.deferred, 2);
+	assert.equal(sitemapRows.has(C2), true, 'kept: the deferred URLs were re-linked onto it');
 	const rest = await walk(omit);
-	assert.equal(rest.removed, 2);
-	assert.equal(sitemapRows.has(C2), false);
+	assert.equal(rest.departures.outcomes.render, 2);
+	assert.equal(sitemapRows.has(C2), false, 'dropped once nothing is left on it');
 });
 
 test('a dropped child whose URLs moved into a FAILED child is re-linked, and its row outlives the walk', async () => {

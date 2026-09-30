@@ -2467,11 +2467,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'(`departure_relinked`). Refusals count `shrink_refused`.\n\n' +
 				'ACCEPTED ONLY ONCE IT OUTLIVES A REBUILD. A refused shorter document is believed when it has been ' +
 				'refused at least `acceptAfter` times AND it survived a NEW origin version (a changed `Last-Modified` ' +
-				'or content — for a dropped child, its index\u2019s) or `acceptAge` has passed since it was first ' +
-				'refused. Counting walks alone accepted a bad nightly build after a few walks of the same day, before ' +
-				'the next rebuild could fix it. An acceptance is logged at error and counted `shrink_accepted`, and ' +
-				'releases at most `releasePerWalk` departures a walk; the rest stay attributed and release on later ' +
-				'walks (`shrink_held_back`). `maxRatio: 1` disables the guard.',
+				'or content — for a dropped child, its index\u2019s) arriving at least `newVersionAfter` after the ' +
+				'first refusal, or `acceptAge` has passed since it was first refused. Counting walks alone accepted a ' +
+				'bad nightly build after a few walks of the same day, before the next rebuild could fix it. An ' +
+				'acceptance is logged at error and counted `shrink_accepted`; what it departs is metered like every ' +
+				'other departure, by `sitemap.departure.maxPerWalk`. `maxRatio: 1` disables the guard.',
 			{
 				maxRatio: option(
 					0.5,
@@ -2502,13 +2502,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'generator that failed one build has had two chances to fix it; a shrink still there is real.',
 					{ unit: 'ms', min: 0 }
 				),
-				releasePerWalk: option(
-					5000,
-					'Most URLs an ACCEPTED shrink may unlink in one walk, or -1 for no ceiling. The rest keep their ' +
-						'attribution and release on later walks (the document is re-fetched in full until it is ' +
-						'done), counted `shrink_held_back` — so a real shrink believed at last spreads its departures, ' +
-						'and their renders, over several walks instead of one burst.',
-					{ min: -1 }
+				newVersionAfter: option(
+					20 * HOUR,
+					'How long after the first refusal a NEW origin version must arrive to count as the rebuild that ' +
+						'confirms a shrink. A touch or re-publish of the same bad build bumps `Last-Modified` within ' +
+						'hours, and a partial that varies from fetch to fetch changes its digest every walk; neither is ' +
+						'the next build. 20h: past the same day\u2019s walks, short of a nightly rebuild.',
+					{ unit: 'ms', min: 0 }
 				),
 			}
 		),
@@ -2562,6 +2562,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'-1 removes the ceiling: every departed URL gets its action and nothing is ever counted as ' +
 						'`capped`. That gives up the guard above, so read a `dryRun` tally first. 0 acts on ' +
 						'nothing — every candidate is still decided and reported.',
+					{ min: -1 }
+				),
+				maxPerWalk: option(
+					5000,
+					'Most departures one walk may DECIDE, across every child sitemap at once, or -1 for no ceiling. ' +
+						'Past it, departed URLs are DEFERRED, not dropped: each is put back on the child that unlinked ' +
+						'it, whose validator is cleared so the next walk re-prunes it and offers them again ' +
+						'(`departure_deferred`, and a `budget` entry in the progress row\u2019s `holdBack`).\n\n' +
+						'WHY. `sitemap.shrinkGuard` refuses a document that lost more than `maxRatio` of itself; a ' +
+						'well-formed partial build that lost less — in one child or in all of them — is not refused, ' +
+						'and without this every URL it dropped would depart in one walk and rejoin, all of it, when the ' +
+						'origin recovered. Metered, a mass event spreads over several walks, and a recovery inside that ' +
+						'time turns the deferred URLs back into listed ones that never departed. Only URLs still ' +
+						'unattributed once the walk is over count: shear the walk already re-attached never does.\n\n' +
+						'HOW IT DIFFERS FROM `maxActions`: that cap is lossy — its overflow never gets its departure ' +
+						'action — and bounds how many actions run; this one is lossless and bounds how fast departures ' +
+						'are believed. Only HELD URLs can be deferred, so it needs `maxCandidates` at least as large. ' +
+						'5000: comfortably above a mature catalog\u2019s daily departures spread over its walks, and a ' +
+						'small fraction of what a missing or half-built product child sheds.',
 					{ min: -1 }
 				),
 				maxCandidates: option(
