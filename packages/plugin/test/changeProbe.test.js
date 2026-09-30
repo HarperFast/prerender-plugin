@@ -833,6 +833,8 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 			p.expiresAt <= after - config.page.swrTtl && p.expiresAt >= before - config.page.swrTtl,
 			`expiresAt ${p.expiresAt} is not backdated past swrTtl (${config.page.swrTtl}) around [${before}, ${after}]`
 		);
+		// The key rides in the patch: one that races a cross-node delete must not store a keyless stub.
+		assert.equal(p.cacheKey, p.id);
 	}
 });
 
