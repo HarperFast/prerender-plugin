@@ -362,3 +362,50 @@ test('change_lag_ms is counted for a render that lands the change, never for one
 	await claimAndPost(['35.99', 'USD', 'InStock']);
 	assert.equal(lag().length, 1, 'agrees: one sample');
 });
+
+test('round 3 N1: during an invalidation, a covered page the pass only WALKED PAST costs no re-probe when it heals (R2-NEW1)', async () => {
+	configure({
+		mode: 'anchored',
+		anchorTime: new Date(Date.now() - 10 * HOUR).toISOString().slice(11, 16),
+		anchorTimezone: 'UTC',
+	});
+	const trip = Date.now() - 3 * HOUR;
+	stores.invalidation.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seed({ probedAt: trip - 24 * HOUR }); // the pre-trip baseline a covered pass leaves where it was
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: trip + 60_000,
+			lastRun: { startedBy: 'reseed', startedAt: trip + 60_000, finishedAt: Date.now() - HOUR },
+		},
+	});
+	answers.set('a', { status: 200, body: { price: 39.99, available: true } });
+	await claimAndPost(['39.99', 'USD', 'InStock']); // the accelerator's heal render — correct
+	assert.deepEqual(asked, [], 'the walk-past is no observation: nothing asked');
+	assert.deepEqual(outcomes(), ['untrusted']);
+	assert.equal(hardExpired(), false);
+});
+
+test('round 3 N5: a newer render landing while the re-probe was out supersedes it — its claim is neither judged nor wiped', async () => {
+	seed();
+	// The origin still says 35.99 (the suspect render showed 39.99) — but while it answers, a newer render
+	// lands and writes its own claim.
+	answers.set('a', { status: 200, body: { price: 35.99, available: true } });
+	const newerClaim = JSON.stringify([['35.99'], true]);
+	const respond = answers.get('a');
+	answers.set('a', {
+		...respond,
+		get body() {
+			stores.probeState.set(A, {
+				...stores.probeState.get(A),
+				pageSignature: newerClaim,
+				pageClaimAt: new Date(Date.now() + 60_000),
+			});
+			return respond.body;
+		},
+	});
+	await claimAndPost(['39.99', 'USD', 'InStock']);
+	assert.deepEqual(outcomes(), ['rechecked', 'superseded']);
+	assert.equal(hardExpired(), false, 'the newer page is not expired on the old one’s evidence');
+	assert.equal(stores.probeState.get(A).pageSignature, newerClaim, 'and its claim survives');
+});
