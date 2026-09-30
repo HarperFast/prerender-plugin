@@ -564,7 +564,10 @@ export const afterNegativeProxy = (
 		return resource;
 	}
 
-	if (row) {
+	// A HEAD's 2xx/3xx neither drops the entry nor counts against it: an origin's HEAD handler is not the
+	// page (plenty answer 200 to any path), so it may CONFIRM a stored 404 above but cannot overturn one.
+	// The next GET, or the background re-check, decides.
+	if (row && method !== 'HEAD') {
 		// THE RISK NUMBER: an armed cache would have answered this request with the stored 404 (or answered
 		// it at once and only then re-checked), and the origin, asked anyway, says the page is live.
 		if (policy.dryRun && !excluded && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {

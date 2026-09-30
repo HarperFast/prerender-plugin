@@ -136,3 +136,19 @@ test('the discovery path reuses its own read: a gone row reopens, a noindex row 
 	assert.deepEqual(told, ['suppressed']);
 	assert.deepEqual(reopenOps(), []);
 });
+
+test("a HEAD's 200 reopens nothing, on either path — that claim takes a GET's status", async () => {
+	// An origin's HEAD handler is not the page: plenty answer 200 to any path. Before HEAD was forwarded
+	// as a HEAD this could not happen; now it must be refused explicitly.
+	TargetBase.rows.set(U, { url: U, state: 'suppressed', suppressedReason: 'http-gone' });
+	maybeSchedule(ok200({ method: 'HEAD' }), PRERENDER, route(), 'Bingbot', null, { cacheStatus: 'miss' });
+	await settle();
+	assert.equal(reads, 0, 'the gated path does not even look');
+	await handlePageScheduling(ok200({ method: 'HEAD' }), route(), 'Googlebot', (c) => told.push(c));
+	assert.deepEqual(told, ['suppressed'], 'the miss cause is unchanged');
+	assert.deepEqual(reopenOps(), []);
+
+	// The same request as a GET does reopen — the gate is the method, nothing else.
+	await handlePageScheduling(ok200({ method: 'GET' }), route(), 'Googlebot', null);
+	assert.deepEqual(reopenOps(), ['would-file/traffic']);
+});

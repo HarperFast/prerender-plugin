@@ -24,7 +24,9 @@ let getResidencyByUrl;
 let pageGet = async () => null;
 const rawPuts = [];
 
-const origin = { requests: [], server: null, port: 0, sockets: new Set(), respond: null };
+// `inFlight`: origin responses not yet finished or torn down. A body nobody reads and nobody releases
+// keeps its response here until undici's body timeout — that, not an idle pooled socket, is a leak.
+const origin = { requests: [], server: null, port: 0, sockets: new Set(), connections: 0, inFlight: 0, respond: null };
 const peer = { server: null, requests: 0, respond: null };
 
 // A Harper-request-shaped header bag: case-insensitive `get` plus the `asObject` the proxy forwards.
@@ -53,9 +55,12 @@ const defaultOrigin = (req, res) => {
 before(async () => {
 	origin.server = http.createServer((req, res) => {
 		origin.requests.push({ method: req.method, url: req.url, headers: req.headers });
+		origin.inFlight++;
+		res.on('close', () => origin.inFlight--);
 		(origin.respond ?? defaultOrigin)(req, res);
 	});
 	origin.server.on('connection', (socket) => {
+		origin.connections++;
 		origin.sockets.add(socket);
 		socket.on('close', () => origin.sockets.delete(socket));
 	});
@@ -193,8 +198,13 @@ const cachedPage = (over = {}) => ({
 
 // ── F5: a proxied redirect keeps its target ──────────────────────────────────────────────────────
 
-test('a proxied origin 301 reaches the crawler WITH its Location, relayed verbatim', async () => {
-	for (const location of ['https://www.example.com/product/prd-2/new.jsp', '/product/prd-2/new.jsp']) {
+test('a proxied origin 301 reaches the crawler WITH its Location, absolute, resolved against the public URL', async () => {
+	for (const [location, expected] of [
+		['https://www.example.com/product/prd-2/new.jsp', 'https://www.example.com/product/prd-2/new.jsp'],
+		// Relative: resolved here, so the redirect is right whether the edge relays it or follows it.
+		['/product/prd-2/new.jsp', `http://127.0.0.1:${origin.port}/product/prd-2/new.jsp`],
+		['new.jsp?c=1', `http://127.0.0.1:${origin.port}/p/new.jsp?c=1`],
+	]) {
 		origin.respond = (_req, res) => {
 			res.writeHead(301, { location, 'content-type': 'text/html', 'content-language': 'en-US' });
 			res.end('moved');
@@ -202,7 +212,7 @@ test('a proxied origin 301 reaches the crawler WITH its Location, relayed verbat
 		const res = await handleBotRequest(request('/desktop/p/moved'));
 		await drain(res.body);
 		assert.equal(res.status, 301);
-		assert.equal(res.headers.get('location'), location, 'a redirect with no target is a dead end for the crawler');
+		assert.equal(res.headers.get('location'), expected, 'a redirect with no target is a dead end for the crawler');
 		assert.equal(res.headers.get('content-language'), 'en-US');
 	}
 });
@@ -227,6 +237,7 @@ test('a HEAD miss goes to the origin as a HEAD, and HEAD misses do not pin origi
 		origin.sockets.size <= before + 1,
 		`five HEAD misses must not hold five origin connections open (open: ${origin.sockets.size}, before: ${before})`
 	);
+	assert.equal(origin.inFlight, 0);
 });
 
 test('a HEAD miss on a raw-cache route stores nothing — there is no body to keep', async () => {
@@ -238,19 +249,16 @@ test('a HEAD miss on a raw-cache route stores nothing — there is no body to ke
 
 test('a local 304 made from an origin 200 releases the origin body instead of pinning its socket', async () => {
 	await settle(50);
-	const before = origin.sockets.size;
 	for (let i = 0; i < 5; i++) {
 		// The origin ignores the validator and answers 200; the crawler's If-None-Match matches its ETag, so
-		// the handler answers 304 itself and never sends the 4 MB it was handed.
+		// the handler answers 304 itself and never sends the 4 MB it was handed. Past the drain limit the
+		// body is torn down rather than read to the end.
 		const res = await handleBotRequest(request(`/desktop/p/big-cond-${i}`, 'GET', { 'if-none-match': '"origin-v1"' }));
 		assert.equal(res.status, 304);
 		assert.equal(res.body, undefined);
 	}
 	await settle();
-	assert.ok(
-		origin.sockets.size <= before + 1,
-		`five local 304s must not hold five origin connections open (open: ${origin.sockets.size}, before: ${before})`
-	);
+	assert.equal(origin.inFlight, 0, 'every abandoned 4 MB response was released, none left pinned');
 });
 
 test('a local 304 on a captured body drains it instead, so the raw capture beside it still stores', async () => {
@@ -324,7 +332,11 @@ test("a cache serve drops the origin document's validators and carries Last-Modi
 	pageGet = async () => cachedPage();
 	const res = await handleBotRequest(request('/desktop/p/cached'));
 	assert.equal(res.status, 200);
-	assert.equal(res.headers.get('etag'), null, 'the stored ETag is the ORIGIN document’s, not this snapshot’s');
+	assert.equal(
+		res.headers.get('etag'),
+		`W/"${new Date('2026-09-29T10:00:00Z').getTime()}"`,
+		'the stored ETag is the ORIGIN document’s; the snapshot’s names its render'
+	);
 	assert.equal(res.headers.get('last-modified'), new Date('2026-09-29T10:00:00Z').toUTCString());
 });
 
@@ -349,4 +361,90 @@ test('If-Modified-Since is evaluated against the render time', async () => {
 		request('/desktop/p/cached', 'GET', { 'if-modified-since': new Date('2026-09-15T00:00:00Z').toUTCString() })
 	);
 	assert.equal(older.status, 200, 're-rendered since: the crawler must get the new snapshot');
+});
+
+// ── round 2: a refused page row must not let our own validators decide ────────────────────────
+
+// The origin a Merchant Center-style check trips on: content changed, content ETag changed, but its
+// Last-Modified is a template mtime that never moves.
+const constantLastModified = (_req, res) => {
+	res.writeHead(200, {
+		'content-type': 'text/html',
+		'etag': '"new-content"',
+		'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT',
+	});
+	res.end('<html>new price</html>');
+};
+
+test('a probe hard-expired (stale) page proxied with OUR Last-Modified is a 200, and the validator never reaches the origin', async () => {
+	origin.respond = constantLastModified;
+	// The crawler holds our snapshot: its Last-Modified is our render time, an hour ago.
+	const ours = new Date(Date.now() - 3_600_000).toUTCString();
+	// The page row is still there but hard-expired: past its SWR window, so it is not served.
+	pageGet = async () => cachedPage({ expiresAt: new Date(Date.now() - config.page.swrTtl - 60_000) });
+	const res = await handleBotRequest(
+		request('/desktop/p/expired', 'GET', { 'if-modified-since': ours, 'accept-encoding': 'identity' })
+	);
+	assert.equal(res.headers.get('x-harper-cache'), 'stale');
+	assert.equal(res.status, 200, 'a 304 here keeps the pre-change snapshot the probe just expired');
+	assert.equal(await drain(res.body), '<html>new price</html>');
+	assert.equal(origin.requests.at(-1).headers['if-modified-since'], undefined, 'stripped upstream too');
+});
+
+test('a blob-fault proxy strips the validators and skips the local conditional too', async () => {
+	origin.respond = constantLastModified;
+	pageGet = async () =>
+		cachedPage({ content: { bytes: async () => Promise.reject(new Error('Blob file not found')) } });
+	const res = await handleBotRequest(
+		request('/desktop/p/dangling', 'GET', {
+			'if-modified-since': new Date().toUTCString(),
+			'if-none-match': '"new-content"',
+		})
+	);
+	await drain(res.body);
+	assert.equal(res.headers.get('x-harper-cache'), 'blob-missing');
+	assert.equal(res.status, 200);
+	const sent = origin.requests.at(-1).headers;
+	assert.equal(sent['if-modified-since'], undefined);
+	assert.equal(sent['if-none-match'], undefined);
+});
+
+test('a TRUE miss keeps ordinary conditional handling: its validators came from the origin', async () => {
+	origin.respond = constantLastModified;
+	const res = await handleBotRequest(request('/desktop/p/never-cached', 'GET', { 'if-none-match': '"new-content"' }));
+	assert.equal(res.status, 304);
+	assert.equal(origin.requests.at(-1).headers['if-none-match'], '"new-content"', 'forwarded, as before');
+});
+
+test('the snapshot ETag revalidates the exact render: 304 for it, 200 once the page re-renders', async () => {
+	const tag = `W/"${new Date('2026-09-29T10:00:00Z').getTime()}"`;
+	pageGet = async () => cachedPage();
+	assert.equal((await handleBotRequest(request('/desktop/p/cached', 'GET', { 'if-none-match': tag }))).status, 304);
+	// Re-rendered 400 ms later — the same HTTP-date second. If-Modified-Since would call this unchanged.
+	pageGet = async () => cachedPage({ lastCached: new Date('2026-09-29T10:00:00.400Z') });
+	const later = await handleBotRequest(
+		request('/desktop/p/cached', 'GET', {
+			'if-none-match': tag,
+			'if-modified-since': new Date('2026-09-29T10:00:00Z').toUTCString(),
+		})
+	);
+	assert.equal(later.status, 200);
+});
+
+test('a local 304 on a GET drains the body so the pooled origin connection is REUSED, not closed', async () => {
+	origin.respond = (_req, res) => {
+		res.writeHead(200, { 'content-type': 'text/html', 'etag': '"small"' });
+		res.end('y'.repeat(200 * 1024));
+	};
+	await settle(50);
+	const before = origin.connections;
+	for (let i = 0; i < 5; i++) {
+		const res = await handleBotRequest(request(`/desktop/p/small-cond-${i}`, 'GET', { 'if-none-match': '"small"' }));
+		assert.equal(res.status, 304);
+		await settle(30);
+	}
+	assert.ok(
+		origin.connections - before <= 1,
+		`five local 304s must reuse one connection, not open five (opened ${origin.connections - before})`
+	);
 });

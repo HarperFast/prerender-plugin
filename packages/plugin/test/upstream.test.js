@@ -110,6 +110,18 @@ test('resolveUpstreamHeaders always drops the base-ignored and security/debug he
 	assert.equal(upstream['x-harper-prerender-debug'], undefined);
 });
 
+test('resolveUpstreamHeaders never forwards the peer token header, default or configured', () => {
+	// An older node that does not know a /prerender_peer/* path treats it as bot traffic under a broad
+	// prefix route, and would otherwise proxy it to the origin carrying the cluster's shared secret.
+	applyOptions({});
+	let upstream = resolveUpstreamHeaders({ 'x-harper-peer-token': 'cluster-secret', 'x-keep': 'yes' }, 'desktop');
+	assert.equal(upstream['x-harper-peer-token'], undefined);
+	assert.equal(upstream['x-keep'], 'yes');
+	applyOptions({ peerRescue: { header: 'X-Cluster-Token' } });
+	upstream = resolveUpstreamHeaders({ 'x-cluster-token': 'cluster-secret' }, 'desktop');
+	assert.equal(upstream['x-cluster-token'], undefined, 'matched case-insensitively, and the memo rebuilt');
+});
+
 test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
 	applyOptions({ origin: { ignoredHeaders: ['x-internal', 'x-trace-id'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' }, 'desktop');

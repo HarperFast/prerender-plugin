@@ -830,7 +830,8 @@ export const METRICS = Object.freeze({
 					"'passthrough' — declared, deliberately not prerendered), or 'overflow' — requests dropped from " +
 					'the per-bucket breakdown past ingress.report.maxBuckets, counted here so the metric’s volume ' +
 					'is never a lie (their class is unknown by construction). serve_error: the kind ' +
-					"('blob-stream' = a cached page’s stored body errored while streaming out). page_age_negative: " +
+					"('blob-stream' = a cached page’s stored body errored while streaming out; 'bad-header' = a " +
+					'stored or origin header value no response may carry, dropped from the response). page_age_negative: ' +
 					'the bot name. invalidation_error: the kind — read-error (the row read threw; a live ' +
 					'last-known-good answered, or the request failed OPEN), lkg-expired (it threw and the memory ' +
 					'was older than invalidation.lkgMaxAge — the serious one), invalid-row (row exists, shape ' +

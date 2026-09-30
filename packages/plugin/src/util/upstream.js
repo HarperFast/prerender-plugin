@@ -89,25 +89,31 @@ const hopByHopHeaders = [
 // Downstream request headers never forwarded to the origin (the static portion).
 const BASE_IGNORED_HEADERS = [...hopByHopHeaders, 'host', 'user-agent', 'accept-encoding', 'cookie', 'authorization'];
 
-// The full ignore set also includes the configurable security-token and debug
-// header names (so a client can't spoof them) plus any operator-configured
-// `ignoredHeaders`. Header names are matched case-insensitively — downstream
-// keys and the base set are lowercase, so every configurable name (token, debug,
-// and each ignoredHeaders entry) is lowercased here; otherwise a mixed-case
-// configured name would let a lowercase spoof slip past. Memoize the Set and
+// The full ignore set also includes the configurable security-token, debug and peer-token
+// header names (so a client can't spoof them, and a cluster secret never reaches the origin)
+// plus any operator-configured `ignoredHeaders`. The peer token is the one a node attaches to
+// its own `/prerender_peer/*` calls: a node that does not know one of those paths (an older
+// release, mid-rollout) treats the call as bot traffic under a broad prefix route, and without
+// this it would proxy the request to the origin carrying the cluster's shared secret.
+// Header names are matched case-insensitively — downstream keys and the base set are
+// lowercase, so every configurable name (token, debug, peer, and each ignoredHeaders entry)
+// is lowercased here; otherwise a mixed-case configured name would let a lowercase spoof
+// slip past. Memoize the Set and
 // rebuild only when those inputs change, instead of allocating on every fetch.
 let ignoredHeadersCache = null;
 let ignoredHeadersKey = '';
 const ignoredDownstreamRequestHeaders = () => {
 	const tokenHeader = config.origin.securityToken.header;
 	const debugKey = config.debugHeader.key;
+	const peerHeader = config.peerRescue.header;
 	const configured = config.origin.ignoredHeaders;
-	const key = `${tokenHeader} ${debugKey} ${configured.join(',')}`;
+	const key = `${tokenHeader} ${debugKey} ${peerHeader} ${configured.join(',')}`;
 	if (ignoredHeadersCache === null || key !== ignoredHeadersKey) {
 		ignoredHeadersCache = new Set([
 			...BASE_IGNORED_HEADERS,
 			String(tokenHeader).toLowerCase(),
 			String(debugKey).toLowerCase(),
+			...(peerHeader ? [String(peerHeader).toLowerCase()] : []),
 			...configured.map((name) => String(name).toLowerCase()),
 		]);
 		ignoredHeadersKey = key;
@@ -134,10 +140,8 @@ const ignoredDownstreamRequestHeaders = () => {
 // `location` IS WHAT MAKES A PROXIED REDIRECT A REDIRECT. The dispatcher's `request()` does not
 // follow redirects, so an origin 301/302/307/308 is relayed as that status — and without this
 // header the crawler got a 301 naming no target: a dead end it records against the URL instead of
-// the move the origin declared. Relayed VERBATIM, relative or absolute: the origin resolved it
-// against the public URL, which is the URL the crawler asked for (forwarded mode rebuilds the fetch
-// from the forwarded host; prefix mode's absolute URL is the public one), so the client resolves it
-// correctly with no rewriting here.
+// the move the origin declared. A relative value is resolved against the public URL before it is
+// relayed (`publicLocation` in fetchOriginResource).
 //
 // `content-language` is the origin's own statement of the document's language, which a crawler
 // uses to place the page; dropping it on a miss served the same document with less information than
@@ -222,12 +226,18 @@ export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators
  * socket stays held until the body is consumed — and that is how a HEAD, or a 304 answered locally
  * from an origin 200, used to pin one origin connection each.
  *
- * BY DESTROYING THE UNDERLYING NODE STREAM, never by `cancel()`ing the web stream wrapped around it.
- * Node's `Readable.toWeb` adapter (measured on v24.15) keeps a scheduled `resume` after a cancel, whose
- * next `data` event enqueues into the closed controller and throws `ERR_INVALID_STATE` from an event
- * handler — an uncaughtException on the serve path. Destroying the source is the same release with no
- * adapter in the way. A captured body carries its own `releaseBody`, which drains the crawler's branch
- * instead so the capture beside it still completes (util/rawCache.js#discardStream).
+ * A GET BODY IS DRAINED, up to `DRAIN_LIMIT_BYTES`, so the connection goes back to the pool: a local
+ * 304 is an ordinary answer to a crawler revalidating, and closing a pooled TLS connection for each one
+ * trades a few hundred KB already in flight for a fresh handshake. Past the limit — or for a HEAD, whose
+ * body is empty anyway — the undici stream is DESTROYED.
+ *
+ * NEVER BY `cancel()`ING THE WEB STREAM wrapped around it. Node's `Readable.toWeb` adapter (v24.15)
+ * throws `ERR_INVALID_STATE` from its `data` handler when a cancel lands while the source already holds
+ * buffered data — an uncaughtException on the serve path. Reproduced: 10 of 20 cancels against an
+ * origin that sends a 4 MB body in one write; an origin that trickles small chunks does not show it,
+ * which is why it is easy to miss. Reading, and destroying the source, never touch that path. A
+ * captured body carries its own `releaseBody`, which drains the crawler's branch so the capture beside
+ * it still completes (util/rawCache.js#discardStream).
  *
  * A resource that did not come from `fetchOriginResource` (a stored page, a test fixture) falls back to
  * its stream's own `cancel`, not awaited: a tee branch's cancel settles only when both branches do.
@@ -235,6 +245,50 @@ export const resolveUpstreamHeaders = (downstream, deviceType, { stripValidators
 export const releaseOriginBody = (resource) => {
 	if (typeof resource?.releaseBody === 'function') resource.releaseBody();
 	else resource?.content?.cancel?.()?.catch?.(() => {});
+};
+
+const DRAIN_LIMIT_BYTES = 1024 * 1024;
+
+const drainOrDestroy = (content, source) => {
+	let reader;
+	try {
+		reader = content.getReader();
+	} catch {
+		source.destroy();
+		return;
+	}
+	(async () => {
+		let drained = 0;
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) return;
+				drained += value?.byteLength ?? 0;
+				if (drained > DRAIN_LIMIT_BYTES) {
+					source.destroy();
+					return;
+				}
+			}
+		} catch {
+			source.destroy();
+		}
+	})();
+};
+
+// An origin `Location` as the crawler must receive it: absolute, resolved against the PUBLIC URL this
+// request asked for (the fetch URL is built from it — the forwarded host and proto, or prefix mode's
+// absolute URL). A relative target is legal HTTP and a client resolves it against the URL it
+// requested — which is only the public one if the edge relays this response instead of following it,
+// or rewriting it against its own request. Resolving here removes that dependency. An absolute value
+// is returned untouched, and one that does not parse is relayed verbatim rather than dropped.
+const ABSOLUTE_URL = /^[a-z][a-z0-9+.-]*:/i;
+const publicLocation = (location, base) => {
+	if (typeof location !== 'string' || ABSOLUTE_URL.test(location)) return location;
+	try {
+		return new URL(location, base).href;
+	} catch {
+		return location;
+	}
 };
 
 export const fetchOriginResource = async (request) => {
@@ -268,16 +322,22 @@ export const fetchOriginResource = async (request) => {
 	}
 	metrics.originFetch(performance.now() - fetchStarted, response.statusCode, reason);
 
+	const clean = sanitizeOriginResponseHeaders(response.headers);
+	if (clean.location !== undefined) clean.location = publicLocation(clean.location, urlObj);
+	const content = Readable.toWeb(response.body);
 	return {
 		miss: true,
 		url: urlObj.href,
 		deviceType,
+		// Carried so a caller can tell a HEAD's status from a GET's: a HEAD may confirm a stored answer,
+		// but its 200 alone does not reopen a target or drop a stored 404 (bot_request.js, negativeCache.js).
+		method,
 		statusCode: response.statusCode,
-		headers: sanitizeOriginResponseHeaders(response.headers),
-		content: Readable.toWeb(response.body),
+		headers: clean,
+		content,
 		// See `releaseOriginBody`. A property rather than a lookup so it survives the `{ ...resource }`
 		// copies the capture paths make.
-		releaseBody: () => response.body.destroy(),
+		releaseBody: method === 'HEAD' ? () => response.body.destroy() : () => drainOrDestroy(content, response.body),
 		viaStaging: Boolean(stagingIp),
 		// SURFACED SEPARATELY BECAUSE THE SANITIZER DROPS IT. `set-cookie` is not on the forwarded
 		// allowlist, so by the time a caller sees `headers` there is nothing left to tell it the origin

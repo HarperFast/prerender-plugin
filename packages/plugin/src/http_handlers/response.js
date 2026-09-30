@@ -38,6 +38,49 @@ function formatRoute(route) {
 const ORIGIN_VALIDATORS = new Set(['etag', 'last-modified']);
 
 /**
+ * Append one stored or relayed header, as separate values where the source had several.
+ *
+ * THE RENDERER'S HEADERS COME FROM PUPPETEER, WHICH JOINS A REPEATED RESPONSE HEADER WITH `\n` — and
+ * `Headers.append` throws on a newline. So a page whose origin sent two `x-robots-tag`, `vary`,
+ * `cache-control` or `link` headers lost that header on every cache serve and logged an error each
+ * time: one log line per served request, for as long as the page stayed cached. Split, each value is
+ * appended in turn (the response then carries them as HTTP itself does). An array — undici's shape
+ * for a repeated origin header — is the same case. A value that is invalid for any other reason is
+ * dropped and COUNTED (`serve_error` `bad-header`); the log line is rate-limited per worker, because
+ * the same stored row is served again on every request.
+ */
+const appendHeader = (headers, key, value) => {
+	if (Array.isArray(value)) {
+		for (const item of value) appendHeader(headers, key, item);
+		return;
+	}
+	const text = typeof value === 'string' ? value : String(value);
+	if (text.includes('\n')) {
+		for (const line of text.split(/\r?\n/)) if (line) appendOne(headers, key, line);
+		return;
+	}
+	appendOne(headers, key, text);
+};
+
+const BAD_HEADER_LOG_INTERVAL_MS = 60_000;
+let lastBadHeaderLog = 0;
+const appendOne = (headers, key, value) => {
+	try {
+		headers.append(key, value);
+	} catch (e) {
+		metrics.serveError('bad-header');
+		const now = Date.now();
+		if (now - lastBadHeaderLog >= BAD_HEADER_LOG_INTERVAL_MS) {
+			lastBadHeaderLog = now;
+			getLogger().warn?.(
+				`[prerender] dropped response header "${key}": ${e?.message ?? e} (counted as serve_error bad-header; ` +
+					`logged at most once a minute per worker)`
+			);
+		}
+	}
+};
+
+/**
  * Build the base response headers from the upstream/cached resource: copy every upstream
  * header (`link` only under `page.serveLinkHeader`), and set `age` for a cached 200.
  *
@@ -47,10 +90,11 @@ const ORIGIN_VALIDATORS = new Set(['etag', 'last-modified']);
  * snapshot: a re-render that changed client-rendered content (prices, reviews, stock) under an
  * unchanged origin ETag answered the crawler's next conditional request 304, and the crawler kept
  * the old snapshot while every signal said a fresh page was being served. So a snapshot carries
- * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, which moves on every
- * render. No ETag: none is cheaply at hand (the page stores no content hash, and hashing ~220 KB
- * per request is not cheap), and an ETag that is not about the bytes is the defect being removed.
- * A raw-cache document is the origin's bytes verbatim, so it keeps the origin's validators.
+ * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, and the ETag is a
+ * weak tag of that same instant, `W/"<lastCachedMs>"` — both move on every render. (No content hash
+ * is stored, and hashing ~220 KB per request is not cheap; a render stamp is exact for "is this the
+ * render you hold".) A raw-cache document is the origin's bytes verbatim, so it keeps the origin's
+ * validators.
  */
 export function buildResponseHeaders(resource, snapshot = false) {
 	const headers = new Headers();
@@ -60,11 +104,7 @@ export function buildResponseHeaders(resource, snapshot = false) {
 	for (const [key, value] of Object.entries(upstreamHeaders)) {
 		if (key === 'link' && !serveLink) continue;
 		if (snapshot && ORIGIN_VALIDATORS.has(key)) continue;
-		try {
-			headers.append(key, value);
-		} catch (e) {
-			getLogger().error(e);
-		}
+		appendHeader(headers, key, value);
 	}
 
 	// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad value yields
@@ -75,7 +115,14 @@ export function buildResponseHeaders(resource, snapshot = false) {
 			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
 			headers.set('age', String(ageSec));
 		}
-		if (snapshot) headers.set('last-modified', new Date(lastCachedMs).toUTCString());
+		if (snapshot) {
+			headers.set('last-modified', new Date(lastCachedMs).toUTCString());
+			// A version tag, weak because it names the render rather than hashing its bytes: it changes on
+			// every render and on nothing else. `If-None-Match` takes precedence over `If-Modified-Since`,
+			// so a crawler holding it revalidates against the exact render, not a one-second HTTP date that
+			// two renders can share and that another node's clock stamped.
+			headers.set('etag', `W/"${lastCachedMs}"`);
+		}
 	}
 
 	return headers;
@@ -269,8 +316,11 @@ export function deliverResource(resource, request, info = {}) {
 	//
 	// This is NOT the documented "the edge keeps its own TTL" caveat. A TTL expires; a 304 loop does
 	// not. The origin-side half is closed in util/upstream.js (`stripValidators`); this is the local
-	// half. `invalidated` is the only verdict that skips it, so ordinary 304 handling is untouched.
-	const suppressConditional = info.cacheStatus === 'invalidated';
+	// half. It covers every proxy that found a page row it would not serve (`info.stripConditionals`,
+	// set in resolveResource: stale, blob faults, a render-now fallback over a page) — not only an
+	// invalidation — because the crawler's `If-Modified-Since` is then this plugin's render time, and
+	// the origin's `Last-Modified` is usually older than it whether or not the content changed.
+	const suppressConditional = info.cacheStatus === 'invalidated' || info.stripConditionals === true;
 
 	if (!suppressConditional) {
 		const unconditional = body;
