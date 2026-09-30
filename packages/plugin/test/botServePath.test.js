@@ -146,6 +146,7 @@ after(() => {
 });
 
 beforeEach(() => {
+	config.page.snapshotValidators = false;
 	origin.requests = [];
 	origin.respond = null;
 	peer.requests = 0;
@@ -328,7 +329,27 @@ test('a rescue whose owner copy is servable is still served from the owner', asy
 
 // ── V2: a snapshot's validators describe the snapshot ───────────────────────────────────────────
 
-test("a cache serve drops the origin document's validators and carries Last-Modified = its render time", async () => {
+test('by default a cache serve carries no validators at all, and a conditional request gets the full snapshot', async () => {
+	pageGet = async () => cachedPage();
+	const plain = await handleBotRequest(request('/desktop/p/cached'));
+	assert.equal(plain.status, 200);
+	assert.equal(plain.headers.get('x-harper-source'), 'cache');
+	assert.equal(plain.headers.has('etag'), false, "not the origin document's, and not our own");
+	assert.equal(plain.headers.has('last-modified'), false);
+	const conditional = await handleBotRequest(
+		request('/desktop/p/cached', 'GET', {
+			'if-none-match': `W/"${new Date('2026-09-29T10:00:00Z').getTime()}-desktop"`,
+			'if-modified-since': new Date().toUTCString(),
+			'accept-encoding': 'identity',
+		})
+	);
+	assert.equal(conditional.status, 200, 'nothing this cache served can be revalidated');
+	assert.equal(await drain(conditional.body), '<html>snapshot</html>');
+	assert.equal(origin.requests.length, 0, 'still a cache serve');
+});
+
+test("page.snapshotValidators: a cache serve drops the origin document's validators and carries Last-Modified = its render time", async () => {
+	config.page.snapshotValidators = true;
 	pageGet = async () => cachedPage();
 	const res = await handleBotRequest(request('/desktop/p/cached'));
 	assert.equal(res.status, 200);
@@ -347,7 +368,8 @@ test("the origin's ETag no longer revalidates a snapshot: a re-render under an u
 	assert.equal(origin.requests.length, 0, 'still a cache serve');
 });
 
-test('If-Modified-Since is evaluated against the render time', async () => {
+test('page.snapshotValidators: If-Modified-Since is evaluated against the render time', async () => {
+	config.page.snapshotValidators = true;
 	pageGet = async () => cachedPage();
 	const same = await handleBotRequest(
 		request('/desktop/p/cached', 'GET', { 'if-modified-since': new Date('2026-09-29T10:00:00Z').toUTCString() })
@@ -416,7 +438,8 @@ test('a TRUE miss keeps ordinary conditional handling: its validators came from 
 	assert.equal(origin.requests.at(-1).headers['if-none-match'], '"new-content"', 'forwarded, as before');
 });
 
-test('the snapshot ETag revalidates the exact render: 304 for it, 200 once the page re-renders', async () => {
+test('page.snapshotValidators: the snapshot ETag revalidates the exact render: 304 for it, 200 once the page re-renders', async () => {
+	config.page.snapshotValidators = true;
 	const tag = `W/"${new Date('2026-09-29T10:00:00Z').getTime()}-desktop"`;
 	pageGet = async () => cachedPage();
 	assert.equal((await handleBotRequest(request('/desktop/p/cached', 'GET', { 'if-none-match': tag }))).status, 304);

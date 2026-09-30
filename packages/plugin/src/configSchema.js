@@ -794,6 +794,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Hints, for example). A proxied (cache-miss) response is unaffected either way — it never ' +
 				'carries `Link`.'
 		),
+		snapshotValidators: option(
+			false,
+			'Give a rendered page its own validators: `ETag: W/"<lastCachedMs>-<deviceType>"` and ' +
+				'`Last-Modified` = its render time. With them, a crawler that already holds the current render ' +
+				'gets a 304 from the cache instead of the whole snapshot again.\n\n' +
+				'OFF by default because it changes what crawlers receive. A site whose origin sends no ' +
+				'validators has never had a conditional request answered from this cache; turning this on ' +
+				'starts crawlers revalidating and the cache answering 304s — a change to crawl traffic worth ' +
+				'measuring (`response_304` beside `bot_serve`), and the edge in front has to pass ' +
+				'`If-None-Match` / `If-Modified-Since` through and relay the 304.\n\n' +
+				'Either way a rendered page NEVER carries the origin document’s `ETag` / `Last-Modified`: they ' +
+				'describe the raw document, not the snapshot, so a re-render that changed client-rendered ' +
+				'content under an unchanged origin ETag would answer 304 and the crawler would keep the old ' +
+				'snapshot. A raw-cache document is the origin’s bytes verbatim and keeps the origin’s validators; ' +
+				'a proxied response carries whatever the origin sent.'
+		),
 	}),
 
 	invalidation: group(
