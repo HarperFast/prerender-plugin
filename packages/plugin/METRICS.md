@@ -414,6 +414,10 @@ sustained rate (see §5):
 - **`blob delivery error`** — the residual mid-stream failure, now reachable only for a cached body
   that arrived unmaterialized (the render-now timeout fallback). Still counted as `serve_error`
   (`blob-stream`); a non-zero rate here means a path is bypassing the up-front read.
+- **`dropped response header "…"`** — a stored or origin header value no HTTP response may carry was
+  left off the response. Counted per serve as `serve_error` `bad-header` and logged at most once a minute
+  per worker, because the same stored row fails the same way on every request. (A value repeated by the
+  origin and newline-joined by the renderer is not this: it is split and served as separate values.)
 - **`invalidation read failed for scope …`** — the storage fault behind the `invalidation_error` series; the
   metric says how often, the line says which scope and what threw.
 - **`invalidation view read failed` / `could not subscribe to invalidations` / `invalidation subscription closed`**

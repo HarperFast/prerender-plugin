@@ -777,19 +777,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 			{ unit: 'ms', min: 0, max: 2147483647 }
 		),
 		serveLinkHeader: option(
-			true,
-			'Serve the origin document’s `Link` response header with a cached page.\n\n' +
-				'The renderer stores the header off the origin document precisely so a canonical or hreflang ' +
-				'alternate declared in HTTP (rather than in the markup) reaches the crawler with the snapshot — ' +
-				'which is what a browser loading the same URL receives. Every earlier release stripped it on ' +
-				'every serve, a rule inherited from a predecessor codebase that relayed the origin’s headers ' +
-				'wholesale on the proxy path, where it kept the live page’s resource hints off relayed responses. ' +
-				'This plugin’s proxy path is allowlisted and has never carried `Link`, so the strip ended up ' +
-				'acting only on the header the renderer stored on purpose.\n\n' +
-				'Turn it off if the origin’s `Link` is mostly resource hints (`preload`, `preconnect`) and the ' +
-				'edge in front of this plugin acts on them for bot traffic (103 Early Hints, for example). One ' +
-				'check settles it: look at a stored page’s `headers` for `link`, and see which `rel` values it ' +
-				'carries. A proxied (cache-miss) response is unaffected either way — it never carries `Link`.'
+			false,
+			'Serve the origin document’s `Link` response header with a cached page. OFF until the stored ' +
+				'rows have been sampled — the check below — because what the renderer stores there is not ' +
+				'known to be what a crawler should get.\n\n' +
+				'The renderer keeps the header off the response it rendered so that a canonical or hreflang ' +
+				'alternate declared in HTTP (rather than in the markup) can reach the crawler with the snapshot, ' +
+				'which is what a browser loading the same URL receives. Releases before 0.97.0 stripped it with no ' +
+				'way to turn that off, a rule inherited from a predecessor codebase whose proxy path relayed ' +
+				'the origin’s headers wholesale. But the stored value can also carry the live page’s resource hints ' +
+				'(`preload`, `preconnect` — some of them injected by a CDN, not the origin), and for a render ' +
+				'that followed a client-side redirect it is the SOURCE document’s header, not the page served.\n\n' +
+				'THE CHECK: sample stored pages’ `headers` for `link` and read the `rel` values. Enable this when ' +
+				'they are canonical/alternate entries that match the page; leave it off when they are mostly ' +
+				'resource hints and the edge in front of this plugin acts on them for bot traffic (103 Early ' +
+				'Hints, for example). A proxied (cache-miss) response is unaffected either way — it never ' +
+				'carries `Link`.'
 		),
 	}),
 
