@@ -308,21 +308,69 @@ test('the live sweep walks past a row a projected scan stops at — it no longer
 	assert.equal(stats.deleted, 1);
 });
 
-test('a url-less stub row is recovered from the primary store by key and deleted through the cascading delete', async () => {
+/** `liveTargetTable` plus a point read and a RAW delete of its own, so a raw delete is told from the cascade. */
+const liveTargetTableWithRows = (rows, rawDeleted) => {
+	const Table = liveTargetTable(rows);
+	return class extends Table {
+		static async get({ id, select }) {
+			const found = rows.find((row) => row.key === id);
+			return found ? Object.fromEntries((select ?? ['url']).map((key) => [key, found.value[key]])) : undefined;
+		}
+		static async delete(id) {
+			rawDeleted.push(id);
+		}
+	};
+};
+
+test('a url-less stub row is recovered by key, re-read, and only the RAW row deleted — never the cascade', async () => {
 	const stub = 'https://example.com/b';
 	const rows = [liveRow(FIXED), liveRow(stub, { stub: true }), liveRow('https://example.com/c')];
-	globalThis.databases.render_service.Target = liveTargetTable(rows);
+	const rawDeleted = [];
+	globalThis.databases.render_service.Target = liveTargetTableWithRows(rows, rawDeleted);
 	const { stats, deleted } = await withDeleteSpy(() =>
 		orphanSweep.sweepKeyRuleOrphans({ maxDeletes: 10, dryRun: false })
 	);
 	assert.equal(stats.unreadable, 1);
 	assert.equal(stats.stubs, 1);
-	assert.deepEqual(deleted, [stub]);
+	assert.deepEqual(rawDeleted, [stub], 'the stub row, through the raw table');
+	assert.deepEqual(deleted, [], 'no cascading delete: no schedule, page or probe-state delete replicated anywhere');
 	assert.match(orphanSweep.summarizeSweep(stats, 10).message, /1 url-less stub row/);
 });
 
-test('a recovered stub respects ownership, the lease check and the dry run', async () => {
+test('a stub with anything live behind it is KEPT: a schedule row here, a rendered page, or a row whole again', async () => {
 	const stub = 'https://example.com/b';
+	const rows = [liveRow(FIXED), liveRow(stub, { stub: true })];
+	globalThis.databases.render_service.Target = liveTargetTableWithRows(rows, []);
+	assert.equal(await orphanSweep.isDeletableStub(stub), true);
+
+	globalThis.databases.render_schedule.RenderSchedule = class extends FakeTable {
+		static async get({ id }) {
+			return id === stub ? { nextRenderTime: 1 } : undefined;
+		}
+	};
+	assert.equal(await orphanSweep.isDeletableStub(stub), false, 'an owner-local schedule row');
+	globalThis.databases.render_schedule.RenderSchedule = FakeTable;
+
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get({ id }) {
+			return id.startsWith(`${stub}|`) ? { cacheKey: id, statusCode: 200 } : undefined;
+		}
+	};
+	assert.equal(await orphanSweep.isDeletableStub(stub), false, 'a rendered page');
+	globalThis.databases.page_cache.PrerenderedPage = class extends FakeTable {
+		static async get({ id }) {
+			return id.startsWith(`${stub}|`) ? { expiresAt: 1 } : undefined; // a page stub is not a page
+		}
+	};
+	assert.equal(await orphanSweep.isDeletableStub(stub), true);
+
+	rows[1] = liveRow(stub);
+	assert.equal(await orphanSweep.isDeletableStub(stub), false, 'whole again since the recovery read');
+});
+
+test('a recovered stub respects ownership, the lease check, the re-read and the dry run', async () => {
+	const stub = 'https://example.com/b';
+	const stubDeleted = [];
 	const { stats, deleted } = await run([{ url: FIXED }], {
 		streamTargets: async function* ({ onUnreadable }) {
 			yield { url: FIXED };
@@ -332,12 +380,27 @@ test('a recovered stub respects ownership, the lease check and the dry run', asy
 			assert.deepEqual(gaps, [FIXED]);
 			return [stub, 'https://example.com/elsewhere'];
 		},
+		stubDeletable: async () => true,
+		deleteStub: async (url) => stubDeleted.push(url),
 		ownerOf: (url) => (url.endsWith('elsewhere') ? 'another-node' : OWNED),
 		dryRun: true,
 	});
 	assert.equal(stats.stubs, 1, 'the unowned stub is left to its owner');
 	assert.equal(stats.deleted, 1, 'counted, not deleted, in a dry run');
-	assert.deepEqual(deleted, []);
+	assert.deepEqual([...deleted, ...stubDeleted], []);
+
+	const kept = await run([], {
+		streamTargets: async function* ({ onUnreadable }) {
+			onUnreadable({ after: null });
+			yield* [];
+		},
+		recoverStubs: async () => [stub],
+		stubDeletable: async () => false,
+		deleteStub: async (url) => stubDeleted.push(url),
+	});
+	assert.equal(kept.stats.stubsKept, 1);
+	assert.equal(kept.stats.deleted, 0);
+	assert.deepEqual(stubDeleted, []);
 
 	const leased = await run([], {
 		streamTargets: async function* ({ onUnreadable }) {
@@ -345,8 +408,10 @@ test('a recovered stub respects ownership, the lease check and the dry run', asy
 			yield* [];
 		},
 		recoverStubs: async () => [stub],
+		stubDeletable: async () => true,
+		deleteStub: async (url) => stubDeleted.push(url),
 		isLeased: (key) => key === stub,
 	});
 	assert.equal(leased.stats.leaseSkipped, 1);
-	assert.deepEqual(leased.deleted, []);
+	assert.deepEqual(stubDeleted, []);
 });

@@ -428,7 +428,11 @@ function entryTable(ctx, detail, entries) {
 		: ['url', 'changefreq', 'priority', 'state', { text: '', right: true }];
 
 	const offset = detail.offset ?? 0;
-	const total = detail.sitemap.entryCount ?? entries.length;
+	// Paged over what the plugin STORES, not what the document holds: from plugin v0.97.0 a urlset row
+	// keeps only a leading sample of its entries, so paging to `entryCount` ran out at the sample and kept
+	// offering "next" onto empty pages. An older plugin sends no `entriesStored` and stores everything.
+	const entryCount = detail.sitemap.entryCount ?? entries.length;
+	const total = Math.min(entryCount, detail.sitemap.entriesStored ?? entryCount);
 
 	const page = (next) => {
 		ctx.data.offset = Math.max(0, next);
@@ -451,6 +455,10 @@ function entryTable(ctx, detail, entries) {
 		),
 		foot: [
 			el('span', { text: `${num(Math.min(offset + 1, total))}–${num(offset + entries.length)} of ${num(total)}` }),
+			total < entryCount &&
+				muted(
+					`showing the first ${num(total)} of ${num(entryCount)} — only a leading sample of a sitemap's entries is stored`
+				),
 			spacer(),
 			offset > 0 && link('← prev', () => page(offset - PAGE_SIZE)),
 			offset + entries.length < total && link('next →', () => page(offset + PAGE_SIZE)),

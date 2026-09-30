@@ -120,6 +120,10 @@ export const createRefreshRun = ({
 		// whose render (or, for a row suppressed on a verdict a listing contradicts, whose recheck) was
 		// brought forward into `sitemap.newTargets.window`. Shares `maxPerRun` with `createdSoon`.
 		listedSoon: 0,
+		// Documents `sitemap.shrinkGuard` refused as much shorter than the last one accepted, and the
+		// identical shorter documents it accepted after `acceptAfter` refusals.
+		shrinkRefused: 0,
+		shrinkAccepted: 0,
 		removed: 0,
 		// Documents the origin answered 304 to, so their entries were never re-parsed and their
 		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;
@@ -146,7 +150,7 @@ export const createRefreshRun = ({
 	// unlinked, so no later walk will offer it again — which is why `capped` is reported at all.
 	//
 	// Held as `{ url, sitemapUrl }` — the child whose prune unlinked it — because two post-walk steps
-	// need to put a URL BACK: a walk with a failed child re-links everything it unlinked, and a URL a
+	// need to put a URL BACK: a failed child re-links the URLs that could have moved into it, and a URL a
 	// 304'd child still lists is re-attached to that child. `holdCap` can exceed `departureCap` (an
 	// arrival-only deployment holds them for the re-link alone); the departure candidates are always
 	// the first `departureCap` of the list, so a departure-only deployment holds exactly what it did.
@@ -160,6 +164,12 @@ export const createRefreshRun = ({
 	// them still lists can look departed when the child that owned it drops it (see `unchangedUrlsets`).
 	const unchanged = [];
 	const listedUnchanged = new Set();
+	// Every sitemap's parent as the walk reached it, and every child that failed with its parent — what
+	// scopes a failure to the held URLs that could have moved into it (resources/Sitemap.js
+	// `heldBlockedByFailures`). Uncapped: one entry per sitemap DOCUMENT, never per URL.
+	const parents = new Map();
+	const failedChildren = new Map();
+	const relinkedChildren = new Set();
 
 	// Rejoined URLs held for the post-walk arrival action (util/sitemapArrival.js). Unlike departures
 	// these are decided AT re-attach time — `startedAt` is what makes that exact — and only acted on
@@ -226,12 +236,35 @@ export const createRefreshRun = ({
 		},
 
 		/**
-		 * Did any child fail — a fetch, a parse, a truncation, a tripped shrink guard? A failed child's
-		 * URLs were never re-attached, so every URL that shifted into it from an earlier child reads as
-		 * departed; nothing this walk unlinked can be trusted to have left.
+		 * Did any child fail — a fetch, a parse, a truncation, a tripped shrink guard? A failed child
+		 * re-attached nothing, so every URL that shifted into it from another child reads as departed.
+		 * Which held URLs that could be is `failedChildren` — the scope, not the whole walk.
 		 */
 		walkFailed() {
 			return failed.length > 0 || failedOverflow > 0;
+		},
+
+		/** Where the walk reached `url` from: its index, or null for the root. */
+		noteParent(url, parentUrl) {
+			parents.set(url, parentUrl ?? null);
+		},
+
+		parentOf(url) {
+			return parents.get(url);
+		},
+
+		/** Every failed document with the index that listed it (undefined when unknown). */
+		failedChildren() {
+			return [...failedChildren].map(([url, parentUrl]) => ({ url, parentUrl }));
+		},
+
+		/** A post-walk re-link put held URLs back on `sitemapUrl`, so its row must outlive this walk. */
+		noteRelinked(sitemapUrl) {
+			relinkedChildren.add(sitemapUrl);
+		},
+
+		wasRelinkedTo(sitemapUrl) {
+			return relinkedChildren.has(sitemapUrl);
 		},
 
 		/**
@@ -275,9 +308,10 @@ export const createRefreshRun = ({
 		},
 
 		/** A child sitemap threw. The walk continues; the failure is reported, not swallowed. */
-		addFailure(url, error) {
+		addFailure(url, error, { parentUrl = parents.get(url) } = {}) {
 			if (failed.length < failedCap) failed.push({ url, error: describeError(error) });
 			else failedOverflow++;
+			failedChildren.set(url, parentUrl);
 		},
 
 		/** A prune scan hit `scan.collectCap`, so only part of the departed set was unlinked. */

@@ -1,8 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyOptions } from '../src/config.js';
+import { applyOptions, config } from '../src/config.js';
 import { createRefreshRun } from '../src/util/sitemapRun.js';
-import { decideDeparture, DepartureAction, departureActionFor, shrinkRefusal } from '../src/util/sitemapDeparture.js';
+import {
+	decideDeparture,
+	DepartureAction,
+	departureActionFor,
+	indexShrinkRefusal,
+	shrinkRefusal,
+} from '../src/util/sitemapDeparture.js';
 import { anyRouteDeparts } from '../src/util/routeClass.js';
 
 globalThis.logger ??= { debug() {}, info() {}, warn() {}, error() {} };
@@ -181,29 +187,42 @@ test('walkFailed counts a failure past failedCap too — a cap of 0 must not hid
 	assert.equal(run.walkFailed(), true);
 });
 
-// ---- the shrink guard ----
+// ---- the shrink guard: the DOCUMENT, never the prune ----
 
-test('shrinkRefusal: past maxRatio and at least minUrls it refuses, naming the option', () => {
+test('shrinkRefusal: a document below (1 - maxRatio) of the last accepted, by at least minUrls, is refused', () => {
 	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 100 } } });
 	assert.match(
-		shrinkRefusal({ sitemapUrl: SITEMAP, departed: 30_000, examined: 50_000 }),
-		/refusing to unlink 30000 of 50000 attributed URLs \(60%.*maxRatio=0\.5/
+		shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 20_000, stored: 50_000 }),
+		/refusing a document of 20000 entries against the 50000 last accepted \(60% shorter.*maxRatio=0\.5/
 	);
-	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 20_000, examined: 50_000 }), null, 'under the ratio');
-	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 99, examined: 100 }), null, 'under minUrls');
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 30_000, stored: 50_000 }), null, 'under the ratio');
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 1, stored: 99 }), null, 'a drop under minUrls');
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 50_000, stored: 50_000 }), null, 'same length');
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 0, stored: undefined }), null, 'a first fetch');
 });
 
-test('shrinkRefusal: a baseline larger than the scan is the denominator, and maxRatio 1 disables it', () => {
-	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 10 } } });
-	// A dropped child: 12 leftovers of a 50,000-entry document — the rest moved and were re-attached.
-	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12, baseline: 50_000 }), null);
-	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12 }), null);
+test('shrinkRefusal: maxRatio 1 disables it, and the defaults are 0.5 of the last length, from a 1000-entry drop', () => {
 	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 1, minUrls: 10 } } });
-	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 12, examined: 12 }), null);
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 0, stored: 50_000 }), null);
+	applyOptions({});
+	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 1, stored: 999 }), null);
+	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 999, stored: 1999 }), null);
+	assert.equal(config.sitemap.shrinkGuard.acceptAfter, 3);
 });
 
-test('the shrink guard defaults: 0.5 of what a child held, from 1000 URLs', () => {
+test('indexShrinkRefusal: past maxRatio of the children by count OR by the entries they held, with no minUrls floor', () => {
 	applyOptions({});
-	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 999, examined: 999 }), null);
-	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, departed: 1000, examined: 1999 }), null);
+	const counts = (droppedChildren, droppedEntries) => ({
+		indexUrl: SITEMAP,
+		storedChildren: 32,
+		droppedChildren,
+		storedEntries: 850_000,
+		droppedEntries,
+	});
+	assert.equal(indexShrinkRefusal(counts(1, 50_000)), null, 'one child renamed or retired');
+	assert.match(indexShrinkRefusal(counts(17, 10)), /stops listing 17 of 32 child sitemaps/);
+	assert.notEqual(indexShrinkRefusal(counts(9, 450_000)), null, 'nine product children are most of the corpus');
+	assert.equal(indexShrinkRefusal(counts(0, 0)), null);
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 1 } } });
+	assert.equal(indexShrinkRefusal(counts(32, 850_000)), null);
 });

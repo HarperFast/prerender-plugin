@@ -480,7 +480,19 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 	const client = [...clientSources.values()].join('\n');
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('sitemap_'.length)}'`);
 
-	const NOT_CHARTED = new Map();
+	const NOT_CHARTED = new Map([
+		[
+			'sitemap_shrink_refused',
+			'documents sitemap.shrinkGuard refused as much shorter than the last accepted (plugin v0.97.0); each is ' +
+				'also a failed child, which sitemap_failed already charts — a dedicated tile waits for the panel ' +
+				'the departure family needs',
+		],
+		[
+			'sitemap_shrink_accepted',
+			'identical shorter documents accepted after shrinkGuard.acceptAfter refusals (plugin v0.97.0) — rare and ' +
+				'logged at error; waits for the same panel',
+		],
+	]);
 
 	for (const name of new Set(emitted)) {
 		if (NOT_CHARTED.has(name)) continue;
