@@ -351,7 +351,8 @@ test('change_lag_ms is counted for a render that lands the change, never for one
 	seed();
 	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: Date.now() - HOUR });
 	await claimAndPost(['39.99', 'USD', 'InStock']); // disagrees with the observed 35.99
-	assert.deepEqual(outcomes(), ['refiled']);
+	// The render check confirms a suspect render with one re-probe before acting; the origin still says 35.99.
+	assert.deepEqual(outcomes(), ['rechecked', 'confirmed']);
 	assert.equal(lag().length, 0, 'stale: no sample');
 
 	for (const rows of Object.values(stores)) rows.clear();
