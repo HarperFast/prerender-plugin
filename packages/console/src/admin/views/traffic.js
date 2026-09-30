@@ -2210,6 +2210,21 @@ function negativeCache(ctx, data, filter) {
 	// Every would-serve-live request was first counted as would-serve OR would-revalidate (the lookup
 	// counts, the proxied 200 then counts again), so those two are its denominator.
 	const wouldAnswer = wouldServe + ev('would-revalidate');
+	// The same risk for the excluded bots, measured without serving it (plugin v0.97.4): an excluded request
+	// that found a stored 404 counts bot-excluded, and excluded-live when the origin then answered 200. Per
+	// bot, because the decision to let a bot read the cache is made per bot.
+	const excludedFound = ev('bot-excluded');
+	const excludedLive = ev('excluded-live');
+	const liveByBot = new Map();
+	for (const s of events) {
+		if (s.method === 'excluded-live')
+			liveByBot.set(s.type ?? 'unknown', (liveByBot.get(s.type ?? 'unknown') ?? 0) + s.count);
+	}
+	const liveBots = [...liveByBot.entries()]
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 3)
+		.map(([bot, count]) => `${bot} ${num(count)}`)
+		.join(' · ');
 
 	if (!enabled && !events.length && !answered && !rechecking && !reopens.length) {
 		return card('Negative cache', {
@@ -2242,7 +2257,11 @@ function negativeCache(ctx, data, filter) {
 			' it answers and nobody is asked; after that it answers at once while the origin is re-checked, which ',
 			'saves no origin request and is counted against offload. A sitemap-listed Target always overrules it. ',
 			'In a dry run nothing is answered from storage: “would serve” is what arming saves, and “would serve ',
-			'live” is how often arming would have answered a live page with a 404.',
+			'live” is how often arming would have answered a live page with a 404. ',
+			'“Excluded bots, origin live” is that same risk for the bots in ',
+			el('code', { text: 'render.negative.excludeBots' }),
+			', whose requests always reach the origin: the share that would have been a stale 404 had the bot ',
+			'been allowed to read the cache.',
 		],
 		body: [
 			wouldLive > 0 &&
@@ -2264,11 +2283,21 @@ function negativeCache(ctx, data, filter) {
 							warn: wouldLive > 0,
 						})
 					: stat('Answered, re-checking', fmtCount(rechecking), 'counted against offload'),
-				stat('Stored', fmtCount(stored), refused ? `${fmtCount(refused)} refused` : 'no refusals'),
+				stat(
+					'Stored',
+					fmtCount(stored),
+					`${refused ? `${fmtCount(refused)} refused` : 'no refusals'} · ${num(ev('guarded-listed'))} overruled by a sitemap listing`
+				),
 				stat(
 					'Re-checks',
 					fmtCount(ev('recheck-gone') + ev('recheck-live') + ev('recheck-moved') + ev('recheck-error')),
 					`${num(ev('recheck-live'))} live · ${num(ev('recheck-error'))} failed · ${num(ev('recheck-busy'))} shed`
+				),
+				stat(
+					'Excluded bots, origin live',
+					excludedFound ? riskShare(excludedLive, excludedFound) : '—',
+					`${num(excludedLive)} of ${num(excludedFound)} excluded requests that found a stored 404 got a 200 from the origin` +
+						(liveBots ? ` · ${liveBots}` : '')
 				),
 				stat(
 					'Re-ask gap',

@@ -708,7 +708,10 @@ export const METRICS = Object.freeze({
 			'negative_cache = the negative cache (render.negative), one emit per event. Stores read like raw_cache ' +
 			'(stored + stored-unshared is the store rate; the refusals say why a route fills nothing). On read, ' +
 			'guarded-listed / guarded-target are stored 404s a Target overruled (the entry is dropped), bot-excluded ' +
-			'are requests from render.negative.excludeBots that found one. The re-checks are the recovery signal: ' +
+			'are requests from render.negative.excludeBots that found one, and excluded-live (plugin v0.97.4) are ' +
+			'those whose origin answer was a 200: the stale 404 that bot would have been given had it not been ' +
+			'excluded. excluded-live / bot-excluded per bot is what decides whether a bot can leave excludeBots. ' +
+			'The re-checks are the recovery signal: ' +
 			'recheck-live counts stored 404s the origin now answers 200 for — each one dropped and its gone target ' +
 			'reopened — and recheck-busy is the per-worker cap shedding checks. IN A DRY RUN, would-serve is exactly ' +
 			'the origin requests arming would save, and would-serve-live is the risk: requests an armed cache would ' +
@@ -856,8 +859,8 @@ export const METRICS = Object.freeze({
 					'negative_cache: the outcome — stored/stored-unshared; a refusal (has-cookie, private, no-store, ' +
 					'staging, no-body, empty, oversize, capture-failed, capture-busy, write-failed, skipped-listed, ' +
 					'skipped-target); a guard on read (guarded-listed, guarded-target, guard-error, invalidated, ' +
-					'bot-excluded, read-blob-failed); a background re-check (recheck-gone, recheck-live, recheck-moved, ' +
-					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
+					'bot-excluded, excluded-live, read-blob-failed); a background re-check (recheck-gone, ' +
+					'recheck-live, recheck-moved, recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
@@ -868,8 +871,9 @@ export const METRICS = Object.freeze({
 				name: 'context',
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
-					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
+					'page_age_negative: the device type. negative_cache: the bot name on bot-excluded and ' +
+					'excluded-live (null on every other outcome). invalidation_reenqueue: the invalidation scope ' +
+					'literal that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
 					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
@@ -1083,7 +1087,8 @@ export const metrics = Object.freeze({
 	 */
 	rawCache: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'raw_cache', outcome, null),
 	/** One negative-cache event (render.negative): a store, a refusal, a read guard, a re-check, or a dry-run verdict. */
-	negativeCache: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'negative_cache', outcome, null),
+	negativeCache: (outcome, botName = null) =>
+		server.recordAnalytics(true, 'prerender_ops', 'negative_cache', outcome, botName),
 	/** Milliseconds since the origin last confirmed a stored 404, per request that found one — the freshMs curve. */
 	negativeGap: (ms) => server.recordAnalytics(ms, 'prerender_ops', 'negative_gap', null, null),
 	/** A gone-suppressed target seen answering 200 at the origin, and what was done about it. `via` = traffic | recheck. */

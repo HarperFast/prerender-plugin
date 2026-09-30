@@ -380,7 +380,13 @@ test('an excluded bot is never answered, but its request is carried so its 404 s
 	const got = await answer({ botName: 'Googlebot', policy: policy({ excludeBots: ['Googlebot'] }) });
 	assert.equal(got.answered, undefined);
 	assert.equal(got.excluded, true);
+	assert.equal(got.excludedBot, 'Googlebot');
 	assert.deepEqual(opsOf('negative_cache'), ['bot-excluded']);
+	assert.equal(
+		ops.find((o) => o.method === 'bot-excluded').type,
+		'Googlebot',
+		'per bot, the denominator of excluded-live'
+	);
 });
 
 test('a Target a sitemap lists overrules a stored 404 on READ, and the entry is dropped', async () => {
@@ -524,6 +530,73 @@ test('THE RISK NUMBER: a dry run counts would-serve-live when the origin answers
 	await settle();
 	assert.deepEqual(opsOf('negative_cache'), ['would-serve-live']);
 	assert.equal(rows.has(KEY_A), false, 'and the wrong entry is dropped');
+});
+
+test('THE SAME RISK FOR AN EXCLUDED BOT: its origin 200 on a stored 404 counts excluded-live, per bot, armed or dry', async () => {
+	// The request an answer from storage would have got wrong, observed for free because an excluded bot's
+	// request always reaches the origin. Counted whatever the switch says: it is what decides excludeBots.
+	for (const [dryRun, checkedAgo, verdict] of [
+		[false, 10 * 60_000, 'fresh'],
+		[true, 10 * 60_000, 'fresh'],
+		[false, 2 * HOUR, 'revalidate'],
+	]) {
+		const pol = policy({ dryRun, excludeBots: ['Googlebot', 'Storebot-Google'] });
+		rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - checkedAgo) }));
+		ops.length = 0;
+		const lookup = await answer({ botName: 'Storebot-Google', policy: pol });
+		assert.equal(lookup.verdict, verdict);
+		await nc.afterNegativeProxy(origin404({ statusCode: 200 }), { key: KEY_A, cacheUrl: URL_A, policy: pol, lookup });
+		await settle();
+		const label = `dryRun ${dryRun}, ${verdict}`;
+		assert.deepEqual(opsOf('negative_cache'), ['bot-excluded', 'excluded-live'], label);
+		assert.equal(ops.find((o) => o.method === 'excluded-live').type, 'Storebot-Google', label);
+		assert.equal(rows.has(KEY_A), false, `${label}: the wrong entry is dropped`);
+	}
+});
+
+test('excluded-live counts only an excluded bot, on a GET, for an entry that would have answered, contradicted by a 200', async () => {
+	const pol = policy({ excludeBots: ['Googlebot'] });
+	const cases = [
+		// The origin confirmed the 404: nothing would have been wrong.
+		{ label: 'origin 404', status: 404, lookup: { verdict: 'fresh', excluded: true, excludedBot: 'Googlebot' } },
+		// A HEAD's 200 overturns nothing.
+		{
+			label: 'HEAD 200',
+			status: 200,
+			method: 'HEAD',
+			lookup: { verdict: 'fresh', excluded: true, excludedBot: 'Googlebot' },
+		},
+		// A guard error also proxies as `excluded`, but no bot was refused.
+		{ label: 'guard error', status: 200, lookup: { verdict: 'fresh', excluded: true } },
+		// An expired entry answers nobody, so no answer from storage was at stake.
+		{ label: 'expired', status: 200, lookup: { verdict: 'expired', excluded: true, excludedBot: 'Googlebot' } },
+		// A readable bot in a dry run is would-serve-live, not this.
+		{
+			label: 'readable bot, dry run',
+			status: 200,
+			dry: true,
+			lookup: { verdict: 'fresh' },
+			expect: ['would-serve-live'],
+		},
+	];
+	for (const { label, status, method = 'GET', lookup, dry = false, expect = [] } of cases) {
+		const row = storedRow();
+		rows.set(KEY_A, row);
+		ops.length = 0;
+		await nc.afterNegativeProxy(
+			origin404({ statusCode: status, ...(method === 'HEAD' ? { content: streamOf('') } : {}) }),
+			{
+				key: KEY_A,
+				cacheUrl: URL_A,
+				policy: dry ? policy({ ...pol, dryRun: true }) : pol,
+				lookup: { row, ...lookup },
+				method,
+			}
+		);
+		await settle();
+		assert.equal(opsOf('negative_cache').includes('excluded-live'), false, label);
+		for (const op of expect) assert.ok(opsOf('negative_cache').includes(op), `${label}: ${op}`);
+	}
 });
 
 test('a proxied 200 or redirect drops the entry; a 5xx leaves it', async () => {

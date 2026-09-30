@@ -590,6 +590,29 @@ test('the negative-cache panel reads the dry run: would-serve, and the stale-404
 	assert.match(text, /9 live again · 1 still gone/);
 });
 
+test("the negative-cache panel measures the excluded bots' stale-404 risk per bot, and the listings that overruled a 404", async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'negative_cache', 'stored', null, 400),
+			combo('prerender_ops', 'negative_cache', 'guarded-listed', null, 4),
+			// Excluded requests that found a stored 404, per bot; two of them got a 200 from the origin.
+			combo('prerender_ops', 'negative_cache', 'bot-excluded', 'Googlebot', 1500),
+			combo('prerender_ops', 'negative_cache', 'bot-excluded', 'Storebot-Google', 500),
+			combo('prerender_ops', 'negative_cache', 'excluded-live', 'Googlebot', 2),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Excluded bots, origin live/);
+	// 2 of 2,000, at the risk precision (not rounded to 0%).
+	assert.match(text, /0\.1%/);
+	assert.match(text, /2 of 2,000 excluded requests that found a stored 404 got a 200 from the origin · Googlebot 2/);
+	assert.match(text, /4 overruled by a sitemap listing/);
+});
+
 test('the per-route table counts a verified serve as cache-served', async () => {
 	const analytics = {
 		...ANALYTICS,

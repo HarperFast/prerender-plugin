@@ -473,8 +473,8 @@ export const answerFromNegativeCache = async ({
 	}
 
 	if (!botMayReadNegative(botName, policy)) {
-		metrics.negativeCache('bot-excluded');
-		return { row, verdict, excluded: true };
+		metrics.negativeCache('bot-excluded', botName);
+		return { row, verdict, excluded: true, excludedBot: botName };
 	}
 
 	const guarded = await guard(cacheUrl, policy);
@@ -547,7 +547,7 @@ export const afterNegativeProxy = (
 	resource,
 	{ key, cacheUrl, policy, lookup = {}, method = 'GET', nowMs = Date.now() }
 ) => {
-	const { row = null, verdict = null, excluded = false, guarded } = lookup;
+	const { row = null, verdict = null, excluded = false, excludedBot = null, guarded } = lookup;
 	const status = resource.statusCode;
 
 	if (policy.statuses.includes(status)) {
@@ -575,6 +575,13 @@ export const afterNegativeProxy = (
 		// it at once and only then re-checked), and the origin, asked anyway, says the page is live.
 		if (policy.dryRun && !excluded && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {
 			metrics.negativeCache('would-serve-live');
+		}
+		// THE SAME RISK FOR AN EXCLUDED BOT, armed or not: the stale 404 an answer from storage would have
+		// given it. Its request always reaches the origin, so this is observed for free, and it is the number
+		// that decides whether a bot can leave `excludeBots`. Keyed on the bot rather than on `excluded`,
+		// which a guard error sets too.
+		if (excludedBot && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {
+			metrics.negativeCache('excluded-live', excludedBot);
 		}
 		if (status >= 200 && status < 400) void dropNegativePage(key);
 	}
