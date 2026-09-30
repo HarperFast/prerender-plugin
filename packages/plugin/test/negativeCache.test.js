@@ -1,5 +1,6 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { gunzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -225,6 +226,37 @@ test('a proxied 404 is captured, delivered in full, and stored with its windows 
 	assert.ok(row.checkedAt.getTime() >= before && row.storedAt.getTime() === row.checkedAt.getTime());
 	assert.equal(row.expiresAt.getTime() - row.checkedAt.getTime(), config.render.negative.lifeMs);
 	assert.deepEqual(opsOf('negative_cache'), ['stored']);
+});
+
+test('an UNCOMPRESSED 404 reaches the crawler as sent and is stored gzipped (the origin that sends 404s that way)', async () => {
+	const page = '<html><body>' + '<p>This item is no longer available.</p>'.repeat(4000) + '</body></html>';
+	const out = await nc.captureForNegativeCache(
+		origin404({
+			headers: { 'content-type': 'text/html', 'content-length': String(page.length) },
+			content: streamOf(page),
+		}),
+		{ key: KEY_A, cacheUrl: URL_A, policy: policy() }
+	);
+	assert.equal(await drain(out.content), page, 'the crawler branch is the origin body, untouched');
+	await settle();
+	const row = rows.get(KEY_A);
+	assert.ok(row, 'stored');
+	assert.deepEqual(JSON.parse(row.headers), { 'content-type': 'text/html', 'content-encoding': 'gzip' });
+	assert.equal(gunzipSync(Buffer.from(row.content)).toString(), page);
+	assert.ok(row.content.length < page.length / 5, `stored ${row.content.length} bytes for a ${page.length}-byte page`);
+	assert.deepEqual(opsOf('negative_cache'), ['stored']);
+});
+
+test('maxBytes counts the body AS RECEIVED: an uncompressed 404 over it is oversize even though it would compress under it', async () => {
+	const page = 'x'.repeat(4096);
+	const out = await nc.captureForNegativeCache(
+		origin404({ headers: { 'content-type': 'text/html' }, content: streamOf(page) }),
+		{ key: KEY_A, cacheUrl: URL_A, policy: policy({ maxBytes: 1024 }) }
+	);
+	assert.equal(await drain(out.content), page);
+	await settle();
+	assert.equal(rows.has(KEY_A), false, 'the cap bounds the capture\u2019s memory, which holds the uncompressed bytes');
+	assert.deepEqual(opsOf('negative_cache'), ['oversize']);
 });
 
 test('a URL a sitemap lists is never stored, and neither is one with any Target under skipTargets: any', async () => {
@@ -665,6 +697,29 @@ test('a refreshing re-check is a GET whose 404 replaces the stored body and rest
 	assert.equal(row.checkedAt.getTime(), row.storedAt.getTime());
 	assert.deepEqual(opsOf('negative_cache'), ['recheck-gone', 'stored']);
 	assert.equal(nc.negativeRechecksInFlight(), 0);
+});
+
+test('a refreshing re-check stores an uncompressed 404 gzipped too, like a capture', async () => {
+	rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
+	const page = '<html>' + 'gone '.repeat(2000) + '</html>';
+	const fetchOrigin = async () => origin404({ headers: { 'content-type': 'text/html' }, content: streamOf(page) });
+	assert.equal(
+		nc.startNegativeRecheck({
+			key: KEY_A,
+			url: URL_A,
+			cacheUrl: URL_A,
+			deviceType: 'desktop',
+			policy: policy(),
+			refreshBody: true,
+			fetchOrigin,
+		}),
+		true
+	);
+	await settle();
+	const row = rows.get(KEY_A);
+	assert.equal(JSON.parse(row.headers)['content-encoding'], 'gzip');
+	assert.equal(gunzipSync(Buffer.from(row.content)).toString(), page);
+	assert.deepEqual(opsOf('negative_cache'), ['recheck-gone', 'stored']);
 });
 
 test('a refreshing re-check that finds the page live drops the entry and reopens, like a HEAD', async () => {
