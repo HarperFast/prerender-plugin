@@ -121,11 +121,9 @@ export const createRefreshRun = ({
 		// brought forward into `sitemap.newTargets.window`. Shares `maxPerRun` with `createdSoon`.
 		listedSoon: 0,
 		// Documents (and dropped children) `sitemap.shrinkGuard` refused as much shorter than the last one
-		// accepted; the refused shrinks it accepted once they outlived a rebuild; and the URLs an accepted
-		// shrink kept attributed this walk, past `releasePerWalk`, to release on later ones.
+		// accepted, and the refused shrinks it accepted once they outlived a rebuild.
 		shrinkRefused: 0,
 		shrinkAccepted: 0,
-		shrinkHeldBack: 0,
 		removed: 0,
 		// Documents the origin answered 304 to, so their entries were never re-parsed and their
 		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;
@@ -172,6 +170,9 @@ export const createRefreshRun = ({
 	const parents = new Map();
 	const failedChildren = new Map();
 	const relinkedChildren = new Set();
+	// Why departures are being held back, per child: a refused shrink, a failed child, the walk's budget.
+	// What the progress row shows an operator, so a hold-back is never silent.
+	const holdBack = new Map();
 
 	// Rejoined URLs held for the post-walk arrival action (util/sitemapArrival.js). Unlike departures
 	// these are decided AT re-attach time — `startedAt` is what makes that exact — and only acted on
@@ -260,6 +261,20 @@ export const createRefreshRun = ({
 			return [...failedChildren].map(([url, parentUrl]) => ({ url, parentUrl }));
 		},
 
+		/**
+		 * Record why departures are held back for one child — `reason` is 'refused-shrink', 'failed-child' or
+		 * 'budget' — with since when and, for a refusal, when acceptance becomes possible. The first reason
+		 * recorded for a child stands (a refusal is also a failed child); a budget deferral adds its count.
+		 */
+		noteHoldBack(entry) {
+			const existing = holdBack.get(entry.sitemapUrl);
+			if (!existing) {
+				if (holdBack.size < failedCap) holdBack.set(entry.sitemapUrl, { ...entry });
+				return;
+			}
+			if (entry.reason === 'budget') existing.deferred = (existing.deferred ?? 0) + (entry.count ?? 0);
+		},
+
 		/** A post-walk re-link put held URLs back on `sitemapUrl`, so its row must outlive this walk. */
 		noteRelinked(sitemapUrl) {
 			relinkedChildren.add(sitemapUrl);
@@ -329,6 +344,7 @@ export const createRefreshRun = ({
 				removedSample: [...removedSample],
 				failed: [...failed],
 				failedOverflow,
+				holdBack: [...holdBack.values()].map((entry) => ({ ...entry })),
 				truncatedScans: [...truncatedScans],
 				departures: {
 					// What the walk collected vs what it could not hold: a capped list means some

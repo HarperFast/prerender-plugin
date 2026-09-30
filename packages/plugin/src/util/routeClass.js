@@ -384,6 +384,9 @@ const getRoutes = () => {
 	return compiled;
 };
 
+/** The compiled route list this config produces, excludes folded in — read-only; do not mutate. */
+export const compiledRoutes = () => getRoutes();
+
 /**
  * Compile a PROSPECTIVE `routes` / `excludePathPatterns` pair and report what it would produce,
  * without touching the memo and without logging.
