@@ -357,3 +357,41 @@ test('a failed list is an error, never "no sitemaps"', async () => {
 	assert.match(text, /upstream down/);
 	assert.doesNotMatch(text, /No sitemaps registered/);
 });
+
+// Plugin v0.97.0 stores only a leading sample of a urlset's entries. Paging to `entryCount` ran out at
+// the sample and kept offering "next" onto empty pages from page 11 on.
+test('a urlset pages over the entries the plugin STORES, and says it is showing the first of N', async () => {
+	const sampled = (offset) => ({
+		...CHILD_DETAIL,
+		sitemap: { ...CHILD_DETAIL.sitemap, entryCount: 50_000, entriesStored: 500 },
+		entries: Array.from({ length: 50 }, (_, i) => ({ loc: `https://example.com/p/${offset + i}`, state: 'cached' })),
+		offset,
+	});
+	const ctx = makeCtx();
+	ctx.post = async (route, body) => ({ ok: true, body: route === 'sitemap' ? sampled(body.offset ?? 0) : {} });
+	ctx.data.selected = CHILD;
+	ctx.data.offset = 450;
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /451–500 of 500/);
+	assert.match(text, /showing the first 500 of 50,000/);
+	assert.equal(linkSaying(draw(ctx), 'next →'), null, 'no next page past the stored sample');
+	assert.notEqual(linkSaying(draw(ctx), '← prev'), null);
+});
+
+test('an older plugin that sends no entriesStored still pages to entryCount, with no sample note', async () => {
+	const ctx = makeCtx();
+	ctx.post = async (route) => ({
+		ok: true,
+		body:
+			route === 'sitemap'
+				? { ...CHILD_DETAIL, sitemap: { ...CHILD_DETAIL.sitemap, entryCount: 120 }, entries: CHILD_DETAIL.entries }
+				: {},
+	});
+	ctx.data.selected = CHILD;
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /of 120/);
+	assert.doesNotMatch(text, /showing the first/);
+	assert.notEqual(linkSaying(draw(ctx), 'next →'), null);
+});

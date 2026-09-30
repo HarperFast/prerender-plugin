@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
  * stored and merged whole, so the resolve check passes them, and the route or probe compiler then
  * quietly leaves the bad entries out. Before v0.97.0 the apply answered `applied: true` with the
  * drop reported beside it, which stored a route that was in the table and not in the router. Now the
- * dropped entries are `rejected`, in the preview and in the refusal alike.
+ * dropped entries are `rejected`, in the preview and in the refusal alike — those the set NEWLY drops,
+ * since one the running value already drops rides along in every whole-list edit the console sends.
  *
  * THE CONFIG VIEW REPORTS AN OVERRIDE MASKING A FILE CHANGE: each row records the file's value hash
  * when it is written, and the layers view compares it with the file now.
@@ -121,6 +122,29 @@ test('a bad route already in the FILE layer does not block an unrelated edit', a
 	assert.equal(res.status, 200);
 	assert.equal((await res.json()).applied, true);
 	assert.equal(overrideRows.get('page.ttl').value, 7000);
+});
+
+// The console sends the WHOLE list on a one-entry edit, so a bad entry the file layer already drops rides
+// along in every edit of that list. Refusing on it blocked every routes edit, contrary to the intent above.
+test('a bad route the running config ALREADY drops does not block an edit of the same list', async () => {
+	const bad = { match: 'nope', path: '/typo/' };
+	applyOptions(file([...FILE_ROUTES, bad]), {});
+	const edited = [...FILE_ROUTES, bad, { match: 'prefix', path: '/store/' }];
+	const res = await PrerenderAdmin.configOverride({ set: [{ path: 'ingress.routes', value: edited }] }, operator);
+	assert.equal(res.status, 200);
+	assert.equal((await res.json()).applied, true);
+	assert.deepEqual(overrideRows.get('ingress.routes').value, edited);
+});
+
+test('an edit that ADDS a bad route beside one already dropped is refused for the new one only', async () => {
+	const bad = { match: 'nope', path: '/typo/' };
+	applyOptions(file([...FILE_ROUTES, bad]), {});
+	const edited = [...FILE_ROUTES, bad, { match: 'prefix', path: 'no-leading-slash' }, bad];
+	const res = await PrerenderAdmin.configOverride({ set: [{ path: 'ingress.routes', value: edited }] }, operator);
+	assert.equal(res.status, 409);
+	const body = await res.json();
+	assert.equal(body.rejected[0].dropped, 2, 'the new entry, and the second copy of the old one');
+	assert.equal(overrideRows.size, 0);
 });
 
 test('a clean routes set applies and records the file value it was written against', async () => {
