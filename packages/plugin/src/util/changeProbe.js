@@ -2720,7 +2720,6 @@ const probeSettings = () => {
 		ratePerSecond: c.ratePerSecond,
 		concurrency: c.concurrency,
 		scope: c.scope,
-		reprobeAfter: c.reprobeAfter,
 		abortAfterDistress: c.abortAfterDistress,
 		backoffMax: c.backoffMax,
 		trigger: {

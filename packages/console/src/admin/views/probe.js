@@ -1,6 +1,6 @@
 /**
  * Change probe: what the probe is doing RIGHT NOW, whether it is healthy, and — separately — what
- * its finished passes found.
+ * its passes found.
  *
  * THE QUESTION THIS PAGE ANSWERS FIRST is "what is the probe doing now, and is it healthy?", and
  * the page before this one could not answer it. It showed the last pass that ENDED next to a bare
@@ -93,9 +93,9 @@ import {
 	relative,
 } from './_probeState.js';
 
-// `ranged`: the finished-pass panel reads the shell's global time range. The pass counters are
-// emitted ONCE PER FINISHED PASS, so a narrow range often holds canary passes and no sweep at all —
-// the panel's empty state says to widen it rather than reading as "nothing is probing".
+// `ranged`: the pass panel reads the shell's global time range. The pass counters are emitted per
+// probed batch (plugin v0.97.0+; once per FINISHED pass before), so a narrow range can hold nothing from
+// an older node's sweep — the panel's empty state says to widen it rather than reading as "nothing is probing".
 export const meta = { id: 'probe', label: 'Change probe', icon: ICONS.probe, ranged: true };
 
 /**
@@ -167,14 +167,12 @@ const OUTCOME_LABEL = Object.fromEntries(OUTCOMES.map(([key, label]) => [`probe_
 const FAILURE_ALARM = 0.5;
 
 /**
- * A pass that skipped this share of its matched rows is not keeping the cadence it appears to.
+ * A pass that skipped this share of the rows it considered is re-walking ground it had already covered.
  *
- * `reprobeAfter` exists so a RESTARTED sweep does not re-probe ground the interrupted pass had
- * already covered, and right after a restart a large skip share is the feature working. In a
- * settled deployment it means `reprobeAfter` has been set too close to `sweepInterval`: the URLs
- * probed late in one pass fall inside the next pass's skip window, so their real re-probe cadence
- * is two sweep intervals rather than one, and nothing else on this page shows it — `probed` just
- * looks like a smaller corpus.
+ * Since plugin v0.97.0 a pass skips only rows written since it — or the pass it resumes — began, so a
+ * skip is the overlap a RESUMED pass re-walks after a restart, and a large share in a settled deployment
+ * means the node keeps restarting mid-pass. (Before v0.97.0 it skipped baselines younger than
+ * `reprobeAfter`, an option since retired: that test skipped exactly the URLs that had just CHANGED.)
  */
 const FRESH_NOTICE = 0.5;
 
@@ -299,7 +297,6 @@ function settingsFromConfig(ctx) {
 		ratePerSecond: setting('ratePerSecond'),
 		concurrency: setting('concurrency'),
 		scope: setting('scope'),
-		reprobeAfter: setting('reprobeAfter'),
 		trigger: { concurrency: setting('trigger.concurrency') },
 		canary: {
 			interval: setting('canary.interval'),
@@ -1312,7 +1309,6 @@ const settingRows = [
 	['Rate ceiling', (s) => (s?.ratePerSecond ? `${s.ratePerSecond}/s` : null)],
 	['Concurrency', (s) => s?.concurrency],
 	['Scope', (s) => s?.scope],
-	['Re-probe after', (s) => (s?.reprobeAfter ? duration(s.reprobeAfter) : null)],
 	['Actions in flight', (s) => (s?.trigger?.concurrency ? `at most ${num(s.trigger.concurrency)}` : null)],
 	[
 		'Canary',
@@ -1422,10 +1418,11 @@ function configCard(status, model) {
 // ---------------------------------------------------------------- the measured drift
 
 /**
- * The finished passes' trend, from the analytics window — labelled PER FINISHED PASS on the card,
- * because it is: a `probe_*` series is emitted once, when a pass ENDS, so a nine-hour pass is one
- * bar at its end and nothing before it. These charts can say what passes found; they cannot say
- * whether the probe is running, which is what "Probe now" above is for.
+ * The passes' trend, from the analytics window. Since plugin v0.97.0 a `probe_*` series is emitted per
+ * probed BATCH, as increments, so a running pass shows up here as it goes; from an older plugin it is
+ * emitted once, when a pass ENDS, so a nine-hour pass is one bar at its end and nothing before it. Either
+ * way these charts say what passes found; they cannot say whether the probe is running, which is what
+ * "Probe now" above is for.
  *
  * The change rate the probe is actually measuring.
  *
@@ -1438,13 +1435,13 @@ function configCard(status, model) {
  */
 function drift(ctx) {
 	const data = ctx.data.analytics;
-	if (!data) return card('Finished passes', { body: [note('bad', ['The analytics window did not load.'])] });
+	if (!data) return card('Probe passes', { body: [note('bad', ['The analytics window did not load.'])] });
 	if (data.available === false) {
-		return card('Finished passes', {
+		return card('Probe passes', {
 			body: [
 				el('div', {
 					cls: 'empty',
-					text: 'Analytics is off on this node, so there is no finished-pass trend. The cards above are unaffected.',
+					text: 'Analytics is off on this node, so there is no pass trend. The cards above are unaffected.',
 				}),
 			],
 		});
@@ -1452,21 +1449,24 @@ function drift(ctx) {
 
 	const combos = pick(data, 'prerender_ops', (s) => typeof s.path === 'string' && s.path.startsWith('probe_'));
 	if (windowEmpty(data) || !combos.length) {
-		return card(`Finished passes — ${scopeLabel(data)}`, {
-			head: [pill('per finished pass — not live', '')],
+		return card(`Probe passes — ${scopeLabel(data)}`, {
+			head: [pill('counts, not a live gauge', '')],
 			body: [
 				emptyNote('change-probe', data),
 				el('div', {
 					cls: 'hint',
-					text: 'Emitted once per FINISHED pass — widen the range before reading this as “nothing is probing”.',
+					text:
+						'Emitted as each pass probes (per batch; from a plugin older than v0.97.0, once per FINISHED ' +
+						'pass) — widen the range before reading this as “nothing is probing”.',
 				}),
 			],
 			foot: [scanFooter(data)],
 		});
 	}
 
-	// `total` is COUNTER-ONLY in these rows and `count` is the number of PASSES, not of probes —
-	// the recorded value is what a pass counted, so the sum is Σ(mean × count).
+	// `total` is COUNTER-ONLY in these rows and `count` is the number of EMITS — probed batches since
+	// plugin v0.97.0, whole passes before — never of probes: the recorded value is what a batch (or a
+	// pass) counted, so the sum is Σ(mean × count).
 	const totalOf = (series) => sumValues(combos.filter((s) => s.path === `probe_${series}`));
 	const probed = totalOf('probed');
 	const changed = totalOf('changed');
@@ -1516,9 +1516,9 @@ function drift(ctx) {
 		{ values: true }
 	);
 
-	return card(`Finished passes — ${scopeLabel(data)}`, {
+	return card(`Probe passes — ${scopeLabel(data)}`, {
 		head: [
-			pill('per finished pass — not live', ''),
+			pill('counts, not a live gauge', ''),
 			failing ? pill('probe failures dominate', 'bad') : null,
 			throttled > 0 ? pill('origin pushing back', 'bad') : null,
 			unreadable > 0 ? pill('unreadable rows', 'bad') : null,
@@ -1529,8 +1529,9 @@ function drift(ctx) {
 			legend(keys.map((key) => ({ label: OUTCOME_LABEL[key], color: OUTCOME_COLOR[key] }))),
 		],
 		help: [
-			'NOT LIVE: every series is emitted when a pass ENDS, so a running pass is in none of these — a nine-hour pass ',
-			'is one bar at its end, and bars are passes, not probes. These are series side by side, NOT a partition: ',
+			'NOT A LIVE GAUGE: since plugin v0.97.0 every series is emitted per probed batch, so a running pass counts here ',
+			'as it goes; from an older plugin a series is emitted when a pass ENDS — a nine-hour pass is one bar at its ',
+			'end. Bars are counts, not passes. These are series side by side, NOT a partition: ',
 			'Throttled is inside Failed, Page mismatch overlays the outcome buckets, and Skipped sits outside Probes. ',
 			'Changed is measured against probes that HAD a baseline (seeds, re-baselined rows and failures compared ',
 			'nothing); expect one pass of re-baselined rows after any rule edit. Page mismatch stays zero unless a rule ',
@@ -1598,16 +1599,15 @@ function drift(ctx) {
 				]),
 			skipping &&
 				note('warn', [
-					el('strong', { text: `${pct(fresh, fresh + probed)} of the rows considered were skipped as fresh.` }),
-					' After a restart that is ',
-					el('code', { text: 'reprobeAfter' }),
-					' working; sustained, it sits too close to ',
-					el('code', { text: 'sweepInterval' }),
-					' and a URL’s real cadence is two sweep intervals.',
+					el('strong', {
+						text: `${pct(fresh, fresh + probed)} of the rows considered were skipped as already probed.`,
+					}),
+					' A pass skips only rows it — or the pass it resumes — has already probed, so this is a resumed pass ',
+					're-walking ground: sustained, the node is restarting mid-pass.',
 				]),
 			stats([
-				stat('Probes', fmtCount(probed), 'across finished passes', {
-					title: 'Probe attempts across every finished pass.',
+				stat('Probes', fmtCount(probed), 'in this window', {
+					title: 'Probe attempts in the window, from every pass (running ones included, from plugin v0.97.0).',
 				}),
 				stat('Changed', pct(changed, compared), `${fmtCount(changed)} of ${fmtCount(compared)} compared`),
 				// Overlays the outcome buckets — a mismatched row is also inside Changed or the
@@ -1936,7 +1936,7 @@ function settings(ctx, { open = false } = {}) {
 				'endpoints are usually uncached) and sizes the sweep — a 200k-URL slice at 10/s is ~5.6h per pass; leave ' +
 				'dryRun on until the change rate above has been watched a while. mode: interval fires every sweepInterval ' +
 				'and silently skips an overrunning pass, continuous paces itself to cycleTarget and reports a miss, anchored ' +
-				'runs daily at anchorTime. Keep reprobeAfter well below sweepInterval; backoffMax and abortAfterDistress ' +
+				'runs daily at anchorTime. backoffMax and abortAfterDistress ' +
 				'govern origin pushback, load.* this node’s own load (leave it off in interval mode). A detected change ' +
 				'is acted on when found: trigger.concurrency bounds the actions in flight, and queue.ready.changedHeadStart ' +
 				'(under Queue) sets how far ahead its render starts.',
