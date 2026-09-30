@@ -49,7 +49,9 @@
  * done (the caller runs it after the drain). A retry that succeeds counts `recovered`; one that fails
  * again, and any failure past the bound, is left to the next probe as before. The list is bounded
  * because a failure storm (a database refusing every write) is exactly when holding every item would
- * cost the most memory and buy the least — those retries would fail too. A restart during the retries
+ * cost the most memory and buy the least — those retries would fail too. A retry first asks the caller
+ * whether the detection still stands (`stillDue`): hours can pass between the two, and a page re-rendered
+ * or a baseline re-written meanwhile must not be expired, or written over, on the walk's old evidence. A restart during the retries
  * loses them to the next pass: the cursor is not held back for them, which would make a resume re-probe
  * everything after the pass's first failure.
  */
@@ -59,8 +61,10 @@ export const RETRY_LIMIT = 1000;
 
 /**
  * @param {object} ports
- * @param {(row: object) => Promise<boolean | void>} ports.act    expire the page and file its render;
- *   resolving `false` means it deliberately did nothing (counted `covered`, baseline still written)
+ * @param {(row: object, item: object) => Promise<string | void>} ports.act    expire the page and file
+ *   its render; resolving 'covered' or 'healed' means it deliberately did nothing (see `run`)
+ * @param {(item: object) => Promise<boolean>} [ports.stillDue]  before an after-walk retry: is the
+ *   detection still current? False skips the retry (counted `retryStale`)
  * @param {(url: string, observed: string, opts: object) => Promise<void>} ports.write  baseline write
  * @param {number} ports.concurrency    actions in flight at once
  * @param {(error: unknown, item: object) => void} [ports.onError]
@@ -72,6 +76,7 @@ export const createChangeActions = ({
 	onError,
 	now = () => Date.now(),
 	retryLimit = RETRY_LIMIT,
+	stillDue = null,
 } = {}) => {
 	const limit = Math.max(1, concurrency | 0);
 	// `waitMs` is how long the pass spent blocked on a full pipeline — the one way actions can slow a
@@ -81,10 +86,12 @@ export const createChangeActions = ({
 	const stats = {
 		triggered: 0,
 		covered: 0,
+		healed: 0,
 		errors: 0,
 		retried: 0,
 		recovered: 0,
 		retrySkipped: 0,
+		retryStale: 0,
 		maxInFlight: 0,
 		waits: 0,
 		waitMs: 0,
@@ -113,20 +120,33 @@ export const createChangeActions = ({
 
 	const run = async (item, retry) => {
 		try {
-			// `false` = the action decided there was nothing to do (the reseed's covered-by-invalidation
-			// case, changeProbe.js `actOnChange`): the baseline still moves, as a dry run's would, and the
-			// claim stays — no page was expired, so what it describes is still the cached page.
-			const acted = (await act(item.row)) !== false;
-			// AFTER the action, never before — see the module comment. `clearClaim` goes with it because
-			// the page was just hard-expired, so whatever the stored page claim described is no longer
-			// being served.
-			await write(item.row.url, item.observed, {
-				rowExists: item.rowExists,
-				clearClaim: acted,
-				fingerprint: item.fingerprint,
-			});
-			if (acted) stats.triggered++;
-			else stats.covered++;
+			// A retry hours after the detection must not act on what the walk saw then: if the baseline
+			// has moved since, or a page re-rendered after the change was found, the next probe is the one
+			// to decide (`stillDue`, changeProbe.js).
+			if (retry && stillDue && !(await stillDue(item))) {
+				stats.retryStale++;
+				return;
+			}
+			// What the action did (changeProbe.js `actOnChange`): 'acted' (or nothing, for an injected
+			// `act`), or one of the two cases an active invalidation leaves nothing to do for —
+			// 'covered' (no baseline either: the change stays detectable) and 'healed' (the baseline
+			// moves; the claim stays, since no page was expired and it still describes the cached one).
+			const outcome = (await act(item.row, item)) ?? 'acted';
+			if (outcome === 'covered') {
+				stats.covered++;
+			} else {
+				// AFTER the action, never before — see the module comment. `clearClaim` goes with it
+				// because the page was just hard-expired, so whatever the stored page claim described is
+				// no longer being served.
+				const acted = outcome !== 'healed';
+				await write(item.row.url, item.observed, {
+					rowExists: item.rowExists,
+					clearClaim: acted,
+					fingerprint: item.fingerprint,
+				});
+				if (acted) stats.triggered++;
+				else stats.healed++;
+			}
 			if (retry) stats.recovered++;
 		} catch (e) {
 			if (!retry) {

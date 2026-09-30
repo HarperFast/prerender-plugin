@@ -257,16 +257,46 @@ test('F3 wired: a URL changed 9h ago by a daytime pass is probed and acted on by
 
 test('A4: probe counters are emitted per batch, and a pass that THROWS has still reported what it probed', async () => {
 	configure({ chunkSize: 10 });
-	for (let i = 0; i < 6; i++) seedTarget(String(i));
-	// The fifth URL's ProbeState read fails hard: the pass throws out of its walk.
-	probeFaults.get = async (id) => {
-		if (id === pdp('4')) throw new Error('storage fault');
+	for (let i = 0; i < 14; i++) seedTarget(String(i).padStart(2, '0'));
+	// The registry read fails on the second chunk: the walk itself throws, which ends the pass.
+	let chunks = 0;
+	const search = RegistryTable.search;
+	RegistryTable.search = function (query) {
+		if (++chunks === 2) throw new Error('registry read fault');
+		return search.call(this, query);
 	};
-	await assert.rejects(changeProbe.runProbeSweepOnce({ startedBy: 'manual' }), /storage fault/);
+	try {
+		await assert.rejects(changeProbe.runProbeSweepOnce({ startedBy: 'manual' }), /registry read fault/);
+	} finally {
+		RegistryTable.search = search;
+	}
 	assert.ok(series('probed').length >= 2, 'more than one emit: per batch, not once per pass');
-	// Two full batches landed before the fault (and the error path reports the tail it reached).
-	assert.ok(total('probed') >= 4, 'what the pass probed before it threw is reported, not lost with the pass');
-	assert.equal(total('seeded'), 4);
+	assert.equal(total('probed'), 10, 'what the pass probed before it threw is reported, not lost with the pass');
+	assert.equal(total('seeded'), 10);
+});
+
+test('item 5: a ProbeState fault on one row is counted and SKIPS that row — the pass goes on', async () => {
+	// Harper answers 503 "outstanding write transactions" under a write wave; one such throw used to end the
+	// whole pass, and nothing resumed it.
+	configure({ chunkSize: 10 });
+	for (let i = 0; i < 6; i++) seedTarget(String(i));
+	probeFaults.get = async (id) => {
+		if (id === pdp('4')) throw new Error('503 outstanding write transactions');
+	};
+	probeFaults.put = async (id) => {
+		if (id === pdp('2')) throw new Error('503 outstanding write transactions');
+	};
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	assert.equal(result.error, null);
+	assert.equal(result.examined, 6, 'the walk finished');
+	assert.equal(result.rowErrors, 2, 'the failed read and the failed seed write');
+	assert.equal(result.probed, 5, 'the row whose read failed was not probed');
+	assert.equal(total('errors'), 2, 'counted in probe_errors');
+	assert.ok(probeRows.has(pdp('5')), 'rows after the fault were seeded');
+	assert.ok(
+		warns.some((m) => m.includes('2 rows skipped')),
+		'and the pass says so'
+	);
 });
 
 test('A4: an action that fails is retried once after the walk — the page is expired by the end of the pass', async () => {
@@ -534,7 +564,10 @@ test('F7b: the reseed ACTS on a page re-rendered after the trip that then change
 		'the pre-trip page is NOT expired — clearing a false trip restores it'
 	);
 	assert.equal(schedules.get(pdp('pre')), undefined);
-	assert.equal(probeRows.get(pdp('pre')).signature, '[8]', 'but its baseline moves, as the dry run did');
+	// The baseline stays where it was (round 2): a FALSE trip then leaves no glitch value behind for the
+	// next pass to "detect" back, and a true trip's page is acted on if the invalidation is cleared first.
+	assert.equal(probeRows.get(pdp('pre')).signature, '[10]', 'and its baseline does not move');
+	assert.equal(lastRun.covered, 1);
 });
 
 // ---- detection lag (G1) ---------------------------------------------------------------------------
@@ -562,4 +595,149 @@ test('G1: every detected change emits two lag bounds, per rule — since the anc
 	assert.equal(pass.type, 'pdp', 'labelled by rule');
 	assert.ok(pass.value >= before - anchorAt && pass.value <= after - anchorAt, 'measured from the ANCHOR');
 	assert.ok(previous.value >= before - previousStart && previous.value <= after - previousStart);
+});
+
+// ---- round 2: what an active invalidation leaves the probe to do ----------------------------------
+
+const PAIR_RULES = () => [
+	{
+		label: 'pdp',
+		pathPattern: '^/product/prd-([^/]+)',
+		source: 'request',
+		request: { urlTemplate: `http://127.0.0.1:${port}/price/$1` },
+		// slots 0/1 are what the claim pair reads; slot 2 is an UNMAPPED slot that moves with the price (a
+		// regular price, a percent-off) — so `caughtUp` can never absorb the change.
+		extract: ['price', 'available', 'regular'],
+		pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 },
+	},
+];
+const configurePair = () =>
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			dryRun: false,
+			rules: PAIR_RULES(),
+			ratePerSecond: 10_000,
+			concurrency: 2,
+			canary: { count: 10, interval: 0 },
+		},
+	});
+const waitForLastRun = async (label) => {
+	for (let i = 0; i < 400; i++) {
+		const lastRun = (await changeProbe.readProbeStateForTest())?.sweep?.lastRun;
+		if (lastRun && (!label || lastRun.label === label)) return lastRun;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	throw new Error('no pass finished');
+};
+
+test('round 2 item 1: the reseed does NOT expire a page healed after the trip whose claim agrees (reviewer RV3)', async () => {
+	const spec = await import('../src/util/changeProbeSpec.js');
+	configurePair();
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('healed');
+	answers.set('healed', { status: 200, body: { price: 8, available: true, regular: 12 } }); // the post-trip origin
+	probeRows.set(pdp('healed'), {
+		url: pdp('healed'),
+		signature: '[10,true,15]', // the pre-trip baseline
+		probedAt: new Date(trip - 24 * HOUR),
+		pageSignature: spec.pageClaimFromOffers(['8', 'USD', 'InStock']), // what the healed render claims
+		pageClaimAt: new Date(trip + HOUR),
+		pageFacts: null,
+		ruleFingerprint: null,
+	});
+	seedPage('healed', { lastCached: trip + HOUR, expiresAt: Date.now() + 90 * HOUR });
+	changeProbe.requestSweepReseed('reseed after invalidating all');
+	const lastRun = await waitForLastRun('reseed after invalidating all');
+	assert.equal(lastRun.changed, 1);
+	assert.equal(lastRun.triggered, 0, 'nothing acted on');
+	assert.equal(lastRun.healed, 1);
+	assert.ok(pageOf('healed').expiresAt > Date.now(), 'the correct, healed page keeps serving');
+	assert.equal(schedules.get(pdp('healed')), undefined, 'and is not re-filed');
+	assert.equal(probeRows.get(pdp('healed')).signature, '[8,true,12]', 'its baseline moves to the post-trip values');
+	assert.ok(probeRows.get(pdp('healed')).pageSignature, 'and the claim stays: it still describes the page');
+	assert.equal(total('caught_up'), 1, 'counted as caught up');
+});
+
+test('round 2 item 1: a post-trip page whose claim DISAGREES, or a baseline taken after the trip, is still acted on', async () => {
+	const spec = await import('../src/util/changeProbeSpec.js');
+	configurePair();
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	const seedRow = (id, { claim, probedAt }) => {
+		seedTarget(id);
+		answers.set(id, { status: 200, body: { price: 8, available: true, regular: 12 } });
+		probeRows.set(pdp(id), {
+			url: pdp(id),
+			signature: '[10,true,15]',
+			probedAt: new Date(probedAt),
+			pageSignature: spec.pageClaimFromOffers([claim, 'USD', 'InStock']),
+			pageClaimAt: new Date(trip + HOUR),
+			pageFacts: null,
+			ruleFingerprint: null,
+		});
+		seedPage(id, { lastCached: trip + HOUR });
+	};
+	seedRow('stale-render', { claim: '10', probedAt: trip - 24 * HOUR }); // rendered after the trip, still old
+	seedRow('later-change', { claim: '8', probedAt: trip + 30 * 60_000 }); // a change NEWER than the trip
+	changeProbe.requestSweepReseed('r');
+	const lastRun = await waitForLastRun('r');
+	assert.equal(lastRun.triggered, 2);
+	assert.ok(pageOf('stale-render').expiresAt < Date.now());
+	assert.ok(pageOf('later-change').expiresAt < Date.now());
+});
+
+test('round 2 item 7: ANY pass during an active invalidation leaves a pre-trip page to it — not only the reseed', async () => {
+	configure({});
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('pre');
+	seedBaseline('pre', '[10]', trip - 24 * HOUR);
+	answers.set('pre', { status: 200, body: { price: 8 } });
+	seedPage('pre', { lastCached: trip - HOUR });
+	// The anchored pass that interrupted the reseed, say: an ordinary acting pass.
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'anchor' });
+	assert.equal(result.covered, 1);
+	assert.equal(result.triggered, 0);
+	assert.ok(pageOf('pre').expiresAt > Date.now(), 'not expired: clearing a false trip still restores it');
+});
+
+test('round 2 item 11: the pass reads the epoch directly and never keeps "nothing invalidated" for the pass', async (t) => {
+	configure({});
+	t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-09-24T03:00:00Z') });
+	try {
+		const epochFor = changeProbe.__epochResolverForTest();
+		assert.equal(await epochFor(pdp('1')), null);
+		invalidations.set('all', { scope: 'all', invalidatedAt: new Date(Date.now()), mode: 'hard' });
+		t.mock.timers.tick(6_000);
+		const epoch = await epochFor(pdp('1'));
+		assert.equal(epoch?.trippedAt, Date.parse('2026-09-24T03:00:00Z'), 'a trip recorded mid-pass is seen');
+		invalidations.clear();
+		t.mock.timers.tick(60_000);
+		assert.ok(await epochFor(pdp('1')), 'an epoch once seen is kept for the pass');
+	} finally {
+		t.mock.timers.reset();
+	}
+});
+
+test('round 2 item 9: the after-walk retry is skipped when the page re-rendered after the detection', async () => {
+	configure({});
+	seedTarget('1');
+	seedBaseline('1', '[10]', Date.now() - 30 * HOUR);
+	seedPage('1');
+	answers.set('1', { status: 200, body: { price: 8 } });
+	let refusals = 0;
+	pageFaults.patch = async () => {
+		if (refusals++ > 0) return;
+		// The first attempt fails — and a render lands meanwhile, showing the change.
+		for (const key of cacheKeysOf(pdp('1'))) pages.set(key, { ...pages.get(key), lastCached: Date.now() + 1000 });
+		throw new Error('write refused');
+	};
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	assert.equal(result.errors, 1);
+	assert.equal(result.retryStale, 1, 'the retry saw the newer render and stood down');
+	assert.equal(result.triggered, 0);
+	assert.ok(pageOf('1').expiresAt > Date.now(), 'the new render is not expired on the walk’s old evidence');
+	assert.equal(probeRows.get(pdp('1')).signature, '[10]', 'and the old observation is not written');
 });

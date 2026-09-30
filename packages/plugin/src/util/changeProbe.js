@@ -56,7 +56,7 @@ import { resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
 import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
-import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
+import { CLUSTER_SCOPE, recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
@@ -156,7 +156,9 @@ const newStats = () => ({
 	unchanged: 0,
 	changed: 0,
 	triggered: 0, // changes acted on: page hard-expired, render filed ahead of rotation, baseline written
-	covered: 0, // RESEED only: changes whose every page the trip's invalidation already refuses — baselined, not acted on
+	covered: 0, // changes an active invalidation already refuses every page of: not acted on, baseline NOT moved
+	healed: 0, // changes every page of which was re-rendered after the trip and agrees: baselined, not acted on (counted in probe_caught_up)
+	rowErrors: 0, // ProbeState reads/writes that threw: the row is skipped (or its write lost) and the pass goes on
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
 	fresh: 0, // skipped: baseline written since this pass (or the pass it resumes) began — already probed
@@ -330,30 +332,38 @@ const probeOnce = async (rule, url) => {
  * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
  * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
-export const actOnChange = async (row, { coveredBy = null } = {}) => {
+export const actOnChange = async (row, { coveredBy = null, evidence = null } = {}) => {
 	const nowMs = Date.now();
 	const keys = cacheKeysOf(row.url);
 	const hardExpiredAt = nowMs - config.page.swrTtl;
 	const pages = await Promise.all(
 		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt', 'lastCached'] }))
 	);
-	// COVERED BY THE INVALIDATION — the reseed after a canary trip only (`coveredBy`, see
-	// `requestSweepReseed`). Every page the URL has predates the trip's epoch and no verification lets it
-	// through, so the invalidation is already refusing all of it: acting would add nothing a bot sees
-	// now, and would make the trip irreversible for this URL — clearing a FALSE trip is meant to restore
-	// exactly these pages. Returns false: nothing done, the baseline is still written (as a dry run
-	// would), and the pipeline counts it `covered`, not `triggered`.
-	if (coveredBy && (await isCoveredByInvalidation(row.url, pages, coveredBy))) return false;
+	// NOTHING TO DO WHILE AN INVALIDATION HOLDS THE SCOPE — sweeps only (`coveredBy`), whenever the URL's
+	// scope has an active invalidation (see `coverageOf`). Two cases, and neither acts:
+	//   'covered'  every page predates the epoch and no verification lets it through: the invalidation
+	//              is refusing all of it already. Acting would add nothing a bot sees, and would make the
+	//              trip irreversible for this URL. The baseline is NOT moved either, so a false trip leaves
+	//              no glitch values behind for the next pass to "detect" back, and a true trip's page is
+	//              still acted on if the invalidation is cleared before it re-renders.
+	//   'healed'   every page was rendered after the trip, from the render whose claim AGREES with this
+	//              observation, on a baseline taken before the trip: the page shows the change. The
+	//              baseline moves, and the claim stays (it still describes the cached page).
+	if (coveredBy) {
+		const coverage = await coverageOf(row.url, pages, coveredBy, evidence);
+		if (coverage) return coverage;
+	}
 	// EXPIRE FIRST: if anything below fails, the page has at least stopped serving known-wrong content,
 	// and the stale baseline makes the next probe act again. A page already expired this far (a change
 	// found again before its render landed) is not patched again — one replicated write per device
-	// page per change, not per detection.
+	// page per change, not per detection. The key rides in the patch: a patch that races a delete (the
+	// target retired on another node) would otherwise store a page stub with no key.
 	await Promise.all(
 		pages.map(async (page, index) => {
 			if (!page) return;
 			const expiresAt = dateColumnMs(page.expiresAt);
 			if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
-			await pageTable().patch(keys[index], { expiresAt: hardExpiredAt });
+			await pageTable().patch(keys[index], { cacheKey: keys[index], expiresAt: hardExpiredAt });
 		})
 	);
 	// FILED AT THE CURRENT MINUTE, NEVER LATER THAN IT ALREADY WAS (`fileDueNow`). The current minute
@@ -375,49 +385,96 @@ export const actOnChange = async (row, { coveredBy = null } = {}) => {
 		changedAt: nowMs,
 		demandPeriod: demand.known ? demand.periodMs : undefined,
 	});
-	return true;
+	return 'acted';
 };
 
 /**
- * Is every page of this URL already refused by an invalidation? `epochFor(url)` resolves the epoch the
- * serve path would apply (`{ at }` with the pad added, or null), and a page is refused when it was
- * rendered at or before it — `!(lastCached > at)`, the serve path's own NaN-safe test — and no page
- * verification exempts it (`resolveServeStatus`). A URL with NO page is covered too: there is nothing
- * the invalidation lets through for an action to stop.
+ * What an active invalidation already does for this URL's pages: 'covered', 'healed' or null (act).
+ * `epochFor(url)` resolves the epoch the serve path applies (`at`, with the pad) and the trip instant
+ * itself (`trippedAt`). Per page:
+ *
+ *   REFUSED  rendered at or before the epoch — `!(lastCached > at)`, the serve path's own NaN-safe test —
+ *            and not exempted by a page verification (`resolveServeStatus`).
+ *   HEALED   rendered by (or after) the render that wrote the stored claim (`lastCached >= pageClaimAt`,
+ *            the verification basis rule), that render came after the epoch, the claim AGREES with this
+ *            observation (`evidence.pageAgrees`: the claim pair compared and agreed, no armed mapped
+ *            field disagreeing), and the baseline was taken BEFORE the trip — so the change this probe
+ *            sees is the trip's own, which the page was rendered after. At the main deployment most
+ *            changed slots (regular, sale, percent-off) are unmapped, so `caughtUp` never fires for
+ *            them, and without this rule a pass during an invalidation expired every page the
+ *            accelerator had already re-rendered correctly: up to ~78k per node on one trip night.
+ *
+ * All pages healed -> 'healed'; every page refused or healed, at least one refused -> 'covered' (the
+ * refused one keeps the stale baseline); no page at all -> 'covered'; anything else -> null.
  */
-const isCoveredByInvalidation = async (url, pages, epochFor) => {
+const coverageOf = async (url, pages, epochFor, evidence) => {
 	const epoch = await epochFor(url);
-	if (!epoch) return false;
+	if (!epoch) return null;
 	const { verifiedAtMs, basisAtMs } = await resolveVerification(url);
-	return pages.every((page) => {
-		if (!page) return true;
+	const claimAt = epochOf(evidence?.pageClaimAt);
+	const probedAt = Number.isFinite(evidence?.probedAt) ? evidence.probedAt : NaN;
+	const healedRender = evidence?.pageAgrees === true && claimAt > epoch.at && probedAt < epoch.trippedAt;
+	let refused = 0;
+	for (const page of pages) {
+		if (!page) continue;
 		const lastCached = dateColumnMs(page.lastCached);
-		if (lastCached > epoch.at) return false;
-		return !(verifiedAtMs > epoch.at && lastCached >= basisAtMs);
-	});
+		if (!(lastCached > epoch.at)) {
+			if (verifiedAtMs > epoch.at && lastCached >= basisAtMs) return null;
+			refused++;
+		} else if (!(healedRender && lastCached >= claimAt)) {
+			return null;
+		}
+	}
+	return refused > 0 || !pages.some(Boolean) ? 'covered' : 'healed';
 };
 
 /**
- * The invalidation epoch per route scope, resolved ONCE PER PASS (a pass covers hundreds of thousands
- * of URLs; the scope set is a handful). A scope cleared mid-pass keeps its epoch for the rest of the
- * pass, which only means a covered URL is baselined rather than expired — and clearing the
- * invalidation is exactly the operator saying those pages may serve.
+ * The invalidation epoch per route scope for one pass, READ DIRECTLY from the table rather than from the
+ * serve path's per-worker view. The view is rebuilt on a doorbell after each write, so a reseed chained
+ * straight off a canary trip could resolve before this worker's view had the trip's own row — and a
+ * pass that took that "nothing is invalidated" for its whole run acted on the entire scope. Off the hot
+ * path (it runs per detected change), so two point reads on a tiny table are affordable.
+ *
+ * An epoch, once seen, is kept for the pass: a scope cleared mid-pass only means a covered URL is left to
+ * the invalidation rather than expired, which is what clearing it asks for anyway. "Nothing invalidated"
+ * is kept for only a few seconds, so an invalidation recorded mid-pass (here, or replicated in from
+ * another node) is seen within that. A failed read is "nothing invalidated", not cached — the pass then
+ * acts as it would with no invalidation, the freshness-safe direction.
  */
+const EPOCH_NONE_TTL_MS = 5 * SECOND;
 const epochResolver = () => {
-	const epochs = new Map();
+	const epochs = new Map(); // scope -> epoch | { none: until }
 	return async (url) => {
 		const scope = routeScopeForUrl(url);
-		if (!epochs.has(scope)) {
-			let epoch = null;
-			try {
-				epoch = await resolveInvalidation(scope);
-			} catch {
-				epoch = null;
-			}
-			epochs.set(scope, epoch);
+		const known = epochs.get(scope);
+		if (known && !known.none) return known;
+		if (known?.none > Date.now()) return null;
+		let epoch = null;
+		try {
+			epoch = await readEpochDirect(scope);
+		} catch {
+			return null;
 		}
-		return epochs.get(scope);
+		epochs.set(scope, epoch ?? { none: Date.now() + EPOCH_NONE_TTL_MS });
+		return epoch;
 	};
+};
+
+/** `resolveInvalidation`'s answer (max over `all` and the route's scope), from the rows themselves. */
+const readEpochDirect = async (routeScope) => {
+	if (!config.invalidation.enabled) return null;
+	const scopes = routeScope && routeScope !== CLUSTER_SCOPE ? [CLUSTER_SCOPE, routeScope] : [CLUSTER_SCOPE];
+	const rows = await Promise.all(
+		scopes.map((scope) => invalidationTable().get({ id: scope, select: ['scope', 'invalidatedAt'] }))
+	);
+	let trippedAt = NaN;
+	for (const row of rows) {
+		// A row with no readable instant applies to nothing (`interpretRow`, which also logs it — the
+		// serve path's view does that once per load; here it would log once per changed URL).
+		const at = epochMsOf(row?.invalidatedAt);
+		if (Number.isFinite(at) && !(at <= trippedAt)) trippedAt = at;
+	}
+	return Number.isFinite(trippedAt) ? { at: trippedAt + config.invalidation.pad, trippedAt } : null;
 };
 
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
@@ -478,8 +535,10 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
 		fields.pageClaimAt = null;
 		fields.pageFacts = null;
 	}
+	// The key rides in the patch too, so a patch that races the row's delete (the target retired) cannot
+	// leave a keyless stub behind.
 	return rowExists
-		? probeStateTable().patch(url, fields)
+		? probeStateTable().patch(url, { url, ...fields })
 		: probeStateTable().put(url, { url, pageSignature: null, pageClaimAt: null, pageFacts: null, ...fields });
 };
 
@@ -575,7 +634,7 @@ export const recordPageClaim = async (
 		const verdict = existing && claim ? await renderClaimVerdict(url, rule, claim, existing) : null;
 		// The bound (see `renderClaimVerdict`) rides in the claim's own write: no extra write.
 		if (verdict?.stale) fields.renderRefiledAt = new Date();
-		if (existing) await probeStateTable().patch(url, fields);
+		if (existing) await probeStateTable().patch(url, { url, ...fields });
 		// A record of nothing is not worth creating a row for; on an EXISTING row the nulls above are
 		// the point (they retire an older render's record).
 		else if (fields.pageSignature !== null || fields.pageFacts) await probeStateTable().put(url, { url, ...fields });
@@ -1277,7 +1336,20 @@ export const runProbePass = async ({
 		// knows is wrong is expired when it is found, and the render queue orders the re-renders. The
 		// BASELINE WRITE GOES WITH THE ACTION, after it succeeds, because that ordering is the whole
 		// retry story — an action that fails or never finishes leaves the signature stale.
-		await submitTrigger({ row, observed, rowExists: stored !== null, fingerprint: rule.fingerprint });
+		await submitTrigger({
+			row,
+			observed,
+			rowExists: stored !== null,
+			fingerprint: rule.fingerprint,
+			detectedAt: now(),
+			// What the stored page claim says about this observation, for an active invalidation's
+			// "healed" test (`coverageOf`) and the retry's staleness test (`stillDue`).
+			page: {
+				pageAgrees: claimVerdict === true && !mappedDisagrees,
+				pageClaimAt: stored?.pageClaimAt ?? null,
+				probedAt: Number.isFinite(stored?.probedAt) ? stored.probedAt : null,
+			},
+		});
 	};
 
 	// Pacing: batches of `concurrency`, each batch held to the window `ratePerSecond` implies for
@@ -1295,7 +1367,25 @@ export const runProbePass = async ({
 		batchDistress = 0;
 		retryAfterMs = 0;
 		const probedBefore = stats.probed;
-		await Promise.all(batch.map(processOne));
+		// A ROW'S STORAGE FAULT IS THAT ROW'S, NOT THE PASS'S. The ProbeState read and the baseline writes
+		// throw on a database under pressure (Harper answers 503 "outstanding write transactions" exactly on
+		// a reprice night's write wave), and one such throw used to end the whole pass — the rest of the
+		// night unprobed, and nothing resumed it. The row is counted (`rowErrors`, in `probe_errors`) and
+		// the walk goes on; a baseline that was not read or not written is simply probed again next pass.
+		await Promise.all(
+			batch.map((item) =>
+				processOne(item).catch((e) => {
+					stats.rowErrors++;
+					if (stats.failureSamples.length < 3) {
+						stats.failureSamples.push({
+							url: item.row.url,
+							rule: item.rule.label,
+							error: `storage: ${e?.message ?? String(e)}`,
+						});
+					}
+				})
+			)
+		);
 		// ONLY ROWS THAT MADE A REQUEST ARE PACED. A row skipped as fresh costs a node-local read and no
 		// origin call, so charging it a slot of the rate window made a run of skips crawl at
 		// `ratePerSecond` for nothing — the pacing exists for the origin, not for the table.
@@ -1439,6 +1529,27 @@ async function* readCohortRows(urls) {
 	}
 }
 
+/**
+ * Before an after-walk retry (util/changeActions.js): does the detection still stand? Not when the
+ * baseline has moved since (another pass, the canary or the render check wrote one — acting now would
+ * write the walk's older observation over it), nor when a page of the URL was rendered after the change
+ * was found (expiring it would throw away a render that may well show the change; the next probe
+ * decides). A read that fails says "yes": the retry then fails or succeeds on its own terms.
+ */
+const detectionStillCurrent = async (item) => {
+	try {
+		const current = await readSignature(item.row.url);
+		const probedNow = Number.isFinite(current?.probedAt) ? current.probedAt : null;
+		if (probedNow !== (item.page?.probedAt ?? null)) return false;
+		const pages = await Promise.all(
+			cacheKeysOf(item.row.url).map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'lastCached'] }))
+		);
+		return !pages.some((page) => dateColumnMs(page?.lastCached) > item.detectedAt);
+	} catch {
+		return true;
+	}
+};
+
 // One log line per failed action: the first attempt, and the after-walk retry (util/changeActions.js).
 const logActionError = (e, item, { retry = false } = {}) =>
 	logger.error(
@@ -1531,6 +1642,12 @@ export const createPassEmitter = (kind, emit = (value, series) => metrics.change
 
 const logPass = (stats, kind, dryRun) => {
 	const line = { kind, dryRun, ...stats };
+	if (stats.rowErrors > 0) {
+		logger.warn(
+			`[prerender] change-probe ${kind}: ${stats.rowErrors} rows skipped on a ProbeState read or write that ` +
+				`threw (samples in the pass record); they are probed again next pass`
+		);
+	}
 	// A scope that keeps less than it skips is either a site whose corpus really is mostly unlisted (and
 	// then `scope: listed` is the wrong setting for it) or sitemaps that stopped listing what they used
 	// to. Neither should be discovered from the origin-request savings looking good.
@@ -1880,8 +1997,11 @@ export const runProbeSweepOnce = async ({
 	});
 	const counts = () => ({
 		...live,
+		// A change the page had already healed from under an invalidation (`coverageOf`) is a caught-up
+		// change, found by the action rather than by the walk.
+		caughtUp: (live?.caughtUp ?? 0) + (triggers?.stats.healed ?? 0),
 		triggered: triggers?.stats.triggered ?? 0,
-		errors: triggers?.stats.errors ?? 0,
+		errors: (triggers?.stats.errors ?? 0) + (live?.rowErrors ?? 0),
 	});
 	try {
 		const rules = probeRules();
@@ -1893,14 +2013,17 @@ export const runProbeSweepOnce = async ({
 		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
 		// so the first changes of the pass are not stamped as unknown for want of it.
 		await warmDemand();
-		// A RESEED acts on a change only where the trip's invalidation does not already cover every page
-		// (see `requestSweepReseed`); every other pass acts on every change.
-		const coveredBy = reseed ? epochResolver() : null;
+		// EVERY sweep acts on a change only where an active invalidation does not already cover its pages
+		// (`coverageOf`) — the reseed a trip chains, and just as much the anchored pass that interrupts that
+		// reseed, or any pass that runs while the scope is invalidated. The canary is the exception (it
+		// acts on its cohort and baselines it, or it would re-detect, and re-trip on, the same change).
+		const coveredBy = epochResolver();
 		triggers = createChangeActions({
-			act: coveredBy ? (target) => actOnChange(target, { coveredBy }) : actOnChange,
+			act: (target, item) => actOnChange(target, { coveredBy, evidence: item.page }),
 			write: writeSignature,
 			concurrency: config.changeProbe.trigger.concurrency,
 			onError: logActionError,
+			stillDue: detectionStillCurrent,
 		});
 		// The heartbeat's payload, built only when a beat is due (see makeHeartbeat). `recentRate` is
 		// probes per second since the PREVIOUS beat — the rate the pass is running at now, which an
@@ -1980,6 +2103,8 @@ export const runProbeSweepOnce = async ({
 		}
 		stats.triggered = triggers.stats.triggered;
 		stats.covered = triggers.stats.covered;
+		stats.healed = triggers.stats.healed;
+		stats.retryStale = triggers.stats.retryStale;
 		stats.errors = triggers.stats.errors;
 		stats.retried = triggers.stats.retried;
 		stats.recovered = triggers.stats.recovered;
@@ -2230,13 +2355,14 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				write: writeSignature,
 				concurrency: config.changeProbe.trigger.concurrency,
 				onError: logActionError,
+				stillDue: detectionStillCurrent,
 			});
 			const emit = createPassEmitter('canary');
 			let canaryLive = null;
 			const canaryCounts = () => ({
 				...canaryLive,
 				triggered: canaryTriggers.stats.triggered,
-				errors: canaryTriggers.stats.errors,
+				errors: canaryTriggers.stats.errors + (canaryLive?.rowErrors ?? 0),
 			});
 			const stats = await runProbePass({
 				rows: readCohortRows(urls),
@@ -3317,6 +3443,9 @@ export const probeStatePublishedForTest = probeStatePublished;
 
 /** Tests only — the pass's timer heartbeat, assertable without a pass that takes minutes. */
 export const __startHeartbeatForTest = startHeartbeat;
+
+/** Tests only — the per-pass invalidation-epoch resolver the sweep's actions consult. */
+export const __epochResolverForTest = epochResolver;
 
 /** Tests only — where a resume starts, from the walk position and the actions in flight. */
 export const __resumeKeyOfForTest = resumeKeyOf;
