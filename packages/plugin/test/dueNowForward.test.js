@@ -27,7 +27,7 @@ const table = new Map();
 const analytics = [];
 let fetches = [];
 let peerFetch = null;
-let config, funnel, forward, handler, residency;
+let config, funnel, forward, handler, residency, QueueState;
 
 before(async () => {
 	globalThis.Resource = class {};
@@ -89,6 +89,7 @@ before(async () => {
 	funnel = await import('../src/util/renderSchedule.js');
 	forward = await import('../src/util/peerHeal.js');
 	handler = (await import('../src/http_handlers/peer_heal.js')).handlePeerDueNowRequest;
+	({ QueueState } = await import('../src/resources/QueueState.js'));
 });
 
 /** The first product URL `node` owns. */
@@ -266,4 +267,71 @@ test('the endpoint files a change mark it is forwarded, with its demand', async 
 	assert.equal(JSON.parse(answer.body).outcome, 'filed');
 	assert.equal(table.get(cacheKey).changedAt, changedAt);
 	assert.equal(table.get(cacheKey).demandPeriod, 6 * HOUR);
+});
+
+// ---- round 2 --------------------------------------------------------------------------------------
+
+test('the owner clamps a forwarded change mark to its own clock', async () => {
+	// A caller whose clock runs ahead would stamp a mark later than every lease this node grants for a
+	// while, and each of those renders would be dropped as changed-during-render.
+	const cacheKey = ownedBy('node-a');
+	const before = Date.now();
+	const answer = await handler(
+		request({ body: { cacheKey, fromSitemap: true, effectiveInterval: null, changedAt: before + 3_600_000 } })
+	);
+	assert.equal(JSON.parse(answer.body).outcome, 'filed');
+	const markedAt = table.get(cacheKey).changedAt;
+	assert.ok(markedAt >= before && markedAt <= Date.now(), 'the owner’s now, not the caller’s hour ahead');
+});
+
+test('a filing that landed answers filed even when waking consumers fails', async (t) => {
+	// Anything else makes the caller file it again locally — the whole-row replace forwarding avoids.
+	const original = QueueState.noteWork;
+	QueueState.noteWork = async () => {
+		throw new Error('QueueStatus write failed');
+	};
+	t.after(() => {
+		QueueState.noteWork = original;
+	});
+	const cacheKey = ownedBy('node-a');
+	const answer = await handler(request({ body: { cacheKey, fromSitemap: true, effectiveInterval: null } }));
+	assert.equal(answer.status, 200);
+	assert.equal(JSON.parse(answer.body).outcome, 'filed');
+});
+
+/** A peer that never answers: its fetch rejects with an AbortError when the deadline fires. */
+const neverAnswers = async (_url, { signal }) =>
+	new Promise((_resolve, reject) => {
+		signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+	});
+
+test('a SLOW owner is not a refusing one: a plain ask that times out is left to the owner, not written here', async () => {
+	const url = ownedBy('node-b');
+	const earlier = Math.floor(Date.now() / MINUTE) * MINUTE - 3 * HOUR;
+	table.set(url, { nextRenderTime: earlier, fromSitemap: true, effectiveInterval: null, changedAt: earlier });
+	config.queue.dueNowForward.timeoutMs = 20;
+	peerFetch = neverAnswers;
+	await funnel.fileDueNow(url, { fromSitemap: true, effectiveInterval: null });
+	assert.equal(table.get(url).changedAt, earlier, 'the owner’s row is not replaced by a local write');
+	assert.equal(table.get(url).nextRenderTime, earlier);
+	assert.deepEqual(forwardOutcomes(), ['timed-out']);
+});
+
+test('an ask carrying a change mark that times out IS filed here: losing it costs a cadence on the origin', async () => {
+	const url = ownedBy('node-b');
+	config.queue.dueNowForward.timeoutMs = 20;
+	peerFetch = neverAnswers;
+	const changedAt = Date.now();
+	await funnel.fileDueNow(url, { fromSitemap: true, effectiveInterval: null, changedAt });
+	assert.equal(table.get(url).changedAt, changedAt);
+	assert.deepEqual(forwardOutcomes(), ['fell-back']);
+});
+
+test('a forwarded bulk re-file carries urgent:false, and the owner files no ask', async () => {
+	const url = ownedBy('node-b');
+	await funnel.fileDueNow(url, { fromSitemap: true, effectiveInterval: null, urgent: false });
+	assert.equal(JSON.parse(fetches[0].init.body).urgent, false);
+	assert.equal('urgentAt' in table.get(url), false);
+	await funnel.fileDueNow(ownedBy('node-b', 1_000), { fromSitemap: true, effectiveInterval: null });
+	assert.ok(table.get(ownedBy('node-b', 1_000)).urgentAt > 0, 'a single ask still is one on the owner');
 });

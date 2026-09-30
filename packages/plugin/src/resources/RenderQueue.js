@@ -204,12 +204,28 @@ const patchTarget = (url, fields) => Target.patch(url, { url, ...fields });
  * An ask's mark (`urgentAt`) is deliberately NOT carried: the ask was answered by the attempts, and a
  * page that failed its fast lane as well is a failing page, not an urgent one.
  */
-const readMarks = async (url) => {
-	const row = await getScheduleRow(url, ['changedAt', 'demandPeriod']);
+const marksOf = (row) => {
 	const changedAt = numberOf(row?.changedAt);
 	if (!(Number.isFinite(changedAt) && changedAt > 0)) return {};
 	const demandPeriod = numberOf(row?.demandPeriod);
 	return { changedAt, demandPeriod: Number.isFinite(demandPeriod) && demandPeriod > 0 ? demandPeriod : undefined };
+};
+
+const readMarks = async (url) => marksOf(await getScheduleRow(url, ['changedAt', 'demandPeriod']));
+
+/**
+ * What a result needs of its row before it decides anything: the marks (above), and the ask — when an
+ * `urgentAt` was filed and the due time it was filed at. One local point read.
+ */
+const readResultState = async (url) => {
+	const row = await getScheduleRow(url, ['nextRenderTime', 'changedAt', 'demandPeriod', 'urgentAt']);
+	const askedAt = numberOf(row?.urgentAt);
+	const dueAt = numberOf(row?.nextRenderTime);
+	return {
+		marks: marksOf(row),
+		askedAt: Number.isFinite(askedAt) && askedAt > 0 ? askedAt : undefined,
+		dueAt: Number.isFinite(dueAt) ? dueAt : undefined,
+	};
 };
 
 /**
@@ -595,10 +611,17 @@ export class RenderQueue extends Resource {
 		// must keep it, or the row — which still carries its original overdue due time now that
 		// the lease has left `nextRenderTime` — becomes immediately re-claimable and hot-loops.
 		let holdLease = false;
+		// Set by the outcomes that land but leave the row due on purpose (a render dropped for predating a
+		// change mark, one that kept an ask filed while it ran): the re-grant at the same minute that
+		// follows is then not counted as a result whose commit failed (util/renderLease.js `missesOf`).
+		let leftDue = false;
 		try {
 			return await this.processDecodedJobResult(result, {
 				holdLease: () => {
 					holdLease = true;
+				},
+				leaveDue: () => {
+					leftDue = true;
 				},
 				grant,
 				startedBy,
@@ -624,7 +647,7 @@ export class RenderQueue extends Resource {
 			// grant read above: a key granted again while this result was processed is another renderer's.
 			// No grant at all means this node holds no lease the result could be for (a restart, or the
 			// slot recycled), so any lease that appears meanwhile is someone else's too.
-			if (!holdLease && grant) releaseLease(claimKey, { grantedAtMs: grant.grantedAtMs });
+			if (!holdLease && grant) releaseLease(claimKey, { grantedAtMs: grant.grantedAtMs, leftDue });
 		}
 	}
 
@@ -668,7 +691,10 @@ export class RenderQueue extends Resource {
 	 * renders — while a per-device row for a NON-default device is a one-off: its page is stored and
 	 * the row deleted, and the URL row is not touched. `describeJob` decides which, once.
 	 */
-	static async processDecodedJobResult(posted, { holdLease: hold, grant = null, startedBy = null }) {
+	static async processDecodedJobResult(
+		posted,
+		{ holdLease: hold, leaveDue = () => {}, grant = null, startedBy = null }
+	) {
 		const { rowKey, url, asked, variants } = normalizeJobResult(posted);
 		const job = describeJob(rowKey, url);
 		let held = false;
@@ -745,7 +771,8 @@ export class RenderQueue extends Resource {
 		// render, never toward a stored stale page — or, with no lease slot to ask, the latest instant the
 		// render can have begun. Only for a job that writes the URL row: a one-device render beside the
 		// rotation neither reads nor clears its mark.
-		const marks = job.fold ? await readMarks(url) : {};
+		const rowState = job.fold ? await readResultState(url) : { marks: {} };
+		const { marks } = rowState;
 		const grantedBy = Math.min(grant?.grantedAtMs ?? Infinity, startedBy ?? Infinity);
 		if (marks.changedAt !== undefined && marks.changedAt > grantedBy) {
 			metrics.renderOutcome('superseded', 'changed-during-render');
@@ -754,8 +781,14 @@ export class RenderQueue extends Resource {
 					`${new Date(marks.changedAt).toISOString()}, so it may show the old content. The row stays due and ` +
 					`marked, and renders again now.`
 			);
+			leaveDue();
 			return;
 		}
+		// AN ASK FILED WHILE THIS RENDER RAN is not answered by it, the same way: a revalidate or render-now
+		// that arrived after the grant wants the page as it is NOW, and this render fetched it before. Unlike
+		// a change, nothing says its content is wrong, so it is stored — only the ask must survive, which the
+		// reschedule below would clear (`urgentAt` is cleared by every other writer's `put`). See step 5.
+		const askedDuringRender = rowState.askedAt !== undefined && rowState.askedAt > grantedBy;
 
 		// 1. A redirect the browser bailed on at navigation, or a rendered-through client-side redirect
 		// that produced nothing. Decided by `processRedirectResult` for the whole URL, exactly as one
@@ -1101,7 +1134,16 @@ export class RenderQueue extends Resource {
 		// replaced it — from the mark's first instant, which `fileDueNow` keeps, to now. Emitted only here,
 		// where every device rendered and the reschedule below clears the mark: a partial render keeps the
 		// mark through the retry lane, and its URL is counted once, when its render finally lands.
-		if (marks.changedAt !== undefined && renderTarget && scheduleJob.fold && !refiledTo && stored.length) {
+		// Not for a render the probe's own check found STALE: it does not carry the change's content, the
+		// page is re-filed, and the lag is counted when the render that does carry it lands.
+		if (
+			marks.changedAt !== undefined &&
+			renderTarget &&
+			scheduleJob.fold &&
+			!refiledTo &&
+			stored.length &&
+			!claimCheck?.stale
+		) {
 			metrics.renderChangeLag(Math.max(0, Date.now() - marks.changedAt), routeLabelOf(url));
 		}
 
@@ -1114,8 +1156,14 @@ export class RenderQueue extends Resource {
 			// A one-device render (a per-device row for a non-default device) does NOT reschedule: the
 			// URL's rotation is on the URL row, and this result was an extra render beside it.
 			if (scheduleJob.fold) {
+				// An ask filed while this render ran (step 0) keeps the row due, at the time it was filed, and
+				// keeps its mark: the pages just stored stay fresh to their cadence, and the ask is answered by
+				// the next render instead of silently by this one.
+				const keepAsk = askedDuringRender && !refiledTo;
+				if (keepAsk) leaveDue();
 				await writeSchedule(scheduleUrl, {
-					nextRenderTime,
+					nextRenderTime: keepAsk ? Math.min(rowState.dueAt ?? currentMinuteMs(), currentMinuteMs()) : nextRenderTime,
+					...(keepAsk ? { urgentAt: rowState.askedAt } : {}),
 					fromSitemap: !!renderTarget.sitemapUrl,
 					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
 					// the writer every target passes through on every cycle, so it is what backfills the
@@ -1290,10 +1338,10 @@ export class RenderQueue extends Resource {
 
 		// Due now, not jittered: adoptions arrive one per source render, already spread by the
 		// sources' own schedule jitter, and the source's cached pages were just deleted — the
-		// sooner the destination renders, the shorter the window a bot gets neither page. An explicit
-		// current minute is also what marks the row an ask (`urgentAt`, in `Target.put`), so it ranks
-		// ahead of routine lateness rather than behind every overdue row.
-		const target = { nextRenderTime: currentMinuteMs() };
+		// sooner the destination renders, the shorter the window a bot gets neither page. It is a single
+		// ask (`urgent`, consumed by `Target.put` into `urgentAt`), so it ranks ahead of routine lateness
+		// rather than behind every overdue row.
+		const target = { nextRenderTime: currentMinuteMs(), urgent: true };
 		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
 			target.renderInterval = source.renderInterval;
 		}

@@ -727,7 +727,9 @@ export const METRICS = Object.freeze({
 			'due_now_forward = a render-now, revalidate, rejoin or probe filing made on a node that does not own the ' +
 			'row (queue.dueNowForward): forwarded (the owner filed it, keeping an earlier due time and a change ' +
 			'mark), fell-back (the owner could not be asked or refused, so it was filed here as before 0.97.0 — ' +
-			'which can demote the owner’s row), skipped (that owner failed within the last 30s; filed here). A ' +
+			'which can demote the owner’s row), timed-out (the owner did not answer in time and the ask carried ' +
+			'no change mark: left to the owner, not written here — see queue.dueNowForward), skipped (that owner ' +
+			'failed within the last 30s; filed here). A ' +
 			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
@@ -851,7 +853,7 @@ export const METRICS = Object.freeze({
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
-					'fell-back, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
+					'fell-back, timed-out, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
 					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (refiled, bounded, untrusted, dry_run, error). Other series: null.',
 			},
 			type: {

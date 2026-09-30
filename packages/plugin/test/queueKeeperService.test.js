@@ -1043,20 +1043,42 @@ test('a row filed due NOW ranks at the head of a full ready set — no longer be
 		.readyQueue()
 		.peek(cap)
 		.map((e) => e.cacheKey);
-	// Ahead of every routine row less than one cadence (48h) late — and behind the ones more than a
-	// cadence late, which is the bound that keeps a wave of asks from starving the rotation.
-	const pastACadence = cap + 5 - (48 * HOUR) / MINUTE;
-	for (const key of [asked, changed]) {
+	// Each ahead of every routine row less than its head start (in 48h cadences) late — and behind the ones
+	// later than that, which is the bound that keeps a wave of either from starving the rotation. The
+	// change's head start is the larger, so the change ranks ahead of the ask.
+	const { changedHeadStart, urgentHeadStart } = config.queue.ready;
+	for (const [key, headStart] of [
+		[asked, urgentHeadStart],
+		[changed, changedHeadStart],
+	]) {
+		const pastHeadStart = cap + 5 - (headStart * 48 * HOUR) / MINUTE;
 		const at = published.indexOf(key);
 		assert.ok(at >= 0, `${key} is published`);
-		assert.ok(at <= pastACadence + 2, `${key} ranks ahead of routine lateness under a cadence (at ${at})`);
-		assert.ok(at >= pastACadence - 1, 'and behind rows more than a cadence late');
+		assert.ok(at <= pastHeadStart + 2, `${key} ranks ahead of routine lateness under its head start (at ${at})`);
+		assert.ok(at >= pastHeadStart - 2, `and behind rows later than that (at ${at})`);
 	}
+	assert.ok(published.indexOf(changed) < published.indexOf(asked), 'a change outranks an equally late ask');
 	s.writeState();
 	const body = await PrerenderAdmin.queueState().json();
 	assert.equal(body.trust.exact, true);
 	assert.equal((await s.verify()).repaired, 0, 'the keeper holds the urgent class exactly as the table has it');
 	s.stop();
+});
+
+test('with the default head starts a change found now outranks an ask filed hours before it', async () => {
+	// At equal head starts an ask filed two hours earlier scored 2.083 against a change found now at 2.0 (a
+	// 48h sitemap page, boost 2): a burst of asks queued the changes found after it. A changed page is
+	// answered from the origin while it waits; an asked-for page usually still from the cache.
+	const { scoreOf } = await import('../src/util/renderPriority.js');
+	const { sitemapBoost, changedHeadStart, urgentHeadStart, changedDemand } = config.queue.ready;
+	assert.ok(urgentHeadStart < changedHeadStart, 'the ask’s head start is the smaller');
+	const now = Date.now();
+	const at = { nowMs: now, intervalMs: 48 * HOUR, sitemapBoost, changedHeadStart, urgentHeadStart, changedDemand };
+	const askedEarlier = scoreOf({ dueAt: now - 2 * HOUR, fromSitemap: true, urgent: true }, at);
+	const changedNow = scoreOf({ dueAt: now, fromSitemap: true, changed: true }, at);
+	assert.ok(changedNow > askedEarlier, `${changedNow} > ${askedEarlier}`);
+	const routineLate = scoreOf({ dueAt: now - 12 * HOUR, fromSitemap: true }, at);
+	assert.ok(scoreOf({ dueAt: now, fromSitemap: true, urgent: true }, at) > routineLate, 'an ask still beats routine');
 });
 
 test('the keeper loads the urgent mark: it is in the load projection and in what a verification compares', async () => {

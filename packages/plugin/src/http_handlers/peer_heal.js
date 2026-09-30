@@ -197,11 +197,16 @@ export async function handlePeerDueNowRequest(request) {
 	const url = cacheKey ? CacheKey.urlOf(cacheKey) : null;
 	const host = url ? URL.parse(url)?.hostname : null;
 	const effectiveInterval = body?.effectiveInterval === null ? null : optionalPositive(body?.effectiveInterval);
-	const changedAt = optionalPositive(body?.changedAt);
+	// ON THE OWNER'S CLOCK. A mark later than now — a caller whose clock runs ahead — would read as newer
+	// than any lease this node grants for the next while, and every render granted before the caller's
+	// "now" would be dropped as changed-during-render (resources/RenderQueue.js).
+	const forwardedChangedAt = optionalPositive(body?.changedAt);
+	const changedAt = Number.isFinite(forwardedChangedAt) ? Math.min(forwardedChangedAt, Date.now()) : forwardedChangedAt;
 	const demandPeriod = optionalPositive(body?.demandPeriod);
 	if (
 		!host ||
 		typeof body.fromSitemap !== 'boolean' ||
+		(body.urgent !== undefined && typeof body.urgent !== 'boolean') ||
 		effectiveInterval === undefined ||
 		Number.isNaN(effectiveInterval) ||
 		Number.isNaN(changedAt) ||
@@ -223,11 +228,17 @@ export async function handlePeerDueNowRequest(request) {
 			effectiveInterval,
 			changedAt,
 			demandPeriod,
+			urgent: body.urgent !== false,
 			forwarded: true,
 		});
 		// Wake this node's idle consumers, as a local render-now does: the claim reads a node-local flag,
-		// which the forwarding node could not reach.
-		await QueueState.noteWork();
+		// which the forwarding node could not reach. Best-effort: the row IS filed, and answering anything
+		// but `filed` would make the caller write it again locally — the whole-row replace this avoids.
+		try {
+			await QueueState.noteWork();
+		} catch (e) {
+			logger.warn(`[prerender] filed ${cacheKey} for a peer but could not wake consumers: ${e?.message ?? String(e)}`);
+		}
 		return json({ outcome: 'filed', nextRenderTime });
 	} catch (e) {
 		// ANSWER, never reject: the caller is holding a render-now or a revalidate, and a 500 lets it file the

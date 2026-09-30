@@ -1225,17 +1225,21 @@ test('a result that outlived its lease with NO grant since is still the latest r
 	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
 });
 
-test('Target.put marks the row urgent only for an explicit due time that is not in the future', async () => {
-	// An adopted redirect destination and a sitemap `revalidate: true` pass the current minute: an ask to
-	// render now. A jittered first render, and an explicit future time, are not asks.
+test('Target.put marks the row urgent only for a single ask: `urgent` with a time not in the future', async () => {
+	// An adopted redirect destination passes `urgent: true` with the current minute. A sitemap walk's
+	// `revalidate: true` passes the current minute for every URL it lists — a bulk re-file, not an ask:
+	// marked, it would queue its whole sitemap ahead of every change found while it drains.
 	const { Target } = await import('../src/resources/Target.js');
 	const minute = Math.floor(Date.now() / 60_000) * 60_000;
 	await Target.put(A, { renderInterval: 3_600_000 });
 	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'jittered');
-	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute + 3_600_000 });
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute + 3_600_000, urgent: true });
 	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'explicitly later');
 	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute });
-	assert.ok(stores.renderSchedule.get(A).urgentAt > 0, 'explicitly now');
+	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'a bulk re-file at now');
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute, urgent: true });
+	assert.ok(stores.renderSchedule.get(A).urgentAt > 0, 'a single ask at now');
+	assert.equal('urgent' in stores.target.get(A), false, 'the intent is consumed, never stored on the target');
 });
 
 // ───────────────────────────── what a landed render reports ─────────────────────────────
@@ -1305,4 +1309,96 @@ test('a page in an encoding that would cost a decompression to measure is not me
 		rendered('mobile', 'not really gzip', { headers: { 'content-encoding': 'gzip' } }),
 	]);
 	assert.deepEqual(sizeSamples(), []);
+});
+
+// ───────────────────────────── outcomes that leave the row due on purpose ─────────────────────────────
+
+const failedResult = () => [
+	{ deviceType: 'desktop', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+];
+
+test('a render dropped for predating a change mark does not count toward a wedge hold', async (t) => {
+	// It leaves the row due at the minute its lease was granted for — deliberately — and a re-grant at that
+	// minute is otherwise the signature of a result whose commit failed.
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += 5_000;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: clock.now });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.deepEqual(outcomes(), [['superseded', 'changed-during-render']]);
+	clock.now += 6_000;
+	assert.equal(funnel.leaseTable().missesBeforeGrant(A, funnel.minuteOf(1)), 0);
+});
+
+test('an ask filed while a render ran survives it: the page is stored, the row stays due and urgent', async (t) => {
+	// A revalidate or render-now that arrived after the grant wants the page as it is now; the in-flight
+	// render fetched it before. Nothing says its content is wrong, so it is kept — but the reschedule used
+	// to clear the ask with it.
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += 5_000;
+	const askedAt = clock.now;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), urgentAt: askedAt });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>fetched before the ask</html>'), rendered('mobile')]);
+	assert.equal(
+		stores.prerenderedPage.get(key(A, 'desktop')).content.toString(),
+		'<html>fetched before the ask</html>',
+		'stored'
+	);
+	const row = stores.renderSchedule.get(A);
+	assert.equal(row.urgentAt, askedAt, 'the ask survives');
+	assert.ok(row.nextRenderTime <= clock.now, 'and is still due');
+	assert.ok(
+		stores.prerenderedPage.get(key(A, 'desktop')).expiresAt > clock.now + 3_000_000,
+		'while the page stays fresh to its cadence'
+	);
+	clock.now += 6_000;
+	assert.equal(funnel.leaseTable().missesBeforeGrant(A, funnel.minuteOf(row.nextRenderTime)), 0, 'no wedge miss');
+});
+
+test('an ask filed BEFORE the grant is answered by the render, and cleared by its reschedule', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), urgentAt: clock.now - 60_000 });
+	await claim();
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	const row = stores.renderSchedule.get(A);
+	assert.equal(row.urgentAt, undefined);
+	assert.ok(row.nextRenderTime > clock.now + 3_000_000, 'rescheduled a cadence out');
+});
+
+test('a change drop, then a kept ask, then two fast-lane failures: the key is not held back', async (t) => {
+	// The reviewer's sequence: two outcomes that leave the row due on purpose used to count as two results
+	// whose commit failed, and the fast lane's own expiries then crossed the wedge limit — the key held back
+	// for twenty minutes on a page that was hard-expired.
+	const clock = fakeClock(t);
+	const lease = config.queue.jobLeaseTime;
+	seedUrlRow();
+	assert.equal((await claim()).length, 1);
+	clock.now += 5_000;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: clock.now });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]); // dropped: changed during render
+
+	clock.now += 6_000;
+	assert.equal((await claim()).length, 1);
+	clock.now += 5_000;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), urgentAt: clock.now });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]); // stored, the ask kept: still due
+
+	for (let i = 0; i < 2; i++) {
+		clock.now += 6_000;
+		assert.equal((await claim()).length, 1, `attempt ${i + 3} granted`);
+		clock.now += 3_000;
+		await postVariants(A, failedResult()); // fast lane: the lease is held to its expiry
+		clock.now += lease;
+	}
+	assert.equal((await claim()).length, 1, 'granted again, not held back');
 });

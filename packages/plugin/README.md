@@ -532,9 +532,12 @@ table is read by primary key only, and `nextRenderTime` carries no index
   on the row as `demandPeriod` when the change was acted on — so the score is the bot visits the wait has
   sent to the origin, and a change wave renders the pages bots ask for first. A row with no estimate
   (tracker off, cold or saturated) orders by cadence.
-- **An ask to render now starts ahead too.** A row filed due now by a render-now, a revalidate, an
-  admin rejoin or an adopted redirect destination (`urgentAt`) starts `queue.ready.urgentHeadStart`
-  cadences ahead; filed at the current minute it would otherwise rank behind every overdue row. Both
+- **A single ask to render now starts ahead too, but behind a change.** A row filed due now by a
+  render-now, an admin revalidate or rejoin of one URL, an adopted redirect destination or a first
+  sitemap listing (`urgentAt`) starts `queue.ready.urgentHeadStart` (0.5) cadences ahead; filed at the
+  current minute it would otherwise rank behind every overdue row. Half the change's head start, so a
+  page found changed — answered from the origin while it waits — outranks an equally late ask. Bulk
+  re-files (a revalidate over a collection, a sitemap walk with `revalidate: true`) are not asks. Both
   head starts are in boosted units — multiplied by `sitemapBoost`, as sitemap lateness is — so a fresh
   marked row outranks every routine row less than that many cadences late, sitemap-listed or not.
 - **It repairs itself from the table.** Each publish re-reads the head of what it published and fixes
