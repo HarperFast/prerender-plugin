@@ -65,8 +65,8 @@
  *
  * THE SUBSCRIPTION IS PRICED PER DATABASE, not per table: the audit log spans the database, so every
  * commit anywhere in it pays a notify pass for each subscribed worker. That is free here only because
- * `Invalidation` is ALONE in its database and written only when an invalidation is applied or cleared. Never move another
- * table into `invalidation`; see schema.graphql.
+ * `Invalidation` is ALONE in its database and written only when an invalidation is applied or
+ * cleared. Never move another table into `invalidation`; see schema.graphql.
  *
  * EVERY FAILURE FALLS BACK TO THE OLD PATH, never to a stale view. The view is trusted only after a
  * full read completed while the subscription it was loaded under is still the live one. Until then —
@@ -599,7 +599,36 @@ export const recordInvalidation = async ({ scope, reason, updatedBy }) => {
 		reason,
 		updatedBy: updatedBy ?? null,
 	});
+	await reflectOwnWrite(scope, invalidatedAt.getTime());
 	return { scope, invalidatedAt: invalidatedAt.toISOString(), mode: HARD, reason, updatedBy: updatedBy ?? null };
+};
+
+/**
+ * THE WRITER'S OWN WORKER SEES ITS WRITE BEFORE THE WRITE RETURNS. The doorbell reaches this worker a
+ * notify pass and a read after the commit, and a caller that acts on its own write at once would miss
+ * it: the change probe's canary trip records an invalidation and immediately chains a reseed, whose
+ * first resolution then saw NO epoch, treated nothing as covered and re-baselined the whole scope —
+ * making a false trip unrecoverable by clearing it.
+ *
+ * So: reload the view now, after the write, and wait for it. A write made outside a request (the
+ * probe's passes) has committed by the time `put` resolves, so that read sees it. A write made INSIDE
+ * a request (the admin API) commits only when the request ends, so no read can see it yet — then the
+ * write is patched into this worker's copy directly, and the doorbell after the commit replaces the
+ * patch with the real row. The patch never overrides a newer answer: a put only raises a scope's epoch,
+ * and a clear only removes an epoch older than the clear itself.
+ */
+const reflectOwnWrite = async (scope, atMs) => {
+	if (subscription === null) return; // no view in use: the per-request reads see the table itself
+	await requestLoad();
+	if (view === null) return;
+	const current = view.get(scope);
+	if (atMs === null) {
+		if (current === undefined || !(current <= Date.now())) return;
+	} else if (current !== undefined && current >= atMs) return;
+	const next = new Map(view);
+	if (atMs === null) next.delete(scope);
+	else next.set(scope, atMs);
+	view = next;
 };
 
 /**
@@ -615,6 +644,7 @@ export const clearInvalidation = async (scope) => {
 	// Drop the LKG entry on this worker so its own next request re-reads rather than serving the
 	// cleared epoch out of its remembered answer for up to `lkgMaxAge`.
 	lkg.delete(scope);
+	await reflectOwnWrite(scope, null);
 	return { scope, cleared: true, existed: existed !== false };
 };
 

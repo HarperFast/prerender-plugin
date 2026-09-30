@@ -39,6 +39,12 @@ let scans = 0;
 let subscribeFails = 0;
 let scanFails = 0;
 let scanGate = null;
+let deferWrites = false;
+const pending = new Map();
+const commitPending = () => {
+	for (const [id, row] of pending) row === null ? rows.delete(id) : rows.set(id, row);
+	pending.clear();
+};
 
 before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], recordAnalytics: () => {} };
@@ -65,9 +71,15 @@ before(async () => {
 					return { ...row };
 				},
 				async put(id, data) {
-					rows.set(id, { scope: id, ...data });
+					// `deferWrites` models a write inside a request: invisible to other readers until commit.
+					if (deferWrites) pending.set(id, { scope: id, ...data });
+					else rows.set(id, { scope: id, ...data });
 				},
 				async delete(id) {
+					if (deferWrites) {
+						pending.set(id, null);
+						return rows.has(id);
+					}
 					return rows.delete(id);
 				},
 				async *search() {
@@ -109,6 +121,8 @@ beforeEach(() => {
 	subscribeFails = 0;
 	scanFails = 0;
 	scanGate = null;
+	deferWrites = false;
+	pending.clear();
 	inv.resetInvalidationState();
 	config.invalidation.enabled = true;
 	config.invalidation.syncInterval = 60_000;
@@ -462,4 +476,40 @@ test('a view load refreshes the last-known-good, so a later fallback read error 
 	failNext = 1;
 	const resolved = await inv.resolveInvalidation(null);
 	assert.equal(resolved?.at, 5_000_000 + PAD, 'a storage fault right after the drop must not un-invalidate');
+});
+
+test("a writer's own worker sees its write when the write returns — the canary trip's reseed resolves at once", async () => {
+	// The trip records an invalidation and chains a reseed immediately; that reseed's first resolution
+	// saw NO epoch (the doorbell had not landed), treated nothing as covered and re-baselined the scope.
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	const written = await inv.recordInvalidation({ scope: ROUTE, reason: 'canary trip', updatedBy: 'change-probe' });
+	const resolved = inv.resolveInvalidation(ROUTE);
+	assert.equal(resolved?.at, new Date(written.invalidatedAt).getTime() + PAD, 'no doorbell rung, and already visible');
+
+	await inv.clearInvalidation(ROUTE);
+	assert.equal(inv.resolveInvalidation(ROUTE), null, 'and the clear, the same way');
+	assert.deepEqual(reads, [], 'from the view, not by falling back to per-request reads');
+});
+
+test('a write inside a request (not yet committed) is patched into the writer’s view, and the commit settles it', async () => {
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	deferWrites = true;
+	const written = await inv.recordInvalidation({ scope: 'all', reason: 'admin', updatedBy: 'joe' });
+	assert.equal(rows.has('all'), false, 'precondition: no read can see it yet');
+	assert.equal(inv.resolveInvalidation(null)?.at, new Date(written.invalidatedAt).getTime() + PAD);
+
+	// The request ends: the commit rings the doorbell and the real row replaces the patch.
+	deferWrites = false;
+	commitPending();
+	ring();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(inv.resolveInvalidation(null)?.at, new Date(written.invalidatedAt).getTime() + PAD);
+
+	// A clear inside a request, the same way round.
+	deferWrites = true;
+	await inv.clearInvalidation('all');
+	assert.equal(rows.has('all'), true, 'precondition: the delete is not visible yet');
+	assert.equal(inv.resolveInvalidation(null), null);
 });
