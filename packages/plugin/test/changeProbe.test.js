@@ -464,8 +464,11 @@ test('requestSweepReseed runs immediately when no sweep is running', async () =>
 	assert.equal(chained, false);
 	while (!(await status()).sweep.lastRun) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal((await status()).sweep.lastRun.label, 'reseed-now');
-	// A reseed is dry-run BY CONSTRUCTION — re-baseline, never act — even on an armed probe.
-	assert.equal((await status()).sweep.lastRun.dryRun, true);
+	// ARMED since v0.97.0 (F7b): it acts on a change wherever the trip's invalidation does not already
+	// cover every page — a dry-run reseed baselined pages re-rendered after the trip that then changed,
+	// and they served wrong for the rest of the night.
+	assert.equal((await status()).sweep.lastRun.dryRun, false);
+	assert.equal((await status()).sweep.lastRun.startedBy, 'reseed');
 	config.changeProbe.dryRun = savedDryRun;
 });
 
@@ -503,7 +506,7 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 		while ((await status()).sweep.lastRun?.label !== 'reseed-after-trip') {
 			await new Promise((resolve) => setImmediate(resolve));
 		}
-		assert.equal((await status()).sweep.lastRun.dryRun, true);
+		assert.equal((await status()).sweep.lastRun.dryRun, false, 'the chained reseed acts (F7b)');
 	} finally {
 		config.changeProbe.chunkSize = savedChunk;
 		config.changeProbe.dryRun = savedDryRun;
@@ -511,12 +514,18 @@ test('requestSweepReseed interrupts a running sweep and chains the reseed after 
 	}
 });
 
-test('freshness skip: a baseline younger than reprobeAfter is not re-probed', async () => {
-	// The restart case: a pass that already covered these URLs died mid-walk, and the pass that
-	// replaces it must not spend origin requests re-confirming what is already stored.
+test('freshness skip: only a baseline written since THIS pass began is skipped — a recent CHANGE is re-probed', async () => {
+	// F3 (review 2026-09-29). `probedAt` moves only when a baseline is WRITTEN — a change, a seed, a
+	// re-baseline — so the old "younger than reprobeAfter" test skipped precisely the URLs that had just
+	// changed. The live case: a daytime pass caught a change and wrote its baseline at T-9h; the anchored
+	// pass that began after midnight reached the URL at T, skipped it as "fresh", and the midnight reprice
+	// kept serving for another day. Now only a baseline written at or after the pass's own start (a row an
+	// interrupted run of this same pass already covered) is skipped.
 	const probed = [];
 	const T = 1_700_000_000_000;
+	const passStart = T - 3 * HOUR;
 	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const triggered = [];
 	const stats = await changeProbe.runProbePass({
 		rows: stream([row(URL_A), row(URL_B)]),
 		rules: compileProbeRules(RULES_RAW),
@@ -526,19 +535,47 @@ test('freshness skip: a baseline younger than reprobeAfter is not re-probed', as
 			probed.push(url);
 			return '[9]';
 		},
-		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - 60_000 : T - 20 * HOUR }),
+		// URL_A: written by this pass an hour ago (before a restart). URL_B: changed by a daytime pass 9h ago.
+		read: async (url) => ({ signature: '[1]', probedAt: url === URL_A ? T - HOUR : T - 9 * HOUR }),
 		write: async () => {},
-		submitTrigger: async () => 'queued',
+		submitTrigger: async ({ row }) => triggered.push(row.url),
 		dryRun: false,
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
 		now: () => T,
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: passStart,
 	});
-	assert.deepEqual(probed, [URL_B], 'only the stale baseline was re-probed');
+	assert.deepEqual(probed, [URL_B], 'the 9h-old change is re-probed; only this pass’s own write is skipped');
+	assert.deepEqual(triggered, [URL_B], 'and the reprice it finds is acted on');
 	assert.equal(stats.fresh, 1);
 	assert.equal(stats.probed, 1);
+});
+
+test('freshness skip: with no pass start (the canary), nothing is ever skipped', async () => {
+	const probed = [];
+	const T = 1_700_000_000_000;
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const stats = await changeProbe.runProbePass({
+		rows: stream([row(URL_A)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async (rule, url) => {
+			probed.push(url);
+			return '[1]';
+		},
+		read: async () => ({ signature: '[1]', probedAt: T - 1 }),
+		write: async () => {},
+		submitTrigger: async () => {},
+		dryRun: false,
+		concurrency: 1,
+		ratePerSecond: 1000,
+		pause: async () => {},
+		now: () => T,
+	});
+	assert.deepEqual(probed, [URL_A]);
+	assert.equal(stats.fresh, 0);
 });
 
 test('freshness skip: an unparseable or missing probedAt probes rather than skips', async () => {
@@ -561,10 +598,36 @@ test('freshness skip: an unparseable or missing probedAt probes rather than skip
 		concurrency: 1,
 		ratePerSecond: 1000,
 		pause: async () => {},
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: 0,
 	});
 	assert.equal(probed.length, 2, 'unknown age must probe — never skip on a value we cannot read');
 	assert.equal(stats.fresh, 0);
+});
+
+test('pacing: a row skipped as fresh makes no origin call and is NOT charged a slot of the rate window', async () => {
+	// P4 (review 2026-09-29). Skipped rows used to count toward the paced batch, so a run of skips crawled
+	// at `ratePerSecond` though it asked the origin nothing.
+	const waits = [];
+	const T = 1_700_000_000_000;
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B), row(URL_C), row(URL_D)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => '[1]',
+		// A, B and C were written by this pass already; only D makes a request.
+		read: async (url) => ({ signature: '[1]', probedAt: url === URL_D ? T - 9 * HOUR : T }),
+		write: async () => {},
+		submitTrigger: async () => {},
+		dryRun: false,
+		concurrency: 2,
+		ratePerSecond: 1, // a 1000ms window per probed row
+		now: () => T,
+		pause: async (ms) => waits.push(ms),
+		skipProbedSince: T - HOUR,
+	});
+	assert.deepEqual(waits, [1000], 'the all-skip batch waits nothing; the batch with one probe waits one slot');
 });
 
 test('origin backoff: a pushback response stretches the pacing window, a clean batch relaxes it', async () => {
@@ -703,7 +766,7 @@ test('freshness skip: a BigInt probedAt is coerced, not thrown on', async () => 
 		ratePerSecond: 1000,
 		pause: async () => {},
 		now: () => T,
-		reprobeAfter: 12 * HOUR,
+		skipProbedSince: T - HOUR,
 	});
 	assert.deepEqual(probed, [], 'the BigInt-derived timestamp was understood as fresh');
 	assert.equal(stats.fresh, 1);
@@ -1460,12 +1523,18 @@ test('scheduler: mode is live — switching re-arms rather than leaving the old 
 	await applyProbeConfig({ enabled: false });
 });
 
+// An anchor time of day (UTC) that last occurred `hours` ago. The resume and catch-up decisions compare
+// a claim's start with the most recent anchor, so a fixed '03:00' would make these tests depend on the
+// hour they run at.
+const anchorHoursAgo = (hours) => new Date(Date.now() - hours * HOUR).toISOString().slice(11, 16);
+
 const armAnchoredScheduler = async (t, extra = {}) => {
 	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
 	await applyProbeConfig({
 		enabled: true,
 		mode: 'anchored',
-		anchorTime: '03:00',
+		// Six hours back: every claim these tests seed (1-4h old) belongs to the current anchor period.
+		anchorTime: anchorHoursAgo(6),
 		anchorTimezone: 'UTC',
 		startDelay: 0,
 		startJitter: 1,
@@ -1520,6 +1589,8 @@ test("RESTART RESILIENCE: the resume starts the WALK at the published cursor, in
 			dryRun: true,
 			originStartedAt: startedAt - HOUR, // itself a resume of an earlier pass
 			progress: { cursor },
+			// The anchored pass already ran since the anchor, so no catch-up competes with the resume.
+			lastRun: { startedBy: 'anchor', startedAt: Date.now() - 5 * HOUR, dryRun: false },
 		},
 	});
 	const decision = await changeProbe.__checkResumeForTest();
@@ -1556,7 +1627,7 @@ test('RESTART RESILIENCE: an early config apply re-arms a pending resume instead
 	await applyProbeConfig({
 		enabled: true,
 		mode: 'anchored',
-		anchorTime: '04:00',
+		anchorTime: anchorHoursAgo(5),
 		anchorTimezone: 'UTC',
 		startDelay: 0,
 		startJitter: 1,
@@ -1991,6 +2062,28 @@ test('NO pageSignature -> NOT verified, even though pageDisagrees is false', asy
 		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: null } },
 	});
 	assert.deepEqual(verified, [], 'no claim was compared, so there is nothing to certify');
+});
+
+test('a stored claim that COMPARES NOTHING is not proof — P1: verified needs a comparison that happened', async () => {
+	// P1 (review 2026-09-29). The page's availability word is one the vocabulary does not know (null
+	// verdict) and the endpoint's price is null: neither dimension is comparable. Before, the proof was
+	// "a stored claim exists", and the no-disagreement answer then certified a page nobody had compared.
+	const sig = JSON.stringify([39.99, null, null, true]);
+	const { verified, stats } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: sig },
+		stored: {
+			[URL_A]: {
+				signature: sig,
+				probedAt: NaN,
+				pageSignature: JSON.stringify([['35.99'], null]),
+				pageClaimAt: CLAIM_AT,
+			},
+		},
+	});
+	assert.equal(stats.unchanged, 1);
+	assert.equal(stats.pageMismatch, 0, 'nothing comparable is not a disagreement either');
+	assert.deepEqual(verified, [], 'and not an agreement: no dimension was compared');
 });
 
 test('a DISAGREEING page is triggered, never verified', async () => {
@@ -3213,7 +3306,7 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW, chunkSize: 250, dryRun: true } });
 	t.after(() => applyOptions({ changeProbe: { enabled: false } }));
 	const T0 = Date.parse('2026-09-24T05:05:00Z');
-	t.mock.timers.enable({ apis: ['Date'], now: T0 });
+	t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: T0 });
 
 	// Yesterday's finished pass — the record the running pass must NOT be confused with.
 	await changeProbe.publishProbeStateForTest({
@@ -3224,19 +3317,25 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	});
 
 	let release;
+	let blocked = false;
 	const gate = new Promise((resolve) => (release = resolve));
 	globalThis.databases.render_service.Target = walkableTargets(unmatchedUrls(300), {
 		hold: async (index) => {
-			// Past the first chunk's heartbeat: the walk has examined 250 rows and beaten once at 200.
-			if (index === 249) t.mock.timers.tick(31_000);
-			if (index >= 250) await gate;
+			// The walk has examined the first chunk's 250 rows and is stuck fetching the next one.
+			if (index >= 250) {
+				blocked = true;
+				await gate;
+			}
 		},
 	});
 
 	const pass = changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	for (let i = 0; i < 200 && !blocked; i++) await flushTurns(1);
+	// Stuck in ONE await for longer than a heartbeat: the timer beats anyway (P3).
+	t.mock.timers.tick(31_000);
 	for (let i = 0; i < 200; i++) {
 		await flushTurns(1);
-		if ((await changeProbe.readProbeStateForTest())?.sweep?.progress?.examined === 200) break;
+		if ((await changeProbe.readProbeStateForTest())?.sweep?.progress?.examined === 250) break;
 	}
 
 	const mid = await changeProbe.changeProbeStatus();
@@ -3248,8 +3347,8 @@ test('a running sweep publishes ITS OWN identity and partial counts, apart from 
 	assert.equal(mid.sweep.current.phase, 'walking');
 	assert.equal(mid.sweep.current.stale, false);
 	assert.equal(mid.sweep.current.sliceEstimate, 12_345, 'the previous complete pass sizes the ETA');
-	assert.equal(mid.sweep.progress.examined, 200, 'the pass’s own counters, not yesterday’s');
-	assert.equal(mid.sweep.progress.examinedApprox, 200, 'kept for consoles that predate the counters');
+	assert.equal(mid.sweep.progress.examined, 250, 'the pass’s own counters, not yesterday’s');
+	assert.equal(mid.sweep.progress.examinedApprox, 250, 'kept for consoles that predate the counters');
 	assert.equal(mid.sweep.progress.probed, 0);
 	assert.equal(mid.sweep.progress.actionsInFlight, 0);
 	assert.equal(typeof mid.sweep.progress.recentRate, 'number');
@@ -3421,16 +3520,15 @@ test('the canary’s cohort build republishes the cohort sizes instead of leavin
 	await applyProbeConfig({ enabled: false });
 });
 
-test('the drain keeps beating while the queue settles, and stops the moment it is idle', async (t) => {
+test('the pass heartbeat is a TIMER: it beats while the pass sits in one await, and never after it stops', async (t) => {
+	// P3 (review 2026-09-29): the beat used to ride the walk's yields, so a Retry-After wait (up to 5
+	// minutes, the staleness window) or a long wait for an action slot made a live claim read as dead.
 	t.mock.timers.enable({ apis: ['setInterval'] });
-	let settle;
-	const triggers = { drain: () => new Promise((resolve) => (settle = resolve)) };
 	let beats = 0;
-	const draining = changeProbe.__drainWithHeartbeatForTest(triggers, () => beats++);
+	const stop = changeProbe.__startHeartbeatForTest(() => beats++);
 	t.mock.timers.tick(30_000);
-	assert.equal(beats, 3, 'a beat every third of an interval while the queue drains');
-	settle();
-	await draining;
+	assert.equal(beats, 3, 'a tick every third of an interval, with no walk progress at all');
+	stop();
 	t.mock.timers.tick(60_000);
 	assert.equal(beats, 3, 'and none after');
 	t.mock.timers.reset();
@@ -3472,4 +3570,130 @@ test('the resume cursor is held back to the lowest URL whose action is still in 
 	assert.equal(at('https://e.x/p/m', 'https://e.x/p/c'), 'https://e.x/p/c', 'an earlier action still in flight');
 	assert.equal(at('https://e.x/p/c', 'https://e.x/p/m'), 'https://e.x/p/c', 'the walk position is the lower bound');
 	assert.equal(at(null, null), null);
+});
+
+test('onChange fires for an origin change only — not for a seed, an unchanged row, or an ignored-only change', async () => {
+	const seen = [];
+	const { stats } = await runPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C)],
+		stored: { [URL_B]: '[1]', [URL_C]: '[1]' },
+		answers: { [URL_A]: '[1]', [URL_B]: '[1]', [URL_C]: '[2]' },
+		onChange: (rule, changed) => seen.push([rule.label, changed.url]),
+	});
+	assert.equal(stats.changed, 1);
+	assert.deepEqual(seen, [['pdp', URL_C]]);
+});
+
+// ---- the canary's optional time-of-day schedule (E2) ----------------------------------------------
+
+test('E2: nextScheduledCanary — dense inside a window from its start, the outside interval elsewhere', (t) => {
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['Date'] });
+	try {
+		const schedule = [{ fromTime: '00:00', toTime: '02:00', from: 0, to: 120, interval: 10 * 60_000 }];
+		// The window boundaries are read off the wall clock, so each case sets it.
+		const from = (iso, interval = 2 * HOUR) => {
+			t.mock.timers.setTime(Date.parse(iso));
+			return new Date(
+				changeProbe.nextScheduledCanary(Date.now(), { schedule, interval, timezone: 'UTC' })
+			).toISOString();
+		};
+		assert.equal(
+			from('2026-09-23T23:30:00.000Z'),
+			'2026-09-24T00:00:00.000Z',
+			'the window start beats the outside cadence'
+		);
+		assert.equal(from('2026-09-24T00:00:00.000Z'), '2026-09-24T00:10:00.000Z', 'then every window interval');
+		assert.equal(from('2026-09-24T01:50:00.000Z'), '2026-09-24T02:00:00.000Z', 'up to the window end');
+		assert.equal(
+			from('2026-09-24T01:55:00.000Z'),
+			'2026-09-24T03:55:00.000Z',
+			'past it, the outside cadence from that run'
+		);
+		assert.equal(from('2026-09-24T12:00:00.000Z'), '2026-09-24T14:00:00.000Z');
+		assert.equal(from('2026-09-24T23:00:00.000Z'), '2026-09-25T00:00:00.000Z');
+		assert.equal(from('2026-09-24T12:00:00.000Z', 0), '2026-09-25T00:00:00.000Z', 'outside interval 0: windows only');
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+	}
+});
+
+test('E2: the scheduled canary runs at the window start and every window interval, and publishes its next run', async (t) => {
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse('2026-09-23T23:30:00Z') });
+	try {
+		await applyProbeConfig({
+			// Anchored, so the canary arms at once (interval mode arms it with the boot sweep), with the anchor
+			// and the boot check out of the way.
+			enabled: true,
+			mode: 'anchored',
+			anchorTime: '12:00',
+			startDelay: 24 * HOUR - 1,
+			startJitter: 1,
+			canary: { interval: 2 * HOUR, count: 10, schedule: [{ from: '00:00', to: '02:00', interval: 600_000 }] },
+		});
+		changeProbe.startChangeProbeScheduler();
+		await changeProbe.probeStatePublishedForTest();
+		let status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:00:00Z'), 'the window start, not 23:30 + 2h');
+		assert.deepEqual(status.canary.schedule, [{ from: '00:00', to: '02:00', interval: 600_000 }]);
+		t.mock.timers.tick(30 * 60_000); // 00:00 — the first run
+		await settlePasses();
+		status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.lastRun?.startedAt, Date.parse('2026-09-24T00:00:00Z'), 'ran at the window start');
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:10:00Z'));
+		t.mock.timers.tick(10 * 60_000);
+		await settlePasses();
+		status = await changeProbe.changeProbeStatus();
+		assert.equal(status.canary.lastRun?.startedAt, Date.parse('2026-09-24T00:10:00Z'));
+		assert.equal(status.canary.nextRunAt, Date.parse('2026-09-24T00:20:00Z'));
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+		await applyProbeConfig({ enabled: false });
+	}
+});
+
+test('E2: with no schedule the canary is the fixed interval, exactly as before', async (t) => {
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+	await applyProbeConfig({ enabled: true, sweepInterval: 60_000, startDelay: 60_000, canary: { interval: 30_000 } });
+	changeProbe.startChangeProbeScheduler();
+	await changeProbe.probeStatePublishedForTest();
+	const status = await changeProbe.changeProbeStatus();
+	assert.equal(status.canary.armedInterval, 30_000);
+	assert.equal(status.canary.schedule, null);
+	t.mock.timers.reset();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('E2: a window starting inside the spring-forward hole still arms a FUTURE run', async (t) => {
+	// America/New_York, 2026-03-08: 02:00 EST jumps to 03:00 EDT, so a 02:30 start does not occur that day.
+	const hostTz = process.env.TZ;
+	process.env.TZ = 'UTC';
+	t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: Date.parse('2026-03-08T06:45:00Z') });
+	try {
+		await applyProbeConfig({
+			enabled: true,
+			mode: 'anchored',
+			anchorTime: '12:00',
+			startDelay: 24 * HOUR - 1,
+			startJitter: 1,
+			anchorTimezone: 'America/New_York',
+			canary: { interval: 0, count: 10, schedule: [{ from: '02:30', to: '04:00', interval: 600_000 }] },
+		});
+		changeProbe.startChangeProbeScheduler();
+		await changeProbe.probeStatePublishedForTest();
+		const status = await changeProbe.changeProbeStatus();
+		assert.ok(status.canary.nextRunAt > Date.now(), `next run ${new Date(status.canary.nextRunAt).toISOString()}`);
+	} finally {
+		t.mock.timers.reset();
+		if (hostTz === undefined) delete process.env.TZ;
+		else process.env.TZ = hostTz;
+		await applyProbeConfig({ enabled: false });
+	}
 });

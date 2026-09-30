@@ -604,7 +604,8 @@ export const METRICS = Object.freeze({
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
 			'demand_*), per visit-ring re-union (demand_fill, demand_false_positive), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
-			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
+			'per probed batch of a probe pass (the probe_* pass counters, cycle_behind included — increments since ' +
+			'the previous batch; before v0.97.0, once per finished pass), per gated cacheable miss (discovery_gated), ' +
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
@@ -636,11 +637,33 @@ export const METRICS = Object.freeze({
 			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
 			'its outcome — `lowered` is work accepted, everything else is a refusal with its reason; the feature ' +
 			'is off by default, so no rows means disabled. ' +
-			'probe_* = the change probe, per finished pass (sweep and canary alike): probed = attempts, of which ' +
+			'probe_* = the change probe, sweep and canary alike, emitted per probed batch as increments (so a ' +
+			'pass that throws or is cut short has reported everything up to its last batch, and a long pass is ' +
+			'not one row a lost analytics window can drop whole): probed = attempts, of which ' +
 			'seeded (first observation stored) + changed + failed, the remainder unchanged; triggered = changes ' +
 			'acted on (page hard-expired, render filed ahead of rotation): every change the page has not ' +
 			'caught up with, and every page mismatch on an unchanged signature, is acted on unless the pass is a ' +
-			'dry run — nothing is deferred; an action that fails is in the pass record, not here; ' +
+			'dry run — nothing is deferred; errors = actions that threw (each is retried once when the walk ends — ' +
+			'the pass record has retried/recovered/unacted — and a change still unacted is found again on its next ' +
+			'probe; expect zero); caught_up = changes the cached page already showed (a mapped pageCheck field ' +
+			'agreed with the new value), baseline moved, nothing triggered — they overlay changed; ignored = changes ' +
+			'confined to pageCheck.ignoreChanges slots, not counted as changed; probe_anchor = one emit per ' +
+			'anchor in anchored mode, detail = what became of it: on_time, interrupted (a dry-run or reseed pass ' +
+			'was asked to stand down first), chained (it waited for a pass that acts), caught_up (the process was ' +
+			'down when it came; run at boot), skipped (served by a later anchor’s pass, or abandoned by a ' +
+			're-arm) — anything but on_time is logged, and a skipped is a night whose pass started late; ' +
+			'probe_detection_lag = a duration (ms) per origin change a SWEEP detects, two upper bounds on how long ' +
+			'the change went unseen (no per-URL "last seen unchanged" is stored, so the lag itself cannot be ' +
+			'measured): detail pass = since the start of the pass that found it (for an anchored pass, since the ' +
+			'anchor — the lag itself for a change that landed on schedule), detail previous_pass = since the ' +
+			'start of the pass before (a true bound when that pass covered the URL); context = the rule label. ' +
+			'Read percentiles, never the total; probe_render_mismatch = the render check (changeProbe.renderCheck): ' +
+			'a render that landed disagreeing with the probe’s last observation of the origin, detail = refiled ' +
+			'(hard-expired and re-filed as a change), bounded (already re-filed once against that observation — a ' +
+			'page that disagrees every time; left to the pass), untrusted (the observation predates the last ' +
+			'anchor or trip and no pass has seen the URL since, so the render may just be newer — nothing done), ' +
+			'dry_run, error. refiled is stale renders caught before they served a pass-length; a steady bounded ' +
+			'is pages the endpoint and the page genuinely disagree on; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -695,10 +718,10 @@ export const METRICS = Object.freeze({
 			'together by age: a gone target’s own recheck lands in 14d+ (render.suppression.gone.recheckInterval), ' +
 			'so http-gone in the younger buckets is an EARLY recheck — a reopen, an arrival or an operator ' +
 			'revalidate — and lifted / (lifted + held) there is how often the evidence that filed it was right. ' +
-			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
-			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
-			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
-			'sweepInterval and real cadence is being eaten. probe_throttled = probes the origin refused ' +
+			'probe_fresh = probes SKIPPED because the URL’s baseline was written since the pass (or the pass it ' +
+			'resumes) began, i.e. this pass already probed it — the overlap a resume re-walks; from v0.97.0 it ' +
+			'is near zero in a settled pass (before, it skipped any baseline younger than reprobeAfter, which ' +
+			'meant every recent CHANGE). probe_throttled = probes the origin refused ' +
 			'with pushback (429/502/503/504/timeout), which is what drives the sweep to halve its rate: ' +
 			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it. ' +
 			'due_now_forward = a render-now, revalidate, rejoin or probe filing made on a node that does not own the ' +
@@ -711,7 +734,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted, suppression_held and due_now_forward are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'gone_reopen, suppression_lifted, suppression_held and due_now_forward are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -764,6 +787,12 @@ export const METRICS = Object.freeze({
 					'probe_unreadable',
 					'probe_page_mismatch',
 					'probe_cycle_behind',
+					'probe_errors',
+					'probe_caught_up',
+					'probe_ignored',
+					'probe_anchor',
+					'probe_detection_lag',
+					'probe_render_mismatch',
 					'discovery_gated',
 					'entity_gate',
 					'raw_cache',
@@ -819,7 +848,8 @@ export const METRICS = Object.freeze({
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
-					'fell-back, skipped). Other series: null.',
+					'fell-back, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (refiled, bounded, untrusted, dry_run, error). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -829,7 +859,8 @@ export const METRICS = Object.freeze({
 					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
-					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. Other series: null.',
+					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
+					'Other series: null.',
 			},
 		},
 	}),
@@ -1087,6 +1118,11 @@ export const metrics = Object.freeze({
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 
-	/** One series of a finished change-probe pass — prerender_ops `probe_<series>`. */
-	changeProbe: (value, series) => server.recordAnalytics(value, 'prerender_ops', `probe_${series}`, null, null),
+	/**
+	 * One change-probe series — prerender_ops `probe_<series>`. The pass counters pass neither label;
+	 * `probe_anchor` names its outcome, `probe_detection_lag` its bound and rule, `probe_render_mismatch`
+	 * its outcome.
+	 */
+	changeProbe: (value, series, detail = null, context = null) =>
+		server.recordAnalytics(value, 'prerender_ops', `probe_${series}`, detail, context),
 });

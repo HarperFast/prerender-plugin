@@ -431,6 +431,27 @@ test('claimsDisagree compares each dimension only when BOTH sides claim it', asy
 	assert.equal(claimsDisagree(JSON.stringify([[], null]), JSON.stringify([['29.99'], true])), false);
 });
 
+test('compareClaims is THREE-WAY: agreed, disagreed, or nothing comparable', async () => {
+	// P1: `claimsDisagree` answered false both on agreement and when no dimension could be compared, and
+	// the page-verification proof took that false as an agreement.
+	const { compareClaims } = await import('../src/util/changeProbeSpec.js');
+	assert.equal(compareClaims(JSON.stringify([['35.99'], true]), JSON.stringify([['35.99'], true])), true);
+	assert.equal(
+		compareClaims(JSON.stringify([['35.99'], null]), JSON.stringify([['35.99'], null])),
+		true,
+		'price alone'
+	);
+	assert.equal(compareClaims(JSON.stringify([[], false]), JSON.stringify([[], false])), true, 'availability alone');
+	assert.equal(compareClaims(JSON.stringify([['35.99'], false]), JSON.stringify([['35.99'], true])), false);
+	assert.equal(compareClaims(JSON.stringify([['35.99'], true]), JSON.stringify([['29.99'], true])), false);
+	// Nothing comparable: page availability unrecognised and endpoint price null; no readable page price.
+	assert.equal(compareClaims(JSON.stringify([['35.99'], null]), JSON.stringify([[], true])), null);
+	assert.equal(compareClaims(JSON.stringify([[], null]), JSON.stringify([['29.99'], true])), null);
+	assert.equal(compareClaims(null, JSON.stringify([['35.99'], true])), null);
+	assert.equal(compareClaims('not json', JSON.stringify([['35.99'], true])), null);
+	assert.equal(compareClaims(JSON.stringify({ a: 1 }), JSON.stringify([['35.99'], true])), null);
+});
+
 test('apiClaimOf projects through the mapping; absent mapped fields yield no claim', async () => {
 	const pc = { priceFrom: 2, availableFrom: 3 };
 	assert.deepEqual(JSON.parse(apiClaimOf([39.99, 35.99, 35.99, true], pc)), [['35.99'], true]);

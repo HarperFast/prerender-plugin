@@ -181,6 +181,35 @@ Notes that bite:
   gate name `entity` (never in a dry run), so every view of what the gates hold out includes them;
   unlike the `route`/`bot` gates, `entity` is evaluated only for URLs with no target row, so it counts
   refused mints rather than gated misses on known targets.
+- **The change probe's `probe_*` series changed shape in v0.97.0, and the table row above predates
+  it.** (1) The pass counters are emitted **per probed batch as increments**, not once when a pass
+  ends: a nine-hour pass is no longer one row that a dropped analytics window loses whole, and a pass
+  that throws or is cut short has reported everything up to its last batch. Read `total`; `count` is
+  emits, not passes. (2) New counters beside them: `probe_errors` (actions that threw — each is
+  retried once when the walk ends, and the pass record carries `retried` / `recovered` / `unacted`;
+  expect zero), `probe_caught_up` (changes the cached page already showed on a mapped
+  `pageCheck.fields` slot — nothing triggered; overlays `changed`) and `probe_ignored` (changes
+  confined to `pageCheck.ignoreChanges`; not counted as `changed`). (3) `probe_fresh` now counts only
+  URLs whose baseline was written since the pass — or the pass it resumes — began, i.e. that pass had
+  already probed them; near zero in a settled pass. It used to count baselines younger than
+  `changeProbe.reprobeAfter` (now retired), which selected every recently CHANGED URL. (4)
+  `probe_anchor` (anchored mode): one emit per anchor, detail = what became of it — `on_time`,
+  `interrupted` (a dry-run or reseed pass was asked to stand down first), `chained` (it waited for a
+  pass that acts), `caught_up` (the node was down when it came; run at boot) or `skipped` (served by
+  a later anchor's pass, or abandoned by a re-arm). **Anything but `on_time` means that night's pass
+  started late; `skipped` means an anchor got no pass of its own.**
+  (5) `probe_detection_lag` — a **duration** (ms; read percentiles, never the total), one pair per
+  origin change a sweep detects, context = rule label. No per-URL "last seen unchanged" is stored (an
+  unchanged probe writes nothing), so the lag is bounded, not measured: detail `pass` = since the
+  start of the pass that found it — for an anchored pass, since the ANCHOR, which for a change that
+  landed on schedule is the lag itself; detail `previous_pass` = since the start of the pass before,
+  a true upper bound whenever that pass covered the URL. The G1 detection-latency number. (6)
+  `probe_render_mismatch` — the render check (`changeProbe.renderCheck`): a render that landed
+  disagreeing with the probe's last observation of the origin. Detail `refiled` (hard-expired and
+  re-filed as a change — a stale render caught before it served for a pass), `bounded` (already
+  re-filed once against that observation: a page that disagrees every time, left to the pass),
+  `untrusted` (the observation predates the last anchor or canary trip and no pass has seen the URL
+  since, so the render may just be newer — nothing done), `dry_run`, `error`.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. Since v0.93.0 it comes from the queue keeper and is exact; it is absent while the

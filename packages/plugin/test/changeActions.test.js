@@ -146,3 +146,72 @@ test('lowestInFlight names the earliest URL still acting, and the time spent wai
 	await actions.drain();
 	assert.equal(actions.lowestInFlight, null);
 });
+
+test('A4: a failed action is retried ONCE after the walk; a success counts recovered and writes the baseline', async () => {
+	// The walk cursor has moved past a failed URL, so without the retry its page — known wrong — serves
+	// until the next pass reaches it again: in anchored mode, tomorrow.
+	const attempts = new Map();
+	const written = [];
+	const retries = [];
+	const actions = createChangeActions({
+		act: async (row) => {
+			const n = (attempts.get(row.url) ?? 0) + 1;
+			attempts.set(row.url, n);
+			// `a` fails once (transient), `b` fails every time.
+			if (row.url === 'b' || n === 1) throw new Error('write refused');
+		},
+		write: async (url) => written.push(url),
+		onError: (e, it, { retry }) => retries.push([it.row.url, retry]),
+		concurrency: 2,
+	});
+	await actions.submit(item('a'));
+	await actions.submit(item('b'));
+	await actions.drain();
+	assert.deepEqual(written, [], 'nothing acted on the first attempt');
+	await actions.retryFailed();
+	assert.deepEqual(written, ['a'], 'the transient failure recovered and its baseline was written');
+	assert.equal(attempts.get('a'), 2);
+	assert.equal(attempts.get('b'), 2, 'retried once, not forever');
+	assert.equal(actions.stats.errors, 2, 'errors counts first attempts');
+	assert.equal(actions.stats.retried, 2);
+	assert.equal(actions.stats.recovered, 1);
+	assert.equal(actions.stats.triggered, 1);
+	assert.deepEqual(retries, [
+		['a', false],
+		['b', false],
+		['b', true],
+	]);
+	await actions.retryFailed();
+	assert.equal(attempts.get('b'), 2, 'a retry that fails is not queued again');
+});
+
+test('A4: the retry list is BOUNDED — failures past it are counted and left to the next probe', async () => {
+	const actions = createChangeActions({
+		act: async () => {
+			throw new Error('refused');
+		},
+		write: async () => {},
+		retryLimit: 2,
+	});
+	for (const url of ['a', 'b', 'c', 'd']) await actions.submit(item(url));
+	await actions.drain();
+	await actions.retryFailed();
+	assert.equal(actions.stats.errors, 4);
+	assert.equal(actions.stats.retried, 2);
+	assert.equal(actions.stats.retrySkipped, 2);
+});
+
+test('A4: retries run after stop() — stopping ends the walk’s submissions, not work it already decided on', async () => {
+	let calls = 0;
+	const actions = createChangeActions({
+		act: async () => {
+			if (calls++ === 0) throw new Error('refused');
+		},
+		write: async () => {},
+	});
+	await actions.submit(item('a'));
+	await actions.drain();
+	actions.stop();
+	await actions.retryFailed();
+	assert.equal(actions.stats.recovered, 1);
+});

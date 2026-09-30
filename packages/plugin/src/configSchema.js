@@ -1154,9 +1154,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'moves on a schedule — a retailer whose prices change only at its own midnight — this puts ' +
 					'the walk right after the change instead of spreading it over the day, so detection latency ' +
 					'is the pass length rather than up to a cycle, and the corpus is current for the day by the ' +
-					'time the pass ends. No pass runs at boot in this mode (baselines persist; a restart waits ' +
-					'for the anchor). The canary keeps its own cadence, so an off-schedule mass change is still ' +
-					'caught; only the full walk is anchored.\n\n' +
+					'time the pass ends. A restart does not start a pass of its own in this mode (baselines ' +
+					'persist): it RESUMES a pass it cut short from the walk cursor, and CATCHES UP the pass for an ' +
+					'anchor it was down for (no acting pass started since the most recent anchor). An anchor that ' +
+					'fires while another sweep holds the node interrupts a dry run or a reseed, and waits for any ' +
+					'other pass and runs after it — never skipped silently (`probe_anchor`). The canary keeps its ' +
+					'own cadence, so an off-schedule mass change is still caught; only the full walk is anchored.\n\n' +
 					'Switching is safe in every direction and takes effect on the next config apply; a pass ' +
 					'in flight finishes under the rules it started with.',
 				{ enum: ['interval', 'continuous', 'anchored'] }
@@ -1169,9 +1172,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'tail of the old one.',
 				{ nonEmpty: true }
 			),
-			anchorTimezone: option('UTC', 'ANCHORED MODE ONLY: IANA timezone `anchorTime` is interpreted in.', {
-				nonEmpty: true,
-			}),
+			anchorTimezone: option(
+				'UTC',
+				'IANA timezone `anchorTime` (anchored mode) and the `canary.schedule` windows are interpreted in.',
+				{ nonEmpty: true }
+			),
 			anchorWindow: option(
 				0,
 				'ANCHORED MODE ONLY: wall-clock budget the daily pass paces itself to, like `cycleTarget` ' +
@@ -1259,15 +1264,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			reprobeAfter: option(
 				12 * HOUR,
-				'Skip a URL whose stored baseline is younger than this. What makes a sweep RESUMABLE: the ' +
-					'walk position is in memory, so a restart mid-pass otherwise re-probes every URL the pass ' +
-					'had already covered — hours of origin requests that can only confirm what is already ' +
-					'stored. With this set, a restarted pass skips that ground in seconds and reaches new work ' +
-					'immediately. Keep it comfortably BELOW `sweepInterval` (half is the default) or the skip ' +
-					'starts eating real passes: a URL probed at the very end of one pass would be skipped by ' +
-					'the next one, and its cadence would silently stretch. 0 disables skipping. The canary ' +
-					'never skips (its whole job is the fast cadence), and a canary-triggered RESEED never ' +
-					'skips (every baseline is known-stale after a mass change).',
+				'RETIRED in v0.97.0 — accepted so existing configs and overrides stay valid, read by nothing. It ' +
+					'skipped a URL whose stored baseline was younger than this, meant to spare a restarted pass the ' +
+					'ground it had covered. But a baseline is only WRITTEN on a change, a seed or a re-baseline — an ' +
+					'unchanged probe writes nothing — so the age test skipped exactly the URLs that had recently ' +
+					'CHANGED and never the quiet ones: a change caught by an off-schedule pass was then skipped by the ' +
+					'next scheduled pass, and a reprice landing in between waited a further full pass. A pass now ' +
+					'skips only URLs written since IT (or the pass it resumes) began, which needs no setting, and an ' +
+					'interrupted anchored pass resumes from its walk cursor. The canary never skipped and still does ' +
+					'not. Remove it from config at leisure.',
 				{ unit: 'ms', min: 0 }
 			),
 			backoffMax: option(
@@ -1368,6 +1373,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 				}
 			),
+			renderCheck: option(
+				true,
+				'Check each render against the probe’s last observation of the origin as it lands (rules with the ' +
+					'`pageCheck` price/availability pair only): a page whose claim DISAGREES with the stored endpoint ' +
+					'signature is hard-expired and its render re-filed ahead of rotation, exactly as a detected change ' +
+					'is. It catches a render claimed before a probe found a change and landing after it, and a render ' +
+					'that captured a stale CDN or origin copy — pages the pass would otherwise not look at again until ' +
+					'its next run. The stored signature is trusted only when the probe is known to have observed the ' +
+					'URL since the origin last moved (the most recent anchor in anchored mode; the start of an active ' +
+					'invalidation), so a render newer than the probe’s view is never expired on its stale evidence, ' +
+					'and one re-file per stored observation bounds a page that disagrees every time. Dry run counts ' +
+					'only. Outcomes are `probe_render_mismatch`. Costs no read or write on a render that agrees.'
+			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
 				min: SECOND,
@@ -1398,11 +1416,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
 					'replaces it.)',
 				{
-					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
-						unit: 'ms',
-						min: 0,
-						max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
-					}),
+					interval: option(
+						30 * MINUTE,
+						'How often the cohort is probed — all day, or outside the `schedule` windows when one is set. ' +
+							'0 disables the canary (with a schedule: disables it outside the windows).',
+						{
+							unit: 'ms',
+							min: 0,
+							max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
+						}
+					),
+					schedule: option(
+						[],
+						'OPTIONAL time-of-day cadence; empty (the default) probes every `interval`, all day. Each entry is ' +
+							'`{ from: "HH:MM", to: "HH:MM", interval: <ms, >= 60000> }` in `anchorTimezone` (the anchor’s zone ' +
+							'and DST handling): inside the window the cohort is probed at its start and then every ' +
+							'`interval`; outside every window, every `canary.interval` (0 = not at all). A window may wrap ' +
+							'midnight; the first one containing an instant applies; an invalid entry is dropped with a ' +
+							'warning.\n\n' +
+							'WHY. On a site that reprices on a schedule a mass change comes at one time of day, and a ' +
+							'500-URL cohort every 30 minutes around the clock is ~24k origin calls per node per day spent ' +
+							'mostly confirming nothing happened. E.g. `interval: 14400000` (4h) with `schedule: [{ from: ' +
+							'"23:50", to: "03:00", interval: 600000 }]` (10 min) probes densely across a midnight reprice ' +
+							'and every 4h elsewhere — ' +
+							'but an OFF-schedule mass change is then seen up to `interval` late, so keep the outside ' +
+							'interval within what that exposure can bear.',
+						{ itemType: 'object' }
+					),
 					count: option(
 						500,
 						'Cohort size per rule per node. At the default threshold this resolves a mass change with ' +
