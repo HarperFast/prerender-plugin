@@ -5,8 +5,8 @@
  *
  * COST: no scan, no table read, no await. Everything is a syscall-sized `os`/`process` call, one
  * read of `/proc/meminfo` (procfs — generated in memory, never touches a disk), and two small
- * package.json reads memoized for the life of the worker. It runs on every overview request, on
- * workers that also serve bot traffic, so it has to stay that cheap.
+ * package.json reads, one at module load and one memoized on first use. It runs on every overview
+ * request, on workers that also serve bot traffic, so it has to stay that cheap.
  *
  * NEVER THROWS. Each field is guarded on its own: a failure costs that field (null), not the
  * overview. A health strip that 500s the page it sits on is worse than one with a gap.
@@ -81,18 +81,28 @@ const readJson = (path) => {
 	}
 };
 
-// Memoized on first use: both files are fixed for the life of the process (a deploy restarts it).
-let pluginVersionMemo;
+/**
+ * This package's version, read ONCE, when this module loads — from the package.json two levels above
+ * this file (src/util/ → root). Checked by name, so an unexpected install layout yields null rather
+ * than another package's version.
+ *
+ * AT LOAD, NOT ON FIRST USE. The file on disk is not the running code: a deploy that does not restart
+ * Harper installs the new package.json and leaves every worker on the old modules. Read lazily, the
+ * first overview after such a deploy reported the staged version as the running one, on exactly the
+ * node where an operator was checking whether the deploy took. Read at load, it names the code this
+ * worker actually loaded, since the modules and this read are the same moment.
+ */
+const loadedPluginVersion = (() => {
+	const pkg = safe(() => readJson(new URL('../../package.json', import.meta.url)));
+	return pkg?.name === '@harperfast/prerender' && typeof pkg.version === 'string' ? pkg.version : null;
+})();
+
+// Memoized on first use: Harper's version cannot change under a running process.
 let harperVersionMemo;
 
-/** This package's version, from the package.json two levels above this file (src/util/ → root). */
+/** The version of the plugin code this worker loaded. See `loadedPluginVersion`. */
 export function pluginVersion() {
-	if (pluginVersionMemo === undefined) {
-		const pkg = safe(() => readJson(new URL('../../package.json', import.meta.url)));
-		// Checked by name, so an unexpected install layout yields null rather than another package's version.
-		pluginVersionMemo = pkg?.name === '@harperfast/prerender' && typeof pkg.version === 'string' ? pkg.version : null;
-	}
-	return pluginVersionMemo;
+	return loadedPluginVersion;
 }
 
 const HARPER_PACKAGES = new Set(['harper', 'harperdb', '@harperfast/harper', '@harperfast/harper-pro']);

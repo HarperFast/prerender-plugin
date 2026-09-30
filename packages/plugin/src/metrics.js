@@ -292,8 +292,8 @@ export const METRICS = Object.freeze({
 		emittedBy: 'resources/RenderQueue.js',
 		cadence:
 			'per render result posted back by a browser worker: one `outcome` row always (a result is one URL — ' +
-			'every device variant in it — since v0.66.0), and one `time_ms` sample per device variant the worker ' +
-			'timed',
+			'every device variant in it — since v0.66.0), one `time_ms` sample per device variant the worker ' +
+			'timed, and one `change_lag_ms` sample per URL whose render landed while its row carried a change mark',
 		summary: 'The render fleet, in one scan: how long each render took, and what became of it.',
 		usefulFor:
 			'`time_ms` is fleet capacity (renders/hour/pod = concurrency ÷ time_ms) and what a settle-tuning ' +
@@ -310,20 +310,31 @@ export const METRICS = Object.freeze({
 		dimensions: {
 			path: {
 				name: 'series',
-				values: ['time_ms', 'outcome'],
-				description: 'time_ms = duration distribution (ms). outcome = counter of what became of the result.',
+				values: ['time_ms', 'outcome', 'change_lag_ms'],
+				description:
+					'time_ms = duration distribution (ms). outcome = counter of what became of the result. ' +
+					'change_lag_ms (plugin v0.97.0) = TRIGGER TO CACHE: ms from the instant the origin was found ' +
+					'changed (`changedAt` — the change probe, a gone reopen, a sitemap departure or rejoin) to the ' +
+					'render that replaced the page landing, one sample per URL, emitted where that render clears the ' +
+					'mark. Every millisecond of it the page was hard-expired and bots were served the origin; its p95 ' +
+					'per route against the probe cadence is how fresh a detected change actually gets. A render that ' +
+					'did not land (a failure, a render granted before the mark) emits nothing, so the lag keeps ' +
+					'growing until one does.',
 			},
 			method: {
-				name: 'statusCode (time_ms) / outcome (outcome)',
+				name: 'statusCode (time_ms) / outcome (outcome) / route (change_lag_ms)',
 				description:
 					'time_ms: HTTP status the render observed — a NUMBER at the emit site (for a redirect bail, ' +
 					'the FIRST hop’s 3xx). outcome: rendered | suppressed | auth-failure | transient | failed | ' +
-					'redirect — rendered = usable result, suppressed = genuine non-indexable verdict (target moves ' +
-					'to its recheck cadence), auth-failure = 401/403 kept and retried, transient = 408/429/5xx kept ' +
-					'and retried, failed = the render itself broke, redirect = the page moved or bounced.',
+					'redirect | superseded — rendered = usable result, suppressed = genuine non-indexable verdict ' +
+					'(target moves to its recheck cadence), auth-failure = 401/403 kept and retried, transient = ' +
+					'408/429/5xx kept and retried, failed = the render itself broke, redirect = the page moved or ' +
+					'bounced, superseded = the result was dropped whole because a newer fact outranks it (plugin ' +
+					'v0.97.0; see its detail). change_lag_ms: the route label, as route_serve.path (the matched ' +
+					"route's path, else 'unrouted').",
 			},
 			type: {
-				name: 'candidacy (time_ms) / detail (outcome)',
+				name: 'candidacy (time_ms) / detail (outcome) / unused (change_lag_ms)',
 				values: [
 					'candidate',
 					'non-candidate',
@@ -347,6 +358,8 @@ export const METRICS = Object.freeze({
 					'permanent',
 					'navigation',
 					'not-attempted',
+					'newer-lease',
+					'changed-during-render',
 				],
 				description:
 					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
@@ -364,7 +377,41 @@ export const METRICS = Object.freeze({
 					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
 					'it — a render is wasted every interval until fixed), non-indexable-destination (source ' +
 					'retired, destination suppressed), temporary (kept, strike counted), permanent (source retired ' +
-					'in favor of the destination).',
+					'in favor of the destination); superseded: newer-lease (the render began before the key was ' +
+					'leased to another renderer — a result that outlived its lease; nothing stored, and the newer ' +
+					'lease is not released) / changed-during-render (its lease predates the row’s change mark, so ' +
+					'it may show the content from before the change; nothing stored, the row stays due and marked ' +
+					'and renders again at once).',
+			},
+		},
+	}),
+
+	render_size: metric('render_size', {
+		kind: 'value',
+		unit: 'bytes',
+		emittedBy: 'resources/RenderQueue.js',
+		cadence: 'one sample per device page a render result stored',
+		summary: 'How big each stored page is DECODED — the HTML a crawler parses, not the bytes on the wire.',
+		usefulFor:
+			'Crawler size limits are on the decoded document (Bing’s soft limit is 1 MB), and a page’s size ' +
+			'swings with its content (a product page with thousands of reviews is several times one with none). ' +
+			'`count` per band over the route’s total is the exact share of its renders over each threshold — ' +
+			'"share of product-page renders over 1 MB" is the rows with band 1m-2m or 2m-plus — and the values ' +
+			'inside a band are its distribution.',
+		caveats:
+			'Measured for a gzip body (its trailer states the decoded length, so it costs nothing) and an ' +
+			'unencoded one — the render fleet’s default and only configured encoding. A page stored in any ' +
+			'other encoding emits NO sample rather than paying a decompression per render on the result path. ' +
+			'Pages stored, not pages served: a page is counted once per render, however often it is served.',
+		dimensions: {
+			path: { name: 'route', description: 'As route_serve.path.' },
+			method: { name: 'deviceType', values: DEVICE_TYPES, description: 'The stored page’s device.' },
+			type: {
+				name: 'band',
+				values: ['under-500k', '500k-1m', '1m-2m', '2m-plus'],
+				description:
+					'Decoded size band, decimal units (1m = 1,000,000 bytes, the stricter reading of a "1 MB" limit): ' +
+					'the three edges are the ones a size budget is judged against.',
 			},
 		},
 	}),
@@ -471,8 +518,8 @@ export const METRICS = Object.freeze({
 		cadence:
 			'snapshot gauges once per backlog snapshot per node (worker 0, management.backlogSnapshotInterval); ' +
 			'reconcile_* once per sweep per node; keeper_load_ms once per keeper load, keeper_publish_ms once per ' +
-			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms and keeper_repaired once ' +
-			'per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
+			'keeper publish (worker 0, queue.keeper.publishInterval), keeper_verify_ms, keeper_repaired and ' +
+			'keeper_unschedulable once per verification walk; claim_granted / claim_stale / claim_wedged per claim that had any',
 		summary: 'Every queue signal under one name: backlog gauges, the queue keeper, schedule-gap repairs.',
 		usefulFor:
 			'The queue’s alertable surface, readable in ONE get_analytics scan (a metric name is a scan — see the ' +
@@ -498,6 +545,7 @@ export const METRICS = Object.freeze({
 					'keeper_publish_ms',
 					'keeper_repaired',
 					'keeper_verify_ms',
+					'keeper_unschedulable',
 					'claim_stale',
 					'claim_wedged',
 				],
@@ -521,12 +569,17 @@ export const METRICS = Object.freeze({
 					'(missing, wrong minute or class, or deleted) and repaired; expect 0, and treat a steady count as ' +
 					'its subscription losing writes. ' +
 					'keeper_verify_ms = one verification walk of the whole table (queue.keeper.verifyInterval). ' +
+					'keeper_unschedulable = rows this node owns whose nextRenderTime is null or negative, found by a ' +
+					'verification walk (emitted only when non-zero): the keeper cannot hold them and no claim can grant ' +
+					'them, so those URLs never render until something re-files them. Not a repair, and not counted in ' +
+					'keeper_repaired. ' +
 					'claim_stale = ready-set entries a claim skipped because the durable row was no longer due ' +
 					'(rendered, rescheduled or deleted after the keeper published it): renders the check saved. A ' +
 					'steady trickle is normal; a large, sustained count means the keeper is seeing writes late. ' +
 					'claim_wedged = keys a claim held back instead of granting (an exponential hold in the lease table, ' +
-					'capped at the cadence) because their last leases all expired with no result: a renderer crashing ' +
-					'on the URL, or, when many appear at once, results not reaching this node. The log names them.',
+					'capped at the cadence) because their last leases all ended without moving the row — expired with no ' +
+					'result, or (since v0.97.0) released by a result whose commit then failed: a renderer crashing on ' +
+					'the URL, or, when many appear at once, results not reaching this node. The log names them.',
 			},
 			method: {
 				name: 'source (claim_granted)',
@@ -544,17 +597,19 @@ export const METRICS = Object.freeze({
 		emittedBy:
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
-			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js',
+			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
+			'util/renderSchedule.js (due_now_forward)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
 			'demand_*), per visit-ring re-union (demand_fill, demand_false_positive), ' +
 			'per failed epoch read (invalidation_error), per heal attempt (invalidation_reenqueue), ' +
-			'per finished probe pass (probe_*, cycle_behind included), per gated cacheable miss (discovery_gated), ' +
+			'per probed batch of a probe pass (the probe_* pass counters, cycle_behind included — increments since ' +
+			'the previous batch; before v0.97.0, once per finished pass), per gated cacheable miss (discovery_gated), ' +
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
-			'or suppression_held)',
+			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -582,11 +637,39 @@ export const METRICS = Object.freeze({
 			'`lkg-expired` is the serious kind. invalidation_reenqueue = every demand-driven heal attempt with ' +
 			'its outcome — `lowered` is work accepted, everything else is a refusal with its reason; the feature ' +
 			'is off by default, so no rows means disabled. ' +
-			'probe_* = the change probe, per finished pass (sweep and canary alike): probed = attempts, of which ' +
+			'probe_* = the change probe, sweep and canary alike, emitted per probed batch as increments (so a ' +
+			'pass that throws or is cut short has reported everything up to its last batch, and a long pass is ' +
+			'not one row a lost analytics window can drop whole): probed = attempts, of which ' +
 			'seeded (first observation stored) + changed + failed, the remainder unchanged; triggered = changes ' +
 			'acted on (page hard-expired, render filed ahead of rotation): every change the page has not ' +
 			'caught up with, and every page mismatch on an unchanged signature, is acted on unless the pass is a ' +
-			'dry run — nothing is deferred; an action that fails is in the pass record, not here; ' +
+			'dry run — nothing is deferred; errors = actions that threw (each is retried once when the walk ends — ' +
+			'the pass record has retried/recovered/unacted — and a change still unacted is found again on its next ' +
+			'probe; expect zero); caught_up = changes the cached page already showed (a mapped pageCheck field ' +
+			'agreed with the new value, or every page of it was re-rendered after an active invalidation\u2019s trip and ' +
+			'shows the change), baseline moved, nothing triggered — they overlay changed; covered = changes an active ' +
+			'invalidation already answers (every page refused, or served on a page verification): not counted ' +
+			'changed, not acted on, baseline kept, re-counted each pass until the page re-renders; ignored = changes ' +
+			'confined to pageCheck.ignoreChanges slots, not counted as changed; probe_anchor = one emit per ' +
+			'anchor in anchored mode, detail = what became of it: on_time, interrupted (a dry-run or reseed pass ' +
+			'was asked to stand down first), chained (it waited for a pass that acts), caught_up (the process was ' +
+			'down when it came; run at boot), skipped (served by a later anchor’s pass, or abandoned by a ' +
+			're-arm) — anything but on_time is logged, and a skipped is a night whose pass started late; ' +
+			'probe_detection_lag = a duration (ms) per origin change a SWEEP detects, two upper bounds on how long ' +
+			'the change went unseen (no per-URL "last seen unchanged" is stored, so the lag itself cannot be ' +
+			'measured): detail pass = since the start of the pass that found it (for an anchored pass, since the ' +
+			'anchor — the lag itself for a change that landed on schedule), detail previous_pass = since the ' +
+			'start of the pass before (a true bound when that pass covered the URL); context = the rule label. ' +
+			'Read percentiles, never the total; probe_render_mismatch = the render check (changeProbe.renderCheck): ' +
+			'a render that landed disagreeing with the probe’s last observation of the origin, detail = rechecked ' +
+			'(one confirming origin request made — count these as origin calls), then confirmed (the origin still ' +
+			'disagreed with the page: hard-expired and re-filed as a change), cleared (the origin had moved and ' +
+			'the page shows it: baseline updated, nothing expired), recheck_failed or recheck_inconclusive; or, with ' +
+			'no request, bounded (already confirmed once against that observation — a page that disagrees every ' +
+			'time; left to the pass), untrusted (the origin is known to have moved since the probe last looked, so ' +
+			'the render may just be newer — left to the pass), shed (no slot within a minute in the budget a running sweep leaves), ' +
+			'dry_run, error. confirmed is stale renders caught before they served a pass-length; a steady bounded ' +
+			'is pages the endpoint and the page genuinely disagree on; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
 			'verdicts; probe_invalidated counts the bulk invalidations the canary actually recorded (a trip ' +
@@ -641,18 +724,25 @@ export const METRICS = Object.freeze({
 			'together by age: a gone target’s own recheck lands in 14d+ (render.suppression.gone.recheckInterval), ' +
 			'so http-gone in the younger buckets is an EARLY recheck — a reopen, an arrival or an operator ' +
 			'revalidate — and lifted / (lifted + held) there is how often the evidence that filed it was right. ' +
-			'probe_fresh = probes SKIPPED because a stored baseline was younger than reprobeAfter — the ' +
-			'work a restarted sweep did not have to redo; a large share right after a restart is the ' +
-			'feature working, a large share in a settled pass means reprobeAfter is too close to ' +
-			'sweepInterval and real cadence is being eaten. probe_throttled = probes the origin refused ' +
+			'probe_fresh = probes SKIPPED because the URL’s baseline was written since the pass (or the pass it ' +
+			'resumes) began, i.e. this pass already probed it — the overlap a resume re-walks; from v0.97.0 it ' +
+			'is near zero in a settled pass (before, it skipped any baseline younger than reprobeAfter, which ' +
+			'meant every recent CHANGE). probe_throttled = probes the origin refused ' +
 			'with pushback (429/502/503/504/timeout), which is what drives the sweep to halve its rate: ' +
-			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it.',
+			'ALERT ON THIS — it is the only signal that the probe is loading an origin that cannot take it. ' +
+			'due_now_forward = a render-now, revalidate, rejoin or probe filing made on a node that does not own the ' +
+			'row (queue.dueNowForward): forwarded (the owner filed it, keeping an earlier due time and a change ' +
+			'mark), fell-back (the owner could not be asked or refused, so it was filed here as before 0.97.0 — ' +
+			'which can demote the owner’s row), timed-out (the owner did not answer in time and the ask carried ' +
+			'no change mark: left to the owner, not written here — see queue.dueNowForward), skipped (that owner ' +
+			'failed within the last 30s; filed here). A ' +
+			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted and suppression_held are counters; negative_gap is a duration (ms — read its percentiles, not its total); ' +
+			'gone_reopen, suppression_lifted, suppression_held and due_now_forward are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -705,6 +795,13 @@ export const METRICS = Object.freeze({
 					'probe_unreadable',
 					'probe_page_mismatch',
 					'probe_cycle_behind',
+					'probe_errors',
+					'probe_caught_up',
+					'probe_ignored',
+					'probe_covered',
+					'probe_anchor',
+					'probe_detection_lag',
+					'probe_render_mismatch',
 					'discovery_gated',
 					'entity_gate',
 					'raw_cache',
@@ -713,6 +810,7 @@ export const METRICS = Object.freeze({
 					'gone_reopen',
 					'suppression_lifted',
 					'suppression_held',
+					'due_now_forward',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -729,7 +827,8 @@ export const METRICS = Object.freeze({
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
-					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age.',
+					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age. ' +
+					'due_now_forward = off-owner "render this now" filings, by outcome.',
 			},
 			method: {
 				name: 'detail',
@@ -738,11 +837,15 @@ export const METRICS = Object.freeze({
 					"'passthrough' — declared, deliberately not prerendered), or 'overflow' — requests dropped from " +
 					'the per-bucket breakdown past ingress.report.maxBuckets, counted here so the metric’s volume ' +
 					'is never a lie (their class is unknown by construction). serve_error: the kind ' +
-					"('blob-stream' = a cached page’s stored body errored while streaming out). page_age_negative: " +
+					"('blob-stream' = a cached page’s stored body errored while streaming out; 'bad-header' = a " +
+					'stored or origin header value no response may carry, dropped from the response). page_age_negative: ' +
 					'the bot name. invalidation_error: the kind — read-error (the row read threw; a live ' +
 					'last-known-good answered, or the request failed OPEN), lkg-expired (it threw and the memory ' +
 					'was older than invalidation.lkgMaxAge — the serious one), invalid-row (row exists, shape ' +
-					'unusable), unknown-mode (treated as hard). invalidation_reenqueue: the outcome — lowered ' +
+					'unusable), unknown-mode (treated as hard) — those two once per view load, not per request — ' +
+					'view-read-error / view-subscribe-error (the worker’s in-memory view could not be read, or its ' +
+					'subscription could not be armed or closed: that worker resolves per request until the ' +
+					'invalidation.syncInterval backstop recovers it; correct, only dearer). invalidation_reenqueue: the outcome — lowered ' +
 					'(accepted), not-owner/paused/leased (correctly declined), no-schedule/no-target (nothing to ' +
 					'accelerate; no-schedule on a live URL is the terminal gap reconcile repairs), unhealable, ' +
 					"not-sooner, throttled, error. discovery_gated: which gate refused ('route' = the matched " +
@@ -757,7 +860,9 @@ export const METRICS = Object.freeze({
 					'recheck-error, recheck-busy, recheck-joined); or a dry-run verdict (would-serve, would-revalidate, ' +
 					'would-serve-live). gone_reopen: the outcome (filed, would-file, deduped, capped, error). ' +
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
-					'(http-gone, noindex, canonical-mismatch, ...). Other series: null.',
+					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
+					'fell-back, timed-out, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (rechecked, confirmed, cleared, recheck_failed, recheck_inconclusive, bounded, untrusted, shed, dry_run, error). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -767,7 +872,8 @@ export const METRICS = Object.freeze({
 					'that triggered the heal. discovery_gated and entity_gate: the bot name. gone_reopen: what saw the ' +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
-					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. Other series: null.',
+					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
+					'Other series: null.',
 			},
 		},
 	}),
@@ -871,6 +977,10 @@ export const describeMetrics = () => ({
 
 // ---------------------------------------------------------------------- emitters
 //
+/** `render_size`'s band for a decoded byte count — decimal edges, see its catalog entry. */
+export const renderSizeBand = (bytes) =>
+	bytes < 500_000 ? 'under-500k' : bytes < 1_000_000 ? '500k-1m' : bytes < 2_000_000 ? '1m-2m' : '2m-plus';
+
 // The ONLY places `server.recordAnalytics` is called. Each one fixes its metric's slot order to
 // what the catalog above documents, so a dashboard contract cannot be changed by editing an
 // argument list in an unrelated module. Value metrics take the value first, exactly as
@@ -911,6 +1021,11 @@ export const metrics = Object.freeze({
 
 	/** What became of one posted render result — exactly one call per result; the `render` outcome series. */
 	renderOutcome: (outcome, detail) => server.recordAnalytics(true, 'render', 'outcome', outcome, detail ?? null),
+	// trigger-to-cache: ms from the change mark to the render that cleared it, per route
+	renderChangeLag: (lagMs, route) => server.recordAnalytics(lagMs, 'render', 'change_lag_ms', route, null),
+	// a stored page's decoded size, per route and device, banded so a share over a threshold is a count
+	renderSize: (bytes, route, deviceType) =>
+		server.recordAnalytics(bytes, 'render_size', route, deviceType, renderSizeBand(bytes)),
 
 	/** How one render's readiness contract ended — one call per governed variant. */
 	renderReadiness: (contract, verdict) =>
@@ -1005,6 +1120,8 @@ export const metrics = Object.freeze({
 
 	/** A failed invalidation-epoch resolution — a prerender_ops series. */
 	invalidationError: (kind) => server.recordAnalytics(true, 'prerender_ops', 'invalidation_error', kind, null),
+	// a "render this now" filing on a node that does not own the row: forwarded to the owner, or filed here
+	dueNowForward: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'due_now_forward', outcome, null),
 
 	/** The outcome of one demand-driven heal attempt — a prerender_ops series. */
 	// outcome: 'written' | 'read-error' | 'write-error'. A skip is not counted here — the serve path's
@@ -1014,6 +1131,11 @@ export const metrics = Object.freeze({
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 
-	/** One series of a finished change-probe pass — prerender_ops `probe_<series>`. */
-	changeProbe: (value, series) => server.recordAnalytics(value, 'prerender_ops', `probe_${series}`, null, null),
+	/**
+	 * One change-probe series — prerender_ops `probe_<series>`. The pass counters pass neither label;
+	 * `probe_anchor` names its outcome, `probe_detection_lag` its bound and rule, `probe_render_mismatch`
+	 * its outcome.
+	 */
+	changeProbe: (value, series, detail = null, context = null) =>
+		server.recordAnalytics(value, 'prerender_ops', `probe_${series}`, detail, context),
 });

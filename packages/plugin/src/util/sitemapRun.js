@@ -96,6 +96,10 @@ export const createRefreshRun = ({
 	failedCap = 100,
 	departureCap = 0,
 	arrivalCap = 0,
+	// How many unlinked URLs to hold, with the child that unlinked them, for the post-walk
+	// corrections — the failed-walk re-link and the unchanged-lister re-attach (resources/Sitemap.js).
+	// Never fewer than `departureCap`: the departure candidates ARE the first `departureCap` of them.
+	holdCap = departureCap,
 	startedAt = Date.now(),
 } = {}) => {
 	const totals = {
@@ -112,6 +116,14 @@ export const createRefreshRun = ({
 		// new target; this counts the subset that was not capped, so `created - createdSoon` is the
 		// bulk-population overflow that fell back to the old behaviour.
 		createdSoon: 0,
+		// Re-attached targets on their FIRST listing — discovered from traffic, never listed before —
+		// whose render (or, for a row suppressed on a verdict a listing contradicts, whose recheck) was
+		// brought forward into `sitemap.newTargets.window`. Shares `maxPerRun` with `createdSoon`.
+		listedSoon: 0,
+		// Documents (and dropped children) `sitemap.shrinkGuard` refused as much shorter than the last one
+		// accepted, and the refused shrinks it accepted once they outlived a rebuild.
+		shrinkRefused: 0,
+		shrinkAccepted: 0,
 		removed: 0,
 		// Documents the origin answered 304 to, so their entries were never re-parsed and their
 		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;
@@ -136,7 +148,31 @@ export const createRefreshRun = ({
 	// uncapped setting (`maxCandidates: -1`, via `departureLimit`), which holds every URL the walk
 	// unlinks and never sets `capped`. A URL past a finite cap is not deferred: it is already
 	// unlinked, so no later walk will offer it again — which is why `capped` is reported at all.
-	const departure = { candidates: [], capped: false, outcomes: {} };
+	//
+	// Held as `{ url, sitemapUrl }` — the child whose prune unlinked it — because two post-walk steps
+	// need to put a URL BACK: a failed child re-links the URLs that could have moved into it, and a URL a
+	// 304'd child still lists is re-attached to that child. `holdCap` can exceed `departureCap` (an
+	// arrival-only deployment holds them for the re-link alone); the departure candidates are always
+	// the first `departureCap` of the list, so a departure-only deployment holds exactly what it did.
+	const heldCap = Math.max(departureCap, holdCap);
+	const unlinked = [];
+	let unlinkedOverflow = false;
+	const departure = { outcomes: {} };
+	const departureCount = () => (departureCap > 0 ? Math.min(unlinked.length, departureCap) : 0);
+	const departureCapped = () => departureCap > 0 && (unlinked.length > departureCap || unlinkedOverflow);
+	// Urlset children the origin answered 304 to: their entries were not read this walk, so a URL one of
+	// them still lists can look departed when the child that owned it drops it (see `unchangedUrlsets`).
+	const unchanged = [];
+	const listedUnchanged = new Set();
+	// Every sitemap's parent as the walk reached it, and every child that failed with its parent — what
+	// scopes a failure to the held URLs that could have moved into it (resources/Sitemap.js
+	// `heldBlockedByFailures`). Uncapped: one entry per sitemap DOCUMENT, never per URL.
+	const parents = new Map();
+	const failedChildren = new Map();
+	const relinkedChildren = new Set();
+	// Why departures are being held back, per child: a refused shrink, a failed child, the walk's budget.
+	// What the progress row shows an operator, so a hold-back is never silent.
+	const holdBack = new Map();
 
 	// Rejoined URLs held for the post-walk arrival action (util/sitemapArrival.js). Unlike departures
 	// these are decided AT re-attach time — `startedAt` is what makes that exact — and only acted on
@@ -169,14 +205,87 @@ export const createRefreshRun = ({
 		 * caps are independent, and stopping the whole loop at the SAMPLE cap would have silently
 		 * truncated the candidate list to `removedSampleCap` entries.
 		 */
-		addRemoved(targets) {
+		addRemoved(targets, sitemapUrl = null) {
 			totals.removed += targets.length;
 			for (const target of targets) {
 				if (removedSample.length < removedSampleCap) removedSample.push(target.url);
-				if (departureCap <= 0) continue;
-				if (departure.candidates.length < departureCap) departure.candidates.push(target.url);
-				else departure.capped = true;
+				if (heldCap <= 0) continue;
+				if (unlinked.length < heldCap) unlinked.push({ url: target.url, sitemapUrl });
+				else unlinkedOverflow = true;
 			}
+		},
+
+		/** Every unlinked URL held, with the child that unlinked it — the post-walk corrections' input. */
+		heldUnlinked() {
+			return unlinked;
+		},
+
+		/** A urlset child answered 304, so its entries were never read this walk. */
+		addUnchangedUrlset(url) {
+			unchanged.push(url);
+		},
+
+		unchangedUrlsets() {
+			return unchanged;
+		},
+
+		/** A held URL was re-attached to a 304'd child that still lists it. */
+		noteListedUnchanged(url) {
+			listedUnchanged.add(url);
+		},
+
+		isListedUnchanged(url) {
+			return listedUnchanged.has(url);
+		},
+
+		/**
+		 * Did any child fail — a fetch, a parse, a truncation, a tripped shrink guard? A failed child
+		 * re-attached nothing, so every URL that shifted into it from another child reads as departed.
+		 * Which held URLs that could be is `failedChildren` — the scope, not the whole walk.
+		 */
+		walkFailed() {
+			return failed.length > 0 || failedOverflow > 0;
+		},
+
+		/** Where the walk reached `url` from: its index, or null for the root. */
+		noteParent(url, parentUrl) {
+			parents.set(url, parentUrl ?? null);
+		},
+
+		parentOf(url) {
+			return parents.get(url);
+		},
+
+		/** Every failed document with the index that listed it (undefined when unknown). */
+		failedChildren() {
+			return [...failedChildren].map(([url, parentUrl]) => ({ url, parentUrl }));
+		},
+
+		/**
+		 * Record why departures are held back for one child. `reason` is 'refused-shrink' (with `since`, the
+		 * first refusal, and when acceptance becomes possible), 'failed-child' (with `heldBack`, how many held
+		 * URLs it kept back) or 'budget' (with `deferred`, how many departures went past
+		 * `sitemap.departure.maxPerWalk`); the last two carry `at`, this walk. One entry per child: the first
+		 * reason stands (a refused child is also a failed child), and later ones add their counts to it.
+		 */
+		noteHoldBack(entry) {
+			const existing = holdBack.get(entry.sitemapUrl);
+			if (!existing) {
+				if (holdBack.size < failedCap) holdBack.set(entry.sitemapUrl, { ...entry });
+				return;
+			}
+			for (const key of ['heldBack', 'deferred']) {
+				if (Number.isFinite(entry[key])) existing[key] = (existing[key] ?? 0) + entry[key];
+			}
+		},
+
+		/** A post-walk re-link put held URLs back on `sitemapUrl`, so its row must outlive this walk. */
+		noteRelinked(sitemapUrl) {
+			relinkedChildren.add(sitemapUrl);
+		},
+
+		wasRelinkedTo(sitemapUrl) {
+			return relinkedChildren.has(sitemapUrl);
 		},
 
 		/**
@@ -184,12 +293,12 @@ export const createRefreshRun = ({
 		 * child, so an index index fanning out to 17 children cannot multiply it by 17.
 		 */
 		fastPathTaken() {
-			return totals.createdSoon;
+			return totals.createdSoon + totals.listedSoon;
 		},
 
 		/** The departed URLs to re-read once the walk has finished. */
 		departureCandidates() {
-			return departure.candidates;
+			return unlinked.slice(0, departureCount()).map(({ url }) => url);
 		},
 
 		/**
@@ -220,9 +329,10 @@ export const createRefreshRun = ({
 		},
 
 		/** A child sitemap threw. The walk continues; the failure is reported, not swallowed. */
-		addFailure(url, error) {
+		addFailure(url, error, { parentUrl = parents.get(url) } = {}) {
 			if (failed.length < failedCap) failed.push({ url, error: describeError(error) });
 			else failedOverflow++;
+			failedChildren.set(url, parentUrl);
 		},
 
 		/** A prune scan hit `scan.collectCap`, so only part of the departed set was unlinked. */
@@ -238,12 +348,13 @@ export const createRefreshRun = ({
 				removedSample: [...removedSample],
 				failed: [...failed],
 				failedOverflow,
+				holdBack: [...holdBack.values()].map((entry) => ({ ...entry })),
 				truncatedScans: [...truncatedScans],
 				departures: {
 					// What the walk collected vs what it could not hold: a capped list means some
 					// departed URLs were never checked, which is a smaller claim than "none departed".
-					considered: departure.candidates.length,
-					capped: departure.capped,
+					considered: departureCount(),
+					capped: departureCapped(),
 					outcomes: { ...departure.outcomes },
 				},
 				arrivals: {

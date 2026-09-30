@@ -238,6 +238,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'demand',
 		'invalidationError',
 		'invalidationReenqueue',
+		// `render_size` (plugin v0.97.0): its path slot is the route label, a dimension like route_serve's.
+		// No view reads it yet — a page-size panel beside the Traffic view's route table is the follow-up.
+		'renderSize',
 		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe
 		// view, and guarded by name in the test BELOW: being on this list exempts an emitter from
 		// the scan above, which is how three probe series once shipped with no panel and a green
@@ -294,6 +297,8 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 			'prerender_ops.entity_gate',
 			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
 		],
+		// `render.change_lag_ms` and `prerender_ops.due_now_forward` (plugin v0.97.0) are charted on the Queue
+		// view since console v0.22.0 (Change to cache, Filing).
 	]);
 
 	const client = [...clientSources.values()].join('\n');
@@ -341,7 +346,9 @@ test('every probe series the catalog declares is read by the console, or waived 
 	const client = [...clientSources.values()].join('\n');
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('probe_'.length)}'`);
 
-	const NOT_CHARTED = new Map();
+	// Every probe series is charted: the passes card and, since console v0.22.0, the Change safety card
+	// (errors, caught_up, ignored, covered, anchor, detection_lag, render_mismatch).
+	const NOT_CHARTED = new Map([]);
 
 	for (const name of series) {
 		if (NOT_CHARTED.has(name)) continue;
@@ -428,10 +435,10 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 	const BUILT_AT_THE_CALL_SITE = new Map([
 		[
 			"`departure_${name.replace(/-/g, '_')}`",
-			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …) — ten ' +
-				'series with dry-run-vs-armed semantics of their own. No console panel reads them: the ' +
-				'Sitemaps view charts walk OUTCOMES, and departures are a separate decision surface that ' +
-				'needs its own panel rather than seven more tiles on this one. Tracked, not forgotten.',
+			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …, and the walk ' +
+				'corrections _relinked / _deferred / _listed_unchanged of plugin v0.97.0) — read by the Sitemaps ' +
+				'view\u2019s Departures card (console v0.22.0) through `departure(\u2026)`, grouped by what each ' +
+				'means for a page: acted, shear, held back, deferred, skipped, lost.',
 		],
 	]);
 
@@ -455,7 +462,9 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 	const client = [...clientSources.values()].join('\n');
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('sitemap_'.length)}'`);
 
-	const NOT_CHARTED = new Map();
+	const NOT_CHARTED = new Map([
+		// `sitemap_shrink_refused` / `_accepted` (plugin v0.97.0) are read by the Departures card.
+	]);
 
 	for (const name of new Set(emitted)) {
 		if (NOT_CHARTED.has(name)) continue;

@@ -113,3 +113,23 @@ test('the wait never goes backwards as strikes climb', () => {
 		prev = w;
 	}
 });
+
+test('a CHANGED row backs off at lease scale, doubling, and never past what a routine row would wait', async () => {
+	// The probe hard-expired its page, so every minute the retry waits is a minute bots get the origin: a
+	// cadence wait (48h on a product page) is the whole of that exposure.
+	const { changedRetryWait } = await import('../src/util/failureBackoff.js');
+	setRetry();
+	const lease = 10 * 60 * 1000; // the queue.jobLeaseTime default
+	assert.equal(changedRetryWait(48 * H, 3, true), 2 * lease, 'the first escalation: two leases, not two days');
+	assert.equal(changedRetryWait(48 * H, 4, true), 4 * lease);
+	assert.equal(changedRetryWait(48 * H, 5, true), 8 * lease);
+	assert.equal(changedRetryWait(48 * H, 30, true), backoffWait(48 * H, 30, true), 'capped at the routine wait');
+	assert.ok(changedRetryWait(1 * H, 9, true) <= backoffWait(1 * H, 9, true));
+});
+
+test('a changed row still doubles with backoffFactor 1 — flat would be a lease-paced hot loop', async () => {
+	const { changedRetryWait } = await import('../src/util/failureBackoff.js');
+	setRetry({ backoffFactor: 1 });
+	const lease = 10 * 60 * 1000;
+	assert.equal(changedRetryWait(48 * H, 4, true), 4 * lease);
+});

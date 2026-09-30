@@ -18,6 +18,7 @@
  * time, so overrides applied during `handleApplication` take effect.
  */
 
+import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import {
 	configSchema,
@@ -28,6 +29,8 @@ import {
 	walkOptions,
 	schemaNodeAt,
 	checkUiEditable,
+	describeItemRule,
+	invalidItems,
 	isOption,
 	SECOND,
 	MINUTE,
@@ -35,6 +38,7 @@ import {
 	DAY,
 } from './configSchema.js';
 import { describeSecret } from './util/redact.js';
+import { runInLoadContext } from './util/detach.js';
 // Cyclic by design, and safe: routeClass.js imports `config`/`getLogger` from here, and this
 // module calls back into it only from inside `collectConfigWarnings` — never at module
 // evaluation time. The count has to come from the compiler rather than from raw config,
@@ -268,6 +272,14 @@ const enforceSchemaConstraints = (fresh, fallback = null) => {
 				return;
 			}
 		}
+		if (node.items && Array.isArray(value)) {
+			const bad = invalidItems(node, value);
+			if (bad.length) {
+				const listed = bad.map((v) => JSON.stringify(v)).join(', ');
+				reject(path, node, `${listed} not allowed here — each entry must be ${describeItemRule(node.items)}`);
+				return;
+			}
+		}
 		// null/undefined can't actually reach here through applyOptions (mergeInto skips
 		// null/undefined overrides, and every schema path exists in the defaults), but the
 		// validator shouldn't depend on the merge layer's behavior to be safe.
@@ -325,6 +337,10 @@ const trackRestartScopedChanges = () => {
 // nobody set.
 let lastHostOptions = {};
 let lastOverrides = {};
+// Per override path, a hash of the FILE layer's value at that path when the row was written
+// (`fileHash` on the row), or null for a row written before v0.97.0 recorded one. What `masking`
+// in `describeConfigLayers` compares against.
+let lastOverrideFileHashes = {};
 
 /**
  * Rewrite one dotted path through the schema's `movedFrom` aliases.
@@ -426,6 +442,49 @@ const normalizeOverrides = (overrides) => {
 	return out;
 };
 
+/** `normalizeOverrides` for the recorded file hashes: keyed by current path, strings or null. */
+const normalizeRecorded = (recorded) => {
+	const aliases = aliasPaths();
+	const out = {};
+	for (const [path, hash] of overrideEntries(recorded)) {
+		out[remapOverridePath(path, aliases)] = typeof hash === 'string' && hash !== '' ? hash : null;
+	}
+	return out;
+};
+
+/** Object keys sorted, list order kept: two equal config values always serialize alike. */
+const canonical = (value) => {
+	if (Array.isArray(value)) return value.map(canonical);
+	if (isPlainObject(value)) {
+		return Object.fromEntries(
+			Object.keys(value)
+				.sort()
+				.map((key) => [key, canonical(value[key])])
+		);
+	}
+	return value;
+};
+
+/**
+ * A stable hash of one config value. An override row records it for the FILE layer's value at its
+ * path when the row is written, so a later apply can tell whether config.yaml moved underneath it.
+ * A hash rather than a copy: the value can be a whole route or rule list, and the question is only
+ * "has it changed", which the current file value in the layers view then answers in detail.
+ */
+export const hashConfigValue = (value) =>
+	createHash('sha256')
+		.update(JSON.stringify(canonical(value ?? null)))
+		.digest('base64url');
+
+/**
+ * The file layer's value hash at each path, as this worker last applied that layer. What an override
+ * row being written records as its `fileHash`.
+ */
+export const fileLayerHashes = (paths) => {
+	const fileConfig = resolveConfig(lastHostOptions, null).config;
+	return Object.fromEntries(paths.map((path) => [path, hashConfigValue(getPath(fileConfig, path))]));
+};
+
 /**
  * Build a config from its layers WITHOUT touching the live one.
  *
@@ -479,8 +538,10 @@ export const resolveConfig = (options, overrides) => {
  *
  * @param options    host options (`scope.options.getAll()`)
  * @param overrides  stored overrides as dotted path -> value (Map or plain object)
+ * @param recorded   per override path, the `fileHash` its row recorded (null for an older row).
+ *                   Changes nothing that is applied; it is what `masking` is judged against.
  */
-export const applyOptions = (options, overrides) => {
+export const applyOptions = (options, overrides, recorded = null) => {
 	const { config: fresh, warnings } = resolveConfig(options, overrides);
 	for (const message of warnings) getLogger().warn?.(message);
 
@@ -492,6 +553,7 @@ export const applyOptions = (options, overrides) => {
 
 	lastHostOptions = isPlainObject(options) ? deepClone(options) : {};
 	lastOverrides = normalizeOverrides(overrides);
+	lastOverrideFileHashes = normalizeRecorded(recorded);
 
 	// The first apply is boot: everything takes effect, nothing is pending-restart.
 	if (!bootConfig) bootConfig = deepClone(config);
@@ -501,7 +563,11 @@ export const applyOptions = (options, overrides) => {
 
 	for (const listener of configListeners) {
 		try {
-			listener(config, previous);
+			// In the load-time context, never the caller's (util/detach.js). An apply can run inside a
+			// request (a stored-override doorbell may fire in the committing request's async context),
+			// and these listeners re-arm the schedulers' timers: armed there, every later tick of the
+			// probe, reconcile, backlog and poll timers would run on that request's closed transaction.
+			runInLoadContext(() => listener(config, previous));
 		} catch (e) {
 			getLogger().error?.(e);
 		}
@@ -516,6 +582,74 @@ export const activeOverrides = () => deepClone(lastOverrides);
 export const hostOptions = () => deepClone(lastHostOptions);
 
 const sameValue = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+/**
+ * Whether one stored override still means what it meant when it was written.
+ *
+ * AN OVERRIDE IS STORED PER OPTION, and a list is one option. So one edit to `ingress.routes` from
+ * the console stores a copy of EVERY route, and from then on a config.yaml change to any route
+ * deploys, reads as deployed, and is merged away by that copy with nothing to say so. The row records
+ * a hash of the file's value when it is written (`fileHash`), and this compares it with the file now.
+ *
+ *   redundant  the override equals the file's value now, so clearing it changes nothing. It is still
+ *              worth clearing: until then it pins the option against every future deploy.
+ *   masking    the override is in effect, differs from the file, and the file has changed since the
+ *              override was written: a deploy is being overridden that the operator never saw.
+ *              null when the row recorded no hash (written before v0.97.0), because then it is not
+ *              known whether the file moved. It is never guessed. False for an override that is not
+ *              in effect, because the file value is what is running.
+ */
+const overrideDrift = (path, { overrideValue, fileValue, inEffect }) => {
+	const redundant = sameValue(overrideValue, fileValue);
+	const recorded = lastOverrideFileHashes[path];
+	let masking;
+	if (!inEffect || redundant) masking = false;
+	else if (typeof recorded !== 'string') masking = null;
+	else masking = hashConfigValue(fileValue) !== recorded;
+	return { redundant, masking };
+};
+
+/**
+ * `overrideDrift` as findings, in the `collectConfigWarnings` shape: a warning for each masking
+ * override (logged at every apply, and served on GET /prerender_admin/config) and an info finding
+ * for each redundant one in effect.
+ */
+export const collectOverrideWarnings = () => {
+	const paths = Object.keys(lastOverrides);
+	if (paths.length === 0) return [];
+	const fileConfig = resolveConfig(lastHostOptions, null).config;
+	const findings = [];
+	for (const path of paths) {
+		// A path this release does not have is already reported by the merge, which drops it.
+		if (!isOption(schemaNodeAt(path))) continue;
+		const overrideValue = lastOverrides[path];
+		const inEffect = sameValue(getPath(config, path), overrideValue);
+		const { masking, redundant } = overrideDrift(path, {
+			overrideValue,
+			fileValue: getPath(fileConfig, path),
+			inEffect,
+		});
+		if (masking) {
+			findings.push({
+				severity: 'warn',
+				key: path,
+				message:
+					`the stored override of ${path} is masking a config.yaml change: the deployed value has changed ` +
+					`since the override was written, and the override still wins, so the deployed change is not ` +
+					`running. Clear the override to run the file's value, or save it again to keep it.`,
+			});
+		} else if (redundant && inEffect) {
+			findings.push({
+				severity: 'info',
+				key: path,
+				message:
+					`the stored override of ${path} equals the deployed config.yaml value, so clearing it changes ` +
+					`nothing now. Until it is cleared it pins ${path} against every future deploy.`,
+			});
+		}
+	}
+	return findings;
+};
 
 /**
  * Per-option provenance: what each layer says, which one won, and whether a stored override is
@@ -545,6 +679,9 @@ export const describeConfigLayers = () => {
 		const effective = getPath(config, path);
 		const overridden = Object.hasOwn(lastOverrides, path);
 		const overrideValue = overridden ? lastOverrides[path] : undefined;
+		const drift = overridden
+			? overrideDrift(path, { overrideValue, fileValue, inEffect: sameValue(effective, overrideValue) })
+			: null;
 
 		let source;
 		if (overridden && sameValue(effective, overrideValue)) source = 'override';
@@ -563,6 +700,9 @@ export const describeConfigLayers = () => {
 			file: show(fileValue),
 			override: overridden ? show(overrideValue) : undefined,
 			effective: show(effective),
+			// Only on an overridden option, like `override`. See `overrideDrift`.
+			redundant: drift?.redundant,
+			masking: drift?.masking,
 		});
 	});
 
@@ -870,6 +1010,9 @@ const warnOnRiskyConfig = () => {
 	const log = getLogger();
 	for (const { message } of collectConfigWarnings()) {
 		log.warn?.(`[prerender] ${message}`);
+	}
+	for (const { severity, message } of collectOverrideWarnings()) {
+		if (severity === 'warn') log.warn?.(`[prerender] ${message}`);
 	}
 };
 

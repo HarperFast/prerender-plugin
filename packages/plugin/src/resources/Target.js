@@ -6,6 +6,7 @@ import { currentMinuteMs, dateColumnMs, getInitialRenderTime } from '../util/tim
 import { applyInBatches, collectFromScan } from '../util/scan.js';
 import { deleteSchedule, fileDueNow, writeSchedule } from '../util/renderSchedule.js';
 import { gradeSuppression } from '../util/suppression.js';
+import { runDetached } from '../util/detach.js';
 
 const {
 	page_cache: { PrerenderedPage },
@@ -90,6 +91,9 @@ export class Target extends TargetTable {
 
 		let nextRenderTime = data.nextRenderTime;
 		delete data.nextRenderTime;
+		// Scheduling intent, like the time above: consumed here, never stored on the target.
+		const asked = data.urgent === true;
+		delete data.urgent;
 
 		if (!data.schedulerNode) {
 			data.schedulerNode = getResidencyByUrl(url);
@@ -118,9 +122,14 @@ export class Target extends TargetTable {
 		// ONE row, keyed by the URL: the claim renders every configured device off it. The explicit
 		// `nextRenderTime` branch is validated no further than `> 0`, and it is the funnel for
 		// redirect adoption, sitemap `revalidate: true`, and any external `PUT /render_targets`.
+		const explicit = Number.isFinite(nextRenderTime) && nextRenderTime > 0;
 		await writeSchedule(url, {
-			nextRenderTime:
-				Number.isFinite(nextRenderTime) && nextRenderTime > 0 ? nextRenderTime : getInitialRenderTime(url, interval),
+			nextRenderTime: explicit ? nextRenderTime : getInitialRenderTime(url, interval),
+			// A caller's single ask to render now (`urgent: true` with a time not in the future — an adopted
+			// redirect destination) is ranked ahead like a `fileDueNow` ask; see `urgentAt` in
+			// schema.graphql. A bulk re-file (a sitemap walk's `revalidate: true`) and a jittered first
+			// render never are: tens of thousands of asks would queue ahead of every change found after them.
+			urgentAt: asked && explicit && nextRenderTime <= currentMinuteMs() ? Date.now() : undefined,
 			fromSitemap,
 			// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
 			// target row, so a put clears `demandInterval` along with the suppression fields; the
@@ -168,7 +177,11 @@ export class Target extends TargetTable {
 	async post(body, target) {
 		switch (body.action) {
 			case 'revalidate':
-				return Target.revalidate(target);
+				// Awaited, so the response still carries the counts, but run OUTSIDE the request's
+				// transaction (util/detach.js): phase 2 is `scan.collectCap` URLs of page patches and
+				// schedule writes in batches meant to commit as they go, and on the request's transaction
+				// they would all be pending on one the 30-second long-transaction monitor fires on.
+				return runDetached(() => Target.revalidate(target));
 			default:
 				throw new Error('invalid action');
 		}
@@ -301,7 +314,10 @@ export class Target extends TargetTable {
 	/** A render found a suppressed URL indexable again — put it back in normal rotation.
 	 *  The caller reschedules the URL row at its cadence. */
 	static async reactivate(url) {
-		await Target.patch(url, { state: null, suppressedReason: null, suppressedAt: null, strikes: 0 });
+		// The key rides the patch: a target deleted a moment ago on another node would otherwise come back
+		// as a row with no `url` (a patch of a missing record stores only what it names — see
+		// `pruneSitemapTargets` in resources/Sitemap.js).
+		await Target.patch(url, { url, state: null, suppressedReason: null, suppressedAt: null, strikes: 0 });
 	}
 
 	/**
@@ -378,7 +394,8 @@ export class Target extends TargetTable {
 						// operator's revalidate that happens to run before its render lands.
 						const expiresAt = dateColumnMs(existingPage?.expiresAt);
 						if (existingPage && !(Number.isFinite(expiresAt) && expiresAt <= Date.now())) {
-							await PrerenderedPage.patch(cacheKey, { expiresAt: Date.now() });
+							// With its key, so a page deleted since the read is not re-created as a keyless stub.
+							await PrerenderedPage.patch(cacheKey, { cacheKey, expiresAt: Date.now() });
 						}
 					})
 				);
@@ -389,8 +406,11 @@ export class Target extends TargetTable {
 				// those pages being cached at all.
 				//
 				// `fileDueNow`: filed at the current minute PER URL, and a row already due, or already
-				// marked by the change probe, keeps its place.
+				// marked by the change probe, keeps its place. NOT an ask when it re-files a collection
+				// (`urgent`): a route-wide revalidate would otherwise queue up to its whole match set ahead of
+				// every change found while it drains. A revalidate that names one URL is an ask.
 				await fileDueNow(url, {
+					urgent: urls.length === 1,
 					fromSitemap: !!sitemapUrl,
 					// `null` — the sweep resolves from config instead, which is what it did before this
 					// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and

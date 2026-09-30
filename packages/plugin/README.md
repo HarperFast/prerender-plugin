@@ -524,7 +524,7 @@ table is read by primary key only, and `nextRenderTime` carries no index
   > route > stored > default, so a page `render.demand` promoted to 6 h is not ranked as if it were on
   > its route's 24 h ceiling. `sitemapBoost` is a multiplier, never a tier, so a discovered page is
   > served within roughly `sitemapBoost ×` the worst sitemap ratio. Rows are grouped by class (route ×
-  > cadence × sitemap flag × change mark × demand estimate), within which due time already orders them,
+  > cadence × sitemap flag × change or urgent mark × demand estimate), within which due time already orders them,
   > so the best K is a merge over class heads, not a scan.
 - **Changed pages first, most-asked-for first.** A row the change probe filed (`changedAt`) starts
   `queue.ready.changedHeadStart` cadences ahead. With `queue.ready.changedDemand` (default on) its wait
@@ -532,6 +532,14 @@ table is read by primary key only, and `nextRenderTime` carries no index
   on the row as `demandPeriod` when the change was acted on — so the score is the bot visits the wait has
   sent to the origin, and a change wave renders the pages bots ask for first. A row with no estimate
   (tracker off, cold or saturated) orders by cadence.
+- **A single ask to render now starts ahead too, but behind a change.** A row filed due now by a
+  render-now, an admin revalidate or rejoin of one URL, an adopted redirect destination or a first
+  sitemap listing (`urgentAt`) starts `queue.ready.urgentHeadStart` (0.5) cadences ahead; filed at the
+  current minute it would otherwise rank behind every overdue row. Half the change's head start, so a
+  page found changed — answered from the origin while it waits — outranks an equally late ask. Bulk
+  re-files (a revalidate over a collection, a sitemap walk with `revalidate: true`) are not asks. Both
+  head starts are in boosted units — multiplied by `sitemapBoost`, as sitemap lateness is — so a fresh
+  marked row outranks every routine row less than that many cadences late, sitemap-listed or not.
 - **It repairs itself from the table.** Each publish re-reads the head of what it published and fixes
   what it holds wrongly. A verification walk (`queue.keeper.verifyInterval`, 1 h) checks every row it
   owns and every row it holds against the table and repairs the difference (`keeper_repaired`,
@@ -1069,6 +1077,20 @@ never a snapshot of the whole config. That distinction is the entire design:
 - Clearing one row reverts **one option** to the deployed value. Clearing every row returns the
   cluster to exactly its deployed state — which is the rollback story, and it is one delete.
 
+**But a list is one option.** An edit to one route stores a copy of the whole `ingress.routes` list
+(and one probe rule, all of `changeProbe.rules`). From then on, a `config.yaml` edit to _any_ route
+deploys and is merged away by that copy. So since v0.97.0 each row records a hash of the file's value
+at its path when it is written (`fileHash`), and `GET /prerender_admin/config` reports on each
+overridden option in `layers`:
+
+- `masking: true` means the override is in effect and the file's value has changed since the row
+  was written. A deploy is being overridden. This is also a `warn` finding in `warnings`, and is
+  logged on every apply.
+- `redundant: true` means the override now equals the file's value, so clearing it is a no-op that
+  un-pins the option. This is also an `info` finding.
+- `masking: null` means the row was written before v0.97.0 and recorded no hash, so it is unknown
+  whether the file moved. Saving the row again records one.
+
 The rows live in `config.ConfigOverride` — alone in that database, because a subscription is a
 per-database cost — and **replicate**, so the console writes once, on
 whichever node it reached, and every node converges — including a node that was down when the write
@@ -1135,10 +1157,12 @@ could not:
   deployed setting down with it.
 - **`noop`** — a change whose prospective effective value equals the current one, e.g. an override
   that merely restates what the file already says.
-- **dropped routes** — an `ingress.routes` edit is compiled by `inspectRoutes()` during the preview.
-  An invalid route entry is _dropped_, not rejected, so from the outside it is indistinguishable
-  from a route nobody wrote: the config lists it, the plugin starts, and the paths it covered
-  quietly stop being prerendered. The preview compiles it and reports the drop.
+- **dropped entries** — an `ingress.routes` or `changeProbe.rules` value is compiled during the
+  preview (`inspectRoutes()` / `inspectProbeRules()`). The compiler _drops_ an invalid entry rather
+  than rejecting it, so from the outside the entry is indistinguishable from one nobody wrote: the
+  config lists it, the plugin starts, and the paths it covered quietly stop being prerendered (or
+  probed). Since v0.97.0 such a value is listed in `rejected` with its `dropped` count and the
+  compiler's reasons, and the apply refuses it (409) like any other value that would not be honoured.
 
 ### Bulk cache invalidation
 
@@ -1230,10 +1254,21 @@ changed pages by how often bots ask for them (a page known wrong is being served
 it re-renders). Nothing detected is deferred and there is no per-pass budget —
 the render queue orders the work. Actions run beside the walk, at most `trigger.concurrency` at once
 (the pass waits for a free slot rather than dropping a change), and the new baseline is written only
-after its action succeeds, so a failure or a restart leaves the change detectable. A restart that
-cuts an anchored pass short resumes it on boot from the walk cursor its heartbeat published (held back
-to any action still in flight), with the interrupted pass's own dry-run and reseed settings. Two cadences
-cover the two ways content actually changes:
+after its action succeeds, so a failure or a restart leaves the change detectable; an action that
+throws is retried once when the walk ends. A restart that cuts an anchored pass short resumes it on boot
+from the walk cursor its heartbeat published (held back to any action still in flight), with the
+interrupted pass's own dry-run and reseed settings; a restart that spanned the anchor runs that
+anchor's pass at boot instead (v0.97.0), and an anchor that fires while another sweep holds the node
+stands a dry run, a reseed or a pass for an older anchor down, or waits for any other pass and runs
+after it — each outcome is a `probe_anchor` emit, never a silent skip; an anchored pass that throws is
+resumed from its cursor. A pass skips only URLs it (or the pass it resumes) has already probed, and a
+storage fault on one row skips that row, not the pass. With `renderCheck` (default on) each render of a
+claim-pair `pageCheck` URL is compared with the probe's last observation of the origin as it lands; one
+that disagrees gets ONE confirming probe, and is expired and re-filed only if the origin still
+disagrees with it — claimed before a probe found a change, or rendered from a stale CDN copy — while an
+origin that moved and a render that shows it just update the baseline (`probe_render_mismatch`). While
+an invalidation is active, no pass acts on a page it already refuses, or on one re-rendered after the
+trip that agrees with the origin. Two cadences cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
   `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price
@@ -1263,7 +1298,11 @@ cover the two ways content actually changes:
   invalidation** (above): pre-change snapshots stop serving immediately — bots get origin content,
   which is correct by definition — while re-renders refill on their own machinery. Detection and
   response are different mechanisms on purpose: re-rendering a large corpus takes a render fleet
-  hours; invalidating it takes one row.
+  hours; invalidating it takes one row. The trip's **reseed** re-probes the whole slice and acts on
+  every change the invalidation does not already cover (a page re-rendered after the trip), leaving
+  pages that predate it to the invalidation so that clearing a false trip still restores them.
+  `canary.schedule` (optional) replaces the all-day `canary.interval` with time-of-day windows in
+  `anchorTimezone`, dense where a scheduled change is expected and sparse elsewhere.
 
 **A probe failure changes nothing** — no signature write, no trigger. The probe is an accelerator
 on top of the baseline cadence, never a gate on it: an endpoint that breaks (or replatforms) shows

@@ -58,13 +58,15 @@ import { CacheKey } from './cacheKey.js';
 import { canonicalizeUrl } from './url.js';
 import { queryAllowlistFor } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
-import { leaseInfo } from './renderSchedule.js';
-import { Target } from '../resources/Target.js';
+import { getScheduleRow, leaseInfo } from './renderSchedule.js';
+import { pageKeysOf, scheduleKeysOf, Target } from '../resources/Target.js';
+import { recoverKeylessKeys, walkUrlRange } from './urlWalk.js';
 import { claimRun, finishRun, isRunning, makeHeartbeat, publishRunState, readRunState } from './runState.js';
 
 // Rows scanned between event-loop yields, so a sweep over a large registry stays background
 // work rather than monopolizing the thread. Same value, and the same reason, as reconcile.
 const YIELD_EVERY = 200;
+const CHUNK_SIZE = 10_000;
 
 /**
  * Is this stored url a fixed point of the CURRENT canonicalization?
@@ -100,6 +102,9 @@ export const isOrphanedByKeyRule = (url) => {
  */
 export const sweepOrphanedTargets = async ({
 	streamTargets,
+	recoverStubs,
+	stubDeletable = async () => false,
+	deleteStub,
 	isLeased,
 	deleteTarget,
 	ownerOf,
@@ -109,11 +114,50 @@ export const sweepOrphanedTargets = async ({
 	dryRun = false,
 	onYield = () => {},
 } = {}) => {
-	const stats = { examined: 0, owned: 0, orphaned: 0, leaseSkipped: 0, deleted: 0, truncated: false, dryRun };
+	const stats = {
+		examined: 0,
+		owned: 0,
+		orphaned: 0,
+		unreadable: 0,
+		stubs: 0,
+		stubsKept: 0,
+		leaseSkipped: 0,
+		deleted: 0,
+		truncated: false,
+		dryRun,
+	};
 	const toDelete = [];
+	const stubsToDelete = [];
+	const gaps = [];
+	const onUnreadable = ({ after } = {}) => {
+		stats.unreadable++;
+		if (after !== undefined) gaps.push(after);
+	};
 
-	// Phase 1 — read only.
-	for await (const target of streamTargets()) {
+	// SKIP ANYTHING CURRENTLY IN FLIGHT, so a delete does not land mid-render.
+	//
+	// CORRECTNESS DOES NOT DEPEND ON THIS. `processJobResult` already reschedules only under
+	// `if (renderTarget)`, and its `else` branch DELETES the schedule row precisely because
+	// "no target owns this schedule" means nothing sets a recurring cadence. So a result
+	// arriving after its target was swept retires its own row instead of resurrecting it —
+	// the race resolves correctly on its own.
+	//
+	// What this check buys is waste, not safety: it avoids spending a render on a target
+	// that is about to disappear, and it avoids the one write on that path that is NOT
+	// target-guarded — the `PrerenderedPage.put`, which would otherwise leave a page record
+	// under a key whose target and schedule we just removed.
+	//
+	// Checked under every schedule key the URL can have a lease under — the URL row, and any
+	// pre-0.66.0 device row that has not yet converted — and any one lease defers the whole
+	// target: the delete is per-url and takes every key with it, so it is unsafe while ANY of
+	// them is out. A deferred target is simply swept on the next pass.
+	const leased = (url) =>
+		isLeased(url) || deviceTypes.some((deviceType) => isLeased(CacheKey.toCacheKey({ url, deviceType })));
+
+	// Phase 1 — read only. The walk (util/urlWalk.js) skips a row it cannot read and keeps going; a
+	// plain projected scan could END at one, and this sweep would report "no orphans" having covered a
+	// fraction of the registry.
+	for await (const target of streamTargets({ onUnreadable })) {
 		stats.examined++;
 		if (stats.examined % YIELD_EVERY === 0) await onYield();
 
@@ -126,27 +170,7 @@ export const sweepOrphanedTargets = async ({
 		if (!isOrphanedByKeyRule(target.url)) continue;
 		stats.orphaned++;
 
-		// SKIP ANYTHING CURRENTLY IN FLIGHT, so a delete does not land mid-render.
-		//
-		// CORRECTNESS DOES NOT DEPEND ON THIS. `processJobResult` already reschedules only under
-		// `if (renderTarget)`, and its `else` branch DELETES the schedule row precisely because
-		// "no target owns this schedule" means nothing sets a recurring cadence. So a result
-		// arriving after its target was swept retires its own row instead of resurrecting it —
-		// the race resolves correctly on its own.
-		//
-		// What this check buys is waste, not safety: it avoids spending a render on a target
-		// that is about to disappear, and it avoids the one write on that path that is NOT
-		// target-guarded — the `PrerenderedPage.put`, which would otherwise leave a page record
-		// under a key whose target and schedule we just removed.
-		//
-		// Checked under every schedule key the URL can have a lease under — the URL row, and any
-		// pre-0.66.0 device row that has not yet converted — and any one lease defers the whole
-		// target: the delete is per-url and takes every key with it, so it is unsafe while ANY of
-		// them is out. A deferred target is simply swept on the next pass.
-		if (
-			isLeased(target.url) ||
-			deviceTypes.some((deviceType) => isLeased(CacheKey.toCacheKey({ url: target.url, deviceType })))
-		) {
+		if (leased(target.url)) {
 			stats.leaseSkipped++;
 			continue;
 		}
@@ -157,15 +181,65 @@ export const sweepOrphanedTargets = async ({
 		if (toDelete.length < maxDeletes) toDelete.push(target.url);
 	}
 
+	// Phase 1b — the rows the walk could not read because they carry no `url` at all: stubs a patch
+	// created on a key deleted a moment earlier (util/urlWalk.js `recoverKeylessKeys`). Not targets —
+	// no schedule, no cadence, nothing any path will ever renew — and invisible to every other sweep.
+	// Their key is still their URL, so ownership and leases are judged exactly as for an orphan, and
+	// they share the delete cap, after the orphans.
+	for (const url of gaps.length && recoverStubs ? await recoverStubs(gaps) : []) {
+		if (ownerOf(url) !== hostname) continue;
+		stats.stubs++;
+		if (leased(url)) {
+			stats.leaseSkipped++;
+			continue;
+		}
+		if (toDelete.length + stubsToDelete.length < maxDeletes) stubsToDelete.push(url);
+	}
+
 	// Phase 2 — deletes, with the scan's cursor now closed.
 	for (const url of toDelete) {
 		if (!dryRun) await deleteTarget(url);
 		stats.deleted++;
 	}
 
-	stats.truncated = stats.orphaned - stats.leaseSkipped > stats.deleted;
+	// A stub is found on THIS node's copy only, and replicas differ: the same key can be a stub here and
+	// a whole, rendering target elsewhere. So each one is re-read and must still be a stub with nothing
+	// live behind it — no schedule row on this node (the owner, where one would be) and no rendered page
+	// (`stubDeletable`) — and then only the stub ROW goes (`deleteStub`, the raw table). The cascading
+	// delete an orphan takes would replicate page, schedule and probe-state deletes to every node,
+	// including one where the row is whole. Checked in a dry run too, so its count is honest.
+	for (const url of stubsToDelete) {
+		if (!(await stubDeletable(url))) {
+			stats.stubsKept++;
+			continue;
+		}
+		if (!dryRun) await deleteStub(url);
+		stats.deleted++;
+	}
+
+	stats.truncated = stats.orphaned + stats.stubs - stats.leaseSkipped - stats.stubsKept > stats.deleted;
 
 	return stats;
+};
+
+/**
+ * Is `url` still a url-less stub with nothing live behind it? Re-read, because the recovery that found
+ * it read a range of the store some time before: the row must still exist and still lack its `url`,
+ * this node must hold no schedule row for it (the sweep runs on the owner, so that read is
+ * authoritative), and no page for it may carry a `statusCode` (a rendered page means a target, here or
+ * on a replica that has it whole). Every read is node-local.
+ */
+export const isDeletableStub = async (url) => {
+	const row = await databases.render_service.Target.get({ id: url, select: ['url'] });
+	if (!row || typeof row.url === 'string') return false;
+	for (const key of scheduleKeysOf(url)) {
+		if (await getScheduleRow(key, ['nextRenderTime'])) return false;
+	}
+	for (const cacheKey of pageKeysOf(url)) {
+		const page = await databases.page_cache.PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'statusCode'] });
+		if (page && page.statusCode !== null && page.statusCode !== undefined) return false;
+	}
+	return true;
 };
 
 /** `sweepOrphanedTargets` bound to the live tables. */
@@ -177,11 +251,16 @@ export const sweepKeyRuleOrphans = async ({
 	onYield = () => setImmediate(),
 } = {}) => {
 	return sweepOrphanedTargets({
-		// One unconstrained streamed scan, for the reasons spelled out on `reconcileScheduleGaps`:
-		// no `sort` (a sort on the un-indexed primary key is rejected), no conditions (Harper
-		// injects the full-scan condition itself), no `limit` (the caller streams and never
-		// resumes). `url` is the only column the predicate needs.
-		streamTargets: () => databases.render_service.Target.search({ select: ['url'] }),
+		// The keyset walk every other registry sweep uses, never one unconstrained projected scan: a
+		// projected iterator can silently END at a row whose key attribute did not decode, and this
+		// sweep then reported "no key-rule orphans" over a fraction of the registry (see
+		// util/urlWalk.js). `url` is the only column the predicate needs.
+		streamTargets: ({ onUnreadable }) =>
+			walkUrlRange(databases.render_service.Target, { select: ['url'], chunkSize: CHUNK_SIZE, onUnreadable }),
+		recoverStubs: (gaps) => recoverKeylessKeys(databases.render_service.Target, gaps),
+		stubDeletable: isDeletableStub,
+		// The RAW table's delete — this row only, no cascade (see the phase-2 comment in the sweep).
+		deleteStub: (url) => databases.render_service.Target.delete(url),
 		// Node-local shared-buffer lookup, which is exactly why this sweep is owner-scoped.
 		isLeased: (cacheKey) => Boolean(leaseInfo(cacheKey)),
 		// The RESOURCE class delete, never `databases.render_service.Target`'s (the raw table,
@@ -206,8 +285,8 @@ export const sweepKeyRuleOrphans = async ({
 /**
  * The one-line summary of a pass, split out so the branch is unit-testable.
  *
- * GATED ON `orphaned`, NOT ON `deleted`. A pass that found orphans and deferred every one of
- * them as in-flight has `deleted === 0` and `truncated === false` (truncation is
+ * GATED ON `orphaned` (and `stubs`), NOT ON `deleted`. A pass that found orphans and deferred every
+ * one of them as in-flight has `deleted === 0` and `truncated === false` (truncation is
  * `orphaned - leaseSkipped > deleted`, which is `0 > 0` when they are all deferred) — so a
  * condition written in terms of the deletion would take the quiet branch and report "no
  * key-rule orphans" while orphans plainly exist. That is the one wrong answer this line must
@@ -218,10 +297,11 @@ export const sweepKeyRuleOrphans = async ({
  * only be true when `orphaned` is non-zero.
  */
 export const summarizeSweep = (stats, maxDeletes) => {
-	if (!stats.orphaned) {
+	const unreadable = stats.unreadable ? `, ${stats.unreadable} unreadable` : '';
+	if (!stats.orphaned && !stats.stubs) {
 		return {
 			level: 'info',
-			message: `[prerender] orphan sweep: no key-rule orphans among ${stats.owned} owned target(s) (${stats.examined} examined)`,
+			message: `[prerender] orphan sweep: no key-rule orphans among ${stats.owned} owned target(s) (${stats.examined} examined${unreadable})`,
 		};
 	}
 
@@ -232,8 +312,10 @@ export const summarizeSweep = (stats, maxDeletes) => {
 		level: 'warn',
 		message:
 			`[prerender] orphan sweep${stats.dryRun ? ' (DRY RUN, nothing deleted)' : ''}: ` +
-			`${stats.deleted} of ${stats.orphaned} key-rule orphan(s) across ${stats.owned} owned target(s) ` +
-			`(${stats.examined} examined, ${stats.leaseSkipped} deferred as in-flight)` +
+			`${stats.deleted} of ${stats.orphaned} key-rule orphan(s)` +
+			`${stats.stubs ? ` and ${stats.stubs} url-less stub row(s) (${stats.stubsKept} kept: live behind them)` : ''} ` +
+			`across ${stats.owned} owned target(s) ` +
+			`(${stats.examined} examined${unreadable}, ${stats.leaseSkipped} deferred as in-flight)` +
 			(stats.truncated ? ` — the rest left for the next sweep by the ${maxDeletes}-delete cap` : ''),
 	};
 };

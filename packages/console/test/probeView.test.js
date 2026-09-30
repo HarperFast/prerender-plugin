@@ -8,9 +8,9 @@
  *     seeding compares almost nothing, and dividing by `probed` would report that as a low
  *     change rate — "the catalogue is stable" — when the truthful answer is "we have not
  *     compared anything yet".
- *   - The pass counters are per FINISHED PASS, so `count` is passes and the recorded value is
- *     what a pass counted. Summing counts answers "how many passes ran", with a plausible
- *     number.
+ *   - The pass counters are per EMIT (a probed batch from plugin v0.97.0, a finished pass
+ *     before), so `count` is emits and the recorded value is what that batch or pass counted.
+ *     Summing counts answers "how many emits", with a plausible number.
  *   - A dominant failure share is the endpoint-changed-shape alarm, and it is invisible in every
  *     other number: a failed probe leaves the signature untouched, triggers nothing, and looks
  *     exactly like a page that did not change.
@@ -278,7 +278,8 @@ test('a trip that recorded no invalidation says so instead of implying pages wer
 test('an empty window is explained by the pass cadence, not read as "nothing is probing"', async () => {
 	const ctx = await ready({ analytics: { ...ANALYTICS, series: [] } });
 	const text = draw(ctx).textContent;
-	assert.match(text, /once per FINISHED pass/);
+	assert.match(text, /per batch/);
+	assert.match(text, /once per FINISHED\s+pass/);
 	assert.match(text, /widen the range/);
 });
 
@@ -486,17 +487,17 @@ test('rows skipped as fresh are counted against what a pass considered, not agai
 	assert.match(tile(ctx, 'Skipped as fresh').textContent, /of 5\.0k rows considered/);
 });
 
-// A settled deployment that skips most of what it considers is not keeping the cadence its
-// settings describe: reprobeAfter sits too close to sweepInterval, so a URL probed late in one
-// pass is skipped by the next and its true cadence is two sweep intervals. `probed` alone just
-// looks like a smaller corpus.
-test('a sustained skip share is explained as a reprobeAfter/sweepInterval overlap', async () => {
+// Since plugin v0.97.0 a pass skips only rows it (or the pass it resumes) already probed, so a large
+// skip share is resumes re-walking ground — a node restarting mid-pass. The old advice (tune
+// `reprobeAfter`, an option since retired) must not be given.
+test('a sustained skip share is explained as resumed passes re-walking ground, not as a reprobeAfter overlap', async () => {
 	const ctx = await ready({
 		analytics: { ...ANALYTICS, series: [...ANALYTICS.series, passes('fresh', 4, 5000)] },
 	});
 	const text = draw(ctx).textContent;
-	assert.match(text, /reprobeAfter/);
-	assert.match(text, /two sweep\s+intervals|two sweep intervals/);
+	assert.match(text, /skipped as already probed/);
+	assert.match(text, /restarting mid-pass/);
+	assert.doesNotMatch(text, /reprobeAfter/);
 });
 
 // ---------------------------------------------------------------- unreadable rows
@@ -883,7 +884,7 @@ const v2Settings = {
 	ratePerSecond: 10,
 	concurrency: 4,
 	scope: 'all',
-	reprobeAfter: 6 * HOUR,
+	// No reprobeAfter: plugin v0.97.0 retired it and stopped reporting it.
 	trigger: { concurrency: 8 },
 	canary: { interval: 30 * 60_000, count: 500, threshold: 0.7, minSample: 50 },
 };
@@ -1136,13 +1137,15 @@ test('detail on demand: per-slot changes carry the extract path, per-field misma
 	assert.match(last.textContent, /Mapping guard/);
 });
 
-test('the finished-pass charts say they are per finished pass, not live — and draw what a change produced', async () => {
+test('the pass charts say they are counts, not a live gauge — and draw what a change produced', async () => {
 	const ctx = await ready();
-	const card = cardTitled(ctx, /^Finished passes/);
+	const card = cardTitled(ctx, /^Probe passes/);
 	assert.ok(card);
-	assert.match(card.textContent, /per finished pass — not live/);
+	assert.match(card.textContent, /counts, not a live gauge/);
 	// The long "why" sits behind the card's help toggle — present, not on the page by default.
-	assert.match(helpText(card), /NOT LIVE/);
+	assert.match(helpText(card), /NOT A LIVE GAUGE/);
+	assert.match(helpText(card), /per probed batch/);
+	assert.doesNotMatch(helpText(card), /bars are passes/);
 	assert.match(helpText(card), /Throttled is inside Failed/);
 	const acted = tile(ctx, 'Acted on');
 	assert.match(acted.textContent, /220/, 'Σ over 4 passes of 55');
@@ -1158,7 +1161,7 @@ test('a window from an older plugin: the series v0.94.0 removed draw no tile, le
 			series: [...ANALYTICS.series, passes('deferred', 4, 5), passes('trigger_queue_depth', 4, 812)],
 		},
 	});
-	const card = cardTitled(ctx, /^Finished passes/);
+	const card = cardTitled(ctx, /^Probe passes/);
 	assert.equal(tile(ctx, 'Trigger queue peak'), null);
 	assert.doesNotMatch(card.textContent, /Deferred|deferred|queue peak|812/);
 	assert.match(tile(ctx, 'Acted on').textContent, /220/);
@@ -1376,7 +1379,7 @@ test('the status read time is on the page, so a stale screen can never pass for 
 
 // ---- the redesign: shell-owned header and range, help toggles, scoped refresh (console v0.17) ----
 
-test('the finished-pass panel follows the GLOBAL range, and the view has no range picker of its own', async () => {
+test('the pass panel follows the GLOBAL range, and the view has no range picker of its own', async () => {
 	const ctx = makeCtx();
 	ctx.rangeMs = 6 * HOUR;
 	await load(ctx);
@@ -1510,4 +1513,67 @@ test('explanations moved behind help keep their substance', async () => {
 		null,
 		'no explanatory paragraph is left in a card body'
 	);
+});
+
+// ---- the Change safety card (plugin v0.97.0 series) ----
+
+/** A counted event: one emit per event, value 1, the detail on the method slot. */
+const events = (series, detail, n) => ({ ...passes(series, n, 1), method: detail });
+
+/** A duration: `n` samples whose median and p95 are as given, the bound on method and the rule on type. */
+const lag = (bound, rule, n, medianMs, p95Ms) => ({
+	...passes('detection_lag', n, medianMs),
+	method: bound,
+	type: rule,
+	median: medianMs,
+	p95: p95Ms,
+});
+
+/** A tile's VALUE line alone (its label and caption run into it in `textContent`). */
+const valueOf = (ctx, label) => tile(ctx, label).children[1].textContent;
+
+const SAFETY = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		passes('errors', 2, 3), // 2 batches with 3 action errors each = 6
+		passes('caught_up', 4, 10),
+		passes('covered', 1, 7),
+		events('anchor', 'on_time', 3),
+		events('anchor', 'skipped', 1),
+		lag('pass', 'price', 100, 2 * HOUR, 6 * HOUR),
+		lag('previous_pass', 'price', 100, 20 * HOUR, 30 * HOUR),
+		events('render_mismatch', 'rechecked', 5),
+		events('render_mismatch', 'confirmed', 2),
+		events('render_mismatch', 'cleared', 3),
+		events('render_mismatch', 'shed', 4),
+	],
+};
+
+test('the Change safety card sums action errors by VALUE and flags them', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.equal(valueOf(ctx, 'Action errors'), '6');
+	assert.match(draw(ctx).textContent, /6 action error\(s\)/);
+	assert.equal(valueOf(ctx, 'Caught up'), '40');
+	assert.equal(valueOf(ctx, 'Covered'), '7');
+});
+
+test('the Change safety card reads anchor outcomes, and a skipped anchor is the warning', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.match(tile(ctx, 'Anchored passes').textContent, /3 on time/);
+	assert.equal(valueOf(ctx, 'Skipped anchors'), '1');
+	assert.match(draw(ctx).textContent, /an anchored pass was skipped/);
+});
+
+test('the Change safety card reads detection lag as a duration and the render check by outcome', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.match(tile(ctx, 'Detection lag').textContent, /2(\.0)?\s?h/);
+	assert.match(tile(ctx, '…from the previous pass').textContent, /20(\.0)?\s?h/);
+	assert.match(tile(ctx, 'Render check').textContent, /2 confirmed stale · 3 cleared/);
+	assert.match(tile(ctx, 'Not re-probed').textContent, /4 shed/);
+});
+
+test('without the v0.97.0 series the Change safety card says so rather than showing zeros', async () => {
+	const ctx = await ready();
+	assert.match(draw(ctx).textContent, /No action, anchor, detection-lag or render-check series/);
 });

@@ -20,16 +20,29 @@ const parser = new XMLParser({
  * truthiness (`data.urlset` is falsy for an empty sitemap). The `typeof data === 'object'`
  * guard keeps `in` off a non-object result — fast-xml-parser v5 always returns an object
  * (plain text parses to `{}`), but this stays safe if that ever changes.
+ *
+ * ALSO THROWS ON A TRUNCATED DOCUMENT — one whose root element is never closed. Without validation
+ * fast-xml-parser parses an unclosed `<urlset>` to whatever prefix it got, and a cut-off body is not
+ * an edge case: undici decodes a truncated gzip stream leniently, so a 200 whose compressed body was
+ * cut short arrives as a well-formed-looking PREFIX with no error anywhere (reproduced: 1,972 of
+ * 5,000 entries, status 200, no throw). Accepted, every URL past the cut reads as departed — unlinked,
+ * then rendered by the departure check, then rendered again as a rejoin once the origin recovers.
+ * Thrown, it is a failed child, which holds back the departures that could have moved into it
+ * (Sitemap.js `processDepartures`).
  */
 export function parseSitemap(xml) {
 	const data = parser.parse(xml);
 
 	if (data && typeof data === 'object') {
 		if ('urlset' in data) {
-			return { isIndex: false, entries: Array.isArray(data.urlset?.url) ? data.urlset.url : [] };
+			const entries = Array.isArray(data.urlset?.url) ? data.urlset.url : [];
+			assertComplete(xml, 'urlset', entries.length);
+			return { isIndex: false, entries };
 		}
 		if ('sitemapindex' in data) {
-			return { isIndex: true, entries: Array.isArray(data.sitemapindex?.sitemap) ? data.sitemapindex.sitemap : [] };
+			const entries = Array.isArray(data.sitemapindex?.sitemap) ? data.sitemapindex.sitemap : [];
+			assertComplete(xml, 'sitemapindex', entries.length);
+			return { isIndex: true, entries };
 		}
 	}
 
@@ -38,6 +51,31 @@ export function parseSitemap(xml) {
 		`expected a <urlset> or <sitemapindex> root, got ${rootTags.length ? `<${rootTags.join('>, <')}>` : 'a non-XML or empty document'}`
 	);
 }
+
+// What may legitimately follow the root's close: whitespace, comments, processing instructions.
+const TRAILER = /^(?:\s|<!--[\s\S]*?-->|<\?[\s\S]*?\?>)*$/;
+
+/**
+ * Throw unless the document's LAST element is the root's close (or a self-closed empty root).
+ *
+ * A targeted check rather than `XMLValidator.validate`, on purpose. Full validation is strict about
+ * things real sitemaps get wrong and every parser tolerates — an unescaped `&` in a `<loc>` is enough —
+ * and a document it refused would be a child failed on EVERY walk, which stops that child's prune and,
+ * through the failed-walk guard, every departure in the walk. Truncation is the failure worth refusing,
+ * and a cut-off document has exactly one signature: its root is never closed.
+ */
+const assertComplete = (xml, root, parsed) => {
+	const text = String(xml);
+	const close = text.lastIndexOf(`</${root}`);
+	const closeEnd = close >= 0 ? text.indexOf('>', close) : -1;
+	if (closeEnd >= 0 && TRAILER.test(text.slice(closeEnd + 1))) return;
+	const selfClosed = new RegExp(`<${root}\\b[^>]*/>`).exec(text);
+	if (selfClosed && close < 0 && TRAILER.test(text.slice(selfClosed.index + selfClosed[0].length))) return;
+	throw new Error(
+		`the document is truncated — its <${root}> is never closed (${parsed} entries before the cut). ` +
+			`Refused rather than read as a shorter sitemap, which would unlink every URL past the cut`
+	);
+};
 
 /**
  * Split a sitemap's `<url>` entries into the ones worth prerendering and the ones that aren't.
@@ -48,13 +86,14 @@ export function parseSitemap(xml) {
  * pure render load and cache growth for no served output. At 1M+ URLs that is the difference
  * between the fleet working on pages bots actually receive and working on nothing.
  *
- * Returns `{ incoming, filtered, invalid }`:
+ * Returns `{ incoming, filtered, invalid, routes }`:
  *   - `incoming` — Map of canonical URL-half -> entry, for prerender-class URLs only. Keyed the
  *     same way the bot read keys it, so the prune diff and the target keys built from it match
  *     what a request will look up.
  *   - `filtered`  — per-class counts of entries deliberately left out.
  *   - `invalid`   — `{ loc, message }` for entries whose URL won't parse, so one bad `<loc>`
  *     reports itself instead of aborting a refresh over millions of good ones.
+ *   - `routes`    — every route (`routeKey`) the document's entries fall on, filtered ones included.
  *
  * Pure and dependency-free (both helpers it uses are pure), so it is unit-testable — unlike
  * `Sitemap.refresh`, which cannot be loaded without a live Harper.
@@ -63,6 +102,7 @@ export const partitionSitemapEntries = (entries) => {
 	const incoming = new Map();
 	const filtered = { [PASSTHROUGH]: 0, [UNCLASSIFIED]: 0 };
 	const invalid = [];
+	const routes = new Set();
 
 	for (const entry of Array.isArray(entries) ? entries : []) {
 		try {
@@ -79,7 +119,9 @@ export const partitionSitemapEntries = (entries) => {
 
 			// One classification serves both the decision and the key; deriving them from separate
 			// calls would let the class and the allowlist disagree about the same URL.
-			const { routeClass, queryParams } = classifyPath(parsed.pathname);
+			const classified = classifyPath(parsed.pathname);
+			const { routeClass, queryParams } = classified;
+			routes.add(routeKey(classified));
 			if (routeClass !== PRERENDER) {
 				filtered[routeClass]++;
 				continue;
@@ -90,5 +132,14 @@ export const partitionSitemapEntries = (entries) => {
 		}
 	}
 
-	return { incoming, filtered, invalid };
+	return { incoming, filtered, invalid, routes };
 };
+
+/**
+ * A classification's ROUTE as a comparable key: the matched route entry, or the class when none
+ * matched. The granularity a URL can shear across — a paginated product sitemap moves product URLs
+ * between its children, never into the store-locator sitemap — so it is what scopes a failed child's
+ * hold-back (resources/Sitemap.js). Printable, because a child row stores the set of them.
+ */
+export const routeKey = ({ routeClass, entry }) =>
+	entry ? JSON.stringify([routeClass, entry.match, entry.path]) : routeClass;

@@ -25,9 +25,11 @@
  * schedule row is. When the buffer is re-created zeroed at worker-generation replacement, the schedule
  * rows are still due and the next claim simply re-grants them. The cost is a duplicate-render burst —
  * at ~500 in flight per node a rolling four-node restart re-grants ~2,000 jobs whose original renderers
- * are still working, and both results are accepted (the later `PrerenderedPage.put` wins, with a correct
- * `expiresAt`). The one sharp edge is that two results for the same failing key each run
- * `Target.patch(url, { strikes })`, so a failing key can double-strike toward `maxStrikes`. That is
+ * are still working. A result whose render provably began before its key's latest grant is dropped
+ * (`grantOf`, and `RenderQueue.processJobResult`); one that cannot be proved late is accepted, and the
+ * later `PrerenderedPage.put` wins, with a correct `expiresAt`. The one sharp edge is that two results
+ * for the same failing key each run `Target.patch(url, { strikes })`, so a failing key can
+ * double-strike toward `maxStrikes`. That is
  * accepted: every candidate fix (gate the strike on lease presence, stamp a claim generation onto the
  * row) silently disables the `render.failureRetry.fastRetries` lane across restarts, which is worse.
  *
@@ -38,7 +40,9 @@
  * row at its original due time, and a claim's durable-row check would pass. `release` therefore sets
  * the expiry to `now + RELEASE_GRACE_MS`: the key stays unclaimable for a few seconds while the
  * transaction becomes visible, and the slot is then reused exactly like any expired one. Committing the
- * transaction early instead is NOT an option: the request wrapper commits again.
+ * transaction early instead is NOT an option: the request wrapper commits again. The same ordering is
+ * why a commit that FAILS after the release is invisible here unless something counts it: the row is
+ * still due at the minute it was granted for, so a re-grant at that minute is counted as a miss.
  *
  * NOTE ON THIS MODULE'S DEPENDENCIES: it has none beyond the hash. No `config`, no Harper globals, not
  * even the `getSab` wrapper — the LIVE buffer is acquired in `util/renderSchedule.js`. This file is a
@@ -61,16 +65,41 @@ export const LEASE_EPOCH_SEC = 1_700_000_000;
 const H_OCCUPANCY = 0;
 const HEADER_INT32 = 1;
 
-// Slot: [hashLo, hashHi, expiresSec, dueMinute, misses]
+// Slot: [hashLo, hashHi, expiresSec, dueMinute, misses, grantedSec, grantedDue, grantedMs]
 const S_LO = 0;
 const S_HI = 1;
 const S_EXPIRES = 2;
 const S_DUE = 3;
-// How many of this key's leases in a row EXPIRED rather than being released: the result never came
-// (a renderer crash, a result that could not get back to this node), or the fast-retry lane held it.
-// Reset by a release. See `missesBeforeGrant` and `hold`.
+// How many of this key's leases in a row ended without moving the row: EXPIRED with no result (a
+// renderer crash, a result that could not get back to this node, or the fast-retry lane holding it),
+// or RELEASED and then re-granted at the very due minute it was granted for — a result that was
+// processed but whose commit did not land. Reset by a release the row moved past. See
+// `missesBeforeGrant` and `hold`.
 const S_MISSES = 4;
-const SLOT_INT32 = 5;
+// When the key's LATEST REAL GRANT was made — whole seconds relative to LEASE_EPOCH_SEC, plus its
+// millisecond within that second — and the due minute it was made for. Written by every grant that is
+// not a hold, and deliberately NOT by release or expiry: they describe the lease generation a result has
+// to belong to, which is exactly what a released or expired slot still has to answer (see `grantOf`).
+//
+// TO THE MILLISECOND, because it is compared with marks that are. A change or an ask filed due now is
+// typically granted 0.2-1.5 s later; floored to its second, a grant in the same wall-clock second as the
+// mark read as EARLIER than it (measured: 23.6% of marks filed strictly before their grant), and the
+// result path then dropped a correct first render of a changed page as changed-during-render. An Int32
+// cannot hold epoch milliseconds, hence the second word.
+const S_GRANTED = 5;
+const S_GRANTED_DUE = 6;
+const S_GRANTED_MS = 7;
+const SLOT_INT32 = 8;
+
+/** `grantedDue` of a slot no real grant has written: a hold into a fresh slot. `grantOf` reports none. */
+const GRANT_NONE = -1;
+
+/**
+ * `grantedDue` of a lease released by a result that DELIBERATELY left its row due (`release`'s
+ * `leftDue`): the grant is still known, but its due minute is forgotten, so re-granting the row at that
+ * minute is not read as a result whose commit failed.
+ */
+const GRANT_LEFT_DUE = -2;
 
 /**
  * `dueMinute` of a slot whose lease has been RELEASED and is only sitting out its
@@ -112,7 +141,7 @@ const MAX_PROBE = 8;
 export const LEASE_HEADER_BYTES = HEADER_INT32 * 4;
 export const LEASE_SLOT_BYTES = SLOT_INT32 * 4;
 
-/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 81,924 B. */
+/** Byte size of a lease buffer with `slots` slots. 4,096 slots = 131,076 B. */
 export const leaseBufferBytes = (slots) => LEASE_HEADER_BYTES + LEASE_SLOT_BYTES * Math.max(0, slots | 0);
 
 /** Slots that actually fit in a buffer of this size — the authority when a size assert fails. */
@@ -144,6 +173,10 @@ export const createLeaseTable = ({
 	// double render; a lease that expires 999 ms late is nothing.
 	const toExpiresSec = (ms) => Math.ceil(ms / 1000) - LEASE_EPOCH_SEC;
 	const fromExpiresSec = (sec) => (sec + LEASE_EPOCH_SEC) * 1000;
+	// A grant instant is kept exactly, as a whole second and its millisecond (see S_GRANTED).
+	const toGrantedSec = (ms) => Math.floor(ms / 1000) - LEASE_EPOCH_SEC;
+	const grantedAtOf = (at) =>
+		fromExpiresSec(Atomics.load(i32, at + S_GRANTED)) + Math.max(0, Atomics.load(i32, at + S_GRANTED_MS));
 
 	// A slot is live while now is strictly before its expiry second. `expiresSec === 0` on a
 	// never-written slot therefore reads as long expired rather than as "leased at the epoch
@@ -236,14 +269,25 @@ export const createLeaseTable = ({
 		const { found, free } = locate(lo, hi, nowSec);
 		const expiresSec = toExpiresSec(leaseExpiryMs);
 		// Clamped at 0 so a caller's junk value can never land on a marker.
-		const due = held ? DUE_HELD : Math.max(0, dueMinute | 0);
+		const minute = Math.max(0, dueMinute | 0);
+		const due = held ? DUE_HELD : minute;
+		const grantedAt = Math.floor(now());
+		const grantedSec = toGrantedSec(grantedAt);
+		const grantedMs = grantedAt - Math.floor(grantedAt / 1000) * 1000;
 
 		if (found !== -1) {
 			const at = base(found);
 			const observed = Atomics.load(i32, at + S_EXPIRES);
 			if (isLive(observed, nowSec)) return false;
-			const misses = missesOf(at);
+			const misses = missesOf(at, minute);
 			Atomics.store(i32, at + S_DUE, due);
+			// The generation stamp BEFORE the expiry CAS that publishes the lease, so a generation-checked
+			// `release` racing this grant sees the new stamp and refuses (see `release`).
+			if (!held) {
+				Atomics.store(i32, at + S_GRANTED, grantedSec);
+				Atomics.store(i32, at + S_GRANTED_MS, grantedMs);
+				Atomics.store(i32, at + S_GRANTED_DUE, minute);
+			}
 			if (Atomics.compareExchange(i32, at + S_EXPIRES, observed, expiresSec) !== observed) return false;
 			Atomics.store(i32, at + S_MISSES, misses);
 			if (!held) Atomics.add(i32, H_OCCUPANCY, 1);
@@ -257,6 +301,10 @@ export const createLeaseTable = ({
 		Atomics.store(i32, at + S_EXPIRES, expiresSec);
 		Atomics.store(i32, at + S_DUE, due);
 		Atomics.store(i32, at + S_MISSES, 0);
+		// A hold into a fresh slot has no grant behind it: a negative due minute reads as "no generation".
+		Atomics.store(i32, at + S_GRANTED, held ? 0 : grantedSec);
+		Atomics.store(i32, at + S_GRANTED_MS, held ? 0 : grantedMs);
+		Atomics.store(i32, at + S_GRANTED_DUE, held ? GRANT_NONE : minute);
 		onGrantWindow?.(cacheKey);
 		if (Atomics.compareExchange(i32, at + S_LO, observedLo, lo) !== observedLo) return false;
 		if (liveElsewhere(lo, hi, free, nowSec)) {
@@ -272,28 +320,48 @@ export const createLeaseTable = ({
 	 * failing to report (see `claimSchedules`). Node-local and lost on restart, deliberately — it writes
 	 * nothing durable, so a restart simply gives the key another attempt. A result that arrives for the
 	 * key meanwhile (`release`) ends the hold after the usual grace and resets its miss count.
+	 *
+	 * `dueMinute` is the row's, as for a grant: it is what decides whether the lease that just ended
+	 * counts as a miss the hold carries (see `missesOf`).
 	 */
-	const hold = (cacheKey, untilMs) => grant(cacheKey, { leaseExpiryMs: untilMs, held: true });
+	const hold = (cacheKey, untilMs, dueMinute) => grant(cacheKey, { dueMinute, leaseExpiryMs: untilMs, held: true });
 
 	/**
-	 * The miss count a grant into the expired slot at `at` carries: reset by a release, carried unchanged
-	 * through a hold (no render was attempted), and advanced by one for a lease that simply expired.
+	 * The miss count a grant for `dueMinute` into the expired slot at `at` carries: carried unchanged
+	 * through a hold (no render was attempted), advanced by one for a lease that simply expired, and
+	 * reset by a release — UNLESS the key is being granted again for the same due minute its released
+	 * lease was granted for.
+	 *
+	 * THAT IS A RESULT WHOSE COMMIT DID NOT LAND. The result path releases the lease from inside the
+	 * request, before the request's transaction commits (see the module comment). If that commit then
+	 * fails, the renderer has already been answered and does not retry, the row is still due at its old
+	 * minute, and the key is re-granted as soon as the grace passes — and a plain release-resets rule
+	 * zeroed the count every time, so the wedge guard could never engage on a loop that renders the same
+	 * page every few seconds and stores none of them. Every result that lands moves the row (a
+	 * reschedule, a backoff, a recheck or a delete), so a re-grant at the same minute is the signature.
 	 */
-	const missesOf = (at) => {
+	const missesOf = (at, dueMinute) => {
 		const due = Atomics.load(i32, at + S_DUE);
 		const stored = Math.max(0, Atomics.load(i32, at + S_MISSES));
-		if (due === DUE_RELEASED) return 0;
+		if (due === DUE_RELEASED) {
+			const grantedDue = Atomics.load(i32, at + S_GRANTED_DUE);
+			// Left due on purpose: carried, like a hold — neither a result whose commit failed nor one that
+			// moved the row past its trouble.
+			if (grantedDue === GRANT_LEFT_DUE) return stored;
+			return dueMinute !== undefined && grantedDue === dueMinute ? stored + 1 : 0;
+		}
 		return due === DUE_HELD ? stored : stored + 1;
 	};
 
 	/**
-	 * How many of `cacheKey`'s leases in a row have just expired without a result: 0 when it holds no
-	 * expired slot, when its last lease was released, and when what just ended was a HOLD — the attempt
-	 * after a hold is always granted, carrying the count, so a key that still fails to report is held
-	 * again for twice as long. The claim path uses it to bound a render that never reports (see
-	 * `claimSchedules`). An undercount when the slot has been recycled by another key, never an overcount.
+	 * How many of `cacheKey`'s leases in a row have ended without moving its row, counting the grant about
+	 * to be made for `dueMinute` (see `missesOf`): 0 when it holds no expired slot, when its last lease
+	 * was released and the row has moved since, and when what just ended was a HOLD — the attempt after a
+	 * hold is always granted, carrying the count, so a key that still fails to report is held again for
+	 * twice as long. The claim path uses it to bound a render that never reports (see `claimSchedules`).
+	 * An undercount when the slot has been recycled by another key, never an overcount.
 	 */
-	const missesBeforeGrant = (cacheKey) => {
+	const missesBeforeGrant = (cacheKey, dueMinute) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
 		const { found } = locate(lo, hi, nowSec);
@@ -301,7 +369,35 @@ export const createLeaseTable = ({
 		const at = base(found);
 		if (isLive(Atomics.load(i32, at + S_EXPIRES), nowSec)) return 0;
 		if (Atomics.load(i32, at + S_DUE) === DUE_HELD) return 0;
-		return missesOf(at);
+		return missesOf(at, dueMinute === undefined ? undefined : Math.max(0, dueMinute | 0));
+	};
+
+	/**
+	 * The key's LATEST REAL GRANT — `{ grantedAtMs, dueMinute, live, released }` — whether that lease is
+	 * still live, released, or long expired; null when no slot knows the key (never leased on this worker
+	 * generation, or the slot was recycled by another key).
+	 *
+	 * It is the lease GENERATION a result can be tested against, which the rest of this table cannot
+	 * answer: `leaseOf` forgets a lease the moment it is released or expires, and a result can arrive
+	 * after either — a render that outlived its lease is still posted — by which time the key may have
+	 * been granted to another renderer. `grantedAtMs` is exact to the millisecond.
+	 */
+	const grantOf = (cacheKey) => {
+		const { lo, hi } = lease64(cacheKey);
+		const nowSec = nowSecond();
+		const { found } = locate(lo, hi, nowSec);
+		if (found === -1) return null;
+		const at = base(found);
+		const grantedDue = Atomics.load(i32, at + S_GRANTED_DUE);
+		if (grantedDue === GRANT_NONE) return null;
+		const due = Atomics.load(i32, at + S_DUE);
+		return {
+			grantedAtMs: grantedAtOf(at),
+			// null once a release has said the row was left due on purpose
+			dueMinute: grantedDue < 0 ? null : grantedDue,
+			live: isCounted(at, nowSec),
+			released: due === DUE_RELEASED,
+		};
 	};
 
 	/** Does another slot in `lo`'s probe window hold a live lease for this key? */
@@ -327,6 +423,18 @@ export const createLeaseTable = ({
 	 * claimable again once its `RELEASE_GRACE_MS` grace has passed. Idempotent; false when this key
 	 * holds no lease to give up.
 	 *
+	 * `grantedAtMs` (from `grantOf`) makes the release GENERATION-CHECKED: it gives up only the lease that
+	 * was granted then, and refuses when the key has been granted again since. Without it, a result that
+	 * outlived its lease released whichever lease the key held when it arrived — another renderer's, whose
+	 * key then became claimable again under it.
+	 *
+	 * `leftDue` says the result landed but left its row due ON PURPOSE — a render dropped for predating a
+	 * change mark, or one that kept an ask filed while it ran. The row is then re-granted at the minute
+	 * this lease was granted for, which is otherwise the signature of a result whose commit failed (see
+	 * `missesOf`); forgetting that minute keeps a deliberate re-render from counting toward a wedge hold,
+	 * and the count it had is carried, not reset — a deliberate re-render is not a result that proved
+	 * the key healthy either.
+	 *
 	 * The slot is deliberately NOT published free — see the module comment on the commit-visibility
 	 * grace. Nothing in this function writes `hashLo`, and the one payload word it does write is CAS'd
 	 * against the value it read.
@@ -335,7 +443,7 @@ export const createLeaseTable = ({
 	 * can have been recycled by another key in between, and clearing it by index would silently free
 	 * somebody else's lease.
 	 */
-	const release = (cacheKey) => {
+	const release = (cacheKey, { grantedAtMs, leftDue = false } = {}) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
 		const { found } = locate(lo, hi, nowSec);
@@ -353,6 +461,13 @@ export const createLeaseTable = ({
 		// written.
 		const expiresSec = Atomics.load(i32, at + S_EXPIRES);
 		if (Atomics.load(i32, at + S_LO) !== lo || Atomics.load(i32, at + S_HI) !== hi) return false;
+		// The generation, checked after the expiry was read: a grant stores its stamp BEFORE its expiry CAS,
+		// so a re-grant already under way when that read ran has changed the stamp by now and is refused.
+		// One that starts after this check can still have its due word taken by the CAS below (a window of
+		// a few instructions): its expiry is never shortened — the expiry CAS names the value read above —
+		// so the key stays unclaimable for the whole new lease, and only the gauge and `leaseOf` read it as
+		// released until the next slot walk.
+		if (grantedAtMs !== undefined && grantedAtOf(at) !== grantedAtMs) return false;
 
 		// ONE release per lease, claimed with a CAS on the due-minute word. Two results for one key is
 		// a documented case (the restart duplicate-render burst), and without this claim the second
@@ -361,6 +476,7 @@ export const createLeaseTable = ({
 		if (dueMinute === DUE_RELEASED) return false;
 		const wasCounted = isCounted(at, nowSec); // false for a hold: it was never counted
 		if (Atomics.compareExchange(i32, at + S_DUE, dueMinute, DUE_RELEASED) !== dueMinute) return false;
+		if (leftDue) Atomics.store(i32, at + S_GRANTED_DUE, GRANT_LEFT_DUE);
 
 		// Shorten to the grace, never lengthen (a lease that already expired stays expired), and only
 		// if the expiry is still the one read above.
@@ -416,6 +532,7 @@ export const createLeaseTable = ({
 		occupancy,
 		scanLive,
 		leaseOf,
+		grantOf,
 		missesBeforeGrant,
 		resetAll,
 	};
@@ -423,5 +540,6 @@ export const createLeaseTable = ({
 
 /** The named cross-worker buffer this table lives in. Versioned, so a layout change gets a new name
  *  rather than a differently-shaped view of the old bytes (v2: the claim floor's header words are gone,
- *  and a slot carries its miss count). */
-export const LEASE_SAB_KEY = 'render_queue_v2';
+ *  and a slot carries its miss count; v3: and its latest grant's instant, to the millisecond, and due
+ *  minute). */
+export const LEASE_SAB_KEY = 'render_queue_v3';

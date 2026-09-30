@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { walkUrlRange } from '../src/util/urlWalk.js';
+import { recoverKeylessKeys, walkUrlRange } from '../src/util/urlWalk.js';
 
 /**
  * The unreadable-row contract (see src/util/urlWalk.js): rows without a string `url` are skipped
@@ -238,4 +238,46 @@ test('a projection that omits the key still walks: the key is always projected',
 		table.calls.every((call) => !call.select || call.select.includes('url')),
 		'every projected read carries the key'
 	);
+});
+
+// ---- where an unreadable row was, and getting its key back ----
+
+test('onUnreadable says where a url-less row sat: after the last readable key, or null before the first', async () => {
+	const rows = [row(U(1), false), row(U(2)), row(U(3), false), row(U(4))];
+	const seen = [];
+	await collect(
+		walkUrlRange(fakeTable(rows), { select: ['url'], chunkSize: 10, onUnreadable: (info) => seen.push(info) })
+	);
+	assert.deepEqual(seen, [{ after: null }, { after: U(2) }]);
+});
+
+/** A primary store over `entries` ({ key, value }), in key order, as `getRange` yields them. */
+const storeTable = (entries) => ({
+	primaryStore: {
+		*getRange({ start } = {}) {
+			for (const entry of entries) if (start === undefined || entry.key >= start) yield entry;
+		},
+	},
+});
+
+test('recoverKeylessKeys finds every keyless row between a gap and the next readable one — and nothing else', () => {
+	const table = storeTable([
+		{ key: U(1), value: { url: U(1) } },
+		{ key: U(2), value: { sitemapUrl: null } }, // stub
+		{ key: U(3), value: null }, // tombstone: not a row
+		{ key: U(4), value: { strikes: 0 } }, // stub
+		{ key: U(5), value: { url: U(5) } }, // closes the gap
+		{ key: U(6), value: { sitemapUrl: null } }, // a different gap nobody reported
+	]);
+	assert.deepEqual(recoverKeylessKeys(table, [U(1), U(1)]), [U(2), U(4)]);
+	assert.deepEqual(recoverKeylessKeys(table, [null]), [], 'a gap before the first row ends at the first readable one');
+});
+
+test('recoverKeylessKeys is bounded per gap and overall, honours the key attribute, and needs a primary store', () => {
+	const entries = [{ key: 'k0', value: { cacheKey: 'k0' } }];
+	for (let i = 1; i <= 20; i++) entries.push({ key: `k${String(i).padStart(2, '0')}`, value: { expiresAt: 1 } });
+	const table = storeTable(entries);
+	assert.equal(recoverKeylessKeys(table, ['k0'], { key: 'cacheKey', perGap: 5 }).length, 5);
+	assert.equal(recoverKeylessKeys(table, ['k0'], { key: 'cacheKey', max: 3 }).length, 3);
+	assert.deepEqual(recoverKeylessKeys({ search() {} }, ['k0']), []);
 });

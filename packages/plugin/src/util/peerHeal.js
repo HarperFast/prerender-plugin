@@ -119,3 +119,87 @@ export const forwardHeal = async ({ owner, url, cacheKey }) => {
 		clearTimeout(timer);
 	}
 };
+
+// ---- a "render this now" filing, forwarded to the row's owner ---------------------------------------
+
+/**
+ * The path, and the single gate for the client and the endpoint alike: on, with the shared secret the
+ * peer endpoints already use. See `queue.dueNowForward` for why this exists.
+ */
+export const PEER_DUE_NOW_PATH = '/prerender_peer/due-now';
+
+export const isDueNowForwardActive = () =>
+	Boolean(config.queue.dueNowForward.enabled && config.peerRescue.token && config.peerRescue.header);
+
+/**
+ * How long an owner is not asked again after a transport failure. Not a config option: it only bounds
+ * the cost of a peer that is down (a bulk revalidate forwards about three rows in four, and each would
+ * otherwise wait out the timeout), and the fallback it leads to is the pre-forwarding behaviour.
+ */
+const FORWARD_COOLDOWN_MS = 30_000;
+const coolingUntil = new Map();
+
+/** Tests only: forget every cooldown. */
+export const resetDueNowForward = () => coolingUntil.clear();
+
+/**
+ * Ask `owner` to file `cacheKey` due now with its own `fileDueNow`, where the read that keeps an earlier
+ * due time and a change mark is authoritative. Returns `{ ok: true, nextRenderTime }` when the owner
+ * filed it, else `{ ok: false, reason }` (with `timedOut` when the answer was merely slow) — and the
+ * caller decides whether to write locally, as it always did.
+ *
+ * Never throws, for the same reason `forwardHeal` does not: every failure has to end as a fallback.
+ */
+export const forwardDueNow = async ({
+	owner,
+	cacheKey,
+	fromSitemap,
+	effectiveInterval,
+	changedAt,
+	demandPeriod,
+	urgent = true,
+}) => {
+	if (!isDueNowForwardActive()) return { ok: false, reason: 'disabled' };
+	if (!isKnownNode(owner)) return { ok: false, reason: `unknown node "${owner}"` };
+	if ((coolingUntil.get(owner) ?? 0) > Date.now()) return { ok: false, reason: 'cooling' };
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), config.queue.dueNowForward.timeoutMs);
+	timer.unref?.();
+	try {
+		const response = await fetch(`${peerOrigin(owner)}${PEER_DUE_NOW_PATH}`, {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				[config.peerRescue.header]: config.peerRescue.token,
+			},
+			body: JSON.stringify({ cacheKey, fromSitemap, effectiveInterval, changedAt, demandPeriod, urgent }),
+			signal: controller.signal,
+			dispatcher: dispatcher(),
+		});
+		if (!response.ok) {
+			// A 400 is about this one filing; anything else (404: the owner has it off, 403: the token
+			// differs, 5xx) will answer the next one the same way.
+			if (response.status !== 400) coolingUntil.set(owner, Date.now() + FORWARD_COOLDOWN_MS);
+			return { ok: false, reason: `peer responded ${response.status}` };
+		}
+		const body = await response.json();
+		const nextRenderTime = Number(body?.nextRenderTime);
+		// A refusal (`not-owner`: the owner's view of residency differs, mid-topology-change) is the
+		// owner working, not a fault — no cooldown, and the caller files locally.
+		if (body?.outcome !== 'filed' || !Number.isFinite(nextRenderTime)) {
+			return { ok: false, reason: body?.outcome ?? 'no outcome' };
+		}
+		coolingUntil.delete(owner);
+		return { ok: true, nextRenderTime };
+	} catch (e) {
+		coolingUntil.set(owner, Date.now() + FORWARD_COOLDOWN_MS);
+		const name = e?.name;
+		const message = e?.message ?? String(e);
+		// A timeout is reported apart from a failure: the owner may have filed it (see `fileDueNow`).
+		if (name === 'AbortError') return { ok: false, reason: 'peer timed out', timedOut: true };
+		return { ok: false, reason: `peer fetch failed: ${message}` };
+	} finally {
+		clearTimeout(timer);
+	}
+};

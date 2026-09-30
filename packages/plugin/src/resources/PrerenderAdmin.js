@@ -77,10 +77,12 @@ import { setTimeout as sleep, setImmediate as yieldNow } from 'node:timers/promi
 import {
 	config,
 	collectConfigWarnings,
+	collectOverrideWarnings,
 	pendingRestartChanges,
 	describeConfigLayers,
 	resolveConfig,
 	activeOverrides,
+	hashConfigValue,
 	hostOptions,
 } from '../config.js';
 import { describeConfigSchema, secretPaths } from '../configSchema.js';
@@ -116,6 +118,7 @@ import { getLastOrphanSweep, isOrphanSweepRunning, runOrphanSweepOnce } from '..
 import { getPageOrphanSweepState, startPageOrphanSweep, stopPageOrphanSweep } from '../util/pageOrphanSweep.js';
 import { getDiscoveredPurgeState, startDiscoveredPurge, stopDiscoveredPurge } from '../util/discoveredPurge.js';
 import { changeProbeStatus, isPassRunningOnNode, runProbeCanaryOnce, runProbeSweepOnce } from '../util/changeProbe.js';
+import { inspectProbeRules } from '../util/changeProbeSpec.js';
 import { getBacklogSnapshotState, runBacklogSnapshotOnce } from '../util/backlogSnapshot.js';
 import { QUEUE_STATE_SCHEMA, readQueueStateDocument } from '../util/queueKeeperService.js';
 import { peekUnroutedReport } from '../util/unrouted.js';
@@ -253,6 +256,26 @@ const routeOf = (target) => {
  * it — but it has to tolerate a path that names nothing, because a CLEAR may legitimately name an
  * option that no longer exists in this release (that row is exactly the one that needs deleting).
  */
+/**
+ * The entries of `requested` the compiler would drop that `current` does not already drop — each entry
+ * compiled on its own (neither compiler's verdict on an entry depends on its neighbours), and matched
+ * by canonical value, as a multiset so a duplicated bad entry is not excused by one already running.
+ */
+const newlyDropped = (inspect, requested, current) => {
+	const droppedIn = (list) => (Array.isArray(list) ? list : []).filter((one) => inspect([one]).dropped > 0);
+	const running = new Map();
+	for (const one of droppedIn(current)) {
+		const key = hashConfigValue(one);
+		running.set(key, (running.get(key) ?? 0) + 1);
+	}
+	return droppedIn(requested).filter((one) => {
+		const key = hashConfigValue(one);
+		const left = running.get(key) ?? 0;
+		if (left > 0) running.set(key, left - 1);
+		return left === 0;
+	});
+};
+
 const valueAt = (obj, path) => {
 	let node = obj;
 	for (const segment of String(path).split('.')) {
@@ -549,10 +572,15 @@ export class PrerenderAdmin extends Resource {
 	 *   config          the effective config, secrets reported as presence only
 	 *   schema          the option catalog: descriptions, types, defaults, live-vs-restart scope,
 	 *                   validation hints, and whether the console may write each option
-	 *   warnings        cross-option findings against the RUNNING config
+	 *   warnings        cross-option findings against the RUNNING config, plus one per stored override
+	 *                   that is masking a config.yaml change (warn) or now equals it (info)
 	 *   pendingRestart  restart-scoped options changed since boot — the new value is in `config`,
 	 *                   but the running behavior still reflects the boot value
-	 *   layers          per option, what each layer says and which one won
+	 *   layers          per option, what each layer says and which one won. An overridden option also
+	 *                   carries `redundant` (the override equals the file's value now: clearing it changes
+	 *                   nothing) and `masking` (the override is in effect and the file's value has changed
+	 *                   since it was written: true / false, or null for a row written before v0.97.0,
+	 *                   which recorded nothing to compare against)
 	 *   overrides       the stored rows, and whether this node is keeping up with them
 	 *
 	 * `layers` is the answer to "why is this value what it is", which the merged `config` cannot
@@ -569,7 +597,7 @@ export class PrerenderAdmin extends Resource {
 		return json({
 			config: redactConfig(config),
 			schema: describeConfigSchema(),
-			warnings: collectConfigWarnings(),
+			warnings: [...collectConfigWarnings(), ...collectOverrideWarnings()],
 			pendingRestart: pendingRestartChanges(),
 			layers: describeConfigLayers(),
 			overrides: {
@@ -621,6 +649,8 @@ export class PrerenderAdmin extends Resource {
 	 * The preview also COMPILES a prospective `ingress.routes` rather than echoing it. An invalid
 	 * route entry is dropped, not rejected — from the outside indistinguishable from a route nobody
 	 * wrote — so echoing the operator's input back would confirm a route that is about to vanish.
+	 * A set of `ingress.routes` or `changeProbe.rules` whose compiler would drop entries is therefore
+	 * listed in `rejected` and refused on apply, like any other value the cluster would not honour.
 	 */
 	static async configOverride(data, context) {
 		// 409, not a silent write, and the same refusal `invalidate` gives for `invalidation.enabled`:
@@ -777,6 +807,39 @@ export class PrerenderAdmin extends Resource {
 				requested: secret ? describeSecret(entry.value) : entry.value,
 				effective: secret ? describeSecret(effective) : effective,
 				reason: 'the resolved config does not hold this value — it would be stored and never honored',
+			});
+		}
+
+		// ENTRIES THE COMPILER WOULD DROP are the same outcome one level down: the list is stored and
+		// merged whole, so the resolve check above passes it, and then the route compiler or the probe
+		// compiler quietly leaves the bad entries out. A route or a rule that is in the table and not
+		// in the router is exactly what this route exists to keep out, so it is refused like any other
+		// value that would not be honoured.
+		//
+		// Only the entries this set NEWLY drops, against what the running value already drops. The console
+		// sends the whole list back on a one-entry edit, so a bad entry already in the file layer (or an
+		// earlier override) rides along in every edit of that list; refusing on it blocked every edit,
+		// including the one fixing a different entry. It is already not honoured, and this set changes
+		// nothing about that — the config warnings keep reporting it.
+		const rejectedPaths = new Set(rejected.map((entry) => entry.path));
+		for (const entry of sets) {
+			if (rejectedPaths.has(entry.path)) continue;
+			const inspect =
+				entry.path === 'ingress.routes'
+					? (list) => inspectRoutes(list, [])
+					: entry.path === 'changeProbe.rules'
+						? inspectProbeRules
+						: null;
+			if (!inspect) continue;
+			const fresh = newlyDropped(inspect, entry.value, valueAt(config, entry.path));
+			if (!fresh.length) continue;
+			rejected.push({
+				path: entry.path,
+				requested: entry.value,
+				dropped: fresh.length,
+				reason:
+					`the compiler would drop ${fresh.length} of these entries, so they would be stored and never ` +
+					`honored: ${inspect(fresh).warnings.join('; ')}`,
 			});
 		}
 
@@ -1102,8 +1165,10 @@ export class PrerenderAdmin extends Resource {
 		}
 
 		// The write is residency-routed, so this reaches the owning node from any node. `fileDueNow`: a
-		// row already due, or marked by the change probe, keeps its place and its mark.
-		await fileDueNow(canonicalUrl, {
+		// row already due, or marked by the change probe, keeps its place and its mark. On a node that does
+		// not own the row it cannot see that place, so it files the current minute, and the returned time is
+		// the one it wrote.
+		const nextRenderTime = await fileDueNow(canonicalUrl, {
 			fromSitemap: !!target.sitemapUrl,
 			// The target's real cadence, off the point read above — an admin rejoin should not cost the
 			// page its ranking on the way back into rotation.
@@ -1885,6 +1950,10 @@ export class PrerenderAdmin extends Resource {
 				url: sitemap.url,
 				isIndex: !!sitemap.isIndex,
 				entryCount: sitemap.entryCount ?? allEntries.length,
+				// How many of them are stored, and so pageable here: a urlset row keeps only a leading sample
+				// (resources/Sitemap.js `STORED_ENTRY_SAMPLE`), an index its whole list. Paging past this
+				// returns nothing, so a client pages to the smaller of the two.
+				entriesStored: allEntries.length,
 				lastRefreshed: sitemap.lastRefreshed ?? null,
 				parentUrl: sitemap.parentUrl ?? null,
 			},

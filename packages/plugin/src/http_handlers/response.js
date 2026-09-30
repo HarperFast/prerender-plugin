@@ -14,6 +14,7 @@ import { CacheKey } from '../util/cacheKey.js';
 import { headersToObject } from '../util/headers.js';
 import { getAcceptedEncodings, getBestEncoding, reencode } from '../util/contentEncoding.js';
 import { metrics } from '../metrics.js';
+import { releaseOriginBody } from '../util/upstream.js';
 
 // Headers preserved on a 304 response; everything else is dropped.
 const allowed304Headers = ['cache-control', 'expires', 'date', 'etag', 'last-modified', 'vary', 'age'];
@@ -33,31 +34,99 @@ function formatRoute(route) {
 	return `${route.match ?? ''} ${route.path ?? ''} [${params}] ${route.mode ?? ''} (${route.source ?? ''})`;
 }
 
-/**
- * Build the base response headers from the upstream/cached resource: copy every upstream
- * header except `link`, and set `age` for a cached 200.
- */
-export function buildResponseHeaders(resource) {
-	const headers = new Headers();
-	const upstreamHeaders = headersToObject(resource.headers);
+// The origin's validators, which a rendered snapshot must not carry. See `buildResponseHeaders`.
+const ORIGIN_VALIDATORS = new Set(['etag', 'last-modified']);
 
-	for (const [key, value] of Object.entries(upstreamHeaders)) {
-		try {
-			if (key !== 'link') {
-				headers.append(key, value);
-			}
-		} catch (e) {
-			getLogger().error(e);
+/**
+ * Append one stored or relayed header, as separate values where the source had several.
+ *
+ * THE RENDERER'S HEADERS COME FROM PUPPETEER, WHICH JOINS A REPEATED RESPONSE HEADER WITH `\n` — and
+ * `Headers.append` throws on a newline. So a page whose origin sent two `x-robots-tag`, `vary`,
+ * `cache-control` or `link` headers lost that header on every cache serve and logged an error each
+ * time: one log line per served request, for as long as the page stayed cached. Split, each value is
+ * appended in turn (the response then carries them as HTTP itself does). An array — undici's shape
+ * for a repeated origin header — is the same case. A value that is invalid for any other reason is
+ * dropped and COUNTED (`serve_error` `bad-header`); the log line is rate-limited per worker, because
+ * the same stored row is served again on every request.
+ */
+const appendHeader = (headers, key, value) => {
+	if (Array.isArray(value)) {
+		for (const item of value) appendHeader(headers, key, item);
+		return;
+	}
+	const text = typeof value === 'string' ? value : String(value);
+	if (text.includes('\n')) {
+		for (const line of text.split(/\r?\n/)) if (line) appendOne(headers, key, line);
+		return;
+	}
+	appendOne(headers, key, text);
+};
+
+const BAD_HEADER_LOG_INTERVAL_MS = 60_000;
+let lastBadHeaderLog = 0;
+const appendOne = (headers, key, value) => {
+	try {
+		headers.append(key, value);
+	} catch (e) {
+		metrics.serveError('bad-header');
+		const now = Date.now();
+		if (now - lastBadHeaderLog >= BAD_HEADER_LOG_INTERVAL_MS) {
+			lastBadHeaderLog = now;
+			getLogger().warn?.(
+				`[prerender] dropped response header "${key}": ${e?.message ?? e} (counted as serve_error bad-header; ` +
+					`logged at most once a minute per worker)`
+			);
 		}
 	}
+};
 
-	if (resource.statusCode === 200 && resource.lastCached) {
-		// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad
-		// value yields no age header rather than "NaN".
-		const lastCachedMs = new Date(resource.lastCached).getTime();
-		if (!isNaN(lastCachedMs)) {
+/**
+ * Build the base response headers from the upstream/cached resource: copy every upstream
+ * header (`link` only under `page.serveLinkHeader`), and set `age` for a cached 200.
+ *
+ * `snapshot` — the body is a RENDERED page (a cache serve, a peer rescue, a render-now result),
+ * not the origin's own bytes. Its stored `etag`/`last-modified` are the ORIGIN DOCUMENT's, which
+ * the renderer kept from the response it rendered, and they describe that raw document, not the
+ * snapshot: a re-render that changed client-rendered content (prices, reviews, stock) under an
+ * unchanged origin ETag answered the crawler's next conditional request 304, and the crawler kept
+ * the old snapshot while every signal said a fresh page was being served. So a snapshot carries
+ * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, and the ETag is a
+ * weak tag of that same instant and the device, `W/"<lastCachedMs>-<deviceType>"` — both move on
+ * every render. (No content hash
+ * is stored, and hashing ~220 KB per request is not cheap; a render stamp is exact for "is this the
+ * render you hold".) A raw-cache document is the origin's bytes verbatim, so it keeps the origin's
+ * validators.
+ */
+export function buildResponseHeaders(resource, snapshot = false, deviceType = resource.deviceType) {
+	const headers = new Headers();
+	const upstreamHeaders = headersToObject(resource.headers);
+	const serveLink = config.page.serveLinkHeader;
+
+	for (const [key, value] of Object.entries(upstreamHeaders)) {
+		if (key === 'link' && !serveLink) continue;
+		if (snapshot && ORIGIN_VALIDATORS.has(key)) continue;
+		appendHeader(headers, key, value);
+	}
+
+	// lastCached is a schema `Date`; read it robustly (Date | number | string) so a bad value yields
+	// no header rather than "NaN" or an "Invalid Date" validator.
+	const lastCachedMs = resource.lastCached ? new Date(resource.lastCached).getTime() : NaN;
+	if (!isNaN(lastCachedMs)) {
+		if (resource.statusCode === 200) {
 			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
 			headers.set('age', String(ageSec));
+		}
+		if (snapshot) {
+			headers.set('last-modified', new Date(lastCachedMs).toUTCString());
+			// A version tag, weak because it names the render rather than hashing its bytes: it changes on
+			// every render and on nothing else. `If-None-Match` takes precedence over `If-Modified-Since`,
+			// so a crawler holding it revalidates against the exact render, not a one-second HTTP date that
+			// two renders can share and that another node's clock stamped. THE DEVICE IS PART OF IT: one
+			// render job stamps the same `lastCached` on every device variant it writes, so without it the
+			// desktop and mobile snapshots of a URL — different bytes — would carry the same tag.
+			// A stored page row carries its cache key but no device column, so that is the fallback.
+			const device = deviceType ?? (resource.cacheKey ? CacheKey.parse(resource.cacheKey).deviceType : undefined) ?? '';
+			headers.set('etag', `W/"${lastCachedMs}-${device}"`);
 		}
 	}
 
@@ -178,7 +247,7 @@ export function negotiateEncoding(body, headers, request) {
 
 	// Normalize the body to a Node stream before re-encoding. Three shapes reach here and each
 	// needs different handling — getting this wrong corrupts the response SILENTLY:
-	//   - web ReadableStream (the origin path, `Readable.toWeb(response.body)`) → convert
+	//   - web ReadableStream (the origin path, `originBodyStream(response.body)`) → convert
 	//   - Node Readable → pass through; `Readable.from([stream])` would emit the stream OBJECT as
 	//     a single chunk. Not currently reachable (upstream.js hands over a web stream), but
 	//     upstream.js holds a Node Readable and only converts it for this call, so anyone dropping
@@ -208,7 +277,11 @@ export function deliverResource(resource, request, info = {}) {
 	// was turned into an origin serve BEFORE this function committed a status (see
 	// `resolveResource`). The fallback to `resource.content` covers the origin path and the
 	// render-now timeout fallback, which can hand back a cached page nobody materialized.
-	let body = request.method === 'HEAD' ? undefined : (info.cachedBody ?? resource.content);
+	const isHead = request.method === 'HEAD';
+	let body = isHead ? undefined : (info.cachedBody ?? resource.content);
+	// A HEAD is forwarded upstream as a HEAD, so this body is normally already empty — but it is
+	// still a live stream on an open socket until someone ends it.
+	if (isHead) releaseOriginBody(resource);
 	const wasCacheMiss = computeWasCacheMiss(resource);
 
 	// RESIDUAL PATH ONLY: a cached Blob that arrived unmaterialized. It still streams, and a
@@ -232,7 +305,10 @@ export function deliverResource(resource, request, info = {}) {
 		body = body.stream();
 	}
 
-	let headers = buildResponseHeaders(resource);
+	// 'cache' and 'rendered' are the sources whose body is a rendered snapshot; 'raw' and 'negative'
+	// are the origin's own stored bytes, and 'origin' its live ones.
+	const snapshot = info.source === 'cache' || info.source === 'rendered';
+	let headers = buildResponseHeaders(resource, snapshot, resource.deviceType ?? info.deviceType);
 
 	// A CONDITIONAL REQUEST MUST NOT BE ABLE TO UNDO AN INVALIDATION, and it could, by two
 	// independent routes. The crawler's validators are ones this plugin handed it off the
@@ -245,11 +321,18 @@ export function deliverResource(resource, request, info = {}) {
 	//
 	// This is NOT the documented "the edge keeps its own TTL" caveat. A TTL expires; a 304 loop does
 	// not. The origin-side half is closed in util/upstream.js (`stripValidators`); this is the local
-	// half. `invalidated` is the only verdict that skips it, so ordinary 304 handling is untouched.
-	const suppressConditional = info.cacheStatus === 'invalidated';
+	// half. It covers every proxy that found a page row it would not serve (`info.stripConditionals`,
+	// set in resolveResource: stale, blob faults, a render-now fallback over a page) — not only an
+	// invalidation — because the crawler's `If-Modified-Since` is then this plugin's render time, and
+	// the origin's `Last-Modified` is usually older than it whether or not the content changed.
+	const suppressConditional = info.cacheStatus === 'invalidated' || info.stripConditionals === true;
 
 	if (!suppressConditional) {
+		const unconditional = body;
 		({ status, headers, body } = applyConditional(status, headers, request, body));
+		// A 304 made HERE out of an origin 200 abandons the origin's body — the same pinned socket as a
+		// HEAD, on every conditional request the origin itself did not answer 304.
+		if (body === undefined && unconditional !== undefined) releaseOriginBody(resource);
 	}
 
 	// AFTER `applyConditional`, not before — the same treatment `x-harper-render-now` already gets

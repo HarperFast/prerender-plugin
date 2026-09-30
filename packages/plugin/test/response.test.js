@@ -23,18 +23,196 @@ const mockRequest = (headers = {}) => {
 
 beforeEach(() => applyOptions({}));
 
-test('buildResponseHeaders copies upstream headers, drops link, sets age for a cached 200', () => {
+test('buildResponseHeaders copies upstream headers, drops link by default, sets age for a cached 200', () => {
 	const resource = {
 		statusCode: 200,
-		headers: { 'content-type': 'text/html', 'link': '<https://x>; rel=preload', 'etag': '"abc"' },
+		headers: { 'content-type': 'text/html', 'link': '<https://x>; rel=canonical', 'etag': '"abc"' },
 		lastCached: new Date(Date.now() - 5000),
 	};
 	const headers = buildResponseHeaders(resource);
 	assert.equal(headers.get('content-type'), 'text/html');
 	assert.equal(headers.get('etag'), '"abc"');
-	assert.equal(headers.has('link'), false);
+	assert.equal(headers.has('link'), false, 'off until stored rows are sampled (page.serveLinkHeader)');
 	const age = Number(headers.get('age'));
 	assert.ok(age >= 4 && age <= 7, `expected age ~5, got ${age}`);
+});
+
+test('page.serveLinkHeader: true serves the stored Link', () => {
+	applyOptions({ page: { serveLinkHeader: true } });
+	const headers = buildResponseHeaders({ statusCode: 200, headers: { link: '<https://x>; rel=canonical' } }, true);
+	assert.equal(headers.get('link'), '<https://x>; rel=canonical');
+});
+
+test('a newline-joined stored header (puppeteer joins repeats with \\n) is served as its separate values', () => {
+	// Headers.append throws on a newline, so before this a page whose origin sent two x-robots-tag, vary,
+	// cache-control or link headers lost that header on EVERY cache serve, with an error log each time.
+	applyOptions({ page: { serveLinkHeader: true } });
+	const logged = [];
+	globalThis.logger = {
+		error: (...a) => logged.push(a),
+		warn: (...a) => logged.push(a),
+		info() {},
+		debug() {},
+		trace() {},
+	};
+	emitted.length = 0;
+	const stored = JSON.stringify({
+		'x-robots-tag': 'noarchive\nmax-snippet:50',
+		'vary': 'Accept-Encoding\r\nUser-Agent',
+		'link': '<https://www.example.com/p>; rel=canonical\n<https://www.example.com/fr/p>; rel=alternate; hreflang=fr',
+	});
+	for (let i = 0; i < 3; i++) {
+		const headers = buildResponseHeaders({ statusCode: 200, headers: stored }, true);
+		assert.equal(headers.get('x-robots-tag'), 'noarchive, max-snippet:50');
+		assert.equal(headers.get('vary'), 'Accept-Encoding, User-Agent');
+		assert.equal(
+			headers.get('link'),
+			'<https://www.example.com/p>; rel=canonical, <https://www.example.com/fr/p>; rel=alternate; hreflang=fr'
+		);
+	}
+	assert.deepEqual(logged, [], 'nothing to report: every value was served');
+	assert.equal(emitted.filter((a) => a[3] === 'bad-header').length, 0);
+});
+
+test('a header no response may carry is dropped, COUNTED per serve, and logged at most once a minute', () => {
+	const logged = [];
+	globalThis.logger = {
+		error: (...a) => logged.push(a),
+		warn: (...a) => logged.push(a),
+		info() {},
+		debug() {},
+		trace() {},
+	};
+	emitted.length = 0;
+	for (let i = 0; i < 5; i++) {
+		const headers = buildResponseHeaders({
+			statusCode: 200,
+			headers: { 'x-bad': 'a\u0000b', 'content-type': 'text/html' },
+		});
+		assert.equal(headers.get('content-type'), 'text/html', 'the rest of the response is unaffected');
+		assert.equal(headers.has('x-bad'), false);
+	}
+	assert.equal(emitted.filter((a) => a[1] === 'prerender_ops' && a[3] === 'bad-header').length, 5);
+	assert.equal(logged.length, 1, 'one log line for five serves, not one per request');
+});
+
+test('a snapshot carries W/"<lastCachedMs>-<device>" and Last-Modified from lastCached, never the origin validators', () => {
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const stored = { 'etag': '"origin"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
+	const desktop = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'desktop');
+	assert.equal(desktop.get('etag'), `W/"${lastCached}-desktop"`);
+	assert.equal(desktop.get('last-modified'), new Date(lastCached).toUTCString());
+	// One render job stamps the SAME lastCached on every device variant; the bytes differ, so must the tag.
+	const mobile = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'mobile');
+	assert.notEqual(mobile.get('etag'), desktop.get('etag'));
+});
+
+test('a stored page row with no device column takes the device off its cache key', () => {
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const row = (device) => ({
+		statusCode: 200,
+		headers: '{}',
+		lastCached,
+		cacheKey: `https://www.example.com/p|${device}`,
+	});
+	const desktop = deliverResource(
+		row('desktop'),
+		{ ...mockRequest(), method: 'GET' },
+		{ source: 'cache', cachedBody: Buffer.from('d') }
+	);
+	assert.equal(desktop.headers.get('etag'), `W/"${lastCached}-desktop"`);
+	const mobile = deliverResource(
+		row('mobile'),
+		{ ...mockRequest({ 'if-none-match': desktop.headers.get('etag') }), method: 'GET' },
+		{
+			source: 'cache',
+			cachedBody: Buffer.from('m'),
+		}
+	);
+	assert.equal(mobile.status, 200);
+});
+
+test("one device's snapshot ETag does not revalidate another device's snapshot of the same render", () => {
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const page = { statusCode: 200, headers: '{}', lastCached };
+	const desktopTag = buildResponseHeaders(page, true, 'desktop').get('etag');
+	const asMobile = deliverResource(
+		page,
+		{ ...mockRequest({ 'if-none-match': desktopTag }), method: 'GET' },
+		{
+			source: 'cache',
+			deviceType: 'mobile',
+			cachedBody: Buffer.from('mobile bytes'),
+		}
+	);
+	assert.equal(asMobile.status, 200);
+	const asDesktop = deliverResource(
+		page,
+		{ ...mockRequest({ 'if-none-match': desktopTag }), method: 'GET' },
+		{
+			source: 'cache',
+			deviceType: 'desktop',
+			cachedBody: Buffer.from('desktop bytes'),
+		}
+	);
+	assert.equal(asDesktop.status, 304);
+});
+
+test('the snapshot ETag decides revalidation: a same-second re-render is a 200, the same render a 304', () => {
+	// If-Modified-Since alone cannot tell two renders inside one second apart (HTTP dates are seconds), and
+	// the date was stamped by whichever node rendered. If-None-Match takes precedence and names the render.
+	const base = Date.UTC(2026, 8, 29, 12, 0, 0);
+	const first = buildResponseHeaders({ statusCode: 200, headers: {}, lastCached: base + 100 }, true);
+	const validators = { 'if-none-match': first.get('etag'), 'if-modified-since': first.get('last-modified') };
+	const rerender = deliverResource(
+		{ statusCode: 200, headers: '{}', lastCached: base + 900 },
+		{ ...mockRequest(validators), method: 'GET' },
+		{ source: 'cache', cachedBody: Buffer.from('new') }
+	);
+	assert.equal(rerender.status, 200);
+	const same = deliverResource(
+		{ statusCode: 200, headers: '{}', lastCached: base + 100 },
+		{ ...mockRequest(validators), method: 'GET' },
+		{ source: 'cache', cachedBody: Buffer.from('old') }
+	);
+	assert.equal(same.status, 304);
+	assert.equal(same.headers.get('etag'), `W/"${base + 100}-"`);
+});
+
+test('a proxy that found a page row it would not serve skips the local conditional', () => {
+	// The crawler's If-Modified-Since is our render time; the origin's Last-Modified is a template mtime.
+	// Compared locally they answered 304 for a page the probe had just expired.
+	const ims = new Date(Date.now() - 3_600_000).toUTCString();
+	let released = 0;
+	const origin = {
+		miss: true,
+		statusCode: 200,
+		headers: { 'etag': '"new-hash"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT' },
+		content: 'NEW BODY',
+		releaseBody: () => released++,
+	};
+	const refused = deliverResource(
+		origin,
+		{ ...mockRequest({ 'if-modified-since': ims }), method: 'GET' },
+		{
+			source: 'origin',
+			cacheStatus: 'stale',
+			stripConditionals: true,
+		}
+	);
+	assert.equal(refused.status, 200);
+	assert.equal(released, 0, 'the body is sent, not released');
+	// A true miss keeps ordinary conditional handling against the origin's validators.
+	const miss = deliverResource(
+		origin,
+		{ ...mockRequest({ 'if-modified-since': ims }), method: 'GET' },
+		{
+			source: 'origin',
+			cacheStatus: 'miss',
+		}
+	);
+	assert.equal(miss.status, 304);
+	assert.equal(released, 1);
 });
 
 test('buildResponseHeaders omits age unless it is a cached 200', () => {

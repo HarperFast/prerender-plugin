@@ -50,6 +50,9 @@ import { MINUTE, currentMinuteMs, numberOf } from './time.js';
 import { LEASE_SAB_KEY, createLeaseTable, leaseBufferBytes, leaseSlotsIn } from './renderLease.js';
 import { READY_EPOCH_SEC, READY_SAB_KEY, createReadyQueue, readyBufferBytes, readyCapacityIn } from './readyQueue.js';
 import { walkUrlRange } from './urlWalk.js';
+import { getResidencyByUrl } from './residency.js';
+import { forwardDueNow, isDueNowForwardActive } from './peerHeal.js';
+import { metrics } from '../metrics.js';
 
 /**
  * The live lease table, over one named buffer shared by every worker on this node.
@@ -147,7 +150,7 @@ export const minuteOf = (ms) => Math.floor(ms / MINUTE);
  */
 export const writeSchedule = async (
 	cacheKey,
-	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt, demandPeriod } = {}
+	{ nextRenderTime, fromSitemap, effectiveInterval, targetMissingSince, changedAt, demandPeriod, urgentAt } = {}
 ) => {
 	if (fromSitemap === undefined) {
 		throw new Error(`writeSchedule(${cacheKey}) needs an explicit fromSitemap — put replaces the record`);
@@ -165,7 +168,8 @@ export const writeSchedule = async (
 	// `changedAt` the same way: the change probe sets it, a failed render's retry carries it, and every
 	// other write — the render's own reschedule above all — clears it by omission (schema.graphql).
 	// `demandPeriod` rides with it and ONLY with it: it describes how urgent the change is, so a row
-	// with no mark never carries one.
+	// with no mark never carries one. `urgentAt` (an ask to render now, `fileDueNow`) is cleared the same
+	// way, and is not written beside a change mark: the change's head start is the one such a row takes.
 	const marked = Number.isFinite(changedAt);
 	await scheduleTable().put(cacheKey, {
 		nextRenderTime,
@@ -174,6 +178,7 @@ export const writeSchedule = async (
 		...(targetMissingSince === undefined ? {} : { targetMissingSince }),
 		...(marked ? { changedAt } : {}),
 		...(marked && Number.isFinite(demandPeriod) && demandPeriod > 0 ? { demandPeriod } : {}),
+		...(!marked && Number.isFinite(urgentAt) && urgentAt > 0 ? { urgentAt } : {}),
 	});
 };
 
@@ -185,24 +190,87 @@ export const writeSchedule = async (
  * marks a row that has none, and `demandPeriod` goes with the mark: a row already marked keeps the
  * one it has, and takes the given one only if it had none.
  *
- * The read is node-local (`getScheduleRow`, `replicateFrom: false`): on the row's OWNER it sees the
- * row; anywhere else it sees nothing, and the row is filed plainly at the current minute — which is
- * what every such writer did before, and the write still reaches the owner by residency.
+ * A SINGLE ASK SAYS SO ON THE ROW (`urgentAt`, first instant kept). Filed at the current minute its
+ * lateness is zero, which ranked it behind every overdue row in the queue — and past the ready set's
+ * capacity not published at all: a render-now whose caller was polling for it, an admin revalidate or
+ * rejoin, a new sitemap URL. The mark gives it `queue.ready.urgentHeadStart` (util/renderPriority.js),
+ * and a change mark, when there is one, takes precedence over it. A BULK re-file passes `urgent: false`
+ * (a revalidate over a collection): tens of thousands of asks would otherwise queue ahead of every page
+ * found changed while they drain. It still keeps an ask a row already carries.
+ *
+ * AN EARLIER DUE TIME IS KEPT ONLY IF IT IS STILL OPEN. A due minute the key's latest lease was granted
+ * for has been claimed: a render for it ran or is running, and when the caller is inside that render's
+ * own result — or anything else that wrote the row in a transaction not yet committed — the local read
+ * returns the row as it was BEFORE that write, at exactly that minute. Keeping it would file the row
+ * back at a minute already served: ranked as if it had waited all along, and re-granted at the very
+ * minute its last lease was, which the lease table counts as a result that never committed (a wedge
+ * miss). So such a row is filed at the current minute instead — never later than now, and never at a
+ * minute a lease has already answered.
+ *
+ * ON THE OWNER, OR NOT AT ALL. The read that makes all of that possible is node-local
+ * (`getScheduleRow`, `replicateFrom: false`), so it is only authoritative on the row's residency owner.
+ * Anywhere else — about three calls in four on a four-node cluster — it sees nothing, and the whole-row
+ * `put` that replicates to the owner REPLACES the owner's row: an overdue row pushed back to the
+ * current minute, its change mark and demand estimate wiped. So a node that does not own the row asks
+ * the owner to file it (`forwardDueNow`, `queue.dueNowForward`) and writes nothing itself. If the owner
+ * cannot be asked, or refuses, the row is filed here exactly as it always was: the forward can only
+ * make this better, never worse. `forwarded` is set by the owner's endpoint, and makes it a leaf.
+ *
+ * Returns the due time it wrote (the owner's, when forwarded).
  */
-export const fileDueNow = async (cacheKey, { fromSitemap, effectiveInterval, changedAt, demandPeriod } = {}) => {
-	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod']);
+export const fileDueNow = async (
+	cacheKey,
+	{ fromSitemap, effectiveInterval, changedAt, demandPeriod, urgent = true, forwarded = false } = {}
+) => {
+	if (!forwarded && isDueNowForwardActive()) {
+		const owner = getResidencyByUrl(CacheKey.urlOf(cacheKey));
+		if (owner !== server.hostname) {
+			const sent = await forwardDueNow({
+				owner,
+				cacheKey,
+				fromSitemap,
+				effectiveInterval,
+				changedAt,
+				demandPeriod,
+				urgent,
+			});
+			if (sent.ok) {
+				metrics.dueNowForward('forwarded');
+				return sent.nextRenderTime;
+			}
+			// A SLOW ANSWER IS NOT A REFUSAL. The owner may well have filed it, and a local write here is the
+			// whole-row replace forwarding exists to prevent — landing after the owner's filing, it would wipe
+			// what that filing kept. So a plain ask that timed out is left to the owner: the worst case is one
+			// ask lost to a lost request (a render-now falls back to the origin; a revalidate or rejoin renders
+			// on cadence). An ask carrying a CHANGE MARK is filed here anyway: losing it leaves a page known
+			// wrong on the origin for a whole cadence, which is the greater harm. A definite failure — refused,
+			// not reachable, a non-2xx, or an owner cooling after one — is filed here as before 0.97.0.
+			if (sent.timedOut && !Number.isFinite(changedAt)) {
+				metrics.dueNowForward('timed-out');
+				return currentMinuteMs();
+			}
+			metrics.dueNowForward(sent.reason === 'cooling' ? 'skipped' : 'fell-back');
+		}
+	}
+	const existing = await getScheduleRow(cacheKey, ['nextRenderTime', 'changedAt', 'demandPeriod', 'urgentAt']);
 	const minute = currentMinuteMs();
 	const due = numberOf(existing?.nextRenderTime);
 	const markedAt = numberOf(existing?.changedAt);
 	const heldPeriod = numberOf(existing?.demandPeriod);
+	const askedAt = numberOf(existing?.urgentAt);
 	const wasMarked = Number.isFinite(markedAt) && markedAt > 0;
+	const leasedFor = leaseTable().grantOf(cacheKey)?.dueMinute;
+	const open = Number.isFinite(due) && due > 0 && due < minute && minuteOf(due) !== leasedFor;
+	const nextRenderTime = open ? due : minute;
 	await writeSchedule(cacheKey, {
-		nextRenderTime: Number.isFinite(due) && due > 0 && due < minute ? due : minute,
+		nextRenderTime,
 		fromSitemap,
 		effectiveInterval,
 		changedAt: wasMarked ? markedAt : changedAt,
 		demandPeriod: wasMarked && Number.isFinite(heldPeriod) && heldPeriod > 0 ? heldPeriod : demandPeriod,
+		urgentAt: Number.isFinite(askedAt) && askedAt > 0 ? askedAt : urgent ? Date.now() : undefined,
 	});
+	return nextRenderTime;
 };
 
 /**
@@ -257,7 +325,9 @@ export const getScheduleRow = (cacheKey, select) =>
  *
  * A RENDER THAT NEVER REPORTS IS BOUNDED HERE. A lease that expires with no result — a renderer crashing
  * on the URL, or a result that cannot get back to this node — leaves the row due, so the key would be
- * granted again at every expiry, forever. The lease table counts those misses; past the fast-retry
+ * granted again at every expiry, forever; so does a result that was processed and released its lease
+ * but whose commit then failed (it is re-granted at the same due minute, which the lease table counts
+ * as a miss too — see `missesOf` in util/renderLease.js). The lease table counts those misses; past the fast-retry
  * lane's own holds (`render.failureRetry.fastRetries`) plus one, the key is HELD BACK in the lease table
  * instead of granted — two leases, then four, eight, … capped at its cadence — and named (`pass.wedged`).
  * Nothing durable is written, no strike is counted, and the first result that comes back for the key
@@ -314,7 +384,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 				pass.skippedStale++;
 				continue;
 			}
-			const misses = leases.missesBeforeGrant(entry.cacheKey);
+			const misses = leases.missesBeforeGrant(entry.cacheKey, minuteOf(dueAt));
 			if (misses > missLimit) {
 				const carried = Number(row.effectiveInterval);
 				const cadence =
@@ -322,7 +392,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 						? carried
 						: resolveRenderInterval(CacheKey.urlOf(entry.cacheKey), null);
 				const backoff = Math.min(cadence, leaseTimeMs * 2 ** Math.min(20, misses - missLimit));
-				if (leases.hold(entry.cacheKey, nowMs + backoff))
+				if (leases.hold(entry.cacheKey, nowMs + backoff, minuteOf(dueAt)))
 					pass.wedged.push({ cacheKey: entry.cacheKey, misses, backoff });
 				continue;
 			}
@@ -358,7 +428,7 @@ export const claimSchedules = async ({ grantLimit } = {}) => {
 
 // ---- the queue keeper's table I/O (driven by util/queueKeeperService.js) ---------------------
 
-/** The four fields every reader of this table projects. */
+/** The fields every reader of this table projects. */
 export const SCHEDULE_SELECT = [
 	'cacheKey',
 	'nextRenderTime',
@@ -366,6 +436,7 @@ export const SCHEDULE_SELECT = [
 	'effectiveInterval',
 	'changedAt',
 	'demandPeriod',
+	'urgentAt',
 ];
 
 /**
@@ -500,9 +571,13 @@ export const readKeeperSignal = (nowMs = Date.now()) => {
 
 // ---- lease lifecycle exposed to the result path ---------------------------------------------
 
-export const releaseLease = (cacheKey) => leaseTable().release(cacheKey);
+/** Release `cacheKey`'s lease; with `grantedAtMs` (from `leaseGrant`), only the lease granted then. */
+export const releaseLease = (cacheKey, options) => leaseTable().release(cacheKey, options);
 
 export const leaseInfo = (cacheKey) => leaseTable().leaseOf(cacheKey);
+
+/** The key's latest real grant, live, released or expired — the lease generation a result belongs to. */
+export const leaseGrant = (cacheKey) => leaseTable().grantOf(cacheKey);
 
 // ---- status derivation (zero DB ops) --------------------------------------------------------
 

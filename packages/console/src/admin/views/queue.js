@@ -70,6 +70,7 @@ export const QUEUE_HEALTH = Object.freeze({
 	publishMs: 'keeper_publish_ms',
 	verifyMs: 'keeper_verify_ms',
 	repaired: 'keeper_repaired',
+	unschedulable: 'keeper_unschedulable',
 });
 
 /** One `queue_health` series from an analytics window. */
@@ -159,6 +160,8 @@ export function render(ctx) {
 			nodeEntries(analytics).length > 0 &&
 			el('div', { cls: 'cols' }, [timesCard(analytics), detailCard(analytics)]),
 		usable && nodeEntries(analytics).length === 0 && detailCard(analytics),
+		usable && el('div', { cls: 'cols' }, [changeLagCard(analytics), renderSizeCard(analytics)]),
+		usable && filingCard(analytics),
 		upcoming(ctx, data, qs),
 		usable && el('div', { cls: 'scan-foot' }, [scanFooter(analytics)]),
 		settings(ctx),
@@ -1501,6 +1504,148 @@ function detailCard(data) {
 						}))
 					)
 				: emptyNote('render outcomes', data),
+		],
+	});
+}
+
+/**
+ * CHANGE TO CACHE (plugin v0.97.0, `render` `change_lag_ms`): for a page the change probe found changed
+ * — hard-expired, so crawlers get the origin until it re-renders — the time from the change being found
+ * to its re-render landing, per route (the route label rides the method slot). One sample per URL whose
+ * render cleared the mark; a render the probe suspects is stale, or a result dropped as superseded,
+ * records none. Percentiles merge approximately (≈).
+ */
+function changeLagCard(data) {
+	const lag = pick(data, 'render', (s) => s.path === 'change_lag_ms');
+	if (!lag.length) {
+		return card('Change to cache', {
+			help: 'Time from the change probe finding a page changed to its re-render landing (plugin v0.97.0+).',
+			body: [emptyNote('change-to-cache', data)],
+		});
+	}
+	const byRoute = new Map();
+	for (const s of lag) byRoute.set(s.method ?? 'unrouted', [...(byRoute.get(s.method ?? 'unrouted') ?? []), s]);
+	const rows = [...byRoute]
+		.map(([label, combos]) => ({
+			label,
+			value: weighted(combos, 'median') ?? 0,
+			sub: `≈p95 ${fmtMs(weighted(combos, 'p95'))} · ${num(sumCount(combos))}`,
+		}))
+		.sort((a, b) => b.value - a.value);
+	const series = [
+		{ label: 'p95', color: SERIES[2], points: weightedBuckets(lag, 'p95s', data.bucketCount) },
+		{ label: 'mean', color: SERIES[0], points: weightedBuckets(lag, 'means', data.bucketCount) },
+	];
+	return card(`Change to cache — ${scopeLabel(data)}`, {
+		head: [spacer(), legend(series.map(({ label, color }) => ({ label, color })))],
+		help:
+			'For a page the change probe found changed, the time from the change being found to its re-render ' +
+			'landing — the window in which crawlers get the origin for it. Median and ≈p95 (count-weighted), per route.',
+		body: [
+			stats([
+				stat('Median lag', fmtMs(weighted(lag, 'median')), `${num(sumCount(lag))} changed page(s) re-rendered`),
+				stat('≈p95 lag', fmtMs(weighted(lag, 'p95')), 'the slow tail'),
+				stat('Mean lag', fmtMs(weighted(lag, 'mean')), 'exact across nodes'),
+			]),
+			lineChart(data, series),
+			rows.length > 1 && section('queue-lag-routes', 'By route (median)', [barList(rows, { format: fmtMs })]),
+		],
+	});
+}
+
+/** A share to one decimal — the page-size target is a couple of percent, where whole percents say nothing. */
+const pct1 = (part, whole) => (whole ? `${((part / whole) * 100).toFixed(1)}%` : '—');
+
+/** `render_size` bands at or over 1 MB decoded (plugin metrics.js `renderSizeBand`). */
+const OVER_1MB = new Set(['1m-2m', '2m-plus']);
+const SIZE_BANDS = ['under-500k', '500k-1m', '1m-2m', '2m-plus'];
+
+/**
+ * PAGE SIZE (plugin v0.97.0, `render_size`): the decoded size of every page a render stored, in bands,
+ * by route (path slot) and device (method slot). Bing documents a 1 MB limit on the HTML it reads, so the
+ * share at or over 1 MB is the number to watch; renders stored brotli-encoded are not measured.
+ */
+function renderSizeCard(data) {
+	const sizes = pick(data, 'render_size');
+	if (!sizes.length) {
+		return card('Page size', {
+			help: 'Decoded size of every stored render, in bands (plugin v0.97.0+).',
+			body: [emptyNote('page-size', data)],
+		});
+	}
+	const total = sumCount(sizes);
+	const over = sumCount(sizes.filter((s) => OVER_1MB.has(s.type)));
+	const band = (key) => sumCount(sizes.filter((s) => s.type === key));
+	const groups = new Map();
+	for (const s of sizes) {
+		const key = `${s.path ?? 'unrouted'} · ${s.method ?? '—'}`;
+		groups.set(key, [...(groups.get(key) ?? []), s]);
+	}
+	const rows = [...groups]
+		.map(([label, combos]) => {
+			const n = sumCount(combos);
+			const big = sumCount(combos.filter((s) => OVER_1MB.has(s.type)));
+			return { label, value: n ? big / n : 0, sub: `${num(big)} of ${num(n)}` };
+		})
+		.sort((a, b) => b.value - a.value);
+	return card(`Page size — ${scopeLabel(data)}`, {
+		head: [over > 0 ? pill(`${pct1(over, total)} over 1 MB`, 'warn') : pill('none over 1 MB', 'ok'), spacer()],
+		help:
+			'Decoded size of every stored render. Bing documents a 1 MB limit on the HTML it reads, so the share at ' +
+			'or over 1 MB is the one to watch, by route and device. Renders stored brotli-encoded are not measured.',
+		body: [
+			stats([
+				stat('Over 1 MB', pct1(over, total), `${num(over)} of ${num(total)} render(s)`, { warn: over > 0 }),
+				...SIZE_BANDS.map((key) => stat(key, fmtCount(band(key)), pct(band(key), total))),
+			]),
+			section('queue-size-routes', 'Share over 1 MB by route · device', [
+				barList(rows, { format: (v) => `${(v * 100).toFixed(1)}%`, max: 1 }),
+			]),
+		],
+	});
+}
+
+/** `due_now_forward` outcomes (plugin v0.97.0) and what each means for the ask. */
+const FORWARD_OUTCOMES = [
+	['forwarded', 'the owner filed it'],
+	['fell-back', 'filed here instead (owner refused or unreachable)'],
+	['timed-out', 'left to a slow owner'],
+	['skipped', 'owner cooling down after a failure'],
+];
+
+/**
+ * FILING HEALTH (plugin v0.97.0). A "render this now" ask made on a node that does not own the row is
+ * forwarded to its owner (`queue.dueNowForward`), so the owner's row keeps its change mark and place;
+ * `fell-back` is the old whole-row write, which can drop them. `keeper_unschedulable` counts owned
+ * schedule rows with no usable due time, found by a verification walk — expected to be zero.
+ */
+function filingCard(data) {
+	const forward = pick(data, 'prerender_ops', (s) => s.path === 'due_now_forward');
+	const unschedulable = queueSeries(data, QUEUE_HEALTH.unschedulable);
+	if (!forward.length && !unschedulable.length) return null;
+	const outcome = (key) => sumCount(forward.filter((s) => s.method === key));
+	const total = sumCount(forward);
+	// Emitted only by a walk that FOUND some, carrying how many — so its mean is rows per such walk.
+	const stuck = Math.round(weighted(unschedulable, 'mean') ?? 0);
+	return card(`Filing — ${scopeLabel(data)}`, {
+		head: [
+			outcome('fell-back') > 0 ? pill(`${num(outcome('fell-back'))} fell back`, 'warn') : null,
+			stuck > 0 ? pill('unschedulable rows', 'bad') : null,
+			spacer(),
+		],
+		help:
+			'“Render this now” asks made on a node that does not own the row are forwarded to its owner, so the ' +
+			'owner’s row keeps its change mark and place; a fallback is the old local write. Unschedulable rows ' +
+			'are owned schedule rows with no usable due time, found by a verification walk — expect none.',
+		body: [
+			stats([
+				...FORWARD_OUTCOMES.map(([key, sub]) =>
+					stat(key, fmtCount(outcome(key)), total ? `${pct(outcome(key), total)} · ${sub}` : sub, {
+						warn: key === 'fell-back' && outcome(key) > 0,
+					})
+				),
+				stat('Unschedulable rows', fmtCount(stuck), 'per verification walk that found any', { bad: stuck > 0 }),
+			]),
 		],
 	});
 }

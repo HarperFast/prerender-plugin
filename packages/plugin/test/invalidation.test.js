@@ -1,5 +1,6 @@
-import { test, before, beforeEach } from 'node:test';
+import { test, before, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 
 /**
  * `util/invalidation.js` — the module the whole feature rests on.
@@ -32,6 +33,18 @@ let reads = [];
 let failNext = 0;
 let warns = [];
 let errors = [];
+// The subscription fake: every subscriber, a count of scans, and switches for the failures under test.
+let subscribers = [];
+let scans = 0;
+let subscribeFails = 0;
+let scanFails = 0;
+let scanGate = null;
+let deferWrites = false;
+const pending = new Map();
+const commitPending = () => {
+	for (const [id, row] of pending) row === null ? rows.delete(id) : rows.set(id, row);
+	pending.clear();
+};
 
 before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], recordAnalytics: () => {} };
@@ -58,13 +71,36 @@ before(async () => {
 					return { ...row };
 				},
 				async put(id, data) {
-					rows.set(id, { scope: id, ...data });
+					// `deferWrites` models a write inside a request: invisible to other readers until commit.
+					if (deferWrites) pending.set(id, { scope: id, ...data });
+					else rows.set(id, { scope: id, ...data });
 				},
 				async delete(id) {
+					if (deferWrites) {
+						pending.set(id, null);
+						return rows.has(id);
+					}
 					return rows.delete(id);
 				},
 				async *search() {
-					for (const row of rows.values()) yield { ...row };
+					scans++;
+					if (scanGate) await scanGate;
+					if (scanFails > 0) {
+						scanFails--;
+						throw new Error('storage fault');
+					}
+					for (const row of [...rows.values()]) yield { ...row };
+				},
+				async subscribe(options) {
+					if (subscribeFails > 0) {
+						subscribeFails--;
+						throw new Error('Can not subscribe to a table without an audit log');
+					}
+					const subscription = new EventEmitter();
+					subscription.options = options;
+					subscription.end = () => void (subscription.ended = true);
+					subscribers.push(subscription);
+					return subscription;
 				},
 			},
 		},
@@ -80,8 +116,16 @@ beforeEach(() => {
 	warns = [];
 	errors = [];
 	failNext = 0;
+	subscribers = [];
+	scans = 0;
+	subscribeFails = 0;
+	scanFails = 0;
+	scanGate = null;
+	deferWrites = false;
+	pending.clear();
 	inv.resetInvalidationState();
 	config.invalidation.enabled = true;
+	config.invalidation.syncInterval = 60_000;
 	config.invalidation.pad = PAD;
 	config.invalidation.lkgMaxAge = 5 * MINUTE;
 	config.ingress.routes = [{ match: 'prefix', path: '/catalog/' }];
@@ -290,4 +334,199 @@ test('clearInvalidation reports from what it did, never by re-reading, and drops
 	// of its own remembered answer.
 	failNext = 1;
 	assert.equal(await inv.resolveInvalidation(null), null, 'the LKG entry went with the row');
+});
+
+// ---- the per-worker view (the subscription replaces the per-request reads) ----
+
+const until = async (condition, what) => {
+	for (let i = 0; i < 500; i++) {
+		if (condition()) return;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.fail(`timed out waiting for ${what}`);
+};
+const trusted = () => inv.invalidationViewState().trusted;
+const ring = () => subscribers.at(-1).options.listener({ type: 'put' });
+
+test('once the view has loaded, a cache-servable request costs ZERO reads — it was two per request', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(1_000_000), mode: 'hard' });
+	rows.set(ROUTE, { scope: ROUTE, invalidatedAt: at(9_000_000), mode: 'hard' });
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	assert.equal(subscribers.length, 1);
+	assert.equal(subscribers[0].options.omitCurrent, true, 'the retained replay truncates; the view loads by a read');
+	assert.equal(typeof subscribers[0].options.listener, 'function', 'the listener form, never for-await');
+
+	reads = [];
+	for (let i = 0; i < 100; i++) {
+		const resolved = inv.resolveInvalidation(ROUTE);
+		assert.deepEqual(resolved, { scope: ROUTE, at: 9_000_000 + PAD }, 'same max(at) rule, same pad');
+	}
+	assert.deepEqual(inv.resolveInvalidation('route:prefix:/other/'), { scope: 'all', at: 1_000_000 + PAD });
+	assert.deepEqual(reads, [], 'no point read at all');
+	config.invalidation.enabled = false;
+	assert.equal(inv.resolveInvalidation(ROUTE), null, 'the kill switch still wins');
+});
+
+test('before the view has loaded, the serve path reads per request — correct from the first request', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+	let release;
+	scanGate = new Promise((resolve) => (release = resolve));
+	inv.startInvalidationWatch();
+	await until(() => subscribers.length === 1, 'the subscription');
+	assert.equal(trusted(), false);
+	assert.equal((await inv.resolveInvalidation(null)).at, 5_000_000 + PAD);
+	assert.deepEqual(reads, ['all'], 'the pre-view path, exactly as before');
+	release();
+	await until(trusted, 'the view to load');
+});
+
+test('an apply and an undo reach the view on the doorbell, from any node', async () => {
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	assert.equal(inv.resolveInvalidation(null), null);
+
+	// A row written anywhere in the cluster commits here by replication and rings the subscription.
+	rows.set('all', { scope: 'all', invalidatedAt: at(7_000_000) });
+	ring();
+	await until(() => inv.resolveInvalidation(null) !== null, 'the apply');
+	assert.equal(inv.resolveInvalidation(null).at, 7_000_000 + PAD);
+
+	rows.delete('all');
+	ring();
+	await until(() => inv.resolveInvalidation(null) === null, 'the undo');
+	assert.deepEqual(reads, [], 'still no per-request read');
+});
+
+test('a doorbell that rings mid-load is not lost: another load follows the one in flight', async () => {
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	let release;
+	scanGate = new Promise((resolve) => (release = resolve));
+	const before = scans;
+	ring();
+	await until(() => scans === before + 1, 'the second load to start');
+	// The write lands after the in-flight load has begun, so only a load AFTER it can see the row.
+	rows.set('all', { scope: 'all', invalidatedAt: at(3_000_000) });
+	ring();
+	scanGate = null;
+	release();
+	await until(() => inv.resolveInvalidation(null) !== null, 'the write rung mid-load');
+	assert.equal(scans, before + 2, 'exactly one more load, not one per ring');
+});
+
+test('a closed subscription falls back to per-request reads, and the backstop re-subscribes', async () => {
+	mock.timers.enable({ apis: ['setInterval'] });
+	try {
+		rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+		inv.startInvalidationWatch();
+		await until(trusted, 'the view to load');
+		subscribers[0].emit('close');
+		assert.equal(trusted(), false, 'a view nobody rings for is never trusted');
+		reads = [];
+		assert.equal((await inv.resolveInvalidation(null)).at, 5_000_000 + PAD);
+		assert.deepEqual(reads, ['all'], 'correct meanwhile, by the per-request path');
+
+		mock.timers.tick(60_000);
+		await until(() => subscribers.length === 2 && trusted(), 'the re-subscribe and reload');
+		reads = [];
+		inv.resolveInvalidation(null);
+		assert.deepEqual(reads, []);
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test('a subscribe that throws is counted, falls back, and is retried by the backstop', async () => {
+	mock.timers.enable({ apis: ['setInterval'] });
+	try {
+		subscribeFails = 1;
+		inv.startInvalidationWatch();
+		await until(() => warns.some((w) => w.includes('could not subscribe')), 'the warning');
+		assert.equal(trusted(), false);
+		assert.equal(scans > 0, true, 'the resolvability report still ran');
+		mock.timers.tick(60_000);
+		await until(trusted, 'the retried subscription to load');
+		assert.equal(subscribers.length, 1);
+	} finally {
+		mock.timers.reset();
+	}
+});
+
+test('a view read that fails leaves the view untrusted; the next doorbell or tick recovers it', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	scanFails = 1;
+	ring();
+	await until(() => !trusted(), 'the failed read to distrust the view');
+	assert.ok(errors.some((e) => e.includes('invalidation view read failed')));
+	reads = [];
+	assert.equal((await inv.resolveInvalidation(null)).at, 5_000_000 + PAD, 'the fallback still enforces it');
+	assert.deepEqual(reads, ['all']);
+	ring();
+	await until(trusted, 'the recovery');
+});
+
+test('a view load refreshes the last-known-good, so a later fallback read error has a current answer', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	subscribers[0].emit('close');
+	failNext = 1;
+	const resolved = await inv.resolveInvalidation(null);
+	assert.equal(resolved?.at, 5_000_000 + PAD, 'a storage fault right after the drop must not un-invalidate');
+});
+
+test("a writer's own worker sees its write when the write returns — the canary trip's reseed resolves at once", async () => {
+	// The trip records an invalidation and chains a reseed immediately; that reseed's first resolution
+	// saw NO epoch (the doorbell had not landed), treated nothing as covered and re-baselined the scope.
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	const written = await inv.recordInvalidation({ scope: ROUTE, reason: 'canary trip', updatedBy: 'change-probe' });
+	const resolved = inv.resolveInvalidation(ROUTE);
+	assert.equal(resolved?.at, new Date(written.invalidatedAt).getTime() + PAD, 'no doorbell rung, and already visible');
+
+	await inv.clearInvalidation(ROUTE);
+	assert.equal(inv.resolveInvalidation(ROUTE), null, 'and the clear, the same way');
+	assert.deepEqual(reads, [], 'from the view, not by falling back to per-request reads');
+});
+
+test('a write inside a request (not yet committed) is patched into the writer’s view, and the commit settles it', async () => {
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	deferWrites = true;
+	const written = await inv.recordInvalidation({ scope: 'all', reason: 'admin', updatedBy: 'joe' });
+	assert.equal(rows.has('all'), false, 'precondition: no read can see it yet');
+	assert.equal(inv.resolveInvalidation(null)?.at, new Date(written.invalidatedAt).getTime() + PAD);
+
+	// The request ends: the commit rings the doorbell and the real row replaces the patch.
+	deferWrites = false;
+	commitPending();
+	ring();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(inv.resolveInvalidation(null)?.at, new Date(written.invalidatedAt).getTime() + PAD);
+});
+
+test('a clear inside a request is NOT patched: if its transaction aborts, nothing invalidated is served', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
+	deferWrites = true;
+	await inv.clearInvalidation('all');
+	assert.equal(rows.has('all'), true, 'precondition: the delete is not visible yet');
+	assert.equal(
+		inv.resolveInvalidation(null)?.at,
+		5_000_000 + PAD,
+		'still enforced until the delete commits — late is the safe direction'
+	);
+	// The request aborts: nothing commits, and the invalidation must still be in force.
+	pending.clear();
+	deferWrites = false;
+	ring();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(inv.resolveInvalidation(null)?.at, 5_000_000 + PAD);
+	// A clear outside a request has committed by the time it returns, and its own worker sees it at once.
+	await inv.clearInvalidation('all');
+	assert.equal(inv.resolveInvalidation(null), null);
 });

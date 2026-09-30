@@ -32,6 +32,9 @@
  * the surviving record still references — the dangling-blob class the serve path already has to
  * survive (harper#2134). Deleting only keys nothing is writing is what keeps that off the table.
  *
+ * A STUB — a row with neither a status nor a cache time, which only a patch landing on a deleted key
+ * writes — needs only tests 1 and 5 (`isPageStub`), and is re-checked as still a stub.
+ *
  * A false positive costs nothing a crawler can see. Test 3 means the row was already answered from
  * the origin; the deletion only turns a `stale` into a `miss`, and on a route that discovers, that
  * miss re-mints the target (see util/discoveredPurge.js on why deletion is self-healing). Test 4 is
@@ -58,7 +61,7 @@ import { CacheKey } from './cacheKey.js';
 import { getNodes, getResidencyByUrl } from './residency.js';
 import { leaseInfo } from './renderSchedule.js';
 import { scheduleKeysOf } from '../resources/Target.js';
-import { walkUrlRange } from './urlWalk.js';
+import { recoverKeylessKeys, walkUrlRange } from './urlWalk.js';
 import {
 	claimRun,
 	finishRun,
@@ -82,6 +85,16 @@ const PAUSE_SLICE_MS = 500;
 const epochMs = (value) => (value === null || value === undefined ? NaN : new Date(value).getTime());
 
 /**
+ * A row no render wrote: neither a status nor a cache time. What a `patch` of a page's expiry leaves when
+ * it lands on a key deleted a moment earlier — a patch of a missing record creates one holding only the
+ * patched fields. It has no content to serve and no age to wait out, and the age test alone kept it
+ * forever (`lastCached` reads NaN, which is "cannot tell"). Deleted like an orphan, whether or not a
+ * target exists: the target's next render writes the page whole either way.
+ */
+export const isPageStub = (row) =>
+	!!row && (row.statusCode === null || row.statusCode === undefined) && !Number.isFinite(epochMs(row.lastCached));
+
+/**
  * One sweep pass over a page stream. ALL I/O is injected (the discoveredPurge pattern), so the
  * predicate, the owner scope, the batching, the pacing and the cancel path are testable without
  * Harper globals. `stats` is mutated IN PLACE so a live status read reports real progress.
@@ -90,6 +103,7 @@ const epochMs = (value) => (value === null || value === undefined ? NaN : new Da
  */
 export const sweepOrphanedPages = async ({
 	rows,
+	recoverStubs,
 	ownerOf,
 	hostname,
 	targetExists,
@@ -144,6 +158,22 @@ export const sweepOrphanedPages = async ({
 		}
 	};
 
+	// A stub skips the age, servable and target tests (see `isPageStub`), never the lease: a render in
+	// flight is about to write this key whole.
+	const takeStub = async (cacheKey, url) => {
+		stats.stubs++;
+		if (isLeased(url)) {
+			stats.leaseSkipped++;
+			return;
+		}
+		if (stats.deleted + batch.length >= maxDeletes) {
+			stats.truncated = true;
+			return;
+		}
+		batch.push({ cacheKey, url, stub: true });
+		if (batch.length >= batchSize) await flush();
+	};
+
 	for await (const row of rows) {
 		if (isCanceled()) {
 			stats.canceled = true;
@@ -156,6 +186,11 @@ export const sweepOrphanedPages = async ({
 		if (!url) continue;
 		if (ownerOf(url) !== hostname) continue;
 		stats.owned++;
+
+		if (isPageStub(row)) {
+			await takeStub(row.cacheKey, url);
+			continue;
+		}
 
 		// An unreadable timestamp is "cannot tell", which is never a reason to delete.
 		const cachedAt = epochMs(row.lastCached);
@@ -188,6 +223,20 @@ export const sweepOrphanedPages = async ({
 		batch.push({ cacheKey: row.cacheKey, url, lastCachedMs: cachedAt });
 		if (batch.length >= batchSize) await flush();
 	}
+
+	// Stubs written before the key rode the patch have no `cacheKey` at all, so the walk counted them
+	// unreadable and could not name them; the primary store can (util/urlWalk.js `recoverKeylessKeys`).
+	if (!stats.canceled && recoverStubs) {
+		for (const cacheKey of await recoverStubs()) {
+			if (isCanceled()) {
+				stats.canceled = true;
+				break;
+			}
+			const url = CacheKey.urlOf(cacheKey);
+			if (!url || ownerOf(url) !== hostname) continue;
+			await takeStub(cacheKey, url);
+		}
+	}
 	await flush();
 
 	return stats;
@@ -204,6 +253,7 @@ const newStats = () => ({
 	deleted: 0,
 	changed: 0,
 	unreadable: 0,
+	stubs: 0,
 	truncated: false,
 	errors: 0,
 	errorSamples: [],
@@ -222,9 +272,14 @@ export const deletePageBatch = async (batch, { replicatedConfirmation = 0 } = {}
 	let deleted = 0;
 	let changed = 0;
 	const run = async () => {
-		for (const { cacheKey, url, lastCachedMs } of batch) {
-			const page = await pages.get({ id: cacheKey, select: ['cacheKey', 'lastCached'] });
-			if (!page || epochMs(page.lastCached) !== lastCachedMs || (await targets.get({ id: url, select: ['url'] }))) {
+		for (const { cacheKey, url, lastCachedMs, stub } of batch) {
+			const page = await pages.get({ id: cacheKey, select: ['cacheKey', 'lastCached', 'statusCode'] });
+			// A stub is re-checked as STILL a stub — a render that landed since wrote the row whole; an orphan
+			// as still carrying the `lastCached` the walk saw, with no target since.
+			const unchanged = stub
+				? isPageStub(page)
+				: page && epochMs(page.lastCached) === lastCachedMs && !(await targets.get({ id: url, select: ['url'] }));
+			if (!unchanged) {
 				changed++;
 				continue;
 			}
@@ -292,15 +347,19 @@ export const startPageOrphanSweep = async ({
 
 	const beat = makeHeartbeat(KEY);
 	await publishRunState(KEY, { progress: { ...stats } });
+	const gaps = [];
 	sweepOrphanedPages({
 		rows: walkUrlRange(databases.page_cache.PrerenderedPage, {
 			key: 'cacheKey',
-			select: ['cacheKey', 'lastCached', 'expiresAt'],
+			select: ['cacheKey', 'lastCached', 'expiresAt', 'statusCode'],
 			chunkSize: CHUNK_SIZE,
-			onUnreadable: () => {
+			onUnreadable: ({ after } = {}) => {
 				stats.unreadable++;
+				if (after !== undefined) gaps.push(after);
 			},
 		}),
+		recoverStubs: () =>
+			gaps.length ? recoverKeylessKeys(databases.page_cache.PrerenderedPage, gaps, { key: 'cacheKey' }) : [],
 		ownerOf: getResidencyByUrl,
 		hostname: server.hostname,
 		// Target is not residency-pinned, so this is a plain node-local point read.
@@ -331,9 +390,10 @@ export const startPageOrphanSweep = async ({
 			logger.warn(
 				`[prerender] page orphan sweep ${stats.canceled ? 'stopped' : 'finished'}` +
 					`${stats.dryRun ? ' (DRY RUN, nothing deleted)' : ''}: ${stats.dryRun ? 'would delete' : 'deleted'} ` +
-					`${stats.deleted} of ${stats.orphaned} orphaned page(s) (${stats.owned} owned of ${stats.examined} ` +
+					`${stats.deleted} of ${stats.orphaned + stats.stubs} orphaned page(s) (${stats.owned} owned of ${stats.examined} ` +
 					`examined; ${stats.old} old enough, ${stats.servableSkipped} still servable, ` +
 					`${stats.targeted} with a target, ${stats.leaseSkipped} in flight` +
+					`${stats.stubs ? `, ${stats.stubs} content-less stub row(s)` : ''}` +
 					`${stats.changed ? `, ${stats.changed} changed before delete` : ''}` +
 					`${stats.unreadable ? `, ${stats.unreadable} unreadable row(s) skipped` : ''}` +
 					`${stats.errors ? `, ${stats.errors} failed batch(es)` : ''})` +

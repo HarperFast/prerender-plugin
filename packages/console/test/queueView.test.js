@@ -879,3 +879,64 @@ test('demand periods read as intervals, the window as its bound, and no estimate
 	assert.equal(changedOrdering({ schema: { children: {} }, layers: [] }), null);
 	assert.equal(changedOrdering(demandConfig()).windowMs, 96 * H);
 });
+
+// ---- plugin v0.97.0 series: change to cache, page size, filing ----
+
+const HOUR_MS = 3_600_000;
+const V097 = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		// 40 changed product pages re-rendered in a median 2h (p95 6h); 10 catalog pages in 30m.
+		combo('render', 'change_lag_ms', 'prefix:/product/', null, 40, 2 * HOUR_MS, 6 * HOUR_MS),
+		combo('render', 'change_lag_ms', 'prefix:/catalog/', null, 10, HOUR_MS / 2, HOUR_MS),
+		// 1,000 product renders: 970 under 1 MB, 30 over (3.0%) — a whole-percent display would say 3%.
+		combo('render_size', 'prefix:/product/', 'desktop', 'under-500k', 600, 300_000),
+		combo('render_size', 'prefix:/product/', 'desktop', '500k-1m', 370, 700_000),
+		combo('render_size', 'prefix:/product/', 'desktop', '1m-2m', 25, 1_400_000),
+		combo('render_size', 'prefix:/product/', 'mobile', '2m-plus', 5, 2_500_000),
+		combo('prerender_ops', 'due_now_forward', 'forwarded', null, 90, 1),
+		combo('prerender_ops', 'due_now_forward', 'fell-back', null, 10, 1),
+		combo('queue_health', 'keeper_unschedulable', null, null, 2, 3),
+	],
+};
+
+const readyWith = async (analytics) => {
+	const ctx = makeCtx(analytics);
+	await load(ctx);
+	return ctx;
+};
+const valueOf = (ctx, label) => tile(ctx, label).children[1].textContent;
+
+test('change to cache reads the lag as a duration across routes, with the tail beside the median', async () => {
+	const ctx = await readyWith(V097);
+	assert.match(valueOf(ctx, 'Median lag'), /h|m/);
+	assert.match(valueOf(ctx, '≈p95 lag'), /h/);
+	assert.match(tile(ctx, 'Median lag').textContent, /50 changed page\(s\) re-rendered/);
+	assert.match(draw(ctx).textContent, /Change to cache/);
+});
+
+test('page size reports the share over 1 MB to one decimal, by band', async () => {
+	const ctx = await readyWith(V097);
+	assert.equal(valueOf(ctx, 'Over 1 MB'), '3.0%');
+	assert.match(tile(ctx, 'Over 1 MB').textContent, /30 of 1,000/);
+	assert.equal(valueOf(ctx, '2m-plus'), '5');
+	assert.match(draw(ctx).textContent, /3\.0% over 1 MB/);
+});
+
+test('filing shows forwarding outcomes and flags fallbacks and unschedulable rows', async () => {
+	const ctx = await readyWith(V097);
+	assert.equal(valueOf(ctx, 'forwarded'), '90');
+	assert.match(tile(ctx, 'fell-back').textContent, /10%/);
+	assert.equal(valueOf(ctx, 'Unschedulable rows'), '3');
+	assert.match(draw(ctx).textContent, /10 fell back/);
+	assert.match(draw(ctx).textContent, /unschedulable rows/);
+});
+
+test('without the v0.97.0 series the new cards say so, and filing is not shown at all', async () => {
+	const ctx = await readyWith(ANALYTICS);
+	const text = draw(ctx).textContent;
+	assert.match(text, /Change to cache/);
+	assert.match(text, /Page size/);
+	assert.doesNotMatch(text, /Filing —/);
+});

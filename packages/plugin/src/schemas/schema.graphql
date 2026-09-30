@@ -17,8 +17,8 @@
 #   probe_state      ProbeState, RenderExpectation,  — change-probe baselines + per-page render
 #                    ProbeStateAnchor                  expectations (node-local, isolated for
 #                                                      reseed write bursts)
-#   invalidation     Invalidation                    — bulk-invalidation epochs (read on the
-#                                                      serve path; isolated, see the type)
+#   invalidation     Invalidation                    — bulk-invalidation epochs (held in memory by
+#                                                      every worker and SUBSCRIBED; isolated, see the type)
 #   raw_cache        RawPage, RawPageAnchor          — cached origin documents for URLs outside
 #                                                      the render rotation (expiring, isolated)
 #   negative_cache   NegativePage,                   — the origin's own 404/410 responses, node-local
@@ -55,6 +55,22 @@ type Sitemap @table(database: "sitemaps") {
 	# double the point reads and double the writes, every single pass. Refresh-all now visits
 	# roots only and lets the index reach its own children.
 	parentUrl: String @indexed
+	# Every route this urlset's entries fell on at its last successful parse (`routeKey`, util/sitemap.js)
+	# — what a failure of this child could have received, which scopes the departure hold-back.
+	routes: [String]
+	# The route table `routes` was computed under (routeClass.js `routeTableFingerprint`): a failed
+	# child's keys are trusted only while it still matches.
+	routesFingerprint: String
+	# `sitemap.shrinkGuard`'s memory of a shrink it REFUSED (a document much shorter than this row, or —
+	# on a dropped child's row — its index leaving it out): how many times, and the version and time of
+	# the FIRST refusal, which "a new origin version" (`newVersionAfter`) and `acceptAge` are measured from. A refused fetch
+	# patches only these; an accepted document's put replaces the row and clears them.
+	shrinkRefusals: Int
+	shrinkRefusedVersion: String
+	shrinkRefusedAt: Date
+	# A dropped child whose omission was accepted and is still draining (the walk's departure budget
+	# deferred part of it back onto this row): not judged again until it is gone or listed again.
+	shrinkAcceptedAt: Date
 }
 
 type SitemapFailure {
@@ -197,6 +213,17 @@ type RenderSchedule @table(database: "render_schedule") @export {
 	# Absent = the tracker could not say (off, cold, saturated); the row then orders by cadence.
 	# NOT @indexed.
 	demandPeriod: Long
+	# When a SINGLE ASK filed this row due now (ms): a render-now, an admin revalidate or rejoin of one
+	# URL, a first sitemap listing — `fileDueNow` (util/renderSchedule.js) unless its caller re-files a
+	# collection (`urgent: false`) — and an adopted redirect destination (`Target.put` with `urgent`). A
+	# bulk re-file is not marked. Filed at the current minute such a row is zero cadences
+	# late, which ranked it behind every overdue row; the queue keeper ranks a row carrying this
+	# `queue.ready.urgentHeadStart` ahead instead (util/renderPriority.js). Distinct from `changedAt`,
+	# which means the ORIGIN changed and is what the re-render-lag metric measures from; a row carrying
+	# both takes the change's head start, and this is not written beside a change mark. Cleared by every
+	# other writer's `put`, the render's reschedule above all; NOT carried through a failed render's slow
+	# lane (the ask was answered by the attempts). NOT @indexed.
+	urgentAt: Long
 }
 
 type QueueStatus @table(database: "render_service") @sealed @export(name: "queue_status") {
@@ -287,6 +314,13 @@ type ConfigOverride @table(database: "config") @sealed {
 	# Why this override exists. It outlives the operator who set it, and an unexplained override that
 	# contradicts the deployed file is precisely the row the next person cannot safely revert.
 	note: String
+
+	# A hash of the config.yaml layer's value at `path` when the row was written (config.js
+	# `hashConfigValue`). A row holds a WHOLE option, so an override of one route is a copy of every
+	# route, and a later config.yaml edit to any of them is silently merged away. Comparing this with
+	# the file's value now is how the layers view reports that (`masking`). Null on rows written
+	# before v0.97.0, which report `masking: null`, unknown.
+	fileHash: String
 }
 
 # Bulk cache invalidation. "Everything of this kind is wrong as of now; stop serving it."
@@ -304,7 +338,10 @@ type ConfigOverride @table(database: "config") @sealed {
 # ITS OWN DATABASE, for two measured reasons. Harper serializes writes per database, and (a) a bulk
 # write to another table in the same database pushed tiny-table read p99 from 0.24 ms to 9.7 ms
 # (max 13.9 ms) — and this table is read ON THE SERVE PATH; (b) `Target.revalidate` and the queue
-# both write `render_service`, so a scope row there would queue behind those commits.
+# both write `render_service`, so a scope row there would queue behind those commits. And a third,
+# since every worker SUBSCRIBES to it (util/invalidation.js holds the table in memory): a
+# subscription is priced per DATABASE — every commit anywhere in it runs a notify pass for each
+# subscribed worker — so NOTHING ELSE MAY EVER SHARE THIS DATABASE.
 #
 # DELIBERATELY NOT @export. A REST write verb here takes the whole corpus off the serve path in one
 # request, and a bare PUT cannot enforce any of the validation that makes a scope meaningful — the
@@ -482,6 +519,12 @@ type ProbeState @table(database: "probe_state", replicate: false) @sealed {
 	# before this column existed; those are compared as usual and stamped on their next quiet
 	# probe. Written by the probe only, in the same put/patch as `signature`.
 	ruleFingerprint: String
+	# When the render check (`changeProbe.renderCheck`, util/changeProbe.js renderClaimVerdict) last
+	# expired and re-filed this URL because a render disagreed with `signature`. Bounds it to ONE re-file
+	# per stored observation (it acts only while `probedAt` is newer), so a page that disagrees with the
+	# endpoint on every render cannot loop. Written in the render's own claim patch; null until then.
+	# Adding this column to the @sealed table needs the workers restarted (a deploy does that).
+	renderRefiledAt: Date
 }
 
 # What the last accepted render of a PAGE produced — the defence against content disappearing with

@@ -45,10 +45,11 @@ const harness = ({ slots = SLOTS, now = 1_700_000_000_000 } = {}) => {
 test('the buffer layout is header + fixed-size slots', () => {
 	// One header word: the occupancy gauge.
 	assert.equal(LEASE_HEADER_BYTES, 4);
-	// Five slot words: hash lo/hi, expiry, due minute, and the miss count.
-	assert.equal(LEASE_SLOT_BYTES, 20);
-	assert.equal(leaseBufferBytes(4096), 4 + 20 * 4096);
-	assert.equal(leaseBufferBytes(4096), 81_924, 'the documented 80KB sizing');
+	// Eight slot words: hash lo/hi, expiry, due minute, the miss count, and the latest grant's second, due
+	// minute and millisecond.
+	assert.equal(LEASE_SLOT_BYTES, 32);
+	assert.equal(leaseBufferBytes(4096), 4 + 32 * 4096);
+	assert.equal(leaseBufferBytes(4096), 131_076, 'the documented 128KB sizing');
 });
 
 // ---- the all-zero buffer ----
@@ -246,6 +247,83 @@ test('a lease that EXPIRES counts as a miss; a released one resets the count', (
 	assert.equal(table.missesBeforeGrant(key), 0, 'released: the count starts again');
 });
 
+test('a RELEASED lease re-granted at the same due minute counts a miss: its result did not commit', () => {
+	// The result path releases before the request's transaction commits. When that commit fails, the row
+	// is still due at its old minute and the key is re-granted a few seconds later — and a release that
+	// always reset the count meant the wedge guard never engaged on that loop.
+	let t = 1_700_000_000_000;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/uncommitted';
+	for (let i = 1; i <= 4; i++) {
+		assert.equal(table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE }), true);
+		assert.equal(table.release(key), true, 'a result came');
+		t += 6_000; // past the release grace
+		assert.equal(table.missesBeforeGrant(key, 7), i, `${i} result(s) in a row left the row where it was`);
+	}
+	assert.equal(table.missesBeforeGrant(key, 8), 0, 'a row that moved is a result that landed: the count resets');
+	table.grant(key, { dueMinute: 8, leaseExpiryMs: t + MINUTE });
+	table.release(key);
+	t += 6_000;
+	assert.equal(table.missesBeforeGrant(key, 8), 1, 'and it counts again from there');
+});
+
+test('a hold carries a same-minute miss count, so the backoff after an uncommitted loop keeps doubling', () => {
+	let t = 1_700_000_000_000;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/uncommitted';
+	for (let i = 0; i < 3; i++) {
+		table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+		table.release(key);
+		t += 6_000;
+	}
+	assert.equal(table.missesBeforeGrant(key, 7), 3);
+	assert.equal(table.hold(key, t + MINUTE, 7), true);
+	t += MINUTE;
+	assert.equal(table.missesBeforeGrant(key, 7), 0, 'the attempt after a hold is always granted');
+	table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+	table.release(key);
+	t += 6_000;
+	assert.equal(table.missesBeforeGrant(key, 7), 4, 'carried through the hold, not reset by it');
+});
+
+test('grantOf names the latest real grant, and still does once it is released or expired', () => {
+	let t = 1_700_000_000_500;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/a';
+	assert.equal(table.grantOf(key), null, 'never granted');
+	table.grant(key, { dueMinute: 3, leaseExpiryMs: t + MINUTE });
+	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_500, dueMinute: 3, live: true, released: false });
+	table.release(key);
+	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_500, dueMinute: 3, live: false, released: true });
+	t += 2 * MINUTE;
+	table.grant(key, { dueMinute: 5, leaseExpiryMs: t + MINUTE });
+	t += 2 * MINUTE; // expired with no result
+	assert.deepEqual(table.grantOf(key), {
+		grantedAtMs: 1_700_000_120_500,
+		dueMinute: 5,
+		live: false,
+		released: false,
+	});
+	table.hold(key, t + MINUTE, 5);
+	assert.equal(table.grantOf(key).grantedAtMs, 1_700_000_120_500, 'a hold is not a grant');
+});
+
+test('a generation-checked release gives up only the lease granted then — never a re-grant since', () => {
+	// A render that outlived its lease still posts its result. By then the key may be leased to another
+	// renderer, and an unchecked release handed that renderer's key back to the queue.
+	let t = 1_700_000_000_000;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/slow';
+	table.grant(key, { dueMinute: 3, leaseExpiryMs: t + MINUTE });
+	const first = table.grantOf(key).grantedAtMs;
+	t += 2 * MINUTE; // the first renderer is still going; its lease expires
+	table.grant(key, { dueMinute: 3, leaseExpiryMs: t + MINUTE }); // and the key goes to a second one
+	assert.equal(table.release(key, { grantedAtMs: first }), false, 'the late result does not release it');
+	assert.equal(table.isLeased(key), true);
+	assert.equal(table.leaseOf(key).leaseExpiresAtMs, t + MINUTE, 'still the second renderer’s lease, untruncated');
+	assert.equal(table.release(key, { grantedAtMs: table.grantOf(key).grantedAtMs }), true, 'its own result does');
+});
+
 test('re-granting an EXPIRED lease reuses its slot instead of consuming a second one', () => {
 	const now = 1_700_000_000_000;
 	const { table, clock } = harness({ now });
@@ -432,4 +510,35 @@ test('a size mismatch derives the slot count from the buffer instead of indexing
 	const table = createLeaseTable({ buffer, slots: 4096, now: () => 1_700_000_000_000 });
 	assert.equal(table.slots, 4);
 	assert.equal(table.grant('a|desktop', { dueMinute: 1, leaseExpiryMs: 1_700_000_060_000 }), true);
+});
+
+test('the grant instant is exact to the millisecond — a mark in the same second is not "after" it', () => {
+	// Floored to its second, a grant at .400 read as .000, before a mark filed at .100 — and the result path
+	// dropped that correct render as changed-during-render.
+	const t = 1_700_000_050_400;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	table.grant('https://www.example.com/ms', { dueMinute: 1, leaseExpiryMs: t + MINUTE });
+	assert.equal(table.grantOf('https://www.example.com/ms').grantedAtMs, t);
+	assert.equal(
+		table.release('https://www.example.com/ms', { grantedAtMs: t - 400 }),
+		false,
+		'the second alone is not the grant'
+	);
+	assert.equal(table.release('https://www.example.com/ms', { grantedAtMs: t }), true);
+});
+
+test('a leftDue release CARRIES the miss count — it neither counts a miss nor resets the count', () => {
+	let t = 1_700_000_000_000;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/carried';
+	for (let i = 0; i < 3; i++) {
+		table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+		t += 2 * MINUTE; // expired with no result
+	}
+	assert.equal(table.missesBeforeGrant(key, 7), 3);
+	table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+	table.release(key, { grantedAtMs: table.grantOf(key).grantedAtMs, leftDue: true });
+	t += 6_000;
+	assert.equal(table.missesBeforeGrant(key, 7), 3, 'the same minute: not a commit that failed');
+	assert.equal(table.missesBeforeGrant(key, 9), 3, 'another minute: not a result that proved the key healthy');
 });

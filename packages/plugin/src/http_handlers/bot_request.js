@@ -66,7 +66,7 @@ export async function handleBotRequest(request) {
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
-		const info = { route, routeClass };
+		const info = { route, routeClass, deviceType };
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		// WHY THIS MISS HAPPENED (`bot_miss`), for exactly the requests bot_serve counts as origin|miss.
@@ -294,7 +294,31 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		// markup, and an intra-cluster fetch is ~50x cheaper than the origin round trip. Inert unless
 		// `peerRescue` is configured; origin remains the backstop for every miss (owner is this node,
 		// owner unreachable, owner's own read fails).
-		const rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		let rescue = await rescueFromOwner({ cacheKey, cacheUrl });
+		// THE OWNER'S COPY IS JUDGED BY THE SAME RULE THE LOCAL ONE WAS. The local record proved itself
+		// servable, but it is the replica — and replication lag is exactly when blob faults cluster, so
+		// the owner's newer metadata may already say this page must not be served: hard-expired by the
+		// change probe, or re-rendered before an epoch the local copy postdates. Serving those bytes as a
+		// 200 because the LOCAL row said so would hand the crawler the very page the probe acted to stop.
+		// Decided here rather than on the owner so that one node, one epoch and one config decide the
+		// whole request, and so the endpoint stays a dumb read (http_handlers/peer_page.js). The
+		// verification pair still applies: the owner is never older than the local copy, so a proof
+		// that exempted the local render exempts the owner's too.
+		if (rescue.ok) {
+			const owner = resolveServeStatus({
+				expiresAtMs: epochMsOf(rescue.page.expiresAt),
+				lastCachedMs: epochMsOf(rescue.page.lastCached),
+				swrTtl: config.page.swrTtl,
+				now: Date.now(),
+				epoch,
+				verifiedAtMs,
+				basisAtMs,
+			});
+			if (!owner.servable) {
+				const why = owner.status === 'invalidated' ? 'invalidated' : 'past its serve window';
+				rescue = { ok: false, owner: rescue.owner, reason: `the owner's copy is ${why}` };
+			}
+		}
 		if (rescue.ok) {
 			const note = timedOut ? `read exceeded ${config.page.blobReadBudgetMs}ms` : 'unreadable';
 			logger.warn(
@@ -330,10 +354,14 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		}
 		info.cacheStatus = failStatus;
 		info.source = 'origin';
+		// A page row was found and is not being served: see `stripConditionals` below.
+		info.stripConditionals = true;
 		return fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
+			stripValidators: true,
 			reason: failStatus,
 		});
 	}
@@ -356,8 +384,10 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 			cacheKey,
 			request,
 			routeScope: routeScopeForEntry(info.route),
+			pageFound: Boolean(page),
 		});
 		info.renderNowStatus = rendered.renderNowStatus;
+		info.stripConditionals = rendered.stripConditionals === true;
 		// 'hit' served the fresh render; on timeout we served the fallback (a cached page
 		// when miss=false, else the origin proxy / 504).
 		info.source = rendered.renderNowStatus === 'hit' ? 'rendered' : rendered.resource.miss ? 'origin' : 'cache';
@@ -464,27 +494,49 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	}
 
 	info.source = 'origin';
-	// `stripValidators` on an invalidated verdict, so the origin cannot answer 304 to the validators
-	// this plugin handed the crawler off the snapshot that was just invalidated. Without it the crawler
-	// keeps the pre-change bytes while every signal — the counter, the source, the status — says the
-	// invalidation worked. See util/upstream.js.
+	// A PAGE ROW WAS FOUND AND IS NOT BEING SERVED — stale (a probe hard-expire lands here), invalidated —
+	// or an invalidation refused a raw document: the crawler's validators may be ones this plugin handed
+	// it off that very snapshot, so they must decide nothing. `stripValidators` keeps them from the
+	// origin, and `info.stripConditionals` keeps `deliverResource` from comparing them with the
+	// origin's own validators. The second is the one that bit: a snapshot's `Last-Modified` is its
+	// render time, and an origin whose `Last-Modified` does not track content (a template mtime, a
+	// publish date) is older than that, so `If-Modified-Since` answered 304 locally and the crawler
+	// kept the pre-change snapshot of a page the probe had just expired — on exactly the path Merchant
+	// Center checks prices against. Only a TRUE miss and a raw serve keep ordinary conditional
+	// handling: nothing this plugin served can be behind their validators.
+	info.stripConditionals = Boolean(page) || info.cacheStatus === 'invalidated';
+	//
+	// A HEAD GOES UPSTREAM AS A HEAD. Sent as a GET, the origin built and sent a full document that
+	// nothing would read: `deliverResource` drops the body of a HEAD, and the undici stream behind it
+	// held its socket until `bodyTimeout` — one pinned origin connection per HEAD miss.
 	const resource = await fetchOriginResource({
 		url,
 		deviceType,
+		method: request.method,
 		headers: request.headers,
-		stripValidators: info.cacheStatus === 'invalidated',
+		stripValidators: info.stripConditionals,
 		// The cache status that led here IS the origin_fetch reason (miss/stale/skip/invalidated).
 		reason: info.cacheStatus,
 	});
 
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
-	// store is detached inside `captureForRawCache` — no latency on this response.
-	const kept = rawPolicy ? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy }) : resource;
-	// Same rule for a 404/410: the store (and the Target guard in front of it) is detached. The two never
-	// both attach — the raw cache stores only 200s, the negative cache only its configured statuses.
+	// store is detached inside `captureForRawCache` — no latency on this response. Never for a HEAD:
+	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
+	const kept =
+		rawPolicy && request.method !== 'HEAD'
+			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy })
+			: resource;
+	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
+	// only 200s, the negative cache only its configured statuses.
 	return negativePolicy
-		? afterNegativeProxy(kept, { key: negativeKey, cacheUrl, policy: negativePolicy, lookup: negativeLookup })
+		? afterNegativeProxy(kept, {
+				key: negativeKey,
+				cacheUrl,
+				policy: negativePolicy,
+				lookup: negativeLookup,
+				method: request.method,
+			})
 		: kept;
 }
 
@@ -560,7 +612,9 @@ export function maybeSchedule(
 		// the origin answering 200 for it is evidence whichever crawler asked. A true miss only: a suppressed
 		// target has no page, so anything else found a row in rotation and has nothing to reopen. Detached,
 		// like the discovery read, and never on a route-gated path (that return is above).
-		if (cacheStatus === 'miss' && config.render.suppression.gone.reopen.enabled) {
+		// Never on a HEAD: the origin's HEAD handler is not the page, and plenty answer 200 to any path.
+		// Reopening a target is a claim that the page exists, and that takes a GET's status.
+		if (cacheStatus === 'miss' && resource.method !== 'HEAD' && config.render.suppression.gone.reopen.enabled) {
 			setImmediate(reopenFromTraffic, resource);
 		}
 		return onMiss?.('gated-bot');
@@ -638,7 +692,7 @@ export function recordDemand({ resource, routeClass, route, cacheUrl, botName, c
 // On-demand render: force an immediate one-off render and wait for the fresh result,
 // bypassing both the cache and the origin proxy. Returns { resource, renderNowStatus }
 // where renderNowStatus is 'hit' (fresh render served) or 'timeout' (fell back).
-async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeScope }) {
+async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeScope, pageFound = false }) {
 	const since = Date.now();
 
 	// `fromSitemap` COMES FROM THE TARGET, and this fixes a pre-existing bug: `put` REPLACES the
@@ -727,17 +781,21 @@ async function renderNow({ url, cacheUrl, deviceType, cacheKey, request, routeSc
 	// letting the crawler keep pre-change bytes while the request records renderNowStatus:
 	// 'timeout' and every signal reads as success. Stripping whenever ANY epoch is active for the
 	// scope (rather than re-deriving this page's exact verdict) over-strips at worst — the cost is
-	// a full origin response instead of a 304, only while an invalidation row exists.
+	// a full origin response instead of a 304, only while an invalidation row exists. And whenever a
+	// page row was found at all, for the reason `stripConditionals` gives in resolveResource.
 	const activeEpoch = await resolveInvalidation(routeScope);
+	const stripConditionals = pageFound || !!activeEpoch;
 	return {
 		resource: await fetchOriginResource({
 			url,
 			deviceType,
+			method: request.method,
 			headers: request.headers,
-			stripValidators: !!activeEpoch,
+			stripValidators: stripConditionals,
 			reason: 'render-timeout',
 		}),
 		renderNowStatus: 'timeout',
+		stripConditionals,
 	};
 }
 
@@ -776,7 +834,8 @@ export async function handlePageScheduling(resource, route, botName, onMiss = nu
 			if (existingTarget) {
 				if (existingTarget.state === 'suppressed') {
 					tell('suppressed');
-					if (isGoneSuppressed(existingTarget)) {
+					// A GET's 200 only, for the reason the gated-bot branch of `maybeSchedule` gives.
+					if (isGoneSuppressed(existingTarget) && resource.method !== 'HEAD') {
 						await maybeReopenGone({ url: canonicalUrl, target: existingTarget, via: 'traffic' });
 					}
 				} else if (resource.deviceType && !config.deviceTypes.default.includes(resource.deviceType)) tell('device');

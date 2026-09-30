@@ -357,3 +357,119 @@ test('a failed list is an error, never "no sitemaps"', async () => {
 	assert.match(text, /upstream down/);
 	assert.doesNotMatch(text, /No sitemaps registered/);
 });
+
+// Plugin v0.97.0 stores only a leading sample of a urlset's entries. Paging to `entryCount` ran out at
+// the sample and kept offering "next" onto empty pages from page 11 on.
+test('a urlset pages over the entries the plugin STORES, and says it is showing the first of N', async () => {
+	const sampled = (offset) => ({
+		...CHILD_DETAIL,
+		sitemap: { ...CHILD_DETAIL.sitemap, entryCount: 50_000, entriesStored: 500 },
+		entries: Array.from({ length: 50 }, (_, i) => ({ loc: `https://example.com/p/${offset + i}`, state: 'cached' })),
+		offset,
+	});
+	const ctx = makeCtx();
+	ctx.post = async (route, body) => ({ ok: true, body: route === 'sitemap' ? sampled(body.offset ?? 0) : {} });
+	ctx.data.selected = CHILD;
+	ctx.data.offset = 450;
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /451–500 of 500/);
+	assert.match(text, /showing the first 500 of 50,000/);
+	assert.equal(linkSaying(draw(ctx), 'next →'), null, 'no next page past the stored sample');
+	assert.notEqual(linkSaying(draw(ctx), '← prev'), null);
+});
+
+test('an older plugin that sends no entriesStored still pages to entryCount, with no sample note', async () => {
+	const ctx = makeCtx();
+	ctx.post = async (route) => ({
+		ok: true,
+		body:
+			route === 'sitemap'
+				? { ...CHILD_DETAIL, sitemap: { ...CHILD_DETAIL.sitemap, entryCount: 120 }, entries: CHILD_DETAIL.entries }
+				: {},
+	});
+	ctx.data.selected = CHILD;
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /of 120/);
+	assert.doesNotMatch(text, /showing the first/);
+	assert.notEqual(linkSaying(draw(ctx), 'next →'), null);
+});
+
+// ---- the Departures card (the departure family, and plugin v0.97.0's guard series) ----
+
+const DEPARTURES = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		combo('sitemap_departure_render', 2, 40), // 80 acted
+		combo('sitemap_departure_reattached', 2, 500), // shear
+		combo('sitemap_departure_relinked', 1, 12),
+		combo('sitemap_departure_deferred', 1, 300),
+		combo('sitemap_departure_suppressed', 1, 5),
+		combo('sitemap_departure_capped', 1, 7),
+		combo('sitemap_shrink_refused', 1, 1),
+		combo('sitemap_shrink_accepted', 1, 1),
+	],
+};
+
+const HOLDING = {
+	...LIST,
+	sitemaps: [
+		{
+			...LIST.sitemaps[0],
+			refresh: {
+				...LIST.sitemaps[0].refresh,
+				holdBack: [
+					{
+						sitemapUrl: CHILD,
+						reason: 'refused-shrink',
+						detail: 'refusing a document of 10 entries against the 50000 last accepted',
+						since: new Date(Date.now() - 2 * HOUR).toISOString(),
+						acceptRegardlessAt: new Date(Date.now() + 46 * HOUR).toISOString(),
+					},
+					{ sitemapUrl: 'https://example.com/sitemap-products-2.xml', reason: 'budget', deferred: 300 },
+				],
+			},
+		},
+	],
+};
+
+const tileIn = (ctx, label) =>
+	find(draw(ctx), (n) => n.attributes?.class === 'stat' && n.children[0]?.textContent === label);
+const valueIn = (ctx, label) => tileIn(ctx, label).children[1].textContent;
+
+test('departures are grouped by what they mean for a page: acted, shear, held back, deferred, lost', async () => {
+	const ctx = makeCtx({ analytics: DEPARTURES });
+	await load(ctx);
+	assert.equal(valueIn(ctx, 'Acted'), '80');
+	assert.equal(valueIn(ctx, 'Shear'), '1.0k');
+	assert.equal(valueIn(ctx, 'Held back'), '12');
+	assert.equal(valueIn(ctx, 'Deferred'), '300');
+	assert.equal(valueIn(ctx, 'Lost'), '7');
+	const text = textOf(ctx);
+	assert.match(text, /7 capped — lost/);
+	assert.match(text, /1 shrink\(s\) accepted/);
+});
+
+test('the Departures card lists every child holding departures back, and why', async () => {
+	const ctx = makeCtx({ analytics: DEPARTURES, list: async () => ({ ok: true, body: HOLDING }) });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.match(text, /2 child sitemap\(s\) holding back/);
+	assert.match(text, /refused as much shorter than the last accepted/);
+	assert.match(text, /300 deferred/);
+});
+
+test('with nothing departed and nothing held, the Departures card says so', async () => {
+	const ctx = await ready();
+	assert.match(textOf(ctx), /No departures decided in the last 24h, and nothing held back/);
+});
+
+test('a held-back row says how long ago it started, not NaN', async () => {
+	const ctx = makeCtx({ analytics: DEPARTURES, list: async () => ({ ok: true, body: HOLDING }) });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.doesNotMatch(text, /NaN/);
+	assert.match(text, /2h ago|2 h ago|hours? ago/);
+});

@@ -13,7 +13,20 @@ let funnel;
 before(async () => {
 	globalThis.server = { hostname: 'test-node', nodes: [], config: { http: { port: 9926 } } };
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} };
+	// `fileDueNow` asks the lease table whether a due minute is still open, so the named shared buffers
+	// have to exist — keyed, as in production, or every acquisition gets its own zeroed buffer.
+	const sabs = new Map();
 	globalThis.databases = {
+		coordination: {
+			SharedBuffer: {
+				primaryStore: {
+					getUserSharedBuffer: (key, buffer) => {
+						if (!sabs.has(key)) sabs.set(key, buffer);
+						return sabs.get(key);
+					},
+				},
+			},
+		},
 		render_schedule: {
 			RenderSchedule: {
 				put: async (id, data) => rows.set(id, { ...data }),
@@ -143,4 +156,83 @@ test('fileDueNow: a marked row keeps its demand, and takes the given one only if
 		demandPeriod: 9e6,
 	});
 	assert.equal(rows.get('https://example.com/unknown').demandPeriod, 9e6, 'marked with no estimate: takes the new one');
+});
+
+test('fileDueNow marks the row URGENT, keeping the first ask’s instant; a change mark takes precedence', async () => {
+	// Filed at the current minute a row is zero cadences late, so without the mark an ask to render now
+	// ranked behind every overdue row — and past the ready set's capacity was not published at all.
+	rows.clear();
+	const before = Date.now();
+	await funnel.fileDueNow('https://example.com/asked', { fromSitemap: true, effectiveInterval: null });
+	const askedAt = rows.get('https://example.com/asked').urgentAt;
+	assert.ok(askedAt >= before && askedAt <= Date.now(), 'marked when filed');
+	await funnel.fileDueNow('https://example.com/asked', { fromSitemap: true, effectiveInterval: null });
+	assert.equal(rows.get('https://example.com/asked').urgentAt, askedAt, 'a second ask keeps the first instant');
+
+	await funnel.fileDueNow('https://example.com/changed', {
+		fromSitemap: true,
+		effectiveInterval: null,
+		changedAt: before,
+	});
+	assert.equal(rows.get('https://example.com/changed').changedAt, before);
+	assert.equal('urgentAt' in rows.get('https://example.com/changed'), false, 'not written beside a change mark');
+
+	// Every other writer `put`s the row whole, so the render's reschedule clears it by omission.
+	await funnel.writeSchedule('https://example.com/asked', {
+		nextRenderTime: T0,
+		fromSitemap: true,
+		effectiveInterval: null,
+	});
+	assert.equal('urgentAt' in rows.get('https://example.com/asked'), false);
+});
+
+test('fileDueNow returns the due time it wrote', async () => {
+	rows.clear();
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/r', { fromSitemap: true, effectiveInterval: null }),
+		minute
+	);
+	rows.set('https://example.com/r', { nextRenderTime: minute - 3_600_000, fromSitemap: true });
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/r', { fromSitemap: true, effectiveInterval: null }),
+		minute - 3_600_000
+	);
+});
+
+test('fileDueNow with urgent:false (a bulk re-file) adds no ask, and keeps one the row already has', async () => {
+	rows.clear();
+	await funnel.fileDueNow('https://example.com/bulk', { fromSitemap: true, effectiveInterval: null, urgent: false });
+	assert.equal('urgentAt' in rows.get('https://example.com/bulk'), false);
+	rows.set('https://example.com/asked', { nextRenderTime: T0, fromSitemap: true, urgentAt: T0 });
+	await funnel.fileDueNow('https://example.com/asked', { fromSitemap: true, effectiveInterval: null, urgent: false });
+	assert.equal(rows.get('https://example.com/asked').urgentAt, T0, 'an earlier single ask survives a bulk re-file');
+});
+
+test('fileDueNow never keeps a due minute a lease was already granted for — it files the current minute', async () => {
+	// Inside a render's own result (or any caller whose write is not yet committed) the local read returns
+	// the row as it was before that write: at the minute its lease was granted for. Keeping it re-filed the
+	// row at a minute a render already answered, ranked as if it had waited all along, and made the next
+	// grant look like a result whose commit failed (a wedge miss).
+	funnel.resetRenderQueueState();
+	rows.clear();
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	const D = minute - 3 * 3_600_000;
+	rows.set('https://example.com/rendered', { nextRenderTime: D, fromSitemap: true });
+	funnel.leaseTable().grant('https://example.com/rendered', {
+		dueMinute: funnel.minuteOf(D),
+		leaseExpiryMs: Date.now() + 600_000,
+	});
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/rendered', { fromSitemap: true, effectiveInterval: null }),
+		minute,
+		'the claimed minute is not kept'
+	);
+	rows.set('https://example.com/waiting', { nextRenderTime: D, fromSitemap: true });
+	assert.equal(
+		await funnel.fileDueNow('https://example.com/waiting', { fromSitemap: true, effectiveInterval: null }),
+		D,
+		'a due minute no lease has answered still is'
+	);
+	funnel.resetRenderQueueState();
 });

@@ -63,6 +63,59 @@ test('throws on a plain-text (non-XML) response — e.g. a bare "Access Denied"'
 	assert.throws(() => parseSitemap('Access Denied'), /got a non-XML or empty document/);
 });
 
+// --- truncation: a cut-off document is refused, never read as a shorter sitemap ---
+
+test('a <urlset> whose root is never closed is refused as truncated, not parsed to its prefix', () => {
+	const cut = `${xmlDecl}<urlset><url><loc>https://x/a</loc></url><url><loc>https://x/b</loc></url><url><loc>https://x/`;
+	// The parser hands back the half-written third entry too — which is exactly why the prefix must not be trusted.
+	assert.throws(() => parseSitemap(cut), /truncated — its <urlset> is never closed \(3 entries before the cut\)/);
+});
+
+test('a <sitemapindex> cut off mid-list is refused the same way', () => {
+	const cut = `${xmlDecl}<sitemapindex><sitemap><loc>https://x/s1.xml</loc></sitemap><sitemap><loc>https://x/s`;
+	assert.throws(() => parseSitemap(cut), /truncated — its <sitemapindex> is never closed/);
+});
+
+test('whitespace, comments and processing instructions after the root close are not truncation', () => {
+	const { entries } = parseSitemap(
+		`${xmlDecl}<urlset><url><loc>https://x/a</loc></url></urlset>\n<!-- generated 2026-09-29 -->\n<?done?>\n`
+	);
+	assert.equal(entries.length, 1);
+	assert.deepEqual(
+		parseSitemap(`${xmlDecl}<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/>\n`).entries,
+		[]
+	);
+});
+
+test('an unescaped ampersand — invalid XML every parser tolerates — is still accepted: truncation is the only refusal', () => {
+	const { entries } = parseSitemap(`${xmlDecl}<urlset><url><loc>https://x/a?b=1&c=2</loc></url></urlset>`);
+	assert.equal(entries.length, 1);
+});
+
+test('a truncated GZIP body, which undici decodes leniently to a prefix with status 200, is refused', async () => {
+	const { createServer } = await import('node:http');
+	const { gzipSync } = await import('node:zlib');
+	const locs = Array.from({ length: 5000 }, (_, i) => `<url><loc>https://example.com/product/prd-${i}</loc></url>`);
+	const gz = gzipSync(
+		`${xmlDecl}<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${locs.join('')}</urlset>`
+	);
+	const cut = gz.subarray(0, Math.floor(gz.length * 0.4));
+	const server = createServer((req, res) => {
+		res.writeHead(200, { 'content-type': 'application/xml', 'content-encoding': 'gzip', 'content-length': cut.length });
+		res.end(cut);
+	});
+	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		const res = await fetch(`http://127.0.0.1:${server.address().port}/sitemap.xml`);
+		assert.equal(res.status, 200);
+		const text = await res.text();
+		assert.ok(text.length > 0, 'the prefix arrives with no error');
+		assert.throws(() => parseSitemap(text), /truncated/);
+	} finally {
+		server.close();
+	}
+});
+
 // --- partitionSitemapEntries: only prerender routes become render targets ---
 
 const ROUTES = [
@@ -91,6 +144,15 @@ test('keeps prerender entries and counts the rest by class', () => {
 	assert.equal(filtered[PASSTHROUGH], 1);
 	assert.equal(filtered[UNCLASSIFIED], 1);
 	assert.deepEqual(invalid, []);
+});
+
+test('reports every route the entries fall on, filtered ones included', () => {
+	forwarded();
+	const { routes } = partitionSitemapEntries(
+		locs('https://www.example.com/catalog/a.jsp', 'https://www.example.com/orders/x', 'https://www.example.com/blog/y')
+	);
+	assert.equal(routes.size, 3, 'the catalog route, the passthrough route and the unclassified class');
+	assert.ok(routes.has(UNCLASSIFIED));
 });
 
 test('keys kept entries with the matched route allowlist, not the raw URL', () => {

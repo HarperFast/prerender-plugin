@@ -30,3 +30,11 @@ export const runDetached = AsyncResource.bind((fn) => {
 		return Promise.reject(e);
 	}
 });
+
+/**
+ * The same context switch for SYNCHRONOUS work whose caller handles its own throws: a throw propagates
+ * as a throw. It is for callbacks that ARM timers or subscriptions, such as `onConfigApplied`
+ * listeners: a timer captures the context it is armed in, so a listener run inside a request would
+ * arm every timer it touches on that request's transaction, and each tick would inherit it.
+ */
+export const runInLoadContext = AsyncResource.bind((fn) => fn());

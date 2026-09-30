@@ -33,6 +33,9 @@ export async function handleApplication(scope) {
 	// consulted at apply time rather than here, so flipping `management.overrides.enabled` in the
 	// config file takes effect on the next apply without having to re-read the table.
 	let overrides = {};
+	// Each row's recorded file hash, by path. Applied nowhere: it is what the layers view and the
+	// apply-time warning judge `masking` against (see `overrideDrift` in src/config.js).
+	let recorded = {};
 
 	// BOTH LAYERS ON EVERY APPLY. `applyOptions` rebuilds the whole config from defaults each time,
 	// so applying one layer alone silently drops the other: a config.yaml edit would wipe every
@@ -45,7 +48,7 @@ export async function handleApplication(scope) {
 	// so the override layer is dropped rather than allowed to be fatal.
 	const apply = () => {
 		try {
-			return applyOptions(hostOptions(), overridesEnabledFor(hostOptions()) ? overrides : {});
+			return applyOptions(hostOptions(), overridesEnabledFor(hostOptions()) ? overrides : {}, recorded);
 		} catch (e) {
 			scope.logger.error(
 				`[prerender] Could not apply stored config overrides (${e.message}) — running the deployed ` +
@@ -60,8 +63,9 @@ export async function handleApplication(scope) {
 	// neither, and the resulting staleness would persist — invisibly — until the backstop poll. The
 	// watcher's own settings come from a pure resolve of the file layer, because nothing has been
 	// applied yet and reading the live config here would see schema defaults.
-	await startOverrideWatch((next) => {
+	await startOverrideWatch((next, nextRecorded) => {
 		overrides = next;
+		recorded = nextRecorded ?? {};
 		apply();
 	}, resolveConfig(hostOptions(), null).config.management.overrides);
 
@@ -79,8 +83,9 @@ export async function handleApplication(scope) {
 	// doorbell fired in the window that subscribing early exists to cover. In that case the watcher
 	// has strictly fresher data and this boot read must NOT overwrite it; applying anyway would
 	// reinstate the pre-edit config and file it under a fingerprint that says nothing is pending.
-	if (seedOverrideFingerprint(layer.overrides)) {
+	if (seedOverrideFingerprint(layer.overrides, layer.recorded)) {
 		overrides = layer.overrides;
+		recorded = layer.recorded ?? {};
 		apply();
 	}
 
@@ -114,11 +119,11 @@ export async function handleApplication(scope) {
 	// Unlike the three above, this one runs on EVERY worker: its counters are in-process, so
 	// each worker has to flush its own tally (see util/unrouted.js).
 	startUnroutedReporter();
-	// EVERY worker too, and for two different reasons in one call: it primes this worker's
-	// last-known-good invalidation set (the serve path resolves per request, and the HTTP handler is
-	// installed at module load — before this runs — so the very first cache-servable request would
-	// otherwise be the one uncovered read), and it reports any recorded scope that no longer names a
-	// configured route. That second half must re-run on config changes, because a route RENAMED by a
-	// live edit un-invalidates a corpus somebody deliberately invalidated, with nothing else to notice.
+	// EVERY worker too, and for two different reasons in one call: it starts this worker's subscribed
+	// in-memory view of the invalidation table (the serve path resolves epochs from it; until it loads,
+	// the handler — installed at module load, before this runs — reads per request), and it reports any
+	// recorded scope that no longer names a configured route. That second half must re-run on config
+	// changes, because a route RENAMED by a live edit un-invalidates a corpus somebody deliberately
+	// invalidated, with nothing else to notice.
 	startInvalidationWatch();
 }

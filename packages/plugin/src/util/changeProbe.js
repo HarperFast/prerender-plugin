@@ -52,15 +52,17 @@ import { metrics } from '../metrics.js';
 import { fnv1a32 } from './hash.js';
 import { epochMsOf, dateColumnMs, getNextTimeOfDay, DAY, MINUTE, SECOND } from './time.js';
 import { getResidencyByUrl } from './residency.js';
-import { resolveEffectiveInterval } from './routeClass.js';
+import { resolveEffectiveInterval, routeScopeForUrl } from './routeClass.js';
 import { fileDueNow } from './renderSchedule.js';
 import { demandOf, warmDemand } from './demand.js';
 import { createChangeActions } from './changeActions.js';
-import { recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
+import { CLUSTER_SCOPE, recordInvalidation, isScopeResolvable, resolveInvalidation } from './invalidation.js';
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
-import { writeVerification } from './pageVerification.js';
+import { resolveVerification, writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
+import { runDetached } from './detach.js';
+import { getSab } from './coordination.js';
 import { probeScopeFilter } from './probeScope.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
@@ -75,7 +77,7 @@ import {
 	signatureUnderPrefix,
 	statusSignalFor,
 	apiClaimOf,
-	claimsDisagree,
+	compareClaims,
 	pageClaimFromOffers,
 	changedSlots,
 	compareField,
@@ -156,9 +158,12 @@ const newStats = () => ({
 	unchanged: 0,
 	changed: 0,
 	triggered: 0, // changes acted on: page hard-expired, render filed ahead of rotation, baseline written
+	covered: 0, // changes an active invalidation already answers (every page refused, or verified on proof): not counted `changed`, not acted on, baseline NOT moved
+	healed: 0, // changes every page of which was re-rendered after the trip and shows: baselined, not acted on — OVERLAYS changed, counted in caughtUp
+	rowErrors: 0, // ProbeState reads/writes that threw: the row is skipped (or its write lost) and the pass goes on
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
-	fresh: 0, // skipped: baseline younger than reprobeAfter (a pass already covered it)
+	fresh: 0, // skipped: baseline written since this pass (or the pass it resumes) began — already probed
 	pageMismatch: 0, // cached page disagreed with the origin (pageCheck: the claim pair, or an ARMED mapped field) — OVERLAYS the buckets above, which count by signature outcome alone
 	caughtUp: 0, // origin changed, but every changed slot is a mapped slot the cached page ALREADY shows the new value for: baseline written, nothing triggered — OVERLAYS changed
 	ignored: 0, // origin changed only in pageCheck.ignoreChanges slots: baseline written, nothing triggered, NOT a change for the canary — OVERLAYS unchanged
@@ -333,17 +338,20 @@ export const actOnChange = async (row) => {
 	const nowMs = Date.now();
 	const keys = cacheKeysOf(row.url);
 	const hardExpiredAt = nowMs - config.page.swrTtl;
+	const pages = await Promise.all(
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] }))
+	);
 	// EXPIRE FIRST: if anything below fails, the page has at least stopped serving known-wrong content,
 	// and the stale baseline makes the next probe act again. A page already expired this far (a change
 	// found again before its render landed) is not patched again — one replicated write per device
-	// page per change, not per detection.
+	// page per change, not per detection. The key rides in the patch: a patch that races a delete (the
+	// target retired on another node) would otherwise store a page stub with no key.
 	await Promise.all(
-		keys.map(async (cacheKey) => {
-			const page = await pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] });
+		pages.map(async (page, index) => {
 			if (!page) return;
 			const expiresAt = dateColumnMs(page.expiresAt);
 			if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
-			await pageTable().patch(cacheKey, { expiresAt: hardExpiredAt });
+			await pageTable().patch(keys[index], { cacheKey: keys[index], expiresAt: hardExpiredAt });
 		})
 	);
 	// FILED AT THE CURRENT MINUTE, NEVER LATER THAN IT ALREADY WAS (`fileDueNow`). The current minute
@@ -367,11 +375,114 @@ export const actOnChange = async (row) => {
 	});
 };
 
+/**
+ * What an active invalidation already does for the pages of a URL a pass would act on: 'covered',
+ * 'healed' or null (act). `epochFor(url)` resolves the epoch the serve path applies (`at`, with the pad)
+ * and the trip instant itself (`trippedAt`). Per page:
+ *
+ *   REFUSED   rendered at or before the epoch — `!(lastCached > at)`, the serve path's own NaN-safe
+ *             test — and not exempted by a page verification (`resolveServeStatus`).
+ *   VERIFIED  rendered before the epoch but served on proof: the render that wrote the stored claim
+ *             (`lastCached >= pageClaimAt`, the verification basis rule) and that claim AGREES with this
+ *             observation (`pageAgrees`: the claim pair compared and agreed, no armed mapped field
+ *             disagreeing). While verification is armed for the rule, the verification is WRITTEN here —
+ *             without it, a page rendered after the reprice but before the trip (the reprice-to-trip gap,
+ *             up to one canary interval) could never be rescued: it is re-detected as changed every pass
+ *             and never reaches the unchanged branch that writes verifications (review, round 3). An
+ *             existing verification with an agreeing claim counts the same.
+ *   HEALED    rendered after the epoch, by (or after) the render that wrote the agreeing claim, on a
+ *             baseline taken before the trip, and every changed slot is one that page shows
+ *             (`changeShown`) — so the change this probe sees is the trip's own, which the page was
+ *             rendered after. Without the rule a pass during an invalidation expired every page the
+ *             accelerator had already re-rendered correctly.
+ *
+ * Every page HEALED -> 'healed' (the pass moves the baseline); every page refused, verified or healed,
+ * with at least one not healed -> 'covered' (nothing done, the baseline stays: a false trip leaves no
+ * glitch value behind, and a true trip's page is still acted on once the invalidation is cleared); no page
+ * at all -> 'covered'; anything else -> null, and the pass acts.
+ */
+const coverageOf = async (url, { pageAgrees, pageClaimAt, probedAt, changeShown, verify }, epochFor) => {
+	const epoch = await epochFor(url);
+	if (!epoch) return null;
+	const keys = cacheKeysOf(url);
+	const pages = await Promise.all(
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'lastCached'] }))
+	);
+	const { verifiedAtMs, basisAtMs } = await resolveVerification(url);
+	const claimAt = epochOf(pageClaimAt);
+	const healedRender = changeShown === true && claimAt > epoch.at && probedAt < epoch.trippedAt;
+	let others = 0;
+	let verifyDue = false;
+	for (const page of pages) {
+		if (!page) continue;
+		const lastCached = dateColumnMs(page.lastCached);
+		const described = pageAgrees === true && lastCached >= claimAt;
+		if (!(lastCached > epoch.at)) {
+			if (verifiedAtMs > epoch.at && lastCached >= basisAtMs && !described) return null;
+			if (described && verify) verifyDue = true;
+			others++;
+		} else if (!(healedRender && lastCached >= claimAt)) {
+			return null;
+		}
+	}
+	if (verifyDue) await verify(url, pageClaimAt);
+	return others > 0 || !pages.some(Boolean) ? 'covered' : 'healed';
+};
+
+/**
+ * The invalidation epoch per route scope for one pass, READ DIRECTLY from the table rather than from the
+ * serve path's per-worker view. The view is rebuilt on a doorbell after each write, so a reseed chained
+ * straight off a canary trip could resolve before this worker's view had the trip's own row — and a
+ * pass that took that "nothing is invalidated" for its whole run acted on the entire scope. Off the hot
+ * path (it runs per detected change), so two point reads on a tiny table are affordable.
+ *
+ * An epoch, once seen, is kept for the pass: a scope cleared mid-pass only means a covered URL is left to
+ * the invalidation rather than expired, which is what clearing it asks for anyway. "Nothing invalidated"
+ * is kept for only a few seconds, so an invalidation recorded mid-pass (here, or replicated in from
+ * another node) is seen within that. A failed read is "nothing invalidated", not cached — the pass then
+ * acts as it would with no invalidation, the freshness-safe direction.
+ */
+const EPOCH_NONE_TTL_MS = 5 * SECOND;
+const epochResolver = () => {
+	const epochs = new Map(); // scope -> epoch | { none: until }
+	return async (url) => {
+		const scope = routeScopeForUrl(url);
+		const known = epochs.get(scope);
+		if (known && !known.none) return known;
+		if (known?.none > Date.now()) return null;
+		let epoch = null;
+		try {
+			epoch = await readEpochDirect(scope);
+		} catch {
+			return null;
+		}
+		epochs.set(scope, epoch ?? { none: Date.now() + EPOCH_NONE_TTL_MS });
+		return epoch;
+	};
+};
+
+/** `resolveInvalidation`'s answer (max over `all` and the route's scope), from the rows themselves. */
+const readEpochDirect = async (routeScope) => {
+	if (!config.invalidation.enabled) return null;
+	const scopes = routeScope && routeScope !== CLUSTER_SCOPE ? [CLUSTER_SCOPE, routeScope] : [CLUSTER_SCOPE];
+	const rows = await Promise.all(
+		scopes.map((scope) => invalidationTable().get({ id: scope, select: ['scope', 'invalidatedAt'] }))
+	);
+	let trippedAt = NaN;
+	for (const row of rows) {
+		// A row with no readable instant applies to nothing (`interpretRow`, which also logs it — the
+		// serve path's view does that once per load; here it would log once per changed URL).
+		const at = epochMsOf(row?.invalidatedAt);
+		if (Number.isFinite(at) && !(at <= trippedAt)) trippedAt = at;
+	}
+	return Number.isFinite(trippedAt) ? { at: trippedAt + config.invalidation.pad, trippedAt } : null;
+};
+
 // ProbeState is node-local (`replicate: false`) and only ever touched by the owner's probe —
 // a missing row (never probed, ownership moved, node rebuilt, target deleted) reads as null and
 // the state machine SEEDS, which is the safe direction everywhere this can happen.
-// Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL
-// another pass already covered (see `reprobeAfter` in runProbePass).
+// Returns the whole baseline, not just the signature: `probedAt` is what lets a pass skip a URL it
+// (or the pass it resumes) already probed — see `skipProbedSince` in runProbePass.
 const readSignature = async (url) => {
 	const row = await probeStateTable().get({
 		id: url,
@@ -406,8 +517,12 @@ const readSignature = async (url) => {
 // the seeding write is by definition to a URL with no row yet; a patch there would make every
 // first observation a silent no-op. A row the render path creates between the read and that put
 // loses at most one baseline to the race and re-seeds on the next pass.
-export const writeSignature = (url, signature, { rowExists = false, clearClaim = false, fingerprint = null } = {}) => {
-	const fields = { signature, probedAt: new Date() };
+export const writeSignature = (
+	url,
+	signature,
+	{ rowExists = false, clearClaim = false, fingerprint = null, extra = null } = {}
+) => {
+	const fields = { signature, probedAt: new Date(), ...extra };
 	// The rule that made this observation (changeProbeSpec.js ruleFingerprint), so the next pass
 	// can tell a rule edit from a content change. Written with EVERY baseline, including the
 	// one-time stamp of a pre-fingerprint row; a signature is never left beside a stale fingerprint.
@@ -425,8 +540,10 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
 		fields.pageClaimAt = null;
 		fields.pageFacts = null;
 	}
+	// The key rides in the patch too, so a patch that races the row's delete (the target retired) cannot
+	// leave a keyless stub behind.
 	return rowExists
-		? probeStateTable().patch(url, fields)
+		? probeStateTable().patch(url, { url, ...fields })
 		: probeStateTable().put(url, { url, pageSignature: null, pageClaimAt: null, pageFacts: null, ...fields });
 };
 
@@ -451,6 +568,13 @@ export const writeSignature = (url, signature, { rowExists = false, clearClaim =
  * one-device render, whose other device pages are older than this record would claim) — stores
  * null, which compares as no claim. A rule without fields keeps the original behaviour exactly: a
  * render that yields no claim writes nothing.
+ *
+ * AND IT CHECKS THE RENDER (`changeProbe.renderCheck`, v0.97.0). The row this reads to choose between
+ * patch and put holds the probe's last observation of the origin, so the new claim is compared with it
+ * right here — see `renderClaimVerdict`. Resolves `{ stale: true }` when the render disagrees and should
+ * be expired and re-filed; the CALLER does that (`actOnStaleRender`), after its own page writes and its
+ * reschedule, which would otherwise overwrite both the expiry and the re-file. Anything else resolves
+ * undefined, and nothing here ever rejects.
  */
 export const recordPageClaim = async (
 	url,
@@ -507,15 +631,307 @@ export const recordPageClaim = async (
 		}
 		// patch cannot create, and put would clobber the probe's own signature/probedAt — so read
 		// first and choose. The read is a node-local point read on a small table, once per render
-		// of a pageCheck-matched URL.
-		const existing = await probeStateTable().get({ id: url, select: ['url'] });
-		if (existing) await probeStateTable().patch(url, fields);
+		// of a pageCheck-matched URL. It carries the probe's baseline too, for the render check.
+		const existing = await probeStateTable().get({
+			id: url,
+			select: ['url', 'signature', 'probedAt', 'ruleFingerprint', 'renderRefiledAt'],
+		});
+		const verdict = existing && claim ? await renderClaimVerdict(url, rule, claim, existing) : null;
+		// The bound (see `renderClaimVerdict`) rides in the claim's own write: no extra write. The claim's
+		// own stamp is kept for the confirming re-probe, which must not act on (or clear) a newer claim.
+		if (verdict?.stale) {
+			fields.renderRefiledAt = new Date();
+			noteSuspectClaim(url, claimAt.getTime());
+		}
+		if (existing) await probeStateTable().patch(url, { url, ...fields });
 		// A record of nothing is not worth creating a row for; on an EXISTING row the nulls above are
 		// the point (they retire an older render's record).
 		else if (fields.pageSignature !== null || fields.pageFacts) await probeStateTable().put(url, { url, ...fields });
+		if (verdict?.outcome) countProbe('render_mismatch', verdict.outcome);
+		return verdict?.stale ? { stale: true } : undefined;
 	} catch (e) {
 		logger.warn?.(`[prerender] change-probe page claim not recorded for ${url}: ${e?.message ?? String(e)}`);
+		return undefined;
 	}
+};
+
+/**
+ * THE RENDER CHECK: does a render that just landed disagree with the probe's last observation of the
+ * origin? Null when nothing disagrees (or the check does not apply), else `{ outcome }`, with
+ * `stale: true` when the render is SUSPECT and one confirming re-probe of the URL is due
+ * (`actOnStaleRender`, which the render result path calls after its own writes).
+ *
+ * WHAT IT CATCHES. A render claimed BEFORE a probe found a change and landing AFTER it (the queue drops
+ * most of those on the lease-vs-mark check; this catches the rest), and a render that captured a stale
+ * copy of the page (a CDN or origin cache behind the one the probe's endpoint reads). Either way the probe
+ * will not look at the URL again until its next pass, a day away in anchored mode, and the page serves
+ * wrong until then.
+ *
+ * WHY A RE-PROBE, NOT THE BASELINE'S WORD. The stored signature is the probe's last observation and the
+ * render is newer than it, so a disagreement means the render is stale OR the origin moved since the probe
+ * looked — an intra-day availability change, an off-schedule reprice, a baseline left by a false trip's
+ * glitch — and only the first is the render's fault. Acting on the baseline expired correct pages in every
+ * one of those cases (review, round 2). So nothing is expired on a disagreement alone: ONE origin request
+ * asks again (`confirmStaleRender`), and only an answer that also disagrees with the page acts.
+ *
+ * WHEN IT DOES NOT EVEN ASK. When the origin is KNOWN to have moved since the probe last observed the URL
+ * (`mayBeStale`: the most recent anchor, in anchored mode, or an active invalidation's trip, came after
+ * it), the render is likelier right than the baseline, and the pass reaching the URL will compare the
+ * page's claim itself — counted `untrusted`, no request. On a reprice night that is nearly every
+ * disagreement, so the re-probes stay a trickle.
+ *
+ * WHY IT CANNOT LOOP. A page whose origin genuinely disagrees with the endpoint on every render would
+ * re-probe and re-render forever. `renderRefiledAt` bounds it to ONE confirmation per stored observation:
+ * a later disagreeing render against the same baseline counts `bounded` and is left to the pass.
+ *
+ * Only the price/availability claim pair — the fields a served mismatch costs most on — and only in an
+ * armed probe (`dry_run` is counted otherwise, and asks nothing). The mapped `pageCheck.fields` are not
+ * checked here: the mapping-defect guard that protects them lives in the sweep's process.
+ */
+const renderClaimVerdict = async (url, rule, claim, stored) => {
+	if (!config.changeProbe.renderCheck) return null;
+	const fingerprint = stored.ruleFingerprint ?? null;
+	if (!stored.signature || (fingerprint !== null && fingerprint !== rule.fingerprint)) return null;
+	const slots = signatureSlots(stored.signature);
+	if (!slots) return null; // a status-signal literal carries no price/availability to compare
+	if (compareClaims(claim, apiClaimOf(slots, rule.pageCheck)) !== false) return null;
+	const probedAt = epochOf(stored.probedAt);
+	const refiledAt = epochOf(stored.renderRefiledAt);
+	if (Number.isFinite(refiledAt) && !(probedAt > refiledAt)) return { outcome: 'bounded' };
+	if (!(await mayBeStale(url, probedAt))) return { outcome: 'untrusted' };
+	if (config.changeProbe.dryRun) return { outcome: 'dry_run' };
+	return { stale: true };
+};
+
+/**
+ * Could the render, rather than the origin, be what changed? False when the origin is known to have moved
+ * since the probe last observed the URL:
+ *
+ *   an active invalidation's trip came after the BASELINE (`probedAt`). Not after a walk-past: a pass
+ *     during an invalidation leaves a covered page's baseline where it was (`coverageOf`), so "the reseed
+ *     walked past it" says nothing about what the origin said — and counting it made every covered page
+ *     that later healed cost a re-probe, for the whole invalidation (review, round 3).
+ *   in anchored mode, the most recent anchor came after the latest observation (`observedSince`, or the
+ *     baseline's own write).
+ *
+ * True otherwise — including when nothing is known (interval or continuous mode, no invalidation), which
+ * is a question to ASK the origin, never a reason to trust a baseline of any age.
+ */
+const mayBeStale = async (url, probedAt) => {
+	const baselineAt = Number.isFinite(probedAt) ? probedAt : -Infinity;
+	try {
+		const epoch = await resolveInvalidation(routeScopeForUrl(url));
+		// The epoch carries the serve path's pad; the trip itself is the instant that matters here.
+		if (epoch && baselineAt < epoch.at - config.invalidation.pad) return false;
+	} catch {
+		// Unknown: judge on the anchor alone.
+	}
+	if (!isAnchored()) return true;
+	const anchor = previousAnchorOccurrence();
+	if (!Number.isFinite(anchor)) return true;
+	const since = observedSince((await sweepStateForRenderCheck())?.sweep, url);
+	return Math.max(baselineAt, Number.isFinite(since) ? since : -Infinity) >= anchor;
+};
+
+/**
+ * When the probe last OBSERVED `url` at the latest, from this node's published pass state (the probe
+ * writes nothing on an unchanged observation, so this is the only record there is): the start of the
+ * running pass once its cursor is past the URL, else the start of the last pass if it covered the URL
+ * (it finished, or it stopped past it). NaN when unknown. A pass's start is its ORIGIN — a resume and
+ * the pass it continues walk one key range between them.
+ */
+const observedSince = (sweep, url) => {
+	if (!sweep) return NaN;
+	if (sweep.running === true && typeof sweep.progress?.cursor === 'string' && url < sweep.progress.cursor) {
+		return epochMsOf(sweep.originStartedAt ?? sweep.startedAt);
+	}
+	const last = sweep.lastRun;
+	if (!last || last.error) return NaN;
+	if (last.aborted && !(typeof last.walkedThrough === 'string' && url <= last.walkedThrough)) return NaN;
+	return epochMsOf(last.resumedFrom ?? last.startedAt);
+};
+
+// The pass state for the render check, re-read at most every few seconds per worker: it only runs on a
+// disagreement, but a change wave can make that thousands of renders an hour.
+const RENDER_CHECK_STATE_TTL_MS = 10 * SECOND;
+let renderCheckState = { at: 0, row: null };
+const sweepStateForRenderCheck = async () => {
+	if (Date.now() - renderCheckState.at < RENDER_CHECK_STATE_TTL_MS) return renderCheckState.row;
+	renderCheckState = { at: Date.now(), row: await readProbeState() };
+	return renderCheckState.row;
+};
+
+/**
+ * Confirm a render the render check found suspect (`recordPageClaim` resolved `{ stale }`): queue ONE
+ * re-probe of the URL, and act only on its answer (`confirmStaleRender`). Called by the render result path
+ * AFTER its page writes and its reschedule, so an expiry and re-file it leads to cannot be overwritten by
+ * them. Returns at once — the request runs DETACHED from the render result's request context (whose
+ * transaction Harper closes after the response, `util/detach.js`) — and never rejects.
+ */
+const rechecksInFlight = new Set();
+export const actOnStaleRender = (url, target = null) => {
+	const claimAtMs = suspectClaims.get(url) ?? NaN;
+	suspectClaims.delete(url);
+	if (rechecksInFlight.size >= RECHECK_MAX_PENDING) {
+		countProbe('render_mismatch', 'shed');
+		return Promise.resolve();
+	}
+	const running = runDetached(() => confirmStaleRender(url, target, claimAtMs)).catch((e) => {
+		countProbe('render_mismatch', 'error');
+		logger.warn?.(`[prerender] change-probe: render recheck of ${url} failed: ${e?.message ?? String(e)}`);
+	});
+	rechecksInFlight.add(running);
+	running.finally(() => rechecksInFlight.delete(running));
+	return Promise.resolve();
+};
+
+// The claim stamp (`pageClaimAt`, epoch ms) of each suspect render, from `recordPageClaim` to the
+// `actOnStaleRender` the same result path calls a moment later on the same worker. Bounded: a result
+// path that never makes the call (no target) must not grow it.
+const suspectClaims = new Map();
+const noteSuspectClaim = (url, claimAtMs) => {
+	suspectClaims.delete(url);
+	suspectClaims.set(url, claimAtMs);
+	if (suspectClaims.size > RECHECK_MAX_PENDING) suspectClaims.delete(suspectClaims.keys().next().value);
+};
+
+// Per worker: re-probes waiting for a pacing slot. Past this, a suspect render is left to the pass.
+const RECHECK_MAX_PENDING = 256;
+// The longest a re-probe waits for its node-wide slot before it is shed (counted `shed`).
+const RECHECK_MAX_WAIT_MS = MINUTE;
+
+/**
+ * THE RE-PROBES' PACE: NODE-WIDE, AND OUT OF THE SWEEP'S BUDGET, NOT BESIDE IT.
+ *
+ * Node-wide because a render lands on whichever worker the fleet's POST reached, so a per-worker pace
+ * would let sixteen workers send sixteen times the rate. Out of the sweep's budget because
+ * `ratePerSecond` is the number agreed with whoever runs the origin: a re-probe paced at it beside a
+ * sweep running at it is twice the agreed rate (review, round 3). So a running sweep publishes the
+ * HEADROOM it leaves (`publishSweepHeadroom`: the ceiling minus the rate it is paced at, divided by
+ * whatever backoff the origin or the node has imposed on it), and the re-probes share only that — none
+ * while a sweep runs at the ceiling or the origin is pushing back, the whole ceiling when no sweep runs.
+ *
+ * One shared cell (`[nextSlot, headroom in milli-requests/s, when the sweep last published it]`, epoch
+ * ms): each re-probe takes the next slot `1000 / headroom` ms on, by compare-and-swap, and waits for it —
+ * or is shed (the pass will get to the URL) when that slot is more than `RECHECK_MAX_WAIT_MS` away. A
+ * sweep that stops publishing (it ended, or its worker died) stops counting after `SWEEP_PACE_FRESH_MS`.
+ */
+const SWEEP_PACE_FRESH_MS = 2 * MINUTE;
+let originPace = null;
+const originPaceCell = () => (originPace ??= new BigInt64Array(getSab('change_probe_origin_pace', 24)));
+
+/** The running sweep's share of the node's probe budget: what it leaves for the re-probes. Null = done. */
+const publishSweepHeadroom = (headroom) => {
+	const cell = originPaceCell();
+	Atomics.store(cell, 1, BigInt(Math.max(0, Math.round((headroom ?? 0) * 1000))));
+	Atomics.store(cell, 2, headroom === null ? 0n : BigInt(Date.now()));
+};
+
+const recheckRate = () => {
+	const ceiling = Math.max(1, config.changeProbe.ratePerSecond);
+	const cell = originPaceCell();
+	const publishedAt = Number(Atomics.load(cell, 2));
+	if (!(publishedAt > 0 && Date.now() - publishedAt < SWEEP_PACE_FRESH_MS)) return ceiling;
+	return Math.min(ceiling, Number(Atomics.load(cell, 1)) / 1000);
+};
+
+const reserveRecheckSlot = () => {
+	const cell = originPaceCell();
+	const rate = recheckRate();
+	if (!(rate > 0)) return null;
+	const step = BigInt(Math.max(1, Math.ceil(1000 / rate)));
+	for (let attempt = 0; attempt < 32; attempt++) {
+		const now = BigInt(Date.now());
+		const next = Atomics.load(cell, 0);
+		const slot = next > now ? next : now;
+		if (slot - now > BigInt(RECHECK_MAX_WAIT_MS)) return null;
+		if (Atomics.compareExchange(cell, 0, next, slot + step) === next) return Number(slot);
+	}
+	return null;
+};
+
+/**
+ * The confirming re-probe. The page's claim is re-read (a newer render, or an action, may have replaced
+ * or cleared it meanwhile) and compared with the fresh observation:
+ *
+ *   disagrees    the page is stale: hard-expired and re-filed as a change (`actOnChange`), counted
+ *                `confirmed`. The fresh observation becomes the baseline only if it differs from the
+ *                stored one (the origin moved too); an unchanged origin keeps its baseline, so the bound
+ *                in `renderClaimVerdict` holds until the pass writes a new one.
+ *   agrees       the origin moved since the probe last looked and the page shows it: the fresh
+ *                observation becomes the baseline, nothing is expired — `cleared`.
+ *   neither      nothing comparable, a failed probe, the claim gone: nothing is done.
+ */
+const confirmStaleRender = async (url, target, claimAtMs = NaN) => {
+	const slot = reserveRecheckSlot();
+	if (slot === null) {
+		countProbe('render_mismatch', 'shed');
+		return;
+	}
+	if (slot > Date.now()) await waitUnref(slot - Date.now());
+	if (!config.changeProbe.enabled || !config.changeProbe.renderCheck) return;
+	const pathname = URL.parse(url)?.pathname;
+	const rule = pathname ? probeRules().find((candidate) => candidate.pathPattern.test(pathname)) : null;
+	if (!rule?.pageCheck) return;
+	countProbe('render_mismatch', 'rechecked');
+	let fresh = null;
+	try {
+		fresh = await probeOnce(rule, url);
+	} catch {
+		fresh = null;
+	}
+	const values = fresh ? signatureSlots(fresh) : null;
+	if (!values) {
+		countProbe('render_mismatch', 'recheck_failed');
+		return;
+	}
+	const stored = await probeStateTable().get({
+		id: url,
+		select: ['url', 'signature', 'pageSignature', 'pageClaimAt', 'ruleFingerprint'],
+	});
+	// A NEWER RENDER LANDED while this waited for its slot: its claim is what describes the cached page now,
+	// and it had its own render check. This one has nothing left to judge.
+	const newerThan = (value) => Number.isFinite(claimAtMs) && epochOf(value) > claimAtMs;
+	if (stored && newerThan(stored.pageClaimAt)) {
+		countProbe('render_mismatch', 'superseded');
+		return;
+	}
+	const verdict = stored?.pageSignature
+		? compareClaims(stored.pageSignature, apiClaimOf(values, rule.pageCheck))
+		: null;
+	if (verdict === null) {
+		countProbe('render_mismatch', 'recheck_inconclusive');
+		return;
+	}
+	if (verdict === true) {
+		if (fresh !== stored.signature) {
+			await writeSignature(url, fresh, { rowExists: true, fingerprint: rule.fingerprint });
+		}
+		countProbe('render_mismatch', 'cleared');
+		return;
+	}
+	await actOnChange({
+		url,
+		sitemapUrl: target?.sitemapUrl ?? null,
+		renderInterval: target?.renderInterval ?? null,
+		demandInterval: target?.demandInterval ?? null,
+	});
+	if (fresh !== stored.signature) {
+		// The bound re-armed in the same write: `renderRefiledAt` at or after the new `probedAt`. The claim
+		// is cleared only if it is still the one judged here — a render that landed during the action wrote
+		// a newer claim describing a newer page, and wiping it would blind the next comparison.
+		const current = await probeStateTable().get({ id: url, select: ['url', 'pageClaimAt'] });
+		await writeSignature(url, fresh, {
+			rowExists: true,
+			clearClaim: !newerThan(current?.pageClaimAt),
+			fingerprint: rule.fingerprint,
+			extra: { renderRefiledAt: new Date() },
+		});
+	}
+	countProbe('render_mismatch', 'confirmed');
+	logger.info?.(
+		`[prerender] change-probe: the render of ${url} disagrees with the origin, asked again — expired and re-filed`
+	);
 };
 
 /** The page record to store for one render, or null — see recordPageClaim for when and why. */
@@ -755,7 +1171,9 @@ export const runProbePass = async ({
 	inScope = null,
 	ownershipChecked = false,
 	onYield = () => yieldNow(),
-	reprobeAfter = 0,
+	// Skip a URL whose baseline was written at or after this instant (epoch ms): THIS pass, or the pass
+	// it resumes, already probed it. Null never skips — the canary's setting. See `processOne`.
+	skipProbedSince = null,
 	backoffMax = 1,
 	abortAfterDistress = 0,
 	// Continuous mode. `cycleTarget` is the wall-clock budget for covering `sliceSize` matched
@@ -768,8 +1186,24 @@ export const runProbePass = async ({
 	readLag = () => null,
 	lagThreshold = 0,
 	loadBackoffMax = 1,
+	// Observability hooks. `onStart` receives the pass's LIVE stats object as soon as it exists — the
+	// caller cannot otherwise reach it while the pass runs (or after it throws), and its heartbeat and
+	// metric emission both need to. `onBatch` fires after every probed batch, which is the cadence the
+	// pass's metrics are emitted on (see `createPassEmitter`).
+	onStart = () => {},
+	onBatch = () => {},
+	// Called with (rule, row) for every origin CHANGE the pass detects (the rows counted `changed`) —
+	// what the detection-lag metric is emitted from.
+	onChange = () => {},
+	// What an active invalidation already does for a URL the pass would act on (`coverageOf`): 'covered',
+	// 'healed' or null. Null = no such check (the canary, and every pass that does not wire it).
+	coverageOf = null,
+	// Told the rate each batch was paced at and the backoff on it (`(rate, originThrottle, loadThrottle)`),
+	// so a sweep can publish the budget it leaves (`publishSweepHeadroom`).
+	onPace = () => {},
 } = {}) => {
 	const stats = newStats();
+	onStart(stats);
 	const batch = [];
 
 	// The origin-pressure state. `throttle` multiplies the pacing window, so it divides the
@@ -814,14 +1248,21 @@ export const runProbePass = async ({
 	};
 
 	const processOne = async ({ row, rule }) => {
-		// Read BEFORE the probe now (it used to read after, to skip the read on a failed probe).
-		// The stored baseline carries WHEN it was taken, and a baseline younger than
-		// `reprobeAfter` means another pass already covered this URL — the common case after a
-		// restart, which otherwise re-probes hours of already-seeded ground. Trading a node-local
-		// point read for an origin request is the right way round: the origin request is the
-		// scarce, externally-visible resource.
+		// Read BEFORE the probe (it used to read after, to skip the read on a failed probe): the stored
+		// baseline carries WHEN it was written, and one written since this pass began — by this pass
+		// before a restart cut it short, by an in-flight action the resume cursor was held back for, or
+		// by the canary — has already been probed by the pass this row belongs to. Trading a node-local
+		// point read for an origin request is the right way round: the origin request is the scarce,
+		// externally-visible resource.
+		//
+		// SINCE THE PASS BEGAN, NOT "YOUNGER THAN `reprobeAfter`" (the rule before v0.97.0). `probedAt`
+		// moves only when a baseline is WRITTEN — a change, a seed, a re-baseline — never on an unchanged
+		// observation, so an age test selected exactly the rows that had recently CHANGED and never the
+		// quiet ones it was meant to spare. Measured on a live deployment: every change an off-schedule
+		// daytime pass caught was skipped by the next night's anchored pass, because its baseline was
+		// under 12h old — and that night's reprice of those pages waited a full day for the pass after.
 		const stored = (await read(row.url)) ?? null;
-		if (reprobeAfter > 0 && Number.isFinite(stored?.probedAt) && now() - stored.probedAt < reprobeAfter) {
+		if (skipProbedSince !== null && Number.isFinite(stored?.probedAt) && stored.probedAt >= skipProbedSince) {
 			stats.fresh++;
 			return;
 		}
@@ -910,10 +1351,12 @@ export const runProbePass = async ({
 			return values;
 		};
 
-		let pageDisagrees = false;
+		// The claim pair's verdict: true compared-and-agreed, false disagreed, null nothing comparable.
+		let claimVerdict = null;
 		if (claimPair && stored?.pageSignature && valuesOf()) {
-			pageDisagrees = claimsDisagree(stored.pageSignature, apiClaimOf(values, pageCheck));
+			claimVerdict = compareClaims(stored.pageSignature, apiClaimOf(values, pageCheck));
 		}
+		const pageDisagrees = claimVerdict === false;
 
 		const signatureChanged = Boolean(stored?.signature) && stored.signature !== comparable;
 
@@ -980,30 +1423,71 @@ export const runProbePass = async ({
 		};
 		let ignoredOnly = false;
 		let caughtUp = false;
+		// The changed slots that need the page to show them (ignored ones excluded), or null for a
+		// status-signal literal — a state, not slots.
+		let relevant = null;
 		if (signatureChanged) {
 			const slots = changedSlots(stored.signature, comparable);
 			if (slots === null) {
 				bump(stats.slotChanges, rule.label, 'signal');
 			} else {
 				for (const slot of slots) bump(stats.slotChanges, rule.label, String(slot));
-				const relevant = slots.filter((slot) => !(pageCheck?.ignoreChanges ?? []).includes(slot));
+				relevant = slots.filter((slot) => !(pageCheck?.ignoreChanges ?? []).includes(slot));
 				if (!relevant.length) ignoredOnly = true;
 				else if (verdicts) caughtUp = relevant.every((slot) => slotCaughtUp(slot));
 			}
 		}
 
 		const needsRender = signatureChanged && !ignoredOnly && !caughtUp;
+
+		// WHAT AN ACTIVE INVALIDATION ALREADY DOES FOR THE PAGE (`coverage`, the sweep only — see
+		// `coverageOf`), decided here rather than in the action so a covered row is COUNTED as one: an
+		// armed pass that would act asks first, and 'covered' (the invalidation refuses every page, or a
+		// verification now serves it on proof) does nothing at all — no baseline, no action, no `changed`,
+		// no detection lag, so a long invalidation does not re-report the same URLs as changes every pass —
+		// while 'healed' (every page re-rendered after the trip, showing this change) moves the baseline
+		// like a caught-up change. HEALED NEEDS EVERY CHANGED SLOT SHOWN: in the claim pair, which agreed,
+		// or on an armed mapped field that agreed — an unmapped slot that moved could be a second change
+		// after the heal render, which only a re-render resolves (review, round 3).
+		const pageAgrees = claimVerdict === true && !mappedDisagrees;
+		let coverage = null;
+		if (coverageOf && !dryRun && stored?.signature && (needsRender || pageDisagrees || mappedDisagrees)) {
+			const pairSlots = claimPair ? [pageCheck.priceFrom, pageCheck.availableFrom] : [];
+			const shown = (slot) =>
+				pairSlots.includes(slot) ||
+				(verdicts ?? []).some(({ field, verdict }) => field.slot === slot && verdict === true && armed(field));
+			coverage = await coverageOf(row.url, {
+				pageAgrees,
+				pageClaimAt: stored.pageClaimAt ?? null,
+				probedAt: Number.isFinite(stored.probedAt) ? stored.probedAt : null,
+				changeShown: pageAgrees && relevant !== null && relevant.every(shown),
+				verify: verificationArmed ? verify : null,
+			});
+		}
 		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
 		// `probed = seeded + rebaselined + unchanged + changed + failed` is the documented invariant, and the
 		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
 		// would silently shrink the mass-change sample right when claims are most likely to be
 		// stale. `pageMismatch`, `caughtUp` and `ignored` OVERLAY these buckets; they never replace
 		// them. An IGNORED change is bucketed unchanged — for the canary it is not a change.
-		if (signatureChanged && !ignoredOnly) stats.changed++;
-		else if (stored?.signature) stats.unchanged++;
+		// A COVERED change is its own bucket: the partition is `probed = seeded + rebaselined + unchanged +
+		// changed + covered + failed`, and the canary (which never covers) keeps its denominator.
+		if (coverage === 'covered' && signatureChanged && !ignoredOnly) {
+			stats.covered++;
+		} else if (signatureChanged && !ignoredOnly) {
+			stats.changed++;
+			onChange(rule, row);
+		} else if (stored?.signature) stats.unchanged++;
 		else stats.seeded++;
 		if (ignoredOnly) stats.ignored++;
 		if (caughtUp) stats.caughtUp++;
+		if (coverage === 'covered') return;
+		if (coverage === 'healed') {
+			stats.caughtUp++;
+			stats.healed++;
+			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+			return;
+		}
 		if (!needsRender && !pageDisagrees && !mappedDisagrees) {
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
@@ -1020,18 +1504,20 @@ export const runProbePass = async ({
 			if (signatureChanged || extended || stored.fingerprint === null || stored.fingerprint === undefined) {
 				await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
 			}
-			// PROOF that something was compared: the stored claim for a rule with the claim pair (the
-			// original gate, unchanged), else at least one armed mapped field that agreed. A caught-up
-			// row is not verified on this pass — its baseline just moved — and is on the next.
-			const proof = claimPair ? Boolean(stored.pageSignature) : mappedAgreed > 0;
+			// PROOF that something was compared AND agreed: for a rule with the claim pair, a claim
+			// comparison that actually compared a dimension (`claimVerdict === true` — a stored claim
+			// alone is not a comparison: an unrecognised availability word beside a null endpoint price
+			// compares nothing and used to pass here); else at least one armed mapped field that agreed.
+			// A caught-up row is not verified on this pass — its baseline just moved — and is on the next.
+			const proof = claimPair ? claimVerdict === true : mappedAgreed > 0;
 			if (verificationArmed && proof && !caughtUp && !mappedDisagrees) {
 				// PROOF, not absence of news. Both conditions are load-bearing and neither is
 				// redundant:
 				//
-				//   proof                 `pageDisagrees` is computed only when a stored claim exists (and
-				//                         a mapped field only when a stored record does), so a URL whose
-				//                         page claim is unknown arrives here with nothing disagreeing —
-				//                         identical, at this line, to a real agreement. Without this guard
+				//   proof                 nothing disagreeing is not an agreement: a URL whose page claim
+				//                         is unknown, or whose claim shares no comparable dimension with the
+				//                         endpoint's, arrives here with nothing disagreeing — identical, at
+				//                         this line, to a real agreement. Without this guard
 				//                         we would stamp "verified" on a page nobody ever compared, and
 				//                         serve it through an invalidation. That is the one failure this
 				//                         feature must never produce.
@@ -1065,7 +1551,15 @@ export const runProbePass = async ({
 		// knows is wrong is expired when it is found, and the render queue orders the re-renders. The
 		// BASELINE WRITE GOES WITH THE ACTION, after it succeeds, because that ordering is the whole
 		// retry story — an action that fails or never finishes leaves the signature stale.
-		await submitTrigger({ row, observed, rowExists: stored !== null, fingerprint: rule.fingerprint });
+		await submitTrigger({
+			row,
+			observed,
+			rowExists: stored !== null,
+			fingerprint: rule.fingerprint,
+			detectedAt: now(),
+			// The baseline this was detected against, for the retry's staleness test (`stillDue`).
+			page: { probedAt: Number.isFinite(stored?.probedAt) ? stored.probedAt : null },
+		});
 	};
 
 	// Pacing: batches of `concurrency`, each batch held to the window `ratePerSecond` implies for
@@ -1079,14 +1573,37 @@ export const runProbePass = async ({
 	// response to pressure immediate and the recovery slow — the asymmetry a backoff needs.
 	const flush = async () => {
 		if (!batch.length) return;
-		const batchSize = batch.length;
 		const started = now();
 		batchDistress = 0;
 		retryAfterMs = 0;
-		await Promise.all(batch.map(processOne));
+		const probedBefore = stats.probed;
+		// A ROW'S STORAGE FAULT IS THAT ROW'S, NOT THE PASS'S. The ProbeState read and the baseline writes
+		// throw on a database under pressure (Harper answers 503 "outstanding write transactions" exactly on
+		// a reprice night's write wave), and one such throw used to end the whole pass — the rest of the
+		// night unprobed, and nothing resumed it. The row is counted (`rowErrors`, in `probe_errors`) and
+		// the walk goes on; a baseline that was not read or not written is simply probed again next pass.
+		await Promise.all(
+			batch.map((item) =>
+				processOne(item).catch((e) => {
+					stats.rowErrors++;
+					if (stats.failureSamples.length < 3) {
+						stats.failureSamples.push({
+							url: item.row.url,
+							rule: item.rule.label,
+							error: `storage: ${e?.message ?? String(e)}`,
+						});
+					}
+				})
+			)
+		);
+		// ONLY ROWS THAT MADE A REQUEST ARE PACED. A row skipped as fresh costs a node-local read and no
+		// origin call, so charging it a slot of the rate window made a run of skips crawl at
+		// `ratePerSecond` for nothing — the pacing exists for the origin, not for the table.
+		const requested = stats.probed - probedBefore;
 		// Every row up to here has been probed and its action (if any) started: the resume cursor may
 		// move past them once their actions settle (see `resumeKeyOf`).
 		stats.walkedThrough = batch[batch.length - 1].row.url;
+		onBatch(stats);
 
 		throttle = stepBackoff(throttle, batchDistress > 0, backoffMax);
 		stats.throttleLevel = throttle;
@@ -1122,11 +1639,12 @@ export const runProbePass = async ({
 		const { rate, behind } = pacedRate({ ratePerSecond, cycleRate });
 		if (behind && cycleTarget > 0 && sliceSize > 0) stats.behindBatches++;
 		stats.pacedRate = rate;
+		onPace(rate, throttle, loadThrottle);
 
 		const elapsed = now() - started;
 		batch.length = 0;
 		const wait = batchPause({
-			batchSize,
+			batchSize: requested,
 			rate,
 			originThrottle: throttle,
 			loadThrottle,
@@ -1152,9 +1670,8 @@ export const runProbePass = async ({
 		stats.examined++;
 		// Skipped rows (unowned, unmatched — most of a multi-node registry) never reach the paced
 		// flush, so without this a chunk of pure skips runs as one synchronous burst. Same
-		// discipline, same cadence as util/reconcile.js's walk. The LIVE stats ride along so the
-		// sweep's heartbeat can publish the running pass's own partial counts — the caller cannot
-		// read `stats` itself, which is still in its temporal dead zone while this pass runs.
+		// discipline, same cadence as util/reconcile.js's walk. (The heartbeat does NOT ride this —
+		// see `startHeartbeat` for why it is a timer.)
 		if (stats.examined % YIELD_EVERY === 0) await onYield(stats);
 		if (!ownershipChecked && ownerOf(row.url) !== hostname) continue;
 		stats.owned++;
@@ -1223,34 +1740,126 @@ async function* readCohortRows(urls) {
 	}
 }
 
-// Metric emission must never cost the pass or the trip action its outcome.
-const countProbe = (series) => {
+/**
+ * Before an after-walk retry (util/changeActions.js): does the detection still stand? Not when the
+ * baseline has moved since (another pass, the canary or the render check wrote one — acting now would
+ * write the walk's older observation over it), nor when a page of the URL was rendered after the change
+ * was found (expiring it would throw away a render that may well show the change; the next probe
+ * decides). A read that fails says "yes": the retry then fails or succeeds on its own terms.
+ */
+const detectionStillCurrent = async (item) => {
 	try {
-		metrics.changeProbe(1, series);
+		const current = await readSignature(item.row.url);
+		const probedNow = Number.isFinite(current?.probedAt) ? current.probedAt : null;
+		if (probedNow !== (item.page?.probedAt ?? null)) return false;
+		const pages = await Promise.all(
+			cacheKeysOf(item.row.url).map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'lastCached'] }))
+		);
+		return !pages.some((page) => dateColumnMs(page?.lastCached) > item.detectedAt);
+	} catch {
+		return true;
+	}
+};
+
+// One log line per failed action: the first attempt, and the after-walk retry (util/changeActions.js).
+const logActionError = (e, item, { retry = false } = {}) =>
+	logger.error(
+		e,
+		retry
+			? `[prerender] change-probe action retry failed for ${item.row.url} — left for the next probe of it`
+			: `[prerender] change-probe action failed for ${item.row.url} (retried once when the walk ends)`
+	);
+
+// Metric emission must never cost the pass or the trip action its outcome.
+const countProbe = (series, detail = null, value = 1, context = null) => {
+	try {
+		metrics.changeProbe(value, series, detail, context);
 	} catch (e) {
 		logger.warn(`[prerender] change-probe ${series} not recorded: ${e?.message ?? String(e)}`);
 	}
 };
 
-const emitStats = (stats, kind) => {
-	try {
-		metrics.changeProbe(stats.probed, 'probed');
-		metrics.changeProbe(stats.seeded, 'seeded');
-		metrics.changeProbe(stats.rebaselined, 'rebaselined');
-		metrics.changeProbe(stats.changed, 'changed');
-		metrics.changeProbe(stats.triggered, 'triggered');
-		metrics.changeProbe(stats.failed, 'failed');
-		metrics.changeProbe(stats.fresh, 'fresh');
-		metrics.changeProbe(stats.throttled, 'throttled');
-		metrics.changeProbe(stats.pageMismatch, 'page_mismatch');
-		metrics.changeProbe(stats.behindBatches, 'cycle_behind');
-	} catch (e) {
-		logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
-	}
+/**
+ * DETECTION LAG, as two upper bounds per detected change — there is no per-URL record of when the probe
+ * last saw a URL UNCHANGED (an unchanged probe writes nothing, by design), so the true lag cannot be
+ * measured, only bounded:
+ *
+ *   `pass`           now minus the start of the pass that found it — for an anchored pass, the ANCHOR
+ *                    instant it serves (it may start later: chained, or caught up), so for a change that
+ *                    landed at the origin's scheduled time this is the lag itself.
+ *   `previous_pass`  now minus the start of the pass before it. That pass observed the URL at some point
+ *                    after its start, so if it covered the URL, the change happened after this — a true
+ *                    upper bound, not an estimate.
+ *
+ * `probe_detection_lag`, detail = the bound, context = the rule label, value = ms: read its percentiles.
+ */
+const detectionLagEmitter =
+	({ passStart, previousStart }) =>
+	(rule) => {
+		const now = Date.now();
+		if (Number.isFinite(passStart) && now >= passStart)
+			countProbe('detection_lag', 'pass', now - passStart, rule.label);
+		if (Number.isFinite(previousStart) && now >= previousStart) {
+			countProbe('detection_lag', 'previous_pass', now - previousStart, rule.label);
+		}
+	};
+
+/**
+ * A pass's counters as `probe_*` series, emitted AS THE PASS GOES: each call sends what each counter
+ * gained since the previous call, and a counter that gained nothing sends nothing.
+ *
+ * WHY NOT ONCE, AT THE END. That was the shape until v0.97.0, and it made a nine-hour pass ONE
+ * analytics row per series: recorded whole or lost whole (Harper 5.2 aggregates two thirds of every
+ * 90s and drops the rest, so a single row lands in a dropped window about a third of the time), lost
+ * entirely when the pass threw or a restart cut it short (the emit sat after the walk), and — read over
+ * a window that truncated the pass — attributed to whichever window the pass happened to END in. Per
+ * batch, a pass's counts spread over its whole duration like every per-request series, so ratios
+ * against those stay unbiased, and a crashed pass has already reported everything up to its last batch.
+ * `total` is the meaningful number; `count` is emits, not passes.
+ */
+const PASS_SERIES = [
+	['probed', 'probed'],
+	['seeded', 'seeded'],
+	['rebaselined', 'rebaselined'],
+	['changed', 'changed'],
+	['triggered', 'triggered'],
+	['errors', 'errors'],
+	['failed', 'failed'],
+	['fresh', 'fresh'],
+	['throttled', 'throttled'],
+	['pageMismatch', 'page_mismatch'],
+	['caughtUp', 'caught_up'],
+	['covered', 'covered'],
+	['ignored', 'ignored'],
+	['behindBatches', 'cycle_behind'],
+];
+
+export const createPassEmitter = (kind, emit = (value, series) => metrics.changeProbe(value, series)) => {
+	const sent = {};
+	return (counts) => {
+		try {
+			for (const [key, series] of PASS_SERIES) {
+				const value = counts?.[key];
+				if (!Number.isFinite(value)) continue;
+				const delta = value - (sent[key] ?? 0);
+				if (delta <= 0) continue;
+				sent[key] = value;
+				emit(delta, series);
+			}
+		} catch (e) {
+			logger.warn(`[prerender] change-probe ${kind} metrics not recorded: ${e?.message ?? String(e)}`);
+		}
+	};
 };
 
 const logPass = (stats, kind, dryRun) => {
 	const line = { kind, dryRun, ...stats };
+	if (stats.rowErrors > 0) {
+		logger.warn(
+			`[prerender] change-probe ${kind}: ${stats.rowErrors} rows skipped on a ProbeState read or write that ` +
+				`threw (samples in the pass record); they are probed again next pass`
+		);
+	}
 	// A scope that keeps less than it skips is either a site whose corpus really is mostly unlisted (and
 	// then `scope: listed` is the wrong setting for it) or sitemaps that stopped listing what they used
 	// to. Neither should be discovered from the origin-request savings looking good.
@@ -1293,7 +1902,15 @@ const HEARTBEAT_MS = 30 * SECOND;
  */
 const claimPass = async (
 	kind,
-	{ startedBy = null, dryRun = null, label = null, reseed = false, originStartedAt = null } = {}
+	{
+		startedBy = null,
+		dryRun = null,
+		label = null,
+		reseed = false,
+		originStartedAt = null,
+		anchorAt = null,
+		cursor = null,
+	} = {}
 ) => {
 	const row = await readProbeState();
 	if (isPassRunning(row, kind, PASS_STALE_MS)) {
@@ -1320,7 +1937,10 @@ const claimPass = async (
 			startedAt,
 			heartbeatAt: startedAt,
 			lastRun: previous,
-			progress: null,
+			// A RESUME's cursor is seeded here, not left for the first heartbeat (30s on): a process that dies
+			// inside that window would otherwise leave a claim with no cursor, and the next boot's resume
+			// would start the walk over from the top.
+			progress: cursor ? { cursor } : null,
 			startedBy,
 			dryRun,
 			label,
@@ -1328,10 +1948,18 @@ const claimPass = async (
 			// the pass it belongs to (itself, or the one a resume is continuing) — see `checkResume`.
 			reseed,
 			originStartedAt: originStartedAt ?? startedAt,
+			// The anchor instant an anchored pass serves (it can start later: chained behind another pass,
+			// or caught up at boot) — kept so a resume serves the same one. Null for every other pass.
+			anchorAt,
+			// A request to stand down is addressed to the pass that holds the claim NOW, so a new claim
+			// starts with none (see `requestSweepInterrupt`).
+			interruptRequestedAt: null,
+			interruptRequestedBy: null,
+			interruptForAnchorAt: null,
 			sliceEstimate: kind === 'sweep' ? sliceEstimateFrom(previous) : null,
 		},
 	});
-	return { ok: true, startedAt };
+	return { ok: true, startedAt, previous };
 };
 
 /**
@@ -1348,18 +1976,23 @@ const sliceEstimateFrom = (previous) => {
 };
 
 /**
- * Wait out the actions in flight while keeping the pass's heartbeat alive. `onBeat` fires every third
- * of a heartbeat interval (the heartbeat itself throttles to one write per interval) until the
- * pipeline is idle, and never after — see the drain in `runProbeSweepOnce` for why the drain needs one.
+ * Keep a pass's heartbeat alive ON A TIMER for as long as the pass runs: `onTick` fires every third of
+ * a heartbeat interval (the heartbeat itself throttles to one write per interval) until the returned
+ * stop function is called, and never after.
+ *
+ * WHY A TIMER, NOT THE WALK. The heartbeat used to ride the walk's yields — one every 200 rows
+ * examined — and a pass can sit inside ONE await for longer than the claim's staleness window: an
+ * origin's `Retry-After` (honoured up to 5 minutes, which IS `PASS_STALE_MS`), a long wait for an
+ * action slot while the database is slow, a slow chunk read. The claim then read as dead while the pass
+ * was alive, and the console's "Run sweep" (or a resume check) started a second full-rate pass beside
+ * it — the origin taking `ratePerSecond` twice over, the one number agreed with whoever runs it. A timer
+ * beats through all of those. Unref'd, so it never holds a process open, and the caller stops it before
+ * releasing the claim: a beat after the release would publish `running: true` over a finished pass.
  */
-const drainWithHeartbeat = async (triggers, onBeat) => {
-	const timer = setInterval(onBeat, HEARTBEAT_MS / 3);
+const startHeartbeat = (onTick) => {
+	const timer = setInterval(() => void onTick(), HEARTBEAT_MS / 3);
 	timer.unref?.();
-	try {
-		await triggers.drain();
-	} finally {
-		clearInterval(timer);
-	}
+	return () => clearInterval(timer);
 };
 
 /**
@@ -1409,9 +2042,9 @@ const passProgress = (live, extra) => ({
  * `progress: null` is EXPLICIT because the merge is one level deep and omission means "leave
  * alone" — without it a finished pass would carry the last mid-pass progress reading forever.
  */
-const releasePass = async (kind, startedAt, lastRun) => {
+const releasePass = async (kind, startedAt, lastRun, extra = {}) => {
 	await publishProbeState({
-		[kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun, progress: null },
+		[kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun, progress: null, ...extra },
 	});
 };
 
@@ -1532,6 +2165,7 @@ export const runProbeSweepOnce = async ({
 	reseed = false,
 	startedBy = null,
 	resume = null,
+	anchorAt = null,
 } = {}) => {
 	// Worker-local guard, and it is SET SYNCHRONOUSLY on purpose. The node-wide claim below is an
 	// await, so setting the flag after it would leave a window in which two concurrent calls on
@@ -1553,6 +2187,8 @@ export const runProbeSweepOnce = async ({
 		label,
 		reseed,
 		originStartedAt: resume?.originStartedAt ?? null,
+		anchorAt,
+		cursor: resume?.cursor ?? null,
 	});
 	if (!claim.ok) {
 		// Release the local flag we optimistically took — the `finally` below is not reached from
@@ -1561,23 +2197,64 @@ export const runProbeSweepOnce = async ({
 		return { skipped: true, reason: claim.reason, lastRun: claim.lastRun ?? lastSweep };
 	}
 	const startedAt = claim.startedAt;
+	// The start of the pass this one belongs to: itself, or the one a resume continues.
+	const passOrigin = resume?.originStartedAt ?? startedAt;
 	const beat = makeHeartbeat('sweep', startedAt);
+	// The pass's live counters and its action pipeline, held OUTSIDE the try so the error path can still
+	// emit what the pass did before it threw (see `createPassEmitter`).
+	let live = null;
+	let triggers = null;
+	let phase = 'walking';
+	let stopHeartbeat = () => {};
+	// Stands down when an anchored pass asks it to (see `requestSweepInterrupt`) if its work is a subset of
+	// what that pass will do: a dry run acts on nothing; a reseed probes every matched URL and acts on what
+	// changed, as the anchored pass does; and a pass serving an OLDER anchor (a catch-up, or a pass that
+	// outran its day) has nothing left to do that the newer one will not. Any other pass is never
+	// interrupted; the anchor waits for it.
+	let interruptedBy = null;
+	const checkInterrupt = async () => {
+		if (interruptedBy !== null) return;
+		const pass = (await readProbeState())?.sweep;
+		const at = epochMsOf(pass?.interruptRequestedAt);
+		if (!(Number.isFinite(at) && at >= startedAt)) return;
+		const forAnchor = epochMsOf(pass.interruptForAnchorAt);
+		const subsumed =
+			limits.dryRun === true ||
+			reseed === true ||
+			(anchorAt !== null && Number.isFinite(forAnchor) && forAnchor > anchorAt);
+		if (subsumed) interruptedBy = pass.interruptRequestedBy ?? 'request';
+	};
+	const emit = createPassEmitter('sweep');
+	const detectionLag = detectionLagEmitter({
+		passStart: anchorAt ?? resume?.originStartedAt ?? startedAt,
+		previousStart: epochMsOf(claim.previous?.resumedFrom ?? claim.previous?.startedAt),
+	});
+	const counts = () => ({
+		...live,
+		triggered: triggers?.stats.triggered ?? 0,
+		errors: (triggers?.stats.errors ?? 0) + (live?.rowErrors ?? 0),
+	});
 	try {
 		const rules = probeRules();
 		const count = Math.max(1, config.changeProbe.canary.count | 0);
 		const collectors = new Map(rules.map((rule) => [rule.label, cohortCollector(count)]));
 		let unreadable = 0;
-		let yields = 0;
 		// Changes are acted on BESIDE the walk, not inside it: `submit` returns once the action has
 		// started, so the pass runs at its probe-rate floor whatever the change rate, and only waits
 		// when every action slot is busy — see util/changeActions.js. The demand union is loaded first,
 		// so the first changes of the pass are not stamped as unknown for want of it.
 		await warmDemand();
-		const triggers = createChangeActions({
+		// EVERY sweep acts on a change only where an active invalidation does not already cover its pages
+		// (`coverageOf`) — the reseed a trip chains, and just as much the anchored pass that interrupts that
+		// reseed, or any pass that runs while the scope is invalidated. The canary is the exception (it
+		// acts on its cohort and baselines it, or it would re-detect, and re-trip on, the same change).
+		const epochFor = epochResolver();
+		triggers = createChangeActions({
 			act: actOnChange,
 			write: writeSignature,
 			concurrency: config.changeProbe.trigger.concurrency,
-			onError: (e, item) => logger.error(e, `[prerender] change-probe action failed for ${item.row.url}`),
+			onError: logActionError,
+			stillDue: detectionStillCurrent,
 		});
 		// The heartbeat's payload, built only when a beat is due (see makeHeartbeat). `recentRate` is
 		// probes per second since the PREVIOUS beat — the rate the pass is running at now, which an
@@ -1590,7 +2267,7 @@ export const runProbeSweepOnce = async ({
 			const recentRate = seconds > 0 ? Math.round(((probed - lastBeat.probed) / seconds) * 100) / 100 : null;
 			lastBeat = { at: now, probed };
 			return {
-				examinedApprox: yields * YIELD_EVERY,
+				examinedApprox: Number.isFinite(live?.examined) ? live.examined : 0,
 				...passProgress(live, {
 					phase,
 					recentRate,
@@ -1604,6 +2281,13 @@ export const runProbeSweepOnce = async ({
 				}),
 			};
 		};
+		// The liveness signal for the node-wide claim, for the WHOLE pass — walk, drain and retries (see
+		// `startHeartbeat`). Its failure is swallowed by `publishProbeState`: a pass must never die of
+		// bookkeeping.
+		stopHeartbeat = startHeartbeat(async () => {
+			await beat(progressOf(live, phase));
+			await checkInterrupt();
+		});
 		const stats = await runProbePass({
 			rows: walkTargets(
 				config.changeProbe.chunkSize,
@@ -1624,34 +2308,43 @@ export const runProbeSweepOnce = async ({
 			isArmed: verificationArmedFor,
 			guard: theMappingGuard(),
 			...limits,
-			// The liveness signal for the node-wide claim, throttled inside `makeHeartbeat` — this
-			// fires every YIELD_EVERY rows, the heartbeat writes at most every HEARTBEAT_MS. Its
-			// failure is swallowed by `publishProbeState`: a pass must never die of bookkeeping.
-			onYield: async (live) => {
-				await yieldNow();
-				// A LOCAL counter, not `stats` — `const stats = await runProbePass({...})` leaves
-				// `stats` in the temporal dead zone while this callback runs, so touching it here
-				// throws a ReferenceError rather than reading undefined. The pass hands its live
-				// counters over as `live` instead.
-				yields++;
-				await beat(progressOf(live, 'walking'));
-			},
-			// A reseed re-baselines everything, so it must not skip fresh-looking rows.
-			reprobeAfter: reseed ? 0 : config.changeProbe.reprobeAfter,
-			// A pending reseed cancels too: the pass that must stand down for it is this one.
-			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null,
+			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a
+			// reseed: a row it re-baselined before a restart cut it short is re-baselined already.
+			skipProbedSince: resume?.originStartedAt ?? startedAt,
+			// A pending reseed cancels too: the pass that must stand down for it is this one. So does an
+			// anchored pass's request, when this is a dry run or a reseed.
+			isCanceled: () => !config.changeProbe.enabled || sweepInterrupt !== null || interruptedBy !== null,
 			collectCohort: (rule, url) => collectors.get(rule.label).add(url),
 			inScope: probeScopeFilter(config.changeProbe),
+			onStart: (running) => (live = running),
+			onBatch: () => emit(counts()),
+			onChange: detectionLag,
+			coverageOf: (url, evidence) => coverageOf(url, evidence, epochFor),
+			onPace: (rate, originThrottle, loadThrottle) =>
+				publishSweepHeadroom(
+					Math.max(0, config.changeProbe.ratePerSecond - rate) / Math.max(1, originThrottle * loadThrottle)
+				),
 		});
 		// A cancelled pass starts nothing more; what is in flight finishes. Either way wait for the
 		// actions in flight — the pass is not finished while pages it decided to expire are unexpired,
 		// and `triggered` would under-report. There are at most `trigger.concurrency` of them.
 		if (stats.aborted) triggers.stop();
-		// The drain keeps the heartbeat (the walk's rides its yields, and there are none while it
-		// waits), so a slow database never makes a live pass read as dead.
-		await drainWithHeartbeat(triggers, () => void beat(progressOf(stats, 'draining')));
+		phase = 'draining';
+		await triggers.drain();
+		// The actions that failed, once more (util/changeActions.js) — the cursor has moved past them, so
+		// otherwise each is a known-wrong page until the next pass. Not when the probe was switched off.
+		if (config.changeProbe.enabled) {
+			phase = 'retrying';
+			await triggers.retryFailed();
+		}
 		stats.triggered = triggers.stats.triggered;
+		stats.retryStale = triggers.stats.retryStale;
 		stats.errors = triggers.stats.errors;
+		stats.retried = triggers.stats.retried;
+		stats.recovered = triggers.stats.recovered;
+		stats.retrySkipped = triggers.stats.retrySkipped;
+		// Changes this pass detected and did not act on: the next probe of each URL finds it again.
+		stats.unacted = triggers.stats.errors - triggers.stats.recovered;
 		stats.maxActionsInFlight = triggers.stats.maxInFlight;
 		stats.actionWaitMs = triggers.stats.waitMs;
 		stats.unreadable = unreadable;
@@ -1673,7 +2366,7 @@ export const runProbeSweepOnce = async ({
 		// same row, and letting the two interleave could write back the scheduler branch it read
 		// before this landed.
 		if (!partialWalk) await publishScheduler();
-		emitStats(stats, 'sweep');
+		emit(counts());
 		logPass(stats, 'sweep', limits.dryRun);
 		lastSweep = {
 			...stats,
@@ -1681,15 +2374,29 @@ export const runProbeSweepOnce = async ({
 			startedBy: passStartedBy,
 			resumedFrom: resume?.originStartedAt ?? null,
 			resumeCursor: resume?.cursor ?? null,
+			anchorAt,
+			interruptedBy,
 			label,
 			node: server.hostname,
 			startedAt,
 			finishedAt: Date.now(),
 			error: null,
 		};
-		await releasePass('sweep', startedAt, lastSweep);
+		stopHeartbeat();
+		// WHAT THIS PASS SERVED, in fields no other kind of pass overwrites: the origin of the last pass
+		// that ran to completion, armed and dry apart. `lastRun` is the last pass that ENDED, whatever it
+		// was — a console dry run after the anchored pass replaced it, and the boot check then read the
+		// night as unserved and ran a whole catch-up pass (review, round 2). See `anchorServedSince`.
+		const served = stats.aborted
+			? {}
+			: limits.dryRun
+				? { completedDryOrigin: passOrigin }
+				: { completedArmedOrigin: passOrigin };
+		await releasePass('sweep', startedAt, lastSweep, served);
 		return lastSweep;
 	} catch (e) {
+		// What the pass did before it threw is real work the origin saw; report it.
+		if (live) emit(counts());
 		lastSweep = {
 			node: server.hostname,
 			startedAt,
@@ -1697,51 +2404,68 @@ export const runProbeSweepOnce = async ({
 			startedBy: passStartedBy,
 			dryRun: limits.dryRun,
 			error: e?.message ?? String(e),
+			// Enough to RESUME it: an anchored pass that throws is picked up from here (`runAnchoredPass`),
+			// and a thrown pass never counts as having served its anchor (`anchorServedSince`).
+			resumedFrom: resume?.originStartedAt ?? null,
+			anchorAt,
+			reseed,
+			cursor: live
+				? resumeKeyOf(live.walkedThrough ?? null, triggers?.lowestInFlight ?? null)
+				: (resume?.cursor ?? null),
 		};
 		// A THROWN pass must release too, and must publish the error: leaving the claim held would
 		// wedge the probe until the heartbeat went stale, and dropping the error would make a
 		// crashed pass indistinguishable from one that never ran.
+		stopHeartbeat();
 		await releasePass('sweep', startedAt, lastSweep);
 		throw e;
 	} finally {
+		stopHeartbeat();
 		sweepRunning = false;
+		try {
+			publishSweepHeadroom(null);
+		} catch {
+			// A coordination buffer that cannot be reached: the re-probes' pace ages the last value out.
+		}
 		// The trip's reseed, chained after this pass stood down for it. Cleared BEFORE the chained
 		// pass starts so the reseed does not cancel itself.
 		const chained = sweepInterrupt;
 		sweepInterrupt = null;
 		if (chained) {
-			runProbeSweepOnce({ dryRun: true, label: chained, reseed: true, startedBy: 'reseed' }).catch((e) =>
-				logger.error(e)
-			);
+			void runSweepResilient({ dryRun: chained.dryRun, label: chained.label, reseed: true, startedBy: 'reseed' });
 		}
 	}
 };
 
-// The label of a reseed waiting for the running sweep to stand down, or null. See
+// The reseed waiting for the running sweep to stand down (`{ label, dryRun }`), or null. See
 // `requestSweepReseed` — a plain "skip if running" here was the wrong shape, because a canary
 // trip lands DURING a sweep in exactly the scenario the canary exists for.
 let sweepInterrupt = null;
 
 /**
- * Run a signature RESEED sweep (dry-run semantics: probe + re-baseline, act on nothing) as soon as
- * possible: immediately when no sweep is running, otherwise by interrupting the running pass — which
- * notices via its cancellation check within a batch — and chaining the reseed when it exits.
+ * Run a signature RESEED sweep as soon as possible: immediately when no sweep is running, otherwise by
+ * interrupting the running pass — which notices via its cancellation check within a batch — and
+ * chaining the reseed when it exits. A reseed probes EVERY matched URL (a mass change has just been
+ * absorbed, so every baseline is known-stale) and re-baselines what changed.
  *
- * A DRY RUN ON PURPOSE, even though every other detected change is acted on. The trip has already
- * invalidated the whole scope, so the pages are already not served; what is left is re-rendering,
- * and the invalidation accelerator does that for exactly the pages bots ask for. A per-URL action
- * here would add nothing but harm: it would hard-expire pages individually (so clearing a FALSE
- * trip's invalidation would no longer restore serving), re-expire pages that had already re-rendered
- * correctly since the trip (the baseline predates the change, and a render never updates it), and
- * put the whole scope ahead of the accelerator's demand-driven heals.
+ * ARMED, EXCEPT WHERE THE INVALIDATION ALREADY COVERS THE PAGE (v0.97.0; it was a dry run before). The
+ * trip invalidated the scope, but the epoch only refuses pages rendered BEFORE it — so a page
+ * re-rendered after the trip that then changed, and a page-claim mismatch on one, were baselined by the
+ * dry-run reseed and never expired: known-wrong pages served for the rest of the night, and the
+ * baseline no longer disagreed, so the next pass did not act either. The reseed now acts on a change as
+ * any pass does — expire, file the render — unless every page of the URL predates the epoch and no
+ * verification exempts it (`isCoveredByInvalidation`). Those it baselines without acting, which keeps
+ * what the dry run was for: clearing a FALSE trip's invalidation still restores serving for exactly
+ * those pages, and a per-URL expiry does not pile the whole scope ahead of the accelerator's
+ * demand-driven heals. `dryRun` is the tripping canary's: a trip only acts on an armed canary pass.
  */
-export const requestSweepReseed = (label) => {
+export const requestSweepReseed = (label, { dryRun = false } = {}) => {
 	if (sweepRunning) {
-		sweepInterrupt = label;
+		sweepInterrupt = { label, dryRun };
 		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
 		return { chained: true };
 	}
-	runProbeSweepOnce({ dryRun: true, label, reseed: true, startedBy: 'reseed' }).catch((e) => logger.error(e));
+	void runSweepResilient({ dryRun, label, reseed: true, startedBy: 'reseed' });
 	return { chained: false };
 };
 
@@ -1797,7 +2521,7 @@ export const canaryVerdict = (stats, { threshold, minSample }) => {
  * sound — and say exactly why not otherwise, because a mass price change the operator configured
  * a response for is the one event this feature exists to catch.
  */
-const actOnTrip = async (rule, fraction) => {
+const actOnTrip = async (rule, fraction, { dryRun = false } = {}) => {
 	const scope = rule.invalidateScope;
 	if (!scope) {
 		logger.warn(
@@ -1840,8 +2564,9 @@ const actOnTrip = async (rule, fraction) => {
 			`origin for that scope until pages re-render; a reseed sweep is re-baselining signatures now`
 	);
 	// A mass change makes the whole stored diff stale, so re-baseline NOW rather than waiting out the
-	// next pass — as a RESEED, a dry run (see `requestSweepReseed` for why it acts on nothing).
-	const { chained } = requestSweepReseed(`reseed after invalidating ${scope}`);
+	// next pass — as a RESEED, which acts only where the invalidation does not cover (see
+	// `requestSweepReseed`).
+	const { chained } = requestSweepReseed(`reseed after invalidating ${scope}`, { dryRun });
 	return { acted: true, scope, reseedChained: chained };
 };
 
@@ -1883,7 +2608,15 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				act: actOnChange,
 				write: writeSignature,
 				concurrency: config.changeProbe.trigger.concurrency,
-				onError: (e, item) => logger.error(e, `[prerender] change-probe action failed for ${item.row.url}`),
+				onError: logActionError,
+				stillDue: detectionStillCurrent,
+			});
+			const emit = createPassEmitter('canary');
+			let canaryLive = null;
+			const canaryCounts = () => ({
+				...canaryLive,
+				triggered: canaryTriggers.stats.triggered,
+				errors: canaryTriggers.stats.errors + (canaryLive?.rowErrors ?? 0),
 			});
 			const stats = await runProbePass({
 				rows: readCohortRows(urls),
@@ -1903,24 +2636,32 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				// disagreements alike.
 				guard: theMappingGuard(),
 				...limits,
-				// NEVER skips on baseline age. The cohort is small and deliberately probed on a
-				// cadence far tighter than `reprobeAfter` — freshness-skipping here would silence
-				// the mass-change detector between sweeps, which is the one thing it exists for.
-				reprobeAfter: 0,
+				// NEVER skips. The cohort is small and re-probed on a deliberately fast cadence, and a
+				// skip here would silence the mass-change detector between sweeps — the one thing it
+				// exists for.
+				skipProbedSince: null,
 				isCanceled: () => !config.changeProbe.enabled,
 				// Re-checked per pass, not only when the cohort was built: a member whose grace ran out
 				// since then is skipped (and counted) exactly as the sweep would skip it.
 				inScope: probeScopeFilter(config.changeProbe),
+				onStart: (running) => (canaryLive = running),
+				onBatch: () => emit(canaryCounts()),
 			});
 			await canaryTriggers.drain();
+			if (config.changeProbe.enabled) await canaryTriggers.retryFailed();
 			stats.triggered = canaryTriggers.stats.triggered;
 			stats.errors = canaryTriggers.stats.errors;
-			emitStats(stats, 'canary');
+			stats.retried = canaryTriggers.stats.retried;
+			stats.recovered = canaryTriggers.stats.recovered;
+			stats.unacted = canaryTriggers.stats.errors - canaryTriggers.stats.recovered;
+			emit(canaryCounts());
 			const verdict = canaryVerdict(stats, { threshold: canary.threshold, minSample: canary.minSample });
 			let action = null;
 			if (verdict.tripped) {
 				countProbe('canary_trip');
-				action = limits.dryRun ? { acted: false, reason: 'dry-run' } : await actOnTrip(rule, verdict.fraction);
+				action = limits.dryRun
+					? { acted: false, reason: 'dry-run' }
+					: await actOnTrip(rule, verdict.fraction, { dryRun: limits.dryRun });
 				if (limits.dryRun) {
 					logger.warn(
 						`[prerender] change-probe canary WOULD TRIP for ${rule.label} ` +
@@ -2079,7 +2820,6 @@ const probeSettings = () => {
 		ratePerSecond: c.ratePerSecond,
 		concurrency: c.concurrency,
 		scope: c.scope,
-		reprobeAfter: c.reprobeAfter,
 		abortAfterDistress: c.abortAfterDistress,
 		backoffMax: c.backoffMax,
 		trigger: {
@@ -2087,6 +2827,7 @@ const probeSettings = () => {
 		},
 		canary: {
 			interval: c.canary.interval,
+			schedule: canarySchedule().map(scheduleWindowStatus),
 			count: c.canary.count,
 			threshold: c.canary.threshold,
 			minSample: c.canary.minSample,
@@ -2181,10 +2922,15 @@ export const changeProbeStatus = async () => {
 			current: currentPass(row, 'canary'),
 			lastRun: canary?.lastRun ?? null,
 			armedInterval: scheduler?.armedCanary ?? null,
-			nextRunAt:
-				config.changeProbe.enabled && canaryArmedAt !== null && canaryEvery > 0
-					? nextTick(canaryArmedAt, canaryEvery, now)
-					: null,
+			// The time-of-day schedule, when one is set (`canary.schedule`); null = the fixed interval.
+			schedule: scheduler?.armedCanarySchedule ? canarySchedule().map(scheduleWindowStatus) : null,
+			nextRunAt: !config.changeProbe.enabled
+				? null
+				: scheduler?.armedCanarySchedule
+					? msOrNull(scheduler.nextCanaryAt)
+					: canaryArmedAt !== null && canaryEvery > 0
+						? nextTick(canaryArmedAt, canaryEvery, now)
+						: null,
 			cohortSizes: scheduler?.cohortSizes ?? {},
 		},
 	};
@@ -2199,6 +2945,10 @@ let sweepTimer = null;
 let canaryTimer = null;
 let armedSweep = null;
 let armedCanary = null;
+// The armed canary SCHEDULE's identity (windows + timezone), or null when the fixed interval runs.
+let armedCanarySchedule = null;
+// When a scheduled canary fires next — published, because a chain of timeouts has no `armedAt + k*every`.
+let nextCanaryAt = null;
 // When each driver was armed, so ANY worker can say when it fires next: the timers themselves live
 // on worker 0, and a timer cannot be asked for its next tick.
 let bootAt = null;
@@ -2232,6 +2982,8 @@ const publishScheduler = () => {
 			scheduler: {
 				armedSweep,
 				armedCanary,
+				armedCanarySchedule,
+				nextCanaryAt,
 				nextAnchorAt,
 				bootAt,
 				intervalArmedAt,
@@ -2254,7 +3006,8 @@ const clearProbeTimers = () => {
 	if (anchorTimer) clearTimeout(anchorTimer);
 	if (resumeTimer) clearTimeout(resumeTimer);
 	bootTimer = sweepTimer = canaryTimer = anchorTimer = resumeTimer = null;
-	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = null;
+	nextAnchorAt = bootAt = intervalArmedAt = canaryArmedAt = nextCanaryAt = null;
+	timerGeneration++;
 	stopContinuousLoop();
 };
 
@@ -2288,8 +3041,9 @@ let nextAnchorAt = null;
  * where the walk had got to, held back to any action still in flight — `resumeKeyOf`), with the
  * interrupted pass's own dry-run and reseed semantics, recording the pass it continues. One that
  * still beats may be a manual run on another worker, or simply not aged out yet since the restart, so
- * it is looked at again once it would have. A pass (or a chain of resumes) that started more than a
- * day ago is not resumed: the anchor has already started a new one.
+ * it is looked at again once it would have. A pass (or a chain of resumes) that started before the most
+ * recent anchor, or more than a day ago, is not resumed: that anchor's pass is due instead, and the same
+ * check catches it up (see `checkResume`).
  */
 const RESUME_WITHIN_MS = DAY;
 let resumeTimer = null;
@@ -2310,6 +3064,49 @@ const armResumeCheck = (delay = null) => {
 	resumeTimer.unref?.();
 };
 
+/**
+ * Has a pass that SERVES the anchor started on this node at or after `since` and run to completion? What
+ * serves it is a pass matching the configured mode: an armed pass when the probe is armed; a dry run too
+ * when the probe is configured dry (commissioning) — otherwise every restart of a dry-run deployment ran
+ * a whole catch-up pass. A pass that threw or was cut short did not serve it (a restart at least runs it
+ * again). A pass's start is its ORIGIN, because a resume walks only the tail of a pass whose head may
+ * predate `since`.
+ *
+ * The evidence is `completedArmedOrigin` / `completedDryOrigin`, which only a completed pass of that
+ * kind writes (`runProbeSweepOnce`): a console dry run after the anchored pass no longer hides it. A row
+ * from before those fields existed falls back to the last pass that ended — so on the FIRST boot after the
+ * upgrade, a node whose last pre-upgrade pass was a console dry run catches the night up once even though
+ * its anchored pass ran (review, round 3: accepted; the fields exist from then on).
+ */
+const anchorServedSince = (sweep, since) => {
+	const armed = epochMsOf(sweep?.completedArmedOrigin);
+	const dry = epochMsOf(sweep?.completedDryOrigin);
+	const dryServes = config.changeProbe.dryRun === true;
+	if (Number.isFinite(armed) || Number.isFinite(dry)) return armed >= since || (dryServes && dry >= since);
+	const last = sweep?.lastRun;
+	if (!last || last.error || last.aborted) return false;
+	if (last.dryRun === true && !dryServes) return false;
+	return epochMsOf(last.resumedFrom ?? last.startedAt) >= since;
+};
+
+/**
+ * The boot-time decision for anchored mode: resume the pass a restart cut short, or CATCH UP the pass a
+ * restart made this node miss, or neither.
+ *
+ * CATCHING UP. The anchor timer only ever looks forward (`nextAnchorOccurrence`), so a process that was
+ * down when its anchor came — a deploy at 00:03 for a 00:05 anchor, a crash overnight — used to skip
+ * that night's pass entirely, and nothing said so: the next pass was the following night, and every
+ * page the reprice moved served its old price for a day. Now, if no pass that serves the anchor has
+ * completed since the most recent one (`anchorServedSince`), that anchor's pass is started
+ * (`probe_anchor` outcome `caught_up`). It serves an older anchor than the next one, so it stands down
+ * if it is still running when the next anchor fires.
+ *
+ * WHICH WINS. A stale claim that belongs to the current anchor period (its origin is at or after the
+ * most recent anchor) is today's pass: it is resumed from its cursor. A dry run or a reseed is not
+ * resumed when a catch-up is due — the anchored pass would interrupt it the moment it started. One
+ * whose origin predates the most recent anchor is yesterday's pass: finishing its tail would leave the
+ * head unprobed since before the anchor, so the catch-up runs a whole pass instead.
+ */
 const checkResume = async () => {
 	const decided = (result) => {
 		resumePending = false;
@@ -2319,32 +3116,55 @@ const checkResume = async () => {
 		return decided({ resumed: false, reason: 'not armed' });
 	const row = await readProbeState();
 	const sweep = row?.sweep;
+	const lastAnchor = previousAnchorOccurrence();
+	const catchUpDue = Number.isFinite(lastAnchor) && !anchorServedSince(sweep, lastAnchor);
 	const startedAt = epochMsOf(sweep?.startedAt);
-	if (!sweep?.running || !Number.isFinite(startedAt)) return decided({ resumed: false, reason: 'nothing interrupted' });
-	if (isPassRunning(row, 'sweep', PASS_STALE_MS)) {
-		armResumeCheck(PASS_STALE_MS);
-		return { resumed: false, reason: 'claim still live' };
+	let reason = 'nothing interrupted';
+	if (sweep?.running && Number.isFinite(startedAt)) {
+		if (isPassRunning(row, 'sweep', PASS_STALE_MS)) {
+			armResumeCheck(PASS_STALE_MS);
+			return { resumed: false, reason: 'claim still live' };
+		}
+		// An unusable origin falls back to this claim's own start (validated above): `NaN` would pass the age
+		// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
+		const recordedOrigin = epochMsOf(sweep.originStartedAt);
+		const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
+		const interruptible =
+			sweep.dryRun === true ||
+			sweep.reseed === true ||
+			sweep.startedBy === 'reseed' ||
+			(Number.isFinite(epochMsOf(sweep.anchorAt)) && epochMsOf(sweep.anchorAt) < lastAnchor);
+		if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS)) reason = 'older than a day';
+		else if (Number.isFinite(lastAnchor) && originStartedAt < lastAnchor) reason = 'predates the last anchor';
+		else if (catchUpDue && interruptible) reason = 'a dry run or reseed, and the anchored pass is due';
+		else {
+			const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
+			logger.warn(
+				`[prerender] change-probe: resuming the sweep a restart interrupted (started ${new Date(originStartedAt).toISOString()}) ` +
+					`from ${cursor ? JSON.stringify(cursor) : 'the start (no cursor was published)'}`
+			);
+			const anchorAt = epochMsOf(sweep.anchorAt);
+			void runSweepResilient({
+				startedBy: 'resume',
+				resume: { cursor, originStartedAt },
+				reseed: sweep.reseed === true || sweep.startedBy === 'reseed',
+				// The interrupted pass's own mode — a manual dry run must not resume armed, nor the reverse.
+				dryRun: typeof sweep.dryRun === 'boolean' ? sweep.dryRun : undefined,
+				label: sweep.label ?? null,
+				anchorAt: Number.isFinite(anchorAt) ? anchorAt : null,
+			});
+			return decided({ resumed: true, from: originStartedAt, cursor });
+		}
 	}
-	// An unusable origin falls back to this claim's own start (validated above): `NaN` would pass the age
-	// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
-	const recordedOrigin = epochMsOf(sweep.originStartedAt);
-	const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
-	if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS))
-		return decided({ resumed: false, reason: 'older than a day' });
-	const cursor = typeof sweep.progress?.cursor === 'string' ? sweep.progress.cursor : '';
-	logger.warn(
-		`[prerender] change-probe: resuming the sweep a restart interrupted (started ${new Date(originStartedAt).toISOString()}) ` +
-			`from ${cursor ? JSON.stringify(cursor) : 'the start (no cursor was published)'}`
-	);
-	runProbeSweepOnce({
-		startedBy: 'resume',
-		resume: { cursor, originStartedAt },
-		reseed: sweep.reseed === true || sweep.startedBy === 'reseed',
-		// The interrupted pass's own mode — a manual dry run must not resume armed, nor the reverse.
-		dryRun: typeof sweep.dryRun === 'boolean' ? sweep.dryRun : undefined,
-		label: sweep.label ?? null,
-	}).catch((e) => logger.error(e));
-	return decided({ resumed: true, from: originStartedAt, cursor });
+	if (catchUpDue) {
+		logger.warn(
+			`[prerender] change-probe: no pass has run since the ${new Date(lastAnchor).toISOString()} anchor (the ` +
+				`process was down when it came) — running that anchor's pass now`
+		);
+		void runAnchoredPass(lastAnchor, { outcome: 'caught_up' });
+		return decided({ resumed: false, reason, caughtUp: true, anchorAt: lastAnchor });
+	}
+	return decided({ resumed: false, reason });
 };
 
 /**
@@ -2371,6 +3191,234 @@ const nextAnchorOccurrence = () => {
 	if (!Number.isFinite(at)) return NaN;
 	return at <= Date.now() ? at + DAY : at;
 };
+
+/** Minutes past local midnight of `ms` in `timezone` (DST-correct: Intl resolves the offset at `ms`). */
+const localFormatters = new Map();
+export const localMinutesOf = (ms, timezone) => {
+	let format = localFormatters.get(timezone);
+	if (!format) {
+		format = new Intl.DateTimeFormat('en-US', {
+			timeZone: timezone,
+			hour: '2-digit',
+			minute: '2-digit',
+			hourCycle: 'h23',
+		});
+		localFormatters.set(timezone, format);
+	}
+	let hours = 0;
+	let minutes = 0;
+	for (const part of format.formatToParts(new Date(ms))) {
+		if (part.type === 'hour') hours = Number(part.value);
+		else if (part.type === 'minute') minutes = Number(part.value);
+	}
+	return hours * 60 + minutes;
+};
+
+/** "HH:MM" as minutes past midnight, the way `getNextTimeOfDay` reads it (unparseable parts are 0). */
+export const minutesOfTimeOfDay = (timeStr) => {
+	const [h, m] = String(timeStr).split(':');
+	const hours = Number.parseInt(h, 10);
+	const minutes = Number.parseInt(m ?? '0', 10);
+	return (Number.isFinite(hours) ? hours : 0) * 60 + (Number.isFinite(minutes) ? minutes : 0);
+};
+
+/**
+ * The most recent occurrence of the anchor at or before now, or NaN when it cannot be computed.
+ *
+ * The day before the next one, CORRECTED FOR A DST SHIFT between them: `next - 24h` lands an hour off
+ * the anchor's wall-clock time when a transition falls in between, so the difference between the
+ * anchor's minutes and the candidate's local minutes (as Intl resolves them at that instant) is
+ * applied. An anchor that does not exist that day (inside the spring-forward hour) resolves within
+ * the hour, which is all a "did a pass start since" test needs.
+ */
+const previousAnchorOccurrence = () => {
+	const next = nextAnchorOccurrence();
+	if (!Number.isFinite(next)) return NaN;
+	let at = next - DAY;
+	try {
+		let delta =
+			minutesOfTimeOfDay(config.changeProbe.anchorTime) - localMinutesOf(at, config.changeProbe.anchorTimezone);
+		if (delta > 720) delta -= 1440;
+		if (delta < -720) delta += 1440;
+		at += delta * MINUTE;
+	} catch {
+		return NaN;
+	}
+	return at <= Date.now() ? at : at - DAY;
+};
+
+/**
+ * Ask whatever sweep holds this node's claim to stand down — honoured only by a dry run or a reseed
+ * (the passes an anchored pass subsumes), within one heartbeat tick, on whichever worker it runs.
+ * Addressed through the claim row because the pass may be on another worker (a console-started dry
+ * run), where no module state reaches it; a new claim clears it (`claimPass`).
+ */
+export const requestSweepInterrupt = (by, forAnchorAt = null) =>
+	publishProbeState({
+		sweep: { interruptRequestedAt: Date.now(), interruptRequestedBy: by, interruptForAnchorAt: forAnchorAt },
+	});
+
+// How often an anchored pass that is waiting for another sweep tries again.
+const ANCHOR_RETRY_MS = 15 * SECOND;
+// Bumped by every re-arm, so an anchor that fired knows whether re-arming after its pass is still its job.
+let timerGeneration = 0;
+
+/**
+ * Run the anchored pass for the anchor at `anchorAt` — now if the sweep is free, otherwise as soon as it
+ * is. Resolves when the pass has run, or when the wait was abandoned. Never rejects.
+ *
+ * AN ANCHOR IS NEVER SILENTLY LOST. It used to await `runProbeSweepOnce`, which returns `{ skipped }`
+ * whenever any sweep is running on the node — a reseed after a canary trip, a manual pass from the
+ * console, a resume — and the timer re-armed for TOMORROW with no log line and no metric: the pass the
+ * whole mode exists for simply did not happen that night. Now:
+ *
+ *   - a dry run or a reseed is asked to stand down (`requestSweepInterrupt`), and the anchored pass
+ *     takes the sweep as soon as it has — outcome `interrupted`. A dry run acts on nothing, and a
+ *     reseed's work (every matched URL probed, what changed acted on) is what the anchored pass does.
+ *   - any other pass (it ACTS, and is not the anchored pass's to cut short) is left to finish, and the
+ *     anchored pass runs after it — outcome `chained`.
+ *   - an anchor that comes round while this wait is still going (the other pass outran a whole day) is
+ *     served by the same pass, and the one it replaces is counted `skipped`.
+ *   - a re-arm (a mode or anchor edit, a disable) abandons the wait — counted `skipped` too.
+ *
+ * Every anchor is one `probe_anchor` emit, detail = outcome; `on_time` is the plain case and
+ * `caught_up` the boot catch-up (`checkResume`).
+ */
+const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
+	// The schedule this pass belongs to. A re-arm that keeps it (a canary edit, say) leaves the wait
+	// alone; one that changes the anchor, the mode, or disables the probe abandons it.
+	const key = anchorKey();
+	let served = anchorAt;
+	let result = outcome;
+	let asked = false;
+	let waitedFor = null;
+	// A pass that THREW is picked up from its cursor, a bounded number of times (`ANCHOR_RESUMES`): one
+	// storage fault on a reprice night must not cost the rest of the night.
+	let resume = null;
+	let resumes = 0;
+	for (;;) {
+		if (!schedulerStarted || !config.changeProbe.enabled || !isAnchored() || armedSweep !== key) {
+			countProbe('anchor', 'skipped');
+			logger.warn(
+				`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} was abandoned — the ` +
+					`schedule changed while it waited`
+			);
+			return null;
+		}
+		let pass;
+		try {
+			// Attempt only when the claim looks free: every attempt briefly holds this worker's re-entrancy
+			// flag, and a reseed requested inside that instant would be parked for a pass that never starts.
+			pass =
+				sweepRunning || (await isPassRunningOnNode('sweep'))
+					? { skipped: true }
+					: await runProbeSweepOnce(
+							resume ? { startedBy: 'resume', resume, anchorAt: served } : { startedBy: 'anchor', anchorAt: served }
+						);
+		} catch (e) {
+			logger.error(e);
+			const failed = (await readProbeState())?.sweep?.lastRun;
+			if (resumes < ANCHOR_RESUMES && failed?.error) {
+				resumes++;
+				resume = {
+					cursor: typeof failed.cursor === 'string' ? failed.cursor : '',
+					originStartedAt: epochMsOf(failed.resumedFrom ?? failed.startedAt),
+				};
+				logger.warn(
+					`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} threw (${e?.message ?? e}) — ` +
+						`resuming it from ${resume.cursor ? JSON.stringify(resume.cursor) : 'the start'} in ` +
+						`${ANCHOR_RESUME_DELAY_MS / 1000}s (attempt ${resumes} of ${ANCHOR_RESUMES})`
+				);
+				await waitUnref(ANCHOR_RESUME_DELAY_MS);
+				continue;
+			}
+			countProbe('anchor', result);
+			return null;
+		}
+		if (!pass?.skipped) {
+			countProbe('anchor', result);
+			if (result !== 'on_time') {
+				logger.warn(
+					`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} ran ` +
+						(result === 'caught_up' ? 'as a catch-up' : `after ${waitedFor ?? 'another sweep'} (${result})`)
+				);
+			}
+			return pass;
+		}
+		const holder = (await readProbeState())?.sweep;
+		const holderAnchor = epochMsOf(holder?.anchorAt);
+		// What `checkInterrupt` in the holder will honour: a dry run, a reseed, or a pass for an older anchor.
+		const interruptible =
+			holder?.dryRun === true || holder?.reseed === true || (Number.isFinite(holderAnchor) && holderAnchor < served);
+		waitedFor = holder?.startedBy ? `a ${holder.dryRun ? 'dry-run ' : ''}${holder.startedBy} pass` : waitedFor;
+		if (interruptible) {
+			if (!asked) {
+				asked = true;
+				if (result === 'on_time') result = 'interrupted';
+				logger.warn(
+					`[prerender] change-probe: the anchor found ${waitedFor ?? 'a pass it subsumes'} running — asking it to stand down`
+				);
+			}
+			// RE-ASSERTED ON EVERY TRY, not once: the request is one field of a row every worker rewrites whole
+			// (`publishProbeState` is a read-modify-write serialized only per worker), so the holder's own
+			// heartbeat, landing between our read and write, can erase it.
+			await requestSweepInterrupt('anchor', served);
+		} else if (result === 'on_time') {
+			result = 'chained';
+			logger.warn(
+				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a sweep'} running — its pass runs when that one ends`
+			);
+		}
+		// A LATER anchor while this one waits: one pass serves both, and the older is the one skipped.
+		const latest = previousAnchorOccurrence();
+		if (Number.isFinite(latest) && latest > served) {
+			countProbe('anchor', 'skipped');
+			served = latest;
+		}
+		await waitUnref(ANCHOR_RETRY_MS);
+	}
+};
+
+// How often, and how soon, a thrown pass is resumed before it is given up on.
+const ANCHOR_RESUMES = 3;
+const ANCHOR_RESUME_DELAY_MS = MINUTE;
+
+/**
+ * Run a detached sweep — the reseed a trip chains, the boot resume — and, if it THROWS, resume it from the
+ * cursor its error record carries, up to `ANCHOR_RESUMES` times, `ANCHOR_RESUME_DELAY_MS` apart: the same
+ * bounded recovery `runAnchoredPass` gives the anchored pass, so one storage fault does not cost the rest
+ * of the slice. Never rejects; resolves with the last attempt's record, or null once it gives up.
+ */
+const runSweepResilient = async (options) => {
+	let run = options;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await runProbeSweepOnce(run);
+		} catch (e) {
+			logger.error(e);
+			const failed = (await readProbeState())?.sweep?.lastRun;
+			if (attempt >= ANCHOR_RESUMES || !failed?.error || !config.changeProbe.enabled) return null;
+			const resume = {
+				cursor: typeof failed.cursor === 'string' ? failed.cursor : '',
+				originStartedAt: epochMsOf(failed.resumedFrom ?? failed.startedAt),
+			};
+			logger.warn(
+				`[prerender] change-probe: a ${options.startedBy ?? 'detached'} pass threw (${e?.message ?? e}) — resuming it ` +
+					`from ${resume.cursor ? JSON.stringify(resume.cursor) : 'the start'} in ${ANCHOR_RESUME_DELAY_MS / 1000}s ` +
+					`(attempt ${attempt + 1} of ${ANCHOR_RESUMES})`
+			);
+			await waitUnref(ANCHOR_RESUME_DELAY_MS);
+			run = { ...options, startedBy: 'resume', resume };
+		}
+	}
+};
+
+// A wait that never holds the process open (the global timer, which is also what tests can drive).
+const waitUnref = (ms) =>
+	new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+	});
 
 const armAnchorTimer = () => {
 	if (anchorTimer) clearTimeout(anchorTimer);
@@ -2400,16 +3448,14 @@ const armAnchorTimer = () => {
 			nextAnchorAt = Number.isFinite(upcoming) ? upcoming : null;
 			// Awaited so the scheduler write lands before the pass claims the row.
 			await publishScheduler();
-			try {
-				await runProbeSweepOnce({ startedBy: 'anchor' });
-			} catch (e) {
-				logger.error(e);
+			const generation = timerGeneration;
+			await runAnchoredPass(at);
+			// Config is re-read here rather than captured: this is the boundary a live change acts on. A
+			// mode or anchor edit while the pass ran (or waited) has already re-armed through
+			// syncProbeTimers — the generation moved — and that arming stands.
+			if (generation === timerGeneration && config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) {
+				armAnchorTimer();
 			}
-			// Config is re-read here rather than captured: this is the boundary a live change acts on.
-			// A mode or anchor edit mid-pass has already re-armed through syncProbeTimers (the marker
-			// changed), and `armAnchorTimer` clears whatever timer that armed before arming its own, so
-			// the two can never both be live.
-			if (config.changeProbe.enabled && isAnchored() && armedSweep === anchorKey()) armAnchorTimer();
 		},
 		Math.max(0, at - Date.now())
 	);
@@ -2478,6 +3524,121 @@ const stopContinuousLoop = () => {
 	continuousStop = null;
 };
 
+/**
+ * THE CANARY'S TIME-OF-DAY SCHEDULE (`changeProbe.canary.schedule`) — optional; empty (the default) is
+ * the fixed `canary.interval`, exactly as before.
+ *
+ * WHY. The canary exists to catch a mass change fast, and on a site that reprices on a schedule the
+ * change comes at one time of day: a 500-URL cohort every 30 minutes all day is ~24k origin calls per
+ * node per day, nearly all of them confirming that nothing happened. A schedule makes the canary dense
+ * where a change is expected and sparse elsewhere: windows `{ from, to, interval }` ("HH:MM", in
+ * `anchorTimezone`, the anchor's own zone and DST handling), each with its own interval; outside every
+ * window `canary.interval` applies (0 = no canary there). A window may wrap midnight (`to` < `from`);
+ * the first window containing an instant is the one that applies.
+ *
+ * WHEN IT RUNS. At each window's start, then every `interval` inside it; a run whose next interval would
+ * cross the window's end hands over to the outside cadence, counted from that run. A chain of timeouts,
+ * re-armed at each FIRE (not after the pass, so the cadence does not drift by the pass's duration), and
+ * every next instant is computed afresh from the wall clock — a DST shift moves the windows with the
+ * local time rather than accumulating an hour of error, and a start inside a spring-forward hole is
+ * pushed to its next real occurrence rather than resolving into the past.
+ */
+let compiledSchedule = null;
+let compiledScheduleFrom;
+const TIME_OF_DAY = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+export const canarySchedule = () => {
+	const raw = config.changeProbe.canary.schedule;
+	if (raw === compiledScheduleFrom) return compiledSchedule;
+	compiledScheduleFrom = raw;
+	compiledSchedule = [];
+	for (const [index, entry] of (Array.isArray(raw) ? raw : []).entries()) {
+		const interval = Number(entry?.interval);
+		const valid =
+			TIME_OF_DAY.test(String(entry?.from ?? '')) &&
+			TIME_OF_DAY.test(String(entry?.to ?? '')) &&
+			entry.from !== entry.to &&
+			Number.isFinite(interval) &&
+			interval >= MINUTE &&
+			interval <= MAX_TIMER_DELAY;
+		if (!valid) {
+			logger.warn?.(
+				`[prerender] changeProbe.canary.schedule[${index}] is not { from: "HH:MM", to: "HH:MM" (different), ` +
+					`interval: >= 60000 ms } — ignored: ${JSON.stringify(entry)}`
+			);
+			continue;
+		}
+		compiledSchedule.push({
+			fromTime: entry.from,
+			toTime: entry.to,
+			from: minutesOfTimeOfDay(entry.from),
+			to: minutesOfTimeOfDay(entry.to),
+			interval,
+		});
+	}
+	return compiledSchedule;
+};
+const MAX_TIMER_DELAY = 2147483647;
+const canaryScheduleKey = (schedule) =>
+	`${config.changeProbe.anchorTimezone}|${schedule.map((w) => `${w.fromTime}-${w.toTime}/${w.interval}`).join(',')}`;
+const scheduleWindowStatus = (window) => ({ from: window.fromTime, to: window.toTime, interval: window.interval });
+
+/** The next occurrence of "HH:MM" in `timezone`, strictly after now (the spring-forward guard). */
+const nextOccurrenceOf = (timeStr, timezone) => {
+	const at = getNextTimeOfDay(timeStr, timezone);
+	if (!Number.isFinite(at)) return NaN;
+	return at <= Date.now() ? at + DAY : at;
+};
+
+/** When the scheduled canary should next run, seen from `now` (just after a run, or at arming). */
+export const nextScheduledCanary = (now, { schedule, interval, timezone }) => {
+	const minutes = localMinutesOf(now, timezone);
+	const inside = (w) => (w.from < w.to ? minutes >= w.from && minutes < w.to : minutes >= w.from || minutes < w.to);
+	const current = schedule.find(inside);
+	const outside = interval > 0 ? now + interval : Infinity;
+	let next = outside;
+	if (current) {
+		const end = nextOccurrenceOf(current.toTime, timezone);
+		next = Number.isFinite(end) && now + current.interval > end ? outside : now + current.interval;
+	}
+	for (const window of schedule) {
+		const start = nextOccurrenceOf(window.fromTime, timezone);
+		if (Number.isFinite(start) && start < next) next = start;
+	}
+	return next;
+};
+
+const armCanarySchedule = () => {
+	if (canaryTimer) clearTimeout(canaryTimer);
+	canaryTimer = null;
+	let at;
+	try {
+		at = nextScheduledCanary(Date.now(), {
+			schedule: canarySchedule(),
+			interval: config.changeProbe.canary.interval,
+			timezone: config.changeProbe.anchorTimezone,
+		});
+	} catch (e) {
+		logger.warn(
+			`[prerender] change-probe: canary.schedule cannot be evaluated in anchorTimezone ` +
+				`"${config.changeProbe.anchorTimezone}" (${e?.message ?? String(e)}) — the scheduled canary is not armed`
+		);
+		at = NaN;
+	}
+	nextCanaryAt = Number.isFinite(at) ? at : null;
+	if (nextCanaryAt !== null) {
+		canaryTimer = setTimeout(
+			() => {
+				canaryTimer = null;
+				armCanarySchedule();
+				runProbeCanaryOnce({ startedBy: 'interval' }).catch((e) => logger.error(e));
+			},
+			Math.min(Math.max(0, nextCanaryAt - Date.now()), MAX_TIMER_DELAY)
+		);
+		canaryTimer.unref?.();
+	}
+	void publishScheduler();
+};
+
 const armIntervals = () => {
 	// The SWEEP is what the mode changes. The CANARY is orthogonal to it — a fixed cohort on a
 	// fast fixed cadence, whose whole job is to notice a mass change between sweeps — so it arms
@@ -2493,7 +3654,8 @@ const armIntervals = () => {
 		sweepTimer.unref?.();
 		intervalArmedAt = Date.now();
 	}
-	if (armedCanary) {
+	if (armedCanarySchedule !== null) armCanarySchedule();
+	else if (armedCanary) {
 		canaryTimer = setInterval(
 			() => runProbeCanaryOnce({ startedBy: 'interval' }).catch((e) => logger.error(e)),
 			armedCanary
@@ -2523,8 +3685,17 @@ const syncProbeTimers = () => {
 			: isAnchored()
 				? anchorKey()
 				: config.changeProbe.sweepInterval;
-	const desiredCanary = enabled && config.changeProbe.canary.interval > 0 ? config.changeProbe.canary.interval : null;
-	if (desiredSweep === armedSweep && desiredCanary === armedCanary) return;
+	const schedule = canarySchedule();
+	const desiredCanarySchedule = enabled && schedule.length ? canaryScheduleKey(schedule) : null;
+	const desiredCanary =
+		enabled && config.changeProbe.canary.interval > 0
+			? config.changeProbe.canary.interval
+			: desiredCanarySchedule !== null
+				? 0
+				: null;
+	if (desiredSweep === armedSweep && desiredCanary === armedCanary && desiredCanarySchedule === armedCanarySchedule) {
+		return;
+	}
 
 	// A mode switch must re-measure. The slice estimate is not wrong across a switch, but it can
 	// be arbitrarily stale (interval mode never maintains it), and pacing a fresh continuous cycle
@@ -2543,6 +3714,7 @@ const syncProbeTimers = () => {
 	clearProbeTimers();
 	armedSweep = desiredSweep;
 	armedCanary = desiredCanary;
+	armedCanarySchedule = desiredCanarySchedule;
 
 	// EVERY BRANCH BELOW PUBLISHES, AND ONLY AFTER IT HAS ARMED (#176). This used to publish once,
 	// here, before anything was armed — so the snapshot carried the anchor as null, and null is the
@@ -2602,8 +3774,17 @@ export const publishProbeStateForTest = publishProbeState;
 /** Tests only — resolves once every state write this worker issued has landed. */
 export const probeStatePublishedForTest = probeStatePublished;
 
-/** Tests only — the drain's heartbeat keeper, assertable without a queue that takes minutes. */
-export const __drainWithHeartbeatForTest = drainWithHeartbeat;
+/** Tests only — the pass's timer heartbeat, assertable without a pass that takes minutes. */
+export const __startHeartbeatForTest = startHeartbeat;
+
+/** Tests only — the node-wide pace of the render check's confirming re-probes. */
+export const __reserveRecheckSlotForTest = () => reserveRecheckSlot();
+
+/** Tests only — resolves once every render recheck this worker queued has settled. */
+export const renderRechecksSettledForTest = () => Promise.all([...rechecksInFlight]);
+
+/** Tests only — the per-pass invalidation-epoch resolver the sweep's actions consult. */
+export const __epochResolverForTest = epochResolver;
 
 /** Tests only — where a resume starts, from the walk position and the actions in flight. */
 export const __resumeKeyOfForTest = resumeKeyOf;
@@ -2621,8 +3802,10 @@ export const __mappingGuardForTest = theMappingGuard;
 export const resetChangeProbeState = () => {
 	clearProbeTimers();
 	schedulerStarted = false;
-	armedSweep = armedCanary = null;
+	armedSweep = armedCanary = armedCanarySchedule = null;
 	sweepRunning = canaryRunning = false;
+	compiledSchedule = null;
+	compiledScheduleFrom = undefined;
 	sweepInterrupt = null;
 	lastSweep = lastCanary = null;
 	cohorts = new Map();
@@ -2632,6 +3815,9 @@ export const resetChangeProbeState = () => {
 	lastUnsupportedWarnAt = 0;
 	lastFactsUnsupportedWarnAt = 0;
 	lastFactsRefusedWarnAt = 0;
+	renderCheckState = { at: 0, row: null };
+	originPace?.fill(0n);
+	suspectClaims.clear();
 	mappingGuard = null;
 	measuredSliceSize = null;
 	resumePending = false;

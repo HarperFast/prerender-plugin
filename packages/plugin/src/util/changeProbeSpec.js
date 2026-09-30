@@ -662,15 +662,24 @@ export const apiClaimOf = (values, pageCheck) => {
 };
 
 /**
- * Do the page's claim and the endpoint's claim disagree?
+ * Compare the page's claim with the endpoint's: `true` compared and agreed, `false` disagreed, `null`
+ * nothing comparable — the same three-way verdict `compareField` gives a mapped field.
+ *
+ * WHY THREE WAYS. This used to answer "do they disagree?", and `false` then meant BOTH "they agree" and
+ * "there was nothing to compare" — a page whose availability word is unrecognised beside an endpoint
+ * whose price is null reads exactly like a page that matched. The page-verification proof took that
+ * `false` as evidence (gated only on a stored claim existing), so it could certify a page as current
+ * on price and availability when neither had been compared. A proof must be a comparison that
+ * happened: callers that only need "disagreed" test `=== false`.
  *
  * Asymmetric on price BY DESIGN: the page may legitimately print several offer prices (variants)
  * while the endpoint reports one, so the test is whether the endpoint's price is ABSENT from the
  * page's set — not whether the sets are equal. Each dimension compares only when both sides
- * actually claim it; a null/empty side is "no claim", which is never a disagreement.
+ * actually claim it; a null/empty side is "no claim", which is never a disagreement. Agreement
+ * needs at least one dimension compared and none disagreeing.
  */
-export const claimsDisagree = (pageClaim, apiClaim) => {
-	if (!pageClaim || !apiClaim) return false;
+export const compareClaims = (pageClaim, apiClaim) => {
+	if (!pageClaim || !apiClaim) return null;
 	try {
 		const page = JSON.parse(pageClaim);
 		const api = JSON.parse(apiClaim);
@@ -678,23 +687,34 @@ export const claimsDisagree = (pageClaim, apiClaim) => {
 		// previous release (or a corrupted row), so it may be any JSON at all — destructuring a
 		// non-array throws, and this runs inside the sweep's per-URL path where an uncaught throw
 		// would end the whole pass. Anything unrecognisable reads as "no comparable claim".
-		if (!Array.isArray(page) || !Array.isArray(api)) return false;
+		if (!Array.isArray(page) || !Array.isArray(api)) return null;
 		const [pagePrices, pageInStock] = page;
 		const [apiPrices, apiInStock] = api;
-		if (!Array.isArray(pagePrices) || !Array.isArray(apiPrices)) return false;
+		if (!Array.isArray(pagePrices) || !Array.isArray(apiPrices)) return null;
+		let compared = false;
 		// Availability compares only when BOTH sides hold a boolean verdict — null means that side
 		// makes no availability claim (unrecognized vocabulary, unmapped field), and no claim is
 		// never a disagreement.
-		if (typeof pageInStock === 'boolean' && typeof apiInStock === 'boolean' && apiInStock !== pageInStock) return true;
+		if (typeof pageInStock === 'boolean' && typeof apiInStock === 'boolean') {
+			if (apiInStock !== pageInStock) return false;
+			compared = true;
+		}
 		// Price compares only when the page prints at least one price the plugin could read: an
 		// unreadable price format (currency-prefixed strings, an AggregateOffer) must reduce to
 		// "no price claim", not to "disagrees with every endpoint price" — the latter re-expires
 		// the page after every render, forever.
-		return pagePrices.length > 0 && apiPrices.length > 0 && !apiPrices.every((price) => pagePrices.includes(price));
+		if (pagePrices.length > 0 && apiPrices.length > 0) {
+			if (!apiPrices.every((price) => pagePrices.includes(price))) return false;
+			compared = true;
+		}
+		return compared ? true : null;
 	} catch {
-		return false;
+		return null;
 	}
 };
+
+/** Do the page's claim and the endpoint's claim disagree? `compareClaims` answering `false`. */
+export const claimsDisagree = (pageClaim, apiClaim) => compareClaims(pageClaim, apiClaim) === false;
 
 // ---- the page record: what each cached page claims, field by field ------------------------------
 

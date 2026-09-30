@@ -9,10 +9,12 @@
  *   - It answers STRICTLY from the local cache and never proxies onward — no recursion is
  *     possible regardless of residency disagreement between nodes, the same property the
  *     explainer's `/prerender_admin/schedule` endpoint keeps.
- *   - It applies no freshness verdict. The caller already proved ITS record servable, and this
- *     node — the residency owner — writes every render for the key, so its version is never
- *     older than the caller's. Metadata and bytes are returned as one consistent version and
- *     the caller serves exactly that.
+ *   - It applies no freshness verdict: metadata and bytes are returned as one consistent version,
+ *     and the CALLER judges that metadata with `resolveServeStatus` under its own epoch before
+ *     serving a byte (http_handlers/bot_request.js). The caller's own record being servable proves
+ *     nothing about this one — it is the replica, and this node's newer metadata may already be
+ *     hard-expired — and one node deciding the whole request keeps a single epoch and config in
+ *     charge of it.
  *
  * Gated on the shared cluster token (`peerRescue.token`, compared timing-safely), because a bot
  * request carries no user credentials a peer could forward. The endpoint discloses nothing the

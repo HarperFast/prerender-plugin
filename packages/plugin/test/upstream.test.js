@@ -6,6 +6,8 @@ import { restartPaths } from '../src/configSchema.js';
 import {
 	configuredStagingIp,
 	dispatcherFor,
+	drainOrDestroy,
+	releaseOriginBody,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
 	stagingTargetIp,
@@ -109,6 +111,18 @@ test('resolveUpstreamHeaders always drops the base-ignored and security/debug he
 	assert.equal(upstream['x-harper-prerender-debug'], undefined);
 });
 
+test('resolveUpstreamHeaders never forwards the peer token header, default or configured', () => {
+	// An older node that does not know a /prerender_peer/* path treats it as bot traffic under a broad
+	// prefix route, and would otherwise proxy it to the origin carrying the cluster's shared secret.
+	applyOptions({});
+	let upstream = resolveUpstreamHeaders({ 'x-harper-peer-token': 'cluster-secret', 'x-keep': 'yes' }, 'desktop');
+	assert.equal(upstream['x-harper-peer-token'], undefined);
+	assert.equal(upstream['x-keep'], 'yes');
+	applyOptions({ peerRescue: { header: 'X-Cluster-Token' } });
+	upstream = resolveUpstreamHeaders({ 'x-cluster-token': 'cluster-secret' }, 'desktop');
+	assert.equal(upstream['x-cluster-token'], undefined, 'matched case-insensitively, and the memo rebuilt');
+});
+
 test('resolveUpstreamHeaders drops operator-configured ignoredHeaders', () => {
 	applyOptions({ origin: { ignoredHeaders: ['x-internal', 'x-trace-id'] } });
 	const upstream = resolveUpstreamHeaders({ 'x-internal': 'secret', 'x-trace-id': '123', 'x-keep': 'yes' }, 'desktop');
@@ -141,6 +155,53 @@ test('sanitizeOriginResponseHeaders keeps genuine origin headers', () => {
 	assert.equal(clean['etag'], '"abc"');
 	assert.equal(clean['vary'], 'Accept-Encoding');
 	assert.equal(clean['x-robots-tag'], 'noindex');
+});
+
+test('sanitizeOriginResponseHeaders keeps a redirect target and the document language, and still drops link', () => {
+	// The proxy does not follow redirects, so without `location` an origin 301 reached the crawler naming
+	// no target. `link` stays out: traffic discovery reads these headers, and its Link-canonical check has
+	// never seen one on this path (see the allowlist's comment).
+	const clean = sanitizeOriginResponseHeaders({
+		'location': '/product/prd-2/new.jsp',
+		'content-language': 'en-US',
+		'link': '<https://www.example.com/p>; rel="canonical"',
+	});
+	assert.equal(clean['location'], '/product/prd-2/new.jsp', 'relayed verbatim, relative or not');
+	assert.equal(clean['content-language'], 'en-US');
+	assert.equal(clean['link'], undefined);
+});
+
+test('releaseOriginBody destroys the origin stream, and falls back to cancel for anything else', async () => {
+	let released = 0;
+	releaseOriginBody({ releaseBody: () => released++, content: { cancel: () => assert.fail('never the web cancel') } });
+	assert.equal(released, 1);
+	let cancelled = 0;
+	releaseOriginBody({ content: new ReadableStream({ cancel: () => void cancelled++ }) });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(cancelled, 1);
+	// A stored page (Blob content, no stream) and nothing at all are both no-ops, never a throw.
+	releaseOriginBody({ content: new Blob(['x']) });
+	releaseOriginBody(undefined);
+});
+
+test('a drain has its own deadline: an origin body that stalls is destroyed, not held for bodyTimeout', async () => {
+	let destroyed = 0;
+	const stalled = new ReadableStream({ pull: () => new Promise(() => {}) });
+	drainOrDestroy(stalled, { destroy: () => destroyed++ }, 30);
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.equal(destroyed, 1);
+
+	// A body that ends inside the deadline is simply drained — its connection is reused, never destroyed.
+	destroyed = 0;
+	const small = new ReadableStream({
+		start(c) {
+			c.enqueue(new Uint8Array(10));
+			c.close();
+		},
+	});
+	drainOrDestroy(small, { destroy: () => destroyed++ }, 30);
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.equal(destroyed, 0);
 });
 
 test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {

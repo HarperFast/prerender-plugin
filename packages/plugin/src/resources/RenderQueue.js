@@ -1,6 +1,6 @@
 import { getMutex } from '../util/coordination.js';
 import { config, onConfigApplied } from '../config.js';
-import { currentMinuteMs, dateColumnMs } from '../util/time.js';
+import { currentMinuteMs, dateColumnMs, numberOf } from '../util/time.js';
 import { suppressionAgeBucket } from '../util/suppression.js';
 import { QueueState } from './QueueState.js';
 import { CacheKey } from '../util/cacheKey.js';
@@ -11,12 +11,13 @@ import {
 	queryAllowlistFor,
 	resolveEffectiveInterval,
 	resolveRenderInterval,
+	routeScopeForUrl,
 	PRERENDER,
 } from '../util/routeClass.js';
 import { decideInterval } from '../util/demandLadder.js';
 import { hasObservations, recordReadinessExpectation } from '../util/readinessExpectation.js';
-import { recordPageClaim } from '../util/changeProbe.js';
-import { backoffWait } from '../util/failureBackoff.js';
+import { actOnStaleRender, recordPageClaim } from '../util/changeProbe.js';
+import { backoffWait, changedRetryWait } from '../util/failureBackoff.js';
 import { recordUnroutedPath } from '../util/unrouted.js';
 import { metrics } from '../metrics.js';
 import { Target, countedStrikes } from './Target.js';
@@ -27,6 +28,7 @@ import {
 	deleteSchedule,
 	deriveQueueStatus,
 	getScheduleRow,
+	leaseGrant,
 	reconcileLeaseGauge,
 	releaseLease,
 	writeSchedule,
@@ -178,6 +180,96 @@ const retireRowIfConverted = async (job, held) => {
 const retireSource = async (job) => {
 	await Target.delete(job.url);
 	job.rowGone = job.fold;
+};
+
+/**
+ * Patch a target's fields WITH ITS PRIMARY KEY. Every patch on the result path reads the target a
+ * moment earlier, and a `Target.delete` on another node (a sitemap departure, a retirement) can
+ * replicate in between. Harper applies a patch to a missing record by storing ONLY the patched fields
+ * (`resources/Table.ts`: the incremental update is applied to a null record, and the primary key is
+ * set only when the update names it) — a row whose `url` attribute is absent, which a projected walk
+ * cannot read and nothing can address. Naming the key costs nothing and makes the worst case a
+ * readable ghost the purge and reconcile sweeps can see.
+ */
+const patchTarget = (url, fields) => Target.patch(url, { url, ...fields });
+
+/**
+ * The marks a row carries that a retry must carry forward, as `writeSchedule` takes them.
+ *
+ * A CHANGED PAGE STAYS CHANGED THROUGH A RENDER THAT DID NOT LAND. The probe hard-expired it and marked
+ * the row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
+ * that is still being served from the origin. Its demand estimate (`demandPeriod`) rides with it.
+ * A local point read: results land on the owner, and elsewhere it reads nothing and nothing is carried.
+ *
+ * An ask's mark (`urgentAt`) is deliberately NOT carried: the ask was answered by the attempts, and a
+ * page that failed its fast lane as well is a failing page, not an urgent one.
+ */
+const marksOf = (row) => {
+	const changedAt = numberOf(row?.changedAt);
+	if (!(Number.isFinite(changedAt) && changedAt > 0)) return {};
+	const demandPeriod = numberOf(row?.demandPeriod);
+	return { changedAt, demandPeriod: Number.isFinite(demandPeriod) && demandPeriod > 0 ? demandPeriod : undefined };
+};
+
+const readMarks = async (url) => marksOf(await getScheduleRow(url, ['changedAt', 'demandPeriod']));
+
+/**
+ * What a result needs of its row before it decides anything: the marks (above), and the ask — when an
+ * `urgentAt` was filed and the due time it was filed at. One local point read.
+ */
+const readResultState = async (url) => {
+	const row = await getScheduleRow(url, ['nextRenderTime', 'changedAt', 'demandPeriod', 'urgentAt']);
+	const askedAt = numberOf(row?.urgentAt);
+	const dueAt = numberOf(row?.nextRenderTime);
+	return {
+		marks: marksOf(row),
+		askedAt: Number.isFinite(askedAt) && askedAt > 0 ? askedAt : undefined,
+		dueAt: Number.isFinite(dueAt) ? dueAt : undefined,
+	};
+};
+
+/**
+ * How much earlier than a key's latest grant a result's render must provably have begun before it is
+ * treated as another lease's (see `processJobResult`). A renderer's timing comes off its own clock and
+ * leaves out what it does around a render; the slack absorbs that, and costs detection only for a
+ * render that began within it of the re-grant — which a lease of at least two minutes all but rules out.
+ */
+const LEASE_GENERATION_SLACK_MS = 5_000;
+
+/**
+ * The latest instant a posted result's render can have begun: now, less the render time its variants
+ * report — they render in turn inside one job, so their times add, and each is a duration off the
+ * renderer's own clock, so no skew enters. Null when none reported one (a renderer older than the
+ * field, or nothing rendered), and then the lease-generation tests have nothing to go on and decide
+ * nothing.
+ */
+const renderStartedBy = (result, nowMs) => {
+	const times = Array.isArray(result.variants)
+		? result.variants.map((variant) => variant?.renderTime)
+		: [result.renderTime];
+	let total = 0;
+	for (const ms of times) if (typeof ms === 'number' && Number.isFinite(ms) && ms > 0) total += ms;
+	return total > 0 ? nowMs - total : null;
+};
+
+/** The route label the metrics carry for a URL — the keeper's and `route_serve`'s. */
+const routeLabelOf = (url) => routeScopeForUrl(url) ?? 'unrouted';
+
+/**
+ * A stored body's DECODED length, or null when it cannot be had for free.
+ *
+ * A gzip member ends with ISIZE, the uncompressed length modulo 2^32 (RFC 1952 §2.3.1), so for the
+ * render fleet's default encoding the answer is four bytes away, and an unencoded body is its own
+ * length. Anything else would mean decompressing every page on the result path — a request handler, per
+ * render — to measure it, so it is not measured. Read byte by byte so a plain Uint8Array works too.
+ */
+const decodedLengthOf = (content, encoding) => {
+	if (!content?.byteLength) return null;
+	const coding = typeof encoding === 'string' ? encoding.trim().toLowerCase() : '';
+	if (coding === '' || coding === 'identity') return content.byteLength;
+	const n = content.byteLength;
+	if (coding !== 'gzip' || n < 18 || content[0] !== 0x1f || content[1] !== 0x8b) return null;
+	return (content[n - 4] | (content[n - 3] << 8) | (content[n - 2] << 16) | (content[n - 1] << 24)) >>> 0;
 };
 
 /** A row carries a cadence when a recurring writer filed it; a targetless render-now files none. */
@@ -494,15 +586,45 @@ export class RenderQueue extends Resource {
 		// reassign the working key, and releasing by that would have leaked the SOURCE's lease on every
 		// rendered client-side redirect — the source would then stay unclaimable for a full lease).
 		const claimKey = result.id;
+		// THE LEASE GENERATION THIS RESULT CAN BELONG TO, read before anything is decided or released. A
+		// render that outlives its lease still posts its result, and by then the key can have been granted
+		// to another renderer. That result is LATE, not current: it must not overwrite the newer lease's
+		// page (or reschedule over its result, if it has landed), and above all must not release the newer
+		// lease — release was keyed by the key alone, so it handed the other renderer's key back to the
+		// queue mid-render. A result whose render provably began before the key's latest grant is
+		// therefore dropped whole, and the release below names the grant it belongs to.
+		//
+		// "Provably" is one-directional on purpose: the renderer echoes no lease token, so the only
+		// evidence is its render time against the grant instant. A result that cannot be proved late is
+		// processed exactly as before.
+		const grant = claimKey === undefined || claimKey === null ? null : leaseGrant(String(claimKey));
+		const startedBy = renderStartedBy(result, Date.now());
+		if (grant && startedBy !== null && startedBy < grant.grantedAtMs - LEASE_GENERATION_SLACK_MS) {
+			metrics.renderOutcome('superseded', 'newer-lease');
+			logger.info(
+				`[prerender] discarding a late result for ${claimKey}: its render began before the key was leased again ` +
+					`at ${new Date(grant.grantedAtMs).toISOString()}, so that lease's render stands and its lease is left alone`
+			);
+			return;
+		}
 		// Set true by the branches whose retry pacing IS the lease (see retryAfterFailure): they
 		// must keep it, or the row — which still carries its original overdue due time now that
 		// the lease has left `nextRenderTime` — becomes immediately re-claimable and hot-loops.
 		let holdLease = false;
+		// Set by the outcomes that land but leave the row due on purpose (a render dropped for predating a
+		// change mark, one that kept an ask filed while it ran): the re-grant at the same minute that
+		// follows is then not counted as a result whose commit failed (util/renderLease.js `missesOf`).
+		let leftDue = false;
 		try {
 			return await this.processDecodedJobResult(result, {
 				holdLease: () => {
 					holdLease = true;
 				},
+				leaveDue: () => {
+					leftDue = true;
+				},
+				grant,
+				startedBy,
 			});
 		} catch (e) {
 			// A THROW MUST HOLD THE LEASE. `holdLease` is only set by branches that ran to
@@ -521,8 +643,11 @@ export class RenderQueue extends Resource {
 			holdLease = true;
 			throw e;
 		} finally {
-			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`.
-			if (!holdLease && claimKey) releaseLease(claimKey);
+			// THE SINGLE RELEASE POINT. One lease, one result, one release — by `claimKey`, and only of the
+			// grant read above: a key granted again while this result was processed is another renderer's.
+			// No grant at all means this node holds no lease the result could be for (a restart, or the
+			// slot recycled), so any lease that appears meanwhile is someone else's too.
+			if (!holdLease && grant) releaseLease(claimKey, { grantedAtMs: grant.grantedAtMs, leftDue });
 		}
 	}
 
@@ -566,7 +691,10 @@ export class RenderQueue extends Resource {
 	 * renders — while a per-device row for a NON-default device is a one-off: its page is stored and
 	 * the row deleted, and the URL row is not touched. `describeJob` decides which, once.
 	 */
-	static async processDecodedJobResult(posted, { holdLease: hold }) {
+	static async processDecodedJobResult(
+		posted,
+		{ holdLease: hold, leaveDue = () => {}, grant = null, startedBy = null }
+	) {
 		const { rowKey, url, asked, variants } = normalizeJobResult(posted);
 		const job = describeJob(rowKey, url);
 		let held = false;
@@ -629,6 +757,43 @@ export class RenderQueue extends Resource {
 			if (typeof readiness.firstSatisfiedMs === 'number')
 				metrics.renderReadinessMs(readiness.firstSatisfiedMs, readiness.contract);
 		}
+
+		// 0. A RESULT FROM A LEASE OLDER THAN A CHANGE MARK IS OLD CONTENT. The change probe (or a gone
+		// reopen, or a sitemap departure) marks the row `changedAt` when it finds the origin changed, and
+		// hard-expires the page. A render granted BEFORE that instant may have fetched the document before
+		// the change — measured shape: claimed at T-8s, marked at T, posted at T+3s — and storing it would
+		// serve the old price fresh for a whole cadence, while its reschedule cleared the mark that says
+		// the page is wrong. So it is dropped whole: nothing stored, the row left due with its mark, and the
+		// lease released so the page renders again at once. It cannot loop: the next grant is after the
+		// mark, whose first instant `fileDueNow` keeps.
+		//
+		// The grant is the lease's, TO THE MILLISECOND — or, with no lease slot to ask, the latest instant
+		// the render can have begun. Exact rather than floored to its second, because a mark filed due now
+		// is typically granted 0.2-1.5 s later, often inside the same second: floored, the grant read as
+		// before the mark and a correct first render of a changed page was dropped (23.6% of marks made
+		// strictly before their grant). Exactness cannot let a stale render through: the renderer fetches
+		// the document seconds AFTER the grant (it launches, paces and navigates first), so a render whose
+		// grant is even a millisecond after the mark fetched a document the origin had already changed.
+		// Only for a job that writes the URL row: a one-device render beside the rotation neither reads nor
+		// clears its mark.
+		const rowState = job.fold ? await readResultState(url) : { marks: {} };
+		const { marks } = rowState;
+		const grantedBy = Math.min(grant?.grantedAtMs ?? Infinity, startedBy ?? Infinity);
+		if (marks.changedAt !== undefined && marks.changedAt > grantedBy) {
+			metrics.renderOutcome('superseded', 'changed-during-render');
+			logger.info(
+				`[prerender] not storing the render of ${url}: its lease predates the change found at ` +
+					`${new Date(marks.changedAt).toISOString()}, so it may show the old content. The row stays due and ` +
+					`marked, and renders again now.`
+			);
+			leaveDue();
+			return;
+		}
+		// AN ASK FILED WHILE THIS RENDER RAN is not answered by it, the same way: a revalidate or render-now
+		// that arrived after the grant wants the page as it is NOW, and this render fetched it before. Unlike
+		// a change, nothing says its content is wrong, so it is stored — only the ask must survive, which the
+		// reschedule below would clear (`urgentAt` is cleared by every other writer's `put`). See step 5.
+		const askedDuringRender = rowState.askedAt !== undefined && rowState.askedAt > grantedBy;
 
 		// 1. A redirect the browser bailed on at navigation, or a rendered-through client-side redirect
 		// that produced nothing. Decided by `processRedirectResult` for the whole URL, exactly as one
@@ -808,6 +973,16 @@ export class RenderQueue extends Resource {
 		const stored = rendered.filter(
 			(variant) => !!variant.content && !variant.discardContent && !(refiledTo && !variant.refiled) && !withheld
 		);
+		// How big each page is as a crawler parses it (G4): one sample per device page stored, by the route
+		// of the key it is stored under.
+		for (const variant of stored) {
+			const bytes = decodedLengthOf(variant.content, variant.headers['content-encoding']);
+			if (bytes !== null) {
+				metrics.renderSize(bytes, routeLabelOf(CacheKey.urlOf(variant.storeKey)), variant.deviceType);
+			}
+		}
+		// What the change probe's render check made of this render (`recordPageClaim`); acted on below.
+		let claimCheck;
 		if (stored.length) {
 			// ONE timestamp for every page and for the claim recorded alongside them. Taken once rather
 			// than per use because `recordPageClaim` stores it as the basis a per-URL verification
@@ -853,7 +1028,7 @@ export class RenderQueue extends Resource {
 			// the probe claim: one node-local point read and one small write each, and like
 			// `recordPageClaim` it never rejects — a regression signal must not cost a render.
 			const observed = stored.filter((variant) => hasObservations(variant.readiness?.learned));
-			await Promise.all([
+			[claimCheck] = await Promise.all([
 				recordPageClaim(scheduleUrl, claiming.structuredOffers, cachedAt, {
 					pageFacts: describing.pageFacts,
 					complete: everyDevice,
@@ -960,6 +1135,22 @@ export class RenderQueue extends Resource {
 						? 'discarded'
 						: 'no-content'
 		);
+		// TRIGGER TO CACHE (G1): how long a page found changed was served from the origin before this render
+		// replaced it — from the mark's first instant, which `fileDueNow` keeps, to now. Emitted only here,
+		// where every device rendered and the reschedule below clears the mark: a partial render keeps the
+		// mark through the retry lane, and its URL is counted once, when its render finally lands.
+		// Not for a render the probe's own check found STALE: it does not carry the change's content, the
+		// page is re-filed, and the lag is counted when the render that does carry it lands.
+		if (
+			marks.changedAt !== undefined &&
+			renderTarget &&
+			scheduleJob.fold &&
+			!refiledTo &&
+			stored.length &&
+			!claimCheck?.stale
+		) {
+			metrics.renderChangeLag(Math.max(0, Date.now() - marks.changedAt), routeLabelOf(url));
+		}
 
 		if (renderTarget) {
 			// A target owns this URL → recurring. Reschedule relative to completion using the resolved
@@ -970,8 +1161,14 @@ export class RenderQueue extends Resource {
 			// A one-device render (a per-device row for a non-default device) does NOT reschedule: the
 			// URL's rotation is on the URL row, and this result was an extra render beside it.
 			if (scheduleJob.fold) {
+				// An ask filed while this render ran (step 0) keeps the row due, at the time it was filed, and
+				// keeps its mark: the pages just stored stay fresh to their cadence, and the ask is answered by
+				// the next render instead of silently by this one.
+				const keepAsk = askedDuringRender && !refiledTo;
+				if (keepAsk) leaveDue();
 				await writeSchedule(scheduleUrl, {
-					nextRenderTime,
+					nextRenderTime: keepAsk ? Math.min(rowState.dueAt ?? currentMinuteMs(), currentMinuteMs()) : nextRenderTime,
+					...(keepAsk ? { urgentAt: rowState.askedAt } : {}),
 					fromSitemap: !!renderTarget.sitemapUrl,
 					// `interval`, i.e. the rung `decideInterval` JUST chose — not the route ceiling. This is
 					// the writer every target passes through on every cycle, so it is what backfills the
@@ -986,7 +1183,7 @@ export class RenderQueue extends Resource {
 				// patches (~one per render for a full cycle), in dry-run too. A converged corpus therefore
 				// pays nothing here, on the system's hottest path.
 				if (demand.action === 'promoted' || demand.action === 'demoted') {
-					await Target.patch(scheduleUrl, { demandInterval: demand.level });
+					await patchTarget(scheduleUrl, { demandInterval: demand.level });
 				}
 			}
 
@@ -1007,7 +1204,7 @@ export class RenderQueue extends Resource {
 				// count, so redirect blips months apart never accumulate toward retirement.
 				// Guarded by strikes > 0 — the hot path (healthy target, no strikes) pays no
 				// extra write.
-				await Target.patch(scheduleUrl, { strikes: 0 });
+				await patchTarget(scheduleUrl, { strikes: 0 });
 			}
 		} else if (!job.rowGone) {
 			// No target owns this URL on this node: a one-off's row is dropped, a recurring row is
@@ -1017,6 +1214,10 @@ export class RenderQueue extends Resource {
 			// expires, and with the row gone nothing can claim the key meanwhile.
 			await settleTargetless(job, targetless ?? { kind: 'one-off' });
 		}
+		// A render the probe's render check found SUSPECT (it disagrees with the probe's last observation of
+		// the origin — util/changeProbe.js): one confirming re-probe is queued HERE, after the page writes and
+		// the reschedule above, which would otherwise overwrite the expiry and re-file it may lead to.
+		if (renderTarget && claimCheck?.stale) await actOnStaleRender(scheduleUrl, renderTarget);
 		await retireRowIfConverted(job, held);
 	}
 
@@ -1142,8 +1343,10 @@ export class RenderQueue extends Resource {
 
 		// Due now, not jittered: adoptions arrive one per source render, already spread by the
 		// sources' own schedule jitter, and the source's cached pages were just deleted — the
-		// sooner the destination renders, the shorter the window a bot gets neither page.
-		const target = { nextRenderTime: currentMinuteMs() };
+		// sooner the destination renders, the shorter the window a bot gets neither page. It is a single
+		// ask (`urgent`, consumed by `Target.put` into `urgentAt`), so it ranks ahead of routine lateness
+		// rather than behind every overdue row.
+		const target = { nextRenderTime: currentMinuteMs(), urgent: true };
 		if (Number.isFinite(source?.renderInterval) && source.renderInterval > 0) {
 			target.renderInterval = source.renderInterval;
 		}
@@ -1182,7 +1385,7 @@ export class RenderQueue extends Resource {
 			await retireSource(job); // drops the target, its pages, and every folding row
 			return;
 		}
-		await Target.patch(sourceUrl, { strikes });
+		await patchTarget(sourceUrl, { strikes });
 		await this.rescheduleAtTargetCadence(job, renderTarget);
 	}
 
@@ -1240,7 +1443,7 @@ export class RenderQueue extends Resource {
 			return (await settleTargetless(job, await readTargetlessRow(job))) === 'deferred' ? 'slow' : 'dropped';
 		}
 		const strikes = countedStrikes(renderTarget.strikes) + 1;
-		await Target.patch(sourceUrl, { strikes });
+		await patchTarget(sourceUrl, { strikes });
 
 		if (strikes <= config.render.failureRetry.fastRetries) {
 			logger.debug(`Retrying ${job.rowKey} on its claim lease (failure strike ${strikes})`);
@@ -1257,31 +1460,32 @@ export class RenderQueue extends Resource {
 			return 'slow';
 		}
 
-		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
 		const fromSitemap = !!renderTarget.sitemapUrl;
-		const wait = backoffWait(interval, strikes, fromSitemap);
-		// THE CADENCE, NOT `wait`. The backoff is how long until the retry; the cadence is how often the
-		// page wants to render. Filing `wait` here would tell the keeper a repeatedly-failing 1h page is
-		// on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority on
-		// every strike. `backoffWait` is derived FROM the cadence, so both are in hand.
+		// THE EFFECTIVE CADENCE — the ladder's rung — not the route ceiling, for the wait AND for what is
+		// filed. The ceiling is what the ladder allocates WITHIN: a product page on a 96h route rendering
+		// at its 48h rung has pages that expire at 48h, so a retry filed 96h out left a failed page on the
+		// origin for ~42h past its swr window.
+		//
+		// And the cadence is filed, not `wait`: the backoff is how long until the retry, the cadence how
+		// often the page wants to render. Filing `wait` would tell the keeper a repeatedly-failing 1h page
+		// is on a multi-hour cadence and rank it as barely late — rewarding failure with lower priority.
 		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
-		const nextRenderTime = currentMinuteMs() + wait;
-		// A CHANGED PAGE STAYS CHANGED THROUGH A FAILED RENDER. The probe hard-expired it and marked the
-		// row; `put` replaces the record, so a retry that omitted the mark would quietly demote a page
-		// that is still being served from the origin. A local point read: results land on the owner,
-		// and elsewhere it reads nothing and the mark is simply not carried.
-		// Its demand estimate rides with the mark (`demandPeriod`), for the same reason.
-		const { changedAt, demandPeriod } = (await getScheduleRow(sourceUrl, ['changedAt', 'demandPeriod'])) ?? {};
+		const marks = await readMarks(sourceUrl);
+		// A MARKED page waits at lease scale (`changedRetryWait`): its page is hard-expired, so a cadence
+		// wait is that long on the origin.
+		const wait =
+			marks.changedAt === undefined
+				? backoffWait(cadence, strikes, fromSitemap)
+				: changedRetryWait(cadence, strikes, fromSitemap);
 		logger.debug(
 			`Retrying ${sourceUrl} in ${Math.round(wait / 60000)}m (failure strike ${strikes}` +
-				`${fromSitemap ? '' : ', non-sitemap'})`
+				`${fromSitemap ? '' : ', non-sitemap'}${marks.changedAt === undefined ? '' : ', changed'})`
 		);
 		await writeSchedule(sourceUrl, {
-			nextRenderTime,
+			nextRenderTime: currentMinuteMs() + wait,
 			fromSitemap,
 			effectiveInterval: cadence,
-			changedAt: changedAt === null || changedAt === undefined ? undefined : Number(changedAt),
-			demandPeriod: demandPeriod === null || demandPeriod === undefined ? undefined : Number(demandPeriod),
+			...marks,
 		});
 		return 'slow';
 	}
@@ -1313,17 +1517,23 @@ export class RenderQueue extends Resource {
 			await settleTargetless(job, await readTargetlessRow(job));
 			return;
 		}
-		// Same cadence resolution as the post-render path above (route > stored > default).
-		const interval = resolveRenderInterval(sourceUrl, renderTarget.renderInterval);
+		// The ladder rung when the row carried one, else the ceiling — for the wait as well as the filed
+		// cadence, as in `retryAfterFailure` (a wait at the route ceiling outlived the rung's pages by half
+		// a ceiling). A caller-supplied `preloaded` row is documented as "at least renderInterval +
+		// sitemapUrl", so an absent `demandInterval` means "not read" rather than "not promoted" —
+		// resolving to the ceiling is the safe reading, and the next render files the true rung either
+		// way. (`recordRedirectStrike`, the one in-tree preloader, selects it.)
+		//
+		// A marked row keeps its mark, but NOT the lease-scale wait the failure lane gives it: every
+		// result here costs a redirect strike, and `render.redirects.maxStrikes` of them retire the source.
+		// At lease scale four temporary redirects — a failover of an hour or two — would retire it; at the
+		// cadence they take four cycles, which is what that ceiling was sized against.
+		const cadence = resolveEffectiveInterval(sourceUrl, renderTarget);
 		await writeSchedule(sourceUrl, {
-			nextRenderTime: currentMinuteMs() + interval,
+			nextRenderTime: currentMinuteMs() + cadence,
 			fromSitemap: !!renderTarget.sitemapUrl,
-			// The ladder rung when the row carried one, else the ceiling. A caller-supplied `preloaded`
-			// row is documented as "at least renderInterval + sitemapUrl", so an absent `demandInterval`
-			// means "not read" rather than "not promoted" — resolving to the ceiling is the safe reading,
-			// and the next render files the true rung either way. (`recordRedirectStrike`, the one
-			// in-tree preloader, now selects it.)
-			effectiveInterval: resolveEffectiveInterval(sourceUrl, renderTarget),
+			effectiveInterval: cadence,
+			...(await readMarks(sourceUrl)),
 		});
 	}
 
@@ -1368,10 +1578,11 @@ export class RenderQueue extends Resource {
 				.map((w) => `${w.cacheKey} (${w.misses} leases, held ${Math.round(w.backoff / 60_000)} min)`)
 				.join(', ');
 			logger.warn(
-				`[prerender] ${pass.wedged.length} key(s) whose last leases all expired with no result were held back ` +
-					`instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
-					`crashing or hanging on these URLs, or results are not reaching this node. No strike was counted, and ` +
-					`the first result that arrives for a key clears its hold.`
+				`[prerender] ${pass.wedged.length} key(s) whose last leases all ended without moving their row were held ` +
+					`back instead of granted again: ${sample}${pass.wedged.length > 3 ? ', …' : ''}. Either the renderer is ` +
+					`crashing or hanging on these URLs, results are not reaching this node, or results arrive and their ` +
+					`commit fails (the log has the error). No strike was counted, and the first result that lands for a ` +
+					`key clears its hold.`
 			);
 		}
 

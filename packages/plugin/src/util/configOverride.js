@@ -5,11 +5,18 @@
  * in `config.ConfigOverride` written from the console. This module owns everything about
  * that third layer except the merge itself, which is `config.js`'s `resolveConfig`.
  *
- * WHY DELTAS AND NOT A SNAPSHOT. Each row is one option path. A snapshot of the whole config would
- * freeze every option an operator ever touched against future deploys: ship a corrected default, or
- * a fixed route, and the stale snapshot shadows it with nothing to say why the deploy did nothing.
- * With deltas, a `config.yaml` change still lands for every path nobody pinned, clearing one row
- * reverts one option, and clearing all of them returns the cluster to exactly its deployed state.
+ * WHY ONE ROW PER OPTION AND NOT A SNAPSHOT. A snapshot of the whole config would freeze every option
+ * an operator ever touched against future deploys: ship a corrected default, or a fixed route, and the
+ * stale snapshot shadows it with nothing to say why the deploy did nothing. With a row per option, a
+ * `config.yaml` change still lands for every path nobody pinned, clearing one row reverts one option,
+ * and clearing all of them returns the cluster to exactly its deployed state.
+ *
+ * BUT A ROW IS A WHOLE OPTION, NOT A DELTA WITHIN ONE. A list is a single option, so one route edited
+ * from the console stores a copy of every route in `ingress.routes` (and one rule, every rule in
+ * `changeProbe.rules`), and that copy then masks each later config.yaml edit to ANY entry. So each row
+ * records a hash of the file's value at its path when it is written (`fileHash`), and the layers view
+ * reports per row whether the file has moved since (`masking`) or now says the same thing
+ * (`redundant`). A masking row is also logged on every apply. See `overrideDrift` in config.js.
  *
  * WHY A REPLICATED TABLE AND NOT A FILE. The alternative — the console writing a file on each node —
  * has no convergence: a node that was mid-restart for one write diverges permanently, and there is
@@ -33,8 +40,9 @@
  * dozen rows.
  */
 
-import { config, getLogger, onConfigApplied, resolveConfig } from '../config.js';
-import { aliasPaths, checkUiEditable } from '../configSchema.js';
+import { config, fileLayerHashes, getLogger, onConfigApplied, resolveConfig } from '../config.js';
+import { aliasPaths, checkUiEditable, describeItemRule, invalidItems } from '../configSchema.js';
+import { runDetached } from './detach.js';
 
 const table = () => databases.config.ConfigOverride;
 
@@ -117,11 +125,13 @@ const withDeadline = async (label, run) => {
  * answer. The degradation is reported so the console can say the layer is not being honoured
  * instead of showing an empty override list that looks like "nobody has set anything".
  *
- * @returns {Promise<{ overrides: Record<string, any>, rows: object[], degraded: boolean,
- *                     truncated: boolean, error: string|null }>}
+ * `recorded` is each row's `fileHash` by path, or null for a row that recorded none.
+ *
+ * @returns {Promise<{ overrides: Record<string, any>, recorded: Record<string, string|null>,
+ *                     rows: object[], degraded: boolean, truncated: boolean, error: string|null }>}
  */
 export const readOverrides = async () => {
-	const empty = { overrides: {}, rows: [], degraded: true, truncated: false, error: null };
+	const empty = { overrides: {}, recorded: {}, rows: [], degraded: true, truncated: false, error: null };
 	try {
 		const rows = await withDeadline('ConfigOverride read', async () => {
 			const collected = [];
@@ -132,7 +142,7 @@ export const readOverrides = async () => {
 			for await (const row of table().search(
 				{
 					conditions: [{ attribute: 'path', comparator: 'greater_than', value: '' }],
-					select: ['path', 'value', 'updatedTime', 'updatedBy', 'note'],
+					select: ['path', 'value', 'updatedTime', 'updatedBy', 'note', 'fileHash'],
 					limit: MAX_OVERRIDE_ROWS + 1,
 				},
 				// SECOND argument, not a query field. Harper's search path consumes query options it
@@ -156,15 +166,17 @@ export const readOverrides = async () => {
 		}
 
 		const overrides = {};
+		const recorded = {};
 		for (const row of kept) {
 			if (typeof row?.path !== 'string' || row.path === '') continue;
 			// `undefined` is how a row says nothing, and it is also what the merge skips. Storing it
 			// would be a row that exists, lists in the console, and does nothing.
 			if (row.value === undefined) continue;
 			overrides[row.path] = row.value;
+			recorded[row.path] = typeof row.fileHash === 'string' && row.fileHash !== '' ? row.fileHash : null;
 		}
 
-		return { overrides, rows: kept, degraded: false, truncated, error: null };
+		return { overrides, recorded, rows: kept, degraded: false, truncated, error: null };
 	} catch (e) {
 		getLogger().warn?.(
 			`[prerender] Could not read stored config overrides (${messageOf(e)}) — running the deployed ` +
@@ -205,12 +217,16 @@ export const loadOverrideLayer = async (hostOptions) => {
  * regardless would be correct but not free: `applyOptions` notifies every `onConfigApplied`
  * listener, and those re-arm the sitemap scheduler, the reconciler and the backlog snapshotter. A
  * no-op poll must not touch any of them.
+ *
+ * The recorded file hashes count as a change too: saving the same value again after a config.yaml
+ * edit is how an operator says "keep this", and every worker has to see it to stop reporting the
+ * row as masking.
  */
-export const fingerprintOverrides = (overrides) =>
+export const fingerprintOverrides = (overrides, recorded = null) =>
 	JSON.stringify(
 		Object.keys(overrides ?? {})
 			.sort()
-			.map((path) => [path, overrides[path]])
+			.map((path) => [path, overrides[path], recorded?.[path] ?? null])
 	);
 
 /**
@@ -254,6 +270,17 @@ export const validateOverride = (path, value) => {
 		}
 	}
 
+	if (node.items && Array.isArray(value)) {
+		const bad = invalidItems(node, value);
+		if (bad.length) {
+			const listed = bad.map((v) => JSON.stringify(v)).join(', ');
+			return {
+				ok: false,
+				reason: `${path}: ${listed} not allowed here — each entry must be ${describeItemRule(node.items)}`,
+			};
+		}
+	}
+
 	if (node.nonEmpty && (value === '' || (Array.isArray(value) && value.length === 0))) {
 		return { ok: false, reason: `${path}: must not be empty` };
 	}
@@ -286,6 +313,9 @@ export const writeOverrides = async ({ set = [], clear = [], updatedBy = null } 
 	const overrides = table();
 	const written = [];
 	const cleared = [];
+	// The file layer this worker is running, at each path being set: what a later apply compares
+	// against to tell whether config.yaml moved underneath the row (`masking`).
+	const fileHashes = fileLayerHashes(set.map((entry) => entry.path));
 
 	// CLEAR THE ALIASES TOO. The layer is indexed by the path an option lives at NOW, so a row
 	// written before that option moved is reported to the console under its current name — and a
@@ -309,6 +339,7 @@ export const writeOverrides = async ({ set = [], clear = [], updatedBy = null } 
 			value: entry.value,
 			updatedBy,
 			note: typeof entry.note === 'string' && entry.note ? entry.note : null,
+			fileHash: fileHashes[entry.path],
 		});
 		written.push(entry.path);
 	}
@@ -344,7 +375,7 @@ export const overrideWatchState = () => ({
  * Seed the fingerprint from the set applied at boot, so the first backstop tick does not see every
  * override as new and re-apply a config that is already correct.
  */
-export const seedOverrideFingerprint = (overrides) => {
+export const seedOverrideFingerprint = (overrides, recorded = null) => {
 	// Only when the watcher has not already applied something. A doorbell can fire between subscribe
 	// and this call — that window is exactly why subscribing happens first — and seeding over its
 	// result would file a NEWER applied set under an OLDER fingerprint. The backstop would then read
@@ -353,14 +384,14 @@ export const seedOverrideFingerprint = (overrides) => {
 	//
 	// Returns whether it seeded, so the caller knows whether its own boot apply is still wanted.
 	if (lastFingerprint !== null) return false;
-	lastFingerprint = fingerprintOverrides(overrides);
+	lastFingerprint = fingerprintOverrides(overrides, recorded);
 	lastReadAt = Date.now();
 	return true;
 };
 
 /**
- * Start watching the override table. Idempotent. `onOverrides(overrides)` is called only when the
- * set has actually changed since the last call.
+ * Start watching the override table. Idempotent. `onOverrides(overrides, recorded)` is called only
+ * when the set (or a row's recorded file hash) has actually changed since the last call.
  *
  * Subscribing happens BEFORE the caller's boot read, deliberately: a write landing between a read
  * and a later subscribe would be caught by neither, and the resulting staleness would persist until
@@ -389,17 +420,17 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 		inFlight = (inFlight ?? Promise.resolve()).then(async () => {
 			if (mine !== generation) return;
 
-			const { overrides, degraded, error } = await readOverrides();
+			const { overrides, recorded, degraded, error } = await readOverrides();
 			lastReadAt = Date.now();
 			lastError = error;
 			if (degraded) return;
 
-			const fingerprint = fingerprintOverrides(overrides);
+			const fingerprint = fingerprintOverrides(overrides, recorded);
 			if (fingerprint === lastFingerprint) return;
 
 			getLogger().info?.(`[prerender] Config overrides changed (${reason}) — reapplying`);
 			try {
-				await onOverrides(overrides);
+				await onOverrides(overrides, recorded);
 				// AFTER the apply, never before. Recording it first means an apply that threw is filed as
 				// done: the backstop then sees "no change" on every subsequent tick and the worker runs
 				// the old config indefinitely, which is precisely the state the backstop exists to end.
@@ -412,11 +443,19 @@ export const startOverrideWatch = async (onOverrides, bootSettings) => {
 		return inFlight;
 	};
 
+	// ARMED DETACHED (util/detach.js). This runs from the subscription's listener, and Harper's
+	// `committed` handler may run it in the async context of the request whose write rang it. A timer
+	// armed there inherits that context, so the re-read, the apply and every timer the apply re-arms
+	// would run on the request's transaction, which Harper closes after the response: the table read
+	// aborts with "Database closed during transaction get". Every console edit is served by some
+	// worker, and that worker is where this can happen.
 	const ring = (reason) => {
 		clearTimeout(debounceTimer);
-		debounceTimer = setTimeout(() => {
-			reread(reason).catch((e) => getLogger().error?.(e));
-		}, DEBOUNCE_MS);
+		debounceTimer = runDetached(() =>
+			setTimeout(() => {
+				reread(reason).catch((e) => getLogger().error?.(e));
+			}, DEBOUNCE_MS)
+		);
 		debounceTimer.unref?.();
 	};
 

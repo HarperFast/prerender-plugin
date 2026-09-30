@@ -19,6 +19,10 @@
  *   nonEmpty  true — an empty string/array is rejected at apply time (default kept).
  *             Reserved for values where empty is catastrophic rather than unwise.
  *   itemType  Display hint for array options ('string' | 'object').
+ *   items     { integer?, min?, max?, not? } — a rule every entry of a list of NUMBERS must meet.
+ *             A list with one entry breaking it is rejected whole at apply time (default
+ *             kept), like `itemEnum`, and for the same reason: it is for lists where a
+ *             rogue entry does harm rather than nothing.
  *   uiEditable
  *             false — the console must refuse to write this option, and says so instead of
  *             offering a control. Inherited by a group's children, like `scope`. Reserved for
@@ -65,7 +69,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 	domains: option(
 		[],
 		'Allowlist of hostnames considered indexable. Pages on other hosts are rendered but ' +
-			'never marked indexable/cached. Empty = allow all.',
+			'never marked indexable/cached. Empty = allow all.\n\n' +
+			'Also the hosts a SITEMAP fetch may send `origin.securityToken` to (and pin to ' +
+			'`origin.staging.ip`), beside the root sitemap\u2019s own host — re-decided on every redirect ' +
+			'hop. A child sitemap on another host of this deployment needs listing here; empty trusts only ' +
+			'the root\u2019s host.',
 		{ itemType: 'string' }
 	),
 
@@ -275,7 +283,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'across them.',
 				{
 					enabled: option(true, 'Emit the periodic unrouted-path report.'),
-					interval: option(5 * MINUTE, 'How often each worker flushes its tally.', { unit: 'ms', min: SECOND }),
+					interval: option(
+						5 * MINUTE,
+						'How often each worker flushes its tally. At most 2147483647 (~24.8 days), Node’s timer ' +
+							'ceiling: past it a timer fires every millisecond rather than never.',
+						{ unit: 'ms', min: SECOND, max: 2147483647 }
+					),
 					maxBuckets: option(200, 'Distinct buckets tracked per class before overflow counting.', { min: 1 }),
 					topN: option(20, 'Buckets listed per log line, highest count first.', { min: 1 }),
 				}
@@ -657,11 +670,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			peerTimeoutMs: option(2500, 'Timeout for the peer-node explainer request.', { unit: 'ms', min: 1 }),
 			scanCap: option(
 				20000,
-				'Ceiling on rows touched by a management scan (the suppressed-target count, the analytics ' +
-					'reads). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
+				'Ceiling on rows touched by a management scan (the suppressed-target count, a sitemap’s ' +
+					'target count; the analytics scan has its own `analytics.scanCap`). Counting is a capped index walk — at 1M+ targets an uncapped count is not a ' +
 					'page-load query — so results past this are reported as truncated rather than silently ' +
-					'undercounted. The queue counts are not scans: they come from the queue keeper.',
-				{ min: 1 }
+					'undercounted. The queue counts are not scans: they come from the queue keeper.\n\n' +
+					'At most 1,000,000, 50x the default. It is editable from the console, and each walk it ' +
+					'bounds runs on a worker that also serves bot traffic. The largest such walk (every ' +
+					'suppressed target) is useful up to about this size; past it the answer is "a lot", and a ' +
+					'truncated count already reports that.',
+				{ min: 1, max: 1_000_000 }
 			),
 			backlogSnapshotInterval: option(
 				15 * MINUTE,
@@ -669,8 +686,9 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'and histogram, plus the table counts, which are scans and so never run on dashboard page load. ' +
 					'Its `overdue` count includes in-flight jobs (their rows keep their past due time until the ' +
 					'render lands). 0 disables the timer; the console’s Recompute button still triggers a one-off ' +
-					'pass.',
-				{ unit: 'ms', min: 0 }
+					'pass. At most 2147483647 (~24.8 days), Node’s timer ceiling: past it a timer fires every ' +
+					'millisecond rather than never, so a large value is not a way to switch this off — 0 is.',
+				{ unit: 'ms', min: 0, max: 2147483647 }
 			),
 			snapshotTableCounts: option(
 				true,
@@ -685,8 +703,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 			pageSize: option(
 				50,
 				'Rows per page for the console’s sitemap-entry and page-cache tables. Also bounds the ' +
-					'per-entry state lookups a sitemap detail performs (point reads, one per row).',
-				{ min: 1 }
+					'per-entry state lookups a sitemap detail performs (point reads, one per row). At most ' +
+					'500, 10x the default: a sitemap page costs two point reads per row, and a page longer than ' +
+					'this is a table nobody reads on one screen.',
+				{ min: 1, max: 500 }
 			),
 			analytics: group(
 				'The console’s Traffic/queue-health charts: ONE bounded primary-key scan of this node’s ' +
@@ -700,8 +720,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						DAY,
 						'Ceiling on the window one analytics request may ask for. The scan cost scales ' +
 							'directly with the window (rows = active metric combos × aggregate periods), so ' +
-							'this is the knob that bounds the worst read an operator can trigger.',
-						{ unit: 'ms', min: MINUTE }
+							'this is the knob that bounds the worst read an operator can trigger. At most 7 days, ' +
+							'7x the default and the console’s longest range (24h). A longer window would be ' +
+							'decided by `scanCap` rather than by the range, and would come back truncated.',
+						{ unit: 'ms', min: MINUTE, max: 7 * DAY }
 					),
 					cacheTtl: option(
 						MINUTE,
@@ -715,8 +737,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Ceiling on rows one analytics scan walks. The walk runs NEWEST-FIRST, so past the ' +
 							'cap it is the oldest end of the window that is shed, and the response reports ' +
 							'the window it actually covered rather than presenting a partial range as the ' +
-							'full one.',
-						{ min: 1000 }
+							'full one.\n\n' +
+							'Memory does not grow with this: each row is folded into its series as it is read, ' +
+							'so a scan holds one accumulator per metric combo, not the rows. What grows is the ' +
+							'time one scan keeps a serving worker busy, which is what the ceiling bounds. At ' +
+							'3,000,000 it is 10x the ~300,000 rows a busy node writes in 24h, which covers the ' +
+							'7-day `maxRange` ceiling at that rate.',
+						{ min: 1000, max: 3_000_000 }
 					),
 				}
 			),
@@ -748,6 +775,24 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'so a fat-fingered budget would time out EVERY cache hit and send all traffic to the origin. ' +
 				'The cap turns that into a rejected value that keeps the default.',
 			{ unit: 'ms', min: 0, max: 2147483647 }
+		),
+		serveLinkHeader: option(
+			false,
+			'Serve the origin document’s `Link` response header with a cached page. OFF until the stored ' +
+				'rows have been sampled — the check below — because what the renderer stores there is not ' +
+				'known to be what a crawler should get.\n\n' +
+				'The renderer keeps the header off the response it rendered so that a canonical or hreflang ' +
+				'alternate declared in HTTP (rather than in the markup) can reach the crawler with the snapshot, ' +
+				'which is what a browser loading the same URL receives. Releases before 0.97.0 stripped it with no ' +
+				'way to turn that off, a rule inherited from a predecessor codebase whose proxy path relayed ' +
+				'the origin’s headers wholesale. But the stored value can also carry the live page’s resource hints ' +
+				'(`preload`, `preconnect` — some of them injected by a CDN, not the origin), and for a render ' +
+				'that followed a client-side redirect it is the SOURCE document’s header, not the page served.\n\n' +
+				'THE CHECK: sample stored pages’ `headers` for `link` and read the `rel` values. Enable this when ' +
+				'they are canonical/alternate entries that match the page; leave it off when they are mostly ' +
+				'resource hints and the edge in front of this plugin acts on them for bot traffic (103 Early ' +
+				'Hints, for example). A proxied (cache-miss) response is unaffected either way — it never ' +
+				'carries `Link`.'
 		),
 	}),
 
@@ -804,6 +849,19 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'invalidated", and failing closed would turn a cosmetic storage fault into a total offload ' +
 					'outage. Set 0 to fail open on the first read error.',
 				{ unit: 'ms', min: 0 }
+			),
+			syncInterval: option(
+				MINUTE,
+				'How often each worker re-reads the invalidation table as a BACKSTOP to its subscription.\n\n' +
+					'Every worker holds the table in memory and the serve path resolves epochs from that copy with no ' +
+					'read at all; a subscription re-reads it the moment any row changes, on any node, so an ' +
+					'invalidation and its undo both reach every worker within about a second. This interval bounds ' +
+					'the one failure the subscription cannot report — delivery stopping silently — to at most this ' +
+					'long of a stale view. It costs one read of a single-digit table per worker per interval, against ' +
+					'the two point reads per cache-servable request the view replaced. While the subscription is ' +
+					'down or the copy has not loaded, the serve path reads the table per request instead, and each ' +
+					'tick also retries the subscription.',
+				{ unit: 'ms', min: SECOND, max: 2147483647 }
 			),
 			maxScopes: option(
 				16,
@@ -1127,9 +1185,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'moves on a schedule — a retailer whose prices change only at its own midnight — this puts ' +
 					'the walk right after the change instead of spreading it over the day, so detection latency ' +
 					'is the pass length rather than up to a cycle, and the corpus is current for the day by the ' +
-					'time the pass ends. No pass runs at boot in this mode (baselines persist; a restart waits ' +
-					'for the anchor). The canary keeps its own cadence, so an off-schedule mass change is still ' +
-					'caught; only the full walk is anchored.\n\n' +
+					'time the pass ends. A restart does not start a pass of its own in this mode (baselines ' +
+					'persist): it RESUMES a pass it cut short from the walk cursor, and CATCHES UP the pass for an ' +
+					'anchor it was down for (no acting pass started since the most recent anchor). An anchor that ' +
+					'fires while another sweep holds the node interrupts a dry run or a reseed, and waits for any ' +
+					'other pass and runs after it — never skipped silently (`probe_anchor`). The canary keeps its ' +
+					'own cadence, so an off-schedule mass change is still caught; only the full walk is anchored.\n\n' +
 					'Switching is safe in every direction and takes effect on the next config apply; a pass ' +
 					'in flight finishes under the rules it started with.',
 				{ enum: ['interval', 'continuous', 'anchored'] }
@@ -1142,9 +1203,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'tail of the old one.',
 				{ nonEmpty: true }
 			),
-			anchorTimezone: option('UTC', 'ANCHORED MODE ONLY: IANA timezone `anchorTime` is interpreted in.', {
-				nonEmpty: true,
-			}),
+			anchorTimezone: option(
+				'UTC',
+				'IANA timezone `anchorTime` (anchored mode) and the `canary.schedule` windows are interpreted in.',
+				{ nonEmpty: true }
+			),
 			anchorWindow: option(
 				0,
 				'ANCHORED MODE ONLY: wall-clock budget the daily pass paces itself to, like `cycleTarget` ' +
@@ -1232,15 +1295,15 @@ export const configSchema = group('Prerender plugin configuration.', {
 			),
 			reprobeAfter: option(
 				12 * HOUR,
-				'Skip a URL whose stored baseline is younger than this. What makes a sweep RESUMABLE: the ' +
-					'walk position is in memory, so a restart mid-pass otherwise re-probes every URL the pass ' +
-					'had already covered — hours of origin requests that can only confirm what is already ' +
-					'stored. With this set, a restarted pass skips that ground in seconds and reaches new work ' +
-					'immediately. Keep it comfortably BELOW `sweepInterval` (half is the default) or the skip ' +
-					'starts eating real passes: a URL probed at the very end of one pass would be skipped by ' +
-					'the next one, and its cadence would silently stretch. 0 disables skipping. The canary ' +
-					'never skips (its whole job is the fast cadence), and a canary-triggered RESEED never ' +
-					'skips (every baseline is known-stale after a mass change).',
+				'RETIRED in v0.97.0 — accepted so existing configs and overrides stay valid, read by nothing. It ' +
+					'skipped a URL whose stored baseline was younger than this, meant to spare a restarted pass the ' +
+					'ground it had covered. But a baseline is only WRITTEN on a change, a seed or a re-baseline — an ' +
+					'unchanged probe writes nothing — so the age test skipped exactly the URLs that had recently ' +
+					'CHANGED and never the quiet ones: a change caught by an off-schedule pass was then skipped by the ' +
+					'next scheduled pass, and a reprice landing in between waited a further full pass. A pass now ' +
+					'skips only URLs written since IT (or the pass it resumes) began, which needs no setting, and an ' +
+					'interrupted anchored pass resumes from its walk cursor. The canary never skipped and still does ' +
+					'not. Remove it from config at leisure.',
 				{ unit: 'ms', min: 0 }
 			),
 			backoffMax: option(
@@ -1341,6 +1404,25 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 				}
 			),
+			renderCheck: option(
+				true,
+				'Check each render against the probe’s last observation of the origin as it lands (rules with the ' +
+					'`pageCheck` price/availability pair only). A page whose claim DISAGREES with the stored endpoint ' +
+					'signature is SUSPECT, and ONE confirming probe of that URL decides: if the origin, asked again, also ' +
+					'disagrees with the page, the page is hard-expired and its render re-filed ahead of rotation, exactly ' +
+					'as a detected change is; if it agrees (the origin moved since the probe last looked, and the render ' +
+					'shows it), the baseline is updated and nothing is expired. It catches a render claimed before a ' +
+					'probe found a change and landing after it, and a render that captured a stale CDN or origin copy — ' +
+					'pages the pass would otherwise not look at again until its next run. No request is made when the ' +
+					'origin is known to have moved since the probe last observed the URL (the most recent anchor in ' +
+					'anchored mode, an active invalidation’s trip): the pass will compare that page itself. One ' +
+					'confirmation per stored observation bounds a page that disagrees every time. The confirming ' +
+					'requests come out of the SAME node-wide `ratePerSecond` budget as the sweep — only the headroom a ' +
+					'running sweep leaves (none while it runs at the ceiling or the origin pushes back; all of it when ' +
+					'no sweep runs) — and are shed, left to the pass, when the next slot is over a minute away. Dry run ' +
+					'counts only and asks nothing. Outcomes are ' +
+					'`probe_render_mismatch`. Costs no read, write or request on a render that agrees.'
+			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
 				min: SECOND,
@@ -1371,11 +1453,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'bootstrap build after a restart uses a cheaper key-order sample until the first sweep ' +
 					'replaces it.)',
 				{
-					interval: option(30 * MINUTE, 'How often the cohort is probed. 0 disables the canary.', {
-						unit: 'ms',
-						min: 0,
-						max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
-					}),
+					interval: option(
+						30 * MINUTE,
+						'How often the cohort is probed — all day, or outside the `schedule` windows when one is set. ' +
+							'0 disables the canary (with a schedule: disables it outside the windows).',
+						{
+							unit: 'ms',
+							min: 0,
+							max: 2147483647, // setInterval's signed-32-bit delay cap — see sweepInterval
+						}
+					),
+					schedule: option(
+						[],
+						'OPTIONAL time-of-day cadence; empty (the default) probes every `interval`, all day. Each entry is ' +
+							'`{ from: "HH:MM", to: "HH:MM", interval: <ms, >= 60000> }` in `anchorTimezone` (the anchor’s zone ' +
+							'and DST handling): inside the window the cohort is probed at its start and then every ' +
+							'`interval`; outside every window, every `canary.interval` (0 = not at all). A window may wrap ' +
+							'midnight; the first one containing an instant applies; an invalid entry is dropped with a ' +
+							'warning.\n\n' +
+							'WHY. On a site that reprices on a schedule a mass change comes at one time of day, and a ' +
+							'500-URL cohort every 30 minutes around the clock is ~24k origin calls per node per day spent ' +
+							'mostly confirming nothing happened. E.g. `interval: 14400000` (4h) with `schedule: [{ from: ' +
+							'"23:50", to: "03:00", interval: 600000 }]` (10 min) probes densely across a midnight reprice ' +
+							'and every 4h elsewhere — ' +
+							'but an OFF-schedule mass change is then seen up to `interval` late, so keep the outside ' +
+							'interval within what that exposure can bear.',
+						{ itemType: 'object' }
+					),
 					count: option(
 						500,
 						'Cohort size per rule per node. At the default threshold this resolves a mass change with ' +
@@ -1662,8 +1766,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				statuses: option(
 					[404, 410],
-					'Origin statuses to keep. Anything else is never stored. 5xx and 429 must never be here: they ' +
-						'are the origin failing to answer, not a statement that the page does not exist.'
+					'Origin statuses to keep. Anything else is never stored. Each entry must be an integer 4xx ' +
+						'other than 429, and a list with any other entry is refused whole (the default is kept). A 5xx ' +
+						'or a 429 is the origin failing to answer, not a statement that the page does not exist, so ' +
+						'storing one would replay an outage to crawlers. A string such as "404" never equals a ' +
+						'status, so it would store nothing.',
+					{ items: { integer: true, min: 400, max: 499, not: [429] } }
 				),
 				freshMs: option(
 					HOUR,
@@ -2061,10 +2169,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'write.',
 			{
 				enabled: option(true, 'Run the periodic schedule-repair sweep.'),
-				interval: option(6 * HOUR, 'How often each node sweeps its own slice of the keyspace.', {
-					unit: 'ms',
-					min: SECOND,
-				}),
+				interval: option(
+					6 * HOUR,
+					'How often each node sweeps its own slice of the keyspace. At most 2147483647 (~24.8 days), ' +
+						'Node’s timer ceiling: past it a timer fires every millisecond rather than never, so a large ' +
+						'value is not a way to switch the sweep off — `enabled: false` is.',
+					{ unit: 'ms', min: SECOND, max: 2147483647 }
+				),
 				startDelay: option(5 * MINUTE, 'Grace after boot before the first sweep.', {
 					unit: 'ms',
 					min: 0,
@@ -2295,7 +2406,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 				maxPerRun: option(
 					5000,
 					'Creates per walk that may take the fast path. Past this, new targets fall back to ' +
-						'full-interval jitter — the bulk-population guard.',
+						'full-interval jitter — the bulk-population guard.\n\n' +
+						'A discovered target\u2019s FIRST listing (a URL minted from traffic that no walk has listed ' +
+						'or unlinked) shares this cap: it is filed due now — or, when a canonical-mismatch or ' +
+						'noindex verdict parked it, its recheck is — and counted `listedSoon` on the refresh result. ' +
+						'A gone-suppressed one is left to `render.suppression.gone.reopen`.',
 					{ min: 0 }
 				),
 			}
@@ -2329,6 +2444,70 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'a bad purge, a half-applied delete, a botched migration. Without a periodic full pass a ' +
 						'corpus could drift for as long as the origin left its sitemaps untouched and nothing ' +
 						'would notice. Set it to 0 to make every fetch unconditional (the pre-0.69.0 behaviour).',
+					{ unit: 'ms', min: 0 }
+				),
+			}
+		),
+		shrinkGuard: group(
+			'A circuit breaker on a sitemap that arrives much shorter than the one last accepted — the ' +
+				'partial but well-formed document: a generator that died mid-build and still closed its root, ' +
+				'an edge serving a stale partial object, an index that left out a child it failed to build. (A ' +
+				'body cut off mid-document is refused earlier, by the parse: its root is never closed.) Accepted, ' +
+				'such a document presents every URL it lost as departed — hard-expired and re-rendered on an armed ' +
+				'departure check — and every one of them rejoins, and renders again, when the origin recovers.\n\n' +
+				'THREE CHECKS, ALL ON WHAT THE ORIGIN SENT, NONE ON WHAT MOVED: (1) a urlset whose entry count fell ' +
+				'below `(1 - maxRatio)` of its stored `entryCount`, by at least `minUrls`; (2) a child its index ' +
+				'stopped listing that still holds, AFTER the walk, at least `minUrls` URLs listed nowhere else and ' +
+				'more than `maxRatio` of what it held; (3) an index whose dropped children together hold that much ' +
+				'of everything its children held. URLs that merely move — forward shear across fixed-size children, ' +
+				'a cache-key rule re-keying a child, children renamed each build — are never counted: (2) and (3) ' +
+				'measure URLs listed nowhere after the walk, not child names.\n\n' +
+				'A refused document or dropped child is a FAILED child: its row and its targets stay exactly as the ' +
+				'last good fetch left them, and the held URLs on its routes are held back rather than departed ' +
+				'(`departure_relinked`). Refusals count `shrink_refused`.\n\n' +
+				'ACCEPTED ONLY ONCE IT OUTLIVES A REBUILD. A refused shorter document is believed when it has been ' +
+				'refused at least `acceptAfter` times AND it survived a NEW origin version (a changed `Last-Modified` ' +
+				'or content — for a dropped child, its index\u2019s) arriving at least `newVersionAfter` after the ' +
+				'first refusal, or `acceptAge` has passed since it was first refused. Counting walks alone accepted a ' +
+				'bad nightly build after a few walks of the same day, before the next rebuild could fix it. An ' +
+				'acceptance is logged at error and counted `shrink_accepted`; what it departs is metered like every ' +
+				'other departure, by `sitemap.departure.maxPerWalk`. `maxRatio: 1` disables the guard.',
+			{
+				maxRatio: option(
+					0.5,
+					'Largest share of what it last held a document may lose in one fetch. 1 disables the guard. 0.5 ' +
+						'because real churn is nowhere near it — a mature catalog child gains and loses a few percent a ' +
+						'day — while a truncated or partial document typically loses most of itself.',
+					{ min: 0, max: 1 }
+				),
+				minUrls: option(
+					1000,
+					'Nothing smaller than this many lost URLs is refused, by any of the three checks — so a small ' +
+						'child or index the site legitimately empties is never held back. Sized well above real ' +
+						'per-child churn (tens a day on a mature catalog) and well below what a truncated or missing ' +
+						'product child loses (tens of thousands).',
+					{ min: 0 }
+				),
+				acceptAfter: option(
+					2,
+					'Refusals of a shorter document before it may be accepted at all — the floor under `acceptAge` ' +
+						'and the new-version rule, so one odd fetch (an edge answering with a different ' +
+						'`Last-Modified` for the same object) is never mistaken for a rebuild.',
+					{ min: 1 }
+				),
+				acceptAge: option(
+					48 * HOUR,
+					'Accept a refused shorter document that has stayed refused this long since its first refusal, ' +
+						'even if the origin never published a new version of it. 48h: past two nightly rebuilds, so a ' +
+						'generator that failed one build has had two chances to fix it; a shrink still there is real.',
+					{ unit: 'ms', min: 0 }
+				),
+				newVersionAfter: option(
+					20 * HOUR,
+					'How long after the first refusal a NEW origin version must arrive to count as the rebuild that ' +
+						'confirms a shrink. A touch or re-publish of the same bad build bumps `Last-Modified` within ' +
+						'hours, and a partial that varies from fetch to fetch changes its digest every walk; neither is ' +
+						'the next build. 20h: past the same day\u2019s walks, short of a nightly rebuild.',
 					{ unit: 'ms', min: 0 }
 				),
 			}
@@ -2385,6 +2564,28 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'nothing — every candidate is still decided and reported.',
 					{ min: -1 }
 				),
+				maxPerWalk: option(
+					5000,
+					'Most departures one walk may DECIDE, across every child sitemap at once, or -1 for no ceiling. ' +
+						'Past it, departed URLs are DEFERRED, not dropped: each is put back on the child that unlinked ' +
+						'it, whose validator is cleared so the next walk re-prunes it and offers them again ' +
+						'(`departure_deferred`, and a `budget` entry in the progress row\u2019s `holdBack`).\n\n' +
+						'WHY. `sitemap.shrinkGuard` refuses a document that lost more than `maxRatio` of itself; a ' +
+						'well-formed partial build that lost less — in one child or in all of them — is not refused, ' +
+						'and without this every URL it dropped would depart in one walk and rejoin, all of it, when the ' +
+						'origin recovered. Metered, a mass event spreads over several walks, and a recovery inside that ' +
+						'time turns the deferred URLs back into listed ones that never departed. Only URLs still ' +
+						'unattributed once the walk is over count: shear the walk already re-attached never does.\n\n' +
+						'HOW IT DIFFERS FROM `maxActions`: that cap is lossy — its overflow never gets its departure ' +
+						'action — and bounds how many actions run; this one is lossless and bounds how fast departures ' +
+						'are believed. Only HELD URLs can be deferred, so it needs `maxCandidates` at least as large. ' +
+						'5000: comfortably above a mature catalog\u2019s daily departures spread over its walks, and a ' +
+						'small fraction of what a missing or half-built product child sheds. The budget goes ROUND-ROBIN across ' +
+						'the children that unlinked them, so one child\u2019s mass event cannot hold every other child\u2019s ' +
+						'departures back. The deferral re-links for real even under `dryRun` — it undoes the walk\u2019s own ' +
+						'unlink, as the failed-child re-link does.',
+					{ min: -1 }
+				),
 				maxCandidates: option(
 					50000,
 					'Ceiling on departed URLs HELD for the post-walk check, or -1 for no ceiling. Separate from ' +
@@ -2397,7 +2598,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'Overflow is DROPPED FOR GOOD, for the same reason as `maxActions` overflow: the URL is ' +
 						'already unlinked, so no later walk offers it again. It is never decided and never appears ' +
 						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
-						'removes the ceiling and never reports `capped`; 0 collects nothing.',
+						'removes the ceiling and never reports `capped`; 0 collects nothing.\n\n' +
+						'The same list is what a walk with a FAILED child draws on to re-link (`departure_relinked`) ' +
+						'the URLs that could have moved into it — those on a route it held at its last parse — ' +
+						'instead of departing them, so it also bounds that, and an arrival-only deployment holds up ' +
+						'to this many for the re-link alone.',
 					{ min: -1 }
 				),
 			}
@@ -2497,10 +2702,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'How often each node re-resolves queue state on worker 0. The recompute scans nothing — ' +
 				'empty/queued/unready comes from the queue keeper. This interval governs how fast a ' +
 				'replicated pause/resume intent (QueueControl) converges onto a node, how often the QueueStatus ' +
-				'row is broadcast, and how often the lease gauge is reconciled.',
+				'row is broadcast, and how often the lease gauge is reconciled. At most 2147483647 (~24.8 days), ' +
+				'Node’s timer ceiling: past it a timer fires every millisecond rather than never.',
 			{
 				unit: 'ms',
 				min: SECOND,
+				max: 2147483647,
 			}
 		),
 		maxClaimLimit: option(
@@ -2514,7 +2721,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'Lease slots in the node-local shared buffer that records which keys are currently being ' +
 				'rendered.\n\n' +
 				'Sizing: a 10-minute lease at 12,000 renders/hour is about 2,000 leases in flight fleet-wide, ' +
-				'so ~500 per node on four nodes; 4,096 slots × 20 bytes is 80KB. A claim that cannot record ' +
+				'so ~500 per node on four nodes; 4,096 slots × 32 bytes is 128KB. A claim that cannot record ' +
 				'a lease does NOT grant the job (a granted-but-unrecorded job is a double render), so an ' +
 				'undersized table shows up as claims granting fewer jobs than asked, with a warning naming the ' +
 				'occupancy.\n\n' +
@@ -2561,9 +2768,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'it were already this many of its own intervals late. The probe hard-expires such a page and ' +
 						'files its render at the current minute, so without a head start it would enter at lateness ' +
 						'zero, behind every overdue row, while bots are served the origin for as long as it waits.\n\n' +
+						'IN BOOSTED UNITS (since v0.97.0): the head start is multiplied by `sitemapBoost`, as a sitemap ' +
+						'row’s lateness is, so a page found changed a minute ago outranks every routine row less than ' +
+						'this many cadences late, sitemap-listed or not (a discovered one, less than this times the ' +
+						'boost). Unboosted, a sitemap row half a cadence late already outranked it at the default boost.\n\n' +
 						'ADDITIVE, and bounded: a routine row still wins once it is more than `changedHeadStart` ' +
 						'cadences later than the changed rows being held, so a large change wave takes the fleet for ' +
 						'a while, never indefinitely. `0` ranks changed pages like any other due row.',
+					{ min: 0 }
+				),
+				urgentHeadStart: option(
+					0.5,
+					'The same kind of head start, for a row filed due now by a SINGLE ASK rather than a detected ' +
+						'change: a render-now, an admin revalidate or rejoin of one URL, the destination of a permanent ' +
+						'redirect whose source was just retired, a URL a sitemap lists for the first time ' +
+						'(`RenderSchedule.urgentAt`). Filed at the current minute such a row is zero cadences late, so ' +
+						'without this it ranked behind every overdue row — and past `capacity` routine rows, was not ' +
+						'published at all. Bulk re-files (a revalidate over a collection, a sitemap walk with ' +
+						'`revalidate: true`) are not asks and are not marked.\n\n' +
+						'HALF OF `changedHeadStart` BY DEFAULT, on purpose. A changed page is hard-expired and answered ' +
+						'from the origin while it waits; an asked-for page is usually still served from the cache. So a ' +
+						'change must outrank an ask of the same lateness — and at 0.5 against 1 it does, and outranks ' +
+						'any ask filed less than half a cadence before it — while an ask still outranks routine rows ' +
+						'less than half a cadence late (sitemap-listed; a discovered one, less than half a cadence times ' +
+						'the boost). Keep it below `changedHeadStart`: at equal values an ask filed two hours before a ' +
+						'change outranks it. In boosted units and bounded exactly as `changedHeadStart` is. A row that ' +
+						'is also marked changed takes `changedHeadStart`; the two are not added. `0` ranks such rows ' +
+						'like any other due row, which is the pre-0.97.0 behaviour.',
 					{ min: 0 }
 				),
 				changedDemand: option(
@@ -2625,6 +2856,37 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'backlog snapshot. Walks every occupied minute of every class, so it runs apart from the ' +
 						'publish, which only takes the head of the queue.',
 					{ unit: 'ms', min: 1000, max: 2147483647 }
+				),
+			}
+		),
+		dueNowForward: group(
+			'FORWARD A "RENDER THIS NOW" TO THE ROW’S OWNER (v0.97.0). Every render-now, revalidate, admin ' +
+				'rejoin and change-probe filing goes through one write that must never DEMOTE a row: a row ' +
+				'already due keeps its due time, and a change mark keeps its first instant. That needs the row, ' +
+				'and the row lives only on its residency owner — on any other node (about three in four on a ' +
+				'four-node cluster) the local read sees nothing, and the whole-row write that replicates to the ' +
+				'owner REPLACED its row: an overdue row pushed back to the current minute, its change mark and ' +
+				'demand estimate wiped.\n\n' +
+				'So a node that does not own the row asks the owner to file it (`POST /prerender_peer/due-now`), ' +
+				'where the read is authoritative, and writes nothing itself. The owner never forwards onward. ' +
+				'If the owner refuses or cannot be reached, the write is made locally exactly as before — never ' +
+				'worse than without this — and that owner is not asked again for 30 seconds, so a peer that is ' +
+				'down costs a bulk revalidate one timeout, not one per row. A SLOW answer is not a refusal: the ' +
+				'owner may have filed it, and a local write landing after that filing would wipe what it kept. ' +
+				'So a plain ask that times out is left to the owner (the worst case is one ask lost to a lost ' +
+				'request), and only one carrying a change mark — whose loss leaves a page known wrong on the ' +
+				'origin for a cadence — is written locally. Counted as `prerender_ops` `due_now_forward`.\n\n' +
+				'REQUIRES `peerRescue.token` and `peerRescue.header` (the shared cluster secret the peer ' +
+				'endpoints already use). With either unset this is inert and the endpoint answers 404.',
+			{
+				enabled: option(true, 'Forward when the peer token is configured. Off files every row locally, as before.'),
+				timeoutMs: option(
+					1000,
+					'Deadline for one forwarded filing. Past it, an ask carrying a change mark is filed locally and ' +
+						'any other is left to the owner (see above). Short, because a render-now waits on it: the bot ' +
+						'is held for the render, and this sits in front of it. Capped at the 32-bit signed maximum ' +
+						'because it reaches `setTimeout`.',
+					{ unit: 'ms', min: 1, max: 2147483647 }
 				),
 			}
 		),
@@ -2961,7 +3223,18 @@ export const describeConfigSchema = () => {
 		if (isOption(node)) {
 			const out = { kind: 'option', type: typeOf(node.default), description: node.description, scope };
 			out.default = clone(node.default);
-			for (const key of ['enum', 'itemEnum', 'unit', 'min', 'max', 'nonEmpty', 'itemType', 'secret', 'movedFrom']) {
+			for (const key of [
+				'enum',
+				'itemEnum',
+				'items',
+				'unit',
+				'min',
+				'max',
+				'nonEmpty',
+				'itemType',
+				'secret',
+				'movedFrom',
+			]) {
 				if (node[key] !== undefined) out[key] = node[key];
 			}
 			// Resolved rather than raw: the console renders a control from this, so it must not have to
@@ -2981,6 +3254,40 @@ export const describeConfigSchema = () => {
 	};
 	return describe(configSchema, 'live', true);
 };
+
+/**
+ * The entries of a list that break the option's `items` rule; empty when all pass or there is no
+ * rule. Shared by the apply-time constraint pass and the override door, so the two cannot disagree.
+ */
+export const invalidItems = (node, list) => {
+	const rule = node?.items;
+	if (!rule || !Array.isArray(list)) return [];
+	return list.filter(
+		(entry) =>
+			typeof entry !== 'number' ||
+			!Number.isFinite(entry) ||
+			(rule.integer && !Number.isInteger(entry)) ||
+			(rule.min !== undefined && entry < rule.min) ||
+			(rule.max !== undefined && entry > rule.max) ||
+			(Array.isArray(rule.not) && rule.not.includes(entry))
+	);
+};
+
+/** An `items` rule as the reason a refusal gives. */
+export const describeItemRule = (rule) =>
+	[
+		rule.integer ? 'an integer' : 'a number',
+		rule.min !== undefined && rule.max !== undefined
+			? `from ${rule.min} to ${rule.max}`
+			: rule.min !== undefined
+				? `>= ${rule.min}`
+				: rule.max !== undefined
+					? `<= ${rule.max}`
+					: null,
+		Array.isArray(rule.not) && rule.not.length ? `other than ${rule.not.join(', ')}` : null,
+	]
+		.filter(Boolean)
+		.join(' ');
 
 /**
  * May the console write this path, and if not, why not?
