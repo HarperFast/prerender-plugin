@@ -610,6 +610,19 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 			return children;
 		}
 		run.addUnchangedUrlset(sitemapUrl);
+		// A 304 is the version last ACCEPTED — a refused fetch never stores its validator — so any shrink
+		// state on the row is over: a refusal the origin has since undone, or a dropped child the index
+		// lists again. Left on, a later refusal would count from the stale first one (and be accepted at
+		// once), and a stale `shrinkAcceptedAt` would skip the guard if the index ever dropped it again.
+		if (stored && (numberOf(stored.shrinkRefusals) > 0 || Number.isFinite(dateColumnMs(stored.shrinkAcceptedAt)))) {
+			await Sitemap.patch(sitemapUrl, {
+				url: sitemapUrl,
+				shrinkRefusals: null,
+				shrinkRefusedVersion: null,
+				shrinkRefusedAt: null,
+				shrinkAcceptedAt: null,
+			});
+		}
 		return [];
 	}
 
@@ -1437,8 +1450,17 @@ async function failureScope(url, parentUrl) {
 	return current ? { routes } : { routes, ...orSiblings };
 }
 
-/** Were this row's `routes` computed under today's route table? A row stored before the fingerprint: no. */
-const routesAreCurrent = (row) => row?.routesFingerprint === routeTableFingerprint();
+/**
+ * Were this row's `routes` computed under today's route table? A row stored before the fingerprint
+ * existed is TRUSTED, as every earlier version did: otherwise, right after an upgrade, every row would
+ * read stale, one child that kept failing would hold back its siblings' departures for as long as it
+ * failed (it never parses, so it is never stamped), and every walk would refetch every unchanged child.
+ * Rows are stamped at their next full parse, so an edit made after that is caught.
+ */
+const routesAreCurrent = (row) =>
+	row?.routesFingerprint === undefined || row?.routesFingerprint === null
+		? true
+		: row.routesFingerprint === routeTableFingerprint();
 
 /**
  * The held URLs any of this walk's failed documents could have received (see `processDepartures`), and
@@ -1453,13 +1475,15 @@ async function heldBlockedByFailures(run) {
 	const scopes = [];
 	for (const { url, parentUrl } of run.failedChildren())
 		scopes.push({ url, scope: await failureScope(url, parentUrl) });
-	const covers = (scope, url, sitemapUrl) =>
+	const covers = (scope, key, sitemapUrl) =>
 		scope.all ||
-		scope.routes?.has(routeKeyOf(url)) ||
+		scope.routes?.has(key) ||
 		(scope.siblingsOf !== undefined && run.parentOf(sitemapUrl) === scope.siblingsOf);
 	for (const { url, sitemapUrl } of held) {
+		// The key once per URL, not once per failed scope: classification and its JSON key are the cost here.
+		const key = routeKeyOf(url);
 		for (const { url: failedUrl, scope } of scopes) {
-			if (!covers(scope, url, sitemapUrl)) continue;
+			if (!covers(scope, key, sitemapUrl)) continue;
 			blocked.add(url);
 			blockers.set(failedUrl, (blockers.get(failedUrl) ?? 0) + 1);
 		}

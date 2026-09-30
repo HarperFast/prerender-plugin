@@ -465,3 +465,11 @@ test('with nothing departed and nothing held, the Departures card says so', asyn
 	const ctx = await ready();
 	assert.match(textOf(ctx), /No departures decided in the last 24h, and nothing held back/);
 });
+
+test('a held-back row says how long ago it started, not NaN', async () => {
+	const ctx = makeCtx({ analytics: DEPARTURES, list: async () => ({ ok: true, body: HOLDING }) });
+	await load(ctx);
+	const text = textOf(ctx);
+	assert.doesNotMatch(text, /NaN/);
+	assert.match(text, /2h ago|2 h ago|hours? ago/);
+});

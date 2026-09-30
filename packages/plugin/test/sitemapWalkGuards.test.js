@@ -581,6 +581,36 @@ test('a dropped child accepted once drains under the budget without being accept
 	assert.equal(sitemapRows.has(C2), false);
 });
 
+// Final review: a 304 is the version last accepted, so shrink state left on the row is stale.
+test('a 304 clears a refusal the origin has since undone', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+	lastMod[C1] = MON;
+	const full = { [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) };
+	await walk(full);
+	lastMod[C1] = TUE;
+	assert.equal((await walk({ [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) })).shrinkRefused, 1);
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, 1);
+	lastMod[C1] = MON; // the origin serves the accepted version again: its validator answers 304
+	const back = await walk(full);
+	assert.equal(back.notModified >= 1, true);
+	assert.equal(sitemapRows.get(C1).shrinkRefusals ?? null, null, 'cleared');
+	assert.equal(sitemapRows.get(C1).shrinkRefusedAt ?? null, null);
+});
+
+// Final review: right after an upgrade no row has a fingerprint. Reading them all as stale would let one
+// child that keeps failing hold back every sibling's departures for as long as it failed.
+test('a row stored before the route fingerprint existed is trusted for its routes', async () => {
+	const CATALOG = `${HOST}/sitemap_catalog.xml`;
+	const cat = (n) => `${HOST}/catalog/c-${n}`;
+	configure({ routes: [PRODUCT_ROUTE, { match: 'prefix', path: '/catalog/' }] });
+	await walk({ [ROOT]: index(C1, CATALOG), [C1]: urlset(P(1), P(2)), [CATALOG]: urlset(cat(1)) });
+	for (const row of sitemapRows.values()) delete row.routesFingerprint; // as stored by an older plugin
+	// P(2) really leaves; the CATALOG child fails. Its stored routes are catalog only, so P(2) departs.
+	const result = await walk({ [ROOT]: index(C1, CATALOG), [C1]: urlset(P(1)) });
+	assert.equal(result.failed.length, 1);
+	assert.equal(result.departures.outcomes.render, 1, 'not held back behind an unrelated failure');
+});
+
 // Round-3 item 4: a hold-back must never be silent. The result (and the progress row it feeds) names each
 // child departures are held back for, why, since when, and when a refusal can be accepted.
 test('the result names a refused shrink it holds back, with since when and when it can be accepted', async () => {

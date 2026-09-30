@@ -1785,7 +1785,8 @@ function safetyCard(ctx) {
 				stat(
 					'Render check',
 					fmtCount(rechecked),
-					`re-probed · ${num(check('confirmed'))} confirmed stale · ${num(check('cleared'))} cleared`
+					`re-probed · ${num(check('confirmed'))} confirmed stale · ${num(check('cleared'))} cleared · ` +
+						`${num(check('recheck_failed') + check('recheck_inconclusive') + check('error') + check('superseded'))} inconclusive`
 				),
 				stat(
 					'Not re-probed',

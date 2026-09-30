@@ -640,7 +640,9 @@ function departuresCard(ctx, roots) {
 	const deferred = departure('deferred');
 	const skipped = departure('suppressed') + departure('route_opted_out') + departure('target_gone');
 	const capped = departure('capped');
-	const lostOther = departure('relink_error') + departure('unknown_child') + departure('failed');
+	// URLs only: `departure_failed` counts failed departure CHECKS (one per walk), not URLs, so it is named apart.
+	const lostOther = departure('relink_error') + departure('unknown_child');
+	const checkFailed = departure('failed');
 	const refused = totalOf('shrink_refused');
 	const accepted = totalOf('shrink_accepted');
 	const holds = roots.flatMap((root) =>
@@ -660,7 +662,7 @@ function departuresCard(ctx, roots) {
 		el('tr', null, [
 			el('td', { cls: 'mono truncate', text: shortPath(hold.sitemapUrl) ?? hold.sitemapUrl, title: hold.sitemapUrl }),
 			el('td', { text: HOLD_REASON[hold.reason] ?? hold.reason, title: hold.detail ?? '' }),
-			el('td', { text: when(hold) ? ago(when(hold)) : '—' }),
+			el('td', { text: Number.isFinite(Date.parse(when(hold))) ? ago(Date.parse(when(hold))) : '—' }),
 			el('td', {
 				cls: 'right mono',
 				text: Number.isFinite(hold.deferred)
@@ -698,9 +700,12 @@ function departuresCard(ctx, roots) {
 				stat('Held back', fmtCount(relinked), 'a child they could move into failed'),
 				stat('Deferred', fmtCount(deferred), 'past the walk budget, next walk'),
 				stat('Skipped', fmtCount(skipped), 'suppressed · no action · gone'),
-				stat('Lost', fmtCount(capped + lostOther), `${num(capped)} capped · ${num(lostOther)} failed`, {
-					bad: capped + lostOther > 0,
-				}),
+				stat(
+					'Lost',
+					fmtCount(capped + lostOther),
+					`${num(capped)} capped · ${num(lostOther)} re-link failed${checkFailed ? ` · check failed ${num(checkFailed)}×` : ''}`,
+					{ bad: capped + lostOther + checkFailed > 0 }
+				),
 				stat('Shrinks refused', fmtCount(refused), 'much shorter than the last accepted'),
 				stat('Shrinks accepted', fmtCount(accepted), 'a real shrink landed', { warn: accepted > 0 }),
 			]),
