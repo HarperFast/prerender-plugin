@@ -1402,3 +1402,31 @@ test('a change drop, then a kept ask, then two fast-lane failures: the key is no
 	}
 	assert.equal((await claim()).length, 1, 'granted again, not held back');
 });
+
+test('a mark filed a moment before its grant, in the same second, is BEFORE the render — not during it', async (t) => {
+	// A change or ask filed due now is typically granted 0.2-1.5 s later. With the grant floored to its
+	// second, one granted inside the mark's own second read as earlier than the mark, and a correct first
+	// render of a changed page was dropped (23.6% of marks made strictly before their grant).
+	const clock = fakeClock(t);
+	clock.now = Math.floor(clock.now / 1000) * 1000 + 100;
+	seedUrlRow();
+	const changedAt = clock.now;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	clock.now += 300; // granted at .400 of the same second
+	await claim();
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>the new price</html>'), rendered('mobile')]);
+	assert.deepEqual(outcomes(), [['rendered', 'stored']], 'stored, not dropped as changed-during-render');
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>the new price</html>');
+
+	seedUrlRow({ url: B });
+	stores.renderSchedule.set(B, {
+		...stores.renderSchedule.get(B),
+		urgentAt: (clock.now = Math.floor(clock.now / 1000) * 1000 + 1_100),
+	});
+	clock.now += 300;
+	await claim();
+	clock.now += 3_000;
+	await postVariants(B, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(stores.renderSchedule.get(B).urgentAt, undefined, 'an ask filed before the grant is answered by it');
+});

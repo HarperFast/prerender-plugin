@@ -45,11 +45,11 @@ const harness = ({ slots = SLOTS, now = 1_700_000_000_000 } = {}) => {
 test('the buffer layout is header + fixed-size slots', () => {
 	// One header word: the occupancy gauge.
 	assert.equal(LEASE_HEADER_BYTES, 4);
-	// Seven slot words: hash lo/hi, expiry, due minute, the miss count, and the latest grant's instant and
-	// due minute.
-	assert.equal(LEASE_SLOT_BYTES, 28);
-	assert.equal(leaseBufferBytes(4096), 4 + 28 * 4096);
-	assert.equal(leaseBufferBytes(4096), 114_692, 'the documented 112KB sizing');
+	// Eight slot words: hash lo/hi, expiry, due minute, the miss count, and the latest grant's second, due
+	// minute and millisecond.
+	assert.equal(LEASE_SLOT_BYTES, 32);
+	assert.equal(leaseBufferBytes(4096), 4 + 32 * 4096);
+	assert.equal(leaseBufferBytes(4096), 131_076, 'the documented 128KB sizing');
 });
 
 // ---- the all-zero buffer ----
@@ -292,20 +292,20 @@ test('grantOf names the latest real grant, and still does once it is released or
 	const key = 'https://www.example.com/a';
 	assert.equal(table.grantOf(key), null, 'never granted');
 	table.grant(key, { dueMinute: 3, leaseExpiryMs: t + MINUTE });
-	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_000, dueMinute: 3, live: true, released: false });
+	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_500, dueMinute: 3, live: true, released: false });
 	table.release(key);
-	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_000, dueMinute: 3, live: false, released: true });
+	assert.deepEqual(table.grantOf(key), { grantedAtMs: 1_700_000_000_500, dueMinute: 3, live: false, released: true });
 	t += 2 * MINUTE;
 	table.grant(key, { dueMinute: 5, leaseExpiryMs: t + MINUTE });
 	t += 2 * MINUTE; // expired with no result
 	assert.deepEqual(table.grantOf(key), {
-		grantedAtMs: 1_700_000_120_000,
+		grantedAtMs: 1_700_000_120_500,
 		dueMinute: 5,
 		live: false,
 		released: false,
 	});
 	table.hold(key, t + MINUTE, 5);
-	assert.equal(table.grantOf(key).grantedAtMs, 1_700_000_120_000, 'a hold is not a grant');
+	assert.equal(table.grantOf(key).grantedAtMs, 1_700_000_120_500, 'a hold is not a grant');
 });
 
 test('a generation-checked release gives up only the lease granted then — never a re-grant since', () => {
@@ -510,4 +510,35 @@ test('a size mismatch derives the slot count from the buffer instead of indexing
 	const table = createLeaseTable({ buffer, slots: 4096, now: () => 1_700_000_000_000 });
 	assert.equal(table.slots, 4);
 	assert.equal(table.grant('a|desktop', { dueMinute: 1, leaseExpiryMs: 1_700_000_060_000 }), true);
+});
+
+test('the grant instant is exact to the millisecond — a mark in the same second is not "after" it', () => {
+	// Floored to its second, a grant at .400 read as .000, before a mark filed at .100 — and the result path
+	// dropped that correct render as changed-during-render.
+	const t = 1_700_000_050_400;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	table.grant('https://www.example.com/ms', { dueMinute: 1, leaseExpiryMs: t + MINUTE });
+	assert.equal(table.grantOf('https://www.example.com/ms').grantedAtMs, t);
+	assert.equal(
+		table.release('https://www.example.com/ms', { grantedAtMs: t - 400 }),
+		false,
+		'the second alone is not the grant'
+	);
+	assert.equal(table.release('https://www.example.com/ms', { grantedAtMs: t }), true);
+});
+
+test('a leftDue release CARRIES the miss count — it neither counts a miss nor resets the count', () => {
+	let t = 1_700_000_000_000;
+	const table = createLeaseTable({ buffer: new ArrayBuffer(leaseBufferBytes(SLOTS)), slots: SLOTS, now: () => t });
+	const key = 'https://www.example.com/carried';
+	for (let i = 0; i < 3; i++) {
+		table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+		t += 2 * MINUTE; // expired with no result
+	}
+	assert.equal(table.missesBeforeGrant(key, 7), 3);
+	table.grant(key, { dueMinute: 7, leaseExpiryMs: t + MINUTE });
+	table.release(key, { grantedAtMs: table.grantOf(key).grantedAtMs, leftDue: true });
+	t += 6_000;
+	assert.equal(table.missesBeforeGrant(key, 7), 3, 'the same minute: not a commit that failed');
+	assert.equal(table.missesBeforeGrant(key, 9), 3, 'another minute: not a result that proved the key healthy');
 });

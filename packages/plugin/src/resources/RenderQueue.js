@@ -230,8 +230,8 @@ const readResultState = async (url) => {
 
 /**
  * How much earlier than a key's latest grant a result's render must provably have begun before it is
- * treated as another lease's (see `processJobResult`). The grant instant is floored to the second and a
- * renderer's timing comes off its own clock; the slack absorbs both, and costs detection only for a
+ * treated as another lease's (see `processJobResult`). A renderer's timing comes off its own clock and
+ * leaves out what it does around a render; the slack absorbs that, and costs detection only for a
  * render that began within it of the re-grant — which a lease of at least two minutes all but rules out.
  */
 const LEASE_GENERATION_SLACK_MS = 5_000;
@@ -767,10 +767,15 @@ export class RenderQueue extends Resource {
 		// lease released so the page renders again at once. It cannot loop: the next grant is after the
 		// mark, whose first instant `fileDueNow` keeps.
 		//
-		// The grant is the lease's, floored to its second — a lower bound, so this errs toward one wasted
-		// render, never toward a stored stale page — or, with no lease slot to ask, the latest instant the
-		// render can have begun. Only for a job that writes the URL row: a one-device render beside the
-		// rotation neither reads nor clears its mark.
+		// The grant is the lease's, TO THE MILLISECOND — or, with no lease slot to ask, the latest instant
+		// the render can have begun. Exact rather than floored to its second, because a mark filed due now
+		// is typically granted 0.2-1.5 s later, often inside the same second: floored, the grant read as
+		// before the mark and a correct first render of a changed page was dropped (23.6% of marks made
+		// strictly before their grant). Exactness cannot let a stale render through: the renderer fetches
+		// the document seconds AFTER the grant (it launches, paces and navigates first), so a render whose
+		// grant is even a millisecond after the mark fetched a document the origin had already changed.
+		// Only for a job that writes the URL row: a one-device render beside the rotation neither reads nor
+		// clears its mark.
 		const rowState = job.fold ? await readResultState(url) : { marks: {} };
 		const { marks } = rowState;
 		const grantedBy = Math.min(grant?.grantedAtMs ?? Infinity, startedBy ?? Infinity);
