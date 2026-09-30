@@ -334,8 +334,8 @@ test("a cache serve drops the origin document's validators and carries Last-Modi
 	assert.equal(res.status, 200);
 	assert.equal(
 		res.headers.get('etag'),
-		`W/"${new Date('2026-09-29T10:00:00Z').getTime()}"`,
-		'the stored ETag is the ORIGIN document’s; the snapshot’s names its render'
+		`W/"${new Date('2026-09-29T10:00:00Z').getTime()}-desktop"`,
+		'the stored ETag is the ORIGIN document’s; the snapshot’s names its render and device'
 	);
 	assert.equal(res.headers.get('last-modified'), new Date('2026-09-29T10:00:00Z').toUTCString());
 });
@@ -417,7 +417,7 @@ test('a TRUE miss keeps ordinary conditional handling: its validators came from 
 });
 
 test('the snapshot ETag revalidates the exact render: 304 for it, 200 once the page re-renders', async () => {
-	const tag = `W/"${new Date('2026-09-29T10:00:00Z').getTime()}"`;
+	const tag = `W/"${new Date('2026-09-29T10:00:00Z').getTime()}-desktop"`;
 	pageGet = async () => cachedPage();
 	assert.equal((await handleBotRequest(request('/desktop/p/cached', 'GET', { 'if-none-match': tag }))).status, 304);
 	// Re-rendered 400 ms later — the same HTTP-date second. If-Modified-Since would call this unchanged.

@@ -91,12 +91,13 @@ const appendOne = (headers, key, value) => {
  * unchanged origin ETag answered the crawler's next conditional request 304, and the crawler kept
  * the old snapshot while every signal said a fresh page was being served. So a snapshot carries
  * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, and the ETag is a
- * weak tag of that same instant, `W/"<lastCachedMs>"` — both move on every render. (No content hash
+ * weak tag of that same instant and the device, `W/"<lastCachedMs>-<deviceType>"` — both move on
+ * every render. (No content hash
  * is stored, and hashing ~220 KB per request is not cheap; a render stamp is exact for "is this the
  * render you hold".) A raw-cache document is the origin's bytes verbatim, so it keeps the origin's
  * validators.
  */
-export function buildResponseHeaders(resource, snapshot = false) {
+export function buildResponseHeaders(resource, snapshot = false, deviceType = resource.deviceType) {
 	const headers = new Headers();
 	const upstreamHeaders = headersToObject(resource.headers);
 	const serveLink = config.page.serveLinkHeader;
@@ -120,8 +121,12 @@ export function buildResponseHeaders(resource, snapshot = false) {
 			// A version tag, weak because it names the render rather than hashing its bytes: it changes on
 			// every render and on nothing else. `If-None-Match` takes precedence over `If-Modified-Since`,
 			// so a crawler holding it revalidates against the exact render, not a one-second HTTP date that
-			// two renders can share and that another node's clock stamped.
-			headers.set('etag', `W/"${lastCachedMs}"`);
+			// two renders can share and that another node's clock stamped. THE DEVICE IS PART OF IT: one
+			// render job stamps the same `lastCached` on every device variant it writes, so without it the
+			// desktop and mobile snapshots of a URL — different bytes — would carry the same tag.
+			// A stored page row carries its cache key but no device column, so that is the fallback.
+			const device = deviceType ?? (resource.cacheKey ? CacheKey.parse(resource.cacheKey).deviceType : undefined) ?? '';
+			headers.set('etag', `W/"${lastCachedMs}-${device}"`);
 		}
 	}
 
@@ -242,7 +247,7 @@ export function negotiateEncoding(body, headers, request) {
 
 	// Normalize the body to a Node stream before re-encoding. Three shapes reach here and each
 	// needs different handling — getting this wrong corrupts the response SILENTLY:
-	//   - web ReadableStream (the origin path, `Readable.toWeb(response.body)`) → convert
+	//   - web ReadableStream (the origin path, `originBodyStream(response.body)`) → convert
 	//   - Node Readable → pass through; `Readable.from([stream])` would emit the stream OBJECT as
 	//     a single chunk. Not currently reachable (upstream.js hands over a web stream), but
 	//     upstream.js holds a Node Readable and only converts it for this call, so anyone dropping
@@ -303,7 +308,7 @@ export function deliverResource(resource, request, info = {}) {
 	// 'cache' and 'rendered' are the sources whose body is a rendered snapshot; 'raw' and 'negative'
 	// are the origin's own stored bytes, and 'origin' its live ones.
 	const snapshot = info.source === 'cache' || info.source === 'rendered';
-	let headers = buildResponseHeaders(resource, snapshot);
+	let headers = buildResponseHeaders(resource, snapshot, resource.deviceType ?? info.deviceType);
 
 	// A CONDITIONAL REQUEST MUST NOT BE ABLE TO UNDO AN INVALIDATION, and it could, by two
 	// independent routes. The crawler's validators are ones this plugin handed it off the

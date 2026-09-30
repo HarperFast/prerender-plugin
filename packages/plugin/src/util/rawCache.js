@@ -318,7 +318,7 @@ export const collectBody = async (stream, maxBytes) => {
 			const { done, value } = await reader.read();
 			if (done) break;
 			// `?? 0` because a chunk without a numeric byteLength would make `size` NaN, and `NaN > maxBytes`
-			// is FALSE — the cap would silently stop existing. Unreachable through `Readable.toWeb`, but
+			// is FALSE — the cap would silently stop existing. Unreachable through `originBodyStream`, but
 			// `teeForCapture` is exported and the failure is unbounded retention.
 			size += value?.byteLength ?? 0;
 			if (size > maxBytes) {

@@ -6,6 +6,7 @@ import { restartPaths } from '../src/configSchema.js';
 import {
 	configuredStagingIp,
 	dispatcherFor,
+	drainOrDestroy,
 	releaseOriginBody,
 	resolveUpstreamHeaders,
 	sanitizeOriginResponseHeaders,
@@ -181,6 +182,26 @@ test('releaseOriginBody destroys the origin stream, and falls back to cancel for
 	// A stored page (Blob content, no stream) and nothing at all are both no-ops, never a throw.
 	releaseOriginBody({ content: new Blob(['x']) });
 	releaseOriginBody(undefined);
+});
+
+test('a drain has its own deadline: an origin body that stalls is destroyed, not held for bodyTimeout', async () => {
+	let destroyed = 0;
+	const stalled = new ReadableStream({ pull: () => new Promise(() => {}) });
+	drainOrDestroy(stalled, { destroy: () => destroyed++ }, 30);
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.equal(destroyed, 1);
+
+	// A body that ends inside the deadline is simply drained — its connection is reused, never destroyed.
+	destroyed = 0;
+	const small = new ReadableStream({
+		start(c) {
+			c.enqueue(new Uint8Array(10));
+			c.close();
+		},
+	});
+	drainOrDestroy(small, { destroy: () => destroyed++ }, 30);
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.equal(destroyed, 0);
 });
 
 test('sanitizeOriginResponseHeaders strips CDN/edge-injected headers (badxform cause)', () => {
