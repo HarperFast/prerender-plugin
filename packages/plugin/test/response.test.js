@@ -96,14 +96,66 @@ test('a header no response may carry is dropped, COUNTED per serve, and logged a
 	assert.equal(logged.length, 1, 'one log line for five serves, not one per request');
 });
 
-test('a snapshot carries W/"<lastCachedMs>" and Last-Modified from lastCached, never the origin validators', () => {
+test('a snapshot carries W/"<lastCachedMs>-<device>" and Last-Modified from lastCached, never the origin validators', () => {
 	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
-	const headers = buildResponseHeaders(
-		{ statusCode: 200, headers: { 'etag': '"origin"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT' }, lastCached },
-		true
+	const stored = { 'etag': '"origin"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
+	const desktop = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'desktop');
+	assert.equal(desktop.get('etag'), `W/"${lastCached}-desktop"`);
+	assert.equal(desktop.get('last-modified'), new Date(lastCached).toUTCString());
+	// One render job stamps the SAME lastCached on every device variant; the bytes differ, so must the tag.
+	const mobile = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'mobile');
+	assert.notEqual(mobile.get('etag'), desktop.get('etag'));
+});
+
+test('a stored page row with no device column takes the device off its cache key', () => {
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const row = (device) => ({
+		statusCode: 200,
+		headers: '{}',
+		lastCached,
+		cacheKey: `https://www.example.com/p|${device}`,
+	});
+	const desktop = deliverResource(
+		row('desktop'),
+		{ ...mockRequest(), method: 'GET' },
+		{ source: 'cache', cachedBody: Buffer.from('d') }
 	);
-	assert.equal(headers.get('etag'), `W/"${lastCached}"`);
-	assert.equal(headers.get('last-modified'), new Date(lastCached).toUTCString());
+	assert.equal(desktop.headers.get('etag'), `W/"${lastCached}-desktop"`);
+	const mobile = deliverResource(
+		row('mobile'),
+		{ ...mockRequest({ 'if-none-match': desktop.headers.get('etag') }), method: 'GET' },
+		{
+			source: 'cache',
+			cachedBody: Buffer.from('m'),
+		}
+	);
+	assert.equal(mobile.status, 200);
+});
+
+test("one device's snapshot ETag does not revalidate another device's snapshot of the same render", () => {
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const page = { statusCode: 200, headers: '{}', lastCached };
+	const desktopTag = buildResponseHeaders(page, true, 'desktop').get('etag');
+	const asMobile = deliverResource(
+		page,
+		{ ...mockRequest({ 'if-none-match': desktopTag }), method: 'GET' },
+		{
+			source: 'cache',
+			deviceType: 'mobile',
+			cachedBody: Buffer.from('mobile bytes'),
+		}
+	);
+	assert.equal(asMobile.status, 200);
+	const asDesktop = deliverResource(
+		page,
+		{ ...mockRequest({ 'if-none-match': desktopTag }), method: 'GET' },
+		{
+			source: 'cache',
+			deviceType: 'desktop',
+			cachedBody: Buffer.from('desktop bytes'),
+		}
+	);
+	assert.equal(asDesktop.status, 304);
 });
 
 test('the snapshot ETag decides revalidation: a same-second re-render is a 200, the same render a 304', () => {
@@ -124,7 +176,7 @@ test('the snapshot ETag decides revalidation: a same-second re-render is a 200, 
 		{ source: 'cache', cachedBody: Buffer.from('old') }
 	);
 	assert.equal(same.status, 304);
-	assert.equal(same.headers.get('etag'), `W/"${base + 100}"`);
+	assert.equal(same.headers.get('etag'), `W/"${base + 100}-"`);
 });
 
 test('a proxy that found a page row it would not serve skips the local conditional', () => {

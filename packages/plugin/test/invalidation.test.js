@@ -506,10 +506,27 @@ test('a write inside a request (not yet committed) is patched into the writer’
 	ring();
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(inv.resolveInvalidation(null)?.at, new Date(written.invalidatedAt).getTime() + PAD);
+});
 
-	// A clear inside a request, the same way round.
+test('a clear inside a request is NOT patched: if its transaction aborts, nothing invalidated is served', async () => {
+	rows.set('all', { scope: 'all', invalidatedAt: at(5_000_000) });
+	inv.startInvalidationWatch();
+	await until(trusted, 'the view to load');
 	deferWrites = true;
 	await inv.clearInvalidation('all');
 	assert.equal(rows.has('all'), true, 'precondition: the delete is not visible yet');
+	assert.equal(
+		inv.resolveInvalidation(null)?.at,
+		5_000_000 + PAD,
+		'still enforced until the delete commits — late is the safe direction'
+	);
+	// The request aborts: nothing commits, and the invalidation must still be in force.
+	pending.clear();
+	deferWrites = false;
+	ring();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(inv.resolveInvalidation(null)?.at, 5_000_000 + PAD);
+	// A clear outside a request has committed by the time it returns, and its own worker sees it at once.
+	await inv.clearInvalidation('all');
 	assert.equal(inv.resolveInvalidation(null), null);
 });

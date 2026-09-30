@@ -66,7 +66,7 @@ export async function handleBotRequest(request) {
 		// Debug/observability info surfaced as x-harper-* response headers (only when the
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
-		const info = { route, routeClass };
+		const info = { route, routeClass, deviceType };
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		// WHY THIS MISS HAPPENED (`bot_miss`), for exactly the requests bot_serve counts as origin|miss.

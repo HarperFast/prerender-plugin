@@ -612,22 +612,23 @@ export const recordInvalidation = async ({ scope, reason, updatedBy }) => {
  *
  * So: reload the view now, after the write, and wait for it. A write made outside a request (the
  * probe's passes) has committed by the time `put` resolves, so that read sees it. A write made INSIDE
- * a request (the admin API) commits only when the request ends, so no read can see it yet — then the
- * write is patched into this worker's copy directly, and the doorbell after the commit replaces the
- * patch with the real row. The patch never overrides a newer answer: a put only raises a scope's epoch,
- * and a clear only removes an epoch older than the clear itself.
+ * a request (the admin API) commits only when the request ends, so no read can see it yet — then an
+ * APPLY is patched into this worker's copy directly, and the doorbell after the commit replaces the
+ * patch with the real row. The patch only ever raises a scope's epoch, never overrides a newer one.
+ *
+ * A CLEAR IS NEVER PATCHED. If the request's transaction aborts, a patched clear would leave this
+ * worker serving pages somebody invalidated while the row still exists — failing open, the one
+ * direction this feature must not fail. Unpatched, a clear lands on this worker a notify pass after
+ * its commit, which is the safe direction to be late in.
  */
 const reflectOwnWrite = async (scope, atMs) => {
 	if (subscription === null) return; // no view in use: the per-request reads see the table itself
 	await requestLoad();
-	if (view === null) return;
+	if (atMs === null || view === null) return;
 	const current = view.get(scope);
-	if (atMs === null) {
-		if (current === undefined || !(current <= Date.now())) return;
-	} else if (current !== undefined && current >= atMs) return;
+	if (current !== undefined && current >= atMs) return;
 	const next = new Map(view);
-	if (atMs === null) next.delete(scope);
-	else next.set(scope, atMs);
+	next.set(scope, atMs);
 	view = next;
 };
 
