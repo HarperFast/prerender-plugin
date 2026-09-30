@@ -96,7 +96,39 @@ test('a header no response may carry is dropped, COUNTED per serve, and logged a
 	assert.equal(logged.length, 1, 'one log line for five serves, not one per request');
 });
 
-test('a snapshot carries W/"<lastCachedMs>-<device>" and Last-Modified from lastCached, never the origin validators', () => {
+test("by default a snapshot carries NO validators — neither the origin document's nor its own — and never 304s", () => {
+	// The default: a site whose origin sends no validators keeps serving crawlers exactly that. Turning
+	// them on starts crawlers revalidating and this cache answering 304s, so it is a decision, not a default.
+	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
+	const stored = { 'etag': '"origin"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT', 'content-type': 'text/html' };
+	const headers = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'desktop');
+	assert.equal(headers.has('etag'), false);
+	assert.equal(headers.has('last-modified'), false);
+	assert.equal(headers.get('content-type'), 'text/html');
+	assert.ok(headers.has('age'), 'age is not a validator and is still set');
+	// Every conditional shape a crawler could send gets the full snapshot: the origin's tag, a tag from a
+	// release that did send ours, and dates either side of the render.
+	for (const conditional of [
+		{ 'if-none-match': '"origin"' },
+		{ 'if-none-match': `W/"${lastCached}-desktop"` },
+		{ 'if-modified-since': new Date(lastCached + 60_000).toUTCString() },
+		{ 'if-modified-since': 'Mon, 01 Jan 2024 00:00:00 GMT' },
+	]) {
+		for (const source of ['cache', 'rendered']) {
+			const res = deliverResource(
+				{ statusCode: 200, headers: JSON.stringify(stored), lastCached, deviceType: 'desktop' },
+				{ ...mockRequest(conditional), method: 'GET' },
+				{ source, cachedBody: Buffer.from('snapshot') }
+			);
+			assert.equal(res.status, 200, `${source} ${JSON.stringify(conditional)}`);
+			assert.equal(res.headers.has('etag'), false);
+			assert.equal(res.headers.has('last-modified'), false);
+		}
+	}
+});
+
+test('page.snapshotValidators: a snapshot carries W/"<lastCachedMs>-<device>" and Last-Modified from lastCached, never the origin validators', () => {
+	applyOptions({ page: { snapshotValidators: true } });
 	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
 	const stored = { 'etag': '"origin"', 'last-modified': 'Mon, 01 Jan 2024 00:00:00 GMT' };
 	const desktop = buildResponseHeaders({ statusCode: 200, headers: stored, lastCached }, true, 'desktop');
@@ -107,7 +139,8 @@ test('a snapshot carries W/"<lastCachedMs>-<device>" and Last-Modified from last
 	assert.notEqual(mobile.get('etag'), desktop.get('etag'));
 });
 
-test('a stored page row with no device column takes the device off its cache key', () => {
+test('page.snapshotValidators: a stored page row with no device column takes the device off its cache key', () => {
+	applyOptions({ page: { snapshotValidators: true } });
 	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
 	const row = (device) => ({
 		statusCode: 200,
@@ -132,7 +165,8 @@ test('a stored page row with no device column takes the device off its cache key
 	assert.equal(mobile.status, 200);
 });
 
-test("one device's snapshot ETag does not revalidate another device's snapshot of the same render", () => {
+test("page.snapshotValidators: one device's snapshot ETag does not revalidate another device's snapshot of the same render", () => {
+	applyOptions({ page: { snapshotValidators: true } });
 	const lastCached = Date.UTC(2026, 8, 29, 12, 0, 0, 100);
 	const page = { statusCode: 200, headers: '{}', lastCached };
 	const desktopTag = buildResponseHeaders(page, true, 'desktop').get('etag');
@@ -158,7 +192,8 @@ test("one device's snapshot ETag does not revalidate another device's snapshot o
 	assert.equal(asDesktop.status, 304);
 });
 
-test('the snapshot ETag decides revalidation: a same-second re-render is a 200, the same render a 304', () => {
+test('page.snapshotValidators: the snapshot ETag decides revalidation: a same-second re-render is a 200, the same render a 304', () => {
+	applyOptions({ page: { snapshotValidators: true } });
 	// If-Modified-Since alone cannot tell two renders inside one second apart (HTTP dates are seconds), and
 	// the date was stamped by whichever node rendered. If-None-Match takes precedence and names the render.
 	const base = Date.UTC(2026, 8, 29, 12, 0, 0);

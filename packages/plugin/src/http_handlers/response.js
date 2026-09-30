@@ -89,12 +89,13 @@ const appendOne = (headers, key, value) => {
  * the renderer kept from the response it rendered, and they describe that raw document, not the
  * snapshot: a re-render that changed client-rendered content (prices, reviews, stock) under an
  * unchanged origin ETag answered the crawler's next conditional request 304, and the crawler kept
- * the old snapshot while every signal said a fresh page was being served. So a snapshot carries
- * validators derived from ITSELF: `Last-Modified` is the render's `lastCached`, and the ETag is a
- * weak tag of that same instant and the device, `W/"<lastCachedMs>-<deviceType>"` — both move on
- * every render. (No content hash
- * is stored, and hashing ~220 KB per request is not cheap; a render stamp is exact for "is this the
- * render you hold".) A raw-cache document is the origin's bytes verbatim, so it keeps the origin's
+ * the old snapshot while every signal said a fresh page was being served. So a snapshot never
+ * carries the origin's validators. Under `page.snapshotValidators` it carries validators derived
+ * from ITSELF: `Last-Modified` is the render's `lastCached`, and the ETag is a weak tag of that
+ * same instant and the device, `W/"<lastCachedMs>-<deviceType>"` — both move on every render. (No
+ * content hash is stored, and hashing ~220 KB per request is not cheap; a render stamp is exact for
+ * "is this the render you hold".) Off, it carries none, so no conditional request is ever answered
+ * from a snapshot. A raw-cache document is the origin's bytes verbatim, so it keeps the origin's
  * validators.
  */
 export function buildResponseHeaders(resource, snapshot = false, deviceType = resource.deviceType) {
@@ -116,7 +117,7 @@ export function buildResponseHeaders(resource, snapshot = false, deviceType = re
 			const ageSec = Math.max(0, Math.floor((Date.now() - lastCachedMs) / 1000));
 			headers.set('age', String(ageSec));
 		}
-		if (snapshot) {
+		if (snapshot && config.page.snapshotValidators) {
 			headers.set('last-modified', new Date(lastCachedMs).toUTCString());
 			// A version tag, weak because it names the render rather than hashing its bytes: it changes on
 			// every render and on nothing else. `If-None-Match` takes precedence over `If-Modified-Since`,
