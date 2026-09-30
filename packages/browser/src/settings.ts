@@ -11,8 +11,9 @@
 import { cpus, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LaunchOptions } from 'puppeteer';
-import { loadConfig, mergeConfig } from './config.js';
+import { loadConfig, mergeConfig, MAX_TIMER_MS } from './config.js';
 import type { DeepPartial, PrerenderConfig } from './config.js';
+import type { AdmissionSettings } from './admission.js';
 
 export type ResourceCacheOptions = {
 	/** Disable the on-disk resource cache entirely. */
@@ -43,8 +44,19 @@ export type BrowserOptions = {
 	concurrency?: number;
 	/** Max render starts per second (default 8). */
 	rps?: number;
-	/** Jobs claimed per batch (default: concurrency * 2). */
+	/**
+	 * Jobs claimed per batch (default: concurrency). Under `pressure` admission, the largest claim
+	 * (default: `admission.max`); each claim is sized to the capacity free at that moment.
+	 */
 	jobClaimLimit?: number;
+	/**
+	 * How many renders run at once (see admission.ts). `fixed` (default) always runs `concurrency`.
+	 * `pressure` starts at `concurrency` clamped to [`min`, `max`] and steps between them from the
+	 * container's CPU pressure every `intervalMs` (default 5000): `min` defaults to concurrency/2,
+	 * `max` to concurrency (brake only), `lowPressure` 15 / `highPressure` 30 (PSI percent). Needs
+	 * cgroup v2 PSI; without it the limit holds.
+	 */
+	admission?: Partial<AdmissionSettings>;
 	/** Pages a browser renders before being retired and replaced (default 200). */
 	browserExpirationThreshold?: number;
 	/** Render each page in a fresh incognito context (default true). */
@@ -115,6 +127,7 @@ export type Settings = {
 	concurrency: number;
 	rps: number;
 	jobClaimLimit: number;
+	admission: AdmissionSettings;
 	browserExpirationThreshold: number;
 	incognitoPages: boolean;
 	contentEncoding: string;
@@ -178,6 +191,7 @@ const defaults = (): Settings => ({
 	concurrency: defaultConcurrency(),
 	rps: 8,
 	jobClaimLimit: 0, // resolved from concurrency in applySettings
+	admission: { mode: 'fixed', min: 1, max: 1, lowPressure: 15, highPressure: 30, intervalMs: 5000 }, // resolved in applySettings
 	browserExpirationThreshold: 200,
 	incognitoPages: true,
 	contentEncoding: 'gzip',
@@ -252,10 +266,14 @@ export const resolveSettings = (
 	fresh.config = typeof options.config === 'string' ? loadConfig(options.config) : mergeConfig(options.config ?? {});
 	fresh.concurrency = options.concurrency ?? fresh.concurrency;
 	fresh.rps = options.rps ?? fresh.rps;
+	fresh.admission = resolveAdmission(options.admission, fresh.concurrency);
 	// Claim at most what this worker can actually render at once. Over-claiming (the old
 	// concurrency*2) made one worker grab jobs it couldn't start and hold them leased-idle,
 	// starving other renderers of a burst and doubling the per-claim lease-write transaction.
-	fresh.jobClaimLimit = options.jobClaimLimit ?? fresh.concurrency;
+	// Under pressure admission this is only the ceiling: each claim is sized to the capacity free
+	// at that moment (Worker.claimSize).
+	fresh.jobClaimLimit =
+		options.jobClaimLimit ?? (fresh.admission.mode === 'pressure' ? fresh.admission.max : fresh.concurrency);
 	fresh.browserExpirationThreshold = options.browserExpirationThreshold ?? fresh.browserExpirationThreshold;
 	fresh.incognitoPages = options.incognitoPages ?? fresh.incognitoPages;
 	fresh.contentEncoding = options.contentEncoding ?? fresh.contentEncoding;
@@ -285,6 +303,42 @@ export const resolveSettings = (
 
 	Object.assign(settings, fresh);
 	return settings;
+};
+
+const resolveAdmission = (options: Partial<AdmissionSettings> | undefined, concurrency: number): AdmissionSettings => {
+	// `max` defaults to `concurrency`: by default the limit only brakes below the configured slot
+	// count. Raising it above means more concurrent origin requests exactly when renders are slow
+	// for a reason other than CPU (a slow origin), so going above is the operator's explicit call.
+	const max = options?.max ?? concurrency;
+	const admission: AdmissionSettings = {
+		mode: options?.mode ?? 'fixed',
+		max,
+		min: options?.min ?? Math.min(max, Math.max(1, Math.floor(concurrency / 2))),
+		lowPressure: options?.lowPressure ?? 15,
+		highPressure: options?.highPressure ?? 30,
+		intervalMs: options?.intervalMs ?? 5000,
+	};
+	if (admission.mode !== 'fixed' && admission.mode !== 'pressure') {
+		throw new Error(`startWorker: admission.mode must be 'fixed' or 'pressure', got ${String(admission.mode)}`);
+	}
+	if (admission.mode === 'fixed') return admission;
+	if (!Number.isInteger(admission.min) || admission.min < 1) {
+		throw new Error(`startWorker: admission.min must be a positive integer, got ${admission.min}`);
+	}
+	if (!Number.isInteger(admission.max) || admission.max < admission.min) {
+		throw new Error(`startWorker: admission.max must be an integer >= admission.min, got ${admission.max}`);
+	}
+	if (!(admission.lowPressure >= 0 && admission.highPressure > admission.lowPressure && admission.highPressure < 100)) {
+		throw new Error(
+			`startWorker: admission needs 0 <= lowPressure < highPressure < 100 (PSI percent), got ${admission.lowPressure} / ${admission.highPressure}`
+		);
+	}
+	if (!(admission.intervalMs >= 1000 && admission.intervalMs <= MAX_TIMER_MS)) {
+		throw new Error(
+			`startWorker: admission.intervalMs must be between 1000 and ${MAX_TIMER_MS}, got ${admission.intervalMs}`
+		);
+	}
+	return admission;
 };
 
 /**

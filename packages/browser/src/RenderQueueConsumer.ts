@@ -26,7 +26,11 @@ const toEpochMs = (value: unknown): number | undefined => {
 	return undefined;
 };
 
-export async function* RenderQueueConsumer(signal?: AbortSignal) {
+/** @param claimLimit jobs to ask for in the next claim, read before each one (default `settings.jobClaimLimit`). */
+export async function* RenderQueueConsumer(
+	signal?: AbortSignal,
+	claimLimit: () => number = () => settings.jobClaimLimit
+) {
 	const mqttClient = await connectMqtt();
 	const health = getHostHealth();
 
@@ -96,7 +100,7 @@ export async function* RenderQueueConsumer(signal?: AbortSignal) {
 				continue;
 			}
 
-			const { jobs, outcome, retryAfterMs } = await claimJobs(host, settings.jobClaimLimit);
+			const { jobs, outcome, retryAfterMs } = await claimJobs(host, claimLimit());
 			switch (outcome) {
 				case 'jobs':
 					health.recordJobs(host);

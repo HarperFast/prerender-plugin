@@ -51,23 +51,51 @@ cache, and starts the worker loop; it resolves once the cache index is built. It
 
 Only `harper` is required; everything else has a default.
 
-| Option                       | Default                                           | Purpose                                                                                     |
-| ---------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `harper`                     | _(required)_                                      | `{ mqttOrigin, user, pass, workerId }` — connection + identity                              |
-| `queuePort`                  | `9926`                                            | Port of the plugin's render-queue HTTP API                                                  |
-| `bypass`                     | `{ header: x-harper-renderer-bypass, token: '' }` | Shared origin-bypass header/token (match the plugin)                                        |
-| `config`                     | built-in defaults                                 | Rendering config (deep-partial object _or_ JSON file path)                                  |
-| `concurrency`                | ~half the CPUs                                    | Max concurrent page renders                                                                 |
-| `rps`                        | `8`                                               | Max job starts per second (a job renders every device of one URL — see the queue protocol)  |
-| `jobClaimLimit`              | `concurrency * 2`                                 | Jobs claimed per batch                                                                      |
-| `browserExpirationThreshold` | `200`                                             | Pages a browser renders before being retired                                                |
-| `incognitoPages`             | `true`                                            | Render each page in a fresh incognito context                                               |
-| `contentEncoding`            | `gzip`                                            | Encoding used when posting rendered HTML back                                               |
-| `chromeArgs`                 | hardened headless set                             | Chrome launch flags                                                                         |
-| `browserLaunchOptions`       | built from `chromeArgs`                           | Full Puppeteer launch options (overrides `chromeArgs`)                                      |
-| `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)                                  |
-| `renderer`                   | the default renderer                              | Custom renderer (see below)                                                                 |
-| `installSignalHandlers`      | `true`                                            | Own SIGTERM/SIGINT (drain in-flight renders, then close Chrome); `false` to own the process |
+| Option                       | Default                                           | Purpose                                                                                      |
+| ---------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `harper`                     | _(required)_                                      | `{ mqttOrigin, user, pass, workerId }` — connection + identity                               |
+| `queuePort`                  | `9926`                                            | Port of the plugin's render-queue HTTP API                                                   |
+| `bypass`                     | `{ header: x-harper-renderer-bypass, token: '' }` | Shared origin-bypass header/token (match the plugin)                                         |
+| `config`                     | built-in defaults                                 | Rendering config (deep-partial object _or_ JSON file path)                                   |
+| `concurrency`                | ~half the CPUs                                    | Max concurrent page renders                                                                  |
+| `rps`                        | `8`                                               | Max job starts per second (a job renders every device of one URL — see the queue protocol)   |
+| `jobClaimLimit`              | `concurrency` (`admission.max` under `pressure`)  | Jobs claimed per batch (under `pressure`, the ceiling; each claim is sized to free capacity) |
+| `admission`                  | `{ mode: 'fixed' }`                               | How many renders run at once — `fixed` or CPU-`pressure`-stepped (see below)                 |
+| `browserExpirationThreshold` | `200`                                             | Pages a browser renders before being retired                                                 |
+| `incognitoPages`             | `true`                                            | Render each page in a fresh incognito context                                                |
+| `contentEncoding`            | `gzip`                                            | Encoding used when posting rendered HTML back                                                |
+| `chromeArgs`                 | hardened headless set                             | Chrome launch flags                                                                          |
+| `browserLaunchOptions`       | built from `chromeArgs`                           | Full Puppeteer launch options (overrides `chromeArgs`)                                       |
+| `resourceCache`              | enabled, ~8 GB in tmp                             | On-disk shared sub-resource cache (`enabled`/`dir`/limits)                                   |
+| `renderer`                   | the default renderer                              | Custom renderer (see below)                                                                  |
+| `installSignalHandlers`      | `true`                                            | Own SIGTERM/SIGINT (drain in-flight renders, then close Chrome); `false` to own the process  |
+
+### `admission` — renders at once from CPU pressure
+
+`fixed` (the default) always runs `concurrency` renders. `pressure` starts at `concurrency` (clamped to
+[`min`, `max`]) and, every `intervalMs`, steps the limit from the container's CPU pressure — cgroup v2
+PSI `cpu.pressure`, the share of that interval in which some task waited for a CPU: up one when
+pressure is below `lowPressure` and the limit held a job back, down one above `highPressure`, down a
+quarter above twice `highPressure`. Render cost varies ~20x by page, so a fixed slot count overloads a
+pod that draws heavy pages; pressure is the waiting that overload causes.
+
+Pressure mode also sizes each queue claim to what can start soon — the free slots, or the free
+prefetch-pool room — up to `jobClaimLimit`, so a busy worker does not hold jobs an idle one could
+start.
+
+```js
+admission: { mode: 'pressure', min: 2, max: 5, lowPressure: 15, highPressure: 30, intervalMs: 5000 }
+```
+
+Defaults: `min` = `concurrency / 2`, `max` = `concurrency`, pressure 15 / 30, interval 5000 ms. With
+the default `max` the limit only brakes. A `max` above `concurrency` lets it climb while CPU is idle,
+but idle CPU with work waiting is also what a slow origin looks like, so a higher `max` means more
+concurrent origin requests exactly then, and more Chrome pages in memory: set it against what the
+origin and the pod's memory tolerate. Measured under a CFS quota, pressure 15 and 30 fell at about 80%
+and 95% of the pod's cores; throughput peaked at 90–95%. Without PSI (cgroup v1, macOS) the limit
+holds and one warning is logged at startup. Every worker in a container steps on the same signal,
+from a random phase. The stats line reports the current limit as `saturation.concurrency` and the
+last reading as `saturation.admission.pressure`.
 
 ## Queue protocol
 

@@ -7,7 +7,8 @@ import { setTimeout } from 'timers/promises';
 import { noop } from './util/noop.js';
 import { getResourceCache } from './ResourceCache.js';
 import { settings } from './settings.js';
-import { CpuSampler } from './util/cpu.js';
+import { CpuSampler, pressureBetween, readCpuStallUs, type StallSample } from './util/cpu.js';
+import { nextAdmissionLimit, type AdmissionSettings } from './admission.js';
 import { renderPhaseOf } from './util/renderPhase.js';
 import { JobDocumentCache } from './documentReuse.js';
 import { closePrefetchAgent, prefetchDocument, type PrefetchOutcome } from './documentPrefetch.js';
@@ -75,6 +76,18 @@ export default class RenderWorker {
 	rps = 10;
 
 	inflight: Set<Promise<void>> = new Set();
+
+	// Renders allowed at once right now: CONCURRENCY under fixed admission, stepped between the
+	// configured bounds under pressure admission (admission.ts). `admission` is null under fixed.
+	private readonly admission: AdmissionSettings | null;
+	private admissionLimit: number;
+	private maxActivePages: number;
+	private admissionTimer: NodeJS.Timeout | null = null;
+	private lastStall: StallSample | null = null;
+	private lastPressure: number | null = null;
+	private demandSinceStep = false;
+	private waitingForSlot = false;
+	private limitWaiters: Set<() => void> = new Set();
 
 	lastRenderStartTime = Date.now();
 
@@ -237,6 +250,25 @@ export default class RenderWorker {
 		this.BROWSER_MAX_TOTAL_PAGES = config.browserExpirationThreshold ?? 5000;
 		this.renderFn = config.renderer;
 
+		const admission = settings.admission;
+		if (admission.mode === 'pressure') {
+			this.admission = { ...admission };
+			this.admissionLimit = Math.min(admission.max, Math.max(admission.min, this.CONCURRENCY));
+			this.maxActivePages = admission.max;
+			this.samplePressure();
+			if (this.lastStall === null) {
+				logger.warn(
+					{ limit: this.admissionLimit },
+					'pressure admission: no CPU pressure reading (needs cgroup v2 PSI) — the render limit holds'
+				);
+			}
+			this.startAdmission(this.admission);
+		} else {
+			this.admission = null;
+			this.admissionLimit = this.CONCURRENCY;
+			this.maxActivePages = this.CONCURRENCY;
+		}
+
 		this.browserCleanupInterval = setInterval(() => {
 			this.closeRetiredBrowsers();
 		}, 10000);
@@ -283,7 +315,7 @@ export default class RenderWorker {
 	 * dropped: no variant of it was attempted, so there is nothing to post, and its lease expires and
 	 * the queue re-grants it — the same fate a job sitting unclaimed in the consumer's batch always had.
 	 */
-	async run(jobs: AsyncIterable<RenderJob> = RenderQueueConsumer(this.consumerAbort.signal)) {
+	async run(jobs: AsyncIterable<RenderJob> = RenderQueueConsumer(this.consumerAbort.signal, () => this.claimSize())) {
 		const prefetch = settings.config.documentReuse.prefetch;
 		if (!prefetch.enabled) {
 			for await (const job of jobs) {
@@ -355,13 +387,90 @@ export default class RenderWorker {
 		await filling;
 	}
 
-	/** Hold until a render slot is free. */
+	/** Hold until a render slot is free: a render finishing, or the admission limit rising. */
 	private async awaitSlot() {
-		// wait for slot to open up
-		if (this.inflight.size >= this.CONCURRENCY) {
-			this.stats.concurrencyBlocked++;
-			await Promise.race(this.inflight);
+		if (this.inflight.size < this.admissionLimit) return;
+		this.stats.concurrencyBlocked++;
+		this.waitingForSlot = true;
+		try {
+			while (this.inflight.size >= this.admissionLimit) {
+				if (this.jobHeldBack()) this.demandSinceStep = true;
+				let wake = noop;
+				const raised = new Promise<void>((resolve) => (wake = resolve));
+				this.limitWaiters.add(wake);
+				try {
+					await Promise.race([...this.inflight, raised]);
+				} finally {
+					this.limitWaiters.delete(wake);
+				}
+			}
+			// A job that reached the pool during the wait waited too.
+			if (this.jobHeldBack()) this.demandSinceStep = true;
+		} finally {
+			this.waitingForSlot = false;
 		}
+	}
+
+	/**
+	 * Whether the limit is holding a job back right now. The prefetch loop waits for a slot BEFORE
+	 * taking a job, so there a full set of slots holds a job back only while the pool has one — and a
+	 * pooled job with a slot free is prefetching ahead, not held back.
+	 */
+	private jobHeldBack(): boolean {
+		return this.waitingForSlot && (this.pool === null || this.pool.size > 0);
+	}
+
+	/**
+	 * Jobs to ask for in the next claim. Under pressure admission, what can start soon — free slots, or
+	 * free pool room when prefetching — so a busy worker does not hold jobs an idle one could start,
+	 * and a worker with room fills it in one claim. Capped by `jobClaimLimit`, at least 1.
+	 */
+	private claimSize(): number {
+		if (this.admission === null) return settings.jobClaimLimit;
+		const free = this.pool ? this.pool.capacity - this.pool.size : this.admissionLimit - this.inflight.size;
+		return Math.min(settings.jobClaimLimit, Math.max(1, free));
+	}
+
+	/**
+	 * Step the admission limit every `intervalMs`, from a random phase so the workers sharing a
+	 * container step at different moments and each reads pressure that already reflects the others'
+	 * last change.
+	 */
+	private startAdmission(admission: AdmissionSettings) {
+		const step = () => this.stepAdmission(admission, this.samplePressure());
+		this.admissionTimer = globalThis.setTimeout(
+			() => {
+				// Re-baseline rather than step: the window since construction is an arbitrary slice of an
+				// interval, and each step should read one whole interval.
+				this.samplePressure();
+				this.admissionTimer = setInterval(step, admission.intervalMs);
+				this.admissionTimer.unref();
+			},
+			Math.floor(Math.random() * admission.intervalMs)
+		);
+		this.admissionTimer.unref();
+	}
+
+	/** CPU pressure since the previous sample (util/cpu.ts `pressureBetween`), or null without one. */
+	private samplePressure(): number | null {
+		const stallUs = readCpuStallUs();
+		if (stallUs === null) return null;
+		const prev = this.lastStall;
+		this.lastStall = { stallUs, atMs: Date.now() };
+		return prev ? pressureBetween(prev, this.lastStall) : null;
+	}
+
+	private stepAdmission(admission: AdmissionSettings, pressure: number | null) {
+		this.lastPressure = pressure === null ? null : Number(pressure.toFixed(1));
+		const hasDemand = this.demandSinceStep || this.jobHeldBack();
+		this.demandSinceStep = false;
+		this.applyAdmissionLimit(nextAdmissionLimit(this.admissionLimit, pressure, hasDemand, admission));
+	}
+
+	private applyAdmissionLimit(next: number) {
+		const raised = next > this.admissionLimit;
+		this.admissionLimit = next;
+		if (raised) for (const wake of this.limitWaiters) wake();
 	}
 
 	/** Whether a claimed job still has enough lease to be worth rendering; counted and logged when not. */
@@ -622,7 +731,10 @@ export default class RenderWorker {
 			},
 			saturation: {
 				inflight: this.inflight.size,
-				concurrency: this.CONCURRENCY,
+				concurrency: this.admissionLimit,
+				admission: this.admission
+					? { min: this.admission.min, max: this.admission.max, pressure: this.lastPressure }
+					: undefined,
 				concurrencyBlocked: s.concurrencyBlocked,
 				rpsDelayed: s.rpsDelayed,
 				expiredSkipped: s.expiredSkipped,
@@ -695,6 +807,10 @@ export default class RenderWorker {
 	// the browser .close() promises run and Chrome is orphaned (the whole point of closing here).
 	async destroy() {
 		clearInterval(this.logStatsInterval);
+		if (this.admissionTimer !== null) {
+			clearInterval(this.admissionTimer);
+			this.admissionTimer = null;
+		}
 		if (this.browserCleanupInterval !== null) {
 			clearInterval(this.browserCleanupInterval);
 			this.browserCleanupInterval = null;
@@ -1063,7 +1179,7 @@ export default class RenderWorker {
 			}
 			logger.info({ event: 'launching browser', retired: this.retiredBrowsers.size });
 			this.browserPromise = ManagedBrowser.launch({
-				maxActivePages: this.CONCURRENCY,
+				maxActivePages: this.maxActivePages,
 				puppeteerLaunchOptions: this.browserLaunchOptions,
 			}).finally(() => (this.browserPromise = null));
 			this.browser = await this.browserPromise;

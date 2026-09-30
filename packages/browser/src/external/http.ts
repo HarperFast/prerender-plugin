@@ -6,7 +6,9 @@ const originPoolMap = new Map<string, Pool>();
 function getPool(origin: string) {
 	let pool = originPoolMap.get(origin);
 	if (!pool) {
-		pool = new Pool(origin, { connections: settings.concurrency });
+		// One connection per render that may be posting its result at once.
+		const renders = settings.admission.mode === 'pressure' ? settings.admission.max : settings.concurrency;
+		pool = new Pool(origin, { connections: Math.max(settings.concurrency, renders) });
 		originPoolMap.set(origin, pool);
 	}
 	return pool;
