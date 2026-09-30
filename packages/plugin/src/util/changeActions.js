@@ -61,8 +61,7 @@ export const RETRY_LIMIT = 1000;
 
 /**
  * @param {object} ports
- * @param {(row: object, item: object) => Promise<string | void>} ports.act    expire the page and file
- *   its render; resolving 'covered' or 'healed' means it deliberately did nothing (see `run`)
+ * @param {(row: object, item: object) => Promise<void>} ports.act    expire the page and file its render
  * @param {(item: object) => Promise<boolean>} [ports.stillDue]  before an after-walk retry: is the
  *   detection still current? False skips the retry (counted `retryStale`)
  * @param {(url: string, observed: string, opts: object) => Promise<void>} ports.write  baseline write
@@ -85,8 +84,6 @@ export const createChangeActions = ({
 	// `errors - recovered` is what is left for the next probe; `retrySkipped` failed past the bound.
 	const stats = {
 		triggered: 0,
-		covered: 0,
-		healed: 0,
 		errors: 0,
 		retried: 0,
 		recovered: 0,
@@ -127,26 +124,16 @@ export const createChangeActions = ({
 				stats.retryStale++;
 				return;
 			}
-			// What the action did (changeProbe.js `actOnChange`): 'acted' (or nothing, for an injected
-			// `act`), or one of the two cases an active invalidation leaves nothing to do for —
-			// 'covered' (no baseline either: the change stays detectable) and 'healed' (the baseline
-			// moves; the claim stays, since no page was expired and it still describes the cached one).
-			const outcome = (await act(item.row, item)) ?? 'acted';
-			if (outcome === 'covered') {
-				stats.covered++;
-			} else {
-				// AFTER the action, never before — see the module comment. `clearClaim` goes with it
-				// because the page was just hard-expired, so whatever the stored page claim described is
-				// no longer being served.
-				const acted = outcome !== 'healed';
-				await write(item.row.url, item.observed, {
-					rowExists: item.rowExists,
-					clearClaim: acted,
-					fingerprint: item.fingerprint,
-				});
-				if (acted) stats.triggered++;
-				else stats.healed++;
-			}
+			await act(item.row, item);
+			// AFTER the action, never before — see the module comment. `clearClaim` goes with it because
+			// the page was just hard-expired, so whatever the stored page claim described is no longer
+			// being served.
+			await write(item.row.url, item.observed, {
+				rowExists: item.rowExists,
+				clearClaim: true,
+				fingerprint: item.fingerprint,
+			});
+			stats.triggered++;
 			if (retry) stats.recovered++;
 		} catch (e) {
 			if (!retry) {

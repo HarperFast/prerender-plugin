@@ -158,8 +158,8 @@ const newStats = () => ({
 	unchanged: 0,
 	changed: 0,
 	triggered: 0, // changes acted on: page hard-expired, render filed ahead of rotation, baseline written
-	covered: 0, // changes an active invalidation already refuses every page of: not acted on, baseline NOT moved
-	healed: 0, // changes every page of which was re-rendered after the trip and agrees: baselined, not acted on (counted in probe_caught_up)
+	covered: 0, // changes an active invalidation already answers (every page refused, or verified on proof): not counted `changed`, not acted on, baseline NOT moved
+	healed: 0, // changes every page of which was re-rendered after the trip and shows: baselined, not acted on — OVERLAYS changed, counted in caughtUp
 	rowErrors: 0, // ProbeState reads/writes that threw: the row is skipped (or its write lost) and the pass goes on
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
@@ -334,27 +334,13 @@ const probeOnce = async (rule, url) => {
  * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
  * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
-export const actOnChange = async (row, { coveredBy = null, evidence = null } = {}) => {
+export const actOnChange = async (row) => {
 	const nowMs = Date.now();
 	const keys = cacheKeysOf(row.url);
 	const hardExpiredAt = nowMs - config.page.swrTtl;
 	const pages = await Promise.all(
-		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt', 'lastCached'] }))
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] }))
 	);
-	// NOTHING TO DO WHILE AN INVALIDATION HOLDS THE SCOPE — sweeps only (`coveredBy`), whenever the URL's
-	// scope has an active invalidation (see `coverageOf`). Two cases, and neither acts:
-	//   'covered'  every page predates the epoch and no verification lets it through: the invalidation
-	//              is refusing all of it already. Acting would add nothing a bot sees, and would make the
-	//              trip irreversible for this URL. The baseline is NOT moved either, so a false trip leaves
-	//              no glitch values behind for the next pass to "detect" back, and a true trip's page is
-	//              still acted on if the invalidation is cleared before it re-renders.
-	//   'healed'   every page was rendered after the trip, from the render whose claim AGREES with this
-	//              observation, on a baseline taken before the trip: the page shows the change. The
-	//              baseline moves, and the claim stays (it still describes the cached page).
-	if (coveredBy) {
-		const coverage = await coverageOf(row.url, pages, coveredBy, evidence);
-		if (coverage) return coverage;
-	}
 	// EXPIRE FIRST: if anything below fails, the page has at least stopped serving known-wrong content,
 	// and the stale baseline makes the next probe act again. A page already expired this far (a change
 	// found again before its render landed) is not patched again — one replicated write per device
@@ -387,47 +373,60 @@ export const actOnChange = async (row, { coveredBy = null, evidence = null } = {
 		changedAt: nowMs,
 		demandPeriod: demand.known ? demand.periodMs : undefined,
 	});
-	return 'acted';
 };
 
 /**
- * What an active invalidation already does for this URL's pages: 'covered', 'healed' or null (act).
- * `epochFor(url)` resolves the epoch the serve path applies (`at`, with the pad) and the trip instant
- * itself (`trippedAt`). Per page:
+ * What an active invalidation already does for the pages of a URL a pass would act on: 'covered',
+ * 'healed' or null (act). `epochFor(url)` resolves the epoch the serve path applies (`at`, with the pad)
+ * and the trip instant itself (`trippedAt`). Per page:
  *
- *   REFUSED  rendered at or before the epoch — `!(lastCached > at)`, the serve path's own NaN-safe test —
- *            and not exempted by a page verification (`resolveServeStatus`).
- *   HEALED   rendered by (or after) the render that wrote the stored claim (`lastCached >= pageClaimAt`,
- *            the verification basis rule), that render came after the epoch, the claim AGREES with this
- *            observation (`evidence.pageAgrees`: the claim pair compared and agreed, no armed mapped
- *            field disagreeing), and the baseline was taken BEFORE the trip — so the change this probe
- *            sees is the trip's own, which the page was rendered after. At the main deployment most
- *            changed slots (regular, sale, percent-off) are unmapped, so `caughtUp` never fires for
- *            them, and without this rule a pass during an invalidation expired every page the
- *            accelerator had already re-rendered correctly: up to ~78k per node on one trip night.
+ *   REFUSED   rendered at or before the epoch — `!(lastCached > at)`, the serve path's own NaN-safe
+ *             test — and not exempted by a page verification (`resolveServeStatus`).
+ *   VERIFIED  rendered before the epoch but served on proof: the render that wrote the stored claim
+ *             (`lastCached >= pageClaimAt`, the verification basis rule) and that claim AGREES with this
+ *             observation (`pageAgrees`: the claim pair compared and agreed, no armed mapped field
+ *             disagreeing). While verification is armed for the rule, the verification is WRITTEN here —
+ *             without it, a page rendered after the reprice but before the trip (the reprice-to-trip gap,
+ *             up to one canary interval) could never be rescued: it is re-detected as changed every pass
+ *             and never reaches the unchanged branch that writes verifications (review, round 3). An
+ *             existing verification with an agreeing claim counts the same.
+ *   HEALED    rendered after the epoch, by (or after) the render that wrote the agreeing claim, on a
+ *             baseline taken before the trip, and every changed slot is one that page shows
+ *             (`changeShown`) — so the change this probe sees is the trip's own, which the page was
+ *             rendered after. Without the rule a pass during an invalidation expired every page the
+ *             accelerator had already re-rendered correctly.
  *
- * All pages healed -> 'healed'; every page refused or healed, at least one refused -> 'covered' (the
- * refused one keeps the stale baseline); no page at all -> 'covered'; anything else -> null.
+ * Every page HEALED -> 'healed' (the pass moves the baseline); every page refused, verified or healed,
+ * with at least one not healed -> 'covered' (nothing done, the baseline stays: a false trip leaves no
+ * glitch value behind, and a true trip's page is still acted on once the invalidation is cleared); no page
+ * at all -> 'covered'; anything else -> null, and the pass acts.
  */
-const coverageOf = async (url, pages, epochFor, evidence) => {
+const coverageOf = async (url, { pageAgrees, pageClaimAt, probedAt, changeShown, verify }, epochFor) => {
 	const epoch = await epochFor(url);
 	if (!epoch) return null;
+	const keys = cacheKeysOf(url);
+	const pages = await Promise.all(
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'lastCached'] }))
+	);
 	const { verifiedAtMs, basisAtMs } = await resolveVerification(url);
-	const claimAt = epochOf(evidence?.pageClaimAt);
-	const probedAt = Number.isFinite(evidence?.probedAt) ? evidence.probedAt : NaN;
-	const healedRender = evidence?.pageAgrees === true && claimAt > epoch.at && probedAt < epoch.trippedAt;
-	let refused = 0;
+	const claimAt = epochOf(pageClaimAt);
+	const healedRender = changeShown === true && claimAt > epoch.at && probedAt < epoch.trippedAt;
+	let others = 0;
+	let verifyDue = false;
 	for (const page of pages) {
 		if (!page) continue;
 		const lastCached = dateColumnMs(page.lastCached);
+		const described = pageAgrees === true && lastCached >= claimAt;
 		if (!(lastCached > epoch.at)) {
-			if (verifiedAtMs > epoch.at && lastCached >= basisAtMs) return null;
-			refused++;
+			if (verifiedAtMs > epoch.at && lastCached >= basisAtMs && !described) return null;
+			if (described && verify) verifyDue = true;
+			others++;
 		} else if (!(healedRender && lastCached >= claimAt)) {
 			return null;
 		}
 	}
-	return refused > 0 || !pages.some(Boolean) ? 'covered' : 'healed';
+	if (verifyDue) await verify(url, pageClaimAt);
+	return others > 0 || !pages.some(Boolean) ? 'covered' : 'healed';
 };
 
 /**
@@ -638,8 +637,12 @@ export const recordPageClaim = async (
 			select: ['url', 'signature', 'probedAt', 'ruleFingerprint', 'renderRefiledAt'],
 		});
 		const verdict = existing && claim ? await renderClaimVerdict(url, rule, claim, existing) : null;
-		// The bound (see `renderClaimVerdict`) rides in the claim's own write: no extra write.
-		if (verdict?.stale) fields.renderRefiledAt = new Date();
+		// The bound (see `renderClaimVerdict`) rides in the claim's own write: no extra write. The claim's
+		// own stamp is kept for the confirming re-probe, which must not act on (or clear) a newer claim.
+		if (verdict?.stale) {
+			fields.renderRefiledAt = new Date();
+			noteSuspectClaim(url, claimAt.getTime());
+		}
 		if (existing) await probeStateTable().patch(url, { url, ...fields });
 		// A record of nothing is not worth creating a row for; on an EXISTING row the nulls above are
 		// the point (they retire an older render's record).
@@ -702,29 +705,32 @@ const renderClaimVerdict = async (url, rule, claim, stored) => {
 
 /**
  * Could the render, rather than the origin, be what changed? False when the origin is known to have moved
- * since the probe last observed the URL: the most recent anchor (anchored mode) or an active
- * invalidation's trip came after the latest observation (`observedSince`, or the baseline's own write).
+ * since the probe last observed the URL:
+ *
+ *   an active invalidation's trip came after the BASELINE (`probedAt`). Not after a walk-past: a pass
+ *     during an invalidation leaves a covered page's baseline where it was (`coverageOf`), so "the reseed
+ *     walked past it" says nothing about what the origin said — and counting it made every covered page
+ *     that later healed cost a re-probe, for the whole invalidation (review, round 3).
+ *   in anchored mode, the most recent anchor came after the latest observation (`observedSince`, or the
+ *     baseline's own write).
+ *
  * True otherwise — including when nothing is known (interval or continuous mode, no invalidation), which
  * is a question to ASK the origin, never a reason to trust a baseline of any age.
  */
 const mayBeStale = async (url, probedAt) => {
-	let movedAt = -Infinity;
-	if (isAnchored()) {
-		const anchor = previousAnchorOccurrence();
-		if (Number.isFinite(anchor)) movedAt = anchor;
-	}
+	const baselineAt = Number.isFinite(probedAt) ? probedAt : -Infinity;
 	try {
 		const epoch = await resolveInvalidation(routeScopeForUrl(url));
 		// The epoch carries the serve path's pad; the trip itself is the instant that matters here.
-		if (epoch) movedAt = Math.max(movedAt, epoch.at - config.invalidation.pad);
+		if (epoch && baselineAt < epoch.at - config.invalidation.pad) return false;
 	} catch {
 		// Unknown: judge on the anchor alone.
 	}
-	if (movedAt === -Infinity) return true;
+	if (!isAnchored()) return true;
+	const anchor = previousAnchorOccurrence();
+	if (!Number.isFinite(anchor)) return true;
 	const since = observedSince((await sweepStateForRenderCheck())?.sweep, url);
-	return (
-		Math.max(Number.isFinite(probedAt) ? probedAt : -Infinity, Number.isFinite(since) ? since : -Infinity) >= movedAt
-	);
+	return Math.max(baselineAt, Number.isFinite(since) ? since : -Infinity) >= anchor;
 };
 
 /**
@@ -764,11 +770,13 @@ const sweepStateForRenderCheck = async () => {
  */
 const rechecksInFlight = new Set();
 export const actOnStaleRender = (url, target = null) => {
+	const claimAtMs = suspectClaims.get(url) ?? NaN;
+	suspectClaims.delete(url);
 	if (rechecksInFlight.size >= RECHECK_MAX_PENDING) {
 		countProbe('render_mismatch', 'shed');
 		return Promise.resolve();
 	}
-	const running = runDetached(() => confirmStaleRender(url, target)).catch((e) => {
+	const running = runDetached(() => confirmStaleRender(url, target, claimAtMs)).catch((e) => {
 		countProbe('render_mismatch', 'error');
 		logger.warn?.(`[prerender] change-probe: render recheck of ${url} failed: ${e?.message ?? String(e)}`);
 	});
@@ -777,30 +785,67 @@ export const actOnStaleRender = (url, target = null) => {
 	return Promise.resolve();
 };
 
+// The claim stamp (`pageClaimAt`, epoch ms) of each suspect render, from `recordPageClaim` to the
+// `actOnStaleRender` the same result path calls a moment later on the same worker. Bounded: a result
+// path that never makes the call (no target) must not grow it.
+const suspectClaims = new Map();
+const noteSuspectClaim = (url, claimAtMs) => {
+	suspectClaims.delete(url);
+	suspectClaims.set(url, claimAtMs);
+	if (suspectClaims.size > RECHECK_MAX_PENDING) suspectClaims.delete(suspectClaims.keys().next().value);
+};
+
 // Per worker: re-probes waiting for a pacing slot. Past this, a suspect render is left to the pass.
 const RECHECK_MAX_PENDING = 256;
 // The longest a re-probe waits for its node-wide slot before it is shed (counted `shed`).
 const RECHECK_MAX_WAIT_MS = MINUTE;
 
 /**
- * THE RE-PROBES' PACE, NODE-WIDE: a render lands on whichever worker the fleet's POST reached, so a
- * per-worker pace would let sixteen workers send sixteen times the rate. One shared cell holds the next
- * free slot (epoch ms); each re-probe takes the next slot `1000 / ratePerSecond` ms on, by compare-and-
- * swap, and waits for it — or is shed when that slot is more than `RECHECK_MAX_WAIT_MS` away. Paced at
- * `changeProbe.ratePerSecond`, like the canary: beside a running sweep that can add up to its rate again,
- * which is the same bound the canary's overlap already has — and the re-probes are a trickle (see
- * `renderClaimVerdict`).
+ * THE RE-PROBES' PACE: NODE-WIDE, AND OUT OF THE SWEEP'S BUDGET, NOT BESIDE IT.
+ *
+ * Node-wide because a render lands on whichever worker the fleet's POST reached, so a per-worker pace
+ * would let sixteen workers send sixteen times the rate. Out of the sweep's budget because
+ * `ratePerSecond` is the number agreed with whoever runs the origin: a re-probe paced at it beside a
+ * sweep running at it is twice the agreed rate (review, round 3). So a running sweep publishes the
+ * HEADROOM it leaves (`publishSweepHeadroom`: the ceiling minus the rate it is paced at, divided by
+ * whatever backoff the origin or the node has imposed on it), and the re-probes share only that — none
+ * while a sweep runs at the ceiling or the origin is pushing back, the whole ceiling when no sweep runs.
+ *
+ * One shared cell (`[nextSlot, headroom in milli-requests/s, when the sweep last published it]`, epoch
+ * ms): each re-probe takes the next slot `1000 / headroom` ms on, by compare-and-swap, and waits for it —
+ * or is shed (the pass will get to the URL) when that slot is more than `RECHECK_MAX_WAIT_MS` away. A
+ * sweep that stops publishing (it ended, or its worker died) stops counting after `SWEEP_PACE_FRESH_MS`.
  */
-let recheckPace = null;
+const SWEEP_PACE_FRESH_MS = 2 * MINUTE;
+let originPace = null;
+const originPaceCell = () => (originPace ??= new BigInt64Array(getSab('change_probe_origin_pace', 24)));
+
+/** The running sweep's share of the node's probe budget: what it leaves for the re-probes. Null = done. */
+const publishSweepHeadroom = (headroom) => {
+	const cell = originPaceCell();
+	Atomics.store(cell, 1, BigInt(Math.max(0, Math.round((headroom ?? 0) * 1000))));
+	Atomics.store(cell, 2, headroom === null ? 0n : BigInt(Date.now()));
+};
+
+const recheckRate = () => {
+	const ceiling = Math.max(1, config.changeProbe.ratePerSecond);
+	const cell = originPaceCell();
+	const publishedAt = Number(Atomics.load(cell, 2));
+	if (!(publishedAt > 0 && Date.now() - publishedAt < SWEEP_PACE_FRESH_MS)) return ceiling;
+	return Math.min(ceiling, Number(Atomics.load(cell, 1)) / 1000);
+};
+
 const reserveRecheckSlot = () => {
-	recheckPace ??= new BigInt64Array(getSab('change_probe_recheck_pace', 8));
-	const step = BigInt(Math.max(1, Math.ceil(1000 / Math.max(1, config.changeProbe.ratePerSecond))));
+	const cell = originPaceCell();
+	const rate = recheckRate();
+	if (!(rate > 0)) return null;
+	const step = BigInt(Math.max(1, Math.ceil(1000 / rate)));
 	for (let attempt = 0; attempt < 32; attempt++) {
 		const now = BigInt(Date.now());
-		const next = Atomics.load(recheckPace, 0);
+		const next = Atomics.load(cell, 0);
 		const slot = next > now ? next : now;
 		if (slot - now > BigInt(RECHECK_MAX_WAIT_MS)) return null;
-		if (Atomics.compareExchange(recheckPace, 0, next, slot + step) === next) return Number(slot);
+		if (Atomics.compareExchange(cell, 0, next, slot + step) === next) return Number(slot);
 	}
 	return null;
 };
@@ -817,7 +862,7 @@ const reserveRecheckSlot = () => {
  *                observation becomes the baseline, nothing is expired — `cleared`.
  *   neither      nothing comparable, a failed probe, the claim gone: nothing is done.
  */
-const confirmStaleRender = async (url, target) => {
+const confirmStaleRender = async (url, target, claimAtMs = NaN) => {
 	const slot = reserveRecheckSlot();
 	if (slot === null) {
 		countProbe('render_mismatch', 'shed');
@@ -842,8 +887,15 @@ const confirmStaleRender = async (url, target) => {
 	}
 	const stored = await probeStateTable().get({
 		id: url,
-		select: ['url', 'signature', 'pageSignature', 'ruleFingerprint'],
+		select: ['url', 'signature', 'pageSignature', 'pageClaimAt', 'ruleFingerprint'],
 	});
+	// A NEWER RENDER LANDED while this waited for its slot: its claim is what describes the cached page now,
+	// and it had its own render check. This one has nothing left to judge.
+	const newerThan = (value) => Number.isFinite(claimAtMs) && epochOf(value) > claimAtMs;
+	if (stored && newerThan(stored.pageClaimAt)) {
+		countProbe('render_mismatch', 'superseded');
+		return;
+	}
 	const verdict = stored?.pageSignature
 		? compareClaims(stored.pageSignature, apiClaimOf(values, rule.pageCheck))
 		: null;
@@ -865,10 +917,13 @@ const confirmStaleRender = async (url, target) => {
 		demandInterval: target?.demandInterval ?? null,
 	});
 	if (fresh !== stored.signature) {
-		// The bound re-armed in the same write: `renderRefiledAt` at or after the new `probedAt`.
+		// The bound re-armed in the same write: `renderRefiledAt` at or after the new `probedAt`. The claim
+		// is cleared only if it is still the one judged here — a render that landed during the action wrote
+		// a newer claim describing a newer page, and wiping it would blind the next comparison.
+		const current = await probeStateTable().get({ id: url, select: ['url', 'pageClaimAt'] });
 		await writeSignature(url, fresh, {
 			rowExists: true,
-			clearClaim: true,
+			clearClaim: !newerThan(current?.pageClaimAt),
 			fingerprint: rule.fingerprint,
 			extra: { renderRefiledAt: new Date() },
 		});
@@ -1140,6 +1195,12 @@ export const runProbePass = async ({
 	// Called with (rule, row) for every origin CHANGE the pass detects (the rows counted `changed`) —
 	// what the detection-lag metric is emitted from.
 	onChange = () => {},
+	// What an active invalidation already does for a URL the pass would act on (`coverageOf`): 'covered',
+	// 'healed' or null. Null = no such check (the canary, and every pass that does not wire it).
+	coverageOf = null,
+	// Told the rate each batch was paced at and the backoff on it (`(rate, originThrottle, loadThrottle)`),
+	// so a sweep can publish the budget it leaves (`publishSweepHeadroom`).
+	onPace = () => {},
 } = {}) => {
 	const stats = newStats();
 	onStart(stats);
@@ -1362,32 +1423,71 @@ export const runProbePass = async ({
 		};
 		let ignoredOnly = false;
 		let caughtUp = false;
+		// The changed slots that need the page to show them (ignored ones excluded), or null for a
+		// status-signal literal — a state, not slots.
+		let relevant = null;
 		if (signatureChanged) {
 			const slots = changedSlots(stored.signature, comparable);
 			if (slots === null) {
 				bump(stats.slotChanges, rule.label, 'signal');
 			} else {
 				for (const slot of slots) bump(stats.slotChanges, rule.label, String(slot));
-				const relevant = slots.filter((slot) => !(pageCheck?.ignoreChanges ?? []).includes(slot));
+				relevant = slots.filter((slot) => !(pageCheck?.ignoreChanges ?? []).includes(slot));
 				if (!relevant.length) ignoredOnly = true;
 				else if (verdicts) caughtUp = relevant.every((slot) => slotCaughtUp(slot));
 			}
 		}
 
 		const needsRender = signatureChanged && !ignoredOnly && !caughtUp;
+
+		// WHAT AN ACTIVE INVALIDATION ALREADY DOES FOR THE PAGE (`coverage`, the sweep only — see
+		// `coverageOf`), decided here rather than in the action so a covered row is COUNTED as one: an
+		// armed pass that would act asks first, and 'covered' (the invalidation refuses every page, or a
+		// verification now serves it on proof) does nothing at all — no baseline, no action, no `changed`,
+		// no detection lag, so a long invalidation does not re-report the same URLs as changes every pass —
+		// while 'healed' (every page re-rendered after the trip, showing this change) moves the baseline
+		// like a caught-up change. HEALED NEEDS EVERY CHANGED SLOT SHOWN: in the claim pair, which agreed,
+		// or on an armed mapped field that agreed — an unmapped slot that moved could be a second change
+		// after the heal render, which only a re-render resolves (review, round 3).
+		const pageAgrees = claimVerdict === true && !mappedDisagrees;
+		let coverage = null;
+		if (coverageOf && !dryRun && stored?.signature && (needsRender || pageDisagrees || mappedDisagrees)) {
+			const pairSlots = claimPair ? [pageCheck.priceFrom, pageCheck.availableFrom] : [];
+			const shown = (slot) =>
+				pairSlots.includes(slot) ||
+				(verdicts ?? []).some(({ field, verdict }) => field.slot === slot && verdict === true && armed(field));
+			coverage = await coverageOf(row.url, {
+				pageAgrees,
+				pageClaimAt: stored.pageClaimAt ?? null,
+				probedAt: Number.isFinite(stored.probedAt) ? stored.probedAt : null,
+				changeShown: pageAgrees && relevant !== null && relevant.every(shown),
+				verify: verificationArmed ? verify : null,
+			});
+		}
 		// Bucket by SIGNATURE outcome alone, BEFORE the page check influences control flow:
 		// `probed = seeded + rebaselined + unchanged + changed + failed` is the documented invariant, and the
 		// canary's denominator is changed + unchanged — a page-mismatch row that skipped both
 		// would silently shrink the mass-change sample right when claims are most likely to be
 		// stale. `pageMismatch`, `caughtUp` and `ignored` OVERLAY these buckets; they never replace
 		// them. An IGNORED change is bucketed unchanged — for the canary it is not a change.
-		if (signatureChanged && !ignoredOnly) {
+		// A COVERED change is its own bucket: the partition is `probed = seeded + rebaselined + unchanged +
+		// changed + covered + failed`, and the canary (which never covers) keeps its denominator.
+		if (coverage === 'covered' && signatureChanged && !ignoredOnly) {
+			stats.covered++;
+		} else if (signatureChanged && !ignoredOnly) {
 			stats.changed++;
 			onChange(rule, row);
 		} else if (stored?.signature) stats.unchanged++;
 		else stats.seeded++;
 		if (ignoredOnly) stats.ignored++;
 		if (caughtUp) stats.caughtUp++;
+		if (coverage === 'covered') return;
+		if (coverage === 'healed') {
+			stats.caughtUp++;
+			stats.healed++;
+			await write(row.url, observed, { rowExists: true, fingerprint: rule.fingerprint });
+			return;
+		}
 		if (!needsRender && !pageDisagrees && !mappedDisagrees) {
 			if (!stored?.signature) {
 				// First observation: baseline it, trigger nothing — the page's content is not known
@@ -1457,13 +1557,8 @@ export const runProbePass = async ({
 			rowExists: stored !== null,
 			fingerprint: rule.fingerprint,
 			detectedAt: now(),
-			// What the stored page claim says about this observation, for an active invalidation's
-			// "healed" test (`coverageOf`) and the retry's staleness test (`stillDue`).
-			page: {
-				pageAgrees: claimVerdict === true && !mappedDisagrees,
-				pageClaimAt: stored?.pageClaimAt ?? null,
-				probedAt: Number.isFinite(stored?.probedAt) ? stored.probedAt : null,
-			},
+			// The baseline this was detected against, for the retry's staleness test (`stillDue`).
+			page: { probedAt: Number.isFinite(stored?.probedAt) ? stored.probedAt : null },
 		});
 	};
 
@@ -1544,6 +1639,7 @@ export const runProbePass = async ({
 		const { rate, behind } = pacedRate({ ratePerSecond, cycleRate });
 		if (behind && cycleTarget > 0 && sliceSize > 0) stats.behindBatches++;
 		stats.pacedRate = rate;
+		onPace(rate, throttle, loadThrottle);
 
 		const elapsed = now() - started;
 		batch.length = 0;
@@ -1733,6 +1829,7 @@ const PASS_SERIES = [
 	['throttled', 'throttled'],
 	['pageMismatch', 'page_mismatch'],
 	['caughtUp', 'caught_up'],
+	['covered', 'covered'],
 	['ignored', 'ignored'],
 	['behindBatches', 'cycle_behind'],
 ];
@@ -2134,9 +2231,6 @@ export const runProbeSweepOnce = async ({
 	});
 	const counts = () => ({
 		...live,
-		// A change the page had already healed from under an invalidation (`coverageOf`) is a caught-up
-		// change, found by the action rather than by the walk.
-		caughtUp: (live?.caughtUp ?? 0) + (triggers?.stats.healed ?? 0),
 		triggered: triggers?.stats.triggered ?? 0,
 		errors: (triggers?.stats.errors ?? 0) + (live?.rowErrors ?? 0),
 	});
@@ -2154,9 +2248,9 @@ export const runProbeSweepOnce = async ({
 		// (`coverageOf`) — the reseed a trip chains, and just as much the anchored pass that interrupts that
 		// reseed, or any pass that runs while the scope is invalidated. The canary is the exception (it
 		// acts on its cohort and baselines it, or it would re-detect, and re-trip on, the same change).
-		const coveredBy = epochResolver();
+		const epochFor = epochResolver();
 		triggers = createChangeActions({
-			act: (target, item) => actOnChange(target, { coveredBy, evidence: item.page }),
+			act: actOnChange,
 			write: writeSignature,
 			concurrency: config.changeProbe.trigger.concurrency,
 			onError: logActionError,
@@ -2225,6 +2319,11 @@ export const runProbeSweepOnce = async ({
 			onStart: (running) => (live = running),
 			onBatch: () => emit(counts()),
 			onChange: detectionLag,
+			coverageOf: (url, evidence) => coverageOf(url, evidence, epochFor),
+			onPace: (rate, originThrottle, loadThrottle) =>
+				publishSweepHeadroom(
+					Math.max(0, config.changeProbe.ratePerSecond - rate) / Math.max(1, originThrottle * loadThrottle)
+				),
 		});
 		// A cancelled pass starts nothing more; what is in flight finishes. Either way wait for the
 		// actions in flight — the pass is not finished while pages it decided to expire are unexpired,
@@ -2239,8 +2338,6 @@ export const runProbeSweepOnce = async ({
 			await triggers.retryFailed();
 		}
 		stats.triggered = triggers.stats.triggered;
-		stats.covered = triggers.stats.covered;
-		stats.healed = triggers.stats.healed;
 		stats.retryStale = triggers.stats.retryStale;
 		stats.errors = triggers.stats.errors;
 		stats.retried = triggers.stats.retried;
@@ -2325,14 +2422,17 @@ export const runProbeSweepOnce = async ({
 	} finally {
 		stopHeartbeat();
 		sweepRunning = false;
+		try {
+			publishSweepHeadroom(null);
+		} catch {
+			// A coordination buffer that cannot be reached: the re-probes' pace ages the last value out.
+		}
 		// The trip's reseed, chained after this pass stood down for it. Cleared BEFORE the chained
 		// pass starts so the reseed does not cancel itself.
 		const chained = sweepInterrupt;
 		sweepInterrupt = null;
 		if (chained) {
-			runProbeSweepOnce({ dryRun: chained.dryRun, label: chained.label, reseed: true, startedBy: 'reseed' }).catch(
-				(e) => logger.error(e)
-			);
+			void runSweepResilient({ dryRun: chained.dryRun, label: chained.label, reseed: true, startedBy: 'reseed' });
 		}
 	}
 };
@@ -2365,7 +2465,7 @@ export const requestSweepReseed = (label, { dryRun = false } = {}) => {
 		logger.warn(`[prerender] change-probe: interrupting the running sweep to reseed (${label})`);
 		return { chained: true };
 	}
-	runProbeSweepOnce({ dryRun, label, reseed: true, startedBy: 'reseed' }).catch((e) => logger.error(e));
+	void runSweepResilient({ dryRun, label, reseed: true, startedBy: 'reseed' });
 	return { chained: false };
 };
 
@@ -2974,7 +3074,9 @@ const armResumeCheck = (delay = null) => {
  *
  * The evidence is `completedArmedOrigin` / `completedDryOrigin`, which only a completed pass of that
  * kind writes (`runProbeSweepOnce`): a console dry run after the anchored pass no longer hides it. A row
- * from before those fields existed falls back to the last pass that ended.
+ * from before those fields existed falls back to the last pass that ended — so on the FIRST boot after the
+ * upgrade, a node whose last pre-upgrade pass was a console dry run catches the night up once even though
+ * its anchored pass ran (review, round 3: accepted; the fields exist from then on).
  */
 const anchorServedSince = (sweep, since) => {
 	const armed = epochMsOf(sweep?.completedArmedOrigin);
@@ -3042,7 +3144,7 @@ const checkResume = async () => {
 					`from ${cursor ? JSON.stringify(cursor) : 'the start (no cursor was published)'}`
 			);
 			const anchorAt = epochMsOf(sweep.anchorAt);
-			runProbeSweepOnce({
+			void runSweepResilient({
 				startedBy: 'resume',
 				resume: { cursor, originStartedAt },
 				reseed: sweep.reseed === true || sweep.startedBy === 'reseed',
@@ -3050,7 +3152,7 @@ const checkResume = async () => {
 				dryRun: typeof sweep.dryRun === 'boolean' ? sweep.dryRun : undefined,
 				label: sweep.label ?? null,
 				anchorAt: Number.isFinite(anchorAt) ? anchorAt : null,
-			}).catch((e) => logger.error(e));
+			});
 			return decided({ resumed: true, from: originStartedAt, cursor });
 		}
 	}
@@ -3277,9 +3379,39 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 	}
 };
 
-// How often, and how soon, a thrown anchored pass is resumed before the anchor gives up on it.
+// How often, and how soon, a thrown pass is resumed before it is given up on.
 const ANCHOR_RESUMES = 3;
 const ANCHOR_RESUME_DELAY_MS = MINUTE;
+
+/**
+ * Run a detached sweep — the reseed a trip chains, the boot resume — and, if it THROWS, resume it from the
+ * cursor its error record carries, up to `ANCHOR_RESUMES` times, `ANCHOR_RESUME_DELAY_MS` apart: the same
+ * bounded recovery `runAnchoredPass` gives the anchored pass, so one storage fault does not cost the rest
+ * of the slice. Never rejects; resolves with the last attempt's record, or null once it gives up.
+ */
+const runSweepResilient = async (options) => {
+	let run = options;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await runProbeSweepOnce(run);
+		} catch (e) {
+			logger.error(e);
+			const failed = (await readProbeState())?.sweep?.lastRun;
+			if (attempt >= ANCHOR_RESUMES || !failed?.error || !config.changeProbe.enabled) return null;
+			const resume = {
+				cursor: typeof failed.cursor === 'string' ? failed.cursor : '',
+				originStartedAt: epochMsOf(failed.resumedFrom ?? failed.startedAt),
+			};
+			logger.warn(
+				`[prerender] change-probe: a ${options.startedBy ?? 'detached'} pass threw (${e?.message ?? e}) — resuming it ` +
+					`from ${resume.cursor ? JSON.stringify(resume.cursor) : 'the start'} in ${ANCHOR_RESUME_DELAY_MS / 1000}s ` +
+					`(attempt ${attempt + 1} of ${ANCHOR_RESUMES})`
+			);
+			await waitUnref(ANCHOR_RESUME_DELAY_MS);
+			run = { ...options, startedBy: 'resume', resume };
+		}
+	}
+};
 
 // A wait that never holds the process open (the global timer, which is also what tests can drive).
 const waitUnref = (ms) =>
@@ -3684,7 +3816,8 @@ export const resetChangeProbeState = () => {
 	lastFactsUnsupportedWarnAt = 0;
 	lastFactsRefusedWarnAt = 0;
 	renderCheckState = { at: 0, row: null };
-	recheckPace?.fill(0n);
+	originPace?.fill(0n);
+	suspectClaims.clear();
 	mappingGuard = null;
 	measuredSliceSize = null;
 	resumePending = false;

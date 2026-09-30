@@ -1417,8 +1417,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'origin is known to have moved since the probe last observed the URL (the most recent anchor in ' +
 					'anchored mode, an active invalidation’s trip): the pass will compare that page itself. One ' +
 					'confirmation per stored observation bounds a page that disagrees every time. The confirming ' +
-					'requests are paced node-wide at `ratePerSecond` (on top of a running sweep, like the canary) and ' +
-					'shed when the next slot is over a minute away. Dry run counts only and asks nothing. Outcomes are ' +
+					'requests come out of the SAME node-wide `ratePerSecond` budget as the sweep — only the headroom a ' +
+					'running sweep leaves (none while it runs at the ceiling or the origin pushes back; all of it when ' +
+					'no sweep runs) — and are shed, left to the pass, when the next slot is over a minute away. Dry run ' +
+					'counts only and asks nothing. Outcomes are ' +
 					'`probe_render_mismatch`. Costs no read, write or request on a render that agrees.'
 			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {

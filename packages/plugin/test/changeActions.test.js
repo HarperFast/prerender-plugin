@@ -234,22 +234,3 @@ test('round 2 item 9: a retry whose detection is no longer current is SKIPPED, n
 	assert.equal(actions.stats.retryStale, 1);
 	assert.equal(actions.stats.recovered, 0);
 });
-
-test('round 2 item 1: an action that resolves covered writes no baseline; healed writes it and keeps the claim', async () => {
-	const writes = [];
-	const outcomes = { a: 'covered', b: 'healed', c: undefined };
-	const actions = createChangeActions({
-		act: async (row, it) => {
-			assert.equal(it.row, row, 'the whole item reaches the action');
-			return outcomes[row.url];
-		},
-		write: async (url, observed, opts) => writes.push([url, opts.clearClaim]),
-	});
-	for (const url of ['a', 'b', 'c']) await actions.submit(item(url));
-	await actions.drain();
-	assert.deepEqual(writes.sort(), [
-		['b', false],
-		['c', true],
-	]);
-	assert.deepEqual([actions.stats.covered, actions.stats.healed, actions.stats.triggered], [1, 1, 1]);
-});

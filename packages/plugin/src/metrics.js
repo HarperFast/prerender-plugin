@@ -646,7 +646,10 @@ export const METRICS = Object.freeze({
 			'dry run — nothing is deferred; errors = actions that threw (each is retried once when the walk ends — ' +
 			'the pass record has retried/recovered/unacted — and a change still unacted is found again on its next ' +
 			'probe; expect zero); caught_up = changes the cached page already showed (a mapped pageCheck field ' +
-			'agreed with the new value), baseline moved, nothing triggered — they overlay changed; ignored = changes ' +
+			'agreed with the new value, or every page of it was re-rendered after an active invalidation\u2019s trip and ' +
+			'shows the change), baseline moved, nothing triggered — they overlay changed; covered = changes an active ' +
+			'invalidation already answers (every page refused, or served on a page verification): not counted ' +
+			'changed, not acted on, baseline kept, re-counted each pass until the page re-renders; ignored = changes ' +
 			'confined to pageCheck.ignoreChanges slots, not counted as changed; probe_anchor = one emit per ' +
 			'anchor in anchored mode, detail = what became of it: on_time, interrupted (a dry-run or reseed pass ' +
 			'was asked to stand down first), chained (it waited for a pass that acts), caught_up (the process was ' +
@@ -664,7 +667,7 @@ export const METRICS = Object.freeze({
 			'the page shows it: baseline updated, nothing expired), recheck_failed or recheck_inconclusive; or, with ' +
 			'no request, bounded (already confirmed once against that observation — a page that disagrees every ' +
 			'time; left to the pass), untrusted (the origin is known to have moved since the probe last looked, so ' +
-			'the render may just be newer — left to the pass), shed (the node-wide pace was over a minute out), ' +
+			'the render may just be newer — left to the pass), shed (no slot within a minute in the budget a running sweep leaves), ' +
 			'dry_run, error. confirmed is stale renders caught before they served a pass-length; a steady bounded ' +
 			'is pages the endpoint and the page genuinely disagree on; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
@@ -795,6 +798,7 @@ export const METRICS = Object.freeze({
 					'probe_errors',
 					'probe_caught_up',
 					'probe_ignored',
+					'probe_covered',
 					'probe_anchor',
 					'probe_detection_lag',
 					'probe_render_mismatch',

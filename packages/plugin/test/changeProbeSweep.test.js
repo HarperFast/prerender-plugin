@@ -555,7 +555,7 @@ test('F7b: the reseed ACTS on a page re-rendered after the trip that then change
 		lastRun = (await changeProbe.readProbeStateForTest())?.sweep?.lastRun;
 	}
 	assert.equal(lastRun.dryRun, false, 'the reseed is armed');
-	assert.equal(lastRun.changed, 3);
+	assert.equal(lastRun.changed, 2, 'a covered change is counted covered, not changed (round 3)');
 	assert.equal(lastRun.triggered, 2, 'post and verified: pages a bot can still be served');
 	assert.equal(lastRun.covered, 1, 'pre: every page already refused by the invalidation');
 	assert.ok(pageOf('post').expiresAt < Date.now(), 'the post-trip page that changed no longer serves');
@@ -639,10 +639,11 @@ test('round 2 item 1: the reseed does NOT expire a page healed after the trip wh
 	const trip = Date.now() - 2 * HOUR;
 	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
 	seedTarget('healed');
-	answers.set('healed', { status: 200, body: { price: 8, available: true, regular: 12 } }); // the post-trip origin
+	// The post-trip origin: the price moved (a slot the claim pair shows); the unmapped slot did not.
+	answers.set('healed', { status: 200, body: { price: 8, available: true, regular: 12 } });
 	probeRows.set(pdp('healed'), {
 		url: pdp('healed'),
-		signature: '[10,true,15]', // the pre-trip baseline
+		signature: '[10,true,12]', // the pre-trip baseline
 		probedAt: new Date(trip - 24 * HOUR),
 		pageSignature: spec.pageClaimFromOffers(['8', 'USD', 'InStock']), // what the healed render claims
 		pageClaimAt: new Date(trip + HOUR),
@@ -660,6 +661,92 @@ test('round 2 item 1: the reseed does NOT expire a page healed after the trip wh
 	assert.equal(probeRows.get(pdp('healed')).signature, '[8,true,12]', 'its baseline moves to the post-trip values');
 	assert.ok(probeRows.get(pdp('healed')).pageSignature, 'and the claim stays: it still describes the page');
 	assert.equal(total('caught_up'), 1, 'counted as caught up');
+});
+
+test('round 3 N3: a change on a slot the page does not show is NOT healed — the heal render may predate it (R2-RV3b)', async () => {
+	// The heal render (trip+1h) showed price 8 and regular 12; the origin has since moved regular to 13,
+	// which no claim or mapped field can see. Only a re-render resolves it.
+	const spec = await import('../src/util/changeProbeSpec.js');
+	configurePair();
+	const trip = Date.now() - 3 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('second');
+	answers.set('second', { status: 200, body: { price: 8, available: true, regular: 13 } });
+	probeRows.set(pdp('second'), {
+		url: pdp('second'),
+		signature: '[10,true,15]',
+		probedAt: new Date(trip - 24 * HOUR),
+		pageSignature: spec.pageClaimFromOffers(['8', 'USD', 'InStock']),
+		pageClaimAt: new Date(trip + HOUR),
+		pageFacts: null,
+		ruleFingerprint: null,
+	});
+	seedPage('second', { lastCached: trip + HOUR, expiresAt: Date.now() + 90 * HOUR });
+	changeProbe.requestSweepReseed('r3');
+	const lastRun = await waitForLastRun('r3');
+	assert.equal(lastRun.healed, 0);
+	assert.equal(lastRun.triggered, 1, 'acted on');
+	assert.ok(pageOf('second').expiresAt < Date.now());
+});
+
+test('round 3 N2: a pre-trip page rendered after the reprice, whose claim agrees, is VERIFIED — and served (R2-NEW3)', async (t) => {
+	t.after(() => applyOptions({ invalidation: { verification: { enabled: false } } }));
+	const spec = await import('../src/util/changeProbeSpec.js');
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			dryRun: false,
+			rules: [{ ...PAIR_RULES()[0], invalidateScope: 'all' }],
+			ratePerSecond: 10_000,
+			concurrency: 2,
+			canary: { count: 10, interval: 0 },
+		},
+		invalidation: { verification: { enabled: true } },
+	});
+	const trip = Date.now() - 3 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('early');
+	answers.set('early', { status: 200, body: { price: 8, available: true, regular: 12 } });
+	probeRows.set(pdp('early'), {
+		url: pdp('early'),
+		signature: '[10,true,15]', // before the reprice
+		probedAt: new Date(trip - 24 * HOUR),
+		pageSignature: spec.pageClaimFromOffers(['8', 'USD', 'InStock']), // rendered after the reprice
+		pageClaimAt: new Date(trip - 20 * 60_000), // ...20 minutes before the canary tripped
+		pageFacts: null,
+		ruleFingerprint: null,
+	});
+	seedPage('early', { lastCached: trip - 20 * 60_000, expiresAt: Date.now() + 90 * HOUR });
+	changeProbe.requestSweepReseed('r');
+	const first = await waitForLastRun('r');
+	assert.equal(first.covered, 1);
+	const verification = verifications.get(pdp('early'));
+	assert.ok(verification, 'the verification is written');
+	assert.equal(new Date(verification.basisAt).getTime(), trip - 20 * 60_000, 'on the render the claim came from');
+	assert.ok(pageOf('early').expiresAt > Date.now(), 'not expired');
+	// The next pass: still covered (served on its verification), not re-counted as a change.
+	const second = await changeProbe.runProbeSweepOnce({ startedBy: 'anchor' });
+	assert.equal(second.changed, 0);
+	assert.equal(second.covered, 1);
+	assert.equal(second.triggered, 0);
+});
+
+test('round 3 N4: a covered URL is counted covered, with no probe_changed and no detection lag, every pass', async () => {
+	configure({});
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('pre');
+	seedBaseline('pre', '[10]', trip - 24 * HOUR);
+	answers.set('pre', { status: 200, body: { price: 8 } });
+	seedPage('pre', { lastCached: trip - HOUR });
+	for (let pass = 0; pass < 2; pass++) {
+		const result = await changeProbe.runProbeSweepOnce({ startedBy: 'anchor' });
+		assert.equal(result.changed, 0);
+		assert.equal(result.covered, 1);
+	}
+	assert.equal(total('changed'), 0);
+	assert.equal(series('detection_lag').length, 0);
+	assert.equal(total('covered'), 2, 'probe_covered says what the passes left to the invalidation');
 });
 
 test('round 2 item 1: a post-trip page whose claim DISAGREES, or a baseline taken after the trip, is still acted on', async () => {
@@ -897,4 +984,48 @@ test('round 2 item 8: a resume publishes its cursor WITH the claim, not 30s late
 		resume: { cursor: 'https://site.example.com/help/00005', originStartedAt: Date.now() - HOUR },
 	});
 	assert.equal(seen, 'https://site.example.com/help/00005');
+});
+
+test('round 3 N1: the render check’s re-probes share the sweep’s budget — none while a sweep runs at the ceiling', async () => {
+	configure({ chunkSize: 250, ratePerSecond: 10_000 });
+	for (let i = 0; i < 300; i++) seedTarget(String(i).padStart(3, '0'));
+	const gate = gateAt(250);
+	const pass = changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	for (let i = 0; i < 1000 && !gate.reached(); i++) await realSleep(5);
+	await flushTurns(5);
+	assert.equal(changeProbe.__reserveRecheckSlotForTest(), null, 'the sweep is at the ceiling: no headroom');
+	holdRow = async () => {};
+	gate.release();
+	await pass;
+	assert.ok(Number.isFinite(changeProbe.__reserveRecheckSlotForTest()), 'no sweep: the whole ceiling');
+});
+
+test('round 3 N6: a RESEED (and a boot resume) that throws is resumed from its cursor, like the anchored pass', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	try {
+		configure({ chunkSize: 250 });
+		for (let i = 0; i < 300; i++) seedTarget(String(i).padStart(3, '0'));
+		let chunks = 0;
+		const search = RegistryTable.search;
+		RegistryTable.search = function (query) {
+			if (++chunks === 2) throw new Error('registry read fault');
+			return search.call(this, query);
+		};
+		try {
+			changeProbe.requestSweepReseed('reseed after invalidating all');
+			for (let i = 0; i < 1000 && !(await sweepRow())?.lastRun?.error; i++) await realSleep(10);
+			assert.equal((await sweepRow()).lastRun.cursor, pdp('249'));
+			t.mock.timers.tick(60_000);
+			for (let i = 0; i < 1000 && (await sweepRow())?.lastRun?.startedBy !== 'resume'; i++) await realSleep(10);
+		} finally {
+			RegistryTable.search = search;
+		}
+		const row = await sweepRow();
+		assert.equal(row.lastRun.startedBy, 'resume');
+		assert.equal(row.lastRun.error, null);
+		assert.equal(row.lastRun.examined, 51, 'the tail from the cursor');
+		assert.equal(row.reseed, true, 'resumed as the reseed it was');
+	} finally {
+		t.mock.timers.reset();
+	}
 });

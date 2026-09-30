@@ -188,8 +188,11 @@ Notes that bite:
   emits, not passes. (2) New counters beside them: `probe_errors` (actions that threw — each is
   retried once when the walk ends, and the pass record carries `retried` / `recovered` / `unacted`;
   expect zero), `probe_caught_up` (changes the cached page already showed on a mapped
-  `pageCheck.fields` slot — nothing triggered; overlays `changed`) and `probe_ignored` (changes
-  confined to `pageCheck.ignoreChanges`; not counted as `changed`). (3) `probe_fresh` now counts only
+  `pageCheck.fields` slot, or on a page re-rendered after an active invalidation's trip — nothing
+  triggered; overlays `changed`), `probe_ignored` (changes confined to `pageCheck.ignoreChanges`; not
+  counted as `changed`) and `probe_covered` (changes an active invalidation already answers — every page
+  refused, or served on a page verification: not counted as `changed`, not acted on, re-counted each
+  pass until the page re-renders). (3) `probe_fresh` now counts only
   URLs whose baseline was written since the pass — or the pass it resumes — began, i.e. that pass had
   already probed them; near zero in a settled pass. It used to count baselines younger than
   `changeProbe.reprobeAfter` (now retired), which selected every recently CHANGED URL. (4)
@@ -212,7 +215,7 @@ Notes that bite:
   `recheck_failed` or `recheck_inconclusive`; or, with no request, `bounded` (already confirmed once
   against that observation: a page that disagrees every time, left to the pass), `untrusted` (the
   origin is known to have moved since the probe last looked — the last anchor or a canary trip — so the
-  render may just be newer; left to the pass), `shed` (the node-wide pace was over a minute out),
+  render may just be newer; left to the pass), `shed` (no slot within a minute in the budget the sweep leaves — re-probes share `ratePerSecond` with it),
   `dry_run`, `error`.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
