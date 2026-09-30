@@ -150,6 +150,7 @@ export function render(ctx) {
 					]),
 				]),
 		walkActivity(ctx),
+		departuresCard(ctx, roots),
 		settings(ctx),
 		editTray(ctx),
 	];
@@ -598,6 +599,117 @@ function walkActivity(ctx) {
 			]),
 		],
 		foot: [scanFooter(data)],
+	});
+}
+
+/** How a hold-back entry's reason reads (plugin v0.97.0 `holdBack` on the run row). */
+const HOLD_REASON = {
+	'refused-shrink': 'refused as much shorter than the last accepted',
+	'failed-child': 'failed, so URLs that could have moved into it were held back',
+	'budget': 'past sitemap.departure.maxPerWalk, deferred to later walks',
+};
+
+/**
+ * DEPARTURES — what the walks decided about URLs that LEFT a sitemap, and what the guards held back
+ * (plugin v0.97.0 for the guard series; the departure family itself predates it and had no panel).
+ *
+ *   Acted       the route's departure action ran (armed), or would have (dry run: `would_*`).
+ *   Shear       re-attached after the walk (`reattached`), or still listed by an unchanged child
+ *               (`listed_unchanged`) — moves, not departures; the check exists to catch exactly these.
+ *   Held back   re-linked because a child they could have moved into failed (`relinked`), or deferred
+ *               past the walk's budget (`deferred`). Both are offered again next walk — postponed, not lost.
+ *   Skipped     suppressed targets, routes with no departure action, targets already gone.
+ *   Lost        `capped` by the lossy `maxActions`, or a re-link that failed — these never get their action.
+ *
+ * The shrink guard's two counters sit beside them: a refused document is also a failed child, and an
+ * ACCEPTED shrink is the one to alert on (a real shrink landed, and its departures are now being decided).
+ * The hold-back table is live state from each root's run row, not the 24h window.
+ */
+function departuresCard(ctx, roots) {
+	const data = ctx.data.analytics;
+	const combos =
+		data && data.available !== false
+			? pick(data, 'prerender_ops', (s) => typeof s.path === 'string' && s.path.startsWith('sitemap_'))
+			: [];
+	const totalOf = (series) => sumValues(combos.filter((s) => s.path === `sitemap_${series}`));
+	const departure = (outcome) => totalOf(`departure_${outcome}`);
+	const acted = departure('render') + departure('expire');
+	const wouldAct = departure('would_render') + departure('would_expire');
+	const shear = departure('reattached') + departure('listed_unchanged');
+	const relinked = departure('relinked');
+	const deferred = departure('deferred');
+	const skipped = departure('suppressed') + departure('route_opted_out') + departure('target_gone');
+	const capped = departure('capped');
+	const lostOther = departure('relink_error') + departure('unknown_child') + departure('failed');
+	const refused = totalOf('shrink_refused');
+	const accepted = totalOf('shrink_accepted');
+	const holds = roots.flatMap((root) =>
+		(Array.isArray(root.refresh?.holdBack) ? root.refresh.holdBack : []).map((hold) => ({ ...hold, root: root.url }))
+	);
+	const anything =
+		acted || wouldAct || shear || relinked || deferred || skipped || capped || lostOther || refused || accepted;
+	if (!anything && !holds.length) {
+		return card('Departures — last 24h', {
+			help: 'What walks decided about URLs that left a sitemap. Routes opt in with ingress.routes[].departureAction.',
+			body: [el('div', { cls: 'empty', text: 'No departures decided in the last 24h, and nothing held back.' })],
+		});
+	}
+
+	const when = (hold) => hold.since ?? hold.at;
+	const holdRows = holds.map((hold) =>
+		el('tr', null, [
+			el('td', { cls: 'mono truncate', text: shortPath(hold.sitemapUrl) ?? hold.sitemapUrl, title: hold.sitemapUrl }),
+			el('td', { text: HOLD_REASON[hold.reason] ?? hold.reason, title: hold.detail ?? '' }),
+			el('td', { text: when(hold) ? ago(when(hold)) : '—' }),
+			el('td', {
+				cls: 'right mono',
+				text: Number.isFinite(hold.deferred)
+					? `${num(hold.deferred)} deferred`
+					: Number.isFinite(hold.heldBack)
+						? `${num(hold.heldBack)} held`
+						: hold.acceptRegardlessAt
+							? `accepts by ${new Date(hold.acceptRegardlessAt).toLocaleString()}`
+							: '',
+			}),
+		])
+	);
+
+	return card(`Departures — ${data ? scopeLabel(data) : 'cluster'}, last 24h`, {
+		head: [
+			accepted > 0 ? pill(`${fmtCount(accepted)} shrink(s) accepted`, 'warn') : null,
+			capped > 0 ? pill(`${fmtCount(capped)} capped — lost`, 'bad') : null,
+			holds.length ? pill(`${num(holds.length)} child sitemap(s) holding back`, 'info') : null,
+			spacer(),
+		],
+		help: [
+			'What walks decided about URLs that left a sitemap. Shear — a URL that moved to another child — is not a ',
+			'departure. Held-back and deferred URLs are offered again next walk; capped ones never get their action (',
+			el('code', { text: 'sitemap.departure.maxActions' }),
+			' is lossy, ',
+			el('code', { text: 'maxPerWalk' }),
+			' is not). An accepted shrink is the one to alert on: a real shrink landed.',
+		],
+		body: [
+			stats([
+				wouldAct > 0 && !acted
+					? stat('Would act', fmtCount(wouldAct), 'dry run: render or expire')
+					: stat('Acted', fmtCount(acted), `${num(departure('render'))} render · ${num(departure('expire'))} expire`),
+				stat('Shear', fmtCount(shear), 'moved between children, not departed'),
+				stat('Held back', fmtCount(relinked), 'a child they could move into failed'),
+				stat('Deferred', fmtCount(deferred), 'past the walk budget, next walk'),
+				stat('Skipped', fmtCount(skipped), 'suppressed · no action · gone'),
+				stat('Lost', fmtCount(capped + lostOther), `${num(capped)} capped · ${num(lostOther)} failed`, {
+					bad: capped + lostOther > 0,
+				}),
+				stat('Shrinks refused', fmtCount(refused), 'much shorter than the last accepted'),
+				stat('Shrinks accepted', fmtCount(accepted), 'a real shrink landed', { warn: accepted > 0 }),
+			]),
+			holds.length > 0 &&
+				section('sitemap-holdback', 'Held back now', [
+					table(['Child sitemap', 'Why', 'Since', { text: '', right: true }], holdRows),
+				]),
+		],
+		foot: data ? [scanFooter(data)] : [],
 	});
 }
 

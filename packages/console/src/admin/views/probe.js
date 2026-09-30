@@ -62,8 +62,10 @@ import {
 	table,
 } from '../ui.js';
 import {
+	barList,
 	emptyNote,
 	fmtCount,
+	fmtMs,
 	isMerged,
 	legend,
 	pick,
@@ -74,6 +76,7 @@ import {
 	stackBy,
 	stackedBars,
 	sumValues,
+	weighted,
 	windowEmpty,
 } from '../charts.js';
 import { appliedNote, configState, editTray, loadConfig, optionIndex, settingsCard } from './_configEdit.js';
@@ -272,6 +275,7 @@ export function render(ctx) {
 		canaryCard(ctx, status, model),
 		configCard(status, model),
 		drift(ctx),
+		safetyCard(ctx),
 		capacityCard(ctx, status, model.cluster),
 		...knobs,
 	];
@@ -1660,6 +1664,143 @@ function drift(ctx) {
 				]),
 		],
 		foot: [scanFooter(data)],
+	});
+}
+
+/**
+ * What happened to the changes the passes FOUND, and how late they were found (plugin v0.97.0+). The
+ * passes card says how much changed; this one says whether every change was acted on — the question a
+ * Merchant Center audit asks — and how long a changed page could have served before the probe saw it.
+ *
+ *   Actions      `errors` are actions that threw (each retried once after the walk; `unacted` on the
+ *                status is what stayed wrong). `caught_up` changes needed no action — the page was
+ *                already re-rendered with the new content — and `ignored` ones only moved slots the rule
+ *                ignores. `covered` changes were left alone because an active invalidation already
+ *                refuses every page of the URL.
+ *   Anchor       what each anchored pass did at its anchor: on time, interrupted (a dry run or reseed
+ *                stood down for it), chained (it waited for a running pass), caught up (run at boot
+ *                after a restart spanned the anchor), or skipped. Skipped is the one to act on.
+ *   Detection    an UPPER BOUND on detection lag, per detected change: from this pass's start (for an
+ *                anchored pass, its anchor — so, for a change made at the reprice, the lag itself), and
+ *                from the previous pass's start (the change can be no older). Percentiles merge
+ *                approximately (≈), see charts.js `weighted`.
+ *   Render check a new render whose page claim disagreed with the probe's last observation is confirmed
+ *                by one re-probe before anything is expired: `confirmed` (the page really was stale,
+ *                expired and re-filed), `cleared` (the origin had moved; the baseline was updated), and
+ *                what was not re-probed (`shed`, `bounded`, `untrusted`, `dry_run`).
+ */
+function safetyCard(ctx) {
+	const data = ctx.data.analytics;
+	if (!data || data.available === false || windowEmpty(data)) return null;
+	const combos = pick(data, 'prerender_ops', (s) => typeof s.path === 'string' && s.path.startsWith('probe_'));
+	const totalOf = (series) => sumValues(combos.filter((s) => s.path === `probe_${series}`));
+	const errors = totalOf('errors');
+	const caughtUp = totalOf('caught_up');
+	const ignored = totalOf('ignored');
+	const covered = totalOf('covered');
+	const changed = totalOf('changed');
+	const byDetail = (series) => {
+		const by = new Map();
+		for (const s of combos.filter((c) => c.path === `probe_${series}`)) {
+			const key = s.method ?? 'unknown';
+			by.set(key, (by.get(key) ?? 0) + (Number.isFinite(s.mean) ? s.mean * s.count : s.count));
+		}
+		return (key) => by.get(key) ?? 0;
+	};
+	const anchor = byDetail('anchor');
+	const check = byDetail('render_mismatch');
+	const lag = combos.filter((s) => s.path === 'probe_detection_lag');
+	const lagPass = lag.filter((s) => s.method === 'pass');
+	const lagPrevious = lag.filter((s) => s.method === 'previous_pass');
+	const anchors = ['on_time', 'interrupted', 'chained', 'caught_up', 'skipped'].reduce((acc, k) => acc + anchor(k), 0);
+	const rechecked = check('rechecked');
+	const notRechecked = check('shed') + check('bounded') + check('untrusted') + check('dry_run');
+	const nothing =
+		!errors && !caughtUp && !ignored && !covered && !anchors && !lag.length && !rechecked && !notRechecked;
+	if (nothing) {
+		return card(`Change safety — ${scopeLabel(data)}`, {
+			body: [
+				el('div', {
+					cls: 'empty',
+					text: 'No action, anchor, detection-lag or render-check series in this range (plugin v0.97.0+).',
+				}),
+			],
+		});
+	}
+
+	// Per rule: the typical bound, the rule label riding the context slot.
+	const rules = new Map();
+	for (const s of lagPass) {
+		const key = s.type ?? 'unknown';
+		rules.set(key, [...(rules.get(key) ?? []), s]);
+	}
+	const ruleRows = [...rules]
+		.map(([label, rows]) => ({
+			label,
+			value: weighted(rows, 'median') ?? 0,
+			sub: `≈p95 ${fmtMs(weighted(rows, 'p95'))} · ${num(rows.reduce((acc, r) => acc + r.count, 0))}`,
+		}))
+		.sort((a, b) => b.value - a.value);
+
+	return card(`Change safety — ${scopeLabel(data)}`, {
+		head: [
+			errors > 0 ? pill(`${fmtCount(errors)} action error(s)`, 'bad') : null,
+			anchor('skipped') > 0 ? pill('an anchored pass was skipped', 'warn') : null,
+			spacer(),
+		],
+		help: [
+			'Whether every change the passes found was acted on, and how long a changed page could have served ',
+			'before the probe saw it. Detection lag is an upper bound: from this pass’s start (an anchored pass: its ',
+			'anchor), and from the previous pass’s start. A render whose page disagrees with the probe is re-probed ',
+			'once before anything is expired.',
+		],
+		body: [
+			stats([
+				stat('Action errors', fmtCount(errors), 'retried once after the walk', { bad: errors > 0 }),
+				stat('Caught up', fmtCount(caughtUp), 'already re-rendered with the change'),
+				stat('Ignored', fmtCount(ignored), 'only ignored slots moved'),
+				stat('Covered', fmtCount(covered), 'refused by an active invalidation'),
+				stat(
+					'Detection lag',
+					fmtMs(weighted(lagPass, 'median')),
+					`median from pass start · ≈p95 ${fmtMs(weighted(lagPass, 'p95'))}`
+				),
+				stat(
+					'…from the previous pass',
+					fmtMs(weighted(lagPrevious, 'median')),
+					`the change is no older · ≈p95 ${fmtMs(weighted(lagPrevious, 'p95'))}`
+				),
+			]),
+			stats([
+				stat(
+					'Anchored passes',
+					fmtCount(anchors),
+					`${num(anchor('on_time'))} on time · ${num(anchor('interrupted'))} interrupted · ` +
+						`${num(anchor('chained'))} chained · ${num(anchor('caught_up'))} caught up`,
+					{ warn: anchor('skipped') > 0 }
+				),
+				stat('Skipped anchors', fmtCount(anchor('skipped')), 'a night the pass did not run', {
+					warn: anchor('skipped') > 0,
+				}),
+				stat(
+					'Render check',
+					fmtCount(rechecked),
+					`re-probed · ${num(check('confirmed'))} confirmed stale · ${num(check('cleared'))} cleared`
+				),
+				stat(
+					'Not re-probed',
+					fmtCount(notRechecked),
+					`${num(check('shed'))} shed · ${num(check('bounded'))} bounded · ${num(check('untrusted'))} untrusted`
+				),
+			]),
+			changed > 0 &&
+				el('div', {
+					cls: 'hint',
+					text: `Of ${fmtCount(changed)} change(s) found in this range; covered changes are counted apart from changed.`,
+				}),
+			ruleRows.length > 1 &&
+				section('probe-lag-rules', 'Detection lag by rule (median)', [barList(ruleRows, { format: fmtMs })]),
+		],
 	});
 }
 

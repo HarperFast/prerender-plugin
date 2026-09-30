@@ -1514,3 +1514,66 @@ test('explanations moved behind help keep their substance', async () => {
 		'no explanatory paragraph is left in a card body'
 	);
 });
+
+// ---- the Change safety card (plugin v0.97.0 series) ----
+
+/** A counted event: one emit per event, value 1, the detail on the method slot. */
+const events = (series, detail, n) => ({ ...passes(series, n, 1), method: detail });
+
+/** A duration: `n` samples whose median and p95 are as given, the bound on method and the rule on type. */
+const lag = (bound, rule, n, medianMs, p95Ms) => ({
+	...passes('detection_lag', n, medianMs),
+	method: bound,
+	type: rule,
+	median: medianMs,
+	p95: p95Ms,
+});
+
+/** A tile's VALUE line alone (its label and caption run into it in `textContent`). */
+const valueOf = (ctx, label) => tile(ctx, label).children[1].textContent;
+
+const SAFETY = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		passes('errors', 2, 3), // 2 batches with 3 action errors each = 6
+		passes('caught_up', 4, 10),
+		passes('covered', 1, 7),
+		events('anchor', 'on_time', 3),
+		events('anchor', 'skipped', 1),
+		lag('pass', 'price', 100, 2 * HOUR, 6 * HOUR),
+		lag('previous_pass', 'price', 100, 20 * HOUR, 30 * HOUR),
+		events('render_mismatch', 'rechecked', 5),
+		events('render_mismatch', 'confirmed', 2),
+		events('render_mismatch', 'cleared', 3),
+		events('render_mismatch', 'shed', 4),
+	],
+};
+
+test('the Change safety card sums action errors by VALUE and flags them', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.equal(valueOf(ctx, 'Action errors'), '6');
+	assert.match(draw(ctx).textContent, /6 action error\(s\)/);
+	assert.equal(valueOf(ctx, 'Caught up'), '40');
+	assert.equal(valueOf(ctx, 'Covered'), '7');
+});
+
+test('the Change safety card reads anchor outcomes, and a skipped anchor is the warning', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.match(tile(ctx, 'Anchored passes').textContent, /3 on time/);
+	assert.equal(valueOf(ctx, 'Skipped anchors'), '1');
+	assert.match(draw(ctx).textContent, /an anchored pass was skipped/);
+});
+
+test('the Change safety card reads detection lag as a duration and the render check by outcome', async () => {
+	const ctx = await ready({ analytics: SAFETY });
+	assert.match(tile(ctx, 'Detection lag').textContent, /2(\.0)?\s?h/);
+	assert.match(tile(ctx, '…from the previous pass').textContent, /20(\.0)?\s?h/);
+	assert.match(tile(ctx, 'Render check').textContent, /2 confirmed stale · 3 cleared/);
+	assert.match(tile(ctx, 'Not re-probed').textContent, /4 shed/);
+});
+
+test('without the v0.97.0 series the Change safety card says so rather than showing zeros', async () => {
+	const ctx = await ready();
+	assert.match(draw(ctx).textContent, /No action, anchor, detection-lag or render-check series/);
+});

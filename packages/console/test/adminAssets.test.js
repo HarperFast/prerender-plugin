@@ -297,19 +297,8 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 			'prerender_ops.entity_gate',
 			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
 		],
-		// plugin v0.97.0: how often an off-owner "render this now" filing reached its owner. A health signal
-		// with an expected steady state (forwarded, or nothing when the peer token is unset); a tile on the
-		// Queue view is the console follow-up.
-		// plugin v0.97.0: trigger-to-cache for a detected change, per route. Read raw from the analytics
-		// endpoint until the Change probe view charts it beside the pass counters it is the outcome of.
-		[
-			'render.change_lag_ms',
-			'plugin v0.97.0; read raw from /prerender_admin/analytics — a Change probe panel is the follow-up',
-		],
-		[
-			'prerender_ops.due_now_forward',
-			'plugin v0.97.0; read raw from /prerender_admin/analytics until the Queue view charts it',
-		],
+		// `render.change_lag_ms` and `prerender_ops.due_now_forward` (plugin v0.97.0) are charted on the Queue
+		// view since console v0.22.0 (Change to cache, Filing).
 	]);
 
 	const client = [...clientSources.values()].join('\n');
@@ -357,16 +346,9 @@ test('every probe series the catalog declares is read by the console, or waived 
 	const client = [...clientSources.values()].join('\n');
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('probe_'.length)}'`);
 
-	const NOT_CHARTED = new Map([
-		// Added by plugin v0.97.0; the pass record on GET /change-probe carries them. Console panel later.
-		['probe_errors', 'plugin 0.97.0: actions that threw — read via /change-probe (errors/unacted); panel later'],
-		['probe_caught_up', 'plugin 0.97.0: read via /change-probe (caughtUp); panel later'],
-		['probe_ignored', 'plugin 0.97.0: read via /change-probe (ignored); panel later'],
-		['probe_covered', 'plugin 0.97.0: read via /change-probe (covered); panel later'],
-		['probe_anchor', 'plugin 0.97.0: anchored-pass outcomes (detail); logged on the node; panel later'],
-		['probe_detection_lag', 'plugin 0.97.0: a duration (percentiles, per rule); panel later'],
-		['probe_render_mismatch', 'plugin 0.97.0: render-check outcomes (detail); panel later'],
-	]);
+	// Every probe series is charted: the passes card and, since console v0.22.0, the Change safety card
+	// (errors, caught_up, ignored, covered, anchor, detection_lag, render_mismatch).
+	const NOT_CHARTED = new Map([]);
 
 	for (const name of series) {
 		if (NOT_CHARTED.has(name)) continue;
@@ -453,11 +435,10 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 	const BUILT_AT_THE_CALL_SITE = new Map([
 		[
 			"`departure_${name.replace(/-/g, '_')}`",
-			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …) — ten ' +
-				'series with dry-run-vs-armed semantics of their own, plus the walk corrections _relinked and ' +
-				'_listed_unchanged (plugin v0.97.0), which need that same panel. No console panel reads them: the ' +
-				'Sitemaps view charts walk OUTCOMES, and departures are a separate decision surface that ' +
-				'needs its own panel rather than seven more tiles on this one. Tracked, not forgotten.',
+			'the post-walk sitemap-departure family (departure_render / _expire / _reattached / …, and the walk ' +
+				'corrections _relinked / _deferred / _listed_unchanged of plugin v0.97.0) — read by the Sitemaps ' +
+				'view\u2019s Departures card (console v0.22.0) through `departure(\u2026)`, grouped by what each ' +
+				'means for a page: acted, shear, held back, deferred, skipped, lost.',
 		],
 	]);
 
@@ -482,17 +463,7 @@ test('every sitemap series the plugin emits is read by the console, or waived wi
 	const isRead = (name) => client.includes(`'${name}'`) || client.includes(`'${name.slice('sitemap_'.length)}'`);
 
 	const NOT_CHARTED = new Map([
-		[
-			'sitemap_shrink_refused',
-			'documents sitemap.shrinkGuard refused as much shorter than the last accepted (plugin v0.97.0); each is ' +
-				'also a failed child, which sitemap_failed already charts — a dedicated tile waits for the panel ' +
-				'the departure family needs',
-		],
-		[
-			'sitemap_shrink_accepted',
-			'refused shrinks accepted once they outlived a rebuild or shrinkGuard.acceptAge (plugin v0.97.0) — rare ' +
-				'and logged at error; waits for the same panel',
-		],
+		// `sitemap_shrink_refused` / `_accepted` (plugin v0.97.0) are read by the Departures card.
 	]);
 
 	for (const name of new Set(emitted)) {
@@ -541,11 +512,6 @@ test('every queue_health series is read or waived, and the console reads none th
 		['paused', 'pause state is read from the overview (QueueControl intent and QueueStatus observed)'],
 		['reconcile_restored', 'the Corpus view reads the repair sweep result from overview.reconcile'],
 		['reconcile_missing', 'the Corpus view reads the repair sweep result from overview.reconcile'],
-		[
-			'keeper_unschedulable',
-			'plugin v0.97.0: emitted only when a verification walk finds owned rows with no due time (expect none); ' +
-				'the count is also in queue-state keeper.verify.unschedulable — a Queue tile is a console follow-up',
-		],
 	]);
 	for (const name of declared) {
 		if (NOT_CHARTED.has(name)) continue;
