@@ -455,7 +455,7 @@ test('departure.maxPerWalk meters an accepted shrink across walks: deferred URLs
 	assert.equal(sitemapRows.get(C1).lastModified, null, 'refetched in full next walk');
 	const budget = first.holdBack.find((entry) => entry.reason === 'budget');
 	assert.equal(budget.sitemapUrl, C1);
-	assert.equal(budget.count, 5);
+	assert.equal(budget.deferred, 5);
 
 	const second = await walk(short);
 	assert.equal(second.shrinkRefused, 0, 'already accepted: not judged again');
@@ -481,6 +481,8 @@ test('departure.maxPerWalk is one budget across every child: shrinks short of ma
 	assert.equal(lost.filter((url) => attributed(url)).length, 3, 'the deferred three are still attributed');
 
 	// The origin recovers before the deferred URLs' turn: they were never departed, so they do not rejoin.
+	// (A new millisecond first: the re-attach tells a rejoin from shear by comparing against the walk's start.)
+	await sleep(2);
 	const recovered = await walk({
 		[ROOT]: index(C1, C2),
 		[C1]: urlset(...range(0, 10)),
@@ -496,6 +498,87 @@ test('departure.maxPerWalk leaves a normal walk alone: departures under the budg
 	assert.equal(result.departures.outcomes.render, 2);
 	assert.equal(result.departures.outcomes.deferred ?? 0, 0);
 	assert.equal(result.holdBack.length, 0);
+});
+
+// Round-4 review R1: the budget was spent on every unattributed URL, including ones no action is taken
+// on — so suppressed targets or opted-out routes pushed real departures to later walks.
+test('departure.maxPerWalk is spent only on departures that get an action', async () => {
+	configure({ departure: { maxPerWalk: 3 } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 20)) });
+	for (const url of range(10, 15)) Object.assign(targets.get(url), { state: 'suppressed' });
+	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) }); // 5 suppressed + 5 live leave
+	assert.equal(result.departures.outcomes.suppressed, 5, 'decided, not deferred');
+	assert.equal(result.departures.outcomes.render, 3, 'the budget goes to live departures');
+	assert.equal(result.departures.outcomes.deferred, 2);
+});
+
+// Round-4 review R4: first-come handed the whole budget to the first child with a mass event.
+test('departure.maxPerWalk is shared round-robin: a mass event in one child does not starve another', async () => {
+	configure({ departure: { maxPerWalk: 4 } });
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 20)), [C2]: urlset(...range(20, 30)) });
+	// C1 (walked first) loses 8, C2 loses 2 — both under maxRatio.
+	const result = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 12)), [C2]: urlset(...range(20, 28)) });
+	assert.equal(result.departures.outcomes.render, 4);
+	for (const url of range(28, 30)) assert.equal(attributed(url), null, `${url} (C2) departed this walk`);
+	assert.equal(range(12, 20).filter((url) => attributed(url) === C1).length, 6, 'C1 keeps the rest for later');
+});
+
+// Round-4 review R2: an arrival-only deployment still holds unlinked URLs, and the budget metered them.
+test('departure.maxPerWalk does nothing when departures are off', async () => {
+	configure({ departure: { maxPerWalk: 1, enabled: false } });
+	lastMod[C1] = MON;
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	lastMod[C1] = TUE;
+	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 7)) });
+	assert.equal(result.departures.outcomes.deferred ?? 0, 0);
+	assert.equal(result.holdBack.length, 0);
+	assert.equal(sitemapRows.get(C1).lastModified, TUE, 'no refetch forced');
+});
+
+// Round-4 review R5: checking only that stored keys still EXIST missed a route added above an existing one.
+test('a failed child holds back its siblings when a route was added above the one its keys name', async () => {
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1), P(2)), [C2]: urlset(P(4)) });
+	// A more specific route above /product/: P(2) now classifies under it, though C2's stored key still exists.
+	configure({ routes: [{ ...PRODUCT_ROUTE, path: '/product/prd-2' }, PRODUCT_ROUTE] });
+	const result = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }); // P2 shifted into C2, which fails
+	assert.deepEqual(result.departures.outcomes, { relinked: 1 });
+	assert.equal(attributed(P(2)), C1);
+});
+
+// Round-4 review R6: a row refused before its first-refusal time was recorded was refused forever.
+test('a refusal with no recorded first-refusal time records one, so acceptance can still happen', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, acceptAge: 20 } } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	delete sitemapRows.get(C1).shrinkRefusedAt; // as a row written before the time was recorded
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	assert.ok(sitemapRows.get(C1).shrinkRefusedAt, 'recorded now');
+	await sleep(25);
+	assert.equal((await walk(short)).shrinkAccepted, 1);
+});
+
+// Round-4 review R7: a dropped child draining under the budget was refused and re-accepted every walk.
+test('a dropped child accepted once drains under the budget without being accepted again', async () => {
+	configure({
+		sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, newVersionAfter: 0 } },
+		departure: { maxPerWalk: 2 },
+	});
+	lastMod[ROOT] = MON;
+	const docs = { [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 5)), [C2]: urlset(...range(5, 11)) };
+	await walk(docs);
+	lastMod[ROOT] = TUE;
+	const omit = { ...docs, [ROOT]: index(C1) };
+	assert.equal((await walk(omit)).shrinkRefused, 1);
+	lastMod[ROOT] = 'Wed, 03 Sep 2026 00:00:00 GMT';
+	const accepted = await walk(omit);
+	assert.equal(accepted.shrinkAccepted, 1);
+	assert.equal(accepted.departures.outcomes.render, 2);
+	let accepts = 0;
+	for (let walks = 0; walks < 3; walks++) accepts += (await walk(omit)).shrinkAccepted;
+	assert.equal(accepts, 0, 'draining, not re-judged');
+	assert.equal(range(5, 11).filter((url) => attributed(url)).length, 0, 'drained');
+	assert.equal(sitemapRows.has(C2), false);
 });
 
 // Round-3 item 4: a hold-back must never be silent. The result (and the progress row it feeds) names each
@@ -520,6 +603,8 @@ test('the result names a failed child that held URLs back', async () => {
 	const entry = result.holdBack.find((hold) => hold.sitemapUrl === C2);
 	assert.equal(entry.reason, 'failed-child');
 	assert.ok(entry.detail, 'with the failure');
+	assert.equal(entry.heldBack, 2);
+	assert.equal(result.holdBack.length, 1, 'only the child that held something back');
 });
 
 // Round-3 item 6: a child's stored `routes` are keys of the config it was last parsed under. After a route

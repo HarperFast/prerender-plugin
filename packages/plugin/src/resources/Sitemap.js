@@ -2,7 +2,7 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { describeError } from '../util/errors.js';
 import { Target } from './Target.js';
-import { classifyUrl, compiledRoutes, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from '../util/routeClass.js';
+import { classifyUrl, PASSTHROUGH, PRERENDER, routeTableFingerprint, UNCLASSIFIED } from '../util/routeClass.js';
 import {
 	currentMinuteMs,
 	dateColumnMs,
@@ -648,6 +648,9 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 		// Every route the document's entries fall on — what a failure of this child can have received, so
 		// the hold-back is scoped by all of them, not by whichever route its first entries happen to share.
 		routes: [...routes],
+		// The route table those keys were computed under: a later walk trusts `routes` only while it still
+		// matches (`failureScope`), since an edit can move today's URLs onto other keys.
+		routesFingerprint: routeTableFingerprint(),
 	});
 	return [];
 }
@@ -660,6 +663,7 @@ const STORED_SELECT = [
 	'shrinkRefusals',
 	'shrinkRefusedVersion',
 	'shrinkRefusedAt',
+	'shrinkAcceptedAt',
 ];
 
 /** A document's version for the shrink guard: its validator and a digest of its locs — either moving is a new version. */
@@ -719,7 +723,11 @@ async function judgeShrunk({ sitemapUrl, stored, version, refusal, run }) {
 			url: sitemapUrl,
 			shrinkRefusals: refusals + 1,
 			// The FIRST refusal's version and time: what "a new version" and both ages are measured from.
-			...(refusals === 0 ? { shrinkRefusedVersion: version, shrinkRefusedAt: new Date(firstAt) } : {}),
+			// Also whenever the time is missing (a row refused before it was recorded): without it the age
+			// is 0 on every walk, and neither acceptance rule could ever fire.
+			...(refusals === 0 || !Number.isFinite(recordedAt)
+				? { shrinkRefusedVersion: version, shrinkRefusedAt: new Date(firstAt) }
+				: {}),
 		});
 	}
 	return false;
@@ -812,22 +820,27 @@ async function pruneDroppedChildren(run, dropped, visited) {
 		}
 		try {
 			const { departed, truncated } = leaf.scan;
+			// A dropped child ALREADY ACCEPTED is draining (the walk's budget deferred part of it back onto
+			// its row): judged again, it would be refused and re-accepted on every walk of the drain, each an
+			// error-level "ACCEPTING a shrink" and a `shrink_accepted` — the metric to alert on.
+			const accepted = Number.isFinite(dateColumnMs(leaf.stored?.shrinkAcceptedAt));
 			const refusal =
-				droppedChildRefusal({
+				!accepted &&
+				(droppedChildRefusal({
 					sitemapUrl: leaf.url,
 					leftovers: departed.length,
 					entryCount: leaf.stored?.entryCount,
 				}) ??
-				// A dropped SUB-INDEX's descendants are measured against `indexEntries`, the stored
-				// `entryCount`s of the children of the index that dropped it — and a sub-index row counts
-				// child sitemaps, not URLs, so that denominator is too small and this trips more readily.
-				// Fails closed (a refusal waits for acceptance), and the deployments this runs on have flat
-				// indexes; measuring URL units through a nested index would need its descendants' rows.
-				indexShrinkRefusal({
-					indexUrl: leaf.info.indexUrl,
-					leftovers: leftoversByIndex.get(leaf.info.indexUrl) ?? 0,
-					storedEntries: leaf.info.indexEntries ?? 0,
-				});
+					// A dropped SUB-INDEX's descendants are measured against `indexEntries`, the stored
+					// `entryCount`s of the children of the index that dropped it — and a sub-index row counts
+					// child sitemaps, not URLs, so that denominator is too small and this trips more readily.
+					// Fails closed (a refusal waits for acceptance), and the deployments this runs on have flat
+					// indexes; measuring URL units through a nested index would need its descendants' rows.
+					indexShrinkRefusal({
+						indexUrl: leaf.info.indexUrl,
+						leftovers: leftoversByIndex.get(leaf.info.indexUrl) ?? 0,
+						storedEntries: leaf.info.indexEntries ?? 0,
+					}));
 			if (refusal) {
 				if (
 					!(await judgeShrunk({
@@ -843,6 +856,7 @@ async function pruneDroppedChildren(run, dropped, visited) {
 					incomplete.add(leaf.top);
 					continue;
 				}
+				if (leaf.stored) await Sitemap.patch(leaf.url, { url: leaf.url, shrinkAcceptedAt: new Date() });
 			}
 			logger.info(`[prerender] Sitemap ${leaf.url} is no longer listed by its index — unlinking what it still holds`);
 			await unlinkDeparted(leaf.url, departed, run);
@@ -1322,9 +1336,11 @@ export async function processDepartures(run) {
 	// is judged by route, from the routes the failed child's row holds (`heldBlockedByFailures`): a 404 on a
 	// store-locator sitemap says nothing about product pages, and must not hold every product departure
 	// in the walk back with it.
-	const blocked = run.walkFailed() ? await heldBlockedByFailures(run) : new Set();
+	const { blocked, blockers } = run.walkFailed()
+		? await heldBlockedByFailures(run)
+		: { blocked: new Set(), blockers: new Map() };
 	if (blocked.size) {
-		noteFailedHoldBacks(run);
+		noteFailedHoldBacks(run, blockers);
 		await relinkHeld(run, blocked, 'relinked');
 	}
 
@@ -1398,53 +1414,57 @@ const storedRoutes = (row) => {
  * previous child was its SIBLING, else everything.
  */
 async function failureScope(url, parentUrl) {
-	const select = ['url', 'isIndex', 'entries', 'routes'];
+	const select = ['url', 'isIndex', 'entries', 'routes', 'routesFingerprint'];
 	const row = await Sitemap.get({ id: url, select });
 	const routes = new Set();
-	if (row && !row.isIndex) for (const key of storedRoutes(row)) routes.add(key);
+	let current = true;
+	const take = (childRow) => {
+		for (const key of storedRoutes(childRow)) routes.add(key);
+		if (!routesAreCurrent(childRow)) current = false;
+	};
+	if (row && !row.isIndex) take(row);
 	if (row?.isIndex) {
 		for (const child of await sitemapDescendants(url)) {
 			const childRow = await Sitemap.get({ id: child, select });
-			if (childRow && !childRow.isIndex) for (const key of storedRoutes(childRow)) routes.add(key);
+			if (childRow && !childRow.isIndex) take(childRow);
 		}
 	}
 	const orSiblings = parentUrl === undefined || parentUrl === null ? { all: true } : { siblingsOf: parentUrl };
 	if (!routes.size) return orSiblings;
-	// A route key the CURRENT config no longer produces (a route edited or removed since the child was last
-	// parsed) says nothing about which of today's URLs it held, so the child also holds back its siblings'.
-	const current = currentRouteKeys();
-	return [...routes].every((key) => current.has(key)) ? { routes } : { routes, ...orSiblings };
+	// Keys computed under a route table that has since changed (a route added above another, one edited,
+	// the ingress mode switched) say nothing reliable about which of TODAY's URLs the child held, so it
+	// also holds back its siblings' — the conservative direction: a re-link, never a false departure.
+	return current ? { routes } : { routes, ...orSiblings };
 }
 
-/** Every route key the current config can classify a URL into (util/sitemap.js `routeKey`). */
-const currentRouteKeys = () => {
-	const keys = new Set([PRERENDER, PASSTHROUGH, UNCLASSIFIED]);
-	for (const entry of compiledRoutes()) {
-		keys.add(routeKey({ routeClass: entry.mode === PASSTHROUGH ? PASSTHROUGH : PRERENDER, entry }));
-	}
-	return keys;
-};
+/** Were this row's `routes` computed under today's route table? A row stored before the fingerprint: no. */
+const routesAreCurrent = (row) => row?.routesFingerprint === routeTableFingerprint();
 
-/** The held URLs any of this walk's failed documents could have received (see `processDepartures`). */
+/**
+ * The held URLs any of this walk's failed documents could have received (see `processDepartures`), and
+ * — for the progress row's `holdBack` — how many each failed document held back, so a failure that
+ * covered nothing held is not reported as holding anything.
+ */
 async function heldBlockedByFailures(run) {
 	const held = run.heldUnlinked();
 	const blocked = new Set();
-	if (!held.length) return blocked;
-	const routes = new Set();
-	const parents = new Set();
-	for (const { url, parentUrl } of run.failedChildren()) {
-		const scope = await failureScope(url, parentUrl);
-		if (scope.all) {
-			for (const entry of held) blocked.add(entry.url);
-			return blocked;
-		}
-		for (const key of scope.routes ?? []) routes.add(key);
-		if (scope.siblingsOf !== undefined) parents.add(scope.siblingsOf);
-	}
+	const blockers = new Map();
+	if (!held.length) return { blocked, blockers };
+	const scopes = [];
+	for (const { url, parentUrl } of run.failedChildren())
+		scopes.push({ url, scope: await failureScope(url, parentUrl) });
+	const covers = (scope, url, sitemapUrl) =>
+		scope.all ||
+		scope.routes?.has(routeKeyOf(url)) ||
+		(scope.siblingsOf !== undefined && run.parentOf(sitemapUrl) === scope.siblingsOf);
 	for (const { url, sitemapUrl } of held) {
-		if (routes.has(routeKeyOf(url)) || (parents.size && parents.has(run.parentOf(sitemapUrl)))) blocked.add(url);
+		for (const { url: failedUrl, scope } of scopes) {
+			if (!covers(scope, url, sitemapUrl)) continue;
+			blocked.add(url);
+			blockers.set(failedUrl, (blockers.get(failedUrl) ?? 0) + 1);
+		}
 	}
-	return blocked;
+	return { blocked, blockers };
 }
 
 /**
@@ -1469,15 +1489,22 @@ async function relinkHeld(run, urls, outcome) {
 	await applyInBatches({
 		items: run.heldUnlinked().filter(({ url }) => urls.has(url)),
 		apply: async ({ url, sitemapUrl }) => {
-			const target = await Target.get({ id: url, select: ['url', 'sitemapUrl'] });
-			if (!target) return run.countDeparture('target-gone');
-			if (target.sitemapUrl) return run.countDeparture('reattached');
-			if (!sitemapUrl) return run.countDeparture('unknown-child');
-			await Target.patch(url, { url, sitemapUrl, unlistedAt: null });
-			unconditional.add(sitemapUrl);
-			run.noteRelinked(sitemapUrl);
-			run.countDeparture(outcome);
-			relinked++;
+			// PER URL: one failed read or write must not abort the rest, which would leave every URL after it
+			// unlinked with no departure decided — lost, since no later walk offers an unlinked URL again.
+			try {
+				const target = await Target.get({ id: url, select: ['url', 'sitemapUrl'] });
+				if (!target) return run.countDeparture('target-gone');
+				if (target.sitemapUrl) return run.countDeparture('reattached');
+				if (!sitemapUrl) return run.countDeparture('unknown-child');
+				await Target.patch(url, { url, sitemapUrl, unlistedAt: null });
+				unconditional.add(sitemapUrl);
+				run.noteRelinked(sitemapUrl);
+				run.countDeparture(outcome);
+				relinked++;
+			} catch (e) {
+				run.countDeparture('relink-error');
+				logger.warn(`[prerender] Could not re-link ${url} to ${sitemapUrl}: ${describeError(e)}`);
+			}
 		},
 	});
 	for (const sitemapUrl of unconditional) {
@@ -1515,48 +1542,100 @@ async function relinkHeld(run, urls, outcome) {
  * and not held, as before.
  */
 async function deferPastBudget(run, blocked) {
+	// Nothing departs when the check is off or no route opts in. An arrival-only deployment still HOLDS
+	// unlinked URLs (for its rejoin check), and metering those would re-link and refetch for nothing.
+	if (!departureCandidateCap()) return new Set();
 	const limit = departureLimit(config.sitemap.departure.maxPerWalk);
 	const held = run.heldUnlinked().filter(({ url }) => !blocked.has(url));
 	if (!(held.length > limit)) return new Set();
 
-	const unattributed = new Set();
+	// ONLY A DEPARTURE THAT WILL BE ACTED ON SPENDS THE BUDGET — the executor's own decision
+	// (`decideDeparture`) on the target as it stands after the walk. Shear the walk re-attached, a
+	// suppressed target, a route with no departure action: none gets an action, so none may push a real
+	// departure to a later walk. A target that cannot be read is deferred rather than decided — re-offered
+	// next walk, never lost.
+	const acting = new Set();
+	const unreadable = new Set();
 	await applyInBatches({
 		items: held,
 		apply: async ({ url }) => {
-			const target = await Target.get({ id: url, select: ['url', 'sitemapUrl'] });
-			if (target && !target.sitemapUrl) unattributed.add(url);
+			try {
+				const target = await Target.get({ id: url, select: ['url', 'sitemapUrl', 'state'] });
+				if (decideDeparture({ url, target }).action !== DepartureAction.NONE) acting.add(url);
+			} catch {
+				unreadable.add(url);
+			}
 		},
 	});
-	const departing = held.filter(({ url }) => unattributed.has(url));
-	const over = departing.slice(limit);
+	const over = [
+		...pastBudget(
+			held.filter(({ url }) => acting.has(url)),
+			limit
+		),
+		...held.filter(({ url }) => unreadable.has(url)),
+	];
 	if (!over.length) return new Set();
 
 	const deferred = new Set(over.map(({ url }) => url));
 	const byChild = new Map();
 	for (const { sitemapUrl } of over) byChild.set(sitemapUrl, (byChild.get(sitemapUrl) ?? 0) + 1);
-	const since = new Date().toISOString();
+	const at = new Date(run.startedAt).toISOString();
 	for (const [sitemapUrl, count] of byChild) {
 		run.noteHoldBack({
 			sitemapUrl,
 			reason: 'budget',
 			detail: `${count} departure(s) past sitemap.departure.maxPerWalk, deferred to later walks`,
-			since,
-			count,
+			at,
+			deferred: count,
 		});
 	}
 	await relinkHeld(run, deferred, 'deferred');
 	return deferred;
 }
 
-/** Name every failed child the hold-back scoped on, unless a refusal already named it. */
-function noteFailedHoldBacks(run) {
+/**
+ * The entries past a budget of `limit`, SHARED ROUND-ROBIN across the children that unlinked them (in
+ * walk order): each child departs one before any child departs a second. First-come would hand the whole
+ * budget to the first child with a mass event — every later child's departures deferred behind it walk
+ * after walk, and a child that keeps shedding (a partial that varies between fetches) holding the rest
+ * off indefinitely. Within a child, walk order.
+ */
+const pastBudget = (entries, limit) => {
+	if (!(entries.length > limit)) return [];
+	const queues = new Map();
+	for (const entry of entries) {
+		const queue = queues.get(entry.sitemapUrl);
+		if (queue) queue.push(entry);
+		else queues.set(entry.sitemapUrl, [entry]);
+	}
+	const lists = [...queues.values()];
+	const taken = lists.map(() => 0);
+	for (let granted = 0, progressed = true; granted < limit && progressed; ) {
+		progressed = false;
+		for (let i = 0; i < lists.length && granted < limit; i++) {
+			if (taken[i] < lists[i].length) {
+				taken[i]++;
+				granted++;
+				progressed = true;
+			}
+		}
+	}
+	return lists.flatMap((list, i) => list.slice(taken[i]));
+};
+
+/**
+ * Name every failed child that held URLs back, with how many (a refused child already named by its
+ * refusal gets the count added). `at` is this walk: a failed child's hold-back lasts until it answers.
+ */
+function noteFailedHoldBacks(run, blockers) {
 	const errors = new Map(run.snapshot().failed.map(({ url, error }) => [url, error]));
-	for (const { url } of run.failedChildren()) {
+	for (const [url, heldBack] of blockers) {
 		run.noteHoldBack({
 			sitemapUrl: url,
 			reason: 'failed-child',
 			detail: errors.get(url) ?? null,
-			since: new Date().toISOString(),
+			at: new Date(run.startedAt).toISOString(),
+			heldBack,
 		});
 	}
 }
@@ -1602,12 +1681,11 @@ async function reattachToUnchangedListers(run, rootSitemapUrl) {
 	for (const childUrl of unchanged) {
 		if (!pending.size) return;
 		const pendingRoutes = new Set([...pending].map(routeKeyOf));
-		const stored = await Sitemap.get({ id: childUrl, select: ['url', 'entries', 'routes'] });
+		const stored = await Sitemap.get({ id: childUrl, select: ['url', 'entries', 'routes', 'routesFingerprint'] });
 		const routes = storedRoutes(stored);
-		// Skipped only when every route it holds is one the current config still produces and none is a
-		// pending URL's: a stale key cannot rule a URL out.
-		const current = currentRouteKeys();
-		if (routes.size && [...routes].every((key) => current.has(key) && !pendingRoutes.has(key))) continue;
+		// Skipped only when its keys were computed under today's route table and none is a pending URL's:
+		// keys from an older table cannot rule a URL out.
+		if (routes.size && routesAreCurrent(stored) && ![...routes].some((key) => pendingRoutes.has(key))) continue;
 
 		const latest = await fetchLatestSitemap(childUrl, { rootSitemapUrl })
 			.catch(() => fetchLatestSitemap(childUrl, { rootSitemapUrl }))

@@ -58,6 +58,9 @@ type Sitemap @table(database: "sitemaps") {
 	# Every route this urlset's entries fell on at its last successful parse (`routeKey`, util/sitemap.js)
 	# — what a failure of this child could have received, which scopes the departure hold-back.
 	routes: [String]
+	# The route table `routes` was computed under (routeClass.js `routeTableFingerprint`): a failed
+	# child's keys are trusted only while it still matches.
+	routesFingerprint: String
 	# `sitemap.shrinkGuard`'s memory of a shrink it REFUSED (a document much shorter than this row, or —
 	# on a dropped child's row — its index leaving it out): how many times, and the version and time of
 	# the FIRST refusal, which "a new origin version" (`newVersionAfter`) and `acceptAge` are measured from. A refused fetch
@@ -65,6 +68,9 @@ type Sitemap @table(database: "sitemaps") {
 	shrinkRefusals: Int
 	shrinkRefusedVersion: String
 	shrinkRefusedAt: Date
+	# A dropped child whose omission was accepted and is still draining (the walk's departure budget
+	# deferred part of it back onto this row): not judged again until it is gone or listed again.
+	shrinkAcceptedAt: Date
 }
 
 type SitemapFailure {

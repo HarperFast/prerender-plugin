@@ -2580,7 +2580,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'action — and bounds how many actions run; this one is lossless and bounds how fast departures ' +
 						'are believed. Only HELD URLs can be deferred, so it needs `maxCandidates` at least as large. ' +
 						'5000: comfortably above a mature catalog\u2019s daily departures spread over its walks, and a ' +
-						'small fraction of what a missing or half-built product child sheds.',
+						'small fraction of what a missing or half-built product child sheds. The budget goes ROUND-ROBIN across ' +
+						'the children that unlinked them, so one child\u2019s mass event cannot hold every other child\u2019s ' +
+						'departures back. The deferral re-links for real even under `dryRun` — it undoes the walk\u2019s own ' +
+						'unlink, as the failed-child re-link does.',
 					{ min: -1 }
 				),
 				maxCandidates: option(

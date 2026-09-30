@@ -262,9 +262,11 @@ export const createRefreshRun = ({
 		},
 
 		/**
-		 * Record why departures are held back for one child — `reason` is 'refused-shrink', 'failed-child' or
-		 * 'budget' — with since when and, for a refusal, when acceptance becomes possible. The first reason
-		 * recorded for a child stands (a refusal is also a failed child); a budget deferral adds its count.
+		 * Record why departures are held back for one child. `reason` is 'refused-shrink' (with `since`, the
+		 * first refusal, and when acceptance becomes possible), 'failed-child' (with `heldBack`, how many held
+		 * URLs it kept back) or 'budget' (with `deferred`, how many departures went past
+		 * `sitemap.departure.maxPerWalk`); the last two carry `at`, this walk. One entry per child: the first
+		 * reason stands (a refused child is also a failed child), and later ones add their counts to it.
 		 */
 		noteHoldBack(entry) {
 			const existing = holdBack.get(entry.sitemapUrl);
@@ -272,7 +274,9 @@ export const createRefreshRun = ({
 				if (holdBack.size < failedCap) holdBack.set(entry.sitemapUrl, { ...entry });
 				return;
 			}
-			if (entry.reason === 'budget') existing.deferred = (existing.deferred ?? 0) + (entry.count ?? 0);
+			for (const key of ['heldBack', 'deferred']) {
+				if (Number.isFinite(entry[key])) existing[key] = (existing[key] ?? 0) + entry[key];
+			}
 		},
 
 		/** A post-walk re-link put held URLs back on `sitemapUrl`, so its row must outlive this walk. */

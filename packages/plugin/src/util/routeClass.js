@@ -32,6 +32,7 @@
  * it. So an allowlist on a passthrough entry is rejected at compile time, not honored.
  */
 
+import { createHash } from 'node:crypto';
 import { config, getLogger } from '../config.js';
 import { compileEntityPrefix, endsOnDelimiter } from './entityGate.js';
 
@@ -384,8 +385,29 @@ const getRoutes = () => {
 	return compiled;
 };
 
-/** The compiled route list this config produces, excludes folded in — read-only; do not mutate. */
-export const compiledRoutes = () => getRoutes();
+/**
+ * A digest of everything that decides which route a URL classifies into: the ingress mode and the
+ * compiled route table, excludes folded in, in match order. A sitemap child stores it beside the route
+ * keys its entries fell on (Sitemap.js `routes`), so a later walk can tell "those keys are today's" from
+ * "the table moved under them". Checking only that each stored key still EXISTS misses the two edits
+ * that matter most: a more specific route added above an existing one (the old key still exists, but
+ * today's URLs classify under the new one) and a switch of `ingress.mode` (keys change shape). Memoized
+ * on the compiled list, which `getRoutes` rebuilds on every config change.
+ */
+let fingerprint = null;
+let fingerprintRoutes;
+let fingerprintMode;
+
+export const routeTableFingerprint = () => {
+	const routes = getRoutes();
+	if (routes !== fingerprintRoutes || config.ingress.mode !== fingerprintMode) {
+		const table = JSON.stringify([config.ingress.mode, routes.map((entry) => [entry.match, entry.path, entry.mode])]);
+		fingerprint = createHash('sha256').update(table).digest('hex').slice(0, 16);
+		fingerprintRoutes = routes;
+		fingerprintMode = config.ingress.mode;
+	}
+	return fingerprint;
+};
 
 /**
  * Compile a PROSPECTIVE `routes` / `excludePathPatterns` pair and report what it would produce,
