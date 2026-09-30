@@ -86,13 +86,14 @@ const assertComplete = (xml, root, parsed) => {
  * pure render load and cache growth for no served output. At 1M+ URLs that is the difference
  * between the fleet working on pages bots actually receive and working on nothing.
  *
- * Returns `{ incoming, filtered, invalid }`:
+ * Returns `{ incoming, filtered, invalid, routes }`:
  *   - `incoming` — Map of canonical URL-half -> entry, for prerender-class URLs only. Keyed the
  *     same way the bot read keys it, so the prune diff and the target keys built from it match
  *     what a request will look up.
  *   - `filtered`  — per-class counts of entries deliberately left out.
  *   - `invalid`   — `{ loc, message }` for entries whose URL won't parse, so one bad `<loc>`
  *     reports itself instead of aborting a refresh over millions of good ones.
+ *   - `routes`    — every route (`routeKey`) the document's entries fall on, filtered ones included.
  *
  * Pure and dependency-free (both helpers it uses are pure), so it is unit-testable — unlike
  * `Sitemap.refresh`, which cannot be loaded without a live Harper.
@@ -101,6 +102,7 @@ export const partitionSitemapEntries = (entries) => {
 	const incoming = new Map();
 	const filtered = { [PASSTHROUGH]: 0, [UNCLASSIFIED]: 0 };
 	const invalid = [];
+	const routes = new Set();
 
 	for (const entry of Array.isArray(entries) ? entries : []) {
 		try {
@@ -117,7 +119,9 @@ export const partitionSitemapEntries = (entries) => {
 
 			// One classification serves both the decision and the key; deriving them from separate
 			// calls would let the class and the allowlist disagree about the same URL.
-			const { routeClass, queryParams } = classifyPath(parsed.pathname);
+			const classified = classifyPath(parsed.pathname);
+			const { routeClass, queryParams } = classified;
+			routes.add(routeKey(classified));
 			if (routeClass !== PRERENDER) {
 				filtered[routeClass]++;
 				continue;
@@ -128,5 +132,14 @@ export const partitionSitemapEntries = (entries) => {
 		}
 	}
 
-	return { incoming, filtered, invalid };
+	return { incoming, filtered, invalid, routes };
 };
+
+/**
+ * A classification's ROUTE as a comparable key: the matched route entry, or the class when none
+ * matched. The granularity a URL can shear across — a paginated product sitemap moves product URLs
+ * between its children, never into the store-locator sitemap — so it is what scopes a failed child's
+ * hold-back (resources/Sitemap.js). Printable, because a child row stores the set of them.
+ */
+export const routeKey = ({ routeClass, entry }) =>
+	entry ? JSON.stringify([routeClass, entry.match, entry.path]) : routeClass;

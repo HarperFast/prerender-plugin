@@ -355,24 +355,82 @@ test('forward shear across FIXED-SIZE children is not a shrink: new URLs are cre
 	assert.ok(result.departures.outcomes.reattached >= 6, 'the rest is shear, recognised after the walk');
 });
 
-test('an IDENTICAL shorter document is accepted after acceptAfter refusals; a changed one restarts the count', async () => {
+// Round-3 N1: acceptance used to count WALKS, so a bad nightly build served unchanged all day was believed
+// on the fourth walk of the same day — a mass departure — and rejoined when the next rebuild fixed it.
+test('a shorter document served unchanged all day stays refused: it is not accepted before it outlives a rebuild', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+	const full = { [ROOT]: index(C1), [C1]: urlset(...range(0, 20)) };
+	await walk(full);
+	const partial = { [ROOT]: index(C1), [C1]: urlset(...range(0, 4)) };
+	for (let walks = 1; walks <= 4; walks++) {
+		const result = await walk(partial);
+		assert.equal(result.shrinkRefused, 1, `walk ${walks}`);
+		assert.equal(result.removed, 0);
+	}
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, 4);
+	await sleep(2);
+	const rebuilt = await walk(full);
+	assert.equal(rebuilt.failed.length, 0);
+	assert.equal(rebuilt.arrivals.considered, 0, 'nothing departed, so nothing rejoins');
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, undefined, 'the full document clears the refusal');
+});
+
+test('a refused shrink is accepted once it survives a NEW origin version, and not before acceptAfter refusals', async () => {
 	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2 } } });
+	lastMod[C1] = MON;
 	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
 
+	lastMod[C1] = TUE; // the bad build
 	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
 	assert.equal((await walk(short)).shrinkRefused, 1);
-	// A different short document restarts the count...
-	assert.equal((await walk({ [ROOT]: index(C1), [C1]: urlset(P(0), P(2)) })).shrinkRefused, 1);
-	assert.equal(sitemapRows.get(C1).shrinkRefusals, 1);
-	// ...so this identical pair needs two refusals before it is believed.
-	assert.equal((await walk(short)).shrinkRefused, 1);
-	assert.equal((await walk(short)).shrinkRefused, 1);
+	assert.equal(sitemapRows.get(C1).shrinkRefusedVersion.startsWith(TUE), true);
+	lastMod[C1] = 'Wed, 03 Sep 2026 00:00:00 GMT'; // the next build: still short
 	const accepted = await walk(short);
-	assert.equal(accepted.shrinkAccepted, 1);
-	assert.equal(accepted.failed.length, 0);
-	assert.equal(accepted.removed, 8);
+	assert.equal(accepted.shrinkRefused, 1, 'a new version on the FIRST refusal is still under acceptAfter');
+	const believed = await walk(short);
+	assert.equal(believed.shrinkAccepted, 1);
+	assert.equal(believed.failed.length, 0);
+	assert.equal(believed.removed, 8);
 	assert.equal(sitemapRows.get(C1).entryCount, 2);
-	assert.equal(sitemapRows.get(C1).shrinkRefusals, undefined, 'the accepted put clears the count');
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, undefined, 'the accepted put clears the refusal');
+});
+
+test('a refused shrink with no new version is accepted after acceptAge', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2, acceptAge: 20 } } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	assert.equal((await walk(short)).shrinkRefused, 1, 'not yet aged');
+	await sleep(25);
+	assert.equal((await walk(short)).shrinkAccepted, 1);
+});
+
+test('an accepted shrink releases at most releasePerWalk departures a walk, and the rest on later walks', async () => {
+	configure({
+		sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, acceptAge: 0, releasePerWalk: 3 } },
+	});
+	lastMod[C1] = MON;
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+	lastMod[C1] = TUE;
+	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
+	await walk(short); // refused once
+	const first = await walk(short);
+	assert.equal(first.shrinkAccepted, 1);
+	assert.equal(first.removed, 3);
+	assert.equal(first.shrinkHeldBack, 5);
+	assert.equal(first.departures.outcomes.render, 3);
+	assert.equal(sitemapRows.get(C1).shrinkRelease, true);
+	assert.equal(sitemapRows.get(C1).lastModified, null, 'refetched in full next walk');
+
+	const second = await walk(short);
+	assert.equal(second.shrinkRefused, 0, 'already accepted: not judged again');
+	assert.equal(second.removed, 3);
+	assert.equal(second.shrinkHeldBack, 2);
+	const third = await walk(short);
+	assert.equal(third.removed, 2);
+	assert.equal(third.shrinkHeldBack, 0);
+	assert.equal(sitemapRows.get(C1).shrinkRelease, undefined, 'done releasing');
+	assert.equal(sitemapRows.get(C1).lastModified, TUE, 'conditional again');
 });
 
 // ---- S1: a child the index stops listing ----
@@ -402,7 +460,10 @@ test('a child the index STOPS LISTING is pruned after the walk: what moved stays
 
 // Probe 3: a well-formed PARTIAL index omitting many small children used to depart all of them and drop
 // their rows, and they rejoined — two renders each — the next walk.
+// Probe 3 (round 2): a well-formed PARTIAL index omitting many small children used to depart all of them
+// and drop their rows, and they rejoined — two renders each — the next walk.
 test('an index that omits most of its children is refused: nothing is pruned, and the full index brings no rejoin', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
 	const C4 = `${HOST}/sitemap_product_4.xml`;
 	const docs = {
 		[ROOT]: index(C1, C2, C3, C4),
@@ -417,36 +478,120 @@ test('an index that omits most of its children is refused: nothing is pruned, an
 	lastMod[ROOT] = TUE;
 	schedulePuts.length = 0;
 	const partial = await walk({ ...docs, [ROOT]: index(C1) });
-	assert.equal(partial.shrinkRefused, 1);
+	assert.equal(partial.shrinkRefused, 3, 'each omitted child refused');
 	assert.equal(partial.removed, 0);
 	assert.deepEqual(partial.departures.outcomes, {});
 	assert.equal(schedulePuts.length, 0);
 	for (const child of [C2, C3, C4]) assert.equal(sitemapRows.has(child), true);
-	assert.equal(sitemapRows.get(ROOT).entries.length, 4, 'the refused index is not stored');
 	assert.equal(attributed(P(6)), C2);
 
 	await sleep(2);
+	lastMod[ROOT] = 'Wed, 03 Sep 2026 00:00:00 GMT'; // the fixed index
 	const back = await walk(docs);
 	assert.equal(back.shrinkRefused, 0);
 	assert.equal(back.arrivals.considered, 0, 'nothing departed, so nothing rejoins');
 });
 
-test('a partial index is refused by the ENTRIES its omitted children held, too, and accepted after acceptAfter', async () => {
-	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 1000, acceptAfter: 1 } } });
-	// One large child omitted out of four: 1 of 4 by count, 20 of 26 by entries.
+// Round-3 N10: with only an index-wide share, ONE child omitted of many (its build failed) departed
+// everything it held, uncapped, and deleted its row; everything rejoined when it came back.
+test('an index that omits ONE child of many is refused for that child, held back, and nothing rejoins when it returns', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+	const C4 = `${HOST}/sitemap_product_4.xml`;
+	const docs = {
+		[ROOT]: index(C1, C2, C3, C4),
+		[C1]: urlset(...range(0, 50)),
+		[C2]: urlset(...range(50, 100)),
+		[C3]: urlset(...range(100, 150)),
+		[C4]: urlset(...range(150, 200)),
+	};
+	await walk(docs);
+	const omitted = await walk({ ...docs, [ROOT]: index(C1, C2, C4) });
+	assert.equal(omitted.shrinkRefused, 1);
+	assert.deepEqual(
+		omitted.failed.map((f) => f.url),
+		[C3]
+	);
+	assert.equal(omitted.removed, 0);
+	assert.equal(sitemapRows.has(C3), true);
+	await sleep(2);
+	const back = await walk(docs);
+	assert.equal(back.arrivals.considered, 0);
+	assert.equal(back.failed.length, 0);
+});
+
+// Round-3 N7: a refused partial index was not a failure, so a URL that sheared into a child it omitted
+// was unlinked by its old child, re-attached by nobody, departed — and rejoined.
+test('a URL that sheared into a child a refused index omits is held back, not departed', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
 	await walk({
 		[ROOT]: index(C1, C2, C3),
-		[C1]: urlset(P(100)),
-		[C2]: urlset(...range(0, 20)),
-		[C3]: urlset(...range(200, 205)),
+		[C1]: urlset(...range(0, 5)),
+		[C2]: urlset(...range(5, 10)),
+		[C3]: urlset(...range(10, 15)),
 	});
-	const refused = await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(100)), [C3]: urlset(...range(200, 205)) });
-	assert.equal(refused.shrinkRefused, 1);
-	assert.equal(attributed(P(0)), C2);
+	const partial = await walk({ [ROOT]: index(C1), [C1]: urlset(P(100), ...range(0, 4)) });
+	assert.deepEqual(partial.departures.outcomes, { relinked: 1 });
+	assert.equal(attributed(P(4)), C1);
+	await sleep(2);
+	const back = await walk({
+		[ROOT]: index(C1, C2, C3),
+		[C1]: urlset(P(100), ...range(0, 4)),
+		[C2]: urlset(...range(4, 10)),
+		[C3]: urlset(...range(10, 15)),
+	});
+	assert.equal(back.arrivals.considered, 0);
+	assert.equal(attributed(P(4)), C2);
+});
 
-	const accepted = await walk();
+// Round-3 N3: judged by child NAMES, children renamed every build read as all dropped, every walk.
+test('children renamed every build are not a partial index: a real departure in the old child departs', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+	const child = (v, n) => `${HOST}/sitemap_product_${n}.xml?v=${v}`;
+	await walk({
+		[ROOT]: index(child(0, 1), child(0, 2)),
+		[child(0, 1)]: urlset(P(1), P(2), P(3)),
+		[child(0, 2)]: urlset(P(4), P(5)),
+	});
+	for (let v = 1; v <= 3; v++) {
+		await sleep(2);
+		const result = await walk({
+			[ROOT]: index(child(v, 1), child(v, 2)),
+			[child(v, 1)]: urlset(P(1), P(2)),
+			[child(v, 2)]: urlset(P(4), P(5)),
+		});
+		assert.equal(result.shrinkRefused, 0, `v=${v}`);
+		assert.equal(sitemapRows.has(child(v - 1, 1)), false, 'the old rows go');
+		if (v === 1) assert.deepEqual(result.departures.outcomes, { render: 1 });
+	}
+	assert.equal(attributed(P(3)), null, 'P(3) left the site and departed');
+	assert.equal(sitemapRows.size, 3);
+});
+
+test('a small legitimate index change is not refused: the minUrls floor applies to dropped children too', async () => {
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2), P(3)) });
+	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(P(1)) });
+	assert.equal(result.shrinkRefused, 0);
+	assert.equal(result.removed, 2);
+	assert.equal(sitemapRows.has(C2), false);
+});
+
+test('an omitted child is accepted once its INDEX publishes a new version still without it, releasing in batches', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 1, releasePerWalk: 4 } } });
+	lastMod[ROOT] = MON;
+	const docs = { [ROOT]: index(C1, C2), [C1]: urlset(...range(0, 5)), [C2]: urlset(...range(5, 11)) };
+	await walk(docs);
+	lastMod[ROOT] = TUE;
+	const omit = { ...docs, [ROOT]: index(C1) };
+	assert.equal((await walk(omit)).shrinkRefused, 1);
+	assert.equal((await walk(omit)).shrinkRefused, 1, 'the same index version: still refused');
+	lastMod[ROOT] = 'Wed, 03 Sep 2026 00:00:00 GMT';
+	const accepted = await walk(omit);
 	assert.equal(accepted.shrinkAccepted, 1);
-	assert.equal(accepted.removed, 20);
+	assert.equal(accepted.removed, 4);
+	assert.equal(accepted.shrinkHeldBack, 2);
+	assert.equal(sitemapRows.has(C2), true, 'kept while it is still releasing');
+	const rest = await walk(omit);
+	assert.equal(rest.removed, 2);
 	assert.equal(sitemapRows.has(C2), false);
 });
 
@@ -537,6 +682,33 @@ test('a failed child on the SAME route holds back only that route: a catalog dep
 	assert.deepEqual(result.departures.outcomes, { relinked: 1, render: 1 });
 	assert.equal(attributed(P(2)), C1, 'the product URL could have moved into the failed product child');
 	assert.equal(attributed(K(2)), null, 'the catalog URL could not');
+});
+
+// Round-3 N2: the hold-back was scoped from the 500-entry sample alone, so a mixed child whose first 500
+// entries share one route missed the others.
+test('a failed MIXED child holds back every route it held, not only the ones in its first 500 entries', async () => {
+	applyOptions({
+		domains: [],
+		sitemap: {
+			departure: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+			arrival: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+		},
+		ingress: {
+			mode: 'forwarded',
+			routes: [
+				{ match: 'prefix', path: '/product/', departureAction: 'render', arrivalAction: 'render' },
+				{ match: 'prefix', path: '/catalog/' },
+			],
+		},
+	});
+	const K = (n) => `${HOST}/catalog/c-${n}`;
+	const cats = Array.from({ length: 600 }, (_, i) => K(i)); // catalog first, product after
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1), P(2)), [C2]: urlset(...cats, P(3)) });
+	assert.equal(sitemapRows.get(C2).routes.length, 2, 'both routes recorded from the whole document');
+
+	const result = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)) }); // P(2) moved into C2, which fails
+	assert.deepEqual(result.departures.outcomes, { relinked: 1 });
+	assert.equal(attributed(P(2)), C1);
 });
 
 // ---- S5: a second lister that answered 304 ----

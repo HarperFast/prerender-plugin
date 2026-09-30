@@ -439,20 +439,21 @@ sustained rate (see §5):
   restart-scoped for this reason).
 - **`Sitemap <url> failed and was skipped` / `Sitemap refresh for <url> aborted`** — a sitemap walk
   losing coverage; nothing else reports a failed walk. A child refused as `truncated` (its root never
-  closes) or by `sitemap.shrinkGuard` (`refusing a document of N entries against the M last accepted`)
-  fails here too. The guard's refusals are `prerender_ops` `sitemap_shrink_refused`. An identical shorter
-  document is accepted after `shrinkGuard.acceptAfter` refusals — logged as `ACCEPTING a document …` and
-  counted `sitemap_shrink_accepted`, the one to alert on: a real shrink landed. An index refused for
-  omitting most of its children logs `refusing an index that stops listing …` and counts
-  `sitemap_shrink_refused` without failing anything: the children it still lists are walked.
+  closes) or by `sitemap.shrinkGuard` (`refusing a document of N entries against the M last accepted`, or
+  — for a child its index left out — `no longer listed by its index, and N … are listed nowhere else`)
+  fails here too; refusals count `prerender_ops` `sitemap_shrink_refused`. A refused shrink is accepted
+  only once it survives a new origin version or `shrinkGuard.acceptAge` — logged as `ACCEPTING a shrink …`
+  and counted `sitemap_shrink_accepted`, the one to alert on: a real shrink landed. Its departures then
+  release at most `shrinkGuard.releasePerWalk` a walk; `sitemap_shrink_held_back` counts the rest.
 - **`Departure check HELD BACK N URL(s) …`** — a child failed, so the held URLs that could have moved into
-  it (on a route its stored entry sample covers; a child never stored holds its siblings' URLs) were put
+  it (on a route it held at its last parse; a child never stored holds its siblings' URLs) were put
   back on the child that unlinked them instead of departing. Counted in the `sitemap_departure_*` family
   as `departure_relinked` (deferred to the next walk, not lost); every other departure of the walk is
   acted on. Beside it, `departure_listed_unchanged`: URLs the owning child dropped but a second child
   still lists, re-attached to that child after it answered 304.
 - **`Sitemap <url> is no longer listed by its index — unlinking what it still holds`** — a child an index
-  dropped, pruned after the walk and its row removed (unless held URLs were re-linked onto it).
+  dropped, pruned after the walk (behind the shrink guard) and its row removed once nothing is re-linked
+  onto it or left to release.
 
 ### 4c. Tables you can query directly
 

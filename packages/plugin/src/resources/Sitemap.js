@@ -11,7 +11,7 @@ import {
 	getNextSitemapRefreshTime,
 	numberOf,
 } from '../util/time.js';
-import { parseSitemap, partitionSitemapEntries } from '../util/sitemap.js';
+import { parseSitemap, partitionSitemapEntries, routeKey } from '../util/sitemap.js';
 import { actionForExisting, canSkipLookup, createRefreshRun, TargetAction } from '../util/sitemapRun.js';
 import { configuredStagingIp, dispatcherFor } from '../util/upstream.js';
 import { setImmediate } from 'node:timers/promises';
@@ -24,8 +24,10 @@ import {
 	departureCandidateCap,
 	departureActionFor,
 	departureLimit,
+	droppedChildRefusal,
 	indexShrinkRefusal,
 	shrinkRefusal,
+	shrinkReleaseLimit,
 } from '../util/sitemapDeparture.js';
 import {
 	arrivalActionFor,
@@ -480,6 +482,7 @@ const progressFields = (snapshot) => ({
 	listedSoon: snapshot.listedSoon,
 	shrinkRefused: snapshot.shrinkRefused,
 	shrinkAccepted: snapshot.shrinkAccepted,
+	shrinkHeldBack: snapshot.shrinkHeldBack,
 	notModified: snapshot.notModified,
 	duplicates: snapshot.duplicates,
 	deferred: snapshot.deferred,
@@ -548,6 +551,8 @@ async function runTrackedRefresh(rootUrl, options) {
 			// accepted after `acceptAfter` refusals — the second is the one to alert on: a real shrink landed.
 			metrics.sitemapRun(result.shrinkRefused, 'shrink_refused');
 			metrics.sitemapRun(result.shrinkAccepted, 'shrink_accepted');
+			// URLs an accepted shrink kept attributed this walk, past `releasePerWalk`; they release later.
+			metrics.sitemapRun(result.shrinkHeldBack, 'shrink_held_back');
 		} catch (e) {
 			logger.warn(`[prerender] sitemap_run gauges not recorded: ${describeError(e)}`);
 		}
@@ -577,11 +582,8 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 
 	// A narrow projection on purpose: `entries` on an index can be long, and this read happens for
 	// every document on every pass. The entries are read back only on the one path that needs them —
-	// a 304 on an INDEX. `entryCount` and the refusal pair are the shrink guard's (`refuseShrunk`).
-	const stored = await Sitemap.get({
-		id: sitemapUrl,
-		select: ['url', 'isIndex', 'lastModified', 'lastRefreshed', 'entryCount', 'shrinkRefusals', 'shrinkRefusedHash'],
-	});
+	// a 304 on an INDEX. `entryCount` and the refusal fields are the shrink guard's (`judgeShrunk`).
+	const stored = await Sitemap.get({ id: sitemapUrl, select: [...STORED_SELECT, 'isIndex', 'lastRefreshed'] });
 	const ifModifiedSince = conditionalValidatorFor(stored, revalidate);
 
 	const latestSitemap = await fetchLatestSitemap(sitemapUrl, { ifModifiedSince, rootSitemapUrl });
@@ -596,13 +598,15 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 		// stored entries and keep walking; each child then makes its own conditional decision.
 		//
 		// And re-diffed against the stored child rows, although the list is unchanged: a child a
-		// previous walk found dropped but could not prune (a failed scan, a re-link that kept its row)
-		// still has its row, and an index that 304s from then on would otherwise never offer it again.
-		// No shrink guard here: this list is the one a walk already accepted.
+		// previous walk found dropped but did not prune (refused by the shrink guard, a failed scan, a
+		// release still in progress) still has its row, and an index that 304s from then on would
+		// otherwise never offer it again. Same version as the walk that stored this list, so a refusal
+		// waits out `acceptAge` rather than counting a 304 as a rebuild.
 		if (stored?.isIndex === true) {
 			const storedRow = await Sitemap.get({ id: sitemapUrl, select: ['url', 'entries'] });
 			const children = (storedRow?.entries ?? []).map(({ loc }) => loc).filter(Boolean);
-			for (const [url, info] of (await findDroppedChildren(sitemapUrl, children)).dropped) dropped?.set(url, info);
+			const version = documentVersion(stored?.lastModified, children);
+			for (const [url, info] of await findDroppedChildren(sitemapUrl, children, version)) dropped?.set(url, info);
 			return children;
 		}
 		run.addUnchangedUrlset(sitemapUrl);
@@ -613,73 +617,109 @@ async function refreshOneSitemap(sitemapUrl, { parentUrl, revalidate, run, visit
 	delete row.notModified;
 
 	if (latestSitemap.isIndex === true) {
+		// Stored whatever it omits: whether an omission is a partial index is judged after the walk, by
+		// what the children it dropped still hold (`pruneDroppedChildren`), never by child names.
 		const children = latestSitemap.entries.map(({ loc }) => loc).filter(Boolean);
-		const found = await findDroppedChildren(sitemapUrl, children);
-		// A partial INDEX is refused before anything is written: the children it still lists are walked,
-		// and the ones it omits keep their rows and their targets. Neither the new list nor the new
-		// validator is stored, so the next walk fetches it in full and decides again.
-		const refusal = indexShrinkRefusal({ indexUrl: sitemapUrl, ...found.counts });
-		if (refusal && (await refuseShrunk(sitemapUrl, stored, children, refusal, run))) {
-			logger.error(`[prerender] ${refusal}`);
-			return children;
-		}
 		await Sitemap.put(sitemapUrl, row);
-		for (const [url, info] of found.dropped) dropped?.set(url, info);
+		const version = documentVersion(latestSitemap.lastModified, children);
+		for (const [url, info] of await findDroppedChildren(sitemapUrl, children, version)) dropped?.set(url, info);
 		return children;
 	}
 
 	// A urlset much SHORTER than the one last accepted is refused before its prune: thrown, it is a
-	// failed child (the walk's catch records it), its row and its targets untouched.
+	// failed child (the walk's catch records it), its row and its targets untouched. An accepted one,
+	// and one still releasing an earlier acceptance, prunes at most `releasePerWalk`.
+	let releasing = stored?.shrinkRelease === true;
 	const refusal = shrinkRefusal({ sitemapUrl, incoming: latestSitemap.entries.length, stored: stored?.entryCount });
 	if (refusal) {
-		const locs = latestSitemap.entries.map((entry) => entry?.loc);
-		if (await refuseShrunk(sitemapUrl, stored, locs, refusal, run)) throw new Error(refusal);
+		const version = documentVersion(
+			latestSitemap.lastModified,
+			latestSitemap.entries.map((entry) => entry?.loc)
+		);
+		if (!(await judgeShrunk({ sitemapUrl, stored, version, refusal, run }))) throw new Error(refusal);
+		releasing = true;
 	}
 
-	if (latestSitemap.entries?.length) {
-		await reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited });
-	}
+	const { routes, heldBack } = latestSitemap.entries?.length
+		? await reconcileSitemapEntries(sitemapUrl, latestSitemap, {
+				revalidate,
+				run,
+				visited,
+				releaseLimit: releasing ? shrinkReleaseLimit() : Infinity,
+			})
+		: { routes: new Set(), heldBack: 0 };
 
-	await Sitemap.put(sitemapUrl, { ...row, entries: latestSitemap.entries.slice(0, STORED_ENTRY_SAMPLE) });
+	await Sitemap.put(sitemapUrl, {
+		...row,
+		entries: latestSitemap.entries.slice(0, STORED_ENTRY_SAMPLE),
+		// Every route the document's entries fall on — what a failure of this child can have received, so
+		// the hold-back is scoped by all of them, not by whichever route its first entries happen to share.
+		routes: [...routes],
+		// A release with URLs still held back: no validator, so the next walk fetches it again in full and
+		// unlinks the next batch, and the marker keeps that walk to the same ceiling.
+		...(heldBack > 0 ? { lastModified: null, shrinkRelease: true } : {}),
+	});
 	return [];
 }
 
-/** A document's identity for the shrink guard's acceptance count: its entry count and a digest of its locs. */
-const documentHash = (locs) =>
-	`${locs.length}:${createHash('sha256').update(locs.join('\n')).digest('base64url').slice(0, 22)}`;
+/** What every guard read of a stored row projects. */
+const STORED_SELECT = [
+	'url',
+	'lastModified',
+	'entryCount',
+	'shrinkRefusals',
+	'shrinkRefusedVersion',
+	'shrinkRefusedAt',
+	'shrinkRelease',
+];
+
+/** A document's version for the shrink guard: its validator and a digest of its locs — either moving is a new version. */
+const documentVersion = (lastModified, locs) =>
+	`${lastModified ?? ''}|${locs.length}:${createHash('sha256').update(locs.join('\n')).digest('base64url').slice(0, 22)}`;
 
 /**
- * Refuse a document the shrink guard tripped on — or ACCEPT it, when this is the same document
- * refused `sitemap.shrinkGuard.acceptAfter` times running. Returns true for a refusal.
+ * Refuse a shorter document the shrink guard tripped on — or ACCEPT it, once the shrink has outlived a
+ * rebuild. Returns true to accept.
  *
- * The acceptance is what keeps a REAL shrink (a catalog cut, a seasonal section retired) from holding
- * a child's attribution, and its new URLs, off forever. "The same document" is its entry count plus a
- * digest of its locs, so a partial that varies from fetch to fetch — the transient kind — never
- * accumulates. The count rides the stored row, which a refused fetch otherwise leaves untouched; an
- * accepted document's `put` replaces the row and clears it.
+ * Accepted when it has been refused at least `acceptAfter` times AND either it survived a NEW version
+ * (`version` differs from the one first refused: the origin rebuilt it, and it is still short) or
+ * `acceptAge` has passed since the first refusal. Counting walks alone was the wrong clock: a deployment
+ * walking four times a day between nightly rebuilds accepted a bad build after a few walks of the same
+ * day, just before the next rebuild would have fixed it — a mass departure, then a mass rejoin.
+ *
+ * The state rides the stored row, which a refused fetch otherwise leaves untouched; an accepted
+ * document's put replaces the row and clears it (a dropped child's row goes when its prune completes).
  */
-async function refuseShrunk(sitemapUrl, stored, locs, refusal, run) {
-	const { acceptAfter } = config.sitemap.shrinkGuard;
-	const hash = documentHash(locs);
-	const prior = stored?.shrinkRefusedHash === hash ? numberOf(stored?.shrinkRefusals) : 0;
-	const refusals = Number.isFinite(prior) ? prior : 0;
-	if (refusals >= acceptAfter) {
+async function judgeShrunk({ sitemapUrl, stored, version, refusal, run }) {
+	const { acceptAfter, acceptAge } = config.sitemap.shrinkGuard;
+	const refusals = Math.max(0, numberOf(stored?.shrinkRefusals) || 0);
+	const firstAt = dateColumnMs(stored?.shrinkRefusedAt);
+	const rebuilt = refusals > 0 && stored?.shrinkRefusedVersion !== version;
+	const aged = refusals > 0 && Number.isFinite(firstAt) && Date.now() - firstAt >= acceptAge;
+	if (refusals >= acceptAfter && (rebuilt || aged)) {
 		run.count('shrinkAccepted');
 		logger.error(
-			`[prerender] ${sitemapUrl}: ACCEPTING a document the shrink guard refused ${refusals} walks running, ` +
-				`unchanged each time — treated as a real shrink now. (${refusal})`
+			`[prerender] ${sitemapUrl}: ACCEPTING a shrink the guard refused ${refusals} time(s) — it ` +
+				`${rebuilt ? 'survived a new origin version' : `has stood for ${Math.round((Date.now() - firstAt) / 3_600_000)}h`}. ` +
+				`Its departures release at most sitemap.shrinkGuard.releasePerWalk a walk. (${refusal})`
 		);
-		return false;
+		return true;
 	}
 	run.count('shrinkRefused');
-	if (stored)
-		await Sitemap.patch(sitemapUrl, { url: sitemapUrl, shrinkRefusals: refusals + 1, shrinkRefusedHash: hash });
-	return true;
+	if (stored) {
+		await Sitemap.patch(sitemapUrl, {
+			url: sitemapUrl,
+			shrinkRefusals: refusals + 1,
+			// The FIRST refusal's version and time: what "a new version" and `acceptAge` are measured from.
+			...(refusals === 0 ? { shrinkRefusedVersion: version, shrinkRefusedAt: new Date() } : {}),
+		});
+	}
+	return false;
 }
 
 /**
- * The children of `indexUrl` that have a stored row but are no longer listed, and the counts the
- * index-level shrink guard reads.
+ * The children of `indexUrl` that have a stored row but are no longer listed, each with what the
+ * post-walk guard needs: the index's version and the entries all its stored children held.
  *
  * A child's row keeps its `parentUrl` after the index stops listing it, so it is not a root either:
  * nothing walks it, nothing prunes it, and every target attributed to it stays LISTED for good — in
@@ -687,75 +727,128 @@ async function refuseShrunk(sitemapUrl, stored, locs, refusal, run) {
  * departure check. Collected here, acted on after the walk. Read-only: the cursor closes before any
  * write (util/scan.js).
  */
-async function findDroppedChildren(indexUrl, listed) {
+async function findDroppedChildren(indexUrl, listed, indexVersion) {
 	const listedNow = new Set(listed);
-	const dropped = new Map();
-	const counts = { storedChildren: 0, droppedChildren: 0, storedEntries: 0, droppedEntries: 0 };
+	const dropped = [];
+	let storedEntries = 0;
 	for await (const row of Sitemap.search({
 		select: ['url', 'isIndex', 'entryCount'],
 		conditions: [{ attribute: 'parentUrl', value: indexUrl }],
 	})) {
 		if (!row?.url) continue;
 		const entries = numberOf(row.entryCount);
-		const held = Number.isFinite(entries) && entries > 0 ? entries : 0;
-		counts.storedChildren++;
-		counts.storedEntries += held;
-		if (listedNow.has(row.url)) continue;
-		counts.droppedChildren++;
-		counts.droppedEntries += held;
-		dropped.set(row.url, { isIndex: row.isIndex === true, parentUrl: indexUrl });
+		storedEntries += Number.isFinite(entries) && entries > 0 ? entries : 0;
+		if (!listedNow.has(row.url)) dropped.push([row.url, { isIndex: row.isIndex === true, parentUrl: indexUrl }]);
 	}
-	return { dropped, counts };
+	for (const [, info] of dropped) Object.assign(info, { indexUrl, indexVersion, indexEntries: storedEntries });
+	return dropped;
 }
 
 /**
- * Prune every child an index stopped listing as if it now listed nothing. Returns the rows the caller
- * drops after the departure step — never this, because that step may re-link held URLs back onto one.
+ * Prune every child an index stopped listing as if it now listed nothing — unless the shrink guard says
+ * the omission is a partial index. Returns the rows the caller drops after the departure step — never
+ * this, because that step may re-link held URLs back onto one.
  *
- * Skipped when this walk visited it after all (another index lists it). A dropped sub-INDEX takes its
- * own descendants with it — its targets are attributed to its children, never to itself. A failure is a
- * failed child: its row and its targets stay as they were, and the next walk offers it again. A
- * truncated prune keeps the row for the same reason, so the rest is unlinked on a later pass rather
- * than stranded.
+ * Skipped when this walk visited it after all (another index lists it). A dropped sub-INDEX stands for
+ * its stored descendants — its targets are attributed to its children, never to itself.
+ *
+ * THREE PHASES, so the guard sees the whole omission before anything is unlinked: every dropped urlset's
+ * leftovers are collected (what it still holds after the walk re-attached everything that moved: exactly
+ * what is listed nowhere now); each is judged alone (`droppedChildRefusal`) and with its index
+ * (`indexShrinkRefusal`); then the ones not refused are pruned. A refused one is a FAILED child — its row
+ * and its targets stay, and its routes hold back the URLs that could have moved into it (a URL that
+ * shifted into a child the index left out is unlinked by its old child and re-attached by nobody).
  */
 async function pruneDroppedChildren(run, dropped, visited) {
-	const pruned = [];
+	const leaves = [];
 	for (const [url, info] of [...dropped].filter(([candidate]) => !visited.has(candidate))) {
 		run.noteParent(url, info.parentUrl);
+		if (!info.isIndex) {
+			leaves.push({ url, info, top: url });
+			continue;
+		}
+		for (const child of (await sitemapDescendants(url)).filter((candidate) => !visited.has(candidate))) {
+			const row = await Sitemap.get({ id: child, select: ['url', 'isIndex', 'parentUrl'] });
+			run.noteParent(child, row?.parentUrl ?? url);
+			if (row && row.isIndex !== true) leaves.push({ url: child, info, top: url });
+			else if (row) leaves.push({ url: child, info, top: url, index: true });
+		}
+		leaves.push({ url, info, top: url, index: true });
+	}
+
+	// Phase 1: what each dropped urlset still holds.
+	const leftoversByIndex = new Map();
+	for (const leaf of leaves) {
+		if (leaf.index) continue;
 		try {
-			if (info.isIndex) {
-				const descendants = (await sitemapDescendants(url)).filter((child) => !visited.has(child));
-				let complete = true;
-				for (const child of descendants) {
-					try {
-						const row = await Sitemap.get({ id: child, select: ['url', 'isIndex', 'parentUrl'] });
-						run.noteParent(child, row?.parentUrl ?? url);
-						if (row && row.isIndex !== true && !(await pruneDroppedChild(run, child))) complete = false;
-					} catch (e) {
-						complete = false;
-						logger.error(
-							`[prerender] Sitemap ${child} is no longer listed and could not be pruned: ${describeError(e)}`
-						);
-						run.addFailure(child, e);
-					}
-				}
-				if (complete) pruned.push(...descendants, url);
-				continue;
-			}
-			if (await pruneDroppedChild(run, url)) pruned.push(url);
+			leaf.stored = await Sitemap.get({ id: leaf.url, select: STORED_SELECT });
+			leaf.scan = await collectDeparted(leaf.url, new Map(), run);
+			const key = leaf.info.indexUrl;
+			leftoversByIndex.set(key, (leftoversByIndex.get(key) ?? 0) + leaf.scan.departed.length);
 		} catch (e) {
-			logger.error(`[prerender] Sitemap ${url} is no longer listed and could not be pruned: ${describeError(e)}`);
-			run.addFailure(url, e);
+			leaf.failed = true;
+			logger.error(`[prerender] Sitemap ${leaf.url} is no longer listed and could not be pruned: ${describeError(e)}`);
+			run.addFailure(leaf.url, e);
 		}
 	}
-	return pruned;
-}
 
-/** One dropped urlset: every target still attributed to it departs. True when it was fully pruned. */
-async function pruneDroppedChild(run, sitemapUrl) {
-	logger.info(`[prerender] Sitemap ${sitemapUrl} is no longer listed by its index — unlinking what it still holds`);
-	const { truncated } = await pruneSitemapTargets(sitemapUrl, new Map(), { run });
-	return !truncated;
+	// Phase 2 and 3: judge each, prune the ones not refused.
+	const incomplete = new Set();
+	const pruned = [];
+	for (const leaf of leaves) {
+		if (leaf.index) continue;
+		if (leaf.failed) {
+			incomplete.add(leaf.top);
+			continue;
+		}
+		try {
+			const { departed, truncated } = leaf.scan;
+			let releasing = leaf.stored?.shrinkRelease === true;
+			const refusal =
+				!releasing &&
+				(droppedChildRefusal({
+					sitemapUrl: leaf.url,
+					leftovers: departed.length,
+					entryCount: leaf.stored?.entryCount,
+				}) ??
+					indexShrinkRefusal({
+						indexUrl: leaf.info.indexUrl,
+						leftovers: leftoversByIndex.get(leaf.info.indexUrl) ?? 0,
+						storedEntries: leaf.info.indexEntries ?? 0,
+					}));
+			if (refusal) {
+				if (
+					!(await judgeShrunk({
+						sitemapUrl: leaf.url,
+						stored: leaf.stored,
+						version: leaf.info.indexVersion,
+						refusal,
+						run,
+					}))
+				) {
+					logger.error(`[prerender] ${refusal}`);
+					run.addFailure(leaf.url, new Error(refusal));
+					incomplete.add(leaf.top);
+					continue;
+				}
+				releasing = true;
+			}
+			logger.info(`[prerender] Sitemap ${leaf.url} is no longer listed by its index — unlinking what it still holds`);
+			const heldBack = await unlinkDeparted(leaf.url, departed, run, releasing ? shrinkReleaseLimit() : Infinity);
+			if (heldBack > 0) await Sitemap.patch(leaf.url, { url: leaf.url, shrinkRelease: true });
+			if (heldBack > 0 || truncated) incomplete.add(leaf.top);
+			else if (leaf.top === leaf.url) pruned.push(leaf.url);
+		} catch (e) {
+			incomplete.add(leaf.top);
+			logger.error(`[prerender] Sitemap ${leaf.url} is no longer listed and could not be pruned: ${describeError(e)}`);
+			run.addFailure(leaf.url, e);
+		}
+	}
+	// A dropped sub-index goes with all its descendants, and only once every one of them is done.
+	for (const top of new Set(leaves.filter((leaf) => leaf.index && leaf.url === leaf.top).map((leaf) => leaf.top))) {
+		if (!incomplete.has(top)) pruned.push(...leaves.filter((leaf) => leaf.top === top).map((leaf) => leaf.url));
+	}
+	return pruned;
 }
 
 /**
@@ -796,12 +889,12 @@ const fileFirstListing = (url, existing, renderInterval) =>
 	});
 
 /** Diff one `<urlset>` against the targets currently attributed to it, and apply the result. */
-async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited }) {
+async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, run, visited, releaseLimit }) {
 	// Keep only the URLs this deployment actually prerenders, keyed by the canonical URL-half the
 	// bot read uses — so the prune diff below and the target keys built later both match what a
 	// request will look up. Everything else is counted and dropped rather than turned into a
 	// target that renders into a key no read computes. See util/sitemap.js.
-	const { incoming: incomingEntryMap, filtered, invalid } = partitionSitemapEntries(latestSitemap.entries);
+	const { incoming: incomingEntryMap, filtered, invalid, routes } = partitionSitemapEntries(latestSitemap.entries);
 
 	// debug, not warn: per-entry, and a sitemap with thousands of bad entries would flood the
 	// log. The aggregate summary (reportFiltered) already reports counts and escalates itself
@@ -812,7 +905,7 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
 	run.addFiltered(filtered);
 
-	const { knownKeys } = await pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run });
+	const { knownKeys, heldBack } = await pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run, limit: releaseLimit });
 
 	// Read once per child rather than per entry: config is a live object and this is the hot loop.
 	const { window: newTargetWindow, maxPerRun: newTargetCap } = config.sitemap.newTargets;
@@ -945,6 +1038,8 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	if (inflight.length > 0) {
 		await Promise.all(inflight);
 	}
+
+	return { routes, heldBack };
 }
 
 /**
@@ -955,7 +1050,14 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
  * (`refreshOneSitemap`); what the prune unlinks includes every URL that merely moved, which is the
  * post-walk shear handling's to sort out, not a reason to refuse.
  */
-async function pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run }) {
+async function pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run, limit = Infinity }) {
+	const scan = await collectDeparted(sitemapUrl, incomingEntryMap, run);
+	const heldBack = await unlinkDeparted(sitemapUrl, scan.departed, run, limit);
+	return { knownKeys: scan.knownKeys, truncated: scan.truncated, heldBack };
+}
+
+/** The read half of a prune: every target attributed to `sitemapUrl` the document no longer lists. */
+async function collectDeparted(sitemapUrl, incomingEntryMap, run) {
 	// Two-phase, and NOT because of event-loop fairness alone: this loop used to issue
 	// `Target.patch` from inside the open search cursor. Harper's long-transaction monitor
 	// aborts (422, poisoned) any transaction that has writes pending when it fires, so on a large
@@ -1022,6 +1124,18 @@ async function pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run }) {
 		run.addTruncatedScan(sitemapUrl, examined, departed.length);
 	}
 
+	return { departed, examined, truncated, knownKeys };
+}
+
+/**
+ * The write half: unlink `departed`, at most `limit` of them (an accepted shrink releasing in batches,
+ * `sitemap.shrinkGuard.releasePerWalk`). Returns how many it held back.
+ */
+async function unlinkDeparted(sitemapUrl, departed, run, limit = Infinity) {
+	const released = departed.length > limit ? departed.slice(0, limit) : departed;
+	const heldBack = departed.length - released.length;
+	if (heldBack > 0) run.count('shrinkHeldBack', heldBack);
+
 	// `unlistedAt` rides the unlink patch — no extra write — and is THE WALK'S START, not this prune's
 	// clock: a URL this same walk re-attaches further on then carries exactly `run.startedAt`, which is
 	// how the entry loop's re-attach tells shear from a rejoin (util/sitemapArrival.js). The probe's
@@ -1034,12 +1148,12 @@ async function pruneSitemapTargets(sitemapUrl, incomingEntryMap, { run }) {
 	// row with no `url` — invisible to every keyed walk (util/urlWalk.js counts it as unreadable) and
 	// undeletable by anything that reads rows to find them.
 	await applyInBatches({
-		items: departed,
+		items: released,
 		apply: (target) => Target.patch(target.url, { url: target.url, sitemapUrl: null, unlistedAt }),
 	});
-	run.addRemoved(departed, sitemapUrl);
+	run.addRemoved(released, sitemapUrl);
 
-	return { knownKeys, truncated };
+	return heldBack;
 }
 
 function getTtlFromChangeFreq(changefreq, { minTtl, defaultTtl }) {
@@ -1201,7 +1315,7 @@ export async function processDepartures(run) {
 	// nothing re-attaches it. It would read as departed here: its page hard-expired and filed to render,
 	// and on the NEXT walk, re-attached with this walk's stamp, read as a rejoin and rendered again. So
 	// those URLs are put back instead (`relinkHeld`) and the next walk decides. Which URLs "could have"
-	// is judged by route, from the failed child's stored entry sample (`heldBlockedByFailures`): a 404 on a
+	// is judged by route, from the routes the failed child's row holds (`heldBlockedByFailures`): a 404 on a
 	// store-locator sitemap says nothing about product pages, and must not hold every product departure
 	// in the walk back with it.
 	const blocked = run.walkFailed() ? await heldBlockedByFailures(run) : new Set();
@@ -1247,38 +1361,40 @@ function recordDepartureGauges(outcomes) {
 	}
 }
 
-/**
- * The ROUTE a URL belongs to, as a comparable key: the matched route entry, or the class when none
- * matched. This is the granularity shear can cross — a paginated product sitemap moves product URLs
- * between its children, never into the store-locator sitemap.
- */
-const routeKeyOf = (url) => {
-	const { routeClass, entry } = classifyUrl(url);
-	return entry ? `${routeClass}\u0000${entry.match}\u0000${entry.path}` : routeClass;
-};
+/** The ROUTE a URL belongs to, as the key a child row's `routes` set holds (util/sitemap.js `routeKey`). */
+const routeKeyOf = (url) => routeKey(classifyUrl(url));
 
-/** The routes a stored entry sample covers. Empty when there is no sample to read. */
-const sampleRoutes = (entries) => {
+/**
+ * The routes a stored child row holds: its `routes` set, written from EVERY entry on each successful
+ * parse, else — a row stored before that existed — whatever its leading entry sample covers. The sample
+ * alone missed a mixed child whose first 500 entries share one route and whose rest are on another.
+ */
+const storedRoutes = (row) => {
 	const routes = new Set();
-	for (const entry of Array.isArray(entries) ? entries : []) {
+	if (Array.isArray(row?.routes) && row.routes.length) {
+		for (const key of row.routes) if (typeof key === 'string') routes.add(key);
+		return routes;
+	}
+	for (const entry of Array.isArray(row?.entries) ? row.entries : []) {
 		if (typeof entry?.loc === 'string' && URL.canParse(entry.loc)) routes.add(routeKeyOf(entry.loc));
 	}
 	return routes;
 };
 
 /**
- * What one failed document could have received: the routes its stored sample covers (a sub-index: its
- * stored children's samples), else — a document never stored, so nothing is known of its content — every
- * URL whose previous child was its SIBLING, else everything.
+ * What one failed document could have received: the routes it holds (a sub-index: its stored
+ * children's), else — a document never stored, so nothing is known of its content — every URL whose
+ * previous child was its SIBLING, else everything.
  */
 async function failureScope(url, parentUrl) {
-	const row = await Sitemap.get({ id: url, select: ['url', 'isIndex', 'entries'] });
+	const select = ['url', 'isIndex', 'entries', 'routes'];
+	const row = await Sitemap.get({ id: url, select });
 	const routes = new Set();
-	if (row && !row.isIndex) for (const key of sampleRoutes(row.entries)) routes.add(key);
+	if (row && !row.isIndex) for (const key of storedRoutes(row)) routes.add(key);
 	if (row?.isIndex) {
 		for (const child of await sitemapDescendants(url)) {
-			const childRow = await Sitemap.get({ id: child, select: ['url', 'isIndex', 'entries'] });
-			if (childRow && !childRow.isIndex) for (const key of sampleRoutes(childRow.entries)) routes.add(key);
+			const childRow = await Sitemap.get({ id: child, select });
+			if (childRow && !childRow.isIndex) for (const key of storedRoutes(childRow)) routes.add(key);
 		}
 	}
 	if (routes.size) return { routes };
@@ -1370,8 +1486,8 @@ const hasWalkAction = (url) =>
  * NARROWED BEFORE ANYTHING IS FETCHED, because a product child is megabytes and ~0.3s of parse on the
  * worker that also serves bots. Only held URLs that are STILL unattributed once the walk is over (shear
  * already re-attached the rest) and whose route has a departure or arrival action (nothing else acts on
- * a false unlink) are pending; with none, nothing is fetched. And only a child whose stored entry sample
- * shares a route with them is re-read. One retry per child, since a transient error here would
+ * a false unlink) are pending; with none, nothing is fetched. And only a child whose stored routes
+ * include one of theirs is re-read. One retry per child, since a transient error here would
  * otherwise hold its route's departures back for a walk; a second failure is a failed child, which
  * holds back only the pending URLs it could list (`heldBlockedByFailures`).
  */
@@ -1393,8 +1509,8 @@ async function reattachToUnchangedListers(run, rootSitemapUrl) {
 	for (const childUrl of unchanged) {
 		if (!pending.size) return;
 		const pendingRoutes = new Set([...pending].map(routeKeyOf));
-		const stored = await Sitemap.get({ id: childUrl, select: ['url', 'entries'] });
-		const routes = sampleRoutes(stored?.entries);
+		const stored = await Sitemap.get({ id: childUrl, select: ['url', 'entries', 'routes'] });
+		const routes = storedRoutes(stored);
 		if (routes.size && ![...routes].some((key) => pendingRoutes.has(key))) continue;
 
 		const latest = await fetchLatestSitemap(childUrl, { rootSitemapUrl })
