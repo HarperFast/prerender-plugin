@@ -61,6 +61,8 @@ import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
 import { walkUrlRange } from './urlWalk.js';
+import { runDetached } from './detach.js';
+import { getSab } from './coordination.js';
 import { probeScopeFilter } from './probeScope.js';
 import { batchPause, cycleRatePerSecond, pacedRate, stepBackoff } from './probePacer.js';
 import { loopLagMonitorState, readLoopLagMs, startLoopLagMonitor, stopLoopLagMonitor } from './loopLag.js';
@@ -516,8 +518,12 @@ const readSignature = async (url) => {
 // the seeding write is by definition to a URL with no row yet; a patch there would make every
 // first observation a silent no-op. A row the render path creates between the read and that put
 // loses at most one baseline to the race and re-seeds on the next pass.
-export const writeSignature = (url, signature, { rowExists = false, clearClaim = false, fingerprint = null } = {}) => {
-	const fields = { signature, probedAt: new Date() };
+export const writeSignature = (
+	url,
+	signature,
+	{ rowExists = false, clearClaim = false, fingerprint = null, extra = null } = {}
+) => {
+	const fields = { signature, probedAt: new Date(), ...extra };
 	// The rule that made this observation (changeProbeSpec.js ruleFingerprint), so the next pass
 	// can tell a rule edit from a content change. Written with EVERY baseline, including the
 	// one-time stamp of a pre-fingerprint row; a signature is never left beside a stale fingerprint.
@@ -649,32 +655,35 @@ export const recordPageClaim = async (
 /**
  * THE RENDER CHECK: does a render that just landed disagree with the probe's last observation of the
  * origin? Null when nothing disagrees (or the check does not apply), else `{ outcome }`, with
- * `stale: true` when the page should be expired and re-filed.
+ * `stale: true` when the render is SUSPECT and one confirming re-probe of the URL is due
+ * (`actOnStaleRender`, which the render result path calls after its own writes).
  *
- * WHAT IT CATCHES. A render claimed BEFORE a probe found a change and landing AFTER it — the probe
- * expired the old page and filed a render, and the render already in flight then stored the old content
- * over it with a fresh expiry; and a render that captured a stale copy of the page (a CDN or origin
- * cache behind the one the probe's endpoint reads). Either way the probe will not look at the URL again
- * until its next pass, a day away in anchored mode, and the page serves wrong until then.
+ * WHAT IT CATCHES. A render claimed BEFORE a probe found a change and landing AFTER it (the queue drops
+ * most of those on the lease-vs-mark check; this catches the rest), and a render that captured a stale
+ * copy of the page (a CDN or origin cache behind the one the probe's endpoint reads). Either way the probe
+ * will not look at the URL again until its next pass, a day away in anchored mode, and the page serves
+ * wrong until then.
  *
- * WHEN IT TRUSTS THE BASELINE. The stored signature is the probe's last observation, and the render is
- * NEWER than it — so a disagreement means the render is stale OR the origin changed since the probe
- * looked, and only the first is the render's fault. Acting on the second would expire correct pages en
- * masse exactly when the origin changes most: every cadence render between a midnight reprice and the
- * pass reaching its URL. So the baseline is trusted only when the probe is known to have observed the
- * URL (`observedSince`: the running pass walked past it, or the last pass covered it — or the baseline
- * itself was written) SINCE the last point the origin is known to have moved: the most recent anchor in
- * anchored mode, and the start of any active invalidation for the URL's route (a canary trip is a mass
- * change). Otherwise `untrusted`, and nothing is done — the pass will compare the page's claim itself.
+ * WHY A RE-PROBE, NOT THE BASELINE'S WORD. The stored signature is the probe's last observation and the
+ * render is newer than it, so a disagreement means the render is stale OR the origin moved since the probe
+ * looked — an intra-day availability change, an off-schedule reprice, a baseline left by a false trip's
+ * glitch — and only the first is the render's fault. Acting on the baseline expired correct pages in every
+ * one of those cases (review, round 2). So nothing is expired on a disagreement alone: ONE origin request
+ * asks again (`confirmStaleRender`), and only an answer that also disagrees with the page acts.
  *
- * WHY IT CANNOT LOOP. A page whose origin genuinely disagrees with the endpoint on every render (the
- * page prints a price the endpoint never reports) would re-render forever. `renderRefiledAt` bounds it
- * to ONE re-file per stored observation: a later disagreeing render against the same baseline counts
- * `bounded` and is left to the pass, which acts on the claim as it always has and writes a new baseline.
+ * WHEN IT DOES NOT EVEN ASK. When the origin is KNOWN to have moved since the probe last observed the URL
+ * (`mayBeStale`: the most recent anchor, in anchored mode, or an active invalidation's trip, came after
+ * it), the render is likelier right than the baseline, and the pass reaching the URL will compare the
+ * page's claim itself — counted `untrusted`, no request. On a reprice night that is nearly every
+ * disagreement, so the re-probes stay a trickle.
+ *
+ * WHY IT CANNOT LOOP. A page whose origin genuinely disagrees with the endpoint on every render would
+ * re-probe and re-render forever. `renderRefiledAt` bounds it to ONE confirmation per stored observation:
+ * a later disagreeing render against the same baseline counts `bounded` and is left to the pass.
  *
  * Only the price/availability claim pair — the fields a served mismatch costs most on — and only in an
- * armed probe (`dry_run` is counted otherwise). The mapped `pageCheck.fields` are not checked here: the
- * mapping-defect guard that protects them lives in the sweep's process.
+ * armed probe (`dry_run` is counted otherwise, and asks nothing). The mapped `pageCheck.fields` are not
+ * checked here: the mapping-defect guard that protects them lives in the sweep's process.
  */
 const renderClaimVerdict = async (url, rule, claim, stored) => {
 	if (!config.changeProbe.renderCheck) return null;
@@ -686,13 +695,19 @@ const renderClaimVerdict = async (url, rule, claim, stored) => {
 	const probedAt = epochOf(stored.probedAt);
 	const refiledAt = epochOf(stored.renderRefiledAt);
 	if (Number.isFinite(refiledAt) && !(probedAt > refiledAt)) return { outcome: 'bounded' };
-	if (!(await baselineTrusted(url, probedAt))) return { outcome: 'untrusted' };
+	if (!(await mayBeStale(url, probedAt))) return { outcome: 'untrusted' };
 	if (config.changeProbe.dryRun) return { outcome: 'dry_run' };
 	return { stale: true };
 };
 
-/** Is the probe's baseline for `url` known to postdate the last time the origin is known to have moved? */
-const baselineTrusted = async (url, probedAt) => {
+/**
+ * Could the render, rather than the origin, be what changed? False when the origin is known to have moved
+ * since the probe last observed the URL: the most recent anchor (anchored mode) or an active
+ * invalidation's trip came after the latest observation (`observedSince`, or the baseline's own write).
+ * True otherwise — including when nothing is known (interval or continuous mode, no invalidation), which
+ * is a question to ASK the origin, never a reason to trust a baseline of any age.
+ */
+const mayBeStale = async (url, probedAt) => {
 	let movedAt = -Infinity;
 	if (isAnchored()) {
 		const anchor = previousAnchorOccurrence();
@@ -741,27 +756,127 @@ const sweepStateForRenderCheck = async () => {
 };
 
 /**
- * Expire and re-file a render the render check found stale (`recordPageClaim` resolved `{ stale }`):
- * exactly the probe's own action, so the page stops serving now and its re-render is ranked as a change.
- * Called by the render result path AFTER its page writes and its reschedule. Never rejects — a render
- * must not fail for this.
+ * Confirm a render the render check found suspect (`recordPageClaim` resolved `{ stale }`): queue ONE
+ * re-probe of the URL, and act only on its answer (`confirmStaleRender`). Called by the render result path
+ * AFTER its page writes and its reschedule, so an expiry and re-file it leads to cannot be overwritten by
+ * them. Returns at once — the request runs DETACHED from the render result's request context (whose
+ * transaction Harper closes after the response, `util/detach.js`) — and never rejects.
  */
-export const actOnStaleRender = async (url, target = null) => {
-	try {
-		await actOnChange({
-			url,
-			sitemapUrl: target?.sitemapUrl ?? null,
-			renderInterval: target?.renderInterval ?? null,
-			demandInterval: target?.demandInterval ?? null,
-		});
-		countProbe('render_mismatch', 'refiled');
-		logger.info?.(
-			`[prerender] change-probe: the render of ${url} disagrees with the probe's last observation of the origin — expired and re-filed`
-		);
-	} catch (e) {
-		countProbe('render_mismatch', 'error');
-		logger.warn?.(`[prerender] change-probe: stale render of ${url} not re-filed: ${e?.message ?? String(e)}`);
+const rechecksInFlight = new Set();
+export const actOnStaleRender = (url, target = null) => {
+	if (rechecksInFlight.size >= RECHECK_MAX_PENDING) {
+		countProbe('render_mismatch', 'shed');
+		return Promise.resolve();
 	}
+	const running = runDetached(() => confirmStaleRender(url, target)).catch((e) => {
+		countProbe('render_mismatch', 'error');
+		logger.warn?.(`[prerender] change-probe: render recheck of ${url} failed: ${e?.message ?? String(e)}`);
+	});
+	rechecksInFlight.add(running);
+	running.finally(() => rechecksInFlight.delete(running));
+	return Promise.resolve();
+};
+
+// Per worker: re-probes waiting for a pacing slot. Past this, a suspect render is left to the pass.
+const RECHECK_MAX_PENDING = 256;
+// The longest a re-probe waits for its node-wide slot before it is shed (counted `shed`).
+const RECHECK_MAX_WAIT_MS = MINUTE;
+
+/**
+ * THE RE-PROBES' PACE, NODE-WIDE: a render lands on whichever worker the fleet's POST reached, so a
+ * per-worker pace would let sixteen workers send sixteen times the rate. One shared cell holds the next
+ * free slot (epoch ms); each re-probe takes the next slot `1000 / ratePerSecond` ms on, by compare-and-
+ * swap, and waits for it — or is shed when that slot is more than `RECHECK_MAX_WAIT_MS` away. Paced at
+ * `changeProbe.ratePerSecond`, like the canary: beside a running sweep that can add up to its rate again,
+ * which is the same bound the canary's overlap already has — and the re-probes are a trickle (see
+ * `renderClaimVerdict`).
+ */
+let recheckPace = null;
+const reserveRecheckSlot = () => {
+	recheckPace ??= new BigInt64Array(getSab('change_probe_recheck_pace', 8));
+	const step = BigInt(Math.max(1, Math.ceil(1000 / Math.max(1, config.changeProbe.ratePerSecond))));
+	for (let attempt = 0; attempt < 32; attempt++) {
+		const now = BigInt(Date.now());
+		const next = Atomics.load(recheckPace, 0);
+		const slot = next > now ? next : now;
+		if (slot - now > BigInt(RECHECK_MAX_WAIT_MS)) return null;
+		if (Atomics.compareExchange(recheckPace, 0, next, slot + step) === next) return Number(slot);
+	}
+	return null;
+};
+
+/**
+ * The confirming re-probe. The page's claim is re-read (a newer render, or an action, may have replaced
+ * or cleared it meanwhile) and compared with the fresh observation:
+ *
+ *   disagrees    the page is stale: hard-expired and re-filed as a change (`actOnChange`), counted
+ *                `confirmed`. The fresh observation becomes the baseline only if it differs from the
+ *                stored one (the origin moved too); an unchanged origin keeps its baseline, so the bound
+ *                in `renderClaimVerdict` holds until the pass writes a new one.
+ *   agrees       the origin moved since the probe last looked and the page shows it: the fresh
+ *                observation becomes the baseline, nothing is expired — `cleared`.
+ *   neither      nothing comparable, a failed probe, the claim gone: nothing is done.
+ */
+const confirmStaleRender = async (url, target) => {
+	const slot = reserveRecheckSlot();
+	if (slot === null) {
+		countProbe('render_mismatch', 'shed');
+		return;
+	}
+	if (slot > Date.now()) await waitUnref(slot - Date.now());
+	if (!config.changeProbe.enabled || !config.changeProbe.renderCheck) return;
+	const pathname = URL.parse(url)?.pathname;
+	const rule = pathname ? probeRules().find((candidate) => candidate.pathPattern.test(pathname)) : null;
+	if (!rule?.pageCheck) return;
+	countProbe('render_mismatch', 'rechecked');
+	let fresh = null;
+	try {
+		fresh = await probeOnce(rule, url);
+	} catch {
+		fresh = null;
+	}
+	const values = fresh ? signatureSlots(fresh) : null;
+	if (!values) {
+		countProbe('render_mismatch', 'recheck_failed');
+		return;
+	}
+	const stored = await probeStateTable().get({
+		id: url,
+		select: ['url', 'signature', 'pageSignature', 'ruleFingerprint'],
+	});
+	const verdict = stored?.pageSignature
+		? compareClaims(stored.pageSignature, apiClaimOf(values, rule.pageCheck))
+		: null;
+	if (verdict === null) {
+		countProbe('render_mismatch', 'recheck_inconclusive');
+		return;
+	}
+	if (verdict === true) {
+		if (fresh !== stored.signature) {
+			await writeSignature(url, fresh, { rowExists: true, fingerprint: rule.fingerprint });
+		}
+		countProbe('render_mismatch', 'cleared');
+		return;
+	}
+	await actOnChange({
+		url,
+		sitemapUrl: target?.sitemapUrl ?? null,
+		renderInterval: target?.renderInterval ?? null,
+		demandInterval: target?.demandInterval ?? null,
+	});
+	if (fresh !== stored.signature) {
+		// The bound re-armed in the same write: `renderRefiledAt` at or after the new `probedAt`.
+		await writeSignature(url, fresh, {
+			rowExists: true,
+			clearClaim: true,
+			fingerprint: rule.fingerprint,
+			extra: { renderRefiledAt: new Date() },
+		});
+	}
+	countProbe('render_mismatch', 'confirmed');
+	logger.info?.(
+		`[prerender] change-probe: the render of ${url} disagrees with the origin, asked again — expired and re-filed`
+	);
 };
 
 /** The page record to store for one render, or null — see recordPageClaim for when and why. */
@@ -3531,6 +3646,12 @@ export const probeStatePublishedForTest = probeStatePublished;
 /** Tests only — the pass's timer heartbeat, assertable without a pass that takes minutes. */
 export const __startHeartbeatForTest = startHeartbeat;
 
+/** Tests only — the node-wide pace of the render check's confirming re-probes. */
+export const __reserveRecheckSlotForTest = () => reserveRecheckSlot();
+
+/** Tests only — resolves once every render recheck this worker queued has settled. */
+export const renderRechecksSettledForTest = () => Promise.all([...rechecksInFlight]);
+
 /** Tests only — the per-pass invalidation-epoch resolver the sweep's actions consult. */
 export const __epochResolverForTest = epochResolver;
 
@@ -3564,6 +3685,7 @@ export const resetChangeProbeState = () => {
 	lastFactsUnsupportedWarnAt = 0;
 	lastFactsRefusedWarnAt = 0;
 	renderCheckState = { at: 0, row: null };
+	recheckPace?.fill(0n);
 	mappingGuard = null;
 	measuredSliceSize = null;
 	resumePending = false;

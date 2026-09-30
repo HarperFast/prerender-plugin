@@ -658,11 +658,14 @@ export const METRICS = Object.freeze({
 			'anchor — the lag itself for a change that landed on schedule), detail previous_pass = since the ' +
 			'start of the pass before (a true bound when that pass covered the URL); context = the rule label. ' +
 			'Read percentiles, never the total; probe_render_mismatch = the render check (changeProbe.renderCheck): ' +
-			'a render that landed disagreeing with the probe’s last observation of the origin, detail = refiled ' +
-			'(hard-expired and re-filed as a change), bounded (already re-filed once against that observation — a ' +
-			'page that disagrees every time; left to the pass), untrusted (the observation predates the last ' +
-			'anchor or trip and no pass has seen the URL since, so the render may just be newer — nothing done), ' +
-			'dry_run, error. refiled is stale renders caught before they served a pass-length; a steady bounded ' +
+			'a render that landed disagreeing with the probe’s last observation of the origin, detail = rechecked ' +
+			'(one confirming origin request made — count these as origin calls), then confirmed (the origin still ' +
+			'disagreed with the page: hard-expired and re-filed as a change), cleared (the origin had moved and ' +
+			'the page shows it: baseline updated, nothing expired), recheck_failed or recheck_inconclusive; or, with ' +
+			'no request, bounded (already confirmed once against that observation — a page that disagrees every ' +
+			'time; left to the pass), untrusted (the origin is known to have moved since the probe last looked, so ' +
+			'the render may just be newer — left to the pass), shed (the node-wide pace was over a minute out), ' +
+			'dry_run, error. confirmed is stale renders caught before they served a pass-length; a steady bounded ' +
 			'is pages the endpoint and the page genuinely disagree on; ' +
 			'probe_changed / probe_probed is the measured change rate a dry-run week reports, and a rising ' +
 			'probe_failed share is the endpoint-changed-shape alarm. probe_canary_trip counts mass-change ' +
@@ -852,7 +855,7 @@ export const METRICS = Object.freeze({
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
 					'fell-back, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
-					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (refiled, bounded, untrusted, dry_run, error). Other series: null.',
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (rechecked, confirmed, cleared, recheck_failed, recheck_inconclusive, bounded, untrusted, shed, dry_run, error). Other series: null.',
 			},
 			type: {
 				name: 'context',
