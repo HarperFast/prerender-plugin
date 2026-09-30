@@ -1,6 +1,7 @@
 import { test, before, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { publishDueRows } from './support/keeperStandIn.js';
+import { checkHarperKey } from './support/harperKeyLimit.js';
 
 /**
  * processJobResult over the url-keyed Target registry.
@@ -48,10 +49,12 @@ let analytics = [];
 // instance (so Target's put/delete overrides apply, exactly like Harper's Resource), put
 // REPLACES the row (that is what makes Target.put a reactivation — omitted suppression
 // fields clear), patch merges, and get() honors Harper's select semantics — a STRING select
-// returns the bare scalar, an array select builds a record. All are load-bearing.
+// returns the bare scalar, an array select builds a record. All are load-bearing. Every access
+// applies Harper's primary-key check, so a key past the limit throws where the real table would.
 const makeResourceBase = (rows) =>
 	class FakeResource {
 		constructor(id) {
+			checkHarperKey(id);
 			this.__id = id;
 		}
 		getId() {
@@ -65,6 +68,7 @@ const makeResourceBase = (rows) =>
 		}
 		static async get(query) {
 			const id = typeof query === 'object' ? query.id : query;
+			checkHarperKey(id);
 			const row = rows.get(id);
 			if (!row) return null;
 			const select = typeof query === 'object' ? query.select : undefined;
@@ -81,6 +85,7 @@ const makeResourceBase = (rows) =>
 			return resource.put({ ...data });
 		}
 		static async patch(id, data) {
+			checkHarperKey(id);
 			rows.set(id, { ...(rows.get(id) ?? {}), ...data });
 		}
 		static async delete(id) {
@@ -356,6 +361,57 @@ test('outcome=redirected without permanence (client-side, 200) keeps the source'
 	assert.ok(stores.target.has(A), 'no proof of permanence — the source stays');
 	assert.ok(stores.renderSchedule.has(A), 'and stays scheduled');
 	assert.equal(stores.target.has(B), false);
+});
+
+// ---- a destination too long to key ----
+
+// Harper refuses a key past 1978 bytes, so no row may be read or written under this URL.
+const LONG = `https://site.example.com/product/${'x'.repeat(2100)}`;
+
+test('301 onto a URL too long to key retires the source and adopts nothing — no read or write under its key', async () => {
+	seedSource();
+	await postResult({ id: key(A), url: A, statusCode: 301, outcome: 'redirected', redirectedTo: LONG });
+
+	assert.equal(stores.target.has(A), false, 'the move is permanent: the source retires as for any 301');
+	for (const device of DEVICES) assert.equal(stores.prerenderedPage.has(key(A, device)), false);
+	assert.equal(stores.target.size, 0, 'nothing adopted');
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
+	assert.deepEqual(
+		outcomes.map((a) => [a[3], a[4]]),
+		[['redirect', 'unkeyable-destination']],
+		'its own detail: "permanent" means a destination was adopted'
+	);
+});
+
+test('a non-indexable landing on a URL too long to key retires the source and suppresses nothing', async () => {
+	seedSource();
+	await postResult({
+		id: key(A),
+		url: A,
+		statusCode: 200,
+		outcome: 'redirected',
+		redirectedTo: LONG,
+		isIndexable: false,
+		reason: 'noindex',
+	});
+	assert.equal(stores.target.has(A), false);
+	assert.equal(stores.target.size, 0, 'no suppression row: it has no key, and nothing could schedule it');
+});
+
+test('a rendered client-side redirect onto a URL too long to key discards the render and keeps the target', async () => {
+	seedSource();
+	await postResult(
+		{ id: key(A), url: A, statusCode: 200, outcome: 'rendered', isIndexable: true, redirectedTo: LONG, headers: {} },
+		'<html>landed</html>'
+	);
+	assert.ok(stores.target.has(A), 'nothing to refile onto, so the source is not retired');
+	assert.ok(stores.renderSchedule.has(A), 'and stays in rotation');
+	assert.equal(
+		stores.prerenderedPage.get(key(A))?.content,
+		'old html',
+		'the render is not stored as the source either'
+	);
+	assert.ok(warns.some((w) => w.includes('redirected to a URL too long to be a cache key')));
 });
 
 // ---- rendered ----

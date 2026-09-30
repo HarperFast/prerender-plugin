@@ -88,7 +88,7 @@ const CACHE_STATUSES = Object.freeze([
 	'invalidated', // a bulk invalidation cost us a serve we would otherwise have made
 	'miss', // nothing cached under this key
 	'skip', // the cache was deliberately not consulted (renderNow / Cache-Control)
-	'bypass', // not a cacheable request at all (non-GET/HEAD)
+	'bypass', // not a cacheable request at all (non-GET/HEAD, or a URL too long to be a table key)
 	// A stored ORIGIN document answered it (`render.raw`). A cache serve, and it counts toward
 	// offload — but NOT a prerendered one: no browser ran on it. Its own value so that "cache
 	// served" and "rendered coverage" stay different questions, and so `page_age` can exclude it.
@@ -353,6 +353,7 @@ export const METRICS = Object.freeze({
 					'landed-auth',
 					'landed-transient',
 					'unrouted-destination',
+					'unkeyable-destination',
 					'non-indexable-destination',
 					'temporary',
 					'permanent',
@@ -365,8 +366,9 @@ export const METRICS = Object.freeze({
 					'time_ms: candidate (was cached) | non-candidate (suppression verdict) | unknown (worker posted ' +
 					'no isIndexable) | redirect (its own lane, so redirect bails do not read as fast renders). ' +
 					'outcome: per-outcome refinement — rendered: stored / discarded (landed on a class we never ' +
-					'serve) / refiled (client-side redirect onto another prerender key) / no-content (a legacy ' +
-					'worker posted an indexable verdict with nothing to store) / target-missing (a recurring row whose ' +
+					'serve, or on a URL too long to key) / refiled (client-side redirect onto another prerender ' +
+					'key) / no-content (a legacy worker posted an indexable verdict with nothing to store) / ' +
+					'target-missing (a recurring row whose ' +
 					'URL has no Target on this node — page not stored, row deferred, see render.targetMissing); ' +
 					'suppressed: the browser’s ' +
 					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
@@ -375,8 +377,10 @@ export const METRICS = Object.freeze({
 					'or it began draining — so the URL retries; unknown = pre-v1.16.0 worker posted no detail); ' +
 					'redirect: landed-auth/landed-transient ' +
 					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
-					'it — a render is wasted every interval until fixed), non-indexable-destination (source ' +
-					'retired, destination suppressed), temporary (kept, strike counted), permanent (source retired ' +
+					'it — a render is wasted every interval until fixed), unkeyable-destination (plugin v0.97.3: a ' +
+					'permanent move to a URL too long to be a cache key — source retired, nothing adopted), ' +
+					'non-indexable-destination (source retired, destination suppressed), temporary (kept, strike ' +
+					'counted), permanent (source retired ' +
 					'in favor of the destination); superseded: newer-lease (the render began before the key was ' +
 					'leased to another renderer — a result that outlived its lease; nothing stored, and the newer ' +
 					'lease is not released) / changed-during-render (its lease predates the row’s change mark, so ' +
@@ -442,6 +446,7 @@ export const METRICS = Object.freeze({
 					'skip',
 					'invalidated',
 					'bypass',
+					'key-too-long',
 					'blob-missing',
 					'blob-timeout',
 					'render-timeout',
@@ -450,8 +455,10 @@ export const METRICS = Object.freeze({
 				],
 				description:
 					'Why the origin was consulted: the cache status that led here (miss/stale/skip/invalidated), ' +
-					'bypass (non-GET/HEAD), render-timeout (a renderNow render did not land in time and the ' +
-					'origin was the fallback), or revalidate (a background re-check of a stored 404/410 past its ' +
+					'bypass (non-GET/HEAD), key-too-long (plugin v0.97.3: a URL whose cache key would exceed ' +
+					'Harper’s primary-key limit, proxied uncached — bot_serve counts it as bypass), render-timeout ' +
+					'(a renderNow render did not land in time and the origin was the fallback), or revalidate (a ' +
+					'background re-check of a stored 404/410 past its ' +
 					'fresh window, render.negative — one per bot_serve cacheStatus negative-revalidate). ' +
 					"'other' is the emitter's default for a caller that passed no " +
 					'reason — its presence is a bug in the caller, not a traffic category.',

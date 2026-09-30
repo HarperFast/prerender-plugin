@@ -1147,6 +1147,15 @@ export class PrerenderAdmin extends Resource {
 
 		const { cacheKey, canonicalUrl } = explanation.resolved;
 
+		// Said outright: the Target read would throw on the key, and `readWithTimeout` reports a throw as a
+		// timeout — a 504 for a URL that can never be scheduled at all.
+		if (!explanation.eligibility.keyable) {
+			return json(
+				{ error: 'This URL is too long to be a cache key: it is proxied to the origin and never scheduled.' },
+				400
+			);
+		}
+
 		const timedOutReads = [];
 		const target = await readWithTimeout('renderTarget', timedOutReads, () =>
 			Target.get({ id: canonicalUrl, select: ['url', 'sitemapUrl', 'renderInterval', 'demandInterval'] })
@@ -1624,6 +1633,21 @@ export class PrerenderAdmin extends Resource {
 		}
 
 		const { cacheKey, canonicalUrl } = explanation.resolved;
+
+		// A URL TOO LONG TO KEY HAS NO ROWS, and reading for them would throw — which `readWithTimeout`
+		// turns into a "degraded" view blaming timed-out reads. The true answer is certain without a read:
+		// nothing is stored or scheduled under it, and a bot request for it is proxied to the origin.
+		if (!explanation.eligibility.keyable) {
+			return json({
+				...explanation,
+				cadence: null,
+				rows: { renderTarget: null, renderSchedule: null, prerenderedPage: null, suppression: null },
+				verdict: { reliable: true, wouldServe: 'origin', scheduled: false, recurring: false, suppressed: false },
+				residency: null,
+				degraded: null,
+				checkedAt: Date.now(),
+			});
+		}
 
 		// RenderSchedule is residency-pinned (`setResidencyById`), so a plain `get` for a row
 		// owned by another node performs a REMOTE fetch (`sourceLoad`) — see Harper's
