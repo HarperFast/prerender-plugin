@@ -2682,7 +2682,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'Lease slots in the node-local shared buffer that records which keys are currently being ' +
 				'rendered.\n\n' +
 				'Sizing: a 10-minute lease at 12,000 renders/hour is about 2,000 leases in flight fleet-wide, ' +
-				'so ~500 per node on four nodes; 4,096 slots × 28 bytes is 112KB. A claim that cannot record ' +
+				'so ~500 per node on four nodes; 4,096 slots × 32 bytes is 128KB. A claim that cannot record ' +
 				'a lease does NOT grant the job (a granted-but-unrecorded job is a double render), so an ' +
 				'undersized table shows up as claims granting fewer jobs than asked, with a warning naming the ' +
 				'occupancy.\n\n' +
