@@ -2719,15 +2719,22 @@ export const configSchema = group('Prerender plugin configuration.', {
 					{ min: 0 }
 				),
 				urgentHeadStart: option(
-					1,
-					'The same head start, for a row filed due now by an ASK rather than a detected change: a ' +
-						'render-now, a revalidate, an admin rejoin, the destination of a permanent redirect whose ' +
-						'source was just retired, a sitemap entry filed for an immediate render ' +
+					0.5,
+					'The same kind of head start, for a row filed due now by a SINGLE ASK rather than a detected ' +
+						'change: a render-now, an admin revalidate or rejoin of one URL, the destination of a permanent ' +
+						'redirect whose source was just retired, a URL a sitemap lists for the first time ' +
 						'(`RenderSchedule.urgentAt`). Filed at the current minute such a row is zero cadences late, so ' +
 						'without this it ranked behind every overdue row — and past `capacity` routine rows, was not ' +
-						'published at all. In boosted units and bounded exactly as `changedHeadStart` is, so a ' +
-						'route-wide revalidate takes the fleet for a while, never indefinitely. A row that is also ' +
-						'marked changed takes `changedHeadStart` instead; the two are not added. `0` ranks such rows ' +
+						'published at all. Bulk re-files (a revalidate over a collection, a sitemap walk with ' +
+						'`revalidate: true`) are not asks and are not marked.\n\n' +
+						'HALF OF `changedHeadStart` BY DEFAULT, on purpose. A changed page is hard-expired and answered ' +
+						'from the origin while it waits; an asked-for page is usually still served from the cache. So a ' +
+						'change must outrank an ask of the same lateness — and at 0.5 against 1 it does, and outranks ' +
+						'any ask filed less than half a cadence before it — while an ask still outranks routine rows ' +
+						'less than half a cadence late (sitemap-listed; a discovered one, less than half a cadence times ' +
+						'the boost). Keep it below `changedHeadStart`: at equal values an ask filed two hours before a ' +
+						'change outranks it. In boosted units and bounded exactly as `changedHeadStart` is. A row that ' +
+						'is also marked changed takes `changedHeadStart`; the two are not added. `0` ranks such rows ' +
 						'like any other due row, which is the pre-0.97.0 behaviour.',
 					{ min: 0 }
 				),
@@ -2803,19 +2810,23 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'demand estimate wiped.\n\n' +
 				'So a node that does not own the row asks the owner to file it (`POST /prerender_peer/due-now`), ' +
 				'where the read is authoritative, and writes nothing itself. The owner never forwards onward. ' +
-				'If the owner cannot be reached or refuses, the write is made locally exactly as before — never ' +
+				'If the owner refuses or cannot be reached, the write is made locally exactly as before — never ' +
 				'worse than without this — and that owner is not asked again for 30 seconds, so a peer that is ' +
-				'down costs a bulk revalidate one timeout, not one per row. Counted as `prerender_ops` ' +
-				'`due_now_forward`.\n\n' +
+				'down costs a bulk revalidate one timeout, not one per row. A SLOW answer is not a refusal: the ' +
+				'owner may have filed it, and a local write landing after that filing would wipe what it kept. ' +
+				'So a plain ask that times out is left to the owner (the worst case is one ask lost to a lost ' +
+				'request), and only one carrying a change mark — whose loss leaves a page known wrong on the ' +
+				'origin for a cadence — is written locally. Counted as `prerender_ops` `due_now_forward`.\n\n' +
 				'REQUIRES `peerRescue.token` and `peerRescue.header` (the shared cluster secret the peer ' +
 				'endpoints already use). With either unset this is inert and the endpoint answers 404.',
 			{
 				enabled: option(true, 'Forward when the peer token is configured. Off files every row locally, as before.'),
 				timeoutMs: option(
 					1000,
-					'Deadline for one forwarded filing, after which it is made locally. Short, because a render-now ' +
-						'waits on it: the bot is held for the render, and this sits in front of it. Capped at the ' +
-						'32-bit signed maximum because it reaches `setTimeout`.',
+					'Deadline for one forwarded filing. Past it, an ask carrying a change mark is filed locally and ' +
+						'any other is left to the owner (see above). Short, because a render-now waits on it: the bot ' +
+						'is held for the render, and this sits in front of it. Capped at the 32-bit signed maximum ' +
+						'because it reaches `setTimeout`.',
 					{ unit: 'ms', min: 1, max: 2147483647 }
 				),
 			}

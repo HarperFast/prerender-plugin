@@ -91,6 +91,9 @@ export class Target extends TargetTable {
 
 		let nextRenderTime = data.nextRenderTime;
 		delete data.nextRenderTime;
+		// Scheduling intent, like the time above: consumed here, never stored on the target.
+		const asked = data.urgent === true;
+		delete data.urgent;
 
 		if (!data.schedulerNode) {
 			data.schedulerNode = getResidencyByUrl(url);
@@ -122,10 +125,11 @@ export class Target extends TargetTable {
 		const explicit = Number.isFinite(nextRenderTime) && nextRenderTime > 0;
 		await writeSchedule(url, {
 			nextRenderTime: explicit ? nextRenderTime : getInitialRenderTime(url, interval),
-			// An explicit time that is not in the future is an ask to render now (an adopted redirect
-			// destination, a sitemap `revalidate: true`), ranked ahead like any `fileDueNow` — see
-			// `urgentAt` in schema.graphql. A jittered initial time never is.
-			urgentAt: explicit && nextRenderTime <= currentMinuteMs() ? Date.now() : undefined,
+			// A caller's single ask to render now (`urgent: true` with a time not in the future — an adopted
+			// redirect destination) is ranked ahead like a `fileDueNow` ask; see `urgentAt` in
+			// schema.graphql. A bulk re-file (a sitemap walk's `revalidate: true`) and a jittered first
+			// render never are: tens of thousands of asks would queue ahead of every change found after them.
+			urgentAt: asked && explicit && nextRenderTime <= currentMinuteMs() ? Date.now() : undefined,
 			fromSitemap,
 			// `interval`, and no ladder rung applied — deliberately. `super.put` above REPLACES the
 			// target row, so a put clears `demandInterval` along with the suppression fields; the
@@ -402,8 +406,11 @@ export class Target extends TargetTable {
 				// those pages being cached at all.
 				//
 				// `fileDueNow`: filed at the current minute PER URL, and a row already due, or already
-				// marked by the change probe, keeps its place.
+				// marked by the change probe, keeps its place. NOT an ask when it re-files a collection
+				// (`urgent`): a route-wide revalidate would otherwise queue up to its whole match set ahead of
+				// every change found while it drains. A revalidate that names one URL is an ask.
 				await fileDueNow(url, {
+					urgent: urls.length === 1,
 					fromSitemap: !!sitemapUrl,
 					// `null` — the sweep resolves from config instead, which is what it did before this
 					// field existed. Phase 1's projection is deliberately just `url` + `sitemapUrl` (and

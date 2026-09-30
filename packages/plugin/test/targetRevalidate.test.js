@@ -251,3 +251,18 @@ test('reactivate carries the url: a target deleted a moment earlier comes back a
 		strikes: 0,
 	});
 });
+
+test('a revalidate over a collection is not an ask: its rows carry no urgent mark; one naming a single URL is', async () => {
+	// Marked, a route-wide revalidate (up to its whole match set) queued ahead of every page the probe found
+	// changed while it drained — changed pages are answered from the origin, revalidated ones from the cache.
+	const urls = Array.from({ length: 3 }, (_, i) => `https://www.example.com/bulk${i}`);
+	for (const url of urls) stores.target.set(url, { url });
+	await Target.revalidate({});
+	for (const url of urls) assert.equal('urgentAt' in stores.renderSchedule.get(url), false, url);
+
+	for (const rows of Object.values(stores)) rows.clear();
+	const one = 'https://www.example.com/one';
+	stores.target.set(one, { url: one });
+	await Target.revalidate({});
+	assert.ok(stores.renderSchedule.get(one).urgentAt > 0, 'a revalidate that names one URL is an ask');
+});

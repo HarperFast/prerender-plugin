@@ -256,3 +256,21 @@ test('M4(b): dry run counts and does nothing; renderCheck: false does not even c
 	assert.equal(hardExpired(), false);
 	assert.deepEqual(outcomes(), []);
 });
+
+test('change_lag_ms is counted for a render that lands the change, never for one the render check finds stale', async () => {
+	// A stale render does not carry the change's content: it is re-filed, and its trigger-to-cache lag is
+	// the next render's to report. Counted here too it would be counted twice, and too early.
+	const lag = () => analytics.filter((a) => a[1] === 'render' && a[2] === 'change_lag_ms');
+	seed();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: Date.now() - HOUR });
+	await claimAndPost(['39.99', 'USD', 'InStock']); // disagrees with the observed 35.99
+	assert.deepEqual(outcomes(), ['refiled']);
+	assert.equal(lag().length, 0, 'stale: no sample');
+
+	for (const rows of Object.values(stores)) rows.clear();
+	funnel.resetRenderQueueState();
+	seed();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: Date.now() - HOUR });
+	await claimAndPost(['35.99', 'USD', 'InStock']);
+	assert.equal(lag().length, 1, 'agrees: one sample');
+});

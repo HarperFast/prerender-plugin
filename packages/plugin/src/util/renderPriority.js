@@ -76,8 +76,9 @@
  *
  *     score += headStart x max(1, sitemapBoost)
  *         headStart = changedHeadStart   a row the change probe filed: `changedAt` on the row
- *                   = urgentHeadStart    a row filed due now by an ask: `urgentAt` (render-now,
- *                                        revalidate, rejoin, a redirect destination adopted)
+ *                   = urgentHeadStart    a row filed due now by a single ask: `urgentAt` (render-now,
+ *                                        a one-URL revalidate or rejoin, an adopted redirect
+ *                                        destination, a first sitemap listing)
  *
  * The one ADDITIVE term, and it has to be: both kinds are filed at the current minute, so their
  * lateness is zero and no multiplier can move it — they would enter behind every overdue row in the
@@ -100,9 +101,16 @@
  * Starvation stays bounded, with the same kind of statement as the boost's: a routine row wins as
  * soon as its score passes the marked rows' — so if marked rows are being held at `U` cadences late,
  * a routine sitemap row is served by `headStart + U` cadences late (times `sitemapBoost` for a
- * discovered one). A change wave, or a route-wide revalidate, can take the fleet for a while; it
- * cannot take it indefinitely. A row carrying both marks takes the change's head start: the two are
- * not added.
+ * discovered one). A change wave, or a burst of asks, can take the fleet for a while; it cannot take
+ * it indefinitely. A row carrying both marks takes the change's head start: the two are not added.
+ *
+ * A CHANGE OUTRANKS AN ASK, which is why `urgentHeadStart` defaults to half of `changedHeadStart`. A
+ * changed page is answered from the origin while it waits; an asked-for one usually still from the
+ * cache. At equal head starts an ask filed two hours earlier out-scored a change found now (2.083 to
+ * 2.0 on a 48h sitemap page), so a burst of asks queued the changes found after it. At half, a change
+ * outranks every ask filed less than half a cadence before it. For the same reason a BULK re-file is
+ * not an ask at all (`fileDueNow`'s `urgent`): a route-wide revalidate or a sitemap walk with
+ * `revalidate: true` would otherwise put up to 100k rows ahead of every change found while they drain.
  *
  * ── A CHANGED PAGE WAITS IN VISITS, NOT CADENCES ──────────────────────────────────────────────
  *

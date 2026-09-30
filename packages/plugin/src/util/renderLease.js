@@ -84,6 +84,16 @@ const S_GRANTED = 5;
 const S_GRANTED_DUE = 6;
 const SLOT_INT32 = 7;
 
+/** `grantedDue` of a slot no real grant has written: a hold into a fresh slot. `grantOf` reports none. */
+const GRANT_NONE = -1;
+
+/**
+ * `grantedDue` of a lease released by a result that DELIBERATELY left its row due (`release`'s
+ * `leftDue`): the grant is still known, but its due minute is forgotten, so re-granting the row at that
+ * minute is not read as a result whose commit failed.
+ */
+const GRANT_LEFT_DUE = -2;
+
 /**
  * `dueMinute` of a slot whose lease has been RELEASED and is only sitting out its
  * commit-visibility grace (see the module comment). A real due minute is minutes-since-the-epoch,
@@ -282,7 +292,7 @@ export const createLeaseTable = ({
 		Atomics.store(i32, at + S_MISSES, 0);
 		// A hold into a fresh slot has no grant behind it: a negative due minute reads as "no generation".
 		Atomics.store(i32, at + S_GRANTED, held ? 0 : grantedSec);
-		Atomics.store(i32, at + S_GRANTED_DUE, held ? -1 : minute);
+		Atomics.store(i32, at + S_GRANTED_DUE, held ? GRANT_NONE : minute);
 		onGrantWindow?.(cacheKey);
 		if (Atomics.compareExchange(i32, at + S_LO, observedLo, lo) !== observedLo) return false;
 		if (liveElsewhere(lo, hi, free, nowSec)) {
@@ -363,11 +373,12 @@ export const createLeaseTable = ({
 		if (found === -1) return null;
 		const at = base(found);
 		const grantedDue = Atomics.load(i32, at + S_GRANTED_DUE);
-		if (grantedDue < 0) return null;
+		if (grantedDue === GRANT_NONE) return null;
 		const due = Atomics.load(i32, at + S_DUE);
 		return {
 			grantedAtMs: fromExpiresSec(Atomics.load(i32, at + S_GRANTED)),
-			dueMinute: grantedDue,
+			// null once a release has said the row was left due on purpose
+			dueMinute: grantedDue < 0 ? null : grantedDue,
 			live: isCounted(at, nowSec),
 			released: due === DUE_RELEASED,
 		};
@@ -401,6 +412,11 @@ export const createLeaseTable = ({
 	 * outlived its lease released whichever lease the key held when it arrived — another renderer's, whose
 	 * key then became claimable again under it.
 	 *
+	 * `leftDue` says the result landed but left its row due ON PURPOSE — a render dropped for predating a
+	 * change mark, or one that kept an ask filed while it ran. The row is then re-granted at the minute
+	 * this lease was granted for, which is otherwise the signature of a result whose commit failed (see
+	 * `missesOf`); forgetting that minute keeps a deliberate re-render from counting toward a wedge hold.
+	 *
 	 * The slot is deliberately NOT published free — see the module comment on the commit-visibility
 	 * grace. Nothing in this function writes `hashLo`, and the one payload word it does write is CAS'd
 	 * against the value it read.
@@ -409,7 +425,7 @@ export const createLeaseTable = ({
 	 * can have been recycled by another key in between, and clearing it by index would silently free
 	 * somebody else's lease.
 	 */
-	const release = (cacheKey, { grantedAtMs } = {}) => {
+	const release = (cacheKey, { grantedAtMs, leftDue = false } = {}) => {
 		const { lo, hi } = lease64(cacheKey);
 		const nowSec = nowSecond();
 		const { found } = locate(lo, hi, nowSec);
@@ -442,6 +458,7 @@ export const createLeaseTable = ({
 		if (dueMinute === DUE_RELEASED) return false;
 		const wasCounted = isCounted(at, nowSec); // false for a hold: it was never counted
 		if (Atomics.compareExchange(i32, at + S_DUE, dueMinute, DUE_RELEASED) !== dueMinute) return false;
+		if (leftDue) Atomics.store(i32, at + S_GRANTED_DUE, GRANT_LEFT_DUE);
 
 		// Shorten to the grace, never lengthen (a lease that already expired stays expired), and only
 		// if the expiry is still the one read above.

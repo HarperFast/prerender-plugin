@@ -145,11 +145,20 @@ export const resetDueNowForward = () => coolingUntil.clear();
 /**
  * Ask `owner` to file `cacheKey` due now with its own `fileDueNow`, where the read that keeps an earlier
  * due time and a change mark is authoritative. Returns `{ ok: true, nextRenderTime }` when the owner
- * filed it, else `{ ok: false, reason }` — and the caller then writes locally, as it always did.
+ * filed it, else `{ ok: false, reason }` (with `timedOut` when the answer was merely slow) — and the
+ * caller decides whether to write locally, as it always did.
  *
  * Never throws, for the same reason `forwardHeal` does not: every failure has to end as a fallback.
  */
-export const forwardDueNow = async ({ owner, cacheKey, fromSitemap, effectiveInterval, changedAt, demandPeriod }) => {
+export const forwardDueNow = async ({
+	owner,
+	cacheKey,
+	fromSitemap,
+	effectiveInterval,
+	changedAt,
+	demandPeriod,
+	urgent = true,
+}) => {
 	if (!isDueNowForwardActive()) return { ok: false, reason: 'disabled' };
 	if (!isKnownNode(owner)) return { ok: false, reason: `unknown node "${owner}"` };
 	if ((coolingUntil.get(owner) ?? 0) > Date.now()) return { ok: false, reason: 'cooling' };
@@ -164,7 +173,7 @@ export const forwardDueNow = async ({ owner, cacheKey, fromSitemap, effectiveInt
 				'content-type': 'application/json',
 				[config.peerRescue.header]: config.peerRescue.token,
 			},
-			body: JSON.stringify({ cacheKey, fromSitemap, effectiveInterval, changedAt, demandPeriod }),
+			body: JSON.stringify({ cacheKey, fromSitemap, effectiveInterval, changedAt, demandPeriod, urgent }),
 			signal: controller.signal,
 			dispatcher: dispatcher(),
 		});
@@ -187,7 +196,9 @@ export const forwardDueNow = async ({ owner, cacheKey, fromSitemap, effectiveInt
 		coolingUntil.set(owner, Date.now() + FORWARD_COOLDOWN_MS);
 		const name = e?.name;
 		const message = e?.message ?? String(e);
-		return { ok: false, reason: name === 'AbortError' ? 'peer timed out' : `peer fetch failed: ${message}` };
+		// A timeout is reported apart from a failure: the owner may have filed it (see `fileDueNow`).
+		if (name === 'AbortError') return { ok: false, reason: 'peer timed out', timedOut: true };
+		return { ok: false, reason: `peer fetch failed: ${message}` };
 	} finally {
 		clearTimeout(timer);
 	}
