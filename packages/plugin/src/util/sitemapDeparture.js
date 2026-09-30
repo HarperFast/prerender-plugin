@@ -68,23 +68,52 @@ export { DepartureAction };
 export const departureLimit = (value) => (value < 0 ? Infinity : value);
 
 /**
- * Would unlinking `departed` of a child's `examined` attributed URLs trip `sitemap.shrinkGuard`?
- * Returns the refusal message, or null to let the prune proceed.
+ * Did this DOCUMENT get so much shorter than the last one this deployment accepted that it is more
+ * likely truncated or partial than real (`sitemap.shrinkGuard`)? Returns the refusal message, or null.
  *
- * `baseline` lets a caller measure against more than the scan saw: a child the index stopped listing
- * is pruned AFTER the walk, when the URLs that moved to other children have already been re-attached,
- * so its scan returns only the leftovers and every one of them departs — 100% of what it examined,
- * whatever share of the child that is. Its last `entryCount` is the honest denominator there.
+ * The document, never the prune: an earlier version measured "would-be-unlinked ÷ attributed", which
+ * counts every URL that merely MOVED — forward shear across fixed-size paginated children, a cache-key
+ * rule re-keying a child's URLs — as shrink. That tripped on children whose length had not changed at
+ * all, every walk, freezing their attribution and, through the failed-walk guard, departures. A URL
+ * that moved is the post-walk shear handling's business (the module comment above); this asks only how
+ * many entries the origin sent against how many it sent last time.
+ *
+ * @param {{ sitemapUrl: string, incoming: number, stored: unknown }} counts  `stored` is the row's
+ *   `entryCount` as read — absent on a first fetch, which is never refused
  */
-export const shrinkRefusal = ({ sitemapUrl, departed, examined, baseline = 0 }) => {
+export const shrinkRefusal = ({ sitemapUrl, incoming, stored }) => {
 	const { maxRatio, minUrls } = config.sitemap.shrinkGuard;
-	const of = Math.max(examined, baseline);
-	if (maxRatio >= 1 || departed < Math.max(1, minUrls) || of <= 0 || departed <= maxRatio * of) return null;
+	const before = Number(stored);
+	if (maxRatio >= 1 || stored === null || stored === undefined || !(before > 0)) return null;
+	const drop = before - incoming;
+	if (drop < Math.max(1, minUrls) || incoming >= (1 - maxRatio) * before) return null;
 	return (
-		`${sitemapUrl}: refusing to unlink ${departed} of ${of} attributed URLs (${Math.round((departed / of) * 100)}%, ` +
-		`past sitemap.shrinkGuard.maxRatio=${maxRatio}) — a document this much shorter than the last one is far ` +
-		`more likely truncated or partial than real. Its targets keep their attribution; if the shrink is real, ` +
-		`raise maxRatio for one walk`
+		`${sitemapUrl}: refusing a document of ${incoming} entries against the ${before} last accepted ` +
+		`(${Math.round((drop / before) * 100)}% shorter, past sitemap.shrinkGuard.maxRatio=${maxRatio}) — far more ` +
+		`likely truncated or partial than real. Its targets keep their attribution; an identical document is ` +
+		`accepted after sitemap.shrinkGuard.acceptAfter consecutive refusals`
+	);
+};
+
+/**
+ * Did an INDEX lose more than `maxRatio` of its children — by count, or by the entries they last held
+ * — against the children it listed before? Returns the refusal message, or null.
+ *
+ * The index-level form of `shrinkRefusal`, and deliberately without its `minUrls` floor: a partial
+ * index that omits many SMALL children is the same partial document, and each omitted child would be
+ * pruned (every URL it held departed) and its row dropped, only to rejoin on the next walk — two renders
+ * per URL. Counted both ways because either can hide the other: one large child, or many small ones.
+ */
+export const indexShrinkRefusal = ({ indexUrl, storedChildren, droppedChildren, storedEntries, droppedEntries }) => {
+	const { maxRatio } = config.sitemap.shrinkGuard;
+	if (maxRatio >= 1 || !(droppedChildren > 0)) return null;
+	const byCount = storedChildren > 0 && droppedChildren > maxRatio * storedChildren;
+	const byEntries = storedEntries > 0 && droppedEntries > maxRatio * storedEntries;
+	if (!byCount && !byEntries) return null;
+	return (
+		`${indexUrl}: refusing an index that stops listing ${droppedChildren} of ${storedChildren} child sitemaps ` +
+		`(${droppedEntries} of ${storedEntries} entries they held), past sitemap.shrinkGuard.maxRatio=${maxRatio} — ` +
+		`none of them is pruned; an identical index is accepted after sitemap.shrinkGuard.acceptAfter refusals`
 	);
 };
 

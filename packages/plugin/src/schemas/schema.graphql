@@ -55,6 +55,11 @@ type Sitemap @table(database: "sitemaps") {
 	# double the point reads and double the writes, every single pass. Refresh-all now visits
 	# roots only and lets the index reach its own children.
 	parentUrl: String @indexed
+	# `sitemap.shrinkGuard`'s memory of a document it REFUSED as much shorter than this row: how many
+	# walks running it refused the same document, and that document's entry count and digest. A refused
+	# fetch patches only these; an accepted one's put replaces the row and clears them.
+	shrinkRefusals: Int
+	shrinkRefusedHash: String
 }
 
 type SitemapFailure {

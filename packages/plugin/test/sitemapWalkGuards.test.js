@@ -3,7 +3,7 @@
  * walks (`Sitemap.refresh`) against in-memory tables and a faked origin that answers conditionally,
  * fails, redirects and truncates on demand.
  *
- *  - a walk with a failed child acts on no departure, and puts back what it unlinked;
+ *  - a failed child holds back, and puts back, only the URLs that could have moved into it;
  *  - a truncated or much-shorter document is a failed child, not a shorter sitemap;
  *  - a child the index stops listing is pruned (behind the same guard) instead of staying listed forever;
  *  - a URL still listed by a child that answered 304 is re-attached to it, not departed;
@@ -234,7 +234,7 @@ const attributed = (url) => targets.get(url)?.sitemapUrl;
 
 // ---- F1: a failed child ----
 
-test('a walk with a FAILED child acts on no departure, re-links what it unlinked, and the next walk sees no rejoin', async () => {
+test('a FAILED child holds back the URLs that could have moved into it: re-linked, and the next walk sees no rejoin', async () => {
 	lastMod[C1] = MON;
 	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1), P(2), P(3)), [C2]: urlset(P(4)) });
 	for (const key of cacheKeysOf(P(2))) pages.set(key, { expiresAt: Date.now() + 86_400_000 });
@@ -245,7 +245,7 @@ test('a walk with a FAILED child acts on no departure, re-links what it unlinked
 	const failed = await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)) });
 
 	assert.equal(failed.failed.length, 1);
-	assert.deepEqual(failed.departures.outcomes, { relinked: 2 }, 'no departure acted on');
+	assert.deepEqual(failed.departures.outcomes, { relinked: 2 }, 'neither shifted URL departs');
 	assert.equal(schedulePuts.length, 0, 'nothing filed to render');
 	for (const key of cacheKeysOf(P(2))) assert.ok(pages.get(key).expiresAt > Date.now(), 'nothing expired');
 	for (const url of [P(2), P(3)]) {
@@ -306,13 +306,14 @@ test('a TRUNCATED child is a failed child: nothing it dropped is unlinked, depar
 	assert.equal(good.failed.length, 0);
 });
 
-test('the shrink guard refuses a well-formed child that lost most of what it held, and maxRatio 1 lets it through', async () => {
-	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+test('the shrink guard refuses a DOCUMENT much shorter than the last accepted, and maxRatio 1 lets it through', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 3 } } });
 	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
 
 	const refused = await walk({ [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) });
 	assert.equal(refused.failed.length, 1);
-	assert.match(refused.failed[0].error, /refusing to unlink 8 of 10.*shrinkGuard\.maxRatio=0\.5/);
+	assert.match(refused.failed[0].error, /refusing a document of 2 entries against the 10 last accepted.*maxRatio=0\.5/);
+	assert.equal(refused.shrinkRefused, 1);
 	assert.equal(refused.removed, 0);
 	assert.equal(sitemapRows.get(C1).entryCount, 10, 'the row keeps the last good fetch');
 	for (const url of range(0, 10)) assert.equal(attributed(url), C1);
@@ -331,14 +332,66 @@ test('the shrink guard leaves a shrink under minUrls alone — the default floor
 	assert.equal(result.removed, 9);
 });
 
+// Probe 1 of the round-2 review: the guard used to measure would-be-unlinked ÷ attributed, which counts
+// every URL that MOVED. Forward shear across fixed-size children tripped it on every walk, froze the old
+// attribution, never created the head insertions, and held the one real departure back for good.
+test('forward shear across FIXED-SIZE children is not a shrink: new URLs are created and only the real departure departs', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3 } } });
+	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(...range(10, 20)), [C2]: urlset(...range(20, 30)) });
+	// Six low-id URLs inserted at the head, P(25) genuinely removed; every child stays 10 long.
+	const all = [...range(1, 7), ...range(10, 25), ...range(26, 30)];
+	await sleep(2);
+	const result = await walk({
+		[ROOT]: index(C1, C2, C3),
+		[C1]: urlset(...all.slice(0, 10)),
+		[C2]: urlset(...all.slice(10, 20)),
+		[C3]: urlset(...all.slice(20)),
+	});
+	assert.equal(result.failed.length, 0);
+	assert.equal(result.shrinkRefused, 0);
+	assert.equal(targets.has(P(1)), true, 'the head insertions are created');
+	assert.equal(attributed(P(25)), null);
+	assert.equal(result.departures.outcomes.render, 1, 'only P(25) departs');
+	assert.ok(result.departures.outcomes.reattached >= 6, 'the rest is shear, recognised after the walk');
+});
+
+test('an IDENTICAL shorter document is accepted after acceptAfter refusals; a changed one restarts the count', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 3, acceptAfter: 2 } } });
+	await walk({ [ROOT]: index(C1), [C1]: urlset(...range(0, 10)) });
+
+	const short = { [ROOT]: index(C1), [C1]: urlset(P(0), P(1)) };
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	// A different short document restarts the count...
+	assert.equal((await walk({ [ROOT]: index(C1), [C1]: urlset(P(0), P(2)) })).shrinkRefused, 1);
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, 1);
+	// ...so this identical pair needs two refusals before it is believed.
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	assert.equal((await walk(short)).shrinkRefused, 1);
+	const accepted = await walk(short);
+	assert.equal(accepted.shrinkAccepted, 1);
+	assert.equal(accepted.failed.length, 0);
+	assert.equal(accepted.removed, 8);
+	assert.equal(sitemapRows.get(C1).entryCount, 2);
+	assert.equal(sitemapRows.get(C1).shrinkRefusals, undefined, 'the accepted put clears the count');
+});
+
 // ---- S1: a child the index stops listing ----
 
 test('a child the index STOPS LISTING is pruned after the walk: what moved stays, what is listed nowhere departs', async () => {
-	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2), P(3)) });
+	await walk({
+		[ROOT]: index(C1, C2, C3),
+		[C1]: urlset(...range(10, 15)),
+		[C2]: urlset(P(2), P(3)),
+		[C3]: urlset(...range(20, 25)),
+	});
 	assert.equal(attributed(P(3)), C2);
 
 	schedulePuts.length = 0;
-	const result = await walk({ [ROOT]: index(C1), [C1]: urlset(P(1), P(2)) });
+	const result = await walk({
+		[ROOT]: index(C1, C3),
+		[C1]: urlset(...range(10, 15), P(2)),
+		[C3]: urlset(...range(20, 25)),
+	});
 	assert.equal(attributed(P(2)), C1, 'the URL that moved is re-attached, not departed');
 	assert.equal(attributed(P(3)), null, 'the one listed nowhere is unlinked');
 	assert.equal(result.removed, 1);
@@ -347,50 +400,143 @@ test('a child the index STOPS LISTING is pruned after the walk: what moved stays
 	assert.equal(targets.has(P(2)) && targets.has(P(3)), true, 'without deleting any target');
 });
 
-test('a dropped child that would lose everything trips the guard, is offered again on a 304 index, and prunes once allowed', async () => {
-	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 1 } } });
+// Probe 3: a well-formed PARTIAL index omitting many small children used to depart all of them and drop
+// their rows, and they rejoined — two renders each — the next walk.
+test('an index that omits most of its children is refused: nothing is pruned, and the full index brings no rejoin', async () => {
+	const C4 = `${HOST}/sitemap_product_4.xml`;
+	const docs = {
+		[ROOT]: index(C1, C2, C3, C4),
+		[C1]: urlset(...range(0, 5)),
+		[C2]: urlset(...range(5, 10)),
+		[C3]: urlset(...range(10, 15)),
+		[C4]: urlset(...range(15, 20)),
+	};
 	lastMod[ROOT] = MON;
-	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2), P(3)) });
+	await walk(docs);
 
 	lastMod[ROOT] = TUE;
-	const refused = await walk({ [ROOT]: index(C1), [C1]: urlset(P(1)) });
-	assert.deepEqual(
-		refused.failed.map((f) => f.url),
-		[C2]
-	);
-	assert.equal(attributed(P(2)), C2);
-	assert.equal(sitemapRows.has(C2), true, 'kept, so a later walk offers it again');
+	schedulePuts.length = 0;
+	const partial = await walk({ ...docs, [ROOT]: index(C1) });
+	assert.equal(partial.shrinkRefused, 1);
+	assert.equal(partial.removed, 0);
+	assert.deepEqual(partial.departures.outcomes, {});
+	assert.equal(schedulePuts.length, 0);
+	for (const child of [C2, C3, C4]) assert.equal(sitemapRows.has(child), true);
+	assert.equal(sitemapRows.get(ROOT).entries.length, 4, 'the refused index is not stored');
+	assert.equal(attributed(P(6)), C2);
 
-	const again = await walk(); // the index now answers 304
-	assert.equal(again.notModified >= 1, true);
-	assert.deepEqual(
-		again.failed.map((f) => f.url),
-		[C2]
-	);
+	await sleep(2);
+	const back = await walk(docs);
+	assert.equal(back.shrinkRefused, 0);
+	assert.equal(back.arrivals.considered, 0, 'nothing departed, so nothing rejoins');
+});
 
-	configure({ sitemap: { shrinkGuard: { maxRatio: 1, minUrls: 1 } } });
-	const allowed = await walk();
-	assert.equal(allowed.failed.length, 0);
-	assert.equal(attributed(P(2)), null);
-	assert.equal(attributed(P(3)), null);
+test('a partial index is refused by the ENTRIES its omitted children held, too, and accepted after acceptAfter', async () => {
+	configure({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 1000, acceptAfter: 1 } } });
+	// One large child omitted out of four: 1 of 4 by count, 20 of 26 by entries.
+	await walk({
+		[ROOT]: index(C1, C2, C3),
+		[C1]: urlset(P(100)),
+		[C2]: urlset(...range(0, 20)),
+		[C3]: urlset(...range(200, 205)),
+	});
+	const refused = await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(100)), [C3]: urlset(...range(200, 205)) });
+	assert.equal(refused.shrinkRefused, 1);
+	assert.equal(attributed(P(0)), C2);
+
+	const accepted = await walk();
+	assert.equal(accepted.shrinkAccepted, 1);
+	assert.equal(accepted.removed, 20);
 	assert.equal(sitemapRows.has(C2), false);
 });
 
-test('a dropped child is left alone on a walk that failed elsewhere — its URLs are not stranded on a deleted row', async () => {
-	await walk({ [ROOT]: index(C1, C2), [C1]: urlset(P(1)), [C2]: urlset(P(2), P(3)) });
+test('a dropped child whose URLs moved into a FAILED child is re-linked, and its row outlives the walk', async () => {
+	const C4 = `${HOST}/sitemap_product_4.xml`;
+	await walk({
+		[ROOT]: index(C1, C2, C4),
+		[C1]: urlset(...range(10, 15)),
+		[C2]: urlset(P(2), P(3)),
+		[C4]: urlset(...range(20, 25)),
+	});
 
-	// The index replaces C2 with C3 — and C3 fails this walk, so nothing has re-attached C2's URLs yet.
-	const failed = await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(1)) });
+	// The index replaces C2 with C3 — and C3, never fetched before, fails this walk.
+	const failed = await walk({
+		[ROOT]: index(C1, C3, C4),
+		[C1]: urlset(...range(10, 15)),
+		[C4]: urlset(...range(20, 25)),
+	});
 	assert.equal(failed.failed.length, 1);
-	assert.equal(failed.removed, 0, 'the dropped child is not pruned on a failed walk');
+	assert.deepEqual(
+		failed.departures.outcomes,
+		{ relinked: 2 },
+		'a sibling that failed with no sample holds its siblings'
+	);
 	assert.equal(attributed(P(2)), C2);
-	assert.equal(sitemapRows.has(C2), true);
+	assert.equal(sitemapRows.has(C2), true, 'kept: its URLs were put back on it');
 
-	const clean = await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(1)), [C3]: urlset(P(2), P(3)) });
+	const clean = await walk({
+		[ROOT]: index(C1, C3, C4),
+		[C1]: urlset(...range(10, 15)),
+		[C3]: urlset(P(2), P(3)),
+		[C4]: urlset(...range(20, 25)),
+	});
 	assert.equal(clean.failed.length, 0);
 	assert.equal(attributed(P(2)), C3);
 	assert.equal(attributed(P(3)), C3);
-	assert.equal(sitemapRows.has(C2), false, 'dropped once the walk is clean');
+	assert.equal(sitemapRows.has(C2), false, 'dropped once nothing was put back on it');
+});
+
+// ---- a failed child holds back only what could have moved into it ----
+
+test('a failed child on ANOTHER route holds nothing back: product departures proceed while the stores sitemap 404s', async () => {
+	applyOptions({
+		domains: [],
+		origin: { securityToken: { header: 'x-bypass', value: 'SECRET' } },
+		sitemap: {
+			departure: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+			arrival: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+		},
+		ingress: {
+			mode: 'forwarded',
+			routes: [{ match: 'prefix', path: '/product/', departureAction: 'render', arrivalAction: 'render' }],
+		},
+	});
+	const STORES = `${HOST}/sitemap_stores.xml`;
+	const S = (n) => `${HOST}/stores/store-${n}.shtml`; // routed nowhere, like a store locator
+	await walk({ [ROOT]: index(STORES, C1), [STORES]: urlset(S(1), S(2)), [C1]: urlset(P(1), P(2)) });
+
+	const result = await walk({ [ROOT]: index(STORES, C1), [C1]: urlset(P(1)) });
+	assert.deepEqual(
+		result.failed.map((f) => f.url),
+		[STORES]
+	);
+	assert.deepEqual(result.departures.outcomes, { render: 1 }, 'P(2) departs');
+	assert.equal(attributed(P(2)), null);
+});
+
+test('a failed child on the SAME route holds back only that route: a catalog departure still proceeds', async () => {
+	applyOptions({
+		domains: [],
+		sitemap: {
+			departure: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+			arrival: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+		},
+		ingress: {
+			mode: 'forwarded',
+			routes: [
+				{ match: 'prefix', path: '/product/', departureAction: 'render' },
+				{ match: 'prefix', path: '/catalog/', departureAction: 'render' },
+			],
+		},
+	});
+	const CAT = `${HOST}/sitemap_catalog.xml`;
+	const K = (n) => `${HOST}/catalog/c-${n}`;
+	await walk({ [ROOT]: index(CAT, C1, C2), [CAT]: urlset(K(1), K(2)), [C1]: urlset(P(1), P(2)), [C2]: urlset(P(3)) });
+
+	const result = await walk({ [ROOT]: index(CAT, C1, C2), [CAT]: urlset(K(1)), [C1]: urlset(P(1)) });
+	assert.deepEqual(result.departures.outcomes, { relinked: 1, render: 1 });
+	assert.equal(attributed(P(2)), C1, 'the product URL could have moved into the failed product child');
+	assert.equal(attributed(K(2)), null, 'the catalog URL could not');
 });
 
 // ---- S5: a second lister that answered 304 ----
@@ -417,6 +563,104 @@ test('a URL the owning child drops is re-attached to a child that still lists it
 	await sleep(5);
 	const next = await walk();
 	assert.equal(next.arrivals.considered, 0, 'and it never reads as a rejoin');
+});
+
+// Probes 2 / 2b / 4 of the round-2 review: the re-read used to fetch every 304'd urlset in full whenever
+// anything at all was held — shear the walk had already re-attached, or an unlink on a route nothing acts on.
+test('shear alone re-reads nothing: a held URL the walk already re-attached is not pending', async () => {
+	lastMod[C3] = MON;
+	await walk({ [ROOT]: index(C1, C2, C3), [C1]: urlset(P(1), P(2)), [C2]: urlset(P(3)), [C3]: urlset(P(50), P(51)) });
+	fetchLog.length = 0;
+	const result = await walk({
+		[ROOT]: index(C1, C2, C3),
+		[C1]: urlset(P(1)),
+		[C2]: urlset(P(2), P(3)),
+		[C3]: urlset(P(50), P(51)),
+	});
+	assert.deepEqual(
+		fetchLog.filter((f) => f.url === C3).map((f) => f.headers['If-Modified-Since']),
+		[MON],
+		'only the conditional fetch'
+	);
+	assert.deepEqual(result.departures.outcomes, { reattached: 1 });
+});
+
+test('an unlink on a route with no departure or arrival action re-reads nothing, and a pending product URL re-reads only product children', async () => {
+	applyOptions({
+		domains: [],
+		sitemap: {
+			departure: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+			arrival: { enabled: true, dryRun: false, maxActions: -1, maxCandidates: -1 },
+			conditional: { enabled: true },
+		},
+		ingress: {
+			mode: 'forwarded',
+			routes: [
+				{ match: 'prefix', path: '/product/', departureAction: 'render', arrivalAction: 'render' },
+				{ match: 'prefix', path: '/catalog/' },
+			],
+		},
+	});
+	const CAT = `${HOST}/sitemap_catalog.xml`;
+	const K = (n) => `${HOST}/catalog/c-${n}`;
+	lastMod[CAT] = MON;
+	lastMod[C1] = MON;
+	lastMod[C2] = MON;
+	await walk({
+		[ROOT]: index(CAT, C1, C2),
+		[CAT]: urlset(K(1), K(2)),
+		[C1]: urlset(...range(0, 5)),
+		[C2]: urlset(...range(5, 10)),
+	});
+
+	lastMod[CAT] = TUE;
+	fetchLog.length = 0;
+	await walk({
+		[ROOT]: index(CAT, C1, C2),
+		[CAT]: urlset(K(1)),
+		[C1]: urlset(...range(0, 5)),
+		[C2]: urlset(...range(5, 10)),
+	});
+	assert.equal(
+		fetchLog.filter((f) => !f.headers['If-Modified-Since'] && f.url !== CAT && f.url !== ROOT).length,
+		0,
+		'no full re-read'
+	);
+
+	// Now a product URL really departs from C1 while CAT and C2 answer 304: only C2 could list it.
+	lastMod[C1] = TUE;
+	fetchLog.length = 0;
+	const result = await walk({
+		[ROOT]: index(CAT, C1, C2),
+		[CAT]: urlset(K(1)),
+		[C1]: urlset(...range(0, 4)),
+		[C2]: urlset(...range(5, 10)),
+	});
+	const full = fetchLog.filter((f) => f.url !== ROOT && f.url !== C1 && !f.headers['If-Modified-Since']);
+	assert.deepEqual(
+		full.map((f) => f.url),
+		[C2],
+		'the catalog child shares no route with the pending URL'
+	);
+	assert.deepEqual(result.departures.outcomes, { render: 1 });
+});
+
+test('a transient failure re-reading an unchanged child is retried once, and does not hold the departure back', async () => {
+	lastMod[C3] = MON;
+	await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(1), P(2)), [C3]: urlset(P(50)) });
+	let calls = 0;
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init) => {
+		if (url === C3 && !init.headers?.['If-Modified-Since'] && ++calls === 1) return new Response('x', { status: 503 });
+		return realFetch(url, init);
+	};
+	try {
+		const result = await walk({ [ROOT]: index(C1, C3), [C1]: urlset(P(1)), [C3]: urlset(P(50)) });
+		assert.equal(result.failed.length, 0);
+		assert.deepEqual(result.departures.outcomes, { render: 1 });
+	} finally {
+		globalThis.fetch = realFetch;
+	}
 });
 
 test('no held URL, no re-read: a walk that unlinked nothing never refetches a 304 child', async () => {
@@ -556,6 +800,25 @@ test('the bypass token goes to the root sitemap’s host and to `domains`, never
 	fetchLog.length = 0;
 	await walk();
 	assert.equal(sent(partner), 'SECRET', 'a host the deployment names is trusted');
+});
+
+test('the token is never sent in cleartext: not to a same-host http:// child, not across an https -> http redirect', async () => {
+	const plain = 'http://site.example.com/sitemap_plain.xml';
+	const downgraded = 'http://site.example.com/sitemap_moved.xml';
+	redirects[C1] = downgraded;
+	await walk({ [ROOT]: index(C1, plain), [plain]: urlset(P(1)), [downgraded]: urlset(P(2)) });
+	const sent = (url) => fetchLog.find((f) => f.url === url)?.headers['x-bypass'];
+	assert.equal(sent(C1), 'SECRET');
+	assert.equal(sent(downgraded), undefined);
+	assert.equal(sent(plain), undefined);
+	assert.equal(attributed(P(1)), plain, 'fetched all the same — only the token is withheld');
+});
+
+test('a local origin may carry the token over http', async () => {
+	const localRoot = 'http://127.0.0.1:9926/sitemap.xml';
+	documents = { [localRoot]: urlset(P(1)) };
+	await sitemaps.refresh(localRoot);
+	assert.equal(fetchLog.find((f) => f.url === localRoot).headers['x-bypass'], 'SECRET');
 });
 
 test('a redirect re-decides the token on every hop, and the document is ingested under the URL that was asked for', async () => {

@@ -2440,39 +2440,51 @@ export const configSchema = group('Prerender plugin configuration.', {
 			}
 		),
 		shrinkGuard: group(
-			'A circuit breaker on the prune itself: a child sitemap whose fetch would unlink more than ' +
-				'`maxRatio` of the URLs attributed to it is refused and counted as a FAILED child — its row, ' +
-				'its targets and their attribution are left exactly as the last good fetch left them, and the ' +
-				'walk, having a failed child, acts on no departure and re-links what it did unlink. It applies ' +
-				'to every deployment, departure check or not: the prune runs regardless, and an unlink is what ' +
-				'the departure and arrival checks, the probe’s `listed` scope and the negative cache’s ' +
-				'`listed` guard all read.\n\n' +
-				'WHAT IT GUARDS AGAINST: a child that arrives short but well-formed — a generator that died ' +
-				'mid-build and still closed its root, an edge serving a stale partial object. A body cut off ' +
-				'mid-document is refused earlier, by the parse (its root is never closed). Either way the ' +
-				'document presents every URL it lost as departed, which on an armed departure check is a slice ' +
-				'of the cache hard-expired and re-rendered, then re-rendered again as rejoins once the origin ' +
+			'A circuit breaker on a DOCUMENT that arrives much shorter than the one last accepted. A urlset ' +
+				'child whose entry count falls below `(1 - maxRatio)` of its stored `entryCount`, by at least ' +
+				'`minUrls`, is refused and counted as a FAILED child: its row, its targets and their ' +
+				'attribution stay exactly as the last good fetch left them. An INDEX that stops listing more ' +
+				'than `maxRatio` of its children (by count, or by the entries they last held) is refused the ' +
+				'same way: the children it still lists are walked, and none of the ones it omits is pruned.\n\n' +
+				'WHAT IT GUARDS AGAINST: a document short but well-formed — a generator that died mid-build and ' +
+				'still closed its root, an edge serving a stale partial object, an index that lost half its ' +
+				'`<sitemap>` entries. A body cut off mid-document is refused earlier, by the parse (its root is ' +
+				'never closed). Accepted, such a document presents every URL it lost as departed: hard-expired ' +
+				'and re-rendered on an armed departure check, then re-rendered again as rejoins when the origin ' +
 				'recovers.\n\n' +
-				'WHY 0.5: real churn is nowhere near it. A paginated product child sheds URLs through shear, not ' +
-				'the prune (a URL that moved to an earlier child is re-attached before this child is pruned), so ' +
-				'what one child genuinely loses per walk is a few percent at most, while a truncated or partial ' +
-				'document typically loses most of itself. The breaker trips on EVERY walk until the document ' +
-				'recovers, so a shrink that is real needs an operator: raise `maxRatio` for one walk (1 disables ' +
-				'the guard), then put it back. A child the index STOPS LISTING is pruned behind the same guard, ' +
-				'measured against the larger of its attributed targets and its last `entryCount`.',
+				'IT MEASURES THE DOCUMENT, NOT THE PRUNE. URLs that merely MOVE — forward shear across ' +
+				'fixed-size paginated children, a cache-key rule re-keying a child — leave a document as long as ' +
+				'it was, and are the post-walk shear handling\u2019s business. Only a document that got shorter ' +
+				'is refused.\n\n' +
+				'A REAL SHRINK DOES NOT FREEZE THE WALK FOREVER: after `acceptAfter` consecutive refusals of an ' +
+				'IDENTICAL document (same entry count, same content hash) it is accepted, logged at error and ' +
+				'counted `shrink_accepted`. Refusals are `shrink_refused` and a failed child on the walk result. ' +
+				'`maxRatio: 1` disables the guard.',
 			{
 				maxRatio: option(
 					0.5,
-					'Largest share of a child’s attributed URLs one prune may unlink. 1 disables the guard.',
+					'Largest share of its last accepted length a document may lose in one fetch (a urlset: ' +
+						'entries; an index: children, or the entries they held). 1 disables the guard. 0.5 because ' +
+						'real churn is nowhere near it — a mature catalog child gains and loses a few percent a day — ' +
+						'while a truncated or partial document typically loses most of itself.',
 					{ min: 0, max: 1 }
 				),
 				minUrls: option(
 					1000,
-					'The guard applies only when the prune would unlink at least this many URLs, so a small ' +
-						'child legitimately emptied by the site is not refused on every walk. Sized well above real ' +
-						'per-child churn (tens a day on a mature catalog) and well below what a truncated product ' +
-						'child loses (tens of thousands).',
+					'A URLSET is refused only when it lost at least this many entries, so a small child the site ' +
+						'legitimately empties is never held back. Sized well above real per-child churn (tens a day on a ' +
+						'mature catalog) and well below what a truncated product child loses (tens of thousands). Not ' +
+						'applied to an index, whose partial form is many small children.',
 					{ min: 0 }
+				),
+				acceptAfter: option(
+					3,
+					'Consecutive refusals of an IDENTICAL shorter document after which it is accepted as real ' +
+						'(logged at error, counted `shrink_accepted`). At the default 6h refresh that is a day of a ' +
+						'shrink persisting unchanged before the walk believes it — long enough for a transient ' +
+						'partial to recover, short enough that a real catalog cut is not held off for good. Any ' +
+						'change to the document restarts the count.',
+					{ min: 1 }
 				),
 			}
 		),
@@ -2541,9 +2553,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'already unlinked, so no later walk offers it again. It is never decided and never appears ' +
 						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
 						'removes the ceiling and never reports `capped`; 0 collects nothing.\n\n' +
-						'The same list is what a walk with a FAILED child re-links (`departure_relinked`) instead of ' +
-						'departing, so it also bounds that, and an arrival-only deployment holds up to this many ' +
-						'for the re-link alone.',
+						'The same list is what a walk with a FAILED child draws on to re-link (`departure_relinked`) ' +
+						'the URLs that could have moved into it — those on a route its stored entry sample covers — ' +
+						'instead of departing them, so it also bounds that, and an arrival-only deployment holds up ' +
+						'to this many for the re-link alone.',
 					{ min: -1 }
 				),
 			}

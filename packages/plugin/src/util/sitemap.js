@@ -27,7 +27,8 @@ const parser = new XMLParser({
  * cut short arrives as a well-formed-looking PREFIX with no error anywhere (reproduced: 1,972 of
  * 5,000 entries, status 200, no throw). Accepted, every URL past the cut reads as departed — unlinked,
  * then rendered by the departure check, then rendered again as a rejoin once the origin recovers.
- * Thrown, it is a failed child, and a walk with a failed child acts on no departure (Sitemap.js).
+ * Thrown, it is a failed child, which holds back the departures that could have moved into it
+ * (Sitemap.js `processDepartures`).
  */
 export function parseSitemap(xml) {
 	const data = parser.parse(xml);
