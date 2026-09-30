@@ -48,7 +48,7 @@ import { config, onConfigApplied } from '../config.js';
 import { metrics } from '../metrics.js';
 import { CacheKey } from './cacheKey.js';
 import { getSab } from './coordination.js';
-import { changedOf, demandPeriodOf, createQueueKeeper } from './queueKeeper.js';
+import { changedOf, demandPeriodOf, createQueueKeeper, urgentOf } from './queueKeeper.js';
 import {
 	clearKeeperSignal,
 	getScheduleRow,
@@ -81,7 +81,15 @@ const TOP_CHECK_ROWS = 64;
 const TOP_CHECK_TTL_MS = 60_000;
 /** A publish is forced at least this often, so an expired lease is noticed even with nothing else moving. */
 const FORCE_PUBLISH_MS = 10_000;
-const SCHEDULE_FIELDS = ['cacheKey', 'nextRenderTime', 'fromSitemap', 'effectiveInterval', 'changedAt', 'demandPeriod'];
+const SCHEDULE_FIELDS = [
+	'cacheKey',
+	'nextRenderTime',
+	'fromSitemap',
+	'effectiveInterval',
+	'changedAt',
+	'demandPeriod',
+	'urgentAt',
+];
 const MAX_TIMER_MS = 2_147_483_647;
 
 let snapshot = null;
@@ -144,6 +152,19 @@ export const classifyScheduleRow = (key, value) => {
 
 const capList = (list) => (list.length > MAX_LISTED ? list.slice(0, MAX_LISTED) : list);
 
+/**
+ * The due time a row would be held at, or NaN when it has none the keeper can hold — the keeper's own
+ * rule (`util/queueKeeper.js`): absent, non-finite and negative are not held. `Number(null)` is 0, so
+ * absence is rejected before the coercion. Every repair tests this, never `Number.isFinite` alone: a
+ * row the keeper will not hold must not read as one it is missing.
+ */
+const holdableDueOf = (row) => {
+	const at = row?.nextRenderTime;
+	if (at === null || at === undefined) return Number.NaN;
+	const ms = Number(at);
+	return Number.isFinite(ms) && ms >= 0 ? ms : Number.NaN;
+};
+
 /** Does what the keeper holds for this key match the durable row? */
 const matches = (held, row, described) =>
 	held !== null &&
@@ -151,6 +172,7 @@ const matches = (held, row, described) =>
 	held.minute === minuteOf(Number(row.nextRenderTime)) &&
 	held.fromSitemap === !!row.fromSitemap &&
 	held.changed === changedOf(row) &&
+	held.urgent === urgentOf(row) &&
 	held.demandPeriodMs === demandPeriodOf(row) &&
 	held.cadenceMs === described.cadenceMs &&
 	held.carried === described.carried &&
@@ -250,8 +272,7 @@ export const createKeeperService = ({
 		const after = keeper.describe(key);
 		if (JSON.stringify(before) !== JSON.stringify(after)) return false; // an event won
 		const described = row ? classifyScheduleRow(key, row) : null;
-		const due = row ? Number(row.nextRenderTime) : NaN;
-		const shouldHold = described !== null && Number.isFinite(due) && due >= 0;
+		const shouldHold = described !== null && Number.isFinite(holdableDueOf(row));
 		if (!shouldHold) {
 			if (after === null) return false;
 			keeper.apply(key, null);
@@ -600,6 +621,7 @@ export const createKeeperService = ({
 				nowMs,
 				sitemapBoost: config.queue.ready.sitemapBoost,
 				changedHeadStart: config.queue.ready.changedHeadStart,
+				urgentHeadStart: config.queue.ready.urgentHeadStart,
 				changedDemand: config.queue.ready.changedDemand,
 				skip: (key) => leases.isLeased(key),
 			});
@@ -653,7 +675,16 @@ export const createKeeperService = ({
 		walkWanted = false;
 		const mine = epoch;
 		const started = performance.now();
-		const result = { at: now(), scanned: 0, owned: 0, unowned: 0, missing: 0, mismatched: 0, phantoms: 0 };
+		const result = {
+			at: now(),
+			scanned: 0,
+			owned: 0,
+			unowned: 0,
+			missing: 0,
+			mismatched: 0,
+			phantoms: 0,
+			unschedulable: 0,
+		};
 		const verifyTouched = new Set();
 		touched = verifyTouched;
 		let ok = false;
@@ -673,10 +704,18 @@ export const createKeeperService = ({
 				// needed. Otherwise the walked row IS the table's value, newer than anything held.
 				if (verifyTouched.has(key)) return;
 				const held = keeper.describe(key);
-				if (!described) {
+				// NOT HOLDABLE IS NOT MISSING. A row this node owns with no usable due time (null, negative) is
+				// one the keeper never holds, by its own rule, so "held === null" is the correct state for it.
+				// Counted as missing, it was "repaired" on every walk — `keeper_repaired` never reached 0, the
+				// keeper never read as exact and the backlog snapshot as truncated, forever, over one bad row.
+				// It is counted apart instead: no claim can ever grant it, which is its own problem to report.
+				const holdable = described !== null && Number.isFinite(holdableDueOf(row));
+				if (!holdable) {
 					if (held !== null) {
 						keeper.apply(key, null);
 						result.mismatched++;
+					} else if (described) {
+						result.unschedulable++;
 					}
 					return;
 				}
@@ -703,6 +742,14 @@ export const createKeeperService = ({
 			stats.repairedTotal += result.repaired;
 			if (!walked.partial && stats.partialLoad) stats.partialLoad = null; // the whole table is now held
 			metrics.queueHealth(result.ms, 'keeper_verify_ms');
+			if (result.unschedulable) {
+				metrics.queueHealth(result.unschedulable, 'keeper_unschedulable');
+				log?.warn?.(
+					`[prerender] queue keeper verification found ${result.unschedulable} schedule row(s) this node owns with ` +
+						'no usable nextRenderTime (null or negative). No claim can grant them, so those URLs do not render; ' +
+						're-file them (POST /prerender_admin/revalidate) or delete them.'
+				);
+			}
 			if (result.repaired) {
 				metrics.queueHealth(result.repaired, 'keeper_repaired');
 				log?.warn?.(

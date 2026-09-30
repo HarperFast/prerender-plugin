@@ -2546,7 +2546,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'Lease slots in the node-local shared buffer that records which keys are currently being ' +
 				'rendered.\n\n' +
 				'Sizing: a 10-minute lease at 12,000 renders/hour is about 2,000 leases in flight fleet-wide, ' +
-				'so ~500 per node on four nodes; 4,096 slots × 20 bytes is 80KB. A claim that cannot record ' +
+				'so ~500 per node on four nodes; 4,096 slots × 28 bytes is 112KB. A claim that cannot record ' +
 				'a lease does NOT grant the job (a granted-but-unrecorded job is a double render), so an ' +
 				'undersized table shows up as claims granting fewer jobs than asked, with a warning naming the ' +
 				'occupancy.\n\n' +
@@ -2593,9 +2593,26 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'it were already this many of its own intervals late. The probe hard-expires such a page and ' +
 						'files its render at the current minute, so without a head start it would enter at lateness ' +
 						'zero, behind every overdue row, while bots are served the origin for as long as it waits.\n\n' +
+						'IN BOOSTED UNITS (since v0.97.0): the head start is multiplied by `sitemapBoost`, as a sitemap ' +
+						'row’s lateness is, so a page found changed a minute ago outranks every routine row less than ' +
+						'this many cadences late, sitemap-listed or not (a discovered one, less than this times the ' +
+						'boost). Unboosted, a sitemap row half a cadence late already outranked it at the default boost.\n\n' +
 						'ADDITIVE, and bounded: a routine row still wins once it is more than `changedHeadStart` ' +
 						'cadences later than the changed rows being held, so a large change wave takes the fleet for ' +
 						'a while, never indefinitely. `0` ranks changed pages like any other due row.',
+					{ min: 0 }
+				),
+				urgentHeadStart: option(
+					1,
+					'The same head start, for a row filed due now by an ASK rather than a detected change: a ' +
+						'render-now, a revalidate, an admin rejoin, the destination of a permanent redirect whose ' +
+						'source was just retired, a sitemap entry filed for an immediate render ' +
+						'(`RenderSchedule.urgentAt`). Filed at the current minute such a row is zero cadences late, so ' +
+						'without this it ranked behind every overdue row — and past `capacity` routine rows, was not ' +
+						'published at all. In boosted units and bounded exactly as `changedHeadStart` is, so a ' +
+						'route-wide revalidate takes the fleet for a while, never indefinitely. A row that is also ' +
+						'marked changed takes `changedHeadStart` instead; the two are not added. `0` ranks such rows ' +
+						'like any other due row, which is the pre-0.97.0 behaviour.',
 					{ min: 0 }
 				),
 				changedDemand: option(
@@ -2657,6 +2674,33 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'backlog snapshot. Walks every occupied minute of every class, so it runs apart from the ' +
 						'publish, which only takes the head of the queue.',
 					{ unit: 'ms', min: 1000, max: 2147483647 }
+				),
+			}
+		),
+		dueNowForward: group(
+			'FORWARD A "RENDER THIS NOW" TO THE ROW’S OWNER (v0.97.0). Every render-now, revalidate, admin ' +
+				'rejoin and change-probe filing goes through one write that must never DEMOTE a row: a row ' +
+				'already due keeps its due time, and a change mark keeps its first instant. That needs the row, ' +
+				'and the row lives only on its residency owner — on any other node (about three in four on a ' +
+				'four-node cluster) the local read sees nothing, and the whole-row write that replicates to the ' +
+				'owner REPLACED its row: an overdue row pushed back to the current minute, its change mark and ' +
+				'demand estimate wiped.\n\n' +
+				'So a node that does not own the row asks the owner to file it (`POST /prerender_peer/due-now`), ' +
+				'where the read is authoritative, and writes nothing itself. The owner never forwards onward. ' +
+				'If the owner cannot be reached or refuses, the write is made locally exactly as before — never ' +
+				'worse than without this — and that owner is not asked again for 30 seconds, so a peer that is ' +
+				'down costs a bulk revalidate one timeout, not one per row. Counted as `prerender_ops` ' +
+				'`due_now_forward`.\n\n' +
+				'REQUIRES `peerRescue.token` and `peerRescue.header` (the shared cluster secret the peer ' +
+				'endpoints already use). With either unset this is inert and the endpoint answers 404.',
+			{
+				enabled: option(true, 'Forward when the peer token is configured. Off files every row locally, as before.'),
+				timeoutMs: option(
+					1000,
+					'Deadline for one forwarded filing, after which it is made locally. Short, because a render-now ' +
+						'waits on it: the bot is held for the render, and this sits in front of it. Capped at the ' +
+						'32-bit signed maximum because it reaches `setTimeout`.',
+					{ unit: 'ms', min: 1, max: 2147483647 }
 				),
 			}
 		),

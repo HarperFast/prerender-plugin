@@ -692,11 +692,47 @@ test('a key whose leases keep expiring with no result is held back, ever longer,
 
 		clock += 4 * lease + 1_000;
 		assert.equal((await claimOne()).jobs.length, 1);
-		funnel.releaseLease(item(1)); // a result arrives
+		// A result arrives, and moves the row as every result that lands does (here to a minute that is
+		// still due, so the next claim can see it). A release that leaves the row at the minute it was
+		// granted for is a result that did not commit — counted as a miss, not a reset (see below).
+		funnel.releaseLease(item(1));
+		const moved = row(item(1), clock - MINUTE);
+		table.set(item(1), moved);
+		emit('put', item(1), moved);
 		clock += lease + 1_000;
 		pass = await claimOne();
 		assert.equal(pass.jobs.length, 1, 'a result resets the count: granted normally again');
 		assert.deepEqual(pass.wedged, []);
+		s.stop();
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test('a key whose results keep being released without moving its row is held back too', async () => {
+	// The result path releases before the request's transaction commits; a commit that then fails leaves
+	// the row due at its old minute, and the key is re-granted as soon as the grace passes — a loop at
+	// claim speed that renders the page and stores nothing. Each release reset the count, so the wedge
+	// guard never engaged.
+	const realNow = Date.now;
+	let clock = realNow();
+	Date.now = () => clock;
+	try {
+		seed([row(item(1), clock - HOUR)]);
+		const s = await started({ now: () => clock });
+		const claimOne = async () => {
+			await s.publish();
+			return funnel.claimSchedules({ grantLimit: 1 });
+		};
+		const limit = config.render.failureRetry.fastRetries + 2;
+		for (let i = 0; i < limit; i++) {
+			assert.equal((await claimOne()).jobs.length, 1, `lease ${i + 1} granted`);
+			funnel.releaseLease(item(1)); // a result was processed; its commit did not land
+			clock += 6_000; // past the release grace
+		}
+		const pass = await claimOne();
+		assert.equal(pass.jobs.length, 0, 'held back, not granted again');
+		assert.equal(pass.wedged[0]?.cacheKey, item(1));
 		s.stop();
 	} finally {
 		Date.now = realNow;
@@ -772,6 +808,43 @@ test('the verification walk repairs a missing row, a mismatched one and a delete
 	const body = await PrerenderAdmin.queueState().json();
 	assert.equal(body.trust.exact, false, 'a verification that repaired anything is not exact');
 	assert.equal((await s.verify()).repaired, 0, 'and a second walk finds nothing');
+	s.stop();
+});
+
+test('a row with no usable due time is counted apart by the walk, never "repaired" on every pass', async () => {
+	// The keeper never holds a row without a due time (its own rule), so held === null is the RIGHT state
+	// for one. Counted as missing, every walk "repaired" it again: keeper_repaired never reached 0 and the
+	// keeper never read as exact, forever, over one bad row.
+	const now = Date.now();
+	seed([
+		row(item(1), now - HOUR),
+		{ cacheKey: item(2), nextRenderTime: null, fromSitemap: true },
+		{ cacheKey: item(3), nextRenderTime: -5, fromSitemap: true },
+	]);
+	const s = await started();
+	const first = await s.verify();
+	const second = await s.verify();
+	for (const walk of [first, second]) {
+		assert.equal(walk.missing, 0);
+		assert.equal(walk.repaired, 0, 'nothing the keeper holds differs from the table');
+		assert.equal(walk.unschedulable, 2, 'the two rows no claim can grant, counted on their own');
+	}
+	assert.equal(s.keeper.has(item(2)), false);
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.trust.exact, true, 'a bad row is not a keeper that disagrees with its table');
+	s.stop();
+});
+
+test('a held row whose due time the table has since lost is dropped by the walk, as a mismatch', async () => {
+	const now = Date.now();
+	seed([row(item(1), now - HOUR)]);
+	const s = await started();
+	table.set(item(1), { cacheKey: item(1), nextRenderTime: null, fromSitemap: true }); // event lost
+	const result = await s.verify();
+	assert.equal(result.mismatched, 1);
+	assert.equal(result.unschedulable, 0);
+	assert.equal(s.keeper.has(item(1)), false);
 	s.stop();
 });
 
@@ -946,6 +1019,56 @@ test('a row the change probe marked is loaded as CHANGED and counted in queue-st
 	s.writeState();
 	const body = await PrerenderAdmin.queueState().json();
 	assert.equal(body.now.dueChanged, 1);
+	s.stop();
+});
+
+test('a row filed due NOW ranks at the head of a full ready set — no longer behind every overdue row', async () => {
+	// Measured before the urgent mark: with 5,005 routine rows 1–5,005 minutes late, a row filed at the
+	// current minute (render-now, revalidate, rejoin, a new sitemap URL) was not published at all, while a
+	// changed row filed the same minute placed 3,565th. Both now start a boosted head start ahead.
+	const now = Date.now();
+	const cap = funnel.readyQueue().capacity;
+	const rows = [];
+	for (let n = 1; n <= cap + 5; n++) rows.push(row(item(n), Math.floor((now - n * MINUTE) / MINUTE) * MINUTE));
+	seed(rows);
+	const s = await started();
+	const asked = item(0);
+	await funnel.fileDueNow(asked, { fromSitemap: false, effectiveInterval: null });
+	emit('put', asked, table.get(asked));
+	const changed = item(cap + 6);
+	await funnel.fileDueNow(changed, { fromSitemap: true, effectiveInterval: null, changedAt: now });
+	emit('put', changed, table.get(changed));
+	await s.publish();
+	const published = funnel
+		.readyQueue()
+		.peek(cap)
+		.map((e) => e.cacheKey);
+	// Ahead of every routine row less than one cadence (48h) late — and behind the ones more than a
+	// cadence late, which is the bound that keeps a wave of asks from starving the rotation.
+	const pastACadence = cap + 5 - (48 * HOUR) / MINUTE;
+	for (const key of [asked, changed]) {
+		const at = published.indexOf(key);
+		assert.ok(at >= 0, `${key} is published`);
+		assert.ok(at <= pastACadence + 2, `${key} ranks ahead of routine lateness under a cadence (at ${at})`);
+		assert.ok(at >= pastACadence - 1, 'and behind rows more than a cadence late');
+	}
+	s.writeState();
+	const body = await PrerenderAdmin.queueState().json();
+	assert.equal(body.trust.exact, true);
+	assert.equal((await s.verify()).repaired, 0, 'the keeper holds the urgent class exactly as the table has it');
+	s.stop();
+});
+
+test('the keeper loads the urgent mark: it is in the load projection and in what a verification compares', async () => {
+	const { SCHEDULE_SELECT } = await import('../src/util/renderSchedule.js');
+	assert.ok(SCHEDULE_SELECT.includes('urgentAt'), 'a projection without it would load every ask as routine');
+	const now = Date.now();
+	seed([{ ...row(item(1), now - MINUTE), urgentAt: now - MINUTE }]);
+	const s = await started();
+	assert.equal(s.keeper.describe(item(1)).urgent, true);
+	table.set(item(1), row(item(1), now - MINUTE)); // the mark cleared, event lost
+	assert.equal((await s.verify()).mismatched, 1);
+	assert.equal(s.keeper.describe(item(1)).urgent, false);
 	s.stop();
 });
 

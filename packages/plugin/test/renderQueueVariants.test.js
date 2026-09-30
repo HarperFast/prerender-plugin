@@ -1020,3 +1020,289 @@ test('a malformed readiness report cannot cost the render — arrays are read de
 	assert.equal(stores.renderExpectation.size, 0, 'a non-object learned is not an observation');
 	assert.equal(leased(A), false, 'and the lease is released — no 500, no held lease');
 });
+
+// ───────────────────────────── a patch that races a delete ─────────────────────────────
+
+/**
+ * A Target deleted on another node between the result path's read and its patch. Harper applies a
+ * patch to a missing record by storing only the patched fields — the fake `patch` above does the same
+ * — so a patch without the primary key leaves a row with no `url`, which no projected walk can read.
+ */
+const deleteTargetAfterRead = (t, nth) => {
+	const base = globalThis.databases.render_service.Target;
+	const original = base.get;
+	let reads = 0;
+	base.get = async function (query) {
+		const row = await original.call(this, query);
+		if (++reads === nth) stores.target.delete(typeof query === 'object' ? query.id : query);
+		return row;
+	};
+	t.after(() => {
+		base.get = original;
+	});
+};
+
+test('a failure strike racing a cross-node delete leaves a row that carries its url', async (t) => {
+	seedUrlRow();
+	await claim();
+	// the result's own read, then the retry lane's — the one its strike patch follows
+	deleteTargetAfterRead(t, 2);
+	await postVariants(A, [
+		{ deviceType: 'desktop', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+		{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	]);
+	assert.equal(stores.target.get(A)?.url, A, 'the patch named the key, so the row it left is addressable');
+});
+
+test('a strike reset racing a cross-node delete leaves a row that carries its url', async (t) => {
+	seedUrlRow({ strikes: 2 });
+	await claim();
+	deleteTargetAfterRead(t, 1);
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(stores.target.get(A)?.url, A);
+});
+
+// ───────────────────────────── the slow lane's wait ─────────────────────────────
+
+const HOUR_MS = 3_600_000;
+const failedVariants = () => [
+	{ deviceType: 'desktop', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+];
+/** A product page on a 96h ceiling rendering at its 48h ladder rung, one strike short of the slow lane. */
+const seedLadderedRow = (schedule = {}) => {
+	seedUrlRow({ renderInterval: 96 * HOUR_MS, strikes: config.render.failureRetry.fastRetries });
+	stores.target.set(A, { ...stores.target.get(A), demandInterval: 48 * HOUR_MS });
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), effectiveInterval: 48 * HOUR_MS, ...schedule });
+};
+
+test('the slow lane waits the page’s EFFECTIVE cadence, not the route ceiling it renders within', async () => {
+	// The pages expire at the 48h rung; a retry filed at the 96h ceiling left a failed page on the origin
+	// for ~42h past its swr window.
+	seedLadderedRow();
+	await claim();
+	const before = Date.now();
+	await postVariants(A, failedVariants());
+	const row = stores.renderSchedule.get(A);
+	assert.ok(row.nextRenderTime <= before + 48 * HOUR_MS, 'one 48h cadence out, not 96h');
+	assert.ok(row.nextRenderTime >= before + 48 * HOUR_MS - 60_000);
+	assert.equal(row.effectiveInterval, 48 * HOUR_MS);
+});
+
+test('a CHANGED page’s failed render retries at lease scale, and keeps its mark', async () => {
+	// Hard-expired by the probe, so every minute of the wait is served from the origin.
+	const changedAt = Date.now() - 60_000;
+	seedLadderedRow({ changedAt, demandPeriod: 6 * HOUR_MS });
+	await claim();
+	const before = Date.now();
+	await postVariants(A, failedVariants());
+	const row = stores.renderSchedule.get(A);
+	const twoLeases = 2 * config.queue.jobLeaseTime;
+	assert.ok(row.nextRenderTime <= before + twoLeases, 'two leases, not two days');
+	assert.ok(row.nextRenderTime >= before + twoLeases - 60_000);
+	assert.equal(row.changedAt, changedAt, 'still changed');
+	assert.equal(row.demandPeriod, 6 * HOUR_MS);
+	assert.equal(row.effectiveInterval, 48 * HOUR_MS, 'the cadence filed is still the cadence');
+});
+
+test('a temporary redirect re-files the source at its EFFECTIVE cadence, carrying its change mark', async () => {
+	const changedAt = Date.now() - 60_000;
+	seedLadderedRow({ changedAt });
+	stores.target.set(A, { ...stores.target.get(A), strikes: 0 });
+	await claim();
+	const before = Date.now();
+	const bounce = (deviceType) => ({
+		deviceType,
+		outcome: 'redirected',
+		statusCode: 302,
+		redirectedTo: 'https://site.example.com/elsewhere',
+		headers: {},
+	});
+	await postVariants(A, [bounce('desktop'), bounce('mobile')]);
+	assert.deepEqual(outcomes(), [['redirect', 'temporary']]);
+	const row = stores.renderSchedule.get(A);
+	assert.ok(row.nextRenderTime <= before + 48 * HOUR_MS, 'the rung, not the 96h ceiling');
+	assert.ok(row.nextRenderTime >= before + 48 * HOUR_MS - 60_000, 'but no lease-scale wait: strikes retire here');
+	assert.equal(row.changedAt, changedAt);
+});
+
+// ───────────────────────────── which lease a result belongs to ─────────────────────────────
+
+/** Drive Date.now for one test: every clock in the claim, lease and result paths reads it late. */
+const fakeClock = (t) => {
+	const real = Date.now;
+	const clock = { now: real() };
+	Date.now = () => clock.now;
+	t.after(() => {
+		Date.now = real;
+	});
+	return clock;
+};
+
+test('a render whose lease predates a change mark is not stored: the row stays due, marked, and renders again', async (t) => {
+	// Claimed at T-8s, the probe finds the origin changed and marks the row at T, the result posts at T+3s:
+	// its document may be from before the change, and storing it would serve the old price for a cadence.
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += 8_000;
+	const changedAt = clock.now;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt, demandPeriod: 6 * 3_600_000 });
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>old price</html>'), rendered('mobile', '<html>old</html>')]);
+
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content, 'old html', 'nothing stored');
+	const row = stores.renderSchedule.get(A);
+	assert.equal(row.nextRenderTime, 1, 'still due where it was');
+	assert.equal(row.changedAt, changedAt, 'and still marked');
+	assert.equal(leased(A), false, 'the lease is released, so the page renders again at once');
+	assert.deepEqual(outcomes(), [['superseded', 'changed-during-render']]);
+});
+
+test('a render granted AFTER the change mark is stored as normal, and its reschedule clears the mark', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt: clock.now - 60_000 });
+	await claim();
+	clock.now += 3_000;
+	await postVariants(A, [rendered('desktop', '<html>new price</html>'), rendered('mobile')]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>new price</html>');
+	assert.equal(stores.renderSchedule.get(A).changedAt, undefined);
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+});
+
+test('a result that outlived its lease does not release the renderer the key went to next', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000; // the first renderer is still going; its lease expires
+	assert.equal((await claim()).length, 1, 'and the key is granted to a second renderer');
+	clock.now += 20_000;
+	// began before the second grant: 30s + 20s ago, and it rendered for longer than that
+	await postVariants(A, [
+		rendered('desktop', '<html>late</html>', { renderTime: 60_000 }),
+		rendered('mobile', '<html>late</html>', { renderTime: 20_000 }),
+	]);
+
+	assert.equal(leased(A), true, 'the second renderer still holds its lease');
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content, 'old html', 'and the late page is not stored');
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, 1, 'nor rescheduled over');
+	assert.deepEqual(outcomes(), [['superseded', 'newer-lease']]);
+});
+
+test('a result that outlived its lease never overwrites the page the next lease already stored', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000;
+	await claim();
+	clock.now += 10_000;
+	await postVariants(A, [rendered('desktop', '<html>newer</html>'), rendered('mobile', '<html>newer</html>')]);
+	const rescheduled = stores.renderSchedule.get(A).nextRenderTime;
+	clock.now += 10_000;
+	await postVariants(A, [
+		rendered('desktop', '<html>older</html>', { renderTime: 80_000 }),
+		rendered('mobile', '<html>older</html>', { renderTime: 10_000 }),
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>newer</html>');
+	assert.equal(stores.renderSchedule.get(A).nextRenderTime, rescheduled);
+	assert.deepEqual(outcomes(), [
+		['rendered', 'stored'],
+		['superseded', 'newer-lease'],
+	]);
+});
+
+test('a result that outlived its lease with NO grant since is still the latest render, and is stored', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	clock.now += config.queue.jobLeaseTime + 30_000;
+	await postVariants(A, [
+		rendered('desktop', '<html>slow</html>', { renderTime: config.queue.jobLeaseTime }),
+		rendered('mobile', '<html>slow</html>', { renderTime: 20_000 }),
+	]);
+	assert.equal(stores.prerenderedPage.get(key(A, 'desktop')).content.toString(), '<html>slow</html>');
+	assert.deepEqual(outcomes(), [['rendered', 'stored']]);
+});
+
+test('Target.put marks the row urgent only for an explicit due time that is not in the future', async () => {
+	// An adopted redirect destination and a sitemap `revalidate: true` pass the current minute: an ask to
+	// render now. A jittered first render, and an explicit future time, are not asks.
+	const { Target } = await import('../src/resources/Target.js');
+	const minute = Math.floor(Date.now() / 60_000) * 60_000;
+	await Target.put(A, { renderInterval: 3_600_000 });
+	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'jittered');
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute + 3_600_000 });
+	assert.equal('urgentAt' in stores.renderSchedule.get(A), false, 'explicitly later');
+	await Target.put(A, { renderInterval: 3_600_000, nextRenderTime: minute });
+	assert.ok(stores.renderSchedule.get(A).urgentAt > 0, 'explicitly now');
+});
+
+// ───────────────────────────── what a landed render reports ─────────────────────────────
+
+const lagSamples = () => analytics.filter((a) => a[1] === 'render' && a[2] === 'change_lag_ms');
+const sizeSamples = () => analytics.filter((a) => a[1] === 'render_size');
+
+test('a render that lands for a changed row reports trigger-to-cache, once, by route', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	const changedAt = clock.now - 7 * 60_000;
+	stores.renderSchedule.set(A, { ...stores.renderSchedule.get(A), changedAt });
+	await claim();
+	clock.now += 20_000;
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.deepEqual(
+		lagSamples().map((a) => [a[0], a[3]]),
+		[[7 * 60_000 + 20_000, 'unrouted']],
+		'ms from the mark to the landed render, labelled by route'
+	);
+});
+
+test('no lag sample for a routine row, a partial render, or a render refused for predating the mark', async (t) => {
+	const clock = fakeClock(t);
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [rendered('desktop'), rendered('mobile')]);
+	assert.equal(lagSamples().length, 0, 'routine: nothing changed');
+
+	seedUrlRow({ url: B });
+	stores.renderSchedule.set(B, { ...stores.renderSchedule.get(B), changedAt: clock.now - 60_000 });
+	await claim();
+	await postVariants(B, [
+		rendered('desktop'),
+		{ deviceType: 'mobile', outcome: 'error', reason: 'error', statusCode: 500, headers: {} },
+	]);
+	assert.equal(lagSamples().length, 0, 'partial: the mark rides the retry, and the landing is counted then');
+});
+
+test('each stored page reports its DECODED size by route and device, banded at the 1 MB threshold', async () => {
+	const { gzipSync } = await import('node:zlib');
+	seedUrlRow();
+	await claim();
+	const big = `<html>${'x'.repeat(1_200_000)}</html>`;
+	const gz = gzipSync(Buffer.from(big));
+	await postVariants(A, [
+		rendered('desktop', gz, { headers: { 'content-encoding': 'gzip' } }),
+		rendered('mobile', '<html>small</html>'),
+	]);
+	assert.deepEqual(
+		sizeSamples()
+			.map((a) => [a[0], a[2], a[3], a[4]])
+			.sort((x, y) => x[2].localeCompare(y[2])),
+		[
+			[Buffer.byteLength(big), 'unrouted', 'desktop', '1m-2m'],
+			[Buffer.byteLength('<html>small</html>'), 'unrouted', 'mobile', 'under-500k'],
+		],
+		'the gzip trailer’s length, not the bytes on the wire'
+	);
+});
+
+test('a page in an encoding that would cost a decompression to measure is not measured', async () => {
+	seedUrlRow();
+	await claim();
+	await postVariants(A, [
+		rendered('desktop', 'br-bytes', { headers: { 'content-encoding': 'br' } }),
+		rendered('mobile', 'not really gzip', { headers: { 'content-encoding': 'gzip' } }),
+	]);
+	assert.deepEqual(sizeSamples(), []);
+});

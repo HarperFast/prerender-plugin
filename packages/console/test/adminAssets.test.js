@@ -238,6 +238,9 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		'demand',
 		'invalidationError',
 		'invalidationReenqueue',
+		// `render_size` (plugin v0.97.0): its path slot is the route label, a dimension like route_serve's.
+		// No view reads it yet — a page-size panel beside the Traffic view's route table is the follow-up.
+		'renderSize',
 		// `probe_${series}` — one emit per finished pass, per counter. Charted on the Change probe
 		// view, and guarded by name in the test BELOW: being on this list exempts an emitter from
 		// the scan above, which is how three probe series once shipped with no panel and a green
@@ -293,6 +296,19 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 		[
 			'prerender_ops.entity_gate',
 			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
+		],
+		// plugin v0.97.0: how often an off-owner "render this now" filing reached its owner. A health signal
+		// with an expected steady state (forwarded, or nothing when the peer token is unset); a tile on the
+		// Queue view is the console follow-up.
+		// plugin v0.97.0: trigger-to-cache for a detected change, per route. Read raw from the analytics
+		// endpoint until the Change probe view charts it beside the pass counters it is the outcome of.
+		[
+			'render.change_lag_ms',
+			'plugin v0.97.0; read raw from /prerender_admin/analytics — a Change probe panel is the follow-up',
+		],
+		[
+			'prerender_ops.due_now_forward',
+			'plugin v0.97.0; read raw from /prerender_admin/analytics until the Queue view charts it',
 		],
 	]);
 
@@ -503,6 +519,11 @@ test('every queue_health series is read or waived, and the console reads none th
 		['paused', 'pause state is read from the overview (QueueControl intent and QueueStatus observed)'],
 		['reconcile_restored', 'the Corpus view reads the repair sweep result from overview.reconcile'],
 		['reconcile_missing', 'the Corpus view reads the repair sweep result from overview.reconcile'],
+		[
+			'keeper_unschedulable',
+			'plugin v0.97.0: emitted only when a verification walk finds owned rows with no due time (expect none); ' +
+				'the count is also in queue-state keeper.verify.unschedulable — a Queue tile is a console follow-up',
+		],
 	]);
 	for (const name of declared) {
 		if (NOT_CHARTED.has(name)) continue;

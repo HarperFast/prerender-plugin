@@ -39,3 +39,25 @@ export function backoffWait(interval, strikes, fromSitemap) {
 	// out. It is applied last, and rounded, because `interval` itself need not be minute-aligned.
 	return Math.max(Math.round(interval), Math.floor(capped / MINUTE) * MINUTE);
 }
+
+/**
+ * The slow-lane wait for a row the change probe MARKED (`changedAt`): lease-scale and exponential —
+ * two leases, then four, eight, … — never longer than `backoffWait` would file for a routine row.
+ *
+ * A marked page is not a page that is merely late. The probe hard-expired it because its content is
+ * known wrong, so for every minute this retry waits, bots are served the origin. A routine failure
+ * backs off by CADENCE because its cached page stays servable through the swr window; a marked page
+ * has no such cover, and a cadence wait (48h on a product page) leaves it on the origin for the whole
+ * of it. Exponential rather than flat so a page that fails on every render still cannot hot-loop:
+ * with the default two fast retries a permanently failing changed page costs about eight more renders
+ * before the wait reaches the page's cadence, where it stays.
+ *
+ * Doubling per strike whatever `backoffFactor` says: that option's `1` means "the flat cadence", which
+ * here would be a flat lease — the hot loop this curve exists to prevent.
+ */
+export function changedRetryWait(interval, strikes, fromSitemap) {
+	const { fastRetries } = config.render.failureRetry;
+	const escalations = Math.max(0, strikes - fastRetries - 1);
+	const leaseScale = config.queue.jobLeaseTime * 2 ** Math.min(30, escalations + 1);
+	return Math.min(backoffWait(interval, strikes, fromSitemap), Math.floor(leaseScale / MINUTE) * MINUTE);
+}
