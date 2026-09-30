@@ -6,6 +6,7 @@ import {
 	decideDeparture,
 	DepartureAction,
 	departureActionFor,
+	droppedChildRefusal,
 	indexShrinkRefusal,
 	shrinkRefusal,
 } from '../src/util/sitemapDeparture.js';
@@ -207,22 +208,32 @@ test('shrinkRefusal: maxRatio 1 disables it, and the defaults are 0.5 of the las
 	applyOptions({});
 	assert.equal(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 1, stored: 999 }), null);
 	assert.notEqual(shrinkRefusal({ sitemapUrl: SITEMAP, incoming: 999, stored: 1999 }), null);
-	assert.equal(config.sitemap.shrinkGuard.acceptAfter, 3);
+	assert.equal(config.sitemap.shrinkGuard.acceptAfter, 2);
+	assert.equal(config.sitemap.shrinkGuard.acceptAge, 48 * 3_600_000);
+	assert.equal(config.sitemap.shrinkGuard.releasePerWalk, 5000);
 });
 
-test('indexShrinkRefusal: past maxRatio of the children by count OR by the entries they held, with no minUrls floor', () => {
+test('droppedChildRefusal: what a dropped child still holds after the walk, past maxRatio and at least minUrls', () => {
 	applyOptions({});
-	const counts = (droppedChildren, droppedEntries) => ({
-		indexUrl: SITEMAP,
-		storedChildren: 32,
-		droppedChildren,
-		storedEntries: 850_000,
-		droppedEntries,
-	});
-	assert.equal(indexShrinkRefusal(counts(1, 50_000)), null, 'one child renamed or retired');
-	assert.match(indexShrinkRefusal(counts(17, 10)), /stops listing 17 of 32 child sitemaps/);
-	assert.notEqual(indexShrinkRefusal(counts(9, 450_000)), null, 'nine product children are most of the corpus');
-	assert.equal(indexShrinkRefusal(counts(0, 0)), null);
+	const child = (leftovers, entryCount) => ({ sitemapUrl: SITEMAP, leftovers, entryCount });
+	// One product child of 32 left out of its index: every one of its 50k URLs is listed nowhere else.
+	assert.match(droppedChildRefusal(child(50_000, 50_000)), /50000 of the 50000 URLs it held are listed nowhere/);
+	assert.equal(droppedChildRefusal(child(40, 50_000)), null, 'its URLs moved to children still listed');
+	assert.equal(droppedChildRefusal(child(900, 900)), null, 'a small child, under minUrls');
+	assert.notEqual(droppedChildRefusal(child(2_000, undefined)), null, 'no stored count: measured against itself');
 	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 1 } } });
-	assert.equal(indexShrinkRefusal(counts(32, 850_000)), null);
+	assert.equal(droppedChildRefusal(child(50_000, 50_000)), null);
+});
+
+test('indexShrinkRefusal: URLs listed nowhere after the walk, never child names, with the minUrls floor', () => {
+	applyOptions({});
+	const idx = (leftovers) => ({ indexUrl: SITEMAP, leftovers, storedEntries: 850_000 });
+	assert.equal(indexShrinkRefusal(idx(0)), null, 'every child renamed, nothing lost');
+	assert.equal(indexShrinkRefusal(idx(400_000)), null, 'under half of what the children held');
+	assert.match(indexShrinkRefusal(idx(500_000)), /hold 500000 of its 850000 entries/);
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 0.5, minUrls: 10 } } });
+	assert.equal(indexShrinkRefusal({ indexUrl: SITEMAP, leftovers: 9, storedEntries: 12 }), null, 'under minUrls');
+	assert.notEqual(indexShrinkRefusal({ indexUrl: SITEMAP, leftovers: 10, storedEntries: 12 }), null);
+	applyOptions({ sitemap: { shrinkGuard: { maxRatio: 1 } } });
+	assert.equal(indexShrinkRefusal(idx(850_000)), null);
 });

@@ -146,6 +146,15 @@ test('keeps prerender entries and counts the rest by class', () => {
 	assert.deepEqual(invalid, []);
 });
 
+test('reports every route the entries fall on, filtered ones included', () => {
+	forwarded();
+	const { routes } = partitionSitemapEntries(
+		locs('https://www.example.com/catalog/a.jsp', 'https://www.example.com/orders/x', 'https://www.example.com/blog/y')
+	);
+	assert.equal(routes.size, 3, 'the catalog route, the passthrough route and the unclassified class');
+	assert.ok(routes.has(UNCLASSIFIED));
+});
+
 test('keys kept entries with the matched route allowlist, not the raw URL', () => {
 	// The key has to equal what a bot read computes, or the render is stored where nothing looks.
 	forwarded();

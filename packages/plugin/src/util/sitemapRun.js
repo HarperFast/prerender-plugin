@@ -120,10 +120,12 @@ export const createRefreshRun = ({
 		// whose render (or, for a row suppressed on a verdict a listing contradicts, whose recheck) was
 		// brought forward into `sitemap.newTargets.window`. Shares `maxPerRun` with `createdSoon`.
 		listedSoon: 0,
-		// Documents `sitemap.shrinkGuard` refused as much shorter than the last one accepted, and the
-		// identical shorter documents it accepted after `acceptAfter` refusals.
+		// Documents (and dropped children) `sitemap.shrinkGuard` refused as much shorter than the last one
+		// accepted; the refused shrinks it accepted once they outlived a rebuild; and the URLs an accepted
+		// shrink kept attributed this walk, past `releasePerWalk`, to release on later ones.
 		shrinkRefused: 0,
 		shrinkAccepted: 0,
+		shrinkHeldBack: 0,
 		removed: 0,
 		// Documents the origin answered 304 to, so their entries were never re-parsed and their
 		// prune scan never ran. On a healthy corpus this is most of every pass between rebuilds;

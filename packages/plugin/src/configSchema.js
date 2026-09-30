@@ -2447,51 +2447,66 @@ export const configSchema = group('Prerender plugin configuration.', {
 			}
 		),
 		shrinkGuard: group(
-			'A circuit breaker on a DOCUMENT that arrives much shorter than the one last accepted. A urlset ' +
-				'child whose entry count falls below `(1 - maxRatio)` of its stored `entryCount`, by at least ' +
-				'`minUrls`, is refused and counted as a FAILED child: its row, its targets and their ' +
-				'attribution stay exactly as the last good fetch left them. An INDEX that stops listing more ' +
-				'than `maxRatio` of its children (by count, or by the entries they last held) is refused the ' +
-				'same way: the children it still lists are walked, and none of the ones it omits is pruned.\n\n' +
-				'WHAT IT GUARDS AGAINST: a document short but well-formed — a generator that died mid-build and ' +
-				'still closed its root, an edge serving a stale partial object, an index that lost half its ' +
-				'`<sitemap>` entries. A body cut off mid-document is refused earlier, by the parse (its root is ' +
-				'never closed). Accepted, such a document presents every URL it lost as departed: hard-expired ' +
-				'and re-rendered on an armed departure check, then re-rendered again as rejoins when the origin ' +
-				'recovers.\n\n' +
-				'IT MEASURES THE DOCUMENT, NOT THE PRUNE. URLs that merely MOVE — forward shear across ' +
-				'fixed-size paginated children, a cache-key rule re-keying a child — leave a document as long as ' +
-				'it was, and are the post-walk shear handling\u2019s business. Only a document that got shorter ' +
-				'is refused.\n\n' +
-				'A REAL SHRINK DOES NOT FREEZE THE WALK FOREVER: after `acceptAfter` consecutive refusals of an ' +
-				'IDENTICAL document (same entry count, same content hash) it is accepted, logged at error and ' +
-				'counted `shrink_accepted`. Refusals are `shrink_refused` and a failed child on the walk result. ' +
-				'`maxRatio: 1` disables the guard.',
+			'A circuit breaker on a sitemap that arrives much shorter than the one last accepted — the ' +
+				'partial but well-formed document: a generator that died mid-build and still closed its root, ' +
+				'an edge serving a stale partial object, an index that left out a child it failed to build. (A ' +
+				'body cut off mid-document is refused earlier, by the parse: its root is never closed.) Accepted, ' +
+				'such a document presents every URL it lost as departed — hard-expired and re-rendered on an armed ' +
+				'departure check — and every one of them rejoins, and renders again, when the origin recovers.\n\n' +
+				'THREE CHECKS, ALL ON WHAT THE ORIGIN SENT, NONE ON WHAT MOVED: (1) a urlset whose entry count fell ' +
+				'below `(1 - maxRatio)` of its stored `entryCount`, by at least `minUrls`; (2) a child its index ' +
+				'stopped listing that still holds, AFTER the walk, at least `minUrls` URLs listed nowhere else and ' +
+				'more than `maxRatio` of what it held; (3) an index whose dropped children together hold that much ' +
+				'of everything its children held. URLs that merely move — forward shear across fixed-size children, ' +
+				'a cache-key rule re-keying a child, children renamed each build — are never counted: (2) and (3) ' +
+				'measure URLs listed nowhere after the walk, not child names.\n\n' +
+				'A refused document or dropped child is a FAILED child: its row and its targets stay exactly as the ' +
+				'last good fetch left them, and the held URLs on its routes are held back rather than departed ' +
+				'(`departure_relinked`). Refusals count `shrink_refused`.\n\n' +
+				'ACCEPTED ONLY ONCE IT OUTLIVES A REBUILD. A refused shorter document is believed when it has been ' +
+				'refused at least `acceptAfter` times AND it survived a NEW origin version (a changed `Last-Modified` ' +
+				'or content — for a dropped child, its index\u2019s) or `acceptAge` has passed since it was first ' +
+				'refused. Counting walks alone accepted a bad nightly build after a few walks of the same day, before ' +
+				'the next rebuild could fix it. An acceptance is logged at error and counted `shrink_accepted`, and ' +
+				'releases at most `releasePerWalk` departures a walk; the rest stay attributed and release on later ' +
+				'walks (`shrink_held_back`). `maxRatio: 1` disables the guard.',
 			{
 				maxRatio: option(
 					0.5,
-					'Largest share of its last accepted length a document may lose in one fetch (a urlset: ' +
-						'entries; an index: children, or the entries they held). 1 disables the guard. 0.5 because ' +
-						'real churn is nowhere near it — a mature catalog child gains and loses a few percent a day — ' +
-						'while a truncated or partial document typically loses most of itself.',
+					'Largest share of what it last held a document may lose in one fetch. 1 disables the guard. 0.5 ' +
+						'because real churn is nowhere near it — a mature catalog child gains and loses a few percent a ' +
+						'day — while a truncated or partial document typically loses most of itself.',
 					{ min: 0, max: 1 }
 				),
 				minUrls: option(
 					1000,
-					'A URLSET is refused only when it lost at least this many entries, so a small child the site ' +
-						'legitimately empties is never held back. Sized well above real per-child churn (tens a day on a ' +
-						'mature catalog) and well below what a truncated product child loses (tens of thousands). Not ' +
-						'applied to an index, whose partial form is many small children.',
+					'Nothing smaller than this many lost URLs is refused, by any of the three checks — so a small ' +
+						'child or index the site legitimately empties is never held back. Sized well above real ' +
+						'per-child churn (tens a day on a mature catalog) and well below what a truncated or missing ' +
+						'product child loses (tens of thousands).',
 					{ min: 0 }
 				),
 				acceptAfter: option(
-					3,
-					'Consecutive refusals of an IDENTICAL shorter document after which it is accepted as real ' +
-						'(logged at error, counted `shrink_accepted`). At the default 6h refresh that is a day of a ' +
-						'shrink persisting unchanged before the walk believes it — long enough for a transient ' +
-						'partial to recover, short enough that a real catalog cut is not held off for good. Any ' +
-						'change to the document restarts the count.',
+					2,
+					'Refusals of a shorter document before it may be accepted at all — the floor under `acceptAge` ' +
+						'and the new-version rule, so one odd fetch (an edge answering with a different ' +
+						'`Last-Modified` for the same object) is never mistaken for a rebuild.',
 					{ min: 1 }
+				),
+				acceptAge: option(
+					48 * HOUR,
+					'Accept a refused shorter document that has stayed refused this long since its first refusal, ' +
+						'even if the origin never published a new version of it. 48h: past two nightly rebuilds, so a ' +
+						'generator that failed one build has had two chances to fix it; a shrink still there is real.',
+					{ unit: 'ms', min: 0 }
+				),
+				releasePerWalk: option(
+					5000,
+					'Most URLs an ACCEPTED shrink may unlink in one walk, or -1 for no ceiling. The rest keep their ' +
+						'attribution and release on later walks (the document is re-fetched in full until it is ' +
+						'done), counted `shrink_held_back` — so a real shrink believed at last spreads its departures, ' +
+						'and their renders, over several walks instead of one burst.',
+					{ min: -1 }
 				),
 			}
 		),
@@ -2561,7 +2576,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 						'in the outcome tally; `removed` minus `departures.considered` is how many were lost. -1 ' +
 						'removes the ceiling and never reports `capped`; 0 collects nothing.\n\n' +
 						'The same list is what a walk with a FAILED child draws on to re-link (`departure_relinked`) ' +
-						'the URLs that could have moved into it — those on a route its stored entry sample covers — ' +
+						'the URLs that could have moved into it — those on a route it held at its last parse — ' +
 						'instead of departing them, so it also bounds that, and an arrival-only deployment holds up ' +
 						'to this many for the re-link alone.',
 					{ min: -1 }

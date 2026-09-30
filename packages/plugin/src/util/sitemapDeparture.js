@@ -74,7 +74,7 @@ export const departureLimit = (value) => (value < 0 ? Infinity : value);
  * The document, never the prune: an earlier version measured "would-be-unlinked ÷ attributed", which
  * counts every URL that merely MOVED — forward shear across fixed-size paginated children, a cache-key
  * rule re-keying a child's URLs — as shrink. That tripped on children whose length had not changed at
- * all, every walk, freezing their attribution and, through the failed-walk guard, departures. A URL
+ * all, every walk, freezing their attribution and, through the failed-child hold-back, departures. A URL
  * that moved is the post-walk shear handling's business (the module comment above); this asks only how
  * many entries the origin sent against how many it sent last time.
  *
@@ -90,32 +90,51 @@ export const shrinkRefusal = ({ sitemapUrl, incoming, stored }) => {
 	return (
 		`${sitemapUrl}: refusing a document of ${incoming} entries against the ${before} last accepted ` +
 		`(${Math.round((drop / before) * 100)}% shorter, past sitemap.shrinkGuard.maxRatio=${maxRatio}) — far more ` +
-		`likely truncated or partial than real. Its targets keep their attribution; an identical document is ` +
-		`accepted after sitemap.shrinkGuard.acceptAfter consecutive refusals`
+		`likely truncated or partial than real. Its targets keep their attribution until it survives a new ` +
+		`origin version or sitemap.shrinkGuard.acceptAge`
 	);
 };
 
 /**
- * Did an INDEX lose more than `maxRatio` of its children — by count, or by the entries they last held
- * — against the children it listed before? Returns the refusal message, or null.
- *
- * The index-level form of `shrinkRefusal`, and deliberately without its `minUrls` floor: a partial
- * index that omits many SMALL children is the same partial document, and each omitted child would be
- * pruned (every URL it held departed) and its row dropped, only to rejoin on the next walk — two renders
- * per URL. Counted both ways because either can hide the other: one large child, or many small ones.
+ * Would pruning a child its index STOPPED LISTING depart too much of it? A dropped child is pruned only
+ * after the walk, when every URL that merely moved to a child still listed has been re-attached, so what
+ * it still holds is exactly what is listed NOWHERE now. Refused when that is at least `minUrls` and more
+ * than `maxRatio` of the entries it last held — one child a generator failed to build and left out of
+ * its index is the case (1 of 32 children, ~50k of ~907k entries: far under any index-wide share).
  */
-export const indexShrinkRefusal = ({ indexUrl, storedChildren, droppedChildren, storedEntries, droppedEntries }) => {
-	const { maxRatio } = config.sitemap.shrinkGuard;
-	if (maxRatio >= 1 || !(droppedChildren > 0)) return null;
-	const byCount = storedChildren > 0 && droppedChildren > maxRatio * storedChildren;
-	const byEntries = storedEntries > 0 && droppedEntries > maxRatio * storedEntries;
-	if (!byCount && !byEntries) return null;
+export const droppedChildRefusal = ({ sitemapUrl, leftovers, entryCount }) => {
+	const { maxRatio, minUrls } = config.sitemap.shrinkGuard;
+	const held = Math.max(Number(entryCount) || 0, leftovers);
+	if (maxRatio >= 1 || leftovers < Math.max(1, minUrls) || leftovers <= maxRatio * held) return null;
 	return (
-		`${indexUrl}: refusing an index that stops listing ${droppedChildren} of ${storedChildren} child sitemaps ` +
-		`(${droppedEntries} of ${storedEntries} entries they held), past sitemap.shrinkGuard.maxRatio=${maxRatio} — ` +
-		`none of them is pruned; an identical index is accepted after sitemap.shrinkGuard.acceptAfter refusals`
+		`${sitemapUrl}: no longer listed by its index, and ${leftovers} of the ${held} URLs it held are listed ` +
+		`nowhere else (past sitemap.shrinkGuard.maxRatio=${maxRatio}) — far more likely a child the generator ` +
+		`failed to build than a real removal. Not pruned until the omission survives a new index version or ` +
+		`sitemap.shrinkGuard.acceptAge`
 	);
 };
+
+/**
+ * The same question for an INDEX as a whole: did the children it stopped listing, together, leave more
+ * than `maxRatio` of everything its children held listed nowhere — at least `minUrls` of it? Measured in
+ * URLs listed nowhere AFTER the walk, never in child names: a generator that renames its children every
+ * build (a cache-buster, a dated file name) drops every child by name on every walk while losing
+ * nothing, and would otherwise be refused forever. Catches the partial index that omits many SMALL
+ * children, each under the per-child floor.
+ */
+export const indexShrinkRefusal = ({ indexUrl, leftovers, storedEntries }) => {
+	const { maxRatio, minUrls } = config.sitemap.shrinkGuard;
+	if (maxRatio >= 1 || leftovers < Math.max(1, minUrls) || leftovers <= maxRatio * storedEntries) return null;
+	return (
+		`${indexUrl}: the child sitemaps it stopped listing hold ${leftovers} of its ${storedEntries} entries, ` +
+		`listed nowhere else (past sitemap.shrinkGuard.maxRatio=${maxRatio}) — a partial index, far more ` +
+		`likely than a real removal. None of them is pruned until the omission survives a new index version or ` +
+		`sitemap.shrinkGuard.acceptAge`
+	);
+};
+
+/** `sitemap.shrinkGuard.releasePerWalk` as a ceiling: -1 (any negative) is none. */
+export const shrinkReleaseLimit = () => departureLimit(config.sitemap.shrinkGuard.releasePerWalk);
 
 /**
  * How many departed URLs one walk may hold for the post-walk check.
