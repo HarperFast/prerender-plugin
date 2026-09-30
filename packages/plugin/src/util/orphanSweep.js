@@ -58,8 +58,8 @@ import { CacheKey } from './cacheKey.js';
 import { canonicalizeUrl } from './url.js';
 import { queryAllowlistFor } from './routeClass.js';
 import { getResidencyByUrl } from './residency.js';
-import { leaseInfo } from './renderSchedule.js';
-import { Target } from '../resources/Target.js';
+import { getScheduleRow, leaseInfo } from './renderSchedule.js';
+import { pageKeysOf, scheduleKeysOf, Target } from '../resources/Target.js';
 import { recoverKeylessKeys, walkUrlRange } from './urlWalk.js';
 import { claimRun, finishRun, isRunning, makeHeartbeat, publishRunState, readRunState } from './runState.js';
 
@@ -103,6 +103,8 @@ export const isOrphanedByKeyRule = (url) => {
 export const sweepOrphanedTargets = async ({
 	streamTargets,
 	recoverStubs,
+	stubDeletable = async () => false,
+	deleteStub,
 	isLeased,
 	deleteTarget,
 	ownerOf,
@@ -118,12 +120,14 @@ export const sweepOrphanedTargets = async ({
 		orphaned: 0,
 		unreadable: 0,
 		stubs: 0,
+		stubsKept: 0,
 		leaseSkipped: 0,
 		deleted: 0,
 		truncated: false,
 		dryRun,
 	};
 	const toDelete = [];
+	const stubsToDelete = [];
 	const gaps = [];
 	const onUnreadable = ({ after } = {}) => {
 		stats.unreadable++;
@@ -189,7 +193,7 @@ export const sweepOrphanedTargets = async ({
 			stats.leaseSkipped++;
 			continue;
 		}
-		if (toDelete.length < maxDeletes) toDelete.push(url);
+		if (toDelete.length + stubsToDelete.length < maxDeletes) stubsToDelete.push(url);
 	}
 
 	// Phase 2 — deletes, with the scan's cursor now closed.
@@ -198,9 +202,44 @@ export const sweepOrphanedTargets = async ({
 		stats.deleted++;
 	}
 
-	stats.truncated = stats.orphaned + stats.stubs - stats.leaseSkipped > stats.deleted;
+	// A stub is found on THIS node's copy only, and replicas differ: the same key can be a stub here and
+	// a whole, rendering target elsewhere. So each one is re-read and must still be a stub with nothing
+	// live behind it — no schedule row on this node (the owner, where one would be) and no rendered page
+	// (`stubDeletable`) — and then only the stub ROW goes (`deleteStub`, the raw table). The cascading
+	// delete an orphan takes would replicate page, schedule and probe-state deletes to every node,
+	// including one where the row is whole. Checked in a dry run too, so its count is honest.
+	for (const url of stubsToDelete) {
+		if (!(await stubDeletable(url))) {
+			stats.stubsKept++;
+			continue;
+		}
+		if (!dryRun) await deleteStub(url);
+		stats.deleted++;
+	}
+
+	stats.truncated = stats.orphaned + stats.stubs - stats.leaseSkipped - stats.stubsKept > stats.deleted;
 
 	return stats;
+};
+
+/**
+ * Is `url` still a url-less stub with nothing live behind it? Re-read, because the recovery that found
+ * it read a range of the store some time before: the row must still exist and still lack its `url`,
+ * this node must hold no schedule row for it (the sweep runs on the owner, so that read is
+ * authoritative), and no page for it may carry a `statusCode` (a rendered page means a target, here or
+ * on a replica that has it whole). Every read is node-local.
+ */
+export const isDeletableStub = async (url) => {
+	const row = await databases.render_service.Target.get({ id: url, select: ['url'] });
+	if (!row || typeof row.url === 'string') return false;
+	for (const key of scheduleKeysOf(url)) {
+		if (await getScheduleRow(key, ['nextRenderTime'])) return false;
+	}
+	for (const cacheKey of pageKeysOf(url)) {
+		const page = await databases.page_cache.PrerenderedPage.get({ id: cacheKey, select: ['cacheKey', 'statusCode'] });
+		if (page && page.statusCode !== null && page.statusCode !== undefined) return false;
+	}
+	return true;
 };
 
 /** `sweepOrphanedTargets` bound to the live tables. */
@@ -219,6 +258,9 @@ export const sweepKeyRuleOrphans = async ({
 		streamTargets: ({ onUnreadable }) =>
 			walkUrlRange(databases.render_service.Target, { select: ['url'], chunkSize: CHUNK_SIZE, onUnreadable }),
 		recoverStubs: (gaps) => recoverKeylessKeys(databases.render_service.Target, gaps),
+		stubDeletable: isDeletableStub,
+		// The RAW table's delete — this row only, no cascade (see the phase-2 comment in the sweep).
+		deleteStub: (url) => databases.render_service.Target.delete(url),
 		// Node-local shared-buffer lookup, which is exactly why this sweep is owner-scoped.
 		isLeased: (cacheKey) => Boolean(leaseInfo(cacheKey)),
 		// The RESOURCE class delete, never `databases.render_service.Target`'s (the raw table,
@@ -271,7 +313,8 @@ export const summarizeSweep = (stats, maxDeletes) => {
 		message:
 			`[prerender] orphan sweep${stats.dryRun ? ' (DRY RUN, nothing deleted)' : ''}: ` +
 			`${stats.deleted} of ${stats.orphaned} key-rule orphan(s)` +
-			`${stats.stubs ? ` and ${stats.stubs} url-less stub row(s)` : ''} across ${stats.owned} owned target(s) ` +
+			`${stats.stubs ? ` and ${stats.stubs} url-less stub row(s) (${stats.stubsKept} kept: live behind them)` : ''} ` +
+			`across ${stats.owned} owned target(s) ` +
 			`(${stats.examined} examined${unreadable}, ${stats.leaseSkipped} deferred as in-flight)` +
 			(stats.truncated ? ` — the rest left for the next sweep by the ${maxDeletes}-delete cap` : ''),
 	};
