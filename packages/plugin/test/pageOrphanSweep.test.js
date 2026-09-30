@@ -73,6 +73,7 @@ const page = (n, { ageDays = 30, device = 'desktop', expiresAt } = {}) => {
 	const lastCached = NOW - ageDays * DAY;
 	return {
 		cacheKey: `${url(n)}|${device}`,
+		statusCode: 200,
 		lastCached: new Date(lastCached).toISOString(),
 		expiresAt: new Date(expiresAt ?? lastCached + DAY).toISOString(),
 	};
@@ -89,6 +90,7 @@ const freshStats = () => ({
 	deleted: 0,
 	changed: 0,
 	unreadable: 0,
+	stubs: 0,
 	truncated: false,
 	errors: 0,
 	errorSamples: [],
@@ -166,8 +168,14 @@ test('a page inside its SWR window is still servable and is spared', async () =>
 
 test('an unreadable timestamp is "cannot tell", never a reason to delete', async () => {
 	const { deleted } = await run([
-		{ cacheKey: `${url(1)}|desktop`, lastCached: null, expiresAt: null },
-		{ cacheKey: `${url(2)}|desktop`, lastCached: new Date(NOW - 30 * DAY).toISOString(), expiresAt: null },
+		// A rendered page (it has a status) whose cache time cannot be read — not a stub (see below).
+		{ cacheKey: `${url(1)}|desktop`, statusCode: 200, lastCached: null, expiresAt: null },
+		{
+			cacheKey: `${url(2)}|desktop`,
+			statusCode: 200,
+			lastCached: new Date(NOW - 30 * DAY).toISOString(),
+			expiresAt: null,
+		},
 	]);
 	assert.deepEqual(deleted, []);
 });
@@ -315,4 +323,59 @@ test('a stop lands during a long pacing window, not after it', async () => {
 	);
 	assert.equal(stats.canceled, true);
 	assert.equal(stats.deleted, 10, 'the second batch was never started');
+});
+
+// ---- stubs: rows no render wrote ----
+
+/** What a page-expiry patch leaves when it lands on a key deleted a moment earlier. */
+const stub = (n, device = 'desktop') => ({
+	cacheKey: `${url(n)}|${device}`,
+	expiresAt: new Date(NOW - DAY).toISOString(),
+});
+
+test('a STUB (no status, no cache time) is deleted without an age, servable or target test — but never while leased', async () => {
+	const { stats, deleted } = await run([stub(1), stub(2), page(3)], {
+		targetExists: async () => true,
+		isLeased: (u) => u === url(2),
+	});
+	assert.deepEqual(deleted, [`${url(1)}|desktop`], 'the stub goes even though a target exists; the page does not');
+	assert.equal(stats.stubs, 2);
+	assert.equal(stats.leaseSkipped, 1);
+	assert.equal(stats.targeted, 1);
+});
+
+test('stubs the walk could not name (written without their key) are recovered and deleted after the walk', async () => {
+	const { stats, deleted } = await run([page(1)], {
+		recoverStubs: async () => [`${url(7)}|mobile`],
+	});
+	assert.deepEqual(deleted, [`${url(1)}|desktop`, `${url(7)}|mobile`]);
+	assert.equal(stats.stubs, 1);
+});
+
+test('deletePageBatch re-checks a stub as STILL a stub — a render that landed since wrote the row whole', async () => {
+	const rows = new Map([
+		[`${url(1)}|desktop`, { expiresAt: new Date(NOW).toISOString() }],
+		[`${url(2)}|desktop`, { statusCode: 200, lastCached: new Date(NOW).toISOString() }],
+	]);
+	const deletedKeys = [];
+	globalThis.transaction = async (fn) => fn();
+	globalThis.databases.page_cache.PrerenderedPage = {
+		get: async ({ id }) => (rows.has(id) ? { ...rows.get(id) } : null),
+		delete: async (id) => deletedKeys.push(id),
+	};
+	globalThis.databases.render_service.Target = { get: async ({ id }) => ({ url: id }) };
+	const result = await sweep.deletePageBatch([
+		{ cacheKey: `${url(1)}|desktop`, url: url(1), stub: true },
+		{ cacheKey: `${url(2)}|desktop`, url: url(2), stub: true },
+		{ cacheKey: `${url(3)}|desktop`, url: url(3), stub: true },
+	]);
+	assert.deepEqual(deletedKeys, [`${url(1)}|desktop`], 'even with a target: a stub has nothing to lose');
+	assert.deepEqual(result, { deleted: 1, changed: 2 });
+});
+
+test('isPageStub: a rendered page is never a stub, whatever else it lacks', () => {
+	assert.equal(sweep.isPageStub({ cacheKey: 'k', statusCode: 404 }), false);
+	assert.equal(sweep.isPageStub({ cacheKey: 'k', lastCached: new Date(NOW).toISOString() }), false);
+	assert.equal(sweep.isPageStub({ cacheKey: 'k', expiresAt: 1 }), true);
+	assert.equal(sweep.isPageStub(null), false);
 });

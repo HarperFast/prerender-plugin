@@ -68,6 +68,27 @@ export { DepartureAction };
 export const departureLimit = (value) => (value < 0 ? Infinity : value);
 
 /**
+ * Would unlinking `departed` of a child's `examined` attributed URLs trip `sitemap.shrinkGuard`?
+ * Returns the refusal message, or null to let the prune proceed.
+ *
+ * `baseline` lets a caller measure against more than the scan saw: a child the index stopped listing
+ * is pruned AFTER the walk, when the URLs that moved to other children have already been re-attached,
+ * so its scan returns only the leftovers and every one of them departs — 100% of what it examined,
+ * whatever share of the child that is. Its last `entryCount` is the honest denominator there.
+ */
+export const shrinkRefusal = ({ sitemapUrl, departed, examined, baseline = 0 }) => {
+	const { maxRatio, minUrls } = config.sitemap.shrinkGuard;
+	const of = Math.max(examined, baseline);
+	if (maxRatio >= 1 || departed < Math.max(1, minUrls) || of <= 0 || departed <= maxRatio * of) return null;
+	return (
+		`${sitemapUrl}: refusing to unlink ${departed} of ${of} attributed URLs (${Math.round((departed / of) * 100)}%, ` +
+		`past sitemap.shrinkGuard.maxRatio=${maxRatio}) — a document this much shorter than the last one is far ` +
+		`more likely truncated or partial than real. Its targets keep their attribution; if the shrink is real, ` +
+		`raise maxRatio for one walk`
+	);
+};
+
+/**
  * How many departed URLs one walk may hold for the post-walk check.
  *
  * Zero unless the check is on AND some route opts in, which keeps the candidate list empty — and the

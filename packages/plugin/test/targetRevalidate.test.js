@@ -227,3 +227,27 @@ test('a target row with no url is skipped instead of scheduling the string "unde
 		'no schedule rows (and no floor lowering) for a URL that does not exist'
 	);
 });
+
+// A patch of a MISSING record creates one holding only the patched fields (this fake's `patch` merges
+// onto nothing, as Harper's does), and Harper writes the key attribute only when the patch names it.
+// Every patch of a row that may have just been deleted therefore carries its key.
+test('the revalidate expiry patch carries the page key, so one racing a delete cannot leave a keyless stub', async () => {
+	const url = 'https://www.example.com/raced';
+	stores.target.set(url, { url });
+	for (const device of DEVICES) stores.prerenderedPage.set(`${url}|${device}`, { expiresAt: Date.now() + 3_600_000 });
+	await Target.revalidate({});
+	for (const device of DEVICES)
+		assert.equal(stores.prerenderedPage.get(`${url}|${device}`).cacheKey, `${url}|${device}`);
+});
+
+test('reactivate carries the url: a target deleted a moment earlier comes back addressable, not as a url-less stub', async () => {
+	const url = 'https://www.example.com/reactivated';
+	await Target.reactivate(url);
+	assert.deepEqual(stores.target.get(url), {
+		url,
+		state: null,
+		suppressedReason: null,
+		suppressedAt: null,
+		strikes: 0,
+	});
+});

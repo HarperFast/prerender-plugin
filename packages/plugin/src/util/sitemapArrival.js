@@ -79,6 +79,20 @@ export const isRejoin = (existing, walkStartedAt) => {
 };
 
 /**
+ * Is re-attaching this target its FIRST listing — a URL discovered from traffic that no walk has
+ * listed or unlinked (no attribution, no stamp)?
+ *
+ * The walk's re-attach is attribution-only by design (it must not re-jitter a listed URL's schedule),
+ * and for a move between sitemaps or a rejoin that is right. For a first listing it is not: the URL
+ * keeps the discovery-time jitter on its first render (up to a whole cadence out — 96h measured on one
+ * route) and, if a verdict parked it, the verdict's recheck (7 days for canonical-mismatch or noindex),
+ * although the site has just declared it — the signal a new URL's CREATE is fast-pathed for. A target
+ * unlinked before the stamp existed (v0.89.0) reads as a first listing too; the cost is one early render.
+ */
+export const isFirstListing = (existing) =>
+	!!existing && !existing.sitemapUrl && !Number.isFinite(dateColumnMs(existing.unlistedAt));
+
+/**
  * The action a route declares for URLs that rejoin a sitemap. Prerender routes only, and the field is
  * already normalized by `compileEntry` — see `departureActionFor`, which this mirrors.
  */

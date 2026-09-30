@@ -396,7 +396,16 @@ sustained rate (see §5):
   change reached a running node; the node runs at the OLD size until restarted (the option is
   restart-scoped for this reason).
 - **`Sitemap <url> failed and was skipped` / `Sitemap refresh for <url> aborted`** — a sitemap walk
-  losing coverage; nothing else reports a failed walk.
+  losing coverage; nothing else reports a failed walk. A child refused as `truncated` (its root never
+  closes) or by `sitemap.shrinkGuard` (`refusing to unlink N of M attributed URLs`) fails here too, on
+  every walk until the document recovers — raise `shrinkGuard.maxRatio` for one walk if the shrink is real.
+- **`Departure check SKIPPED: N child sitemap(s) failed …`** — the walk had a failed child, so it acted on
+  no departure and put what it had unlinked back on the child that unlinked it. Counted in the
+  `sitemap_departure_*` family as `departure_relinked` (deferred to the next clean walk, not lost), beside
+  `departure_listed_unchanged`: URLs the owning child dropped but a second child still lists, re-attached
+  to that child after it answered 304.
+- **`Sitemap <url> is no longer listed by its index — unlinking what it still holds`** — a child an index
+  dropped, pruned after the walk (behind the shrink guard) and its row removed.
 
 ### 4c. Tables you can query directly
 

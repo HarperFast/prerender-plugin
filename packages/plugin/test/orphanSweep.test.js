@@ -246,3 +246,107 @@ test('a dry run says so in the line, so a census is never read as a deletion', a
 
 	assert.match(message, /DRY RUN, nothing deleted/);
 });
+
+// ---- the live walk: unreadable rows and url-less stubs ----
+
+/**
+ * A Target table over an ordered row list with the two store personalities util/urlWalk.js survives:
+ * a row with no `url` in its VALUE (a stub a patch created on a deleted key) is yielded url-less on
+ * a tolerant read, and a PROJECTED read aborts in front of any key in `abortsBefore`. An unconstrained
+ * scan — the shape this sweep used to issue — aborts there too. `primaryStore.getRange` yields every
+ * entry's KEY beside its value, as the store does.
+ */
+const liveTargetTable = (rows, { abortsBefore = new Set() } = {}) =>
+	class extends FakeTable {
+		static search({ conditions, sort, select, limit = Infinity } = {}) {
+			const [range, upper] = conditions ?? [];
+			let view = rows.filter(({ key }) => {
+				if (!range) return true;
+				if (range.comparator === 'greater_than' ? key <= range.value : key < range.value) return false;
+				return !(upper && key >= upper.value);
+			});
+			if (sort?.descending) view = [...view].reverse();
+			const out = [];
+			for (const { key, value } of view) {
+				if (select && abortsBefore.has(key)) break;
+				out.push({ url: value.url });
+				if (out.length >= limit) break;
+			}
+			return out;
+		}
+		static primaryStore = {
+			*getRange({ start } = {}) {
+				for (const { key, value } of rows) if (start === undefined || key >= start) yield { key, value };
+			},
+		};
+	};
+
+const liveRow = (url, { stub = false } = {}) => ({ key: url, value: stub ? { sitemapUrl: null } : { url } });
+
+const withDeleteSpy = async (fn) => {
+	const deleted = [];
+	const original = FakeTable.delete;
+	FakeTable.delete = async (id) => {
+		deleted.push(id);
+	};
+	try {
+		return { stats: await fn(), deleted };
+	} finally {
+		FakeTable.delete = original;
+	}
+};
+
+test('the live sweep walks past a row a projected scan stops at — it no longer reports "no orphans" over a fraction', async () => {
+	// Projected reads stop in front of b; an orphan sits beyond it.
+	const rows = [liveRow(FIXED), liveRow('https://example.com/b'), liveRow('https://example.com/c?foo=1')];
+	globalThis.databases.render_service.Target = liveTargetTable(rows, {
+		abortsBefore: new Set(['https://example.com/b']),
+	});
+	const { stats } = await withDeleteSpy(() => orphanSweep.sweepKeyRuleOrphans({ maxDeletes: 10, dryRun: true }));
+	assert.equal(stats.orphaned, 1, 'the orphan past the unreadable row is found');
+	assert.equal(stats.unreadable, 1);
+	assert.equal(stats.deleted, 1);
+});
+
+test('a url-less stub row is recovered from the primary store by key and deleted through the cascading delete', async () => {
+	const stub = 'https://example.com/b';
+	const rows = [liveRow(FIXED), liveRow(stub, { stub: true }), liveRow('https://example.com/c')];
+	globalThis.databases.render_service.Target = liveTargetTable(rows);
+	const { stats, deleted } = await withDeleteSpy(() =>
+		orphanSweep.sweepKeyRuleOrphans({ maxDeletes: 10, dryRun: false })
+	);
+	assert.equal(stats.unreadable, 1);
+	assert.equal(stats.stubs, 1);
+	assert.deepEqual(deleted, [stub]);
+	assert.match(orphanSweep.summarizeSweep(stats, 10).message, /1 url-less stub row/);
+});
+
+test('a recovered stub respects ownership, the lease check and the dry run', async () => {
+	const stub = 'https://example.com/b';
+	const { stats, deleted } = await run([{ url: FIXED }], {
+		streamTargets: async function* ({ onUnreadable }) {
+			yield { url: FIXED };
+			onUnreadable({ after: FIXED });
+		},
+		recoverStubs: async (gaps) => {
+			assert.deepEqual(gaps, [FIXED]);
+			return [stub, 'https://example.com/elsewhere'];
+		},
+		ownerOf: (url) => (url.endsWith('elsewhere') ? 'another-node' : OWNED),
+		dryRun: true,
+	});
+	assert.equal(stats.stubs, 1, 'the unowned stub is left to its owner');
+	assert.equal(stats.deleted, 1, 'counted, not deleted, in a dry run');
+	assert.deepEqual(deleted, []);
+
+	const leased = await run([], {
+		streamTargets: async function* ({ onUnreadable }) {
+			onUnreadable({ after: null });
+			yield* [];
+		},
+		recoverStubs: async () => [stub],
+		isLeased: (key) => key === stub,
+	});
+	assert.equal(leased.stats.leaseSkipped, 1);
+	assert.deepEqual(leased.deleted, []);
+});
