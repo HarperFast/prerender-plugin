@@ -807,7 +807,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 				'Either way a rendered page NEVER carries the origin document’s `ETag` / `Last-Modified`: they ' +
 				'describe the raw document, not the snapshot, so a re-render that changed client-rendered ' +
 				'content under an unchanged origin ETag would answer 304 and the crawler would keep the old ' +
-				'snapshot. A raw-cache document is the origin’s bytes verbatim and keeps the origin’s validators; ' +
+				'snapshot. A raw-cache document is the origin’s own document (gzipped before it is stored when the origin sent it uncompressed) and keeps the origin’s validators; ' +
 				'a proxied response carries whatever the origin sent.'
 		),
 	}),

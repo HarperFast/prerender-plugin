@@ -357,7 +357,8 @@ test('an uncompressed origin 404 is stored gzipped, then answered from storage t
 	assert.equal(miss.status, 404);
 	assert.equal(await drain(miss.body), page, 'the proxied 404 is the origin body, untouched');
 	assert.equal(origin.requests.length, 1);
-	await settle(100);
+	// The store is detached (gzip, then the put): wait for it rather than for a fixed time.
+	for (let i = 0; i < 100 && negativeRows.size === 0; i++) await settle(20);
 
 	const row = [...negativeRows.values()][0];
 	assert.ok(row, 'the 404 was stored');

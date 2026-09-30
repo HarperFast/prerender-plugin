@@ -699,6 +699,29 @@ test('a refreshing re-check is a GET whose 404 replaces the stored body and rest
 	assert.equal(nc.negativeRechecksInFlight(), 0);
 });
 
+test('a refreshing re-check stores an uncompressed 404 gzipped too, like a capture', async () => {
+	rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
+	const page = '<html>' + 'gone '.repeat(2000) + '</html>';
+	const fetchOrigin = async () => origin404({ headers: { 'content-type': 'text/html' }, content: streamOf(page) });
+	assert.equal(
+		nc.startNegativeRecheck({
+			key: KEY_A,
+			url: URL_A,
+			cacheUrl: URL_A,
+			deviceType: 'desktop',
+			policy: policy(),
+			refreshBody: true,
+			fetchOrigin,
+		}),
+		true
+	);
+	await settle();
+	const row = rows.get(KEY_A);
+	assert.equal(JSON.parse(row.headers)['content-encoding'], 'gzip');
+	assert.equal(gunzipSync(Buffer.from(row.content)).toString(), page);
+	assert.deepEqual(opsOf('negative_cache'), ['recheck-gone', 'stored']);
+});
+
 test('a refreshing re-check that finds the page live drops the entry and reopens, like a HEAD', async () => {
 	rows.set(KEY_A, storedRow({ storedAt: new Date(NOW - 20 * HOUR) }));
 	let cancelled = false;
