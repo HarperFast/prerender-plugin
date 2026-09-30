@@ -1,6 +1,8 @@
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+// A REAL wait, for tests that mock the global timers but talk to the loopback origin.
+import { setTimeout as realSleep } from 'node:timers/promises';
 
 /**
  * The change probe END TO END on this process: the real sweep (`runProbeSweepOnce`), the real walk,
@@ -740,4 +742,159 @@ test('round 2 item 9: the after-walk retry is skipped when the page re-rendered 
 	assert.equal(result.triggered, 0);
 	assert.ok(pageOf('1').expiresAt > Date.now(), 'the new render is not expired on the walk’s old evidence');
 	assert.equal(probeRows.get(pdp('1')).signature, '[10]', 'and the old observation is not written');
+});
+
+// ---- round 2: what serves an anchor, and what stands down for one ---------------------------------
+
+const restartNode = async (t, now, extra = {}) => {
+	// A restart: every piece of module state goes; the node-local row stays.
+	changeProbe.resetChangeProbeState();
+	t.mock.timers.reset();
+	await armAnchored(t, now, { startDelay: 24 * HOUR - 1, ...extra });
+};
+
+test('round 2 item 2: a console DRY RUN after the anchored pass does not make the next boot catch the night up (RV1)', async (t) => {
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	t.mock.timers.tick(60_000); // 03:00 — the anchored pass runs to completion
+	await flushTurns(60);
+	assert.equal((await sweepRow()).lastRun.startedBy, 'anchor');
+	t.mock.timers.setTime(Date.parse('2026-09-24T10:00:00Z'));
+	await changeProbe.runProbeSweepOnce({ startedBy: 'manual', dryRun: true }); // the console's forced dry run
+	assert.equal((await sweepRow()).lastRun.dryRun, true, 'lastRun is now the dry run');
+
+	await restartNode(t, '2026-09-24T15:00:00Z');
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.equal(decision.caughtUp, undefined, `no catch-up: the night was served (${JSON.stringify(decision)})`);
+	assert.deepEqual(anchorOutcomes(), ['on_time']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 4: with the probe configured DRY, a dry anchored pass serves the anchor — no catch-up per restart (RV2)', async (t) => {
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1, dryRun: true });
+	t.mock.timers.tick(60_000);
+	await flushTurns(60);
+	assert.equal((await sweepRow()).lastRun.dryRun, true);
+	await restartNode(t, '2026-09-24T15:00:00Z', { dryRun: true });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, undefined);
+	// …but the same row read by an ARMED probe: a dry pass is not the pass it asked for.
+	await restartNode(t, '2026-09-24T15:00:00Z', { dryRun: false });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, true);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 2: a catch-up still running at the NEXT anchor stands down for it, instead of chaining a second pass (RV4)', async (t) => {
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-24T10:00:00Z'),
+			dryRun: true,
+			startedBy: 'manual',
+			lastRun: { startedBy: 'manual', startedAt: Date.parse('2026-09-24T10:00:00Z'), dryRun: true },
+		},
+	});
+	unmatched(300);
+	const gate = gateAt(250);
+	await armAnchored(t, '2026-09-25T02:58:00Z');
+	t.mock.timers.tick(1); // the boot check: a catch-up for the 24th's anchor (no armed pass since it)
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+	assert.equal((await sweepRow()).anchorAt, Date.parse('2026-09-24T03:00:00Z'));
+	t.mock.timers.tick(2 * 60_000); // 03:00 on the 25th — the anchor fires and asks the catch-up to stand down
+	await flushTurns();
+	t.mock.timers.tick(10_000); // the catch-up's heartbeat tick reads the request
+	await flushTurns();
+	holdRow = async () => {};
+	gate.release();
+	await flushTurns(60);
+	t.mock.timers.tick(15_000); // the anchor's retry finds the sweep free
+	await flushTurns(60);
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'anchor');
+	assert.equal(row.lastRun.anchorAt, Date.parse('2026-09-25T03:00:00Z'));
+	assert.equal(row.lastRun.examined, 300, 'one whole pass for tonight, not a chained second one');
+	assert.deepEqual(anchorOutcomes(), ['caught_up', 'interrupted']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 5: an anchored pass that THROWS is resumed from its cursor — and a thrown pass never serves the anchor', async (t) => {
+	for (let i = 0; i < 300; i++) seedTarget(String(i).padStart(3, '0'));
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	let chunks = 0;
+	const search = RegistryTable.search;
+	RegistryTable.search = function (query) {
+		if (++chunks === 2) throw new Error('registry read fault'); // the second chunk of the first attempt
+		return search.call(this, query);
+	};
+	try {
+		t.mock.timers.tick(60_000); // 03:00
+		for (let i = 0; i < 1000 && !(await sweepRow())?.lastRun?.error; i++) await realSleep(10);
+		const failed = (await sweepRow()).lastRun;
+		assert.match(failed.error, /registry read fault/);
+		assert.equal(failed.cursor, pdp('249'), 'where the walk had got to');
+		t.mock.timers.tick(60_000); // the resume delay
+		for (let i = 0; i < 1000 && (await sweepRow())?.lastRun?.startedBy !== 'resume'; i++) await realSleep(10);
+	} finally {
+		RegistryTable.search = search;
+	}
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'resume');
+	assert.equal(row.lastRun.error, null);
+	assert.equal(row.lastRun.resumedFrom, Date.parse('2026-09-24T03:00:00Z'));
+	assert.equal(row.lastRun.examined, 51, 'the tail from the cursor (inclusive), not the whole slice again');
+	assert.equal(row.lastRun.fresh, 1, 'the cursor row itself was already probed by the pass it continues');
+	assert.equal(row.completedArmedOrigin, Date.parse('2026-09-24T03:00:00Z'), 'the night is served');
+	assert.deepEqual(anchorOutcomes(), ['on_time']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 5: at boot, a pass that errored does not count as having served the anchor', async (t) => {
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-24T03:00:00Z'),
+			dryRun: false,
+			lastRun: { startedBy: 'anchor', startedAt: Date.parse('2026-09-24T03:00:00Z'), dryRun: false, error: 'boom' },
+		},
+	});
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T15:00:00Z', { startDelay: 24 * HOUR - 1 });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, true);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 6: the stand-down request is RE-ASSERTED on every try — a racing write that erased it loses nothing', async (t) => {
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	unmatched(300);
+	const gate = gateAt(250);
+	const reseed = changeProbe.runProbeSweepOnce({ reseed: true, startedBy: 'reseed', label: 'r' });
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+	t.mock.timers.tick(60_000); // the anchor fires and asks
+	await flushTurns();
+	// Another worker's whole-row write lands on top of it: the request is gone before the reseed read it.
+	const row = sharedRows.get('change_probe');
+	sharedRows.set('change_probe', { ...row, sweep: { ...row.sweep, interruptRequestedAt: null } });
+	t.mock.timers.tick(15_000); // the anchor's retry: still held by the reseed, so it asks again
+	await flushTurns();
+	t.mock.timers.tick(10_000); // the reseed's heartbeat tick reads it
+	await flushTurns();
+	holdRow = async () => {};
+	gate.release();
+	const stoodDown = await reseed;
+	assert.equal(stoodDown.interruptedBy, 'anchor');
+	t.mock.timers.reset();
+});
+
+test('round 2 item 8: a resume publishes its cursor WITH the claim, not 30s later', async () => {
+	configure({});
+	unmatched(10);
+	let seen = null;
+	holdRow = async () => {
+		seen ??= (await sweepRow())?.progress?.cursor ?? 'none';
+	};
+	await changeProbe.runProbeSweepOnce({
+		startedBy: 'resume',
+		resume: { cursor: 'https://site.example.com/help/00005', originStartedAt: Date.now() - HOUR },
+	});
+	assert.equal(seen, 'https://site.example.com/help/00005');
 });

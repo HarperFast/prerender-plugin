@@ -1690,7 +1690,15 @@ const HEARTBEAT_MS = 30 * SECOND;
  */
 const claimPass = async (
 	kind,
-	{ startedBy = null, dryRun = null, label = null, reseed = false, originStartedAt = null, anchorAt = null } = {}
+	{
+		startedBy = null,
+		dryRun = null,
+		label = null,
+		reseed = false,
+		originStartedAt = null,
+		anchorAt = null,
+		cursor = null,
+	} = {}
 ) => {
 	const row = await readProbeState();
 	if (isPassRunning(row, kind, PASS_STALE_MS)) {
@@ -1717,7 +1725,10 @@ const claimPass = async (
 			startedAt,
 			heartbeatAt: startedAt,
 			lastRun: previous,
-			progress: null,
+			// A RESUME's cursor is seeded here, not left for the first heartbeat (30s on): a process that dies
+			// inside that window would otherwise leave a claim with no cursor, and the next boot's resume
+			// would start the walk over from the top.
+			progress: cursor ? { cursor } : null,
 			startedBy,
 			dryRun,
 			label,
@@ -1732,6 +1743,7 @@ const claimPass = async (
 			// starts with none (see `requestSweepInterrupt`).
 			interruptRequestedAt: null,
 			interruptRequestedBy: null,
+			interruptForAnchorAt: null,
 			sliceEstimate: kind === 'sweep' ? sliceEstimateFrom(previous) : null,
 		},
 	});
@@ -1818,9 +1830,9 @@ const passProgress = (live, extra) => ({
  * `progress: null` is EXPLICIT because the merge is one level deep and omission means "leave
  * alone" — without it a finished pass would carry the last mid-pass progress reading forever.
  */
-const releasePass = async (kind, startedAt, lastRun) => {
+const releasePass = async (kind, startedAt, lastRun, extra = {}) => {
 	await publishProbeState({
-		[kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun, progress: null },
+		[kind]: { running: false, startedAt, heartbeatAt: Date.now(), lastRun, progress: null, ...extra },
 	});
 };
 
@@ -1964,6 +1976,7 @@ export const runProbeSweepOnce = async ({
 		reseed,
 		originStartedAt: resume?.originStartedAt ?? null,
 		anchorAt,
+		cursor: resume?.cursor ?? null,
 	});
 	if (!claim.ok) {
 		// Release the local flag we optimistically took — the `finally` below is not reached from
@@ -1972,6 +1985,8 @@ export const runProbeSweepOnce = async ({
 		return { skipped: true, reason: claim.reason, lastRun: claim.lastRun ?? lastSweep };
 	}
 	const startedAt = claim.startedAt;
+	// The start of the pass this one belongs to: itself, or the one a resume continues.
+	const passOrigin = resume?.originStartedAt ?? startedAt;
 	const beat = makeHeartbeat('sweep', startedAt);
 	// The pass's live counters and its action pipeline, held OUTSIDE the try so the error path can still
 	// emit what the pass did before it threw (see `createPassEmitter`).
@@ -1979,16 +1994,23 @@ export const runProbeSweepOnce = async ({
 	let triggers = null;
 	let phase = 'walking';
 	let stopHeartbeat = () => {};
-	// A dry run or a reseed stands down when an anchored pass asks it to (see `requestSweepInterrupt`):
-	// the one acts on nothing, and the other's work — every matched URL probed, what changed acted on —
-	// is what the anchored pass does anyway. Any other pass is never interrupted; the anchor waits for it.
-	const interruptible = limits.dryRun === true || reseed === true;
+	// Stands down when an anchored pass asks it to (see `requestSweepInterrupt`) if its work is a subset of
+	// what that pass will do: a dry run acts on nothing; a reseed probes every matched URL and acts on what
+	// changed, as the anchored pass does; and a pass serving an OLDER anchor (a catch-up, or a pass that
+	// outran its day) has nothing left to do that the newer one will not. Any other pass is never
+	// interrupted; the anchor waits for it.
 	let interruptedBy = null;
 	const checkInterrupt = async () => {
-		if (!interruptible || interruptedBy !== null) return;
+		if (interruptedBy !== null) return;
 		const pass = (await readProbeState())?.sweep;
 		const at = epochMsOf(pass?.interruptRequestedAt);
-		if (Number.isFinite(at) && at >= startedAt) interruptedBy = pass.interruptRequestedBy ?? 'request';
+		if (!(Number.isFinite(at) && at >= startedAt)) return;
+		const forAnchor = epochMsOf(pass.interruptForAnchorAt);
+		const subsumed =
+			limits.dryRun === true ||
+			reseed === true ||
+			(anchorAt !== null && Number.isFinite(forAnchor) && forAnchor > anchorAt);
+		if (subsumed) interruptedBy = pass.interruptRequestedBy ?? 'request';
 	};
 	const emit = createPassEmitter('sweep');
 	const detectionLag = detectionLagEmitter({
@@ -2149,7 +2171,16 @@ export const runProbeSweepOnce = async ({
 			error: null,
 		};
 		stopHeartbeat();
-		await releasePass('sweep', startedAt, lastSweep);
+		// WHAT THIS PASS SERVED, in fields no other kind of pass overwrites: the origin of the last pass
+		// that ran to completion, armed and dry apart. `lastRun` is the last pass that ENDED, whatever it
+		// was — a console dry run after the anchored pass replaced it, and the boot check then read the
+		// night as unserved and ran a whole catch-up pass (review, round 2). See `anchorServedSince`.
+		const served = stats.aborted
+			? {}
+			: limits.dryRun
+				? { completedDryOrigin: passOrigin }
+				: { completedArmedOrigin: passOrigin };
+		await releasePass('sweep', startedAt, lastSweep, served);
 		return lastSweep;
 	} catch (e) {
 		// What the pass did before it threw is real work the origin saw; report it.
@@ -2161,6 +2192,14 @@ export const runProbeSweepOnce = async ({
 			startedBy: passStartedBy,
 			dryRun: limits.dryRun,
 			error: e?.message ?? String(e),
+			// Enough to RESUME it: an anchored pass that throws is picked up from here (`runAnchoredPass`),
+			// and a thrown pass never counts as having served its anchor (`anchorServedSince`).
+			resumedFrom: resume?.originStartedAt ?? null,
+			anchorAt,
+			reseed,
+			cursor: live
+				? resumeKeyOf(live.walkedThrough ?? null, triggers?.lowestInFlight ?? null)
+				: (resume?.cursor ?? null),
 		};
 		// A THROWN pass must release too, and must publish the error: leaving the claim held would
 		// wedge the probe until the heartbeat went stale, and dropping the error would make a
@@ -2812,19 +2851,26 @@ const armResumeCheck = (delay = null) => {
 };
 
 /**
- * Did a pass that ACTS start on this node at or after `since`? The evidence is the sweep branch of the
- * row: the latest claim (running or released — its fields outlive the release) and the last pass that
- * ended. A pass's start is its ORIGIN — the start of the pass a resume continues — because a resume
- * walks only the tail of a pass whose head may predate `since`. A dry run observed but acted on
- * nothing, so it is not the pass an anchor asked for; an unknown `dryRun` (a row from before v0.91.0)
- * is read as acting, which errs toward NOT running an extra full pass against the origin.
+ * Has a pass that SERVES the anchor started on this node at or after `since` and run to completion? What
+ * serves it is a pass matching the configured mode: an armed pass when the probe is armed; a dry run too
+ * when the probe is configured dry (commissioning) — otherwise every restart of a dry-run deployment ran
+ * a whole catch-up pass. A pass that threw or was cut short did not serve it (a restart at least runs it
+ * again). A pass's start is its ORIGIN, because a resume walks only the tail of a pass whose head may
+ * predate `since`.
+ *
+ * The evidence is `completedArmedOrigin` / `completedDryOrigin`, which only a completed pass of that
+ * kind writes (`runProbeSweepOnce`): a console dry run after the anchored pass no longer hides it. A row
+ * from before those fields existed falls back to the last pass that ended.
  */
-const actingPassSince = (sweep, since) => {
-	const claimOrigin = epochMsOf(sweep?.originStartedAt ?? sweep?.startedAt);
-	if (sweep && sweep.dryRun !== true && claimOrigin >= since) return true;
+const anchorServedSince = (sweep, since) => {
+	const armed = epochMsOf(sweep?.completedArmedOrigin);
+	const dry = epochMsOf(sweep?.completedDryOrigin);
+	const dryServes = config.changeProbe.dryRun === true;
+	if (Number.isFinite(armed) || Number.isFinite(dry)) return armed >= since || (dryServes && dry >= since);
 	const last = sweep?.lastRun;
-	const lastOrigin = epochMsOf(last?.resumedFrom ?? last?.startedAt);
-	return Boolean(last) && last.dryRun !== true && lastOrigin >= since;
+	if (!last || last.error || last.aborted) return false;
+	if (last.dryRun === true && !dryServes) return false;
+	return epochMsOf(last.resumedFrom ?? last.startedAt) >= since;
 };
 
 /**
@@ -2834,8 +2880,10 @@ const actingPassSince = (sweep, since) => {
  * CATCHING UP. The anchor timer only ever looks forward (`nextAnchorOccurrence`), so a process that was
  * down when its anchor came — a deploy at 00:03 for a 00:05 anchor, a crash overnight — used to skip
  * that night's pass entirely, and nothing said so: the next pass was the following night, and every
- * page the reprice moved served its old price for a day. Now, if no pass that acts has started since
- * the most recent anchor, one is started, as that anchor's pass (`probe_anchor` outcome `caught_up`).
+ * page the reprice moved served its old price for a day. Now, if no pass that serves the anchor has
+ * completed since the most recent one (`anchorServedSince`), that anchor's pass is started
+ * (`probe_anchor` outcome `caught_up`). It serves an older anchor than the next one, so it stands down
+ * if it is still running when the next anchor fires.
  *
  * WHICH WINS. A stale claim that belongs to the current anchor period (its origin is at or after the
  * most recent anchor) is today's pass: it is resumed from its cursor. A dry run or a reseed is not
@@ -2853,7 +2901,7 @@ const checkResume = async () => {
 	const row = await readProbeState();
 	const sweep = row?.sweep;
 	const lastAnchor = previousAnchorOccurrence();
-	const catchUpDue = Number.isFinite(lastAnchor) && !actingPassSince(sweep, lastAnchor);
+	const catchUpDue = Number.isFinite(lastAnchor) && !anchorServedSince(sweep, lastAnchor);
 	const startedAt = epochMsOf(sweep?.startedAt);
 	let reason = 'nothing interrupted';
 	if (sweep?.running && Number.isFinite(startedAt)) {
@@ -2865,7 +2913,11 @@ const checkResume = async () => {
 		// test below as "recent" and then throw formatting the log line, silently cancelling the resume.
 		const recordedOrigin = epochMsOf(sweep.originStartedAt);
 		const originStartedAt = Number.isFinite(recordedOrigin) ? recordedOrigin : startedAt;
-		const interruptible = sweep.dryRun === true || sweep.reseed === true || sweep.startedBy === 'reseed';
+		const interruptible =
+			sweep.dryRun === true ||
+			sweep.reseed === true ||
+			sweep.startedBy === 'reseed' ||
+			(Number.isFinite(epochMsOf(sweep.anchorAt)) && epochMsOf(sweep.anchorAt) < lastAnchor);
 		if (!(Date.now() - originStartedAt < RESUME_WITHIN_MS)) reason = 'older than a day';
 		else if (Number.isFinite(lastAnchor) && originStartedAt < lastAnchor) reason = 'predates the last anchor';
 		else if (catchUpDue && interruptible) reason = 'a dry run or reseed, and the anchored pass is due';
@@ -2985,8 +3037,10 @@ const previousAnchorOccurrence = () => {
  * Addressed through the claim row because the pass may be on another worker (a console-started dry
  * run), where no module state reaches it; a new claim clears it (`claimPass`).
  */
-export const requestSweepInterrupt = (by) =>
-	publishProbeState({ sweep: { interruptRequestedAt: Date.now(), interruptRequestedBy: by } });
+export const requestSweepInterrupt = (by, forAnchorAt = null) =>
+	publishProbeState({
+		sweep: { interruptRequestedAt: Date.now(), interruptRequestedBy: by, interruptForAnchorAt: forAnchorAt },
+	});
 
 // How often an anchored pass that is waiting for another sweep tries again.
 const ANCHOR_RETRY_MS = 15 * SECOND;
@@ -3022,6 +3076,10 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 	let result = outcome;
 	let asked = false;
 	let waitedFor = null;
+	// A pass that THREW is picked up from its cursor, a bounded number of times (`ANCHOR_RESUMES`): one
+	// storage fault on a reprice night must not cost the rest of the night.
+	let resume = null;
+	let resumes = 0;
 	for (;;) {
 		if (!schedulerStarted || !config.changeProbe.enabled || !isAnchored() || armedSweep !== key) {
 			countProbe('anchor', 'skipped');
@@ -3038,9 +3096,26 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 			pass =
 				sweepRunning || (await isPassRunningOnNode('sweep'))
 					? { skipped: true }
-					: await runProbeSweepOnce({ startedBy: 'anchor', anchorAt: served });
+					: await runProbeSweepOnce(
+							resume ? { startedBy: 'resume', resume, anchorAt: served } : { startedBy: 'anchor', anchorAt: served }
+						);
 		} catch (e) {
 			logger.error(e);
+			const failed = (await readProbeState())?.sweep?.lastRun;
+			if (resumes < ANCHOR_RESUMES && failed?.error) {
+				resumes++;
+				resume = {
+					cursor: typeof failed.cursor === 'string' ? failed.cursor : '',
+					originStartedAt: epochMsOf(failed.resumedFrom ?? failed.startedAt),
+				};
+				logger.warn(
+					`[prerender] change-probe: the anchored pass for ${new Date(served).toISOString()} threw (${e?.message ?? e}) — ` +
+						`resuming it from ${resume.cursor ? JSON.stringify(resume.cursor) : 'the start'} in ` +
+						`${ANCHOR_RESUME_DELAY_MS / 1000}s (attempt ${resumes} of ${ANCHOR_RESUMES})`
+				);
+				await waitUnref(ANCHOR_RESUME_DELAY_MS);
+				continue;
+			}
 			countProbe('anchor', result);
 			return null;
 		}
@@ -3055,16 +3130,24 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 			return pass;
 		}
 		const holder = (await readProbeState())?.sweep;
-		const interruptible = holder?.dryRun === true || holder?.reseed === true;
+		const holderAnchor = epochMsOf(holder?.anchorAt);
+		// What `checkInterrupt` in the holder will honour: a dry run, a reseed, or a pass for an older anchor.
+		const interruptible =
+			holder?.dryRun === true || holder?.reseed === true || (Number.isFinite(holderAnchor) && holderAnchor < served);
 		waitedFor = holder?.startedBy ? `a ${holder.dryRun ? 'dry-run ' : ''}${holder.startedBy} pass` : waitedFor;
-		if (interruptible && !asked) {
-			asked = true;
-			if (result === 'on_time') result = 'interrupted';
-			logger.warn(
-				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a dry run or reseed'} running — asking it to stand down`
-			);
-			await requestSweepInterrupt('anchor');
-		} else if (!interruptible && result === 'on_time') {
+		if (interruptible) {
+			if (!asked) {
+				asked = true;
+				if (result === 'on_time') result = 'interrupted';
+				logger.warn(
+					`[prerender] change-probe: the anchor found ${waitedFor ?? 'a pass it subsumes'} running — asking it to stand down`
+				);
+			}
+			// RE-ASSERTED ON EVERY TRY, not once: the request is one field of a row every worker rewrites whole
+			// (`publishProbeState` is a read-modify-write serialized only per worker), so the holder's own
+			// heartbeat, landing between our read and write, can erase it.
+			await requestSweepInterrupt('anchor', served);
+		} else if (result === 'on_time') {
 			result = 'chained';
 			logger.warn(
 				`[prerender] change-probe: the anchor found ${waitedFor ?? 'a sweep'} running — its pass runs when that one ends`
@@ -3079,6 +3162,10 @@ const runAnchoredPass = async (anchorAt, { outcome = 'on_time' } = {}) => {
 		await waitUnref(ANCHOR_RETRY_MS);
 	}
 };
+
+// How often, and how soon, a thrown anchored pass is resumed before the anchor gives up on it.
+const ANCHOR_RESUMES = 3;
+const ANCHOR_RESUME_DELAY_MS = MINUTE;
 
 // A wait that never holds the process open (the global timer, which is also what tests can drive).
 const waitUnref = (ms) =>
