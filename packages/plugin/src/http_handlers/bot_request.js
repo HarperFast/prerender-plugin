@@ -600,7 +600,9 @@ export function maybeSchedule(
 		// the origin answering 200 for it is evidence whichever crawler asked. A true miss only: a suppressed
 		// target has no page, so anything else found a row in rotation and has nothing to reopen. Detached,
 		// like the discovery read, and never on a route-gated path (that return is above).
-		if (cacheStatus === 'miss' && config.render.suppression.gone.reopen.enabled) {
+		// Never on a HEAD: the origin's HEAD handler is not the page, and plenty answer 200 to any path.
+		// Reopening a target is a claim that the page exists, and that takes a GET's status.
+		if (cacheStatus === 'miss' && resource.method !== 'HEAD' && config.render.suppression.gone.reopen.enabled) {
 			setImmediate(reopenFromTraffic, resource);
 		}
 		return onMiss?.('gated-bot');
@@ -817,7 +819,8 @@ export async function handlePageScheduling(resource, route, botName, onMiss = nu
 			if (existingTarget) {
 				if (existingTarget.state === 'suppressed') {
 					tell('suppressed');
-					if (isGoneSuppressed(existingTarget)) {
+					// A GET's 200 only, for the reason the gated-bot branch of `maybeSchedule` gives.
+					if (isGoneSuppressed(existingTarget) && resource.method !== 'HEAD') {
 						await maybeReopenGone({ url: canonicalUrl, target: existingTarget, via: 'traffic' });
 					}
 				} else if (resource.deviceType && !config.deviceTypes.default.includes(resource.deviceType)) tell('device');

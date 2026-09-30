@@ -817,6 +817,35 @@ test('a proxied HEAD 404 stores nothing, and never confirms bytes that have outl
 	assert.deepEqual(writes, [['patch', KEY_A]]);
 });
 
+test("a proxied HEAD 200 does not drop a stored 404 or count against it — only a GET's status overturns one", async () => {
+	for (const statusCode of [200, 301]) {
+		const row = storedRow();
+		rows.set(KEY_A, row);
+		ops.length = 0;
+		await nc.afterNegativeProxy(origin404({ statusCode, content: streamOf('') }), {
+			key: KEY_A,
+			cacheUrl: URL_A,
+			policy: policy({ dryRun: true }),
+			lookup: { row, verdict: 'fresh' },
+			method: 'HEAD',
+		});
+		await settle();
+		assert.equal(rows.has(KEY_A), true, `HEAD ${statusCode}`);
+		assert.deepEqual(opsOf('negative_cache'), [], 'not a would-serve-live either');
+	}
+	// The same answer to a GET does drop it.
+	const row = storedRow();
+	rows.set(KEY_A, row);
+	await nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		lookup: { row, verdict: 'expired' },
+	});
+	await settle();
+	assert.equal(rows.has(KEY_A), false);
+});
+
 test('the guard reads the Target once, locally: listed, any Target, or nothing', async () => {
 	assert.equal(await nc.targetGuard(URL_A, policy()), null);
 	targets.set(URL_A, { state: 'suppressed', sitemapUrl: null });
