@@ -833,6 +833,8 @@ test('a trip hard-expires the page PAST the swr window — a known-wrong page is
 			p.expiresAt <= after - config.page.swrTtl && p.expiresAt >= before - config.page.swrTtl,
 			`expiresAt ${p.expiresAt} is not backdated past swrTtl (${config.page.swrTtl}) around [${before}, ${after}]`
 		);
+		// The key rides in the patch: one that races a cross-node delete must not store a keyless stub.
+		assert.equal(p.cacheKey, p.id);
 	}
 });
 
@@ -1252,6 +1254,8 @@ test('recordPageClaim UPDATES an existing row with patch — put would clobber t
 	assert.equal(calls.patch.length, 1);
 	assert.equal(calls.patch[0].id, CLAIM_URL);
 	assert.deepEqual(calls.patch[0].patch, {
+		// The key rides in every patch, so one that races the row's delete cannot leave a keyless stub.
+		url: CLAIM_URL,
 		pageSignature: JSON.stringify([['35.99'], false]),
 		pageClaimAt: new Date(1_700_000_000_000),
 	});
@@ -1311,7 +1315,8 @@ test('writeSignature: patch for an existing row (claim untouched unless cleared)
 	};
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true });
 	assert.equal(calls.put.length, 0);
-	assert.deepEqual(Object.keys(calls.patch[0].fields).sort(), ['probedAt', 'signature']);
+	assert.deepEqual(Object.keys(calls.patch[0].fields).sort(), ['probedAt', 'signature', 'url']);
+	assert.equal(calls.patch[0].fields.url, URL_A, 'the key rides in the patch (no keyless stub on a racing delete)');
 
 	await changeProbe.writeSignature(URL_A, 'sig', { rowExists: true, clearClaim: true });
 	// THE WHOLE RECORD. `pageClaimAt` is the render `pageSignature` and `pageFacts` came from; clearing
@@ -1322,6 +1327,7 @@ test('writeSignature: patch for an existing row (claim untouched unless cleared)
 		'pageSignature',
 		'probedAt',
 		'signature',
+		'url',
 	]);
 	assert.equal(calls.patch[1].fields.pageSignature, null);
 	assert.equal(calls.patch[1].fields.pageClaimAt, null);
@@ -3145,6 +3151,7 @@ test('recordPageClaim stores the canonical page record in the SAME write as the 
 	assert.equal(calls.put.length, 0);
 	assert.equal(calls.patch.length, 1, 'one write — no extra read or write for the record');
 	assert.deepEqual(calls.patch[0].patch, {
+		url: CLAIM_URL,
 		pageSignature: JSON.stringify([['35.99'], true]),
 		pageFacts: JSON.stringify(canonicalPageFacts(FACTS_IN)),
 		pageClaimAt: new Date(1_700_000_000_000),
@@ -3229,7 +3236,7 @@ test('recordPageClaim: a fields-only rule records the page record and no claim; 
 		pageCheck: { enabled: true, priceFrom: 2, availableFrom: 3 },
 	});
 	await changeProbe.recordPageClaim(CLAIM_URL, ['35.99', 'USD', 'InStock'], 1_700_000_000_000, { pageFacts: FACTS_IN });
-	assert.deepEqual(Object.keys(pairOnly.patch[0].patch).sort(), ['pageClaimAt', 'pageSignature']);
+	assert.deepEqual(Object.keys(pairOnly.patch[0].patch).sort(), ['pageClaimAt', 'pageSignature', 'url']);
 	await changeProbe.recordPageClaim(CLAIM_URL, null, 1_700_000_000_000, { pageFacts: FACTS_IN });
 	assert.equal(pairOnly.patch.length, 1, 'no claim, no write — exactly as before fields existed');
 });

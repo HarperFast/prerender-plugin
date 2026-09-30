@@ -215,3 +215,41 @@ test('A4: retries run after stop() — stopping ends the walk’s submissions, n
 	await actions.retryFailed();
 	assert.equal(actions.stats.recovered, 1);
 });
+
+test('round 2 item 9: a retry whose detection is no longer current is SKIPPED, not acted on stale inputs', async () => {
+	let attempts = 0;
+	const written = [];
+	const actions = createChangeActions({
+		act: async () => {
+			if (attempts++ === 0) throw new Error('refused');
+		},
+		write: async (url) => written.push(url),
+		stillDue: async (it) => it.row.url !== 'a',
+	});
+	await actions.submit(item('a'));
+	await actions.drain();
+	await actions.retryFailed();
+	assert.equal(attempts, 1, 'the retry did not act');
+	assert.deepEqual(written, [], 'nor write the old observation over the newer baseline');
+	assert.equal(actions.stats.retryStale, 1);
+	assert.equal(actions.stats.recovered, 0);
+});
+
+test('round 2 item 1: an action that resolves covered writes no baseline; healed writes it and keeps the claim', async () => {
+	const writes = [];
+	const outcomes = { a: 'covered', b: 'healed', c: undefined };
+	const actions = createChangeActions({
+		act: async (row, it) => {
+			assert.equal(it.row, row, 'the whole item reaches the action');
+			return outcomes[row.url];
+		},
+		write: async (url, observed, opts) => writes.push([url, opts.clearClaim]),
+	});
+	for (const url of ['a', 'b', 'c']) await actions.submit(item(url));
+	await actions.drain();
+	assert.deepEqual(writes.sort(), [
+		['b', false],
+		['c', true],
+	]);
+	assert.deepEqual([actions.stats.covered, actions.stats.healed, actions.stats.triggered], [1, 1, 1]);
+});

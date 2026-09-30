@@ -1,6 +1,8 @@
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+// A REAL wait, for tests that mock the global timers but talk to the loopback origin.
+import { setTimeout as realSleep } from 'node:timers/promises';
 
 /**
  * The change probe END TO END on this process: the real sweep (`runProbeSweepOnce`), the real walk,
@@ -257,16 +259,46 @@ test('F3 wired: a URL changed 9h ago by a daytime pass is probed and acted on by
 
 test('A4: probe counters are emitted per batch, and a pass that THROWS has still reported what it probed', async () => {
 	configure({ chunkSize: 10 });
-	for (let i = 0; i < 6; i++) seedTarget(String(i));
-	// The fifth URL's ProbeState read fails hard: the pass throws out of its walk.
-	probeFaults.get = async (id) => {
-		if (id === pdp('4')) throw new Error('storage fault');
+	for (let i = 0; i < 14; i++) seedTarget(String(i).padStart(2, '0'));
+	// The registry read fails on the second chunk: the walk itself throws, which ends the pass.
+	let chunks = 0;
+	const search = RegistryTable.search;
+	RegistryTable.search = function (query) {
+		if (++chunks === 2) throw new Error('registry read fault');
+		return search.call(this, query);
 	};
-	await assert.rejects(changeProbe.runProbeSweepOnce({ startedBy: 'manual' }), /storage fault/);
+	try {
+		await assert.rejects(changeProbe.runProbeSweepOnce({ startedBy: 'manual' }), /registry read fault/);
+	} finally {
+		RegistryTable.search = search;
+	}
 	assert.ok(series('probed').length >= 2, 'more than one emit: per batch, not once per pass');
-	// Two full batches landed before the fault (and the error path reports the tail it reached).
-	assert.ok(total('probed') >= 4, 'what the pass probed before it threw is reported, not lost with the pass');
-	assert.equal(total('seeded'), 4);
+	assert.equal(total('probed'), 10, 'what the pass probed before it threw is reported, not lost with the pass');
+	assert.equal(total('seeded'), 10);
+});
+
+test('item 5: a ProbeState fault on one row is counted and SKIPS that row — the pass goes on', async () => {
+	// Harper answers 503 "outstanding write transactions" under a write wave; one such throw used to end the
+	// whole pass, and nothing resumed it.
+	configure({ chunkSize: 10 });
+	for (let i = 0; i < 6; i++) seedTarget(String(i));
+	probeFaults.get = async (id) => {
+		if (id === pdp('4')) throw new Error('503 outstanding write transactions');
+	};
+	probeFaults.put = async (id) => {
+		if (id === pdp('2')) throw new Error('503 outstanding write transactions');
+	};
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	assert.equal(result.error, null);
+	assert.equal(result.examined, 6, 'the walk finished');
+	assert.equal(result.rowErrors, 2, 'the failed read and the failed seed write');
+	assert.equal(result.probed, 5, 'the row whose read failed was not probed');
+	assert.equal(total('errors'), 2, 'counted in probe_errors');
+	assert.ok(probeRows.has(pdp('5')), 'rows after the fault were seeded');
+	assert.ok(
+		warns.some((m) => m.includes('2 rows skipped')),
+		'and the pass says so'
+	);
 });
 
 test('A4: an action that fails is retried once after the walk — the page is expired by the end of the pass', async () => {
@@ -534,7 +566,10 @@ test('F7b: the reseed ACTS on a page re-rendered after the trip that then change
 		'the pre-trip page is NOT expired — clearing a false trip restores it'
 	);
 	assert.equal(schedules.get(pdp('pre')), undefined);
-	assert.equal(probeRows.get(pdp('pre')).signature, '[8]', 'but its baseline moves, as the dry run did');
+	// The baseline stays where it was (round 2): a FALSE trip then leaves no glitch value behind for the
+	// next pass to "detect" back, and a true trip's page is acted on if the invalidation is cleared first.
+	assert.equal(probeRows.get(pdp('pre')).signature, '[10]', 'and its baseline does not move');
+	assert.equal(lastRun.covered, 1);
 });
 
 // ---- detection lag (G1) ---------------------------------------------------------------------------
@@ -562,4 +597,304 @@ test('G1: every detected change emits two lag bounds, per rule — since the anc
 	assert.equal(pass.type, 'pdp', 'labelled by rule');
 	assert.ok(pass.value >= before - anchorAt && pass.value <= after - anchorAt, 'measured from the ANCHOR');
 	assert.ok(previous.value >= before - previousStart && previous.value <= after - previousStart);
+});
+
+// ---- round 2: what an active invalidation leaves the probe to do ----------------------------------
+
+const PAIR_RULES = () => [
+	{
+		label: 'pdp',
+		pathPattern: '^/product/prd-([^/]+)',
+		source: 'request',
+		request: { urlTemplate: `http://127.0.0.1:${port}/price/$1` },
+		// slots 0/1 are what the claim pair reads; slot 2 is an UNMAPPED slot that moves with the price (a
+		// regular price, a percent-off) — so `caughtUp` can never absorb the change.
+		extract: ['price', 'available', 'regular'],
+		pageCheck: { enabled: true, priceFrom: 0, availableFrom: 1 },
+	},
+];
+const configurePair = () =>
+	applyOptions({
+		changeProbe: {
+			enabled: true,
+			dryRun: false,
+			rules: PAIR_RULES(),
+			ratePerSecond: 10_000,
+			concurrency: 2,
+			canary: { count: 10, interval: 0 },
+		},
+	});
+const waitForLastRun = async (label) => {
+	for (let i = 0; i < 400; i++) {
+		const lastRun = (await changeProbe.readProbeStateForTest())?.sweep?.lastRun;
+		if (lastRun && (!label || lastRun.label === label)) return lastRun;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	throw new Error('no pass finished');
+};
+
+test('round 2 item 1: the reseed does NOT expire a page healed after the trip whose claim agrees (reviewer RV3)', async () => {
+	const spec = await import('../src/util/changeProbeSpec.js');
+	configurePair();
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('healed');
+	answers.set('healed', { status: 200, body: { price: 8, available: true, regular: 12 } }); // the post-trip origin
+	probeRows.set(pdp('healed'), {
+		url: pdp('healed'),
+		signature: '[10,true,15]', // the pre-trip baseline
+		probedAt: new Date(trip - 24 * HOUR),
+		pageSignature: spec.pageClaimFromOffers(['8', 'USD', 'InStock']), // what the healed render claims
+		pageClaimAt: new Date(trip + HOUR),
+		pageFacts: null,
+		ruleFingerprint: null,
+	});
+	seedPage('healed', { lastCached: trip + HOUR, expiresAt: Date.now() + 90 * HOUR });
+	changeProbe.requestSweepReseed('reseed after invalidating all');
+	const lastRun = await waitForLastRun('reseed after invalidating all');
+	assert.equal(lastRun.changed, 1);
+	assert.equal(lastRun.triggered, 0, 'nothing acted on');
+	assert.equal(lastRun.healed, 1);
+	assert.ok(pageOf('healed').expiresAt > Date.now(), 'the correct, healed page keeps serving');
+	assert.equal(schedules.get(pdp('healed')), undefined, 'and is not re-filed');
+	assert.equal(probeRows.get(pdp('healed')).signature, '[8,true,12]', 'its baseline moves to the post-trip values');
+	assert.ok(probeRows.get(pdp('healed')).pageSignature, 'and the claim stays: it still describes the page');
+	assert.equal(total('caught_up'), 1, 'counted as caught up');
+});
+
+test('round 2 item 1: a post-trip page whose claim DISAGREES, or a baseline taken after the trip, is still acted on', async () => {
+	const spec = await import('../src/util/changeProbeSpec.js');
+	configurePair();
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	const seedRow = (id, { claim, probedAt }) => {
+		seedTarget(id);
+		answers.set(id, { status: 200, body: { price: 8, available: true, regular: 12 } });
+		probeRows.set(pdp(id), {
+			url: pdp(id),
+			signature: '[10,true,15]',
+			probedAt: new Date(probedAt),
+			pageSignature: spec.pageClaimFromOffers([claim, 'USD', 'InStock']),
+			pageClaimAt: new Date(trip + HOUR),
+			pageFacts: null,
+			ruleFingerprint: null,
+		});
+		seedPage(id, { lastCached: trip + HOUR });
+	};
+	seedRow('stale-render', { claim: '10', probedAt: trip - 24 * HOUR }); // rendered after the trip, still old
+	seedRow('later-change', { claim: '8', probedAt: trip + 30 * 60_000 }); // a change NEWER than the trip
+	changeProbe.requestSweepReseed('r');
+	const lastRun = await waitForLastRun('r');
+	assert.equal(lastRun.triggered, 2);
+	assert.ok(pageOf('stale-render').expiresAt < Date.now());
+	assert.ok(pageOf('later-change').expiresAt < Date.now());
+});
+
+test('round 2 item 7: ANY pass during an active invalidation leaves a pre-trip page to it — not only the reseed', async () => {
+	configure({});
+	const trip = Date.now() - 2 * HOUR;
+	invalidations.set('all', { scope: 'all', invalidatedAt: new Date(trip), mode: 'hard' });
+	seedTarget('pre');
+	seedBaseline('pre', '[10]', trip - 24 * HOUR);
+	answers.set('pre', { status: 200, body: { price: 8 } });
+	seedPage('pre', { lastCached: trip - HOUR });
+	// The anchored pass that interrupted the reseed, say: an ordinary acting pass.
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'anchor' });
+	assert.equal(result.covered, 1);
+	assert.equal(result.triggered, 0);
+	assert.ok(pageOf('pre').expiresAt > Date.now(), 'not expired: clearing a false trip still restores it');
+});
+
+test('round 2 item 11: the pass reads the epoch directly and never keeps "nothing invalidated" for the pass', async (t) => {
+	configure({});
+	t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-09-24T03:00:00Z') });
+	try {
+		const epochFor = changeProbe.__epochResolverForTest();
+		assert.equal(await epochFor(pdp('1')), null);
+		invalidations.set('all', { scope: 'all', invalidatedAt: new Date(Date.now()), mode: 'hard' });
+		t.mock.timers.tick(6_000);
+		const epoch = await epochFor(pdp('1'));
+		assert.equal(epoch?.trippedAt, Date.parse('2026-09-24T03:00:00Z'), 'a trip recorded mid-pass is seen');
+		invalidations.clear();
+		t.mock.timers.tick(60_000);
+		assert.ok(await epochFor(pdp('1')), 'an epoch once seen is kept for the pass');
+	} finally {
+		t.mock.timers.reset();
+	}
+});
+
+test('round 2 item 9: the after-walk retry is skipped when the page re-rendered after the detection', async () => {
+	configure({});
+	seedTarget('1');
+	seedBaseline('1', '[10]', Date.now() - 30 * HOUR);
+	seedPage('1');
+	answers.set('1', { status: 200, body: { price: 8 } });
+	let refusals = 0;
+	pageFaults.patch = async () => {
+		if (refusals++ > 0) return;
+		// The first attempt fails — and a render lands meanwhile, showing the change.
+		for (const key of cacheKeysOf(pdp('1'))) pages.set(key, { ...pages.get(key), lastCached: Date.now() + 1000 });
+		throw new Error('write refused');
+	};
+	const result = await changeProbe.runProbeSweepOnce({ startedBy: 'manual' });
+	assert.equal(result.errors, 1);
+	assert.equal(result.retryStale, 1, 'the retry saw the newer render and stood down');
+	assert.equal(result.triggered, 0);
+	assert.ok(pageOf('1').expiresAt > Date.now(), 'the new render is not expired on the walk’s old evidence');
+	assert.equal(probeRows.get(pdp('1')).signature, '[10]', 'and the old observation is not written');
+});
+
+// ---- round 2: what serves an anchor, and what stands down for one ---------------------------------
+
+const restartNode = async (t, now, extra = {}) => {
+	// A restart: every piece of module state goes; the node-local row stays.
+	changeProbe.resetChangeProbeState();
+	t.mock.timers.reset();
+	await armAnchored(t, now, { startDelay: 24 * HOUR - 1, ...extra });
+};
+
+test('round 2 item 2: a console DRY RUN after the anchored pass does not make the next boot catch the night up (RV1)', async (t) => {
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	t.mock.timers.tick(60_000); // 03:00 — the anchored pass runs to completion
+	await flushTurns(60);
+	assert.equal((await sweepRow()).lastRun.startedBy, 'anchor');
+	t.mock.timers.setTime(Date.parse('2026-09-24T10:00:00Z'));
+	await changeProbe.runProbeSweepOnce({ startedBy: 'manual', dryRun: true }); // the console's forced dry run
+	assert.equal((await sweepRow()).lastRun.dryRun, true, 'lastRun is now the dry run');
+
+	await restartNode(t, '2026-09-24T15:00:00Z');
+	const decision = await changeProbe.__checkResumeForTest();
+	assert.equal(decision.caughtUp, undefined, `no catch-up: the night was served (${JSON.stringify(decision)})`);
+	assert.deepEqual(anchorOutcomes(), ['on_time']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 4: with the probe configured DRY, a dry anchored pass serves the anchor — no catch-up per restart (RV2)', async (t) => {
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1, dryRun: true });
+	t.mock.timers.tick(60_000);
+	await flushTurns(60);
+	assert.equal((await sweepRow()).lastRun.dryRun, true);
+	await restartNode(t, '2026-09-24T15:00:00Z', { dryRun: true });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, undefined);
+	// …but the same row read by an ARMED probe: a dry pass is not the pass it asked for.
+	await restartNode(t, '2026-09-24T15:00:00Z', { dryRun: false });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, true);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 2: a catch-up still running at the NEXT anchor stands down for it, instead of chaining a second pass (RV4)', async (t) => {
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-24T10:00:00Z'),
+			dryRun: true,
+			startedBy: 'manual',
+			lastRun: { startedBy: 'manual', startedAt: Date.parse('2026-09-24T10:00:00Z'), dryRun: true },
+		},
+	});
+	unmatched(300);
+	const gate = gateAt(250);
+	await armAnchored(t, '2026-09-25T02:58:00Z');
+	t.mock.timers.tick(1); // the boot check: a catch-up for the 24th's anchor (no armed pass since it)
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+	assert.equal((await sweepRow()).anchorAt, Date.parse('2026-09-24T03:00:00Z'));
+	t.mock.timers.tick(2 * 60_000); // 03:00 on the 25th — the anchor fires and asks the catch-up to stand down
+	await flushTurns();
+	t.mock.timers.tick(10_000); // the catch-up's heartbeat tick reads the request
+	await flushTurns();
+	holdRow = async () => {};
+	gate.release();
+	await flushTurns(60);
+	t.mock.timers.tick(15_000); // the anchor's retry finds the sweep free
+	await flushTurns(60);
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'anchor');
+	assert.equal(row.lastRun.anchorAt, Date.parse('2026-09-25T03:00:00Z'));
+	assert.equal(row.lastRun.examined, 300, 'one whole pass for tonight, not a chained second one');
+	assert.deepEqual(anchorOutcomes(), ['caught_up', 'interrupted']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 5: an anchored pass that THROWS is resumed from its cursor — and a thrown pass never serves the anchor', async (t) => {
+	for (let i = 0; i < 300; i++) seedTarget(String(i).padStart(3, '0'));
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	let chunks = 0;
+	const search = RegistryTable.search;
+	RegistryTable.search = function (query) {
+		if (++chunks === 2) throw new Error('registry read fault'); // the second chunk of the first attempt
+		return search.call(this, query);
+	};
+	try {
+		t.mock.timers.tick(60_000); // 03:00
+		for (let i = 0; i < 1000 && !(await sweepRow())?.lastRun?.error; i++) await realSleep(10);
+		const failed = (await sweepRow()).lastRun;
+		assert.match(failed.error, /registry read fault/);
+		assert.equal(failed.cursor, pdp('249'), 'where the walk had got to');
+		t.mock.timers.tick(60_000); // the resume delay
+		for (let i = 0; i < 1000 && (await sweepRow())?.lastRun?.startedBy !== 'resume'; i++) await realSleep(10);
+	} finally {
+		RegistryTable.search = search;
+	}
+	const row = await sweepRow();
+	assert.equal(row.lastRun.startedBy, 'resume');
+	assert.equal(row.lastRun.error, null);
+	assert.equal(row.lastRun.resumedFrom, Date.parse('2026-09-24T03:00:00Z'));
+	assert.equal(row.lastRun.examined, 51, 'the tail from the cursor (inclusive), not the whole slice again');
+	assert.equal(row.lastRun.fresh, 1, 'the cursor row itself was already probed by the pass it continues');
+	assert.equal(row.completedArmedOrigin, Date.parse('2026-09-24T03:00:00Z'), 'the night is served');
+	assert.deepEqual(anchorOutcomes(), ['on_time']);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 5: at boot, a pass that errored does not count as having served the anchor', async (t) => {
+	sharedRows.set('change_probe', {
+		sweep: {
+			running: false,
+			startedAt: Date.parse('2026-09-24T03:00:00Z'),
+			dryRun: false,
+			lastRun: { startedBy: 'anchor', startedAt: Date.parse('2026-09-24T03:00:00Z'), dryRun: false, error: 'boom' },
+		},
+	});
+	unmatched(10);
+	await armAnchored(t, '2026-09-24T15:00:00Z', { startDelay: 24 * HOUR - 1 });
+	assert.equal((await changeProbe.__checkResumeForTest()).caughtUp, true);
+	t.mock.timers.reset();
+});
+
+test('round 2 item 6: the stand-down request is RE-ASSERTED on every try — a racing write that erased it loses nothing', async (t) => {
+	await armAnchored(t, '2026-09-24T02:59:00Z', { startDelay: 24 * HOUR - 1 });
+	unmatched(300);
+	const gate = gateAt(250);
+	const reseed = changeProbe.runProbeSweepOnce({ reseed: true, startedBy: 'reseed', label: 'r' });
+	for (let i = 0; i < 100 && !gate.reached(); i++) await flushTurns(1);
+	t.mock.timers.tick(60_000); // the anchor fires and asks
+	await flushTurns();
+	// Another worker's whole-row write lands on top of it: the request is gone before the reseed read it.
+	const row = sharedRows.get('change_probe');
+	sharedRows.set('change_probe', { ...row, sweep: { ...row.sweep, interruptRequestedAt: null } });
+	t.mock.timers.tick(15_000); // the anchor's retry: still held by the reseed, so it asks again
+	await flushTurns();
+	t.mock.timers.tick(10_000); // the reseed's heartbeat tick reads it
+	await flushTurns();
+	holdRow = async () => {};
+	gate.release();
+	const stoodDown = await reseed;
+	assert.equal(stoodDown.interruptedBy, 'anchor');
+	t.mock.timers.reset();
+});
+
+test('round 2 item 8: a resume publishes its cursor WITH the claim, not 30s later', async () => {
+	configure({});
+	unmatched(10);
+	let seen = null;
+	holdRow = async () => {
+		seen ??= (await sweepRow())?.progress?.cursor ?? 'none';
+	};
+	await changeProbe.runProbeSweepOnce({
+		startedBy: 'resume',
+		resume: { cursor: 'https://site.example.com/help/00005', originStartedAt: Date.now() - HOUR },
+	});
+	assert.equal(seen, 'https://site.example.com/help/00005');
 });

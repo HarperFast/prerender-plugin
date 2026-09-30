@@ -1209,9 +1209,9 @@ export class RenderQueue extends Resource {
 			// expires, and with the row gone nothing can claim the key meanwhile.
 			await settleTargetless(job, targetless ?? { kind: 'one-off' });
 		}
-		// A render the probe's render check found STALE (it disagrees with the probe's last observation of
-		// the origin — util/changeProbe.js): expired and re-filed HERE, after the page writes and the
-		// reschedule above, either of which would otherwise overwrite the expiry or the re-file.
+		// A render the probe's render check found SUSPECT (it disagrees with the probe's last observation of
+		// the origin — util/changeProbe.js): one confirming re-probe is queued HERE, after the page writes and
+		// the reschedule above, which would otherwise overwrite the expiry and re-file it may lead to.
 		if (renderTarget && claimCheck?.stale) await actOnStaleRender(scheduleUrl, renderTarget);
 		await retireRowIfConverted(job, held);
 	}

@@ -1259,12 +1259,16 @@ throws is retried once when the walk ends. A restart that cuts an anchored pass 
 from the walk cursor its heartbeat published (held back to any action still in flight), with the
 interrupted pass's own dry-run and reseed settings; a restart that spanned the anchor runs that
 anchor's pass at boot instead (v0.97.0), and an anchor that fires while another sweep holds the node
-stands a dry run or a reseed down, or waits for any other pass and runs after it — each outcome is a
-`probe_anchor` emit, never a silent skip. A pass skips only URLs it (or the pass it resumes) has already
-probed. With `renderCheck` (default on) each render of a claim-pair `pageCheck` URL is compared with
-the probe's last observation of the origin as it lands, and one that disagrees — claimed before a probe
-found a change, or rendered from a stale CDN copy — is expired and re-filed at once
-(`probe_render_mismatch`). Two cadences cover the two ways content actually changes:
+stands a dry run, a reseed or a pass for an older anchor down, or waits for any other pass and runs
+after it — each outcome is a `probe_anchor` emit, never a silent skip; an anchored pass that throws is
+resumed from its cursor. A pass skips only URLs it (or the pass it resumes) has already probed, and a
+storage fault on one row skips that row, not the pass. With `renderCheck` (default on) each render of a
+claim-pair `pageCheck` URL is compared with the probe's last observation of the origin as it lands; one
+that disagrees gets ONE confirming probe, and is expired and re-filed only if the origin still
+disagrees with it — claimed before a probe found a change, or rendered from a stale CDN copy — while an
+origin that moved and a render that shows it just update the baseline (`probe_render_mismatch`). While
+an invalidation is active, no pass acts on a page it already refuses, or on one re-rendered after the
+trip that agrees with the origin. Two cadences cover the two ways content actually changes:
 
 - The **sweep** walks each node's owned slice of the registry, paced (`ratePerSecond`,
   `concurrency`), catching continuous per-URL drift — availability sell-through, item-level price

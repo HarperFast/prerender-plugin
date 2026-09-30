@@ -205,11 +205,15 @@ Notes that bite:
   landed on schedule is the lag itself; detail `previous_pass` = since the start of the pass before,
   a true upper bound whenever that pass covered the URL. The G1 detection-latency number. (6)
   `probe_render_mismatch` — the render check (`changeProbe.renderCheck`): a render that landed
-  disagreeing with the probe's last observation of the origin. Detail `refiled` (hard-expired and
-  re-filed as a change — a stale render caught before it served for a pass), `bounded` (already
-  re-filed once against that observation: a page that disagrees every time, left to the pass),
-  `untrusted` (the observation predates the last anchor or canary trip and no pass has seen the URL
-  since, so the render may just be newer — nothing done), `dry_run`, `error`.
+  disagreeing with the probe's last observation of the origin. Detail `rechecked` (ONE confirming
+  origin request made — count it as an origin call), then `confirmed` (the origin still disagreed:
+  hard-expired and re-filed as a change — a stale render caught before it served for a pass),
+  `cleared` (the origin had moved and the render shows it: baseline updated, nothing expired),
+  `recheck_failed` or `recheck_inconclusive`; or, with no request, `bounded` (already confirmed once
+  against that observation: a page that disagrees every time, left to the pass), `untrusted` (the
+  origin is known to have moved since the probe last looked — the last anchor or a canary trip — so the
+  render may just be newer; left to the pass), `shed` (the node-wide pace was over a minute out),
+  `dry_run`, `error`.
 - **`queue_health.overdue` includes in-flight renders** (a leased row keeps its past due time), so
   its healthy floor is the in-flight count, not zero — and it is not comparable with numbers from
   before v0.34.0. Since v0.93.0 it comes from the queue keeper and is exact; it is absent while the
