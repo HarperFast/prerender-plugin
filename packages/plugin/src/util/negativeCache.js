@@ -49,7 +49,7 @@ import {
 	collectBody,
 	discardStream,
 	hasCacheControlDirective,
-	storedHeaders,
+	storableBody,
 	teeForCapture,
 	unsharedHint,
 } from './rawCache.js';
@@ -174,10 +174,13 @@ export const negativeStoreRefusal = (resource, policy) => {
 /** Store a captured response. Best-effort: every failure is counted and swallowed (it runs detached). */
 export const storeNegativePage = async ({ key, resource, bytes, policy, nowMs = Date.now() }) => {
 	try {
+		// An uncompressed 404 is gzipped before it is stored (see `storableBody`): the origin this was
+		// built for sends every 404 uncompressed, 79-699 KB, while its 200s arrive gzipped.
+		const stored = await storableBody(resource.headers, bytes);
 		await table().put(key, {
 			statusCode: resource.statusCode,
-			headers: JSON.stringify(storedHeaders(resource.headers)),
-			content: createBlob(bytes),
+			headers: JSON.stringify(stored.headers),
+			content: createBlob(stored.bytes),
 			storedAt: new Date(nowMs),
 			checkedAt: new Date(nowMs),
 			expiresAt: new Date(nowMs + policy.lifeMs),

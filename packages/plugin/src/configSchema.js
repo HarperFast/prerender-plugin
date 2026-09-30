@@ -1592,9 +1592,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 				enabled: option(false, 'Master switch. Off = nothing is stored, nothing is read, no extra reads.'),
 				maxBytes: option(
 					1048576,
-					'Largest document to store, in bytes AS THE ORIGIN SENT IT — which is compressed (the ' +
-						'origin is asked for gzip), so this bounds memory and storage rather than the decompressed ' +
-						'size a search engine sees. Over the cap the document is served and NOT stored, and the ' +
+					'Largest document to store, in bytes AS THE ORIGIN SENT IT — normally compressed (the ' +
+						'origin is asked for gzip), so this bounds memory rather than the decompressed size a search ' +
+						'engine sees. A body the origin sends UNCOMPRESSED counts at its full size here (that is ' +
+						'what the capture holds in memory), and is gzipped before it is stored, so its stored size ' +
+						'is usually far smaller. Over the cap the document is served and NOT stored, and the ' +
 						'capture is abandoned so nothing further is buffered for it.\n\n' +
 						'BUDGET ~2x THIS PER IN-FLIGHT CAPTURE, not 1x. A capture holds one copy of the bytes, and ' +
 						'the `tee()` retains a second for the branch the crawler has not read yet — measured with a ' +
@@ -1860,8 +1862,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 				),
 				maxBytes: option(
 					1048576,
-					'Largest response body to store, in bytes as the origin sent it (compressed). Over it, served ' +
-						'and not stored. Same capture, same ~2x-per-capture memory rule, as `render.raw.maxBytes`.',
+					'Largest response body to store, in bytes as the origin sent it. Over it, served and not ' +
+						'stored. Same capture, same ~2x-per-capture memory rule, as `render.raw.maxBytes`. SIZE IT ' +
+						'FOR AN UNCOMPRESSED BODY: origins that gzip their pages often send error pages ' +
+						'uncompressed (one production origin sends every 404 uncompressed, 79-699 KB, a retired ' +
+						'product’s full page), and such a body counts at its full size here. It is gzipped ' +
+						'before it is stored (7-13x smaller on those pages).',
 					{ unit: 'bytes', min: 1 }
 				),
 				maxConcurrentCaptures: option(

@@ -1,6 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { gunzipSync } from 'node:zlib';
 
 /**
  * The bot serve path end to end: `handleBotRequest` against a real origin over a real socket, and a real
@@ -23,6 +24,7 @@ let config;
 let getResidencyByUrl;
 let pageGet = async () => null;
 const rawPuts = [];
+const negativeRows = new Map();
 
 // `inFlight`: origin responses not yet finished or torn down. A body nobody reads and nobody releases
 // keeps its response here until undici's body timeout — that, not an idle pooled socket, is a leak.
@@ -116,7 +118,20 @@ before(async () => {
 				},
 			},
 		},
-		negative_cache: { NegativePage: { get: async () => null } },
+		negative_cache: {
+			NegativePage: {
+				get: async (key) => (negativeRows.has(key) ? { ...negativeRows.get(key) } : null),
+				put: async (key, data) => {
+					negativeRows.set(key, { cacheKey: key, ...data });
+				},
+				patch: async (key, data) => {
+					negativeRows.set(key, { ...(negativeRows.get(key) ?? {}), ...data });
+				},
+				delete: async (key) => {
+					negativeRows.delete(key);
+				},
+			},
+		},
 		crawl_stats: { CrawlSketch: class {}, VisitFilter: class {} },
 	};
 	let applyOptions;
@@ -128,11 +143,12 @@ before(async () => {
 			routes: [
 				{ match: 'prefix', path: '/p/', mode: 'prerender', queryParams: [] },
 				{ match: 'prefix', path: '/raw/', mode: 'prerender', queryParams: [], rawCache: true },
+				{ match: 'prefix', path: '/neg/', mode: 'prerender', queryParams: [], negativeCache: true },
 			],
 		},
 		analytics: { enabled: false },
 		invalidation: { enabled: false },
-		render: { raw: { enabled: true } },
+		render: { raw: { enabled: true }, negative: { enabled: true, dryRun: false } },
 		peerRescue: { enabled: true, token: 'cluster-secret' },
 	});
 	({ handleBotRequest } = await import('../src/http_handlers/bot_request.js'));
@@ -156,6 +172,7 @@ beforeEach(() => {
 	};
 	pageGet = async () => null;
 	rawPuts.length = 0;
+	negativeRows.clear();
 });
 
 const request = (path, method = 'GET', extra = {}) => ({
@@ -325,6 +342,40 @@ test('a rescue whose owner copy is servable is still served from the owner', asy
 	assert.equal(res.headers.get('x-harper-cache'), 'peer-rescue');
 	assert.equal(await drain(res.body), '<html>owner snapshot</html>');
 	assert.equal(origin.requests.length, 0);
+});
+
+// ── an origin 404 sent uncompressed is stored gzipped, and served correctly both ways ────────────────
+
+test('an uncompressed origin 404 is stored gzipped, then answered from storage to gzip and identity clients alike', async () => {
+	const page = '<html><body>' + '<p>This item is no longer available.</p>'.repeat(5000) + '</body></html>';
+	origin.respond = (_req, res) => {
+		// No content-encoding, whatever the request asked for: the origin shape this was built for.
+		res.writeHead(404, { 'content-type': 'text/html' });
+		res.end(page);
+	};
+	const miss = await handleBotRequest(request('/desktop/neg/gone', 'GET', { 'accept-encoding': 'identity' }));
+	assert.equal(miss.status, 404);
+	assert.equal(await drain(miss.body), page, 'the proxied 404 is the origin body, untouched');
+	assert.equal(origin.requests.length, 1);
+	await settle(100);
+
+	const row = [...negativeRows.values()][0];
+	assert.ok(row, 'the 404 was stored');
+	assert.equal(JSON.parse(row.headers)['content-encoding'], 'gzip');
+	assert.ok(row.content.length < page.length / 5, `stored ${row.content.length} bytes for ${page.length}`);
+
+	const gz = await handleBotRequest(request('/desktop/neg/gone', 'GET', { 'accept-encoding': 'gzip' }));
+	assert.equal(gz.status, 404);
+	assert.equal(gz.headers.get('x-harper-source'), 'negative');
+	assert.equal(gz.headers.get('content-encoding'), 'gzip');
+	const gzBytes = Buffer.from(await new Response(gz.body).arrayBuffer());
+	assert.equal(gunzipSync(gzBytes).toString(), page, 'served as stored, and it decodes to the origin page');
+
+	const plain = await handleBotRequest(request('/desktop/neg/gone', 'GET', { 'accept-encoding': 'identity' }));
+	assert.equal(plain.status, 404);
+	assert.equal(plain.headers.get('content-encoding'), null, 'decoded for a client that did not ask for gzip');
+	assert.equal(await drain(plain.body), page);
+	assert.equal(origin.requests.length, 1, 'both answered from storage: the origin was asked once');
 });
 
 // ── V2: a snapshot's validators describe the snapshot ───────────────────────────────────────────

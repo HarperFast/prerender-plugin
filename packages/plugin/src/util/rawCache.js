@@ -28,13 +28,16 @@
  *
  * ── THE ENCODING RULE ────────────────────────────────────────────────────────────────────────
  *
- * The bytes are stored EXACTLY as the origin sent them, with the origin's own `content-encoding`
- * (gzip — see `resolveUpstreamHeaders`). `http_handlers/response.js` re-encodes from the stored
- * header at serve time, so decoding on the way in would cost a decompress on the miss branch and
- * buy nothing. The one header that must NOT survive is `content-length`: a re-encoded body has a
- * different length, and a stored one would contradict the bytes actually written.
+ * The bytes are stored as the origin sent them, with the origin's own `content-encoding` (gzip — see
+ * `resolveUpstreamHeaders`), EXCEPT a body the origin sent uncompressed, which is gzipped before it is
+ * stored (`storableBody`). `http_handlers/response.js` re-encodes from the stored header at serve time,
+ * so decoding on the way in would cost a decompress on the miss branch and buy nothing. The one header
+ * that must NOT survive is `content-length`: a re-encoded body has a different length, and a stored one
+ * would contradict the bytes actually written.
  */
 
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 import { getNextTimeOfDay } from './time.js';
@@ -386,6 +389,38 @@ export const storedHeaders = (originHeaders) => {
 	return { ...rest };
 };
 
+const gzipAsync = promisify(gzip);
+
+/** No `content-encoding`, or an explicit `identity`: the bytes are the document itself. */
+const isIdentity = (headers) => {
+	const encoding = String(headers?.['content-encoding'] ?? '')
+		.trim()
+		.toLowerCase();
+	return encoding === '' || encoding === 'identity';
+};
+
+/**
+ * The bytes and headers to STORE for a captured origin body: the origin's own encoding, except that an
+ * UNCOMPRESSED body is gzipped first and stored as `content-encoding: gzip`.
+ *
+ * An origin that honours `accept-encoding: gzip` for its pages does not always do so for everything:
+ * one production origin sends every 404 uncompressed whatever `Accept-Encoding` asks for (16 of 16
+ * sampled, 79-699 KB), while its 200s arrive gzipped. Stored as sent, such a body costs 7-13x the
+ * storage, and every serve re-encodes it for a crawler that asked for gzip. Compressed here, once, it
+ * is served as stored. Measured on those bodies: 1.7-2.4 ms of CPU at level 6 (zlib's default) for
+ * 348-699 KB, to 47-54 KB, on zlib's thread pool rather than the event loop, and on the detached store
+ * path, never in front of a response.
+ *
+ * `maxBytes` still counts the bytes AS RECEIVED, before this: it is what bounds the capture's memory
+ * (the tee retains the crawler's unread branch while the capture reads ahead), and that is uncompressed
+ * for exactly these bodies.
+ */
+export const storableBody = async (originHeaders, bytes) => {
+	const headers = storedHeaders(originHeaders);
+	if (!isIdentity(headers)) return { bytes, headers };
+	return { bytes: await gzipAsync(bytes, { level: 6 }), headers: { ...headers, 'content-encoding': 'gzip' } };
+};
+
 /**
  * Store a captured document. Best-effort by contract: every failure is counted and swallowed,
  * because this runs detached from a response that has already been served and there is nobody left
@@ -393,11 +428,12 @@ export const storedHeaders = (originHeaders) => {
  */
 export const storeRawPage = async ({ cacheKey, resource, bytes, policy }) => {
 	try {
+		const stored = await storableBody(resource.headers, bytes);
 		await table().put(cacheKey, {
 			statusCode: resource.statusCode,
 			lastCached: new Date(),
-			content: createBlob(bytes),
-			headers: JSON.stringify(storedHeaders(resource.headers)),
+			content: createBlob(stored.bytes),
+			headers: JSON.stringify(stored.headers),
 			expiresAt: new Date(rawExpiresAt(policy)),
 		});
 		// COUNTED APART WHEN THE ORIGIN CALLED IT PERSONAL. Enabling `assumeShared` must not silence

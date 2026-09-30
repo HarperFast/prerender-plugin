@@ -1,5 +1,6 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { gunzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -386,6 +387,53 @@ test('the capture cannot hold the crawler back: downstream completes without the
 	const { downstream } = rawCache.teeForCapture(streamOf(['one', 'two']), 1024);
 	const delivered = await drain(downstream);
 	assert.equal(delivered.toString(), 'onetwo');
+});
+
+// ---- uncompressed origin bodies are gzipped before they are stored ---------------------------
+
+// An origin that gzips its pages can still send some responses uncompressed (one production origin sends
+// every 404 that way). Stored as sent they cost 7-13x the storage and are re-encoded on every serve.
+const html = (kb) =>
+	'<!doctype html><html><body>' + '<div class="tile">Item not available</div>'.repeat(kb * 24) + '</body></html>';
+
+test('storableBody gzips an uncompressed body and says so; the bytes decode to the original', async () => {
+	const body = Buffer.from(html(64));
+	for (const headers of [
+		{ 'content-type': 'text/html' },
+		{ 'content-type': 'text/html', 'content-encoding': 'identity' },
+	]) {
+		const stored = await rawCache.storableBody({ ...headers, 'content-length': String(body.length) }, body);
+		assert.equal(stored.headers['content-encoding'], 'gzip', JSON.stringify(headers));
+		assert.equal(stored.headers['content-length'], undefined, 'a stored length would contradict the served bytes');
+		assert.equal(stored.headers['content-type'], 'text/html');
+		assert.ok(stored.bytes.length < body.length / 5, `compressed ${body.length} -> ${stored.bytes.length}`);
+		assert.deepEqual(gunzipSync(stored.bytes), body);
+	}
+});
+
+test('storableBody leaves a body the origin already encoded exactly as sent', async () => {
+	for (const encoding of ['gzip', 'br', 'deflate', 'GZIP']) {
+		const bytes = Buffer.from(`ENCODED-AS-${encoding}`);
+		const stored = await rawCache.storableBody({ 'content-encoding': encoding, 'content-length': '9' }, bytes);
+		assert.equal(stored.bytes, bytes, encoding);
+		assert.deepEqual(stored.headers, { 'content-encoding': encoding });
+	}
+});
+
+test('a raw document the origin sent uncompressed is stored gzipped, under content-encoding gzip', async () => {
+	const body = Buffer.from(html(32));
+	await rawCache.storeRawPage({
+		cacheKey: 'k-identity',
+		resource: originResource({
+			headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': String(body.length) },
+		}),
+		bytes: body,
+		policy: policy(),
+	});
+	const row = rows.get('k-identity');
+	assert.equal(JSON.parse(row.headers)['content-encoding'], 'gzip');
+	assert.deepEqual(gunzipSync(row.content.bytes), body);
+	assert.ok(ops.includes('prerender_ops:raw_cache:stored'), 'still exactly one store emit');
 });
 
 // ---- store + read round trip -----------------------------------------------------------------

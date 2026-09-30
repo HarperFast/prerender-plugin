@@ -672,8 +672,10 @@ type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 	# dropped on the way in: a re-encoded body has a different length, and a stored one would
 	# contradict the bytes actually written.
 	headers: String
-	# The origin bytes VERBATIM, in the origin's own encoding (gzip — see `resolveUpstreamHeaders`).
-	# Storing them decoded would cost a decompress on the serve path's miss branch and buy nothing.
+	# The origin bytes in the origin's own encoding (gzip — see `resolveUpstreamHeaders`), except a body
+	# the origin sent uncompressed, which is gzipped before it is stored (util/rawCache.js
+	# `storableBody`), with `headers` saying so. Storing them decoded would cost a decompress on the
+	# serve path's miss branch and buy nothing.
 	content: Blob
 	lastCached: Date
 	# @expiresAt MAKES THIS FIELD THE RECORD'S REAL EXPIRATION, not merely a column the serve path
@@ -739,7 +741,8 @@ type NegativePage @table(database: "negative_cache", replicate: false, expiratio
 	# The origin's own response headers, filtered to `sanitizeOriginResponseHeaders`'s allowlist and
 	# without `content-length` — the same rule, and the same reason, as RawPage.headers.
 	headers: String
-	# The origin bytes VERBATIM, in the origin's own encoding (see RawPage.content).
+	# The origin bytes in the origin's own encoding, gzipped first when it sent them uncompressed
+	# (see RawPage.content).
 	content: Blob
 	storedAt: Date
 	checkedAt: Date
