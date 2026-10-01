@@ -4,10 +4,11 @@ import { config } from '../config.js';
  * HARPER'S PRIMARY-KEY LIMIT: a key must encode to at most this many bytes (`MAX_KEY_BYTES` in
  * Harper's `resources/Table.ts`, 5.x). A read or write keyed by anything longer throws a 400
  * `ClientError` ("Primary key size is too large") before it touches storage, so an over-limit URL
- * cannot be cached, scheduled or recorded at all — only proxied. Encoded in ordered-binary, a string
- * costs its UTF-8 bytes plus one per character below U+0004, and a canonical URL has none of those
- * (WHATWG `URL` percent-encodes every control character and every non-ASCII one), so for these keys
- * the UTF-8 length is the exact encoded length.
+ * cannot be cached, scheduled or recorded at all — only proxied. Ordered-binary encodes a string as its
+ * UTF-8 bytes, plus an escape byte per character up to U+0004 in a short string and one leading byte when
+ * the first character is below U+001C. A canonical URL is printable ASCII starting with `h` (WHATWG `URL`
+ * percent-encodes every control and non-ASCII character), so for these keys the UTF-8 length is the exact
+ * encoded length — pinned against the encoder in test/cacheKey.test.js.
  */
 export const MAX_KEY_BYTES = 1978;
 
@@ -35,13 +36,23 @@ export class CacheKey {
 		return cacheKey.substring(0, cacheKey.indexOf(config.cacheKey.delimiter));
 	}
 
+	/** True when this one key fits `MAX_KEY_BYTES` (see `fitsKeyLimit` for the URL-level bound). */
+	static keyFits(key) {
+		const str = String(key ?? '');
+		if (str.length * 3 <= MAX_KEY_BYTES) return true;
+		if (str.length > MAX_KEY_BYTES) return false;
+		return Buffer.byteLength(str) <= MAX_KEY_BYTES;
+	}
+
 	/**
 	 * True when every table key this canonical URL can produce fits `MAX_KEY_BYTES`. The longest is
 	 * its cacheKey for the longest supported device — `Target`, `ProbeState` and a URL-keyed
 	 * `RenderSchedule` row use the bare URL, the page, raw and negative caches the cacheKey — so the
-	 * bound is checked once, at the point a URL arrives, and nothing downstream has to repeat it.
-	 * Counted in UTF-16 units first: nearly every URL is decided without measuring its bytes, since a
-	 * unit costs at least one UTF-8 byte and at most three.
+	 * bound is checked where a URL arrives (bot request, sitemap ingest, redirect destination). A Target
+	 * created before that check may still be one of the URLs that fit while their page keys do not, so the
+	 * key lists in resources/Target.js leave out any key past the limit and the render-result path retires
+	 * such a target. Counted in UTF-16 units first: nearly every URL is decided without measuring its
+	 * bytes, since a unit costs at least one UTF-8 byte and at most three.
 	 */
 	static fitsKeyLimit(url) {
 		const str = String(url ?? '');

@@ -933,10 +933,16 @@ async function reconcileSitemapEntries(sitemapUrl, latestSitemap, { revalidate, 
 	const { incoming: incomingEntryMap, filtered, invalid, routes } = partitionSitemapEntries(latestSitemap.entries);
 
 	// debug, not warn: per-entry, and a sitemap with thousands of bad entries would flood the
-	// log. The aggregate summary (reportFiltered) already reports counts and escalates itself
-	// to error when most of the sitemap is affected.
+	// log. One info line per child carries the count, because nothing else reports invalid entries
+	// (reportFiltered counts the route-filtered ones only).
 	for (const { loc, message } of invalid) {
 		logger.debug(`Skipping invalid sitemap entry ${loc}: ${message}`);
+	}
+	if (invalid.length) {
+		logger.info(
+			`[prerender] ${sitemapUrl}: skipped ${invalid.length} invalid entr${invalid.length === 1 ? 'y' : 'ies'} ` +
+				`(first: ${invalid[0].message})`
+		);
 	}
 	reportFiltered(sitemapUrl, filtered, latestSitemap.entries.length);
 	run.addFiltered(filtered);

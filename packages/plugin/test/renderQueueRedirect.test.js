@@ -414,6 +414,33 @@ test('a rendered client-side redirect onto a URL too long to key discards the re
 	assert.ok(warns.some((w) => w.includes('redirected to a URL too long to be a cache key')));
 });
 
+test('a Target created before the bound whose URL fits but whose page keys do not is retired on its result, not wedged', async () => {
+	// 1,975 bytes: the URL is a valid key, but `<url>|desktop` is 1,983 — every page write would throw.
+	const band = `https://site.example.com/product/${'b'.repeat(1975 - 'https://site.example.com/product/'.length)}`;
+	assert.equal(Buffer.byteLength(band), 1975);
+	const { pageKeysOf, cacheKeysOf, scheduleKeysOf } = await import('../src/resources/Target.js');
+	assert.deepEqual(pageKeysOf(band), [], 'no page key can exist, so none is listed');
+	assert.deepEqual(cacheKeysOf(band), []);
+	assert.deepEqual(scheduleKeysOf(band), [band], 'the URL-keyed schedule row is a valid key');
+
+	stores.target.set(band, { url: band, renderInterval: 3_600_000 });
+	stores.renderSchedule.set(band, { nextRenderTime: 1, fromSitemap: true });
+	await postResult(
+		{ id: band, url: band, statusCode: 200, outcome: 'rendered', isIndexable: true, headers: {} },
+		'<html>page</html>'
+	);
+	assert.equal(stores.target.has(band), false, 'retired: it can never be cached, and its bot requests are proxied');
+	assert.equal(stores.renderSchedule.has(band), false);
+	assert.equal(stores.prerenderedPage.size, 0);
+	const outcomes = analytics.filter((a) => a[1] === 'render' && a[2] === 'outcome');
+	assert.deepEqual(
+		outcomes.map((a) => [a[3], a[4]]),
+		[['failed', 'unkeyable']],
+		'exactly one outcome'
+	);
+	assert.ok(warns.some((w) => w.includes('its page keys would exceed the 1978-byte key limit')));
+});
+
 // ---- rendered ----
 
 test('outcome=rendered stores the page and reschedules', async () => {

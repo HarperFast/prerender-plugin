@@ -137,3 +137,11 @@ test('fitsKeyLimit follows the configured key shape: a delimiter per extra attri
 	assert.equal(CacheKey.fitsKeyLimit(urlOf(MAX_KEY_BYTES)), true, 'a URL-only key is the URL itself');
 	assert.equal(CacheKey.fitsKeyLimit(urlOf(MAX_KEY_BYTES + 1)), false);
 });
+
+test('keyFits measures one key against the limit, bytes not characters', () => {
+	assert.equal(CacheKey.keyFits('k'.repeat(MAX_KEY_BYTES)), true, 'exactly the limit fits');
+	assert.equal(CacheKey.keyFits('k'.repeat(MAX_KEY_BYTES + 1)), false);
+	assert.equal(CacheKey.keyFits('\u00e9'.repeat(989)), true, '1,978 bytes');
+	assert.equal(CacheKey.keyFits('\u00e9'.repeat(990)), false, '1,980 bytes in 990 characters');
+	assert.equal(CacheKey.keyFits(''), true);
+});

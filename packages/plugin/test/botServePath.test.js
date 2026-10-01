@@ -291,6 +291,29 @@ test('a URL too long to be a cache key is proxied to the origin — not the 500 
 	}
 });
 
+test('an over-limit HEAD goes upstream as a HEAD, a POST with its method, and both are origin_fetch key-too-long', async () => {
+	const recorded = [];
+	const { recordAnalytics } = server;
+	server.recordAnalytics = (...args) => recorded.push(args);
+	try {
+		const path = `/desktop/p/${'a'.repeat(2100)}`;
+		const head = await handleBotRequest(request(path, 'HEAD'));
+		assert.equal(head.status, 200);
+		assert.equal(head.body, undefined);
+		assert.equal(origin.requests.at(-1).method, 'HEAD');
+		const post = await handleBotRequest(request(path, 'POST'));
+		await drain(post.body);
+		assert.equal(post.status, 200);
+		assert.equal(origin.requests.at(-1).method, 'POST');
+		const reasons = recorded.filter((a) => a[1] === 'origin_fetch').map((a) => a[3]);
+		assert.deepEqual(reasons, ['key-too-long', 'key-too-long']);
+		await settle();
+		assert.deepEqual(tableKeys, []);
+	} finally {
+		server.recordAnalytics = recordAnalytics;
+	}
+});
+
 test('an over-limit URL whose origin answers 404 on a negative-cache route stores nothing', async () => {
 	origin.respond = (_req, res) => {
 		res.writeHead(404, { 'content-type': 'text/html' });

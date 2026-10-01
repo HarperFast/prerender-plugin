@@ -359,6 +359,7 @@ export const METRICS = Object.freeze({
 					'permanent',
 					'navigation',
 					'not-attempted',
+					'unkeyable',
 					'newer-lease',
 					'changed-during-render',
 				],
@@ -374,7 +375,9 @@ export const METRICS = Object.freeze({
 					'reason (noindex/canonical-mismatch/http-error/redirect-loop, else unspecified); auth-failure/' +
 					'transient: the status code; failed: the error phase (navigation = the document never arrived; ' +
 					'not-attempted = the worker was asked for this device and never started it — its lease ran short ' +
-					'or it began draining — so the URL retries; unknown = pre-v1.16.0 worker posted no detail); ' +
+					'or it began draining — so the URL retries; unknown = pre-v1.16.0 worker posted no detail; unkeyable = ' +
+					'plugin v0.97.3: the URL fits Harper\u2019s key limit but its page keys do not, so nothing can be ' +
+					'stored and the target is retired — only a Target created before the bound was checked at entry); ' +
 					'redirect: landed-auth/landed-transient ' +
 					'(destination answered 401/403 / 5xx-shaped), unrouted-destination (route list has no home for ' +
 					'it — a render is wasted every interval until fixed), unkeyable-destination (plugin v0.97.3: a ' +

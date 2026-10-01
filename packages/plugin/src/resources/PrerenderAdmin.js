@@ -2044,6 +2044,10 @@ export class PrerenderAdmin extends Resource {
 			return { ...base, state: 'invalid', stateDetail: 'not an absolute URL' };
 		}
 
+		// Invalid, as the sitemap ingest counts it (util/sitemap.js): no route decision could make it cacheable.
+		if (!explanation.eligibility.keyable) {
+			return { ...base, state: 'invalid', stateDetail: 'too long to be a cache key' };
+		}
 		if (!explanation.eligibility.prerendered) {
 			return { ...base, state: 'filtered', stateDetail: `${explanation.ingress.routeClass} route` };
 		}
