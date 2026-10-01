@@ -24,10 +24,10 @@ export const NO_CHECK = Object.freeze({
 	outcome: null,
 	field: null,
 	evidence: null,
-	observed: null,
+	observedDigest: null,
 });
 
-const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'observed'];
+const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'observedDigest'];
 const stringOrNull = (value) => (typeof value === 'string' && value !== '' ? value : null);
 
 /**
@@ -38,9 +38,11 @@ const stringOrNull = (value) => (typeof value === 'string' && value !== '' ? val
  * replicated to every node, so the observation itself was most of every row. Two different observations
  * share a digest with probability ~2^-96; a collision would cost one skipped probe of one URL for one pass.
  */
+// UTF-16, not UTF-8: UTF-8 maps every lone surrogate to U+FFFD, so two different ill-formed strings would
+// share a digest; the string's own code units are lossless.
 export const observationDigest = (signature) =>
 	typeof signature === 'string' && signature !== ''
-		? createHash('sha256').update(signature).digest('base64url').slice(0, 16)
+		? createHash('sha256').update(signature, 'utf16le').digest('base64url').slice(0, 16)
 		: null;
 
 /**
@@ -60,7 +62,7 @@ export const readPageCheck = async (url) => {
 			outcome: stringOrNull(row.outcome) ?? 'agree',
 			field: stringOrNull(row.field),
 			evidence: stringOrNull(row.evidence),
-			observed: stringOrNull(row.observed),
+			observedDigest: stringOrNull(row.observedDigest),
 		};
 	} catch (e) {
 		metrics.serveCheck('read-error', null);
@@ -86,15 +88,15 @@ export const coveredAt = (thresholdMs, lastCachedMs, check = NO_CHECK) =>
 export const checkSparesProbe = (check, stored, rule, sinceMs) =>
 	check.outcome === 'agree' &&
 	check.checkedAtMs >= sinceMs &&
-	check.observed !== null &&
+	check.observedDigest !== null &&
 	typeof stored?.signature === 'string' &&
-	check.observed === observationDigest(stored.signature) &&
+	check.observedDigest === observationDigest(stored.signature) &&
 	stored.fingerprint === rule.fingerprint;
 
 /**
  * Record a check of the page whose `lastCached` was `basisAtMs`: `outcome` 'agree' (with the endpoint's
- * `signature` when there was one, stored as its digest), 'mismatch' or 'held' (with the `field` and the digest of what the
- * origin said for it, `evidence`), 'inconclusive' or 'failed'. Never throws.
+ * `signature` when there was one, stored as its digest), 'mismatch' or 'held' (with the `field` and the
+ * digest of what the origin said for it, `evidence`), 'inconclusive' or 'failed'. Never throws.
  */
 export const writePageCheck = async (
 	url,
@@ -110,7 +112,7 @@ export const writePageCheck = async (
 			outcome,
 			field: stringOrNull(field),
 			evidence: stringOrNull(evidence),
-			observed: observationDigest(signature),
+			observedDigest: observationDigest(signature),
 		});
 	} catch (e) {
 		metrics.serveCheck('write-error', null);

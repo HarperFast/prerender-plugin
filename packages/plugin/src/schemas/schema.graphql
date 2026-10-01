@@ -431,7 +431,7 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 # serve-time check (util/serveCheck.js), the nightly sweep, a raw-document check. The serve path reads it
 # to decide whether a page served now is due a check (any decided check covers its window, so one URL is
 # asked once per window cluster-wide, whatever the verdict), and the sweep reads it to skip a row a check
-# has already observed EXACTLY as its baseline stands (`observed`) since the pass began.
+# has already observed EXACTLY as its baseline stands (`observedDigest`) since the pass began.
 #
 # NOT `PageVerification`, and the separation is load-bearing. A verification EXEMPTS a page from a bulk
 # invalidation, and is written only by the rule whose own scope recorded that invalidation, only while
@@ -463,7 +463,7 @@ type PageCheck @table(database: "verification", expiration: 604800) @sealed {
 	# about an unmapped slot, and only an identical observation says the probe would have found the row
 	# unchanged. A digest, not the observation: a product observation runs ~1 KB, this row is written for
 	# nearly every URL the nightly pass probes, and it replicates to every node.
-	observed: String
+	observedDigest: String
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {

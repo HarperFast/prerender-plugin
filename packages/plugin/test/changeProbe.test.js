@@ -3908,10 +3908,10 @@ test('a row a check OBSERVED EXACTLY AS ITS BASELINE STANDS since the pass began
 	// A slot no mapped field reads moved (the first price): an agreement on the mapped fields says nothing about it.
 	const MOVED = JSON.stringify([44.99, 35.99, 35.99, true]);
 	const checks = {
-		[URL_A]: { outcome: 'agree', checkedAtMs: since + 1000, observed: observationDigest(AGREE_SIG) }, // exactly the baseline
-		[URL_B]: { outcome: 'agree', checkedAtMs: since + 1000, observed: observationDigest(MOVED) }, // agreed, but saw the slot move
-		[URL_C]: { outcome: 'agree', checkedAtMs: since - 1000, observed: observationDigest(AGREE_SIG) }, // before the pass
-		[URL_D]: { outcome: 'mismatch', checkedAtMs: since + 1000, observed: null }, // not an agreement
+		[URL_A]: { outcome: 'agree', checkedAtMs: since + 1000, observedDigest: observationDigest(AGREE_SIG) }, // exactly the baseline
+		[URL_B]: { outcome: 'agree', checkedAtMs: since + 1000, observedDigest: observationDigest(MOVED) }, // agreed, but saw the slot move
+		[URL_C]: { outcome: 'agree', checkedAtMs: since - 1000, observedDigest: observationDigest(AGREE_SIG) }, // before the pass
+		[URL_D]: { outcome: 'mismatch', checkedAtMs: since + 1000, observedDigest: null }, // not an agreement
 	};
 	const probed = [];
 	const { stats } = await runVerifyPass({
@@ -3944,7 +3944,11 @@ test('no skip while a verification is armed for the rule: the probe writes that 
 			probed.push(url);
 			return AGREE_SIG;
 		},
-		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, observed: observationDigest(AGREE_SIG) }),
+		readCheck: async () => ({
+			outcome: 'agree',
+			checkedAtMs: since + 1000,
+			observedDigest: observationDigest(AGREE_SIG),
+		}),
 		skipCheckedSince: since,
 	});
 	assert.deepEqual(probed, [URL_A]);
@@ -3962,7 +3966,11 @@ test('a baseline under another rule fingerprint is never spared by a check', asy
 			probed.push(url);
 			return AGREE_SIG;
 		},
-		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, observed: observationDigest(AGREE_SIG) }),
+		readCheck: async () => ({
+			outcome: 'agree',
+			checkedAtMs: since + 1000,
+			observedDigest: observationDigest(AGREE_SIG),
+		}),
 		skipCheckedSince: since,
 	});
 	assert.deepEqual(probed, [URL_A]);

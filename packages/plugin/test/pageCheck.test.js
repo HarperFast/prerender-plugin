@@ -71,13 +71,13 @@ const OBSERVATION = JSON.stringify([
 test('an agreeing check stores a 16-character digest of its observation, never the observation', async () => {
 	await pageCheck.writePageCheck(URL_A, 1_000, { outcome: 'agree', signature: OBSERVATION });
 	const stored = rows.get(URL_A);
-	assert.equal(stored.observed, pageCheck.observationDigest(OBSERVATION));
-	assert.equal(stored.observed.length, 16);
+	assert.equal(stored.observedDigest, pageCheck.observationDigest(OBSERVATION));
+	assert.equal(stored.observedDigest.length, 16);
 	assert.ok(!JSON.stringify(stored).includes('cushioned sole'), 'the observation itself is not stored');
 	assert.ok(JSON.stringify(stored).length < 300, `row ${JSON.stringify(stored).length} bytes`);
 	const read = await pageCheck.readPageCheck(URL_A);
 	assert.equal(read.outcome, 'agree');
-	assert.equal(read.observed, stored.observed);
+	assert.equal(read.observedDigest, stored.observedDigest);
 	assert.equal(read.basisAtMs, 1_000);
 });
 
@@ -96,15 +96,29 @@ test('the sweep skips exactly when its baseline is the observation the check saw
 	assert.equal(pageCheck.checkSparesProbe(check, baseline, rule, Date.now() + 60_000), false);
 	await pageCheck.writePageCheck(URL_A, 1_000, { outcome: 'mismatch', field: '0:title', evidence: 'ab' });
 	assert.equal(pageCheck.checkSparesProbe(await pageCheck.readPageCheck(URL_A), baseline, rule, since), false);
-	// No observation stored (a document check, a disagreement): no digest, no skip.
+	// The outcome check refuses on its own: a non-agreement carrying the very digest is still no skip.
+	for (const outcome of ['mismatch', 'held', 'inconclusive', 'failed']) {
+		assert.equal(pageCheck.checkSparesProbe({ ...check, outcome }, baseline, rule, since), false, outcome);
+	}
+	// No observation stored (a document check, a disagreement): no digest, and an empty baseline never
+	// matches a missing one.
 	assert.equal(pageCheck.observationDigest(null), null);
 	assert.equal(pageCheck.observationDigest(''), null);
+	assert.equal(
+		pageCheck.checkSparesProbe({ ...check, observedDigest: null }, { signature: '', fingerprint: 'f1' }, rule, since),
+		false
+	);
+});
+
+test('the digest is lossless over the string: distinct lone surrogates digest differently', () => {
+	const digests = ['\uD800', '\uDBFF', '\uDC00', '\uFFFD'].map((s) => pageCheck.observationDigest(s));
+	assert.equal(new Set(digests).size, 4);
 });
 
 test('a failed read is "not checked"', async () => {
 	failReads = true;
 	const read = await pageCheck.readPageCheck(URL_A);
 	assert.ok(Number.isNaN(read.checkedAtMs));
-	assert.equal(read.observed, null);
+	assert.equal(read.observedDigest, null);
 	assert.equal(pageCheck.coveredAt(0, -1, read), false);
 });
