@@ -75,7 +75,7 @@ export const invalidatesReads = (route) => !READ_ONLY_POST.has(route);
 export const VERIFY_MS = 60_000;
 
 /**
- * Larger answers are served but not stored. Today's largest (a 24h analytics window) is tens of KB per
+ * Larger answers (in bytes, checked before decoding) are served but not stored. Today's largest (a 24h analytics window) is tens of KB per
  * node; anything near this is not a dashboard read.
  */
 export const MAX_CACHED_BODY = 4 * 1024 * 1024;
@@ -274,8 +274,8 @@ export function createReadCache({ table, fetch, verify, detach, workerId, enable
 	const store = (key, raw, payload, startedAt) => {
 		const tableRef = table();
 		if (!tableRef || payload === null || payload === undefined) return;
+		if (raw.body.length > MAX_CACHED_BODY) return;
 		const text = raw.body.toString('utf8');
-		if (text.length > MAX_CACHED_BODY) return;
 		const record = {
 			body: text,
 			contentType: raw.contentType,
@@ -328,7 +328,10 @@ export function createReadCache({ table, fetch, verify, detach, workerId, enable
 
 			const [entry, generation] = await Promise.all([lookup(tableRef, key), generationOf(tableRef)]);
 			if (isFresh(entry, { ttl, now: now(), generation }) && (await isVouched())) {
-				const hit = hitOf(entry, now());
+				// Fresh when looked up is not enough: the session check can take up to a request timeout, and
+				// the entry must still be fresh — and its age true — at the moment it is served.
+				const servedAt = now();
+				const hit = isFresh(entry, { ttl, now: servedAt, generation }) ? hitOf(entry, servedAt) : null;
 				if (hit) return hit;
 			}
 

@@ -567,8 +567,15 @@ export class PrerenderConsole extends Resource {
 		try {
 			const askedAt = Date.now();
 			const res = await upstream(node, 'session', { cookie: tokens[node] });
-			const body = await res.body.json();
+			let body = null;
+			try {
+				body = await res.body.json();
+			} catch {
+				/* unreadable — handled below */
+			}
+			// Before any refusal below: an answer that does not confirm the token must still revoke it.
 			noteSession(node, tokens[node], res.statusCode, body, askedAt);
+			if (!body || typeof body !== 'object') throw new Error(`unreadable session answer (${res.statusCode})`);
 			return json({ ...body, ...base });
 		} catch (e) {
 			getLogger().warn(`[prerender-console] session check against ${node} failed: ${e?.message ?? String(e)}`);

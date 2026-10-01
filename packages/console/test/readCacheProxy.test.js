@@ -37,7 +37,7 @@ const { encodeSessionCookie } = await import('../src/util/proxy.js');
 /** A stand-in prerender node: a super_user session for `good` cookies, a counter per route. */
 async function node(name, { good = ['hdb-session=op-1', 'hdb-session=op-2'] } = {}) {
 	const hits = {};
-	const state = { paused: false };
+	const state = { paused: false, sessionBroken: false };
 	const server = createServer(async (req, res) => {
 		const route = new URL(req.url, 'http://x').pathname.replace('/prerender_admin/', '');
 		hits[route] = (hits[route] ?? 0) + 1;
@@ -47,6 +47,10 @@ async function node(name, { good = ['hdb-session=op-1', 'hdb-session=op-2'] } = 
 		};
 		if (!good.includes(req.headers.cookie))
 			return send(401, { error: 'Authentication required', authenticated: false });
+		if (route === 'session' && state.sessionBroken) {
+			res.writeHead(200, { 'content-type': 'application/json' });
+			return res.end('<html>bad gateway</html>');
+		}
 		if (route === 'session') return send(200, { authenticated: true, superUser: true, username: 'op' });
 		if (req.method === 'POST' && route === 'queue') {
 			await new Promise((resolve) => req.resume().on('end', resolve));
@@ -173,4 +177,19 @@ test('a read-only POST leaves the cache alone', async (t) => {
 	await as(WorkerOne, op1).post(target('explain', { node: a.origin }), { url: 'https://www.example.com/' });
 	await as(WorkerOne, op1).get(target('sitemaps', { node: a.origin }));
 	assert.equal(a.hits.sitemaps, 1);
+});
+
+test('an unreadable session answer revokes the token’s confirmation before it is refused', async (t) => {
+	const { a, op1 } = await cluster(t);
+	await as(WorkerOne, op1).get(target('sitemaps', { node: a.origin }));
+	await settle();
+
+	a.state.sessionBroken = true;
+	const session = await (await as(WorkerOne, op1).get(target('session', { node: a.origin }))).json();
+	assert.equal(session.authenticated, false);
+	assert.equal(a.hits.session, 1);
+
+	// The cached sitemaps are not served on the strength of the earlier confirmation: the node is asked.
+	await as(WorkerOne, op1).get(target('sitemaps', { node: a.origin }));
+	assert.equal(a.hits.session, 2, 'the cache re-checked the session instead of trusting the old confirmation');
 });

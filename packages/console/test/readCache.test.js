@@ -539,3 +539,36 @@ test('an unreadable write generation trusts nothing cached', async () => {
 	};
 	assert.equal((await w.cache.read(A, 'overview', '', 'tok-1')).cached, false);
 });
+
+test('an entry that goes stale during a slow session check is not served', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const seed = worker({ table, clock, answers: { overview: raw(200, { n: 1 }) } });
+	await seed.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	const slow = createReadCache({
+		table: () => table,
+		fetch: async () => raw(200, { n: 2 }),
+		verify: async () => {
+			clock.now += DEFAULT_READ_TTL; // the check took as long as the entry had left
+			return true;
+		},
+		detach: (fn) => fn(),
+		workerId: ++workers,
+		now: () => clock.now,
+	});
+	const answer = await slow.read(A, 'overview', '', 'tok-2');
+	assert.equal(answer.cached, false);
+	assert.deepEqual(answer.payload, { n: 2 });
+});
+
+test('the size bound is in bytes, checked before the body is decoded', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	// Fewer characters than the bound, more bytes: two bytes per 'é'.
+	const pad = 'é'.repeat(MAX_CACHED_BODY / 2 + 1);
+	const w = worker({ table, clock, answers: { sitemaps: raw(200, { pad }) } });
+	await w.cache.read(A, 'sitemaps', '', 'tok-1');
+	await settle();
+	assert.equal(table.rows.size, 0);
+});
