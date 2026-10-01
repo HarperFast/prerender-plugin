@@ -129,7 +129,8 @@ re-read), and has no `@export` (nothing reaches it over REST).
 - **A write through the console invalidates every cached read**, on every worker, before the POST answers,
   so the reload after an action reads the node. The read-only POSTs (`explain`, `schedule`, `sitemap`) leave
   the cache alone. A write made elsewhere (another console host, the plugin's own schedulers) is seen once
-  the TTL runs out.
+  the TTL runs out. One limit: a cluster-scoped write lands on one node and replicates to the others
+  asynchronously, so the reload can cache another node's pre-replication answer for that route's TTL.
 - Concurrent misses for one URL on one worker send one request; a burst that lands on several workers
   before the first answer is stored can send one per worker. Only readable JSON `200`s up to 4 MB are
   stored. `cache: false` sends every read upstream.

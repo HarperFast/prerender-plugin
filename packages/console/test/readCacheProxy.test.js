@@ -22,6 +22,10 @@ globalThis.databases = {
 		ProxyRead: {
 			get: async (key) => rows.get(key) ?? null,
 			put: async (key, record) => void rows.set(key, Object.freeze({ key, ...record })),
+			search: ({ conditions: [{ value }] }) =>
+				(async function* () {
+					for (const [key, row] of rows) if (key.startsWith(value)) yield row;
+				})(),
 		},
 	},
 };

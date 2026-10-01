@@ -39,6 +39,7 @@
  * that node has confirmed the next operator's own session. Writes invalidate it.
  */
 
+import { threadId } from 'node:worker_threads';
 import { request as undiciRequest, Agent } from 'undici';
 import { config, getLogger } from '../config.js';
 import { getAdminAsset, renderAdminPage } from '../admin/index.js';
@@ -177,16 +178,18 @@ const reads = createReadCache({
 	fetch: async (origin, path, cookie) => consume(await upstream(origin, path, { cookie })),
 	verify: confirmsSuperUser,
 	detach: runDetached,
+	workerId: threadId,
 	enabled: () => config.cache,
 	log: { warn: (message) => getLogger().warn(message) },
 });
 
 /**
  * The shell checks the session before every view load; the answer is also the read cache's proof of
- * who this token belongs to, so a hit right after it needs no second check.
+ * who this token belongs to, so a hit right after it needs no second check. `askedAt` is when the
+ * check was sent: an answer to a check sent before a logout does not undo it.
  */
-const noteSession = (origin, cookie, status, body) =>
-	isSuperUserSession(status, body) ? reads.confirm(origin, cookie) : reads.forget(origin, cookie);
+const noteSession = (origin, cookie, status, body, askedAt) =>
+	isSuperUserSession(status, body) ? reads.confirm(origin, cookie, askedAt) : reads.forget(origin, cookie);
 
 // ------------------------------------------------------------------ cluster fan-out
 
@@ -538,9 +541,10 @@ export class PrerenderConsole extends Resource {
 			const failed = [];
 			for (const origin of signedIn) {
 				try {
+					const askedAt = Date.now();
 					const res = await upstream(origin, 'session', { cookie: tokens[origin] });
 					const body = await res.body.json().catch(() => null);
-					noteSession(origin, tokens[origin], res.statusCode, body);
+					noteSession(origin, tokens[origin], res.statusCode, body, askedAt);
 					if (body?.authenticated) {
 						return json({ ...body, node: null, scope: 'cluster', checkedNode: hostOf(origin), ...base });
 					}
@@ -561,9 +565,10 @@ export class PrerenderConsole extends Resource {
 		const node = scope.origin;
 		if (!tokens[node]) return json({ authenticated: false, sessionsEnabled: true, ...base });
 		try {
+			const askedAt = Date.now();
 			const res = await upstream(node, 'session', { cookie: tokens[node] });
 			const body = await res.body.json();
-			noteSession(node, tokens[node], res.statusCode, body);
+			noteSession(node, tokens[node], res.statusCode, body, askedAt);
 			return json({ ...body, ...base });
 		} catch (e) {
 			getLogger().warn(`[prerender-console] session check against ${node} failed: ${e?.message ?? String(e)}`);
@@ -642,8 +647,9 @@ export class PrerenderConsole extends Resource {
 	/** Best-effort upstream logouts, then drop the console cookie — the part that matters. */
 	static async logout(context) {
 		const tokens = tokensFrom(context);
-		// This worker stops vouching at once; the others within `VERIFY_MS`, and the upstream sessions
-		// end now, so no node confirms these tokens again.
+		// This worker stops vouching at once, including on the answer to a request already in flight;
+		// the others within `VERIFY_MS`. The upstream sessions end now, so no node confirms these tokens
+		// again.
 		for (const [origin, cookie] of Object.entries(tokens)) reads.forget(origin, cookie);
 		await Promise.all(
 			Object.entries(tokens).map(([origin, cookie]) =>

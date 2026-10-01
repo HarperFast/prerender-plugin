@@ -80,14 +80,31 @@ export const VERIFY_MS = 60_000;
  */
 export const MAX_CACHED_BODY = 4 * 1024 * 1024;
 
-/** The row holding the write generation. Never a valid cache key: those are URLs. */
-export const GENERATION_KEY = 'write-generation';
+/**
+ * The write-generation rows: ONE PER WORKER, `write-generation:<worker>`, each only ever moved forward
+ * by its own worker, and read as the max of all of them. A single shared row would be last-writer-wins:
+ * two POSTs on two workers can commit in the opposite order to their timestamps, leave the row at the
+ * earlier one, and let a third worker serve an entry fetched between them. None of these is a cache key
+ * — those are URLs, or `sha256:` digests.
+ */
+export const GENERATION_PREFIX = 'write-generation:';
 
-/** Bound on remembered confirmations, per worker. One per operator per node in practice. */
-const MAX_CONFIRMATIONS = 1000;
+/** Bound on remembered confirmations and revocations, per worker. One per operator per node in practice. */
+const MAX_REMEMBERED = 1000;
+
+/**
+ * Harper refuses a primary key past 1,978 bytes. A key is the URL the console would ask, which a page
+ * browse's prefix or cursor can lengthen without limit, so a long one is stored by its digest instead.
+ */
+const MAX_PLAIN_KEY_BYTES = 1024;
 
 /** The cache key is the URL the console would ask: one origin, one route, one query. */
-export const cacheKeyFor = (origin, path) => `${origin}/prerender_admin/${path}`;
+export const cacheKeyFor = (origin, path) => {
+	const url = `${origin}/prerender_admin/${path}`;
+	return Buffer.byteLength(url) <= MAX_PLAIN_KEY_BYTES
+		? url
+		: `sha256:${createHash('sha256').update(url).digest('base64url')}`;
+};
 
 const isJson = (contentType) => /\bjson\b/i.test(String(contentType ?? ''));
 
@@ -107,55 +124,75 @@ const ageOf = (payload) =>
  *
  * Freshness runs from `bornAt`, when the DATA was produced, not from when the console fetched it. The
  * plugin caches analytics itself and says how old its answer was (`cacheAgeMs`); counting from the
- * fetch would stack the two TTLs, and a "60s" window could be two minutes old. An entry the clock has
- * gone backwards past is not fresh either: it would otherwise stay fresh for however far the clock
- * moved.
+ * fetch would stack the two TTLs, and a "60s" window could be two minutes old. Data is never younger
+ * than its fetch, whatever a node's clock claimed. An entry the clock has gone backwards past is not
+ * fresh either: it would otherwise stay fresh for however far the clock moved.
  */
 export function isFresh(entry, { ttl, now, generation }) {
 	if (!entry || typeof entry.body !== 'string') return false;
 	if (!Number.isFinite(entry.startedAt) || !Number.isFinite(entry.bornAt)) return false;
 	if (entry.startedAt < generation) return false;
 	if (now < entry.startedAt) return false;
-	return now - entry.bornAt < ttl;
+	return now - Math.min(entry.bornAt, entry.startedAt) < ttl;
 }
+
+/** A Map that keeps its newest `MAX_REMEMBERED` keys. */
+const remember = (map, key, value) => {
+	map.delete(key);
+	map.set(key, value);
+	while (map.size > MAX_REMEMBERED) map.delete(map.keys().next().value);
+};
 
 /**
  * The read path every proxied GET takes.
  *
  * `fetch(origin, path, cookie)` → `{ status, contentType, body: Buffer }`, throwing on transport
- * failure; `verify(origin, cookie)` → whether that node accepts the token as a super_user. `table()`
- * returns the Harper table, or null where there is none (tests, or a host without the schema), and
- * `detach(fn)` runs a write outside the request's transaction (util/detach.js).
+ * failure; `verify(origin, cookie)` → whether that node accepts the token as a super_user, throwing
+ * likewise. `table()` returns the Harper table, or null where there is none (tests, or a host without
+ * the schema). `detach(fn)` runs `fn` outside the request's transaction (util/detach.js) — every table
+ * access goes through it: a write inside the request would be reaped with it, and a read would hold a
+ * read transaction open across the whole upstream wait, which Harper force-commits past 30s and then
+ * refuses further reads on. `workerId` names this worker's generation row.
  *
  * Every answer is `{ status, contentType, body, payload, cached, ageMs }`: `payload` is a parse of
  * `body` that belongs to this caller alone (a merger may modify it), `undefined` for a non-JSON body,
  * and null for an unreadable one; `ageMs` is how long ago the console fetched it, null when it just did.
  */
-export function createReadCache({ table, fetch, verify, detach, enabled = () => true, now = Date.now, log }) {
+export function createReadCache({ table, fetch, verify, detach, workerId, enabled = () => true, now = Date.now, log }) {
 	const confirmed = new Map();
 	const confirming = new Map();
+	// When each token was last refused or signed out. Evidence gathered BEFORE that moment — a request
+	// already in flight at logout that answers 200 after it — never confirms the token again.
+	const revoked = new Map();
 	const inflight = new Map();
-	// This worker's own last write, so its next read sees it before the table write has committed.
+	// This worker's own last write: its generation row's value, and seen by its own reads before the
+	// row has committed.
 	let localGeneration = 0;
+	const generationKey = `${GENERATION_PREFIX}${workerId}`;
 
 	const idOf = (origin, cookie) => createHash('sha256').update(origin).update('\0').update(cookie).digest('base64url');
 
-	const confirm = (origin, cookie) => {
+	/** `askedAt`: when the request that proved the token was SENT — what a revocation is compared with. */
+	const confirm = (origin, cookie, askedAt = now()) => {
 		if (!cookie) return;
 		const id = idOf(origin, cookie);
-		confirmed.delete(id);
-		confirmed.set(id, now());
-		if (confirmed.size <= MAX_CONFIRMATIONS) return;
-		const cutoff = now() - VERIFY_MS;
-		for (const [key, at] of confirmed) if (at < cutoff) confirmed.delete(key);
-		while (confirmed.size > MAX_CONFIRMATIONS) confirmed.delete(confirmed.keys().next().value);
+		const refusedAt = revoked.get(id);
+		if (refusedAt !== undefined && askedAt <= refusedAt) return;
+		remember(confirmed, id, now());
 	};
 
 	const forget = (origin, cookie) => {
-		if (cookie) confirmed.delete(idOf(origin, cookie));
+		if (!cookie) return;
+		const id = idOf(origin, cookie);
+		confirmed.delete(id);
+		remember(revoked, id, now());
 	};
 
-	/** Whether `origin` currently accepts this token — remembered, else asked (once, however many wait). */
+	/**
+	 * Whether `origin` currently accepts this token — remembered, else asked (once, however many wait).
+	 * A transport failure REJECTS: the node did not answer, and the caller must not then send it a second
+	 * request to time out on.
+	 */
 	const vouched = (origin, cookie) => {
 		if (!cookie) return false;
 		const id = idOf(origin, cookie);
@@ -163,16 +200,14 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 		if (at !== undefined && now() - at < VERIFY_MS && now() >= at) return true;
 		let pending = confirming.get(id);
 		if (!pending) {
+			const askedAt = now();
 			pending = Promise.resolve()
 				.then(() => verify(origin, cookie))
-				.then(
-					(ok) => {
-						if (ok) confirm(origin, cookie);
-						else forget(origin, cookie);
-						return !!ok;
-					},
-					() => false
-				)
+				.then((ok) => {
+					if (ok) confirm(origin, cookie, askedAt);
+					else forget(origin, cookie);
+					return !!ok;
+				})
 				.finally(() => confirming.delete(id));
 			confirming.set(id, pending);
 		}
@@ -188,18 +223,32 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 		ageMs,
 	});
 
-	const safeGet = async (store, key) => {
+	const lookup = async (tableRef, key) => {
 		try {
-			return (await store.get(key)) ?? null;
+			return (await detach(() => tableRef.get(key))) ?? null;
 		} catch (e) {
 			log?.warn?.(`[prerender-console] read cache lookup failed; reading the node: ${e?.message ?? String(e)}`);
 			return null;
 		}
 	};
 
-	const generationOf = async (store) => {
-		const row = await safeGet(store, GENERATION_KEY);
-		return Math.max(localGeneration, Number.isFinite(row?.startedAt) ? row.startedAt : 0);
+	/** The newest write any worker on this host has stamped. */
+	const generationOf = async (tableRef) => {
+		let newest = localGeneration;
+		try {
+			await detach(async () => {
+				const rows = tableRef.search({
+					conditions: [{ attribute: 'key', comparator: 'starts_with', value: GENERATION_PREFIX }],
+					select: ['key', 'startedAt'],
+				});
+				for await (const row of rows) if (Number.isFinite(row?.startedAt)) newest = Math.max(newest, row.startedAt);
+			});
+		} catch (e) {
+			log?.warn?.(`[prerender-console] write generation unreadable; reading the node: ${e?.message ?? String(e)}`);
+			// Unknown generation: nothing cached may be trusted, so every entry reads as stale.
+			return Infinity;
+		}
+		return newest;
 	};
 
 	const hitOf = (entry, at) => {
@@ -209,7 +258,7 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 		// The plugin's own age, carried forward: the footer's "cached Ns ago" must count the console's
 		// time on top, or a minute-old window would read as the plugin's few seconds.
 		if (ageOf(payload) !== null) {
-			payload.cacheAgeMs = at - entry.bornAt;
+			payload.cacheAgeMs = at - Math.min(entry.bornAt, entry.startedAt);
 			text = JSON.stringify(payload);
 		}
 		return {
@@ -231,9 +280,9 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 			body: text,
 			contentType: raw.contentType,
 			startedAt,
-			bornAt: startedAt - (ageOf(payload) ?? 0),
+			// A node whose clock runs behind can report a negative age; data is never younger than its fetch.
+			bornAt: startedAt - Math.max(0, ageOf(payload) ?? 0),
 		};
-		// Detached: the write must not join (and be reaped with) the request's transaction.
 		Promise.resolve(detach(() => tableRef.put(key, record))).catch((e) =>
 			log?.warn?.(`[prerender-console] read cache store failed for ${key}: ${e?.message ?? String(e)}`)
 		);
@@ -252,7 +301,7 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 		}
 		const answer = answerOf(raw);
 		if (raw.status === 200) {
-			confirm(origin, cookie);
+			confirm(origin, cookie, startedAt);
 			store(key, raw, answer.payload, startedAt);
 		} else if (raw.status === 401 || raw.status === 403) {
 			forget(origin, cookie);
@@ -272,15 +321,19 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 			if (!tableRef || ttl <= 0) return answerOf(await fetch(origin, path, cookie));
 
 			const key = cacheKeyFor(origin, path);
-			const [entry, generation] = await Promise.all([safeGet(tableRef, key), generationOf(tableRef)]);
-			const at = now();
-			if (isFresh(entry, { ttl, now: at, generation }) && (await vouched(origin, cookie))) {
+			// Asked at most once per read: a node that does not answer the session check costs one
+			// timeout, not one per path below.
+			let vouching = null;
+			const isVouched = () => (vouching ??= Promise.resolve(vouched(origin, cookie)));
+
+			const [entry, generation] = await Promise.all([lookup(tableRef, key), generationOf(tableRef)]);
+			if (isFresh(entry, { ttl, now: now(), generation }) && (await isVouched())) {
 				const hit = hitOf(entry, now());
 				if (hit) return hit;
 			}
 
 			const flight = inflight.get(key);
-			if (flight && flight.startedAt >= generation && (await vouched(origin, cookie))) {
+			if (flight && flight.startedAt >= generation && (await isVouched())) {
 				// A transport failure is the node's state at this moment, for every rider alike — rethrown,
 				// not retried. A 401/403 is about the LEADER's token, so a rider asks with its own.
 				const raw = await flight.promise;
@@ -294,13 +347,13 @@ export function createReadCache({ table, fetch, verify, detach, enabled = () => 
 		 * POST before it answers, so the reload that follows cannot read the old generation.
 		 */
 		async noteWrite() {
-			const at = now();
-			localGeneration = Math.max(localGeneration, at);
+			localGeneration = Math.max(localGeneration, now());
 			inflight.clear();
 			const tableRef = table();
 			if (!tableRef) return;
+			const at = localGeneration;
 			try {
-				await detach(() => tableRef.put(GENERATION_KEY, { body: null, contentType: null, startedAt: at, bornAt: at }));
+				await detach(() => tableRef.put(generationKey, { body: null, contentType: null, startedAt: at, bornAt: at }));
 			} catch (e) {
 				log?.warn?.(
 					`[prerender-console] write generation not stored; other workers may serve pre-write reads for up to their TTL: ${e?.message ?? String(e)}`

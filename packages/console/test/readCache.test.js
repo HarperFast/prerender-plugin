@@ -11,8 +11,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
 	createReadCache,
+	cacheKeyFor,
 	DEFAULT_READ_TTL,
-	GENERATION_KEY,
+	GENERATION_PREFIX,
 	MAX_CACHED_BODY,
 	READ_ONLY_POST,
 	READ_TTL,
@@ -24,17 +25,34 @@ import { PROXIED_GET, PROXIED_POST } from '../src/util/proxy.js';
 const A = 'https://node-a.example.com:9926';
 const B = 'https://node-b.example.com:9926';
 
+// Nonzero while a worker's `detach` is running `fn`. Every table access must happen inside it: one in
+// the request's transaction is reaped with it (a write) or held open across the upstream wait (a read).
+let detachDepth = 0;
+const outsideDetach = [];
+const checkDetached = (op) => detachDepth > 0 || outsideDetach.push(op);
+
 /** A Map standing in for the ProxyRead table: one instance is "the host", shared by every worker. */
 function fakeTable() {
 	const rows = new Map();
 	return {
 		rows,
-		get: async (key) => rows.get(key) ?? null,
+		get: async (key) => (checkDetached('get'), rows.get(key) ?? null),
 		put: async (key, record) => {
+			checkDetached('put');
 			rows.set(key, Object.freeze({ key, ...record }));
+		},
+		search: ({ conditions }) => {
+			checkDetached('search');
+			const [{ attribute, comparator, value }] = conditions;
+			assert.deepEqual([attribute, comparator], ['key', 'starts_with']);
+			return (async function* () {
+				for (const [key, row] of rows) if (key.startsWith(value)) yield row;
+			})();
 		},
 	};
 }
+
+let workers = 0;
 
 /**
  * One worker's cache over a shared table. `answers` maps a path to what the node says; `goodTokens`
@@ -43,7 +61,6 @@ function fakeTable() {
 function worker({ table, clock, answers = {}, goodTokens = ['tok-1', 'tok-2'], enabled = true }) {
 	const fetches = [];
 	const verifies = [];
-	const detached = [];
 	const cache = createReadCache({
 		table: () => table,
 		fetch: async (origin, path, cookie) => {
@@ -58,13 +75,18 @@ function worker({ table, clock, answers = {}, goodTokens = ['tok-1', 'tok-2'], e
 			return goodTokens.includes(cookie);
 		},
 		detach: (fn) => {
-			detached.push(fn);
-			return fn();
+			detachDepth++;
+			try {
+				return fn();
+			} finally {
+				detachDepth--;
+			}
 		},
+		workerId: ++workers,
 		enabled: () => enabled,
 		now: () => clock.now,
 	});
-	return { cache, fetches, verifies, detached };
+	return { cache, fetches, verifies };
 }
 
 const raw = (status, body, contentType = 'application/json; charset=utf-8') => ({
@@ -198,8 +220,10 @@ test('a write through the console makes every earlier entry a miss — on every 
 
 	clock.now += 10;
 	await one.cache.noteWrite();
-	assert.ok(table.rows.get(GENERATION_KEY), 'the generation is stored for the other workers');
-	assert.equal(one.detached.length, 2, 'both the entry write and the generation write ran detached');
+	assert.ok(
+		[...table.rows.keys()].some((key) => key.startsWith(GENERATION_PREFIX)),
+		'the generation is stored for the other workers'
+	);
 
 	answers.overview = raw(200, { paused: true });
 	const mine = await one.cache.read(A, 'overview', '', 'tok-1');
@@ -390,4 +414,128 @@ test('the table outlives the longest TTL, so no row vanishes while it is still s
 	const expirationMs = Number(directive.match(/expiration: (\d+)/)[1]) * 1000;
 	const longest = Math.max(DEFAULT_READ_TTL, ...Object.values(READ_TTL));
 	assert.ok(expirationMs > longest, `expiration ${expirationMs}ms must exceed the longest TTL ${longest}ms`);
+});
+
+test('every table access runs outside the request’s transaction', () => {
+	// Accumulated across every test above: reads, searches and writes alike.
+	assert.deepEqual(outsideDetach, []);
+});
+
+test('two writes that commit out of order still leave the newer generation in force', async () => {
+	const table = fakeTable();
+	const early = { now: 2000 };
+	const late = { now: 2005 };
+	const reader = { now: 2003 };
+	const a = worker({ table, clock: early });
+	const c = worker({ table, clock: late });
+	const b = worker({ table, clock: reader, answers: { overview: raw(200, { n: 1 }) } });
+	// B fetched between the two writes...
+	await b.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	// ...C's write (2005) commits first, A's (2000) after it.
+	await c.cache.noteWrite();
+	await a.cache.noteWrite();
+	reader.now = 2010;
+	assert.equal((await b.cache.read(A, 'overview', '', 'tok-1')).cached, false, 'the entry predates C’s write');
+});
+
+test('a node that does not answer the session check costs one request, not one per path', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const seed = worker({ table, clock, answers: { overview: raw(200, { n: 0 }) } });
+	await seed.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	// A fresh entry, and a requester this worker has never confirmed, whose session check fails in transit.
+	const verifies = [];
+	const unreachable = createReadCache({
+		table: () => table,
+		fetch: async () => assert.fail('no data request after the node failed to answer'),
+		verify: async (origin, cookie) => {
+			verifies.push(cookie);
+			throw new Error('headers timeout');
+		},
+		detach: (fn) => fn(),
+		workerId: ++workers,
+		now: () => clock.now,
+	});
+	await assert.rejects(unreachable.read(A, 'overview', '', 'tok-2'), /headers timeout/);
+	assert.deepEqual(verifies, ['tok-2'], 'one session check, and its failure is the answer');
+});
+
+test('a refused session check is asked once, then the node’s own answer is fetched', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const w = worker({ table, clock, answers: { overview: raw(200, { n: 1 }) } });
+	await w.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	const forged = await w.cache.read(A, 'overview', '', 'forged');
+	assert.equal(forged.status, 401);
+	assert.equal(w.verifies.length, 1, 'one session check');
+	assert.equal(w.fetches.length, 2, 'then one data request for the refused token, after the first read');
+});
+
+test('a 200 that was in flight when the token was signed out does not confirm it again', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	let release;
+	const gate = new Promise((resolve) => (release = resolve));
+	const w = worker({
+		table,
+		clock,
+		answers: { overview: raw(200, { n: 1 }), config: async () => (await gate, raw(200, { c: 1 })) },
+	});
+	await w.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	const inFlight = w.cache.read(A, 'config', '', 'tok-1');
+	await settle();
+	clock.now += 1;
+	w.cache.forget(A, 'tok-1'); // logout
+	clock.now += 1;
+	release();
+	await inFlight;
+	await w.cache.read(A, 'overview', '', 'tok-1');
+	assert.equal(w.verifies.length, 1, 'the hit after logout asked the node again');
+
+	// A session check sent before the logout, answered after it, does not undo it either.
+	w.cache.forget(A, 'tok-1');
+	w.cache.confirm(A, 'tok-1', clock.now - 1);
+	await w.cache.read(A, 'overview', '', 'tok-1');
+	assert.equal(w.verifies.length, 2);
+});
+
+test('a negative age from a node with a slow clock does not stretch the TTL', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const w = worker({ table, clock, answers: { 'analytics?range=1': raw(200, { cacheAgeMs: -3_600_000 }) } });
+	await w.cache.read(A, 'analytics', 'range=1', 'tok-1');
+	await settle();
+	clock.now += READ_TTL.analytics;
+	assert.equal((await w.cache.read(A, 'analytics', 'range=1', 'tok-1')).cached, false);
+});
+
+test('a key past Harper’s primary-key limit is stored by digest, and still found', async () => {
+	const long = `prefix=${encodeURIComponent('https://www.example.com/' + 'a'.repeat(3000))}`;
+	const key = cacheKeyFor(A, `pages?${long}`);
+	assert.match(key, /^sha256:/);
+	assert.ok(Buffer.byteLength(key) < 1978);
+	assert.equal(cacheKeyFor(A, 'pages?prefix=%2F'), `${A}/prerender_admin/pages?prefix=%2F`, 'short keys stay readable');
+
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const w = worker({ table, clock, answers: { [`pages?${long}`]: raw(200, { pages: [] }) } });
+	await w.cache.read(A, 'pages', long, 'tok-1');
+	await settle();
+	assert.equal((await w.cache.read(A, 'pages', long, 'tok-1')).cached, true);
+});
+
+test('an unreadable write generation trusts nothing cached', async () => {
+	const table = fakeTable();
+	const clock = { now: 1_000_000 };
+	const w = worker({ table, clock, answers: { overview: raw(200, { n: 1 }) } });
+	await w.cache.read(A, 'overview', '', 'tok-1');
+	await settle();
+	table.search = () => {
+		throw new Error('Database closed during transaction get operation');
+	};
+	assert.equal((await w.cache.read(A, 'overview', '', 'tok-1')).cached, false);
 });
