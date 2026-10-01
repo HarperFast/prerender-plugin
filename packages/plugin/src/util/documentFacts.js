@@ -1503,3 +1503,98 @@ export const serializeDocumentFacts = (facts) => {
 	const bytes = Buffer.byteLength(json, 'utf8');
 	return bytes > PAGE_FACTS_MAX_BYTES ? { json: null, bytes, refused: true } : { json, bytes, refused: false };
 };
+
+/**
+ * The facts of a body still ARRIVING (a response stream): the same result as `documentFactsOf`, read only
+ * as far as the scan needs. Identity chunks go straight to the scanner; compressed ones accumulate and are
+ * inflated as a growing prefix whenever the bytes in hand reach the next round's size. Once the scan is
+ * done the stream is destroyed, so the rest of the body is never transferred. Never throws on the body
+ * itself: a read error is 'failed', an inflate error 'corrupt'.
+ */
+export const documentFactsFromStream = async (
+	stream,
+	{
+		contentEncoding = null,
+		contentType = null,
+		maxBytes = DEFAULT_MAX_SCAN_BYTES,
+		firstInflateBytes = FIRST_INFLATE_PREFIX,
+		want = HEAD_FACTS,
+	} = {}
+) => {
+	const release = () => {
+		try {
+			stream?.destroy?.();
+		} catch {
+			// already gone
+		}
+	};
+	const scanner = createDocumentFactsScanner({ maxBytes, charset: charsetOfContentType(contentType), want });
+	const encoding = encodingOf(contentEncoding);
+	if (encoding !== '' && !INFLATABLE.has(encoding)) {
+		release();
+		return { facts: null, outcome: 'encoding', scannedBytes: 0, inflatedBytes: 0, compressedBytesRead: 0 };
+	}
+	const chunks = [];
+	let have = 0;
+	let fed = 0;
+	let inflated = 0;
+	let next = Math.max(1024, firstInflateBytes);
+	// One inflate round over every compressed byte in hand: false once the scan wants no more.
+	const round = () => {
+		const out = inflatePrefix(encoding, Buffer.concat(chunks, have), maxBytes);
+		inflated += out.length;
+		const more = out.length > fed ? scanner.push(out.subarray(fed)) : true;
+		fed = out.length;
+		return more;
+	};
+	let roundAt = 0; // compressed bytes the last inflate round covered
+	let stopped = false; // the scan needs nothing more (done, or bounded)
+	try {
+		for await (const chunk of stream) {
+			have += chunk.length;
+			if (encoding === '') {
+				if (!scanner.push(chunk)) {
+					stopped = true;
+					break;
+				}
+				continue;
+			}
+			chunks.push(chunk);
+			if (have >= next) {
+				roundAt = have;
+				if (!round()) {
+					stopped = true;
+					break;
+				}
+				next = have * 2;
+			}
+			// The compressed side is bounded too: a body that never inflates far enough is not read forever.
+			if (have > maxBytes) {
+				scanner.truncate();
+				stopped = true;
+				break;
+			}
+		}
+		// The body ended between rounds: inflate what arrived since the last one.
+		if (!stopped && encoding !== '' && have > roundAt) round();
+	} catch (e) {
+		release();
+		if (e?.code === 'ERR_BUFFER_TOO_LARGE') {
+			scanner.truncate();
+			return { ...scanner.finish(), inflatedBytes: inflated, compressedBytesRead: have };
+		}
+		const corrupt =
+			e?.code?.startsWith?.('Z_') ||
+			e?.code === 'ERR_ZLIB_INITIALIZATION_FAILED' ||
+			/incorrect|invalid|unexpected end/i.test(e?.message ?? '');
+		return {
+			facts: null,
+			outcome: corrupt ? 'corrupt' : 'failed',
+			scannedBytes: fed,
+			inflatedBytes: inflated,
+			compressedBytesRead: have,
+		};
+	}
+	release();
+	return { ...scanner.finish(), inflatedBytes: inflated, compressedBytesRead: have };
+};

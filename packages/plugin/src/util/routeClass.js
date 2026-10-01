@@ -37,6 +37,9 @@ import { config, getLogger } from '../config.js';
 import { compileEntityPrefix, endsOnDelimiter } from './entityGate.js';
 import { DOCUMENT_FACTS, HEAD_FACTS } from './documentFacts.js';
 
+/** What `documentCheck: true` compares: a listing page's own facts and its products. */
+const DOCUMENT_CHECK_DEFAULT = Object.freeze(['title', 'metaDescription', 'canonical', 'itemList']);
+
 export const PRERENDER = 'prerender';
 export const PASSTHROUGH = 'passthrough';
 export const UNCLASSIFIED = 'unclassified';
@@ -270,6 +273,26 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route DOCUMENT CHECK (util/serveCheck.js): which facts to compare between a served page
+	// and the origin's document now, for a route no endpoint rule covers. `true` = the listing defaults.
+	// Same drop-the-FIELD rule: a typo checks nothing and changes nothing about how the path is served.
+	let documentCheck = null;
+	if (raw.documentCheck !== undefined && raw.documentCheck !== null && raw.documentCheck !== false) {
+		const wanted = raw.documentCheck === true ? DOCUMENT_CHECK_DEFAULT : raw.documentCheck;
+		if (mode === PASSTHROUGH) {
+			warn(
+				`ignoring documentCheck on passthrough route "${raw.match} ${raw.path}" — a passthrough route serves nothing from cache`
+			);
+		} else if (!Array.isArray(wanted) || wanted.length === 0 || wanted.some((f) => !DOCUMENT_FACTS.includes(f))) {
+			warn(
+				`ignoring documentCheck on route "${raw.match} ${raw.path}" — expected true or a non-empty array of ` +
+					`${DOCUMENT_FACTS.join(', ')}; got ${JSON.stringify(raw.documentCheck)}`
+			);
+		} else {
+			documentCheck = Object.freeze([...new Set(wanted)]);
+		}
+	}
+
 	// Optional per-route negative cache (util/negativeCache.js) — `rawCache`'s sibling for the origin's own
 	// 404/410. Same drop-the-FIELD rule, and the same split: this is the ROUTE's opt-in only, and
 	// `render.negative.enabled` is the master switch checked at the call site.
@@ -345,6 +368,7 @@ const compileEntry = (raw, source, warn) => {
 		arrivalAction,
 		rawCache,
 		rawFacts,
+		documentCheck,
 		negativeCache,
 		entityPrefix,
 		source,

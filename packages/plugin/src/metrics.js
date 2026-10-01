@@ -598,7 +598,7 @@ export const METRICS = Object.freeze({
 			'util/unrouted.js, resources/Sitemap.js, http_handlers/response.js, util/backlogSnapshot.js, ' +
 			'util/demandLadder.js, util/visitFilter.js, util/invalidation.js, util/invalidationReenqueue.js, http_handlers/bot_request.js, ' +
 			'util/changeProbe.js, util/entityGate.js, util/negativeCache.js, util/goneReopen.js, resources/RenderQueue.js, ' +
-			'util/renderSchedule.js (due_now_forward)',
+			'util/renderSchedule.js (due_now_forward), util/serveCheck.js and util/pageCheck.js (serve_check)',
 		cadence:
 			'per report flush (unrouted), per finished sitemap run (sitemap_*), per delivery failure ' +
 			'(serve_error, page_age_negative), per snapshot (config_warnings), per stats interval (the ladder\u2019s ' +
@@ -609,7 +609,8 @@ export const METRICS = Object.freeze({
 			'per raw-document store attempt (raw_cache), per entity-gate evaluation (entity_gate), per ' +
 			'negative-cache store, guard, re-check or dry-run verdict (negative_cache), per request that found a ' +
 			'stored 404 (negative_gap), per reopen decision (gone_reopen), per suppressed target rendered (suppression_lifted ' +
-			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward)',
+			'or suppression_held), per "render this now" filing on a node that does not own the row (due_now_forward), ' +
+			'per serve-time check decision (serve_check)',
 		summary: 'Every low-volume operational signal, under one name so a sweep pays one scan for all of them.',
 		usefulFor:
 			'unrouted = requests served without prerendering, per path bucket: CDN over-forwarding vs. the ' +
@@ -736,13 +737,21 @@ export const METRICS = Object.freeze({
 			'which can demote the owner’s row), timed-out (the owner did not answer in time and the ask carried ' +
 			'no change mark: left to the owner, not written here — see queue.dueNowForward), skipped (that owner ' +
 			'failed within the last 30s; filed here). A ' +
-			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset.',
+			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset. ' +
+			'serve_check = the serve-time check (changeProbe.serveCheck): would-check (dry run: a page served from ' +
+			'cache that is due a check), queued, then the verdict — agree (recorded in PageCheck), mismatch (the ' +
+			'page disagreed with the origin and was expired and re-filed: THE NUMBER TO WATCH, by hour, since it is ' +
+			'what a page served from cache between two checks gets wrong), raw-mismatch (a stored raw document ' +
+			'disagreed and was deleted), inconclusive (nothing comparable), failed (the origin request failed); or ' +
+			'why nothing was asked — busy (queue full), shed (no budget slot in time), deduped (checked by another ' +
+			'worker or node meanwhile), no-facts (the served page states nothing comparable), read-error, ' +
+			'write-error, error.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted, suppression_held and due_now_forward are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
+			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -811,6 +820,7 @@ export const METRICS = Object.freeze({
 					'suppression_lifted',
 					'suppression_held',
 					'due_now_forward',
+					'serve_check',
 				],
 				description:
 					'unrouted = non-prerendered serve counts (see method/type). sitemap_* = per finished run: ' +
@@ -828,7 +838,8 @@ export const METRICS = Object.freeze({
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
 					'gone-suppressed targets reopened on an origin 200. suppression_lifted = suppressions a render ' +
 					'lifted, by reason and age. suppression_held = suppressions a render re-proved, by reason and age. ' +
-					'due_now_forward = off-owner "render this now" filings, by outcome.',
+					'due_now_forward = off-owner "render this now" filings, by outcome. serve_check = serve-time ' +
+					'checks against the origin, by outcome.',
 			},
 			method: {
 				name: 'detail',
@@ -862,7 +873,9 @@ export const METRICS = Object.freeze({
 					'suppression_lifted and suppression_held: the suppressedReason the render lifted or re-proved ' +
 					'(http-gone, noindex, canonical-mismatch, ...). due_now_forward: the outcome (forwarded, ' +
 					'fell-back, timed-out, skipped). probe_anchor: the outcome (on_time, interrupted, ' +
-					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (rechecked, confirmed, cleared, recheck_failed, recheck_inconclusive, bounded, untrusted, shed, dry_run, error). Other series: null.',
+					'chained, caught_up, skipped). probe_detection_lag: the bound (pass, previous_pass). probe_render_mismatch: the outcome (rechecked, confirmed, cleared, recheck_failed, recheck_inconclusive, bounded, untrusted, shed, dry_run, error). ' +
+					'serve_check: the outcome (would-check, queued, agree, mismatch, raw-mismatch, inconclusive, failed, ' +
+					'busy, shed, deduped, no-facts, read-error, write-error, error). Other series: null.',
 			},
 			type: {
 				name: 'context',
@@ -873,6 +886,8 @@ export const METRICS = Object.freeze({
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
 					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
+					"serve_check: the check's source — 'api' (the rule's endpoint), 'document' (the origin document, " +
+					"documentCheck routes) or 'raw' (a stored raw document against the endpoint); null for read/write errors. " +
 					'Other series: null.',
 			},
 		},
@@ -1128,6 +1143,8 @@ export const metrics = Object.freeze({
 	// `verified` cacheStatus is what measures exemptions actually granted, and counting "row absent"
 	// would swamp both with the normal case.
 	pageVerification: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'page_verification', outcome, null),
+	serveCheck: (outcome, source) =>
+		server.recordAnalytics(true, 'prerender_ops', 'serve_check', outcome, source ?? null),
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 

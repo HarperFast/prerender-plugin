@@ -60,6 +60,7 @@ import { CLUSTER_SCOPE, recordInvalidation, isScopeResolvable, resolveInvalidati
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
+import { readPageCheck, writePageCheck } from './pageCheck.js';
 import { walkUrlRange } from './urlWalk.js';
 import { runDetached } from './detach.js';
 import { getSab } from './coordination.js';
@@ -164,6 +165,7 @@ const newStats = () => ({
 	failed: 0, // fetch/parse/extraction failures — signature untouched, nothing triggered
 	errors: 0, // actions that threw — signature left stale, so the next probe of the URL acts again
 	fresh: 0, // skipped: baseline written since this pass (or the pass it resumes) began — already probed
+	checkedOnDemand: 0, // skipped: checked and agreed since the anchor (a serve-time check on any node, or this pass before a restart)
 	pageMismatch: 0, // cached page disagreed with the origin (pageCheck: the claim pair, or an ARMED mapped field) — OVERLAYS the buckets above, which count by signature outcome alone
 	caughtUp: 0, // origin changed, but every changed slot is a mapped slot the cached page ALREADY shows the new value for: baseline written, nothing triggered — OVERLAYS changed
 	ignored: 0, // origin changed only in pageCheck.ignoreChanges slots: baseline written, nothing triggered, NOT a change for the canary — OVERLAYS unchanged
@@ -201,11 +203,11 @@ const readBounded = async (stream, maxBytes) => {
  * host, so sending them unconditionally would hand the bypass secret to (and mis-route DNS for) a
  * third party. Same scoping rule the renderer applies to its own bypass token.
  */
-const probeFetch = async ({ url, method, headers, body }, targetUrl) => {
+const probeRequest = ({ url, method, headers, body }, targetUrl) => {
 	const urlObj = new URL(url);
 	const timeout = config.changeProbe.requestTimeout;
 	const sameOrigin = isSameProbeOrigin(targetUrl, url);
-	const response = await dispatcherFor(sameOrigin ? configuredStagingIp() : undefined).request({
+	return dispatcherFor(sameOrigin ? configuredStagingIp() : undefined).request({
 		origin: urlObj.origin,
 		path: urlObj.pathname + urlObj.search,
 		method,
@@ -219,6 +221,10 @@ const probeFetch = async ({ url, method, headers, body }, targetUrl) => {
 		headersTimeout: timeout,
 		bodyTimeout: timeout,
 	});
+};
+
+const probeFetch = async (request, targetUrl) => {
+	const response = await probeRequest(request, targetUrl);
 	const raw = await readBounded(response.body, config.changeProbe.maxResponseBytes);
 	// maxOutputLength so a pathological gzip body cannot expand past what the raw cap allows.
 	const buffer =
@@ -334,6 +340,52 @@ const probeOnce = async (rule, url) => {
  * invalidated page outright); `Target.revalidate` keeps the plain `Date.now()` expiry
  * deliberately — an operator asking for a re-render is not asserting the content is wrong.
  */
+/**
+ * One probe of `url` under `rule`, outside any pass — the serve-time check's request (util/serveCheck.js).
+ * Same request, token scoping, extraction and status signals as the sweep's. Throws on fetch failure.
+ */
+export const probeRuleOnce = (rule, url) => probeOnce(rule, url);
+
+/**
+ * The page's own DOCUMENT, as the probe would fetch it (same User-Agent, the origin token same-origin only,
+ * gzip): `{ statusCode, headers, body }` with the body a STREAM, so the caller reads only as far as it
+ * needs (util/documentFacts.js `documentFactsFromStream`) and destroys the rest. Throws on fetch failure.
+ */
+export const probeDocument = (url) => probeRequest({ url, method: 'GET', headers: { accept: 'text/html' } }, url);
+
+/** The most recent anchor (the nightly update) at or before now in anchored mode, else NaN. */
+export const lastAnchorAt = () => (isAnchored() ? previousAnchorOccurrence() : NaN);
+
+/** Is this mapped field armed on THIS WORKER (not disarmed by its mapping-defect guard)? */
+export const isFieldArmed = (rule, field) => theMappingGuard().isArmed(rule, field);
+
+/**
+ * The labels of `rule`'s mapped fields disarmed ON THIS NODE: this worker's guard, plus what the node's
+ * last pass published (`lastRun.fieldGuard`). The guard lives with the sweep, on one worker, so a check
+ * running on any other worker must read the published state, or it would compare a field the guard
+ * stopped trusting and re-render pages for it on every window. Re-read at most every few seconds.
+ */
+export const disarmedFieldsOnNode = async (rule) => {
+	const out = new Set();
+	for (const field of rule.pageCheck?.fields ?? []) if (!isFieldArmed(rule, field)) out.add(field.label);
+	try {
+		const published = (await sweepStateForRenderCheck())?.sweep?.lastRun?.fieldGuard?.[rule.label];
+		for (const [label, state] of Object.entries(published ?? {})) if (state?.armed === false) out.add(label);
+	} catch {
+		// Unknown: this worker's own guard is what there is.
+	}
+	return out;
+};
+
+/**
+ * Are serve-time checks running for real (enabled and not a dry run)? Then the sweep leaves `share` of the
+ * node's budget to them and skips what they checked since the anchor.
+ */
+const serveChecksArmed = () =>
+	Boolean(
+		config.changeProbe.enabled && config.changeProbe.serveCheck?.enabled && !config.changeProbe.serveCheck.dryRun
+	);
+
 export const actOnChange = async (row) => {
 	const nowMs = Date.now();
 	const keys = cacheKeysOf(row.url);
@@ -835,7 +887,14 @@ const recheckRate = () => {
 	return Math.min(ceiling, Number(Atomics.load(cell, 1)) / 1000);
 };
 
-const reserveRecheckSlot = () => {
+const reserveRecheckSlot = () => reserveOriginSlot(RECHECK_MAX_WAIT_MS);
+
+/**
+ * A slot in the node's probe budget for an out-of-pass request, at most `maxWaitMs` away, or null (shed).
+ * The render re-check and the serve-time checks share it: only the headroom a running sweep leaves, the
+ * whole ceiling when none runs.
+ */
+export const reserveOriginSlot = (maxWaitMs) => {
 	const cell = originPaceCell();
 	const rate = recheckRate();
 	if (!(rate > 0)) return null;
@@ -844,7 +903,7 @@ const reserveRecheckSlot = () => {
 		const now = BigInt(Date.now());
 		const next = Atomics.load(cell, 0);
 		const slot = next > now ? next : now;
-		if (slot - now > BigInt(RECHECK_MAX_WAIT_MS)) return null;
+		if (slot - now > BigInt(maxWaitMs)) return null;
 		if (Atomics.compareExchange(cell, 0, next, slot + step) === next) return Number(slot);
 	}
 	return null;
@@ -1174,6 +1233,12 @@ export const runProbePass = async ({
 	// Skip a URL whose baseline was written at or after this instant (epoch ms): THIS pass, or the pass
 	// it resumes, already probed it. Null never skips — the canary's setting. See `processOne`.
 	skipProbedSince = null,
+	// Serve-time checks (util/serveCheck.js): `checkedAt(url)` resolves the last agreeing check (ms, NaN
+	// when none), a row checked at or after `skipCheckedSince` is skipped, and `recordCheck(url, basisAtMs)`
+	// records this pass's own agreeing comparisons. All null = the pre-feature pass.
+	checkedAt = null,
+	skipCheckedSince = null,
+	recordCheck = null,
 	backoffMax = 1,
 	abortAfterDistress = 0,
 	// Continuous mode. `cycleTarget` is the wall-clock budget for covering `sliceSize` matched
@@ -1265,6 +1330,16 @@ export const runProbePass = async ({
 		if (skipProbedSince !== null && Number.isFinite(stored?.probedAt) && stored.probedAt >= skipProbedSince) {
 			stats.fresh++;
 			return;
+		}
+		// CHECKED SINCE THE ANCHOR, by a serve-time check on any node or by this pass before a restart: the
+		// comparison this row would make has been made against the origin since the update. A local read of a
+		// replicated table instead of an origin request.
+		if (skipCheckedSince !== null && checkedAt) {
+			const at = await checkedAt(row.url);
+			if (at >= skipCheckedSince) {
+				stats.checkedOnDemand++;
+				return;
+			}
 		}
 		stats.probed++;
 		let observed;
@@ -1535,6 +1610,11 @@ export const runProbePass = async ({
 				// outruns the probe is exactly what the paced sweep exists to prevent.
 				await verify(row.url, stored.pageClaimAt);
 			}
+			// THE SAME PROOF, recorded as a CHECK (util/pageCheck.js) while serve-time checks are on: the serve
+			// path then spares a request for a page the pass just compared, and a restarted pass skips what it
+			// already checked since the anchor. Not a verification: it exempts nothing from an invalidation.
+			if (recordCheck && proof && !caughtUp && !mappedDisagrees)
+				await recordCheck(row.url, epochOf(stored.pageClaimAt));
 			return;
 		}
 		if (dryRun) {
@@ -2112,7 +2192,11 @@ const anchorKey = () => `anchored:${config.changeProbe.anchorTime}|${config.chan
 const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 	dryRun: typeof dryRunOverride === 'boolean' ? dryRunOverride : config.changeProbe.dryRun,
 	concurrency: config.changeProbe.concurrency,
-	ratePerSecond: config.changeProbe.ratePerSecond,
+	// While serve-time checks are armed the pass runs below the ceiling by their `share`, so its published
+	// headroom (`publishSweepHeadroom`) is at least that much and demand is checked during the pass, not after.
+	ratePerSecond: serveChecksArmed()
+		? Math.max(0.1, config.changeProbe.ratePerSecond * (1 - config.changeProbe.serveCheck.share))
+		: config.changeProbe.ratePerSecond,
 	backoffMax: config.changeProbe.backoffMax,
 	abortAfterDistress: config.changeProbe.abortAfterDistress,
 	// Continuous pacing, or zeroes — and zeroes are what make interval mode bit-identical: with
@@ -2306,6 +2390,11 @@ export const runProbeSweepOnce = async ({
 			submitTrigger: triggers.submit,
 			verify: writeVerification,
 			isArmed: verificationArmedFor,
+			// Serve-time checks: the pass records its own agreeing comparisons (dry run included — they are
+			// observations), and, once the checks are armed, skips what was checked since this pass began.
+			checkedAt: config.changeProbe.serveCheck?.enabled ? async (url) => (await readPageCheck(url)).checkedAtMs : null,
+			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
+			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
 			guard: theMappingGuard(),
 			...limits,
 			// Rows this pass (or the pass it resumes) already probed — see `processOne`. The same for a

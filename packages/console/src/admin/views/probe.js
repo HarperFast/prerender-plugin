@@ -276,6 +276,7 @@ export function render(ctx) {
 		configCard(status, model),
 		drift(ctx),
 		safetyCard(ctx),
+		serveCheckCard(ctx),
 		capacityCard(ctx, status, model.cluster),
 		...knobs,
 	];
@@ -1806,6 +1807,78 @@ function safetyCard(ctx) {
 }
 
 /** Per-rule canary verdicts, normalized over the node and cluster payload shapes. */
+// The outcomes a serve-time check can end in that asked the origin nothing (plugin v0.98.0+).
+const SERVE_CHECK_SKIPS = ['busy', 'shed', 'deduped', 'no-facts'];
+
+/**
+ * SERVE-TIME CHECKS (plugin v0.98.0+, `changeProbe.serveCheck`): a page served from cache, due a check, is
+ * served as before and checked in the background. `mismatch` is the number this panel exists for — a page
+ * that disagreed with the origin when a bot asked for it, expired and re-filed on the spot — and over the
+ * range it is what the pass alone would have left serving until it reached the page.
+ */
+function serveCheckCard(ctx) {
+	const data = ctx.data.analytics;
+	if (!data || data.available === false || windowEmpty(data)) return null;
+	const combos = pick(data, 'prerender_ops', (s) => s.path === 'serve_check');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('changeProbe.serveCheck.enabled')?.effective === true;
+	const dryRun = options.get('changeProbe.serveCheck.dryRun')?.effective !== false;
+	if (!enabled && !combos.length) return null;
+	const by = new Map();
+	const bySource = new Map();
+	for (const s of combos) {
+		const outcome = s.method ?? 'unknown';
+		by.set(outcome, (by.get(outcome) ?? 0) + s.count);
+		if (outcome === 'mismatch' || outcome === 'raw-mismatch') {
+			const source = s.type ?? 'unknown';
+			bySource.set(source, (bySource.get(source) ?? 0) + s.count);
+		}
+	}
+	const n = (key) => by.get(key) ?? 0;
+	const decided = n('agree') + n('mismatch') + n('raw-mismatch');
+	const skipped = SERVE_CHECK_SKIPS.reduce((acc, key) => acc + n(key), 0);
+	const errors = n('error') + n('read-error') + n('write-error');
+	return card(`Serve-time checks — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? (dryRun ? pill('dry run', 'info') : pill('armed', 'ok')) : pill('off', ''),
+			errors > 0 ? pill(`${fmtCount(errors)} error(s)`, 'bad') : null,
+			spacer(),
+		],
+		help: [
+			'A page served from cache that has not been checked since the nightly anchor (or within ',
+			el('code', { text: 'changeProbe.serveCheck.maxAge' }),
+			') is served as usual and checked against the origin in the background. A mismatch expires the page and ',
+			're-files its render. In a dry run nothing is asked: “would check” is the demand arming would serve, and ',
+			'its distinct URLs are the ',
+			el('code', { text: 'would-check' }),
+			' series of crawl breadth. Narrow the range to an hour to read mismatches by hour.',
+		],
+		body: [
+			stats([
+				dryRun && enabled
+					? stat('Would check', fmtCount(n('would-check')), 'requests to pages due a check')
+					: stat('Queued', fmtCount(n('queued')), 'checks the gate let through'),
+				stat(
+					'Agreed',
+					fmtCount(n('agree')),
+					decided ? `${pct(n('agree'), decided)} of decided` : 'recorded, asked once'
+				),
+				stat('Mismatched', fmtCount(n('mismatch')), 'expired and re-filed', { bad: n('mismatch') > 0 && !dryRun }),
+				stat('Raw deleted', fmtCount(n('raw-mismatch')), 'stored documents that disagreed'),
+				stat('Inconclusive', fmtCount(n('inconclusive')), 'nothing comparable'),
+				stat('Request failed', fmtCount(n('failed')), 'the origin did not answer usably'),
+				stat('Not asked', fmtCount(skipped), 'busy, shed, deduped, no facts'),
+			]),
+			bySource.size
+				? barList(
+						[...bySource].map(([label, value]) => ({ label: `mismatch · ${label}`, value })),
+						{ format: fmtCount }
+					)
+				: null,
+		],
+	});
+}
+
 function perRuleRows(status) {
 	const last = status.canary?.lastRun;
 	const hostname = status.node ?? 'this node';

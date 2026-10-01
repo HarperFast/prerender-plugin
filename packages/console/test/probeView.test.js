@@ -1577,3 +1577,49 @@ test('without the v0.97.0 series the Change safety card says so rather than show
 	const ctx = await ready();
 	assert.match(draw(ctx).textContent, /No action, anchor, detection-lag or render-check series/);
 });
+
+// ---- the Serve-time checks card (plugin v0.98.0, prerender_ops serve_check) ----
+
+/** A serve_check counter: one emit per decision, the outcome on method and the source on type. */
+const serveCheckEvents = (outcome, source, n) => ({
+	metric: 'prerender_ops',
+	path: 'serve_check',
+	method: outcome,
+	type: source,
+	count: n,
+	total: n,
+	counts: new Array(BUCKETS).fill(n / BUCKETS),
+	mean: 1,
+});
+
+const SERVE_CHECKS = {
+	...ANALYTICS,
+	series: [
+		...ANALYTICS.series,
+		serveCheckEvents('queued', 'api', 120),
+		serveCheckEvents('agree', 'api', 100),
+		serveCheckEvents('mismatch', 'api', 6),
+		serveCheckEvents('raw-mismatch', 'raw', 2),
+		serveCheckEvents('shed', 'api', 3),
+		serveCheckEvents('busy', 'api', 1),
+		serveCheckEvents('failed', 'document', 4),
+	],
+};
+
+test('the Serve-time checks card counts verdicts by outcome and names the source of each mismatch', async () => {
+	const ctx = await ready({ analytics: SERVE_CHECKS });
+	assert.equal(valueOf(ctx, 'Agreed'), '100');
+	assert.match(tile(ctx, 'Agreed').textContent, /93% of decided/);
+	assert.equal(valueOf(ctx, 'Mismatched'), '6');
+	assert.equal(valueOf(ctx, 'Raw deleted'), '2');
+	assert.equal(valueOf(ctx, 'Not asked'), '4');
+	assert.equal(valueOf(ctx, 'Request failed'), '4');
+	const text = draw(ctx).textContent;
+	assert.match(text, /mismatch · api/);
+	assert.match(text, /mismatch · raw/);
+});
+
+test('without the serve_check series and with the feature off, the card is not drawn', async () => {
+	const ctx = await ready();
+	assert.doesNotMatch(draw(ctx).textContent, /Serve-time checks/);
+});

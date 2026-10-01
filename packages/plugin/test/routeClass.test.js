@@ -580,3 +580,19 @@ test('route rawFacts: true = every head fact, an array is validated, a bad value
 		JSON.stringify(warnings)
 	);
 });
+
+test('route documentCheck: true = the listing facts, an array is validated, a bad value drops the FIELD only', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/listings/', documentCheck: true },
+				{ match: 'prefix', path: '/collections/', documentCheck: ['title', 'canonical'] },
+				{ match: 'prefix', path: '/products/', documentCheck: ['h1'] },
+			],
+		},
+	});
+	assert.deepEqual(matchRoute('/listings/shoes').documentCheck, ['title', 'metaDescription', 'canonical', 'itemList']);
+	assert.deepEqual(matchRoute('/collections/bath').documentCheck, ['title', 'canonical']);
+	assert.equal(matchRoute('/products/widget').documentCheck, null);
+	assert.equal(matchRoute('/products/widget').mode, 'prerender');
+});

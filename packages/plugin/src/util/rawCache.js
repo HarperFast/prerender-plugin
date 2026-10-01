@@ -252,11 +252,12 @@ export const storeRefusal = (resource, policy) => {
 	// `no-store` is the origin instructing caches not to keep this response AT ALL, and
 	// `assumeShared` does NOT override it: that setting answers "is this response the same for every
 	// crawler", which is a different question from "may it be kept". `private` is the explicit form
-	// of the sharedness claim, so that one yields.
+	// of the sharedness claim, so that one yields. Only `ignoreNoStore` — the deployment asserting
+	// that its origin sends `no-store` on documents a CDN keeps anyway — stores past it.
 	//
 	// `no-cache` is deliberately NOT refused: it means revalidate-before-use, not do-not-store, and
 	// refusing it would exclude most correctly-configured HTML.
-	if (hasCacheControlDirective(headers['cache-control'], 'no-store')) return 'no-store';
+	if (hasCacheControlDirective(headers['cache-control'], 'no-store') && !policy.ignoreNoStore) return 'no-store';
 	if (unshared === 'private' && !policy.assumeShared) return 'no-store';
 	// Only under `deviceIndependent`: with per-device keys a device-varying document is stored under
 	// the device that fetched it, which is correct. See `variesByDevice`.
@@ -533,6 +534,19 @@ export const captureForRawCache = (resource, { cacheKey, policy, factsWant = nul
 	// `releaseBody` replaced (util/upstream.js#releaseOriginBody): once a capture rides the body, an
 	// unsent response drains its branch instead of destroying the source out from under the capture.
 	return { ...resource, content: downstream, releaseBody: () => discardStream(downstream) };
+};
+
+/**
+ * Drop a stored document — a serve-time check found it disagreeing with the origin (util/serveCheck.js),
+ * so the next request proxies and re-captures. Never throws: a failed delete leaves a row that expires on
+ * its own, and the next check of it asks again.
+ */
+export const deleteRawPage = async (key) => {
+	try {
+		await table().delete(key);
+	} catch (e) {
+		logger.warn?.(`[prerender] raw document not deleted for ${key}: ${e?.message ?? String(e)}`);
+	}
 };
 
 /**

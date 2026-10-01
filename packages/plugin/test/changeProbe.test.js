@@ -3704,3 +3704,49 @@ test('E2: a window starting inside the spring-forward hole still arms a FUTURE r
 		await applyProbeConfig({ enabled: false });
 	}
 });
+
+// ---- serve-time checks: the pass records its agreements, and skips what was checked since it began ----
+
+test('an agreeing comparison is RECORDED as a check, whether or not an invalidation is armed — with the render basis', async () => {
+	const recorded = [];
+	const { verified } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
+		armed: false,
+		recordCheck: async (url, basisAtMs) => recorded.push({ url, basisAtMs }),
+	});
+	assert.deepEqual(verified, [], 'no invalidation armed: no verification, which would exempt from one');
+	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime() }]);
+});
+
+test('a comparison that never happened is not recorded as a check', async () => {
+	const recorded = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: null } },
+		armed: false,
+		recordCheck: async (url, basisAtMs) => recorded.push({ url, basisAtMs }),
+	});
+	assert.deepEqual(recorded, []);
+});
+
+test('a row checked since the pass began is skipped without a request; an older check is not', async () => {
+	const since = Date.now() - 60_000;
+	const probed = [];
+	const { stats } = await runVerifyPass({
+		rows: [row(URL_A), row(URL_B)],
+		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
+		stored: {},
+		armed: false,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return AGREE_SIG;
+		},
+		checkedAt: async (url) => (url === URL_A ? since + 1000 : since - 1000),
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_B]);
+	assert.equal(stats.checkedOnDemand, 1);
+});

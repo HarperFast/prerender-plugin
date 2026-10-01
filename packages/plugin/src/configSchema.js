@@ -114,7 +114,8 @@ export const configSchema = group('Prerender plugin configuration.', {
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
 					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
-					'rawCache?: boolean, rawFacts?: boolean | string[], negativeCache?: boolean, entityPrefix?: string }.\n\n' +
+					'rawCache?: boolean, rawFacts?: boolean | string[], documentCheck?: boolean | string[], ' +
+					'negativeCache?: boolean, entityPrefix?: string }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -204,6 +205,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'The scan stops once it has what was named, so name only what will be compared: on a template ' +
 					'whose head is mostly inline CSS, `[title, metaDescription, canonical]` reads ~1 KB where `true` ' +
 					'reads the whole head. Costs tens of microseconds per stored document, after the response.\n\n' +
+					'`documentCheck` (default off; requires `changeProbe.serveCheck`) \u2014 check a cached page on this ' +
+					'route against the ORIGIN DOCUMENT itself, for a route no `changeProbe` endpoint rule covers ' +
+					'(listing pages): the facts named (`true` = title, metaDescription, canonical and `itemList`) ' +
+					'are read off the served page and off the origin\u2019s document now, and compared, `itemList` ' +
+					'by price and availability of the products listed in both, so re-ranking is not a change.\n\n' +
 					'`negativeCache` (default false, prerender routes only, requires `render.negative.enabled`) — ' +
 					'whether a MISS on this route that the origin answers 404/410 stores that response, so the next ' +
 					'crawler asking for the same dead URL is answered without another origin round trip. Like ' +
@@ -1446,6 +1452,70 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'counts only and asks nothing. Outcomes are ' +
 					'`probe_render_mismatch`. Costs no read, write or request on a render that agrees.'
 			),
+			serveCheck: group(
+				'CHECK A CACHED PAGE AGAINST THE ORIGIN WHEN A BOT ASKS FOR IT (util/serveCheck.js), default off. ' +
+					'A page served from cache that has not been checked since the last anchor (`anchorTime`, the ' +
+					'nightly update), or, for the `sample` of URLs, within `maxAge`, is served as usual and ONE ' +
+					'check is queued in the background (stale-while-revalidate): the rule\u2019s endpoint for a URL a ' +
+					'`pageCheck` rule matches, or the document itself on a route with `documentCheck`. It is ' +
+					'compared with what the page actually served claims, read off the served bytes ' +
+					'(util/documentFacts.js), with the same comparators the sweep uses. Agreement is recorded ' +
+					'(`PageCheck`, replicated, so no node asks again for that page in the window); a ' +
+					'disagreement expires the page and re-files its render exactly as a detected change does.\n\n' +
+					'Nothing waits on it: the read, the scan and the queueing happen after the response, and the ' +
+					'request itself runs on the node-wide probe budget. While it is armed the sweep runs at ' +
+					'`ratePerSecond \u00d7 (1 \u2212 share)`, leaving `share` to the checks (all of it when no pass ' +
+					'runs), and skips every URL checked since the anchor, so the anchored round costs the origin no ' +
+					'more than the pass did, ordered by demand instead of by key. `maxAge` re-checks cost what they ' +
+					'cost: up to one request per requested page per window. Raw documents with stored facts ' +
+					'(`rawFacts`) are checked the same way, and a disagreeing one is deleted.\n\n' +
+					'`dryRun` counts what WOULD be checked (`serve_check` would-check, and its distinct URLs as the ' +
+					'`would-check` series of `/prerender_admin/crawl-breadth`) and asks nothing.',
+				{
+					enabled: option(false, 'Master switch. Off: nothing is read, queued or asked.'),
+					dryRun: option(
+						true,
+						'Count the checks that would run (`serve_check` outcome `would-check`, by source) and their ' +
+							'distinct URLs, and make no request, write or expiry.'
+					),
+					maxAge: option(
+						12 * HOUR,
+						'Re-check a page whose last check (or render) is older than this, even within one anchor ' +
+							'window, for the `sample` of URLs. 0 = only once per anchor window.',
+						{ unit: 'ms', min: 0 }
+					),
+					sample: option(
+						1,
+						'The fraction of URLs (stable, by hash) the `maxAge` re-check applies to. The anchor check ' +
+							'applies to every URL. Lower it to measure the intra-day change rate on a cohort before ' +
+							'paying for it everywhere.',
+						{ min: 0, max: 1 }
+					),
+					bots: option(
+						['*'],
+						'Bots whose requests may trigger a check, by the same names and rules as ' +
+							'`ingress.discoveryBots`. Every bot by default: a crawler that does not matter for ' +
+							'shopping still refreshes a page before one that does asks for it.'
+					),
+					share: option(
+						0.5,
+						'Of the node\u2019s `ratePerSecond`, the part the sweep leaves to these checks while it runs.',
+						{ min: 0, max: 1 }
+					),
+					maxPending: option(
+						1000,
+						'Checks queued per worker before more are dropped (`busy`). A dropped check is asked again ' +
+							'by the next request for that page.',
+						{ min: 1 }
+					),
+					maxWait: option(
+						10 * MINUTE,
+						'The longest a queued check waits for its slot in the node\u2019s probe budget before it is ' +
+							'shed (`shed`); the next request for the page queues it again.',
+						{ unit: 'ms', min: SECOND }
+					),
+				}
+			),
 			requestTimeout: option(10 * SECOND, 'Per-probe timeout, headers and body both.', {
 				unit: 'ms',
 				min: SECOND,
@@ -1653,6 +1723,17 @@ export const configSchema = group('Prerender plugin configuration.', {
 					['text/html'],
 					'Content types eligible for storage, matched against the leading type of the response ' +
 						'`content-type` (parameters ignored). Anything else is served and not stored.'
+				),
+				ignoreNoStore: option(
+					false,
+					'Store a document even when the origin sends `Cache-Control: no-store`. Off by default, and ' +
+						'`assumeShared` does not imply it: `no-store` is the origin asking caches not to keep the ' +
+						'response at all. It is a switch because some origins send it on every document while a CDN, ' +
+						'and this plugin\u2019s own page cache, keep them anyway; on such an origin a stored document is ' +
+						'no different from the pages already cached. Pair it with `rawFacts` and ' +
+						'`changeProbe.serveCheck` on a route where prices move, so a stored copy is checked against ' +
+						'the origin rather than trusted until it expires. Leave it off for an origin whose `no-store` ' +
+						'means something.'
 				),
 				assumeShared: option(
 					false,

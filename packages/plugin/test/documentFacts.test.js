@@ -460,3 +460,34 @@ test('bounds: maxBytes caps one oversized push and an inflate that would exceed 
 	assert.equal(r.outcome, 'truncated');
 	assert.ok(r.inflatedBytes <= 1024 * 1024, `inflated ${r.inflatedBytes}`);
 });
+
+test('documentFactsFromStream: the same facts as a body in hand, reading only as far as the head', async () => {
+	const { documentFactsFromStream } = await import('../src/util/documentFacts.js');
+	const { Readable } = await import('node:stream');
+	const html = Buffer.from(
+		doc(HEAD + ld(PRODUCT) + ld(CRUMBS), `<p>${randomBytes(200 * 1024).toString('base64')}</p>`)
+	);
+	const whole = documentFactsOf(html, { url: URL0 }).facts;
+	for (const [encoding, bytes] of [
+		[null, html],
+		['gzip', zlib.gzipSync(html)],
+		['br', zlib.brotliCompressSync(html)],
+	]) {
+		let read = 0;
+		const chunks = [];
+		for (let i = 0; i < bytes.length; i += 4096) chunks.push(bytes.subarray(i, i + 4096));
+		const stream = Readable.from(
+			(function* () {
+				for (const chunk of chunks) {
+					read += chunk.length;
+					yield chunk;
+				}
+			})()
+		);
+		const r = await documentFactsFromStream(stream, { contentEncoding: encoding });
+		assert.deepEqual(r.facts, whole, `${encoding ?? 'identity'}`);
+		assert.ok(read < bytes.length / 2, `${encoding ?? 'identity'}: read ${read} of ${bytes.length}`);
+	}
+	const corrupt = await documentFactsFromStream(Readable.from([Buffer.from('not gzip')]), { contentEncoding: 'gzip' });
+	assert.equal(corrupt.facts, null);
+});
