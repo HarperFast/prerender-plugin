@@ -123,7 +123,7 @@ const SNAPSHOT = (over = {}) =>
 let calls;
 let checks; // url -> a PageCheck record (util/pageCheck.js readPageCheck)
 let bases; // key -> the served copy's lastCached now (ms); absent = unchanged
-const NO_CHECK = { checkedAtMs: NaN, basisAtMs: NaN, outcome: null, field: null, evidence: null, signature: null };
+const NO_CHECK = { checkedAtMs: NaN, basisAtMs: NaN, outcome: null, field: null, evidence: null, observed: null };
 const check = (over) => ({ ...NO_CHECK, outcome: 'agree', ...over });
 const ANCHOR = Date.now() - 3 * 3600_000; // the nightly update, three hours ago
 

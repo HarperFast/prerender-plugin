@@ -11,6 +11,7 @@
  * that would otherwise be refused, because a check exempts nothing.
  */
 
+import { createHash } from 'node:crypto';
 import { metrics } from '../metrics.js';
 import { dateColumnMs } from './time.js';
 
@@ -23,16 +24,29 @@ export const NO_CHECK = Object.freeze({
 	outcome: null,
 	field: null,
 	evidence: null,
-	signature: null,
+	observed: null,
 });
 
-const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'signature'];
+const SELECT = ['url', 'checkedAt', 'basisAt', 'outcome', 'field', 'evidence', 'observed'];
 const stringOrNull = (value) => (typeof value === 'string' && value !== '' ? value : null);
+
+/**
+ * A probe observation (`ProbeState.signature`) as 16 characters: 96 bits of its SHA-256, base64url.
+ * This is what `PageCheck` stores of an agreeing check's observation, and all the sweep's skip needs:
+ * is it EXACTLY the baseline? An observation runs ~1 KB on a product endpoint (every SKU's tuple, the
+ * description, the breadcrumbs), and a row is written for nearly every URL the nightly pass probes and
+ * replicated to every node, so the observation itself was most of every row. Two different observations
+ * share a digest with probability ~2^-96; a collision would cost one skipped probe of one URL for one pass.
+ */
+export const observationDigest = (signature) =>
+	typeof signature === 'string' && signature !== ''
+		? createHash('sha256').update(signature).digest('base64url').slice(0, 16)
+		: null;
 
 /**
  * `url`'s last check: when it ran and the `lastCached` it covered (ms, NaN when never, unreadable, or the
  * read failed), its outcome, the field a disagreement named and the digest of what the origin said for it,
- * and an agreeing endpoint check's signature.
+ * and the digest of an agreeing endpoint check's observation (`observationDigest`).
  * A row written before `outcome` existed was an agreement. `select` is an array: a string projects to a
  * bare scalar.
  */
@@ -46,7 +60,7 @@ export const readPageCheck = async (url) => {
 			outcome: stringOrNull(row.outcome) ?? 'agree',
 			field: stringOrNull(row.field),
 			evidence: stringOrNull(row.evidence),
-			signature: stringOrNull(row.signature),
+			observed: stringOrNull(row.observed),
 		};
 	} catch (e) {
 		metrics.serveCheck('read-error', null);
@@ -72,14 +86,14 @@ export const coveredAt = (thresholdMs, lastCachedMs, check = NO_CHECK) =>
 export const checkSparesProbe = (check, stored, rule, sinceMs) =>
 	check.outcome === 'agree' &&
 	check.checkedAtMs >= sinceMs &&
-	check.signature !== null &&
+	check.observed !== null &&
 	typeof stored?.signature === 'string' &&
-	check.signature === stored.signature &&
+	check.observed === observationDigest(stored.signature) &&
 	stored.fingerprint === rule.fingerprint;
 
 /**
  * Record a check of the page whose `lastCached` was `basisAtMs`: `outcome` 'agree' (with the endpoint's
- * `signature` when there was one), 'mismatch' or 'held' (with the `field` and the digest of what the
+ * `signature` when there was one, stored as its digest), 'mismatch' or 'held' (with the `field` and the digest of what the
  * origin said for it, `evidence`), 'inconclusive' or 'failed'. Never throws.
  */
 export const writePageCheck = async (
@@ -96,7 +110,7 @@ export const writePageCheck = async (
 			outcome,
 			field: stringOrNull(field),
 			evidence: stringOrNull(evidence),
-			signature: stringOrNull(signature),
+			observed: observationDigest(signature),
 		});
 	} catch (e) {
 		metrics.serveCheck('write-error', null);
