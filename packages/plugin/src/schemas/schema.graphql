@@ -427,10 +427,11 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 	basisAt: Date
 }
 
-# THE LAST TIME A CACHED PAGE WAS CHECKED AGAINST THE ORIGIN AND AGREED (util/pageCheck.js), from any
-# source: the serve-time check (util/serveCheck.js), the nightly sweep, a raw-document check. The serve
-# path reads it to decide whether a page served now is due a check, and the sweep reads it to skip what
-# demand already checked since the anchor.
+# THE LAST TIME A CACHED PAGE WAS CHECKED AGAINST THE ORIGIN (util/pageCheck.js), from any source: the
+# serve-time check (util/serveCheck.js), the nightly sweep, a raw-document check. The serve path reads it
+# to decide whether a page served now is due a check (any decided check covers its window, so one URL is
+# asked once per window cluster-wide, whatever the verdict), and the sweep reads it to skip a row a check
+# has already observed EXACTLY as its baseline stands (`signature`) since the pass began.
 #
 # NOT `PageVerification`, and the separation is load-bearing. A verification EXEMPTS a page from a bulk
 # invalidation, and is written only by the rule whose own scope recorded that invalidation, only while
@@ -443,11 +444,24 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 # reads stay off page_cache. Keyed by URL with `basisAt` for per-device pages, exactly as PageVerification.
 type PageCheck @table(database: "verification", expiration: 604800) @sealed {
 	url: String @primaryKey
-	# When the check ran and agreed.
+	# When the check ran.
 	checkedAt: Date
 	# The `lastCached` of the page (or raw document) whose facts were compared: a key is covered only when
 	# its own `lastCached` is at least this.
 	basisAt: Date
+	# 'agree', 'mismatch' (acted on), 'held' (the same disagreement repeated by a page rendered after the
+	# last one, the origin unchanged — systematic, not a change, so not acted on again), or 'inconclusive'
+	# (nothing comparable).
+	outcome: String
+	# The field a disagreement named ('mismatch' and 'held'), and a digest of what the origin said for it:
+	# the same disagreement again, with the origin unchanged, on a page rendered after it, is `held`.
+	field: String
+	evidence: String
+	# An agreeing ENDPOINT check's observation, exactly as the sweep stores it (`ProbeState.signature`).
+	# The sweep skips a row only when this equals its own baseline: a check that agreed on the mapped
+	# fields says nothing about an unmapped slot, and only an identical observation says the probe would
+	# have found the row unchanged.
+	signature: String
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {

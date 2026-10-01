@@ -491,3 +491,29 @@ test('documentFactsFromStream: the same facts as a body in hand, reading only as
 	const corrupt = await documentFactsFromStream(Readable.from([Buffer.from('not gzip')]), { contentEncoding: 'gzip' });
 	assert.equal(corrupt.facts, null);
 });
+
+test('documentFactsOfYielding: the same result as documentFactsOf, with the event loop let in between rounds', async () => {
+	const { documentFactsOf, documentFactsOfYielding } = await import('../src/util/documentFacts.js');
+	// A head that is mostly inline CSS, and a fact behind it: several inflate rounds, several identity slices.
+	const html =
+		'<!doctype html><html><head><meta charset="utf-8"><title>T</title>' +
+		// Random class names, so the gzip body is large too (repeated CSS would fit the first prefix).
+		`<style>${Array.from({ length: 12_000 }, () => `.c${randomBytes(6).toString('hex')}{color:red}`).join('')}</style>` +
+		'<link rel="canonical" href="https://shop.example.com/c/x"><meta name="description" content="D">' +
+		'</head><body></body></html>';
+	const identity = Buffer.from(html);
+	const gzip = zlib.gzipSync(identity);
+	for (const [bytes, contentEncoding] of [
+		[identity, null],
+		[gzip, 'gzip'],
+	]) {
+		const sync = documentFactsOf(bytes, { contentEncoding });
+		let turns = 0;
+		const ticker = setInterval(() => turns++, 0);
+		const yielded = await documentFactsOfYielding(bytes, { contentEncoding });
+		clearInterval(ticker);
+		assert.deepEqual(yielded, sync);
+		assert.equal(sync.facts.canonical, 'https://shop.example.com/c/x');
+		assert.ok(turns > 0 || sync.outcome !== 'ok', `the loop ran between rounds (${contentEncoding ?? 'identity'})`);
+	}
+});

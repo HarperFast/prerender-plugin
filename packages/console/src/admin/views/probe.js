@@ -1806,9 +1806,8 @@ function safetyCard(ctx) {
 	});
 }
 
-/** Per-rule canary verdicts, normalized over the node and cluster payload shapes. */
 // The outcomes a serve-time check can end in that asked the origin nothing (plugin v0.98.0+).
-const SERVE_CHECK_SKIPS = ['busy', 'shed', 'deduped', 'no-facts'];
+const SERVE_CHECK_SKIPS = ['busy', 'shed', 'deduped', 'superseded', 'dropped', 'no-facts'];
 
 /**
  * SERVE-TIME CHECKS (plugin v0.98.0+, `changeProbe.serveCheck`): a page served from cache, due a check, is
@@ -1829,13 +1828,14 @@ function serveCheckCard(ctx) {
 	for (const s of combos) {
 		const outcome = s.method ?? 'unknown';
 		by.set(outcome, (by.get(outcome) ?? 0) + s.count);
-		if (outcome === 'mismatch' || outcome === 'raw-mismatch') {
+		if (outcome === 'mismatch' || outcome === 'raw-mismatch' || outcome === 'no-target') {
 			const source = s.type ?? 'unknown';
 			bySource.set(source, (bySource.get(source) ?? 0) + s.count);
 		}
 	}
 	const n = (key) => by.get(key) ?? 0;
-	const decided = n('agree') + n('mismatch') + n('raw-mismatch');
+	const acted = n('mismatch') + n('no-target');
+	const decided = n('agree') + acted + n('raw-mismatch') + n('held');
 	const skipped = SERVE_CHECK_SKIPS.reduce((acc, key) => acc + n(key), 0);
 	const errors = n('error') + n('read-error') + n('write-error');
 	return card(`Serve-time checks — ${scopeLabel(data)}`, {
@@ -1848,8 +1848,10 @@ function serveCheckCard(ctx) {
 			'A page served from cache that has not been checked since the nightly anchor (or within ',
 			el('code', { text: 'changeProbe.serveCheck.maxAge' }),
 			') is served as usual and checked against the origin in the background. A mismatch expires the page and ',
-			're-files its render. In a dry run nothing is asked: “would check” is the demand arming would serve, and ',
-			'its distinct URLs are the ',
+			're-files its render. “Held” is the same disagreement again on a page rendered after it, the origin ',
+			'unchanged: a mapping or a page type that cannot agree, worth a look, and not re-rendered again. In a dry ',
+			'run nothing is asked: “would check” counts requests to due pages (an upper bound on what arming would ',
+			'ask), and its distinct URLs are the ',
 			el('code', { text: 'would-check' }),
 			' series of crawl breadth. Narrow the range to an hour to read mismatches by hour.',
 		],
@@ -1863,11 +1865,16 @@ function serveCheckCard(ctx) {
 					fmtCount(n('agree')),
 					decided ? `${pct(n('agree'), decided)} of decided` : 'recorded, asked once'
 				),
-				stat('Mismatched', fmtCount(n('mismatch')), 'expired and re-filed', { bad: n('mismatch') > 0 && !dryRun }),
+				stat('Mismatched', fmtCount(acted), 'expired (and re-filed, with a Target)', {
+					bad: acted > 0 && !dryRun,
+				}),
 				stat('Raw deleted', fmtCount(n('raw-mismatch')), 'stored documents that disagreed'),
+				stat('Held', fmtCount(n('held')), 'the same disagreement after a re-render: systematic, not acted on', {
+					bad: n('held') > 0,
+				}),
 				stat('Inconclusive', fmtCount(n('inconclusive')), 'nothing comparable'),
-				stat('Request failed', fmtCount(n('failed')), 'the origin did not answer usably'),
-				stat('Not asked', fmtCount(skipped), 'busy, shed, deduped, no facts'),
+				stat('Request failed', fmtCount(n('failed') + n('throttled')), 'no usable answer, or the origin pushed back'),
+				stat('Not asked', fmtCount(skipped), 'busy, shed, deduped, superseded, dropped, no facts'),
 			]),
 			bySource.size
 				? barList(
@@ -1879,6 +1886,7 @@ function serveCheckCard(ctx) {
 	});
 }
 
+/** Per-rule canary verdicts, normalized over the node and cluster payload shapes. */
 function perRuleRows(status) {
 	const last = status.canary?.lastRun;
 	const hostname = status.node ?? 'this node';

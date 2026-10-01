@@ -1459,16 +1459,20 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'check is queued in the background (stale-while-revalidate): the rule\u2019s endpoint for a URL a ' +
 					'`pageCheck` rule matches, or the document itself on a route with `documentCheck`. It is ' +
 					'compared with what the page actually served claims, read off the served bytes ' +
-					'(util/documentFacts.js), with the same comparators the sweep uses. Agreement is recorded ' +
-					'(`PageCheck`, replicated, so no node asks again for that page in the window); a ' +
-					'disagreement expires the page and re-files its render exactly as a detected change does.\n\n' +
+					'(util/documentFacts.js), with the same comparators the sweep uses. Every verdict is recorded ' +
+					'(`PageCheck`, replicated, so no node asks again about that page in the window); a ' +
+					'disagreement expires the page and re-files its render exactly as a detected change does. The ' +
+					'same disagreement again on a page rendered after it, the origin unchanged, is systematic, not a ' +
+					'change: it is held (`serve_check` held) and not re-rendered again.\n\n' +
 					'Nothing waits on it: the read, the scan and the queueing happen after the response, and the ' +
-					'request itself runs on the node-wide probe budget. While it is armed the sweep runs at ' +
-					'`ratePerSecond \u00d7 (1 \u2212 share)`, leaving `share` to the checks (all of it when no pass ' +
-					'runs), and skips every URL checked since the anchor, so the anchored round costs the origin no ' +
-					'more than the pass did, ordered by demand instead of by key. `maxAge` re-checks cost what they ' +
-					'cost: up to one request per requested page per window. Raw documents with stored facts ' +
-					'(`rawFacts`) are checked the same way, and a disagreeing one is deleted.\n\n' +
+					'request itself runs on the node-wide probe budget, paused node-wide while the origin pushes ' +
+					'back. While it is armed a pass leaves the checks what they are using (up to `share` of ' +
+					'`ratePerSecond`; all of it when no pass runs), so the total stays at `ratePerSecond`, and the ' +
+					'sweep skips every URL a check observed exactly as its baseline stands since the pass began, so ' +
+					'the anchored round costs the origin no more than the pass did, ordered by demand instead of by ' +
+					'key. `maxAge` re-checks cost what they cost: up to one request per requested page per window. ' +
+					'Raw documents with stored facts (`rawFacts`) are checked the same way, and a disagreeing one is ' +
+					'deleted. The probe\u2019s own `dryRun` keeps these dry too.\n\n' +
 					'`dryRun` counts what WOULD be checked (`serve_check` would-check, and its distinct URLs as the ' +
 					'`would-check` series of `/prerender_admin/crawl-breadth`) and asks nothing.',
 				{
@@ -1499,7 +1503,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 					),
 					share: option(
 						0.5,
-						'Of the node\u2019s `ratePerSecond`, the part the sweep leaves to these checks while it runs.',
+						'Of the node\u2019s `ratePerSecond`, the most a running pass leaves to these checks (and the ' +
+							'render re-check). It leaves what they USE \u2014 twice their rate over the last few seconds, ' +
+							'at least a tenth of the ceiling \u2014 so a quiet afternoon costs the pass about 10%, and a ' +
+							'burst of due pages at the anchor gets up to this share within seconds. A pass never runs ' +
+							'below 1 request/s, so below a `ratePerSecond` of 2 it leaves nothing and checks wait for ' +
+							'the pass to end.',
 						{ min: 0, max: 1 }
 					),
 					maxPending: option(

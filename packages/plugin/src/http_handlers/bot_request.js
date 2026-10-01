@@ -114,27 +114,23 @@ const SNAPSHOT_SERVES = new Set(['hit', 'swr', 'verified']);
 
 /**
  * Hand a cache serve to the serve-time check (util/serveCheck.js): the served bytes for a snapshot (none
- * on a HEAD, which sends nothing and has nothing to read), the stored facts for a raw document.
+ * on a HEAD, which sends nothing and has nothing to read) with its headers as stored — parsed later, only
+ * when a check is due, never before this response — and the stored facts for a raw document.
  */
 function maybeServeCheck(resource, request, info, cacheUrl) {
 	if (!config.changeProbe.serveCheck?.enabled || info.source === 'origin') return;
 	const kind = SNAPSHOT_SERVES.has(info.cacheStatus) ? 'page' : info.cacheStatus === 'raw' ? 'raw' : null;
 	if (!kind || (kind === 'page' && request.method === 'HEAD')) return;
-	let headers = {};
-	try {
-		headers = typeof resource?.headers === 'string' ? JSON.parse(resource.headers) : (resource?.headers ?? {});
-	} catch {
-		headers = {};
-	}
 	considerServeCheck({
 		kind,
 		url: cacheUrl,
 		lastCachedMs: resource?.lastCached ? new Date(resource.lastCached).getTime() : NaN,
 		body: kind === 'page' ? info.cachedBody : undefined,
-		contentEncoding: headers['content-encoding'] ?? null,
-		contentType: headers['content-type'] ?? null,
+		headers: kind === 'page' ? (resource?.headers ?? null) : null,
+		cacheKey: kind === 'page' ? (info.cacheKey ?? resource?.cacheKey ?? null) : null,
 		facts: kind === 'raw' ? (resource?.facts ?? null) : null,
 		rawKey: kind === 'raw' ? (info.rawKey ?? null) : null,
+		deviceType: info.deviceType ?? null,
 		botName: request.botName,
 		route: info.route,
 	});

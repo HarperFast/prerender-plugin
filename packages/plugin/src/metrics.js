@@ -739,13 +739,21 @@ export const METRICS = Object.freeze({
 			'failed within the last 30s; filed here). A ' +
 			'sustained fell-back share is a peer the forward cannot reach; no rows means the peer token is unset. ' +
 			'serve_check = the serve-time check (changeProbe.serveCheck): would-check (dry run: a page served from ' +
-			'cache that is due a check), queued, then the verdict — agree (recorded in PageCheck), mismatch (the ' +
+			'cache that is due a check; counted once per URL per 5 minutes per worker, so an UPPER BOUND on the ' +
+			'requests armed checks would make — the distinct URLs are `would-check` in /prerender_admin/crawl-breadth), ' +
+			'queued, then the verdict — agree (recorded in PageCheck), mismatch (the ' +
 			'page disagreed with the origin and was expired and re-filed: THE NUMBER TO WATCH, by hour, since it is ' +
 			'what a page served from cache between two checks gets wrong), raw-mismatch (a stored raw document ' +
-			'disagreed and was deleted), inconclusive (nothing comparable), failed (the origin request failed); or ' +
-			'why nothing was asked — busy (queue full), shed (no budget slot in time), deduped (checked by another ' +
-			'worker or node meanwhile), no-facts (the served page states nothing comparable), read-error, ' +
-			'write-error, error.',
+			'disagreed and was deleted), held (the same field disagreed again on a page rendered after the last ' +
+			'mismatch: a systematic difference between page and origin, not a change, so not acted on — a sustained ' +
+			'count names a mapping or a page type to look at), inconclusive (nothing comparable), failed (the origin ' +
+			'request failed), throttled (the origin pushed back: out-of-pass requests on the node pause); or ' +
+			'why nothing was asked — busy (queue full), shed (no budget slot in time, or paused by pushback), deduped ' +
+			'(checked by another worker or node meanwhile), superseded (the served copy was re-rendered, re-captured ' +
+			'or removed while the check waited), dropped (checks were switched off or to dry run while it waited), ' +
+			'no-facts (the served page states nothing comparable), no-target (a page with no Target disagreed: ' +
+			'expired, nothing filed), suppressed (a suppressed Target\u2019s page disagreed: left to the suppression ' +
+			'path), read-error, write-error, error.',
 		caveats:
 			'Value semantics per series: unrouted, sitemap_*, the probe_* pass counters and the demand_* decision counters ' +
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +

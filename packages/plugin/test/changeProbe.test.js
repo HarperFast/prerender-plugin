@@ -1823,6 +1823,82 @@ test('cycle pacing belongs to the SWEEP — the canary must never inherit the sw
 	applyOptions({ changeProbe: { enabled: false } });
 });
 
+// ---- the out-of-pass budget: what a pass leaves, and the origin's pushback -----------------------
+
+test('a pass leaves out-of-pass requests what they USE, not `share` — and only while checks are really armed', async () => {
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false, share: 0.5 },
+	});
+	changeProbe.__resetOriginPaceForTest();
+	assert.equal(changeProbe.__passLimitsForTest(undefined).ratePerSecond, 10, 'the ceiling itself is not cut');
+	const reserve = changeProbe.__passLimitsForTest(undefined).reserveHeadroom;
+	assert.equal(typeof reserve, 'function');
+	// Idle: the floor (a tenth of the ceiling), not half of it.
+	assert.equal(reserve(), 1);
+	// Busy: twice what was used in the window, at most `share` of the ceiling.
+	for (let i = 0; i < 12; i++) assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	const busy = reserve();
+	assert.ok(busy > 1 && busy <= 5, `headroom ${busy}`);
+	// Not armed — a serve-check dry run, or the probe's own: the pass runs at the ceiling and leaves nothing.
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: true },
+	});
+	assert.equal(changeProbe.__passLimitsForTest(undefined).reserveHeadroom, null);
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: true,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false },
+	});
+	assert.equal(changeProbe.serveChecksArmed(), false, "the probe's dry run governs its checks");
+	assert.equal(changeProbe.__passLimitsForTest(undefined).reserveHeadroom, null);
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('the pass ceiling is lowered by the headroom it leaves, batch by batch', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const waits = [];
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => JSON.stringify([1]),
+		read: async () => null,
+		write: async () => {},
+		submitTrigger: async () => 'queued',
+		dryRun: false,
+		concurrency: 1,
+		ratePerSecond: 10,
+		reserveHeadroom: () => 6,
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		onPace: (rate) => waits.push(`rate ${rate}`),
+	});
+	assert.ok(waits.includes('rate 4'), JSON.stringify(waits));
+});
+
+test("the origin's pushback pauses every out-of-pass request on the node, and a healthy answer resets the escalation", async () => {
+	await applyProbeConfig({ enabled: true, ratePerSecond: 10 });
+	changeProbe.__resetOriginPaceForTest();
+	assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	changeProbe.noteOriginPushback(null);
+	assert.equal(changeProbe.reserveOriginSlot(60_000), null, 'paused: shed, not queued behind the pushback');
+	changeProbe.noteOriginHealthy();
+	assert.equal(changeProbe.reserveOriginSlot(60_000), null, 'a healthy answer does not cut a pause short');
+	changeProbe.__resetOriginPaceForTest();
+	assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
 // ---- cross-worker observability ------------------------------------------------------------
 
 /**
@@ -3707,17 +3783,17 @@ test('E2: a window starting inside the spring-forward hole still arms a FUTURE r
 
 // ---- serve-time checks: the pass records its agreements, and skips what was checked since it began ----
 
-test('an agreeing comparison is RECORDED as a check, whether or not an invalidation is armed — with the render basis', async () => {
+test('an agreeing comparison is RECORDED as a check, whether or not an invalidation is armed — with the render basis and the observation', async () => {
 	const recorded = [];
 	const { verified } = await runVerifyPass({
 		rows: [row(URL_A)],
 		answers: { [URL_A]: AGREE_SIG },
 		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
 		armed: false,
-		recordCheck: async (url, basisAtMs) => recorded.push({ url, basisAtMs }),
+		recordCheck: async (url, basisAtMs, options) => recorded.push({ url, basisAtMs, ...options }),
 	});
 	assert.deepEqual(verified, [], 'no invalidation armed: no verification, which would exempt from one');
-	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime() }]);
+	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG }]);
 });
 
 test('a comparison that never happened is not recorded as a check', async () => {
@@ -3732,21 +3808,77 @@ test('a comparison that never happened is not recorded as a check', async () => 
 	assert.deepEqual(recorded, []);
 });
 
-test('a row checked since the pass began is skipped without a request; an older check is not', async () => {
+// The fingerprint of the rule `runVerifyPass` compiles: a baseline stamped with it is comparable.
+const verifyRuleFingerprint = async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	return compileProbeRules([{ ...PAGECHECK_RULES[0], invalidateScope: 'route:prefix:/p/' }])[0].fingerprint;
+};
+
+test('a row a check OBSERVED EXACTLY AS ITS BASELINE STANDS since the pass began is skipped; anything less is probed', async () => {
+	const fingerprint = await verifyRuleFingerprint();
 	const since = Date.now() - 60_000;
+	const URL_C = 'https://example.com/product/prd-c/';
+	const URL_D = 'https://example.com/product/prd-d/';
+	const baseline = { signature: AGREE_SIG, fingerprint, probedAt: since - 3600_000 };
+	// A slot no mapped field reads moved (the first price): an agreement on the mapped fields says nothing about it.
+	const MOVED = JSON.stringify([44.99, 35.99, 35.99, true]);
+	const checks = {
+		[URL_A]: { outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }, // exactly the baseline
+		[URL_B]: { outcome: 'agree', checkedAtMs: since + 1000, signature: MOVED }, // agreed, but saw the slot move
+		[URL_C]: { outcome: 'agree', checkedAtMs: since - 1000, signature: AGREE_SIG }, // before the pass
+		[URL_D]: { outcome: 'mismatch', checkedAtMs: since + 1000, signature: null }, // not an agreement
+	};
 	const probed = [];
 	const { stats } = await runVerifyPass({
-		rows: [row(URL_A), row(URL_B)],
-		answers: { [URL_A]: AGREE_SIG, [URL_B]: AGREE_SIG },
-		stored: {},
+		rows: [row(URL_A), row(URL_B), row(URL_C), row(URL_D)],
+		answers: { [URL_A]: AGREE_SIG, [URL_B]: MOVED, [URL_C]: AGREE_SIG, [URL_D]: AGREE_SIG },
+		stored: { [URL_A]: baseline, [URL_B]: baseline, [URL_C]: baseline, [URL_D]: baseline },
+		armed: false,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return { [URL_B]: MOVED }[url] ?? AGREE_SIG;
+		},
+		readCheck: async (url) => checks[url],
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_B, URL_C, URL_D]);
+	assert.equal(stats.checkedOnDemand, 1);
+	assert.equal(stats.changed, 1, 'the moved slot is still detected — by the probe the skip would have spared');
+});
+
+test('no skip while a verification is armed for the rule: the probe writes that proof, a check cannot', async () => {
+	const fingerprint = await verifyRuleFingerprint();
+	const since = Date.now() - 60_000;
+	const probed = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, fingerprint, probedAt: NaN } },
+		armed: true,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return AGREE_SIG;
+		},
+		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }),
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_A]);
+});
+
+test('a baseline under another rule fingerprint is never spared by a check', async () => {
+	const since = Date.now() - 60_000;
+	const probed = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, fingerprint: 'edited-since', probedAt: NaN } },
 		armed: false,
 		probe: async (rule, url) => {
 			probed.push(url);
 			return AGREE_SIG;
 		},
-		checkedAt: async (url) => (url === URL_A ? since + 1000 : since - 1000),
+		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }),
 		skipCheckedSince: since,
 	});
-	assert.deepEqual(probed, [URL_B]);
-	assert.equal(stats.checkedOnDemand, 1);
+	assert.deepEqual(probed, [URL_A]);
 });

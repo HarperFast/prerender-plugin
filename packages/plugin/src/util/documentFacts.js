@@ -1428,8 +1428,35 @@ const inflatePrefix = (encoding, input, maxOutput) => {
  *
  * Identity bodies are scanned in place. A compressed body is inflated in growing prefixes (see the
  * module header), each round's NEW output fed to the same scanner, so the scan itself never repeats.
+ * Synchronous; `documentFactsOfYielding` is the same scan with the event loop let in between rounds.
  */
-export const documentFactsOf = (
+export const documentFactsOf = (bytes, options = {}) => {
+	const rounds = scanRounds(bytes, options);
+	for (;;) {
+		const step = rounds.next();
+		if (step.done) return step.value;
+	}
+};
+
+/**
+ * `documentFactsOf`, letting the event loop in between rounds (each inflate round, each 64 KB of an
+ * identity body): for a scan off the response path that may read far — a snapshot whose head is mostly
+ * inline CSS reads to `maxBytes` when a fact it is asked for is not there — so no one block of it holds
+ * the loop for the whole scan. Same result, byte for byte.
+ */
+export const documentFactsOfYielding = async (bytes, options = {}) => {
+	const rounds = scanRounds(bytes, options);
+	for (;;) {
+		const step = rounds.next();
+		if (step.done) return step.value;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+};
+
+const IDENTITY_SLICE = 64 * 1024;
+
+/** The scan as a generator: it yields between rounds and returns the result. */
+function* scanRounds(
 	bytes,
 	{
 		contentEncoding = null,
@@ -1438,11 +1465,14 @@ export const documentFactsOf = (
 		firstInflateBytes = FIRST_INFLATE_PREFIX,
 		want = HEAD_FACTS,
 	} = {}
-) => {
+) {
 	const scanner = createDocumentFactsScanner({ maxBytes, charset: charsetOfContentType(contentType), want });
 	const encoding = encodingOf(contentEncoding);
 	if (encoding === '') {
-		scanner.push(bytes);
+		for (let at = 0; at < bytes.length; at += IDENTITY_SLICE) {
+			if (!scanner.push(bytes.subarray(at, Math.min(bytes.length, at + IDENTITY_SLICE)))) break;
+			if (at + IDENTITY_SLICE < bytes.length) yield;
+		}
 		return { ...scanner.finish(), inflatedBytes: 0, compressedBytesRead: 0 };
 	}
 	if (!INFLATABLE.has(encoding)) {
@@ -1476,8 +1506,9 @@ export const documentFactsOf = (
 			return { ...scanner.finish(), inflatedBytes: inflated, compressedBytesRead: prefix };
 		}
 		prefix = Math.min(bytes.length, prefix * 2);
+		yield;
 	}
-};
+}
 
 const INFLATABLE = new Set(['gzip', 'x-gzip', 'deflate', 'br']);
 

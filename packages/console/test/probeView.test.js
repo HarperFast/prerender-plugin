@@ -1619,6 +1619,25 @@ test('the Serve-time checks card counts verdicts by outcome and names the source
 	assert.match(text, /mismatch · raw/);
 });
 
+test('held disagreements count as decided and are flagged; pushback is a failed request; a superseded check was not asked', async () => {
+	const analytics = {
+		...SERVE_CHECKS,
+		series: [
+			...SERVE_CHECKS.series,
+			serveCheckEvents('held', 'api', 2),
+			serveCheckEvents('no-target', 'api', 1),
+			serveCheckEvents('throttled', 'api', 1),
+			serveCheckEvents('superseded', 'api', 1),
+		],
+	};
+	const ctx = await ready({ analytics });
+	assert.equal(valueOf(ctx, 'Held'), '2');
+	assert.equal(valueOf(ctx, 'Mismatched'), '7', 'a page with no Target was still expired');
+	assert.match(tile(ctx, 'Agreed').textContent, /90% of decided/);
+	assert.equal(valueOf(ctx, 'Request failed'), '5');
+	assert.equal(valueOf(ctx, 'Not asked'), '5');
+});
+
 test('without the serve_check series and with the feature off, the card is not drawn', async () => {
 	const ctx = await ready();
 	assert.doesNotMatch(draw(ctx).textContent, /Serve-time checks/);

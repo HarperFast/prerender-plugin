@@ -60,7 +60,7 @@ import { CLUSTER_SCOPE, recordInvalidation, isScopeResolvable, resolveInvalidati
 import { dispatcherFor, configuredStagingIp } from './upstream.js';
 import { cacheKeysOf } from '../resources/Target.js';
 import { resolveVerification, writeVerification } from './pageVerification.js';
-import { readPageCheck, writePageCheck } from './pageCheck.js';
+import { checkSparesProbe, readPageCheck, writePageCheck } from './pageCheck.js';
 import { walkUrlRange } from './urlWalk.js';
 import { runDetached } from './detach.js';
 import { getSab } from './coordination.js';
@@ -247,6 +247,8 @@ const probeFetch = async (request, targetUrl) => {
 // product. 429 is explicit; 502/503/504 are an origin at or past its limit, and a probe sweep
 // that keeps its rate through them is adding load to something already failing.
 const DISTRESS_STATUS = new Set([429, 502, 503, 504]);
+/** Is this HTTP status the origin pushing back? The same set every probe request is judged by. */
+export const isDistressStatus = (statusCode) => DISTRESS_STATUS.has(statusCode);
 // undici's timeout/connection failures — the unstated version of the same signal.
 const DISTRESS_CODES = new Set([
 	'UND_ERR_HEADERS_TIMEOUT',
@@ -347,11 +349,24 @@ const probeOnce = async (rule, url) => {
 export const probeRuleOnce = (rule, url) => probeOnce(rule, url);
 
 /**
- * The page's own DOCUMENT, as the probe would fetch it (same User-Agent, the origin token same-origin only,
- * gzip): `{ statusCode, headers, body }` with the body a STREAM, so the caller reads only as far as it
- * needs (util/documentFacts.js `documentFactsFromStream`) and destroys the rest. Throws on fetch failure.
+ * The page's own DOCUMENT, as the probe would fetch it (the origin token same-origin only, gzip), with
+ * `deviceType`'s User-Agent (`origin.userAgents`, the miss proxy's) so a device-specific origin answers
+ * with the document the served page was rendered from: `{ statusCode, headers, body }` with the body a
+ * STREAM, so the caller reads only as far as it needs (util/documentFacts.js `documentFactsFromStream`)
+ * and destroys the rest. Throws on fetch failure.
  */
-export const probeDocument = (url) => probeRequest({ url, method: 'GET', headers: { accept: 'text/html' } }, url);
+export const probeDocument = (url, deviceType = null) =>
+	probeRequest(
+		{
+			url,
+			method: 'GET',
+			headers: {
+				'accept': 'text/html',
+				'user-agent': config.origin.userAgents[deviceType] ?? config.origin.userAgents.desktop,
+			},
+		},
+		url
+	);
 
 /** The most recent anchor (the nightly update) at or before now in anchored mode, else NaN. */
 export const lastAnchorAt = () => (isAnchored() ? previousAnchorOccurrence() : NaN);
@@ -361,15 +376,19 @@ export const isFieldArmed = (rule, field) => theMappingGuard().isArmed(rule, fie
 
 /**
  * The labels of `rule`'s mapped fields disarmed ON THIS NODE: this worker's guard, plus what the node's
- * last pass published (`lastRun.fieldGuard`). The guard lives with the sweep, on one worker, so a check
- * running on any other worker must read the published state, or it would compare a field the guard
- * stopped trusting and re-render pages for it on every window. Re-read at most every few seconds.
+ * running pass last beat (`progress.fieldGuard`), else what its last pass published (`lastRun.fieldGuard`).
+ * The guard lives with the sweep, on one worker, so a check running on any other worker must read the
+ * published state, or it would compare a field the guard stopped trusting and re-render pages for it on
+ * every window. Re-read at most every few seconds.
  */
 export const disarmedFieldsOnNode = async (rule) => {
 	const out = new Set();
 	for (const field of rule.pageCheck?.fields ?? []) if (!isFieldArmed(rule, field)) out.add(field.label);
 	try {
-		const published = (await sweepStateForRenderCheck())?.sweep?.lastRun?.fieldGuard?.[rule.label];
+		const sweep = (await sweepStateForRenderCheck())?.sweep;
+		// The running pass's beat is newer than the last pass's record.
+		const guards = (sweep?.running === true && sweep.progress?.fieldGuard) || sweep?.lastRun?.fieldGuard;
+		const published = guards?.[rule.label];
 		for (const [label, state] of Object.entries(published ?? {})) if (state?.armed === false) out.add(label);
 	} catch {
 		// Unknown: this worker's own guard is what there is.
@@ -378,40 +397,29 @@ export const disarmedFieldsOnNode = async (rule) => {
 };
 
 /**
- * Are serve-time checks running for real (enabled and not a dry run)? Then the sweep leaves `share` of the
- * node's budget to them and skips what they checked since the anchor.
+ * Are serve-time checks running for real (enabled, and neither they nor the probe in dry run)? Then a pass
+ * leaves them what they use of the node's budget (`outOfPassHeadroom`), and the sweep skips what they
+ * observed since it began. The probe's own dry run governs them too: a probe that is only measuring must
+ * not have its checks expiring pages.
  */
-const serveChecksArmed = () =>
+export const serveChecksArmed = () =>
 	Boolean(
-		config.changeProbe.enabled && config.changeProbe.serveCheck?.enabled && !config.changeProbe.serveCheck.dryRun
+		config.changeProbe.enabled &&
+			!config.changeProbe.dryRun &&
+			config.changeProbe.serveCheck?.enabled &&
+			!config.changeProbe.serveCheck.dryRun
 	);
 
 export const actOnChange = async (row) => {
 	const nowMs = Date.now();
-	const keys = cacheKeysOf(row.url);
-	const hardExpiredAt = nowMs - config.page.swrTtl;
-	const pages = await Promise.all(
-		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] }))
-	);
-	// EXPIRE FIRST: if anything below fails, the page has at least stopped serving known-wrong content,
-	// and the stale baseline makes the next probe act again. A page already expired this far (a change
-	// found again before its render landed) is not patched again — one replicated write per device
-	// page per change, not per detection. The key rides in the patch: a patch that races a delete (the
-	// target retired on another node) would otherwise store a page stub with no key.
-	await Promise.all(
-		pages.map(async (page, index) => {
-			if (!page) return;
-			const expiresAt = dateColumnMs(page.expiresAt);
-			if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
-			await pageTable().patch(keys[index], { cacheKey: keys[index], expiresAt: hardExpiredAt });
-		})
-	);
+	await expireChangedPages(row.url, nowMs);
 	// FILED AT THE CURRENT MINUTE, NEVER LATER THAN IT ALREADY WAS (`fileDueNow`). The current minute
 	// PER ACTION, not captured once for a pass (a pass runs for hours, and a stale minute ranks the row
 	// as if it had waited that long — the Target.revalidate lesson). A row already due keeps its due
 	// time and a change found again before its render landed keeps its first `changedAt`: re-filing
 	// either at "now" would move the page BACK in the queue on every pass that re-detected it. The probe
-	// runs on the owner, so the read that makes this possible is local.
+	// runs on the owner, so the read that makes this possible is local; a serve-time check runs anywhere,
+	// and `fileDueNow` forwards it to the owner.
 	//
 	// THE PAGE'S DEMAND GOES WITH THE MARK (`demandPeriod`): how often bots ask for it, from the demand
 	// tracker, so the queue can order changed pages by the origin visits their wait costs
@@ -425,6 +433,31 @@ export const actOnChange = async (row) => {
 		changedAt: nowMs,
 		demandPeriod: demand.known ? demand.periodMs : undefined,
 	});
+};
+
+/**
+ * Hard-expire every device page of `url` (past the stale-while-revalidate window, so none is served), the
+ * first half of `actOnChange`. Alone for a page known wrong that has no Target to re-file.
+ */
+export const expireChangedPages = async (url, nowMs = Date.now()) => {
+	const keys = cacheKeysOf(url);
+	const hardExpiredAt = nowMs - config.page.swrTtl;
+	const pages = await Promise.all(
+		keys.map((cacheKey) => pageTable().get({ id: cacheKey, select: ['cacheKey', 'expiresAt'] }))
+	);
+	// EXPIRE FIRST (`actOnChange` files after this): if the filing fails, the page has at least stopped
+	// serving known-wrong content, and the stale baseline makes the next probe act again. A page already expired this far (a change
+	// found again before its render landed) is not patched again — one replicated write per device
+	// page per change, not per detection. The key rides in the patch: a patch that races a delete (the
+	// target retired on another node) would otherwise store a page stub with no key.
+	await Promise.all(
+		pages.map(async (page, index) => {
+			if (!page) return;
+			const expiresAt = dateColumnMs(page.expiresAt);
+			if (Number.isFinite(expiresAt) && expiresAt <= hardExpiredAt) return;
+			await pageTable().patch(keys[index], { cacheKey: keys[index], expiresAt: hardExpiredAt });
+		})
+	);
 };
 
 /**
@@ -853,26 +886,42 @@ const RECHECK_MAX_PENDING = 256;
 const RECHECK_MAX_WAIT_MS = MINUTE;
 
 /**
- * THE RE-PROBES' PACE: NODE-WIDE, AND OUT OF THE SWEEP'S BUDGET, NOT BESIDE IT.
+ * THE OUT-OF-PASS REQUESTS' PACE: NODE-WIDE, AND OUT OF THE SWEEP'S BUDGET, NOT BESIDE IT.
  *
- * Node-wide because a render lands on whichever worker the fleet's POST reached, so a per-worker pace
- * would let sixteen workers send sixteen times the rate. Out of the sweep's budget because
- * `ratePerSecond` is the number agreed with whoever runs the origin: a re-probe paced at it beside a
- * sweep running at it is twice the agreed rate (review, round 3). So a running sweep publishes the
- * HEADROOM it leaves (`publishSweepHeadroom`: the ceiling minus the rate it is paced at, divided by
- * whatever backoff the origin or the node has imposed on it), and the re-probes share only that — none
- * while a sweep runs at the ceiling or the origin is pushing back, the whole ceiling when no sweep runs.
+ * Node-wide because a render lands on whichever worker the fleet's POST reached, and a bot on whichever
+ * worker Harper picked, so a per-worker pace would let sixteen workers send sixteen times the rate. Out of
+ * the sweep's budget because `ratePerSecond` is the number agreed with whoever runs the origin: a re-probe
+ * paced at it beside a sweep running at it is twice the agreed rate (review, round 3). So a running pass
+ * (the sweep or the canary) publishes the HEADROOM it leaves (`publishSweepHeadroom`: the ceiling minus the
+ * rate it is paced at, divided by whatever backoff the origin or the node has imposed on it), and the
+ * out-of-pass requests (the render re-check, the serve-time checks) share only that — the whole ceiling
+ * when no pass runs.
  *
- * One shared cell (`[nextSlot, headroom in milli-requests/s, when the sweep last published it]`, epoch
- * ms): each re-probe takes the next slot `1000 / headroom` ms on, by compare-and-swap, and waits for it —
- * or is shed (the pass will get to the URL) when that slot is more than `RECHECK_MAX_WAIT_MS` away. A
- * sweep that stops publishing (it ended, or its worker died) stops counting after `SWEEP_PACE_FRESH_MS`.
+ * WHAT A PASS LEAVES, while serve-time checks are armed: what they are USING, not what they might
+ * (`outOfPassHeadroom`). Twice the out-of-pass rate of the last few seconds, at least a floor and at most
+ * `serveCheck.share` of the ceiling — so the total never exceeds `ratePerSecond`, the checks can double
+ * their allowance every few seconds when a burst of due pages arrives (the anchor), and a quiet afternoon
+ * costs the pass a tenth of its rate, not `share` of it. Unarmed, a pass runs at the ceiling and leaves
+ * nothing, as before.
+ *
+ * PUSHBACK STOPS THEM. A serve-time check the origin answers 429/5xx, or that times out, pauses every
+ * out-of-pass request on the node (`noteOriginPushback`): twice as long per consecutive pushback, at
+ * least its `Retry-After`, at most five minutes, cleared by the next healthy answer. A pass backs off on its
+ * own (`stepBackoff`), and its published headroom shrinks with it.
+ *
+ * One shared cell, epoch ms: `[nextSlot, headroom in milli-requests/s, when a pass last published it,
+ * usage window start, requests in it, requests in the window before, paused until, pushback level]`.
+ * Each request takes the next slot `1000 / rate` ms on, by compare-and-swap, and waits for it — or is shed
+ * (the pass will get to the URL) when that slot is more than its `maxWaitMs` away. A pass that stops
+ * publishing (it ended, or its worker died) stops counting after `SWEEP_PACE_FRESH_MS`.
  */
 const SWEEP_PACE_FRESH_MS = 2 * MINUTE;
+const USAGE_WINDOW_MS = 5 * SECOND;
+const PUSHBACK_PAUSE_MAX_MS = 5 * MINUTE;
 let originPace = null;
-const originPaceCell = () => (originPace ??= new BigInt64Array(getSab('change_probe_origin_pace', 24)));
+const originPaceCell = () => (originPace ??= new BigInt64Array(getSab('change_probe_origin_pace_v2', 64)));
 
-/** The running sweep's share of the node's probe budget: what it leaves for the re-probes. Null = done. */
+/** A running pass's share of the node's probe budget: what it leaves out-of-pass. Null = done. */
 const publishSweepHeadroom = (headroom) => {
 	const cell = originPaceCell();
 	Atomics.store(cell, 1, BigInt(Math.max(0, Math.round((headroom ?? 0) * 1000))));
@@ -887,15 +936,66 @@ const recheckRate = () => {
 	return Math.min(ceiling, Number(Atomics.load(cell, 1)) / 1000);
 };
 
+/** Count one out-of-pass request in the usage window (approximate under a race; it only steers a rate). */
+const noteOutOfPassRequest = (cell, nowMs) => {
+	const start = Atomics.load(cell, 3);
+	if (nowMs - Number(start) >= USAGE_WINDOW_MS && Atomics.compareExchange(cell, 3, start, BigInt(nowMs)) === start) {
+		const finished = Atomics.exchange(cell, 4, 0n);
+		Atomics.store(cell, 5, nowMs - Number(start) >= 2 * USAGE_WINDOW_MS ? 0n : finished);
+	}
+	Atomics.add(cell, 4, 1n);
+};
+
+/** Out-of-pass requests per second over the last one to two usage windows. */
+export const outOfPassRate = (nowMs = Date.now()) => {
+	const cell = originPaceCell();
+	const elapsed = nowMs - Number(Atomics.load(cell, 3));
+	if (!(elapsed >= 0) || elapsed >= 2 * USAGE_WINDOW_MS) return 0;
+	const current = Number(Atomics.load(cell, 4));
+	if (elapsed >= USAGE_WINDOW_MS) return (current / elapsed) * 1000;
+	return ((Number(Atomics.load(cell, 5)) + current) / (USAGE_WINDOW_MS + elapsed)) * 1000;
+};
+
+/** What a pass leaves out-of-pass while serve-time checks are armed (see above), in requests per second. */
+export const outOfPassHeadroom = (nowMs = Date.now()) => {
+	const ceiling = Math.max(0, config.changeProbe.ratePerSecond);
+	const most = ceiling * (config.changeProbe.serveCheck?.share ?? 0);
+	const floor = Math.min(most, Math.max(0.1, ceiling * 0.1));
+	return Math.min(most, Math.max(floor, 2 * outOfPassRate(nowMs)));
+};
+
+/**
+ * The origin pushed back on an out-of-pass request (a 429/5xx, a timeout): pause them all on this node,
+ * twice as long per consecutive pushback, at least `retryAfterMs`. See above.
+ */
+export const noteOriginPushback = (retryAfterMs = null) => {
+	const cell = originPaceCell();
+	const level = Math.min(16, Number(Atomics.add(cell, 7, 1n)) + 1);
+	const pause = Math.min(PUSHBACK_PAUSE_MAX_MS, Math.max(retryAfterMs ?? 0, SECOND * 2 ** (level - 1)));
+	const until = BigInt(Date.now() + pause);
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const current = Atomics.load(cell, 6);
+		if (current >= until || Atomics.compareExchange(cell, 6, current, until) === current) break;
+	}
+};
+
+/** An out-of-pass request was answered normally: the pushback level starts over. */
+export const noteOriginHealthy = () => {
+	const cell = originPaceCell();
+	if (Atomics.load(cell, 7) !== 0n) Atomics.store(cell, 7, 0n);
+};
+
 const reserveRecheckSlot = () => reserveOriginSlot(RECHECK_MAX_WAIT_MS);
 
 /**
  * A slot in the node's probe budget for an out-of-pass request, at most `maxWaitMs` away, or null (shed).
- * The render re-check and the serve-time checks share it: only the headroom a running sweep leaves, the
- * whole ceiling when none runs.
+ * The render re-check and the serve-time checks share it: only the headroom a running pass leaves, the
+ * whole ceiling when none runs, nothing while the origin's pushback pauses them.
  */
 export const reserveOriginSlot = (maxWaitMs) => {
 	const cell = originPaceCell();
+	const nowMs = Date.now();
+	if (Number(Atomics.load(cell, 6)) > nowMs) return null;
 	const rate = recheckRate();
 	if (!(rate > 0)) return null;
 	const step = BigInt(Math.max(1, Math.ceil(1000 / rate)));
@@ -904,7 +1004,10 @@ export const reserveOriginSlot = (maxWaitMs) => {
 		const next = Atomics.load(cell, 0);
 		const slot = next > now ? next : now;
 		if (slot - now > BigInt(maxWaitMs)) return null;
-		if (Atomics.compareExchange(cell, 0, next, slot + step) === next) return Number(slot);
+		if (Atomics.compareExchange(cell, 0, next, slot + step) === next) {
+			noteOutOfPassRequest(cell, Number(now));
+			return Number(slot);
+		}
 	}
 	return null;
 };
@@ -1233,12 +1336,16 @@ export const runProbePass = async ({
 	// Skip a URL whose baseline was written at or after this instant (epoch ms): THIS pass, or the pass
 	// it resumes, already probed it. Null never skips — the canary's setting. See `processOne`.
 	skipProbedSince = null,
-	// Serve-time checks (util/serveCheck.js): `checkedAt(url)` resolves the last agreeing check (ms, NaN
-	// when none), a row checked at or after `skipCheckedSince` is skipped, and `recordCheck(url, basisAtMs)`
+	// Serve-time checks (util/serveCheck.js): `readCheck(url)` resolves the URL's last check
+	// (util/pageCheck.js `readPageCheck`), a row a check observed exactly as its baseline stands at or after
+	// `skipCheckedSince` is skipped (`checkSparesProbe`), and `recordCheck(url, basisAtMs, { signature })`
 	// records this pass's own agreeing comparisons. All null = the pre-feature pass.
-	checkedAt = null,
+	readCheck = null,
 	skipCheckedSince = null,
 	recordCheck = null,
+	// Requests per second to leave out of `ratePerSecond` for out-of-pass requests, re-read every batch
+	// (`outOfPassHeadroom`), or null to run at the ceiling.
+	reserveHeadroom = null,
 	backoffMax = 1,
 	abortAfterDistress = 0,
 	// Continuous mode. `cycleTarget` is the wall-clock budget for covering `sliceSize` matched
@@ -1331,12 +1438,15 @@ export const runProbePass = async ({
 			stats.fresh++;
 			return;
 		}
-		// CHECKED SINCE THE ANCHOR, by a serve-time check on any node or by this pass before a restart: the
-		// comparison this row would make has been made against the origin since the update. A local read of a
-		// replicated table instead of an origin request.
-		if (skipCheckedSince !== null && checkedAt) {
-			const at = await checkedAt(row.url);
-			if (at >= skipCheckedSince) {
+		// OBSERVED SINCE THE PASS BEGAN, EXACTLY AS THE BASELINE STANDS — by a serve-time check on any node, or
+		// by this pass before a restart: the probe this row would make has been made, and it would find the
+		// row unchanged on every slot (`checkSparesProbe`). A local read of a replicated table instead of an
+		// origin request. Not an agreement on the mapped fields alone: a slot the page does not show (a
+		// regular price beside the sale price, a status flag) can move while every mapped field agrees, and
+		// only this probe would see it. Not while a verification is armed for the rule's scope either: the
+		// probe's quiet observation is what writes it (below), and a check cannot stand in for that proof.
+		if (skipCheckedSince !== null && readCheck && stored?.signature && !(await isVerificationArmed(rule))) {
+			if (checkSparesProbe(await readCheck(row.url), stored, rule, skipCheckedSince)) {
 				stats.checkedOnDemand++;
 				return;
 			}
@@ -1613,8 +1723,10 @@ export const runProbePass = async ({
 			// THE SAME PROOF, recorded as a CHECK (util/pageCheck.js) while serve-time checks are on: the serve
 			// path then spares a request for a page the pass just compared, and a restarted pass skips what it
 			// already checked since the anchor. Not a verification: it exempts nothing from an invalidation.
+			// The observation goes with it: it is the baseline now (written above when it moved), which is what
+			// lets a restarted pass skip the row (`checkSparesProbe`).
 			if (recordCheck && proof && !caughtUp && !mappedDisagrees)
-				await recordCheck(row.url, epochOf(stored.pageClaimAt));
+				await recordCheck(row.url, epochOf(stored.pageClaimAt), { signature: observed });
 			return;
 		}
 		if (dryRun) {
@@ -1716,7 +1828,8 @@ export const runProbePass = async ({
 			elapsed: now() - passStarted,
 			cycleTarget,
 		});
-		const { rate, behind } = pacedRate({ ratePerSecond, cycleRate });
+		const ceiling = reserveHeadroom ? Math.max(0.1, ratePerSecond - reserveHeadroom()) : ratePerSecond;
+		const { rate, behind } = pacedRate({ ratePerSecond: ceiling, cycleRate });
 		if (behind && cycleTarget > 0 && sliceSize > 0) stats.behindBatches++;
 		stats.pacedRate = rate;
 		onPace(rate, throttle, loadThrottle);
@@ -2192,11 +2305,11 @@ const anchorKey = () => `anchored:${config.changeProbe.anchorTime}|${config.chan
 const passLimits = (dryRunOverride, { paced = false } = {}) => ({
 	dryRun: typeof dryRunOverride === 'boolean' ? dryRunOverride : config.changeProbe.dryRun,
 	concurrency: config.changeProbe.concurrency,
-	// While serve-time checks are armed the pass runs below the ceiling by their `share`, so its published
-	// headroom (`publishSweepHeadroom`) is at least that much and demand is checked during the pass, not after.
-	ratePerSecond: serveChecksArmed()
-		? Math.max(0.1, config.changeProbe.ratePerSecond * (1 - config.changeProbe.serveCheck.share))
-		: config.changeProbe.ratePerSecond,
+	ratePerSecond: config.changeProbe.ratePerSecond,
+	// While serve-time checks are armed the pass runs below the ceiling by what they are using
+	// (`outOfPassHeadroom`, re-read every batch), so its published headroom covers them and demand is
+	// checked during the pass, not after.
+	reserveHeadroom: serveChecksArmed() ? outOfPassHeadroom : null,
 	backoffMax: config.changeProbe.backoffMax,
 	abortAfterDistress: config.changeProbe.abortAfterDistress,
 	// Continuous pacing, or zeroes — and zeroes are what make interval mode bit-identical: with
@@ -2352,6 +2465,12 @@ export const runProbeSweepOnce = async ({
 			lastBeat = { at: now, probed };
 			return {
 				examinedApprox: Number.isFinite(live?.examined) ? live.examined : 0,
+				// Where each mapped field's guard stands NOW, for the checks on every other worker
+				// (`disarmedFieldsOnNode`): a field disarmed mid-pass stops being compared within a beat, not
+				// when the pass ends — or never, for a pass that dies.
+				...(rules.some((rule) => rule.pageCheck?.fields?.length)
+					? { fieldGuard: theMappingGuard().snapshot(rules) }
+					: {}),
 				...passProgress(live, {
 					phase,
 					recentRate,
@@ -2392,7 +2511,7 @@ export const runProbeSweepOnce = async ({
 			isArmed: verificationArmedFor,
 			// Serve-time checks: the pass records its own agreeing comparisons (dry run included — they are
 			// observations), and, once the checks are armed, skips what was checked since this pass began.
-			checkedAt: config.changeProbe.serveCheck?.enabled ? async (url) => (await readPageCheck(url)).checkedAtMs : null,
+			readCheck: config.changeProbe.serveCheck?.enabled ? readPageCheck : null,
 			skipCheckedSince: serveChecksArmed() ? (resume?.originStartedAt ?? startedAt) : null,
 			recordCheck: config.changeProbe.serveCheck?.enabled ? writePageCheck : null,
 			guard: theMappingGuard(),
@@ -2735,7 +2854,17 @@ export const runProbeCanaryOnce = async ({ dryRun, startedBy = null } = {}) => {
 				inScope: probeScopeFilter(config.changeProbe),
 				onStart: (running) => (canaryLive = running),
 				onBatch: () => emit(canaryCounts()),
+				// The canary's requests count against the node's budget like the sweep's, so it publishes the
+				// headroom it leaves too — otherwise out-of-pass requests take the whole ceiling beside it. A
+				// sweep running on this worker publishes already, and its number stands.
+				onPace: (rate, originThrottle, loadThrottle) => {
+					if (sweepRunning) return;
+					publishSweepHeadroom(
+						Math.max(0, config.changeProbe.ratePerSecond - rate) / Math.max(1, originThrottle * loadThrottle)
+					);
+				},
 			});
+			if (!sweepRunning) publishSweepHeadroom(null);
 			await canaryTriggers.drain();
 			if (config.changeProbe.enabled) await canaryTriggers.retryFailed();
 			stats.triggered = canaryTriggers.stats.triggered;
@@ -3883,6 +4012,8 @@ export const __checkResumeForTest = checkResume;
 
 /** Tests only — the limits builder, so the sweep/canary split is assertable without a live pass. */
 export const __passLimitsForTest = passLimits;
+/** Tests only — a clean out-of-pass budget cell: no published headroom, no usage, no pause. */
+export const __resetOriginPaceForTest = () => originPaceCell().fill(0n);
 
 /** Tests only — the process's mapping guard, as the sweep and canary get it (live config, real warning). */
 export const __mappingGuardForTest = theMappingGuard;
