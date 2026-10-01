@@ -215,6 +215,8 @@ export function sourcesOf(results, { mode, scope = 'cluster', extra = null } = {
 		status: r.status ?? 0,
 		error: r.error ?? null,
 		ms: Number.isFinite(r.ms) ? r.ms : null,
+		// How long ago the console's read cache fetched this node's answer; null when it was read now.
+		ageMs: Number.isFinite(r.ageMs) ? r.ageMs : null,
 	}));
 	const answered = nodes.filter((n) => n.ok).length;
 	return {

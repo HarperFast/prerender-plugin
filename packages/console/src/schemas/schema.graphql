@@ -1,0 +1,37 @@
+# Prerender console schema: the read cache, and nothing else. Everything the console shows lives
+# on the prerender cluster it points at; this database only holds recent answers from it.
+#
+#   prerender_console  ProxyRead,       — upstream GET answers, node-local (src/util/readCache.js)
+#                      ConsoleAnchor      (+ an empty replicated anchor, see the type)
+
+# One upstream answer per URL the console asked (origin + route + query), plus one reserved row,
+# `write-generation`, stamped by every state-changing POST.
+#
+# NODE-LOCAL, UNAUDITED, UNEXPORTED. Every worker on this host shares it — that is the point; a
+# module-level Map would be per worker, and Harper spreads connections across workers. It is not
+# replicated: a second console host has its own operators and its own cache. It is not audited: a
+# crash then loses rows written since the last flush, which for a cache costs one re-read, whereas
+# auditing would write every cached body to the transaction log as well. It has no `@export`, so
+# nothing reaches it over REST; it is read and written only by the console's own proxy.
+#
+# `expiration` reclaims rows the route TTLs (at most 10 minutes) have long since stopped serving. It
+# must stay above the longest TTL, or a row would vanish while still servable; a test pins that.
+type ProxyRead @table(database: "prerender_console", replicate: false, audit: false, expiration: 3600) @sealed {
+	key: String @primaryKey
+	# The upstream's JSON body, verbatim. Null on the generation row.
+	body: String
+	contentType: String
+	# When the console sent the request (epoch ms). Compared with the write generation.
+	startedAt: Float
+	# When the DATA was produced: `startedAt` less the upstream's own `cacheAgeMs`, where it reports one.
+	# Freshness runs from here, so the console's TTL and the plugin's do not stack.
+	bornAt: Float
+}
+
+# DELIBERATELY EMPTY, AND REPLICATED — the anchor that keeps this database subscribable on a
+# replicated console cluster. A database whose tables are all `replicate: false` gives replication's
+# subscription nothing to attach to, and the link loops disconnect/retry (harper-pro#685; the plugin's
+# `coordination` database carries the same anchor). Never written, so it costs nothing.
+type ConsoleAnchor @table(database: "prerender_console") @sealed {
+	id: Int @primaryKey
+}
