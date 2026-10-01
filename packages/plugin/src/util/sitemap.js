@@ -1,5 +1,6 @@
 import { XMLParser } from 'fast-xml-parser';
 import { canonicalizeUrl } from './url.js';
+import { CacheKey, MAX_KEY_BYTES } from './cacheKey.js';
 import { classifyPath, PASSTHROUGH, PRERENDER, UNCLASSIFIED } from './routeClass.js';
 
 const parser = new XMLParser({
@@ -91,8 +92,9 @@ const assertComplete = (xml, root, parsed) => {
  *     same way the bot read keys it, so the prune diff and the target keys built from it match
  *     what a request will look up.
  *   - `filtered`  — per-class counts of entries deliberately left out.
- *   - `invalid`   — `{ loc, message }` for entries whose URL won't parse, so one bad `<loc>`
- *     reports itself instead of aborting a refresh over millions of good ones.
+ *   - `invalid`   — `{ loc, message }` for entries whose URL won't parse or is too long to be a
+ *     cache key, so one bad `<loc>` reports itself instead of aborting a refresh over millions of
+ *     good ones.
  *   - `routes`    — every route (`routeKey`) the document's entries fall on, filtered ones included.
  *
  * Pure and dependency-free (both helpers it uses are pure), so it is unit-testable — unlike
@@ -126,7 +128,17 @@ export const partitionSitemapEntries = (entries) => {
 				filtered[routeClass]++;
 				continue;
 			}
-			incoming.set(canonicalizeUrl(entry.loc, queryParams), entry);
+			const cacheUrl = canonicalizeUrl(entry.loc, queryParams);
+			// Invalid, not filtered: no route decision could make it cacheable. Caught here because the
+			// ingest's `Target.get` would throw on it, and a throw there ends the child's ingest partway.
+			if (!CacheKey.fitsKeyLimit(cacheUrl)) {
+				invalid.push({
+					loc: entry.loc,
+					message: `too long to be a cache key (${Buffer.byteLength(cacheUrl)} bytes; the limit is ${MAX_KEY_BYTES})`,
+				});
+				continue;
+			}
+			incoming.set(cacheUrl, entry);
 		} catch (e) {
 			invalid.push({ loc: entry?.loc, message: e?.message ?? String(e) });
 		}

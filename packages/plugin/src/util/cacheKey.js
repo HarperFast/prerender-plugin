@@ -1,6 +1,18 @@
 import { config } from '../config.js';
 
 /**
+ * HARPER'S PRIMARY-KEY LIMIT: a key must encode to at most this many bytes (`MAX_KEY_BYTES` in
+ * Harper's `resources/Table.ts`, 5.x). A read or write keyed by anything longer throws a 400
+ * `ClientError` ("Primary key size is too large") before it touches storage, so an over-limit URL
+ * cannot be cached, scheduled or recorded at all — only proxied. Ordered-binary encodes a string as its
+ * UTF-8 bytes, plus an escape byte per character up to U+0004 in a short string and one leading byte when
+ * the first character is below U+001C. A canonical URL is printable ASCII starting with `h` (WHATWG `URL`
+ * percent-encodes every control and non-ASCII character), so for these keys the UTF-8 length is the exact
+ * encoded length — pinned against the encoder in test/cacheKey.test.js.
+ */
+export const MAX_KEY_BYTES = 1978;
+
+/**
  * Builds and parses cache keys. The delimiter and attribute list come from
  * `config.cacheKey` and are read lazily so host overrides apply.
  */
@@ -22,6 +34,41 @@ export class CacheKey {
 
 	static extractUrl(cacheKey) {
 		return cacheKey.substring(0, cacheKey.indexOf(config.cacheKey.delimiter));
+	}
+
+	/** True when this one key fits `MAX_KEY_BYTES` (see `fitsKeyLimit` for the URL-level bound). */
+	static keyFits(key) {
+		const str = String(key ?? '');
+		if (str.length * 3 <= MAX_KEY_BYTES) return true;
+		if (str.length > MAX_KEY_BYTES) return false;
+		return Buffer.byteLength(str) <= MAX_KEY_BYTES;
+	}
+
+	/**
+	 * True when every table key this canonical URL can produce fits `MAX_KEY_BYTES`. The longest is
+	 * its cacheKey for the longest supported device — `Target`, `ProbeState` and a URL-keyed
+	 * `RenderSchedule` row use the bare URL, the page, raw and negative caches the cacheKey — so the
+	 * bound is checked where a URL arrives (bot request, sitemap ingest, redirect destination). A Target
+	 * created before that check may still be one of the URLs that fit while their page keys do not, so the
+	 * key lists in resources/Target.js leave out any key past the limit and the render-result path retires
+	 * such a target. Counted in UTF-16 units first: nearly every URL is decided without measuring its
+	 * bytes, since a unit costs at least one UTF-8 byte and at most three.
+	 */
+	static fitsKeyLimit(url) {
+		const str = String(url ?? '');
+		// Everything a cacheKey adds to the URL: a delimiter per extra attribute, and the device when
+		// it is one of them (`toCacheKey` is only ever handed a url and a deviceType).
+		const { delimiter, attributes } = config.cacheKey;
+		let device = '';
+		if (attributes.includes('deviceType')) {
+			for (const d of config.deviceTypes.supported) if (d.length > device.length) device = d;
+		}
+		const delimiters = Math.max(0, attributes.length - 1);
+		const units = str.length + delimiters * delimiter.length + device.length;
+		if (units * 3 <= MAX_KEY_BYTES) return true;
+		if (units > MAX_KEY_BYTES) return false;
+		const bytes = Buffer.byteLength(str) + delimiters * Buffer.byteLength(delimiter) + Buffer.byteLength(device);
+		return bytes <= MAX_KEY_BYTES;
 	}
 
 	// ── schedule keys ──────────────────────────────────────────────────────────────────────────

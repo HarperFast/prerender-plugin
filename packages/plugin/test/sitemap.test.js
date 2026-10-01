@@ -180,6 +180,32 @@ test('one malformed <loc> is reported without losing the good entries', () => {
 	assert.ok(invalid[0].message);
 });
 
+test('a <loc> too long to be a cache key is reported invalid, and the rest of the sitemap still lands', () => {
+	// The ingest's Target.get would throw on its key — Harper refuses a key past its limit — and a throw
+	// there ended the child's ingest partway, losing every entry after it.
+	forwarded();
+	const long = `https://www.example.com/catalog/a.jsp?CN=${'Room:Patio%20%26%20Outdoor+'.repeat(80)}`;
+	const { incoming, invalid } = partitionSitemapEntries(
+		locs('https://www.example.com/catalog/a.jsp', long, 'https://www.example.com/catalog/b.jsp')
+	);
+	assert.deepEqual(
+		[...incoming.keys()],
+		['https://www.example.com/catalog/a.jsp', 'https://www.example.com/catalog/b.jsp']
+	);
+	assert.equal(invalid.length, 1);
+	assert.equal(invalid[0].loc, long);
+	assert.match(invalid[0].message, /too long to be a cache key \(\d+ bytes; the limit is 1978\)/);
+});
+
+test('a long <loc> whose KEY fits is kept: the bound is on the canonical key, not the raw URL', () => {
+	// The route allowlist drops `utm`, so the key is short however long the listed URL is.
+	forwarded();
+	const loc = `https://www.example.com/catalog/a.jsp?CN=x&utm=${'y'.repeat(3000)}`;
+	const { incoming, invalid } = partitionSitemapEntries(locs(loc));
+	assert.deepEqual([...incoming.keys()], ['https://www.example.com/catalog/a.jsp?CN=x']);
+	assert.deepEqual(invalid, []);
+});
+
 test('carries the entry through so changefreq still drives renderInterval', () => {
 	forwarded();
 	const { incoming } = partitionSitemapEntries([{ loc: 'https://www.example.com/catalog/a.jsp', changefreq: 'daily' }]);

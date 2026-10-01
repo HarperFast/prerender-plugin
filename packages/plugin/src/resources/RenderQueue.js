@@ -3,7 +3,7 @@ import { config, onConfigApplied } from '../config.js';
 import { currentMinuteMs, dateColumnMs, numberOf } from '../util/time.js';
 import { suppressionAgeBucket } from '../util/suppression.js';
 import { QueueState } from './QueueState.js';
-import { CacheKey } from '../util/cacheKey.js';
+import { CacheKey, MAX_KEY_BYTES } from '../util/cacheKey.js';
 import { sanitizeDeviceType } from '../util/device_type.js';
 import { canonicalizeUrl } from '../util/url.js';
 import {
@@ -373,8 +373,8 @@ const notAttemptedVariant = (deviceType) => ({
  *   storeKey      where its content goes — `cacheKey`, or the destination's key after a refile.
  *   outcome       posted (browser >= v1.16.0) or inferred from the legacy signals.
  *   redirect      set when `redirectedTo` canonicalizes to a DIFFERENT key: `{ redirectKey,
- *                 destinationUrl, redirectPath, landedOn }`. A target whose page URL collapses back
- *                 to the same key (trailing slash, param reorder, encoding) is not a redirect.
+ *                 destinationUrl, redirectPath, landedOn, keyable }`. A target whose page URL collapses
+ *                 back to the same key (trailing slash, param reorder, encoding) is not a redirect.
  */
 const classifyVariant = (variant, job) => {
 	variant.headers ??= {};
@@ -401,17 +401,21 @@ const classifyVariant = (variant, job) => {
 		// The browser posts the RAW final page URL as `redirectedTo`. Canonicalize it the same way
 		// serving does — with the allowlist a bot READ of that target would use (route-aware) — so
 		// the rendered content is stored under the key that read computes.
-		const redirectKey = CacheKey.toCacheKey({
-			deviceType: variant.deviceType,
-			url: canonicalizeUrl(variant.redirectedTo, queryAllowlistFor(variant.redirectedTo)),
-		});
+		const destinationUrl = canonicalizeUrl(variant.redirectedTo, queryAllowlistFor(variant.redirectedTo));
+		const redirectKey = CacheKey.toCacheKey({ deviceType: variant.deviceType, url: destinationUrl });
 		if (redirectKey !== variant.cacheKey) {
 			const redirectPath = URL.parse(variant.redirectedTo)?.pathname;
+			// The canonical URL itself, not `extractUrl(redirectKey)`: that cuts at the first delimiter, which a
+			// configured delimiter other than `|` can legitimately occur before.
 			variant.redirect = {
 				redirectKey,
-				destinationUrl: CacheKey.extractUrl(redirectKey),
+				destinationUrl,
 				redirectPath,
 				landedOn: redirectPath === undefined ? PRERENDER : classifyPath(redirectPath).routeClass,
+				// False when the destination's keys would exceed Harper's key limit: nothing may be stored,
+				// scheduled or suppressed under it (every such read or write throws), and a bot request for it
+				// is proxied uncached anyway (http_handlers/bot_request.js).
+				keyable: CacheKey.fitsKeyLimit(destinationUrl),
 			};
 		}
 	}
@@ -758,6 +762,20 @@ export class RenderQueue extends Resource {
 				metrics.renderReadinessMs(readiness.firstSatisfiedMs, readiness.contract);
 		}
 
+		// 00. A URL WHOSE PAGE KEYS CANNOT BE STORED. Harper refuses a key past `MAX_KEY_BYTES`, and a URL just
+		// under the limit has page keys (`<url><delimiter><device>`) just over it: every page write for it would
+		// throw, and the result would hold its lease and re-render forever. Nothing admits such a URL any more —
+		// the bot path, sitemap ingest and redirect adoption all check `fitsKeyLimit` — but a Target created before
+		// that check can still exist. It can never be cached, and a bot request for it is proxied, so it is retired.
+		if (!CacheKey.fitsKeyLimit(url)) {
+			metrics.renderOutcome('failed', 'unkeyable');
+			logger.warn(
+				`[prerender] retiring ${url.slice(0, 200)}…: its page keys would exceed the ${MAX_KEY_BYTES}-byte key limit`
+			);
+			await retireSource(job);
+			return;
+		}
+
 		// 0. A RESULT FROM A LEASE OLDER THAN A CHANGE MARK IS OLD CONTENT. The change probe (or a gone
 		// reopen, or a sitemap departure) marks the row `changedAt` when it finds the origin changed, and
 		// hard-expires the page. A render granted BEFORE that instant may have fetched the document before
@@ -885,7 +903,15 @@ export class RenderQueue extends Resource {
 		let refiledTo = null;
 		for (const variant of variants) {
 			if (variant.outcome !== 'rendered' || !variant.redirect) continue;
-			if (variant.redirect.landedOn === PRERENDER) {
+			if (variant.redirect.keyable === false) {
+				// Same outcome as a class we never serve, and for the same reason: there is no key to store the
+				// render under. Unlike that case no route edit could supply one — the URL is simply too long.
+				logger.warn(
+					`Prerendered url ${rowKey} redirected to a URL too long to be a cache key ` +
+						`(${variant.redirectedTo.slice(0, 200)}…) — discarding the render and keeping the target`
+				);
+				variant.discardContent = true;
+			} else if (variant.redirect.landedOn === PRERENDER) {
 				if (!refiledTo) {
 					logger.info(`Skipped prerendered url due to redirect: ${rowKey} redirected to ${variant.redirectedTo}`);
 					await retireSource(job);
@@ -1238,7 +1264,7 @@ export class RenderQueue extends Resource {
 	 * single lease-release point — knows whether this result's pacing is the lease itself.
 	 */
 	static async processRedirectResult(variant, job) {
-		const { redirectKey, destinationUrl, landedOn, redirectPath } = variant.redirect;
+		const { redirectKey, destinationUrl, landedOn, redirectPath, keyable } = variant.redirect;
 		const { url: sourceUrl, rowKey } = job;
 
 		// Same status rules as the failure branch, applied BEFORE anything retires or strikes
@@ -1294,8 +1320,9 @@ export class RenderQueue extends Resource {
 			await retireSource(job);
 			const domain = URL.parse(destinationUrl)?.hostname;
 			// Auth-shaped and transient statuses never reach here (guarded above), so this
-			// suppression is a genuine content/gone verdict about the destination.
-			if (!config.domains.length || config.domains.includes(domain)) {
+			// suppression is a genuine content/gone verdict about the destination. A destination too long
+			// to key has no row to suppress, and needs none: nothing can ever schedule it.
+			if (keyable !== false && (!config.domains.length || config.domains.includes(domain))) {
 				await Target.suppress(destinationUrl, { reason: variant.reason, statusCode: variant.statusCode });
 			}
 			return;
@@ -1322,6 +1349,19 @@ export class RenderQueue extends Resource {
 		// place. A mutual 301 pair (A↔B) ping-pongs create/delete at the targets' cadence; each
 		// hop is a navigation-only render surfaced by this warn, so a broken site costs noise,
 		// not settles.
+		//
+		// A destination TOO LONG TO KEY retires the source all the same — the move is permanent, and a bot
+		// asking for the source is proxied to the origin's own redirect — but adopts nothing: every read or
+		// write keyed by that URL would throw, and a bot request for it is proxied uncached anyway.
+		if (keyable === false) {
+			metrics.renderOutcome('redirect', 'unkeyable-destination');
+			logger.info(
+				`Prerendered url ${rowKey} permanently redirected (${variant.statusCode}) to a URL too long to be ` +
+					`a cache key (${variant.redirectedTo.slice(0, 200)}…) — retiring the target, adopting nothing`
+			);
+			await retireSource(job);
+			return;
+		}
 		metrics.renderOutcome('redirect', 'permanent');
 		logger.info(
 			`Prerendered url ${rowKey} permanently redirected (${variant.statusCode}) to ${variant.redirectedTo} — ` +

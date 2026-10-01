@@ -60,6 +60,10 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 	const globalCanonicalUrl = canonicalizeUrl(rawUrl, config.cacheKey.queryParams);
 	const globalCacheKey = CacheKey.toCacheKey({ url: globalCanonicalUrl, deviceType });
 
+	// A URL whose keys exceed Harper's primary-key limit is proxied live on every route: no row can be
+	// read or written under it (http_handlers/bot_request.js, `CacheKey.fitsKeyLimit`).
+	const keyable = CacheKey.fitsKeyLimit(canonicalUrl);
+
 	// Empty allowlist = allow all hosts (same rule as processJobResult).
 	const domainAllowed = config.domains.length === 0 || config.domains.includes(url.hostname);
 
@@ -96,8 +100,10 @@ export const explainCacheKey = (rawUrl, requestedDeviceType) => {
 		},
 		eligibility: {
 			// Only a `prerender` path is cached and scheduled; the other two classes are proxied
-			// live and never enter the cache.
-			prerendered: routeClass === PRERENDER,
+			// live and never enter the cache, and so is a URL too long to key.
+			prerendered: routeClass === PRERENDER && keyable,
+			// False when this URL's cache key would exceed Harper's primary-key limit (`MAX_KEY_BYTES`).
+			keyable,
 			// Set when the classification came from a folded `excludePathPatterns` entry rather
 			// than a route the operator wrote — a different config key to go and change.
 			excludedByPattern: route && route.source === 'excludePathPatterns' ? route.path : null,
