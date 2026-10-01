@@ -65,24 +65,34 @@ test('reads every head fact in the renderer contract, h1 excepted', () => {
 	});
 });
 
-test('head scope stops as soon as every head fact is in hand — the rest of the document is never read', () => {
+test('the scan stops as soon as every head fact is in hand — the rest of the document is never read', () => {
 	const html = doc(HEAD + ld(PRODUCT) + ld(CRUMBS) + '<script>' + 'x'.repeat(100_000) + '</script>');
 	const r = factsOf(html);
 	assert.equal(r.facts.title, 'Widget');
 	assert.ok(r.scannedBytes < 2_000, `scanned ${r.scannedBytes} of ${html.length}`);
 });
 
-test('head scope stops at </head> or <body>: a later fact is no claim, a product in the body is null', () => {
+test('the scan is the head: it ends where the HTML parser ends the head, and a later fact is no claim', () => {
 	const r = factsOf(doc('<meta charset="utf-8"><title>T</title>', ld(PRODUCT)));
 	assert.equal(r.reachedHeadEnd, true);
-	assert.equal(r.facts.product, null);
-	assert.equal(
-		factsOf(doc('<meta charset="utf-8"><title>T</title>', ld(PRODUCT)), { scope: 'document' }).facts.product.name,
-		'Widget'
-	);
+	assert.equal(r.facts.product, null); // in the body
+	// An implied head works the same way; the body start ends it.
 	const implied = factsOf('<!doctype html><meta charset="utf-8"><title>Implied</title><body>' + ld(PRODUCT));
 	assert.equal(implied.facts.title, 'Implied');
 	assert.equal(implied.facts.product, null);
+	// A start tag the head does not allow ends it, and so does non-whitespace text.
+	assert.equal(factsOf(doc('<meta charset="utf-8"><div></div><title>After</title>')).facts, null);
+	assert.equal(factsOf(doc('<meta charset="utf-8">text<title>After</title>')).facts, null);
+	assert.equal(factsOf(doc('<meta charset="utf-8"><svg><title>Icon</title></svg>')).facts, null);
+	// End tags that act as "anything else" end it too; any other stray end tag is ignored.
+	assert.equal(factsOf(doc('<meta charset="utf-8"></br><title>After</title>')).facts, null);
+	assert.equal(factsOf(doc('<meta charset="utf-8"></p><title>Kept</title>')).facts.title, 'Kept');
+	// The renderer's one-level-down JSON-LD fallback applies only when NO block anywhere has a top-level
+	// match, which reading only the head cannot know: never used.
+	const nested = doc(
+		'<meta charset="utf-8">' + ld({ '@type': 'ItemPage', 'mainEntity': { ...PRODUCT, name: 'Nested' } })
+	);
+	assert.equal(factsOf(nested).facts, null);
 });
 
 test('tags are matched as HTML matches them: any case, any attribute order, any quoting', () => {
@@ -110,41 +120,52 @@ test('the first of each wins, as querySelector does; duplicate attributes keep t
 	assert.equal(r.facts.canonical, 'https://b.example.com/');
 });
 
-test('markup that is not markup is skipped: comments, raw text, templates, foreign content', () => {
+test('markup that is not markup is skipped: comments, raw text, scripts, templates', () => {
 	const r = factsOf(
 		doc(
-			'<meta charset="utf-8"><!-- <title>Fake</title> --><!--><!--->' +
+			'<meta charset="utf-8"><!-- <title>Fake</title> --><!--><!---><!-- x --!>' +
 				'<noscript><link rel="canonical" href="https://fake.example.com/"></noscript>' +
-				'<template>' +
+				'<template><template></template><link rel="canonical" href="https://fake.example.com/"></template>' +
+				'<template><!-- </template> -->' +
 				ld({ ...PRODUCT, name: 'Fake' }) +
 				'</template>' +
 				'<script>var s = "</head><title>x</title>"; if (a < b) {}</script>' +
+				'<script><!--<script>a</script><title>Escaped</title></script>' +
 				'<style>a::after{content:"<title>x</title>"}</style>' +
-				'<title>Real</title><link rel="canonical" href="https://real.example.com/">' +
+				'</x a=">"><title>Real</title><link rel="canonical" href="https://real.example.com/">' +
 				ld(PRODUCT)
 		)
 	);
 	assert.equal(r.facts.title, 'Real');
 	assert.equal(r.facts.canonical, 'https://real.example.com/');
 	assert.equal(r.facts.product.name, 'Widget');
-	// An SVG <title> is not the document's title.
-	const svg = factsOf(
-		'<!doctype html><html><head><meta charset="utf-8"></head><body><svg><title>Icon</title></svg></body></html>',
-		{
-			scope: 'document',
-		}
-	);
-	assert.equal(svg.facts, null);
 });
 
-test('character references decode exactly or the fact is refused — never a guess', () => {
+test('character references decode exactly as the HTML tokenizer does, or the fact is refused', () => {
 	const title = (t) =>
 		factsOf(doc(`<meta charset="utf-8"><title>${t}</title><meta name="description" content="d">`)).facts.title;
 	assert.equal(title('Men&#39;s &amp; Women&#x27;s &quot;Tees&quot; &lt;3'), 'Men\'s & Women\'s "Tees" <3');
 	assert.equal(title('AT&T Phone & Case'), 'AT&T Phone & Case'); // a bare & is literal
-	assert.equal(title('Caf&eacute;'), null); // a named reference this decoder does not know
-	assert.equal(title('&copy 2024'), null); // a legacy name without its semicolon: context-dependent
-	assert.equal(title('It&#39s'), null); // a numeric one without its semicolon
+	assert.equal(title('Caf&eacute; &mdash; Bar'), 'Café — Bar');
+	// The 106 legacy names decode without `;` (longest match), and numeric ones do too.
+	assert.equal(title('&copy 2024 Caf&eacute Table'), '© 2024 Café Table');
+	assert.equal(title('&notin it It&#39s'), "¬in it It's"); // the longest legacy prefix: "not"
+	assert.equal(title('&notit;'), null); // `;` after the run: the full table could hold "notit;"
+	assert.equal(title('&#128;&#0;&#x110000;'), '€��'); // the windows-1252 remap, then U+FFFD
+	// A named reference outside this decoder's set, with `;`, may be in the full table: refused.
+	assert.equal(title('I &hearts; it'), null);
+	// The attribute rule: a legacy name without `;` before `=` or an alphanumeric stays literal.
+	const desc = (c) =>
+		factsOf(doc(`<meta charset="utf-8"><title>T</title><meta name="description" content="${c}">`)).facts
+			.metaDescription;
+	assert.equal(desc('a?x=1&copy=2&ampb &amp c'), 'a?x=1&copy=2&ampb & c');
+	// References inside the attributes that pick an element are decoded before comparing.
+	const viaRef = factsOf(
+		doc(
+			'<meta charset="utf-8"><title>T</title><link rel="&#99;anonical" href="https://a.example.com/"><link rel="canonical" href="https://b.example.com/">'
+		)
+	);
+	assert.equal(viaRef.facts.canonical, 'https://a.example.com/');
 });
 
 test('title whitespace is collapsed as document.title does it; CR/CRLF become LF everywhere', () => {
@@ -163,34 +184,60 @@ test('text is decoded only when the charset makes it exact', () => {
 	const r = factsOf(plain);
 	assert.equal(r.facts.title, 'Plain');
 	assert.equal(r.facts.metaDescription, null);
-	// The response header can supply it.
+	// The response header can supply it, and it outranks a meta; a byte-order mark outranks both.
 	assert.equal(factsOf(plain, { contentType: 'text/html; charset=UTF-8' }).facts.metaDescription, 'Café');
-	// A declared non-UTF-8 charset refuses the whole document.
-	assert.equal(factsOf('<html><head><meta charset="windows-1252"><title>T</title></head></html>').outcome, 'charset');
+	assert.equal(factsOf('﻿' + plain, { contentType: 'text/html; charset=windows-1252' }).facts.metaDescription, 'Café');
+	// Another ASCII-compatible charset: ASCII text reads, non-ASCII does not.
+	const latin = factsOf(
+		'<html><head><meta charset="windows-1252"><title>T</title><meta name="description" content="Café"></head></html>'
+	);
+	assert.equal(latin.facts.title, 'T');
+	assert.equal(latin.facts.metaDescription, null);
+	// Not ASCII-compatible at all: nothing is read.
+	assert.equal(factsOf(plain, { contentType: 'text/html; charset=utf-16' }).outcome, 'charset');
+	// A JSON-LD block that cannot be decoded makes the later ones unknowable: never the next block instead.
+	const poisoned = factsOf(
+		'<!doctype html><html><head><title>T</title>' +
+			ld({ ...PRODUCT, name: 'Café' }) +
+			ld({ ...PRODUCT, name: 'Other' }) +
+			'</head></html>'
+	);
+	assert.equal(poisoned.facts.product, null);
+	// NUL is U+FFFD, as the tokenizer makes it.
+	assert.equal(factsOf(doc('<meta charset="utf-8"><title>a\u0000b</title>')).facts.title, 'a�b');
 	assert.equal(charsetOfContentType('text/html; charset="utf-8"'), 'utf-8');
 	assert.equal(charsetOfContentType('text/html'), null);
 });
 
-test('canonical: resolved like link.href — and null when the resolution is not knowable yet', () => {
-	const c = (head, opts) =>
-		factsOf(doc(`<meta charset="utf-8">${head}<title>T</title>`), opts).facts?.canonical ?? null;
+test('the charset search ends where Chrome’s does: a meta past it is not adopted', () => {
+	const pad = '<!-- ' + 'x'.repeat(1200) + ' -->';
+	// A tag outside Chrome's head-tag set, then 1 KB: Chrome stops looking, so the title is not UTF-8 to it.
+	const late = factsOf(
+		`<!doctype html><html><head><template></template>${pad}<meta charset="utf-8"><title>Café</title></head></html>`
+	);
+	assert.equal(late.facts?.title ?? null, null);
+	// Head tags only: Chrome keeps looking at any distance.
+	const far = factsOf(`<!doctype html><html><head>${pad}<meta charset="utf-8"><title>Café</title></head></html>`);
+	assert.equal(far.facts.title, 'Café');
+});
+
+test('canonical: reported only when its resolution cannot depend on the base URL, in characters both URL serializers agree on', () => {
+	const c = (head) => factsOf(doc(`<meta charset="utf-8">${head}<title>T</title>`)).facts?.canonical ?? null;
 	assert.equal(
-		c('<base href="https://cdn.example.com/b/"><link rel="canonical" href="../c?x=1#f">'),
-		'https://cdn.example.com/c?x=1#f'
+		c('<link rel="canonical" href="HTTPS://Shop.Example.COM:443/a/../b?x=1#f">'),
+		'https://shop.example.com/b?x=1#f'
 	);
-	assert.equal(c('<link rel="canonical" href="/p/1">'), 'https://shop.example.com/p/1');
+	// A `<base>` may sit anywhere in the document, even after the head: anything relative is unknowable.
+	assert.equal(c('<base href="https://cdn.example.com/b/"><link rel="canonical" href="../c">'), null);
+	assert.equal(c('<link rel="canonical" href="/p/1">'), null);
+	assert.equal(c('<link rel="canonical" href="//shop.example.com/p">'), null);
+	assert.equal(c('<link rel="canonical" href="https:/www.example.com/x">'), null); // same-scheme relative
+	assert.equal(c('<link rel="canonical" href="">'), null);
 	assert.equal(c('<link rel="canonical">'), null); // no href: the DOM's .href is ''
-	assert.equal(c('<link rel="canonical" href="">'), URL0); // empty href: the document's own URL
-	assert.equal(c('<link rel="canonical" href="/p/1">', { url: null }), null); // nothing to resolve against
-	// Every head fact found before </head>: the scan stops early, a later <base> could still apply, so null.
-	const early = factsOf(
-		doc(
-			'<meta charset="utf-8"><title>T</title><link rel="canonical" href="/p/1"><meta name="description" content="d">' +
-				ld(PRODUCT) +
-				ld(CRUMBS)
-		)
-	);
-	assert.equal(early.facts.canonical, null);
+	// Characters Chrome and Node serialize differently, or that depend on the charset: refused.
+	assert.equal(c('<link rel="canonical" href="https://shop.example.com/c/red|blue">'), null);
+	assert.equal(c('<link rel="canonical" href="&nbsp;https://shop.example.com/x">'), null);
+	assert.equal(c('<link rel="canonical" href="https://shop.example.com/100%-cotton">'), null);
 });
 
 test('JSON-LD: the selector is exact on type, a malformed block costs nothing else, graphs and arrays are read', () => {
@@ -274,23 +321,6 @@ test('JSON-LD reduction matches the renderer: ProductGroup variants, AggregateOf
 		factsOf(doc(`<meta charset="utf-8"><title>${'x'.repeat(DOCUMENT_FACT_BOUNDS.maxString + 1)}</title>`)).facts,
 		null
 	);
-});
-
-test('the one-level-down fallback is used only when the WHOLE document was read', () => {
-	const html = doc(
-		'<meta charset="utf-8">' +
-			ld({ '@type': 'ItemPage', 'mainEntity': { ...PRODUCT, name: 'Nested' }, 'breadcrumb': CRUMBS })
-	);
-	assert.equal(factsOf(html).facts, null); // head scope: a top-level product could still come later
-	const whole = factsOf(html, { scope: 'document' }).facts;
-	assert.equal(whole.product.name, 'Nested');
-	assert.deepEqual(whole.breadcrumbs, ['Home', 'Tools']);
-	// ...and a top-level one later in the document beats it, as in the renderer.
-	const later = doc(
-		'<meta charset="utf-8">' + ld({ '@type': 'WebPage', 'mainEntity': { ...PRODUCT, name: 'Nested' } }),
-		ld({ ...PRODUCT, name: 'Top' })
-	);
-	assert.equal(factsOf(later, { scope: 'document' }).facts.product.name, 'Top');
 });
 
 test('chunks may split anything: 1-byte, 3-byte and 8 KB pushes all read what one push reads', () => {
@@ -418,4 +448,15 @@ test('itemList (opt-in, outside the renderer contract): a listing page’s produ
 		})),
 	};
 	assert.equal(factsOf(doc(HEAD + ld(huge)), { want: ['title', 'itemList'] }).facts.itemList, null);
+});
+
+test('bounds: maxBytes caps one oversized push and an inflate that would exceed it (a decompression bomb)', () => {
+	const head = '<!doctype html><html><head><meta charset="utf-8"><script>' + 'x'.repeat(200_000);
+	const one = documentFactsOf(Buffer.from(head), { maxBytes: 64 * 1024 });
+	assert.equal(one.outcome, 'truncated');
+	assert.ok(one.scannedBytes <= 64 * 1024);
+	const bomb = zlib.gzipSync(Buffer.alloc(50 * 1024 * 1024, 0x20));
+	const r = documentFactsOf(bomb, { contentEncoding: 'gzip', maxBytes: 1024 * 1024 });
+	assert.equal(r.outcome, 'truncated');
+	assert.ok(r.inflatedBytes <= 1024 * 1024, `inflated ${r.inflatedBytes}`);
 });
