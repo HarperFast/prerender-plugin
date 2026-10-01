@@ -111,7 +111,10 @@ export const reconcileSchedules = async ({
 		if (await getSchedule(target.url)) continue;
 		let scheduledByDeviceRow = false;
 		for (const deviceType of deviceTypes) {
-			if (await getSchedule(CacheKey.toCacheKey({ url: target.url, deviceType }))) {
+			const deviceKey = CacheKey.toCacheKey({ url: target.url, deviceType });
+			// A key past Harper's limit holds no row, and reading one throws (util/cacheKey.js).
+			if (!CacheKey.keyFits(deviceKey)) continue;
+			if (await getSchedule(deviceKey)) {
 				scheduledByDeviceRow = true;
 				break;
 			}

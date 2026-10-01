@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import { CacheKey } from '../util/cacheKey.js';
+import { CacheKey, MAX_KEY_BYTES } from '../util/cacheKey.js';
 import { getBotName, botMayDiscover, botCountsAsDemand } from '../util/userAgent.js';
 import { isPrerenderCandidate } from '../util/indexSignals.js';
 import { canonicalizeUrl } from '../util/url.js';
@@ -68,6 +68,18 @@ export async function handleBotRequest(request) {
 		// debug header is present). `route` is the matched route entry, if any; `routeClass`
 		// decides whether this request is cached and scheduled at all.
 		const info = { route, routeClass, deviceType };
+
+		// A URL TOO LONG TO BE A KEY IS PROXIED AND NOTHING ELSE. Every table this request would touch —
+		// the page, raw and negative caches, the verification proof, the Target a miss discovers — is keyed
+		// by this URL, and Harper refuses a key past `MAX_KEY_BYTES` with a throw. That throw used to reach
+		// the catch below from the very first page read, so the crawler got a 500 for a URL the origin
+		// answers. Returned before the scheduling tail, not just before the read: a miss's detached
+		// discovery would throw on the same key a moment later.
+		if (!CacheKey.fitsKeyLimit(cacheUrl)) {
+			const resource = await proxyUnkeyable({ request, url, cacheUrl, deviceType, info });
+			if (recordBots) recordServeOutcome(resource, request, info, deviceType);
+			return deliverResource(resource, request, info);
+		}
 
 		const resource = await resolveResource({ request, url, cacheUrl, deviceType, routeClass, info });
 		// WHY THIS MISS HAPPENED (`bot_miss`), for exactly the requests bot_serve counts as origin|miss.
@@ -210,6 +222,27 @@ function resolveBotTarget(request) {
 		routeClass,
 		route: entry,
 	};
+}
+
+// The origin proxy for a URL whose keys would exceed Harper's limit (`CacheKey.fitsKeyLimit`). It is
+// `bypass` for the same reason a non-GET is: not a cacheable request at all, so nothing was looked up,
+// and every consumer of the status already treats it that way (no demand, no raw or negative lookup,
+// not a miss). The origin_fetch reason is its own, so the two stay apart in the analytics.
+async function proxyUnkeyable({ request, url, cacheUrl, deviceType, info }) {
+	logger.warn(
+		`Proxying a ${Buffer.byteLength(cacheUrl)}-byte URL uncached: its cache key would exceed the ` +
+			`${MAX_KEY_BYTES}-byte key limit (${cacheUrl.slice(0, 200)}…)`
+	);
+	info.cacheStatus = 'bypass';
+	info.source = 'origin';
+	return fetchOriginResource({
+		url,
+		deviceType,
+		method: request.method,
+		headers: request.headers,
+		body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request._nodeRequest,
+		reason: 'key-too-long',
+	});
 }
 
 // Resolve the resource to serve: an origin proxy for non-GET/HEAD, else a fresh cache hit,
@@ -666,8 +699,8 @@ export async function reopenFromTraffic(resource) {
 }
 
 // Cache statuses that never looked for a page row, so they can neither prove nor disprove that a
-// Target exists: a non-GET (`bypass`) and a deliberate cache skip (`skip`). They are not `miss`
-// either — a miss LOOKED and found nothing — so they take neither branch below and record no
+// Target exists: a non-GET or an over-limit URL (`bypass`) and a deliberate cache skip (`skip`). They are
+// not `miss` either — a miss LOOKED and found nothing — so they take neither branch below and record no
 // demand. That is the conservative reading of an ambiguous request, not a claim that on-demand
 // traffic is illegitimate: a render-now MISS still records, because it looked, found nothing, and
 // is about to mint the Target that makes the URL real.

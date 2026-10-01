@@ -68,7 +68,14 @@ const deviceTypes = () => config.deviceTypes.default;
  * such a row converts itself the first time it renders, but a target retired before that must not
  * leave one behind to render once more and drop itself.
  */
-export const cacheKeysOf = (url) => deviceTypes().map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
+// EVERY KEY LIST BELOW LEAVES OUT A KEY PAST HARPER'S LIMIT (`MAX_KEY_BYTES`). No row can exist under one,
+// and any read, write or delete keyed by one throws — so a URL just under the limit, whose page keys are just
+// over it (a Target created before the bound was checked at entry), would make every delete, suppression,
+// purge and departure that touches its pages throw. Skipping a key no row can have is exact, not lossy.
+const fitting = (keys) => keys.filter((key) => CacheKey.keyFits(key));
+
+export const cacheKeysOf = (url) =>
+	fitting(deviceTypes().map((deviceType) => CacheKey.toCacheKey({ url, deviceType })));
 
 /**
  * Every page key a URL can have been STORED under — one per SUPPORTED device, not just the default
@@ -80,10 +87,10 @@ export const cacheKeysOf = (url) => deviceTypes().map((deviceType) => CacheKey.t
  * rows that exist, so they stay on `cacheKeysOf`.
  */
 export const pageKeysOf = (url) =>
-	config.deviceTypes.supported.map((deviceType) => CacheKey.toCacheKey({ url, deviceType }));
+	fitting(config.deviceTypes.supported.map((deviceType) => CacheKey.toCacheKey({ url, deviceType })));
 
 /** Every SCHEDULE key a URL may have a row under: the URL row, plus any not-yet-converted device row. */
-export const scheduleKeysOf = (url) => [url, ...cacheKeysOf(url)];
+export const scheduleKeysOf = (url) => fitting([url, ...cacheKeysOf(url)]);
 
 export class Target extends TargetTable {
 	async put(data, target) {

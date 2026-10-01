@@ -2,6 +2,7 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gunzipSync } from 'node:zlib';
+import { checkHarperKey } from './support/harperKeyLimit.js';
 
 /**
  * The bot serve path end to end: `handleBotRequest` against a real origin over a real socket, and a real
@@ -25,6 +26,13 @@ let getResidencyByUrl;
 let pageGet = async () => null;
 const rawPuts = [];
 const negativeRows = new Map();
+// Every key a URL-keyed table was asked for. Each fake below also applies Harper's key check, so a key
+// past the limit throws exactly where the real table would.
+const tableKeys = [];
+const keyed = (table, key) => {
+	tableKeys.push(`${table}:${key}`);
+	checkHarperKey(key);
+};
 
 // `inFlight`: origin responses not yet finished or torn down. A body nobody reads and nobody releases
 // keeps its response here until undici's body timeout — that, not an idle pooled socket, is a leak.
@@ -88,10 +96,13 @@ before(async () => {
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {}, trace() {} };
 	globalThis.createBlob = (bytes) => bytes;
 	class TargetBase {
-		static async get() {
+		static async get(query) {
+			keyed('Target', typeof query === 'object' ? query.id : query);
 			return null;
 		}
-		static async put() {}
+		static async put(key) {
+			keyed('Target', key);
+		}
 	}
 	globalThis.databases = {
 		coordination: {
@@ -102,6 +113,7 @@ before(async () => {
 		page_cache: {
 			PrerenderedPage: class {
 				static async get(key) {
+					keyed('PrerenderedPage', key);
 					const page = await pageGet(key);
 					return page && { cacheKey: key, ...page };
 				}
@@ -109,25 +121,42 @@ before(async () => {
 		},
 		probe_state: { ProbeState: class {}, RenderExpectation: class {} },
 		invalidation: { Invalidation: { get: async () => null } },
-		verification: { PageVerification: { get: async () => null } },
+		verification: {
+			PageVerification: {
+				get: async (key) => {
+					keyed('PageVerification', key);
+					return null;
+				},
+			},
+		},
 		raw_cache: {
 			RawPage: {
-				get: async () => null,
+				get: async (key) => {
+					keyed('RawPage', key);
+					return null;
+				},
 				put: async (key) => {
+					keyed('RawPage', key);
 					rawPuts.push(key);
 				},
 			},
 		},
 		negative_cache: {
 			NegativePage: {
-				get: async (key) => (negativeRows.has(key) ? { ...negativeRows.get(key) } : null),
+				get: async (key) => {
+					keyed('NegativePage', key);
+					return negativeRows.has(key) ? { ...negativeRows.get(key) } : null;
+				},
 				put: async (key, data) => {
+					keyed('NegativePage', key);
 					negativeRows.set(key, { cacheKey: key, ...data });
 				},
 				patch: async (key, data) => {
+					keyed('NegativePage', key);
 					negativeRows.set(key, { ...(negativeRows.get(key) ?? {}), ...data });
 				},
 				delete: async (key) => {
+					keyed('NegativePage', key);
 					negativeRows.delete(key);
 				},
 			},
@@ -173,6 +202,7 @@ beforeEach(() => {
 	pageGet = async () => null;
 	rawPuts.length = 0;
 	negativeRows.clear();
+	tableKeys.length = 0;
 });
 
 const request = (path, method = 'GET', extra = {}) => ({
@@ -233,6 +263,82 @@ test('a proxied origin 301 reaches the crawler WITH its Location, absolute, reso
 		assert.equal(res.headers.get('location'), expected, 'a redirect with no target is a dead end for the crawler');
 		assert.equal(res.headers.get('content-language'), 'en-US');
 	}
+});
+
+// ── A URL too long to be a key is proxied, not 500'd ──────────────────────────────────────────────
+
+test('a URL too long to be a cache key is proxied to the origin — not the 500 a key throw made it — and touches no table', async () => {
+	// Harper refuses a primary key past 1978 bytes with a throw. The page read was the first thing to hit
+	// it, and the catch-all answered the crawler 500 for a URL the origin serves.
+	const warned = [];
+	const { warn } = logger;
+	logger.warn = (msg) => warned.push(String(msg));
+	try {
+		for (const route of ['p', 'raw', 'neg']) {
+			const path = `/desktop/${route}/${'a'.repeat(2100)}`;
+			const res = await handleBotRequest(request(path, 'GET', { 'accept-encoding': 'identity' }));
+			assert.equal(await drain(res.body), '<html>origin</html>', `${route}: the origin's document`);
+			assert.equal(res.status, 200, route);
+			assert.equal(res.headers.get('x-harper-cache'), 'bypass', `${route}: not a cacheable request at all`);
+			assert.equal(res.headers.get('x-harper-source'), 'origin');
+			assert.equal(origin.requests.at(-1).url, path.slice('/desktop'.length), 'the whole URL reached the origin');
+		}
+		await settle(); // the scheduling tail is detached: it would have read the Target by now
+		assert.deepEqual(tableKeys, [], 'no read or write under a key Harper would refuse');
+		assert.equal(warned.filter((m) => m.includes('its cache key would exceed the 1978-byte key limit')).length, 3);
+	} finally {
+		logger.warn = warn;
+	}
+});
+
+test('an over-limit HEAD goes upstream as a HEAD, a POST with its method, and both are origin_fetch key-too-long', async () => {
+	const recorded = [];
+	const { recordAnalytics } = server;
+	server.recordAnalytics = (...args) => recorded.push(args);
+	try {
+		const path = `/desktop/p/${'a'.repeat(2100)}`;
+		const head = await handleBotRequest(request(path, 'HEAD'));
+		assert.equal(head.status, 200);
+		assert.equal(head.body, undefined);
+		assert.equal(origin.requests.at(-1).method, 'HEAD');
+		const post = await handleBotRequest(request(path, 'POST'));
+		await drain(post.body);
+		assert.equal(post.status, 200);
+		assert.equal(origin.requests.at(-1).method, 'POST');
+		const reasons = recorded.filter((a) => a[1] === 'origin_fetch').map((a) => a[3]);
+		assert.deepEqual(reasons, ['key-too-long', 'key-too-long']);
+		await settle();
+		assert.deepEqual(tableKeys, []);
+	} finally {
+		server.recordAnalytics = recordAnalytics;
+	}
+});
+
+test('an over-limit URL whose origin answers 404 on a negative-cache route stores nothing', async () => {
+	origin.respond = (_req, res) => {
+		res.writeHead(404, { 'content-type': 'text/html' });
+		res.end('gone');
+	};
+	const res = await handleBotRequest(request(`/desktop/neg/${'a'.repeat(2100)}`));
+	await drain(res.body);
+	assert.equal(res.status, 404, "the origin's own answer");
+	await settle();
+	assert.equal(negativeRows.size, 0);
+	assert.deepEqual(tableKeys, []);
+});
+
+test('a URL just inside the limit is still looked up and cached normally', async () => {
+	// 'desktop' plus the delimiter is 8 bytes beside the URL, so this URL's key is exactly 1978 bytes.
+	const prefix = `http://127.0.0.1:${origin.port}/p/`;
+	const path = `/desktop/p/${'a'.repeat(1978 - 8 - prefix.length)}`;
+	const res = await handleBotRequest(request(path));
+	await drain(res.body);
+	assert.equal(res.status, 200);
+	assert.equal(res.headers.get('x-harper-cache'), 'miss');
+	assert.ok(
+		tableKeys.some((k) => k.startsWith('PrerenderedPage:')),
+		'the page was looked up under its key'
+	);
 });
 
 // ── V1: a HEAD is a HEAD upstream, and nothing abandons a live origin body ──────────────────────

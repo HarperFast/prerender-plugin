@@ -106,3 +106,12 @@ test('an unparseable URL throws rather than returning a plausible-looking key', 
 	assert.throws(() => explainCacheKey('not-a-url', 'desktop'));
 	assert.throws(() => explainCacheKey('/relative/path', 'desktop'));
 });
+
+test('a URL too long to be a cache key is reported not keyable, and so not prerendered, on any route', () => {
+	const out = explainCacheKey(`https://www.example.com/a/${'x'.repeat(2100)}`, 'desktop');
+	assert.equal(out.eligibility.keyable, false);
+	assert.equal(out.eligibility.prerendered, false, 'proxied live: nothing can be stored under its key');
+	const short = explainCacheKey('https://www.example.com/a', 'desktop');
+	assert.equal(short.eligibility.keyable, true);
+	assert.equal(short.eligibility.prerendered, true);
+});
