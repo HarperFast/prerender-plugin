@@ -2680,6 +2680,55 @@ test('MAPPED FIELD: the page disagrees with an UNCHANGED origin -> trigger, coun
 	assert.equal(written[0].clearClaim, true, 'the trigger clears the record with the claim');
 });
 
+test('a SCOPED field is compared only where its pathPattern matches: a placeholder elsewhere neither triggers nor feeds the guard', async () => {
+	// The endpoint's title is a placeholder on collection pages (prd-c…); the title is scoped away from them.
+	const scoped = {
+		...MAPPED_RULE,
+		pageCheck: {
+			...MAPPED_RULE.pageCheck,
+			fields: MAPPED_RULE.pageCheck.fields.map((field) =>
+				field.fact === 'title' ? { ...field, pathPattern: '^/product/prd-(?!c)' } : field
+			),
+		},
+	};
+	const URL_C = 'https://www.example.com/product/prd-c9/towels.jsp';
+	const collectionApi = await apiSig({ title: 'Shop', seoUrl: '/product/prd-c9/towels.jsp' }, scoped);
+	const regularApi = await apiSig({}, scoped);
+	const collectionRecord = await RECORD({
+		title: 'Towel Collection',
+		canonical: 'https://www.example.com/product/prd-c9/towels.jsp',
+	});
+	const { guard, disarmed } = guardFor();
+	const { stats, triggered } = await runMappedPass({
+		rulesRaw: [scoped],
+		rows: [row(URL_A), row(URL_C)],
+		answers: { [URL_A]: regularApi, [URL_C]: collectionApi },
+		stored: {
+			[URL_A]: { signature: regularApi, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) },
+			[URL_C]: { signature: collectionApi, pageFacts: collectionRecord },
+		},
+		guard,
+	});
+	assert.deepEqual(triggered, [URL_A], 'the regular page is still caught on its title; the collection is not');
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } });
+	assert.deepEqual(disarmed, []);
+	const { rules } = await runMappedPass({ rulesRaw: [scoped], rows: [], answers: {} });
+	const titleGuard = guard.snapshot(rules).pdp['0:title'];
+	assert.equal(titleGuard.witnessed, 1, 'only the in-scope page is witnessed: the placeholder cannot disarm the field');
+	assert.equal(titleGuard.disagreed, 1);
+});
+
+test('a SLUG CHANGE is a canonical disagreement: the page claims the old path, the endpoint the new one', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/red-running-shoe.jsp' });
+	const { stats, triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '1:canonical': 1 } });
+});
+
 test('the same page AGREEING on every mapped field -> unchanged, nothing triggered, nothing written', async () => {
 	const signature = await apiSig();
 	const { stats, triggered, written } = await runMappedPass({

@@ -746,3 +746,41 @@ test('a check switched off (or to dry run) while it waited is counted dropped, a
 	await serveCheck.serveChecksSettledForTest();
 	assert.deepEqual(outcomes(), ['queued', 'dropped']);
 });
+
+test('a SLUG CHANGE is caught when a bot asks: the served canonical against the endpoint’s path now', async () => {
+	const { setApi } = await setup();
+	setApi(API({ seoUrl: '/product/prd-a/red-running-shoe.jsp' }));
+	await consider(served());
+	assert.equal(calls.expire.length, 1);
+	assert.equal(calls.writeCheck[0].field, '1:canonical');
+	assert.deepEqual(outcomes(), ['queued', 'mismatch']);
+});
+
+test('a field scoped away from a URL (pathPattern) cannot decide its check there', async () => {
+	const { compileProbeRules, extractValues } = await import('../src/util/changeProbeSpec.js');
+	const { documentFactsOf } = await import('../src/util/documentFacts.js');
+	const scoped = {
+		...RULE,
+		pageCheck: {
+			...RULE.pageCheck,
+			fields: RULE.pageCheck.fields.map((field) =>
+				field.fact === 'title' ? { ...field, pathPattern: '^/product/prd-(?!c)' } : field
+			),
+		},
+	};
+	const [rule] = compileProbeRules([scoped]);
+	const facts = documentFactsOf(Buffer.from(SNAPSHOT())).facts;
+	const placeholder = extractValues(API({ title: 'Shop' }), rule.extract);
+	// On a collection URL the placeholder title is no claim; the canonical, image and offers still decide.
+	const collectionUrl = 'https://shop.example.com/product/prd-c1/red-shoe.jsp';
+	const collectionFacts = { ...facts, canonical: collectionUrl };
+	const onCollection = serveCheck.compareWithEndpoint(
+		rule,
+		extractValues(API({ title: 'Shop', seoUrl: '/product/prd-c1/red-shoe.jsp' }), rule.extract),
+		collectionFacts,
+		{ pageUrl: collectionUrl }
+	);
+	assert.deepEqual(onCollection, { result: 'agree' });
+	// On a regular URL the same disagreement decides.
+	assert.equal(serveCheck.compareWithEndpoint(rule, placeholder, facts, { pageUrl: URL_A }).result, 'mismatch');
+});

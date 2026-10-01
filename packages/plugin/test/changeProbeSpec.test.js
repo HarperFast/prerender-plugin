@@ -988,6 +988,65 @@ test('pageCheck.fields compile into { slot, fact, compare, options, label }; the
 	assert.equal(both.pageCheck.fields.length, 1);
 });
 
+test('a field scoped by pathPattern compares only on the URLs it matches, and is no claim on the rest', async () => {
+	const { compareField } = await import('../src/util/changeProbeSpec.js');
+	const warnings = [];
+	const rule = mapped(
+		{
+			fields: [
+				// The endpoint's title is a placeholder on collection pages (/p/c…): compare it everywhere else.
+				{ slot: 0, fact: 'title', compare: 'text', pathPattern: '^/p/(?!c)' },
+				{ slot: 1, fact: 'canonical', compare: 'path' },
+			],
+		},
+		warnings
+	);
+	assert.deepEqual(warnings, []);
+	const [title, canonical] = rule.pageCheck.fields;
+	assert.ok(title.pathPattern instanceof RegExp);
+	assert.equal(canonical.pathPattern, null, 'unscoped: everywhere, as before');
+	const facts = { title: 'Red Shoe', canonical: 'https://shop.example.com/p/123/red-shoe' };
+	const regular = { pageUrl: 'https://shop.example.com/p/123/red-shoe' };
+	const collection = { pageUrl: 'https://shop.example.com/p/c456/towels' };
+	assert.equal(compareField(title, 'Blue Shoe', facts, regular), false, 'in scope: a disagreement');
+	assert.equal(compareField(title, 'Red Shoe', facts, regular), true);
+	assert.equal(compareField(title, 'Shop', facts, collection), null, 'out of scope: no claim, never a disagreement');
+	assert.equal(
+		compareField(title, 'Shop', facts, {}),
+		null,
+		'a scoped field that cannot tell where it is compares nothing'
+	);
+	// Unscoped fields are untouched by the scope of their siblings — a slug change is still caught everywhere.
+	assert.equal(compareField(canonical, '/p/123/red-shoes', facts, collection), false);
+});
+
+test('a pathPattern that is not a usable regular expression drops its entry, never widening it to every page', () => {
+	for (const [pathPattern, pattern] of [
+		['(', /pathPattern does not compile as a regular expression/],
+		['', /pathPattern must be a non-empty regular expression string/],
+		[7, /pathPattern must be a non-empty regular expression string/],
+	]) {
+		const warnings = [];
+		const rule = mapped(
+			{
+				fields: [
+					{ slot: 0, fact: 'title', compare: 'text', pathPattern },
+					{ slot: 1, fact: 'canonical', compare: 'path' },
+				],
+			},
+			warnings
+		);
+		assert.deepEqual(
+			rule.pageCheck.fields.map((field) => field.label),
+			['1:canonical'],
+			JSON.stringify(pathPattern)
+		);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], pattern);
+		assert.match(warnings[0], /entry dropped/);
+	}
+});
+
 test('a bad pageCheck.fields entry drops ALONE with a warning — never the rule, never its siblings', () => {
 	const cases = [
 		[{ slot: 99, fact: 'title', compare: 'text' }, /fields\[0\]\.slot must be an integer index into extract \(0-7\)/],

@@ -3008,7 +3008,12 @@ const ruleStatus = (rule) => ({
 	invalidateScope: rule.invalidateScope,
 	// Only when present, so a rule without them reads exactly as it did.
 	...(rule.pageCheck?.fields?.length
-		? { pageFields: rule.pageCheck.fields.map((field) => `${field.label}:${field.compare}`) }
+		? {
+				// A scoped field says where it compares, or "never compares on these pages" reads as a bug.
+				pageFields: rule.pageCheck.fields.map(
+					(field) => `${field.label}:${field.compare}${field.pathPattern ? ` (only ${field.pathPattern.source})` : ''}`
+				),
+			}
 		: {}),
 	...(rule.pageCheck?.ignoreChanges?.length ? { ignoreChanges: rule.pageCheck.ignoreChanges } : {}),
 	// WHAT MAKES TWO NODES' RULES THE SAME RULE. The console used to compare the objects above across

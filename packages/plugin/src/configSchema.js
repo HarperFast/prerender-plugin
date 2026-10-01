@@ -1160,7 +1160,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'fields the page cannot show stop re-rendering at all. Shape: `pageCheck: { enabled: true, ' +
 					'fields: [{ slot: <i>, fact: "<fact>", compare: "<comparator>" }, ...], ignoreChanges: [<i>, ...] }` ' +
 					'(both, like the claim pair, apply only while `enabled` is true), where `slot` indexes ' +
-					'`extract`. The comparators are a closed set, each applying to certain facts: ' +
+					'`extract`. A field may carry `pathPattern` (a regular expression on the URL path, like the ' +
+					'rule\u2019s own): it is then compared only on the URLs that match, and is no claim at all on the ' +
+					'rest \u2014 for an endpoint that states one page type faithfully and another with a placeholder ' +
+					'(a collection page whose endpoint title is the site name: `pathPattern: "^/product/prd-(?!c)"`). ' +
+					'The comparators are a closed set, each applying to certain facts: ' +
 					'"text" (exact after Unicode NFC, whitespace collapse and trim — no case folding and NO HTML ' +
 					'stripping: an endpoint’s description may carry markup the page’s meta tag repeats verbatim), ' +
 					'"path" (URL path only — origin, query and fragment ignored, a relative value resolved against the ' +
