@@ -551,3 +551,48 @@ test('route rawCache defaults to false and is ignored on a passthrough route', (
 	// A passthrough route is never served from cache, so a stored document would answer nothing.
 	assert.equal(matchRoute('/help/contact-us').rawCache, false);
 });
+
+test('route rawFacts: true = every head fact, an array is validated, a bad value drops the FIELD only', () => {
+	const routes = [
+		{ match: 'prefix', path: '/listings/', rawCache: true, rawFacts: ['title', 'canonical', 'itemList'] },
+		{ match: 'prefix', path: '/collections/', rawCache: true, rawFacts: ['title', 'h1'] }, // h1 is never read
+		{ match: 'prefix', path: '/products/', rawCache: true, rawFacts: true },
+		{ match: 'prefix', path: '/brand/', rawFacts: true }, // no rawCache: kept, but it does nothing
+	];
+	forwarded({ ingress: { routes } });
+	assert.deepEqual(matchRoute('/listings/shoes').rawFacts, ['title', 'canonical', 'itemList']);
+	assert.equal(matchRoute('/collections/bath').rawFacts, null);
+	assert.equal(matchRoute('/collections/bath').rawCache, true, 'the route and its other fields survive');
+	assert.deepEqual(matchRoute('/products/widget').rawFacts, [
+		'title',
+		'metaDescription',
+		'canonical',
+		'product',
+		'breadcrumbs',
+	]);
+	const { warnings } = inspectRoutes(routes, []);
+	assert.ok(
+		warnings.some((w) => w.includes('rawFacts') && w.includes('"prefix /collections/"')),
+		JSON.stringify(warnings)
+	);
+	assert.ok(
+		warnings.some((w) => w.includes('rawFacts') && w.includes('does nothing')),
+		JSON.stringify(warnings)
+	);
+});
+
+test('route documentCheck: true = the listing facts, an array is validated, a bad value drops the FIELD only', () => {
+	forwarded({
+		ingress: {
+			routes: [
+				{ match: 'prefix', path: '/listings/', documentCheck: true },
+				{ match: 'prefix', path: '/collections/', documentCheck: ['title', 'canonical'] },
+				{ match: 'prefix', path: '/products/', documentCheck: ['h1'] },
+			],
+		},
+	});
+	assert.deepEqual(matchRoute('/listings/shoes').documentCheck, ['title', 'metaDescription', 'canonical', 'itemList']);
+	assert.deepEqual(matchRoute('/collections/bath').documentCheck, ['title', 'canonical']);
+	assert.equal(matchRoute('/products/widget').documentCheck, null);
+	assert.equal(matchRoute('/products/widget').mode, 'prerender');
+});

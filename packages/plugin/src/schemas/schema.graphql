@@ -427,6 +427,43 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 	basisAt: Date
 }
 
+# THE LAST TIME A CACHED PAGE WAS CHECKED AGAINST THE ORIGIN (util/pageCheck.js), from any source: the
+# serve-time check (util/serveCheck.js), the nightly sweep, a raw-document check. The serve path reads it
+# to decide whether a page served now is due a check (any decided check covers its window, so one URL is
+# asked once per window cluster-wide, whatever the verdict), and the sweep reads it to skip a row a check
+# has already observed EXACTLY as its baseline stands (`signature`) since the pass began.
+#
+# NOT `PageVerification`, and the separation is load-bearing. A verification EXEMPTS a page from a bulk
+# invalidation, and is written only by the rule whose own scope recorded that invalidation, only while
+# it is active. A check is written in steady state by whatever checked the page — so in that table it
+# would let a price/availability check exempt pages from an invalidation recorded for something else
+# entirely (a template change). Here it exempts nothing; it only spares a request.
+#
+# Replicated and NOT residency-pinned, like PageVerification: a page is served on whichever node the CDN
+# picks, and every node must see that another already checked it. Same database, so the serve path's
+# reads stay off page_cache. Keyed by URL with `basisAt` for per-device pages, exactly as PageVerification.
+type PageCheck @table(database: "verification", expiration: 604800) @sealed {
+	url: String @primaryKey
+	# When the check ran.
+	checkedAt: Date
+	# The `lastCached` of the page (or raw document) whose facts were compared: a key is covered only when
+	# its own `lastCached` is at least this.
+	basisAt: Date
+	# 'agree', 'mismatch' (acted on), 'held' (the same disagreement repeated by a page rendered after the
+	# last one, the origin unchanged — systematic, not a change, so not acted on again), 'inconclusive'
+	# (nothing comparable), or 'failed' (the request failed; asked again next window, not every 5 minutes).
+	outcome: String
+	# The field a disagreement named ('mismatch' and 'held'), and a digest of what the origin said for it:
+	# the same disagreement again, with the origin unchanged, on a page rendered after it, is `held`.
+	field: String
+	evidence: String
+	# An agreeing ENDPOINT check's observation, exactly as the sweep stores it (`ProbeState.signature`).
+	# The sweep skips a row only when this equals its own baseline: a check that agreed on the mapped
+	# fields says nothing about an unmapped slot, and only an identical observation says the probe would
+	# have found the row unchanged.
+	signature: String
+}
+
 type PrerenderedPage @table(database: "page_cache") @export {
 	cacheKey: String @primaryKey
 	statusCode: Int!
@@ -678,6 +715,12 @@ type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 	# serve path's miss branch and buy nothing.
 	content: Blob
 	lastCached: Date
+	# What the stored document CLAIMS, read off its bytes as it was stored (util/documentFacts.js), when the
+	# route asks for it (`rawFacts`): canonical JSON in the page-record shape (`ProbeState.pageFacts`, plus
+	# `itemList` for a listing page), at most 16 KB, else null. Lets a stored document be compared with the
+	# origin without reading or inflating its blob. Null — including on every row stored before this
+	# existed — is no claim, never "verified".
+	facts: String
 	# @expiresAt MAKES THIS FIELD THE RECORD'S REAL EXPIRATION, not merely a column the serve path
 	# reads. Without it Harper stamps every row with the table default above (48h) and reclaims on that
 	# schedule, while `readRawPage` independently refuses the row at this timestamp — so between the

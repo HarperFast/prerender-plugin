@@ -297,9 +297,16 @@ const compileVocabulary = (pc, label, warn) => {
 
 /**
  * `pageCheck.fields`: which extracted slot holds what the page shows as which PAGE FACT, and how
- * the two are compared. Each entry `{ slot, fact, compare, ...options }` compiles to
- * `{ slot, fact, compare, options, label }` where `label` ("<slot>:<fact>") names it in stats and
- * warnings.
+ * the two are compared. Each entry `{ slot, fact, compare, pathPattern?, ...options }` compiles to
+ * `{ slot, fact, compare, options, label, pathPattern }` where `label` ("<slot>:<fact>") names it in
+ * stats and warnings, and `pathPattern` (a RegExp, or null) scopes it to the URLs whose path matches.
+ *
+ * SCOPED, NOT FORKED. One endpoint can describe one page type faithfully and another with a
+ * placeholder (a "collection" page whose endpoint title is the site's name): the field is right on one
+ * and wrong on every page of the other, and the other's pages sort together, so the mapping guard sees
+ * them as a burst. A second rule with the same request would split the canary cohort and the corpus
+ * walk for one bad field. A field's `pathPattern` instead makes it no claim at all on the URLs outside
+ * it — exactly as if those pages stated nothing — while it keeps comparing everywhere else.
  *
  * DROPPED PER ENTRY, never the rule and never the list: a mapping entry is independent of its
  * siblings (each compares its own slot to its own fact), so a typo in one is no reason to stop
@@ -351,8 +358,24 @@ const compilePageFields = (list, inBounds, extract, label, warn) => {
 			warn(`${where}: ${problem} — entry dropped`);
 			continue;
 		}
+		// A scope that does not compile drops the entry: comparing it everywhere would be the very
+		// disagreement it was written to prevent.
+		let fieldPattern = null;
+		if (entry.pathPattern !== undefined && entry.pathPattern !== null) {
+			if (typeof entry.pathPattern !== 'string' || entry.pathPattern === '') {
+				warn(`${where}.pathPattern must be a non-empty regular expression string — entry dropped`);
+				continue;
+			}
+			try {
+				fieldPattern = new RegExp(entry.pathPattern);
+			} catch (e) {
+				warn(`${where}.pathPattern does not compile as a regular expression (${e.message}) — entry dropped`);
+				continue;
+			}
+		}
 		const unknown = Object.keys(entry).filter(
-			(key) => key !== 'slot' && key !== 'fact' && key !== 'compare' && !comparator.keys.includes(key)
+			(key) =>
+				key !== 'slot' && key !== 'fact' && key !== 'compare' && key !== 'pathPattern' && !comparator.keys.includes(key)
 		);
 		if (unknown.length) warn(`${where}: unknown key(s) ${unknown.join(', ')} ignored`);
 		const fieldLabel = `${entry.slot}:${entry.fact}`;
@@ -361,7 +384,14 @@ const compilePageFields = (list, inBounds, extract, label, warn) => {
 			continue;
 		}
 		seen.add(fieldLabel);
-		fields.push({ slot: entry.slot, fact: entry.fact, compare: entry.compare, options, label: fieldLabel });
+		fields.push({
+			slot: entry.slot,
+			fact: entry.fact,
+			compare: entry.compare,
+			options,
+			label: fieldLabel,
+			pathPattern: fieldPattern,
+		});
 	}
 	return fields;
 };
@@ -1033,6 +1063,16 @@ const COMPARATORS = {
 };
 
 /**
+ * Does a scoped field (`pathPattern`) apply to the page in `ctx.pageUrl`? An unknown page never
+ * matches: a scoped field that cannot tell where it is compares nothing. The path is parsed once per
+ * comparison context, not once per field.
+ */
+const fieldApplies = (field, ctx) => {
+	if (ctx.pathname === undefined) ctx.pathname = (ctx.pageUrl && URL.parse(ctx.pageUrl)?.pathname) || null;
+	return ctx.pathname !== null && field.pathPattern.test(ctx.pathname);
+};
+
+/**
  * One mapped field's verdict: true (the page agrees with the endpoint value), false (disagrees),
  * null (not compared). `facts` is a parsed page record (`parsePageFacts`), `ctx` is
  * `{ pageUrl, vocabulary }`. Never throws — a comparator fault on data from a previous release or
@@ -1041,6 +1081,7 @@ const COMPARATORS = {
 export const compareField = (field, apiValue, facts, ctx = {}) => {
 	if (!facts || apiValue === null || apiValue === undefined) return null;
 	try {
+		if (field.pathPattern && !fieldApplies(field, ctx)) return null;
 		const pageValue = PAGE_FACTS[field.fact].get(facts);
 		if (pageValue === null || pageValue === undefined) return null;
 		return COMPARATORS[field.compare].compare(apiValue, pageValue, field, ctx);

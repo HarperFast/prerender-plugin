@@ -33,6 +33,7 @@ import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
 import { captureForRawCache, rawCachePolicy, rawKeyOf, readRawPage } from '../util/rawCache.js';
+import { considerServeCheck } from '../util/serveCheck.js';
 import {
 	afterNegativeProxy,
 	answerFromNegativeCache,
@@ -106,6 +107,9 @@ export async function handleBotRequest(request) {
 		if (recordBots) {
 			recordServeOutcome(resource, request, info, deviceType);
 		}
+		// A page served from cache may be due a check against the origin (util/serveCheck.js). Deferred
+		// inside: nothing about this response waits on it.
+		maybeServeCheck(resource, request, info, cacheUrl);
 
 		return deliverResource(resource, request, info);
 	} catch (e) {
@@ -115,6 +119,33 @@ export async function handleBotRequest(request) {
 			status: 500,
 		};
 	}
+}
+
+// The cache statuses that served a rendered snapshot from this node's cache, and the raw-document one.
+const SNAPSHOT_SERVES = new Set(['hit', 'swr', 'verified']);
+
+/**
+ * Hand a cache serve to the serve-time check (util/serveCheck.js): the served bytes for a snapshot (none
+ * on a HEAD, which sends nothing and has nothing to read) with its headers as stored — parsed later, only
+ * when a check is due, never before this response — and the stored facts for a raw document.
+ */
+function maybeServeCheck(resource, request, info, cacheUrl) {
+	if (!config.changeProbe.serveCheck?.enabled || info.source === 'origin') return;
+	const kind = SNAPSHOT_SERVES.has(info.cacheStatus) ? 'page' : info.cacheStatus === 'raw' ? 'raw' : null;
+	if (!kind || (kind === 'page' && request.method === 'HEAD')) return;
+	considerServeCheck({
+		kind,
+		url: cacheUrl,
+		lastCachedMs: resource?.lastCached ? new Date(resource.lastCached).getTime() : NaN,
+		body: kind === 'page' ? info.cachedBody : undefined,
+		headers: kind === 'page' ? (resource?.headers ?? null) : null,
+		cacheKey: kind === 'page' ? (info.cacheKey ?? resource?.cacheKey ?? null) : null,
+		facts: kind === 'raw' ? (resource?.facts ?? null) : null,
+		rawKey: kind === 'raw' ? (info.rawKey ?? null) : null,
+		deviceType: info.deviceType ?? null,
+		botName: request.botName,
+		route: info.route,
+	});
 }
 
 // Serve-outcome analytics, recorded once the request has resolved to a resource. `bot_request`
@@ -482,6 +513,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 				info.cachedBody = body.body;
 				info.cacheStatus = 'raw';
 				info.source = 'raw';
+				info.rawKey = rawKey;
 				return { ...stored, cacheKey, deviceType, url: cacheUrl };
 			}
 			// COUNTED AND LOGGED, never silent. The page path emits `serveError` here for a reason: a
@@ -558,7 +590,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
 	const kept =
 		rawPolicy && request.method !== 'HEAD'
-			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy })
+			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy, factsWant: info.route?.rawFacts ?? null })
 			: resource;
 	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
 	// only 200s, the negative cache only its configured statuses.

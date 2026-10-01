@@ -1,6 +1,6 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -711,4 +711,84 @@ test('capture under deviceIndependent: the refusal is counted by name and nothin
 test('deviceIndependent defaults to false — sharing across devices is opt-in', async () => {
 	const { defaultConfig } = await import('../src/configSchema.js');
 	assert.equal(defaultConfig().render.raw.deviceIndependent, false);
+});
+
+// ---- page facts stored beside the document (route `rawFacts`) ------------------------------------
+
+const FACTS_DOC =
+	'<!doctype html><html><head><meta charset="utf-8"><title>Widget</title>' +
+	'<link rel="canonical" href="https://shop.example.com/p/1"><meta name="description" content="A widget.">' +
+	'</head><body><h1>Widget</h1></body></html>';
+const storedFacts = () => JSON.parse(rows.get('k').facts);
+// The store is detached and gzips on the threadpool, so wait for the row rather than for a fixed number of ticks.
+const storedRow = async (key = 'k') => {
+	for (let i = 0; i < 200 && !rows.get(key); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+	return rows.get(key);
+};
+
+test('rawFacts: the facts are read off the bytes as received and stored on the row, identity or gzip', async () => {
+	const want = ['title', 'metaDescription', 'canonical'];
+	const expected = {
+		canonical: 'https://shop.example.com/p/1',
+		title: 'Widget',
+		metaDescription: 'A widget.',
+		h1: null,
+		product: null,
+		breadcrumbs: null,
+	};
+	// Identity: scanned before `storableBody` gzips it.
+	const identity = originResource({
+		url: 'https://shop.example.com/p/1',
+		headers: { 'content-type': 'text/html; charset=utf-8' },
+		content: streamOf([FACTS_DOC.slice(0, 40), FACTS_DOC.slice(40)]),
+	});
+	await drain(rawCache.captureForRawCache(identity, { cacheKey: 'k', policy: policy(), factsWant: want }).content);
+	await storedRow();
+	assert.deepEqual(storedFacts(), expected);
+	assert.equal(rows.get('k').headers.includes('"content-encoding":"gzip"'), true, 'the body is still stored gzipped');
+
+	// Gzip from the origin: inflated only as far as the facts.
+	rows.clear();
+	const gz = originResource({
+		url: 'https://shop.example.com/p/1',
+		content: streamOf([gzipSync(Buffer.from(FACTS_DOC))]),
+	});
+	await drain(rawCache.captureForRawCache(gz, { cacheKey: 'k', policy: policy(), factsWant: want }).content);
+	await storedRow();
+	assert.deepEqual(storedFacts(), expected);
+});
+
+test('rawFacts: not asked for, or unreadable, stores null facts — and the document is stored either way', async () => {
+	const plain = originResource({
+		headers: { 'content-type': 'text/html; charset=utf-8' },
+		content: streamOf([FACTS_DOC]),
+	});
+	await drain(rawCache.captureForRawCache(plain, { cacheKey: 'k', policy: policy() }).content);
+	await storedRow();
+	assert.equal(rows.get('k').facts, null);
+
+	// Claimed gzip, not gzip: the scan fails, the store does not.
+	rows.clear();
+	const corrupt = originResource({ content: streamOf(['definitely not gzip']) });
+	await drain(rawCache.captureForRawCache(corrupt, { cacheKey: 'k', policy: policy(), factsWant: ['title'] }).content);
+	await storedRow();
+	assert.equal(rows.get('k').facts, null);
+	assert.equal(rows.get('k').content.bytes.toString(), 'definitely not gzip');
+	assert.equal(rawCache.rawFactsOf({ headers: {} }, Buffer.from(FACTS_DOC), null), null);
+});
+
+test('ignoreNoStore: a no-store document is refused unless the deployment says its no-store means nothing', () => {
+	const resource = originResource({
+		headers: { 'content-type': 'text/html', 'cache-control': 'max-age=0, no-cache, no-store' },
+	});
+	assert.equal(rawCache.storeRefusal(resource, policy()), 'no-store');
+	config.render.raw.ignoreNoStore = true;
+	try {
+		assert.equal(rawCache.storeRefusal(resource, policy()), null);
+		// `private` is a different claim, still governed by assumeShared.
+		const priv = originResource({ headers: { 'content-type': 'text/html', 'cache-control': 'private, no-store' } });
+		assert.equal(rawCache.storeRefusal(priv, policy()), 'no-store');
+	} finally {
+		config.render.raw.ignoreNoStore = false;
+	}
 });

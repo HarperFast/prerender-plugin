@@ -1823,6 +1823,115 @@ test('cycle pacing belongs to the SWEEP — the canary must never inherit the sw
 	applyOptions({ changeProbe: { enabled: false } });
 });
 
+test('disarmedFieldsOnNode: a running pass\u2019s heartbeat guard outranks the last pass\u2019s record; the last pass\u2019s applies otherwise', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+	const [rule] = compileProbeRules([MAPPED_RULE]);
+	const guardOf = (armed) => ({ pdp: { '0:title': { witnessed: 50, disagreed: armed ? 0 : 50, armed } } });
+	// Mid-pass: the beat says the title was disarmed since the last pass, which still had it armed.
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: true,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+			progress: { fieldGuard: guardOf(false) },
+			lastRun: { fieldGuard: guardOf(true) },
+		},
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
+	// No pass running: the last pass's record is what there is.
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(false) } },
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(true) } },
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], []);
+	changeProbe.resetChangeProbeState();
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
+// ---- the out-of-pass budget: what a pass leaves, and the origin's pushback -----------------------
+
+test('a pass leaves out-of-pass requests what they USE, not `share` — and only while checks are really armed', async () => {
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false, share: 0.5 },
+	});
+	changeProbe.__resetOriginPaceForTest();
+	assert.equal(changeProbe.__passLimitsForTest(undefined).ratePerSecond, 10, 'the ceiling itself is not cut');
+	const reserve = changeProbe.__passLimitsForTest(undefined).reserveHeadroom;
+	assert.equal(typeof reserve, 'function');
+	// Idle: the floor (a tenth of the ceiling), not half of it.
+	assert.equal(reserve(), 1);
+	// Busy: twice what was used in the window, at most `share` of the ceiling.
+	for (let i = 0; i < 12; i++) assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	const busy = reserve();
+	assert.ok(busy > 1 && busy <= 5, `headroom ${busy}`);
+	// Not armed — a serve-check dry run, or the probe's own: the pass runs at the ceiling and leaves nothing.
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: false,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: true },
+	});
+	assert.equal(changeProbe.__passLimitsForTest(undefined).reserveHeadroom, null);
+	await applyProbeConfig({
+		enabled: true,
+		dryRun: true,
+		ratePerSecond: 10,
+		serveCheck: { enabled: true, dryRun: false },
+	});
+	assert.equal(changeProbe.serveChecksArmed(), false, "the probe's dry run governs its checks");
+	assert.equal(changeProbe.__passLimitsForTest(undefined).reserveHeadroom, null);
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
+test('the pass ceiling is lowered by the headroom it leaves, batch by batch', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const waits = [];
+	await changeProbe.runProbePass({
+		rows: stream([row(URL_A), row(URL_B)]),
+		rules: compileProbeRules(RULES_RAW),
+		ownerOf: () => 'node-a',
+		hostname: 'node-a',
+		probe: async () => JSON.stringify([1]),
+		read: async () => null,
+		write: async () => {},
+		submitTrigger: async () => 'queued',
+		dryRun: false,
+		concurrency: 1,
+		ratePerSecond: 10,
+		reserveHeadroom: () => 6,
+		now: () => 0,
+		pause: async (ms) => waits.push(ms),
+		onPace: (rate) => waits.push(`rate ${rate}`),
+	});
+	assert.ok(waits.includes('rate 4'), JSON.stringify(waits));
+});
+
+test("the origin's pushback pauses every out-of-pass request on the node, and a healthy answer resets the escalation", async () => {
+	await applyProbeConfig({ enabled: true, ratePerSecond: 10 });
+	changeProbe.__resetOriginPaceForTest();
+	assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	changeProbe.noteOriginPushback(null);
+	assert.equal(changeProbe.reserveOriginSlot(60_000), null, 'paused: shed, not queued behind the pushback');
+	changeProbe.noteOriginHealthy();
+	assert.equal(changeProbe.reserveOriginSlot(60_000), null, 'a healthy answer does not cut a pause short');
+	changeProbe.__resetOriginPaceForTest();
+	assert.notEqual(changeProbe.reserveOriginSlot(60_000), null);
+	changeProbe.__resetOriginPaceForTest();
+	await applyProbeConfig({ enabled: false });
+});
+
 // ---- cross-worker observability ------------------------------------------------------------
 
 /**
@@ -2602,6 +2711,55 @@ test('MAPPED FIELD: the page disagrees with an UNCHANGED origin -> trigger, coun
 	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } }, 'decomposed by field');
 	assert.deepEqual(stats.slotChanges, {}, 'no origin change to decompose');
 	assert.equal(written[0].clearClaim, true, 'the trigger clears the record with the claim');
+});
+
+test('a SCOPED field is compared only where its pathPattern matches: a placeholder elsewhere neither triggers nor feeds the guard', async () => {
+	// The endpoint's title is a placeholder on collection pages (prd-c…); the title is scoped away from them.
+	const scoped = {
+		...MAPPED_RULE,
+		pageCheck: {
+			...MAPPED_RULE.pageCheck,
+			fields: MAPPED_RULE.pageCheck.fields.map((field) =>
+				field.fact === 'title' ? { ...field, pathPattern: '^/product/prd-(?!c)' } : field
+			),
+		},
+	};
+	const URL_C = 'https://www.example.com/product/prd-c9/towels.jsp';
+	const collectionApi = await apiSig({ title: 'Shop', seoUrl: '/product/prd-c9/towels.jsp' }, scoped);
+	const regularApi = await apiSig({}, scoped);
+	const collectionRecord = await RECORD({
+		title: 'Towel Collection',
+		canonical: 'https://www.example.com/product/prd-c9/towels.jsp',
+	});
+	const { guard, disarmed } = guardFor();
+	const { stats, triggered } = await runMappedPass({
+		rulesRaw: [scoped],
+		rows: [row(URL_A), row(URL_C)],
+		answers: { [URL_A]: regularApi, [URL_C]: collectionApi },
+		stored: {
+			[URL_A]: { signature: regularApi, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) },
+			[URL_C]: { signature: collectionApi, pageFacts: collectionRecord },
+		},
+		guard,
+	});
+	assert.deepEqual(triggered, [URL_A], 'the regular page is still caught on its title; the collection is not');
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '0:title': 1 } });
+	assert.deepEqual(disarmed, []);
+	const { rules } = await runMappedPass({ rulesRaw: [scoped], rows: [], answers: {} });
+	const titleGuard = guard.snapshot(rules).pdp['0:title'];
+	assert.equal(titleGuard.witnessed, 1, 'only the in-scope page is witnessed: the placeholder cannot disarm the field');
+	assert.equal(titleGuard.disagreed, 1);
+});
+
+test('a SLUG CHANGE is a canonical disagreement: the page claims the old path, the endpoint the new one', async () => {
+	const signature = await apiSig({ seoUrl: '/product/prd-a/red-running-shoe.jsp' });
+	const { stats, triggered } = await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: signature },
+		stored: { [URL_A]: { signature, pageFacts: await RECORD() } },
+	});
+	assert.deepEqual(triggered, [URL_A]);
+	assert.deepEqual(stats.fieldMismatch, { pdp: { '1:canonical': 1 } });
 });
 
 test('the same page AGREEING on every mapped field -> unchanged, nothing triggered, nothing written', async () => {
@@ -3703,4 +3861,106 @@ test('E2: a window starting inside the spring-forward hole still arms a FUTURE r
 		else process.env.TZ = hostTz;
 		await applyProbeConfig({ enabled: false });
 	}
+});
+
+// ---- serve-time checks: the pass records its agreements, and skips what was checked since it began ----
+
+test('an agreeing comparison is RECORDED as a check, whether or not an invalidation is armed — with the render basis and the observation', async () => {
+	const recorded = [];
+	const { verified } = await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: AGREE_CLAIM, pageClaimAt: CLAIM_AT } },
+		armed: false,
+		recordCheck: async (url, basisAtMs, options) => recorded.push({ url, basisAtMs, ...options }),
+	});
+	assert.deepEqual(verified, [], 'no invalidation armed: no verification, which would exempt from one');
+	assert.deepEqual(recorded, [{ url: URL_A, basisAtMs: CLAIM_AT.getTime(), signature: AGREE_SIG }]);
+});
+
+test('a comparison that never happened is not recorded as a check', async () => {
+	const recorded = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, probedAt: NaN, pageSignature: null } },
+		armed: false,
+		recordCheck: async (url, basisAtMs) => recorded.push({ url, basisAtMs }),
+	});
+	assert.deepEqual(recorded, []);
+});
+
+// The fingerprint of the rule `runVerifyPass` compiles: a baseline stamped with it is comparable.
+const verifyRuleFingerprint = async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	return compileProbeRules([{ ...PAGECHECK_RULES[0], invalidateScope: 'route:prefix:/p/' }])[0].fingerprint;
+};
+
+test('a row a check OBSERVED EXACTLY AS ITS BASELINE STANDS since the pass began is skipped; anything less is probed', async () => {
+	const fingerprint = await verifyRuleFingerprint();
+	const since = Date.now() - 60_000;
+	const URL_C = 'https://example.com/product/prd-c/';
+	const URL_D = 'https://example.com/product/prd-d/';
+	const baseline = { signature: AGREE_SIG, fingerprint, probedAt: since - 3600_000 };
+	// A slot no mapped field reads moved (the first price): an agreement on the mapped fields says nothing about it.
+	const MOVED = JSON.stringify([44.99, 35.99, 35.99, true]);
+	const checks = {
+		[URL_A]: { outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }, // exactly the baseline
+		[URL_B]: { outcome: 'agree', checkedAtMs: since + 1000, signature: MOVED }, // agreed, but saw the slot move
+		[URL_C]: { outcome: 'agree', checkedAtMs: since - 1000, signature: AGREE_SIG }, // before the pass
+		[URL_D]: { outcome: 'mismatch', checkedAtMs: since + 1000, signature: null }, // not an agreement
+	};
+	const probed = [];
+	const { stats } = await runVerifyPass({
+		rows: [row(URL_A), row(URL_B), row(URL_C), row(URL_D)],
+		answers: { [URL_A]: AGREE_SIG, [URL_B]: MOVED, [URL_C]: AGREE_SIG, [URL_D]: AGREE_SIG },
+		stored: { [URL_A]: baseline, [URL_B]: baseline, [URL_C]: baseline, [URL_D]: baseline },
+		armed: false,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return { [URL_B]: MOVED }[url] ?? AGREE_SIG;
+		},
+		readCheck: async (url) => checks[url],
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_B, URL_C, URL_D]);
+	assert.equal(stats.checkedOnDemand, 1);
+	assert.equal(stats.changed, 1, 'the moved slot is still detected — by the probe the skip would have spared');
+});
+
+test('no skip while a verification is armed for the rule: the probe writes that proof, a check cannot', async () => {
+	const fingerprint = await verifyRuleFingerprint();
+	const since = Date.now() - 60_000;
+	const probed = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, fingerprint, probedAt: NaN } },
+		armed: true,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return AGREE_SIG;
+		},
+		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }),
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_A]);
+});
+
+test('a baseline under another rule fingerprint is never spared by a check', async () => {
+	const since = Date.now() - 60_000;
+	const probed = [];
+	await runVerifyPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: AGREE_SIG },
+		stored: { [URL_A]: { signature: AGREE_SIG, fingerprint: 'edited-since', probedAt: NaN } },
+		armed: false,
+		probe: async (rule, url) => {
+			probed.push(url);
+			return AGREE_SIG;
+		},
+		readCheck: async () => ({ outcome: 'agree', checkedAtMs: since + 1000, signature: AGREE_SIG }),
+		skipCheckedSince: since,
+	});
+	assert.deepEqual(probed, [URL_A]);
 });
