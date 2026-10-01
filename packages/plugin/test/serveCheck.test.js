@@ -386,18 +386,29 @@ test('every shortfall asks nothing: no budget slot (shed), a full queue (busy), 
 	serveCheck.resetServeChecks();
 	ops = [];
 	await setup();
+	const recorded = new Map();
+	let asked = 0;
 	serveCheck.__setServeCheckDepsForTest({
 		anchor: () => ANCHOR,
 		reserveSlot: () => Date.now(),
-		readCheck: async () => NO_CHECK,
+		readCheck: async (url) => recorded.get(url) ?? NO_CHECK,
+		writeCheck: async (url, basisAtMs, options) =>
+			recorded.set(url, { ...NO_CHECK, checkedAtMs: Date.now(), basisAtMs, ...options }),
 		readBasis: async () => 0,
 		probe: async () => {
+			asked++;
 			throw new Error('a refused request');
 		},
 		expire: async () => assert.fail('a failed request must not act'),
 	});
-	await consider(served({ url: 'https://shop.example.com/product/prd-z/x.jsp' }));
+	const failing = served({ url: 'https://shop.example.com/product/prd-z/x.jsp' });
+	await consider(failing);
 	assert.deepEqual(outcomes(), ['queued', 'failed']);
+	assert.equal(recorded.get(failing.url)?.outcome, 'failed', 'recorded, so the window is covered');
+	// Another worker (fresh memory), the same window: not asked again, however often bots ask for the page.
+	serveCheck.resetServeChecks();
+	await consider(failing);
+	assert.equal(asked, 1);
 });
 
 test('a raw document is checked from its STORED facts, and a disagreeing one is deleted', async () => {

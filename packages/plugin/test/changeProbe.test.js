@@ -1823,6 +1823,39 @@ test('cycle pacing belongs to the SWEEP — the canary must never inherit the sw
 	applyOptions({ changeProbe: { enabled: false } });
 });
 
+test('disarmedFieldsOnNode: a running pass\u2019s heartbeat guard outranks the last pass\u2019s record; the last pass\u2019s applies otherwise', async () => {
+	const { compileProbeRules } = await import('../src/util/changeProbeSpec.js');
+	const { applyOptions } = await import('../src/config.js');
+	applyOptions({ changeProbe: { enabled: true, rules: RULES_RAW } });
+	const [rule] = compileProbeRules([MAPPED_RULE]);
+	const guardOf = (armed) => ({ pdp: { '0:title': { witnessed: 50, disagreed: armed ? 0 : 50, armed } } });
+	// Mid-pass: the beat says the title was disarmed since the last pass, which still had it armed.
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: {
+			running: true,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+			progress: { fieldGuard: guardOf(false) },
+			lastRun: { fieldGuard: guardOf(true) },
+		},
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
+	// No pass running: the last pass's record is what there is.
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(false) } },
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], ['0:title']);
+	changeProbe.resetChangeProbeState();
+	await changeProbe.publishProbeStateForTest({
+		sweep: { running: false, startedAt: 1, heartbeatAt: 1, progress: null, lastRun: { fieldGuard: guardOf(true) } },
+	});
+	assert.deepEqual([...(await changeProbe.disarmedFieldsOnNode(rule))], []);
+	changeProbe.resetChangeProbeState();
+	applyOptions({ changeProbe: { enabled: false } });
+});
+
 // ---- the out-of-pass budget: what a pass leaves, and the origin's pushback -----------------------
 
 test('a pass leaves out-of-pass requests what they USE, not `share` — and only while checks are really armed', async () => {

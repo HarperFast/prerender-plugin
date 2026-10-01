@@ -393,10 +393,13 @@ const runCheck = async (item, gen = generation) => {
 		metrics.serveCheck('agree', item.source);
 	} else if (verdict.result === 'mismatch') {
 		await settleMismatch(item, verdict, prior);
-	} else if (verdict.result === 'inconclusive') {
-		// Recorded too: asking again in five minutes would get the same nothing, on every worker and node.
-		await deps.writeCheck(item.url, item.lastCachedMs, { outcome: 'inconclusive' });
-		metrics.serveCheck('inconclusive', item.source);
+	} else if (verdict.result === 'inconclusive' || verdict.result === 'failed') {
+		// Recorded too: asking again in five minutes would get the same nothing (or the same refusal, for an
+		// endpoint that fails on this URL every time), on every worker of every node, for as long as bots ask
+		// for the page. One ask per URL per window, whatever the answer; the nightly pass still probes it.
+		// Not a pushback (`throttled`): that one pauses the node and is asked again once the pause lifts.
+		await deps.writeCheck(item.url, item.lastCachedMs, { outcome: verdict.result });
+		metrics.serveCheck(verdict.result, item.source);
 	} else {
 		metrics.serveCheck(verdict.result, item.source);
 	}

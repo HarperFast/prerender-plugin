@@ -1080,8 +1080,8 @@ const fieldApplies = (field, ctx) => {
  */
 export const compareField = (field, apiValue, facts, ctx = {}) => {
 	if (!facts || apiValue === null || apiValue === undefined) return null;
-	if (field.pathPattern && !fieldApplies(field, ctx)) return null;
 	try {
+		if (field.pathPattern && !fieldApplies(field, ctx)) return null;
 		const pageValue = PAGE_FACTS[field.fact].get(facts);
 		if (pageValue === null || pageValue === undefined) return null;
 		return COMPARATORS[field.compare].compare(apiValue, pageValue, field, ctx);

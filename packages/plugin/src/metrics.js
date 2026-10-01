@@ -747,7 +747,8 @@ export const METRICS = Object.freeze({
 			'disagreed and was deleted), held (the same field disagreed again on a page rendered after the last ' +
 			'mismatch: a systematic difference between page and origin, not a change, so not acted on — a sustained ' +
 			'count names a mapping or a page type to look at), inconclusive (nothing comparable), failed (the origin ' +
-			'request failed), throttled (the origin pushed back: out-of-pass requests on the node pause); or ' +
+			'request failed; recorded, so asked again next window), throttled (the origin pushed back: out-of-pass ' +
+			'requests on the node pause); or ' +
 			'why nothing was asked — busy (queue full), shed (no budget slot in time, or paused by pushback), deduped ' +
 			'(checked by another worker or node meanwhile), superseded (the served copy was re-rendered, re-captured ' +
 			'or removed while the check waited), dropped (checks were switched off or to dry run while it waited), ' +

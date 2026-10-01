@@ -450,8 +450,8 @@ type PageCheck @table(database: "verification", expiration: 604800) @sealed {
 	# its own `lastCached` is at least this.
 	basisAt: Date
 	# 'agree', 'mismatch' (acted on), 'held' (the same disagreement repeated by a page rendered after the
-	# last one, the origin unchanged — systematic, not a change, so not acted on again), or 'inconclusive'
-	# (nothing comparable).
+	# last one, the origin unchanged — systematic, not a change, so not acted on again), 'inconclusive'
+	# (nothing comparable), or 'failed' (the request failed; asked again next window, not every 5 minutes).
 	outcome: String
 	# The field a disagreement named ('mismatch' and 'held'), and a digest of what the origin said for it:
 	# the same disagreement again, with the origin unchanged, on a page rendered after it, is `held`.

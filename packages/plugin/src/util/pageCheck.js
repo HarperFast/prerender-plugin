@@ -80,7 +80,7 @@ export const checkSparesProbe = (check, stored, rule, sinceMs) =>
 /**
  * Record a check of the page whose `lastCached` was `basisAtMs`: `outcome` 'agree' (with the endpoint's
  * `signature` when there was one), 'mismatch' or 'held' (with the `field` and the digest of what the
- * origin said for it, `evidence`), or 'inconclusive'. Never throws.
+ * origin said for it, `evidence`), 'inconclusive' or 'failed'. Never throws.
  */
 export const writePageCheck = async (
 	url,
