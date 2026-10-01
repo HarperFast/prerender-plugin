@@ -123,7 +123,7 @@ const SNAPSHOT = (over = {}) =>
 let calls;
 let checks; // url -> a PageCheck record (util/pageCheck.js readPageCheck)
 let bases; // key -> the served copy's lastCached now (ms); absent = unchanged
-const NO_CHECK = { checkedAtMs: NaN, basisAtMs: NaN, outcome: null, field: null, evidence: null, signature: null };
+const NO_CHECK = { checkedAtMs: NaN, basisAtMs: NaN, outcome: null, field: null, evidence: null, observedDigest: null };
 const check = (over) => ({ ...NO_CHECK, outcome: 'agree', ...over });
 const ANCHOR = Date.now() - 3 * 3600_000; // the nightly update, three hours ago
 
@@ -302,7 +302,9 @@ test('a due page that agrees is recorded with the SERVED page’s basis, and is 
 	const [written] = calls.writeCheck;
 	assert.equal(written.basisAtMs, input.lastCachedMs);
 	assert.equal(written.outcome, 'agree');
-	assert.equal(typeof written.signature, 'string', 'the observation, for the sweep to compare with its baseline');
+	// EXACTLY the probe's observation (writePageCheck digests it), or the sweep could never match its baseline.
+	const { compileProbeRules, extractValues, signatureOf } = await import('../src/util/changeProbeSpec.js');
+	assert.equal(written.signature, signatureOf(extractValues(API(), compileProbeRules([RULE])[0].extract)));
 	assert.deepEqual(calls.expire, []);
 	assert.deepEqual(outcomes(), ['queued', 'agree']);
 	// The same page again on this worker: not asked again.

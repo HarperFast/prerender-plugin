@@ -431,7 +431,7 @@ type PageVerification @table(database: "verification", expiration: 604800) @seal
 # serve-time check (util/serveCheck.js), the nightly sweep, a raw-document check. The serve path reads it
 # to decide whether a page served now is due a check (any decided check covers its window, so one URL is
 # asked once per window cluster-wide, whatever the verdict), and the sweep reads it to skip a row a check
-# has already observed EXACTLY as its baseline stands (`signature`) since the pass began.
+# has already observed EXACTLY as its baseline stands (`observedDigest`) since the pass began.
 #
 # NOT `PageVerification`, and the separation is load-bearing. A verification EXEMPTS a page from a bulk
 # invalidation, and is written only by the rule whose own scope recorded that invalidation, only while
@@ -457,11 +457,13 @@ type PageCheck @table(database: "verification", expiration: 604800) @sealed {
 	# the same disagreement again, with the origin unchanged, on a page rendered after it, is `held`.
 	field: String
 	evidence: String
-	# An agreeing ENDPOINT check's observation, exactly as the sweep stores it (`ProbeState.signature`).
-	# The sweep skips a row only when this equals its own baseline: a check that agreed on the mapped
-	# fields says nothing about an unmapped slot, and only an identical observation says the probe would
-	# have found the row unchanged.
-	signature: String
+	# A digest (16 characters, util/pageCheck.js `observationDigest`) of an agreeing ENDPOINT check's
+	# observation, as the sweep stores it in full (`ProbeState.signature`). The sweep skips a row only when
+	# this equals the digest of its own baseline: a check that agreed on the mapped fields says nothing
+	# about an unmapped slot, and only an identical observation says the probe would have found the row
+	# unchanged. A digest, not the observation: a product observation runs ~1 KB, this row is written for
+	# nearly every URL the nightly pass probes, and it replicates to every node.
+	observedDigest: String
 }
 
 type PrerenderedPage @table(database: "page_cache") @export {
