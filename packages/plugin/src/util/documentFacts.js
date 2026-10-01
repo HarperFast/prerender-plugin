@@ -740,7 +740,7 @@ export const createDocumentFactsScanner = ({
 	const text = (buf, s, e) => {
 		let out;
 		if (encoding === 'utf-8') out = buf.toString('utf8', s, e);
-		else if (encoding !== 'refuse' && isPlainAscii(buf, s, e)) out = buf.latin1Slice(s, e);
+		else if (encoding !== 'refuse' && isPlainAscii(buf, s, e)) out = buf.toString('latin1', s, e);
 		else return null;
 		if (out.indexOf('\r') >= 0) out = out.replace(/\r\n?/g, '\n');
 		if (out.indexOf('\0') >= 0) out = out.replace(/\0/g, '�');
@@ -807,13 +807,13 @@ export const createDocumentFactsScanner = ({
 	const meta = (buf) => {
 		if (!charsetSearchOpen) return;
 		let label = null;
-		if (attrs.charsetS >= 0) label = buf.latin1Slice(attrs.charsetS, attrs.charsetE);
+		if (attrs.charsetS >= 0) label = buf.toString('latin1', attrs.charsetS, attrs.charsetE);
 		else if (
 			attrs.httpEquivS >= 0 &&
 			attrs.contentS >= 0 &&
 			bytesEqualLower(buf, attrs.httpEquivS, attrs.httpEquivE, 'content-type')
 		) {
-			const m = /charset\s*=\s*["']?([^"';\s]+)/i.exec(buf.latin1Slice(attrs.contentS, attrs.contentE));
+			const m = /charset\s*=\s*["']?([^"';\s]+)/i.exec(buf.toString('latin1', attrs.contentS, attrs.contentE));
 			label = m ? m[1] : null;
 		}
 		const found = encodingOfLabel(label, true);
@@ -912,7 +912,7 @@ export const createDocumentFactsScanner = ({
 				const after = readTag(buf, n, end, false);
 				if (after < 0) return true;
 				const kind = kindOf(buf, lt + 2, n);
-				if (charsetSearchOpen) charsetWindow(buf.latin1Slice(lt + 2, n).toLowerCase(), true, base + after);
+				if (charsetSearchOpen) charsetWindow(buf.toString('latin1', lt + 2, n).toLowerCase(), true, base + after);
 				if (templateDepth > 0) {
 					if (kind === K_TEMPLATE) templateDepth--;
 				} else if (
@@ -971,7 +971,7 @@ export const createDocumentFactsScanner = ({
 				if (closed < 0) return true;
 				i = closed;
 			} else if (kind === K_TITLE || kind === K_RAWTEXT || kind === K_RAWTEXT_BODY) {
-				const name = buf.latin1Slice(lt + 1, n).toLowerCase();
+				const name = buf.toString('latin1', lt + 1, n).toLowerCase();
 				// Chrome's charset search may read markup inside a <noscript> that the renderer's DOM (scripting
 				// on) holds as text, so a charset still undetermined here stays undetermined: ASCII only.
 				if (name === 'noscript') charsetSearchOpen = false;
@@ -1000,7 +1000,7 @@ export const createDocumentFactsScanner = ({
 				}
 				i = after;
 			}
-			if (charsetSearchOpen) charsetWindow(buf.latin1Slice(lt + 1, n).toLowerCase(), false, base + i);
+			if (charsetSearchOpen) charsetWindow(buf.toString('latin1', lt + 1, n).toLowerCase(), false, base + i);
 			pos = i;
 			if (satisfied()) return stopScan();
 		}
