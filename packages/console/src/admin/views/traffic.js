@@ -2183,7 +2183,8 @@ function negativeCache(ctx, data, filter) {
 	const routes = (options.get('ingress.routes')?.effective ?? []).filter(
 		(entry) => entry && typeof entry === 'object' && entry.negativeCache === true
 	);
-	// Narrowed by the bot filter like every other bot_serve read here; the prerender_ops rows carry no bot.
+	// Narrowed by the bot filter like every other bot_serve read here. The prerender_ops rows carry no bot,
+	// except the excluded-bot pair below, which is narrowed the same way.
 	const answered = sumCount(pick(data, 'bot_serve', (s) => s.method === 'negative' && keepBot(filter, s.type)));
 	const rechecking = sumCount(
 		pick(data, 'bot_serve', (s) => s.method === 'negative-revalidate' && keepBot(filter, s.type))
@@ -2210,21 +2211,30 @@ function negativeCache(ctx, data, filter) {
 	// Every would-serve-live request was first counted as would-serve OR would-revalidate (the lookup
 	// counts, the proxied 200 then counts again), so those two are its denominator.
 	const wouldAnswer = wouldServe + ev('would-revalidate');
-	// The same risk for the excluded bots, measured without serving it (plugin v0.97.4): an excluded request
-	// that found a stored 404 counts bot-excluded, and excluded-live when the origin then answered 200. Per
-	// bot, because the decision to let a bot read the cache is made per bot.
-	const excludedFound = ev('bot-excluded');
-	const excludedLive = ev('excluded-live');
-	const liveByBot = new Map();
+	// The same risk for the excluded bots, measured without serving it (plugin v0.97.4): an excluded GET that
+	// found a stored 404 counts bot-excluded NAMED, and excluded-live when the origin then answered live. Only
+	// named rows are the denominator: a HEAD's, and every row from before 0.97.4 (which never counted
+	// excluded-live), carry no bot and would understate the share. Per bot, because the decision to let a bot
+	// read the cache is made per bot.
+	const excludedFoundBy = new Map();
+	const excludedLiveBy = new Map();
 	for (const s of events) {
-		if (s.method === 'excluded-live')
-			liveByBot.set(s.type ?? 'unknown', (liveByBot.get(s.type ?? 'unknown') ?? 0) + s.count);
+		if (s.type === null || s.type === undefined || !keepBot(filter, s.type)) continue;
+		const into = s.method === 'bot-excluded' ? excludedFoundBy : s.method === 'excluded-live' ? excludedLiveBy : null;
+		if (into) into.set(s.type, (into.get(s.type) ?? 0) + s.count);
 	}
-	const liveBots = [...liveByBot.entries()]
-		.sort((a, b) => b[1] - a[1])
+	const sumOf = (map) => [...map.values()].reduce((a, b) => a + b, 0);
+	const excludedFound = sumOf(excludedFoundBy);
+	const excludedLive = sumOf(excludedLiveBy);
+	const perBot = [...excludedFoundBy.entries()]
+		.sort((a, b) => (excludedLiveBy.get(b[0]) ?? 0) - (excludedLiveBy.get(a[0]) ?? 0) || b[1] - a[1])
 		.slice(0, 3)
-		.map(([bot, count]) => `${bot} ${num(count)}`)
+		.map(([bot, found]) => {
+			const live = excludedLiveBy.get(bot) ?? 0;
+			return `${bot} ${riskShare(live, found)} (${num(live)}/${num(found)})`;
+		})
 		.join(' · ');
+	const excludesBots = (options.get('render.negative.excludeBots')?.effective ?? []).length > 0;
 
 	if (!enabled && !events.length && !answered && !rechecking && !reopens.length) {
 		return card('Negative cache', {
@@ -2293,12 +2303,13 @@ function negativeCache(ctx, data, filter) {
 					fmtCount(ev('recheck-gone') + ev('recheck-live') + ev('recheck-moved') + ev('recheck-error')),
 					`${num(ev('recheck-live'))} live · ${num(ev('recheck-error'))} failed · ${num(ev('recheck-busy'))} shed`
 				),
-				stat(
-					'Excluded bots, origin live',
-					excludedFound ? riskShare(excludedLive, excludedFound) : '—',
-					`${num(excludedLive)} of ${num(excludedFound)} excluded requests that found a stored 404 got a 200 from the origin` +
-						(liveBots ? ` · ${liveBots}` : '')
-				),
+				(excludesBots || excludedFound > 0) &&
+					stat(
+						'Excluded bots, origin live',
+						excludedFound ? riskShare(excludedLive, excludedFound) : '—',
+						`${num(excludedLive)} of ${num(excludedFound)} excluded GETs that found a stored 404 got a live answer from the origin` +
+							(perBot ? ` · ${perBot}` : '')
+					),
 				stat(
 					'Re-ask gap',
 					fmtMs(weighted(gaps, 'median')),

@@ -71,24 +71,29 @@ export const negativeCachePolicy = (entry) => {
 /** The storage key: the per-device cacheKey, or the device-free URL under `deviceIndependent`. */
 export const negativeKeyOf = ({ cacheKey, cacheUrl }, policy) => (policy?.deviceIndependent ? cacheUrl : cacheKey);
 
-// `excludeBots`, compiled to a lowercase Set and cached on the IDENTITY of the config array, the same
+// `excludeBots`, compiled to a lowercase-keyed Map and cached on the IDENTITY of the config array, the same
 // idiom as the discovery allowlist: applyOptions replaces config on every change, so an identity check
-// notices an edit and costs one comparison on the request path.
+// notices an edit and costs one comparison on the request path. The value is the CONFIGURED spelling: a
+// bot name derived from the UA keeps the UA's own casing, and the metrics must not split one listed bot
+// into several series by it.
 let excludedFrom;
-let excluded = new Set();
+let excluded = new Map();
 
-/** May a request from `botName` be answered from a stored response? */
-export const botMayReadNegative = (botName, policy) => {
+/** The `excludeBots` entry `botName` matches, in its configured spelling, or null when it may read. */
+export const excludedBotName = (botName, policy) => {
 	if (policy.excludeBots !== excludedFrom) {
 		excludedFrom = policy.excludeBots;
-		excluded = new Set(
+		excluded = new Map(
 			(Array.isArray(excludedFrom) ? excludedFrom : [])
 				.filter((name) => typeof name === 'string' && name !== '')
-				.map((name) => name.toLowerCase())
+				.map((name) => [name.toLowerCase(), name])
 		);
 	}
-	return !(typeof botName === 'string' && excluded.has(botName.toLowerCase()));
+	return typeof botName === 'string' ? (excluded.get(botName.toLowerCase()) ?? null) : null;
 };
+
+/** May a request from `botName` be answered from a stored response? */
+export const botMayReadNegative = (botName, policy) => excludedBotName(botName, policy) === null;
 
 /**
  * Which window a stored row is in, for a request arriving at `nowMs`: 'fresh' | 'revalidate' | 'expired'.
@@ -472,11 +477,9 @@ export const answerFromNegativeCache = async ({
 		return { row, verdict: 'expired' };
 	}
 
-	if (!botMayReadNegative(botName, policy)) {
-		metrics.negativeCache('bot-excluded', botName);
-		return { row, verdict, excluded: true, excludedBot: botName };
-	}
-
+	// THE TARGET GUARD BEFORE THE BOT CHECK, so an excluded bot's request is judged against the same row a
+	// readable bot's would be. A row a listed Target overrules answers nobody, and counting it for an excluded
+	// bot made `excluded-live` report a relisted product the sitemap had already protected.
 	const guarded = await guard(cacheUrl, policy);
 	if (guarded === 'error') {
 		// Fail closed: proxy. The row stays; its next read decides again.
@@ -489,6 +492,14 @@ export const answerFromNegativeCache = async ({
 		metrics.negativeCache(`guarded-${guarded}`);
 		void dropNegativePage(key);
 		return { row: null, verdict: null, guarded };
+	}
+
+	const excludedBot = excludedBotName(botName, policy);
+	if (excludedBot) {
+		// The bot name only on a GET: those are the requests `excluded-live` can judge (a HEAD's 200 proves
+		// nothing about the page), so the named rows are exactly its denominator.
+		metrics.negativeCache('bot-excluded', method === 'HEAD' ? null : excludedBot);
+		return { row, verdict, excluded: true, excludedBot };
 	}
 
 	if (policy.dryRun) {
@@ -573,14 +584,18 @@ export const afterNegativeProxy = (
 	if (row && method !== 'HEAD') {
 		// THE RISK NUMBER: an armed cache would have answered this request with the stored 404 (or answered
 		// it at once and only then re-checked), and the origin, asked anyway, says the page is live.
-		if (policy.dryRun && !excluded && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {
+		// LIVE = a 200, or a 304: the origin saying the crawler's own copy of a live page is current. A 3xx
+		// redirect drops the entry below but is not counted, since the page moved rather than came back.
+		const live = status === 200 || status === 304;
+		const wouldAnswer = verdict === 'fresh' || verdict === 'revalidate';
+		if (policy.dryRun && !excluded && live && wouldAnswer) {
 			metrics.negativeCache('would-serve-live');
 		}
 		// THE SAME RISK FOR AN EXCLUDED BOT, armed or not: the stale 404 an answer from storage would have
 		// given it. Its request always reaches the origin, so this is observed for free, and it is the number
 		// that decides whether a bot can leave `excludeBots`. Keyed on the bot rather than on `excluded`,
-		// which a guard error sets too.
-		if (excludedBot && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {
+		// which a guard error sets too; the guard already ran, so a row a listed Target overrules never gets here.
+		if (excludedBot && live && wouldAnswer) {
 			metrics.negativeCache('excluded-live', excludedBot);
 		}
 		if (status >= 200 && status < 400) void dropNegativePage(key);

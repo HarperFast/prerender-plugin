@@ -607,10 +607,40 @@ test("the negative-cache panel measures the excluded bots' stale-404 risk per bo
 	await load(ctx);
 	const text = everything(ctx);
 	assert.match(text, /Excluded bots, origin live/);
-	// 2 of 2,000, at the risk precision (not rounded to 0%).
-	assert.match(text, /0\.1%/);
-	assert.match(text, /2 of 2,000 excluded requests that found a stored 404 got a 200 from the origin · Googlebot 2/);
+	// 2 of 2,000, at the risk precision (not rounded to 0%), and per bot, since the decision is per bot.
+	assert.match(
+		text,
+		/2 of 2,000 excluded GETs that found a stored 404 got a live answer from the origin · Googlebot 0\.1% \(2\/1,500\) · Storebot-Google 0\.0% \(0\/500\)/
+	);
 	assert.match(text, /4 overruled by a sitemap listing/);
+});
+
+test('the excluded-bot share counts only NAMED rows, narrows with the bot filter, and hides when nothing is excluded', async () => {
+	const series = [
+		...ANALYTICS.series,
+		combo('prerender_ops', 'negative_cache', 'stored', null, 400),
+		// Unnamed: a HEAD, or a node still on a release before excluded-live existed. Never in the denominator.
+		combo('prerender_ops', 'negative_cache', 'bot-excluded', null, 8000),
+		combo('prerender_ops', 'negative_cache', 'bot-excluded', 'Googlebot', 1000),
+		combo('prerender_ops', 'negative_cache', 'bot-excluded', 'Storebot-Google', 1000),
+		combo('prerender_ops', 'negative_cache', 'excluded-live', 'Storebot-Google', 10),
+	];
+	const ctx = makeCtx({ analytics: { ...ANALYTICS, series } });
+	await load(ctx);
+	assert.match(everything(ctx), /10 of 2,000 excluded GETs/, 'the 8,000 unnamed rows stay out');
+
+	ctx.data.bots = ['Googlebot'];
+	assert.match(everything(ctx), /0 of 1,000 excluded GETs/, 'narrowed to the selected bot');
+
+	// No excludeBots configured and no excluded rows: the tile would only ever read "—".
+	const quiet = makeCtx({
+		analytics: {
+			...ANALYTICS,
+			series: [...ANALYTICS.series, combo('prerender_ops', 'negative_cache', 'stored', null, 4)],
+		},
+	});
+	await load(quiet);
+	assert.doesNotMatch(everything(quiet), /excluded GETs that found a stored 404/);
 });
 
 test('the per-route table counts a verified serve as cache-served', async () => {

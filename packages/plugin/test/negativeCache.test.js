@@ -599,6 +599,116 @@ test('excluded-live counts only an excluded bot, on a GET, for an entry that wou
 	}
 });
 
+// End to end through the real lookup: what `answerFromNegativeCache` hands `afterNegativeProxy` decides the count.
+const excludedRoundTrip = async ({
+	status = 200,
+	method = 'GET',
+	botName = 'Googlebot',
+	exclude = ['Googlebot'],
+	over = {},
+} = {}) => {
+	const pol = policy({ excludeBots: exclude });
+	const lookup = await answer({ botName, method, policy: pol, ...over });
+	await nc.afterNegativeProxy(
+		origin404({ statusCode: status, ...(method === 'HEAD' ? { content: streamOf('') } : {}) }),
+		{
+			key: KEY_A,
+			cacheUrl: URL_A,
+			policy: pol,
+			lookup,
+			method,
+		}
+	);
+	await settle();
+	return lookup;
+};
+
+test('a relisted URL is judged by the Target guard BEFORE the bot check: no excluded-live for a row the sitemap overrules', async () => {
+	rows.set(KEY_A, storedRow());
+	targets.set(URL_A, { sitemapUrl: 'https://www.example.com/sitemap_product_1.xml' });
+	await excludedRoundTrip();
+	assert.deepEqual(opsOf('negative_cache'), ['guarded-listed'], 'the same verdict a readable bot gets');
+	assert.equal(rows.has(KEY_A), false, 'the overruled row is dropped');
+});
+
+test('excluded-live end to end: a guard error, an invalidation or an expired row never counts; a 304 does, a 301 does not', async () => {
+	// Guard error: fails closed, proxies, and names no refused bot.
+	rows.set(KEY_A, storedRow());
+	failTarget = true;
+	await excludedRoundTrip();
+	assert.deepEqual(opsOf('negative_cache'), ['guard-error']);
+	failTarget = false;
+
+	// An invalidation newer than the last confirmation: the row answers nobody.
+	rows.set(KEY_A, storedRow());
+	ops.length = 0;
+	await excludedRoundTrip({ over: { epochOf: async () => ({ at: NOW }) } });
+	assert.equal(opsOf('negative_cache').includes('excluded-live'), false, 'invalidated');
+	assert.equal(opsOf('negative_cache').includes('bot-excluded'), false, 'invalidated is not in the denominator either');
+
+	// Expired: answers nobody, not in the denominator.
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 7 * HOUR), expiresAt: new Date(Date.now() + HOUR) }));
+	ops.length = 0;
+	await excludedRoundTrip();
+	assert.deepEqual(
+		opsOf('negative_cache').filter((o) => o === 'bot-excluded' || o === 'excluded-live'),
+		[],
+		'expired'
+	);
+
+	// A 304 is the origin saying the crawler's copy of a LIVE page is current.
+	rows.set(KEY_A, storedRow());
+	ops.length = 0;
+	await excludedRoundTrip({ status: 304 });
+	assert.deepEqual(opsOf('negative_cache'), ['bot-excluded', 'excluded-live'], '304');
+
+	// A redirect drops the row but the page moved rather than came back.
+	rows.set(KEY_A, storedRow());
+	ops.length = 0;
+	await excludedRoundTrip({ status: 301 });
+	assert.deepEqual(opsOf('negative_cache'), ['bot-excluded'], '301');
+	assert.equal(rows.has(KEY_A), false);
+});
+
+test('bot-excluded names the bot only on a GET, so its named rows are exactly the requests excluded-live can judge', async () => {
+	rows.set(KEY_A, storedRow());
+	await excludedRoundTrip({ method: 'HEAD' });
+	const head = ops.find((o) => o.method === 'bot-excluded');
+	assert.equal(head.type, null, 'a HEAD is counted, unnamed');
+	assert.equal(opsOf('negative_cache').includes('excluded-live'), false);
+});
+
+test('an excluded bot is named in its excludeBots spelling, whatever casing the UA gave it', async () => {
+	rows.set(KEY_A, storedRow());
+	await excludedRoundTrip({ botName: 'ADSBOT-GOOGLE-MOBILE', exclude: ['AdsBot-Google-Mobile'] });
+	assert.deepEqual(
+		ops.filter((o) => o.path === 'negative_cache').map((o) => [o.method, o.type]),
+		[
+			['bot-excluded', 'AdsBot-Google-Mobile'],
+			['excluded-live', 'AdsBot-Google-Mobile'],
+		]
+	);
+	assert.equal(
+		nc.excludedBotName('adsbot-google-mobile', policy({ excludeBots: ['AdsBot-Google-Mobile'] })),
+		'AdsBot-Google-Mobile'
+	);
+	assert.equal(nc.excludedBotName('Bingbot', policy({ excludeBots: ['AdsBot-Google-Mobile'] })), null);
+});
+
+test('would-serve-live counts a 304 as live too', async () => {
+	const dry = policy({ dryRun: true });
+	const row = storedRow();
+	rows.set(KEY_A, row);
+	await nc.afterNegativeProxy(origin404({ statusCode: 304, content: streamOf('') }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: dry,
+		lookup: { row, verdict: 'fresh' },
+	});
+	await settle();
+	assert.deepEqual(opsOf('negative_cache'), ['would-serve-live']);
+});
+
 test('a proxied 200 or redirect drops the entry; a 5xx leaves it', async () => {
 	for (const [statusCode, kept] of [
 		[200, false],
