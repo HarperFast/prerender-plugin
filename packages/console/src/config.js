@@ -1,6 +1,6 @@
 /**
  * Console component configuration. Deliberately tiny next to the plugin's schema machinery:
- * this component has four knobs, and its README is the option reference.
+ * this component has five knobs, and its README is the option reference.
  *
  * Mirrors the plugin's pattern where it matters: `config` is a live, pre-populated object
  * that modules read lazily at request time, and `applyOptions` mutates it in place so the
@@ -35,6 +35,12 @@ export const config = {
 
 	/** Name of the console's own session cookie (holds the per-node upstream tokens). */
 	cookieName: 'prerender-console-session',
+
+	/**
+	 * Answer repeat reads from the console's own cache instead of the prerender nodes
+	 * (src/util/readCache.js has the TTLs and who may read a hit). `false` sends every read upstream.
+	 */
+	cache: true,
 };
 
 const isValidNodeUrl = (value) => {
@@ -82,6 +88,9 @@ export function applyOptions(options = {}) {
 							'and operator credentials will be sent to whatever answers the configured node addresses.'
 					);
 				}
+				break;
+			case 'cache':
+				config.cache = value !== false;
 				break;
 			case 'cookieName':
 				if (typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value)) config.cookieName = value;

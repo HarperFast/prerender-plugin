@@ -30,6 +30,7 @@ Options are supplied by the host app under this component's key in its `config.y
     - 'https://node-b.internal.example.com:9926'
   requestTimeout: 30000 # ms deadline per proxied request
   rejectUnauthorized: true # verify upstream TLS; false hands operator credentials to whatever answers
+  cache: true # answer repeat reads from the console's read cache — see "Read cache" below
 ```
 
 **List nodes, not a load-balanced name.** Sessions are per Harper instance, and the underlying
@@ -93,9 +94,45 @@ Three properties worth knowing:
   additionally carries an envelope naming the node that accepted it and saying the rows replicate,
   so the console's own write path does not read as the failure that panel exists to raise.
 
-Cost: one bounded, per-worker-cached read per node per refresh, off the crawler serve path. The
-`analytics` cache TTL (`management.analytics.cacheTtl` on the prerender side) absorbs view
-switches and second operators, and the fan-out is capped at 6 concurrent upstream requests.
+Cost: about one bounded read per node per route per TTL, off the crawler serve path (see below),
+and the fan-out is capped at 6 concurrent upstream requests.
+
+## Read cache
+
+**Repeat reads are answered by the console, not the prerender nodes.** Every proxied GET goes through
+a cache keyed by the URL it would ask (node + route + query), so a view switch, a second operator, a
+second tab and a node drill-down after a cluster view are all answered without touching a node that is
+also serving crawlers ([`src/util/readCache.js`](src/util/readCache.js)).
+
+It is a **table**, `prerender_console.ProxyRead`, not memory: Harper spreads connections across worker
+threads, so a per-worker cache misses most of the time. That is also what limits the plugin's own
+per-worker analytics cache. The table is node-local (not replicated), unaudited (a crash costs one
+re-read), and has no `@export` (nothing reaches it over REST).
+
+| Routes                       | TTL    | Why                                                                    |
+| ---------------------------- | ------ | ---------------------------------------------------------------------- |
+| `analytics`, `crawl-breadth` | 60s    | Harper aggregates analytics once a minute; day-bucketed sketches       |
+| `metrics`                    | 10 min | the metric catalog — static per plugin release                         |
+| `pages`                      | 15s    | a capped page-cache scan on a heavy slot                               |
+| everything else              | 5s     | cheap on the node, and what an operator watches; collapses bursts only |
+| `session`, `page-content`    | never  | the auth check itself; a byte-exact, per-page download                 |
+
+- **A hit is served only to an operator the node has confirmed.** Every data route needs a super_user and
+  no answer depends on which one asked, so one answer can serve several operators. The console cannot
+  validate a session token itself, though, so a cached answer from node X goes only to a requester whose own
+  token node X confirmed in the last 60s: through a data read, the shell's session check, or a session check
+  the cache makes when it has neither. A cookie the node rejects gets the node's own `401`.
+- **Ages count from when the data was produced.** The plugin reports how old its analytics answer was
+  (`cacheAgeMs`), and the console starts its TTL from there. The two caches never stack, and the footer's
+  "cached Ns ago" includes the console's time too. Each node in `sources.nodes` carries `ageMs`, which is
+  how long ago the console fetched it, or `null` when it was just read.
+- **A write through the console invalidates every cached read**, on every worker, before the POST answers,
+  so the reload after an action reads the node. The read-only POSTs (`explain`, `schedule`, `sitemap`) leave
+  the cache alone. A write made elsewhere (another console host, the plugin's own schedulers) is seen once
+  the TTL runs out.
+- Concurrent misses for one URL on one worker send one request; a burst that lands on several workers
+  before the first answer is stored can send one per worker. Only readable JSON `200`s up to 4 MB are
+  stored. `cache: false` sends every read upstream.
 
 ## Editing configuration
 

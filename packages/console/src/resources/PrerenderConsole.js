@@ -33,11 +33,17 @@
  * and merges the answers here; `node=<hostname>` is the drill-down. Which routes merge, which
  * are answered by one node because the data replicates, and how each merge is defined, all live
  * in util/aggregate.js. Writes are never fanned out — see the POST handler.
+ *
+ * EVERY READ GOES THROUGH THE READ CACHE (util/readCache.js), per node: a cluster view and a node
+ * drill-down share entries, and an answer fetched for one operator serves the next — but only once
+ * that node has confirmed the next operator's own session. Writes invalidate it.
  */
 
 import { request as undiciRequest, Agent } from 'undici';
 import { config, getLogger } from '../config.js';
 import { getAdminAsset, renderAdminPage } from '../admin/index.js';
+import { runDetached } from '../util/detach.js';
+import { createReadCache, invalidatesReads } from '../util/readCache.js';
 import {
 	cookiePairsFrom,
 	decodeSessionCookie,
@@ -142,15 +148,45 @@ async function upstream(origin, path, { method = 'GET', body, cookie } = {}) {
 	});
 }
 
-/** Pass an upstream response through: status + content-type + body, nothing else. */
-async function passThrough(res) {
-	const contentType = String(res.headers['content-type'] ?? 'application/json; charset=utf-8');
-	const body = Buffer.from(await res.body.arrayBuffer());
-	return new Response(body, {
+/** One upstream response, consumed: status, content type and bytes. */
+async function consume(res) {
+	return {
 		status: res.statusCode,
-		headers: noStore({ 'content-type': contentType, 'x-content-type-options': 'nosniff' }),
-	});
+		contentType: String(res.headers['content-type'] ?? 'application/json; charset=utf-8'),
+		body: Buffer.from(await res.body.arrayBuffer()),
+	};
 }
+
+/** Pass an upstream answer through: status + content-type + body, nothing else. */
+const passThrough = (answer) =>
+	new Response(answer.body, {
+		status: answer.status,
+		headers: noStore({ 'content-type': answer.contentType, 'x-content-type-options': 'nosniff' }),
+	});
+
+const isSuperUserSession = (status, body) => status === 200 && !!body?.authenticated && !!body?.superUser;
+
+/** Whether `origin` accepts this token as a super_user — what the read cache asks before serving a hit. */
+async function confirmsSuperUser(origin, cookie) {
+	const res = await upstream(origin, 'session', { cookie });
+	return isSuperUserSession(res.statusCode, await res.body.json().catch(() => null));
+}
+
+const reads = createReadCache({
+	table: () => (typeof databases === 'undefined' ? null : (databases?.prerender_console?.ProxyRead ?? null)),
+	fetch: async (origin, path, cookie) => consume(await upstream(origin, path, { cookie })),
+	verify: confirmsSuperUser,
+	detach: runDetached,
+	enabled: () => config.cache,
+	log: { warn: (message) => getLogger().warn(message) },
+});
+
+/**
+ * The shell checks the session before every view load; the answer is also the read cache's proof of
+ * who this token belongs to, so a hit right after it needs no second check.
+ */
+const noteSession = (origin, cookie, status, body) =>
+	isSuperUserSession(status, body) ? reads.confirm(origin, cookie) : reads.forget(origin, cookie);
 
 // ------------------------------------------------------------------ cluster fan-out
 
@@ -190,7 +226,7 @@ const hostOf = (origin) => {
  * failing the whole request because one node of four is unreachable — would make the cluster
  * view useless in exactly the situation an operator opens it for.
  */
-async function fanOut(route, { tokens, query = '', method = 'GET', body } = {}) {
+async function fanOut(route, { tokens, query = '' } = {}) {
 	return mapLimit(config.nodes, FANOUT_CONCURRENCY, async (origin) => {
 		const base = { origin, hostname: hostOf(origin) };
 		const cookie = tokens[origin];
@@ -198,15 +234,15 @@ async function fanOut(route, { tokens, query = '', method = 'GET', body } = {}) 
 
 		const began = Date.now();
 		try {
-			const res = await upstream(origin, route + (query ? `?${query}` : ''), { method, body, cookie });
+			const answer = await reads.read(origin, route, query, cookie);
 			const ms = Date.now() - began;
-			const payload = await res.body.json().catch(() => null);
-			if (res.statusCode !== 200) {
+			const payload = answer.payload ?? null;
+			if (answer.status !== 200) {
 				return {
 					...base,
 					ok: false,
-					status: res.statusCode,
-					error: payload?.error ?? `answered ${res.statusCode}`,
+					status: answer.status,
+					error: payload?.error ?? `answered ${answer.status}`,
 					ms,
 					// Kept apart from `body`, which every merger treats as a usable answer: only a merger
 					// that knows a route's non-200 means something reads this (queue-state's 503 carries
@@ -214,7 +250,7 @@ async function fanOut(route, { tokens, query = '', method = 'GET', body } = {}) 
 					errorBody: payload,
 				};
 			}
-			return { ...base, ok: true, status: 200, error: null, ms, body: payload };
+			return { ...base, ok: true, status: 200, error: null, ms, ageMs: answer.ageMs, body: payload };
 		} catch (e) {
 			return {
 				...base,
@@ -239,8 +275,7 @@ async function firstReachable(route, { tokens, query = '', signedIn }) {
 	let lastError = null;
 	for (const origin of signedIn) {
 		try {
-			const res = await upstream(origin, route + (query ? `?${query}` : ''), { cookie: tokens[origin] });
-			return { origin, res };
+			return { origin, answer: await reads.read(origin, route, query, tokens[origin]) };
 		} catch (e) {
 			lastError = e;
 			getLogger().warn(
@@ -259,7 +294,7 @@ async function firstReachable(route, { tokens, query = '', signedIn }) {
  * "N of M nodes answered" banner off a page where nothing is missing: that banner reads
  * `complete === false` on every payload a view loaded.)
  */
-const oneNodeSources = (mode, origin, tokens, note, skipped) => ({
+const oneNodeSources = (mode, origin, tokens, note, skipped, ageMs = null) => ({
 	mode,
 	scope: 'cluster',
 	servedBy: hostOf(origin),
@@ -274,6 +309,7 @@ const oneNodeSources = (mode, origin, tokens, note, skipped) => ({
 		status: node === origin ? 200 : 0,
 		error: node === origin ? null : tokens[node] ? skipped : 'not signed in to this node',
 		ms: null,
+		ageMs: node === origin ? ageMs : null,
 	})),
 });
 
@@ -282,9 +318,9 @@ const oneNodeSources = (mode, origin, tokens, note, skipped) => ({
  * implies a fan-out that did not happen. A non-JSON body is passed through untouched —
  * `page-content` serves a stored page as text and must stay byte-exact.
  */
-async function sharedResponse(route, origin, res, tokens) {
-	if (res.statusCode !== 200) return passThrough(res);
-	const payload = await res.body.json().catch(() => null);
+function sharedResponse(route, origin, answer, tokens) {
+	if (answer.status !== 200) return passThrough(answer);
+	const payload = answer.payload;
 	if (!payload || typeof payload !== 'object')
 		return json({ error: 'The prerender node sent an unreadable body' }, 502);
 	return json({
@@ -295,7 +331,8 @@ async function sharedResponse(route, origin, res, tokens) {
 			origin,
 			tokens,
 			SHARED_NOTE[route] ?? 'this data is the same on every node',
-			'not queried (replicated data)'
+			'not queried (replicated data)',
+			answer.ageMs
 		),
 	});
 }
@@ -312,9 +349,14 @@ async function sharedResponse(route, origin, res, tokens) {
  * A non-200 passes through untouched: it is the node's real answer, and a refusal wearing a
  * cluster envelope reads as though the cluster refused.
  */
-async function replicatedWriteResponse(route, origin, res, tokens) {
-	if (res.statusCode !== 200) return passThrough(res);
-	const payload = await res.body.json().catch(() => null);
+function replicatedWriteResponse(route, origin, answer, tokens) {
+	if (answer.status !== 200) return passThrough(answer);
+	let payload = null;
+	try {
+		payload = JSON.parse(answer.body.toString('utf8'));
+	} catch {
+		/* unreadable — refused below */
+	}
 	if (!payload || typeof payload !== 'object')
 		return json({ error: 'The prerender node sent an unreadable body' }, 502);
 	return json({
@@ -378,8 +420,7 @@ export class PrerenderConsole extends Resource {
 		if (!tokens[node]) return json({ error: 'Not signed in to this node', authenticated: false }, 401);
 
 		try {
-			const res = await upstream(node, route + (query ? `?${query}` : ''), { cookie: tokens[node] });
-			return await passThrough(res);
+			return passThrough(await reads.read(node, route, query, tokens[node]));
 		} catch (e) {
 			return PrerenderConsole.upstreamError(node, e);
 		}
@@ -404,11 +445,11 @@ export class PrerenderConsole extends Resource {
 		}
 
 		// Replicated or static: one node answers for the cluster.
-		const { origin, res, error } = await firstReachable(route, { tokens, query, signedIn });
+		const { origin, answer, error } = await firstReachable(route, { tokens, query, signedIn });
 		if (!origin) return PrerenderConsole.upstreamError(signedIn[0], error ?? new Error('no node answered'));
 		// A stored page is served as text and downloaded, not parsed — it must stay byte-exact,
 		// so it never gets the JSON envelope.
-		return route === 'page-content' ? passThrough(res) : sharedResponse(route, origin, res, tokens);
+		return route === 'page-content' ? passThrough(answer) : sharedResponse(route, origin, answer, tokens);
 	}
 
 	async post(target, data) {
@@ -446,16 +487,21 @@ export class PrerenderConsole extends Resource {
 		if (!node) return json({ error: 'Not signed in to any node', authenticated: false }, 401);
 		if (!tokens[node]) return json({ error: 'Not signed in to this node', authenticated: false }, 401);
 
+		let answer;
 		try {
-			const res = await upstream(node, route, { method: 'POST', body: data ?? {}, cookie: tokens[node] });
-			// Only under cluster scope: asked of a named node, the operator already knows where the
-			// write went, and the answer stays byte-exact.
-			return scope.cluster && REPLICATED_POST_NOTE[route]
-				? await replicatedWriteResponse(route, node, res, tokens)
-				: await passThrough(res);
+			answer = await consume(await upstream(node, route, { method: 'POST', body: data ?? {}, cookie: tokens[node] }));
 		} catch (e) {
 			return PrerenderConsole.upstreamError(node, e);
+		} finally {
+			// Before answering, whatever the outcome: a write that failed in transit may still have
+			// landed, and the reload that follows this response must not read the answer from before it.
+			if (invalidatesReads(route)) await reads.noteWrite();
 		}
+		// Only under cluster scope: asked of a named node, the operator already knows where the
+		// write went, and the answer stays byte-exact.
+		return scope.cluster && REPLICATED_POST_NOTE[route]
+			? replicatedWriteResponse(route, node, answer, tokens)
+			: passThrough(answer);
 	}
 
 	/**
@@ -494,6 +540,7 @@ export class PrerenderConsole extends Resource {
 				try {
 					const res = await upstream(origin, 'session', { cookie: tokens[origin] });
 					const body = await res.body.json().catch(() => null);
+					noteSession(origin, tokens[origin], res.statusCode, body);
 					if (body?.authenticated) {
 						return json({ ...body, node: null, scope: 'cluster', checkedNode: hostOf(origin), ...base });
 					}
@@ -516,6 +563,7 @@ export class PrerenderConsole extends Resource {
 		try {
 			const res = await upstream(node, 'session', { cookie: tokens[node] });
 			const body = await res.body.json();
+			noteSession(node, tokens[node], res.statusCode, body);
 			return json({ ...body, ...base });
 		} catch (e) {
 			getLogger().warn(`[prerender-console] session check against ${node} failed: ${e?.message ?? String(e)}`);
@@ -594,6 +642,9 @@ export class PrerenderConsole extends Resource {
 	/** Best-effort upstream logouts, then drop the console cookie — the part that matters. */
 	static async logout(context) {
 		const tokens = tokensFrom(context);
+		// This worker stops vouching at once; the others within `VERIFY_MS`, and the upstream sessions
+		// end now, so no node confirms these tokens again.
+		for (const [origin, cookie] of Object.entries(tokens)) reads.forget(origin, cookie);
 		await Promise.all(
 			Object.entries(tokens).map(([origin, cookie]) =>
 				upstream(origin, 'logout', { method: 'POST', body: {}, cookie }).then(

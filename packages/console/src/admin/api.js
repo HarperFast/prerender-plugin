@@ -91,7 +91,8 @@ async function request(path, options) {
  * switching views mid-load used to issue a second identical fetch, which the browser then held
  * behind the first (its cache lock) and which the node answered twice. Sharing the promise makes the
  * second caller ride the first. Only while in flight: a finished request is never reused, so a
- * Refresh always goes back to the server.
+ * Refresh always goes back to the console — which answers it from its read cache inside the route's
+ * TTL (util/readCache.js), and from the node after it.
  */
 const inflight = new Map();
 
