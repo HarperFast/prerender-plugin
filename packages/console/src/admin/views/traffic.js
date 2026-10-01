@@ -838,7 +838,8 @@ const NOT_HIT = {
 		'the stored 404 answered at once while the origin was re-checked in the background — counted against offload',
 	],
 	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
-	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD)'],
+	// An over-limit URL is `bypass` too from plugin v0.97.3: its cache key would exceed Harper's key limit.
+	'bypass': ['not-cacheable', 'not a cacheable request at all (non-GET/HEAD, or a URL too long to be a cache key)'],
 };
 
 /** Fold the non-hit serves into one row per verdict, carrying what answered each of them. */
