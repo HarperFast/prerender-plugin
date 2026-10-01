@@ -114,7 +114,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					"{ match: 'exact' | 'prefix' | 'contains', path: string, mode?: 'prerender' | 'passthrough', " +
 					'queryParams?: string[], renderInterval?: number, discoverTargets?: boolean, demandFloor?: number, ' +
 					"departureAction?: 'none' | 'expire' | 'render', arrivalAction?: 'none' | 'render', " +
-					'rawCache?: boolean, negativeCache?: boolean, entityPrefix?: string }.\n\n' +
+					'rawCache?: boolean, rawFacts?: boolean | string[], negativeCache?: boolean, entityPrefix?: string }.\n\n' +
 					'FIRST MATCH WINS, so order most-specific first. That ordering is what lets a passthrough ' +
 					'carve-out sit inside a prerendered prefix (`/products/clearance/` above `/products/`) ' +
 					'without a second list and a precedence rule.\n\n' +
@@ -197,6 +197,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'`discoverTargets: false` — gated URLs are exactly the population this is for, and gating ' +
 					'without it leaves them missing on every request forever. Enable it only on a route whose ' +
 					'server-rendered document already carries its SEO surface; see `render.raw`.\n\n' +
+					'`rawFacts` (default off; only meaningful with `rawCache`) — the page facts to read off each document ' +
+					'as it is stored and keep beside it (`RawPage.facts`), so a stored document can be compared with the ' +
+					'origin without reading its body: `true` for every head fact (title, metaDescription, canonical, ' +
+					'product, breadcrumbs), or an array naming them, plus `itemList` for a listing page’s products. ' +
+					'The scan stops once it has what was named, so name only what will be compared: on a template ' +
+					'whose head is mostly inline CSS, `[title, metaDescription, canonical]` reads ~1 KB where `true` ' +
+					'reads the whole head. Costs tens of microseconds per stored document, after the response.\n\n' +
 					'`negativeCache` (default false, prerender routes only, requires `render.negative.enabled`) — ' +
 					'whether a MISS on this route that the origin answers 404/410 stores that response, so the next ' +
 					'crawler asking for the same dead URL is answered without another origin round trip. Like ' +

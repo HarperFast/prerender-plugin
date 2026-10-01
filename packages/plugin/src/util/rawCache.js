@@ -41,6 +41,7 @@ import { promisify } from 'node:util';
 import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 import { getNextTimeOfDay } from './time.js';
+import { documentFactsOf, serializeDocumentFacts } from './documentFacts.js';
 
 const table = () => databases.raw_cache.RawPage;
 
@@ -422,18 +423,48 @@ export const storableBody = async (originHeaders, bytes) => {
 };
 
 /**
+ * The page facts to store beside a captured document (see `rawFacts` on the route), as canonical JSON,
+ * or null: not asked for, nothing found, the record refused as oversize, or the scan failed. Read off the
+ * bytes AS RECEIVED, before `storableBody` compresses them: an identity body is scanned in place (~20 µs
+ * for a ~250 KB product page, beside the ~1.3 ms the gzip that follows costs), and a compressed one is
+ * inflated only as far as its facts (~40-70 µs measured). Synchronous on purpose — one short slice on a
+ * path that already runs after the crawler's response, not a threadpool round trip (util/documentFacts.js).
+ *
+ * NEVER fails the store: facts are an addition to the row, and a document stored without them is
+ * exactly a document stored before this existed — no claim.
+ */
+export const rawFactsOf = (resource, bytes, want) => {
+	if (!want) return null;
+	try {
+		const { facts } = documentFactsOf(bytes, {
+			url: resource.url ?? null,
+			contentEncoding: resource.headers?.['content-encoding'] ?? null,
+			contentType: resource.headers?.['content-type'] ?? null,
+			want,
+		});
+		return serializeDocumentFacts(facts).json;
+	} catch (e) {
+		logger.warn?.(`[prerender] raw document facts not read for ${resource.url}: ${e?.message ?? String(e)}`);
+		return null;
+	}
+};
+
+/**
  * Store a captured document. Best-effort by contract: every failure is counted and swallowed,
  * because this runs detached from a response that has already been served and there is nobody left
  * to tell.
  */
-export const storeRawPage = async ({ cacheKey, resource, bytes, policy }) => {
+export const storeRawPage = async ({ cacheKey, resource, bytes, policy, factsWant = null }) => {
 	try {
+		// Before `storableBody`, which may compress `bytes`: the scan is cheapest on what arrived.
+		const facts = rawFactsOf(resource, bytes, factsWant);
 		const stored = await storableBody(resource.headers, bytes);
 		await table().put(cacheKey, {
 			statusCode: resource.statusCode,
 			lastCached: new Date(),
 			content: createBlob(stored.bytes),
 			headers: JSON.stringify(stored.headers),
+			facts,
 			expiresAt: new Date(rawExpiresAt(policy)),
 		});
 		// COUNTED APART WHEN THE ORIGIN CALLED IT PERSONAL. Enabling `assumeShared` must not silence
@@ -456,7 +487,7 @@ export const storeRawPage = async ({ cacheKey, resource, bytes, policy }) => {
  * `page_cache`-shaped write in front of a crawler's body is latency the crawler pays for a benefit
  * only the NEXT crawler gets.
  */
-export const captureForRawCache = (resource, { cacheKey, policy }) => {
+export const captureForRawCache = (resource, { cacheKey, policy, factsWant = null }) => {
 	const refusal = storeRefusal(resource, policy);
 	if (refusal) {
 		metrics.rawCache(refusal);
@@ -486,7 +517,7 @@ export const captureForRawCache = (resource, { cacheKey, policy }) => {
 				metrics.rawCache(result.bytes ? 'empty' : result.outcome);
 				return;
 			}
-			return storeRawPage({ cacheKey, resource, bytes: result.bytes, policy });
+			return storeRawPage({ cacheKey, resource, bytes: result.bytes, policy, factsWant });
 		})
 		// The store is detached, so nothing else would observe a throw from the metric emit or the
 		// logger inside `storeRawPage`'s own catch. An unhandled rejection here would be a process-level

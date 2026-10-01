@@ -525,7 +525,7 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
 	const kept =
 		rawPolicy && request.method !== 'HEAD'
-			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy })
+			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy, factsWant: info.route?.rawFacts ?? null })
 			: resource;
 	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
 	// only 200s, the negative cache only its configured statuses.

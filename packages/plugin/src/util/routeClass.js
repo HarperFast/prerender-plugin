@@ -35,6 +35,7 @@
 import { createHash } from 'node:crypto';
 import { config, getLogger } from '../config.js';
 import { compileEntityPrefix, endsOnDelimiter } from './entityGate.js';
+import { DOCUMENT_FACTS, HEAD_FACTS } from './documentFacts.js';
 
 export const PRERENDER = 'prerender';
 export const PASSTHROUGH = 'passthrough';
@@ -243,6 +244,32 @@ const compileEntry = (raw, source, warn) => {
 		}
 	}
 
+	// Optional per-route PAGE FACTS for the raw cache: which facts (util/documentFacts.js) to read off a
+	// document as it is stored, so a stored document can be compared with the origin without reading its
+	// blob. `true` = every head fact; an array names them (the scan stops once it has them, which is what
+	// keeps a template with a huge head cheap). Same drop-the-FIELD rule: a typo stores no facts — no
+	// claim — and changes nothing about how the path is served or cached.
+	let rawFacts = null;
+	if (raw.rawFacts !== undefined && raw.rawFacts !== null && raw.rawFacts !== false) {
+		const wanted = raw.rawFacts === true ? HEAD_FACTS : raw.rawFacts;
+		if (mode === PASSTHROUGH) {
+			warn(`ignoring rawFacts on passthrough route "${raw.match} ${raw.path}" — a passthrough route stores nothing`);
+		} else if (!Array.isArray(wanted) || wanted.length === 0 || wanted.some((f) => !DOCUMENT_FACTS.includes(f))) {
+			warn(
+				`ignoring rawFacts on route "${raw.match} ${raw.path}" — expected true or a non-empty array of ` +
+					`${DOCUMENT_FACTS.join(', ')}; got ${JSON.stringify(raw.rawFacts)}`
+			);
+		} else {
+			rawFacts = Object.freeze([...new Set(wanted)]);
+			if (!rawCache) {
+				warn(
+					`rawFacts on route "${raw.match} ${raw.path}" does nothing: the route does not set rawCache: true, ` +
+						`so it stores no documents to read facts from`
+				);
+			}
+		}
+	}
+
 	// Optional per-route negative cache (util/negativeCache.js) — `rawCache`'s sibling for the origin's own
 	// 404/410. Same drop-the-FIELD rule, and the same split: this is the ROUTE's opt-in only, and
 	// `render.negative.enabled` is the master switch checked at the call site.
@@ -317,6 +344,7 @@ const compileEntry = (raw, source, warn) => {
 		departureAction,
 		arrivalAction,
 		rawCache,
+		rawFacts,
 		negativeCache,
 		entityPrefix,
 		source,

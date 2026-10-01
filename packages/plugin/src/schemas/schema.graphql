@@ -678,6 +678,12 @@ type RawPage @table(database: "raw_cache", expiration: 172800) @sealed {
 	# serve path's miss branch and buy nothing.
 	content: Blob
 	lastCached: Date
+	# What the stored document CLAIMS, read off its bytes as it was stored (util/documentFacts.js), when the
+	# route asks for it (`rawFacts`): canonical JSON in the page-record shape (`ProbeState.pageFacts`, plus
+	# `itemList` for a listing page), at most 16 KB, else null. Lets a stored document be compared with the
+	# origin without reading or inflating its blob. Null — including on every row stored before this
+	# existed — is no claim, never "verified".
+	facts: String
 	# @expiresAt MAKES THIS FIELD THE RECORD'S REAL EXPIRATION, not merely a column the serve path
 	# reads. Without it Harper stamps every row with the table default above (48h) and reclaims on that
 	# schedule, while `readRawPage` independently refuses the row at this timestamp — so between the
