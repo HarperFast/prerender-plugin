@@ -165,7 +165,8 @@ type Target @table(database: "render_service") @export {
 # a document proxied from the origin (which moves a row, never creates one) — and only when the canonical
 # MOVES or a dry run remembers an adoption (an unchanged observation writes nothing). Replicated and NOT
 # residency-pinned, like `Target`: a row per entity plus ~one write per re-slug, and every node answers a point
-# read locally. Not @export: internal state, read through the admin API. Inert unless `entities.enabled`.
+# read locally. Not @export: internal state, read through the admin API. On by default (`entities.enabled`),
+# and empty for a deployment whose routes declare no `entityPrefix`.
 type Entity @table(database: "render_service") {
 	id: String @primaryKey
 	# The canonical URL (a Target key) the newest observation named.

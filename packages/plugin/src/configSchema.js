@@ -244,7 +244,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'origin since the last anchor and not heard re-slugged since by the entity registry (see ' +
 					'`ingress.entityServe`); anything else falls through to the ordinary miss path. Setting it also ' +
 					'lets every document proxied from the origin on the route teach the registry the canonical it ' +
-					'declares (`entities.enabled`). ONLY FOR A SITE THAT ANSWERS EVERY SPELLING OF AN ENTITY WITH THE SAME ' +
+					'declares (the entity registry, `entities`). ONLY FOR A SITE THAT ANSWERS EVERY SPELLING OF AN ENTITY WITH THE SAME ' +
 					'DOCUMENT. The experiment that settles it: fetch two spellings of one product from the origin and ' +
 					'compare everything but per-response noise — the canonical, title, description, offers and ' +
 					'breadcrumbs must be identical, and the canonical must name the same URL from both. Governed by ' +
@@ -308,7 +308,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'registry names one of them. That page must have been rendered since the threshold ' +
 					'below, or checked against the origin since then by a check that compared its canonical and ' +
 					'found it the same (`PageCheck.canonicalAgreed` — the serve-time check and the probe sweep write ' +
-					'it, so the probe rule must map `canonical`); with `entities.enabled`, the registry must not have ' +
+					'it, so the probe rule must map `canonical`); unless the registry is switched off, it must not have ' +
 					'heard the origin name another canonical since (`moved`); and its own `<link rel=canonical>` ' +
 					'must name it. ' +
 					'An unconfirmed page is offered to the serve-time check, under that check\u2019s own switches and ' +
@@ -322,7 +322,7 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'entity-served. With `ingress.entityGate.dryRun: true` only each spelling\u2019s first request ' +
 					'can be answered, and `would-serve` undercounts what arming would answer by its repeats (read ' +
 					'as `has-target`). A served spelling is never minted: it was not a miss.\n\n' +
-					'TURN THE REGISTRY ON WITH IT (`entities.enabled`, adoption armed): with the gate armed, adoption ' +
+					'ARM ADOPTION WITH IT (`entities.adopt.dryRun: false`; the registry is on by default): with the gate armed, adoption ' +
 					'is what files a re-slugged product\u2019s new canonical, and the registry is what tells this ' +
 					'serve the old page has moved.\n\n' +
 					'Observed on `prerender_ops` / `entity_serve`, one emit per evaluation by outcome, and ' +
@@ -3176,9 +3176,13 @@ export const configSchema = group('Prerender plugin configuration.', {
 			'(`ingress.entityServe`). Observations on `prerender_ops` / `entity_canonical`.',
 		{
 			enabled: option(
-				false,
-				'Keep the registry. Off by default: on, the first probe pass writes one row per probed entity (paced ' +
-					'by the probe) and renders fill in the rest; after that it writes only when a canonical moves.'
+				true,
+				'Keep the registry. ON by default, and inert for any route without an `ingress.routes[].entityPrefix`: ' +
+					'that prefix is the opt-in. On a route with one, the first probe pass writes one row per probed ' +
+					'entity (paced by the probe) and renders fill in the rest; after that it writes only when a canonical ' +
+					'moves. Nothing a crawler sees changes with it alone: adoption is dry run by default ' +
+					'(`entities.adopt.dryRun`), and the entity serve needs its own opt-in. Off removes every registry ' +
+					'read and write, and the entity serve then has no `moved` veto and no tie-break.'
 			),
 			adopt: group(
 				'ADOPT A CANONICAL NO TARGET HOLDS (util/entity.js `resolveCanonical`, issue #166). When an observation ' +
@@ -3195,7 +3199,10 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'observations are the origin\u2019s own answers for the entity, so a crawler-invented spelling ' +
 					'cannot make one invent a canonical. Outcomes on `prerender_ops` / `canonical_adopt`.',
 				{
-					enabled: option(true, 'Switch. Inert until `entities.enabled`, so leaving it on costs nothing until then.'),
+					enabled: option(
+						true,
+						'Switch. Files nothing while `dryRun` is on, and nothing at all with the registry off.'
+					),
 					dryRun: option(
 						true,
 						'Count `would-adopt` and file nothing. The default, because the number to know first is how many ' +

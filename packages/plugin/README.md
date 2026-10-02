@@ -363,7 +363,7 @@ origin, exactly as before:
   systematic disagreement on another field, served at its own URL anyway) confirms; a `mismatch` does
   not. Outside anchored mode there is no anchor: set `ingress.entityServe.maxConfirmAge`, or nothing is
   ever confirmed.
-- **The registry has not heard otherwise since** (`moved`, with `entities.enabled`). The registry holds the
+- **The registry has not heard otherwise since** (`moved`; the registry is on by default). The registry holds the
   canonical the origin named most recently, from whichever fetch saw it first: the nightly probe, a render
   (including the canonical a canonical verdict declares), a serve-time check, or a miss proxied to the
   origin. When it names another document, first heard after the page was last confirmed, the page
@@ -394,7 +394,7 @@ Armed, the gate never mints such a spelling. A served spelling is never minted e
 not a miss. So with the gate in dry run, `would-serve` counts only each spelling's first request: arm
 the gate first, or read `would-serve` as a floor.
 
-**Turn the registry on with it** (`entities.enabled`, adoption out of dry run). With the gate armed, a
+**Arm adoption with it** (`entities.adopt.dryRun: false`; the registry itself is on by default). With the gate armed, a
 re-slugged product's new canonical is not minted while its old spelling is in rotation, and an
 out-of-stock product's is never in the sitemap. So until the old spelling's re-render suppresses it,
 adoption is what files the new canonical, and the registry is what tells the entity serve the old page
@@ -412,10 +412,14 @@ holding the entity's current canonical URL ([#166](https://github.com/HarperFast
 
 ```yaml
 entities:
-  enabled: true
+  enabled: true # the default: a route opts in by declaring entityPrefix
   adopt:
     dryRun: true # the default: count would-adopt, file nothing
 ```
+
+On by default, because the route's `entityPrefix` is already the opt-in. A deployment with no such route
+has no entities and the registry does nothing. Alone it changes nothing a crawler sees: adoption files
+nothing until `adopt.dryRun: false`, and the entity serve needs its own `entityServe`.
 
 - **Written by observations of the origin only**: every fetch that says which URL is the entity's
   canonical. On a site whose every spelling of a product is one document, each is the origin's own

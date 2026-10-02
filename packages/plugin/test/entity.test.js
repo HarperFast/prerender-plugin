@@ -176,14 +176,14 @@ test('a failed read or write is counted and swallowed', async () => {
 	assert.deepEqual(ops('entity_canonical'), [['error', 'probe']]);
 });
 
-test('OFF (the default): no read, no write, nothing counted', async () => {
+test('OFF: no read, no write, nothing counted', async () => {
 	configure({ entities: { enabled: false } });
 	assert.equal((await observe(CANON)).outcome, null);
 	await entity.observeRenderedCanonical(CANON, CANON, Date.now());
 	assert.deepEqual(writes, []);
 	assert.deepEqual(analytics, []);
 	applyOptions({});
-	assert.equal(config.entities.enabled, false);
+	assert.equal(config.entities.enabled, true, 'on by default: a route opts in with entityPrefix');
 });
 
 test('a stored render reports the canonical its page declared', async () => {
@@ -433,10 +433,10 @@ test('a failed adoption is counted and swallowed', async () => {
 	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'error');
 });
 
-test('config: the registry is off by default; adoption is on but dry run, bounded', () => {
+test('config: the registry is on by default (a route opts in with entityPrefix); adoption is on but dry run, bounded', () => {
 	applyOptions({});
 	assert.deepEqual(config.entities, {
-		enabled: false,
+		enabled: true,
 		adopt: { enabled: true, dryRun: true, maxPerHour: 60, retryAfter: 7 * 24 * HOUR },
 	});
 	assert.equal('adoptCanonical' in config.changeProbe, false, 'one home: the registry\u2019s own group');

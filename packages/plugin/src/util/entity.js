@@ -46,7 +46,8 @@
  * replicated like `Target`: writes are rare (an entity's first observation, then only a MOVE — an
  * unchanged observation writes nothing), and every node answers a point read locally.
  *
- * Inert unless `entities.enabled`. Every failure is counted and swallowed: nothing here may cost a render
+ * On by default and inert for any route without an `entityPrefix`, which is the opt-in; `entities.enabled: false`
+ * turns it off. Every failure is counted and swallowed: nothing here may cost a render
  * result or a probe.
  */
 

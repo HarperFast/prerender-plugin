@@ -197,13 +197,13 @@ Notes that bite:
   `has-target`). `unconfirmed` climbs right after the anchor and falls as the pass and the serve-time
   checks confirm canonicals. If a route stays there, no check compares its `canonical`. `moved`
   (v0.102.0) is a page the origin has since been heard naming another canonical: by the registry
-  (`entities.enabled`), or by the spelling's own canonical verdict when it is newer than the page's last
+  (on by default), or by the spelling's own canonical verdict when it is newer than the page's last
   confirmation and did not name it. It should be rare. With adoption armed it should not persist for an
   entity, because the observation that moved the registry also filed the new canonical; under the
   adoption dry run, or past `maxPerHour`, it lasts until the new canonical renders by another path. `entity_serve_ms` (v0.102.0) is each evaluation's duration, every outcome: a
   duration, so read its percentiles.
 - **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
-  `entities.enabled`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
+  `entities.enabled`, on by default for routes with an `entityPrefix`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
   what it did to the registry (`new`, `moved`, `same`, `older`, `foreign` — another entity's prefix, or a
   query string — `untracked` — a crawler's proxied miss of an entity with no row, which creates none —
   `unreadable`, `error`),
