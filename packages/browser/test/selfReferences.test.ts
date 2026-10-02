@@ -83,7 +83,7 @@ let base = '';
 
 const FIXTURE = `<!doctype html><html><head><title>stars</title></head><body>
 <svg width="0" height="0"><defs><linearGradient id="star_filled"><stop offset="1" stop-color="#fc0"/></linearGradient></defs></svg>
-<svg id="stars" width="20" height="20"></svg>
+<svg id="stars" width="20" height="20" style="display:block"></svg>
 <script>
 document.getElementById('stars').innerHTML =
 	'<path d="M0 0h20v20H0z" fill="url(' + location.href.split('#')[0] + '#star_filled)"></path>';
@@ -108,4 +108,57 @@ test('a rendered snapshot carries the fragment-only reference a script built fro
 	assert.ok(result.html, 'the page rendered');
 	assert.match(result.html!, /fill="url\(#star_filled\)"/);
 	assert.doesNotMatch(result.html!, /url\(http/, 'no absolute self-reference survives');
+});
+
+// ── the reason, measured: what each spelling PAINTS when the snapshot is served at another URL ─────────
+
+const paintOf = async (url: string, selector: string): Promise<'filled' | 'unfilled'> => {
+	const puppeteer = (await import('puppeteer')).default;
+	const browser = await puppeteer.launch({ headless: true });
+	try {
+		const page = await browser.newPage();
+		await page.goto(url, { waitUntil: 'networkidle0' });
+		const png = await (await page.$(selector))!.screenshot({ encoding: 'base64' });
+		// Decoded in the same tab: a second tab would leave this one in the background, where screenshots hang.
+		const [r, g, b] = await page.evaluate(async (b64: string) => {
+			const img = new Image();
+			img.src = `data:image/png;base64,${b64}`;
+			await img.decode();
+			const canvas = document.createElement('canvas');
+			canvas.width = img.width;
+			canvas.height = img.height;
+			const ctx = canvas.getContext('2d')!;
+			ctx.drawImage(img, 0, 0);
+			return [...ctx.getImageData(img.width >> 1, img.height >> 1, 1, 1).data.slice(0, 3)];
+		}, png);
+		// The gradient is #fc0 (255, 204, 0); the page behind it is white.
+		return r > 200 && g > 150 && b < 80 ? 'filled' : 'unfilled';
+	} finally {
+		await browser.close();
+	}
+};
+
+test('served at ANOTHER URL, the rewritten snapshot still paints its stars — the absolute one does not', async () => {
+	const rendered = await renderOnce({ url: `${base}/product/prd-1/slug.jsp`, config: { scroll: { enabled: false } } });
+	const snapshot = rendered.html!.replace(/<script[\s\S]*?<\/script>/g, '');
+	const absolute = snapshot.replace('url(#star_filled)', `url(${base}/product/prd-1/slug.jsp#star_filled)`);
+	assert.notEqual(absolute, snapshot, 'the control restores the absolute reference');
+	const served = new Map([
+		['/product/prd-1/OTHER-SPELLING.jsp', snapshot],
+		['/product/prd-1/control.jsp', absolute],
+	]);
+	const other = http.createServer((req, res) => {
+		res.setHeader('content-type', 'text/html; charset=utf-8');
+		res.end(served.get(req.url ?? '') ?? FIXTURE);
+	});
+	await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve));
+	const at = (path: string) => `http://127.0.0.1:${(other.address() as AddressInfo).port}${path}`;
+	try {
+		assert.equal(await paintOf(at('/product/prd-1/OTHER-SPELLING.jsp'), '#stars'), 'filled');
+		// Measured with Chrome 148: an absolute self-reference at another URL is an external paint server,
+		// which paints nothing (the browser even fetches that URL trying to resolve it).
+		assert.equal(await paintOf(at('/product/prd-1/control.jsp'), '#stars'), 'unfilled');
+	} finally {
+		other.close();
+	}
 });

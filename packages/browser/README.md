@@ -831,8 +831,9 @@ route whose cache key drops the query, and (plugin ≥ 0.100.0, `entityServe`) e
 the same entity. Anything a script built from `location` names the render URL. Links to it are
 harmless, but a CSS reference is not: a reviews widget that fills its rating stars with
 `fill="url(<page URL>#rating_star_filled)"` names a gradient in the same document only while the
-snapshot is served at that exact URL. Anywhere else the reference is external, and the stars lose
-their fill.
+snapshot is served at that exact URL. Anywhere else the reference is external. Measured in Chrome 148,
+an external paint server paints nothing, so the stars lose their fill, and the browser also fetches the
+render URL while trying to resolve it.
 
 So the serialized snapshot rewrites every CSS `url(<this page's URL>#id)` (absolute, scheme-relative
 or path-absolute; any quoting) to `url(#id)`. A fragment-only `url()` always refers to the current
