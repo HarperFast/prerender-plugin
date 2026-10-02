@@ -312,7 +312,15 @@ export const negativeRechecksInFlight = () => inFlightChecks.size;
  * `onLive` hears about a 200 so a gone-suppressed target for the URL can be reopened (util/goneReopen.js):
  * the entry going away fixes what this node SERVES, and only a render fixes what the rotation HOLDS.
  */
-export const settleNegativeRecheck = async ({ key, cacheUrl, statusCode, policy, onLive, nowMs = Date.now() }) => {
+export const settleNegativeRecheck = async ({
+	key,
+	cacheUrl,
+	statusCode,
+	policy,
+	onLive,
+	confirmedAtMs = NaN,
+	nowMs = Date.now(),
+}) => {
 	if (policy.statuses.includes(statusCode)) {
 		await confirmNegativePage(key, policy, nowMs);
 		metrics.negativeCache('recheck-gone');
@@ -321,6 +329,8 @@ export const settleNegativeRecheck = async ({ key, cacheUrl, statusCode, policy,
 	if (statusCode >= 200 && statusCode < 300) {
 		await dropNegativePage(key);
 		metrics.negativeCache('recheck-live');
+		// Served as a 404 since its last confirmation, at most: the request that asked for this re-check got it.
+		if (Number.isFinite(confirmedAtMs)) metrics.servedWrong(nowMs - confirmedAtMs, 'negative-recheck', '404');
 		if (statusCode === 200 && onLive) {
 			try {
 				await onLive(cacheUrl);
@@ -386,6 +396,7 @@ export const startNegativeRecheck = ({
 	policy,
 	onLive,
 	refreshBody = false,
+	confirmedAtMs = NaN,
 	fetchOrigin = fetchOriginResource,
 }) => {
 	if (inFlightChecks.has(key)) {
@@ -419,7 +430,7 @@ export const startNegativeRecheck = ({
 		// has to be closed to release the socket — by destroying the source, not cancelling the web stream
 		// (see `releaseOriginBody`), and not awaited, so nothing can pin the re-check slot.
 		releaseOriginBody(resource);
-		await settleNegativeRecheck({ key, cacheUrl, statusCode: resource.statusCode, policy, onLive });
+		await settleNegativeRecheck({ key, cacheUrl, statusCode: resource.statusCode, policy, onLive, confirmedAtMs });
 	})()
 		.catch((e) => logger.warn?.(`[prerender] negative-cache re-check failed for ${key}: ${e?.message ?? String(e)}`))
 		.finally(() => inFlightChecks.delete(key));
@@ -514,6 +525,7 @@ export const answerFromNegativeCache = async ({
 					policy,
 					onLive,
 					refreshBody: negativeBodyExpired(row, policy, nowMs),
+					confirmedAtMs: checkedAtMs,
 				})
 			: false;
 	return {
@@ -576,7 +588,14 @@ export const afterNegativeProxy = (
 		if (policy.dryRun && !excluded && status === 200 && (verdict === 'fresh' || verdict === 'revalidate')) {
 			metrics.negativeCache('would-serve-live');
 		}
-		if (status >= 200 && status < 400) void dropNegativePage(key);
+		if (status >= 200 && status < 400) {
+			// An ARMED cache was answering other crawlers with this 404 until now (a dry run answered nobody).
+			if (!policy.dryRun && status === 200) {
+				const confirmedAtMs = dateColumnMs(row.checkedAt);
+				if (Number.isFinite(confirmedAtMs)) metrics.servedWrong(nowMs - confirmedAtMs, 'negative-fetch', '404');
+			}
+			void dropNegativePage(key);
+		}
 	}
 	return resource;
 };

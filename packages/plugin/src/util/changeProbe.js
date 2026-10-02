@@ -1125,6 +1125,7 @@ const confirmStaleRender = async (url, target, claimAtMs = NaN) => {
 		});
 	}
 	countProbe('render_mismatch', 'confirmed');
+	if (Number.isFinite(claimAtMs)) metrics.servedWrong(Date.now() - claimAtMs, 'render-check', 'claim');
 	logger.info?.(
 		`[prerender] change-probe: the render of ${url} disagrees with the origin, asked again — expired and re-filed`
 	);
@@ -1336,7 +1337,7 @@ const bump = (table, rule, key) => {
 
 // A rule's mapped `canonical` field (the first, when it maps several), memoized per compiled rule.
 const canonicalFields = new WeakMap();
-const canonicalFieldOf = (rule) => {
+export const canonicalFieldOf = (rule) => {
 	if (!canonicalFields.has(rule)) {
 		canonicalFields.set(rule, (rule.pageCheck?.fields ?? []).find((field) => field.fact === 'canonical') ?? null);
 	}
@@ -1411,6 +1412,10 @@ export const runProbePass = async ({
 	// Called with (rule, row) for every origin CHANGE the pass detects (the rows counted `changed`) —
 	// what the detection-lag metric is emitted from.
 	onChange = () => {},
+	// Called with `{ what, knownRightAt }` for every cached page found disagreeing with the origin (the rows
+	// counted `pageMismatch`): the field, and when the page was last known right. The sweep wires the
+	// `served_wrong` metric; the canary, whose cohort repeats every half hour, wires none.
+	onServedWrong = null,
 	// What an active invalidation already does for a URL the pass would act on (`coverageOf`): 'covered',
 	// 'healed' or null. Null = no such check (the canary, and every pass that does not wire it).
 	coverageOf = null,
@@ -1617,6 +1622,7 @@ export const runProbePass = async ({
 		let verdicts = null;
 		let facts = null;
 		let mappedDisagrees = false;
+		let firstWrong = null;
 		let mappedAgreed = 0;
 		const armed = (field) => !guard || guard.isArmed(rule, field);
 		if (mappedFields.length && stored?.pageFacts && valuesOf()) {
@@ -1638,14 +1644,25 @@ export const runProbePass = async ({
 					if (witnessed) guard?.witness(rule, field, verdict === false);
 					if (verdict === false) {
 						bump(stats.fieldMismatch, rule.label, field.label);
-						if (armed(field)) mappedDisagrees = true;
+						if (armed(field)) {
+							mappedDisagrees = true;
+							firstWrong ??= field.label;
+						}
 					} else if (armed(field)) {
 						mappedAgreed++;
 					}
 				}
 			}
 		}
-		if (pageDisagrees || mappedDisagrees) stats.pageMismatch++;
+		if (pageDisagrees || mappedDisagrees) {
+			stats.pageMismatch++;
+			// Wrong since its render; or, when the origin changed since the last pass, since that pass at most.
+			if (onServedWrong) {
+				const renderedAt = epochOf(stored?.pageClaimAt);
+				const knownRightAt = signatureChanged ? Math.max(renderedAt, Number(stored.probedAt)) : renderedAt;
+				if (Number.isFinite(knownRightAt)) onServedWrong({ what: firstWrong ?? 'claim', knownRightAt });
+			}
+		}
 
 		// WHICH SLOTS CHANGED, and whether the change needs a render at all. Two ways it may not:
 		//
@@ -2603,6 +2620,7 @@ export const runProbeSweepOnce = async ({
 			onStart: (running) => (live = running),
 			onBatch: () => emit(counts()),
 			onChange: detectionLag,
+			onServedWrong: ({ what, knownRightAt }) => metrics.servedWrong(Date.now() - knownRightAt, 'sweep', what),
 			coverageOf: (url, evidence) => coverageOf(url, evidence, epochFor),
 			onPace: (rate, originThrottle, loadThrottle) =>
 				publishSweepHeadroom(

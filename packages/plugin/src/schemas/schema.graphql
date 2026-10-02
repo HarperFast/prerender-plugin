@@ -134,6 +134,10 @@ type Target @table(database: "render_service") @export {
 	# Why the last verdict suppressed it: noindex | canonical-mismatch | redirect-loop | ...
 	suppressedReason: String
 	suppressedAt: Date
+	# The canonical a CANONICAL VERDICT's page named (browser >= 1.40.0 `declaredCanonical`), null otherwise.
+	# The entity serve answers this spelling only with the page it named, or one confirmed after the verdict
+	# (util/entityServe.js): the verdict is this spelling's own, newest word on where its product lives.
+	suppressedCanonical: String
 	# Consecutive non-indexable verdicts; render.suppression.maxStrikes deletes the target.
 	strikes: Int
 	# Current demand-ladder rung (ms), when render.demand is enabled. Absent = the target has
@@ -157,11 +161,12 @@ type Target @table(database: "render_service") @export {
 # two unrelated rows; this is where "which of them does the origin call canonical, now" lives.
 #
 # DERIVED, NEVER AUTHORITATIVE: `Target` stays the render registry. Written only by observations of the
-# origin — the change probe's mapped `canonical` slot and a stored render's declared canonical — and only
-# when the canonical MOVES (an unchanged observation writes nothing). Replicated and NOT residency-pinned,
-# like `Target`: writes are rare, and every node answers a point read locally. Not @export: internal state,
-# read through the admin API. On by default (`entities.enabled`), and empty for a deployment whose routes declare
-# no `entityPrefix`.
+# origin — the change probe's mapped `canonical` slot, a render's declared canonical, a serve-time check, and
+# a document proxied from the origin (which moves a row, never creates one) — and only when the canonical
+# MOVES or a dry run remembers an adoption (an unchanged observation writes nothing). Replicated and NOT
+# residency-pinned, like `Target`: a row per entity plus ~one write per re-slug, and every node answers a point
+# read locally. Not @export: internal state, read through the admin API. On by default (`entities.enabled`),
+# and empty for a deployment whose routes declare no `entityPrefix`.
 type Entity @table(database: "render_service") {
 	id: String @primaryKey
 	# The canonical URL (a Target key) the newest observation named.

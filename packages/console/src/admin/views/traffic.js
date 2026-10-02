@@ -186,6 +186,8 @@ export function render(ctx) {
 		rawCache(ctx, data, filter),
 		negativeCache(ctx, data, filter),
 		entityServe(ctx, data, filter),
+		entityRegistry(ctx, data),
+		servedWrong(data),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -2310,14 +2312,16 @@ function negativeCache(ctx, data, filter) {
 // Why an entity serve fell through (plugin `prerender_ops` / `entity_serve`), with what each one means.
 const ENTITY_FALL_THROUGHS = [
 	['unconfirmed', 'canonical not rendered or checked since the anchor'],
-	['has-target', 'the spelling has a target of its own'],
+	['has-target', 'the spelling has a target the render path keeps'],
+	['moved', 'the registry heard a re-slug since'],
 	['no-page', 'no page for this device'],
 	['stale', 'past its expiry'],
 	['not-indexable', 'not a 200, or not indexable'],
 	['invalidated', 'predates an invalidation'],
-	['ambiguous', 'more than one candidate'],
+	['ambiguous', 'more than one candidate, none named by the registry'],
 	['no-sibling', 'no other target in rotation'],
 	['not-self-canonical', 'its canonical does not name it'],
+	['has-query', 'a query string'],
 	['unreadable', 'body unreadable'],
 	['no-prefix', 'no entity prefix'],
 	['error', 'read failed'],
@@ -2338,10 +2342,13 @@ function entityServe(ctx, data, filter) {
 		(entry) => entry && typeof entry === 'object' && entry.entityServe === true
 	);
 	const served = sumCount(pick(data, 'bot_serve', (s) => s.method === 'entity' && keepBot(filter, s.type)));
+	// Each evaluation's duration (plugin v0.102.0): what an opted-in route adds to a miss it does not answer.
+	const timings = pick(data, 'prerender_ops', (s) => s.path === 'entity_serve_ms');
 	const help = [
-		'A miss for a spelling with no page and no target of its own (an old or invented slug), answered from the ',
-		'cached render of its entity’s canonical: a fresh, indexable page that names itself, whose canonical was ',
-		'rendered or checked against the origin since the anchor. Switches: ',
+		'A miss for a spelling with no page and no target the render path keeps (an old or invented slug, or one ',
+		'suppressed because its page names its canonical elsewhere), answered from the cached render of its ',
+		'entity’s canonical: a fresh, indexable page that names itself, whose canonical was rendered or checked ',
+		'against the origin since the anchor, and not heard re-slugged since by the entity registry. Switches: ',
 		el('code', { text: 'ingress.entityServe' }),
 		' and ',
 		el('code', { text: 'entityServe' }),
@@ -2403,8 +2410,173 @@ function entityServe(ctx, data, filter) {
 						.join(' · ') || 'none',
 					{ warn: ev('error') + ev('unreadable') > 0 }
 				),
+				timings.length > 0 &&
+					stat(
+						'Cost per evaluation',
+						fmtMs(weighted(timings, 'median')),
+						`median · p95 ≈ ${fmtMs(weighted(timings, 'p95'))} · added to a miss it does not answer`
+					),
 			]),
 			!events.length && el('div', { cls: 'empty', text: 'No entity-serve evaluations in this range.' }),
+		],
+	});
+}
+
+// Who told the entity registry (plugin `entity_canonical` / `canonical_adopt` context), in the order a re-slug is
+// usually seen: the origin documents crawlers pull, the renders, the serve-time checks, the nightly probe. A move
+// is a re-slug, or one observer correcting another (an endpoint and a page that disagree flap between them).
+const ENTITY_OBSERVERS = [
+	['origin', 'proxied origin documents'],
+	['render', 'renders'],
+	['check', 'serve-time checks'],
+	['probe', 'the nightly probe'],
+];
+
+/**
+ * The entity registry (plugin v0.101.0, `entities`): each product's current canonical, learned from every fetch
+ * from the origin. `entity_canonical` is every observation by what it did (`moved` is a re-slug seen, by the
+ * observer that saw it first); `canonical_adopt` is what was done about a canonical no target held. In an
+ * adoption dry run, `would-adopt` plus `capped` is what arming files.
+ */
+function entityRegistry(ctx, data) {
+	const observed = pick(data, 'prerender_ops', (s) => s.path === 'entity_canonical');
+	const adoptions = pick(data, 'prerender_ops', (s) => s.path === 'canonical_adopt');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('entities.enabled')?.effective === true;
+	const adoptOn = options.get('entities.adopt.enabled')?.effective !== false;
+	const adoptDry = options.get('entities.adopt.dryRun')?.effective !== false;
+	const help = [
+		'One row per product holding its current canonical, written by every fetch from the origin that names it: ',
+		'proxied misses, renders, serve-time checks and the nightly probe. A canonical no target holds is filed due ',
+		'now (adoption). Switches: ',
+		el('code', { text: 'entities' }),
+		' (',
+		link('Config →', () => ctx.go('config')),
+		').',
+	];
+	if (!enabled && !observed.length && !adoptions.length) {
+		return card('Entity registry', {
+			head: [spacer(), pill('off', '')],
+			help,
+			body: [el('div', { cls: 'empty', text: 'Off.' })],
+		});
+	}
+	const tally = (combos) => {
+		const by = new Map();
+		for (const s of combos) {
+			const key = `${s.method ?? 'unknown'}|${s.type ?? 'unknown'}`;
+			by.set(key, (by.get(key) ?? 0) + s.count);
+		}
+		return (outcome, from = null) =>
+			from === null
+				? [...by].filter(([key]) => key.startsWith(`${outcome}|`)).reduce((acc, [, n]) => acc + n, 0)
+				: (by.get(`${outcome}|${from}`) ?? 0);
+	};
+	const seen = tally(observed);
+	const did = tally(adoptions);
+	const filed = did('adopted') + did('reactivated');
+	const wouldFile = did('would-adopt');
+	const byObserver = (count) =>
+		ENTITY_OBSERVERS.map(([from, label]) => [label, count(from)])
+			.filter(([, n]) => n > 0)
+			.map(([label, n]) => `${num(n)} ${label}`)
+			.join(' · ') || 'none';
+
+	return card(`Entity registry — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? pill('on', 'ok') : pill('off', 'warn'),
+			adoptOn ? (adoptDry ? pill('adoption dry run', 'info') : pill('adoption armed', 'ok')) : pill('adoption off', ''),
+			spacer(),
+		],
+		help,
+		body: [
+			stats([
+				stat(
+					'Canonical moves',
+					fmtCount(seen('moved')),
+					byObserver((from) => seen('moved', from))
+				),
+				stat('New entities', fmtCount(seen('new')), 'first observation of a product'),
+				adoptDry
+					? stat(
+							'Would adopt',
+							fmtCount(wouldFile + did('capped')),
+							`${num(wouldFile)} under the hourly budget · ${num(did('capped'))} past it`,
+							{ warn: did('capped') > 0 }
+						)
+					: stat(
+							'Adopted',
+							fmtCount(filed),
+							byObserver((from) => did('adopted', from) + did('reactivated', from)),
+							{
+								warn: did('capped') > 0,
+							}
+						),
+				stat(
+					'Not adopted',
+					fmtCount(did('exists') + did('suppressed') + did('recent') + did('refused') + did('error')),
+					`${num(did('exists'))} already held · ${num(did('recent'))} recent · ${num(did('suppressed'))} suppressed` +
+						(did('error') ? ` · ${num(did('error'))} errors` : ''),
+					{ warn: did('error') > 0 }
+				),
+			]),
+			!observed.length && !adoptions.length && el('div', { cls: 'empty', text: 'No registry activity in this range.' }),
+		],
+	});
+}
+
+// Who found a served copy wrong (plugin `served_wrong` detail), in the order they usually run.
+const SERVED_WRONG_DETECTORS = [
+	['check', 'serve-time checks'],
+	['check-raw', 'checks of raw documents'],
+	['render-check', 'render checks'],
+	['sweep', 'the nightly pass'],
+	['negative-recheck', 'stored-404 re-checks'],
+	['negative-fetch', 'stored 404s a crawler’s miss found live'],
+];
+
+/**
+ * Served while wrong (plugin v0.102.0, prerender_ops `served_wrong`): every cached copy — a page, a raw document, a
+ * stored 404 — found to differ from the origin while it was being served, by the detector that found it. The value
+ * is an UPPER BOUND on how long it was out there (since it was last known right), so the percentiles say how long
+ * wrong copies lived, and the count by field says what was wrong. Serves per wrong copy are not counted.
+ */
+function servedWrong(data) {
+	const found = pick(data, 'prerender_ops', (s) => s.path === 'served_wrong');
+	const help = [
+		'Cached copies found to differ from the origin while they were being served, at the moment a check, the ',
+		'nightly pass, a render check or a stored-404 re-check found them. Each one’s age is how long it had been ',
+		'served since it was last known right — an upper bound. How many times each was served is not counted.',
+	];
+	if (!found.length) {
+		return card('Served while wrong', {
+			head: [spacer()],
+			help,
+			body: [el('div', { cls: 'empty', text: 'Nothing found wrong in this range.' })],
+		});
+	}
+	const of = (detector) => found.filter((s) => s.method === detector);
+	const byField = new Map();
+	for (const s of found) byField.set(s.type ?? 'unknown', (byField.get(s.type ?? 'unknown') ?? 0) + s.count);
+	const fields = [...byField].sort((a, b) => b[1] - a[1]).slice(0, 4);
+	return card(`Served while wrong — ${scopeLabel(data)}`, {
+		head: [spacer()],
+		help,
+		body: [
+			stats(
+				SERVED_WRONG_DETECTORS.filter(([key]) => of(key).length > 0).map(([key, label]) => {
+					const rows = of(key);
+					return stat(
+						`Found by ${label}`,
+						fmtCount(sumCount(rows)),
+						`out for ≤ ${fmtMs(weighted(rows, 'median'))} median · ≈${fmtMs(weighted(rows, 'p95'))} p95`
+					);
+				})
+			),
+			el('div', { cls: 'note' }, [
+				'Most often wrong: ',
+				fields.map(([field, n]) => `${field} (${num(n)})`).join(' · '),
+			]),
 		],
 	});
 }

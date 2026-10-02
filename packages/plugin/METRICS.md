@@ -189,22 +189,45 @@ Notes that bite:
   traffic is answered that way. `entity_serve` is one emit per evaluation of a true miss on an
   opted-in route, detail = outcome, context = bot: `served`, `would-serve` (every guard passed under
   `ingress.entityServe.dryRun`; the miss path answered it — **the dry-run number**, to read against
-  `bot_serve` `origin`/`miss` on the route), or the guard that fell through: `has-target`,
-  `no-sibling`, `no-page`, `not-indexable`, `stale`, `invalidated`, `ambiguous`, `unconfirmed`,
-  `not-self-canonical`, `unreadable`, `no-prefix`, `error`. Read `has-target` with the entity gate in
-  mind: in a gate dry run every spelling a minting crawler asks for again has a target by then.
-  `unconfirmed` climbs right after the anchor and falls as the pass and the serve-time checks
-  confirm canonicals. If a route stays there, no check compares its `canonical`.
+  `bot_serve` `origin`/`miss` on the route), or the guard that fell through: `has-query`,
+  `has-target`, `no-sibling`, `no-page`, `not-indexable`, `stale`, `invalidated`, `ambiguous`,
+  `unconfirmed`, `moved`, `not-self-canonical`, `unreadable`, `no-prefix`, `error`. Read `has-target`
+  with the entity gate in mind: in a gate dry run every spelling a minting crawler asks for again has
+  a target by then (since v0.102.0 a spelling suppressed as a canonical verdict is answered, not
+  `has-target`). `unconfirmed` climbs right after the anchor and falls as the pass and the serve-time
+  checks confirm canonicals. If a route stays there, no check compares its `canonical`. `moved`
+  (v0.102.0) is a page the origin has since been heard naming another canonical: by the registry
+  (on by default), or by the spelling's own canonical verdict when it is newer than the page's last
+  confirmation and did not name it. It should be rare. With adoption armed it should not persist for an
+  entity, because the observation that moved the registry also filed the new canonical; under the
+  adoption dry run, or past `maxPerHour`, it lasts until the new canonical renders by another path. `entity_serve_ms` (v0.102.0) is each evaluation's duration, every outcome: a
+  duration, so read its percentiles.
+- **What was served wrong is `prerender_ops` / `served_wrong`** (v0.102.0): one emit per cached copy found
+  to differ from the origin while it was being served (a rendered page, a raw document, a stored 404), at the
+  moment a detector found it. Never per serve, so it costs the request path nothing. The value is an **upper
+  bound** on how long that copy was served wrong: ms since it was last known right (its render, or the last
+  check that agreed with that very copy; for a 404, its last confirmation). Detail = the detector: `check` /
+  `check-raw` (a serve-time check of a page or a raw document), `sweep` (the nightly pass; the canary is
+  left out, its cohort repeats every half hour), `render-check` (a render that landed disagreeing with the
+  origin), `negative-recheck` / `negative-fetch` (a stored 404 the origin answers 200 for, found by the
+  re-check or by a proxied request). Context = what disagreed: the `pageCheck` field label (`2:product.offers`,
+  `6:canonical`, …), `claim` (the price/availability pair) or `404`. **Read the count per field** (how many
+  wrong copies, of what) **and the percentiles per detector** (how long they were out). The number of serves
+  each made is not here: that would need a per-key serve counter, which the plugin deliberately does not keep.
 - **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
   `entities.enabled`, on by default for routes with an `entityPrefix`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
-  what it did to the registry (`new`, `moved`, `same`, `older`, `foreign`, `unreadable`, `error`),
-  context = the observer (`probe` or `render`). `moved`/`probe` per day is the re-slug rate; `moved`
-  alternating between `probe` and `render` for the same entities means the endpoint and the page
-  disagree about the canonical. `canonical_adopt` (`entities.adopt`): one emit per adoption decision,
-  made only when an observation names a canonical that is another URL than the one observed: `adopted`,
-  `reactivated`, `would-adopt` (**the dry-run number**), `exists` (every duplicate spelling, nightly),
-  `suppressed`, `recent` (the entity was adopted, or in a dry run would have been, within `retryAfter`),
-  `capped` (past `maxPerHour` on this node), `refused`, `error`.
+  what it did to the registry (`new`, `moved`, `same`, `older`, `foreign` — another entity's prefix, or a
+  query string — `untracked` — a crawler's proxied miss of an entity with no row, which creates none —
+  `unreadable`, `error`),
+  context = the observer: `probe`, `render` (a stored page, or a canonical verdict's declared canonical),
+  `check` (a serve-time check) or `origin` (a proxied origin document on an `entityServe` route; the last
+  two since v0.102.0). `moved` per day is the re-slug rate, and which observer moves it first says how
+  fast a re-slug is seen. `moved` alternating between `probe` and `render` for the same entities means
+  the endpoint and the page disagree about the canonical. `canonical_adopt` (`entities.adopt`): one emit
+  per adoption decision, made only when an observation names a canonical that is another URL than the
+  one observed, context = the observer: `adopted`, `reactivated`, `would-adopt` (**the dry-run
+  number**), `exists` (every duplicate spelling, nightly), `suppressed`, `recent` (the entity was adopted, or in a dry run would have
+  been, within `retryAfter`), `capped` (past `maxPerHour` on this node), `refused`, `error`.
 - **The change probe's `probe_*` series changed shape in v0.97.0, and the table row above predates
   it.** (1) The pass counters are emitted **per probed batch as increments**, not once when a pass
   ends: a nine-hour pass is no longer one row that a dropped analytics window loses whole, and a pass

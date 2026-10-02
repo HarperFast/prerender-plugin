@@ -297,16 +297,6 @@ test('a metric the plugin emits is charted by the console, or waived with a reas
 			'prerender_ops.entity_gate',
 			'dry-run census; read raw from /prerender_admin/analytics — armed refusals land in discovery_gated',
 		],
-		// The entity registry (plugin v0.101.0) ships off, and its adoption in dry run. Its two series are read
-		// raw from the analytics endpoint during that window; a console panel for them is the follow-up.
-		[
-			'prerender_ops.entity_canonical',
-			'registry ships off; read raw from /prerender_admin/analytics during the dry run — panel follows',
-		],
-		[
-			'prerender_ops.canonical_adopt',
-			'adoption ships in dry run; read raw from /prerender_admin/analytics (would-adopt) — panel follows',
-		],
 		// `render.change_lag_ms` and `prerender_ops.due_now_forward` (plugin v0.97.0) are charted on the Queue
 		// view since console v0.22.0 (Change to cache, Filing).
 	]);

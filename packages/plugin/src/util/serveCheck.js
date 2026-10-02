@@ -55,6 +55,7 @@ import { documentFactsFromStream, documentFactsOfYielding, HEAD_FACTS } from './
 import { compareField, parsePageFacts, signatureSlots } from './changeProbeSpec.js';
 import {
 	actOnChange,
+	canonicalFieldOf,
 	disarmedFieldsOnNode,
 	expireChangedPages,
 	isDistress,
@@ -68,6 +69,7 @@ import {
 	reserveOriginSlot,
 } from './changeProbe.js';
 import { coveredAt, readPageCheck, writePageCheck } from './pageCheck.js';
+import { resolveCanonical } from './entity.js';
 import { recordMissBreadth } from './crawlStats.js';
 import { deleteRawPage } from './rawCache.js';
 import { dateColumnMs } from './time.js';
@@ -108,6 +110,7 @@ const DEFAULTS = Object.freeze({
 	deleteRaw: deleteRawPage,
 	readTarget: (url) =>
 		targetTable().get({ id: url, select: ['url', 'state', 'sitemapUrl', 'renderInterval', 'demandInterval'] }),
+	resolveCanonical,
 });
 let deps = DEFAULTS;
 /** Tests: replace effects (merged over the defaults); no argument restores them. */
@@ -405,6 +408,8 @@ const runCheck = async (item, gen = generation) => {
 		return;
 	}
 	let verdict;
+	// When the origin was asked: the instant the registry stamps this check's observation with.
+	const askedAt = Date.now();
 	try {
 		verdict = item.source === 'document' ? await checkDocument(item) : await checkEndpoint(item);
 	} catch (e) {
@@ -415,6 +420,16 @@ const runCheck = async (item, gen = generation) => {
 		}
 	}
 	if (verdict.answered) deps.healthy();
+	// THE ENTITY REGISTRY (util/entity.js): the canonical the origin named for this page's entity, whatever the
+	// comparison found — a check is a fetch from the origin, and a re-slug it sees moves the registry (and
+	// adopts the new canonical) now, rather than at the next nightly pass. Never throws.
+	if (typeof verdict.originCanonical === 'string' && verdict.originCanonical !== '') {
+		try {
+			await deps.resolveCanonical({ url: item.url, value: verdict.originCanonical, from: 'check', atMs: askedAt });
+		} catch {
+			// a registry fault never costs the check
+		}
+	}
 	if (verdict.result === 'agree') {
 		await deps.writeCheck(item.url, item.lastCachedMs, {
 			outcome: 'agree',
@@ -468,6 +483,12 @@ const settleMismatch = async (item, verdict, prior) => {
 	}
 	const acted = await act(item);
 	if (acted === null) return;
+	// SERVED WRONG, since the copy was last known right: its render, or a check that agreed with this very copy.
+	const agreedAt = prior?.outcome === 'agree' && prior.basisAtMs === item.lastCachedMs ? prior.checkedAtMs : -Infinity;
+	const knownRightAt = Math.max(item.lastCachedMs, agreedAt);
+	if (Number.isFinite(knownRightAt)) {
+		metrics.servedWrong(Date.now() - knownRightAt, item.kind === 'raw' ? 'check-raw' : 'check', verdict.field);
+	}
 	await deps.writeCheck(item.url, item.lastCachedMs, {
 		outcome: 'mismatch',
 		field: verdict.field,
@@ -493,7 +514,10 @@ const checkEndpoint = async (item) => {
 		pageUrl: item.url,
 		isArmed: (_rule, field) => !disarmed.has(field.label),
 	});
-	return { ...verdict, answered: true, signature: typeof observed === 'string' ? observed : null };
+	// The endpoint's canonical, only from a field the mapping guard has not disarmed (as the sweep reads it).
+	const canonical = canonicalFieldOf(item.rule);
+	const originCanonical = canonical && !disarmed.has(canonical.label) ? (values[canonical.slot] ?? null) : null;
+	return { ...verdict, answered: true, signature: typeof observed === 'string' ? observed : null, originCanonical };
 };
 
 /** A short stable digest of what the origin said for a disagreeing field (`PageCheck.evidence`). */
@@ -546,7 +570,11 @@ const checkDocument = async (item) => {
 		want: item.want,
 	});
 	if (!facts) return { result: outcome === 'ok' ? 'inconclusive' : 'failed', answered: true };
-	return { ...compareDocuments(item.facts, facts, item.want), answered: true };
+	return {
+		...compareDocuments(item.facts, facts, item.want),
+		answered: true,
+		originCanonical: facts.canonical ?? null,
+	};
 };
 
 const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);

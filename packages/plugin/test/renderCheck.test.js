@@ -409,3 +409,15 @@ test('round 3 N5: a newer render landing while the re-probe was out supersedes i
 	assert.equal(hardExpired(), false, 'the newer page is not expired on the old one’s evidence');
 	assert.equal(stores.probeState.get(A).pageSignature, newerClaim, 'and its claim survives');
 });
+
+test('a confirmed render check reports the render SERVED WRONG since it was stored', async () => {
+	seed();
+	const before = Date.now();
+	await claimAndPost(['39.99', 'USD', 'InStock']);
+	const wrong = analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === 'served_wrong');
+	assert.equal(wrong.length, 1);
+	const [[ms, , , detector, what]] = wrong;
+	assert.equal(detector, 'render-check');
+	assert.equal(what, 'claim');
+	assert.ok(ms >= 0 && ms <= Date.now() - before + 1000, `out for ${ms}ms: since the render landed`);
+});

@@ -880,7 +880,16 @@ export class RenderQueue extends Resource {
 			const { deleted, absent, held } = await Target.suppress(url, {
 				reason: verdict.reason,
 				statusCode: verdict.statusCode,
+				canonical: verdict.declaredCanonical ?? null,
 			});
+			// THE CANONICAL THE VERDICT NAMED (browser >= 1.40.0 `declaredCanonical`), into the entity registry: on a
+			// site where every spelling of a product is one document, the render of an old spelling after a
+			// re-slug is often the first fetch from the origin to see the new canonical, and this is where the
+			// product lives now. Recorded and, when no target holds it, adopted — so the new canonical renders now
+			// rather than at the next nightly probe. Observed when the origin was read. Never rejects.
+			await observeRenderedCanonical(url, verdict.declaredCanonical, Date.now() - renderSpanMs(variants)).catch(
+				() => {}
+			);
 			// The other half of `suppression_lifted` below: a suppressed target rendered, and the verdict
 			// stood. Together they are the precision of every early recheck — a gone target rendered
 			// before its `recheckInterval` was filed by a reopen (util/goneReopen.js), and this is where
@@ -1074,8 +1083,15 @@ export class RenderQueue extends Resource {
 				// The entity registry (util/entity.js): the canonical this page declared, observed when the origin
 				// was READ — the store time less the stored renders, which run one after another — so a render
 				// claimed before a re-slug cannot outrank the probe that saw it. A point read, and a write only
-				// when the canonical moves; never rejects.
-				observeRenderedCanonical(scheduleUrl, describing.pageFacts, cachedAt - renderSpanMs(stored)).catch(() => {}),
+				// when the canonical moves; a canonical no target holds is adopted. Never rejects.
+				// A sitemap target is stored even when its canonical names another URL: its page record says so,
+				// and so does the verdict's `declaredCanonical`, which stands in when the record's extraction failed.
+				observeRenderedCanonical(
+					scheduleUrl,
+					describing.pageFacts?.canonical ??
+						stored.find((variant) => typeof variant.declaredCanonical === 'string')?.declaredCanonical,
+					cachedAt - renderSpanMs(stored)
+				).catch(() => {}),
 				...observed.map((variant) =>
 					recordReadinessExpectation({ url: scheduleUrl, deviceType: variant.deviceType }, variant.readiness)
 				),
@@ -1340,7 +1356,11 @@ export class RenderQueue extends Resource {
 			// suppression is a genuine content/gone verdict about the destination. A destination too long
 			// to key has no row to suppress, and needs none: nothing can ever schedule it.
 			if (keyable !== false && (!config.domains.length || config.domains.includes(domain))) {
-				await Target.suppress(destinationUrl, { reason: variant.reason, statusCode: variant.statusCode });
+				await Target.suppress(destinationUrl, {
+					reason: variant.reason,
+					statusCode: variant.statusCode,
+					canonical: variant.declaredCanonical ?? null,
+				});
 			}
 			return;
 		}

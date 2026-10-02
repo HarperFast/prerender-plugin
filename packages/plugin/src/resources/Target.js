@@ -220,7 +220,7 @@ export class Target extends TargetTable {
 	 * pages either way — stale content of a page that said "don't index me" must not keep
 	 * serving.
 	 */
-	static async suppress(url, { reason, statusCode } = {}) {
+	static async suppress(url, { reason, statusCode, canonical = null } = {}) {
 		const existing = await Target.get({
 			id: url,
 			select: [
@@ -294,6 +294,8 @@ export class Target extends TargetTable {
 			state: 'suppressed',
 			suppressedReason: storedReason,
 			suppressedAt: Date.now(),
+			// What the page named, for a canonical verdict: the entity serve's evidence (util/entityServe.js).
+			suppressedCanonical: typeof canonical === 'string' && canonical !== '' ? canonical : null,
 			strikes,
 		});
 

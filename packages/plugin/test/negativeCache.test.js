@@ -925,3 +925,51 @@ test('NegativePage is node-local, expiring by its own field, and its database ha
 	assert.doesNotMatch(table[0], /@export/, 'no REST write verb may put a 404 under a cache key');
 	assert.match(schema, /type NegativePageAnchor @table\(database: "negative_cache"\)/, 'harper-pro#685');
 });
+
+// ── served while wrong ───────────────────────────────────────────────────────────────────────────
+
+const wrongOps = () => ops.filter((o) => o.metric === 'prerender_ops' && o.path === 'served_wrong');
+
+test('a stored 404 found live is reported SERVED WRONG since its last confirmation — by the re-check, or an armed proxy', async () => {
+	rows.set(KEY_A, storedRow({ checkedAt: new Date(NOW - 2 * HOUR) }));
+	await nc.settleNegativeRecheck({
+		key: KEY_A,
+		cacheUrl: URL_A,
+		statusCode: 200,
+		policy: policy(),
+		confirmedAtMs: NOW - 2 * HOUR,
+		nowMs: NOW,
+	});
+	assert.deepEqual(
+		wrongOps().map(({ value, method, type }) => [value, method, type]),
+		[[2 * HOUR, 'negative-recheck', '404']]
+	);
+
+	// An ARMED cache was answering with it until a proxied request (an excluded bot, say) found it live.
+	ops.length = 0;
+	const row = storedRow({ checkedAt: new Date(NOW - HOUR) });
+	rows.set(KEY_A, row);
+	await nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy(),
+		lookup: { row, verdict: 'fresh', excluded: true },
+		nowMs: NOW,
+	});
+	assert.deepEqual(
+		wrongOps().map(({ value, method }) => [value, method]),
+		[[HOUR, 'negative-fetch']]
+	);
+
+	// A DRY RUN answered nobody with it: that is would-serve-live's to count, not this.
+	ops.length = 0;
+	rows.set(KEY_A, row);
+	await nc.afterNegativeProxy(origin404({ statusCode: 200 }), {
+		key: KEY_A,
+		cacheUrl: URL_A,
+		policy: policy({ dryRun: true }),
+		lookup: { row, verdict: 'fresh' },
+		nowMs: NOW,
+	});
+	assert.deepEqual(wrongOps(), []);
+});

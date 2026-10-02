@@ -1378,3 +1378,100 @@ test('miss rows fold route and bot per cause, and an unknown cause gets its own 
 	// A device outside deviceTypes.default is configuration, not capacity: it never waits on a render.
 	assert.equal(missRows([combo('bot_miss', 'device', '/a', 'googlebot', 1)])[0].family, 'rule');
 });
+
+// ---- the entity registry (plugin entities) ------------------------------------------
+
+test('the entity-serve panel names the newer fall-throughs and what an evaluation costs', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'entity_serve', 'served', 'bingbot', 500),
+			combo('prerender_ops', 'entity_serve', 'moved', 'bingbot', 30),
+			combo('prerender_ops', 'entity_serve', 'has-query', 'bingbot', 20),
+			combo('prerender_ops', 'entity_serve_ms', null, null, 550, 1.5, 6),
+		],
+	};
+	const config = {
+		...CONFIG,
+		layers: [
+			...CONFIG.layers.filter((layer) => layer.path !== 'ingress.routes'),
+			{ path: 'ingress.routes', effective: [{ match: 'prefix', path: '/product/', entityServe: true }] },
+			{ path: 'ingress.entityServe.dryRun', effective: false },
+		],
+	};
+	const ctx = makeCtx({ analytics, config });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /30 the registry heard a re-slug since · 20 a query string/);
+	assert.match(text, /Cost per evaluation/);
+	assert.match(text, /median · p95/);
+});
+
+test('the registry panel: canonical moves by the observer that saw them, and the adoption dry-run number', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'entity_canonical', 'moved', 'origin', 60),
+			combo('prerender_ops', 'entity_canonical', 'moved', 'render', 25),
+			combo('prerender_ops', 'entity_canonical', 'moved', 'probe', 15),
+			combo('prerender_ops', 'entity_canonical', 'new', 'probe', 9000),
+			combo('prerender_ops', 'entity_canonical', 'same', 'probe', 900000),
+			combo('prerender_ops', 'canonical_adopt', 'would-adopt', 'origin', 70),
+			combo('prerender_ops', 'canonical_adopt', 'capped', 'probe', 5),
+			combo('prerender_ops', 'canonical_adopt', 'exists', 'probe', 1200),
+		],
+	};
+	const config = {
+		...CONFIG,
+		layers: [...CONFIG.layers, { path: 'entities.enabled', effective: true }],
+	};
+	const ctx = makeCtx({ analytics, config });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Entity registry/);
+	assert.match(text, /adoption dry run/);
+	assert.match(text, /Canonical moves/);
+	assert.match(text, /60 proxied origin documents · 25 renders · 15 the nightly probe/);
+	assert.match(text, /Would adopt/);
+	assert.match(text, /70 under the hourly budget · 5 past it/);
+	assert.match(text, /1,200 already held/);
+});
+
+test('the registry panel is a quiet “off” when the registry is off and silent', async () => {
+	const ctx = makeCtx({ analytics: ANALYTICS });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Entity registry/);
+});
+
+// ---- served while wrong (plugin served_wrong) -------------------------------------------
+
+test('the served-while-wrong card: wrong copies by the detector that found them, how long they were out, and what was wrong', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'served_wrong', 'check', '2:product.offers', 40, 3 * 3_600_000, 9 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'check', '6:canonical', 5, 2 * 3_600_000, 4 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'sweep', '2:product.offers', 300, 8 * 3_600_000, 20 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'negative-recheck', '404', 7, 90_000, 600_000),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Served while wrong/);
+	assert.match(text, /Found by serve-time checks/);
+	assert.match(text, /Found by the nightly pass/);
+	assert.match(text, /Found by stored-404 re-checks/);
+	assert.match(text, /out for ≤ 8\.0h median · ≈20\.0h p95/);
+	assert.match(text, /Most often wrong: 2:product\.offers \(340\) · 404 \(7\) · 6:canonical \(5\)/);
+});
+
+test('the served-while-wrong card says so when nothing was found wrong', async () => {
+	const ctx = makeCtx({ analytics: ANALYTICS });
+	await load(ctx);
+	assert.match(everything(ctx), /Nothing found wrong in this range/);
+});
