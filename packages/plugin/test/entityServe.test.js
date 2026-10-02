@@ -266,7 +266,7 @@ const drain = async (body) => {
 };
 const settle = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
 // The entity serve's own range read (the discovery gate's, on the detached tail of a miss, reads 3).
-const entityReads = () => searches.filter(({ query }) => query.limit === entityServe.ENTITY_READ_LIMIT).length;
+const entityReads = () => searches.filter(({ query }) => query.limit === entityServe.ENTITY_READ_LIMIT + 1).length;
 const outcomes = () => analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === 'entity_serve').map((a) => a[3]);
 let matchRoute;
 let inspectRoutes;
@@ -429,6 +429,17 @@ test('ambiguous: two servable pages, more rows than the read covers, or an unrea
 	assert.equal((await evaluate()).outcome, 'ambiguous', 'an unreadable row could be this spelling’s own');
 });
 
+test('an entity with EXACTLY as many rows as the read covers is complete: the row past them proves the prefix ended', async () => {
+	entity(); // the canonical and one suppressed old slug
+	for (let i = 0; i < entityServe.ENTITY_READ_LIMIT - 2; i++)
+		target(`${ORIGIN}/product/prd-1/dead-${i}.jsp`, 'suppressed');
+	assert.equal((await evaluate()).outcome, 'served', 'the end of the table');
+	target(`${ORIGIN}/product/prd-2/another.jsp`);
+	assert.equal((await evaluate()).outcome, 'served', 'the next key is another product');
+	target(`${ORIGIN}/product/prd-1/zz-one-more.jsp`, 'suppressed');
+	assert.equal((await evaluate()).outcome, 'ambiguous', 'one more under the prefix: the read cannot see them all');
+});
+
 test('the read is one bounded, one-sided, node-local PK range with the minimal projection', async () => {
 	entity();
 	await evaluate();
@@ -437,7 +448,7 @@ test('the read is one bounded, one-sided, node-local PK range with the minimal p
 	assert.deepEqual(query.conditions, [
 		{ attribute: 'url', comparator: 'greater_than_equal', value: `${ORIGIN}/product/prd-1/` },
 	]);
-	assert.equal(query.limit, entityServe.ENTITY_READ_LIMIT);
+	assert.equal(query.limit, entityServe.ENTITY_READ_LIMIT + 1, 'one past the limit, to prove the prefix ended');
 	assert.deepEqual(query.select, ['url', 'state']);
 	assert.deepEqual(context, { replicateFrom: false });
 });

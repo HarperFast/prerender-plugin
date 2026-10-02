@@ -158,7 +158,9 @@ export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_L
 			conditions: [{ attribute: 'url', comparator: 'greater_than_equal', value: prefix }],
 			sort: { attribute: 'url' },
 			select: [...SIBLING_SELECT],
-			limit,
+			// ONE PAST THE LIMIT: the extra row is what tells an entity with exactly `limit` rows (the next key is
+			// outside the prefix, so the read is complete) from one with more (it is not).
+			limit: limit + 1,
 		},
 		{ replicateFrom: false }
 	)) {
@@ -176,7 +178,7 @@ export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_L
 		if (key === url) own = true;
 		else if (inRotation(row)) keys.push(key);
 	}
-	return { own, inRotation: keys, complete: !unreadable && (ended || read < limit) };
+	return { own, inRotation: keys, complete: !unreadable && (ended || read <= limit) };
 };
 
 // The anchor moves once a day and resolving it costs two Intl calls: re-read at most once a minute per
