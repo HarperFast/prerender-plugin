@@ -1319,7 +1319,7 @@ const bump = (table, rule, key) => {
 
 // A rule's mapped `canonical` field (the first, when it maps several), memoized per compiled rule.
 const canonicalFields = new WeakMap();
-const canonicalFieldOf = (rule) => {
+export const canonicalFieldOf = (rule) => {
 	if (!canonicalFields.has(rule)) {
 		canonicalFields.set(rule, (rule.pageCheck?.fields ?? []).find((field) => field.fact === 'canonical') ?? null);
 	}

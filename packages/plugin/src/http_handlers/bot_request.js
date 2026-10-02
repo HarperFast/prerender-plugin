@@ -33,6 +33,7 @@ import { metrics } from '../metrics.js';
 import { recordVisit } from '../util/visitFilter.js';
 import { materializeCachedBody } from '../util/cachedBody.js';
 import { captureForRawCache, rawCachePolicy, rawKeyOf, readRawPage } from '../util/rawCache.js';
+import { tapOriginCanonical, tapsOriginCanonical } from '../util/originCanonical.js';
 import { considerServeCheck } from '../util/serveCheck.js';
 import {
 	afterNegativeProxy,
@@ -615,14 +616,21 @@ async function resolveResource({ request, url, cacheUrl, deviceType, routeClass,
 		reason: info.cacheStatus,
 	});
 
+	// THE ENTITY'S CANONICAL, off the document the crawler is about to read (util/originCanonical.js). On an
+	// entityServe route every spelling is one document, so every fetch that reaches here — a miss, a stale or an
+	// invalidated page — says where the product lives now. Read off the head as the bytes stream by: no second
+	// origin request, and nothing this response waits on.
+	const observed = tapsOriginCanonical(info.route, request.method)
+		? tapOriginCanonical(resource, { url: cacheUrl })
+		: resource;
 	// Keep what we just fetched, for the next crawler asking the same question. The capture rides the
 	// body the crawler is already reading, so this costs no second origin request and — because the
 	// store is detached inside `captureForRawCache` — no latency on this response. Never for a HEAD:
 	// there is no body to keep, and an empty capture of a 200 is a document nobody should be served.
 	const kept =
 		rawPolicy && request.method !== 'HEAD'
-			? captureForRawCache(resource, { cacheKey: rawKey, policy: rawPolicy, factsWant: info.route?.rawFacts ?? null })
-			: resource;
+			? captureForRawCache(observed, { cacheKey: rawKey, policy: rawPolicy, factsWant: info.route?.rawFacts ?? null })
+			: observed;
 	// Same rule for a 404/410: the store is detached. The two never both attach — the raw cache stores
 	// only 200s, the negative cache only its configured statuses.
 	return negativePolicy

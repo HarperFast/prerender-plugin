@@ -715,26 +715,35 @@ export const METRICS = Object.freeze({
 			'entity_serve = one emit per true miss on a route with ingress.routes[].entityServe, split by what ' +
 			'the entity serve decided (util/entityServe.js): served (answered from the canonical’s render — ' +
 			'also bot_serve source entity), would-serve (every guard passed under ingress.entityServe.dryRun; the ' +
-			'miss path answered it — THE DRY-RUN NUMBER), or the guard that fell through: has-target (the spelling ' +
-			'has a row of its own — with the entity gate in dry run, every spelling a minting crawler asks for ' +
-			'again lands here), no-sibling, no-page, not-indexable, stale, invalidated, ambiguous, unconfirmed ' +
-			'(the canonical was neither rendered nor checked-and-agreed since the anchor — the probe and the ' +
-			'serve-time check fill this in; a route stuck here has no rule that maps `canonical`), ' +
+			'miss path answered it — THE DRY-RUN NUMBER), or the guard that fell through: has-query (the spelling ' +
+			'carries a query string), has-target (the spelling has a row of its own that the render path keeps — in ' +
+			'rotation, or suppressed for a reason about the URL itself; one suppressed as a canonical verdict is ' +
+			'answered — with the entity gate in dry run, every spelling a minting crawler asks for again lands ' +
+			'here), no-sibling, no-page, not-indexable, stale, invalidated, ambiguous (two servable pages the ' +
+			'registry does not choose between, or more rows than the read covers), unconfirmed (the canonical was ' +
+			'neither rendered nor checked-and-agreed since the anchor — the probe and the serve-time check fill ' +
+			'this in; a route stuck here has no rule that maps `canonical`), moved (the entity registry heard the ' +
+			'origin name another canonical after the page was last confirmed: a re-slug it predates), ' +
 			'not-self-canonical, unreadable, no-prefix, error. ' +
+			'entity_serve_ms = milliseconds one entity-serve evaluation took, every outcome: what an opted-in ' +
+			'route adds to a miss before the miss path runs. ' +
 			'entity_canonical = one emit per observation of an entity\u2019s canonical (entities.enabled, ' +
 			'util/entity.js), by what it did to the registry: new (the entity\u2019s first row), moved (the canonical ' +
 			'changed — a re-slug, or one observation correcting another), same (nothing written), older (a ' +
 			'disagreeing observation made before the stored one, ignored), foreign (a canonical under another ' +
-			'entity\u2019s prefix, ignored), unreadable, error; context = the observer, probe or render. moved/probe ' +
-			'per day is the re-slug rate. A steady stream of moved alternating between probe and render means the ' +
-			'endpoint and the page disagree about the canonical. ' +
+			'entity\u2019s prefix, ignored), unreadable, error; context = the observer: probe (the change probe\u2019s ' +
+			'mapped canonical), render (a stored page\u2019s canonical, or the one a canonical verdict declared), ' +
+			'check (a serve-time check\u2019s endpoint or document) or origin (a proxied origin document on an ' +
+			'entityServe route). moved per day is the re-slug rate; which observer moves it first says how fast a ' +
+			're-slug is seen. A steady stream of moved alternating between probe and render means the endpoint ' +
+			'and the page disagree about the canonical. ' +
 			'canonical_adopt = one emit per adoption decision (entities.adopt), made only when an observation names ' +
 			'a canonical that is ANOTHER URL than the one observed: adopted (a target ' +
 			'filed due now), reactivated (a canonical-verdict suppression lifted, due now), would-adopt (either, in ' +
 			'a dry run — THE DRY-RUN NUMBER), exists (the canonical has a target in rotation — every duplicate ' +
 			'spelling, nightly), suppressed (its target is suppressed for a reason the origin\u2019s word does not overturn), ' +
 			'recent (adopted within retryAfter), capped (past maxPerHour on this node), refused (unkeyable, off the domain ' +
-			'allowlist, or not on a prerender route), error. ' +
+			'allowlist, or not on a prerender route), error; context = the observer that named it. ' +
 			'raw_cache = one emit per raw-document store attempt, split by outcome: `stored`, `stored-unshared`, ' +
 			'or the reason it was refused (not-200, staging, has-cookie, content-type, no-store, no-body, ' +
 			'oversize, capture-failed, write-failed, vary-device). READ THE REFUSALS, not the successes — a route that is ' +
@@ -802,7 +811,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap and probe_detection_lag are durations (ms — read their percentiles, not their total); ' +
+			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap, probe_detection_lag and entity_serve_ms are durations (ms — read their percentiles, not their total); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -865,6 +874,7 @@ export const METRICS = Object.freeze({
 					'discovery_gated',
 					'entity_gate',
 					'entity_serve',
+					'entity_serve_ms',
 					'entity_canonical',
 					'canonical_adopt',
 					'raw_cache',
@@ -888,8 +898,8 @@ export const METRICS = Object.freeze({
 					'invalidation_error = failed epoch resolutions. invalidation_reenqueue = heal-attempt outcomes. ' +
 					'probe_* = change-probe pass counters (see usefulFor). discovery_gated = gated cacheable misses. ' +
 					'entity_gate = entity discovery gate evaluations, by outcome. entity_serve = entity-serve ' +
-					'evaluations of true misses, by outcome. entity_canonical = observations of an ' +
-					'entity\u2019s canonical (entities.enabled). canonical_adopt = the change probe\u2019s adoption ' +
+					'evaluations of true misses, by outcome. entity_serve_ms = how long each took. entity_canonical = ' +
+					'observations of an entity\u2019s canonical (entities.enabled). canonical_adopt = adoption ' +
 					'decisions (entities.adopt). raw_cache = raw-document store ' +
 					'attempts. negative_cache = the negative cache (render.negative): stores, refusals, re-checks and ' +
 					'dry-run verdicts. negative_gap = age of a stored 404 when a request for it arrived. gone_reopen = ' +
@@ -920,8 +930,8 @@ export const METRICS = Object.freeze({
 					"route's discoverTargets, 'bot' = ingress.discoveryBots, 'entity' = the route's entityPrefix " +
 					'found a sibling URL of the same entity in rotation, armed gate only). entity_gate: the outcome ' +
 					'(gated, would-gate, suppressed-only, no-siblings, no-prefix, error). entity_serve: the outcome ' +
-					'(served, would-serve, no-prefix, has-target, no-sibling, no-page, not-indexable, stale, ' +
-					'invalidated, ambiguous, unconfirmed, not-self-canonical, unreadable, error). entity_canonical: the outcome ' +
+					'(served, would-serve, no-prefix, has-query, has-target, no-sibling, no-page, not-indexable, stale, ' +
+					'invalidated, ambiguous, unconfirmed, moved, not-self-canonical, unreadable, error). entity_canonical: the outcome ' +
 					'(new, moved, same, older, foreign, unreadable, error). canonical_adopt: the outcome (adopted, ' +
 					'reactivated, would-adopt, exists, suppressed, recent, capped, refused, error). raw_cache: THE OUTCOME — stored, ' +
 					'stored-unshared, or the refusal name; this is the slot the console reads that panel from. ' +
@@ -943,8 +953,8 @@ export const METRICS = Object.freeze({
 				description:
 					'unrouted: first path segment (`/blog/*`), `/` for root (null for the overflow row). ' +
 					'page_age_negative: the device type. invalidation_reenqueue: the invalidation scope literal ' +
-					'that triggered the heal. discovery_gated, entity_gate and entity_serve: the bot name. entity_canonical: the observer, ' +
-					"'probe' or 'render'. gone_reopen: what saw the " +
+					'that triggered the heal. discovery_gated, entity_gate and entity_serve: the bot name. entity_canonical and ' +
+					"canonical_adopt: the observer, 'probe', 'render', 'check' or 'origin'. gone_reopen: what saw the " +
 					"200 — 'traffic' (a proxied bot request) or 'recheck' (a negative-cache re-check). " +
 					'suppression_lifted and suppression_held: how long the target had been suppressed (since its last ' +
 					'verdict) — <1h, <6h, <1d, <3d, <14d, 14d+, or unknown. probe_detection_lag: the rule label. ' +
@@ -1155,17 +1165,20 @@ export const metrics = Object.freeze({
 	 */
 	entityServe: (outcome, botName) =>
 		server.recordAnalytics(true, 'prerender_ops', 'entity_serve', outcome, botName ?? null),
+	/** How long one entity-serve evaluation took, every outcome (ms) — what it adds to a miss. */
+	entityServeMs: (ms) => server.recordAnalytics(ms, 'prerender_ops', 'entity_serve_ms', null, null),
 
 	/**
 	 * One observation of an entity's canonical (util/entity.js) — a prerender_ops series. `outcome` is what it
-	 * did to the registry (new, moved, same, older, foreign, unreadable, error); `from` is the observer, 'probe'
-	 * or 'render'.
+	 * did to the registry (new, moved, same, older, foreign, unreadable, error); `from` is the observer: 'probe',
+	 * 'render', 'check' or 'origin'.
 	 */
 	entityCanonical: (outcome, from) =>
 		server.recordAnalytics(true, 'prerender_ops', 'entity_canonical', outcome, from ?? null),
 
 	/** One adoption decision (util/entity.js `resolveCanonical`) — a prerender_ops series. */
-	canonicalAdopt: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'canonical_adopt', outcome, null),
+	canonicalAdopt: (outcome, from) =>
+		server.recordAnalytics(true, 'prerender_ops', 'canonical_adopt', outcome, from ?? null),
 
 	/**
 	 * One raw-document store attempt and what became of it — a prerender_ops series.

@@ -152,7 +152,7 @@ const setup = async (serveCheckOptions = {}, extra = {}) => {
 	checks = new Map();
 	bases = new Map();
 	let api = API();
-	serveCheck.__setServeCheckDepsForTest({
+	lastDeps = {
 		anchor: () => ANCHOR,
 		reserveSlot: () => Date.now(),
 		disarmed: async () => new Set(),
@@ -175,9 +175,13 @@ const setup = async (serveCheckOptions = {}, extra = {}) => {
 			renderInterval: 1,
 			demandInterval: 2,
 		}),
-	});
+	};
+	serveCheck.__setServeCheckDepsForTest(lastDeps);
 	return { setApi: (next) => (api = next) };
 };
+// What `setup` injected, for a test that adds an effect on top of it.
+let lastDeps = null;
+const currentDeps = () => lastDeps;
 
 beforeEach(() => {
 	ops = [];
@@ -836,4 +840,75 @@ test('a field scoped away from a URL (pathPattern) cannot decide its check there
 	assert.deepEqual(onCollection, { result: 'agree', canonicalAgreed: true });
 	// On a regular URL the same disagreement decides.
 	assert.equal(serveCheck.compareWithEndpoint(rule, placeholder, facts, { pageUrl: URL_A }).result, 'mismatch');
+});
+
+// ---- the entity registry learns from every check ----------------------------------------------------
+
+test('a check tells the entity registry the canonical the endpoint named — agree or not, never from a disarmed field', async () => {
+	const { setApi } = await setup();
+	const told = [];
+	const resolveCanonical = async (observation) => told.push(observation);
+	serveCheck.__setServeCheckDepsForTest({ ...currentDeps(), resolveCanonical });
+	await consider(served());
+	assert.deepEqual(told, [{ url: URL_A, value: '/product/prd-a/red-shoe.jsp', from: 'check' }], 'an agreeing check');
+	// A re-slug the check catches: the registry hears the NEW slug now, not at the next nightly pass.
+	told.length = 0;
+	serveCheck.resetServeChecks();
+	setApi(API({ seoUrl: '/product/prd-a/red-running-shoe.jsp' }));
+	await consider(served());
+	assert.deepEqual(told, [{ url: URL_A, value: '/product/prd-a/red-running-shoe.jsp', from: 'check' }]);
+	// A canonical field the mapping guard disarmed is suspected of being mapped wrong: it says nothing.
+	told.length = 0;
+	serveCheck.resetServeChecks();
+	serveCheck.__setServeCheckDepsForTest({
+		...currentDeps(),
+		resolveCanonical,
+		disarmed: async () => new Set(['1:canonical']),
+	});
+	await consider(served());
+	assert.deepEqual(told, []);
+});
+
+test('a registry that throws costs the check nothing', async () => {
+	await setup();
+	serveCheck.__setServeCheckDepsForTest({
+		...currentDeps(),
+		resolveCanonical: async () => {
+			throw new Error('registry fault');
+		},
+	});
+	await consider(served());
+	assert.equal(calls.writeCheck.length, 1);
+	assert.equal(calls.writeCheck[0].outcome, 'agree');
+});
+
+test('a document check tells the registry the canonical the origin document declares', async () => {
+	await setup({}, { ingress: { mode: 'forwarded', routes: [{ match: 'prefix', path: '/c/', documentCheck: true }] } });
+	const told = [];
+	const doc =
+		'<!doctype html><html><head><title>Shoes</title><link rel="canonical" href="https://shop.example.com/c/shoes-new">' +
+		'</head><body></body></html>';
+	serveCheck.__setServeCheckDepsForTest({
+		...currentDeps(),
+		resolveCanonical: async (observation) => told.push(observation),
+		fetchDocument: async () => ({
+			statusCode: 200,
+			headers: { 'content-type': 'text/html' },
+			body: Readable.from([Buffer.from(doc)]),
+		}),
+	});
+	const { matchRoute } = await import('../src/util/routeClass.js');
+	await consider({
+		kind: 'page',
+		url: 'https://shop.example.com/c/shoes',
+		lastCachedMs: ANCHOR - 1,
+		headers: { 'content-type': 'text/html; charset=utf-8' },
+		body: Buffer.from(doc.replace('shoes-new', 'shoes')),
+		deviceType: 'desktop',
+		botName: 'Bingbot',
+		route: matchRoute('/c/shoes'),
+	});
+	assert.deepEqual(told, [
+		{ url: 'https://shop.example.com/c/shoes', value: 'https://shop.example.com/c/shoes-new', from: 'check' },
+	]);
 });

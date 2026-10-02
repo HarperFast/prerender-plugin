@@ -29,8 +29,9 @@ const searches = [];
 let searchFault = null;
 const sabs = new Map();
 const visitRows = new Map();
+const entityRows = new Map(); // the entity registry: prefix -> row
 
-const origin = { server: null, port: 0, requests: [] };
+const origin = { server: null, port: 0, requests: [], body: '<html>origin</html>' };
 let ORIGIN = '';
 let CANON = '';
 let VARIANT = '';
@@ -71,7 +72,7 @@ before(async () => {
 	origin.server = http.createServer((req, res) => {
 		origin.requests.push({ method: req.method, url: req.url, headers: req.headers });
 		res.writeHead(200, { 'content-type': 'text/html' });
-		res.end('<html>origin</html>');
+		res.end(origin.body);
 	});
 	await new Promise((resolve) => origin.server.listen(0, '127.0.0.1', resolve));
 	origin.port = origin.server.address().port;
@@ -128,7 +129,18 @@ before(async () => {
 				},
 			},
 		},
-		render_service: { Target: TargetBase, QueueControl: class {}, QueueStatus: class {} },
+		render_service: {
+			Target: TargetBase,
+			QueueControl: class {},
+			QueueStatus: class {},
+			Entity: {
+				get: async ({ id, select }) => {
+					const row = entityRows.get(id);
+					return row ? Object.fromEntries(select.map((field) => [field, row[field]])) : null;
+				},
+				patch: async (id, data) => entityRows.set(id, { ...(entityRows.get(id) ?? {}), ...data }),
+			},
+		},
 		render_schedule: { RenderSchedule: class {} },
 		page_cache: { PrerenderedPage: PageBase },
 		probe_state: { ProbeState: class {}, RenderExpectation: class {} },
@@ -215,7 +227,7 @@ const page = (over = {}) => {
 		...over,
 	};
 };
-const target = (url, state = null) => targets.set(url, { url, state });
+const target = (url, state = null, suppressedReason = null) => targets.set(url, { url, state, suppressedReason });
 const keyOf = (url, device = 'desktop') => `${url}|${device}`;
 // The entity, as it stands on the measured origin: one canonical target in rotation with a fresh page,
 // an old slug suppressed beside it, and nothing at all for the spelling a crawler asks for.
@@ -235,6 +247,8 @@ beforeEach(() => {
 	searches.length = 0;
 	searchFault = null;
 	origin.requests = [];
+	origin.body = '<html>origin</html>';
+	entityRows.clear();
 	offered = [];
 	ANCHOR = Date.now() - 6 * HOUR;
 	configure();
@@ -353,14 +367,34 @@ const fallsThrough = async (expected, { device = 'desktop', url = VARIANT } = {}
 	assert.deepEqual(outcomes(), [expected]);
 };
 
-test('has-target: a spelling with a target of its own is the render path’s — active or suppressed', async () => {
-	for (const state of [null, 'suppressed']) {
+test('has-target: a spelling with a target the render path keeps — in rotation, or suppressed about itself', async () => {
+	for (const [state, reason] of [
+		[null, null],
+		['suppressed', 'noindex'],
+		['suppressed', 'http-gone'],
+		['suppressed', null],
+	]) {
 		entity();
-		target(VARIANT, state);
+		target(VARIANT, state, reason);
 		await fallsThrough('has-target');
 		analytics.length = 0;
 		origin.requests = [];
 	}
+});
+
+test('a spelling suppressed as a CANONICAL VERDICT is answered: its own render said the product lives elsewhere', async () => {
+	for (const reason of ['canonical-mismatch', 'canonical-variant']) {
+		targets.clear();
+		entity();
+		target(VARIANT, 'suppressed', reason);
+		analytics.length = 0;
+		const res = await handleBotRequest(request(VARIANT));
+		await drain(res.body);
+		assert.equal(res.headers.get('x-harper-cache'), 'entity', reason);
+		assert.equal(res.headers.get('x-harper-entity'), keyOf(CANON));
+		assert.deepEqual(outcomes(), ['served']);
+	}
+	assert.deepEqual(origin.requests, [], 'the origin was not asked');
 });
 
 test('no-sibling: every other target of the entity is suppressed (or there is none)', async () => {
@@ -438,7 +472,7 @@ test('the read is one bounded, one-sided, node-local PK range with the minimal p
 		{ attribute: 'url', comparator: 'greater_than_equal', value: `${ORIGIN}/product/prd-1/` },
 	]);
 	assert.equal(query.limit, entityServe.ENTITY_READ_LIMIT);
-	assert.deepEqual(query.select, ['url', 'state']);
+	assert.deepEqual(query.select, ['url', 'state', 'suppressedReason']);
 	assert.deepEqual(context, { replicateFrom: false });
 });
 
@@ -889,4 +923,150 @@ test('an entity serve is demand for the CANONICAL — the URL that owns the targ
 		resetHeldSabs();
 		configure();
 	}
+});
+
+// ── the entity registry: the newest word from the origin ────────────────────────────────────────────
+
+const NEW_SLUG = () => `${ORIGIN}/product/prd-1/new-slug.jsp`;
+const PREFIX = () => `${ORIGIN}/product/prd-1/`;
+const registryRow = (canonical, canonicalAt, from = 'probe') => ({
+	id: PREFIX(),
+	canonical,
+	canonicalFrom: from,
+	canonicalAt: canonicalAt instanceof Date ? canonicalAt : new Date(canonicalAt),
+});
+const withRegistry = (row) => {
+	const read = [];
+	entityServe.__setEntityServeDepsForTest({
+		anchor: () => ANCHOR,
+		offerCheck: (candidate) => offered.push(candidate),
+		comparesCanonical: () => true,
+		registryOn: () => true,
+		readEntity: async (key) => {
+			read.push(key);
+			return typeof row === 'function' ? row() : row;
+		},
+	});
+	return read;
+};
+
+test('MOVED: the origin named another canonical after the page was rendered — a re-slug it predates', async () => {
+	entity(); // rendered at ANCHOR + 1h
+	const read = withRegistry(registryRow(NEW_SLUG(), ANCHOR + 2 * HOUR, 'check'));
+	assert.equal((await evaluate()).outcome, 'moved');
+	assert.deepEqual(read, [PREFIX()], 'one point read, by the entity prefix');
+	// Named BEFORE the render: the render read the origin later, and its page names itself — it stands.
+	withRegistry(registryRow(NEW_SLUG(), ANCHOR + 30 * 60_000));
+	assert.equal((await evaluate()).outcome, 'served');
+	// The registry naming the page itself, in any spelling, is no veto.
+	withRegistry(registryRow(CANON, Date.now()));
+	assert.equal((await evaluate()).outcome, 'served');
+	withRegistry(registryRow(CANON.replace('right-slug', 'right%2Dslug'), Date.now()));
+	assert.equal((await evaluate()).outcome, 'served', 'decodeURI-equal: one document');
+	// An unreadable instant cannot say which came first: it vetoes.
+	withRegistry({ id: PREFIX(), canonical: NEW_SLUG(), canonicalAt: 'not a date' });
+	assert.equal((await evaluate()).outcome, 'moved');
+	// No row, or a row with no canonical: nothing to say.
+	withRegistry(null);
+	assert.equal((await evaluate()).outcome, 'served');
+	withRegistry({ id: PREFIX() });
+	assert.equal((await evaluate()).outcome, 'served');
+});
+
+test('MOVED against a CHECK-confirmed page: the later of the render and the check is when it was last confirmed', async () => {
+	entity({ lastCached: new Date(ANCHOR - 2 * HOUR) });
+	check(); // checked at ANCHOR + 30m, canonical agreed
+	withRegistry(registryRow(NEW_SLUG(), ANCHOR + 10 * 60_000));
+	assert.equal((await evaluate()).outcome, 'served', 'the check is newer than the registry’s word');
+	withRegistry(registryRow(NEW_SLUG(), ANCHOR + 40 * 60_000));
+	assert.equal((await evaluate()).outcome, 'moved', 'the registry heard the re-slug after the check');
+});
+
+test('a TIE between two servable spellings goes to the one the registry names — and with no word, ambiguous', async () => {
+	entity();
+	const next = NEW_SLUG();
+	target(next);
+	pages.set(keyOf(next), page({ canonical: next }));
+	assert.equal((await evaluate()).outcome, 'ambiguous', 'the registry off: never a guess');
+	withRegistry(registryRow(next, ANCHOR));
+	const picked = await evaluate();
+	assert.equal(picked.outcome, 'served');
+	assert.equal(picked.serve.url, next);
+	withRegistry(registryRow(`${ORIGIN}/product/prd-1/third.jsp`, ANCHOR));
+	assert.equal((await evaluate()).outcome, 'ambiguous', 'it names neither');
+});
+
+test('the registry is read only when it is on, and only once there is a page to serve', async () => {
+	entity();
+	let reads = 0;
+	entityServe.__setEntityServeDepsForTest({
+		anchor: () => ANCHOR,
+		offerCheck: () => {},
+		comparesCanonical: () => true,
+		registryOn: () => false,
+		readEntity: async () => {
+			reads++;
+			return registryRow(NEW_SLUG(), Date.now());
+		},
+	});
+	assert.equal((await evaluate()).outcome, 'served', 'registry off: no veto');
+	assert.equal(reads, 0);
+	const read = withRegistry(registryRow(NEW_SLUG(), Date.now()));
+	pages.clear();
+	assert.equal((await evaluate()).outcome, 'no-page');
+	assert.deepEqual(read, [], 'nothing to serve, nothing to ask');
+});
+
+test('has-query: a spelling with a query string falls through, before any read', async () => {
+	entity();
+	assert.equal((await evaluate({ cacheUrl: `${VARIANT}?color=red` })).outcome, 'has-query');
+	assert.equal(entityReads(), 0);
+});
+
+test('every evaluation records how long it took, whatever it decided', async () => {
+	entity();
+	await evaluate();
+	await evaluate({ cacheUrl: `${ORIGIN}/elsewhere` });
+	const timings = analytics.filter((a) => a[1] === 'prerender_ops' && a[2] === 'entity_serve_ms');
+	assert.equal(timings.length, 2);
+	for (const [value] of timings) assert.ok(Number.isFinite(value) && value >= 0);
+});
+
+// ── every fetch from the origin resolves the canonical ──────────────────────────────────────────────
+
+test('a miss that reaches the origin teaches the registry the canonical its document declares — and adopts it', async () => {
+	configure({ rest: { entities: { enabled: true, adopt: { dryRun: false } } } });
+	entityServe.__setEntityServeDepsForTest({
+		anchor: () => ANCHOR,
+		offerCheck: () => {},
+		comparesCanonical: () => true,
+	});
+	const next = NEW_SLUG();
+	// No sibling in rotation: the spelling falls through to the origin, whose document names the new slug.
+	target(`${ORIGIN}/product/prd-1/old-slug.jsp`, 'suppressed', 'canonical-mismatch');
+	origin.body = `<!doctype html><html><head><link rel="canonical" href="${next}"><title>t</title></head><body>${'x'.repeat(4096)}</body></html>`;
+	const res = await handleBotRequest(request(VARIANT));
+	const body = await drain(res.body);
+	assert.equal(res.headers.get('x-harper-source'), 'origin');
+	const text = res.headers.get('content-encoding') === 'gzip' ? gunzipSync(body).toString() : body.toString();
+	assert.equal(text, origin.body, 'the crawler gets every byte the origin sent');
+	await settle(100);
+	const row = entityRows.get(PREFIX());
+	assert.equal(row?.canonical, next);
+	assert.equal(row?.canonicalFrom, 'origin');
+	assert.ok(puts.includes(next), 'the canonical no target held was filed');
+	const adopt = analytics.find((a) => a[1] === 'prerender_ops' && a[2] === 'canonical_adopt');
+	assert.deepEqual(adopt.slice(3), ['adopted', 'origin']);
+});
+
+test('no tap with the registry off, on a route that does not opt in, or for a HEAD', async () => {
+	origin.body = `<html><head><link rel="canonical" href="${NEW_SLUG()}"></head></html>`;
+	target(`${ORIGIN}/product/prd-1/old-slug.jsp`, 'suppressed', 'canonical-mismatch');
+	await drain((await handleBotRequest(request(VARIANT))).body);
+	configure({ rest: { entities: { enabled: true } }, route: { entityServe: false } });
+	await drain((await handleBotRequest(request(VARIANT))).body);
+	configure({ rest: { entities: { enabled: true } } });
+	await drain((await handleBotRequest(request(VARIANT, 'HEAD'))).body);
+	await settle(100);
+	assert.equal(entityRows.size, 0);
 });

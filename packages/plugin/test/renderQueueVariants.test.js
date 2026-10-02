@@ -1465,3 +1465,76 @@ test('a stored render tells the entity registry the canonical its page declared,
 	const storedAt = stores.prerenderedPage.get(key(OLD, 'desktop')).lastCached;
 	assert.equal(entity.canonicalAt.getTime(), storedAt - 30, 'the store time less the renders, which run in turn');
 });
+
+test('a canonical VERDICT tells the registry where the product lives now, and adopts it when no target holds it', async (t) => {
+	const OLD = 'https://site.example.com/product/prd-1/old-slug.jsp';
+	const NEW = 'https://site.example.com/product/prd-1/new-slug.jsp';
+	const entities = new Map();
+	databases.render_service.Entity = {
+		get: async ({ id }) => entities.get(id) ?? null,
+		patch: async (id, data) => entities.set(id, { ...(entities.get(id) ?? {}), ...data }),
+	};
+	config.ingress.mode = 'forwarded';
+	config.ingress.routes = [
+		{ match: 'prefix', path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/' },
+	];
+	config.entities.enabled = true;
+	config.entities.adopt.dryRun = false;
+	t.after(() => {
+		config.entities.enabled = false;
+		config.entities.adopt.dryRun = true;
+		delete databases.render_service.Entity;
+	});
+	seedUrlRow({ url: OLD });
+	await claim();
+	await postVariants(OLD, [
+		{
+			deviceType: 'desktop',
+			outcome: 'non-indexable',
+			isIndexable: false,
+			statusCode: 200,
+			reason: 'canonical-mismatch',
+			declaredCanonical: NEW,
+			renderTime: 50,
+		},
+	]);
+	assert.equal(stores.target.get(OLD).suppressedReason, 'canonical-mismatch', 'the verdict still suppresses');
+	const entity = entities.get('https://site.example.com/product/prd-1/');
+	assert.equal(entity?.canonical, NEW);
+	assert.equal(entity.canonicalFrom, 'render');
+	assert.ok(stores.target.has(NEW), 'the new canonical has a target');
+	const schedule = stores.renderSchedule.get(NEW);
+	assert.ok(schedule?.urgentAt > 0 && schedule.nextRenderTime <= Date.now(), 'filed due now and urgent');
+	assert.equal(entity.adoptedCanonical, NEW);
+});
+
+test('a verdict from a renderer that predates declaredCanonical says nothing to the registry', async (t) => {
+	const OLD = 'https://site.example.com/product/prd-2/old-slug.jsp';
+	const entities = new Map();
+	databases.render_service.Entity = {
+		get: async ({ id }) => entities.get(id) ?? null,
+		patch: async (id, data) => entities.set(id, { ...(entities.get(id) ?? {}), ...data }),
+	};
+	config.ingress.mode = 'forwarded';
+	config.ingress.routes = [
+		{ match: 'prefix', path: '/product/prd-', queryParams: [], entityPrefix: '^/product/prd-[^/]+/' },
+	];
+	config.entities.enabled = true;
+	t.after(() => {
+		config.entities.enabled = false;
+		delete databases.render_service.Entity;
+	});
+	seedUrlRow({ url: OLD });
+	await claim();
+	await postVariants(OLD, [
+		{
+			deviceType: 'desktop',
+			outcome: 'non-indexable',
+			isIndexable: false,
+			statusCode: 200,
+			reason: 'canonical-mismatch',
+		},
+	]);
+	assert.equal(stores.target.get(OLD).state, 'suppressed');
+	assert.equal(entities.size, 0);
+});

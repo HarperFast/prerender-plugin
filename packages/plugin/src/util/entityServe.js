@@ -21,14 +21,20 @@
  * Only for a TRUE miss (no page row for this key) on a route that sets `entityServe` beside its
  * `entityPrefix` (util/entityGate.js says what an entity prefix is), and only when ALL of these hold:
  *
- *   1. THE SPELLING HAS NO TARGET OF ITS OWN (`has-target`). A spelling with a row belongs to the render
- *      path: a new canonical arriving from the sitemap, a duplicate the render verdict suppressed.
- *   2. EXACTLY ONE CANDIDATE. Among the entity's targets in rotation, exactly one has a page for this
- *      device that is a 200, indexable, inside its own expiry (`hit` — not SWR) and not covered by an
- *      invalidation it predates. None: `no-sibling` / `no-page` / `not-indexable` / `stale` /
- *      `invalidated`; more than one, or more rows than the read covers: `ambiguous`. A choice is never
- *      guessed: measured, the entity had exactly one servable spelling in 199 of 199 cases, and it was
- *      the canonical the variant's own document declared.
+ *   0. NO QUERY STRING (`has-query`). A route that keys a query param says it can change the document.
+ *   1. THE SPELLING HAS NO TARGET THE RENDER PATH KEEPS (`has-target`): none of its own, or one suppressed
+ *      as a CANONICAL VERDICT (`canonical-mismatch`, `canonical-variant`) — its own render found that the
+ *      page names its canonical elsewhere, which is exactly the case this answers (measured on one
+ *      deployment, one crawler made ~11k such misses a day). A row in rotation (a new canonical arriving
+ *      from the sitemap) or suppressed about the URL itself (a 404, a noindex) is the render path's.
+ *   2. ONE CANDIDATE. Among the entity's targets in rotation, one has a page for this device that is a
+ *      200, indexable, inside its own expiry (`hit` — not SWR) and not covered by an invalidation it
+ *      predates. None: `no-sibling` / `no-page` / `not-indexable` / `stale` / `invalidated`. More than one
+ *      is decided by the ENTITY REGISTRY (util/entity.js) when it names one of them — a re-slug whose new
+ *      canonical has rendered while the old spelling has not yet been suppressed — and is `ambiguous`
+ *      otherwise, as is more rows than the read covers. A choice is never guessed: measured, the entity had
+ *      exactly one servable spelling in 199 of 199 cases, and it was the canonical the variant's own
+ *      document declared.
  *   3. ITS CANONICAL CONFIRMED SINCE THE THRESHOLD (`unconfirmed`): rendered at or after it, or checked
  *      against the origin at or after it by a check that compared the page's canonical with the origin's
  *      and found them the same (`PageCheck.canonicalAgreed`, written by the serve-time check and by the
@@ -42,6 +48,15 @@
  *      already serves at its own URL. An unconfirmed candidate is OFFERED to the serve-time check, under
  *      that check's own switches, bots and budget, so the request that found it unconfirmed is what gets
  *      it confirmed.
+ *   3b. THE REGISTRY HAS NOT HEARD OTHERWISE SINCE (`moved`). With the registry on, its canonical is the
+ *      origin's most recent word on where the entity lives, from whichever fetch saw it first — the probe, a
+ *      render (a canonical verdict's declared canonical included), a serve-time check, or a miss proxied to
+ *      the origin (util/originCanonical.js). When it names ANOTHER document, first heard after the candidate
+ *      was last confirmed (rendered, or checked and agreed), the candidate predates a re-slug: its page still
+ *      names the old slug, and it is not handed to other spellings. This is what closes the window between a
+ *      daytime re-slug and the next check of the old page: the first origin fetch to see it vetoes, and the
+ *      same observation adopted the new canonical (filed due now), which serves once it renders. An
+ *      unreadable instant vetoes.
  *   4. IT NAMES ITSELF (`not-self-canonical`): the served bytes' own `<link rel=canonical>`, read off the
  *      head (util/documentFacts.js), canonicalizes to that target's URL. `isIndexable` alone does not say
  *      this — a page with no canonical is indexable too.
@@ -54,10 +69,11 @@
  *
  * Only on an opted-in route's true misses, in place of an origin round trip: one bounded primary-key range
  * read of `Target` (node-local: Target is not residency-pinned; `replicateFrom: false` anyway), one page
- * read per target in rotation under the prefix (almost always one), a `PageCheck` read only when the
- * render alone does not confirm, the body read, and a head scan that stops at the canonical (~0.5% into a
- * product page). The range read also answers guard 1: the spelling's own row, if it has one, is under the
- * same prefix.
+ * read per target in rotation under the prefix (almost always one), one `Entity` point read once there is a
+ * page to serve (registry on; node-local, replicated), a `PageCheck` read only when the render alone does
+ * not confirm, the body read, and a head scan that stops at the canonical (~0.5% into a product page). The
+ * range read also answers guard 1: the spelling's own row, if it has one, is under the same prefix. Each
+ * evaluation's duration is `prerender_ops` / `entity_serve_ms`.
  *
  * ── WHAT IT NEEDS BESIDE IT ───────────────────────────────────────────────────────────────────
  *
@@ -81,7 +97,8 @@
 import { config } from '../config.js';
 import { metrics } from '../metrics.js';
 import { CacheKey } from './cacheKey.js';
-import { entityPrefixOf, inRotation, SIBLING_SELECT } from './entityGate.js';
+import { entityPrefixOf, inRotation } from './entityGate.js';
+import { entitiesOn, readEntity, sameDocument } from './entity.js';
 import { resolveServeStatus } from './pageFreshness.js';
 import { resolveInvalidation } from './invalidation.js';
 import { queryAllowlistFor, routeScopeForEntry } from './routeClass.js';
@@ -105,7 +122,12 @@ export const EntityServeOutcome = Object.freeze({
 	WOULD_SERVE: 'would-serve',
 	/** This URL produced no usable entity prefix (util/entityGate.js `entityPrefixOf`). */
 	NO_PREFIX: 'no-prefix',
-	/** This spelling has a Target of its own: the render path's. */
+	/** The spelling carries a query string: on a route that keys one, it may be another document. */
+	HAS_QUERY: 'has-query',
+	/**
+	 * This spelling has a Target of its own that the render path keeps: in rotation, or suppressed for a
+	 * reason that is about this URL (a 404, a noindex). One suppressed as a canonical verdict is answered.
+	 */
 	HAS_TARGET: 'has-target',
 	/** No other target of the entity is in rotation. */
 	NO_SIBLING: 'no-sibling',
@@ -121,6 +143,11 @@ export const EntityServeOutcome = Object.freeze({
 	AMBIGUOUS: 'ambiguous',
 	/** The candidate was neither rendered nor checked-and-agreed since the threshold. */
 	UNCONFIRMED: 'unconfirmed',
+	/**
+	 * The entity registry heard the origin name ANOTHER canonical after the candidate was last confirmed: a
+	 * re-slug the candidate predates. Its page still names the old slug, so it is not handed to other spellings.
+	 */
+	MOVED: 'moved',
 	/** The candidate's own canonical does not name it (or could not be read off its head). */
 	NOT_SELF_CANONICAL: 'not-self-canonical',
 	/** The candidate's body could not be read. Also counted on `serve_error`. */
@@ -139,8 +166,21 @@ export const EntityServeOutcome = Object.freeze({
  */
 export const ENTITY_READ_LIMIT = 8;
 
+// What the read projects: each row's key and state, and — for this spelling's own row — why it was suppressed.
+// An ARRAY: a string `select` projects to a bare scalar.
+export const ENTITY_ROW_SELECT = Object.freeze(['url', 'state', 'suppressedReason']);
+
+// A spelling whose own target is suppressed as a CANONICAL VERDICT is answered: its own render found that the
+// page names its canonical elsewhere, which is exactly the case this serve exists for. Measured on one
+// deployment, one crawler made ~11k such misses a day. Any other suppression is a statement about this URL
+// (it 404s, it is noindex) and the render path keeps it.
+const ANSWERED_SUPPRESSIONS = new Set(['canonical-mismatch', 'canonical-variant']);
+const keptByRenderPath = (own) =>
+	own !== null && !(own.state === 'suppressed' && ANSWERED_SUPPRESSIONS.has(own.suppressedReason));
+
 /**
- * The entity's rows under `prefix`: `{ own, inRotation, complete }` — whether `url` has a row of its own,
+ * The entity's rows under `prefix`: `{ own, inRotation, complete }` — `url`'s own row (`{ state,
+ * suppressedReason }`, or null when it has none),
  * the keys of the OTHER rows in rotation, and whether the read saw every row under the prefix (it ended on
  * a key outside the prefix, or before the limit). An unreadable row makes the read incomplete: it could be
  * this spelling's own row, or a second candidate.
@@ -148,7 +188,7 @@ export const ENTITY_READ_LIMIT = 8;
  * THE LOOP BODY DOES NOT AWAIT, so the cursor is released before anything else happens (util/scan.js).
  */
 export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_LIMIT }) => {
-	let own = false;
+	let own = null;
 	let read = 0;
 	let unreadable = false;
 	let ended = false;
@@ -157,7 +197,7 @@ export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_L
 		{
 			conditions: [{ attribute: 'url', comparator: 'greater_than_equal', value: prefix }],
 			sort: { attribute: 'url' },
-			select: [...SIBLING_SELECT],
+			select: [...ENTITY_ROW_SELECT],
 			limit,
 		},
 		{ replicateFrom: false }
@@ -173,7 +213,7 @@ export const readEntityRows = async ({ table, prefix, url, limit = ENTITY_READ_L
 			ended = true;
 			break;
 		}
-		if (key === url) own = true;
+		if (key === url) own = { state: row.state ?? null, suppressedReason: row.suppressedReason ?? null };
 		else if (inRotation(row)) keys.push(key);
 	}
 	return { own, inRotation: keys, complete: !unreadable && (ended || read < limit) };
@@ -301,6 +341,8 @@ const DEFAULTS = Object.freeze({
 	anchor: lastAnchorAt,
 	comparesCanonical: (url, route) => checkComparesFact(url, route, 'canonical'),
 	offerCheck,
+	registryOn: entitiesOn,
+	readEntity,
 });
 let deps = DEFAULTS;
 /** Tests: replace effects (merged over the defaults); no argument restores them. */
@@ -327,22 +369,27 @@ export async function resolveEntityServe({
 	settings = config.ingress.entityServe,
 	nowMs = Date.now(),
 }) {
+	const startedAt = performance.now();
 	const decided = (outcome, serve = null) => {
 		metrics.entityServe(outcome, botName);
+		metrics.entityServeMs(performance.now() - startedAt);
 		return { outcome, serve };
 	};
 	try {
 		const prefix = entityPrefixOf(cacheUrl, route);
 		if (!prefix) return decided(EntityServeOutcome.NO_PREFIX);
+		// A route that keys a query param says the param can change the document; the canonical's render is
+		// one document. (A route whose key drops the query never gets here with one.)
+		if (URL.parse(cacheUrl)?.search) return decided(EntityServeOutcome.HAS_QUERY);
 
 		const rows = await readEntityRows({ table: deps.targets(), prefix, url: cacheUrl });
-		if (rows.own) return decided(EntityServeOutcome.HAS_TARGET);
+		if (keptByRenderPath(rows.own)) return decided(EntityServeOutcome.HAS_TARGET);
 		if (!rows.complete) return decided(EntityServeOutcome.AMBIGUOUS);
 		if (rows.inRotation.length === 0) return decided(EntityServeOutcome.NO_SIBLING);
 
-		let candidate = null;
 		let refusal = EntityServeOutcome.NO_PAGE;
 		let epoch;
+		const servable = [];
 		for (const url of rows.inRotation) {
 			const cacheKey = CacheKey.toCacheKey({ url, deviceType });
 			const page = await deps.readPage(cacheKey);
@@ -353,14 +400,27 @@ export async function resolveEntityServe({
 				if (REFUSAL_RANK[refused] > REFUSAL_RANK[refusal]) refusal = refused;
 				continue;
 			}
-			if (candidate) return decided(EntityServeOutcome.AMBIGUOUS);
-			candidate = { url, cacheKey, page };
+			servable.push({ url, cacheKey, page });
 		}
-		if (!candidate) return decided(refusal);
+		if (servable.length === 0) return decided(refusal);
+
+		// THE ENTITY REGISTRY (util/entity.js): the canonical the origin named most recently, by any observer — a
+		// probe, a render, a serve-time check, a proxied origin document. One node-local point read, only once
+		// there is something to serve. It breaks a tie between two servable spellings (a re-slug whose new
+		// canonical has rendered while the old one has not yet been suppressed), and it vetoes below.
+		const registry = deps.registryOn() ? await deps.readEntity(prefix) : null;
+		const named = typeof registry?.canonical === 'string' ? registry.canonical : null;
+		let candidate = servable[0];
+		if (servable.length > 1) {
+			candidate = named ? servable.find((option) => sameDocument(option.url, named)) : null;
+			if (!candidate) return decided(EntityServeOutcome.AMBIGUOUS);
+		}
 
 		const { url, cacheKey, page } = candidate;
 		const lastCachedMs = dateColumnMs(page.lastCached);
 		const threshold = confirmThreshold(nowMs, settings.maxConfirmAge, deps.anchor);
+		// When the canonical was last confirmed: the render, or a check of the canonical since it.
+		let confirmedAtMs = lastCachedMs;
 		if (!(lastCachedMs >= threshold)) {
 			// The render alone does not confirm it; a check of its canonical since the threshold can.
 			const check = Number.isFinite(threshold) ? await deps.readCheck(url) : null;
@@ -371,6 +431,14 @@ export async function resolveEntityServe({
 				}
 				return decided(EntityServeOutcome.UNCONFIRMED);
 			}
+			confirmedAtMs = Math.max(lastCachedMs, check.checkedAtMs);
+		}
+		// THE REGISTRY'S VETO. The origin named another canonical AFTER this page was last confirmed: a re-slug it
+		// predates, seen by whichever observer got there first. Until the page re-renders (and is suppressed) or
+		// a check confirms it again, it is not handed to other spellings. An unreadable instant vetoes: there is
+		// no telling which came first.
+		if (named && !sameDocument(named, url) && !(dateColumnMs(registry.canonicalAt) <= confirmedAtMs)) {
+			return decided(EntityServeOutcome.MOVED);
 		}
 
 		const body = await deps.readBody(page);

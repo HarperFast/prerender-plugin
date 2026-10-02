@@ -337,12 +337,18 @@ bounded primary-key range, at most 8 rows, node-local. The miss is answered from
 only when all of these hold. Otherwise it falls through to the raw cache, the negative cache and the
 origin, exactly as before:
 
-- **The spelling has no target of its own.** A spelling with a row belongs to the render path. That
-  covers a new canonical arriving from the sitemap and a duplicate the render verdict suppressed.
-- **Exactly one candidate.** Exactly one target of the entity in rotation has a page for this device
-  that is a 200, indexable, inside its own expiry (not SWR), and not covered by an invalidation it
-  predates. More than one, or more rows than the read covers, is `ambiguous`: the choice is never
-  guessed.
+- **No query string** (`has-query`). A route that keys a query param says it can change the document.
+- **The spelling has no target the render path keeps.** A spelling with no row of its own is answered,
+  and so is one whose own target was suppressed as a canonical verdict (`canonical-mismatch`,
+  `canonical-variant`): its own render found that the page names its canonical elsewhere. Measured on
+  one deployment, one crawler made ~11k such misses a day. A row in rotation (a new canonical arriving
+  from the sitemap) or one suppressed about the URL itself (a 404, a noindex) is `has-target`.
+- **One candidate.** One target of the entity in rotation has a page for this device that is a 200,
+  indexable, inside its own expiry (not SWR), and not covered by an invalidation it predates. When more
+  than one does, the [entity registry](#the-entity-registry-and-adopting-the-canonical-the-origin-names-entities)
+  decides if it names one of them (a re-slug whose new canonical has rendered while the old spelling has
+  not yet been suppressed); otherwise it is `ambiguous`, as is more rows than the read covers. The choice
+  is never guessed.
 - **Its canonical was confirmed since the anchor.** The page was either rendered at or after the last
   anchor, or checked against the origin since then by a check that compared its canonical and found it
   the same (`PageCheck.canonicalAgreed`). Both the serve-time check and the probe sweep write that
@@ -355,12 +361,20 @@ origin, exactly as before:
   systematic disagreement on another field, served at its own URL anyway) confirms; a `mismatch` does
   not. Outside anchored mode there is no anchor: set `ingress.entityServe.maxConfirmAge`, or nothing is
   ever confirmed.
+- **The registry has not heard otherwise since** (`moved`, with `entities.enabled`). The registry holds the
+  canonical the origin named most recently, from whichever fetch saw it first: the nightly probe, a render
+  (including the canonical a canonical verdict declares), a serve-time check, or a miss proxied to the
+  origin. When it names another document, first heard after the page was last confirmed, the page
+  predates a re-slug and is not handed to other spellings. That closes the window between a daytime
+  re-slug and the next check of the old page: the first origin fetch to see the re-slug vetoes, and the
+  same observation adopted the new canonical (filed due now), which is served once it renders.
 - **It names itself.** The served bytes' own `<link rel=canonical>`, read off the head, must
   canonicalize to that target's URL. `isIndexable` alone cannot say this, because a page with no
   canonical is indexable too.
 
 It is served with the canonical's own stored headers and validators, as `bot_serve` source and status
-`entity`, and debug requests get `x-harper-entity: <the key that answered>`. It stores nothing, so it
+`entity`, and debug requests get `x-harper-entity: <the key that answered>`. Each evaluation's duration
+is `prerender_ops` / `entity_serve_ms`, what it adds to a miss it does not answer. It stores nothing, so it
 replicates nothing. It answers the first request for a spelling, where a raw cache only answers
 repeats, and it serves the rendered page instead of the unrendered document. A serve-time check of it
 checks the canonical's key. Snapshots rendered with `@harperfast/prerender-browser` ≥ 1.40.0 also make
@@ -378,10 +392,16 @@ Armed, the gate never mints such a spelling. A served spelling is never minted e
 not a miss. So with the gate in dry run, `would-serve` counts only each spelling's first request: arm
 the gate first, or read `would-serve` as a floor.
 
+**Turn the registry on with it** (`entities.enabled`, adoption out of dry run). With the gate armed, a
+re-slugged product's new canonical is not minted while its old spelling is in rotation, and an
+out-of-stock product's is never in the sitemap. So until the old spelling's re-render suppresses it,
+adoption is what files the new canonical, and the registry is what tells the entity serve the old page
+has moved.
+
 **Rollout.** Deploy with `dryRun: true`. Read `prerender_ops` / `entity_serve`: `would-serve` is what
 arming would answer, and the other outcomes say why the rest fall through. Then set `dryRun: false`.
 
-### The entity registry, and adopting the canonical the probe reports (`entities`)
+### The entity registry, and adopting the canonical the origin names (`entities`)
 
 `Target` is keyed by URL, so two spellings of one product are two unrelated rows, and nothing records
 which of them the origin calls canonical. The registry keeps one `Entity` row per entity a route
@@ -395,9 +415,17 @@ entities:
     dryRun: true # the default: count would-adopt, file nothing
 ```
 
-- **Written by observations of the origin only.** The change probe's mapped `canonical` slot is one
-  observer; it is the endpoint's own answer for the product id. A stored render's declared
-  `pageFacts.canonical` is the other.
+- **Written by observations of the origin only**: every fetch that says which URL is the entity's
+  canonical. On a site whose every spelling of a product is one document, each is the origin's own
+  answer for the product id, so a crawler-invented spelling cannot make it invent a canonical.
+  - `probe`: the change probe's mapped `canonical` slot, every night for every product.
+  - `render`: a stored render's `pageFacts.canonical`, and the canonical a canonical verdict declares
+    (`@harperfast/prerender-browser` ≥ 1.40.0). After a re-slug, the render of the old spelling is often
+    the first fetch to see it.
+  - `check`: a serve-time check, from the endpoint's canonical slot or the origin document's canonical.
+  - `origin`: a miss proxied to the origin on an `entityServe` route. Its canonical is read off the head
+    as the crawler's bytes stream by (at most 128 KiB, and at most 32 at once per worker), so it costs no
+    second request and nothing the response waits on.
   - When two observations disagree, the newer wins. A render's instant is when it read the origin
     (store time less its longest render), so a render claimed before a re-slug can't undo the probe
     that saw it.
@@ -406,8 +434,9 @@ entities:
     treats it.
   - A canonical under another entity's prefix is ignored, and so is a relative path (only an absolute
     URL or a `/`-rooted path counts).
-- **Adoption.** When the probe reports a canonical that is another URL of the same entity, and no target
-  holds it in rotation, its target is filed due now and urgent, as redirect adoption does.
+- **Adoption.** When any observer names a canonical that is another URL of the same entity than the one
+  it observed, and no target holds it in rotation, its target is filed due now and urgent, as redirect
+  adoption does.
   - A target suppressed as a canonical verdict (`canonical-mismatch`, `canonical-variant`) is reactivated
     the same way. One suppressed for any other reason (a 404, a noindex) is left alone.
   - Bounded by `maxPerHour` per node, shared by every worker thread and every observer; by `retryAfter`
@@ -424,11 +453,15 @@ entities:
 - **Cost.** Replicated and not residency-pinned. The first probe pass with the registry on writes one row
   per probed entity, paced by the probe, and renders fill in the rest. After that it writes only when a
   canonical moves.
+- **Read by the entity serve** (above): a page whose canonical the registry has since heard move is not
+  handed to other spellings (`moved`), and a tie between two servable spellings goes to the one it names.
 - **Inspect it:** `GET /prerender_admin/explain?url=…` reports `rows.entity` (the canonical, who named it,
-  when, and the last adoption). Outcomes: `prerender_ops` / `entity_canonical` and `canonical_adopt`.
+  when, and the last adoption). Outcomes: `prerender_ops` / `entity_canonical` and `canonical_adopt`,
+  both with the observer as context. The console's Traffic view charts them.
 
-Phase 2 of #166 moves the readers onto it: the probe walks entities rather than every target, and the
-entity gate and entity serve do a point read.
+Still to come ([#166](https://github.com/HarperFast/prerender-plugin/issues/166) phase 2): the probe walks
+entities rather than every target, through a host-supplied entity source
+([#242](https://github.com/HarperFast/prerender-plugin/issues/242)), and the entity gate does a point read.
 
 ### Sitemaps are filtered to prerender routes
 

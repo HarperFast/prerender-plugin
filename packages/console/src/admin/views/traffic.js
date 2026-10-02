@@ -186,6 +186,7 @@ export function render(ctx) {
 		rawCache(ctx, data, filter),
 		negativeCache(ctx, data, filter),
 		entityServe(ctx, data, filter),
+		entityRegistry(ctx, data),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -2310,14 +2311,16 @@ function negativeCache(ctx, data, filter) {
 // Why an entity serve fell through (plugin `prerender_ops` / `entity_serve`), with what each one means.
 const ENTITY_FALL_THROUGHS = [
 	['unconfirmed', 'canonical not rendered or checked since the anchor'],
-	['has-target', 'the spelling has a target of its own'],
+	['has-target', 'the spelling has a target the render path keeps'],
+	['moved', 'the registry heard a re-slug since'],
 	['no-page', 'no page for this device'],
 	['stale', 'past its expiry'],
 	['not-indexable', 'not a 200, or not indexable'],
 	['invalidated', 'predates an invalidation'],
-	['ambiguous', 'more than one candidate'],
+	['ambiguous', 'more than one candidate, none named by the registry'],
 	['no-sibling', 'no other target in rotation'],
 	['not-self-canonical', 'its canonical does not name it'],
+	['has-query', 'a query string'],
 	['unreadable', 'body unreadable'],
 	['no-prefix', 'no entity prefix'],
 	['error', 'read failed'],
@@ -2338,10 +2341,13 @@ function entityServe(ctx, data, filter) {
 		(entry) => entry && typeof entry === 'object' && entry.entityServe === true
 	);
 	const served = sumCount(pick(data, 'bot_serve', (s) => s.method === 'entity' && keepBot(filter, s.type)));
+	// Each evaluation's duration (plugin v0.102.0): what an opted-in route adds to a miss it does not answer.
+	const timings = pick(data, 'prerender_ops', (s) => s.path === 'entity_serve_ms');
 	const help = [
-		'A miss for a spelling with no page and no target of its own (an old or invented slug), answered from the ',
-		'cached render of its entity’s canonical: a fresh, indexable page that names itself, whose canonical was ',
-		'rendered or checked against the origin since the anchor. Switches: ',
+		'A miss for a spelling with no page and no target the render path keeps (an old or invented slug, or one ',
+		'suppressed because its page names its canonical elsewhere), answered from the cached render of its ',
+		'entity’s canonical: a fresh, indexable page that names itself, whose canonical was rendered or checked ',
+		'against the origin since the anchor, and not heard re-slugged since by the entity registry. Switches: ',
 		el('code', { text: 'ingress.entityServe' }),
 		' and ',
 		el('code', { text: 'entityServe' }),
@@ -2403,8 +2409,116 @@ function entityServe(ctx, data, filter) {
 						.join(' · ') || 'none',
 					{ warn: ev('error') + ev('unreadable') > 0 }
 				),
+				timings.length > 0 &&
+					stat(
+						'Cost per evaluation',
+						fmtMs(weighted(timings, 'median')),
+						`median · p95 ≈ ${fmtMs(weighted(timings, 'p95'))} · added to a miss it does not answer`
+					),
 			]),
 			!events.length && el('div', { cls: 'empty', text: 'No entity-serve evaluations in this range.' }),
+		],
+	});
+}
+
+// Who told the entity registry (plugin `entity_canonical` / `canonical_adopt` context), in the order a re-slug is
+// usually seen: the origin documents crawlers pull, the renders, the serve-time checks, the nightly probe.
+const ENTITY_OBSERVERS = [
+	['origin', 'proxied origin documents'],
+	['render', 'renders'],
+	['check', 'serve-time checks'],
+	['probe', 'the nightly probe'],
+];
+
+/**
+ * The entity registry (plugin v0.101.0, `entities`): each product's current canonical, learned from every fetch
+ * from the origin. `entity_canonical` is every observation by what it did (`moved` is a re-slug seen, by the
+ * observer that saw it first); `canonical_adopt` is what was done about a canonical no target held. In an
+ * adoption dry run, `would-adopt` plus `capped` is what arming files.
+ */
+function entityRegistry(ctx, data) {
+	const observed = pick(data, 'prerender_ops', (s) => s.path === 'entity_canonical');
+	const adoptions = pick(data, 'prerender_ops', (s) => s.path === 'canonical_adopt');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('entities.enabled')?.effective === true;
+	const adoptOn = options.get('entities.adopt.enabled')?.effective !== false;
+	const adoptDry = options.get('entities.adopt.dryRun')?.effective !== false;
+	const help = [
+		'One row per product holding its current canonical, written by every fetch from the origin that names it: ',
+		'proxied misses, renders, serve-time checks and the nightly probe. A canonical no target holds is filed due ',
+		'now (adoption). Switches: ',
+		el('code', { text: 'entities' }),
+		' (',
+		link('Config →', () => ctx.go('config')),
+		').',
+	];
+	if (!enabled && !observed.length && !adoptions.length) {
+		return card('Entity registry', {
+			head: [spacer(), pill('off', '')],
+			help,
+			body: [el('div', { cls: 'empty', text: 'Off.' })],
+		});
+	}
+	const tally = (combos) => {
+		const by = new Map();
+		for (const s of combos) {
+			const key = `${s.method ?? 'unknown'}|${s.type ?? 'unknown'}`;
+			by.set(key, (by.get(key) ?? 0) + s.count);
+		}
+		return (outcome, from = null) =>
+			from === null
+				? [...by].filter(([key]) => key.startsWith(`${outcome}|`)).reduce((acc, [, n]) => acc + n, 0)
+				: (by.get(`${outcome}|${from}`) ?? 0);
+	};
+	const seen = tally(observed);
+	const did = tally(adoptions);
+	const filed = did('adopted') + did('reactivated');
+	const wouldFile = did('would-adopt');
+	const byObserver = (count) =>
+		ENTITY_OBSERVERS.map(([from, label]) => [label, count(from)])
+			.filter(([, n]) => n > 0)
+			.map(([label, n]) => `${num(n)} ${label}`)
+			.join(' · ') || 'none';
+
+	return card(`Entity registry — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? pill('on', 'ok') : pill('off', 'warn'),
+			adoptOn ? (adoptDry ? pill('adoption dry run', 'info') : pill('adoption armed', 'ok')) : pill('adoption off', ''),
+			spacer(),
+		],
+		help,
+		body: [
+			stats([
+				stat(
+					'Re-slugs seen',
+					fmtCount(seen('moved')),
+					byObserver((from) => seen('moved', from))
+				),
+				stat('New entities', fmtCount(seen('new')), 'first observation of a product'),
+				adoptDry
+					? stat(
+							'Would adopt',
+							fmtCount(wouldFile + did('capped')),
+							`${num(wouldFile)} under the hourly budget · ${num(did('capped'))} past it`,
+							{ warn: did('capped') > 0 }
+						)
+					: stat(
+							'Adopted',
+							fmtCount(filed),
+							byObserver((from) => did('adopted', from) + did('reactivated', from)),
+							{
+								warn: did('capped') > 0,
+							}
+						),
+				stat(
+					'Not adopted',
+					fmtCount(did('exists') + did('suppressed') + did('recent') + did('refused') + did('error')),
+					`${num(did('exists'))} already held · ${num(did('recent'))} recent · ${num(did('suppressed'))} suppressed` +
+						(did('error') ? ` · ${num(did('error'))} errors` : ''),
+					{ warn: did('error') > 0 }
+				),
+			]),
+			!observed.length && !adoptions.length && el('div', { cls: 'empty', text: 'No registry activity in this range.' }),
 		],
 	});
 }

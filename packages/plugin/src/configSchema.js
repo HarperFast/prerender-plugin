@@ -235,13 +235,16 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'prefix plus `[^/]+` segments, no nested quantifiers. Governed by `ingress.entityGate` (dry run ' +
 					'by default).\n\n' +
 					'`entityServe` (default false; prerender routes with an `entityPrefix` only) — answer a TRUE miss ' +
-					'for a URL with no target of its own from the cached render of its entity\u2019s canonical URL, ' +
+					'for a URL with no target of its own (or one suppressed as a canonical verdict) from the cached ' +
+					'render of its entity\u2019s canonical URL, ' +
 					'instead of the origin: the crawler asking for `/product/prd-1/old-slug.jsp` gets the page cached ' +
 					'for `/product/prd-1/right-slug.jsp`, which declares the canonical exactly as the origin would. ' +
 					'Served only when one target of the entity in rotation has a fresh, indexable 200 page for the ' +
 					'device, that page\u2019s own canonical names it, and its canonical was confirmed against the ' +
-					'origin since the last anchor (see `ingress.entityServe`); anything else falls through to the ' +
-					'ordinary miss path. ONLY FOR A SITE THAT ANSWERS EVERY SPELLING OF AN ENTITY WITH THE SAME ' +
+					'origin since the last anchor and not heard re-slugged since by the entity registry (see ' +
+					'`ingress.entityServe`); anything else falls through to the ordinary miss path. Setting it also ' +
+					'lets every document proxied from the origin on the route teach the registry the canonical it ' +
+					'declares (`entities.enabled`). ONLY FOR A SITE THAT ANSWERS EVERY SPELLING OF AN ENTITY WITH THE SAME ' +
 					'DOCUMENT. The experiment that settles it: fetch two spellings of one product from the origin and ' +
 					'compare everything but per-response noise — the canonical, title, description, offers and ' +
 					'breadcrumbs must be identical, and the canonical must name the same URL from both. Governed by ' +
@@ -296,14 +299,18 @@ export const configSchema = group('Prerender plugin configuration.', {
 			entityServe: group(
 				'The entity serve. Nothing here does anything until a route sets `ingress.routes[].entityServe` ' +
 					'beside its `entityPrefix` — see that field for what it does and when a site qualifies.\n\n' +
-					'WHEN IT SERVES. On a true miss (no page for this key) for a URL with no target of its own, the ' +
-					'targets sharing its entity prefix are read (one bounded primary-key range read of at most 8 ' +
-					'rows, node-local). Exactly one of them in rotation must have a page for this device that is a ' +
-					'200, indexable, inside its own expiry (not SWR) and not covered by an invalidation it predates; ' +
-					'none, or more than one, falls through. That page must have been rendered since the threshold ' +
+					'WHEN IT SERVES. On a true miss (no page for this key) for a URL with no query string and no ' +
+					'target of its own (one suppressed as a canonical verdict counts as none: its own render said the ' +
+					'product lives elsewhere), the targets sharing its entity prefix are read (one bounded primary-key ' +
+					'range read of at most 8 rows, node-local). One of them in rotation must have a page for this ' +
+					'device that is a 200, indexable, inside its own expiry (not SWR) and not covered by an ' +
+					'invalidation it predates; none falls through, and more than one falls through unless the entity ' +
+					'registry names one of them. That page must have been rendered since the threshold ' +
 					'below, or checked against the origin since then by a check that compared its canonical and ' +
 					'found it the same (`PageCheck.canonicalAgreed` — the serve-time check and the probe sweep write ' +
-					'it, so the probe rule must map `canonical`); and its own `<link rel=canonical>` must name it. ' +
+					'it, so the probe rule must map `canonical`); with `entities.enabled`, the registry must not have ' +
+					'heard the origin name another canonical since (`moved`); and its own `<link rel=canonical>` ' +
+					'must name it. ' +
 					'An unconfirmed page is offered to the serve-time check, under that check\u2019s own switches and ' +
 					'budget. Then it is served as `bot_serve` source and status `entity`.\n\n' +
 					'WHY THE CONFIRMATION. An origin re-spells slugs. Between a re-spell and the old page\u2019s ' +
@@ -315,7 +322,11 @@ export const configSchema = group('Prerender plugin configuration.', {
 					'entity-served. With `ingress.entityGate.dryRun: true` only each spelling\u2019s first request ' +
 					'can be answered, and `would-serve` undercounts what arming would answer by its repeats (read ' +
 					'as `has-target`). A served spelling is never minted: it was not a miss.\n\n' +
-					'Observed on `prerender_ops` / `entity_serve`, one emit per evaluation by outcome.',
+					'TURN THE REGISTRY ON WITH IT (`entities.enabled`, adoption armed): with the gate armed, adoption ' +
+					'is what files a re-slugged product\u2019s new canonical, and the registry is what tells this ' +
+					'serve the old page has moved.\n\n' +
+					'Observed on `prerender_ops` / `entity_serve`, one emit per evaluation by outcome, and ' +
+					'`entity_serve_ms`, each evaluation\u2019s duration.',
 				{
 					enabled: option(
 						true,
@@ -3157,10 +3168,12 @@ export const configSchema = group('Prerender plugin configuration.', {
 	entities: group(
 		'THE ENTITY REGISTRY (util/entity.js, issue #166): one `Entity` row per entity a route declares with ' +
 			'`ingress.routes[].entityPrefix` (a product), keyed by the entity prefix, holding the entity\u2019s ' +
-			'current canonical URL. Written by observations of the origin only: the change probe\u2019s mapped ' +
-			'`canonical` slot and a stored render\u2019s declared canonical, the newer of two disagreeing ' +
-			'observations winning, and only when the canonical moves. Replicated, not residency-pinned. Read by ' +
-			'`entities.adopt`. Observations on `prerender_ops` / `entity_canonical`.',
+			'current canonical URL. Written by observations of the origin only — every fetch that says which URL is ' +
+			'the canonical: the change probe\u2019s mapped `canonical` slot, a render\u2019s declared canonical (a ' +
+			'stored page\u2019s, or a canonical verdict\u2019s), a serve-time check, and a document proxied from the ' +
+			'origin on an `entityServe` route — the newer of two disagreeing observations winning, and only when ' +
+			'the canonical moves. Replicated, not residency-pinned. Read by `entities.adopt` and the entity serve ' +
+			'(`ingress.entityServe`). Observations on `prerender_ops` / `entity_canonical`.',
 		{
 			enabled: option(
 				false,

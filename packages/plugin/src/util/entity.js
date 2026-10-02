@@ -21,12 +21,19 @@
  *
  * ── WHO WRITES THE CANONICAL, AND WHY THE NEWEST WINS ─────────────────────────────────────────
  *
- * Two observers of the origin, and nothing else:
+ * Every fetch from the origin that says which URL is the entity's canonical, and nothing else. On a site
+ * whose every spelling of a product is one document (the reason a route sets `entityServe`), each of them is
+ * the origin's own answer for the product id, so a junk spelling cannot invent a canonical — the reason
+ * "adopt the canonical" was unsafe on catalog facets does not apply:
  *
  *   probe    the change probe's mapped `canonical` slot (the consumer's rule: the details endpoint's
- *            seoURL). The origin's own answer for the product id, so a junk spelling cannot invent a
- *            canonical — the reason "adopt the canonical" was unsafe on catalog facets does not apply.
- *   render   a stored render's `pageFacts.canonical`: what the page itself declared.
+ *            seoURL), every night for every product.
+ *   render   a stored render's `pageFacts.canonical`, and the canonical a canonical VERDICT declared
+ *            (browser >= 1.40.0 `declaredCanonical`): the render of an old spelling after a re-slug is
+ *            often the first fetch to see it.
+ *   check    a serve-time check: the endpoint's canonical slot, or the origin document's canonical.
+ *   origin   a proxied origin document on an `entityServe` route (util/originCanonical.js): every miss
+ *            that reaches the origin, read off its head as the crawler's bytes stream by.
  *
  * Either one moves the canonical only with an observation NEWER than the one that set it, so a render
  * claimed before a re-slug and landing after the probe saw it cannot move the canonical back. Its instant
@@ -206,12 +213,14 @@ export async function observeCanonical({ url, canonical, from, atMs }) {
 }
 
 /**
- * A stored render's observation (resources/RenderQueue.js): the page's own declared canonical, at the
- * instant the origin was read, which the caller passes. Never rejects.
+ * A render's observation (resources/RenderQueue.js): the canonical the page declared — a stored page's own
+ * `pageFacts.canonical`, or the one a canonical verdict reported — at the instant the origin was read, which the
+ * caller passes. Resolved like every other observation: recorded, and adopted when no target holds it. Never
+ * rejects.
  */
-export const observeRenderedCanonical = async (url, pageFacts, readAtMs) => {
-	if (!entitiesOn() || typeof pageFacts?.canonical !== 'string') return;
-	await observeCanonical({ url, canonical: pageFacts.canonical, from: 'render', atMs: readAtMs });
+export const observeRenderedCanonical = async (url, canonical, readAtMs) => {
+	if (!entitiesOn() || typeof canonical !== 'string' || canonical === '') return;
+	await resolveCanonical({ url, value: canonical, from: 'render', atMs: readAtMs });
 };
 
 // Suppression reasons the origin's own word overturns: each is a render's verdict that the page named its
@@ -367,7 +376,7 @@ export const createCanonicalResolver = ({
 		const adopt = typeof settings === 'function' ? settings() : settings;
 		if (!adopt?.enabled) return observed;
 		const decided = (outcome) => {
-			metrics.canonicalAdopt(outcome);
+			metrics.canonicalAdopt(outcome, from ?? null);
 			return { ...observed, adopt: outcome };
 		};
 		let target;
