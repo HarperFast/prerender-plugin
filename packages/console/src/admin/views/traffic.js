@@ -185,6 +185,7 @@ export function render(ctx) {
 		discoveryGate(ctx, data, filter),
 		rawCache(ctx, data, filter),
 		negativeCache(ctx, data, filter),
+		entityServe(ctx, data, filter),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -687,11 +688,12 @@ function staleness(ctx, data, scope) {
 	// is what is wrong, so say that rather than let a config gap read as a fleet failure.
 	//
 	// THE DENOMINATOR IS THE SERVES THAT PRODUCED THE DISTRIBUTION, which is the serves whose SOURCE
-	// was `cache` — `page_age`/`route_page_age` are emitted only on that branch. It is deliberately
-	// not `isCacheServed`, which since plugin v0.76.0 also contains `raw`: a raw document contributes
-	// no age sample, so counting it here would shrink the past-due share on exactly the deployments
-	// that serve a lot of raw and fire this note against a fleet that is genuinely behind.
-	const agedServes = sumCount(serves.filter((x) => x.path === 'cache'));
+	// was `cache` or `entity` (plugin v0.100.0: another URL's render, served at a spelling) —
+	// `page_age`/`route_page_age` are emitted only on those. It is deliberately not `isCacheServed`,
+	// which since plugin v0.76.0 also contains `raw`: a raw document contributes no age sample, so
+	// counting it here would shrink the past-due share on exactly the deployments that serve a lot of
+	// raw and fire this note against a fleet that is genuinely behind.
+	const agedServes = sumCount(serves.filter((x) => x.path === 'cache' || x.path === 'entity'));
 	const pastDue = sumCount(serves.filter((x) => x.method === 'swr' || x.method === 'stale'));
 	const contradicted =
 		normalizable && Number.isFinite(ratioP95) && ratioP95 > 1 && agedServes > 0 && pastDue / agedServes < 0.01;
@@ -799,6 +801,14 @@ const FAMILIES = [
 		hint: 'a dead URL answered from the origin’s stored 404 — there is no page to render',
 	},
 	{
+		key: 'entity',
+		label: 'Entity serve',
+		// A spelling with no page of its own, answered from the cached render of its entity's canonical
+		// (plugin `entityServe`, v0.100.0). A rendered page and no fault — its own family, like raw, so the
+		// feature working never reads as a coverage gap, and its share stays readable on its own.
+		hint: 'a spelling answered from its entity’s canonical render — one render covering many URLs',
+	},
+	{
 		key: 'not-cacheable',
 		label: 'Not cacheable',
 		hint: 'the cache was never consulted',
@@ -836,6 +846,10 @@ const NOT_HIT = {
 	'negative-revalidate': [
 		'negative',
 		'the stored 404 answered at once while the origin was re-checked in the background — counted against offload',
+	],
+	'entity': [
+		'entity',
+		'no page under this key, so the cached render of its entity’s canonical answered it — the origin was not asked',
 	],
 	'skip': ['not-cacheable', 'the cache was deliberately not consulted (renderNow / Cache-Control)'],
 	// An over-limit URL is `bypass` too from plugin v0.97.3: its cache key would exceed Harper's key limit.
@@ -2289,6 +2303,108 @@ function negativeCache(ctx, data, filter) {
 				),
 			]),
 			!events.length && el('div', { cls: 'empty', text: 'No negative-cache activity in this range.' }),
+		],
+	});
+}
+
+// Why an entity serve fell through (plugin `prerender_ops` / `entity_serve`), with what each one means.
+const ENTITY_FALL_THROUGHS = [
+	['unconfirmed', 'canonical not rendered or checked since the anchor'],
+	['has-target', 'the spelling has a target of its own'],
+	['no-page', 'no page for this device'],
+	['stale', 'past its expiry'],
+	['not-indexable', 'not a 200, or not indexable'],
+	['invalidated', 'predates an invalidation'],
+	['ambiguous', 'more than one candidate'],
+	['no-sibling', 'no other target in rotation'],
+	['not-self-canonical', 'its canonical does not name it'],
+	['unreadable', 'body unreadable'],
+	['no-prefix', 'no entity prefix'],
+	['error', 'read failed'],
+];
+
+/**
+ * The entity serve (plugin v0.100.0): a true miss for one spelling of an entity answered from the cached
+ * render of its canonical. The served count is bot_serve status `entity`; the census of every evaluation —
+ * the dry-run number, and why the rest fell through — is prerender_ops `entity_serve`.
+ */
+function entityServe(ctx, data, filter) {
+	const events = pick(data, 'prerender_ops', (s) => s.path === 'entity_serve');
+	const options = optionIndex(configState(ctx).payload);
+	const enabled = options.get('ingress.entityServe.enabled')?.effective !== false;
+	const dryRun = options.get('ingress.entityServe.dryRun')?.effective !== false;
+	const gateDryRun = options.get('ingress.entityGate.dryRun')?.effective !== false;
+	const routes = (options.get('ingress.routes')?.effective ?? []).filter(
+		(entry) => entry && typeof entry === 'object' && entry.entityServe === true
+	);
+	const served = sumCount(pick(data, 'bot_serve', (s) => s.method === 'entity' && keepBot(filter, s.type)));
+	const help = [
+		'A miss for a spelling with no page and no target of its own (an old or invented slug), answered from the ',
+		'cached render of its entity’s canonical: a fresh, indexable page that names itself, whose canonical was ',
+		'rendered or checked against the origin since the anchor. Switches: ',
+		el('code', { text: 'ingress.entityServe' }),
+		' and ',
+		el('code', { text: 'entityServe' }),
+		' on a route (',
+		link('Config →', () => ctx.go('config')),
+		'). In a dry run nothing is served: “would serve” is what arming answers.',
+	];
+	if (!routes.length && !events.length && !served) {
+		return card('Entity serve', {
+			head: [spacer(), pill('off', '')],
+			help,
+			body: [el('div', { cls: 'empty', text: 'Off.' })],
+		});
+	}
+
+	const by = new Map();
+	for (const s of events) by.set(s.method ?? 'unknown', (by.get(s.method ?? 'unknown') ?? 0) + s.count);
+	const ev = (key) => by.get(key) ?? 0;
+	const evaluated = sumCount(events);
+	const answered = dryRun ? ev('would-serve') : ev('served');
+	const reasons = ENTITY_FALL_THROUGHS.filter(([key]) => ev(key) > 0).sort(([a], [b]) => ev(b) - ev(a));
+	const others = reasons.filter(([key]) => key !== 'unconfirmed' && key !== 'has-target');
+
+	return card(`Entity serve — ${scopeLabel(data)}`, {
+		head: [
+			enabled ? (dryRun ? pill('dry run', 'info') : pill('armed', 'ok')) : pill('master switch off', 'warn'),
+			routes.length
+				? pill(`${routes.length} route${routes.length === 1 ? '' : 's'} opted in`, 'info')
+				: pill('no route opted in', 'warn'),
+			spacer(),
+		],
+		help,
+		body: [
+			gateDryRun &&
+				ev('has-target') > 0 &&
+				el('div', { cls: 'note warn' }, [
+					'The entity gate is in dry run, so a spelling’s repeats are minted and land in “has a target”. Arm ',
+					el('code', { text: 'ingress.entityGate' }),
+					' to count them.',
+				]),
+			stats([
+				dryRun && enabled
+					? stat('Would serve', fmtCount(answered), `${pct(answered, evaluated)} of evaluated misses`)
+					: stat('Served', fmtCount(served), `origin not asked${filter ? ' · filtered' : ''}`),
+				stat(
+					'Unconfirmed',
+					fmtCount(ev('unconfirmed')),
+					`${pct(ev('unconfirmed'), evaluated)} · canonical not confirmed since the anchor`
+				),
+				stat('Has a target', fmtCount(ev('has-target')), `${pct(ev('has-target'), evaluated)} · the render path’s`, {
+					warn: gateDryRun && ev('has-target') > 0,
+				}),
+				stat(
+					'Other fall-throughs',
+					fmtCount(others.reduce((acc, [key]) => acc + ev(key), 0)),
+					others
+						.slice(0, 3)
+						.map(([key, means]) => `${num(ev(key))} ${means}`)
+						.join(' · ') || 'none',
+					{ warn: ev('error') + ev('unreadable') > 0 }
+				),
+			]),
+			!events.length && el('div', { cls: 'empty', text: 'No entity-serve evaluations in this range.' }),
 		],
 	});
 }
