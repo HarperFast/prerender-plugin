@@ -4088,3 +4088,48 @@ test('a baseline under another rule fingerprint is never spared by a check', asy
 	});
 	assert.deepEqual(probed, [URL_A]);
 });
+
+test('the sweep reports a page SERVED WRONG: since its render, or — when the origin moved — since the last pass at most', async () => {
+	const told = [];
+	const onServedWrong = (sample) => told.push(sample);
+	const unmoved = await apiSig();
+	await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: unmoved },
+		stored: { [URL_A]: { signature: unmoved, pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }) } },
+		onServedWrong,
+	});
+	assert.deepEqual(told, [{ what: '0:title', knownRightAt: RENDERED_AT.getTime() }], 'wrong since it was rendered');
+
+	// The origin changed since the baseline, rendered BEFORE that pass: right until then, at most.
+	told.length = 0;
+	const before = await apiSig({ title: 'Red Shoe (Old Name)' });
+	await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: unmoved },
+		stored: {
+			[URL_A]: {
+				signature: before,
+				probedAt: 5000,
+				pageClaimAt: RENDERED_AT,
+				pageFacts: await RECORD({ title: 'Red Shoe (Old Name)' }),
+			},
+		},
+		onServedWrong,
+	});
+	assert.deepEqual(told, [{ what: '0:title', knownRightAt: 5000 }]);
+
+	// A page that agrees is nothing to report; and no hook, no report (the canary wires none).
+	told.length = 0;
+	await runMappedPass({
+		rows: [row(URL_A)],
+		answers: { [URL_A]: unmoved },
+		stored: { [URL_A]: { signature: unmoved, pageFacts: await RECORD() } },
+		onServedWrong,
+	});
+	assert.deepEqual(told, []);
+	const SRC = await import('node:fs').then((fs) =>
+		fs.readFileSync(new URL('../src/util/changeProbe.js', import.meta.url), 'utf8')
+	);
+	assert.equal(SRC.match(/onServedWrong: \(/g)?.length, 1, 'wired once: the sweep');
+});

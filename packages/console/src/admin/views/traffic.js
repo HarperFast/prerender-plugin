@@ -187,6 +187,7 @@ export function render(ctx) {
 		negativeCache(ctx, data, filter),
 		entityServe(ctx, data, filter),
 		entityRegistry(ctx, data),
+		servedWrong(data),
 		breadth(ctx, filter),
 		el('div', { cls: 'scan-foot' }, [scanFooter(data)]),
 		knobs,
@@ -2520,6 +2521,62 @@ function entityRegistry(ctx, data) {
 				),
 			]),
 			!observed.length && !adoptions.length && el('div', { cls: 'empty', text: 'No registry activity in this range.' }),
+		],
+	});
+}
+
+// Who found a served copy wrong (plugin `served_wrong` detail), in the order they usually run.
+const SERVED_WRONG_DETECTORS = [
+	['check', 'serve-time checks'],
+	['check-raw', 'checks of raw documents'],
+	['render-check', 'render checks'],
+	['sweep', 'the nightly pass'],
+	['negative-recheck', 'stored-404 re-checks'],
+	['negative-fetch', 'stored 404s a crawler’s miss found live'],
+];
+
+/**
+ * Served while wrong (plugin v0.102.0, prerender_ops `served_wrong`): every cached copy — a page, a raw document, a
+ * stored 404 — found to differ from the origin while it was being served, by the detector that found it. The value
+ * is an UPPER BOUND on how long it was out there (since it was last known right), so the percentiles say how long
+ * wrong copies lived, and the count by field says what was wrong. Serves per wrong copy are not counted.
+ */
+function servedWrong(data) {
+	const found = pick(data, 'prerender_ops', (s) => s.path === 'served_wrong');
+	const help = [
+		'Cached copies found to differ from the origin while they were being served, at the moment a check, the ',
+		'nightly pass, a render check or a stored-404 re-check found them. Each one’s age is how long it had been ',
+		'served since it was last known right — an upper bound. How many times each was served is not counted.',
+	];
+	if (!found.length) {
+		return card('Served while wrong', {
+			head: [spacer()],
+			help,
+			body: [el('div', { cls: 'empty', text: 'Nothing found wrong in this range.' })],
+		});
+	}
+	const of = (detector) => found.filter((s) => s.method === detector);
+	const byField = new Map();
+	for (const s of found) byField.set(s.type ?? 'unknown', (byField.get(s.type ?? 'unknown') ?? 0) + s.count);
+	const fields = [...byField].sort((a, b) => b[1] - a[1]).slice(0, 4);
+	return card(`Served while wrong — ${scopeLabel(data)}`, {
+		head: [spacer()],
+		help,
+		body: [
+			stats(
+				SERVED_WRONG_DETECTORS.filter(([key]) => of(key).length > 0).map(([key, label]) => {
+					const rows = of(key);
+					return stat(
+						`Found by ${label}`,
+						fmtCount(sumCount(rows)),
+						`out for ≤ ${fmtMs(weighted(rows, 'median'))} median · ≈${fmtMs(weighted(rows, 'p95'))} p95`
+					);
+				})
+			),
+			el('div', { cls: 'note' }, [
+				'Most often wrong: ',
+				fields.map(([field, n]) => `${field} (${num(n)})`).join(' · '),
+			]),
 		],
 	});
 }

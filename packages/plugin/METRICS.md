@@ -202,6 +202,18 @@ Notes that bite:
   entity, because the observation that moved the registry also filed the new canonical; under the
   adoption dry run, or past `maxPerHour`, it lasts until the new canonical renders by another path. `entity_serve_ms` (v0.102.0) is each evaluation's duration, every outcome: a
   duration, so read its percentiles.
+- **What was served wrong is `prerender_ops` / `served_wrong`** (v0.102.0): one emit per cached copy found
+  to differ from the origin while it was being served (a rendered page, a raw document, a stored 404), at the
+  moment a detector found it. Never per serve, so it costs the request path nothing. The value is an **upper
+  bound** on how long that copy was served wrong: ms since it was last known right (its render, or the last
+  check that agreed with that very copy; for a 404, its last confirmation). Detail = the detector: `check` /
+  `check-raw` (a serve-time check of a page or a raw document), `sweep` (the nightly pass; the canary is
+  left out, its cohort repeats every half hour), `render-check` (a render that landed disagreeing with the
+  origin), `negative-recheck` / `negative-fetch` (a stored 404 the origin answers 200 for, found by the
+  re-check or by a proxied request). Context = what disagreed: the `pageCheck` field label (`2:product.offers`,
+  `6:canonical`, …), `claim` (the price/availability pair) or `404`. **Read the count per field** (how many
+  wrong copies, of what) **and the percentiles per detector** (how long they were out). The number of serves
+  each made is not here: that would need a per-key serve counter, which the plugin deliberately does not keep.
 - **The entity registry is `prerender_ops` / `entity_canonical` and `canonical_adopt`** (v0.101.0,
   `entities.enabled`, on by default for routes with an `entityPrefix`). `entity_canonical`: one emit per observation of an entity's canonical, detail =
   what it did to the registry (`new`, `moved`, `same`, `older`, `foreign` — another entity's prefix, or a

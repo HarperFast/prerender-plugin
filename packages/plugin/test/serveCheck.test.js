@@ -21,6 +21,7 @@ let serveCheck;
 let applyOptions;
 let config;
 let ops = [];
+let samples = [];
 
 const sabs = new Map();
 const sharedBufferStub = {
@@ -54,7 +55,10 @@ before(async () => {
 		workerIndex: 0,
 		nodes: [],
 		config: { http: {} },
-		recordAnalytics: (value, metric, path, method, type) => ops.push(`${metric}:${path}:${method}:${type}`),
+		recordAnalytics: (value, metric, path, method, type) => {
+			ops.push(`${metric}:${path}:${method}:${type}`);
+			samples.push({ value, metric, path, method, type });
+		},
 	};
 	globalThis.logger = { debug() {}, info() {}, warn() {}, error() {}, notify() {} };
 	globalThis.databases = {
@@ -185,6 +189,7 @@ const currentDeps = () => lastDeps;
 
 beforeEach(() => {
 	ops = [];
+	samples = [];
 	serveCheck.resetServeChecks();
 });
 afterEach(() => {
@@ -915,4 +920,36 @@ test('a document check tells the registry the canonical the origin document decl
 	assert.deepEqual(told, [
 		{ url: 'https://shop.example.com/c/shoes', value: 'https://shop.example.com/c/shoes-new', from: 'check' },
 	]);
+});
+
+// ---- served while wrong -----------------------------------------------------------------------------
+
+const wrong = () => samples.filter((s) => s.metric === 'prerender_ops' && s.path === 'served_wrong');
+
+test('a mismatch reports the copy SERVED WRONG, since it was last known right: its render, or an agreeing check of it', async () => {
+	const { setApi } = await setup();
+	setApi(API({ seoUrl: '/product/prd-a/red-running-shoe.jsp' }));
+	const input = served();
+	const before = Date.now();
+	await consider(input);
+	const [first] = wrong();
+	assert.equal(first.method, 'check');
+	assert.equal(first.type, '1:canonical', 'what disagreed');
+	assert.ok(first.value >= before - input.lastCachedMs && first.value <= Date.now() - input.lastCachedMs);
+
+	// An earlier check AGREED with this very copy: it was known right then, so the window starts there.
+	samples = [];
+	serveCheck.resetServeChecks();
+	const agreedAt = ANCHOR - 600_000;
+	checks.set(URL_A, check({ outcome: 'agree', checkedAtMs: agreedAt, basisAtMs: input.lastCachedMs }));
+	// Due again (the check predates the anchor), and the origin still disagrees.
+	await consider(served());
+	const [second] = wrong();
+	assert.ok(second.value <= Date.now() - agreedAt && second.value >= Date.now() - agreedAt - 5_000);
+});
+
+test('nothing is reported for an agreement, or for a HELD disagreement (served knowingly, not newly found)', async () => {
+	await setup();
+	await consider(served());
+	assert.deepEqual(wrong(), []);
 });

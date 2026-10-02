@@ -1445,3 +1445,33 @@ test('the registry panel is a quiet “off” when the registry is off and silen
 	const text = everything(ctx);
 	assert.match(text, /Entity registry/);
 });
+
+// ---- served while wrong (plugin served_wrong) -------------------------------------------
+
+test('the served-while-wrong card: wrong copies by the detector that found them, how long they were out, and what was wrong', async () => {
+	const analytics = {
+		...ANALYTICS,
+		series: [
+			...ANALYTICS.series,
+			combo('prerender_ops', 'served_wrong', 'check', '2:product.offers', 40, 3 * 3_600_000, 9 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'check', '6:canonical', 5, 2 * 3_600_000, 4 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'sweep', '2:product.offers', 300, 8 * 3_600_000, 20 * 3_600_000),
+			combo('prerender_ops', 'served_wrong', 'negative-recheck', '404', 7, 90_000, 600_000),
+		],
+	};
+	const ctx = makeCtx({ analytics });
+	await load(ctx);
+	const text = everything(ctx);
+	assert.match(text, /Served while wrong/);
+	assert.match(text, /Found by serve-time checks/);
+	assert.match(text, /Found by the nightly pass/);
+	assert.match(text, /Found by stored-404 re-checks/);
+	assert.match(text, /out for ≤ 8\.0h median · ≈20\.0h p95/);
+	assert.match(text, /Most often wrong: 2:product\.offers \(340\) · 404 \(7\) · 6:canonical \(5\)/);
+});
+
+test('the served-while-wrong card says so when nothing was found wrong', async () => {
+	const ctx = makeCtx({ analytics: ANALYTICS });
+	await load(ctx);
+	assert.match(everything(ctx), /Nothing found wrong in this range/);
+});

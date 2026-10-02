@@ -481,6 +481,12 @@ const settleMismatch = async (item, verdict, prior) => {
 	}
 	const acted = await act(item);
 	if (acted === null) return;
+	// SERVED WRONG, since the copy was last known right: its render, or a check that agreed with this very copy.
+	const agreedAt = prior?.outcome === 'agree' && prior.basisAtMs === item.lastCachedMs ? prior.checkedAtMs : -Infinity;
+	const knownRightAt = Math.max(item.lastCachedMs, agreedAt);
+	if (Number.isFinite(knownRightAt)) {
+		metrics.servedWrong(Date.now() - knownRightAt, item.kind === 'raw' ? 'check-raw' : 'check', verdict.field);
+	}
 	await deps.writeCheck(item.url, item.lastCachedMs, {
 		outcome: 'mismatch',
 		field: verdict.field,

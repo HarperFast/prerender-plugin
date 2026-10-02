@@ -725,6 +725,16 @@ export const METRICS = Object.freeze({
 			'this in; a route stuck here has no rule that maps `canonical`), moved (the entity registry heard the ' +
 			'origin name another canonical after the page was last confirmed: a re-slug it predates), ' +
 			'not-self-canonical, unreadable, no-prefix, error. ' +
+			'served_wrong = one emit per cached copy found to differ from the origin while it was being served ' +
+			'(a 200 page, a raw document or a stored 404), at the moment a detector found it — never per serve, so ' +
+			'it costs nothing on the request path. The value is an UPPER BOUND on how long that copy was served ' +
+			'wrong: ms since it was last known right (its render, or the last check that agreed with this very ' +
+			'copy; for a 404 its last confirmation). detail = the detector: check / check-raw (a serve-time check), ' +
+			'sweep (the nightly pass; not the canary), render-check (a render that landed wrong), negative-recheck / ' +
+			'negative-fetch (a stored 404 the origin answers 200 for); context = what disagreed: the pageCheck field ' +
+			'label, claim (the price/availability pair), or 404. The count is how many wrong copies were found; the ' +
+			'percentiles are how long they were out there. How many serves each one made is not counted: that needs ' +
+			'a per-key serve counter, which the plugin deliberately does not keep. ' +
 			'entity_serve_ms = milliseconds one entity-serve evaluation took, every outcome: what an opted-in ' +
 			'route adds to a miss before the miss path runs. ' +
 			'entity_canonical = one emit per observation of an entity\u2019s canonical (entities.enabled, ' +
@@ -814,7 +824,7 @@ export const METRICS = Object.freeze({
 			'(promoted/demoted/held/skipped_cold/single_rung/promoted_fast/fast/graded) are per-interval/per-run counts whose `total` is the meaningful ' +
 			'sum (`count` is flushes/runs); serve_error, page_age_negative, invalidation_error, ' +
 			'invalidation_reenqueue, probe_canary_trip, probe_invalidated, discovery_gated, entity_gate, raw_cache, negative_cache, ' +
-			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap, probe_detection_lag and entity_serve_ms are durations (ms — read their percentiles, not their total); ' +
+			'gone_reopen, suppression_lifted, suppression_held, due_now_forward and serve_check are counters; negative_gap, probe_detection_lag, entity_serve_ms and served_wrong are durations (ms — read their percentiles, not their total; served_wrong\u2019s count is the number of wrong copies found); ' +
 			'config_warnings is a slow gauge (latest value); ' +
 			'demand_fill is a per-node gauge (one worker refreshes the node\u2019s union) — never sum it, and READ ITS PEAK, NOT ITS MEAN. It is the ' +
 			'set-bit fraction of the newest visit-filter slot, which resets to ~0 at every slice rollover ' +
@@ -880,6 +890,7 @@ export const METRICS = Object.freeze({
 					'entity_serve_ms',
 					'entity_canonical',
 					'canonical_adopt',
+					'served_wrong',
 					'raw_cache',
 					'negative_cache',
 					'negative_gap',
@@ -1242,6 +1253,15 @@ export const metrics = Object.freeze({
 	pageVerification: (outcome) => server.recordAnalytics(true, 'prerender_ops', 'page_verification', outcome, null),
 	serveCheck: (outcome, source) =>
 		server.recordAnalytics(true, 'prerender_ops', 'serve_check', outcome, source ?? null),
+	/**
+	 * A cached copy that was being SERVED, found to differ from the origin — one emit per detection, never per
+	 * serve. The value is an UPPER BOUND on how long it was served that way: ms since it was last known right
+	 * (its render, or the last check that agreed with this very copy; a 404's last confirmation). `detector`:
+	 * check | check-raw | sweep | render-check | negative-recheck | negative-fetch. `what`: the field that
+	 * disagreed (a pageCheck field label, `claim` for the price/availability pair), or `404`.
+	 */
+	servedWrong: (ms, detector, what) =>
+		server.recordAnalytics(Math.max(0, ms), 'prerender_ops', 'served_wrong', detector, what ?? null),
 	invalidationReenqueue: (outcome, scope) =>
 		server.recordAnalytics(true, 'prerender_ops', 'invalidation_reenqueue', outcome, scope ?? null),
 
