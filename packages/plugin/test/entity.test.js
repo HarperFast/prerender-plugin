@@ -454,3 +454,52 @@ test('the sweep wires the resolver with its pass\u2019s dry run; the canary wire
 	const queue = await readFile(join(SRC, 'resources', 'RenderQueue.js'), 'utf8');
 	assert.match(queue, /observeRenderedCanonical\(scheduleUrl, describing\.pageFacts,/);
 });
+
+// ── review of 0.101.0: what a dry run counts, and what it spends ───────────────────────────────────
+
+test('a DRY RUN counts each entity once per retryAfter, as arming would file it — not every observation', async () => {
+	let clock = Date.UTC(2026, 9, 2, 10, 0, 0);
+	const { watch, filed } = observer({ settings: { dryRun: true }, now: () => clock });
+	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'would-adopt');
+	assert.equal(entities.get(PRODUCT).wouldAdoptCanonical, CANON);
+	// Every later observation of the same entity (a proxied miss, a verdict, a check) inside the window:
+	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'recent');
+	assert.equal((await watch({ url: `${PRODUCT}other-spelling.jsp`, value: CANON })).adopt, 'recent');
+	clock += 7 * 24 * HOUR;
+	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'would-adopt', 'the window passed');
+	assert.deepEqual(filed, []);
+	assert.equal(entities.get(PRODUCT).adoptedCanonical, undefined, 'a dry run never records a real adoption');
+});
+
+test('a dry run spends its own lane: it never takes the slots an armed node’s real adoptions need', async () => {
+	const settings = { maxPerHour: 1 };
+	// An operator's measure-only sweep on an armed node fills the dry lane...
+	const sweep = observer({ settings, probeDryRun: true });
+	assert.equal((await reslug(sweep.watch, 1)).adopt, 'would-adopt');
+	assert.equal((await reslug(sweep.watch, 2)).adopt, 'capped', 'the dry lane is capped like the real one');
+	// ...and a real observation the same hour still files.
+	const armed = observer({ settings });
+	assert.equal((await reslug(armed.watch, 3)).adopt, 'adopted');
+	assert.equal((await reslug(armed.watch, 4)).adopt, 'capped');
+});
+
+test('arming starts from no memory: an entity a dry run would have adopted is adopted at once when armed', async () => {
+	const dry = observer({ settings: { dryRun: true } });
+	assert.equal((await dry.watch({ url: OLD, value: CANON })).adopt, 'would-adopt');
+	const armed = observer();
+	assert.equal((await armed.watch({ url: OLD, value: CANON })).adopt, 'adopted');
+	assert.equal(armed.filed.length, 1);
+});
+
+test('retryAfter is per ENTITY: two spellings naming each other cannot reactivate each other in turn', async () => {
+	let clock = Date.UTC(2026, 9, 2, 10, 0, 0);
+	const { watch, filed } = observer({
+		now: () => clock,
+		target: { url: CANON, state: 'suppressed', suppressedReason: 'canonical-mismatch' },
+	});
+	assert.equal((await watch({ url: OLD, value: CANON })).adopt, 'reactivated');
+	clock += HOUR;
+	// The origin now names the OLD spelling again (a re-slug back, or an inconsistent copy at the edge).
+	assert.equal((await watch({ url: CANON, value: OLD })).adopt, 'recent');
+	assert.equal(filed.length, 1);
+});

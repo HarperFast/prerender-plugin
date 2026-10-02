@@ -172,10 +172,14 @@ type Entity @table(database: "render_service") {
 	# render claimed before a re-slug, landing after the probe saw it) does not.
 	canonicalAt: Date
 	firstSeenAt: Date
-	# The last canonical a target was ADOPTED for, and when: a canonical that did not take is not re-filed
-	# until `entities.adopt.retryAfter` has passed.
+	# The last canonical a target was ADOPTED for, and when: the entity is not adopted again until
+	# `entities.adopt.retryAfter` has passed, whichever canonical is named then.
 	adoptedCanonical: String
 	adoptedAt: Date
+	# The same, for an adoption a DRY RUN would have made: so the dry-run number counts entities, not
+	# observations, and arming starts from no memory at all (a dry run never blocks a real adoption).
+	wouldAdoptCanonical: String
+	wouldAdoptAt: Date
 }
 
 # The render queue: ONE ROW PER URL, due at `nextRenderTime`. A claim of a row is one job that

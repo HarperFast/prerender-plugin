@@ -1778,6 +1778,8 @@ export class PrerenderAdmin extends Resource {
 							canonicalAt: entityRow?.canonicalAt ? new Date(entityRow.canonicalAt).getTime() : null,
 							adoptedCanonical: entityRow?.adoptedCanonical ?? null,
 							adoptedAt: entityRow?.adoptedAt ? new Date(entityRow.adoptedAt).getTime() : null,
+							wouldAdoptCanonical: entityRow?.wouldAdoptCanonical ?? null,
+							wouldAdoptAt: entityRow?.wouldAdoptAt ? new Date(entityRow.wouldAdoptAt).getTime() : null,
 						}
 					: null,
 				// Already described (locally or by the owner) — see above.
