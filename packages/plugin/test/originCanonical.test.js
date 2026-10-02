@@ -192,8 +192,10 @@ test('tapsOriginCanonical: a GET, on an entityServe route with an entity prefix,
 	assert.equal(originCanonical.tapsOriginCanonical(route, 'HEAD'), false);
 	assert.equal(originCanonical.tapsOriginCanonical({ ...route, entityServe: false }, 'GET'), false);
 	assert.equal(originCanonical.tapsOriginCanonical({ entityServe: true }, 'GET'), false);
-	applyOptions({});
+	applyOptions({ entities: { enabled: false } });
 	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET'), false, 'registry off');
+	applyOptions({});
+	assert.equal(originCanonical.tapsOriginCanonical(route, 'GET'), true, 'on by default');
 });
 
 test('an UNSENT tapped response lets go: its branch is cancelled, and the source once the tap has its prefix', async () => {

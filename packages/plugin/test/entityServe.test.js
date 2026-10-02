@@ -1077,13 +1077,16 @@ test('a miss that reaches the origin teaches the registry the canonical its docu
 test('no tap with the registry off, on a route that does not opt in, or for a HEAD', async () => {
 	origin.body = `<html><head><link rel="canonical" href="${NEW_SLUG()}"></head></html>`;
 	target(`${ORIGIN}/product/prd-1/old-slug.jsp`, 'suppressed', 'canonical-mismatch');
+	// A row the tap WOULD move, so a tap that ran shows up as a write.
+	entityRows.set(PREFIX(), registryRow(`${ORIGIN}/product/prd-1/old-slug.jsp`, ANCHOR, 'probe'));
+	configure({ rest: { entities: { enabled: false } } });
 	await drain((await handleBotRequest(request(VARIANT))).body);
 	configure({ rest: { entities: { enabled: true } }, route: { entityServe: false } });
 	await drain((await handleBotRequest(request(VARIANT))).body);
 	configure({ rest: { entities: { enabled: true } } });
 	await drain((await handleBotRequest(request(VARIANT, 'HEAD'))).body);
 	await settle(100);
-	assert.equal(entityRows.size, 0);
+	assert.equal(entityRows.get(PREFIX()).canonicalFrom, 'probe', 'nothing tapped: the row is as the probe left it');
 });
 
 // ── review of 0.102.0 ────────────────────────────────────────────────────────────────────────────────
