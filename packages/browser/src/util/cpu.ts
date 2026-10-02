@@ -27,9 +27,45 @@ const USER_HZ = 100;
 
 const CGROUP_V2_USAGE = '/sys/fs/cgroup/cpu.stat';
 const CGROUP_V2_MAX = '/sys/fs/cgroup/cpu.max';
+const CGROUP_V2_PRESSURE = '/sys/fs/cgroup/cpu.pressure';
 const CGROUP_V1_USAGE = '/sys/fs/cgroup/cpuacct/cpuacct.usage';
 const CGROUP_V1_QUOTA = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us';
 const CGROUP_V1_PERIOD = '/sys/fs/cgroup/cpu/cpu.cfs_period_us';
+
+/**
+ * The `some total=` counter from a PSI `cpu.pressure` file: cumulative microseconds in which at least
+ * one of the cgroup's tasks was runnable but waiting for a CPU. Null when the text has no such field.
+ */
+export function parseCpuStallUs(text: string): number | null {
+	const match = text.match(/^some\s.*?\btotal=(\d+)/m);
+	return match ? Number(match[1]) : null;
+}
+
+/**
+ * The container's CPU stall counter (see `parseCpuStallUs`), or null where the kernel exposes none —
+ * cgroup v1, PSI disabled, or a non-Linux host.
+ */
+export function readCpuStallUs(path = CGROUP_V2_PRESSURE): number | null {
+	try {
+		return parseCpuStallUs(readFileSync(path, 'utf8'));
+	} catch {
+		return null;
+	}
+}
+
+export type StallSample = { stallUs: number; atMs: number };
+
+/**
+ * CPU pressure between two stall samples: the percent of wall time in which some task waited for a
+ * CPU. The same quantity PSI's `avg10` smooths over ~10 s, taken over exactly the interval instead,
+ * so a controller stepping every few seconds reads its own last step rather than a lagging average.
+ * Null when the samples cannot be compared (no elapsed time, or a counter that went backwards).
+ */
+export function pressureBetween(prev: StallSample, cur: StallSample): number | null {
+	const elapsedUs = (cur.atMs - prev.atMs) * 1000;
+	if (!(elapsedUs > 0) || cur.stallUs < prev.stallUs) return null;
+	return Math.min(100, ((cur.stallUs - prev.stallUs) / elapsedUs) * 100);
+}
 
 /** Total CPU microseconds consumed by the whole cgroup so far, or null if unreadable. */
 function readCgroupUsageUsec(): number | null {

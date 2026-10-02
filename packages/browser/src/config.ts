@@ -618,7 +618,7 @@ export const defaultConfig = (): PrerenderConfig => ({
 });
 
 /** setTimeout's delay ceiling: past this a timer fires at once instead of late. */
-const MAX_TIMER_MS = 2147483647;
+export const MAX_TIMER_MS = 2147483647;
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === 'object' && value !== null && !Array.isArray(value);
